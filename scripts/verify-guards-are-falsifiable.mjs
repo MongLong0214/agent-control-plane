@@ -37,6 +37,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { CASES_DIR, loadFalsifiabilityCases } from "./lib/falsifiability-cases.mjs";
+
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const VITEST = join(ROOT, "node_modules", ".bin", "vitest");
 /**
@@ -452,6 +454,24 @@ const GUARDS = [
     replace: "",
     killedBy: [
       "tests/process/reason-code-static-outflow-census.test.ts::production trigger denials and mappings agree",
+    ],
+  },
+  {
+    // #639 contract 1's fourth field was a constant. `TelegramRouterOptions.bindingGeneration`
+    // was optional with a `() => null` default, and no composition root — not this one, not the
+    // disposable-realm driver, not a test — ever supplied it. So every claim ACP has written
+    // stored `digestOf({ bindingGeneration: null })`, and a turn claimed while a CEO was bound at
+    // generation 1 was indistinguishable from one claimed with no CEO bound at all: the fence
+    // against reconciling one CEO's turn under the next generation could not move.
+    //
+    // The mutation is exactly the old behaviour, not a nonsense value, because the old behaviour
+    // is what was wrong — and it produced a digest that looked entirely plausible in every row.
+    what: "the claim's binding digest names the CEO generation that asked the turn",
+    file: "src/ingress/telegram-polling.ts",
+    find: "    bindingGeneration: () => cp.bindings.active(roleKeyFor(Role.CEO))?.bindingGeneration ?? null,",
+    replace: "    bindingGeneration: () => null,",
+    killedBy: [
+      "tests/process/a-turn-claim-outlives-the-process-that-made-it.test.ts::carries the same four values to a reader that opens the file after the writer is gone",
     ],
   },
   {
@@ -3973,35 +3993,10 @@ const GUARDS = [
       "tests/unit/acceptance-report.test.ts::is ANOMALIES_PRESENT only when an accepted anomaly is an actual positive count, never from prevented attempts alone",
     ],
   },
-  {
-    // #575: the App permission check moved from a single exact shape to an append-only list
-    // of exact shapes, precisely so the App's grant and this code no longer have to narrow in
-    // the same instant. Removing the key-count check turns every shape's match into "contains
-    // at least these keys at these levels" — a superset would then match, which is exactly the
-    // silent broadening the list exists to prevent.
-    what: "an App permission grant with an extra key beyond an approved shape is refused, not accepted as a superset",
-    file: "src/github/credential-store.ts",
-    find: "    Object.keys(permissions).length === expected.length &&\n",
-    replace: "",
-    killedBy: [
-      "tests/unit/github-app-credential-store.test.ts::refuses the narrowed grant shape plus one extra permission — a superset is never accepted",
-    ],
-  },
-  {
-    // The transitional shape (the grant deployed before #575) has to keep matching until the
-    // owner narrows the App in GitHub settings, and the narrowed target shape has to already
-    // match so that narrowing needs no coordinated deploy. Downgrading the narrowed shape's
-    // `actions` entry to `write` makes it require a permission level the actual narrowed grant
-    // (`actions: read`) does not have, so only the transitional shape would still match —
-    // reproducing exactly the ordering deadlock #575 exists to remove.
-    what: "the narrowed post-575 target shape is present in the approved list, not only the transitional one",
-    file: "src/github/credential-store.ts",
-    find: "    actions: \"read\",\n",
-    replace: "    actions: \"write\",\n",
-    killedBy: [
-      "tests/unit/github-app-credential-store.test.ts::accepts the narrowed post-575 target grant shape with merge_queues and statuses dropped and actions read added",
-    ],
-  },
+  // #741 moved two rows out of this array and into `scripts/falsifiability-cases/`:
+  // `app-permission-superset-is-refused` and `narrowed-post-575-shape-is-approved`. They ran
+  // unchanged; what changed is that a branch adding a row no longer has to write at this one
+  // point in this one file.
   {
     // Requirement 4: a refusal must name which shapes were expected, not just that the match
     // failed — otherwise the operator has to read this source to learn what to grant. Removing
@@ -4014,6 +4009,224 @@ const GUARDS = [
     killedBy: [
       "tests/unit/github-app-credential-store.test.ts::names every approved shape in the refusal message rather than only saying the match failed",
     ],
+  },
+  {
+    // Issue #246 — a producer forbidden from writing to GitHub still has to answer a plan
+    // that calls for one. Honestly receipting a GitHub operation requires performing it,
+    // which this producer never does, so it refuses the whole plan instead. Neutering the
+    // condition would make the producer fabricate a result — repositories, receipts,
+    // verification — for a GitHub write that never happened.
+    //
+    // Bare-file `killedBy`: the describing `describe` block is `repo factory producer
+    // (#246)`, and `vitest -t` treats `#`/`(`/`)` as regex metacharacters (see this file's
+    // own guidance at the top).
+    what: "the producer refuses a plan that requires a GitHub write rather than fabricating a receipt for one",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "  if (plan.githubOperations.length > 0) {\n",
+    replace: "  if (false && plan.githubOperations.length > 0) {\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // The other honesty refusal this producer builds in: `bootstrapVerification` must carry
+    // a real PASS. Neutering this check would let a genuinely-failing local `git` command
+    // (a real, non-zero exit) still get recorded as PASS with a real exactHead attached — a
+    // schema-complete lie about something that was actually observed to fail.
+    what: "the producer refuses to record a fabricated PASS when the local verification command genuinely fails",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "      if (result.exitCode !== 0) {\n",
+    replace: "      if (false && result.exitCode !== 0) {\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // `assertContained` (added in CEO review round 2, defect 1) now independently refuses a
+    // role like `../../etc` by realpath, which made this row's original test
+    // ("...would escape the given work directory") survive its own mutation — the
+    // containment check caught the escape whether or not this regex existed, so removing
+    // the regex alone was no longer observable. A role that is not kebab-case but is not
+    // path-shaped at all (`Primary_Role`: no `/`, no `..`) never trips containment, so that
+    // is the property only this regex still uniquely guards.
+    what: "the plan schema refuses a repository role that is not kebab-case, independent of path escape",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: '.regex(/^[a-z0-9][a-z0-9-]*$/, "repositoryRole must be kebab-case"),\n',
+    replace: ",\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // CEO review round 2, defect 2 — without this, a failure after `mkdirSync` (a genuinely
+    // failing verification command, a failed commit, …) leaves the checkout directory
+    // behind. The next attempt at the exact same bootstrap operation is then refused forever
+    // by the `existsSync` collision check above, which is correct in isolation but a
+    // permanent trap combined with a mid-flight failure. Neutering the removal here
+    // reproduces exactly that: cleanup is attempted, ownership is proven, and nothing is
+    // actually deleted.
+    what: "a failed run removes only the checkout it just created, so the same bootstrap operation can retry",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "  rmSync(localRepoPath, { recursive: true, force: true });\n",
+    replace: "  // rmSync(localRepoPath, { recursive: true, force: true });\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // CEO review round 2, defect 4 — `git ls-tree` ran with `allowFailure: true` and its
+    // exit code was never checked before this function built `verified: true` on top of its
+    // output: a failed listing produced a receipt claiming verification anyway, the same
+    // "field filled because the shape wanted it" defect the rest of this producer exists to
+    // refuse. Neutering the check here reproduces that: `trackedFilesOrDeny` records success
+    // regardless of what `git ls-tree` actually reported.
+    what: "the producer refuses to build a verified receipt on top of a tracked-file listing that genuinely failed",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "  if (tracked.exitCode !== 0) {\n",
+    replace: "  if (false && tracked.exitCode !== 0) {\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // CEO review round 3, defect 1 — CEO executed `["-C", <outside>, "init", "-b", "pwn"]`
+    // through `verificationArgs` and it wrote a real `.git` outside `workDir`; the field was
+    // removed entirely (replaced by the closed `VERIFICATION_KINDS` enum) rather than
+    // patched, because blocklisting `-C`/`--git-dir`/`--work-tree`/`--global` still leaves
+    // "and anything else you find" open. `.strict()` is what makes a plan reconstructing the
+    // old attack shape (an extra `verificationArgs` key) a loud, immediate schema rejection
+    // instead of a silently-stripped key that could mask a real regression here.
+    what: "the plan schema rejects an old-shaped attack plan (a stray verificationArgs key) rather than silently stripping it",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "  })\n  .strict();\n\nexport type RepoFactoryPlanFixture",
+    replace: "  });\n\nexport type RepoFactoryPlanFixture",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // CEO review round 3, defect 2 — `git status --porcelain` exits 0 whether or not the
+    // tree is dirty; the dirtiness is only ever on stdout. A judge that checked only
+    // `exitCode` (the previous shape) reported PASS over the producer's own untracked
+    // ownership marker — CEO measured it directly: `local-clean-tree:PASS` next to a real
+    // `?? .repo-factory-operation.json`. Neutering this line reproduces exactly that.
+    what: "CLEAN_TREE denies a dirty working tree observed on stdout, not only a non-zero exit code",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "      if (result.stdout.trim().length > 0) {\n",
+    replace: "      if (false && result.stdout.trim().length > 0) {\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // CEO review round 4, defect 3 — round 3's fix re-verified device+inode identity
+    // immediately before every operation, and CEO demonstrated directly that a swap injected
+    // strictly between a successful re-check and the git call right after it was followed
+    // exactly as before: shrinking a check-then-act window is not closing it. The real close
+    // is this: an ancestor directory owned by someone else can be tampered with by that other
+    // account regardless of any check this process performs, so it is refused outright.
+    // Neutering the ownership half of the check would let a directory owned by another
+    // account (who could swap its contents at any time, on their own schedule, not raced) be
+    // treated as safe.
+    what: "the producer refuses a checkout whose parent chain includes a directory not owned by this process",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "  if (stat.uid !== myUid) {\n",
+    replace: "  if (false && stat.uid !== myUid) {\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // The other half of the same precondition: even a directory this process owns is unsafe
+    // if another user or group can also write to it — group/other write access is exactly
+    // what would let a different account create, delete, or rename entries inside it,
+    // including replacing this run's own checkout with a symlink, at any time, not only in
+    // some narrow window this process might fail to re-check. Neutering the mode check here
+    // reproduces exactly that: a world-writable "repositories" directory is treated as safe.
+    what: "the producer refuses a checkout whose parent chain includes a directory writable by another user or group",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "  if ((stat.mode & 0o022) !== 0) {\n",
+    replace: "  if (false && (stat.mode & 0o022) !== 0) {\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // CEO review round 5, defect 1 — round 4's chain walk stopped at `workDir` itself,
+    // leaving `dirname(workDir)` unchecked. Renaming or replacing the `workDir` *entry* does
+    // not need write access inside `workDir` — only on its own parent — so an
+    // attacker-writable grandparent holding an owner-only `workDir` passed round 4's check
+    // while still being able to swap the `workDir` entry out from under it. Neutering the
+    // one-level extension here reproduces exactly that gap: reachedBoundary is computed but
+    // never used to add the boundary's own parent to the chain.
+    what: "the producer refuses when the directory governing workDir's own rename permission is unsafe, not only workDir and below",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "    if (parentOfWorkDir !== boundary) chain.push(parentOfWorkDir);\n",
+    replace: "    if (false && parentOfWorkDir !== boundary) chain.push(parentOfWorkDir);\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // CEO review round 5, defect 2 — CEO's correction: same-UID concurrent producers are
+    // this system's normal operating mode, not an attacker model, and an `existsSync`
+    // check-then-act cannot decide a collision between two such producers racing the same
+    // path. Reverting `createCheckoutLeafOrDeny`'s atomic, non-recursive leaf creation back
+    // to `recursive: true` reproduces exactly the shape CEO found: reproduced directly
+    // against commit 7d6b580, two real concurrent OS processes racing the same checkout path
+    // did not deterministically split 1 success / 1 collision — one run crashed with
+    // `ENOTEMPTY` when one process's cleanup collided with the other's still-open writes into
+    // the same directory, because recursive `mkdirSync` treats an already-existing directory
+    // as success for both callers. A real subprocess race is inherently timing-dependent to
+    // *trigger* (`tests/process/repo-factory-produce-local-cli.test.ts` carries that
+    // real-world reproduction as evidence, five consecutive clean runs), so the falsifiable
+    // row here is pinned by a deterministic unit test instead: a directory pre-existing at
+    // the exact leaf path, standing in for what a concurrent creator would have left a moment
+    // earlier, refused rather than silently reused — no race required to observe the
+    // difference reliably on every run.
+    what: "createCheckoutLeafOrDeny — the filesystem's own atomic mkdir, not existsSync — decides a same-path creation collision",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "    mkdirSync(localRepoPath, { mode: SAFE_DIRECTORY_MODE });\n",
+    replace: "    mkdirSync(localRepoPath, { mode: SAFE_DIRECTORY_MODE, recursive: true });\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // CEO review round 6, defect 1 — `statSync` follows a symlink and reports its *target*'s
+    // identity, not the entry's own. `assertParentChainNotAttackerWritable` computed
+    // `dirname(workDir)` through a symlink (`unsafeGrandparent/link -> safeTarget`, the
+    // target 0700 and owned by this process) and, under the previous `statSync`-based check,
+    // judged `safeTarget` as safe without ever examining `link` itself or the unsafe
+    // directory that actually governs whether that entry can be renamed. Neutering the
+    // symlink/non-directory check here reproduces exactly that: a symlink anywhere in the
+    // chain is judged by whatever it resolves to, rather than refused outright.
+    what: "judgeRealDirectoryEntry refuses a symlink outright rather than judging whatever it resolves to",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "  if (stat.isSymbolicLink() || !stat.isDirectory()) {\n",
+    replace: "  if (false && (stat.isSymbolicLink() || !stat.isDirectory())) {\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // CEO review round 6, defect 2 — an explicit `mode` on `mkdirSync` is still subject to
+    // the process umask, and the previous shape returned `allow` the instant `mkdirSync`
+    // succeeded, never inspecting what was actually created. Under `umask(0)`, a bare
+    // `mkdirSync(dir)` with no mode argument created `workDir`, `repositories`, and the
+    // checkout leaf all at `0777` — world-writable — and the run completed successfully
+    // anyway. Neutering the explicit safe mode here (removing it from `ensureDirectoryLevel`'s
+    // creation of `workDir`/`repositories`) reproduces that under a hostile umask; the
+    // post-creation judgement this same round adds is what still catches it, so the pinned
+    // test also proves that half by checking the resulting mode is exactly `0700`.
+    what: "ensureDirectoryLevel gives every directory it creates an explicit safe mode, not whatever the process umask happens to leave",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "    mkdirSync(dir, { mode: SAFE_DIRECTORY_MODE });\n",
+    replace: "    mkdirSync(dir);\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // CEO review round 7, M1 — CEO mutated this exact condition on the committed code and
+    // reported the count: 25 passed, survives. The judgement (`judgeRealDirectoryEntry`)
+    // still correctly denies with this line neutered; only the *cleanup* stops happening, so
+    // a test that only checks `judged.allowed` cannot see it. Removing the whole condition
+    // reproduces exactly that: the directory this call just created is left behind after a
+    // denial rather than removed.
+    what: "a directory judged unsafe immediately after this call created it is actually removed, not merely denied",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "  if (!judged.allowed && justCreated) {\n",
+    replace: "  if (false) {\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // CEO review round 7, M2 — CEO mutated this exact call site on the committed code and
+    // reported the count: 25 passed, survives. Every other test's route to a denial for a
+    // freshly created directory went through `ensureDirectoryLevel`'s reuse branch, a path
+    // `createCheckoutLeafOrDeny` never takes (an already-existing leaf is always a collision
+    // there, never something to judge-and-reuse) — so nothing exercised the leaf's own call
+    // site at all. Bypassing the judgement here reproduces exactly that: the repository is
+    // written into a checkout directory this function never verified.
+    what: "createCheckoutLeafOrDeny judges the leaf directory through its own call site, not only via ensureDirectoryLevel's shared path",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "  return judgeAndCleanupIfJustCreated(localRepoPath, justCreated, statEntry);\n",
+    replace: "  void justCreated;\n  return allow(ReasonCode.OK, undefined);\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
   },
   {
     // #734 criterion 3, the row that kills the shape the brief names explicitly: a re-evaluation
@@ -4145,6 +4358,33 @@ const GUARDS = [
   },
 ];
 
+/**
+ * The rows that live one-per-file under `scripts/falsifiability-cases/` (#741).
+ *
+ * This is the **first** thing the run does, deliberately, and the ordering is the acceptance
+ * criterion rather than a preference. Everything below — the `what:` count, the anchor pass, the
+ * snapshot, the mutations — happens only if every case module parsed and validated. A file that
+ * does not parse therefore has no path to a check that counts things and calls the count a pass,
+ * which is exactly the path taken on 2026-08-31: `grep -c "what:"` answered 298, the expected
+ * arithmetic agreed, and `node` answered `SyntaxError: Unexpected token ':'`.
+ *
+ * The load is fail-closed in every direction (empty directory, unreadable module, duplicate id,
+ * a module carrying two rows, a `killedBy` naming a file that is not there) because a loader that
+ * skips what it cannot read is worse than the single array it replaces: the array at least died
+ * loudly, while a skipped module subtracts a row and leaves the survivors reporting a full sweep.
+ */
+let CASES;
+try {
+  CASES = await loadFalsifiabilityCases(ROOT);
+} catch (error) {
+  process.stdout.write(`verify-guards-are-falsifiable: ${error.message}\n`);
+  process.stdout.write(`\nRESULT: FAIL — ${CASES_DIR} was refused, so nothing was run.\n`);
+  process.exit(1);
+}
+
+/** The array and the directory are one table from here down. */
+const ALL_ROWS = [...GUARDS, ...CASES];
+
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
 
 /**
@@ -4163,8 +4403,8 @@ const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".
  */
 const anchorsOnly = process.argv.includes("--anchors-only");
 
-const rows = GUARDS.filter((g) => !g.skip).filter(
-  (g) => !only || g.what.includes(only) || g.file.includes(only),
+const rows = ALL_ROWS.filter((g) => !g.skip).filter(
+  (g) => !only || g.what.includes(only) || g.file.includes(only) || (g.id ?? "").includes(only),
 );
 
 const out = (line) => process.stdout.write(line + "\n");
@@ -4192,9 +4432,13 @@ if (tableSource === null) {
   process.exit(2);
 }
 const declaredWhats = [...tableSource[1].matchAll(/^\s*what: "/gm)].length;
+// Its subject is the inline array only, and it has to stay that way: the case modules under
+// `scripts/falsifiability-cases/` cannot lose a row to a missing `},{` because there is no
+// enclosing literal to merge into. Their analogue is the loader's one-export/one-object check,
+// which has already run above.
 if (declaredWhats !== GUARDS.length) {
   out(
-    `verify-guards-are-falsifiable: the table has ${declaredWhats} \`what:\` line(s) and ` +
+    `verify-guards-are-falsifiable: the inline table has ${declaredWhats} \`what:\` line(s) and ` +
       `${GUARDS.length} row(s).`,
   );
   out("  A missing `},{` merges two rows into one object; the earlier one is discarded in silence.");
@@ -4494,7 +4738,7 @@ if (!lociBlock) {
   process.exit(1);
 }
 const loci = [...lociBlock[1].matchAll(/^\s*(\w+):/gm)].map((m) => m[1]);
-const claimed = new Set(GUARDS.flatMap((g) => g.symbols ?? []));
+const claimed = new Set(ALL_ROWS.flatMap((g) => g.symbols ?? []));
 const unclaimed = loci.filter((s) => !claimed.has(s));
 
 // ---------------------------------------------------------------------------
