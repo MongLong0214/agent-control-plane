@@ -203,11 +203,19 @@ export interface TelegramRouterOptions {
   /**
    * The CEO binding generation a turn is being run under, read at claim time.
    *
-   * Optional, and its absence is recorded as absence rather than as a generation. A default of
-   * zero would put a number in the digest that no binding ever had, and a later receipt would
-   * be compared against it and disagree for a reason nobody could find.
+   * `null` is a legitimate answer and means no CEO is bound. A default of zero would put a
+   * number in the digest that no binding ever had, and a later receipt would be compared
+   * against it and disagree for a reason nobody could find.
+   *
+   * Required, with no default, because the default is what broke it. This option was optional
+   * and `?? (() => null)` filled it in — and no composition root ever supplied it, so every
+   * claim in every deployment stored `digestOf({ bindingGeneration: null })` while a CEO was
+   * bound at generation 1. The field contract 1 names as the fence against reconciling one
+   * CEO's turn under the next one's generation was a constant, and nothing said so: absence
+   * and a live generation produced the same digest. Making it required turns forgetting to
+   * wire it into a compile error rather than a value that looks plausible in every row.
    */
-  bindingGeneration?: () => number | null;
+  bindingGeneration: () => number | null;
   /** Fault-injection seam for proving each durable checkpoint is restartable. */
   onInterrupt?: (point: TelegramInterruptPoint, update: TelegramUpdate, runId?: string) => void | Promise<void>;
 }
@@ -375,7 +383,7 @@ export class TelegramHermesRouter {
     this.ownerDecision = options.ownerDecision;
     this.defaultProjectId = options.defaultProjectId ?? null;
     this.directHandler = options.directHandler ?? defaultDirectHandler;
-    this.bindingGeneration = options.bindingGeneration ?? (() => null);
+    this.bindingGeneration = options.bindingGeneration;
     this.getStoredResponse = options.getStoredResponse ?? (() => null);
     this.getStoredState = options.getStoredState ?? ((nonce) => {
       const stored = this.getStoredResponse(nonce);

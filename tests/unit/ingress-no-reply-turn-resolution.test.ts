@@ -80,6 +80,10 @@ const buildRouter = (harness: ReturnType<typeof makeHarness>) => {
     ingress,
     hermes,
     currentCandidateSnapshotDigest: () => null,
+    // No CEO is bound in this fixture, and `null` is what that honestly is. The option carries
+    // no default any more: the default was how every production claim came to store a constant
+    // where contract 1's binding digest belongs.
+    bindingGeneration: () => null,
   });
   return { guard, ingress, router };
 };
