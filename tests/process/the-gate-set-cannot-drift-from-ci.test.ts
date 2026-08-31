@@ -205,11 +205,23 @@ const stubbedPnpm = (options: { fail?: string; kill?: string }): { path: string;
   return { path: directory, log };
 };
 
+// One environment, shared by every spawn in this file. `--list` renders a gate's command
+// including any argument it takes from the environment (`trailers` takes `ACP_TRAILERS_RANGE`),
+// so a `--list` that reads a different environment than the run describes a different gate set
+// and the comparison below fails for a reason that has nothing to do with drift. That is not
+// hypothetical: this file passed locally, where the variable is unset and both spawns agreed by
+// accident, and failed on both CI legs, where the workflow sets it for the `pnpm gates` step.
+const runnerEnv = (stub?: { path: string }): NodeJS.ProcessEnv => ({
+  ...process.env,
+  ...(stub ? { PATH: `${stub.path}:${process.env.PATH ?? ""}` } : {}),
+  ACP_TRAILERS_RANGE: "",
+});
+
 const runRunner = (stub: { path: string }, args: string[] = []) =>
   spawnSync(process.execPath, [RUNNER, ...args], {
     cwd: REPO_ROOT,
     encoding: "utf8",
-    env: { ...process.env, PATH: `${stub.path}:${process.env.PATH ?? ""}`, ACP_TRAILERS_RANGE: "" },
+    env: runnerEnv(stub),
   });
 
 const invocations = (log: string): string[] =>
@@ -223,7 +235,7 @@ describe("the pre-push gate runner", () => {
 
     expect(result.status, result.stdout).toBe(0);
     const ran = invocations(stub.log);
-    const listed = spawnSync(process.execPath, [RUNNER, "--list"], { cwd: REPO_ROOT, encoding: "utf8" })
+    const listed = spawnSync(process.execPath, [RUNNER, "--list"], { cwd: REPO_ROOT, encoding: "utf8", env: runnerEnv() })
       .stdout.split("\n")
       .filter(Boolean)
       .map((line) => line.replace(/^\S+\s+pnpm\s+/, ""));
