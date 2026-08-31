@@ -110,8 +110,8 @@ const receiptEvidence = {
 
 const frame = (id: number, result: unknown): string => `${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`;
 const initialized = (): string => frame(1, { protocolVersion: 1, agentInfo: { name: "hermes-agent", version: "test" }, agentCapabilities: {}, authMethods: [] });
-const terminalResult = (receipt: Record<string, unknown>): Record<string, unknown> => ({
-  stopReason: receipt.status === "REFUSED" ? "refusal" : "end_turn",
+const terminalResult = (receipt: Record<string, unknown>, stopReason = receipt.status === "REFUSED" ? "refusal" : "end_turn"): Record<string, unknown> => ({
+  stopReason,
   _meta: { hermes: { acpTerminalReceipt: receipt } },
 });
 
@@ -497,6 +497,43 @@ describe("bounded Hermes ACP client", () => {
       await expect(runHermesAcp(request(), { spawn: () => child })).resolves.toEqual({ status: "FAILED", reason: "MALFORMED_TERMINAL_RECEIPT" });
       expectFailureShutdown(child);
     }
+  });
+
+  it.each([
+    ["NEVER_FOUND", { status: "NEVER_FOUND", turnRequestId: receiptIdentity.turnRequestId }, "end_turn", { status: "NOT_COMPLETED", terminalStatus: "NEVER_FOUND" }],
+    ["PREPARED", inFlight("PREPARED"), "end_turn", { status: "NOT_COMPLETED", terminalStatus: "PREPARED" }],
+    ["CLAIMED", inFlight("CLAIMED"), "end_turn", { status: "NOT_COMPLETED", terminalStatus: "CLAIMED" }],
+    ["COMPLETED", completed(), "end_turn", { status: "COMPLETED" }],
+    ["ABORTED", aborted(), "end_turn", { status: "ABORTED" }],
+    ["REFUSED", { status: "REFUSED" }, "refusal", { status: "NOT_COMPLETED", terminalStatus: "REFUSED" }],
+  ] as const)("accepts a %s terminal receipt only with its compatible stopReason", async (_status, receipt, stopReason, expected) => {
+    const child = new FakeChild();
+    connect(child, () => {
+      child.stdout.emitText(frame(2, terminalResult(receipt, stopReason)));
+      cleanClose(child);
+    });
+
+    await expect(runHermesAcp(request(), { spawn: () => child })).resolves.toMatchObject(expected);
+    expect(child.killCalls).toBe(0);
+    expectNoResidue(child);
+  });
+
+  it.each([
+    ["NEVER_FOUND", { status: "NEVER_FOUND", turnRequestId: receiptIdentity.turnRequestId }, "refusal"],
+    ["PREPARED", inFlight("PREPARED"), "refusal"],
+    ["CLAIMED", inFlight("CLAIMED"), "cancelled"],
+    ["COMPLETED", completed(), "cancelled"],
+    ["ABORTED", aborted(), "unknown-terminal-reason"],
+    ["REFUSED", { status: "REFUSED" }, "end_turn"],
+  ] as const)("rejects a %s terminal receipt with incompatible stopReason %s", async (_status, receipt, stopReason) => {
+    const child = new FakeChild();
+    connect(child, () => {
+      child.stdout.emitText(frame(2, terminalResult(receipt, stopReason)));
+      cleanClose(child);
+    });
+
+    await expect(runHermesAcp(request(), { spawn: () => child })).resolves.toEqual({ status: "FAILED", reason: "MALFORMED_TERMINAL_RECEIPT" });
+    expectFailureShutdown(child);
   });
 
   it("returns terminal-attested Hermes abort evidence without content", async () => {

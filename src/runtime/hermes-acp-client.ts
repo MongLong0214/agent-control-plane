@@ -281,6 +281,14 @@ const terminalMatchesRequest = (terminal: JsonRecord, input: HermesAcpInput): bo
   );
 };
 
+const terminalStopReasonMatchesStatus = (status: unknown, stopReason: string): boolean =>
+  status === "REFUSED"
+    ? stopReason === "refusal"
+    : (
+      status === "NEVER_FOUND" || status === "PREPARED" || status === "CLAIMED" ||
+      status === "COMPLETED" || status === "ABORTED"
+    ) && stopReason === "end_turn";
+
 const terminalResult = (result: unknown, input: HermesAcpInput): HermesAcpResult => {
   if (!isRecord(result) || !hasExactKeys(result, ["_meta", "stopReason"]) || typeof result.stopReason !== "string") {
     return { status: "FAILED", reason: "MALFORMED_TERMINAL_RECEIPT" };
@@ -291,6 +299,9 @@ const terminalResult = (result: unknown, input: HermesAcpInput): HermesAcpResult
   }
   const terminal = meta.hermes.acpTerminalReceipt;
   const status = terminal.status;
+  if (!terminalStopReasonMatchesStatus(status, result.stopReason)) {
+    return { status: "FAILED", reason: "MALFORMED_TERMINAL_RECEIPT" };
+  }
   if (status === "NEVER_FOUND") {
     if (!hasExactKeys(terminal, ["status", "turnRequestId"]) || terminal.turnRequestId !== input.receiptIdentity.turnRequestId) {
       return { status: "FAILED", reason: "MALFORMED_TERMINAL_RECEIPT" };
