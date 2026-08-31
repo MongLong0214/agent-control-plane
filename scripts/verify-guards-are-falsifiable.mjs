@@ -3266,6 +3266,48 @@ const GUARDS = [
       "tests/unit/acceptance-report.test.ts::is ANOMALIES_PRESENT only when an accepted anomaly is an actual positive count, never from prevented attempts alone",
     ],
   },
+  {
+    // #575: the App permission check moved from a single exact shape to an append-only list
+    // of exact shapes, precisely so the App's grant and this code no longer have to narrow in
+    // the same instant. Removing the key-count check turns every shape's match into "contains
+    // at least these keys at these levels" — a superset would then match, which is exactly the
+    // silent broadening the list exists to prevent.
+    what: "an App permission grant with an extra key beyond an approved shape is refused, not accepted as a superset",
+    file: "src/github/credential-store.ts",
+    find: "    Object.keys(permissions).length === expected.length &&\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/github-app-credential-store.test.ts::refuses the narrowed grant shape plus one extra permission — a superset is never accepted",
+    ],
+  },
+  {
+    // The transitional shape (the grant deployed before #575) has to keep matching until the
+    // owner narrows the App in GitHub settings, and the narrowed target shape has to already
+    // match so that narrowing needs no coordinated deploy. Downgrading the narrowed shape's
+    // `actions` entry to `write` makes it require a permission level the actual narrowed grant
+    // (`actions: read`) does not have, so only the transitional shape would still match —
+    // reproducing exactly the ordering deadlock #575 exists to remove.
+    what: "the narrowed post-575 target shape is present in the approved list, not only the transitional one",
+    file: "src/github/credential-store.ts",
+    find: "    actions: \"read\",\n",
+    replace: "    actions: \"write\",\n",
+    killedBy: [
+      "tests/unit/github-app-credential-store.test.ts::accepts the narrowed post-575 target grant shape with merge_queues and statuses dropped and actions read added",
+    ],
+  },
+  {
+    // Requirement 4: a refusal must name which shapes were expected, not just that the match
+    // failed — otherwise the operator has to read this source to learn what to grant. Removing
+    // the shape description from the denial message reproduces the bare, unhelpful message this
+    // guard replaced.
+    what: "the permission-denied message names the approved shapes rather than only saying the match failed",
+    file: "src/github/credential-store.ts",
+    find: "          `(expected one of: ${describeApprovedPermissionShapes()})`,\n",
+    replace: "          \"\",\n",
+    killedBy: [
+      "tests/unit/github-app-credential-store.test.ts::names every approved shape in the refusal message rather than only saying the match failed",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
