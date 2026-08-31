@@ -263,6 +263,13 @@ while (queue.length > 0) {
 const commandRunsFullVitestSuite = (command) =>
   splitSegments(command).some((segment) => {
     const words = withoutLeadingEnvironment(shellWords(segment));
+    if (
+      (basename(words[0] ?? "") === "node" || basename(words[0] ?? "") === "node.exe") &&
+      words.length === 2 &&
+      isScriptOperand(words[1], "scripts/run-vitest-gate.mjs")
+    ) {
+      return true;
+    }
     if (basename(words[0] ?? "") === "vitest") {
       return words.length === 1 || (words.length === 2 && words[1] === "run");
     }

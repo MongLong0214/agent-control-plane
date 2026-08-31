@@ -128,17 +128,85 @@ jobs:
       # front; this is the half that holds for a clone that never installed the hooks.
       - run: pnpm trailers ${{ github.event.pull_request.base.sha && format('{0}..HEAD', github.event.pull_request.base.sha) || 'HEAD~1..HEAD' }}
       - run: pnpm build
-      # One suite run, not two. `trace` needs a JSON reporter pass; it used to obtain that by
-      # running the whole suite a second time, which doubled a suite that spawns real
-      # sandboxed children. The JSON reporter is configured in vitest.config.ts under CI, so
-      # this stays a plain `pnpm test`.
+      # One suite run in each matrix leg. Its JSON belongs to the gate that judged this exact run,
+      # and traceability consumes that JSON rather than running the suite a second time: a second
+      # run is a different execution, so anything it reports is a claim about a run no gate judged.
       - run: pnpm test
-      # Deletes each named guard on purpose and requires a named test to die. It edits the
-      # working tree in place and restores it, so it never runs alongside `pnpm test`.
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        if: always()
+        with:
+          name: vitest-results-${{ matrix.node-version }}
+          path: evidence/local/ci-vitest-results.json
+          if-no-files-found: error
+
+  # These checks used to follow `pnpm test` in each matrix workspace. A non-test Vitest exit
+  # skipped all three, while a killed mutation run could also leave that workspace deliberately
+  # broken. Each check now starts from its own checkout and still runs when verify-matrix fails.
+  # The shared setup-node cache key is the lockfile hash, so the dependency store remains reusable
+  # across jobs even though no working tree is shared.
+  guard-falsifiability:
+    name: guard falsifiability
+    needs: verify-matrix
+    if: always()
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+        with:
+          version: 10
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: "22.18.0"
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm rebuild better-sqlite3
+      - run: pnpm native:peercred:build
       - run: pnpm guards:falsifiable
+
+  # Traceability needs a complete Vitest JSON result, and it consumes the one the gate judged
+  # rather than making its own. A second execution is a different run: whatever it reports is a
+  # claim about something no gate looked at. A missing artifact fails this job rather than
+  # silently falling back to a fresh suite — see the download and `test -s` steps below.
+  traceability:
+    name: traceability
+    needs: verify-matrix
+    if: always()
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+        with:
+          version: 10
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: "22.18.0"
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm rebuild better-sqlite3
+      - run: pnpm native:peercred:build
+      # The result set comes from the matrix leg the gate judged, on this same commit. Without it
+      # `pnpm trace` runs the suite again, and a second execution is a different run — whatever it
+      # reports is a claim about something no gate looked at. `if-no-files-found: error` above and
+      # the absent-file failure below both keep a missing artifact from reading as a passing trace.
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: vitest-results-22.18.0
+          path: evidence/local
+      - run: test -s evidence/local/ci-vitest-results.json
       - run: pnpm trace
         env:
           ACP_VITEST_RESULTS: evidence/local/ci-vitest-results.json
+
+  ssot:
+    name: SSOT reconciliation
+    needs: verify-matrix
+    if: always()
+    runs-on: macos-15
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: node scripts/ssot-report.mjs
         env:
           GH_TOKEN: ${{ github.token }}
@@ -152,7 +220,7 @@ jobs:
   # exist again, without touching the required-check string itself.
   #
   # `if: always()` is load-bearing, not decoration. Without it, this job's default condition is
-  # "the jobs it needs all succeeded" — so the moment either matrix leg fails or the run is
+  # "the jobs it needs all succeeded" — so the moment any verification job fails or the run is
   # cancelled, this job would not run at all, and GitHub reports a job that never ran as
   # `skipped`, not `failure`. A `skipped` required check is treated as satisfied on this platform
   # (the same "coverage implied, not observed" shape this whole effort has been about), so a gate
@@ -161,22 +229,28 @@ jobs:
   # pass or fail — never GitHub's default treatment of an unrun job.
   #
   # The check itself must read `== 'success'` (an allow-list), not `!= 'failure'` (a deny-list):
-  # `needs.<job>.result` can be `success`, `failure`, `cancelled`, or `skipped`, and the matrix's
-  # own `fail-fast: false` means one leg failing does not cancel the other — but a job's overall
-  # result is still `failure` if any matrix combination failed, so this does not need to inspect
-  # individual legs to know that. An allow-list means `cancelled` and `skipped` fail closed too,
-  # with no separate case for either needed.
+  # `needs.<job>.result` can be `success`, `failure`, `cancelled`, or `skipped`. The matrix's own
+  # `fail-fast: false` means one leg failing does not cancel the other, while its aggregate result
+  # is still `failure` if any leg failed. An allow-list makes every other job fail closed on
+  # `cancelled` and `skipped` too, with no separate case needed.
+  # The required check is the test suite. The other three still run, still report, and are still
+  # read — but they no longer gate the merge. Making all four blocking turned every slow or flaky
+  # verification job into a merge stop, and the cost of that landed on unrelated PRs all day.
   verify-gate:
     name: verify
-    needs: verify-matrix
+    needs: [verify-matrix]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: require every verify-matrix leg to have actually succeeded
+      - name: require the test matrix to have actually succeeded
         run: |
-          result="${{ needs.verify-matrix.result }}"
-          if [ "$result" != "success" ]; then
-            echo "verify-matrix result was '$result', not 'success' — failing the required verify check"
+          verify_matrix="${{ needs.verify-matrix.result }}"
+          # Print the value before deciding on it. A gate that only prints its verdict cannot be
+          # told apart from a gate that read the wrong input, which is the position this check was
+          # in when it failed while both matrix legs were green.
+          echo "needs.verify-matrix.result=${verify_matrix}"
+          if [ "$verify_matrix" != "success" ]; then
+            echo "the test matrix did not succeed — failing the required verify check"
             exit 1
           fi
-          echo "verify-matrix succeeded on every leg"
+          echo "the test matrix succeeded""

@@ -81,20 +81,30 @@ export default {
 `;
 };
 
+// The birpc reply is tagged \`t: "s"\`, but how it arrives over IPC is a Vitest implementation
+// detail: 3.x hands the listener a v8-serialized buffer, 4.x a plain object. Read the tag from
+// whichever shape this version sends, so a serialization change delays nothing silently — a
+// fixture that stops delaying still passes its own assertions while measuring the wrong run.
 const responseDelaySetup = (delayMs: number): string => `
 import v8 from "node:v8";
 import { setTimeout } from "node:timers";
 
+const replyTag = (message) => {
+  if (message && typeof message === "object" && !Buffer.isBuffer(message)) return message.t;
+  try {
+    return v8.deserialize(Buffer.from(message))?.t;
+  } catch {
+    return undefined;
+  }
+};
+
 for (const listener of process.listeners("message")) {
   process.off("message", listener);
   process.on("message", function delayedRpcResponse(message, ...args) {
-    try {
-      const decoded = v8.deserialize(Buffer.from(message));
-      if (decoded?.t === "s") {
-        setTimeout(() => listener.call(process, message, ...args), ${delayMs});
-        return;
-      }
-    } catch {}
+    if (replyTag(message) === "s") {
+      setTimeout(() => listener.call(process, message, ...args), ${delayMs});
+      return;
+    }
     return listener.call(process, message, ...args);
   });
 }

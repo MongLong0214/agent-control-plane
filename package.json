@@ -5,7 +5,7 @@
   "description": "Single local runtime authority that turns managed project intent into verified production-ready results",
   "type": "module",
   "engines": {
-    "node": ">=22.18.0"
+    "node": "^22.18.0 || >=24"
   },
   "bin": {
     "agentctl": "./dist/cli/agentctl.js",
@@ -16,7 +16,7 @@
     "postinstall": "node scripts/build-native-peercred.mjs",
     "build": "tsc -p tsconfig.build.json && cp src/db/schema.sql dist/db/schema.sql",
     "typecheck": "tsc --noEmit",
-    "test": "node scripts/verify-v1-experiment-isolation-declaration.mjs && vitest run",
+    "test": "node scripts/verify-v1-experiment-isolation-declaration.mjs && node scripts/run-vitest-gate.mjs",
     "test:unit": "vitest run tests/unit",
     "test:scenarios": "vitest run tests/scenarios",
     "test:e2e": "vitest run tests/e2e --testTimeout=600000",
@@ -79,6 +79,6 @@
     "node-gyp": "11.5.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3",
-    "vitest": "^3.0.2"
+    "vitest": "4.1.11"
   }
 }
