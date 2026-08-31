@@ -1,6 +1,6 @@
 # Owner actions — prepared up to the line
 
-Three items need the owner. Each is prepared as far as it can be without them; what remains is
+Four items need the owner. Each is prepared as far as it can be without them; what remains is
 stated as commands rather than description. Ordered by what they unblock.
 
 Every path and variable below was read out of the code, not inferred. Where I am recommending
@@ -150,6 +150,260 @@ than copied from a document written before them.
 
 `docs/ACCEPTANCE.md` carries the window start, duration, three project names and five zero
 counts with the telemetry queries that produced them.
+
+---
+
+## 4. Reconcile the deployed daemon with candidate main — blocks #512
+
+The first dogfood run cannot mean anything until the daemon that ran it is a known quantity.
+This is not "reconcile a drifted database" — the running process and its database agree with
+each other. What is broken is that the checked-out source at the deployment path has moved past
+what was ever built and restarted there, and nothing running today would tell you that on its
+own.
+
+### Why it is needed
+
+Four numbers describe one deployment, and only two of them agree:
+
+    running dist + live DB     25   these two agree with each other
+    checked-out source         30   at the same path, but not what is loaded
+    candidate / main           34   b683176, as observed while drafting (re-pin before executing)
+
+The live migration ledger's last five rows (`bootstrap-v20` through `v25-sources-name-admitted-
+messages`) all landed within 85 ms of the daemon's own `startedAt`, and nothing has landed since.
+`Db.applySchema` (`src/db/database.ts:328-363`) only calls `migrate()` when the on-disk version
+differs from the build's `SCHEMA_VERSION`, walks the chain in one pass to exactly
+`SCHEMA_VERSION`, and returns without touching the ledger once `version === SCHEMA_VERSION`
+(`:353`). A run that starts at 20 and stops dead at 25 is only possible if the running build's own
+`SCHEMA_VERSION` constant is 25 — so **the running bytes declare 25**, matching the live database.
+That conclusion is reconstructed from ledger timestamps, not read back from anything self-
+reporting; see the health.json gap below.
+
+The checked-out source at the deployment path (`686281a897c44937bd40e1759decd95b76d63f49`, clean)
+declares `SCHEMA_VERSION = 30` — introduced by `0da07459e36feafb1123523ba94d366dfca6cd6b`
+("fix: a merge commit carries what the branch recorded…", 2026-08-22T15:08:12+09:00). The running
+`dist/daemon/agentcpd.js` has an mtime roughly ten hours *earlier* than that commit, so it was
+never built from it: **the checkout does not describe what is running**, and rebuilding it in
+place — for any reason, by anyone — changes that instantly (see "Do not execute" below). Candidate
+main (`b683176`) is a further four versions ahead, at 34.
+
+So "migrate v25 → v34" only names one operation if the code that performs it is pinned to the
+candidate SHA at the moment it runs, not to whatever happens to be checked out. Item 3 pins that.
+
+**Limitation this packet cannot close:** `health.json` carries `pid`, `startedAt`, `at`,
+`continuityMode`, `mode`, `blockingFindings`, `lockHeld`, `runs`, `lastReconcile` and
+`timerHealth` — no build SHA, no `SCHEMA_VERSION`, no binary digest. Nothing the running process
+exposes over the operator socket or the state directory attests to its own identity. The 25
+above is forensics (ledger-timing correlation), not a readback, and a `shasum` of `dist/` after
+the fact only proves what bytes sit on disk *now* — it says nothing about what a given `pid`
+loaded at its own start unless nobody has touched the file since. A minimal fix — `agentcpd`
+recording `{ schemaVersion, entrySha256 }` in `health.json` once, at the top of its own startup,
+before it does anything else — would close both this gap and item 5's below. That is a real
+change and does not belong in this document; it is filed here as a limitation, not implemented.
+
+### Command
+
+**1. Pin identity — measurement only, changes nothing.**
+
+    git -C /Users/isaac/projects/agent-control-plane rev-parse HEAD
+    git -C /Users/isaac/projects/agent-control-plane status --porcelain
+    grep -n "SCHEMA_VERSION = " /Users/isaac/projects/agent-control-plane/src/db/migrations.ts
+    stat -f '%Sm' /Users/isaac/projects/agent-control-plane/dist/daemon/agentcpd.js \
+      /Users/isaac/projects/agent-control-plane/dist/db/migrations.js
+    sqlite3 "$HOME/.agent-control-plane/state.sqlite" \
+      "select version, migration_id, applied_at from schema_migrations order by version;"
+    cat "$HOME/.agent-control-plane/health.json"
+
+Compare the `applied_at` column against `startedAt` in `health.json`: if the top rows cluster
+within about a second of `startedAt` and stop, that run's own `SCHEMA_VERSION` is exactly the
+version it stopped at — the same reasoning that produced the 25 above, done fresh, because the
+numbers in this document age from the moment they were written.
+
+**2. Back up both halves — database and bytes. Neither backup exists in any tool already here.**
+
+Database, using the existing maintenance CLI, then a readback that proves it is good:
+
+    node /Users/isaac/projects/agent-control-plane/dist/db/state-admin.js backup \
+      --database "$HOME/.agent-control-plane/state.sqlite" | tee /tmp/acp-512-backup.json
+    BACKUP_PATH="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync("/tmp/acp-512-backup.json","utf8")).backup.path)')"
+    shasum -a 256 "$BACKUP_PATH"
+    cat "$BACKUP_PATH.manifest.json"
+    sqlite3 "$BACKUP_PATH" "PRAGMA integrity_check;"
+
+Good means: the `shasum` output matches the manifest's `databaseSha256`, and `integrity_check`
+returns `ok`. `backupDatabase` (`src/db/backup.ts`) opens the source readonly and never invokes
+`Db`, so this is safe to run against the live daemon exactly as it stands, before anything else
+changes.
+
+Bytes — nothing in `deploy/install-launchd.sh` snapshots `dist/`; `snapshot_current_deployment`
+only copies the plist and the launcher shell script (`deploy/install-launchd.sh:143-155`), and
+that function only runs from the `install`/`upgrade` subcommands, which this procedure does not
+use (the app root and node path are not changing — only the tree's contents are). Without this
+step, "roll back the bytes" in item 6 would have nothing to restore to, since rebuilding from any
+git commit produces new bytes, not the ones that were actually running:
+
+    BYTES_BACKUP="$HOME/.agent-control-plane/deploy-backups/dist-pre-512-$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "$BYTES_BACKUP" && chmod 700 "$BYTES_BACKUP"
+    cp -a /Users/isaac/projects/agent-control-plane/dist "$BYTES_BACKUP/dist"
+    shasum -a 256 /Users/isaac/projects/agent-control-plane/dist/daemon/agentcpd.js | tee "$BYTES_BACKUP/agentcpd.js.sha256"
+
+**3. Stop the job, then rebuild the candidate, then validate on a throwaway copy — never the
+live file.**
+
+`RunAtLoad` is `true` and `KeepAlive` is `{ SuccessfulExit = false }` with a 30 s
+`ThrottleInterval` (`deploy/com.agentcontrolplane.agentcpd.plist.template`). Rebuilding `dist/` in
+place while the job is still loaded means the *next* crash or reboot — not the next command —
+migrates the live database to whatever the rebuild declares, with no approval gate anywhere in
+that path (`Db`'s constructor calls `migrate()` unconditionally, `src/db/database.ts:362`).
+Stopping first removes the job from launchd's supervision entirely until it is explicitly
+started again, which is the only thing in this repository that closes that window:
+
+    bash /Users/isaac/projects/agent-control-plane/deploy/install-launchd.sh stop
+    for i in $(seq 1 30); do [ -e "$HOME/.agent-control-plane/agentcpd.lock" ] || break; sleep 1; done
+    [ -e "$HOME/.agent-control-plane/agentcpd.lock" ] && echo "STILL LOCKED — stop before proceeding"
+
+(Plain `stop` does not wait for the lock the way `install`/`upgrade`/`rollback` do internally —
+`deploy/install-launchd.sh:349-351` versus `:340` — so this loop is written out rather than
+assumed.)
+
+With the job stopped, re-pin and rebuild the candidate (see item 8 — this SHA must be re-verified
+right before this line, not copied from this document):
+
+    git -C /Users/isaac/projects/agent-control-plane fetch origin
+    git -C /Users/isaac/projects/agent-control-plane checkout <RE-PINNED CANDIDATE SHA>
+    ( cd /Users/isaac/projects/agent-control-plane && pnpm install && pnpm rebuild better-sqlite3 && pnpm build )
+    grep -n "SCHEMA_VERSION = " /Users/isaac/projects/agent-control-plane/src/db/migrations.ts
+
+Then validate the exact code that is about to run, against a disposable copy of the item-2
+backup:
+
+    DRY_DIR="$(mktemp -d)"; DRY="$DRY_DIR/dry-run.sqlite"
+    cp "$BACKUP_PATH" "$DRY"
+    node --input-type=module -e '
+      import { openDb, SCHEMA_VERSION } from "/Users/isaac/projects/agent-control-plane/dist/db/database.js";
+      const db = openDb(process.argv[1]);
+      console.log(JSON.stringify({
+        schemaVersion: SCHEMA_VERSION,
+        userVersion: Number(db.raw.pragma("user_version", { simple: true })),
+      }));
+    ' "$DRY"
+    rm -rf "$DRY_DIR"
+
+Expect `{"schemaVersion":34,"userVersion":34}` (or whatever `SCHEMA_VERSION` main declares by
+execution day). This drives the real migration code (`Db.applySchema` → `Db.migrate`,
+`src/db/database.ts:328-441`), not a re-implementation of it, because it is the same compiled
+file the daemon is about to load.
+
+**What a failure looks like — not just the success path.** `migrate()` takes exactly one backup,
+before the first step in the chain (`backupOpenDatabaseSync`, `:401-405`), and the `catch` block
+restores from that same single backup regardless of which step in the chain threw
+(`restoreMigrationBackup(filename, backup)`, `:422`, closing over the one `backup` bound at
+`:401`) — so **a failure anywhere in a 25→34 run restores to 25, not to whatever intermediate
+version it reached.** The thrown message is exactly `"migration failed; the original database was
+restored from its automatic backup"` (`:435-439`), or, if even that restore fails, `"migration
+failed and the automatic backup could not be restored"` (`:424-434`). This is not hypothetical:
+`tests/unit/database-migration-restore.test.ts:828` ("restores the original v11 database when a
+fault is injected after a migration commits") drives exactly this path today and asserts that
+message. The ordered chain from 25 to 34 was confirmed contiguous while preparing this packet —
+nine steps, `fromVersion`/`toVersion` running 25→26→27→28→29→30→31→32→33→34 with no gap in
+`src/db/migrations.ts`, and `tests/unit/database-migration-restore.test.ts:588` already asserts
+`MIGRATIONS.map(m => m.fromVersion)` equals `MIGRATIONS.map(m => m.toVersion - 1)` for the whole
+registry — so a failure here on execution day would be a genuinely new defect in one of those
+nine steps, not a missing link this packet failed to notice.
+
+If the dry run throws either message: stop. Do not proceed to item 4. File which migration step
+failed and treat it as a blocker on this packet, not something to retry past.
+
+**4. Start the job — this is the real migration, under supervision, not a dry run.**
+
+    bash /Users/isaac/projects/agent-control-plane/deploy/install-launchd.sh start
+
+The first `Db` the new process opens finds `state.sqlite` at 25 and a build declaring 34, and
+`applySchema` runs the real chain, protected by its own internal backup exactly as validated in
+item 3. Watch it for the first 60–90 s (`ThrottleInterval` is 30 s): if it is not stable by then,
+treat it as crash-looping and go straight to item 6 rather than waiting longer.
+
+**5. Post-restart readback.**
+
+    sqlite3 "$HOME/.agent-control-plane/state.sqlite" "select max(version) from schema_migrations;"
+    cat "$HOME/.agent-control-plane/health.json"
+    shasum -a 256 /Users/isaac/projects/agent-control-plane/dist/daemon/agentcpd.js
+
+Expect: `max(version)` is 34; `health.json` shows a new `pid` and `startedAt`, `lockHeld: true`,
+and no new `blockingFindings`; the `shasum` matches the hash taken right after the build in item
+3. That last line carries the same caveat as item 1's identity read: it proves what is on disk
+now equals what was built, not that the new `pid` attests to it — nothing here does, per the
+limitation above.
+
+**6. Rollback — one joint operation. A byte-only or database-only rollback is unsafe by
+construction.**
+
+    bash /Users/isaac/projects/agent-control-plane/deploy/install-launchd.sh stop
+    for i in $(seq 1 30); do [ -e "$HOME/.agent-control-plane/agentcpd.lock" ] || break; sleep 1; done
+    rm -rf /Users/isaac/projects/agent-control-plane/dist
+    cp -a "$BYTES_BACKUP/dist" /Users/isaac/projects/agent-control-plane/dist
+    node /Users/isaac/projects/agent-control-plane/dist/db/state-admin.js restore "$BACKUP_PATH" \
+      --database "$HOME/.agent-control-plane/state.sqlite" --confirm-restore
+    bash /Users/isaac/projects/agent-control-plane/deploy/install-launchd.sh start
+
+Restoring only the database and leaving 34-declaring bytes in place is nearly harmless — a build
+opening a database *older* than itself just migrates forward again, reproducing the state being
+rolled back from. Restoring only the bytes and leaving the database at 34 is not: `applySchema`
+refuses a database newer than the running build outright — `"database schema is newer than this
+build"` (`src/db/database.ts:335-341`) — and with `KeepAlive.SuccessfulExit = false` and a 30 s
+`ThrottleInterval`, launchd retries that failure forever. Both restores must complete, in either
+order, while the job is stopped, before the next `start`.
+
+### What it creates
+
+A database backup and manifest under `~/.agent-control-plane/backups/` (item 2); a `dist/`
+snapshot and its hash under `~/.agent-control-plane/deploy-backups/` (item 2); nine new rows in
+`schema_migrations`, versions 26 through 34, each with a `sha256:` receipt (item 4, on success);
+an updated `~/.agent-control-plane/health.json` with a new `pid` and `startedAt` (item 4). Nothing
+in `deploy/` or this repository is modified — every write lands under the operator's own state
+directory or the deployment checkout the owner already controls.
+
+### Which identity
+
+The owner's own macOS account — the account that already owns `~/Library/LaunchAgents`,
+`~/.agent-control-plane`, and the `/Users/isaac/projects/agent-control-plane` checkout. No
+separate service account exists or is proposed; `launchctl bootstrap`/`bootout` operate in the
+`gui/$(id -u)` domain, which is this account's own login session.
+
+### Where it applies
+
+The live host only: `/Users/isaac/projects/agent-control-plane` (the deployment checkout) and
+`~/.agent-control-plane` (the state directory). Nothing here touches this worktree, this branch,
+or `origin`.
+
+### Do not execute before Isaac's approval, on the day it is executed
+
+This gate is not satisfied by simply not typing the start command. `RunAtLoad` and
+`KeepAlive{SuccessfulExit = false}` mean the daemon restarts itself, unattended, on any crash or
+reboot — and `Db`'s migration runs with no confirmation prompt, no flag and no operator token the
+moment the on-disk version disagrees with the build. **Rebuilding the candidate in item 3 is
+already inside the blast radius this line gates**, because the instant that build lands in
+`/Users/isaac/projects/agent-control-plane/dist/`, an unrelated crash or a routine reboot —
+someone else's, not this procedure's — performs the migration with nobody having approved it. If
+a rebuild happens there for any other reason before Isaac has approved execution, stop the job
+immediately (item 3's `install-launchd.sh stop` command) and treat items 3 through 5 as already
+armed, not as something to defer casually.
+
+### What makes this packet stale
+
+1. **`dist/daemon/agentcpd.js` or `dist/db/migrations.js` under the deployment checkout has a
+   newer mtime than what item 1 recorded.** Someone rebuilt the tree — the more likely trigger,
+   because that tree is the launchd job's `WorkingDirectory` and nothing gates a build the way
+   this document gates a migration. Re-run item 1 before touching anything else.
+2. **`origin/main`'s HEAD is no longer the SHA pinned in item 1/3.** Re-derive it with
+   `git -C /Users/isaac/projects/agent-control-plane fetch origin && git -C … rev-parse
+   origin/main` immediately before item 3, not from this document — main was observed moving
+   during the drafting of this very packet.
+3. **`select max(version) from schema_migrations` on the live database is no longer 25.**
+   Either this packet already ran, or the standing hazard in item 7 already fired somewhere else.
+   Stop and re-derive the whole packet; do not assume which case it is.
+4. **`SCHEMA_VERSION` in `src/db/migrations.ts` on main is no longer 34.** A new migration landed;
+   the chain-contiguity check and the dry-run target in item 3 must be redone against it.
 
 ---
 
