@@ -221,19 +221,132 @@ numbers in this document age from the moment they were written.
 
 **2. Back up both halves — database and bytes. Neither backup exists in any tool already here.**
 
-Database, using the existing maintenance CLI, then a readback that proves it is good:
+Database — using SQLite's own **online backup API** through the `sqlite3` CLI, not the
+maintenance CLI's `backup` subcommand. That subcommand loads `better-sqlite3`
+(`src/db/database.ts:1`), and a fresh `node` process run for this procedure cannot load its
+native binding — the daemon loaded it once at its own start, and rebuilding the binding here
+(before item 3 stops the job) is exactly the thing the "do not execute" gate below exists to
+prevent. Measured on this host: `sqlite3` is **3.51.0**, which has `.backup ?DB? FILE`, and the
+live database's `journal_mode` is `delete`. A raw `cp` of a live database can copy a file mid
+write; the online backup API is built for exactly this and needs nothing stopped to be safe. So
+there is no `cp` here, and no fallback to one.
 
-    node /Users/isaac/projects/agent-control-plane/dist/db/state-admin.js backup \
-      --database "$HOME/.agent-control-plane/state.sqlite" | tee /tmp/acp-512-backup.json
-    BACKUP_PATH="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync("/tmp/acp-512-backup.json","utf8")).backup.path)')"
-    shasum -a 256 "$BACKUP_PATH"
+This block was rewritten after running the previous version against the real host and watching
+it fail silently: the `node` step above threw, `BACKUP_PATH` came out empty, and
+`sqlite3 "" "PRAGMA integrity_check;"` opened a throwaway temporary database and printed `ok` —
+a real command, a real `ok`, and no backup at all. Every step below exists to make that specific
+shape unreachable: `sqlite3` is never invoked against a path that has not already been proven
+non-empty, absolute, and a real file.
+
+<!-- owner-actions:database-backup:start -->
+
+    set -euo pipefail
+
+    SOURCE_DB="$HOME/.agent-control-plane/state.sqlite"
+
+    # 1. Identity of the source, established before anything reads or copies it.
+    if [ -z "$SOURCE_DB" ] || [ -L "$SOURCE_DB" ]; then
+      echo "refusing: SOURCE_DB is empty or a symlink" >&2; exit 1
+    fi
+    test -f "$SOURCE_DB"
+    test -r "$SOURCE_DB"
+    test -s "$SOURCE_DB"
+    SOURCE_SIZE="$(stat -f '%z' "$SOURCE_DB")"
+    SOURCE_INODE="$(stat -f '%i' "$SOURCE_DB")"
+    SOURCE_MTIME="$(stat -f '%Sm' "$SOURCE_DB")"
+    SOURCE_USER_VERSION="$(sqlite3 -readonly "$SOURCE_DB" 'PRAGMA user_version;')"
+    echo "source: size=$SOURCE_SIZE inode=$SOURCE_INODE mtime=$SOURCE_MTIME user_version=$SOURCE_USER_VERSION"
+
+    # 2. An explicit new destination inside the owner-only backup directory. Refused here, before
+    #    the backup runs: empty, already existing, a symlink, or a missing parent all stop below.
+    BACKUP_DIR="$HOME/.agent-control-plane/backups"
+    mkdir -p "$BACKUP_DIR"
+    chmod 700 "$BACKUP_DIR"
+    if [ ! -d "$BACKUP_DIR" ] || [ -L "$BACKUP_DIR" ]; then
+      echo "refusing: $BACKUP_DIR is missing or not a plain directory" >&2; exit 1
+    fi
+    BACKUP_NAME="state-$(date -u +%Y%m%dT%H%M%SZ).sqlite"
+    BACKUP_PATH="$BACKUP_DIR/$BACKUP_NAME"
+    BACKUP_TMP="$BACKUP_DIR/.${BACKUP_NAME}.tmp-$$"
+    case "$BACKUP_PATH" in
+      /*) ;;
+      *) echo "refusing: backup path is not absolute" >&2; exit 1 ;;
+    esac
+    if [ -z "$BACKUP_PATH" ] || [ -e "$BACKUP_PATH" ] || [ -L "$BACKUP_PATH" ]; then
+      echo "refusing: $BACKUP_PATH is empty or already exists" >&2; exit 1
+    fi
+    if [ -z "$BACKUP_TMP" ] || [ -e "$BACKUP_TMP" ] || [ -L "$BACKUP_TMP" ]; then
+      echo "refusing: $BACKUP_TMP is empty or already exists" >&2; exit 1
+    fi
+
+    # 3. The backup itself: one `sqlite3` invocation, the online backup API, against the live
+    #    database exactly as it stands. Busy, error, or any nonzero exit stops here — there is no
+    #    raw-copy fallback for this command to fall back to.
+    sqlite3 -readonly "$SOURCE_DB" ".timeout 30000" ".backup '$BACKUP_TMP'"
+
+    # 4. Verify the artifact before trusting it further. `$SOURCE_DB` above and `$BACKUP_TMP` here
+    #    are the only two paths this block ever hands to `sqlite3`, and both are proven non-empty,
+    #    absolute, and a real file first — this is what makes `sqlite3 "" ...` unreachable. If any
+    #    check below fails, stop: do not call `sqlite3` again against this path.
+    if [ -z "$BACKUP_TMP" ]; then
+      echo "refusing: backup temp path is empty" >&2; exit 1
+    fi
+    case "$BACKUP_TMP" in
+      /*) ;;
+      *) echo "refusing: backup temp path is not absolute" >&2; exit 1 ;;
+    esac
+    if [ -L "$BACKUP_TMP" ]; then
+      echo "refusing: $BACKUP_TMP is a symlink" >&2; exit 1
+    fi
+    test -f "$BACKUP_TMP"
+    test -s "$BACKUP_TMP"
+
+    # 5. Integrity check — stdout must be exactly `ok`, and the command must exit 0. Both, not
+    #    either: a corrupt backup can still exit 0 with the wrong text, and a hung/busy one exits
+    #    nonzero under `set -e` before stdout is even compared.
+    INTEGRITY="$(sqlite3 -readonly "$BACKUP_TMP" 'PRAGMA integrity_check;')"
+    if [ "$INTEGRITY" != "ok" ]; then
+      echo "refusing: integrity_check on $BACKUP_TMP returned '$INTEGRITY', not ok" >&2; exit 1
+    fi
+
+    # 6. Manifest — the backup's own sha256, written and then re-verified from the file on disk,
+    #    not trusted from a shell variable alone. The rollback receipt below, and item 6, accept
+    #    only this exact, verified path.
+    BACKUP_SHA256="$(shasum -a 256 "$BACKUP_TMP" | cut -d' ' -f1)"
+    BACKUP_USER_VERSION="$(sqlite3 -readonly "$BACKUP_TMP" 'PRAGMA user_version;')"
+    cat > "${BACKUP_TMP}.manifest.json" <<JSON
+      { "format": "agent-control-plane.sqlite-backup/online-v1",
+        "sourcePath": "$SOURCE_DB",
+        "sourceSize": $SOURCE_SIZE,
+        "sourceInode": $SOURCE_INODE,
+        "sourceUserVersion": $SOURCE_USER_VERSION,
+        "backupPath": "$BACKUP_PATH",
+        "backupSha256": "$BACKUP_SHA256",
+        "backupUserVersion": $BACKUP_USER_VERSION,
+        "createdAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)" }
+    JSON
+    grep -q "\"backupSha256\": \"$BACKUP_SHA256\"" "${BACKUP_TMP}.manifest.json"
+    VERIFY_SHA256="$(shasum -a 256 "$BACKUP_TMP" | cut -d' ' -f1)"
+    if [ "$VERIFY_SHA256" != "$BACKUP_SHA256" ]; then
+      echo "refusing: re-hash of $BACKUP_TMP no longer matches the recorded sha256" >&2; exit 1
+    fi
+
+    # 7. Only now — every check above has passed — rename atomically to the final name. A failure
+    #    or interrupt anywhere above this line never leaves anything at $BACKUP_PATH for a later
+    #    step to mistake for a verified backup.
+    mv "$BACKUP_TMP" "$BACKUP_PATH"
+    mv "${BACKUP_TMP}.manifest.json" "${BACKUP_PATH}.manifest.json"
+    test -s "$BACKUP_PATH"
+    test -s "$BACKUP_PATH.manifest.json"
+    echo "backup verified: $BACKUP_PATH"
     cat "$BACKUP_PATH.manifest.json"
-    sqlite3 "$BACKUP_PATH" "PRAGMA integrity_check;"
 
-Good means: the `shasum` output matches the manifest's `databaseSha256`, and `integrity_check`
-returns `ok`. `backupDatabase` (`src/db/backup.ts`) opens the source readonly and never invokes
-`Db`, so this is safe to run against the live daemon exactly as it stands, before anything else
-changes.
+<!-- owner-actions:database-backup:end -->
+
+Good means the last two lines print — a manifest whose `backupSha256` was independently
+recomputed twice and a path that survived the atomic rename. Nothing before that line does, and
+`$BACKUP_PATH` is the only value the rest of this document may treat as a verified backup: not a
+value parsed from a file that might not have been written, and not a value that might be empty.
 
 Bytes — nothing in `deploy/install-launchd.sh` snapshots `dist/`; `snapshot_current_deployment`
 only copies the plist and the launcher shell script (`deploy/install-launchd.sh:143-155`), and

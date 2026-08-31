@@ -3287,6 +3287,40 @@ const GUARDS = [
     killedBy: ["tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts"],
   },
   {
+    // #512: the database-backup step in item 4 step 2 replaced `state-admin.js backup` (which
+    // needs a `better-sqlite3` binding a fresh `node` process cannot load) with SQLite's own
+    // online backup API. Executing the old text against the real host produced an empty
+    // `BACKUP_PATH` and `sqlite3 "" "PRAGMA integrity_check;"` printed `ok` — a real command, a
+    // real success exit, and no backup at all. This row deletes the destination guard that makes
+    // that shape unreachable (empty / already-exists / symlink), leaving the `mv` at the end free
+    // to silently overwrite whatever already sits at the deterministic destination name — exactly
+    // the "destination already exists" counterexample the named test drives.
+    what: "the database backup step refuses an already-existing destination before writing anything",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    if [ -z "$BACKUP_PATH" ] || [ -e "$BACKUP_PATH" ] || [ -L "$BACKUP_PATH" ]; then\n' +
+      '      echo "refusing: $BACKUP_PATH is empty or already exists" >&2; exit 1\n' +
+      "    fi\n",
+    replace: "",
+    killedBy: ["tests/process/the-database-backup-step-fails-closed.test.ts"],
+  },
+  {
+    // #512, second guard on the same block: exit code alone does not prove the backup is good —
+    // the reported defect was exactly a command that exited 0 while proving nothing. Deleting the
+    // content comparison (keeping only a nonzero-exit check would still be satisfied by a stub
+    // that prints the wrong text and exits 0) reproduces that shape for the destination file
+    // instead of the empty path, and the named test's "bad integrity" fixture — a `sqlite3` stub
+    // that answers every `integrity_check` with `malformed` at exit 0 — catches it.
+    what: "the database backup step requires integrity_check stdout to be exactly ok, not just exit 0",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    if [ "$INTEGRITY" != "ok" ]; then\n' +
+      '      echo "refusing: integrity_check on $BACKUP_TMP returned \'$INTEGRITY\', not ok" >&2; exit 1\n' +
+      "    fi\n",
+    replace: "",
+    killedBy: ["tests/process/the-database-backup-step-fails-closed.test.ts"],
+  },
+  {
     // #241 — the whole point of the acceptance readout. Forcing `observed` to true makes an
     // empty database compute accepted anomalies (all zero) and report OBSERVED_NO_ANOMALIES
     // instead of N/A: exactly the "0/PASS" shape the CEO ruling named as worse than the ceremony
