@@ -253,4 +253,4 @@ jobs:
             echo "the test matrix did not succeed — failing the required verify check"
             exit 1
           fi
-          echo "the test matrix succeeded""
+          echo "the test matrix succeeded"
