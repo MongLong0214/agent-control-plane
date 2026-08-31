@@ -55,6 +55,19 @@ pnpm trace
 node scripts/ssot-report.mjs
 ```
 
+Before a push, run the whole thing CI runs:
+
+```bash
+pnpm gates
+```
+
+That is the CI `verify` job's gate sequence — every check, in its order, stopping at the first
+failure and printing each gate's exit code. It is not a local approximation of that job: the
+sequence lives in [`scripts/lib/prepush-gates.mjs`](scripts/lib/prepush-gates.mjs), the workflow
+invokes the same runner, and `pnpm gates:ci-parity` (itself one of the gates) fails the build if
+either side ever holds a gate the other does not. About three minutes; the structural checks that
+catch most mistakes are done in twenty seconds.
+
 `pnpm install` also builds `native/peercred` (Darwin only, no-op elsewhere) via its own
 `postinstall` script — see ADR-0010. `pnpm rebuild better-sqlite3` stays a separate, explicit
 step above because the same pnpm build-approval gate that requires it for that dependency does

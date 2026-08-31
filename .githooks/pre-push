@@ -8,6 +8,13 @@
 # The full sweep is over an hour and is not a pre-push check; the anchors pass is a string search
 # and is. It cannot tell you a guard is tested. It can tell you a row stopped checking anything,
 # which is what CI failed on.
+#
+# What this hook deliberately does *not* run is `pnpm gates` — the whole CI gate set, about three
+# minutes (#739). It is three minutes because it includes the suite, and a hook that costs that on
+# every push to a work-in-progress branch is a hook people remove. Run it yourself before a push
+# you expect to be reviewed: it is the same manifest and the same executor CI uses, so a green
+# `pnpm gates` is the answer CI would give, and #736's `pnpm lint` failure arrives in five seconds
+# instead of after a push and a wait.
 set -e
 if ! node scripts/verify-guards-are-falsifiable.mjs --anchors-only; then
   echo "pre-push: a falsifiability row no longer names a line that exists." >&2

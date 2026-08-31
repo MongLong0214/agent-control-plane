@@ -30,6 +30,8 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { GATES } from "./lib/prepush-gates.mjs";
+
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const asJson = process.argv.includes("--json");
 
@@ -244,6 +246,22 @@ const workflowRuns = readdirSync(workflowsDir)
   .flatMap((name) =>
     extractRunCommands(readFileSync(join(workflowsDir, name), "utf8"), `.github/workflows/${name}`),
   );
+
+/**
+ * #739 collapsed twenty `run:` steps into one `pnpm gates`, and the gate set moved into a data
+ * file. That is a command site this scan has to read, or it stops seeing everything CI runs
+ * through the runner — `pnpm test` first, which is what makes a test-spawn site "CI-selected".
+ * Measured: the moment the workflow stopped saying `pnpm test` in so many words,
+ * `verify-tx-denial-sites.mjs` lost its only plausible caller and this census failed.
+ *
+ * The manifest is read as the commands it is, not parsed out of YAML — that direction is exactly
+ * what #739 rejected.
+ */
+const gateManifestRuns = GATES.map((gate) => ({
+  source: "scripts/lib/prepush-gates.mjs",
+  command: `pnpm ${gate.script}`,
+}));
+workflowRuns.push(...gateManifestRuns);
 
 /** Follow the plausible graph direction: workflow-named package script -> aliases its command names. */
 const plausiblyCiRoutedPackageScripts = new Set();

@@ -537,6 +537,11 @@ export const ReasonCode = {
   DOCTOR_DEGRADED: "DOCTOR_DEGRADED",
   DOCTOR_BLOCKED: "DOCTOR_BLOCKED",
   DOCTOR_ERROR: "DOCTOR_ERROR",
+  // #734 — a persisted doctor verdict compared against the clock, and against whether the most
+  // recent attempt to refresh it landed at all. Neither is a fifth `DoctorStatus`; both are
+  // read at the layer that decides whether the report is still good enough to hand to a reader.
+  DOCTOR_HEALTH_STALE: "DOCTOR_HEALTH_STALE",
+  DOCTOR_HEALTH_UNKNOWN: "DOCTOR_HEALTH_UNKNOWN",
   CANDIDATE_PIPELINE_ATTEMPT_STALE: "CANDIDATE_PIPELINE_ATTEMPT_STALE",
   REPAIR_NOT_ALLOWLISTED: "REPAIR_NOT_ALLOWLISTED",
   REPAIR_PRECONDITION_UNMET: "REPAIR_PRECONDITION_UNMET",
@@ -602,6 +607,7 @@ export const STALENESS_REASON_CODES: ReadonlySet<ReasonCode> = new Set([
   ReasonCode.CAPACITY_SENSOR_FILE_STALE,
   ReasonCode.CEO_CONVERSATION_STALE,
   ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE,
+  ReasonCode.DOCTOR_HEALTH_STALE,
   ReasonCode.EVIDENCE_STALE,
   ReasonCode.FINALIZATION_ATTEMPT_STALE,
   ReasonCode.MERGE_BASE_STALE,
