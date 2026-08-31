@@ -110,4 +110,25 @@ describe("the admitted payload is write-once", () => {
 
     expect(JSON.parse(payloadOf(harness, "update:4243")!)).toEqual({ text: PROMPT, messageId: 7 });
   });
+
+  it("refuses an INSERT OR REPLACE, which rewrites the row without running an UPDATE trigger", () => {
+    const harness = makeHarness({ ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }] });
+    const { ingress } = ingressOver(harness);
+    expect(ingress.admit(updateFrom(4244, PROMPT), SECRET).allowed).toBe(true);
+
+    // The other half of write-once, and the half an UPDATE trigger cannot see: REPLACE deletes the
+    // row and inserts a new one. Without this the payload rule would read as enforced and be
+    // reachable — and so would the replay defence this whole table exists for, because a replaced
+    // row is a nonce that has never been seen. `pnpm schema:census` refuses a table guarded on one
+    // verb and open on the other, and named this one.
+    expect(() =>
+      harness.cp.db.run(
+        `INSERT OR REPLACE INTO inbound_messages (channel, nonce, actor, received_at, payload_json)
+         VALUES ('telegram', 'update:4244', ?, ?, ?)`,
+        [OWNER_ID, "2026-08-12T00:00:00.000Z", JSON.stringify({ text: "something else", messageId: 7 })],
+      ),
+    ).toThrow(/INBOUND_MESSAGE_NO_REPLACE/);
+
+    expect(JSON.parse(payloadOf(harness, "update:4244")!)).toEqual({ text: PROMPT, messageId: 7 });
+  });
 });
