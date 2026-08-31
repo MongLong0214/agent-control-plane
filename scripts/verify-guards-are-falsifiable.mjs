@@ -85,6 +85,20 @@ const vitestArgsFor = (killedBy) => {
 
 const GUARDS = [
   {
+    what: "ci preflight refuses a workflow pnpm command whose package script is missing",
+    file: "package.json",
+    find: '    "trace": "tsx src/tools/traceability.ts",\n',
+    replace: "",
+    killedBy: ["tests/process/ci-preflight.test.ts::accepts every repository workflow command"],
+  },
+  {
+    what: "ci preflight refuses an unmatched quote in a workflow run block",
+    file: ".github/workflows/ci.yml",
+    find: '          echo "the test matrix succeeded"',
+    replace: '          echo "the test matrix succeeded""',
+    killedBy: ["tests/process/ci-preflight.test.ts::accepts every repository workflow command"],
+  },
+  {
     // This is the one static outflow for the code. Its catalogue classification remains,
     // proving that membership metadata and prose cannot satisfy the outflow census.
     what: "every declared reason code has a verified static outflow",

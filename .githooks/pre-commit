@@ -1,5 +1,5 @@
 #!/bin/sh
-# Two things that went wrong repeatedly on 2026-08-19..22, made impossible rather than remembered.
+# Three things that went wrong repeatedly, made impossible rather than remembered.
 #
 # 1. The falsifiability harness edits guarded sources in place and restores them at the end. Its
 #    own start-up check asks "is the tree dirty?", which a *concurrent* commit passes trivially:
@@ -10,6 +10,9 @@
 # 2. Editing a line a mutation row anchors to leaves the row matching nothing, which means it
 #    checks nothing while still reporting the guard as covered. Three times on one branch, each
 #    found forty minutes into CI. The anchors pass is a string search and costs about a second.
+#
+# 3. A workflow can still parse as YAML while its `run:` block has invalid Bash, or can call a
+#    package script that a merge removed. Both used to become visible only after CI started.
 set -e
 
 SENTINEL="$(git rev-parse --git-dir)/verify-guards-in-flight.json"
@@ -17,6 +20,11 @@ if [ -e "$SENTINEL" ]; then
   echo "pre-commit: the falsifiability harness has a mutation applied." >&2
   echo "  $SENTINEL" >&2
   echo "Wait for it to finish, or reconcile that file by hand, before committing." >&2
+  exit 1
+fi
+
+if ! pnpm ci:preflight; then
+  echo "pre-commit: the workflow commands do not match the working tree." >&2
   exit 1
 fi
 

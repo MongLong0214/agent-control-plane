@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { delimiter, dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
@@ -62,6 +62,24 @@ const runLive = (env: NodeJS.ProcessEnv) =>
     encoding: "utf8",
     env: { ...process.env, ...env },
   });
+
+/** Derives a declaration-shaped witness from each non-JS language without pinning the corpus. */
+const declarationWitnessFor = (relativePath: string): string => {
+  const text = readFileSync(join(repoRoot, relativePath), "utf8");
+  const patterns: Record<string, RegExp> = {
+    ".py": /^\s*(?:(?:async\s+)?def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\b|^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=/gm,
+    ".sh": /^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{|^\s*([A-Za-z_][A-Za-z0-9_]*)=/gm,
+    ".sql": /\bCREATE\s+(?:TABLE|TRIGGER|INDEX|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?["`]?([A-Za-z_][A-Za-z0-9_]*)/gim,
+    ".yaml": /^\s*(?:-\s+)?([A-Za-z_][A-Za-z0-9_]*):(?:\s|$)/gm,
+    ".yml": /^\s*(?:-\s+)?([A-Za-z_][A-Za-z0-9_]*):(?:\s|$)/gm,
+  };
+  const pattern = patterns[extname(relativePath)];
+  expect(pattern, `no witness grammar for ${relativePath}`).toBeDefined();
+  const candidates = [...text.matchAll(pattern!)].map((match) => match.slice(1).find(Boolean)!);
+  const witness = candidates.at(-1);
+  expect(witness, `no declaration witness in ${relativePath}`).toBeDefined();
+  return witness!;
+};
 
 describe("verify-tracker-loci-resolve", () => {
   it("#649: finds the real citation #657 made stale — binding-registry.ts:163 no longer unconditionally mints", () => {
@@ -2400,25 +2418,17 @@ describe("verify-tracker-loci-resolve", () => {
         };
       });
 
-      const otherWitnesses: Record<string, string> = {
-        ".github/workflows/ci.yml": "result",
-        ".github/workflows/tracker-loci.yml": "GH_TOKEN",
-        "deploy/egress/allowlist-proxy.py": "ALLOWLIST_DIGEST",
-        "deploy/install-launchd.sh": "required_keychain_value",
-        "pnpm-lock.yaml": "zod",
-        "src/db/schema.sql": "sessions_incarnation_immutable",
-        "tests/fixtures/schema-v11.sql": "sessions_incarnation_immutable",
-      };
       const otherListed = spawnSync("git", ["ls-files", "*.py", "*.sh", "*.yaml", "*.yml", "*.sql"], {
         cwd: repoRoot,
         encoding: "utf8",
       });
       expect(otherListed.status).toBe(0);
-      expect(otherListed.stdout.split("\n").filter(Boolean).sort()).toEqual(Object.keys(otherWitnesses).sort());
-      const otherIssues: IssueFixture[] = Object.entries(otherWitnesses).map(([relPath, witness], index) => ({
+      const otherFiles = otherListed.stdout.split("\n").filter(Boolean);
+      expect(otherFiles.length).toBeGreaterThan(0);
+      const otherIssues: IssueFixture[] = otherFiles.map((relPath, index) => ({
         number: 96500 + index,
         title: `tracked non-JS corpus witness ${relPath}`,
-        body: `\`${witness}\` in \`${relPath}\``,
+        body: `\`${declarationWitnessFor(relPath)}\` in \`${relPath}\``,
       }));
 
       // The corpus held 259 tracked JS-family files after #718 and #721 merged. Keep 200 as a
@@ -2426,6 +2436,7 @@ describe("verify-tracker-loci-resolve", () => {
       // accidentally trivialized corpus must fail visibly.
       expect(jsFiles.length).toBeGreaterThan(200);
       expect(jsIssues).toHaveLength(jsFiles.length);
+      expect(otherIssues).toHaveLength(otherFiles.length);
       const { path, cleanup } = withIssues([...jsIssues, ...otherIssues]);
       try {
         const result = run(path);
