@@ -45,9 +45,25 @@ afterAll(cleanupTempDirs);
  *      them leaves a database with no manifest at the final path — not the verified pair the
  *      rest of this document treats `$BACKUP_PATH` as meaning.
  *
- * The corrected block claims the final name with `mkdir` (POSIX-atomic, fails `EEXIST` rather
- * than replacing) before either `mv`, and unwinds anything it already published if it does not
- * reach the end — so a partial publish leaves nothing at the final path at all.
+ * A second CEO review (#745, round 3) rejected the `mkdir`-reserve-then-release answer to those
+ * two, for one reason that produces both: a lock's lifetime is its critical section, while the
+ * artifact it protects — a published backup — outlives that section forever. Three more
+ * counterexamples follow from it, and each has its own case at the bottom of this file:
+ *
+ *   6. Delayed claim. A run that passed `[ -e "$BACKUP_PATH" ]` before another run published can
+ *      take the freed reservation afterwards and overwrite the published pair, never having
+ *      re-read the final name.
+ *   7. Untrappable death. `trap … EXIT` does not run on `SIGKILL` or power loss, so publishing the
+ *      database first can leave one at the final path with no manifest beside it. The existing
+ *      failure fixture only injects an ordinary nonzero return, which always reaches the trap.
+ *   8. A stranger's failure is not a stranger's deletion. Cleanup keyed to a released lock deletes
+ *      by name, and by then the name no longer records who owns it.
+ *
+ * The corrected block makes the final names themselves the claim, held permanently: `ln` is
+ * atomic and fails `EEXIST` rather than replacing (`mv -n` is not a substitute — neither the GNU
+ * nor the BSD implementation is race-free). The manifest is linked first and the database last,
+ * so `$BACKUP_PATH` is the commit marker and no untrappable death can leave a database without
+ * one; and cleanup unlinks only names this run created, only while that marker is absent.
  *
  * Safety: `HOME` is a disposable fixture directory for every case; nothing here reads or writes
  * `~/.agent-control-plane` or any real path.
@@ -169,6 +185,75 @@ const setUpFixtureHome = (root: string): { fixtureHome: string; dbPath: string }
   const dbPath = join(fixtureHome, ".agent-control-plane", "state.sqlite");
   buildScratchDatabase(dbPath);
   return { fixtureHome, dbPath };
+};
+
+/** Writes an executable shell stub and returns its path. */
+const writeStub = (dir: string, name: string, lines: string[]): string => {
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, name);
+  writeFileSync(path, [...lines, ""].join("\n"));
+  chmodSync(path, 0o755);
+  return path;
+};
+
+/**
+ * A `date` that answers the one call the script uses to name the destination with a fixed value,
+ * and passes every other call (the manifest's `createdAt`) through. Two runs given this stub
+ * target the identical `$BACKUP_PATH` deterministically instead of racing and hoping.
+ */
+const FIXED_STAMP = "FIXEDSTAMP";
+const writeFixedDateStub = (dir: string): void => {
+  writeStub(dir, "date", [
+    "#!/bin/bash",
+    `if [ "$1" = "-u" ] && [ "$2" = "+%Y%m%dT%H%M%SZ" ]; then`,
+    `  echo "${FIXED_STAMP}"`,
+    "else",
+    '  exec /bin/date "$@"',
+    "fi",
+  ]);
+};
+
+const finalPathsFor = (fixtureHome: string): { backupsDir: string; finalDb: string; finalManifest: string } => {
+  const backupsDir = join(fixtureHome, ".agent-control-plane", "backups");
+  const finalDb = join(backupsDir, `state-${FIXED_STAMP}.sqlite`);
+  return { backupsDir, finalDb, finalManifest: `${finalDb}.manifest.json` };
+};
+
+const sha256Of = (path: string): string =>
+  execFileSync("shasum", ["-a", "256", path], { encoding: "utf8" }).trim().split(/\s+/)[0] ?? "";
+
+const listing = (dir: string): string[] =>
+  spawnSync("find", [dir, "-mindepth", "1"], { encoding: "utf8" })
+    .stdout.trim()
+    .split("\n")
+    .filter((line) => line.length > 0);
+
+/**
+ * A `sqlite3` that stops the run *after* the destination precheck and *before* the backup itself,
+ * signalling `reached` and waiting for `release`. This is the barrier the "delayed claim" cases
+ * need: the paused run has already passed `[ -e "$BACKUP_PATH" ]`, which is precisely the state
+ * a publication step must not assume still holds.
+ */
+const writeBarrierSqlite3Stub = (dir: string, reached: string, release: string): void => {
+  writeStub(dir, "sqlite3", [
+    "#!/bin/bash",
+    'for a in "$@"; do',
+    '  case "$a" in',
+    `    *.backup*) /usr/bin/touch "${reached}"; while [ ! -e "${release}" ]; do /bin/sleep 0.05; done ;;`,
+    "  esac",
+    "done",
+    'exec /usr/bin/sqlite3 "$@"',
+  ]);
+};
+
+const waitForFile = async (path: string, timeoutMs = 20_000): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(path)) {
+    if (Date.now() > deadline) {
+      throw new Error(`timed out waiting for ${path}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
 };
 
 describe("the database-backup step in docs/ops/owner-actions.md, extracted and run against fixtures", () => {
@@ -441,54 +526,239 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
     }).trim();
     expect(integrity).toBe("ok");
 
-    // No reservation directory left behind claiming the name either.
-    const reservationListing = spawnSync(
-      "find",
-      [backupsDir, "-mindepth", "1", "-name", ".reserved-*"],
-      { encoding: "utf8" },
-    );
-    expect((reservationListing.stdout ?? "").trim()).toBe("");
+    // Nothing else left behind under the claimed name — no reservation, no orphan, no temp file:
+    // exactly the published pair and nothing more.
+    expect(listing(backupsDir).sort()).toEqual([finalFile, finalManifest].sort());
   });
 
-  it("leaves zero consumable backups at the final path when the manifest publish fails after the database publish succeeds", () => {
+  it("leaves zero consumable backups at the final path when the second publish step fails after the first succeeded", () => {
     const root = tempDir("acp-database-backup-partial-publish-");
     const { fixtureHome } = setUpFixtureHome(root);
+    const { backupsDir, finalDb, finalManifest } = finalPathsFor(fixtureHome);
 
-    // A `mv` stub that behaves exactly like the real one, except for the one call that publishes
-    // the manifest to its final name — injecting a failure strictly *after* the database's own
-    // `mv` to `$BACKUP_PATH` has already succeeded, per #745's required RED (b).
     const stubDir = join(root, "stub-bin");
-    mkdirSync(stubDir, { recursive: true });
-    const stubPath = join(stubDir, "mv");
-    writeFileSync(
-      stubPath,
-      [
+    writeFixedDateStub(stubDir);
+    // Fail the *second* operation that writes a final name, whichever tool performs it and
+    // whichever name comes first — so this case is about the half-published shape itself rather
+    // than about one implementation of publishing. The counter is shared across both stubs.
+    const counter = join(root, "publish-count");
+    for (const tool of ["mv", "ln"]) {
+      writeStub(stubDir, tool, [
         "#!/bin/bash",
         'last="${@: -1}"',
         'case "$last" in',
-        '  *.manifest.json) echo "stub: manifest publish failed" >&2; exit 1 ;;',
+        `  "${finalDb}"|"${finalManifest}")`,
+        `    n=$(/bin/cat "${counter}" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "${counter}"`,
+        '    if [ "$n" -ge 2 ]; then echo "stub: second publish step failed" >&2; exit 1; fi',
+        "    ;;",
         "esac",
-        'exec /bin/mv "$@"',
-        "",
-      ].join("\n"),
-    );
-    chmodSync(stubPath, 0o755);
+        `exec /bin/${tool} "$@"`,
+      ]);
+    }
 
     const result = runExtractedBackup(fixtureHome, minimalPath(stubDir));
 
     expect(result.spawnError).toBeUndefined();
     expect(result.signal).toBeNull();
     expect(result.code).not.toBe(0);
-    expect(result.stderr).toContain("manifest publish failed");
+    expect(result.stderr).toContain("second publish step failed");
 
-    // Zero consumable incomplete backups: no database-without-manifest (or the reverse) under
-    // the final naming pattern, and no reservation directory left claiming the name either — the
-    // failed run unwound exactly what it had already published.
-    const backupsDir = join(fixtureHome, ".agent-control-plane", "backups");
-    const survivors = spawnSync("find", [backupsDir, "-mindepth", "1"], { encoding: "utf8" })
-      .stdout.trim()
-      .split("\n")
-      .filter((line) => line.length > 0);
-    expect(survivors).toEqual([]);
+    // Zero consumable incomplete backups: no database-without-manifest, no manifest-without-
+    // database, and no temp file left claiming anything — the failed run unwound exactly what it
+    // had already put at a final name.
+    expect(listing(backupsDir)).toEqual([]);
   });
+
+  // #745, CEO round 3: the claim is a hard link, and `ln` needs both names on one filesystem.
+  // `$BACKUP_TMP` is a sibling of `$BACKUP_PATH` inside `$BACKUP_DIR`, so this holds — which is
+  // exactly why it is asserted rather than assumed. An assumption nothing checks is the shape
+  // that survives until the day the directory is a mount point and the failure is a clobber.
+  it("refuses when the temp file is not on the same filesystem as the destination directory", () => {
+    const root = tempDir("acp-database-backup-cross-device-");
+    const { fixtureHome } = setUpFixtureHome(root);
+    const { backupsDir } = finalPathsFor(fixtureHome);
+
+    const stubDir = join(root, "stub-bin");
+    writeFixedDateStub(stubDir);
+    // A `stat` that reports a different device number for the temp file than for its own parent
+    // directory, and passes every other query (`%z`, `%i`, `%Sm` on the source) straight through.
+    writeStub(stubDir, "stat", [
+      "#!/bin/bash",
+      `if [ "$1" = "-f" ] && [ "$2" = "%d" ]; then`,
+      '  case "$3" in',
+      '    *.tmp-*) echo "999999"; exit 0 ;;',
+      "  esac",
+      "fi",
+      'exec /usr/bin/stat "$@"',
+    ]);
+
+    const result = runExtractedBackup(fixtureHome, minimalPath(stubDir));
+
+    expect(result.spawnError).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("not on the same filesystem");
+    // Refused before anything was published: no final name exists, claimed or otherwise.
+    expect(listing(backupsDir).filter((p) => !p.includes("/.")).sort()).toEqual([]);
+  });
+
+  // #745, CEO round 3, counterexample 2 — the delayed claim. A mutual-exclusion primitive whose
+  // lifetime is the critical section cannot protect an artifact that outlives it: a reservation
+  // released once a run has published leaves the published name unclaimed, and a second run that
+  // passed the destination precheck *before* that publication happened will not re-check it.
+  it("refuses a delayed claim: a run that passed the destination check before another run published cannot overwrite it", async () => {
+    const root = tempDir("acp-database-backup-delayed-claim-");
+    const { fixtureHome, dbPath } = setUpFixtureHome(root);
+
+    const winnerBin = join(root, "winner-bin");
+    writeFixedDateStub(winnerBin);
+
+    const stalledBin = join(root, "stalled-bin");
+    writeFixedDateStub(stalledBin);
+    const reached = join(root, "stalled-reached");
+    const release = join(root, "stalled-release");
+    writeBarrierSqlite3Stub(stalledBin, reached, release);
+
+    // The stalled run starts first and parks after its `[ -e "$BACKUP_PATH" ]` precheck. Its view
+    // of the final name is now stale for the rest of its life, deterministically.
+    const stalled = spawnExtractedBackup(fixtureHome, minimalPath(stalledBin));
+    await waitForFile(reached);
+
+    // The other run then goes all the way through, cleanup included.
+    const winner = runExtractedBackup(fixtureHome, minimalPath(winnerBin));
+    expect(winner.spawnError).toBeUndefined();
+    expect(winner.code).toBe(0);
+    const winnerShaMatch = winner.stdout.match(/"backupSha256": "([0-9a-f]{64})"/);
+    if (winnerShaMatch === null) {
+      throw new Error("the winning run's stdout did not contain a backupSha256 to compare against");
+    }
+    const winnerSha256 = winnerShaMatch[1];
+
+    const { finalDb, finalManifest } = finalPathsFor(fixtureHome);
+    expect(sha256Of(finalDb)).toBe(winnerSha256);
+
+    // Move the source on before releasing the stalled run, so its own copy is genuinely different
+    // bytes. Without this both runs copy an identical database and an overwrite is
+    // indistinguishable from no overwrite — the assertion would pass against the defect.
+    execFileSync("sqlite3", [
+      dbPath,
+      "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<2000) INSERT INTO t SELECT x FROM c;",
+    ]);
+
+    writeFileSync(release, "go\n");
+    const stalledResult = await stalled;
+
+    expect(stalledResult.spawnError).toBeUndefined();
+    // The final name is a claim that is never released, so the delayed run collides here rather
+    // than publishing over an artifact it last looked at before that artifact existed.
+    expect(stalledResult.code).not.toBe(0);
+    expect(stalledResult.stderr).toContain("already owns the final name");
+    // Bytes on disk against what the winner reported — not merely "a file is still there".
+    expect(sha256Of(finalDb)).toBe(winnerSha256);
+    expect(readFileSync(finalManifest, "utf8")).toContain(`"backupSha256": "${winnerSha256}"`);
+  }, 60_000);
+
+  // #745, CEO round 3, counterexample 1 — `trap … EXIT` does not run on SIGKILL or power loss, so
+  // integrity across the two published names cannot depend on it. Ordering is what has to carry
+  // it: the database is linked last, which makes it the commit marker.
+  it("leaves no database at the final path when the run dies untrappably mid-publish, and the next run refuses rather than resuming", () => {
+    const root = tempDir("acp-database-backup-sigkill-");
+    const { fixtureHome } = setUpFixtureHome(root);
+    const { backupsDir, finalDb, finalManifest } = finalPathsFor(fixtureHome);
+
+    const killBin = join(root, "kill-bin");
+    writeFixedDateStub(killBin);
+    // Whatever tool publishes, and whichever name it publishes first: do the real operation, then
+    // SIGKILL the shell that invoked it. No `trap` runs — which is the point. A host losing power
+    // does not run the trap either, and the existing failure fixture (an ordinary nonzero return
+    // from the second publish call) always reaches it.
+    for (const tool of ["mv", "ln"]) {
+      writeStub(killBin, tool, [
+        "#!/bin/bash",
+        `/bin/${tool} "$@" || exit $?`,
+        'last="${@: -1}"',
+        'case "$last" in',
+        `  "${finalDb}"|"${finalManifest}") kill -9 "$PPID" ;;`,
+        "esac",
+        "exit 0",
+      ]);
+    }
+
+    const killed = runExtractedBackup(fixtureHome, minimalPath(killBin));
+    expect(killed.spawnError).toBeUndefined();
+    expect(killed.signal).toBe("SIGKILL");
+
+    // Item 6 opens `$BACKUP_PATH` with `sqlite3` and treats it as a verified backup. A database
+    // sitting at that name with no manifest beside it is therefore the one shape that must be
+    // unreachable even when no cleanup code gets to run at all.
+    expect(existsSync(finalDb)).toBe(false);
+
+    // The claim is permanent, so the next run refuses instead of resuming into a name whose
+    // history it cannot see.
+    const laterBin = join(root, "later-bin");
+    writeFixedDateStub(laterBin);
+    const later = runExtractedBackup(fixtureHome, minimalPath(laterBin));
+    expect(later.spawnError).toBeUndefined();
+    expect(later.code).not.toBe(0);
+    expect(later.stderr).toContain("already owns the final name");
+    expect(existsSync(finalDb)).toBe(false);
+    // And it did not publish under the claimed name by another route either.
+    expect(listing(backupsDir).filter((p) => p === finalDb)).toEqual([]);
+  }, 60_000);
+
+  // #745, CEO round 3, the derivative of counterexample 2 and its own property: a run that fails
+  // must unwind what *it* created and nothing else. Cleanup keyed to a released lock deletes by
+  // name, and by then the name no longer says who owns it.
+  it("a failed run does not delete another run's published backup", async () => {
+    const root = tempDir("acp-database-backup-stranger-delete-");
+    const { fixtureHome } = setUpFixtureHome(root);
+    const { finalDb, finalManifest } = finalPathsFor(fixtureHome);
+
+    const winnerBin = join(root, "winner-bin");
+    writeFixedDateStub(winnerBin);
+
+    const stalledBin = join(root, "stalled-bin");
+    writeFixedDateStub(stalledBin);
+    const reached = join(root, "stalled-reached");
+    const release = join(root, "stalled-release");
+    writeBarrierSqlite3Stub(stalledBin, reached, release);
+    // The stalled run's own publish step fails, whichever tool and whichever name it reaches
+    // first. Its unwinding must touch only what it created.
+    for (const tool of ["mv", "ln"]) {
+      writeStub(stalledBin, tool, [
+        "#!/bin/bash",
+        'last="${@: -1}"',
+        'case "$last" in',
+        `  "${finalDb}"|"${finalManifest}") echo "stub: publish step failed" >&2; exit 1 ;;`,
+        "esac",
+        `exec /bin/${tool} "$@"`,
+      ]);
+    }
+
+    const stalled = spawnExtractedBackup(fixtureHome, minimalPath(stalledBin));
+    await waitForFile(reached);
+
+    const winner = runExtractedBackup(fixtureHome, minimalPath(winnerBin));
+    expect(winner.spawnError).toBeUndefined();
+    expect(winner.code).toBe(0);
+    const winnerShaMatch = winner.stdout.match(/"backupSha256": "([0-9a-f]{64})"/);
+    if (winnerShaMatch === null) {
+      throw new Error("the winning run's stdout did not contain a backupSha256 to compare against");
+    }
+    const winnerSha256 = winnerShaMatch[1];
+    const winnerManifest = readFileSync(finalManifest, "utf8");
+
+    writeFileSync(release, "go\n");
+    const stalledResult = await stalled;
+
+    expect(stalledResult.spawnError).toBeUndefined();
+    expect(stalledResult.code).not.toBe(0);
+
+    // The published pair belongs to the run that made it. Another run's failure is not a licence
+    // to remove it.
+    expect(existsSync(finalDb)).toBe(true);
+    expect(sha256Of(finalDb)).toBe(winnerSha256);
+    expect(existsSync(finalManifest)).toBe(true);
+    expect(readFileSync(finalManifest, "utf8")).toBe(winnerManifest);
+  }, 60_000);
 });

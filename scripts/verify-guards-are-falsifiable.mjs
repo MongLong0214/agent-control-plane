@@ -3321,40 +3321,118 @@ const GUARDS = [
     killedBy: ["tests/process/the-database-backup-step-fails-closed.test.ts"],
   },
   {
-    // #745, CEO round 2: the destination check above runs once, before the backup, and does not
-    // close the window between that check and the final `mv` — which is not no-clobber. Two runs
-    // sharing a timestamp both pass that earlier check independently and then both reach the
-    // publish step; without an atomic claim on the final name, the second `mv` silently
-    // overwrites the first run's already-verified backup. Replacing the atomic, fail-closed
-    // `mkdir` claim with a `mkdir -p` (which never fails on an existing directory, granting no
-    // exclusivity at all) reproduces exactly that: both racing runs proceed to publish, so the
-    // named test's collision fixture — two real processes forced to the same final name by a
-    // pinned timestamp — sees zero refusals instead of exactly one.
+    // #745, CEO round 2: the destination check runs once, before the backup, and does not close
+    // the window between that check and publication. Two runs sharing a timestamp both pass it
+    // independently and both reach the publish step; without an exclusive claim on the final
+    // name, the second silently overwrites the first run's already-verified backup.
+    //
+    // Round 3 replaced a `mkdir` reservation with the final name itself, so this row now mutates
+    // the claim that survived: `ln -f` unlinks an existing destination before linking, which
+    // means it never fails `EEXIST` and grants no exclusivity at all — the exact property the
+    // reservation was there for. The named test forces two runs onto one final name with a
+    // pinned timestamp and a barrier, and sees the second one publish instead of refuse.
     what: "the database backup step claims the final name atomically so only one of two racing runs ever publishes",
     file: "docs/ops/owner-actions.md",
     find:
-      '    if ! mkdir "$RESERVATION" 2>/dev/null; then\n' +
+      '    if ! ln "${BACKUP_TMP}.manifest.json" "${BACKUP_PATH}.manifest.json" 2>/dev/null; then\n' +
       '      echo "refusing: another run already owns the final name $BACKUP_PATH" >&2\n' +
-      '      rm -f "$BACKUP_TMP" "${BACKUP_TMP}.manifest.json"\n' +
       "      exit 1\n" +
       "    fi\n",
-    replace: '    mkdir -p "$RESERVATION" 2>/dev/null || true\n',
-    killedBy: ["tests/process/the-database-backup-step-fails-closed.test.ts"],
+    replace: '    ln -f "${BACKUP_TMP}.manifest.json" "${BACKUP_PATH}.manifest.json"\n',
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::refuses a delayed claim: a run that passed the destination check before another run published cannot overwrite it",
+    ],
   },
   {
-    // #745, CEO round 2, second counterexample: publication is two independent `mv` calls (the
-    // database, then the manifest), so a failure between them can leave a database with no
-    // manifest at the final path. Deleting the cleanup line that removes what this run already
-    // published — while leaving the reservation directory's own removal intact — reproduces
-    // exactly that half-published shape: the named test's fixture fails the manifest `mv` after
-    // the database `mv` has already succeeded, and without this line the database survives alone
-    // at `$BACKUP_PATH` instead of the whole partial publish being unwound.
+    // #745, CEO round 3, counterexample 1: `trap … EXIT` does not run on `SIGKILL` or a host
+    // power loss, so which name is written last — not the trap — is what decides what an
+    // untrappable death can leave behind. The manifest is linked first and the database last, so
+    // `$BACKUP_PATH` is the commit marker and the worst survivable state is a manifest with no
+    // database (which item 6's `test -s "$BACKUP_PATH"` refuses).
+    //
+    // This row swaps the two links. The result is still atomic and still exclusive — the claim
+    // is simply on the wrong name — which is why nothing about racing dies here: the mutation is
+    // about ordering alone. The named test kills the run immediately after its first publish
+    // call and finds a database sitting at the final path with no manifest beside it.
+    what: "the database backup step links the database last so an untrappable death cannot leave one without a manifest",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    if ! ln "${BACKUP_TMP}.manifest.json" "${BACKUP_PATH}.manifest.json" 2>/dev/null; then\n' +
+      '      echo "refusing: another run already owns the final name $BACKUP_PATH" >&2\n' +
+      "      exit 1\n" +
+      "    fi\n" +
+      "    MANIFEST_LINKED=1\n" +
+      '    ln "$BACKUP_TMP" "$BACKUP_PATH"\n',
+    replace:
+      '    if ! ln "$BACKUP_TMP" "$BACKUP_PATH" 2>/dev/null; then\n' +
+      '      echo "refusing: another run already owns the final name $BACKUP_PATH" >&2\n' +
+      "      exit 1\n" +
+      "    fi\n" +
+      "    MANIFEST_LINKED=1\n" +
+      '    ln "${BACKUP_TMP}.manifest.json" "${BACKUP_PATH}.manifest.json"\n',
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::leaves no database at the final path when the run dies untrappably mid-publish, and the next run refuses rather than resuming",
+    ],
+  },
+  {
+    // #745, CEO round 2, second counterexample: publication writes two names, so an ordinary
+    // failure between them can leave one of them alone at the final path. Deleting the unwind
+    // reproduces that half-published shape — the named test fails the second publish call after
+    // the first has succeeded, and without this line the manifest survives alone at
+    // `$BACKUP_PATH.manifest.json` instead of the partial publish being unwound.
     what: "the database backup step unwinds a partial publish so no database-without-manifest survives at the final path",
     file: "docs/ops/owner-actions.md",
     find:
-      '        rm -f "$BACKUP_PATH" "$BACKUP_PATH.manifest.json" "$BACKUP_TMP" "${BACKUP_TMP}.manifest.json"\n',
+      '      if [ "$MANIFEST_LINKED" = "1" ] && [ ! -e "$BACKUP_PATH" ]; then\n' +
+      '        rm -f "$BACKUP_PATH.manifest.json"\n' +
+      "      fi\n",
     replace: "",
-    killedBy: ["tests/process/the-database-backup-step-fails-closed.test.ts"],
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::leaves zero consumable backups at the final path when the second publish step fails after the first succeeded",
+    ],
+  },
+  {
+    // #745, CEO round 3, the derivative of counterexample 2 and its own property. The unwind
+    // above must remove only names *this run* created, and only while the commit marker is
+    // absent. The previous revision released its reservation on success, so the name no longer
+    // recorded who owned it, and a later run that failed after claiming ran
+    // `rm -f "$BACKUP_PATH" "$BACKUP_PATH.manifest.json"` over a stranger's verified backup.
+    //
+    // This row restores exactly that unconditional form — same anchor as the row above, opposite
+    // mutation, because "unwinds its own partial publish" and "does not unwind anyone else's" are
+    // two properties of one block and a single mutation cannot ask both. The named test lets one
+    // run publish and a second, older run fail afterwards, then reads the published bytes back.
+    what: "the database backup cleanup unlinks only what this run created, never a publication it merely collided with",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '      if [ "$MANIFEST_LINKED" = "1" ] && [ ! -e "$BACKUP_PATH" ]; then\n' +
+      '        rm -f "$BACKUP_PATH.manifest.json"\n' +
+      "      fi\n",
+    replace: '      rm -f "$BACKUP_PATH" "$BACKUP_PATH.manifest.json"\n',
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::a failed run does not delete another run's published backup",
+    ],
+  },
+  {
+    // #745, CEO round 3: `ln` claims the final name only because both names are on one
+    // filesystem — across a mount boundary it fails outright, and the reflex fix for that failure
+    // is a `mv`, which clobbers. The siblings-in-one-directory argument is true today and is
+    // asserted rather than assumed, because an assumption nothing checks survives until the day
+    // it stops holding. Deleting the assertion lets the run proceed on a temp file its own `stat`
+    // reports on a different device, which the named test injects.
+    what: "the database backup step proves the temp file and the destination share a filesystem before claiming with ln",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    BACKUP_TMP_DEVICE="$(stat -f \'%d\' "$BACKUP_TMP")"\n' +
+      '    BACKUP_DIR_DEVICE="$(stat -f \'%d\' "$BACKUP_DIR")"\n' +
+      '    if [ -z "$BACKUP_TMP_DEVICE" ] || [ "$BACKUP_TMP_DEVICE" != "$BACKUP_DIR_DEVICE" ]; then\n' +
+      '      echo "refusing: $BACKUP_TMP is not on the same filesystem as $BACKUP_DIR; ln cannot claim the final name atomically" >&2\n' +
+      "      exit 1\n" +
+      "    fi\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::refuses when the temp file is not on the same filesystem as the destination directory",
+    ],
   },
   {
     // #241 — the whole point of the acceptance readout. Forcing `observed` to true makes an

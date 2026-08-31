@@ -331,50 +331,95 @@ non-empty, absolute, and a real file.
       echo "refusing: re-hash of $BACKUP_TMP no longer matches the recorded sha256" >&2; exit 1
     fi
 
-    # 7. Publish — every check above has passed. Two runs sharing the same timestamp both pass
-    #    everything above independently and would both reach a plain `mv` to the same
-    #    `$BACKUP_PATH`; the second `mv` would silently overwrite the first run's already-verified
-    #    backup, because `mv` is not no-clobber. So ownership of the final name is claimed with
-    #    `mkdir`, which POSIX guarantees is atomic and fails `EEXIST` rather than replacing — at
-    #    most one of two racing runs ever wins this line, and the loser exits here, before it has
-    #    touched `$BACKUP_PATH` or its manifest at all.
-    RESERVATION="$BACKUP_DIR/.reserved-${BACKUP_NAME}"
-    CLAIMED=0
-    PUBLISHED=0
-    # Runs once, however this shell exits. A run that never claimed the reservation (the loser
-    # above) leaves this a no-op. A run that claimed it but did not finish publishing removes
-    # exactly what it itself may have already put at the final name — so a partial publish never
-    # leaves a database with no manifest, or a manifest with no database, sitting at
-    # `$BACKUP_PATH` for a later step to mistake for a verified backup.
-    publish_cleanup() {
-      if [ "$CLAIMED" = "1" ] && [ "$PUBLISHED" != "1" ]; then
-        rm -f "$BACKUP_PATH" "$BACKUP_PATH.manifest.json" "$BACKUP_TMP" "${BACKUP_TMP}.manifest.json"
-        rm -rf "$RESERVATION"
-      elif [ "$CLAIMED" = "1" ]; then
-        rmdir "$RESERVATION" 2>/dev/null || true
-      fi
-    }
-    trap publish_cleanup EXIT
-    if ! mkdir "$RESERVATION" 2>/dev/null; then
-      echo "refusing: another run already owns the final name $BACKUP_PATH" >&2
-      rm -f "$BACKUP_TMP" "${BACKUP_TMP}.manifest.json"
+    # 7. Publish — every check above has passed. The final names themselves are the claim, and
+    #    they are never given back. `ln` creates a hard link atomically and fails `EEXIST` rather
+    #    than replacing: it is the file-level analogue of `mkdir` and it never clobbers. `mv -n`
+    #    is not a substitute — neither the GNU nor the BSD implementation is race-free, and using
+    #    it would reintroduce exactly the check-then-act this replaces.
+    #
+    #    `ln` requires both names on one filesystem. `$BACKUP_TMP` and `$BACKUP_PATH` are siblings
+    #    inside `$BACKUP_DIR`, so this holds — but it is asserted here rather than assumed, and a
+    #    run that cannot prove it stops instead of falling back to something that can clobber.
+    #    Read into variables first: a `$(stat …)` compared inline fails open, because a `stat`
+    #    that errors on both sides makes the comparison "" = "" and the check passes having
+    #    measured nothing. Under `set -e` an assignment carries its substitution's exit status,
+    #    and the `-z` covers a `stat` that exits 0 and prints nothing.
+    BACKUP_TMP_DEVICE="$(stat -f '%d' "$BACKUP_TMP")"
+    BACKUP_DIR_DEVICE="$(stat -f '%d' "$BACKUP_DIR")"
+    if [ -z "$BACKUP_TMP_DEVICE" ] || [ "$BACKUP_TMP_DEVICE" != "$BACKUP_DIR_DEVICE" ]; then
+      echo "refusing: $BACKUP_TMP is not on the same filesystem as $BACKUP_DIR; ln cannot claim the final name atomically" >&2
       exit 1
     fi
-    CLAIMED=1
-    mv "$BACKUP_TMP" "$BACKUP_PATH"
-    mv "${BACKUP_TMP}.manifest.json" "${BACKUP_PATH}.manifest.json"
+    MANIFEST_LINKED=0
+    # Runs once, however this shell exits, and unlinks only names *this run itself created* —
+    # never `$BACKUP_PATH`, which this run never creates unless it is committing. The manifest
+    # link is dropped only while the commit marker is absent: once `$BACKUP_PATH` exists the
+    # publication is complete and belongs to whoever made it, and an unconditional
+    # `rm -f "$BACKUP_PATH"` here would let a run that merely collided delete a stranger's
+    # verified backup on its way out.
+    publish_cleanup() {
+      if [ "$MANIFEST_LINKED" = "1" ] && [ ! -e "$BACKUP_PATH" ]; then
+        rm -f "$BACKUP_PATH.manifest.json"
+      fi
+      rm -f "$BACKUP_TMP" "${BACKUP_TMP}.manifest.json"
+    }
+    trap publish_cleanup EXIT
+    # The manifest is linked first and the database last, so `$BACKUP_PATH` is the commit marker.
+    # This ordering, not the trap, is what makes a partial publish unusable: `trap … EXIT` does
+    # not run on `SIGKILL` or a host power loss, and a death between the two links therefore
+    # leaves at most a manifest with no database — never a database that looks verified with no
+    # manifest beside it. Item 6 checks `$BACKUP_PATH` first and refuses that state.
+    #
+    # The same line is also the exclusion. Two runs sharing a timestamp both pass every check
+    # above independently, and one may have passed the destination check long before the other
+    # published; because nothing is ever released, the later one still collides here and refuses
+    # before it has touched `$BACKUP_PATH` at all.
+    if ! ln "${BACKUP_TMP}.manifest.json" "${BACKUP_PATH}.manifest.json" 2>/dev/null; then
+      echo "refusing: another run already owns the final name $BACKUP_PATH" >&2
+      exit 1
+    fi
+    MANIFEST_LINKED=1
+    ln "$BACKUP_TMP" "$BACKUP_PATH"
+    rm -f "$BACKUP_TMP" "${BACKUP_TMP}.manifest.json"
     test -s "$BACKUP_PATH"
     test -s "$BACKUP_PATH.manifest.json"
-    PUBLISHED=1
     echo "backup verified: $BACKUP_PATH"
     cat "$BACKUP_PATH.manifest.json"
 
 <!-- owner-actions:database-backup:end -->
 
 Good means the last two lines print — a manifest whose `backupSha256` was independently
-recomputed twice and a path that survived the atomic rename. Nothing before that line does, and
-`$BACKUP_PATH` is the only value the rest of this document may treat as a verified backup: not a
-value parsed from a file that might not have been written, and not a value that might be empty.
+recomputed twice and a database at a final name this run claimed with a link that cannot replace
+anything. Nothing before that line does, and `$BACKUP_PATH` is the only value the rest of this
+document may treat as a verified backup: not a value parsed from a file that might not have been
+written, and not a value that might be empty.
+
+An earlier revision of step 7 reserved the final name with `mkdir` and released the reservation on
+success. That is a mutual-exclusion primitive, and its lifetime is the critical section — while
+the thing it was protecting, a published backup, outlives that section forever. **A lock released
+at the end of a critical section cannot protect an artifact that outlives it.** Two failures
+followed directly. A second run that had passed the `[ -e "$BACKUP_PATH" ]` check *before* the
+first published could take the freed reservation afterwards and `mv` over the published pair
+without ever re-reading the final name; and because the reservation no longer said who owned that
+name, the losing run's cleanup deleted a backup it had not made. Both are gone because the final
+name is now the claim itself, held permanently, rather than a lock standing in for one.
+
+**One new state this creates, and its recovery.** A run killed between the two links leaves a
+manifest at `$BACKUP_PATH.manifest.json` with no database beside it. That name is claimed
+permanently, so a later run at the same timestamp refuses rather than resuming — which is correct
+and fail-closed, and item 6's preflight already treats it as no usable backup, because
+`test -s "$BACKUP_PATH"` is checked there and fails first. It is still a state someone has to
+clear rather than puzzle over. To recover, take a fresh backup: this block's name carries a new
+UTC timestamp, so it does not collide. To remove the orphan instead, confirm there is no database
+at the paired name before unlinking anything:
+
+    ORPHAN="$BACKUP_DIR/state-<TIMESTAMP>.sqlite"
+    test ! -e "$ORPHAN"                 # refuse if a database is present — that pair is a real backup
+    test -s "$ORPHAN.manifest.json"
+    rm "$ORPHAN.manifest.json"
+
+Never remove the manifest without that first `test`: a manifest whose database exists is half of a
+verified backup, and deleting it is how the failure this section is about gets recreated by hand.
 
 Bytes — nothing in `deploy/install-launchd.sh` snapshots `dist/`; `snapshot_current_deployment`
 only copies the plist and the launcher shell script (`deploy/install-launchd.sh:143-155`), and
@@ -589,6 +634,13 @@ sample, and the ones it omits are exactly the ones nobody thought about.
 The hash comparison closes the other half: it re-hashes the bytes **in the backup**, not the
 source they came from, so a copy that silently truncated is caught here rather than after the
 live `dist` is gone.
+
+`test -s "$BACKUP_PATH"` also covers the one incomplete state item 4 step 2 can leave behind. A
+backup run killed untrappably between its two links leaves a manifest at
+`$BACKUP_PATH.manifest.json` with no database — the deliberate direction of that ordering, since
+the reverse would leave a database that looks verified. That is **not a usable backup**, and this
+line refuses it before `rm -rf` runs, on its own, without needing to reason about the manifest.
+Clearing the orphan is written out at the end of item 4 step 2.
 
 `install-launchd.sh rollback` is deliberately **not** used here, and the reason is worth
 stating because reusing it looks obviously right. That path does stop the job, wait for the
