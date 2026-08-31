@@ -3320,9 +3320,44 @@ const GUARDS = [
     // that stays in memory while `health.json` keeps answering the previous healthy value.
     what: "#734: a failed system-doctor re-evaluation persists STALE to disk inside its own failure branch, not only when a caller happens to writeHealth afterward",
     file: "src/daemon/daemon.ts",
-    find: '      try {\n        this.writeHealth(null);\n      } catch (writeErr) {\n        this.cp.audit.record({\n          kind: "DAEMON_TIMER_FAILED",\n          reasonCode: ReasonCode.DAEMON_TIMER_FAILED,\n          evidence: { timer: "health", error: safeErrorMessage(writeErr) },\n        });\n      }\n',
-    replace: "",
+    find: "      this.persistDoctorHealth();\n      throw err;\n",
+    replace: "      throw err;\n",
     killedBy: ["tests/unit/daemon-doctor-freshness.test.ts"],
+  },
+  {
+    // A persistence failure is not the caller's answer, on either branch. Rethrowing instead of
+    // auditing puts a storage error where the doctor's outcome belongs: on the success path the
+    // operator is told the run failed when it succeeded, and on the failure path the storage
+    // error replaces the doctor rejection the method exists to surface. This is the guard that
+    // makes "persistence is not evaluation" enforceable rather than merely arranged — the `try`
+    // scope alone cannot be mutated into the defect, but the swallow can.
+    what: "#734: a failed health persist is audited and dropped, never raised as the doctor evaluation's outcome",
+    file: "src/daemon/daemon.ts",
+    find: "      this.writeHealth(null);\n    } catch (writeErr) {\n",
+    replace: "      this.writeHealth(null);\n    } catch (writeErr) {\n      throw writeErr;\n",
+    killedBy: [
+      "tests/unit/daemon-doctor-freshness.test.ts::a health-write failure after a doctor SUCCESS is not reclassified",
+    ],
+  },
+  {
+    // The audit sink is a sink, and an unprotected report of a failure is a second way for the
+    // reporting to become the failure. Removing the inner `try` restores exactly the shape the
+    // CEO blocked: an audit that throws escapes the write handler and replaces the doctor error
+    // on its way to the operator, so the one fact the whole method exists to surface is the one
+    // fact the caller does not receive.
+    what: "#734: an audit failure while reporting a failed health persist does not replace the doctor error",
+    file: "src/daemon/daemon.ts",
+    find:
+      "      try {\n        this.cp.audit.record({\n          kind: \"DAEMON_TIMER_FAILED\",\n" +
+      "          reasonCode: ReasonCode.DAEMON_TIMER_FAILED,\n" +
+      "          evidence: { timer: \"health\", error: safeErrorMessage(writeErr) },\n        });\n      } catch {\n",
+    replace:
+      "      {\n        this.cp.audit.record({\n          kind: \"DAEMON_TIMER_FAILED\",\n" +
+      "          reasonCode: ReasonCode.DAEMON_TIMER_FAILED,\n" +
+      "          evidence: { timer: \"health\", error: safeErrorMessage(writeErr) },\n        });\n      }\n      if (false) {\n",
+    killedBy: [
+      "tests/unit/daemon-doctor-freshness.test.ts::a doctor failure whose health write AND whose audit both fail",
+    ],
   },
   {
     // The failed attempt's ticket must be a *fresh* completion position, because that is the only
@@ -3347,8 +3382,8 @@ const GUARDS = [
     // open, which is why it gets its own row rather than being read off the row above.
     what: "#734: a successful system-doctor evaluation records its own completion position, not one ahead of it",
     file: "src/daemon/daemon.ts",
-    find: "      this.#lastDoctorSuccess = { report, generation };\n",
-    replace: "      this.#lastDoctorSuccess = { report, generation: generation + 1 };\n",
+    find: "    this.#lastDoctorSuccess = { report, generation };\n",
+    replace: "    this.#lastDoctorSuccess = { report, generation: generation + 1 };\n",
     killedBy: [
       "tests/unit/daemon-doctor-freshness.test.ts::a re-evaluation that fails yields STALE immediately",
     ],

@@ -1173,13 +1173,18 @@ export class Daemon {
    */
   private async runSystemDoctorCheck(supplementalFindings: readonly Finding[] = []): Promise<DoctorReport> {
     const startedAt = this.cp.clock.nowIso();
+    let report: DoctorReport;
+    // The `try` covers the evaluation and nothing else. It used to wrap the success path's
+    // persist as well, which made a *storage* error arrive at a `catch` whose only vocabulary is
+    // "the doctor failed": the write threw, the catch recorded a failed attempt naming the
+    // storage error, the retry inside it succeeded, and disk ended up holding STALE and
+    // `"re-evaluation failed: <storage error>"` for an evaluation that had actually succeeded.
+    // The ordering was corrupted with it — `++this.#doctorCompletions` ran a second time, so one
+    // evaluation consumed two completion tickets and the fabricated failure outranked its own
+    // success. The generation mechanism was doing exactly what it should with a fact that was
+    // not true. Persistence is not evaluation, and only the evaluation belongs in here.
     try {
-      const report = await this.cp.doctor.run("system", undefined, supplementalFindings);
-      const generation = ++this.#doctorCompletions;
-      this.#lastDoctorSuccess = { report, generation };
-      this.#lastDoctorAttempt = { startedAt, completedAt: this.cp.clock.nowIso(), generation, ok: true };
-      this.writeHealth(null);
-      return report;
+      report = await this.cp.doctor.run("system", undefined, supplementalFindings);
     } catch (err) {
       const generation = ++this.#doctorCompletions;
       this.#lastDoctorAttempt = {
@@ -1189,16 +1194,47 @@ export class Daemon {
         ok: false,
         error: safeErrorMessage(err),
       };
+      this.persistDoctorHealth();
+      throw err;
+    }
+    const generation = ++this.#doctorCompletions;
+    this.#lastDoctorSuccess = { report, generation };
+    this.#lastDoctorAttempt = { startedAt, completedAt: this.cp.clock.nowIso(), generation, ok: true };
+    this.persistDoctorHealth();
+    return report;
+  }
+
+  /**
+   * #734 — write the doctor snapshot, and never let the writing become the answer.
+   *
+   * Both branches of `runSystemDoctorCheck` end here, and the guarantee is the same for both: a
+   * persistence failure is audited and dropped, never raised. On the failure path that is what
+   * keeps the doctor's own rejection — the fact the method exists to surface — from being
+   * replaced by an unrelated storage error. On the success path it is what keeps a failed write
+   * from being reclassified as a failed evaluation.
+   *
+   * The audit is itself inside a `try`. That is not defensive decoration: an audit sink that
+   * throws is a sink, and without this the exception it raises escapes and replaces the doctor
+   * error on its way out — precisely the masking the outer contract promises cannot happen,
+   * reintroduced one layer down. There is nowhere left to report a failure of the reporting
+   * channel that is more reliable than the channel that just failed, so it is swallowed. That is
+   * the whole point: what the caller receives is the doctor's outcome, always.
+   */
+  private persistDoctorHealth(): void {
+    try {
+      this.writeHealth(null);
+    } catch (writeErr) {
       try {
-        this.writeHealth(null);
-      } catch (writeErr) {
         this.cp.audit.record({
           kind: "DAEMON_TIMER_FAILED",
           reasonCode: ReasonCode.DAEMON_TIMER_FAILED,
           evidence: { timer: "health", error: safeErrorMessage(writeErr) },
         });
+      } catch {
+        // The reporting channel is the thing that failed. Anything further would be another
+        // call to something already known to be throwing, and it would escape into the caller's
+        // answer — the exact defect this method exists to prevent.
       }
-      throw err;
     }
   }
 

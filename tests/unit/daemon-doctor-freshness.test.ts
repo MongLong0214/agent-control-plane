@@ -54,6 +54,32 @@ const deferred = (): Deferred => {
   return { promise, release };
 };
 
+/**
+ * `health.json` is rewritten in place, so a poll can catch it mid-write. A parse failure here is
+ * "not yet", not a verdict — returning null lets the caller keep waiting rather than turning a
+ * read race into a test failure.
+ */
+const doctorCheckedAt = (stateDir: string): string | null => {
+  try {
+    return readHealth(stateDir).doctor?.checkedAt ?? null;
+  } catch {
+    return null;
+  }
+};
+
+const waitFor = async (
+  predicate: () => boolean,
+  description: string,
+  timeoutMs = 5_000,
+): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (predicate()) return;
+    if (Date.now() >= deadline) throw new Error(`timed out after ${timeoutMs}ms waiting for ${description}`);
+    await new Promise<void>((resolveWait) => setTimeout(resolveWait, 5));
+  }
+};
+
 const PEER: AuthenticatedOperatorPeer = {
   channel: "cli",
   peerId: "cli:fixture-operator",
@@ -121,7 +147,16 @@ describe("#734 daemon doctor freshness", () => {
     const before = readHealth(stateDir).doctor!.checkedAt;
 
     harness.clock.advance(60_000);
-    await new Promise<void>((resolveWait) => setTimeout(resolveWait, 40));
+    // Poll for the condition, never sleep for a duration. A fixed `setTimeout(40)` asserted that
+    // a 20ms-interval tick had *had time to happen*, which is a claim about the runner's load
+    // rather than about the daemon: it passed alone and failed under a parallel suite. A verdict
+    // that moves with machine load cannot tell a real regression from a busy runner, and a suite
+    // that reports that stops being read. The timeout below is a failure ceiling, not a wait —
+    // a loaded runner takes longer and still gets the same answer.
+    await waitFor(
+      () => doctorCheckedAt(stateDir) !== before,
+      "the periodic capacity-sensor tick to refresh the persisted doctor snapshot",
+    );
 
     const after = readHealth(stateDir).doctor!;
     // The tick ran on the live clock at the moment it fired, not at process start — this is what
@@ -405,6 +440,105 @@ describe("#734 daemon doctor freshness", () => {
     expect(afterSuccess.status).not.toBe("STALE");
     expect(afterSuccess.checkedAt).toBe(ranAtSucceeding);
     expect(afterSuccess.reason).toBeUndefined();
+    await daemon.stop();
+  });
+
+  it("criterion 6: a health-write failure after a doctor SUCCESS is not reclassified as a failed evaluation", async () => {
+    // The `try` used to wrap the success path's `writeHealth` as well as the evaluation, so a
+    // storage error arrived at a `catch` whose only vocabulary is "the doctor failed". Three
+    // things then went wrong at once: the operator was told INTERNAL_ERROR for an evaluation
+    // that had succeeded, disk was left holding STALE with the *storage* error as its reason,
+    // and `++this.#doctorCompletions` ran a second time — one evaluation consuming two
+    // completion tickets, so the fabricated failure outranked its own success. The ordering was
+    // working correctly on a fact that was not true.
+    const harness = makeHarness();
+    harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    const stateDir = tempDir("acp-doctor-freshness-");
+    const daemon = new Daemon(harness.cp, { stateDir, doctorFreshnessMs: 5 * 60_000 });
+    const started = await daemon.start();
+    expect(started.allowed).toBe(true);
+
+    // Installed after startup so it counts only the writes this scenario provokes: the first
+    // health write after the doctor succeeds fails, and every later one lands.
+    const realWriteHealth = daemon.writeHealth.bind(daemon);
+    let failNextWrite = true;
+    vi.spyOn(daemon, "writeHealth").mockImplementation((reconcile) => {
+      if (failNextWrite) {
+        failNextWrite = false;
+        throw new Error("#734 test: health.json write failed");
+      }
+      realWriteHealth(reconcile);
+    });
+
+    harness.clock.advance(10_000);
+    const ranAt = harness.clock.nowIso();
+    const response = await daemon.handleOperatorRequest(
+      { requestId: "req-doctor-run-write-fails", method: OPERATOR_METHOD.DOCTOR_RUN, params: { scope: "system" } },
+      PEER,
+    );
+
+    // A later write lands, and must not resurrect a verdict that was never true.
+    daemon.writeHealth(null);
+    const onDisk = readHealth(stateDir).doctor!;
+    expect(onDisk.status).not.toBe("STALE");
+    expect(onDisk.reason).toBeUndefined();
+    expect(onDisk.checkedAt).toBe(ranAt);
+
+    // The doctor succeeded, so the caller is told so. A failed persist is not the caller's answer.
+    expect(response.allowed).toBe(true);
+
+    // Dropped from the answer, but not dropped silently.
+    const persistFailures = harness.cp.audit
+      .all()
+      .filter((entry) => entry.kind === "DAEMON_TIMER_FAILED")
+      .filter((entry) => JSON.stringify(entry.evidence ?? {}).includes("#734 test: health.json write failed"));
+    expect(persistFailures.length).toBe(1);
+    expect(persistFailures[0]?.evidence).toMatchObject({ timer: "health" });
+
+    vi.restoreAllMocks();
+    await daemon.stop();
+  });
+
+  it("criterion 6 (audit sink too): a doctor failure whose health write AND whose audit both fail still propagates the doctor's own error", async () => {
+    // The contract this method documents is that the doctor's rejection always wins and always
+    // propagates. The audit call in the write-failure handler was itself unprotected, so an
+    // audit sink that throws replaced the doctor error on the way out — the masking the contract
+    // forbids, reintroduced one layer below where it was fixed.
+    const harness = makeHarness();
+    harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    const stateDir = tempDir("acp-doctor-freshness-");
+    const daemon = new Daemon(harness.cp, { stateDir, doctorFreshnessMs: 5 * 60_000 });
+    const started = await daemon.start();
+    expect(started.allowed).toBe(true);
+
+    vi.spyOn(harness.cp.doctor, "run").mockRejectedValueOnce(new Error("#734 test: doctor probe exploded"));
+    vi.spyOn(daemon, "writeHealth").mockImplementation(() => {
+      throw new Error("#734 test: health.json write failed");
+    });
+    // Only the persist-failure audit throws. Failing every audit would break unrelated daemon
+    // bookkeeping and the test would stop being about this path.
+    const realRecord = harness.cp.audit.record.bind(harness.cp.audit);
+    vi.spyOn(harness.cp.audit, "record").mockImplementation((entry) => {
+      if (entry.kind === "DAEMON_TIMER_FAILED") throw new Error("#734 test: audit sink exploded");
+      return realRecord(entry);
+    });
+
+    harness.clock.advance(10_000);
+    const response = await daemon.handleOperatorRequest(
+      { requestId: "req-doctor-run-audit-fails", method: OPERATOR_METHOD.DOCTOR_RUN, params: { scope: "system" } },
+      PEER,
+    );
+
+    expect(response.allowed).toBe(false);
+    expect(response.reasonCode).toBe(ReasonCode.INTERNAL_ERROR);
+    // The fact this method exists to surface is the doctor's rejection — not the storage error
+    // stacked on top of it, and not the audit failure stacked on top of that.
+    const evidence = JSON.stringify(response.evidence ?? {});
+    expect(evidence).toContain("#734 test: doctor probe exploded");
+    expect(evidence).not.toContain("#734 test: audit sink exploded");
+    expect(evidence).not.toContain("#734 test: health.json write failed");
+
+    vi.restoreAllMocks();
     await daemon.stop();
   });
 
