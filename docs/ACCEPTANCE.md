@@ -433,14 +433,28 @@ and prints, as its own output:
   produces — an explicit, requested cancellation. It is **not** the same claim as an abandoned
   lifecycle (one left to time out or orphaned with no terminal disposition at all); the schema
   has no `ABANDONED` run state and no separate event for that, so this report does not claim one;
-- **`preventedAttempts`** — five real counts, one per category, of `audit_events` rows for the
-  reason code an existing enforcement mechanism records when it **refuses** exactly that
-  category's attempt (see `PREVENTED_ATTEMPT_REASON_CODES` in `src/export/acceptance-report.ts`
-  for exactly which reason codes back each count, and the negative test each mechanism carries).
-  **A non-zero value here is the guard working, not a defect** — `MERGE_AUTHORITY_DENIED` is the
-  record of an unauthorised merge being *stopped*, and reporting that as an anomaly would invert
-  what happened. This count is never `N/A` or `UNKNOWN`: the query is unambiguous regardless of
-  whether any lifecycle ever completed;
+- **`preventedAttempts`** — for each category, the count of `audit_events` rows written by the
+  one real production writer that records this category's guard refusing an attempt. A reason
+  code alone is not enough to find that writer: `COMPLETION_AUTHORITY_DENIED` is also the reason
+  code for an evidence-write authority refusal, a schema-migration authority refusal, and five
+  distinct canonical-turn authority refusals (`src/db/database.ts` `TRIGGER_CODES`), none of
+  which is a false completion, and `MERGE_AUTHORITY_DENIED` is also written when the daemon's own
+  finalizer lacks authority mid-finalization — a misconfiguration, not a blocked unauthorised
+  merge. `PREVENTED_ATTEMPT_WRITERS` in `src/export/acceptance-report.ts` names the exact
+  `(kind, reason_code)` pair each category actually reads, found by reading every `.record(` call
+  site in `src/` rather than assumed from the reason code, plus — for the two pairs that still
+  collapse two meanings after fixing `kind` — an `isGenuine` check against a field inside
+  `evidence_json` that narrows the rest of the way.
+  **A non-zero value here is the guard working, not a defect** — a genuine
+  `unauthorizedMerges` row is the record of an unauthorised merge being *stopped*, and reporting
+  that as an anomaly would invert what happened.
+  **Not every category has a writer.** `duplicateDispatches` (`OUTBOX_DUPLICATE_SUPPRESSED`) has
+  none: `Outbox.enqueue()` returns that code as an *allowed*, idempotent-replay `Decision` and
+  never calls `.record(` for it, on either the application-level or the trigger-sourced path. So
+  `preventedAttempts.duplicateDispatches` reads `"UNKNOWN"`, not `0` — a `0` a reader could
+  mistake for "measured and clean" is exactly the defect this correction exists to remove, one
+  field over from `acceptedAnomalies`. `preventedAttempts` is still never `"N/A"`: whether a
+  writer exists, and what it has recorded, does not depend on any lifecycle having happened;
 - **`acceptedAnomalies`** — whether the bad thing actually *landed despite* the guard: a false
   completion that stuck, a message actually sent twice, a stale-generation result actually used,
   a forged gate that actually got a merge through, a merge that actually landed without
@@ -473,3 +487,12 @@ and prints, as its own output:
    category is a verified zero — not reachable today, since no category has a source, but the
    logic supports it once one exists), `UNVERIFIED` (lifecycles exist, nothing positive, at
    least one category unproven), and `ANOMALIES_PRESENT` (an actual accepted anomaly, named).
+4. A `preventedAttempts` count is keyed on the real writer's `(kind, reason_code)`, never on
+   `reason_code` alone, and a row from a *different* writer that happens to share the reason
+   code must not count: seeding a `MERGE_AUTHORITY_DENIED` row under
+   `kind: "FINALIZATION_ATTEMPT_FAILED"` (the daemon's own finalizer lacking authority) leaves
+   `unauthorizedMerges` at `0`, while the same reason code under
+   `kind: "MANAGED_WRITE_GUARD"` (the guard actually refusing an unauthorised write) counts.
+   Symmetrically, a `COMPLETION_AUTHORITY_DENIED` row stamped with one of the seven unrelated
+   SQLite trigger sentinels in its `evidence.sqlite` field does not count toward
+   `falseCompletions`.

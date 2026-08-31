@@ -40,6 +40,27 @@ import type { Db } from "../db/database.ts";
  * fire on a proven accepted anomaly. The realistic case — lifecycles exist, the guards have
  * fired, and every accepted-anomaly source is `UNKNOWN` — is its own verdict, `UNVERIFIED`, so a
  * reader cannot mistake "nothing here can prove or disprove it" for a clean bill of health.
+ *
+ * **A third correction (CEO review of #736 at `b8c48eb`).** `preventedAttempts` keyed on
+ * `reason_code` alone, and the reason codes are broader than the five categories:
+ * `COMPLETION_AUTHORITY_DENIED` is also the reason code for an evidence-write authority
+ * refusal, a schema-migration authority refusal, and five distinct canonical-turn authority
+ * refusals (`src/db/database.ts` `TRIGGER_CODES`, ~line 907) — none of which is a false
+ * completion. `MERGE_AUTHORITY_DENIED` is also written when the daemon's *own* finalizer lacks
+ * completion authority mid-finalization (`src/daemon/finalizer.ts` `handleFailure`) — a
+ * misconfiguration, not a blocked unauthorised-merge attempt. Counting either as the named
+ * category would repeat the exact inversion the second correction fixed, one field deeper: a
+ * broad reason code was read as if it named the narrow event.
+ *
+ * So `preventedAttempts` is now keyed on the **real writer** — `PREVENTED_ATTEMPT_WRITERS`
+ * below names, for each category, the exact `(kind, reason_code)` an actual `audit.record(...)`
+ * call site uses, found by reading every `.record(` call in `src/` rather than assumed from the
+ * reason code alone. Two of the five pairs still collapse two different events even after
+ * fixing `kind`; those two carry an `isGenuine` check against a field inside `evidence_json`
+ * (the discriminator PRD item 7's third component asks for) rather than a reason code or kind
+ * alone. Where no writer exists at all, the category reports `"UNKNOWN"` — the same non-zero
+ * honesty `acceptedAnomalies` already has, for the same reason: a zero no writer could ever
+ * have produced is not a measurement.
  */
 
 export const AcceptanceReportSchemaId = "agent-control-plane.acceptance-report.v1";
@@ -86,7 +107,15 @@ export interface AnomalyCategories<T> {
  */
 export type AcceptedAnomalyCount = number | "N/A" | "UNKNOWN";
 
-export type PreventedAttempts = AnomalyCategories<number>;
+/**
+ * A count backed by a named, real writer; `"UNKNOWN"` when no production `.record(` call was
+ * found for this category, or when the only pair found still collapses more than one meaning
+ * and cannot be narrowed. Never `"N/A"`: unlike `acceptedAnomalies`, this is not gated on any
+ * lifecycle having happened — a guard can fire, or fail to have a writer, independent of that.
+ */
+export type PreventedAttemptCount = number | "UNKNOWN";
+
+export type PreventedAttempts = AnomalyCategories<PreventedAttemptCount>;
 export type AcceptedAnomalies = AnomalyCategories<AcceptedAnomalyCount>;
 
 export type AcceptanceVerdict = "N/A" | "OBSERVED_NO_ANOMALIES" | "ANOMALIES_PRESENT" | "UNVERIFIED";
@@ -106,27 +135,86 @@ export interface AcceptanceReport {
 }
 
 /**
- * Each of the five categories mapped to the `reason_code`(s) an existing, negative-test-covered
- * enforcement mechanism records when it **refuses** exactly that attempt. This is prevention, not
- * occurrence — see the module comment. Counting `audit_events` rows against these codes is what
- * makes `preventedAttempts` real regardless of lifecycle count: the query is unambiguous.
+ * One real, named production writer: the exact `(kind, reason_code)` an actual
+ * `audit.record(...)` call site uses, found by reading `src/` rather than assumed from the
+ * reason code. `isGenuine`, when present, narrows further inside that row's `evidence_json` —
+ * present only where the `(kind, reason_code)` pair still collapses two different events.
  */
-export const PREVENTED_ATTEMPT_REASON_CODES: Readonly<Record<keyof PreventedAttempts, readonly string[]>> = {
-  // ProductionGate refuses a completion that does not carry the authority to grant it —
-  // tests/unit/core-r2.test.ts and others assert the denial by name.
-  falseCompletions: [ReasonCode.COMPLETION_AUTHORITY_DENIED],
-  // Outbox suppresses a second dispatch of the same message rather than sending it twice —
-  // tests/unit/trusted-core.test.ts, tests/unit/outbox-buzz-claims-r2.test.ts.
-  duplicateDispatches: [ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED],
-  // The candidate pipeline refuses a result computed under a generation that is no longer
-  // current rather than accepting it as if it were fresh — tests/unit/review-r2.test.ts.
-  acceptedStaleGenerationResults: [ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE],
-  // GitHub kernel refuses a gate created by an untrusted party or with unverifiable payload
-  // provenance — tests/scenarios/github-hardening.test.ts, tests/scenarios/github-kernel.test.ts.
-  forgedGates: [ReasonCode.GATE_CREATOR_UNTRUSTED, ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID],
-  // Only the daemon's own approved finalizer may sequence a merge — tests/unit/guard-hardening.test.ts,
-  // tests/scenarios/finalizer.test.ts.
-  unauthorizedMerges: [ReasonCode.MERGE_AUTHORITY_DENIED],
+interface PreventedAttemptWriter {
+  kind: string;
+  reasonCode: string;
+  isGenuine?: (evidence: Record<string, unknown>) => boolean;
+}
+
+/**
+ * For each of the five categories, the real writer(s) — or `null` where none was found. Every
+ * entry names the source file and line reasoning was checked against (2026-08-31, this branch),
+ * because a hand-list like this rots the moment a call site moves; `verify-guards-are-
+ * falsifiable.mjs` carries a row per pair to catch that, and
+ * `tests/unit/acceptance-report.test.ts` asserts each pair's literal text is still present in
+ * the named file.
+ *
+ * - **falseCompletions**: `src/daemon/finalizer.ts` `handleFailure` writes
+ *   `(kind: "FINALIZATION_ATTEMPT_FAILED", reasonCode: failure.reasonCode)` for *any* denied
+ *   step in a finalization attempt. The one step that can fail with
+ *   `COMPLETION_AUTHORITY_DENIED` for a genuine reason is the `RunState.COMPLETED` transition in
+ *   `src/run/run-engine.ts` `transition()` (its `deny()` calls at the authority and run-kind
+ *   checks) — the real "something tried to complete this run without the authority to" guard.
+ *   But the *same reason code* is also what seven unrelated SQLite trigger sentinels translate
+ *   to (`src/db/database.ts` `TRIGGER_CODES`, e.g. `EVIDENCE_WRITE_AUTHORITY_DENIED`,
+ *   `SCHEMA_MIGRATION_AUTHORITY_DENIED`, five `CANONICAL_TURN_*_AUTHORITY_DENIED` triggers), and
+ *   if one of those fires inside the same finalization attempt and is caught into `failure`, the
+ *   row looks identical by `(kind, reason_code)` alone. `translate()`
+ *   (`src/db/database.ts:1012`) always stamps the tripped sentinel onto `evidence.sqlite`; the
+ *   genuine `run-engine.ts` denial's evidence never has that key (its shapes are
+ *   `{ runId, to, supplied }` and `{ runId, kind, expectedSource }`). So `evidence.sqlite`
+ *   absent is the discriminator.
+ * - **duplicateDispatches**: searched and found no writer. `Outbox.enqueue()` (`src/outbox/
+ *   outbox.ts`) returns `OUTBOX_DUPLICATE_SUPPRESSED` as an *allowed* `Decision` value on an
+ *   idempotent replay, and its `catch` block converts the trigger-sourced thrown version of the
+ *   same code back into that same returned Decision — neither path ever calls `.record(`.
+ *   `UNKNOWN`, not `0`.
+ * - **acceptedStaleGenerationResults**: `src/run/candidate-pipeline.ts`
+ *   `recordAttemptReclaimed` is the only writer of `kind: "CANDIDATE_PIPELINE_ATTEMPT_RECLAIMED"`
+ *   in `src/`, and it always pairs that kind with the literal
+ *   `ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE` — already unique, no discriminator needed.
+ * - **forgedGates**: `src/github/github-kernel.ts` writes `kind: "GATE_REJECTED"` for three
+ *   different reason codes from the same gate-check loop — `MERGE_GATE_MISSING` (a gate simply
+ *   absent, not forged), `GATE_PAYLOAD_PROVENANCE_INVALID` and `GATE_CREATOR_UNTRUSTED` (both
+ *   genuinely about a forged or unattributable gate). Filtering by `reason_code` inside that
+ *   `kind` already excludes the non-forgery code; no further discriminator needed.
+ * - **unauthorizedMerges**: `src/guard/managed-write-guard.ts` `ManagedWriteGuard.evaluate()`
+ *   writes `(kind: "MANAGED_WRITE_GUARD", reasonCode: exposed.reasonCode)` for every guard
+ *   decision, and the only place `decide()` returns `MERGE_AUTHORITY_DENIED` is the
+ *   post-approval-write check ("post-approval GitHub writes require the daemon finalizer
+ *   capability") — a genuine blocked unauthorised write during the merge/finalization phase.
+ *   The *other* `MERGE_AUTHORITY_DENIED` site, `github-kernel.ts` `assertFreshDaemonFinalization`
+ *   ("fresh GitHub finalization requires daemon authority"), is not this writer at all — it
+ *   surfaces only through `finalizer.ts`'s `FINALIZATION_ATTEMPT_FAILED`, which this mapping
+ *   does not read from for this category. `kind` alone already separates the two meanings; no
+ *   evidence discriminator needed. (`managed-write-guard.ts:139,445` are composition-root
+ *   construction guards reachable only at startup, never through a request path that reaches
+ *   `.record(`, so they contribute no rows either way.)
+ */
+export const PREVENTED_ATTEMPT_WRITERS: Readonly<
+  Record<keyof PreventedAttempts, readonly PreventedAttemptWriter[] | null>
+> = {
+  falseCompletions: [
+    {
+      kind: "FINALIZATION_ATTEMPT_FAILED",
+      reasonCode: ReasonCode.COMPLETION_AUTHORITY_DENIED,
+      isGenuine: (evidence) => evidence["sqlite"] === undefined,
+    },
+  ],
+  duplicateDispatches: null,
+  acceptedStaleGenerationResults: [
+    { kind: "CANDIDATE_PIPELINE_ATTEMPT_RECLAIMED", reasonCode: ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE },
+  ],
+  forgedGates: [
+    { kind: "GATE_REJECTED", reasonCode: ReasonCode.GATE_CREATOR_UNTRUSTED },
+    { kind: "GATE_REJECTED", reasonCode: ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID },
+  ],
+  unauthorizedMerges: [{ kind: "MANAGED_WRITE_GUARD", reasonCode: ReasonCode.MERGE_AUTHORITY_DENIED }],
 };
 
 /**
@@ -217,25 +305,42 @@ const readLifecycles = (db: Db): AcceptanceLifecycles => {
   return { completed, failed, cancelled, total: completed + failed + cancelled };
 };
 
-const countByReasonCodes = (db: Db, codes: readonly string[]): number => {
-  const placeholders = codes.map(() => "?").join(",");
-  const row = db.get<{ count: number }>(
-    `SELECT COUNT(*) AS count FROM audit_events WHERE reason_code IN (${placeholders})`,
-    [...codes],
+interface AuditEvidenceRow {
+  evidence_json: string;
+}
+
+/** Counts rows for one writer, applying `isGenuine` in JS so evidence never needs a SQL parse. */
+const countWriter = (db: Db, writer: PreventedAttemptWriter): number => {
+  const rows = db.all<AuditEvidenceRow>(
+    `SELECT evidence_json FROM audit_events WHERE kind = ? AND reason_code = ?`,
+    [writer.kind, writer.reasonCode],
   );
-  return row?.count ?? 0;
+  if (!writer.isGenuine) return rows.length;
+  let count = 0;
+  for (const row of rows) {
+    let evidence: Record<string, unknown>;
+    try {
+      evidence = JSON.parse(row.evidence_json) as Record<string, unknown>;
+    } catch {
+      // A row whose evidence cannot be parsed cannot be shown genuine; excluding it is the
+      // safe direction, the same way an unproven accepted anomaly reads UNKNOWN rather than 0.
+      continue;
+    }
+    if (writer.isGenuine(evidence)) count += 1;
+  }
+  return count;
 };
 
-const readPreventedAttempts = (db: Db): PreventedAttempts => ({
-  falseCompletions: countByReasonCodes(db, PREVENTED_ATTEMPT_REASON_CODES.falseCompletions),
-  duplicateDispatches: countByReasonCodes(db, PREVENTED_ATTEMPT_REASON_CODES.duplicateDispatches),
-  acceptedStaleGenerationResults: countByReasonCodes(
-    db,
-    PREVENTED_ATTEMPT_REASON_CODES.acceptedStaleGenerationResults,
-  ),
-  forgedGates: countByReasonCodes(db, PREVENTED_ATTEMPT_REASON_CODES.forgedGates),
-  unauthorizedMerges: countByReasonCodes(db, PREVENTED_ATTEMPT_REASON_CODES.unauthorizedMerges),
-});
+const PREVENTED_ATTEMPT_KEYS = Object.keys(PREVENTED_ATTEMPT_WRITERS) as (keyof PreventedAttempts)[];
+
+const readPreventedAttempts = (db: Db): PreventedAttempts => {
+  const result = {} as PreventedAttempts;
+  for (const key of PREVENTED_ATTEMPT_KEYS) {
+    const writers = PREVENTED_ATTEMPT_WRITERS[key];
+    result[key] = writers === null ? "UNKNOWN" : writers.reduce((sum, writer) => sum + countWriter(db, writer), 0);
+  }
+  return result;
+};
 
 const ACCEPTED_ANOMALY_KEYS = Object.keys(ACCEPTED_ANOMALY_SOURCES) as (keyof AcceptedAnomalies)[];
 
@@ -295,7 +400,13 @@ export const computeVerdict = (
   }
 
   if (unknown.length > 0) {
-    const preventedTotal = Object.values(preventedAttempts).reduce((sum, value) => sum + value, 0);
+    // Categories with no writer (currently `duplicateDispatches`) contribute nothing to this
+    // sum — "UNKNOWN" is not a quantity, and treating it as zero here would be the same error
+    // this file exists to refuse, just inside a sentence instead of a field.
+    const preventedTotal = Object.values(preventedAttempts).reduce(
+      (sum, value) => sum + (typeof value === "number" ? value : 0),
+      0,
+    );
     return {
       verdict: "UNVERIFIED",
       verdictDetail:

@@ -3232,12 +3232,41 @@ const GUARDS = [
     ],
   },
   {
-    what: "a prevented forged-gate attempt is actually counted from its enforcement's reason codes",
+    what: "a prevented forged-gate attempt is actually counted from its enforcement's writer",
     file: "src/export/acceptance-report.ts",
-    find: "  forgedGates: [ReasonCode.GATE_CREATOR_UNTRUSTED, ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID],",
+    find: "  forgedGates: [\n    { kind: \"GATE_REJECTED\", reasonCode: ReasonCode.GATE_CREATOR_UNTRUSTED },\n    { kind: \"GATE_REJECTED\", reasonCode: ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID },\n  ],",
     replace: "  forgedGates: [],",
     killedBy: [
       "tests/unit/acceptance-report.test.ts::a prevented attempt from a guard refusing a forged gate does not produce ANOMALIES_PRESENT",
+    ],
+  },
+  {
+    // #736 third correction: kind and reason_code, keyed alone, are not enough — a
+    // MERGE_AUTHORITY_DENIED row exists under FINALIZATION_ATTEMPT_FAILED too (the daemon's own
+    // finalizer lacking authority mid-finalization), and that is not a blocked unauthorised-merge
+    // attempt. Widening the writer's kind to admit it reintroduces exactly that inversion.
+    what: "unauthorizedMerges counts only the write-guard writer, not the unrelated finalization-failure writer of the same reason code",
+    file: "src/export/acceptance-report.ts",
+    find: "  unauthorizedMerges: [{ kind: \"MANAGED_WRITE_GUARD\", reasonCode: ReasonCode.MERGE_AUTHORITY_DENIED }],",
+    replace:
+      "  unauthorizedMerges: [\n" +
+      "    { kind: \"MANAGED_WRITE_GUARD\", reasonCode: ReasonCode.MERGE_AUTHORITY_DENIED },\n" +
+      "    { kind: \"FINALIZATION_ATTEMPT_FAILED\", reasonCode: ReasonCode.MERGE_AUTHORITY_DENIED },\n" +
+      "  ],",
+    killedBy: [
+      "tests/unit/acceptance-report.test.ts::a MERGE_AUTHORITY_DENIED row written under FINALIZATION_ATTEMPT_FAILED not an unauthorized-merge event does not increment unauthorizedMerges",
+    ],
+  },
+  {
+    // Same correction, the other collapsed reason code: seven unrelated SQLite trigger sentinels
+    // also translate to COMPLETION_AUTHORITY_DENIED (src/db/database.ts TRIGGER_CODES). Removing
+    // the evidence.sqlite discriminator would count any of those seven as a false completion.
+    what: "falseCompletions excludes a COMPLETION_AUTHORITY_DENIED row stamped with an unrelated SQLite trigger sentinel",
+    file: "src/export/acceptance-report.ts",
+    find: '      isGenuine: (evidence) => evidence["sqlite"] === undefined,',
+    replace: "      isGenuine: () => true,",
+    killedBy: [
+      "tests/unit/acceptance-report.test.ts::a COMPLETION_AUTHORITY_DENIED row stamped with a non-completion SQLite sentinel does not increment falseCompletions",
     ],
   },
   {
