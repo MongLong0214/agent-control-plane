@@ -3416,8 +3416,39 @@ const GUARDS = [
     // difference reliably on every run.
     what: "createCheckoutLeafOrDeny — the filesystem's own atomic mkdir, not existsSync — decides a same-path creation collision",
     file: "src/bootstrap/repo-factory-producer.ts",
-    find: "    mkdirSync(localRepoPath);\n",
-    replace: "    mkdirSync(localRepoPath, { recursive: true });\n",
+    find: "    mkdirSync(localRepoPath, { mode: SAFE_DIRECTORY_MODE });\n",
+    replace: "    mkdirSync(localRepoPath, { mode: SAFE_DIRECTORY_MODE, recursive: true });\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // CEO review round 6, defect 1 — `statSync` follows a symlink and reports its *target*'s
+    // identity, not the entry's own. `assertParentChainNotAttackerWritable` computed
+    // `dirname(workDir)` through a symlink (`unsafeGrandparent/link -> safeTarget`, the
+    // target 0700 and owned by this process) and, under the previous `statSync`-based check,
+    // judged `safeTarget` as safe without ever examining `link` itself or the unsafe
+    // directory that actually governs whether that entry can be renamed. Neutering the
+    // symlink/non-directory check here reproduces exactly that: a symlink anywhere in the
+    // chain is judged by whatever it resolves to, rather than refused outright.
+    what: "judgeRealDirectoryEntry refuses a symlink outright rather than judging whatever it resolves to",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "  if (stat.isSymbolicLink() || !stat.isDirectory()) {\n",
+    replace: "  if (false && (stat.isSymbolicLink() || !stat.isDirectory())) {\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // CEO review round 6, defect 2 — an explicit `mode` on `mkdirSync` is still subject to
+    // the process umask, and the previous shape returned `allow` the instant `mkdirSync`
+    // succeeded, never inspecting what was actually created. Under `umask(0)`, a bare
+    // `mkdirSync(dir)` with no mode argument created `workDir`, `repositories`, and the
+    // checkout leaf all at `0777` — world-writable — and the run completed successfully
+    // anyway. Neutering the explicit safe mode here (removing it from `ensureDirectoryLevel`'s
+    // creation of `workDir`/`repositories`) reproduces that under a hostile umask; the
+    // post-creation judgement this same round adds is what still catches it, so the pinned
+    // test also proves that half by checking the resulting mode is exactly `0700`.
+    what: "ensureDirectoryLevel gives every directory it creates an explicit safe mode, not whatever the process umask happens to leave",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "    mkdirSync(dir, { mode: SAFE_DIRECTORY_MODE });\n",
+    replace: "    mkdirSync(dir);\n",
     killedBy: ["tests/unit/repo-factory-producer.test.ts"],
   },
 ];

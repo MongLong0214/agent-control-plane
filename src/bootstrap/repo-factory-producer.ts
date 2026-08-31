@@ -4,8 +4,8 @@ import {
   mkdirSync,
   readFileSync,
   rmSync,
-  statSync,
   writeFileSync,
+  type Stats,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
@@ -179,6 +179,33 @@ export const judgeDirectoryOwnership = (
 };
 
 /**
+ * Judges the real, on-disk entry at `dir` — via `lstatSync`, which the caller must have
+ * already taken (never `statSync`, which follows a symlink and reports its *target*'s
+ * identity instead of the entry's own). CEO review round 6, defect 1: a `workDir` reached
+ * through `unsafeGrandparent/link -> safeTarget` looked safe under `statSync`, because it
+ * silently inspected `safeTarget` (0700, owned by this process) and never examined `link`
+ * itself or `unsafeGrandparent`, the directory that actually governs whether the `link`
+ * *entry* can be renamed or replaced by another account. A symlink anywhere this producer
+ * expects a real directory is refused outright, regardless of what it resolves to or who
+ * owns that target — verifying the indirection away is not the same as refusing to depend
+ * on one at all, and only the second is real.
+ */
+const judgeRealDirectoryEntry = (
+  dir: string,
+  stat: Stats,
+  myUid: number,
+): Decision<void> => {
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    return deny(
+      ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
+      "a directory this run depends on is a symlink or not a directory at all; refusing rather than trust what it resolves to or who can replace the entry itself",
+      { dir },
+    );
+  }
+  return judgeDirectoryOwnership(dir, stat, myUid);
+};
+
+/**
  * CEO review round 4, defect 3 — round 3's fix re-verified the checkout path's device+inode
  * identity immediately before every subsequent operation. CEO's verdict was explicit and
  * demonstrated directly: a swap injected strictly between a successful re-check and the git
@@ -252,11 +279,63 @@ const assertParentChainNotAttackerWritable = (workDir: string, localRepoPath: st
     if (parentOfWorkDir !== boundary) chain.push(parentOfWorkDir);
   }
   for (const dir of chain) {
-    if (!existsSync(dir)) continue; // not created yet — nothing to own or misconfigure
-    const judged = judgeDirectoryOwnership(dir, statSync(dir), myUid);
+    let stat: Stats;
+    try {
+      stat = lstatSync(dir);
+    } catch {
+      continue; // not created yet — nothing to own or misconfigure
+    }
+    const judged = judgeRealDirectoryEntry(dir, stat, myUid);
     if (!judged.allowed) return judged;
   }
   return allow(ReasonCode.OK, undefined);
+};
+
+/** Owner-only. Passed explicitly to every `mkdirSync` this producer performs — see below. */
+const SAFE_DIRECTORY_MODE = 0o700;
+
+/**
+ * Judges whatever now sits at `dir` — freshly created by this same call, or discovered
+ * already there — and, if this call is the one that just created it, removes it again on a
+ * denial. CEO review round 6, defect 2: an explicit `mode` on `mkdirSync` is still subject to
+ * the process umask (`mode & ~umask`), and the previous shape returned `allow` the instant
+ * `mkdirSync` succeeded, never inspecting what was actually created. Reproduced directly:
+ * under `umask(0)`, a bare `mkdirSync(dir)` with no mode argument created `workDir`,
+ * `repositories`, and the checkout leaf all at `0777` — world-writable — and the run
+ * completed successfully anyway. `SAFE_DIRECTORY_MODE` narrows what is *requested*; this
+ * function is what actually verifies what was *granted*, via `lstatSync` (never `statSync`,
+ * for the same reason `judgeRealDirectoryEntry` above does not use it).
+ *
+ * Self-cleanup is safe exactly because there is no gap to race here: `mkdirSync` above and
+ * this judgement are the same synchronous call, so whatever this call just created is
+ * unambiguously its own — unlike `cleanupOwnedCheckout`, which needs the ownership-marker
+ * dance because real async work happens between creating the checkout and a possible later
+ * failure.
+ */
+const judgeAndCleanupIfJustCreated = (dir: string, justCreated: boolean): Decision<void> => {
+  if (typeof process.getuid !== "function") {
+    if (justCreated) rmSync(dir, { recursive: true, force: true });
+    return deny(
+      ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
+      "ownership verification is not supported on this platform; refusing rather than silently skipping it",
+      { dir },
+    );
+  }
+  let stat: Stats;
+  try {
+    stat = lstatSync(dir);
+  } catch (err) {
+    return deny(
+      ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
+      "a directory this run needs disappeared between creation and inspection",
+      { dir, message: (err as Error).message },
+    );
+  }
+  const judged = judgeRealDirectoryEntry(dir, stat, process.getuid());
+  if (!judged.allowed && justCreated) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  return judged;
 };
 
 /**
@@ -267,14 +346,32 @@ const assertParentChainNotAttackerWritable = (workDir: string, localRepoPath: st
  * through it and writes real directories inside whatever it points to, *before* any
  * post-creation check gets a chance to refuse (CEO review round 4, defect 3b). A plain
  * `mkdirSync(dir)` either creates a fresh, genuine directory atomically, or fails `EEXIST`
- * if anything — including a symlink raced into place — already occupies that exact path; the
- * `lstatSync` fallback below (never `statSync`, which would follow a symlink and inspect its
- * *target* instead of the entry itself) tells the two cases apart and refuses the second.
+ * if anything — including a symlink raced into place — already occupies that exact path.
+ * Either way, `judgeAndCleanupIfJustCreated` verifies what is actually there afterward —
+ * freshly created or reused, real directory or something else, safe mode or not.
  *
  * `workDir` and the shared `repositories` directory are created this way; the checkout leaf
- * itself uses the same primitive directly in `produceRepoFactoryResult` as the collision
- * authority (see the comment there for why that matters for same-UID concurrency).
+ * itself uses `createCheckoutLeafOrDeny` in `produceRepoFactoryResult` (same shape, except an
+ * already-existing directory there is a collision, never something to reuse).
  */
+export const ensureDirectoryLevel = (dir: string): Decision<void> => {
+  let justCreated = false;
+  try {
+    mkdirSync(dir, { mode: SAFE_DIRECTORY_MODE });
+    justCreated = true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "EEXIST") {
+      return deny(
+        ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
+        "could not create a directory this run needs",
+        { dir, message: (err as Error).message },
+      );
+    }
+  }
+  return judgeAndCleanupIfJustCreated(dir, justCreated);
+};
+
 /**
  * THE collision authority for the checkout leaf itself (CEO review round 5, defect 2). Unlike
  * `ensureDirectoryLevel` above — which treats an already-existing real directory as fine to
@@ -289,12 +386,15 @@ const assertParentChainNotAttackerWritable = (workDir: string, localRepoPath: st
  * that is Node's own documented idempotent behaviour, and it is exactly why the previous
  * shape gave two concurrent creators no collision signal whatsoever; a plain, non-recursive
  * `mkdirSync` on the same already-existing directory does throw `EEXIST`, tested directly
- * below without needing a real race).
+ * below without needing a real race). As with `ensureDirectoryLevel`, a successful create is
+ * still judged afterward — see `judgeAndCleanupIfJustCreated` for why (CEO review round 6,
+ * defect 2).
  */
 export const createCheckoutLeafOrDeny = (localRepoPath: string): Decision<void> => {
+  let justCreated = false;
   try {
-    mkdirSync(localRepoPath);
-    return allow(ReasonCode.OK, undefined);
+    mkdirSync(localRepoPath, { mode: SAFE_DIRECTORY_MODE });
+    justCreated = true;
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "EEXIST") {
@@ -310,40 +410,7 @@ export const createCheckoutLeafOrDeny = (localRepoPath: string): Decision<void> 
       { localRepoPath, message: (err as Error).message },
     );
   }
-};
-
-export const ensureDirectoryLevel = (dir: string): Decision<void> => {
-  try {
-    mkdirSync(dir);
-    return allow(ReasonCode.OK, undefined);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code !== "EEXIST") {
-      return deny(
-        ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
-        "could not create a directory this run needs",
-        { dir, message: (err as Error).message },
-      );
-    }
-  }
-  let stat: ReturnType<typeof lstatSync>;
-  try {
-    stat = lstatSync(dir);
-  } catch (statErr) {
-    return deny(
-      ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
-      "a directory this run needs disappeared between creation and inspection",
-      { dir, message: (statErr as Error).message },
-    );
-  }
-  if (!stat.isDirectory()) {
-    return deny(
-      ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
-      "a path this run needs to be a real directory is something else (possibly a symlink raced into place)",
-      { dir },
-    );
-  }
-  return allow(ReasonCode.OK, undefined);
+  return judgeAndCleanupIfJustCreated(localRepoPath, justCreated);
 };
 
 /**

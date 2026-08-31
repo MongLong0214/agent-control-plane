@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -377,6 +378,83 @@ describe("repo factory producer (#246)", () => {
       symlinkSync(elsewhere, symlinked);
       const refused = ensureDirectoryLevel(symlinked);
       expect(refused.allowed).toBe(false);
+    });
+  });
+
+  /**
+   * CEO review round 6 — two counterexamples against round 5's ownership-chain
+   * implementation, both verified empirically against commit `42564de` before this fix.
+   */
+  describe("CEO review round 6, defect 1 — statSync followed the symlink, judging the wrong directory", () => {
+    it("refuses when workDir's own parent is reached through a symlink whose target looks safe — verifies the entry, not the followed target", async () => {
+      // Reproduced against 42564de: `unsafeGrandparent` (0777) held `link -> safeTarget`
+      // (0700, owned by this process). `assertParentChainNotAttackerWritable` computed
+      // `dirname(workDir)` as `unsafeGrandparent/link` and called `statSync` on it, which
+      // followed the symlink and reported `safeTarget`'s uid/mode — safe — never inspecting
+      // `link` itself or the unsafe directory that actually contains that entry. Observed:
+      // `produced.allowed: true`, a full repository written inside `safeTarget`. `lstatSync`
+      // sees `link` as the symlink it is and refuses outright, regardless of what it
+      // resolves to.
+      const { sandbox } = makeSandbox();
+      const unsafeGrandparent = join(sandbox, "unsafe-grandparent");
+      mkdirSync(unsafeGrandparent, { recursive: true });
+      chmodSync(unsafeGrandparent, 0o777);
+
+      const safeTarget = join(sandbox, "safe-target");
+      mkdirSync(safeTarget, { recursive: true, mode: 0o700 });
+
+      const link = join(unsafeGrandparent, "link");
+      symlinkSync(safeTarget, link);
+
+      const workDir = join(link, "workdir"); // does not exist yet; dirname(workDir) === link
+
+      const produced = await produceRepoFactoryResult({ plan: basePlan(), workDir });
+      expect(produced.allowed).toBe(false);
+      // Not merely refused afterward — nothing was ever written through the symlink either.
+      expect(readdirSync(safeTarget)).toEqual([]);
+    });
+  });
+
+  describe("CEO review round 6, defect 2 — a newly created directory was never judged", () => {
+    it("gives every level it creates an explicit safe mode and judges it afterward, even under a hostile umask", async () => {
+      // Reproduced against 42564de: under `umask(0)`, a bare `mkdirSync(dir)` with no mode
+      // argument created `workDir`, `repositories`, and the checkout leaf all at `0777` —
+      // world-writable — and `ensureDirectoryLevel`/`createCheckoutLeafOrDeny` returned
+      // `allow` the instant `mkdirSync` succeeded, never inspecting what was actually
+      // created. The restore below runs in a `finally`: leaking a process-wide umask into
+      // the rest of the suite would be its own defect.
+      const { workDir } = makeSandbox();
+      const oldUmask = process.umask(0);
+      try {
+        const produced = await produceRepoFactoryResult({ plan: basePlan(), workDir });
+        expect(produced.allowed).toBe(true);
+        if (!produced.allowed) return;
+        const checkoutPath = produced.value.repositories[0]?.proposedCheckoutPath;
+        expect(checkoutPath).toBeTruthy();
+        if (!checkoutPath) return;
+
+        expect(statSync(workDir).mode & 0o777).toBe(0o700);
+        expect(statSync(join(workDir, "repositories")).mode & 0o777).toBe(0o700);
+        expect(statSync(checkoutPath).mode & 0o777).toBe(0o700);
+      } finally {
+        process.umask(oldUmask);
+      }
+    });
+
+    it("refuses a freshly created directory left unsafe by the platform, rather than trusting mkdirSync's success alone — pure decision, no umask needed", () => {
+      // Exercises `judgeAndCleanupIfJustCreated`'s own decision indirectly: a directory
+      // that exists with an unsafe mode is refused whether this call created it a moment
+      // ago or found it already there — the judgement does not depend on which.
+      const { sandbox } = makeSandbox();
+      const dir = join(sandbox, "already-unsafe");
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      chmodSync(dir, 0o777); // simulates a directory this run just created ending up unsafe
+      const judged = ensureDirectoryLevel(dir);
+      expect(judged.allowed).toBe(false);
+      // The directory existed before this call (from this test's own setup, standing in for
+      // "just created"), so ensureDirectoryLevel's self-cleanup does not apply here — this
+      // pins the judgement itself, not the cleanup.
+      expect(existsSync(dir)).toBe(true);
     });
   });
 
