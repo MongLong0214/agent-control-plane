@@ -301,19 +301,29 @@ export class TelegramIngress {
     return this.guard.resolveTurn("telegram", nonce);
   }
 
-  /** The reply's terminal transition and the turn's resolution, in one transaction. */
-  completeReplyAndResolveTurn(nonce: string, result: unknown): Decision<void> {
-    return this.guard.completeReplyAndResolveTurn("telegram", nonce, result);
+  /**
+   * The reply's terminal transition and, only for a turn the CEO answered, its resolution.
+   *
+   * `turnOutcome` is passed through rather than decided here: this class knows the channel, and
+   * the router knows what the reply is. See the guard method for why it has no default (#639).
+   */
+  completeReplyAndResolveTurn(
+    nonce: string,
+    result: unknown,
+    turnOutcome: "ANSWERED" | "UNANSWERED",
+  ): Decision<void> {
+    return this.guard.completeReplyAndResolveTurn("telegram", nonce, result, turnOutcome);
   }
 
-  /** Atomically records a terminal failed reply and settles the handler's turn, if it claimed one. */
+  /** Atomically records a terminal failed reply and settles the handler's turn, if it answered one. */
   settleReplyAndTurn(
     nonce: string,
     result: unknown,
     settlement: "UNANSWERABLE" | "UNRESOLVED",
+    turnOutcome: "ANSWERED" | "UNANSWERED",
     expected: "PENDING" | "UNKNOWN_RETRYABLE" = "PENDING",
   ): Decision<void> {
-    return this.guard.settleReplyAndTurn("telegram", nonce, result, settlement, expected);
+    return this.guard.settleReplyAndTurn("telegram", nonce, result, settlement, turnOutcome, expected);
   }
 
   /**

@@ -8,6 +8,7 @@ import { createHermesMcpPort } from "../mcp/hermes-server.ts";
 import { IngressGuard } from "./ingress-guard.ts";
 import {
   type TelegramReply,
+  type TelegramDirectAnswer,
   type TelegramDirectInput,
   TelegramHermesRouter,
   type TelegramOwnerGateSignal,
@@ -267,7 +268,9 @@ export type TelegramLongPollRuntimeStatus =
 export interface TelegramLongPollStartOptions {
   transport?: TelegramBotTransport;
   onError?: (error: unknown) => void;
-  onDirect?: (input: TelegramDirectInput) => string | Promise<string>;
+  onDirect?: (
+    input: TelegramDirectInput,
+  ) => string | TelegramDirectAnswer | Promise<string | TelegramDirectAnswer>;
   onCeoApproved?: (runId: string) => void | Promise<unknown>;
   /** Production starts polling immediately; tests can drive one poll cycle deterministically. */
   start?: boolean;
@@ -1531,6 +1534,7 @@ const storedState = (cp: ControlPlane, nonce: string): TelegramStoredState | nul
       deliveryStatus?: unknown;
       unknownDeliveryAttempts?: unknown;
       deliveryFailure?: unknown;
+      turnAnswered?: unknown;
     };
     if (
       candidate.kind !== "TELEGRAM_WORKFLOW" ||
@@ -1538,6 +1542,10 @@ const storedState = (cp: ControlPlane, nonce: string): TelegramStoredState | nul
     ) return null;
     if (candidate.runId !== undefined && typeof candidate.runId !== "string") return null;
     if (candidate.sent !== undefined && typeof candidate.sent !== "boolean") return null;
+    // This parser rebuilds the state field by field rather than casting the row, so a field it
+    // does not name is silently dropped — which is how the first draft of #639 lost
+    // `turnAnswered` between the reservation and the restart that reads it back.
+    if (candidate.turnAnswered !== undefined && typeof candidate.turnAnswered !== "boolean") return null;
     if (
       candidate.deliveryStatus !== undefined &&
       ![
@@ -1558,6 +1566,7 @@ const storedState = (cp: ControlPlane, nonce: string): TelegramStoredState | nul
         kind: "TELEGRAM_WORKFLOW",
         phase: candidate.phase as TelegramStoredState["phase"],
         ...(candidate.runId ? { runId: candidate.runId } : {}),
+        ...(candidate.turnAnswered === undefined ? {} : { turnAnswered: candidate.turnAnswered }),
       };
     }
     if (
@@ -1600,6 +1609,7 @@ const storedState = (cp: ControlPlane, nonce: string): TelegramStoredState | nul
         ? {}
         : { unknownDeliveryAttempts: Number(candidate.unknownDeliveryAttempts) }),
       ...(deliveryFailure ? { deliveryFailure } : {}),
+      ...(candidate.turnAnswered === undefined ? {} : { turnAnswered: candidate.turnAnswered }),
     };
   } catch {
     return null;
