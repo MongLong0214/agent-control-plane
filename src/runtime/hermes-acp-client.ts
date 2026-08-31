@@ -1,6 +1,6 @@
 import { spawn as spawnChild } from "node:child_process";
 import { createHash } from "node:crypto";
-import { EventEmitter } from "node:events";
+import type { EventEmitter } from "node:events";
 import { StringDecoder } from "node:string_decoder";
 
 /** The exact eight-field wire proof accepted by `hermes acp`; it has no schema field. */
