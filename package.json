@@ -18,6 +18,8 @@
     "declarations:tracker-loci-strip": "tsc --allowJs --checkJs --declaration --emitDeclarationOnly --skipLibCheck --module ESNext --target ES2023 --moduleResolution bundler --outDir scripts/lib scripts/lib/tracker-loci-strip.mjs",
     "typecheck": "pnpm declarations:tracker-loci-strip && git diff --exit-code -- scripts/lib/tracker-loci-strip.d.mts && tsc --noEmit",
     "ci:preflight": "node scripts/verify-ci-preflight.mjs",
+    "gates": "node scripts/run-prepush-gates.mjs",
+    "gates:ci-parity": "node scripts/verify-ci-runs-the-gate-runner.mjs",
     "test": "node scripts/verify-v1-experiment-isolation-declaration.mjs && node scripts/run-vitest-gate.mjs",
     "test:unit": "vitest run tests/unit",
     "test:scenarios": "vitest run tests/scenarios",

@@ -131,6 +131,188 @@ const GUARDS = [
     replace: "const workflowNames = [];\n",
     killedBy: ["tests/process/ci-preflight.test.ts::accepts every repository workflow command"],
   },
+  // sol-simplify: #739's rows. They exist only while the gate manifest and its runner do;
+  // remove them with that contract, not before it.
+  {
+    what: "the gate-parity check refuses a gate the CI job runs outside the runner",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "        fail(\n" +
+      "          `${where}: ${CI_GATE_JOB} runs ${JSON.stringify(command.key)} as its own step. ` +\n" +
+      "            \"A gate CI runs and `pnpm gates` does not is exactly the drift #739 removes — put it \" +\n" +
+      "            \"in GATES in scripts/lib/prepush-gates.mjs, or declare it as setup with a reason.\",\n" +
+      "        );\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses a gate CI runs as its own step — the #736 shape, in the direction CI grows",
+    ],
+  },
+  {
+    what: "the gate-parity check refuses a command in the gate job it cannot name",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "          fail(\n" +
+      "            `${where}: ${CI_GATE_JOB} runs ${JSON.stringify(segment)}, which is neither the gate ` +\n" +
+      "              \"runner nor a declared setup command. The gate job may only build the environment \" +\n" +
+      "              \"and run `pnpm gates`; anything else is a gate that exists on one side only.\",\n" +
+      "          );\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses a command in the gate job it cannot name at all",
+    ],
+  },
+  {
+    what: "the gate-parity check refuses a CI job that never runs the gate runner",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "  fail(\n" +
+      "    `${gateJobSource}: ${CI_GATE_JOB} never runs \\`pnpm ${RUNNER_SCRIPT}\\`. CI would then have its ` +\n" +
+      "      \"own gate list, which is the second source of truth #739 exists to remove.\",\n" +
+      "  );\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses a CI job that lists its own gates instead of invoking the runner",
+    ],
+  },
+  {
+    what: "the gate-parity check refuses a runner invocation carrying arguments",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "          fail(\n" +
+      "            `${where}: the gate runner is invoked with ${JSON.stringify(command.args.join(\" \"))}; ` +\n" +
+      "              \"it must be invoked with no arguments so that CI runs the whole manifest\",\n" +
+      "          );\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses a runner invocation carrying arguments, which is how a subset gets in",
+    ],
+  },
+  {
+    what: "the gate-parity check refuses a gates script that does not invoke the runner",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "  fail(\n" +
+      "    `the ${JSON.stringify(RUNNER_SCRIPT)} script does not invoke ${RUNNER_PATH} ` +\n" +
+      "      `(it is ${JSON.stringify(runnerScriptBody)})`,\n" +
+      "  );\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses a gates script that no longer invokes the runner",
+    ],
+  },
+  {
+    what: "the gate-parity check refuses a manifest gate that names no package script",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "    fail(`the gate manifest names ${JSON.stringify(gate.script)}, which is not a package script`);\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses a manifest gate whose package script a merge deleted",
+    ],
+  },
+  {
+    what: "the gate-parity check refuses verification in another job that no declaration explains",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "        fail(\n" +
+      "          `${where}: job ${JSON.stringify(run.job)} runs ${JSON.stringify(command.key)}, which is ` +\n" +
+      "            \"neither in the gate manifest nor declared in VERIFICATION_OUTSIDE_THE_RUNNER. \" +\n" +
+      "            `Add it to GATES, or declare ${JSON.stringify(declarationKey)} with the reason it is ` +\n" +
+      "            \"not a pre-push gate.\",\n" +
+      "        );\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses verification in another job that no declaration explains",
+    ],
+  },
+  {
+    what: "the gate-parity check refuses continue-on-error on the gate job",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "      fail(`${source}:${index + 1}: ${CI_GATE_JOB} sets continue-on-error, so its gates cannot fail the job`);\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses continue-on-error on the gate job, which would let every gate fail green",
+    ],
+  },
+  {
+    what: "the gate-parity check refuses a declaration that names nothing a workflow runs",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "    fail(`VERIFICATION_OUTSIDE_THE_RUNNER declares ${JSON.stringify(key)}, which no workflow runs; remove it`);\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses a declaration that no longer names anything a workflow runs",
+    ],
+  },
+  {
+    what: "the gate-parity check refuses a command-shaped line it could not attribute",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "      fail(\n" +
+      "        `${source}:${index + 1}: a command-shaped line outside every parsed run block: ` +\n" +
+      "          `${JSON.stringify(line.trim())}. This check could not classify it, so it refuses rather ` +\n" +
+      "          \"than report a coverage it does not have.\",\n" +
+      "      );\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses a run: form it cannot attribute, rather than reporting a coverage it does not have",
+    ],
+  },
+  {
+    what: "the gate runner stops at the first failing gate",
+    file: "scripts/run-prepush-gates.mjs",
+    find:
+      "  if (status !== 0) {\n" +
+      "    failure = { printed, status, detail, index };\n" +
+      "    break;\n" +
+      "  }\n",
+    replace:
+      "  if (status !== 0) {\n" +
+      "    failure = { printed, status, detail, index };\n" +
+      "  }\n",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::stops at the first failing gate and exits with that gate's status",
+    ],
+  },
+  {
+    what: "the gate runner exits with the failing gate's status",
+    file: "scripts/run-prepush-gates.mjs",
+    find:
+      "process.exit(failure ? failure.status : 0);\n",
+    replace:
+      "process.exit(0);\n",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::stops at the first failing gate and exits with that gate's status",
+    ],
+  },
+  {
+    what: "the gate runner counts a signal-killed gate as a failure",
+    file: "scripts/run-prepush-gates.mjs",
+    find:
+      "  const status = child.error ? 1 : child.signal ? 128 : (child.status ?? 1);\n",
+    replace:
+      "  const status = child.error ? 1 : child.signal ? 0 : (child.status ?? 1);\n",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::counts a gate killed by a signal as a failure, not as an exit code of zero",
+    ],
+  },
+  {
+    what: "the gate runner refuses an argument that would run part of the set",
+    file: "scripts/run-prepush-gates.mjs",
+    find:
+      "if (unknown.length > 0) {\n" +
+      "  process.stderr.write(\n" +
+      "    `gates: unrecognised argument(s): ${unknown.join(\" \")}\\n` +\n" +
+      "      \"gates runs the whole set; there is deliberately no way to run part of it.\\n\",\n" +
+      "  );\n" +
+      "  process.exit(2);\n" +
+      "}\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses an argument, because a subset of the gates is the thing that failed #736",
+    ],
+  },
   {
     // This is the one static outflow for the code. Its catalogue classification remains,
     // proving that membership metadata and prose cannot satisfy the outflow census.
