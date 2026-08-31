@@ -254,6 +254,21 @@ non-empty, absolute, and a real file.
     SOURCE_SIZE="$(stat -f '%z' "$SOURCE_DB")"
     SOURCE_INODE="$(stat -f '%i' "$SOURCE_DB")"
     SOURCE_MTIME="$(stat -f '%Sm' "$SOURCE_DB")"
+    # Byte 18 of the SQLite header is the file-format write version: 1 is a rollback journal,
+    # 2 is WAL. Every `sqlite3` call below passes `-readonly`, and a read-only connection to a
+    # WAL database has to create the `-shm` file it is not allowed to create — it fails
+    # `SQLITE_CANTOPEN (14)` with no explanation of why. This is read from the file's own bytes
+    # rather than asked of `sqlite3`, because asking is the thing that cannot work here.
+    #
+    # This is not hypothetical and it is not stable: the live database is `delete` (measured), but
+    # `Db`'s constructor sets `journal_mode = WAL` on a database it creates (`src/db/database.ts`
+    # around the `PRAGMA journal_mode = WAL` line), so a state file created by this code rather
+    # than inherited from an older one is WAL. Until this procedure is re-verified for that case,
+    # a WAL source stops here with a sentence that says so, instead of an errno.
+    SOURCE_JOURNAL_FORMAT="$(od -An -tu1 -j18 -N1 "$SOURCE_DB" | tr -d ' ')"
+    if [ "$SOURCE_JOURNAL_FORMAT" != "1" ]; then
+      echo "refusing: $SOURCE_DB has SQLite write-format $SOURCE_JOURNAL_FORMAT, not 1; a read-only connection cannot open a WAL database and this procedure is not verified for one" >&2; exit 1
+    fi
     SOURCE_USER_VERSION="$(sqlite3 -readonly "$SOURCE_DB" 'PRAGMA user_version;')"
     echo "source: size=$SOURCE_SIZE inode=$SOURCE_INODE mtime=$SOURCE_MTIME user_version=$SOURCE_USER_VERSION"
 
@@ -279,10 +294,35 @@ non-empty, absolute, and a real file.
       echo "refusing: $BACKUP_TMP is empty or already exists" >&2; exit 1
     fi
 
+    # Cleanup is armed here, before the temp file can exist, rather than beside the publish step
+    # that needs it. Every refusal between this line and the end is a refusal that has already
+    # created something, and an earlier revision armed the trap only at step 7 — so each of those
+    # left a `.state-….tmp-<pid>` behind in the backup directory. `$BACKUP_TMP` carries this
+    # shell's pid, so it names nothing another run owns.
+    #
+    # It unlinks only names *this run itself created*, and never `$BACKUP_PATH`, which this run
+    # never creates unless it is committing. The manifest link is dropped only while the commit
+    # marker is absent: once `$BACKUP_PATH` exists the publication is complete and belongs to
+    # whoever made it, and an unconditional `rm -f "$BACKUP_PATH"` here would let a run that
+    # merely collided at step 7 delete a stranger's verified backup on its way out. That is not
+    # hypothetical — it is what the released-reservation revision did.
+    MANIFEST_LINKED=0
+    publish_cleanup() {
+      if [ "$MANIFEST_LINKED" = "1" ] && [ ! -e "$BACKUP_PATH" ]; then
+        rm -f "$BACKUP_PATH.manifest.json"
+      fi
+      rm -f "$BACKUP_TMP" "${BACKUP_TMP}.manifest.json"
+    }
+    trap publish_cleanup EXIT
+
     # 3. The backup itself: one `sqlite3` invocation, the online backup API, against the live
     #    database exactly as it stands. Busy, error, or any nonzero exit stops here — there is no
     #    raw-copy fallback for this command to fall back to.
     sqlite3 -readonly "$SOURCE_DB" ".timeout 30000" ".backup '$BACKUP_TMP'"
+    # `readManifest` in `src/db/backup.ts` runs `assertPrivatePath` on both the backup and its
+    # manifest, and that requires mode exactly 0600. `.backup` writes with the ambient umask, so
+    # without this the restore refuses the artifact on permissions alone.
+    chmod 600 "$BACKUP_TMP"
 
     # 4. Verify the artifact before trusting it further. `$SOURCE_DB` above and `$BACKUP_TMP` here
     #    are the only two paths this block ever hands to `sqlite3`, and both are proven non-empty,
@@ -310,23 +350,39 @@ non-empty, absolute, and a real file.
     fi
 
     # 6. Manifest — the backup's own sha256, written and then re-verified from the file on disk,
-    #    not trusted from a shell variable alone. The rollback receipt below, and item 6, accept
-    #    only this exact, verified path.
-    BACKUP_SHA256="$(shasum -a 256 "$BACKUP_TMP" | cut -d' ' -f1)"
+    #    not trusted from a shell variable alone.
+    #
+    #    The schema is **not this document's to choose**. `readManifest` in `src/db/backup.ts` is
+    #    the only reader that matters, because every restore goes through it, and it accepts
+    #    exactly these five fields: `format` equal to the string below, `databaseFile` equal to
+    #    the backup's basename, `databaseSha256` matching `^sha256:[a-f0-9]{64}$`, an integer
+    #    `schemaVersion`, and a string `createdAt`. An earlier revision invented a second schema
+    #    here (`…/online-v1`, `backupSha256`, `backupUserVersion`) and it was never readable:
+    #    `state-admin.js restore` rejected every backup this procedure produced, with
+    #    `backup manifest has an invalid shape`. The procedure whose only purpose is to make a
+    #    rollback possible produced backups the rollback refused.
+    #
+    #    So: one schema, owned by the code that validates it. If these fields ever need to change,
+    #    they change in `src/db/backup.ts` first and here second — never the other way round. The
+    #    source identity that used to live in this file is already on stdout from step 1.
+    BACKUP_SHA256="sha256:$(shasum -a 256 "$BACKUP_TMP" | cut -d' ' -f1)"
     BACKUP_USER_VERSION="$(sqlite3 -readonly "$BACKUP_TMP" 'PRAGMA user_version;')"
+    # `schemaVersion` is JSON-unquoted, so a non-integer here does not produce a manifest that is
+    # merely wrong — it produces one that is not JSON, and the failure surfaces at restore time as
+    # a parse error rather than here as a refusal.
+    case "$BACKUP_USER_VERSION" in
+      ''|*[!0-9]*) echo "refusing: user_version of $BACKUP_TMP is '$BACKUP_USER_VERSION', not an integer" >&2; exit 1 ;;
+    esac
     cat > "${BACKUP_TMP}.manifest.json" <<JSON
-      { "format": "agent-control-plane.sqlite-backup/online-v1",
-        "sourcePath": "$SOURCE_DB",
-        "sourceSize": $SOURCE_SIZE,
-        "sourceInode": $SOURCE_INODE,
-        "sourceUserVersion": $SOURCE_USER_VERSION,
-        "backupPath": "$BACKUP_PATH",
-        "backupSha256": "$BACKUP_SHA256",
-        "backupUserVersion": $BACKUP_USER_VERSION,
-        "createdAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)" }
+    { "format": "agent-control-plane.sqlite-backup/v1",
+      "databaseFile": "$BACKUP_NAME",
+      "databaseSha256": "$BACKUP_SHA256",
+      "schemaVersion": $BACKUP_USER_VERSION,
+      "createdAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)" }
     JSON
-    grep -q "\"backupSha256\": \"$BACKUP_SHA256\"" "${BACKUP_TMP}.manifest.json"
-    VERIFY_SHA256="$(shasum -a 256 "$BACKUP_TMP" | cut -d' ' -f1)"
+    chmod 600 "${BACKUP_TMP}.manifest.json"
+    grep -q "\"databaseSha256\": \"$BACKUP_SHA256\"" "${BACKUP_TMP}.manifest.json"
+    VERIFY_SHA256="sha256:$(shasum -a 256 "$BACKUP_TMP" | cut -d' ' -f1)"
     if [ "$VERIFY_SHA256" != "$BACKUP_SHA256" ]; then
       echo "refusing: re-hash of $BACKUP_TMP no longer matches the recorded sha256" >&2; exit 1
     fi
@@ -350,25 +406,24 @@ non-empty, absolute, and a real file.
       echo "refusing: $BACKUP_TMP is not on the same filesystem as $BACKUP_DIR; ln cannot claim the final name atomically" >&2
       exit 1
     fi
-    MANIFEST_LINKED=0
-    # Runs once, however this shell exits, and unlinks only names *this run itself created* —
-    # never `$BACKUP_PATH`, which this run never creates unless it is committing. The manifest
-    # link is dropped only while the commit marker is absent: once `$BACKUP_PATH` exists the
-    # publication is complete and belongs to whoever made it, and an unconditional
-    # `rm -f "$BACKUP_PATH"` here would let a run that merely collided delete a stranger's
-    # verified backup on its way out.
-    publish_cleanup() {
-      if [ "$MANIFEST_LINKED" = "1" ] && [ ! -e "$BACKUP_PATH" ]; then
-        rm -f "$BACKUP_PATH.manifest.json"
-      fi
-      rm -f "$BACKUP_TMP" "${BACKUP_TMP}.manifest.json"
-    }
-    trap publish_cleanup EXIT
+    # `publish_cleanup` and its `trap` are armed back in step 2, before the temp file can exist,
+    # so a refusal anywhere between there and here leaves nothing behind. `MANIFEST_LINKED` is the
+    # only state it reads, and only the next line sets it.
+    #
     # The manifest is linked first and the database last, so `$BACKUP_PATH` is the commit marker.
-    # This ordering, not the trap, is what makes a partial publish unusable: `trap … EXIT` does
-    # not run on `SIGKILL` or a host power loss, and a death between the two links therefore
-    # leaves at most a manifest with no database — never a database that looks verified with no
-    # manifest beside it. Item 6 checks `$BACKUP_PATH` first and refuses that state.
+    # This ordering, not the trap, is what survives a death the shell cannot handle: `trap … EXIT`
+    # does not run on `SIGKILL`, so a run killed between the two links leaves at most a manifest
+    # with no database — never a database that looks verified with no manifest beside it. Item 6
+    # checks `$BACKUP_PATH` first and refuses that state.
+    #
+    # **This covers process death, not power loss.** The kernel applies both `link` operations in
+    # order, so any surviving process — including a later run of this block — observes them in
+    # order. It says nothing about what reaches stable storage: there is no `fsync` of this
+    # directory and no `F_FULLFSYNC` between the two calls, so after a host power loss or an OS
+    # crash the second link can be on disk while the first is not, and a database with no manifest
+    # is possible. Closing that would need a real durability protocol, and this block does not
+    # have one. What does hold after a crash is item 6's preflight: it validates the pair with the
+    # real restore validator before it destroys anything.
     #
     # The same line is also the exclusion. Two runs sharing a timestamp both pass every check
     # above independently, and one may have passed the destination check long before the other
@@ -388,11 +443,24 @@ non-empty, absolute, and a real file.
 
 <!-- owner-actions:database-backup:end -->
 
-Good means the last two lines print — a manifest whose `backupSha256` was independently
+Good means the last two lines print — a manifest whose `databaseSha256` was independently
 recomputed twice and a database at a final name this run claimed with a link that cannot replace
 anything. Nothing before that line does, and `$BACKUP_PATH` is the only value the rest of this
 document may treat as a verified backup: not a value parsed from a file that might not have been
 written, and not a value that might be empty.
+
+**What the ordering guarantees, precisely.** The manifest is linked before the database, and that
+ordering is what an untrappable death runs into. Against **process termination** — `SIGKILL`, a
+crashed shell — it is a real guarantee: the kernel has already applied both namespace operations
+by the time anything else can look, so no surviving process ever sees the database without its
+manifest. Against **host power loss or an OS crash** it is not, and this document does not claim
+it is. Nothing here `fsync`s the directory, and macOS needs `F_FULLFSYNC` for a write to actually
+reach the platter, so the two metadata writes can land out of order and a crash can leave a
+database at `$BACKUP_PATH` with no manifest. The `SIGKILL` case is the one this repository's tests
+can exercise and do; the power-loss case would need a durability protocol nobody has written here.
+What covers it instead is item 6, which validates the backup through the real restore validator
+before it destroys anything — so a torn pair fails the rollback's preflight rather than the
+rollback itself.
 
 An earlier revision of step 7 reserved the final name with `mkdir` and released the reservation on
 success. That is a mutual-exclusion primitive, and its lifetime is the critical section — while
@@ -412,6 +480,12 @@ and fail-closed, and item 6's preflight already treats it as no usable backup, b
 clear rather than puzzle over. To recover, take a fresh backup: this block's name carries a new
 UTC timestamp, so it does not collide. To remove the orphan instead, confirm there is no database
 at the paired name before unlinking anything:
+
+(After a power loss the reverse pair — a database with no manifest — is possible too, per the
+ordering note above. Do not hand-write a manifest for it. Take a fresh backup: a manifest written
+by hand is precisely how the document's schema and `src/db/backup.ts`'s drifted apart, and the
+resulting file is unverifiable by construction, since its whole purpose is to attest to bytes
+nobody watched being produced.)
 
     ORPHAN="$BACKUP_DIR/state-<TIMESTAMP>.sqlite"
     test ! -e "$ORPHAN"                 # refuse if a database is present — that pair is a real backup
@@ -607,6 +681,21 @@ markers and nowhere else, so it fails to find its anchor rather than silently te
     sqlite3 "$BACKUP_PATH" "PRAGMA integrity_check;" | grep -qx ok
     shasum -a 256 "$BYTES_BACKUP/dist/daemon/agentcpd.js" | \
       cut -d' ' -f1 | grep -qxf <(cut -d' ' -f1 "$BYTES_BACKUP/agentcpd.js.sha256")
+    # The restore, run for real against a throwaway database, before anything is destroyed.
+    # Every check above this line asks whether a file is *present*; none of them asks whether
+    # `restoreDatabase` will accept it, and those are different claims. `readManifest` alone can
+    # refuse on the manifest's format, its `databaseFile`, its `databaseSha256` shape, its
+    # `schemaVersion`, or either file's permissions — and `validateBackup` then re-hashes the
+    # image, re-checks its integrity, and asserts this schema's invariants at its recorded
+    # version. A backup that fails any of those was going to fail *after* `rm -rf dist`, in the
+    # procedure you reach for when things are already broken. This is the same command as the
+    # real restore below, differing only in `--database`, so what it proves is not a proxy.
+    ROLLBACK_PREFLIGHT_DIR="$BYTES_BACKUP/rollback-preflight"
+    rm -rf "$ROLLBACK_PREFLIGHT_DIR"
+    mkdir -p "$ROLLBACK_PREFLIGHT_DIR"
+    chmod 700 "$ROLLBACK_PREFLIGHT_DIR"
+    node "$BYTES_BACKUP/dist/db/state-admin.js" restore "$BACKUP_PATH" \
+      --database "$ROLLBACK_PREFLIGHT_DIR/state.sqlite" --confirm-restore
     rm -rf /Users/isaac/projects/agent-control-plane/dist
     cp -a "$BYTES_BACKUP/dist" /Users/isaac/projects/agent-control-plane/dist
     cp "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist" "$HOME/Library/LaunchAgents/com.agentcontrolplane.agentcpd.plist"

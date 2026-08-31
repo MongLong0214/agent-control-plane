@@ -1,9 +1,11 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
+import { restoreDatabase } from "../../src/db/backup.ts";
+import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -64,6 +66,24 @@ afterAll(cleanupTempDirs);
  * nor the BSD implementation is race-free). The manifest is linked first and the database last,
  * so `$BACKUP_PATH` is the commit marker and no untrappable death can leave a database without
  * one; and cleanup unlinks only names this run created, only while that marker is absent.
+ *
+ * A third CEO review (#745, round 4) found that the ordering claim was stated too strongly and
+ * that the artifact was unusable:
+ *
+ *   9. Manifest-first orders the two links against *process* termination — the kernel has applied
+ *      both namespace operations by the time anything can look. It does not order them against
+ *      power loss: nothing here `fsync`s, and macOS needs `F_FULLFSYNC`. The document now claims
+ *      only what the `SIGKILL` case below actually demonstrates.
+ *  10. The document had invented a second manifest schema. `readManifest` in src/db/backup.ts —
+ *      which every restore goes through — accepts only `…/v1` with a `sha256:`-prefixed
+ *      `databaseSha256`, an integer `schemaVersion`, a `databaseFile` equal to the backup's
+ *      basename, and mode 0600 on both files. So `state-admin.js restore` rejected every backup
+ *      this procedure produced. One schema now, owned by the code that validates it, and the case
+ *      that proves it runs the real commands and hands the result to the real validator.
+ *
+ * Measured while closing (10): `Db`'s constructor sets `journal_mode = WAL`, while the live
+ * database is `delete`. Every `sqlite3` call in the block is `-readonly`, and a read-only
+ * connection cannot open a WAL database — so step 1 now refuses one by name rather than by errno.
  *
  * Safety: `HOME` is a disposable fixture directory for every case; nothing here reads or writes
  * `~/.agent-control-plane` or any real path.
@@ -219,8 +239,14 @@ const finalPathsFor = (fixtureHome: string): { backupsDir: string; finalDb: stri
   return { backupsDir, finalDb, finalManifest: `${finalDb}.manifest.json` };
 };
 
+/**
+ * The digest in the `sha256:`-prefixed form the manifest records, so an on-disk reading and a
+ * manifest reading are directly comparable. The prefix is not decoration: `readManifest` requires
+ * `^sha256:[a-f0-9]{64}$`, and comparing a bare hex digest against a manifest field would be a
+ * comparison that can never match once the manifest is the shape the validator accepts.
+ */
 const sha256Of = (path: string): string =>
-  execFileSync("shasum", ["-a", "256", path], { encoding: "utf8" }).trim().split(/\s+/)[0] ?? "";
+  `sha256:${execFileSync("shasum", ["-a", "256", path], { encoding: "utf8" }).trim().split(/\s+/)[0] ?? ""}`;
 
 const listing = (dir: string): string[] =>
   spawnSync("find", [dir, "-mindepth", "1"], { encoding: "utf8" })
@@ -502,9 +528,9 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
     expect(loser.stderr).toContain("already owns the final name");
     expect(winner.stdout).toContain("backup verified:");
 
-    const winnerShaMatch = winner.stdout.match(/"backupSha256": "([0-9a-f]{64})"/);
+    const winnerShaMatch = winner.stdout.match(/"databaseSha256": "(sha256:[0-9a-f]{64})"/);
     if (winnerShaMatch === null) {
-      throw new Error("the winning run's stdout did not contain a backupSha256 to compare against");
+      throw new Error("the winning run's stdout did not contain a databaseSha256 to compare against");
     }
     const winnerSha256 = winnerShaMatch[1];
 
@@ -514,12 +540,9 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
     expect(existsSync(finalFile)).toBe(true);
     expect(existsSync(finalManifest)).toBe(true);
 
-    const onDiskSha256 = execFileSync("shasum", ["-a", "256", finalFile], { encoding: "utf8" })
-      .trim()
-      .split(/\s+/)[0];
     // The earlier (winning) run's artifact, byte-unchanged: the loser never got to overwrite it
     // with its own (independently built, separately verified) copy.
-    expect(onDiskSha256).toBe(winnerSha256);
+    expect(sha256Of(finalFile)).toBe(winnerSha256);
 
     const integrity = execFileSync("sqlite3", [finalFile, "PRAGMA integrity_check;"], {
       encoding: "utf8",
@@ -569,6 +592,137 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
     expect(listing(backupsDir)).toEqual([]);
   });
 
+  // #745, CEO round 4, blocker 2. The two halves of this procedure had two manifest schemas: the
+  // document wrote `agent-control-plane.sqlite-backup/online-v1` with `backupSha256`, and
+  // `readManifest` in src/db/backup.ts — which every restore goes through — accepts only
+  // `…/v1` with a `sha256:`-prefixed `databaseSha256`, a `schemaVersion`, and a `databaseFile`
+  // equal to the backup's basename. So the procedure that exists to make a rollback possible
+  // produced a backup the rollback rejects.
+  //
+  // Asserting the manifest's *shape* would not have caught it and must not be what this checks:
+  // a hand-written expectation is exactly how the two drifted apart. This runs the documented
+  // commands for real, against a real ACP database, and hands the result to the function item 6
+  // actually calls.
+  it("produces a backup that item 6's real restore validator accepts, end to end", () => {
+    const root = tempDir("acp-database-backup-restore-roundtrip-");
+    const fixtureHome = join(root, "home");
+    const stateDir = join(fixtureHome, ".agent-control-plane");
+    mkdirSync(stateDir, { recursive: true });
+    chmodSync(fixtureHome, 0o700);
+    chmodSync(stateDir, 0o700);
+
+    // A real ACP database, not a scratch table. `validateBackup` re-reads `PRAGMA user_version`,
+    // asserts this schema's load-bearing invariants and its migration ledger at that version, so
+    // nothing less than the real thing can demonstrate acceptance.
+    //
+    // In `delete` journal mode, because that is what the live `state.sqlite` measures as, and the
+    // procedure is written for it. `Db`'s constructor sets WAL on a database it creates, which is
+    // a divergence worth knowing about — step 1 of the document now refuses a WAL source by name
+    // rather than letting `sqlite3 -readonly` fail it with a bare errno.
+    const source = join(stateDir, "state.sqlite");
+    new Db(source).close();
+    execFileSync("sqlite3", [source, "PRAGMA journal_mode=DELETE;"]);
+    for (const sidecar of [`${source}-wal`, `${source}-shm`]) {
+      if (existsSync(sidecar)) unlinkSync(sidecar);
+    }
+    chmodSync(source, 0o600);
+
+    const result = runExtractedBackup(fixtureHome, minimalPath());
+    expect(result.spawnError).toBeUndefined();
+    expect(result.code).toBe(0);
+    const published = /backup verified: (\S+)/.exec(result.stdout)?.[1];
+    if (published === undefined) {
+      throw new Error(`the documented backup did not report a published path:\n${result.stderr}`);
+    }
+
+    // `state-admin.js restore` is lock check + `restoreDatabase`, and `restoreDatabase` is
+    // `validateBackup` + install. This is that path, on the bytes the document just produced.
+    const target = join(root, "restore-target");
+    mkdirSync(target, { recursive: true });
+    chmodSync(target, 0o700);
+    const restoredPath = join(target, "state.sqlite");
+    const restored = restoreDatabase(restoredPath, published);
+    expect(restored.restoredFrom).toBe(published);
+    expect(restored.databasePath).toBe(restoredPath);
+
+    // And the restored image is a database this binary will open, which is the property a
+    // rollback needs and an accepted manifest alone does not prove.
+    const reopened = new Db(restoredPath);
+    try {
+      expect(Number(reopened.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
+    } finally {
+      reopened.close();
+    }
+  }, 60_000);
+
+  // #745 round 4, measured while building the case above. Every `sqlite3` call in this block
+  // passes `-readonly`, and a read-only connection to a WAL database has to create the `-shm`
+  // file it is not permitted to create. The document declares the live database is `delete` —
+  // true, measured — but `Db`'s constructor sets `journal_mode = WAL` on a database it creates,
+  // so a state file made by this code rather than inherited is WAL, and the procedure would fail
+  // with a bare `SQLITE_CANTOPEN (14)` that explains nothing.
+  //
+  // The assertion is the named refusal, not merely a nonzero exit: without the guard the script
+  // still fails, it just fails without saying why — which is the shape this whole block exists to
+  // eliminate.
+  it("refuses a WAL source by name rather than letting a read-only connection fail with an errno", () => {
+    const root = tempDir("acp-database-backup-wal-source-");
+    const fixtureHome = join(root, "home");
+    const stateDir = join(fixtureHome, ".agent-control-plane");
+    mkdirSync(stateDir, { recursive: true });
+    chmodSync(fixtureHome, 0o700);
+    chmodSync(stateDir, 0o700);
+
+    // Exactly what `new Db(...)` leaves behind, cleanly closed: WAL declared in the header, no
+    // sidecars on disk.
+    const source = join(stateDir, "state.sqlite");
+    new Db(source).close();
+    for (const sidecar of [`${source}-wal`, `${source}-shm`]) {
+      if (existsSync(sidecar)) unlinkSync(sidecar);
+    }
+    expect(
+      execFileSync("od", ["-An", "-tu1", "-j18", "-N1", source], { encoding: "utf8" }).trim(),
+    ).toBe("2");
+
+    const result = runExtractedBackup(fixtureHome, minimalPath());
+
+    expect(result.spawnError).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("has SQLite write-format 2, not 1");
+    expect(existsSync(join(stateDir, "backups"))).toBe(false);
+  }, 60_000);
+
+  // #745 round 4: `schemaVersion` is the one JSON-unquoted field, so an empty or non-numeric
+  // reading does not make the manifest wrong — it makes it not JSON, and `readManifest` then
+  // fails at restore time with a parse error instead of here with a refusal.
+  it("refuses when the backup's user_version does not read as an integer, before publishing a manifest", () => {
+    const root = tempDir("acp-database-backup-nonnumeric-version-");
+    const { fixtureHome } = setUpFixtureHome(root);
+    const { backupsDir } = finalPathsFor(fixtureHome);
+
+    const stubDir = join(root, "stub-bin");
+    writeFixedDateStub(stubDir);
+    // Answers `PRAGMA user_version` with nothing for the temp file only, so step 1's reading of
+    // the source is untouched and the failure is specifically about the value that reaches the
+    // manifest.
+    writeStub(stubDir, "sqlite3", [
+      "#!/bin/bash",
+      'if [ "${*}" != "${*/user_version}" ] && [ "${*}" != "${*/.tmp-}" ]; then',
+      "  exit 0",
+      "fi",
+      'exec /usr/bin/sqlite3 "$@"',
+    ]);
+
+    const result = runExtractedBackup(fixtureHome, minimalPath(stubDir));
+
+    expect(result.spawnError).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("not an integer");
+    expect(listing(backupsDir)).toEqual([]);
+  });
+
   // #745, CEO round 3: the claim is a hard link, and `ln` needs both names on one filesystem.
   // `$BACKUP_TMP` is a sibling of `$BACKUP_PATH` inside `$BACKUP_DIR`, so this holds — which is
   // exactly why it is asserted rather than assumed. An assumption nothing checks is the shape
@@ -598,8 +752,9 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
     expect(result.signal).toBeNull();
     expect(result.code).not.toBe(0);
     expect(result.stderr).toContain("not on the same filesystem");
-    // Refused before anything was published: no final name exists, claimed or otherwise.
-    expect(listing(backupsDir).filter((p) => !p.includes("/.")).sort()).toEqual([]);
+    // Refused before anything was published, and nothing left behind — the cleanup trap is armed
+    // before the temp file can exist, so a refusal at this point is not a refusal that littered.
+    expect(listing(backupsDir)).toEqual([]);
   });
 
   // #745, CEO round 3, counterexample 2 — the delayed claim. A mutual-exclusion primitive whose
@@ -628,9 +783,9 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
     const winner = runExtractedBackup(fixtureHome, minimalPath(winnerBin));
     expect(winner.spawnError).toBeUndefined();
     expect(winner.code).toBe(0);
-    const winnerShaMatch = winner.stdout.match(/"backupSha256": "([0-9a-f]{64})"/);
+    const winnerShaMatch = winner.stdout.match(/"databaseSha256": "(sha256:[0-9a-f]{64})"/);
     if (winnerShaMatch === null) {
-      throw new Error("the winning run's stdout did not contain a backupSha256 to compare against");
+      throw new Error("the winning run's stdout did not contain a databaseSha256 to compare against");
     }
     const winnerSha256 = winnerShaMatch[1];
 
@@ -655,7 +810,7 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
     expect(stalledResult.stderr).toContain("already owns the final name");
     // Bytes on disk against what the winner reported — not merely "a file is still there".
     expect(sha256Of(finalDb)).toBe(winnerSha256);
-    expect(readFileSync(finalManifest, "utf8")).toContain(`"backupSha256": "${winnerSha256}"`);
+    expect(readFileSync(finalManifest, "utf8")).toContain(`"databaseSha256": "${winnerSha256}"`);
   }, 60_000);
 
   // #745, CEO round 3, counterexample 1 — `trap … EXIT` does not run on SIGKILL or power loss, so
@@ -741,9 +896,9 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
     const winner = runExtractedBackup(fixtureHome, minimalPath(winnerBin));
     expect(winner.spawnError).toBeUndefined();
     expect(winner.code).toBe(0);
-    const winnerShaMatch = winner.stdout.match(/"backupSha256": "([0-9a-f]{64})"/);
+    const winnerShaMatch = winner.stdout.match(/"databaseSha256": "(sha256:[0-9a-f]{64})"/);
     if (winnerShaMatch === null) {
-      throw new Error("the winning run's stdout did not contain a backupSha256 to compare against");
+      throw new Error("the winning run's stdout did not contain a databaseSha256 to compare against");
     }
     const winnerSha256 = winnerShaMatch[1];
     const winnerManifest = readFileSync(finalManifest, "utf8");

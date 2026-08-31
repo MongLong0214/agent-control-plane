@@ -3287,6 +3287,108 @@ const GUARDS = [
     killedBy: ["tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts"],
   },
   {
+    // #745 round 4, measured. Every `sqlite3` call in the database-backup block passes
+    // `-readonly`, and a read-only connection to a WAL database must create the `-shm` file it is
+    // not permitted to create: it fails `SQLITE_CANTOPEN (14)` and says nothing about why. The
+    // document declares the live database is `delete` — measured, true — but `Db`'s constructor
+    // sets `journal_mode = WAL` on a database it creates, so a state file made by this code rather
+    // than inherited from an older one is WAL, and the declaration is a fact with an expiry date.
+    //
+    // Deleting this guard does not make the block succeed on a WAL source; it makes it fail with
+    // an errno instead of a sentence. That is why the named test asserts the message and not the
+    // exit status — the guard's whole content is that the refusal is legible.
+    what: "the database backup step refuses a WAL source by name instead of failing with a bare errno",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    SOURCE_JOURNAL_FORMAT="$(od -An -tu1 -j18 -N1 "$SOURCE_DB" | tr -d \' \')"\n' +
+      '    if [ "$SOURCE_JOURNAL_FORMAT" != "1" ]; then\n' +
+      '      echo "refusing: $SOURCE_DB has SQLite write-format $SOURCE_JOURNAL_FORMAT, not 1; a read-only connection cannot open a WAL database and this procedure is not verified for one" >&2; exit 1\n' +
+      "    fi\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::refuses a WAL source by name rather than letting a read-only connection fail with an errno",
+    ],
+  },
+  {
+    // #745 round 4, blocker 2. `readManifest` runs `assertPrivatePath` on the backup *and* its
+    // manifest, and that requires mode exactly 0600. `.backup` writes with the ambient umask —
+    // 0644 on this host — so without this line the restore refuses the artifact on permissions
+    // before it ever reaches the manifest's contents. The named test runs the whole documented
+    // procedure and hands the result to the real `restoreDatabase`, which is where this surfaces.
+    what: "the database backup step makes the backup file private enough for the restore validator to read",
+    file: "docs/ops/owner-actions.md",
+    find: '    chmod 600 "$BACKUP_TMP"\n',
+    replace: "",
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::produces a backup that item 6's real restore validator accepts, end to end",
+    ],
+  },
+  {
+    // #745 round 4, blocker 2, the same for the manifest — a separate line, a separate way to
+    // fail, and `assertPrivatePath` is called on both paths independently.
+    what: "the database backup step makes the manifest private enough for the restore validator to read",
+    file: "docs/ops/owner-actions.md",
+    find: '    chmod 600 "${BACKUP_TMP}.manifest.json"\n',
+    replace: "",
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::produces a backup that item 6's real restore validator accepts, end to end",
+    ],
+  },
+  {
+    // #745 round 4, blocker 2, the defect itself. The document had invented a second manifest
+    // schema (`agent-control-plane.sqlite-backup/online-v1`, `backupSha256`, `backupUserVersion`)
+    // that `readManifest` in src/db/backup.ts refuses outright, so `state-admin.js restore`
+    // rejected every backup this procedure produced — the procedure whose only purpose is to make
+    // that restore possible.
+    //
+    // This row restores the old `format` string and nothing else. One field is enough: it is an
+    // equality check in `readManifest`, and it proves the named test is coupled to what the
+    // validator actually accepts rather than to a shape written down twice.
+    what: "the database backup step writes the manifest schema the restore validator accepts, not one of its own",
+    file: "docs/ops/owner-actions.md",
+    find: '    { "format": "agent-control-plane.sqlite-backup/v1",\n',
+    replace: '    { "format": "agent-control-plane.sqlite-backup/online-v1",\n',
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::produces a backup that item 6's real restore validator accepts, end to end",
+    ],
+  },
+  {
+    // #745 round 4. `schemaVersion` is the one manifest field emitted unquoted, so a reading that
+    // is empty or non-numeric does not produce a manifest that is merely wrong — it produces one
+    // that is not JSON, and the failure then surfaces at restore time as a parse error rather
+    // than here as a refusal. Deleting the guard lets the block publish that manifest and exit 0.
+    what: "the database backup step refuses a non-integer user_version before it can emit a manifest that is not JSON",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    case "$BACKUP_USER_VERSION" in\n' +
+      "      ''|*[!0-9]*) echo \"refusing: user_version of $BACKUP_TMP is '$BACKUP_USER_VERSION', not an integer\" >&2; exit 1 ;;\n" +
+      "    esac\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::refuses when the backup's user_version does not read as an integer, before publishing a manifest",
+    ],
+  },
+  {
+    // #745 round 4, blocker 2's ordering half — the part that made the schema mismatch dangerous
+    // rather than merely wrong. Item 6's preflight checked that a manifest *existed*; it never
+    // checked that `restoreDatabase` would accept it, and those are different claims. So an
+    // unreadable manifest failed *after* `rm -rf .../dist`, in the procedure you reach for when
+    // things are already broken.
+    //
+    // Deleting the validating restore returns the preflight to existence-checking. The named test
+    // supplies a backup whose file is real, private and integral and whose manifest is exactly
+    // what this document wrote before this round: every remaining check passes, and `rm -rf` runs.
+    what: "the rollback preflight validates the backup through the real restore before rm -rf, not merely that a manifest exists",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    node "$BYTES_BACKUP/dist/db/state-admin.js" restore "$BACKUP_PATH" \\\n' +
+      '      --database "$ROLLBACK_PREFLIGHT_DIR/state.sqlite" --confirm-restore\n',
+    replace: "",
+    killedBy: [
+      "tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts::refuses to run rm -rf when the backup's manifest is one the real restore validator rejects",
+    ],
+  },
+  {
     // #512: the database-backup step in item 4 step 2 replaced `state-admin.js backup` (which
     // needs a `better-sqlite3` binding a fresh `node` process cannot load) with SQLite's own
     // online backup API. Executing the old text against the real host produced an empty

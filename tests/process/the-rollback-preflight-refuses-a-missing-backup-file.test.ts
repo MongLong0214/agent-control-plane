@@ -1,9 +1,11 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
+import { backupDatabase } from "../../src/db/backup.ts";
+import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -114,6 +116,53 @@ interface BackupFixture {
 }
 
 /**
+ * A real ACP database in the journal mode the live one is actually in.
+ *
+ * `Db`'s constructor sets `journal_mode = WAL` on a database it creates, while the live
+ * `state.sqlite` is `delete` (both measured). The document's procedure is written for the live
+ * shape and refuses anything else, so a fixture that left the default would be testing a database
+ * this procedure never sees.
+ */
+const buildRealAcpDatabase = (path: string): void => {
+  new Db(path).close();
+  execFileSync("sqlite3", [path, "PRAGMA journal_mode=DELETE;"]);
+  for (const sidecar of [`${path}-wal`, `${path}-shm`]) {
+    if (existsSync(sidecar)) unlinkSync(sidecar);
+  }
+  chmodSync(path, 0o600);
+};
+
+/**
+ * Stands in for the operator's deployed `$BYTES_BACKUP/dist/db/state-admin.js`.
+ *
+ * It delegates to *this repository's built* `state-admin.js` rather than reimplementing it, so
+ * the thing the preflight exercises is the real CLI and the real `restoreDatabase` →
+ * `validateBackup` → `readManifest` chain. A stub that merely exited 0 — which is what this
+ * fixture used to write — would make the preflight's new validating step unfalsifiable: it would
+ * pass for every backup, valid or not.
+ *
+ * Written as CommonJS with a dynamic `import()`: the fixture directory has no `package.json`, so
+ * a bare `.js` there is CJS regardless of what this repository's own `type` field says.
+ */
+const stateAdminShim = (): string => {
+  const real = join(process.cwd(), "dist", "db", "state-admin.js");
+  if (!existsSync(real)) {
+    throw new Error(
+      `${real} does not exist — run \`pnpm build\` before this suite. This fixture must not ` +
+        `silently fall back to a stub: a stub cannot refuse an invalid backup, and refusing one ` +
+        `is the property under test.`,
+    );
+  }
+  return [
+    `import(${JSON.stringify(real)})`,
+    "  .then((m) => m.main(process.argv.slice(2)))",
+    "  .then((code) => process.exit(code))",
+    "  .catch((error) => { console.error(error && error.message ? error.message : error); process.exit(1); });",
+    "",
+  ].join("\n");
+};
+
+/**
  * Builds a fully valid `$BYTES_BACKUP` + `$BACKUP_PATH` pair — matching hash, a real sqlite
  * database that passes `PRAGMA integrity_check`, a non-empty manifest and plist — and then omits
  * exactly one file, per the two counterexamples in #737's scope.
@@ -123,10 +172,15 @@ interface BackupFixture {
  * targets would still leave the *other* checks blocking `rm -rf`, and the row would report a kill
  * it did not earn.
  */
-const buildBackupFixture = (root: string, omit: "launcher" | "stateAdmin"): BackupFixture => {
+const buildBackupFixture = async (
+  root: string,
+  omit: "launcher" | "stateAdmin" | "nothing",
+  manifest: "valid" | "priorDocumentSchema" = "valid",
+): Promise<BackupFixture> => {
   const bytesBackup = join(root, "bytes-backup");
   mkdirSync(join(bytesBackup, "dist", "daemon"), { recursive: true });
   mkdirSync(join(bytesBackup, "dist", "db"), { recursive: true });
+  chmodSync(bytesBackup, 0o700);
 
   writeFileSync(join(bytesBackup, "dist", "daemon", "agentcpd.js"), BACKUP_DIST_SENTINEL);
   const shasumOut = execFileSync(
@@ -137,7 +191,7 @@ const buildBackupFixture = (root: string, omit: "launcher" | "stateAdmin"): Back
   writeFileSync(join(bytesBackup, "agentcpd.js.sha256"), shasumOut);
 
   if (omit !== "stateAdmin") {
-    writeFileSync(join(bytesBackup, "dist", "db", "state-admin.js"), "process.exit(0);\n");
+    writeFileSync(join(bytesBackup, "dist", "db", "state-admin.js"), stateAdminShim());
   }
   if (omit !== "launcher") {
     writeFileSync(join(bytesBackup, "agentcpd-launch.sh"), "#!/bin/sh\nexit 0\n");
@@ -147,9 +201,45 @@ const buildBackupFixture = (root: string, omit: "launcher" | "stateAdmin"): Back
     "<?xml version=\"1.0\"?><plist><dict/></plist>\n",
   );
 
+  // A genuinely valid backup, produced by the authority on what "valid" means — `backupDatabase`
+  // in src/db/backup.ts, the same writer whose `readManifest` the rollback's restore goes
+  // through. Hand-writing this pair is what let the document's manifest schema and the
+  // validator's drift apart unnoticed (#745 round 4); a fixture that hand-writes it can only
+  // repeat that.
+  //
+  // "Fully valid otherwise" is also what makes the falsifiability rows work: delete the one guard
+  // a row targets and every remaining check must pass, so the extracted script really does reach
+  // `rm -rf`. A fixture whose backup the preflight would reject anyway would let those rows
+  // report kills they did not earn.
+  const sourceHome = join(root, "backup-source");
+  mkdirSync(sourceHome, { recursive: true });
+  chmodSync(sourceHome, 0o700);
+  const sourceDb = join(sourceHome, "state.sqlite");
+  buildRealAcpDatabase(sourceDb);
   const backupPath = join(bytesBackup, "state-backup.sqlite");
-  execFileSync("sqlite3", [backupPath, "create table t (x integer);"]);
-  writeFileSync(`${backupPath}.manifest.json`, JSON.stringify({ databaseSha256: "fixture" }));
+  await backupDatabase(sourceDb, backupPath);
+
+  if (manifest === "priorDocumentSchema") {
+    // Exactly what item 4 step 2 wrote before #745 round 4: a second, invented manifest schema
+    // that `readManifest` refuses on `format`, on `databaseFile`, and on `databaseSha256` alike.
+    // The backup file beside it is real, private and integral — every existence check in the
+    // preflight passes, which is the whole point.
+    writeFileSync(
+      `${backupPath}.manifest.json`,
+      `${JSON.stringify({
+        format: "agent-control-plane.sqlite-backup/online-v1",
+        sourcePath: sourceDb,
+        backupPath,
+        backupSha256: execFileSync("shasum", ["-a", "256", backupPath], { encoding: "utf8" })
+          .trim()
+          .split(/\s+/)[0],
+        backupUserVersion: SCHEMA_VERSION,
+        createdAt: new Date().toISOString(),
+      })}\n`,
+      { mode: 0o600 },
+    );
+    chmodSync(`${backupPath}.manifest.json`, 0o600);
+  }
 
   return { bytesBackup, backupPath };
 };
@@ -211,6 +301,10 @@ const runExtractedRollback = (fixture: BackupFixture): { result: RunResult; fixt
 
   mkdirSync(join(fixtureHome, "Library", "LaunchAgents"), { recursive: true });
   mkdirSync(join(fixtureHome, ".agent-control-plane"), { recursive: true });
+  // 0700, because the real restore this script ends in refuses an insecure state directory. The
+  // default here is 0755, and leaving it would make every case in this file fail on a directory
+  // mode before it ever reached the property it is about.
+  chmodSync(join(fixtureHome, ".agent-control-plane"), 0o700);
 
   const script = neutralizeAppRoot(extractRollbackPreflightScript(), fixtureAppRoot);
 
@@ -235,9 +329,9 @@ const runExtractedRollback = (fixture: BackupFixture): { result: RunResult; fixt
 };
 
 describe("the rollback preflight in docs/ops/owner-actions.md, extracted and run against a fixture backup", () => {
-  it("refuses to run rm -rf when the launcher backup file is missing", () => {
+  it("refuses to run rm -rf when the launcher backup file is missing", async () => {
     const root = tempDir("acp-rollback-preflight-backup-");
-    const fixture = buildBackupFixture(root, "launcher");
+    const fixture = await buildBackupFixture(root, "launcher");
 
     const { result, fixtureAppRoot } = runExtractedRollback(fixture);
 
@@ -256,9 +350,9 @@ describe("the rollback preflight in docs/ops/owner-actions.md, extracted and run
     );
   });
 
-  it("refuses to run rm -rf when the backup state-admin.js is missing", () => {
+  it("refuses to run rm -rf when the backup state-admin.js is missing", async () => {
     const root = tempDir("acp-rollback-preflight-backup-");
-    const fixture = buildBackupFixture(root, "stateAdmin");
+    const fixture = await buildBackupFixture(root, "stateAdmin");
 
     const { result, fixtureAppRoot } = runExtractedRollback(fixture);
 
@@ -270,4 +364,48 @@ describe("the rollback preflight in docs/ops/owner-actions.md, extracted and run
       LIVE_DIST_SENTINEL,
     );
   });
+
+  // #745 round 4, blocker 2. Every check the preflight had asked whether a file was *present*.
+  // None asked whether `restoreDatabase` would accept it, and those are different claims — so a
+  // backup with an unreadable manifest failed *after* `rm -rf dist`, in the procedure you reach
+  // for when things are already broken.
+  //
+  // The manifest here is not an invented broken shape: it is exactly what item 4 step 2 wrote
+  // before this round, and the database beside it is real, private and integral. Everything the
+  // old preflight looked at passes.
+  it("refuses to run rm -rf when the backup's manifest is one the real restore validator rejects", async () => {
+    const root = tempDir("acp-rollback-preflight-unreadable-manifest-");
+    const fixture = await buildBackupFixture(root, "nothing", "priorDocumentSchema");
+
+    const { result, fixtureAppRoot } = runExtractedRollback(fixture);
+
+    expect(result.spawnError).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.code).not.toBe(0);
+    // Refused for the stated reason — the validator read the manifest and rejected it — rather
+    // than incidentally, on a missing file or a shell error.
+    expect(result.stderr).toContain("backup manifest");
+    expect(result.stderr).not.toContain(`rm -rf ${fixtureAppRoot}/dist`);
+    expect(readFileSync(join(fixtureAppRoot, "dist", "daemon", "agentcpd.js"), "utf8")).toBe(
+      LIVE_DIST_SENTINEL,
+    );
+  }, 60_000);
+
+  // The other half of the same property: a preflight that refuses everything would satisfy the
+  // case above and be useless. A backup the validator does accept must get all the way through.
+  it("passes the preflight and reaches the restore when the backup is one the real validator accepts", async () => {
+    const root = tempDir("acp-rollback-preflight-valid-");
+    const fixture = await buildBackupFixture(root, "nothing");
+
+    const { result, fixtureAppRoot } = runExtractedRollback(fixture);
+
+    expect(result.spawnError).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.code).toBe(0);
+    // It got past the preflight and did the destructive work it is supposed to do.
+    expect(result.stderr).toContain(`rm -rf ${fixtureAppRoot}/dist`);
+    expect(readFileSync(join(fixtureAppRoot, "dist", "daemon", "agentcpd.js"), "utf8")).toBe(
+      BACKUP_DIST_SENTINEL,
+    );
+  }, 60_000);
 });
