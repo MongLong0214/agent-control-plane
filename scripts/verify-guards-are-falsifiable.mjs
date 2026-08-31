@@ -3050,6 +3050,16 @@ const GUARDS = [
     ],
   },
   {
+    // #416 keeps V1's stated absence of enforcement honest; ACP 2.0 still needs its runtime guard.
+    what: "the V1 experiment isolation census scans every production source file",
+    file: "scripts/verify-v1-experiment-isolation-declaration.mjs",
+    find: 'const sourceFiles = walk("src").filter((file) => file !== ISOLATION_MODULE);',
+    replace: "const sourceFiles = [];",
+    killedBy: [
+      "tests/process/v1-experiment-isolation-declaration.test.ts::detects synthetic experiment state opening and validator consumption",
+    ],
+  },
+  {
     what: "a reported failed test is a product failure",
     file: "scripts/run-vitest-gate.mjs",
     find: "  if (statusCounts.failed > 0) {",
