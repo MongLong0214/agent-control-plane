@@ -3239,6 +3239,24 @@ const GUARDS = [
     killedBy: ["tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts"],
   },
   {
+    // #737, CEO's second-round finding: the launcher row above did not cover the *other* named
+    // counterexample — nothing mutated the state-admin.js existence/readability guard, so that
+    // half of the fixture had a test but no proof the test could fail. This row deletes both
+    // lines (existence and readability are one guard for this file; deleting only one would still
+    // leave the other blocking `rm -rf`, so it would not be about the file going missing at all).
+    // Reproduced by hand before this row existed: with these two lines removed and the
+    // state-admin-only-missing fixture otherwise fully valid, the extracted script ran `rm -rf`
+    // for real and the named test failed on that — proving the guard was untested, not merely
+    // unwritten.
+    what: "the rollback preflight refuses a missing backup state-admin.js before rm -rf runs",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    test -f "$BYTES_BACKUP/dist/db/state-admin.js"\n' +
+      '    test -r "$BYTES_BACKUP/dist/db/state-admin.js"\n',
+    replace: "",
+    killedBy: ["tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts"],
+  },
+  {
     // #241 — the whole point of the acceptance readout. Forcing `observed` to true makes an
     // empty database compute accepted anomalies (all zero) and report OBSERVED_NO_ANOMALIES
     // instead of N/A: exactly the "0/PASS" shape the CEO ruling named as worse than the ceremony

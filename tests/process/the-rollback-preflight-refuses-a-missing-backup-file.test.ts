@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
@@ -156,9 +156,47 @@ const buildBackupFixture = (root: string, omit: "launcher" | "stateAdmin"): Back
 
 interface RunResult {
   code: number | null;
+  signal: NodeJS.Signals | null;
+  spawnError: Error | undefined;
   stdout: string;
   stderr: string;
 }
+
+/**
+ * The absolute `bash` binary, spawned directly rather than left for the child to resolve via
+ * `PATH`. The standard location on every runner and every developer machine this repository
+ * targets (macOS): resolving it any other way would mean the child's own minimal `PATH` below
+ * decides which `bash` interprets the extracted script, before that `PATH` has done anything else.
+ */
+const BASH = "/bin/bash";
+
+/**
+ * An explicit, minimal environment for the child — built from nothing, never `...process.env`.
+ *
+ * `process.env` on a developer's or CI machine can carry `BASH_ENV`/`ENV` (sourced by
+ * non-interactive bash *before* anything in `-c`'s script runs, ahead of the `HOME` substitution
+ * below ever taking effect) or a `PATH` this test did not choose, which decides which `sqlite3`,
+ * `shasum`, `seq`, `sleep`, `cut`, `grep`, `cp`, `rm`, `mkdir`, `chmod` and `node` actually run.
+ * Spreading it would make "no owner path is touched" a claim about *this machine's current
+ * environment*, not about what the test itself guarantees.
+ *
+ * So every variable here is named and justified, and nothing else is passed:
+ *   - `PATH`: only the directories holding the external commands the extracted script invokes,
+ *     plus this Node's own directory (for the `node "$BYTES_BACKUP/dist/db/state-admin.js"` line,
+ *     reached only if a guard were removed) — no inherited PATH, no surprise binary.
+ *   - `HOME`: the one variable this whole fixture exists to substitute; the disposable directory
+ *     built above, never the real one.
+ *   - `BYTES_BACKUP` / `BACKUP_PATH`: the two variables the document's own procedure expects an
+ *     operator's shell to have already set; here they point at the fixture backup, never a real
+ *     one.
+ * `BASH_ENV` and `ENV` are absent because nothing is spread — there is no inherited value to omit.
+ */
+const explicitChildEnv = (fixtureHome: string, fixture: BackupFixture): NodeJS.ProcessEnv => ({
+  PATH: ["/bin", "/usr/bin", dirname(process.execPath)].join(":"),
+  HOME: fixtureHome,
+  BYTES_BACKUP: fixture.bytesBackup,
+  BACKUP_PATH: fixture.backupPath,
+});
 
 const runExtractedRollback = (fixture: BackupFixture): { result: RunResult; fixtureAppRoot: string; fixtureHome: string } => {
   const root = tempDir("acp-rollback-preflight-");
@@ -176,20 +214,21 @@ const runExtractedRollback = (fixture: BackupFixture): { result: RunResult; fixt
 
   const script = neutralizeAppRoot(extractRollbackPreflightScript(), fixtureAppRoot);
 
-  const proc = spawnSync("bash", ["-x", "-c", script], {
+  const proc = spawnSync(BASH, ["-x", "-c", script], {
     cwd: fixtureAppRoot,
     encoding: "utf8",
-    env: {
-      ...process.env,
-      HOME: fixtureHome,
-      BYTES_BACKUP: fixture.bytesBackup,
-      BACKUP_PATH: fixture.backupPath,
-    },
+    env: explicitChildEnv(fixtureHome, fixture),
     timeout: 30_000,
   });
 
   return {
-    result: { code: proc.status, stdout: proc.stdout, stderr: proc.stderr },
+    result: {
+      code: proc.status,
+      signal: proc.signal,
+      spawnError: proc.error,
+      stdout: proc.stdout,
+      stderr: proc.stderr,
+    },
     fixtureAppRoot,
     fixtureHome,
   };
@@ -202,7 +241,14 @@ describe("the rollback preflight in docs/ops/owner-actions.md, extracted and run
 
     const { result, fixtureAppRoot } = runExtractedRollback(fixture);
 
-    expect(result.code).not.toBe(0);
+    // A refusal has a specific shape, and only that shape is accepted: the process must have
+    // actually run to completion under `bash`'s own control (no spawn error, no signal — a hang,
+    // a crash or a timeout all report `status: null` too, and `.not.toBe(0)` alone cannot tell
+    // "refused" apart from "never ran"), and it must exit with exactly the code `set -e` gives a
+    // failing `test` — 1, not merely "not zero".
+    expect(result.spawnError).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.code).toBe(1);
     // The destructive command was never *invoked* — not merely that its effect is absent.
     expect(result.stderr).not.toContain(`rm -rf ${fixtureAppRoot}/dist`);
     expect(readFileSync(join(fixtureAppRoot, "dist", "daemon", "agentcpd.js"), "utf8")).toBe(
@@ -216,7 +262,9 @@ describe("the rollback preflight in docs/ops/owner-actions.md, extracted and run
 
     const { result, fixtureAppRoot } = runExtractedRollback(fixture);
 
-    expect(result.code).not.toBe(0);
+    expect(result.spawnError).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.code).toBe(1);
     expect(result.stderr).not.toContain(`rm -rf ${fixtureAppRoot}/dist`);
     expect(readFileSync(join(fixtureAppRoot, "dist", "daemon", "agentcpd.js"), "utf8")).toBe(
       LIVE_DIST_SENTINEL,
