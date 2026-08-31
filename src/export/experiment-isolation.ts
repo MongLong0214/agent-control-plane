@@ -7,6 +7,7 @@ import { EXPERIMENT_ISOLATION_SCHEMA_ID } from "./baseline-contract.ts";
 
 /**
  * V1-BR-08 — partial. This is a path-validation result for a future offline experiment.
+ * #416 keeps this V1 declaration synchronized with experiment-state candidates but does not add ACP 2.0 runtime enforcement.
  * V1 has no experiment context or state-opening runtime, so this value deliberately makes
  * no write-denial or context-withholding claim. A future ACP 2.0 owner must consume this
  * validation before opening any experiment state and add the runtime enforcement there.

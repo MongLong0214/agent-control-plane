@@ -96,6 +96,12 @@ describe("pre-commit refuses while the falsifiability harness holds a mutation",
       join(fake, "scripts", "verify-guards-are-falsifiable.mjs"),
       `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "yes");\n`,
     );
+    // This case isolates the later anchors call. The real preflight and both of its counterexamples
+    // run through scripts/verify-ci-preflight.mjs in ci-preflight.test.ts.
+    writeFileSync(
+      join(fake, "package.json"),
+      JSON.stringify({ scripts: { "ci:preflight": "true" } }),
+    );
 
     // Nothing staged at all — the case the old filter skipped.
     const done = spawnSync(hook("pre-commit"), [], { cwd: fake, encoding: "utf8" });

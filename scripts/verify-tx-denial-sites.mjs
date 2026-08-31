@@ -175,6 +175,15 @@ const EXEMPT = [
       "after that guard can deny.",
   },
   {
+    file: "cto/cto-lifecycle.ts",
+    marker: "owner session stopped during project suspension",
+    reason:
+      "the irreversible provider stop has already happened before this transaction, so " +
+      "STOPPED must survive a returned denial. The #692 compensation re-checkpoints any " +
+      "CEO-resolved ACTIVE run after STOPPED before revoke; the interleaving regression " +
+      "proves that resolveEscalation interleaving no longer makes revoke deny.",
+  },
+  {
     file: "run/run-engine.ts",
     marker: "§29/§30.3 — activation, its envelope and its audit record are one operation",
     reason:
@@ -246,20 +255,7 @@ const EXEMPT = [
  * issue, not a claim of safety, and is reported as such rather than folded into
  * "documented exemption(s)" where a reader could mistake it for one.
  */
-const DEFERRED = [
-  {
-    file: "cto/cto-lifecycle.ts",
-    marker: "the CTO binding changed while runtime shutdown was in progress",
-    reason:
-      "suspendProject's STOPPED transition commits, then bindings.revoke() can deny " +
-      "(e.g. a concurrent resolveEscalation flips a BLOCKED run back to ACTIVE between " +
-      "the two calls) — and by then the external provider has already been told to " +
-      "stop, which is not reversible, so this is not a mechanical tx()->txDecision() " +
-      "substitution. Needs an explicit compensation policy and an interleaving test. " +
-      "Tracked in #692; see the comment at the call site.",
-    issue: "#692",
-  },
-];
+const DEFERRED = [];
 
 /** Recursively list `.ts` files under `dir`, skipping test files. */
 const listTsFiles = (dir) => {

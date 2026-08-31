@@ -63,6 +63,9 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
           cache: pnpm
+      # Dependency-free and first: the same working-tree check as pre-commit catches a workflow
+      # package-script mismatch or invalid Bash before install and the test matrix spend minutes.
+      - run: pnpm ci:preflight
       - run: pnpm install --frozen-lockfile
       - run: pnpm rebuild better-sqlite3
       # ADR-0010: this repository's own binding.gyp + node-addon-api convention for native
