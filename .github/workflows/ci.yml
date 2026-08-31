@@ -87,6 +87,9 @@ jobs:
       # #705's static half: every direct script has a plausible invocation site. The command
       # prints that this cannot establish execution and that dynamic measurement remains #705.
       - run: pnpm scripts:plausible-callers
+      # Mutable repository structure is named by symbols or derived at the point of use. This
+      # catches four copied coordinate forms that already went stale in tests and documentation.
+      - run: pnpm coordinates:stale
       # Seconds, and it answers the question that actually goes stale: does every mutation row
       # still name a line that exists. Editing a guarded line renames its anchor and the row
       # silently stops checking anything — three times on one branch, each found only when the

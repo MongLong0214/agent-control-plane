@@ -23,7 +23,12 @@ if [ -e "$SENTINEL" ]; then
   exit 1
 fi
 
-if ! pnpm ci:preflight; then
+# Through `pnpm`, so a repository that stubs the script — as the hook's own test does — is
+# running what it declared rather than a path this file guessed. `CI=true` is what pnpm's
+# dependency check needs to proceed without a TTY; without it the hook fails on module-purge
+# confirmation, which is a condition unrelated to anything it is checking, and a hook that
+# fails for unrelated reasons gets switched off.
+if ! CI=true pnpm ci:preflight; then
   echo "pre-commit: the workflow commands do not match the working tree." >&2
   exit 1
 fi
