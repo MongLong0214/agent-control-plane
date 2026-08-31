@@ -38,6 +38,7 @@ import {
   type TelegramLongPollStartOptions,
   type TelegramLongPollListener,
 } from "../ingress/telegram-polling.ts";
+import type { TelegramDirectAnswer } from "../ingress/telegram-router.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
 import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
 import { createCtoMcpPort, createCtoServer } from "../mcp/cto-server.ts";
@@ -1555,11 +1556,25 @@ const startDaemonTelegramListenerOrRefuse = async (
  * owner is a person waiting in a chat, and an exception here would surface as a dropped
  * message. The reason code travels with the sentence so a refusal in the transcript can still
  * be traced to the branch that produced it.
+ *
+ * The return carries `answered` beside the text, and that is the whole of #639's residual fix.
+ * Both branches produce a sentence the owner must see — silence after a timeout is worse than an
+ * apology — but only one of them is the CEO answering. A bare string could not tell the ingress
+ * layer which, so the reply's acceptance by Telegram resolved the turn either way, and a
+ * `CEO_CONVERSATION_TIMEOUT` apology was indistinguishable from an answer in the row. Delivering
+ * it and counting it as answered are now two separate things.
  */
-export const answerAsCeo = async (port: CeoConversationPort, text: string): Promise<string> => {
+export const answerAsCeo = async (
+  port: CeoConversationPort,
+  text: string,
+): Promise<TelegramDirectAnswer> => {
   const answered = await port.ask(text);
-  if (answered.allowed) return answered.value;
-  return `${ceoUnavailableSentence(answered.reasonCode)} (${answered.reasonCode})`;
+  if (answered.allowed) return { answered: true, text: answered.value };
+  return {
+    answered: false,
+    reasonCode: answered.reasonCode,
+    text: `${ceoUnavailableSentence(answered.reasonCode)} (${answered.reasonCode})`,
+  };
 };
 
 /**

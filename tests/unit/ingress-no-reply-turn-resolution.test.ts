@@ -145,6 +145,7 @@ describe("#672 a claimed turn whose handler produces no reply", () => {
       updateId: 1,
       nonce,
       correlationId: "no-reply-correlation",
+      turnAnswered: false,
       admitted: true,
       replayed: false,
       classification: "DIRECT",
@@ -212,6 +213,7 @@ describe("#672 a claimed turn whose handler produces no reply", () => {
       text: "an answer that may or may not have reached Telegram",
       replyToMessageId: 1,
       correlationId: "no-reply-correlation",
+      turnAnswered: false,
     };
     expect(
       ingress.recordResultIf(
@@ -232,6 +234,7 @@ describe("#672 a claimed turn whose handler produces no reply", () => {
       updateId: 2,
       nonce,
       correlationId: "no-reply-correlation",
+      turnAnswered: false,
       admitted: true,
       replayed: true,
       classification: null,
@@ -274,7 +277,7 @@ describe("#672 a claimed turn whose handler produces no reply", () => {
         reply: "answered",
         sent: true,
         deliveryStatus: "APPLIED",
-      }).allowed,
+      }, "ANSWERED").allowed,
     ).toBe(true);
     const resolved = storedClaim(harness, nonce);
     expect(resolved["repliedAt"]).toBeTruthy();
@@ -367,6 +370,7 @@ describe("#672 a claimed turn whose handler produces no reply", () => {
       updateId: 5,
       nonce,
       correlationId: "late-reply-correlation",
+      turnAnswered: false,
       admitted: true,
       replayed: false,
       classification: "DIRECT",

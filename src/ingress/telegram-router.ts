@@ -131,7 +131,41 @@ export interface TelegramStoredState {
   deliveryStatus?: TelegramDeliveryStatus;
   unknownDeliveryAttempts?: number;
   deliveryFailure?: TelegramStoredDeliveryFailure;
+  /**
+   * Whether the reply held here is the CEO's own answer to the claimed turn (#639).
+   *
+   * Durable rather than derived at completion time, because the two lifecycles do not end
+   * together: a reservation can be written now, the process can die, and the retry that
+   * completes or settles it runs from this row alone. Without it, a retried real answer would
+   * be indistinguishable from a retried apology and one of the two would be recorded wrongly.
+   *
+   * Absent means "not known to be an answer", and is read as unanswered — the same fail-closed
+   * direction `deliveryStatus`'s own legacy fallback takes. Only rows that carry a turn claim
+   * are affected by the difference, and `reserveResponse` writes this field on every one of
+   * them, so absence here is a pre-`#639` row rather than a live gap.
+   */
+  turnAnswered?: boolean;
 }
+
+/**
+ * What a DIRECT handler produced, and whether it is an answer to the turn.
+ *
+ * A bare `string` is the shorthand for "this handler answered": a handler whose return type is
+ * a string has no way to express anything else, so treating it as an answer is reading its own
+ * contract rather than filling in a default. The object form exists for the one handler that
+ * can fail to answer while still owing the owner a sentence — `answerAsCeo`, which turns a
+ * refusal from the CEO route into an apology the owner must still see (#639). That sentence is
+ * delivered like any other reply; what it must not do is spend the turn's resolution.
+ */
+export type TelegramDirectAnswer =
+  | { answered: true; text: string }
+  | { answered: false; text: string; reasonCode: ReasonCodeValue };
+
+/** Whether a reply's completion may also resolve the turn that produced it (#639). */
+export type TelegramTurnOutcome = "ANSWERED" | "UNANSWERED";
+
+const directAnswerOf = (result: string | TelegramDirectAnswer): TelegramDirectAnswer =>
+  typeof result === "string" ? { answered: true, text: result } : result;
 
 export type TelegramInterruptPoint =
   | "after-admission"
@@ -158,6 +192,15 @@ export interface TelegramRouteOutcome {
   input: TelegramHermesInput | null;
   reply: TelegramReply | null;
   reasonCode: ReasonCodeValue;
+  /**
+   * Whether this reply is the CEO's own answer to a turn this router claimed (#639).
+   *
+   * Required, with no default, for the reason #748 recorded about `bindingGeneration`: the field
+   * that decides a turn's fate must not be one a construction site can forget. Only
+   * `completeDirectRoute` can say `true` — every other outcome either carries no claim or
+   * carries a sentence this daemon composed, and neither is an answer.
+   */
+  turnAnswered: boolean;
   runId?: string;
 }
 
@@ -195,7 +238,9 @@ export interface TelegramRouterOptions {
   /** A deployment may choose one project for the shorthand `/managed <request>` form. */
   defaultProjectId?: string | null;
   /** DIRECT is deliberately a narrow callback, not a mutation capability. */
-  directHandler?: (input: TelegramDirectInput) => string | Promise<string>;
+  directHandler?: (
+    input: TelegramDirectInput,
+  ) => string | TelegramDirectAnswer | Promise<string | TelegramDirectAnswer>;
   /** Lets a restarted poller retry a response that was prepared but not sent. */
   getStoredResponse?: (nonce: string) => TelegramStoredResponse | null;
   /** Durable workflow state used to resume a Telegram update after a process crash. */
@@ -538,6 +583,8 @@ export class TelegramHermesRouter {
         correlationId: correlationIdFor(update),
         admitted: true,
         replayed: false,
+        // An owner decision claims no CEO turn; this acknowledgement is the router's own (#639).
+        turnAnswered: false,
         classification: "OWNER_DECISION",
         input: null,
         reply,
@@ -666,23 +713,29 @@ export class TelegramHermesRouter {
     input: TelegramDirectInput,
   ): Promise<TelegramRouteOutcome> {
     try {
-      const directText = await this.directHandler(input);
-      return this.outcomeWithReply(
-        update,
-        true,
-        false,
-        input,
-        // Not "acknowledged by Hermes". The default directHandler is a pure function that
-        // formats a string; nothing is dispatched and Hermes never sees the message. Naming
-        // an actor that did not receive it tells the owner a request is in motion when it is
-        // not — the reply was the only thing that looked like progress.
-        //
-        // A deployment may inject a directHandler that does reach somewhere, so the prefix
-        // states only what the router itself knows: the message arrived and created no run.
-        // Anything about who handled it belongs to the handler's own text.
-        this.replyFor(update, `DIRECT received; no run created\n${directText}`),
-        ReasonCode.OK,
-      );
+      const answer = directAnswerOf(await this.directHandler(input));
+      return {
+        ...this.outcomeWithReply(
+          update,
+          true,
+          false,
+          input,
+          // Not "acknowledged by Hermes". The default directHandler is a pure function that
+          // formats a string; nothing is dispatched and Hermes never sees the message. Naming
+          // an actor that did not receive it tells the owner a request is in motion when it is
+          // not — the reply was the only thing that looked like progress.
+          //
+          // A deployment may inject a directHandler that does reach somewhere, so the prefix
+          // states only what the router itself knows: the message arrived and created no run.
+          // Anything about who handled it belongs to the handler's own text.
+          this.replyFor(update, `DIRECT received; no run created\n${answer.text}`),
+          ReasonCode.OK,
+        ),
+        // The one place a turn can be answered, and the one place that knows whether it was.
+        // `answered: false` is a sentence the daemon composed because the CEO route refused —
+        // the owner must still see it, and it must not spend the turn's resolution (#639).
+        turnAnswered: answer.answered,
+      };
     } catch (error) {
       if (error instanceof TelegramInterruption) throw error;
       return this.outcomeWithReply(
@@ -756,6 +809,10 @@ export class TelegramHermesRouter {
       reply: outcome.reply,
       sent: false,
       deliveryStatus: "PENDING",
+      // Written here, at the reservation, because the completion may happen in a different
+      // process (#639). Whether this reply is the CEO's answer is known now and unknowable
+      // later: a restarted poller that retries this send has only the row.
+      turnAnswered: outcome.turnAnswered,
       ...(prior?.unknownDeliveryAttempts === undefined
         ? {}
         : { unknownDeliveryAttempts: prior.unknownDeliveryAttempts }),
@@ -773,10 +830,18 @@ export class TelegramHermesRouter {
       throw new Error(`Telegram response completion requires a PENDING reservation (${outcome.nonce})`);
     }
     // Two lifecycles, one transaction. The turn's is not this message's reply — and until they were
-    // separated (#646) the write below erased the claim — but they end on the same fact, so they
+    // separated (#646) the write below erased the claim — but when they end on the same fact they
     // have to commit on the same fact: a review found the window where the process commits APPLIED,
     // crashes, and on restart returns early without ever resolving the turn, holding the nonce with
     // a turn that finished.
+    //
+    // *When* they end on the same fact. They do not always, and assuming they did is #639's
+    // residual defect: Telegram accepting a sentence is the end of the reply's lifecycle no
+    // matter who wrote the sentence, while the turn ends only if the CEO answered it. An
+    // apology this daemon composed after `CEO_CONVERSATION_TIMEOUT` was, at this seam,
+    // indistinguishable from an answer — it was delivered, so the turn was resolved. Both facts
+    // are still recorded; they are simply no longer the same fact. The reply is completed either
+    // way, and only `ANSWERED` also resolves the turn.
     const completed = this.ingress.completeReplyAndResolveTurn(outcome.nonce, {
       kind: "TELEGRAM_WORKFLOW",
       phase: "REPLIED",
@@ -784,11 +849,35 @@ export class TelegramHermesRouter {
       reply: outcome.reply,
       sent: true,
       deliveryStatus: "APPLIED",
+      turnAnswered: this.turnAnswered(outcome, prior),
       ...(prior?.unknownDeliveryAttempts === undefined
         ? {}
         : { unknownDeliveryAttempts: prior.unknownDeliveryAttempts }),
-    } satisfies TelegramStoredState);
+    } satisfies TelegramStoredState, this.turnOutcomeFor(outcome, prior));
     if (!completed.allowed) throw new Error(`${completed.reasonCode}: ${completed.message}`);
+  }
+
+  /**
+   * Whether the reply being finalized is the CEO's answer to the claimed turn (#639).
+   *
+   * The durable row wins over the in-memory outcome. `reserveResponse` wrote it before the send,
+   * and the process that finishes the send may not be the one that started it — a restarted
+   * poller retrying a reserved reply reconstructs its outcome from this row, so the row is the
+   * only place the answer survives a crash.
+   *
+   * Absent on the row means a reservation written before this field existed. Read as *not* an
+   * answer: the cost is a turn that stays visibly unknown until an operator looks, and the cost
+   * of the other default is a turn the CEO never answered recorded as answered.
+   */
+  private turnAnswered(outcome: TelegramRouteOutcome, prior: TelegramStoredState | null): boolean {
+    return prior?.turnAnswered ?? outcome.turnAnswered;
+  }
+
+  private turnOutcomeFor(
+    outcome: TelegramRouteOutcome,
+    prior: TelegramStoredState | null,
+  ): TelegramTurnOutcome {
+    return this.turnAnswered(outcome, prior) ? "ANSWERED" : "UNANSWERED";
   }
 
   /** Release only a reservation whose transport proved that no message was accepted. */
@@ -804,6 +893,9 @@ export class TelegramHermesRouter {
       reply: outcome.reply,
       sent: false,
       deliveryStatus: "RETRYABLE",
+      // Carried forward, not recomputed: this row is the only surviving record of whether the
+      // reply being retried is the CEO's answer (#639), and a release rewrites the whole row.
+      turnAnswered: this.turnAnswered(outcome, prior),
       ...(prior?.unknownDeliveryAttempts === undefined
         ? {}
         : { unknownDeliveryAttempts: prior.unknownDeliveryAttempts }),
@@ -831,9 +923,13 @@ export class TelegramHermesRouter {
       reply: outcome.reply,
       sent: false,
       deliveryStatus,
+      turnAnswered: this.turnAnswered(outcome, prior),
       ...(unknownDeliveryAttempts > 0 ? { unknownDeliveryAttempts } : {}),
       deliveryFailure: failure,
-    } satisfies TelegramStoredState, deliveryStatus);
+      // A settlement terminalizes the *reply*. Whether it may also settle the turn is the same
+      // question `completeResponse` asks (#639): Telegram refusing an apology this daemon wrote
+      // says nothing about the CEO's turn, which is still unanswered and must stay visible.
+    } satisfies TelegramStoredState, deliveryStatus, this.turnOutcomeFor(outcome, prior));
     if (!settled.allowed) throw new Error(`${settled.reasonCode}: ${settled.message}`);
   }
 
@@ -852,10 +948,16 @@ export class TelegramHermesRouter {
       ...(outcome.runId ?? prior?.runId ? { runId: outcome.runId ?? prior?.runId } : {}),
       reply: outcome.reply,
       deliveryStatus: "UNRESOLVED",
+      turnAnswered: this.turnAnswered(outcome, prior),
       unknownDeliveryAttempts,
       deliveryFailure: failure,
     } satisfies TelegramStoredState;
-    const recorded = this.ingress.settleReplyAndTurn(outcome.nonce, state, "UNRESOLVED");
+    const recorded = this.ingress.settleReplyAndTurn(
+      outcome.nonce,
+      state,
+      "UNRESOLVED",
+      this.turnOutcomeFor(outcome, prior),
+    );
     if (!recorded.allowed) throw new Error(`${recorded.reasonCode}: ${recorded.message}`);
   }
 
@@ -999,6 +1101,8 @@ export class TelegramHermesRouter {
       input: null,
       reply: this.replyFor(update, this.failureText("OWNER DECISION refused", refusal)),
       reasonCode: refusal.reasonCode,
+      // An owner-decision refusal claims no CEO turn, and this text is the router's own (#639).
+      turnAnswered: false,
     };
   }
 
@@ -1017,6 +1121,9 @@ export class TelegramHermesRouter {
       input: null,
       reply: includeReply ? stored.reply ?? null : null,
       reasonCode: ReasonCode.INGRESS_REPLAY_IGNORED,
+      // Read back off the row rather than assumed. A retried send may be carrying a real CEO
+      // answer, and this process did not run the handler that produced it (#639).
+      turnAnswered: stored.turnAnswered ?? false,
       ...(stored.runId ? { runId: stored.runId } : {}),
     };
   }
@@ -1043,6 +1150,9 @@ export class TelegramHermesRouter {
       nonce,
       state,
       "UNRESOLVED",
+      // Read off the row this recovery is reading anyway: the process that reserved this reply
+      // is gone, and its verdict on whether the CEO answered is durable or nowhere (#639).
+      stored.turnAnswered ? "ANSWERED" : "UNANSWERED",
       priorStatus === "UNKNOWN_RETRYABLE" ? "UNKNOWN_RETRYABLE" : "PENDING",
     );
     if (recorded.allowed) return state;
@@ -1084,6 +1194,8 @@ export class TelegramHermesRouter {
       input: null,
       reply: null,
       reasonCode,
+      // A denial carries no reply at all, so nothing here can resolve a turn (#639).
+      turnAnswered: false,
     };
   }
 
@@ -1106,6 +1218,19 @@ export class TelegramHermesRouter {
       input,
       reply,
       reasonCode,
+      // Not a parameter, and `false` rather than `true`, on purpose (#639).
+      //
+      // Every reply built here is one this router composed — a park notice, a refusal, a
+      // failure text, a MANAGED acknowledgement. None of them is the CEO answering a turn, so
+      // there is no site among them that would want the other value. `completeDirectRoute` is
+      // the sole producer of a CEO answer and overrides this explicitly.
+      //
+      // The direction matters more than the mechanism. A forgotten site here leaves a turn
+      // unresolved: doctor raises `TURN_OUTCOME_UNKNOWN` and the owner is told, on their next
+      // message, that a turn is outstanding. That is loud and recoverable. The default this
+      // replaces failed the other way — it resolved turns nobody answered, silently, which is
+      // the whole of the defect.
+      turnAnswered: false,
       ...(runId ? { runId } : {}),
     };
   }
