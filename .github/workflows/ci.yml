@@ -163,9 +163,10 @@ jobs:
       - run: pnpm native:peercred:build
       - run: pnpm guards:falsifiable
 
-  # Traceability needs a complete Vitest JSON result. It intentionally makes that result in this
-  # clean checkout instead of consuming a possibly absent artifact from a failed matrix leg.
-  # `pnpm trace` states this fallback and runs the suite once with its own JSON output path.
+  # Traceability needs a complete Vitest JSON result, and it consumes the one the gate judged
+  # rather than making its own. A second execution is a different run: whatever it reports is a
+  # claim about something no gate looked at. A missing artifact fails this job rather than
+  # silently falling back to a fresh suite — see the download and `test -s` steps below.
   traceability:
     name: traceability
     needs: verify-matrix

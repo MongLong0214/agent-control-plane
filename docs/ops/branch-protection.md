@@ -16,8 +16,10 @@ The workflow now has five jobs:
   the current Node 22 release, producing `verify (22.18.0)` and `verify (22)` checks;
 - `guard-falsifiability`, displayed as `guard falsifiability`, runs the mutation sweep in its own
   clean checkout after the matrix;
-- `traceability`, displayed as `traceability`, runs its own independent test suite and generates
-  the complete report it consumes in its own clean checkout;
+- `traceability`, displayed as `traceability`, checks out clean and consumes the Vitest JSON the
+  gate judged, downloaded from the `22.18.0` matrix leg of the same run. It does not run the suite
+  again: a second execution is a different run, so a report built from it describes something no
+  gate examined. A missing or empty artifact fails the job rather than falling back to a fresh run;
 - `ssot`, displayed as `SSOT reconciliation`, runs the reconciliation check in its own checkout;
   and
 - `verify-gate`, displayed as bare `verify`, needs all four preceding jobs and runs under

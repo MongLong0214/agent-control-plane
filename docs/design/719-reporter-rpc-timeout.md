@@ -361,14 +361,18 @@ after `verify-matrix`, under a job-level `always()` condition. The required `ver
 success from all four jobs, so a failed, cancelled, or skipped downstream job cannot satisfy the
 gate. No downstream command runs in a workspace a failed test or mutation may have edited.
 
-Traceability deliberately does not download a matrix artifact: it runs its own suite and creates
-its own JSON result in the clean checkout. This preserves its complete-result dependency when
-both matrix tests fail or produce no artifact.
+Traceability downloads the JSON the gate judged from the `22.18.0` matrix leg of the same run,
+rather than producing its own. A second suite execution is a different run, so a traceability
+report built from it states coverage for something no gate examined. The complete-result
+dependency is preserved by failing instead of substituting: the upload declares
+`if-no-files-found: error` and the job asserts the downloaded file is non-empty before running
+`pnpm trace`. When both matrix legs fail there is no report to trust, and that is the outcome.
 
-The source-counted workflow cost changes are exact: full-suite invocations increase from two to
-three, full falsifiability sweeps decrease from two to one, and SSOT invocations decrease from two
-to one. Three independent job setup/install sequences are added. The local 4.1.11 full-suite run
-above measured 480.57 seconds, but GitHub runner duration for the extra traceability suite, the
-falsifiability job, job startup, and install/rebuild is **unmeasured**. All dependency-bearing jobs
+The source-counted workflow cost changes are exact: full-suite invocations stay at two — the two
+matrix legs — because traceability consumes one leg's JSON instead of running a third; full
+falsifiability sweeps decrease from two to one, and SSOT invocations decrease from two to one.
+Three independent job setup/install sequences are added. The local 4.1.11 full-suite run above
+measured 480.57 seconds, but GitHub runner duration for the falsifiability job, job startup, and
+install/rebuild is **unmeasured**. All dependency-bearing jobs
 use `actions/setup-node`'s pnpm cache with the same lockfile-derived key; actual cache hits and
 saved runner time are **unmeasured** until this workflow runs on GitHub Actions.
