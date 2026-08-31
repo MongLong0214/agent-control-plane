@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 34;
+export const SCHEMA_VERSION = 35;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -102,6 +102,11 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   /CREATE INDEX IF NOT EXISTS assignments_actor[^;]*;/,
   /-- CP-HI-04 — the identity columns of a binding are fixed once written\.[\s\S]*?CREATE TRIGGER IF NOT EXISTS assignments_generation_immutable[\s\S]*?\nEND;/,
   /-- ---------------------------------------------------------------------------\n-- conversational_actor_registrations[\s\S]*?(?=-- ---------------------------------------------------------------------------\n-- assignments)/,
+  // #631 — names `NEW.payload_json`, a column v35 adds. `CREATE TABLE IF NOT EXISTS
+  // inbound_messages` is a no-op against the v11 table, so replaying this here creates a trigger
+  // over a column that does not exist yet and the whole chain aborts on the first UPDATE. v35
+  // owns it, which is the rule this list exists to state.
+  /-- #631 — the admitted payload is the sender's own words[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_payload_immutable[\s\S]*?\nEND;/,
 ];
 
 /**
@@ -2198,6 +2203,45 @@ const v34: SchemaMigration = {
   checksum: () => migrationChecksum("v34-persist-hermes-target-bind-receipt-evidence"),
 };
 
+/**
+ * Keeps the admitted payload — the sender's own words — beside the row that says a message was
+ * admitted (#631).
+ *
+ * Nullable and deliberately not backfilled: a v34 row's payload does not exist anywhere to be
+ * recovered from, and writing a placeholder would turn "we never kept this" into a stored value a
+ * later reader would take for the message. `unresolvedTurns` reports `payload: null` for those
+ * rows, which is the true statement about them.
+ *
+ * The trigger is the load-bearing half. The column could have been added without one and the
+ * writers would still only INSERT it — but that is exactly what was true of the turn claim before
+ * #646, when it shared `result_json` with the reply lifecycle and the reservation's ordinary
+ * UPDATE erased it. A write-once column reachable by UPDATE is a lifecycle waiting to be given.
+ */
+const v35: SchemaMigration = {
+  id: "v35-keep-the-admitted-payload-with-its-inbound-row",
+  fromVersion: 34,
+  toVersion: 35,
+  apply: (raw) => {
+    const columns = (
+      raw.prepare(`SELECT name FROM pragma_table_info('inbound_messages')`).all() as Array<{
+        name: string;
+      }>
+    ).map((row) => row.name);
+    if (!columns.includes("payload_json")) {
+      raw.exec(`ALTER TABLE inbound_messages ADD COLUMN payload_json TEXT`);
+    }
+    raw.exec(`
+      CREATE TRIGGER IF NOT EXISTS inbound_messages_payload_immutable
+      BEFORE UPDATE OF payload_json ON inbound_messages
+      WHEN NEW.payload_json IS NOT OLD.payload_json
+      BEGIN
+        SELECT RAISE(ABORT, 'INBOUND_PAYLOAD_IMMUTABLE');
+      END;
+    `);
+  },
+  checksum: () => migrationChecksum("v35-keep-the-admitted-payload-with-its-inbound-row"),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -2222,6 +2266,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v32,
   v33,
   v34,
+  v35,
 ]);
 
 interface RequiredTrigger {
@@ -2328,6 +2373,7 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "attestation_generation_matches_assignment", sentinel: "ATTESTATION_GENERATION_MISMATCH", introducedIn: 31 },
   { name: "conversational_actors_incarnation_matches_session_on_insert", sentinel: "ACTOR_SESSION_INCARNATION_MISMATCH", introducedIn: 31 },
   { name: "conversational_actors_incarnation_matches_session_on_update", sentinel: "ACTOR_SESSION_INCARNATION_MISMATCH", introducedIn: 31 },
+  { name: "inbound_messages_payload_immutable", sentinel: "INBOUND_PAYLOAD_IMMUTABLE", introducedIn: 35 },
   { name: "canonical_turn_sources_admission_matches_claim", sentinel: "CANONICAL_TURN_SOURCE_NOT_CLAIM_TIME", introducedIn: 32 },
 ];
 

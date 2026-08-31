@@ -411,6 +411,45 @@ const asV33Fixture = (path: string): void => {
   }
 };
 
+/**
+ * A v34 database: current schema with #631's payload column and its trigger taken back off, an
+ * admitted inbound row already in it, and the ledger wound back to 34.
+ *
+ * The row matters. v35 adds a nullable column with no backfill, and the question a rollback
+ * boundary answers is what the snapshot holds if the upgrade is reversed — so the fixture has to
+ * carry a row that existed before the column did.
+ */
+const asV34Fixture = (path: string): void => {
+  const current = new Db(path);
+  current.close();
+
+  const raw = new Database(path);
+  try {
+    raw.exec("DROP TRIGGER IF EXISTS inbound_messages_payload_immutable");
+    const present = raw
+      .prepare("SELECT 1 AS present FROM pragma_table_info('inbound_messages') WHERE name = 'payload_json'")
+      .get();
+    if (present) raw.exec("ALTER TABLE inbound_messages DROP COLUMN payload_json");
+    raw.function("acp_schema_migration_authorized", () => 1);
+    raw.exec("DROP TRIGGER schema_migrations_immutable; DROP TRIGGER schema_migrations_no_delete;");
+    raw.exec("DELETE FROM schema_migrations");
+    const v34 = MIGRATIONS.find((migration) => migration.toVersion === 34);
+    if (!v34) throw new Error("v34 migration is absent from the ordered registry");
+    raw.prepare(
+      "INSERT INTO schema_migrations (version, migration_id, checksum, applied_at) VALUES (?, ?, ?, ?)",
+    ).run(34, v34.id, v34.checksum(), NOW);
+    installMigrationLedger(raw);
+    raw.prepare(
+      `INSERT INTO inbound_messages (channel, nonce, actor, received_at)
+       VALUES ('telegram', 'update:34', '424242', ?)`,
+    ).run(NOW);
+    raw.pragma("user_version = 34");
+  } finally {
+    raw.close();
+    asPrivateStateFile(path);
+  }
+};
+
 const fileSha256 = (path: string): string =>
   `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
 
@@ -466,6 +505,59 @@ const assertEmptyActorRegistry = (db: Db): void => {
 };
 
 describe("versioned SQLite migration", () => {
+  it("opening a v34 database takes an automatic rollback snapshot before v35 admitted-payload state", () => {
+    const path = join(tempDir("acp-v34-admitted-payload-boundary-"), "state.sqlite");
+    asV34Fixture(path);
+
+    const migrated = new Db(path);
+    let backupPath: string;
+    try {
+      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
+      const receipt = migrated.get<{
+        migration_id: string;
+        backup_file: string | null;
+        backup_checksum: string | null;
+      }>(
+        `SELECT migration_id, backup_file, backup_checksum
+           FROM schema_migrations WHERE version = 35`,
+      );
+      expect(receipt).toMatchObject({
+        migration_id: "v35-keep-the-admitted-payload-with-its-inbound-row",
+        backup_file: expect.stringContaining("-pre-migration-v34-"),
+        backup_checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      });
+      if (!receipt?.backup_file) throw new Error("v35 receipt did not name its automatic backup");
+      backupPath = receipt.backup_file;
+      expect(existsSync(backupPath)).toBe(true);
+
+      // No backfill, deliberately: a row admitted before the column existed has no copy of its
+      // message anywhere, and writing a placeholder would turn "we never kept this" into a value
+      // a later reader takes for the message.
+      expect(migrated.get<{ payload_json: string | null }>(
+        "SELECT payload_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'update:34'",
+      )).toEqual({ payload_json: null });
+
+      // And the column arrives with its write-once rule already on it. A migration that added the
+      // column and left the trigger to schema.sql would leave every upgraded deployment — as
+      // opposed to every fresh one — with a payload any UPDATE could reach.
+      expect(() => migrated.run(
+        "UPDATE inbound_messages SET payload_json = 'forged' WHERE nonce = 'update:34'",
+      )).toThrow(/INBOUND_PAYLOAD_IMMUTABLE/);
+    } finally {
+      migrated.close();
+    }
+
+    const rollbackSnapshot = new Database(backupPath, { readonly: true, fileMustExist: true });
+    try {
+      expect(Number(rollbackSnapshot.pragma("user_version", { simple: true }))).toBe(34);
+      expect(rollbackSnapshot.prepare(
+        "SELECT 1 AS present FROM pragma_table_info('inbound_messages') WHERE name = 'payload_json'",
+      ).get()).toBeUndefined();
+    } finally {
+      rollbackSnapshot.close();
+    }
+  });
+
   it("opening a v33 database takes an automatic rollback snapshot before v34 target-bind receipt state", () => {
     const path = join(tempDir("acp-v33-hermes-receipt-boundary-"), "state.sqlite");
     asV33Fixture(path);
@@ -473,7 +565,7 @@ describe("versioned SQLite migration", () => {
     const migrated = new Db(path);
     let backupPath: string;
     try {
-      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(34);
+      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
       const receipt = migrated.get<{
         migration_id: string;
         backup_file: string | null;
@@ -657,7 +749,8 @@ describe("versioned SQLite migration", () => {
         [31, "v31-a-generation-means-nothing-without-its-role-key"],
         [32, "v32-a-source-can-only-cite-its-turns-own-claim-event"],
         [33, "v33-back-up-before-telegram-settlement-state"],
-        [SCHEMA_VERSION, "v34-persist-hermes-target-bind-receipt-evidence"],
+        [34, "v34-persist-hermes-target-bind-receipt-evidence"],
+        [SCHEMA_VERSION, "v35-keep-the-admitted-payload-with-its-inbound-row"],
       ]);
       // Stated as properties rather than one `objectContaining` per version. The list above
       // already pins the exact order and ids; this block only ever said "every receipt carries a

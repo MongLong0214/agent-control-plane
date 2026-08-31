@@ -1191,10 +1191,36 @@ CREATE TABLE IF NOT EXISTS inbound_messages (
   -- Two lifecycles in one field is the whole defect: the reply's advanced and took the turn's with
   -- it. They reference each other by id now and share no storage.
   turn_claim_json TEXT,
+  -- What the sender actually said, kept because nothing else keeps it (#631).
+  --
+  -- The three columns above are all *about* a message: its key, its reply's delivery, its turn's
+  -- claim. None of them is the message. For Telegram that made the transport the sole custodian
+  -- of the owner's own words, and the restart path spends that copy: a redelivered update whose
+  -- turn is unresolved is refused INGRESS_TURN_OUTCOME_UNKNOWN with a null reply, the poller
+  -- settles it, and settling advances the offset — which is how ACP tells Telegram to drop it.
+  -- Answer never sent, copy never kept, and the message becomes indistinguishable from one the
+  -- owner never wrote.
+  --
+  -- Written once, by `IngressGuard.admit`'s INSERT, before any handler runs — so it is on disk
+  -- before anything can advance an offset past it. Never updated, and the trigger below is what
+  -- makes that structural rather than a convention: #646's defect was two lifecycles sharing
+  -- `result_json`, where the reply's advance overwrote the turn's claim. A third lifecycle
+  -- reachable by UPDATE would be the same defect a third time.
+  payload_json TEXT,
   PRIMARY KEY (channel, nonce)
 );
 
 CREATE INDEX IF NOT EXISTS inbound_received ON inbound_messages(received_at);
+
+-- #631 — the admitted payload is the sender's own words and the only copy ACP holds. Every other
+-- column on this row is updated by some lifecycle; this one is write-once so that no lifecycle
+-- can reach it, which is the structural form of the separation #646 had to make by hand.
+CREATE TRIGGER IF NOT EXISTS inbound_messages_payload_immutable
+BEFORE UPDATE OF payload_json ON inbound_messages
+WHEN NEW.payload_json IS NOT OLD.payload_json
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_PAYLOAD_IMMUTABLE');
+END;
 
 -- ---------------------------------------------------------------------------
 -- telegram_owner_prompts

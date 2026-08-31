@@ -415,9 +415,21 @@ export class IngressGuard {
       });
     }
 
+    // The payload goes down with the row, in the same statement (#631). Not a second write after
+    // it: an INSERT followed by an UPDATE has a window, and the window is exactly the one this
+    // column exists to close — a process that dies between them has admitted a message and kept
+    // no copy of it, which is the state that made an interrupted turn indistinguishable from a
+    // message the sender never wrote.
     this.db.run(
-      `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES (?, ?, ?, ?)`,
-      [request.channel, request.nonce, request.actor, this.clock.nowIso()],
+      `INSERT INTO inbound_messages (channel, nonce, actor, received_at, payload_json)
+        VALUES (?, ?, ?, ?, ?)`,
+      [
+        request.channel,
+        request.nonce,
+        request.actor,
+        this.clock.nowIso(),
+        JSON.stringify(request.payload ?? null),
+      ],
     );
     // From the field this constructor populated, not `policy.nonceTtlMs` — the caller's own
     // `IngressPolicy` object can still be mutated after construction, and the transport-retention
@@ -705,8 +717,13 @@ export class IngressGuard {
    * oldest outstanding turn is the one that has been unanswered longest.
    */
   unresolvedTurns(channel: string, sessionDigest: string): readonly UnresolvedTurn[] {
-    const rows = this.db.all<{ nonce: string; received_at: string; turn_claim_json: string }>(
-      `SELECT nonce, received_at, turn_claim_json FROM inbound_messages
+    const rows = this.db.all<{
+      nonce: string;
+      received_at: string;
+      turn_claim_json: string;
+      payload_json: string | null;
+    }>(
+      `SELECT nonce, received_at, turn_claim_json, payload_json FROM inbound_messages
         WHERE channel = ?
           AND turn_claim_json IS NOT NULL
           AND json_extract(turn_claim_json, '$.repliedAt') IS NULL
@@ -724,6 +741,7 @@ export class IngressGuard {
       // turn, and handing them the wrong timestamp under a confident name is worse than handing
       // them the right one under a plain name.
       receivedAt: row.received_at,
+      payload: admittedPayload(row.payload_json),
       ...normalizeStoredTurnClaim(JSON.parse(row.turn_claim_json) as StoredTurnClaim),
     }));
   }
@@ -1320,6 +1338,18 @@ export interface UnresolvedTurn extends TurnClaim {
    * it will have `claimed_at`, and this field stays what it says it is.
    */
   receivedAt: string;
+  /**
+   * What the sender actually wrote, as `admit` stored it — untrusted data, never instructions.
+   *
+   * `null` for a row admitted by a build older than the column (#631 adds no backfill, because
+   * there is nothing to backfill from), and for any row whose stored JSON does not parse. Both
+   * mean the same thing to a reader and the type says so: this turn's content is not available.
+   *
+   * The three digests above identify a turn; none of them is the turn. A `promptDigest` cannot be
+   * shown to the owner, matched against what they remember sending, or re-run — so a reconciler
+   * holding only a claim knows a message was lost without knowing which one.
+   */
+  payload: unknown;
 }
 
 /**
@@ -1376,6 +1406,24 @@ const isRecoverableIngressResult = (resultJson: string | null): boolean => {
  * whose reply was terminally unanswerable or externally unresolved. These are three different
  * facts, and each closes the ingress claim without overstating the others.
  */
+/**
+ * The admitted payload as stored, or `null` when this row does not have one.
+ *
+ * Unparseable is `null` rather than a throw: this is read on the path that tells the owner what
+ * was lost, and a reader that throws on one bad row tells them nothing about any row. The value
+ * stays `unknown` on the way out — it is the sender's text, and §27.4's rule that a payload
+ * crosses as data does not stop applying because the crossing is now a database instead of a
+ * transport.
+ */
+const admittedPayload = (payloadJson: string | null): unknown => {
+  if (payloadJson === null) return null;
+  try {
+    return JSON.parse(payloadJson) as unknown;
+  } catch {
+    return null;
+  }
+};
+
 const unresolvedClaim = (turnClaimJson: string | null): boolean => {
   if (!turnClaimJson) return false;
   try {
