@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rm } from "node:fs/promises";
@@ -45,7 +45,7 @@ const basePlan = (): RepoFactoryPlanFixture => ({
   repositoryRole: "primary",
   defaultBranch: "main",
   verificationCommandId: "local-clean-tree",
-  verificationArgs: ["status", "--porcelain"],
+  verificationKind: "CLEAN_TREE",
   githubOperations: [],
 });
 
@@ -97,5 +97,32 @@ describe("repo-factory:produce-local CLI (#246)", () => {
     await expect(
       execFileAsync(process.execPath, [TSX_ENTRY, CLI_ENTRY], { cwd: process.cwd() }),
     ).rejects.toMatchObject({ code: 1 });
+  });
+
+  it("CEO review round 3, defect 1 — the exact attack CEO ran through the real CLI is now refused, not just in-process", async () => {
+    const sandbox = makeSandbox();
+    const outsideTarget = join(sandbox, "outside-target");
+    mkdirSync(outsideTarget, { recursive: true });
+    // Reconstructed verbatim: a plan carrying the old `verificationArgs` shape with a second
+    // `-C` aimed outside workDir. The field no longer exists in the schema, so this is
+    // rejected before any git call — but the point of a process-level test is proving that
+    // holds through the real CLI's JSON parsing, not only the in-process object shape.
+    const attackPlanPath = join(sandbox, "plan.json");
+    writeFileSync(
+      attackPlanPath,
+      JSON.stringify({ ...basePlan(), verificationArgs: ["-C", outsideTarget, "init", "-b", "pwn"] }),
+    );
+    const workDir = join(sandbox, "workdir");
+
+    await expect(
+      execFileAsync(
+        process.execPath,
+        [TSX_ENTRY, CLI_ENTRY, `--plan=${attackPlanPath}`, `--work-dir=${workDir}`],
+        { cwd: process.cwd() },
+      ),
+    ).rejects.toMatchObject({ code: 1 });
+
+    expect(existsSync(join(outsideTarget, ".git"))).toBe(false);
+    expect(readdirSync(outsideTarget)).toEqual([]);
   });
 });

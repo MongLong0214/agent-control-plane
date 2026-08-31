@@ -3283,8 +3283,8 @@ const GUARDS = [
     // schema-complete lie about something that was actually observed to fail.
     what: "the producer refuses to record a fabricated PASS when the local verification command genuinely fails",
     file: "src/bootstrap/repo-factory-producer.ts",
-    find: "  if (verification.exitCode !== 0) {\n",
-    replace: "  if (false && verification.exitCode !== 0) {\n",
+    find: "      if (result.exitCode !== 0) {\n",
+    replace: "      if (false && result.exitCode !== 0) {\n",
     killedBy: ["tests/unit/repo-factory-producer.test.ts"],
   },
   {
@@ -3335,8 +3335,8 @@ const GUARDS = [
     // actually deleted.
     what: "a failed run removes only the checkout it just created, so the same bootstrap operation can retry",
     file: "src/bootstrap/repo-factory-producer.ts",
-    find: "  rmSync(localRepoPath, { recursive: true, force: true });\n",
-    replace: "  // rmSync(localRepoPath, { recursive: true, force: true });\n",
+    find: "  rmSync(anchor.path, { recursive: true, force: true });\n",
+    replace: "  // rmSync(anchor.path, { recursive: true, force: true });\n",
     killedBy: ["tests/unit/repo-factory-producer.test.ts"],
   },
   {
@@ -3350,6 +3350,45 @@ const GUARDS = [
     file: "src/bootstrap/repo-factory-producer.ts",
     find: "  if (tracked.exitCode !== 0) {\n",
     replace: "  if (false && tracked.exitCode !== 0) {\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // CEO review round 3, defect 1 — CEO executed `["-C", <outside>, "init", "-b", "pwn"]`
+    // through `verificationArgs` and it wrote a real `.git` outside `workDir`; the field was
+    // removed entirely (replaced by the closed `VERIFICATION_KINDS` enum) rather than
+    // patched, because blocklisting `-C`/`--git-dir`/`--work-tree`/`--global` still leaves
+    // "and anything else you find" open. `.strict()` is what makes a plan reconstructing the
+    // old attack shape (an extra `verificationArgs` key) a loud, immediate schema rejection
+    // instead of a silently-stripped key that could mask a real regression here.
+    what: "the plan schema rejects an old-shaped attack plan (a stray verificationArgs key) rather than silently stripping it",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "  })\n  .strict();\n\nexport type RepoFactoryPlanFixture",
+    replace: "  });\n\nexport type RepoFactoryPlanFixture",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // CEO review round 3, defect 2 — `git status --porcelain` exits 0 whether or not the
+    // tree is dirty; the dirtiness is only ever on stdout. A judge that checked only
+    // `exitCode` (the previous shape) reported PASS over the producer's own untracked
+    // ownership marker — CEO measured it directly: `local-clean-tree:PASS` next to a real
+    // `?? .repo-factory-operation.json`. Neutering this line reproduces exactly that.
+    what: "CLEAN_TREE denies a dirty working tree observed on stdout, not only a non-zero exit code",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "      if (result.stdout.trim().length > 0) {\n",
+    replace: "      if (false && result.stdout.trim().length > 0) {\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // CEO review round 3, defect 3 — every operation after the one containment check at the
+    // top passed a bare pathname straight through, so a symlink swapped in afterward (proven
+    // directly: a bare `git -C <path>` call follows such a swap without complaint) was
+    // silently followed. Neutering the identity comparison here reproduces exactly that:
+    // `assertStillAnchored` reports "still anchored" regardless of whether the pathname still
+    // refers to the directory `anchorDirectory` opened.
+    what: "assertStillAnchored refuses once the anchored path no longer matches the directory's original device+inode identity",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "  if (stat.dev !== anchor.identity.dev || stat.ino !== anchor.identity.ino) {\n",
+    replace: "  if (false && (stat.dev !== anchor.identity.dev || stat.ino !== anchor.identity.ino)) {\n",
     killedBy: ["tests/unit/repo-factory-producer.test.ts"],
   },
 ];
