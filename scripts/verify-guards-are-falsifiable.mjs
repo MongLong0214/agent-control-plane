@@ -3299,12 +3299,14 @@ const GUARDS = [
     killedBy: ["tests/unit/repo-factory-producer.test.ts"],
   },
   {
-    // `repositoryRole` is also the local directory name (`repositoryCheckoutPath` joins it
-    // straight onto `workDir`), so this regex is the only thing standing between a plan and
-    // a path that escapes the directory the producer was given to write in. Removing it
-    // would let a role like `../../etc` parse and be joined into a real filesystem path
-    // outside `workDir`.
-    what: "the plan schema refuses a repository role that would escape the given work directory",
+    // `assertContained` (added in CEO review round 2, defect 1) now independently refuses a
+    // role like `../../etc` by realpath, which made this row's original test
+    // ("...would escape the given work directory") survive its own mutation — the
+    // containment check caught the escape whether or not this regex existed, so removing
+    // the regex alone was no longer observable. A role that is not kebab-case but is not
+    // path-shaped at all (`Primary_Role`: no `/`, no `..`) never trips containment, so that
+    // is the property only this regex still uniquely guards.
+    what: "the plan schema refuses a repository role that is not kebab-case, independent of path escape",
     file: "src/bootstrap/repo-factory-producer.ts",
     find: '.regex(/^[a-z0-9][a-z0-9-]*$/, "repositoryRole must be kebab-case"),\n',
     replace: ",\n",

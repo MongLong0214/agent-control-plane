@@ -134,6 +134,16 @@ describe("repo factory producer (#246)", () => {
     expect(produced.allowed).toBe(false);
   });
 
+  it("rejects a repository role that is not kebab-case even when it never escapes the work directory", async () => {
+    // "Primary_Role" is not path-shaped at all — `repositoryCheckoutPath` joins it straight
+    // onto workDir with no escape, so the realpath containment check alone would let it
+    // through. Only the plan schema's own kebab-case format rule stands here.
+    const { workDir } = makeSandbox();
+    const plan: RepoFactoryPlanFixture = { ...basePlan(), repositoryRole: "Primary_Role" };
+    const produced = await produceRepoFactoryResult({ plan, workDir });
+    expect(produced.allowed).toBe(false);
+  });
+
   it("refuses when an existing path component between the work directory and the checkout escapes it via a symlink", async () => {
     const { sandbox, workDir } = makeSandbox();
     mkdirSync(workDir, { recursive: true });
