@@ -3287,6 +3287,256 @@ const GUARDS = [
     killedBy: ["tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts"],
   },
   {
+    // #745 round 4, measured. Every `sqlite3` call in the database-backup block passes
+    // `-readonly`, and a read-only connection to a WAL database must create the `-shm` file it is
+    // not permitted to create: it fails `SQLITE_CANTOPEN (14)` and says nothing about why. The
+    // document declares the live database is `delete` — measured, true — but `Db`'s constructor
+    // sets `journal_mode = WAL` on a database it creates, so a state file made by this code rather
+    // than inherited from an older one is WAL, and the declaration is a fact with an expiry date.
+    //
+    // Deleting this guard does not make the block succeed on a WAL source; it makes it fail with
+    // an errno instead of a sentence. That is why the named test asserts the message and not the
+    // exit status — the guard's whole content is that the refusal is legible.
+    what: "the database backup step refuses a WAL source by name instead of failing with a bare errno",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    SOURCE_JOURNAL_FORMAT="$(od -An -tu1 -j18 -N1 "$SOURCE_DB" | tr -d \' \')"\n' +
+      '    if [ "$SOURCE_JOURNAL_FORMAT" != "1" ]; then\n' +
+      '      echo "refusing: $SOURCE_DB has SQLite write-format $SOURCE_JOURNAL_FORMAT, not 1; a read-only connection cannot open a WAL database and this procedure is not verified for one" >&2; exit 1\n' +
+      "    fi\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::refuses a WAL source by name rather than letting a read-only connection fail with an errno",
+    ],
+  },
+  {
+    // #745 round 4, blocker 2. `readManifest` runs `assertPrivatePath` on the backup *and* its
+    // manifest, and that requires mode exactly 0600. `.backup` writes with the ambient umask —
+    // 0644 on this host — so without this line the restore refuses the artifact on permissions
+    // before it ever reaches the manifest's contents. The named test runs the whole documented
+    // procedure and hands the result to the real `restoreDatabase`, which is where this surfaces.
+    what: "the database backup step makes the backup file private enough for the restore validator to read",
+    file: "docs/ops/owner-actions.md",
+    find: '    chmod 600 "$BACKUP_TMP"\n',
+    replace: "",
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::produces a backup that item 6's real restore validator accepts, end to end",
+    ],
+  },
+  {
+    // #745 round 4, blocker 2, the same for the manifest — a separate line, a separate way to
+    // fail, and `assertPrivatePath` is called on both paths independently.
+    what: "the database backup step makes the manifest private enough for the restore validator to read",
+    file: "docs/ops/owner-actions.md",
+    find: '    chmod 600 "${BACKUP_TMP}.manifest.json"\n',
+    replace: "",
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::produces a backup that item 6's real restore validator accepts, end to end",
+    ],
+  },
+  {
+    // #745 round 4, blocker 2, the defect itself. The document had invented a second manifest
+    // schema (`agent-control-plane.sqlite-backup/online-v1`, `backupSha256`, `backupUserVersion`)
+    // that `readManifest` in src/db/backup.ts refuses outright, so `state-admin.js restore`
+    // rejected every backup this procedure produced — the procedure whose only purpose is to make
+    // that restore possible.
+    //
+    // This row restores the old `format` string and nothing else. One field is enough: it is an
+    // equality check in `readManifest`, and it proves the named test is coupled to what the
+    // validator actually accepts rather than to a shape written down twice.
+    what: "the database backup step writes the manifest schema the restore validator accepts, not one of its own",
+    file: "docs/ops/owner-actions.md",
+    find: '    { "format": "agent-control-plane.sqlite-backup/v1",\n',
+    replace: '    { "format": "agent-control-plane.sqlite-backup/online-v1",\n',
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::produces a backup that item 6's real restore validator accepts, end to end",
+    ],
+  },
+  {
+    // #745 round 4. `schemaVersion` is the one manifest field emitted unquoted, so a reading that
+    // is empty or non-numeric does not produce a manifest that is merely wrong — it produces one
+    // that is not JSON, and the failure then surfaces at restore time as a parse error rather
+    // than here as a refusal. Deleting the guard lets the block publish that manifest and exit 0.
+    what: "the database backup step refuses a non-integer user_version before it can emit a manifest that is not JSON",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    case "$BACKUP_USER_VERSION" in\n' +
+      "      ''|*[!0-9]*) echo \"refusing: user_version of $BACKUP_TMP is '$BACKUP_USER_VERSION', not an integer\" >&2; exit 1 ;;\n" +
+      "    esac\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::refuses when the backup's user_version does not read as an integer, before publishing a manifest",
+    ],
+  },
+  {
+    // #745 round 4, blocker 2's ordering half — the part that made the schema mismatch dangerous
+    // rather than merely wrong. Item 6's preflight checked that a manifest *existed*; it never
+    // checked that `restoreDatabase` would accept it, and those are different claims. So an
+    // unreadable manifest failed *after* `rm -rf .../dist`, in the procedure you reach for when
+    // things are already broken.
+    //
+    // Deleting the validating restore returns the preflight to existence-checking. The named test
+    // supplies a backup whose file is real, private and integral and whose manifest is exactly
+    // what this document wrote before this round: every remaining check passes, and `rm -rf` runs.
+    what: "the rollback preflight validates the backup through the real restore before rm -rf, not merely that a manifest exists",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    node "$BYTES_BACKUP/dist/db/state-admin.js" restore "$BACKUP_PATH" \\\n' +
+      '      --database "$ROLLBACK_PREFLIGHT_DIR/state.sqlite" --confirm-restore\n',
+    replace: "",
+    killedBy: [
+      "tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts::refuses to run rm -rf when the backup's manifest is one the real restore validator rejects",
+    ],
+  },
+  {
+    // #512: the database-backup step in item 4 step 2 replaced `state-admin.js backup` (which
+    // needs a `better-sqlite3` binding a fresh `node` process cannot load) with SQLite's own
+    // online backup API. Executing the old text against the real host produced an empty
+    // `BACKUP_PATH` and `sqlite3 "" "PRAGMA integrity_check;"` printed `ok` — a real command, a
+    // real success exit, and no backup at all. This row deletes the destination guard that makes
+    // that shape unreachable (empty / already-exists / symlink), leaving the `mv` at the end free
+    // to silently overwrite whatever already sits at the deterministic destination name — exactly
+    // the "destination already exists" counterexample the named test drives.
+    what: "the database backup step refuses an already-existing destination before writing anything",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    if [ -z "$BACKUP_PATH" ] || [ -e "$BACKUP_PATH" ] || [ -L "$BACKUP_PATH" ]; then\n' +
+      '      echo "refusing: $BACKUP_PATH is empty or already exists" >&2; exit 1\n' +
+      "    fi\n",
+    replace: "",
+    killedBy: ["tests/process/the-database-backup-step-fails-closed.test.ts"],
+  },
+  {
+    // #512, second guard on the same block: exit code alone does not prove the backup is good —
+    // the reported defect was exactly a command that exited 0 while proving nothing. Deleting the
+    // content comparison (keeping only a nonzero-exit check would still be satisfied by a stub
+    // that prints the wrong text and exits 0) reproduces that shape for the destination file
+    // instead of the empty path, and the named test's "bad integrity" fixture — a `sqlite3` stub
+    // that answers every `integrity_check` with `malformed` at exit 0 — catches it.
+    what: "the database backup step requires integrity_check stdout to be exactly ok, not just exit 0",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    if [ "$INTEGRITY" != "ok" ]; then\n' +
+      '      echo "refusing: integrity_check on $BACKUP_TMP returned \'$INTEGRITY\', not ok" >&2; exit 1\n' +
+      "    fi\n",
+    replace: "",
+    killedBy: ["tests/process/the-database-backup-step-fails-closed.test.ts"],
+  },
+  {
+    // #745, CEO round 2: the destination check runs once, before the backup, and does not close
+    // the window between that check and publication. Two runs sharing a timestamp both pass it
+    // independently and both reach the publish step; without an exclusive claim on the final
+    // name, the second silently overwrites the first run's already-verified backup.
+    //
+    // Round 3 replaced a `mkdir` reservation with the final name itself, so this row now mutates
+    // the claim that survived: `ln -f` unlinks an existing destination before linking, which
+    // means it never fails `EEXIST` and grants no exclusivity at all — the exact property the
+    // reservation was there for. The named test forces two runs onto one final name with a
+    // pinned timestamp and a barrier, and sees the second one publish instead of refuse.
+    what: "the database backup step claims the final name atomically so only one of two racing runs ever publishes",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    if ! ln "${BACKUP_TMP}.manifest.json" "${BACKUP_PATH}.manifest.json" 2>/dev/null; then\n' +
+      '      echo "refusing: another run already owns the final name $BACKUP_PATH" >&2\n' +
+      "      exit 1\n" +
+      "    fi\n",
+    replace: '    ln -f "${BACKUP_TMP}.manifest.json" "${BACKUP_PATH}.manifest.json"\n',
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::refuses a delayed claim: a run that passed the destination check before another run published cannot overwrite it",
+    ],
+  },
+  {
+    // #745, CEO round 3, counterexample 1: `trap … EXIT` does not run on `SIGKILL` or a host
+    // power loss, so which name is written last — not the trap — is what decides what an
+    // untrappable death can leave behind. The manifest is linked first and the database last, so
+    // `$BACKUP_PATH` is the commit marker and the worst survivable state is a manifest with no
+    // database (which item 6's `test -s "$BACKUP_PATH"` refuses).
+    //
+    // This row swaps the two links. The result is still atomic and still exclusive — the claim
+    // is simply on the wrong name — which is why nothing about racing dies here: the mutation is
+    // about ordering alone. The named test kills the run immediately after its first publish
+    // call and finds a database sitting at the final path with no manifest beside it.
+    what: "the database backup step links the database last so an untrappable death cannot leave one without a manifest",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    if ! ln "${BACKUP_TMP}.manifest.json" "${BACKUP_PATH}.manifest.json" 2>/dev/null; then\n' +
+      '      echo "refusing: another run already owns the final name $BACKUP_PATH" >&2\n' +
+      "      exit 1\n" +
+      "    fi\n" +
+      "    MANIFEST_LINKED=1\n" +
+      '    ln "$BACKUP_TMP" "$BACKUP_PATH"\n',
+    replace:
+      '    if ! ln "$BACKUP_TMP" "$BACKUP_PATH" 2>/dev/null; then\n' +
+      '      echo "refusing: another run already owns the final name $BACKUP_PATH" >&2\n' +
+      "      exit 1\n" +
+      "    fi\n" +
+      "    MANIFEST_LINKED=1\n" +
+      '    ln "${BACKUP_TMP}.manifest.json" "${BACKUP_PATH}.manifest.json"\n',
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::leaves no database at the final path when the run dies untrappably mid-publish, and the next run refuses rather than resuming",
+    ],
+  },
+  {
+    // #745, CEO round 2, second counterexample: publication writes two names, so an ordinary
+    // failure between them can leave one of them alone at the final path. Deleting the unwind
+    // reproduces that half-published shape — the named test fails the second publish call after
+    // the first has succeeded, and without this line the manifest survives alone at
+    // `$BACKUP_PATH.manifest.json` instead of the partial publish being unwound.
+    what: "the database backup step unwinds a partial publish so no database-without-manifest survives at the final path",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '      if [ "$MANIFEST_LINKED" = "1" ] && [ ! -e "$BACKUP_PATH" ]; then\n' +
+      '        rm -f "$BACKUP_PATH.manifest.json"\n' +
+      "      fi\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::leaves zero consumable backups at the final path when the second publish step fails after the first succeeded",
+    ],
+  },
+  {
+    // #745, CEO round 3, the derivative of counterexample 2 and its own property. The unwind
+    // above must remove only names *this run* created, and only while the commit marker is
+    // absent. The previous revision released its reservation on success, so the name no longer
+    // recorded who owned it, and a later run that failed after claiming ran
+    // `rm -f "$BACKUP_PATH" "$BACKUP_PATH.manifest.json"` over a stranger's verified backup.
+    //
+    // This row restores exactly that unconditional form — same anchor as the row above, opposite
+    // mutation, because "unwinds its own partial publish" and "does not unwind anyone else's" are
+    // two properties of one block and a single mutation cannot ask both. The named test lets one
+    // run publish and a second, older run fail afterwards, then reads the published bytes back.
+    what: "the database backup cleanup unlinks only what this run created, never a publication it merely collided with",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '      if [ "$MANIFEST_LINKED" = "1" ] && [ ! -e "$BACKUP_PATH" ]; then\n' +
+      '        rm -f "$BACKUP_PATH.manifest.json"\n' +
+      "      fi\n",
+    replace: '      rm -f "$BACKUP_PATH" "$BACKUP_PATH.manifest.json"\n',
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::a failed run does not delete another run's published backup",
+    ],
+  },
+  {
+    // #745, CEO round 3: `ln` claims the final name only because both names are on one
+    // filesystem — across a mount boundary it fails outright, and the reflex fix for that failure
+    // is a `mv`, which clobbers. The siblings-in-one-directory argument is true today and is
+    // asserted rather than assumed, because an assumption nothing checks survives until the day
+    // it stops holding. Deleting the assertion lets the run proceed on a temp file its own `stat`
+    // reports on a different device, which the named test injects.
+    what: "the database backup step proves the temp file and the destination share a filesystem before claiming with ln",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    BACKUP_TMP_DEVICE="$(stat -f \'%d\' "$BACKUP_TMP")"\n' +
+      '    BACKUP_DIR_DEVICE="$(stat -f \'%d\' "$BACKUP_DIR")"\n' +
+      '    if [ -z "$BACKUP_TMP_DEVICE" ] || [ "$BACKUP_TMP_DEVICE" != "$BACKUP_DIR_DEVICE" ]; then\n' +
+      '      echo "refusing: $BACKUP_TMP is not on the same filesystem as $BACKUP_DIR; ln cannot claim the final name atomically" >&2\n' +
+      "      exit 1\n" +
+      "    fi\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::refuses when the temp file is not on the same filesystem as the destination directory",
+    ],
+  },
+  {
     // #241 — the whole point of the acceptance readout. Forcing `observed` to true makes an
     // empty database compute accepted anomalies (all zero) and report OBSERVED_NO_ANOMALIES
     // instead of N/A: exactly the "0/PASS" shape the CEO ruling named as worse than the ceremony
