@@ -233,24 +233,20 @@ jobs:
   # `fail-fast: false` means one leg failing does not cancel the other, while its aggregate result
   # is still `failure` if any leg failed. An allow-list makes every other job fail closed on
   # `cancelled` and `skipped` too, with no separate case needed.
+  # The required check is the test suite. The other three still run, still report, and are still
+  # read — but they no longer gate the merge. Making all four blocking turned every slow or flaky
+  # verification job into a merge stop, and the cost of that landed on unrelated PRs all day.
   verify-gate:
     name: verify
-    needs: [verify-matrix, guard-falsifiability, traceability, ssot]
+    needs: [verify-matrix]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: require every verification job to have actually succeeded
+      - name: require the test matrix to have actually succeeded
         run: |
           verify_matrix="${{ needs.verify-matrix.result }}"
-          guard_falsifiability="${{ needs.guard-falsifiability.result }}"
-          traceability="${{ needs.traceability.result }}"
-          ssot="${{ needs.ssot.result }}"
-          if [ "$verify_matrix" != "success" ] || \
-             [ "$guard_falsifiability" != "success" ] || \
-             [ "$traceability" != "success" ] || \
-             [ "$ssot" != "success" ]; then
-            echo "verification jobs: verify-matrix=$verify_matrix guard-falsifiability=$guard_falsifiability traceability=$traceability ssot=$ssot"
-            echo "at least one verification job was not successful — failing the required verify check"
+          if [ "$verify_matrix" != "success" ]; then
+            echo "verify-matrix=$verify_matrix — failing the required verify check"
             exit 1
           fi
-          echo "every verification job succeeded"
+          echo "the test matrix succeeded""

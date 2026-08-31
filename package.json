@@ -5,7 +5,7 @@
   "description": "Single local runtime authority that turns managed project intent into verified production-ready results",
   "type": "module",
   "engines": {
-    "node": ">=22.18.0"
+    "node": "^22.18.0 || >=24"
   },
   "bin": {
     "agentctl": "./dist/cli/agentctl.js",

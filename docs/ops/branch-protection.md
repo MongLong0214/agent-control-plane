@@ -65,7 +65,7 @@ cat > /tmp/acp-ruleset.json <<'JSON'
     {
       "type": "required_status_checks",
       "parameters": {
-        "strict_required_status_checks_policy": true,
+        "strict_required_status_checks_policy": false,
         "required_status_checks": [
           { "context": "verify", "integration_id": 15368 }
         ]
@@ -78,8 +78,16 @@ JSON
 gh api -X POST repos/MongLong0214/agent-control-plane/rulesets --input /tmp/acp-ruleset.json
 ```
 
-`strict_required_status_checks_policy: true` is "branch must be up to date before merging", which is
-what makes the base a proven base rather than a stale one.
+`strict_required_status_checks_policy` is "branch must be up to date before merging". It is now
+**false**, and the live setting is `"strict": false`. It was true, and the cost was measured: with a
+required check that takes 13-25 minutes, every merge invalidated every other open PR, so a day of
+ordinary work spent most of its wall-clock re-running a suite that had already passed on the same
+code. What it bought was a base proven current at merge time; what it cost was that no two PRs could
+land without serialising through a full re-run each. The tradeoff was resolved toward throughput.
+
+A PR can therefore merge on a base that is behind main. `merge-tree` conflict detection still runs,
+but a semantic conflict — one where both sides merge cleanly and the combination is wrong — is no
+longer caught before the merge. It shows up on main's own CI run instead.
 
 `required_approving_review_count` is `0` because this repository currently has one human. Raise it to
 `1` the moment there is a second, and the review's intent is satisfied either way — the gate that
@@ -120,7 +128,7 @@ ruleset path next to it was pinned to an app.
 cat > /tmp/acp-protection.json <<'JSON'
 {
   "required_status_checks": {
-    "strict": true,
+    "strict": false,
     "checks": [{ "context": "verify", "app_id": 15368 }]
   },
   "enforce_admins": true,
