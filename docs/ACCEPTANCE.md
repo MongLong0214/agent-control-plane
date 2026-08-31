@@ -89,7 +89,7 @@ these 12 failures arrived with them.
 | 4 | One multi-repository run with an explicit merge order | **Met in part** | Multi-repository freezing and staleness are proven with two real repositories (CP-S25), `run_repositories.merge_order` and per-repository merge state are implemented, and merge order is enforced with a regression test. A real two-repository run merging in declared order, with the first repository's post-merge verification gating the second, has not been executed — #240. |
 | 5 | Zero role/session independence violations under GPT-down and Claude-down continuity | **Met** | CP-S19–CP-S22, CP-S24, CP-S34, all in `tests/scenarios/graph-capacity-continuity.test.ts`, all passing. Distinct sessions are asserted, and a failover the coverage plan cannot staff is refused rather than downgraded. |
 | 6 | Repo Factory bootstrap → primary CTO activation → doctor | **Met on the control-plane side** | Activation runs from a fixture `repo-factory.result.v2` through registration, binding, handoff ACK and doctor (CP-S52, passing). The producing side is a separate deliverable and does not exist yet — #246. |
-| 7 | Zero false completions, duplicate dispatches, accepted stale-generation results, forged gates or unauthorised merges | **Superseded by tooling — run `agentctl acceptance report`** | The CEO ruling on #241 discarded the `30 lifecycles × 3 projects` quota and the hand-transcribed ceremony this row used to describe. `agentctl acceptance report` reads `runs`, `audit_events` and `telemetry_metrics` directly and prints the five counts itself; **its output is the evidence**, not a number copied into this file. Zero lifecycles renders every count `N/A`, never a passing zero — see `src/export/acceptance-report.ts`. |
+| 7 | Zero false completions, duplicate dispatches, accepted stale-generation results, forged gates or unauthorised merges | **Superseded by tooling — run `agentctl acceptance report`** | The CEO ruling on #241 discarded the `30 lifecycles × 3 projects` quota and the hand-transcribed ceremony this row used to describe. `agentctl acceptance report` reads `runs`, `audit_events` and `telemetry_metrics` directly; **its output is the evidence**, not a number copied into this file. It reports two different things for these five categories, not one — see "Items 7–8" below for why they cannot be collapsed into a single count. Zero lifecycles renders every accepted-anomaly count `N/A`, never a passing zero — see `src/export/acceptance-report.ts`. |
 | 8 | Recorded observation window and duration for the zero counts | **Superseded by tooling — run `agentctl acceptance report`** | The same command derives the window from the data's own first and last recorded activity and prints it alongside the counts. Follows item 7. |
 | 9 | Zero owner interrupts for routine technical revision during dogfood | **Not met** | Follows item 7. #241. CP-S33 and CP-S53 prove routine revision and churn do not notify upward, and both pass. |
 | 10 | Every P0 requirement linked to a scenario and evidence | **Met** | The generated report links P0 requirements to scenario declarations from the PRD tables. This is declaration traceability, not behavioural proof that a requirement is met. |
@@ -428,19 +428,48 @@ and prints, as its own output:
 
 - **the observation window** — the first and last recorded activity the data actually spans,
   and the duration between them (never a configured or constant window);
-- **lifecycle outcomes** — completed / failed / abandoned counts, drawn from `runs.state`;
-- **the five anomaly counts** — false completions, duplicate dispatches, accepted
-  stale-generation results, forged gates and unauthorised merges, each counted from the
-  `audit_events` rows the mechanism that already enforces it records (see
-  `ANOMALY_REASON_CODES` in `src/export/acceptance-report.ts` for exactly which reason codes
-  back each count, and the negative test each mechanism carries);
+- **lifecycle outcomes** — `completed` / `failed` / `cancelled` counts, drawn from `runs.state`.
+  `cancelled` counts `runs.state = 'CANCELLED'`, the terminal state `agentctl run cancel`
+  produces — an explicit, requested cancellation. It is **not** the same claim as an abandoned
+  lifecycle (one left to time out or orphaned with no terminal disposition at all); the schema
+  has no `ABANDONED` run state and no separate event for that, so this report does not claim one;
+- **`preventedAttempts`** — five real counts, one per category, of `audit_events` rows for the
+  reason code an existing enforcement mechanism records when it **refuses** exactly that
+  category's attempt (see `PREVENTED_ATTEMPT_REASON_CODES` in `src/export/acceptance-report.ts`
+  for exactly which reason codes back each count, and the negative test each mechanism carries).
+  **A non-zero value here is the guard working, not a defect** — `MERGE_AUTHORITY_DENIED` is the
+  record of an unauthorised merge being *stopped*, and reporting that as an anomaly would invert
+  what happened. This count is never `N/A` or `UNKNOWN`: the query is unambiguous regardless of
+  whether any lifecycle ever completed;
+- **`acceptedAnomalies`** — whether the bad thing actually *landed despite* the guard: a false
+  completion that stuck, a message actually sent twice, a stale-generation result actually used,
+  a forged gate that actually got a merge through, a merge that actually landed without
+  authority. This is the count PRD item 7 means by "zero anomalies", and it is **not** the same
+  number as `preventedAttempts`. As of this writing there is no production mechanism that proves
+  any of the five after the fact — every candidate was searched and rejected (see
+  `ACCEPTED_ANOMALY_SOURCES` in `src/export/acceptance-report.ts` for the search, category by
+  category, including why the closest candidate for false completions was rejected as unreliable
+  rather than merely absent). So every category currently reads `UNKNOWN` once at least one
+  lifecycle exists, never a bare `0` — a `0` here would claim a source proved the anomaly did not
+  happen, and none does yet;
 - **daemon health**, reused from `agentctl daemon status` rather than reimplemented.
 
-**The load-bearing property, proved by `tests/unit/acceptance-report.test.ts`:** zero lifecycles
-renders every anomaly count `N/A` and the overall verdict `N/A` — never a passing zero. A
-database can hold tens of thousands of `audit_events` / `telemetry_metrics` rows from the daemon
-monitoring itself (capacity probes, continuity reconciliation) while `runs` stays empty; the
-verdict gates on lifecycles reaching a terminal state, not on that self-monitoring activity, so
-that case still reads `N/A` rather than a clean pass. When at least one lifecycle has completed,
-the verdict is either `OBSERVED_NO_ANOMALIES` (carrying the exact lifecycle count, and explicitly
-not a long-term reliability claim) or `ANOMALIES_PRESENT` (naming which counts are non-zero).
+**The load-bearing properties, proved by `tests/unit/acceptance-report.test.ts`:**
+
+1. Zero lifecycles renders every `acceptedAnomalies` count `N/A` and the overall verdict `N/A` —
+   never a passing zero. A database can hold tens of thousands of `audit_events` /
+   `telemetry_metrics` rows from the daemon monitoring itself (capacity probes, continuity
+   reconciliation) while `runs` stays empty; the verdict gates on lifecycles reaching a terminal
+   state, not on that self-monitoring activity, so that case still reads `N/A` rather than a
+   clean pass.
+2. `N/A` and `UNKNOWN` are different claims and the output never conflates them: `N/A` means
+   "there were no lifecycles to observe"; `UNKNOWN` means "at least one lifecycle happened but
+   nothing in this database can prove or disprove this category either way."
+3. `ANOMALIES_PRESENT` is decided from `acceptedAnomalies` alone — a `preventedAttempts` count
+   being non-zero never produces it. The realistic case today — lifecycles exist, guards have
+   fired, and every `acceptedAnomalies` source is `UNKNOWN` — is its own verdict, `UNVERIFIED`,
+   precisely so it cannot be mistaken for a clean bill of health. The full verdict vocabulary is
+   `N/A` (no lifecycles), `OBSERVED_NO_ANOMALIES` (lifecycles exist and every accepted-anomaly
+   category is a verified zero — not reachable today, since no category has a source, but the
+   logic supports it once one exists), `UNVERIFIED` (lifecycles exist, nothing positive, at
+   least one category unproven), and `ANOMALIES_PRESENT` (an actual accepted anomaly, named).

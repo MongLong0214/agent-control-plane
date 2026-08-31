@@ -1,7 +1,13 @@
 import { afterAll, describe, expect, it } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { buildAcceptanceReport } from "../../src/export/acceptance-report.ts";
+import {
+  type AcceptanceLifecycles,
+  type AcceptedAnomalies,
+  buildAcceptanceReport,
+  computeVerdict,
+  type PreventedAttempts,
+} from "../../src/export/acceptance-report.ts";
 import type { Db } from "../../src/db/database.ts";
 import { makeHarness } from "../helpers/harness.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
@@ -28,18 +34,54 @@ const insertAudit = (db: Db, at: string, kind: string, reasonCode: string | null
   );
 };
 
-describe("agentctl acceptance report", () => {
-  it("reports NA for the verdict and every anomaly when the database has no lifecycles", () => {
+const noLifecycles: AcceptanceLifecycles = { completed: 0, failed: 0, cancelled: 0, total: 0 };
+const oneLifecycle: AcceptanceLifecycles = { completed: 1, failed: 0, cancelled: 0, total: 1 };
+const twelveLifecycles: AcceptanceLifecycles = { completed: 12, failed: 0, cancelled: 0, total: 12 };
+
+const zeroPrevented: PreventedAttempts = {
+  falseCompletions: 0,
+  duplicateDispatches: 0,
+  acceptedStaleGenerationResults: 0,
+  forgedGates: 0,
+  unauthorizedMerges: 0,
+};
+
+const allNA: AcceptedAnomalies = {
+  falseCompletions: "N/A",
+  duplicateDispatches: "N/A",
+  acceptedStaleGenerationResults: "N/A",
+  forgedGates: "N/A",
+  unauthorizedMerges: "N/A",
+};
+
+const allUnknown: AcceptedAnomalies = {
+  falseCompletions: "UNKNOWN",
+  duplicateDispatches: "UNKNOWN",
+  acceptedStaleGenerationResults: "UNKNOWN",
+  forgedGates: "UNKNOWN",
+  unauthorizedMerges: "UNKNOWN",
+};
+
+const allZero: AcceptedAnomalies = {
+  falseCompletions: 0,
+  duplicateDispatches: 0,
+  acceptedStaleGenerationResults: 0,
+  forgedGates: 0,
+  unauthorizedMerges: 0,
+};
+
+describe("agentctl acceptance report — reading the database", () => {
+  it("reports NA for the verdict and every accepted anomaly when the database has no lifecycles", () => {
     const harness = makeHarness();
     const report = buildAcceptanceReport(harness.cp.db, harness.cp.clock);
 
     expect(report.lifecycles.total).toBe(0);
     expect(report.verdict).toBe("N/A");
-    expect(report.anomalies.falseCompletions).toBe("N/A");
-    expect(report.anomalies.duplicateDispatches).toBe("N/A");
-    expect(report.anomalies.acceptedStaleGenerationResults).toBe("N/A");
-    expect(report.anomalies.forgedGates).toBe("N/A");
-    expect(report.anomalies.unauthorizedMerges).toBe("N/A");
+    expect(report.acceptedAnomalies.falseCompletions).toBe("N/A");
+    expect(report.acceptedAnomalies.duplicateDispatches).toBe("N/A");
+    expect(report.acceptedAnomalies.acceptedStaleGenerationResults).toBe("N/A");
+    expect(report.acceptedAnomalies.forgedGates).toBe("N/A");
+    expect(report.acceptedAnomalies.unauthorizedMerges).toBe("N/A");
 
     const rendered = JSON.stringify(report);
     expect(rendered).not.toContain("PASS");
@@ -61,47 +103,62 @@ describe("agentctl acceptance report", () => {
     expect(report.window.firstActivityAt).toBe("2026-08-01T00:00:00.000Z");
     expect(report.window.lastActivityAt).toBe("2026-08-14T00:00:00.000Z");
     expect(report.verdict).toBe("N/A");
-    expect(report.anomalies.forgedGates).toBe("N/A");
+    expect(report.acceptedAnomalies.forgedGates).toBe("N/A");
   });
 
-  it("reports real distinguishable zero counts for a database with completed lifecycles and no anomalies", () => {
+  it("reports the cancelled field under its own name, not abandoned", () => {
+    const harness = makeHarness();
+    insertRun(harness.cp.db, "run_cancelled_1", "CANCELLED", "2026-08-10T00:00:00.000Z");
+
+    const report = buildAcceptanceReport(harness.cp.db, harness.cp.clock);
+    expect(report.lifecycles).toEqual({ completed: 0, failed: 0, cancelled: 1, total: 1 });
+    expect(Object.keys(report.lifecycles)).not.toContain("abandoned");
+  });
+
+  it("reports real zero prevented attempts and UNKNOWN accepted anomalies for completed lifecycles with no guard denials", () => {
     const harness = makeHarness();
     insertRun(harness.cp.db, "run_clean_1", "COMPLETED", "2026-08-10T00:00:00.000Z");
     insertRun(harness.cp.db, "run_clean_2", "FAILED", "2026-08-11T00:00:00.000Z");
     insertRun(harness.cp.db, "run_clean_3", "CANCELLED", "2026-08-12T00:00:00.000Z");
 
     const report = buildAcceptanceReport(harness.cp.db, harness.cp.clock);
-    expect(report.lifecycles).toEqual({ completed: 1, failed: 1, abandoned: 1, total: 3 });
-    expect(report.anomalies.falseCompletions).toBe(0);
-    expect(report.anomalies.duplicateDispatches).toBe(0);
-    expect(report.anomalies.acceptedStaleGenerationResults).toBe(0);
-    expect(report.anomalies.forgedGates).toBe(0);
-    expect(report.anomalies.unauthorizedMerges).toBe(0);
-    expect(report.verdict).toBe("OBSERVED_NO_ANOMALIES");
+    expect(report.lifecycles).toEqual({ completed: 1, failed: 1, cancelled: 1, total: 3 });
+    // Prevented attempts are a real, always-measurable count — no guard fired, so all real zeros.
+    expect(report.preventedAttempts).toEqual(zeroPrevented);
+    // No accepted-anomaly source exists in this codebase today (see ACCEPTED_ANOMALY_SOURCES in
+    // src/export/acceptance-report.ts) — every category must read UNKNOWN, never a bare 0.
+    expect(report.acceptedAnomalies).toEqual(allUnknown);
+    expect(report.verdict).toBe("UNVERIFIED");
     expect(report.verdictDetail).toContain("3");
-    expect(report.verdictDetail.toLowerCase()).toContain("not a");
+    expect(report.verdictDetail.toLowerCase()).toContain("not a clean bill of health");
   });
 
-  it("names a seeded forged-gate anomaly as a non-zero, non-NA count", () => {
+  it("a prevented attempt from a guard refusing a forged gate does not produce ANOMALIES_PRESENT", () => {
+    // This is the correction that matters: GATE_CREATOR_UNTRUSTED is the record of the guard
+    // *working* — an attempt was refused, not an anomaly that was accepted. Seeding it must move
+    // preventedAttempts, never acceptedAnomalies, and the verdict must not read as a clean pass
+    // either — it stays UNVERIFIED because no accepted-anomaly source can rule the anomaly out.
     const harness = makeHarness();
     insertRun(harness.cp.db, "run_forged_1", "COMPLETED", "2026-08-10T00:00:00.000Z");
     insertAudit(harness.cp.db, "2026-08-10T00:05:00.000Z", "GATE_REJECTED", ReasonCode.GATE_CREATOR_UNTRUSTED);
 
     const report = buildAcceptanceReport(harness.cp.db, harness.cp.clock);
-    expect(report.anomalies.forgedGates).toBe(1);
-    expect(report.anomalies.unauthorizedMerges).toBe(0);
-    expect(report.verdict).toBe("ANOMALIES_PRESENT");
-    expect(report.verdictDetail).toContain("forgedGates");
+    expect(report.preventedAttempts.forgedGates).toBe(1);
+    expect(report.acceptedAnomalies.forgedGates).toBe("UNKNOWN");
+    expect(report.verdict).not.toBe("ANOMALIES_PRESENT");
+    expect(report.verdict).not.toBe("OBSERVED_NO_ANOMALIES");
+    expect(report.verdict).toBe("UNVERIFIED");
   });
 
-  it("names a seeded unauthorized-merge anomaly as a non-zero, non-NA count", () => {
+  it("a prevented attempt from a guard refusing an unauthorised merge does not produce ANOMALIES_PRESENT", () => {
     const harness = makeHarness();
     insertRun(harness.cp.db, "run_merge_1", "COMPLETED", "2026-08-10T00:00:00.000Z");
     insertAudit(harness.cp.db, "2026-08-10T00:05:00.000Z", "MERGE_REJECTED", ReasonCode.MERGE_AUTHORITY_DENIED);
 
     const report = buildAcceptanceReport(harness.cp.db, harness.cp.clock);
-    expect(report.anomalies.unauthorizedMerges).toBe(1);
-    expect(report.verdict).toBe("ANOMALIES_PRESENT");
+    expect(report.preventedAttempts.unauthorizedMerges).toBe(1);
+    expect(report.acceptedAnomalies.unauthorizedMerges).toBe("UNKNOWN");
+    expect(report.verdict).not.toBe("ANOMALIES_PRESENT");
   });
 
   it("derives the window from the data's own first and last activity rather than a constant", () => {
@@ -133,8 +190,8 @@ describe("agentctl acceptance report", () => {
     }
     const largeReport = buildAcceptanceReport(large.cp.db, large.cp.clock);
 
-    expect(smallReport.verdict).toBe("OBSERVED_NO_ANOMALIES");
-    expect(largeReport.verdict).toBe("OBSERVED_NO_ANOMALIES");
+    expect(smallReport.verdict).toBe("UNVERIFIED");
+    expect(largeReport.verdict).toBe("UNVERIFIED");
     expect(smallReport.lifecycles.total).toBe(1);
     expect(largeReport.lifecycles.total).toBe(12);
     // Same verdict token, but the detail and the count it carries must differ — a reader
@@ -142,5 +199,44 @@ describe("agentctl acceptance report", () => {
     expect(smallReport.verdictDetail).not.toBe(largeReport.verdictDetail);
     expect(smallReport.verdictDetail).toContain("1");
     expect(largeReport.verdictDetail).toContain("12");
+  });
+});
+
+describe("agentctl acceptance report — verdict logic in isolation", () => {
+  it("is NA whenever there are no lifecycles, regardless of prevented attempts", () => {
+    const { verdict } = computeVerdict(noLifecycles, zeroPrevented, allNA);
+    expect(verdict).toBe("N/A");
+  });
+
+  it("is OBSERVED_NO_ANOMALIES only when every accepted-anomaly category is a verified zero", () => {
+    const { verdict, verdictDetail } = computeVerdict(oneLifecycle, zeroPrevented, allZero);
+    expect(verdict).toBe("OBSERVED_NO_ANOMALIES");
+    expect(verdictDetail).not.toContain("PASS");
+  });
+
+  it("is UNVERIFIED when lifecycles exist and at least one accepted-anomaly category is UNKNOWN, with no positives", () => {
+    const mixed: AcceptedAnomalies = { ...allZero, forgedGates: "UNKNOWN" };
+    const { verdict, verdictDetail } = computeVerdict(oneLifecycle, zeroPrevented, mixed);
+    expect(verdict).toBe("UNVERIFIED");
+    expect(verdictDetail).toContain("forgedGates");
+  });
+
+  it("is ANOMALIES_PRESENT only when an accepted anomaly is an actual positive count, never from prevented attempts alone", () => {
+    const busyGuards: PreventedAttempts = { ...zeroPrevented, unauthorizedMerges: 40 };
+    const stillUnverified = computeVerdict(oneLifecycle, busyGuards, allUnknown);
+    expect(stillUnverified.verdict).toBe("UNVERIFIED");
+
+    const oneAcceptedAnomaly: AcceptedAnomalies = { ...allZero, unauthorizedMerges: 1 };
+    const { verdict, verdictDetail } = computeVerdict(oneLifecycle, busyGuards, oneAcceptedAnomaly);
+    expect(verdict).toBe("ANOMALIES_PRESENT");
+    expect(verdictDetail).toContain("unauthorizedMerges");
+  });
+
+  it("names the exact lifecycle count in the UNVERIFIED detail so a small and a large sample read differently", () => {
+    const smallDetail = computeVerdict(oneLifecycle, zeroPrevented, allUnknown).verdictDetail;
+    const largeDetail = computeVerdict(twelveLifecycles, zeroPrevented, allUnknown).verdictDetail;
+    expect(smallDetail).not.toBe(largeDetail);
+    expect(smallDetail).toContain("1");
+    expect(largeDetail).toContain("12");
   });
 });

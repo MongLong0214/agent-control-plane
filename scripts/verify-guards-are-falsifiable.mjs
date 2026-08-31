@@ -3220,23 +3220,24 @@ const GUARDS = [
   },
   {
     // #241 — the whole point of the acceptance readout. Forcing `observed` to true makes an
-    // empty database compute anomalies (all zero) and report OBSERVED_NO_ANOMALIES instead of
-    // N/A: exactly the "0/PASS" shape the CEO ruling named as worse than the ceremony it replaces.
+    // empty database compute accepted anomalies (all zero) and report OBSERVED_NO_ANOMALIES
+    // instead of N/A: exactly the "0/PASS" shape the CEO ruling named as worse than the ceremony
+    // it replaces.
     what: "an acceptance report with zero lifecycles reports NA rather than a zero anomaly count",
     file: "src/export/acceptance-report.ts",
     find: "  const observed = lifecycles.total > 0;",
     replace: "  const observed = true;",
     killedBy: [
-      "tests/unit/acceptance-report.test.ts::reports NA for the verdict and every anomaly when the database has no lifecycles",
+      "tests/unit/acceptance-report.test.ts::reports NA for the verdict and every accepted anomaly when the database has no lifecycles",
     ],
   },
   {
-    what: "a forged-gate anomaly is actually counted from its enforcement's reason codes",
+    what: "a prevented forged-gate attempt is actually counted from its enforcement's reason codes",
     file: "src/export/acceptance-report.ts",
     find: "  forgedGates: [ReasonCode.GATE_CREATOR_UNTRUSTED, ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID],",
     replace: "  forgedGates: [],",
     killedBy: [
-      "tests/unit/acceptance-report.test.ts::names a seeded forged-gate anomaly as a non-zero, non-NA count",
+      "tests/unit/acceptance-report.test.ts::a prevented attempt from a guard refusing a forged gate does not produce ANOMALIES_PRESENT",
     ],
   },
   {
@@ -3250,6 +3251,19 @@ const GUARDS = [
       '  const lastActivityAt = "2026-01-01T00:00:00.000Z";',
     killedBy: [
       "tests/unit/acceptance-report.test.ts::derives the window from the data's own first and last activity rather than a constant",
+    ],
+  },
+  {
+    // The second correction from the CEO's review of #736 (efe7552): the first cut let a
+    // prevented attempt (a guard denial) read as an accepted anomaly. This row reintroduces
+    // exactly that bug — computing "is anything present" from `preventedAttempts` instead of
+    // `acceptedAnomalies` — so a guard doing its job would flip the verdict to ANOMALIES_PRESENT.
+    what: "ANOMALIES_PRESENT is decided from accepted anomalies, never from prevented attempts alone",
+    file: "src/export/acceptance-report.ts",
+    find: "  const entries = Object.entries(acceptedAnomalies) as [keyof AcceptedAnomalies, AcceptedAnomalyCount][];",
+    replace: "  const entries = Object.entries(preventedAttempts) as [keyof AcceptedAnomalies, AcceptedAnomalyCount][];",
+    killedBy: [
+      "tests/unit/acceptance-report.test.ts::is ANOMALIES_PRESENT only when an accepted anomaly is an actual positive count, never from prevented attempts alone",
     ],
   },
 ];
