@@ -930,6 +930,11 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   SCHEMA_MIGRATION_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
   SCHEMA_MIGRATION_RECEIPT_IMMUTABLE: ReasonCode.CONFLICT,
   BASELINE_RECORD_IMMUTABLE: ReasonCode.CONFLICT,
+  // #631 — the admitted payload is write-once on both verbs. A caller that trips either of
+  // these is trying to rewrite the sender's own words, which is a conflict with a row that
+  // already holds them, not an internal fault.
+  INBOUND_PAYLOAD_IMMUTABLE: ReasonCode.CONFLICT,
+  INBOUND_MESSAGE_NO_REPLACE: ReasonCode.CONFLICT,
   // The canonical-turn ledger, which had no entries here at all: every one of its denials came
   // out of `db.tx` as a raw Error rather than as a typed refusal, so a claim whose source insert
   // tripped a guard threw instead of denying. The guards are what this ledger is *for*, and the

@@ -106,7 +106,10 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   // inbound_messages` is a no-op against the v11 table, so replaying this here creates a trigger
   // over a column that does not exist yet and the whole chain aborts on the first UPDATE. v35
   // owns it, which is the rule this list exists to state.
-  /-- #631 — the admitted payload is the sender's own words[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_payload_immutable[\s\S]*?\nEND;/,
+  /-- CP-HI-08 — the admitted payload is the sender's own words[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_payload_immutable[\s\S]*?\nEND;/,
+  // Same reason as the trigger above, and the same owner: `INSERT OR REPLACE` is the other half
+  // of write-once, and v35 creates both or neither.
+  /-- CP-HI-06 — same census, same hole as the rows above[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_no_replace[\s\S]*?\nEND;/,
 ];
 
 /**
@@ -2238,6 +2241,17 @@ const v35: SchemaMigration = {
         SELECT RAISE(ABORT, 'INBOUND_PAYLOAD_IMMUTABLE');
       END;
     `);
+    raw.exec(`
+      CREATE TRIGGER IF NOT EXISTS inbound_messages_no_replace
+      BEFORE INSERT ON inbound_messages
+      WHEN EXISTS (
+        SELECT 1 FROM inbound_messages
+         WHERE channel = NEW.channel AND nonce = NEW.nonce
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'INBOUND_MESSAGE_NO_REPLACE');
+      END;
+    `);
   },
   checksum: () => migrationChecksum("v35-keep-the-admitted-payload-with-its-inbound-row"),
 };
@@ -2374,6 +2388,7 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "conversational_actors_incarnation_matches_session_on_insert", sentinel: "ACTOR_SESSION_INCARNATION_MISMATCH", introducedIn: 31 },
   { name: "conversational_actors_incarnation_matches_session_on_update", sentinel: "ACTOR_SESSION_INCARNATION_MISMATCH", introducedIn: 31 },
   { name: "inbound_messages_payload_immutable", sentinel: "INBOUND_PAYLOAD_IMMUTABLE", introducedIn: 35 },
+  { name: "inbound_messages_no_replace", sentinel: "INBOUND_MESSAGE_NO_REPLACE", introducedIn: 35 },
   { name: "canonical_turn_sources_admission_matches_claim", sentinel: "CANONICAL_TURN_SOURCE_NOT_CLAIM_TIME", introducedIn: 32 },
 ];
 
