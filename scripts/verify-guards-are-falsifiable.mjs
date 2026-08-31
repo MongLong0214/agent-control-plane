@@ -3238,6 +3238,125 @@ const GUARDS = [
       '    test -s "$BACKUP_PATH"\n',
     killedBy: ["tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts"],
   },
+  {
+    // #241 — the whole point of the acceptance readout. Forcing `observed` to true makes an
+    // empty database compute accepted anomalies (all zero) and report OBSERVED_NO_ANOMALIES
+    // instead of N/A: exactly the "0/PASS" shape the CEO ruling named as worse than the ceremony
+    // it replaces.
+    what: "an acceptance report with zero lifecycles reports NA rather than a zero anomaly count",
+    file: "src/export/acceptance-report.ts",
+    find: "  const observed = lifecycles.total > 0;",
+    replace: "  const observed = true;",
+    killedBy: [
+      "tests/unit/acceptance-report.test.ts::reports NA for the verdict and every accepted anomaly when the database has no lifecycles",
+    ],
+  },
+  {
+    what: "a prevented forged-gate attempt is actually counted from its enforcement's writer",
+    file: "src/export/acceptance-report.ts",
+    find: "  forgedGates: [\n    { kind: \"GATE_REJECTED\", reasonCode: ReasonCode.GATE_CREATOR_UNTRUSTED },\n    { kind: \"GATE_REJECTED\", reasonCode: ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID },\n  ],",
+    replace: "  forgedGates: [],",
+    killedBy: [
+      "tests/unit/acceptance-report.test.ts::a prevented attempt from a guard refusing a forged gate does not produce ANOMALIES_PRESENT",
+    ],
+  },
+  {
+    // #736 third correction: kind and reason_code, keyed alone, are not enough — a
+    // MERGE_AUTHORITY_DENIED row exists under FINALIZATION_ATTEMPT_FAILED too (the daemon's own
+    // finalizer lacking authority mid-finalization), and that is not a blocked unauthorised-merge
+    // attempt. Widening the writer's kind to admit it reintroduces exactly that inversion.
+    what: "unauthorizedMerges counts only the write-guard writer, not the unrelated finalization-failure writer of the same reason code",
+    file: "src/export/acceptance-report.ts",
+    find: "  unauthorizedMerges: [{ kind: \"MANAGED_WRITE_GUARD\", reasonCode: ReasonCode.MERGE_AUTHORITY_DENIED }],",
+    replace:
+      "  unauthorizedMerges: [\n" +
+      "    { kind: \"MANAGED_WRITE_GUARD\", reasonCode: ReasonCode.MERGE_AUTHORITY_DENIED },\n" +
+      "    { kind: \"FINALIZATION_ATTEMPT_FAILED\", reasonCode: ReasonCode.MERGE_AUTHORITY_DENIED },\n" +
+      "  ],",
+    killedBy: [
+      "tests/unit/acceptance-report.test.ts::a MERGE_AUTHORITY_DENIED row written under FINALIZATION_ATTEMPT_FAILED not an unauthorized-merge event does not increment unauthorizedMerges",
+    ],
+  },
+  {
+    // Same correction, the other collapsed reason code: seven unrelated SQLite trigger sentinels
+    // also translate to COMPLETION_AUTHORITY_DENIED (src/db/database.ts TRIGGER_CODES). Removing
+    // the evidence.sqlite discriminator would count any of those seven as a false completion.
+    what: "falseCompletions excludes a COMPLETION_AUTHORITY_DENIED row stamped with an unrelated SQLite trigger sentinel",
+    file: "src/export/acceptance-report.ts",
+    find: '      isGenuine: (evidence) => evidence["sqlite"] === undefined,',
+    replace: "      isGenuine: () => true,",
+    killedBy: [
+      "tests/unit/acceptance-report.test.ts::a COMPLETION_AUTHORITY_DENIED row stamped with a non-completion SQLite sentinel does not increment falseCompletions",
+    ],
+  },
+  {
+    what: "the acceptance window is read from the data rather than a hardcoded constant",
+    file: "src/export/acceptance-report.ts",
+    find:
+      "  const firstActivityAt = row?.first ?? null;\n" +
+      "  const lastActivityAt = row?.last ?? null;",
+    replace:
+      '  const firstActivityAt = "2026-01-01T00:00:00.000Z";\n' +
+      '  const lastActivityAt = "2026-01-01T00:00:00.000Z";',
+    killedBy: [
+      "tests/unit/acceptance-report.test.ts::derives the window from the data's own first and last activity rather than a constant",
+    ],
+  },
+  {
+    // The second correction from the CEO's review of #736 (efe7552): the first cut let a
+    // prevented attempt (a guard denial) read as an accepted anomaly. This row reintroduces
+    // exactly that bug — computing "is anything present" from `preventedAttempts` instead of
+    // `acceptedAnomalies` — so a guard doing its job would flip the verdict to ANOMALIES_PRESENT.
+    what: "ANOMALIES_PRESENT is decided from accepted anomalies, never from prevented attempts alone",
+    file: "src/export/acceptance-report.ts",
+    find: "  const entries = Object.entries(acceptedAnomalies) as [keyof AcceptedAnomalies, AcceptedAnomalyCount][];",
+    replace: "  const entries = Object.entries(preventedAttempts) as [keyof AcceptedAnomalies, AcceptedAnomalyCount][];",
+    killedBy: [
+      "tests/unit/acceptance-report.test.ts::is ANOMALIES_PRESENT only when an accepted anomaly is an actual positive count, never from prevented attempts alone",
+    ],
+  },
+  {
+    // #575: the App permission check moved from a single exact shape to an append-only list
+    // of exact shapes, precisely so the App's grant and this code no longer have to narrow in
+    // the same instant. Removing the key-count check turns every shape's match into "contains
+    // at least these keys at these levels" — a superset would then match, which is exactly the
+    // silent broadening the list exists to prevent.
+    what: "an App permission grant with an extra key beyond an approved shape is refused, not accepted as a superset",
+    file: "src/github/credential-store.ts",
+    find: "    Object.keys(permissions).length === expected.length &&\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/github-app-credential-store.test.ts::refuses the narrowed grant shape plus one extra permission — a superset is never accepted",
+    ],
+  },
+  {
+    // The transitional shape (the grant deployed before #575) has to keep matching until the
+    // owner narrows the App in GitHub settings, and the narrowed target shape has to already
+    // match so that narrowing needs no coordinated deploy. Downgrading the narrowed shape's
+    // `actions` entry to `write` makes it require a permission level the actual narrowed grant
+    // (`actions: read`) does not have, so only the transitional shape would still match —
+    // reproducing exactly the ordering deadlock #575 exists to remove.
+    what: "the narrowed post-575 target shape is present in the approved list, not only the transitional one",
+    file: "src/github/credential-store.ts",
+    find: "    actions: \"read\",\n",
+    replace: "    actions: \"write\",\n",
+    killedBy: [
+      "tests/unit/github-app-credential-store.test.ts::accepts the narrowed post-575 target grant shape with merge_queues and statuses dropped and actions read added",
+    ],
+  },
+  {
+    // Requirement 4: a refusal must name which shapes were expected, not just that the match
+    // failed — otherwise the operator has to read this source to learn what to grant. Removing
+    // the shape description from the denial message reproduces the bare, unhelpful message this
+    // guard replaced.
+    what: "the permission-denied message names the approved shapes rather than only saying the match failed",
+    file: "src/github/credential-store.ts",
+    find: "          `(expected one of: ${describeApprovedPermissionShapes()})`,\n",
+    replace: "          \"\",\n",
+    killedBy: [
+      "tests/unit/github-app-credential-store.test.ts::names every approved shape in the refusal message rather than only saying the match failed",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
