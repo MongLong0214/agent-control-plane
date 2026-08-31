@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 
 import { describe, expect, it, vi } from "vitest";
 
+import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { runHermesAcp } from "../../src/runtime/hermes-acp-client.ts";
 
 class FakeOutput extends EventEmitter {
@@ -136,7 +137,7 @@ const aborted = (overrides: Record<string, unknown> = {}): Record<string, unknow
   ...receiptEvidence,
   receiptId: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   evidenceDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-  reasonCode: "HERMES_AGENT_RUN_EXCEPTION",
+  reasonCode: ReasonCode.HERMES_AGENT_RUN_EXCEPTION,
   ...overrides,
 });
 

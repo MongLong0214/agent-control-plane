@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import { StringDecoder } from "node:string_decoder";
 
+import { ReasonCode } from "../core/reason-codes.ts";
+
 /** The exact eight-field wire proof accepted by `hermes acp`; it has no schema field. */
 export type HermesTargetBindWireReceipt = {
   domain: "hermes.target-bind";
@@ -153,7 +155,6 @@ const ABORTED_KEYS = [
   "evidenceDigest",
   "reasonCode",
 ] as const;
-const HERMES_ABORT_REASON_CODE = "HERMES_AGENT_RUN_EXCEPTION";
 const SHUTDOWN_GRACE_MS = 25;
 
 const isRecord = (value: unknown): value is JsonRecord =>
@@ -334,7 +335,7 @@ const terminalResult = (result: unknown, input: HermesAcpInput): HermesAcpResult
       !hasExactKeys(terminal, ABORTED_KEYS) ||
       !nonEmpty(terminal.turnRequestId) || !nonEmpty(terminal.sessionId) ||
       !isDigest(terminal.receiptId) || !isDigest(terminal.evidenceDigest) ||
-      reasonCode !== HERMES_ABORT_REASON_CODE || !receiptEvidenceIsWellTyped(terminal) ||
+      reasonCode !== ReasonCode.HERMES_AGENT_RUN_EXCEPTION || !receiptEvidenceIsWellTyped(terminal) ||
       returnedIdentity === null
     ) return { status: "FAILED", reason: "MALFORMED_TERMINAL_RECEIPT" };
     if (!terminalMatchesRequest(terminal, input)) {
@@ -345,7 +346,7 @@ const terminalResult = (result: unknown, input: HermesAcpInput): HermesAcpResult
       receiptIdentity: returnedIdentity,
       receiptId: terminal.receiptId,
       evidenceDigest: terminal.evidenceDigest,
-      reasonCode,
+      reasonCode: ReasonCode.HERMES_AGENT_RUN_EXCEPTION,
     };
   }
   if (status !== "COMPLETED") return { status: "FAILED", reason: "MALFORMED_TERMINAL_RECEIPT" };
