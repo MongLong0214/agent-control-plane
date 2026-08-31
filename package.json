@@ -37,6 +37,7 @@
     "adapter:source": "node scripts/verify-acceptance-adapter-source.mjs",
     "guards:falsifiable": "node scripts/verify-guards-are-falsifiable.mjs",
     "guards:anchors": "node scripts/verify-guards-are-falsifiable.mjs --anchors-only",
+    "coordinates:stale": "node scripts/verify-stale-coordinate-literals.mjs",
     "guards:peercred-unreachable": "node scripts/verify-peercred-is-unreachable.mjs",
     "native:peercred:build": "node scripts/build-native-peercred.mjs",
     "hooks:check": "node scripts/verify-hooks-are-installed.mjs",
