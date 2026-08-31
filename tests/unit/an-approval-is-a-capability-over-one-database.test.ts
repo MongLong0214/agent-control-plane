@@ -3,6 +3,9 @@ import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_pr
 import {
   chmodSync,
   existsSync,
+  linkSync,
+  renameSync,
+  statSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -256,6 +259,65 @@ describe("a migration whose chain another process already ran", () => {
     } finally {
       raw.close();
     }
+  }, 120_000);
+});
+
+describe("a database replaced at its pathname while a migration is being set up", () => {
+  it("refuses under the lock, migrates neither file, and leaves the approval spendable", () => {
+    const root = stateRoot();
+    const databasePath = join(root, "state.sqlite");
+    const original = databaseAtV11(root, "state.sqlite", "sentinel-of-a");
+    expect(original).toBe(databasePath);
+    const approval = approveMigration(databasePath, "isaac");
+
+    // A second name for the inode this open will hold, so the test can still read that file
+    // after the pathname stops naming it. Without it the migrated-or-not question about the
+    // orphan is unanswerable, and the orphan is the whole point.
+    const openedInode = join(root, "opened-inode.sqlite");
+    linkSync(databasePath, openedInode);
+
+    // The replacement is at the *same* version, so a version check — from the handle or from
+    // the path — cannot tell the difference. Only identity can.
+    const replacement = databaseAtV11(root, "replacement.sqlite", "sentinel-of-b");
+
+    let swapped = false;
+    expect(
+      () =>
+        new Db(databasePath, {
+          beforeMigrationExclusivity: () => {
+            if (swapped) return;
+            swapped = true;
+            // The link swap a restore performs: a new inode takes the name atomically and the
+            // old one is unlinked while this connection still holds it open.
+            renameSync(replacement, databasePath);
+          },
+        }),
+    ).toThrowError(/no longer the one this migration was set up for/);
+
+    expect(swapped).toBe(true);
+
+    // Neither file was migrated: not the one the pathname now names, and not the orphan this
+    // connection was holding. This is the assertion the counterexample is about — the version
+    // at the pathname stays 11 whether or not the bug fires, because the bug migrates the
+    // *other* inode.
+    expect(schemaVersionOf(databasePath)).toBe(11);
+    expect(sentinelsIn(databasePath)).toEqual(["sentinel-of-b"]);
+    expect(schemaVersionOf(openedInode)).toBe(11);
+    expect(sentinelsIn(openedInode)).toEqual(["sentinel-of-a"]);
+
+    // Nothing was spent, so the approval is still there.
+    expect(existsSync(migrationApprovalPath(databasePath))).toBe(true);
+
+    // And it is still spendable, which is the stronger statement: put the approved inode back
+    // under its name and the same approval runs the chain it always named.
+    for (const sidecar of [`${databasePath}-wal`, `${databasePath}-shm`]) {
+      if (existsSync(sidecar)) rmSync(sidecar);
+    }
+    renameSync(openedInode, databasePath);
+    openDb(databasePath).close();
+    expect(schemaVersionOf(databasePath)).toBe(SCHEMA_VERSION);
+    expect(sentinelsIn(databasePath)).toEqual(["sentinel-of-a"]);
+    expect(approval.target.inode).toBe(statSync(databasePath).ino);
   }, 120_000);
 });
 

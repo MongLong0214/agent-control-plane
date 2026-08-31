@@ -3442,6 +3442,24 @@ const GUARDS = [
     ],
   },
   {
+    // #747 round 3 — the version re-read above asks the open handle, and a handle survives its
+    // own name. Without this line a v11 database swapped in at the pathname passes that check
+    // (the handle still holds the unlinked original at 11) and the migration proceeds.
+    // Measured on the head before it: the replacement — which no approval named — came out at
+    // 34, the approved inode stayed at 11, and the approval was consumed.
+    what: "a migration re-resolves the pathname under the lock, not the open handle",
+    file: "src/db/database.ts",
+    find:
+      "      if (\n" +
+      "        !isSameTarget(underLock, approval.target) ||\n" +
+      "        (this.#openedTarget !== null && !isSameTarget(underLock, this.#openedTarget))\n" +
+      "      ) {",
+    replace: "      if (false) {",
+    killedBy: [
+      "tests/unit/an-approval-is-a-capability-over-one-database.test.ts::refuses under the lock, migrates neither file, and leaves the approval spendable",
+    ],
+  },
+  {
     // Taking the lock and re-reading state under it are two different properties, and the row
     // above only observes the first. Without this one, a second process that read version 11
     // before the holder committed applies a chain that has already been applied — measured, it

@@ -38,7 +38,7 @@ import {
   ensurePrivateDirectory,
   finalizeNewPrivateDatabaseFiles,
 } from "./state-preflight.ts";
-import { targetIdentityOf } from "./target-identity.ts";
+import { isSameTarget, targetIdentityOf, type TargetIdentity } from "./target-identity.ts";
 
 export type SqliteDatabase = Database.Database;
 
@@ -274,6 +274,8 @@ export class Db {
   migrationApprovalRetirement: ApprovalRetirement | null = null;
   /** The repair applied to an approval that outlived its own migration, when one was found. */
   staleMigrationApprovalRetirement: ApprovalRetirement | null = null;
+  /** The identity the pathname had when this connection opened it; null for `:memory:`. */
+  readonly #openedTarget: TargetIdentity | null;
 
   constructor(filename: string, private readonly options: DbOpenOptions = {}) {
     const persistent = filename !== ":memory:";
@@ -319,6 +321,13 @@ export class Db {
             const stat = statSync(this.file);
             return `${stat.dev}:${stat.ino}`;
           })();
+    // What the pathname resolved to at the moment this connection opened it (#747).
+    //
+    // `this.identity` answers "which resource is this" for capability issuance. This answers a
+    // different question that only matters later: does the name still lead to the file this
+    // handle holds. They are computed together and diverge only if something replaces the file
+    // between them, which is itself the condition worth refusing on.
+    this.#openedTarget = persistent ? targetIdentityOf(this.file) : null;
     this.#raw.pragma("foreign_keys = ON");
     this.#raw.pragma("busy_timeout = 10000");
     // SQLite performs REPLACE's implicit delete *without* firing DELETE triggers unless this is
@@ -440,6 +449,55 @@ export class Db {
     // uncontended. An open that does not migrate never touches the lock.
     this.options.beforeMigrationExclusivity?.();
     this.withMigrationExclusivity(() => {
+      // #747 — re-resolve the *pathname* under the lock, from the filesystem, not from the
+      // open handle.
+      //
+      // The version re-read below asks the *handle*, and a handle survives its own name. Replace
+      // the file at this path with another database at the same version and `this.#raw` still
+      // refers to the unlinked original, so the version reads 11 and that check passes — the
+      // guard meant to close the window is exactly what makes this instance invisible.
+      //
+      // Measured on the head before this line existed, with a v11 replacement swapped in at the
+      // pathname: the file *at the pathname* — the replacement, which no approval ever named —
+      // came out at version 34 carrying its own rows, the approved inode stayed at 11, and the
+      // approval was consumed. So it is not merely split brain. The approval was spent, no
+      // approved database was migrated, and a database nobody approved was. WAL and shared-memory
+      // sidecars are named by path rather than by the open file, which is the plausible route,
+      // but the end state is the finding and does not depend on that explanation.
+      //
+      // One condition, two questions, because either alone leaves a hole the other covers and a
+      // check nothing can falsify is not a check:
+      //
+      //   - Is the file at this path still the one the approval names? The approval is a
+      //     capability over one target and it was matched outside the lock, where the answer
+      //     could still change.
+      //   - Does the name still lead to the file this connection opened? If not, the handle is a
+      //     handle to an orphan. The caller asked to open a *path*; migrating an inode the path
+      //     no longer names is not what it asked for, however valid the approval was a moment
+      //     ago. **The handle is suspect the instant the pathname moves off it**, and that is
+      //     why this refuses rather than trusting the approval it already matched.
+      //
+      // The second is not implied by the first: a swap away and back between the approval check
+      // and this line leaves the path equal to what was approved while the handle holds neither.
+      //
+      // Refusing costs nothing that has to be recovered: no DDL has run, and the retirement
+      // below is not reached, so the approval stays exactly as spendable as it was.
+      const underLock = targetIdentityOf(this.file);
+      if (
+        !isSameTarget(underLock, approval.target) ||
+        (this.#openedTarget !== null && !isSameTarget(underLock, this.#openedTarget))
+      ) {
+        throw acpError(
+          ReasonCode.CONFLICT,
+          "the database at this path is no longer the one this migration was set up for",
+          {
+            file: this.file,
+            current: underLock,
+            approved: approval.target,
+            opened: this.#openedTarget,
+          },
+        );
+      }
       // Re-read under the lock. Everything above was decided without exclusivity, so a
       // concurrent migration could have completed in between; a check whose result is used
       // after the lock it was taken without is the defect this whole block is about.
