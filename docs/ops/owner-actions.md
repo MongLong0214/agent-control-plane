@@ -392,6 +392,15 @@ limitation above.
 **6. Rollback — one joint operation. A byte-only or database-only rollback is unsafe by
 construction.**
 
+The command block between the two HTML comment markers below is extracted verbatim, at test
+time, by `tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts`, which runs
+it against a disposable fixture standing in for `$HOME` and the app root, with a missing backup
+file, and asserts that `rm -rf` never runs. Moving the block out from under these markers, or
+editing a preflight check inside it, is not a formatting change: that test extracts from these
+markers and nowhere else, so it fails to find its anchor rather than silently testing stale text.
+
+<!-- owner-actions:rollback-preflight:start -->
+
     set -e
     bash /Users/isaac/projects/agent-control-plane/deploy/install-launchd.sh stop
     for i in $(seq 1 30); do [ -e "$HOME/.agent-control-plane/agentcpd.lock" ] || break; sleep 1; done
@@ -421,6 +430,8 @@ construction.**
     node "$BYTES_BACKUP/dist/db/state-admin.js" restore "$BACKUP_PATH" \
       --database "$HOME/.agent-control-plane/state.sqlite" --confirm-restore
     bash /Users/isaac/projects/agent-control-plane/deploy/install-launchd.sh start
+
+<!-- owner-actions:rollback-preflight:end -->
 
 Those checks run **before** the first destructive command, and the list is complete rather than
 representative: every `cp` source and every path handed to `node` below appears above, checked

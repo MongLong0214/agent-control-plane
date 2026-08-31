@@ -3218,6 +3218,26 @@ const GUARDS = [
       "tests/process/vitest-result-gate.test.ts::does not retry an unexplained run failure",
     ],
   },
+  {
+    // #737: the rollback preflight in docs/ops/owner-actions.md item 6 checks every file the
+    // rollback will read before its first destructive command (`rm -rf .../dist`). This row
+    // deletes the launcher check specifically, leaving the other checks around it intact, so a
+    // test that only asserted "some check exists somewhere" could not be fooled by this — the
+    // named test extracts the whole block and runs it against a fixture backup that is otherwise
+    // fully valid and is missing only the launcher file, so with this line gone the extracted
+    // script sails through every remaining check and actually runs `rm -rf` against the fixture's
+    // live dist directory.
+    what: "the rollback preflight refuses a missing launcher backup file before rm -rf runs",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    test -s "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist"\n' +
+      '    test -s "$BYTES_BACKUP/agentcpd-launch.sh"\n' +
+      '    test -s "$BACKUP_PATH"\n',
+    replace:
+      '    test -s "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist"\n' +
+      '    test -s "$BACKUP_PATH"\n',
+    killedBy: ["tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
