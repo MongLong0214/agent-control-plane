@@ -258,13 +258,22 @@ that path (`Db`'s constructor calls `migrate()` unconditionally, `src/db/databas
 Stopping first removes the job from launchd's supervision entirely until it is explicitly
 started again, which is the only thing in this repository that closes that window:
 
+    set -e
     bash /Users/isaac/projects/agent-control-plane/deploy/install-launchd.sh stop
     for i in $(seq 1 30); do [ -e "$HOME/.agent-control-plane/agentcpd.lock" ] || break; sleep 1; done
-    [ -e "$HOME/.agent-control-plane/agentcpd.lock" ] && echo "STILL LOCKED — stop before proceeding"
+    if [ -e "$HOME/.agent-control-plane/agentcpd.lock" ]; then
+      echo "agentcpd lock remains after stop; refusing to rebuild" >&2
+      exit 1
+    fi
 
-(Plain `stop` does not wait for the lock the way `install`/`upgrade`/`rollback` do internally —
-`deploy/install-launchd.sh:349-351` versus `:340` — so this loop is written out rather than
-assumed.)
+The `exit 1` is the whole point of this step, not a formality. `install-launchd.sh`'s own
+`wait_for_stop` (`deploy/install-launchd.sh:324-330`) ends the same wait with
+`fail "agentcpd lock remains after launchctl stop; refusing database restore"`, and every
+command that touches state — `install`, `upgrade`, `rollback` — goes through it. Plain `stop`
+does not, so the wait has to be written out here; **writing it out is where the fail-closed
+property is easiest to drop, and dropping it is worse than not waiting at all**, because a
+warning printed above a rebuild reads as a step that ran. A rebuild that proceeds past a held
+lock replaces the bytes of a live process.
 
 With the job stopped, re-pin and rebuild the candidate (see item 8 — this SHA must be re-verified
 right before this line, not copied from this document):
@@ -338,13 +347,30 @@ limitation above.
 **6. Rollback — one joint operation. A byte-only or database-only rollback is unsafe by
 construction.**
 
+    set -e
     bash /Users/isaac/projects/agent-control-plane/deploy/install-launchd.sh stop
     for i in $(seq 1 30); do [ -e "$HOME/.agent-control-plane/agentcpd.lock" ] || break; sleep 1; done
+    if [ -e "$HOME/.agent-control-plane/agentcpd.lock" ]; then
+      echo "agentcpd lock remains after stop; refusing to replace deployment bytes" >&2
+      exit 1
+    fi
     rm -rf /Users/isaac/projects/agent-control-plane/dist
     cp -a "$BYTES_BACKUP/dist" /Users/isaac/projects/agent-control-plane/dist
-    node /Users/isaac/projects/agent-control-plane/dist/db/state-admin.js restore "$BACKUP_PATH" \
-      --database "$HOME/.agent-control-plane/state.sqlite" --confirm-restore
-    bash /Users/isaac/projects/agent-control-plane/deploy/install-launchd.sh start
+    bash /Users/isaac/projects/agent-control-plane/deploy/install-launchd.sh rollback \
+      --database-backup "$BACKUP_PATH"
+
+The database half is delegated to `install-launchd.sh rollback` rather than driven by hand,
+because that path already stops the job, waits for the lock **fail-closed**, restores the
+database through `state-admin.js`, restores the saved plist and launcher, and starts the job
+(`deploy/install-launchd.sh:367-386`). Reproducing those steps here would reproduce them
+without the `fail`.
+
+Only the `dist` restore is written out, because `rollback` snapshots the launchd artifacts and
+the database — not the build output. That is exactly why the guard above it is not optional:
+`rm -rf dist` against a still-running daemon replaces the bytes of a live process, and the
+database restore is then refused by the lock a moment later, leaving a **partial rollback** —
+old bytes, new schema — which is the one combination `applySchema` refuses outright and
+`KeepAlive` then retries forever.
 
 Restoring only the database and leaving 34-declaring bytes in place is nearly harmless — a build
 opening a database *older* than itself just migrates forward again, reproducing the state being
@@ -359,9 +385,14 @@ order, while the job is stopped, before the next `start`.
 A database backup and manifest under `~/.agent-control-plane/backups/` (item 2); a `dist/`
 snapshot and its hash under `~/.agent-control-plane/deploy-backups/` (item 2); nine new rows in
 `schema_migrations`, versions 26 through 34, each with a `sha256:` receipt (item 4, on success);
-an updated `~/.agent-control-plane/health.json` with a new `pid` and `startedAt` (item 4). Nothing
-in `deploy/` or this repository is modified — every write lands under the operator's own state
-directory or the deployment checkout the owner already controls.
+an updated `~/.agent-control-plane/health.json` with a new `pid` and `startedAt` (item 4).
+
+Nothing is written to `origin`. **The deployment checkout is modified**, and this is not a
+side effect to gloss: item 3's `git checkout`, `pnpm install` and `pnpm build` move that
+checkout's `HEAD`, index and worktree, and replace `dist/` and `node_modules/`. Item 6 replaces
+`dist/` again from the snapshot. That checkout is the launchd job's `WorkingDirectory`, so the
+owner should expect its state to differ afterward — an earlier draft of this section claimed
+"nothing in this repository is modified", which was false in the one direction that matters.
 
 ### Which identity
 
