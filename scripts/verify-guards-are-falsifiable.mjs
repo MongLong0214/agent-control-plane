@@ -85,6 +85,53 @@ const vitestArgsFor = (killedBy) => {
 
 const GUARDS = [
   {
+    what: "ci preflight refuses a workflow pnpm command whose package script is missing",
+    file: "package.json",
+    find: '    "trace": "tsx src/tools/traceability.ts",\n',
+    replace: "",
+    killedBy: ["tests/process/ci-preflight.test.ts::accepts every repository workflow command"],
+  },
+  {
+    what: "ci preflight refuses an unmatched quote in a workflow run block",
+    file: ".github/workflows/ci.yml",
+    find: '          echo "the test matrix succeeded"',
+    replace: '          echo "the test matrix succeeded""',
+    killedBy: ["tests/process/ci-preflight.test.ts::accepts every repository workflow command"],
+  },
+  // sol-simplify: these rows exist only while ci preflight does; remove them with that guard.
+  {
+    what: "ci preflight reports a workflow pnpm command whose package script is missing",
+    file: "scripts/verify-ci-preflight.mjs",
+    find:
+      "    failures.push(\n" +
+      "      `${run.source}:${run.line}: pnpm invokes missing package script ${JSON.stringify(invocation.name)}`,\n" +
+      "    );\n",
+    replace: "",
+    killedBy: [
+      "tests/process/ci-preflight.test.ts::rejects a workflow pnpm command whose package script is missing",
+    ],
+  },
+  {
+    what: "ci preflight reports a Bash syntax error in a workflow run block",
+    file: "scripts/verify-ci-preflight.mjs",
+    find:
+      '    failures.push(`${run.source}:${run.line}: run command fails bash -n: ${detail}`);\n',
+    replace: "",
+    killedBy: [
+      "tests/process/ci-preflight.test.ts::rejects an unmatched quote in a workflow run block",
+    ],
+  },
+  {
+    what: "ci preflight reads at least one repository workflow file",
+    file: "scripts/verify-ci-preflight.mjs",
+    find:
+      "const workflowNames = readdirSync(workflowsDir)\n" +
+      '  .filter((name) => /\\.ya?ml$/i.test(name))\n' +
+      "  .sort();\n",
+    replace: "const workflowNames = [];\n",
+    killedBy: ["tests/process/ci-preflight.test.ts::accepts every repository workflow command"],
+  },
+  {
     // This is the one static outflow for the code. Its catalogue classification remains,
     // proving that membership metadata and prose cannot satisfy the outflow census.
     what: "every declared reason code has a verified static outflow",

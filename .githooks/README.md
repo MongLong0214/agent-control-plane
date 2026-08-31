@@ -15,6 +15,9 @@ hook that a clone silently starts running is a code-execution path, and git clos
 
 **`pre-commit`**
 
+- Committing a workflow whose `pnpm` shorthand has no package script, or whose `run:` command
+  does not parse under Bash. `pnpm ci:preflight` checks the working tree here and before CI's
+  dependency installation.
 - Committing while `verify-guards-are-falsifiable.mjs` has a mutation applied. It edits guarded
   sources in place and restores them at the end; a commit during that window takes the mutation.
   Twice — 2026-08-19 by way of a killed run, 2026-08-22 by way of a live one. Both put a *removed

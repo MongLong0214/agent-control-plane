@@ -1,0 +1,4 @@
+allowBuilds:
+  better-sqlite3: true
+  esbuild: true
+storeDir: /private/tmp/acp-717-pnpm-store/v11
