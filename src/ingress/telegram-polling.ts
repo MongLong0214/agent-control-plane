@@ -3,7 +3,7 @@ import type { OwnerIdentity } from "../ceo/owner-authority.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { RunState } from "../domain/types.ts";
+import { Role, RunState, roleKeyFor } from "../domain/types.ts";
 import { createHermesMcpPort } from "../mcp/hermes-server.ts";
 import { IngressGuard } from "./ingress-guard.ts";
 import {
@@ -1109,6 +1109,18 @@ export const startTelegramLongPollListener = async (
   const router = new TelegramHermesRouter({
     ingress,
     hermes,
+    // Contract 1's fourth field, read from the live binding at claim time rather than captured
+    // once here: a generation that advances while this listener is up (a handoff, a rebind) has
+    // to reach the next turn's claim, and a value closed over at construction never would.
+    //
+    // Supplied at all because it was not. `TelegramRouterOptions.bindingGeneration` was optional
+    // with a `() => null` default and no composition root — not this one, not the disposable-realm
+    // driver, not a test — ever passed it, so every claim ACP has ever written stored
+    // `digestOf({ bindingGeneration: null })`. The digest meant to say which CEO asked the turn
+    // was the same constant whether a CEO was bound at generation 1 or none was bound at all,
+    // which is the one distinction it exists to draw. The option is now required, so the next
+    // composition root cannot repeat this silently.
+    bindingGeneration: () => cp.bindings.active(roleKeyFor(Role.CEO))?.bindingGeneration ?? null,
     currentCandidateSnapshotDigest: (runId) => cp.runs.currentCandidate(runId),
     resolveOwnerPrompt: (input) => storedOwnerPrompt(cp, input.chatId, input.messageId, input.runId),
     recordOwnerPrompt: (record) => recordOwnerPrompt(cp, record),
