@@ -2827,8 +2827,10 @@ const GUARDS = [
   {
     what: "a discovered file count pinned to a literal is rejected",
     file: "scripts/verify-stale-coordinate-literals.mjs",
-    find: "    if (readsDiscoveredMembers) pins.push({ index: start, count: match[2] });",
-    replace: "    if (false) pins.push({ index: start, count: match[2] });",
+    find:
+      "          if (readsDiscoveredMembers) pins.push({ index: node.getStart(sourceFile), count: node.arguments[0].text });",
+    replace:
+      "          if (false) pins.push({ index: node.getStart(sourceFile), count: node.arguments[0].text });",
     killedBy: [
       "tests/unit/verify-stale-coordinate-literals.test.ts::a discovered file count pinned to a literal is rejected",
     ],
@@ -2847,7 +2849,7 @@ const GUARDS = [
     what: "a workflow job total copied into documentation is rejected",
     file: "scripts/verify-stale-coordinate-literals.mjs",
     find:
-      "  const jobTotalPattern = /\\b(?:the\\s+)?workflow\\s+(?:now\\s+)?has\\s+(?:one|two|three|four|five|six|seven|eight|nine|ten|\\d+)\\s+jobs?\\b/gi;",
+      "  const jobTotalPattern = /\\b(?:the\\s+)?workflow\\s+(?:now|currently)\\s+has\\s+(?:one|two|three|four|five|six|seven|eight|nine|ten|\\d+)\\s+jobs?\\b/gi;",
     replace: "  const jobTotalPattern = /$^/g;",
     killedBy: [
       "tests/unit/verify-stale-coordinate-literals.test.ts::a workflow job total copied into documentation is rejected",

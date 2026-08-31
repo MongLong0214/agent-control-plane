@@ -4,14 +4,15 @@
  *
  *   1. a test fixture quotes an existing `src/**:line` followed by source text
  *   2. a test discovers files with `git ls-files` and pins the result with `toHaveLength(number)`
- *   3. one Markdown paragraph names a measured SHA and gives a `node` reproduction command that
- *      does not consume that SHA through `--ref`
- *   4. Markdown states the current total number of jobs in a workflow
+ *   3. one Markdown paragraph names a measured SHA and explicitly labels an inline `node` command
+ *      as its replay/reproduction command without passing that SHA through `--ref`
+ *   4. Markdown explicitly says a workflow now/currently has a literal total number of jobs
  *
  * This is deliberately narrower than every file:line mention. Historical measurement documents
  * use line citations, while a missing-path citation is also a durable negative control: moving
- * production cannot change the fact that `src/does/not/exist.ts:42` is absent. The four forms
- * above have syntactic boundaries the repository can enforce without an exemption list.
+ * production cannot change the fact that `src/does/not/exist.ts:42` is absent. Unlabelled `node`
+ * commands and hypothetical job counts are outside this check: prose proximity alone does not
+ * make a command a reproduction command or a number the current workflow total.
  *
  * sol-simplify: copied mutable coordinates caused four defects in one day; remove this check when
  * repository coordinates are represented by structured symbols and queries instead.
@@ -21,6 +22,8 @@
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import ts from "typescript";
 
 const rootArg = process.argv.find((argument) => argument.startsWith("--root="));
 const repoRoot = rootArg
@@ -59,8 +62,8 @@ const finding = (kind, path, line, detail) => ({ kind, path, line, detail });
 
 /**
  * Returns quoted contents plus code with comments and quotes blanked, preserving newlines and
- * offsets. The check needs two small syntactic facts — an exact `ls-files` argument and an actual
- * `toHaveLength(number)` call — without depending on installed packages in a disposable tree.
+ * offsets. Source-coordinate fixtures need their string contents without mistaking comments for
+ * code; TypeScript handles binding-aware analysis of discovered file counts below.
  */
 const lexicalSource = (source) => {
   const code = [...source];
@@ -127,59 +130,107 @@ const lexicalSource = (source) => {
   return { code: code.join(""), strings };
 };
 
-const mentionsIdentifier = (source, identifier) =>
-  new RegExp(`(?:^|[^A-Za-z0-9_$])${identifier.replace(/[$]/g, "\\$")}(?:$|[^A-Za-z0-9_$])`).test(
-    source,
-  );
-
 /**
- * Finds literal length assertions whose subject is derived, in the same file, from a command that
- * contains the exact `ls-files` argument. This deliberately small dataflow follows variable
- * initializers; merely putting an unrelated length assertion beside a git query is not enough.
+ * Finds literal length assertions whose subject is derived through simple variable initializers
+ * from an expression containing the exact `ls-files` string. TypeScript symbols make each lexical
+ * binding distinct, so reusing a name in another function or block cannot inherit derivation.
+ * Reassignments, returned values, parameter passing, properties written after initialization, and
+ * inter-file flow are deliberately outside this check.
  */
-const discoveredFileCountPins = (lexical) => {
-  const assignments = [...lexical.code.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([^;]*);/g)].map(
-    (match) => ({
-      name: match[1],
-      value: match[2],
-      start: match.index ?? 0,
-      end: (match.index ?? 0) + match[0].length,
-    }),
-  );
-  const discoveryPositions = lexical.strings
-    .filter((literal) => literal.value === "ls-files")
-    .map((literal) => literal.start);
+const discoveredFileCountPins = (source, path) => {
+  const compilerOptions = {
+    allowJs: true,
+    checkJs: false,
+    noLib: true,
+    noResolve: true,
+    target: ts.ScriptTarget.Latest,
+  };
+  const sourceFile = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true);
+  const defaultHost = ts.createCompilerHost(compilerOptions);
+  const host = {
+    ...defaultHost,
+    fileExists: (candidate) => candidate === path,
+    getSourceFile: (candidate) => (candidate === path ? sourceFile : undefined),
+    readFile: (candidate) => (candidate === path ? source : undefined),
+    writeFile: () => undefined,
+  };
+  const program = ts.createProgram({ rootNames: [path], options: compilerOptions, host });
+  const checker = program.getTypeChecker();
+
+  const anyNode = (node, accepts) => {
+    if (accepts(node)) return true;
+    let found = false;
+    ts.forEachChild(node, (child) => {
+      if (!found && anyNode(child, accepts)) found = true;
+    });
+    return found;
+  };
+  const containsLsFiles = (node) =>
+    anyNode(
+      node,
+      (candidate) =>
+        (ts.isStringLiteral(candidate) || ts.isNoSubstitutionTemplateLiteral(candidate)) &&
+        candidate.text === "ls-files",
+    );
+
+  const initializers = [];
+  const collectInitializers = (node) => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer !== undefined) {
+      const symbol = checker.getSymbolAtLocation(node.name);
+      if (symbol !== undefined) initializers.push({ symbol, value: node.initializer });
+    }
+    ts.forEachChild(node, collectInitializers);
+  };
+  collectInitializers(sourceFile);
+
   const derived = new Set(
-    assignments
-      .filter((assignment) =>
-        discoveryPositions.some((position) => position >= assignment.start && position < assignment.end),
-      )
-      .map((assignment) => assignment.name),
+    initializers.filter(({ value }) => containsLsFiles(value)).map(({ symbol }) => symbol),
   );
+  const readsDerivedBinding = (node) =>
+    anyNode(
+      node,
+      (candidate) =>
+        ts.isIdentifier(candidate) && derived.has(checker.getSymbolAtLocation(candidate)),
+    );
 
   let changed = true;
   while (changed) {
     changed = false;
-    for (const assignment of assignments) {
-      if (derived.has(assignment.name)) continue;
-      if ([...derived].some((identifier) => mentionsIdentifier(assignment.value, identifier))) {
-        derived.add(assignment.name);
+    for (const initializer of initializers) {
+      if (derived.has(initializer.symbol)) continue;
+      if (readsDerivedBinding(initializer.value)) {
+        derived.add(initializer.symbol);
         changed = true;
       }
     }
   }
 
   const pins = [];
-  for (const match of lexical.code.matchAll(
-    /\bexpect\s*\(([^;]*?)\)\s*\.toHaveLength\s*\(\s*(\d+)\s*\)/g,
-  )) {
-    const start = match.index ?? 0;
-    const end = start + match[0].length;
-    const readsDiscoveredMembers =
-      discoveryPositions.some((position) => position >= start && position < end) ||
-      [...derived].some((identifier) => mentionsIdentifier(match[1], identifier));
-    if (readsDiscoveredMembers) pins.push({ index: start, count: match[2] });
-  }
+  const unwrapParentheses = (node) => {
+    let current = node;
+    while (ts.isParenthesizedExpression(current)) current = current.expression;
+    return current;
+  };
+  const collectPins = (node) => {
+    if (ts.isCallExpression(node) && node.arguments.length === 1 && ts.isNumericLiteral(node.arguments[0])) {
+      const property = unwrapParentheses(node.expression);
+      if (ts.isPropertyAccessExpression(property) && property.name.text === "toHaveLength") {
+        const expectCall = unwrapParentheses(property.expression);
+        if (
+          ts.isCallExpression(expectCall) &&
+          ts.isIdentifier(unwrapParentheses(expectCall.expression)) &&
+          unwrapParentheses(expectCall.expression).text === "expect" &&
+          expectCall.arguments.length === 1
+        ) {
+          const subject = expectCall.arguments[0];
+          const readsDiscoveredMembers = containsLsFiles(subject) || readsDerivedBinding(subject);
+          if (readsDiscoveredMembers) pins.push({ index: node.getStart(sourceFile), count: node.arguments[0].text });
+        }
+      }
+    }
+    ts.forEachChild(node, collectPins);
+  };
+  collectPins(sourceFile);
   return pins;
 };
 
@@ -209,7 +260,7 @@ for (const path of testFiles) {
     }
   }
 
-  for (const pin of discoveredFileCountPins(lexical)) {
+  for (const pin of discoveredFileCountPins(text, path)) {
     testFindings.push(
       finding(
         "discovered-file-count",
@@ -228,7 +279,9 @@ for (const path of documentFiles) {
   for (const paragraph of text.split(/\n[ \t]*\n/)) {
     const measured = paragraph.match(/\bmeasured against\s+`([0-9a-f]{7,40})`/i);
     if (measured) {
-      for (const command of paragraph.matchAll(/`(node\s+[^`\n]+)`/g)) {
+      const reproductionCommandPattern =
+        /\b(?:replay|reproduce|reproducible)\s+with\s+`(node\s+[^`\n]+)`/gi;
+      for (const command of paragraph.matchAll(reproductionCommandPattern)) {
         const sha = measured[1];
         const consumesMeasuredRef = new RegExp(`--ref(?:=|\\s+)${sha}(?:\\s|$)`).test(command[1]);
         if (!consumesMeasuredRef) {
@@ -246,14 +299,14 @@ for (const path of documentFiles) {
     paragraphOffset += paragraph.length + 2;
   }
 
-  const jobTotalPattern = /\b(?:the\s+)?workflow\s+(?:now\s+)?has\s+(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+jobs?\b/gi;
+  const jobTotalPattern = /\b(?:the\s+)?workflow\s+(?:now|currently)\s+has\s+(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+jobs?\b/gi;
   for (const match of text.matchAll(jobTotalPattern)) {
     documentFindings.push(
       finding(
         "workflow-job-total",
         path,
         lineAt(text, match.index ?? 0),
-        `${JSON.stringify(match[0])} copies a workflow total that changes when jobs are split or added`,
+        `${JSON.stringify(match[0])} states a current workflow total that changes when jobs are split or added`,
       ),
     );
   }
@@ -273,7 +326,9 @@ if (asJson) {
         limitations: [
           "document file:line citations are not classified because historical snapshots and current loci have the same syntax",
           "a source coordinate in a test is classified only when it names an existing production file and quotes source text after the line",
-          "a numeric test length is classified only when same-file initializer dataflow traces its subject to git ls-files",
+          "a numeric test length is classified only when TypeScript binding-aware initializer flow in that file traces its subject to an exact ls-files string; reassignments, calls, returns, and inter-file flow are not classified",
+          "a measured SHA constrains only an inline node command explicitly introduced by replay with, reproduce with, or reproducible with in the same paragraph",
+          "a workflow job total is classified only when the prose explicitly says the workflow now or currently has that total",
         ],
       },
       null,
@@ -288,7 +343,7 @@ if (asJson) {
     process.stderr.write(`  ${item.path}:${item.line} [${item.kind}] ${item.detail}\n`);
   }
   process.stderr.write(
-    "\nName production loci by symbol, derive discovered membership, and pass measured refs into reproduction commands.\n",
+    "\nName production loci by symbol, derive discovered membership, and pass measured refs into explicitly labelled replay/reproduction commands.\n",
   );
 } else {
   process.stdout.write(

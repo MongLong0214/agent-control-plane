@@ -124,7 +124,7 @@ it("reports all four repeated moving coordinate forms", () => {
   write(
     root,
     "docs/ops/branch-protection.md",
-    `${["The workflow has", "five jobs."].join(" ")}\n`,
+    `${["The workflow now has", "five jobs."].join(" ")}\n`,
   );
 
   const result = run(root);
@@ -170,6 +170,30 @@ it("unrelated and derived lengths remain valid beside git discovery", () => {
   expect(parsedFindings(result)).toEqual([]);
 });
 
+it("the same variable name in another test block has an independent binding", () => {
+  const root = fixture();
+  write(
+    root,
+    "tests/unit/scopes.test.ts",
+    [
+      'import { spawnSync } from "node:child_process";',
+      'it("discovers files", () => {',
+      '  const listed = spawnSync("git", ["ls-files", "*.ts"]);',
+      "  expect(listed.stdout).toEqual(expect.anything());",
+      "});",
+      'it("checks a local list", () => {',
+      '  const listed = ["one", "two"];',
+      "  expect(listed).toHaveLength(2);",
+      "});",
+      "",
+    ].join("\n"),
+  );
+
+  const result = run(root);
+  expect(result.status).toBe(0);
+  expect(parsedFindings(result)).toEqual([]);
+});
+
 it("a node command that consumes its measured SHA remains valid", () => {
   const root = fixture();
   write(
@@ -183,12 +207,43 @@ it("a node command that consumes its measured SHA remains valid", () => {
   expect(parsedFindings(result)).toEqual([]);
 });
 
+it("an unrelated node command beside a bound reproduction command remains valid", () => {
+  const root = fixture();
+  write(
+    root,
+    "docs/design/census.md",
+    [
+      "Measured against `8622195`; replay with",
+      "`node docs/design/census.mjs --ref 8622195 --json`.",
+      "Record the runtime with `node --version`.",
+      "",
+    ].join("\n"),
+  );
+
+  const result = run(root);
+  expect(result.status).toBe(0);
+  expect(parsedFindings(result)).toEqual([]);
+});
+
 it("historical workflow wording remains valid", () => {
   const root = fixture();
   write(
     root,
     "docs/ops/history.md",
     "The workflow's one job had the id verify before the matrix split.\n",
+  );
+
+  const result = run(root);
+  expect(result.status).toBe(0);
+  expect(parsedFindings(result)).toEqual([]);
+});
+
+it("a hypothetical workflow job count remains valid", () => {
+  const root = fixture();
+  write(
+    root,
+    "docs/ops/conditional.md",
+    "If the workflow has two jobs, split the slower one before adding a matrix.\n",
   );
 
   const result = run(root);
