@@ -360,6 +360,13 @@ describe("the rollback preflight in docs/ops/owner-actions.md, extracted and run
     expect(result.signal).toBeNull();
     expect(result.code).toBe(1);
     expect(result.stderr).not.toContain(`rm -rf ${fixtureAppRoot}/dist`);
+    // Refused before *attempting* to run it, which is what these two `test` lines are for and the
+    // only thing that distinguishes them now. The validating restore added in round 4 also runs
+    // this binary before `rm -rf`, so a missing file already stops the rollback by failing there
+    // — and the falsifiability sweep caught exactly that: delete the guard and the destructive
+    // command still never ran, so nothing was watching the guard any more. A preflight that
+    // names what it will read has to refuse before the read, not by the read failing.
+    expect(result.stderr).not.toContain("state-admin.js restore");
     expect(readFileSync(join(fixtureAppRoot, "dist", "daemon", "agentcpd.js"), "utf8")).toBe(
       LIVE_DIST_SENTINEL,
     );
