@@ -3406,6 +3406,65 @@ const GUARDS = [
     ],
   },
   {
+    // #747 — an approval is a capability over one database. Keyed by the directory it lives in,
+    // any database beside it spends it: measured, two v11 databases in one private directory,
+    // an approval taken on A, and B migrated on it with A's backup as the recovery point.
+    what: "an approval is spendable only on the database whose identity it names",
+    file: "src/db/migration-approval.ts",
+    find: "  if (!isSameTarget(approval.target, opened)) {",
+    replace: "  if (false) {",
+    killedBy: [
+      "tests/unit/an-approval-is-a-capability-over-one-database.test.ts::cannot be spent by opening a different database beside it",
+    ],
+  },
+  {
+    // A version and a checksum say the file is an intact database at the right schema. They do
+    // not say it is an image of *this* one, and a rollback from somebody else's image restores
+    // somebody else's data.
+    what: "an approved rollback point must be an image of the database it will roll back",
+    file: "src/db/backup.ts",
+    find: "  if (!isSameTarget(manifest.source, target)) {",
+    replace: "  if (false) {",
+    killedBy: [
+      "tests/unit/a-migration-approval.test.ts::is refused when its recovery point is an image of a different database at the same version",
+    ],
+  },
+  {
+    // The lock the daemon takes in `start()` is taken after the constructor has already
+    // migrated. Without this the schema is rewritten under a live holder of the database, and
+    // the contention is discovered afterwards.
+    what: "a migration holds the deployment's state lock while it runs",
+    file: "src/db/database.ts",
+    find: "    this.withMigrationExclusivity(() => {",
+    replace: "    ((work) => work())(() => {",
+    killedBy: [
+      "tests/unit/an-approval-is-a-capability-over-one-database.test.ts::refuses rather than rewriting the schema under the lock holder",
+    ],
+  },
+  {
+    // Filing the spent approval away is bookkeeping about a migration that already committed.
+    // Throwing from it reports a committed migration as a failed start, which is the state
+    // nothing could recognise.
+    what: "a failed approval retirement does not fail the start whose migration already committed",
+    file: "src/db/migration-approval.ts",
+    find:
+      "  try {\n" +
+      "    renameSync(approvalPath, retiredApprovalPath(approvalPath, from, to));\n" +
+      "    return { retired: true, approvalPath, error: null };\n" +
+      "  } catch (error) {",
+    replace:
+      "  try {\n" +
+      "    renameSync(approvalPath, retiredApprovalPath(approvalPath, from, to));\n" +
+      "    return { retired: true, approvalPath, error: null };\n" +
+      "  } catch (error) {\n" +
+      "    throw error;\n" +
+      "  }\n" +
+      "  if (false) {",
+    killedBy: [
+      "tests/unit/an-approval-is-a-capability-over-one-database.test.ts::does not turn a committed migration into a failed start",
+    ],
+  },
+  {
     // #738 — the defect itself. Delete the approval check and the constructor migrates the
     // database it just opened, which is what a restart under `KeepAlive`/`RunAtLoad` performs
     // the moment a `pnpm build` in the deployment checkout changes the declared SCHEMA_VERSION.
@@ -3415,13 +3474,14 @@ const GUARDS = [
     find:
       "    const approval = assertMigrationApproved(\n" +
       "      this.file,\n" +
+      "      targetIdentityOf(this.file),\n" +
       "      migrationPlanFrom(version),\n" +
       "      this.options.migrationApproval ?? null,\n" +
-      "    );\n" +
-      "    this.migrate(filename, version);",
+      "    );",
     replace:
-      "    const approval = this.options.migrationApproval ?? null;\n" +
-      "    this.migrate(filename, version);",
+      "    const approval =\n" +
+      "      this.options.migrationApproval ??\n" +
+      "      ({ fromVersion: version, toVersion: SCHEMA_VERSION } as MigrationApproval);",
     killedBy: [
       "tests/unit/a-restart-that-would-migrate.test.ts::refuses, leaves the database at its own version, and exits so the supervisor stops retrying",
     ],
@@ -3453,7 +3513,7 @@ const GUARDS = [
     // on a path nobody validated.
     what: "an approval must name a validated recovery point at the version the chain starts from",
     file: "src/db/migration-approval.ts",
-    find: "  assertRollbackPointAt(approval.backupPath, plan.fromVersion);",
+    find: "  assertRollbackPointAt(approval.backupPath, plan.fromVersion, approval.target);",
     replace: "",
     killedBy: [
       "tests/unit/a-migration-approval.test.ts::is refused when its recovery point is not an image of the version this migration starts from",

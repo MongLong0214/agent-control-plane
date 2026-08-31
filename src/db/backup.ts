@@ -27,6 +27,12 @@ import {
   migrationChainFrom,
 } from "./migrations.ts";
 import {
+  isSameTarget,
+  isTargetIdentity,
+  targetIdentityOf,
+  type TargetIdentity,
+} from "./target-identity.ts";
+import {
   PRIVATE_FILE_MODE,
   assertPrivateDatabaseFiles,
   assertPrivatePath,
@@ -49,6 +55,14 @@ interface BackupManifest {
   databaseSha256: string;
   schemaVersion: number;
   createdAt: string;
+  /**
+   * The database this snapshot was taken from (#747), recorded by the process that had both
+   * files open rather than reconstructed afterwards. Optional in the shape check because
+   * manifests written before this field existed are still valid backups and must stay
+   * restorable; `assertRollbackPointAt` requires it, because a rollback point for an approved
+   * migration has to be an image of *that* target, not any file with a matching schema version.
+   */
+  source?: TargetIdentity;
 }
 
 export interface RestoreResult {
@@ -132,7 +146,11 @@ const publishStagedBackup = (staged: string, destination: string): void => {
   unlinkSync(staged);
 };
 
-const writeManifest = (backupPath: string, version: number): DatabaseBackup => {
+const writeManifest = (
+  backupPath: string,
+  version: number,
+  source: TargetIdentity,
+): DatabaseBackup => {
   assertPrivatePath(backupPath, "file");
   const sha256 = hashFile(backupPath);
   const manifestPath = backupManifestPath(backupPath);
@@ -142,6 +160,7 @@ const writeManifest = (backupPath: string, version: number): DatabaseBackup => {
     databaseSha256: sha256,
     schemaVersion: version,
     createdAt: new Date().toISOString(),
+    source,
   };
   writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`, { encoding: "utf8", mode: PRIVATE_FILE_MODE, flag: "wx" });
   assertPrivatePath(manifestPath, "file");
@@ -177,7 +196,7 @@ export const backupOpenDatabaseSync = (
     chmodSync(staged, PRIVATE_FILE_MODE);
     publishStagedBackup(staged, destination);
     published = true;
-    return writeManifest(destination, schemaVersion(raw));
+    return writeManifest(destination, schemaVersion(raw), targetIdentityOf(sourcePath));
   } catch (error) {
     removePartialBackup(staged);
     if (published) removePartialBackup(destination);
@@ -226,13 +245,35 @@ export const captureRollbackPointSync = (
  * image whose ledger the current build reads as malformed, which is a fact about the old
  * database, not a reason to leave it with no recovery point.
  */
-export const assertRollbackPointAt = (backupPath: string, expectedVersion: number): DatabaseBackup => {
+export const assertRollbackPointAt = (
+  backupPath: string,
+  expectedVersion: number,
+  target: TargetIdentity,
+): DatabaseBackup => {
   const manifest = validateBackup(backupPath, { assertSchemaInvariants: false });
   if (manifest.schemaVersion !== expectedVersion) {
     throw acpError(ReasonCode.SCHEMA_MIGRATION_NOT_APPROVED, "the approved rollback point is not at the version this migration starts from", {
       backupPath,
       expected: expectedVersion,
       found: manifest.schemaVersion,
+    });
+  }
+  // #747 — a version and a checksum say the file is an intact database at the right schema.
+  // They do not say it is an image of *this* database, and an approval whose recovery point
+  // belongs to a different file is a rollback to somebody else's data. The manifest carries
+  // the source identity recorded when the snapshot was taken; an older manifest carries none,
+  // and a rollback point with no stated provenance is refused here rather than assumed.
+  if (manifest.source === undefined) {
+    throw acpError(ReasonCode.SCHEMA_MIGRATION_NOT_APPROVED, "the approved rollback point does not record which database it was taken from", {
+      backupPath,
+      target,
+    });
+  }
+  if (!isSameTarget(manifest.source, target)) {
+    throw acpError(ReasonCode.SCHEMA_MIGRATION_NOT_APPROVED, "the approved rollback point is an image of a different database", {
+      backupPath,
+      approvedTarget: target,
+      backupOf: manifest.source,
     });
   }
   return {
@@ -260,7 +301,7 @@ export const backupDatabase = async (
     chmodSync(staged, PRIVATE_FILE_MODE);
     publishStagedBackup(staged, destination);
     published = true;
-    return writeManifest(destination, schemaVersion(raw));
+    return writeManifest(destination, schemaVersion(raw), targetIdentityOf(databasePath));
   } catch (error) {
     removePartialBackup(staged);
     if (published) removePartialBackup(destination);
@@ -282,7 +323,10 @@ const readManifest = (backupPath: string): BackupManifest => {
       typeof parsed.databaseSha256 !== "string" ||
       !/^sha256:[a-f0-9]{64}$/.test(parsed.databaseSha256) ||
       !Number.isInteger(parsed.schemaVersion) ||
-      typeof parsed.createdAt !== "string"
+      typeof parsed.createdAt !== "string" ||
+      // Absent is valid — manifests predating #747 are still restorable. Present-and-malformed
+      // is not: it would otherwise read as "no provenance recorded", which is a different claim.
+      (parsed.source !== undefined && !isTargetIdentity(parsed.source))
     ) {
       throw new Error("backup manifest has an invalid shape");
     }

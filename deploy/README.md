@@ -66,8 +66,11 @@ restart declares. The refusal exits 0, so `KeepAlive { SuccessfulExit = false }`
 stopped rather than retrying every `ThrottleInterval`; it leaves `migration-refusal.json` in the
 state directory and `agentctl daemon status` reports it with no daemon running. `migration-plan`
 reads the database read-only and prints what a start would do; `approve-migration` refuses a live
-lock, takes a validated recovery point, and writes an approval naming that exact chain, which is
-spent when the chain runs.
+lock, takes a validated recovery point, and writes an approval naming that exact chain and the
+database it is for, which is spent when the chain runs. An approval is a capability over one
+file — canonical path, device and inode — so it cannot be spent by a different database beside
+it, and its recovery point must be an image of that same file (#747). The migration holds the
+deployment's state lock while it runs, so it cannot rewrite the schema under a live daemon.
 
 ```bash
 agentcpd-state migration-plan

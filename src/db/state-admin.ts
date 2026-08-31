@@ -16,7 +16,16 @@ import {
   readMigrationApproval,
 } from "./migration-approval.ts";
 import { SCHEMA_VERSION } from "./migrations.ts";
+import { targetIdentityOf } from "./target-identity.ts";
 import { assertPrivatePath, ensurePrivateDirectory } from "./state-preflight.ts";
+
+const readApprovalForReport = (databasePath: string): unknown => {
+  try {
+    return readMigrationApproval(databasePath);
+  } catch (error) {
+    return { unreadable: migrationApprovalPath(databasePath), error: String(error) };
+  }
+};
 
 const readJsonIfPresent = (path: string): unknown => {
   if (!existsSync(path)) return null;
@@ -152,7 +161,13 @@ export const main = async (argv: string[]): Promise<number> => {
           // A start that does not migrate is the ordinary case and says so with an empty plan,
           // rather than by this command having nothing to print.
           plan: version === SCHEMA_VERSION || version === 0 ? null : migrationPlanFrom(version),
-          approvalOnFile: readMigrationApproval(parsed.databasePath),
+          target: targetIdentityOf(parsed.databasePath),
+          // Reported, never thrown on: this is the command an owner runs *because* something is
+          // wrong, so a malformed approval has to be visible here rather than take the reading
+          // down with it. A file naming this build's version while the database already has it
+          // is bookkeeping whose rename failed (#747) — inert, and repaired on the next open.
+          approvalOnFile: readApprovalForReport(parsed.databasePath),
+          approvalIsStale: version === SCHEMA_VERSION && existsSync(migrationApprovalPath(parsed.databasePath)),
           lastRefusal: readJsonIfPresent(migrationRefusalPath(parsed.databasePath)),
         },
         null,

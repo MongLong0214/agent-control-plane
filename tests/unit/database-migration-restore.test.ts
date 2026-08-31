@@ -852,6 +852,13 @@ describe("versioned SQLite migration", () => {
     } finally {
       raw.close();
     }
+    // #747 — the rollback links a staged image into place, so the restored database is a new
+    // inode and the approval that authorised the failed attempt no longer names it. Retrying
+    // therefore needs a fresh decision, which is the right contract: a chain that failed partway
+    // is exactly when a restart must not silently try again. Before this, the surviving approval
+    // re-armed the same failing migration for the supervisor's next restart, every 30 seconds.
+    expect(() => new Db(path)).toThrowError(/for a different database than the one being opened/);
+    approveMigration(path, "database-migration-restore fixture");
     const recovered = new Db(path);
     try {
       expect(history(recovered)).toEqual(before);

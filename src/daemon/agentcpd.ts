@@ -1497,7 +1497,21 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     cp.audit.record({
       kind: "SCHEMA_MIGRATION_APPROVAL_SPENT",
       reasonCode: ReasonCode.OK,
-      evidence: { ...cp.db.appliedMigrationApproval },
+      evidence: {
+        ...cp.db.appliedMigrationApproval,
+        // #747 — filing the approval away can fail after the migration commits, and that no
+        // longer fails the start. This is where the outcome becomes visible rather than lost:
+        // an approval left on disk is inert, but it is not silent.
+        retirement: cp.db.migrationApprovalRetirement,
+      },
+    });
+  }
+  // The repair half: an approval that outlived its own migration, filed away on this open.
+  if (cp.db.staleMigrationApprovalRetirement !== null) {
+    cp.audit.record({
+      kind: "SCHEMA_MIGRATION_APPROVAL_RETIRED_LATE",
+      reasonCode: ReasonCode.OK,
+      evidence: { ...cp.db.staleMigrationApprovalRetirement },
     });
   }
 

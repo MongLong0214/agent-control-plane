@@ -393,9 +393,21 @@ proved out:
 
 `approve-migration` refuses while the lock is held, takes its own validated recovery point at
 the current version, and writes `~/.agent-control-plane/migration-approval.json` naming that
-backup and the ordered chain. It approves **one** migration between two named versions: after
+backup, the ordered chain, and **which database** it is for — canonical path plus device and
+inode (#747). It approves **one** migration of **one** file between two named versions: after
 the chain runs, the file is renamed to `migration-approval.applied-v25-v34-<epoch>.json` and
 authorises nothing further.
+
+Two consequences worth knowing before item 6:
+
+  - The migration itself holds `agentcpd.lock` for as long as it runs, so it cannot proceed
+    under a daemon that is still holding the database. That pre-check in `approve-migration` is
+    a snapshot; the lock is the guarantee.
+  - If the chain fails, its automatic rollback links the pre-migration image back into place,
+    which gives the restored database a **new inode**. The approval no longer names it, so the
+    next start refuses instead of retrying. That is deliberate: a chain that failed partway is
+    exactly when a supervised restart must not silently try again. Retrying is a fresh
+    `approve-migration` after the failing step has been understood — item 6's blocker rule.
 
 The first `Db` the new process opens finds `state.sqlite` at 25, a build declaring 34, and an
 approval naming exactly 25→34, and `applySchema` runs the real chain — protected by its own

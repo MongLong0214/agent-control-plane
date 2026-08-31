@@ -35,6 +35,12 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { assertRollbackPointAt, captureRollbackPointSync } from "./backup.ts";
 import { SCHEMA_VERSION, migrationChainFrom } from "./migrations.ts";
 import { PRIVATE_FILE_MODE, assertPrivatePath, ensurePrivateDirectory } from "./state-preflight.ts";
+import {
+  isSameTarget,
+  isTargetIdentity,
+  targetIdentityOf,
+  type TargetIdentity,
+} from "./target-identity.ts";
 
 export const MIGRATION_APPROVAL_FORMAT = "agent-control-plane.migration-approval/v1";
 
@@ -48,6 +54,12 @@ export interface MigrationPlan {
 
 export interface MigrationApproval extends MigrationPlan {
   format: typeof MIGRATION_APPROVAL_FORMAT;
+  /**
+   * The database this approves (#747). Without it the approval is a capability over whichever
+   * file happens to be opened next in the same directory, and the recovery point below belongs
+   * to a file that may not be the one about to change.
+   */
+  target: TargetIdentity;
   /** The validated image the owner gets back if the chain fails partway. */
   backupPath: string;
   approvedBy: string;
@@ -110,7 +122,8 @@ export const readMigrationApproval = (databasePath: string): MigrationApproval |
     parsed.backupPath.length === 0 ||
     typeof parsed.approvedBy !== "string" ||
     parsed.approvedBy.trim().length === 0 ||
-    typeof parsed.approvedAt !== "string"
+    typeof parsed.approvedAt !== "string" ||
+    !isTargetIdentity(parsed.target)
   ) {
     throw acpError(ReasonCode.SCHEMA_MIGRATION_NOT_APPROVED, "the migration approval on file has an invalid shape", {
       approvalPath: path,
@@ -129,6 +142,7 @@ export const readMigrationApproval = (databasePath: string): MigrationApproval |
  */
 export const assertMigrationApproved = (
   databasePath: string,
+  opened: TargetIdentity,
   plan: MigrationPlan,
   supplied: MigrationApproval | null,
 ): MigrationApproval => {
@@ -141,12 +155,24 @@ export const assertMigrationApproved = (
       {
         databasePath,
         approvalPath,
+        target: opened,
         fromVersion: plan.fromVersion,
         toVersion: plan.toVersion,
         migrations: plan.migrations,
         action:
           "agentcpd-state approve-migration --database <db> --approved-by <who> --confirm-migration",
       },
+    );
+  }
+  // #747 — the first thing to establish is *which database* this approves. An approval names
+  // one target; the file being opened is the only one it may be spent on. Measured before this
+  // check existed: two v11 databases in one directory, an approval taken on A, a start opened
+  // on B — B migrated on A's approval and A's backup became B's recovery point.
+  if (!isSameTarget(approval.target, opened)) {
+    throw acpError(
+      ReasonCode.SCHEMA_MIGRATION_NOT_APPROVED,
+      "the migration approval is for a different database than the one being opened",
+      { databasePath, approvalPath, approvedTarget: approval.target, openedTarget: opened },
     );
   }
   if (
@@ -173,26 +199,77 @@ export const assertMigrationApproved = (
       },
     );
   }
-  assertRollbackPointAt(approval.backupPath, plan.fromVersion);
+  assertRollbackPointAt(approval.backupPath, plan.fromVersion, approval.target);
   return approval;
 };
 
+/** Whether a spent approval was filed away, and why not when it was not. */
+export interface ApprovalRetirement {
+  retired: boolean;
+  approvalPath: string;
+  error: string | null;
+}
+
+const retiredApprovalPath = (approvalPath: string, from: number, to: number): string =>
+  join(dirname(approvalPath), `migration-approval.applied-v${from}-v${to}-${Date.now()}.json`);
+
 /**
- * Retires an approval that has been spent, so a file left lying in the state directory is
- * never a standing permission. The version check above already refuses a second use — the
- * database is no longer at `fromVersion` — but an approval whose migration ran is a record of
- * something that happened, and it is filed as one.
+ * Files a spent approval away, and **never throws** (#747).
+ *
+ * The migration is the irreversible act; filing the approval is bookkeeping about an act that
+ * already committed. Letting the bookkeeping fail the operation it describes is what produced
+ * the state this contract exists to remove — a database upgraded to the new version and a
+ * startup that reported failure, with nothing on either side saying which of the two had
+ * happened. So the rename is attempted, its failure is reported to the caller, and the caller
+ * carries on.
+ *
+ * Safety does not rest on this succeeding. A spent approval is inert because `applySchema`
+ * compares versions before it ever consults an approval: the database is now at the build's
+ * version, so the early-return branch is taken and the file is not read, and `approveMigration`
+ * refuses to issue another for a database already at that version. Retirement is what keeps the
+ * state directory honest, not what keeps it safe.
  */
-export const consumeMigrationApproval = (databasePath: string, approval: MigrationApproval): void => {
-  const path = migrationApprovalPath(databasePath);
-  if (!existsSync(path)) return;
-  renameSync(
-    path,
-    join(
-      dirname(path),
-      `migration-approval.applied-v${approval.fromVersion}-v${approval.toVersion}-${Date.now()}.json`,
-    ),
-  );
+export const retireMigrationApproval = (
+  databasePath: string,
+  from: number,
+  to: number,
+): ApprovalRetirement => {
+  const approvalPath = migrationApprovalPath(databasePath);
+  if (!existsSync(approvalPath)) return { retired: true, approvalPath, error: null };
+  try {
+    renameSync(approvalPath, retiredApprovalPath(approvalPath, from, to));
+    return { retired: true, approvalPath, error: null };
+  } catch (error) {
+    return {
+      retired: false,
+      approvalPath,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+};
+
+/**
+ * The repair half of the same contract: an approval that outlived its own migration is retired
+ * the next time this database is opened at the build's version.
+ *
+ * Reached from the branch that does no migration at all, so it costs one `existsSync` on a path
+ * that normally does not exist, and it refuses nothing. An approval naming some *other*
+ * to-version is left alone and reported rather than filed away — this is a repair for
+ * bookkeeping that failed, not a sweep of anything it does not recognise.
+ */
+export const retireStaleMigrationApproval = (databasePath: string): ApprovalRetirement | null => {
+  const approvalPath = migrationApprovalPath(databasePath);
+  if (!existsSync(approvalPath)) return null;
+  let approval: MigrationApproval | null;
+  try {
+    approval = readMigrationApproval(databasePath);
+  } catch {
+    // Unreadable or malformed. `migration-plan` still shows the file; guessing at its contents
+    // in order to delete it is not a repair.
+    return { retired: false, approvalPath, error: "the approval on file could not be read" };
+  }
+  if (approval === null || approval.toVersion !== SCHEMA_VERSION) return null;
+  return retireMigrationApproval(databasePath, approval.fromVersion, approval.toVersion);
 };
 
 export const writeMigrationApproval = (
@@ -229,9 +306,14 @@ export const approveMigration = (databasePath: string, approvedBy: string): Migr
     });
   }
   const plan = migrationPlanFrom(fromVersion);
+  // Identity is taken before the snapshot and the snapshot records it independently, so the
+  // approval and its recovery point name the same target because the same call observed both —
+  // rather than because a later reader assumed they went together (#747).
+  const target = targetIdentityOf(databasePath);
   const backup = captureRollbackPointSync(databasePath);
   const approval: MigrationApproval = {
     format: MIGRATION_APPROVAL_FORMAT,
+    target,
     fromVersion: plan.fromVersion,
     toVersion: plan.toVersion,
     migrations: plan.migrations,

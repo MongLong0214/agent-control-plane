@@ -1,9 +1,10 @@
 import Database from "better-sqlite3";
 import { existsSync, realpathSync, statSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 
 import { acpError, fail, isAcpError, type Decision } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { SingleInstanceLock } from "../daemon/single-instance.ts";
 import {
   DEFAULT_BACKUP_RETENTION,
   assertIntegrity,
@@ -26,8 +27,10 @@ import {
 } from "./migrations.ts";
 import {
   assertMigrationApproved,
-  consumeMigrationApproval,
   migrationPlanFrom,
+  retireMigrationApproval,
+  retireStaleMigrationApproval,
+  type ApprovalRetirement,
   type MigrationApproval,
 } from "./migration-approval.ts";
 import {
@@ -35,6 +38,7 @@ import {
   ensurePrivateDirectory,
   finalizeNewPrivateDatabaseFiles,
 } from "./state-preflight.ts";
+import { targetIdentityOf } from "./target-identity.ts";
 
 export type SqliteDatabase = Database.Database;
 
@@ -251,6 +255,13 @@ export class Db {
    * approved it, rather than only in the schema ledger (#738).
    */
   appliedMigrationApproval: MigrationApproval | null = null;
+  /**
+   * Whether the spent approval was filed away, and why not when it was not. A failed rename is
+   * reported rather than thrown, so a committed migration is never reported as a failed start.
+   */
+  migrationApprovalRetirement: ApprovalRetirement | null = null;
+  /** The repair applied to an approval that outlived its own migration, when one was found. */
+  staleMigrationApprovalRetirement: ApprovalRetirement | null = null;
 
   constructor(filename: string, private readonly options: DbOpenOptions = {}) {
     const persistent = filename !== ":memory:";
@@ -376,6 +387,13 @@ export class Db {
         includeTelegramOwnerPrompts: true,
       });
       assertMigrationLedgerAt(this.#raw, version);
+      // #747, the repair half of the retirement contract. This branch is also the proof that a
+      // spent approval is inert: it returns without ever consulting one, so an approval left on
+      // disk by a failed rename authorises nothing. Filing it away here is what keeps the state
+      // directory from showing a permission that is no longer one.
+      if (filename !== ":memory:") {
+        this.staleMigrationApprovalRetirement = retireStaleMigrationApproval(this.file);
+      }
       return;
     }
     // #738 — the enforcement site, and the reason it is *here* rather than in the daemon's
@@ -389,12 +407,71 @@ export class Db {
     // returned above, so nothing that does not migrate reaches this.
     const approval = assertMigrationApproved(
       this.file,
+      targetIdentityOf(this.file),
       migrationPlanFrom(version),
       this.options.migrationApproval ?? null,
     );
-    this.migrate(filename, version);
-    consumeMigrationApproval(this.file, approval);
+    // #747 — the exclusivity a migration needs, acquired by the migration.
+    //
+    // The gate lives here because `ControlPlane`'s constructor opens the database before
+    // `Daemon.start()` runs; that is also why the daemon's single-instance lock is acquired
+    // *after* the point where the schema would already have changed. A second process could
+    // therefore rewrite the schema under a daemon that was holding the database, and only learn
+    // about the contention afterwards. The approval CLI's liveness pre-check does not close
+    // that ordering: it is a snapshot taken minutes earlier.
+    //
+    // So the migration takes the same lock the daemon takes, for exactly as long as it is
+    // migrating, and releases it before returning. `Daemon.start()` then acquires it normally.
+    // This is not a daemon-specific rule bolted onto a shared constructor — a schema migration
+    // is an exclusive operation whoever performs it, so the CLI and the verification scripts
+    // that reach this same line take it too, on their own state directory, where it is
+    // uncontended. An open that does not migrate never touches the lock.
+    this.withMigrationExclusivity(() => {
+      // Re-read under the lock. Everything above was decided without exclusivity, so a
+      // concurrent migration could have completed in between; a check whose result is used
+      // after the lock it was taken without is the defect this whole block is about.
+      const current = Number(this.#raw.pragma("user_version", { simple: true }));
+      if (current !== version) {
+        throw acpError(
+          ReasonCode.CONFLICT,
+          "the database schema changed while this process was acquiring migration exclusivity",
+          { expected: version, found: current, file: this.file },
+        );
+      }
+      this.migrate(filename, version);
+    });
     this.appliedMigrationApproval = approval;
+    this.migrationApprovalRetirement = retireMigrationApproval(
+      this.file,
+      approval.fromVersion,
+      approval.toVersion,
+    );
+  }
+
+  /**
+   * Runs `work` while holding the deployment's single-instance lock.
+   *
+   * The lock is the daemon's, deliberately: exclusivity that only excluded other migrations
+   * would still let a migration run under a live daemon holding the database. Contention is
+   * reported as `DAEMON_ALREADY_RUNNING` — an ordinary unsuccessful start that the supervisor
+   * is right to retry, because the holder may exit — and never as a migration refusal, which
+   * exits 0 and stays down.
+   */
+  private withMigrationExclusivity(work: () => void): void {
+    const lock = new SingleInstanceLock(join(dirname(this.file), "agentcpd.lock"));
+    const acquired = lock.acquire(new Date().toISOString());
+    if (!acquired.allowed) {
+      throw acpError(
+        acquired.reasonCode,
+        "refusing to migrate the schema while another process holds the state lock",
+        { file: this.file, ...acquired.evidence },
+      );
+    }
+    try {
+      work();
+    } finally {
+      lock.release();
+    }
   }
 
   private bootstrapFreshSchema(): void {

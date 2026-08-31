@@ -8,6 +8,7 @@ import { isAcpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { captureRollbackPointSync } from "../../src/db/backup.ts";
 import { SCHEMA_VERSION, openDb } from "../../src/db/database.ts";
+import { targetIdentityOf } from "../../src/db/target-identity.ts";
 import {
   MIGRATION_APPROVAL_FORMAT,
   approveMigration,
@@ -77,6 +78,7 @@ const approvalFor = (databasePath: string, overrides: Partial<MigrationApproval>
   const plan = migrationPlanFrom(11);
   writeMigrationApproval(databasePath, {
     format: MIGRATION_APPROVAL_FORMAT,
+    target: targetIdentityOf(databasePath),
     fromVersion: plan.fromVersion,
     toVersion: plan.toVersion,
     migrations: plan.migrations,
@@ -178,6 +180,23 @@ describe("an approval that does not name what would happen", () => {
     const refused = refusalFrom(databasePath);
 
     expect(refused.reasonCode).toBe(ReasonCode.SCHEMA_MIGRATION_NOT_APPROVED);
+    expect(schemaVersionOf(databasePath)).toBe(11);
+  }, 60_000);
+
+  it("is refused when its recovery point is an image of a different database at the same version", () => {
+    const databasePath = databaseAtV11();
+    const real = approveMigration(databasePath, "isaac");
+    // A different v11 database, in its own directory so approving it clobbers nothing. Its
+    // backup is intact, checksummed, and at exactly the version this migration starts from —
+    // every property the version and checksum checks look at — and it is an image of somebody
+    // else's data, which is what a rollback from it would restore.
+    const strayBackup = captureRollbackPointSync(databaseAtV11()).path;
+    approvalFor(databasePath, { migrations: real.migrations, backupPath: strayBackup });
+
+    const refused = refusalFrom(databasePath);
+
+    expect(refused.reasonCode).toBe(ReasonCode.SCHEMA_MIGRATION_NOT_APPROVED);
+    expect(refused.message).toContain("image of a different database");
     expect(schemaVersionOf(databasePath)).toBe(11);
   }, 60_000);
 

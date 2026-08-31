@@ -1027,6 +1027,9 @@ describe("baseline boundary contracts", () => {
       restored.close();
     }
 
+    // #747 — the rollback linked a staged image into place, so the restored database is a new
+    // inode that the failed attempt's approval no longer names. Retrying takes a fresh decision.
+    approveMigration(databasePath, "baseline-export fixture");
     const migrated = new Db(databasePath);
     try {
       expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
