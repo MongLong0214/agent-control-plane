@@ -128,6 +128,17 @@ const completed = (overrides: Record<string, unknown> = {}): Record<string, unkn
   ...overrides,
 });
 
+const aborted = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+  status: "ABORTED",
+  turnRequestId: receiptIdentity.turnRequestId,
+  sessionId: targetBindReceipt.requested_session_id,
+  ...receiptEvidence,
+  receiptId: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  evidenceDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  reasonCode: "HERMES_AGENT_RUN_EXCEPTION",
+  ...overrides,
+});
+
 const inFlight = (status: "PREPARED" | "CLAIMED"): Record<string, unknown> => ({
   status,
   turnRequestId: receiptIdentity.turnRequestId,
@@ -210,6 +221,7 @@ describe("bounded Hermes ACP client", () => {
       receiptId: canonicalDigest(receiptIdentity),
       evidenceDigest: rawUtf8Digest("exact Hermes bytes"),
       content: "exact Hermes bytes",
+      receiptIdentity,
     });
     expect(spawnOptions).toEqual({
       cwd: "/trusted/cwd",
@@ -224,6 +236,42 @@ describe("bounded Hermes ACP client", () => {
     });
     expect(child.stdin.endCalls).toBe(1);
     expect(child.killCalls).toBe(0);
+    expectNoResidue(child);
+  });
+
+  it("returns completed semantic identity from the terminal receipt rather than the input echo", async () => {
+    const child = new FakeChild();
+    const inputIdentity = { ...receiptIdentity };
+    const terminalIdentity = { ...inputIdentity };
+    connect(child, () => {
+      child.stdout.emitText(frame(2, terminalResult(completed({
+        receiptIdentity: terminalIdentity,
+        receiptIdentityDigest: canonicalDigest(terminalIdentity),
+      }))));
+      cleanClose(child);
+    });
+
+    const result = await runHermesAcp(request({ receiptIdentity: inputIdentity }), { spawn: () => child });
+
+    expect(result).toMatchObject({
+      status: "COMPLETED",
+      receiptIdentity: {
+        turnRequestId: terminalIdentity.turnRequestId,
+        targetActorId: terminalIdentity.targetActorId,
+        promptDigest: terminalIdentity.promptDigest,
+        bindingGeneration: terminalIdentity.bindingGeneration,
+        targetBindingId: terminalIdentity.targetBindingId,
+        targetAttestationId: terminalIdentity.targetAttestationId,
+        executorSessionId: terminalIdentity.executorSessionId,
+        executorSessionIncarnation: terminalIdentity.executorSessionIncarnation,
+      },
+    });
+    expect(result.status).toBe("COMPLETED");
+    if (result.status === "COMPLETED") {
+      expect(result.receiptIdentity).not.toBe(inputIdentity);
+      (inputIdentity as { targetAttestationId: string }).targetAttestationId = "changed-after-terminal-reply";
+      expect(result.receiptIdentity.targetAttestationId).toBe(terminalIdentity.targetAttestationId);
+    }
     expectNoResidue(child);
   });
 
@@ -376,7 +424,7 @@ describe("bounded Hermes ACP client", () => {
     ["CLAIMED", inFlight("CLAIMED"), "claimedAt", null],
     ["COMPLETED", completed(), "terminalMessageId", "42"],
   ] as const)("closes the exact %s schema for extra, missing, and wrong-type fields", async (_status, receipt, wrongKey, wrongValue) => {
-    const missing = { ...receipt };
+    const missing: Record<string, unknown> = { ...receipt };
     delete missing[wrongKey];
     const variants = [
       { ...receipt, unexpected: true },
@@ -395,14 +443,53 @@ describe("bounded Hermes ACP client", () => {
     }
   });
 
-  it("documents that ABORTED has no proven Hermes producer schema and stays fail closed", async () => {
+  it("returns terminal-attested Hermes abort evidence without content", async () => {
     const child = new FakeChild();
+    const inputIdentity = { ...receiptIdentity };
+    const terminalIdentity = { ...inputIdentity };
+    const receipt = aborted({
+      receiptIdentity: terminalIdentity,
+      receiptIdentityDigest: canonicalDigest(terminalIdentity),
+    });
     connect(child, () => {
-      child.stdout.emitText(frame(2, terminalResult({ status: "ABORTED" })));
+      child.stdout.emitText(frame(2, terminalResult(receipt)));
       cleanClose(child);
     });
 
-    await expect(runHermesAcp(request(), { spawn: () => child })).resolves.toEqual({ status: "FAILED", reason: "MALFORMED_TERMINAL_RECEIPT" });
+    const result = await runHermesAcp(request({ receiptIdentity: inputIdentity }), { spawn: () => child });
+
+    expect(result).toEqual({
+      status: "ABORTED",
+      receiptIdentity: terminalIdentity,
+      receiptId: receipt.receiptId,
+      evidenceDigest: receipt.evidenceDigest,
+      reasonCode: receipt.reasonCode,
+    });
+    expect(result).not.toHaveProperty("content");
+    expect(result.status).toBe("ABORTED");
+    if (result.status === "ABORTED") {
+      expect(result.receiptIdentity).not.toBe(inputIdentity);
+      (inputIdentity as { targetAttestationId: string }).targetAttestationId = "changed-after-terminal-reply";
+      expect(result.receiptIdentity.targetAttestationId).toBe(terminalIdentity.targetAttestationId);
+    }
+    expect(child.killCalls).toBe(0);
+    expectNoResidue(child);
+  });
+
+  it.each([
+    ["malformed", aborted({ assistantContent: "must not exist" }), "MALFORMED_TERMINAL_RECEIPT"],
+    ["mismatched", aborted({
+      receiptIdentity: { ...receiptIdentity, targetActorId: "actor:other" },
+      receiptIdentityDigest: canonicalDigest({ ...receiptIdentity, targetActorId: "actor:other" }),
+    }), "TERMINAL_RECEIPT_MISMATCH"],
+  ])("keeps %s ABORTED receipts fail closed", async (_kind, receipt, reason) => {
+    const child = new FakeChild();
+    connect(child, () => {
+      child.stdout.emitText(frame(2, terminalResult(receipt)));
+      cleanClose(child);
+    });
+
+    await expect(runHermesAcp(request(), { spawn: () => child })).resolves.toEqual({ status: "FAILED", reason });
     expectFailureShutdown(child);
   });
 

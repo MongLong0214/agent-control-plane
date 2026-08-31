@@ -51,7 +51,8 @@ export type HermesAcpInput = {
 };
 
 export type HermesAcpResult =
-  | { status: "COMPLETED"; receiptId: string; evidenceDigest: string; content: string }
+  | { status: "COMPLETED"; receiptIdentity: HermesAcpReceiptIdentity; receiptId: string; evidenceDigest: string; content: string }
+  | { status: "ABORTED"; receiptIdentity: HermesAcpReceiptIdentity; receiptId: string; evidenceDigest: string; reasonCode: string }
   | { status: "NEVER_FOUND" }
   | { status: "NOT_COMPLETED"; terminalStatus: "PREPARED" | "CLAIMED" | "NEVER_FOUND" | "REFUSED" }
   | { status: "FAILED"; reason: HermesAcpFailureReason };
@@ -143,6 +144,16 @@ const RECEIPT_PUBLIC_KEYS = [
 const PREPARED_KEYS = RECEIPT_PUBLIC_KEYS;
 const CLAIMED_KEYS = RECEIPT_PUBLIC_KEYS;
 const COMPLETED_KEYS = [...RECEIPT_PUBLIC_KEYS, "assistantContent"] as const;
+const ABORTED_KEYS = [
+  "status",
+  "turnRequestId",
+  "sessionId",
+  ...RECEIPT_EVIDENCE_KEYS,
+  "receiptId",
+  "evidenceDigest",
+  "reasonCode",
+] as const;
+const HERMES_ABORT_REASON_CODE = "HERMES_AGENT_RUN_EXCEPTION";
 const SHUTDOWN_GRACE_MS = 25;
 
 const isRecord = (value: unknown): value is JsonRecord =>
@@ -305,6 +316,27 @@ const terminalResult = (result: unknown, input: HermesAcpInput): HermesAcpResult
       ? { status: "NOT_COMPLETED", terminalStatus: status }
       : { status: "FAILED", reason: "TERMINAL_RECEIPT_MISMATCH" };
   }
+  if (status === "ABORTED") {
+    const returnedIdentity = asReceiptIdentity(terminal.receiptIdentity);
+    const reasonCode = terminal.reasonCode;
+    if (
+      !hasExactKeys(terminal, ABORTED_KEYS) ||
+      !nonEmpty(terminal.turnRequestId) || !nonEmpty(terminal.sessionId) ||
+      !isDigest(terminal.receiptId) || !isDigest(terminal.evidenceDigest) ||
+      reasonCode !== HERMES_ABORT_REASON_CODE || !receiptEvidenceIsWellTyped(terminal) ||
+      returnedIdentity === null
+    ) return { status: "FAILED", reason: "MALFORMED_TERMINAL_RECEIPT" };
+    if (!terminalMatchesRequest(terminal, input)) {
+      return { status: "FAILED", reason: "TERMINAL_RECEIPT_MISMATCH" };
+    }
+    return {
+      status: "ABORTED",
+      receiptIdentity: returnedIdentity,
+      receiptId: terminal.receiptId,
+      evidenceDigest: terminal.evidenceDigest,
+      reasonCode,
+    };
+  }
   if (status !== "COMPLETED") return { status: "FAILED", reason: "MALFORMED_TERMINAL_RECEIPT" };
   if (
     !hasExactKeys(terminal, COMPLETED_KEYS) ||
@@ -313,11 +345,16 @@ const terminalResult = (result: unknown, input: HermesAcpInput): HermesAcpResult
     !finiteNumber(terminal.createdAt) || !finiteNumber(terminal.claimedAt) || !finiteNumber(terminal.completedAt) ||
     typeof terminal.assistantContent !== "string" || !receiptEvidenceIsWellTyped(terminal)
   ) return { status: "FAILED", reason: "MALFORMED_TERMINAL_RECEIPT" };
-  if (!terminalMatchesRequest(terminal, input) || terminal.responseDigest !== rawUtf8Digest(terminal.assistantContent)) {
+  const returnedIdentity = asReceiptIdentity(terminal.receiptIdentity);
+  if (
+    returnedIdentity === null || !terminalMatchesRequest(terminal, input) ||
+    terminal.responseDigest !== rawUtf8Digest(terminal.assistantContent)
+  ) {
     return { status: "FAILED", reason: "TERMINAL_RECEIPT_MISMATCH" };
   }
   return {
     status: "COMPLETED",
+    receiptIdentity: returnedIdentity,
     receiptId: terminal.receiptIdentityDigest as string,
     evidenceDigest: terminal.responseDigest,
     content: terminal.assistantContent,
