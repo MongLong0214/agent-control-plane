@@ -331,13 +331,41 @@ non-empty, absolute, and a real file.
       echo "refusing: re-hash of $BACKUP_TMP no longer matches the recorded sha256" >&2; exit 1
     fi
 
-    # 7. Only now — every check above has passed — rename atomically to the final name. A failure
-    #    or interrupt anywhere above this line never leaves anything at $BACKUP_PATH for a later
-    #    step to mistake for a verified backup.
+    # 7. Publish — every check above has passed. Two runs sharing the same timestamp both pass
+    #    everything above independently and would both reach a plain `mv` to the same
+    #    `$BACKUP_PATH`; the second `mv` would silently overwrite the first run's already-verified
+    #    backup, because `mv` is not no-clobber. So ownership of the final name is claimed with
+    #    `mkdir`, which POSIX guarantees is atomic and fails `EEXIST` rather than replacing — at
+    #    most one of two racing runs ever wins this line, and the loser exits here, before it has
+    #    touched `$BACKUP_PATH` or its manifest at all.
+    RESERVATION="$BACKUP_DIR/.reserved-${BACKUP_NAME}"
+    CLAIMED=0
+    PUBLISHED=0
+    # Runs once, however this shell exits. A run that never claimed the reservation (the loser
+    # above) leaves this a no-op. A run that claimed it but did not finish publishing removes
+    # exactly what it itself may have already put at the final name — so a partial publish never
+    # leaves a database with no manifest, or a manifest with no database, sitting at
+    # `$BACKUP_PATH` for a later step to mistake for a verified backup.
+    publish_cleanup() {
+      if [ "$CLAIMED" = "1" ] && [ "$PUBLISHED" != "1" ]; then
+        rm -f "$BACKUP_PATH" "$BACKUP_PATH.manifest.json" "$BACKUP_TMP" "${BACKUP_TMP}.manifest.json"
+        rm -rf "$RESERVATION"
+      elif [ "$CLAIMED" = "1" ]; then
+        rmdir "$RESERVATION" 2>/dev/null || true
+      fi
+    }
+    trap publish_cleanup EXIT
+    if ! mkdir "$RESERVATION" 2>/dev/null; then
+      echo "refusing: another run already owns the final name $BACKUP_PATH" >&2
+      rm -f "$BACKUP_TMP" "${BACKUP_TMP}.manifest.json"
+      exit 1
+    fi
+    CLAIMED=1
     mv "$BACKUP_TMP" "$BACKUP_PATH"
     mv "${BACKUP_TMP}.manifest.json" "${BACKUP_PATH}.manifest.json"
     test -s "$BACKUP_PATH"
     test -s "$BACKUP_PATH.manifest.json"
+    PUBLISHED=1
     echo "backup verified: $BACKUP_PATH"
     cat "$BACKUP_PATH.manifest.json"
 

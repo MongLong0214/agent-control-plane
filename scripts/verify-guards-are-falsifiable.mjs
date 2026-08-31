@@ -3321,6 +3321,42 @@ const GUARDS = [
     killedBy: ["tests/process/the-database-backup-step-fails-closed.test.ts"],
   },
   {
+    // #745, CEO round 2: the destination check above runs once, before the backup, and does not
+    // close the window between that check and the final `mv` — which is not no-clobber. Two runs
+    // sharing a timestamp both pass that earlier check independently and then both reach the
+    // publish step; without an atomic claim on the final name, the second `mv` silently
+    // overwrites the first run's already-verified backup. Replacing the atomic, fail-closed
+    // `mkdir` claim with a `mkdir -p` (which never fails on an existing directory, granting no
+    // exclusivity at all) reproduces exactly that: both racing runs proceed to publish, so the
+    // named test's collision fixture — two real processes forced to the same final name by a
+    // pinned timestamp — sees zero refusals instead of exactly one.
+    what: "the database backup step claims the final name atomically so only one of two racing runs ever publishes",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    if ! mkdir "$RESERVATION" 2>/dev/null; then\n' +
+      '      echo "refusing: another run already owns the final name $BACKUP_PATH" >&2\n' +
+      '      rm -f "$BACKUP_TMP" "${BACKUP_TMP}.manifest.json"\n' +
+      "      exit 1\n" +
+      "    fi\n",
+    replace: '    mkdir -p "$RESERVATION" 2>/dev/null || true\n',
+    killedBy: ["tests/process/the-database-backup-step-fails-closed.test.ts"],
+  },
+  {
+    // #745, CEO round 2, second counterexample: publication is two independent `mv` calls (the
+    // database, then the manifest), so a failure between them can leave a database with no
+    // manifest at the final path. Deleting the cleanup line that removes what this run already
+    // published — while leaving the reservation directory's own removal intact — reproduces
+    // exactly that half-published shape: the named test's fixture fails the manifest `mv` after
+    // the database `mv` has already succeeded, and without this line the database survives alone
+    // at `$BACKUP_PATH` instead of the whole partial publish being unwound.
+    what: "the database backup step unwinds a partial publish so no database-without-manifest survives at the final path",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '        rm -f "$BACKUP_PATH" "$BACKUP_PATH.manifest.json" "$BACKUP_TMP" "${BACKUP_TMP}.manifest.json"\n',
+    replace: "",
+    killedBy: ["tests/process/the-database-backup-step-fails-closed.test.ts"],
+  },
+  {
     // #241 — the whole point of the acceptance readout. Forcing `observed` to true makes an
     // empty database compute accepted anomalies (all zero) and report OBSERVED_NO_ANOMALIES
     // instead of N/A: exactly the "0/PASS" shape the CEO ruling named as worse than the ceremony

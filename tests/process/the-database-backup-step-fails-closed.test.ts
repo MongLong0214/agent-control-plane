@@ -1,5 +1,5 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
@@ -33,6 +33,21 @@ afterAll(cleanupTempDirs);
  *   3. A backup taken while a second process is continuously writing to the source database
  *      completes with `integrity_check` = `ok`, and the source remains open and writable
  *      afterward — this is the whole reason the online backup API replaces a raw `cp`.
+ *
+ * A CEO review of an earlier version of this block (#745) found two further counterexamples
+ * about *publication*, not the backup itself, both still present at that point:
+ *
+ *   4. The destination-exists check above runs once, before the backup — it does not close the
+ *      window between that check and the final `mv`, which is not no-clobber. Two runs sharing
+ *      the same timestamp both pass every check independently and then both `mv` to the same
+ *      `$BACKUP_PATH`; the second silently overwrites the first run's already-verified backup.
+ *   5. The database and the manifest are published by two separate `mv` calls. A failure between
+ *      them leaves a database with no manifest at the final path — not the verified pair the
+ *      rest of this document treats `$BACKUP_PATH` as meaning.
+ *
+ * The corrected block claims the final name with `mkdir` (POSIX-atomic, fails `EEXIST` rather
+ * than replacing) before either `mv`, and unwinds anything it already published if it does not
+ * reach the end — so a partial publish leaves nothing at the final path at all.
  *
  * Safety: `HOME` is a disposable fixture directory for every case; nothing here reads or writes
  * `~/.agent-control-plane` or any real path.
@@ -121,6 +136,32 @@ const runExtractedBackup = (fixtureHome: string, path: string): RunResult => {
     stderr: proc.stderr,
   };
 };
+
+/**
+ * Same script, same shape as `runExtractedBackup`, but launched with the async `spawn` so two
+ * instances can genuinely run concurrently rather than one completing before the next starts.
+ */
+const spawnExtractedBackup = (fixtureHome: string, path: string): Promise<RunResult> =>
+  new Promise((resolve) => {
+    const child = spawn(BASH, ["-c", extractDatabaseBackupScript()], {
+      cwd: fixtureHome,
+      env: { HOME: fixtureHome, PATH: path },
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    child.on("error", (err) => {
+      resolve({ code: null, signal: null, spawnError: err, stdout, stderr });
+    });
+    child.on("close", (code, signal) => {
+      resolve({ code, signal, spawnError: undefined, stdout, stderr });
+    });
+  });
 
 const setUpFixtureHome = (root: string): { fixtureHome: string; dbPath: string } => {
   const fixtureHome = join(root, "home");
@@ -323,4 +364,131 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
     );
     expect(rowCountAfter).toBeGreaterThan(3);
   }, 20_000);
+
+  it("publishes atomically: two overlapping runs targeting the same final name — exactly one wins, and its artifact is byte-unchanged afterward", async () => {
+    const root = tempDir("acp-database-backup-collision-");
+    const { fixtureHome } = setUpFixtureHome(root);
+
+    // `date` stubbed to a fixed value, but only for the exact call the script makes to name the
+    // final destination — so two independent runs are forced to target the identical
+    // `$BACKUP_PATH`, deterministically, the way #745 asked for ("pin the timestamp so the
+    // collision is deterministic"), not by racing and hoping. Every other `date` invocation (the
+    // manifest's `createdAt`) passes straight through to the real binary.
+    const stubDir = join(root, "stub-bin");
+    mkdirSync(stubDir, { recursive: true });
+    const stubPath = join(stubDir, "date");
+    writeFileSync(
+      stubPath,
+      [
+        "#!/bin/bash",
+        'if [ "$1" = "-u" ] && [ "$2" = "+%Y%m%dT%H%M%SZ" ]; then',
+        '  echo "FIXEDSTAMP"',
+        "else",
+        '  exec /bin/date "$@"',
+        "fi",
+        "",
+      ].join("\n"),
+    );
+    chmodSync(stubPath, 0o755);
+
+    const path = minimalPath(stubDir);
+    const [r1, r2] = await Promise.all([
+      spawnExtractedBackup(fixtureHome, path),
+      spawnExtractedBackup(fixtureHome, path),
+    ]);
+
+    expect(r1.spawnError).toBeUndefined();
+    expect(r2.spawnError).toBeUndefined();
+    expect(r1.signal).toBeNull();
+    expect(r2.signal).toBeNull();
+
+    const results = [r1, r2];
+    const winners = results.filter((r) => r.code === 0);
+    const losers = results.filter((r) => r.code !== 0);
+    // Exactly one success and one collision — never both succeeding (the reservation guard
+    // removed, or absent) and never both failing (a defect of a different shape entirely).
+    expect(winners.length).toBe(1);
+    expect(losers.length).toBe(1);
+    const winner = winners[0];
+    const loser = losers[0];
+    if (winner === undefined || loser === undefined) {
+      throw new Error("expected exactly one winner and one loser");
+    }
+    expect(loser.stderr).toContain("already owns the final name");
+    expect(winner.stdout).toContain("backup verified:");
+
+    const winnerShaMatch = winner.stdout.match(/"backupSha256": "([0-9a-f]{64})"/);
+    if (winnerShaMatch === null) {
+      throw new Error("the winning run's stdout did not contain a backupSha256 to compare against");
+    }
+    const winnerSha256 = winnerShaMatch[1];
+
+    const backupsDir = join(fixtureHome, ".agent-control-plane", "backups");
+    const finalFile = join(backupsDir, "state-FIXEDSTAMP.sqlite");
+    const finalManifest = `${finalFile}.manifest.json`;
+    expect(existsSync(finalFile)).toBe(true);
+    expect(existsSync(finalManifest)).toBe(true);
+
+    const onDiskSha256 = execFileSync("shasum", ["-a", "256", finalFile], { encoding: "utf8" })
+      .trim()
+      .split(/\s+/)[0];
+    // The earlier (winning) run's artifact, byte-unchanged: the loser never got to overwrite it
+    // with its own (independently built, separately verified) copy.
+    expect(onDiskSha256).toBe(winnerSha256);
+
+    const integrity = execFileSync("sqlite3", [finalFile, "PRAGMA integrity_check;"], {
+      encoding: "utf8",
+    }).trim();
+    expect(integrity).toBe("ok");
+
+    // No reservation directory left behind claiming the name either.
+    const reservationListing = spawnSync(
+      "find",
+      [backupsDir, "-mindepth", "1", "-name", ".reserved-*"],
+      { encoding: "utf8" },
+    );
+    expect((reservationListing.stdout ?? "").trim()).toBe("");
+  });
+
+  it("leaves zero consumable backups at the final path when the manifest publish fails after the database publish succeeds", () => {
+    const root = tempDir("acp-database-backup-partial-publish-");
+    const { fixtureHome } = setUpFixtureHome(root);
+
+    // A `mv` stub that behaves exactly like the real one, except for the one call that publishes
+    // the manifest to its final name — injecting a failure strictly *after* the database's own
+    // `mv` to `$BACKUP_PATH` has already succeeded, per #745's required RED (b).
+    const stubDir = join(root, "stub-bin");
+    mkdirSync(stubDir, { recursive: true });
+    const stubPath = join(stubDir, "mv");
+    writeFileSync(
+      stubPath,
+      [
+        "#!/bin/bash",
+        'last="${@: -1}"',
+        'case "$last" in',
+        '  *.manifest.json) echo "stub: manifest publish failed" >&2; exit 1 ;;',
+        "esac",
+        'exec /bin/mv "$@"',
+        "",
+      ].join("\n"),
+    );
+    chmodSync(stubPath, 0o755);
+
+    const result = runExtractedBackup(fixtureHome, minimalPath(stubDir));
+
+    expect(result.spawnError).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("manifest publish failed");
+
+    // Zero consumable incomplete backups: no database-without-manifest (or the reverse) under
+    // the final naming pattern, and no reservation directory left claiming the name either — the
+    // failed run unwound exactly what it had already published.
+    const backupsDir = join(fixtureHome, ".agent-control-plane", "backups");
+    const survivors = spawnSync("find", [backupsDir, "-mindepth", "1"], { encoding: "utf8" })
+      .stdout.trim()
+      .split("\n")
+      .filter((line) => line.length > 0);
+    expect(survivors).toEqual([]);
+  });
 });
