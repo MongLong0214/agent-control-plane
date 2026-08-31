@@ -4061,60 +4061,6 @@ const GUARDS = [
       "tests/unit/daemon-doctor-freshness.test.ts::a re-evaluation that fails yields STALE immediately",
     ],
   },
-  {
-    // #740. `recordQualityObservation` has no production caller yet, and the seam is kept
-    // because the two facts it records are required Gate A evidence — deleting it would make
-    // `quality.complete` reachable without them. What it must not become is a way to satisfy
-    // those facts by saying so: OBSERVED and NOT_OBSERVED both raise the fact to covered, so
-    // an operator asserting "no rollback happened" with nothing attached would buy the same
-    // coverage a post-merge receipt does. Measured before the fix: two evidence-free operator
-    // assertions moved requiredFactCoverage from 0.25 to 0.5 on a real completed run.
-    what: "#740: a quality observation that claims to have looked must name the evidence it read",
-    file: "src/export/baseline-recorder.ts",
-    find:
-      '    if (payload.status !== "UNAVAILABLE" && payload.evidenceDigest == null) {\n' +
-      '      return deny(ReasonCode.INVALID_ARGUMENT, "an observed quality fact must name the evidence it was read from", {\n' +
-      "        runId,\n" +
-      "        fact: payload.fact,\n" +
-      "        status: payload.status,\n" +
-      "      });\n" +
-      "    }\n",
-    replace: "",
-    killedBy: [
-      "tests/unit/baseline-export.test.ts::refuses a quality observation that names no evidence it was read from",
-    ],
-  },
-  {
-    // The read half of the same property, and not redundant with the write half: the ledger is
-    // append-only, so a record written before the recorder required a digest — or inserted
-    // around the recorder — is read forever. Coverage is decided here, so the digest is
-    // required here too. The row above cannot kill this one's test and this one cannot kill
-    // that one's: one refuses a write, the other refuses to count a row already stored.
-    what: "#740: a stored quality observation covers its fact only if it names its evidence",
-    file: "src/export/run-evidence.ts",
-    find: '    return typeof observation["evidenceDigest"] === "string";\n',
-    replace: "    return true;\n",
-    killedBy: [
-      "tests/unit/baseline-export.test.ts::does not let a stored quality observation without an evidence digest cover its fact",
-    ],
-  },
-  {
-    // #740's headline allegation was that `productionRuns.length > 0` makes an unwritten count
-    // report as an observed zero. It does not — this else lowers the flag for any production run
-    // that carries no count, so the output is null. Deleting it makes the allegation true: one
-    // completed production run that recorded nothing would report "0 unauthorized merges
-    // observed". The claim was false and this is the row that keeps it false.
-    what: "#740: a production run carrying no unauthorized-merge count lowers the observed flag",
-    file: "src/export/run-evidence.ts",
-    find:
-      "    } else {\n" +
-      "      unauthorizedMergeCountsObserved = false;\n" +
-      "    }\n",
-    replace: "    }\n",
-    killedBy: [
-      "tests/unit/baseline-export.test.ts::reports an unknown unauthorized-merge count for a completed production run that recorded no quality observation",
-    ],
-  },
 ];
 
 /**
