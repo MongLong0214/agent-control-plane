@@ -18,7 +18,7 @@ const anAdmittedPayloadIsStoredWithItsRow = {
   find: "        JSON.stringify(request.payload ?? null),\n",
   replace: "        null,\n",
   killedBy: [
-    "tests/process/an-owner-message-outlives-the-process-that-lost-its-turn.test.ts::keeps the owner's own words readable from the file after Telegram's copy is spent",
+    "tests/process/an-owner-message-outlives-the-process-that-lost-its-turn.test.ts::holds Telegram's copy when restart finds an unresolved governed turn",
   ],
 };
 
