@@ -7,7 +7,6 @@ import {
   runInItsOwnProcess,
   MESSAGE_ID,
   PROMPT,
-  UPDATE_ID,
   type LoseReport,
   type NextMessageReport,
   type RecoverReport,
