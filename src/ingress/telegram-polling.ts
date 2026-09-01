@@ -321,11 +321,12 @@ type TelegramLongPollRouteProgress =
 type TelegramUpdateState =
   | { status: "RUNNING" }
   | { status: "RETRYABLE"; retryAt: number }
+  | { status: "HELD_UNRESOLVED" }
   | { status: "SETTLED" };
 
 type TelegramUpdateReservation =
   | { reserved: true }
-  | { reserved: false; retryInMs?: number };
+  | { reserved: false; retryInMs?: number; holdsOrderedOffset?: boolean };
 
 export type TelegramPollRoute =
   | { status: "COMPLETED"; outcome: TelegramRouteOutcome }
@@ -770,12 +771,17 @@ export class TelegramLongPollService {
     });
     const routes: TelegramPollRoute[] = [];
     let retryInMs: number | undefined;
+    let heldUnresolvedUpdate = false;
     for (const update of updates) {
       if (this.#offset !== undefined && update.update_id < this.#offset) continue;
       const reservation = this.reserveUpdate(update.update_id);
       if (!reservation.reserved) {
         if (reservation.retryInMs !== undefined) {
           retryInMs = Math.min(retryInMs ?? reservation.retryInMs, reservation.retryInMs);
+        }
+        if (reservation.holdsOrderedOffset) {
+          heldUnresolvedUpdate = true;
+          break;
         }
         continue;
       }
@@ -787,9 +793,11 @@ export class TelegramLongPollService {
             // `getUpdates(offset)` is Telegram's deletion acknowledgement. A replayed claimed
             // turn has no governed completion — its handler may have run before the crash — so a
             // null reply must not turn that uncertainty into a silent acknowledgement. Keep this
-            // event id retryable (and therefore coalesced by `reserveUpdate`) but do not route a
-            // later id in the same ordered batch past it.
-            this.retryUpdate(update.update_id);
+            // event id held by this listener (rather than ordinarily retryable) so elapsed retry
+            // delay cannot admit a second receipt lookup. A restart gets a fresh local hold and
+            // is the next reconciliation attempt; do not route a later id in this batch past it.
+            this.holdUnresolvedUpdate(update.update_id);
+            heldUnresolvedUpdate = true;
             routes.push(progress);
             break;
           }
@@ -830,7 +838,12 @@ export class TelegramLongPollService {
     // A pending CEO turn has been accepted into a tracked task before incidental outbound prompts
     // run. Managed routes and owner decisions still finish here; only the CEO call leaves the poll.
     if (!this.#terminalDeliveryError) await this.deliverOwnerGatePrompts();
-    if (routes.length === 0 && updates.length > 0) {
+    if (heldUnresolvedUpdate) {
+      // A held update is returned immediately while its ordered acknowledgement remains behind an
+      // unresolved durable claim. The hold, not this delay, prevents re-admission; the delay only
+      // keeps this live listener from hot-polling its known unresolved head-of-line update.
+      await delay(this.options.retryDelayMs ?? 5_000);
+    } else if (routes.length === 0 && updates.length > 0) {
       if (retryInMs !== undefined) {
         // A detached CEO failure no longer reaches loop()'s catch. Its update-local deadline is the
         // replacement observer: keep the held offset, but do not ask Telegram for this update in
@@ -1022,6 +1035,13 @@ export class TelegramLongPollService {
     if (!Number.isSafeInteger(updateId)) return { reserved: true };
     const state = this.#updateStates.get(updateId);
     if (state?.status === "RUNNING" || state?.status === "SETTLED") return { reserved: false };
+    if (state?.status === "HELD_UNRESOLVED") {
+      return {
+        reserved: false,
+        retryInMs: this.options.retryDelayMs ?? 5_000,
+        holdsOrderedOffset: true,
+      };
+    }
     if (state?.status === "RETRYABLE") {
       const retryInMs = state.retryAt - Date.now();
       if (retryInMs > 0) return { reserved: false, retryInMs };
@@ -1041,6 +1061,17 @@ export class TelegramLongPollService {
    */
   private holdsOffsetForUnresolvedTurn(outcome: TelegramRouteOutcome): boolean {
     return outcome.reply === null && outcome.reasonCode === ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN;
+  }
+
+  /**
+   * An unverified Hermes result has no listener-local retry deadline. Retrying it would perform
+   * another receipt lookup without a process boundary, whereas a restart deliberately creates the
+   * next reconciliation attempt with a fresh reservation map.
+   */
+  private holdUnresolvedUpdate(updateId: number): void {
+    if (Number.isSafeInteger(updateId)) {
+      this.#updateStates.set(updateId, { status: "HELD_UNRESOLVED" });
+    }
   }
 
   private retryUpdate(updateId: number, error?: unknown): void {
