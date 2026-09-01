@@ -2370,15 +2370,16 @@ const v36: SchemaMigration = {
     );
 
     for (const row of claims) {
-      let claim: Record<string, unknown>;
-      try {
-        const parsed = JSON.parse(row.turn_claim_json) as unknown;
-        if (!isRecord(parsed)) v36BackfillFailure(row.channel, row.nonce, "CLAIM_INVALID");
-        claim = parsed;
-      } catch (error) {
-        if (isAcpError(error)) throw error;
-        v36BackfillFailure(row.channel, row.nonce, "CLAIM_CORRUPT");
-      }
+      const claim = (() => {
+        try {
+          const parsed = JSON.parse(row.turn_claim_json) as unknown;
+          if (isRecord(parsed)) return parsed;
+          return v36BackfillFailure(row.channel, row.nonce, "CLAIM_INVALID");
+        } catch (error) {
+          if (isAcpError(error)) throw error;
+          return v36BackfillFailure(row.channel, row.nonce, "CLAIM_CORRUPT");
+        }
+      })();
       if (
         claim["deliveryStatus"] !== "TURN_CLAIMED"
         || !nonEmptyString(claim["turnRequestId"])
@@ -2409,7 +2410,7 @@ const v36: SchemaMigration = {
       if (source.turn_request_id !== claim["turnRequestId"]) {
         v36BackfillFailure(row.channel, row.nonce, "SOURCE_TURN_MISMATCH");
       }
-      const canonical: unknown = {
+      const canonicalCandidate: unknown = {
         turnRequestId: source.turn_request_id,
         targetActorId: source.target_actor_id,
         promptDigest: source.prompt_digest,
@@ -2419,9 +2420,9 @@ const v36: SchemaMigration = {
         executorSessionId: source.executor_session_id,
         executorSessionIncarnation: source.executor_session_incarnation,
       };
-      if (!isInboundReceiptIdentity(canonical)) {
-        v36BackfillFailure(row.channel, row.nonce, "CANONICAL_IDENTITY_INVALID");
-      }
+      const canonical = isInboundReceiptIdentity(canonicalCandidate)
+        ? canonicalCandidate
+        : v36BackfillFailure(row.channel, row.nonce, "CANONICAL_IDENTITY_INVALID");
       if (claim["promptDigest"] !== canonical.promptDigest) {
         v36BackfillFailure(row.channel, row.nonce, "PROMPT_DIGEST_MISMATCH");
       }
