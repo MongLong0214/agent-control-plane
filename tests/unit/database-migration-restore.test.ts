@@ -23,6 +23,7 @@ import {
   replayDdlWithoutPostV12Columns,
   schemaSql,
 } from "../../src/db/migrations.ts";
+import { digestOf } from "../../src/core/digest.ts";
 import { isAcpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { systemClock } from "../../src/core/clock.ts";
@@ -461,6 +462,174 @@ const asV34Fixture = (path: string, options: { unresolvedTurn?: boolean } = {}):
   }
 };
 
+const V35_RECEIPT_IDENTITY = {
+  turnRequestId: "turn:v35-legacy",
+  targetActorId: "actor:v35-legacy",
+  promptDigest: `sha256:${"d".repeat(64)}`,
+  bindingGeneration: 7,
+  targetBindingId: "binding:v35-legacy",
+  targetAttestationId: "attestation:v35-legacy",
+  executorSessionId: "session:v35-legacy",
+  executorSessionIncarnation: "incarnation:v35-legacy",
+} as const;
+
+const V35_UNBOUND_TURN_CLAIM = JSON.stringify({
+  deliveryStatus: "TURN_CLAIMED",
+  turnRequestId: V35_RECEIPT_IDENTITY.turnRequestId,
+  sessionDigest: `sha256:${"c".repeat(64)}`,
+  promptDigest: V35_RECEIPT_IDENTITY.promptDigest,
+  bindingDigest: digestOf({ bindingGeneration: V35_RECEIPT_IDENTITY.bindingGeneration }),
+});
+
+const seedV35CanonicalTurn = (
+  raw: Database.Database,
+  identity: typeof V35_RECEIPT_IDENTITY,
+  source: { channel: string; nonce: string; attempt: number; predecessorTurnRequestId: string | null },
+): void => {
+  raw.prepare(
+    `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
+     VALUES (?, ?, 'fixture', 'fixture', 'READY', ?, ?)`,
+  ).run(identity.executorSessionId, identity.executorSessionIncarnation, NOW, NOW);
+  raw.prepare(
+    `INSERT INTO conversational_actors
+       (actor_id, kind, current_session_id, current_session_incarnation, created_at)
+     VALUES (?, 'CEO', ?, ?, ?)`,
+  ).run(identity.targetActorId, identity.executorSessionId, identity.executorSessionIncarnation, NOW);
+  raw.prepare(
+    `INSERT INTO actor_target_bindings
+       (target_binding_id, target_actor_id, executor_kind, target_locator, target_locator_digest, bound_at)
+     VALUES (?, ?, 'hermes', ?, ?, ?)`,
+  ).run(
+    identity.targetBindingId,
+    identity.targetActorId,
+    `target:${identity.targetActorId}`,
+    `sha256:${identity.targetActorId.replace(/[^a-z]/g, "a").padEnd(64, "a").slice(0, 64)}`,
+    NOW,
+  );
+  raw.prepare(
+    `INSERT INTO assignments
+       (assignment_id, role_key, role, actor_id, session_id, session_incarnation,
+        binding_generation, mode, status, created_at)
+     VALUES (?, ?, 'CEO', ?, ?, ?, ?, 'PREFERRED', 'ACTIVE', ?)`,
+  ).run(
+    `assignment:${identity.turnRequestId}`,
+    `CEO:${identity.targetActorId}`,
+    identity.targetActorId,
+    identity.executorSessionId,
+    identity.executorSessionIncarnation,
+    identity.bindingGeneration,
+    NOW,
+  );
+  raw.prepare(
+    `INSERT INTO actor_target_attestations
+       (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
+        executor_session_id, executor_session_incarnation, binding_generation, assignment_id, attested_at)
+     VALUES (?, ?, 'hermes.target-bind/v1', ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    identity.targetAttestationId,
+    identity.targetBindingId,
+    `sha256:${identity.targetAttestationId.replace(/[^a-z]/g, "b").padEnd(64, "b").slice(0, 64)}`,
+    identity.executorSessionId,
+    identity.executorSessionIncarnation,
+    identity.bindingGeneration,
+    `assignment:${identity.turnRequestId}`,
+    NOW,
+  );
+  const auditEventId = Number(raw.prepare(
+    "INSERT INTO audit_events (at, kind, evidence_json) VALUES (?, 'V35_FIXTURE_CLAIM', '{}')",
+  ).run(NOW).lastInsertRowid);
+  raw.prepare(
+    `INSERT INTO canonical_turns
+       (turn_request_id, target_actor_id, target_binding_id, target_attestation_id,
+        executor_session_id, executor_session_incarnation, binding_generation, prompt_digest,
+        claimed_at, claim_audit_event_id, lifecycle_state)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'IN_DOUBT')`,
+  ).run(
+    identity.turnRequestId,
+    identity.targetActorId,
+    identity.targetBindingId,
+    identity.targetAttestationId,
+    identity.executorSessionId,
+    identity.executorSessionIncarnation,
+    identity.bindingGeneration,
+    identity.promptDigest,
+    NOW,
+    auditEventId,
+  );
+  raw.prepare(
+    `INSERT INTO canonical_turn_sources
+       (turn_request_id, source_channel, source_nonce, source_attempt, batch_ordinal,
+        source_digest, predecessor_turn_request_id, admission_audit_event_id)
+     VALUES (?, ?, ?, ?, 0, ?, ?, ?)`,
+  ).run(
+    identity.turnRequestId,
+    source.channel,
+    source.nonce,
+    source.attempt,
+    `sha256:${"e".repeat(64)}`,
+    source.predecessorTurnRequestId,
+    auditEventId,
+  );
+};
+
+/** A v35 claim with no bound receipt identity and an exact canonical-ledger source. */
+const asV35IngressClaimFixture = (
+  path: string,
+  shape: "matched" | "mismatched" | "ambiguous" = "matched",
+): void => {
+  const current = new Db(path);
+  current.close();
+
+  const raw = new Database(path);
+  try {
+    // v36 owns this guard. A current-schema file wound back to v35 must not receive it early.
+    raw.exec("DROP TRIGGER IF EXISTS inbound_messages_turn_claim_identity_immutable");
+    raw.function("acp_schema_migration_authorized", () => 1);
+    raw.exec("DROP TRIGGER schema_migrations_immutable; DROP TRIGGER schema_migrations_no_delete;");
+    raw.exec("DELETE FROM schema_migrations");
+    const v35 = MIGRATIONS.find((migration) => migration.toVersion === 35);
+    if (!v35) throw new Error("v35 migration is absent from the ordered registry");
+    raw.prepare(
+      "INSERT INTO schema_migrations (version, migration_id, checksum, applied_at) VALUES (?, ?, ?, ?)",
+    ).run(35, v35.id, v35.checksum(), NOW);
+    installMigrationLedger(raw);
+
+    seedV35CanonicalTurn(raw, V35_RECEIPT_IDENTITY, {
+      channel: "telegram",
+      nonce: "update:v35-legacy",
+      attempt: 1,
+      predecessorTurnRequestId: null,
+    });
+    if (shape === "ambiguous") {
+      seedV35CanonicalTurn(raw, {
+        ...V35_RECEIPT_IDENTITY,
+        turnRequestId: "turn:v35-ambiguous",
+        targetActorId: "actor:v35-ambiguous",
+        targetBindingId: "binding:v35-ambiguous",
+        targetAttestationId: "attestation:v35-ambiguous",
+        executorSessionId: "session:v35-ambiguous",
+        executorSessionIncarnation: "incarnation:v35-ambiguous",
+      }, {
+        channel: "telegram",
+        nonce: "update:v35-legacy",
+        attempt: 2,
+        predecessorTurnRequestId: V35_RECEIPT_IDENTITY.turnRequestId,
+      });
+    }
+    const turnClaim = shape === "mismatched"
+      ? JSON.stringify({ ...JSON.parse(V35_UNBOUND_TURN_CLAIM), turnRequestId: "turn:v35-mismatched" })
+      : V35_UNBOUND_TURN_CLAIM;
+    raw.prepare(
+      `INSERT INTO inbound_messages (channel, nonce, actor, received_at, turn_claim_json, payload_json)
+       VALUES ('telegram', 'update:v35-legacy', '424242', ?, ?, '{"text":"legacy"}')`,
+    ).run(NOW, turnClaim);
+    raw.pragma("user_version = 35");
+  } finally {
+    raw.close();
+    asPrivateStateFile(path);
+  }
+};
+
 const fileSha256 = (path: string): string =>
   `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
 
@@ -516,6 +685,116 @@ const assertEmptyActorRegistry = (db: Db): void => {
 };
 
 describe("versioned SQLite migration", () => {
+  it("backfills a v35 unresolved claim from its exact canonical ledger before freezing receipt identity", () => {
+    const path = join(tempDir("acp-v35-ingress-receipt-backfill-"), "state.sqlite");
+    asV35IngressClaimFixture(path);
+
+    const migrated = new Db(path);
+    try {
+      const row = migrated.get<{ turn_claim_json: string }>(
+        "SELECT turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'update:v35-legacy'",
+      );
+      expect(JSON.parse(row?.turn_claim_json ?? "{}") as { receiptIdentity?: unknown }).toEqual(
+        expect.objectContaining({ receiptIdentity: V35_RECEIPT_IDENTITY }),
+      );
+      expect(migrated.get<{ migration_id: string }>(
+        "SELECT migration_id FROM schema_migrations WHERE version = ?",
+        [SCHEMA_VERSION],
+      )).toEqual({ migration_id: "v36-backfill-ingress-receipt-identities-before-freezing-claims" });
+    } finally {
+      migrated.close();
+    }
+
+    // A second, default SQLite connection proves the guard is a database property, not Db's
+    // translated error surface or a connection-local marker. The legitimate lifecycle write is
+    // deliberately the same json_set form production uses.
+    const raw = new Database(path);
+    try {
+      expect(() => raw.prepare(
+        `UPDATE inbound_messages
+            SET turn_claim_json = json_set(turn_claim_json, '$.receiptIdentity.targetActorId', 'actor:forged')
+          WHERE channel = 'telegram' AND nonce = 'update:v35-legacy'`,
+      ).run()).toThrow(/INBOUND_TURN_CLAIM_IDENTITY_IMMUTABLE/);
+      expect(() => raw.prepare(
+        `UPDATE inbound_messages
+            SET turn_claim_json = json_set(turn_claim_json, '$.noReplyAt', ?)
+          WHERE channel = 'telegram' AND nonce = 'update:v35-legacy'`,
+      ).run(NOW)).not.toThrow();
+      expect(JSON.parse((raw.prepare(
+        "SELECT turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'update:v35-legacy'",
+      ).get() as { turn_claim_json: string }).turn_claim_json)).toMatchObject({
+        receiptIdentity: V35_RECEIPT_IDENTITY,
+        noReplyAt: NOW,
+      });
+    } finally {
+      raw.close();
+    }
+
+    const fresh = new Db(join(tempDir("acp-fresh-ingress-receipt-identity-guard-"), "state.sqlite"));
+    try {
+      expect(fresh.get<{ name: string }>(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = 'inbound_messages_turn_claim_identity_immutable'",
+      )).toEqual({ name: "inbound_messages_turn_claim_identity_immutable" });
+    } finally {
+      fresh.close();
+    }
+  });
+
+  it("refuses mismatched or ambiguous v35 claim mappings before mutation", () => {
+    for (const [shape, reason] of [
+      ["mismatched", "SOURCE_TURN_MISMATCH"],
+      ["ambiguous", "SOURCE_MAPPING_AMBIGUOUS"],
+    ] as const) {
+      const path = join(tempDir(`acp-v35-ingress-receipt-${shape}-`), "state.sqlite");
+      asV35IngressClaimFixture(path, shape);
+      const before = new Database(path, { readonly: true, fileMustExist: true });
+      let claimHex: string;
+      try {
+        expect(Number(before.pragma("user_version", { simple: true }))).toBe(35);
+        claimHex = (before.prepare(
+          "SELECT hex(turn_claim_json) AS claim_hex FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'update:v35-legacy'",
+        ).get() as { claim_hex: string }).claim_hex;
+        expect(before.prepare(
+          "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'inbound_messages_turn_claim_identity_immutable'",
+        ).get()).toBeUndefined();
+      } finally {
+        before.close();
+      }
+
+      let migrationFailure: unknown;
+      try {
+        new Db(path);
+      } catch (error) {
+        migrationFailure = error;
+      }
+      expect(isAcpError(migrationFailure)).toBe(true);
+      if (!isAcpError(migrationFailure)) throw new Error(`v36 unexpectedly opened the ${shape} v35 fixture`);
+      expect(migrationFailure).toMatchObject({
+        reasonCode: ReasonCode.INTERNAL_ERROR,
+        message: "migration failed; the original database was restored from its automatic backup",
+        evidence: expect.objectContaining({
+          fromVersion: 35,
+          migrationError: expect.stringContaining(
+            `channel=telegram nonce=update:v35-legacy reason=${reason}`,
+          ),
+        }),
+      });
+
+      const after = new Database(path, { readonly: true, fileMustExist: true });
+      try {
+        expect(Number(after.pragma("user_version", { simple: true }))).toBe(35);
+        expect((after.prepare(
+          "SELECT hex(turn_claim_json) AS claim_hex FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'update:v35-legacy'",
+        ).get() as { claim_hex: string }).claim_hex).toBe(claimHex);
+        expect(after.prepare(
+          "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'inbound_messages_turn_claim_identity_immutable'",
+        ).get()).toBeUndefined();
+      } finally {
+        after.close();
+      }
+    }
+  });
+
   it("refuses a v34 unresolved turn before v35 can add an unrecoverable admitted-payload state", () => {
     const path = join(tempDir("acp-v34-unrecoverable-unresolved-turn-"), "state.sqlite");
     asV34Fixture(path, { unresolvedTurn: true });
@@ -839,7 +1118,8 @@ describe("versioned SQLite migration", () => {
         [32, "v32-a-source-can-only-cite-its-turns-own-claim-event"],
         [33, "v33-back-up-before-telegram-settlement-state"],
         [34, "v34-persist-hermes-target-bind-receipt-evidence"],
-        [SCHEMA_VERSION, "v35-keep-the-admitted-payload-with-its-inbound-row"],
+        [35, "v35-keep-the-admitted-payload-with-its-inbound-row"],
+        [SCHEMA_VERSION, "v36-backfill-ingress-receipt-identities-before-freezing-claims"],
       ]);
       // Stated as properties rather than one `objectContaining` per version. The list above
       // already pins the exact order and ids; this block only ever said "every receipt carries a

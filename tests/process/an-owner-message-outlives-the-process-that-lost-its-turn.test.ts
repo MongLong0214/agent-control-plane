@@ -15,26 +15,17 @@ import {
 } from "./fixtures/an-owner-message-across-a-restart.ts";
 
 /**
- * #631: an inbound update is persisted before the offset advances — the *update*, not only its
- * key.
+ * A redelivered update whose earlier claimed turn has no governed completion is not a replay that
+ * the poller may acknowledge away. `deniedOrReplay` intentionally returns no reply for
+ * `INGRESS_TURN_OUTCOME_UNKNOWN`: sending an apology would incorrectly turn an unknown CEO turn
+ * into an answer. The poller must therefore hold Telegram's offset as well — otherwise the
+ * restarted process has silently spent the only transport copy before any matched completion.
  *
- * Before this, `inbound_messages` held a nonce, an actor, a timestamp, a reply lifecycle and a
- * turn claim, and nothing that says what the owner wrote. The only copy of the words was
- * Telegram's, and the restart path spends it: a redelivered update whose turn is unresolved is
- * refused `INGRESS_TURN_OUTCOME_UNKNOWN`, `deniedOrReplay` returns `reply: null`, and the poller
- * calls `completeUpdate` on it — which advances the offset, which is how ACP tells Telegram to
- * drop it. No answer was sent and no copy was kept, so the owner's message becomes
- * indistinguishable from one they never wrote. That is this issue's headline sentence, reached
- * through the restart rather than through the offset outrunning a running turn — #630's ordered
- * queue closed the second route and left this one, which is what its own comment says.
- *
- * Three real processes, because that is the boundary: the first dies holding a claim, the second
- * is the daemon coming back up and spending Telegram's copy, and the third asks the file alone
- * what is left. An in-process rehearsal of the same sentence cannot fail — the words are still in
- * a variable.
+ * Three real processes make the restart boundary observable: the first dies holding the claim,
+ * the second polls the same update, and the third proves the durable inbox still identifies it.
  */
 describe("an owner message outlives the process that lost its turn", () => {
-  it("keeps the owner's own words readable from the file after Telegram's copy is spent", () => {
+  it("holds Telegram's copy when restart finds an unresolved governed turn", () => {
     const lost = runInItsOwnProcess<LoseReport>("lose");
     try {
       // The dying process really did take the turn: this is the mid-turn state, not a message
@@ -44,16 +35,15 @@ describe("an owner message outlives the process that lost its turn", () => {
       const restarted = runInItsOwnProcess<RedeliverReport>("redeliver", lost.root);
       expect(restarted.pid, "the restart ran in the dead process").not.toBe(lost.pid);
 
-      // The restart tells the owner nothing and confirms the update away in the same poll. Both
-      // halves are asserted: an offset that advanced while a reply was sent would be an answer,
-      // and a silent poll that held the offset would still have Telegram's copy.
+      // The restart sends no answer and does not confirm the update away. The unresolved claim
+      // has no matched governed completion, so either action would silently close an unknown turn.
       expect(restarted.sent, "the restart answered the owner").toEqual([]);
       expect(
         restarted.offsetAfter,
-        "the restart held the offset, so Telegram still has the owner's message",
-      ).toBe(UPDATE_ID + 1);
+        "the restart advanced the offset without a governed completion",
+      ).toBeNull();
 
-      // Telegram's copy is gone. Everything the owner said now has to come out of the file.
+      // The durable inbox still identifies the unresolved turn, including its original payload.
       const recovered = runInItsOwnProcess<RecoverReport>(
         "recover",
         lost.databasePath,

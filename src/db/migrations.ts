@@ -4,11 +4,12 @@ import { fileURLToPath } from "node:url";
 
 import type Database from "better-sqlite3";
 
-import { acpError } from "../core/errors.ts";
+import { digestOf } from "../core/digest.ts";
+import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 35;
+export const SCHEMA_VERSION = 36;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -110,6 +111,9 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   // Same reason as the trigger above, and the same owner: `INSERT OR REPLACE` is the other half
   // of write-once, and v35 creates both or neither.
   /-- CP-HI-06 — same census, same hole as the rows above[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_no_replace[\s\S]*?\nEND;/,
+  // `turn_claim_json` does not exist before v30. v36 must create this guard only after every
+  // legacy claim has been validated and, where exact ledger evidence exists, backfilled.
+  /-- CP-HI-06 — a claimed ingress turn's target tuple is historical evidence[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_turn_claim_identity_immutable[\s\S]*?\nEND;/,
 ];
 
 /**
@@ -2281,6 +2285,179 @@ const v35: SchemaMigration = {
   checksum: () => migrationChecksum("v35-keep-the-admitted-payload-with-its-inbound-row"),
 };
 
+interface InboundReceiptIdentity {
+  turnRequestId: string;
+  targetActorId: string;
+  promptDigest: string;
+  bindingGeneration: number;
+  targetBindingId: string;
+  targetAttestationId: string;
+  executorSessionId: string;
+  executorSessionIncarnation: string;
+}
+
+const nonEmptyString = (value: unknown): value is string =>
+  typeof value === "string" && value.trim().length > 0;
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const isInboundReceiptIdentity = (value: unknown): value is InboundReceiptIdentity =>
+  isRecord(value)
+  && nonEmptyString(value["turnRequestId"])
+  && nonEmptyString(value["targetActorId"])
+  && nonEmptyString(value["promptDigest"])
+  && typeof value["bindingGeneration"] === "number"
+  && Number.isSafeInteger(value["bindingGeneration"])
+  && value["bindingGeneration"] > 0
+  && nonEmptyString(value["targetBindingId"])
+  && nonEmptyString(value["targetAttestationId"])
+  && nonEmptyString(value["executorSessionId"])
+  && nonEmptyString(value["executorSessionIncarnation"]);
+
+const sameInboundReceiptIdentity = (left: InboundReceiptIdentity, right: InboundReceiptIdentity): boolean =>
+  left.turnRequestId === right.turnRequestId
+  && left.targetActorId === right.targetActorId
+  && left.promptDigest === right.promptDigest
+  && left.bindingGeneration === right.bindingGeneration
+  && left.targetBindingId === right.targetBindingId
+  && left.targetAttestationId === right.targetAttestationId
+  && left.executorSessionId === right.executorSessionId
+  && left.executorSessionIncarnation === right.executorSessionIncarnation;
+
+const v36BackfillFailure = (channel: string, nonce: string, reason: string): never => {
+  throw acpError(
+    ReasonCode.INTERNAL_ERROR,
+    `v36 cannot backfill ingress receipt identity channel=${channel} nonce=${nonce} reason=${reason}`,
+    { channel, nonce, reason },
+  );
+};
+
+/**
+ * Binds pre-v36 unresolved ingress claims to the ledger that already says exactly what they ran.
+ *
+ * This reads the row's own turnRequestId and its exact source relation. It deliberately never asks
+ * the current CEO binding: a failover may have moved that binding since the claim, and a receipt
+ * for the replacement runtime is not evidence about the historical turn. Every rejection happens
+ * before the first UPDATE or CREATE TRIGGER, so the migration transaction remains inspectable and
+ * the outer migration backup restores the original image unchanged.
+ */
+const v36: SchemaMigration = {
+  id: "v36-backfill-ingress-receipt-identities-before-freezing-claims",
+  fromVersion: 35,
+  toVersion: 36,
+  apply: (raw) => {
+    const claims = raw.prepare(
+      `SELECT channel, nonce, turn_claim_json
+         FROM inbound_messages
+        WHERE turn_claim_json IS NOT NULL
+        ORDER BY channel, nonce`,
+    ).all() as Array<{ channel: string; nonce: string; turn_claim_json: string }>;
+    const updates: Array<{ channel: string; nonce: string; original: string; replacement: string }> = [];
+    const sourcesFor = raw.prepare(
+      `SELECT s.turn_request_id,
+              t.target_actor_id,
+              t.prompt_digest,
+              t.binding_generation,
+              t.target_binding_id,
+              t.target_attestation_id,
+              t.executor_session_id,
+              t.executor_session_incarnation
+         FROM canonical_turn_sources s
+         JOIN canonical_turns t ON t.turn_request_id = s.turn_request_id
+        WHERE s.source_channel = ? AND s.source_nonce = ?
+        ORDER BY s.source_attempt`,
+    );
+
+    for (const row of claims) {
+      let claim: Record<string, unknown>;
+      try {
+        const parsed = JSON.parse(row.turn_claim_json) as unknown;
+        if (!isRecord(parsed)) v36BackfillFailure(row.channel, row.nonce, "CLAIM_INVALID");
+        claim = parsed;
+      } catch (error) {
+        if (isAcpError(error)) throw error;
+        v36BackfillFailure(row.channel, row.nonce, "CLAIM_CORRUPT");
+      }
+      if (
+        claim["deliveryStatus"] !== "TURN_CLAIMED"
+        || !nonEmptyString(claim["turnRequestId"])
+        || !nonEmptyString(claim["sessionDigest"])
+        || !nonEmptyString(claim["promptDigest"])
+        || !nonEmptyString(claim["bindingDigest"])
+      ) {
+        v36BackfillFailure(row.channel, row.nonce, "CLAIM_INVALID");
+      }
+      const unresolved = claim["repliedAt"] === undefined
+        && claim["settledAt"] === undefined
+        && claim["noReplyAt"] === undefined;
+      if (!unresolved) continue;
+
+      const sources = sourcesFor.all(row.channel, row.nonce) as Array<{
+        turn_request_id: unknown;
+        target_actor_id: unknown;
+        prompt_digest: unknown;
+        binding_generation: unknown;
+        target_binding_id: unknown;
+        target_attestation_id: unknown;
+        executor_session_id: unknown;
+        executor_session_incarnation: unknown;
+      }>;
+      if (sources.length === 0) v36BackfillFailure(row.channel, row.nonce, "SOURCE_MAPPING_MISSING");
+      if (sources.length !== 1) v36BackfillFailure(row.channel, row.nonce, "SOURCE_MAPPING_AMBIGUOUS");
+      const source = sources[0]!;
+      if (source.turn_request_id !== claim["turnRequestId"]) {
+        v36BackfillFailure(row.channel, row.nonce, "SOURCE_TURN_MISMATCH");
+      }
+      const canonical: unknown = {
+        turnRequestId: source.turn_request_id,
+        targetActorId: source.target_actor_id,
+        promptDigest: source.prompt_digest,
+        bindingGeneration: source.binding_generation,
+        targetBindingId: source.target_binding_id,
+        targetAttestationId: source.target_attestation_id,
+        executorSessionId: source.executor_session_id,
+        executorSessionIncarnation: source.executor_session_incarnation,
+      };
+      if (!isInboundReceiptIdentity(canonical)) {
+        v36BackfillFailure(row.channel, row.nonce, "CANONICAL_IDENTITY_INVALID");
+      }
+      if (claim["promptDigest"] !== canonical.promptDigest) {
+        v36BackfillFailure(row.channel, row.nonce, "PROMPT_DIGEST_MISMATCH");
+      }
+      if (claim["bindingDigest"] !== digestOf({ bindingGeneration: canonical.bindingGeneration })) {
+        v36BackfillFailure(row.channel, row.nonce, "BINDING_DIGEST_MISMATCH");
+      }
+      const storedIdentity = claim["receiptIdentity"];
+      if (storedIdentity !== undefined) {
+        if (!isInboundReceiptIdentity(storedIdentity)
+            || !sameInboundReceiptIdentity(storedIdentity, canonical)) {
+          v36BackfillFailure(row.channel, row.nonce, "RECEIPT_IDENTITY_MISMATCH");
+        }
+        continue;
+      }
+      updates.push({
+        channel: row.channel,
+        nonce: row.nonce,
+        original: row.turn_claim_json,
+        replacement: JSON.stringify({ ...claim, receiptIdentity: canonical }),
+      });
+    }
+
+    const update = raw.prepare(
+      `UPDATE inbound_messages SET turn_claim_json = ?
+        WHERE channel = ? AND nonce = ? AND turn_claim_json = ?`,
+    );
+    for (const row of updates) {
+      if (update.run(row.replacement, row.channel, row.nonce, row.original).changes !== 1) {
+        v36BackfillFailure(row.channel, row.nonce, "CLAIM_CHANGED_DURING_BACKFILL");
+      }
+    }
+    raw.exec(triggerDdlFor(["inbound_messages_turn_claim_identity_immutable"]));
+  },
+  checksum: () => migrationChecksum("v36-backfill-ingress-receipt-identities-before-freezing-claims"),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -2306,6 +2483,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v33,
   v34,
   v35,
+  v36,
 ]);
 
 interface RequiredTrigger {
@@ -2414,6 +2592,7 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "conversational_actors_incarnation_matches_session_on_update", sentinel: "ACTOR_SESSION_INCARNATION_MISMATCH", introducedIn: 31 },
   { name: "inbound_messages_payload_immutable", sentinel: "INBOUND_PAYLOAD_IMMUTABLE", introducedIn: 35 },
   { name: "inbound_messages_no_replace", sentinel: "INBOUND_MESSAGE_NO_REPLACE", introducedIn: 35 },
+  { name: "inbound_messages_turn_claim_identity_immutable", sentinel: "INBOUND_TURN_CLAIM_IDENTITY_IMMUTABLE", introducedIn: 36 },
   { name: "canonical_turn_sources_admission_matches_claim", sentinel: "CANONICAL_TURN_SOURCE_NOT_CLAIM_TIME", introducedIn: 32 },
 ];
 

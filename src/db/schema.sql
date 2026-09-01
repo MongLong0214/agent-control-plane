@@ -1239,6 +1239,34 @@ BEGIN
   SELECT RAISE(ABORT, 'INBOUND_MESSAGE_NO_REPLACE');
 END;
 
+-- CP-HI-06 — a claimed ingress turn's target tuple is historical evidence. A lifecycle writer
+-- may add its terminal facts, but it must never alter the turn it is closing or the exact Hermes
+-- runtime tuple that a future receipt is compared with. `CASE` keeps malformed raw JSON on the
+-- refusal path instead of evaluating json_extract and turning a typed denial into a SQLite parser
+-- error. The INSERT case remains open: claimTurn's first write is what fixes the identity.
+CREATE TRIGGER IF NOT EXISTS inbound_messages_turn_claim_identity_immutable
+BEFORE UPDATE OF turn_claim_json ON inbound_messages
+WHEN OLD.turn_claim_json IS NOT NULL
+ AND CASE
+   WHEN NEW.turn_claim_json IS NULL
+     OR json_valid(OLD.turn_claim_json) <> 1
+     OR json_valid(NEW.turn_claim_json) <> 1 THEN 1
+   WHEN json_extract(NEW.turn_claim_json, '$.turnRequestId')
+          IS NOT json_extract(OLD.turn_claim_json, '$.turnRequestId')
+     OR json_extract(NEW.turn_claim_json, '$.sessionDigest')
+          IS NOT json_extract(OLD.turn_claim_json, '$.sessionDigest')
+     OR json_extract(NEW.turn_claim_json, '$.promptDigest')
+          IS NOT json_extract(OLD.turn_claim_json, '$.promptDigest')
+     OR json_extract(NEW.turn_claim_json, '$.bindingDigest')
+          IS NOT json_extract(OLD.turn_claim_json, '$.bindingDigest')
+     OR json_extract(NEW.turn_claim_json, '$.receiptIdentity')
+          IS NOT json_extract(OLD.turn_claim_json, '$.receiptIdentity') THEN 1
+   ELSE 0
+ END = 1
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_TURN_CLAIM_IDENTITY_IMMUTABLE');
+END;
+
 -- ---------------------------------------------------------------------------
 -- telegram_owner_prompts
 --   Lifecycle: an owner-facing Telegram gate prompt and the candidate it showed.

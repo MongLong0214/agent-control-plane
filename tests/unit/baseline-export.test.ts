@@ -963,6 +963,7 @@ describe("baseline boundary contracts", () => {
       "v33-back-up-before-telegram-settlement-state",
       "v34-persist-hermes-target-bind-receipt-evidence",
       "v35-keep-the-admitted-payload-with-its-inbound-row",
+      "v36-backfill-ingress-receipt-identities-before-freezing-claims",
     ]);
   });
 

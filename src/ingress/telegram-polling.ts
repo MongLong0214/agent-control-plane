@@ -1,11 +1,12 @@
 import type { ControlPlane } from "../app/control-plane.ts";
 import type { OwnerIdentity } from "../ceo/owner-authority.ts";
+import type { ReceiptLookupQuery } from "../conversation/turn-coordinator.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { Role, RunState, roleKeyFor } from "../domain/types.ts";
 import { createHermesMcpPort } from "../mcp/hermes-server.ts";
-import { IngressGuard } from "./ingress-guard.ts";
+import { IngressGuard, type TurnIdentity } from "./ingress-guard.ts";
 import {
   type TelegramReply,
   type TelegramDirectAnswer,
@@ -605,6 +606,8 @@ export class TelegramLongPollService {
       ownerGateSignals?: () => readonly TelegramOwnerGateSignal[];
       ownerPromptStore?: TelegramOwnerPromptStore;
       onRuntimeStatus?: (status: TelegramLongPollRuntimeStatus) => void;
+      /** Reconciles a replayed, durably claimed DIRECT turn without re-running its handler. */
+      reconcileIngressClaim?: (nonce: string) => Promise<Decision<void>>;
     } = {},
   ) {
     if (webhookSecret.trim().length === 0) {
@@ -780,6 +783,16 @@ export class TelegramLongPollService {
       try {
         const progress = await this.routeUpdate(update);
         if (progress.status === "COMPLETED") {
+          if (this.holdsOffsetForUnresolvedTurn(progress.outcome)) {
+            // `getUpdates(offset)` is Telegram's deletion acknowledgement. A replayed claimed
+            // turn has no governed completion — its handler may have run before the crash — so a
+            // null reply must not turn that uncertainty into a silent acknowledgement. Keep this
+            // event id retryable (and therefore coalesced by `reserveUpdate`) but do not route a
+            // later id in the same ordered batch past it.
+            this.retryUpdate(update.update_id);
+            routes.push(progress);
+            break;
+          }
           this.completeUpdate(update.update_id);
           routes.push(progress);
           continue;
@@ -926,7 +939,8 @@ export class TelegramLongPollService {
   private async routeUpdate(update: TelegramUpdate): Promise<TelegramLongPollRouteProgress> {
     const progress = await this.router.routeUntilCeoTurn(update, this.webhookSecret);
     if (progress.status === "COMPLETED") {
-      return { status: "COMPLETED", outcome: await this.deliverRouteOutcome(update, progress.outcome) };
+      const outcome = await this.reconcileIngressClaim(progress.outcome);
+      return { status: "COMPLETED", outcome: await this.deliverRouteOutcome(update, outcome) };
     }
     let markDeliveryStarted!: () => void;
     const deliveryStarted = new Promise<void>((resolve) => { markDeliveryStarted = resolve; });
@@ -935,9 +949,20 @@ export class TelegramLongPollService {
       deliveryStarted,
       outcome: progress.outcome.then((outcome) => {
         markDeliveryStarted();
-        return this.deliverRouteOutcome(update, outcome);
+        return this.reconcileIngressClaim(outcome).then((reconciled) => this.deliverRouteOutcome(update, reconciled));
       }),
     };
+  }
+
+  /** A receipt can release only the replayed claim it authenticated. */
+  private async reconcileIngressClaim(outcome: TelegramRouteOutcome): Promise<TelegramRouteOutcome> {
+    if (!this.holdsOffsetForUnresolvedTurn(outcome) || !this.options.reconcileIngressClaim) return outcome;
+    try {
+      const settled = await this.options.reconcileIngressClaim(outcome.nonce);
+      return settled.allowed ? { ...outcome, reasonCode: settled.reasonCode } : outcome;
+    } catch {
+      return outcome;
+    }
   }
 
   private async deliverRouteOutcome(
@@ -1007,6 +1032,15 @@ export class TelegramLongPollService {
       this.#updateOrder.sort((left, right) => left - right);
     }
     return { reserved: true };
+  }
+
+  /**
+   * A claimed turn that returns as unknown is neither a duplicate nor a completed response.
+   * Its persisted claim says the handler may have reached the executor, but no governed receipt
+   * has closed that fact. Keep Telegram's ordered acknowledgement behind that uncertainty.
+   */
+  private holdsOffsetForUnresolvedTurn(outcome: TelegramRouteOutcome): boolean {
+    return outcome.reply === null && outcome.reasonCode === ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN;
   }
 
   private retryUpdate(updateId: number, error?: unknown): void {
@@ -1082,6 +1116,82 @@ export class TelegramLongPollService {
   }
 }
 
+/**
+ * Builds a receipt lookup only from the verified target proof that was live while the claim is
+ * admitted. A restart reads the immutable tuple from the claim; this callback never upgrades an
+ * old claim to a new target.
+ */
+const receiptIdentityForCurrentHermesCeo = (
+  cp: ControlPlane,
+  identity: TurnIdentity,
+): ReceiptLookupQuery | null => {
+  const roleKey = roleKeyFor(Role.CEO);
+  const binding = cp.bindings.active(roleKey);
+  if (!binding || !cp.bindings.currentHermesTargetBindReceipt({
+    roleKey,
+    sessionId: binding.sessionId,
+    sessionIncarnation: binding.sessionIncarnation,
+  })) return null;
+
+  const rows = cp.db.all<{
+    actor_id: string;
+    binding_generation: number;
+    target_binding_id: string;
+    target_attestation_id: string;
+    executor_session_id: string;
+    executor_session_incarnation: string;
+  }>(
+    `SELECT a.actor_id, a.binding_generation, b.target_binding_id, t.target_attestation_id,
+            t.executor_session_id, t.executor_session_incarnation
+       FROM assignments a
+       JOIN conversational_actors c
+         ON c.actor_id = a.actor_id
+        AND c.current_session_id = a.session_id
+        AND c.current_session_incarnation = a.session_incarnation
+       JOIN sessions s
+         ON s.session_id = a.session_id
+        AND s.incarnation = a.session_incarnation
+        AND s.lifecycle = 'READY'
+       JOIN actor_target_bindings b
+         ON b.target_actor_id = a.actor_id
+        AND b.executor_kind = 'hermes'
+       JOIN actor_target_attestations t
+         ON t.target_binding_id = b.target_binding_id
+        AND t.assignment_id = a.assignment_id
+        AND t.executor_session_id = a.session_id
+        AND t.executor_session_incarnation = a.session_incarnation
+        AND t.binding_generation = a.binding_generation
+        AND t.protocol_version = 'hermes.target-bind/v1'
+        AND t.target_bind_receipt_json IS NOT NULL
+        AND t.target_bind_executor_runtime_identity IS NOT NULL
+      WHERE a.role_key = ?
+        AND a.status = 'ACTIVE'
+        AND a.assignment_id = ?
+        AND a.binding_generation = ?
+        AND a.session_id = ?
+        AND a.session_incarnation = ?`,
+    [
+      roleKey,
+      binding.assignmentId,
+      binding.bindingGeneration,
+      binding.sessionId,
+      binding.sessionIncarnation,
+    ],
+  );
+  if (rows.length !== 1) return null;
+  const target = rows[0]!;
+  return {
+    turnRequestId: identity.turnRequestId,
+    targetActorId: target.actor_id,
+    promptDigest: identity.promptDigest,
+    bindingGeneration: target.binding_generation,
+    targetBindingId: target.target_binding_id,
+    targetAttestationId: target.target_attestation_id,
+    executorSessionId: target.executor_session_id,
+    executorSessionIncarnation: target.executor_session_incarnation,
+  };
+};
+
 /** Starts the production Telegram route after the daemon has acquired its single-instance lock. */
 export const startTelegramLongPollListener = async (
   cp: ControlPlane,
@@ -1106,6 +1216,8 @@ export const startTelegramLongPollListener = async (
       // pass: the escape hatch for an operator who knows their self-hosted server's real window).
       transportRetentionMs: transport.redeliveryRetentionMs ?? config.transportRetentionMs ?? null,
     },
+  }, {
+    receiptIdentityForClaim: (identity) => receiptIdentityForCurrentHermesCeo(cp, identity),
   });
   const ingress = new TelegramIngress(guard, { webhookSecret: config.webhookSecret });
   const hermes = createHermesMcpPort(cp, { onCeoApproved: options.onCeoApproved });
@@ -1149,6 +1261,20 @@ export const startTelegramLongPollListener = async (
     ownerGateSignals: options.ownerGateSignals ?? (() => ownerGateSignalsFromOutbox(cp)),
     ownerPromptStore: createOwnerPromptStore(cp),
     onRuntimeStatus: options.onRuntimeStatus,
+    reconcileIngressClaim: async (nonce) => {
+      const query = guard.receiptIdentityForClaim("telegram", nonce);
+      if (!query) {
+        return deny(
+          ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN,
+          "the replayed Telegram turn has no authenticated Hermes receipt identity",
+          { nonce },
+        );
+      }
+      return cp.conversation.reconcileIngressReceipt(
+        query,
+        (receipt) => guard.completeClaimFromHermesReceipt("telegram", nonce, query, receipt),
+      );
+    },
     ...(options.onInterrupt ? { onInterrupt: options.onInterrupt } : {}),
   });
   if (options.start !== false) service.start();

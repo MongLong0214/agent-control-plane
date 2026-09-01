@@ -17,6 +17,7 @@ import type { TaskContract } from "../../src/run/run-engine.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import type { ManagedManifestWrite } from "../../src/registry/project-registry.ts";
+import type { HermesReceiptPortOptions } from "../../src/runtime/hermes-receipt-port.ts";
 import { commitAll, gitSync, makeRepo, tempDir, writeFiles } from "./fixtures.ts";
 
 /** The single allowlisted owner identity of the fixture deployment. */
@@ -50,6 +51,8 @@ export const makeHarness = (
     githubAppEnvFile?: string;
     githubAppPrivateKeyPath?: string;
     ownerIdentities?: readonly OwnerIdentity[];
+    /** Uses the production Hermes receipt adapter with a test-owned executor seam. */
+    hermesReceipt?: HermesReceiptPortOptions;
     allowTestEvidenceWriters?: boolean;
     /**
      * Replaces the in-memory route. Live acceptance captures pass the real CLI transport so
@@ -106,6 +109,7 @@ console.log('verification ok');`,
     },
     // §21 — the fixture deployment has exactly one owner identity.
     ownerIdentities: options.ownerIdentities ?? [TEST_OWNER],
+    ...(options.hermesReceipt ? { hermesReceipt: options.hermesReceipt } : {}),
     // A fixture writes evidence directly in a few places; the daemon never unlocks this.
     allowTestEvidenceWriters: options.allowTestEvidenceWriters ?? true,
     ctoPreference: { provider: "scripted", model: "scripted-cto", effort: null },
