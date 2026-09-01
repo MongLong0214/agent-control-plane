@@ -962,6 +962,7 @@ describe("baseline boundary contracts", () => {
       "v32-a-source-can-only-cite-its-turns-own-claim-event",
       "v33-back-up-before-telegram-settlement-state",
       "v34-persist-hermes-target-bind-receipt-evidence",
+      "v35-keep-the-admitted-payload-with-its-inbound-row",
     ]);
   });
 
