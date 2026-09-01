@@ -16,6 +16,7 @@ import {
   type HermesBootstrapAuthority,
 } from "../bootstrap/hermes-bootstrap.ts";
 import { BuzzAdapter, BuzzCliTransport } from "../buzz/buzz-adapter.ts";
+import type { OwnerIdentity } from "../ceo/owner-authority.ts";
 import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import {
@@ -435,14 +436,17 @@ export const startBuzzMessageIngressListener = async (
   cp: ControlPlane,
   stateDir: string,
   policy: IngressPolicy,
-  options: { ceoConversation: CeoConversationPort },
+  options: { ceoConversation: CeoConversationPort; ownerActors: readonly string[] },
 ): Promise<LocalBuzzMessageIngress> => {
   if (!policy.secret || policy.secret.trim().length === 0) {
     throw new Error("Buzz message ingress requires a non-empty signing secret");
   }
 
   const guard = new IngressGuard(cp.db, cp.clock, cp.audit, { buzz: policy });
-  const ingress = new BuzzMessageIngress(guard);
+  // `policy.allowedActors` is the relay credential's list and admits every ACTIVE Buzz actor;
+  // `ownerActors` is who may speak to the CEO as the owner. Passing the first for the second is
+  // the defect this argument exists to make impossible to write by accident.
+  const ingress = new BuzzMessageIngress(guard, options.ownerActors);
   const port: BuzzMessageTurnPort = {
     deliverToCeo: (text) => deliverAsCeoTurn(options.ceoConversation, text),
     // Read at claim time, from the binding registry rather than from the peer: the fence is
@@ -1430,6 +1434,30 @@ export const configuredBuzzActorIngressPolicy = (): IngressPolicy | null => {
 };
 
 /**
+ * Which Buzz channel identities may speak to the CEO as the owner.
+ *
+ * Read from `owner-identities` (#245) rather than from `ACP_BUZZ_ALLOWED_ACTORS`, because the
+ * two answer different questions. The environment allowlist is the relay credential's: it says
+ * which channel identities may present an envelope at all, and every ACTIVE Buzz actor the
+ * deployment talks to is on it. Owner authority is declared once, on the host, for every
+ * channel — Telegram already refuses to start on an owner id missing from that file — and the
+ * message path takes its owners from the same place.
+ *
+ * An empty result is not a permissive default: `main` leaves the message socket closed and says
+ * so, which is the fail-closed half of the same separation.
+ */
+export const configuredBuzzMessageOwnerActors = (
+  ownerIdentities: readonly OwnerIdentity[],
+): string[] => [
+  ...new Set(
+    ownerIdentities
+      .filter((identity) => identity.channel === "buzz")
+      .map((identity) => identity.actor.trim())
+      .filter((actor) => actor.length > 0),
+  ),
+];
+
+/**
  * The daemon's Telegram composition root. Tests may replace only the external transport; the
  * guard, sealed Hermes port, CEO receipt callback, durable response reader and poll service are
  * still assembled by the same factory `main` uses.
@@ -1854,11 +1882,22 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     if (buzzActorIngressPolicy) {
       buzzActorIngress = await startBuzzActorIngressListener(cp, stateDir, buzzActorIngressPolicy);
       // The receiving half of #627. It opens with the binding half because both are the same
-      // relay credential, and separately from it because they are different authorities.
-      buzzMessageIngress = await startBuzzMessageIngressListener(cp, stateDir, buzzActorIngressPolicy, {
-        ceoConversation: listeners.ceoConversation,
-      });
-      process.stdout.write("Buzz message ingress started\n");
+      // relay credential, and separately from it because they are different authorities — which
+      // is why it needs a second fact the binding half does not: who the owner is. Without a
+      // declared buzz owner the relay credential alone would carry owner authority, so the
+      // socket stays closed and the operator is told which file to declare it in.
+      const buzzMessageOwnerActors = configuredBuzzMessageOwnerActors(config.ownerIdentities ?? []);
+      if (buzzMessageOwnerActors.length === 0) {
+        process.stdout.write(
+          "Buzz message ingress not started: no owner identity with channel \"buzz\" is declared in owner-identities\n",
+        );
+      } else {
+        buzzMessageIngress = await startBuzzMessageIngressListener(cp, stateDir, buzzActorIngressPolicy, {
+          ceoConversation: listeners.ceoConversation,
+          ownerActors: buzzMessageOwnerActors,
+        });
+        process.stdout.write("Buzz message ingress started\n");
+      }
     }
     if (telegramConfig) {
       const telegramStartOptions = options.telegramStartOptions ?? {};

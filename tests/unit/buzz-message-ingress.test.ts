@@ -5,6 +5,7 @@ import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { afterAll, describe, expect, it } from "vitest";
 
 import {
+  configuredBuzzMessageOwnerActors,
   startBuzzActorIngressListener,
   startBuzzMessageIngressListener,
 } from "../../src/daemon/agentcpd.ts";
@@ -31,6 +32,19 @@ afterAll(cleanupTempDirs);
 
 const SECRET = "buzz-message-ingress-test-secret";
 const OWNER = "npub-owner";
+
+/**
+ * A second channel identity that is every bit as valid as the owner's, and is not the owner.
+ *
+ * It holds the same relay credential — same shared secret, same `allowedActors` entry — which is
+ * what production hands every ACTIVE Buzz actor. So its envelope passes signature, recipient,
+ * nonce and allowlist; the only thing wrong with it is who sent it. Every negative test that
+ * fails on one of the *other* checks would pass with this actor missing, which is why it exists.
+ */
+const NON_OWNER = "npub-not-the-owner";
+
+/** The relay allowlist as production composes it: the owner is on it, and so is everyone else. */
+const RELAY_ACTORS = [OWNER, NON_OWNER];
 
 /** Stands in for the per-request authenticator every inbound CEO tool call already runs. */
 const stillCeo = (): McpPeerAuthenticator => () =>
@@ -124,8 +138,8 @@ const startMessageListener = async (
   startBuzzMessageIngressListener(
     harness.cp,
     tempDir("acp-buzz-message-"),
-    { allowedActors: [OWNER], secret: SECRET },
-    { ceoConversation },
+    { allowedActors: RELAY_ACTORS, secret: SECRET },
+    { ceoConversation, ownerActors: [OWNER] },
   );
 
 describe("the daemon's Buzz message ingress", () => {
@@ -343,7 +357,7 @@ describe("the daemon's Buzz message ingress", () => {
     const guard = new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, {
       buzz: { allowedActors: [OWNER] },
     });
-    const ingress = new BuzzMessageIngress(guard);
+    const ingress = new BuzzMessageIngress(guard, [OWNER]);
 
     const admitted = ingress.admit({
       actor: OWNER,
@@ -365,7 +379,7 @@ describe("the daemon's Buzz message ingress", () => {
         harness.cp,
         tempDir("acp-buzz-unsigned-"),
         { allowedActors: [OWNER] },
-        { ceoConversation: new CeoConversationPort() },
+        { ceoConversation: new CeoConversationPort(), ownerActors: [OWNER] },
       ),
     ).rejects.toThrow(/non-empty signing secret/u);
   });
@@ -462,5 +476,86 @@ describe("the daemon's Buzz message ingress", () => {
       await binding.close();
       await message.close();
     }
+  });
+
+  it("refuses an ACTIVE non-owner's otherwise valid CEO envelope, and still delivers the owner's identical one", async () => {
+    const harness = makeHarness();
+    bindCeo(harness);
+    const conversation = new CeoConversationPort();
+    const { peer, server } = fakeCeoPeer("owner에게만 답한다");
+    conversation.attach(server, stillCeo());
+    const listener = await startMessageListener(harness, conversation);
+    const before = sessionIds(harness);
+
+    try {
+      // Everything about this envelope is valid except who sent it: the signature verifies under
+      // the relay secret, the actor is on the relay allowlist production composes, the recipient
+      // is the CEO, and the nonce is fresh.
+      const eventId = "evt-non-owner";
+      const text = "CEO, 지금 상태 알려줘";
+      const refused = await exchangeSocketLines(
+        listener.socketPath,
+        [envelope({ eventId, text, actor: NON_OWNER })],
+        hasReasonCode,
+      );
+      expect(JSON.parse(refused.trim())).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED,
+      });
+
+      // The three things the refusal has to have cost nobody.
+      expect(peer.calls).toEqual([]);
+      expect(
+        harness.cp.db.all(
+          `SELECT nonce FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`,
+          [buzzMessageNonce(eventId)],
+        ),
+      ).toEqual([]);
+      expect(sessionIds(harness)).toEqual(before);
+
+      // The same event id and the same words from the owner go through. Without this the test
+      // above would also pass on an ingress that refused every message, or one that had quietly
+      // consumed the nonce and would refuse the owner's as a replay.
+      const delivered = await exchangeSocketLines(
+        listener.socketPath,
+        [envelope({ eventId, text })],
+        hasReasonCode,
+      );
+      expect(JSON.parse(delivered.trim())).toMatchObject({
+        ok: true,
+        reasonCode: ReasonCode.OK,
+        answeredByCeo: true,
+      });
+      expect(peer.calls).toEqual([text]);
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("refuses to construct a message ingress with no declared owner", () => {
+    const harness = makeHarness();
+    const guard = new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, {
+      buzz: { allowedActors: RELAY_ACTORS, secret: SECRET },
+    });
+
+    // Falling back to the guard's own allowlist is exactly the defect; an absent owner
+    // declaration has to close the path rather than widen it.
+    expect(() => new BuzzMessageIngress(guard, [])).toThrow(/declared buzz owner identity/u);
+    expect(() => new BuzzMessageIngress(guard, ["  "])).toThrow(/declared buzz owner identity/u);
+  });
+
+  it("takes the message path's owners from owner-identities rather than from the relay allowlist", () => {
+    expect(
+      configuredBuzzMessageOwnerActors([
+        { channel: "telegram", actor: "12345" },
+        { channel: "buzz", actor: OWNER },
+        { channel: "buzz", actor: ` ${OWNER} ` },
+        { channel: "cli", actor: "isaac" },
+      ]),
+    ).toEqual([OWNER]);
+
+    // No buzz owner declared is not "any buzz actor"; `main` reads this empty and leaves the
+    // message socket closed.
+    expect(configuredBuzzMessageOwnerActors([{ channel: "telegram", actor: "12345" }])).toEqual([]);
   });
 });

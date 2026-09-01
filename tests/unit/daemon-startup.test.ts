@@ -51,6 +51,8 @@ const runMain = async (input: {
   realTelegramTransport?: boolean;
   /** Configures the Buzz relay credential, which is what opens both Buzz ingress sockets. */
   buzz?: boolean;
+  /** Declares the Buzz actor as an owner identity, which is what the message half also needs. */
+  buzzOwnerIdentity?: boolean;
   /** Drives an owner Buzz message through the daemon's own socket (#627). */
   expectBuzzMessage?: boolean;
 }): Promise<MainResult> => {
@@ -58,9 +60,18 @@ const runMain = async (input: {
   // to make the operator socket exceed that OS limit and would test the wrong failure.
   const root = mkdtempSync(join("/tmp", "acp-main-startup-"));
   const stateRoot = join(root, ".agent-control-plane");
-  if (input.ownerIdentity) {
+  // The relay credential opens the sockets; this file says who the owner is. They are separate
+  // inputs on purpose — `buzz: true, buzzOwnerIdentity: false` is the deployment where every
+  // ACTIVE relay actor could speak as the owner, and it is a case below rather than a default.
+  const declaredIdentities = [
+    ...(input.ownerIdentity ? [`telegram:${OWNER_ID}`] : []),
+    ...(input.buzzOwnerIdentity ? [`buzz:${BUZZ_ACTOR}`] : []),
+  ];
+  if (declaredIdentities.length > 0) {
     mkdirSync(stateRoot, { recursive: true, mode: 0o700 });
-    writeFileSync(join(stateRoot, "owner-identities"), `telegram:${OWNER_ID}\n`, { mode: 0o600 });
+    writeFileSync(join(stateRoot, "owner-identities"), `${declaredIdentities.join("\n")}\n`, {
+      mode: 0o600,
+    });
   }
 
   const environment: NodeJS.ProcessEnv = {
@@ -224,6 +235,7 @@ describe("#627: an owner's Buzz message reaches the CEO without a session child"
     const result = await runMain({
       seedState: true,
       buzz: true,
+      buzzOwnerIdentity: true,
       expectBuzzMessage: true,
     });
 
@@ -242,6 +254,20 @@ describe("#627: an owner's Buzz message reaches the CEO without a session child"
     const diagnostics = `status=${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
     expect(result.status, diagnostics).toBe(0);
     expect(result.stdout, diagnostics).not.toContain("Buzz message ingress started");
+  }, 40_000);
+
+  it("leaves the message socket closed when the relay credential names no declared owner", async () => {
+    // The composition half of the same separation. The relay credential is configured, so the
+    // binding socket opens exactly as before; what is missing is a `buzz:` line in
+    // `owner-identities`. Reusing the relay allowlist here would make every ACTIVE Buzz actor
+    // the owner, so the message half stays closed and says which file would open it.
+    const result = await runMain({ seedState: true, buzz: true });
+
+    const diagnostics = `status=${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
+    expect(result.status, diagnostics).toBe(0);
+    expect(result.stdout, diagnostics).not.toContain("Buzz message ingress started");
+    expect(result.stdout, diagnostics).toContain("Buzz message ingress not started");
+    expect(result.stdout, diagnostics).toContain("owner-identities");
   }, 40_000);
 });
 

@@ -93,7 +93,26 @@ export interface AdmittedBuzzMessage {
  * nonce, so no caller can pass the two inconsistently.
  */
 export class BuzzMessageIngress {
-  constructor(private readonly guard: IngressGuard) {}
+  readonly #ownerActors: ReadonlySet<string>;
+
+  /**
+   * `ownerActors` is a second allowlist, and it is the point of this class.
+   *
+   * The guard's `buzz` policy says which channel identities the relay may present at all — the
+   * same credential the actor-binding half uses, and one every ACTIVE Buzz actor in the
+   * deployment is on. Speaking to the owner's CEO *as the owner* is a different authority, and
+   * an allowlist that admits the first cannot be the one that grants the second: an otherwise
+   * valid ACTIVE non-owner could sign a CEO-addressed envelope and get a turn. So the owner
+   * identities are supplied separately, from `owner-identities` (#245) rather than from the
+   * relay credential, and an empty set is refused here rather than defaulting to the guard's.
+   */
+  constructor(private readonly guard: IngressGuard, ownerActors: readonly string[]) {
+    const owners = ownerActors.map((actor) => actor.trim()).filter((actor) => actor.length > 0);
+    if (owners.length === 0) {
+      throw new Error("buzz message ingress requires at least one declared buzz owner identity");
+    }
+    this.#ownerActors = new Set(owners);
+  }
 
   nonceFor(eventId: string): string {
     return buzzMessageNonce(eventId);
@@ -131,6 +150,17 @@ export class BuzzMessageIngress {
         ReasonCode.INVALID_ARGUMENT,
         "buzz message ingress delivers only events addressed to the CEO",
         { addressedTo: input.addressedTo },
+      );
+    }
+    if (!this.#ownerActors.has(input.actor.trim())) {
+      // Also before admission, and for a second reason beyond the one above: a non-owner on the
+      // relay allowlist can produce a *valid* signature, so letting the guard admit it first
+      // would consume the `(buzz, nonce)` slot for that event id. The owner's own message for
+      // the same event would then be refused as a replay of a turn that never ran.
+      return deny(
+        ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED,
+        "buzz message ingress delivers only messages from a declared buzz owner identity",
+        { channel: "buzz", actor: input.actor },
       );
     }
 
