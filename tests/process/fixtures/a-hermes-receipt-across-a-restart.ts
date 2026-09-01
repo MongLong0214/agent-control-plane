@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { canonicalJson, digestOf } from "../../../src/core/digest.ts";
+import { ReasonCode } from "../../../src/core/reason-codes.ts";
 import { Role, roleKeyFor } from "../../../src/domain/types.ts";
 import { startDaemonTelegramListener } from "../../../src/daemon/agentcpd.ts";
 import { TelegramInterruption } from "../../../src/ingress/telegram-router.ts";
@@ -89,7 +90,7 @@ const receiptOptions = (
       receiptIdentity: identity,
       receiptId: `receipt:${mode}`,
       evidenceDigest: digestOf({ mode, identity }),
-      reasonCode: "HERMES_EXECUTOR_ABORTED",
+      reasonCode: ReasonCode.HERMES_AGENT_RUN_EXCEPTION,
     } satisfies HermesAcpResult;
   }) satisfies HermesAcpExecute,
 });
