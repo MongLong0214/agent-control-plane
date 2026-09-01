@@ -16,10 +16,10 @@ const storedQualityObservationCoversOnlyWithEvidence = {
   id: "stored-quality-observation-covers-only-with-evidence",
   what: "#740: a stored quality observation covers its fact only if it names its evidence",
   file: "src/export/run-evidence.ts",
-  find: '    return typeof observation["evidenceDigest"] === "string";\n',
+  find: '    return isDigest(observation["evidenceDigest"]);\n',
   replace: "    return true;\n",
   killedBy: [
-    "tests/unit/baseline-export.test.ts::does not let a stored quality observation without an evidence digest cover its fact",
+    "tests/unit/baseline-export.test.ts::does not let a stored quality observation with a malformed nonempty evidence digest cover its fact",
   ],
 };
 
