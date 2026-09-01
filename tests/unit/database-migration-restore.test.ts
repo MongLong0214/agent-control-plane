@@ -648,6 +648,11 @@ const asV35IngressClaimFixture = (
   } finally {
     raw.close();
     asPrivateStateFile(path);
+    // #747 — a v35 file is a pre-current deployed database, and opening it migrates. The owner
+    // approval that authorises v35→v36 is explicit here for the same reason it is on every
+    // other pre-current fixture: without it these cases would measure the approval gate rather
+    // than the backfill they are about.
+    approveMigration(path, "database-migration-restore fixture");
   }
 };
 
