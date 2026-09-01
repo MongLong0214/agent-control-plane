@@ -483,6 +483,18 @@ export class BaselineRecorder {
         fact: payload.fact,
       });
     }
+    // OBSERVED and NOT_OBSERVED both raise a required Gate A quality fact to covered, so both
+    // are observation claims and neither is free. Without this, an operator asserting
+    // "no rollback happened" with nothing attached satisfies the same fact a post-merge
+    // receipt would — manufacturing the coverage this seam exists to record. UNAVAILABLE is
+    // the honest way to say nothing was looked at, and it stays free because it covers nothing.
+    if (payload.status !== "UNAVAILABLE" && payload.evidenceDigest == null) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "an observed quality fact must name the evidence it was read from", {
+        runId,
+        fact: payload.fact,
+        status: payload.status,
+      });
+    }
     return this.record(runId, BaselineRecordKind.QUALITY_OBSERVATION, {
       fact: payload.fact,
       status: payload.status,

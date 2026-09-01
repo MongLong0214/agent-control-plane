@@ -1118,6 +1118,7 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   // already holds them, not an internal fault.
   INBOUND_PAYLOAD_IMMUTABLE: ReasonCode.CONFLICT,
   INBOUND_MESSAGE_NO_REPLACE: ReasonCode.CONFLICT,
+  INBOUND_TURN_CLAIM_IDENTITY_IMMUTABLE: ReasonCode.CONFLICT,
   // The canonical-turn ledger, which had no entries here at all: every one of its denials came
   // out of `db.tx` as a raw Error rather than as a typed refusal, so a claim whose source insert
   // tripped a guard threw instead of denying. The guards are what this ledger is *for*, and the

@@ -7,6 +7,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import type { OwnerApprovalReceipt } from "../ceo/owner-authority.ts";
+import type { ReceiptLookupQuery } from "../conversation/turn-coordinator.ts";
 import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
 
 export interface IngressRequest {
@@ -230,12 +231,21 @@ export class IngressGuard {
    */
   readonly #nonceTtlMsByChannel: Readonly<Record<string, number>>;
 
+  /**
+   * This is supplied only by the production composition root after it has read the live verified
+   * Hermes target. It may decline to bind a receipt identity for legacy/unattested traffic; such a
+   * claim remains safely UNKNOWN rather than being retrofitted to an ambiguous target later.
+   */
+  readonly #receiptIdentityForClaim: ((identity: TurnIdentity) => ReceiptLookupQuery | null) | null;
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
     private readonly audit: AuditLog,
     private readonly policies: Readonly<Record<string, IngressPolicy>>,
+    options: { receiptIdentityForClaim?: (identity: TurnIdentity) => ReceiptLookupQuery | null } = {},
   ) {
+    this.#receiptIdentityForClaim = options.receiptIdentityForClaim ?? null;
     const nonceTtlMsByChannel: Record<string, number> = {};
     for (const [channel, policy] of Object.entries(policies)) {
       if (policy.allowedActors.length === 0) {
@@ -509,6 +519,125 @@ export class IngressGuard {
     return allow(ReasonCode.OK, receipt, admitted.evidence);
   }
 
+  /**
+   * Returns the immutable target tuple stored with one claimed ingress event. This is a read-only
+   * capability: it exposes no receipt and a missing, malformed, or historic claim cannot be
+   * upgraded from the live binding on restart.
+   */
+  receiptIdentityForClaim(channel: string, nonce: string): ReceiptLookupQuery | null {
+    const row = this.db.get<{ turn_claim_json: string | null }>(
+      `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+      [channel, nonce],
+    );
+    if (!row?.turn_claim_json) return null;
+    try {
+      const claim = JSON.parse(row.turn_claim_json) as TurnClaim;
+      return isBoundReceiptIdentity(claim.receiptIdentity ?? null, claim) ? claim.receiptIdentity! : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Atomically writes the only no-reply completion an authenticated terminal receipt can support
+   * today. The coordinator owns receipt lookup and calls this only after its sealed port matched
+   * every field. This guard still re-reads the persisted identity: a receipt for a different
+   * event, a corrupt row, or a concurrent reply must leave this event unresolved.
+   */
+  completeClaimFromHermesReceipt(
+    channel: string,
+    nonce: string,
+    query: ReceiptLookupQuery,
+    receipt: { outcome: "ABORTED"; receiptId: string; evidenceDigest: string; reasonCode: string },
+  ): Decision<void> {
+    return this.db.txDecision(() => {
+      const current = this.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
+        `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+        [channel, nonce],
+      );
+      if (!current?.turn_claim_json) {
+        return deny(ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN, "ingress event has no durable claimed turn", { channel, nonce });
+      }
+      let claim: TurnClaim;
+      try {
+        claim = JSON.parse(current.turn_claim_json) as TurnClaim;
+      } catch {
+        return deny(ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN, "ingress turn claim is corrupt", { channel, nonce });
+      }
+      if (!isBoundReceiptIdentity(claim.receiptIdentity ?? null, claim) ||
+          !sameReceiptIdentity(claim.receiptIdentity!, query)) {
+        return deny(ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN, "receipt does not match this durable ingress turn", {
+          channel,
+          nonce,
+          turnRequestId: query.turnRequestId,
+        });
+      }
+      if (!nonEmptyReceipt(receipt)) {
+        return deny(ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN, "authenticated receipt is incomplete", {
+          channel,
+          nonce,
+          turnRequestId: query.turnRequestId,
+        });
+      }
+      const existingReceipt = (claim as TurnClaim & {
+        hermesReceipt?: { receiptId?: unknown; evidenceDigest?: unknown; reasonCode?: unknown };
+      }).hermesReceipt;
+      if (claim.noReplyAt !== undefined &&
+          existingReceipt?.receiptId === receipt.receiptId &&
+          existingReceipt?.evidenceDigest === receipt.evidenceDigest &&
+          existingReceipt?.reasonCode === receipt.reasonCode) {
+        return allow(ReasonCode.INGRESS_REPLAY_IGNORED, undefined);
+      }
+      if (claim.repliedAt !== undefined || claim.noReplyAt !== undefined || claim.settledAt !== undefined) {
+        return deny(ReasonCode.RESOURCE_COLLISION, "ingress turn already has a different terminal outcome", {
+          channel,
+          nonce,
+          turnRequestId: query.turnRequestId,
+        });
+      }
+      if (!isClaimable(current.result_json)) {
+        return deny(ReasonCode.RESOURCE_COLLISION, "ingress reply state changed before receipt completion", {
+          channel,
+          nonce,
+          turnRequestId: query.turnRequestId,
+        });
+      }
+      const noReplyAt = this.clock.nowIso();
+      const settledClaim = {
+        ...claim,
+        noReplyAt,
+        hermesReceipt: {
+          receiptId: receipt.receiptId,
+          evidenceDigest: receipt.evidenceDigest,
+          reasonCode: receipt.reasonCode,
+        },
+      };
+      const updated = this.db.run(
+        `UPDATE inbound_messages
+            SET result_json = ?, turn_claim_json = ?
+          WHERE channel = ? AND nonce = ? AND turn_claim_json = ?
+            AND (result_json IS NULL OR (
+              json_extract(result_json, '$.kind') = 'TELEGRAM_WORKFLOW' AND
+              json_extract(result_json, '$.phase') = 'ADMITTED'
+            ))`,
+        [
+          JSON.stringify({ kind: "TELEGRAM_NO_REPLY" }),
+          JSON.stringify(settledClaim),
+          channel,
+          nonce,
+          current.turn_claim_json,
+        ],
+      );
+      return updated.changes === 1
+        ? allow(ReasonCode.OK, undefined)
+        : deny(ReasonCode.RESOURCE_COLLISION, "receipt completion raced another ingress writer", {
+            channel,
+            nonce,
+            turnRequestId: query.turnRequestId,
+          });
+    });
+  }
+
   recordResult(channel: string, nonce: string, result: unknown): void {
     this.db.run(`UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ?`, [
       JSON.stringify(result),
@@ -564,7 +693,16 @@ export class IngressGuard {
         // Into its own column, not into `result_json`. That field is this Telegram message's
         // reply-delivery lifecycle, and the reservation writes it whole — so a claim stored there
         // was erased by the first reply produced, which is every ordinary timeout (#646).
-        const claim: TurnClaim = { deliveryStatus: TURN_CLAIMED, ...identity };
+        // A receipt identity is bound at the same durable write as the ingress claim. A later
+        // reader may never derive it from the live CEO binding: that binding can fail over between
+        // dispatch and restart, and a receipt from the replacement runtime is not evidence about
+        // this turn. Invalid/absent input is intentionally omitted, leaving the claim UNKNOWN.
+        const receiptIdentity = this.#receiptIdentityForClaim?.(identity) ?? null;
+        const claim: TurnClaim = {
+          deliveryStatus: TURN_CLAIMED,
+          ...identity,
+          ...(isBoundReceiptIdentity(receiptIdentity, identity) ? { receiptIdentity } : {}),
+        };
         const updated = this.db.run(
           `UPDATE inbound_messages SET turn_claim_json = ?
             WHERE channel = ? AND nonce = ? AND turn_claim_json IS NULL`,
@@ -1326,6 +1464,12 @@ export interface TurnIdentity {
 
 export interface TurnClaim extends TurnIdentity {
   deliveryStatus: typeof TURN_CLAIMED;
+  /**
+   * The exact Hermes target/runtime identity valid when this ingress turn was claimed. Its
+   * `turnRequestId` is the durable canonical identity above, not a second caller-chosen id.
+   * Absent rows predate an authenticated target and fail closed during reconciliation.
+   */
+  receiptIdentity?: ReceiptLookupQuery;
   repliedAt?: string;
   noReplyAt?: string;
   settledAt?: string;
@@ -1406,6 +1550,48 @@ const isClaimable = (resultJson: string | null): boolean => {
     return false;
   }
 };
+
+/** A persisted receipt tuple is usable only when it is bound to this exact claimed turn. */
+const isBoundReceiptIdentity = (
+  value: unknown,
+  identity: TurnIdentity,
+): value is ReceiptLookupQuery => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const query = value as Partial<ReceiptLookupQuery>;
+  return query.turnRequestId === identity.turnRequestId
+    && query.promptDigest === identity.promptDigest
+    && typeof query.targetActorId === "string" && query.targetActorId.trim().length > 0
+    && typeof query.bindingGeneration === "number"
+    && Number.isSafeInteger(query.bindingGeneration)
+    && query.bindingGeneration > 0
+    && identity.bindingDigest === digestOf({ bindingGeneration: query.bindingGeneration })
+    && typeof query.targetBindingId === "string" && query.targetBindingId.trim().length > 0
+    && typeof query.targetAttestationId === "string" && query.targetAttestationId.trim().length > 0
+    && typeof query.executorSessionId === "string" && query.executorSessionId.trim().length > 0
+    && typeof query.executorSessionIncarnation === "string" && query.executorSessionIncarnation.trim().length > 0;
+};
+
+/** Neither a stored row nor its caller may substitute one authenticated target tuple for another. */
+const sameReceiptIdentity = (left: ReceiptLookupQuery, right: ReceiptLookupQuery): boolean =>
+  left.turnRequestId === right.turnRequestId
+  && left.targetActorId === right.targetActorId
+  && left.promptDigest === right.promptDigest
+  && left.bindingGeneration === right.bindingGeneration
+  && left.targetBindingId === right.targetBindingId
+  && left.targetAttestationId === right.targetAttestationId
+  && left.executorSessionId === right.executorSessionId
+  && left.executorSessionIncarnation === right.executorSessionIncarnation;
+
+const nonEmptyReceipt = (receipt: {
+  outcome: "ABORTED";
+  receiptId: string;
+  evidenceDigest: string;
+  reasonCode: string;
+}): boolean =>
+  receipt.outcome === "ABORTED"
+  && receipt.receiptId.trim().length > 0
+  && receipt.evidenceDigest.trim().length > 0
+  && receipt.reasonCode.trim().length > 0;
 
 const isRecoverableIngressResult = (resultJson: string | null): boolean => {
   if (!resultJson) return true;

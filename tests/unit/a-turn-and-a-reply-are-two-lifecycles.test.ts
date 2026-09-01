@@ -1,3 +1,4 @@
+import Database from "better-sqlite3";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { IngressGuard, TURN_CLAIMED, type TurnIdentity } from "../../src/ingress/ingress-guard.ts";
@@ -162,26 +163,56 @@ describe("a reply moving through its lifecycle does not take the turn's with it"
     // changes happen and would pass just as well against two transactions that each succeeded.
     // What one transaction buys is the *failure* case — the reply must not stand alone.
     //
-    // A claim nobody can parse is how the second half is made to fail: `json_set` on malformed JSON
-    // is an error, not a no-op.
+    // A temporary test-only trigger makes the claim resolution fail after the reply transition.
+    // The production trigger keeps valid claims immutable; this test must not corrupt one merely
+    // to reach the transaction's rollback branch.
     const harness = makeHarness();
     const guard = guardFor(harness);
     admitOne(guard, "n1");
     guard.claimTurn("telegram", "n1", identity());
     reserve(guard, "n1");
-    harness.cp.db.run(
-      "UPDATE inbound_messages SET turn_claim_json = 'not json' WHERE channel = 'telegram' AND nonce = 'n1'",
-    );
+    const raw = new Database(harness.cp.db.file);
+    try {
+      raw.exec(`CREATE TRIGGER test_block_turn_claim_lifecycle_resolution
+       BEFORE UPDATE OF turn_claim_json ON inbound_messages
+       WHEN CASE
+         WHEN json_valid(OLD.turn_claim_json) = 1
+          AND json_valid(NEW.turn_claim_json) = 1
+          AND (
+            (json_extract(OLD.turn_claim_json, '$.repliedAt') IS NULL
+              AND json_extract(NEW.turn_claim_json, '$.repliedAt') IS NOT NULL)
+            OR (json_extract(OLD.turn_claim_json, '$.settledAt') IS NULL
+              AND json_extract(NEW.turn_claim_json, '$.settledAt') IS NOT NULL)
+            OR (json_extract(OLD.turn_claim_json, '$.noReplyAt') IS NULL
+              AND json_extract(NEW.turn_claim_json, '$.noReplyAt') IS NOT NULL)
+          ) THEN 1
+         ELSE 0
+       END = 1
+       BEGIN
+         SELECT RAISE(ABORT, 'TEST_TURN_CLAIM_LIFECYCLE_RESOLUTION_BLOCKED');
+       END`);
+    } finally {
+      raw.close();
+    }
 
-    expect(() =>
-      guard.completeReplyAndResolveTurn("telegram", "n1", {
-        kind: "TELEGRAM_WORKFLOW",
-        phase: "REPLIED",
-        reply: "답",
-        sent: true,
-        deliveryStatus: "APPLIED",
-      }, "ANSWERED"),
-    ).toThrow();
+    try {
+      expect(() =>
+        guard.completeReplyAndResolveTurn("telegram", "n1", {
+          kind: "TELEGRAM_WORKFLOW",
+          phase: "REPLIED",
+          reply: "답",
+          sent: true,
+          deliveryStatus: "APPLIED",
+        }, "ANSWERED"),
+      ).toThrow();
+    } finally {
+      const cleanup = new Database(harness.cp.db.file);
+      try {
+        cleanup.exec("DROP TRIGGER test_block_turn_claim_lifecycle_resolution");
+      } finally {
+        cleanup.close();
+      }
+    }
 
     // The reply is still reserved, not applied: the whole transaction went back.
     const stored = harness.cp.db.get<{ result_json: string }>(
