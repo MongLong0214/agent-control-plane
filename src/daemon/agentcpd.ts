@@ -443,9 +443,9 @@ export const startBuzzMessageIngressListener = async (
   }
 
   const guard = new IngressGuard(cp.db, cp.clock, cp.audit, { buzz: policy });
-  // `policy.allowedActors` is the relay credential's list and admits every ACTIVE Buzz actor;
-  // `ownerActors` is who may speak to the CEO as the owner. Passing the first for the second is
-  // the defect this argument exists to make impossible to write by accident.
+  // `policy.allowedActors` is the relay credential's list and admits every ACTIVE Buzz channel
+  // identity; `ownerActors` is who may speak to the CEO as the owner. Passing the first for the
+  // second is the defect this argument exists to make impossible to write by accident.
   const ingress = new BuzzMessageIngress(guard, options.ownerActors);
   const port: BuzzMessageTurnPort = {
     deliverToCeo: (text) => deliverAsCeoTurn(options.ceoConversation, text),
@@ -1438,8 +1438,8 @@ export const configuredBuzzActorIngressPolicy = (): IngressPolicy | null => {
  *
  * Read from `owner-identities` (#245) rather than from `ACP_BUZZ_ALLOWED_ACTORS`, because the
  * two answer different questions. The environment allowlist is the relay credential's: it says
- * which channel identities may present an envelope at all, and every ACTIVE Buzz actor the
- * deployment talks to is on it. Owner authority is declared once, on the host, for every
+ * which channel identities may present an envelope at all, and every ACTIVE Buzz channel
+ * identity the deployment talks to is on it. Owner authority is declared once, on the host, for every
  * channel — Telegram already refuses to start on an owner id missing from that file — and the
  * message path takes its owners from the same place.
  *

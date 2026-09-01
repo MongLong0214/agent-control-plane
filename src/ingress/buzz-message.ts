@@ -99,8 +99,9 @@ export class BuzzMessageIngress {
    * `ownerActors` is a second allowlist, and it is the point of this class.
    *
    * The guard's `buzz` policy says which channel identities the relay may present at all — the
-   * same credential the actor-binding half uses, and one every ACTIVE Buzz actor in the
-   * deployment is on. Speaking to the owner's CEO *as the owner* is a different authority, and
+   * same credential the actor-binding half uses, and one every ACTIVE Buzz channel identity in
+   * the deployment is on. Speaking to the owner's CEO *as the owner* is a different authority,
+   * and
    * an allowlist that admits the first cannot be the one that grants the second: an otherwise
    * valid ACTIVE non-owner could sign a CEO-addressed envelope and get a turn. So the owner
    * identities are supplied separately, from `owner-identities` (#245) rather than from the
