@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 import { createOperatorClient, dispatch as dispatchAgentctl } from "../../src/cli/agentctl.ts";
 import { parseRepoFactoryResult, REPO_FACTORY_RESULT_SCHEMA_ID } from "../../src/bootstrap/repo-factory-result.ts";
 import { canonicalJson, digestOf } from "../../src/core/digest.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ArtifactKind, ExecutionMode, TaskClass } from "../../src/domain/types.ts";
 import {
   BASELINE_EXPORT_SCHEMA_ID,
@@ -27,6 +28,7 @@ import { Db } from "../../src/db/database.ts";
 import { migrationChainFrom, SCHEMA_VERSION } from "../../src/db/migrations.ts";
 import {
   bindWorker,
+  finalizeNoRepositoryRun,
   makeHarness,
   makeStartedOperator,
   registerFixtureProject,
@@ -562,6 +564,7 @@ describe("v1 baseline recording", () => {
       fact: "rollbackOrCompensation",
       status: "NOT_OBSERVED",
       source: "OPERATOR",
+      evidenceDigest: digestOf({ observation: "no rollback in the post-merge window" }),
     });
     expect(rollbackObservation.allowed).toBe(true);
 
@@ -649,6 +652,125 @@ describe("v1 baseline recording", () => {
     expect(positiveAssessment.eligibleForGateA).toBe(false);
     expect(positiveAssessment.gaps).toContain("unauthorized merges observed: 1");
     expect(assessment.gaps.length).toBeGreaterThan(0);
+  });
+
+  it("refuses a quality observation that names no evidence it was read from", () => {
+    const harness = makeHarness();
+    const created = harness.cp.runs.create({ executionMode: ExecutionMode.STANDARD, contract });
+    expect(created.allowed).toBe(true);
+    if (!created.allowed) return;
+
+    for (const status of ["OBSERVED", "NOT_OBSERVED"] as const) {
+      const asserted = harness.cp.runs.recordQualityObservation(created.value.runId, {
+        fact: "rollbackOrCompensation",
+        status,
+        source: "OPERATOR",
+      });
+      expect(asserted.allowed).toBe(false);
+      expect(asserted.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
+    }
+
+    // UNAVAILABLE is the honest way to say nothing was looked at, so it stays free — and
+    // it covers nothing, which is the whole reason it is free.
+    const unavailable = harness.cp.runs.recordQualityObservation(created.value.runId, {
+      fact: "rollbackOrCompensation",
+      status: "UNAVAILABLE",
+      source: "POST_MERGE_OBSERVER",
+    });
+    expect(unavailable.allowed).toBe(true);
+
+    const exported = exporterFor(harness).exportRun(created.value.runId);
+    expect(exported.allowed).toBe(true);
+    if (!exported.allowed) return;
+    const facts = exported.value.baseline.quality["facts"] as Array<Record<string, unknown>>;
+    expect(facts.find((fact) => fact["name"] === "rollbackOrCompensation")?.["present"]).toBe(false);
+  });
+
+  it("does not let a stored quality observation with a malformed nonempty evidence digest cover its fact", () => {
+    const harness = makeHarness();
+    const created = harness.cp.runs.create({ executionMode: ExecutionMode.STANDARD, contract });
+    expect(created.allowed).toBe(true);
+    if (!created.allowed) return;
+
+    // The ledger is append-only: a record written before the recorder required evidence is
+    // read forever. This is that row, inserted the way the ledger already holds one.
+    const recordedAt = harness.clock.nowIso();
+    const payload = {
+      fact: "rollbackOrCompensation",
+      status: "NOT_OBSERVED",
+      source: "OPERATOR",
+      evidenceDigest: "not-a-digest",
+    };
+    const payloadDigest = digestOf({
+      schema: BASELINE_RECORD_SCHEMA_ID,
+      kind: BaselineRecordKind.QUALITY_OBSERVATION,
+      runId: created.value.runId,
+      recordedAt,
+      payload,
+    });
+    harness.cp.db.run(
+      `INSERT INTO baseline_records
+         (run_id, record_kind, schema_id, recorded_at, payload_json, payload_digest)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        created.value.runId,
+        BaselineRecordKind.QUALITY_OBSERVATION,
+        BASELINE_RECORD_SCHEMA_ID,
+        recordedAt,
+        canonicalJson({
+          schema: BASELINE_RECORD_SCHEMA_ID,
+          kind: BaselineRecordKind.QUALITY_OBSERVATION,
+          runId: created.value.runId,
+          recordedAt,
+          payload,
+          payloadDigest,
+        }),
+        payloadDigest,
+      ],
+    );
+    const validObservation = harness.cp.runs.recordQualityObservation(created.value.runId, {
+      fact: "defectEscape",
+      status: "OBSERVED",
+      source: "OPERATOR",
+      evidenceDigest: digestOf({ observation: "defect escape was observed" }),
+    });
+    expect(validObservation.allowed).toBe(true);
+
+    const exported = exporterFor(harness).exportRun(created.value.runId);
+    expect(exported.allowed).toBe(true);
+    if (!exported.allowed) return;
+    const quality = exported.value.baseline.quality;
+    // The records are read and reported — only the valid digest is coverage.
+    expect((quality["rollbackOrCompensation"] as Record<string, unknown>)["status"]).toBe("NOT_OBSERVED");
+    expect((quality["defectEscapeObservedLater"] as Record<string, unknown>)["status"]).toBe("OBSERVED");
+    const facts = quality["facts"] as Array<Record<string, unknown>>;
+    expect(facts.find((fact) => fact["name"] === "rollbackOrCompensation")?.["present"]).toBe(false);
+    expect(facts.find((fact) => fact["name"] === "defectEscape")?.["present"]).toBe(true);
+    expect(quality["complete"]).toBe(false);
+  });
+
+  it("reports an unknown unauthorized-merge count for a completed production run that recorded no quality observation", async () => {
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const finalized = await finalizeNoRepositoryRun(harness, projectId, contract, {
+      baselineHarness: { evidenceSource: "PRODUCTION", acpBinaryVersion: "production-build" },
+    });
+    const exported = exporterFor(harness).exportRun(finalized.runId);
+    expect(exported.allowed).toBe(true);
+    if (!exported.allowed) return;
+    expect(exported.value.run.state).toBe("COMPLETED");
+    expect(Object.hasOwn(exported.value.baseline.quality, "unauthorizedMerges")).toBe(false);
+
+    const assessment = assessBaselineMinimum([exported.value]);
+    expect(assessment.observed.productionAttestedRuns).toBe(1);
+    // Nothing counted, so nothing is reported as counted. A zero here would be the system
+    // claiming no unauthorized merge happened on the strength of never having looked.
+    expect(assessment.observed.unauthorizedMerges).toBe(null);
+    expect(assessment.gaps).toContain("unauthorized merge count is not separately recorded");
+    // And a completed run whose quality baseline is incomplete is counted as exactly that.
+    expect(assessment.observed.falseCompletions).toBe(1);
+    expect(assessment.gaps).toContain("completed runs missing quality baseline: 1");
+    expect(assessment.eligibleForGateA).toBe(false);
   });
 
   it("excludes unqualified invocations from Gate A coverage when evidence is mixed", async () => {
