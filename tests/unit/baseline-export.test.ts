@@ -686,7 +686,7 @@ describe("v1 baseline recording", () => {
     expect(facts.find((fact) => fact["name"] === "rollbackOrCompensation")?.["present"]).toBe(false);
   });
 
-  it("does not let a stored quality observation without an evidence digest cover its fact", () => {
+  it("does not let a stored quality observation with a malformed nonempty evidence digest cover its fact", () => {
     const harness = makeHarness();
     const created = harness.cp.runs.create({ executionMode: ExecutionMode.STANDARD, contract });
     expect(created.allowed).toBe(true);
@@ -699,7 +699,7 @@ describe("v1 baseline recording", () => {
       fact: "rollbackOrCompensation",
       status: "NOT_OBSERVED",
       source: "OPERATOR",
-      evidenceDigest: null,
+      evidenceDigest: "not-a-digest",
     };
     const payloadDigest = digestOf({
       schema: BASELINE_RECORD_SCHEMA_ID,
@@ -728,15 +728,24 @@ describe("v1 baseline recording", () => {
         payloadDigest,
       ],
     );
+    const validObservation = harness.cp.runs.recordQualityObservation(created.value.runId, {
+      fact: "defectEscape",
+      status: "OBSERVED",
+      source: "OPERATOR",
+      evidenceDigest: digestOf({ observation: "defect escape was observed" }),
+    });
+    expect(validObservation.allowed).toBe(true);
 
     const exported = exporterFor(harness).exportRun(created.value.runId);
     expect(exported.allowed).toBe(true);
     if (!exported.allowed) return;
     const quality = exported.value.baseline.quality;
-    // The record is read and reported — it is simply not coverage.
+    // The records are read and reported — only the valid digest is coverage.
     expect((quality["rollbackOrCompensation"] as Record<string, unknown>)["status"]).toBe("NOT_OBSERVED");
+    expect((quality["defectEscapeObservedLater"] as Record<string, unknown>)["status"]).toBe("OBSERVED");
     const facts = quality["facts"] as Array<Record<string, unknown>>;
     expect(facts.find((fact) => fact["name"] === "rollbackOrCompensation")?.["present"]).toBe(false);
+    expect(facts.find((fact) => fact["name"] === "defectEscape")?.["present"]).toBe(true);
     expect(quality["complete"]).toBe(false);
   });
 

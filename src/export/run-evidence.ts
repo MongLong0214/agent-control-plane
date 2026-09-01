@@ -866,7 +866,7 @@ const projectQuality = (
     if (observation === null) return false;
     const status = observation["status"];
     if (status !== "OBSERVED" && status !== "NOT_OBSERVED") return false;
-    return typeof observation["evidenceDigest"] === "string";
+    return isDigest(observation["evidenceDigest"]);
   };
   const rollbackObservation = latestObservation("rollbackOrCompensation");
   const defectEscapeObservation = latestObservation("defectEscape");
