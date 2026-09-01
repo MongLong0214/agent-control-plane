@@ -3037,7 +3037,7 @@ const GUARDS = [
     // backup before this binary can begin storing admitted payloads on the inbound row.
     what: "opening a v34 database takes an automatic rollback snapshot before v35 admitted-payload state",
     file: "src/db/migrations.ts",
-    find: "export const SCHEMA_VERSION = 35;",
+    find: "export const SCHEMA_VERSION = 36;",
     replace: "export const SCHEMA_VERSION = 34;",
     killedBy: [
       "tests/unit/database-migration-restore.test.ts::opening a v34 database takes an automatic rollback snapshot before v35 admitted-payload state",
