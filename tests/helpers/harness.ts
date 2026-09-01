@@ -61,9 +61,17 @@ export const makeHarness = (
      * remote records — see the P1-01 finding on the P0-14 gate canary.
      */
     clock?: ManualClock;
+    /**
+     * Opens an existing fixture root instead of minting a new one.
+     *
+     * A restart is the only reason to want this: the second process has to reach the *same*
+     * database file the first one wrote, and a fresh `tempDir` is a different deployment that
+     * cannot lose anything the first one had.
+     */
+    root?: string;
   } = {},
 ): Harness => {
-  const root = tempDir("acp-harness-");
+  const root = options.root ?? tempDir("acp-harness-");
   const clock = options.clock ?? new ManualClock("2026-08-12T00:00:00.000Z");
   const scripted = new TestProductionAdapter(clock);
 
