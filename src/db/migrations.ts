@@ -2225,6 +2225,31 @@ const v35: SchemaMigration = {
   fromVersion: 34,
   toVersion: 35,
   apply: (raw) => {
+    // A pre-v35 unresolved claim has no authoritative copy of the sender's words. Adding a nullable
+    // column cannot repair that absence, and fabricating a payload from the digest or claim metadata
+    // would make a later recovery reader treat an invention as the message. Check before the first
+    // v35 mutation so the database remains a v34 image an operator can inspect or recover.
+    const unrecoverable = raw.prepare(
+      `SELECT channel, nonce
+         FROM inbound_messages
+        WHERE turn_claim_json IS NOT NULL
+          AND CASE
+            WHEN json_valid(turn_claim_json) <> 1 THEN 1
+            WHEN json_extract(turn_claim_json, '$.repliedAt') IS NULL
+             AND json_extract(turn_claim_json, '$.settledAt') IS NULL
+             AND json_extract(turn_claim_json, '$.noReplyAt') IS NULL THEN 1
+            ELSE 0
+          END = 1
+        ORDER BY received_at ASC
+        LIMIT 1`,
+    ).get() as { channel: string; nonce: string } | undefined;
+    if (unrecoverable) {
+      throw acpError(
+        ReasonCode.INTERNAL_ERROR,
+        "v35 cannot migrate unresolved inbound messages without their admitted payload",
+        unrecoverable,
+      );
+    }
     const columns = (
       raw.prepare(`SELECT name FROM pragma_table_info('inbound_messages')`).all() as Array<{
         name: string;

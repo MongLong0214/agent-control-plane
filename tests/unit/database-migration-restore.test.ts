@@ -419,13 +419,24 @@ const asV33Fixture = (path: string): void => {
  * boundary answers is what the snapshot holds if the upgrade is reversed — so the fixture has to
  * carry a row that existed before the column did.
  */
-const asV34Fixture = (path: string): void => {
+const V34_UNRESOLVED_TURN_CLAIM = JSON.stringify({
+  deliveryStatus: "TURN_CLAIMED",
+  turnRequestId: "turn:34-unresolved",
+  sessionDigest: `sha256:${"c".repeat(64)}`,
+  promptDigest: `sha256:${"d".repeat(64)}`,
+  bindingDigest: `sha256:${"e".repeat(64)}`,
+});
+
+const asV34Fixture = (path: string, options: { unresolvedTurn?: boolean } = {}): void => {
   const current = new Db(path);
   current.close();
 
   const raw = new Database(path);
   try {
-    raw.exec("DROP TRIGGER IF EXISTS inbound_messages_payload_immutable");
+    raw.exec(`
+      DROP TRIGGER IF EXISTS inbound_messages_payload_immutable;
+      DROP TRIGGER IF EXISTS inbound_messages_no_replace;
+    `);
     const present = raw
       .prepare("SELECT 1 AS present FROM pragma_table_info('inbound_messages') WHERE name = 'payload_json'")
       .get();
@@ -440,9 +451,9 @@ const asV34Fixture = (path: string): void => {
     ).run(34, v34.id, v34.checksum(), NOW);
     installMigrationLedger(raw);
     raw.prepare(
-      `INSERT INTO inbound_messages (channel, nonce, actor, received_at)
-       VALUES ('telegram', 'update:34', '424242', ?)`,
-    ).run(NOW);
+      `INSERT INTO inbound_messages (channel, nonce, actor, received_at, turn_claim_json)
+       VALUES ('telegram', 'update:34', '424242', ?, ?)`,
+    ).run(NOW, options.unresolvedTurn ? V34_UNRESOLVED_TURN_CLAIM : null);
     raw.pragma("user_version = 34");
   } finally {
     raw.close();
@@ -505,6 +516,84 @@ const assertEmptyActorRegistry = (db: Db): void => {
 };
 
 describe("versioned SQLite migration", () => {
+  it("refuses a v34 unresolved turn before v35 can add an unrecoverable admitted-payload state", () => {
+    const path = join(tempDir("acp-v34-unrecoverable-unresolved-turn-"), "state.sqlite");
+    asV34Fixture(path, { unresolvedTurn: true });
+
+    let originalRow: {
+      channel: string;
+      nonce: string;
+      actor: string;
+      received_at: string;
+      result_json: string | null;
+      turn_claim_hex: string;
+    } | undefined;
+    const before = new Database(path, { readonly: true, fileMustExist: true });
+    try {
+      expect(Number(before.pragma("user_version", { simple: true }))).toBe(34);
+      expect(before.prepare(
+        "SELECT 1 AS present FROM pragma_table_info('inbound_messages') WHERE name = 'payload_json'",
+      ).get()).toBeUndefined();
+      expect(before.prepare(
+        `SELECT name FROM sqlite_master
+          WHERE type = 'trigger'
+            AND name IN ('inbound_messages_payload_immutable', 'inbound_messages_no_replace')
+          ORDER BY name`,
+      ).all()).toEqual([]);
+      originalRow = before.prepare(
+        `SELECT channel, nonce, actor, received_at, result_json, hex(turn_claim_json) AS turn_claim_hex
+           FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'update:34'`,
+      ).get() as typeof originalRow;
+      expect(originalRow).toMatchObject({
+        channel: "telegram",
+        nonce: "update:34",
+        actor: "424242",
+        received_at: NOW,
+        result_json: null,
+        turn_claim_hex: Buffer.from(V34_UNRESOLVED_TURN_CLAIM, "utf8").toString("hex").toUpperCase(),
+      });
+    } finally {
+      before.close();
+    }
+
+    let migrationFailure: unknown;
+    try {
+      new Db(path);
+    } catch (error) {
+      migrationFailure = error;
+    }
+    expect(isAcpError(migrationFailure)).toBe(true);
+    if (!isAcpError(migrationFailure)) throw new Error("v35 unexpectedly opened the unrecoverable v34 fixture");
+    expect(migrationFailure).toMatchObject({
+      reasonCode: ReasonCode.INTERNAL_ERROR,
+      message: "migration failed; the original database was restored from its automatic backup",
+      evidence: expect.objectContaining({
+        fromVersion: 34,
+        migrationError: "v35 cannot migrate unresolved inbound messages without their admitted payload",
+      }),
+    });
+
+    const after = new Database(path, { readonly: true, fileMustExist: true });
+    try {
+      expect(Number(after.pragma("user_version", { simple: true }))).toBe(34);
+      expect(after.prepare(
+        "SELECT 1 AS present FROM pragma_table_info('inbound_messages') WHERE name = 'payload_json'",
+      ).get()).toBeUndefined();
+      expect(after.prepare(
+        `SELECT name FROM sqlite_master
+          WHERE type = 'trigger'
+            AND name IN ('inbound_messages_payload_immutable', 'inbound_messages_no_replace')
+          ORDER BY name`,
+      ).all()).toEqual([]);
+      expect(after.prepare(
+        `SELECT channel, nonce, actor, received_at, result_json, hex(turn_claim_json) AS turn_claim_hex
+           FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'update:34'`,
+      ).get()).toEqual(originalRow);
+    } finally {
+      after.close();
+    }
+  });
+
   it("opening a v34 database takes an automatic rollback snapshot before v35 admitted-payload state", () => {
     const path = join(tempDir("acp-v34-admitted-payload-boundary-"), "state.sqlite");
     asV34Fixture(path);
