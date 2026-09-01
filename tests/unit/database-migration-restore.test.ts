@@ -462,7 +462,18 @@ const asV34Fixture = (path: string, options: { unresolvedTurn?: boolean } = {}):
   }
 };
 
-const V35_RECEIPT_IDENTITY = {
+type V35ReceiptIdentityFixture = {
+  turnRequestId: string;
+  targetActorId: string;
+  promptDigest: string;
+  bindingGeneration: number;
+  targetBindingId: string;
+  targetAttestationId: string;
+  executorSessionId: string;
+  executorSessionIncarnation: string;
+};
+
+const V35_RECEIPT_IDENTITY: V35ReceiptIdentityFixture = {
   turnRequestId: "turn:v35-legacy",
   targetActorId: "actor:v35-legacy",
   promptDigest: `sha256:${"d".repeat(64)}`,
@@ -483,7 +494,7 @@ const V35_UNBOUND_TURN_CLAIM = JSON.stringify({
 
 const seedV35CanonicalTurn = (
   raw: Database.Database,
-  identity: typeof V35_RECEIPT_IDENTITY,
+  identity: V35ReceiptIdentityFixture,
   source: { channel: string; nonce: string; attempt: number; predecessorTurnRequestId: string | null },
 ): void => {
   raw.prepare(

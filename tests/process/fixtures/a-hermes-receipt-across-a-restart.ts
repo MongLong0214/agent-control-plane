@@ -12,8 +12,8 @@ import { startDaemonTelegramListener } from "../../../src/daemon/agentcpd.ts";
 import { TelegramInterruption } from "../../../src/ingress/telegram-router.ts";
 import type { TelegramBotTransport } from "../../../src/ingress/telegram-polling.ts";
 import type { TelegramUpdate } from "../../../src/ingress/telegram.ts";
-import type { HermesAcpExecute, HermesAcpResult } from "../../../src/runtime/hermes-acp-client.ts";
-import type { HermesReceiptPortOptions } from "../../../src/runtime/hermes-receipt-port.ts";
+import type { HermesAcpResult } from "../../../src/runtime/hermes-acp-client.ts";
+import type { HermesAcpExecute, HermesReceiptPortOptions } from "../../../src/runtime/hermes-receipt-port.ts";
 import { bindCeo, makeHarness, TEST_OWNER } from "../../helpers/harness.ts";
 
 export const OWNER_ID = "424242";
