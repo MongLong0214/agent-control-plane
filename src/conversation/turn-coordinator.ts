@@ -1181,6 +1181,83 @@ export class ConversationTurnCoordinator {
       }));
   }
 
+  async reconcileIngressReceipt(
+    query: ReceiptLookupQuery,
+    /**
+     * The event-specific completion remains with the ingress ledger. The receipt reaches this
+     * closure only after this coordinator's sealed port looked it up and every immutable field
+     * below matched; callers never receive a receipt-shaped public argument they could forge.
+     */
+    settle: (receipt: {
+      outcome: "ABORTED";
+      receiptId: string;
+      evidenceDigest: string;
+      reasonCode: string;
+    }) => Decision<void>,
+  ): Promise<Decision<void>> {
+    let result: ReceiptLookupResult;
+    try {
+      result = await this.#lookupWithTimeout(query);
+    } catch {
+      return deny(
+        ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN,
+        "the authenticated target receipt could not be read, so the ingress turn stays unresolved",
+        { turnRequestId: query.turnRequestId },
+      );
+    }
+    if (!result.found) {
+      return deny(
+        ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN,
+        "the target has no terminal receipt for this ingress turn",
+        { turnRequestId: query.turnRequestId },
+      );
+    }
+    if (result.turnRequestId !== query.turnRequestId) {
+      return deny(ReasonCode.CONVERSATION_TURN_RECEIPT_WRONG_TURN, "receipt names a different turn", {
+        turnRequestId: query.turnRequestId,
+        receiptTurnRequestId: result.turnRequestId,
+      });
+    }
+    if (result.targetActorId !== query.targetActorId || result.promptDigest !== query.promptDigest ||
+        result.bindingGeneration !== query.bindingGeneration) {
+      return deny(ReasonCode.CONVERSATION_TURN_RECEIPT_WRONG_GENERATION, "receipt does not match this turn's actor, prompt, or generation", {
+        turnRequestId: query.turnRequestId,
+      });
+    }
+    if (result.targetBindingId !== query.targetBindingId) {
+      return deny(ReasonCode.CONVERSATION_TURN_RECEIPT_WRONG_BINDING, "receipt names a different target binding", {
+        turnRequestId: query.turnRequestId,
+      });
+    }
+    if (result.targetAttestationId !== query.targetAttestationId) {
+      return deny(ReasonCode.CONVERSATION_TURN_RECEIPT_WRONG_ATTESTATION, "receipt names a different target attestation", {
+        turnRequestId: query.turnRequestId,
+      });
+    }
+    if (result.executorSessionId !== query.executorSessionId ||
+        result.executorSessionIncarnation !== query.executorSessionIncarnation) {
+      return deny(ReasonCode.CONVERSATION_TURN_RECEIPT_WRONG_RUNTIME, "receipt names a different executor runtime", {
+        turnRequestId: query.turnRequestId,
+      });
+    }
+    // A completed target receipt has an owner-reply obligation. The canonical outbox does not
+    // exist on this ingress lane yet, so only an authenticated ABORTED receipt can terminalize it
+    // without falsely claiming the owner received the target's response.
+    if (result.outcome !== "ABORTED") {
+      return deny(
+        ReasonCode.CONVERSATION_TURN_RECEIPT_REPLY_OBLIGATION_UNDISCHARGEABLE,
+        "a completed target receipt cannot settle ingress before its reply is atomically durable",
+        { turnRequestId: query.turnRequestId },
+      );
+    }
+    return settle({
+      outcome: result.outcome,
+      receiptId: result.receiptId,
+      evidenceDigest: result.evidenceDigest,
+      reasonCode: result.reasonCode,
+    });
+  }
+
   /**
    * Sweeps every `IN_DOUBT` turn once, asking `this.#receiptPort` about each — the write half of
    * contract 6, and the one settlement path that does not take a `TurnPermit`.

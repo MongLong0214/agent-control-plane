@@ -1401,16 +1401,50 @@ const truncateTelegramText = (text: string): string =>
  */
 const MAX_NAMED_UNRESOLVED_TURNS = 10;
 
+/**
+ * How much of a lost message the park reply quotes back.
+ *
+ * Bounded for #695's reason: `MAX_NAMED_UNRESOLVED_TURNS` rows each carrying an unbounded excerpt
+ * is the same reply-too-long failure the row cap exists to prevent, moved into the row. Ten rows
+ * at this width plus their timestamps stays far under the 3,880-character cut, so the two lines
+ * that tell the owner `/again` exists still arrive.
+ */
+const UNRESOLVED_EXCERPT_LIMIT = 120;
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/**
+ * What the owner wrote in a turn that never resolved, as the durable inbox holds it (#631).
+ *
+ * States the absence rather than omitting the row. A row admitted before `payload_json` existed
+ * has no copy of its message and never will; rendering it as a bare timestamp would read exactly
+ * like a row whose content *is* known, and the owner deciding whether to `/again` would have no
+ * way to tell "we have it" from "we lost it".
+ */
+const unresolvedTurnExcerpt = (turn: UnresolvedTurn): string => {
+  const payload = turn.payload;
+  const text = isRecord(payload) ? payload["text"] : null;
+  if (typeof text !== "string" || text.length === 0) return "content not recorded";
+  const excerpt = text.length > UNRESOLVED_EXCERPT_LIMIT
+    ? `${text.slice(0, UNRESOLVED_EXCERPT_LIMIT)}…`
+    : text;
+  return `"${excerpt}"`;
+};
+
 /** The park reply's summary of what is unresolved — every row is counted, only some are named. */
 const unresolvedTurnsParkText = (unresolved: readonly UnresolvedTurn[]): string => {
   if (unresolved.length === 1) {
-    return `DIRECT parked: an earlier message in this conversation is still unresolved (received ${unresolved[0]!.receivedAt}).`;
+    const only = unresolved[0]!;
+    return `DIRECT parked: an earlier message in this conversation is still unresolved (received ${only.receivedAt}): ${unresolvedTurnExcerpt(only)}.`;
   }
   const shown = unresolved.slice(0, MAX_NAMED_UNRESOLVED_TURNS);
   const remaining = unresolved.length - shown.length;
-  const timestamps = shown.map((turn) => turn.receivedAt).join(", ");
-  const tail = remaining > 0 ? `, and ${remaining} more` : "";
-  return `DIRECT parked: ${unresolved.length} earlier messages in this conversation are still unresolved (received ${timestamps}${tail}).`;
+  const named = shown
+    .map((turn) => `${turn.receivedAt} ${unresolvedTurnExcerpt(turn)}`)
+    .join("; ");
+  const tail = remaining > 0 ? `; and ${remaining} more` : "";
+  return `DIRECT parked: ${unresolved.length} earlier messages in this conversation are still unresolved (${named}${tail}).`;
 };
 
 const replyToMessageIdFor = (update: TelegramUpdate): number | null => {

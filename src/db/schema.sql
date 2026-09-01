@@ -1191,10 +1191,81 @@ CREATE TABLE IF NOT EXISTS inbound_messages (
   -- Two lifecycles in one field is the whole defect: the reply's advanced and took the turn's with
   -- it. They reference each other by id now and share no storage.
   turn_claim_json TEXT,
+  -- What the sender actually said, kept because nothing else keeps it (#631).
+  --
+  -- The three columns above are all *about* a message: its key, its reply's delivery, its turn's
+  -- claim. None of them is the message. For Telegram that made the transport the sole custodian
+  -- of the owner's own words, and the restart path spends that copy: a redelivered update whose
+  -- turn is unresolved is refused INGRESS_TURN_OUTCOME_UNKNOWN with a null reply, the poller
+  -- settles it, and settling advances the offset — which is how ACP tells Telegram to drop it.
+  -- Answer never sent, copy never kept, and the message becomes indistinguishable from one the
+  -- owner never wrote.
+  --
+  -- Written once, by `IngressGuard.admit`'s INSERT, before any handler runs — so it is on disk
+  -- before anything can advance an offset past it. Never updated, and the trigger below is what
+  -- makes that structural rather than a convention: #646's defect was two lifecycles sharing
+  -- `result_json`, where the reply's advance overwrote the turn's claim. A third lifecycle
+  -- reachable by UPDATE would be the same defect a third time.
+  payload_json TEXT,
   PRIMARY KEY (channel, nonce)
 );
 
 CREATE INDEX IF NOT EXISTS inbound_received ON inbound_messages(received_at);
+
+-- CP-HI-08 — the admitted payload is the sender's own words and the only copy ACP holds. Every
+-- other column on this row is updated by some lifecycle; this one is write-once so that no
+-- lifecycle can reach it, which is the structural form of the separation #646 had to make by hand.
+-- Rewritten, it degrades silently in the exact way CP-HI-08 forbids: a turn interrupted by a crash
+-- stops being distinguishable from a message the owner never sent (#631).
+CREATE TRIGGER IF NOT EXISTS inbound_messages_payload_immutable
+BEFORE UPDATE OF payload_json ON inbound_messages
+WHEN NEW.payload_json IS NOT OLD.payload_json
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_PAYLOAD_IMMUTABLE');
+END;
+
+-- CP-HI-06 — same census, same hole as the rows above: the UPDATE rule is only half of write-once.
+-- `INSERT OR REPLACE` deletes the row and writes a new one, so it rewrites a payload without ever
+-- running an UPDATE trigger, and the replay defence this table exists for goes with it — a
+-- replaced row is a nonce that has never been seen. Found by `pnpm schema:census`, which refuses a
+-- table guarded on one verb and open on the other (#631).
+CREATE TRIGGER IF NOT EXISTS inbound_messages_no_replace
+BEFORE INSERT ON inbound_messages
+WHEN EXISTS (
+  SELECT 1 FROM inbound_messages
+   WHERE channel = NEW.channel AND nonce = NEW.nonce
+)
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_MESSAGE_NO_REPLACE');
+END;
+
+-- CP-HI-06 — a claimed ingress turn's target tuple is historical evidence. A lifecycle writer
+-- may add its terminal facts, but it must never alter the turn it is closing or the exact Hermes
+-- runtime tuple that a future receipt is compared with. `CASE` keeps malformed raw JSON on the
+-- refusal path instead of evaluating json_extract and turning a typed denial into a SQLite parser
+-- error. The INSERT case remains open: claimTurn's first write is what fixes the identity.
+CREATE TRIGGER IF NOT EXISTS inbound_messages_turn_claim_identity_immutable
+BEFORE UPDATE OF turn_claim_json ON inbound_messages
+WHEN OLD.turn_claim_json IS NOT NULL
+ AND CASE
+   WHEN NEW.turn_claim_json IS NULL
+     OR json_valid(OLD.turn_claim_json) <> 1
+     OR json_valid(NEW.turn_claim_json) <> 1 THEN 1
+   WHEN json_extract(NEW.turn_claim_json, '$.turnRequestId')
+          IS NOT json_extract(OLD.turn_claim_json, '$.turnRequestId')
+     OR json_extract(NEW.turn_claim_json, '$.sessionDigest')
+          IS NOT json_extract(OLD.turn_claim_json, '$.sessionDigest')
+     OR json_extract(NEW.turn_claim_json, '$.promptDigest')
+          IS NOT json_extract(OLD.turn_claim_json, '$.promptDigest')
+     OR json_extract(NEW.turn_claim_json, '$.bindingDigest')
+          IS NOT json_extract(OLD.turn_claim_json, '$.bindingDigest')
+     OR json_extract(NEW.turn_claim_json, '$.receiptIdentity')
+          IS NOT json_extract(OLD.turn_claim_json, '$.receiptIdentity') THEN 1
+   ELSE 0
+ END = 1
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_TURN_CLAIM_IDENTITY_IMMUTABLE');
+END;
 
 -- ---------------------------------------------------------------------------
 -- telegram_owner_prompts

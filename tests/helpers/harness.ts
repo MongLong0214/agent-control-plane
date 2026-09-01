@@ -12,10 +12,12 @@ import { BuzzAdapter, InMemoryBuzzTransport, type BuzzTransport } from "../../sr
 import { TestProductionAdapter } from "./production-adapter.ts";
 import type { GitHubClient, GitHubKernelOptions } from "../../src/github/github-kernel.ts";
 import type { OwnerIdentity } from "../../src/ceo/owner-authority.ts";
+import type { BaselineHarnessInput } from "../../src/export/baseline-contract.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import type { ManagedManifestWrite } from "../../src/registry/project-registry.ts";
+import type { HermesReceiptPortOptions } from "../../src/runtime/hermes-receipt-port.ts";
 import { commitAll, gitSync, makeRepo, tempDir, writeFiles } from "./fixtures.ts";
 
 /** The single allowlisted owner identity of the fixture deployment. */
@@ -49,6 +51,8 @@ export const makeHarness = (
     githubAppEnvFile?: string;
     githubAppPrivateKeyPath?: string;
     ownerIdentities?: readonly OwnerIdentity[];
+    /** Uses the production Hermes receipt adapter with a test-owned executor seam. */
+    hermesReceipt?: HermesReceiptPortOptions;
     allowTestEvidenceWriters?: boolean;
     /**
      * Replaces the in-memory route. Live acceptance captures pass the real CLI transport so
@@ -61,9 +65,17 @@ export const makeHarness = (
      * remote records — see the P1-01 finding on the P0-14 gate canary.
      */
     clock?: ManualClock;
+    /**
+     * Opens an existing fixture root instead of minting a new one.
+     *
+     * A restart is the only reason to want this: the second process has to reach the *same*
+     * database file the first one wrote, and a fresh `tempDir` is a different deployment that
+     * cannot lose anything the first one had.
+     */
+    root?: string;
   } = {},
 ): Harness => {
-  const root = tempDir("acp-harness-");
+  const root = options.root ?? tempDir("acp-harness-");
   const clock = options.clock ?? new ManualClock("2026-08-12T00:00:00.000Z");
   const scripted = new TestProductionAdapter(clock);
 
@@ -97,6 +109,7 @@ console.log('verification ok');`,
     },
     // §21 — the fixture deployment has exactly one owner identity.
     ownerIdentities: options.ownerIdentities ?? [TEST_OWNER],
+    ...(options.hermesReceipt ? { hermesReceipt: options.hermesReceipt } : {}),
     // A fixture writes evidence directly in a few places; the daemon never unlocks this.
     allowTestEvidenceWriters: options.allowTestEvidenceWriters ?? true,
     ctoPreference: { provider: "scripted", model: "scripted-cto", effort: null },
@@ -620,6 +633,8 @@ export const finalizeNoRepositoryRun = async (
   harness: Harness,
   projectId: string,
   contract: TaskContract,
+  /** Baseline exports only count a run whose harness identity attests production evidence. */
+  options: { baselineHarness?: BaselineHarnessInput } = {},
 ): Promise<{ runId: string; candidateSnapshotDigest: string }> => {
   bindCeo(harness);
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
@@ -631,6 +646,7 @@ export const finalizeNoRepositoryRun = async (
     // omit their required owner item.
     executionMode: ExecutionMode.STANDARD,
     contract,
+    ...(options.baselineHarness ? { baselineHarness: options.baselineHarness } : {}),
   });
   if (!created.allowed) throw new Error(created.message);
   const dispatched = await harness.cp.runs.dispatch(created.value.runId);

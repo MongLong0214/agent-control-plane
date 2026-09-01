@@ -3033,14 +3033,14 @@ const GUARDS = [
     ],
   },
   {
-    // Removing the v34 boundary makes v33 current again, so opening it takes no pre-migration
-    // backup before this binary can begin writing Hermes target-bind receipt evidence.
-    what: "opening a v33 database takes an automatic rollback snapshot before v34 target-bind receipt state",
+    // Removing the v35 boundary makes v34 current again, so opening it takes no pre-migration
+    // backup before this binary can begin storing admitted payloads on the inbound row.
+    what: "opening a v34 database takes an automatic rollback snapshot before v35 admitted-payload state",
     file: "src/db/migrations.ts",
-    find: "export const SCHEMA_VERSION = 34;",
-    replace: "export const SCHEMA_VERSION = 33;",
+    find: "export const SCHEMA_VERSION = 36;",
+    replace: "export const SCHEMA_VERSION = 34;",
     killedBy: [
-      "tests/unit/database-migration-restore.test.ts::opening a v33 database takes an automatic rollback snapshot before v34 target-bind receipt state",
+      "tests/unit/database-migration-restore.test.ts::opening a v34 database takes an automatic rollback snapshot before v35 admitted-payload state",
     ],
   },
   {
