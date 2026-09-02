@@ -630,10 +630,8 @@ backup:
     # #738 — a migration is now a decided act, and the dry run has to decide it too. This
     # approves the throwaway copy only: the approval file lands in $DRY_DIR beside it, names
     # that copy's own from/to versions, and cannot authorise anything for the live database.
-    node /Users/isaac/projects/agent-control-plane/dist/db/state-admin.js approve-migration \
-      --database "$DRY" --approved-by "$USER" --confirm-migration
-    node /Users/isaac/projects/agent-control-plane/dist/db/state-admin.js migrate-approved-copy \
-      --database-copy "$DRY" --confirm-migration
+    agentcpd-state approve-migration --database "$DRY" --approved-by "$USER" --confirm-migration
+    agentcpd-state migrate-approved-copy --database-copy "$DRY" --confirm-migration
     rm -rf "$DRY_DIR"
 
 Expect a report whose `toVersion` is the `SCHEMA_VERSION` the pinned candidate declares, listing
@@ -642,6 +640,12 @@ the migration ids that ran with `checksum: true` on each, `approvalRetired: true
 
 This drives the real migration code — `applySchema` calling `migrate` in `src/db/database.ts` —
 not a re-implementation of it, because it is the same compiled file the daemon is about to load.
+
+`agentcpd-state` is the installed command, and it is deliberately not spelled as a path into a
+checkout. A runbook step that runs `node <checkout>/dist/db/state-admin.js` makes a private
+working tree the authority for what the operator just proved: it is the same failure as the
+inline program below, one indirection further out, and it is what an operator reaches for when
+the installed interface is the thing they are trying to verify.
 
 **The command is the interface; there is no inline program here any more.** An earlier revision
 of this step imported `openDb` from the deployment's `dist` inside `node --input-type=module -e`.

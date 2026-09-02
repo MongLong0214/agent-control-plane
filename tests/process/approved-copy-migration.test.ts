@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, linkSync, mkdirSync, readFileSync, statSync, symlinkSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, readFileSync, statSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -75,6 +75,20 @@ const v25Copy = (label: string): { dir: string; path: string } => {
     chmodSync(path, 0o600);
   }
   return { dir, path };
+};
+
+/** One v25-shaped database at `path`, optionally stamped at another version. */
+const seedAt = (path: string, version = 25): string => {
+  const raw = new Database(path);
+  try {
+    raw.function("acp_schema_migration_authorized", () => 1);
+    raw.exec(LINEAGE);
+    raw.pragma(`user_version = ${version}`);
+  } finally {
+    raw.close();
+    chmodSync(path, 0o600);
+  }
+  return path;
 };
 
 const userVersion = (path: string): number => {
@@ -181,6 +195,84 @@ describe("U5-POST763-01 supported approved-copy migration", () => {
     expect(userVersion(other.path)).toBe(25);
     expect(readFileSync(other.path)).toEqual(otherBefore);
   }, 120_000);
+
+  /** Bytes plus the sidecars an open would create — what "unchanged" has to mean for a database. */
+  const imprint = (path: string) => ({
+    bytes: readFileSync(path),
+    wal: existsSync(`${path}-wal`),
+    shm: existsSync(`${path}-shm`),
+  });
+
+  it("refuses a copy the approval does not name, without opening it", () => {
+    // The `#747` split, one directory: an approval taken on A, the command run on B. Matching the
+    // approval's target only inside `Db` matches it *after* the writable open, and the measured
+    // cost of that is a moved header on a database the command declined.
+    const dir = tempDir("acp-u5-01-ab-");
+    chmodSync(dir, 0o700);
+    const a = seedAt(join(dir, "a.sqlite"));
+    const b = seedAt(join(dir, "b.sqlite"));
+    approve(a, dir);
+
+    const before = imprint(b);
+    const result = run(["migrate-approved-copy", "--database-copy", b, "--confirm-migration"], {
+      ACP_STATE_DIR: dir,
+      HOME: dir,
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("names a different database");
+    const after = imprint(b);
+    expect(after.bytes).toEqual(before.bytes);
+    expect([after.wal, after.shm]).toEqual([before.wal, before.shm]);
+    expect(userVersion(b)).toBe(25);
+  }, 120_000);
+
+  it("refuses an approval whose chain does not start at 25", () => {
+    // Endpoints are not the plan. An approval for another starting version approves another
+    // migration, and this command runs exactly one.
+    const dir = tempDir("acp-u5-01-v24-");
+    chmodSync(dir, 0o700);
+    const path = seedAt(join(dir, "copy.sqlite"), 24);
+    approve(path, dir);
+    const before = imprint(path);
+
+    const result = run(["migrate-approved-copy", "--database-copy", path, "--confirm-migration"], {
+      ACP_STATE_DIR: dir,
+      HOME: dir,
+    });
+
+    expect(result.status).not.toBe(0);
+    const after = imprint(path);
+    expect(after.bytes).toEqual(before.bytes);
+    expect([after.wal, after.shm]).toEqual([before.wal, before.shm]);
+    expect(userVersion(path)).toBe(24);
+  }, 120_000);
+
+  it("closes its argv grammar", () => {
+    const { dir, path } = v25Copy("argv");
+    approve(path, dir);
+    const before = imprint(path);
+
+    const cases: Array<{ argv: string[]; why: string }> = [
+      { argv: ["--database", path, "--database-copy", path, "--confirm-migration"], why: "two database flags" },
+      { argv: ["--database-copy", path, "--database-copy", path, "--confirm-migration"], why: "repeated copy" },
+      { argv: ["--database-copy", path, "--confirm-migration", "--confirm-migration"], why: "repeated confirm" },
+      { argv: ["--database-copy", path, "--confirm-migration", "--output", "/tmp/x"], why: "foreign flag" },
+      { argv: ["--database-copy", path, "--confirm-migration", "--confirm-restore"], why: "another command's flag" },
+      { argv: ["--database-copy", path, "--confirm-migration", "--nope"], why: "unknown flag" },
+      { argv: ["--database-copy", path, "--confirm-migration", "extra"], why: "positional" },
+    ];
+    for (const { argv, why } of cases) {
+      const result = run(["migrate-approved-copy", ...argv], { ACP_STATE_DIR: dir, HOME: dir });
+      expect(result.status, `${why} was accepted`).not.toBe(0);
+    }
+
+    // A refused grammar never reached the database.
+    const after = imprint(path);
+    expect(after.bytes).toEqual(before.bytes);
+    expect([after.wal, after.shm]).toEqual([before.wal, before.shm]);
+    expect(userVersion(path)).toBe(25);
+  }, 180_000);
 
   it("requires the copy to be named explicitly, and never defaults to a target", () => {
     const { dir, path } = v25Copy("explicit");

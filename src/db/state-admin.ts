@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, lstatSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -17,7 +17,7 @@ import {
 } from "./migration-approval.ts";
 import { migrateApprovedCopy } from "./database.ts";
 import { SCHEMA_VERSION } from "./migrations.ts";
-import { isSameTarget, targetIdentityOf } from "./target-identity.ts";
+import { targetIdentityOf } from "./target-identity.ts";
 import { assertPrivatePath, ensurePrivateDirectory } from "./state-preflight.ts";
 
 const readApprovalForReport = (databasePath: string): unknown => {
@@ -140,6 +140,37 @@ const parse = (argv: string[]): Parsed => {
     );
   }
   if (command === "migrate-approved-copy") {
+    // A closed grammar for this one command: exactly `--database-copy <path>` once and
+    // `--confirm-migration` once, and nothing else. Every other command's flags are refused here
+    // rather than ignored — `--database` in particular, because its default is the one database
+    // this command exists never to touch, and accepting it beside `--database-copy` would leave
+    // two answers to "which file" in one invocation.
+    const allowed = new Set(["--database-copy", "--confirm-migration"]);
+    const seen = new Map<string, number>();
+    for (const token of tokens) {
+      if (!token.startsWith("--")) continue;
+      seen.set(token, (seen.get(token) ?? 0) + 1);
+      if (!allowed.has(token)) {
+        throw new Error(`migrate-approved-copy does not take ${token}\n\n${USAGE}`);
+      }
+    }
+    const repeated = [...seen.entries()].filter(([, count]) => count > 1).map(([flag]) => flag);
+    if (repeated.length > 0) {
+      // A repeat is not a typo to absorb: the later value silently won, so the operator's first
+      // answer and the one that ran were different.
+      throw new Error(
+        `migrate-approved-copy takes each of ${repeated.sort().join(", ")} once\n\n${USAGE}`,
+      );
+    }
+    const positional = tokens.filter((token) => {
+      const index = tokens.indexOf(token);
+      return !token.startsWith("--") && tokens[index - 1] !== "--database-copy";
+    });
+    if (positional.length > 0) {
+      throw new Error(`migrate-approved-copy takes no positional argument\n\n${USAGE}`);
+    }
+  }
+  if (command === "migrate-approved-copy") {
     // Two separate refusals with two separate messages. "Which database" and "are you sure" are
     // different questions, and collapsing them into one error makes the operator guess which half
     // they missed.
@@ -238,50 +269,14 @@ export const main = async (argv: string[]): Promise<number> => {
   }
 
   if (parsed.command === "migrate-approved-copy") {
-    const copy = parsed.databaseCopy!;
-    // Every one of these runs before `Db` is constructed, because `Db`'s first act is to open the
-    // file and its second is to migrate it. A check after that point is a check on a database
-    // that has already been changed.
-    const stat = lstatSync(copy, { throwIfNoEntry: false });
-    if (!stat) throw new Error("the named copy does not exist");
-    if (stat.isSymbolicLink()) {
-      // A symlink is a second name for bytes the approval named once. Following it would migrate
-      // a file the operator did not type.
-      throw new Error("refusing a symbolic link: name the copy itself");
-    }
-    if (!stat.isFile()) throw new Error("refusing a target that is not a regular file");
-    if (stat.nlink !== 1) {
-      // More than one link means the file the approval named is not the only way to reach these
-      // bytes, so "this copy" no longer identifies anything.
-      throw new Error(`refusing a copy with ${stat.nlink} links: it is reachable under another name`);
-    }
-    const canonical = defaultDatabasePath();
-    if (existsSync(canonical) && isSameTarget(targetIdentityOf(copy), targetIdentityOf(canonical))) {
-      // The whole point of the command. Identity rather than path equality, so a different
-      // spelling of the same file is refused too.
-      throw new Error("refusing to migrate the deployment's own database through the copy path");
-    }
-    // The approval and the version are checked before anything opens the file read-write. `Db`
-    // checks both again — that redundancy is deliberate — but its first act is to open, and an
-    // open is a write to the header. Measured: a refusal reached after construction still moved a
-    // byte in a database this command had just declined to touch, which is not "unchanged".
-    const onDisk = onDiskSchemaVersion(copy);
-    const approval = readMigrationApproval(copy);
-    if (!approval) throw new Error("no approval is on file for this copy");
-    if (approval.fromVersion !== onDisk) {
-      throw new Error(
-        `the approval starts at ${approval.fromVersion} and this copy is at ${onDisk}`,
-      );
-    }
-    if (approval.toVersion !== SCHEMA_VERSION) {
-      throw new Error(
-        `the approval ends at ${approval.toVersion} and this build declares ${SCHEMA_VERSION}`,
-      );
-    }
-    const report = migrateApprovedCopy(copy);
+    // Every refusal — link, non-regular file, extra link, canonical identity, version, approval
+    // target and ordered plan — is inside `migrateApprovedCopy`, under the migration lock and
+    // before the first writable handle. Checking any of them here would be checking them outside
+    // that lock, which is the window a replacement at this pathname walks through.
+    const report = migrateApprovedCopy(parsed.databaseCopy!, defaultDatabasePath());
     // Version, ids, whether each receipt carries a checksum, retirement, and the mode. Not the
-    // path: an operator pastes this into a report, and the location of a private copy is not
-    // part of what the chain did.
+    // path: an operator pastes this into a report, and the location of a private copy is not part
+    // of what the chain did.
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     return 0;
   }

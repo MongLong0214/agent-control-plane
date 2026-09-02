@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { acpError, fail, isAcpError, type Decision } from "../core/errors.ts";
@@ -77,6 +77,19 @@ export const SCHEMA_VERSION = CURRENT_SCHEMA_VERSION;
 export interface DbOpenOptions {
   /** Number of generated manual/pre-migration backups retained beside the database. */
   backupRetention?: number;
+  /**
+   * The caller already holds this database's migration lock and keeps it across this open.
+   *
+   * `U5-POST763-01`. `Db` opens the connection and *then* takes exclusivity, so everything a
+   * caller verifies before construction is verified outside the lock: replace the file at that
+   * pathname in between and the replacement is opened read-write — which moves its header — before
+   * any identity check runs. A caller that verifies and opens inside one critical section has to
+   * be able to say so, or it deadlocks against itself on a lock that denies rather than waits.
+   *
+   * The under-lock re-resolution, identity, approval and version checks below still run. This
+   * says who owns the lock, not which checks apply.
+   */
+  migrationLockHeld?: boolean;
   /** Keep SQLite's transient query state off environment-selected filesystem paths. */
   temporaryStorage?: "MEMORY";
   /** Test-only fault injection that proves a committed migration is restored from its backup. */
@@ -530,6 +543,12 @@ export class Db {
    * exits 0 and stays down.
    */
   private withMigrationExclusivity(work: () => void): void {
+    if (this.options.migrationLockHeld === true) {
+      // Held by the caller across this whole open. Acquiring again would deny — the lock refuses
+      // rather than waiting — and every check inside `work` is the same either way.
+      work();
+      return;
+    }
     const lock = new SingleInstanceLock(join(dirname(this.file), "agentcpd.lock"));
     const acquired = lock.acquire(new Date().toISOString());
     if (!acquired.allowed) {
@@ -1254,37 +1273,157 @@ export interface ApprovedCopyMigrationReport {
  * The writer is closed before the result is collected, and the readback opens read-only: a report
  * assembled from the connection that just wrote is a report about what that connection intended.
  */
-export const migrateApprovedCopy = (databasePath: string): ApprovedCopyMigrationReport => {
-  const fromVersion = versionOnDisk(databasePath);
-  const writer = new Db(databasePath);
-  writer.close();
-
-  const raw = new Database(databasePath, { readonly: true, fileMustExist: true });
+export const migrateApprovedCopy = (
+  databasePath: string,
+  canonicalDatabasePath: string,
+): ApprovedCopyMigrationReport => {
+  // The lock is taken *first*, and everything below happens under it — including the writable
+  // open. `Db` takes exclusivity only after opening its connection, so a caller that checks and
+  // then constructs has checked outside the lock: replace the file at that pathname in between and
+  // the replacement is opened read-write, moving its header, before any identity check runs.
+  // Measured on the previous head: a refusal still moved a byte in a database it declined.
+  const lock = new SingleInstanceLock(join(dirname(databasePath), "agentcpd.lock"));
+  const acquired = lock.acquire(new Date().toISOString());
+  if (!acquired.allowed) {
+    throw acpError(
+      acquired.reasonCode,
+      "refusing to migrate a copy while another process holds the state lock",
+      { ...acquired.evidence },
+    );
+  }
   try {
-    const toVersion = Number(raw.pragma("user_version", { simple: true }));
-    const receipts = raw
-      .prepare(
-        `SELECT migration_id AS id, checksum FROM schema_migrations
-          WHERE version > ? ORDER BY version`,
-      )
-      .all(fromVersion) as Array<{ id: string; checksum: string | null }>;
-    return {
-      fromVersion,
-      toVersion,
-      migrations: receipts.map((receipt) => ({
-        id: receipt.id,
-        checksum: /^sha256:[a-f0-9]{64}$/.test(receipt.checksum ?? ""),
-      })),
-      approvalRetired: readMigrationApproval(databasePath) === null,
-      daemonless: true,
-    };
+    const fromVersion = assertApprovedCopyUnderLock(databasePath, canonicalDatabasePath);
+    const writer = new Db(databasePath, { migrationLockHeld: true });
+    writer.close();
+
+    const raw = new Database(databasePath, { readonly: true, fileMustExist: true });
+    try {
+      const toVersion = Number(raw.pragma("user_version", { simple: true }));
+      const receipts = raw
+        .prepare(
+          `SELECT migration_id AS id, checksum FROM schema_migrations
+            WHERE version > ? ORDER BY version`,
+        )
+        .all(fromVersion) as Array<{ id: string; checksum: string | null }>;
+      return {
+        fromVersion,
+        toVersion,
+        migrations: receipts.map((receipt) => ({
+          id: receipt.id,
+          checksum: /^sha256:[a-f0-9]{64}$/.test(receipt.checksum ?? ""),
+        })),
+        approvalRetired: readMigrationApproval(databasePath) === null,
+        daemonless: true,
+      };
+    } finally {
+      raw.close();
+    }
   } finally {
-    raw.close();
+    lock.release();
   }
 };
 
+/** The one version an approved copy may start from, and the one this command exists for. */
+const APPROVED_COPY_FROM_VERSION = 25;
+
+/**
+ * Everything that must be true of the copy, checked under the migration lock and before any
+ * writable handle exists.
+ *
+ * Each refusal names a way the command could otherwise touch a database nobody approved:
+ *
+ *   - a symbolic link is a second name for bytes the approval named once;
+ *   - a non-regular file is not a database;
+ *   - more than one link means "this copy" no longer identifies anything;
+ *   - the deployment's own database is the one file this command exists to never open;
+ *   - an approval whose target is a *different* file in the same directory is the capability
+ *     defect `#747` closed, and matching it only inside `Db` matches it after the open;
+ *   - a version other than 25, or a plan that is not exactly the current ordered chain from 25,
+ *     is a different migration than the one approved.
+ */
+const assertApprovedCopyUnderLock = (
+  databasePath: string,
+  canonicalDatabasePath: string,
+): number => {
+  const stat = lstatSync(databasePath, { throwIfNoEntry: false });
+  if (!stat) throw acpError(ReasonCode.INTERNAL_ERROR, "the named copy does not exist", {});
+  if (stat.isSymbolicLink()) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "refusing a symbolic link: name the copy itself", {});
+  }
+  if (!stat.isFile()) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "refusing a target that is not a regular file", {});
+  }
+  if (stat.nlink !== 1) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      `refusing a copy with ${stat.nlink} links: it is reachable under another name`,
+      {},
+    );
+  }
+
+  // The canonical path is supplied rather than derived here: which file the deployment calls its
+  // own is the operator surface's fact, and a second derivation of it is a second thing to keep
+  // in step with the first.
+  const target = targetIdentityOf(databasePath);
+  if (
+    existsSync(canonicalDatabasePath) &&
+    isSameTarget(target, targetIdentityOf(canonicalDatabasePath))
+  ) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      "refusing to migrate the deployment's own database through the copy path",
+      {},
+    );
+  }
+
+  const onDisk = onDiskVersionReadOnly(databasePath);
+  if (onDisk !== APPROVED_COPY_FROM_VERSION) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      `this copy is at ${onDisk} and this command migrates a copy at ${APPROVED_COPY_FROM_VERSION}`,
+      {},
+    );
+  }
+
+  const approval = readMigrationApproval(databasePath);
+  if (!approval) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "no approval is on file for this copy", {});
+  }
+  if (!isSameTarget(approval.target, target)) {
+    // The approval is a capability over one file. Two databases in one private directory, an
+    // approval taken on A and this command run on B, is exactly the split `#747` measured.
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      "the approval on file names a different database than this copy",
+      {},
+    );
+  }
+  const expected = migrationPlanFrom(APPROVED_COPY_FROM_VERSION);
+  if (approval.fromVersion !== expected.fromVersion || approval.toVersion !== expected.toVersion) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      `the approval covers ${approval.fromVersion}→${approval.toVersion} and this command runs ` +
+        `${expected.fromVersion}→${expected.toVersion}`,
+      {},
+    );
+  }
+  if (
+    approval.migrations.length !== expected.migrations.length ||
+    approval.migrations.some((id, index) => id !== expected.migrations[index])
+  ) {
+    // Same endpoints, different steps. An approval that names another ordered chain approves
+    // another migration, and only the ordered comparison can tell them apart.
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      "the approval names a different ordered chain than this build runs",
+      {},
+    );
+  }
+  return onDisk;
+};
+
 /** The version a database is at, read without opening it through the migrating constructor. */
-const versionOnDisk = (databasePath: string): number => {
+const onDiskVersionReadOnly = (databasePath: string): number => {
   const raw = new Database(databasePath, { readonly: true, fileMustExist: true });
   try {
     return Number(raw.pragma("user_version", { simple: true }));
