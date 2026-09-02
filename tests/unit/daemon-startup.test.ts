@@ -24,6 +24,15 @@ const TELEGRAM_VARIABLES = [
   "ACP_TELEGRAM_API_BASE_URL",
   "ACP_TELEGRAM_TRANSPORT_RETENTION_MS",
 ] as const;
+/**
+ * Deleted from the child's environment unless a case asks for them, for the same reason the
+ * Telegram list is: a developer with these exported would otherwise start the Buzz listeners in
+ * every scenario here, and the one case that is about them would stop being the one that
+ * decides whether they run.
+ */
+const BUZZ_VARIABLES = ["ACP_BUZZ_INGRESS_SECRET", "ACP_BUZZ_ALLOWED_ACTORS", "BUZZ_PRIVATE_KEY"] as const;
+const BUZZ_SECRET = "startup-test-buzz-secret";
+const BUZZ_ACTOR = "npub-startup-owner";
 
 interface MainResult {
   status: number | null;
@@ -40,14 +49,29 @@ const runMain = async (input: {
   expectPromptFlow?: boolean;
   /** Uses the real `TelegramBotApi` composition instead of the runner's fake transport. */
   realTelegramTransport?: boolean;
+  /** Configures the Buzz relay credential, which is what opens both Buzz ingress sockets. */
+  buzz?: boolean;
+  /** Declares the Buzz actor as an owner identity, which is what the message half also needs. */
+  buzzOwnerIdentity?: boolean;
+  /** Drives an owner Buzz message through the daemon's own socket (#627). */
+  expectBuzzMessage?: boolean;
 }): Promise<MainResult> => {
   // macOS sockaddr_un paths are short; the repository's temp worktree path is long enough
   // to make the operator socket exceed that OS limit and would test the wrong failure.
   const root = mkdtempSync(join("/tmp", "acp-main-startup-"));
   const stateRoot = join(root, ".agent-control-plane");
-  if (input.ownerIdentity) {
+  // The relay credential opens the sockets; this file says who the owner is. They are separate
+  // inputs on purpose — `buzz: true, buzzOwnerIdentity: false` is the deployment where every
+  // ACTIVE relay actor could speak as the owner, and it is a case below rather than a default.
+  const declaredIdentities = [
+    ...(input.ownerIdentity ? [`telegram:${OWNER_ID}`] : []),
+    ...(input.buzzOwnerIdentity ? [`buzz:${BUZZ_ACTOR}`] : []),
+  ];
+  if (declaredIdentities.length > 0) {
     mkdirSync(stateRoot, { recursive: true, mode: 0o700 });
-    writeFileSync(join(stateRoot, "owner-identities"), `telegram:${OWNER_ID}\n`, { mode: 0o600 });
+    writeFileSync(join(stateRoot, "owner-identities"), `${declaredIdentities.join("\n")}\n`, {
+      mode: 0o600,
+    });
   }
 
   const environment: NodeJS.ProcessEnv = {
@@ -62,10 +86,16 @@ const runMain = async (input: {
     ...(input.expectTelegram ? { ACP_STARTUP_TEST_EXPECT_TELEGRAM: "1" } : {}),
     ...(input.expectPromptFlow ? { ACP_STARTUP_TEST_EXPECT_PROMPT_FLOW: "1" } : {}),
     ...(input.realTelegramTransport ? { ACP_STARTUP_TEST_REAL_TELEGRAM_TRANSPORT: "1" } : {}),
+    ...(input.expectBuzzMessage ? { ACP_STARTUP_TEST_EXPECT_BUZZ_MESSAGE: "1" } : {}),
     ...(input.telegram ?? {}),
   };
   for (const name of TELEGRAM_VARIABLES) {
     if (!(name in (input.telegram ?? {}))) delete environment[name];
+  }
+  for (const name of BUZZ_VARIABLES) delete environment[name];
+  if (input.buzz) {
+    environment["ACP_BUZZ_INGRESS_SECRET"] = BUZZ_SECRET;
+    environment["ACP_BUZZ_ALLOWED_ACTORS"] = BUZZ_ACTOR;
   }
 
   const child = spawn(process.execPath, ["--import", "tsx", mainRunner], {
@@ -193,6 +223,51 @@ describe("agentcpd main Telegram startup composition", () => {
     expect(result.stdout, diagnostics).toContain("startup test owner prompt observed");
     expect(result.stdout, diagnostics).toContain("startup test owner approval cleared gate");
     expect(result.status, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`).toBe(0);
+  }, 40_000);
+});
+
+describe("#627: an owner's Buzz message reaches the CEO without a session child", () => {
+  it("answers a Buzz message on the daemon's own socket and spawns nothing to do it", async () => {
+    // The deployed path answers a Buzz message by running `hermes acp` as a session child —
+    // a new actor, a new session, an owner conversation split across dozens of them. This
+    // scenario is the receiving half in the shape `ARCHITECTURE.md` accepts: the daemon hands
+    // the message to a peer that is already connected and already holds the CEO binding.
+    const result = await runMain({
+      seedState: true,
+      buzz: true,
+      buzzOwnerIdentity: true,
+      expectBuzzMessage: true,
+    });
+
+    const diagnostics = `status=${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
+    expect(result.stdout, diagnostics).toContain("Buzz message ingress started");
+    expect(result.stdout, diagnostics).toContain("startup test Buzz message answered by the CEO route");
+    // The no-fork property, measured rather than assumed: the runner reads the OS's own child
+    // list and the session registry on both sides of the turn.
+    expect(result.stdout, diagnostics).toContain("startup test Buzz message spawned no session child");
+    expect(result.status, diagnostics).toBe(0);
+  }, 60_000);
+
+  it("opens no Buzz ingress socket at all when the relay credential is not configured", async () => {
+    const result = await runMain({ seedState: true });
+
+    const diagnostics = `status=${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
+    expect(result.status, diagnostics).toBe(0);
+    expect(result.stdout, diagnostics).not.toContain("Buzz message ingress started");
+  }, 40_000);
+
+  it("leaves the message socket closed when the relay credential names no declared owner", async () => {
+    // The composition half of the same separation. The relay credential is configured, so the
+    // binding socket opens exactly as before; what is missing is a `buzz:` line in
+    // `owner-identities`. Reusing the relay allowlist here would make every ACTIVE Buzz actor
+    // the owner, so the message half stays closed and says which file would open it.
+    const result = await runMain({ seedState: true, buzz: true });
+
+    const diagnostics = `status=${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
+    expect(result.status, diagnostics).toBe(0);
+    expect(result.stdout, diagnostics).not.toContain("Buzz message ingress started");
+    expect(result.stdout, diagnostics).toContain("Buzz message ingress not started");
+    expect(result.stdout, diagnostics).toContain("owner-identities");
   }, 40_000);
 });
 
