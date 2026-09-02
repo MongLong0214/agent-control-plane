@@ -52,6 +52,8 @@
 
 #include <sqlite3ext.h>
 #include <errno.h>
+#include <pthread.h>
+#include <time.h>
 #include <fcntl.h>
 #include <string.h>
 #include <stdio.h>
@@ -67,21 +69,137 @@ static sqlite3_vfs *acp_parent = 0;
 static sqlite3_vfs acp_shim;
 
 /**
- * The lease that identifies one binding, and the bracket the whole capability rests on.
+ * The lease that authorises one binding, and the lock that makes the state it guards atomic.
  *
- * The default VFS is process-global, so "who is bound" is process-global too. Before this, three
- * things were possible and none of them announced itself: a second `bind` silently replaced the
- * first, so a caller could still hold a descriptor it believed was bound while every open went to
- * somebody else's file; `unbind` cleared whatever was there for anyone who asked, so an unrelated
- * caller could release a migration's binding mid-flight; and the bound database could be opened any
- * number of times, so "the connection" was never actually one connection.
+ * The first version of this was a counter, and I described it as "an identifier, not a secret".
+ * That was a rationalisation of a design that was simply forgeable, and review demonstrated it:
+ * the lease was 1, and `acp_fd_unbind(1.9)` released it — `sqlite3_value_int64` coerces a REAL,
+ * so even guessing the wrong type worked. A capability that a stranger can guess or coerce is not
+ * a capability.
  *
- * The lease closes all three. It is an identifier, not a secret — a process that can call these
- * functions can read this memory too — and the property it buys is that a mistake is refused
- * rather than silently absorbed.
+ * So the lease is now sixteen bytes from the kernel's entropy source, presented as thirty-two hex
+ * characters, accepted only as TEXT of exactly that length, and compared in constant time. There
+ * is no numeric form to coerce and nothing to count up to.
+ *
+ * The lock exists because the default VFS is process-global and none of this state was
+ * synchronised. Review drove two threads through the bind path with a barrier after the
+ * active-check and both succeeded, one silently replacing the other. The same shape covers the
+ * open cap: check, `dup`, increment were three steps with no mutual exclusion. Recursive, because
+ * one entry point drives another (`xDelete` through the probe path) and a self-deadlock would be a
+ * worse failure than the race.
  */
-static unsigned long long acp_lease = 0;
-static unsigned long long acp_lease_next = 1;
+#define ACP_LEASE_BYTES 16
+#define ACP_LEASE_CHARS 32
+
+static pthread_mutex_t acp_mutex;
+static pthread_once_t acp_mutex_once = PTHREAD_ONCE_INIT;
+
+static void acp_mutex_init(void) {
+  pthread_mutexattr_t attributes;
+  pthread_mutexattr_init(&attributes);
+  pthread_mutexattr_settype(&attributes, PTHREAD_MUTEX_RECURSIVE);
+  pthread_mutex_init(&acp_mutex, &attributes);
+  pthread_mutexattr_destroy(&attributes);
+}
+
+static void acp_state_lock(void) {
+  pthread_once(&acp_mutex_once, acp_mutex_init);
+  pthread_mutex_lock(&acp_mutex);
+}
+
+static void acp_state_unlock(void) { pthread_mutex_unlock(&acp_mutex); }
+
+/*
+ * A rendezvous inside `bind`, compiled only into the test artifact.
+ *
+ * Without it the race test is a coin toss: measured across forty rounds with the lock removed,
+ * only three produced a double binding, so an eight-round test would have missed the defect about
+ * half the time. A test that detects a real race half the time is not evidence about the race.
+ *
+ * Armed for N arrivals, the first thread to reach the point just after the active-check waits for
+ * the others. With the lock in place they cannot arrive — they are still queued on it — so the
+ * first times out and proceeds alone, and exactly one bind succeeds. With the lock removed both
+ * arrive at once, both have already passed the active-check, and both bind. The outcome is decided
+ * by whether the lock exists rather than by scheduling luck.
+ */
+#ifdef ACP_FD_VFS_TESTING
+static pthread_mutex_t acp_barrier_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t acp_barrier_cond = PTHREAD_COND_INITIALIZER;
+static int acp_barrier_want = 0;
+static int acp_barrier_arrived = 0;
+
+static void acp_barrier_wait(void) {
+  if (acp_barrier_want <= 0) return;
+  pthread_mutex_lock(&acp_barrier_mutex);
+  acp_barrier_arrived += 1;
+  if (acp_barrier_arrived >= acp_barrier_want) {
+    pthread_cond_broadcast(&acp_barrier_cond);
+  } else {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 1;
+    pthread_cond_timedwait(&acp_barrier_cond, &acp_barrier_mutex, &deadline);
+  }
+  pthread_mutex_unlock(&acp_barrier_mutex);
+}
+#else
+#define acp_barrier_wait() ((void)0)
+#endif
+
+static unsigned char acp_lease[ACP_LEASE_BYTES];
+static int acp_lease_held = 0;
+
+/** Fills `out` from the kernel's entropy source. Returns 0 on failure; the caller must refuse. */
+static int acp_random_bytes(unsigned char *out, size_t count) {
+  int fd = open("/dev/urandom", O_RDONLY);
+  if (fd < 0) return 0;
+  size_t filled = 0;
+  while (filled < count) {
+    ssize_t got = read(fd, out + filled, count - filled);
+    if (got <= 0) {
+      close(fd);
+      return 0;
+    }
+    filled += (size_t)got;
+  }
+  close(fd);
+  return 1;
+}
+
+static void acp_to_hex(const unsigned char *bytes, size_t count, char *out) {
+  static const char digits[] = "0123456789abcdef";
+  for (size_t i = 0; i < count; i += 1) {
+    out[i * 2] = digits[bytes[i] >> 4];
+    out[i * 2 + 1] = digits[bytes[i] & 0x0f];
+  }
+  out[count * 2] = '\0';
+}
+
+/** Strict hex decode: exactly `count` bytes from `2*count` lowercase-or-uppercase hex digits. */
+static int acp_from_hex(const char *text, size_t chars, unsigned char *out, size_t count) {
+  if (chars != count * 2) return 0;
+  for (size_t i = 0; i < count; i += 1) {
+    int high = -1, low = -1;
+    for (int half = 0; half < 2; half += 1) {
+      char c = text[i * 2 + half];
+      int value;
+      if (c >= '0' && c <= '9') value = c - '0';
+      else if (c >= 'a' && c <= 'f') value = c - 'a' + 10;
+      else if (c >= 'A' && c <= 'F') value = c - 'A' + 10;
+      else return 0;
+      if (half == 0) high = value; else low = value;
+    }
+    out[i] = (unsigned char)((high << 4) | low);
+  }
+  return 1;
+}
+
+/** Constant time: a comparison that returns early leaks how much of a guess was right. */
+static int acp_same_lease(const unsigned char *candidate) {
+  unsigned char difference = 0;
+  for (size_t i = 0; i < ACP_LEASE_BYTES; i += 1) difference |= candidate[i] ^ acp_lease[i];
+  return difference == 0;
+}
 
 /** The one active binding, held under `acp_lease`. */
 static struct {
@@ -238,7 +356,14 @@ static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int 
    */
   if (file) file->pMethods = 0;
 
+  /*
+   * Everything from here to the return reads and writes the binding, so it is one critical
+   * section. The open cap in particular was three separate steps — check the count, `dup` the
+   * descriptor, increment — and two threads could each pass the check before either incremented.
+   */
+  acp_state_lock();
   if (!acp_binding.active || path == 0) {
+    acp_state_unlock();
     return acp_parent->xOpen(acp_parent, path, file, flags, out);
   }
 
@@ -249,6 +374,7 @@ static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int 
     if (!acp_is_bound_database(path)) {
       /* No fallback: a bound process does not open some other main database by pathname. */
       acp_refuse("main database does not match the active binding");
+      acp_state_unlock();
       return SQLITE_CANTOPEN;
     }
     if (acp_binding.main_opens > 0) {
@@ -256,23 +382,27 @@ static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int 
          lock state that neither of them is tracking, and "the connection this binding is for"
          stops naming anything. */
       acp_refuse("the bound database is already open under this lease");
+      acp_state_unlock();
       return SQLITE_CANTOPEN;
     }
     struct stat st;
     if (fstat(acp_binding.main_fd, &st) != 0 ||
         st.st_dev != acp_binding.dev || st.st_ino != acp_binding.ino) {
       acp_refuse("the bound descriptor is no longer the verified object");
+      acp_state_unlock();
       return SQLITE_CANTOPEN;
     }
     memset(f, 0, sizeof *f);
     f->fd = dup(acp_binding.main_fd);
     if (f->fd < 0) {
       acp_refuse("could not duplicate the bound descriptor");
+      acp_state_unlock();
       return SQLITE_CANTOPEN;
     }
     f->pMethods = &acp_io_methods;
     if (out) *out = SQLITE_OPEN_READWRITE;
     acp_binding.main_opens++;
+    acp_state_unlock();
     return SQLITE_OK;
   }
 
@@ -280,12 +410,14 @@ static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int 
     /* Out of scope by ruling, and refused rather than delegated: delegating would open a
        shared-memory family this binding does not own. */
     acp_refuse("write-ahead logging is not available on a bound connection");
+    acp_state_unlock();
     return SQLITE_CANTOPEN;
   }
 
   if (flags & (SQLITE_OPEN_MAIN_JOURNAL | SQLITE_OPEN_SUPER_JOURNAL)) {
     if (!acp_is_bound_sibling(path)) {
       acp_refuse("journal is not a sibling of the bound database");
+      acp_state_unlock();
       return SQLITE_CANTOPEN;
     }
     int how = O_RDWR | O_CREAT;
@@ -293,6 +425,7 @@ static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int 
     int fd = openat(acp_binding.dir_fd, base, how, 0600);
     if (fd < 0) {
       acp_refuse("could not open the journal in the bound directory");
+      acp_state_unlock();
       return SQLITE_CANTOPEN;
     }
     memset(f, 0, sizeof *f);
@@ -302,10 +435,12 @@ static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int 
     f->pMethods = &acp_io_methods;
     if (out) *out = SQLITE_OPEN_READWRITE;
     acp_binding.journal_opens++;
+    acp_state_unlock();
     return SQLITE_OK;
   }
 
   /* Temporary files and everything else the connection needs are not part of the bound family. */
+  acp_state_unlock();
   return acp_parent->xOpen(acp_parent, path, file, flags, out);
 }
 
@@ -315,11 +450,14 @@ static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int 
  * files this binding exists to own.
  */
 static int acp_access(sqlite3_vfs *vfs, const char *path, int flags, int *out) {
+  acp_state_lock();
   if (acp_binding.active && path && acp_is_bound_sibling(path)) {
     int mode = (flags == SQLITE_ACCESS_READWRITE) ? (R_OK | W_OK) : F_OK;
     *out = faccessat(acp_binding.dir_fd, acp_basename(path), mode, 0) == 0;
+    acp_state_unlock();
     return SQLITE_OK;
   }
+  acp_state_unlock();
   return acp_parent->xAccess(acp_parent, path, flags, out);
 }
 
@@ -343,9 +481,11 @@ static int acp_fail_next_dir_sync = 0;
 #endif
 
 static int acp_delete(sqlite3_vfs *vfs, const char *path, int sync_dir) {
+  acp_state_lock();
   if (acp_binding.active && path && acp_is_bound_sibling(path)) {
     acp_binding.deletes++;
     if (unlinkat(acp_binding.dir_fd, acp_basename(path), 0) != 0 && errno != ENOENT) {
+      acp_state_unlock();
       return SQLITE_IOERR_DELETE;
     }
     if (sync_dir) {
@@ -363,10 +503,15 @@ static int acp_delete(sqlite3_vfs *vfs, const char *path, int sync_dir) {
 #else
       int failed = fsync(acp_binding.dir_fd) != 0;
 #endif
-      if (failed) return SQLITE_IOERR_DIR_FSYNC;
+      if (failed) {
+        acp_state_unlock();
+        return SQLITE_IOERR_DIR_FSYNC;
+      }
     }
+    acp_state_unlock();
     return SQLITE_OK;
   }
+  acp_state_unlock();
   return acp_parent->xDelete(acp_parent, path, sync_dir);
 }
 
@@ -404,22 +549,35 @@ static void acp_fn_bind(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   }
   const char *base = acp_basename(full);
   if (base[0] == '\0' || strlen(base) >= ACP_MAX_BASE) {
+    acp_state_unlock();
     sqlite3_result_error(ctx, "the database path has no usable file name", -1);
     return;
   }
   struct stat st;
   if (fstat(main_fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    acp_state_unlock();
     sqlite3_result_error(ctx, "mainFd is not an open regular file", -1);
     return;
   }
   struct stat dst;
   if (fstat(dir_fd, &dst) != 0 || !S_ISDIR(dst.st_mode)) {
+    acp_state_unlock();
     sqlite3_result_error(ctx, "dirFd is not an open directory", -1);
     return;
   }
+  acp_state_lock();
   if (acp_binding.active) {
+    acp_state_unlock();
     sqlite3_result_error(
         ctx, "a binding is already active; release it with its lease before taking another", -1);
+    return;
+  }
+  /* The scheduling point the race test drives; a no-op in the shipping build. */
+  acp_barrier_wait();
+  unsigned char minted[ACP_LEASE_BYTES];
+  if (!acp_random_bytes(minted, sizeof minted)) {
+    acp_state_unlock();
+    sqlite3_result_error(ctx, "could not obtain entropy for a lease; refusing to bind", -1);
     return;
   }
   memset(&acp_binding, 0, sizeof acp_binding);
@@ -430,9 +588,13 @@ static void acp_fn_bind(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   acp_binding.ino = st.st_ino;
   snprintf(acp_binding.base, sizeof acp_binding.base, "%s", base);
   snprintf(acp_binding.path, sizeof acp_binding.path, "%s", full);
-  acp_lease = acp_lease_next++;
-  /* The lease, not the inode: the caller needs the thing it must present to release. */
-  sqlite3_result_int64(ctx, (sqlite3_int64)acp_lease);
+  memcpy(acp_lease, minted, sizeof acp_lease);
+  acp_lease_held = 1;
+  acp_state_unlock();
+  /* The lease, as text. No integer form exists, so there is nothing for a caller to coerce. */
+  char hex[ACP_LEASE_CHARS + 1];
+  acp_to_hex(acp_lease, ACP_LEASE_BYTES, hex);
+  sqlite3_result_text(ctx, hex, ACP_LEASE_CHARS, SQLITE_TRANSIENT);
 }
 
 static void acp_fn_unbind(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
@@ -440,23 +602,56 @@ static void acp_fn_unbind(sqlite3_context *ctx, int argc, sqlite3_value **argv) 
     sqlite3_result_error(ctx, "acp_fd_unbind(lease)", -1);
     return;
   }
+  /*
+   * TEXT only, and of exactly the minted length. Accepting anything SQLite would coerce is how the
+   * previous lease fell: it was the integer 1, and `acp_fd_unbind(1.9)` released it because
+   * `sqlite3_value_int64` rounds a REAL. There is no numeric representation of a lease to coerce
+   * into, and a wrong type is a refusal rather than a conversion.
+   */
+  if (sqlite3_value_type(argv[0]) != SQLITE_TEXT) {
+    sqlite3_result_error(ctx, "a lease is text; nothing else is accepted", -1);
+    return;
+  }
+  const char *text = (const char *)sqlite3_value_text(argv[0]);
+  int chars = sqlite3_value_bytes(argv[0]);
+  unsigned char candidate[ACP_LEASE_BYTES];
+  if (text == 0 || chars != ACP_LEASE_CHARS ||
+      !acp_from_hex(text, (size_t)chars, candidate, ACP_LEASE_BYTES)) {
+    sqlite3_result_error(ctx, "that is not the shape of a lease", -1);
+    return;
+  }
+
+  acp_state_lock();
   if (!acp_binding.active) {
-    /* Releasing nothing is not an error: a bracket must be able to run its release unconditionally
-       without having to know whether the acquire got that far. */
+    /* Releasing nothing is not an error: a bracket must be able to run its release without having
+       to know whether the acquire got that far. */
+    acp_state_unlock();
     sqlite3_result_int(ctx, 0);
     return;
   }
-  unsigned long long lease = (unsigned long long)sqlite3_value_int64(argv[0]);
-  if (lease != acp_lease) {
+  if (!acp_lease_held || !acp_same_lease(candidate)) {
+    acp_state_unlock();
     sqlite3_result_error(ctx, "that lease does not hold the active binding", -1);
     return;
   }
   memset(&acp_binding, 0, sizeof acp_binding);
-  acp_lease = 0;
+  memset(acp_lease, 0, sizeof acp_lease);
+  acp_lease_held = 0;
+  acp_state_unlock();
   sqlite3_result_int(ctx, 1);
 }
 
 #ifdef ACP_FD_VFS_TESTING
+
+/** Arms the bind rendezvous for `n` arrivals, or disarms it with 0. Test-only. */
+static void acp_fn_test_barrier(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  int want = (argc == 1) ? sqlite3_value_int(argv[0]) : 0;
+  pthread_mutex_lock(&acp_barrier_mutex);
+  acp_barrier_want = want;
+  acp_barrier_arrived = 0;
+  pthread_mutex_unlock(&acp_barrier_mutex);
+  sqlite3_result_int(ctx, want);
+}
 
 /** Arms the one-shot directory-sync fault. Test-only; see `acp_fail_next_dir_sync`. */
 static void acp_fn_fail_next_dir_sync(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
@@ -577,14 +772,20 @@ int sqlite3_extension_init(sqlite3 *db, char **err, const sqlite3_api_routines *
       sqlite3_create_function(db, "acp_fd_probe_refusal_methods", 0, SQLITE_UTF8, 0,
                               acp_fn_probe_refusal_methods, 0, 0) != SQLITE_OK ||
       sqlite3_create_function(db, "acp_fd_probe_dir_sync", 1, SQLITE_UTF8, 0,
-                              acp_fn_probe_dir_sync, 0, 0) != SQLITE_OK) {
+                              acp_fn_probe_dir_sync, 0, 0) != SQLITE_OK ||
+      sqlite3_create_function(db, "acp_fd_test_barrier", 1, SQLITE_UTF8, 0,
+                              acp_fn_test_barrier, 0, 0) != SQLITE_OK) {
     return SQLITE_ERROR;
   }
 #endif
 
+  acp_state_lock();
   if (acp_parent == 0) {
     acp_parent = sqlite3_vfs_find(0);
-    if (acp_parent == 0) return SQLITE_ERROR;
+    if (acp_parent == 0) {
+      acp_state_unlock();
+      return SQLITE_ERROR;
+    }
     acp_shim = *acp_parent;
     acp_shim.zName = ACP_VFS_NAME;
     acp_shim.pNext = 0;
@@ -593,8 +794,12 @@ int sqlite3_extension_init(sqlite3 *db, char **err, const sqlite3_api_routines *
     acp_shim.xDelete = acp_delete;
     if ((int)sizeof(AcpFile) > acp_shim.szOsFile) acp_shim.szOsFile = (int)sizeof(AcpFile);
     int rc = sqlite3_vfs_register(&acp_shim, 1);
-    if (rc != SQLITE_OK) return rc;
+    if (rc != SQLITE_OK) {
+      acp_state_unlock();
+      return rc;
+    }
   }
+  acp_state_unlock();
 
   /*
    * The registration outlives the connection that performed it, so the library must too.

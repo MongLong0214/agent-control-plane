@@ -12,7 +12,8 @@
       # production-and-testing a compile failure rather than a silently richer artifact: an
       # injected `-DACP_FD_VFS_TESTING` now cannot produce a library at all.
       "defines": ["ACP_FD_VFS_PRODUCTION_BUILD=1"],
-      "cflags": ["-fPIC", "-Wall"],
+      "cflags": ["-fPIC", "-Wall", "-pthread"],
+      "conditions": [["OS==\"linux\"", {"libraries": ["-lpthread"]}]],
       "product_prefix": "",
       "xcode_settings": {
         "MACOSX_DEPLOYMENT_TARGET": "11.0",
