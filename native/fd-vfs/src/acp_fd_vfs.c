@@ -286,15 +286,23 @@ static int acp_access(sqlite3_vfs *vfs, const char *path, int flags, int *out) {
 }
 
 /*
- * One-shot fault injection for the directory sync, so the failure path can be tested.
+ * One-shot fault injection for the directory sync — compiled only into the test artifact.
  *
  * There is no portable way to make `fsync` on a healthy directory descriptor fail on demand:
  * closing the descriptor breaks the `unlinkat` first, and every other trick either fails both
- * calls or fails neither. Without this the error branch would ship unexecuted — which is the
- * condition it exists to survive. It grants nothing: it cannot bind, open, read or write, and it
- * is armed only by the test that immediately consumes it.
+ * calls or fails neither. Without it the error branch would ship unexecuted, which is the
+ * condition it exists to survive.
+ *
+ * It is behind `ACP_FD_VFS_TESTING` because "the production loader does not expose it" was not a
+ * boundary. The extension registers SQL functions on whichever connection loads it, so any caller
+ * able to load the library could arm a fault in a migration's own VFS regardless of what
+ * `FdVfsControl` chose to surface. A hidden method is not a limit; an absent symbol is. The
+ * production build never defines this macro, and a test proves the symbols are gone by loading the
+ * shipped artifact and finding no such function.
  */
+#ifdef ACP_FD_VFS_TESTING
 static int acp_fail_next_dir_sync = 0;
+#endif
 
 static int acp_delete(sqlite3_vfs *vfs, const char *path, int sync_dir) {
   if (acp_binding.active && path && acp_is_bound_sibling(path)) {
@@ -311,8 +319,12 @@ static int acp_delete(sqlite3_vfs *vfs, const char *path, int sync_dir) {
        * "the migration you were told finished did not", which is the worst shape an error can
        * take here.
        */
+#ifdef ACP_FD_VFS_TESTING
       int failed = acp_fail_next_dir_sync ? (acp_fail_next_dir_sync = 0, 1)
                                           : (fsync(acp_binding.dir_fd) != 0);
+#else
+      int failed = fsync(acp_binding.dir_fd) != 0;
+#endif
       if (failed) return SQLITE_IOERR_DIR_FSYNC;
     }
     return SQLITE_OK;
@@ -385,6 +397,8 @@ static void acp_fn_unbind(sqlite3_context *ctx, int argc, sqlite3_value **argv) 
   sqlite3_result_int(ctx, was);
 }
 
+#ifdef ACP_FD_VFS_TESTING
+
 /** Arms the one-shot directory-sync fault. Test-only; see `acp_fail_next_dir_sync`. */
 static void acp_fn_fail_next_dir_sync(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   (void)argc; (void)argv;
@@ -449,6 +463,8 @@ static void acp_fn_probe_dir_sync(sqlite3_context *ctx, int argc, sqlite3_value 
   sqlite3_result_text(ctx, answer, -1, SQLITE_TRANSIENT);
 }
 
+#endif /* ACP_FD_VFS_TESTING */
+
 static void acp_fn_stats(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   (void)argc; (void)argv;
   char out[512];
@@ -493,8 +509,11 @@ int sqlite3_extension_init(sqlite3 *db, char **err, const sqlite3_api_routines *
   if (sqlite3_create_function(db, "acp_fd_bind", 3, SQLITE_UTF8, 0, acp_fn_bind, 0, 0) != SQLITE_OK ||
       sqlite3_create_function(db, "acp_fd_unbind", 0, SQLITE_UTF8, 0, acp_fn_unbind, 0, 0) != SQLITE_OK ||
       sqlite3_create_function(db, "acp_fd_stats", 0, SQLITE_UTF8, 0, acp_fn_stats, 0, 0) != SQLITE_OK ||
-      sqlite3_create_function(db, "acp_fd_probe", 0, SQLITE_UTF8, 0, acp_fn_probe, 0, 0) != SQLITE_OK ||
-      sqlite3_create_function(db, "acp_fd_fail_next_dir_sync", 0, SQLITE_UTF8, 0,
+      sqlite3_create_function(db, "acp_fd_probe", 0, SQLITE_UTF8, 0, acp_fn_probe, 0, 0) != SQLITE_OK) {
+    return SQLITE_ERROR;
+  }
+#ifdef ACP_FD_VFS_TESTING
+  if (sqlite3_create_function(db, "acp_fd_fail_next_dir_sync", 0, SQLITE_UTF8, 0,
                               acp_fn_fail_next_dir_sync, 0, 0) != SQLITE_OK ||
       sqlite3_create_function(db, "acp_fd_probe_refusal_methods", 0, SQLITE_UTF8, 0,
                               acp_fn_probe_refusal_methods, 0, 0) != SQLITE_OK ||
@@ -502,6 +521,7 @@ int sqlite3_extension_init(sqlite3 *db, char **err, const sqlite3_api_routines *
                               acp_fn_probe_dir_sync, 0, 0) != SQLITE_OK) {
     return SQLITE_ERROR;
   }
+#endif
 
   if (acp_parent == 0) {
     acp_parent = sqlite3_vfs_find(0);

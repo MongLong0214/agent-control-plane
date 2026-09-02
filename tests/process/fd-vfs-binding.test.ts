@@ -31,32 +31,64 @@ afterAll(cleanupTempDirs);
  */
 const REPO = fileURLToPath(new URL("../..", import.meta.url));
 
+/** The extension as it ships: built by node-gyp at install time, loaded by everything below. */
+const PRODUCTION_ARTIFACT = join(
+  REPO,
+  "native",
+  "fd-vfs",
+  "build",
+  "Release",
+  process.platform === "darwin" ? "acp_fd_vfs.dylib" : "acp_fd_vfs.so",
+);
+
 /**
- * A second connection with the extension loaded, used only for its test-only probe functions.
+ * The same C source, compiled a second time with the testing macro defined.
  *
- * The probes exist because two properties cannot be observed from TypeScript at all: SQLite owns
- * the `sqlite3_file` memory an `xOpen` refusal writes into, and no workload here asks `xDelete`
- * for a directory sync. They are deliberately not methods on `FdVfsControl` — the production
- * loader should not carry a way to inject a fault. The binding state they read is process-global,
- * so binding through the real API and probing through this connection describe the same thing.
+ * Two properties cannot be observed from TypeScript at all — SQLite owns the `sqlite3_file` memory
+ * an `xOpen` refusal writes into, and no workload here asks `xDelete` for a directory sync — so
+ * the extension has to answer them from the inside. Keeping those answers off the production
+ * loader was not enough of a boundary: the extension registers its SQL functions on whichever
+ * connection loads it, so any caller able to load the library could arm a fault in a migration's
+ * own VFS no matter what `FdVfsControl` chose to expose. A hidden method is not a limit.
+ *
+ * So the fault and the probes exist only when `ACP_FD_VFS_TESTING` is defined, the shipped build
+ * never defines it, and the evidence lives in a separate artifact this file compiles for itself.
+ * Compiling here is not the require-time compilation ADR-0010 forbids — nothing in `src/` reaches
+ * this, and the shipped artifact is still the one node-gyp built at install time.
  */
-const probeConnection = (): InstanceType<typeof Database> => {
-  const db = new Database(":memory:");
-  db.loadExtension(
-    join(
-      REPO,
-      "native",
-      "fd-vfs",
-      "build",
-      "Release",
-      process.platform === "darwin" ? "acp_fd_vfs.dylib" : "acp_fd_vfs.so",
-    ),
+let testingArtifact: string | null = null;
+
+const buildTestingArtifact = (): string => {
+  if (testingArtifact !== null) return testingArtifact;
+  const dir = tempDir("acp-u6-testing-artifact-");
+  chmodSync(dir, 0o700);
+  const out = join(dir, process.platform === "darwin" ? "acp_fd_vfs.dylib" : "acp_fd_vfs.so");
+  const includes = join(
+    createRequire(import.meta.url).resolve("better-sqlite3"),
+    "..",
+    "..",
+    "deps",
+    "sqlite3",
   );
-  return db;
+  const result = spawnSync(
+    process.env["CC"] ?? "cc",
+    [
+      "-O1",
+      "-fPIC",
+      "-shared",
+      "-DACP_FD_VFS_TESTING",
+      `-I${includes}`,
+      "-o",
+      out,
+      join(REPO, "native", "fd-vfs", "src", "acp_fd_vfs.c"),
+    ],
+    { encoding: "utf8" },
+  );
+  expect(result.status, `compiling the testing artifact failed: ${result.stderr}`).toBe(0);
+  testingArtifact = out;
+  return out;
 };
 
-const probe = (db: InstanceType<typeof Database>, sql: string, ...args: number[]): string =>
-  String((db.prepare(sql).get(...args) as { p: string }).p);
 /**
  * Resolved here and handed to the child as an absolute path.
  *
@@ -258,6 +290,42 @@ describe("U6-UNIT1 the fd-vfs binds a connection to a verified descriptor", () =
     }
   }, 120_000);
 
+  /**
+   * Runs one probe expression in a child process against the testing artifact.
+   *
+   * A child because both artifacts register a VFS under the same name; loading them into one
+   * process would make which shim answers an open depend on load order rather than on what the
+   * case is exercising. The child binds through the extension's own SQL entry point, which is the
+   * same process-global binding `FdVfsControl.bind` reaches.
+   */
+  const runProbe = (databasePath: string, expressions: string[]): string[] => {
+    const artifact = buildTestingArtifact();
+    const dir = tempDir("acp-u6-probe-child-");
+    chmodSync(dir, 0o700);
+    const script = join(dir, "probe.mjs");
+    writeFileSync(
+      script,
+      [
+        `import { openSync } from "node:fs";`,
+        `import { dirname } from "node:path";`,
+        `const Database = (await import(${JSON.stringify(BETTER_SQLITE3)})).default;`,
+        `const db = new Database(":memory:");`,
+        `db.loadExtension(${JSON.stringify(artifact)});`,
+        `const path = ${JSON.stringify(databasePath)};`,
+        `const mainFd = openSync(path, "r+");`,
+        `const dirFd = openSync(dirname(path), "r");`,
+        `db.prepare("SELECT acp_fd_bind(?, ?, ?) AS i").get(path, mainFd, dirFd);`,
+        `const out = [];`,
+        `for (const sql of ${JSON.stringify(expressions)}) out.push(String(db.prepare(sql).get().p));`,
+        `process.stdout.write(JSON.stringify(out));`,
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+    const result = spawnSync(process.execPath, ["--import", "tsx", script], { encoding: "utf8" });
+    expect(result.status, `probe child failed: ${result.stderr}`).toBe(0);
+    return JSON.parse(result.stdout) as string[];
+  };
+
   it("reports a failed directory sync instead of calling the delete a success", () => {
     // Removing a rollback journal is what makes a commit durable: until that directory entry is on
     // stable storage, a power loss can bring the journal back and roll away work this code already
@@ -272,28 +340,16 @@ describe("U6-UNIT1 the fd-vfs binds a connection to a verified descriptor", () =
     const path = join(dir, "copy.sqlite");
     seed(path, 25, "rows");
 
-    const control = FdVfsControl.load();
-    const mainFd = openSync(path, "r+");
-    const dirFd = openSync(dir, "r");
-    try {
-      control.bind(path, mainFd, dirFd);
-      const probes = probeConnection();
-      try {
-        // Control first: the same call with a healthy directory succeeds, so the assertion below
-        // is about the fault and not about this path being broken in general.
-        expect(probe(probes, "SELECT acp_fd_probe_dir_sync(?) AS p", 0)).toBe("rc=0");
-        // SQLITE_IOERR_DIR_FSYNC is 1290 — SQLITE_IOERR (10) with extended code 5.
-        expect(probe(probes, "SELECT acp_fd_probe_dir_sync(?) AS p", 1)).toBe("rc=1290");
-      } finally {
-        probes.close();
-      }
-    } finally {
-      control.unbind();
-      control.close();
-      closeSync(dirFd);
-      closeSync(mainFd);
-    }
-  }, 120_000);
+    const [healthy, faulted] = runProbe(path, [
+      "SELECT acp_fd_probe_dir_sync(0) AS p",
+      "SELECT acp_fd_probe_dir_sync(1) AS p",
+    ]);
+    // Control first: the same call against a healthy directory succeeds, so the assertion below is
+    // about the fault and not about this path being broken in general.
+    expect(healthy).toBe("rc=0");
+    // SQLITE_IOERR_DIR_FSYNC is 1290 — SQLITE_IOERR (10) with extended code 5.
+    expect(faulted).toBe("rc=1290");
+  }, 180_000);
 
   it("leaves pMethods meaningful when it refuses an open", () => {
     // SQLite hands xOpen uninitialised memory and, on some paths, inspects pMethods even after a
@@ -308,26 +364,56 @@ describe("U6-UNIT1 the fd-vfs binds a connection to a verified descriptor", () =
     const path = join(dir, "copy.sqlite");
     seed(path, 25, "rows");
 
-    const control = FdVfsControl.load();
-    const mainFd = openSync(path, "r+");
-    const dirFd = openSync(dir, "r");
-    try {
-      control.bind(path, mainFd, dirFd);
-      const probes = probeConnection();
-      try {
-        const answer = probe(probes, "SELECT acp_fd_probe_refusal_methods() AS p");
-        expect(answer).toContain("rc=14");
-        expect(answer).toContain("methodsNull=1");
-      } finally {
-        probes.close();
-      }
-    } finally {
-      control.unbind();
-      control.close();
-      closeSync(dirFd);
-      closeSync(mainFd);
+    const [answer] = runProbe(path, ["SELECT acp_fd_probe_refusal_methods() AS p"]);
+    expect(answer).toContain("rc=14");
+    expect(answer).toContain("methodsNull=1");
+  }, 180_000);
+
+  it("ships no fault injector: the probes exist only in the testing artifact", () => {
+    // The boundary that matters is the symbol, not the loader. `FdVfsControl` never exposed these,
+    // but the extension registers its SQL functions on whichever connection loads it — so before
+    // this, any caller able to load the shipped library could arm a directory-sync fault inside a
+    // migration's own VFS. Absence is checked against the artifact that actually ships.
+    const dir = tempDir("acp-u6-absence-");
+    chmodSync(dir, 0o700);
+    const script = join(dir, "absence.mjs");
+    const names = [
+      "acp_fd_fail_next_dir_sync()",
+      "acp_fd_probe_refusal_methods()",
+      "acp_fd_probe_dir_sync(1)",
+    ];
+    writeFileSync(
+      script,
+      [
+        `const Database = (await import(${JSON.stringify(BETTER_SQLITE3)})).default;`,
+        `const load = (p) => { const d = new Database(":memory:"); d.loadExtension(p); return d; };`,
+        `const report = {};`,
+        `const prod = load(${JSON.stringify(PRODUCTION_ARTIFACT)});`,
+        `for (const call of ${JSON.stringify(names)}) {`,
+        `  try { prod.prepare("SELECT " + call + " AS p").get(); report[call] = "present"; }`,
+        `  catch (error) { report[call] = /no such function/i.test(String(error)) ? "absent" : String(error); }`,
+        `}`,
+        `report.registered = /registered=1/.test(String(prod.prepare("SELECT acp_fd_probe() AS p").get().p));`,
+        `process.stdout.write(JSON.stringify(report));`,
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+    const result = spawnSync(process.execPath, ["--import", "tsx", script], { encoding: "utf8" });
+    expect(result.status, `absence child failed: ${result.stderr}`).toBe(0);
+    const report = JSON.parse(result.stdout) as Record<string, string | boolean>;
+    for (const call of names) {
+      expect(report[call], `${call} is reachable in the shipped artifact`).toBe("absent");
     }
-  }, 120_000);
+    // And the artifact is the real one, not an empty library that would make absence trivial.
+    expect(report["registered"]).toBe(true);
+
+    // The same source with the macro defined does carry them — otherwise "absent" would prove
+    // nothing about the macro and everything about a typo in the function names.
+    const path = join(dir, "copy.sqlite");
+    seed(path, 25, "rows");
+    const [answer] = runProbe(path, ["SELECT acp_fd_probe_refusal_methods() AS p"]);
+    expect(answer).toContain("methodsNull=1");
+  }, 180_000);
 
   it("stays out of the way entirely when nothing is bound", () => {
     // Registering as the process default is only acceptable because an unbound shim is the VFS it
