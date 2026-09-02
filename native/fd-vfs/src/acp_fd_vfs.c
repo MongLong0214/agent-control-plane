@@ -94,12 +94,26 @@ static sqlite3_vfs acp_shim;
 static pthread_mutex_t acp_mutex;
 static pthread_once_t acp_mutex_once = PTHREAD_ONCE_INIT;
 
+/*
+ * Whether the mutex is usable. Every step of bringing it up can fail, and ignoring those returns
+ * meant a failed initialisation continued straight into unsynchronised access to the very state
+ * the mutex exists to protect — the fault would show up as corruption somewhere else entirely.
+ */
+static int acp_mutex_ready = 0;
+
 static void acp_mutex_init(void) {
   pthread_mutexattr_t attributes;
-  pthread_mutexattr_init(&attributes);
-  pthread_mutexattr_settype(&attributes, PTHREAD_MUTEX_RECURSIVE);
-  pthread_mutex_init(&acp_mutex, &attributes);
+  if (pthread_mutexattr_init(&attributes) != 0) return;
+  if (pthread_mutexattr_settype(&attributes, PTHREAD_MUTEX_RECURSIVE) != 0) {
+    pthread_mutexattr_destroy(&attributes);
+    return;
+  }
+  if (pthread_mutex_init(&acp_mutex, &attributes) != 0) {
+    pthread_mutexattr_destroy(&attributes);
+    return;
+  }
   pthread_mutexattr_destroy(&attributes);
+  acp_mutex_ready = 1;
 }
 
 /* Declared before use: in the shipping build these are nothing at all. */
@@ -113,14 +127,26 @@ static void acp_seam_arrive(void);
 #define acp_seam_arrive() ((void)0)
 #endif
 
-static void acp_state_lock(void) {
-  pthread_once(&acp_mutex_once, acp_mutex_init);
+/** Acquires the state lock. Returns 0 when it could not be taken; the caller must then refuse. */
+static int acp_state_lock(void) {
+  if (pthread_once(&acp_mutex_once, acp_mutex_init) != 0) return 0;
+  if (!acp_mutex_ready) return 0;
   acp_seam_enter_lock_queue();
-  pthread_mutex_lock(&acp_mutex);
+  int rc = pthread_mutex_lock(&acp_mutex);
   acp_seam_leave_lock_queue();
+  return rc == 0;
 }
 
-static void acp_state_unlock(void) { pthread_mutex_unlock(&acp_mutex); }
+/**
+ * Releases the state lock, balancing exactly one successful acquisition.
+ *
+ * An unlock that fails leaves the mutex in a state nothing here can reason about, so the lock is
+ * marked unusable and every later acquisition fails — which turns an unknown into a refusal
+ * instead of into unsynchronised access.
+ */
+static void acp_state_unlock(void) {
+  if (pthread_mutex_unlock(&acp_mutex) != 0) acp_mutex_ready = 0;
+}
 
 /*
  * A rendezvous inside `bind`, compiled only into the test artifact, driven by the parent.
@@ -309,7 +335,8 @@ static struct {
   dev_t dev;
   ino_t ino;
   int main_opens;   /* cumulative, for observation */
-  int main_live;    /* currently open, for the cap */
+  int main_ever;    /* whether this lease has ever admitted a main open — the cap */
+  int main_live;    /* currently open — the lifetime guard for release */
   int journal_opens;
   int deletes;
   int dir_syncs;
@@ -365,10 +392,13 @@ static int acp_close(sqlite3_file *file) {
   if (f->counts_as_main) {
     /* Balanced against the increment in `xOpen`, under the same lock, so "already open" means
        currently open rather than ever opened. */
-    acp_state_lock();
-    if (acp_binding.main_live > 0) acp_binding.main_live -= 1;
-    acp_state_unlock();
-    f->counts_as_main = 0;
+    if (acp_state_lock()) {
+      if (acp_binding.main_live > 0) acp_binding.main_live -= 1;
+      acp_state_unlock();
+      f->counts_as_main = 0;
+    }
+    /* If the lock is gone the count stays as it is: a release is already refused while anything is
+       open, so an unbalanced count keeps this binding held rather than freeing it wrongly. */
   }
   if (f->dir_fd >= 0) close(f->dir_fd);
   f->dir_fd = -1;
@@ -472,7 +502,11 @@ static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int 
    * section. The open cap in particular was three separate steps — check the count, `dup` the
    * descriptor, increment — and two threads could each pass the check before either incremented.
    */
-  acp_state_lock();
+  if (!acp_state_lock()) {
+    /* Without the lock nothing here can tell whether a binding is active, and guessing is the
+       failure this exists to prevent. */
+    return SQLITE_CANTOPEN;
+  }
   if (!acp_binding.active || path == 0) {
     acp_state_unlock();
     return acp_parent->xOpen(acp_parent, path, file, flags, out);
@@ -488,11 +522,15 @@ static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int 
       acp_state_unlock();
       return SQLITE_CANTOPEN;
     }
-    if (acp_binding.main_live > 0) {
-      /* One lease, one connection. Two connections on one descriptor share a file position and a
-         lock state that neither of them is tracking, and "the connection this binding is for"
-         stops naming anything. */
-      acp_refuse("the bound database is already open under this lease");
+    if (acp_binding.main_ever) {
+      /*
+       * One lease, one connection — and "one" is counted for the life of the lease, not for the
+       * moment. Making this a live count weakened the contract into "not concurrently open", which
+       * lets a lease open, close, and open again; I had even written a test that codified the
+       * weaker rule as if it were the intended one. Admission is monotonic, and it is decided
+       * before the descriptor is duplicated so a refusal costs nothing.
+       */
+      acp_refuse("the bound database has already been opened under this lease");
       acp_state_unlock();
       return SQLITE_CANTOPEN;
     }
@@ -515,6 +553,7 @@ static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int 
     if (out) *out = SQLITE_OPEN_READWRITE;
     f->counts_as_main = 1;
     acp_binding.main_opens++;
+    acp_binding.main_ever = 1;
     acp_binding.main_live++;
     acp_state_unlock();
     return SQLITE_OK;
@@ -571,7 +610,7 @@ static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int 
  * files this binding exists to own.
  */
 static int acp_access(sqlite3_vfs *vfs, const char *path, int flags, int *out) {
-  acp_state_lock();
+  if (!acp_state_lock()) return SQLITE_IOERR_ACCESS;
   if (acp_binding.active && path && acp_is_bound_sibling(path)) {
     int mode = (flags == SQLITE_ACCESS_READWRITE) ? (R_OK | W_OK) : F_OK;
     *out = faccessat(acp_binding.dir_fd, acp_basename(path), mode, 0) == 0;
@@ -602,7 +641,7 @@ static int acp_fail_next_dir_sync = 0;
 #endif
 
 static int acp_delete(sqlite3_vfs *vfs, const char *path, int sync_dir) {
-  acp_state_lock();
+  if (!acp_state_lock()) return SQLITE_IOERR_DELETE;
   if (acp_binding.active && path && acp_is_bound_sibling(path)) {
     acp_binding.deletes++;
     if (unlinkat(acp_binding.dir_fd, acp_basename(path), 0) != 0 && errno != ENOENT) {
@@ -683,7 +722,10 @@ static void acp_fn_bind(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     sqlite3_result_error(ctx, "dirFd is not an open directory", -1);
     return;
   }
-  acp_state_lock();
+  if (!acp_state_lock()) {
+    sqlite3_result_error(ctx, "the binding lock is unavailable; refusing to bind", -1);
+    return;
+  }
   if (acp_binding.active) {
     acp_state_unlock();
     sqlite3_result_error(
@@ -739,7 +781,10 @@ static void acp_fn_unbind(sqlite3_context *ctx, int argc, sqlite3_value **argv) 
     return;
   }
 
-  acp_state_lock();
+  if (!acp_state_lock()) {
+    sqlite3_result_error(ctx, "the binding lock is unavailable; refusing to release", -1);
+    return;
+  }
   if (!acp_binding.active) {
     /* Releasing nothing is not an error: a bracket must be able to run its release without having
        to know whether the acquire got that far. */
@@ -771,6 +816,18 @@ static void acp_fn_unbind(sqlite3_context *ctx, int argc, sqlite3_value **argv) 
 }
 
 #ifdef ACP_FD_VFS_TESTING
+
+/**
+ * Marks the state lock unusable, or usable again. Test-only.
+ *
+ * A healthy machine never fails to create a mutex, so without a way to induce it the fail-closed
+ * branches on every entry point would ship unexecuted — the same reason the entropy seams exist.
+ */
+static void acp_fn_test_break_lock(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  int broken = (argc == 1) ? sqlite3_value_int(argv[0]) : 1;
+  acp_mutex_ready = broken ? 0 : 1;
+  sqlite3_result_int(ctx, broken ? 1 : 0);
+}
 
 /** Arms the entropy syscall seams: short reads, EINTR reads, close failures. Test-only. */
 static void acp_fn_test_entropy(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
@@ -836,7 +893,15 @@ static void acp_fn_fail_next_dir_sync(sqlite3_context *ctx, int argc, sqlite3_va
  */
 static void acp_fn_probe_refusal_methods(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   (void)argc; (void)argv;
-  if (!acp_binding.active) {
+  /* Snapshot under the mutex: reading the binding unlocked is the defect this file just fixed
+     everywhere else, and a probe is not exempt from it. */
+  if (!acp_state_lock()) {
+    sqlite3_result_text(ctx, "lock unavailable", -1, SQLITE_TRANSIENT);
+    return;
+  }
+  int active = acp_binding.active;
+  acp_state_unlock();
+  if (!active) {
     sqlite3_result_text(ctx, "no binding", -1, SQLITE_TRANSIENT);
     return;
   }
@@ -868,13 +933,20 @@ static void acp_fn_probe_refusal_methods(sqlite3_context *ctx, int argc, sqlite3
  * called finished — so the branch is exercised directly instead.
  */
 static void acp_fn_probe_dir_sync(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
-  if (!acp_binding.active) {
+  /* Same reason as above: the path is shared state and is copied under the mutex. */
+  if (!acp_state_lock()) {
+    sqlite3_result_text(ctx, "lock unavailable", -1, SQLITE_TRANSIENT);
+    return;
+  }
+  int active = acp_binding.active;
+  char journal[ACP_MAX_PATH + 16];
+  if (active) snprintf(journal, sizeof journal, "%s-journal", acp_binding.path);
+  acp_state_unlock();
+  if (!active) {
     sqlite3_result_text(ctx, "no binding", -1, SQLITE_TRANSIENT);
     return;
   }
   int arm = (argc == 1) ? sqlite3_value_int(argv[0]) : 0;
-  char journal[ACP_MAX_PATH + 16];
-  snprintf(journal, sizeof journal, "%s-journal", acp_binding.path);
   if (arm) acp_fail_next_dir_sync = 1;
   int rc = acp_shim.xDelete(&acp_shim, journal, 1);
   char answer[64];
@@ -889,7 +961,10 @@ static void acp_fn_stats(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   char out[512];
   /* Seven shared fields; reading them unlocked can report a mixture of two states that never
      existed at any instant. */
-  acp_state_lock();
+  if (!acp_state_lock()) {
+    sqlite3_result_text(ctx, "lock unavailable", -1, SQLITE_TRANSIENT);
+    return;
+  }
   snprintf(out, sizeof out,
            "active=%d mainOpens=%d journalOpens=%d deletes=%d dirSyncs=%d refusals=%d refusal=%s",
            acp_binding.active, acp_binding.main_opens, acp_binding.journal_opens,
@@ -948,12 +1023,17 @@ int sqlite3_extension_init(sqlite3 *db, char **err, const sqlite3_api_routines *
       sqlite3_create_function(db, "acp_fd_test_seam_release", 0, SQLITE_UTF8, 0,
                               acp_fn_test_seam_release, 0, 0) != SQLITE_OK ||
       sqlite3_create_function(db, "acp_fd_test_entropy", 3, SQLITE_UTF8, 0,
-                              acp_fn_test_entropy, 0, 0) != SQLITE_OK) {
+                              acp_fn_test_entropy, 0, 0) != SQLITE_OK ||
+      sqlite3_create_function(db, "acp_fd_test_break_lock", 1, SQLITE_UTF8, 0,
+                              acp_fn_test_break_lock, 0, 0) != SQLITE_OK) {
     return SQLITE_ERROR;
   }
 #endif
 
-  acp_state_lock();
+  if (!acp_state_lock()) {
+    if (err) *err = sqlite3_mprintf("acp-fd-vfs could not initialise its state lock");
+    return SQLITE_ERROR;
+  }
   if (acp_parent == 0) {
     acp_parent = sqlite3_vfs_find(0);
     if (acp_parent == 0) {

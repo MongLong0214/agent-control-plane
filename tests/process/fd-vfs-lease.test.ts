@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, closeSync, openSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -68,14 +68,19 @@ const strangerConnection = (): InstanceType<typeof Database> => {
  * Duplicated rather than shared with the binding suite on purpose: this correction is bounded to
  * three paths, and adding a fourth to hold a helper would widen it for tidiness.
  */
-let testingArtifact: string | null = null;
+const REPO_ROOT = fileURLToPath(new URL("../..", import.meta.url));
+const VFS_SOURCE = join(REPO_ROOT, "native", "fd-vfs", "src", "acp_fd_vfs.c");
 
-const buildTestingArtifact = (): string => {
-  if (testingArtifact !== null) return testingArtifact;
-  const dir = tempDir("acp-u6-lease-artifact-");
+/** Compiles the VFS with the testing macro, optionally from transformed source. */
+const compileTestingArtifact = (label: string, transform?: (source: string) => string): string => {
+  const dir = tempDir(`acp-u6-artifact-${label}-`);
   chmodSync(dir, 0o700);
   const out = join(dir, process.platform === "darwin" ? "acp_fd_vfs.dylib" : "acp_fd_vfs.so");
-  const repo = fileURLToPath(new URL("../..", import.meta.url));
+  let source = VFS_SOURCE;
+  if (transform) {
+    source = join(dir, "acp_fd_vfs.c");
+    writeFileSync(source, transform(readFileSync(VFS_SOURCE, "utf8")), { mode: 0o600 });
+  }
   const includes = join(
     createRequire(import.meta.url).resolve("better-sqlite3"),
     "..",
@@ -85,21 +90,17 @@ const buildTestingArtifact = (): string => {
   );
   const result = spawnSync(
     process.env["CC"] ?? "cc",
-    [
-      "-O1",
-      "-fPIC",
-      "-shared",
-      "-DACP_FD_VFS_TESTING",
-      `-I${includes}`,
-      "-o",
-      out,
-      join(repo, "native", "fd-vfs", "src", "acp_fd_vfs.c"),
-    ],
+    ["-O1", "-fPIC", "-shared", "-DACP_FD_VFS_TESTING", `-I${includes}`, "-o", out, source],
     { encoding: "utf8" },
   );
-  expect(result.status, `compiling the testing artifact failed: ${result.stderr}`).toBe(0);
-  testingArtifact = out;
+  expect(result.status, `compiling the ${label} artifact failed: ${result.stderr}`).toBe(0);
   return out;
+};
+
+let testingArtifact: string | null = null;
+const buildTestingArtifact = (): string => {
+  if (testingArtifact === null) testingArtifact = compileTestingArtifact("baseline");
+  return testingArtifact;
 };
 
 /** One private directory holding one seeded database, with its descriptors open. */
@@ -217,22 +218,18 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
     }
   }, 180_000);
 
-  it("serialises concurrent binds, decided by a predicate rather than by a timeout", () => {
-    // The state behind the lease is process-global and was unsynchronised: two threads could each
-    // pass the active-check before either wrote, and one binding would silently replace the other.
-    // Worker threads share the process, so they share the loaded extension's statics.
-    //
-    // The parent decides when to release, and it waits for a predicate that is definite in both
-    // worlds rather than for a duration. With the lock, one thread reaches the seam and the other
-    // is queued for the lock (arrived >= 1 and waiters >= 1). Without it, both reach the seam
-    // (arrived >= 2). Either way the parent then releases, joins both workers, and asserts against
-    // finished threads.
-    //
-    // The earlier version used a one-second timeout as its authority, which is not evidence about
-    // a lock; and repetition would not have served either — measured, with the lock removed, forty
-    // unsynchronised rounds produced a double binding only three times.
-    const artifact = buildTestingArtifact();
-    const dir = tempDir("acp-u6-race-");
+  /** Runs the two-worker bind race against `artifact` and reports what the parent observed. */
+  const raceWith = (
+    artifact: string,
+    label: string,
+  ): {
+    bound: number;
+    errors: string[];
+    predicate: { arrived: number; waiters: number };
+    joined: number;
+    exitCodes: number[];
+  } => {
+    const dir = tempDir(`acp-u6-race-${label}-`);
     chmodSync(dir, 0o700);
     const target = seed(join(dir, "copy.sqlite"));
     const better = createRequire(import.meta.url).resolve("better-sqlite3");
@@ -259,8 +256,8 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
       { mode: 0o600 },
     );
 
-    // A child process, because the testing artifact and the shipped one register a VFS under the
-    // same name; loading both here would make the result depend on load order.
+    // A child process, because artifacts register a VFS under the same name; loading two here
+    // would make the result depend on load order.
     const driver = join(dir, "race.mjs");
     writeFileSync(
       driver,
@@ -275,7 +272,10 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
         `for (const _ of [0, 1]) {`,
         `  const w = new Worker(${JSON.stringify(worker)}, { workerData: {`,
         `    path: ${JSON.stringify(target)}, extension: ${JSON.stringify(artifact)}, better: ${JSON.stringify(better)} } });`,
-        `  outcomes.push(new Promise((resolve, reject) => { w.on("message", resolve); w.on("error", reject); }));`,
+        `  outcomes.push(new Promise((resolve) => {`,
+        `    w.on("message", resolve);`,
+        `    w.on("error", (e) => resolve({ bound: false, error: String(e && e.message ? e.message : e) }));`,
+        `  }));`,
         `  exits.push(new Promise((resolve) => w.on("exit", resolve)));`,
         `}`,
         `const read = () => {`,
@@ -284,9 +284,13 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
         `  return { arrived: n("arrived"), waiters: n("waiters") };`,
         `};`,
         `let seen;`,
+        `let polls = 0;`,
         `for (;;) {`,
         `  seen = read();`,
         `  if (seen.arrived >= 2 || (seen.arrived >= 1 && seen.waiters >= 1)) break;`,
+        `  // A bound, not a verdict: the predicate decides the outcome, and this only refuses to`,
+        `  // hang forever if it never holds. Reaching it is a failure with a diagnosis.`,
+        `  if (++polls > 2500) { process.stderr.write("predicate never held: " + JSON.stringify(seen)); process.exit(3); }`,
         `  await new Promise((r) => setTimeout(r, 2));`,
         `}`,
         `boot.prepare("SELECT acp_fd_test_seam_release() AS r").get();`,
@@ -294,6 +298,7 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
         `const codes = await Promise.all(exits);`,
         `process.stdout.write(JSON.stringify({`,
         `  bound: results.filter((r) => r.bound).length,`,
+        `  errors: results.filter((r) => r.error).map((r) => r.error),`,
         `  predicate: seen,`,
         `  joined: codes.length,`,
         `  exitCodes: codes,`,
@@ -303,14 +308,21 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
     );
 
     const run = spawnSync(process.execPath, ["--import", "tsx", driver], { encoding: "utf8" });
-    expect(run.status, `race driver failed: ${run.stderr}`).toBe(0);
-    const report = JSON.parse(run.stdout) as {
-      bound: number;
-      predicate: { arrived: number; waiters: number };
-      joined: number;
-      exitCodes: number[];
-    };
-    // Both workers ran to completion, so the count below is about finished threads.
+    expect(run.status, `${label} race driver failed: ${run.stderr}`).toBe(0);
+    expect(run.stderr, `${label} race driver warned: ${run.stderr}`).toBe("");
+    return JSON.parse(run.stdout) as ReturnType<typeof raceWith>;
+  };
+
+  it("serialises concurrent binds, decided by a predicate rather than by a timeout", () => {
+    // The state behind the lease is process-global and was unsynchronised: two threads could each
+    // pass the active-check before either wrote, and one binding would silently replace the other.
+    // Worker threads share the process, so they share the loaded extension's statics.
+    //
+    // The parent decides when to release and waits for a predicate that is definite in both worlds
+    // rather than for a duration. With the lock, one thread reaches the seam and the other is
+    // queued for it; without it, both reach the seam. Either way the parent then releases, joins
+    // both workers, and asserts against finished threads.
+    const report = raceWith(buildTestingArtifact(), "baseline");
     expect(report.joined).toBe(2);
     expect(report.exitCodes).toEqual([0, 0]);
     // The lock's signature: one thread inside, the other queued for the lock rather than at the
@@ -318,6 +330,46 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
     expect(report.predicate.arrived).toBe(1);
     expect(report.predicate.waiters).toBeGreaterThanOrEqual(1);
     expect(report.bound, "two threads bound at once").toBe(1);
+  }, 300_000);
+
+  it("owns its lock-removal mutant: without the lock, two joined workers both bind", () => {
+    // The baseline above is only evidence if something makes it fail. This compiles a disposable
+    // artifact from the same source with exactly one locus removed — the body of the acquisition,
+    // count-checked so a rename or a refactor turns this into a failure rather than into a mutant
+    // that quietly is not one — and runs the identical driver against it.
+    const mutant = compileTestingArtifact("no-lock", (source) => {
+      // One contiguous span covering both halves of the pair. Removing only the acquisition is not
+      // a smaller mutation but a different one: the release then unlocks a mutex nobody holds,
+      // which this code treats as unrecoverable and fails closed on, so nothing races and the
+      // driver simply never sees its predicate. The mutation has to leave the pair balanced and
+      // remove exactly one thing — mutual exclusion.
+      const locus = `  acp_seam_enter_lock_queue();
+  int rc = pthread_mutex_lock(&acp_mutex);
+  acp_seam_leave_lock_queue();
+  return rc == 0;
+}`;
+      const release = `  if (pthread_mutex_unlock(&acp_mutex) != 0) acp_mutex_ready = 0;`;
+      expect(source.split(locus).length - 1, "the acquire locus is not exactly one place").toBe(1);
+      expect(source.split(release).length - 1, "the release locus is not exactly one place").toBe(1);
+      return source
+        .replace(
+          locus,
+          `  acp_seam_enter_lock_queue();
+  acp_seam_leave_lock_queue();
+  return 1;
+}`,
+        )
+        .replace(release, `  /* mutant: no release, because there is nothing held */`);
+    });
+
+    const report = raceWith(mutant, "no-lock");
+    // Both workers ran to completion — the failure is a double binding, not a hang or a crash.
+    expect(report.joined).toBe(2);
+    expect(report.exitCodes).toEqual([0, 0]);
+    // Both reached the seam, which is the shape of the defect: each passed the active-check.
+    expect(report.predicate.arrived).toBe(2);
+    // And the assertion the baseline case makes dies here, without any timeout deciding it.
+    expect(report.bound).toBe(2);
   }, 300_000);
 
   it("refuses an uppercase spelling of the lease", () => {
@@ -410,6 +462,61 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
     closeSync(a.mainFd);
   }, 300_000);
 
+  it("refuses everything when the state lock cannot be taken", () => {
+    // Every entry point reads or writes state the mutex protects, so an unusable mutex has to mean
+    // refusal rather than unsynchronised access — the fault would otherwise surface as corruption
+    // somewhere else entirely. A healthy machine never fails to create a mutex, so the failure is
+    // induced by a seam that exists only in the testing artifact.
+    const a = held("brokenlock");
+    const artifact = buildTestingArtifact();
+    const dir = tempDir("acp-u6-brokenlock-");
+    chmodSync(dir, 0o700);
+    const script = join(dir, "broken.mjs");
+    writeFileSync(
+      script,
+      [
+        `import { openSync } from "node:fs";`,
+        `import { dirname } from "node:path";`,
+        `const Database = (await import(${JSON.stringify(createRequire(import.meta.url).resolve("better-sqlite3"))})).default;`,
+        `const db = new Database(":memory:");`,
+        `db.loadExtension(${JSON.stringify(artifact)});`,
+        `const path = ${JSON.stringify(a.path)};`,
+        `const mainFd = openSync(path, "r+");`,
+        `const dirFd = openSync(dirname(path), "r");`,
+        `const attempt = (label, run) => { try { run(); return [label, "accepted"]; }`,
+        `  catch (error) { return [label, String(error).slice(0, 60)]; } };`,
+        `db.prepare("SELECT acp_fd_test_break_lock(?) AS b").get(1);`,
+        `const broken = [`,
+        `  attempt("bind", () => db.prepare("SELECT acp_fd_bind(?, ?, ?) AS l").get(path, mainFd, dirFd)),`,
+        `  attempt("unbind", () => db.prepare("SELECT acp_fd_unbind(?) AS r").get("0".repeat(32))),`,
+        `  attempt("open", () => { const c = new Database(path); c.close(); }),`,
+        `  ["stats", db.prepare("SELECT acp_fd_stats() AS p").get().p],`,
+        `];`,
+        `db.prepare("SELECT acp_fd_test_break_lock(?) AS b").get(0);`,
+        `const healthy = attempt("bind", () => {`,
+        `  const row = db.prepare("SELECT acp_fd_bind(?, ?, ?) AS l").get(path, mainFd, dirFd);`,
+        `  db.prepare("SELECT acp_fd_unbind(?) AS r").get(row.l);`,
+        `});`,
+        `process.stdout.write(JSON.stringify({ broken, healthy }));`,
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+    const run = spawnSync(process.execPath, ["--import", "tsx", script], { encoding: "utf8" });
+    expect(run.status, `broken-lock child failed: ${run.stderr}`).toBe(0);
+    const report = JSON.parse(run.stdout) as { broken: string[][]; healthy: string[] };
+
+    const answers = Object.fromEntries(report.broken);
+    expect(answers["bind"], "bind proceeded without the lock").toContain("lock is unavailable");
+    expect(answers["unbind"], "release proceeded without the lock").toContain("lock is unavailable");
+    expect(answers["open"], "an open proceeded without the lock").not.toBe("accepted");
+    expect(answers["stats"]).toBe("lock unavailable");
+    // And the refusal is the lock's doing, not a broken build: with it restored, binding works.
+    expect(report.healthy[1]).toBe("accepted");
+
+    closeSync(a.dirFd);
+    closeSync(a.mainFd);
+  }, 300_000);
+
   it("refuses to release while the bound database is still open", () => {
     // The lifetime, made explicit. A release while a file is still open leaves that file holding
     // descriptors whose owner has gone, and its close would have to consult state that no longer
@@ -438,11 +545,14 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
     }
   }, 120_000);
 
-  it("balances the open count, so one lease can open the database again after closing it", () => {
-    // "Already open" has to mean currently open. Counting opens without counting closes made the
-    // cap a one-shot for the life of the lease, which is a different rule than the one intended
-    // and one no caller could satisfy twice.
-    const a = held("balance");
+  it("refuses a second main open under one lease even after the first is closed", () => {
+    // One lease, one connection, counted for the life of the lease rather than for the moment.
+    //
+    // I had this wrong: making the cap a live count turned the contract into "not concurrently
+    // open", and I then wrote a test asserting the reopen *succeeded* — codifying the weaker rule
+    // as though it were the intended one. Admission is monotonic, and the refusal is decided
+    // before the descriptor is duplicated.
+    const a = held("monotonic");
     const control = FdVfsControl.load();
     try {
       control.bind(a.path, a.mainFd, a.dirFd);
@@ -450,14 +560,19 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
       first.exec("CREATE TABLE one (x INTEGER)");
       first.close();
 
-      const second = new Database(a.path);
+      expect(() => new Database(a.path)).toThrowError(/unable to open database file/i);
+      expect(control.stats().refusal).toContain("has already been opened under this lease");
+      expect(control.stats().mainOpens).toBe(1);
+
+      // A fresh lease admits one again — the rule is per lease, not per process.
+      control.unbind();
+      control.bind(a.path, a.mainFd, a.dirFd);
+      const next = new Database(a.path);
       try {
-        second.exec("CREATE TABLE two (x INTEGER)");
-        expect(Number(second.pragma("user_version", { simple: true }))).toBe(25);
+        expect(Number(next.pragma("user_version", { simple: true }))).toBe(25);
       } finally {
-        second.close();
+        next.close();
       }
-      expect(control.stats().mainOpens).toBe(2);
     } finally {
       control.unbind();
       control.close();
@@ -525,7 +640,7 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
       const first = new Database(a.path);
       try {
         expect(() => new Database(a.path)).toThrowError(/unable to open database file/i);
-        expect(control.stats().refusal).toContain("already open under this lease");
+        expect(control.stats().refusal).toContain("has already been opened under this lease");
         // The connection that got there first is unharmed.
         first.exec("CREATE TABLE proof (x INTEGER)");
       } finally {
