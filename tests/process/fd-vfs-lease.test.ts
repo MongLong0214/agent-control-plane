@@ -348,7 +348,11 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
   acp_seam_leave_lock_queue();
   return rc == 0;
 }`;
-      const release = `  if (pthread_mutex_unlock(&acp_mutex) != 0) acp_mutex_ready = 0;`;
+      const release = `  if (pthread_mutex_unlock(&acp_mutex) != 0) {
+    acp_mutex_ready = 0;
+    return 0;
+  }
+  return 1;`;
       expect(source.split(locus).length - 1, "the acquire locus is not exactly one place").toBe(1);
       expect(source.split(release).length - 1, "the release locus is not exactly one place").toBe(1);
       return source
@@ -359,7 +363,7 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
   return 1;
 }`,
         )
-        .replace(release, `  /* mutant: no release, because there is nothing held */`);
+        .replace(release, `  return 1;  /* mutant: nothing is held, so nothing is released */`);
     });
 
     const report = raceWith(mutant, "no-lock");
@@ -512,6 +516,175 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
     expect(answers["stats"]).toBe("lock unavailable");
     // And the refusal is the lock's doing, not a broken build: with it restored, binding works.
     expect(report.healthy[1]).toBe("accepted");
+
+    closeSync(a.dirFd);
+    closeSync(a.mainFd);
+  }, 300_000);
+
+  it("does not hold the process lock after reporting its counters", () => {
+    // acp_fd_stats acquired the lock and returned without releasing it. A recursive mutex stays
+    // held by the thread that took it, so every later open blocked forever: reading counters
+    // wedged the process. It vanished when a later edit changed the text an earlier patch had
+    // anchored the unlock to, which is why the pairing is now stated on every path.
+    //
+    // Observed by joining: a worker reads stats, then opens the bound database, and both must
+    // finish. Under the leak the second step never returns.
+    const a = held("statslock");
+    const artifact = buildTestingArtifact();
+    const dir = tempDir("acp-u6-statslock-");
+    chmodSync(dir, 0o700);
+    const script = join(dir, "statslock.mjs");
+    writeFileSync(
+      script,
+      [
+        `import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";`,
+        `import { openSync } from "node:fs";`,
+        `import { dirname } from "node:path";`,
+        `const better = ${JSON.stringify(createRequire(import.meta.url).resolve("better-sqlite3"))};`,
+        `const artifact = ${JSON.stringify(artifact)};`,
+        `const path = ${JSON.stringify(a.path)};`,
+        `const Database = (await import(better)).default;`,
+        `if (isMainThread) {`,
+        `  const db = new Database(":memory:");`,
+        `  db.loadExtension(artifact);`,
+        `  const mainFd = openSync(path, "r+");`,
+        `  const dirFd = openSync(dirname(path), "r");`,
+        `  const lease = db.prepare("SELECT acp_fd_bind(?, ?, ?) AS l").get(path, mainFd, dirFd).l;`,
+        `  // Read the counters on this thread, so any lock it fails to release is held here.`,
+        `  db.prepare("SELECT acp_fd_stats() AS p").get();`,
+        `  const w = new Worker(new URL(import.meta.url), { workerData: { path, artifact, better } });`,
+        `  const done = await Promise.race([`,
+        `    new Promise((r) => w.on("message", (m) => r(m))),`,
+        `    new Promise((r) => { const t = setTimeout(() => r({ opened: false, reason: "worker never returned" }), 8000); t.unref(); }),`,
+        `  ]);`,
+        `  await w.terminate();`,
+        `  process.stdout.write(JSON.stringify(done));`,
+        `} else {`,
+        `  const db = new Database(":memory:");`,
+        `  db.loadExtension(workerData.artifact);`,
+        `  let outcome;`,
+        `  try { const c = new Database(workerData.path); c.close(); outcome = { opened: true }; }`,
+        `  catch (error) { outcome = { opened: false, reason: String(error).slice(0, 60) }; }`,
+        `  parentPort.postMessage(outcome);`,
+        `}`,
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+    // The child is bounded, because the failure this detects is a process that never finishes: a
+    // worker blocked inside a native mutex cannot be terminated from JavaScript, so under the leak
+    // the child hangs rather than reporting. The bound turns that into an observation.
+    const run = spawnSync(process.execPath, ["--import", "tsx", script], {
+      encoding: "utf8",
+      timeout: 60_000,
+      killSignal: "SIGKILL",
+    });
+    expect(
+      run.signal,
+      "the child had to be killed: reading counters left the process lock held",
+    ).toBe(null);
+    expect(run.status, `stats-lock child failed: ${run.stderr}`).toBe(0);
+    const report = JSON.parse(run.stdout) as { opened: boolean; reason?: string };
+    // What matters is that the worker's open returns at all; the leak showed up as never returning.
+    expect(report.reason ?? "", "reading counters left the process lock held").not.toContain(
+      "never returned",
+    );
+
+    closeSync(a.dirFd);
+    closeSync(a.mainFd);
+  }, 300_000);
+
+  it("keeps the lease alive while a journal of the binding is open", () => {
+    // A journal is as much the binding's file as the database is — it was opened through the
+    // binding's directory descriptor. Counting only main opens meant a live journal did not keep
+    // its own lease alive, so a release could succeed underneath it.
+    const a = held("journal");
+    const control = FdVfsControl.load();
+    try {
+      control.bind(a.path, a.mainFd, a.dirFd);
+      const db = new Database(a.path);
+      let closed = false;
+      try {
+        db.exec("BEGIN IMMEDIATE");
+        db.exec("CREATE TABLE journalled (x INTEGER)");
+        expect(control.stats().journalOpens).toBeGreaterThanOrEqual(1);
+        expect(control.stats().liveFiles).toBeGreaterThanOrEqual(2);
+
+        expect(() => control.unbind()).toThrowError(/still open; close it before releasing/);
+        expect(control.stats().active).toBe(true);
+
+        db.close();
+        closed = true;
+      } finally {
+        if (!closed) db.close();
+      }
+      expect(control.stats().liveFiles).toBe(0);
+      control.unbind();
+      expect(control.stats().active).toBe(false);
+    } finally {
+      control.close();
+      closeSync(a.dirFd);
+      closeSync(a.mainFd);
+    }
+  }, 120_000);
+
+  it("reports failure rather than success when the release of the lock fails", () => {
+    // Recording an unlock failure internally was not enough: bind returned a lease, unbind
+    // returned 1, and opens returned SQLITE_OK while the state they had just mutated was no longer
+    // protected by anything. Each caller now says what is true — and none claims a rollback it
+    // cannot perform.
+    const a = held("unlockfail");
+    const artifact = buildTestingArtifact();
+    const dir = tempDir("acp-u6-unlockfail-");
+    chmodSync(dir, 0o700);
+    const script = join(dir, "unlockfail.mjs");
+    writeFileSync(
+      script,
+      [
+        `import { openSync } from "node:fs";`,
+        `import { dirname } from "node:path";`,
+        `const Database = (await import(${JSON.stringify(createRequire(import.meta.url).resolve("better-sqlite3"))})).default;`,
+        `const db = new Database(":memory:");`,
+        `db.loadExtension(${JSON.stringify(artifact)});`,
+        `const path = ${JSON.stringify(a.path)};`,
+        `const mainFd = openSync(path, "r+");`,
+        `const dirFd = openSync(dirname(path), "r");`,
+        `const attempt = (label, run) => { try { run(); return [label, "accepted"]; }`,
+        `  catch (error) { return [label, String(error).slice(0, 80)]; } };`,
+        `const report = {};`,
+        `// Release first, because a bind whose unlock fails cannot be undone — its binding stays`,
+        `// held with a lease nobody can present, which is the consequence being asserted. That`,
+        `// scenario therefore goes last.`,
+        `const first = db.prepare("SELECT acp_fd_bind(?, ?, ?) AS l").get(path, mainFd, dirFd).l;`,
+        `db.prepare("SELECT acp_fd_test_break_unlock(?) AS n").get(1);`,
+        `report.unbind = attempt("unbind", () => db.prepare("SELECT acp_fd_unbind(?) AS r").get(first));`,
+        `db.prepare("SELECT acp_fd_test_break_lock(?) AS b").get(0);`,
+        `report.healthy = attempt("cycle", () => {`,
+        `  const l = db.prepare("SELECT acp_fd_bind(?, ?, ?) AS l").get(path, mainFd, dirFd).l;`,
+        `  db.prepare("SELECT acp_fd_unbind(?) AS r").get(l);`,
+        `});`,
+        `db.prepare("SELECT acp_fd_test_break_unlock(?) AS n").get(1);`,
+        `report.bind = attempt("bind", () => db.prepare("SELECT acp_fd_bind(?, ?, ?) AS l").get(path, mainFd, dirFd));`,
+        `db.prepare("SELECT acp_fd_test_break_lock(?) AS b").get(0);`,
+        `// The binding it took is still held, and no lease exists for it: not a claimed rollback.`,
+        `report.stuck = attempt("rebind", () => db.prepare("SELECT acp_fd_bind(?, ?, ?) AS l").get(path, mainFd, dirFd));`,
+        `process.stdout.write(JSON.stringify(report));`,
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+    const run = spawnSync(process.execPath, ["--import", "tsx", script], { encoding: "utf8" });
+    expect(run.status, `unlock-failure child failed: ${run.stderr}`).toBe(0);
+    const report = JSON.parse(run.stdout) as Record<string, string[]>;
+
+    // A release whose unlock fails says so instead of returning 1.
+    expect(report["unbind"]![1]).toContain("state lock failed");
+    // With the seam cleared, an ordinary cycle works — so the refusals here are the seam's doing
+    // and not a broken build.
+    expect(report["healthy"]![1]).toBe("accepted");
+    // A bind whose unlock fails says so instead of returning a lease.
+    expect(report["bind"]![1]).toContain("state lock failed");
+    // And it does not pretend to have rolled back: the binding it took is still held, and nobody
+    // has a lease for it.
+    expect(report["stuck"]![1]).toContain("a binding is already active");
 
     closeSync(a.dirFd);
     closeSync(a.mainFd);

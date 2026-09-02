@@ -29,6 +29,8 @@ export interface FdVfsStats {
   active: boolean;
   mainOpens: number;
   journalOpens: number;
+  /** Files of this binding currently open. A release is refused while any remain. */
+  liveFiles: number;
   refusals: number;
   refusal: string;
 }
@@ -51,6 +53,7 @@ const parseStats = (line: string): FdVfsStats => {
     active: field("active") === "1",
     mainOpens: Number(field("mainOpens")),
     journalOpens: Number(field("journalOpens")),
+    liveFiles: Number(field("liveFiles")),
     refusals: Number(field("refusals")),
     refusal: line.slice(line.indexOf("refusal=") + "refusal=".length),
   };
