@@ -28,6 +28,7 @@ import {
 import {
   assertMigrationApproved,
   migrationPlanFrom,
+  readMigrationApproval,
   retireMigrationApproval,
   retireStaleMigrationApproval,
   type ApprovalRetirement,
@@ -1224,3 +1225,70 @@ export const translate = (err: unknown): unknown => {
 };
 
 export const openDb = (filename: string, options?: DbOpenOptions): Db => new Db(filename, options);
+
+/** What one approved-copy migration did, in the terms an operator can check (`U5-POST763-01`). */
+export interface ApprovedCopyMigrationReport {
+  fromVersion: number;
+  toVersion: number;
+  /** Each step that ran, and whether its receipt carries a checksum. Never the checksum itself. */
+  migrations: Array<{ id: string; checksum: boolean }>;
+  /** Whether the approval this consumed is no longer on file. */
+  approvalRetired: boolean;
+  /** Always true here, and stated so the report says which program produced it. */
+  daemonless: boolean;
+}
+
+/**
+ * Migrates one disposable copy through the approved chain and reads the result back.
+ *
+ * The reconciliation packet did this with `node --input-type=module -e`, importing `openDb` from
+ * the deployment's `dist`. That is a private import spelled out in a runbook: nothing versions
+ * it, nothing tests it, and the operator proving a chain during an incident is running a program
+ * they wrote at the keyboard. This is the same act with an owner.
+ *
+ * It adds no migration behaviour. The approval, the lock, the opened-target/approved-target
+ * identity check, the under-lock version check, the ordered transaction chain, and the automatic
+ * pre-migration backup with its restore-on-failure are the ones `Db` already runs — a second
+ * engine would be a second set of rules to keep in step.
+ *
+ * The writer is closed before the result is collected, and the readback opens read-only: a report
+ * assembled from the connection that just wrote is a report about what that connection intended.
+ */
+export const migrateApprovedCopy = (databasePath: string): ApprovedCopyMigrationReport => {
+  const fromVersion = versionOnDisk(databasePath);
+  const writer = new Db(databasePath);
+  writer.close();
+
+  const raw = new Database(databasePath, { readonly: true, fileMustExist: true });
+  try {
+    const toVersion = Number(raw.pragma("user_version", { simple: true }));
+    const receipts = raw
+      .prepare(
+        `SELECT migration_id AS id, checksum FROM schema_migrations
+          WHERE version > ? ORDER BY version`,
+      )
+      .all(fromVersion) as Array<{ id: string; checksum: string | null }>;
+    return {
+      fromVersion,
+      toVersion,
+      migrations: receipts.map((receipt) => ({
+        id: receipt.id,
+        checksum: /^sha256:[a-f0-9]{64}$/.test(receipt.checksum ?? ""),
+      })),
+      approvalRetired: readMigrationApproval(databasePath) === null,
+      daemonless: true,
+    };
+  } finally {
+    raw.close();
+  }
+};
+
+/** The version a database is at, read without opening it through the migrating constructor. */
+const versionOnDisk = (databasePath: string): number => {
+  const raw = new Database(databasePath, { readonly: true, fileMustExist: true });
+  try {
+    return Number(raw.pragma("user_version", { simple: true }));
+  } finally {
+    raw.close();
+  }
+};

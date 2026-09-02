@@ -632,20 +632,26 @@ backup:
     # that copy's own from/to versions, and cannot authorise anything for the live database.
     node /Users/isaac/projects/agent-control-plane/dist/db/state-admin.js approve-migration \
       --database "$DRY" --approved-by "$USER" --confirm-migration
-    node --input-type=module -e '
-      import { openDb, SCHEMA_VERSION } from "/Users/isaac/projects/agent-control-plane/dist/db/database.js";
-      const db = openDb(process.argv[1]);
-      console.log(JSON.stringify({
-        schemaVersion: SCHEMA_VERSION,
-        userVersion: Number(db.raw.pragma("user_version", { simple: true })),
-      }));
-    ' "$DRY"
+    node /Users/isaac/projects/agent-control-plane/dist/db/state-admin.js migrate-approved-copy \
+      --database-copy "$DRY" --confirm-migration
     rm -rf "$DRY_DIR"
 
-Expect `{"schemaVersion":34,"userVersion":34}` (or whatever `SCHEMA_VERSION` main declares by
-execution day). This drives the real migration code — `applySchema` calling `migrate` in
-`src/db/database.ts` — not a re-implementation of it, because it is the same compiled
-file the daemon is about to load.
+Expect a report whose `toVersion` is the `SCHEMA_VERSION` the pinned candidate declares, listing
+the migration ids that ran with `checksum: true` on each, `approvalRetired: true`, and
+`daemonless: true`.
+
+This drives the real migration code — `applySchema` calling `migrate` in `src/db/database.ts` —
+not a re-implementation of it, because it is the same compiled file the daemon is about to load.
+
+**The command is the interface; there is no inline program here any more.** An earlier revision
+of this step imported `openDb` from the deployment's `dist` inside `node --input-type=module -e`.
+That is a private import spelled out in a runbook: nothing versions it, nothing tests it, and the
+operator proving a chain during an incident is running a program written at the keyboard.
+`migrate-approved-copy` is the same act with an owner — it takes `--database-copy` and has no
+default, refuses a symbolic link, a non-regular file, a file with more than one link and anything
+that resolves to the deployment's own database *before* it opens anything, and starts no daemon,
+listener or surviving child. It prints no path, so its output can be pasted into a report as it
+stands.
 
 **What a failure looks like — not just the success path.** `migrate()` in `src/db/database.ts`
 takes exactly one backup before the first step in the chain — `backupOpenDatabaseSync`, named
