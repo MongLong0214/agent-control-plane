@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { BuzzCliTransport } from "../../src/buzz/buzz-adapter.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
 
 /**
  * #423 — the adapter is pinned against the surface the *installed* CLI exposes.
@@ -28,6 +29,9 @@ const ceo = LIVE.find((c) => c.name === "ceo")!;
 const commitlore = LIVE.find((c) => c.name === "commitlore")!;
 const GET_CHANNEL = (JSON.parse(channelsGet) as { channel_id: string }).channel_id;
 
+/** A recipient pubkey in the shape the relay uses — 64 lowercase hex characters. */
+const OWNER = "2adaf98f".padEnd(64, "0");
+
 interface Stub {
   binary: string;
   /** Every argv the transport invoked, in order. */
@@ -41,7 +45,8 @@ interface Stub {
  *     hard error, exactly as the installed CLI reports it.
  *   - `channels get` requires `--channel`.
  *   - `messages get` requires `--channel`; there is no `messages list`.
- *   - `messages send` requires `--channel` and `--content`.
+ *   - `messages send` requires `--channel` and `--content`, takes `--mention` any number of
+ *     times, and answers on stdout with the mentions it resolved (#760).
  *
  * Anything else exits non-zero with the CLI's JSON-on-stderr error form.
  */
@@ -101,6 +106,18 @@ if (argv[0] === "messages" && argv[1] === "send") {
   if (!flag("--channel") || !flag("--content")) {
     die("error: the following required arguments were not provided:\\n  --channel <CHANNEL>\\n  --content <CONTENT>");
   }
+  // The installed CLI answers a send with this object on stdout, measured against the live
+  // relay on 2026-09-02. It resolves each --mention it can and reports what it resolved;
+  // ACP_TEST_BUZZ_UNRESOLVED names pubkeys this stub declines, the way a non-member is
+  // declined.
+  const asked = argv.flatMap((a, i) => (a === "--mention" ? [argv[i + 1]] : []));
+  const declined = (process.env.ACP_TEST_BUZZ_UNRESOLVED || "").split(",").filter(Boolean);
+  process.stdout.write(JSON.stringify({
+    accepted: true,
+    event_id: "e".repeat(64),
+    mention_pubkeys: asked.filter((p) => !declined.includes(p)),
+    message: "",
+  }));
   process.exit(0);
 }
 die("error: unrecognized subcommand '" + argv.join(" ") + "'");
@@ -310,7 +327,7 @@ describe("#423 BuzzCliTransport against the installed CLI surface", () => {
   });
 
   it("sends with the argv the CLI accepts and refuses unparseable output", async () => {
-    await new BuzzCliTransport(stub.binary).send(ceo.channel_id, "body");
+    const receipt = await new BuzzCliTransport(stub.binary).send(ceo.channel_id, "body", [OWNER]);
     expect(stub.calls()).toContainEqual([
       "messages",
       "send",
@@ -318,7 +335,10 @@ describe("#423 BuzzCliTransport against the installed CLI surface", () => {
       ceo.channel_id,
       "--content",
       "-",
+      "--mention",
+      OWNER,
     ]);
+    expect(receipt.mentionPubkeys).toEqual([OWNER]);
 
     // A zero exit whose stdout is not JSON must raise, not read as an empty channel list.
     const garbage = join(root, "buzz-garbage");
@@ -327,5 +347,53 @@ describe("#423 BuzzCliTransport against the installed CLI surface", () => {
     await expect(new BuzzCliTransport(garbage).openChannel("ceo")).rejects.toThrow(
       /unparseable output/,
     );
+  });
+
+  it("refuses a send that names no recipient, before the CLI is spawned at all", async () => {
+    const before = stub.calls().length;
+
+    await expect(new BuzzCliTransport(stub.binary).send(ceo.channel_id, "body", [])).rejects
+      .toMatchObject({ reasonCode: ReasonCode.BUZZ_SEND_UNADDRESSED });
+    // Whitespace is not a recipient either; a caller that interpolated an empty variable
+    // must not get past this on the strength of the resulting string being non-empty.
+    await expect(new BuzzCliTransport(stub.binary).send(ceo.channel_id, "body", ["  "])).rejects
+      .toMatchObject({ reasonCode: ReasonCode.BUZZ_SEND_UNADDRESSED });
+
+    // Nothing was sent. Refusing after the spawn would still put the unaddressed message in
+    // the room, which is the outcome this whole rule exists to prevent.
+    expect(stub.calls().length).toBe(before);
+  });
+
+  it("fails the send when the relay did not resolve a recipient it was given", async () => {
+    const stranger = "f".repeat(64);
+    process.env["ACP_TEST_BUZZ_UNRESOLVED"] = stranger;
+    try {
+      await expect(
+        new BuzzCliTransport(stub.binary).send(ceo.channel_id, "body", [OWNER, stranger]),
+      ).rejects.toMatchObject({ reasonCode: ReasonCode.BUZZ_MENTION_NOT_RESOLVED });
+    } finally {
+      delete process.env["ACP_TEST_BUZZ_UNRESOLVED"];
+    }
+
+    // The exit code was 0 and the event was stored — the CLI reported `accepted`. The send
+    // still fails, because being accepted by the relay and having reached the named identity
+    // are two facts and only the second one was asked for.
+    expect(stub.calls().at(-1)).toContain("--mention");
+  });
+
+  it("refuses a send whose answer does not report the relay's mention resolution", async () => {
+    // A relay (or a wrapper) that returns success with no `mention_pubkeys` leaves the
+    // question unanswered. Reading that silence as "resolved nothing" would be a guess and
+    // reading it as success would restore the hole; it is an error instead.
+    const quiet = join(root, "buzz-quiet");
+    writeFileSync(
+      quiet,
+      `#!/bin/sh\necho '{"accepted":true,"event_id":"abc"}'\nexit 0\n`,
+      "utf8",
+    );
+    chmodSync(quiet, 0o755);
+    await expect(
+      new BuzzCliTransport(quiet).send(ceo.channel_id, "body", [OWNER]),
+    ).rejects.toThrow(/did not report mention_pubkeys/);
   });
 });

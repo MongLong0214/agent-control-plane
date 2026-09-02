@@ -1421,8 +1421,8 @@ const GUARDS = [
     what: "the Buzz CLI transport sends on the channel it was given",
     symbols: ["BuzzTransport", "messagesSend", "channelsGet"],
     file: "src/buzz/buzz-adapter.ts",
-    find: "        BUZZ_CLI_INVOCATIONS.messagesSend(channel),",
-    replace: "        BUZZ_CLI_INVOCATIONS.messagesSend(\"mutated-channel\"),",
+    find: "        BUZZ_CLI_INVOCATIONS.messagesSend(channel, named),",
+    replace: "        BUZZ_CLI_INVOCATIONS.messagesSend(\"mutated-channel\", named),",
     killedBy: ["tests/unit/buzz-cli-surface.test.ts"],
   },
   {
