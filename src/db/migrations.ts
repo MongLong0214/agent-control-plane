@@ -236,7 +236,53 @@ const triggerDdlFor = (names: readonly string[]): string => {
   return `${found.join("\n\n")}\n`;
 };
 
-export const ledgerTriggerDdl = (): string => triggerDdlFor(LEDGER_TRIGGER_NAMES);
+/**
+ * The version each ledger trigger first exists at, read from the one place that records it.
+ *
+ * `REQUIRED_SCHEMA_TRIGGERS` already carries `introducedIn` for every name in
+ * `LEDGER_TRIGGER_NAMES` — the fact was in the file the whole time, and the DDL path was the one
+ * caller that did not read it. A name with no entry throws rather than defaulting: defaulting to
+ * "always existed" reintroduces exactly the bug below, and defaulting to "newest" would silently
+ * stop installing a guard.
+ */
+const ledgerTriggerIntroducedIn = (name: string): number => {
+  const declared = REQUIRED_SCHEMA_TRIGGERS.find((trigger) => trigger.name === name);
+  if (!declared) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      `ledger trigger ${name} has no introducedIn; the schema-trigger table and the ledger list have drifted`,
+      { trigger: name },
+    );
+  }
+  // A trigger with no `introducedIn` predates the versions this filter can be asked about, so it
+  // belongs in every set.
+  return declared.introducedIn ?? 0;
+};
+
+/**
+ * The ledger triggers that exist at `atVersion`, or all of them when asked without one.
+ *
+ * #762. A single flat name list has no time axis, and a migration is a point in time. v25–v28
+ * each recreate "the ledger triggers", and the list they read grew to include
+ * `canonical_turn_dispatches_*` — whose table v29 creates. On a database that reaches v26 with
+ * that table already present the DDL succeeds and nothing is visibly wrong; on one that does not,
+ * v26 dies with `no such table: main.canonical_turn_dispatches` and the whole chain rolls back.
+ *
+ * Every chain test started from the v11 fixture, whose second step replays the current
+ * `schema.sql` in full — so every database under test had the v29 table from v12 onward, and the
+ * ordering defect was unobservable. The live deployment came up through `bootstrap-v20` instead,
+ * never ran that replay, and could not migrate at all.
+ *
+ * Callers that install triggers as part of a migration pass their own `toVersion`. Callers
+ * describing the current schema — the invariant assertions, the body census — pass nothing and
+ * get the whole set, which is what "what should be here now" means.
+ */
+export const ledgerTriggerDdl = (atVersion?: number): string =>
+  triggerDdlFor(
+    atVersion === undefined
+      ? LEDGER_TRIGGER_NAMES
+      : LEDGER_TRIGGER_NAMES.filter((name) => ledgerTriggerIntroducedIn(name) <= atVersion),
+  );
 export const provenanceNoReplaceDdl = (): string => triggerDdlFor(PROVENANCE_NO_REPLACE_TRIGGERS);
 
 /** The adjudication tables and their index, taken from the live schema for the same reason. */
@@ -1597,10 +1643,10 @@ const v25: SchemaMigration = {
   apply: (raw) => {
     raw.exec(V25_LEDGER_GUARDS_DDL);
     raw.exec(adjudicationDdl());
-    raw.exec(ledgerTriggerDdl());
+    raw.exec(ledgerTriggerDdl(25));
   },
   checksum: () =>
-    sha256(`v25-ledger-guards\n${V25_LEDGER_GUARDS_DDL}\n${adjudicationDdl()}\n${ledgerTriggerDdl()}`),
+    sha256(`v25-ledger-guards\n${V25_LEDGER_GUARDS_DDL}\n${adjudicationDdl()}\n${ledgerTriggerDdl(25)}`),
 };
 
 /** One object out of the live schema, by pattern, so a rebuild cannot invent its own definition. */
@@ -1918,13 +1964,13 @@ const v26: SchemaMigration = {
     raw.exec(ledgerTriggerDrops());
     rebuildObservationsIfStale(raw);
     raw.exec(adjudicationDdl());
-    raw.exec(ledgerTriggerDdl());
+    raw.exec(ledgerTriggerDdl(26));
     raw.exec(provenanceNoReplaceDdl());
   },
   checksum: () =>
     sha256(
       `v26-ledger-trigger-bodies\n${ledgerTriggerDrops()}\n${adjudicationDdl()}\n` +
-        `${ledgerTriggerDdl()}\n${provenanceNoReplaceDdl()}`,
+        `${ledgerTriggerDdl(26)}\n${provenanceNoReplaceDdl()}`,
     ),
 };
 
@@ -1970,9 +2016,9 @@ const v27: SchemaMigration = {
     // The rebuild drops the table, and a table's triggers go with it. v26 restores them by running
     // the whole ledger DDL after its rebuild for the same reason; leaving it out would carry the
     // CHECK in and take the authority, append-only and no-delete guards out.
-    raw.exec(ledgerTriggerDdl());
+    raw.exec(ledgerTriggerDdl(27));
   },
-  checksum: () => sha256(`v27-an-observation-carries-its-evidence\n${observationsTableOnlyDdl()}\n${ledgerTriggerDdl()}`),
+  checksum: () => sha256(`v27-an-observation-carries-its-evidence\n${observationsTableOnlyDdl()}\n${ledgerTriggerDdl(27)}`),
 };
 
 /**
@@ -2004,12 +2050,12 @@ const v28: SchemaMigration = {
     rebuildCanonicalTurnsIfStale(raw);
     rebuildObservationsIfStale(raw);
     // Each rebuild drops its table and a table's triggers go with it, as v26 and v27 both note.
-    raw.exec(ledgerTriggerDdl());
+    raw.exec(ledgerTriggerDdl(28));
   },
   checksum: () =>
     sha256(
       `v28-an-operator-can-settle-a-turn-nobody-observed\n${canonicalTurnsTableOnlyDdl()}\n` +
-        `${observationsTableOnlyDdl()}\n${ledgerTriggerDdl()}`,
+        `${observationsTableOnlyDdl()}\n${ledgerTriggerDdl(28)}`,
     ),
 };
 
@@ -2028,9 +2074,9 @@ const v29: SchemaMigration = {
   toVersion: 29,
   apply: (raw) => {
     raw.exec(dispatchesDdl());
-    raw.exec(ledgerTriggerDdl());
+    raw.exec(ledgerTriggerDdl(29));
   },
-  checksum: () => sha256(`v29-a-dispatch-is-a-fact\n${dispatchesDdl()}\n${ledgerTriggerDdl()}`),
+  checksum: () => sha256(`v29-a-dispatch-is-a-fact\n${dispatchesDdl()}\n${ledgerTriggerDdl(29)}`),
 };
 
 /**
