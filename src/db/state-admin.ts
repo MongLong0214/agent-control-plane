@@ -162,10 +162,24 @@ const parse = (argv: string[]): Parsed => {
         `migrate-approved-copy takes each of ${repeated.sort().join(", ")} once\n\n${USAGE}`,
       );
     }
-    const positional = tokens.filter((token) => {
-      const index = tokens.indexOf(token);
-      return !token.startsWith("--") && tokens[index - 1] !== "--database-copy";
-    });
+    // Walked by index, not by value. `tokens.indexOf(token)` answers for the *first* token with
+    // that text, so `--database-copy /x --confirm-migration /x` asked about the trailing `/x` and
+    // was told about the one at index 1 — which does follow `--database-copy`, so this walk called
+    // a stray positional a flag value. Every argument in this grammar is a path, so a repeated
+    // value is what an operator types when they paste the same path twice, not an exotic case.
+    //
+    // Defence in depth, and measured as such: the general token loop above refuses any bare token
+    // for this command before control reaches here, so no CLI input observed on 2026-09-02 makes
+    // this walk decide anything — deleting it outright still refuses both spellings above. It is
+    // kept correct rather than kept as an oracle: what refuses the operator today is that loop,
+    // and this file should not read as though this line were the enforcement site.
+    const positional: string[] = [];
+    for (let index = 0; index < tokens.length; index += 1) {
+      const token = tokens[index]!;
+      if (token.startsWith("--")) continue;
+      if (index > 0 && tokens[index - 1] === "--database-copy") continue;
+      positional.push(token);
+    }
     if (positional.length > 0) {
       throw new Error(`migrate-approved-copy takes no positional argument\n\n${USAGE}`);
     }

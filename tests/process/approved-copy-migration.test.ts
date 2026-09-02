@@ -3,6 +3,7 @@ import {
   chmodSync,
   existsSync,
   linkSync,
+  unlinkSync,
   mkdirSync,
   readFileSync,
   renameSync,
@@ -19,6 +20,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import {
   SCHEMA_VERSION,
   __setApprovedCopyWindowHook,
+  __setPreOpenSeamHook,
   migrateApprovedCopy,
 } from "../../src/db/database.ts";
 import { approveMigration } from "../../src/db/migration-approval.ts";
@@ -334,6 +336,35 @@ describe("U5-POST763-01 supported approved-copy migration", () => {
     expect(userVersion(path)).toBe(25);
   }, 180_000);
 
+  it("refuses a stray positional even when it repeats an earlier flag's value", () => {
+    // Every value in this grammar is a path, so a repeated one is what an operator types when
+    // they paste the same path twice — not an exotic case.
+    //
+    // What this asserts is the property, not a particular line: the invocation is refused and the
+    // database family is untouched. Which check refuses it was measured rather than assumed — the
+    // general token loop does, before `migrate-approved-copy`'s own grammar block runs, and
+    // deleting that block's positional walk entirely still refuses every spelling below. So this
+    // deliberately does not assert the block's message: an assertion on it would report coverage
+    // of a line that decides nothing.
+    const { dir, path } = v25Copy("positional-echo");
+    approve(path, dir);
+    const before = imprintOf(path);
+
+    for (const argv of [
+      ["--database-copy", path, "--confirm-migration", path],
+      ["--database-copy", path, path, "--confirm-migration"],
+      ["--confirm-migration", "--database-copy", path, path],
+    ]) {
+      const result = run(["migrate-approved-copy", ...argv], { ACP_STATE_DIR: dir, HOME: dir });
+      expect(result.status, `${argv.join(" ")} was accepted`).not.toBe(0);
+    }
+
+    // The whole family, byte for byte: a grammar refused before anything is decided cannot have
+    // opened, created or checkpointed anything.
+    expect(imprintOf(path)).toEqual(before);
+    expect(userVersion(path)).toBe(25);
+  }, 180_000);
+
   it("requires the copy to be named explicitly, and never defaults to a target", () => {
     const { dir, path } = v25Copy("explicit");
     approve(path, dir);
@@ -484,17 +515,14 @@ describe("U5-POST763-01 the replacement window", () => {
     }
 
     const after = imprintOf(approved);
-    // Byte-exact across the seam — all three artifacts. This is where the counterexample lives:
-    // everything from the moment the alias appeared to the refusal must have left no mark.
+    // All three artifacts, byte-exact, measured from *before the command ran* — no exception for
+    // `-shm`. There used to be one: the version probe opened a read-only connection, and opening
+    // a WAL database makes SQLite rebuild the shared-memory index beside it, so a file this
+    // command had not decided to touch was already moving. The probe reads the header instead
+    // now, so the exception has nothing left to excuse.
     expect(atSeam).not.toBeNull();
     expect(after).toEqual(atSeam);
-    // Across the whole command, the durable bytes are unchanged too. `-shm` is deliberately not
-    // held to that: it is a shared-memory index SQLite re-derives whenever a WAL database is
-    // opened, and this command has to open the copy read-only to read its version. Demanding
-    // stability there would be demanding that nothing ever read the file, which is not a property
-    // this command can have or should claim.
-    expect(after.main).toEqual(before.main);
-    expect(after.wal).toEqual(before.wal);
+    expect(after).toEqual(before);
     expect(userVersion(approved)).toBe(25);
   }, 120_000);
 
@@ -517,5 +545,136 @@ describe("U5-POST763-01 the replacement window", () => {
     }
     expect(fired, "the window hook never ran, so the case above proves nothing").toBe(true);
     expect(userVersion(approved)).toBe(SCHEMA_VERSION);
+  }, 120_000);
+});
+
+/**
+ * The narrower seam: between the name-level pre-open guard and the open itself.
+ *
+ * Every case in the describe above lands *before* the last guard, so a name-based check can still
+ * answer them. These land *after* it — in the gap between `lstat` and `open` that no ordering of
+ * checks can close — so the guard has already said yes and the pathname it inspected is not the
+ * pathname the open will resolve. What decides here is the check that asks the connection which
+ * object it opened.
+ *
+ * Each case asserts three families byte-for-byte from *before the command ran*: the approved copy,
+ * the replacement, and the deployment's own database at the path the command derives internally.
+ */
+describe("U5-POST763-01 the pre-open seam", () => {
+  /** One private directory with an approved copy, an intruder, and a derived canonical database. */
+  const seamFixture = (label: string) => {
+    const home = tempDir(`acp-u5-01-seam-${label}-`);
+    chmodSync(home, 0o700);
+    const stateDir = join(home, ".agent-control-plane");
+    mkdirSync(stateDir, { recursive: true });
+    chmodSync(stateDir, 0o700);
+    const canonical = seedAt(join(stateDir, "state.sqlite"));
+    writeFileSync(`${canonical}-wal`, Buffer.from(`${label}-canonical-wal`), { mode: 0o600 });
+    writeFileSync(`${canonical}-shm`, Buffer.from(`${label}-canonical-shm`), { mode: 0o600 });
+
+    const approved = seedAt(join(home, "approved.sqlite"));
+    const intruder = seedAt(join(home, "intruder.sqlite"));
+    approveMigration(approved, `seam-${label}`);
+    writeFileSync(`${approved}-wal`, Buffer.from(`${label}-approved-wal`), { mode: 0o600 });
+    writeFileSync(`${approved}-shm`, Buffer.from(`${label}-approved-shm`), { mode: 0o600 });
+
+    return {
+      home,
+      approved,
+      intruder,
+      canonical,
+      before: {
+        approved: imprintOf(approved),
+        intruder: imprintOf(intruder),
+        canonical: imprintOf(canonical),
+      },
+    };
+  };
+
+  /** Runs the command with the seam hook armed, under a HOME the fixture owns. */
+  const inSeam = (home: string, hook: () => void, run: () => void) => {
+    const realHome = process.env["HOME"];
+    process.env["HOME"] = home;
+    __setPreOpenSeamHook(hook);
+    try {
+      run();
+    } finally {
+      __setPreOpenSeamHook(null);
+      if (realHome === undefined) delete process.env["HOME"];
+      else process.env["HOME"] = realHome;
+    }
+  };
+
+  it("refuses a file renamed onto the pathname between the guard and the open", () => {
+    const f = seamFixture("swap");
+    inSeam(f.home, () => renameSync(f.intruder, f.approved), () => {
+      expect(() => migrateApprovedCopy(f.approved)).toThrowError(
+        /opened a different file|changed after it was verified/,
+      );
+    });
+
+    // The intruder now answers to the approved name. `rename` moves the main file and nothing
+    // else, so the family at that pathname is the intruder's bytes beside the approved copy's own
+    // leftover sidecars — and every one of the three is exactly what it was before the command,
+    // so nothing was opened for writing, no header moved, and no WAL was written.
+    expect(imprintOf(f.approved)).toEqual({
+      main: f.before.intruder.main,
+      wal: f.before.approved.wal,
+      shm: f.before.approved.shm,
+    });
+    expect(userVersion(f.approved)).toBe(25);
+    expect(imprintOf(f.canonical)).toEqual(f.before.canonical);
+  }, 120_000);
+
+  it("refuses a symbolic link put in the pathname's place between the guard and the open", () => {
+    const f = seamFixture("symlink");
+    inSeam(f.home, () => {
+      unlinkSync(f.approved);
+      symlinkSync(f.intruder, f.approved);
+    }, () => {
+      expect(() => migrateApprovedCopy(f.approved)).toThrowError(
+        /opened a different file|changed after it was verified/,
+      );
+    });
+
+    expect(imprintOf(f.intruder)).toEqual(f.before.intruder);
+    expect(userVersion(f.intruder)).toBe(25);
+    expect(imprintOf(f.canonical)).toEqual(f.before.canonical);
+  }, 120_000);
+
+  it("refuses a hard link made onto the verified object between the guard and the open", () => {
+    const f = seamFixture("hardlink");
+    // The alias is the deployment's own database *and* the pathname is untouched, so every
+    // name-level answer is unchanged: the approved path still names the verified inode. Only the
+    // object's own link count, read off the descriptor the open produced, differs.
+    unlinkSync(f.canonical);
+    unlinkSync(`${f.canonical}-wal`);
+    unlinkSync(`${f.canonical}-shm`);
+    const before = imprintOf(f.approved);
+    inSeam(f.home, () => linkSync(f.approved, f.canonical), () => {
+      expect(() => migrateApprovedCopy(f.approved)).toThrowError(
+        /reachable under 2 names|deployment's own database/,
+      );
+    });
+
+    expect(imprintOf(f.approved)).toEqual(before);
+    expect(userVersion(f.approved)).toBe(25);
+  }, 120_000);
+
+  it("still migrates when nothing happens in the pre-open seam", () => {
+    // The negative control for this seam specifically: a check that refused whenever the hook was
+    // armed would satisfy all three cases above and never let a migration through.
+    const f = seamFixture("ok");
+    unlinkSync(f.canonical);
+    unlinkSync(`${f.canonical}-wal`);
+    unlinkSync(`${f.canonical}-shm`);
+    let fired = false;
+    inSeam(f.home, () => {
+      fired = true;
+    }, () => {
+      expect(migrateApprovedCopy(f.approved).toVersion).toBe(SCHEMA_VERSION);
+    });
+    expect(fired, "the seam hook never ran, so the cases above prove nothing").toBe(true);
+    expect(userVersion(f.approved)).toBe(SCHEMA_VERSION);
   }, 120_000);
 });

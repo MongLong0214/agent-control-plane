@@ -1,5 +1,15 @@
 import Database from "better-sqlite3";
-import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -291,7 +301,22 @@ export class Db {
     // still be the file that caller verified under that lock — otherwise the replacement gets
     // opened read-write and only then refused, which is the regression this closes.
     assertHeldLockStillDescribes(filename);
-    this.#raw = new Database(filename);
+    // `fileMustExist` under a held lock: if the verified file is unlinked in the seam, an ordinary
+    // open would *create* an empty database at that pathname — a refusal that leaves a new file
+    // behind is still an effect.
+    const guarded = heldLockDescribes(filename);
+    if (guarded) preOpenSeamHook?.();
+    this.#raw = new Database(filename, guarded ? { fileMustExist: true } : {});
+    if (guarded) {
+      // The name-level check above is an early refusal. This is the one that decides, because it
+      // asks the connection what it opened rather than asking the pathname again.
+      try {
+        assertHeldLockOwnsTheOpenedFile(filename);
+      } catch (error) {
+        this.#raw.close();
+        throw error;
+      }
+    }
     let temporaryStorage: typeof this.temporaryStorage;
     try {
       if (this.options.temporaryStorage === "MEMORY") {
@@ -1268,6 +1293,20 @@ export const __setApprovedCopyWindowHook = (hook: (() => void) | null): void => 
   approvedCopyWindowHook = hook;
 };
 
+/**
+ * Test-only seam at the narrower window: after the name-level pre-open guard and before the open.
+ *
+ * The window hook above stands where a replacement lands between verification and construction.
+ * This one stands one statement later — between `lstat` and `open`, the gap no ordering of checks
+ * can remove — because that is where a name-based guard has already given its answer and the open
+ * has not yet happened. A counterexample placed here is invisible to every check that asks a
+ * pathname, which is exactly what it is for.
+ */
+let preOpenSeamHook: (() => void) | null = null;
+export const __setPreOpenSeamHook = (hook: (() => void) | null): void => {
+  preOpenSeamHook = hook;
+};
+
 /** What one approved-copy migration did, in the terms an operator can check (`U5-POST763-01`). */
 export interface ApprovedCopyMigrationReport {
   fromVersion: number;
@@ -1388,6 +1427,107 @@ const deploymentDatabasePath = (): string =>
  */
 const lockPathFor = (databaseFile: string): string =>
   join(realpathSync(dirname(databaseFile)), "agentcpd.lock");
+
+/** True when the caller handed this open a migration lock it is holding over this pathname. */
+const heldLockDescribes = (filename: string): boolean =>
+  heldMigrationLock !== null &&
+  filename !== ":memory:" &&
+  heldMigrationLock.lockPath === lockPathFor(filename);
+
+/** Where this process's own open file descriptors can be enumerated and stat'ed. */
+const openDescriptorDirectory = (): string =>
+  process.platform === "linux" ? "/proc/self/fd" : "/dev/fd";
+
+/**
+ * Refuses unless the file this connection *actually opened* is the one verified under the lock.
+ *
+ * Every check before this one asks a pathname a question, and a pathname is not the thing being
+ * protected. `lstat(path)` then `open(path)` are two syscalls, and no amount of moving them
+ * closer together makes them one: a swap landing between them is opened, and a swap that lands
+ * and is undone between them leaves every name-based check agreeing while the handle holds the
+ * intruder. That last interleaving is invisible to name re-checks by construction, which is why
+ * listing more of them does not close this.
+ *
+ * So this asks the connection instead. The descriptor table is what the open produced; stat'ing
+ * it names the object with no path involved, and `nlink` read from that descriptor is the object's
+ * own link count — a hard link added under *any* name, at any moment before this line, shows up
+ * here without this function knowing that name exists.
+ *
+ * Refusing here costs nothing that has to be recovered: a bare connection writes no header and
+ * creates no `-wal` or `-shm` (measured), and the caller closes it before this throw propagates.
+ *
+ * Fail-closed: if the descriptor table cannot be read, the question was not answered, and an
+ * unanswered question is not a pass.
+ */
+const assertHeldLockOwnsTheOpenedFile = (filename: string): void => {
+  const held = heldMigrationLock;
+  if (!held) return;
+  const expected = held.copy;
+
+  let descriptors: string[];
+  try {
+    descriptors = readdirSync(openDescriptorDirectory());
+  } catch {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      "cannot verify which file this connection opened, so it will not be used",
+      {},
+    );
+  }
+
+  let linksOnTheOpenedObject: number | null = null;
+  for (const entry of descriptors) {
+    const descriptor = Number(entry);
+    if (!Number.isInteger(descriptor)) continue;
+    let opened;
+    try {
+      opened = fstatSync(descriptor);
+    } catch {
+      continue;
+    }
+    if (opened.dev === expected.device && opened.ino === expected.inode) {
+      linksOnTheOpenedObject = opened.nlink;
+      break;
+    }
+  }
+  if (linksOnTheOpenedObject === null) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      "this connection opened a different file than the one verified under the migration lock",
+      {},
+    );
+  }
+  if (linksOnTheOpenedObject !== 1) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      `the verified file is reachable under ${linksOnTheOpenedObject} names`,
+      {},
+    );
+  }
+
+  // The operator asked to migrate a *path*. An inode the path no longer names is not what they
+  // asked for, however correct the handle is.
+  const now = existsSync(filename) ? targetIdentityOf(filename) : null;
+  if (!now || !isSameTarget(now, expected)) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      "the file at this path changed after it was verified under the migration lock",
+      {},
+    );
+  }
+
+  const canonicalPath = deploymentDatabasePath();
+  if (existsSync(canonicalPath)) {
+    const canonical = targetIdentityOf(canonicalPath);
+    if (canonical.device === expected.device && canonical.inode === expected.inode) {
+      throw acpError(
+        ReasonCode.INTERNAL_ERROR,
+        "refusing to migrate the deployment's own database through the copy path",
+        {},
+      );
+    }
+  }
+};
 
 /**
  * Refuses an open whose target stopped being the one the held lock was taken over.
@@ -1519,12 +1659,31 @@ const assertApprovedCopyUnderLock = (databasePath: string): number => {
   return onDisk;
 };
 
-/** The version a database is at, read without opening it through the migrating constructor. */
+/**
+ * The version a database is at, read out of its header rather than by connecting to it.
+ *
+ * A read-only connection is not a read-only act. Opening a WAL database makes SQLite build the
+ * shared-memory index beside it, so the probe that asked "what version is this copy?" rewrote
+ * `-shm` on a file this command had not yet decided to touch — and that byte movement then had to
+ * be excused in the tests, which is how an exception gets written for a defect.
+ *
+ * The header answers the same question and moves nothing: bytes 0..15 are the format string and
+ * bytes 60..63 are `user_version`, big-endian, both fixed by the file format.
+ */
+const SQLITE_HEADER_BYTES = 100;
+const SQLITE_MAGIC = "SQLite format 3\u0000";
+
 const onDiskVersionReadOnly = (databasePath: string): number => {
-  const raw = new Database(databasePath, { readonly: true, fileMustExist: true });
+  const header = Buffer.alloc(SQLITE_HEADER_BYTES);
+  const fd = openSync(databasePath, "r");
+  let read: number;
   try {
-    return Number(raw.pragma("user_version", { simple: true }));
+    read = readSync(fd, header, 0, SQLITE_HEADER_BYTES, 0);
   } finally {
-    raw.close();
+    closeSync(fd);
   }
+  if (read < SQLITE_HEADER_BYTES || header.toString("latin1", 0, 16) !== SQLITE_MAGIC) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "this copy is not an SQLite database", {});
+  }
+  return header.readUInt32BE(60);
 };
