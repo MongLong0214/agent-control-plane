@@ -29,6 +29,8 @@ export interface FdVfsStats {
   active: boolean;
   mainOpens: number;
   journalOpens: number;
+  /** Files of this binding currently open. A release is refused while any remain. */
+  liveFiles: number;
   refusals: number;
   refusal: string;
 }
@@ -51,6 +53,7 @@ const parseStats = (line: string): FdVfsStats => {
     active: field("active") === "1",
     mainOpens: Number(field("mainOpens")),
     journalOpens: Number(field("journalOpens")),
+    liveFiles: Number(field("liveFiles")),
     refusals: Number(field("refusals")),
     refusal: line.slice(line.indexOf("refusal=") + "refusal=".length),
   };
@@ -67,6 +70,8 @@ const parseStats = (line: string): FdVfsStats => {
  */
 export class FdVfsControl {
   readonly #db: InstanceType<typeof Database>;
+  /** The lease of the binding this control currently holds, or null when it holds none. */
+  #lease: string | null = null;
 
   private constructor(db: InstanceType<typeof Database>) {
     this.#db = db;
@@ -100,15 +105,35 @@ export class FdVfsControl {
    * uses the second only for `openat`/`faccessat`/`unlinkat` on the journal, so closing them is
    * the caller's business and closing them early is the caller's bug.
    */
-  bind(databasePath: string, mainFd: number, dirFd: number): void {
+  bind(databasePath: string, mainFd: number, dirFd: number): string {
     // The whole path, not its file name. Two databases in different directories can share a name,
     // and a binding keyed on the name alone would hand one connection the other's descriptor —
     // the same defect this exists to end, just at a shorter length.
-    this.#db.prepare("SELECT acp_fd_bind(?, ?, ?) AS ino").get(databasePath, mainFd, dirFd);
+    //
+    // Returns the lease that must be presented to release it: sixteen bytes of kernel entropy as
+    // hex, not a counter. Taking a second binding while one is held is refused rather than
+    // silently replacing it, because a replacement leaves the first caller still holding a
+    // descriptor it believes is bound while every open goes somewhere else.
+    const row = this.#db
+      .prepare("SELECT acp_fd_bind(?, ?, ?) AS lease")
+      .get(databasePath, mainFd, dirFd) as { lease: string };
+    this.#lease = row.lease;
+    return this.#lease;
   }
 
+  /**
+   * Releases the binding this control holds. Safe to call when it holds none.
+   *
+   * The lease is dropped only after the native release reports success. Clearing it first meant a
+   * refused release still mutated caller-visible state: the control would believe it had let go
+   * while the process was still bound, and the binding could then be released by nobody.
+   */
   unbind(): void {
-    this.#db.prepare("SELECT acp_fd_unbind() AS was").get();
+    if (this.#lease === null) return;
+    const released = this.#db.prepare("SELECT acp_fd_unbind(?) AS released").get(this.#lease) as {
+      released: number;
+    };
+    if (released.released === 1 || released.released === 0) this.#lease = null;
   }
 
   stats(): FdVfsStats {
