@@ -61,52 +61,95 @@ export const driftedBlobs = (): string[] =>
     return actual === blob.sha256 ? [] : [`${blob.path}: ${actual} (pinned ${blob.sha256})`];
   });
 
+/** What a closed schema has to state, so that "closed" is a property and not a hope. */
+export interface ClosedSchema {
+  /** Required top-level fields and their exact runtime kinds. Missing or wrong is a failure. */
+  topLevel: Readonly<Record<string, "string" | "number">>;
+  /** The field holding the entries, and whether it is a keyed record or an ordered array. */
+  entriesKey: string;
+  entriesKind: "record" | "array";
+  entryShape: Readonly<Record<string, "string" | "number">>;
+}
+
+/** Own-property test that a `__proto__` or `constructor` key cannot satisfy. */
+const hasOwn = (object: object, key: string): boolean =>
+  Object.prototype.hasOwnProperty.call(object, key);
+
 /**
  * A JSON parser that refuses the shapes an `as T` cast waves through.
  *
- * Three refusals, each for a way the trace could stop describing what it claims while still
- * parsing. `JSON.parse` keeps the last of two identical keys and discards the first silently, so
- * a duplicated object name loses an ownership; an escaped spelling (`alpha`) is the same key
- * to the parser and a different string to a regular expression over the raw text; and a field
- * nobody reads is a field nobody notices changing.
+ * The first version of this was called closed and was not. Review found four ways through, each
+ * of which this now states rather than assumes:
+ *
+ *   - it listed *allowed* top-level fields and never required any, so a document with only its
+ *     entries — no provenance, no baseline version — parsed;
+ *   - it took the entries as either a record or an array, so the trace's keyed map and the
+ *     receipts' ordered list were interchangeable;
+ *   - it tested field membership with `in`, which walks the prototype chain, so `__proto__`,
+ *     `constructor` and `toString` were allowed fields on every entry;
+ *   - and one consumer bypassed it entirely with its own cast.
+ *
+ * The duplicate-key walk below is scope-aware on purpose: the same field name in two different
+ * objects is ordinary JSON, and only a repeat within one object loses a value.
  */
-export const parseClosedJson = <T>(
-  text: string,
-  shape: {
-    allowedTopLevel: readonly string[];
-    entriesKey: string;
-    entryShape: Readonly<Record<string, "string" | "number">>;
-  },
-): T => {
+export const parseClosedJson = <T>(text: string, shape: ClosedSchema): T => {
   rejectDuplicateKeys(text);
-  const parsed = JSON.parse(text) as Record<string, unknown>;
+  const parsed: unknown = JSON.parse(text);
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new Error("frozen authority is not a JSON object");
   }
-  const unknown = Object.keys(parsed).filter((key) => !shape.allowedTopLevel.includes(key));
+  const document = parsed as Record<string, unknown>;
+
+  const allowed = new Set([...Object.keys(shape.topLevel), shape.entriesKey]);
+  const unknown = Object.keys(document).filter((key) => !allowed.has(key));
   if (unknown.length > 0) {
     throw new Error(`frozen authority has unknown field(s): ${unknown.sort().join(", ")}`);
   }
-  const entries = parsed[shape.entriesKey];
+  for (const [field, kind] of Object.entries(shape.topLevel)) {
+    if (!hasOwn(document, field)) {
+      throw new Error(`frozen authority is missing required field ${field}`);
+    }
+    if (typeof document[field] !== kind) {
+      throw new Error(
+        `frozen authority field ${field} is ${typeof document[field]}, expected ${kind}`,
+      );
+    }
+  }
+  if (!hasOwn(document, shape.entriesKey)) {
+    throw new Error(`frozen authority is missing required field ${shape.entriesKey}`);
+  }
+
+  const entries = document[shape.entriesKey];
   if (typeof entries !== "object" || entries === null) {
     throw new Error(`frozen authority's ${shape.entriesKey} is not an object or array`);
   }
-  // Both shapes are frozen bytes this cannot alter: the trace keys its entries by object name,
-  // the receipts are an ordered list. Validating either the same way is what lets the pin stay on
-  // the file rather than on a form convenient to check.
-  const named: Array<[string, unknown]> = Array.isArray(entries)
-    ? entries.map((entry, index) => [`[${index}]`, entry])
+  // Record and array are different documents, and a parser that accepts either cannot say which
+  // one it read.
+  const isArray = Array.isArray(entries);
+  if (isArray !== (shape.entriesKind === "array")) {
+    throw new Error(
+      `frozen authority's ${shape.entriesKey} is ${isArray ? "an array" : "a record"}, ` +
+        `expected ${shape.entriesKind === "array" ? "an array" : "a record"}`,
+    );
+  }
+
+  const named: Array<[string, unknown]> = isArray
+    ? (entries as unknown[]).map((entry, index) => [`[${index}]`, entry])
     : Object.entries(entries as Record<string, unknown>);
+  const allowedFields = new Set(Object.keys(shape.entryShape));
   for (const [name, entry] of named) {
     if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
       throw new Error(`frozen authority entry ${name} is not an object`);
     }
     const fields = entry as Record<string, unknown>;
-    const extra = Object.keys(fields).filter((key) => !(key in shape.entryShape));
+    const extra = Object.keys(fields).filter((key) => !allowedFields.has(key));
     if (extra.length > 0) {
       throw new Error(`frozen authority entry ${name} has unknown field(s): ${extra.sort().join(", ")}`);
     }
     for (const [field, kind] of Object.entries(shape.entryShape)) {
+      if (!hasOwn(fields, field)) {
+        throw new Error(`frozen authority entry ${name} is missing ${field}`);
+      }
       if (typeof fields[field] !== kind) {
         throw new Error(
           `frozen authority entry ${name}.${field} is ${typeof fields[field]}, expected ${kind}`,
@@ -114,8 +157,24 @@ export const parseClosedJson = <T>(
       }
     }
   }
-  return parsed as T;
+  return document as T;
 };
+
+/** The owner trace, as every consumer must read it — one parser, no second spelling. */
+export interface OwnerTrace {
+  _provenance: string;
+  baselineVersion: number;
+  baselineFixture: string;
+  objects: Record<string, { type: string; owner: number }>;
+}
+
+export const parseOwnerTrace = (text: string): OwnerTrace =>
+  parseClosedJson<OwnerTrace>(text, {
+    topLevel: { _provenance: "string", baselineVersion: "number", baselineFixture: "string" },
+    entriesKey: "objects",
+    entriesKind: "record",
+    entryShape: { type: "string", owner: "number" },
+  });
 
 /**
  * Duplicate keys, compared after unescaping — `alpha` and `alpha` are one key to the parser.

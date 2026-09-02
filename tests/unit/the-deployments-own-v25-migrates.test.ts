@@ -11,12 +11,18 @@ import {
   RECEIPT_BYTES_SHA256,
   digestOfFile,
   parseClosedJson,
+  parseOwnerTrace,
 } from "../helpers/frozen-authority.ts";
 
-/** The sealed owner trace — the same immutable input the provenance detector reads. */
-const TRACE = JSON.parse(
+/**
+ * The sealed owner trace, read through the *same* exported parser the detector uses.
+ *
+ * This was a `JSON.parse … as`, which is a second spelling of the document and therefore a way
+ * around every refusal the closed parser makes. One parser or none.
+ */
+const TRACE = parseOwnerTrace(
   readFileSync(new URL("../fixtures/v25-owner-trace.json", import.meta.url), "utf8"),
-) as { baselineVersion: number; objects: Record<string, { type: string; owner: number }> };
+);
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -73,8 +79,9 @@ interface ReceiptRow {
 const RECEIPTS = parseClosedJson<{ _provenance: string; receipts: ReceiptRow[] }>(
   RECEIPT_TEXT,
   {
-    allowedTopLevel: ["_provenance", "receipts"],
+    topLevel: { _provenance: "string" },
     entriesKey: "receipts",
+    entriesKind: "array",
     entryShape: {
       version: "number",
       migrationId: "string",

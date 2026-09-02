@@ -7,7 +7,12 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { MIGRATIONS } from "../../src/db/migrations.ts";
-import { FROZEN_BLOBS, driftedBlobs, parseClosedJson } from "../helpers/frozen-authority.ts";
+import {
+  FROZEN_BLOBS,
+  driftedBlobs,
+  parseClosedJson,
+  parseOwnerTrace,
+} from "../helpers/frozen-authority.ts";
 import {
   REPLAY_FUNCTION,
   migrationsReachingTheReplay,
@@ -51,28 +56,7 @@ const TRACE_TEXT = readFileSync(
   "utf8",
 );
 
-interface TraceShape {
-  _provenance: string;
-  baselineVersion: number;
-  baselineFixture: string;
-  objects: Record<string, { type: string; owner: number }>;
-}
-
-/**
- * The trace, read through the closed parser.
- *
- * `JSON.parse … as TraceShape` was a cast: it admitted unknown fields, wrong runtime types, and
- * duplicate keys whose first occurrence `JSON.parse` had already discarded. The parser this calls
- * refuses all three, and compares keys after unescaping so `alpha` and `\u0061lpha` are one key.
- */
-const parseTrace = (text: string): TraceShape =>
-  parseClosedJson<TraceShape>(text, {
-    allowedTopLevel: ["_provenance", "baselineVersion", "baselineFixture", "objects"],
-    entriesKey: "objects",
-    entryShape: { type: "string", owner: "number" },
-  });
-
-const TRACE = parseTrace(TRACE_TEXT);
+const TRACE = parseOwnerTrace(TRACE_TEXT);
 
 /**
  * Migrations that replay a schema snapshot instead of introducing objects.
@@ -409,26 +393,78 @@ describe("#762 the sealed trace refuses the ways it could quietly stop being tru
     // with an escape — went through.
     const escaped = `{"_provenance":"p","baselineVersion":25,"baselineFixture":"f","objects":{`
       + `"\\u0061lpha":{"type":"table","owner":26},"alpha":{"type":"table","owner":29}}}`;
-    expect(() => parseTrace(escaped)).toThrowError(/duplicate key/);
+    expect(() => parseOwnerTrace(escaped)).toThrowError(/duplicate key/);
 
     const nested = `{"_provenance":"p","baselineVersion":25,"baselineFixture":"f",`
       + `"objects":{"a":{"type":"table","owner":26,"owner":29}}}`;
-    expect(() => parseTrace(nested)).toThrowError(/duplicate key/);
+    expect(() => parseOwnerTrace(nested)).toThrowError(/duplicate key/);
+  });
+
+  it("requires every top-level field, at its stated kind", () => {
+    // Listing *allowed* fields and requiring none let a document with only its entries parse —
+    // no provenance, no baseline version, and every later comparison standing on defaults.
+    const ok = `{"_provenance":"p","baselineVersion":25,"baselineFixture":"f","objects":{}}`;
+    expect(() => parseOwnerTrace(ok)).not.toThrow();
+    expect(() => parseOwnerTrace(`{"baselineVersion":25,"baselineFixture":"f","objects":{}}`))
+      .toThrowError(/missing required field _provenance/);
+    expect(() => parseOwnerTrace(`{"_provenance":"p","baselineFixture":"f","objects":{}}`))
+      .toThrowError(/missing required field baselineVersion/);
+    expect(() => parseOwnerTrace(`{"_provenance":"p","baselineVersion":25,"baselineFixture":"f"}`))
+      .toThrowError(/missing required field objects/);
+    expect(() =>
+      parseOwnerTrace(`{"_provenance":"p","baselineVersion":"25","baselineFixture":"f","objects":{}}`),
+    ).toThrowError(/baselineVersion is string, expected number/);
+  });
+
+  it("refuses a record where an array belongs, and an array where a record belongs", () => {
+    // The trace is keyed by object name and the receipts are ordered. A parser that takes either
+    // cannot say which document it read, so it cannot say the entries mean what it claims.
+    expect(() =>
+      parseOwnerTrace(`{"_provenance":"p","baselineVersion":25,"baselineFixture":"f","objects":[]}`),
+    ).toThrowError(/is an array, expected a record/);
+    expect(() =>
+      parseClosedJson(`{"_provenance":"p","receipts":{}}`, {
+        topLevel: { _provenance: "string" },
+        entriesKey: "receipts",
+        entriesKind: "array",
+        entryShape: { version: "number" },
+      }),
+    ).toThrowError(/is a record, expected an array/);
+  });
+
+  it("refuses an entry field that only exists on the prototype", () => {
+    // `key in shape` walks the prototype chain, so `__proto__`, `constructor` and `toString` were
+    // allowed fields on every entry — a name that is never declared and never rejected.
+    for (const inherited of ["__proto__", "constructor", "toString"]) {
+      const text =
+        `{"_provenance":"p","baselineVersion":25,"baselineFixture":"f","objects":` +
+        `{"a":{"type":"table","owner":26,"${inherited}":"x"}}}`;
+      expect(() => parseOwnerTrace(text), inherited).toThrowError(/unknown field/);
+    }
+  });
+
+  it("allows the same field name in two different objects", () => {
+    // The negative control for the duplicate walk. Repeats across scopes are ordinary JSON, and a
+    // detector that rejected them would have to be turned off.
+    const text =
+      `{"_provenance":"p","baselineVersion":25,"baselineFixture":"f","objects":` +
+      `{"a":{"type":"table","owner":26},"b":{"type":"table","owner":29}}}`;
+    expect(() => parseOwnerTrace(text)).not.toThrow();
   });
 
   it("rejects an unknown field and a wrong runtime type", () => {
     // A field nobody reads is a field nobody notices changing, and `owner: "26"` compares as a
     // string against a number for the rest of the run.
     expect(() =>
-      parseTrace(`{"_provenance":"p","baselineVersion":25,"baselineFixture":"f","objects":{},"extra":1}`),
+      parseOwnerTrace(`{"_provenance":"p","baselineVersion":25,"baselineFixture":"f","objects":{},"extra":1}`),
     ).toThrowError(/unknown field/);
     expect(() =>
-      parseTrace(
+      parseOwnerTrace(
         `{"_provenance":"p","baselineVersion":25,"baselineFixture":"f","objects":{"a":{"type":"table","owner":"26"}}}`,
       ),
     ).toThrowError(/owner is string, expected number/);
     expect(() =>
-      parseTrace(
+      parseOwnerTrace(
         `{"_provenance":"p","baselineVersion":25,"baselineFixture":"f","objects":{"a":{"type":"table","owner":26,"note":"x"}}}`,
       ),
     ).toThrowError(/unknown field\(s\): note/);
