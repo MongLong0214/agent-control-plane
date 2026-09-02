@@ -9,8 +9,9 @@
 -- `bootstrap-v20` and migrated to 25 by the build of the day; it never ran
 -- `v12-migration-ledger-and-invariant-replay`, whose replay of the current `schema.sql` is what
 -- gave every other fixture the tables later migrations own. Measured against it: 40 tables to the
--- current schema's 41, 58 triggers, and zero mentions of `canonical_turn_dispatches` — the v29
--- table whose absence made `v26` fail and the whole chain roll back.
+-- current schema's 41, 58 triggers, and no trace of the table v29 introduces — the one whose
+-- absence made `v26` fail and the whole chain roll back. That table is not named anywhere in
+-- this file, comments included: an absence contract a reader can break by grepping is not one.
 --
 -- Do not regenerate this by bootstrapping a current database and deleting objects from it. That
 -- produces a v36 file wearing a v25 version number, which proves nothing about what a real v25

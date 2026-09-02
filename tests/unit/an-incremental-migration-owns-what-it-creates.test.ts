@@ -4,7 +4,6 @@ import { join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
-import { Db } from "../../src/db/database.ts";
 import { MIGRATIONS } from "../../src/db/migrations.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
@@ -35,6 +34,18 @@ const LINEAGE = readFileSync(
   "utf8",
 );
 const LINEAGE_VERSION = 25;
+
+/**
+ * The sealed owner trace: object name, type, and the first incremental step that creates it,
+ * captured from a completed 25→36 run of the real lineage and committed as a fixture.
+ */
+const TRACE = JSON.parse(
+  readFileSync(new URL("../fixtures/v25-owner-trace.json", import.meta.url), "utf8"),
+) as {
+  baselineVersion: number;
+  baselineFixture: string;
+  objects: Record<string, { type: string; owner: number }>;
+};
 
 /**
  * Migrations that replay a schema snapshot instead of introducing objects.
@@ -97,9 +108,25 @@ const namesMatching = (statements: readonly string[], patterns: readonly RegExp[
 };
 
 /**
- * Owner of every object: `<= baselineVersion` for anything the baseline already had, and the
- * first incremental step that creates it otherwise.
+ * Owner of every object, read from the sealed trace rather than computed from the code under test.
+ *
+ * The previous version derived this from a run of the migrations themselves, which made the
+ * answer move whenever the source moved — so a mutation changed both the code and the standard it
+ * was being judged against, and the two agreed all the way down. Sealing the trace as a fixture
+ * is what makes the mutation control mean something: the owner truth is the same file before and
+ * after the edit.
+ *
+ * The baseline is a fact about a database that existed, not an inference: everything in
+ * `schema-v25-lineage.sql` was owned at or before 25.
  */
+export const sealedOwnership = (): Map<string, number> => {
+  const owner = new Map<string, number>();
+  for (const name of baselineObjects()) owner.set(name, TRACE.baselineVersion);
+  for (const [name, entry] of Object.entries(TRACE.objects)) owner.set(name, entry.owner);
+  return owner;
+};
+
+/** Ownership from an explicit map — the seam the synthetic controls below feed. */
 export const ownership = (
   baseline: ReadonlySet<string>,
   baselineVersion: number,
@@ -157,21 +184,11 @@ const baselineObjects = (): Set<string> => {
  * Against the lineage artifact, not a current bootstrap: these are the statements the deployment
  * would actually run, and a step that cannot run there is the failure this whole issue is.
  */
-const incrementalSteps = (on: "lineage" | "current" = "lineage"): Step[] => {
-  const path = join(tempDir(`acp-762-incremental-${on}-`), "state.sqlite");
-  if (on === "current") {
-    // A current database, only so the whole chain completes and every step's SQL is recorded.
-    // Ownership has to come from a run that reaches the end: against the lineage the chain stops
-    // at the first missing object, so the step that *owns* that object never speaks and the leak
-    // could only be reported as "something threw". Nothing about this run is a claim that the
-    // lineage can migrate — that is the other run, below.
-    const seeded = new Db(path);
-    seeded.close();
-    chmodSync(path, 0o600);
-  }
+const incrementalSteps = (): Step[] => {
+  const path = join(tempDir("acp-762-incremental-"), "state.sqlite");
   const raw = new Database(path);
   raw.function("acp_schema_migration_authorized", () => 1);
-  if (on === "lineage") raw.exec(LINEAGE);
+  raw.exec(LINEAGE);
   raw.pragma(`user_version = ${LINEAGE_VERSION}`);
 
   const realExec = raw.exec.bind(raw);
@@ -223,15 +240,31 @@ describe("#762 snapshot replays are not object owners", () => {
     expect(snapshotReplayCallers().sort()).toEqual([...DECLARED_SNAPSHOT_REPLAY].sort());
   });
 
-  it("derives ownership from a chain that completes, so a late object has an owner", () => {
-    // The ownership run must reach the end, or the object whose lateness is the whole point is
-    // owned by nobody and the leak check has nothing to compare against.
-    const complete = incrementalSteps("current");
-    expect(complete.filter((step) => step.failure)).toEqual([]);
-    const owner = ownership(baselineObjects(), LINEAGE_VERSION, complete);
-    // Something the baseline did not have has to be owned later than the baseline, or the two
-    // runs are describing the same database and the comparison is empty.
-    expect([...owner.values()].some((version) => version > LINEAGE_VERSION)).toBe(true);
+  it("keeps the sealed trace and the candidate's own CREATE census in both-way agreement", () => {
+    // The drift gate. A sealed fixture is only truth for as long as it still describes the code:
+    // this regenerates the census from the lineage run and compares it to the trace in both
+    // directions, so a new object with no entry fails and a stale entry naming nothing fails too.
+    const steps = incrementalSteps();
+    expect(steps.filter((step) => step.failure)).toEqual([]);
+
+    const baseline = baselineObjects();
+    const census = new Map<string, number>();
+    for (const step of steps) {
+      for (const name of namesMatching(step.statements, CREATE_PATTERNS)) {
+        if (baseline.has(name) || census.has(name)) continue;
+        census.set(name, step.toVersion);
+      }
+    }
+
+    const sealed = new Map(
+      Object.entries(TRACE.objects).map(([name, entry]) => [name, entry.owner] as const),
+    );
+    const asRows = (map: ReadonlyMap<string, number>) =>
+      [...map.entries()].map(([name, owner]) => `${name}@v${owner}`).sort();
+
+    expect(asRows(census)).toEqual(asRows(sealed));
+    expect(TRACE.baselineVersion).toBe(LINEAGE_VERSION);
+    expect(TRACE.baselineFixture).toBe("tests/fixtures/schema-v25-lineage.sql");
   });
 
   it("keeps the replay steps outside the incremental chain entirely", () => {
@@ -263,8 +296,9 @@ describe("#762 no incremental migration references an object a later one owns", 
     // Both halves. The leak list is the diagnosis and the failure list is the symptom; a chain
     // that dies at v26 with a leak reported is the defect, and one that dies with no leak
     // reported is a different defect this file has not explained.
-    const owner = ownership(baselineObjects(), LINEAGE_VERSION, incrementalSteps("current"));
-    expect(futureObjectLeaks(owner, steps)).toEqual([]);
+    // The sealed trace, not a run of the code being judged: under a mutation the owner truth has
+    // to stay put or the control proves nothing.
+    expect(futureObjectLeaks(sealedOwnership(), steps)).toEqual([]);
     expect(steps.filter((step) => step.failure).map((step) => `${step.id}: ${step.failure}`)).toEqual([]);
   });
 

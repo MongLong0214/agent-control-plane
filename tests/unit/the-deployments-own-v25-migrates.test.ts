@@ -7,6 +7,11 @@ import { afterAll, describe, expect, it } from "vitest";
 import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
 import { approveMigration } from "../../src/db/migration-approval.ts";
 import { MIGRATIONS } from "../../src/db/migrations.ts";
+
+/** The sealed owner trace — the same immutable input the provenance detector reads. */
+const TRACE = JSON.parse(
+  readFileSync(new URL("../fixtures/v25-owner-trace.json", import.meta.url), "utf8"),
+) as { baselineVersion: number; objects: Record<string, { type: string; owner: number }> };
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -93,9 +98,19 @@ const contents = (path: string) => {
       projects: raw.prepare("SELECT project_id, name, created_at FROM projects ORDER BY project_id").all(),
       sessions: raw.prepare("SELECT session_id, provider, model, lifecycle FROM sessions ORDER BY session_id").all(),
       audit: raw.prepare("SELECT event_id, at, kind, evidence_json FROM audit_events ORDER BY event_id").all(),
+      // `checksum` is in the projection because leaving it out let a receipt be rewritten while
+      // the comparison still passed: version, id and timestamp can all survive a tampered
+      // checksum, and the checksum is the part that says the step ran what it claims.
       ledger: raw
-        .prepare("SELECT version, migration_id, applied_at FROM schema_migrations ORDER BY version")
-        .all() as Array<{ version: number; migration_id: string; applied_at: string }>,
+        .prepare(
+          "SELECT version, migration_id, checksum, applied_at FROM schema_migrations ORDER BY version",
+        )
+        .all() as Array<{
+        version: number;
+        migration_id: string;
+        checksum: string;
+        applied_at: string;
+      }>,
       tables: (raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as Array<{ name: string }>).map((r) => r.name),
       triggers: (raw.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name").all() as Array<{ name: string }>).map((r) => r.name),
       indexes: (raw.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as Array<{ name: string }>).map((r) => r.name),
@@ -106,6 +121,22 @@ const contents = (path: string) => {
 };
 
 describe("#762 the deployment's own v25 lineage", () => {
+  it("names nowhere in its bytes the object a later migration owns", () => {
+    // Not a stylistic point. The fixture is the artifact an absence contract rests on, and a
+    // comment mentioning the name is a grep hit that makes the contract unverifiable by the
+    // cheapest check anyone would reach for. Read as raw bytes so no parser is between the
+    // assertion and the file.
+    const raw = readFileSync(
+      new URL("../fixtures/schema-v25-lineage.sql", import.meta.url),
+      "utf8",
+    );
+    const late = Object.entries(TRACE.objects)
+      .filter(([, entry]) => entry.owner > TRACE.baselineVersion)
+      .map(([name]) => name);
+    expect(late.length).toBeGreaterThan(0);
+    expect(late.filter((name) => raw.includes(name))).toEqual([]);
+  });
+
   it("is a real v25, not a current database wearing a v25 number", () => {
     const artifact = join(tempDir("acp-762-artifact-"), "state.sqlite");
     writeV25Artifact(artifact);
@@ -155,6 +186,13 @@ describe("#762 the deployment's own v25 lineage", () => {
       ...before.ledger.map((row) => row.version),
       ...MIGRATIONS.filter((m) => m.fromVersion >= 25).map((m) => m.toVersion),
     ]);
+
+    // Every appended receipt is a well-formed one, not just a row at the right version.
+    for (const row of after.ledger.slice(before.ledger.length)) {
+      expect(row.migration_id).toMatch(/^v\d+-[a-z0-9-]+$/);
+      expect(row.checksum).toMatch(/^sha256:[a-f0-9]{64}$/);
+      expect(row.applied_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    }
 
     // Nothing the v25 had was dropped on the way, and the table that could not be created is now
     // there. Stated as a superset rather than an equality: later steps add objects, and pinning

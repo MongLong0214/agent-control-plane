@@ -1,0 +1,182 @@
+{
+  "baselineVersion": 25,
+  "baselineFixture": "tests/fixtures/schema-v25-lineage.sql",
+  "objects": {
+    "actor_target_attestations_no_replace": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "actor_target_bindings_no_replace": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "assignments_no_replace": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "attestation_generation_matches_assignment": {
+      "type": "trigger",
+      "owner": 31
+    },
+    "audit_events_no_replace": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "baseline_records_no_replace": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "canonical_turn_adjudication_citations": {
+      "type": "table",
+      "owner": 26
+    },
+    "canonical_turn_adjudication_citations_append_only": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "canonical_turn_adjudication_citations_no_delete": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "canonical_turn_adjudication_citations_no_replace": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "canonical_turn_adjudication_citations_same_turn": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "canonical_turn_adjudication_citations_write_authority": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "canonical_turn_adjudications": {
+      "type": "table",
+      "owner": 26
+    },
+    "canonical_turn_adjudications_append_only": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "canonical_turn_adjudications_by_turn": {
+      "type": "index",
+      "owner": 26
+    },
+    "canonical_turn_adjudications_no_delete": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "canonical_turn_adjudications_no_replace": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "canonical_turn_adjudications_write_authority": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "canonical_turn_dispatches": {
+      "type": "table",
+      "owner": 29
+    },
+    "canonical_turn_dispatches_append_only": {
+      "type": "trigger",
+      "owner": 29
+    },
+    "canonical_turn_dispatches_no_delete": {
+      "type": "trigger",
+      "owner": 29
+    },
+    "canonical_turn_dispatches_no_replace": {
+      "type": "trigger",
+      "owner": 29
+    },
+    "canonical_turn_dispatches_write_authority": {
+      "type": "trigger",
+      "owner": 29
+    },
+    "canonical_turn_observations_no_replace": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "canonical_turn_observations_rebuilt": {
+      "type": "table",
+      "owner": 26
+    },
+    "canonical_turn_sources_admission_matches_claim": {
+      "type": "trigger",
+      "owner": 28
+    },
+    "canonical_turn_sources_no_replace": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "canonical_turns_no_replace": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "canonical_turns_rebuilt": {
+      "type": "table",
+      "owner": 28
+    },
+    "conversational_actor_registrations_no_replace": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "conversational_actors_incarnation_matches_session_on_insert": {
+      "type": "trigger",
+      "owner": 31
+    },
+    "conversational_actors_incarnation_matches_session_on_update": {
+      "type": "trigger",
+      "owner": 31
+    },
+    "conversational_actors_no_replace": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "github_receipts_no_replace": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "inbound_messages_no_replace": {
+      "type": "trigger",
+      "owner": 35
+    },
+    "inbound_messages_payload_immutable": {
+      "type": "trigger",
+      "owner": 35
+    },
+    "inbound_messages_turn_claim_identity_immutable": {
+      "type": "trigger",
+      "owner": 36
+    },
+    "manifests_no_replace": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "outbox_no_replace": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "run_artifacts_no_replace": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "runs_no_replace": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "sessions_no_replace": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "task_executions_no_replace": {
+      "type": "trigger",
+      "owner": 26
+    },
+    "telegram_owner_prompts_no_replace": {
+      "type": "trigger",
+      "owner": 26
+    }
+  }
+}
