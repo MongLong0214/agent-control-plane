@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { MIGRATIONS } from "../../src/db/migrations.ts";
+import { FROZEN_BLOBS, driftedBlobs, parseClosedJson } from "../helpers/frozen-authority.ts";
 import {
   REPLAY_FUNCTION,
   migrationsReachingTheReplay,
@@ -50,37 +51,28 @@ const TRACE_TEXT = readFileSync(
   "utf8",
 );
 
-/**
- * Duplicate keys are rejected before parsing, not after.
- *
- * `JSON.parse` keeps the last of two identical keys and drops the first silently, so a trace with
- * one name written twice loses an ownership and still parses into a plausible object. The raw
- * text is the only place that fact survives.
- */
-const parseTraceRejectingDuplicates = (text: string): TraceShape => {
-  const seen = new Set<string>();
-  const duplicates: string[] = [];
-  JSON.parse(text, function reviver(this: unknown, key: string, value: unknown) {
-    return value;
-  });
-  for (const match of text.matchAll(/^\s{4}"([^"]+)":\s*\{/gm)) {
-    const name = match[1]!;
-    if (seen.has(name)) duplicates.push(name);
-    seen.add(name);
-  }
-  if (duplicates.length > 0) {
-    throw new Error(`owner trace has duplicate object keys: ${duplicates.sort().join(", ")}`);
-  }
-  return JSON.parse(text) as TraceShape;
-};
-
 interface TraceShape {
+  _provenance: string;
   baselineVersion: number;
   baselineFixture: string;
   objects: Record<string, { type: string; owner: number }>;
 }
 
-const TRACE = parseTraceRejectingDuplicates(TRACE_TEXT);
+/**
+ * The trace, read through the closed parser.
+ *
+ * `JSON.parse … as TraceShape` was a cast: it admitted unknown fields, wrong runtime types, and
+ * duplicate keys whose first occurrence `JSON.parse` had already discarded. The parser this calls
+ * refuses all three, and compares keys after unescaping so `alpha` and `\u0061lpha` are one key.
+ */
+const parseTrace = (text: string): TraceShape =>
+  parseClosedJson<TraceShape>(text, {
+    allowedTopLevel: ["_provenance", "baselineVersion", "baselineFixture", "objects"],
+    entriesKey: "objects",
+    entryShape: { type: "string", owner: "number" },
+  });
+
+const TRACE = parseTrace(TRACE_TEXT);
 
 /**
  * Migrations that replay a schema snapshot instead of introducing objects.
@@ -399,15 +391,47 @@ describe("#762 snapshot replays are not object owners", () => {
 });
 
 describe("#762 the sealed trace refuses the ways it could quietly stop being true", () => {
-  it("rejects a duplicate object key before parsing keeps only the last one", () => {
-    // `JSON.parse` drops the first of two identical keys silently, so a trace with one name
-    // written twice loses an ownership and still parses into a plausible object.
-    const doubled = TRACE_TEXT.replace(
-      /^(\s{4}"[^"]+":\s*\{\n(?:.*\n)*?\s{4}\},\n)/m,
-      "$1$1",
-    );
-    expect(doubled).not.toBe(TRACE_TEXT);
-    expect(() => parseTraceRejectingDuplicates(doubled)).toThrowError(/duplicate object keys/);
+  it("pins the blobs the whole argument rests on", () => {
+    // Supplied by the independent review after it read the preserved backup, not recomputed here:
+    // a pin a run derives from the file it is pinning agrees with any file it is handed.
+    expect(FROZEN_BLOBS.map((blob) => blob.path).sort()).toEqual([
+      "src/db/migrations.ts",
+      "tests/fixtures/schema-v25-lineage.sql",
+      "tests/fixtures/v25-lineage-receipts.json",
+      "tests/fixtures/v25-owner-trace.json",
+    ]);
+    expect(driftedBlobs()).toEqual([]);
+  });
+
+  it("rejects a duplicate key however it is spelled or indented", () => {
+    // `JSON.parse` keeps the last of two identical keys and drops the first silently. The old
+    // check matched a four-space line shape, so the same duplicate at another depth — or written
+    // with an escape — went through.
+    const escaped = `{"_provenance":"p","baselineVersion":25,"baselineFixture":"f","objects":{`
+      + `"\\u0061lpha":{"type":"table","owner":26},"alpha":{"type":"table","owner":29}}}`;
+    expect(() => parseTrace(escaped)).toThrowError(/duplicate key/);
+
+    const nested = `{"_provenance":"p","baselineVersion":25,"baselineFixture":"f",`
+      + `"objects":{"a":{"type":"table","owner":26,"owner":29}}}`;
+    expect(() => parseTrace(nested)).toThrowError(/duplicate key/);
+  });
+
+  it("rejects an unknown field and a wrong runtime type", () => {
+    // A field nobody reads is a field nobody notices changing, and `owner: "26"` compares as a
+    // string against a number for the rest of the run.
+    expect(() =>
+      parseTrace(`{"_provenance":"p","baselineVersion":25,"baselineFixture":"f","objects":{},"extra":1}`),
+    ).toThrowError(/unknown field/);
+    expect(() =>
+      parseTrace(
+        `{"_provenance":"p","baselineVersion":25,"baselineFixture":"f","objects":{"a":{"type":"table","owner":"26"}}}`,
+      ),
+    ).toThrowError(/owner is string, expected number/);
+    expect(() =>
+      parseTrace(
+        `{"_provenance":"p","baselineVersion":25,"baselineFixture":"f","objects":{"a":{"type":"table","owner":26,"note":"x"}}}`,
+      ),
+    ).toThrowError(/unknown field\(s\): note/);
   });
 
   it("fails when an entry's type is rewritten", () => {

@@ -7,6 +7,11 @@ import { afterAll, describe, expect, it } from "vitest";
 import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
 import { approveMigration } from "../../src/db/migration-approval.ts";
 import { MIGRATIONS } from "../../src/db/migrations.ts";
+import {
+  RECEIPT_BYTES_SHA256,
+  digestOfFile,
+  parseClosedJson,
+} from "../helpers/frozen-authority.ts";
 
 /** The sealed owner trace — the same immutable input the provenance detector reads. */
 const TRACE = JSON.parse(
@@ -44,18 +49,44 @@ const LINEAGE = readFileSync(
  * matches the regular expression, including one a rewrite put there. These are the real rows the
  * deployment recorded, read read-only from the pre-migration backup.
  */
-const RECEIPTS = (
-  JSON.parse(
-    readFileSync(new URL("../fixtures/v25-lineage-receipts.json", import.meta.url), "utf8"),
-  ) as {
-    receipts: Array<{
-      version: number;
-      migrationId: string;
-      checksum: string;
-      appliedAt: string;
-    }>;
-  }
-).receipts;
+const RECEIPT_TEXT = readFileSync(
+  new URL("../fixtures/v25-lineage-receipts.json", import.meta.url),
+  "utf8",
+);
+
+interface ReceiptRow {
+  version: number;
+  migrationId: string;
+  checksum: string;
+  appliedAt: string;
+}
+
+/**
+ * The receipts, read through the closed parser and bound to the hash the authority fixed.
+ *
+ * The binding is what stops this from comparing a fixture to itself. An independent authority
+ * read the preserved backup — private local artifact redacted — confirmed these six rows
+ * field-for-field, and fixed the bytes; the constant it produced is what the seed and the
+ * comparison both stand on, so a rewrite of the fixture fails the pin rather than quietly
+ * rewriting the standard too.
+ */
+const RECEIPTS = parseClosedJson<{ _provenance: string; receipts: ReceiptRow[] }>(
+  RECEIPT_TEXT,
+  {
+    allowedTopLevel: ["_provenance", "receipts"],
+    entriesKey: "receipts",
+    entryShape: {
+      version: "number",
+      migrationId: "string",
+      checksum: "string",
+      appliedAt: "string",
+    },
+  },
+);
+
+const RECEIPT_ROWS: ReceiptRow[] = [...RECEIPTS.receipts].sort(
+  (left, right) => left.version - right.version,
+);
 
 const NOW = "2026-08-23T02:39:31.318Z";
 
@@ -65,7 +96,7 @@ const NOW = "2026-08-23T02:39:31.318Z";
  * The rows are the point of the comparison afterwards — a chain that reached 36 by rebuilding
  * tables would satisfy a version check and still have dropped what was in them.
  */
-const writeV25Artifact = (path: string): void => {
+const writeV25Artifact = (path: string, receipts: readonly ReceiptRow[] = RECEIPT_ROWS): void => {
   const raw = new Database(path);
   try {
     // The lineage carries the ledger's own write-authority guards, which call a function the
@@ -74,7 +105,7 @@ const writeV25Artifact = (path: string): void => {
     // avoid, one object smaller.
     raw.function("acp_schema_migration_authorized", () => 1);
     raw.exec(LINEAGE);
-    for (const receipt of RECEIPTS) {
+    for (const receipt of receipts) {
       raw.prepare(
         `INSERT INTO schema_migrations (version, migration_id, checksum, applied_at)
          VALUES (?, ?, ?, ?)`,
@@ -132,6 +163,50 @@ const contents = (path: string) => {
 };
 
 describe("#762 the deployment's own v25 lineage", () => {
+  it("binds the receipt bytes to the hash the independent authority fixed", () => {
+    // Without this the fixture is seed and standard at once, and comparing it to itself passes
+    // however it was rewritten. The constant came from outside this repository.
+    expect(digestOfFile("tests/fixtures/v25-lineage-receipts.json")).toBe(RECEIPT_BYTES_SHA256);
+    expect(RECEIPT_ROWS.map((row) => row.version)).toEqual([20, 21, 22, 23, 24, 25]);
+  });
+
+  it("rejects a historical receipt that is wrong but well formed", () => {
+    // The control for the sealed half. v23 is given v24's real checksum: both are genuine
+    // `sha256:` values from this very ledger, so every format check passes and only a comparison
+    // against the sealed facts can tell them apart.
+    const tampered = RECEIPT_ROWS.map((row) =>
+      row.version === 23 ? { ...row, checksum: RECEIPT_ROWS[4]!.checksum } : row,
+    );
+    expect(tampered[3]!.checksum).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(tampered).not.toEqual(RECEIPT_ROWS);
+
+    const artifact = join(tempDir("acp-762-tampered-history-"), "state.sqlite");
+    writeV25Artifact(artifact, tampered);
+    const seeded = contents(artifact).ledger;
+
+    // What the sealed facts say this database should contain, compared field for field.
+    expect(
+      seeded.map((row) => `${row.version}|${row.migration_id}|${row.checksum}|${row.applied_at}`),
+    ).not.toEqual(
+      RECEIPT_ROWS.map(
+        (row) => `${row.version}|${row.migrationId}|${row.checksum}|${row.appliedAt}`,
+      ),
+    );
+
+    // And the same comparison holds on the untampered artifact, or the case above proves nothing.
+    const honest = join(tempDir("acp-762-honest-history-"), "state.sqlite");
+    writeV25Artifact(honest);
+    expect(
+      contents(honest).ledger.map(
+        (row) => `${row.version}|${row.migration_id}|${row.checksum}|${row.applied_at}`,
+      ),
+    ).toEqual(
+      RECEIPT_ROWS.map(
+        (row) => `${row.version}|${row.migrationId}|${row.checksum}|${row.appliedAt}`,
+      ),
+    );
+  });
+
   it("names nowhere in its bytes the object a later migration owns", () => {
     // Not a stylistic point. The fixture is the artifact an absence contract rests on, and a
     // comment mentioning the name is a grep hit that makes the contract unverifiable by the
