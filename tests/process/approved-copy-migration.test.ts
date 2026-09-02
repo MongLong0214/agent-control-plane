@@ -8,6 +8,7 @@ import {
   renameSync,
   statSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -105,11 +106,20 @@ const seedAt = (path: string, version = 25): string => {
   return path;
 };
 
-/** Bytes plus the sidecars an open would create — what "unchanged" has to mean for a database. */
+/**
+ * A database and its sidecars, each as `absent` or as its exact bytes.
+ *
+ * Existence booleans were not enough: a `-wal` that already existed could be rewritten in place
+ * and compare equal to itself, so "the command did not touch this database" was being read off a
+ * pair of `true`s. Bytes say it; presence only says something is there.
+ */
+const artifact = (path: string): "absent" | Buffer =>
+  existsSync(path) ? readFileSync(path) : "absent";
+
 const imprintOf = (path: string) => ({
-  bytes: readFileSync(path),
-  wal: existsSync(`${path}-wal`),
-  shm: existsSync(`${path}-shm`),
+  main: artifact(path),
+  wal: artifact(`${path}-wal`),
+  shm: artifact(`${path}-shm`),
 });
 
 const userVersion = (path: string): number => {
@@ -137,10 +147,20 @@ describe("U5-POST763-01 supported approved-copy migration", () => {
     const before = readFileSync(path);
     expect(userVersion(path)).toBe(25);
 
+    // The database this command must never touch is not "some other database" — it is the one the
+    // command derives internally, from `homedir()`. So the control is seeded at exactly that
+    // derived path, under the HOME the command will run with: a bystander copy in an unrelated
+    // directory could be left untouched by a command that migrated the deployment.
+    const canonical = join(dir, ".agent-control-plane", "state.sqlite");
+    mkdirSync(join(dir, ".agent-control-plane"), { recursive: true });
+    chmodSync(join(dir, ".agent-control-plane"), 0o700);
+    seedAt(canonical);
+    // Sidecars with content, so "untouched" is a comparison of bytes and not of two absences.
+    writeFileSync(`${canonical}-wal`, Buffer.from("canonical-wal-must-not-move"), { mode: 0o600 });
+    writeFileSync(`${canonical}-shm`, Buffer.from("canonical-shm-must-not-move"), { mode: 0o600 });
     // Snapshotted before the command, not after: a protected database compared only to its own
     // later state proves nothing about what the command did in between.
-    const protectedSource = v25Copy("protected");
-    const protectedBefore = imprintOf(protectedSource.path);
+    const canonicalBefore = imprintOf(canonical);
 
     approve(path, dir);
 
@@ -187,13 +207,16 @@ describe("U5-POST763-01 supported approved-copy migration", () => {
           "SELECT version, migration_id AS id, checksum FROM schema_migrations WHERE version > 25 ORDER BY version",
         )
         .all() as Array<{ version: number; id: string; checksum: string }>;
-      expect(receipts.map((row) => `${row.version}|${row.id}`)).toEqual(
-        MIGRATIONS.filter((migration) => migration.fromVersion >= 25).map(
-          (migration) => `${migration.toVersion}|${migration.id}`,
-        ),
+      // Version, id *and* checksum, each compared to what `MIGRATIONS` says it should be. The
+      // previous spelling checked the checksum against a format regular expression, which any
+      // sha256 of anything satisfies — including a checksum recorded for a different migration.
+      expect(receipts).toEqual(
+        MIGRATIONS.filter((migration) => migration.fromVersion >= 25).map((migration) => ({
+          version: migration.toVersion,
+          id: migration.id,
+          checksum: migration.checksum(),
+        })),
       );
-      // Checksums read from the ledger, not a boolean the command computed about them.
-      for (const row of receipts) expect(row.checksum).toMatch(/^sha256:[a-f0-9]{64}$/);
     } finally {
       raw.close();
     }
@@ -201,15 +224,11 @@ describe("U5-POST763-01 supported approved-copy migration", () => {
     // Retirement is a fact about a file, and the command's `approvalRetired` is a claim about it.
     expect(existsSync(join(dir, "migration-approval.json"))).toBe(false);
 
-    // The protected source was captured *before* the command ran, so "untouched" is measured
-    // against what it was rather than against what it is now.
-    const afterProtected = imprintOf(protectedSource.path);
-    expect(afterProtected.bytes).toEqual(protectedBefore.bytes);
-    expect([afterProtected.wal, afterProtected.shm]).toEqual([
-      protectedBefore.wal,
-      protectedBefore.shm,
-    ]);
-    expect(userVersion(protectedSource.path)).toBe(25);
+    // The derived canonical database, captured *before* the command ran, so "untouched" is
+    // measured against what it was rather than against what it is now — main and both sidecars,
+    // byte for byte.
+    expect(imprintOf(canonical)).toEqual(canonicalBefore);
+    expect(userVersion(canonical)).toBe(25);
     expect(before.length).toBeGreaterThan(0);
   }, 120_000);
 
@@ -268,9 +287,7 @@ describe("U5-POST763-01 supported approved-copy migration", () => {
 
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("names a different database");
-    const after = imprintOf(b);
-    expect(after.bytes).toEqual(before.bytes);
-    expect([after.wal, after.shm]).toEqual([before.wal, before.shm]);
+    expect(imprintOf(b)).toEqual(before);
     expect(userVersion(b)).toBe(25);
   }, 120_000);
 
@@ -289,9 +306,7 @@ describe("U5-POST763-01 supported approved-copy migration", () => {
     });
 
     expect(result.status).not.toBe(0);
-    const after = imprintOf(path);
-    expect(after.bytes).toEqual(before.bytes);
-    expect([after.wal, after.shm]).toEqual([before.wal, before.shm]);
+    expect(imprintOf(path)).toEqual(before);
     expect(userVersion(path)).toBe(24);
   }, 120_000);
 
@@ -315,9 +330,7 @@ describe("U5-POST763-01 supported approved-copy migration", () => {
     }
 
     // A refused grammar never reached the database.
-    const after = imprintOf(path);
-    expect(after.bytes).toEqual(before.bytes);
-    expect([after.wal, after.shm]).toEqual([before.wal, before.shm]);
+    expect(imprintOf(path)).toEqual(before);
     expect(userVersion(path)).toBe(25);
   }, 180_000);
 
@@ -422,9 +435,66 @@ describe("U5-POST763-01 the replacement window", () => {
       __setApprovedCopyWindowHook(null);
     }
 
+    expect(imprintOf(approved)).toEqual(before);
+    expect(userVersion(approved)).toBe(25);
+  }, 120_000);
+
+  it("refuses a canonical alias hard-linked onto the approved inode after the check", () => {
+    // Identity alone cannot see this. A hard link leaves device and inode exactly as they were,
+    // so `isSameTarget` still passes while the file has become reachable under a second name —
+    // and here that name is the deployment's own database. The copy and the live store are now
+    // one inode, and migrating "the copy" migrates the deployment.
+    const home = tempDir("acp-u5-01-alias-home-");
+    chmodSync(home, 0o700);
+    const stateDir = join(home, ".agent-control-plane");
+    mkdirSync(stateDir, { recursive: true });
+    chmodSync(stateDir, 0o700);
+
+    const dir = tempDir("acp-u5-01-alias-");
+    chmodSync(dir, 0o700);
+    const approved = seedAt(join(dir, "approved.sqlite"));
+    approveMigration(approved, "alias-control");
+    // Non-empty sidecars, written last because recording the approval opens and closes the
+    // database, and the close takes the sidecars with it. Content rather than absence, so that
+    // "unchanged" is a byte comparison of something real instead of of two `absent`s.
+    writeFileSync(`${approved}-wal`, Buffer.from("wal-content-that-must-not-move"), { mode: 0o600 });
+    writeFileSync(`${approved}-shm`, Buffer.from("shm-content-that-must-not-move"), { mode: 0o600 });
+
+    const before = imprintOf(approved);
+    expect(before.wal).not.toBe("absent");
+    expect(before.shm).not.toBe("absent");
+
+    const realHome = process.env["HOME"];
+    process.env["HOME"] = home;
+    let atSeam: ReturnType<typeof imprintOf> | null = null;
+    __setApprovedCopyWindowHook(() => {
+      // The canonical path did not exist at verification time, which is exactly why a captured
+      // canonical identity cannot catch this.
+      linkSync(approved, join(stateDir, "state.sqlite"));
+      atSeam = imprintOf(approved);
+    });
+    try {
+      expect(() => migrateApprovedCopy(approved)).toThrowError(
+        /reachable under 2 names|deployment's own database/,
+      );
+    } finally {
+      __setApprovedCopyWindowHook(null);
+      if (realHome === undefined) delete process.env["HOME"];
+      else process.env["HOME"] = realHome;
+    }
+
     const after = imprintOf(approved);
-    expect(after.bytes).toEqual(before.bytes);
-    expect([after.wal, after.shm]).toEqual([before.wal, before.shm]);
+    // Byte-exact across the seam — all three artifacts. This is where the counterexample lives:
+    // everything from the moment the alias appeared to the refusal must have left no mark.
+    expect(atSeam).not.toBeNull();
+    expect(after).toEqual(atSeam);
+    // Across the whole command, the durable bytes are unchanged too. `-shm` is deliberately not
+    // held to that: it is a shared-memory index SQLite re-derives whenever a WAL database is
+    // opened, and this command has to open the copy read-only to read its version. Demanding
+    // stability there would be demanding that nothing ever read the file, which is not a property
+    // this command can have or should claim.
+    expect(after.main).toEqual(before.main);
+    expect(after.wal).toEqual(before.wal);
     expect(userVersion(approved)).toBe(25);
   }, 120_000);
 

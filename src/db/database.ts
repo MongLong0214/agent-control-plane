@@ -1255,7 +1255,6 @@ export const openDb = (filename: string, options?: DbOpenOptions): Db => new Db(
 interface HeldMigrationLock {
   lockPath: string;
   copy: TargetIdentity;
-  canonical: TargetIdentity | null;
 }
 let heldMigrationLock: HeldMigrationLock | null = null;
 
@@ -1315,13 +1314,7 @@ export const migrateApprovedCopy = (databasePath: string): ApprovedCopyMigration
   }
   try {
     const fromVersion = assertApprovedCopyUnderLock(databasePath);
-    heldMigrationLock = {
-      lockPath,
-      copy: targetIdentityOf(databasePath),
-      canonical: existsSync(deploymentDatabasePath())
-        ? targetIdentityOf(deploymentDatabasePath())
-        : null,
-    };
+    heldMigrationLock = { lockPath, copy: targetIdentityOf(databasePath) };
     try {
       // The window. A replacement landing here is what the pre-open check in `Db`'s constructor
       // refuses, and the hook is how a test gets to stand in it.
@@ -1396,20 +1389,52 @@ const deploymentDatabasePath = (): string =>
 const lockPathFor = (databaseFile: string): string =>
   join(realpathSync(dirname(databaseFile)), "agentcpd.lock");
 
-/** Refuses an open whose pathname no longer holds the file the held lock was taken over. */
+/**
+ * Refuses an open whose target stopped being the one the held lock was taken over.
+ *
+ * Identity alone is not enough, and that is the finding this shape exists for: a hard link added
+ * after the check leaves the device and inode exactly as they were, so `isSameTarget` still
+ * passes while the file has become reachable under a second name — and if that second name is the
+ * deployment's own database, this command is about to migrate the live store through its copy
+ * path. So the file's *shape* is re-measured here too, and the canonical target is re-derived
+ * rather than compared to what it was at verification time: a canonical alias that did not exist
+ * then is precisely the case a captured value cannot see.
+ */
 const assertHeldLockStillDescribes = (filename: string): void => {
   const held = heldMigrationLock;
   if (!held || filename === ":memory:") return;
   if (held.lockPath !== lockPathFor(filename)) return;
-  const now = existsSync(filename) ? targetIdentityOf(filename) : null;
-  if (!now || !isSameTarget(now, held.copy)) {
+
+  const stat = lstatSync(filename, { throwIfNoEntry: false });
+  if (!stat || stat.isSymbolicLink() || !stat.isFile()) {
     throw acpError(
       ReasonCode.INTERNAL_ERROR,
       "the file at this path changed after it was verified under the migration lock",
       {},
     );
   }
-  if (held.canonical && isSameTarget(now, held.canonical)) {
+  if (stat.nlink !== 1) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      `the copy became reachable under ${stat.nlink} names after it was verified`,
+      {},
+    );
+  }
+
+  const now = targetIdentityOf(filename);
+  if (!isSameTarget(now, held.copy)) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      "the file at this path changed after it was verified under the migration lock",
+      {},
+    );
+  }
+
+  // Re-derived, not the value captured at verification: a canonical database that appeared since
+  // then — or an alias linked onto this very inode — is invisible to the captured one.
+  const canonicalPath = deploymentDatabasePath();
+  const canonicalNow = existsSync(canonicalPath) ? targetIdentityOf(canonicalPath) : null;
+  if (canonicalNow && isSameTarget(now, canonicalNow)) {
     throw acpError(
       ReasonCode.INTERNAL_ERROR,
       "refusing to migrate the deployment's own database through the copy path",
