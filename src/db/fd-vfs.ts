@@ -1,5 +1,5 @@
 import { closeSync, openSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import Database from "better-sqlite3";
@@ -101,9 +101,10 @@ export class FdVfsControl {
    * the caller's business and closing them early is the caller's bug.
    */
   bind(databasePath: string, mainFd: number, dirFd: number): void {
-    this.#db
-      .prepare("SELECT acp_fd_bind(?, ?, ?) AS ino")
-      .get(basename(databasePath), mainFd, dirFd);
+    // The whole path, not its file name. Two databases in different directories can share a name,
+    // and a binding keyed on the name alone would hand one connection the other's descriptor —
+    // the same defect this exists to end, just at a shorter length.
+    this.#db.prepare("SELECT acp_fd_bind(?, ?, ?) AS ino").get(databasePath, mainFd, dirFd);
   }
 
   unbind(): void {

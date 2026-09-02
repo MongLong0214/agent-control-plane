@@ -169,6 +169,42 @@ describe("U6-UNIT1 the fd-vfs binds a connection to a verified descriptor", () =
     expect(imprintOf(other)).toEqual(otherBefore);
   }, 120_000);
 
+  it("refuses a same-named database in another directory, and never hands over the descriptor", () => {
+    // The binding is over one file, not over a file name. Two directories can each hold a
+    // `copy.sqlite`; a binding keyed on the name alone would hand the second connection the first
+    // one's descriptor, and it would read and write that file believing otherwise — this unit's
+    // own defect, at the length of a basename.
+    const boundDir = tempDir("acp-u6-samename-bound-");
+    const otherDir = tempDir("acp-u6-samename-other-");
+    chmodSync(boundDir, 0o700);
+    chmodSync(otherDir, 0o700);
+    const bound = join(boundDir, "copy.sqlite");
+    const other = join(otherDir, "copy.sqlite");
+    seed(bound, 25, "bound_rows");
+    seed(other, 77, "other_rows");
+    const boundBefore = imprintOf(bound);
+
+    const control = FdVfsControl.load();
+    const mainFd = openSync(bound, "r+");
+    const dirFd = openSync(boundDir, "r");
+    try {
+      control.bind(bound, mainFd, dirFd);
+      expect(() => new Database(other)).toThrowError(/unable to open database file/i);
+      expect(control.stats().refusal).toContain("does not match the active binding");
+    } finally {
+      control.unbind();
+      control.close();
+      closeSync(dirFd);
+      closeSync(mainFd);
+    }
+
+    // Neither file was touched, and in particular the same-named stranger never became a second
+    // name for the bound object.
+    expect(imprintOf(bound)).toEqual(boundBefore);
+    expect(headerVersion(other)).toBe(77);
+    expect(readFileSync(other).includes(Buffer.from("other_rows"))).toBe(true);
+  }, 120_000);
+
   it("refuses to open the bound name once the descriptor stops being the verified object", () => {
     const dir = tempDir("acp-u6-swapped-");
     chmodSync(dir, 0o700);

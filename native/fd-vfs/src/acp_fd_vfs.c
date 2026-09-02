@@ -47,6 +47,7 @@ SQLITE_EXTENSION_INIT1
 
 #define ACP_VFS_NAME "acp-fd-vfs"
 #define ACP_MAX_BASE 256
+#define ACP_MAX_PATH 1024
 
 static sqlite3_vfs *acp_parent = 0;
 static sqlite3_vfs acp_shim;
@@ -57,6 +58,16 @@ static struct {
   int main_fd;
   int dir_fd;
   char base[ACP_MAX_BASE];
+  /*
+   * The bound database's full path, normalised the way SQLite will present it.
+   *
+   * Matching on the basename alone was wrong, and wrong in exactly the way this whole unit exists
+   * to end: two databases in different directories can share a name, so `/a/copy.sqlite` and
+   * `/b/copy.sqlite` were the same key. A connection opening the second one would have been handed
+   * the descriptor for the first and would have read and written it believing otherwise. A name
+   * standing in for an object is the defect, at whatever length the name happens to be.
+   */
+  char path[ACP_MAX_PATH];
   dev_t dev;
   ino_t ino;
   int main_opens;
@@ -83,10 +94,15 @@ static const char *acp_basename(const char *path) {
   return slash ? slash + 1 : path;
 }
 
-/** True when `base` is the bound database or one of its sibling journal names. */
-static int acp_is_bound_sibling(const char *base) {
-  size_t n = strlen(acp_binding.base);
-  return strncmp(base, acp_binding.base, n) == 0 && (base[n] == '\0' || base[n] == '-');
+/** True when `path` is the bound database itself. Whole path, not a name within some directory. */
+static int acp_is_bound_database(const char *path) {
+  return strcmp(path, acp_binding.path) == 0;
+}
+
+/** True when `path` is one of the bound database's own journal siblings, e.g. `<db>-journal`. */
+static int acp_is_bound_sibling(const char *path) {
+  size_t n = strlen(acp_binding.path);
+  return strncmp(path, acp_binding.path, n) == 0 && path[n] == '-';
 }
 
 static int acp_close(sqlite3_file *file) {
@@ -188,7 +204,7 @@ static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int 
   AcpFile *f = (AcpFile *)file;
 
   if (flags & SQLITE_OPEN_MAIN_DB) {
-    if (strcmp(base, acp_binding.base) != 0) {
+    if (!acp_is_bound_database(path)) {
       /* No fallback: a bound process does not open some other main database by pathname. */
       acp_refuse("main database does not match the active binding");
       return SQLITE_CANTOPEN;
@@ -219,7 +235,7 @@ static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int 
   }
 
   if (flags & (SQLITE_OPEN_MAIN_JOURNAL | SQLITE_OPEN_SUPER_JOURNAL)) {
-    if (!acp_is_bound_sibling(base)) {
+    if (!acp_is_bound_sibling(path)) {
       acp_refuse("journal is not a sibling of the bound database");
       return SQLITE_CANTOPEN;
     }
@@ -250,7 +266,7 @@ static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int 
  * files this binding exists to own.
  */
 static int acp_access(sqlite3_vfs *vfs, const char *path, int flags, int *out) {
-  if (acp_binding.active && path && acp_is_bound_sibling(acp_basename(path))) {
+  if (acp_binding.active && path && acp_is_bound_sibling(path)) {
     int mode = (flags == SQLITE_ACCESS_READWRITE) ? (R_OK | W_OK) : F_OK;
     *out = faccessat(acp_binding.dir_fd, acp_basename(path), mode, 0) == 0;
     return SQLITE_OK;
@@ -259,7 +275,7 @@ static int acp_access(sqlite3_vfs *vfs, const char *path, int flags, int *out) {
 }
 
 static int acp_delete(sqlite3_vfs *vfs, const char *path, int sync_dir) {
-  if (acp_binding.active && path && acp_is_bound_sibling(acp_basename(path))) {
+  if (acp_binding.active && path && acp_is_bound_sibling(path)) {
     if (unlinkat(acp_binding.dir_fd, acp_basename(path), 0) != 0 && errno != ENOENT) {
       return SQLITE_IOERR_DELETE;
     }
@@ -274,11 +290,36 @@ static void acp_fn_bind(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     sqlite3_result_error(ctx, "acp_fd_bind(basename, mainFd, dirFd)", -1);
     return;
   }
-  const char *base = (const char *)sqlite3_value_text(argv[0]);
+  const char *given = (const char *)sqlite3_value_text(argv[0]);
   int main_fd = sqlite3_value_int(argv[1]);
   int dir_fd = sqlite3_value_int(argv[2]);
-  if (base == 0 || base[0] == '\0' || strchr(base, '/') != 0 || strlen(base) >= ACP_MAX_BASE) {
-    sqlite3_result_error(ctx, "basename must be a plain file name", -1);
+  if (given == 0 || given[0] != '/' || strlen(given) >= ACP_MAX_PATH) {
+    sqlite3_result_error(ctx, "the database must be named by an absolute path", -1);
+    return;
+  }
+  /*
+   * Normalised through the wrapped VFS's own `xFullPathname`, because that is the form SQLite will
+   * hand back to `xOpen`. Comparing against the string the caller happened to type would leave the
+   * match depending on spelling rather than on what SQLite resolved.
+   */
+  char full[ACP_MAX_PATH];
+  /*
+   * `SQLITE_OK_SYMLINK` is a success, and treating it as a failure cost a debugging round: every
+   * temporary directory on macOS lives under `/var`, which is a symlink to `/private/var`, so this
+   * call resolves a symlink component and says so with a distinct OK code. The primary result code
+   * is the low byte — comparing the whole value against `SQLITE_OK` rejects every extended success
+   * as well as every error.
+   */
+  int rc = acp_parent->xFullPathname(acp_parent, given, (int)sizeof full, full);
+  if ((rc & 0xff) != SQLITE_OK) {
+    char msg[128];
+    snprintf(msg, sizeof msg, "could not resolve the database path (rc=%d)", rc);
+    sqlite3_result_error(ctx, msg, -1);
+    return;
+  }
+  const char *base = acp_basename(full);
+  if (base[0] == '\0' || strlen(base) >= ACP_MAX_BASE) {
+    sqlite3_result_error(ctx, "the database path has no usable file name", -1);
     return;
   }
   struct stat st;
@@ -298,6 +339,7 @@ static void acp_fn_bind(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   acp_binding.dev = st.st_dev;
   acp_binding.ino = st.st_ino;
   snprintf(acp_binding.base, sizeof acp_binding.base, "%s", base);
+  snprintf(acp_binding.path, sizeof acp_binding.path, "%s", full);
   sqlite3_result_int64(ctx, (sqlite3_int64)st.st_ino);
 }
 
