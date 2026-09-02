@@ -33,6 +33,7 @@ import { fileURLToPath } from "node:url";
 
 import { ControlPlane, defaultConfig } from "../src/app/control-plane.ts";
 import { Db, SCHEMA_VERSION } from "../src/db/database.ts";
+import { approveMigration } from "../src/db/migration-approval.ts";
 import { isAcpError } from "../src/core/errors.ts";
 
 const asJson = process.argv.includes("--json");
@@ -494,6 +495,9 @@ const createPinnedV11 = (path: string, mutate?: (raw: Database.Database) => void
     raw.close();
   }
   chmodSync(path, 0o600);
+  // #738 — a database at an older version no longer migrates itself. The verifier is asking
+  // what an approved upgrade does, so it takes the approval the owner would take.
+  approveMigration(path, "verify-fresh-database");
 };
 
 const olderPath = join(root, "olderVersion.sqlite");

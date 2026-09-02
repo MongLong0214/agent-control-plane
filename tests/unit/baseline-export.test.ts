@@ -25,6 +25,7 @@ import {
   type RunEvidenceExport,
 } from "../../src/export/run-evidence.ts";
 import { Db } from "../../src/db/database.ts";
+import { approveMigration } from "../../src/db/migration-approval.ts";
 import { migrationChainFrom, SCHEMA_VERSION } from "../../src/db/migrations.ts";
 import {
   bindWorker,
@@ -997,6 +998,9 @@ describe("baseline boundary contracts", () => {
     } finally {
       raw.close();
     }
+    // #738 — a database at an older version no longer migrates itself. This fixture is a
+    // deployment that stopped at v13, so it takes the approval its owner would have taken.
+    approveMigration(databasePath, "baseline-export fixture");
 
     const reopened = new Database(databasePath);
     try {
@@ -1122,6 +1126,9 @@ describe("baseline boundary contracts", () => {
     } finally {
       raw.close();
     }
+    // #738 — a database at an older version no longer migrates itself. This fixture is a
+    // deployment that stopped at v13, so it takes the approval its owner would have taken.
+    approveMigration(databasePath, "baseline-export fixture");
 
     expect(() => new Db(databasePath, {
       afterMigration: (migration) => {
@@ -1144,6 +1151,9 @@ describe("baseline boundary contracts", () => {
       restored.close();
     }
 
+    // #747 — the rollback linked a staged image into place, so the restored database is a new
+    // inode that the failed attempt's approval no longer names. Retrying takes a fresh decision.
+    approveMigration(databasePath, "baseline-export fixture");
     const migrated = new Db(databasePath);
     try {
       expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);

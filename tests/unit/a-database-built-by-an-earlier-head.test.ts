@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { AuditLog } from "../../src/db/audit.ts";
 import { ConversationTurnCoordinator } from "../../src/conversation/turn-coordinator.ts";
 import { openDb } from "../../src/db/database.ts";
+import { approveMigration } from "../../src/db/migration-approval.ts";
 import { ManualClock } from "../../src/core/clock.ts";
 import { IngressGuard } from "../../src/ingress/ingress-guard.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -87,6 +88,9 @@ const databaseWithHistoricalTrigger = (): string => {
     END`);
   raw.exec("PRAGMA user_version = 24");
   raw.close();
+  // #738 — a database at an older version no longer migrates itself. This image is what an
+  // earlier head left on disk, so it carries the approval that head's owner would have taken.
+  approveMigration(path, "earlier-head fixture");
   return path;
 };
 

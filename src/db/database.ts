@@ -1,9 +1,10 @@
 import Database from "better-sqlite3";
 import { existsSync, realpathSync, statSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 
 import { acpError, fail, isAcpError, type Decision } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { SingleInstanceLock } from "../daemon/single-instance.ts";
 import {
   DEFAULT_BACKUP_RETENTION,
   assertIntegrity,
@@ -25,10 +26,19 @@ import {
   type SchemaMigration,
 } from "./migrations.ts";
 import {
+  assertMigrationApproved,
+  migrationPlanFrom,
+  retireMigrationApproval,
+  retireStaleMigrationApproval,
+  type ApprovalRetirement,
+  type MigrationApproval,
+} from "./migration-approval.ts";
+import {
   assertPrivateDatabaseFiles,
   ensurePrivateDirectory,
   finalizeNewPrivateDatabaseFiles,
 } from "./state-preflight.ts";
+import { isSameTarget, targetIdentityOf, type TargetIdentity } from "./target-identity.ts";
 
 export type SqliteDatabase = Database.Database;
 
@@ -70,6 +80,25 @@ export interface DbOpenOptions {
   temporaryStorage?: "MEMORY";
   /** Test-only fault injection that proves a committed migration is restored from its backup. */
   afterMigration?: (migration: SchemaMigration) => void;
+  /**
+   * Test-only scheduling seam at the one point a migration race is decidable: after this open
+   * has read the on-disk version and validated its approval, and before it acquires
+   * exclusivity (#747).
+   *
+   * `SingleInstanceLock.acquire` denies rather than blocking, so the interleaving that the
+   * re-read below exists for cannot be produced by starting two processes and hoping — the
+   * second one has to arrive *after* the first released, still holding a version it read
+   * before the first committed. This seam schedules that window; it does not simulate it. What
+   * runs inside it is a real second process taking the real lock and running the real chain.
+   */
+  beforeMigrationExclusivity?: () => void;
+  /**
+   * An approval delivered in-process rather than through the state directory's approval file
+   * (#738). Held to the identical checks, so this is a second way to hand over an approval and
+   * not a way past one. Omitting it does not permit a migration: it means the only approval
+   * this open will consider is the one on disk.
+   */
+  migrationApproval?: MigrationApproval;
 }
 const EVIDENCE_WRITE_MINT: unique symbol = Symbol("evidence-write-mint");
 const TURN_MATERIALIZATION_MINT: unique symbol = Symbol("turn-materialization-mint");
@@ -232,6 +261,21 @@ export class Db {
   readonly identity: string;
   /** The connection's observed SQLite temporary-storage policy. */
   readonly temporaryStorage: "DEFAULT" | "FILE" | "MEMORY";
+  /**
+   * The approval this open spent, or null when it did not migrate. Read by the composition
+   * root so a migration that happened lands in the audit trail with the name of whoever
+   * approved it, rather than only in the schema ledger (#738).
+   */
+  appliedMigrationApproval: MigrationApproval | null = null;
+  /**
+   * Whether the spent approval was filed away, and why not when it was not. A failed rename is
+   * reported rather than thrown, so a committed migration is never reported as a failed start.
+   */
+  migrationApprovalRetirement: ApprovalRetirement | null = null;
+  /** The repair applied to an approval that outlived its own migration, when one was found. */
+  staleMigrationApprovalRetirement: ApprovalRetirement | null = null;
+  /** The identity the pathname had when this connection opened it; null for `:memory:`. */
+  readonly #openedTarget: TargetIdentity | null;
 
   constructor(filename: string, private readonly options: DbOpenOptions = {}) {
     const persistent = filename !== ":memory:";
@@ -277,6 +321,13 @@ export class Db {
             const stat = statSync(this.file);
             return `${stat.dev}:${stat.ino}`;
           })();
+    // What the pathname resolved to at the moment this connection opened it (#747).
+    //
+    // `this.identity` answers "which resource is this" for capability issuance. This answers a
+    // different question that only matters later: does the name still lead to the file this
+    // handle holds. They are computed together and diverge only if something replaces the file
+    // between them, which is itself the condition worth refusing on.
+    this.#openedTarget = persistent ? targetIdentityOf(this.file) : null;
     this.#raw.pragma("foreign_keys = ON");
     this.#raw.pragma("busy_timeout = 10000");
     // SQLite performs REPLACE's implicit delete *without* firing DELETE triggers unless this is
@@ -357,9 +408,141 @@ export class Db {
         includeTelegramOwnerPrompts: true,
       });
       assertMigrationLedgerAt(this.#raw, version);
+      // #747, the repair half of the retirement contract. This branch is also the proof that a
+      // spent approval is inert: it returns without ever consulting one, so an approval left on
+      // disk by a failed rename authorises nothing. Filing it away here is what keeps the state
+      // directory from showing a permission that is no longer one.
+      if (filename !== ":memory:") {
+        this.staleMigrationApprovalRetirement = retireStaleMigrationApproval(this.file);
+      }
       return;
     }
-    this.migrate(filename, version);
+    // #738 — the enforcement site, and the reason it is *here* rather than in the daemon's
+    // startup sequence: `ControlPlane`'s constructor opens the database, so by the time
+    // `Daemon.start()` runs the migration has already happened. A gate in the startup sequence
+    // would name the hazard at a point the mutation never traverses. This line is the last
+    // point that can still refuse, and it is upstream of every caller — daemon, CLI, script —
+    // because they all arrive through this constructor.
+    //
+    // A fresh database (version 0) and a database already at this build's version both
+    // returned above, so nothing that does not migrate reaches this.
+    const approval = assertMigrationApproved(
+      this.file,
+      targetIdentityOf(this.file),
+      migrationPlanFrom(version),
+      this.options.migrationApproval ?? null,
+    );
+    // #747 — the exclusivity a migration needs, acquired by the migration.
+    //
+    // The gate lives here because `ControlPlane`'s constructor opens the database before
+    // `Daemon.start()` runs; that is also why the daemon's single-instance lock is acquired
+    // *after* the point where the schema would already have changed. A second process could
+    // therefore rewrite the schema under a daemon that was holding the database, and only learn
+    // about the contention afterwards. The approval CLI's liveness pre-check does not close
+    // that ordering: it is a snapshot taken minutes earlier.
+    //
+    // So the migration takes the same lock the daemon takes, for exactly as long as it is
+    // migrating, and releases it before returning. `Daemon.start()` then acquires it normally.
+    // This is not a daemon-specific rule bolted onto a shared constructor — a schema migration
+    // is an exclusive operation whoever performs it, so the CLI and the verification scripts
+    // that reach this same line take it too, on their own state directory, where it is
+    // uncontended. An open that does not migrate never touches the lock.
+    this.options.beforeMigrationExclusivity?.();
+    this.withMigrationExclusivity(() => {
+      // #747 — re-resolve the *pathname* under the lock, from the filesystem, not from the
+      // open handle.
+      //
+      // The version re-read below asks the *handle*, and a handle survives its own name. Replace
+      // the file at this path with another database at the same version and `this.#raw` still
+      // refers to the unlinked original, so the version reads 11 and that check passes — the
+      // guard meant to close the window is exactly what makes this instance invisible.
+      //
+      // Measured on the head before this line existed, with a v11 replacement swapped in at the
+      // pathname: the file *at the pathname* — the replacement, which no approval ever named —
+      // came out at version 34 carrying its own rows, the approved inode stayed at 11, and the
+      // approval was consumed. So it is not merely split brain. The approval was spent, no
+      // approved database was migrated, and a database nobody approved was. WAL and shared-memory
+      // sidecars are named by path rather than by the open file, which is the plausible route,
+      // but the end state is the finding and does not depend on that explanation.
+      //
+      // One condition, two questions, because either alone leaves a hole the other covers and a
+      // check nothing can falsify is not a check:
+      //
+      //   - Is the file at this path still the one the approval names? The approval is a
+      //     capability over one target and it was matched outside the lock, where the answer
+      //     could still change.
+      //   - Does the name still lead to the file this connection opened? If not, the handle is a
+      //     handle to an orphan. The caller asked to open a *path*; migrating an inode the path
+      //     no longer names is not what it asked for, however valid the approval was a moment
+      //     ago. **The handle is suspect the instant the pathname moves off it**, and that is
+      //     why this refuses rather than trusting the approval it already matched.
+      //
+      // The second is not implied by the first: a swap away and back between the approval check
+      // and this line leaves the path equal to what was approved while the handle holds neither.
+      //
+      // Refusing costs nothing that has to be recovered: no DDL has run, and the retirement
+      // below is not reached, so the approval stays exactly as spendable as it was.
+      const underLock = targetIdentityOf(this.file);
+      if (
+        !isSameTarget(underLock, approval.target) ||
+        (this.#openedTarget !== null && !isSameTarget(underLock, this.#openedTarget))
+      ) {
+        throw acpError(
+          ReasonCode.CONFLICT,
+          "the database at this path is no longer the one this migration was set up for",
+          {
+            file: this.file,
+            current: underLock,
+            approved: approval.target,
+            opened: this.#openedTarget,
+          },
+        );
+      }
+      // Re-read under the lock. Everything above was decided without exclusivity, so a
+      // concurrent migration could have completed in between; a check whose result is used
+      // after the lock it was taken without is the defect this whole block is about.
+      const current = Number(this.#raw.pragma("user_version", { simple: true }));
+      if (current !== version) {
+        throw acpError(
+          ReasonCode.CONFLICT,
+          "the database schema changed while this process was acquiring migration exclusivity",
+          { expected: version, found: current, file: this.file },
+        );
+      }
+      this.migrate(filename, version);
+    });
+    this.appliedMigrationApproval = approval;
+    this.migrationApprovalRetirement = retireMigrationApproval(
+      this.file,
+      approval.fromVersion,
+      approval.toVersion,
+    );
+  }
+
+  /**
+   * Runs `work` while holding the deployment's single-instance lock.
+   *
+   * The lock is the daemon's, deliberately: exclusivity that only excluded other migrations
+   * would still let a migration run under a live daemon holding the database. Contention is
+   * reported as `DAEMON_ALREADY_RUNNING` — an ordinary unsuccessful start that the supervisor
+   * is right to retry, because the holder may exit — and never as a migration refusal, which
+   * exits 0 and stays down.
+   */
+  private withMigrationExclusivity(work: () => void): void {
+    const lock = new SingleInstanceLock(join(dirname(this.file), "agentcpd.lock"));
+    const acquired = lock.acquire(new Date().toISOString());
+    if (!acquired.allowed) {
+      throw acpError(
+        acquired.reasonCode,
+        "refusing to migrate the schema while another process holds the state lock",
+        { file: this.file, ...acquired.evidence },
+      );
+    }
+    try {
+      work();
+    } finally {
+      lock.release();
+    }
   }
 
   private bootstrapFreshSchema(): void {

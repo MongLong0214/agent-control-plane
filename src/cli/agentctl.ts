@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -133,10 +134,19 @@ export const main = async (argv: string[]): Promise<number> => {
     // `lock` is a file read that never checks whether its pid is alive, so it can appear
     // beside any of them, including beside a process that is already gone.
     const lock = new SingleInstanceLock(join(config.databasePath, "..", "agentcpd.lock"));
+    // A fourth situation, and the one where every other surface is dark: the daemon refused to
+    // start because it would have migrated the database (#738). There is no socket, and the
+    // doctor cannot run either — it is built by the composition root that could not open the
+    // file — so this offline reading is the observation path that survives. It carries the
+    // refusal verbatim rather than leaving the owner an unreachable socket and no reason.
+    const refusalPath = join(config.databasePath, "..", "migration-refusal.json");
     print({
       lock: lock.read(),
       databasePath: config.databasePath,
       daemonStatus: { reasonCode: live.reasonCode, message: live.message },
+      migrationRefusal: existsSync(refusalPath)
+        ? (JSON.parse(readFileSync(refusalPath, "utf8")) as unknown)
+        : null,
     });
     return 0;
   }

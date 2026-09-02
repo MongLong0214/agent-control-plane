@@ -30,7 +30,7 @@ allowed to *read*, rather than somewhere it must *spawn* to reach.
 
 `~/.agent-control-plane/reviewer/claude/` containing `.credentials.json` and `.claude.json`.
 Those three paths are exactly what `claudeCredentialPaths()` hands the seatbelt profile as the
-reviewer's readable credential scope (`src/runtime/cli-adapters.ts:1088-1095`).
+reviewer's readable credential scope (`claudeCredentialPaths` in `src/runtime/cli-adapters.ts`).
 
 ### Which identity
 
@@ -38,8 +38,9 @@ reviewer's readable credential scope (`src/runtime/cli-adapters.ts:1088-1095`).
 
 Nothing in the code checks the account. What the code requires is that the reviewer never reads
 the ordinary provider config tree, because that tree can hold producer conversations — the
-`~/.codex` comment at `cli-adapters.ts:604-607` states the reasoning and the Claude path follows
-it. A fresh directory satisfies that whichever account authenticates into it.
+`~/.codex` comment above `codexCredentialPaths` in `src/runtime/cli-adapters.ts` states the
+reasoning and the Claude path follows it. A fresh directory satisfies that whichever account
+authenticates into it.
 
 **Recommendation, not a requirement:** use a separate account if one is available. Same-account
 means the reviewer and the producers share a rate-limit pool, so reviewer starvation and
@@ -110,9 +111,9 @@ message creating a run and leaving Buzz dispatch evidence. Every path that touch
 
 ### What it creates
 
-Four Keychain items the launcher reads at start
-(`deploy/install-launchd.sh:254-259`). Telegram stays disabled when none are present and
-**refuses a partial set**, so all four are needed together.
+Four Keychain items the launcher reads at start — the `required_keychain_value` /
+`optional_keychain_value` block in `deploy/install-launchd.sh`. Telegram stays disabled when none
+are present and **refuses a partial set**, so all four are needed together.
 
 ### Which identity
 
@@ -171,10 +172,10 @@ Four numbers describe one deployment, and only two of them agree:
 
 The live migration ledger's last five rows (`bootstrap-v20` through `v25-sources-name-admitted-
 messages`) all landed within 85 ms of the daemon's own `startedAt`, and nothing has landed since.
-`Db.applySchema` (`src/db/database.ts:328-363`) only calls `migrate()` when the on-disk version
+`src/db/database.ts` — `applySchema` only calls `migrate()` when the on-disk version
 differs from the build's `SCHEMA_VERSION`, walks the chain in one pass to exactly
-`SCHEMA_VERSION`, and returns without touching the ledger once `version === SCHEMA_VERSION`
-(`:353`). A run that starts at 20 and stops dead at 25 is only possible if the running build's own
+`SCHEMA_VERSION`, and returns without touching the ledger once `version === SCHEMA_VERSION`.
+A run that starts at 20 and stops dead at 25 is only possible if the running build's own
 `SCHEMA_VERSION` constant is 25 — so **the running bytes declare 25**, matching the live database.
 That conclusion is reconstructed from ledger timestamps, not read back from anything self-
 reporting; see the health.json gap below.
@@ -223,7 +224,8 @@ numbers in this document age from the moment they were written.
 
 Database — using SQLite's own **online backup API** through the `sqlite3` CLI, not the
 maintenance CLI's `backup` subcommand. That subcommand loads `better-sqlite3`
-(`src/db/database.ts:1`), and a fresh `node` process run for this procedure cannot load its
+(its `better-sqlite3` import in `src/db/database.ts`), and a fresh `node` process run for this
+procedure cannot load its
 native binding — the daemon loaded it once at its own start, and rebuilding the binding here
 (before item 3 stops the job) is exactly the thing the "do not execute" gate below exists to
 prevent. Measured on this host: `sqlite3` is **3.51.0**, which has `.backup ?DB? FILE`, and the
@@ -524,7 +526,7 @@ Never remove the manifest without that first `test`: a manifest whose database e
 verified backup, and deleting it is how the failure this section is about gets recreated by hand.
 
 Bytes — nothing in `deploy/install-launchd.sh` snapshots `dist/`; `snapshot_current_deployment`
-only copies the plist and the launcher shell script (`deploy/install-launchd.sh:143-155`), and
+only copies the plist and the launcher shell script, and
 that function only runs from the `install`/`upgrade` subcommands, which this procedure does not
 use (the app root and node path are not changing — only the tree's contents are). Without this
 step, "roll back the bytes" in item 6 would have nothing to restore to, since rebuilding from any
@@ -570,8 +572,8 @@ shell variable that dies with the session, and a later rollback would be picking
 that merely look contemporaneous.
 
 That co-location is not tidiness. `install-launchd.sh` does snapshot the plist and launcher —
-`snapshot_current_deployment` (`deploy/install-launchd.sh:143-155`) — but it runs from exactly
-one call site, inside `install|upgrade` (`:338`), and this procedure calls neither. So no
+`snapshot_current_deployment` in `deploy/install-launchd.sh` — but it runs from exactly
+one call site, inside `install|upgrade`, and this procedure calls neither. So no
 snapshot is created by this run. And `rollback` selects one with
 `find "$deploy_backups_dir" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1` (`:373`) — the
 newest directory *by name*, which would be some earlier install's artifacts, or nothing at all
@@ -586,10 +588,13 @@ live file.**
 `RunAtLoad` is `true` and `KeepAlive` is `{ SuccessfulExit = false }` with a 30 s
 `ThrottleInterval` (`deploy/com.agentcontrolplane.agentcpd.plist.template`). Rebuilding `dist/` in
 place while the job is still loaded means the *next* crash or reboot — not the next command —
-migrates the live database to whatever the rebuild declares, with no approval gate anywhere in
-that path (`Db`'s constructor calls `migrate()` unconditionally, `src/db/database.ts:362`).
-Stopping first removes the job from launchd's supervision entirely until it is explicitly
-started again, which is the only thing in this repository that closes that window:
+arrives at a build declaring a different `SCHEMA_VERSION` than the live database carries. Since
+#738 that start **refuses** rather than migrating: `Db`'s constructor requires an approval on
+file naming the exact from-version, to-version and ordered migration ids
+(`assertMigrationApproved`, `src/db/database.ts`), and the process exits 0 so
+`KeepAlive { SuccessfulExit = false }` stops rather than retrying every 30 s. Stopping the job
+first is still the right order — it removes the job from supervision entirely until it is
+explicitly started again, so the rebuild is not racing a supervised process for the same bytes:
 
     set -e
     bash /Users/isaac/projects/agent-control-plane/deploy/install-launchd.sh stop
@@ -600,7 +605,7 @@ started again, which is the only thing in this repository that closes that windo
     fi
 
 The `exit 1` is the whole point of this step, not a formality. `install-launchd.sh`'s own
-`wait_for_stop` (`deploy/install-launchd.sh:324-330`) ends the same wait with
+`wait_for_stop` in `deploy/install-launchd.sh` ends the same wait with
 `fail "agentcpd lock remains after launchctl stop; refusing database restore"`, and every
 command that touches state — `install`, `upgrade`, `rollback` — goes through it. Plain `stop`
 does not, so the wait has to be written out here; **writing it out is where the fail-closed
@@ -621,6 +626,12 @@ backup:
 
     DRY_DIR="$(mktemp -d)"; DRY="$DRY_DIR/dry-run.sqlite"
     cp "$BACKUP_PATH" "$DRY"
+    chmod 700 "$DRY_DIR"; chmod 600 "$DRY"
+    # #738 — a migration is now a decided act, and the dry run has to decide it too. This
+    # approves the throwaway copy only: the approval file lands in $DRY_DIR beside it, names
+    # that copy's own from/to versions, and cannot authorise anything for the live database.
+    node /Users/isaac/projects/agent-control-plane/dist/db/state-admin.js approve-migration \
+      --database "$DRY" --approved-by "$USER" --confirm-migration
     node --input-type=module -e '
       import { openDb, SCHEMA_VERSION } from "/Users/isaac/projects/agent-control-plane/dist/db/database.js";
       const db = openDb(process.argv[1]);
@@ -632,38 +643,91 @@ backup:
     rm -rf "$DRY_DIR"
 
 Expect `{"schemaVersion":34,"userVersion":34}` (or whatever `SCHEMA_VERSION` main declares by
-execution day). This drives the real migration code (`Db.applySchema` → `Db.migrate`,
-`src/db/database.ts:328-441`), not a re-implementation of it, because it is the same compiled
+execution day). This drives the real migration code — `applySchema` calling `migrate` in
+`src/db/database.ts` — not a re-implementation of it, because it is the same compiled
 file the daemon is about to load.
 
-**What a failure looks like — not just the success path.** `migrate()` takes exactly one backup,
-before the first step in the chain (`backupOpenDatabaseSync`, `:401-405`), and the `catch` block
-restores from that same single backup regardless of which step in the chain threw
-(`restoreMigrationBackup(filename, backup)`, `:422`, closing over the one `backup` bound at
-`:401`) — so **a failure anywhere in a 25→34 run restores to 25, not to whatever intermediate
-version it reached.** The thrown message is exactly `"migration failed; the original database was
-restored from its automatic backup"` (`:435-439`), or, if even that restore fails, `"migration
-failed and the automatic backup could not be restored"` (`:424-434`). This is not hypothetical:
-`tests/unit/database-migration-restore.test.ts:828` ("restores the original v11 database when a
-fault is injected after a migration commits") drives exactly this path today and asserts that
-message. The ordered chain from 25 to 34 was confirmed contiguous while preparing this packet —
-nine steps, `fromVersion`/`toVersion` running 25→26→27→28→29→30→31→32→33→34 with no gap in
-`src/db/migrations.ts`, and `tests/unit/database-migration-restore.test.ts:588` already asserts
-`MIGRATIONS.map(m => m.fromVersion)` equals `MIGRATIONS.map(m => m.toVersion - 1)` for the whole
-registry — so a failure here on execution day would be a genuinely new defect in one of those
-nine steps, not a missing link this packet failed to notice.
+**What a failure looks like — not just the success path.** `migrate()` in `src/db/database.ts`
+takes exactly one backup before the first step in the chain — `backupOpenDatabaseSync`, named
+`pre-migration-v<from>` — and its `catch` block calls `restoreMigrationBackup` with that same
+single `backup` binding regardless of which step threw. So **a failure anywhere in the run
+restores to the version the chain started at, not to whatever intermediate version it reached.**
+The thrown message is exactly `"migration failed; the original database was restored from its
+automatic backup"`, or, if even that restore fails, `"migration failed and the automatic backup
+could not be restored"`. This is not hypothetical: `restores the original v11 database when a
+fault is injected after a migration commits`, in
+`tests/unit/database-migration-restore.test.ts`, drives exactly this path today and asserts that
+message.
+
+The one recovery point is also visible in the ledger afterwards, which is how to tell a real
+chain apart from one that claims more safety than it has: only the receipt for the chain's
+**first** step carries `backup_file` and `backup_checksum`, and every later receipt carries
+`NULL` for both. `migrates a v11 fixture in order, records its backup receipt, and
+re-establishes load-bearing guards` asserts exactly that, and the falsifiability case
+`one-recovery-point-for-the-whole-chain` is the mutation that proves the assertion is load-bearing.
+
+**Three of the steps are destructive table rewrites, which is why the single recovery point
+matters here rather than being a formality.** `v26-ledger-trigger-bodies`,
+`v27-an-observation-carries-its-evidence` and `v28-an-operator-can-settle-a-turn-nobody-observed`
+each run with `foreignKeysOffDuringApply: true` and call `rebuildObservationsIfStale` — v28 also
+`rebuildCanonicalTurnsIfStale` — and those helpers **drop and recreate** the table, taking its
+triggers with it and restoring them from `ledgerTriggerDdl()` afterwards. A failure at, say, the
+step after v28 therefore does not leave a database one edit away from correct; it leaves one that
+has had `canonical_turns` and `canonical_turn_observations` rewritten, and the pre-chain image is
+the only thing that undoes that.
+
+The chain was confirmed contiguous while preparing this packet, and stays confirmed by test
+rather than by this sentence: `MIGRATIONS.map(m => m.fromVersion)` equals
+`MIGRATIONS.map(m => m.toVersion - 1)` for the whole registry, asserted in
+`tests/unit/database-migration-restore.test.ts`. So a failure here on execution day would be a
+genuinely new defect in one of those steps, not a missing link this packet failed to notice. **Do
+not read a step count out of this document** — derive it on the day from the live
+`max(version)` and the `SCHEMA_VERSION` the pinned candidate declares, per staleness rule 4.
 
 If the dry run throws either message: stop. Do not proceed to item 4. File which migration step
 failed and treat it as a blocker on this packet, not something to retry past.
 
-**4. Start the job — this is the real migration, under supervision, not a dry run.**
+**4. Approve the migration, then start the job — this is the real migration, under supervision,
+not a dry run.**
 
+Since #738 the start refuses unless an approval on file names this exact chain. Read the plan
+first — `migration-plan` opens the database read-only and changes nothing — and approve only
+after the printed `fromVersion`, `toVersion` and `migrations` are the ones item 3's dry run just
+proved out:
+
+    node /Users/isaac/projects/agent-control-plane/dist/db/state-admin.js migration-plan \
+      --database "$HOME/.agent-control-plane/state.sqlite"
+    node /Users/isaac/projects/agent-control-plane/dist/db/state-admin.js approve-migration \
+      --database "$HOME/.agent-control-plane/state.sqlite" --approved-by "$USER" --confirm-migration
     bash /Users/isaac/projects/agent-control-plane/deploy/install-launchd.sh start
 
-The first `Db` the new process opens finds `state.sqlite` at 25 and a build declaring 34, and
-`applySchema` runs the real chain, protected by its own internal backup exactly as validated in
-item 3. Watch it for the first 60–90 s (`ThrottleInterval` is 30 s): if it is not stable by then,
-treat it as crash-looping and go straight to item 6 rather than waiting longer.
+`approve-migration` refuses while the lock is held, takes its own validated recovery point at
+the current version, and writes `~/.agent-control-plane/migration-approval.json` naming that
+backup, the ordered chain, and **which database** it is for — canonical path plus device and
+inode (#747). It approves **one** migration of **one** file between two named versions: after
+the chain runs, the file is renamed to `migration-approval.applied-v25-v<to>-<epoch>.json` and
+authorises nothing further.
+
+Two consequences worth knowing before item 6:
+
+  - The migration itself holds `agentcpd.lock` for as long as it runs, so it cannot proceed
+    under a daemon that is still holding the database. That pre-check in `approve-migration` is
+    a snapshot; the lock is the guarantee.
+  - If the chain fails, its automatic rollback links the pre-migration image back into place,
+    which gives the restored database a **new inode**. The approval no longer names it, so the
+    next start refuses instead of retrying. That is deliberate: a chain that failed partway is
+    exactly when a supervised restart must not silently try again. Retrying is a fresh
+    `approve-migration` after the failing step has been understood — item 6's blocker rule.
+
+The first `Db` the new process opens finds `state.sqlite` at 25, a build declaring the pinned
+`SCHEMA_VERSION`, and an approval naming exactly that chain, and `applySchema` runs it — protected by its own
+internal backup exactly as validated in item 3. Watch it for the first 60–90 s
+(`ThrottleInterval` is 30 s): if it is not stable by then, treat it as crash-looping and go
+straight to item 6 rather than waiting longer.
+
+If the start refuses instead, `~/.agent-control-plane/migration-refusal.json` carries the plan
+it declined and `agentctl daemon status` reports it offline — the socket and the doctor are both
+unavailable during a refusal, so that file and `agentcpd.err.log` are the observation surface.
 
 **5. Post-restart readback.**
 
@@ -671,7 +735,8 @@ treat it as crash-looping and go straight to item 6 rather than waiting longer.
     cat "$HOME/.agent-control-plane/health.json"
     shasum -a 256 /Users/isaac/projects/agent-control-plane/dist/daemon/agentcpd.js
 
-Expect: `max(version)` is 34; `health.json` shows a new `pid` and `startedAt`, `lockHeld: true`,
+Expect: `max(version)` is the pinned `SCHEMA_VERSION` — 36 as measured 2026-09-02, not the 34
+item 1 recorded; `health.json` shows a new `pid` and `startedAt`, `lockHeld: true`,
 and no new `blockingFindings`; the `shasum` matches the hash taken right after the build in item
 3. That last line carries the same caveat as item 1's identity read: it proves what is on disk
 now equals what was built, not that the new `pid` attests to it — nothing here does, per the
@@ -762,9 +827,10 @@ Clearing the orphan is written out at the end of item 4 step 2.
 `install-launchd.sh rollback` is deliberately **not** used here, and the reason is worth
 stating because reusing it looks obviously right. That path does stop the job, wait for the
 lock fail-closed, restore the database and restore a plist and launcher — but it selects them
-with `find … | sort | tail -n 1` (`deploy/install-launchd.sh:373`), the newest directory in
+with `find … | sort | tail -n 1` inside `rollback` in `deploy/install-launchd.sh`, the newest
+directory in
 `deploy-backups/` **by name**. This procedure never calls `install`/`upgrade`, which is the
-only caller of `snapshot_current_deployment` (`:143-155`, called at `:338`), so it creates no
+only caller of `snapshot_current_deployment`, so it creates no
 snapshot of its own. `rollback` would therefore either abort with `no prior deployment
 snapshot is available`, or restore the plist and launcher of some earlier install — **a
 rollback to an identity that is not the one this operation replaced.**
@@ -778,11 +844,14 @@ replaces the bytes of a live process, and the database restore is then refused b
 moment later, leaving a **partial rollback** — old bytes, new schema — the one combination
 `applySchema` refuses outright and `KeepAlive` then retries forever.
 
-Restoring only the database and leaving 34-declaring bytes in place is nearly harmless — a build
-opening a database *older* than itself just migrates forward again, reproducing the state being
-rolled back from. Restoring only the bytes and leaving the database at 34 is not: `applySchema`
+Restoring only the database and leaving 34-declaring bytes in place no longer silently undoes
+itself — since #738 a build opening a database *older* than itself refuses unless an approval
+names that migration, so the restored file stays restored and the daemon stays stopped rather
+than migrating forward again. It is still a half-finished rollback and still has to be completed.
+Restoring only the bytes and leaving the database at 34 is worse: `applySchema`
 refuses a database newer than the running build outright — `"database schema is newer than this
-build"` (`src/db/database.ts:335-341`) — and with `KeepAlive.SuccessfulExit = false` and a 30 s
+build"` (thrown by `applySchema` in `src/db/database.ts`) — and with
+`KeepAlive.SuccessfulExit = false` and a 30 s
 `ThrottleInterval`, launchd retries that failure forever. Both restores must complete, in either
 order, while the job is stopped, before the next `start`.
 
@@ -790,7 +859,8 @@ order, while the job is stopped, before the next `start`.
 
 A database backup and manifest under `~/.agent-control-plane/backups/` (item 2); a `dist/`
 snapshot and its hash under `~/.agent-control-plane/deploy-backups/` (item 2); nine new rows in
-`schema_migrations`, versions 26 through 34, each with a `sha256:` receipt (item 4, on success);
+`schema_migrations`, one row per step from 26 to the pinned `SCHEMA_VERSION`, each with a
+`sha256:` receipt (item 4, on success);
 an updated `~/.agent-control-plane/health.json` with a new `pid` and `startedAt` (item 4).
 
 Nothing is written to `origin`. **The deployment checkout is modified**, and this is not a
@@ -839,14 +909,19 @@ armed, not as something to defer casually.
 3. **`select max(version) from schema_migrations` on the live database is no longer 25.**
    Either this packet already ran, or the standing hazard in item 7 already fired somewhere else.
    Stop and re-derive the whole packet; do not assume which case it is.
-4. **`SCHEMA_VERSION` in `src/db/migrations.ts` on main is no longer 34.** A new migration landed;
-   the chain-contiguity check and the dry-run target in item 3 must be redone against it.
+4. **`SCHEMA_VERSION` in `src/db/migrations.ts` on main is no longer the number item 1 recorded.**
+   A new migration landed; the chain-contiguity check and the dry-run target in item 3 must be
+   redone against it. **This tripwire has already fired.** Item 1 recorded 34. Measured
+   2026-09-02: `origin/main` declares `SCHEMA_VERSION = 36` and the live database is still at 25,
+   so the chain this packet would run is 25→36 — two steps longer than the prose it was drafted
+   with. Re-derive item 1's pins before executing anything; do not read a target version, a step
+   count, or an `applied-v25-v<to>` filename out of this document.
 
 ---
 
 ## Why the observation window needs a daemon, and the e2e cannot stand in
 
-`tests/e2e/real-component-integration.test.ts:123` creates its state root with `tempDir()`, so
+`tempDir()` in `tests/e2e/real-component-integration.test.ts` creates its state root, so
 every run writes a fresh `state.sqlite` and discards it. Running it thirty times produces thirty
 databases, not thirty counted lifecycles.
 

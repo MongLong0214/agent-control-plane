@@ -3940,6 +3940,170 @@ const GUARDS = [
     ],
   },
   {
+    // #747 — an approval is a capability over one database. Keyed by the directory it lives in,
+    // any database beside it spends it: measured, two v11 databases in one private directory,
+    // an approval taken on A, and B migrated on it with A's backup as the recovery point.
+    what: "an approval is spendable only on the database whose identity it names",
+    file: "src/db/migration-approval.ts",
+    find: "  if (!isSameTarget(approval.target, opened)) {",
+    replace: "  if (false) {",
+    killedBy: [
+      "tests/unit/an-approval-is-a-capability-over-one-database.test.ts::cannot be spent by opening a different database beside it",
+    ],
+  },
+  {
+    // A version and a checksum say the file is an intact database at the right schema. They do
+    // not say it is an image of *this* one, and a rollback from somebody else's image restores
+    // somebody else's data.
+    what: "an approved rollback point must be an image of the database it will roll back",
+    file: "src/db/backup.ts",
+    find: "  if (!isSameTarget(manifest.source, target)) {",
+    replace: "  if (false) {",
+    killedBy: [
+      "tests/unit/a-migration-approval.test.ts::is refused when its recovery point is an image of a different database at the same version",
+    ],
+  },
+  {
+    // The lock the daemon takes in `start()` is taken after the constructor has already
+    // migrated. Without this the schema is rewritten under a live holder of the database, and
+    // the contention is discovered afterwards.
+    what: "a migration holds the deployment's state lock while it runs",
+    file: "src/db/database.ts",
+    find: "    this.withMigrationExclusivity(() => {",
+    replace: "    ((work) => work())(() => {",
+    killedBy: [
+      "tests/unit/an-approval-is-a-capability-over-one-database.test.ts::refuses rather than rewriting the schema under the lock holder",
+    ],
+  },
+  {
+    // #747 round 3 — the version re-read above asks the open handle, and a handle survives its
+    // own name. Without this line a v11 database swapped in at the pathname passes that check
+    // (the handle still holds the unlinked original at 11) and the migration proceeds.
+    // Measured on the head before it: the replacement — which no approval named — came out at
+    // 34, the approved inode stayed at 11, and the approval was consumed.
+    what: "a migration re-resolves the pathname under the lock, not the open handle",
+    file: "src/db/database.ts",
+    find:
+      "      if (\n" +
+      "        !isSameTarget(underLock, approval.target) ||\n" +
+      "        (this.#openedTarget !== null && !isSameTarget(underLock, this.#openedTarget))\n" +
+      "      ) {",
+    replace: "      if (false) {",
+    killedBy: [
+      "tests/unit/an-approval-is-a-capability-over-one-database.test.ts::refuses under the lock, migrates neither file, and leaves the approval spendable",
+    ],
+  },
+  {
+    // Taking the lock and re-reading state under it are two different properties, and the row
+    // above only observes the first. Without this one, a second process that read version 11
+    // before the holder committed applies a chain that has already been applied — measured, it
+    // dies inside migration v12 and rolls back, so the harm is a failed start on a database
+    // that was already correct, not a silent corruption. Either way it is not the refusal the
+    // code claims to make.
+    what: "a migration re-reads the schema version under the lock before applying its chain",
+    file: "src/db/database.ts",
+    find:
+      "      const current = Number(this.#raw.pragma(\"user_version\", { simple: true }));\n" +
+      "      if (current !== version) {",
+    replace: "      const current = version;\n      if (false) {",
+    killedBy: [
+      "tests/unit/an-approval-is-a-capability-over-one-database.test.ts::refuses under the lock rather than re-running it, and the ledger records one run",
+    ],
+  },
+  {
+    // Filing the spent approval away is bookkeeping about a migration that already committed.
+    // Throwing from it reports a committed migration as a failed start, which is the state
+    // nothing could recognise.
+    what: "a failed approval retirement does not fail the start whose migration already committed",
+    file: "src/db/migration-approval.ts",
+    find:
+      "  try {\n" +
+      "    renameSync(approvalPath, retiredApprovalPath(approvalPath, from, to));\n" +
+      "    return { retired: true, approvalPath, error: null };\n" +
+      "  } catch (error) {",
+    replace:
+      "  try {\n" +
+      "    renameSync(approvalPath, retiredApprovalPath(approvalPath, from, to));\n" +
+      "    return { retired: true, approvalPath, error: null };\n" +
+      "  } catch (error) {\n" +
+      "    throw error;\n" +
+      "  }\n" +
+      "  if (false) {",
+    killedBy: [
+      "tests/unit/an-approval-is-a-capability-over-one-database.test.ts::does not turn a committed migration into a failed start",
+    ],
+  },
+  {
+    // #738 — the defect itself. Delete the approval check and the constructor migrates the
+    // database it just opened, which is what a restart under `KeepAlive`/`RunAtLoad` performs
+    // the moment a `pnpm build` in the deployment checkout changes the declared SCHEMA_VERSION.
+    // The mutant is the *previous* behaviour, verbatim.
+    what: "opening a database at an older version refuses instead of migrating it unapproved",
+    file: "src/db/database.ts",
+    find:
+      "    const approval = assertMigrationApproved(\n" +
+      "      this.file,\n" +
+      "      targetIdentityOf(this.file),\n" +
+      "      migrationPlanFrom(version),\n" +
+      "      this.options.migrationApproval ?? null,\n" +
+      "    );",
+    replace:
+      "    const approval =\n" +
+      "      this.options.migrationApproval ??\n" +
+      "      ({ fromVersion: version, toVersion: SCHEMA_VERSION } as MigrationApproval);",
+    killedBy: [
+      "tests/unit/a-restart-that-would-migrate.test.ts::refuses, leaves the database at its own version, and exits so the supervisor stops retrying",
+    ],
+  },
+  {
+    // A refusal that exits unsuccessfully is restarted by `KeepAlive { SuccessfulExit = false }`
+    // every `ThrottleInterval`, forever. The message improves and the loop does not.
+    what: "a refused migration exits successfully so launchd stops restarting the daemon",
+    file: "src/daemon/agentcpd.ts",
+    find: "  return { exitCode: 0, body: report, reportPath };",
+    replace: "  return { exitCode: 1, body: report, reportPath };",
+    killedBy: [
+      "tests/unit/a-restart-that-would-migrate.test.ts::refuses, leaves the database at its own version, and exits so the supervisor stops retrying",
+    ],
+  },
+  {
+    // An approval that does not have to name the chain is an approval of migrations in general.
+    what: "an approval must name the same ordered migrations the start would run",
+    file: "src/db/migration-approval.ts",
+    find: "    !sameOrderedIds(approval.migrations, plan.migrations)",
+    replace: "    false",
+    killedBy: [
+      "tests/unit/a-migration-approval.test.ts::is refused when it approves a shorter chain than the one that would run",
+    ],
+  },
+  {
+    // The single automatic pre-migration snapshot is the only recovery point for the whole
+    // chain, and v26..v28 include DROP TABLE. Dropping this check leaves the approval resting
+    // on a path nobody validated.
+    what: "an approval must name a validated recovery point at the version the chain starts from",
+    file: "src/db/migration-approval.ts",
+    find: "  assertRollbackPointAt(approval.backupPath, plan.fromVersion, approval.target);",
+    replace: "",
+    killedBy: [
+      "tests/unit/a-migration-approval.test.ts::is refused when its recovery point is not an image of the version this migration starts from",
+    ],
+  },
+  {
+    // During a refusal there is no operator socket and no doctor, because both need the
+    // ControlPlane that could not open the database. This reading is the whole observation
+    // surface, and dropping it leaves the owner with an unreachable socket and no reason.
+    what: "the offline daemon status reports a migration refusal when nothing else can",
+    file: "src/cli/agentctl.ts",
+    find:
+      "      migrationRefusal: existsSync(refusalPath)\n" +
+      "        ? (JSON.parse(readFileSync(refusalPath, \"utf8\")) as unknown)\n" +
+      "        : null,",
+    replace: "      migrationRefusal: null,",
+    killedBy: [
+      "tests/unit/a-restart-that-would-migrate.test.ts::still answers an offline observation with the refusal, because no socket and no doctor survive it",
+    ],
+  },
+  {
     // Issue #246 — a producer forbidden from writing to GitHub still has to answer a plan
     // that calls for one. Honestly receipting a GitHub operation requires performing it,
     // which this producer never does, so it refuses the whole plan instead. Neutering the
