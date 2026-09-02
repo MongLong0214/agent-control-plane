@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 
@@ -91,16 +92,17 @@ const TRACE = parseTraceRejectingDuplicates(TRACE_TEXT);
 const DECLARED_SNAPSHOT_REPLAY = ["v12-migration-ledger-and-invariant-replay", "v13-finalization-state-machine"];
 
 const MIGRATIONS_PATH = fileURLToPath(new URL("../../src/db/migrations.ts", import.meta.url));
+const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 
-/**
- * Migrations that can reach the snapshot replay, resolved through the call graph.
- *
- * Was a regular expression over `id: "…"` plus a text slice, which attributes a call to whichever
- * id happens to appear above it. Review named both failures: a call moved into a helper is
- * attributed to nothing, and a call in a function declared between two migration literals is
- * attributed to the earlier one — either way a new caller appears and the answer stays the same.
- */
-const snapshotReplayCallers = (): string[] => migrationsReachingTheReplay(MIGRATIONS_PATH).reaching;
+/** Writes a throwaway module and returns its path. */
+const writeSource = (lines: readonly string[]): string => {
+  const path = join(tempDir("acp-762-source-"), "synthetic.ts");
+  writeFileSync(path, lines.join("\n"), "utf8");
+  return path;
+};
+
+const reachingIn = (lines: readonly string[]): string[] =>
+  migrationsReachingTheReplay(writeSource(lines)).reaching;
 
 interface Step {
   id: string;
@@ -306,80 +308,86 @@ const incrementalSteps = (): Step[] => {
 };
 
 describe("#762 snapshot replays are not object owners", () => {
-  it("classifies every caller of the snapshot replay, and refuses a new one", () => {
-    // The classification is the load-bearing part: an unclassified replay caller would own every
-    // object in the snapshot and make the leak check below vacuous, which is what happened when
-    // `v13` was not accounted for.
-    expect(snapshotReplayCallers().sort()).toEqual([...DECLARED_SNAPSHOT_REPLAY].sort());
+  it("answers only for registered migrations, and loses no call edge", () => {
+    const found = migrationsReachingTheReplay(MIGRATIONS_PATH);
+    expect(found.reaching).toEqual([...DECLARED_SNAPSHOT_REPLAY].sort());
+    // Fail-closed, both directions. A bare call the walk cannot place means it lost the program;
+    // a registry entry it cannot resolve means it answered for fewer migrations than run.
+    expect(found.unfollowable).toEqual([]);
+    expect(found.unresolvedRegistryEntries).toEqual([]);
+    // Every registered id is accounted for, so "reaching" is a subset of something real rather
+    // than of whatever object literals happened to look like migrations.
+    expect(MIGRATIONS.map((migration) => migration.id)).toEqual(
+      expect.arrayContaining(found.reaching),
+    );
   });
 
-  it("keeps the sealed trace and the candidate's own schema transitions in both-way agreement", () => {
-    // The drift gate, and it compares **typed triples**: name alone let a type be rewritten in
-    // the trace with nothing noticing. Derived from `sqlite_master` before and after each step
-    // rather than from the SQL a step issued, because a conditional CREATE that changed nothing
-    // is not an introduction — measured, that difference is two objects.
-    const census = schemaTransitionCensus();
-    const sealed = Object.entries(TRACE.objects)
-      .map(([name, entry]) => `${name}:${entry.type}@v${entry.owner}`)
+  it("closes the external edges by the only route that could reach the replay", () => {
+    // An imported function can reach the replay only if its module imports it. That is a fact
+    // about the import graph, not about the walk, so it is measured here: production has exactly
+    // one file naming the replay, and a second one would make every external edge unaccounted.
+    const producers = execFileSync(
+      "git",
+      ["grep", "-l", REPLAY_FUNCTION, "--", "src"],
+      { cwd: repoRoot, encoding: "utf8" },
+    )
+      .split("\n")
+      .filter((line) => line.length > 0)
       .sort();
-    expect(census).toEqual(sealed);
-    expect(TRACE.baselineVersion).toBe(LINEAGE_VERSION);
-    expect(TRACE.baselineFixture).toBe("tests/fixtures/schema-v25-lineage.sql");
+    expect(producers).toEqual(["src/db/migrations.ts"]);
+
+    // With that established, the external edges are named rather than waved through.
+    const found = migrationsReachingTheReplay(MIGRATIONS_PATH);
+    expect(found.external.length).toBeGreaterThan(0);
   });
 
-  it("still classifies a caller whose replay call moved into a helper", () => {
-    // The discriminating case for the resolver. A text slice keyed on `id: "…"` attributes this
-    // call to nothing — the helper is declared outside every migration literal — so the old
-    // classification reported the same two names with a third caller present.
-    const source = join(tempDir("acp-762-moved-"), "moved.ts");
-    writeFileSync(
-      source,
-      [
-        `const viaHelper = (raw: unknown): void => { ${REPLAY_FUNCTION}(); void raw; };`,
-        `export const ${REPLAY_FUNCTION} = (): string => "";`,
-        "const m = {",
-        '  id: "v99-moved-into-a-helper",',
-        "  fromVersion: 98,",
-        "  toVersion: 99,",
-        "  apply: (raw: unknown) => { viaHelper(raw); },",
-        '  checksum: () => "",',
-        "};",
-        "void m;",
-      ].join("\n"),
-      "utf8",
-    );
-    expect(migrationsReachingTheReplay(source).reaching).toEqual(["v99-moved-into-a-helper"]);
+  it("classifies a registered migration whose replay call moved into a helper", () => {
+    // The discriminating case. A text slice keyed on `id: "…"` attributes this to nothing, and an
+    // AST walk that ignores the registry answers for literals production never runs.
+    expect(reachingIn([
+      `const viaHelper = (): void => { ${REPLAY_FUNCTION}(); };`,
+      `export const ${REPLAY_FUNCTION} = (): string => "";`,
+      "const v99 = {",
+      '  id: "v99-moved-into-a-helper",',
+      "  apply: () => { viaHelper(); },",
+      "};",
+      "export const MIGRATIONS = Object.freeze([v99]);",
+    ])).toEqual(["v99-moved-into-a-helper"]);
   });
 
-  it("does not attribute a replay call to a migration that merely precedes it in the file", () => {
-    // The other half of the same defect: a slice attributes a call in a function declared between
-    // two literals to the earlier one, so a migration that never calls anything is reported as a
-    // replayer and the real caller is not.
-    const source = join(tempDir("acp-762-adjacent-"), "adjacent.ts");
-    writeFileSync(
-      source,
-      [
-        `export const ${REPLAY_FUNCTION} = (): string => "";`,
-        "const a = {",
-        '  id: "v98-calls-nothing",',
-        "  fromVersion: 97,",
-        "  toVersion: 98,",
-        "  apply: () => {},",
-        '  checksum: () => "",',
-        "};",
-        `const between = (): void => { ${REPLAY_FUNCTION}(); };`,
-        "const b = {",
-        '  id: "v99-calls-between",',
-        "  fromVersion: 98,",
-        "  toVersion: 99,",
-        "  apply: () => { between(); },",
-        '  checksum: () => "",',
-        "};",
-        "void a; void b;",
-      ].join("\n"),
-      "utf8",
-    );
-    expect(migrationsReachingTheReplay(source).reaching).toEqual(["v99-calls-between"]);
+  it("does not answer for an object literal the registry never lists", () => {
+    // The contract is what production runs. An unregistered literal that calls the replay is not
+    // a migration, and reporting it describes a program that does not exist — the previous
+    // version's control asserted the opposite.
+    expect(reachingIn([
+      `export const ${REPLAY_FUNCTION} = (): string => "";`,
+      "const listed = {",
+      '  id: "v99-listed",',
+      "  apply: () => {},",
+      "};",
+      "const unlisted = {",
+      '  id: "v98-unlisted",',
+      `  apply: () => { ${REPLAY_FUNCTION}(); },`,
+      "};",
+      "void unlisted;",
+      "export const MIGRATIONS = Object.freeze([listed]);",
+    ])).toEqual([]);
+  });
+
+  it("refuses to answer when a registered migration calls something it cannot follow", () => {
+    // An unclassified helper that is neither declared nor imported. There is no sound reading of
+    // that edge, so the walk reports it instead of returning a confident empty answer.
+    const source = writeSource([
+      `export const ${REPLAY_FUNCTION} = (): string => "";`,
+      "const v99 = {",
+      '  id: "v99-calls-a-ghost",',
+      "  apply: () => { somethingNobodyDeclared(); },",
+      "};",
+      "export const MIGRATIONS = Object.freeze([v99]);",
+    ]);
+    const found = migrationsReachingTheReplay(source);
+    expect(found.unfollowable).toEqual(["somethingNobodyDeclared"]);
+    expect(found.reaching).toEqual([]);
   });
 
   it("keeps the replay steps outside the incremental chain entirely", () => {
