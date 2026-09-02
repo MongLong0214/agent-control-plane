@@ -105,11 +105,13 @@ static void acp_mutex_init(void) {
   pthread_mutexattr_t attributes;
   if (pthread_mutexattr_init(&attributes) != 0) return;
   if (pthread_mutexattr_settype(&attributes, PTHREAD_MUTEX_RECURSIVE) != 0) {
-    (void)pthread_mutexattr_destroy(&attributes);
+    /* Already failing; the destroy result cannot change that, but it is read rather than voided so
+       no line here claims a result it did not look at. */
+    if (pthread_mutexattr_destroy(&attributes) != 0) return;
     return;
   }
   if (pthread_mutex_init(&acp_mutex, &attributes) != 0) {
-    (void)pthread_mutexattr_destroy(&attributes);
+    if (pthread_mutexattr_destroy(&attributes) != 0) return;
     return;
   }
   /* Checked like every other step: a destroy that fails means the attributes object is in an
@@ -156,7 +158,9 @@ static int acp_state_unlock(void) {
 #ifdef ACP_FD_VFS_TESTING
   if (acp_test_unlock_fails > 0) {
     acp_test_unlock_fails -= 1;
-    pthread_mutex_unlock(&acp_mutex);
+    /* Checked like the real one: the seam simulates a failed release, it does not get to skip
+       releasing, and an unnoticed failure here would be the same defect wearing a test hat. */
+    if (pthread_mutex_unlock(&acp_mutex) != 0) { /* already the failure being simulated */ }
     acp_mutex_ready = 0;
     return 0;
   }
@@ -404,27 +408,52 @@ static int acp_is_bound_sibling(const char *path) {
   return strncmp(path, acp_binding.path, n) == 0 && path[n] == '-';
 }
 
+#ifdef ACP_FD_VFS_TESTING
+/*
+ * What the last `xClose` returned.
+ *
+ * `sqlite3_close` does not surface a VFS close failure to its caller — SQLite discards the result
+ * on most paths — so a test that watches the connection's close cannot see this at all. The
+ * requirement is about what `xClose` returns, so that is what is recorded and asserted.
+ */
+static int acp_last_close_rc = -1;
+#endif
+
 static int acp_close(sqlite3_file *file) {
   AcpFile *f = (AcpFile *)file;
+  int outcome = SQLITE_OK;
   if (f->delete_on_close && f->dir_fd >= 0 && f->base[0]) {
     unlinkat(f->dir_fd, f->base, 0);
   }
   if (f->owned_by_binding) {
-    /* Balanced against the increment in `xOpen`, under the same lock, so "already open" means
-       currently open rather than ever opened. */
+    /* Balanced against the increment in `xOpen`, under the same lock, so the live count means
+       currently open. */
     if (acp_state_lock()) {
       if (acp_binding.live_files > 0) acp_binding.live_files -= 1;
-      (void)acp_state_unlock();
+      /*
+       * The count has already moved, so a failed release here leaves the accounting unprotected.
+       * Reporting `SQLITE_OK` after that was a false success: the caller was told the file closed
+       * cleanly while the state describing it was no longer guarded by anything. Ownership is
+       * cleared exactly once either way — the decrement happened — and the descriptors below are
+       * still closed, so the answer is "closed, but the outcome is not trustworthy".
+       */
+      if (!acp_state_unlock()) outcome = SQLITE_IOERR_CLOSE;
       f->owned_by_binding = 0;
+    } else {
+      /* The lock was already gone before the decrement, so the count is left as it is: a release
+         is refused while anything is open, which keeps the binding held rather than freeing it
+         wrongly. The close is still not a success. */
+      outcome = SQLITE_IOERR_CLOSE;
     }
-    /* If the lock is gone the count stays as it is: a release is already refused while anything is
-       open, so an unbalanced count keeps this binding held rather than freeing it wrongly. */
   }
   if (f->dir_fd >= 0) close(f->dir_fd);
   f->dir_fd = -1;
   if (f->fd >= 0) close(f->fd);
   f->fd = -1;
-  return SQLITE_OK;
+#ifdef ACP_FD_VFS_TESTING
+  acp_last_close_rc = outcome;
+#endif
+  return outcome;
 }
 
 static int acp_read(sqlite3_file *file, void *buf, int n, sqlite3_int64 offset) {
@@ -675,7 +704,7 @@ static int acp_delete(sqlite3_vfs *vfs, const char *path, int sync_dir) {
   if (acp_binding.active && path && acp_is_bound_sibling(path)) {
     acp_binding.deletes++;
     if (unlinkat(acp_binding.dir_fd, acp_basename(path), 0) != 0 && errno != ENOENT) {
-      (void)acp_state_unlock();
+      if (!acp_state_unlock()) return SQLITE_IOERR_DELETE;
       return SQLITE_IOERR_DELETE;
     }
     if (sync_dir) {
@@ -694,7 +723,7 @@ static int acp_delete(sqlite3_vfs *vfs, const char *path, int sync_dir) {
       int failed = fsync(acp_binding.dir_fd) != 0;
 #endif
       if (failed) {
-        (void)acp_state_unlock();
+        if (!acp_state_unlock()) return SQLITE_IOERR_DELETE;
         return SQLITE_IOERR_DIR_FSYNC;
       }
     }
@@ -756,7 +785,10 @@ static void acp_fn_bind(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     return;
   }
   if (acp_binding.active) {
-    (void)acp_state_unlock();
+    if (!acp_state_unlock()) {
+      sqlite3_result_error(ctx, "the state lock failed while refusing a second binding", -1);
+      return;
+    }
     sqlite3_result_error(
         ctx, "a binding is already active; release it with its lease before taking another", -1);
     return;
@@ -765,7 +797,10 @@ static void acp_fn_bind(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   acp_seam_arrive();
   unsigned char minted[ACP_LEASE_BYTES];
   if (!acp_random_bytes(minted, sizeof minted)) {
-    (void)acp_state_unlock();
+    if (!acp_state_unlock()) {
+      sqlite3_result_error(ctx, "the state lock failed while refusing to bind", -1);
+      return;
+    }
     sqlite3_result_error(ctx, "could not obtain entropy for a lease; refusing to bind", -1);
     return;
   }
@@ -825,12 +860,18 @@ static void acp_fn_unbind(sqlite3_context *ctx, int argc, sqlite3_value **argv) 
   if (!acp_binding.active) {
     /* Releasing nothing is not an error: a bracket must be able to run its release without having
        to know whether the acquire got that far. */
-    (void)acp_state_unlock();
+    if (!acp_state_unlock()) {
+      sqlite3_result_error(ctx, "the state lock failed while releasing nothing", -1);
+      return;
+    }
     sqlite3_result_int(ctx, 0);
     return;
   }
   if (!acp_lease_held || !acp_same_lease(candidate)) {
-    (void)acp_state_unlock();
+    if (!acp_state_unlock()) {
+      sqlite3_result_error(ctx, "the state lock failed while refusing a release", -1);
+      return;
+    }
     sqlite3_result_error(ctx, "that lease does not hold the active binding", -1);
     return;
   }
@@ -841,7 +882,10 @@ static void acp_fn_unbind(sqlite3_context *ctx, int argc, sqlite3_value **argv) 
      * describes anything. Refusing is the honest answer — the holder still has the connection and
      * can close it — and it removes the whole class rather than making the close defensive.
      */
-    (void)acp_state_unlock();
+    if (!acp_state_unlock()) {
+      sqlite3_result_error(ctx, "the state lock failed while refusing a release", -1);
+      return;
+    }
     sqlite3_result_error(
         ctx, "a file of this binding is still open; close it before releasing", -1);
     return;
@@ -859,6 +903,12 @@ static void acp_fn_unbind(sqlite3_context *ctx, int argc, sqlite3_value **argv) 
 }
 
 #ifdef ACP_FD_VFS_TESTING
+
+/** Reports what the last `xClose` returned, or -1 if none has run. Test-only. */
+static void acp_fn_last_close_rc(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  (void)argc; (void)argv;
+  sqlite3_result_int(ctx, acp_last_close_rc);
+}
 
 /** Arms `n` forced unlock failures. Test-only; see `acp_state_unlock`. */
 static void acp_fn_test_break_unlock(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
@@ -950,7 +1000,10 @@ static void acp_fn_probe_refusal_methods(sqlite3_context *ctx, int argc, sqlite3
     return;
   }
   int active = acp_binding.active;
-  (void)acp_state_unlock();
+  if (!acp_state_unlock()) {
+    sqlite3_result_text(ctx, "lock unavailable", -1, SQLITE_TRANSIENT);
+    return;
+  }
   if (!active) {
     sqlite3_result_text(ctx, "no binding", -1, SQLITE_TRANSIENT);
     return;
@@ -991,7 +1044,10 @@ static void acp_fn_probe_dir_sync(sqlite3_context *ctx, int argc, sqlite3_value 
   int active = acp_binding.active;
   char journal[ACP_MAX_PATH + 16];
   if (active) snprintf(journal, sizeof journal, "%s-journal", acp_binding.path);
-  (void)acp_state_unlock();
+  if (!acp_state_unlock()) {
+    sqlite3_result_text(ctx, "lock unavailable", -1, SQLITE_TRANSIENT);
+    return;
+  }
   if (!active) {
     sqlite3_result_text(ctx, "no binding", -1, SQLITE_TRANSIENT);
     return;
@@ -1088,7 +1144,9 @@ int sqlite3_extension_init(sqlite3 *db, char **err, const sqlite3_api_routines *
       sqlite3_create_function(db, "acp_fd_test_break_lock", 1, SQLITE_UTF8, 0,
                               acp_fn_test_break_lock, 0, 0) != SQLITE_OK ||
       sqlite3_create_function(db, "acp_fd_test_break_unlock", 1, SQLITE_UTF8, 0,
-                              acp_fn_test_break_unlock, 0, 0) != SQLITE_OK) {
+                              acp_fn_test_break_unlock, 0, 0) != SQLITE_OK ||
+      sqlite3_create_function(db, "acp_fd_last_close_rc", 0, SQLITE_UTF8, 0,
+                              acp_fn_last_close_rc, 0, 0) != SQLITE_OK) {
     return SQLITE_ERROR;
   }
 #endif
@@ -1100,7 +1158,9 @@ int sqlite3_extension_init(sqlite3 *db, char **err, const sqlite3_api_routines *
   if (acp_parent == 0) {
     acp_parent = sqlite3_vfs_find(0);
     if (acp_parent == 0) {
-      (void)acp_state_unlock();
+      if (!acp_state_unlock()) {
+        if (err) *err = sqlite3_mprintf("acp-fd-vfs could not release its state lock during load");
+      }
       return SQLITE_ERROR;
     }
     acp_shim = *acp_parent;
@@ -1112,7 +1172,9 @@ int sqlite3_extension_init(sqlite3 *db, char **err, const sqlite3_api_routines *
     if ((int)sizeof(AcpFile) > acp_shim.szOsFile) acp_shim.szOsFile = (int)sizeof(AcpFile);
     int rc = sqlite3_vfs_register(&acp_shim, 1);
     if (rc != SQLITE_OK) {
-      (void)acp_state_unlock();
+      if (!acp_state_unlock()) {
+        if (err) *err = sqlite3_mprintf("acp-fd-vfs could not release its state lock during load");
+      }
       return rc;
     }
   }

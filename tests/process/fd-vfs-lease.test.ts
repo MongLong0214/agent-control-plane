@@ -690,6 +690,60 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
     closeSync(a.mainFd);
   }, 300_000);
 
+  it("does not report a clean close when the release of the lock fails", () => {
+    // xClose decrements the live count and then released the lock without looking at the result,
+    // so a close could return SQLITE_OK while the accounting it had just moved was no longer
+    // guarded by anything. Measured before the fix: close_rc=0 with the lock already unavailable —
+    // a false success, and the earliest wrong effect on this path.
+    const a = held("closefail");
+    const artifact = buildTestingArtifact();
+    const dir = tempDir("acp-u6-closefail-");
+    chmodSync(dir, 0o700);
+    const script = join(dir, "closefail.mjs");
+    writeFileSync(
+      script,
+      [
+        `import { openSync } from "node:fs";`,
+        `import { dirname } from "node:path";`,
+        `const Database = (await import(${JSON.stringify(createRequire(import.meta.url).resolve("better-sqlite3"))})).default;`,
+        `const db = new Database(":memory:");`,
+        `db.loadExtension(${JSON.stringify(artifact)});`,
+        `const path = ${JSON.stringify(a.path)};`,
+        `const mainFd = openSync(path, "r+");`,
+        `const dirFd = openSync(dirname(path), "r");`,
+        `db.prepare("SELECT acp_fd_bind(?, ?, ?) AS l").get(path, mainFd, dirFd);`,
+        `const bound = new Database(path);`,
+        `// Arm the failure so it lands on the release inside xClose, after the decrement.`,
+        `db.prepare("SELECT acp_fd_test_break_unlock(?) AS n").get(1);`,
+        `bound.close();`,
+        `// sqlite3_close discards a VFS close failure, so the connection's own close says nothing.`,
+        `// What the requirement is about is the value xClose returned, and that is what is read.`,
+        `const closeRc = db.prepare("SELECT acp_fd_last_close_rc() AS p").get().p;`,
+        `const post = db.prepare("SELECT acp_fd_stats() AS p").get().p;`,
+        `process.stdout.write(JSON.stringify({ closeRc, post }));`,
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+    const run = spawnSync(process.execPath, ["--import", "tsx", script], {
+      encoding: "utf8",
+      timeout: 60_000,
+      killSignal: "SIGKILL",
+    });
+    expect(run.signal, "the close-failure child had to be killed").toBe(null);
+    expect(run.status, `close-failure child failed: ${run.stderr}`).toBe(0);
+    const report = JSON.parse(run.stdout) as { closeRc: number; post: string };
+
+    // SQLITE_IOERR_CLOSE is 4106 — SQLITE_IOERR (10) with extended code 16. Not SQLITE_OK, which
+    // is what it used to return once the lock behind its own bookkeeping was gone.
+    expect(report.closeRc, "xClose reported success after a failed release").toBe(4106);
+    // And the state really is unguarded afterwards, which is what makes the report a lie rather
+    // than a harmless quibble.
+    expect(report.post).toBe("lock unavailable");
+
+    closeSync(a.dirFd);
+    closeSync(a.mainFd);
+  }, 300_000);
+
   it("refuses to release while the bound database is still open", () => {
     // The lifetime, made explicit. A release while a file is still open leaves that file holding
     // descriptors whose owner has gone, and its close would have to consult state that no longer
