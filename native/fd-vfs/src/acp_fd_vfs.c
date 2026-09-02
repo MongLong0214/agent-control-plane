@@ -102,67 +102,150 @@ static void acp_mutex_init(void) {
   pthread_mutexattr_destroy(&attributes);
 }
 
+/* Declared before use: in the shipping build these are nothing at all. */
+#ifdef ACP_FD_VFS_TESTING
+static void acp_seam_enter_lock_queue(void);
+static void acp_seam_leave_lock_queue(void);
+static void acp_seam_arrive(void);
+#else
+#define acp_seam_enter_lock_queue() ((void)0)
+#define acp_seam_leave_lock_queue() ((void)0)
+#define acp_seam_arrive() ((void)0)
+#endif
+
 static void acp_state_lock(void) {
   pthread_once(&acp_mutex_once, acp_mutex_init);
+  acp_seam_enter_lock_queue();
   pthread_mutex_lock(&acp_mutex);
+  acp_seam_leave_lock_queue();
 }
 
 static void acp_state_unlock(void) { pthread_mutex_unlock(&acp_mutex); }
 
 /*
- * A rendezvous inside `bind`, compiled only into the test artifact.
+ * A rendezvous inside `bind`, compiled only into the test artifact, driven by the parent.
  *
- * Without it the race test is a coin toss: measured across forty rounds with the lock removed,
- * only three produced a double binding, so an eight-round test would have missed the defect about
- * half the time. A test that detects a real race half the time is not evidence about the race.
+ * The first version used a timeout as its authority: the arriving thread waited a second, and with
+ * the lock held the second thread could not arrive, so the first proceeded when the clock said so.
+ * That makes elapsed time the evidence, and it cannot show the mutant deterministically either —
+ * measured, with the lock removed, forty unsynchronised rounds produced a double binding only
+ * three times.
  *
- * Armed for N arrivals, the first thread to reach the point just after the active-check waits for
- * the others. With the lock in place they cannot arrive — they are still queued on it — so the
- * first times out and proceeds alone, and exactly one bind succeeds. With the lock removed both
- * arrive at once, both have already passed the active-check, and both bind. The outcome is decided
- * by whether the lock exists rather than by scheduling luck.
+ * So the parent decides. Two counters are published: how many threads have reached the seam, and
+ * how many are queued for the state lock. Both worlds then have a definite predicate the parent can
+ * wait for rather than a duration:
+ *
+ *   - with the lock: one thread arrives and the other is queued  (arrived >= 1 && waiters >= 1)
+ *   - without it:    both threads arrive                          (arrived >= 2)
+ *
+ * The parent releases once its predicate holds and then joins both workers, so the assertion runs
+ * against finished threads rather than against a hope about timing. These counters live under
+ * their own mutex — never the state lock — because the parent has to be able to read them while a
+ * worker is inside the critical section.
  */
 #ifdef ACP_FD_VFS_TESTING
-static pthread_mutex_t acp_barrier_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t acp_barrier_cond = PTHREAD_COND_INITIALIZER;
-static int acp_barrier_want = 0;
-static int acp_barrier_arrived = 0;
+static pthread_mutex_t acp_seam_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t acp_seam_cond = PTHREAD_COND_INITIALIZER;
+static int acp_seam_armed = 0;
+static int acp_seam_arrived = 0;
+static int acp_seam_released = 0;
+static int acp_seam_waiters = 0;
 
-static void acp_barrier_wait(void) {
-  if (acp_barrier_want <= 0) return;
-  pthread_mutex_lock(&acp_barrier_mutex);
-  acp_barrier_arrived += 1;
-  if (acp_barrier_arrived >= acp_barrier_want) {
-    pthread_cond_broadcast(&acp_barrier_cond);
-  } else {
-    struct timespec deadline;
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_sec += 1;
-    pthread_cond_timedwait(&acp_barrier_cond, &acp_barrier_mutex, &deadline);
-  }
-  pthread_mutex_unlock(&acp_barrier_mutex);
+static void acp_seam_enter_lock_queue(void) {
+  pthread_mutex_lock(&acp_seam_mutex);
+  if (acp_seam_armed) acp_seam_waiters += 1;
+  pthread_mutex_unlock(&acp_seam_mutex);
 }
-#else
-#define acp_barrier_wait() ((void)0)
+
+static void acp_seam_leave_lock_queue(void) {
+  pthread_mutex_lock(&acp_seam_mutex);
+  if (acp_seam_armed && acp_seam_waiters > 0) acp_seam_waiters -= 1;
+  pthread_mutex_unlock(&acp_seam_mutex);
+}
+
+static void acp_seam_arrive(void) {
+  pthread_mutex_lock(&acp_seam_mutex);
+  if (!acp_seam_armed) {
+    pthread_mutex_unlock(&acp_seam_mutex);
+    return;
+  }
+  acp_seam_arrived += 1;
+  pthread_cond_broadcast(&acp_seam_cond);
+  while (!acp_seam_released) pthread_cond_wait(&acp_seam_cond, &acp_seam_mutex);
+  pthread_mutex_unlock(&acp_seam_mutex);
+}
 #endif
 
-static unsigned char acp_lease[ACP_LEASE_BYTES];
+static unsigned char acp_lease[ACP_LEASE_BYTES];static unsigned char acp_lease[ACP_LEASE_BYTES];
 static int acp_lease_held = 0;
 
-/** Fills `out` from the kernel's entropy source. Returns 0 on failure; the caller must refuse. */
+/*
+ * Syscall seams, compiled only into the test artifact.
+ *
+ * The entropy path has three failure modes that never occur on a healthy machine and all of which
+ * decide whether a lease is trustworthy: a short read, an interrupted read, and a close that
+ * fails. Without a way to induce them the retry and the cleanup ship unexecuted, which is the
+ * condition they exist for. The seams are one-shot counters, absent from the shipping build, and
+ * they can only make entropy collection *fail* — never succeed with weaker bytes.
+ */
+#ifdef ACP_FD_VFS_TESTING
+static int acp_test_short_reads = 0;   /* serve one byte at a time for this many reads */
+static int acp_test_eintr_reads = 0;   /* fail this many reads with EINTR before serving */
+static int acp_test_close_fails = 0;   /* report the descriptor close as failed */
+#endif
+
+static ssize_t acp_entropy_read(int fd, unsigned char *out, size_t want) {
+#ifdef ACP_FD_VFS_TESTING
+  if (acp_test_eintr_reads > 0) {
+    acp_test_eintr_reads -= 1;
+    errno = EINTR;
+    return -1;
+  }
+  if (acp_test_short_reads > 0) {
+    acp_test_short_reads -= 1;
+    want = 1;
+  }
+#endif
+  return read(fd, out, want);
+}
+
+static int acp_entropy_close(int fd) {
+#ifdef ACP_FD_VFS_TESTING
+  if (acp_test_close_fails > 0) {
+    acp_test_close_fails -= 1;
+    close(fd);
+    return -1;
+  }
+#endif
+  return close(fd);
+}
+
+/**
+ * Fills `out` from the kernel's entropy source. Returns 0 on failure; the caller must refuse.
+ *
+ * An interrupted read is retried rather than treated as failure — `read` returning -1 with EINTR
+ * has produced no bytes and says nothing about the source. A close that fails is treated as
+ * failure even though the bytes are already in hand: this is the one place where being wrong is
+ * unrecoverable, and refusing to bind costs an operator a retry.
+ */
 static int acp_random_bytes(unsigned char *out, size_t count) {
   int fd = open("/dev/urandom", O_RDONLY);
   if (fd < 0) return 0;
   size_t filled = 0;
   while (filled < count) {
-    ssize_t got = read(fd, out + filled, count - filled);
-    if (got <= 0) {
-      close(fd);
+    ssize_t got = acp_entropy_read(fd, out + filled, count - filled);
+    if (got < 0) {
+      if (errno == EINTR) continue;
+      acp_entropy_close(fd);
+      return 0;
+    }
+    if (got == 0) {
+      acp_entropy_close(fd);
       return 0;
     }
     filled += (size_t)got;
   }
-  close(fd);
+  if (acp_entropy_close(fd) != 0) return 0;
   return 1;
 }
 
@@ -175,7 +258,14 @@ static void acp_to_hex(const unsigned char *bytes, size_t count, char *out) {
   out[count * 2] = '\0';
 }
 
-/** Strict hex decode: exactly `count` bytes from `2*count` lowercase-or-uppercase hex digits. */
+/**
+ * Strict decode: exactly `count` bytes from `2*count` **lowercase** hex digits.
+ *
+ * Uppercase was accepted, and review used it: `acp_fd_unbind(upper(lease))` released the binding
+ * from a second connection. A capability with more than one spelling has more than one holder in
+ * every sense that matters — the lease is minted in exactly one form, so exactly one form is
+ * accepted, and `A`-`F` is a refusal rather than an alias.
+ */
 static int acp_from_hex(const char *text, size_t chars, unsigned char *out, size_t count) {
   if (chars != count * 2) return 0;
   for (size_t i = 0; i < count; i += 1) {
@@ -185,7 +275,6 @@ static int acp_from_hex(const char *text, size_t chars, unsigned char *out, size
       int value;
       if (c >= '0' && c <= '9') value = c - '0';
       else if (c >= 'a' && c <= 'f') value = c - 'a' + 10;
-      else if (c >= 'A' && c <= 'F') value = c - 'A' + 10;
       else return 0;
       if (half == 0) high = value; else low = value;
     }
@@ -219,7 +308,8 @@ static struct {
   char path[ACP_MAX_PATH];
   dev_t dev;
   ino_t ino;
-  int main_opens;
+  int main_opens;   /* cumulative, for observation */
+  int main_live;    /* currently open, for the cap */
   int journal_opens;
   int deletes;
   int dir_syncs;
@@ -228,10 +318,21 @@ static struct {
 } acp_binding;
 
 typedef struct AcpFile AcpFile;
+/**
+ * What one open file needs, held on the file rather than read back off the binding.
+ *
+ * `xClose` used to consult the global binding for the directory descriptor it unlinks through. A
+ * release is allowed to happen while a file is still open, and it clears exactly those fields — so
+ * a close racing a valid unbind could unlink through a descriptor that had been cleared, or worse,
+ * reused for something else by then. A file that carries its own duplicate of the directory
+ * descriptor does not need the binding to still exist, and closing it touches nothing shared.
+ */
 struct AcpFile {
   const sqlite3_io_methods *pMethods;
   int fd;
+  int dir_fd;            /* this file's own duplicate; -1 when it needs none */
   int delete_on_close;
+  int counts_as_main;    /* so the live-open accounting is balanced by this file's own close */
   char base[ACP_MAX_BASE];
 };
 
@@ -258,9 +359,19 @@ static int acp_is_bound_sibling(const char *path) {
 
 static int acp_close(sqlite3_file *file) {
   AcpFile *f = (AcpFile *)file;
-  if (f->delete_on_close && acp_binding.active && f->base[0]) {
-    unlinkat(acp_binding.dir_fd, f->base, 0);
+  if (f->delete_on_close && f->dir_fd >= 0 && f->base[0]) {
+    unlinkat(f->dir_fd, f->base, 0);
   }
+  if (f->counts_as_main) {
+    /* Balanced against the increment in `xOpen`, under the same lock, so "already open" means
+       currently open rather than ever opened. */
+    acp_state_lock();
+    if (acp_binding.main_live > 0) acp_binding.main_live -= 1;
+    acp_state_unlock();
+    f->counts_as_main = 0;
+  }
+  if (f->dir_fd >= 0) close(f->dir_fd);
+  f->dir_fd = -1;
   if (f->fd >= 0) close(f->fd);
   f->fd = -1;
   return SQLITE_OK;
@@ -377,7 +488,7 @@ static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int 
       acp_state_unlock();
       return SQLITE_CANTOPEN;
     }
-    if (acp_binding.main_opens > 0) {
+    if (acp_binding.main_live > 0) {
       /* One lease, one connection. Two connections on one descriptor share a file position and a
          lock state that neither of them is tracking, and "the connection this binding is for"
          stops naming anything. */
@@ -393,6 +504,7 @@ static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int 
       return SQLITE_CANTOPEN;
     }
     memset(f, 0, sizeof *f);
+    f->dir_fd = -1;
     f->fd = dup(acp_binding.main_fd);
     if (f->fd < 0) {
       acp_refuse("could not duplicate the bound descriptor");
@@ -401,7 +513,9 @@ static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int 
     }
     f->pMethods = &acp_io_methods;
     if (out) *out = SQLITE_OPEN_READWRITE;
+    f->counts_as_main = 1;
     acp_binding.main_opens++;
+    acp_binding.main_live++;
     acp_state_unlock();
     return SQLITE_OK;
   }
@@ -429,6 +543,13 @@ static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int 
       return SQLITE_CANTOPEN;
     }
     memset(f, 0, sizeof *f);
+    f->dir_fd = dup(acp_binding.dir_fd);
+    if (f->dir_fd < 0) {
+      close(fd);
+      acp_refuse("could not duplicate the bound directory descriptor");
+      acp_state_unlock();
+      return SQLITE_CANTOPEN;
+    }
     f->fd = fd;
     f->delete_on_close = (flags & SQLITE_OPEN_DELETEONCLOSE) ? 1 : 0;
     snprintf(f->base, sizeof f->base, "%s", base);
@@ -549,19 +670,16 @@ static void acp_fn_bind(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   }
   const char *base = acp_basename(full);
   if (base[0] == '\0' || strlen(base) >= ACP_MAX_BASE) {
-    acp_state_unlock();
     sqlite3_result_error(ctx, "the database path has no usable file name", -1);
     return;
   }
   struct stat st;
   if (fstat(main_fd, &st) != 0 || !S_ISREG(st.st_mode)) {
-    acp_state_unlock();
     sqlite3_result_error(ctx, "mainFd is not an open regular file", -1);
     return;
   }
   struct stat dst;
   if (fstat(dir_fd, &dst) != 0 || !S_ISDIR(dst.st_mode)) {
-    acp_state_unlock();
     sqlite3_result_error(ctx, "dirFd is not an open directory", -1);
     return;
   }
@@ -573,7 +691,7 @@ static void acp_fn_bind(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     return;
   }
   /* The scheduling point the race test drives; a no-op in the shipping build. */
-  acp_barrier_wait();
+  acp_seam_arrive();
   unsigned char minted[ACP_LEASE_BYTES];
   if (!acp_random_bytes(minted, sizeof minted)) {
     acp_state_unlock();
@@ -634,6 +752,17 @@ static void acp_fn_unbind(sqlite3_context *ctx, int argc, sqlite3_value **argv) 
     sqlite3_result_error(ctx, "that lease does not hold the active binding", -1);
     return;
   }
+  if (acp_binding.main_live > 0) {
+    /*
+     * The lifetime, made explicit. Releasing while a file is still open leaves that file holding
+     * descriptors whose owner has gone: its closes would have to consult state that no longer
+     * describes anything. Refusing is the honest answer — the holder still has the connection and
+     * can close it — and it removes the whole class rather than making the close defensive.
+     */
+    acp_state_unlock();
+    sqlite3_result_error(ctx, "the bound database is still open; close it before releasing", -1);
+    return;
+  }
   memset(&acp_binding, 0, sizeof acp_binding);
   memset(acp_lease, 0, sizeof acp_lease);
   acp_lease_held = 0;
@@ -643,14 +772,50 @@ static void acp_fn_unbind(sqlite3_context *ctx, int argc, sqlite3_value **argv) 
 
 #ifdef ACP_FD_VFS_TESTING
 
-/** Arms the bind rendezvous for `n` arrivals, or disarms it with 0. Test-only. */
-static void acp_fn_test_barrier(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
-  int want = (argc == 1) ? sqlite3_value_int(argv[0]) : 0;
-  pthread_mutex_lock(&acp_barrier_mutex);
-  acp_barrier_want = want;
-  acp_barrier_arrived = 0;
-  pthread_mutex_unlock(&acp_barrier_mutex);
-  sqlite3_result_int(ctx, want);
+/** Arms the entropy syscall seams: short reads, EINTR reads, close failures. Test-only. */
+static void acp_fn_test_entropy(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  if (argc != 3) {
+    sqlite3_result_error(ctx, "acp_fd_test_entropy(shortReads, eintrReads, closeFails)", -1);
+    return;
+  }
+  acp_test_short_reads = sqlite3_value_int(argv[0]);
+  acp_test_eintr_reads = sqlite3_value_int(argv[1]);
+  acp_test_close_fails = sqlite3_value_int(argv[2]);
+  sqlite3_result_int(ctx, 1);
+}
+
+/** Arms or disarms the bind rendezvous. Test-only. */
+static void acp_fn_test_seam(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  int arm = (argc == 1) ? sqlite3_value_int(argv[0]) : 0;
+  pthread_mutex_lock(&acp_seam_mutex);
+  acp_seam_armed = arm ? 1 : 0;
+  acp_seam_arrived = 0;
+  acp_seam_released = 0;
+  acp_seam_waiters = 0;
+  pthread_mutex_unlock(&acp_seam_mutex);
+  sqlite3_result_int(ctx, arm ? 1 : 0);
+}
+
+/** Publishes the rendezvous counters. Never takes the state lock — the parent reads these while a
+    worker is inside the critical section. Test-only. */
+static void acp_fn_test_seam_state(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  (void)argc; (void)argv;
+  pthread_mutex_lock(&acp_seam_mutex);
+  char out[96];
+  snprintf(out, sizeof out, "arrived=%d waiters=%d released=%d",
+           acp_seam_arrived, acp_seam_waiters, acp_seam_released);
+  pthread_mutex_unlock(&acp_seam_mutex);
+  sqlite3_result_text(ctx, out, -1, SQLITE_TRANSIENT);
+}
+
+/** Releases everyone waiting at the rendezvous, and anyone who reaches it later. Test-only. */
+static void acp_fn_test_seam_release(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  (void)argc; (void)argv;
+  pthread_mutex_lock(&acp_seam_mutex);
+  acp_seam_released = 1;
+  pthread_cond_broadcast(&acp_seam_cond);
+  pthread_mutex_unlock(&acp_seam_mutex);
+  sqlite3_result_int(ctx, 1);
 }
 
 /** Arms the one-shot directory-sync fault. Test-only; see `acp_fail_next_dir_sync`. */
@@ -722,6 +887,9 @@ static void acp_fn_probe_dir_sync(sqlite3_context *ctx, int argc, sqlite3_value 
 static void acp_fn_stats(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   (void)argc; (void)argv;
   char out[512];
+  /* Seven shared fields; reading them unlocked can report a mixture of two states that never
+     existed at any instant. */
+  acp_state_lock();
   snprintf(out, sizeof out,
            "active=%d mainOpens=%d journalOpens=%d deletes=%d dirSyncs=%d refusals=%d refusal=%s",
            acp_binding.active, acp_binding.main_opens, acp_binding.journal_opens,
@@ -773,8 +941,14 @@ int sqlite3_extension_init(sqlite3 *db, char **err, const sqlite3_api_routines *
                               acp_fn_probe_refusal_methods, 0, 0) != SQLITE_OK ||
       sqlite3_create_function(db, "acp_fd_probe_dir_sync", 1, SQLITE_UTF8, 0,
                               acp_fn_probe_dir_sync, 0, 0) != SQLITE_OK ||
-      sqlite3_create_function(db, "acp_fd_test_barrier", 1, SQLITE_UTF8, 0,
-                              acp_fn_test_barrier, 0, 0) != SQLITE_OK) {
+      sqlite3_create_function(db, "acp_fd_test_seam", 1, SQLITE_UTF8, 0,
+                              acp_fn_test_seam, 0, 0) != SQLITE_OK ||
+      sqlite3_create_function(db, "acp_fd_test_seam_state", 0, SQLITE_UTF8, 0,
+                              acp_fn_test_seam_state, 0, 0) != SQLITE_OK ||
+      sqlite3_create_function(db, "acp_fd_test_seam_release", 0, SQLITE_UTF8, 0,
+                              acp_fn_test_seam_release, 0, 0) != SQLITE_OK ||
+      sqlite3_create_function(db, "acp_fd_test_entropy", 3, SQLITE_UTF8, 0,
+                              acp_fn_test_entropy, 0, 0) != SQLITE_OK) {
     return SQLITE_ERROR;
   }
 #endif

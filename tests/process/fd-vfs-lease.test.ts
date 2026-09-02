@@ -217,18 +217,20 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
     }
   }, 180_000);
 
-  it("serialises concurrent binds so only one of two threads takes the binding", () => {
+  it("serialises concurrent binds, decided by a predicate rather than by a timeout", () => {
     // The state behind the lease is process-global and was unsynchronised: two threads could each
     // pass the active-check before either wrote, and one binding would silently replace the other.
-    // Worker threads share the process, so they share the loaded extension's statics — a real race
-    // rather than a simulated one.
+    // Worker threads share the process, so they share the loaded extension's statics.
     //
-    // Driven through the testing artifact's rendezvous rather than by repetition, and that choice
-    // is a measurement: with the lock removed, forty unsynchronised rounds produced a double
-    // binding only three times, so an eight-round test would have missed the defect about half the
-    // time. Armed for two arrivals, the outcome is decided by whether the lock exists — with it,
-    // the second thread is still queued and the first waits out the timeout alone; without it,
-    // both arrive at once and both bind.
+    // The parent decides when to release, and it waits for a predicate that is definite in both
+    // worlds rather than for a duration. With the lock, one thread reaches the seam and the other
+    // is queued for the lock (arrived >= 1 and waiters >= 1). Without it, both reach the seam
+    // (arrived >= 2). Either way the parent then releases, joins both workers, and asserts against
+    // finished threads.
+    //
+    // The earlier version used a one-second timeout as its authority, which is not evidence about
+    // a lock; and repetition would not have served either — measured, with the lock removed, forty
+    // unsynchronised rounds produced a double binding only three times.
     const artifact = buildTestingArtifact();
     const dir = tempDir("acp-u6-race-");
     chmodSync(dir, 0o700);
@@ -267,22 +269,202 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
         `const Database = (await import(${JSON.stringify(better)})).default;`,
         `const boot = new Database(":memory:");`,
         `boot.loadExtension(${JSON.stringify(artifact)});`,
-        `boot.prepare("SELECT acp_fd_test_barrier(?) AS n").get(2);`,
-        `const results = await Promise.all([0, 1].map(() => new Promise((resolve, reject) => {`,
+        `boot.prepare("SELECT acp_fd_test_seam(?) AS armed").get(1);`,
+        `const outcomes = [];`,
+        `const exits = [];`,
+        `for (const _ of [0, 1]) {`,
         `  const w = new Worker(${JSON.stringify(worker)}, { workerData: {`,
         `    path: ${JSON.stringify(target)}, extension: ${JSON.stringify(artifact)}, better: ${JSON.stringify(better)} } });`,
-        `  w.on("message", resolve); w.on("error", reject);`,
-        `})));`,
-        `process.stdout.write(JSON.stringify({ bound: results.filter((r) => r.bound).length }));`,
+        `  outcomes.push(new Promise((resolve, reject) => { w.on("message", resolve); w.on("error", reject); }));`,
+        `  exits.push(new Promise((resolve) => w.on("exit", resolve)));`,
+        `}`,
+        `const read = () => {`,
+        `  const line = boot.prepare("SELECT acp_fd_test_seam_state() AS s").get().s;`,
+        `  const n = (k) => Number(line.split(" ").find((f) => f.startsWith(k + "=")).slice(k.length + 1));`,
+        `  return { arrived: n("arrived"), waiters: n("waiters") };`,
+        `};`,
+        `let seen;`,
+        `for (;;) {`,
+        `  seen = read();`,
+        `  if (seen.arrived >= 2 || (seen.arrived >= 1 && seen.waiters >= 1)) break;`,
+        `  await new Promise((r) => setTimeout(r, 2));`,
+        `}`,
+        `boot.prepare("SELECT acp_fd_test_seam_release() AS r").get();`,
+        `const results = await Promise.all(outcomes);`,
+        `const codes = await Promise.all(exits);`,
+        `process.stdout.write(JSON.stringify({`,
+        `  bound: results.filter((r) => r.bound).length,`,
+        `  predicate: seen,`,
+        `  joined: codes.length,`,
+        `  exitCodes: codes,`,
+        `}));`,
       ].join("\n"),
       { mode: 0o600 },
     );
 
     const run = spawnSync(process.execPath, ["--import", "tsx", driver], { encoding: "utf8" });
     expect(run.status, `race driver failed: ${run.stderr}`).toBe(0);
-    const { bound } = JSON.parse(run.stdout) as { bound: number };
-    expect(bound, "two threads bound at once").toBe(1);
+    const report = JSON.parse(run.stdout) as {
+      bound: number;
+      predicate: { arrived: number; waiters: number };
+      joined: number;
+      exitCodes: number[];
+    };
+    // Both workers ran to completion, so the count below is about finished threads.
+    expect(report.joined).toBe(2);
+    expect(report.exitCodes).toEqual([0, 0]);
+    // The lock's signature: one thread inside, the other queued for the lock rather than at the
+    // seam. Two arrivals would mean both had passed the active-check.
+    expect(report.predicate.arrived).toBe(1);
+    expect(report.predicate.waiters).toBeGreaterThanOrEqual(1);
+    expect(report.bound, "two threads bound at once").toBe(1);
   }, 300_000);
+
+  it("refuses an uppercase spelling of the lease", () => {
+    // A capability with two spellings has two holders. Review released a binding from a second
+    // connection with acp_fd_unbind(upper(lease)) — the decoder took A-F, so the minted form and
+    // an alias of it were both accepted.
+    const a = held("case");
+    const control = FdVfsControl.load();
+    const stranger = strangerConnection();
+    try {
+      const lease = control.bind(a.path, a.mainFd, a.dirFd);
+      expect(lease).toBe(lease.toLowerCase());
+      expect(() =>
+        stranger.prepare("SELECT acp_fd_unbind(upper(?)) AS r").get(lease),
+      ).toThrowError(/not the shape of a lease/);
+      expect(control.stats().active, "an uppercase alias released the binding").toBe(true);
+      // Mixed case is the same alias problem with a smaller edit distance.
+      const mixed = `${lease.slice(0, 31).toUpperCase()}${lease[31]}`;
+      if (mixed !== lease) {
+        expect(() => stranger.prepare("SELECT acp_fd_unbind(?) AS r").get(mixed)).toThrow();
+        expect(control.stats().active).toBe(true);
+      }
+      control.unbind();
+      expect(control.stats().active).toBe(false);
+    } finally {
+      stranger.close();
+      control.close();
+      closeSync(a.dirFd);
+      closeSync(a.mainFd);
+    }
+  }, 120_000);
+
+  it("retries an interrupted entropy read and refuses when the source cannot be closed", () => {
+    // Three failure modes decide whether a lease is trustworthy and none of them happens on a
+    // healthy machine: a short read, an interrupted read, and a close that fails. Without a way to
+    // induce them the retry and the cleanup would ship unexecuted, which is the condition they
+    // exist for. The seams can only make entropy collection fail — never succeed with weaker bytes.
+    const a = held("entropy");
+    const artifact = buildTestingArtifact();
+    const dir = tempDir("acp-u6-entropy-");
+    chmodSync(dir, 0o700);
+    const script = join(dir, "entropy.mjs");
+    writeFileSync(
+      script,
+      [
+        `import { openSync } from "node:fs";`,
+        `import { dirname } from "node:path";`,
+        `const Database = (await import(${JSON.stringify(createRequire(import.meta.url).resolve("better-sqlite3"))})).default;`,
+        `const db = new Database(":memory:");`,
+        `db.loadExtension(${JSON.stringify(artifact)});`,
+        `const path = ${JSON.stringify(a.path)};`,
+        `const mainFd = openSync(path, "r+");`,
+        `const dirFd = openSync(dirname(path), "r");`,
+        `const attempt = (shortReads, eintr, closeFails) => {`,
+        `  db.prepare("SELECT acp_fd_test_entropy(?, ?, ?) AS a").get(shortReads, eintr, closeFails);`,
+        `  try {`,
+        `    const row = db.prepare("SELECT acp_fd_bind(?, ?, ?) AS lease").get(path, mainFd, dirFd);`,
+        `    db.prepare("SELECT acp_fd_unbind(?) AS r").get(row.lease);`,
+        `    return { bound: true, lease: row.lease };`,
+        `  } catch (error) { return { bound: false, why: String(error).slice(0, 70) }; }`,
+        `};`,
+        `const report = {`,
+        `  short: attempt(32, 0, 0),`,
+        `  interrupted: attempt(0, 4, 0),`,
+        `  closeFailed: attempt(0, 0, 1),`,
+        `  afterCloseFailure: db.prepare("SELECT acp_fd_stats() AS p").get().p,`,
+        `  healthy: attempt(0, 0, 0),`,
+        `};`,
+        `process.stdout.write(JSON.stringify(report));`,
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+    const run = spawnSync(process.execPath, ["--import", "tsx", script], { encoding: "utf8" });
+    expect(run.status, `entropy child failed: ${run.stderr}`).toBe(0);
+    const report = JSON.parse(run.stdout) as Record<string, { bound: boolean; lease?: string } | string>;
+
+    // A short read is served one byte at a time; the loop must keep asking until it has sixteen.
+    expect((report["short"] as { bound: boolean }).bound, "a short read defeated the fill").toBe(true);
+    expect((report["short"] as { lease?: string }).lease).toMatch(/^[0-9a-f]{32}$/);
+    // EINTR produced no bytes and says nothing about the source, so it is retried, not failed.
+    expect((report["interrupted"] as { bound: boolean }).bound).toBe(true);
+    // A close that fails is treated as failure even though the bytes are in hand: this is the one
+    // place where being wrong is unrecoverable, and refusing costs an operator a retry.
+    expect((report["closeFailed"] as { bound: boolean }).bound).toBe(false);
+    // And it failed before touching any binding state.
+    expect(String(report["afterCloseFailure"])).toContain("active=0");
+    expect((report["healthy"] as { bound: boolean }).bound).toBe(true);
+
+    closeSync(a.dirFd);
+    closeSync(a.mainFd);
+  }, 300_000);
+
+  it("refuses to release while the bound database is still open", () => {
+    // The lifetime, made explicit. A release while a file is still open leaves that file holding
+    // descriptors whose owner has gone, and its close would have to consult state that no longer
+    // describes anything. Refusing removes the class; the holder still has the connection.
+    const a = held("lifetime");
+    const control = FdVfsControl.load();
+    try {
+      control.bind(a.path, a.mainFd, a.dirFd);
+      const db = new Database(a.path);
+      let closed = false;
+      try {
+        expect(() => control.unbind()).toThrowError(/still open; close it before releasing/);
+        expect(control.stats().active).toBe(true);
+        db.close();
+        closed = true;
+      } finally {
+        if (!closed) db.close();
+      }
+      // Once nothing is open, the same lease releases normally.
+      control.unbind();
+      expect(control.stats().active).toBe(false);
+    } finally {
+      control.close();
+      closeSync(a.dirFd);
+      closeSync(a.mainFd);
+    }
+  }, 120_000);
+
+  it("balances the open count, so one lease can open the database again after closing it", () => {
+    // "Already open" has to mean currently open. Counting opens without counting closes made the
+    // cap a one-shot for the life of the lease, which is a different rule than the one intended
+    // and one no caller could satisfy twice.
+    const a = held("balance");
+    const control = FdVfsControl.load();
+    try {
+      control.bind(a.path, a.mainFd, a.dirFd);
+      const first = new Database(a.path);
+      first.exec("CREATE TABLE one (x INTEGER)");
+      first.close();
+
+      const second = new Database(a.path);
+      try {
+        second.exec("CREATE TABLE two (x INTEGER)");
+        expect(Number(second.pragma("user_version", { simple: true }))).toBe(25);
+      } finally {
+        second.close();
+      }
+      expect(control.stats().mainOpens).toBe(2);
+    } finally {
+      control.unbind();
+      control.close();
+      closeSync(a.dirFd);
+      closeSync(a.mainFd);
+    }
+  }, 120_000);
 
   it("keeps its lease when a release is refused, instead of going quiet", () => {
     // The loader used to clear its lease before the native release returned, so a refused release
