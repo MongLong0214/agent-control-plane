@@ -72,6 +72,10 @@ export const GATES = [
   // #539 lands src/core/peercred.ts unreachable from every live surface on purpose — a new call
   // site (or a ControlPlane export) is a RED mutant here, not a deliverable.
   { script: "guards:peercred-unreachable" },
+  // U6 unit 1 lands src/db/fd-vfs.ts the same way: the descriptor-binding primitive and its
+  // evidence, with no product wiring. Unit 3 adds the call site and removes this gate in the same
+  // change, so the primitive going live is a decision rather than a discovery.
+  { script: "guards:fd-vfs-unreachable" },
   // `migrations:check` freezes what each migration does. v24's DDL was edited in place across two
   // correction rounds; a database created at the earlier one then sat at that version with bodies
   // nobody's code expected and could not settle a turn.
@@ -125,6 +129,7 @@ export const CI_SETUP_COMMANDS = new Map([
   ["pnpm install", "installs the dependencies every later gate needs"],
   ["pnpm rebuild", "rebuilds better-sqlite3 against the matrix leg's Node ABI"],
   ["pnpm native:peercred:build", "ADR-0010: prebuilds the Darwin peercred addon before anything loads it"],
+  ["pnpm native:fd-vfs:build", "ADR-0010 convention, new load mechanism: prebuilds the fd-vfs SQLite extension; unlike peercred it is built on every platform"],
   ["pnpm ci:preflight", "runs pre-install as a seconds-long fast fail; also runs inside the runner"],
 ]);
 

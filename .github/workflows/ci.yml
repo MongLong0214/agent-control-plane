@@ -72,6 +72,7 @@ jobs:
       # addons, prebuilt here rather than compiled on load. macos-15 is the only runner this job
       # uses, so this is also where #539's Darwin-only peercred addon gets its one build.
       - run: pnpm native:peercred:build
+      - run: pnpm native:fd-vfs:build
       # One step, one manifest, one executor. Every gate this job runs is in
       # `scripts/lib/prepush-gates.mjs`, and `pnpm gates` is what a developer runs before pushing
       # — the same command, the same order, the same fail-fast stop. It replaced twenty listed
@@ -123,6 +124,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm rebuild better-sqlite3
       - run: pnpm native:peercred:build
+      - run: pnpm native:fd-vfs:build
       - run: pnpm guards:falsifiable
 
   # Traceability needs a complete Vitest JSON result, and it consumes the one the gate judged
@@ -146,6 +148,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm rebuild better-sqlite3
       - run: pnpm native:peercred:build
+      - run: pnpm native:fd-vfs:build
       # The result set comes from the matrix leg the gate judged, on this same commit. Without it
       # `pnpm trace` runs the suite again, and a second execution is a different run — whatever it
       # reports is a claim about something no gate looked at. `if-no-files-found: error` above and
