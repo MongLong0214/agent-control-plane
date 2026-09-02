@@ -19,8 +19,36 @@ import { fileURLToPath } from "node:url";
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const ADDON_DIR = join(ROOT, "native", "fd-vfs");
 
+/*
+ * Variables that reach the compiler as flags. node-gyp's Make generator appends `CFLAGS` and
+ * `CPPFLAGS` to every compile command, so inheriting them lets any caller add a define to the
+ * shipping build — measured: `CFLAGS=-DACP_FD_VFS_TESTING pnpm native:fd-vfs:build` exited 0 and
+ * produced a library containing the test seam. The `#error` in the C source is the hard stop;
+ * dropping these keeps a legitimate build working instead of failing on someone's ambient flags.
+ */
+const FLAG_CARRYING = ["CFLAGS", "CPPFLAGS", "CXXFLAGS", "LDFLAGS", "GYP_DEFINES", "MAKEFLAGS"];
+
+const buildEnv = { ...process.env };
+for (const name of FLAG_CARRYING) delete buildEnv[name];
+
+/*
+ * Anything left that still names the test macro is a route this list does not know about. Refuse
+ * rather than guess, and name only the variable — its value is the caller's, and a build log is
+ * not the place for it.
+ */
+const smuggled = Object.entries(buildEnv)
+  .filter(([, value]) => typeof value === "string" && value.includes("ACP_FD_VFS_TESTING"))
+  .map(([name]) => name);
+if (smuggled.length > 0) {
+  process.stderr.write(
+    `build-native-fd-vfs: refusing to build; ${smuggled.sort().join(", ")} names the test macro, ` +
+      "which must never reach the shipping artifact\n",
+  );
+  process.exit(1);
+}
+
 const nodeGyp = join(ROOT, "node_modules", ".bin", "node-gyp");
-const result = spawnSync(nodeGyp, ["rebuild"], { cwd: ADDON_DIR, stdio: "inherit" });
+const result = spawnSync(nodeGyp, ["rebuild"], { cwd: ADDON_DIR, stdio: "inherit", env: buildEnv });
 
 if (result.error) {
   process.stderr.write(`build-native-fd-vfs: failed to run node-gyp: ${result.error.message}\n`);

@@ -36,6 +36,20 @@
  * ownership would need `xShmMap` and friends and is out of scope; the caller is required to refuse
  * a database that already has a non-empty `-wal`/`-shm` beside it before binding.
  */
+/*
+ * The shipping build and the testing build are different artifacts, and this makes that a fact the
+ * compiler enforces rather than a property of how the build happened to be invoked.
+ *
+ * `binding.gyp` defines `ACP_FD_VFS_PRODUCTION_BUILD` for the target that ships. Measured before
+ * this existed: `CFLAGS=-DACP_FD_VFS_TESTING pnpm native:fd-vfs:build` exited 0 and produced a
+ * shipping library carrying the fault injector, because node-gyp's Make generator appends
+ * inherited `CFLAGS` and `CPPFLAGS` to the compile command. Default-clean is not fail-closed: it
+ * only describes the invocation nobody tampered with.
+ */
+#if defined(ACP_FD_VFS_PRODUCTION_BUILD) && defined(ACP_FD_VFS_TESTING)
+#error "ACP_FD_VFS_TESTING must never be defined for the shipping build: the test seam would ship"
+#endif
+
 #include <sqlite3ext.h>
 #include <errno.h>
 #include <fcntl.h>

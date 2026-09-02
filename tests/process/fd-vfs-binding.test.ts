@@ -578,4 +578,89 @@ describe("U6-UNIT1 the fd-vfs binds a connection to a verified descriptor", () =
     }
     expect(readFileSync(path)).toEqual(before);
   }, 180_000);
+
+  it("cannot be built with the test seam by a caller's compiler flags", () => {
+    // Default-clean is not fail-closed. node-gyp's Make generator appends inherited CFLAGS and
+    // CPPFLAGS to every compile command, so before this, `CFLAGS=-DACP_FD_VFS_TESTING pnpm
+    // native:fd-vfs:build` exited 0 and produced a shipping library carrying the fault injector —
+    // the artifact that gets installed, not a test one.
+    //
+    // Run through the real wrapper, because the property is about the command that actually builds
+    // what ships. The contract is: an explicit failure, or an artifact with no seam in it.
+    for (const variable of ["CFLAGS", "CPPFLAGS"]) {
+      const build = spawnSync(process.execPath, [join(REPO, "scripts", "build-native-fd-vfs.mjs")], {
+        cwd: REPO,
+        encoding: "utf8",
+        env: { ...process.env, [variable]: "-DACP_FD_VFS_TESTING" },
+      });
+      if (build.status !== 0) continue; // an explicit refusal also satisfies the contract
+      const shipped = readFileSync(PRODUCTION_ARTIFACT);
+      for (const name of [
+        "acp_fd_fail_next_dir_sync",
+        "acp_fd_probe_refusal_methods",
+        "acp_fd_probe_dir_sync",
+      ]) {
+        expect(
+          shipped.includes(Buffer.from(name)),
+          `${variable} put ${name} into the artifact that ships`,
+        ).toBe(false);
+      }
+    }
+
+    // Names absent from the bytes is necessary, not sufficient: the check that matters is what a
+    // caller can actually invoke after loading the library that is on disk right now.
+    const dir = tempDir("acp-u6-hostile-");
+    chmodSync(dir, 0o700);
+    const script = join(dir, "hostile.mjs");
+    writeFileSync(
+      script,
+      [
+        `const Database = (await import(${JSON.stringify(BETTER_SQLITE3)})).default;`,
+        `const db = new Database(":memory:");`,
+        `db.loadExtension(${JSON.stringify(PRODUCTION_ARTIFACT)});`,
+        `const report = {};`,
+        `for (const call of ["acp_fd_fail_next_dir_sync()", "acp_fd_probe_refusal_methods()", "acp_fd_probe_dir_sync(1)"]) {`,
+        `  try { db.prepare("SELECT " + call + " AS p").get(); report[call] = "present"; }`,
+        `  catch (error) { report[call] = /no such function/i.test(String(error)) ? "absent" : String(error); }`,
+        `}`,
+        `report.registered = /registered=1/.test(String(db.prepare("SELECT acp_fd_probe() AS p").get().p));`,
+        `process.stdout.write(JSON.stringify(report));`,
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+    const loaded = spawnSync(process.execPath, ["--import", "tsx", script], { encoding: "utf8" });
+    expect(loaded.status, `load check failed: ${loaded.stderr}`).toBe(0);
+    const report = JSON.parse(loaded.stdout) as Record<string, string | boolean>;
+    for (const call of Object.keys(report).filter((key) => key !== "registered")) {
+      expect(report[call], `${call} is reachable after a hostile build`).toBe("absent");
+    }
+    expect(report["registered"]).toBe(true);
+
+    // And the identity is enforced by the compiler, not only by the wrapper: asking for both at
+    // once must refuse to produce anything.
+    const includes = join(
+      createRequire(import.meta.url).resolve("better-sqlite3"),
+      "..",
+      "..",
+      "deps",
+      "sqlite3",
+    );
+    const both = spawnSync(
+      process.env["CC"] ?? "cc",
+      [
+        "-O1",
+        "-fPIC",
+        "-shared",
+        "-DACP_FD_VFS_PRODUCTION_BUILD=1",
+        "-DACP_FD_VFS_TESTING",
+        `-I${includes}`,
+        "-o",
+        join(dir, "both.o"),
+        join(REPO, "native", "fd-vfs", "src", "acp_fd_vfs.c"),
+      ],
+      { encoding: "utf8" },
+    );
+    expect(both.status, "a build claiming both identities produced an artifact").not.toBe(0);
+    expect(both.stderr).toMatch(/must never be defined for the shipping build/);
+  }, 300_000);
 });

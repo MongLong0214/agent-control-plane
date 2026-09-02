@@ -8,6 +8,10 @@
       # the SQLite instance it will be loaded into, and this is the only copy that is guaranteed
       # to — a system `sqlite3ext.h` tracks the OS, not this dependency.
       "include_dirs": ["<!(node -p \"require('path').join(require.resolve('better-sqlite3'), '../../deps/sqlite3')\")"],
+      # The shipping identity. Paired with the `#error` in the C source, this makes
+      # production-and-testing a compile failure rather than a silently richer artifact: an
+      # injected `-DACP_FD_VFS_TESTING` now cannot produce a library at all.
+      "defines": ["ACP_FD_VFS_PRODUCTION_BUILD=1"],
       "cflags": ["-fPIC", "-Wall"],
       "product_prefix": "",
       "xcode_settings": {
