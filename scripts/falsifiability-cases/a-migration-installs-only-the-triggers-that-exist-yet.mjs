@@ -14,7 +14,7 @@ const aMigrationInstallsOnlyTheTriggersThatExistYet = {
   find: "    raw.exec(ledgerTriggerDdl(26));\n    raw.exec(provenanceNoReplaceDdl());",
   replace: "    raw.exec(ledgerTriggerDdl());\n    raw.exec(provenanceNoReplaceDdl());",
   killedBy: [
-    "tests/unit/a-database-that-never-replayed-the-schema.test.ts::migrates all the way to the current version",
+    "tests/unit/an-incremental-migration-owns-what-it-creates.test.ts::finds no leak in the shipped chain, and every step runs",
   ],
 };
 
