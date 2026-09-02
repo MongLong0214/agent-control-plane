@@ -66,7 +66,24 @@ SQLITE_EXTENSION_INIT1
 static sqlite3_vfs *acp_parent = 0;
 static sqlite3_vfs acp_shim;
 
-/** The one active binding. Unit 2 adds the bracket that guarantees at most one caller. */
+/**
+ * The lease that identifies one binding, and the bracket the whole capability rests on.
+ *
+ * The default VFS is process-global, so "who is bound" is process-global too. Before this, three
+ * things were possible and none of them announced itself: a second `bind` silently replaced the
+ * first, so a caller could still hold a descriptor it believed was bound while every open went to
+ * somebody else's file; `unbind` cleared whatever was there for anyone who asked, so an unrelated
+ * caller could release a migration's binding mid-flight; and the bound database could be opened any
+ * number of times, so "the connection" was never actually one connection.
+ *
+ * The lease closes all three. It is an identifier, not a secret — a process that can call these
+ * functions can read this memory too — and the property it buys is that a mistake is refused
+ * rather than silently absorbed.
+ */
+static unsigned long long acp_lease = 0;
+static unsigned long long acp_lease_next = 1;
+
+/** The one active binding, held under `acp_lease`. */
 static struct {
   int active;
   int main_fd;
@@ -234,6 +251,13 @@ static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int 
       acp_refuse("main database does not match the active binding");
       return SQLITE_CANTOPEN;
     }
+    if (acp_binding.main_opens > 0) {
+      /* One lease, one connection. Two connections on one descriptor share a file position and a
+         lock state that neither of them is tracking, and "the connection this binding is for"
+         stops naming anything. */
+      acp_refuse("the bound database is already open under this lease");
+      return SQLITE_CANTOPEN;
+    }
     struct stat st;
     if (fstat(acp_binding.main_fd, &st) != 0 ||
         st.st_dev != acp_binding.dev || st.st_ino != acp_binding.ino) {
@@ -393,6 +417,11 @@ static void acp_fn_bind(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     sqlite3_result_error(ctx, "dirFd is not an open directory", -1);
     return;
   }
+  if (acp_binding.active) {
+    sqlite3_result_error(
+        ctx, "a binding is already active; release it with its lease before taking another", -1);
+    return;
+  }
   memset(&acp_binding, 0, sizeof acp_binding);
   acp_binding.active = 1;
   acp_binding.main_fd = main_fd;
@@ -401,14 +430,30 @@ static void acp_fn_bind(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   acp_binding.ino = st.st_ino;
   snprintf(acp_binding.base, sizeof acp_binding.base, "%s", base);
   snprintf(acp_binding.path, sizeof acp_binding.path, "%s", full);
-  sqlite3_result_int64(ctx, (sqlite3_int64)st.st_ino);
+  acp_lease = acp_lease_next++;
+  /* The lease, not the inode: the caller needs the thing it must present to release. */
+  sqlite3_result_int64(ctx, (sqlite3_int64)acp_lease);
 }
 
 static void acp_fn_unbind(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
-  (void)argc; (void)argv;
-  int was = acp_binding.active;
+  if (argc != 1) {
+    sqlite3_result_error(ctx, "acp_fd_unbind(lease)", -1);
+    return;
+  }
+  if (!acp_binding.active) {
+    /* Releasing nothing is not an error: a bracket must be able to run its release unconditionally
+       without having to know whether the acquire got that far. */
+    sqlite3_result_int(ctx, 0);
+    return;
+  }
+  unsigned long long lease = (unsigned long long)sqlite3_value_int64(argv[0]);
+  if (lease != acp_lease) {
+    sqlite3_result_error(ctx, "that lease does not hold the active binding", -1);
+    return;
+  }
   memset(&acp_binding, 0, sizeof acp_binding);
-  sqlite3_result_int(ctx, was);
+  acp_lease = 0;
+  sqlite3_result_int(ctx, 1);
 }
 
 #ifdef ACP_FD_VFS_TESTING
@@ -521,7 +566,7 @@ int sqlite3_extension_init(sqlite3 *db, char **err, const sqlite3_api_routines *
   }
 
   if (sqlite3_create_function(db, "acp_fd_bind", 3, SQLITE_UTF8, 0, acp_fn_bind, 0, 0) != SQLITE_OK ||
-      sqlite3_create_function(db, "acp_fd_unbind", 0, SQLITE_UTF8, 0, acp_fn_unbind, 0, 0) != SQLITE_OK ||
+      sqlite3_create_function(db, "acp_fd_unbind", 1, SQLITE_UTF8, 0, acp_fn_unbind, 0, 0) != SQLITE_OK ||
       sqlite3_create_function(db, "acp_fd_stats", 0, SQLITE_UTF8, 0, acp_fn_stats, 0, 0) != SQLITE_OK ||
       sqlite3_create_function(db, "acp_fd_probe", 0, SQLITE_UTF8, 0, acp_fn_probe, 0, 0) != SQLITE_OK) {
     return SQLITE_ERROR;
