@@ -30,6 +30,33 @@ afterAll(cleanupTempDirs);
  * extension: no mocks, real SQLite, real files, real `rename` interleavings.
  */
 const REPO = fileURLToPath(new URL("../..", import.meta.url));
+
+/**
+ * A second connection with the extension loaded, used only for its test-only probe functions.
+ *
+ * The probes exist because two properties cannot be observed from TypeScript at all: SQLite owns
+ * the `sqlite3_file` memory an `xOpen` refusal writes into, and no workload here asks `xDelete`
+ * for a directory sync. They are deliberately not methods on `FdVfsControl` — the production
+ * loader should not carry a way to inject a fault. The binding state they read is process-global,
+ * so binding through the real API and probing through this connection describe the same thing.
+ */
+const probeConnection = (): InstanceType<typeof Database> => {
+  const db = new Database(":memory:");
+  db.loadExtension(
+    join(
+      REPO,
+      "native",
+      "fd-vfs",
+      "build",
+      "Release",
+      process.platform === "darwin" ? "acp_fd_vfs.dylib" : "acp_fd_vfs.so",
+    ),
+  );
+  return db;
+};
+
+const probe = (db: InstanceType<typeof Database>, sql: string, ...args: number[]): string =>
+  String((db.prepare(sql).get(...args) as { p: string }).p);
 /**
  * Resolved here and handed to the child as an absolute path.
  *
@@ -223,6 +250,77 @@ describe("U6-UNIT1 the fd-vfs binds a connection to a verified descriptor", () =
       const stats = control.stats();
       expect(stats.active).toBe(true);
       expect(stats.mainOpens).toBe(0);
+    } finally {
+      control.unbind();
+      control.close();
+      closeSync(dirFd);
+      closeSync(mainFd);
+    }
+  }, 120_000);
+
+  it("reports a failed directory sync instead of calling the delete a success", () => {
+    // Removing a rollback journal is what makes a commit durable: until that directory entry is on
+    // stable storage, a power loss can bring the journal back and roll away work this code already
+    // called finished. Discarding the sync result reported exactly that as success.
+    //
+    // Driven through the contract rather than through a workload, and that is a measurement, not a
+    // convenience: across seven `xDelete` calls spanning bound and unbound databases in both
+    // journal modes, SQLite asked for a directory sync zero times. A test written against an
+    // ordinary commit would therefore pass whether or not the failure is reported.
+    const dir = tempDir("acp-u6-dirsync-");
+    chmodSync(dir, 0o700);
+    const path = join(dir, "copy.sqlite");
+    seed(path, 25, "rows");
+
+    const control = FdVfsControl.load();
+    const mainFd = openSync(path, "r+");
+    const dirFd = openSync(dir, "r");
+    try {
+      control.bind(path, mainFd, dirFd);
+      const probes = probeConnection();
+      try {
+        // Control first: the same call with a healthy directory succeeds, so the assertion below
+        // is about the fault and not about this path being broken in general.
+        expect(probe(probes, "SELECT acp_fd_probe_dir_sync(?) AS p", 0)).toBe("rc=0");
+        // SQLITE_IOERR_DIR_FSYNC is 1290 — SQLITE_IOERR (10) with extended code 5.
+        expect(probe(probes, "SELECT acp_fd_probe_dir_sync(?) AS p", 1)).toBe("rc=1290");
+      } finally {
+        probes.close();
+      }
+    } finally {
+      control.unbind();
+      control.close();
+      closeSync(dirFd);
+      closeSync(mainFd);
+    }
+  }, 120_000);
+
+  it("leaves pMethods meaningful when it refuses an open", () => {
+    // SQLite hands xOpen uninitialised memory and, on some paths, inspects pMethods even after a
+    // failure — closing the file if it is non-NULL. A refusal that never touched the field left
+    // whatever was on the stack to be read as a methods table.
+    //
+    // The contract cannot be observed from here: SQLite owns that memory. So the extension
+    // allocates it, fills it with a sentinel no valid pointer could be, drives a real refusal
+    // through the registered shim, and reports what a caller would find.
+    const dir = tempDir("acp-u6-methods-");
+    chmodSync(dir, 0o700);
+    const path = join(dir, "copy.sqlite");
+    seed(path, 25, "rows");
+
+    const control = FdVfsControl.load();
+    const mainFd = openSync(path, "r+");
+    const dirFd = openSync(dir, "r");
+    try {
+      control.bind(path, mainFd, dirFd);
+      const probes = probeConnection();
+      try {
+        const answer = probe(probes, "SELECT acp_fd_probe_refusal_methods() AS p");
+        expect(answer).toContain("rc=14");
+        expect(answer).toContain("methodsNull=1");
+      } finally {
+        probes.close();
+      }
     } finally {
       control.unbind();
       control.close();

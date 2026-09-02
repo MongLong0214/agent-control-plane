@@ -72,6 +72,8 @@ static struct {
   ino_t ino;
   int main_opens;
   int journal_opens;
+  int deletes;
+  int dir_syncs;
   int refusals;
   char last_refusal[256];
 } acp_binding;
@@ -196,6 +198,15 @@ static const sqlite3_io_methods acp_io_methods = {
 };
 
 static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int flags, int *out) {
+  /*
+   * SQLite hands `xOpen` uninitialised memory and then, on some paths, inspects `pMethods` even
+   * after a failed open — closing the file if it is non-NULL. Every refusal below returned
+   * `SQLITE_CANTOPEN` without touching that field, leaving whatever bytes happened to be on the
+   * stack to be read as a methods table. Clearing it here covers every exit, including the ones
+   * added later, rather than relying on each refusal to remember.
+   */
+  if (file) file->pMethods = 0;
+
   if (!acp_binding.active || path == 0) {
     return acp_parent->xOpen(acp_parent, path, file, flags, out);
   }
@@ -274,12 +285,36 @@ static int acp_access(sqlite3_vfs *vfs, const char *path, int flags, int *out) {
   return acp_parent->xAccess(acp_parent, path, flags, out);
 }
 
+/*
+ * One-shot fault injection for the directory sync, so the failure path can be tested.
+ *
+ * There is no portable way to make `fsync` on a healthy directory descriptor fail on demand:
+ * closing the descriptor breaks the `unlinkat` first, and every other trick either fails both
+ * calls or fails neither. Without this the error branch would ship unexecuted — which is the
+ * condition it exists to survive. It grants nothing: it cannot bind, open, read or write, and it
+ * is armed only by the test that immediately consumes it.
+ */
+static int acp_fail_next_dir_sync = 0;
+
 static int acp_delete(sqlite3_vfs *vfs, const char *path, int sync_dir) {
   if (acp_binding.active && path && acp_is_bound_sibling(path)) {
+    acp_binding.deletes++;
     if (unlinkat(acp_binding.dir_fd, acp_basename(path), 0) != 0 && errno != ENOENT) {
       return SQLITE_IOERR_DELETE;
     }
-    if (sync_dir) fsync(acp_binding.dir_fd);
+    if (sync_dir) {
+      acp_binding.dir_syncs++;
+      /*
+       * Removing a rollback journal is what makes a commit durable: until the directory entry is
+       * on stable storage, a power loss can bring the journal back and roll the committed
+       * migration away. Discarding this result reported that as success — the failure mode being
+       * "the migration you were told finished did not", which is the worst shape an error can
+       * take here.
+       */
+      int failed = acp_fail_next_dir_sync ? (acp_fail_next_dir_sync = 0, 1)
+                                          : (fsync(acp_binding.dir_fd) != 0);
+      if (failed) return SQLITE_IOERR_DIR_FSYNC;
+    }
     return SQLITE_OK;
   }
   return acp_parent->xDelete(acp_parent, path, sync_dir);
@@ -350,12 +385,78 @@ static void acp_fn_unbind(sqlite3_context *ctx, int argc, sqlite3_value **argv) 
   sqlite3_result_int(ctx, was);
 }
 
+/** Arms the one-shot directory-sync fault. Test-only; see `acp_fail_next_dir_sync`. */
+static void acp_fn_fail_next_dir_sync(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  (void)argc; (void)argv;
+  acp_fail_next_dir_sync = 1;
+  sqlite3_result_int(ctx, 1);
+}
+
+/**
+ * Reports what a caller would see in `pMethods` after a refused open.
+ *
+ * The contract cannot be observed from outside C: SQLite owns the `sqlite3_file` memory, so a test
+ * in TypeScript has nothing to inspect. This allocates that memory itself, fills it with a
+ * sentinel no valid pointer could be, drives a real refusal through the registered shim, and
+ * reports the field. Poisoning it here rather than reading back what this file just wrote is what
+ * keeps the check from being circular.
+ */
+static void acp_fn_probe_refusal_methods(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  (void)argc; (void)argv;
+  if (!acp_binding.active) {
+    sqlite3_result_text(ctx, "no binding", -1, SQLITE_TRANSIENT);
+    return;
+  }
+  int size = acp_shim.szOsFile;
+  sqlite3_file *file = sqlite3_malloc(size);
+  if (file == 0) {
+    sqlite3_result_text(ctx, "out of memory", -1, SQLITE_TRANSIENT);
+    return;
+  }
+  memset(file, 0xAA, (size_t)size);
+  int out = 0;
+  /* A main-database open that cannot match the binding: the shortest real refusal path. */
+  int rc = acp_shim.xOpen(&acp_shim, "/nonexistent/not-the-bound-database.sqlite", file,
+                          SQLITE_OPEN_MAIN_DB | SQLITE_OPEN_READWRITE, &out);
+  char answer[128];
+  snprintf(answer, sizeof answer, "rc=%d methodsNull=%d", rc, file->pMethods == 0);
+  sqlite3_free(file);
+  sqlite3_result_text(ctx, answer, -1, SQLITE_TRANSIENT);
+}
+
+/**
+ * Drives `xDelete` with `sync_dir = 1` and reports the result code. Test-only.
+ *
+ * Measured on this platform: across seven `xDelete` calls spanning bound and unbound databases in
+ * both journal modes, SQLite asked for a directory sync zero times. So no ordinary workload
+ * reaches this branch, and a test written against one would pass whether or not the error is
+ * reported. The contract still requires reporting it — a rollback journal whose removal is not on
+ * stable storage can come back after a power loss and roll away a migration this code already
+ * called finished — so the branch is exercised directly instead.
+ */
+static void acp_fn_probe_dir_sync(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  if (!acp_binding.active) {
+    sqlite3_result_text(ctx, "no binding", -1, SQLITE_TRANSIENT);
+    return;
+  }
+  int arm = (argc == 1) ? sqlite3_value_int(argv[0]) : 0;
+  char journal[ACP_MAX_PATH + 16];
+  snprintf(journal, sizeof journal, "%s-journal", acp_binding.path);
+  if (arm) acp_fail_next_dir_sync = 1;
+  int rc = acp_shim.xDelete(&acp_shim, journal, 1);
+  char answer[64];
+  snprintf(answer, sizeof answer, "rc=%d", rc);
+  sqlite3_result_text(ctx, answer, -1, SQLITE_TRANSIENT);
+}
+
 static void acp_fn_stats(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   (void)argc; (void)argv;
   char out[512];
-  snprintf(out, sizeof out, "active=%d mainOpens=%d journalOpens=%d refusals=%d refusal=%s",
+  snprintf(out, sizeof out,
+           "active=%d mainOpens=%d journalOpens=%d deletes=%d dirSyncs=%d refusals=%d refusal=%s",
            acp_binding.active, acp_binding.main_opens, acp_binding.journal_opens,
-           acp_binding.refusals, acp_binding.last_refusal);
+           acp_binding.deletes, acp_binding.dir_syncs, acp_binding.refusals,
+           acp_binding.last_refusal);
   sqlite3_result_text(ctx, out, -1, SQLITE_TRANSIENT);
 }
 
@@ -392,7 +493,13 @@ int sqlite3_extension_init(sqlite3 *db, char **err, const sqlite3_api_routines *
   if (sqlite3_create_function(db, "acp_fd_bind", 3, SQLITE_UTF8, 0, acp_fn_bind, 0, 0) != SQLITE_OK ||
       sqlite3_create_function(db, "acp_fd_unbind", 0, SQLITE_UTF8, 0, acp_fn_unbind, 0, 0) != SQLITE_OK ||
       sqlite3_create_function(db, "acp_fd_stats", 0, SQLITE_UTF8, 0, acp_fn_stats, 0, 0) != SQLITE_OK ||
-      sqlite3_create_function(db, "acp_fd_probe", 0, SQLITE_UTF8, 0, acp_fn_probe, 0, 0) != SQLITE_OK) {
+      sqlite3_create_function(db, "acp_fd_probe", 0, SQLITE_UTF8, 0, acp_fn_probe, 0, 0) != SQLITE_OK ||
+      sqlite3_create_function(db, "acp_fd_fail_next_dir_sync", 0, SQLITE_UTF8, 0,
+                              acp_fn_fail_next_dir_sync, 0, 0) != SQLITE_OK ||
+      sqlite3_create_function(db, "acp_fd_probe_refusal_methods", 0, SQLITE_UTF8, 0,
+                              acp_fn_probe_refusal_methods, 0, 0) != SQLITE_OK ||
+      sqlite3_create_function(db, "acp_fd_probe_dir_sync", 1, SQLITE_UTF8, 0,
+                              acp_fn_probe_dir_sync, 0, 0) != SQLITE_OK) {
     return SQLITE_ERROR;
   }
 
