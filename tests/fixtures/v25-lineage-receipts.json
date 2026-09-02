@@ -1,0 +1,41 @@
+{
+  "_provenance": "schema_migrations of the live pre-migration backup taken 2026-09-02, read-only. Real receipts written by the deployment, not synthesised.",
+  "receipts": [
+    {
+      "version": 20,
+      "migrationId": "bootstrap-v20",
+      "checksum": "sha256:3e416bd79a60d8a4dee47f52e85c5ece4df28e285c8f983d2274c73b764c9b62",
+      "appliedAt": "2026-08-17T13:06:38.933Z"
+    },
+    {
+      "version": 21,
+      "migrationId": "v21-canonical-turns",
+      "checksum": "sha256:474d28d76a85e62e1df1697f2bcf96a168061d799ee2b8a5d52c8d927158feb7",
+      "appliedAt": "2026-08-23T02:39:31.245Z"
+    },
+    {
+      "version": 22,
+      "migrationId": "v22-canonical-turn-ledger",
+      "checksum": "sha256:0431ddace84b2c2785fa2eca5107a4e9bd6a2a7d87e6070d6550c00dc0d6b5e7",
+      "appliedAt": "2026-08-23T02:39:31.277Z"
+    },
+    {
+      "version": 23,
+      "migrationId": "v23-turn-claimed-at",
+      "checksum": "sha256:a066442ba8603e17c6b2c969884edc99b6f2e5ca9fb219ea6d663b6da085ab27",
+      "appliedAt": "2026-08-23T02:39:31.288Z"
+    },
+    {
+      "version": 24,
+      "migrationId": "v24-observation-ledger",
+      "checksum": "sha256:09b7d8c4f027fc3293832ff7266f4a50836c7998473e0dc2d61eb4802296d1d6",
+      "appliedAt": "2026-08-23T02:39:31.298Z"
+    },
+    {
+      "version": 25,
+      "migrationId": "v25-sources-name-admitted-messages",
+      "checksum": "sha256:2826f8db9da4c8f27efc0bcd2e82aeed660179a05c96df9a0d27e69170a16a0a",
+      "appliedAt": "2026-08-23T02:39:31.318Z"
+    }
+  ]
+}

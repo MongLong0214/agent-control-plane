@@ -1,10 +1,15 @@
 import Database from "better-sqlite3";
-import { chmodSync, readFileSync } from "node:fs";
+import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
 import { MIGRATIONS } from "../../src/db/migrations.ts";
+import {
+  REPLAY_FUNCTION,
+  migrationsReachingTheReplay,
+} from "../helpers/migration-replay-reachability.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -39,13 +44,42 @@ const LINEAGE_VERSION = 25;
  * The sealed owner trace: object name, type, and the first incremental step that creates it,
  * captured from a completed 25→36 run of the real lineage and committed as a fixture.
  */
-const TRACE = JSON.parse(
-  readFileSync(new URL("../fixtures/v25-owner-trace.json", import.meta.url), "utf8"),
-) as {
+const TRACE_TEXT = readFileSync(
+  new URL("../fixtures/v25-owner-trace.json", import.meta.url),
+  "utf8",
+);
+
+/**
+ * Duplicate keys are rejected before parsing, not after.
+ *
+ * `JSON.parse` keeps the last of two identical keys and drops the first silently, so a trace with
+ * one name written twice loses an ownership and still parses into a plausible object. The raw
+ * text is the only place that fact survives.
+ */
+const parseTraceRejectingDuplicates = (text: string): TraceShape => {
+  const seen = new Set<string>();
+  const duplicates: string[] = [];
+  JSON.parse(text, function reviver(this: unknown, key: string, value: unknown) {
+    return value;
+  });
+  for (const match of text.matchAll(/^\s{4}"([^"]+)":\s*\{/gm)) {
+    const name = match[1]!;
+    if (seen.has(name)) duplicates.push(name);
+    seen.add(name);
+  }
+  if (duplicates.length > 0) {
+    throw new Error(`owner trace has duplicate object keys: ${duplicates.sort().join(", ")}`);
+  }
+  return JSON.parse(text) as TraceShape;
+};
+
+interface TraceShape {
   baselineVersion: number;
   baselineFixture: string;
   objects: Record<string, { type: string; owner: number }>;
-};
+}
+
+const TRACE = parseTraceRejectingDuplicates(TRACE_TEXT);
 
 /**
  * Migrations that replay a schema snapshot instead of introducing objects.
@@ -56,24 +90,17 @@ const TRACE = JSON.parse(
  */
 const DECLARED_SNAPSHOT_REPLAY = ["v12-migration-ledger-and-invariant-replay", "v13-finalization-state-machine"];
 
-const MIGRATIONS_SOURCE = readFileSync(
-  new URL("../../src/db/migrations.ts", import.meta.url),
-  "utf8",
-);
+const MIGRATIONS_PATH = fileURLToPath(new URL("../../src/db/migrations.ts", import.meta.url));
 
-/** Every migration whose body calls the snapshot replay, read out of the source. */
-const snapshotReplayCallers = (): string[] => {
-  const callers: string[] = [];
-  const ids = [...MIGRATIONS_SOURCE.matchAll(/^  id: "(v\d+-[a-z0-9-]+)",$/gm)];
-  for (const [index, match] of ids.entries()) {
-    const body = MIGRATIONS_SOURCE.slice(
-      match.index!,
-      ids[index + 1]?.index ?? MIGRATIONS_SOURCE.length,
-    );
-    if (body.includes("replayDdlWithoutPostV12Columns()")) callers.push(match[1]!);
-  }
-  return callers;
-};
+/**
+ * Migrations that can reach the snapshot replay, resolved through the call graph.
+ *
+ * Was a regular expression over `id: "…"` plus a text slice, which attributes a call to whichever
+ * id happens to appear above it. Review named both failures: a call moved into a helper is
+ * attributed to nothing, and a call in a function declared between two migration literals is
+ * attributed to the earlier one — either way a new caller appears and the answer stays the same.
+ */
+const snapshotReplayCallers = (): string[] => migrationsReachingTheReplay(MIGRATIONS_PATH).reaching;
 
 interface Step {
   id: string;
@@ -179,6 +206,52 @@ const baselineObjects = (): Set<string> => {
 };
 
 /**
+ * `name:type@vN` for every object the real lineage gains, by first appearance in `sqlite_master`.
+ *
+ * The authority is the database's own catalogue at each boundary. A statement can be issued and
+ * change nothing (`CREATE … IF NOT EXISTS` against something already there), and counting that as
+ * ownership is what the SQL-scraping version did.
+ */
+const schemaTransitionCensus = (): string[] => {
+  const path = join(tempDir("acp-762-census-"), "state.sqlite");
+  const raw = new Database(path);
+  raw.function("acp_schema_migration_authorized", () => 1);
+  raw.exec(LINEAGE);
+  raw.pragma(`user_version = ${LINEAGE_VERSION}`);
+
+  const snapshot = (): Map<string, string> =>
+    new Map(
+      (raw
+        .prepare("SELECT name, type FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
+        .all() as Array<{ name: string; type: string }>).map((row) => [row.name, row.type]),
+    );
+
+  const rows: string[] = [];
+  const owned = new Set<string>();
+  try {
+    let previous = snapshot();
+    for (const migration of MIGRATIONS) {
+      if (migration.fromVersion < LINEAGE_VERSION) continue;
+      migration.apply(raw);
+      const now = snapshot();
+      for (const [name, type] of now) {
+        if (previous.has(name)) continue;
+        // Duplicate ownership is impossible by construction here, and asserted anyway: two steps
+        // both claiming to introduce one object would mean the snapshot lost it in between.
+        if (owned.has(name)) throw new Error(`two steps introduce ${name}`);
+        owned.add(name);
+        rows.push(`${name}:${type}@v${migration.toVersion}`);
+      }
+      previous = now;
+    }
+  } finally {
+    raw.close();
+    chmodSync(path, 0o600);
+  }
+  return rows.sort();
+};
+
+/**
  * Runs the incremental steps above the lineage version and records the SQL each one issues.
  *
  * Against the lineage artifact, not a current bootstrap: these are the statements the deployment
@@ -240,31 +313,73 @@ describe("#762 snapshot replays are not object owners", () => {
     expect(snapshotReplayCallers().sort()).toEqual([...DECLARED_SNAPSHOT_REPLAY].sort());
   });
 
-  it("keeps the sealed trace and the candidate's own CREATE census in both-way agreement", () => {
-    // The drift gate. A sealed fixture is only truth for as long as it still describes the code:
-    // this regenerates the census from the lineage run and compares it to the trace in both
-    // directions, so a new object with no entry fails and a stale entry naming nothing fails too.
-    const steps = incrementalSteps();
-    expect(steps.filter((step) => step.failure)).toEqual([]);
-
-    const baseline = baselineObjects();
-    const census = new Map<string, number>();
-    for (const step of steps) {
-      for (const name of namesMatching(step.statements, CREATE_PATTERNS)) {
-        if (baseline.has(name) || census.has(name)) continue;
-        census.set(name, step.toVersion);
-      }
-    }
-
-    const sealed = new Map(
-      Object.entries(TRACE.objects).map(([name, entry]) => [name, entry.owner] as const),
-    );
-    const asRows = (map: ReadonlyMap<string, number>) =>
-      [...map.entries()].map(([name, owner]) => `${name}@v${owner}`).sort();
-
-    expect(asRows(census)).toEqual(asRows(sealed));
+  it("keeps the sealed trace and the candidate's own schema transitions in both-way agreement", () => {
+    // The drift gate, and it compares **typed triples**: name alone let a type be rewritten in
+    // the trace with nothing noticing. Derived from `sqlite_master` before and after each step
+    // rather than from the SQL a step issued, because a conditional CREATE that changed nothing
+    // is not an introduction — measured, that difference is two objects.
+    const census = schemaTransitionCensus();
+    const sealed = Object.entries(TRACE.objects)
+      .map(([name, entry]) => `${name}:${entry.type}@v${entry.owner}`)
+      .sort();
+    expect(census).toEqual(sealed);
     expect(TRACE.baselineVersion).toBe(LINEAGE_VERSION);
     expect(TRACE.baselineFixture).toBe("tests/fixtures/schema-v25-lineage.sql");
+  });
+
+  it("still classifies a caller whose replay call moved into a helper", () => {
+    // The discriminating case for the resolver. A text slice keyed on `id: "…"` attributes this
+    // call to nothing — the helper is declared outside every migration literal — so the old
+    // classification reported the same two names with a third caller present.
+    const source = join(tempDir("acp-762-moved-"), "moved.ts");
+    writeFileSync(
+      source,
+      [
+        `const viaHelper = (raw: unknown): void => { ${REPLAY_FUNCTION}(); void raw; };`,
+        `export const ${REPLAY_FUNCTION} = (): string => "";`,
+        "const m = {",
+        '  id: "v99-moved-into-a-helper",',
+        "  fromVersion: 98,",
+        "  toVersion: 99,",
+        "  apply: (raw: unknown) => { viaHelper(raw); },",
+        '  checksum: () => "",',
+        "};",
+        "void m;",
+      ].join("\n"),
+      "utf8",
+    );
+    expect(migrationsReachingTheReplay(source).reaching).toEqual(["v99-moved-into-a-helper"]);
+  });
+
+  it("does not attribute a replay call to a migration that merely precedes it in the file", () => {
+    // The other half of the same defect: a slice attributes a call in a function declared between
+    // two literals to the earlier one, so a migration that never calls anything is reported as a
+    // replayer and the real caller is not.
+    const source = join(tempDir("acp-762-adjacent-"), "adjacent.ts");
+    writeFileSync(
+      source,
+      [
+        `export const ${REPLAY_FUNCTION} = (): string => "";`,
+        "const a = {",
+        '  id: "v98-calls-nothing",',
+        "  fromVersion: 97,",
+        "  toVersion: 98,",
+        "  apply: () => {},",
+        '  checksum: () => "",',
+        "};",
+        `const between = (): void => { ${REPLAY_FUNCTION}(); };`,
+        "const b = {",
+        '  id: "v99-calls-between",',
+        "  fromVersion: 98,",
+        "  toVersion: 99,",
+        "  apply: () => { between(); },",
+        '  checksum: () => "",',
+        "};",
+        "void a; void b;",
+      ].join("\n"),
+      "utf8",
+    );
+    expect(migrationsReachingTheReplay(source).reaching).toEqual(["v99-calls-between"]);
   });
 
   it("keeps the replay steps outside the incremental chain entirely", () => {
@@ -272,6 +387,77 @@ describe("#762 snapshot replays are not object owners", () => {
     // never reaches them and neither does this measurement.
     const ids = incrementalSteps().map((step) => step.id);
     for (const replay of DECLARED_SNAPSHOT_REPLAY) expect(ids).not.toContain(replay);
+  });
+});
+
+describe("#762 the sealed trace refuses the ways it could quietly stop being true", () => {
+  it("rejects a duplicate object key before parsing keeps only the last one", () => {
+    // `JSON.parse` drops the first of two identical keys silently, so a trace with one name
+    // written twice loses an ownership and still parses into a plausible object.
+    const doubled = TRACE_TEXT.replace(
+      /^(\s{4}"[^"]+":\s*\{\n(?:.*\n)*?\s{4}\},\n)/m,
+      "$1$1",
+    );
+    expect(doubled).not.toBe(TRACE_TEXT);
+    expect(() => parseTraceRejectingDuplicates(doubled)).toThrowError(/duplicate object keys/);
+  });
+
+  it("fails when an entry's type is rewritten", () => {
+    // The comparison is on typed triples for this reason: keyed on name alone, a trigger
+    // relabelled as a table matches and nothing says so.
+    const [name, entry] = Object.entries(TRACE.objects)[0]!;
+    const swapped = { ...TRACE.objects, [name]: { ...entry, type: `${entry.type}-rewritten` } };
+    const sealed = Object.entries(swapped)
+      .map(([n, e]) => `${n}:${e.type}@v${e.owner}`)
+      .sort();
+    expect(schemaTransitionCensus()).not.toEqual(sealed);
+  });
+
+  it("fails on an entry that names nothing, and on an object with no entry", () => {
+    const census = schemaTransitionCensus();
+    const rows = (objects: Record<string, { type: string; owner: number }>) =>
+      Object.entries(objects)
+        .map(([n, e]) => `${n}:${e.type}@v${e.owner}`)
+        .sort();
+
+    // Stale: an entry the candidate no longer produces.
+    expect(census).not.toEqual(
+      rows({ ...TRACE.objects, zzz_not_in_the_candidate: { type: "table", owner: 30 } }),
+    );
+
+    // Omitted: an object the candidate produces with no entry to describe it.
+    const [dropped] = Object.keys(TRACE.objects);
+    const withoutOne = { ...TRACE.objects };
+    delete withoutOne[dropped!];
+    expect(census).not.toEqual(rows(withoutOne));
+  });
+
+  it("reads identifiers the SQL text would have hidden", () => {
+    // Bracketed, quoted, schema-qualified and multi-line identifiers are all valid SQLite and all
+    // read differently by a regular expression over the statement. `sqlite_master` reports the
+    // resolved name whatever the source looked like, which is why the census asks it and not the
+    // SQL.
+    const path = join(tempDir("acp-762-identifiers-"), "s.sqlite");
+    const raw = new Database(path);
+    try {
+      raw.exec(`CREATE TABLE [bracketed name] (id INTEGER PRIMARY KEY)`);
+      raw.exec(`CREATE TABLE "quoted-with-hyphen" (id INTEGER PRIMARY KEY)`);
+      raw.exec(`CREATE TABLE main.qualified (id INTEGER PRIMARY KEY)`);
+      raw.exec(`CREATE\n  TABLE\n  split_across_lines (id INTEGER PRIMARY KEY)`);
+      const names = new Set(
+        (raw
+          .prepare("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
+          .all() as Array<{ name: string }>).map((row) => row.name),
+      );
+      expect([...names].sort()).toEqual([
+        "bracketed name",
+        "qualified",
+        "quoted-with-hyphen",
+        "split_across_lines",
+      ]);
+    } finally {
+      raw.close();
+    }
   });
 });
 

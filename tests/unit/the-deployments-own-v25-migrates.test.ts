@@ -36,15 +36,26 @@ const LINEAGE = readFileSync(
   "utf8",
 );
 
-/** The live ledger's own history: a v20 bootstrap, then five steps inside one restart. */
-const LEDGER: ReadonlyArray<readonly [number, string, string]> = [
-  [20, "bootstrap-v20", "2026-08-17T13:06:38.933Z"],
-  [21, "v21-canonical-turns", "2026-08-23T02:39:31.245Z"],
-  [22, "v22-canonical-turn-ledger", "2026-08-23T02:39:31.277Z"],
-  [23, "v23-turn-claimed-at", "2026-08-23T02:39:31.288Z"],
-  [24, "v24-observation-ledger", "2026-08-23T02:39:31.298Z"],
-  [25, "v25-sources-name-admitted-messages", "2026-08-23T02:39:31.318Z"],
-];
+/**
+ * The deployment's own receipts, checksums included, sealed from the preserved backup.
+ *
+ * The previous version wrote `sha256:` + sixty-four `a`s. That is a shape, not a receipt: the
+ * before/after comparison it fed proved the prefix survived, which is true of any value that
+ * matches the regular expression, including one a rewrite put there. These are the real rows the
+ * deployment recorded, read read-only from the pre-migration backup.
+ */
+const RECEIPTS = (
+  JSON.parse(
+    readFileSync(new URL("../fixtures/v25-lineage-receipts.json", import.meta.url), "utf8"),
+  ) as {
+    receipts: Array<{
+      version: number;
+      migrationId: string;
+      checksum: string;
+      appliedAt: string;
+    }>;
+  }
+).receipts;
 
 const NOW = "2026-08-23T02:39:31.318Z";
 
@@ -63,11 +74,11 @@ const writeV25Artifact = (path: string): void => {
     // avoid, one object smaller.
     raw.function("acp_schema_migration_authorized", () => 1);
     raw.exec(LINEAGE);
-    for (const [version, id, appliedAt] of LEDGER) {
+    for (const receipt of RECEIPTS) {
       raw.prepare(
         `INSERT INTO schema_migrations (version, migration_id, checksum, applied_at)
          VALUES (?, ?, ?, ?)`,
-      ).run(version, id, `sha256:${"a".repeat(64)}`, appliedAt);
+      ).run(receipt.version, receipt.migrationId, receipt.checksum, receipt.appliedAt);
     }
     raw.prepare(
       `INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)`,
@@ -150,7 +161,54 @@ describe("#762 the deployment's own v25 lineage", () => {
     // followed by five steps, which is what `never ran v12` looks like in the ledger.
     expect(before.ledger.map((row) => row.version)).toEqual([20, 21, 22, 23, 24, 25]);
     expect(before.ledger[0]?.migration_id).toBe("bootstrap-v20");
+    // The receipts are the deployment's, not synthesised: a real checksum is not a run of one
+    // character, and the fixture would be worthless as evidence if it were.
+    for (const row of before.ledger) {
+      expect(row.checksum).toMatch(/^sha256:[0-9a-f]{64}$/);
+      expect(row.checksum).not.toMatch(/^sha256:(.)\1{63}$/);
+    }
     expect(before.ledger.some((row) => row.migration_id.startsWith("v12-"))).toBe(false);
+  });
+
+  it("rejects a receipt that is wrong but well formed", () => {
+    // The mutation the format check could not see. Both values below satisfy every regular
+    // expression the previous version applied — a real migration id and a real sha256 — and both
+    // belong to a different step.
+    const artifact = join(tempDir("acp-762-wrong-receipt-"), "state.sqlite");
+    writeV25Artifact(artifact);
+    const before = contents(artifact);
+
+    const working = join(tempDir("acp-762-wrong-receipt-copy-"), "state.sqlite");
+    copyFileSync(artifact, working);
+    chmodSync(working, 0o600);
+    approveMigration(working, "wrong-but-well-formed");
+    const migrated = new Db(working);
+    migrated.close();
+
+    const raw = new Database(working);
+    try {
+      raw.function("acp_schema_migration_authorized", () => 1);
+      raw.exec("DROP TRIGGER schema_migrations_immutable; DROP TRIGGER schema_migrations_no_delete;");
+      // A checksum that is another step's, not a malformed one.
+      const other = MIGRATIONS.find((m) => m.toVersion === 30)!;
+      raw.prepare("UPDATE schema_migrations SET checksum = ? WHERE version = 29").run(
+        other.checksum(),
+      );
+    } finally {
+      raw.close();
+    }
+
+    const after = contents(working);
+    const appended = after.ledger.slice(before.ledger.length);
+    const expected = MIGRATIONS.filter((m) => m.fromVersion >= 25).map(
+      (m) => `${m.toVersion}|${m.id}|${m.checksum()}`,
+    );
+    // Well formed, and not the receipt for the step it sits on.
+    const tampered = appended.find((row) => row.version === 29)!;
+    expect(tampered.checksum).toMatch(/^sha256:[a-f0-9]{64}$/);
+    expect(appended.map((row) => `${row.version}|${row.migration_id}|${row.checksum}`)).not.toEqual(
+      expected,
+    );
   });
 
   it("migrates a byte-for-byte copy to the current version with its contents intact", () => {
@@ -187,11 +245,20 @@ describe("#762 the deployment's own v25 lineage", () => {
       ...MIGRATIONS.filter((m) => m.fromVersion >= 25).map((m) => m.toVersion),
     ]);
 
-    // Every appended receipt is a well-formed one, not just a row at the right version.
-    for (const row of after.ledger.slice(before.ledger.length)) {
-      expect(row.migration_id).toMatch(/^v\d+-[a-z0-9-]+$/);
-      expect(row.checksum).toMatch(/^sha256:[a-f0-9]{64}$/);
-      expect(row.applied_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    // Every appended receipt is compared to the migration it claims to be, not to a shape. A
+    // well-formed id and a well-formed checksum belonging to a different step both pass a regular
+    // expression and neither passes this.
+    const appended = after.ledger.slice(before.ledger.length);
+    expect(
+      appended.map((row) => `${row.version}|${row.migration_id}|${row.checksum}`),
+    ).toEqual(
+      MIGRATIONS.filter((migration) => migration.fromVersion >= 25).map(
+        (migration) => `${migration.toVersion}|${migration.id}|${migration.checksum()}`,
+      ),
+    );
+    for (const row of appended) {
+      // Full ISO, not a date prefix: `2026-09-02Tanything` satisfies the old check.
+      expect(row.applied_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
     }
 
     // Nothing the v25 had was dropped on the way, and the table that could not be created is now

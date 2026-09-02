@@ -1,4 +1,5 @@
 {
+  "_provenance": "Derived by diffing sqlite_master before and after each incremental step of a real 25->36 run of tests/fixtures/schema-v25-lineage.sql. Typed, and a first transition rather than a statement that was issued: a conditional CREATE that changed nothing is not an owner.",
   "baselineVersion": 25,
   "baselineFixture": "tests/fixtures/schema-v25-lineage.sql",
   "objects": {
@@ -98,10 +99,6 @@
       "type": "trigger",
       "owner": 26
     },
-    "canonical_turn_observations_rebuilt": {
-      "type": "table",
-      "owner": 26
-    },
     "canonical_turn_sources_admission_matches_claim": {
       "type": "trigger",
       "owner": 28
@@ -113,10 +110,6 @@
     "canonical_turns_no_replace": {
       "type": "trigger",
       "owner": 26
-    },
-    "canonical_turns_rebuilt": {
-      "type": "table",
-      "owner": 28
     },
     "conversational_actor_registrations_no_replace": {
       "type": "trigger",
