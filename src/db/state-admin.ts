@@ -58,9 +58,12 @@ is the observation path that still answers when the daemon will not start.
 
 migrate-approved-copy runs the approved chain against one disposable copy and exits. It takes
 --database-copy and has no default: the default is the one database it must never touch. It
-refuses a symlink, a non-regular file, a file with more than one link, and anything that resolves
-to the deployment's own database, before it opens anything. Nothing is started; there is no
-daemon, listener or surviving child. This is the supported form of the dry run the reconciliation
+refuses a symlink, a non-regular file, a file with more than one link, a copy with a write-ahead
+log beside it, and anything that resolves to the deployment's own database. It opens that pathname
+exactly once, read-write, and every later decision is about that descriptor rather than about the
+name; the chain runs against a staged image and is written back through the same descriptor, so
+the copy is written once, at the end, and every refusal happens before that write. Nothing is
+started; there is no daemon, listener or surviving child. This is the supported form of the dry run the reconciliation
 packet used to spell out as an inline node evaluation.
 
 approve-migration is the owner's decision to let that happen. It refuses a live agentcpd

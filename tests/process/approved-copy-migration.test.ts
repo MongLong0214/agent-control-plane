@@ -1,8 +1,10 @@
 import { spawnSync } from "node:child_process";
 import {
   chmodSync,
+  closeSync,
   existsSync,
   linkSync,
+  openSync,
   unlinkSync,
   mkdirSync,
   readFileSync,
@@ -19,8 +21,7 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import {
   SCHEMA_VERSION,
-  __setApprovedCopyWindowHook,
-  __setPreOpenSeamHook,
+  __runApprovedCopyMigrationWithSeam,
   migrateApprovedCopy,
 } from "../../src/db/database.ts";
 import { approveMigration } from "../../src/db/migration-approval.ts";
@@ -436,148 +437,60 @@ describe("U5-POST763-01 supported approved-copy migration", () => {
 });
 
 /**
- * The window between the final under-lock check and the first writable open.
+ * A database left in real WAL mode, with the sidecars SQLite itself produced, and no live mapping.
  *
- * A same-directory A/B case proves the approval names one file. It does not prove *when* that is
- * checked, and the difference is the defect: the first version verified, then constructed `Db`,
- * and `Db` opens its connection before taking exclusivity — so a file swapped in at that pathname
- * was opened read-write and only then refused. These cases stand in that window, in-process,
- * because a spawned command cannot be interrupted at one instruction.
+ * Sidecars written as arbitrary bytes are not a WAL fixture: nothing about them behaves the way a
+ * log behaves, so an oracle comparing them proves only that nobody wrote those bytes.
+ *
+ * Nor is a WAL database with a connection still holding it. That was the first attempt here, and
+ * it was *insensitive*: a second opener maps the existing shared-memory file instead of building
+ * one, so the very probe this oracle exists to catch passed. The three files are therefore copied
+ * out while a connection has them live and the source is closed afterwards, which leaves a real,
+ * self-consistent WAL triple at rest — the state that makes the next open rebuild `-shm`.
  */
-describe("U5-POST763-01 the replacement window", () => {
-  it("refuses a file swapped in after the final check, without opening it", () => {
-    const dir = tempDir("acp-u5-01-window-");
-    chmodSync(dir, 0o700);
-    const approved = seedAt(join(dir, "approved.sqlite"));
-    const intruder = seedAt(join(dir, "intruder.sqlite"));
-    approveMigration(approved, "window-control");
-
-    const before = imprintOf(intruder);
-    __setApprovedCopyWindowHook(() => {
-      // Exactly the moment the old code opened. `rename` is atomic and leaves the pathname
-      // pointing at a different inode — the shape a real swap takes.
-      renameSync(intruder, approved);
-    });
-    try {
-      expect(() => migrateApprovedCopy(approved)).toThrowError(
-        /changed after it was verified under the migration lock/,
-      );
-    } finally {
-      __setApprovedCopyWindowHook(null);
-    }
-
-    expect(imprintOf(approved)).toEqual(before);
-    expect(userVersion(approved)).toBe(25);
-  }, 120_000);
-
-  it("refuses a canonical alias hard-linked onto the approved inode after the check", () => {
-    // Identity alone cannot see this. A hard link leaves device and inode exactly as they were,
-    // so `isSameTarget` still passes while the file has become reachable under a second name —
-    // and here that name is the deployment's own database. The copy and the live store are now
-    // one inode, and migrating "the copy" migrates the deployment.
-    const home = tempDir("acp-u5-01-alias-home-");
-    chmodSync(home, 0o700);
-    const stateDir = join(home, ".agent-control-plane");
-    mkdirSync(stateDir, { recursive: true });
-    chmodSync(stateDir, 0o700);
-
-    const dir = tempDir("acp-u5-01-alias-");
-    chmodSync(dir, 0o700);
-    const approved = seedAt(join(dir, "approved.sqlite"));
-    approveMigration(approved, "alias-control");
-    // Non-empty sidecars, written last because recording the approval opens and closes the
-    // database, and the close takes the sidecars with it. Content rather than absence, so that
-    // "unchanged" is a byte comparison of something real instead of of two `absent`s.
-    writeFileSync(`${approved}-wal`, Buffer.from("wal-content-that-must-not-move"), { mode: 0o600 });
-    writeFileSync(`${approved}-shm`, Buffer.from("shm-content-that-must-not-move"), { mode: 0o600 });
-
-    const before = imprintOf(approved);
-    expect(before.wal).not.toBe("absent");
-    expect(before.shm).not.toBe("absent");
-
-    const realHome = process.env["HOME"];
-    process.env["HOME"] = home;
-    let atSeam: ReturnType<typeof imprintOf> | null = null;
-    __setApprovedCopyWindowHook(() => {
-      // The canonical path did not exist at verification time, which is exactly why a captured
-      // canonical identity cannot catch this.
-      linkSync(approved, join(stateDir, "state.sqlite"));
-      atSeam = imprintOf(approved);
-    });
-    try {
-      expect(() => migrateApprovedCopy(approved)).toThrowError(
-        /reachable under 2 names|deployment's own database/,
-      );
-    } finally {
-      __setApprovedCopyWindowHook(null);
-      if (realHome === undefined) delete process.env["HOME"];
-      else process.env["HOME"] = realHome;
-    }
-
-    const after = imprintOf(approved);
-    // All three artifacts, byte-exact, measured from *before the command ran* — no exception for
-    // `-shm`. There used to be one: the version probe opened a read-only connection, and opening
-    // a WAL database makes SQLite rebuild the shared-memory index beside it, so a file this
-    // command had not decided to touch was already moving. The probe reads the header instead
-    // now, so the exception has nothing left to excuse.
-    expect(atSeam).not.toBeNull();
-    expect(after).toEqual(atSeam);
-    expect(after).toEqual(before);
-    expect(userVersion(approved)).toBe(25);
-  }, 120_000);
-
-  it("still migrates when nothing happens in the window", () => {
-    // The negative control. A guard that refused whenever the hook existed would satisfy the case
-    // above and never let a real migration through.
-    const dir = tempDir("acp-u5-01-window-ok-");
-    chmodSync(dir, 0o700);
-    const approved = seedAt(join(dir, "approved.sqlite"));
-    approveMigration(approved, "window-control-ok");
-
-    let fired = false;
-    __setApprovedCopyWindowHook(() => {
-      fired = true;
-    });
-    try {
-      expect(migrateApprovedCopy(approved).toVersion).toBe(SCHEMA_VERSION);
-    } finally {
-      __setApprovedCopyWindowHook(null);
-    }
-    expect(fired, "the window hook never ran, so the case above proves nothing").toBe(true);
-    expect(userVersion(approved)).toBe(SCHEMA_VERSION);
-  }, 120_000);
-});
+const seedWithRealWal = (path: string): void => {
+  const source = `${path}.live`;
+  const writer = new Database(source);
+  writer.function("acp_schema_migration_authorized", () => 1);
+  writer.exec(LINEAGE);
+  writer.pragma("journal_mode = WAL");
+  writer.pragma("user_version = 25");
+  writer.exec("CREATE TABLE IF NOT EXISTS wal_probe (a INTEGER)");
+  writer.prepare("INSERT INTO wal_probe (a) VALUES (?)").run(1);
+  // Copied while the log is live, so all three files are what SQLite actually wrote.
+  for (const suffix of ["", "-wal", "-shm"]) {
+    writeFileSync(`${path}${suffix}`, readFileSync(`${source}${suffix}`), { mode: 0o600 });
+  }
+  writer.close();
+  for (const suffix of ["", "-wal", "-shm"]) {
+    if (existsSync(`${source}${suffix}`)) unlinkSync(`${source}${suffix}`);
+  }
+};
 
 /**
- * The narrower seam: between the name-level pre-open guard and the open itself.
+ * The pathname is resolved once, into a descriptor, and every later decision is about that object.
  *
- * Every case in the describe above lands *before* the last guard, so a name-based check can still
- * answer them. These land *after* it — in the gap between `lstat` and `open` that no ordering of
- * checks can close — so the guard has already said yes and the pathname it inspected is not the
- * pathname the open will resolve. What decides here is the check that asks the connection which
- * object it opened.
- *
- * Each case asserts three families byte-for-byte from *before the command ran*: the approved copy,
- * the replacement, and the deployment's own database at the path the command derives internally.
+ * These are the cases the three previous designs could not answer. Each asserts three families
+ * byte-for-byte — the approved copy, the intruder, and the deployment's own database at the path
+ * the command derives internally — from before the command to after it returns.
  */
-describe("U5-POST763-01 the pre-open seam", () => {
-  /** One private directory with an approved copy, an intruder, and a derived canonical database. */
-  const seamFixture = (label: string) => {
-    const home = tempDir(`acp-u5-01-seam-${label}-`);
+describe("U5-POST763-01 the descriptor is the authority", () => {
+  const fixture = (label: string) => {
+    const home = tempDir(`acp-u5-01-fd-${label}-`);
     chmodSync(home, 0o700);
     const stateDir = join(home, ".agent-control-plane");
     mkdirSync(stateDir, { recursive: true });
     chmodSync(stateDir, 0o700);
-    const canonical = seedAt(join(stateDir, "state.sqlite"));
-    writeFileSync(`${canonical}-wal`, Buffer.from(`${label}-canonical-wal`), { mode: 0o600 });
-    writeFileSync(`${canonical}-shm`, Buffer.from(`${label}-canonical-shm`), { mode: 0o600 });
+    // The protected canonical database is a real WAL-mode database, so "untouched" is a claim
+    // about a live `-wal` and `-shm` rather than about two files of invented bytes.
+    const canonical = join(stateDir, "state.sqlite");
+    seedWithRealWal(canonical);
+    expect(imprintOf(canonical).wal).not.toBe("absent");
+    expect(imprintOf(canonical).shm).not.toBe("absent");
 
     const approved = seedAt(join(home, "approved.sqlite"));
     const intruder = seedAt(join(home, "intruder.sqlite"));
-    approveMigration(approved, `seam-${label}`);
-    writeFileSync(`${approved}-wal`, Buffer.from(`${label}-approved-wal`), { mode: 0o600 });
-    writeFileSync(`${approved}-shm`, Buffer.from(`${label}-approved-shm`), { mode: 0o600 });
-
+    approveMigration(approved, `fd-${label}`);
     return {
       home,
       approved,
@@ -591,90 +504,137 @@ describe("U5-POST763-01 the pre-open seam", () => {
     };
   };
 
-  /** Runs the command with the seam hook armed, under a HOME the fixture owns. */
-  const inSeam = (home: string, hook: () => void, run: () => void) => {
+  const underHome = <T,>(home: string, run: () => T): T => {
     const realHome = process.env["HOME"];
     process.env["HOME"] = home;
-    __setPreOpenSeamHook(hook);
     try {
-      run();
+      return run();
     } finally {
-      __setPreOpenSeamHook(null);
       if (realHome === undefined) delete process.env["HOME"];
       else process.env["HOME"] = realHome;
     }
   };
 
-  it("refuses a file renamed onto the pathname between the guard and the open", () => {
-    const f = seamFixture("swap");
-    inSeam(f.home, () => renameSync(f.intruder, f.approved), () => {
-      expect(() => migrateApprovedCopy(f.approved)).toThrowError(
-        /opened a different file|changed after it was verified/,
-      );
-    });
+  it("refuses the ABA the descriptor-table scan admitted, and never opens the intruder", () => {
+    // The exact shape the fd-table scan could not see: some unrelated descriptor in this process
+    // is already open on the approved file, the pathname is pointed at an intruder, and then put
+    // back. A scan for "is the expected inode open anywhere in this process" answers yes to the
+    // unrelated descriptor while the connection is on the intruder.
+    //
+    // Here the pathname is resolved once and the answer is the descriptor this command opened, so
+    // the unrelated one is not consulted and cannot vouch for anything.
+    const f = fixture("aba");
+    const unrelated = openSync(f.approved, "r");
+    try {
+      underHome(f.home, () => {
+        expect(() =>
+          __runApprovedCopyMigrationWithSeam(f.approved, () => {
+            renameSync(f.intruder, f.approved);
+          }),
+          // `rename` onto the pathname unlinks the verified object, so the descriptor reports a
+          // link count of zero: the file this command holds open is no longer reachable under any
+          // name at all. Either refusal is the same finding read from the same descriptor.
+        ).toThrowError(/reachable under 0 names|no longer names the copy this command verified/);
+      });
+    } finally {
+      closeSync(unrelated);
+    }
 
-    // The intruder now answers to the approved name. `rename` moves the main file and nothing
-    // else, so the family at that pathname is the intruder's bytes beside the approved copy's own
-    // leftover sidecars — and every one of the three is exactly what it was before the command,
-    // so nothing was opened for writing, no header moved, and no WAL was written.
+    // The intruder now answers to the approved name and is byte-identical to what it was: the
+    // command never opened it, never wrote it, and left no log beside it.
     expect(imprintOf(f.approved)).toEqual({
       main: f.before.intruder.main,
       wal: f.before.approved.wal,
       shm: f.before.approved.shm,
     });
     expect(userVersion(f.approved)).toBe(25);
+    // And the deployment's own real-WAL database is untouched in all three artifacts.
     expect(imprintOf(f.canonical)).toEqual(f.before.canonical);
   }, 120_000);
 
-  it("refuses a symbolic link put in the pathname's place between the guard and the open", () => {
-    const f = seamFixture("symlink");
-    inSeam(f.home, () => {
-      unlinkSync(f.approved);
-      symlinkSync(f.intruder, f.approved);
-    }, () => {
-      expect(() => migrateApprovedCopy(f.approved)).toThrowError(
-        /opened a different file|changed after it was verified/,
-      );
+  it("refuses a hard link made onto the verified object before the commit", () => {
+    // The pathname is undisturbed here — every name-level answer is unchanged. What differs is
+    // the object's own link count, read from the descriptor.
+    const f = fixture("link");
+    const alias = join(f.home, "alias.sqlite");
+    underHome(f.home, () => {
+      expect(() =>
+        __runApprovedCopyMigrationWithSeam(f.approved, () => {
+          linkSync(f.approved, alias);
+        }),
+      ).toThrowError(/reachable under 2 names/);
     });
 
-    expect(imprintOf(f.intruder)).toEqual(f.before.intruder);
-    expect(userVersion(f.intruder)).toBe(25);
-    expect(imprintOf(f.canonical)).toEqual(f.before.canonical);
-  }, 120_000);
-
-  it("refuses a hard link made onto the verified object between the guard and the open", () => {
-    const f = seamFixture("hardlink");
-    // The alias is the deployment's own database *and* the pathname is untouched, so every
-    // name-level answer is unchanged: the approved path still names the verified inode. Only the
-    // object's own link count, read off the descriptor the open produced, differs.
-    unlinkSync(f.canonical);
-    unlinkSync(`${f.canonical}-wal`);
-    unlinkSync(`${f.canonical}-shm`);
-    const before = imprintOf(f.approved);
-    inSeam(f.home, () => linkSync(f.approved, f.canonical), () => {
-      expect(() => migrateApprovedCopy(f.approved)).toThrowError(
-        /reachable under 2 names|deployment's own database/,
-      );
-    });
-
-    expect(imprintOf(f.approved)).toEqual(before);
+    expect(imprintOf(f.approved)).toEqual(f.before.approved);
     expect(userVersion(f.approved)).toBe(25);
+    expect(imprintOf(f.intruder)).toEqual(f.before.intruder);
+    expect(imprintOf(f.canonical)).toEqual(f.before.canonical);
   }, 120_000);
 
-  it("still migrates when nothing happens in the pre-open seam", () => {
-    // The negative control for this seam specifically: a check that refused whenever the hook was
-    // armed would satisfy all three cases above and never let a migration through.
-    const f = seamFixture("ok");
-    unlinkSync(f.canonical);
-    unlinkSync(`${f.canonical}-wal`);
-    unlinkSync(`${f.canonical}-shm`);
-    let fired = false;
-    inSeam(f.home, () => {
-      fired = true;
-    }, () => {
-      expect(migrateApprovedCopy(f.approved).toVersion).toBe(SCHEMA_VERSION);
+  it("refuses a symbolic link standing where the copy was, and leaves both files alone", () => {
+    const f = fixture("symlink");
+    const real = seedAt(join(f.home, "elsewhere.sqlite"));
+    const realBefore = imprintOf(real);
+    unlinkSync(f.approved);
+    symlinkSync(real, f.approved);
+      underHome(f.home, () => {
+        expect(() => migrateApprovedCopy(f.approved)).toThrowError(/refusing a symbolic link/);
+      });
+
+    // The approved pathname's own family, the file the link pointed at, and the canonical
+    // database: none of the three moved.
+    expect(imprintOf(f.approved)).toEqual({
+      main: realBefore.main,
+      wal: f.before.approved.wal,
+      shm: f.before.approved.shm,
     });
-    expect(fired, "the seam hook never ran, so the cases above prove nothing").toBe(true);
+    expect(imprintOf(real)).toEqual(realBefore);
+    expect(userVersion(real)).toBe(25);
+    expect(imprintOf(f.canonical)).toEqual(f.before.canonical);
+  }, 120_000);
+
+  it("refuses a copy that still has a write-ahead log beside it", () => {
+    // In WAL mode the main file's header can lag behind frames living in the sidecar, so a copy
+    // with a log beside it is one whose version cannot be read from its header and whose bytes
+    // cannot be taken from the main file alone. This is also the fixture the `-shm` oracle needs:
+    // a real log, produced by SQLite.
+    const home = tempDir("acp-u5-01-fd-wal-");
+    chmodSync(home, 0o700);
+    const copy = join(home, "copy.sqlite");
+    seedAt(copy);
+    // Approved *before* the log is laid down: recording an approval opens the database read-only,
+    // and the last connection to close a WAL database folds the log back and removes the
+    // sidecars. The triple is written afterwards, over the same inode, so the approval still
+    // names this file.
+    approveMigration(copy, "fd-wal");
+    seedWithRealWal(copy);
+    const before = imprintOf(copy);
+    expect(before.wal).not.toBe("absent");
+    expect(before.shm).not.toBe("absent");
+
+      underHome(home, () => {
+        expect(() => migrateApprovedCopy(copy)).toThrowError(/beside it/);
+      });
+
+    expect(imprintOf(copy)).toEqual(before);
+    expect(userVersion(copy)).toBe(25);
+  }, 120_000);
+
+  it("still migrates the verified object when nothing disturbs it", () => {
+    // The negative control. A design that refused whenever a seam existed would satisfy every
+    // case above and never let a migration through — and the commit has to land on the object the
+    // descriptor named, which is what the version readback proves.
+    const f = fixture("ok");
+    let fired = false;
+      underHome(f.home, () => {
+        const report = __runApprovedCopyMigrationWithSeam(f.approved, () => {
+          fired = true;
+        });
+        expect(report.toVersion).toBe(SCHEMA_VERSION);
+      });
+    expect(fired, "the seam never ran, so the cases above prove nothing").toBe(true);
     expect(userVersion(f.approved)).toBe(SCHEMA_VERSION);
+    expect(imprintOf(f.intruder)).toEqual(f.before.intruder);
+    expect(imprintOf(f.canonical)).toEqual(f.before.canonical);
   }, 120_000);
 });

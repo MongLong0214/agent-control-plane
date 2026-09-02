@@ -666,9 +666,15 @@ of this step imported `openDb` from the deployment's `dist` inside `node --input
 That is a private import spelled out in a runbook: nothing versions it, nothing tests it, and the
 operator proving a chain during an incident is running a program written at the keyboard.
 `migrate-approved-copy` is the same act with an owner — it takes `--database-copy` and has no
-default, refuses a symbolic link, a non-regular file, a file with more than one link and anything
-that resolves to the deployment's own database *before* it opens anything, and starts no daemon,
-listener or surviving child. It prints no path, so its output can be pasted into a report as it
+default, refuses a symbolic link, a non-regular file, a file with more than one link, a copy with
+a write-ahead log beside it and anything that resolves to the deployment's own database, and starts
+no daemon, listener or surviving child. It does not claim to decide before it opens anything — it
+opens the pathname once, read-write, and *that descriptor* is what every later check is about,
+because a check that asks a pathname a second time is describing a file that may not be the one
+SQLite got. The chain runs against a staged image in a private directory and the result is written
+back through the same descriptor: one write to the copy, at the end, with every refusal ahead of
+it. The copy is replaced in place at that point, so a crash inside that write leaves it torn —
+the copy is disposable, but the failure mode is worth knowing. It prints no path, so its output can be pasted into a report as it
 stands.
 
 **What a failure looks like — not just the success path.** `migrate()` in `src/db/database.ts`

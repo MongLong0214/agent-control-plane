@@ -1,14 +1,20 @@
 import Database from "better-sqlite3";
 import {
+  chmodSync,
   closeSync,
   existsSync,
   fstatSync,
+  fsyncSync,
+  ftruncateSync,
   lstatSync,
+  mkdtempSync,
   openSync,
+  readFileSync,
   readSync,
-  readdirSync,
   realpathSync,
+  rmSync,
   statSync,
+  writeSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -37,6 +43,7 @@ import {
   type SchemaMigration,
 } from "./migrations.ts";
 import {
+  approveMigration,
   assertMigrationApproved,
   migrationPlanFrom,
   readMigrationApproval,
@@ -296,27 +303,7 @@ export class Db {
       ensurePrivateDirectory(dirname(filename));
       if (databaseExisted) assertPrivateDatabaseFiles(filename);
     }
-    // Before the connection exists, because opening one is already a write to the header. If a
-    // caller is handing this open a migration lock it holds, the file at this pathname has to
-    // still be the file that caller verified under that lock — otherwise the replacement gets
-    // opened read-write and only then refused, which is the regression this closes.
-    assertHeldLockStillDescribes(filename);
-    // `fileMustExist` under a held lock: if the verified file is unlinked in the seam, an ordinary
-    // open would *create* an empty database at that pathname — a refusal that leaves a new file
-    // behind is still an effect.
-    const guarded = heldLockDescribes(filename);
-    if (guarded) preOpenSeamHook?.();
-    this.#raw = new Database(filename, guarded ? { fileMustExist: true } : {});
-    if (guarded) {
-      // The name-level check above is an early refusal. This is the one that decides, because it
-      // asks the connection what it opened rather than asking the pathname again.
-      try {
-        assertHeldLockOwnsTheOpenedFile(filename);
-      } catch (error) {
-        this.#raw.close();
-        throw error;
-      }
-    }
+    this.#raw = new Database(filename);
     let temporaryStorage: typeof this.temporaryStorage;
     try {
       if (this.options.temporaryStorage === "MEMORY") {
@@ -562,12 +549,6 @@ export class Db {
    */
   private withMigrationExclusivity(work: () => void): void {
     const lockPath = lockPathFor(this.file);
-    if (heldMigrationLock?.lockPath === lockPath) {
-      // Held by the caller across this whole open. Acquiring again would deny — the lock refuses
-      // rather than waiting — and every check inside `work` is the same either way.
-      work();
-      return;
-    }
     const lock = new SingleInstanceLock(lockPath);
     const acquired = lock.acquire(new Date().toISOString());
     if (!acquired.allowed) {
@@ -1264,49 +1245,6 @@ export const translate = (err: unknown): unknown => {
 
 export const openDb = (filename: string, options?: DbOpenOptions): Db => new Db(filename, options);
 
-/**
- * The one capability that lets an open reuse a migration lock its caller already holds.
- *
- * Not an option, and not a boolean. `migrationLockHeld?: boolean` on the exported options was a
- * claim any caller could make: it said "the lock is held" without carrying anything only a
- * lock-holder could have, so the authority was forgeable from outside the module. Review named
- * that, and a supplied canonical path in the same signature, as the same class of defect.
- *
- * This lives in module scope, is set only by `migrateApprovedCopy` while it actually holds the
- * lock, and names the three things it is a capability *over*: the exact lock path, the identity
- * of the copy it verified, and the deployment's own identity as this module derived it. `Db`
- * accepts it only when all three still describe the file it is about to open.
- */
-interface HeldMigrationLock {
-  lockPath: string;
-  copy: TargetIdentity;
-}
-let heldMigrationLock: HeldMigrationLock | null = null;
-
-/**
- * Test-only seam at the window this whole capability exists to close: after the final under-lock
- * verification and before the first writable open. Nothing here grants authority — it only lets a
- * test act in the moment a replacement would.
- */
-let approvedCopyWindowHook: (() => void) | null = null;
-export const __setApprovedCopyWindowHook = (hook: (() => void) | null): void => {
-  approvedCopyWindowHook = hook;
-};
-
-/**
- * Test-only seam at the narrower window: after the name-level pre-open guard and before the open.
- *
- * The window hook above stands where a replacement lands between verification and construction.
- * This one stands one statement later — between `lstat` and `open`, the gap no ordering of checks
- * can remove — because that is where a name-based guard has already given its answer and the open
- * has not yet happened. A counterexample placed here is invisible to every check that asks a
- * pathname, which is exactly what it is for.
- */
-let preOpenSeamHook: (() => void) | null = null;
-export const __setPreOpenSeamHook = (hook: (() => void) | null): void => {
-  preOpenSeamHook = hook;
-};
-
 /** What one approved-copy migration did, in the terms an operator can check (`U5-POST763-01`). */
 export interface ApprovedCopyMigrationReport {
   fromVersion: number;
@@ -1327,20 +1265,60 @@ export interface ApprovedCopyMigrationReport {
  * it, nothing tests it, and the operator proving a chain during an incident is running a program
  * they wrote at the keyboard. This is the same act with an owner.
  *
- * It adds no migration behaviour. The approval, the lock, the opened-target/approved-target
- * identity check, the under-lock version check, the ordered transaction chain, and the automatic
- * pre-migration backup with its restore-on-failure are the ones `Db` already runs — a second
- * engine would be a second set of rules to keep in step.
+ * **The operator's pathname is resolved exactly once, into a descriptor, and never again.**
  *
- * The writer is closed before the result is collected, and the readback opens read-only: a report
- * assembled from the connection that just wrote is a report about what that connection intended.
+ * Three designs came before this one and each was the same mistake in a new spelling: verify a
+ * pathname, then hand that pathname to SQLite and hope the two syscalls saw the same file. They
+ * cannot be made to. The last attempt scanned this process's descriptor table for the expected
+ * inode, which is not a statement about *this* connection at all — hold an unrelated descriptor
+ * on the approved file, point the pathname at an intruder for the duration of the open, and put
+ * it back, and the scan finds the unrelated descriptor, the pathname re-check agrees, and the
+ * connection is on the intruder. A check that can be satisfied by a file nobody opened is not a
+ * check.
+ *
+ * `better-sqlite3` exposes no way to hand a connection a descriptor (`prepare`, `pragma`,
+ * `backup`, `serialize`, `exec` and nine others — nothing that takes or returns a handle), so a
+ * connection-owned binding cannot be built on the supported API. The design therefore stops
+ * trying to make a writable open of the operator's file safe, and stops opening it at all:
+ *
+ *   1. the pathname is opened once, read-write, and every fact after that — size, shape, link
+ *      count, schema version, approved identity — is read from that descriptor;
+ *   2. the bytes are copied *out through the descriptor* into a staging file this command
+ *      creates, and the approved chain runs there, against `Db`, with its own approval, lock and
+ *      pre-migration backup, in a private directory whose approval cannot name anything else;
+ *   3. the migrated bytes are written back *through the same descriptor*, and only after the
+ *      descriptor is re-confirmed to be a single-linked file that the operator's pathname still
+ *      names and that is not the deployment's own database.
+ *
+ * There is exactly one write to the operator's file and it happens at step 3. Everything that can
+ * refuse, refuses before it — so "unchanged on refusal" is a property of the shape rather than of
+ * a guard winning a race.
+ *
+ * What this does not do: it is not crash-atomic against the operator's copy. Step 3 replaces the
+ * file's contents in place, so a crash inside that write leaves the copy torn. The copy is
+ * disposable by contract and the migrated image survives in the staging directory until the write
+ * completes, but an operator should know the failure mode rather than discover it.
  */
-export const migrateApprovedCopy = (databasePath: string): ApprovedCopyMigrationReport => {
-  // The lock is taken *first*, and everything below happens under it — including the writable
-  // open. `Db` takes exclusivity only after opening its connection, so a caller that checks and
-  // then constructs has checked outside the lock: replace the file at that pathname in between and
-  // the replacement is opened read-write, moving its header, before any identity check runs.
-  // Measured on the previous head: a refusal still moved a byte in a database it declined.
+export const migrateApprovedCopy = (databasePath: string): ApprovedCopyMigrationReport =>
+  runApprovedCopyMigration(databasePath, undefined);
+
+/**
+ * The same run with a seam, for tests that need to act between staging and the commit.
+ *
+ * Passed as an argument rather than parked in a module-global: ambient state is replaceable and
+ * re-enterable by anything that can reach the setter, which is how the previous seam could null
+ * out the very capability it was supposed to be tested against. A parameter is scoped to one call
+ * and cannot be forged from outside it.
+ */
+export const __runApprovedCopyMigrationWithSeam = (
+  databasePath: string,
+  seam: () => void,
+): ApprovedCopyMigrationReport => runApprovedCopyMigration(databasePath, seam);
+
+const runApprovedCopyMigration = (
+  databasePath: string,
+  seam: (() => void) | undefined,
+): ApprovedCopyMigrationReport => {
   const lockPath = lockPathFor(databasePath);
   const lock = new SingleInstanceLock(lockPath);
   const acquired = lock.acquire(new Date().toISOString());
@@ -1352,63 +1330,172 @@ export const migrateApprovedCopy = (databasePath: string): ApprovedCopyMigration
     );
   }
   try {
-    const fromVersion = assertApprovedCopyUnderLock(databasePath);
-    heldMigrationLock = { lockPath, copy: targetIdentityOf(databasePath) };
-    try {
-      // The window. A replacement landing here is what the pre-open check in `Db`'s constructor
-      // refuses, and the hook is how a test gets to stand in it.
-      approvedCopyWindowHook?.();
-      const writer = new Db(databasePath);
-      writer.close();
-    } finally {
-      heldMigrationLock = null;
+    // Shape questions the pathname must answer before it is opened at all: an `open` follows a
+    // symbolic link, and following one would put the descriptor on a file the operator did not
+    // name.
+    const named = lstatSync(databasePath, { throwIfNoEntry: false });
+    if (!named) throw acpError(ReasonCode.INTERNAL_ERROR, "the named copy does not exist", {});
+    if (named.isSymbolicLink()) {
+      throw acpError(ReasonCode.INTERNAL_ERROR, "refusing a symbolic link: name the copy itself", {});
+    }
+    if (!named.isFile()) {
+      throw acpError(ReasonCode.INTERNAL_ERROR, "refusing a target that is not a regular file", {});
+    }
+    // A copy handed to this command has to be at rest. In WAL mode the main file's header can lag
+    // behind committed frames living in the sidecar, so a copy with a log beside it is a database
+    // whose version this command cannot read from the header and whose bytes it cannot copy by
+    // reading the main file alone.
+    for (const sidecar of ["-wal", "-shm"]) {
+      if (existsSync(`${databasePath}${sidecar}`)) {
+        throw acpError(
+          ReasonCode.INTERNAL_ERROR,
+          `refusing a copy with a ${sidecar.slice(1)} beside it: check it in and name it at rest`,
+          {},
+        );
+      }
     }
 
-    const raw = new Database(databasePath, { readonly: true, fileMustExist: true });
+    const descriptor = openSync(databasePath, "r+");
+    let stagingDir: string | null = null;
     try {
-      const toVersion = Number(raw.pragma("user_version", { simple: true }));
-      const receipts = raw
-        .prepare(
-          `SELECT migration_id AS id, checksum FROM schema_migrations
-            WHERE version > ? ORDER BY version`,
-        )
-        .all(fromVersion) as Array<{ id: string; checksum: string | null }>;
-      return {
-        fromVersion,
-        toVersion,
-        migrations: receipts.map((receipt) => ({
-          id: receipt.id,
-          checksum: /^sha256:[a-f0-9]{64}$/.test(receipt.checksum ?? ""),
-        })),
-        approvalRetired: readMigrationApproval(databasePath) === null,
-        daemonless: true,
+      const opened = fstatSync(descriptor);
+      if (!opened.isFile()) {
+        throw acpError(ReasonCode.INTERNAL_ERROR, "refusing a target that is not a regular file", {});
+      }
+      if (opened.nlink !== 1) {
+        throw acpError(
+          ReasonCode.INTERNAL_ERROR,
+          `refusing a copy with ${opened.nlink} links: it is reachable under another name`,
+          {},
+        );
+      }
+      // The identity of the file this command holds, taken from the descriptor. Everything below
+      // compares against this, so a pathname that stops leading here cannot redirect any of it.
+      const target: TargetIdentity = {
+        path: realpathSync(databasePath),
+        device: opened.dev,
+        inode: opened.ino,
       };
+      assertApprovedCopyIdentity(databasePath, descriptor, target);
+      const fromVersion = APPROVED_COPY_FROM_VERSION;
+
+      // Stage: the bytes come out through the descriptor, not by reading the pathname again.
+      stagingDir = mkdtempSync(join(dirname(target.path), ".acp-migrate-"));
+      chmodSync(stagingDir, 0o700);
+      const staged = join(stagingDir, "copy.sqlite");
+      copyOutOfDescriptor(descriptor, opened.size, staged);
+
+      seam?.();
+
+      // The approval for the staged file lives in the staging directory — `migrationApprovalPath`
+      // is `dirname(database)/migration-approval.json` — so it names that file and can name
+      // nothing else. It is the operator's approval that authorises this; this one only carries
+      // that decision to the file the chain actually runs against.
+      approveMigration(staged, "approved-copy migration");
+      const writer = new Db(staged);
+      writer.close();
+      checkpointFully(staged);
+
+      const report = readBackApprovedCopy(staged, fromVersion);
+
+      // Commit. Re-confirmed against the descriptor and against the pathname, because between
+      // staging and here the operator's file may have gained a link, or the pathname may have
+      // been pointed somewhere else — in which case this is no longer the act that was approved.
+      const atCommit = fstatSync(descriptor);
+      if (atCommit.nlink !== 1) {
+        throw acpError(
+          ReasonCode.INTERNAL_ERROR,
+          `the copy became reachable under ${atCommit.nlink} names before it could be written`,
+          {},
+        );
+      }
+      const nowNamed = statSync(databasePath, { throwIfNoEntry: false });
+      if (!nowNamed || nowNamed.dev !== target.device || nowNamed.ino !== target.inode) {
+        throw acpError(
+          ReasonCode.INTERNAL_ERROR,
+          "the pathname no longer names the copy this command verified",
+          {},
+        );
+      }
+      assertNotTheDeploymentsOwnDatabase(target);
+      writeIntoDescriptor(descriptor, staged);
+
+      const retirement = retireMigrationApproval(databasePath, fromVersion, report.toVersion);
+      return { ...report, approvalRetired: retirement.retired, daemonless: true };
     } finally {
-      raw.close();
+      closeSync(descriptor);
+      if (stagingDir !== null) rmSync(stagingDir, { recursive: true, force: true });
     }
   } finally {
     lock.release();
   }
 };
 
+/** Copies a database out through the descriptor that was verified, never by pathname. */
+const copyOutOfDescriptor = (descriptor: number, size: number, destination: string): void => {
+  const out = openSync(destination, "wx", 0o600);
+  try {
+    const chunk = Buffer.alloc(Math.min(size === 0 ? 1 : size, 1 << 20));
+    let offset = 0;
+    while (offset < size) {
+      const read = readSync(descriptor, chunk, 0, Math.min(chunk.length, size - offset), offset);
+      if (read === 0) break;
+      writeSync(out, chunk, 0, read, offset);
+      offset += read;
+    }
+  } finally {
+    closeSync(out);
+  }
+};
+
+/** Installs the migrated image into the verified object, through the descriptor that names it. */
+const writeIntoDescriptor = (descriptor: number, source: string): void => {
+  const bytes = readFileSync(source);
+  ftruncateSync(descriptor, 0);
+  writeSync(descriptor, bytes, 0, bytes.length, 0);
+  fsyncSync(descriptor);
+};
+
+/** Folds the log back into the main file, so the staged image is complete on its own. */
+const checkpointFully = (databaseFile: string): void => {
+  const raw = new Database(databaseFile, { fileMustExist: true });
+  try {
+    raw.pragma("wal_checkpoint(TRUNCATE)");
+  } finally {
+    raw.close();
+  }
+};
+
+/** The report, read from the migrated image rather than from the connection that wrote it. */
+const readBackApprovedCopy = (
+  databaseFile: string,
+  fromVersion: number,
+): Omit<ApprovedCopyMigrationReport, "approvalRetired" | "daemonless"> => {
+  const raw = new Database(databaseFile, { readonly: true, fileMustExist: true });
+  try {
+    const toVersion = Number(raw.pragma("user_version", { simple: true }));
+    const receipts = raw
+      .prepare(
+        `SELECT migration_id AS id, checksum FROM schema_migrations
+          WHERE version > ? ORDER BY version`,
+      )
+      .all(fromVersion) as Array<{ id: string; checksum: string | null }>;
+    return {
+      fromVersion,
+      toVersion,
+      migrations: receipts.map((receipt) => ({
+        id: receipt.id,
+        checksum: /^sha256:[a-f0-9]{64}$/.test(receipt.checksum ?? ""),
+      })),
+    };
+  } finally {
+    raw.close();
+  }
+};
+
 /** The one version an approved copy may start from, and the one this command exists for. */
 const APPROVED_COPY_FROM_VERSION = 25;
 
-/**
- * Everything that must be true of the copy, checked under the migration lock and before any
- * writable handle exists.
- *
- * Each refusal names a way the command could otherwise touch a database nobody approved:
- *
- *   - a symbolic link is a second name for bytes the approval named once;
- *   - a non-regular file is not a database;
- *   - more than one link means "this copy" no longer identifies anything;
- *   - the deployment's own database is the one file this command exists to never open;
- *   - an approval whose target is a *different* file in the same directory is the capability
- *     defect `#747` closed, and matching it only inside `Db` matches it after the open;
- *   - a version other than 25, or a plan that is not exactly the current ordered chain from 25,
- *     is a different migration than the one approved.
- */
 /**
  * The deployment's own database, derived here rather than supplied.
  *
@@ -1428,153 +1515,12 @@ const deploymentDatabasePath = (): string =>
 const lockPathFor = (databaseFile: string): string =>
   join(realpathSync(dirname(databaseFile)), "agentcpd.lock");
 
-/** True when the caller handed this open a migration lock it is holding over this pathname. */
-const heldLockDescribes = (filename: string): boolean =>
-  heldMigrationLock !== null &&
-  filename !== ":memory:" &&
-  heldMigrationLock.lockPath === lockPathFor(filename);
-
-/** Where this process's own open file descriptors can be enumerated and stat'ed. */
-const openDescriptorDirectory = (): string =>
-  process.platform === "linux" ? "/proc/self/fd" : "/dev/fd";
-
-/**
- * Refuses unless the file this connection *actually opened* is the one verified under the lock.
- *
- * Every check before this one asks a pathname a question, and a pathname is not the thing being
- * protected. `lstat(path)` then `open(path)` are two syscalls, and no amount of moving them
- * closer together makes them one: a swap landing between them is opened, and a swap that lands
- * and is undone between them leaves every name-based check agreeing while the handle holds the
- * intruder. That last interleaving is invisible to name re-checks by construction, which is why
- * listing more of them does not close this.
- *
- * So this asks the connection instead. The descriptor table is what the open produced; stat'ing
- * it names the object with no path involved, and `nlink` read from that descriptor is the object's
- * own link count — a hard link added under *any* name, at any moment before this line, shows up
- * here without this function knowing that name exists.
- *
- * Refusing here costs nothing that has to be recovered: a bare connection writes no header and
- * creates no `-wal` or `-shm` (measured), and the caller closes it before this throw propagates.
- *
- * Fail-closed: if the descriptor table cannot be read, the question was not answered, and an
- * unanswered question is not a pass.
- */
-const assertHeldLockOwnsTheOpenedFile = (filename: string): void => {
-  const held = heldMigrationLock;
-  if (!held) return;
-  const expected = held.copy;
-
-  let descriptors: string[];
-  try {
-    descriptors = readdirSync(openDescriptorDirectory());
-  } catch {
-    throw acpError(
-      ReasonCode.INTERNAL_ERROR,
-      "cannot verify which file this connection opened, so it will not be used",
-      {},
-    );
-  }
-
-  let linksOnTheOpenedObject: number | null = null;
-  for (const entry of descriptors) {
-    const descriptor = Number(entry);
-    if (!Number.isInteger(descriptor)) continue;
-    let opened;
-    try {
-      opened = fstatSync(descriptor);
-    } catch {
-      continue;
-    }
-    if (opened.dev === expected.device && opened.ino === expected.inode) {
-      linksOnTheOpenedObject = opened.nlink;
-      break;
-    }
-  }
-  if (linksOnTheOpenedObject === null) {
-    throw acpError(
-      ReasonCode.INTERNAL_ERROR,
-      "this connection opened a different file than the one verified under the migration lock",
-      {},
-    );
-  }
-  if (linksOnTheOpenedObject !== 1) {
-    throw acpError(
-      ReasonCode.INTERNAL_ERROR,
-      `the verified file is reachable under ${linksOnTheOpenedObject} names`,
-      {},
-    );
-  }
-
-  // The operator asked to migrate a *path*. An inode the path no longer names is not what they
-  // asked for, however correct the handle is.
-  const now = existsSync(filename) ? targetIdentityOf(filename) : null;
-  if (!now || !isSameTarget(now, expected)) {
-    throw acpError(
-      ReasonCode.INTERNAL_ERROR,
-      "the file at this path changed after it was verified under the migration lock",
-      {},
-    );
-  }
-
+/** Refuses the one file this command exists never to touch, compared by object not by name. */
+const assertNotTheDeploymentsOwnDatabase = (target: TargetIdentity): void => {
   const canonicalPath = deploymentDatabasePath();
-  if (existsSync(canonicalPath)) {
-    const canonical = targetIdentityOf(canonicalPath);
-    if (canonical.device === expected.device && canonical.inode === expected.inode) {
-      throw acpError(
-        ReasonCode.INTERNAL_ERROR,
-        "refusing to migrate the deployment's own database through the copy path",
-        {},
-      );
-    }
-  }
-};
-
-/**
- * Refuses an open whose target stopped being the one the held lock was taken over.
- *
- * Identity alone is not enough, and that is the finding this shape exists for: a hard link added
- * after the check leaves the device and inode exactly as they were, so `isSameTarget` still
- * passes while the file has become reachable under a second name — and if that second name is the
- * deployment's own database, this command is about to migrate the live store through its copy
- * path. So the file's *shape* is re-measured here too, and the canonical target is re-derived
- * rather than compared to what it was at verification time: a canonical alias that did not exist
- * then is precisely the case a captured value cannot see.
- */
-const assertHeldLockStillDescribes = (filename: string): void => {
-  const held = heldMigrationLock;
-  if (!held || filename === ":memory:") return;
-  if (held.lockPath !== lockPathFor(filename)) return;
-
-  const stat = lstatSync(filename, { throwIfNoEntry: false });
-  if (!stat || stat.isSymbolicLink() || !stat.isFile()) {
-    throw acpError(
-      ReasonCode.INTERNAL_ERROR,
-      "the file at this path changed after it was verified under the migration lock",
-      {},
-    );
-  }
-  if (stat.nlink !== 1) {
-    throw acpError(
-      ReasonCode.INTERNAL_ERROR,
-      `the copy became reachable under ${stat.nlink} names after it was verified`,
-      {},
-    );
-  }
-
-  const now = targetIdentityOf(filename);
-  if (!isSameTarget(now, held.copy)) {
-    throw acpError(
-      ReasonCode.INTERNAL_ERROR,
-      "the file at this path changed after it was verified under the migration lock",
-      {},
-    );
-  }
-
-  // Re-derived, not the value captured at verification: a canonical database that appeared since
-  // then — or an alias linked onto this very inode — is invisible to the captured one.
-  const canonicalPath = deploymentDatabasePath();
-  const canonicalNow = existsSync(canonicalPath) ? targetIdentityOf(canonicalPath) : null;
-  if (canonicalNow && isSameTarget(now, canonicalNow)) {
+  if (!existsSync(canonicalPath)) return;
+  const canonical = targetIdentityOf(canonicalPath);
+  if (canonical.device === target.device && canonical.inode === target.inode) {
     throw acpError(
       ReasonCode.INTERNAL_ERROR,
       "refusing to migrate the deployment's own database through the copy path",
@@ -1583,37 +1529,25 @@ const assertHeldLockStillDescribes = (filename: string): void => {
   }
 };
 
-const assertApprovedCopyUnderLock = (databasePath: string): number => {
-  const stat = lstatSync(databasePath, { throwIfNoEntry: false });
-  if (!stat) throw acpError(ReasonCode.INTERNAL_ERROR, "the named copy does not exist", {});
-  if (stat.isSymbolicLink()) {
-    throw acpError(ReasonCode.INTERNAL_ERROR, "refusing a symbolic link: name the copy itself", {});
-  }
-  if (!stat.isFile()) {
-    throw acpError(ReasonCode.INTERNAL_ERROR, "refusing a target that is not a regular file", {});
-  }
-  if (stat.nlink !== 1) {
-    throw acpError(
-      ReasonCode.INTERNAL_ERROR,
-      `refusing a copy with ${stat.nlink} links: it is reachable under another name`,
-      {},
-    );
-  }
+/**
+ * Everything that must be true of the object this command is holding open.
+ *
+ * The old version of this asked the pathname each question and then handed the pathname to
+ * SQLite, so every answer described a file that might not be the one that got opened. Here the
+ * version comes out of the descriptor's own bytes and the approval is matched against the
+ * identity the descriptor reported — which is what makes the exact ABA (hold an unrelated
+ * descriptor on the approved file, point the pathname at an intruder across the open, put it
+ * back) a refusal rather than a pass: the intruder's device and inode are what this reads, and
+ * the approval names the approved file's.
+ */
+const assertApprovedCopyIdentity = (
+  databasePath: string,
+  descriptor: number,
+  target: TargetIdentity,
+): void => {
+  assertNotTheDeploymentsOwnDatabase(target);
 
-  const canonicalDatabasePath = deploymentDatabasePath();
-  const target = targetIdentityOf(databasePath);
-  if (
-    existsSync(canonicalDatabasePath) &&
-    isSameTarget(target, targetIdentityOf(canonicalDatabasePath))
-  ) {
-    throw acpError(
-      ReasonCode.INTERNAL_ERROR,
-      "refusing to migrate the deployment's own database through the copy path",
-      {},
-    );
-  }
-
-  const onDisk = onDiskVersionReadOnly(databasePath);
+  const onDisk = versionFromDescriptor(descriptor);
   if (onDisk !== APPROVED_COPY_FROM_VERSION) {
     throw acpError(
       ReasonCode.INTERNAL_ERROR,
@@ -1628,7 +1562,9 @@ const assertApprovedCopyUnderLock = (databasePath: string): number => {
   }
   if (!isSameTarget(approval.target, target)) {
     // The approval is a capability over one file. Two databases in one private directory, an
-    // approval taken on A and this command run on B, is exactly the split `#747` measured.
+    // approval taken on A and this command run on B, is exactly the split `#747` measured — and
+    // it is also what catches an intruder standing at the approved pathname, because `target`
+    // came from the descriptor rather than from resolving that pathname a second time.
     throw acpError(
       ReasonCode.INTERNAL_ERROR,
       "the approval on file names a different database than this copy",
@@ -1656,7 +1592,6 @@ const assertApprovedCopyUnderLock = (databasePath: string): number => {
       {},
     );
   }
-  return onDisk;
 };
 
 /**
@@ -1673,15 +1608,9 @@ const assertApprovedCopyUnderLock = (databasePath: string): number => {
 const SQLITE_HEADER_BYTES = 100;
 const SQLITE_MAGIC = "SQLite format 3\u0000";
 
-const onDiskVersionReadOnly = (databasePath: string): number => {
+const versionFromDescriptor = (descriptor: number): number => {
   const header = Buffer.alloc(SQLITE_HEADER_BYTES);
-  const fd = openSync(databasePath, "r");
-  let read: number;
-  try {
-    read = readSync(fd, header, 0, SQLITE_HEADER_BYTES, 0);
-  } finally {
-    closeSync(fd);
-  }
+  const read = readSync(descriptor, header, 0, SQLITE_HEADER_BYTES, 0);
   if (read < SQLITE_HEADER_BYTES || header.toString("latin1", 0, 16) !== SQLITE_MAGIC) {
     throw acpError(ReasonCode.INTERNAL_ERROR, "this copy is not an SQLite database", {});
   }
