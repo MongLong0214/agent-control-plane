@@ -273,7 +273,7 @@ export const main = async (argv: string[]): Promise<number> => {
     // target and ordered plan — is inside `migrateApprovedCopy`, under the migration lock and
     // before the first writable handle. Checking any of them here would be checking them outside
     // that lock, which is the window a replacement at this pathname walks through.
-    const report = migrateApprovedCopy(parsed.databaseCopy!, defaultDatabasePath());
+    const report = migrateApprovedCopy(parsed.databaseCopy!);
     // Version, ids, whether each receipt carries a checksum, retirement, and the mode. Not the
     // path: an operator pastes this into a report, and the location of a private copy is not part
     // of what the chain did.

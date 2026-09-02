@@ -621,11 +621,21 @@ right before this line, not copied from this document):
     ( cd /Users/isaac/projects/agent-control-plane && pnpm install && pnpm rebuild better-sqlite3 && pnpm build )
     grep -n "SCHEMA_VERSION = " /Users/isaac/projects/agent-control-plane/src/db/migrations.ts
 
-Then validate the exact code that is about to run, against a disposable copy of the item-2
-backup:
+**Disposable-copy migration — a separate authority, and deliberately a small one.**
 
+Everything above this paragraph rebuilds a checkout: it fetches, pins a SHA and builds, and it is
+the step that decides *which bytes* the deployment will run. The procedure below decides nothing
+of the kind. It takes one parameter — a database image to copy — and one installed command, and
+it proves a chain against a throwaway file. Keeping the two apart is the point: an operator who
+only needs the second must not have to hold the first, and a step that carries checkout authority
+it does not use is a step that can be run for the wrong reason.
+
+Inputs: `$SOURCE_IMAGE`, any readable database image (item 2's backup is the useful one), and the
+installed `agentcpd-state`. Nothing else — no checkout, no build, no path into a working tree.
+
+    SOURCE_IMAGE="${SOURCE_IMAGE:?name the image to copy}"
     DRY_DIR="$(mktemp -d)"; DRY="$DRY_DIR/dry-run.sqlite"
-    cp "$BACKUP_PATH" "$DRY"
+    cp "$SOURCE_IMAGE" "$DRY"
     chmod 700 "$DRY_DIR"; chmod 600 "$DRY"
     # #738 — a migration is now a decided act, and the dry run has to decide it too. This
     # approves the throwaway copy only: the approval file lands in $DRY_DIR beside it, names
@@ -646,6 +656,10 @@ checkout. A runbook step that runs `node <checkout>/dist/db/state-admin.js` make
 working tree the authority for what the operator just proved: it is the same failure as the
 inline program below, one indirection further out, and it is what an operator reaches for when
 the installed interface is the thing they are trying to verify.
+
+For the same reason the block above takes `$SOURCE_IMAGE` rather than reaching for
+`$BACKUP_PATH`: naming a variable set by an earlier step makes this procedure inseparable from
+that step, and it is meant to be runnable on any image, by anyone holding one, at any time.
 
 **The command is the interface; there is no inline program here any more.** An earlier revision
 of this step imported `openDb` from the deployment's `dist` inside `node --input-type=module -e`.

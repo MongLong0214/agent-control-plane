@@ -1,12 +1,26 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, linkSync, mkdirSync, readFileSync, statSync, symlinkSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  symlinkSync,
+} from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import Database from "better-sqlite3";
 import { afterAll, describe, expect, it } from "vitest";
 
-import { SCHEMA_VERSION } from "../../src/db/database.ts";
+import {
+  SCHEMA_VERSION,
+  __setApprovedCopyWindowHook,
+  migrateApprovedCopy,
+} from "../../src/db/database.ts";
+import { approveMigration } from "../../src/db/migration-approval.ts";
 import { MIGRATIONS } from "../../src/db/migrations.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
@@ -91,6 +105,13 @@ const seedAt = (path: string, version = 25): string => {
   return path;
 };
 
+/** Bytes plus the sidecars an open would create — what "unchanged" has to mean for a database. */
+const imprintOf = (path: string) => ({
+  bytes: readFileSync(path),
+  wal: existsSync(`${path}-wal`),
+  shm: existsSync(`${path}-shm`),
+});
+
 const userVersion = (path: string): number => {
   const raw = new Database(path, { readonly: true, fileMustExist: true });
   try {
@@ -115,6 +136,11 @@ describe("U5-POST763-01 supported approved-copy migration", () => {
     const { dir, path } = v25Copy("green");
     const before = readFileSync(path);
     expect(userVersion(path)).toBe(25);
+
+    // Snapshotted before the command, not after: a protected database compared only to its own
+    // later state proves nothing about what the command did in between.
+    const protectedSource = v25Copy("protected");
+    const protectedBefore = imprintOf(protectedSource.path);
 
     approve(path, dir);
 
@@ -151,11 +177,39 @@ describe("U5-POST763-01 supported approved-copy migration", () => {
     // something other than what it claims to be.
     expect(result.stdout).not.toMatch(/listening|socket|daemon started/i);
 
-    // The protected source is a different file and is untouched: this test's own fixture is the
-    // stand-in for every database that is not the approved copy.
-    const untouched = v25Copy("protected");
-    expect(readFileSync(untouched.path).length).toBeGreaterThan(0);
-    expect(userVersion(untouched.path)).toBe(25);
+    // The report is the command's own account of itself. Everything above is checked again here
+    // against the database and the filesystem, because a command that printed the right JSON and
+    // did something else would pass every assertion so far.
+    const raw = new Database(path, { readonly: true, fileMustExist: true });
+    try {
+      const receipts = raw
+        .prepare(
+          "SELECT version, migration_id AS id, checksum FROM schema_migrations WHERE version > 25 ORDER BY version",
+        )
+        .all() as Array<{ version: number; id: string; checksum: string }>;
+      expect(receipts.map((row) => `${row.version}|${row.id}`)).toEqual(
+        MIGRATIONS.filter((migration) => migration.fromVersion >= 25).map(
+          (migration) => `${migration.toVersion}|${migration.id}`,
+        ),
+      );
+      // Checksums read from the ledger, not a boolean the command computed about them.
+      for (const row of receipts) expect(row.checksum).toMatch(/^sha256:[a-f0-9]{64}$/);
+    } finally {
+      raw.close();
+    }
+
+    // Retirement is a fact about a file, and the command's `approvalRetired` is a claim about it.
+    expect(existsSync(join(dir, "migration-approval.json"))).toBe(false);
+
+    // The protected source was captured *before* the command ran, so "untouched" is measured
+    // against what it was rather than against what it is now.
+    const afterProtected = imprintOf(protectedSource.path);
+    expect(afterProtected.bytes).toEqual(protectedBefore.bytes);
+    expect([afterProtected.wal, afterProtected.shm]).toEqual([
+      protectedBefore.wal,
+      protectedBefore.shm,
+    ]);
+    expect(userVersion(protectedSource.path)).toBe(25);
     expect(before.length).toBeGreaterThan(0);
   }, 120_000);
 
@@ -196,13 +250,6 @@ describe("U5-POST763-01 supported approved-copy migration", () => {
     expect(readFileSync(other.path)).toEqual(otherBefore);
   }, 120_000);
 
-  /** Bytes plus the sidecars an open would create — what "unchanged" has to mean for a database. */
-  const imprint = (path: string) => ({
-    bytes: readFileSync(path),
-    wal: existsSync(`${path}-wal`),
-    shm: existsSync(`${path}-shm`),
-  });
-
   it("refuses a copy the approval does not name, without opening it", () => {
     // The `#747` split, one directory: an approval taken on A, the command run on B. Matching the
     // approval's target only inside `Db` matches it *after* the writable open, and the measured
@@ -213,7 +260,7 @@ describe("U5-POST763-01 supported approved-copy migration", () => {
     const b = seedAt(join(dir, "b.sqlite"));
     approve(a, dir);
 
-    const before = imprint(b);
+    const before = imprintOf(b);
     const result = run(["migrate-approved-copy", "--database-copy", b, "--confirm-migration"], {
       ACP_STATE_DIR: dir,
       HOME: dir,
@@ -221,7 +268,7 @@ describe("U5-POST763-01 supported approved-copy migration", () => {
 
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("names a different database");
-    const after = imprint(b);
+    const after = imprintOf(b);
     expect(after.bytes).toEqual(before.bytes);
     expect([after.wal, after.shm]).toEqual([before.wal, before.shm]);
     expect(userVersion(b)).toBe(25);
@@ -234,7 +281,7 @@ describe("U5-POST763-01 supported approved-copy migration", () => {
     chmodSync(dir, 0o700);
     const path = seedAt(join(dir, "copy.sqlite"), 24);
     approve(path, dir);
-    const before = imprint(path);
+    const before = imprintOf(path);
 
     const result = run(["migrate-approved-copy", "--database-copy", path, "--confirm-migration"], {
       ACP_STATE_DIR: dir,
@@ -242,7 +289,7 @@ describe("U5-POST763-01 supported approved-copy migration", () => {
     });
 
     expect(result.status).not.toBe(0);
-    const after = imprint(path);
+    const after = imprintOf(path);
     expect(after.bytes).toEqual(before.bytes);
     expect([after.wal, after.shm]).toEqual([before.wal, before.shm]);
     expect(userVersion(path)).toBe(24);
@@ -251,7 +298,7 @@ describe("U5-POST763-01 supported approved-copy migration", () => {
   it("closes its argv grammar", () => {
     const { dir, path } = v25Copy("argv");
     approve(path, dir);
-    const before = imprint(path);
+    const before = imprintOf(path);
 
     const cases: Array<{ argv: string[]; why: string }> = [
       { argv: ["--database", path, "--database-copy", path, "--confirm-migration"], why: "two database flags" },
@@ -268,7 +315,7 @@ describe("U5-POST763-01 supported approved-copy migration", () => {
     }
 
     // A refused grammar never reached the database.
-    const after = imprint(path);
+    const after = imprintOf(path);
     expect(after.bytes).toEqual(before.bytes);
     expect([after.wal, after.shm]).toEqual([before.wal, before.shm]);
     expect(userVersion(path)).toBe(25);
@@ -342,4 +389,63 @@ describe("U5-POST763-01 supported approved-copy migration", () => {
     const usage = run([]);
     expect(usage.stderr + usage.stdout).toContain("migrate-approved-copy");
   }, 60_000);
+});
+
+/**
+ * The window between the final under-lock check and the first writable open.
+ *
+ * A same-directory A/B case proves the approval names one file. It does not prove *when* that is
+ * checked, and the difference is the defect: the first version verified, then constructed `Db`,
+ * and `Db` opens its connection before taking exclusivity — so a file swapped in at that pathname
+ * was opened read-write and only then refused. These cases stand in that window, in-process,
+ * because a spawned command cannot be interrupted at one instruction.
+ */
+describe("U5-POST763-01 the replacement window", () => {
+  it("refuses a file swapped in after the final check, without opening it", () => {
+    const dir = tempDir("acp-u5-01-window-");
+    chmodSync(dir, 0o700);
+    const approved = seedAt(join(dir, "approved.sqlite"));
+    const intruder = seedAt(join(dir, "intruder.sqlite"));
+    approveMigration(approved, "window-control");
+
+    const before = imprintOf(intruder);
+    __setApprovedCopyWindowHook(() => {
+      // Exactly the moment the old code opened. `rename` is atomic and leaves the pathname
+      // pointing at a different inode — the shape a real swap takes.
+      renameSync(intruder, approved);
+    });
+    try {
+      expect(() => migrateApprovedCopy(approved)).toThrowError(
+        /changed after it was verified under the migration lock/,
+      );
+    } finally {
+      __setApprovedCopyWindowHook(null);
+    }
+
+    const after = imprintOf(approved);
+    expect(after.bytes).toEqual(before.bytes);
+    expect([after.wal, after.shm]).toEqual([before.wal, before.shm]);
+    expect(userVersion(approved)).toBe(25);
+  }, 120_000);
+
+  it("still migrates when nothing happens in the window", () => {
+    // The negative control. A guard that refused whenever the hook existed would satisfy the case
+    // above and never let a real migration through.
+    const dir = tempDir("acp-u5-01-window-ok-");
+    chmodSync(dir, 0o700);
+    const approved = seedAt(join(dir, "approved.sqlite"));
+    approveMigration(approved, "window-control-ok");
+
+    let fired = false;
+    __setApprovedCopyWindowHook(() => {
+      fired = true;
+    });
+    try {
+      expect(migrateApprovedCopy(approved).toVersion).toBe(SCHEMA_VERSION);
+    } finally {
+      __setApprovedCopyWindowHook(null);
+    }
+    expect(fired, "the window hook never ran, so the case above proves nothing").toBe(true);
+    expect(userVersion(approved)).toBe(SCHEMA_VERSION);
+  }, 120_000);
 });

@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { acpError, fail, isAcpError, type Decision } from "../core/errors.ts";
@@ -77,19 +78,6 @@ export const SCHEMA_VERSION = CURRENT_SCHEMA_VERSION;
 export interface DbOpenOptions {
   /** Number of generated manual/pre-migration backups retained beside the database. */
   backupRetention?: number;
-  /**
-   * The caller already holds this database's migration lock and keeps it across this open.
-   *
-   * `U5-POST763-01`. `Db` opens the connection and *then* takes exclusivity, so everything a
-   * caller verifies before construction is verified outside the lock: replace the file at that
-   * pathname in between and the replacement is opened read-write — which moves its header — before
-   * any identity check runs. A caller that verifies and opens inside one critical section has to
-   * be able to say so, or it deadlocks against itself on a lock that denies rather than waits.
-   *
-   * The under-lock re-resolution, identity, approval and version checks below still run. This
-   * says who owns the lock, not which checks apply.
-   */
-  migrationLockHeld?: boolean;
   /** Keep SQLite's transient query state off environment-selected filesystem paths. */
   temporaryStorage?: "MEMORY";
   /** Test-only fault injection that proves a committed migration is restored from its backup. */
@@ -298,6 +286,11 @@ export class Db {
       ensurePrivateDirectory(dirname(filename));
       if (databaseExisted) assertPrivateDatabaseFiles(filename);
     }
+    // Before the connection exists, because opening one is already a write to the header. If a
+    // caller is handing this open a migration lock it holds, the file at this pathname has to
+    // still be the file that caller verified under that lock — otherwise the replacement gets
+    // opened read-write and only then refused, which is the regression this closes.
+    assertHeldLockStillDescribes(filename);
     this.#raw = new Database(filename);
     let temporaryStorage: typeof this.temporaryStorage;
     try {
@@ -543,13 +536,14 @@ export class Db {
    * exits 0 and stays down.
    */
   private withMigrationExclusivity(work: () => void): void {
-    if (this.options.migrationLockHeld === true) {
+    const lockPath = lockPathFor(this.file);
+    if (heldMigrationLock?.lockPath === lockPath) {
       // Held by the caller across this whole open. Acquiring again would deny — the lock refuses
       // rather than waiting — and every check inside `work` is the same either way.
       work();
       return;
     }
-    const lock = new SingleInstanceLock(join(dirname(this.file), "agentcpd.lock"));
+    const lock = new SingleInstanceLock(lockPath);
     const acquired = lock.acquire(new Date().toISOString());
     if (!acquired.allowed) {
       throw acpError(
@@ -1245,6 +1239,36 @@ export const translate = (err: unknown): unknown => {
 
 export const openDb = (filename: string, options?: DbOpenOptions): Db => new Db(filename, options);
 
+/**
+ * The one capability that lets an open reuse a migration lock its caller already holds.
+ *
+ * Not an option, and not a boolean. `migrationLockHeld?: boolean` on the exported options was a
+ * claim any caller could make: it said "the lock is held" without carrying anything only a
+ * lock-holder could have, so the authority was forgeable from outside the module. Review named
+ * that, and a supplied canonical path in the same signature, as the same class of defect.
+ *
+ * This lives in module scope, is set only by `migrateApprovedCopy` while it actually holds the
+ * lock, and names the three things it is a capability *over*: the exact lock path, the identity
+ * of the copy it verified, and the deployment's own identity as this module derived it. `Db`
+ * accepts it only when all three still describe the file it is about to open.
+ */
+interface HeldMigrationLock {
+  lockPath: string;
+  copy: TargetIdentity;
+  canonical: TargetIdentity | null;
+}
+let heldMigrationLock: HeldMigrationLock | null = null;
+
+/**
+ * Test-only seam at the window this whole capability exists to close: after the final under-lock
+ * verification and before the first writable open. Nothing here grants authority — it only lets a
+ * test act in the moment a replacement would.
+ */
+let approvedCopyWindowHook: (() => void) | null = null;
+export const __setApprovedCopyWindowHook = (hook: (() => void) | null): void => {
+  approvedCopyWindowHook = hook;
+};
+
 /** What one approved-copy migration did, in the terms an operator can check (`U5-POST763-01`). */
 export interface ApprovedCopyMigrationReport {
   fromVersion: number;
@@ -1273,16 +1297,14 @@ export interface ApprovedCopyMigrationReport {
  * The writer is closed before the result is collected, and the readback opens read-only: a report
  * assembled from the connection that just wrote is a report about what that connection intended.
  */
-export const migrateApprovedCopy = (
-  databasePath: string,
-  canonicalDatabasePath: string,
-): ApprovedCopyMigrationReport => {
+export const migrateApprovedCopy = (databasePath: string): ApprovedCopyMigrationReport => {
   // The lock is taken *first*, and everything below happens under it — including the writable
   // open. `Db` takes exclusivity only after opening its connection, so a caller that checks and
   // then constructs has checked outside the lock: replace the file at that pathname in between and
   // the replacement is opened read-write, moving its header, before any identity check runs.
   // Measured on the previous head: a refusal still moved a byte in a database it declined.
-  const lock = new SingleInstanceLock(join(dirname(databasePath), "agentcpd.lock"));
+  const lockPath = lockPathFor(databasePath);
+  const lock = new SingleInstanceLock(lockPath);
   const acquired = lock.acquire(new Date().toISOString());
   if (!acquired.allowed) {
     throw acpError(
@@ -1292,9 +1314,23 @@ export const migrateApprovedCopy = (
     );
   }
   try {
-    const fromVersion = assertApprovedCopyUnderLock(databasePath, canonicalDatabasePath);
-    const writer = new Db(databasePath, { migrationLockHeld: true });
-    writer.close();
+    const fromVersion = assertApprovedCopyUnderLock(databasePath);
+    heldMigrationLock = {
+      lockPath,
+      copy: targetIdentityOf(databasePath),
+      canonical: existsSync(deploymentDatabasePath())
+        ? targetIdentityOf(deploymentDatabasePath())
+        : null,
+    };
+    try {
+      // The window. A replacement landing here is what the pre-open check in `Db`'s constructor
+      // refuses, and the hook is how a test gets to stand in it.
+      approvedCopyWindowHook?.();
+      const writer = new Db(databasePath);
+      writer.close();
+    } finally {
+      heldMigrationLock = null;
+    }
 
     const raw = new Database(databasePath, { readonly: true, fileMustExist: true });
     try {
@@ -1341,10 +1377,48 @@ const APPROVED_COPY_FROM_VERSION = 25;
  *   - a version other than 25, or a plan that is not exactly the current ordered chain from 25,
  *     is a different migration than the one approved.
  */
-const assertApprovedCopyUnderLock = (
-  databasePath: string,
-  canonicalDatabasePath: string,
-): number => {
+/**
+ * The deployment's own database, derived here rather than supplied.
+ *
+ * A caller-supplied canonical path is the identity check's own answer handed to it: point it at a
+ * scratch file and "this is not the live database" becomes true by construction.
+ */
+const deploymentDatabasePath = (): string =>
+  join(homedir(), ".agent-control-plane", "state.sqlite");
+
+/**
+ * The lock path, resolved the same way from every caller.
+ *
+ * Comparing unresolved directory names let the capability miss its own lock: a temporary
+ * directory reached as `/var/...` and as `/private/var/...` is one directory with two names, and
+ * the mismatch read as "someone else holds it".
+ */
+const lockPathFor = (databaseFile: string): string =>
+  join(realpathSync(dirname(databaseFile)), "agentcpd.lock");
+
+/** Refuses an open whose pathname no longer holds the file the held lock was taken over. */
+const assertHeldLockStillDescribes = (filename: string): void => {
+  const held = heldMigrationLock;
+  if (!held || filename === ":memory:") return;
+  if (held.lockPath !== lockPathFor(filename)) return;
+  const now = existsSync(filename) ? targetIdentityOf(filename) : null;
+  if (!now || !isSameTarget(now, held.copy)) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      "the file at this path changed after it was verified under the migration lock",
+      {},
+    );
+  }
+  if (held.canonical && isSameTarget(now, held.canonical)) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      "refusing to migrate the deployment's own database through the copy path",
+      {},
+    );
+  }
+};
+
+const assertApprovedCopyUnderLock = (databasePath: string): number => {
   const stat = lstatSync(databasePath, { throwIfNoEntry: false });
   if (!stat) throw acpError(ReasonCode.INTERNAL_ERROR, "the named copy does not exist", {});
   if (stat.isSymbolicLink()) {
@@ -1361,9 +1435,7 @@ const assertApprovedCopyUnderLock = (
     );
   }
 
-  // The canonical path is supplied rather than derived here: which file the deployment calls its
-  // own is the operator surface's fact, and a second derivation of it is a second thing to keep
-  // in step with the first.
+  const canonicalDatabasePath = deploymentDatabasePath();
   const target = targetIdentityOf(databasePath);
   if (
     existsSync(canonicalDatabasePath) &&
