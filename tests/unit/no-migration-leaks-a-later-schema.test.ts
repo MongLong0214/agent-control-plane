@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { chmodSync } from "node:fs";
+import { chmodSync, copyFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
@@ -183,9 +183,26 @@ describe("#762 no migration leaves a later step's triggers behind", () => {
  * objects — derived, never listed here — produces the shape a deployment that never ran the
  * replay actually has.
  */
+/**
+ * One bootstrapped database, copied per case.
+ *
+ * Bootstrapping the whole schema is the expensive part and it is identical every time; doing it
+ * once per start version put this file's cost on the suite's critical path and timed out the
+ * repository census, which clones and typechecks a tree under a 60 s cap.
+ */
+let template: string | null = null;
+const bootstrappedTemplate = (): string => {
+  if (template) return template;
+  const path = join(tempDir("acp-762-template-"), "state.sqlite");
+  const created = new Db(path);
+  created.close();
+  template = path;
+  return path;
+};
+
 const buildAtVersion = (path: string, version: number): void => {
-  const current = new Db(path);
-  current.close();
+  copyFileSync(bootstrappedTemplate(), path);
+  chmodSync(path, 0o600);
 
   const raw = new Database(path);
   try {
