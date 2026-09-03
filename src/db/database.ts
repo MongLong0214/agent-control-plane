@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, fstatSync, lstatSync, readSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { acpError, fail, isAcpError, type Decision } from "../core/errors.ts";
@@ -28,6 +29,7 @@ import {
 import {
   assertMigrationApproved,
   migrationPlanFrom,
+  readMigrationApproval,
   retireMigrationApproval,
   retireStaleMigrationApproval,
   type ApprovalRetirement,
@@ -38,6 +40,7 @@ import {
   ensurePrivateDirectory,
   finalizeNewPrivateDatabaseFiles,
 } from "./state-preflight.ts";
+import { FdVfsControl, withBoundDescriptor } from "./fd-vfs.ts";
 import { isSameTarget, targetIdentityOf, type TargetIdentity } from "./target-identity.ts";
 
 export type SqliteDatabase = Database.Database;
@@ -1224,3 +1227,260 @@ export const translate = (err: unknown): unknown => {
 };
 
 export const openDb = (filename: string, options?: DbOpenOptions): Db => new Db(filename, options);
+
+/** The one version an approved copy may start from, and the one this command exists for. */
+const APPROVED_COPY_FROM_VERSION = 25;
+const SQLITE_HEADER_BYTES = 100;
+const SQLITE_MAGIC = "SQLite format 3\u0000";
+
+/**
+ * The deployment's own database, derived here rather than supplied.
+ *
+ * A caller-supplied canonical path is the identity check's own answer handed to it: point it at a
+ * scratch file and "this is not the live database" becomes true by construction.
+ */
+const deploymentDatabasePath = (): string => join(homedir(), ".agent-control-plane", "state.sqlite");
+
+/**
+ * The version a database is at, read out of the descriptor rather than by connecting to it.
+ *
+ * A read-only connection is not a read-only act: opening a WAL database makes SQLite build the
+ * shared-memory index beside it, so a probe asking "what version is this copy?" would rewrite a
+ * file this command has not yet decided to touch. The header answers the same question and moves
+ * nothing — bytes 0..15 are the format string and 60..63 are `user_version`, big-endian.
+ */
+const versionFromDescriptor = (descriptor: number): number => {
+  const header = Buffer.alloc(SQLITE_HEADER_BYTES);
+  const read = readSync(descriptor, header, 0, SQLITE_HEADER_BYTES, 0);
+  if (read < SQLITE_HEADER_BYTES || header.toString("latin1", 0, 16) !== SQLITE_MAGIC) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "this copy is not an SQLite database", {});
+  }
+  return header.readUInt32BE(60);
+};
+
+/** Refuses the one file this command exists never to touch, compared by object rather than name. */
+const assertNotTheDeploymentsOwnDatabase = (target: TargetIdentity): void => {
+  const canonicalPath = deploymentDatabasePath();
+  if (!existsSync(canonicalPath)) return;
+  const canonical = targetIdentityOf(canonicalPath);
+  if (canonical.device === target.device && canonical.inode === target.inode) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      "refusing to migrate the deployment's own database through the copy path",
+      {},
+    );
+  }
+};
+
+/**
+ * Everything that must be true of the object this command is holding open.
+ *
+ * The identity comes from the descriptor, not from resolving the pathname a second time. That is
+ * the whole point of the binding: a name can stop leading to the file it named between any two
+ * syscalls, and a check that asks the name again is describing a file that may not be the one the
+ * connection got.
+ */
+const assertApprovedCopyIdentity = (
+  databasePath: string,
+  descriptor: number,
+  target: TargetIdentity,
+): void => {
+  const opened = fstatSync(descriptor);
+  if (!opened.isFile()) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "refusing a target that is not a regular file", {});
+  }
+  if (opened.nlink !== 1) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      `refusing a copy with ${opened.nlink} links: it is reachable under another name`,
+      {},
+    );
+  }
+  assertNotTheDeploymentsOwnDatabase(target);
+
+  const onDisk = versionFromDescriptor(descriptor);
+  if (onDisk !== APPROVED_COPY_FROM_VERSION) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      `this copy is at ${onDisk} and this command migrates a copy at ${APPROVED_COPY_FROM_VERSION}`,
+      {},
+    );
+  }
+
+  const approval = readMigrationApproval(databasePath);
+  if (!approval) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "no approval is on file for this copy", {});
+  }
+  if (!isSameTarget(approval.target, target)) {
+    // The approval is a capability over one file. Two databases in one private directory, an
+    // approval taken on A and this command run on B, is the split `#747` measured — and because
+    // `target` came from the descriptor, it also catches an intruder standing at the pathname.
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      "the approval on file names a different database than this copy",
+      {},
+    );
+  }
+  const expected = migrationPlanFrom(APPROVED_COPY_FROM_VERSION);
+  if (approval.fromVersion !== expected.fromVersion || approval.toVersion !== expected.toVersion) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      `the approval covers ${approval.fromVersion}\u2192${approval.toVersion} and this command runs ` +
+        `${expected.fromVersion}\u2192${expected.toVersion}`,
+      {},
+    );
+  }
+  if (
+    approval.migrations.length !== expected.migrations.length ||
+    approval.migrations.some((id: string, index: number) => id !== expected.migrations[index])
+  ) {
+    // Same endpoints, different steps. An approval naming another ordered chain approves another
+    // migration, and only the ordered comparison can tell them apart.
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      "the approval names a different ordered chain than this build runs",
+      {},
+    );
+  }
+};
+
+/** What one approved-copy migration did, in the terms an operator can check (`U6` unit 3). */
+export interface ApprovedCopyMigrationReport {
+  fromVersion: number;
+  toVersion: number;
+  /** Each step that ran, and whether its receipt carries a checksum. Never the checksum itself. */
+  migrations: Array<{ id: string; checksum: boolean }>;
+  /** Whether the approval this consumed is no longer on file. */
+  approvalRetired: boolean;
+  /** The journal mode SQLite actually established, not the one the open asked for. */
+  journalMode: string;
+  /** Always true here, and stated so the report says which program produced it. */
+  daemonless: boolean;
+}
+
+/**
+ * Migrates one disposable copy through the approved chain and reads the result back.
+ *
+ * The reconciliation packet did this with `node --input-type=module -e`, importing `openDb` from
+ * the deployment's `dist`. That is a private import spelled out in a runbook: nothing versions it,
+ * nothing tests it, and the operator proving a chain during an incident is running a program they
+ * wrote at the keyboard. This is the same act with an owner.
+ *
+ * **The operator's pathname is resolved exactly once, into a descriptor, and every later decision
+ * is about that object.** `lstat(path)` and `open(path)` are two syscalls and a rename between
+ * them is invisible to both, so a command that verifies a pathname and then hands the same
+ * pathname to SQLite has verified one thing and opened another. Checking harder does not help; the
+ * counterexample is to hold an unrelated descriptor on the approved file, point the pathname at an
+ * intruder across the open, and put it back.
+ *
+ * So the descriptor is the authority, and `native/fd-vfs` makes SQLite use it: the connection below
+ * opens the operator's own pathname, and the bound VFS hands it a duplicate of the descriptor this
+ * function verified. Nothing is staged and nothing is written back — the migration happens in the
+ * approved file itself, through a handle that cannot be redirected.
+ */
+export const migrateApprovedCopy = (databasePath: string): ApprovedCopyMigrationReport => {
+  /*
+   * The migration lock is `Db`'s to take, and taking it here first only excluded this command from
+   * itself: `withMigrationExclusivity` acquires the same lock over the same directory, and the
+   * lock denies rather than waits, so the migration refused with `DAEMON_ALREADY_RUNNING` naming
+   * this very process. What the lock protects — no daemon and no second migration during the
+   * chain — is unchanged, because `Db` still holds it for exactly that stretch.
+   *
+   * Nothing is left unguarded in the meantime either. The checks below are about the descriptor
+   * this command opens, and a descriptor is not something another process can move; the races an
+   * outer lock would have covered are the pathname ones the binding already removes.
+   */
+  {
+    // Shape questions the pathname must answer before it is opened at all: an `open` follows a
+    // symbolic link, and following one would put the descriptor on a file nobody named.
+    const named = lstatSync(databasePath, { throwIfNoEntry: false });
+    if (!named) throw acpError(ReasonCode.INTERNAL_ERROR, "the named copy does not exist", {});
+    if (named.isSymbolicLink()) {
+      throw acpError(ReasonCode.INTERNAL_ERROR, "refusing a symbolic link: name the copy itself", {});
+    }
+    if (!named.isFile()) {
+      throw acpError(ReasonCode.INTERNAL_ERROR, "refusing a target that is not a regular file", {});
+    }
+    // A copy handed to this command has to be at rest. In WAL mode the main file's header can lag
+    // behind committed frames living in the sidecar, so a copy with a non-empty log beside it is
+    // one whose version cannot be read from its header — and the bound connection cannot own a
+    // shared-memory family, so it could not replay that log either.
+    for (const suffix of ["-wal", "-shm"]) {
+      const sidecar = `${databasePath}${suffix}`;
+      if (existsSync(sidecar) && statSync(sidecar).size > 0) {
+        throw acpError(
+          ReasonCode.INTERNAL_ERROR,
+          `refusing a copy with a non-empty ${suffix.slice(1)} beside it: name it at rest`,
+          {},
+        );
+      }
+    }
+
+    const control = FdVfsControl.load();
+    try {
+      return withBoundDescriptor(control, databasePath, (descriptor) => {
+        const opened = fstatSync(descriptor);
+        const target: TargetIdentity = {
+          path: realpathSync(databasePath),
+          device: opened.dev,
+          inode: opened.ino,
+        };
+        assertApprovedCopyIdentity(databasePath, descriptor, target);
+
+        const writer = new Db(databasePath);
+        try {
+          /*
+           * The mode SQLite established, not the one it was asked for. `Db` requests WAL on every
+           * file-backed open, and a bound connection has no shared-memory support, so SQLite
+           * declines and stays on a rollback journal — silently, by returning the old mode rather
+           * than an error. Asserting the request would assert nothing.
+           */
+          // `pragma_journal_mode` rather than `PRAGMA journal_mode`: this connection refuses reads
+          // that are not queries, and the table-valued form is one.
+          const mode = String(
+            (writer.get<{ journal_mode: string }>("SELECT journal_mode FROM pragma_journal_mode") ??
+              { journal_mode: "" }).journal_mode,
+          ).toLowerCase();
+          if (mode === "wal" || mode === "") {
+            throw acpError(
+              ReasonCode.INTERNAL_ERROR,
+              `a bound migration must run on a rollback journal and this one reports ${mode || "nothing"}`,
+              {},
+            );
+          }
+
+          const toVersion = Number(
+            (writer.get<{ user_version: number }>("SELECT user_version FROM pragma_user_version") ??
+              { user_version: 0 }).user_version,
+          );
+          const receipts = writer.all<{ id: string; checksum: string | null }>(
+            `SELECT migration_id AS id, checksum FROM schema_migrations
+              WHERE version > ? ORDER BY version`,
+            [APPROVED_COPY_FROM_VERSION],
+          );
+          const retirement = retireMigrationApproval(
+            databasePath,
+            APPROVED_COPY_FROM_VERSION,
+            toVersion,
+          );
+          return {
+            fromVersion: APPROVED_COPY_FROM_VERSION,
+            toVersion,
+            migrations: receipts.map((receipt) => ({
+              id: receipt.id,
+              checksum: /^sha256:[a-f0-9]{64}$/.test(receipt.checksum ?? ""),
+            })),
+            approvalRetired: retirement.retired,
+            journalMode: mode,
+            daemonless: true,
+          };
+        } finally {
+          // Closed inside the binding: a release is refused while any file of it is still open.
+          writer.close();
+        }
+      });
+    } finally {
+      control.close();
+    }
+  }
+};

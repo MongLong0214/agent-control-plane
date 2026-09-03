@@ -2,10 +2,13 @@ import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
   closeSync,
+  copyFileSync,
   existsSync,
+  mkdirSync,
   openSync,
   readFileSync,
   renameSync,
+  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -198,9 +201,16 @@ describe("U6-UNIT1 the fd-vfs binds a connection to a verified descriptor", () =
     expect(headerVersion(intruder)).toBe(99);
   }, 120_000);
 
-  it("refuses a main database that is not the bound one, instead of opening it by name", () => {
-    // The absence of a fallback is the point: a bound process does not quietly open some other
-    // database by pathname, because that is the behaviour being replaced.
+  it("gives a different database its own file, and never the bound descriptor", () => {
+    // This used to refuse every main open that was not the bound one. That read as caution and was
+    // over-broad: the binding promises one pathname can only ever open the verified descriptor, it
+    // does not sandbox every database the process might touch. Wiring the migration showed the
+    // cost — `Db.migrate` takes its recovery point with `VACUUM INTO`, SQLite opens that
+    // destination as a database, and the refusal removed the backup the approval mechanism rests
+    // on.
+    //
+    // What the refusal was protecting is asserted directly instead: the stranger gets its own
+    // file, its own contents, and touches none of the binding's accounting.
     const dir = tempDir("acp-u6-other-");
     chmodSync(dir, 0o700);
     const bound = join(dir, "bound.sqlite");
@@ -214,10 +224,27 @@ describe("U6-UNIT1 the fd-vfs binds a connection to a verified descriptor", () =
     const dirFd = openSync(dir, "r");
     try {
       control.bind(bound, mainFd, dirFd);
-      expect(() => new Database(other)).toThrowError(/unable to open database file/i);
-      const stats = control.stats();
-      expect(stats.refusals).toBe(1);
-      expect(stats.refusal).toContain("does not match the active binding");
+      const before = control.stats();
+      const stranger = new Database(other);
+      try {
+        // Its own database: what it reads is what was seeded into `other`, not what is in the
+        // bound file, and writing to it changes only itself.
+        const tables = stranger
+          .prepare("SELECT group_concat(name) AS n FROM sqlite_master WHERE type = ?")
+          .get("table") as { n: string };
+        expect(tables.n).toContain("other_rows");
+        expect(tables.n).not.toContain("bound_rows");
+        stranger.exec("CREATE TABLE stranger_wrote_here (x INTEGER)");
+      } finally {
+        stranger.close();
+      }
+      // And it left the binding's accounting exactly as it found it.
+      const after = control.stats();
+      expect([after.mainOpens, after.liveFiles, after.refusals]).toEqual([
+        before.mainOpens,
+        before.liveFiles,
+        before.refusals,
+      ]);
     } finally {
       control.unbind();
       control.close();
@@ -225,10 +252,13 @@ describe("U6-UNIT1 the fd-vfs binds a connection to a verified descriptor", () =
       closeSync(mainFd);
     }
 
-    expect(imprintOf(other)).toEqual(otherBefore);
+    // The stranger's write landed in the stranger, and the bound file never received it.
+    expect(readFileSync(other).includes(Buffer.from("stranger_wrote_here"))).toBe(true);
+    expect(readFileSync(bound).includes(Buffer.from("stranger_wrote_here"))).toBe(false);
+    expect(imprintOf(other)).not.toEqual(otherBefore);
   }, 120_000);
 
-  it("refuses a same-named database in another directory, and never hands over the descriptor", () => {
+  it("opens a same-named database in another directory as itself, not as the bound one", () => {
     // The binding is over one file, not over a file name. Two directories can each hold a
     // `copy.sqlite`; a binding keyed on the name alone would hand the second connection the first
     // one's descriptor, and it would read and write that file believing otherwise — this unit's
@@ -248,8 +278,19 @@ describe("U6-UNIT1 the fd-vfs binds a connection to a verified descriptor", () =
     const dirFd = openSync(boundDir, "r");
     try {
       control.bind(bound, mainFd, dirFd);
-      expect(() => new Database(other)).toThrowError(/unable to open database file/i);
-      expect(control.stats().refusal).toContain("does not match the active binding");
+      const before = control.stats();
+      const stranger = new Database(other);
+      try {
+        // The name is the same; the file is not. It must see its own version, not the bound one's.
+        expect(
+          Number((stranger.prepare("SELECT user_version FROM pragma_user_version").get() as {
+            user_version: number;
+          }).user_version),
+        ).toBe(77);
+      } finally {
+        stranger.close();
+      }
+      expect(control.stats().liveFiles).toBe(before.liveFiles);
     } finally {
       control.unbind();
       control.close();
@@ -587,14 +628,55 @@ describe("U6-UNIT1 the fd-vfs binds a connection to a verified descriptor", () =
     //
     // Run through the real wrapper, because the property is about the command that actually builds
     // what ships. The contract is: an explicit failure, or an artifact with no seam in it.
+    // The wrapper is run byte-for-byte, from a root that is a copy of the one it builds in.
+    //
+    // Running it against the repository itself rebuilt the artifact every other test loads, in
+    // place, while they were loading it — measured: with this case excluded two files pass 20 of
+    // 20, with it included two of them fail with "the fd-vfs extension could not be loaded". That
+    // is also the most likely explanation for the two unnamed three-failure `tests/process` runs I
+    // have been carrying since unit 2, which were exactly the parallel case.
+    //
+    // Copying the script and the addon and pointing `node_modules` at the real one keeps this a
+    // test of the actual wrapper — same bytes, same node-gyp, same env handling — and stops it
+    // damaging shared state that other tests depend on.
+    const buildRoot = tempDir("acp-u6-wrapper-root-");
+    chmodSync(buildRoot, 0o700);
+    mkdirSync(join(buildRoot, "scripts"), { recursive: true });
+    mkdirSync(join(buildRoot, "native", "fd-vfs", "src"), { recursive: true });
+    copyFileSync(
+      join(REPO, "scripts", "build-native-fd-vfs.mjs"),
+      join(buildRoot, "scripts", "build-native-fd-vfs.mjs"),
+    );
+    copyFileSync(
+      join(REPO, "native", "fd-vfs", "binding.gyp"),
+      join(buildRoot, "native", "fd-vfs", "binding.gyp"),
+    );
+    copyFileSync(
+      join(REPO, "native", "fd-vfs", "src", "acp_fd_vfs.c"),
+      join(buildRoot, "native", "fd-vfs", "src", "acp_fd_vfs.c"),
+    );
+    symlinkSync(join(REPO, "node_modules"), join(buildRoot, "node_modules"));
+    const rootedArtifact = join(
+      buildRoot,
+      "native",
+      "fd-vfs",
+      "build",
+      "Release",
+      process.platform === "darwin" ? "acp_fd_vfs.dylib" : "acp_fd_vfs.so",
+    );
+
     for (const variable of ["CFLAGS", "CPPFLAGS"]) {
-      const build = spawnSync(process.execPath, [join(REPO, "scripts", "build-native-fd-vfs.mjs")], {
-        cwd: REPO,
-        encoding: "utf8",
-        env: { ...process.env, [variable]: "-DACP_FD_VFS_TESTING" },
-      });
+      const build = spawnSync(
+        process.execPath,
+        [join(buildRoot, "scripts", "build-native-fd-vfs.mjs")],
+        {
+          cwd: buildRoot,
+          encoding: "utf8",
+          env: { ...process.env, [variable]: "-DACP_FD_VFS_TESTING" },
+        },
+      );
       if (build.status !== 0) continue; // an explicit refusal also satisfies the contract
-      const shipped = readFileSync(PRODUCTION_ARTIFACT);
+      const shipped = readFileSync(rootedArtifact);
       for (const name of [
         "acp_fd_fail_next_dir_sync",
         "acp_fd_probe_refusal_methods",
@@ -617,7 +699,7 @@ describe("U6-UNIT1 the fd-vfs binds a connection to a verified descriptor", () =
       [
         `const Database = (await import(${JSON.stringify(BETTER_SQLITE3)})).default;`,
         `const db = new Database(":memory:");`,
-        `db.loadExtension(${JSON.stringify(PRODUCTION_ARTIFACT)});`,
+        `db.loadExtension(${JSON.stringify(rootedArtifact)});`,
         `const report = {};`,
         `for (const call of ["acp_fd_fail_next_dir_sync()", "acp_fd_probe_refusal_methods()", "acp_fd_probe_dir_sync(1)"]) {`,
         `  try { db.prepare("SELECT " + call + " AS p").get(); report[call] = "present"; }`,
