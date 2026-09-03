@@ -566,9 +566,22 @@ static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int 
 
   if (flags & SQLITE_OPEN_MAIN_DB) {
     if (!acp_is_bound_database(path)) {
-      /* No fallback: a bound process does not open some other main database by pathname. */
-      acp_refuse("main database does not match the active binding");
-      return acp_state_unlock() ? SQLITE_CANTOPEN : SQLITE_IOERR;
+      /*
+       * A different database is not this binding's business.
+       *
+       * This used to refuse every main open that was not the bound one, which read as caution and
+       * was actually over-broad: the binding is a promise about one pathname — that it can only
+       * ever open the verified descriptor — not a sandbox over every database the process might
+       * touch. Wiring the migration made the cost visible. `Db.migrate` takes its recovery point
+       * with `VACUUM INTO`, and SQLite opens that destination as a database, so the refusal
+       * removed the backup the whole approval mechanism rests on.
+       *
+       * Delegation gives the stranger its own file through the wrapped VFS. It never receives the
+       * bound descriptor and never touches this binding's accounting, which is what the refusal
+       * was there to prevent.
+       */
+      if (!acp_state_unlock()) return SQLITE_IOERR;
+      return acp_parent->xOpen(acp_parent, path, file, flags, out);
     }
     if (acp_binding.main_ever) {
       /*
@@ -612,16 +625,22 @@ static int acp_open(sqlite3_vfs *vfs, const char *path, sqlite3_file *file, int 
   }
 
   if (flags & SQLITE_OPEN_WAL) {
-    /* Out of scope by ruling, and refused rather than delegated: delegating would open a
-       shared-memory family this binding does not own. */
+    if (!acp_is_bound_sibling(path)) {
+      /* Another database's log. Delegated for the same reason its main file is. */
+      if (!acp_state_unlock()) return SQLITE_IOERR;
+      return acp_parent->xOpen(acp_parent, path, file, flags, out);
+    }
+    /* The bound target's own log: refused rather than delegated, because this binding cannot own
+       a shared-memory family and opening one beside the bound file would be exactly that. */
     acp_refuse("write-ahead logging is not available on a bound connection");
     return acp_state_unlock() ? SQLITE_CANTOPEN : SQLITE_IOERR;
   }
 
   if (flags & (SQLITE_OPEN_MAIN_JOURNAL | SQLITE_OPEN_SUPER_JOURNAL)) {
     if (!acp_is_bound_sibling(path)) {
-      acp_refuse("journal is not a sibling of the bound database");
-      return acp_state_unlock() ? SQLITE_CANTOPEN : SQLITE_IOERR;
+      /* Another database's journal. It belongs to whoever opened that database. */
+      if (!acp_state_unlock()) return SQLITE_IOERR;
+      return acp_parent->xOpen(acp_parent, path, file, flags, out);
     }
     int how = O_RDWR | O_CREAT;
     if (flags & SQLITE_OPEN_EXCLUSIVE) how |= O_EXCL;

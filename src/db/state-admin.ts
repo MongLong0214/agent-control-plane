@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 import { isAcpError } from "../core/errors.ts";
 import { SingleInstanceLock } from "../daemon/single-instance.ts";
 import { backupDatabase, pruneAutomaticBackups, restoreDatabase } from "./backup.ts";
+import { migrateApprovedCopy } from "./database.ts";
 import {
   approveMigration,
   migrationApprovalPath,
@@ -58,9 +59,25 @@ approve-migration is the owner's decision to let that happen. It refuses a live 
 lock, takes the recovery point the approval will rest on, and writes an approval naming
 the exact chain. It approves one migration between two named versions, not migrations in
 general: after the chain runs, the approval no longer matches anything.
+
+migrate-approved-copy runs the approved chain against one disposable copy and exits. It takes
+--database-copy and has no default: the default is the one database it must never touch. It
+refuses a symbolic link, a non-regular file, a file with more than one link, a copy with a
+non-empty write-ahead log or shared-memory file beside it, and anything that resolves to the
+deployment's own database. It opens that pathname exactly once, and every later decision is about
+the descriptor rather than the name; the migration runs in the approved file itself through a
+handle that cannot be redirected. Nothing is started; there is no daemon, listener or surviving
+child. This is the supported form of the dry run the reconciliation packet spelled out as an
+inline node evaluation.
 `;
 
-const COMMANDS = ["backup", "restore", "migration-plan", "approve-migration"] as const;
+const COMMANDS = [
+  "backup",
+  "restore",
+  "migration-plan",
+  "approve-migration",
+  "migrate-approved-copy",
+] as const;
 type Command = (typeof COMMANDS)[number];
 
 const isCommand = (value: string | undefined): value is Command =>
@@ -74,6 +91,8 @@ interface Parsed {
   confirmed: boolean;
   approvedBy: string | null;
   confirmedMigration: boolean;
+  /** The disposable copy `migrate-approved-copy` names. Never defaulted, and never `--database`. */
+  databaseCopy: string | null;
 }
 
 const parse = (argv: string[]): Parsed => {
@@ -85,6 +104,7 @@ const parse = (argv: string[]): Parsed => {
   let confirmed = false;
   let approvedBy: string | null = null;
   let confirmedMigration = false;
+  let databaseCopy: string | null = null;
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
     if (token === undefined) continue;
@@ -96,6 +116,9 @@ const parse = (argv: string[]): Parsed => {
       index += 1;
     } else if (token === "--approved-by") {
       approvedBy = tokens[index + 1] ?? "";
+      index += 1;
+    } else if (token === "--database-copy") {
+      databaseCopy = tokens[index + 1] ?? "";
       index += 1;
     } else if (token === "--confirm-migration") {
       confirmedMigration = true;
@@ -118,8 +141,54 @@ const parse = (argv: string[]): Parsed => {
       `approve-migration requires --approved-by <who> and --confirm-migration\n\n${USAGE}`,
     );
   }
+  if (command === "migrate-approved-copy") {
+    // A closed grammar for this one command: exactly `--database-copy <path>` once and
+    // `--confirm-migration` once, and nothing else. Every other command's flags are refused rather
+    // than ignored — `--database` in particular, because its default is the one database this
+    // command exists never to touch, and accepting it beside `--database-copy` would leave two
+    // answers to "which file" in one invocation.
+    const allowed = new Set(["--database-copy", "--confirm-migration"]);
+    const seen = new Map<string, number>();
+    for (const token of tokens) {
+      if (!token.startsWith("--")) continue;
+      seen.set(token, (seen.get(token) ?? 0) + 1);
+      if (!allowed.has(token)) {
+        throw new Error(`migrate-approved-copy does not take ${token}\n\n${USAGE}`);
+      }
+    }
+    const repeated = [...seen.entries()].filter(([, count]) => count > 1).map(([flag]) => flag);
+    if (repeated.length > 0) {
+      // A repeat is not a typo to absorb: the later value silently won, so the operator's first
+      // answer and the one that ran were different.
+      throw new Error(
+        `migrate-approved-copy takes each of ${repeated.sort().join(", ")} once\n\n${USAGE}`,
+      );
+    }
+    // Two separate refusals with two separate messages. "Which database" and "are you sure" are
+    // different questions, and collapsing them makes the operator guess which half they missed.
+    if (databaseCopy === null) {
+      throw new Error(`migrate-approved-copy requires --database-copy <absolute path>\n\n${USAGE}`);
+    }
+    if (!confirmedMigration) {
+      throw new Error(`migrate-approved-copy requires --confirm-migration\n\n${USAGE}`);
+    }
+    if (!isAbsolute(databaseCopy)) {
+      throw new Error("database, output and backup paths must be absolute");
+    }
+  } else if (databaseCopy !== null) {
+    throw new Error(`--database-copy belongs to migrate-approved-copy\n\n${USAGE}`);
+  }
   if (command === "backup" && backupPath !== null) throw new Error(USAGE);
-  return { command, databasePath, output, backupPath, confirmed, approvedBy, confirmedMigration };
+  return {
+    command,
+    databasePath,
+    output,
+    backupPath,
+    confirmed,
+    approvedBy,
+    confirmedMigration,
+    databaseCopy,
+  };
 };
 
 const daemonIsLive = (databasePath: string): { pid: number; startedAt: string } | null => {
@@ -190,6 +259,14 @@ export const main = async (argv: string[]): Promise<number> => {
     process.stdout.write(
       `${JSON.stringify({ approval, approvalPath: migrationApprovalPath(parsed.databasePath) }, null, 2)}\n`,
     );
+    return 0;
+  }
+
+  if (parsed.command === "migrate-approved-copy") {
+    // Thin on purpose: the command is one call, and everything it is allowed to do lives behind
+    // that call rather than being re-decided here where the argv already is.
+    const report = migrateApprovedCopy(parsed.databaseCopy!);
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     return 0;
   }
 

@@ -7,10 +7,10 @@ import Database from "better-sqlite3";
 /**
  * Binds a SQLite connection to a descriptor its caller has already verified (`U6` unit 1).
  *
- * Nothing in `src/` outside this file imports it, and `scripts/verify-fd-vfs-is-unreachable.mjs`
- * holds that as a CI gate. Unit 1 is the primitive and its evidence; wiring
- * `migrate-approved-copy` onto it is unit 3, and a call site appearing before then is meant to
- * fail that check rather than be discovered later.
+ * `migrate-approved-copy` is its one caller. Until unit 3 there was none, and a CI gate held that
+ * absence so the primitive going live would be a decision rather than a discovery; the gate was
+ * removed in the same change that made this reachable, which is the moment it had been waiting
+ * for.
  *
  * The problem it solves is that a pathname is not a file. `lstat(path)` then `open(path)` are two
  * syscalls and a rename between them is invisible to both — so a migration that verifies a
@@ -150,7 +150,7 @@ export class FdVfsControl {
  *
  * The descriptor is taken first and everything after is about it. The caller is expected to have
  * already refused a symbolic link, a non-regular file, more than one link, and a database with a
- * non-empty `-wal`/`-shm` beside it; unit 3 is where `migrate-approved-copy` does that.
+ * non-empty `-wal`/`-shm` beside it; `migrateApprovedCopy` does exactly that before it binds.
  */
 export const withBoundDescriptor = <T>(
   control: FdVfsControl,
@@ -159,11 +159,28 @@ export const withBoundDescriptor = <T>(
 ): T => {
   const fd = openSync(databasePath, "r+");
   const dirFd = openSync(dirname(databasePath), "r");
+  let failed = false;
   try {
     control.bind(databasePath, fd, dirFd);
     return work(fd);
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
-    control.unbind();
+    /*
+     * A release that fails must not replace the reason the work failed.
+     *
+     * The release refuses while any file of the binding is still open, and work that throws
+     * part-way through opening one leaves exactly that state — so the caller would have been told
+     * "a file of this binding is still open" instead of what actually went wrong, which is the
+     * error that matters and the only one they can act on. When the work succeeded there is
+     * nothing to hide behind, and a failed release is itself the news.
+     */
+    try {
+      control.unbind();
+    } catch (releaseError) {
+      if (!failed) throw releaseError;
+    }
     closeSync(dirFd);
     closeSync(fd);
   }

@@ -632,20 +632,40 @@ backup:
     # that copy's own from/to versions, and cannot authorise anything for the live database.
     node /Users/isaac/projects/agent-control-plane/dist/db/state-admin.js approve-migration \
       --database "$DRY" --approved-by "$USER" --confirm-migration
-    node --input-type=module -e '
-      import { openDb, SCHEMA_VERSION } from "/Users/isaac/projects/agent-control-plane/dist/db/database.js";
-      const db = openDb(process.argv[1]);
-      console.log(JSON.stringify({
-        schemaVersion: SCHEMA_VERSION,
-        userVersion: Number(db.raw.pragma("user_version", { simple: true })),
-      }));
-    ' "$DRY"
+    node /Users/isaac/projects/agent-control-plane/dist/db/state-admin.js migrate-approved-copy \
+      --database-copy "$DRY" --confirm-migration
     rm -rf "$DRY_DIR"
 
-Expect `{"schemaVersion":34,"userVersion":34}` (or whatever `SCHEMA_VERSION` main declares by
-execution day). This drives the real migration code — `applySchema` calling `migrate` in
-`src/db/database.ts` — not a re-implementation of it, because it is the same compiled
-file the daemon is about to load.
+Expect a report whose `toVersion` equals the `schemaVersion` main declares on execution day, with
+`approvalRetired: true`, `daemonless: true`, and every step's `checksum` true. This drives the real
+migration code — `applySchema` calling `migrate` in `src/db/database.ts` — not a re-implementation
+of it, because it is the same compiled file the daemon is about to load.
+
+Until `#765`/`#766` this step was an inline `node --input-type=module -e` that imported `openDb`
+from `dist`. That is a private import spelled out in a runbook: nothing versioned it, nothing
+tested it, and the operator proving a chain during an incident was running a program they wrote at
+the keyboard. `migrate-approved-copy` is the same act with an owner.
+
+It takes `--database-copy` and has no default, because the default would be the one database it
+must never touch. It refuses a symbolic link, a non-regular file, a file with more than one link,
+a copy with a non-empty `-wal` or `-shm` beside it, and anything that resolves to the deployment's
+own database. It starts no daemon, listener or surviving child, and prints no path, so its output
+can be pasted into a report as it stands.
+
+**What it means that the copy is migrated in place.** The pathname you name is opened exactly once,
+and every decision after that — identity, link count, version, which approval applies — is about
+that open file rather than about the name. `lstat` and `open` are two syscalls and a rename between
+them is invisible to both, so a command that verified a pathname and then handed the same pathname
+to SQLite would have verified one thing and opened another. A native VFS (`native/fd-vfs`) makes
+SQLite use the descriptor that was verified, so the migration happens in the approved file itself,
+through a handle nothing can redirect. Nothing is staged and nothing is copied back.
+
+One consequence is worth knowing before you read the report: a bound connection has no
+shared-memory support, so SQLite declines to enter WAL mode and runs the chain on a rollback
+journal instead. It declines silently, by returning the previous mode rather than an error, so the
+command asserts the mode it actually got and the report states it under `journalMode`. A copy that
+already has a non-empty log beside it is refused rather than opened, because its header version
+would not be the whole truth.
 
 **What a failure looks like — not just the success path.** `migrate()` in `src/db/database.ts`
 takes exactly one backup before the first step in the chain — `backupOpenDatabaseSync`, named
