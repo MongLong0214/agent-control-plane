@@ -81,6 +81,16 @@ export interface DbOpenOptions {
   backupRetention?: number;
   /** Keep SQLite's transient query state off environment-selected filesystem paths. */
   temporaryStorage?: "MEMORY";
+  /**
+   * A migration lock this caller already holds over the same directory.
+   *
+   * Not a boolean. `migrationLockHeld?: true` would be a claim any caller could make while holding
+   * nothing; the lock itself can only be obtained by acquiring it, and `held()` is true only for
+   * the instance whose descriptor is open. Supplied so a command that must take the lock *before*
+   * it opens anything does not then deadlock against this class taking the same lock again — the
+   * lock denies rather than waits, so the second acquisition refused with the caller's own pid.
+   */
+  migrationLock?: SingleInstanceLock;
   /** Test-only fault injection that proves a committed migration is restored from its backup. */
   afterMigration?: (migration: SchemaMigration) => void;
   /**
@@ -532,6 +542,14 @@ export class Db {
    * exits 0 and stays down.
    */
   private withMigrationExclusivity(work: () => void): void {
+    const supplied = this.options.migrationLock;
+    if (supplied?.held()) {
+      // The caller's lease already covers this directory, and a second lock object for the same
+      // path in the same process would deny — and releasing it would end the caller's exclusivity
+      // early. So the work runs under the lease that exists rather than under a new one.
+      work();
+      return;
+    }
     const lock = new SingleInstanceLock(join(dirname(this.file), "agentcpd.lock"));
     const acquired = lock.acquire(new Date().toISOString());
     if (!acquired.allowed) {
@@ -1380,19 +1398,32 @@ export interface ApprovedCopyMigrationReport {
  */
 export const migrateApprovedCopy = (databasePath: string): ApprovedCopyMigrationReport => {
   /*
-   * The migration lock is `Db`'s to take, and taking it here first only excluded this command from
-   * itself: `withMigrationExclusivity` acquires the same lock over the same directory, and the
-   * lock denies rather than waits, so the migration refused with `DAEMON_ALREADY_RUNNING` naming
-   * this very process. What the lock protects — no daemon and no second migration during the
-   * chain — is unchanged, because `Db` still holds it for exactly that stretch.
+   * The lock comes first, before anything is opened or bound.
    *
-   * Nothing is left unguarded in the meantime either. The checks below are about the descriptor
-   * this command opens, and a descriptor is not something another process can move; the races an
-   * outer lock would have covered are the pathname ones the binding already removes.
+   * Leaving it to `Db` was wrong in a way only two processes show: both could bind the same inode
+   * and open it before either reached `withMigrationExclusivity`, because the bound VFS's locking
+   * methods are deliberately no-ops — this command holds the directory lock, so there is nothing
+   * else to exclude *once it holds it*. Without it the loser could migrate a database the winner
+   * had already migrated, or restore its own pre-migration image over the winner's result and
+   * report success. A descriptor that cannot be moved is not a promise that its bytes are still
+   * what they were.
+   *
+   * The path is spelled exactly as `withMigrationExclusivity` spells it — `dirname` without
+   * resolution — because a lock at `/var/...` and a lock at `/private/var/...` are two files and
+   * would exclude nobody.
    */
-  {
-    // Shape questions the pathname must answer before it is opened at all: an `open` follows a
-    // symbolic link, and following one would put the descriptor on a file nobody named.
+  const lock = new SingleInstanceLock(join(dirname(databasePath), "agentcpd.lock"));
+  const acquired = lock.acquire(new Date().toISOString());
+  if (!acquired.allowed) {
+    throw acpError(
+      acquired.reasonCode,
+      "refusing to migrate a copy while another process holds the state lock",
+      { ...acquired.evidence },
+    );
+  }
+  try {
+    // Everything below is decided under the lease. Shape questions come first because `open`
+    // follows a symbolic link, and following one would put the descriptor on a file nobody named.
     const named = lstatSync(databasePath, { throwIfNoEntry: false });
     if (!named) throw acpError(ReasonCode.INTERNAL_ERROR, "the named copy does not exist", {});
     if (named.isSymbolicLink()) {
@@ -1403,7 +1434,7 @@ export const migrateApprovedCopy = (databasePath: string): ApprovedCopyMigration
     }
     // A copy handed to this command has to be at rest. In WAL mode the main file's header can lag
     // behind committed frames living in the sidecar, so a copy with a non-empty log beside it is
-    // one whose version cannot be read from its header — and the bound connection cannot own a
+    // one whose version cannot be read from its header — and a bound connection cannot own a
     // shared-memory family, so it could not replay that log either.
     for (const suffix of ["-wal", "-shm"]) {
       const sidecar = `${databasePath}${suffix}`;
@@ -1419,6 +1450,8 @@ export const migrateApprovedCopy = (databasePath: string): ApprovedCopyMigration
     const control = FdVfsControl.load();
     try {
       return withBoundDescriptor(control, databasePath, (descriptor) => {
+        // Identity, link count, version and approval are all read here — under the lease, and from
+        // the descriptor this command holds rather than from the pathname a second time.
         const opened = fstatSync(descriptor);
         const target: TargetIdentity = {
           path: realpathSync(databasePath),
@@ -1427,7 +1460,7 @@ export const migrateApprovedCopy = (databasePath: string): ApprovedCopyMigration
         };
         assertApprovedCopyIdentity(databasePath, descriptor, target);
 
-        const writer = new Db(databasePath);
+        const writer = new Db(databasePath, { migrationLock: lock });
         try {
           /*
            * The mode SQLite established, not the one it was asked for. `Db` requests WAL on every
@@ -1435,8 +1468,6 @@ export const migrateApprovedCopy = (databasePath: string): ApprovedCopyMigration
            * declines and stays on a rollback journal — silently, by returning the old mode rather
            * than an error. Asserting the request would assert nothing.
            */
-          // `pragma_journal_mode` rather than `PRAGMA journal_mode`: this connection refuses reads
-          // that are not queries, and the table-valued form is one.
           const mode = String(
             (writer.get<{ journal_mode: string }>("SELECT journal_mode FROM pragma_journal_mode") ??
               { journal_mode: "" }).journal_mode,
@@ -1449,38 +1480,71 @@ export const migrateApprovedCopy = (databasePath: string): ApprovedCopyMigration
             );
           }
 
+          /*
+           * What this writer did, not what the file happens to look like.
+           *
+           * Reading the version back and calling it success would report someone else's migration
+           * as this command's: a second process arriving after the first finished would find the
+           * final version, an absent approval, and print `fromVersion: 25` with nothing of its own
+           * behind it. Success therefore requires that *this* open applied *this* approval.
+           */
+          const applied = writer.appliedMigrationApproval;
+          if (applied === null) {
+            throw acpError(
+              ReasonCode.INTERNAL_ERROR,
+              "this open applied no migration, so there is no approved chain to report",
+              {},
+            );
+          }
           const toVersion = Number(
             (writer.get<{ user_version: number }>("SELECT user_version FROM pragma_user_version") ??
               { user_version: 0 }).user_version,
           );
+          if (toVersion !== SCHEMA_VERSION) {
+            throw acpError(
+              ReasonCode.INTERNAL_ERROR,
+              `the copy ended at ${toVersion} and this build declares ${SCHEMA_VERSION}`,
+              {},
+            );
+          }
           const receipts = writer.all<{ id: string; checksum: string | null }>(
             `SELECT migration_id AS id, checksum FROM schema_migrations
               WHERE version > ? ORDER BY version`,
             [APPROVED_COPY_FROM_VERSION],
           );
-          const retirement = retireMigrationApproval(
-            databasePath,
-            APPROVED_COPY_FROM_VERSION,
-            toVersion,
-          );
+          const planned = migrationPlanFrom(APPROVED_COPY_FROM_VERSION).migrations;
+          if (
+            receipts.length !== planned.length ||
+            receipts.some((receipt, index) => receipt.id !== planned[index])
+          ) {
+            throw acpError(
+              ReasonCode.INTERNAL_ERROR,
+              "the receipts on file are not the ordered chain this command approved",
+              {},
+            );
+          }
+
           return {
-            fromVersion: APPROVED_COPY_FROM_VERSION,
+            fromVersion: applied.fromVersion,
             toVersion,
             migrations: receipts.map((receipt) => ({
               id: receipt.id,
               checksum: /^sha256:[a-f0-9]{64}$/.test(receipt.checksum ?? ""),
             })),
-            approvalRetired: retirement.retired,
+            approvalRetired: writer.migrationApprovalRetirement?.retired ?? false,
             journalMode: mode,
             daemonless: true,
           };
         } finally {
-          // Closed inside the binding: a release is refused while any file of it is still open.
+          // Closed inside the binding, which is released inside the lease: a release is refused
+          // while any file of the binding is open, and the lease must outlive both.
           writer.close();
         }
       });
     } finally {
       control.close();
     }
+  } finally {
+    lock.release();
   }
 };
