@@ -10,6 +10,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -37,6 +38,8 @@ afterAll(cleanupTempDirs);
  * and what comes back — not a function this file could import.
  */
 const CLI = fileURLToPath(new URL("../../src/db/state-admin.ts", import.meta.url));
+/** Imported by the parked child below; the CLI passes no seam, so only a test can reach one. */
+const DB_MODULE = new URL("../../src/db/database.ts", import.meta.url).href;
 const LINEAGE = readFileSync(new URL("../fixtures/schema-v25-lineage.sql", import.meta.url), "utf8");
 
 const run = (args: readonly string[], env: NodeJS.ProcessEnv = {}) =>
@@ -232,59 +235,98 @@ describe("U6-UNIT3 migrate-approved-copy runs in the file it verified", () => {
   }, 300_000);
 
   it("lets exactly one of two overlapping commands migrate the same copy", async () => {
-    // The lease has to be taken before anything is opened or bound. Without it both processes can
-    // bind the same inode and open it before either reaches `Db`'s exclusivity — the bound VFS's
-    // locking methods are deliberately no-ops — and then the loser can migrate a database the
-    // winner already migrated, or restore its own pre-migration image over the winner's result and
-    // report success. A descriptor that cannot be moved is not a promise its bytes are unchanged.
+    // Two processes, one approved copy, scheduled rather than raced — and what each of them is
+    // allowed to conclude when the other one got there first.
+    //
+    // The lease is taken before anything is opened or bound, so without it both processes can bind
+    // the same inode and open it before either reaches `Db`'s exclusivity: the bound VFS's locking
+    // methods are deliberately no-ops. What that costs is measured below rather than asserted here.
+    // On the interleaving this test schedules it costs nothing to the file, because #747's re-read
+    // under the lock catches the loser — so this is a regression test for the *outcome*, and the
+    // half that the lease itself owns is the refusal at the bottom of this case.
     const { dir, path } = copyIn("overlap");
 
-    const start = (): Promise<{ status: number | null; stdout: string; stderr: string }> =>
-      new Promise((resolve) => {
-        const child = spawn(
-          process.execPath,
-          ["--import", "tsx", CLI, "migrate-approved-copy", "--database-copy", path, "--confirm-migration"],
-          { env: { ...process.env, ACP_STATE_DIR: dir, HOME: dir } },
-        );
-        let stdout = "";
-        let stderr = "";
-        child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
-        child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
-        child.on("close", (status) => resolve({ status, stdout, stderr }));
-      });
+    // Then the overlap itself — scheduled, not raced.
+    //
+    // `Promise.all([start(), start()])` was here and could not fail: `SingleInstanceLock.acquire`
+    // denies rather than waiting, so whichever process arrives second is refused at whichever layer
+    // it reaches first, and the outcome reads the same with the lease and without it. Measured on
+    // this file: the two-process case passed with the outer lease deleted.
+    //
+    // The defect needs an interleaving no race produces on purpose — both processes past the open,
+    // one finishing, the *other one still holding what it read before that*. So the parent puts a
+    // process there and holds it: a child parks at `beforeMigrationExclusivity`, which is after the
+    // bind, the open, the version read and the approval check, and before exclusivity. Two FIFOs
+    // carry the handshake, so every step is an ordering rather than a delay.
+    const readyFifo = join(dir, "parked-ready.fifo");
+    const releaseFifo = join(dir, "parked-release.fifo");
+    expect(spawnSync("mkfifo", [readyFifo, releaseFifo]).status, "mkfifo").toBe(0);
+    const parkedScript = join(dir, "parked-child.mjs");
+    writeFileSync(
+      parkedScript,
+      [
+        `import { openSync, writeSync, closeSync, readFileSync } from "node:fs";`,
+        `import { migrateApprovedCopy } from ${JSON.stringify(DB_MODULE)};`,
+        `const [copyPath, ready, release] = process.argv.slice(2);`,
+        `try {`,
+        `  const report = migrateApprovedCopy(copyPath, {`,
+        `    beforeMigrationExclusivity: () => {`,
+        `      const fd = openSync(ready, "w");`,
+        `      try { writeSync(fd, "parked"); } finally { closeSync(fd); }`,
+        `      readFileSync(release, "utf8");`,
+        `    },`,
+        `  });`,
+        `  process.stdout.write(JSON.stringify(report));`,
+        `} catch (error) {`,
+        `  process.stderr.write(error instanceof Error ? error.message : String(error));`,
+        `  process.exit(1);`,
+        `}`,
+      ].join("\n"),
+      { mode: 0o600 },
+    );
 
-    // First, deterministically: a lease already held by someone else. The command must refuse
-    // before it opens anything.
-    //
-    // Two overlapping processes alone cannot show this. `Db` takes the same lock a moment later,
-    // so the loser is refused either way and the outcome looks identical whether or not this
-    // command takes a lease of its own — measured: with the lease removed, the two-process case
-    // still passes. Nor do the bytes distinguish it: the only write an aborted open would make is
-    // the WAL switch, and a bound connection has that declined, so nothing moves.
-    //
-    // What does distinguish it is which layer refused. A command that takes the lease before it
-    // opens anything refuses as itself, about a copy. One that opens first is refused by `Db`,
-    // about a schema, and the evidence then names the file it had already opened.
-    const foreign = new SingleInstanceLock(join(dir, "agentcpd.lock"));
-    expect(foreign.acquire(new Date().toISOString()).allowed).toBe(true);
-    const beforeHeld = imprintOf(path);
-    const refused = run(["migrate-approved-copy", "--database-copy", path, "--confirm-migration"], {
-      ACP_STATE_DIR: dir,
-      HOME: dir,
+    const parked = spawn(process.execPath, ["--import", "tsx", parkedScript, path, readyFifo, releaseFifo], {
+      env: { ...process.env, ACP_STATE_DIR: dir, HOME: dir },
     });
-    foreign.release();
-    expect(refused.status, "a held lease did not stop the command").not.toBe(0);
-    expect(refused.stdout.trim()).toBe("");
-    const refusal = JSON.parse(refused.stderr) as { message: string; evidence?: { file?: string } };
-    expect(
-      refusal.message,
-      "the refusal came from Db, so the copy had already been opened before the lease was checked",
-    ).toContain("refusing to migrate a copy");
-    expect(refusal.evidence?.file).toBeUndefined();
-    expect(imprintOf(path)).toEqual(beforeHeld);
+    let parkedOut = "";
+    let parkedErr = "";
+    parked.stdout.on("data", (chunk: Buffer) => (parkedOut += chunk.toString()));
+    parked.stderr.on("data", (chunk: Buffer) => (parkedErr += chunk.toString()));
+    let parkedExited = false;
+    const parkedClosed = new Promise<{ status: number | null; stdout: string; stderr: string }>(
+      (resolve) =>
+        parked.on("close", (status) => {
+          parkedExited = true;
+          resolve({ status, stdout: parkedOut, stderr: parkedErr });
+        }),
+    );
 
-    // Then the overlap itself, on the same copy, with no coordination between the two processes.
-    const [first, second] = await Promise.all([start(), start()]);
+    // The child is at the boundary when it says so. If it died on the way, that is this failure and
+    // not a hang: the read would otherwise block until the suite's timeout with nothing to show.
+    const arrived = await Promise.race([
+      readFile(readyFifo, "utf8"),
+      parkedClosed.then((outcome) => {
+        throw new Error(`the child exited before the boundary: ${JSON.stringify(outcome)}`);
+      }),
+    ]);
+    expect(arrived).toBe("parked");
+
+    let first: { status: number | null; stdout: string; stderr: string };
+    let second: { status: number | null; stdout: string; stderr: string };
+    try {
+      // A whole real CLI run — open, migrate, retire the approval, exit — against the same copy a
+      // live process already has open and has already read as version 25.
+      const cli = run(["migrate-approved-copy", "--database-copy", path, "--confirm-migration"], {
+        ACP_STATE_DIR: dir,
+        HOME: dir,
+      });
+      first = { status: cli.status, stdout: cli.stdout, stderr: cli.stderr };
+    } finally {
+      // Released last, holding everything it decided before the run above.
+      if (!parkedExited) await Promise.race([writeFile(releaseFifo, "go"), parkedClosed]);
+      second = await parkedClosed;
+    }
+
     const outcomes = [first, second];
     const winners = outcomes.filter((outcome) => outcome.status === 0);
     const losers = outcomes.filter((outcome) => outcome.status !== 0);
@@ -300,19 +342,66 @@ describe("U6-UNIT3 migrate-approved-copy runs in the file it verified", () => {
     // The loser printed no report at all — not a success, and not a version it did not produce.
     expect(losers[0]!.stdout.trim()).toBe("");
 
-    // And it did not restore its own pre-migration image over the winner.
+    // And it did not restore its own pre-migration image over the winner. The ordered ids are the
+    // assertion rather than a count of them: applying the chain twice and losing it both leave a
+    // number, and only one of the two is what a restore looks like.
     expect(headerVersion(path)).toBe(SCHEMA_VERSION);
+    const chain = MIGRATIONS.filter((migration) => migration.fromVersion >= 25).map(
+      (migration) => migration.id,
+    );
     const raw = new Database(path, { readonly: true, fileMustExist: true });
     try {
-      const rows = raw
-        .prepare("SELECT count(*) AS n FROM schema_migrations WHERE version > 25")
-        .get() as { n: number };
-      expect(rows.n, "the copy lost the chain the winner applied").toBe(
-        MIGRATIONS.filter((migration) => migration.fromVersion >= 25).length,
-      );
+      const applied = raw
+        .prepare("SELECT migration_id FROM schema_migrations WHERE version > 25 ORDER BY version")
+        .all() as Array<{ migration_id: string }>;
+      expect(
+        applied.map((row) => row.migration_id),
+        "the copy is not carrying exactly the chain the winner applied, once",
+      ).toEqual(chain);
     } finally {
       raw.close();
     }
+
+    // #4 — and afterwards, nobody may report the winner's work as their own. The approval was spent
+    // and retired, so a later invocation has nothing to apply and must not print a `fromVersion` it
+    // did not migrate from.
+    const after = run(["migrate-approved-copy", "--database-copy", path, "--confirm-migration"], {
+      ACP_STATE_DIR: dir,
+      HOME: dir,
+    });
+    expect(after.status, "a run after the winner reported success it did not produce").not.toBe(0);
+    expect(after.stdout.trim()).toBe("");
+
+    // Last, and separately: a lease already held by someone else, on a copy of its own. The command
+    // must refuse before it opens anything.
+    //
+    // Two overlapping processes alone cannot show this. `Db` takes the same lock a moment later,
+    // so the loser is refused either way and the outcome looks identical whether or not this
+    // command takes a lease of its own — measured: with the lease removed, the two-process case
+    // still passes. Nor do the bytes distinguish it: the only write an aborted open would make is
+    // the WAL switch, and a bound connection has that declined, so nothing moves.
+    //
+    // What does distinguish it is which layer refused. A command that takes the lease before it
+    // opens anything refuses as itself, about a copy. One that opens first is refused by `Db`,
+    // about a schema, and the evidence then names the file it had already opened.
+    const held = copyIn("overlap-held");
+    const foreign = new SingleInstanceLock(join(held.dir, "agentcpd.lock"));
+    expect(foreign.acquire(new Date().toISOString()).allowed).toBe(true);
+    const beforeHeld = imprintOf(held.path);
+    const refused = run(["migrate-approved-copy", "--database-copy", held.path, "--confirm-migration"], {
+      ACP_STATE_DIR: held.dir,
+      HOME: held.dir,
+    });
+    foreign.release();
+    expect(refused.status, "a held lease did not stop the command").not.toBe(0);
+    expect(refused.stdout.trim()).toBe("");
+    const refusal = JSON.parse(refused.stderr) as { message: string; evidence?: { file?: string } };
+    expect(
+      refusal.message,
+      "the refusal came from Db, so the copy had already been opened before the lease was checked",
+    ).toContain("refusing to migrate a copy");
+    expect(refusal.evidence?.file).toBeUndefined();
+    expect(imprintOf(held.path)).toEqual(beforeHeld);
   }, 300_000);
 
   it("refuses a copy with a non-empty log beside it, before it connects", () => {

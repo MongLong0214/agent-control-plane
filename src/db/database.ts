@@ -1395,8 +1395,18 @@ export interface ApprovedCopyMigrationReport {
  * opens the operator's own pathname, and the bound VFS hands it a duplicate of the descriptor this
  * function verified. Nothing is staged and nothing is written back — the migration happens in the
  * approved file itself, through a handle that cannot be redirected.
+ *
+ * `seam` is how a test schedules the two-process window this command's lease exists to close; the
+ * CLI passes one argument, so nothing an operator can run reaches it. It is here because the window
+ * cannot be scheduled from outside the process: measured, an approval file made into a FIFO is
+ * refused by `assertPrivatePath` before it can block, and stopping a child by signal needs the
+ * boundary to be observable from outside, which it is not — it is one instruction between an open
+ * and a lock.
  */
-export const migrateApprovedCopy = (databasePath: string): ApprovedCopyMigrationReport => {
+export const migrateApprovedCopy = (
+  databasePath: string,
+  seam?: { readonly beforeMigrationExclusivity?: () => void },
+): ApprovedCopyMigrationReport => {
   /*
    * The lock comes first, before anything is opened or bound.
    *
@@ -1460,7 +1470,10 @@ export const migrateApprovedCopy = (databasePath: string): ApprovedCopyMigration
         };
         assertApprovedCopyIdentity(databasePath, descriptor, target);
 
-        const writer = new Db(databasePath, { migrationLock: lock });
+        const writer = new Db(databasePath, {
+          migrationLock: lock,
+          beforeMigrationExclusivity: seam?.beforeMigrationExclusivity,
+        });
         try {
           /*
            * The mode SQLite established, not the one it was asked for. `Db` requests WAL on every
