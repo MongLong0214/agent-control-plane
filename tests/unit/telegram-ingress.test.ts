@@ -354,6 +354,11 @@ describe("Telegram production ingress", () => {
         .filter((message) => message.kind === "RUN_DISPATCH");
       expect(pending).toHaveLength(1);
       expect(harness.buzz.sent).toHaveLength(0);
+      // #760 — the dispatch has a room to go to and now also needs someone in it to address.
+      harness.cp.db.run(`UPDATE sessions SET buzz_actor_id = ? WHERE session_id = ?`, [
+        "actor:dispatch-target",
+        pending[0]!.targetSessionId,
+      ]);
 
       const started = await daemon.start();
       expect(started.allowed).toBe(true);

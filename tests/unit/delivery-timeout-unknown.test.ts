@@ -35,7 +35,13 @@ const transportThatFails = (error: Error): BuzzTransport => ({
 });
 
 const enqueueOne = (core: ReturnType<typeof makeCore>, seeded: { runId: string; sessionId: string; roleKey: string }) => {
-  core.db.run(`UPDATE sessions SET buzz_address = 'chan' WHERE session_id = ?`, [seeded.sessionId]);
+  // Both columns: the address is the room and `buzz_actor_id` is who in it this session is.
+  // Since #760 a delivery needs the second as well, or it is refused before the transport is
+  // reached — which would make these classifier cases pass without ever calling it.
+  core.db.run(
+    `UPDATE sessions SET buzz_address = 'chan', buzz_actor_id = 'actor:target' WHERE session_id = ?`,
+    [seeded.sessionId],
+  );
   const queued = core.outbox.enqueue({
     idempotencyKey: `idem-${Math.abs(seeded.runId.length)}-${core.clock.nowIso()}`,
     roleKey: seeded.roleKey,

@@ -493,17 +493,93 @@ describe("round-2 Buzz transport and authority", () => {
     const root = tempDir("acp-buzz-cli-");
     const binary = join(root, "buzz");
     const received = join(root, "received.txt");
-    writeFileSync(binary, "#!/bin/sh\ncat > \"$ACP_TEST_BUZZ_STDIN\"\n", "utf8");
+    // Echoes the receipt the real CLI prints, with exactly the `--mention` values it was
+    // handed (#760): the transport now reads that answer, so a stub that stays silent would
+    // fail the send for a reason this test is not about.
+    writeFileSync(
+      binary,
+      [
+        "#!/bin/sh",
+        'cat > "$ACP_TEST_BUZZ_STDIN"',
+        'm=""; prev=""',
+        'for a in "$@"; do',
+        '  if [ "$prev" = "--mention" ]; then m="$m\\"$a\\","; fi',
+        '  prev="$a"',
+        "done",
+        `printf '{"accepted":true,"event_id":"abc","mention_pubkeys":[%s]}' "\${m%,}"`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
     chmodSync(binary, 0o755);
 
     process.env["ACP_TEST_BUZZ_STDIN"] = received;
     try {
-      await new BuzzCliTransport(binary).send("channel-test", "fenced body\n");
+      await new BuzzCliTransport(binary).send("channel-test", "fenced body\n", [
+        "0".repeat(64),
+      ]);
     } finally {
       delete process.env["ACP_TEST_BUZZ_STDIN"];
     }
 
     expect(readFileSync(received, "utf8")).toBe("fenced body\n");
+  });
+
+  it("#321/#124/#214 delivery addresses the target session's bound identity", async () => {
+    const { core, seeded } = seededCore();
+    const transport = new InMemoryBuzzTransport();
+    const adapter = new BuzzAdapter(
+      core.db,
+      core.clock,
+      core.audit,
+      core.sessions,
+      core.bindings,
+      core.outbox,
+      transport,
+    );
+    expect((await adapter.connect(seeded.sessionId, "shared-channel")).allowed).toBe(true);
+
+    // Written directly, as the fixture writes every other column on this row. Which writer is
+    // allowed to set `buzz_actor_id` is the neighbouring test's subject; this one is about what
+    // delivery does once it is set.
+    core.db.run(`UPDATE sessions SET buzz_actor_id = ? WHERE session_id = ?`, [
+      "actor:target",
+      seeded.sessionId,
+    ]);
+
+    enqueue(core, seeded);
+    const first = await adapter.deliverPending();
+
+    expect(first.delivered).toHaveLength(1);
+    // #760 — the room is not the address. `buzz_actor_id` is who in the room this envelope is
+    // for, and the delivery has to say so or it wakes nobody however correct its contents are.
+    expect(transport.sent).toHaveLength(1);
+    expect(transport.sent[0]?.recipients).toEqual(["actor:target"]);
+  });
+
+  it("#760 refuses to deliver to a session with no bound Buzz identity", async () => {
+    const { core, seeded } = seededCore();
+    const transport = new InMemoryBuzzTransport();
+    const adapter = new BuzzAdapter(
+      core.db,
+      core.clock,
+      core.audit,
+      core.sessions,
+      core.bindings,
+      core.outbox,
+      transport,
+    );
+    // A channel but no bound identity: the old code sent here and the outbox recorded a
+    // delivery, which is the state that cannot be told apart from one that reached someone.
+    expect((await adapter.connect(seeded.sessionId, "shared-channel")).allowed).toBe(true);
+    expect(core.sessions.get(seeded.sessionId)?.buzzActorId).toBeNull();
+
+    enqueue(core, seeded);
+    const result = await adapter.deliverPending();
+
+    expect(result.delivered).toEqual([]);
+    expect(result.failed).toHaveLength(1);
+    expect(transport.sent).toEqual([]);
   });
 
   it("#321/#124/#214 maps only an authenticated actor identity to an active binding", async () => {

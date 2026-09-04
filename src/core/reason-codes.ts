@@ -134,6 +134,26 @@ export const ReasonCode = {
     "RECOVERY_TAKEOVER_REQUIRES_UNREACHABLE_OWNER",
   SESSION_STOP_FAILED: "SESSION_STOP_FAILED",
 
+  // --- buzz delivery -------------------------------------------------------
+  /**
+   * An outbound Buzz message named no recipient, so nobody was addressed by it.
+   *
+   * `accepted: true` from the relay is a statement about the relay, not about who was
+   * notified: a message with no resolved mention lands in the room and wakes no one. This
+   * code is raised before the send is attempted, because a message that cannot address
+   * anyone has nothing to gain from being transmitted.
+   */
+  BUZZ_SEND_UNADDRESSED: "BUZZ_SEND_UNADDRESSED",
+  /**
+   * The relay did not resolve a recipient this message named.
+   *
+   * The relay reports which mentions it actually resolved; a named pubkey missing from that
+   * list was not notified, whatever the send's exit code said. Not retryable: an unresolved
+   * mention means the relay does not consider that identity a member of the channel, and
+   * repeating the same send cannot change that.
+   */
+  BUZZ_MENTION_NOT_RESOLVED: "BUZZ_MENTION_NOT_RESOLVED",
+
   // --- registries ----------------------------------------------------------
   MANIFEST_ACTIVATION_EVIDENCE_MISSING: "MANIFEST_ACTIVATION_EVIDENCE_MISSING",
   MANIFEST_ACTIVATION_GRANT_CONSUMED: "MANIFEST_ACTIVATION_GRANT_CONSUMED",

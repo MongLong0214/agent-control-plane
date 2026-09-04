@@ -2,7 +2,7 @@ import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 
 import type { Clock } from "../core/clock.ts";
-import { type Decision, allow, deny } from "../core/errors.ts";
+import { type Decision, acpError, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
@@ -14,11 +14,36 @@ import type { SessionRegistry } from "../session/session-registry.ts";
 
 const exec = promisify(execFile);
 
+/**
+ * What the relay says it did with one send (#760).
+ *
+ * `mentionPubkeys` is the relay's own resolution, not an echo of what was asked for. That
+ * distinction is the whole point: a `@name` in the body may be presentation-only text the
+ * relay never resolved to a member, and reading the body cannot tell the two apart. The relay
+ * already answers the question; before this it was discarded at the `stdio` boundary.
+ */
+export interface BuzzSendReceipt {
+  eventId: string;
+  mentionPubkeys: readonly string[];
+}
+
 /** Transport seam so delivery can be exercised without a live relay. */
 export interface BuzzTransport {
   /** Resolve or create the address a session is reachable at. */
   openChannel(purpose: string): Promise<string>;
-  send(channel: string, content: string): Promise<void>;
+  /**
+   * `recipients` are Buzz channel identities that must be notified by this message.
+   *
+   * A required argument rather than an option, because the defect being closed is a send
+   * that addressed nobody and reported success. There is no shape of this call that omits
+   * the recipients and still compiles, which is the only version of the rule that survives
+   * a caller who has not read #760.
+   */
+  send(
+    channel: string,
+    content: string,
+    recipients: readonly string[],
+  ): Promise<BuzzSendReceipt>;
   /**
    * Whether this transport can actually be used. Given a purpose it must answer for that
    * purpose — "the binary runs" and "the relay has rooms" are not the same question, and
@@ -227,21 +252,40 @@ export class BuzzCliTransport implements BuzzTransport {
     return channel;
   }
 
-  async send(channel: string, content: string): Promise<void> {
-    await new Promise<void>((resolve, reject) => {
+  async send(
+    channel: string,
+    content: string,
+    recipients: readonly string[],
+  ): Promise<BuzzSendReceipt> {
+    const named = normaliseRecipients(recipients);
+    // Before the spawn, not after it. A send that addresses nobody has nothing to gain from
+    // being transmitted, and transmitting it is what produces the `accepted: true` that reads
+    // as success afterwards.
+    if (named.length === 0) {
+      throw acpError(
+        ReasonCode.BUZZ_SEND_UNADDRESSED,
+        `buzz send to ${channel} named no recipient`,
+        { channel },
+      );
+    }
+
+    const stdout = await new Promise<string>((resolve, reject) => {
       const child = spawn(
         this.binary,
-        BUZZ_CLI_INVOCATIONS.messagesSend(channel),
-        { stdio: ["pipe", "ignore", "pipe"] },
+        BUZZ_CLI_INVOCATIONS.messagesSend(channel, named),
+        // stdout was `ignore` here, which is where the relay's answer about who it notified
+        // was being thrown away.
+        { stdio: ["pipe", "pipe", "pipe"] },
       );
       let settled = false;
       let stderr = "";
-      const finish = (error?: Error): void => {
+      let out = "";
+      const finish = (error?: Error, value?: string): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timeout);
         if (error) reject(error);
-        else resolve();
+        else resolve(value ?? "");
       };
       const timeout = setTimeout(() => {
         child.kill("SIGTERM");
@@ -249,11 +293,14 @@ export class BuzzCliTransport implements BuzzTransport {
       }, 60_000);
 
       child.once("error", (error) => finish(error));
+      child.stdout?.on("data", (chunk: Buffer) => {
+        out = `${out}${chunk.toString("utf8")}`.slice(-64_000);
+      });
       child.stderr?.on("data", (chunk: Buffer) => {
         stderr = `${stderr}${chunk.toString("utf8")}`.slice(-2_000);
       });
       child.once("close", (code, signal) => {
-        if (code === 0) finish();
+        if (code === 0) finish(undefined, out);
         else {
           finish(
             new Error(
@@ -265,13 +312,63 @@ export class BuzzCliTransport implements BuzzTransport {
       child.stdin?.once("error", (error) => finish(error));
       child.stdin?.end(content, "utf8");
     });
+
+    const receipt = asSendReceipt(stdout);
+    const unresolved = named.filter((pubkey) => !receipt.mentionPubkeys.includes(pubkey));
+    // Exit 0 is the relay saying it stored the event. It is not the relay saying it notified
+    // the identities this message named, and those are the two facts #760 stopped conflating.
+    if (unresolved.length > 0) {
+      throw acpError(
+        ReasonCode.BUZZ_MENTION_NOT_RESOLVED,
+        `buzz relay did not resolve ${unresolved.length} recipient(s) on ${channel}`,
+        { channel, unresolved, resolved: receipt.mentionPubkeys, eventId: receipt.eventId },
+      );
+    }
+    return receipt;
   }
 }
 
+/** Recipients, trimmed and de-duplicated, preserving the caller's order. */
+const normaliseRecipients = (recipients: readonly string[]): string[] => [
+  ...new Set(recipients.map((pubkey) => pubkey.trim()).filter((pubkey) => pubkey.length > 0)),
+];
+
+/**
+ * Reads the send result the CLI prints.
+ *
+ * A missing or unparseable `mention_pubkeys` is an error rather than an empty list: treating
+ * "the relay did not say" as "the relay notified nobody" would be a guess, and treating it as
+ * success would restore exactly the hole this closes. Both readings are wrong, so neither is
+ * taken.
+ */
+const asSendReceipt = (stdout: string): BuzzSendReceipt => {
+  const parsed = parseJson(stdout, "messages send");
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("buzz messages send did not return an object");
+  }
+  const record = parsed as Record<string, unknown>;
+  const mentions = record.mention_pubkeys;
+  if (!Array.isArray(mentions) || mentions.some((value) => typeof value !== "string")) {
+    throw new Error("buzz messages send did not report mention_pubkeys");
+  }
+  const eventId = record.event_id;
+  if (typeof eventId !== "string" || eventId.length === 0) {
+    throw new Error("buzz messages send did not report an event_id");
+  }
+  return { eventId, mentionPubkeys: (mentions as string[]).map((pubkey) => pubkey.trim()) };
+};
+
 /** In-memory transport for scenario tests; records what would have been delivered. */
 export class InMemoryBuzzTransport implements BuzzTransport {
-  readonly sent: Array<{ channel: string; content: string }> = [];
+  readonly sent: Array<{ channel: string; content: string; recipients: readonly string[] }> = [];
   #available = true;
+  #nextEventId = 0;
+  #unresolvable = new Set<string>();
+
+  /** Makes the fake relay decline to resolve a pubkey, the way a non-member is declined. */
+  setUnresolvable(pubkeys: readonly string[]): void {
+    this.#unresolvable = new Set(pubkeys);
+  }
 
   setAvailable(available: boolean): void {
     this.#available = available;
@@ -286,9 +383,36 @@ export class InMemoryBuzzTransport implements BuzzTransport {
     return `channel:${purpose}`;
   }
 
-  async send(channel: string, content: string): Promise<void> {
+  async send(
+    channel: string,
+    content: string,
+    recipients: readonly string[],
+  ): Promise<BuzzSendReceipt> {
+    // The same two refusals as the real transport, in the same order. A fake that accepts
+    // what production rejects makes every scenario test a statement about the fake.
+    const named = normaliseRecipients(recipients);
+    if (named.length === 0) {
+      throw acpError(
+        ReasonCode.BUZZ_SEND_UNADDRESSED,
+        `buzz send to ${channel} named no recipient`,
+        { channel },
+      );
+    }
     if (!this.#available) throw new Error("buzz transport unavailable");
-    this.sent.push({ channel, content });
+    const receipt: BuzzSendReceipt = {
+      eventId: `event:${(this.#nextEventId += 1)}`,
+      mentionPubkeys: named.filter((pubkey) => !this.#unresolvable.has(pubkey)),
+    };
+    const unresolved = named.filter((pubkey) => !receipt.mentionPubkeys.includes(pubkey));
+    if (unresolved.length > 0) {
+      throw acpError(
+        ReasonCode.BUZZ_MENTION_NOT_RESOLVED,
+        `buzz relay did not resolve ${unresolved.length} recipient(s) on ${channel}`,
+        { channel, unresolved, resolved: receipt.mentionPubkeys, eventId: receipt.eventId },
+      );
+    }
+    this.sent.push({ channel, content, recipients: named });
+    return receipt;
   }
 }
 
@@ -316,8 +440,18 @@ export const BUZZ_CLI_INVOCATIONS = {
   channelsGet: (channelId: string) => ["channels", "get", "--channel", channelId],
   messagesGet: (channel: string, limit: number) =>
     ["messages", "get", "--channel", channel, "--limit", String(limit)],
-  messagesSend: (channel: string) =>
-    ["messages", "send", "--channel", channel, "--content", "-"],
+  messagesSend: (channel: string, recipients: readonly string[]) => [
+    "messages",
+    "send",
+    "--channel",
+    channel,
+    // stdin, never an argv-borne body: a shell that eats a backtick in the content still
+    // produces exit 0 and an accepted event, so the argument form has no failure mode a
+    // caller can see.
+    "--content",
+    "-",
+    ...recipients.flatMap((pubkey) => ["--mention", pubkey]),
+  ],
 } as const;
 
 export class BuzzAdapter {
@@ -400,8 +534,27 @@ export class BuzzAdapter {
         failed.push(message.messageId);
         continue;
       }
+      // #760 — the recipient is not new information. `sessions.buzz_actor_id` is the same
+      // column `resolveActor` reads inbound, written only by an authenticated
+      // `bindBuzzActor`; the channel says which room, and this says who in it. A target with
+      // no bound identity cannot be addressed, and the answer to that is to refuse the
+      // delivery rather than to send an unaddressed message into the room and call it sent.
+      const recipient = session?.buzzActorId;
+      if (!recipient) {
+        this.outbox.markAttemptFailed(
+          message.messageId,
+          message.claimToken,
+          {
+            failureClass: "contract",
+            retryable: false,
+            error: "target session has no bound buzz channel identity to address",
+          },
+        );
+        failed.push(message.messageId);
+        continue;
+      }
       try {
-        await this.transport.send(channel, render(message));
+        await this.transport.send(channel, render(message), [recipient]);
         // Completing the delivery is a compare-and-set on the claim: if the claim was
         // reclaimed or the message retargeted while we were sending, this fails and the
         // message stays eligible rather than being marked sent to a revoked session.
@@ -449,6 +602,19 @@ const classifyTransportFailure = (error: unknown): {
   error: string;
 } => {
   const message = error instanceof Error ? error.message : String(error);
+  // #760 — matched by type, above the regexes. These two carry a reason code, and keying them
+  // on their wording would make a reworded message silently reclassify itself; every pattern
+  // below is a guess about a string some other program produced, which is why they are guesses
+  // and these are not. Both are `contract`: an unaddressed message and a recipient the relay
+  // does not consider a member are facts about this message, not about the network, and
+  // sending it again unchanged reproduces them exactly.
+  if (
+    isAcpError(error) &&
+    (error.reasonCode === ReasonCode.BUZZ_SEND_UNADDRESSED ||
+      error.reasonCode === ReasonCode.BUZZ_MENTION_NOT_RESOLVED)
+  ) {
+    return { failureClass: "contract", retryable: false, error: message };
+  }
   // #451 — a timeout is the one transport failure where the outcome is genuinely unknown. The
   // frame may already be at the far end: `send` returning late says nothing about whether it
   // arrived. Retrying then delivers the same envelope twice, which is the destination
