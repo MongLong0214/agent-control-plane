@@ -632,7 +632,7 @@ backup:
     # that copy's own from/to versions, and cannot authorise anything for the live database.
     node /Users/isaac/projects/agent-control-plane/dist/db/state-admin.js approve-migration \
       --database "$DRY" --approved-by "$USER" --confirm-migration
-    node /Users/isaac/projects/agent-control-plane/dist/db/state-admin.js migrate-approved-copy \
+    node "$HOME/projects/agent-control-plane/dist/db/state-admin.js" migrate-approved-copy \
       --database-copy "$DRY" --confirm-migration
     rm -rf "$DRY_DIR"
 
