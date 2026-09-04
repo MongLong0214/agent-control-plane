@@ -42,7 +42,14 @@ const INVOCATIONS = [
   { name: "channelsList", argv: BUZZ_CLI_INVOCATIONS.channelsList() },
   { name: "channelsGet", argv: BUZZ_CLI_INVOCATIONS.channelsGet("00000000-0000-0000-0000-000000000000") },
   { name: "messagesGet", argv: BUZZ_CLI_INVOCATIONS.messagesGet("00000000-0000-0000-0000-000000000000", 10) },
-  { name: "messagesSend", argv: BUZZ_CLI_INVOCATIONS.messagesSend("00000000-0000-0000-0000-000000000000") },
+  {
+    name: "messagesSend",
+    // A recipient is required, so the shape check has to supply one. The all-zero pubkey names
+    // nobody and is never sent anywhere — this probe only reads `--help`.
+    argv: BUZZ_CLI_INVOCATIONS.messagesSend("00000000-0000-0000-0000-000000000000", [
+      "0".repeat(64),
+    ]),
+  },
 ];
 
 const helpFor = (argv: readonly string[]): string => {
