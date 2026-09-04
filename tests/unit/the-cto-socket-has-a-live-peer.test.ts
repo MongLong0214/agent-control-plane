@@ -38,6 +38,9 @@ afterAll(cleanupTempDirs);
  */
 const TOKEN = "local-test-token";
 
+/** The id `connectPeer` sends `initialize` under, and the id its response comes back on. */
+const INITIALIZE_ID = 1;
+
 const CONTRACT: TaskContract = {
   goal: "cto delivery target",
   why: "exercise the role's live peer",
@@ -53,6 +56,15 @@ interface PeerHandle {
   socket: Socket;
   /** Texts the daemon delivered to this peer over `sampling/createMessage`. */
   received: string[];
+  /**
+   * Whether this connection's `initialize` response has come back.
+   *
+   * A post-attach observable, not a timer. `startMcpSocket` calls its factory — which is where
+   * `ctoConversation.attach` runs — and only then awaits `mcp.connect(transport)`, so the server
+   * cannot have written a byte of this response until attach had already recorded the connection.
+   * Waiting on it is therefore an ordering proof; a sleep is only a guess about scheduling.
+   */
+  initialized: () => boolean;
   close: () => Promise<void>;
 }
 
@@ -67,6 +79,7 @@ const connectPeer = async (
 ): Promise<PeerHandle> => {
   const socket = createConnection(socketPath);
   const received: string[] = [];
+  let initialized = false;
   await new Promise<void>((resolve, reject) => {
     socket.once("connect", resolve);
     socket.once("error", reject);
@@ -84,10 +97,14 @@ const connectPeer = async (
       const line = buffer.slice(0, newline);
       buffer = buffer.slice(newline + 1);
       if (line.trim().length === 0) continue;
-      let message: { id?: number; method?: string; params?: unknown };
+      let message: { id?: number; method?: string; params?: unknown; result?: unknown };
       try {
         message = JSON.parse(line) as typeof message;
       } catch {
+        continue;
+      }
+      if (message.id === INITIALIZE_ID && message.method === undefined && message.result !== undefined) {
+        initialized = true;
         continue;
       }
       if (message.method === "sampling/createMessage" && message.id !== undefined) {
@@ -111,7 +128,7 @@ const connectPeer = async (
   socket.write(
     `${JSON.stringify(credential)}\n${JSON.stringify({
       jsonrpc: "2.0",
-      id: 1,
+      id: INITIALIZE_ID,
       method: "initialize",
       params: {
         protocolVersion: "2025-11-25",
@@ -125,6 +142,7 @@ const connectPeer = async (
   return {
     socket,
     received,
+    initialized: () => initialized,
     close: () =>
       new Promise<void>((resolve) => {
         if (socket.destroyed) {
@@ -412,6 +430,82 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
     }
   }, 60_000);
 
+  it("stops delivering to a runtime the conversation has moved off, while its other role still arrives", async () => {
+    const harness = makeHarness();
+    const a = await registerFixtureProject(harness, "project-a");
+    const bManifest = fixtureManifest("project-b");
+    const bProject = harness.cp.projects.register({
+      projectId: "project-b",
+      name: "fixture",
+      manifest: bManifest,
+      authorization: harness.cp.manifestAuthorizationForTests(bManifest),
+    });
+    if (!bProject.allowed) throw new Error(`second project failed: ${bProject.message}`);
+
+    const s1 = readySession(harness, "cto-before-failover");
+    const s2 = readySession(harness, "cto-after-failover");
+    for (const projectId of [a.projectId, "project-b"]) {
+      expect(
+        harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId: s1.sessionId, projectId })
+          .reasonCode,
+      ).toBe(ReasonCode.OK);
+    }
+    const keyA = roleKeyFor(Role.PRIMARY_CTO, { projectId: a.projectId });
+    const keyB = roleKeyFor(Role.PRIMARY_CTO, { projectId: "project-b" });
+
+    const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-cto-survived-"), TOKEN);
+    const ctoSocket = listeners.socketPaths[1];
+    if (!ctoSocket) throw new Error("the CTO MCP listener was not started");
+    const before = await connectPeer(ctoSocket, { token: TOKEN, ...s1 });
+    try {
+      await until(
+        () => listeners.ctoConversation.connected(keyA) && listeners.ctoConversation.connected(keyB),
+        "S1 to hold both of its projects",
+      );
+
+      // The conversation for project B survives onto another runtime. The assignment and its
+      // generation do not change — only the actor's live session does — so nothing about the
+      // binding's identity distinguishes before from after. What distinguishes them is which
+      // runtime the registry now names, and the delivery predicate is the only reader of it.
+      const moved = harness.cp.bindings.switchTo({
+        role: Role.PRIMARY_CTO,
+        projectId: "project-b",
+        sessionId: s2.sessionId,
+        conversation: "SURVIVED",
+        reason: "failover for the delivery test",
+      });
+      if (!moved.allowed) throw new Error(`the runtime did not move: ${moved.message}`);
+      expect(
+        harness.cp.bindings.active(keyB)?.sessionId,
+        "the registry did not move project B's runtime",
+      ).toBe(s2.sessionId);
+
+      const stale = await listeners.ctoConversation.deliver(keyB, "must not reach the old runtime");
+      expect(stale.allowed).toBe(false);
+      expect(stale.reasonCode).toBe(ReasonCode.ROLE_PEER_STALE);
+
+      // The sibling binding is still valid and still on this connection, so the refusal above is
+      // the delivery predicate deciding — not the connection having become ineligible.
+      const toA = await listeners.ctoConversation.deliver(keyA, "still for project A");
+      if (!toA.allowed) throw new Error(`the surviving sibling role was lost: ${toA.message}`);
+      expect(before.received).toEqual(["still for project A"]);
+
+      const after = await connectPeer(ctoSocket, { token: TOKEN, ...s2 });
+      try {
+        await until(() => listeners.ctoConversation.connected(keyB), "the new runtime to hold B");
+        const toB = await listeners.ctoConversation.deliver(keyB, "for the new runtime");
+        if (!toB.allowed) throw new Error(`the new runtime was unreachable: ${toB.message}`);
+        expect(after.received).toEqual(["for the new runtime"]);
+        expect(before.received, "the old runtime received B's mail").toEqual(["still for project A"]);
+      } finally {
+        await after.close();
+      }
+    } finally {
+      await before.close();
+      await listeners.close();
+    }
+  }, 60_000);
+
   it("leaves no peer behind when the holder disconnects, and a late close does not detach its replacement", async () => {
     const harness = makeHarness();
     const { projectId } = await registerFixtureProject(harness);
@@ -426,8 +520,18 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
     const ctoSocket = listeners.socketPaths[1];
     if (!ctoSocket) throw new Error("the CTO MCP listener was not started");
     const credential = { token: TOKEN, ...session };
+    // Every peer this row opens is closed in the `finally`, on the failing path as much as the
+    // passing one. `listeners.close()` waits on its live connections, so a row that fails with a
+    // socket still open reports a 60s harness timeout instead of its own message — measured while
+    // proving this row kills an unconditional detach.
+    const opened: PeerHandle[] = [];
+    const open = async (): Promise<PeerHandle> => {
+      const peer = await connectPeer(ctoSocket, credential);
+      opened.push(peer);
+      return peer;
+    };
     try {
-      const first = await connectPeer(ctoSocket, credential);
+      const first = await open();
       await until(() => listeners.ctoConversation.connected(roleKey), "the first peer to attach");
       await first.close();
       await until(
@@ -441,20 +545,25 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
 
       // Reconnect, then close the *replaced* connection last. Its detach must not clear the peer
       // that took its place — that would strand delivery on nobody while a live session is there.
-      const replaced = await connectPeer(ctoSocket, credential);
+      const replaced = await open();
       await until(() => listeners.ctoConversation.connected(roleKey), "the replaced peer to attach");
-      const replacement = await connectPeer(ctoSocket, credential);
-      await until(() => replacement.received.length === 0 && replacement.socket.writable, "the replacement to connect");
-      // Give the daemon the chance to have processed the replacement's handshake before the
-      // replaced connection closes; the assertion below is what proves the ordering held.
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      const replacement = await open();
+      // The ordering this row is about — replacement attached *before* the replaced connection
+      // closes — has to be established, not hoped for. `startMcpSocket` runs its factory, and so
+      // `attach`, before it awaits `mcp.connect(transport)`; the server therefore cannot answer
+      // `initialize` on this socket until the replacement is already the recorded peer. A sleep
+      // would only be a guess about scheduling, and would pass for the wrong reason on a slow run.
+      await until(
+        () => replacement.initialized(),
+        "the replacement's initialize response, which the server can only send after its attach ran",
+      );
       await replaced.close();
 
       const delivered = await listeners.ctoConversation.deliver(roleKey, "after the swap");
       if (!delivered.allowed) throw new Error(`the replacement peer was detached: ${delivered.message}`);
       expect(replacement.received).toEqual(["after the swap"]);
-      await replacement.close();
     } finally {
+      for (const peer of opened) await peer.close();
       await listeners.close();
     }
   }, 60_000);

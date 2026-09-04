@@ -339,11 +339,7 @@ export const startLocalMcpListeners = async (
    */
   const ctoConversation = new RoleConversationPort(Role.PRIMARY_CTO, {
     active: (roleKey) => cp.bindings.active(roleKey),
-    currentCandidates: () =>
-      cp.projects
-        .list()
-        .map((project) => cp.bindings.activePrimaryCto(project.projectId))
-        .filter((binding): binding is NonNullable<typeof binding> => binding !== null),
+    currentCandidates: () => currentBindingsForRoles(cp, [Role.PRIMARY_CTO]),
   });
   const hermes = await startMcpSocket(
     hermesPath,
@@ -1068,6 +1064,40 @@ const presentedBuzzMessage = (value: unknown): BuzzMessageIngressInput | null =>
   return { actor, conversation, eventId, addressedTo, text, signature: signature ?? null };
 };
 
+/**
+ * Every ACTIVE binding of these roles, as the registry currently holds it (`#760` Part B).
+ *
+ * The question is "who holds this role right now", and only the registry answers it. An
+ * assignment row keeps the session it was created for, and `BindingRegistry.switchTo`'s
+ * `SURVIVED` failover moves an actor's live runtime without rewriting that column — so a lookup
+ * keyed on it is wrong in both directions: it names roles a session has lost and omits roles it
+ * has gained. `activePrimaryCto` and `active` resolve the live runtime through the actor, which
+ * is the routing answer.
+ *
+ * Callers filter this list themselves. Narrowing it here as well would put one rule in two
+ * places, and then removing either changes nothing a test can see.
+ */
+const currentBindingsForRoles = (cp: ControlPlane, roles: readonly Role[]): RoleBinding[] => {
+  const out: RoleBinding[] = [];
+  for (const role of roles) {
+    if (role === Role.CEO) {
+      const ceo = cp.bindings.active(roleKeyFor(Role.CEO));
+      if (ceo) out.push(ceo);
+    } else if (role === Role.PRIMARY_CTO) {
+      for (const project of cp.projects.list()) {
+        const cto = cp.bindings.activePrimaryCto(project.projectId);
+        if (cto) out.push(cto);
+      }
+    } else if (role === Role.BOOTSTRAP_CTO) {
+      for (const run of cp.runs.list()) {
+        const bootstrap = cp.bindings.active(roleKeyFor(Role.BOOTSTRAP_CTO, { runId: run.runId }));
+        if (bootstrap) out.push(bootstrap);
+      }
+    }
+  }
+  return out;
+};
+
 interface AcceptedConnection {
   transport: SocketTransport;
   credential: PeerCredential;
@@ -1116,9 +1146,15 @@ const authenticateSocketPeer = (
     });
   }
 
-  const candidate = cp.bindings
-    .bySession(credential.sessionId)
-    .find((binding) => binding.status === "ACTIVE" && expectedRoles.includes(binding.role));
+  // Eligibility is decided against current state, not the assignment's own session column. A
+  // conversation that survived a failover to this runtime has the same assignment and generation
+  // and a different `session_id`; judging on that column refuses the rightful holder before the
+  // connection ever reaches a port, and admits a runtime the role has already left.
+  const candidate = currentBindingsForRoles(cp, expectedRoles).find(
+    (binding) =>
+      binding.sessionId === credential.sessionId &&
+      binding.sessionIncarnation === session.value.incarnation,
+  );
   if (!candidate) {
     if (permitPendingHandoffAck && session.value.lifecycle === SessionLifecycle.READY) {
       const pending = currentPendingNormalHandoff(cp, credential.sessionId);
