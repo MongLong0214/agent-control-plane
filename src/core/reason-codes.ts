@@ -326,6 +326,22 @@ export const ReasonCode = {
    * The shape is carried in the evidence for whoever is reading the journal.
    */
   ROLE_PEER_FAILED: "ROLE_PEER_FAILED",
+  /**
+   * A `p` tag named no role this daemon can address, so nothing became a turn.
+   *
+   * Four different states arrive here and all of them mean the same thing to the sender: the
+   * mentioned identity is bound to no live session, is bound to a session that currently holds no
+   * role, is not a channel identity at all, or is bound to a session holding *several* roles —
+   * which is a legal state (one runtime is the CTO of two projects) and still leaves nobody
+   * addressed, because a message has one recipient and this names two.
+   *
+   * The refusal is raised before the turn is claimed, and that ordering is the substance of the
+   * code rather than a detail: an unaddressed event that reached the turn machinery would consume
+   * its replay slot and be delivered to whichever role a `find` happened to return first. `#760`
+   * B4 asks for the opposite — no turn, no delivery, and one journal row saying which tag could
+   * not be resolved, so an unreachable role is visible rather than silent.
+   */
+  MENTION_TARGET_UNBOUND: "MENTION_TARGET_UNBOUND",
 
   // --- canonical turns -----------------------------------------------------
   /**

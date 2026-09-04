@@ -28,7 +28,9 @@ import {
 } from "../ingress/ingress-guard.ts";
 import {
   BuzzMessageIngress,
-  deliverBuzzMessageToCeo,
+  buzzMessageNonce,
+  deliverBuzzMessage,
+  type BuzzMentionRouter,
   type BuzzMessageIngressInput,
   type BuzzMessageTurnPort,
   type CeoTurnDelivery,
@@ -484,11 +486,85 @@ export const startBuzzActorIngressListener = async (
  * exactly what #627's base measurement observed), and a binding envelope here has no
  * `text`/`eventId` and is refused the same way. Neither crosses.
  */
+/**
+ * The roles a Buzz `p` tag may address.
+ *
+ * Every role the daemon binds, not the subset that happens to have a live-peer port today. The
+ * two questions are different: which role a tag names is a fact about the registry, and whether
+ * that role can be reached is a fact about who is attached. Narrowing the first by the second
+ * would turn a session that is CTO of two projects into an unambiguous single answer whenever
+ * only one of them had a peer — the ambiguity would disappear at exactly the moment it matters.
+ */
+const MENTIONABLE_ROLES: readonly Role[] = [Role.CEO, Role.PRIMARY_CTO, Role.BOOTSTRAP_CTO];
+
+/**
+ * `p` tag → role, through the two things that already know the answer.
+ *
+ * `sessions.buzz_actor_id` is the mapping, and it is the same column `BuzzAdapter.resolveActor`
+ * reads inbound — written only by an authenticated `bindBuzzActor`, unique across live sessions,
+ * and never a display name or a room address. `currentBindingsForRoles` is the registry's answer
+ * to "who holds which role right now", resolved through the actor rather than through the
+ * assignment's own session column, so a conversation that survived a failover is found on the
+ * runtime it is on rather than the one it was created on.
+ *
+ * `resolveActor` itself is not called here for one reason: it answers with a single binding, via
+ * a `find` over the session's ACTIVE assignments. One session legitimately holds several roles —
+ * the CTO of two projects, or a bootstrap binding beside a primary one — and collapsing that to
+ * whichever row came back first is delivery by accident. This returns all of them and lets the
+ * ingress refuse.
+ */
+const buzzMentionRouter = (cp: ControlPlane): BuzzMentionRouter => ({
+  rolesFor: (mention) => {
+    const actor = mention.trim();
+    if (actor.length === 0) return [];
+    // A live session only. A stopped one may still carry the column — the unique index excludes
+    // terminal lifecycles precisely so a respawn can take the identity back — and mail for a
+    // role must not be resolved onto a runtime that has gone.
+    const session = cp.db.get<{ session_id: string }>(
+      `SELECT session_id FROM sessions
+        WHERE buzz_actor_id = ? AND lifecycle IN ('READY','DRAINING')`,
+      [actor],
+    );
+    if (!session) return [];
+    return currentBindingsForRoles(cp, MENTIONABLE_ROLES)
+      .filter((binding) => binding.sessionId === session.session_id)
+      .map((binding) => binding.roleKey);
+  },
+  journalUnbound: (record) => {
+    cp.audit.record({
+      kind: "BUZZ_MENTION_TARGET_UNBOUND",
+      reasonCode: ReasonCode.MENTION_TARGET_UNBOUND,
+      actor: record.actor,
+      evidence: {
+        channel: "buzz",
+        conversation: record.conversation,
+        nonce: buzzMessageNonce(record.eventId),
+        target: record.mention,
+        // The count, not the keys. Which roles a tag nearly reached is the operator's question
+        // and the registry answers it; putting them on the relay's side of this boundary would
+        // tell an unaddressed sender the deployment's role topology.
+        candidates: record.candidates.length,
+      },
+    });
+  },
+});
+
 export const startBuzzMessageIngressListener = async (
   cp: ControlPlane,
   stateDir: string,
   policy: IngressPolicy,
-  options: { ceoConversation: CeoConversationPort; ownerActors: readonly string[] },
+  options: {
+    ceoConversation: CeoConversationPort;
+    ownerActors: readonly string[];
+    /**
+     * B2's live-peer port, for events addressed to a role by `p` tag.
+     *
+     * Optional, and its absence fails closed rather than open: with no port every resolved role
+     * is unreachable, so a mention is refused with `ROLE_PEER_ABSENT` and nothing is delivered.
+     * A composition that forgets to wire it loses delivery, never gains a wrong recipient.
+     */
+    roleConversation?: RoleConversationPort;
+  },
 ): Promise<LocalBuzzMessageIngress> => {
   if (!policy.secret || policy.secret.trim().length === 0) {
     throw new Error("Buzz message ingress requires a non-empty signing secret");
@@ -498,14 +574,17 @@ export const startBuzzMessageIngressListener = async (
   // `policy.allowedActors` is the relay credential's list and admits every ACTIVE Buzz channel
   // identity; `ownerActors` is who may speak to the CEO as the owner. Passing the first for the
   // second is the defect this argument exists to make impossible to write by accident.
-  const ingress = new BuzzMessageIngress(guard, options.ownerActors);
+  const ingress = new BuzzMessageIngress(guard, options.ownerActors, buzzMentionRouter(cp));
+  const roleConversation = options.roleConversation ?? null;
   const port: BuzzMessageTurnPort = {
     deliverToCeo: (text) => deliverAsCeoTurn(options.ceoConversation, text),
+    deliverToRole: (roleKey, text) => deliverAsRoleTurn(roleConversation, roleKey, text),
     // Read at claim time, from the binding registry rather than from the peer: the fence is
     // "which CEO generation was this turn claimed under", and the peer cannot be its own
     // authority for that. Telegram's production composition still passes none (#639's seam is
     // unwired there), so this is the first path that records a real generation on a claim.
     bindingGeneration: () => cp.bindings.active(roleKeyFor(Role.CEO))?.bindingGeneration ?? null,
+    roleBindingGeneration: (roleKey) => cp.bindings.active(roleKey)?.bindingGeneration ?? null,
   };
   const socketPath = join(stateDir, "buzz-message.ingress.sock");
   removeStaleSocket(socketPath);
@@ -1014,7 +1093,7 @@ const serveBuzzMessageTurn = (
     if (!input) {
       return finish(deny(ReasonCode.INVALID_ARGUMENT, "Buzz message ingress message is incomplete"));
     }
-    void deliverBuzzMessageToCeo(ingress, port, input).then(
+    void deliverBuzzMessage(ingress, port, input).then(
       (decision) => finish(decision),
       (error: unknown) => finish(deny(
         ReasonCode.INTERNAL_ERROR,
@@ -1059,11 +1138,12 @@ const endWithBuzzMessage = (socket: Socket, decision: Decision<unknown>): void =
 
 const presentedBuzzMessage = (value: unknown): BuzzMessageIngressInput | null => {
   if (!value || typeof value !== "object") return null;
-  const { actor, conversation, eventId, addressedTo, text, signature } = value as {
+  const { actor, conversation, eventId, addressedTo, mention, text, signature } = value as {
     actor?: unknown;
     conversation?: unknown;
     eventId?: unknown;
     addressedTo?: unknown;
+    mention?: unknown;
     text?: unknown;
     signature?: unknown;
   };
@@ -1072,12 +1152,24 @@ const presentedBuzzMessage = (value: unknown): BuzzMessageIngressInput | null =>
     typeof conversation !== "string" ||
     typeof eventId !== "string" ||
     typeof addressedTo !== "string" ||
+    // A `p` tag of the wrong shape is refused here rather than resolved: an envelope carrying a
+    // number or an array where a pubkey belongs has no address, and reading one out of it would
+    // be this parser guessing at a recipient.
+    (mention !== undefined && mention !== null && typeof mention !== "string") ||
     typeof text !== "string" ||
     (signature !== undefined && signature !== null && typeof signature !== "string")
   ) {
     return null;
   }
-  return { actor, conversation, eventId, addressedTo, text, signature: signature ?? null };
+  return {
+    actor,
+    conversation,
+    eventId,
+    addressedTo,
+    mention: mention ?? null,
+    text,
+    signature: signature ?? null,
+  };
 };
 
 /**
@@ -1778,6 +1870,59 @@ export const deliverAsCeoTurn = async (
 };
 
 /**
+ * `deliverAsCeoTurn` for a message addressed to a role by `p` tag (`#760` B4).
+ *
+ * The contact boundary is the part that matters, and it is not the same question as "did this
+ * succeed". `ROLE_PEER_FAILED` is the one refusal that means the request crossed to the peer and
+ * came back unacknowledged — a timeout, a closed transport, an unreadable answer — so the turn is
+ * a debt rather than a failure and its claim stays outstanding (B5). Every other refusal is
+ * positively established as never having been asked, which is what lets the claim close.
+ *
+ * A null port is that same "never asked": a deployment that did not wire the role listener
+ * refuses delivery rather than finding some other recipient for the message.
+ */
+export const deliverAsRoleTurn = async (
+  port: RoleConversationPort | null,
+  roleKey: string,
+  text: string,
+): Promise<CeoTurnDelivery> => {
+  const delivered: Decision<string> = port
+    ? await port.deliver(roleKey, text)
+    : deny(ReasonCode.ROLE_PEER_ABSENT, "no role conversation listener is configured", { roleKey });
+  if (delivered.allowed) {
+    return { answer: delivered.value, reachedCeo: true, reasonCode: ReasonCode.OK };
+  }
+  return {
+    answer: `${roleUnavailableSentence(delivered.reasonCode)} (${delivered.reasonCode})`,
+    reachedCeo: delivered.reasonCode === ReasonCode.ROLE_PEER_FAILED,
+    reasonCode: delivered.reasonCode,
+  };
+};
+
+/**
+ * What the sender is told when a role could not be reached.
+ *
+ * Same rule as `ceoUnavailableSentence`, and the same trap: none of these may claim more than the
+ * seam observed. Absence in particular is not a fault — a role between holders is ordinary
+ * operation (`#760` B2) — and a sentence that called it an error would train the reader to treat
+ * a normal handover as an incident.
+ */
+export const roleUnavailableSentence = (reasonCode: string): string => {
+  if (reasonCode === ReasonCode.ROLE_PEER_ABSENT) {
+    return "No session is attached for that role right now, so nothing was delivered. The role may be between holders; nobody received this message.";
+  }
+  if (reasonCode === ReasonCode.ROLE_PEER_STALE) {
+    return "The session that was attached for that role no longer holds it, so nothing was delivered to it.";
+  }
+  if (reasonCode === ReasonCode.ROLE_PEER_UNSUPPORTED) {
+    return "The session attached for that role cannot receive over this route — it did not offer sampling at handshake.";
+  }
+  // ROLE_PEER_FAILED and anything else: the peer was asked and did not acknowledge. It may have
+  // read the message anyway, so this says nothing about whether it arrived.
+  return "The session holding that role did not acknowledge the delivery. Whether it read the message is not established, so this turn is unresolved rather than failed.";
+};
+
+/**
  * Exported for test: these sentences are the only thing the owner sees when the CEO route
  * refuses, and one of them used to assert something this seam cannot observe. A sentence with no
  * test is a sentence that drifts back.
@@ -2067,6 +2212,10 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         buzzMessageIngress = await startBuzzMessageIngressListener(cp, stateDir, buzzActorIngressPolicy, {
           ceoConversation: listeners.ceoConversation,
           ownerActors: buzzMessageOwnerActors,
+          // The other half of #760 B4: a `p` tag that resolves to the CTO has somewhere to go.
+          // Without this line the resolution still happens and every delivery refuses, which is
+          // the state that had a person carrying messages between the two roles.
+          roleConversation: listeners.ctoConversation,
         });
         process.stdout.write("Buzz message ingress started\n");
       }
