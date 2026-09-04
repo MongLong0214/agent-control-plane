@@ -265,6 +265,91 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
     }
   }, 60_000);
 
+  it.each([
+    { label: "bootstrap bound first", bootstrapFirst: true },
+    { label: "bootstrap bound last", bootstrapFirst: false },
+  ])(
+    "reaches every project a single session is the CTO of, and none of them through the bootstrap binding ($label)",
+    async ({ bootstrapFirst }) => {
+      const harness = makeHarness();
+      const a = await registerFixtureProject(harness, "project-a");
+      const bManifest = fixtureManifest("project-b");
+      const bProject = harness.cp.projects.register({
+        projectId: "project-b",
+        name: "fixture",
+        manifest: bManifest,
+        authorization: harness.cp.manifestAuthorizationForTests(bManifest),
+      });
+      if (!bProject.allowed) throw new Error(`second project failed: ${bProject.message}`);
+
+      // One session, three live bindings — a legal state, not a contrived one. Socket admission
+      // picks exactly one of them to admit the connection under, and which one it picks must not
+      // decide which of this session's roles can be reached. The order is varied because the
+      // choice admission makes is order-dependent.
+      const session = readySession(harness, "multi-bound-cto");
+      const run = harness.cp.runs.create({
+        projectId: a.projectId,
+        executionMode: ExecutionMode.STANDARD,
+        contract: CONTRACT,
+        repositories: [{ repositoryId: a.repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+      });
+      if (!run.allowed) throw new Error(`run creation failed: ${run.message}`);
+      const bindBootstrap = () =>
+        expect(
+          harness.cp.bindings.bind({
+            role: Role.BOOTSTRAP_CTO,
+            sessionId: session.sessionId,
+            runId: run.value.runId,
+          }).reasonCode,
+        ).toBe(ReasonCode.OK);
+      const bindPrimaries = () => {
+        for (const projectId of [a.projectId, "project-b"]) {
+          expect(
+            harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId: session.sessionId, projectId })
+              .reasonCode,
+          ).toBe(ReasonCode.OK);
+        }
+      };
+      if (bootstrapFirst) {
+        bindBootstrap();
+        bindPrimaries();
+      } else {
+        bindPrimaries();
+        bindBootstrap();
+      }
+
+      const keyA = roleKeyFor(Role.PRIMARY_CTO, { projectId: a.projectId });
+      const keyB = roleKeyFor(Role.PRIMARY_CTO, { projectId: "project-b" });
+      const bootstrapKey = roleKeyFor(Role.BOOTSTRAP_CTO, { runId: run.value.runId });
+
+      const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-cto-multi-"), TOKEN);
+      const ctoSocket = listeners.socketPaths[1];
+      if (!ctoSocket) throw new Error("the CTO MCP listener was not started");
+      const peer = await connectPeer(ctoSocket, { token: TOKEN, ...session });
+      try {
+        await until(
+          () => listeners.ctoConversation.connected(keyA) && listeners.ctoConversation.connected(keyB),
+          "both of the session's projects to have this connection as their peer",
+        );
+        // The bootstrap binding is not a primary destination, whichever order it was bound in.
+        expect(
+          listeners.ctoConversation.connected(bootstrapKey),
+          "a bootstrap binding became a destination on the primary port",
+        ).toBe(false);
+
+        const toA = await listeners.ctoConversation.deliver(keyA, "for project A");
+        if (!toA.allowed) throw new Error(`project A was unreachable: ${toA.message}`);
+        const toB = await listeners.ctoConversation.deliver(keyB, "for project B");
+        if (!toB.allowed) throw new Error(`project B was unreachable: ${toB.message}`);
+        expect(peer.received).toEqual(["for project A", "for project B"]);
+      } finally {
+        await peer.close();
+        await listeners.close();
+      }
+    },
+    60_000,
+  );
+
   it("leaves no peer behind when the holder disconnects, and a late close does not detach its replacement", async () => {
     const harness = makeHarness();
     const { projectId } = await registerFixtureProject(harness);

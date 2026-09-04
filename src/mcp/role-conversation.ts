@@ -116,19 +116,38 @@ export class RoleConversationPort {
    * cannot clear its successor.
    */
   attach(
-    binding: RoleBinding,
+    bindings: readonly RoleBinding[],
     server: McpServer,
     authenticate: McpPeerAuthenticator,
   ): () => void {
-    // Refused *before* it becomes the peer. Attaching first and checking at delivery would
-    // already have displaced the real holder, and the displacement is the defect — the canonical
-    // CTO would stop receiving mail the moment a bootstrap peer connected.
-    if (!this.#isCurrentHolder(binding)) return () => {};
-    const peer: LivePeer = { server, authenticate, binding };
-    this.#live.set(binding.roleKey, peer);
+    /*
+     * **All of the connection's bindings, not one of them.**
+     *
+     * A session legitimately holds several at once — an older `BOOTSTRAP_CTO` and the
+     * `PRIMARY_CTO` of two different projects — and socket admission picks a single one to admit
+     * the connection under. Attaching only that one leaves the rest with no destination for as
+     * long as the session lives: whichever binding admission happened to choose first is the only
+     * role that can be reached, and reconnecting repeats the same choice. So the credential
+     * authenticates the *session*, and the slots are enumerated here, from the registry.
+     *
+     * Each candidate is filtered before it becomes a peer. Attaching first and checking at
+     * delivery would already have displaced the real holder, and the displacement is the defect —
+     * the canonical CTO would stop receiving mail the moment a bootstrap peer connected. A
+     * `BOOTSTRAP_CTO` binding is not a candidate for a `PRIMARY_CTO` slot, and nothing the caller
+     * says about itself is consulted.
+     */
+    const owned: string[] = [];
+    for (const binding of bindings) {
+      if (!this.#isCurrentHolder(binding)) continue;
+      this.#live.set(binding.roleKey, { server, authenticate, binding });
+      owned.push(binding.roleKey);
+    }
     return () => {
-      // Identity-checked: a late close from a replaced connection must not clear its successor.
-      if (this.#live.get(binding.roleKey) === peer) this.#live.delete(binding.roleKey);
+      // Identity-checked per slot: a late close from a replaced connection must not clear its
+      // successor, and a connection releases only the slots it is still the peer of.
+      for (const roleKey of owned) {
+        if (this.#live.get(roleKey)?.server === server) this.#live.delete(roleKey);
+      }
     };
   }
 

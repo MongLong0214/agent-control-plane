@@ -359,7 +359,16 @@ export const startLocalMcpListeners = async (
         // for this project's canonical CTO. A handoff-pending peer holds no binding at all, so
         // there is nothing for it to be the target of.
         if (opening.kind === "BOUND") {
-          server.server.onclose = ctoConversation.attach(opening.binding, server, auth);
+          // The credential authenticated a *session*; admission then picked one of its bindings to
+          // admit the connection under. Which one it picked must not decide which roles the
+          // connection can receive for, so the slots come from the registry rather than from that
+          // choice. `bySession` returns every assignment the session has ever held; the port keeps
+          // only the ones it is currently the holder of, for the role it serves.
+          server.server.onclose = ctoConversation.attach(
+            cp.bindings.bySession(opening.binding.sessionId),
+            server,
+            auth,
+          );
         }
         return server;
       },
