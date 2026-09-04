@@ -462,31 +462,6 @@ export const startBuzzActorIngressListener = async (
 };
 
 /**
- * §6.1 DIRECT for the Buzz surface: an owner's message becomes one turn for the session that
- * currently holds the CEO binding, and the CEO's answer goes back to the relay that sent it.
- *
- * **Its own socket, beside `buzz-actor.ingress.sock` rather than on it.** The three reasons are
- * not stylistic:
- *
- *   - The binding socket's protocol has no method field. It reads one envelope per connection
- *     and dispatches it to `bindActor` by field presence alone, and its answer is a
- *     `Decision<SessionRecord>` with no payload. Multiplexing a second request type onto it
- *     would mean inventing a discriminator on a wire that has none, and a malformed envelope of
- *     either kind could then be parsed as the other.
- *   - `BuzzActorIngress.bindActor` is the only production writer of `sessions.buzz_actor_id`
- *     and requires the local session secret to prove possession. Nothing on the message path
- *     needs that authority, and separate sockets mean it cannot reach it even by accident: the
- *     parse boundary and the authority boundary are the same boundary.
- *   - Their dependencies differ. The binding listener needs only the ingress policy; this one
- *     is meaningless without the CEO conversation port, which `main` builds later, from the
- *     MCP listeners.
- *
- * A client that connects to the wrong one is refused, never silently served: a message envelope
- * on the binding socket has no `sessionId`/`sessionSecret` and is refused as incomplete (that is
- * exactly what #627's base measurement observed), and a binding envelope here has no
- * `text`/`eventId` and is refused the same way. Neither crosses.
- */
-/**
  * The roles a Buzz `p` tag may address.
  *
  * Every role the daemon binds, not the subset that happens to have a live-peer port today. The
@@ -549,6 +524,31 @@ const buzzMentionRouter = (cp: ControlPlane): BuzzMentionRouter => ({
   },
 });
 
+/**
+ * §6.1 DIRECT for the Buzz surface: an owner's message becomes one turn for the session that
+ * currently holds the CEO binding, and the CEO's answer goes back to the relay that sent it.
+ *
+ * **Its own socket, beside `buzz-actor.ingress.sock` rather than on it.** The three reasons are
+ * not stylistic:
+ *
+ *   - The binding socket's protocol has no method field. It reads one envelope per connection
+ *     and dispatches it to `bindActor` by field presence alone, and its answer is a
+ *     `Decision<SessionRecord>` with no payload. Multiplexing a second request type onto it
+ *     would mean inventing a discriminator on a wire that has none, and a malformed envelope of
+ *     either kind could then be parsed as the other.
+ *   - `BuzzActorIngress.bindActor` is the only production writer of `sessions.buzz_actor_id`
+ *     and requires the local session secret to prove possession. Nothing on the message path
+ *     needs that authority, and separate sockets mean it cannot reach it even by accident: the
+ *     parse boundary and the authority boundary are the same boundary.
+ *   - Their dependencies differ. The binding listener needs only the ingress policy; this one
+ *     is meaningless without the CEO conversation port, which `main` builds later, from the
+ *     MCP listeners.
+ *
+ * A client that connects to the wrong one is refused, never silently served: a message envelope
+ * on the binding socket has no `sessionId`/`sessionSecret` and is refused as incomplete (that is
+ * exactly what #627's base measurement observed), and a binding envelope here has no
+ * `text`/`eventId` and is refused the same way. Neither crosses.
+ */
 export const startBuzzMessageIngressListener = async (
   cp: ControlPlane,
   stateDir: string,
