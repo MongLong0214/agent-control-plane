@@ -33,8 +33,14 @@ import type { AuthenticatedMcpPeer, McpPeerAuthenticator } from "./shared.ts";
  */
 interface LivePeer {
   server: McpServer;
+  /**
+   * Credential-only: it re-answers "is this connection's session still live and still permitted to
+   * hold a bound socket", and nothing about any role. A binding-scoped authenticator would make
+   * every slot on the connection depend on whichever binding socket admission happened to pick, so
+   * an event in one project would silently drop the session's other projects.
+   */
   authenticate: McpPeerAuthenticator;
-  /** The binding this connection was admitted under — the target it may receive mail for. */
+  /** The binding this slot was opened for — the target it may receive mail for. */
   binding: RoleBinding;
 }
 

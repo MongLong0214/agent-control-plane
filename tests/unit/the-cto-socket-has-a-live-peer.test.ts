@@ -506,6 +506,84 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
     }
   }, 60_000);
 
+  it("keeps delivering to a sibling role after the binding the connection was admitted under moves away", async () => {
+    const harness = makeHarness();
+    const a = await registerFixtureProject(harness, "project-a");
+    const bManifest = fixtureManifest("project-b");
+    const bProject = harness.cp.projects.register({
+      projectId: "project-b",
+      name: "fixture",
+      manifest: bManifest,
+      authorization: harness.cp.manifestAuthorizationForTests(bManifest),
+    });
+    if (!bProject.allowed) throw new Error(`second project failed: ${bProject.message}`);
+
+    const s1 = readySession(harness, "cto-before-failover");
+    const s2 = readySession(harness, "cto-after-failover");
+    for (const projectId of [a.projectId, "project-b"]) {
+      expect(
+        harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId: s1.sessionId, projectId })
+          .reasonCode,
+      ).toBe(ReasonCode.OK);
+    }
+    const keyA = roleKeyFor(Role.PRIMARY_CTO, { projectId: a.projectId });
+    const keyB = roleKeyFor(Role.PRIMARY_CTO, { projectId: "project-b" });
+
+    const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-cto-admitted-moved-"), TOKEN);
+    const ctoSocket = listeners.socketPaths[1];
+    if (!ctoSocket) throw new Error("the CTO MCP listener was not started");
+    const before = await connectPeer(ctoSocket, { token: TOKEN, ...s1 });
+    try {
+      await until(
+        () => listeners.ctoConversation.connected(keyA) && listeners.ctoConversation.connected(keyB),
+        "S1 to hold both of its projects",
+      );
+
+      // The inverse of the row above, and the half that a binding-scoped authenticator gets wrong.
+      // Socket admission admitted this connection under *one* of S1's two bindings — project A,
+      // the first candidate the registry offers. Moving that one away must not take the other with
+      // it: S1 is still the exact current holder of project B, and B's mail is still S1's to
+      // receive. Anything that re-checks the admitting binding at delivery time loses the sibling.
+      const moved = harness.cp.bindings.switchTo({
+        role: Role.PRIMARY_CTO,
+        projectId: a.projectId,
+        sessionId: s2.sessionId,
+        conversation: "SURVIVED",
+        reason: "failover of the admitting binding",
+      });
+      if (!moved.allowed) throw new Error(`the runtime did not move: ${moved.message}`);
+      expect(
+        harness.cp.bindings.active(keyA)?.sessionId,
+        "the registry did not move project A's runtime",
+      ).toBe(s2.sessionId);
+
+      // A's own slot is refused, and refusing is what releases it — `connected(keyA)` answers for
+      // the recorded slot, so without this the wait below would return on S1's stale entry and the
+      // last delivery would measure eviction rather than S2's arrival.
+      const stale = await listeners.ctoConversation.deliver(keyA, "must not reach the old runtime");
+      expect(stale.allowed).toBe(false);
+      expect(stale.reasonCode).toBe(ReasonCode.ROLE_PEER_STALE);
+
+      const toB = await listeners.ctoConversation.deliver(keyB, "still for project B");
+      if (!toB.allowed) throw new Error(`the surviving sibling role was lost: ${toB.message}`);
+      expect(before.received).toEqual(["still for project B"]);
+
+      const after = await connectPeer(ctoSocket, { token: TOKEN, ...s2 });
+      try {
+        await until(() => listeners.ctoConversation.connected(keyA), "the new runtime to hold A");
+        const toA = await listeners.ctoConversation.deliver(keyA, "for the new runtime");
+        if (!toA.allowed) throw new Error(`the new runtime was unreachable: ${toA.message}`);
+        expect(after.received).toEqual(["for the new runtime"]);
+        expect(before.received, "the old runtime received A's mail").toEqual(["still for project B"]);
+      } finally {
+        await after.close();
+      }
+    } finally {
+      await before.close();
+      await listeners.close();
+    }
+  }, 60_000);
+
   it("leaves no peer behind when the holder disconnects, and a late close does not detach its replacement", async () => {
     const harness = makeHarness();
     const { projectId } = await registerFixtureProject(harness);
