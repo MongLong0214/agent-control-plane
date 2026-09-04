@@ -1,100 +1,312 @@
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { describe, expect, it, afterAll } from "vitest";
+import { createConnection, type Socket } from "node:net";
+
+import { afterAll, describe, expect, it } from "vitest";
 
 import { startLocalMcpListeners } from "../../src/daemon/agentcpd.ts";
-import { Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { allow } from "../../src/core/errors.ts";
-import type { McpPeerAuthenticator } from "../../src/mcp/shared.ts";
+import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
-import { makeHarness, registerFixtureProject } from "../helpers/harness.ts";
+import {
+  fixtureManifest,
+  makeHarness,
+  registerFixtureProject,
+  type Harness,
+} from "../helpers/harness.ts";
+import { ExecutionMode } from "../../src/domain/types.ts";
+import type { TaskContract } from "../../src/run/run-engine.ts";
 
 afterAll(cleanupTempDirs);
 
 /**
- * `#760` Part B / B2 — the daemon has somewhere to push a message addressed to the CTO role.
+ * `#760` Part B / B2 — a message addressed to the CTO role reaches the session holding it, and
+ * reaches nobody else.
  *
- * The CEO half of this already exists: `hermes.mcp.sock`'s handler ends with
- * `ceoConversation.attach(server, auth)`, so whoever currently holds the CEO binding is a live
- * peer the daemon can reach without spawning anything. `cto.mcp.sock` is served by the same
- * `startMcpSocket` with the same role authentication and has no equivalent line, so a message
- * addressed to the CTO has no destination inside the daemon at all.
+ * The CEO half already existed: `hermes.mcp.sock`'s handler ends with `ceoConversation.attach`,
+ * so whoever holds the CEO binding is reachable without spawning anything. `cto.mcp.sock` is
+ * served by the same `startMcpSocket` and had no equivalent line, so a message addressed to the
+ * CTO had no destination inside the daemon and a person carried it (measured 2026-09-04).
  *
- * That absence is what a person has been standing in for. Measured on 2026-09-04: CEO messages
- * reached this repository's CTO session only because the session polled the relay by hand, and
- * when that polling stopped the owner carried messages between the two roles. `#760` X2 names
- * that arrangement as the violation rather than the workaround.
+ * **These tests connect over the real socket.** An earlier version attached a fake peer directly
+ * to the port, which measured the port and not the wiring — deleting the `attach` line in
+ * `agentcpd.ts` left it green. Every row below goes through `startLocalMcpListeners`' own
+ * `cto.mcp.sock`, so the wiring is inside what the test can kill.
  *
- * The port is addressed by **role**, not by session (B0). A CTO session is replaced routinely,
- * and the sender must keep using the same address across the replacement.
+ * The socket admits `PRIMARY_CTO` **and** `BOOTSTRAP_CTO`, and `PRIMARY_CTO` is scoped per
+ * project. Attaching every authenticated connection would let a bootstrap peer, or another
+ * project's primary, become the destination for this project's canonical CTO — which is why the
+ * rows below are as much about who must *not* receive as about who must.
  */
-const stillCto = (): McpPeerAuthenticator => () =>
-  allow(ReasonCode.OK, { sessionId: "s", sessionIncarnation: "i", sessionSecret: "x" } as never);
+const TOKEN = "local-test-token";
 
-interface FakePeer {
-  capabilities: { sampling?: Record<string, unknown> } | undefined;
-  answer: (() => Promise<unknown>) | null;
-  calls: string[];
+const CONTRACT: TaskContract = {
+  goal: "cto delivery target",
+  why: "exercise the role's live peer",
+  scope: [],
+  nonGoals: [],
+  acceptance: ["delivery reaches the holder"],
+  priority: "NORMAL",
+  humanGate: [],
+  references: [],
+};
+
+interface PeerHandle {
+  socket: Socket;
+  /** Texts the daemon delivered to this peer over `sampling/createMessage`. */
+  received: string[];
+  close: () => Promise<void>;
 }
 
-/** The port touches exactly two members of the SDK server, and both are driven by a real peer. */
-const fakePeer = (peer: FakePeer): McpServer =>
-  ({
-    server: {
-      getClientCapabilities: () => peer.capabilities,
-      createMessage: async (params: { messages: { content: { text?: string } }[] }) => {
-        peer.calls.push(params.messages[0]?.content.text ?? "");
-        if (!peer.answer) throw new Error("no scripted answer");
-        return peer.answer();
-      },
-    },
-  }) as unknown as McpServer;
+/**
+ * A real client on the real socket: credential line, then MCP initialize declaring `sampling`,
+ * then it answers the server's `sampling/createMessage` requests. Nothing here stands in for the
+ * daemon — only for the agent that would normally be on the other end.
+ */
+const connectPeer = async (
+  socketPath: string,
+  credential: { token: string; sessionId: string; sessionSecret: string },
+): Promise<PeerHandle> => {
+  const socket = createConnection(socketPath);
+  const received: string[] = [];
+  await new Promise<void>((resolve, reject) => {
+    socket.once("connect", resolve);
+    socket.once("error", reject);
+  });
 
-describe("the CTO socket has a live peer the daemon can reach", () => {
-  it("exposes a conversation port for the CTO role, and a message addressed to it reaches the peer", async () => {
+  let buffer = "";
+  socket.on("error", () => {
+    /* a peer whose socket is destroyed mid-test is an outcome the rows assert on, not a throw */
+  });
+  socket.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString();
+    for (;;) {
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) break;
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+      if (line.trim().length === 0) continue;
+      let message: { id?: number; method?: string; params?: unknown };
+      try {
+        message = JSON.parse(line) as typeof message;
+      } catch {
+        continue;
+      }
+      if (message.method === "sampling/createMessage" && message.id !== undefined) {
+        const params = message.params as { messages?: { content?: { text?: string } }[] } | undefined;
+        received.push(params?.messages?.[0]?.content?.text ?? "");
+        socket.write(
+          `${JSON.stringify({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              role: "assistant",
+              model: "test-peer",
+              content: { type: "text", text: "received" },
+            },
+          })}\n`,
+        );
+      }
+    }
+  });
+
+  socket.write(
+    `${JSON.stringify(credential)}\n${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-11-25",
+        // The capability delivery travels on. Without it the port refuses rather than hanging.
+        capabilities: { sampling: {} },
+        clientInfo: { name: "cto-peer", version: "1" },
+      },
+    })}\n${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}\n`,
+  );
+
+  return {
+    socket,
+    received,
+    close: () =>
+      new Promise<void>((resolve) => {
+        if (socket.destroyed) {
+          resolve();
+          return;
+        }
+        socket.once("close", () => resolve());
+        socket.destroy();
+      }),
+  };
+};
+
+/** Waits on a condition the daemon reaches asynchronously, rather than on a fixed delay. */
+const until = async (predicate: () => boolean, what: string, timeoutMs = 10_000): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`timed out waiting for ${what}`);
+};
+
+const readySession = (harness: Harness, model: string) => {
+  const session = harness.cp.sessions.create({ provider: "scripted", model });
+  expect(
+    harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "MCP peer").reasonCode,
+  ).toBe(ReasonCode.OK);
+  if (!session.sessionSecret) throw new Error("test peer needs a session secret");
+  return { sessionId: session.sessionId, sessionSecret: session.sessionSecret };
+};
+
+describe("a message addressed to the CTO role reaches its holder, and nobody else", () => {
+  it("delivers to the canonical PRIMARY_CTO peer over its own socket", async () => {
     const harness = makeHarness();
-    // The CTO role is scoped to a project — `roleKeyFor(PRIMARY_CTO, { projectId })` — which is
-    // B0's point in the schema already: the address names a role in a project, not a session.
     const { projectId } = await registerFixtureProject(harness);
-    const session = harness.cp.sessions.create({ provider: "scripted", model: "cto-peer" });
+    const session = readySession(harness, "cto-peer");
     expect(
-      harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "CTO MCP peer")
+      harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId: session.sessionId, projectId })
         .reasonCode,
     ).toBe(ReasonCode.OK);
-    expect(harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId: session.sessionId, projectId })
-        .reasonCode)
-      .toBe(ReasonCode.OK);
+    const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
 
-    const listeners = await startLocalMcpListeners(
-      harness.cp,
-      tempDir("acp-cto-peer-"),
-      "local-test-token",
-    );
+    const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-cto-peer-"), TOKEN);
+    const ctoSocket = listeners.socketPaths[1];
+    if (!ctoSocket) throw new Error("the CTO MCP listener was not started");
+    const peer = await connectPeer(ctoSocket, { token: TOKEN, ...session });
     try {
-      // The product fact: the daemon holds a destination for the CTO role, the way it already
-      // does for the CEO. Without it there is nothing for a resolved mention to be delivered to.
-      const port = listeners.ctoConversation;
-      expect(port, "the daemon exposes no conversation port for the CTO role").toBeDefined();
-
-      // No peer is a normal state — a role is replaced routinely — so it refuses rather than
-      // spawning a substitute, and says which role had nobody.
-      const unreachable = await port.deliver("are you there");
-      expect(unreachable.allowed).toBe(false);
-      expect(unreachable.reasonCode, "absence is reported as its own fact, not a failure").toBe(
-        ReasonCode.ROLE_PEER_ABSENT,
+      await until(
+        () => listeners.ctoConversation.connected(roleKey),
+        "the CTO connection to become the role's live peer",
       );
 
-      const peer: FakePeer = { capabilities: { sampling: {} }, answer: null, calls: [] };
-      peer.answer = async () => ({ content: { type: "text", text: "received" } });
-      const detach = port.attach(fakePeer(peer), stillCto());
-      try {
-        const answered = await port.deliver("a message addressed to the CTO role");
-        if (!answered.allowed) throw new Error(`the attached CTO peer was not reached: ${answered.message}`);
-        expect(answered.value, "the peer's acknowledgement is what closes the delivery").toBe("received");
-        expect(peer.calls).toEqual(["a message addressed to the CTO role"]);
-      } finally {
-        detach();
-      }
+      const delivered = await listeners.ctoConversation.deliver(roleKey, "addressed to the CTO");
+      if (!delivered.allowed) throw new Error(`delivery refused: ${delivered.message}`);
+      // The peer's own answer is what closes the delivery: `accepted` without it is the fault
+      // this whole issue is about (B5).
+      expect(delivered.value).toBe("received");
+      expect(peer.received).toEqual(["addressed to the CTO"]);
+    } finally {
+      await peer.close();
+      await listeners.close();
+    }
+  }, 60_000);
+
+  it("does not let a BOOTSTRAP_CTO or another project's PRIMARY_CTO become this role's peer", async () => {
+    const harness = makeHarness();
+    const canonical = await registerFixtureProject(harness, "canonical-project");
+    // A second registered project, but no second repository: a checkout path is bound to one
+    // project, and what this row varies is the *scope the CTO role is bound at*. The project has
+    // to exist — the binding's authority tuple is a foreign key — but nothing here needs a repo.
+    const otherProjectId = "another-project";
+    const otherManifest = fixtureManifest(otherProjectId);
+    const otherProject = harness.cp.projects.register({
+      projectId: otherProjectId,
+      name: "fixture",
+      manifest: otherManifest,
+      authorization: harness.cp.manifestAuthorizationForTests(otherManifest),
+    });
+    if (!otherProject.allowed) throw new Error(`second project failed: ${otherProject.message}`);
+    const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId: canonical.projectId });
+    const otherKey = roleKeyFor(Role.PRIMARY_CTO, { projectId: otherProjectId });
+
+    // BOOTSTRAP_CTO is scoped by run, not project — `BOOTSTRAP_CTO:<runId>` — so it never even
+    // collides with this project's key. It is refused on the role as well, and both matter: the
+    // key alone would stop being enough the moment two scopes ever produced the same string.
+    const run = harness.cp.runs.create({
+      projectId: canonical.projectId,
+      executionMode: ExecutionMode.STANDARD,
+      contract: CONTRACT,
+      repositories: [{ repositoryId: canonical.repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+    });
+    if (!run.allowed) throw new Error(`run creation failed: ${run.message}`);
+    const bootstrap = readySession(harness, "bootstrap-cto");
+    expect(
+      harness.cp.bindings.bind({
+        role: Role.BOOTSTRAP_CTO,
+        sessionId: bootstrap.sessionId,
+        runId: run.value.runId,
+      }).reasonCode,
+    ).toBe(ReasonCode.OK);
+
+    const stranger = readySession(harness, "other-project-cto");
+    expect(
+      harness.cp.bindings.bind({
+        role: Role.PRIMARY_CTO,
+        sessionId: stranger.sessionId,
+        projectId: otherProjectId,
+      }).reasonCode,
+    ).toBe(ReasonCode.OK);
+
+    const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-cto-wrong-"), TOKEN);
+    const ctoSocket = listeners.socketPaths[1];
+    if (!ctoSocket) throw new Error("the CTO MCP listener was not started");
+    const bootstrapPeer = await connectPeer(ctoSocket, { token: TOKEN, ...bootstrap });
+    const strangerPeer = await connectPeer(ctoSocket, { token: TOKEN, ...stranger });
+    try {
+      // Both connections are admitted by the socket — that is the socket's contract — and neither
+      // may become the destination for the canonical CTO's mail. Waiting on the *other* project's
+      // key first gives the daemon time to have attached, so this does not pass on a race.
+      await until(
+        () => listeners.ctoConversation.connected(otherKey),
+        "the other project's CTO to attach under its own key",
+      );
+
+      expect(
+        listeners.ctoConversation.connected(roleKey),
+        "a bootstrap or wrong-project peer became the canonical CTO's destination",
+      ).toBe(false);
+      const refused = await listeners.ctoConversation.deliver(roleKey, "must not arrive");
+      expect(refused.allowed).toBe(false);
+      expect(refused.reasonCode).toBe(ReasonCode.ROLE_PEER_ABSENT);
+      expect(bootstrapPeer.received, "the bootstrap CTO received the canonical CTO's mail").toEqual([]);
+      expect(strangerPeer.received, "another project's CTO received this project's mail").toEqual([]);
+    } finally {
+      await bootstrapPeer.close();
+      await strangerPeer.close();
+      await listeners.close();
+    }
+  }, 60_000);
+
+  it("leaves no peer behind when the holder disconnects, and a late close does not detach its replacement", async () => {
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const session = readySession(harness, "cto-peer");
+    expect(
+      harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId: session.sessionId, projectId })
+        .reasonCode,
+    ).toBe(ReasonCode.OK);
+    const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+
+    const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-cto-close-"), TOKEN);
+    const ctoSocket = listeners.socketPaths[1];
+    if (!ctoSocket) throw new Error("the CTO MCP listener was not started");
+    const credential = { token: TOKEN, ...session };
+    try {
+      const first = await connectPeer(ctoSocket, credential);
+      await until(() => listeners.ctoConversation.connected(roleKey), "the first peer to attach");
+      await first.close();
+      await until(
+        () => !listeners.ctoConversation.connected(roleKey),
+        "the disconnected peer to stop being the destination",
+      );
+      // Nothing is delivered into a socket that has gone: absence is reported as absence.
+      const afterClose = await listeners.ctoConversation.deliver(roleKey, "into a closed socket");
+      expect(afterClose.allowed).toBe(false);
+      expect(afterClose.reasonCode).toBe(ReasonCode.ROLE_PEER_ABSENT);
+
+      // Reconnect, then close the *replaced* connection last. Its detach must not clear the peer
+      // that took its place — that would strand delivery on nobody while a live session is there.
+      const replaced = await connectPeer(ctoSocket, credential);
+      await until(() => listeners.ctoConversation.connected(roleKey), "the replaced peer to attach");
+      const replacement = await connectPeer(ctoSocket, credential);
+      await until(() => replacement.received.length === 0 && replacement.socket.writable, "the replacement to connect");
+      // Give the daemon the chance to have processed the replacement's handshake before the
+      // replaced connection closes; the assertion below is what proves the ordering held.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await replaced.close();
+
+      const delivered = await listeners.ctoConversation.deliver(roleKey, "after the swap");
+      if (!delivered.allowed) throw new Error(`the replacement peer was detached: ${delivered.message}`);
+      expect(replacement.received).toEqual(["after the swap"]);
+      await replacement.close();
     } finally {
       await listeners.close();
     }

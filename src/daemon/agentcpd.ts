@@ -323,7 +323,7 @@ export const startLocalMcpListeners = async (
   const hermesPort = createHermesMcpPort(cp, { onCeoApproved: options.onCeoApproved });
   const ctoPort = createCtoMcpPort(cp);
   const ceoConversation = options.ceoConversation ?? new CeoConversationPort();
-  const ctoConversation = new RoleConversationPort(Role.PRIMARY_CTO);
+  const ctoConversation = new RoleConversationPort(Role.PRIMARY_CTO, cp.bindings);
   const hermes = await startMcpSocket(
     hermesPath,
     token,
@@ -353,10 +353,14 @@ export const startLocalMcpListeners = async (
           auth,
           opening.kind === "PENDING_HANDOFF_ACK" ? { pendingHandoffId: opening.handoffId } : undefined,
         );
-        // The line the CEO socket has had and this one did not. The authenticator travels with
-        // the connection, so a socket that outlives its binding stops receiving the role's mail
-        // rather than keeping it.
-        server.server.onclose = ctoConversation.attach(server, auth);
+        // The line the CEO socket has had and this one did not. The binding the connection was
+        // admitted under is what the port keys and verifies on: this socket also admits
+        // BOOTSTRAP_CTO and admits PRIMARY_CTO for any project, and neither may become the peer
+        // for this project's canonical CTO. A handoff-pending peer holds no binding at all, so
+        // there is nothing for it to be the target of.
+        if (opening.kind === "BOUND") {
+          server.server.onclose = ctoConversation.attach(opening.binding, server, auth);
+        }
         return server;
       },
       true,

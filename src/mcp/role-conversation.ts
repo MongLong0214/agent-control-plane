@@ -3,7 +3,7 @@ import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import type { Role } from "../domain/types.ts";
+import type { Role, RoleBinding } from "../domain/types.ts";
 import type { McpPeerAuthenticator } from "./shared.ts";
 
 /**
@@ -34,6 +34,16 @@ import type { McpPeerAuthenticator } from "./shared.ts";
 interface LivePeer {
   server: McpServer;
   authenticate: McpPeerAuthenticator;
+  /** The binding this connection was admitted under — the target it may receive mail for. */
+  binding: RoleBinding;
+}
+
+/**
+ * The one question attach and deliver both ask: is this connection still *the* holder of the
+ * role it claims? Answered from the registry, never from anything the peer said about itself.
+ */
+export interface RoleBindingSource {
+  active(roleKey: string): RoleBinding | null;
 }
 
 const isTextContent = (content: unknown): content is { type: "text"; text: string } =>
@@ -46,19 +56,54 @@ const isTextContent = (content: unknown): content is { type: "text"; text: strin
 export const DEFAULT_ROLE_DELIVERY_TIMEOUT_MS = 30_000;
 
 export class RoleConversationPort {
-  #live: LivePeer | null = null;
+  /**
+   * One peer per **roleKey**, not one per socket.
+   *
+   * `cto.mcp.sock` admits `PRIMARY_CTO` and `BOOTSTRAP_CTO`, and `PRIMARY_CTO` is scoped per
+   * project — so a single slot would let the last connection to authenticate become the peer for
+   * everyone. A bootstrap CTO, or the primary CTO of another project, would then receive mail
+   * addressed to this project's canonical CTO. Keying by `roleKey` is what makes delivery
+   * addressed rather than merely last-writer.
+   */
+  readonly #live = new Map<string, LivePeer>();
   readonly #role: Role;
+  readonly #bindings: RoleBindingSource;
   readonly #timeoutMs: number;
   readonly #maxTokens: number;
 
-  constructor(role: Role, options: { timeoutMs?: number; maxTokens?: number } = {}) {
+  constructor(
+    role: Role,
+    bindings: RoleBindingSource,
+    options: { timeoutMs?: number; maxTokens?: number } = {},
+  ) {
     this.#role = role;
+    this.#bindings = bindings;
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_ROLE_DELIVERY_TIMEOUT_MS;
     this.#maxTokens = options.maxTokens ?? 1024;
   }
 
   get role(): Role {
     return this.#role;
+  }
+
+  /**
+   * Whether `binding` is, right now, the exact holder this port may deliver to.
+   *
+   * Three separate questions, because each one alone lets a wrong target through: the role has
+   * to be the one this port serves (a `BOOTSTRAP_CTO` is not the canonical CTO), the registry's
+   * current holder has to be this same assignment (another project's key answers for its own
+   * key, never for this one), and the generation has to still be current (a superseded holder is
+   * a former one). None of it is taken from the peer's own claim.
+   */
+  #isCurrentHolder(binding: RoleBinding): boolean {
+    if (binding.role !== this.#role) return false;
+    const current = this.#bindings.active(binding.roleKey);
+    if (!current) return false;
+    return (
+      current.assignmentId === binding.assignmentId &&
+      current.bindingGeneration === binding.bindingGeneration &&
+      current.role === this.#role
+    );
   }
 
   /**
@@ -70,16 +115,25 @@ export class RoleConversationPort {
    * observed the close. Detach is identity-checked so a late close from the replaced connection
    * cannot clear its successor.
    */
-  attach(server: McpServer, authenticate: McpPeerAuthenticator): () => void {
-    const peer: LivePeer = { server, authenticate };
-    this.#live = peer;
+  attach(
+    binding: RoleBinding,
+    server: McpServer,
+    authenticate: McpPeerAuthenticator,
+  ): () => void {
+    // Refused *before* it becomes the peer. Attaching first and checking at delivery would
+    // already have displaced the real holder, and the displacement is the defect — the canonical
+    // CTO would stop receiving mail the moment a bootstrap peer connected.
+    if (!this.#isCurrentHolder(binding)) return () => {};
+    const peer: LivePeer = { server, authenticate, binding };
+    this.#live.set(binding.roleKey, peer);
     return () => {
-      if (this.#live === peer) this.#live = null;
+      // Identity-checked: a late close from a replaced connection must not clear its successor.
+      if (this.#live.get(binding.roleKey) === peer) this.#live.delete(binding.roleKey);
     };
   }
 
-  connected(): boolean {
-    return this.#live !== null;
+  connected(roleKey: string): boolean {
+    return this.#live.has(roleKey);
   }
 
   /**
@@ -88,13 +142,24 @@ export class RoleConversationPort {
    * The acknowledgement is the peer's own reply, because `accepted` without it is the fault this
    * whole issue is about: a relay that took the bytes is not a reader that saw them (B5).
    */
-  async deliver(text: string): Promise<Decision<string>> {
-    const peer = this.#live;
+  async deliver(roleKey: string, text: string): Promise<Decision<string>> {
+    const peer = this.#live.get(roleKey);
     if (!peer) {
       return deny(
         ReasonCode.ROLE_PEER_ABSENT,
         "no session is currently attached for this role, so the message was not delivered",
-        { role: this.#role },
+        { role: this.#role, roleKey },
+      );
+    }
+
+    // The registry is asked again at send time: the holder can move between attach and
+    // delivery, and a message addressed to the role is not the former holder's to receive.
+    if (!this.#isCurrentHolder(peer.binding)) {
+      if (this.#live.get(roleKey) === peer) this.#live.delete(roleKey);
+      return deny(
+        ReasonCode.ROLE_PEER_STALE,
+        "the attached peer no longer holds the role its socket was admitted under",
+        { role: this.#role, roleKey, generation: peer.binding.bindingGeneration },
       );
     }
 
@@ -103,11 +168,11 @@ export class RoleConversationPort {
     // addressed to the role is not theirs to receive.
     const current = peer.authenticate();
     if (!current.allowed) {
-      if (this.#live === peer) this.#live = null;
+      if (this.#live.get(roleKey) === peer) this.#live.delete(roleKey);
       return deny(
         ReasonCode.ROLE_PEER_STALE,
         "the attached peer no longer holds the role its socket was admitted under",
-        { role: this.#role, authenticator: current.reasonCode },
+        { role: this.#role, roleKey, authenticator: current.reasonCode },
       );
     }
 
@@ -115,7 +180,7 @@ export class RoleConversationPort {
       return deny(
         ReasonCode.ROLE_PEER_UNSUPPORTED,
         "the attached peer did not declare the sampling capability delivery travels on",
-        { role: this.#role },
+        { role: this.#role, roleKey },
       );
     }
 
@@ -142,7 +207,7 @@ export class RoleConversationPort {
       return deny(
         ReasonCode.ROLE_PEER_FAILED,
         "the attached peer did not acknowledge the delivery",
-        { role: this.#role, timeoutMs: this.#timeoutMs, shape },
+        { role: this.#role, roleKey, timeoutMs: this.#timeoutMs, shape },
       );
     }
 
@@ -151,7 +216,7 @@ export class RoleConversationPort {
       return deny(
         ReasonCode.ROLE_PEER_FAILED,
         "the attached peer acknowledged with content this text-only route cannot read",
-        { role: this.#role, shape: "not-text" },
+        { role: this.#role, roleKey, shape: "not-text" },
       );
     }
     return allow(ReasonCode.OK, content.text);
