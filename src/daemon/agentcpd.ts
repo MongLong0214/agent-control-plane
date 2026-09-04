@@ -46,6 +46,7 @@ import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
 import { createCtoMcpPort, createCtoServer } from "../mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../mcp/hermes-server.ts";
 import { CeoConversationPort } from "../mcp/ceo-conversation.ts";
+import { RoleConversationPort } from "../mcp/role-conversation.ts";
 import type { AuthenticatedMcpPeer, McpPeerAuthenticator } from "../mcp/shared.ts";
 import type { AuthenticatedOperatorPeer, Daemon } from "./daemon.ts";
 
@@ -113,6 +114,13 @@ export interface LocalMcpListeners {
   socketPaths: readonly string[];
   /** §6.1 DIRECT — the daemon's handle on whoever currently holds the CEO socket. */
   ceoConversation: CeoConversationPort;
+  /**
+   * The destination for a message addressed to the CTO role (#760 Part B / B2).
+   *
+   * The CEO field above has existed since the owner-conversation route; this one did not, so an
+   * addressed message had nowhere inside the daemon to go and a person carried it.
+   */
+  ctoConversation: RoleConversationPort;
   close(): Promise<void>;
 }
 
@@ -315,6 +323,7 @@ export const startLocalMcpListeners = async (
   const hermesPort = createHermesMcpPort(cp, { onCeoApproved: options.onCeoApproved });
   const ctoPort = createCtoMcpPort(cp);
   const ceoConversation = options.ceoConversation ?? new CeoConversationPort();
+  const ctoConversation = new RoleConversationPort(Role.PRIMARY_CTO);
   const hermes = await startMcpSocket(
     hermesPath,
     token,
@@ -338,11 +347,18 @@ export const startLocalMcpListeners = async (
       cp,
       [Role.PRIMARY_CTO, Role.BOOTSTRAP_CTO],
       handshakeTimeoutMs,
-      (auth, opening) => createCtoServer(
-        ctoPort,
-        auth,
-        opening.kind === "PENDING_HANDOFF_ACK" ? { pendingHandoffId: opening.handoffId } : undefined,
-      ),
+      (auth, opening) => {
+        const server = createCtoServer(
+          ctoPort,
+          auth,
+          opening.kind === "PENDING_HANDOFF_ACK" ? { pendingHandoffId: opening.handoffId } : undefined,
+        );
+        // The line the CEO socket has had and this one did not. The authenticator travels with
+        // the connection, so a socket that outlives its binding stops receiving the role's mail
+        // rather than keeping it.
+        server.server.onclose = ctoConversation.attach(server, auth);
+        return server;
+      },
       true,
     );
   } catch (err) {
@@ -355,6 +371,7 @@ export const startLocalMcpListeners = async (
   return {
     socketPaths: [hermesPath, ctoPath],
     ceoConversation,
+    ctoConversation,
     close: async () => {
       await Promise.all(servers.map(closeSocketServer));
       for (const path of [hermesPath, ctoPath]) {
