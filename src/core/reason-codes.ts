@@ -303,6 +303,30 @@ export const ReasonCode = {
    */
   CEO_CONVERSATION_BUSY: "CEO_CONVERSATION_BUSY",
 
+  // --- delivery to a role's live peer (#760 Part B) -------------------------
+  /**
+   * No session is attached for the addressed role, so the message was not delivered.
+   *
+   * Not a failure. A role is handed between sessions as ordinary operation, and the window where
+   * nobody holds it is normal. The event stays queued and the next peer to attach drains it;
+   * nothing is spawned to receive it, because spawning a substitute is the fork model `#627`
+   * removes and would deliver the message to something that is not the role holder.
+   */
+  ROLE_PEER_ABSENT: "ROLE_PEER_ABSENT",
+  /** The attached peer no longer holds the role its socket was admitted under. */
+  ROLE_PEER_STALE: "ROLE_PEER_STALE",
+  /** The attached peer never declared the sampling capability delivery travels on. */
+  ROLE_PEER_UNSUPPORTED: "ROLE_PEER_UNSUPPORTED",
+  /**
+   * The peer was reached and did not acknowledge — a timeout, a closed transport, an error, or
+   * an answer this text-only route cannot read.
+   *
+   * One code rather than four because `#760` B5 makes every one of them the same obligation: an
+   * unacknowledged delivery is a debt that is redelivered, not a state the caller branches on.
+   * The shape is carried in the evidence for whoever is reading the journal.
+   */
+  ROLE_PEER_FAILED: "ROLE_PEER_FAILED",
+
   // --- canonical turns -----------------------------------------------------
   /**
    * No verified target binding exists for this actor, so no turn can be claimed for it.
@@ -634,6 +658,7 @@ export const STALENESS_REASON_CODES: ReadonlySet<ReasonCode> = new Set([
   ReasonCode.MERGE_HEAD_STALE,
   ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
   ReasonCode.REGISTERED_SET_GENERATION_MISMATCH,
+  ReasonCode.ROLE_PEER_STALE,
   ReasonCode.SNAPSHOT_STALE,
   ReasonCode.WRITE_BINDING_GENERATION_STALE,
 ]);

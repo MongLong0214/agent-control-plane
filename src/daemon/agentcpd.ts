@@ -46,6 +46,7 @@ import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
 import { createCtoMcpPort, createCtoServer } from "../mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../mcp/hermes-server.ts";
 import { CeoConversationPort } from "../mcp/ceo-conversation.ts";
+import { RoleConversationPort } from "../mcp/role-conversation.ts";
 import type { AuthenticatedMcpPeer, McpPeerAuthenticator } from "../mcp/shared.ts";
 import type { AuthenticatedOperatorPeer, Daemon } from "./daemon.ts";
 
@@ -113,6 +114,13 @@ export interface LocalMcpListeners {
   socketPaths: readonly string[];
   /** §6.1 DIRECT — the daemon's handle on whoever currently holds the CEO socket. */
   ceoConversation: CeoConversationPort;
+  /**
+   * The destination for a message addressed to the CTO role (#760 Part B / B2).
+   *
+   * The CEO field above has existed since the owner-conversation route; this one did not, so an
+   * addressed message had nowhere inside the daemon to go and a person carried it.
+   */
+  ctoConversation: RoleConversationPort;
   close(): Promise<void>;
 }
 
@@ -315,6 +323,24 @@ export const startLocalMcpListeners = async (
   const hermesPort = createHermesMcpPort(cp, { onCeoApproved: options.onCeoApproved });
   const ctoPort = createCtoMcpPort(cp);
   const ceoConversation = options.ceoConversation ?? new CeoConversationPort();
+  /*
+   * The registry view the CTO port enumerates its slots from.
+   *
+   * `bindings.bySession` cannot serve here: it selects on the assignment's own session column and
+   * joins nothing, so it answers with the session a binding was *created* for. A conversation that
+   * survives a failover moves to another runtime without rewriting that column, which makes the
+   * historical answer wrong in both directions — it lists roles the session has lost and omits
+   * roles it has gained. `activePrimaryCto` resolves the live runtime through the actor, so the
+   * question asked here is "which project has which runtime as its CTO, right now".
+   *
+   * The list is deliberately not narrowed to the connecting session. Deciding who may hold a slot
+   * is the port's single enforcement point; repeating it here would leave two copies of one rule,
+   * and removing either would change nothing a test could see.
+   */
+  const ctoConversation = new RoleConversationPort(Role.PRIMARY_CTO, {
+    active: (roleKey) => cp.bindings.active(roleKey),
+    currentCandidates: () => currentBindingsForRoles(cp, [Role.PRIMARY_CTO]),
+  });
   const hermes = await startMcpSocket(
     hermesPath,
     token,
@@ -338,11 +364,35 @@ export const startLocalMcpListeners = async (
       cp,
       [Role.PRIMARY_CTO, Role.BOOTSTRAP_CTO],
       handshakeTimeoutMs,
-      (auth, opening) => createCtoServer(
-        ctoPort,
-        auth,
-        opening.kind === "PENDING_HANDOFF_ACK" ? { pendingHandoffId: opening.handoffId } : undefined,
-      ),
+      (auth, opening, credential) => {
+        // `auth` stays binding-scoped: MCP tool authority *is* authority over the one assignment
+        // this connection was admitted under, and `createCtoServer` must keep getting it.
+        const server = createCtoServer(
+          ctoPort,
+          auth,
+          opening.kind === "PENDING_HANDOFF_ACK" ? { pendingHandoffId: opening.handoffId } : undefined,
+        );
+        // The line the CEO socket has had and this one did not. The binding the connection was
+        // admitted under is what the port keys and verifies on: this socket also admits
+        // BOOTSTRAP_CTO and admits PRIMARY_CTO for any project, and neither may become the peer
+        // for this project's canonical CTO. A handoff-pending peer holds no binding at all, so
+        // there is nothing for it to be the target of.
+        if (opening.kind === "BOUND") {
+          // The credential authenticated a *session*; admission then picked one of its bindings to
+          // admit the connection under. Which one it picked decides nothing here — the port asks
+          // the registry which roles this authenticated runtime currently holds. `opening.binding`
+          // is deliberately not passed: making a sibling slot's eligibility depend on whichever
+          // binding admission happened to choose is how a role becomes unreachable. For the same
+          // reason the port gets a *credential-only* authenticator rather than `auth` — a
+          // binding-scoped re-check at delivery time reintroduces that dependency through the back
+          // door, and moving the admitted project away took the session's other project with it.
+          server.server.onclose = ctoConversation.attach(
+            server,
+            conversationPeerAuthenticator(cp, credential, opening.sessionIncarnation, ctoConversation.role),
+          );
+        }
+        return server;
+      },
       true,
     );
   } catch (err) {
@@ -355,6 +405,7 @@ export const startLocalMcpListeners = async (
   return {
     socketPaths: [hermesPath, ctoPath],
     ceoConversation,
+    ctoConversation,
     close: async () => {
       await Promise.all(servers.map(closeSocketServer));
       for (const path of [hermesPath, ctoPath]) {
@@ -569,7 +620,11 @@ const startMcpSocket = async (
   cp: ControlPlane,
   expectedRoles: readonly Role[],
   handshakeTimeoutMs: number,
-  factory: (authenticate: McpPeerAuthenticator, opening: BoundSocketPeer) => ReturnType<typeof createHermesServer>,
+  factory: (
+    authenticate: McpPeerAuthenticator,
+    opening: BoundSocketPeer,
+    credential: PeerCredential,
+  ) => ReturnType<typeof createHermesServer>,
   permitPendingHandoffAck = false,
 ): Promise<Server> => {
   removeStaleSocket(path);
@@ -583,7 +638,11 @@ const startMcpSocket = async (
         endWithDecision(socket, opening);
         return;
       }
-      const mcp = factory(peerAuthenticator(cp, accepted.credential, opening.value), opening.value);
+      const mcp = factory(
+        peerAuthenticator(cp, accepted.credential, opening.value),
+        opening.value,
+        accepted.credential,
+      );
       try {
         await mcp.connect(accepted.transport);
       } catch (err) {
@@ -1021,6 +1080,40 @@ const presentedBuzzMessage = (value: unknown): BuzzMessageIngressInput | null =>
   return { actor, conversation, eventId, addressedTo, text, signature: signature ?? null };
 };
 
+/**
+ * Every ACTIVE binding of these roles, as the registry currently holds it (`#760` Part B).
+ *
+ * The question is "who holds this role right now", and only the registry answers it. An
+ * assignment row keeps the session it was created for, and `BindingRegistry.switchTo`'s
+ * `SURVIVED` failover moves an actor's live runtime without rewriting that column — so a lookup
+ * keyed on it is wrong in both directions: it names roles a session has lost and omits roles it
+ * has gained. `activePrimaryCto` and `active` resolve the live runtime through the actor, which
+ * is the routing answer.
+ *
+ * Callers filter this list themselves. Narrowing it here as well would put one rule in two
+ * places, and then removing either changes nothing a test can see.
+ */
+const currentBindingsForRoles = (cp: ControlPlane, roles: readonly Role[]): RoleBinding[] => {
+  const out: RoleBinding[] = [];
+  for (const role of roles) {
+    if (role === Role.CEO) {
+      const ceo = cp.bindings.active(roleKeyFor(Role.CEO));
+      if (ceo) out.push(ceo);
+    } else if (role === Role.PRIMARY_CTO) {
+      for (const project of cp.projects.list()) {
+        const cto = cp.bindings.activePrimaryCto(project.projectId);
+        if (cto) out.push(cto);
+      }
+    } else if (role === Role.BOOTSTRAP_CTO) {
+      for (const run of cp.runs.list()) {
+        const bootstrap = cp.bindings.active(roleKeyFor(Role.BOOTSTRAP_CTO, { runId: run.runId }));
+        if (bootstrap) out.push(bootstrap);
+      }
+    }
+  }
+  return out;
+};
+
 interface AcceptedConnection {
   transport: SocketTransport;
   credential: PeerCredential;
@@ -1069,9 +1162,15 @@ const authenticateSocketPeer = (
     });
   }
 
-  const candidate = cp.bindings
-    .bySession(credential.sessionId)
-    .find((binding) => binding.status === "ACTIVE" && expectedRoles.includes(binding.role));
+  // Eligibility is decided against current state, not the assignment's own session column. A
+  // conversation that survived a failover to this runtime has the same assignment and generation
+  // and a different `session_id`; judging on that column refuses the rightful holder before the
+  // connection ever reaches a port, and admits a runtime the role has already left.
+  const candidate = currentBindingsForRoles(cp, expectedRoles).find(
+    (binding) =>
+      binding.sessionId === credential.sessionId &&
+      binding.sessionIncarnation === session.value.incarnation,
+  );
   if (!candidate) {
     if (permitPendingHandoffAck && session.value.lifecycle === SessionLifecycle.READY) {
       const pending = currentPendingNormalHandoff(cp, credential.sessionId);
@@ -1307,6 +1406,54 @@ const peerAuthenticator =
       });
     }
     return allow(ReasonCode.OK, authenticatedPeer(credential, opening.sessionIncarnation));
+  };
+
+/**
+ * The same connection's authority with **no binding in it** — for a `RoleConversationPort`.
+ *
+ * `peerAuthenticator` above is binding-scoped, and has to be: MCP tool authority is authority over
+ * one role's assignment, so its tail re-asks `authenticateBoundSession` about `opening.binding`.
+ * That is exactly wrong for the conversation port. A session legitimately holds several bindings
+ * at once, socket admission admits the connection under whichever one it happens to find first,
+ * and the port keeps a slot per role. Handing the port a binding-scoped authenticator makes every
+ * slot's liveness depend on the admitting binding: measured 2026-09-05, a same-generation
+ * `switchTo({ conversation: "SURVIVED" })` moving *only* the admitted project away then refused
+ * delivery for the session's other project with `ROLE_PEER_STALE` — while that session was still
+ * the registry's exact current holder of it. A role was lost to an event in a different project.
+ *
+ * So this re-authenticates the three things that are true of the *connection* rather than of any
+ * role: the session secret still verifies, the session has not been respawned since this
+ * connection handshook, and the lifecycle still permits holding a bound socket. It reads no
+ * roleKey, no assignment, no binding generation, and never touches `opening.binding`. Which roles
+ * this authenticated runtime may receive for stays entirely with `RoleConversationPort`'s single
+ * enforcement point, `#isCurrentHolder`, evaluated per slot at attach and again at delivery.
+ *
+ * The lifecycle question needs a role, and the one passed is the **port's own** role — the role
+ * every slot this authenticator can ever guard is a binding of, since `#isCurrentHolder` admits no
+ * other. It is not `opening.binding.role`, which would put the admitting binding back in. Nor is
+ * it hardcoded to the strictest form (`READY` only): a DRAINING primary keeps its already-fenced
+ * authority, and denying it here would silently drop delivery to a holder the registry still names.
+ */
+const conversationPeerAuthenticator =
+  (cp: ControlPlane, credential: PeerCredential, sessionIncarnation: string, role: Role): McpPeerAuthenticator =>
+  () => {
+    const session = cp.sessions.verifySecret(credential.sessionId, credential.sessionSecret);
+    if (!session.allowed) return session as Decision<AuthenticatedMcpPeer>;
+    if (session.value.incarnation !== sessionIncarnation) {
+      return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "session was respawned since this connection authenticated", {
+        sessionId: credential.sessionId,
+        handshake: sessionIncarnation,
+        current: session.value.incarnation,
+      });
+    }
+    if (!lifecyclePermitsBoundSocket(session.value.lifecycle, role)) {
+      return deny(
+        ReasonCode.MCP_PEER_UNAUTHENTICATED,
+        `peer session is ${session.value.lifecycle} and cannot retain this role's socket authority`,
+        { sessionId: credential.sessionId, lifecycle: session.value.lifecycle, role },
+      );
+    }
+    return allow(ReasonCode.OK, authenticatedPeer(credential, sessionIncarnation));
   };
 
 /**
