@@ -72,10 +72,6 @@ export const GATES = [
   // #539 lands src/core/peercred.ts unreachable from every live surface on purpose — a new call
   // site (or a ControlPlane export) is a RED mutant here, not a deliverable.
   { script: "guards:peercred-unreachable" },
-  // U6 unit 1 lands src/db/fd-vfs.ts the same way: the descriptor-binding primitive and its
-  // evidence, with no product wiring. Unit 3 adds the call site and removes this gate in the same
-  // change, so the primitive going live is a decision rather than a discovery.
-  { script: "guards:fd-vfs-unreachable" },
   // `migrations:check` freezes what each migration does. v24's DDL was edited in place across two
   // correction rounds; a database created at the earlier one then sat at that version with bodies
   // nobody's code expected and could not settle a turn.
