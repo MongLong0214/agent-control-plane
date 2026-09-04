@@ -509,6 +509,11 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
   it("keeps delivering to a sibling role after the binding the connection was admitted under moves away", async () => {
     const harness = makeHarness();
     const a = await registerFixtureProject(harness, "project-a");
+    // A and B are registered at *different* instants. The harness clock is manual, so without this
+    // both `projects` rows carry the same `created_at`, `ORDER BY created_at` has nothing left to
+    // order them by, and which of S1's two bindings admits the connection falls to storage order —
+    // an accident, and one that decides whether this row measures the defect or its mirror image.
+    harness.clock.advance(1_000);
     const bManifest = fixtureManifest("project-b");
     const bProject = harness.cp.projects.register({
       projectId: "project-b",
@@ -528,6 +533,22 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
     }
     const keyA = roleKeyFor(Role.PRIMARY_CTO, { projectId: a.projectId });
     const keyB = roleKeyFor(Role.PRIMARY_CTO, { projectId: "project-b" });
+
+    // PREMISE, OBSERVED. Everything below only measures the defect if the connection is admitted
+    // under **A**. Admission takes the first of this session's current bindings that
+    // `currentBindingsForRoles` offers, and for `PRIMARY_CTO` that list is built by walking
+    // `projects.list()` — `SELECT * FROM projects ORDER BY created_at`. This is the same walk,
+    // through the same public registry calls, so what it names is what admission picked.
+    const admitted = harness.cp.projects
+      .list()
+      .map((project) => harness.cp.bindings.activePrimaryCto(project.projectId))
+      .find((binding) => binding?.sessionId === s1.sessionId);
+    expect(
+      admitted?.roleKey,
+      "socket admission admitted this connection under B, so moving A below moves a binding this " +
+        "connection was not admitted under — the inverse of what this row measures, and a state in " +
+        "which a binding-scoped conversation authenticator passes",
+    ).toBe(keyA);
 
     const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-cto-admitted-moved-"), TOKEN);
     const ctoSocket = listeners.socketPaths[1];
