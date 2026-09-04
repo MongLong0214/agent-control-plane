@@ -45,16 +45,19 @@ interface LivePeer {
 export interface RoleBindingSource {
   active(roleKey: string): RoleBinding | null;
   /**
-   * Every ACTIVE binding of this port's role whose **current runtime** is that session and
-   * incarnation.
+   * Every ACTIVE binding of this port's role, as the registry currently holds it.
    *
-   * Deliberately not "the bindings this session was bound under". An assignment row keeps the
-   * session it was created for, and a conversation that survives a failover moves to another
-   * runtime without rewriting it — so the historical column names a session that may no longer
-   * be the one to talk to, in both directions: it lists roles this session has lost, and omits
-   * roles it has gained.
+   * Unfiltered on purpose. Filtering candidates by the connection's session here as well would
+   * put the same rule in two places, and then removing either one changes nothing observable —
+   * which is a guard that cannot be shown to work. The filtering belongs to `#isCurrentHolder`,
+   * which is the single place a candidate becomes a peer.
+   *
+   * What this must not be is "the bindings this session was bound under". An assignment row keeps
+   * the session it was created for, and a conversation that survives a failover moves to another
+   * runtime without rewriting it, so the historical column is wrong in both directions: it lists
+   * roles the session has lost and omits roles it has gained.
    */
-  currentFor(sessionId: string, sessionIncarnation: string): readonly RoleBinding[];
+  currentCandidates(): readonly RoleBinding[];
 }
 
 const isTextContent = (content: unknown): content is { type: "text"; text: string } =>
@@ -141,9 +144,10 @@ export class RoleConversationPort {
      * first would make whichever role admission happened to pick the only reachable one, and the
      * second names the session a conversation *was* on rather than the one it is on now.
      *
-     * So the credential authenticates the session, and the candidates are the bindings whose
-     * current runtime is that authenticated session and incarnation. A `BOOTSTRAP_CTO` binding is
-     * never among them, and nothing the caller says about itself is consulted.
+     * So the credential authenticates the session, the registry offers every current binding of
+     * this role, and `#isCurrentHolder` — the one enforcement point — keeps the ones whose live
+     * runtime is this authenticated session and incarnation. A `BOOTSTRAP_CTO` binding never
+     * survives that check, and nothing the caller says about itself is consulted.
      */
     const identity = authenticate();
     if (!identity.allowed) return () => {};
@@ -151,7 +155,7 @@ export class RoleConversationPort {
     if (!peer.sessionId || !peer.sessionIncarnation) return () => {};
 
     const owned: string[] = [];
-    for (const binding of this.#bindings.currentFor(peer.sessionId, peer.sessionIncarnation)) {
+    for (const binding of this.#bindings.currentCandidates()) {
       if (!this.#isCurrentHolder(binding, peer)) continue;
       this.#live.set(binding.roleKey, { server, authenticate, binding });
       owned.push(binding.roleKey);

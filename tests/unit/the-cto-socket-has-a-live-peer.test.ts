@@ -350,6 +350,68 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
     60_000,
   );
 
+  it("does not let one session's connection hold the slot of a project another session is CTO of", async () => {
+    const harness = makeHarness();
+    const a = await registerFixtureProject(harness, "project-a");
+    const bManifest = fixtureManifest("project-b");
+    const bProject = harness.cp.projects.register({
+      projectId: "project-b",
+      name: "fixture",
+      manifest: bManifest,
+      authorization: harness.cp.manifestAuthorizationForTests(bManifest),
+    });
+    if (!bProject.allowed) throw new Error(`second project failed: ${bProject.message}`);
+
+    // Two runtimes, one project each. The registry offers both bindings as candidates to every
+    // connection — narrowing that list per-connection would put the rule in two places — so the
+    // only thing keeping S1 out of B's slot is the holder check inside the port.
+    const s1 = readySession(harness, "cto-of-a");
+    const s2 = readySession(harness, "cto-of-b");
+    expect(
+      harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId: s1.sessionId, projectId: a.projectId })
+        .reasonCode,
+    ).toBe(ReasonCode.OK);
+    expect(
+      harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId: s2.sessionId, projectId: "project-b" })
+        .reasonCode,
+    ).toBe(ReasonCode.OK);
+
+    const keyA = roleKeyFor(Role.PRIMARY_CTO, { projectId: a.projectId });
+    const keyB = roleKeyFor(Role.PRIMARY_CTO, { projectId: "project-b" });
+
+    const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-cto-wrong-session-"), TOKEN);
+    const ctoSocket = listeners.socketPaths[1];
+    if (!ctoSocket) throw new Error("the CTO MCP listener was not started");
+    const peerOne = await connectPeer(ctoSocket, { token: TOKEN, ...s1 });
+    try {
+      await until(() => listeners.ctoConversation.connected(keyA), "S1 to hold its own project");
+      expect(
+        listeners.ctoConversation.connected(keyB),
+        "a session took the slot of a project another session is the CTO of",
+      ).toBe(false);
+      const refused = await listeners.ctoConversation.deliver(keyB, "for project B only");
+      expect(refused.allowed).toBe(false);
+      expect(refused.reasonCode).toBe(ReasonCode.ROLE_PEER_ABSENT);
+      expect(peerOne.received, "S1 received mail addressed to the CTO of project B").toEqual([]);
+
+      // And B's own holder reaches it, so the refusal above is about who asked rather than about
+      // the project being unreachable.
+      const peerTwo = await connectPeer(ctoSocket, { token: TOKEN, ...s2 });
+      try {
+        await until(() => listeners.ctoConversation.connected(keyB), "S2 to hold its own project");
+        const delivered = await listeners.ctoConversation.deliver(keyB, "for project B only");
+        if (!delivered.allowed) throw new Error(`B's own holder was unreachable: ${delivered.message}`);
+        expect(peerTwo.received).toEqual(["for project B only"]);
+        expect(peerOne.received).toEqual([]);
+      } finally {
+        await peerTwo.close();
+      }
+    } finally {
+      await peerOne.close();
+      await listeners.close();
+    }
+  }, 60_000);
+
   it("leaves no peer behind when the holder disconnects, and a late close does not detach its replacement", async () => {
     const harness = makeHarness();
     const { projectId } = await registerFixtureProject(harness);

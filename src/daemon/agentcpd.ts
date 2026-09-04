@@ -331,20 +331,19 @@ export const startLocalMcpListeners = async (
    * survives a failover moves to another runtime without rewriting that column, which makes the
    * historical answer wrong in both directions — it lists roles the session has lost and omits
    * roles it has gained. `activePrimaryCto` resolves the live runtime through the actor, so the
-   * question asked here is "which projects is this runtime the CTO of, right now".
+   * question asked here is "which project has which runtime as its CTO, right now".
+   *
+   * The list is deliberately not narrowed to the connecting session. Deciding who may hold a slot
+   * is the port's single enforcement point; repeating it here would leave two copies of one rule,
+   * and removing either would change nothing a test could see.
    */
   const ctoConversation = new RoleConversationPort(Role.PRIMARY_CTO, {
     active: (roleKey) => cp.bindings.active(roleKey),
-    currentFor: (sessionId, sessionIncarnation) =>
+    currentCandidates: () =>
       cp.projects
         .list()
         .map((project) => cp.bindings.activePrimaryCto(project.projectId))
-        .filter(
-          (binding): binding is NonNullable<typeof binding> =>
-            binding !== null &&
-            binding.sessionId === sessionId &&
-            binding.sessionIncarnation === sessionIncarnation,
-        ),
+        .filter((binding): binding is NonNullable<typeof binding> => binding !== null),
   });
   const hermes = await startMcpSocket(
     hermesPath,
