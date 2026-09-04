@@ -4,7 +4,7 @@ import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { Role, RoleBinding } from "../domain/types.ts";
-import type { McpPeerAuthenticator } from "./shared.ts";
+import type { AuthenticatedMcpPeer, McpPeerAuthenticator } from "./shared.ts";
 
 /**
  * The daemon's destination for a message addressed to a **role** (`#760` Part B / B2).
@@ -44,6 +44,17 @@ interface LivePeer {
  */
 export interface RoleBindingSource {
   active(roleKey: string): RoleBinding | null;
+  /**
+   * Every ACTIVE binding of this port's role whose **current runtime** is that session and
+   * incarnation.
+   *
+   * Deliberately not "the bindings this session was bound under". An assignment row keeps the
+   * session it was created for, and a conversation that survives a failover moves to another
+   * runtime without rewriting it — so the historical column names a session that may no longer
+   * be the one to talk to, in both directions: it lists roles this session has lost, and omits
+   * roles it has gained.
+   */
+  currentFor(sessionId: string, sessionIncarnation: string): readonly RoleBinding[];
 }
 
 const isTextContent = (content: unknown): content is { type: "text"; text: string } =>
@@ -95,14 +106,19 @@ export class RoleConversationPort {
    * key, never for this one), and the generation has to still be current (a superseded holder is
    * a former one). None of it is taken from the peer's own claim.
    */
-  #isCurrentHolder(binding: RoleBinding): boolean {
+  #isCurrentHolder(binding: RoleBinding, peer: AuthenticatedMcpPeer): boolean {
     if (binding.role !== this.#role) return false;
     const current = this.#bindings.active(binding.roleKey);
     if (!current) return false;
     return (
       current.assignmentId === binding.assignmentId &&
       current.bindingGeneration === binding.bindingGeneration &&
-      current.role === this.#role
+      current.role === this.#role &&
+      // The runtime, not the assignment. Everything above can match while the conversation has
+      // moved to a different session, and delivering on the strength of assignment identity alone
+      // sends the role's mail to the runtime it used to live on.
+      current.sessionId === peer.sessionId &&
+      current.sessionIncarnation === peer.sessionIncarnation
     );
   }
 
@@ -115,30 +131,28 @@ export class RoleConversationPort {
    * observed the close. Detach is identity-checked so a late close from the replaced connection
    * cannot clear its successor.
    */
-  attach(
-    bindings: readonly RoleBinding[],
-    server: McpServer,
-    authenticate: McpPeerAuthenticator,
-  ): () => void {
+  attach(server: McpServer, authenticate: McpPeerAuthenticator): () => void {
     /*
-     * **All of the connection's bindings, not one of them.**
+     * **The connection's slots come from the registry, keyed on who it authenticated as.**
      *
-     * A session legitimately holds several at once — an older `BOOTSTRAP_CTO` and the
+     * A session legitimately holds several bindings at once — an older `BOOTSTRAP_CTO` and the
      * `PRIMARY_CTO` of two different projects — and socket admission picks a single one to admit
-     * the connection under. Attaching only that one leaves the rest with no destination for as
-     * long as the session lives: whichever binding admission happened to choose first is the only
-     * role that can be reached, and reconnecting repeats the same choice. So the credential
-     * authenticates the *session*, and the slots are enumerated here, from the registry.
+     * the connection under. Neither that choice nor the assignment history is authority here: the
+     * first would make whichever role admission happened to pick the only reachable one, and the
+     * second names the session a conversation *was* on rather than the one it is on now.
      *
-     * Each candidate is filtered before it becomes a peer. Attaching first and checking at
-     * delivery would already have displaced the real holder, and the displacement is the defect —
-     * the canonical CTO would stop receiving mail the moment a bootstrap peer connected. A
-     * `BOOTSTRAP_CTO` binding is not a candidate for a `PRIMARY_CTO` slot, and nothing the caller
-     * says about itself is consulted.
+     * So the credential authenticates the session, and the candidates are the bindings whose
+     * current runtime is that authenticated session and incarnation. A `BOOTSTRAP_CTO` binding is
+     * never among them, and nothing the caller says about itself is consulted.
      */
+    const identity = authenticate();
+    if (!identity.allowed) return () => {};
+    const peer = identity.value;
+    if (!peer.sessionId || !peer.sessionIncarnation) return () => {};
+
     const owned: string[] = [];
-    for (const binding of bindings) {
-      if (!this.#isCurrentHolder(binding)) continue;
+    for (const binding of this.#bindings.currentFor(peer.sessionId, peer.sessionIncarnation)) {
+      if (!this.#isCurrentHolder(binding, peer)) continue;
       this.#live.set(binding.roleKey, { server, authenticate, binding });
       owned.push(binding.roleKey);
     }
@@ -171,27 +185,16 @@ export class RoleConversationPort {
       );
     }
 
-    // The registry is asked again at send time: the holder can move between attach and
-    // delivery, and a message addressed to the role is not the former holder's to receive.
-    if (!this.#isCurrentHolder(peer.binding)) {
+    // The registry is asked again at send time, against this connection's own authenticated
+    // identity: the holder can move between attach and delivery, and a message addressed to the
+    // role is not the former holder's to receive.
+    const identity = peer.authenticate();
+    if (!identity.allowed || !this.#isCurrentHolder(peer.binding, identity.value)) {
       if (this.#live.get(roleKey) === peer) this.#live.delete(roleKey);
       return deny(
         ReasonCode.ROLE_PEER_STALE,
         "the attached peer no longer holds the role its socket was admitted under",
         { role: this.#role, roleKey, generation: peer.binding.bindingGeneration },
-      );
-    }
-
-    // The same check an inbound tool call makes, before anything is sent outbound. A socket
-    // admitted under a superseded binding generation belongs to a former holder, and a message
-    // addressed to the role is not theirs to receive.
-    const current = peer.authenticate();
-    if (!current.allowed) {
-      if (this.#live.get(roleKey) === peer) this.#live.delete(roleKey);
-      return deny(
-        ReasonCode.ROLE_PEER_STALE,
-        "the attached peer no longer holds the role its socket was admitted under",
-        { role: this.#role, roleKey, authenticator: current.reasonCode },
       );
     }
 

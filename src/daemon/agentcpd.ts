@@ -323,7 +323,29 @@ export const startLocalMcpListeners = async (
   const hermesPort = createHermesMcpPort(cp, { onCeoApproved: options.onCeoApproved });
   const ctoPort = createCtoMcpPort(cp);
   const ceoConversation = options.ceoConversation ?? new CeoConversationPort();
-  const ctoConversation = new RoleConversationPort(Role.PRIMARY_CTO, cp.bindings);
+  /*
+   * The registry view the CTO port enumerates its slots from.
+   *
+   * `bindings.bySession` cannot serve here: it selects on the assignment's own session column and
+   * joins nothing, so it answers with the session a binding was *created* for. A conversation that
+   * survives a failover moves to another runtime without rewriting that column, which makes the
+   * historical answer wrong in both directions — it lists roles the session has lost and omits
+   * roles it has gained. `activePrimaryCto` resolves the live runtime through the actor, so the
+   * question asked here is "which projects is this runtime the CTO of, right now".
+   */
+  const ctoConversation = new RoleConversationPort(Role.PRIMARY_CTO, {
+    active: (roleKey) => cp.bindings.active(roleKey),
+    currentFor: (sessionId, sessionIncarnation) =>
+      cp.projects
+        .list()
+        .map((project) => cp.bindings.activePrimaryCto(project.projectId))
+        .filter(
+          (binding): binding is NonNullable<typeof binding> =>
+            binding !== null &&
+            binding.sessionId === sessionId &&
+            binding.sessionIncarnation === sessionIncarnation,
+        ),
+  });
   const hermes = await startMcpSocket(
     hermesPath,
     token,
@@ -360,15 +382,11 @@ export const startLocalMcpListeners = async (
         // there is nothing for it to be the target of.
         if (opening.kind === "BOUND") {
           // The credential authenticated a *session*; admission then picked one of its bindings to
-          // admit the connection under. Which one it picked must not decide which roles the
-          // connection can receive for, so the slots come from the registry rather than from that
-          // choice. `bySession` returns every assignment the session has ever held; the port keeps
-          // only the ones it is currently the holder of, for the role it serves.
-          server.server.onclose = ctoConversation.attach(
-            cp.bindings.bySession(opening.binding.sessionId),
-            server,
-            auth,
-          );
+          // admit the connection under. Which one it picked decides nothing here — the port asks
+          // the registry which roles this authenticated runtime currently holds. `opening.binding`
+          // is deliberately not passed: making a sibling slot's eligibility depend on whichever
+          // binding admission happened to choose is how a role becomes unreachable.
+          server.server.onclose = ctoConversation.attach(server, auth);
         }
         return server;
       },
