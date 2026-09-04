@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import { defaultConfig, ControlPlane } from "../../src/app/control-plane.ts";
 import { defaultBackupDirectory, restoreDatabase } from "../../src/db/backup.ts";
 import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
+import { approveMigration } from "../../src/db/migration-approval.ts";
 import {
   installMigrationLedger,
   MIGRATIONS,
@@ -317,6 +318,10 @@ const asV11Fixture = (path: string, seed = false): ReturnType<typeof history> | 
     const result = seed ? history(raw) : undefined;
     raw.close();
     asPrivateStateFile(path);
+    // #738 — a database at an older version does not migrate itself any more. A fixture that
+    // means "this is what an older deployed build left behind" now has to say so the way the
+    // owner does, so these tests exercise the approved path rather than a bypass of it.
+    approveMigration(path, "database-migration-restore fixture");
     return result;
   } finally {
     try { raw.close(); } catch { /* already closed on the success path */ }
@@ -353,6 +358,7 @@ const asV14Fixture = (path: string): void => {
     // umask and 0644 under CI's 022, and production is right to refuse the second one.
     asPrivateStateFile(path);
   }
+  approveMigration(path, "database-migration-restore fixture");
 };
 
 /** Builds the immediately previous release boundary without copying current migration internals. */
@@ -410,6 +416,7 @@ const asV33Fixture = (path: string): void => {
     raw.close();
     asPrivateStateFile(path);
   }
+  approveMigration(path, "database-migration-restore fixture");
 };
 
 /**
@@ -460,6 +467,9 @@ const asV34Fixture = (path: string, options: { unresolvedTurn?: boolean } = {}):
     raw.close();
     asPrivateStateFile(path);
   }
+  // #747 — this fixture represents an older deployed database; make the owner approval that
+  // authorises its v34→v35 migration explicit, as every other pre-current fixture does.
+  approveMigration(path, "database-migration-restore fixture");
 };
 
 type V35ReceiptIdentityFixture = {
@@ -638,6 +648,11 @@ const asV35IngressClaimFixture = (
   } finally {
     raw.close();
     asPrivateStateFile(path);
+    // #747 — a v35 file is a pre-current deployed database, and opening it migrates. The owner
+    // approval that authorises v35→v36 is explicit here for the same reason it is on every
+    // other pre-current fixture: without it these cases would measure the approval gate rather
+    // than the backfill they are about.
+    approveMigration(path, "database-migration-restore fixture");
   }
 };
 
@@ -1318,6 +1333,13 @@ describe("versioned SQLite migration", () => {
     } finally {
       raw.close();
     }
+    // #747 — the rollback links a staged image into place, so the restored database is a new
+    // inode and the approval that authorised the failed attempt no longer names it. Retrying
+    // therefore needs a fresh decision, which is the right contract: a chain that failed partway
+    // is exactly when a restart must not silently try again. Before this, the surviving approval
+    // re-armed the same failing migration for the supervisor's next restart, every 30 seconds.
+    expect(() => new Db(path)).toThrowError(/for a different database than the one being opened/);
+    approveMigration(path, "database-migration-restore fixture");
     const recovered = new Db(path);
     try {
       expect(history(recovered)).toEqual(before);

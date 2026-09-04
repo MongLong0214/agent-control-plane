@@ -16,14 +16,23 @@ import {
   type HermesBootstrapAuthority,
 } from "../bootstrap/hermes-bootstrap.ts";
 import { BuzzAdapter, BuzzCliTransport } from "../buzz/buzz-adapter.ts";
+import type { OwnerIdentity } from "../ceo/owner-authority.ts";
 import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { recordMigrationRefusal } from "../db/migration-approval.ts";
 import {
   BuzzActorIngress,
   IngressGuard,
   isTransportRetentionUnknown,
   type IngressPolicy,
 } from "../ingress/ingress-guard.ts";
+import {
+  BuzzMessageIngress,
+  deliverBuzzMessageToCeo,
+  type BuzzMessageIngressInput,
+  type BuzzMessageTurnPort,
+  type CeoTurnDelivery,
+} from "../ingress/buzz-message.ts";
 import {
   configuredTelegramLongPollConfig,
   startTelegramLongPollListener,
@@ -137,6 +146,12 @@ export interface LocalSessionLaunchChannel {
 
 /** A daemon-owned local hop from the authenticated Buzz relay to SessionRegistry. */
 export interface LocalBuzzActorIngress {
+  socketPath: string;
+  close(): Promise<void>;
+}
+
+/** A daemon-owned local hop from the authenticated Buzz relay to the CEO conversation port. */
+export interface LocalBuzzMessageIngress {
   socketPath: string;
   close(): Promise<void>;
 }
@@ -372,6 +387,78 @@ export const startBuzzActorIngressListener = async (
   const socketPath = join(stateDir, "buzz-actor.ingress.sock");
   removeStaleSocket(socketPath);
   const server = createServer((socket) => serveBuzzActorBinding(socket, ingress));
+
+  try {
+    await listenSocket(server, socketPath);
+  } catch (err) {
+    if (existsSync(socketPath)) unlinkSync(socketPath);
+    throw err;
+  }
+
+  return {
+    socketPath,
+    close: async () => {
+      await closeSocketServer(server);
+      try {
+        if (existsSync(socketPath)) unlinkSync(socketPath);
+      } catch {
+        /* closing the server already releases its socket; this is only cleanup */
+      }
+    },
+  };
+};
+
+/**
+ * §6.1 DIRECT for the Buzz surface: an owner's message becomes one turn for the session that
+ * currently holds the CEO binding, and the CEO's answer goes back to the relay that sent it.
+ *
+ * **Its own socket, beside `buzz-actor.ingress.sock` rather than on it.** The three reasons are
+ * not stylistic:
+ *
+ *   - The binding socket's protocol has no method field. It reads one envelope per connection
+ *     and dispatches it to `bindActor` by field presence alone, and its answer is a
+ *     `Decision<SessionRecord>` with no payload. Multiplexing a second request type onto it
+ *     would mean inventing a discriminator on a wire that has none, and a malformed envelope of
+ *     either kind could then be parsed as the other.
+ *   - `BuzzActorIngress.bindActor` is the only production writer of `sessions.buzz_actor_id`
+ *     and requires the local session secret to prove possession. Nothing on the message path
+ *     needs that authority, and separate sockets mean it cannot reach it even by accident: the
+ *     parse boundary and the authority boundary are the same boundary.
+ *   - Their dependencies differ. The binding listener needs only the ingress policy; this one
+ *     is meaningless without the CEO conversation port, which `main` builds later, from the
+ *     MCP listeners.
+ *
+ * A client that connects to the wrong one is refused, never silently served: a message envelope
+ * on the binding socket has no `sessionId`/`sessionSecret` and is refused as incomplete (that is
+ * exactly what #627's base measurement observed), and a binding envelope here has no
+ * `text`/`eventId` and is refused the same way. Neither crosses.
+ */
+export const startBuzzMessageIngressListener = async (
+  cp: ControlPlane,
+  stateDir: string,
+  policy: IngressPolicy,
+  options: { ceoConversation: CeoConversationPort; ownerActors: readonly string[] },
+): Promise<LocalBuzzMessageIngress> => {
+  if (!policy.secret || policy.secret.trim().length === 0) {
+    throw new Error("Buzz message ingress requires a non-empty signing secret");
+  }
+
+  const guard = new IngressGuard(cp.db, cp.clock, cp.audit, { buzz: policy });
+  // `policy.allowedActors` is the relay credential's list and admits every ACTIVE Buzz channel
+  // identity; `ownerActors` is who may speak to the CEO as the owner. Passing the first for the
+  // second is the defect this argument exists to make impossible to write by accident.
+  const ingress = new BuzzMessageIngress(guard, options.ownerActors);
+  const port: BuzzMessageTurnPort = {
+    deliverToCeo: (text) => deliverAsCeoTurn(options.ceoConversation, text),
+    // Read at claim time, from the binding registry rather than from the peer: the fence is
+    // "which CEO generation was this turn claimed under", and the peer cannot be its own
+    // authority for that. Telegram's production composition still passes none (#639's seam is
+    // unwired there), so this is the first path that records a real generation on a claim.
+    bindingGeneration: () => cp.bindings.active(roleKeyFor(Role.CEO))?.bindingGeneration ?? null,
+  };
+  const socketPath = join(stateDir, "buzz-message.ingress.sock");
+  removeStaleSocket(socketPath);
+  const server = createServer((socket) => serveBuzzMessageTurn(socket, ingress, port));
 
   try {
     await listenSocket(server, socketPath);
@@ -816,6 +903,124 @@ const presentedBuzzActorBinding = (value: unknown): {
   return { actor, sessionId, sessionSecret, nonce, signature: signature ?? null };
 };
 
+/**
+ * One Buzz message per connection, answered on the same connection.
+ *
+ * The connection is held for the length of the CEO turn rather than acknowledged and forgotten,
+ * because the relay is the thing that owns the Buzz thread: the answer has to go back where the
+ * question came from (SSOT §126–127), and this is the only handle on that thread. A message that
+ * never completes its first line inside the handshake budget is refused, so a peer that connects
+ * and says nothing cannot hold a slot open.
+ */
+const serveBuzzMessageTurn = (
+  socket: Socket,
+  ingress: BuzzMessageIngress,
+  port: BuzzMessageTurnPort,
+): void => {
+  let buffer = Buffer.alloc(0);
+  let settled = false;
+  const envelopeDeadline = setTimeout(() => {
+    finish(deny(ReasonCode.INVALID_ARGUMENT, "Buzz message ingress received no complete envelope"));
+  }, DEFAULT_MCP_HANDSHAKE_TIMEOUT_MS);
+  envelopeDeadline.unref();
+  function finish(decision: Decision<unknown>): void {
+    if (settled) return;
+    settled = true;
+    clearTimeout(envelopeDeadline);
+    socket.removeListener("data", receive);
+    endWithBuzzMessage(socket, decision);
+  }
+  const receive = (chunk: Buffer): void => {
+    buffer = Buffer.concat([buffer, chunk]);
+    if (buffer.length > MAX_MCP_LINE_BYTES) {
+      return finish(deny(ReasonCode.INVALID_ARGUMENT, "Buzz message exceeds local transport limit"));
+    }
+    const boundary = buffer.indexOf(0x0a);
+    if (boundary === -1) return;
+    const line = buffer.subarray(0, boundary).toString("utf8");
+    if (buffer.subarray(boundary + 1).length > 0) {
+      return finish(deny(ReasonCode.INVALID_ARGUMENT, "Buzz message ingress accepts one envelope per connection"));
+    }
+    // Stop reading before the turn starts. A second envelope arriving while the CEO is
+    // answering would otherwise re-enter this handler on the same connection.
+    socket.removeListener("data", receive);
+    clearTimeout(envelopeDeadline);
+    let value: unknown;
+    try {
+      value = JSON.parse(line) as unknown;
+    } catch {
+      return finish(deny(ReasonCode.INVALID_ARGUMENT, "Buzz message ingress message is not JSON"));
+    }
+    const input = presentedBuzzMessage(value);
+    if (!input) {
+      return finish(deny(ReasonCode.INVALID_ARGUMENT, "Buzz message ingress message is incomplete"));
+    }
+    void deliverBuzzMessageToCeo(ingress, port, input).then(
+      (decision) => finish(decision),
+      (error: unknown) => finish(deny(
+        ReasonCode.INTERNAL_ERROR,
+        error instanceof Error ? error.message : String(error),
+      )),
+    );
+  };
+  socket.on("data", receive);
+  socket.once("error", () => {
+    settled = true;
+    clearTimeout(envelopeDeadline);
+    socket.removeListener("data", receive);
+  });
+};
+
+/**
+ * Like `endWithDecision`, except the value crosses.
+ *
+ * That function keeps values local because the things it answers with are credentials. Here the
+ * value is the CEO's answer to the owner, and the relay cannot post it to the Buzz thread
+ * without receiving it — a reply that stays inside the daemon is the silence this path exists
+ * to end.
+ */
+const endWithBuzzMessage = (socket: Socket, decision: Decision<unknown>): void => {
+  const answer = decision.allowed ? (decision.value as { answer?: unknown; answeredByCeo?: unknown }) : null;
+  const body = decision.allowed
+    ? {
+        ok: true,
+        reasonCode: decision.reasonCode,
+        answer: typeof answer?.answer === "string" ? answer.answer : null,
+        answeredByCeo: answer?.answeredByCeo === true,
+        evidence: decision.evidence,
+      }
+    : {
+        ok: false,
+        reasonCode: decision.reasonCode,
+        message: decision.message,
+        evidence: decision.evidence,
+      };
+  if (!socket.destroyed) socket.end(`${JSON.stringify(body)}\n`);
+};
+
+const presentedBuzzMessage = (value: unknown): BuzzMessageIngressInput | null => {
+  if (!value || typeof value !== "object") return null;
+  const { actor, conversation, eventId, addressedTo, text, signature } = value as {
+    actor?: unknown;
+    conversation?: unknown;
+    eventId?: unknown;
+    addressedTo?: unknown;
+    text?: unknown;
+    signature?: unknown;
+  };
+  if (
+    typeof actor !== "string" ||
+    typeof conversation !== "string" ||
+    typeof eventId !== "string" ||
+    typeof addressedTo !== "string" ||
+    typeof text !== "string" ||
+    (signature !== undefined && signature !== null && typeof signature !== "string")
+  ) {
+    return null;
+  }
+  return { actor, conversation, eventId, addressedTo, text, signature: signature ?? null };
+};
+
 interface AcceptedConnection {
   transport: SocketTransport;
   credential: PeerCredential;
@@ -1230,6 +1435,30 @@ export const configuredBuzzActorIngressPolicy = (): IngressPolicy | null => {
 };
 
 /**
+ * Which Buzz channel identities may speak to the CEO as the owner.
+ *
+ * Read from `owner-identities` (#245) rather than from `ACP_BUZZ_ALLOWED_ACTORS`, because the
+ * two answer different questions. The environment allowlist is the relay credential's: it says
+ * which channel identities may present an envelope at all, and every ACTIVE Buzz channel
+ * identity the deployment talks to is on it. Owner authority is declared once, on the host, for every
+ * channel — Telegram already refuses to start on an owner id missing from that file — and the
+ * message path takes its owners from the same place.
+ *
+ * An empty result is not a permissive default: `main` leaves the message socket closed and says
+ * so, which is the fail-closed half of the same separation.
+ */
+export const configuredBuzzMessageOwnerActors = (
+  ownerIdentities: readonly OwnerIdentity[],
+): string[] => [
+  ...new Set(
+    ownerIdentities
+      .filter((identity) => identity.channel === "buzz")
+      .map((identity) => identity.actor.trim())
+      .filter((actor) => actor.length > 0),
+  ),
+];
+
+/**
  * The daemon's Telegram composition root. Tests may replace only the external transport; the
  * guard, sealed Hermes port, CEO receipt callback, durable response reader and poll service are
  * still assembled by the same factory `main` uses.
@@ -1378,6 +1607,30 @@ export const answerAsCeo = async (
 };
 
 /**
+ * `answerAsCeo` with the contact boundary kept, which the Buzz path needs and Telegram's
+ * `directHandler` signature cannot carry.
+ *
+ * Whether the request crossed to the CEO peer is not derivable from the reason code — that is
+ * the whole of #652 — and it decides whether the ingress claim closes or stays outstanding. A
+ * string return value throws that fact away, so this returns it beside the text.
+ */
+export const deliverAsCeoTurn = async (
+  port: CeoConversationPort,
+  text: string,
+): Promise<CeoTurnDelivery> => {
+  const outcome = await port.attempt(text);
+  const reachedCeo = outcome.contact === "REACHED";
+  if (outcome.answered.allowed) {
+    return { answer: outcome.answered.value, reachedCeo, reasonCode: ReasonCode.OK };
+  }
+  return {
+    answer: `${ceoUnavailableSentence(outcome.answered.reasonCode)} (${outcome.answered.reasonCode})`,
+    reachedCeo,
+    reasonCode: outcome.answered.reasonCode,
+  };
+};
+
+/**
  * Exported for test: these sentences are the only thing the owner sees when the CEO route
  * refuses, and one of them used to assert something this seam cannot observe. A sentence with no
  * test is a sentence that drifts back.
@@ -1468,6 +1721,12 @@ export interface AgentcpdMainContext {
   cp: ControlPlane;
   daemon: Daemon;
   telegram: TelegramLongPollListener | null;
+  /**
+   * The live CEO conversation port, exposed for the same reason `telegram` is: a composition
+   * test has to be able to stand a peer in front of the surface `main` actually wired, rather
+   * than assert against one it built itself.
+   */
+  ceoConversation: CeoConversationPort | null;
 }
 
 /**
@@ -1505,6 +1764,30 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   const telegramConfig = configuredTelegramLongPollConfig(config.ownerIdentities ?? []);
   const cp = new ControlPlane(config);
 
+  // A migration that ran did so because someone approved it, and the approval names them.
+  // `schema_migrations` records what changed; this records who decided it should (#738).
+  if (cp.db.appliedMigrationApproval !== null) {
+    cp.audit.record({
+      kind: "SCHEMA_MIGRATION_APPROVAL_SPENT",
+      reasonCode: ReasonCode.OK,
+      evidence: {
+        ...cp.db.appliedMigrationApproval,
+        // #747 — filing the approval away can fail after the migration commits, and that no
+        // longer fails the start. This is where the outcome becomes visible rather than lost:
+        // an approval left on disk is inert, but it is not silent.
+        retirement: cp.db.migrationApprovalRetirement,
+      },
+    });
+  }
+  // The repair half: an approval that outlived its own migration, filed away on this open.
+  if (cp.db.staleMigrationApprovalRetirement !== null) {
+    cp.audit.record({
+      kind: "SCHEMA_MIGRATION_APPROVAL_RETIRED_LATE",
+      reasonCode: ReasonCode.OK,
+      evidence: { ...cp.db.staleMigrationApprovalRetirement },
+    });
+  }
+
   let sessionLaunch: LocalSessionLaunchChannel;
   try {
     sessionLaunch = await startSessionLaunchChannel(stateDir);
@@ -1535,6 +1818,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
 
   let listeners: LocalMcpListeners | null = null;
   let buzzActorIngress: LocalBuzzActorIngress | null = null;
+  let buzzMessageIngress: LocalBuzzMessageIngress | null = null;
   let operator: LocalOperatorListener | null = null;
   let hermesBootstrap: HermesBootstrapAuthority | null = null;
   let telegram: TelegramLongPollListener | null = null;
@@ -1550,6 +1834,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     shuttingDown = (async () => {
     process.stdout.write(`\nshutting down on ${signal}\n`);
     await telegram?.close();
+    await buzzMessageIngress?.close();
     await buzzActorIngress?.close();
     await operator?.close();
     await hermesBootstrap?.close();
@@ -1621,6 +1906,23 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     listeners = await startDaemonMcpListeners(cp, stateDir, mcpToken, daemon);
     if (buzzActorIngressPolicy) {
       buzzActorIngress = await startBuzzActorIngressListener(cp, stateDir, buzzActorIngressPolicy);
+      // The receiving half of #627. It opens with the binding half because both are the same
+      // relay credential, and separately from it because they are different authorities — which
+      // is why it needs a second fact the binding half does not: who the owner is. Without a
+      // declared buzz owner the relay credential alone would carry owner authority, so the
+      // socket stays closed and the operator is told which file to declare it in.
+      const buzzMessageOwnerActors = configuredBuzzMessageOwnerActors(config.ownerIdentities ?? []);
+      if (buzzMessageOwnerActors.length === 0) {
+        process.stdout.write(
+          "Buzz message ingress not started: no owner identity with channel \"buzz\" is declared in owner-identities\n",
+        );
+      } else {
+        buzzMessageIngress = await startBuzzMessageIngressListener(cp, stateDir, buzzActorIngressPolicy, {
+          ceoConversation: listeners.ceoConversation,
+          ownerActors: buzzMessageOwnerActors,
+        });
+        process.stdout.write("Buzz message ingress started\n");
+      }
     }
     if (telegramConfig) {
       const telegramStartOptions = options.telegramStartOptions ?? {};
@@ -1650,6 +1952,10 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     }
   } catch (err) {
     await telegram?.close();
+    // Both Buzz listeners, which this teardown used to walk past: a startup that failed after
+    // one of them bound left its socket file behind for the next daemon to find.
+    await buzzMessageIngress?.close();
+    await buzzActorIngress?.close();
     await operator?.close();
     await hermesBootstrap?.close();
     await listeners?.close();
@@ -1661,7 +1967,12 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
 
   process.stdout.write(`${JSON.stringify({ started: started.value }, null, 2)}\n`);
 
-  const context: AgentcpdMainContext = { cp, daemon, telegram };
+  const context: AgentcpdMainContext = {
+    cp,
+    daemon,
+    telegram,
+    ceoConversation: listeners?.ceoConversation ?? null,
+  };
 
   // Keep the process alive; work arrives through authenticated local MCP sockets or timers.
   if (options.waitForShutdown) {
@@ -1681,12 +1992,69 @@ const waitForBackoff = async (seconds: number): Promise<void> => {
   }
 };
 
+/** What a failed start hands to the supervisor, and what it leaves behind for the owner. */
+export interface StartupDisposition {
+  exitCode: number;
+  body: Record<string, unknown>;
+  /** The refusal report's path when one was written, so the stderr line can name it. */
+  reportPath: string | null;
+}
+
+/**
+ * Decides the exit code a failed start gives launchd (#738).
+ *
+ * `KeepAlive { SuccessfulExit = false }` is a conditional: launchd restarts this job when it
+ * exits *un*successfully and leaves it alone when it exits 0. Every failure path here has
+ * always exited 1, which is right for a crash — but a refusal is not a crash. A daemon that
+ * refuses to migrate and exits 1 is restarted 30 seconds later (`ThrottleInterval`), refuses
+ * again, and burns a restart every 30 seconds until someone notices. That is the crash loop
+ * with a nicer message, and `DAEMON_CRASH_LOOP`'s 137 records are what it looks like.
+ *
+ * Exiting 0 is what makes the refusal durable: launchd stops, and the state is exactly one
+ * refusal per boot rather than one every half minute. The cost is that a stopped job is quiet,
+ * so the refusal report and the stderr line below are not decoration — during a refusal there
+ * is no operator socket and no doctor, because both need the `ControlPlane` that could not open
+ * the database. `agentctl daemon status` reads the report offline, which is the one observation
+ * path that survives.
+ *
+ * Nothing else changes: a crash, a doctor block, a bad token still exit 1 and are still
+ * retried.
+ */
+export const dispositionForStartupError = (err: unknown, databasePath: string): StartupDisposition => {
+  const body = isAcpError(err)
+    ? { reasonCode: err.reasonCode, message: err.message, evidence: err.evidence }
+    : { message: (err as Error).message, stack: (err as Error).stack };
+  if (!isAcpError(err) || err.reasonCode !== ReasonCode.SCHEMA_MIGRATION_NOT_APPROVED) {
+    return { exitCode: 1, body, reportPath: null };
+  }
+  const report = { refusedAt: new Date().toISOString(), pid: process.pid, ...body };
+  let reportPath: string | null = null;
+  try {
+    reportPath = recordMigrationRefusal(databasePath, report);
+  } catch (writeError) {
+    // A state directory this process cannot write is a different fault, and it must not turn a
+    // decided refusal back into a restart loop. The stderr line still carries the whole plan.
+    process.stderr.write(
+      `${JSON.stringify({ migrationRefusalReportUnwritable: String(writeError) }, null, 2)}\n`,
+    );
+  }
+  return { exitCode: 0, body: report, reportPath };
+};
+
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
   void main().catch((err: unknown) => {
-    const body = isAcpError(err)
-      ? { reasonCode: err.reasonCode, message: err.message, evidence: err.evidence }
-      : { message: (err as Error).message, stack: (err as Error).stack };
-    process.stderr.write(`${JSON.stringify(body, null, 2)}\n`);
-    process.exit(1);
+    const disposition = dispositionForStartupError(err, defaultConfig().databasePath);
+    process.stderr.write(`${JSON.stringify(disposition.body, null, 2)}\n`);
+    if (disposition.exitCode === 0) {
+      process.stderr.write(
+        "agentcpd refused to start: this build would migrate the live database and no approval " +
+          "names that migration. The daemon is stopped and will not be restarted by launchd " +
+          "until it is started again.\n" +
+          (disposition.reportPath === null ? "" : `Refusal report: ${disposition.reportPath}\n`) +
+          "Approve with: agentcpd-state approve-migration --approved-by <who> --confirm-migration\n" +
+          "Inspect without approving: agentcpd-state migration-plan\n",
+      );
+    }
+    process.exit(disposition.exitCode);
   });
 }
