@@ -519,6 +519,10 @@ const buzzMentionRouter = (cp: ControlPlane): BuzzMentionRouter => ({
         // and the registry answers it; putting them on the relay's side of this boundary would
         // tell an unaddressed sender the deployment's role topology.
         candidates: record.candidates.length,
+        // Which of the five failures this was. A bare count of unbound events cannot separate
+        // "the relay stopped attaching tags" from "this runtime is the CTO of two projects", and
+        // those are different repairs.
+        shape: record.shape,
       },
     });
   },
@@ -609,6 +613,34 @@ export const startBuzzMessageIngressListener = async (
     },
   };
 };
+
+/**
+ * Main's own Buzz message composition: the listeners it just built, wired to the ingress.
+ *
+ * A named function rather than an object literal inside `main` because the one line that matters
+ * here — which port a role-addressed event is delivered through — was otherwise unreachable by
+ * any test. `main` runs a daemon, so a row that exercised it would have to stand one up; a row
+ * that skipped it and passed its own port measured the port and not the wiring, and deleting the
+ * production line left it green. This is the seam that makes the wiring falsifiable: a caller
+ * hands over the real `LocalMcpListeners` and gets back the same ingress `main` gets.
+ *
+ * `startDaemonMcpListeners` sits beside `startLocalMcpListeners` for the same reason.
+ */
+export const startDaemonBuzzMessageIngress = (
+  cp: ControlPlane,
+  stateDir: string,
+  policy: IngressPolicy,
+  listeners: Pick<LocalMcpListeners, "ceoConversation" | "ctoConversation">,
+  ownerActors: readonly string[],
+): Promise<LocalBuzzMessageIngress> =>
+  startBuzzMessageIngressListener(cp, stateDir, policy, {
+    ceoConversation: listeners.ceoConversation,
+    ownerActors,
+    // The other half of #760 B4: a `p` tag that resolves to the CTO has somewhere to go. Without
+    // this line resolution still happens and every role delivery refuses with ROLE_PEER_ABSENT,
+    // which is the state that had a person carrying messages between the two roles.
+    roleConversation: listeners.ctoConversation,
+  });
 
 /**
  * The operator surface is deliberately a one-request protocol rather than a general RPC
@@ -1152,10 +1184,11 @@ const presentedBuzzMessage = (value: unknown): BuzzMessageIngressInput | null =>
     typeof conversation !== "string" ||
     typeof eventId !== "string" ||
     typeof addressedTo !== "string" ||
-    // A `p` tag of the wrong shape is refused here rather than resolved: an envelope carrying a
-    // number or an array where a pubkey belongs has no address, and reading one out of it would
-    // be this parser guessing at a recipient.
-    (mention !== undefined && mention !== null && typeof mention !== "string") ||
+    // `mention` is deliberately not type-checked here. It is inside the signature, so it has to
+    // reach `buzzMessagePayload` byte-identical to what the relay sent; rejecting a number or an
+    // object at the parser would refuse the envelope before anything had authenticated its
+    // sender, and would report a bad *address* as a malformed *message*. A tag of the wrong
+    // shape is admitted as data and refused as an address, with the journal row that owes.
     typeof text !== "string" ||
     (signature !== undefined && signature !== null && typeof signature !== "string")
   ) {
@@ -2209,14 +2242,13 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
           "Buzz message ingress not started: no owner identity with channel \"buzz\" is declared in owner-identities\n",
         );
       } else {
-        buzzMessageIngress = await startBuzzMessageIngressListener(cp, stateDir, buzzActorIngressPolicy, {
-          ceoConversation: listeners.ceoConversation,
-          ownerActors: buzzMessageOwnerActors,
-          // The other half of #760 B4: a `p` tag that resolves to the CTO has somewhere to go.
-          // Without this line the resolution still happens and every delivery refuses, which is
-          // the state that had a person carrying messages between the two roles.
-          roleConversation: listeners.ctoConversation,
-        });
+        buzzMessageIngress = await startDaemonBuzzMessageIngress(
+          cp,
+          stateDir,
+          buzzActorIngressPolicy,
+          listeners,
+          buzzMessageOwnerActors,
+        );
         process.stdout.write("Buzz message ingress started\n");
       }
     }
