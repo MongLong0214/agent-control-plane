@@ -266,6 +266,297 @@ const live = (sockets: readonly ManualSocket[]): ManualSocket => {
   return socket;
 };
 
+/* ------------------------------------------------------- the production adapter's own fixtures */
+
+/**
+ * A stand-in for Node 22's `globalThis.WebSocket`.
+ *
+ * The rows below are the only ones that exercise `nativeRelaySocketFactory` — every other row
+ * injects its own socket and therefore says nothing at all about the adapter. That gap is exactly
+ * where an abandoned native connection can live: the wrapper's reference is dropped, a reconnect
+ * is scheduled, and the real socket stays open with its listeners still attached.
+ *
+ * So this fake counts the two things the wrapper cannot fake away — how many times `close()` was
+ * called on the underlying socket, and how many listeners are still registered on it — and hands
+ * back the listener functions themselves, so a row can call a *stale* one after retirement.
+ */
+interface FakeWebSocketRecord {
+  url: string;
+  sent: string[];
+  closeCalls: number;
+  listenerCount: () => number;
+  emit: (type: string, event?: { data?: unknown }) => void;
+  /** The listener functions as they were registered, kept even after they are removed. */
+  captured: (type: string) => ((event: { data?: unknown }) => void)[];
+}
+
+const installFakeWebSocket = (): { sockets: FakeWebSocketRecord[]; restore: () => void } => {
+  const sockets: FakeWebSocketRecord[] = [];
+  type Listener = (event: { data?: unknown }) => void;
+
+  class FakeWebSocket {
+    readonly #live = new Map<string, Listener[]>();
+    readonly #everRegistered = new Map<string, Listener[]>();
+    readonly #record: FakeWebSocketRecord;
+
+    constructor(url: string) {
+      this.#record = {
+        url,
+        sent: [],
+        closeCalls: 0,
+        listenerCount: () => [...this.#live.values()].reduce((total, list) => total + list.length, 0),
+        emit: (type, event) => {
+          for (const listener of [...(this.#live.get(type) ?? [])]) listener(event ?? {});
+        },
+        captured: (type) => [...(this.#everRegistered.get(type) ?? [])],
+      };
+      sockets.push(this.#record);
+    }
+
+    send(data: string): void {
+      this.#record.sent.push(data);
+    }
+
+    close(): void {
+      this.#record.closeCalls += 1;
+    }
+
+    addEventListener(type: string, listener: Listener): void {
+      this.#live.set(type, [...(this.#live.get(type) ?? []), listener]);
+      this.#everRegistered.set(type, [...(this.#everRegistered.get(type) ?? []), listener]);
+    }
+
+    removeEventListener(type: string, listener: Listener): void {
+      this.#live.set(
+        type,
+        (this.#live.get(type) ?? []).filter((registered) => registered !== listener),
+      );
+    }
+  }
+
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "WebSocket");
+  Object.defineProperty(globalThis, "WebSocket", {
+    value: FakeWebSocket,
+    configurable: true,
+    writable: true,
+  });
+  return {
+    sockets,
+    restore: () => {
+      if (previous) Object.defineProperty(globalThis, "WebSocket", previous);
+      else delete (globalThis as { WebSocket?: unknown }).WebSocket;
+    },
+  };
+};
+
+/** A subscriber on the **production** adapter: no `openSocket` is injected, only the clock. */
+const startOnNativeAdapter = (): {
+  owner: Identity;
+  identity: Identity;
+  sink: RecordingSink;
+  clock: VirtualClock;
+  handle: BuzzMentionSubscriberHandle;
+} => {
+  const stateDir = tempDir("acp-buzz-native-");
+  const keys = tempDir("acp-buzz-native-keys-");
+  const identity = hexIdentity(keys, "cto.key");
+  const owner = hexIdentity(keys, "owner.key");
+  writeConfig(stateDir, configFor([{ keyFile: identity.keyFile, encoding: "hex" }]));
+  const sink = recordingSink("DURABLE");
+  const clock = virtualClock();
+  const handle = startBuzzMentionSubscriberFromStateDir(stateDir, {
+    registry: registryHolding({
+      [identity.pubkey]: { roleKey: ROLE_KEY, buzzActorId: identity.pubkey },
+    }),
+    sink,
+    scheduler: clock.scheduler,
+  });
+  return { owner, identity, sink, clock, handle };
+};
+
+/** NIP-42 over the fake native socket; answers with the subscription id the relay must use. */
+const authenticateNative = async (
+  socket: FakeWebSocketRecord,
+  handle: BuzzMentionSubscriberHandle,
+): Promise<string> => {
+  socket.emit("message", { data: frame(["AUTH", "native-challenge"]) });
+  await handle.settled();
+  const auth = JSON.parse(socket.sent.at(-1) ?? "[]") as [string, { id: string }];
+  expect(auth[0]).toBe("AUTH");
+  socket.emit("message", { data: frame(["OK", auth[1].id, true, ""]) });
+  await handle.settled();
+  const req = socket.sent.map((raw) => JSON.parse(raw) as unknown[]).find((sent) => sent[0] === "REQ");
+  if (!req) throw new Error("the subscriber sent no REQ over the native adapter");
+  return req[1] as string;
+};
+
+/* ====================================================================== production adapter rows */
+
+describe("the buzz mention subscriber's native WebSocket adapter", () => {
+  /**
+   * The whole of the defect this row exists for: a binary frame and an error both mean "this
+   * connection is over", and both used to tell the subscriber so **without closing the socket**.
+   * The wrapper's reference was dropped, a reconnect was scheduled, and the real connection stayed
+   * open with four live listeners — so a replacement could coexist with an abandoned peer that
+   * could still deliver into shared state.
+   */
+  it("closes the underlying socket exactly once on a binary frame, and once on an error", async () => {
+    const fake = installFakeWebSocket();
+    try {
+      const { handle, clock } = startOnNativeAdapter();
+      try {
+        expect(fake.sockets).toHaveLength(1);
+        const first = fake.sockets[0]!;
+        expect(first.listenerCount()).toBe(4);
+
+        // A binary frame is not a Nostr message. It retires the connection.
+        first.emit("message", { data: new Uint8Array([1, 2, 3]) });
+        await handle.settled();
+        expect(first.closeCalls).toBe(1);
+        expect(first.listenerCount()).toBe(0);
+        expect(clock.pending()).toBe(1);
+
+        // Idempotent: a second binary frame through what is left of it changes nothing, and does
+        // not schedule a second reconnect.
+        first.emit("message", { data: new Uint8Array([4]) });
+        expect(first.closeCalls).toBe(1);
+        expect(clock.pending()).toBe(1);
+
+        clock.fireAll();
+        expect(fake.sockets).toHaveLength(2);
+        const second = fake.sockets[1]!;
+        // Exactly one live connection. The abandoned one is closed and deaf.
+        expect(second.listenerCount()).toBe(4);
+        expect(first.listenerCount()).toBe(0);
+        expect(first.closeCalls).toBe(1);
+
+        second.emit("error");
+        await handle.settled();
+        expect(second.closeCalls).toBe(1);
+        expect(second.listenerCount()).toBe(0);
+        expect(clock.pending()).toBe(1);
+      } finally {
+        handle.close();
+      }
+    } finally {
+      fake.restore();
+    }
+  });
+
+  /**
+   * Retiring the listeners is not enough on its own.
+   *
+   * A frame that was already on the queue when its connection was retired has passed the point
+   * where removing a listener helps — it is going to run, and without a fence it would run against
+   * whatever connection happens to be current by then. So the connection has a generation, and a
+   * frame carries the generation it arrived on.
+   */
+  it("lets neither a captured stale listener nor an already-queued stale frame reach the replacement", async () => {
+    const fake = installFakeWebSocket();
+    try {
+      const { handle, clock, sink, identity, owner } = startOnNativeAdapter();
+      try {
+        const first = fake.sockets[0]!;
+        const subId = await authenticateNative(first, handle);
+        const staleMessage = first.captured("message");
+        const staleOpen = first.captured("open");
+        expect(staleMessage).toHaveLength(1);
+        expect(staleOpen).toHaveLength(1);
+
+        const event = mentionEvent({
+          author: owner.secretKey,
+          addressedTo: identity.pubkey,
+          createdAt: 1_800_009_000,
+        });
+
+        // In flight: three frames are handed over and the connection dies before the queue drains.
+        //
+        // The `EVENT` is the weakest of the three and is here only for completeness: `#onEvent`
+        // refuses it for being unsubscribed anyway, because the queue is serial and a
+        // replacement's own AUTH can never overtake a frame already ahead of it. Measured — with
+        // the generation fence deleted this line still passes, so it is not what proves the fence.
+        //
+        // The other two are. A stale `AUTH` reaches `this.#socket?.send`, which by then is the
+        // *replacement's* socket, so without the fence the new connection is handed an AUTH it
+        // was never challenged for. A stale malformed frame reaches `#reconnect()`, which tears
+        // down the replacement and opens a third socket. Neither goes anywhere near `#subscribed`.
+        first.emit("message", { data: frame(["EVENT", subId, event]) });
+        first.emit("message", { data: frame(["AUTH", "stale-queued-challenge"]) });
+        first.emit("message", { data: "}{" });
+        first.emit("error");
+        clock.fireAll();
+        const second = fake.sockets[1]!;
+        await handle.settled();
+
+        // Every one of the three belonged to a connection that no longer exists.
+        expect(sink.admitted).toEqual([]);
+        expect(second.sent).toEqual([]);
+        // The replacement was not torn down by the stale malformed frame, and no third socket
+        // was opened behind it.
+        expect(second.closeCalls).toBe(0);
+        expect(second.listenerCount()).toBe(4);
+        expect(fake.sockets).toHaveLength(2);
+        expect(clock.pending()).toBe(0);
+
+        // And the listener objects a leak would have left behind are inert in both directions:
+        // they neither admit, nor write to the socket they came from, nor to the replacement.
+        for (const listener of staleMessage) {
+          listener({ data: frame(["EVENT", subId, event]) });
+          listener({ data: frame(["AUTH", "stale-challenge"]) });
+        }
+        for (const listener of staleOpen) listener({});
+        await handle.settled();
+        expect(sink.admitted).toEqual([]);
+        expect(second.sent).toEqual([]);
+        expect(first.sent.filter((raw) => raw.includes("stale-challenge"))).toEqual([]);
+        expect(first.closeCalls).toBe(1);
+
+        // The replacement is untouched and still works: it authenticates and admits normally.
+        const resumed = await authenticateNative(second, handle);
+        second.emit("message", { data: frame(["EVENT", resumed, event]) });
+        await handle.settled();
+        expect(sink.admitted.map((entry) => entry.eventId)).toEqual([event.id]);
+      } finally {
+        handle.close();
+      }
+    } finally {
+      fake.restore();
+    }
+  });
+
+  it("leaves zero listeners, zero timers and zero live connections when it is closed", async () => {
+    const fake = installFakeWebSocket();
+    try {
+      const { handle, clock } = startOnNativeAdapter();
+      const first = fake.sockets[0]!;
+      await authenticateNative(first, handle);
+      first.emit("error");
+      clock.fireAll();
+      const second = fake.sockets[1]!;
+      await authenticateNative(second, handle);
+
+      handle.close();
+      expect(clock.pending()).toBe(0);
+      for (const socket of fake.sockets) {
+        expect(socket.listenerCount()).toBe(0);
+        // Each was closed exactly once: the first by its error, the second by this close. An
+        // explicit close must not notify, so it must not have scheduled a reconnect either.
+        expect(socket.closeCalls).toBe(1);
+      }
+      expect(fake.sockets).toHaveLength(2);
+
+      // Nothing can wake it afterwards.
+      second.emit("close");
+      second.emit("error");
+      expect(clock.pending()).toBe(0);
+      expect(fake.sockets).toHaveLength(2);
+      expect(second.closeCalls).toBe(1);
+    } finally {
+      fake.restore();
+    }
+  });
+});
+
 /* ================================================================================= config rows */
 
 describe("the buzz mention subscriber's config authority", () => {

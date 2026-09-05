@@ -375,11 +375,20 @@ export interface BuzzSubscriberScheduler {
   clearTimer(handle: number): void;
 }
 
+/** One listener as this adapter registers it, named so it can be taken off again. */
+type RelaySocketListener = (event: { data?: unknown }) => void;
+
 /** The minimum of `WebSocket` this module uses, so nothing here depends on a DOM lib. */
 interface MinimalWebSocket {
   send(data: string): void;
   close(): void;
-  addEventListener(type: string, listener: (event: { data?: unknown }) => void): void;
+  addEventListener(type: string, listener: RelaySocketListener): void;
+  /**
+   * Optional only so a runtime without it cannot crash the daemon at construction. Node 22's
+   * `WebSocket` is an `EventTarget` and has it; the retirement flag below is what makes a
+   * listener inert whether or not this call is available.
+   */
+  removeEventListener?(type: string, listener: RelaySocketListener): void;
 }
 type MinimalWebSocketConstructor = new (url: string) => MinimalWebSocket;
 
@@ -390,6 +399,22 @@ type MinimalWebSocketConstructor = new (url: string) => MinimalWebSocket;
  * reconnect policy and their own subscription bookkeeping — three behaviours this daemon has
  * opinions about and would then be unable to state. What is imported from that package is only
  * the pure functions: the signature scheme, and nothing that opens anything.
+ *
+ * **Every path out of this connection goes through `retire`, and `retire` runs once.**
+ *
+ * The first version of this adapter answered a binary frame and an `error` by calling
+ * `handlers.onClose()` and nothing else. That tells the subscriber the connection is over — it
+ * drops its reference and schedules a reconnect — while the underlying socket is still open with
+ * four anonymous listeners on it, unremovable because nothing kept a reference to them. The
+ * replacement then coexists with an abandoned peer that is still being delivered to, and a late
+ * frame from the dead connection reaches shared state through a wrapper nobody is holding.
+ *
+ * So the three things that end a connection — a binary frame, an error, a remote close — and the
+ * one that ends it deliberately all converge here, and the guard makes the convergence safe:
+ * listeners come off, the socket is closed exactly once, and the subscriber is told at most once.
+ * An explicit `close()` from the wrapper is the one caller that does **not** want the notification:
+ * it is already the subscriber's own doing, and notifying would schedule a reconnect for a
+ * connection the subscriber deliberately ended.
  */
 export const nativeRelaySocketFactory: BuzzRelaySocketFactory = (url, handlers) => {
   const ctor = (globalThis as { WebSocket?: MinimalWebSocketConstructor }).WebSocket;
@@ -397,16 +422,55 @@ export const nativeRelaySocketFactory: BuzzRelaySocketFactory = (url, handlers) 
     throw new Error("this runtime has no global WebSocket; the buzz subscriber requires Node 22 or newer");
   }
   const socket = new ctor(url);
-  socket.addEventListener("open", () => handlers.onOpen());
-  socket.addEventListener("message", (event) => {
-    if (typeof event.data === "string") handlers.onFrame(event.data);
-    else handlers.onClose();
-  });
-  socket.addEventListener("close", () => handlers.onClose());
-  socket.addEventListener("error", () => handlers.onClose());
+  let retired = false;
+
+  // Named, and captured in one list, because "remove every listener" has to be a thing this
+  // function can actually do. An anonymous listener is registered and then unreachable for ever.
+  const onOpen: RelaySocketListener = () => {
+    if (retired) return;
+    handlers.onOpen();
+  };
+  const onMessage: RelaySocketListener = (event) => {
+    if (retired) return;
+    if (typeof event.data === "string") {
+      handlers.onFrame(event.data);
+      return;
+    }
+    // A binary frame is not a Nostr message and this connection is not one this daemon can read.
+    retire(true);
+  };
+  const onRemoteClose: RelaySocketListener = () => retire(true);
+  const onError: RelaySocketListener = () => retire(true);
+
+  const listeners: readonly (readonly [string, RelaySocketListener])[] = [
+    ["open", onOpen],
+    ["message", onMessage],
+    ["close", onRemoteClose],
+    ["error", onError],
+  ];
+
+  function retire(notify: boolean): void {
+    if (retired) return;
+    retired = true;
+    for (const [type, listener] of listeners) socket.removeEventListener?.(type, listener);
+    try {
+      socket.close();
+    } catch {
+      /* a socket already closing by the runtime's own hand is retired either way */
+    }
+    if (notify) handlers.onClose();
+  }
+
+  for (const [type, listener] of listeners) socket.addEventListener(type, listener);
+
   return {
-    send: (frame) => socket.send(frame),
-    close: () => socket.close(),
+    // A send after retirement is a send on a connection this adapter has closed. Dropping it is
+    // the point: the caller holding this wrapper may be a stale one.
+    send: (frame) => {
+      if (retired) return;
+      socket.send(frame);
+    },
+    close: () => retire(false),
   };
 };
 
@@ -546,6 +610,20 @@ class BuzzMentionSubscription {
   readonly #subscriptionId = randomUUID().replace(/-/gu, "");
 
   #socket: BuzzRelaySocket | null = null;
+  /**
+   * Which connection is current, and the fence a queued frame is checked against.
+   *
+   * `0` means there is no live connection. Every other value names exactly one, and a callback
+   * captures the value it was created under.
+   *
+   * Retiring listeners cannot cover this on its own. A frame handed to `onFrame` is put on a
+   * promise queue and runs later; by then its connection may have been retired and replaced, and
+   * removing a listener does nothing about a callback that is already scheduled. Without the
+   * fence such a frame would be parsed, admitted and — on a refusal — would reconnect *the
+   * replacement*, all on behalf of a connection that no longer exists.
+   */
+  #generation = 0;
+  #connections = 0;
   #authEventId: string | null = null;
   #subscribed = false;
   /** The volatile high-water mark. Inclusive: `since` is `>=` on the wire. */
@@ -576,12 +654,20 @@ class BuzzMentionSubscription {
     if (this.#stopped || this.#socket !== null) return;
     this.#authEventId = null;
     this.#subscribed = false;
+    // Claimed before the socket exists, so every callback the factory registers is already fenced
+    // by the time it can fire.
+    const generation = ++this.#connections;
+    this.#generation = generation;
     this.#socket = this.#deps.openSocket(this.#deps.relayUrl, {
       onOpen: () => {
         /* NIP-42 first: nothing is requested until the relay has challenged and accepted us. */
       },
       onFrame: (raw) => {
         this.#queue = this.#queue.then(async () => {
+          // The fence, and it is checked *here* rather than at delivery: this line runs when the
+          // frame reaches the front of the queue, which is the only moment at which "is this
+          // still the connection I arrived on" has a truthful answer.
+          if (this.#stopped || generation !== this.#generation) return;
           try {
             await this.#handleFrame(raw);
           } catch {
@@ -593,7 +679,10 @@ class BuzzMentionSubscription {
           }
         });
       },
-      onClose: () => this.#onClose(),
+      onClose: () => {
+        if (generation !== this.#generation) return;
+        this.#onClose();
+      },
     });
   }
 
@@ -614,8 +703,14 @@ class BuzzMentionSubscription {
   #drop(): void {
     const socket = this.#socket;
     this.#socket = null;
+    // No live connection from here until `open` claims the next generation. Anything still on the
+    // queue from the one just dropped now fails the fence.
+    this.#generation = 0;
     this.#subscribed = false;
     this.#authEventId = null;
+    // The adapter's own retire path: listeners off, socket closed once, and deliberately no
+    // notification back — this drop *is* the subscriber's decision, and being told about it would
+    // schedule a reconnect for a connection the subscriber itself just ended.
     if (socket) socket.close();
   }
 
@@ -628,6 +723,7 @@ class BuzzMentionSubscription {
    */
   #onClose(): void {
     this.#socket = null;
+    this.#generation = 0;
     this.#subscribed = false;
     this.#authEventId = null;
     if (this.#stopped || this.#timer !== null) return;
