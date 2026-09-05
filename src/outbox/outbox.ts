@@ -10,6 +10,7 @@ import type { Db } from "../db/database.ts";
 import { FailureClass as FailureClassCode, type FailureClass } from "../domain/types.ts";
 import {
   type FencedEnvelope,
+  HOLDER_CLAIMED_KINDS,
   MessageKind,
   RETARGETABLE_KINDS,
   payloadDigestOf,
@@ -43,6 +44,60 @@ export interface OutboxMessage extends FencedEnvelope {
   createdAt: string;
 }
 
+/**
+ * Who is claiming — every field read from the authenticated connection, none from the row.
+ *
+ * `sessionIncarnation` is the field that makes this an identity rather than an address. The other
+ * three are already on the outbox row, so a predicate built from them alone can be satisfied by
+ * any runtime that happens to occupy the same binding; the incarnation is what a respawn changes.
+ */
+export interface HolderIdentity {
+  roleKey: string;
+  bindingGeneration: number;
+  targetSessionId: string;
+  sessionIncarnation: string;
+}
+
+/**
+ * A message handed over to a previous holder whose outcome was never recorded.
+ *
+ * **There is deliberately no `payload` field.** "Never the payload twice" is enforced by this type
+ * having nowhere to put one, rather than by every call site remembering not to. A successor sees
+ * that something was taken and not acknowledged, which is what it needs to reconcile, and learns
+ * nothing about what it said.
+ */
+export interface UnresolvedOwnerMessage {
+  messageId: string;
+  roleKey: string;
+  bindingGeneration: number;
+  targetSessionId: string;
+  kind: MessageKind;
+  payloadDigest: string;
+  sentAt: string | null;
+  attempts: number;
+  createdAt: string;
+}
+
+export interface HolderClaimResult {
+  /**
+   * The row this call moved `PENDING -> SENT`, and the only thing here that carries a payload.
+   *
+   * At most one, and an array rather than a nullable single because the caller's shape should not
+   * have to change if a future kind is drained differently.
+   */
+  claimed: OutboxMessage[];
+  /** Rows already `SENT` and never acknowledged. Metadata only. */
+  unresolved: UnresolvedOwnerMessage[];
+  /**
+   * Whether a claimable message remains that this call did not hand over.
+   *
+   * This is how the holder drains a backlog: it wakes again rather than asking for a batch. It is
+   * also true while `unresolved` is blocking the queue, which is the honest answer — there is work
+   * waiting, and settling the unknown outcome is what releases it.
+   */
+  hasMore: boolean;
+}
+
 export interface DeliveryFailure {
   failureClass: FailureClass;
   retryable: boolean;
@@ -65,6 +120,50 @@ const KNOWN_FAILURE_CLASSES: ReadonlySet<string> = new Set(Object.values(Failure
  * in the delivery predicates as well as enqueue admission; otherwise a valid package can
  * be persisted but can never be claimed or marked SENT.
  */
+/**
+ * The literal list the generic sweep excludes, built from `HOLDER_CLAIMED_KINDS`.
+ *
+ * Derived from the set rather than written out here, so the exclusion cannot drift away from the
+ * set that defines it. Kind strings are module constants, never caller input, so inlining them is
+ * not an injection surface — but the `'` guard is kept because a kind that ever did come from
+ * outside would otherwise turn this into one silently.
+ */
+const HOLDER_CLAIMED_KIND_SQL = [...HOLDER_CLAIMED_KINDS]
+  .map((kind) => `'${kind.replace(/'/g, "''")}'`)
+  .join(", ");
+
+/**
+ * The exact holder, down to the incarnation — the predicate the owner-message lifecycle uses.
+ *
+ * `liveDeliveryTarget` below asks whether *a* live session holds this role generation. That is the
+ * right question for an outward delivery and the wrong one here: a session that was replaced by a
+ * respawn keeps its `session_id` and its generation while becoming a different runtime, and the
+ * conversation an owner's message was addressed to did not survive that. `assignments`
+ * `session_incarnation` is the column that tells the two apart, and it is supplied by the caller
+ * from the authenticated connection rather than read back from the row being claimed — a predicate
+ * that sourced it from the row would compare the database against itself and match always.
+ *
+ * Where the first three values come from is a parameter, and the predicate itself is written once.
+ * `"o"` / `"outbox"` correlate on the outbox row in the statement; `"bound"` takes all four from
+ * the caller, for the replay read-back where there is no outbox row in the statement to correlate
+ * with. A second hand-written spelling of this predicate is how the lifecycle clause went missing
+ * from the replay path in the first place — the two copies drifted, and the drift was invisible
+ * until it was a STOPPED session being told its settle succeeded.
+ */
+const exactHolderTarget = (source: "o" | "outbox" | "bound"): string => {
+  const from = (column: string): string => (source === "bound" ? "?" : `${source}.${column}`);
+  return `EXISTS (
+  SELECT 1 FROM assignments a
+    JOIN sessions s ON s.session_id = a.session_id
+   WHERE a.role_key = ${from("role_key")}
+     AND a.binding_generation = ${from("binding_generation")}
+     AND a.session_id = ${from("target_session_id")}
+     AND a.session_incarnation = ?
+     AND a.status = 'ACTIVE'
+     AND s.lifecycle IN ('READY','DRAINING')
+)`;
+};
+
 const liveDeliveryTarget = (outboxAlias: "o" | "outbox"): string => `(
   EXISTS (
     SELECT 1 FROM assignments a
@@ -220,6 +319,12 @@ export class Outbox {
       const rows = this.db.all<RawOutbox>(
         `SELECT o.* FROM outbox o
           WHERE o.status = 'PENDING'
+            -- Holder-claimed kinds are invisible to this sweep. BuzzAdapter.deliverPending
+            -- transmits whatever comes back from here to the target's Buzz address, so a row that
+            -- appeared in this result would have its payload sent over a channel that never
+            -- authenticated the holder — the exact disclosure the separate claim path exists to
+            -- prevent. The holder takes these through claimForHolder instead.
+            AND o.kind NOT IN (${HOLDER_CLAIMED_KIND_SQL})
             AND o.expires_at > ?
             -- A deferred retry is not deliverable until its window opens; the deferral is
             -- durable, so a restarted loop honours it instead of retrying immediately.
@@ -248,6 +353,238 @@ export class Outbox {
       }
       return claimed;
     });
+  }
+
+  /**
+   * The holder takes its own owner-messages, over its own authenticated connection.
+   *
+   * Four things make this different from `claimDeliverable`, and each is a place a plausible
+   * implementation is still wrong:
+   *
+   * 1. **An unresolved hand-over stops the queue.** A row already `SENT` is not re-served — its
+   *    outcome is genuinely unknown, because the holder may have received it and died before
+   *    acknowledging — and while one exists this call hands over *nothing new*. Reporting the
+   *    unresolved row beside a fresh payload is the subtly wrong version: it looks like it honours
+   *    "never twice" while giving the holder a second message to lose exactly the same way, and it
+   *    lets an unknown outcome accumulate silently behind newer work. `UnresolvedOwnerMessage` has
+   *    no payload field at all, so "never the payload twice" is a property of the type rather than
+   *    of this method remembering not to fill one in.
+   * 2. **Exactly one message per call, oldest first, and the caller does not choose.** A
+   *    caller-supplied batch size is a caller-supplied blast radius: every row in a batch reaches
+   *    `SENT` before the caller has done anything with any of them, so a holder that asked for
+   *    twenty-five and then died put twenty-five owner-messages into the unknown-outcome path
+   *    instead of one. `hasMore` and another wake drain the rest.
+   * 3. **`PENDING -> SENT` happens before the payload is returned**, in the same transaction and
+   *    conditioned on the row still being `PENDING`. Reading the row and then marking it would
+   *    leave a window where a crash loses the message with no record that it was ever handed over.
+   *    The payload returned is re-read from the row the update actually moved, never from the
+   *    candidate read.
+   * 4. **The compare-and-set carries the caller's whole identity**, rather than standing next to a
+   *    check of it. The candidate read and the write are two statements; binding the write to the
+   *    row id alone trusts that nothing changed in between. See the `UPDATE` below.
+   */
+  claimForHolder(holder: HolderIdentity): HolderClaimResult {
+    return this.db.tx(() => {
+      const now = this.clock.nowIso();
+      const tuple = [
+        holder.roleKey,
+        holder.bindingGeneration,
+        holder.targetSessionId,
+        holder.sessionIncarnation,
+      ];
+
+      // Already handed over and never acknowledged. Read first because its presence decides
+      // whether anything new may move at all.
+      const unresolved = this.db
+        .all<RawOutbox>(
+          `SELECT o.* FROM outbox o
+            WHERE o.kind IN (${HOLDER_CLAIMED_KIND_SQL})
+              AND o.status = 'SENT'
+              AND o.role_key = ? AND o.binding_generation = ? AND o.target_session_id = ?
+              AND ${exactHolderTarget("o")}
+            ORDER BY o.created_at`,
+          tuple,
+        )
+        .map(unresolvedOwnerMessage);
+
+      const queued =
+        this.db.get<{ queued: number }>(
+          `SELECT COUNT(*) AS queued FROM outbox o
+            WHERE o.kind IN (${HOLDER_CLAIMED_KIND_SQL})
+              AND o.status = 'PENDING'
+              AND o.role_key = ? AND o.binding_generation = ? AND o.target_session_id = ?
+              AND ${exactHolderTarget("o")}
+              AND o.expires_at > ?`,
+          [...tuple, now],
+        )?.queued ?? 0;
+
+      // The block. An outstanding unknown outcome is exactly the state in which handing out more
+      // work is wrong, so the holder is told what is unsettled and that work is waiting, and is
+      // given neither payload until it settles the first.
+      if (unresolved.length > 0) return { claimed: [], unresolved, hasMore: queued > 0 };
+
+      const candidate = this.db.get<RawOutbox>(
+        `SELECT o.* FROM outbox o
+          WHERE o.kind IN (${HOLDER_CLAIMED_KIND_SQL})
+            AND o.status = 'PENDING'
+            AND o.role_key = ? AND o.binding_generation = ? AND o.target_session_id = ?
+            AND ${exactHolderTarget("o")}
+            AND o.expires_at > ?
+          ORDER BY o.created_at
+          LIMIT 1`,
+        [...tuple, now],
+      );
+      if (!candidate) return { claimed: [], unresolved, hasMore: false };
+
+      // Compare-and-set, asserting the full caller tuple rather than the row id and a status.
+      // `role_key`, `binding_generation` and `target_session_id` are the caller's values, not the
+      // candidate's, so a row that stopped being this caller's between the read above and this
+      // write changes nothing. Without them the `EXISTS` correlates on the row's own columns and
+      // resolves the *row's* assignment, checking it against the caller's incarnation string —
+      // which matches whenever two runtimes happen to share one, and incarnation strings are
+      // unique only within a session.
+      const moved = this.db.run(
+        `UPDATE outbox SET status = 'SENT', sent_at = ?, attempts = attempts + 1,
+                           claim_token = NULL, claimed_at = NULL,
+                           retry_eligible = 0, next_attempt_at = NULL
+          WHERE message_id = ? AND status = 'PENDING'
+            AND kind IN (${HOLDER_CLAIMED_KIND_SQL})
+            AND role_key = ? AND binding_generation = ? AND target_session_id = ?
+            AND ${exactHolderTarget("outbox")}`,
+        [
+          now,
+          candidate.message_id,
+          holder.roleKey,
+          holder.bindingGeneration,
+          holder.targetSessionId,
+          holder.sessionIncarnation,
+        ],
+      ).changes;
+      if (moved !== 1) return { claimed: [], unresolved, hasMore: queued > 0 };
+
+      // Re-read rather than patching the candidate: the payload handed over is the one on the row
+      // this statement actually moved, and so are the attempts and the hand-over instant.
+      const handed = this.db.get<RawOutbox>(`SELECT * FROM outbox WHERE message_id = ?`, [
+        candidate.message_id,
+      ]);
+      return {
+        claimed: handed ? [hydrate(handed)] : [],
+        unresolved,
+        hasMore: queued > 1,
+      };
+    });
+  }
+
+  /**
+   * The holder records that it took one of its own owner-messages: `SENT -> ACKED`.
+   *
+   * Idempotent on an exact repeat, because the acknowledgement can be lost on the way back and a
+   * holder that retries it is doing the right thing — but only for the same holder. `ACKED` is
+   * re-reported as success; every other terminal state is a collision, because moving `REJECTED`
+   * or `EXPIRED` to `ACKED` would rewrite a decision something else already recorded.
+   */
+  completeForHolder(messageId: string, holder: HolderIdentity): Decision<void> {
+    return this.db.tx(() => {
+      const changes = this.db.run(
+        `UPDATE outbox SET status = 'ACKED', acked_at = ?
+          WHERE message_id = ? AND status = 'SENT'
+            AND kind IN (${HOLDER_CLAIMED_KIND_SQL})
+            AND role_key = ? AND binding_generation = ? AND target_session_id = ?
+            AND ${exactHolderTarget("outbox")}`,
+        [
+          this.clock.nowIso(),
+          messageId,
+          holder.roleKey,
+          holder.bindingGeneration,
+          holder.targetSessionId,
+          holder.sessionIncarnation,
+        ],
+      ).changes;
+      if (changes === 1) return allow(ReasonCode.OK, undefined);
+      return this.holderTerminalReplay(messageId, holder, "ACKED");
+    });
+  }
+
+  /**
+   * The holder refuses one of its own owner-messages: terminal, and exact-holder like the claim.
+   *
+   * Reachable from `SENT` and from `PENDING`: a holder may decline a message it has taken, and the
+   * failover path below may decline one that was never taken. Both end `REJECTED`, which no other
+   * transition here moves out of.
+   */
+  rejectForHolder(messageId: string, holder: HolderIdentity): Decision<void> {
+    return this.db.tx(() => {
+      const changes = this.db.run(
+        `UPDATE outbox SET status = 'REJECTED', reason_code = ?,
+                           claim_token = NULL, claimed_at = NULL,
+                           retry_eligible = 0, next_attempt_at = NULL
+          WHERE message_id = ? AND status IN ('PENDING','SENT')
+            AND kind IN (${HOLDER_CLAIMED_KIND_SQL})
+            AND role_key = ? AND binding_generation = ? AND target_session_id = ?
+            AND ${exactHolderTarget("outbox")}`,
+        [
+          ReasonCode.OUTBOX_DELIVERY_REJECTED,
+          messageId,
+          holder.roleKey,
+          holder.bindingGeneration,
+          holder.targetSessionId,
+          holder.sessionIncarnation,
+        ],
+      ).changes;
+      if (changes === 1) return allow(ReasonCode.OK, undefined);
+      return this.holderTerminalReplay(messageId, holder, "REJECTED");
+    });
+  }
+
+  /**
+   * Why an exact-holder transition changed no row — an idempotent repeat, or a refusal.
+   *
+   * The distinction is the whole point: a holder retrying a lost acknowledgement and a stranger
+   * trying to settle somebody else's message both produce zero changed rows, and answering both
+   * the same way would either turn an ordinary retry into an error or let the stranger's call
+   * report success. So the row is re-read and the holder is checked against it explicitly.
+   *
+   * "The same holder" here is the *same* predicate the claim, complete and reject writes assert —
+   * `exactHolderTarget`, lifecycle join included — and not a second hand-written subquery that
+   * happens to name the same four columns. An assignment-only match is not a live holder: a
+   * `STOPPED` session keeps its `ACTIVE` assignment row, so a predicate that stopped at
+   * `assignments` would hand a settled-successfully verdict to a runtime that is gone, on the one
+   * path that never touches the write it is standing in for.
+   */
+  private holderTerminalReplay(
+    messageId: string,
+    holder: HolderIdentity,
+    want: "ACKED" | "REJECTED",
+  ): Decision<void> {
+    const row = this.db.get<RawOutbox>(`SELECT * FROM outbox WHERE message_id = ?`, [messageId]);
+    if (!row) return deny(ReasonCode.NOT_FOUND, "unknown message", { messageId });
+    const sameHolder =
+      row.role_key === holder.roleKey &&
+      row.binding_generation === holder.bindingGeneration &&
+      row.target_session_id === holder.targetSessionId &&
+      Boolean(
+        this.db.get(`SELECT 1 WHERE ${exactHolderTarget("bound")}`, [
+          holder.roleKey,
+          holder.bindingGeneration,
+          holder.targetSessionId,
+          holder.sessionIncarnation,
+        ]),
+      );
+    if (!sameHolder) {
+      return deny(
+        ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
+        "this holder does not own the message it tried to settle",
+        { messageId, status: row.status },
+      );
+    }
+    if (row.status === want) {
+      return allow(ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED, undefined, { messageId, status: row.status });
+    }
+    return deny(
+      ReasonCode.RESOURCE_COLLISION,
+      `message is ${row.status} and cannot move to ${want}`,
+      { messageId, status: row.status },
+    );
   }
 
   /** A claim whose holder died must return to PENDING rather than stay stuck IN_FLIGHT. */
@@ -481,7 +818,20 @@ export class Outbox {
     const now = this.clock.nowIso();
     const pending = this.db.all<RawOutbox>(
       `SELECT * FROM outbox WHERE role_key = ? AND binding_generation = ?
-        AND status IN ('PENDING','IN_FLIGHT')`,
+        AND (
+          status IN ('PENDING','IN_FLIGHT')
+          -- A holder-claimed row that reached SENT is *also* swept, which no other kind is.
+          --
+          -- For an outward delivery, SENT means "the transport took it" and the row is waiting on
+          -- an ACK that a later generation can still legitimately supply, so sweeping it here
+          -- would fence a delivery that succeeded. For an owner-message, SENT means "the previous
+          -- holder was handed the payload and never acknowledged" — its outcome is unknown and it
+          -- is addressed to a conversation that no longer exists. Leaving it would strand it in a
+          -- state nothing sweeps; retargeting it would replay an owner's message into a runtime it
+          -- was never addressed to. So it is rejected, and the loop below cannot retarget it
+          -- because the kind is absent from RETARGETABLE_KINDS.
+          OR (status = 'SENT' AND kind IN (${HOLDER_CLAIMED_KIND_SQL}))
+        )`,
       [roleKey, fromGeneration],
     );
 
@@ -553,12 +903,27 @@ export class Outbox {
       .map(hydrate);
   }
 
-  /** Fence queued and claimed rows whose binding or target lifecycle is no longer valid. */
+  /**
+   * Fence queued and claimed rows whose binding or target lifecycle is no longer valid.
+   *
+   * A holder-claimed row that reached `SENT` is swept here too, which no other kind is — the same
+   * asymmetry `retargetOrReject` makes, and for the same reason. For an outward delivery `SENT`
+   * means the transport took it and an ACK may still legitimately arrive, so fencing it would
+   * reject a delivery that succeeded. For an owner-message it means the previous holder was handed
+   * the payload and never came back; once its target is no longer live, nothing can ever settle
+   * it. Without this clause a restart strands it exactly there: the new holder cannot claim it
+   * (wrong incarnation), `SessionRegistry`'s own stop-time fence only looks at `PENDING` and
+   * `IN_FLIGHT`, and so the row sits `SENT` forever. The `NOT liveDeliveryTarget` condition is what
+   * keeps this off a live holder's outstanding message, which stays claimable and settleable.
+   */
   fenceUndeliverable(): number {
     return this.db.run(
       `UPDATE outbox SET status = 'REJECTED', reason_code = ?, claim_token = NULL, claimed_at = NULL,
                          retry_eligible = 0, next_attempt_at = NULL
-        WHERE status IN ('PENDING','IN_FLIGHT')
+        WHERE (
+                status IN ('PENDING','IN_FLIGHT')
+                OR (status = 'SENT' AND kind IN (${HOLDER_CLAIMED_KIND_SQL}))
+              )
           AND NOT ${liveDeliveryTarget("outbox")}`,
       [ReasonCode.OUTBOX_STALE_GENERATION_REJECTED],
     ).changes;
@@ -636,7 +1001,24 @@ interface RawOutbox {
   failure_class?: FailureClass | null;
   retry_eligible?: number | null;
   next_attempt_at?: string | null;
+  sent_at?: string | null;
 }
+
+/**
+ * Projects a raw row onto the no-payload shape. `payload_json` is read off the row and simply
+ * never copied — the destination type has no field for it.
+ */
+const unresolvedOwnerMessage = (row: RawOutbox): UnresolvedOwnerMessage => ({
+  messageId: row.message_id,
+  roleKey: row.role_key,
+  bindingGeneration: row.binding_generation,
+  targetSessionId: row.target_session_id,
+  kind: row.kind as MessageKind,
+  payloadDigest: row.payload_digest,
+  sentAt: row.sent_at ?? null,
+  attempts: row.attempts,
+  createdAt: row.created_at,
+});
 
 const hydrate = (row: RawOutbox): OutboxMessage => ({
   messageId: row.message_id,
