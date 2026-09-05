@@ -1,8 +1,11 @@
-import { createConnection, type Socket } from "node:net";
+import { chmodSync, writeFileSync } from "node:fs";
+import { createConnection, createServer, type Server, type Socket } from "node:net";
+import { basename, join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
 import { startLocalMcpListeners } from "../../src/daemon/agentcpd.ts";
+import { C0_QUALIFIED_CLIENT, ROLE_WAKE_FRAME, ROLE_WAKE_TOKEN } from "../../src/mcp/role-conversation.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -65,7 +68,17 @@ interface PeerHandle {
    * Waiting on it is therefore an ordering proof; a sleep is only a guess about scheduling.
    */
   initialized: () => boolean;
+  /** Calls one MCP tool on this connection and returns the body `respond` put in it. */
+  callTool: (name: string, args: Record<string, unknown>) => Promise<ToolBody>;
   close: () => Promise<void>;
+}
+
+/** The `respond` envelope, as a peer reads it back off the wire. */
+interface ToolBody {
+  ok: boolean;
+  reasonCode: string;
+  message?: string;
+  value?: unknown;
 }
 
 /**
@@ -76,9 +89,19 @@ interface PeerHandle {
 const connectPeer = async (
   socketPath: string,
   credential: { token: string; sessionId: string; sessionSecret: string },
+  /**
+   * What this peer says it is at `initialize`.
+   *
+   * A parameter rather than a constant because the wake transport is pinned to one qualified
+   * client build, and a row that could not present an unqualified one could not tell a pin from
+   * an unconditional accept.
+   */
+  clientInfo: { name: string; version: string } = { name: "cto-peer", version: "1" },
 ): Promise<PeerHandle> => {
   const socket = createConnection(socketPath);
   const received: string[] = [];
+  const pending = new Map<number, (body: ToolBody) => void>();
+  let nextId = INITIALIZE_ID + 1;
   let initialized = false;
   await new Promise<void>((resolve, reject) => {
     socket.once("connect", resolve);
@@ -105,6 +128,13 @@ const connectPeer = async (
       }
       if (message.id === INITIALIZE_ID && message.method === undefined && message.result !== undefined) {
         initialized = true;
+        continue;
+      }
+      if (message.method === undefined && message.id !== undefined && pending.has(message.id)) {
+        const settle = pending.get(message.id);
+        pending.delete(message.id);
+        const result = message.result as { structuredContent?: ToolBody } | undefined;
+        settle?.(result?.structuredContent ?? { ok: false, reasonCode: "NO_STRUCTURED_CONTENT" });
         continue;
       }
       if (message.method === "sampling/createMessage" && message.id !== undefined) {
@@ -134,7 +164,7 @@ const connectPeer = async (
         protocolVersion: "2025-11-25",
         // The capability delivery travels on. Without it the port refuses rather than hanging.
         capabilities: { sampling: {} },
-        clientInfo: { name: "cto-peer", version: "1" },
+        clientInfo,
       },
     })}\n${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}\n`,
   );
@@ -143,6 +173,14 @@ const connectPeer = async (
     socket,
     received,
     initialized: () => initialized,
+    callTool: (name, args) =>
+      new Promise<ToolBody>((resolveCall) => {
+        const id = nextId++;
+        pending.set(id, resolveCall);
+        socket.write(
+          `${JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } })}\n`,
+        );
+      }),
     close: () =>
       new Promise<void>((resolve) => {
         if (socket.destroyed) {
@@ -152,6 +190,45 @@ const connectPeer = async (
         socket.once("close", () => resolve());
         socket.destroy();
       }),
+  };
+};
+
+/** What a peer's own wake endpoint is: a listening unix socket, and a record of what arrived. */
+interface EndpointHandle {
+  path: string;
+  received: string[];
+  close: () => Promise<void>;
+}
+
+/**
+ * Stands in for the socket a woken client binds for itself.
+ *
+ * Deliberately **not** chmod'd. The real 2.1.259 runtime binds its own socket under its own umask
+ * and never touches that file's mode — C0 measured it chmod'ing only the containing directory — so
+ * a helper that tightened the socket here would be testing an endpoint no real client produces, and
+ * would have hidden a mode check that rejects every real one. The rows chmod the *directory*
+ * instead, which is where the 0700 boundary actually is.
+ */
+const listeningSocket = async (path: string): Promise<EndpointHandle> => {
+  const received: string[] = [];
+  const server: Server = createServer((socket) => {
+    let text = "";
+    socket.on("data", (chunk: Buffer) => {
+      text += chunk.toString();
+    });
+    socket.on("end", () => received.push(text));
+  });
+  await new Promise<void>((resolveListen, reject) => {
+    server.once("error", reject);
+    server.listen(path, () => {
+      server.removeListener("error", reject);
+      resolveListen();
+    });
+  });
+  return {
+    path,
+    received,
+    close: () => new Promise<void>((resolveClose) => server.close(() => resolveClose())),
   };
 };
 
@@ -664,6 +741,193 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
     } finally {
       for (const peer of opened) await peer.close();
       await listeners.close();
+    }
+  }, 60_000);
+
+  /**
+   * `#760` C0 — the wake endpoint, and the two counterexamples that killed the first attempt at it.
+   *
+   * The first attempt shelled out to `ps` for a pid's argv and read the answer as proof that the
+   * registering process owned the socket. The pid and the argv were both caller-supplied, so it was
+   * proof of nothing; this row is what stands in its place, and every question it asks is one the
+   * daemon answers from the filesystem or from the MCP handshake, never from the caller.
+   *
+   * Four refusals and one acceptance in one row, because the cap for this commit is two rows and
+   * each of these branches is separately mutable — the mutations for this row are run against the
+   * dirname check, the socket-type check and the client pin independently.
+   */
+  it("takes a wake endpoint only where it can establish the path for itself, from a qualified client", async () => {
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const session = readySession(harness, "cto-peer");
+    expect(
+      harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId: session.sessionId, projectId })
+        .reasonCode,
+    ).toBe(ReasonCode.OK);
+    const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+
+    // 0700 by chmod rather than by trusting how the directory was made — mkdir honours umask, and
+    // the parent's mode is the boundary the port actually enforces.
+    const stateDir = tempDir("acp-cto-wake-");
+    chmodSync(stateDir, 0o700);
+    const elsewhere = tempDir("acp-cto-elsewhere-");
+    chmodSync(elsewhere, 0o700);
+    const listeners = await startLocalMcpListeners(harness.cp, stateDir, TOKEN);
+    const ctoSocket = listeners.socketPaths[1];
+    if (!ctoSocket) throw new Error("the CTO MCP listener was not started");
+
+    // Three candidate paths, all of which exist and all of which this uid owns. What separates
+    // them is only what the daemon can establish about them, which is the point: a check that
+    // refused a path because it was missing would not be measuring confinement.
+    const good = await listeningSocket(join(stateDir, "cto.wake.sock"));
+    const outside = await listeningSocket(join(elsewhere, "cto.wake.sock"));
+    const notASocket = join(stateDir, "not-a-socket");
+    writeFileSync(notASocket, "", { mode: 0o600 });
+
+    const qualified = await connectPeer(ctoSocket, { token: TOKEN, ...session }, C0_QUALIFIED_CLIENT);
+    let unqualified: PeerHandle | null = null;
+    try {
+      await until(() => qualified.initialized(), "the qualified peer's attach");
+
+      // Outside the configured directory. `elsewhere` is a 0700 directory this uid owns holding a
+      // socket this uid owns, so every ownership question answers yes and only confinement refuses.
+      const away = await qualified.callTool("role_wake_endpoint_register", { endpoint: outside.path });
+      expect(away.ok).toBe(false);
+      expect(away.reasonCode).toBe(ReasonCode.ROLE_PEER_UNSUPPORTED);
+
+      // A traversal that *resolves* into the state directory is refused too — but by the parent
+      // check above, not by the normalization line that reads as though it owns this case. That
+      // was measured: mutating the normalization condition to `false` left this row green, because
+      // `dirname` of the traversed spelling is a different string from the resolved directory. The
+      // assertion stays because the behaviour matters; the attribution does not, and pretending
+      // this row covers that line would be a coverage claim it cannot support.
+      const traversed = await qualified.callTool("role_wake_endpoint_register", {
+        endpoint: `${stateDir}/../${basename(stateDir)}/cto.wake.sock`,
+      });
+      expect(traversed.ok).toBe(false);
+      expect(traversed.reasonCode).toBe(ReasonCode.ROLE_PEER_UNSUPPORTED);
+
+      // In the right directory, owned by this uid, owner-only — and not a socket.
+      const plainFile = await qualified.callTool("role_wake_endpoint_register", { endpoint: notASocket });
+      expect(plainFile.ok).toBe(false);
+      expect(plainFile.reasonCode).toBe(ReasonCode.ROLE_PEER_UNSUPPORTED);
+
+      const accepted = await qualified.callTool("role_wake_endpoint_register", { endpoint: good.path });
+      expect(accepted.ok).toBe(true);
+      // The connection registered for the slots the *registry* gave it, not for a role it named:
+      // there is no argument in that tool call in which it could have named one.
+      expect(accepted.value).toEqual([roleKey]);
+      expect(listeners.ctoConversation.endpointFor(roleKey)).toBe(good.path);
+
+      // Same session, same socket, same everything except the build it declares at handshake. This
+      // connection replaces the first as the role's peer, so it is the current holder by every
+      // other measure, and the pin is the only thing left to refuse it.
+      unqualified = await connectPeer(ctoSocket, { token: TOKEN, ...session });
+      await until(() => unqualified?.initialized() === true, "the unqualified peer's attach");
+      const unpinned = await unqualified.callTool("role_wake_endpoint_register", { endpoint: good.path });
+      expect(unpinned.ok).toBe(false);
+      expect(unpinned.reasonCode).toBe(ReasonCode.ROLE_PEER_UNSUPPORTED);
+      expect(listeners.ctoConversation.endpointFor(roleKey)).toBeNull();
+    } finally {
+      await qualified.close();
+      if (unqualified) await unqualified.close();
+      await listeners.close();
+      await good.close();
+      await outside.close();
+    }
+  }, 60_000);
+
+  /**
+   * The second counterexample: the first attempt made the endpoint durable, in a table with a
+   * migration. A row there outlives the connection whose existence is the only thing that makes
+   * the endpoint real, so "is this role wakeable" would have had two authorities answering it and
+   * the durable one would have kept saying yes after the answer became no.
+   *
+   * Here the endpoint is a field on the live slot, so `attach`'s own detach takes it — which is
+   * what this row measures, by closing the connection rather than by calling any cleanup. If some
+   * later change gives the endpoint a home that survives the connection, this row goes red without
+   * anyone having to remember why.
+   *
+   * It also measures what the wake carries, which is the reason the wake needs no authorization:
+   * one constant token and nothing else.
+   */
+  it("wakes the holder with a constant token, and loses the endpoint when the connection goes", async () => {
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const session = readySession(harness, "cto-peer");
+    expect(
+      harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId: session.sessionId, projectId })
+        .reasonCode,
+    ).toBe(ReasonCode.OK);
+    const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+
+    const stateDir = tempDir("acp-cto-wake-dies-");
+    chmodSync(stateDir, 0o700);
+    const listeners = await startLocalMcpListeners(harness.cp, stateDir, TOKEN);
+    const ctoSocket = listeners.socketPaths[1];
+    if (!ctoSocket) throw new Error("the CTO MCP listener was not started");
+    const endpoint = await listeningSocket(join(stateDir, "cto.wake.sock"));
+
+    const peer = await connectPeer(ctoSocket, { token: TOKEN, ...session }, C0_QUALIFIED_CLIENT);
+    let successor: PeerHandle | null = null;
+    try {
+      await until(() => peer.initialized(), "the peer's attach");
+      const registered = await peer.callTool("role_wake_endpoint_register", { endpoint: endpoint.path });
+      expect(registered.ok).toBe(true);
+
+      const woken = await listeners.ctoConversation.wake(roleKey);
+      expect(woken.reasonCode).toBe(ReasonCode.OK);
+      expect(woken.allowed).toBe(true);
+      await until(() => endpoint.received.length === 1, "the wake to land on the peer's endpoint");
+      // **The byte shape itself**, not merely that something was written. This transport is a
+      // version-pinned local runtime contract and the frame is part of that contract: the runtime
+      // accepts this envelope because it is the shape it parses, so a row that accepted any bytes
+      // would go green against a wake no real 2.1.259 client would ever read.
+      expect(endpoint.received).toEqual([
+        `${JSON.stringify({ type: "user", message: { role: "user", content: "ACP-ROLE-WAKE" } })}\n`,
+      ]);
+      expect(endpoint.received[0]).toBe(ROLE_WAKE_FRAME);
+      // And the whole of what it says. Anything else in here — a nonce, a sender, an event id, a
+      // count — would make the endpoint a disclosure channel defended only by a file mode, and
+      // would make the wake something a wrong recipient could learn from.
+      const frame = JSON.parse(endpoint.received[0] ?? "{}") as {
+        message: { role: string; content: string };
+        type: string;
+      };
+      expect(frame.message.content).toBe(ROLE_WAKE_TOKEN);
+      expect(Object.keys(frame).sort()).toEqual(["message", "type"]);
+      expect(Object.keys(frame.message).sort()).toEqual(["content", "role"]);
+
+      // The connection goes. Nothing else changes: the binding is untouched, the session is still
+      // READY, and the socket file is still sitting in the state directory being a live listener.
+      await peer.close();
+      await until(() => !listeners.ctoConversation.connected(roleKey), "the peer's detach");
+      expect(listeners.ctoConversation.endpointFor(roleKey)).toBeNull();
+
+      const afterClose = await listeners.ctoConversation.wake(roleKey);
+      expect(afterClose.allowed).toBe(false);
+      expect(afterClose.reasonCode).toBe(ReasonCode.ROLE_PEER_ABSENT);
+      expect(endpoint.received).toEqual([ROLE_WAKE_FRAME]);
+
+      // The half a durable endpoint would get wrong, and the reason a table was refused for this.
+      // A successor connection for the same role, from the same session, is the current holder by
+      // every measure the registry has — and it did not register this endpoint. If availability
+      // were keyed by role anywhere that outlives a connection, the successor would inherit it and
+      // this wake would land on a socket the successor does not own.
+      successor = await connectPeer(ctoSocket, { token: TOKEN, ...session }, C0_QUALIFIED_CLIENT);
+      await until(() => successor?.initialized() === true, "the successor's attach");
+      await until(() => listeners.ctoConversation.connected(roleKey), "the successor to hold the slot");
+      expect(listeners.ctoConversation.endpointFor(roleKey)).toBeNull();
+
+      const inherited = await listeners.ctoConversation.wake(roleKey);
+      expect(inherited.allowed).toBe(false);
+      expect(inherited.reasonCode).toBe(ReasonCode.ROLE_PEER_UNSUPPORTED);
+      expect(endpoint.received).toEqual([ROLE_WAKE_FRAME]);
+    } finally {
+      await peer.close();
+      if (successor) await successor.close();
+      await listeners.close();
+      await endpoint.close();
     }
   }, 60_000);
 });

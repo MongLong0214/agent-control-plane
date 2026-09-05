@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import type { Transport, TransportSendOptions } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
 
 import { ControlPlane, defaultConfig, type ControlPlaneConfig } from "../app/control-plane.ts";
 import { COLLECTOR_TIMEOUT_MS } from "../capacity/usage-collectors.ts";
@@ -49,7 +50,7 @@ import { createCtoMcpPort, createCtoServer } from "../mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../mcp/hermes-server.ts";
 import { CeoConversationPort } from "../mcp/ceo-conversation.ts";
 import { RoleConversationPort } from "../mcp/role-conversation.ts";
-import type { AuthenticatedMcpPeer, McpPeerAuthenticator } from "../mcp/shared.ts";
+import { respond, type AuthenticatedMcpPeer, type McpPeerAuthenticator } from "../mcp/shared.ts";
 import type { AuthenticatedOperatorPeer, Daemon } from "./daemon.ts";
 
 const MAX_MCP_LINE_BYTES = 1024 * 1024;
@@ -339,10 +340,18 @@ export const startLocalMcpListeners = async (
    * is the port's single enforcement point; repeating it here would leave two copies of one rule,
    * and removing either would change nothing a test could see.
    */
-  const ctoConversation = new RoleConversationPort(Role.PRIMARY_CTO, {
-    active: (roleKey) => cp.bindings.active(roleKey),
-    currentCandidates: () => currentBindingsForRoles(cp, [Role.PRIMARY_CTO]),
-  });
+  const ctoConversation = new RoleConversationPort(
+    Role.PRIMARY_CTO,
+    {
+      active: (roleKey) => cp.bindings.active(roleKey),
+      currentCandidates: () => currentBindingsForRoles(cp, [Role.PRIMARY_CTO]),
+    },
+    // The wake endpoint directory is this same `stateDir` — the 0700 directory `hermes.mcp.sock`
+    // and `cto.mcp.sock` are already in, two lines above. It is passed rather than derived inside
+    // the port so the port never has to know what a deployment's layout is, and so a test that
+    // wants a different directory gets one without moving the daemon's.
+    { endpointDir: stateDir },
+  );
   const hermes = await startMcpSocket(
     hermesPath,
     token,
@@ -391,6 +400,22 @@ export const startLocalMcpListeners = async (
           server.server.onclose = ctoConversation.attach(
             server,
             conversationPeerAuthenticator(cp, credential, opening.sessionIncarnation, ctoConversation.role),
+          );
+          // Registration is a tool on *this* connection's server, and the handler passes `server`
+          // — the object identity `attach` keyed the slots on — rather than anything from `args`.
+          // That is the whole of "connection-bound": there is no argument here in which a peer
+          // could name a role, a session or a connection other than its own, so the only thing it
+          // can say is which path it is listening on. Everything else the port takes from the
+          // registry and from the filesystem.
+          server.registerTool(
+            "role_wake_endpoint_register",
+            {
+              description:
+                "Register this connection's own wake endpoint socket. Local runtime contract, version-pinned; not a public interface.",
+              inputSchema: { endpoint: z.string().min(1) },
+            },
+            async (args: { endpoint: string }) =>
+              respond(ctoConversation.registerEndpoint(server, args.endpoint)),
           );
         }
         return server;
