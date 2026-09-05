@@ -642,6 +642,25 @@ export class CanonicalSelfClaim {
       );
     }
 
+    // Clause 4 — same-session restore only, checked immediately after the derived identity is
+    // confirmed to match what the caller claimed, and before any of clause 2's environment checks
+    // below. Ordering found wrong by review (round 5): the transcript lookup a few checks down is
+    // real filesystem I/O against whatever session was actually derived, and a caller connected
+    // from a real, otherwise-legitimate claude process that simply isn't the canonical session was
+    // reaching that I/O — and failing with NOT_FOUND ("no transcript exists"), a true but wrong-shaped
+    // refusal, in a process test whose name promised a CONFLICT for the reason this block names. No
+    // fallback bootstraps a new session or actor here regardless of when this runs; moving it earlier
+    // only changes which of two already-correct refusals a non-canonical session hits first, so it
+    // always fails for the reason its own name gives rather than for whichever check happens to run
+    // first against a session this primitive was never going to adopt anyway.
+    if (identity.sessionUuid !== this.#canonicalSessionUuid) {
+      return deny(
+        ReasonCode.CONFLICT,
+        "only the canonical session may be adopted by this primitive",
+        { observed: identity.sessionUuid, canonical: this.#canonicalSessionUuid },
+      );
+    }
+
     // Clause 2 — pid and process start time as a pair; a pid alone is reused (CP-HI-04).
     if (identity.startedAt === null) {
       return deny(
@@ -720,15 +739,6 @@ export class CanonicalSelfClaim {
         { observed: request.buzzChannelId, expected: this.#canonicalBuzzChannelId },
       );
     }
-    // Clause 4 — same-session restore only. No fallback bootstraps a new session or actor here.
-    if (identity.sessionUuid !== this.#canonicalSessionUuid) {
-      return deny(
-        ReasonCode.CONFLICT,
-        "only the canonical session may be adopted by this primitive",
-        { observed: identity.sessionUuid, canonical: this.#canonicalSessionUuid },
-      );
-    }
-
     // Correction 5 — the Buzz routing address is resolved here, before the synchronous
     // transaction opens, never awaited inside it. `sessions.create` accepts `buzzAddress`
     // directly, so the resolved value is written in the same transaction as everything else even

@@ -16,9 +16,9 @@ import { ManualClock } from "../../src/core/clock.ts";
 import { allow, type Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
-  CANONICAL_SESSION_UUID,
   REQUIRED_EXECUTOR_VERSION,
   SELF_CLAIM_OPERATION,
+  makeDefaultTranscriptReader,
 } from "../../src/registry/canonical-self-claim.ts";
 import {
   assertDirectPeer,
@@ -162,6 +162,18 @@ const BUZZ_CHANNEL_ID = "channel:test-canonical";
 const PEER_PROTOCOL = "acp.operator/v1";
 const BUZZ_PURPOSE = "continuity:PRIMARY_CTO";
 
+/**
+ * Entirely synthetic — deliberately not `CANONICAL_SESSION_UUID`. Round 5 review: the previous
+ * version of this file reused the real production constant and relied on `CanonicalSelfClaim`'s
+ * real default transcript reader (`~/.claude/projects/**\/<uuid>.jsonl`), which only ever passed
+ * here because this specific developer machine happens to hold a real transcript for that real,
+ * live session. Diagnostic CI on a machine with no such file got `NOT_FOUND` instead of the
+ * outcome each test actually names. `config.canonicalSessionUuid` is a real, overridable config
+ * field for exactly this reason — production supplies the real constant, this file supplies a
+ * fixture UUID and a fixture transcript it writes into its own temp directory.
+ */
+const TEST_SESSION_UUID = "99999999-9999-4999-8999-999999999999";
+
 const makeCore = (): Core => {
   const db = new Db(":memory:");
   const clock = new ManualClock("2027-01-01T00:00:00.000Z");
@@ -228,7 +240,11 @@ const resolveBuzzAddressFixture = (
   outcome: Decision<string> = allow(ReasonCode.OK, "buzz://test-canonical-cto"),
 ) => async (): Promise<Decision<string>> => outcome;
 
-const depsFor = (core: Core, root: string): CanonicalSelfClaimOperatorDeps => ({
+const depsFor = (
+  core: Core,
+  root: string,
+  options: { sessionUuid?: string; maxAncestryHops?: number } = {},
+): CanonicalSelfClaimOperatorDeps => ({
   db: core.db,
   clock: core.clock,
   sessions: core.sessions,
@@ -242,26 +258,34 @@ const depsFor = (core: Core, root: string): CanonicalSelfClaimOperatorDeps => ({
     expectedCwd: realpathSync(root),
     expectedPeerProtocolVersion: PEER_PROTOCOL,
     expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
-    canonicalSessionUuid: CANONICAL_SESSION_UUID,
+    canonicalSessionUuid: options.sessionUuid ?? TEST_SESSION_UUID,
     canonicalBuzzChannelId: BUZZ_CHANNEL_ID,
     peerProtocolVersion: PEER_PROTOCOL,
     buzzChannelId: BUZZ_CHANNEL_ID,
     buzzActorId: BUZZ_ACTOR_ID,
     buzzPurpose: BUZZ_PURPOSE,
   },
+  // The seam this round added: a real `getPeerCredentials`/`ps`/`lsof` walk is still exercised
+  // (nothing here fakes `processInspector` or `imageInspector`), but the transcript lookup reads
+  // this test's own fixture directory instead of `~/.claude/projects` — this machine's real
+  // transcript for the real production UUID must never be what makes this file green.
+  claimDeps: {
+    transcriptReader: makeDefaultTranscriptReader(join(root, "transcripts")),
+    ...(options.maxAncestryHops !== undefined ? { maxAncestryHops: options.maxAncestryHops } : {}),
+  },
 });
 
-/** A real claude-shaped peer, connected over a real socket, with a real transcript in place. */
-const spawnRealClaudePeer = async (root: string): Promise<Socket> => {
+/** A real claude-shaped peer, connected over a real socket, with a fixture transcript in place. */
+const spawnRealClaudePeer = async (root: string, sessionUuid: string = TEST_SESSION_UUID): Promise<Socket> => {
   const claude = writeVersionedClaude(join(root, "versions"), REQUIRED_EXECUTOR_VERSION);
   const socketPath = join(root, "operator.sock");
   const accepted = acceptOneConnection(socketPath);
-  const child = spawnConnectingProcess(claude, socketPath, ["--session-id", CANONICAL_SESSION_UUID], root);
+  const child = spawnConnectingProcess(claude, socketPath, ["--session-id", sessionUuid], root);
   await waitForStdout(child, "connected");
   const transcriptRoot = join(root, "transcripts");
   const projectDir = join(transcriptRoot, "-work-canonical");
   mkdirSync(projectDir, { recursive: true });
-  writeFileSync(join(projectDir, `${CANONICAL_SESSION_UUID}.jsonl`), '{"line":1}\n');
+  writeFileSync(join(projectDir, `${sessionUuid}.jsonl`), '{"line":1}\n');
   return accepted;
 };
 
@@ -278,14 +302,14 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
       // Minted out of band — never through this test's call to the claim handler itself.
       const ownerApprovalNonce = mintOwnerApprovalOutOfBand(core, {
         projectId,
-        claimedSessionUuid: CANONICAL_SESSION_UUID,
+        claimedSessionUuid: TEST_SESSION_UUID,
         expectedBindingGeneration: 1,
       });
 
       const before = rowCounts(core);
       const result = await executeCanonicalSelfClaimOperator(
         socket,
-        { claimedSessionUuid: CANONICAL_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
+        { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
         depsFor(core, root),
       );
 
@@ -293,7 +317,7 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
       if (!result.allowed) return;
       // `callerPid` was never in the request. It came from a real
       // `getsockopt(SOL_LOCAL, LOCAL_PEERPID)` against `socket`'s own fd.
-      expect(result.value.derivedSessionUuid).toBe(CANONICAL_SESSION_UUID);
+      expect(result.value.derivedSessionUuid).toBe(TEST_SESSION_UUID);
       expect(result.value.binding.role).toBe("PRIMARY_CTO");
 
       const after = rowCounts(core);
@@ -321,7 +345,7 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
       const before = rowCounts(core);
       const result = await executeCanonicalSelfClaimOperator(
         socket,
-        { claimedSessionUuid: CANONICAL_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
+        { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
         depsFor(core, root),
       );
 
@@ -344,7 +368,7 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
 
     const ownerApprovalNonce = mintOwnerApprovalOutOfBand(core, {
       projectId,
-      claimedSessionUuid: CANONICAL_SESSION_UUID,
+      claimedSessionUuid: TEST_SESSION_UUID,
       expectedBindingGeneration: 1,
       approved: false,
     });
@@ -352,7 +376,7 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
     const before = rowCounts(core);
     const result = await executeCanonicalSelfClaimOperator(
       socket,
-      { claimedSessionUuid: CANONICAL_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
+      { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
       depsFor(core, root),
     );
 
@@ -377,14 +401,14 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
 
     const ownerApprovalNonce = mintOwnerApprovalOutOfBand(core, {
       projectId: "some-other-project",
-      claimedSessionUuid: CANONICAL_SESSION_UUID,
+      claimedSessionUuid: TEST_SESSION_UUID,
       expectedBindingGeneration: 1,
     });
 
     const before = rowCounts(core);
     const result = await executeCanonicalSelfClaimOperator(
       socket,
-      { claimedSessionUuid: CANONICAL_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
+      { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
       depsFor(core, root),
     );
 
@@ -404,13 +428,13 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
 
     const ownerApprovalNonce = mintOwnerApprovalOutOfBand(core, {
       projectId,
-      claimedSessionUuid: CANONICAL_SESSION_UUID,
+      claimedSessionUuid: TEST_SESSION_UUID,
       expectedBindingGeneration: 1,
     });
     const deps = depsFor(core, root);
     const first = await executeCanonicalSelfClaimOperator(
       socket,
-      { claimedSessionUuid: CANONICAL_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
+      { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
       deps,
     );
     expect(first.allowed, JSON.stringify(first)).toBe(true);
@@ -421,7 +445,7 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
     // either way, nothing new lands.
     const replay = await executeCanonicalSelfClaimOperator(
       socket,
-      { claimedSessionUuid: CANONICAL_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
+      { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
       deps,
     );
     expect(replay.allowed).toBe(false);
@@ -456,25 +480,34 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
 
       const ownerApprovalNonce = mintOwnerApprovalOutOfBand(core, {
         projectId,
-        claimedSessionUuid: CANONICAL_SESSION_UUID,
+        claimedSessionUuid: TEST_SESSION_UUID,
         expectedBindingGeneration: 1,
       });
 
       const before = rowCounts(core);
+      // `maxAncestryHops: 1` — round 5 fix. The real, unbounded walk (production's default 64)
+      // climbs past this plain child into whatever this environment's own ancestry actually is,
+      // which is not this test's business and is not the same on every machine: this sandbox
+      // happens to run inside a real, ambient claude session (climbing far enough would find it
+      // and deny for a *different* reason than "not a claude process" — a `CONFLICT` from a
+      // session/cwd/version mismatch against that unrelated ambient process), while a bare CI
+      // runner has no such ancestor and would instead climb all the way to pid 1 and deny
+      // `NOT_FOUND`. Neither is what this test's name claims to prove, and neither is stable
+      // across machines. Bounding the walk to one hop makes the outcome depend only on what this
+      // test itself spawned: the plain child is not claude, its immediate parent (this test
+      // process) is not either, and the budget is exhausted before either possibility above can
+      // occur — the same `CONFLICT` reason, "process ancestry walk exceeded its hop limit
+      // without finding a claude ancestor", on every machine.
       const result = await executeCanonicalSelfClaimOperator(
         socket,
-        { claimedSessionUuid: CANONICAL_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
-        depsFor(core, root),
+        { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
+        depsFor(core, root, { maxAncestryHops: 1 }),
       );
 
       expect(result.allowed).toBe(false);
       if (result.allowed) return;
-      // Measured, not assumed: this sandbox always runs *inside* a real claude session, so the
-      // ancestry walk climbing past this plain child does not stop at "no ancestor at all" — it
-      // keeps climbing until it reaches that real, ambient claude process, and denies against
-      // *its* identity (cwd/session/version) instead. Still exactly the property under test: the
-      // request asserts nothing about which process this is.
       expect(result.reasonCode).toBe(ReasonCode.CONFLICT);
+      expect(result.message).toContain("exceeded its hop limit");
       const after = rowCounts(core);
       for (const table of ["sessions", "conversational_actors", "assignments", "actor_target_bindings", "actor_target_attestations"] as const) {
         expect(after[table], table).toBe(before[table]);
@@ -489,7 +522,7 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
     insertProject(core, projectId);
     const ownerApprovalNonce = mintOwnerApprovalOutOfBand(core, {
       projectId,
-      claimedSessionUuid: CANONICAL_SESSION_UUID,
+      claimedSessionUuid: TEST_SESSION_UUID,
       expectedBindingGeneration: 1,
     });
 
@@ -507,7 +540,7 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
     const before = rowCounts(core);
     const result = await executeCanonicalSelfClaimOperator(
       client,
-      { claimedSessionUuid: CANONICAL_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
+      { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
       depsFor(core, root),
     );
 

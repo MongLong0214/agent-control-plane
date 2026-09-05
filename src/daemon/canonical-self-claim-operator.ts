@@ -9,6 +9,7 @@ import type { Db } from "../db/database.ts";
 import {
   CanonicalSelfClaim,
   type CanonicalSelfClaimConfig,
+  type CanonicalSelfClaimDeps,
   type CanonicalSelfClaimReceipt,
 } from "../registry/canonical-self-claim.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
@@ -76,6 +77,22 @@ export interface CanonicalSelfClaimOperatorDeps {
     buzzActorId: string;
     buzzPurpose: string;
   };
+  /**
+   * `CanonicalSelfClaim`'s own injectable process/image/transcript inspectors — a test-only
+   * escape hatch. Production composition (`src/daemon/agentcpd.ts`) never sets this, so
+   * `CanonicalSelfClaim` falls back to its real, OS-backed defaults there. A process test that
+   * needs the kernel-derived peer identity and the real `ps`/`lsof`-backed ancestry walk to be
+   * genuine (that is the property this operator exists to prove) but must not depend on this
+   * machine's actual `~/.claude/projects` transcript directory — or on whatever real process
+   * happens to be running above the test in this environment's own ancestry — sets exactly the
+   * inspector it needs to replace, leaving the rest real. Found necessary by review (round 5):
+   * without this seam, a process test's fixture file was written to disk and never actually
+   * read, because the operator always constructed `CanonicalSelfClaim` with no deps at all — the
+   * test's assertions passed only because this specific developer machine happened to already
+   * hold that exact file on disk for the real production `CANONICAL_SESSION_UUID` the test
+   * reused, which is not true of a CI runner or any other machine.
+   */
+  claimDeps?: CanonicalSelfClaimDeps;
 }
 
 export interface CanonicalSelfClaimOperatorRequest {
@@ -261,6 +278,7 @@ export const executeCanonicalSelfClaimOperator = async (
     deps.buzzActorAuthenticator,
     deps.resolveBuzzAddress,
     deps.config,
+    deps.claimDeps ?? {},
   );
   return claim.claim({
     callerPid: credentials.peerPid,
