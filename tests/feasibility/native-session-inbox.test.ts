@@ -15,6 +15,8 @@
  * `sampling/createMessage` delivery cannot reach a real session no matter how it is
  * wired. This path uses only surfaces the runtime documents for itself.
  */
+import { existsSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 
 import { ACP_WAKE, isClaudeCliAvailable, runInboxProbe } from "./native-session-inbox/harness.ts";
@@ -44,16 +46,23 @@ describe.skipIf(!cliAvailable)("C0: native session inbox reaches model input", (
     }
   }, 180_000);
 
-  it("no request left the machine", async () => {
+  it("every model request went to a loopback fake under a dummy credential", async () => {
     const result = await runInboxProbe({ inject: ACP_WAKE });
 
-    // Positive, not an absence: every request the CLI made is in this list because the
-    // list IS the server it was pointed at, and the wake is in it.
+    // Positive, not an absence: the requests below are in this list because the list
+    // IS the endpoint the CLI's provider traffic was pointed at.
+    //
+    // The scope of that is exactly what the row name says. ANTHROPIC_BASE_URL and the
+    // proxy variables redirect model/provider traffic; they are not a network
+    // namespace, so this is no evidence about a process that ignores the proxy
+    // environment or opens a socket of its own. What it does establish is that the
+    // inference this session performed was served here, under a credential that
+    // belongs to no account.
     expect(result.captured.length).toBeGreaterThan(0);
     expect(result.baseUrl.startsWith("http://127.0.0.1:")).toBe(true);
 
     // The CLI's own reachability probe (HEAD /api/hello) landed here too -- evidence
-    // the base-URL override captured non-inference traffic, not just /v1/messages.
+    // the base-URL override caught non-inference traffic as well, not just /v1/messages.
     const hosts = new Set(result.captured.map((r) => String(r.headers.host ?? "")));
     for (const host of hosts) {
       expect(host.startsWith("127.0.0.1:")).toBe(true);
@@ -69,6 +78,20 @@ describe.skipIf(!cliAvailable)("C0: native session inbox reaches model input", (
     // of the fake server's own stream. If any part of the turn had been served by a
     // real provider, this model id could not be here.
     expect(result.stdout).toContain('"model":"claude-c0-fake"');
+  }, 180_000);
+
+  it("the probe leaves behind neither its temp root nor a live child", async () => {
+    const result = await runInboxProbe({ inject: ACP_WAKE });
+
+    // Stat'd here rather than believed from a flag the harness sets about itself. The
+    // probe has resolved, so its teardown has already run; if the root is still on
+    // disk it was never removed.
+    expect(existsSync(result.teardown.root)).toBe(false);
+
+    // A process that is still running has neither of these set, so the disjunction is
+    // the reaped/not-reaped question and not a restatement of the kill call.
+    const { exitCode, signalCode } = result.teardown;
+    expect(exitCode !== null || signalCode !== null).toBe(true);
   }, 180_000);
 });
 

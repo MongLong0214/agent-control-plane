@@ -2,17 +2,24 @@
  * C0 feasibility harness: can one opaque wake, posted to a running Claude Code
  * session's native unix-domain-socket inbox, reach that session's real model input?
  *
- * Everything here is disposable and offline. The harness owns a temp root that holds
- * the isolated CLAUDE_CONFIG_DIR, the per-invocation settings file, the socket
- * directory, and the fake provider's capture log; nothing outside that root is read
- * or written, and no request leaves loopback.
+ * Everything here is disposable. The harness owns a temp root that holds the isolated
+ * CLAUDE_CONFIG_DIR, the per-invocation settings file, the socket directory, and the
+ * fake provider's capture log; nothing outside that root is read or written, and the
+ * root is removed before the probe resolves.
+ *
+ * What the isolation buys is bounded and worth stating exactly. ANTHROPIC_BASE_URL
+ * points the CLI's model/provider traffic at a loopback fake, and the credential in
+ * the environment is a dummy, so no real-account inference is possible. That is a
+ * claim about model/provider traffic, not about everything the process could do: an
+ * environment override is not a network namespace, and a process that ignores the
+ * proxy variables or opens a socket directly is outside what this observes.
  *
  * Scope is deliberately narrow. This proves delivery only. There is no claim fence,
  * no subscriber, no durable state -- and the wake carries no payload, because the
  * only thing it is ever allowed to mean is "call the ACP claim tool".
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
 import { join } from "node:path";
 
@@ -35,11 +42,31 @@ export const ACP_WAKE = "ACP-WAKE-V1-c0a1f2b6";
 const DUMMY_API_KEY = "sk-ant-c0-feasibility-dummy-not-a-real-credential";
 
 /**
- * A closed port. Anything the CLI tries to send over a proxy lands here and fails at
- * connect. Loopback is excluded so the fake endpoint stays reachable. This turns
- * "nothing left the machine" from an absence into a containment we configured.
+ * A closed port. Anything the CLI sends through the proxy environment lands here and
+ * fails at connect. Loopback is excluded so the fake endpoint stays reachable.
+ *
+ * A real narrowing, and only that: it removes the proxy-honouring paths out of the
+ * process. It is not a containment boundary, because nothing here forces a client to
+ * consult the proxy variables in the first place.
  */
 const BLACKHOLE_PROXY = "http://127.0.0.1:9";
+
+/**
+ * What teardown did, filled in after the `finally` has run and therefore readable by
+ * the caller the moment the probe resolves.
+ *
+ * It exists so the teardown is observable from outside instead of being taken on
+ * trust. `root` is a path the caller can stat for itself; the two exit fields are the
+ * child's own state after the signal, not the harness's opinion of it.
+ */
+export interface ProbeTeardown {
+  /** The temp root this invocation created, owns, and removes. */
+  readonly root: string;
+  /** The child's exit code, or null when a signal ended it. */
+  exitCode: number | null;
+  /** The signal that ended the child, or null when it exited on its own. */
+  signalCode: NodeJS.Signals | null;
+}
 
 export interface HarnessResult {
   /** Every request the fake provider received, in arrival order. */
@@ -53,6 +80,8 @@ export interface HarnessResult {
   readonly init: Record<string, unknown> | undefined;
   readonly socketPath: string;
   readonly baseUrl: string;
+  /** Teardown state, populated before this result is handed back. */
+  readonly teardown: ProbeTeardown;
 }
 
 export interface RunOptions {
@@ -101,6 +130,43 @@ const injectWake = async (socketPath: string, text: string): Promise<void> => {
   });
 };
 
+/** How long a killed child gets to be reaped before the run is failed rather than hung. */
+const CHILD_EXIT_GRACE_MS = 10_000;
+
+/**
+ * Terminates the child this invocation spawned and waits for it to be reaped.
+ *
+ * Signalled through the `ChildProcess` handle, never `process.kill(pid)`: a pid is
+ * reused once the kernel reaps the process, so a numeric signal sent a moment too
+ * late lands on whatever inherited that number. A child that has already exited is
+ * not signalled at all, for the same reason.
+ *
+ * Returns whether the child was reaped inside the grace period. The wait is bounded
+ * so a wedged child fails the run instead of hanging it.
+ */
+const terminateChild = async (child: ChildProcessWithoutNullStreams | undefined): Promise<boolean> => {
+  if (child === undefined) return true;
+  if (child.exitCode !== null || child.signalCode !== null) return true;
+
+  const reaped = new Promise<boolean>((resolve) => {
+    // `exit` is emitted on a later tick, so this synchronous re-check and the listener
+    // below cannot straddle it: either the child is already gone or the listener will
+    // see it go.
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve(true);
+      return;
+    }
+    const timer = setTimeout(() => resolve(false), CHILD_EXIT_GRACE_MS);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+  });
+
+  child.kill("SIGKILL");
+  return reaped;
+};
+
 export const isClaudeCliAvailable = (): boolean => {
   const paths = (process.env.PATH ?? "").split(":");
   return paths.some((dir) => dir.length > 0 && existsSync(join(dir, "claude")));
@@ -142,6 +208,9 @@ export const runInboxProbe = async (options: RunOptions = {}): Promise<HarnessRe
   let child: ChildProcessWithoutNullStreams | undefined;
   let stdout = "";
   let stderr = "";
+  let failure: unknown;
+
+  const teardown: ProbeTeardown = { root, exitCode: null, signalCode: null };
 
   try {
     fake = await startFakeAnthropic(capturePath);
@@ -240,9 +309,29 @@ export const runInboxProbe = async (options: RunOptions = {}): Promise<HarnessRe
       init: initLine,
       socketPath,
       baseUrl: fake.baseUrl,
+      teardown,
     };
+  } catch (error) {
+    failure = error;
+    throw error;
   } finally {
-    child?.kill("SIGKILL");
+    // Order is load-bearing. The child goes first and is waited for: a live one can
+    // recreate the socket under a root we are about to remove. The server closes next,
+    // because it owns the capture file inside that root. Only then is the root gone.
+    const reaped = await terminateChild(child);
+    teardown.exitCode = child?.exitCode ?? null;
+    teardown.signalCode = child?.signalCode ?? null;
+
     await fake?.close();
+
+    // Only the root this invocation made with mkdtempSync, never a path derived from
+    // anything a caller or the runtime supplied.
+    rmSync(root, { recursive: true, force: true });
+
+    // A wedged child fails the run rather than hanging it -- but never in place of a
+    // failure the probe already had, which is the more informative of the two.
+    if (!reaped && failure === undefined) {
+      throw new Error(`inbox probe child did not exit within ${CHILD_EXIT_GRACE_MS}ms`);
+    }
   }
 };
