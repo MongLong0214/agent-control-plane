@@ -940,7 +940,12 @@ export class Daemon {
     if (!expectedBindingGeneration.allowed) return expectedBindingGeneration;
     const nonce = requiredOperatorString(request.params, "nonce");
     if (!nonce.allowed) return nonce;
-    const approved = request.params["approved"] ?? true;
+    // #760 round 6, required part 3 — no default. An owner mints an explicit decision, approval
+    // or rejection; there is no reading of "the caller did not say" that this method may treat as
+    // either one. `request.params["approved"] ?? true` silently turned every omitted or malformed
+    // field into an approval, which is exactly the shape a caller could exploit by leaving the
+    // field out rather than fabricating it.
+    const approved = request.params["approved"];
     if (typeof approved !== "boolean") return invalidOperatorParam("approved", approved);
 
     const approval = {

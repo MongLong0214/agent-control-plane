@@ -1,9 +1,6 @@
-import type { Socket } from "node:net";
-
 import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../ceo/owner-authority.ts";
 import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
-import { getPeerCredentials, type PeerCredentials } from "../core/peercred.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { Db } from "../db/database.ts";
 import {
@@ -16,9 +13,19 @@ import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { BuzzActorAuthenticator, SessionRegistry } from "../session/session-registry.ts";
 
 /**
- * The one production call site #539/#760 authorizes: `actor.claimCanonicalCto`'s operator
- * handler. `scripts/verify-peercred-is-unreachable.mjs` allowlists exactly this file by path;
- * nothing else in `src/` may import `../core/peercred.ts`.
+ * The claim orchestration behind `actor.claimCanonicalCto`: load an *already-admitted* owner
+ * approval back out of storage and compose `CanonicalSelfClaim.claim()`.
+ *
+ * #760 round 6 — this module has no peer-credential logic of its own any more, and imports
+ * nothing from `../core/peercred.ts`. That authority now lives entirely in
+ * `canonical-self-claim-listener.ts` — the one file `scripts/verify-peercred-is-unreachable.mjs`
+ * allowlists for it — which authenticates the connecting process by kernel credential *before*
+ * this function is ever called, and hands the result in as a plain, already-verified
+ * `{ peerPid, uid }` tuple. That split is the CEO's ruling on the mint/claim separation made
+ * concrete: "a process may prove who it is, but it cannot approve itself" is a statement about
+ * which *socket* a caller may reach, not an extra check layered onto a shared one — so the
+ * kernel-identity check belongs to the listener that owns the socket, not to the orchestration
+ * a caller could in principle reach some other way.
  *
  * #760 round 4 correction A — this module never mints an owner approval and never admits one.
  * Minting happens exactly once, elsewhere: `Daemon.executeApproveCanonicalCtoClaim`
@@ -29,30 +36,6 @@ import type { BuzzActorAuthenticator, SessionRegistry } from "../session/session
  * handle naming a decision an owner already made, and this module *loads and verifies* that
  * decision — it does not make one.
  */
-
-/**
- * Node exposes no public API for a socket's raw fd. `_handle.fd` is the field this repository's
- * own `tests/unit/g5-peercred.test.ts` already reads for exactly this reason — there is no other
- * way to hand a real kernel fd to `getsockopt`. Returns `null` (never throws) for a socket with no
- * live native handle, e.g. one already closed by the time this runs — fail-closed, the same shape
- * `getPeerCredentials` itself uses for "cannot be established".
- */
-const rawFd = (socket: Socket): number | null => {
-  const handle = (socket as unknown as { _handle: { fd: number } | null } | null)?._handle;
-  return handle && typeof handle.fd === "number" ? handle.fd : null;
-};
-
-/**
- * The kernel's own record of who is on the other end of this exact connection — never the shared
- * bearer token, a CLI field, the configured operator actor string, or anything in the request
- * payload. Those are each explicitly not substitutes: a caller can assert any pid it likes in a
- * JSON body, and the whole point of this primitive is that nothing here ever reads that assertion
- * as identity.
- */
-export const derivePeerCredentialsFromSocket = (socket: Socket): PeerCredentials | null => {
-  const fd = rawFd(socket);
-  return fd === null ? null : getPeerCredentials(fd);
-};
 
 export interface CanonicalSelfClaimOperatorDeps {
   db: Db;
@@ -81,16 +64,10 @@ export interface CanonicalSelfClaimOperatorDeps {
    * `CanonicalSelfClaim`'s own injectable process/image/transcript inspectors — a test-only
    * escape hatch. Production composition (`src/daemon/agentcpd.ts`) never sets this, so
    * `CanonicalSelfClaim` falls back to its real, OS-backed defaults there. A process test that
-   * needs the kernel-derived peer identity and the real `ps`/`lsof`-backed ancestry walk to be
-   * genuine (that is the property this operator exists to prove) but must not depend on this
-   * machine's actual `~/.claude/projects` transcript directory — or on whatever real process
-   * happens to be running above the test in this environment's own ancestry — sets exactly the
-   * inspector it needs to replace, leaving the rest real. Found necessary by review (round 5):
-   * without this seam, a process test's fixture file was written to disk and never actually
-   * read, because the operator always constructed `CanonicalSelfClaim` with no deps at all — the
-   * test's assertions passed only because this specific developer machine happened to already
-   * hold that exact file on disk for the real production `CANONICAL_SESSION_UUID` the test
-   * reused, which is not true of a CI runner or any other machine.
+   * needs the real `ps`/`lsof`-backed ancestry walk to be genuine (that is the property this
+   * primitive exists to prove) but must not depend on this machine's actual
+   * `~/.claude/projects` transcript directory sets exactly the inspector it needs to replace,
+   * leaving the rest real.
    */
   claimDeps?: CanonicalSelfClaimDeps;
 }
@@ -165,8 +142,8 @@ const isStoredOwnerApprovalPayload = (value: unknown): value is StoredOwnerAppro
  * from exactly that stored row — plus the row's own `actor` column and the `nonce` the caller
  * named — is reading an owner's already-made decision, not accepting the claimant's word for one:
  * every field comes from storage this connection cannot write to (writing it requires the
- * `owner.approveClaimCanonicalCto` operator method, authenticated by the shared bearer token, not
- * by this socket's kernel identity).
+ * `owner.approveClaimCanonicalCto` operator method, authenticated by the shared bearer token on a
+ * socket this listener does not serve).
  *
  * Returns `null` for anything that does not check out — no such nonce, no payload, a payload that
  * is not a valid `OWNER_APPROVAL` envelope — so a missing or fabricated handle denies before this
@@ -199,66 +176,26 @@ const loadAdmittedOwnerApproval = (db: Db, nonce: string): OwnerApprovalReceipt 
 };
 
 /**
- * Correction B — this deployment expects a direct local connection from the exact claude process,
- * not one relayed through an entitlement-checked proxy. `src/core/peercred.ts` documents the
- * distinction its own type carries: `peerPid` is who opened the socket, `effectivePid` is who a
- * proxy says is acting on their behalf, and the two differ exactly when a proxy sits in between.
- * A mismatch denies before the approval handle is ever looked up. Exported as its own pure
- * function — no socket, no I/O — so the mismatch case is a focused unit test rather than
- * something only provable by constructing a real entitlement-checked proxy.
- */
-export const assertDirectPeer = (credentials: PeerCredentials): Decision<PeerCredentials> => {
-  if (credentials.peerPid !== credentials.effectivePid) {
-    return deny(
-      ReasonCode.OPERATOR_UNAUTHENTICATED,
-      "the connecting peer is not a direct connection; a proxied identity is not accepted",
-      { peerPid: credentials.peerPid, effectivePid: credentials.effectivePid },
-    );
-  }
-  return allow(ReasonCode.OK, credentials);
-};
-
-/**
- * The one callable, routable terminal slice #760 requires: peer credentials derived from the
- * accepted connection, an *already-admitted* owner approval loaded back out of storage, and
+ * The claim orchestration: an *already-admitted* owner approval loaded back out of storage, and
  * `CanonicalSelfClaim.claim()` composed to produce a READY session, `PRIMARY_CTO` assignment,
  * target binding, attestation, `buzz_actor_id` and `buzz_address` — or none of it.
  *
- * Ordering: peer identity (both the kernel-established credential and correction B's
- * `peerPid === effectivePid` requirement) is checked first, before the approval is even looked
- * up — a caller that is not the exact, non-proxied peer this deployment expects should never
- * cause the lookup, the ancestry walk, `lsof`, the transcript read, or the Buzz relay contact that
- * follow it. `CanonicalSelfClaim.claim()` itself then re-validates the loaded receipt's operation,
- * parameter binding and `approved` flag before opening its own transaction, exactly as it does for
- * every other caller — this module adds no second copy of that logic, it only refuses to
- * fabricate what `claim()` verifies.
+ * `peer` is a plain `{ peerPid, uid }` tuple the caller (`canonical-self-claim-listener.ts`) has
+ * already authenticated against the kernel and this deployment's own effective uid, and against
+ * `peerPid === effectivePid`, before this function is ever invoked — this orchestration performs
+ * no kernel-credential check of its own and has no way to. `CanonicalSelfClaim.claim()` itself
+ * then re-validates the loaded receipt's operation, parameter binding and `approved` flag before
+ * opening its own transaction, exactly as it does for every other caller — this module adds no
+ * second copy of that logic, it only refuses to fabricate what `claim()` verifies.
  */
 export const executeCanonicalSelfClaimOperator = async (
-  socket: Socket,
+  peer: { peerPid: number; uid: number },
   rawParams: Record<string, unknown>,
   deps: CanonicalSelfClaimOperatorDeps,
 ): Promise<Decision<CanonicalSelfClaimReceipt>> => {
   const parsed = parseCanonicalSelfClaimOperatorRequest(rawParams);
   if (!parsed.allowed) return parsed;
   const request = parsed.value;
-
-  const credentials = derivePeerCredentialsFromSocket(socket);
-  if (credentials === null) {
-    return deny(
-      ReasonCode.OPERATOR_UNAUTHENTICATED,
-      "the connecting peer's kernel credentials could not be established",
-      {},
-    );
-  }
-  const direct = assertDirectPeer(credentials);
-  if (!direct.allowed) return direct as Decision<CanonicalSelfClaimReceipt>;
-  if (credentials.uid !== process.geteuid?.()) {
-    return deny(
-      ReasonCode.OPERATOR_UNAUTHENTICATED,
-      "the connecting peer's effective uid does not match this daemon's own",
-      { observedUid: credentials.uid },
-    );
-  }
 
   const ownerApproval = loadAdmittedOwnerApproval(deps.db, request.ownerApprovalNonce);
   if (ownerApproval === null) {
@@ -281,7 +218,7 @@ export const executeCanonicalSelfClaimOperator = async (
     deps.claimDeps ?? {},
   );
   return claim.claim({
-    callerPid: credentials.peerPid,
+    callerPid: peer.peerPid,
     claimedSessionUuid: request.claimedSessionUuid,
     projectId: request.projectId,
     expectedBindingGeneration: request.expectedBindingGeneration,
@@ -290,7 +227,7 @@ export const executeCanonicalSelfClaimOperator = async (
     // Derived from the kernel-verified connection, never from the request body — this is the
     // "connected peer identity" clause 2 names, expressed as the effective uid the socket
     // actually belongs to rather than a string the caller could type.
-    peerIdentity: `uid:${credentials.uid}`,
+    peerIdentity: `uid:${peer.uid}`,
     buzzChannelId: deps.config.buzzChannelId,
     buzzActorId: deps.config.buzzActorId,
     buzzPurpose: deps.config.buzzPurpose,
