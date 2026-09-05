@@ -349,11 +349,61 @@ const installFakeWebSocket = (): { sockets: FakeWebSocketRecord[]; restore: () =
   };
 };
 
+/**
+ * A sink whose answer the row decides, later.
+ *
+ * The whole class of defect below lives *inside* `await sink.admit(...)`: the connection the frame
+ * arrived on can be retired and replaced while that promise is outstanding. A sink that answers
+ * immediately cannot produce that window at all, which is why every row above is silent about it.
+ */
+interface DeferredSink extends BuzzMentionSink {
+  admitted: string[];
+  entered: () => boolean;
+  resolve: (answer: BuzzMentionAdmission) => void;
+  reject: (message: string) => void;
+}
+
+const deferredSink = (): DeferredSink => {
+  let settle: ((answer: BuzzMentionAdmission) => void) | null = null;
+  let fail: ((error: Error) => void) | null = null;
+  const sink: DeferredSink = {
+    admitted: [],
+    entered: () => settle !== null,
+    admit: (request) => {
+      sink.admitted.push(request.event.id);
+      return new Promise<BuzzMentionAdmission>((resolveAdmit, rejectAdmit) => {
+        settle = resolveAdmit;
+        fail = rejectAdmit;
+      });
+    },
+    resolve: (answer) => {
+      const settleNow = settle;
+      settle = null;
+      fail = null;
+      settleNow?.(answer);
+    },
+    reject: (message) => {
+      const failNow = fail;
+      settle = null;
+      fail = null;
+      failNow?.(new Error(message));
+    },
+  };
+  return sink;
+};
+
+/** Drains the microtask queue far enough for a handler to reach its first real `await`. */
+const flushMicrotasks = async (): Promise<void> => {
+  for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+};
+
 /** A subscriber on the **production** adapter: no `openSocket` is injected, only the clock. */
-const startOnNativeAdapter = (): {
+const startOnNativeAdapter = <T extends BuzzMentionSink>(
+  sink: T = recordingSink("DURABLE") as unknown as T,
+): {
   owner: Identity;
   identity: Identity;
-  sink: RecordingSink;
+  sink: T;
   clock: VirtualClock;
   handle: BuzzMentionSubscriberHandle;
 } => {
@@ -362,7 +412,6 @@ const startOnNativeAdapter = (): {
   const identity = hexIdentity(keys, "cto.key");
   const owner = hexIdentity(keys, "owner.key");
   writeConfig(stateDir, configFor([{ keyFile: identity.keyFile, encoding: "hex" }]));
-  const sink = recordingSink("DURABLE");
   const clock = virtualClock();
   const handle = startBuzzMentionSubscriberFromStateDir(stateDir, {
     registry: registryHolding({
@@ -454,7 +503,7 @@ describe("the buzz mention subscriber's native WebSocket adapter", () => {
   it("lets neither a captured stale listener nor an already-queued stale frame reach the replacement", async () => {
     const fake = installFakeWebSocket();
     try {
-      const { handle, clock, sink, identity, owner } = startOnNativeAdapter();
+      const { handle, clock, sink, identity, owner } = startOnNativeAdapter(recordingSink("DURABLE"));
       try {
         const first = fake.sockets[0]!;
         const subId = await authenticateNative(first, handle);
@@ -516,6 +565,143 @@ describe("the buzz mention subscriber's native WebSocket adapter", () => {
         second.emit("message", { data: frame(["EVENT", resumed, event]) });
         await handle.settled();
         expect(sink.admitted.map((entry) => entry.eventId)).toEqual([event.id]);
+      } finally {
+        handle.close();
+      }
+    } finally {
+      fake.restore();
+    }
+  });
+
+  /**
+   * The window a fence checked once cannot cover.
+   *
+   * `onFrame`'s fence runs when the frame reaches the front of the queue. `#handleFrame` then
+   * *suspends* on the sink. Everything the continuation does afterwards — reconnecting, advancing
+   * the mark, sending — happens on the far side of an `await`, by which time the connection it
+   * belongs to may be closed and replaced. Passing a fence does not entitle a continuation to act
+   * on state that moved while it was suspended.
+   *
+   * Both rows drive the **production** adapter, because the destroyed object is the replacement's
+   * real socket, and a fake wrapper would not show that its listeners went with it.
+   */
+  const STALE_TAILS: readonly { what: string; settle: (sink: DeferredSink) => void }[] = [
+    { what: "answers RETRY", settle: (sink) => sink.resolve("RETRY") },
+    { what: "rejects", settle: (sink) => sink.reject("the seam threw after the connection died") },
+  ];
+
+  for (const tail of STALE_TAILS) {
+    it(`does not let an admission that ${tail.what} after its connection was replaced touch the replacement`, async () => {
+      const fake = installFakeWebSocket();
+      try {
+        const { handle, clock, sink, identity, owner } = startOnNativeAdapter(deferredSink());
+        try {
+          const first = fake.sockets[0]!;
+          const subId = await authenticateNative(first, handle);
+          const event = mentionEvent({
+            author: owner.secretKey,
+            addressedTo: identity.pubkey,
+            createdAt: 1_800_020_000,
+          });
+
+          // 1. The admission starts and is held open.
+          first.emit("message", { data: frame(["EVENT", subId, event]) });
+          await flushMicrotasks();
+          expect(sink.entered()).toBe(true);
+          expect(sink.admitted).toEqual([event.id]);
+
+          // 2. Its connection dies underneath it, and 3. the replacement opens.
+          first.emit("error");
+          expect(first.closeCalls).toBe(1);
+          clock.fireAll();
+          const second = fake.sockets[1]!;
+          expect(second.listenerCount()).toBe(4);
+          expect(second.closeCalls).toBe(0);
+
+          // 4. Only now does the predecessor's tail run.
+          tail.settle(sink);
+          await handle.settled();
+
+          // The replacement is untouched: still open, still listening, no reconnect scheduled
+          // behind it, and no third socket where a stale `#reconnect()` would have left one.
+          expect(second.closeCalls).toBe(0);
+          expect(second.listenerCount()).toBe(4);
+          expect(clock.pending()).toBe(0);
+          expect(fake.sockets).toHaveLength(2);
+          expect(second.sent).toEqual([]);
+
+          // And it still works, which is what says the row measured a stale tail rather than a
+          // subscriber that had simply stopped doing anything.
+          const resumed = await authenticateNative(second, handle);
+          const next = mentionEvent({
+            author: owner.secretKey,
+            addressedTo: identity.pubkey,
+            text: "교체된 연결로",
+            createdAt: 1_800_020_500,
+          });
+          second.emit("message", { data: frame(["EVENT", resumed, next]) });
+          await flushMicrotasks();
+          expect(sink.entered()).toBe(true);
+          sink.resolve("DURABLE");
+          await handle.settled();
+          expect(sink.admitted).toEqual([event.id, next.id]);
+        } finally {
+          handle.close();
+        }
+
+        // The close is complete even after all of that.
+        expect(clock.pending()).toBe(0);
+        for (const socket of fake.sockets) expect(socket.listenerCount()).toBe(0);
+      } finally {
+        fake.restore();
+      }
+    });
+  }
+
+  /**
+   * The other thing a stale continuation must not do.
+   *
+   * `RETRY` and a rejection both leave the mark alone even when they are *current*, so neither row
+   * above can say anything about a stale `since` advance — asserting it there would be an
+   * assertion that passes for a reason unrelated to the fence. A stale `DURABLE` is the answer
+   * that does advance it, so that is where the claim belongs.
+   */
+  it("does not advance the mark from an admission whose connection was already replaced", async () => {
+    const fake = installFakeWebSocket();
+    try {
+      const { handle, clock, sink, identity, owner } = startOnNativeAdapter(deferredSink());
+      try {
+        const first = fake.sockets[0]!;
+        const subId = await authenticateNative(first, handle);
+        first.emit("message", {
+          data: frame([
+            "EVENT",
+            subId,
+            mentionEvent({
+              author: owner.secretKey,
+              addressedTo: identity.pubkey,
+              createdAt: 1_800_030_000,
+            }),
+          ]),
+        });
+        await flushMicrotasks();
+        expect(sink.entered()).toBe(true);
+
+        first.emit("error");
+        clock.fireAll();
+        const second = fake.sockets[1]!;
+
+        // Durable — but for a connection that no longer exists. The mark belongs to the live
+        // connection's request window, and this answer is not evidence about that window.
+        sink.resolve("DURABLE");
+        await handle.settled();
+
+        await authenticateNative(second, handle);
+        const req = second.sent
+          .map((raw) => JSON.parse(raw) as unknown[])
+          .find((sent) => sent[0] === "REQ") as [string, string, Record<string, unknown>];
+        expect(req[2]["since"]).toBeUndefined();
+        expect(Object.keys(req[2])).toEqual(["kinds", "#p"]);
       } finally {
         handle.close();
       }

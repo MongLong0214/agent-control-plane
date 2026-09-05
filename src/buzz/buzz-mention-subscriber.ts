@@ -664,18 +664,22 @@ class BuzzMentionSubscription {
       },
       onFrame: (raw) => {
         this.#queue = this.#queue.then(async () => {
-          // The fence, and it is checked *here* rather than at delivery: this line runs when the
-          // frame reaches the front of the queue, which is the only moment at which "is this
-          // still the connection I arrived on" has a truthful answer.
-          if (this.#stopped || generation !== this.#generation) return;
+          // Checked here, and then again everywhere below. Reaching the front of the queue is the
+          // *first* moment "is this still the connection I arrived on" has a truthful answer; it
+          // is not the last, because `#handleFrame` suspends on the sink.
+          if (!this.#isCurrent(generation)) return;
           try {
-            await this.#handleFrame(raw);
+            await this.#handleFrame(raw, generation);
           } catch {
             // A sink that threw established nothing about the message, so this is the `RETRY`
             // shape and is treated as one: the cursor stays where it is and the socket goes.
             // Letting it reject would take the queue's chain with it, and every later frame on
             // this connection would then be dropped silently.
-            this.#reconnect();
+            //
+            // Conditional on the generation, and that is the whole of the second defect: a
+            // rejection arriving after this connection was replaced used to reach an
+            // unconditional `#reconnect()` and drop *the replacement's* socket.
+            this.#reconnect(generation);
           }
         });
       },
@@ -736,39 +740,64 @@ class BuzzMentionSubscription {
     });
   }
 
-  /** Drops the socket without waiting for the relay to notice, and schedules the reconnect. */
-  #reconnect(): void {
+  /**
+   * Is `generation` still the connection this subscriber is running?
+   *
+   * The one question every suspended continuation has to ask again. A check that ran before an
+   * `await` is not a check on what happens after it: the connection can be retired, its
+   * replacement opened, and the tail of the old frame is still holding a reference to a
+   * subscriber whose state has entirely moved on.
+   */
+  #isCurrent(generation: number): boolean {
+    return !this.#stopped && generation !== 0 && generation === this.#generation;
+  }
+
+  /** A write, refused unless the connection that asked for it is still the connection. */
+  #send(generation: number, frame: string): void {
+    if (!this.#isCurrent(generation)) return;
+    this.#socket?.send(frame);
+  }
+
+  /**
+   * Drops the socket without waiting for the relay to notice, and schedules the reconnect.
+   *
+   * Takes the generation it means to drop, and drops nothing otherwise. Reconnecting is the most
+   * destructive thing a frame handler can do — it closes a live socket — so it is the last place
+   * that should be willing to act on behalf of a connection that has already gone.
+   */
+  #reconnect(generation: number): void {
+    if (!this.#isCurrent(generation)) return;
     this.#drop();
     this.#onClose();
   }
 
-  async #handleFrame(raw: string): Promise<BuzzMentionFrameOutcome> {
+  async #handleFrame(raw: string, generation: number): Promise<BuzzMentionFrameOutcome> {
     if (Buffer.byteLength(raw, "utf8") > MAX_RELAY_FRAME_BYTES) {
-      this.#reconnect();
+      this.#reconnect(generation);
       return rejected("frame-too-large");
     }
     let frame: unknown;
     try {
       frame = JSON.parse(raw) as unknown;
     } catch {
-      this.#reconnect();
+      this.#reconnect(generation);
       return rejected("frame-not-json");
     }
     if (!Array.isArray(frame) || typeof frame[0] !== "string") {
-      this.#reconnect();
+      this.#reconnect(generation);
       return rejected("frame-not-a-message");
     }
     switch (frame[0]) {
       case "AUTH":
-        return this.#onAuthChallenge(frame);
+        return this.#onAuthChallenge(frame, generation);
       case "OK":
-        return this.#onOk(frame);
+        return this.#onOk(frame, generation);
       case "EVENT":
-        return await this.#onEvent(frame);
+        return await this.#onEvent(frame, generation);
       case "EOSE":
-        return this.#onEose(frame);
+        return this.#onEose(frame, generation);
       case "CLOSED":
-        this.#reconnect();
+        this.#reconnect(generation);
         return rejected("unknown-subscription");
       default:
         // `NOTICE` and anything else a relay chooses to say. Ignored rather than treated as a
@@ -778,15 +807,19 @@ class BuzzMentionSubscription {
     }
   }
 
-  #onAuthChallenge(frame: readonly unknown[]): BuzzMentionFrameOutcome {
+  #onAuthChallenge(frame: readonly unknown[], generation: number): BuzzMentionFrameOutcome {
     const challenge = frame[1];
     if (frame.length !== 2 || typeof challenge !== "string" || challenge.length === 0) {
-      this.#reconnect();
+      this.#reconnect(generation);
       return rejected("frame-not-a-message");
     }
     const signed = finalizeEvent(makeAuthEvent(this.#deps.relayUrl, challenge), this.#secretKey);
+    // The auth state belongs to one connection, so it is written only while that connection is
+    // the one running. A stale challenge that overwrote `#authEventId` would make the
+    // replacement's own `OK` unrecognisable, and the subscription would never open.
+    if (!this.#isCurrent(generation)) return rejected("unknown-subscription");
     this.#authEventId = signed.id;
-    this.#socket?.send(JSON.stringify(["AUTH", signed]));
+    this.#send(generation, JSON.stringify(["AUTH", signed]));
     return ACCEPTED;
   }
 
@@ -797,20 +830,23 @@ class BuzzMentionSubscription {
    * demanded AUTH either returns nothing or returns a public subset, and the second is worse — the
    * subscriber would look healthy while missing exactly the messages the auth was for.
    */
-  #onOk(frame: readonly unknown[]): BuzzMentionFrameOutcome {
+  #onOk(frame: readonly unknown[], generation: number): BuzzMentionFrameOutcome {
     const id = frame[1];
     if (typeof id !== "string" || id !== this.#authEventId) return ACCEPTED;
     if (frame[2] !== true) {
-      this.#reconnect();
+      this.#reconnect(generation);
       return rejected("auth-refused");
     }
+    // Subscription state, like auth state, is one connection's. A stale `OK` marking the
+    // subscriber subscribed would let the *next* stale event past `#onEvent`'s own guard.
+    if (!this.#isCurrent(generation)) return rejected("unknown-subscription");
     this.#subscribed = true;
     const filter: Record<string, unknown> = {
       kinds: [BUZZ_MENTION_KIND],
       "#p": [this.#pubkey],
     };
     if (this.#since !== null) filter["since"] = this.#since;
-    this.#socket?.send(JSON.stringify(["REQ", this.#subscriptionId, filter]));
+    this.#send(generation, JSON.stringify(["REQ", this.#subscriptionId, filter]));
     return ACCEPTED;
   }
 
@@ -821,14 +857,18 @@ class BuzzMentionSubscription {
    * been advanced so far, so a reconnect asks for the tail rather than the whole history; and the
    * backoff resets, because a connection that reached EOSE is a connection that worked.
    */
-  #onEose(frame: readonly unknown[]): BuzzMentionFrameOutcome {
+  #onEose(frame: readonly unknown[], generation: number): BuzzMentionFrameOutcome {
     if (frame[1] !== this.#subscriptionId) return rejected("unknown-subscription");
+    // The attempt reset says "a connection reached the end of stored events and therefore
+    // worked". A stale EOSE says that about a connection that is gone, and would hand the live
+    // one a backoff schedule earned by a dead peer.
+    if (!this.#isCurrent(generation)) return rejected("unknown-subscription");
     this.#attempt = 0;
     if (this.#since === null) this.#since = 0;
     return ACCEPTED;
   }
 
-  async #onEvent(frame: readonly unknown[]): Promise<BuzzMentionFrameOutcome> {
+  async #onEvent(frame: readonly unknown[], generation: number): Promise<BuzzMentionFrameOutcome> {
     // The subscription id first, before a byte of the event is looked at. A relay that answers a
     // subscription this connection never opened is answering someone else's question.
     if (!this.#subscribed || frame[1] !== this.#subscriptionId) return rejected("unknown-subscription");
@@ -861,7 +901,7 @@ class BuzzMentionSubscription {
     if (!bound || bound.roleKey !== this.#roleKey || !constantTimeEquals(bound.buzzActorId, this.#pubkey)) {
       // A race, not a refusal: the cursor is preserved and the socket goes, so the same event is
       // asked for again once the registry has settled.
-      this.#reconnect();
+      this.#reconnect(generation);
       return rejected("role-not-held");
     }
 
@@ -872,8 +912,23 @@ class BuzzMentionSubscription {
       conversation,
       event: frozen,
     });
+
+    // **The suspension point.** Admission is the one genuinely slow thing this module does — it
+    // reaches a database and a live peer — and it is therefore the window in which this
+    // connection is most likely to have died and been replaced. Everything below acts on the
+    // subscriber's shared state, so from here the continuation is entitled to nothing until it
+    // has asked again.
+    //
+    // A stale tail is a complete no-op, whichever way the sink answered. Not because the answer
+    // is uninteresting, but because neither thing it would do is meaningful any more: a `RETRY`
+    // would close the *replacement's* socket to retry a request the replacement never made, and
+    // an advance would move the live connection's request window on the strength of a dead
+    // connection's answer. The message itself is not lost by either — the seam has it, or it does
+    // not, and an unadvanced mark simply means the replacement asks for it again.
+    if (!this.#isCurrent(generation)) return { rejected: null, admission };
+
     if (admission === "RETRY") {
-      this.#reconnect();
+      this.#reconnect(generation);
       return { rejected: null, admission };
     }
     this.#since = Math.max(this.#since ?? 0, event.created_at);
