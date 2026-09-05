@@ -574,13 +574,18 @@ that merely look contemporaneous.
 That co-location is not tidiness. `install-launchd.sh` does snapshot the plist and launcher —
 `snapshot_current_deployment` in `deploy/install-launchd.sh` — but it runs from exactly
 one call site, inside `install|upgrade`, and this procedure calls neither. So no
-snapshot is created by this run. And `rollback` selects one with
-`find "$deploy_backups_dir" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1` (`:373`) — the
-newest directory *by name*, which would be some earlier install's artifacts, or nothing at all
-(`fail "no prior deployment snapshot is available"`).
+snapshot is created by this run, and `deploy-backups/` holds whatever some earlier install left
+there, or nothing at all.
 
 **A rollback that restores a plist from a past install is not a rollback of this operation.**
 Both halves of item 6 therefore name `$BYTES_BACKUP` explicitly and never let a tool pick.
+
+`install-launchd.sh rollback` used to pick for itself — `find "$deploy_backups_dir" -mindepth 1
+-maxdepth 1 -type d | sort | tail -n 1`, the newest directory *by name*. That is the selection
+this section warned about, and it is gone: `rollback` now restores one **sealed pair** named by
+its UUID and refuses to discover anything (see "The sealed rollback pair" below). Neither form
+helps *this* procedure, which creates no pair of its own, so item 6 still names `$BYTES_BACKUP`
+at every step.
 
 **3. Stop the job, then rebuild the candidate, then validate on a throwaway copy — never the
 live file.**
@@ -844,18 +849,67 @@ the reverse would leave a database that looks verified. That is **not a usable b
 line refuses it before `rm -rf` runs, on its own, without needing to reason about the manifest.
 Clearing the orphan is written out at the end of item 4 step 2.
 
-`install-launchd.sh rollback` is deliberately **not** used here, and the reason is worth
-stating because reusing it looks obviously right. That path does stop the job, wait for the
-lock fail-closed, restore the database and restore a plist and launcher — but it selects them
-with `find … | sort | tail -n 1` inside `rollback` in `deploy/install-launchd.sh`, the newest
-directory in
-`deploy-backups/` **by name**. This procedure never calls `install`/`upgrade`, which is the
-only caller of `snapshot_current_deployment`, so it creates no
-snapshot of its own. `rollback` would therefore either abort with `no prior deployment
-snapshot is available`, or restore the plist and launcher of some earlier install — **a
-rollback to an identity that is not the one this operation replaced.**
+`install-launchd.sh rollback` is deliberately **not** used here, and the reason has changed
+shape. It used to be that the subcommand picked its own bytes — `find … | sort | tail -n 1`,
+the newest directory in `deploy-backups/` **by name** — so it would have restored the plist and
+launcher of some earlier install: *a rollback to an identity that is not the one this operation
+replaced.* That selection is gone. `rollback` now takes a sealed pair by UUID and a retained
+index digest, and discovers nothing.
 
-So the restore names `$BYTES_BACKUP` explicitly at every step and lets nothing pick for it.
+The reason it is still not used here is simpler and survives that fix: **this procedure seals no
+pair.** It never calls `install`/`upgrade`, it builds `$BYTES_BACKUP` by hand, and there is no
+pair id for it to name. So the restore names `$BYTES_BACKUP` explicitly at every step and lets
+nothing pick for it.
+
+### The sealed rollback pair
+
+A rollback is two restores that have to agree. Choosing them separately is what this section has
+spent several revisions guarding by hand: a database backup from one command, bytes from another,
+and a receipt written afterwards to say they belong together. The sealed pair makes that one
+artifact instead of an agreement between three.
+
+One UUID names a directory holding a **WAL-complete database backup** taken through the supported
+path, the **runtime closure** that reads it, the **launchd generation and config** that starts it,
+an **exact inventory**, and a **self-excluding `SHA256SUMS`** — self-excluding because a checksum
+file that covers itself proves nothing about the file it sits in. After it is sealed the pair
+depends on nothing outside its own root: not the source tree, not a registry, not the machine
+that made it. The tree moving on does not invalidate it.
+
+Seal one with the built module. It reads nothing from the host — every identity below is stated
+on the command line, including the runtime version, so the same command seals the generation you
+are leaving *and*, later, the one you are moving to as its return leg. A generation that could
+only be sealed by the machine currently running it would make a rollback a one-way door:
+
+    node /Users/isaac/projects/agent-control-plane/dist/deploy/rollback-pair.js seal \
+      --pairs-root "$HOME/.agent-control-plane/rollback-pairs" \
+      --database "$HOME/.agent-control-plane/state.sqlite" \
+      --runtime-root /Users/isaac/projects/agent-control-plane/dist \
+      --entrypoint daemon/agentcpd.js \
+      --node-path "$(command -v node)" --node-version "$(node --version)" \
+      --service-label com.agentcontrolplane.agentcpd \
+      --service-generation "$(git -C /Users/isaac/projects/agent-control-plane rev-parse HEAD)" \
+      --plist "$HOME/Library/LaunchAgents/com.agentcontrolplane.agentcpd.plist" \
+      --launcher "$HOME/.agent-control-plane/agentcpd-launch.sh"
+
+It prints `ACP_PAIR_ID` and `ACP_PAIR_INDEX_DIGEST` and writes nothing else. Seal while the job
+is stopped: the database member is taken through the supported backup path, which is WAL-coherent
+and leaves the source and both sidecars untouched, but a recovery point is worth more when
+nothing is writing to the file it is a point for.
+
+**Retain two values, outside the pair: the pair id, and `SHA256(SHA256SUMS)`.** The second one is
+the whole point. Every digest inside a pair can be rewritten by whoever rewrote a member — a
+forgery is internally perfect by construction — so the index digest is deliberately kept where
+the pair cannot reach it, and `rollback` refuses without it:
+
+    bash /Users/isaac/projects/agent-control-plane/deploy/install-launchd.sh rollback \
+      --pair-id <uuid> --expected-index-digest sha256:<64 hex>
+
+Before it stops anything, that command checks the pair id (a UUID — `latest` and a timestamp are
+both refused by name), the retained index digest, the exact inventory and every file digest, the
+declared schema, runtime and service identity, that every member is a regular non-symlink file,
+and that every member is still inside the pair root **after** its path is resolved. Only then does
+it stop the job, wait for the lock, restore the pair's own database, and install the pair's own
+plist and launcher. No member of one pair can satisfy another's inventory.
 `state-admin.js` is invoked from the **backup's** `dist`, not the live tree's, because the live
 tree's `dist` is what is being replaced two lines above.
 

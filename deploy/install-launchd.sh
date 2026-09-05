@@ -12,7 +12,13 @@ Usage:
   deploy/install-launchd.sh install [--app-root PATH] [--node PATH] [--keychain-service NAME] [--no-start]
   deploy/install-launchd.sh start | stop | restart | status | uninstall
   deploy/install-launchd.sh upgrade --app-root PATH [--node PATH] [--keychain-service NAME]
-  deploy/install-launchd.sh rollback --database-backup PATH
+  deploy/install-launchd.sh rollback --pair-id UUID --expected-index-digest sha256:HEX
+
+rollback restores one sealed pair, named by its UUID under
+$HOME/.agent-control-plane/rollback-pairs/. It selects nothing implicitly: the pair holds the
+WAL-complete database backup, the runtime closure and the launchd generation together, and
+--expected-index-digest is the SHA256(SHA256SUMS) retained outside the pair, without which a
+pair can vouch for a forgery of itself. Prevalidation runs before anything is stopped.
 
 The job always uses $HOME/.agent-control-plane because that is agentcpd's configured
 state root. Secrets never go in the plist: store ACP_MCP_TOKEN and ACP_OPERATOR_TOKEN (both required),
@@ -43,7 +49,8 @@ keychain_service="com.agentcontrolplane.agentcpd"
 buzz_keychain_service="${ACP_BUZZ_KEYCHAIN_SERVICE:-buzz-desktop}"
 buzz_keychain_account="${ACP_BUZZ_KEYCHAIN_ACCOUNT:-secrets}"
 buzz_keychain_identity="${ACP_BUZZ_KEYCHAIN_IDENTITY:-identity}"
-database_backup=""
+pair_id=""
+expected_index_digest=""
 no_start=0
 
 while [[ $# -gt 0 ]]; do
@@ -54,8 +61,10 @@ while [[ $# -gt 0 ]]; do
       node_path="${2:-}"; shift 2 ;;
     --keychain-service)
       keychain_service="${2:-}"; shift 2 ;;
-    --database-backup)
-      database_backup="${2:-}"; shift 2 ;;
+    --pair-id)
+      pair_id="${2:-}"; shift 2 ;;
+    --expected-index-digest)
+      expected_index_digest="${2:-}"; shift 2 ;;
     --no-start)
       no_start=1; shift ;;
     --help|-h)
@@ -78,6 +87,7 @@ launch_agents_dir="$home_dir/Library/LaunchAgents"
 plist_path="$launch_agents_dir/$LABEL.plist"
 launcher_path="$state_dir/agentcpd-launch.sh"
 deploy_backups_dir="$state_dir/deploy-backups"
+rollback_pairs_dir="$state_dir/rollback-pairs"
 domain="gui/$(id -u)"
 job="$domain/$LABEL"
 
@@ -364,25 +374,68 @@ case "$command_name" in
     printf 'removed launchd artifacts only; database and backups remain in %s\n' "$state_dir"
     ;;
   rollback)
-    [[ -n "$database_backup" && "$database_backup" = /* ]] ||
-      fail "rollback requires --database-backup /absolute/pre-migration-backup.sqlite"
+    # The pair is named, never discovered. This branch used to take
+    # `find "$deploy_backups_dir" -maxdepth 1 -type d | sort | tail -n 1` — the newest directory
+    # by name — and separately an operator-supplied database backup. Newest is not approved, and
+    # two independently chosen halves are not a pair: the plist could be from one generation and
+    # the database from another with nothing noticing. One sealed pair holds both.
+    [[ -n "$pair_id" ]] ||
+      fail "rollback requires --pair-id <uuid> naming the sealed pair to restore"
+    [[ "$pair_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] ||
+      fail "rollback pair id must be a UUID, never a name like 'latest': $pair_id"
+    [[ -n "$expected_index_digest" ]] ||
+      fail "rollback requires --expected-index-digest sha256:<hex>, the digest retained outside the pair"
+    [[ "$expected_index_digest" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+      fail "expected index digest must be sha256:<64 hex digits>: $expected_index_digest"
     resolve_app_root
     resolve_node
     private_directory "$state_dir"
-    private_directory "$deploy_backups_dir"
-    local_snapshot="$(find "$deploy_backups_dir" -mindepth 1 -maxdepth 1 -type d -print | sort | tail -n 1)"
-    [[ -n "$local_snapshot" ]] || fail "no prior deployment snapshot is available"
-    private_file "$local_snapshot/$LABEL.plist"
-    [[ -f "$local_snapshot/agentcpd-launch.sh" && ! -L "$local_snapshot/agentcpd-launch.sh" ]] || fail "saved launcher is invalid"
+    private_directory "$rollback_pairs_dir"
+    pair_root="$rollback_pairs_dir/$pair_id"
+    [[ -d "$pair_root" && ! -L "$pair_root" ]] || fail "no sealed rollback pair with this id: $pair_root"
+    pair_root="$(cd -P -- "$pair_root" && pwd)"
+    [[ "${pair_root##*/}" == "$pair_id" ]] ||
+      fail "the sealed pair directory resolves to a different id: $pair_root"
+    validator="$app_root/dist/deploy/rollback-pair.js"
+    [[ -f "$validator" ]] || fail "rollback pair validator build missing: $validator"
+
+    # Prevalidation, before anything is stopped, restored or replaced. The index digest is the one
+    # value deliberately kept outside the pair: a pair that vouches for its own index vouches for
+    # a forged one, because a forger rewrites the index alongside the member it altered.
+    index_shasum="$(/usr/bin/shasum -a 256 "$pair_root/SHA256SUMS")" ||
+      fail "sealed pair index is unreadable: $pair_root/SHA256SUMS"
+    actual_index_digest="sha256:${index_shasum%% *}"
+    [[ "$actual_index_digest" == "$expected_index_digest" ]] ||
+      fail "sealed pair index digest does not match the retained digest: expected $expected_index_digest, found $actual_index_digest"
+
+    pair_report="$("$node_path" "$validator" validate --pair-root "$pair_root" \
+      --pair-id "$pair_id" --expected-index-digest "$expected_index_digest")" ||
+      fail "sealed rollback pair failed validation: $pair_root"
+    pair_database=""
+    pair_plist=""
+    pair_launcher=""
+    while IFS='=' read -r report_key report_value; do
+      case "$report_key" in
+        ACP_PAIR_DATABASE) pair_database="$report_value" ;;
+        ACP_PAIR_PLIST) pair_plist="$report_value" ;;
+        ACP_PAIR_LAUNCHER) pair_launcher="$report_value" ;;
+      esac
+    done <<< "$pair_report"
+    for pair_member in "$pair_database" "$pair_plist" "$pair_launcher"; do
+      [[ -n "$pair_member" ]] || fail "the sealed pair validator did not report every member a rollback consumes"
+      [[ "$pair_member" == "$pair_root/"* ]] || fail "refusing a rollback member outside the sealed pair: $pair_member"
+      private_file "$pair_member"
+    done
+
     stop_job
     wait_for_stop
-    "$node_path" "$app_root/dist/db/state-admin.js" restore "$database_backup" \
+    "$node_path" "$app_root/dist/db/state-admin.js" restore "$pair_database" \
       --database "$state_dir/state.sqlite" --confirm-restore
-    cp "$local_snapshot/$LABEL.plist" "$plist_path"
-    cp "$local_snapshot/agentcpd-launch.sh" "$launcher_path"
+    cp "$pair_plist" "$plist_path"
+    cp "$pair_launcher" "$launcher_path"
     chmod 600 "$plist_path"
     chmod 700 "$launcher_path"
     start_job
-    printf 'rolled back deployment and restored database from %s\n' "$database_backup"
+    printf 'rolled back to sealed pair %s (database %s)\n' "$pair_id" "$pair_database"
     ;;
 esac

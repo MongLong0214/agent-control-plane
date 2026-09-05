@@ -1,4 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -11,6 +12,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 
+import { Db } from "../../src/db/database.ts";
+import { sealRollbackPair, type SealedRollbackPair } from "../../src/deploy/rollback-pair.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -135,6 +138,11 @@ if [[ "$target" == *"state-admin.js" ]]; then
   printf '%s\\n' "$*" >> "$ACP_STATE_ADMIN_LOG"
   exit 0
 fi
+if [[ "$target" == *"rollback-pair.js" ]]; then
+  # The real built validator, not a stub. A stub that exited 0 would make every rollback row
+  # here pass for a pair it never looked at, which is the shape of defect these rows exist for.
+  exec "$ACP_REAL_NODE" "$@"
+fi
 if [[ "$target" == *"render-launchd-plist.mjs" ]]; then
   if [[ "\${ACP_RENDER_REQUIRES_STOPPED:-0}" == "1" && -e "\${ACP_LOCK_PATH:-}" ]]; then
     exit 88
@@ -224,6 +232,43 @@ const assertRenderedPlist = (harness: InstallerHarness): void => {
   expect(plist).not.toContain("__ACP_");
   expect(plist).not.toContain("ACP_MCP_TOKEN");
   expect(plist).not.toContain("ACP_TELEGRAM_BOT_TOKEN");
+};
+
+/**
+ * A real sealed pair under this harness's state directory, built by the module the installer's
+ * validator is compiled from. The rollback rows below consume it end to end: the fake `node`
+ * hands `rollback-pair.js` to the real interpreter, so what runs is the actual validator against
+ * an actual pair rather than a stub that would agree with anything.
+ */
+const sealPairFor = async (
+  harness: InstallerHarness,
+  generation = "sealed-generation",
+): Promise<SealedRollbackPair> => {
+  const state = join(harness.home, ".agent-control-plane");
+  mkdirSync(state, { recursive: true, mode: 0o700 });
+  chmodSync(state, 0o700);
+
+  const source = join(harness.home, `pair-source-${generation}`);
+  mkdirSync(join(source, "runtime", "daemon"), { recursive: true, mode: 0o700 });
+  const databasePath = join(source, "state.sqlite");
+  new Db(databasePath).close();
+  chmodSync(databasePath, 0o600);
+  writeFileSync(join(source, "runtime", "daemon", "agentcpd.js"), `// ${generation}\n`, { mode: 0o600 });
+  const plist = join(source, `${label}.plist`);
+  writeFileSync(plist, `<?xml version="1.0"?><plist><dict><!-- ${generation} --></dict></plist>\n`, {
+    mode: 0o600,
+  });
+  const launcher = join(source, "agentcpd-launch.sh");
+  writeFileSync(launcher, `#!/bin/bash\n# ${generation}\nexec true\n`, { mode: 0o600 });
+
+  return sealRollbackPair(join(state, "rollback-pairs"), {
+    databasePath,
+    runtimeRoot: join(source, "runtime"),
+    entrypoint: "daemon/agentcpd.js",
+    nodePath: "/opt/sealed-generation/bin/node",
+    nodeVersion: "v22.18.0",
+    launchd: { label, generation, plistPath: plist, launcherPath: launcher },
+  });
 };
 
 const filesUnder = (directory: string): string[] => {
@@ -551,24 +596,13 @@ describe("launchd deployment artifact", () => {
     ]);
   });
 
-  it("refuses rollback unless an explicit database backup is supplied", () => {
-    const harness = makeHarness();
-    const result = runInstaller(
-      installer,
-      ["rollback", "--app-root", root, "--node", harness.node],
-      harness,
-    );
-
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain("rollback requires --database-backup");
-    expect(existsSync(harness.launchLog)).toBe(false);
-  });
-
-  it("waits for the daemon to stop before rollback invokes state restore", () => {
+  it("refuses a rollback that names no sealed pair, however many snapshots exist", () => {
     const harness = makeHarness();
     expect(
       runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness).status,
     ).toBe(0);
+    // `upgrade` is the only caller of snapshot_current_deployment, so after this there is a
+    // deployment snapshot on disk for an implicit selection to find and restore.
     expect(
       runInstaller(
         installer,
@@ -576,35 +610,143 @@ describe("launchd deployment artifact", () => {
         harness,
       ).status,
     ).toBe(0);
+    writeFileSync(harness.launchLog, "");
+
+    const result = runInstaller(
+      installer,
+      ["rollback", "--app-root", root, "--node", harness.node],
+      harness,
+    );
+
+    expect(result.status, "rollback proceeded without naming the pair it restores").not.toBe(0);
+    expect(result.stderr).toContain("rollback requires --pair-id");
+    expect(existsSync(harness.stateAdminLog)).toBe(false);
+    expect(readFileSync(harness.launchLog, "utf8")).toBe("");
+  });
+
+  it("refuses rollback unless the retained index digest is supplied", () => {
+    const harness = makeHarness();
+    const result = runInstaller(
+      installer,
+      ["rollback", "--app-root", root, "--node", harness.node, "--pair-id", randomUUID()],
+      harness,
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("rollback requires --expected-index-digest");
+    expect(existsSync(harness.launchLog)).toBe(false);
+  });
+
+  it("refuses `latest` and every other name that is not a pair id", () => {
+    const harness = makeHarness();
+    for (const pairId of ["latest", "20260901T000000Z-newest", "..", "../elsewhere"]) {
+      const result = runInstaller(
+        installer,
+        [
+          "rollback",
+          "--app-root",
+          root,
+          "--node",
+          harness.node,
+          "--pair-id",
+          pairId,
+          "--expected-index-digest",
+          `sha256:${"0".repeat(64)}`,
+        ],
+        harness,
+      );
+      expect(result.status, `rollback accepted the pair id ${pairId}`).not.toBe(0);
+      expect(result.stderr).toContain("must be a UUID, never a name like 'latest'");
+    }
+    expect(existsSync(harness.launchLog)).toBe(false);
+  });
+
+  it("refuses a pair whose index digest is not the one retained, before it stops anything", async () => {
+    const harness = makeHarness();
+    expect(
+      runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness).status,
+    ).toBe(0);
+    const pair = await sealPairFor(harness);
+    writeFileSync(harness.launchLog, "");
+
+    const result = runInstaller(
+      installer,
+      [
+        "rollback",
+        "--app-root",
+        root,
+        "--node",
+        harness.node,
+        "--pair-id",
+        pair.pairId,
+        "--expected-index-digest",
+        `sha256:${"0".repeat(64)}`,
+      ],
+      harness,
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("index digest does not match the retained digest");
+    // Prevalidation means before, not during: nothing was stopped and nothing was restored.
+    expect(readFileSync(harness.launchLog, "utf8")).toBe("");
+    expect(existsSync(harness.stateAdminLog)).toBe(false);
+    expect(readFileSync(plistPath(harness), "utf8")).not.toContain("sealed-generation");
+  });
+
+  it("waits for the daemon to stop, then restores the named pair's own database and plist", async () => {
+    const harness = makeHarness();
+    expect(
+      runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness).status,
+    ).toBe(0);
+    const pair = await sealPairFor(harness);
+    // A second, later pair the old implicit `sort | tail -n 1` would have preferred. Nothing may
+    // select it: this rollback names the first one.
+    const newer = await sealPairFor(harness, "generation-nobody-approved");
+    expect(newer.pairId).not.toBe(pair.pairId);
 
     // The fake daemon is loaded again so rollback must take it down. The fake node exits
     // non-zero if state-admin is reached while this lock still exists.
     writeFileSync(harness.loaded, "loaded\n", { mode: 0o600 });
     writeFileSync(harness.lock, "old daemon lock\n", { mode: 0o600 });
     writeFileSync(harness.launchLog, "");
-    const backup = join(harness.home, "operator-named-backup.sqlite");
     const rolledBack = runInstaller(
       installer,
-      ["rollback", "--app-root", root, "--node", harness.node, "--database-backup", backup],
+      [
+        "rollback",
+        "--app-root",
+        root,
+        "--node",
+        harness.node,
+        "--pair-id",
+        pair.pairId,
+        "--expected-index-digest",
+        pair.indexDigest,
+      ],
       harness,
     );
 
-    expect(rolledBack.status).toBe(0);
+    expect(rolledBack.status, rolledBack.stderr).toBe(0);
     expect(existsSync(harness.lock)).toBe(false);
-    expect(readFileSync(harness.stateAdminLog, "utf8")).toContain(`restore ${backup}`);
+    expect(readFileSync(harness.stateAdminLog, "utf8")).toContain(
+      `restore ${join(pair.root, pair.manifest.database.member)}`,
+    );
     expect(subcommands(harness.launchLog)).toEqual(["print", "bootout", "print", "bootstrap", "kickstart"]);
+    // The identity that was installed is the named pair's, not the newest one's.
+    expect(readFileSync(plistPath(harness), "utf8")).toContain("sealed-generation");
+    expect(readFileSync(plistPath(harness), "utf8")).not.toContain("generation-nobody-approved");
+    expect(readFileSync(launcherPath(harness), "utf8")).toContain("sealed-generation");
   });
 
   it("rejects a substring-only installer stub", () => {
     const stub = join(tempDir("acp-launchd-stub-"), "install-launchd.sh");
     const stubText = `#!/bin/bash
-# Usage: install start restart upgrade rollback --database-backup
+# Usage: install start restart upgrade rollback --pair-id --expected-index-digest
 # find-generic-password render-launchd-plist.mjs
 exit 0
 `;
     writeExecutable(stub, stubText);
     execFileSync("bash", ["-n", stub]);
-    for (const token of ["rollback", "--database-backup", "find-generic-password", "render-launchd-plist.mjs"]) {
+    for (const token of ["rollback", "--pair-id", "find-generic-password", "render-launchd-plist.mjs"]) {
       expect(stubText).toContain(token);
     }
 
