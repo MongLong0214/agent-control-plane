@@ -806,12 +806,12 @@ export const startDaemonBuzzMessageIngress = (
  */
 export const buzzMentionSubscriberRegistry = (cp: ControlPlane): BuzzMentionRegistry => ({
   primaryCtoBindingFor: (pubkey) => {
-    const actor = pubkey.trim();
-    if (actor.length === 0) return null;
+    const channelIdentity = pubkey.trim();
+    if (channelIdentity.length === 0) return null;
     const session = cp.db.get<{ session_id: string; buzz_actor_id: string | null }>(
       `SELECT session_id, buzz_actor_id FROM sessions
         WHERE buzz_actor_id = ? AND lifecycle IN ('READY','DRAINING')`,
-      [actor],
+      [channelIdentity],
     );
     if (!session || session.buzz_actor_id === null) return null;
     const held = currentBindingsForRoles(cp, MENTIONABLE_ROLES).filter(
