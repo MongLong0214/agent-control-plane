@@ -3558,42 +3558,33 @@ const GUARDS = [
     ],
   },
   {
-    // #737: the rollback preflight in docs/ops/owner-actions.md item 6 checks every file the
-    // rollback will read before its first destructive command (`rm -rf .../dist`). This row
-    // deletes the launcher check specifically, leaving the other checks around it intact, so a
-    // test that only asserted "some check exists somewhere" could not be fooled by this — the
-    // named test extracts the whole block and runs it against a fixture backup that is otherwise
-    // fully valid and is missing only the launcher file, so with this line gone the extracted
-    // script sails through every remaining check and actually runs `rm -rf` against the fixture's
-    // live dist directory.
-    what: "the rollback preflight refuses a missing launcher backup file before rm -rf runs",
+    // #737 and #745 round 4 left three rows here, each deleting one check from item 6's rollback
+    // preflight and asserting the extracted script then ran `rm -rf` against a fixture's live
+    // dist. All three are gone, and so is their subject: item 6 no longer builds a rollback out
+    // of a separately named database backup and bytes directory, so there is no preflight to
+    // delete a line from and no destructive command for a missing check to reach. Retired in the
+    // same commit that removed the block, because a row whose `find` names text that is not there
+    // has stopped checking anything while still reporting as a row.
+    //
+    // One row replaces them, and only one, because only one line in the new block is a guard the
+    // regression can kill. Measured both ways before this was written: deleting the explicit
+    // `--pair-id`/`--expected-index-digest` pair fails the named row below, while deleting a
+    // `test -n` line leaves all five rows passing — that one is a convenience for the operator,
+    // not a property anything asserts, and inventing a row for it would be false coverage.
+    //
+    // What this protects: the documented rollback names the sealed pair it restores. Without
+    // these flags the document tells an operator to run a rollback that selects nothing
+    // explicitly, which is the defect the sealed pair exists to remove, restated in the one place
+    // an operator reads during an emergency.
+    what: "the documented rollback names an explicit sealed pair rather than letting the installer be run without one",
     file: "docs/ops/owner-actions.md",
     find:
-      '    test -s "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist"\n' +
-      '    test -s "$BYTES_BACKUP/agentcpd-launch.sh"\n' +
-      '    test -s "$BACKUP_PATH"\n',
-    replace:
-      '    test -s "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist"\n' +
-      '    test -s "$BACKUP_PATH"\n',
-    killedBy: ["tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts"],
-  },
-  {
-    // #737, CEO's second-round finding: the launcher row above did not cover the *other* named
-    // counterexample — nothing mutated the state-admin.js existence/readability guard, so that
-    // half of the fixture had a test but no proof the test could fail. This row deletes both
-    // lines (existence and readability are one guard for this file; deleting only one would still
-    // leave the other blocking `rm -rf`, so it would not be about the file going missing at all).
-    // Reproduced by hand before this row existed: with these two lines removed and the
-    // state-admin-only-missing fixture otherwise fully valid, the extracted script ran `rm -rf`
-    // for real and the named test failed on that — proving the guard was untested, not merely
-    // unwritten.
-    what: "the rollback preflight refuses a missing backup state-admin.js before rm -rf runs",
-    file: "docs/ops/owner-actions.md",
-    find:
-      '    test -f "$BYTES_BACKUP/dist/db/state-admin.js"\n' +
-      '    test -r "$BYTES_BACKUP/dist/db/state-admin.js"\n',
-    replace: "",
-    killedBy: ["tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts"],
+      '    bash "$APP_ROOT/deploy/install-launchd.sh" rollback \\\n' +
+      '      --pair-id "$PAIR_ID" --expected-index-digest "$INDEX_DIGEST"\n',
+    replace: '    bash "$APP_ROOT/deploy/install-launchd.sh" rollback\n',
+    killedBy: [
+      "tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts::names a pair id and a retained digest, and carries no split-rollback token",
+    ],
   },
   {
     // #745 round 4, measured. Every `sqlite3` call in the database-backup block passes
@@ -3675,26 +3666,6 @@ const GUARDS = [
     replace: "",
     killedBy: [
       "tests/process/the-database-backup-step-fails-closed.test.ts::refuses when the backup's user_version does not read as an integer, before publishing a manifest",
-    ],
-  },
-  {
-    // #745 round 4, blocker 2's ordering half — the part that made the schema mismatch dangerous
-    // rather than merely wrong. Item 6's preflight checked that a manifest *existed*; it never
-    // checked that `restoreDatabase` would accept it, and those are different claims. So an
-    // unreadable manifest failed *after* `rm -rf .../dist`, in the procedure you reach for when
-    // things are already broken.
-    //
-    // Deleting the validating restore returns the preflight to existence-checking. The named test
-    // supplies a backup whose file is real, private and integral and whose manifest is exactly
-    // what this document wrote before this round: every remaining check passes, and `rm -rf` runs.
-    what: "the rollback preflight validates the backup through the real restore before rm -rf, not merely that a manifest exists",
-    file: "docs/ops/owner-actions.md",
-    find:
-      '    node "$BYTES_BACKUP/dist/db/state-admin.js" restore "$BACKUP_PATH" \\\n' +
-      '      --database "$ROLLBACK_PREFLIGHT_DIR/state.sqlite" --confirm-restore\n',
-    replace: "",
-    killedBy: [
-      "tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts::refuses to run rm -rf when the backup's manifest is one the real restore validator rejects",
     ],
   },
   {

@@ -528,9 +528,10 @@ verified backup, and deleting it is how the failure this section is about gets r
 Bytes — nothing in `deploy/install-launchd.sh` snapshots `dist/`; `snapshot_current_deployment`
 only copies the plist and the launcher shell script, and
 that function only runs from the `install`/`upgrade` subcommands, which this procedure does not
-use (the app root and node path are not changing — only the tree's contents are). Without this
-step, "roll back the bytes" in item 6 would have nothing to restore to, since rebuilding from any
-git commit produces new bytes, not the ones that were actually running:
+use (the app root and node path are not changing — only the tree's contents are). This copy is
+**forensic evidence**, not the rollback path: item 6 restores a sealed pair, which carries its own
+runtime closure. Keep it anyway — rebuilding from any git commit produces new bytes, not the ones
+that were actually running, and being able to compare the two afterwards is worth the disk:
 
     set -e
     BYTES_BACKUP="$HOME/.agent-control-plane/deploy-backups/dist-pre-512-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -558,7 +559,11 @@ complete.
 `$BACKUP_PATH` and `$BYTES_BACKUP` are produced by two independent commands — `state-admin.js`
 names the database backup, and the shell names the bytes directory — so **their timestamps are
 not the same value and must not be treated as a shared identity**. An earlier revision of this
-section claimed they were. Seal the pairing explicitly instead, and let item 6 read it back:
+section claimed they were, and a later one tried to fix it with a receipt file written afterwards
+by hand. Neither works: two independently chosen halves are not a pair no matter what a third file
+says about them, and the receipt is only as good as the shell session that wrote it. Seal a pair
+instead — see "The sealed rollback pair" below — and keep this receipt purely as a note about what
+was on the machine at the time:
 
     cat > "$BYTES_BACKUP/rollback-receipt.json" <<JSON
     { "databaseBackup": "$BACKUP_PATH",
@@ -567,9 +572,8 @@ section claimed they were. Seal the pairing explicitly instead, and let item 6 r
     JSON
     cat "$BYTES_BACKUP/rollback-receipt.json"
 
-The receipt is what makes the two halves one operation. Without it the pairing lives only in a
-shell variable that dies with the session, and a later rollback would be picking two backups
-that merely look contemporaneous.
+The receipt records what was here; it does not make two backups one operation. That is what the
+sealed pair is for, and item 6 uses nothing else.
 
 That co-location is not tidiness. `install-launchd.sh` does snapshot the plist and launcher —
 `snapshot_current_deployment` in `deploy/install-launchd.sh` — but it runs from exactly
@@ -772,94 +776,53 @@ construction.**
 
 The command block between the two HTML comment markers below is extracted verbatim, at test
 time, by `tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts`, which runs
-it against a disposable fixture standing in for `$HOME` and the app root, with a missing backup
-file, and asserts that `rm -rf` never runs. Moving the block out from under these markers, or
-editing a preflight check inside it, is not a formatting change: that test extracts from these
-markers and nowhere else, so it fails to find its anchor rather than silently testing stale text.
+it against a disposable fixture standing in for `$HOME` and the app root and asserts that it
+refuses fail-closed without touching anything. Moving the block out from under these markers, or
+editing a command inside it, is not a formatting change: that test extracts from these markers and
+nowhere else, so it fails to find its anchor rather than silently testing stale text.
+
+Set three values first, from the seal recorded under "The sealed rollback pair" below —
+`APP_ROOT` is the deployment checkout, `PAIR_ID` and `INDEX_DIGEST` are what that seal printed and
+you retained outside the pair.
 
 <!-- owner-actions:rollback-preflight:start -->
 
-    set -e
-    bash /Users/isaac/projects/agent-control-plane/deploy/install-launchd.sh stop
-    for i in $(seq 1 30); do [ -e "$HOME/.agent-control-plane/agentcpd.lock" ] || break; sleep 1; done
-    if [ -e "$HOME/.agent-control-plane/agentcpd.lock" ]; then
-      echo "agentcpd lock remains after stop; refusing to replace deployment bytes" >&2
-      exit 1
-    fi
-    # Everything this rollback will read, checked before anything is destroyed. The list is
-    # derived from the commands below, not from what seems likely to be missing: each `cp`
-    # source and each file passed to `node` appears here, in the form it is used in.
-    test -f "$BYTES_BACKUP/dist/daemon/agentcpd.js"
-    test -f "$BYTES_BACKUP/dist/db/state-admin.js"
-    test -r "$BYTES_BACKUP/dist/db/state-admin.js"
-    test -s "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist"
-    test -s "$BYTES_BACKUP/agentcpd-launch.sh"
-    test -s "$BACKUP_PATH"
-    test -s "$BACKUP_PATH.manifest.json"
-    sqlite3 "$BACKUP_PATH" "PRAGMA integrity_check;" | grep -qx ok
-    shasum -a 256 "$BYTES_BACKUP/dist/daemon/agentcpd.js" | \
-      cut -d' ' -f1 | grep -qxf <(cut -d' ' -f1 "$BYTES_BACKUP/agentcpd.js.sha256")
-    # The restore, run for real against a throwaway database, before anything is destroyed.
-    # Every check above this line asks whether a file is *present*; none of them asks whether
-    # `restoreDatabase` will accept it, and those are different claims. `readManifest` alone can
-    # refuse on the manifest's format, its `databaseFile`, its `databaseSha256` shape, its
-    # `schemaVersion`, or either file's permissions — and `validateBackup` then re-hashes the
-    # image, re-checks its integrity, and asserts this schema's invariants at its recorded
-    # version. A backup that fails any of those was going to fail *after* `rm -rf dist`, in the
-    # procedure you reach for when things are already broken. This is the same command as the
-    # real restore below, differing only in `--database`, so what it proves is not a proxy.
-    ROLLBACK_PREFLIGHT_DIR="$BYTES_BACKUP/rollback-preflight"
-    rm -rf "$ROLLBACK_PREFLIGHT_DIR"
-    mkdir -p "$ROLLBACK_PREFLIGHT_DIR"
-    chmod 700 "$ROLLBACK_PREFLIGHT_DIR"
-    node "$BYTES_BACKUP/dist/db/state-admin.js" restore "$BACKUP_PATH" \
-      --database "$ROLLBACK_PREFLIGHT_DIR/state.sqlite" --confirm-restore
-    rm -rf /Users/isaac/projects/agent-control-plane/dist
-    cp -a "$BYTES_BACKUP/dist" /Users/isaac/projects/agent-control-plane/dist
-    cp "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist" "$HOME/Library/LaunchAgents/com.agentcontrolplane.agentcpd.plist"
-    cp "$BYTES_BACKUP/agentcpd-launch.sh" "$HOME/.agent-control-plane/agentcpd-launch.sh"
-    chmod 600 "$HOME/Library/LaunchAgents/com.agentcontrolplane.agentcpd.plist"
-    chmod 700 "$HOME/.agent-control-plane/agentcpd-launch.sh"
-    node "$BYTES_BACKUP/dist/db/state-admin.js" restore "$BACKUP_PATH" \
-      --database "$HOME/.agent-control-plane/state.sqlite" --confirm-restore
-    bash /Users/isaac/projects/agent-control-plane/deploy/install-launchd.sh start
+    set -eu
+    # Nothing here selects anything. There is no backup to name, no bytes directory to pick and
+    # no plist to choose: the pair id names one sealed generation and the retained digest proves
+    # it is that one. Everything a rollback used to do by hand — stop the job, wait for the lock
+    # fail-closed, check the artifacts, restore the database, put the runtime and launchd config
+    # back — happens inside this one command, which refuses before it changes anything and puts
+    # the previous generation back if any step after the stop fails.
+    test -n "$APP_ROOT"
+    test -n "$PAIR_ID"
+    test -n "$INDEX_DIGEST"
+    bash "$APP_ROOT/deploy/install-launchd.sh" rollback \
+      --pair-id "$PAIR_ID" --expected-index-digest "$INDEX_DIGEST"
+    bash "$APP_ROOT/deploy/install-launchd.sh" status
 
 <!-- owner-actions:rollback-preflight:end -->
 
-Those checks run **before** the first destructive command, and the list is complete rather than
-representative: every `cp` source and every path handed to `node` below appears above, checked
-in the form it is used in — `-r` on `state-admin.js` because `node` reads it, `-s` on the
-launcher and plist because they are copied and must not be empty.
+**Why this is three lines and a command instead of a preflight.** The earlier version of this
+block was a hand-built rollback: it named a database backup in one variable and a bytes directory
+in another, checked each file it was about to consume, and then ran `rm -rf` against the live
+`dist`. Every one of those checks was necessary *because the two halves were selected separately*
+— nothing tied the database it restored to the bytes it copied, so the document had to re-derive
+by hand what a pair now carries. It also had to be complete rather than representative: an earlier
+revision checked three of the files it consumed and then used two more it had never looked at, so
+`rm -rf dist` and half the restore ran before the failure and left the rollback stranded.
 
-An earlier revision checked only three of them and then consumed `agentcpd-launch.sh` and
-`dist/db/state-admin.js` without ever having looked at either. If one of those were missing or
-truncated, `rm -rf dist` and part of the restore would already have run before the failure —
-`set -e` would stop the daemon from starting, but the rollback itself would be stranded
-half-applied. **A preflight that names some of what follows is not a preflight**; it is a
-sample, and the ones it omits are exactly the ones nobody thought about.
+The sealed pair removes the class rather than the symptom. There is one artifact, its members are
+verified against a digest retained outside it, they are copied into an owner-only stage and
+re-verified before anything is installed, and a failure after the stop restores the previous
+runtime, plist and launcher and starts the service again. A destructive command against the live
+tree no longer appears in this document at all, which is why the test that guards this block now
+asserts that none is present.
 
-The hash comparison closes the other half: it re-hashes the bytes **in the backup**, not the
-source they came from, so a copy that silently truncated is caught here rather than after the
-live `dist` is gone.
-
-`test -s "$BACKUP_PATH"` also covers the one incomplete state item 4 step 2 can leave behind. A
-backup run killed untrappably between its two links leaves a manifest at
-`$BACKUP_PATH.manifest.json` with no database — the deliberate direction of that ordering, since
-the reverse would leave a database that looks verified. That is **not a usable backup**, and this
-line refuses it before `rm -rf` runs, on its own, without needing to reason about the manifest.
-Clearing the orphan is written out at the end of item 4 step 2.
-
-`install-launchd.sh rollback` is deliberately **not** used here, and the reason has changed
-shape. It used to be that the subcommand picked its own bytes — `find … | sort | tail -n 1`,
-the newest directory in `deploy-backups/` **by name** — so it would have restored the plist and
-launcher of some earlier install: *a rollback to an identity that is not the one this operation
-replaced.* That selection is gone. `rollback` now takes a sealed pair by UUID and a retained
-index digest, and discovers nothing.
-
-The reason it is still not used here is simpler and survives that fix: **this procedure seals no
-pair.** It never calls `install`/`upgrade`, it builds `$BYTES_BACKUP` by hand, and there is no
-pair id for it to name. So the restore names `$BYTES_BACKUP` explicitly at every step and lets
-nothing pick for it.
+If the rollback refuses, it has changed nothing — not the database, not the bytes, not even the
+directories it looked in. Read the refusal, fix what it names, and run it again. If it fails
+*after* the stop, it has already put the previous generation back and started the service; that is
+a failed rollback, not a half-applied one, and the deployment is where it was before you ran it.
 
 ### The sealed rollback pair
 
@@ -936,16 +899,16 @@ previous runtime, plist and launcher are put back from the copy taken before the
 and the job is started again, so a failed rollback leaves the deployment whole rather than mixed
 or stopped.
 
-**Item 6 above predates this and still restores the two halves separately.** It is kept because
-the test that guards it extracts and executes the block between its markers verbatim, and that
-test lives outside this change's ceiling; retiring the split procedure means retiring that test's
-subject in the same commit. Until that happens, prefer a sealed pair whenever one exists, and read
-item 6 as the fallback for a deployment that has none.
+**Item 6 runs this and nothing else.** The split procedure it used to carry is gone, along with
+the destructive command that made its preflight necessary.
 
-The guard above all of this is not optional: `rm -rf dist` against a still-running daemon
-replaces the bytes of a live process, and the database restore is then refused by the lock a
-moment later, leaving a **partial rollback** — old bytes, new schema — the one combination
-`applySchema` refuses outright and `KeepAlive` then retries forever.
+Why the whole generation has to move together is worth keeping, because it is what the pair is
+for. Replacing the bytes of a still-running daemon and then having the database restore refused by
+the lock a moment later leaves a **partial rollback** — old bytes, new schema — the one
+combination `applySchema` refuses outright and `KeepAlive` then retries forever. A sealed pair
+cannot reach that state: it stops the job and waits for the lock fail-closed before it changes
+anything, and if any step after the stop fails it puts the previous generation back and starts the
+service again.
 
 Restoring only the database and leaving 34-declaring bytes in place no longer silently undoes
 itself — since #738 a build opening a database *older* than itself refuses unless an approval
