@@ -1,16 +1,27 @@
-import { createConnection, type Socket } from "node:net";
+import { chmodSync, writeFileSync } from "node:fs";
+import { createConnection, createServer, type Server, type Socket } from "node:net";
+import { join } from "node:path";
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
+import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import { afterAll, describe, expect, it } from "vitest";
 
 import {
   configuredBuzzMessageOwnerActors,
   startBuzzActorIngressListener,
   startBuzzMessageIngressListener,
+  startDaemonBuzzMentionSubscriber,
   startDaemonBuzzMessageIngress,
   startLocalMcpListeners,
 } from "../../src/daemon/agentcpd.ts";
+import {
+  BUZZ_MENTION_ADDRESSED_TO,
+  BUZZ_SUBSCRIBER_CONFIG_FILENAME,
+  type BuzzRelaySocketFactory,
+  type BuzzRelaySocketHandlers,
+  type BuzzSubscriberScheduler,
+} from "../../src/buzz/buzz-mention-subscriber.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { allow } from "../../src/core/errors.ts";
 import { digestOf } from "../../src/core/digest.ts";
@@ -23,12 +34,18 @@ import {
 import {
   BuzzMessageIngress,
   buzzMessageNonce,
+  buzzMessagePayload,
   buzzMessageSigningRequest,
   ownerMessageQueuedSentence,
+  ownerMessagePointerOf,
   type BuzzMentionRouter,
 } from "../../src/ingress/buzz-message.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
-import { RoleConversationPort } from "../../src/mcp/role-conversation.ts";
+import {
+  C0_QUALIFIED_CLIENT,
+  ROLE_WAKE_FRAME,
+  RoleConversationPort,
+} from "../../src/mcp/role-conversation.ts";
 import type { McpPeerAuthenticator } from "../../src/mcp/shared.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { bindCeo, fixtureManifest, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
@@ -318,6 +335,15 @@ interface ToolBody {
 const connectRolePeer = async (
   socketPath: string,
   credential: { token: string; sessionId: string; sessionSecret: string },
+  /**
+   * The client build this connection announces.
+   *
+   * Defaulted, because only one row needs a specific one: `role_wake_endpoint_register` is pinned
+   * to the qualified 2.1.259 runtime, so the row that registers an endpoint has to arrive as that
+   * build. Every other row is unaffected by what it says here, and passing the pin unconditionally
+   * would have made those rows quietly depend on a version they never exercise.
+   */
+  clientInfo: { name: string; version: string } = { name: "buzz-role-peer", version: "1" },
 ): Promise<{
   socket: Socket;
   callTool: (name: string, args: Record<string, unknown>) => Promise<ToolBody>;
@@ -364,7 +390,7 @@ const connectRolePeer = async (
       params: {
         protocolVersion: "2025-11-25",
         capabilities: {},
-        clientInfo: { name: "buzz-role-peer", version: "1" },
+        clientInfo,
       },
     })}\n${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}\n`,
   );
@@ -400,6 +426,113 @@ const fakeRolePeer = () =>
       getClientVersion: () => ({ name: "claude-code", version: "2.1.259" }),
     },
   }) as never;
+
+/**
+ * The relay, as a thing this test hands frames to.
+ *
+ * No network and no `WebSocket`: the subscriber takes its socket factory as an argument precisely
+ * so the composition rows can be about the daemon rather than about a relay being up.
+ */
+interface ManualRelaySocket {
+  sent: string[];
+  closed: boolean;
+  handlers: BuzzRelaySocketHandlers;
+}
+
+const manualRelay = () => {
+  const sockets: ManualRelaySocket[] = [];
+  const factory: BuzzRelaySocketFactory = (_url, handlers) => {
+    const socket: ManualRelaySocket = { sent: [], closed: false, handlers };
+    sockets.push(socket);
+    return {
+      send: (raw) => socket.sent.push(raw),
+      close: () => {
+        socket.closed = true;
+      },
+    };
+  };
+  const live = (): ManualRelaySocket => {
+    const socket = sockets.at(-1);
+    if (!socket) throw new Error("the subscriber opened no relay socket");
+    return socket;
+  };
+  const framesOf = (socket: ManualRelaySocket): unknown[][] =>
+    socket.sent.map((raw) => JSON.parse(raw) as unknown[]);
+  return {
+    factory,
+    live,
+    /** The filter of the newest connection's `REQ`. */
+    reqFilter: (): Record<string, unknown> => {
+      const req = framesOf(live()).find((sent) => sent[0] === "REQ");
+      if (!req) throw new Error("the subscriber sent no REQ");
+      return req[2] as Record<string, unknown>;
+    },
+    /** NIP-42, then the subscription id the relay must answer on. */
+    authenticateAndSubscribe: async (handle: { settled(): Promise<void> }): Promise<string> => {
+      const socket = live();
+      socket.handlers.onFrame(JSON.stringify(["AUTH", "relay-challenge"]));
+      await handle.settled();
+      const auth = framesOf(socket).at(-1) as [string, { id: string }];
+      expect(auth[0]).toBe("AUTH");
+      socket.handlers.onFrame(JSON.stringify(["OK", auth[1].id, true, ""]));
+      await handle.settled();
+      const req = framesOf(socket).find((sent) => sent[0] === "REQ") as [string, string, unknown];
+      expect(req[0]).toBe("REQ");
+      return req[1];
+    },
+  };
+};
+
+/** The reconnect clock, stepped rather than waited out. */
+const steppedClock = () => {
+  const timers = new Map<number, () => void>();
+  let next = 1;
+  const scheduler: BuzzSubscriberScheduler = {
+    setTimer: (_ms, fire) => {
+      const handle = next++;
+      timers.set(handle, fire);
+      return handle;
+    },
+    clearTimer: (handle) => {
+      timers.delete(handle);
+    },
+  };
+  return {
+    scheduler,
+    fireAll: (): void => {
+      for (const [handle, fire] of [...timers]) {
+        timers.delete(handle);
+        fire();
+      }
+    },
+  };
+};
+
+/** The socket a woken client binds for itself, and a record of the exact bytes that arrived. */
+const listeningWakeEndpoint = async (
+  path: string,
+): Promise<{ path: string; received: string[]; close: () => Promise<void> }> => {
+  const received: string[] = [];
+  const server: Server = createServer((socket) => {
+    let text = "";
+    socket.on("data", (chunk: Buffer) => {
+      text += chunk.toString();
+    });
+    socket.on("end", () => received.push(text));
+  });
+  await new Promise<void>((resolveListen, reject) => {
+    server.once("error", reject);
+    server.listen(path, () => {
+      server.removeListener("error", reject);
+      resolveListen();
+    });
+  });
+  return {
+    path,
+    received,
+    close: () => new Promise<void>((resolveClose) => server.close(() => resolveClose())),
+  };
+};
 
 describe("the daemon's Buzz message ingress", () => {
   it("delivers an owner's Buzz message to the holder of the active CEO binding without spawning a session child", async () => {
@@ -1239,6 +1372,196 @@ describe("the daemon's Buzz message ingress", () => {
     } finally {
       await ingress.close();
       await peer.close();
+      await listeners.close();
+    }
+  }, 60_000);
+
+  /**
+   * The front door, joined to the seam behind it (#760 Part C).
+   *
+   * Everything above this row starts at a local socket somebody else wrote to, which is exactly
+   * what `#627` measured: the messages arrived because a person ran a CLI. This row starts one
+   * step earlier — at a signed relay event — and runs the daemon's own composition all the way to
+   * the holder settling it, so the thing under test is the *wiring*: `startDaemonBuzzMentionSubscriber`
+   * is the function `main` calls, the ingress is the one `startDaemonBuzzMessageIngress` returned,
+   * and the CTO socket is the real one. Nothing here constructs a port or a guard.
+   *
+   * The counts are the assertion. One relay event has to produce **one** of each durable thing,
+   * and the inclusive redelivery that a reconnect necessarily causes has to produce **none** — by
+   * the admission seam's own replay refusal, because this subscriber holds no dedup and no cursor
+   * file to refuse it with.
+   */
+  it("carries one signed relay event through the daemon's own subscriber into one durable owner message, and a reconnect's replay adds nothing", async () => {
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+
+    // Real keys, because the event's signature is the thing the subscriber verifies and a fixture
+    // string could not be verified at all.
+    const ctoKey = generateSecretKey();
+    const ctoPubkey = getPublicKey(ctoKey);
+    const ownerKey = generateSecretKey();
+    const ownerPubkey = getPublicKey(ownerKey);
+
+    const session = readyBoundSession(harness, "cto-relay-peer", ctoPubkey, [projectId]);
+
+    const mcpStateDir = tempDir("acp-buzz-relay-mcp-");
+    chmodSync(mcpStateDir, 0o700);
+    const listeners = await startLocalMcpListeners(harness.cp, mcpStateDir, MCP_TOKEN);
+    const ctoSocket = listeners.socketPaths[1];
+    if (!ctoSocket) throw new Error("the CTO MCP listener was not started");
+    const endpoint = await listeningWakeEndpoint(join(mcpStateDir, "cto.wake.sock"));
+    const peer = await connectRolePeer(
+      ctoSocket,
+      { token: MCP_TOKEN, sessionId: session.sessionId, sessionSecret: session.sessionSecret },
+      C0_QUALIFIED_CLIENT,
+    );
+
+    // One directory for both, the way `main` has one `stateDir`: the ingress socket and the
+    // subscriber's config file live beside each other.
+    const buzzStateDir = tempDir("acp-buzz-relay-");
+    const keyFile = join(buzzStateDir, "cto.nostr.key");
+    writeFileSync(keyFile, `${Buffer.from(ctoKey).toString("hex")}\n`, { mode: 0o600 });
+    chmodSync(keyFile, 0o600);
+    writeFileSync(
+      join(buzzStateDir, BUZZ_SUBSCRIBER_CONFIG_FILENAME),
+      JSON.stringify({
+        relayUrl: "wss://relay.example.invalid/buzz",
+        identities: [{ privateKeyFile: keyFile, encoding: "hex" }],
+      }),
+    );
+
+    const ingress = await startDaemonBuzzMessageIngress(
+      harness.cp,
+      buzzStateDir,
+      // The owner is the key that signs the event; the relay allowlist is wider, as in production.
+      { allowedActors: [ownerPubkey, NON_OWNER], secret: SECRET },
+      listeners,
+      [ownerPubkey],
+    );
+
+    const relay = manualRelay();
+    const clock = steppedClock();
+    const subscriber = startDaemonBuzzMentionSubscriber(
+      harness.cp,
+      buzzStateDir,
+      { allowedActors: [ownerPubkey, NON_OWNER], secret: SECRET },
+      ingress,
+      { openSocket: relay.factory, scheduler: clock.scheduler },
+    );
+
+    try {
+      expect(subscriber.socketCount).toBe(1);
+      expect(subscriber.roleKeys).toEqual([roleKey]);
+      await until(
+        () => listeners.ctoConversation.connected(roleKey),
+        "the CTO connection to become the role's live peer",
+      );
+      const registered = await peer.callTool("role_wake_endpoint_register", {
+        endpoint: endpoint.path,
+      });
+      expect(registered.ok, registered.message).toBe(true);
+      // Registration's own unconditional drain, before the message exists. Counted here so the
+      // wake this row is about is the *next* one rather than this one.
+      await until(() => endpoint.received.length === 1, "the registration's unconditional wake");
+
+      const event = finalizeEvent(
+        {
+          kind: 9,
+          created_at: 1_800_500_000,
+          tags: [
+            ["p", ctoPubkey],
+            ["h", "buzz-cto-room"],
+          ],
+          content: "릴레이로 들어온 지시",
+        },
+        ownerKey,
+      );
+      const subId = await relay.authenticateAndSubscribe(subscriber);
+      relay.live().handlers.onFrame(JSON.stringify(["EVENT", subId, event]));
+      await subscriber.settled();
+
+      // One inbound row, holding the only durable copy of the words.
+      expect(admittedText(harness, event.id)).toBe("릴레이로 들어온 지시");
+      expect(
+        harness.cp.db.all(`SELECT nonce FROM inbound_messages WHERE channel = 'buzz'`, []),
+      ).toHaveLength(1);
+
+      // One `OWNER_MESSAGE`, and a pointer rather than a copy — the digest is over the *full*
+      // signed payload, so a rewritten address would not resolve to it.
+      const queued = queuedOwnerMessages(harness);
+      expect(queued).toHaveLength(1);
+      const row = queued[0]!;
+      expect(row.role_key).toBe(roleKey);
+      expect(row.target_session_id).toBe(session.sessionId);
+      expect(ownerMessagePointerOf(JSON.parse(row.payload_json) as unknown)).toEqual({
+        sourceChannel: "buzz",
+        sourceNonce: buzzMessageNonce(event.id),
+        sourcePayloadDigest: digestOf(
+          buzzMessagePayload({
+            conversation: "buzz-cto-room",
+            addressedTo: BUZZ_MENTION_ADDRESSED_TO,
+            mention: ctoPubkey,
+            text: "릴레이로 들어온 지시",
+          }),
+        ),
+      });
+
+      // One turn, and nobody has answered it.
+      const claim = JSON.parse(admittedRow(harness, event.id)!.turn_claim_json!) as {
+        turnRequestId: string;
+        noReplyAt?: unknown;
+      };
+      expect(claim.turnRequestId).toBe(row.message_id);
+      expect(claim.noReplyAt).toBeUndefined();
+
+      // The exact wake, and nothing else on the endpoint. The frame is a version-pinned local
+      // contract; a row that accepted any bytes would pass against a wake no real client reads.
+      await until(() => endpoint.received.length === 2, "the wake this message's admission sends");
+      expect(endpoint.received).toEqual([ROLE_WAKE_FRAME, ROLE_WAKE_FRAME]);
+
+      // The holder takes it, once, over its own authenticated connection.
+      const claimed = await peer.callTool("role_owner_message_claim", { roleKey });
+      expect(claimed.ok, claimed.message).toBe(true);
+      expect((claimed.value as { claimed?: { text?: string } }).claimed?.text).toBe(
+        "릴레이로 들어온 지시",
+      );
+      const again = await peer.callTool("role_owner_message_claim", { roleKey });
+      expect((again.value as { claimed?: unknown }).claimed ?? null).toBeNull();
+
+      const completed = await peer.callTool("role_owner_message_complete", {
+        roleKey,
+        messageId: row.message_id,
+      });
+      expect(completed.ok, completed.message).toBe(true);
+      expect(harness.cp.outbox.get(row.message_id)?.status).toBe("ACKED");
+      expect(
+        JSON.parse(admittedRow(harness, event.id)!.turn_claim_json!) as { noReplyAt?: unknown },
+      ).toMatchObject({ noReplyAt: expect.any(String) });
+
+      // The reconnect, and the redelivery it necessarily causes. `since` is inclusive, so the
+      // relay sends this event again — and the admission seam refuses it. Nothing in the
+      // subscriber refuses it, because nothing in the subscriber remembers it.
+      relay.live().handlers.onClose();
+      clock.fireAll();
+      const resumed = await relay.authenticateAndSubscribe(subscriber);
+      expect(relay.reqFilter()).toMatchObject({ since: 1_800_500_000 });
+      relay.live().handlers.onFrame(JSON.stringify(["EVENT", resumed, event]));
+      await subscriber.settled();
+
+      expect(
+        harness.cp.db.all(`SELECT nonce FROM inbound_messages WHERE channel = 'buzz'`, []),
+      ).toHaveLength(1);
+      expect(queuedOwnerMessages(harness).map((queuedRow) => queuedRow.message_id)).toEqual([
+        row.message_id,
+      ]);
+      expect(harness.cp.outbox.get(row.message_id)?.status).toBe("ACKED");
+      expect(endpoint.received).toEqual([ROLE_WAKE_FRAME, ROLE_WAKE_FRAME]);
+    } finally {
+      subscriber.close();
+      await ingress.close();
+      await peer.close();
+      await endpoint.close();
       await listeners.close();
     }
   }, 60_000);
