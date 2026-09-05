@@ -72,6 +72,9 @@ import { MessageKind } from "../outbox/envelope.ts";
 import type { HolderIdentity } from "../outbox/outbox.ts";
 import { respond, type AuthenticatedMcpPeer, type McpPeerAuthenticator } from "../mcp/shared.ts";
 import type { AuthenticatedOperatorPeer, Daemon } from "./daemon.ts";
+import { executeCanonicalSelfClaimOperator } from "./canonical-self-claim-operator.ts";
+import { startCanonicalSelfClaimListener, type CanonicalSelfClaimListener } from "./canonical-self-claim-listener.ts";
+import { readOneJsonLineRequest } from "./local-socket-framing.ts";
 
 const MAX_MCP_LINE_BYTES = 1024 * 1024;
 const DEFAULT_MCP_HANDSHAKE_TIMEOUT_MS = 5_000;
@@ -226,6 +229,13 @@ export interface LocalOperatorSocketOptions {
   mcpToken?: string;
   /** The sole additional operator method: a fresh-install Hermes authority bootstrap. */
   bootstrapHermes?: (params: Record<string, unknown>) => Promise<Decision<unknown>>;
+  // #760 round 6 — there used to be a `claimCanonicalCto` option here, dispatched alongside
+  // `bootstrapHermes` on this same bearer-token-authenticated socket. The CEO's ruling on the
+  // mint/claim separation removed it: "a process may prove who it is, but it cannot approve
+  // itself" means the claiming connection cannot sit on this credential surface at all, not even
+  // behind its own kernel-credential check layered on top. It now has its own dedicated,
+  // token-less listener — `startCanonicalSelfClaimListener` in `canonical-self-claim-listener.ts`
+  // — which this socket neither starts nor knows the method name of any more.
 }
 
 interface LiveOperatorBinding extends LocalOperatorCredential {
@@ -1089,14 +1099,13 @@ const serveOperatorRequest = (
   requestTimeoutMs: number,
   options: LocalOperatorSocketOptions,
 ): void => {
-  let buffer = Buffer.alloc(0);
   let settled = false;
   let timeout: NodeJS.Timeout | null = null;
   const finish = (decision: Decision<unknown>): void => {
     if (settled) return;
     settled = true;
     if (timeout) clearTimeout(timeout);
-    socket.removeListener("data", receive);
+    frame.dispose();
     if (!socket.destroyed) socket.end(`${JSON.stringify(decision)}\n`);
   };
   const beginRequest = (method: string): void => {
@@ -1116,63 +1125,67 @@ const serveOperatorRequest = (
     }, budgetMs);
     timeout.unref();
   };
-  const receive = (chunk: Buffer): void => {
-    buffer = Buffer.concat([buffer, chunk]);
-    if (buffer.length > MAX_MCP_LINE_BYTES) {
-      return finish(deny(ReasonCode.INVALID_ARGUMENT, "operator request exceeds local transport limit"));
-    }
-    const boundary = buffer.indexOf(0x0a);
-    if (boundary === -1) return;
-    if (buffer.subarray(boundary + 1).length > 0) {
-      return finish(deny(ReasonCode.INVALID_ARGUMENT, "operator socket accepts one request per connection"));
-    }
-
-    let value: unknown;
-    try {
-      value = JSON.parse(buffer.subarray(0, boundary).toString("utf8")) as unknown;
-    } catch {
-      return finish(deny(ReasonCode.INVALID_ARGUMENT, "operator request is not JSON"));
-    }
-    const peer = authenticateOperatorPeer(value, binding);
-    if (!peer.allowed) return finish(peer);
-    const method = operatorRequestMethod(value);
-    // The handshake is over: this peer authenticated. Everything from here is a statement about
-    // the method, so the deadline governing it has to be a different one under a different name.
-    // Leaving the handshake timer armed made every method slower than five seconds report that
-    // the operator had not authenticated, which they had.
-    beginRequest(method ?? "<none>");
-    if (method === "bootstrap.hermes") {
-      if (!options.bootstrapHermes) {
-        return finish(deny(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED, "Hermes bootstrap is not enabled on this socket", {}));
+  // #760 round 6 — the wire framing (accumulate bytes, find the newline, refuse a second request,
+  // parse JSON) is shared with the canonical self-claim listener via `local-socket-framing.ts`.
+  // Only the framing moved: `authenticateOperatorPeer` below is still this socket's own, and the
+  // shared helper never sees the parsed value before this callback does.
+  const frame = readOneJsonLineRequest(
+    socket,
+    {
+      tooLarge: "operator request exceeds local transport limit",
+      multipleRequests: "operator socket accepts one request per connection",
+      notJson: "operator request is not JSON",
+    },
+    (value) => {
+      const peer = authenticateOperatorPeer(value, binding);
+      if (!peer.allowed) return finish(peer);
+      const method = operatorRequestMethod(value);
+      // The handshake is over: this peer authenticated. Everything from here is a statement about
+      // the method, so the deadline governing it has to be a different one under a different name.
+      // Leaving the handshake timer armed made every method slower than five seconds report that
+      // the operator had not authenticated, which they had.
+      beginRequest(method ?? "<none>");
+      if (method === "bootstrap.hermes") {
+        if (!options.bootstrapHermes) {
+          return finish(deny(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED, "Hermes bootstrap is not enabled on this socket", {}));
+        }
+        if (!daemon.lock.held()) {
+          return finish(deny(ReasonCode.DAEMON_LOCK_LOST, "daemon lock is not held for Hermes bootstrap", {}));
+        }
+        const params = operatorRequestParams(value);
+        if (!params) return finish(deny(ReasonCode.INVALID_ARGUMENT, "Hermes bootstrap parameters are invalid", {}));
+        void options.bootstrapHermes(params).then(finish).catch((error: unknown) => {
+          finish(deny(ReasonCode.INTERNAL_ERROR, "Hermes bootstrap request failed", {
+            error: error instanceof Error ? error.message : String(error),
+          }));
+        });
+        return;
       }
-      if (!daemon.lock.held()) {
-        return finish(deny(ReasonCode.DAEMON_LOCK_LOST, "daemon lock is not held for Hermes bootstrap", {}));
-      }
-      const params = operatorRequestParams(value);
-      if (!params) return finish(deny(ReasonCode.INVALID_ARGUMENT, "Hermes bootstrap parameters are invalid", {}));
-      void options.bootstrapHermes(params).then(finish).catch((error: unknown) => {
-        finish(deny(ReasonCode.INTERNAL_ERROR, "Hermes bootstrap request failed", {
+      // #760 round 6 — `actor.claimCanonicalCto` no longer dispatches here at all. "A process may
+      // prove who it is, but it cannot approve itself": the claiming connection is removed from
+      // this bearer-token surface entirely and reaches a dedicated, token-less listener instead
+      // (`startCanonicalSelfClaimListener`, `canonical-self-claim-listener.ts`). This method simply
+      // is not in `OPERATOR_METHOD` any more, so falling through to the generic dispatch below
+      // denies it `OPERATOR_METHOD_NOT_ALLOWED` — the same refusal any other unknown method gets,
+      // which is the point: this socket has no special knowledge of that method's existence left.
+      void daemon.handleOperatorRequest(value, peer.value).then(finish).catch((error: unknown) => {
+        finish(deny(ReasonCode.INTERNAL_ERROR, "operator request failed", {
           error: error instanceof Error ? error.message : String(error),
         }));
       });
-      return;
-    }
-    void daemon.handleOperatorRequest(value, peer.value).then(finish).catch((error: unknown) => {
-      finish(deny(ReasonCode.INTERNAL_ERROR, "operator request failed", {
-        error: error instanceof Error ? error.message : String(error),
-      }));
-    });
-  };
-  socket.on("data", receive);
+    },
+    (decision) => finish(decision),
+    MAX_MCP_LINE_BYTES,
+  );
   socket.once("error", () => {
     if (timeout) clearTimeout(timeout);
     settled = true;
-    socket.removeListener("data", receive);
+    frame.dispose();
   });
   socket.once("close", () => {
     if (timeout) clearTimeout(timeout);
     settled = true;
-    socket.removeListener("data", receive);
+    frame.dispose();
   });
   timeout = setTimeout(() => {
     finish(deny(ReasonCode.OPERATOR_UNAUTHENTICATED, "operator handshake timed out"));
@@ -2534,15 +2547,25 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     throw err;
   }
 
-  const buzz = new BuzzAdapter(
-    cp.db,
-    cp.clock,
-    cp.audit,
-    cp.sessions,
-    cp.bindings,
-    cp.outbox,
-    new BuzzCliTransport(process.env["ACP_BUZZ_BINARY"] ?? "buzz", process.env["ACP_BUZZ_CHANNEL"] ?? null),
+  const buzzTransport = new BuzzCliTransport(
+    process.env["ACP_BUZZ_BINARY"] ?? "buzz",
+    process.env["ACP_BUZZ_CHANNEL"] ?? null,
   );
+  const buzz = new BuzzAdapter(cp.db, cp.clock, cp.audit, cp.sessions, cp.bindings, cp.outbox, buzzTransport);
+  // #760 round 3 — a channel address only, deliberately not `BuzzAdapter.connect`: that method
+  // also calls `sessions.setBuzzAddress(sessionId, ...)` for an *existing* session, and the
+  // canonical self-claim primitive resolves its address before the session it belongs to exists
+  // (`sessions.create` accepts `buzzAddress` directly, inside the same transaction that mints it).
+  const resolveCanonicalSelfClaimBuzzAddress = async (purpose: string): Promise<Decision<string>> => {
+    if (!(await buzzTransport.available(purpose))) {
+      return deny(ReasonCode.PROBE_FAILED, "buzz transport is not available", { purpose });
+    }
+    try {
+      return allow(ReasonCode.OK, await buzzTransport.openChannel(purpose));
+    } catch (err) {
+      return deny(ReasonCode.PROBE_FAILED, `buzz connect failed: ${(err as Error).message}`, { purpose });
+    }
+  };
   cp.cto.attach({
     buzz: {
       connect: (sessionId, purpose) => buzz.connect(sessionId, purpose),
@@ -2559,6 +2582,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   let buzzMessageIngress: LocalBuzzMessageIngress | null = null;
   let buzzMentionSubscriber: BuzzMentionSubscriberHandle | null = null;
   let operator: LocalOperatorListener | null = null;
+  let canonicalSelfClaim: CanonicalSelfClaimListener | null = null;
   let hermesBootstrap: HermesBootstrapAuthority | null = null;
   let telegram: TelegramLongPollListener | null = null;
   let startCompleted = false;
@@ -2577,6 +2601,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     await buzzMessageIngress?.close();
     await buzzActorIngress?.close();
     await operator?.close();
+    await canonicalSelfClaim?.close();
     await hermesBootstrap?.close();
     await listeners?.close();
     await sessionLaunch.close();
@@ -2643,6 +2668,41 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         bootstrapHermes: (params) => hermesBootstrap!.bootstrap(params),
       },
     );
+    // #760 round 6 — its own dedicated, token-less listener. "A process may prove who it is, but
+    // it cannot approve itself": the claiming connection never holds, reads, or is checked
+    // against `ACP_OPERATOR_TOKEN`; its only authority is the kernel's own record of who opened
+    // this socket, checked by `startCanonicalSelfClaimListener` itself before this handler is
+    // ever called.
+    canonicalSelfClaim = await startCanonicalSelfClaimListener(daemon, stateDir, (peer, params) => {
+      // #760 round 4 correction C — every deployment fact the claiming request used to
+      // supply now lives here, fixed at composition time, never read from the request body.
+      const canonicalCtoBuzzActorId = process.env["ACP_CANONICAL_CTO_BUZZ_ACTOR_ID"] ?? "buzz:canonical-cto";
+      return executeCanonicalSelfClaimOperator(peer, params, {
+        db: cp.db,
+        clock: cp.clock,
+        sessions: cp.sessions,
+        bindings: cp.bindings,
+        ownerAuthority: cp.ownerAuthority,
+        // The canonical CTO's own Buzz channel identity is a deployment fact, configured the
+        // same way the CLI operator identity is (`ACP_OPERATOR_ACTOR`) — not something a
+        // caller asserts and this authenticator merely echoes back.
+        buzzActorAuthenticator: new IngressGuard(cp.db, cp.clock, cp.audit, {
+          buzz: { allowedActors: [canonicalCtoBuzzActorId] },
+        }),
+        resolveBuzzAddress: resolveCanonicalSelfClaimBuzzAddress,
+        config: {
+          expectedCwd: process.env["ACP_CANONICAL_CTO_WORKDIR"] ?? process.cwd(),
+          expectedPeerProtocolVersion: process.env["ACP_CANONICAL_CTO_PEER_PROTOCOL"] ?? "acp.operator/v1",
+          // Matches the listener's own derivation exactly: both read this daemon's effective
+          // uid, never a value either side is told by the other.
+          expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
+          peerProtocolVersion: process.env["ACP_CANONICAL_CTO_PEER_PROTOCOL"] ?? "acp.operator/v1",
+          buzzChannelId: process.env["ACP_BUZZ_CHANNEL"] ?? "c37e88d0-8576-48aa-a69c-9cbd54d47be2",
+          buzzActorId: canonicalCtoBuzzActorId,
+          buzzPurpose: process.env["ACP_CANONICAL_CTO_BUZZ_PURPOSE"] ?? "continuity:PRIMARY_CTO",
+        },
+      });
+    });
     listeners = await startDaemonMcpListeners(cp, stateDir, mcpToken, daemon);
     if (buzzActorIngressPolicy) {
       buzzActorIngress = await startBuzzActorIngressListener(cp, stateDir, buzzActorIngressPolicy);
@@ -2718,6 +2778,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     await buzzMessageIngress?.close();
     await buzzActorIngress?.close();
     await operator?.close();
+    await canonicalSelfClaim?.close();
     await hermesBootstrap?.close();
     await listeners?.close();
     await sessionLaunch.close();

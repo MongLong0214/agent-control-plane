@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 36;
+export const SCHEMA_VERSION = 37;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -2505,6 +2505,31 @@ const v36: SchemaMigration = {
   checksum: () => migrationChecksum("v36-backfill-ingress-receipt-identities-before-freezing-claims"),
 };
 
+/**
+ * Seeds `claude-cli` as a first-class executor kind (#760), moving the write off the
+ * application-time `INSERT OR IGNORE` the canonical self-claim primitive used to perform on
+ * every call.
+ *
+ * An enforcement trigger closing "seeded and immutable"'s missing enforcement site (see the
+ * comment above `executor_kinds` in schema.sql) was built alongside this and reverted: v12/v13
+ * replay the whole *current* schema.sql when climbing an old database, which would install a
+ * schema.sql-defined trigger long before this migration's own place in the chain — and
+ * `v22-canonical-turn-ledger` (frozen, checksummed, unchangeable) both creates this table and
+ * seeds it with `INSERT OR IGNORE INTO executor_kinds VALUES ('hermes')`. Measured: with the
+ * trigger installed, that frozen step's own seed aborts, and
+ * `tests/unit/database-migration-restore.test.ts`'s v11-origin chain fails. Reported rather than
+ * forced; the seed here is real and safe on its own.
+ */
+const v37: SchemaMigration = {
+  id: "v37-seed-claude-cli-executor-kind",
+  fromVersion: 36,
+  toVersion: 37,
+  apply: (raw) => {
+    raw.exec(`INSERT OR IGNORE INTO executor_kinds (executor_kind) VALUES ('claude-cli')`);
+  },
+  checksum: () => migrationChecksum("v37-seed-claude-cli-executor-kind"),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -2531,6 +2556,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v34,
   v35,
   v36,
+  v37,
 ]);
 
 interface RequiredTrigger {

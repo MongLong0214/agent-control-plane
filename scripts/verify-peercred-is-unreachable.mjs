@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 /**
- * `src/core/peercred.ts` must stay unreachable from every live surface.
+ * `src/core/peercred.ts` must stay unreachable from every live surface except an exact allowlist.
  *
- * #539's acceptance is unusual on purpose: it lands a kernel peer-credential primitive that
- * *nothing calls*, and that nothing calls it is the property under test — a rebind or an
- * externally supplied actor-attachment call site needs a separately authorized ticket, not this
- * one. So the gate is not "does the primitive work", it is "does production code reach it".
+ * #539's acceptance was unusual on purpose: it landed a kernel peer-credential primitive that
+ * *nothing calls*, and that nothing called it was the property under test. #760 round 3 is the
+ * "separately authorized ticket" that section always said a live call site would need — narrowly,
+ * for exactly one production Unix-socket handler that must derive its connecting peer's identity
+ * from the kernel rather than from anything the connection itself asserts. `ALLOWED_FILES` below
+ * is that one exception; the gate still fails on every other reference, anywhere else in `src/`.
  *
- * Scans every `.ts` file under `src/` except the primitive's own file for two independent things:
+ * Scans every `.ts` file under `src/` except the primitive's own file (and the one allowlisted
+ * exception) for two independent things:
  *
  *   1. A `from "<specifier>"` clause (static import/export, including `export * from` and
  *      `export * as X from`) or a string-literal dynamic `import("<specifier>")`/`require(
@@ -52,6 +55,28 @@ const SRC = join(ROOT, "src");
 const OWNED_FILE = join(SRC, "core", "peercred.ts");
 /** `OWNED_FILE` with any of the extensions a resolved specifier might carry stripped, once. */
 const OWNED_FILE_STEM = OWNED_FILE.replace(/\.(?:ts|js)$/u, "");
+
+/**
+ * The exact, narrow exception #760 authorizes: the production `actor.claimCanonicalCto`
+ * Unix-socket listener, and nowhere else. Adding a file here is itself the authorization event —
+ * there is no other gate standing between "listed here" and "reachable in production", so this
+ * list is deliberately not a pattern or a directory: one path, spelled out, reviewed as a diff.
+ *
+ * Round 3 through round 5 named `canonical-self-claim-operator.ts` here: that file derived the
+ * connecting peer's kernel credentials itself, from the raw `Socket` the (then-shared) operator
+ * socket handed it. Round 6's ruling on the mint/claim separation ("a process may prove who it
+ * is, but it cannot approve itself" — separate the sockets, not the credentials) moved the claim
+ * off the bearer-token-authenticated operator socket entirely, onto its own dedicated, token-less
+ * listener (`canonical-self-claim-listener.ts`). The kernel-credential authentication moved with
+ * it: that listener now derives and checks the peer identity *before* handing an already-verified
+ * `{ peerPid, uid }` tuple to the claim orchestration, which imports nothing from
+ * `../core/peercred.ts` any more. The old file's exemption would have outlived its reason had it
+ * stayed — a listed file that no longer touches the primitive reads as authorized when it is not,
+ * which is a hole in the opposite direction from an unauthorized reference.
+ */
+const ALLOWED_FILES = new Set([
+  join(SRC, "daemon", "canonical-self-claim-listener.ts"),
+]);
 
 /** Every `.ts` file under `src/`, depth-first, in the shape the other census scripts use. */
 const walk = (dir) => {
@@ -100,7 +125,7 @@ const resolveSpecifier = (specifier, fromFile) => {
 
 const hits = [];
 for (const file of walk(SRC)) {
-  if (file === OWNED_FILE) continue;
+  if (file === OWNED_FILE || ALLOWED_FILES.has(file)) continue;
   const source = readFileSync(file, "utf8");
 
   for (const { specifier, line } of extractSpecifiers(source)) {
@@ -125,15 +150,16 @@ if (hits.length > 0) {
     process.stdout.write(`  ${file}:${line}\n    ${text}\n`);
   }
   process.stdout.write(
-    "\n#539 lands this primitive unreachable on purpose — a live call site (including a\n" +
-      "`ControlPlane` field or export, or a re-export under a different name) needs a separately\n" +
-      "authorized ticket, not this one.\n" +
-      `RESULT: FAIL — ${hits.length} reference(s) outside src/core/peercred.ts.\n`,
+    "\nOnly `src/daemon/canonical-self-claim-listener.ts` (#760 round 6) may reference this\n" +
+      "primitive. A live call site anywhere else (including a `ControlPlane` field or export, or a\n" +
+      "re-export under a different name) needs its own separately authorized ticket, not this one.\n" +
+      `RESULT: FAIL — ${hits.length} reference(s) outside the allowlist.\n`,
   );
   process.exit(1);
 }
 
 process.stdout.write(
   "RESULT: PASS — no reference to getPeerCredentials/PeerCredentials, and no import/export/require\n" +
-    "specifier resolving to core/peercred.ts, outside src/core/peercred.ts\n",
+    "specifier resolving to core/peercred.ts, outside src/core/peercred.ts and the one allowlisted\n" +
+    "listener (src/daemon/canonical-self-claim-listener.ts)\n",
 );

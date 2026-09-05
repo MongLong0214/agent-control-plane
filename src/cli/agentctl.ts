@@ -53,6 +53,10 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
                                            --fenced only when its executor incarnation is still
                                            current: you are stating the execution cannot still write
   agentctl bootstrap hermes --target-bind-executable <path> --hermes-profile <profile> --hermes-home <path> --requested-session-id <id> --expected-lineage-root-digest <sha256> --executor-runtime-identity <identity> -- <command>
+  agentctl claim canonical-cto --claimed-session-id <uuid> --project-id <id> --expected-binding-generation <n> --owner-approval-nonce <nonce>
+                                           adopt the existing canonical CTO conversation in place;
+                                           never launches a runtime the way bootstrap hermes does;
+                                           reaches its own token-less socket, never ACP_OPERATOR_TOKEN
   agentctl daemon status                  daemon mode and health; falls back to the lock file
 `;
 
@@ -106,6 +110,16 @@ export const main = async (argv: string[]): Promise<number> => {
   }
 
   const config = defaultConfig();
+
+  // #760 round 6, required part 2 — dispatched before `ACP_OPERATOR_TOKEN` is ever read, not
+  // merely before it is used. A claimant must not possess the owner/admin credential, and the
+  // only way to make that literally true — checkable by grepping this path for the env var and
+  // finding nothing — is for the branch to exist above the line that reads it, not below a
+  // client construction that happens to carry an empty token for this command.
+  if (command === "claim") {
+    return dispatchCanonicalSelfClaim(rest, config);
+  }
+
   const owner = rest.includes("--owner");
   const args = rest.filter((arg) => arg !== "--owner");
 
@@ -152,6 +166,74 @@ export const main = async (argv: string[]): Promise<number> => {
   }
 
   return dispatch(client, command, args, owner);
+};
+
+/**
+ * `agentctl claim canonical-cto`'s own dispatcher — deliberately separate from `dispatch()`,
+ * which every other command shares one operator client through. This one is never handed that
+ * client: it builds its own, pointed at the dedicated self-claim socket, and reads no bearer
+ * credential at all (#760 round 6, required part 2).
+ */
+const dispatchCanonicalSelfClaim = (args: string[], config: { databasePath: string }): Promise<number> => {
+  if (args[0] !== "canonical-cto") return Promise.resolve(fail(`unknown claim subcommand: ${args[0] ?? ""}`));
+  const selectorArgs = args.slice(1);
+  if (selectorArgs.length % 2 !== 0) {
+    return Promise.resolve(fail("claim canonical-cto selectors must be option/value pairs"));
+  }
+  // No `--caller-pid` / `--claimed-pid` selector: the daemon derives the connecting peer's
+  // identity from the kernel-authenticated socket itself; a flag cannot stand in for that.
+  // No `--peer-protocol-version` / `--peer-identity` / `--buzz-channel` / `--buzz-actor-id` /
+  // `--buzz-purpose` selector either (round 4 correction C, unchanged by round 6): every
+  // deployment fact those used to name is server-configured now, fixed at daemon composition
+  // time, and never read from this request.
+  const selectorFields = {
+    "--claimed-session-id": "claimedSessionUuid",
+    "--project-id": "projectId",
+    "--expected-binding-generation": "expectedBindingGeneration",
+    "--owner-approval-nonce": "ownerApprovalNonce",
+  } as const;
+  const REQUIRED_CLAIM_SELECTORS = Object.keys(selectorFields) as (keyof typeof selectorFields)[];
+  const claimSelectors: Record<string, string> = {};
+  for (let index = 0; index < selectorArgs.length; index += 2) {
+    const option = selectorArgs[index]!;
+    const value = selectorArgs[index + 1]!;
+    const field = selectorFields[option as keyof typeof selectorFields];
+    if (!field) return Promise.resolve(fail(`unknown claim canonical-cto selector: ${option}`));
+    if (claimSelectors[field]) return Promise.resolve(fail(`duplicate claim canonical-cto selector: ${option}`));
+    if (!value || !value.trim() || value.includes("\0")) {
+      return Promise.resolve(fail(`claim canonical-cto selector requires a non-empty value: ${option}`));
+    }
+    claimSelectors[field] = value;
+  }
+  if (REQUIRED_CLAIM_SELECTORS.some((option) => !claimSelectors[selectorFields[option]])) {
+    return Promise.resolve(fail("claim canonical-cto requires every selector"));
+  }
+  let expectedBindingGeneration: number;
+  try {
+    expectedBindingGeneration = requiredInteger(
+      claimSelectors["expectedBindingGeneration"],
+      "--expected-binding-generation",
+      1,
+    );
+  } catch (err) {
+    return Promise.resolve(fail((err as Error).message));
+  }
+  const params = {
+    claimedSessionUuid: claimSelectors["claimedSessionUuid"]!,
+    projectId: claimSelectors["projectId"]!,
+    expectedBindingGeneration,
+    // The `(channel="cli", nonce)` handle naming an owner approval a separate,
+    // bearer-authenticated `owner.approveClaimCanonicalCto` call already admitted. This
+    // connection never mints or admits one itself.
+    ownerApprovalNonce: claimSelectors["ownerApprovalNonce"]!,
+  };
+  const socketPath =
+    process.env["ACP_CLAIM_CANONICAL_CTO_SOCKET"] ??
+    join(config.databasePath, "..", "agentcpd.claim-canonical-cto.sock");
+  return exchangeCanonicalSelfClaimRequest(socketPath, params).then((decision) => {
+    print(decision.allowed ? decision.value : decision);
+    return decision.allowed ? 0 : 1;
+  });
 };
 
 export const dispatch = async (
@@ -434,6 +516,86 @@ export const dispatch = async (
  */
 export const DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS = 180_000;
 
+/**
+ * The wire framing every local socket client in this file shares: write one JSON line, read one
+ * JSON line back, enforce a client-side deadline, treat a closed or errored socket the same way
+ * as one that never answered. Deliberately generic over `requestBody` — this function carries no
+ * concept of a token, a bearer credential, or who may say what; the caller decides the exact
+ * shape of the line written, which is what keeps a claim-socket client and an operator-socket
+ * client from becoming the same authentication surface just because they share a transport.
+ */
+interface OneLineExchangeMessages {
+  unavailable: string;
+  timeout: string;
+  invalidJson: string;
+  invalidDecision: string;
+  closedEarly: string;
+}
+
+const exchangeOneLineRequest = (
+  socketPath: string,
+  requestBody: Record<string, unknown>,
+  timeoutMs: number,
+  messages: OneLineExchangeMessages,
+): Promise<Decision<unknown>> =>
+  new Promise<Decision<unknown>>((resolveExchange) => {
+    const socket = createConnection(socketPath);
+    let received = "";
+    let settled = false;
+    let timeout: NodeJS.Timeout | null = null;
+    const finish = (result: Decision<unknown>): void => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      socket.end();
+      resolveExchange(result);
+    };
+    const unavailable = (error: unknown): void =>
+      finish(
+        deny(ReasonCode.DAEMON_LOCK_LOST, messages.unavailable, {
+          socketPath,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+
+    timeout = setTimeout(() => {
+      socket.destroy();
+      finish(deny(ReasonCode.OPERATOR_REQUEST_TIMEOUT, messages.timeout, { socketPath, budgetMs: timeoutMs }));
+    }, timeoutMs);
+    timeout.unref();
+    socket.setEncoding("utf8");
+    socket.once("connect", () => {
+      socket.write(`${JSON.stringify(requestBody)}\n`);
+    });
+    socket.on("data", (chunk: string) => {
+      received += chunk;
+      const boundary = received.indexOf("\n");
+      if (boundary === -1) return;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(received.slice(0, boundary)) as unknown;
+      } catch {
+        return finish(deny(ReasonCode.INTERNAL_ERROR, messages.invalidJson, {}));
+      }
+      if (!isDecision(parsed)) {
+        return finish(deny(ReasonCode.INTERNAL_ERROR, messages.invalidDecision, {}));
+      }
+      finish(parsed);
+    });
+    socket.once("error", unavailable);
+    socket.once("close", () => {
+      if (!settled) unavailable(new Error(messages.closedEarly));
+    });
+  });
+
+const OPERATOR_EXCHANGE_MESSAGES: OneLineExchangeMessages = {
+  unavailable: "agentcpd operator socket is unavailable; no direct database fallback was attempted",
+  timeout: "agentcpd accepted the request and did not answer within the client budget",
+  invalidJson: "agentcpd returned invalid operator JSON",
+  invalidDecision: "agentcpd returned an invalid operator decision",
+  closedEarly: "operator socket closed before a response",
+};
+
 const exchangeOperatorRequest = (
   options: OperatorClientOptions,
   request: { requestId: string; method: string; params: Record<string, unknown>; idempotencyKey?: string },
@@ -448,69 +610,56 @@ const exchangeOperatorRequest = (
       ),
     );
   }
-
-  return new Promise<Decision<unknown>>((resolveExchange) => {
-    const socket = createConnection(options.socketPath);
-    // Strictly greater than the daemon's own execution budget, so its typed refusal wins the
-    // race and the operator reads why the method failed rather than that the client gave up.
-    // These were both five seconds, and which one fired decided whether the same healthy daemon
-    // was reported as unauthenticated or as having lost its lock (#609).
-    const timeoutMs = options.timeoutMs ?? DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS;
-    let received = "";
-    let settled = false;
-    let timeout: NodeJS.Timeout | null = null;
-    const finish = (result: Decision<unknown>): void => {
-      if (settled) return;
-      settled = true;
-      if (timeout) clearTimeout(timeout);
-      socket.end();
-      resolveExchange(result);
-    };
-    const unavailable = (error: unknown): void =>
-      finish(
-        deny(
-          ReasonCode.DAEMON_LOCK_LOST,
-          "agentcpd operator socket is unavailable; no direct database fallback was attempted",
-          { socketPath: options.socketPath, error: error instanceof Error ? error.message : String(error) },
-        ),
-      );
-
-    timeout = setTimeout(() => {
-      socket.destroy();
-      finish(
-        deny(
-          ReasonCode.OPERATOR_REQUEST_TIMEOUT,
-          "agentcpd accepted the request and did not answer within the client budget",
-          { socketPath: options.socketPath, budgetMs: timeoutMs },
-        ),
-      );
-    }, timeoutMs);
-    timeout.unref();
-    socket.setEncoding("utf8");
-    socket.once("connect", () => {
-      socket.write(`${JSON.stringify({ token, ...request })}\n`);
-    });
-    socket.on("data", (chunk: string) => {
-      received += chunk;
-      const boundary = received.indexOf("\n");
-      if (boundary === -1) return;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(received.slice(0, boundary)) as unknown;
-      } catch {
-        return finish(deny(ReasonCode.INTERNAL_ERROR, "agentcpd returned invalid operator JSON", {}));
-      }
-      if (!isDecision(parsed)) {
-        return finish(deny(ReasonCode.INTERNAL_ERROR, "agentcpd returned an invalid operator decision", {}));
-      }
-      finish(parsed);
-    });
-    socket.once("error", unavailable);
-    socket.once("close", () => {
-      if (!settled) unavailable(new Error("operator socket closed before a response"));
-    });
-  });
+  // Strictly greater than the daemon's own execution budget, so its typed refusal wins the race
+  // and the operator reads why the method failed rather than that the client gave up. These were
+  // both five seconds once, and which one fired decided whether the same healthy daemon was
+  // reported as unauthenticated or as having lost its lock (#609).
+  const timeoutMs = options.timeoutMs ?? DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS;
+  return exchangeOneLineRequest(options.socketPath, { token, ...request }, timeoutMs, OPERATOR_EXCHANGE_MESSAGES);
 };
+
+/**
+ * #760 round 6 — must name the same method `CANONICAL_SELF_CLAIM_METHOD` does in
+ * `src/daemon/canonical-self-claim-listener.ts`. Not imported from there: this file is a client,
+ * never a composition root (see this file's own docstring), and the listener module's other
+ * exports are daemon-side socket and kernel-credential machinery this process must never
+ * construct.
+ */
+const CANONICAL_SELF_CLAIM_METHOD = "actor.claimCanonicalCto";
+
+const CANONICAL_SELF_CLAIM_EXCHANGE_MESSAGES: OneLineExchangeMessages = {
+  unavailable: "the canonical self-claim socket is unavailable",
+  timeout: "the canonical self-claim socket accepted the request and did not answer within the client budget",
+  invalidJson: "agentcpd returned invalid canonical self-claim JSON",
+  invalidDecision: "agentcpd returned an invalid canonical self-claim decision",
+  closedEarly: "canonical self-claim socket closed before a response",
+};
+
+/**
+ * The claim command's own client — no `token` field exists on this function's parameters at all.
+ * By the CEO's ruling on the mint/claim separation ("a process may prove who it is, but it cannot
+ * approve itself"), the claiming connection is not authorized on `ACP_OPERATOR_TOKEN` and must
+ * neither read nor require it; its authority is the kernel's own record of who opened this
+ * socket, established entirely on the daemon side by `startCanonicalSelfClaimListener`.
+ *
+ * `OPERATOR_MUTATION_METHOD_NAMES`'s idempotency-key behaviour is deliberately not reused here.
+ * That set exists to make a retried *operator-socket* mutation replay `Daemon.handleOperatorRequest`'s
+ * cached result rather than re-running it — a property of that dispatcher's own idempotency cache,
+ * keyed by the operator peer's incarnation. The self-claim listener has no such cache and no
+ * concept of an idempotency key; sending one would be a field this listener's parser has never
+ * been asked to understand, asserting a guarantee the far side does not provide.
+ */
+const exchangeCanonicalSelfClaimRequest = (
+  socketPath: string,
+  params: Record<string, unknown>,
+  timeoutMs = DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS,
+): Promise<Decision<unknown>> =>
+  exchangeOneLineRequest(
+    socketPath,
+    { method: CANONICAL_SELF_CLAIM_METHOD, params },
+    timeoutMs,
+    CANONICAL_SELF_CLAIM_EXCHANGE_MESSAGES,
+  );
 
 const isDecision = (value: unknown): value is Decision<unknown> =>
   typeof value === "object" &&

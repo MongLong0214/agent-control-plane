@@ -20,6 +20,7 @@ import {
   type Finding,
 } from "../doctor/doctor.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
+import { SELF_CLAIM_OPERATION } from "../registry/canonical-self-claim.ts";
 import { RunState, SessionLifecycle } from "../domain/types.ts";
 import { buildAcceptanceReport } from "../export/acceptance-report.ts";
 import { RunEvidenceExporter } from "../export/run-evidence.ts";
@@ -213,6 +214,16 @@ export const OPERATOR_METHOD = {
   CONTINUITY_STATUS: "continuity.status",
   OUTBOX_RETRY: "outbox.retry",
   OWNER_APPROVE: "owner.approve",
+  /**
+   * #760 round 4 — the CEO-owned preflight that mints a canonical self-claim owner approval as
+   * its own admission, separate from and prior to `actor.claimCanonicalCto`'s socket (that
+   * method special-cases its own dispatch in agentcpd.ts because its authority is the connecting
+   * peer's kernel identity, not this bearer-authenticated method table). The claiming connection
+   * never reaches this method and never mints its own approval — it only ever presents the
+   * `(channel, nonce)` handle this call produces, which `actor.claimCanonicalCto` loads back out
+   * of `inbound_messages` rather than trusting anything the claiming request asserts.
+   */
+  OWNER_APPROVE_CLAIM_CANONICAL_CTO: "owner.approveClaimCanonicalCto",
   REPAIR_LIST: "repair.list",
   REPAIR_DRY_RUN: "repair.dry-run",
   REPAIR_EXECUTE: "repair.execute",
@@ -239,6 +250,7 @@ export const OPERATOR_MUTATION_METHODS: ReadonlySet<OperatorMethod> = new Set([
   OPERATOR_METHOD.RUN_CANCEL,
   OPERATOR_METHOD.OUTBOX_RETRY,
   OPERATOR_METHOD.OWNER_APPROVE,
+  OPERATOR_METHOD.OWNER_APPROVE_CLAIM_CANONICAL_CTO,
   OPERATOR_METHOD.REPAIR_DRY_RUN,
   OPERATOR_METHOD.REPAIR_EXECUTE,
   OPERATOR_METHOD.CAPACITY_OBSERVE,
@@ -665,6 +677,9 @@ export class Daemon {
         case OPERATOR_METHOD.OWNER_APPROVE:
           return this.executeOwnerApproval(request, peer);
 
+        case OPERATOR_METHOD.OWNER_APPROVE_CLAIM_CANONICAL_CTO:
+          return this.executeApproveCanonicalCtoClaim(request, peer);
+
         case OPERATOR_METHOD.REPAIR_LIST:
           return allow(ReasonCode.OK, this.cp.repair.catalog());
 
@@ -902,6 +917,60 @@ export class Daemon {
       note,
       receipt: admitted.value,
     });
+  }
+
+  /**
+   * #760 round 4 correction A — the *only* place a canonical self-claim owner approval is ever
+   * minted. This runs on the normal bearer-authenticated operator method table (`peer.actor` is
+   * whoever holds the shared operator token, e.g. the owner's own `agentctl` invocation) — never
+   * on the `actor.claimCanonicalCto` socket, which authenticates by kernel peer credential instead
+   * and never reaches this method at all. `nonce` is caller-chosen deliberately: the human running
+   * this command has to hand that exact value to whatever presents the claim afterward, so it
+   * cannot be derived from anything this call alone knows.
+   */
+  private executeApproveCanonicalCtoClaim(
+    request: OperatorRequest,
+    peer: AuthenticatedOperatorPeer,
+  ): Decision<unknown> {
+    const projectId = requiredOperatorString(request.params, "projectId");
+    if (!projectId.allowed) return projectId;
+    const claimedSessionUuid = requiredOperatorString(request.params, "claimedSessionUuid");
+    if (!claimedSessionUuid.allowed) return claimedSessionUuid;
+    const expectedBindingGeneration = requiredOperatorInteger(request.params, "expectedBindingGeneration", 1);
+    if (!expectedBindingGeneration.allowed) return expectedBindingGeneration;
+    const nonce = requiredOperatorString(request.params, "nonce");
+    if (!nonce.allowed) return nonce;
+    // #760 round 6, required part 3 — no default. An owner mints an explicit decision, approval
+    // or rejection; there is no reading of "the caller did not say" that this method may treat as
+    // either one. `request.params["approved"] ?? true` silently turned every omitted or malformed
+    // field into an approval, which is exactly the shape a caller could exploit by leaving the
+    // field out rather than fabricating it.
+    const approved = request.params["approved"];
+    if (typeof approved !== "boolean") return invalidOperatorParam("approved", approved);
+
+    const approval = {
+      runId: null,
+      candidateSnapshotDigest: null,
+      operation: SELF_CLAIM_OPERATION,
+      parameters: {
+        domain: SELF_CLAIM_OPERATION,
+        projectId: projectId.value,
+        claimedSessionUuid: claimedSessionUuid.value,
+        role: "PRIMARY_CTO",
+        expectedBindingGeneration: expectedBindingGeneration.value,
+      },
+      idempotencyKey:
+        request.idempotencyKey ??
+        `claim-canonical-cto:${digestOf({
+          projectId: projectId.value,
+          claimedSessionUuid: claimedSessionUuid.value,
+          expectedBindingGeneration: expectedBindingGeneration.value,
+          approved,
+          nonce: nonce.value,
+        })}`,
+      approved,
+    };
+    return this.admitCliOwnerApproval(peer.actor, approval, nonce.value);
   }
 
   private executeRepair(

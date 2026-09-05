@@ -30,10 +30,27 @@ export const TRACE_BYTES_SHA256 =
 export const RECEIPT_BYTES_SHA256 =
   "aa90c6af77754fce9861cb4f57501879c24f66f5616cf46225c5375adfd2a19d";
 
+/**
+ * #760 round 3 §5(a) — reviewed re-pin, not a silent one.
+ *
+ * `src/db/migrations.ts` changed: `SCHEMA_VERSION` 36 → 37, one new `v37` entry appended to the
+ * end of the frozen `MIGRATIONS` array (a doc comment plus a single-statement `apply`:
+ * `INSERT OR IGNORE INTO executor_kinds (executor_kind) VALUES ('claude-cli')`), and a prose-only
+ * correction to that comment's migration-id reference (v21 → v22) after review found the first
+ * name wrong. No existing migration's `id`, `fromVersion`, `toVersion`, or `apply` body was
+ * altered — the exact property `#762` and `verify-migrations-are-immutable.mjs` both check.
+ *
+ * Reviewed by the coordinator against `git diff <pre-#760-round-3>..HEAD -- src/db/migrations.ts`
+ * (27 insertions, 1 deletion against the base before the `v37` commit): confirmed the diff is
+ * exactly the three changes above, appends rather than rewrites the frozen array, and adds one row
+ * to an existing table without altering any `sqlite_master` ownership fact. This pin is that
+ * review's conclusion, transcribed — not a hash this repository derived from its own input and
+ * therefore agrees with by construction, which is the defect this file's own pins exist to avoid.
+ */
 export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string }> = [
   {
     path: "src/db/migrations.ts",
-    sha256: "23d35db447e90a79d487ea3cc0b01c354e75a7e42af4e604afdf981bf7506dfb",
+    sha256: "e434753a3ff129cde765f6f17566fe7c99c68be085272c72a96cdad1b9c538a1",
   },
   {
     path: "tests/fixtures/schema-v25-lineage.sql",
