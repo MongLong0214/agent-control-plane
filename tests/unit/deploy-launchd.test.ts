@@ -2,10 +2,15 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
+  cpSync,
   existsSync,
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -235,40 +240,117 @@ const assertRenderedPlist = (harness: InstallerHarness): void => {
 };
 
 /**
- * A real sealed pair under this harness's state directory, built by the module the installer's
- * validator is compiled from. The rollback rows below consume it end to end: the fake `node`
- * hands `rollback-pair.js` to the real interpreter, so what runs is the actual validator against
- * an actual pair rather than a stub that would agree with anything.
+ * A disposable app root the rollback rows can actually install into.
+ *
+ * Rolling back now replaces a runtime closure, so these rows must never point the installer at
+ * this repository's own `dist` — a passing test that overwrote the tree it was run from would be
+ * a worse outcome than a failing one. The copy carries the real built closure and the real plist
+ * renderer, so what the installer resolves and executes is the genuine article.
+ */
+const makeDisposableAppRoot = (): string => {
+  const appRoot = tempDir("acp-launchd-approot-");
+  cpSync(join(root, "dist"), join(appRoot, "dist"), { recursive: true });
+  cpSync(join(root, "deploy"), join(appRoot, "deploy"), { recursive: true });
+  // A real deployment resolves the closure's dependencies from a sibling of `dist`, not from
+  // inside it. Linking rather than copying keeps the fixture small; what matters is that the
+  // sibling sits outside the install root, so a rollback replaces `dist` and leaves it alone.
+  symlinkSync(join(root, "node_modules"), join(appRoot, "node_modules"));
+  return realpathSync(appRoot);
+};
+
+interface PairFixture {
+  pair: SealedRollbackPair;
+  appRoot: string;
+  databasePath: string;
+}
+
+const GENERATION_MARKER = "GENERATION.txt";
+
+/**
+ * A real sealed pair for this harness's deployment, built by the module the installer's validator
+ * is compiled from. The rollback rows consume it end to end: the fake `node` hands
+ * `rollback-pair.js` to the real interpreter, so what runs is the actual orchestrator against an
+ * actual pair rather than a stub that would agree with anything.
+ *
+ * The pair's own Node is a real interpreter, deliberately separate from the harness's fake one:
+ * a rollback restores the database through the *sealed* generation's state-admin, not the
+ * deployment's, and a fake there would hide exactly that.
  */
 const sealPairFor = async (
   harness: InstallerHarness,
+  appRoot: string,
   generation = "sealed-generation",
-): Promise<SealedRollbackPair> => {
+): Promise<PairFixture> => {
   const state = join(harness.home, ".agent-control-plane");
   mkdirSync(state, { recursive: true, mode: 0o700 });
   chmodSync(state, 0o700);
+  mkdirSync(join(harness.home, "Library", "LaunchAgents"), { recursive: true, mode: 0o700 });
+
+  const databasePath = join(state, "state.sqlite");
+  if (!existsSync(databasePath)) {
+    new Db(databasePath).close();
+    chmodSync(databasePath, 0o600);
+  }
 
   const source = join(harness.home, `pair-source-${generation}`);
-  mkdirSync(join(source, "runtime", "daemon"), { recursive: true, mode: 0o700 });
-  const databasePath = join(source, "state.sqlite");
-  new Db(databasePath).close();
-  chmodSync(databasePath, 0o600);
-  writeFileSync(join(source, "runtime", "daemon", "agentcpd.js"), `// ${generation}\n`, { mode: 0o600 });
-  const plist = join(source, `${label}.plist`);
-  writeFileSync(plist, `<?xml version="1.0"?><plist><dict><!-- ${generation} --></dict></plist>\n`, {
-    mode: 0o600,
-  });
-  const launcher = join(source, "agentcpd-launch.sh");
-  writeFileSync(launcher, `#!/bin/bash\n# ${generation}\nexec true\n`, { mode: 0o600 });
+  mkdirSync(source, { recursive: true, mode: 0o700 });
+  const runtimeRoot = join(source, "runtime");
+  cpSync(join(root, "dist"), runtimeRoot, { recursive: true });
+  writeFileSync(join(runtimeRoot, GENERATION_MARKER), `${generation}\n`, { mode: 0o600 });
 
-  return sealRollbackPair(join(state, "rollback-pairs"), {
+  const launcherDestination = join(realpathSync(state), "agentcpd-launch.sh");
+  const plistDestination = join(
+    realpathSync(join(harness.home, "Library", "LaunchAgents")),
+    `${label}.plist`,
+  );
+  const plist = join(source, `${label}.plist`);
+  writeFileSync(
+    plist,
+    [
+      '<?xml version="1.0"?>',
+      "<plist><dict>",
+      "  <key>Label</key>",
+      `  <string>${label}</string>`,
+      "  <key>ProgramArguments</key>",
+      `  <array><string>${launcherDestination}</string></array>`,
+      "  <key>WorkingDirectory</key>",
+      `  <string>${appRoot}</string>`,
+      `  <!-- ${generation} -->`,
+      "</dict></plist>",
+      "",
+    ].join("\n"),
+    { mode: 0o600 },
+  );
+  const launcher = join(source, "agentcpd-launch.sh");
+  writeFileSync(
+    launcher,
+    [
+      "#!/bin/bash",
+      `# ${generation}`,
+      `ACP_NODE_PATH=${process.execPath}`,
+      `ACP_APP_ROOT=${appRoot}`,
+      'exec "$ACP_NODE_PATH" "$ACP_APP_ROOT/dist/daemon/agentcpd.js"',
+      "",
+    ].join("\n"),
+    { mode: 0o600 },
+  );
+
+  const pair = await sealRollbackPair(join(state, "rollback-pairs"), {
     databasePath,
-    runtimeRoot: join(source, "runtime"),
+    runtimeRoot,
     entrypoint: "daemon/agentcpd.js",
-    nodePath: "/opt/sealed-generation/bin/node",
-    nodeVersion: "v22.18.0",
+    stateAdmin: "db/state-admin.js",
+    nodePath: process.execPath,
+    nodeVersion: process.version,
+    install: {
+      runtimeRoot: join(appRoot, "dist"),
+      plistPath: plistDestination,
+      launcherPath: launcherDestination,
+      workingDirectory: appRoot,
+    },
     launchd: { label, generation, plistPath: plist, launcherPath: launcher },
   });
+  return { pair, appRoot, databasePath };
 };
 
 const filesUnder = (directory: string): string[] => {
@@ -663,22 +745,24 @@ describe("launchd deployment artifact", () => {
 
   it("refuses a pair whose index digest is not the one retained, before it stops anything", async () => {
     const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
     expect(
-      runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness).status,
+      runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status,
     ).toBe(0);
-    const pair = await sealPairFor(harness);
+    const fixture = await sealPairFor(harness, appRoot);
     writeFileSync(harness.launchLog, "");
+    const installedBefore = readFileSync(launcherPath(harness), "utf8");
 
     const result = runInstaller(
       installer,
       [
         "rollback",
         "--app-root",
-        root,
+        appRoot,
         "--node",
         harness.node,
         "--pair-id",
-        pair.pairId,
+        fixture.pair.pairId,
         "--expected-index-digest",
         `sha256:${"0".repeat(64)}`,
       ],
@@ -687,25 +771,68 @@ describe("launchd deployment artifact", () => {
 
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("index digest does not match the retained digest");
-    // Prevalidation means before, not during: nothing was stopped and nothing was restored.
+    // Prevalidation means before, not during: nothing was stopped, staged or replaced.
     expect(readFileSync(harness.launchLog, "utf8")).toBe("");
-    expect(existsSync(harness.stateAdminLog)).toBe(false);
-    expect(readFileSync(plistPath(harness), "utf8")).not.toContain("sealed-generation");
+    expect(readFileSync(launcherPath(harness), "utf8")).toBe(installedBefore);
+    expect(existsSync(join(harness.home, ".agent-control-plane", "rollback-stage"))).toBe(false);
   });
 
-  it("waits for the daemon to stop, then restores the named pair's own database and plist", async () => {
+  it("creates nothing and changes no mode when it refuses a rollback", () => {
     const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
     expect(
-      runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness).status,
+      runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status,
     ).toBe(0);
-    const pair = await sealPairFor(harness);
+    const state = join(harness.home, ".agent-control-plane");
+    const pairsRoot = join(state, "rollback-pairs");
+    rmSync(pairsRoot, { recursive: true, force: true });
+    const stateModeBefore = statSync(state).mode;
+    const entriesBefore = readdirSync(state).sort();
+    writeFileSync(harness.launchLog, "");
+
+    const result = runInstaller(
+      installer,
+      [
+        "rollback",
+        "--app-root",
+        appRoot,
+        "--node",
+        harness.node,
+        "--pair-id",
+        randomUUID(),
+        "--expected-index-digest",
+        `sha256:${"0".repeat(64)}`,
+      ],
+      harness,
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("required directory does not exist");
+    // The refusal is free: the directory it looked in was not conjured into existence, the state
+    // root's mode was not adjusted, and nothing new appeared beside it.
+    expect(existsSync(pairsRoot), "a refused rollback created the pairs root").toBe(false);
+    expect(readdirSync(state).sort()).toEqual(entriesBefore);
+    expect(statSync(state).mode).toBe(stateModeBefore);
+    expect(readFileSync(harness.launchLog, "utf8")).toBe("");
+  });
+
+  it("waits for the daemon to stop, then installs the named pair's whole generation", async () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    expect(
+      runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status,
+    ).toBe(0);
+    const fixture = await sealPairFor(harness, appRoot);
     // A second, later pair the old implicit `sort | tail -n 1` would have preferred. Nothing may
     // select it: this rollback names the first one.
-    const newer = await sealPairFor(harness, "generation-nobody-approved");
-    expect(newer.pairId).not.toBe(pair.pairId);
+    const newer = await sealPairFor(harness, appRoot, "generation-nobody-approved");
+    expect(newer.pair.pairId).not.toBe(fixture.pair.pairId);
 
-    // The fake daemon is loaded again so rollback must take it down. The fake node exits
-    // non-zero if state-admin is reached while this lock still exists.
+    // Generation B is live: a different runtime closure, plist and launcher.
+    writeFileSync(join(appRoot, "dist", GENERATION_MARKER), "generation-b\n", { mode: 0o600 });
+    writeFileSync(plistPath(harness), "<!-- generation-b -->\n", { mode: 0o600 });
+    writeFileSync(launcherPath(harness), "#!/bin/bash\n# generation-b\n", { mode: 0o700 });
+
     writeFileSync(harness.loaded, "loaded\n", { mode: 0o600 });
     writeFileSync(harness.lock, "old daemon lock\n", { mode: 0o600 });
     writeFileSync(harness.launchLog, "");
@@ -714,27 +841,31 @@ describe("launchd deployment artifact", () => {
       [
         "rollback",
         "--app-root",
-        root,
+        appRoot,
         "--node",
         harness.node,
         "--pair-id",
-        pair.pairId,
+        fixture.pair.pairId,
         "--expected-index-digest",
-        pair.indexDigest,
+        fixture.pair.indexDigest,
       ],
       harness,
     );
 
     expect(rolledBack.status, rolledBack.stderr).toBe(0);
     expect(existsSync(harness.lock)).toBe(false);
-    expect(readFileSync(harness.stateAdminLog, "utf8")).toContain(
-      `restore ${join(pair.root, pair.manifest.database.member)}`,
-    );
     expect(subcommands(harness.launchLog)).toEqual(["print", "bootout", "print", "bootstrap", "kickstart"]);
-    // The identity that was installed is the named pair's, not the newest one's.
+
+    // The generation moved as one: runtime closure, plist and launcher are all the named pair's,
+    // and none of them is the newer pair nobody approved.
+    expect(readFileSync(join(appRoot, "dist", GENERATION_MARKER), "utf8").trim()).toBe("sealed-generation");
     expect(readFileSync(plistPath(harness), "utf8")).toContain("sealed-generation");
-    expect(readFileSync(plistPath(harness), "utf8")).not.toContain("generation-nobody-approved");
     expect(readFileSync(launcherPath(harness), "utf8")).toContain("sealed-generation");
+    expect(readFileSync(launcherPath(harness), "utf8")).not.toContain("generation-nobody-approved");
+    // The runtime installed is a working closure, restored through the pair's own state-admin.
+    expect(existsSync(join(appRoot, "dist", "db", "state-admin.js"))).toBe(true);
+    // The stage is not left lying around holding a copy of the deployment.
+    expect(readdirSync(join(harness.home, ".agent-control-plane", "rollback-stage"))).toEqual([]);
   });
 
   it("rejects a substring-only installer stub", () => {

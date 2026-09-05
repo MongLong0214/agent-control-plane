@@ -863,55 +863,84 @@ nothing pick for it.
 
 ### The sealed rollback pair
 
-A rollback is two restores that have to agree. Choosing them separately is what this section has
-spent several revisions guarding by hand: a database backup from one command, bytes from another,
-and a receipt written afterwards to say they belong together. The sealed pair makes that one
-artifact instead of an agreement between three.
+A rollback is not "restore the database". It is putting back a **generation**: the database image,
+the runtime closure that reads it, the Node executable that runs that closure, and the plist and
+launcher that start it. Restoring one half and leaving the other is not a smaller rollback — it is
+a combination that has never run anywhere, assembled at the moment the deployment is already
+broken. This section spent several revisions guarding that by hand, with a database backup from
+one command, bytes from another, and a receipt written afterwards to say they belonged together.
+The sealed pair replaces that agreement between three things with one artifact.
 
 One UUID names a directory holding a **WAL-complete database backup** taken through the supported
-path, the **runtime closure** that reads it, the **launchd generation and config** that starts it,
-an **exact inventory**, and a **self-excluding `SHA256SUMS`** — self-excluding because a checksum
-file that covers itself proves nothing about the file it sits in. After it is sealed the pair
-depends on nothing outside its own root: not the source tree, not a registry, not the machine
-that made it. The tree moving on does not invalidate it.
+path, the **runtime closure** and the **Node executable** it is bound to, the **launchd generation
+and config**, an **exact inventory**, and a **self-excluding `SHA256SUMS`** — self-excluding
+because a checksum file that covers itself proves nothing about the file it sits in. After it is
+sealed the pair depends on nothing outside its own root: not the source tree, not a registry, not
+the machine that made it. The tree moving on does not invalidate it.
 
-Seal one with the built module. It reads nothing from the host — every identity below is stated
-on the command line, including the runtime version, so the same command seals the generation you
-are leaving *and*, later, the one you are moving to as its return leg. A generation that could
-only be sealed by the machine currently running it would make a rollback a one-way door:
+Seal one with the built module. It reads nothing from the host — every identity below is stated on
+the command line, including the runtime version, so the same command seals the generation you are
+leaving *and*, later, the one you are moving to as its return leg. A producer that could only seal
+the generation it is running under would make a rollback a one-way door. Substitute your own
+checkout path for `$APP_ROOT`:
 
-    node /Users/isaac/projects/agent-control-plane/dist/deploy/rollback-pair.js seal \
+    APP_ROOT=/absolute/path/to/agent-control-plane
+    node "$APP_ROOT/dist/deploy/rollback-pair.js" seal \
       --pairs-root "$HOME/.agent-control-plane/rollback-pairs" \
       --database "$HOME/.agent-control-plane/state.sqlite" \
-      --runtime-root /Users/isaac/projects/agent-control-plane/dist \
-      --entrypoint daemon/agentcpd.js \
+      --runtime-root "$APP_ROOT/dist" \
+      --entrypoint daemon/agentcpd.js --state-admin db/state-admin.js \
       --node-path "$(command -v node)" --node-version "$(node --version)" \
+      --install-runtime-root "$APP_ROOT/dist" \
+      --install-plist "$HOME/Library/LaunchAgents/com.agentcontrolplane.agentcpd.plist" \
+      --install-launcher "$HOME/.agent-control-plane/agentcpd-launch.sh" \
+      --working-directory "$APP_ROOT" \
       --service-label com.agentcontrolplane.agentcpd \
-      --service-generation "$(git -C /Users/isaac/projects/agent-control-plane rev-parse HEAD)" \
+      --service-generation "$(git -C "$APP_ROOT" rev-parse HEAD)" \
       --plist "$HOME/Library/LaunchAgents/com.agentcontrolplane.agentcpd.plist" \
       --launcher "$HOME/.agent-control-plane/agentcpd-launch.sh"
 
-It prints `ACP_PAIR_ID` and `ACP_PAIR_INDEX_DIGEST` and writes nothing else. Seal while the job
-is stopped: the database member is taken through the supported backup path, which is WAL-coherent
-and leaves the source and both sidecars untouched, but a recovery point is worth more when
-nothing is writing to the file it is a point for.
+It prints `ACP_PAIR_ID` and `ACP_PAIR_INDEX_DIGEST` and writes nothing else. Sealing is atomic: the
+pair is built and validated inside an owner-only staging directory and renamed into place, so a
+failure partway leaves **no** directory under the pair id rather than a half-built one under an
+approved-looking name. Seal while the job is stopped — the backup path is WAL-coherent and leaves
+the source and both sidecars untouched, but a recovery point is worth more when nothing is writing
+to the file it is a point for.
+
+`--runtime-root` decides what "the closure" is. `dist` alone is right when dependencies do not
+change between generations, because a rollback then replaces `dist` and leaves the sibling
+`node_modules` in place. If dependencies move with the generation, seal the tree that holds both
+and set `--install-runtime-root` to match.
 
 **Retain two values, outside the pair: the pair id, and `SHA256(SHA256SUMS)`.** The second one is
 the whole point. Every digest inside a pair can be rewritten by whoever rewrote a member — a
-forgery is internally perfect by construction — so the index digest is deliberately kept where
-the pair cannot reach it, and `rollback` refuses without it:
+forgery is internally perfect by construction — so the index digest is deliberately kept where the
+pair cannot reach it, and `rollback` refuses without it:
 
-    bash /Users/isaac/projects/agent-control-plane/deploy/install-launchd.sh rollback \
+    bash "$APP_ROOT/deploy/install-launchd.sh" rollback \
       --pair-id <uuid> --expected-index-digest sha256:<64 hex>
 
-Before it stops anything, that command checks the pair id (a UUID — `latest` and a timestamp are
-both refused by name), the retained index digest, the exact inventory and every file digest, the
-declared schema, runtime and service identity, that every member is a regular non-symlink file,
-and that every member is still inside the pair root **after** its path is resolved. Only then does
-it stop the job, wait for the lock, restore the pair's own database, and install the pair's own
-plist and launcher. No member of one pair can satisfy another's inventory.
-`state-admin.js` is invoked from the **backup's** `dist`, not the live tree's, because the live
-tree's `dist` is what is being replaced two lines above.
+That command refuses **before it creates or changes anything at all**, including the directories it
+looks in. It checks the pair id (a UUID — `latest` and a timestamp are refused by name), the
+retained index digest, the exact inventory with every digest and byte count, the declared schema,
+runtime and service identity, that this pair is for *this* database, *this* service label and
+*this* app root, that every member is a regular non-symlink file with no hard link outside the
+pair, and that every member is still inside the pair root **after** its path is resolved.
+
+It then takes its own verified copy of every member into an owner-only stage and installs only
+from that copy, so a member swapped or rewritten through an alias between validation and install
+cannot reach the running deployment. Only then does it stop the job, wait for the lock, and
+install the whole generation — runtime closure, plist, launcher, and the database restored through
+the **sealed** generation's own `state-admin` under the **sealed** Node. If any step fails, the
+previous runtime, plist and launcher are put back from the copy taken before the first mutation
+and the job is started again, so a failed rollback leaves the deployment whole rather than mixed
+or stopped.
+
+**Item 6 above predates this and still restores the two halves separately.** It is kept because
+the test that guards it extracts and executes the block between its markers verbatim, and that
+test lives outside this change's ceiling; retiring the split procedure means retiring that test's
+subject in the same commit. Until that happens, prefer a sealed pair whenever one exists, and read
+item 6 as the fallback for a deployment that has none.
 
 The guard above all of this is not optional: `rm -rf dist` against a still-running daemon
 replaces the bytes of a live process, and the database restore is then refused by the lock a

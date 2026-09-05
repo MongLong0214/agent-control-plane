@@ -107,6 +107,22 @@ private_directory() {
   [[ "$mode" == "700" ]] || fail "directory mode must be 0700, found $mode: $target"
 }
 
+# Read-only. `private_directory` creates and chmods, which is a mutation: running it during
+# rollback prevalidation means a refused rollback has already changed the filesystem, and the
+# directory it silently created is one nobody chose to have. Setup mutation belongs to
+# install/upgrade; validation only ever asks.
+assert_existing_private_directory() {
+  local target="$1"
+  [[ ! -L "$target" ]] || fail "refusing symlinked directory: $target"
+  [[ -d "$target" ]] || fail "required directory does not exist: $target"
+  local metadata owner mode
+  metadata="$(stat -f '%u %Lp' "$target")"
+  owner="${metadata%% *}"
+  mode="${metadata##* }"
+  [[ "$owner" == "$(id -u)" ]] || fail "directory is not owned by this user: $target"
+  [[ "$mode" == "700" ]] || fail "directory mode must be 0700, found $mode: $target"
+}
+
 private_file() {
   local target="$1"
   [[ -f "$target" && ! -L "$target" ]] || fail "not a regular file: $target"
@@ -389,8 +405,10 @@ case "$command_name" in
       fail "expected index digest must be sha256:<64 hex digits>: $expected_index_digest"
     resolve_app_root
     resolve_node
-    private_directory "$state_dir"
-    private_directory "$rollback_pairs_dir"
+    # Read-only from here to the last prevalidation line: a refused rollback must leave the
+    # filesystem exactly as it found it, including not having created the directories it looked in.
+    assert_existing_private_directory "$state_dir"
+    assert_existing_private_directory "$rollback_pairs_dir"
     pair_root="$rollback_pairs_dir/$pair_id"
     [[ -d "$pair_root" && ! -L "$pair_root" ]] || fail "no sealed rollback pair with this id: $pair_root"
     pair_root="$(cd -P -- "$pair_root" && pwd)"
@@ -408,34 +426,45 @@ case "$command_name" in
     [[ "$actual_index_digest" == "$expected_index_digest" ]] ||
       fail "sealed pair index digest does not match the retained digest: expected $expected_index_digest, found $actual_index_digest"
 
-    pair_report="$("$node_path" "$validator" validate --pair-root "$pair_root" \
-      --pair-id "$pair_id" --expected-index-digest "$expected_index_digest")" ||
+    # Validate, then take our own verified copy of every member, in one process. The shell never
+    # learns a path inside the pair and reopens it later: bytes swapped, or rewritten through a
+    # hard-linked alias, after validation would change the pair and not the stage, and the stage
+    # is what gets installed. This also states what the deployment *is* — database, service label
+    # and app root — so a pair sealed for a different one is refused rather than applied.
+    stage_report="$("$node_path" "$validator" stage --pair-root "$pair_root" \
+      --pair-id "$pair_id" --expected-index-digest "$expected_index_digest" \
+      --expect-database "$state_dir/state.sqlite" \
+      --expect-service-label "$LABEL" \
+      --expect-working-directory "$app_root" \
+      --stage-parent "$state_dir/rollback-stage")" ||
       fail "sealed rollback pair failed validation: $pair_root"
-    pair_database=""
-    pair_plist=""
-    pair_launcher=""
+    stage_root=""
+    applied_generation=""
     while IFS='=' read -r report_key report_value; do
       case "$report_key" in
-        ACP_PAIR_DATABASE) pair_database="$report_value" ;;
-        ACP_PAIR_PLIST) pair_plist="$report_value" ;;
-        ACP_PAIR_LAUNCHER) pair_launcher="$report_value" ;;
+        ACP_STAGE_ROOT) stage_root="$report_value" ;;
+        ACP_PAIR_SERVICE_GENERATION) applied_generation="$report_value" ;;
       esac
-    done <<< "$pair_report"
-    for pair_member in "$pair_database" "$pair_plist" "$pair_launcher"; do
-      [[ -n "$pair_member" ]] || fail "the sealed pair validator did not report every member a rollback consumes"
-      [[ "$pair_member" == "$pair_root/"* ]] || fail "refusing a rollback member outside the sealed pair: $pair_member"
-      private_file "$pair_member"
-    done
+    done <<< "$stage_report"
+    [[ -n "$stage_root" && "$stage_root" == "$state_dir/rollback-stage/"* ]] ||
+      fail "the rollback stage was not created where this deployment keeps it: $stage_root"
+    [[ -d "$stage_root" && ! -L "$stage_root" ]] || fail "the rollback stage is not a direct directory: $stage_root"
 
+    # Everything below this line is one generation being replaced. `apply` installs the sealed
+    # runtime closure, plist, launcher and database together — restoring the database through the
+    # *sealed* state-admin under the *sealed* Node, because pair A's image installed by generation
+    # B's code is the defect this whole mechanism exists to prevent — and puts the previous
+    # generation back if any step fails. A failed apply therefore ends with the old generation
+    # whole, so the job is started again rather than left down.
     stop_job
     wait_for_stop
-    "$node_path" "$app_root/dist/db/state-admin.js" restore "$pair_database" \
-      --database "$state_dir/state.sqlite" --confirm-restore
-    cp "$pair_plist" "$plist_path"
-    cp "$pair_launcher" "$launcher_path"
-    chmod 600 "$plist_path"
-    chmod 700 "$launcher_path"
+    if ! "$node_path" "$validator" apply --stage-root "$stage_root"; then
+      start_job
+      rm -rf "$stage_root"
+      fail "rollback failed and the previous generation was restored; the service was started again"
+    fi
     start_job
-    printf 'rolled back to sealed pair %s (database %s)\n' "$pair_id" "$pair_database"
+    rm -rf "$stage_root"
+    printf 'rolled back to sealed pair %s (generation %s)\n' "$pair_id" "$applied_generation"
     ;;
 esac
