@@ -827,15 +827,25 @@ export const buzzMentionSubscriberRegistry = (cp: ControlPlane): BuzzMentionRegi
 });
 
 /**
- * A retry is a statement that the answer may change; everything else is a statement that it will
- * not.
+ * A retry is a statement that the answer may change; a refusal is a statement about one event and
+ * about nothing else.
  *
  * Only one refusal on this path is transient: the addressed role is between holders, so the
  * admission rolled back, nothing was spent, and the same event admitted a minute later is the
- * message arriving rather than a duplicate. The three `ALREADY_DURABLE` codes are the opposite —
- * the durable copy exists, and asking again produces the same refusal for ever — so they advance
- * the cursor exactly as a success does. Everything unnamed is terminal, which is the safe default:
- * a code this table has not thought about must not become a reconnect loop.
+ * message arriving rather than a duplicate.
+ *
+ * The `ALREADY_DURABLE` codes are the ones where the durable copy demonstrably exists — a replay
+ * of a message this daemon already has, a claimed turn whose outcome nobody recorded, an event id
+ * that already owns an outbox row. Those are as good as a success for the purpose the subscriber
+ * uses this answer for, which is deciding how far its request window may move.
+ *
+ * **Everything else is `REFUSED`, and that is deliberately not cursor-trusted.** The list of ways
+ * a stranger reaches this function is short and it is not empty: the relay's `p` filter authorizes
+ * nobody, so anyone who can sign a kind-9 event can address one here and collect an
+ * `INGRESS_ACTOR_NOT_ALLOWLISTED`. If that answer advanced the window, a stranger could choose it
+ * — one far-future timestamp and the owner's real messages fall outside the next request. So the
+ * default is the answer that changes nothing, and a code has to be named above to be trusted with
+ * the cursor rather than merely to avoid a reconnect loop.
  */
 const SUBSCRIBER_RETRY_CODES: readonly string[] = [ReasonCode.ROLE_PEER_ABSENT];
 const SUBSCRIBER_ALREADY_DURABLE_CODES: readonly string[] = [
@@ -849,7 +859,7 @@ export const buzzMentionAdmissionOf = (decision: Decision<unknown>): BuzzMention
   if (decision.allowed) return "DURABLE";
   if (SUBSCRIBER_ALREADY_DURABLE_CODES.includes(decision.reasonCode)) return "ALREADY_DURABLE";
   if (SUBSCRIBER_RETRY_CODES.includes(decision.reasonCode)) return "RETRY";
-  return "TERMINAL";
+  return "REFUSED";
 };
 
 /**

@@ -323,12 +323,21 @@ export interface BuzzMentionEvent {
  * What the admission seam did with one envelope, in the only four answers this subscriber can act
  * on differently.
  *
- * The three that advance the cursor are three ways of "there is nothing more to do with this
- * event": it became durable, it already was, or it was refused for a reason a redelivery would be
- * refused for again. `RETRY` is the only one that means the answer might change, and it is the
- * only one that must not advance anything.
+ * Only the two **durable** answers are cursor-trusted, and the split between `REFUSED` and the
+ * rest is a security boundary rather than a taxonomy.
+ *
+ * The relay's `p` filter authorizes nobody: anyone who can sign a kind-9 event can address one to
+ * this subscriber's pubkey. Such an event is refused by the seam — it is not from a declared owner
+ * — but a refusal that was allowed to advance the cursor would let that stranger choose the
+ * window. One event dated in the far future, refused, and the next `REQ` asks for everything
+ * `since` the year 2100: every real message the owner has sent is outside it. The refusal would
+ * have become a denial of delivery, mounted by someone with no authority at all.
+ *
+ * So a refusal is a statement about **one event** and never about where the window should be. It
+ * is still deterministic — asking again produces the same refusal — which is why it does not
+ * reconnect either; it simply costs nothing and changes nothing.
  */
-export type BuzzMentionAdmission = "DURABLE" | "ALREADY_DURABLE" | "TERMINAL" | "RETRY";
+export type BuzzMentionAdmission = "DURABLE" | "ALREADY_DURABLE" | "REFUSED" | "RETRY";
 
 /** One verified event, addressed, on its way to the admission seam. */
 export interface BuzzMentionAdmissionRequest {
@@ -373,6 +382,14 @@ export type BuzzRelaySocketFactory = (
 export interface BuzzSubscriberScheduler {
   setTimer(ms: number, fire: () => void): number;
   clearTimer(handle: number): void;
+  /**
+   * Local wall-clock seconds, in the unit a Nostr `created_at` is in.
+   *
+   * On the scheduler rather than beside it, because it is the same kind of thing — the module's
+   * one source of time — and a second, un-injected one is how `Date.now()` gets into a test's
+   * expectations without anyone deciding that it should.
+   */
+  nowSeconds(): number;
 }
 
 /** One listener as this adapter registers it, named so it can be taken off again. */
@@ -496,6 +513,7 @@ export const nativeSubscriberScheduler = (): BuzzSubscriberScheduler => {
         live.delete(handle);
       }
     },
+    nowSeconds: () => Math.floor(Date.now() / 1000),
   };
 };
 
@@ -797,8 +815,7 @@ class BuzzMentionSubscription {
       case "EOSE":
         return this.#onEose(frame, generation);
       case "CLOSED":
-        this.#reconnect(generation);
-        return rejected("unknown-subscription");
+        return this.#onClosed(frame, generation);
       default:
         // `NOTICE` and anything else a relay chooses to say. Ignored rather than treated as a
         // protocol violation: a relay that adds a message type is not a relay this daemon should
@@ -831,8 +848,20 @@ class BuzzMentionSubscription {
    * subscriber would look healthy while missing exactly the messages the auth was for.
    */
   #onOk(frame: readonly unknown[], generation: number): BuzzMentionFrameOutcome {
+    // NIP-20 exactly: `["OK", <id>, <accepted>, <message>]`. Checked whole, before element 2 is
+    // read as a verdict — "it starts with OK so element 2 is the answer" is a guess, and the thing
+    // being guessed at here is whether this connection is authenticated.
+    if (
+      frame.length !== 4 ||
+      typeof frame[1] !== "string" ||
+      typeof frame[2] !== "boolean" ||
+      typeof frame[3] !== "string"
+    ) {
+      this.#reconnect(generation);
+      return rejected("frame-not-a-message");
+    }
     const id = frame[1];
-    if (typeof id !== "string" || id !== this.#authEventId) return ACCEPTED;
+    if (id !== this.#authEventId) return ACCEPTED;
     if (frame[2] !== true) {
       this.#reconnect(generation);
       return rejected("auth-refused");
@@ -858,6 +887,10 @@ class BuzzMentionSubscription {
    * backoff resets, because a connection that reached EOSE is a connection that worked.
    */
   #onEose(frame: readonly unknown[], generation: number): BuzzMentionFrameOutcome {
+    if (frame.length !== 2 || typeof frame[1] !== "string") {
+      this.#reconnect(generation);
+      return rejected("frame-not-a-message");
+    }
     if (frame[1] !== this.#subscriptionId) return rejected("unknown-subscription");
     // The attempt reset says "a connection reached the end of stored events and therefore
     // worked". A stale EOSE says that about a connection that is gone, and would hand the live
@@ -868,8 +901,34 @@ class BuzzMentionSubscription {
     return ACCEPTED;
   }
 
+  /**
+   * The relay ending one subscription.
+   *
+   * Reconnecting is reserved for a well-formed `CLOSED` naming **this** subscription, and that is
+   * narrower than the other verbs on purpose. A reconnect closes a working socket, so it needs
+   * positive evidence that this subscription is the one that ended — and a malformed frame carries
+   * no such evidence: it does not say whose subscription it is, so it cannot be read as saying
+   * ours. Attributing it to us anyway is how a relay's stray bytes become this daemon's reconnect
+   * loop.
+   */
+  #onClosed(frame: readonly unknown[], generation: number): BuzzMentionFrameOutcome {
+    if (frame.length !== 3 || typeof frame[1] !== "string" || typeof frame[2] !== "string") {
+      return rejected("frame-not-a-message");
+    }
+    if (frame[1] !== this.#subscriptionId) return rejected("unknown-subscription");
+    this.#reconnect(generation);
+    return rejected("unknown-subscription");
+  }
+
   async #onEvent(frame: readonly unknown[], generation: number): Promise<BuzzMentionFrameOutcome> {
-    // The subscription id first, before a byte of the event is looked at. A relay that answers a
+    // `["EVENT", <subscription id>, <event>]`, exactly. A frame carrying a surplus element is not
+    // this grammar, and reading elements 1 and 2 out of it anyway would be answering a message
+    // nobody in this protocol sent.
+    if (frame.length !== 3 || typeof frame[1] !== "string") {
+      this.#reconnect(generation);
+      return rejected("frame-not-a-message");
+    }
+    // The subscription id next, before a byte of the event is looked at. A relay that answers a
     // subscription this connection never opened is answering someone else's question.
     if (!this.#subscribed || frame[1] !== this.#subscriptionId) return rejected("unknown-subscription");
 
@@ -949,7 +1008,23 @@ class BuzzMentionSubscription {
       this.#reconnect(generation);
       return { rejected: null, admission };
     }
-    this.#since = Math.max(this.#since ?? 0, event.created_at);
+    // A refusal moves nothing. It is deterministic, so there is nothing to retry and no reason to
+    // drop the connection — and it is reachable by anyone who can sign an event, so it must not be
+    // allowed to choose where the window sits. See `BuzzMentionAdmission`.
+    if (admission === "REFUSED") return { rejected: null, admission };
+
+    // The second guard, and it is independent of the first on purpose. Refusing to trust a
+    // *refusal* covers the stranger; it does nothing about an event this daemon accepted as
+    // durable whose `created_at` is nonetheless in the future — an owner with a skewed clock, or
+    // an owner key in the wrong hands. Either way a timestamp is a claim made by whoever signed
+    // it, and the window is this process's own business, so the claim is clamped to local now
+    // before it is allowed to move anything.
+    //
+    // Clamping down never drops a message: `since` is inclusive, so a mark at or below an event's
+    // own timestamp still asks for that event again, and the seam refuses the duplicate. Clamping
+    // *up* is what the outer `Math.max` refuses — the mark only ever moves forward.
+    const claimed = Math.min(event.created_at, this.#deps.scheduler.nowSeconds());
+    this.#since = Math.max(this.#since ?? 0, claimed);
     return { rejected: null, admission };
   }
 }

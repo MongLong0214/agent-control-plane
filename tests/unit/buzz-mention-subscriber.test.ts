@@ -71,12 +71,18 @@ interface VirtualClock {
   delays: number[];
   pending: () => number;
   fireAll: () => void;
+  /** Moves the injected wall clock, for the rows that measure the timestamp clamp. */
+  setNow: (seconds: number) => void;
 }
+
+/** The default "now" every row runs at, comfortably after every fixture timestamp below. */
+const CLOCK_NOW_SECONDS = 1_900_000_000;
 
 const virtualClock = (): VirtualClock => {
   const timers = new Map<number, () => void>();
   const delays: number[] = [];
   let next = 1;
+  let now = CLOCK_NOW_SECONDS;
   return {
     scheduler: {
       setTimer: (ms, fire) => {
@@ -88,8 +94,14 @@ const virtualClock = (): VirtualClock => {
       clearTimer: (handle) => {
         timers.delete(handle);
       },
+      // Deterministic, and injected like every other clock in this module: a row that reached for
+      // `Date.now()` would be asserting against whatever second the suite happened to run in.
+      nowSeconds: () => now,
     },
     delays,
+    setNow: (seconds: number) => {
+      now = seconds;
+    },
     pending: () => timers.size,
     fireAll: () => {
       for (const [handle, fire] of [...timers]) {
@@ -1571,6 +1583,109 @@ describe("the buzz mention subscriber's relay protocol", () => {
     });
   }
 
+  /**
+   * The grammar of a known verb, checked before any field is read for meaning.
+   *
+   * A relay frame is an untrusted peer's message. "It starts with `OK` so I will read element 2"
+   * is not parsing, it is guessing — and every one of these guesses ends in a state change:
+   * authenticating, admitting, resetting the backoff, or advancing the cursor.
+   */
+  const MALFORMED_OK_FRAMES: readonly { what: string; build: (authId: string) => unknown[] }[] = [
+    { what: "carries no NIP-20 message", build: (authId) => ["OK", authId, true] },
+    { what: "is missing its acceptance and message", build: (authId) => ["OK", authId] },
+    { what: "carries a surplus field", build: (authId) => ["OK", authId, true, "", "extra"] },
+    { what: "states its acceptance as a string", build: (authId) => ["OK", authId, "true", ""] },
+    { what: "states its message as a number", build: (authId) => ["OK", authId, true, 1] },
+  ];
+
+  for (const row of MALFORMED_OK_FRAMES) {
+    it(`opens no subscription on an OK that ${row.what}`, async () => {
+      const { sockets, handle } = startOne({});
+      try {
+        const socket = live(sockets);
+        socket.handlers.onFrame(frame(["AUTH", "challenge-0001"]));
+        await handle.settled();
+        const auth = sentFrames(socket).at(-1) as [string, { id: string }];
+        expect(auth[0]).toBe("AUTH");
+
+        socket.handlers.onFrame(frame(row.build(auth[1].id)));
+        await handle.settled();
+        // Nothing was requested, because nothing authenticated.
+        expect(sentFrames(socket).filter((sent) => sent[0] === "REQ")).toEqual([]);
+      } finally {
+        handle.close();
+      }
+    });
+  }
+
+  it("admits nothing from an EVENT frame of the wrong length", async () => {
+    const { sockets, handle, identity, owner, sink } = startOne({});
+    try {
+      const socket = live(sockets);
+      await authenticate(socket, handle);
+      const subId = (sentFrames(socket)[1] as string[])[1] ?? "";
+      const event = mentionEvent({ author: owner.secretKey, addressedTo: identity.pubkey });
+      socket.handlers.onFrame(frame(["EVENT", subId, event, "surplus"]));
+      await handle.settled();
+      expect(sink.admitted).toEqual([]);
+    } finally {
+      handle.close();
+    }
+  });
+
+  it("does not reset the backoff on an EOSE frame of the wrong shape", async () => {
+    const { sockets, handle, clock } = startOne({});
+    try {
+      live(sockets).handlers.onClose();
+      clock.fireAll();
+      live(sockets).handlers.onClose();
+      clock.fireAll();
+      expect(clock.delays).toEqual([1_000, 2_000]);
+
+      const socket = live(sockets);
+      await authenticate(socket, handle);
+      const subId = (sentFrames(socket)[1] as string[])[1] ?? "";
+      // Short, and long, and mistyped. None of them is this relay saying "end of stored events".
+      socket.handlers.onFrame(frame(["EOSE"]));
+      socket.handlers.onFrame(frame(["EOSE", subId, "surplus"]));
+      socket.handlers.onFrame(frame(["EOSE", 7]));
+      await handle.settled();
+
+      socket.handlers.onClose();
+      // Still climbing. A reset here would have handed the next connection a schedule earned by
+      // a frame that never said anything.
+      expect(clock.delays).toEqual([1_000, 2_000, 4_000]);
+    } finally {
+      handle.close();
+    }
+  });
+
+  it("drops the connection on a CLOSED for this subscription, and on nothing else", async () => {
+    const { sockets, handle, clock } = startOne({});
+    try {
+      const socket = live(sockets);
+      await authenticate(socket, handle);
+      const subId = (sentFrames(socket)[1] as string[])[1] ?? "";
+
+      // Somebody else's subscription, and two frames that are not a CLOSED at all.
+      socket.handlers.onFrame(frame(["CLOSED", "another-subscription", "closed: spam"]));
+      socket.handlers.onFrame(frame(["CLOSED", subId]));
+      socket.handlers.onFrame(frame(["CLOSED", subId, "reason", "surplus"]));
+      socket.handlers.onFrame(frame(["CLOSED", subId, 7]));
+      await handle.settled();
+      expect(socket.closed).toBe(false);
+      expect(clock.pending()).toBe(0);
+
+      // And the one that does name this subscription, in the exact shape.
+      socket.handlers.onFrame(frame(["CLOSED", subId, "closed: rate-limited"]));
+      await handle.settled();
+      expect(socket.closed).toBe(true);
+      expect(clock.pending()).toBe(1);
+    } finally {
+      handle.close();
+    }
+  });
+
   it("ignores relay chatter it has no opinion about", async () => {
     const { sockets, handle, clock, sink, owner, identity } = startOne({});
     try {
@@ -1666,8 +1781,130 @@ describe("the buzz mention subscriber's relay protocol", () => {
     }
   });
 
-  const ADVANCING: readonly BuzzMentionAdmission[] = ["DURABLE", "ALREADY_DURABLE", "TERMINAL"];
-  for (const answer of ADVANCING) {
+  it("keeps the connection and moves nothing when the seam refuses the event", async () => {
+    const { sockets, handle, identity, owner, sink, clock } = startOne({ answer: "REFUSED" });
+    try {
+      const first = live(sockets);
+      await authenticate(first, handle);
+      const subId = (sentFrames(first)[1] as string[])[1] ?? "";
+      // A far-future timestamp, because that is the shape of the attack: a stranger's event is
+      // refused by the seam, and if the refusal were cursor-trusted the window would jump to the
+      // year 2100 and every real message would fall outside the next request.
+      first.handlers.onFrame(
+        frame([
+          "EVENT",
+          subId,
+          mentionEvent({
+            author: owner.secretKey,
+            addressedTo: identity.pubkey,
+            createdAt: 4_102_444_800,
+          }),
+        ]),
+      );
+      await handle.settled();
+      expect(sink.admitted).toHaveLength(1);
+      // Deterministic, so there is nothing to retry and no reason to drop a working socket.
+      expect(first.closed).toBe(false);
+      expect(clock.pending()).toBe(0);
+
+      first.handlers.onClose();
+      clock.fireAll();
+      const second = live(sockets);
+      await authenticate(second, handle);
+      expect((sentFrames(second)[1] as [string, string, Record<string, unknown>])[2]["since"]).toBeUndefined();
+    } finally {
+      handle.close();
+    }
+  });
+
+  /**
+   * The second guard, and it is independent of the first.
+   *
+   * Refusing to trust a *refusal* covers the stranger. It says nothing about an event this daemon
+   * accepted as durable whose `created_at` is nonetheless in the future — an owner whose clock is
+   * skewed, or an owner key in the wrong hands. A timestamp is a claim made by whoever signed it,
+   * and where this process's request window sits is not their decision, so the claim is clamped to
+   * local now before it is allowed to move anything.
+   */
+  it("never advances the mark past its own clock, however the event is dated", async () => {
+    const { sockets, handle, identity, owner, clock } = startOne({ answer: "DURABLE" });
+    try {
+      clock.setNow(1_850_000_000);
+      const first = live(sockets);
+      await authenticate(first, handle);
+      const subId = (sentFrames(first)[1] as string[])[1] ?? "";
+      first.handlers.onFrame(
+        frame([
+          "EVENT",
+          subId,
+          mentionEvent({
+            author: owner.secretKey,
+            addressedTo: identity.pubkey,
+            createdAt: 4_102_444_800,
+          }),
+        ]),
+      );
+      await handle.settled();
+
+      first.handlers.onClose();
+      clock.fireAll();
+      const second = live(sockets);
+      await authenticate(second, handle);
+      // Clamped to now, not to the event's own claim. And clamping down costs nothing: `since` is
+      // inclusive, so the very event that was clamped is still inside the next request's window.
+      const since = (sentFrames(second)[1] as [string, string, Record<string, unknown>])[2]["since"];
+      expect(since).toBe(1_850_000_000);
+      expect(since).toBeLessThan(4_102_444_800);
+    } finally {
+      handle.close();
+    }
+  });
+
+  /** The same second, exactly: an inclusive `since` must still ask for the event that set it. */
+  it("leaves an ordinary past timestamp exactly where it is", async () => {
+    const { sockets, handle, identity, owner, clock } = startOne({ answer: "DURABLE" });
+    try {
+      clock.setNow(1_850_000_000);
+      const first = live(sockets);
+      await authenticate(first, handle);
+      const subId = (sentFrames(first)[1] as string[])[1] ?? "";
+      first.handlers.onFrame(
+        frame([
+          "EVENT",
+          subId,
+          mentionEvent({
+            author: owner.secretKey,
+            addressedTo: identity.pubkey,
+            createdAt: 1_850_000_000,
+          }),
+        ]),
+      );
+      await handle.settled();
+
+      first.handlers.onClose();
+      clock.fireAll();
+      const second = live(sockets);
+      await authenticate(second, handle);
+      // Equal to now, and unchanged by the clamp — the boundary case where an over-eager clamp
+      // would have shaved a second off and turned an inclusive window into a dropped message.
+      expect((sentFrames(second)[1] as [string, string, Record<string, unknown>])[2]["since"]).toBe(
+        1_850_000_000,
+      );
+    } finally {
+      handle.close();
+    }
+  });
+
+  /**
+   * Which answers may move the window, and which only keep the connection.
+   *
+   * `REFUSED` is in the second group and that is the security half of this table: a refusal is
+   * reachable by anyone who can sign an event and put this pubkey in a `p` tag, so letting one
+   * advance the mark would hand a stranger the ability to choose where the next request starts.
+   * It still keeps the connection — a deterministic refusal is not a reason to reconnect.
+   */
+  const CURSOR_TRUSTED: readonly BuzzMentionAdmission[] = ["DURABLE", "ALREADY_DURABLE"];
+  for (const answer of CURSOR_TRUSTED) {
     it(`advances the mark on ${answer} and keeps the connection`, async () => {
       const { sockets, handle, identity, owner, clock } = startOne({ answer });
       try {

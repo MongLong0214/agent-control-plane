@@ -496,6 +496,9 @@ const steppedClock = () => {
     clearTimer: (handle) => {
       timers.delete(handle);
     },
+    // Injected rather than read off the host, so the subscriber's timestamp clamp is deterministic
+    // here too. Comfortably after every fixture timestamp in this file.
+    nowSeconds: () => 1_900_000_000,
   };
   return {
     scheduler,
@@ -1562,6 +1565,125 @@ describe("the daemon's Buzz message ingress", () => {
       await ingress.close();
       await peer.close();
       await endpoint.close();
+      await listeners.close();
+    }
+  }, 60_000);
+
+  /**
+   * A stranger cannot cost the owner their mail (#760 Part C).
+   *
+   * The relay's `p` filter is not an authorization boundary — **anyone** can put this subscriber's
+   * pubkey in a `p` tag. So anyone can hand the daemon a validly signed kind-9 event dated in the
+   * far future. The admission seam refuses it correctly, because it is not from a declared owner.
+   *
+   * The question this row asks is what the *subscriber* then does with that refusal. If a refusal
+   * is cursor-trusted, the high-water mark jumps to the attacker's timestamp and the next
+   * reconnect asks the relay for events `since` the year 2100 — and every real message the owner
+   * has sent, or sends before then, is outside the window. A refusal would have become a denial of
+   * delivery, mounted by a stranger, with nothing durable to show for it.
+   *
+   * So: a refusal is a statement about one event, never about where the window should be.
+   */
+  it("does not let a stranger's refused future event move the window past the owner's real messages", async () => {
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+
+    const ctoKey = generateSecretKey();
+    const ctoPubkey = getPublicKey(ctoKey);
+    const ownerKey = generateSecretKey();
+    const ownerPubkey = getPublicKey(ownerKey);
+    // Not on the owner list. It holds nothing but the ability to sign, which is all anyone needs.
+    const strangerKey = generateSecretKey();
+
+    readyBoundSession(harness, "cto-cursor-peer", ctoPubkey, [projectId]);
+
+    const mcpStateDir = tempDir("acp-buzz-cursor-mcp-");
+    chmodSync(mcpStateDir, 0o700);
+    const listeners = await startLocalMcpListeners(harness.cp, mcpStateDir, MCP_TOKEN);
+
+    const buzzStateDir = tempDir("acp-buzz-cursor-");
+    const keyFile = join(buzzStateDir, "cto.nostr.key");
+    writeFileSync(keyFile, `${Buffer.from(ctoKey).toString("hex")}\n`, { mode: 0o600 });
+    chmodSync(keyFile, 0o600);
+    writeFileSync(
+      join(buzzStateDir, BUZZ_SUBSCRIBER_CONFIG_FILENAME),
+      JSON.stringify({
+        relayUrl: "wss://relay.example.invalid/buzz",
+        identities: [{ privateKeyFile: keyFile, encoding: "hex" }],
+      }),
+    );
+
+    const policy = { allowedActors: [ownerPubkey, NON_OWNER], secret: SECRET };
+    const ingress = await startDaemonBuzzMessageIngress(
+      harness.cp,
+      buzzStateDir,
+      policy,
+      listeners,
+      [ownerPubkey],
+    );
+    const relay = manualRelay();
+    const clock = steppedClock();
+    const subscriber = startDaemonBuzzMentionSubscriber(harness.cp, buzzStateDir, policy, ingress, {
+      openSocket: relay.factory,
+      scheduler: clock.scheduler,
+    });
+
+    try {
+      const subId = await relay.authenticateAndSubscribe(subscriber);
+      const poison = finalizeEvent(
+        {
+          kind: 9,
+          created_at: 4_102_444_800,
+          tags: [
+            ["p", ctoPubkey],
+            ["h", "buzz-cto-room"],
+          ],
+          content: "저는 주인이 아닙니다",
+        },
+        strangerKey,
+      );
+      relay.live().handlers.onFrame(JSON.stringify(["EVENT", subId, poison]));
+      await subscriber.settled();
+
+      // Refused, and nothing durable came of it.
+      expect(
+        harness.cp.db.all(`SELECT nonce FROM inbound_messages WHERE channel = 'buzz'`, []),
+      ).toEqual([]);
+      expect(queuedOwnerMessages(harness)).toEqual([]);
+      // A refusal is not a reason to drop a working connection either.
+      expect(relay.live().closed).toBe(false);
+
+      // The window did not move. This is the whole row: the reconnect must still ask for
+      // everything the owner may have sent.
+      relay.live().handlers.onClose();
+      clock.fireAll();
+      const resumed = await relay.authenticateAndSubscribe(subscriber);
+      expect(relay.reqFilter()["since"]).toBeUndefined();
+
+      // And the owner's own, older, entirely ordinary message still arrives and becomes durable.
+      const real = finalizeEvent(
+        {
+          kind: 9,
+          created_at: 1_800_600_000,
+          tags: [
+            ["p", ctoPubkey],
+            ["h", "buzz-cto-room"],
+          ],
+          content: "주인의 진짜 지시",
+        },
+        ownerKey,
+      );
+      relay.live().handlers.onFrame(JSON.stringify(["EVENT", resumed, real]));
+      await subscriber.settled();
+
+      expect(admittedText(harness, real.id)).toBe("주인의 진짜 지시");
+      const queued = queuedOwnerMessages(harness);
+      expect(queued).toHaveLength(1);
+      expect(queued[0]!.role_key).toBe(roleKey);
+    } finally {
+      subscriber.close();
+      await ingress.close();
       await listeners.close();
     }
   }, 60_000);
