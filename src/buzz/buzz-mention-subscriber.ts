@@ -899,10 +899,18 @@ class BuzzMentionSubscription {
     // Exactly one `h`, non-empty. The `h` tag is the Buzz room, and the room is what the answer
     // goes back to: none means there is no thread to answer, and two means picking one — which is
     // answering in a room the sender did not write in.
-    const rooms = tagValues(event, "h").filter((value) => value.trim().length > 0);
-    if (rooms.length !== 1) return rejected("event-conversation-unusable");
-    const conversation = rooms[0];
-    if (conversation === undefined) return rejected("event-conversation-unusable");
+    //
+    // **Counted before anything is discarded.** Filtering the blanks out first and counting the
+    // remainder answers a different question — "is there exactly one *usable* room" — and a signed
+    // event carrying a real room beside a whitespace one reduces to exactly one under it. That is
+    // the sender naming two rooms and this daemon quietly choosing, which is the thing the
+    // paragraph above says it will not do. So: the raw cardinality decides, and the sole value is
+    // then required to be usable rather than selected for being usable.
+    const rooms = tagValues(event, "h");
+    const conversation = rooms.length === 1 ? rooms[0] : undefined;
+    if (conversation === undefined || conversation.trim().length === 0) {
+      return rejected("event-conversation-unusable");
+    }
 
     // Re-checked here, not only at startup. The role can move between the preflight and this
     // event — that is ordinary operation — and a subscriber that spoke for a role it no longer

@@ -1359,6 +1359,14 @@ describe("the buzz mention subscriber's relay protocol", () => {
       ],
     },
     {
+      what: "an event naming one room and a blank one, so a filter would reduce it to one",
+      build: ({ owner, pubkey, subId }) => [
+        "EVENT",
+        subId,
+        mentionEvent({ author: owner, addressedTo: pubkey, room: [ROOM, "   "] }),
+      ],
+    },
+    {
       what: "an event naming two rooms, so answering would pick one",
       build: ({ owner, pubkey, subId }) => [
         "EVENT",
