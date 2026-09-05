@@ -15,7 +15,6 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
-  REQUIRED_EXECUTOR_VERSION,
   defaultExecutingImageInspector,
   defaultProcessAncestryInspector,
   deriveClaimantIdentity,
@@ -23,6 +22,9 @@ import {
   looksLikeClaudeInvocation,
   makeDefaultTranscriptReader,
 } from "../../src/registry/canonical-self-claim.ts";
+
+/** Synthetic — never a real deployment version, per #760 round 9's no-real-value rule for tests. */
+const TEST_REQUIRED_EXECUTOR_VERSION = "9.0.0-test";
 
 /**
  * Exercises the *real*, OS-backed implementations this module ships as defaults — never the
@@ -113,7 +115,7 @@ const spawnHeld = (executable: string, identityArgs: readonly string[], cwd: str
 describe("real process ancestry — ps-backed, not a fake", () => {
   it("reports the exact command line, a resolvable start time, and the real cwd of a live process", async () => {
     const root = tempRoot();
-    const claude = writeVersionedClaude(join(root, "versions"), REQUIRED_EXECUTOR_VERSION);
+    const claude = writeVersionedClaude(join(root, "versions"), TEST_REQUIRED_EXECUTOR_VERSION);
     const sessionUuid = "33333333-3333-4333-8333-333333333333";
     const child = spawnHeld(claude, ["--session-id", sessionUuid], root);
     await waitUntil(() => child.pid !== undefined, "child pid to be assigned");
@@ -137,7 +139,7 @@ describe("real process ancestry — ps-backed, not a fake", () => {
 
   it("walks a real two-hop ancestry (grandchild -> claude parent) to the claude process", async () => {
     const root = tempRoot();
-    const claude = writeVersionedClaude(join(root, "versions"), REQUIRED_EXECUTOR_VERSION);
+    const claude = writeVersionedClaude(join(root, "versions"), TEST_REQUIRED_EXECUTOR_VERSION);
     const sessionUuid = "44444444-4444-4444-8444-444444444444";
     const resultPath = join(root, "grandchild-pid.txt");
     // The "claude" process spawns a plain, non-claude grandchild and writes its pid to disk —
@@ -227,9 +229,9 @@ describe("real executing-image resolution — the measured symlink/image diverge
     20_000,
   );
 
-  it("resolves the exact required production version end to end (2.1.259)", async () => {
+  it("resolves the exact required version end to end", async () => {
     const root = tempRoot();
-    const claude = writeVersionedClaude(join(root, "versions"), REQUIRED_EXECUTOR_VERSION);
+    const claude = writeVersionedClaude(join(root, "versions"), TEST_REQUIRED_EXECUTOR_VERSION);
     const child = spawnHeld(claude, [], root);
     await waitUntil(() => child.pid !== undefined, "child pid to be assigned");
 
@@ -239,7 +241,7 @@ describe("real executing-image resolution — the measured symlink/image diverge
       image = defaultExecutingImageInspector.resolve(child.pid!);
     }
     expect(image).not.toBeNull();
-    expect(image!.version).toBe(REQUIRED_EXECUTOR_VERSION);
+    expect(image!.version).toBe(TEST_REQUIRED_EXECUTOR_VERSION);
   });
 });
 

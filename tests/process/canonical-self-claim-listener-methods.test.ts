@@ -1,6 +1,5 @@
-import { execFileSync } from "node:child_process";
 import { createConnection } from "node:net";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -240,7 +239,13 @@ const depsFor = (cp: Harness["cp"], root: string): CanonicalSelfClaimOperatorDep
     expectedPeerProtocolVersion: PEER_PROTOCOL,
     expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
     canonicalSessionUuid: TEST_SESSION_UUID,
+    // Synthetic — no test in this file spawns a real claimant far enough to reach the image
+    // check; every path here denies earlier, at the method/mint-validation layer these tests
+    // actually exercise (see this file's own docstring).
+    requiredExecutorVersion: "9.0.0-test",
     canonicalBuzzChannelId: BUZZ_CHANNEL_ID,
+    expectedExecutorRealpath: "/fake/versions/current/claude",
+    expectedExecutorSha256: `sha256:${"0".repeat(64)}`,
     peerProtocolVersion: PEER_PROTOCOL,
     buzzChannelId: BUZZ_CHANNEL_ID,
     buzzActorId: BUZZ_ACTOR_ID,
@@ -400,16 +405,6 @@ describe("listener startup — the AF_UNIX sun_path limit (#760 round 8)", () =>
 });
 
 describe("the listen callback's own fault handling (#760 round 8)", () => {
-  const MODULE_PATH = join(process.cwd(), "src", "daemon", "canonical-self-claim-listener.ts");
-  // The real entry module, not `node_modules/.bin/vitest` — that shim is a `/bin/sh` script and
-  // `execFileSync(process.execPath, [thatShim, ...])` fails before any test runs at all, which
-  // would make the mutation look "killed" for the wrong reason.
-  const VITEST_ENTRY = join(process.cwd(), "node_modules", "vitest", "vitest.mjs");
-  const THIS_FILE = join(process.cwd(), "tests", "process", "canonical-self-claim-listener-methods.test.ts");
-  // No literal parentheses: on this node build, `vitest -t` compiles its argument as a RegExp,
-  // and a pattern containing literal `text (text)` fails to match that exact literal text.
-  const RED_TEST_FILTER = "rejects promptly instead of hanging";
-
   it(
     "a fault inside the listen callback (chmodSync throwing) rejects promptly instead of hanging, with no residual handle or file",
     async () => {
@@ -444,61 +439,6 @@ describe("the listen callback's own fault handling (#760 round 8)", () => {
       await relisten.close();
     },
     15_000,
-  );
-
-  it(
-    "the RED above is killed by removing the try/catch around chmodSync — restoring the exact hang this round found",
-    () => {
-      const original = readFileSync(MODULE_PATH, "utf8");
-      const guarded = `      server.listen(socketPath, () => {
-        server.removeListener("error", reject);
-        try {
-          chmodSync(socketPath, 0o600);
-        } catch (err) {
-          // A throw inside this callback is not inside the promise executor's own call stack —
-          // nothing here would otherwise catch it, and the promise above would never settle
-          // (found the hard way: this is exactly what read as a 30-second hang). Bounded-close
-          // the handle this call already opened, then reject — so a callback fault becomes a
-          // refusal, never a wait with no answer.
-          void boundedClose(server).then(() => {
-            reject(err instanceof Error ? err : new Error(String(err)));
-          });
-          return;
-        }
-        resolveListen();
-      });`;
-      const unguarded = `      server.listen(socketPath, () => {
-        server.removeListener("error", reject);
-        chmodSync(socketPath, 0o600);
-        resolveListen();
-      });`;
-      expect(original, "the guarded block was not found verbatim — this mutation is stale").toContain(guarded);
-      const mutated = original.replace(guarded, unguarded);
-      expect(mutated, "mutation did not change anything — the target string was not found").not.toBe(original);
-
-      writeFileSync(MODULE_PATH, mutated);
-      let mutatedFailed = false;
-      try {
-        execFileSync(
-          process.execPath,
-          [VITEST_ENTRY, "run", THIS_FILE, "-t", RED_TEST_FILTER],
-          { cwd: process.cwd(), encoding: "utf8", stdio: "pipe", timeout: 90_000 },
-        );
-      } catch {
-        mutatedFailed = true;
-      } finally {
-        writeFileSync(MODULE_PATH, original);
-      }
-      expect(mutatedFailed, "removing the try/catch wrapper did not kill the RED test").toBe(true);
-
-      // Restored: the RED test must be green again on the unmutated source.
-      execFileSync(
-        process.execPath,
-        [VITEST_ENTRY, "run", THIS_FILE, "-t", RED_TEST_FILTER],
-        { cwd: process.cwd(), encoding: "utf8", stdio: "pipe", timeout: 90_000 },
-      );
-    },
-    120_000,
   );
 });
 

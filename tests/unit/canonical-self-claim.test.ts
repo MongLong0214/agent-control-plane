@@ -10,10 +10,7 @@ import { roleKeyFor, Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import type { BuzzActorAuthenticator } from "../../src/session/session-registry.ts";
 import {
-  CANONICAL_PROJECT_BUZZ_CHANNEL_ID,
-  CANONICAL_SESSION_UUID,
   CanonicalSelfClaim,
-  REQUIRED_EXECUTOR_VERSION,
   SELF_CLAIM_OPERATION,
   canonicalSelfClaimParameterDigest,
   deriveClaimantIdentity,
@@ -38,6 +35,10 @@ const PEER_PROTOCOL = "mcp/2025-06-18";
 const PEER_IDENTITY = "claude-code-mcp-client";
 const CHANNEL = "channel:test-canonical";
 const BUZZ_ADDRESS = "buzz://test-canonical-cto";
+/** Synthetic — never a real deployment version, per #760 round 9's no-real-value rule for tests. */
+const TEST_REQUIRED_EXECUTOR_VERSION = "0.0.0-test";
+const TEST_EXPECTED_EXECUTOR_REALPATH = "/fake/versions/current/claude";
+const TEST_EXPECTED_EXECUTOR_SHA256 = `sha256:${"0".repeat(64)}`;
 
 /** The five tables clause 3's contract names as the mutation. */
 const FIVE_TABLES = [
@@ -96,8 +97,12 @@ const standardChain = (overrides: Partial<ProcessSnapshot> = {}, sessionUuid = C
   claudeAncestor(overrides, sessionUuid),
 ];
 
-const fakeImageInspector = (version = REQUIRED_EXECUTOR_VERSION): ExecutingImageInspector => ({
-  resolve: () => ({ imagePath: "/fake/versions/current/claude", version }),
+const fakeImageInspector = (
+  version = TEST_REQUIRED_EXECUTOR_VERSION,
+  imagePath = TEST_EXPECTED_EXECUTOR_REALPATH,
+  sha256 = TEST_EXPECTED_EXECUTOR_SHA256,
+): ExecutingImageInspector => ({
+  resolve: () => ({ imagePath, version, sha256 }),
 });
 
 const fakeTranscriptReader = (present = true): TranscriptReader => ({
@@ -106,8 +111,10 @@ const fakeTranscriptReader = (present = true): TranscriptReader => ({
 
 const baseConfig = (overrides: Partial<CanonicalSelfClaimConfig> = {}): CanonicalSelfClaimConfig => ({
   canonicalSessionUuid: CANON,
-  requiredExecutorVersion: REQUIRED_EXECUTOR_VERSION,
+  requiredExecutorVersion: TEST_REQUIRED_EXECUTOR_VERSION,
   canonicalBuzzChannelId: CHANNEL,
+  expectedExecutorRealpath: TEST_EXPECTED_EXECUTOR_REALPATH,
+  expectedExecutorSha256: TEST_EXPECTED_EXECUTOR_SHA256,
   expectedCwd: CWD,
   expectedPeerProtocolVersion: PEER_PROTOCOL,
   expectedPeerIdentity: PEER_IDENTITY,
@@ -122,7 +129,7 @@ const baseConfig = (overrides: Partial<CanonicalSelfClaimConfig> = {}): Canonica
  * a plain `Map` would not roll back with the transaction, and would make the consume-once tests
  * below pass regardless of whether the real rollback wiring works.
  */
-const OWNER_ACTOR = "isaac";
+const OWNER_ACTOR = "test-owner";
 const realOwnerAuthority = (core: CoreHarness): OwnerAuthorityPort =>
   new OwnerAuthority(core.db, [{ channel: "cli", actor: OWNER_ACTOR }], core.clock);
 
@@ -236,11 +243,39 @@ const makeSubject = (
     },
   );
 
-describe("the two deployment facts the packet named", () => {
-  it("exports the exact canonical session UUID and required executor version", () => {
-    expect(CANONICAL_SESSION_UUID).toBe("dc54ab12-e2da-497a-a3c5-9a2a5f8f579a");
-    expect(REQUIRED_EXECUTOR_VERSION).toBe("2.1.259");
-    expect(CANONICAL_PROJECT_BUZZ_CHANNEL_ID).toBe("c37e88d0-8576-48aa-a69c-9cbd54d47be2");
+describe("deployment identity is required, deployment-private configuration (#760 round 9)", () => {
+  it("fails closed, before any effect, when a required deployment value is missing or blank", () => {
+    const core = makeCore();
+    expect(() => makeSubject(core, { configOverrides: { canonicalSessionUuid: "" } })).toThrow(
+      /canonicalSessionUuid/,
+    );
+    expect(() => makeSubject(core, { configOverrides: { requiredExecutorVersion: "" } })).toThrow(
+      /requiredExecutorVersion/,
+    );
+    expect(() => makeSubject(core, { configOverrides: { canonicalBuzzChannelId: "   " } })).toThrow(
+      /canonicalBuzzChannelId/,
+    );
+    expect(() => makeSubject(core, { configOverrides: { expectedExecutorRealpath: "" } })).toThrow(
+      /expectedExecutorRealpath/,
+    );
+    expect(() => makeSubject(core, { configOverrides: { expectedExecutorSha256: "" } })).toThrow(
+      /expectedExecutorSha256/,
+    );
+  });
+
+  it("fails closed when the configured canonical session UUID is not a UUID", () => {
+    const core = makeCore();
+    expect(() => makeSubject(core, { configOverrides: { canonicalSessionUuid: "not-a-uuid" } })).toThrow(/UUID/);
+  });
+
+  it("never falls back to a hardcoded real value — no exported real-ID constant exists to fall back to", () => {
+    // #760 round 9 — CANONICAL_SESSION_UUID / REQUIRED_EXECUTOR_VERSION /
+    // CANONICAL_PROJECT_BUZZ_CHANNEL_ID were removed from this module's exports entirely. This
+    // test is the negative-space proof: every value the primitive uses must come from the config
+    // this test constructs, never from a module-level default.
+    const core = makeCore();
+    const subject = makeSubject(core);
+    expect(subject).toBeInstanceOf(CanonicalSelfClaim);
   });
 });
 
@@ -317,7 +352,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(result.value.binding.role).toBe("PRIMARY_CTO");
     expect(result.value.binding.projectId).toBe(projectId);
     expect(result.value.derivedSessionUuid).toBe(CANON);
-    expect(result.value.executorImageVersion).toBe(REQUIRED_EXECUTOR_VERSION);
+    expect(result.value.executorImageVersion).toBe(TEST_REQUIRED_EXECUTOR_VERSION);
     expect(result.value.buzzAddress).toBe(BUZZ_ADDRESS);
 
     const after = rowCounts(core);
@@ -325,11 +360,17 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       expect(after[table], `table ${table}`).toBe((before[table] ?? 0) + 1);
     }
 
-    const session = core.db.get<{ buzz_actor_id: string; buzz_address: string }>(
-      `SELECT buzz_actor_id, buzz_address FROM sessions WHERE session_id = ?`,
+    const session = core.db.get<{ buzz_actor_id: string; buzz_address: string; os_process_started_at: string }>(
+      `SELECT buzz_actor_id, buzz_address, os_process_started_at FROM sessions WHERE session_id = ?`,
       [result.value.sessionId],
     );
     expect(session).toMatchObject({ buzz_actor_id: "buzz:canonical-cto", buzz_address: BUZZ_ADDRESS });
+    // #760 round 9 — the exact verified `startedAt` from `deriveClaimantIdentity` is what lands
+    // in the row, not a fresh `processStartedAt` read taken at write time. `claudeAncestor`'s own
+    // fixture `startedAt` ("Fri Jan  1 00:00:00 2027") has no real corresponding OS process at
+    // all; if `SessionRegistry.create` were still deriving its own value, this column would be
+    // null (no real pid to `ps`-query), not this fixture's exact fake value.
+    expect(session!.os_process_started_at).toBe("Fri Jan  1 00:00:00 2027");
 
     // Positive evidence that every writer `#mutate` composes recorded its own audit row, exactly
     // once each, inside the same committed transaction — the full footprint the refusal oracle
@@ -407,6 +448,67 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(rowCounts(core)).toEqual(before);
   });
 
+  it(
+    "clause 2 — A→B pid reuse: the claimant's pid is re-verified after derivation, and a start-time " +
+      "mismatch (a different process now answering to that pid) refuses instead of adopting process B as process A",
+    async () => {
+      // `deriveClaimantIdentity` reads this inspector once per pid to establish the verified
+      // identity. `reusablePidInspector` answers that first read with the real claimant (process
+      // A, started at T1) and every later read — the re-verification checkpoints this round adds
+      // — with a *different* process now occupying the same pid (process B, started at T2),
+      // exactly the shape a pid-reuse race produces: A exits, the kernel reissues its pid to an
+      // unrelated process B, and nothing about the pid number alone reveals the swap.
+      const claudePid = 10;
+      const startedAtA = "Fri Jan  1 00:00:00 2027";
+      const startedAtB = "Sat Jan  2 00:00:00 2027";
+      let claudePidReads = 0;
+      const reusablePidInspector: ProcessAncestryInspector = {
+        snapshot: (pid) => {
+          const entry = standardChain().find((s) => s.pid === pid);
+          if (!entry) return null;
+          if (pid !== claudePid) return entry;
+          claudePidReads += 1;
+          // First read (clause 1's derivation): the real claimant, process A. Every subsequent
+          // read (this round's re-verification checkpoints): process B, a different start time
+          // at the identical pid.
+          return claudePidReads === 1 ? { ...entry, startedAt: startedAtA } : { ...entry, startedAt: startedAtB };
+        },
+      };
+
+      const core = makeCore();
+      const projectId = "prj_pid_reuse";
+      insertProject(core, projectId);
+      const subject = new CanonicalSelfClaim(
+        core.db,
+        core.clock,
+        core.sessions,
+        core.bindings,
+        realOwnerAuthority(core),
+        fakeBuzzActorAuthenticator(),
+        fakeResolveBuzzAddress(),
+        baseConfig(),
+        {
+          processInspector: reusablePidInspector,
+          imageInspector: fakeImageInspector(),
+          transcriptReader: fakeTranscriptReader(),
+        },
+      );
+      const request = baseRequest(core, projectId);
+      const before = rowCounts(core);
+      const result = await subject.claim(request);
+
+      expect(result.allowed, JSON.stringify(result)).toBe(false);
+      if (result.allowed) return;
+      expect(result.reasonCode).toBe(ReasonCode.CONFLICT);
+      expect(result.message).toContain("pid may have been reused");
+      expect(result.evidence).toMatchObject({ pid: claudePid, verifiedStartedAt: startedAtA, observedStartedAt: startedAtB });
+      // Genuinely re-verified, not a single check reused across all four checkpoints: at least
+      // one re-check after the original derivation read actually ran.
+      expect(claudePidReads).toBeGreaterThan(1);
+      expect(rowCounts(core)).toEqual(before);
+    },
+  );
+
   it("clause 2 — a headless invocation is refused as not interactive", async () => {
     const core = makeCore();
     const projectId = "prj_headless";
@@ -454,11 +556,12 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(rowCounts(core)).toEqual(before);
   });
 
-  it("clause 2 — target version exactly 2.1.259, from the executing image, not any other observed version", async () => {
+  it("clause 2 — target version exactly the configured required version, from the executing image, not any other observed version", async () => {
     const core = makeCore();
     const projectId = "prj_version";
     insertProject(core, projectId);
-    const subject = makeSubject(core, { imageInspector: fakeImageInspector("2.1.241") });
+    const observedVersion = "1.2.3-wrong";
+    const subject = makeSubject(core, { imageInspector: fakeImageInspector(observedVersion) });
     const request = baseRequest(core, projectId);
     const before = rowCounts(core);
     const result = await subject.claim(request);
@@ -466,9 +569,68 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
     expect(result.message).toContain("not the required version");
-    expect(result.evidence).toMatchObject({ observedVersion: "2.1.241", requiredVersion: "2.1.259" });
+    expect(result.evidence).toMatchObject({
+      observedVersion,
+      requiredVersion: TEST_REQUIRED_EXECUTOR_VERSION,
+    });
     expect(rowCounts(core)).toEqual(before);
   });
+
+  it(
+    "clause 2 — a renamed binary with a forged adjacent manifest (right version, wrong realpath) is rejected",
+    async () => {
+      // The exact attack the packet names: a version string alone can be spoofed by placing any
+      // file at any path with a `package.json` claiming the required version next to it. This
+      // fake reports the required version, but at a path that is not the daemon-configured
+      // expected realpath — proving the realpath comparison is what catches it, not the version
+      // check (which this fake, deliberately, would otherwise satisfy).
+      const core = makeCore();
+      const projectId = "prj_forged_realpath";
+      insertProject(core, projectId);
+      const subject = makeSubject(core, {
+        imageInspector: fakeImageInspector(
+          TEST_REQUIRED_EXECUTOR_VERSION,
+          "/tmp/attacker-controlled/renamed-node-binary",
+          TEST_EXPECTED_EXECUTOR_SHA256,
+        ),
+      });
+      const request = baseRequest(core, projectId);
+      const before = rowCounts(core);
+      const result = await subject.claim(request);
+
+      expect(result.allowed).toBe(false);
+      if (result.allowed) return;
+      expect(result.message).toContain("not at the expected realpath");
+      expect(rowCounts(core)).toEqual(before);
+    },
+  );
+
+  it(
+    "clause 2 — right version and right realpath, wrong bytes (forged hash) is rejected",
+    async () => {
+      // The second half of the same attack: even a file placed at the *expected* path, reporting
+      // the expected version, is rejected if its actual bytes do not hash to the daemon-configured
+      // expected sha256 — the property a version string and a realpath alone cannot prove.
+      const core = makeCore();
+      const projectId = "prj_forged_hash";
+      insertProject(core, projectId);
+      const subject = makeSubject(core, {
+        imageInspector: fakeImageInspector(
+          TEST_REQUIRED_EXECUTOR_VERSION,
+          TEST_EXPECTED_EXECUTOR_REALPATH,
+          `sha256:${"f".repeat(64)}`,
+        ),
+      });
+      const request = baseRequest(core, projectId);
+      const before = rowCounts(core);
+      const result = await subject.claim(request);
+
+      expect(result.allowed).toBe(false);
+      if (result.allowed) return;
+      expect(result.message).toContain("does not hash to the expected sha256");
+      expect(rowCounts(core)).toEqual(before);
+    },
+  );
 
   it("clause 2 — an unresolvable executing image refuses fail-closed", async () => {
     const core = makeCore();

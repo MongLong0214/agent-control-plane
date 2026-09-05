@@ -40,22 +40,15 @@ import type { BuzzActorAuthenticator, SessionRegistry } from "../session/session
  */
 
 // ---------------------------------------------------------------------------
-// Deployment constants. Two facts the packet supplied and this module must not re-derive.
+// Deployment identity. #760 round 9 — the one session UUID, the required executor version, and
+// the canonical Buzz channel are deployment-private facts, not source constants. They are
+// required fields on `CanonicalSelfClaimConfig` (below), sourced by the composition root
+// (`src/daemon/agentcpd.ts`) from required environment variables with no fallback to a real
+// value; a missing one fails construction closed, before any effect. The executing image's
+// version must still be read from the actual resolved artifact at check time, never from a
+// symlink or a fresh `claude --version` invocation resolved through PATH — see
+// `resolveExecutingImagePath`/`versionFromImagePath` below.
 // ---------------------------------------------------------------------------
-
-/** The one session this primitive may ever adopt (#760). No other UUID is a restore target. */
-export const CANONICAL_SESSION_UUID = "dc54ab12-e2da-497a-a3c5-9a2a5f8f579a";
-
-/**
- * The exact executor version this deployment currently requires. Measured live: the
- * `~/.local/bin/claude` symlink was repointed to this version on Sep 3, while the running
- * canonical pane still executes 2.1.241 — so this has to be read from the executing image, never
- * from the symlink and never from a fresh `claude --version` invocation resolved through PATH.
- */
-export const REQUIRED_EXECUTOR_VERSION = "2.1.259";
-
-/** The canonical project's Buzz channel (`repo-factory`). */
-export const CANONICAL_PROJECT_BUZZ_CHANNEL_ID = "c37e88d0-8576-48aa-a69c-9cbd54d47be2";
 
 /**
  * `actor_target_bindings.executor_kind` is a closed vocabulary; the schema seeds exactly one
@@ -313,6 +306,8 @@ export const deriveClaimantIdentity = (
 export interface ExecutingImageEvidence {
   imagePath: string;
   version: string;
+  /** `sha256:<hex>` of the resolved image's actual bytes — this module's own `sha256` helper. */
+  sha256: string;
 }
 
 export interface ExecutingImageInspector {
@@ -359,12 +354,30 @@ const versionFromImagePath = (imagePath: string): string | null => {
   return VERSION_PATTERN.exec(imagePath)?.[1] ?? null;
 };
 
+/**
+ * Hashes the resolved image's actual bytes. A version string and a realpath both describe the
+ * file; neither is the file. A renamed Node binary placed at a forged, expected-looking path with
+ * a forged adjacent manifest would satisfy a realpath check and a version check alike — hashing
+ * the bytes is the one comparison that requires the actual invocation artifact to actually be the
+ * expected one, not merely labeled as it.
+ */
+const hashImageBytes = (imagePath: string): string | null => {
+  try {
+    return sha256(readFileSync(imagePath));
+  } catch {
+    return null;
+  }
+};
+
 export const defaultExecutingImageInspector: ExecutingImageInspector = {
   resolve(pid) {
     const imagePath = resolveExecutingImagePath(pid);
     if (!imagePath) return null;
     const version = versionFromImagePath(imagePath);
-    return version ? { imagePath, version } : null;
+    if (!version) return null;
+    const hash = hashImageBytes(imagePath);
+    if (!hash) return null;
+    return { imagePath, version, sha256: hash };
   },
 };
 
@@ -419,12 +432,39 @@ export const defaultTranscriptReader: TranscriptReader = makeDefaultTranscriptRe
 // ---------------------------------------------------------------------------
 
 export interface CanonicalSelfClaimConfig {
-  /** Overridable only for tests; production has exactly one canonical session. */
-  canonicalSessionUuid?: string;
-  /** Overridable only for tests; production requires exactly `REQUIRED_EXECUTOR_VERSION`. */
-  requiredExecutorVersion?: string;
-  /** Overridable only for tests; production has exactly one canonical project channel. */
-  canonicalBuzzChannelId?: string;
+  /**
+   * The one session this deployment may adopt. Required — deployment-private configuration only,
+   * sourced from the composition root's own environment. There is no default and no fallback: a
+   * missing value is a construction-time failure, never a silent substitution for a real ID.
+   */
+  canonicalSessionUuid: string;
+  /**
+   * The exact executor version this deployment currently requires. Required — deployment-private
+   * configuration only, same no-fallback rule as `canonicalSessionUuid`.
+   */
+  requiredExecutorVersion: string;
+  /**
+   * This deployment's one canonical project Buzz channel. Required — deployment-private
+   * configuration only, same no-fallback rule as `canonicalSessionUuid`.
+   */
+  canonicalBuzzChannelId: string;
+  /**
+   * The daemon-owned expected realpath of the executor image, compared against the actual
+   * resolved invocation artifact (`ExecutingImageEvidence.imagePath`, itself never a symlink —
+   * see `resolveExecutingImagePath`). Required — a version string read from an adjacent,
+   * spoofable `package.json` is not sufficient on its own: a renamed binary plus a forged
+   * manifest would still read as the required version. Comparing the actual resolved path closes
+   * that gap. No fallback to a real value.
+   */
+  expectedExecutorRealpath: string;
+  /**
+   * The daemon-owned expected sha256 of the executor image's actual bytes (`sha256:<hex>`, this
+   * module's own `sha256` helper), compared against a hash computed from the resolved image at
+   * check time. Required, same no-fallback rule. Realpath alone would still trust whatever bytes
+   * happen to live at that path; hashing the bytes closes that second half of the gap — a renamed
+   * Node binary with a forged adjacent manifest, placed at the expected path, still fails here.
+   */
+  expectedExecutorSha256: string;
   /** The one working directory the canonical CTO's claude process may run from. */
   expectedCwd: string;
   /**
@@ -545,13 +585,33 @@ export class CanonicalSelfClaim {
     private readonly config: CanonicalSelfClaimConfig,
     deps: CanonicalSelfClaimDeps = {},
   ) {
+    // Fail closed before any effect: these three are deployment-private configuration with no
+    // fallback to a real value. A blank string (an absent env var coerced by a caller, or a typo
+    // in the composition root) must construct nothing, never silently adopt a hardcoded default.
+    for (const [field, value] of [
+      ["canonicalSessionUuid", config.canonicalSessionUuid],
+      ["requiredExecutorVersion", config.requiredExecutorVersion],
+      ["canonicalBuzzChannelId", config.canonicalBuzzChannelId],
+      ["expectedExecutorRealpath", config.expectedExecutorRealpath],
+      ["expectedExecutorSha256", config.expectedExecutorSha256],
+    ] as const) {
+      if (typeof value !== "string" || value.trim().length === 0) {
+        throw new Error(
+          `CanonicalSelfClaim: config.${field} is required deployment configuration and was missing or empty`,
+        );
+      }
+    }
+    if (!UUID_PATTERN.test(config.canonicalSessionUuid)) {
+      throw new Error("CanonicalSelfClaim: config.canonicalSessionUuid must be a UUID");
+    }
+
     this.#processInspector = deps.processInspector ?? defaultProcessAncestryInspector;
     this.#imageInspector = deps.imageInspector ?? defaultExecutingImageInspector;
     this.#transcriptReader = deps.transcriptReader ?? defaultTranscriptReader;
     this.#maxAncestryHops = deps.maxAncestryHops ?? MAX_ANCESTRY_HOPS;
-    this.#canonicalSessionUuid = config.canonicalSessionUuid ?? CANONICAL_SESSION_UUID;
-    this.#requiredExecutorVersion = config.requiredExecutorVersion ?? REQUIRED_EXECUTOR_VERSION;
-    this.#canonicalBuzzChannelId = config.canonicalBuzzChannelId ?? CANONICAL_PROJECT_BUZZ_CHANNEL_ID;
+    this.#canonicalSessionUuid = config.canonicalSessionUuid;
+    this.#requiredExecutorVersion = config.requiredExecutorVersion;
+    this.#canonicalBuzzChannelId = config.canonicalBuzzChannelId;
   }
 
   async claim(request: CanonicalSelfClaimRequest): Promise<Decision<CanonicalSelfClaimReceipt>> {
@@ -693,7 +753,8 @@ export class CanonicalSelfClaim {
         { observed: request.peerProtocolVersion, expected: this.config.expectedPeerProtocolVersion },
       );
     }
-    // Clause 2 — target version exactly REQUIRED_EXECUTOR_VERSION, from the executing image.
+    // Clause 2 — target version exactly the configured required executor version, from the
+    // executing image.
     const image = this.#imageInspector.resolve(identity.pid);
     if (!image) {
       return deny(
@@ -713,6 +774,30 @@ export class CanonicalSelfClaim {
         },
       );
     }
+    // Clause 2 — the executing image is the exact expected artifact, not merely a file that
+    // reports the expected version. A version string (and even the resolved path alone) can be
+    // spoofed by a renamed binary with a forged adjacent manifest placed at the expected
+    // location; comparing both the realpath and a hash of the actual bytes closes that gap.
+    if (image.imagePath !== this.config.expectedExecutorRealpath) {
+      return deny(
+        ReasonCode.CONFLICT,
+        "the claude ancestor's executing image is not at the expected realpath",
+        { observed: image.imagePath, expected: this.config.expectedExecutorRealpath },
+      );
+    }
+    if (image.sha256 !== this.config.expectedExecutorSha256) {
+      return deny(
+        ReasonCode.CONFLICT,
+        "the claude ancestor's executing image does not hash to the expected sha256",
+        { observed: image.sha256, expected: this.config.expectedExecutorSha256, imagePath: image.imagePath },
+      );
+    }
+    // Clause 2 — pid/startedAt re-verified immediately after the image check. Both the ancestry
+    // walk and this image resolution did real, non-instantaneous I/O; a pid reused in between
+    // must be caught here, before the transcript check or the async Buzz boundary below run
+    // anything else against `identity.pid` as though it still names the verified process.
+    const stillLiveAfterImage = this.#assertClaimantStillLive(identity);
+    if (!stillLiveAfterImage.allowed) return stillLiveAfterImage as Decision<CanonicalSelfClaimReceipt>;
     // Clause 2 — the transcript.
     const transcript = this.#transcriptReader.locate(identity.sessionUuid);
     if (!transcript) {
@@ -745,10 +830,39 @@ export class CanonicalSelfClaim {
     // though resolving it could not run inside that transaction.
     const buzzAddress = await this.resolveBuzzAddress(request.buzzPurpose);
     if (!buzzAddress.allowed) return buzzAddress as Decision<CanonicalSelfClaimReceipt>;
+    // Clause 2 — pid/startedAt re-verified again here. This `await` is the real TOCTOU window:
+    // control left this process entirely (a shelled Buzz CLI transport), for however long that
+    // took, before returning. A pid reused during that gap must be caught before `#mutate` ever
+    // opens its transaction and writes `identity.pid` as though it were still the verified one.
+    const stillLiveAfterBuzz = this.#assertClaimantStillLive(identity);
+    if (!stillLiveAfterBuzz.allowed) return stillLiveAfterBuzz as Decision<CanonicalSelfClaimReceipt>;
 
     // Clause 3 — one atomic mutation, or none. Every identity and authority check above is over;
     // nothing past this point may refuse for a reason this transaction cannot also undo.
     return this.#mutate(request, identity, image, transcript, buzzAddress.value);
+  }
+
+  /**
+   * Re-verifies the immutable `(pid, startedAt)` adoption identity `deriveClaimantIdentity`
+   * established at clause 1, at a point later than that derivation. `identity.startedAt` is
+   * guaranteed non-null here — clause 2's own null check above already denied that case — so this
+   * is always a real string-to-string comparison, never a vacuous pass on two nulls.
+   *
+   * Goes through `this.#processInspector`, the same seam `deriveClaimantIdentity` itself used —
+   * never the raw `processStartedAt` OS call directly. A test that fakes process ancestry (a
+   * synthetic pid with no real corresponding OS process) must re-verify against that same fake,
+   * not against a real `ps` lookup for a pid that was never real to begin with.
+   */
+  #assertClaimantStillLive(identity: DerivedClaimantIdentity): Decision<true> {
+    const observed = this.#processInspector.snapshot(identity.pid)?.startedAt ?? null;
+    if (observed !== identity.startedAt) {
+      return deny(
+        ReasonCode.CONFLICT,
+        "the claimant process's start time no longer matches the identity verified earlier in this claim — its pid may have been reused",
+        { pid: identity.pid, verifiedStartedAt: identity.startedAt, observedStartedAt: observed },
+      );
+    }
+    return allow(ReasonCode.OK, true);
   }
 
   #mutate(
@@ -781,6 +895,14 @@ export class CanonicalSelfClaim {
         );
       }
 
+      // Clause 2 — pid/startedAt re-verified one last time, at the commit boundary itself, inside
+      // this transaction. Everything above this point ran outside the transaction (including the
+      // async Buzz-resolution await); a pid reused in the gap between that last check and this
+      // write is still a real, distinct window, and this is the last point it can be caught
+      // before `identity.pid`/`identity.startedAt` are written as though verified.
+      const stillLiveAtCommit = this.#assertClaimantStillLive(identity);
+      if (!stillLiveAtCommit.allowed) return stillLiveAtCommit as Decision<CanonicalSelfClaimReceipt>;
+
       // Correction 4 — consumed exactly once, inside this transaction. A denial anywhere below
       // rolls this consumption back too, so a refused claim leaves the approval reusable; only a
       // committed one burns it. `OwnerAuthority.consumeApproval` itself denies a replay or a
@@ -793,6 +915,10 @@ export class CanonicalSelfClaim {
         model: "claude-cli",
         workdir: identity.cwd,
         osPid: identity.pid,
+        // The exact verified pair, not a fresh `processStartedAt` read at write time (#760 round
+        // 9) — `SessionRegistry.create` accepts this and stores it as-is rather than re-deriving
+        // its own start time, which is precisely the TOCTOU window this field closes.
+        osStartedAt: identity.startedAt,
         buzzAddress,
       });
       // `bind()` requires a READY session (SESSION_NOT_READY otherwise); `create()` always starts

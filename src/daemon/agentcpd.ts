@@ -2512,6 +2512,33 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   if (!operatorActor) {
     throw new Error("ACP_OPERATOR_ACTOR or USER is required to establish the operator peer identity");
   }
+  // #760 round 9 — deployment-private configuration for the canonical self-claim primitive.
+  // Every value here is required, with no fallback to a real value: a missing env var must fail
+  // this daemon closed before it ever starts listening, not silently substitute a hardcoded ID.
+  const canonicalSessionUuid = process.env["ACP_CANONICAL_SESSION_UUID"]?.trim();
+  if (!canonicalSessionUuid) {
+    throw new Error("ACP_CANONICAL_SESSION_UUID is required to identify the one session this deployment may adopt");
+  }
+  const canonicalRequiredExecutorVersion = process.env["ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION"]?.trim();
+  if (!canonicalRequiredExecutorVersion) {
+    throw new Error("ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION is required for the canonical self-claim primitive");
+  }
+  const canonicalBuzzChannelId = process.env["ACP_BUZZ_CHANNEL"]?.trim();
+  if (!canonicalBuzzChannelId) {
+    throw new Error("ACP_BUZZ_CHANNEL is required for the canonical self-claim primitive's Buzz channel identity");
+  }
+  const canonicalExpectedExecutorRealpath = process.env["ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH"]?.trim();
+  if (!canonicalExpectedExecutorRealpath) {
+    throw new Error(
+      "ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH is required for the canonical self-claim primitive's executable authentication",
+    );
+  }
+  const canonicalExpectedExecutorSha256 = process.env["ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256"]?.trim();
+  if (!canonicalExpectedExecutorSha256) {
+    throw new Error(
+      "ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256 is required for the canonical self-claim primitive's executable authentication",
+    );
+  }
   const telegramConfig = configuredTelegramLongPollConfig(config.ownerIdentities ?? []);
   const cp = new ControlPlane(config);
 
@@ -2691,15 +2718,20 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         }),
         resolveBuzzAddress: resolveCanonicalSelfClaimBuzzAddress,
         config: {
+          canonicalSessionUuid,
+          requiredExecutorVersion: canonicalRequiredExecutorVersion,
+          canonicalBuzzChannelId,
           expectedCwd: process.env["ACP_CANONICAL_CTO_WORKDIR"] ?? process.cwd(),
           expectedPeerProtocolVersion: process.env["ACP_CANONICAL_CTO_PEER_PROTOCOL"] ?? "acp.operator/v1",
           // Matches the listener's own derivation exactly: both read this daemon's effective
           // uid, never a value either side is told by the other.
           expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
           peerProtocolVersion: process.env["ACP_CANONICAL_CTO_PEER_PROTOCOL"] ?? "acp.operator/v1",
-          buzzChannelId: process.env["ACP_BUZZ_CHANNEL"] ?? "c37e88d0-8576-48aa-a69c-9cbd54d47be2",
+          buzzChannelId: canonicalBuzzChannelId,
           buzzActorId: canonicalCtoBuzzActorId,
           buzzPurpose: process.env["ACP_CANONICAL_CTO_BUZZ_PURPOSE"] ?? "continuity:PRIMARY_CTO",
+          expectedExecutorRealpath: canonicalExpectedExecutorRealpath,
+          expectedExecutorSha256: canonicalExpectedExecutorSha256,
         },
       });
     });

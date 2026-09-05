@@ -1,5 +1,5 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -16,11 +16,15 @@ import {
 } from "../../src/daemon/canonical-self-claim-operator.ts";
 import { IngressGuard } from "../../src/ingress/ingress-guard.ts";
 import { allow, type Decision } from "../../src/core/errors.ts";
+import { sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { REQUIRED_EXECUTOR_VERSION, makeDefaultTranscriptReader } from "../../src/registry/canonical-self-claim.ts";
+import { makeDefaultTranscriptReader } from "../../src/registry/canonical-self-claim.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeStartedOperator, TEST_OPERATOR_TOKEN, type Harness, type StartedOperator } from "../helpers/harness.ts";
 import { createConnection } from "node:net";
+
+/** Synthetic — never a real deployment version, per #760 round 9's no-real-value rule for tests. */
+const TEST_REQUIRED_EXECUTOR_VERSION = "9.0.0-test";
 
 /**
  * #760 round 6 — the CEO's ruling on the mint/claim separation: "a process may prove who it is,
@@ -178,7 +182,7 @@ const claimAsRealClaudeProcess = (
   requestBody: Record<string, unknown>,
   sessionUuid: string = TEST_SESSION_UUID,
 ): Promise<Decision<unknown>> => {
-  const claude = writeVersionedClaude(join(root, "versions"), REQUIRED_EXECUTOR_VERSION);
+  const claude = writeVersionedClaude(join(root, "versions"), TEST_REQUIRED_EXECUTOR_VERSION);
   writeTranscriptFixture(root, sessionUuid);
   const child = spawnAndSendOneRequest(claude, socketPath, ["--session-id", sessionUuid], root, requestBody);
   return waitForClaimResult(child);
@@ -291,32 +295,45 @@ const depsFor = (
   cp: Harness["cp"],
   root: string,
   options: { sessionUuid?: string; maxAncestryHops?: number } = {},
-): CanonicalSelfClaimOperatorDeps => ({
-  db: cp.db,
-  clock: cp.clock,
-  sessions: cp.sessions,
-  bindings: cp.bindings,
-  ownerAuthority: cp.ownerAuthority,
-  buzzActorAuthenticator: new IngressGuard(cp.db, cp.clock, cp.audit, {
-    buzz: { allowedActors: [BUZZ_ACTOR_ID] },
-  }),
-  resolveBuzzAddress: resolveBuzzAddressFixture(),
-  config: {
-    expectedCwd: realpathSync(root),
-    expectedPeerProtocolVersion: PEER_PROTOCOL,
-    expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
-    canonicalSessionUuid: options.sessionUuid ?? TEST_SESSION_UUID,
-    canonicalBuzzChannelId: BUZZ_CHANNEL_ID,
-    peerProtocolVersion: PEER_PROTOCOL,
-    buzzChannelId: BUZZ_CHANNEL_ID,
-    buzzActorId: BUZZ_ACTOR_ID,
-    buzzPurpose: BUZZ_PURPOSE,
-  },
-  claimDeps: {
-    transcriptReader: makeDefaultTranscriptReader(join(root, "transcripts")),
-    ...(options.maxAncestryHops !== undefined ? { maxAncestryHops: options.maxAncestryHops } : {}),
-  },
-});
+): CanonicalSelfClaimOperatorDeps => {
+  // Pre-created here so the expected realpath/sha256 are known before the listener starts.
+  // `claimAsRealClaudeProcess` recreates the identical fixture (same root, same version) before
+  // spawning the claiming process — idempotent, since `writeVersionedClaude` clones the same
+  // source binary every time, so the bytes (and therefore the hash) never differ between the two
+  // calls.
+  const claudePath = writeVersionedClaude(join(root, "versions"), TEST_REQUIRED_EXECUTOR_VERSION);
+  const expectedExecutorRealpath = realpathSync(claudePath);
+  const expectedExecutorSha256 = sha256(readFileSync(claudePath));
+  return {
+    db: cp.db,
+    clock: cp.clock,
+    sessions: cp.sessions,
+    bindings: cp.bindings,
+    ownerAuthority: cp.ownerAuthority,
+    buzzActorAuthenticator: new IngressGuard(cp.db, cp.clock, cp.audit, {
+      buzz: { allowedActors: [BUZZ_ACTOR_ID] },
+    }),
+    resolveBuzzAddress: resolveBuzzAddressFixture(),
+    config: {
+      expectedCwd: realpathSync(root),
+      expectedPeerProtocolVersion: PEER_PROTOCOL,
+      expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
+      canonicalSessionUuid: options.sessionUuid ?? TEST_SESSION_UUID,
+      requiredExecutorVersion: TEST_REQUIRED_EXECUTOR_VERSION,
+      canonicalBuzzChannelId: BUZZ_CHANNEL_ID,
+      expectedExecutorRealpath,
+      expectedExecutorSha256,
+      peerProtocolVersion: PEER_PROTOCOL,
+      buzzChannelId: BUZZ_CHANNEL_ID,
+      buzzActorId: BUZZ_ACTOR_ID,
+      buzzPurpose: BUZZ_PURPOSE,
+    },
+    claimDeps: {
+      transcriptReader: makeDefaultTranscriptReader(join(root, "transcripts")),
+      ...(options.maxAncestryHops !== undefined ? { maxAncestryHops: options.maxAncestryHops } : {}),
+    },
+  };
+};
 
 const startClaimListener = async (
   daemon: Pick<Daemon, "lock">,

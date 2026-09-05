@@ -86,6 +86,18 @@ export class SessionRegistry {
     workdir?: string | null;
     buzzAddress?: string | null;
     osPid?: number | null;
+    /**
+     * A caller that already verified `(osPid, osStartedAt)` as one immutable pair — e.g. the
+     * canonical self-claim primitive's ancestry walk (#760) — passes its exact verified value
+     * here so it is the value stored, not a fresh read of `ps` taken at write time. Independently
+     * re-deriving the start time at this point would be a TOCTOU window: if `osPid` has been
+     * reused by an unrelated process between verification and this write, `processStartedAt`
+     * would silently record *that* process's start time as if it were the verified one. Omitted
+     * by every caller that has not independently verified identity — those keep the previous,
+     * derive-at-write-time behavior, which is correct for them since there is no prior
+     * verification for a reused pid to invalidate.
+     */
+    osStartedAt?: string | null;
     sessionId?: string;
     incarnation?: string;
   }): CreatedSession {
@@ -95,6 +107,7 @@ export class SessionRegistry {
     const sessionSecret = this.secretStorageAvailable()
       ? randomBytes(SESSION_SECRET_BYTES).toString("base64url")
       : null;
+    const osStartedAt = input.osStartedAt !== undefined ? input.osStartedAt : processStartedAt(input.osPid);
     if (sessionSecret) {
       this.db.run(
         `INSERT INTO sessions (session_id, incarnation, provider, model, effort, lifecycle,
@@ -103,7 +116,7 @@ export class SessionRegistry {
          VALUES (?, ?, ?, ?, ?, 'STARTING', ?, ?, ?, ?, ?, ?, ?)`,
         [
           sessionId, incarnation, input.provider, input.model, input.effort ?? null,
-          input.buzzAddress ?? null, input.osPid ?? null, processStartedAt(input.osPid),
+          input.buzzAddress ?? null, input.osPid ?? null, osStartedAt,
           input.workdir ?? null,
           hashSessionSecret(sessionSecret).toString("hex"), now, now,
         ],
@@ -116,7 +129,7 @@ export class SessionRegistry {
          VALUES (?, ?, ?, ?, ?, 'STARTING', ?, ?, ?, ?, ?, ?)`,
         [
           sessionId, incarnation, input.provider, input.model, input.effort ?? null,
-          input.buzzAddress ?? null, input.osPid ?? null, processStartedAt(input.osPid),
+          input.buzzAddress ?? null, input.osPid ?? null, osStartedAt,
           input.workdir ?? null, now, now,
         ],
       );
