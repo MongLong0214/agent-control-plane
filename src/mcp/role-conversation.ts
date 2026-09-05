@@ -130,6 +130,35 @@ export const ROLE_WAKE_FRAME = `${JSON.stringify({
 type WakeFailure = { shape: "timeout" | "connection-refused" | "connection-closed" | "unclassified" };
 
 /**
+ * Which endpoint check refused, as a closed set of categories.
+ *
+ * **The evidence on a refused endpoint may not contain the path, the directory, or any fragment of
+ * either.** A `Decision`'s evidence is not a local debug string: it is persisted into audit rows
+ * and handed back to callers, so a denial carrying `endpoint` publishes a private local path to
+ * every reader of a failed registration — and `wake` re-runs this validation, so an endpoint that
+ * was replaced after registration leaks it again on a path nobody is looking at. That is the same
+ * disclosure the wake's connect-error classification already refuses to make, on the denial side
+ * rather than the catch side.
+ *
+ * These are categories rather than a single opaque "refused" because an operator still has to know
+ * *which* condition failed to act on it — a mode problem on the state directory and a client that
+ * bound a regular file need different responses. The category names the check; the caller already
+ * knows which path it asked about, and nobody else needs to.
+ */
+type EndpointCheck =
+  | "not-normalized"
+  | "not-under-expected-directory"
+  | "directory-is-symlink"
+  | "directory-not-a-directory"
+  | "directory-owner-mismatch"
+  | "directory-not-owner-only"
+  | "endpoint-is-symlink"
+  | "endpoint-not-a-socket"
+  | "endpoint-owner-mismatch"
+  | "endpoint-not-inspectable"
+  | "owner-unknown-on-this-platform";
+
+/**
  * The client build C0 qualified this transport on.
  *
  * This route is a **version-pinned local runtime contract**, not a supported public interface and
@@ -307,6 +336,15 @@ export class RoleConversationPort {
    * they could learn by watching the socket exist. Everything a wrong recipient would actually
    * want is behind the connection-bound claim, and no amount of endpoint trickery passes that.
    */
+  /**
+   * The single construction site for an endpoint refusal — so there is exactly one place that
+   * decides what a refused endpoint discloses, and adding a path to the evidence means editing
+   * this signature rather than quietly widening one call site.
+   */
+  #endpointRefusal(check: EndpointCheck, message: string): Decision<string> {
+    return deny(ReasonCode.ROLE_PEER_UNSUPPORTED, message, { role: this.#role, check });
+  }
+
   #validateEndpointPath(endpoint: string): Decision<string> {
     const dir = this.#endpointDir;
     if (dir === null) {
@@ -330,54 +368,79 @@ export class RoleConversationPort {
     // does not claim to measure it — the same way `IngressGuard.claimTurn`'s WHERE clause is kept
     // and documented as a second statement of the fact its transaction already guarantees.
     if (endpoint !== resolvePath(endpoint)) {
-      return deny(
-        ReasonCode.ROLE_PEER_UNSUPPORTED,
+      return this.#endpointRefusal(
+        "not-normalized",
         "a wake endpoint must be an exact absolute normalized path",
-        { role: this.#role, endpoint },
       );
     }
     if (dirname(endpoint) !== dir) {
-      return deny(
-        ReasonCode.ROLE_PEER_UNSUPPORTED,
+      return this.#endpointRefusal(
+        "not-under-expected-directory",
         "a wake endpoint must sit directly in this deployment's owner-only state directory",
-        { role: this.#role, endpoint, expectedDir: dir },
       );
     }
     const uid = process.getuid?.();
     if (uid === undefined) {
-      return deny(ReasonCode.ROLE_PEER_UNSUPPORTED, "this platform cannot answer who owns a path", {
-        role: this.#role,
-      });
+      return this.#endpointRefusal(
+        "owner-unknown-on-this-platform",
+        "this platform cannot answer who owns a path",
+      );
     }
     try {
       // `lstat`, not `stat`, in both places. A symlink whose target satisfies every check is still
       // a name the holder can repoint after registration, and following it here would validate the
       // target while the daemon later connects to whatever the link says at that moment. `stat`
       // would silently make both of these checks about something other than the named path.
+      // Each condition gets its own category rather than collapsing into one refusal: a state
+      // directory someone has loosened and a state directory that is a symlink are different
+      // operator problems, and the category is the only thing left to tell them apart once the
+      // path itself is (correctly) not in the evidence.
       const dirStat = lstatSync(dir);
-      if (!dirStat.isDirectory() || dirStat.uid !== uid || !isOwnerOnly(dirStat.mode)) {
-        return deny(
-          ReasonCode.ROLE_PEER_UNSUPPORTED,
-          "the configured wake endpoint directory is not an owner-only directory this process owns",
-          { role: this.#role, expectedDir: dir },
+      if (dirStat.isSymbolicLink()) {
+        return this.#endpointRefusal(
+          "directory-is-symlink",
+          "the configured wake endpoint directory is a symlink",
+        );
+      }
+      if (!dirStat.isDirectory()) {
+        return this.#endpointRefusal(
+          "directory-not-a-directory",
+          "the configured wake endpoint directory is not a directory",
+        );
+      }
+      if (dirStat.uid !== uid) {
+        return this.#endpointRefusal(
+          "directory-owner-mismatch",
+          "the configured wake endpoint directory is owned by another uid",
+        );
+      }
+      if (!isOwnerOnly(dirStat.mode)) {
+        return this.#endpointRefusal(
+          "directory-not-owner-only",
+          "the configured wake endpoint directory is reachable by group or other",
         );
       }
       const endpointStat = lstatSync(endpoint);
       // No mode check here on purpose — see the docstring. The socket is the client's own file,
       // created under the client's umask, and demanding owner-only bits on it would refuse a
       // correct 2.1.259 endpoint. The 0700 parent above is what makes it unreachable to others.
-      if (!endpointStat.isSocket() || endpointStat.uid !== uid) {
-        return deny(
-          ReasonCode.ROLE_PEER_UNSUPPORTED,
-          "a wake endpoint must be a socket this process's uid owns",
-          { role: this.#role, endpoint },
+      if (endpointStat.isSymbolicLink()) {
+        return this.#endpointRefusal("endpoint-is-symlink", "a wake endpoint must not be a symlink");
+      }
+      if (!endpointStat.isSocket()) {
+        return this.#endpointRefusal("endpoint-not-a-socket", "a wake endpoint must be a socket");
+      }
+      if (endpointStat.uid !== uid) {
+        return this.#endpointRefusal(
+          "endpoint-owner-mismatch",
+          "a wake endpoint must be owned by this process's uid",
         );
       }
     } catch {
-      return deny(ReasonCode.ROLE_PEER_UNSUPPORTED, "the wake endpoint could not be inspected", {
-        role: this.#role,
-        endpoint,
-      });
+      return this.#endpointRefusal(
+        "endpoint-not-inspectable",
+        "the wake endpoint could not be inspected",
+      );
     }
     return allow(ReasonCode.OK, endpoint);
   }
@@ -426,7 +489,9 @@ export class RoleConversationPort {
         return deny(
           ReasonCode.ROLE_PEER_UNSUPPORTED,
           "another live peer of this role already registered that wake endpoint",
-          { role: this.#role, endpoint, heldBy: roleKey },
+          // Same rule as the validation refusals: the role key names the conflicting slot, which
+          // an operator needs, while the path itself stays out of anything persisted or returned.
+          { role: this.#role, heldBy: roleKey },
         );
       }
     }

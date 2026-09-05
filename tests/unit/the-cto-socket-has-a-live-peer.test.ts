@@ -79,7 +79,30 @@ interface ToolBody {
   reasonCode: string;
   message?: string;
   value?: unknown;
+  evidence?: Record<string, unknown>;
 }
+
+/**
+ * A refused endpoint must disclose no path — not the endpoint, not the directory, not a fragment.
+ *
+ * A `Decision`'s evidence is persisted and returned to callers, so a refusal that echoed the path
+ * would publish a private local path to every reader of a failed registration. `wake` re-runs the
+ * same validation, so it would leak again on a path nobody watches.
+ *
+ * Checked against **the values this test actually constructed**, never against a hardcoded string:
+ * a literal would keep passing if the production code changed which path it echoed, which is the
+ * failure mode this assertion exists to catch. The whole response body is searched — message and
+ * evidence together — because a path moved from one field to the other is still disclosed.
+ */
+const expectNoPathLeak = (body: ToolBody, paths: readonly string[]): void => {
+  const serialized = JSON.stringify(body);
+  for (const path of paths) {
+    expect(serialized).not.toContain(path);
+    // The basename too: echoing only the last segment still names the socket, and a check that
+    // looked for the full path alone would call that clean.
+    expect(serialized).not.toContain(basename(path));
+  }
+};
 
 /**
  * A real client on the real socket: credential line, then MCP initialize declaring `sampling`,
@@ -781,8 +804,15 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
     // refused a path because it was missing would not be measuring confinement.
     const good = await listeningSocket(join(stateDir, "cto.wake.sock"));
     const outside = await listeningSocket(join(elsewhere, "cto.wake.sock"));
-    const notASocket = join(stateDir, "not-a-socket");
+    // Named so its basename cannot collide with any refusal category string. "not-a-socket" would
+    // appear inside the category `endpoint-not-a-socket` and make the leak check below pass for a
+    // reason that has nothing to do with a leak.
+    const notASocket = join(stateDir, "plain-regular-file");
     writeFileSync(notASocket, "", { mode: 0o600 });
+
+    // Every private path this row put in front of the daemon. No refusal below may echo any of
+    // them, in any field, whole or by basename.
+    const privatePaths = [good.path, outside.path, notASocket, stateDir, elsewhere];
 
     const qualified = await connectPeer(ctoSocket, { token: TOKEN, ...session }, C0_QUALIFIED_CLIENT);
     let unqualified: PeerHandle | null = null;
@@ -794,6 +824,8 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       const away = await qualified.callTool("role_wake_endpoint_register", { endpoint: outside.path });
       expect(away.ok).toBe(false);
       expect(away.reasonCode).toBe(ReasonCode.ROLE_PEER_UNSUPPORTED);
+      expect(away.evidence?.check).toBe("not-under-expected-directory");
+      expectNoPathLeak(away, privatePaths);
 
       // A traversal that *resolves* into the state directory is refused too — but by the parent
       // check above, not by the normalization line that reads as though it owns this case. That
@@ -806,11 +838,15 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       });
       expect(traversed.ok).toBe(false);
       expect(traversed.reasonCode).toBe(ReasonCode.ROLE_PEER_UNSUPPORTED);
+      expectNoPathLeak(traversed, privatePaths);
 
       // In the right directory, owned by this uid, owner-only — and not a socket.
       const plainFile = await qualified.callTool("role_wake_endpoint_register", { endpoint: notASocket });
       expect(plainFile.ok).toBe(false);
       expect(plainFile.reasonCode).toBe(ReasonCode.ROLE_PEER_UNSUPPORTED);
+      // The category still tells an operator which check refused, without naming the file.
+      expect(plainFile.evidence?.check).toBe("endpoint-not-a-socket");
+      expectNoPathLeak(plainFile, privatePaths);
 
       const accepted = await qualified.callTool("role_wake_endpoint_register", { endpoint: good.path });
       expect(accepted.ok).toBe(true);
@@ -827,6 +863,7 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       const unpinned = await unqualified.callTool("role_wake_endpoint_register", { endpoint: good.path });
       expect(unpinned.ok).toBe(false);
       expect(unpinned.reasonCode).toBe(ReasonCode.ROLE_PEER_UNSUPPORTED);
+      expectNoPathLeak(unpinned, privatePaths);
       expect(listeners.ctoConversation.endpointFor(roleKey)).toBeNull();
     } finally {
       await qualified.close();
