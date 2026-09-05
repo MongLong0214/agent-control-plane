@@ -1,0 +1,1181 @@
+import { randomUUID, timingSafeEqual } from "node:crypto";
+import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync } from "node:fs";
+import { isAbsolute, join, normalize } from "node:path";
+
+import { decode } from "nostr-tools/nip19";
+import { makeAuthEvent } from "nostr-tools/nip42";
+import { finalizeEvent, getPublicKey, validateEvent, verifyEvent } from "nostr-tools/pure";
+
+/**
+ * The daemon's own front door on the relay (#760, Part C).
+ *
+ * Everything downstream of this file already exists: a role-addressed envelope is admitted by
+ * `BuzzMessageIngress`, enqueued as one non-retargetable `OWNER_MESSAGE` pointing at the single
+ * durable copy in `inbound_messages.payload_json`, and taken by the role's holder over its own
+ * authenticated connection. What did not exist was anything inside the daemon that *listens*: the
+ * messages arrived because a person ran a CLI, which is what `#627` measured.
+ *
+ * So this module is deliberately only a front door. It owns the socket, NIP-42, the frame grammar
+ * and the signature check, and it owns **no** durable state at all — no cursor file, no seen-set,
+ * no dedup. Replay refusal already has exactly one authority (`IngressGuard.admit` over the
+ * `(channel, nonce)` slot), and a second one here would be a second answer to the same question:
+ * the two would disagree the first time a database was restored, or a process restarted, or a
+ * relay resent stored history, and the disagreement would be silent in both directions — a message
+ * dropped because this file thought it had seen it, or admitted twice because it had not.
+ *
+ * The high-water mark below is therefore a *volatile* optimisation and nothing else. Losing it
+ * costs a redelivery the admission seam refuses; it can never cost a message.
+ */
+
+/** The one file this subscriber reads, directly beneath the daemon's own state directory. */
+export const BUZZ_SUBSCRIBER_CONFIG_FILENAME = "buzz-nostr-subscriber.json";
+
+/** Buzz carries a chat message as a NIP-C7 `kind 9`. Nothing else is subscribed to. */
+export const BUZZ_MENTION_KIND = 9;
+
+/**
+ * What a mention-sourced envelope declares as its recipient class.
+ *
+ * Not `"CEO"`, and that is the whole of it: `BuzzMessageIngress` reads `"CEO"` as "the owner's own
+ * conversation, no `p` tag consulted", and every event this subscriber sees arrived because its
+ * `p` tag named a role's channel identity. Declaring the recipient class as anything else routes
+ * the envelope through the address resolver, which is where the `p` tag becomes a role key.
+ */
+export const BUZZ_MENTION_ADDRESSED_TO = "ROLE";
+
+/**
+ * The largest relay frame this subscriber will even parse.
+ *
+ * A bound before `JSON.parse` rather than after: a relay is an untrusted peer over a socket the
+ * daemon opened, and "parse it and then see how big it was" hands that peer the allocation.
+ */
+export const MAX_RELAY_FRAME_BYTES = 256 * 1024;
+
+/**
+ * One reconnect timer, backing off and capping.
+ *
+ * It caps rather than growing, because the failure this schedule is for is a relay that is down
+ * and will come back, and a subscriber that has backed off to an hour is one an operator has to
+ * remember to restart.
+ */
+export const RELAY_RECONNECT_BACKOFF_MS: readonly number[] = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
+
+/** How an identity's secret key is written in its file. Declared, never sniffed. */
+export type BuzzSubscriberKeyEncoding = "hex" | "nsec";
+
+/** One channel identity this daemon subscribes as. */
+export interface BuzzSubscriberIdentityConfig {
+  /** An absolute, already-normalized path. Opened `O_NOFOLLOW`; never logged. */
+  readonly privateKeyFile: string;
+  readonly encoding: BuzzSubscriberKeyEncoding;
+}
+
+/** The whole of what `buzz-nostr-subscriber.json` may say. */
+export interface BuzzSubscriberConfig {
+  readonly relayUrl: string;
+  readonly identities: readonly BuzzSubscriberIdentityConfig[];
+}
+
+/** Exactly the keys the file may carry, at each of its two levels. */
+const CONFIG_FIELDS: readonly string[] = ["relayUrl", "identities"];
+const IDENTITY_FIELDS: readonly string[] = ["privateKeyFile", "encoding"];
+const KEY_ENCODINGS: readonly string[] = ["hex", "nsec"];
+
+const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/**
+ * Unknown fields fail closed.
+ *
+ * Ignoring one is how a `relayURL` beside a `relayUrl`, or a `privatekeyFile` beside a
+ * `privateKeyFile`, becomes a subscriber running on a default nobody wrote down. There is no
+ * default to fall back to here — that is the point of the config authority — so the only safe
+ * reading of a key this file does not recognise is that the operator meant something this build
+ * cannot do.
+ */
+const requireExactFields = (value: Record<string, unknown>, allowed: readonly string[], what: string): void => {
+  const unknown = Object.keys(value).filter((key) => !allowed.includes(key));
+  if (unknown.length > 0) {
+    throw new Error(`${what} carries unknown field(s): ${unknown.sort().join(", ")}`);
+  }
+  const missing = allowed.filter((key) => !(key in value));
+  if (missing.length > 0) {
+    throw new Error(`${what} is missing required field(s): ${missing.sort().join(", ")}`);
+  }
+};
+
+/**
+ * The relay address, and the four things it may not be.
+ *
+ * `wss` only — a `ws` relay would carry the owner's words and this daemon's NIP-42 assertion in
+ * clear text on the way to it. No userinfo and no fragment, because both are places a credential
+ * gets written by someone who has one and no other field to put it in, and this file is read by a
+ * daemon that logs its own configuration errors.
+ */
+const requireRelayUrl = (value: unknown): string => {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error("relayUrl must be a non-empty string");
+  }
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("relayUrl must be an absolute URL");
+  }
+  if (url.protocol !== "wss:") throw new Error("relayUrl must use the wss scheme");
+  if (url.username.length > 0 || url.password.length > 0) {
+    throw new Error("relayUrl must carry no credentials");
+  }
+  if (url.hash.length > 0) throw new Error("relayUrl must carry no fragment");
+  return value;
+};
+
+/**
+ * A key path this daemon will open, stated in full by whoever configured it.
+ *
+ * Normalized *and* absolute, checked as a string rather than repaired: `resolve()`-ing a relative
+ * path here would make the key that gets opened depend on the daemon's working directory, and a
+ * path carrying `..` would let a directory this file did check stand in for one it did not.
+ */
+const requirePrivateKeyFile = (value: unknown, what: string): string => {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`${what}.privateKeyFile must be a non-empty string`);
+  }
+  if (!isAbsolute(value) || normalize(value) !== value) {
+    throw new Error(`${what}.privateKeyFile must be an absolute normalized path`);
+  }
+  return value;
+};
+
+/** Parses the config text, or throws. There is no partial acceptance and no repair. */
+export const parseBuzzSubscriberConfig = (text: string): BuzzSubscriberConfig => {
+  let value: unknown;
+  try {
+    value = JSON.parse(text) as unknown;
+  } catch {
+    throw new Error(`${BUZZ_SUBSCRIBER_CONFIG_FILENAME} is not JSON`);
+  }
+  if (!isPlainObject(value)) throw new Error(`${BUZZ_SUBSCRIBER_CONFIG_FILENAME} must be a JSON object`);
+  requireExactFields(value, CONFIG_FIELDS, BUZZ_SUBSCRIBER_CONFIG_FILENAME);
+
+  const relayUrl = requireRelayUrl(value["relayUrl"]);
+  const declared = value["identities"];
+  if (!Array.isArray(declared) || declared.length === 0) {
+    throw new Error("identities must be a non-empty array");
+  }
+  const identities = declared.map((entry, index): BuzzSubscriberIdentityConfig => {
+    const what = `identities[${index}]`;
+    if (!isPlainObject(entry)) throw new Error(`${what} must be a JSON object`);
+    requireExactFields(entry, IDENTITY_FIELDS, what);
+    const encoding = entry["encoding"];
+    if (typeof encoding !== "string" || !KEY_ENCODINGS.includes(encoding)) {
+      throw new Error(`${what}.encoding must be one of: ${KEY_ENCODINGS.join(", ")}`);
+    }
+    return {
+      privateKeyFile: requirePrivateKeyFile(entry["privateKeyFile"], what),
+      encoding: encoding as BuzzSubscriberKeyEncoding,
+    };
+  });
+  return { relayUrl, identities };
+};
+
+/**
+ * The config as it sits beside the daemon's other state, or `null` for "this daemon does not
+ * subscribe".
+ *
+ * Absent is the only silent outcome. A file that exists and cannot be read, or reads and does not
+ * parse, throws — an operator who wrote the file meant the subscriber to run, and starting anyway
+ * with zero sockets and no error is how a deployment comes to believe it is listening.
+ */
+export const readBuzzSubscriberConfig = (stateDir: string): BuzzSubscriberConfig | null => {
+  const path = join(stateDir, BUZZ_SUBSCRIBER_CONFIG_FILENAME);
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new Error(`${BUZZ_SUBSCRIBER_CONFIG_FILENAME} could not be read`);
+  }
+  return parseBuzzSubscriberConfig(text);
+};
+
+/** One identity's key material, and the file identity that proves two entries are two files. */
+export interface BuzzSubscriberKeyMaterial {
+  readonly secretKey: Uint8Array;
+  readonly pubkey: string;
+  /** `dev:ino`, so two paths naming one file through a hard link are one identity. */
+  readonly fileIdentity: string;
+}
+
+const decodeSecretKey = (raw: string, encoding: BuzzSubscriberKeyEncoding, what: string): Uint8Array => {
+  const text = raw.trim();
+  if (encoding === "hex") {
+    if (!/^[0-9a-f]{64}$/u.test(text)) {
+      throw new Error(`${what} declares hex encoding and its key file is not 32 hex-encoded bytes`);
+    }
+    return Uint8Array.from(Buffer.from(text, "hex"));
+  }
+  let decoded: ReturnType<typeof decode>;
+  try {
+    decoded = decode(text);
+  } catch {
+    throw new Error(`${what} declares nsec encoding and its key file is not a decodable bech32 string`);
+  }
+  if (decoded.type !== "nsec") {
+    throw new Error(`${what} declares nsec encoding and its key file decodes to something else`);
+  }
+  return decoded.data;
+};
+
+/**
+ * Opens one key file and derives its pubkey.
+ *
+ * `O_NOFOLLOW` and then `fstat` on the descriptor that was actually opened, rather than `lstat`
+ * on the path and `open` after it: between those two calls the path can become something else,
+ * and the check would have been of a file this process never read.
+ *
+ * Nothing here — not a thrown message, not a field of one — carries the path or any byte of the
+ * key. `what` is the identity's ordinal, which is enough to say which entry is wrong and says
+ * nothing about where a key lives to whoever reads the daemon's stderr.
+ */
+export const loadBuzzSubscriberKey = (
+  identity: BuzzSubscriberIdentityConfig,
+  what: string,
+): BuzzSubscriberKeyMaterial => {
+  let fd: number;
+  try {
+    fd = openSync(identity.privateKeyFile, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch {
+    throw new Error(`${what} key file could not be opened without following a symlink`);
+  }
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw new Error(`${what} key file is not a regular file`);
+    if ((stat.mode & 0o077) !== 0) throw new Error(`${what} key file is readable beyond its owner`);
+    const uid = process.getuid?.();
+    if (uid !== undefined && stat.uid !== uid) {
+      throw new Error(`${what} key file is owned by another uid`);
+    }
+    const secretKey = decodeSecretKey(readFileSync(fd, "utf8"), identity.encoding, what);
+    return {
+      secretKey,
+      pubkey: getPublicKey(secretKey),
+      fileIdentity: `${stat.dev}:${stat.ino}`,
+    };
+  } finally {
+    closeSync(fd);
+  }
+};
+
+/** The live PRIMARY_CTO binding one channel identity holds, as the daemon's registries hold it. */
+export interface BuzzMentionRoleBinding {
+  readonly roleKey: string;
+  /** `sessions.buzz_actor_id` as stored, so this module can compare it rather than trust a lookup. */
+  readonly buzzActorId: string;
+}
+
+/**
+ * The registry question this subscriber asks, supplied rather than reached for.
+ *
+ * Same contract as `BuzzMentionRouter`'s, and for the same reason: routing and addressing
+ * questions belong to the daemon's registries, and a transport module that acquired database
+ * authority to answer one would be two authorities for the same fact.
+ *
+ * The implementation must answer only for a **live** (`READY`/`DRAINING`) session holding exactly
+ * one `PRIMARY_CTO` role under a current binding, and `null` for everything else.
+ */
+export interface BuzzMentionRegistry {
+  primaryCtoBindingFor(pubkey: string): BuzzMentionRoleBinding | null;
+}
+
+/**
+ * A string comparison whose duration says nothing about how far the two matched.
+ *
+ * The value compared is a public key, so this is not defence of a secret. It is defence of the
+ * *binding*: the answer decides whether this daemon speaks for a role, and an attacker who can
+ * make the relay echo candidate pubkeys back should not be able to walk one out of the timing.
+ */
+const constantTimeEquals = (a: string, b: string): boolean => {
+  const left = Buffer.from(a, "utf8");
+  const right = Buffer.from(b, "utf8");
+  if (left.length !== right.length) return false;
+  return timingSafeEqual(left, right);
+};
+
+/**
+ * One verified relay event, exactly as its signature covers it.
+ *
+ * Deep-frozen before anything downstream sees it. A sink that could rewrite `content` after
+ * `verifyEvent` returned would be handing the admission seam words no signature was ever checked
+ * against, and the seam has no way to notice — it is given a payload, not an event.
+ */
+export interface BuzzMentionEvent {
+  readonly id: string;
+  readonly pubkey: string;
+  readonly created_at: number;
+  readonly kind: number;
+  readonly tags: readonly (readonly string[])[];
+  readonly content: string;
+  readonly sig: string;
+}
+
+/**
+ * What the admission seam did with one envelope, in the only four answers this subscriber can act
+ * on differently.
+ *
+ * Only the two **durable** answers are cursor-trusted, and the split between `REFUSED` and the
+ * rest is a security boundary rather than a taxonomy.
+ *
+ * The relay's `p` filter authorizes nobody: anyone who can sign a kind-9 event can address one to
+ * this subscriber's pubkey. Such an event is refused by the seam — it is not from a declared owner
+ * — but a refusal that was allowed to advance the cursor would let that stranger choose the
+ * window. One event dated in the far future, refused, and the next `REQ` asks for everything
+ * `since` the year 2100: every real message the owner has sent is outside it. The refusal would
+ * have become a denial of delivery, mounted by someone with no authority at all.
+ *
+ * So a refusal is a statement about **one event** and never about where the window should be. It
+ * is still deterministic — asking again produces the same refusal — which is why it does not
+ * reconnect either; it simply costs nothing and changes nothing.
+ */
+export type BuzzMentionAdmission = "DURABLE" | "ALREADY_DURABLE" | "REFUSED" | "RETRY";
+
+/** One verified event, addressed, on its way to the admission seam. */
+export interface BuzzMentionAdmissionRequest {
+  /** The role the `p`-tagged identity holds right now, re-checked immediately before this call. */
+  readonly roleKey: string;
+  /** The channel identity the event's `p` tag named: this daemon's own subscribed pubkey. */
+  readonly identityPubkey: string;
+  /** The Buzz room the event arrived on — its single `h` tag. */
+  readonly conversation: string;
+  readonly event: BuzzMentionEvent;
+}
+
+/** Where a verified event goes. The daemon's composition is the only production implementation. */
+export interface BuzzMentionSink {
+  admit(request: BuzzMentionAdmissionRequest): Promise<BuzzMentionAdmission>;
+}
+
+/** The half of a socket this module drives. */
+export interface BuzzRelaySocket {
+  send(frame: string): void;
+  close(): void;
+}
+
+/** The half of a socket this module is driven by. */
+export interface BuzzRelaySocketHandlers {
+  onOpen(): void;
+  /** One text frame. A binary frame is not a Nostr message and must arrive as `onClose`. */
+  onFrame(raw: string): void;
+  onClose(): void;
+}
+
+export type BuzzRelaySocketFactory = (
+  url: string,
+  handlers: BuzzRelaySocketHandlers,
+) => BuzzRelaySocket;
+
+/**
+ * The timer seam. Injected so the reconnect schedule is a thing a test can *step*, rather than a
+ * thing a test has to outlast: a table that proved the 30s cap by sleeping 61 seconds would be a
+ * table nobody runs.
+ */
+export interface BuzzSubscriberScheduler {
+  setTimer(ms: number, fire: () => void): number;
+  clearTimer(handle: number): void;
+  /**
+   * Local wall-clock seconds, in the unit a Nostr `created_at` is in.
+   *
+   * On the scheduler rather than beside it, because it is the same kind of thing — the module's
+   * one source of time — and a second, un-injected one is how `Date.now()` gets into a test's
+   * expectations without anyone deciding that it should.
+   */
+  nowSeconds(): number;
+}
+
+/** One listener as this adapter registers it, named so it can be taken off again. */
+type RelaySocketListener = (event: { data?: unknown }) => void;
+
+/** The minimum of `WebSocket` this module uses, so nothing here depends on a DOM lib. */
+interface MinimalWebSocket {
+  send(data: string): void;
+  close(): void;
+  addEventListener(type: string, listener: RelaySocketListener): void;
+  /**
+   * Optional only so a runtime without it cannot crash the daemon at construction. Node 22's
+   * `WebSocket` is an `EventTarget` and has it; the retirement flag below is what makes a
+   * listener inert whether or not this call is available.
+   */
+  removeEventListener?(type: string, listener: RelaySocketListener): void;
+}
+type MinimalWebSocketConstructor = new (url: string) => MinimalWebSocket;
+
+/**
+ * Node 22's own `globalThis.WebSocket`, and no library.
+ *
+ * `nostr-tools` ships `Relay`/`SimplePool`, which would bring their own socket, their own
+ * reconnect policy and their own subscription bookkeeping — three behaviours this daemon has
+ * opinions about and would then be unable to state. What is imported from that package is only
+ * the pure functions: the signature scheme, and nothing that opens anything.
+ *
+ * **Every path out of this connection goes through `retire`, and `retire` runs once.**
+ *
+ * The first version of this adapter answered a binary frame and an `error` by calling
+ * `handlers.onClose()` and nothing else. That tells the subscriber the connection is over — it
+ * drops its reference and schedules a reconnect — while the underlying socket is still open with
+ * four anonymous listeners on it, unremovable because nothing kept a reference to them. The
+ * replacement then coexists with an abandoned peer that is still being delivered to, and a late
+ * frame from the dead connection reaches shared state through a wrapper nobody is holding.
+ *
+ * So the three things that end a connection — a binary frame, an error, a remote close — and the
+ * one that ends it deliberately all converge here, and the guard makes the convergence safe:
+ * listeners come off, the socket is closed exactly once, and the subscriber is told at most once.
+ * An explicit `close()` from the wrapper is the one caller that does **not** want the notification:
+ * it is already the subscriber's own doing, and notifying would schedule a reconnect for a
+ * connection the subscriber deliberately ended.
+ */
+export const nativeRelaySocketFactory: BuzzRelaySocketFactory = (url, handlers) => {
+  const ctor = (globalThis as { WebSocket?: MinimalWebSocketConstructor }).WebSocket;
+  if (typeof ctor !== "function") {
+    throw new Error("this runtime has no global WebSocket; the buzz subscriber requires Node 22 or newer");
+  }
+  const socket = new ctor(url);
+  let retired = false;
+
+  // Named, and captured in one list, because "remove every listener" has to be a thing this
+  // function can actually do. An anonymous listener is registered and then unreachable for ever.
+  const onOpen: RelaySocketListener = () => {
+    if (retired) return;
+    handlers.onOpen();
+  };
+  const onMessage: RelaySocketListener = (event) => {
+    if (retired) return;
+    if (typeof event.data === "string") {
+      handlers.onFrame(event.data);
+      return;
+    }
+    // A binary frame is not a Nostr message and this connection is not one this daemon can read.
+    retire(true);
+  };
+  const onRemoteClose: RelaySocketListener = () => retire(true);
+  const onError: RelaySocketListener = () => retire(true);
+
+  const listeners: readonly (readonly [string, RelaySocketListener])[] = [
+    ["open", onOpen],
+    ["message", onMessage],
+    ["close", onRemoteClose],
+    ["error", onError],
+  ];
+
+  function retire(notify: boolean): void {
+    if (retired) return;
+    retired = true;
+    for (const [type, listener] of listeners) socket.removeEventListener?.(type, listener);
+    try {
+      socket.close();
+    } catch {
+      /* a socket already closing by the runtime's own hand is retired either way */
+    }
+    if (notify) handlers.onClose();
+  }
+
+  for (const [type, listener] of listeners) socket.addEventListener(type, listener);
+
+  return {
+    // A send after retirement is a send on a connection this adapter has closed. Dropping it is
+    // the point: the caller holding this wrapper may be a stale one.
+    send: (frame) => {
+      if (retired) return;
+      socket.send(frame);
+    },
+    close: () => retire(false),
+  };
+};
+
+/** `setTimeout` behind the seam. Unreferenced, so a subscriber never holds the process open. */
+export const nativeSubscriberScheduler = (): BuzzSubscriberScheduler => {
+  const live = new Map<number, NodeJS.Timeout>();
+  let next = 1;
+  return {
+    setTimer: (ms, fire) => {
+      const handle = next++;
+      const timer = setTimeout(() => {
+        live.delete(handle);
+        fire();
+      }, ms);
+      timer.unref();
+      live.set(handle, timer);
+      return handle;
+    },
+    clearTimer: (handle) => {
+      const timer = live.get(handle);
+      if (timer) {
+        clearTimeout(timer);
+        live.delete(handle);
+      }
+    },
+    nowSeconds: () => Math.floor(Date.now() / 1000),
+  };
+};
+
+/** Recursively freezes the verified event so nothing downstream can rewrite what was checked. */
+const deepFreeze = <T>(value: T): T => {
+  if (typeof value !== "object" || value === null) return value;
+  for (const key of Reflect.ownKeys(value)) {
+    deepFreeze((value as Record<string | symbol, unknown>)[key]);
+  }
+  return Object.freeze(value);
+};
+
+/**
+ * The mutable working shape the signature is checked over.
+ *
+ * `verifyEvent` writes its own verification marker onto the object it is given, so the freeze has
+ * to come after it — which is exactly the order the sink needs anyway: verified first, then
+ * immutable, then handed on.
+ */
+interface RelayEvent {
+  id: string;
+  pubkey: string;
+  created_at: number;
+  kind: number;
+  tags: string[][];
+  content: string;
+  sig: string;
+}
+
+/**
+ * A fresh plain copy of exactly the seven fields a Nostr event has, or `null`.
+ *
+ * Fresh, because what arrives from `JSON.parse` is an object an untrusted peer chose the shape of:
+ * an eighth field rides through `verifyEvent` untouched, and a `__proto__` key is a shape this
+ * process should not be carrying around at all. Rebuilding it field by field means the object the
+ * signature is checked over is the object the sink receives, with nothing else on it.
+ */
+const plainEventOf = (value: unknown): RelayEvent | null => {
+  if (!isPlainObject(value)) return null;
+  const { id, pubkey, created_at: createdAt, kind, tags, content, sig } = value;
+  if (typeof id !== "string" || typeof pubkey !== "string" || typeof sig !== "string") return null;
+  if (typeof content !== "string") return null;
+  if (typeof createdAt !== "number" || !Number.isSafeInteger(createdAt)) return null;
+  if (typeof kind !== "number" || !Number.isSafeInteger(kind)) return null;
+  if (!Array.isArray(tags)) return null;
+  const copiedTags: string[][] = [];
+  for (const tag of tags) {
+    if (!Array.isArray(tag)) return null;
+    if (!tag.every((member): member is string => typeof member === "string")) return null;
+    copiedTags.push([...tag]);
+  }
+  return { id, pubkey, created_at: createdAt, kind, tags: copiedTags, content, sig };
+};
+
+/** Every value of one tag name, in order. */
+const tagValues = (event: RelayEvent, name: string): string[] =>
+  event.tags.filter((tag) => tag[0] === name).map((tag) => tag[1] ?? "");
+
+/**
+ * Why one frame or one event was not acted on.
+ *
+ * Internal, and stays internal: nothing is told this. The relay is never answered with a reason —
+ * a subscriber that reported which check refused an event would be telling an unauthenticated peer
+ * how to build one that passes — and no reason reaches a log, because two of them are derived from
+ * a key file's contents.
+ */
+type BuzzMentionRejection =
+  | "frame-too-large"
+  | "frame-not-json"
+  | "frame-not-a-message"
+  | "auth-refused"
+  | "unknown-subscription"
+  | "event-malformed"
+  | "event-signature-invalid"
+  | "event-wrong-kind"
+  | "event-not-addressed"
+  | "event-conversation-unusable"
+  | "role-not-held";
+
+/** What one identity's connection did with one frame. */
+interface BuzzMentionFrameOutcome {
+  readonly rejected: BuzzMentionRejection | null;
+  readonly admission: BuzzMentionAdmission | null;
+}
+
+const ACCEPTED: BuzzMentionFrameOutcome = { rejected: null, admission: null };
+const rejected = (why: BuzzMentionRejection): BuzzMentionFrameOutcome => ({
+  rejected: why,
+  admission: null,
+});
+
+interface SubscriptionDeps {
+  readonly relayUrl: string;
+  readonly sink: BuzzMentionSink;
+  readonly registry: BuzzMentionRegistry;
+  readonly openSocket: BuzzRelaySocketFactory;
+  readonly scheduler: BuzzSubscriberScheduler;
+}
+
+/**
+ * One identity, one socket, one subscription.
+ *
+ * A socket per identity rather than one multiplexed socket, because NIP-42 authenticates a
+ * *connection* as one pubkey. Two identities on one socket would mean the relay knows one of them
+ * and the second is asserting a role over a connection that authenticated as someone else.
+ */
+class BuzzMentionSubscription {
+  readonly #deps: SubscriptionDeps;
+  readonly #pubkey: string;
+  readonly #secretKey: Uint8Array;
+  readonly #roleKey: string;
+  readonly #subscriptionId = randomUUID().replace(/-/gu, "");
+
+  #socket: BuzzRelaySocket | null = null;
+  /**
+   * Which connection is current, and the fence a queued frame is checked against.
+   *
+   * `0` means there is no live connection. Every other value names exactly one, and a callback
+   * captures the value it was created under.
+   *
+   * Retiring listeners cannot cover this on its own. A frame handed to `onFrame` is put on a
+   * promise queue and runs later; by then its connection may have been retired and replaced, and
+   * removing a listener does nothing about a callback that is already scheduled. Without the
+   * fence such a frame would be parsed, admitted and — on a refusal — would reconnect *the
+   * replacement*, all on behalf of a connection that no longer exists.
+   */
+  #generation = 0;
+  #connections = 0;
+  #authEventId: string | null = null;
+  #subscribed = false;
+  /** The volatile high-water mark. Inclusive: `since` is `>=` on the wire. */
+  #since: number | null = null;
+  #attempt = 0;
+  #timer: number | null = null;
+  #stopped = false;
+  /** Frames are handled one at a time; a second must not overtake the first's admission. */
+  #queue: Promise<void> = Promise.resolve();
+
+  constructor(deps: SubscriptionDeps, identity: { pubkey: string; secretKey: Uint8Array; roleKey: string }) {
+    this.#deps = deps;
+    this.#pubkey = identity.pubkey;
+    this.#secretKey = identity.secretKey;
+    this.#roleKey = identity.roleKey;
+  }
+
+  /** The volatile high-water mark, for the rows that assert a redelivery window rather than a file. */
+  get since(): number | null {
+    return this.#since;
+  }
+
+  get subscriptionId(): string {
+    return this.#subscriptionId;
+  }
+
+  open(): void {
+    if (this.#stopped || this.#socket !== null) return;
+    this.#authEventId = null;
+    this.#subscribed = false;
+    // Claimed before the socket exists, so every callback the factory registers is already fenced
+    // by the time it can fire.
+    const generation = ++this.#connections;
+    this.#generation = generation;
+    this.#socket = this.#deps.openSocket(this.#deps.relayUrl, {
+      onOpen: () => {
+        /* NIP-42 first: nothing is requested until the relay has challenged and accepted us. */
+      },
+      onFrame: (raw) => {
+        this.#queue = this.#queue.then(async () => {
+          // Checked here, and then again everywhere below. Reaching the front of the queue is the
+          // *first* moment "is this still the connection I arrived on" has a truthful answer; it
+          // is not the last, because `#handleFrame` suspends on the sink.
+          if (!this.#isCurrent(generation)) return;
+          try {
+            await this.#handleFrame(raw, generation);
+          } catch {
+            // A sink that threw established nothing about the message, so this is the `RETRY`
+            // shape and is treated as one: the cursor stays where it is and the socket goes.
+            // Letting it reject would take the queue's chain with it, and every later frame on
+            // this connection would then be dropped silently.
+            //
+            // Conditional on the generation, and that is the whole of the second defect: a
+            // rejection arriving after this connection was replaced used to reach an
+            // unconditional `#reconnect()` and drop *the replacement's* socket.
+            this.#reconnect(generation);
+          }
+        });
+      },
+      onClose: () => {
+        if (generation !== this.#generation) return;
+        this.#onClose();
+      },
+    });
+  }
+
+  close(): void {
+    this.#stopped = true;
+    if (this.#timer !== null) {
+      this.#deps.scheduler.clearTimer(this.#timer);
+      this.#timer = null;
+    }
+    this.#drop();
+  }
+
+  /** Settles once every frame delivered so far has been handled. Tests await this; nothing else. */
+  async settled(): Promise<void> {
+    await this.#queue;
+  }
+
+  #drop(): void {
+    const socket = this.#socket;
+    this.#socket = null;
+    // No live connection from here until `open` claims the next generation. Anything still on the
+    // queue from the one just dropped now fails the fence.
+    this.#generation = 0;
+    this.#subscribed = false;
+    this.#authEventId = null;
+    // The adapter's own retire path: listeners off, socket closed once, and deliberately no
+    // notification back — this drop *is* the subscriber's decision, and being told about it would
+    // schedule a reconnect for a connection the subscriber itself just ended.
+    if (socket) socket.close();
+  }
+
+  /**
+   * A dropped socket is reconnected on **one** timer.
+   *
+   * One, because the failure mode of "a timer per event that went wrong" is a relay that flapped
+   * once and is then reconnected to forty times a second by a daemon that thinks it is being
+   * patient.
+   */
+  #onClose(): void {
+    this.#socket = null;
+    this.#generation = 0;
+    this.#subscribed = false;
+    this.#authEventId = null;
+    if (this.#stopped || this.#timer !== null) return;
+    const step = Math.min(this.#attempt, RELAY_RECONNECT_BACKOFF_MS.length - 1);
+    const delay = RELAY_RECONNECT_BACKOFF_MS[step] ?? 30_000;
+    this.#attempt += 1;
+    this.#timer = this.#deps.scheduler.setTimer(delay, () => {
+      this.#timer = null;
+      this.open();
+    });
+  }
+
+  /**
+   * Is `generation` still the connection this subscriber is running?
+   *
+   * The one question every suspended continuation has to ask again. A check that ran before an
+   * `await` is not a check on what happens after it: the connection can be retired, its
+   * replacement opened, and the tail of the old frame is still holding a reference to a
+   * subscriber whose state has entirely moved on.
+   */
+  #isCurrent(generation: number): boolean {
+    return !this.#stopped && generation !== 0 && generation === this.#generation;
+  }
+
+  /** A write, refused unless the connection that asked for it is still the connection. */
+  #send(generation: number, frame: string): void {
+    if (!this.#isCurrent(generation)) return;
+    this.#socket?.send(frame);
+  }
+
+  /**
+   * Drops the socket without waiting for the relay to notice, and schedules the reconnect.
+   *
+   * Takes the generation it means to drop, and drops nothing otherwise. Reconnecting is the most
+   * destructive thing a frame handler can do — it closes a live socket — so it is the last place
+   * that should be willing to act on behalf of a connection that has already gone.
+   */
+  #reconnect(generation: number): void {
+    if (!this.#isCurrent(generation)) return;
+    this.#drop();
+    this.#onClose();
+  }
+
+  async #handleFrame(raw: string, generation: number): Promise<BuzzMentionFrameOutcome> {
+    if (Buffer.byteLength(raw, "utf8") > MAX_RELAY_FRAME_BYTES) {
+      this.#reconnect(generation);
+      return rejected("frame-too-large");
+    }
+    let frame: unknown;
+    try {
+      frame = JSON.parse(raw) as unknown;
+    } catch {
+      this.#reconnect(generation);
+      return rejected("frame-not-json");
+    }
+    if (!Array.isArray(frame) || typeof frame[0] !== "string") {
+      this.#reconnect(generation);
+      return rejected("frame-not-a-message");
+    }
+    switch (frame[0]) {
+      case "AUTH":
+        return this.#onAuthChallenge(frame, generation);
+      case "OK":
+        return this.#onOk(frame, generation);
+      case "EVENT":
+        return await this.#onEvent(frame, generation);
+      case "EOSE":
+        return this.#onEose(frame, generation);
+      case "CLOSED":
+        return this.#onClosed(frame, generation);
+      default:
+        // `NOTICE` and anything else a relay chooses to say. Ignored rather than treated as a
+        // protocol violation: a relay that adds a message type is not a relay this daemon should
+        // stop reading, and nothing below acts on a frame it did not recognise.
+        return ACCEPTED;
+    }
+  }
+
+  #onAuthChallenge(frame: readonly unknown[], generation: number): BuzzMentionFrameOutcome {
+    const challenge = frame[1];
+    if (frame.length !== 2 || typeof challenge !== "string" || challenge.length === 0) {
+      this.#reconnect(generation);
+      return rejected("frame-not-a-message");
+    }
+    const signed = finalizeEvent(makeAuthEvent(this.#deps.relayUrl, challenge), this.#secretKey);
+    // The auth state belongs to one connection, so it is written only while that connection is
+    // the one running. A stale challenge that overwrote `#authEventId` would make the
+    // replacement's own `OK` unrecognisable, and the subscription would never open.
+    if (!this.#isCurrent(generation)) return rejected("unknown-subscription");
+    this.#authEventId = signed.id;
+    this.#send(generation, JSON.stringify(["AUTH", signed]));
+    return ACCEPTED;
+  }
+
+  /**
+   * The relay's verdict on our NIP-42 assertion, and the only thing that opens the subscription.
+   *
+   * A refusal reconnects rather than requesting anyway: an unauthenticated `REQ` on a relay that
+   * demanded AUTH either returns nothing or returns a public subset, and the second is worse — the
+   * subscriber would look healthy while missing exactly the messages the auth was for.
+   */
+  #onOk(frame: readonly unknown[], generation: number): BuzzMentionFrameOutcome {
+    // NIP-20 exactly: `["OK", <id>, <accepted>, <message>]`. Checked whole, before element 2 is
+    // read as a verdict — "it starts with OK so element 2 is the answer" is a guess, and the thing
+    // being guessed at here is whether this connection is authenticated.
+    if (
+      frame.length !== 4 ||
+      typeof frame[1] !== "string" ||
+      typeof frame[2] !== "boolean" ||
+      typeof frame[3] !== "string"
+    ) {
+      this.#reconnect(generation);
+      return rejected("frame-not-a-message");
+    }
+    const id = frame[1];
+    if (id !== this.#authEventId) return ACCEPTED;
+    if (frame[2] !== true) {
+      this.#reconnect(generation);
+      return rejected("auth-refused");
+    }
+    // Subscription state, like auth state, is one connection's. A stale `OK` marking the
+    // subscriber subscribed would let the *next* stale event past `#onEvent`'s own guard.
+    if (!this.#isCurrent(generation)) return rejected("unknown-subscription");
+    this.#subscribed = true;
+    const filter: Record<string, unknown> = {
+      kinds: [BUZZ_MENTION_KIND],
+      "#p": [this.#pubkey],
+    };
+    if (this.#since !== null) filter["since"] = this.#since;
+    this.#send(generation, JSON.stringify(["REQ", this.#subscriptionId, filter]));
+    return ACCEPTED;
+  }
+
+  /**
+   * End of stored events.
+   *
+   * Two things happen here and neither is durable. The high-water mark is floored at whatever has
+   * been advanced so far, so a reconnect asks for the tail rather than the whole history; and the
+   * backoff resets, because a connection that reached EOSE is a connection that worked.
+   */
+  #onEose(frame: readonly unknown[], generation: number): BuzzMentionFrameOutcome {
+    if (frame.length !== 2 || typeof frame[1] !== "string") {
+      this.#reconnect(generation);
+      return rejected("frame-not-a-message");
+    }
+    if (frame[1] !== this.#subscriptionId) return rejected("unknown-subscription");
+    // The attempt reset says "a connection reached the end of stored events and therefore
+    // worked". A stale EOSE says that about a connection that is gone, and would hand the live
+    // one a backoff schedule earned by a dead peer.
+    if (!this.#isCurrent(generation)) return rejected("unknown-subscription");
+    this.#attempt = 0;
+    if (this.#since === null) this.#since = 0;
+    return ACCEPTED;
+  }
+
+  /**
+   * The relay ending one subscription.
+   *
+   * Reconnecting is reserved for a well-formed `CLOSED` naming **this** subscription, and that is
+   * narrower than the other verbs on purpose. A reconnect closes a working socket, so it needs
+   * positive evidence that this subscription is the one that ended — and a malformed frame carries
+   * no such evidence: it does not say whose subscription it is, so it cannot be read as saying
+   * ours. Attributing it to us anyway is how a relay's stray bytes become this daemon's reconnect
+   * loop.
+   */
+  #onClosed(frame: readonly unknown[], generation: number): BuzzMentionFrameOutcome {
+    if (frame.length !== 3 || typeof frame[1] !== "string" || typeof frame[2] !== "string") {
+      return rejected("frame-not-a-message");
+    }
+    if (frame[1] !== this.#subscriptionId) return rejected("unknown-subscription");
+    this.#reconnect(generation);
+    return rejected("unknown-subscription");
+  }
+
+  async #onEvent(frame: readonly unknown[], generation: number): Promise<BuzzMentionFrameOutcome> {
+    // `["EVENT", <subscription id>, <event>]`, exactly. A frame carrying a surplus element is not
+    // this grammar, and reading elements 1 and 2 out of it anyway would be answering a message
+    // nobody in this protocol sent.
+    if (frame.length !== 3 || typeof frame[1] !== "string") {
+      this.#reconnect(generation);
+      return rejected("frame-not-a-message");
+    }
+    // The subscription id next, before a byte of the event is looked at. A relay that answers a
+    // subscription this connection never opened is answering someone else's question.
+    if (!this.#subscribed || frame[1] !== this.#subscriptionId) return rejected("unknown-subscription");
+
+    const event = plainEventOf(frame[2]);
+    if (event === null) return rejected("event-malformed");
+    // `validateEvent` is the structural check and `verifyEvent` is the cryptographic one: the id
+    // must be the hash of the serialization, and the signature must be over that id. Both, on the
+    // copy this module built, and before anything reads a field for meaning.
+    if (!validateEvent(event)) return rejected("event-malformed");
+    if (!verifyEvent(event)) return rejected("event-signature-invalid");
+    if (event.kind !== BUZZ_MENTION_KIND) return rejected("event-wrong-kind");
+    // Exactly one `p`, and it is this identity. The `p` filter is the relay's promise; this is the
+    // daemon checking it, and a relay that widened the filter would otherwise hand this subscriber
+    // someone else's mail to speak for.
+    //
+    // The cardinality is the half that matters most, for the same reason the `h` check below
+    // enforces one room and harder. Two recipients means the daemon picks which of several
+    // addressees it is and then speaks as that one — and everything downstream is built on the
+    // answer: `mention` becomes the address the seam resolves to a role, so a multi-recipient
+    // envelope admitted here is an owner's message delivered to a role it was not solely sent to.
+    // A membership test would accept exactly that, including the degenerate case where the extra
+    // tag is a duplicate of this identity.
+    const recipients = tagValues(event, "p");
+    if (recipients.length !== 1 || recipients[0] !== this.#pubkey) {
+      return rejected("event-not-addressed");
+    }
+    // Exactly one `h`, non-empty. The `h` tag is the Buzz room, and the room is what the answer
+    // goes back to: none means there is no thread to answer, and two means picking one — which is
+    // answering in a room the sender did not write in.
+    //
+    // **Counted before anything is discarded.** Filtering the blanks out first and counting the
+    // remainder answers a different question — "is there exactly one *usable* room" — and a signed
+    // event carrying a real room beside a whitespace one reduces to exactly one under it. That is
+    // the sender naming two rooms and this daemon quietly choosing, which is the thing the
+    // paragraph above says it will not do. So: the raw cardinality decides, and the sole value is
+    // then required to be usable rather than selected for being usable.
+    const rooms = tagValues(event, "h");
+    const conversation = rooms.length === 1 ? rooms[0] : undefined;
+    if (conversation === undefined || conversation.trim().length === 0) {
+      return rejected("event-conversation-unusable");
+    }
+
+    // Re-checked here, not only at startup. The role can move between the preflight and this
+    // event — that is ordinary operation — and a subscriber that spoke for a role it no longer
+    // holds would be admitting an owner's message against a stale binding.
+    const bound = this.#deps.registry.primaryCtoBindingFor(this.#pubkey);
+    if (!bound || bound.roleKey !== this.#roleKey || !constantTimeEquals(bound.buzzActorId, this.#pubkey)) {
+      // A race, not a refusal: the cursor is preserved and the socket goes, so the same event is
+      // asked for again once the registry has settled.
+      this.#reconnect(generation);
+      return rejected("role-not-held");
+    }
+
+    const frozen: BuzzMentionEvent = deepFreeze(event);
+    const admission = await this.#deps.sink.admit({
+      roleKey: bound.roleKey,
+      identityPubkey: this.#pubkey,
+      conversation,
+      event: frozen,
+    });
+
+    // **The suspension point.** Admission is the one genuinely slow thing this module does — it
+    // reaches a database and a live peer — and it is therefore the window in which this
+    // connection is most likely to have died and been replaced. Everything below acts on the
+    // subscriber's shared state, so from here the continuation is entitled to nothing until it
+    // has asked again.
+    //
+    // A stale tail is a complete no-op, whichever way the sink answered. Not because the answer
+    // is uninteresting, but because neither thing it would do is meaningful any more: a `RETRY`
+    // would close the *replacement's* socket to retry a request the replacement never made, and
+    // an advance would move the live connection's request window on the strength of a dead
+    // connection's answer. The message itself is not lost by either — the seam has it, or it does
+    // not, and an unadvanced mark simply means the replacement asks for it again.
+    if (!this.#isCurrent(generation)) return { rejected: null, admission };
+
+    if (admission === "RETRY") {
+      this.#reconnect(generation);
+      return { rejected: null, admission };
+    }
+    // A refusal moves nothing. It is deterministic, so there is nothing to retry and no reason to
+    // drop the connection — and it is reachable by anyone who can sign an event, so it must not be
+    // allowed to choose where the window sits. See `BuzzMentionAdmission`.
+    if (admission === "REFUSED") return { rejected: null, admission };
+
+    // The second guard, and it is independent of the first on purpose. Refusing to trust a
+    // *refusal* covers the stranger; it does nothing about an event this daemon accepted as
+    // durable whose `created_at` is nonetheless in the future — an owner with a skewed clock, or
+    // an owner key in the wrong hands. Either way a timestamp is a claim made by whoever signed
+    // it, and the window is this process's own business, so the claim is clamped to local now
+    // before it is allowed to move anything.
+    //
+    // Clamping down never drops a message: `since` is inclusive, so a mark at or below an event's
+    // own timestamp still asks for that event again, and the seam refuses the duplicate. Clamping
+    // *up* is what the outer `Math.max` refuses — the mark only ever moves forward.
+    const claimed = Math.min(event.created_at, this.#deps.scheduler.nowSeconds());
+    this.#since = Math.max(this.#since ?? 0, claimed);
+    return { rejected: null, admission };
+  }
+}
+
+/** What a started subscriber offers its caller, and what a disabled one offers instead. */
+export interface BuzzMentionSubscriberHandle {
+  /** How many relay connections this daemon holds open. Zero whenever the path is not configured. */
+  readonly socketCount: number;
+  readonly relayUrl: string | null;
+  /** The roles this daemon subscribes for, in config order. */
+  readonly roleKeys: readonly string[];
+  /** Settles once every frame delivered so far has been handled. For tests; production ignores it. */
+  settled(): Promise<void>;
+  close(): void;
+}
+
+/** The disabled outcome, stated rather than implied by a null. */
+const DISABLED: BuzzMentionSubscriberHandle = {
+  socketCount: 0,
+  relayUrl: null,
+  roleKeys: [],
+  settled: () => Promise.resolve(),
+  close: () => {
+    /* nothing was opened */
+  },
+};
+
+export interface BuzzMentionSubscriberOptions {
+  readonly config: BuzzSubscriberConfig;
+  readonly registry: BuzzMentionRegistry;
+  readonly sink: BuzzMentionSink;
+  readonly openSocket?: BuzzRelaySocketFactory;
+  readonly scheduler?: BuzzSubscriberScheduler;
+}
+
+/**
+ * Every identity is preflighted before the first socket opens, and any failure opens none.
+ *
+ * The ordering is the whole of it. A loop that opened each socket as it validated would leave a
+ * deployment with three of five identities subscribed and an error in the log — which is the state
+ * an operator reads as "it started". Preflight is therefore a complete pass with no side effect,
+ * and the sockets are opened afterwards or not at all.
+ */
+export const startBuzzMentionSubscriber = (
+  options: BuzzMentionSubscriberOptions,
+): BuzzMentionSubscriberHandle => {
+  const deps: SubscriptionDeps = {
+    relayUrl: options.config.relayUrl,
+    sink: options.sink,
+    registry: options.registry,
+    openSocket: options.openSocket ?? nativeRelaySocketFactory,
+    scheduler: options.scheduler ?? nativeSubscriberScheduler(),
+  };
+
+  const seenPaths = new Set<string>();
+  const seenFiles = new Set<string>();
+  const seenPubkeys = new Set<string>();
+  const seenRoles = new Set<string>();
+  const prepared: BuzzMentionSubscription[] = [];
+  const roleKeys: string[] = [];
+
+  options.config.identities.forEach((identity, index) => {
+    const what = `identities[${index}]`;
+    // The path is compared as configured. Two entries naming one path are one identity written
+    // twice, and the duplicate would open a second socket asserting the same role — two claimants
+    // for one binding, and a race between them for every message.
+    if (seenPaths.has(identity.privateKeyFile)) {
+      throw new Error(`${what} names a key file another identity already names`);
+    }
+    seenPaths.add(identity.privateKeyFile);
+
+    const material = loadBuzzSubscriberKey(identity, what);
+    if (seenFiles.has(material.fileIdentity)) {
+      throw new Error(`${what} key file is the same file as another identity's`);
+    }
+    seenFiles.add(material.fileIdentity);
+    if (seenPubkeys.has(material.pubkey)) {
+      throw new Error(`${what} derives a channel identity another identity already derives`);
+    }
+    seenPubkeys.add(material.pubkey);
+
+    const bound = deps.registry.primaryCtoBindingFor(material.pubkey);
+    if (!bound) {
+      throw new Error(`${what} does not currently hold a live PRIMARY_CTO binding`);
+    }
+    if (!constantTimeEquals(bound.buzzActorId, material.pubkey)) {
+      throw new Error(`${what} resolves to a session bound to a different channel identity`);
+    }
+    if (seenRoles.has(bound.roleKey)) {
+      throw new Error(`${what} holds a role another identity already holds`);
+    }
+    seenRoles.add(bound.roleKey);
+
+    roleKeys.push(bound.roleKey);
+    prepared.push(
+      new BuzzMentionSubscription(deps, {
+        pubkey: material.pubkey,
+        secretKey: material.secretKey,
+        roleKey: bound.roleKey,
+      }),
+    );
+  });
+
+  // All-or-none, and this is the half the preflight cannot cover.
+  //
+  // The preflight refuses before anything is open, so its failures cost nothing to unwind. A
+  // *construction* failure is different: by the time the second socket throws, the first is open
+  // and listening, and the throw leaves this function without ever returning a handle. That
+  // connection is then unreachable by construction — the caller holds no object, so no later
+  // `close()` can reach it and no reconnect path leads back to it. A partial start at least has
+  // an owner; this would have none.
+  //
+  // Every prepared subscription is closed, including the generation whose socket failed: `open`
+  // claims a generation before it constructs, so closing it is what stops that number from being
+  // treated as live by anything still holding it. `close` on one that never opened is a no-op.
+  //
+  // The original error is rethrown rather than wrapped. The operator needs the constructor's own
+  // failure — a relay refusal, a bad URL, a runtime with no `WebSocket` — and an unwind error in
+  // its place would report that cleanup happened while hiding why startup refused at all.
+  try {
+    for (const subscription of prepared) subscription.open();
+  } catch (err) {
+    for (const subscription of prepared) subscription.close();
+    throw err;
+  }
+
+  return {
+    socketCount: prepared.length,
+    relayUrl: options.config.relayUrl,
+    roleKeys,
+    settled: async () => {
+      for (const subscription of prepared) await subscription.settled();
+    },
+    close: () => {
+      for (const subscription of prepared) subscription.close();
+    },
+  };
+};
+
+/**
+ * The whole path, from "is this daemon configured to subscribe" to an open socket.
+ *
+ * Absent config is the disabled handle rather than a throw, and a present-but-wrong one is a
+ * throw rather than a disabled handle. Those are the two halves of the config authority: a
+ * deployment that said nothing gets nothing, and a deployment that said something wrong is told.
+ */
+export const startBuzzMentionSubscriberFromStateDir = (
+  stateDir: string,
+  options: Omit<BuzzMentionSubscriberOptions, "config">,
+): BuzzMentionSubscriberHandle => {
+  const config = readBuzzSubscriberConfig(stateDir);
+  if (config === null) return DISABLED;
+  return startBuzzMentionSubscriber({ ...options, config });
+};

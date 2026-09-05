@@ -17,6 +17,16 @@ import {
   type HermesBootstrapAuthority,
 } from "../bootstrap/hermes-bootstrap.ts";
 import { BuzzAdapter, BuzzCliTransport } from "../buzz/buzz-adapter.ts";
+import {
+  BUZZ_MENTION_ADDRESSED_TO,
+  startBuzzMentionSubscriberFromStateDir,
+  type BuzzMentionAdmission,
+  type BuzzMentionRegistry,
+  type BuzzMentionSink,
+  type BuzzMentionSubscriberHandle,
+  type BuzzRelaySocketFactory,
+  type BuzzSubscriberScheduler,
+} from "../buzz/buzz-mention-subscriber.ts";
 import type { OwnerIdentity } from "../ceo/owner-authority.ts";
 import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -24,12 +34,14 @@ import { recordMigrationRefusal } from "../db/migration-approval.ts";
 import {
   BuzzActorIngress,
   IngressGuard,
+  ingressSignature,
   isTransportRetentionUnknown,
   type IngressPolicy,
 } from "../ingress/ingress-guard.ts";
 import {
   BuzzMessageIngress,
   buzzMessageNonce,
+  buzzMessageSigningRequest,
   deliverBuzzMessage,
   ownerMessagePointerOf,
   type BuzzMentionRouter,
@@ -172,6 +184,19 @@ export interface LocalBuzzActorIngress {
 /** A daemon-owned local hop from the authenticated Buzz relay to the CEO conversation port. */
 export interface LocalBuzzMessageIngress {
   socketPath: string;
+  /**
+   * The exact admission seam this socket serves (#760 Part C).
+   *
+   * Exposed rather than rebuilt, because the daemon's own relay subscriber now feeds the same
+   * path a person's CLI feeds, and *one* seam is the whole requirement: replay refusal, the owner
+   * allowlist, the `(buzz, nonce)` slot and the `OWNER_MESSAGE` row all have exactly one authority
+   * today. A subscriber that constructed a second ingress and a second port would have made a
+   * second one — and the two would agree until the first time a message arrived on both.
+   */
+  readonly seam: {
+    readonly ingress: BuzzMessageIngress;
+    readonly port: BuzzMessageTurnPort;
+  };
   close(): Promise<void>;
 }
 
@@ -726,6 +751,7 @@ export const startBuzzMessageIngressListener = async (
 
   return {
     socketPath,
+    seam: { ingress, port },
     close: async () => {
       await closeSocketServer(server);
       try {
@@ -764,6 +790,137 @@ export const startDaemonBuzzMessageIngress = (
     // which is the state that had a person carrying messages between the two roles.
     roleConversation: listeners.ctoConversation,
   });
+
+/**
+ * The registry answer the relay subscriber preflights against (#760 Part C).
+ *
+ * Deliberately narrower than `buzzMentionRouter`'s. That one answers "which roles does this tag
+ * name", for an envelope somebody else already decided to send; this one answers "may this daemon
+ * open a socket and speak *as* this identity", and the two are not the same question. A session
+ * holding the CEO binding as well as a CTO one is a perfectly good delivery address and is not
+ * something this daemon may subscribe as: the subscriber asserts one role over one NIP-42
+ * connection, and an identity with a second role has no single thing to assert.
+ *
+ * So: a live session, exactly one mentionable binding, and that binding a `PRIMARY_CTO`. Anything
+ * else is `null`, and `null` at startup is a subscriber that does not open.
+ */
+export const buzzMentionSubscriberRegistry = (cp: ControlPlane): BuzzMentionRegistry => ({
+  primaryCtoBindingFor: (pubkey) => {
+    const channelIdentity = pubkey.trim();
+    if (channelIdentity.length === 0) return null;
+    const session = cp.db.get<{ session_id: string; buzz_actor_id: string | null }>(
+      `SELECT session_id, buzz_actor_id FROM sessions
+        WHERE buzz_actor_id = ? AND lifecycle IN ('READY','DRAINING')`,
+      [channelIdentity],
+    );
+    if (!session || session.buzz_actor_id === null) return null;
+    const held = currentBindingsForRoles(cp, MENTIONABLE_ROLES).filter(
+      (binding) => binding.sessionId === session.session_id,
+    );
+    const only = held.length === 1 ? held[0] : undefined;
+    if (!only || only.role !== Role.PRIMARY_CTO) return null;
+    // The stored column travels back with the answer rather than being assumed equal to the
+    // lookup key. `WHERE buzz_actor_id = ?` is SQLite's comparison, and the subscriber re-runs
+    // it in constant time before it will speak for the role.
+    return { roleKey: only.roleKey, buzzActorId: session.buzz_actor_id };
+  },
+});
+
+/**
+ * A retry is a statement that the answer may change; a refusal is a statement about one event and
+ * about nothing else.
+ *
+ * Only one refusal on this path is transient: the addressed role is between holders, so the
+ * admission rolled back, nothing was spent, and the same event admitted a minute later is the
+ * message arriving rather than a duplicate.
+ *
+ * The `ALREADY_DURABLE` codes are the ones where the durable copy demonstrably exists — a replay
+ * of a message this daemon already has, a claimed turn whose outcome nobody recorded, an event id
+ * that already owns an outbox row. Those are as good as a success for the purpose the subscriber
+ * uses this answer for, which is deciding how far its request window may move.
+ *
+ * **Everything else is `REFUSED`, and that is deliberately not cursor-trusted.** The list of ways
+ * a stranger reaches this function is short and it is not empty: the relay's `p` filter authorizes
+ * nobody, so anyone who can sign a kind-9 event can address one here and collect an
+ * `INGRESS_ACTOR_NOT_ALLOWLISTED`. If that answer advanced the window, a stranger could choose it
+ * — one far-future timestamp and the owner's real messages fall outside the next request. So the
+ * default is the answer that changes nothing, and a code has to be named above to be trusted with
+ * the cursor rather than merely to avoid a reconnect loop.
+ */
+const SUBSCRIBER_RETRY_CODES: readonly string[] = [ReasonCode.ROLE_PEER_ABSENT];
+const SUBSCRIBER_ALREADY_DURABLE_CODES: readonly string[] = [
+  ReasonCode.INGRESS_REPLAY_IGNORED,
+  ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN,
+  ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED,
+];
+
+/** What the admission seam's `Decision` means to a subscriber holding a volatile cursor. */
+export const buzzMentionAdmissionOf = (decision: Decision<unknown>): BuzzMentionAdmission => {
+  if (decision.allowed) return "DURABLE";
+  if (SUBSCRIBER_ALREADY_DURABLE_CODES.includes(decision.reasonCode)) return "ALREADY_DURABLE";
+  if (SUBSCRIBER_RETRY_CODES.includes(decision.reasonCode)) return "RETRY";
+  return "REFUSED";
+};
+
+/**
+ * The daemon's own front door on the relay, feeding the seam a person's CLI feeds (#760 Part C).
+ *
+ * Two things are worth stating about the signature this composes. The subscriber has already
+ * verified the *event's* signature — that is what says the owner wrote these words — and the
+ * envelope it hands the seam is then signed with the deployment's ingress secret, because that is
+ * the credential `IngressGuard` authenticates a local submission with. The daemon is standing
+ * where the relay-side CLI stood, so it presents the credential that surface has always presented.
+ *
+ * What it deliberately does not do is skip the seam. Calling `enqueue` directly would be shorter
+ * and would bypass the owner allowlist, the `(buzz, nonce)` replay slot, the address resolution
+ * and the single-transaction admission — every one of which is a refusal this path is required to
+ * make, and none of which this module is allowed to be a second authority for.
+ *
+ * A daemon with no `buzz-nostr-subscriber.json` gets a handle reporting zero sockets. That is the
+ * configured-off state, and it is a value rather than a `null` so a caller cannot read "absent"
+ * as "running".
+ */
+export const startDaemonBuzzMentionSubscriber = (
+  cp: ControlPlane,
+  stateDir: string,
+  policy: IngressPolicy,
+  messageIngress: Pick<LocalBuzzMessageIngress, "seam">,
+  options: {
+    openSocket?: BuzzRelaySocketFactory;
+    scheduler?: BuzzSubscriberScheduler;
+  } = {},
+): BuzzMentionSubscriberHandle => {
+  const secret = policy.secret?.trim() ?? "";
+  if (secret.length === 0) {
+    throw new Error("Buzz mention subscriber requires a non-empty signing secret");
+  }
+  const sink: BuzzMentionSink = {
+    admit: async (request) => {
+      const input: BuzzMessageIngressInput = {
+        // The event's own author, checked against the declared buzz owners by the seam. A
+        // subscriber cannot widen that: it presents who signed the event and nothing else.
+        actor: request.event.pubkey,
+        conversation: request.conversation,
+        eventId: request.event.id,
+        addressedTo: BUZZ_MENTION_ADDRESSED_TO,
+        // The identity whose `p` tag matched, which is the address the seam resolves to a role.
+        mention: request.identityPubkey,
+        text: request.event.content,
+      };
+      const delivered = await deliverBuzzMessage(messageIngress.seam.ingress, messageIngress.seam.port, {
+        ...input,
+        signature: ingressSignature(secret, buzzMessageSigningRequest(input)),
+      });
+      return buzzMentionAdmissionOf(delivered);
+    },
+  };
+  return startBuzzMentionSubscriberFromStateDir(stateDir, {
+    registry: buzzMentionSubscriberRegistry(cp),
+    sink,
+    ...(options.openSocket ? { openSocket: options.openSocket } : {}),
+    ...(options.scheduler ? { scheduler: options.scheduler } : {}),
+  });
+};
 
 /**
  * The operator surface is deliberately a one-request protocol rather than a general RPC
@@ -2400,6 +2557,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   let listeners: LocalMcpListeners | null = null;
   let buzzActorIngress: LocalBuzzActorIngress | null = null;
   let buzzMessageIngress: LocalBuzzMessageIngress | null = null;
+  let buzzMentionSubscriber: BuzzMentionSubscriberHandle | null = null;
   let operator: LocalOperatorListener | null = null;
   let hermesBootstrap: HermesBootstrapAuthority | null = null;
   let telegram: TelegramLongPollListener | null = null;
@@ -2415,6 +2573,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     shuttingDown = (async () => {
     process.stdout.write(`\nshutting down on ${signal}\n`);
     await telegram?.close();
+    buzzMentionSubscriber?.close();
     await buzzMessageIngress?.close();
     await buzzActorIngress?.close();
     await operator?.close();
@@ -2506,6 +2665,21 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
           buzzMessageOwnerActors,
         );
         process.stdout.write("Buzz message ingress started\n");
+        // #760 Part C — the daemon's own front door on the relay, feeding the socket above.
+        //
+        // Configured-off by default and by construction: with no `buzz-nostr-subscriber.json`
+        // beside the daemon's other state this opens nothing and reports zero sockets, which is
+        // every deployment until an operator writes that file. A malformed one is a startup
+        // error rather than a quiet zero, because an operator who wrote the file meant it.
+        buzzMentionSubscriber = startDaemonBuzzMentionSubscriber(
+          cp,
+          stateDir,
+          buzzActorIngressPolicy,
+          buzzMessageIngress,
+        );
+        process.stdout.write(
+          `Buzz mention subscriber sockets: ${buzzMentionSubscriber.socketCount}\n`,
+        );
       }
     }
     if (telegramConfig) {
@@ -2537,7 +2711,10 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   } catch (err) {
     await telegram?.close();
     // Both Buzz listeners, which this teardown used to walk past: a startup that failed after
-    // one of them bound left its socket file behind for the next daemon to find.
+    // one of them bound left its socket file behind for the next daemon to find. The relay
+    // subscriber joins them for the same reason: it holds outbound sockets, and a startup that
+    // failed after it opened them would leave a daemon that exited still subscribed.
+    buzzMentionSubscriber?.close();
     await buzzMessageIngress?.close();
     await buzzActorIngress?.close();
     await operator?.close();
