@@ -713,6 +713,40 @@ describe("a rollback installs one whole generation", () => {
     }
   });
 
+  it("carries an empty directory through seal, stage and install", async () => {
+    const fixture = makeGenerationFixture("acp-rollback-emptydir-");
+    new Db(fixture.databasePath).close();
+    probeDatabase(fixture.databasePath, "generation-a");
+    const closure = runtimeClosureFor(fixture.root, "generation-a");
+    // A directory with nothing in it. A tree copied by walking its files never creates one, so it
+    // would be silently absent from the installed generation — and a census over files cannot see
+    // that it went missing either.
+    mkdirSync(join(closure, "spool"), { mode: 0o700 });
+    mkdirSync(join(closure, "spool", "inner"), { mode: 0o750 });
+
+    const sealed = await sealRollbackPair(fixture.pairsRoot, fixture.sourcesFor("generation-a", closure));
+    const declared = new Map(sealed.manifest.directories.map((d) => [d.path, d.mode]));
+    expect(declared.get("runtime/spool")).toBe(0o700);
+    expect(declared.get("runtime/spool/inner"), "the empty directory's mode was not recorded").toBe(0o750);
+    expect(existsSync(join(sealed.root, "runtime", "spool", "inner"))).toBe(true);
+
+    cpSync(runtimeClosureFor(fixture.root, "generation-b"), fixture.installRoot, { recursive: true });
+    writeFileSync(fixture.plistDestination, "<!-- generation-b plist -->\n", { mode: 0o600 });
+    writeFileSync(fixture.launcherDestination, "#!/bin/bash\n# generation-b\n", { mode: 0o700 });
+
+    const staged = stageRollbackPair(
+      sealed.root,
+      fixture.expectation(sealed.pairId, sealed.indexDigest),
+      join(fixture.root, "stage"),
+    );
+    applyRollbackPair(staged);
+
+    // Through the stage and into the installed generation, with its mode.
+    const installed = join(fixture.installRoot, "spool", "inner");
+    expect(existsSync(installed), "the empty directory was lost on install").toBe(true);
+    expect(statSync(installed).mode & 0o7777).toBe(0o750);
+  }, 120_000);
+
   it("refuses a destination swapped between the plan and the step that uses it", async () => {
     const fixture = makeGenerationFixture("acp-rollback-toctou-");
     new Db(fixture.databasePath).close();

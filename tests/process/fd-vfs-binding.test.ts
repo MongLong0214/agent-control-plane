@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { afterAll, describe, expect, it } from "vitest";
 
-import { FdVfsControl, RollbackFilesystem } from "../../src/db/fd-vfs.ts";
+import { FdVfsControl, RollbackFilesystem, parseExactIdentity } from "../../src/db/fd-vfs.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -782,7 +782,7 @@ describe("the rollback filesystem primitive anchors on descriptors, not names", 
       const entry = fs.stat(parent, "member");
       expect(entry).not.toBeNull();
       expect(entry!.size, "the held descriptor followed the pathname instead of the object").toBe(
-        "sealed\n".length,
+        BigInt("sealed\n".length),
       );
       fs.closeParent(parent);
     });
@@ -859,6 +859,88 @@ describe("the rollback filesystem primitive anchors on descriptors, not names", 
       fs.removeOwned(parent, "mine-moved", moved.dev, moved.ino);
       expect(existsSync(join(root, "mine-moved"))).toBe(false);
       fs.closeParent(parent);
+    });
+  });
+
+  it("carries a 64-bit inode losslessly, where a JavaScript number collides", () => {
+    const root = tempDir("acp-rb-inode-");
+    mkdirSync(join(root, "mine"), { mode: 0o700 });
+
+    withFs((fs) => {
+      const parent = fs.openParent(root);
+      const mine = fs.stat(parent, "mine")!;
+
+      // The defect this representation exists to prevent, demonstrated on the exact boundary:
+      // two different inodes one apart across 2^53 are the same JavaScript number.
+      const beyond = 9007199254740993n;
+      const below = 9007199254740992n;
+      expect(Number(beyond)).toBe(Number(below));
+      expect(beyond).not.toBe(below);
+
+      // The identity really is a bigint, not a number that was widened afterwards.
+      expect(typeof mine.ino).toBe("bigint");
+      expect(typeof mine.dev).toBe("bigint");
+
+      // An ownership check against a colliding neighbour must refuse. Passing these through a
+      // JavaScript number would make the two indistinguishable and delete the caller's tree.
+      expect(() => fs.removeOwned(parent, "mine", mine.dev, beyond)).toThrow(
+        /removing an owned entry/,
+      );
+      expect(() => fs.removeOwned(parent, "mine", mine.dev, below)).toThrow(
+        /removing an owned entry/,
+      );
+      expect(existsSync(join(root, "mine"))).toBe(true);
+
+      // And the real identity still works.
+      fs.removeOwned(parent, "mine", mine.dev, mine.ino);
+      expect(existsSync(join(root, "mine"))).toBe(false);
+      fs.closeParent(parent);
+    });
+  });
+
+  it("parses a 64-bit identity above 2^53 without losing a bit", () => {
+    // Every inode this machine can create is below 2^53, so no fixture driving the primitive can
+    // reach this boundary — it is real on APFS and unreachable here. Measured directly instead.
+    const beyond = "9007199254740993";
+    const below = "9007199254740992";
+    expect(Number(beyond)).toBe(Number(below));
+    expect(parseExactIdentity(beyond, "ino")).toBe(9007199254740993n);
+    expect(parseExactIdentity(beyond, "ino")).not.toBe(parseExactIdentity(below, "ino"));
+    expect(parseExactIdentity("18446744073709551615", "ino")).toBe(18446744073709551615n);
+    for (const bad of ["", "12a", "-1", "1.5", " 12", "0x10"]) {
+      expect(() => parseExactIdentity(bad, "ino"), `accepted ${JSON.stringify(bad)}`).toThrow(
+        /unreadable ino/,
+      );
+    }
+  });
+
+  it("refuses a stale handle token after its slot has been reopened", () => {
+    const root = tempDir("acp-rb-aba-");
+    mkdirSync(join(root, "first"), { mode: 0o700 });
+    mkdirSync(join(root, "second"), { mode: 0o700 });
+    writeFileSync(join(root, "second", "theirs"), "not mine\n", { mode: 0o600 });
+
+    withFs((fs) => {
+      const first = fs.openParent(join(root, "first"));
+      const staleToken = first.token;
+      fs.closeParent(first);
+
+      // The slot is free and the next open takes it. A bare slot index would make the stale token
+      // resolve to this directory — the ABA a generation-bearing token exists to refuse.
+      const second = fs.openParent(join(root, "second"));
+      expect(second.token.split(".")[0], "the fixture did not reuse the slot").toBe(
+        staleToken.split(".")[0],
+      );
+      expect(second.token).not.toBe(staleToken);
+
+      // Refused outright, not answered about the wrong directory. `stat` returns null only for a
+      // missing entry; a token that names no live handle is a refusal, which is the stronger
+      // answer — it cannot be mistaken for "the file is not there".
+      const stale = { ...second, token: staleToken };
+      expect(() => fs.stat(stale, "theirs"), "a stale token resolved to a reopened slot").toThrow(
+        /refused inspecting an entry/,
+      );
+      fs.closeParent(second);
     });
   });
 

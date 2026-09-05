@@ -124,8 +124,15 @@ export interface RollbackPairManifest {
   createdAt: string;
   database: { member: string; manifestMember: string };
   identity: RollbackPairIdentity;
-  /** Every directory in the pair, so an empty one cannot hide between the named members. */
-  directories: string[];
+  /**
+   * Every directory in the pair with its mode.
+   *
+   * Not just a census against hiding: a tree copied by walking its *files* never creates an empty
+   * directory at all, so one that mattered — a spool, a socket directory, a plugin drop — would
+   * be silently absent from the installed generation. Measured before this carried modes: an empty
+   * directory produced no file entries and was lost through seal, stage and install alike.
+   */
+  directories: Array<{ path: string; mode: number }>;
   inventory: RollbackPairMember[];
 }
 
@@ -284,7 +291,15 @@ const copyPrivateFile = (from: string, to: string): void => {
 };
 
 const copyPrivateTree = (from: string, to: string): void => {
-  for (const member of walkTree(from).files) copyMemberFile(join(from, member), join(to, member));
+  const tree = walkTree(from);
+  mkdirSync(to, { recursive: true, mode: 0o700 });
+  // Directories first, and every one of them — including the empty ones a file walk cannot see.
+  for (const directory of tree.directories) {
+    const source = lstatSync(join(from, directory));
+    mkdirSync(join(to, directory), { recursive: true, mode: 0o700 });
+    chmodSync(join(to, directory), source.mode & 0o7777);
+  }
+  for (const member of tree.files) copyMemberFile(join(from, member), join(to, member));
 };
 
 const renderIndex = (root: string, members: readonly string[]): string =>
@@ -690,7 +705,9 @@ export const sealRollbackPair = async (
       createdAt: new Date().toISOString(),
       database: { member: databaseMember, manifestMember: backupManifestMember },
       identity,
-      directories: [...tree.directories].sort(),
+      directories: [...tree.directories]
+        .sort()
+        .map((directory) => ({ path: directory, mode: lstatSync(join(building, directory)).mode & 0o7777 })),
       inventory: tree.files.sort().map((member) => ({
         path: member,
         sha256: hashFile(join(building, member)),
@@ -807,7 +824,9 @@ const readPairManifest = (path: string, root: string): RollbackPairManifest => {
     typeof service.launcherDestination !== "string" ||
     typeof service.workingDirectory !== "string" ||
     !Array.isArray(candidate.directories) ||
-    candidate.directories.some((entry) => typeof entry !== "string") ||
+    candidate.directories.some(
+      (entry) => typeof entry?.path !== "string" || !Number.isInteger(entry.mode),
+    ) ||
     !Array.isArray(candidate.inventory) ||
     candidate.inventory.some(
       (member) =>
@@ -1024,7 +1043,7 @@ export const validateRollbackPair = (
     });
   }
   const presentDirectories = [...tree.directories].sort();
-  const declaredDirectories = [...manifest.directories].sort();
+  const declaredDirectories = [...manifest.directories].map((entry) => entry.path).sort();
   if (
     presentDirectories.length !== declaredDirectories.length ||
     presentDirectories.some((entry, at) => entry !== declaredDirectories[at])
@@ -1034,6 +1053,23 @@ export const validateRollbackPair = (
       present: presentDirectories,
       declared: declaredDirectories,
     });
+  }
+  for (const directory of manifest.directories) {
+    const actual = lstatSync(join(root, directory.path));
+    if (!actual.isDirectory() || actual.isSymbolicLink()) {
+      throw acpError(ReasonCode.STATE_PATH_INSECURE, "a sealed pair directory is not a direct directory", {
+        root,
+        directory: directory.path,
+      });
+    }
+    if ((actual.mode & 0o7777) !== directory.mode) {
+      throw acpError(ReasonCode.INTERNAL_ERROR, "a sealed pair directory is not at the mode its manifest records", {
+        root,
+        directory: directory.path,
+        declared: directory.mode.toString(8),
+        actual: (actual.mode & 0o7777).toString(8),
+      });
+    }
   }
 
   const inventoryPaths = manifest.inventory.map((member) => member.path);
@@ -1290,6 +1326,14 @@ export const stageRollbackPair = (
   chmodSync(stageRoot, 0o700);
   try {
     const pairMembers = join(stageRoot, "pair");
+    // Directories first, every one of them. Copying the inventory alone reproduces only the files,
+    // so an empty directory would reach the stage as nothing and the install would be missing it —
+    // measured, and invisible to any census that counts files.
+    mkdirSync(pairMembers, { recursive: true, mode: 0o700 });
+    for (const directory of validated.manifest.directories) {
+      mkdirSync(join(pairMembers, directory.path), { recursive: true, mode: 0o700 });
+      chmodSync(join(pairMembers, directory.path), directory.mode);
+    }
     for (const member of validated.manifest.inventory) {
       copyPrivateFile(join(validated.root, member.path), join(pairMembers, member.path));
     }
@@ -1396,8 +1440,8 @@ export const stageRollbackPair = (
 interface FrozenDestination {
   path: string;
   parent: RollbackParent;
-  parentDev: number;
-  parentIno: number;
+  parentDev: bigint;
+  parentIno: bigint;
   name: string;
   /** The leaf as it was at plan time, or null when it was absent. */
   identity: RollbackEntry | null;
@@ -1423,17 +1467,20 @@ const assertDestinationIntact = (
   const parentPath = dirname(destination.path);
   let live;
   try {
-    live = statSync(parentPath);
+    // `bigint: true` because the default `stat` returns `dev`/`ino` as JavaScript numbers, which
+    // are already collided above 53 bits — converting one to BigInt afterwards preserves the
+    // collision rather than the identity.
+    live = statSync(parentPath, { bigint: true });
   } catch {
     throw acpError(ReasonCode.STATE_PATH_INSECURE, `${what} no longer has the directory it was planned in`, {
       path: destination.path,
     });
   }
-  if (live.dev !== destination.parentDev || live.ino !== destination.parentIno) {
+  if (BigInt(live.dev) !== destination.parentDev || BigInt(live.ino) !== destination.parentIno) {
     throw acpError(ReasonCode.STATE_PATH_INSECURE, `${what} now resolves to a different directory than the one verified`, {
       path: destination.path,
-      planned: { dev: destination.parentDev, ino: destination.parentIno },
-      found: { dev: live.dev, ino: live.ino },
+      planned: { dev: String(destination.parentDev), ino: String(destination.parentIno) },
+      found: { dev: String(live.dev), ino: String(live.ino) },
     });
   }
   const now = fs.stat(destination.parent, destination.name);
@@ -1449,8 +1496,8 @@ const assertDestinationIntact = (
   if (now === null || now.dev !== planned.dev || now.ino !== planned.ino || now.type !== planned.type) {
     throw acpError(ReasonCode.STATE_PATH_INSECURE, `${what} is no longer the object that was verified`, {
       path: destination.path,
-      planned: { dev: planned.dev, ino: planned.ino, type: planned.type },
-      found: now,
+      planned: { dev: String(planned.dev), ino: String(planned.ino), type: planned.type },
+      found: now === null ? null : { dev: String(now.dev), ino: String(now.ino), type: now.type },
     });
   }
 };

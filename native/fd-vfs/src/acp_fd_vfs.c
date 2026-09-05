@@ -55,6 +55,7 @@
 #include <pthread.h>
 #include <time.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <sys/stat.h>
@@ -1147,33 +1148,26 @@ __declspec(dllexport)
  * exclusive publication and an ownership-bound cleanup need, and nothing else is reachable
  * through them.
  */
-/*
- * An integer argument, without coercion.
- *
- * `better-sqlite3` binds every JS number as REAL — measured: `typeof(?)` is `real` for 0, 1 and
- * 42 alike — so an integer argument arrives as SQLITE_FLOAT and a plain SQLITE_INTEGER check
- * refuses everything. Reaching for `sqlite3_value_int64` instead would coerce, which is the exact
- * defect the lease above was rewritten to escape: `acp_fd_unbind(1.9)` released lease 1. So the
- * float is accepted only when it is exactly integral, and anything else is refused.
- */
-static int acp_rb_int_arg(sqlite3_value *value, sqlite3_int64 *out) {
-  int type = sqlite3_value_type(value);
-  if (type == SQLITE_INTEGER) {
-    *out = sqlite3_value_int64(value);
-    return 1;
-  }
-  if (type != SQLITE_FLOAT) return 0;
-  double d = sqlite3_value_double(value);
-  if (d != (double)(sqlite3_int64)d) return 0;
-  *out = (sqlite3_int64)d;
-  return 1;
-}
 
 #define ACP_RB_MAX_HANDLES 8
 #define ACP_RB_MAX_DEPTH 32
 
+/*
+ * A handle slot, and why it carries a generation.
+ *
+ * A bare slot index is an ABA waiting to happen: close slot 3, open something else that lands in
+ * slot 3, and a caller still holding "3" now operates on a directory it never opened. The token is
+ * therefore `slot.generation`, the generation increments on every open, and a token whose
+ * generation does not match the slot is refused rather than resolved.
+ *
+ * `poisoned` is the other half. If `close()` fails the descriptor's fate is unknown — it may still
+ * be open, and reusing the slot would hand a later caller a descriptor that is not what its token
+ * says. Terminal uncertainty is recorded by never freeing the slot again.
+ */
 typedef struct {
   int fd; /* -1 when free */
+  unsigned long long generation;
+  int poisoned;
   dev_t dev;
   ino_t ino;
 } acp_rb_handle;
@@ -1183,8 +1177,63 @@ static int acp_rb_initialised = 0;
 
 static void acp_rb_init_locked(void) {
   if (acp_rb_initialised) return;
-  for (int i = 0; i < ACP_RB_MAX_HANDLES; i++) acp_rb_handles[i].fd = -1;
+  for (int i = 0; i < ACP_RB_MAX_HANDLES; i++) {
+    acp_rb_handles[i].fd = -1;
+    acp_rb_handles[i].generation = 0;
+    acp_rb_handles[i].poisoned = 0;
+  }
   acp_rb_initialised = 1;
+}
+
+/*
+ * A 64-bit identity argument, carried as decimal text.
+ *
+ * `dev_t` and `ino_t` are 64-bit and APFS uses the range. A JavaScript number cannot hold more
+ * than 53 bits exactly, so an inode above that arrives already collided — `9007199254740993`
+ * becomes `9007199254740992`, which is a different file. Carrying them as text and parsing here
+ * is the only representation that survives the trip, and the parse refuses anything that is not
+ * exactly a decimal integer rather than taking a prefix.
+ */
+static int acp_rb_u64_arg(sqlite3_value *value, unsigned long long *out) {
+  if (sqlite3_value_type(value) != SQLITE_TEXT) return 0;
+  const char *text = (const char *)sqlite3_value_text(value);
+  if (text == 0 || text[0] == 0) return 0;
+  for (const char *c = text; *c != 0; c++) {
+    if (*c < '0' || *c > '9') return 0;
+  }
+  errno = 0;
+  char *end = 0;
+  unsigned long long parsed = strtoull(text, &end, 10);
+  if (errno != 0 || end == 0 || *end != 0) return 0;
+  *out = parsed;
+  return 1;
+}
+
+/* Parses a `slot.generation` token. Returns the live descriptor, or -1 when it names none. */
+static int acp_rb_resolve_locked(sqlite3_value *value, int *slotOut) {
+  if (sqlite3_value_type(value) != SQLITE_TEXT) return -1;
+  const char *text = (const char *)sqlite3_value_text(value);
+  if (text == 0) return -1;
+  char *dot = strchr(text, '.');
+  if (dot == 0 || dot == text || dot[1] == 0) return -1;
+  char slotText[16];
+  size_t slotLen = (size_t)(dot - text);
+  if (slotLen == 0 || slotLen >= sizeof slotText) return -1;
+  memcpy(slotText, text, slotLen);
+  slotText[slotLen] = 0;
+  for (const char *c = slotText; *c != 0; c++) {
+    if (*c < '0' || *c > '9') return -1;
+  }
+  for (const char *c = dot + 1; *c != 0; c++) {
+    if (*c < '0' || *c > '9') return -1;
+  }
+  long slot = strtol(slotText, 0, 10);
+  unsigned long long generation = strtoull(dot + 1, 0, 10);
+  if (slot < 0 || slot >= ACP_RB_MAX_HANDLES) return -1;
+  if (acp_rb_handles[slot].fd < 0) return -1;
+  if (acp_rb_handles[slot].generation != generation) return -1;
+  if (slotOut != 0) *slotOut = (int)slot;
+  return acp_rb_handles[slot].fd;
 }
 
 /* A name this primitive will act on: one component, no separator, not `.` and not `..`. */
@@ -1203,11 +1252,6 @@ static void acp_rb_error(sqlite3_context *ctx, const char *what, int err) {
   sqlite3_result_text(ctx, buf, -1, SQLITE_TRANSIENT);
 }
 
-/* Resolves a handle id to its live descriptor. Returns -1 when the id names no held parent. */
-static int acp_rb_fd_locked(sqlite3_int64 id) {
-  if (id < 0 || id >= ACP_RB_MAX_HANDLES) return -1;
-  return acp_rb_handles[id].fd;
-}
 
 /* open(path, O_DIRECTORY|O_NOFOLLOW) and remember (dev, ino): the anchor everything else uses. */
 static void acp_fn_rb_open(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
@@ -1227,7 +1271,7 @@ static void acp_fn_rb_open(sqlite3_context *ctx, int argc, sqlite3_value **argv)
   acp_rb_init_locked();
   int slot = -1;
   for (int i = 0; i < ACP_RB_MAX_HANDLES; i++) {
-    if (acp_rb_handles[i].fd < 0) {
+    if (acp_rb_handles[i].fd < 0 && !acp_rb_handles[i].poisoned) {
       slot = i;
       break;
     }
@@ -1235,6 +1279,11 @@ static void acp_fn_rb_open(sqlite3_context *ctx, int argc, sqlite3_value **argv)
   if (slot < 0) {
     acp_state_unlock();
     acp_rb_error(ctx, "HANDLES", EMFILE);
+    return;
+  }
+  if (acp_rb_handles[slot].poisoned) {
+    acp_state_unlock();
+    acp_rb_error(ctx, "POISONED", EIO);
     return;
   }
   int fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -1253,19 +1302,20 @@ static void acp_fn_rb_open(sqlite3_context *ctx, int argc, sqlite3_value **argv)
     return;
   }
   acp_rb_handles[slot].fd = fd;
+  acp_rb_handles[slot].generation += 1;
   acp_rb_handles[slot].dev = st.st_dev;
   acp_rb_handles[slot].ino = st.st_ino;
+  unsigned long long generation = acp_rb_handles[slot].generation;
   acp_state_unlock();
-  char buf[160];
-  snprintf(buf, sizeof buf, "handle=%d dev=%lld ino=%lld", slot, (long long)st.st_dev,
-           (long long)st.st_ino);
+  char buf[200];
+  snprintf(buf, sizeof buf, "token=%d.%llu dev=%llu ino=%llu", slot, generation,
+           (unsigned long long)st.st_dev, (unsigned long long)st.st_ino);
   sqlite3_result_text(ctx, buf, -1, SQLITE_TRANSIENT);
 }
 
 static void acp_fn_rb_close(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
-  sqlite3_int64 id = 0;
-  if (argc != 1 || !acp_rb_int_arg(argv[0], &id)) {
-    sqlite3_result_error(ctx, "acp_rb_close(handle)", -1);
+  if (argc != 1) {
+    sqlite3_result_error(ctx, "acp_rb_close(token)", -1);
     return;
   }
   if (!acp_state_lock()) {
@@ -1273,24 +1323,31 @@ static void acp_fn_rb_close(sqlite3_context *ctx, int argc, sqlite3_value **argv
     return;
   }
   acp_rb_init_locked();
-  int fd = acp_rb_fd_locked(id);
+  int slot = -1;
+  int fd = acp_rb_resolve_locked(argv[0], &slot);
   if (fd < 0) {
     acp_state_unlock();
     sqlite3_result_int(ctx, 0);
     return;
   }
-  close(fd);
-  acp_rb_handles[id].fd = -1;
+  if (close(fd) != 0) {
+    // Terminal uncertainty: the descriptor's fate is unknown, so the slot is never handed out
+    // again. Freeing it would let a later token resolve to a descriptor that is not what it says.
+    acp_rb_handles[slot].poisoned = 1;
+    acp_rb_handles[slot].fd = -1;
+    acp_state_unlock();
+    sqlite3_result_int(ctx, -1);
+    return;
+  }
+  acp_rb_handles[slot].fd = -1;
   acp_state_unlock();
   sqlite3_result_int(ctx, 1);
 }
 
 /* fstatat(AT_SYMLINK_NOFOLLOW) relative to the held parent: identity of the entry as it is now. */
 static void acp_fn_rb_stat(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
-  sqlite3_int64 statHandle = 0;
-  if (argc != 2 || !acp_rb_int_arg(argv[0], &statHandle) ||
-      sqlite3_value_type(argv[1]) != SQLITE_TEXT) {
-    sqlite3_result_error(ctx, "acp_rb_stat(handle, name)", -1);
+  if (argc != 2 || sqlite3_value_type(argv[1]) != SQLITE_TEXT) {
+    sqlite3_result_error(ctx, "acp_rb_stat(token, name)", -1);
     return;
   }
   const char *name = (const char *)sqlite3_value_text(argv[1]);
@@ -1303,7 +1360,7 @@ static void acp_fn_rb_stat(sqlite3_context *ctx, int argc, sqlite3_value **argv)
     return;
   }
   acp_rb_init_locked();
-  int fd = acp_rb_fd_locked(statHandle);
+  int fd = acp_rb_resolve_locked(argv[0], 0);
   if (fd < 0) {
     acp_state_unlock();
     acp_rb_error(ctx, "HANDLE", EBADF);
@@ -1322,9 +1379,10 @@ static void acp_fn_rb_stat(sqlite3_context *ctx, int argc, sqlite3_value **argv)
   else if (S_ISLNK(st.st_mode)) type = "symlink";
   else if (S_ISREG(st.st_mode)) type = "file";
   char buf[256];
-  snprintf(buf, sizeof buf, "type=%s mode=%o dev=%lld ino=%lld nlink=%lld size=%lld", type,
-           (unsigned)(st.st_mode & 07777), (long long)st.st_dev, (long long)st.st_ino,
-           (long long)st.st_nlink, (long long)st.st_size);
+  snprintf(buf, sizeof buf, "type=%s mode=%o dev=%llu ino=%llu nlink=%llu size=%llu", type,
+           (unsigned)(st.st_mode & 07777), (unsigned long long)st.st_dev,
+           (unsigned long long)st.st_ino, (unsigned long long)st.st_nlink,
+           (unsigned long long)st.st_size);
   sqlite3_result_text(ctx, buf, -1, SQLITE_TRANSIENT);
 }
 
@@ -1337,12 +1395,9 @@ static void acp_fn_rb_stat(sqlite3_context *ctx, int argc, sqlite3_value **argv)
  * overwrite of somebody else's directory.
  */
 static void acp_fn_rb_rename_excl(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
-  sqlite3_int64 fromHandle = 0;
-  sqlite3_int64 toHandle = 0;
-  if (argc != 4 || !acp_rb_int_arg(argv[0], &fromHandle) ||
-      sqlite3_value_type(argv[1]) != SQLITE_TEXT || !acp_rb_int_arg(argv[2], &toHandle) ||
+  if (argc != 4 || sqlite3_value_type(argv[1]) != SQLITE_TEXT ||
       sqlite3_value_type(argv[3]) != SQLITE_TEXT) {
-    sqlite3_result_error(ctx, "acp_rb_rename_excl(fromHandle, fromName, toHandle, toName)", -1);
+    sqlite3_result_error(ctx, "acp_rb_rename_excl(fromToken, fromName, toToken, toName)", -1);
     return;
   }
   const char *fromName = (const char *)sqlite3_value_text(argv[1]);
@@ -1356,8 +1411,8 @@ static void acp_fn_rb_rename_excl(sqlite3_context *ctx, int argc, sqlite3_value 
     return;
   }
   acp_rb_init_locked();
-  int fromFd = acp_rb_fd_locked(fromHandle);
-  int toFd = acp_rb_fd_locked(toHandle);
+  int fromFd = acp_rb_resolve_locked(argv[0], 0);
+  int toFd = acp_rb_resolve_locked(argv[2], 0);
   if (fromFd < 0 || toFd < 0) {
     acp_state_unlock();
     acp_rb_error(ctx, "HANDLE", EBADF);
@@ -1440,13 +1495,11 @@ static int acp_rb_remove_at(int parentFd, const char *name, int depth) {
  * intruder alone rather than deleting it on the owner's behalf.
  */
 static void acp_fn_rb_remove_owned(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
-  sqlite3_int64 removeHandle = 0;
-  sqlite3_int64 wantDev = 0;
-  sqlite3_int64 wantIno = 0;
-  if (argc != 4 || !acp_rb_int_arg(argv[0], &removeHandle) ||
-      sqlite3_value_type(argv[1]) != SQLITE_TEXT || !acp_rb_int_arg(argv[2], &wantDev) ||
-      !acp_rb_int_arg(argv[3], &wantIno)) {
-    sqlite3_result_error(ctx, "acp_rb_remove_owned(handle, name, dev, ino)", -1);
+  unsigned long long wantDev = 0;
+  unsigned long long wantIno = 0;
+  if (argc != 4 || sqlite3_value_type(argv[1]) != SQLITE_TEXT ||
+      !acp_rb_u64_arg(argv[2], &wantDev) || !acp_rb_u64_arg(argv[3], &wantIno)) {
+    sqlite3_result_error(ctx, "acp_rb_remove_owned(token, name, dev, ino)", -1);
     return;
   }
   const char *name = (const char *)sqlite3_value_text(argv[1]);
@@ -1459,7 +1512,7 @@ static void acp_fn_rb_remove_owned(sqlite3_context *ctx, int argc, sqlite3_value
     return;
   }
   acp_rb_init_locked();
-  int fd = acp_rb_fd_locked(removeHandle);
+  int fd = acp_rb_resolve_locked(argv[0], 0);
   if (fd < 0) {
     acp_state_unlock();
     acp_rb_error(ctx, "HANDLE", EBADF);
@@ -1472,7 +1525,7 @@ static void acp_fn_rb_remove_owned(sqlite3_context *ctx, int argc, sqlite3_value
     acp_rb_error(ctx, "STAT", e);
     return;
   }
-  if ((long long)st.st_dev != (long long)wantDev || (long long)st.st_ino != (long long)wantIno) {
+  if ((unsigned long long)st.st_dev != wantDev || (unsigned long long)st.st_ino != wantIno) {
     acp_state_unlock();
     acp_rb_error(ctx, "OWNERSHIP", EPERM);
     return;

@@ -204,25 +204,52 @@ export const withBoundDescriptor = <T>(
  * no chmod and no traversal: names are single components. It is what an exclusive publication and
  * an ownership-bound cleanup need, and nothing a caller could build a general filesystem out of.
  */
+/**
+ * `dev` and `ino` are `bigint`, and that is not fastidiousness.
+ *
+ * Both are 64-bit and APFS uses the range. A JavaScript number holds 53 bits exactly, so an inode
+ * above that arrives already collided — measured: `Number("9007199254740993")` is
+ * `9007199254740992`, the identity of a different file. An ownership check comparing those would
+ * agree about two different objects, which is the whole property this primitive exists to provide.
+ * They travel as decimal text and are parsed exactly at both ends.
+ */
 export interface RollbackEntry {
   type: "dir" | "file" | "symlink" | "other";
   mode: number;
-  dev: number;
-  ino: number;
-  nlink: number;
-  size: number;
+  dev: bigint;
+  ino: bigint;
+  nlink: bigint;
+  size: bigint;
 }
 
 export interface RollbackParent {
-  handle: number;
-  dev: number;
-  ino: number;
+  /** `slot.generation`. A slot alone would let a reopened slot answer a stale token — an ABA. */
+  token: string;
+  dev: bigint;
+  ino: bigint;
 }
 
 const field = (line: string, name: string): string =>
   new RegExp(`(?:^| )${name}=([^ ]*)`).exec(line)?.[1] ?? "";
 
 /** Every native result is either a value line or `error=WHAT errno=N`; neither is ever guessed. */
+/**
+ * Parses a 64-bit field exactly, refusing anything that is not a plain decimal integer.
+ *
+ * Exported because the property it carries cannot be reached through the operations above: every
+ * inode this machine can create is below 2^53, so a test driving the real primitive would pass
+ * whether this parsed exactly or went through a JavaScript number. The boundary is real on APFS
+ * and unreachable in a fixture, so it is measured here directly.
+ */
+export const parseExactIdentity = (value: string, what: string): bigint => {
+  if (!/^[0-9]+$/.test(value)) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, `the rollback filesystem returned an unreadable ${what}`, {
+      value,
+    });
+  }
+  return BigInt(value);
+};
+
 const refuse = (operation: string, line: string, detail: Record<string, unknown>): never => {
   throw acpError(ReasonCode.STATE_PATH_INSECURE, `the rollback filesystem refused ${operation}`, {
     ...detail,
@@ -233,7 +260,7 @@ const refuse = (operation: string, line: string, detail: Record<string, unknown>
 
 export class RollbackFilesystem {
   readonly #db: InstanceType<typeof Database>;
-  readonly #open = new Set<number>();
+  readonly #open = new Set<string>();
 
   private constructor(db: InstanceType<typeof Database>) {
     this.#db = db;
@@ -265,18 +292,23 @@ export class RollbackFilesystem {
     );
     if (line.startsWith("error=")) refuse("opening a parent directory", line, { path });
     const parent = {
-      handle: Number(field(line, "handle")),
-      dev: Number(field(line, "dev")),
-      ino: Number(field(line, "ino")),
+      token: field(line, "token"),
+      dev: parseExactIdentity(field(line, "dev"), "dev"),
+      ino: parseExactIdentity(field(line, "ino"), "ino"),
     };
-    this.#open.add(parent.handle);
+    if (!/^[0-9]+\.[0-9]+$/.test(parent.token)) {
+      throw acpError(ReasonCode.INTERNAL_ERROR, "the rollback filesystem returned no usable handle", {
+        path,
+      });
+    }
+    this.#open.add(parent.token);
     return parent;
   }
 
   /** `fstatat(AT_SYMLINK_NOFOLLOW)` under the held parent. `null` when the entry is not there. */
   stat(parent: RollbackParent, name: string): RollbackEntry | null {
     const line = String(
-      (this.#db.prepare("SELECT acp_rb_stat(?, ?) AS r").get(parent.handle, name) as { r: string }).r,
+      (this.#db.prepare("SELECT acp_rb_stat(?, ?) AS r").get(parent.token, name) as { r: string }).r,
     );
     if (line.startsWith("error=")) {
       if (field(line, "error") === "STAT") return null;
@@ -286,10 +318,10 @@ export class RollbackFilesystem {
     return {
       type: type === "dir" || type === "file" || type === "symlink" ? type : "other",
       mode: Number.parseInt(field(line, "mode"), 8),
-      dev: Number(field(line, "dev")),
-      ino: Number(field(line, "ino")),
-      nlink: Number(field(line, "nlink")),
-      size: Number(field(line, "size")),
+      dev: parseExactIdentity(field(line, "dev"), "dev"),
+      ino: parseExactIdentity(field(line, "ino"), "ino"),
+      nlink: parseExactIdentity(field(line, "nlink"), "nlink"),
+      size: parseExactIdentity(field(line, "size"), "size"),
     };
   }
 
@@ -304,7 +336,7 @@ export class RollbackFilesystem {
       (
         this.#db
           .prepare("SELECT acp_rb_rename_excl(?, ?, ?, ?) AS r")
-          .get(from.handle, fromName, to.handle, toName) as { r: string }
+          .get(from.token, fromName, to.token, toName) as { r: string }
       ).r,
     );
     if (line !== "ok") refuse("publishing a name exclusively", line, { fromName, toName });
@@ -317,20 +349,29 @@ export class RollbackFilesystem {
    * foreign replacement is somebody else's tree. Binding it to `(dev, ino)` makes the object the
    * authority, so a swapped stage is refused rather than deleted on the owner's behalf.
    */
-  removeOwned(parent: RollbackParent, name: string, dev: number, ino: number): void {
+  removeOwned(parent: RollbackParent, name: string, dev: bigint, ino: bigint): void {
     const line = String(
       (
         this.#db
           .prepare("SELECT acp_rb_remove_owned(?, ?, ?, ?) AS r")
-          .get(parent.handle, name, dev, ino) as { r: string }
+          .get(parent.token, name, String(dev), String(ino)) as { r: string }
       ).r,
     );
     if (line !== "ok") refuse("removing an owned entry", line, { name, dev, ino });
   }
 
   closeParent(parent: RollbackParent): void {
-    this.#db.prepare("SELECT acp_rb_close(?) AS r").get(parent.handle);
-    this.#open.delete(parent.handle);
+    const released = this.#db.prepare("SELECT acp_rb_close(?) AS r").get(parent.token) as {
+      r: number;
+    };
+    this.#open.delete(parent.token);
+    // A failed close is terminal uncertainty, not a tidy-up detail: the descriptor may still be
+    // open and the slot is now poisoned on the native side so nothing can reuse it.
+    if (released.r === -1) {
+      throw acpError(ReasonCode.INTERNAL_ERROR, "a rollback filesystem handle could not be released", {
+        token: parent.token,
+      });
+    }
   }
 
   /**
@@ -341,9 +382,9 @@ export class RollbackFilesystem {
    * would hide the error that actually matters and is the only one they can act on.
    */
   dispose(): void {
-    for (const handle of [...this.#open]) {
+    for (const token of [...this.#open]) {
       try {
-        this.#db.prepare("SELECT acp_rb_close(?) AS r").get(handle);
+        this.#db.prepare("SELECT acp_rb_close(?) AS r").get(token);
       } catch {
         /* The descriptor goes with the connection below; nothing here is worth masking with. */
       }
