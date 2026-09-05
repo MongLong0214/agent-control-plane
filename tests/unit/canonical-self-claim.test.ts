@@ -3,13 +3,19 @@ import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { OwnerAuthority, type OwnerApprovalReceipt, type OwnerAuthorityPort } from "../../src/ceo/owner-authority.ts";
+import { type Decision, allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { roleKeyFor, Role } from "../../src/domain/types.ts";
+import { roleKeyFor, Role, SessionLifecycle } from "../../src/domain/types.ts";
+import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
+import type { BuzzActorAuthenticator } from "../../src/session/session-registry.ts";
 import {
   CANONICAL_PROJECT_BUZZ_CHANNEL_ID,
   CANONICAL_SESSION_UUID,
   CanonicalSelfClaim,
   REQUIRED_EXECUTOR_VERSION,
+  SELF_CLAIM_OPERATION,
+  canonicalSelfClaimParameterDigest,
   deriveClaimantIdentity,
   extractSessionUuidFromCommand,
   isInteractiveClaudeInvocation,
@@ -31,7 +37,7 @@ const CWD = "/work/repo-factory";
 const PEER_PROTOCOL = "mcp/2025-06-18";
 const PEER_IDENTITY = "claude-code-mcp-client";
 const CHANNEL = "channel:test-canonical";
-const OWNER_DIRECTIVE = "owner-approved-canonical-cto-claim-2026-09-05";
+const BUZZ_ADDRESS = "buzz://test-canonical-cto";
 
 const FIVE_TABLES = [
   "sessions",
@@ -95,6 +101,71 @@ const baseConfig = (overrides: Partial<CanonicalSelfClaimConfig> = {}): Canonica
   ...overrides,
 });
 
+/**
+ * The *real* `OwnerAuthority`, backed by the same test database. Not a hand-rolled fake: the real
+ * class writes its consumption as an `audit_events` row inside `this.db.tx()`, which joins
+ * `CanonicalSelfClaim`'s outer `txDecision` — so a later denial in the same claim genuinely rolls
+ * the consumption back too, exactly as production does. An in-memory fake tracking "consumed" in
+ * a plain `Map` would not roll back with the transaction, and would make the consume-once tests
+ * below pass regardless of whether the real rollback wiring works.
+ */
+const OWNER_ACTOR = "isaac";
+const realOwnerAuthority = (core: CoreHarness): OwnerAuthorityPort =>
+  new OwnerAuthority(core.db, [{ channel: "cli", actor: OWNER_ACTOR }], core.clock);
+
+const fakeBuzzActorAuthenticator = (allowed = true): BuzzActorAuthenticator => ({
+  isAllowedActor: (channel) => allowed && channel === "buzz",
+});
+
+const fakeResolveBuzzAddress = (
+  outcome: Decision<string> = allow(ReasonCode.OK, BUZZ_ADDRESS),
+): ((purpose: string) => Promise<Decision<string>>) => async () => outcome;
+
+let mintedNonces = 0;
+
+/**
+ * Mints a genuinely admitted `OwnerApprovalReceipt` through the same `IngressGuard` route the
+ * daemon's own `admitCliOwnerApproval` uses (src/daemon/daemon.ts) — writing the real
+ * `inbound_messages` row and `INGRESS_ADMITTED` audit event `OwnerAuthority.assertApproval` reads
+ * back. `parameters` is exactly the shape `canonicalSelfClaimParameterDigest` hashes, so the
+ * minted `parameterDigest` matches `claim()`'s own check whenever the scenario is meant to.
+ */
+const mintOwnerApproval = (
+  core: CoreHarness,
+  input: {
+    projectId: string;
+    claimedSessionUuid: string;
+    expectedBindingGeneration: number;
+    actor?: string;
+  },
+): OwnerApprovalReceipt => {
+  const actor = input.actor ?? OWNER_ACTOR;
+  const guard = new IngressGuard(core.db, core.clock, core.audit, { cli: { allowedActors: [actor] } });
+  const approval = {
+    runId: null,
+    candidateSnapshotDigest: null,
+    operation: SELF_CLAIM_OPERATION,
+    parameters: {
+      domain: SELF_CLAIM_OPERATION,
+      projectId: input.projectId,
+      claimedSessionUuid: input.claimedSessionUuid,
+      role: "PRIMARY_CTO",
+      expectedBindingGeneration: input.expectedBindingGeneration,
+    },
+    idempotencyKey: `claim:${input.projectId}:${input.expectedBindingGeneration}:${mintedNonces}`,
+    approved: true,
+  };
+  const nonce = `nonce-${mintedNonces++}`;
+  const admitted = guard.admitOwnerApproval(
+    { channel: "cli", actor, nonce, payload: ownerApprovalPayload(approval) },
+    approval,
+  );
+  if (!admitted.allowed) {
+    throw new Error(`failed to mint a test owner approval: ${JSON.stringify(admitted)}`);
+  }
+  return admitted.value;
+};
+
 const baseRequest = (
   core: CoreHarness,
   projectId: string,
@@ -103,11 +174,14 @@ const baseRequest = (
   callerPid: 100,
   claimedSessionUuid: CANON,
   projectId,
-  ownerDirective: OWNER_DIRECTIVE,
+  expectedBindingGeneration: 1,
+  ownerApproval: mintOwnerApproval(core, { projectId, claimedSessionUuid: CANON, expectedBindingGeneration: 1 }),
   cwd: CWD,
   peerProtocolVersion: PEER_PROTOCOL,
   peerIdentity: PEER_IDENTITY,
   buzzChannelId: CHANNEL,
+  buzzActorId: "buzz:canonical-cto",
+  buzzPurpose: "continuity:PRIMARY_CTO",
   ...overrides,
 });
 
@@ -118,6 +192,9 @@ const makeSubject = (
     chain?: readonly ProcessSnapshot[];
     imageInspector?: ExecutingImageInspector;
     transcriptReader?: TranscriptReader;
+    ownerAuthority?: OwnerAuthorityPort;
+    buzzActorAuthenticator?: BuzzActorAuthenticator;
+    resolveBuzzAddress?: (purpose: string) => Promise<Decision<string>>;
   } = {},
 ): CanonicalSelfClaim =>
   new CanonicalSelfClaim(
@@ -125,6 +202,9 @@ const makeSubject = (
     core.clock,
     core.sessions,
     core.bindings,
+    options.ownerAuthority ?? realOwnerAuthority(core),
+    options.buzzActorAuthenticator ?? fakeBuzzActorAuthenticator(),
+    options.resolveBuzzAddress ?? fakeResolveBuzzAddress(),
     baseConfig(options.configOverrides),
     {
       processInspector: chainInspector(options.chain ?? standardChain()),
@@ -166,7 +246,6 @@ describe("pure identity-derivation helpers", () => {
     const found = deriveClaimantIdentity(100, chainInspector(standardChain()));
     expect(found).toMatchObject({ allowed: true, value: { pid: 10, sessionUuid: CANON } });
 
-    // RED: no claude ancestor exists anywhere in the chain up to pid 1.
     const withoutClaude = deriveClaimantIdentity(
       100,
       chainInspector([
@@ -178,7 +257,6 @@ describe("pure identity-derivation helpers", () => {
     if (withoutClaude.allowed) throw new Error("unreachable");
     expect(withoutClaude.message).toContain("no claude ancestor exists");
 
-    // RED for a different, distinguishable reason: a claude ancestor exists but names no session.
     const noSessionId = deriveClaimantIdentity(
       100,
       chainInspector([{ pid: 100, ppid: 1, command: "/usr/local/bin/claude --print hi", cwd: CWD, startedAt: "t1" }]),
@@ -187,7 +265,6 @@ describe("pure identity-derivation helpers", () => {
     if (noSessionId.allowed) throw new Error("unreachable");
     expect(noSessionId.message).toContain("names no session id");
 
-    // RED for a third reason: an ancestry cycle (a broken ps snapshot) never reaches pid 1.
     const cyclic = deriveClaimantIdentity(
       100,
       chainInspector([{ pid: 100, ppid: 100, command: "/usr/bin/node x.js", cwd: CWD, startedAt: "t1" }]),
@@ -199,14 +276,14 @@ describe("pure identity-derivation helpers", () => {
 });
 
 describe("CanonicalSelfClaim — the six-clause contract", () => {
-  it("claims the canonical session in one atomic mutation, writing exactly one row to each of the five tables", () => {
+  it("claims the canonical session in one atomic mutation, writing exactly one row to each of the five tables", async () => {
     const core = makeCore();
     const projectId = "prj_canonical";
     insertProject(core, projectId);
     const subject = makeSubject(core);
 
     const before = rowCounts(core);
-    const result = subject.claim(baseRequest(core, projectId));
+    const result = await subject.claim(baseRequest(core, projectId));
 
     expect(result.allowed, JSON.stringify(result)).toBe(true);
     if (!result.allowed) return;
@@ -214,21 +291,42 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(result.value.binding.projectId).toBe(projectId);
     expect(result.value.derivedSessionUuid).toBe(CANON);
     expect(result.value.executorImageVersion).toBe(REQUIRED_EXECUTOR_VERSION);
+    expect(result.value.buzzAddress).toBe(BUZZ_ADDRESS);
 
     const after = rowCounts(core);
     for (const table of FIVE_TABLES) {
       expect(after[table], `table ${table}`).toBe((before[table] ?? 0) + 1);
     }
+
+    const session = core.db.get<{ buzz_actor_id: string; buzz_address: string }>(
+      `SELECT buzz_actor_id, buzz_address FROM sessions WHERE session_id = ?`,
+      [result.value.sessionId],
+    );
+    expect(session).toMatchObject({ buzz_actor_id: "buzz:canonical-cto", buzz_address: BUZZ_ADDRESS });
+
+    // Positive evidence that `OwnerAuthority.consumeApproval` genuinely ran and durably recorded
+    // consumption inside this same transaction — compensating for the mutation test below, which
+    // cannot isolate this call's contribution from the independent generation-CAS guard.
+    const consumedAudit = core.db.get<{ c: number }>(
+      `SELECT COUNT(*) AS c FROM audit_events WHERE kind = 'OWNER_APPROVAL_CONSUMED'`,
+    );
+    expect(consumedAudit?.c).toBe(1);
   });
 
-  it("clause 1 — a caller-supplied session UUID is checked against the derived one, never substituted", () => {
+  it("clause 1 — a caller-supplied session UUID is checked against the derived one, never substituted", async () => {
     const core = makeCore();
     const projectId = "prj_uuid_mismatch";
     insertProject(core, projectId);
     const subject = makeSubject(core);
     const before = rowCounts(core);
 
-    const result = subject.claim(baseRequest(core, projectId, { claimedSessionUuid: OTHER }));
+    // The owner approval must itself bind `OTHER` too — otherwise correction 4's own
+    // parameterDigest check fires first (a real, earlier, and correct refusal, but not the one
+    // this test targets), and the derivation mismatch this test names never gets reached.
+    const result = await subject.claim(baseRequest(core, projectId, {
+      claimedSessionUuid: OTHER,
+      ownerApproval: mintOwnerApproval(core, { projectId, claimedSessionUuid: OTHER, expectedBindingGeneration: 1 }),
+    }));
 
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
@@ -238,14 +336,14 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(rowCounts(core)).toEqual(before);
   });
 
-  it("clause 1 — a caller-supplied pid is checked against the derived ancestor pid", () => {
+  it("clause 1 — a caller-supplied pid is checked against the derived ancestor pid", async () => {
     const core = makeCore();
     const projectId = "prj_pid_mismatch";
     insertProject(core, projectId);
     const subject = makeSubject(core);
     const before = rowCounts(core);
 
-    const result = subject.claim(baseRequest(core, projectId, { claimedPid: 999 }));
+    const result = await subject.claim(baseRequest(core, projectId, { claimedPid: 999 }));
 
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
@@ -254,14 +352,14 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(rowCounts(core)).toEqual(before);
   });
 
-  it("clause 2 — pid and start time as a pair: an unresolvable start time refuses even though the pid matches", () => {
+  it("clause 2 — pid and start time as a pair: an unresolvable start time refuses even though the pid matches", async () => {
     const core = makeCore();
     const projectId = "prj_no_start_time";
     insertProject(core, projectId);
     const subject = makeSubject(core, { chain: standardChain({ startedAt: null }) });
     const before = rowCounts(core);
 
-    const result = subject.claim(baseRequest(core, projectId));
+    const result = await subject.claim(baseRequest(core, projectId));
 
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
@@ -269,7 +367,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(rowCounts(core)).toEqual(before);
   });
 
-  it("clause 2 — a headless invocation is refused as not interactive", () => {
+  it("clause 2 — a headless invocation is refused as not interactive", async () => {
     const core = makeCore();
     const projectId = "prj_headless";
     insertProject(core, projectId);
@@ -278,7 +376,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     });
     const before = rowCounts(core);
 
-    const result = subject.claim(baseRequest(core, projectId));
+    const result = await subject.claim(baseRequest(core, projectId));
 
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
@@ -286,14 +384,14 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(rowCounts(core)).toEqual(before);
   });
 
-  it("clause 2 — cwd must match exactly", () => {
+  it("clause 2 — cwd must match exactly", async () => {
     const core = makeCore();
     const projectId = "prj_cwd";
     insertProject(core, projectId);
     const subject = makeSubject(core, { chain: standardChain({ cwd: "/somewhere/else" }) });
     const before = rowCounts(core);
 
-    const result = subject.claim(baseRequest(core, projectId));
+    const result = await subject.claim(baseRequest(core, projectId));
 
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
@@ -301,14 +399,14 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(rowCounts(core)).toEqual(before);
   });
 
-  it("clause 2 — peer protocol version must match the deployment's expectation", () => {
+  it("clause 2 — peer protocol version must match the deployment's expectation", async () => {
     const core = makeCore();
     const projectId = "prj_peer_protocol";
     insertProject(core, projectId);
     const subject = makeSubject(core);
     const before = rowCounts(core);
 
-    const result = subject.claim(baseRequest(core, projectId, { peerProtocolVersion: "mcp/2024-01-01" }));
+    const result = await subject.claim(baseRequest(core, projectId, { peerProtocolVersion: "mcp/2024-01-01" }));
 
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
@@ -316,14 +414,14 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(rowCounts(core)).toEqual(before);
   });
 
-  it("clause 2 — target version exactly 2.1.259, from the executing image, not any other observed version", () => {
+  it("clause 2 — target version exactly 2.1.259, from the executing image, not any other observed version", async () => {
     const core = makeCore();
     const projectId = "prj_version";
     insertProject(core, projectId);
     const subject = makeSubject(core, { imageInspector: fakeImageInspector("2.1.241") });
     const before = rowCounts(core);
 
-    const result = subject.claim(baseRequest(core, projectId));
+    const result = await subject.claim(baseRequest(core, projectId));
 
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
@@ -332,14 +430,14 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(rowCounts(core)).toEqual(before);
   });
 
-  it("clause 2 — an unresolvable executing image refuses fail-closed", () => {
+  it("clause 2 — an unresolvable executing image refuses fail-closed", async () => {
     const core = makeCore();
     const projectId = "prj_no_image";
     insertProject(core, projectId);
     const subject = makeSubject(core, { imageInspector: { resolve: () => null } });
     const before = rowCounts(core);
 
-    const result = subject.claim(baseRequest(core, projectId));
+    const result = await subject.claim(baseRequest(core, projectId));
 
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
@@ -347,14 +445,14 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(rowCounts(core)).toEqual(before);
   });
 
-  it("clause 2 — the transcript must exist on disk", () => {
+  it("clause 2 — the transcript must exist on disk", async () => {
     const core = makeCore();
     const projectId = "prj_no_transcript";
     insertProject(core, projectId);
     const subject = makeSubject(core, { transcriptReader: fakeTranscriptReader(false) });
     const before = rowCounts(core);
 
-    const result = subject.claim(baseRequest(core, projectId));
+    const result = await subject.claim(baseRequest(core, projectId));
 
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
@@ -363,14 +461,14 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(rowCounts(core)).toEqual(before);
   });
 
-  it("clause 2 — the connected peer identity must match the deployment's expectation", () => {
+  it("clause 2 — the connected peer identity must match the deployment's expectation", async () => {
     const core = makeCore();
     const projectId = "prj_peer_identity";
     insertProject(core, projectId);
     const subject = makeSubject(core);
     const before = rowCounts(core);
 
-    const result = subject.claim(baseRequest(core, projectId, { peerIdentity: "someone-else" }));
+    const result = await subject.claim(baseRequest(core, projectId, { peerIdentity: "someone-else" }));
 
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
@@ -378,14 +476,14 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(rowCounts(core)).toEqual(before);
   });
 
-  it("the buzz channel check is real, not decorative: the wrong channel refuses exactly like the live PROBE_FAILED case", () => {
+  it("the buzz channel check is real, not decorative: the wrong channel refuses exactly like the live PROBE_FAILED case", async () => {
     const core = makeCore();
     const projectId = "prj_channel";
     insertProject(core, projectId);
     const subject = makeSubject(core);
     const before = rowCounts(core);
 
-    const result = subject.claim(baseRequest(core, projectId, { buzzChannelId: "DM" }));
+    const result = await subject.claim(baseRequest(core, projectId, { buzzChannelId: "DM" }));
 
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
@@ -393,16 +491,17 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(rowCounts(core)).toEqual(before);
   });
 
-  it("clause 4 — only the exact canonical session may be adopted; a different, otherwise-valid session is refused, not bootstrapped", () => {
+  it("clause 4 — only the exact canonical session may be adopted; a different, otherwise-valid session is refused, not bootstrapped", async () => {
     const core = makeCore();
     const projectId = "prj_other_session";
     insertProject(core, projectId);
-    // Everything about this claim is otherwise perfect — it is a real, live, correctly versioned
-    // interactive claude process with a real transcript. It simply is not the one canonical UUID.
     const subject = makeSubject(core, { chain: standardChain({}, OTHER) });
     const before = rowCounts(core);
 
-    const result = subject.claim(baseRequest(core, projectId, { claimedSessionUuid: OTHER }));
+    const result = await subject.claim(baseRequest(core, projectId, {
+      claimedSessionUuid: OTHER,
+      ownerApproval: mintOwnerApproval(core, { projectId, claimedSessionUuid: OTHER, expectedBindingGeneration: 1 }),
+    }));
 
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
@@ -410,17 +509,117 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(rowCounts(core)).toEqual(before);
   });
 
-  it("clause 3 — a duplicate live actor is refused with zero additional rows, even though the session insert already ran inside the transaction", () => {
+  it("correction 4 — an owner approval for a different operation, project, session or generation is refused before any I/O", async () => {
+    const core = makeCore();
+    const projectId = "prj_wrong_approval";
+    insertProject(core, projectId);
+    const subject = makeSubject(core);
+    const before = rowCounts(core);
+
+    const validApproval = mintOwnerApproval(core, { projectId, claimedSessionUuid: CANON, expectedBindingGeneration: 1 });
+    const wrongOperation = await subject.claim(
+      baseRequest(core, projectId, { ownerApproval: { ...validApproval, operation: "something.else" } }),
+    );
+    expect(wrongOperation.allowed).toBe(false);
+    if (!wrongOperation.allowed) expect(wrongOperation.reasonCode).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
+
+    const wrongProject = await subject.claim(
+      baseRequest(core, projectId, {
+        ownerApproval: mintOwnerApproval(core, {
+          projectId: "some-other-project",
+          claimedSessionUuid: CANON,
+          expectedBindingGeneration: 1,
+        }),
+      }),
+    );
+    expect(wrongProject.allowed).toBe(false);
+    if (!wrongProject.allowed) expect(wrongProject.message).toContain("does not bind the exact project");
+
+    const wrongGeneration = await subject.claim(
+      baseRequest(core, projectId, {
+        ownerApproval: mintOwnerApproval(core, { projectId, claimedSessionUuid: CANON, expectedBindingGeneration: 99 }),
+      }),
+    );
+    expect(wrongGeneration.allowed).toBe(false);
+
+    expect(rowCounts(core)).toEqual(before);
+  });
+
+  it("correction 4 — an owner approval not currently admitted is refused before derivation writes anything", async () => {
+    const core = makeCore();
+    const projectId = "prj_not_admitted";
+    insertProject(core, projectId);
+    const subject = makeSubject(core);
+    const before = rowCounts(core);
+
+    // Shaped exactly like an admitted receipt (so it passes `claim()`'s own operation/project/
+    // generation checks) but never actually admitted: no matching `inbound_messages` row exists
+    // for this nonce, so the *real* `OwnerAuthority.assertApproval` denies it.
+    const fabricated: OwnerApprovalReceipt = {
+      channel: "cli",
+      actor: OWNER_ACTOR,
+      inboundNonce: "never-admitted-nonce",
+      runId: null,
+      candidateSnapshotDigest: null,
+      operation: SELF_CLAIM_OPERATION,
+      parameterDigest: canonicalSelfClaimParameterDigest({
+        projectId,
+        claimedSessionUuid: CANON,
+        expectedBindingGeneration: 1,
+      }),
+      idempotencyKey: "claim:fabricated",
+      approved: true,
+    };
+
+    const result = await subject.claim(baseRequest(core, projectId, { ownerApproval: fabricated }));
+
+    expect(result.allowed).toBe(false);
+    if (result.allowed) return;
+    expect(result.reasonCode).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
+    expect(rowCounts(core)).toEqual(before);
+  });
+
+  it("correction 4 — a replayed owner approval is refused the second time, with zero additional rows", async () => {
+    const core = makeCore();
+    const projectId = "prj_replay";
+    insertProject(core, projectId);
+    const subject = makeSubject(core);
+    const approval = mintOwnerApproval(core, { projectId, claimedSessionUuid: CANON, expectedBindingGeneration: 1 });
+
+    const first = await subject.claim(baseRequest(core, projectId, { ownerApproval: approval }));
+    expect(first.allowed, JSON.stringify(first)).toBe(true);
+    const afterFirst = rowCounts(core);
+
+    // The exact same admitted receipt, presented again for the exact same (project, session,
+    // generation) it already authorised. The real `OwnerAuthority` denies this as an
+    // already-consumed receipt before the transaction ever opens a second session row.
+    const replay = await subject.claim(baseRequest(core, projectId, {
+      ownerApproval: approval,
+      expectedBindingGeneration: 1,
+    }));
+    expect(replay.allowed).toBe(false);
+    expect(rowCounts(core)).toEqual(afterFirst);
+  });
+
+  it("clause 3 — a duplicate live actor is refused with zero additional rows, even though the session insert already ran inside the transaction", async () => {
     const core = makeCore();
     const projectId = "prj_duplicate";
     insertProject(core, projectId);
     const subject = makeSubject(core);
 
-    const first = subject.claim(baseRequest(core, projectId));
+    const first = await subject.claim(baseRequest(core, projectId));
     expect(first.allowed).toBe(true);
     const afterFirst = rowCounts(core);
 
-    const second = subject.claim(baseRequest(core, projectId));
+    const second = await subject.claim(baseRequest(core, projectId, {
+      expectedBindingGeneration: 2,
+      ownerApproval: mintOwnerApproval(core, { projectId, claimedSessionUuid: CANON, expectedBindingGeneration: 2 }),
+      // A different Buzz identity than the first claim's, deliberately: the first session is
+      // still live and holding "buzz:canonical-cto" (`sessions_buzz_actor`'s partial unique
+      // index refuses a second live session the same identity), which would otherwise deny this
+      // attempt at `bindBuzzActor` — a real, earlier guard, but not the one this test targets.
+      buzzActorId: "buzz:canonical-cto-second-attempt",
+    }));
     expect(second.allowed).toBe(false);
     if (second.allowed) return;
     expect(second.reasonCode).toBe(ReasonCode.BINDING_ALREADY_ACTIVE);
@@ -432,13 +631,13 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(rowCounts(core)).toEqual(afterFirst);
   });
 
-  it("clause 4 restore — the same external session, reclaimed after a revoke, reuses the actor and target binding rather than minting a second owner", () => {
+  it("clause 4 restore — the same external session, reclaimed after a revoke, reuses the actor and target binding rather than minting a second owner", async () => {
     const core = makeCore();
     const projectId = "prj_restore";
     insertProject(core, projectId);
     const subject = makeSubject(core);
 
-    const first = subject.claim(baseRequest(core, projectId));
+    const first = await subject.claim(baseRequest(core, projectId));
     expect(first.allowed).toBe(true);
     if (!first.allowed) return;
     const firstActorId = core.db.get<{ actor_id: string }>(
@@ -450,16 +649,22 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
     const revoked = core.bindings.revoke(roleKey, "restart");
     expect(revoked.allowed).toBe(true);
+    // The old runtime is actually gone, not merely revoked at the role layer: `sessions_buzz_actor`
+    // is a partial unique index over *live* sessions only, so a still-READY first session would
+    // otherwise keep "buzz:canonical-cto" and refuse the restore's own `bindBuzzActor` — a real
+    // guard, correctly firing, but for a scenario ("both runtimes alive at once") this test is not
+    // about. A genuine restart transitions the old session to a terminal state first.
+    const stopped = core.sessions.transition(first.value.sessionId, SessionLifecycle.STOPPED, "restart");
+    expect(stopped.allowed).toBe(true);
 
-    // A new process start time and a new session incarnation — the same external Claude session
-    // UUID. (The pid itself is left unchanged: CP-HI-04's point is that a pid alone identifies
-    // nothing, which is exactly why this restore is proven by a differing start time, not a
-    // differing pid.)
     const restoreSubject = makeSubject(core, {
       chain: standardChain({ startedAt: "Fri Jan  1 01:00:00 2027" }),
     });
     const before = rowCounts(core);
-    const restored = restoreSubject.claim(baseRequest(core, projectId));
+    const restored = await restoreSubject.claim(baseRequest(core, projectId, {
+      expectedBindingGeneration: 2,
+      ownerApproval: mintOwnerApproval(core, { projectId, claimedSessionUuid: CANON, expectedBindingGeneration: 2 }),
+    }));
 
     expect(restored.allowed, JSON.stringify(restored)).toBe(true);
     if (!restored.allowed) return;
@@ -475,18 +680,17 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(after.sessions).toBe(before.sessions + 1);
     expect(after.assignments).toBe(before.assignments + 1);
     expect(after.actor_target_attestations).toBe(before.actor_target_attestations + 1);
-    // Not a new actor and not a new target binding — the whole point of clause 4.
     expect(after.conversational_actors).toBe(before.conversational_actors);
     expect(after.actor_target_bindings).toBe(before.actor_target_bindings);
   });
 
-  it("clause 5 — never creates or touches a Hermes/CEO actor; the resulting actor's kind is PRIMARY_CTO alone", () => {
+  it("clause 5 — never creates or touches a Hermes/CEO actor; the resulting actor's kind is PRIMARY_CTO alone", async () => {
     const core = makeCore();
     const projectId = "prj_no_hermes";
     insertProject(core, projectId);
     const subject = makeSubject(core);
 
-    const result = subject.claim(baseRequest(core, projectId));
+    const result = await subject.claim(baseRequest(core, projectId));
     expect(result.allowed).toBe(true);
 
     const kinds = core.db.all<{ kind: string }>(`SELECT kind FROM conversational_actors`);
@@ -497,28 +701,58 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(ceoRows?.c).toBe(0);
   });
 
-  it("rejects an owner directive that is empty or trivially short, before any derivation runs", () => {
+  it("correction 5 — an unresolvable buzz address refuses before the transaction ever opens", async () => {
     const core = makeCore();
-    const projectId = "prj_directive";
+    const projectId = "prj_no_buzz_address";
     insertProject(core, projectId);
-    const subject = makeSubject(core);
+    const subject = makeSubject(core, {
+      resolveBuzzAddress: fakeResolveBuzzAddress(deny(ReasonCode.PROBE_FAILED, "buzz transport is not available", {})),
+    });
     const before = rowCounts(core);
 
-    const result = subject.claim(baseRequest(core, projectId, { ownerDirective: "short" }));
+    const result = await subject.claim(baseRequest(core, projectId));
 
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
-    expect(result.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
+    expect(result.reasonCode).toBe(ReasonCode.PROBE_FAILED);
     expect(rowCounts(core)).toEqual(before);
   });
 
-  it("rejects a malformed claimed session UUID as an argument error, not a derivation mismatch", () => {
+  it("correction 5 — an unauthenticated buzz actor id refuses with zero additional rows, even after the session was created", async () => {
+    const core = makeCore();
+    const projectId = "prj_bad_buzz_actor";
+    insertProject(core, projectId);
+    const subject = makeSubject(core, { buzzActorAuthenticator: fakeBuzzActorAuthenticator(false) });
+    const before = rowCounts(core);
+
+    const result = await subject.claim(baseRequest(core, projectId));
+
+    expect(result.allowed).toBe(false);
+    if (result.allowed) return;
+    expect(result.reasonCode).toBe(ReasonCode.SESSION_BUZZ_ACTOR_NOT_AUTHENTICATED);
+    expect(rowCounts(core)).toEqual(before);
+  });
+
+  it("rejects a malformed claimed session UUID as an argument error, not a derivation mismatch", async () => {
     const core = makeCore();
     const projectId = "prj_malformed_uuid";
     insertProject(core, projectId);
     const subject = makeSubject(core);
 
-    const result = subject.claim(baseRequest(core, projectId, { claimedSessionUuid: "not-a-uuid" }));
+    const result = await subject.claim(baseRequest(core, projectId, { claimedSessionUuid: "not-a-uuid" }));
+
+    expect(result.allowed).toBe(false);
+    if (result.allowed) return;
+    expect(result.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
+  });
+
+  it("rejects a non-positive expected binding generation as an argument error", async () => {
+    const core = makeCore();
+    const projectId = "prj_bad_generation";
+    insertProject(core, projectId);
+    const subject = makeSubject(core);
+
+    const result = await subject.claim(baseRequest(core, projectId, { expectedBindingGeneration: 0 }));
 
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
@@ -603,6 +837,58 @@ describe("adversarial mutations — each must kill its guard, not merely delete 
         (source) => source.replace("if (identity.startedAt === null) {", "if (false) {"),
         "clause 2 — pid and start time as a pair",
       );
+    },
+    30_000,
+  );
+
+  /**
+   * Reported rather than forced (per the evidence bar: "if a mutation does not kill it, report
+   * that rather than adjusting the test"). Removing the `consumeApproval` call does **not** kill
+   * "correction 4 — a replayed owner approval is refused the second time": that test's replay is
+   * for the *same generation* the first claim already committed, and the independent
+   * generation-CAS check (`nextGeneration !== request.expectedBindingGeneration`, checked earlier
+   * in `#mutate`, before consumption) already denies it for that reason alone. This is structural,
+   * not a gap in this one test: `assignments_generation_monotonic` means any two attempts at the
+   * same role key and generation can only ever differ by "the first committed and the second did
+   * not", so an exact-receipt replay and an exhausted generation are the same observable event at
+   * this call site. Consumption is still real and durable — the happy-path test above asserts the
+   * `OWNER_APPROVAL_CONSUMED` audit row directly — this test only shows that *this one scenario*
+   * cannot isolate the consume-once wiring's own contribution from the generation guard sitting in
+   * front of it.
+   */
+  it(
+    "consume-once bypass: removing the call does not kill the replay test, because the generation-CAS is a redundant, earlier guard for this exact scenario",
+    () => {
+      const original = readFileSync(join(process.cwd(), "src", "registry", "canonical-self-claim.ts"), "utf8");
+      const mutated = original.replace(
+        "const consumed = this.ownerAuthority.consumeApproval(request.ownerApproval, null);\n      if (!consumed.allowed) return consumed as Decision<CanonicalSelfClaimReceipt>;",
+        "",
+      );
+      expect(mutated, "mutation did not change anything — the target string was not found").not.toBe(original);
+      writeFileSync(join(process.cwd(), "src", "registry", "canonical-self-claim.ts"), mutated);
+      let mutatedFailed = false;
+      try {
+        execFileSync(
+          process.execPath,
+          [
+            join(process.cwd(), "node_modules", "vitest", "vitest.mjs"),
+            "run",
+            join(process.cwd(), "tests", "unit", "canonical-self-claim.test.ts"),
+            "-t",
+            "correction 4 — a replayed owner approval is refused the second time",
+          ],
+          { cwd: process.cwd(), encoding: "utf8", stdio: "pipe" },
+        );
+      } catch {
+        mutatedFailed = true;
+      } finally {
+        writeFileSync(join(process.cwd(), "src", "registry", "canonical-self-claim.ts"), original);
+      }
+      expect(
+        mutatedFailed,
+        "documented finding: this mutation is NOT killed by the replay test (see comment above) — " +
+          "the generation-CAS guard denies the same scenario independently",
+      ).toBe(false);
     },
     30_000,
   );

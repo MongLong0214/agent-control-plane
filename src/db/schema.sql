@@ -1588,10 +1588,29 @@ CREATE TABLE IF NOT EXISTS continuity_state (
 -- authenticated preflight bind can produce them. Admission fails closed at the schema.
 
 -- Seeded and immutable, so a new executor cannot be introduced by writing a string.
+--
+-- "Immutable" here is still only a comment, not an enforced boundary (#760 measured this: an
+-- application-time `INSERT OR IGNORE INTO executor_kinds` succeeded, silently doing the exact
+-- thing this line declares impossible). A `BEFORE INSERT` trigger closing that gap was built and
+-- reverted: v12/v13 replay the whole *current* schema.sql when climbing from an old database, which
+-- installs a schema.sql-defined trigger far earlier in a replayed chain than its migration number
+-- suggests. `v21-canonical-turns` (src/db/migrations.ts, frozen, checksummed, unchangeable) already
+-- carries its own `INSERT OR IGNORE INTO executor_kinds (executor_kind) VALUES ('hermes')` as part
+-- of first creating this table — and an unconditional insert-blocking trigger, installed early by
+-- v12/v13's replay, aborts that frozen step's redundant, otherwise-harmless re-seed. Measured
+-- directly: `tests/unit/database-migration-restore.test.ts`'s v11-origin chain replay fails with
+-- `EXECUTOR_KIND_IMMUTABLE` the moment the trigger exists. Closing this gap needs either a
+-- version-gated install (the `REQUIRED_LEDGER_TRIGGERS`/`introducedIn`-scoped mechanism the
+-- canonical-turn triggers use, which schema.sql's plain triggers do not have) or an accepted
+-- rewrite of v12/v13's full-replay behavior — both larger than this seed change, so this is
+-- reported rather than forced. The seed below still moves off the runtime `INSERT OR IGNORE` this
+-- primitive used to perform on every call; only the enforcement trigger is not yet safe to add.
 CREATE TABLE IF NOT EXISTS executor_kinds (
   executor_kind TEXT PRIMARY KEY
 );
 INSERT OR IGNORE INTO executor_kinds (executor_kind) VALUES ('hermes');
+-- v37 — the canonical CTO self-claim primitive's target executor family (#760).
+INSERT OR IGNORE INTO executor_kinds (executor_kind) VALUES ('claude-cli');
 
 CREATE TABLE IF NOT EXISTS actor_target_bindings (
   target_binding_id     TEXT PRIMARY KEY,

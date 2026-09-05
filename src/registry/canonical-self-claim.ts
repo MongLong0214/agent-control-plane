@@ -3,26 +3,28 @@ import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "n
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
+import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../ceo/owner-authority.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { processStartedAt } from "../core/process-identity.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { Db } from "../db/database.ts";
-import { Role, SessionLifecycle, type RoleBinding } from "../domain/types.ts";
+import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
 import type { AuthenticatedTargetBinding, BindingRegistry, VerifiedTargetBinding } from "../session/binding-registry.ts";
-import type { SessionRegistry } from "../session/session-registry.ts";
+import type { BuzzActorAuthenticator, SessionRegistry } from "../session/session-registry.ts";
 
 /**
  * Canonical runtime self-claim / adoption (#760).
  *
  * There is no public activation surface that can safely adopt an *already-running*
  * conversation into a first-class role: `agentctl bootstrap hermes` launches a new runtime, which
- * is exactly what must not happen for the canonical CTO pane, because the canonical conversation
- * already exists and must be adopted in place. This module is the claim primitive that composition
- * does: it derives who is asking independently of what it is told, verifies eight independently
- * fatal facts about the claimant, and only then performs one atomic mutation that either creates
- * the session/actor/assignment/target-binding/attestation tuple or writes nothing at all.
+ * is exactly what must not happen for the canonical PRIMARY_CTO conversational actor, because the
+ * canonical conversation already exists and must be adopted in place. This module is the claim
+ * primitive that composition does: it derives who is asking independently of what it is told,
+ * verifies eight independently fatal facts about the claimant, and only then performs one atomic
+ * mutation that either creates the session/actor/assignment/target-binding/attestation tuple or
+ * writes nothing at all.
  *
  * What this module deliberately does not do:
  *  - It never accepts an argument as identity. A caller-supplied session UUID or PID is checked
@@ -57,18 +59,44 @@ export const CANONICAL_PROJECT_BUZZ_CHANNEL_ID = "c37e88d0-8576-48aa-a69c-9cbd54
 
 /**
  * `actor_target_bindings.executor_kind` is a closed vocabulary; the schema seeds exactly one
- * value, `'hermes'` (src/db/schema.sql, src/db/migrations.ts). Reusing that value for a Claude CLI
- * target would mislabel every row a reader later queries by executor kind, and adding a new seed
- * value requires editing schema.sql/migrations.ts — both are forbidden paths for this unit. This
- * value is instead seeded as a plain, idempotent data row (`INSERT OR IGNORE`, not a DDL change)
- * the first time a claim runs; see `#seedExecutorKind`.
+ * value, `'hermes'` (src/db/schema.sql). This one is now seeded the same way, by
+ * `src/db/migrations.ts`'s `v37-seed-claude-cli-executor-kind` — not written here at application
+ * time. Reusing `'hermes'` for a Claude CLI target would mislabel every row a reader later queries
+ * by executor kind, which is why this is its own value rather than a reused one.
  */
 export const SELF_CLAIM_EXECUTOR_KIND = "claude-cli";
 
 /** This primitive's own attestation protocol; deliberately distinct from `hermes.target-bind/v1`. */
 export const SELF_CLAIM_PROTOCOL = "acp.canonical-self-claim/v1";
 
-const MIN_OWNER_DIRECTIVE_LENGTH = 16;
+/**
+ * The operation name a claim's `OwnerApprovalReceipt` must carry, and the domain tag of the
+ * digest that binds it to one exact project, claimant session, role and generation (correction
+ * 4): `OwnerApprovalReceipt.parameterDigest` is a generic field `OwnerAuthority` never interprets
+ * — binding it to *these* parameters is this module's job, not the ledger's.
+ */
+export const SELF_CLAIM_OPERATION = "actor.claim_canonical_cto";
+
+/**
+ * The exact digest an owner approval for one claim attempt must carry as `parameterDigest`. A
+ * mismatch (wrong project, wrong session, wrong role, or a stale `expectedBindingGeneration`)
+ * fails `OwnerAuthority.assertApproval`'s completeness check indirectly — `claim()` compares this
+ * value itself before ever presenting the receipt for consumption, which is the earlier and more
+ * exact refusal point of the two.
+ */
+export const canonicalSelfClaimParameterDigest = (input: {
+  projectId: string;
+  claimedSessionUuid: string;
+  expectedBindingGeneration: number;
+}): string =>
+  digestOf({
+    domain: SELF_CLAIM_OPERATION,
+    projectId: input.projectId,
+    claimedSessionUuid: input.claimedSessionUuid,
+    role: "PRIMARY_CTO",
+    expectedBindingGeneration: input.expectedBindingGeneration,
+  });
+
 const MAX_ANCESTRY_HOPS = 64;
 const SUBPROCESS_TIMEOUT_MS = 5_000;
 const UUID_PATTERN = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
@@ -341,7 +369,7 @@ export const defaultExecutingImageInspector: ExecutingImageInspector = {
 };
 
 // ---------------------------------------------------------------------------
-// Transcript — the Claude session registry/transcript on disk, checked, not assumed.
+// Transcript — the on-disk record of the conversational actor's history, checked, not assumed.
 // ---------------------------------------------------------------------------
 
 export interface TranscriptEvidence {
@@ -417,13 +445,33 @@ export interface CanonicalSelfClaimRequest {
   /** Checked against the derived ancestor pid, when supplied. */
   claimedPid?: number;
   projectId: string;
-  /** A fresh, explicit owner approval token. Never a default, never reused as identity proof. */
-  ownerDirective: string;
+  /**
+   * Real owner authority, not a caller-typed string (correction 4). This is evidence from an
+   * admitted ingress envelope — `OwnerAuthority.assertApproval`'s own contract — never a tuple
+   * this call can fabricate. `claim()` also requires `operation === SELF_CLAIM_OPERATION` and
+   * `parameterDigest === canonicalSelfClaimParameterDigest({ projectId, claimedSessionUuid,
+   * expectedBindingGeneration })`, so a real approval minted for a *different* claim (wrong
+   * project, session, role or generation) is rejected before it is ever presented for
+   * consumption. It is consumed exactly once, inside the same transaction as the mutation it
+   * authorises — a denied mutation leaves it unconsumed and reusable; a committed one burns it.
+   */
+  ownerApproval: OwnerApprovalReceipt;
+  /**
+   * The binding generation this claim expects to create. Checked against the actual next
+   * generation for `PRIMARY_CTO:<projectId>` inside the transaction; a mismatch means the role's
+   * assignment history moved after the owner approved this exact attempt, and denies rather than
+   * silently approving a different generation than the owner actually saw.
+   */
+  expectedBindingGeneration: number;
   /** Reported by the (out-of-scope) transport/caller; compared to the config's expectation. */
   cwd: string;
   peerProtocolVersion: string;
   peerIdentity: string;
   buzzChannelId: string;
+  /** The Buzz channel identity this session will authenticate as, bound via `bindBuzzActor`. */
+  buzzActorId: string;
+  /** Passed to `resolveBuzzAddress` to open the routing channel before the transaction opens. */
+  buzzPurpose: string;
 }
 
 export interface CanonicalSelfClaimReceipt {
@@ -433,6 +481,7 @@ export interface CanonicalSelfClaimReceipt {
   derivedSessionUuid: string;
   executorImageVersion: string;
   executorImagePath: string;
+  buzzAddress: string;
 }
 
 export interface CanonicalSelfClaimDeps {
@@ -469,6 +518,16 @@ export class CanonicalSelfClaim {
     private readonly clock: Clock,
     private readonly sessions: SessionRegistry,
     private readonly bindings: BindingRegistry,
+    /** The canonical owner-authenticated directive/turn mechanism — never a caller-typed string. */
+    private readonly ownerAuthority: OwnerAuthorityPort,
+    /** Authenticates `buzzActorId` for `SessionRegistry.bindBuzzActor` (deployment ingress policy). */
+    private readonly buzzActorAuthenticator: BuzzActorAuthenticator,
+    /**
+     * Opens the Buzz routing channel and returns its address. Async and shells a CLI transport
+     * (`BuzzAdapter.connect` → `BuzzTransport.openChannel`), so it must run — and does, in
+     * `claim()` — *before* the synchronous transaction opens; `Db.txDecision`'s body cannot await.
+     */
+    private readonly resolveBuzzAddress: (purpose: string) => Promise<Decision<string>>,
     private readonly config: CanonicalSelfClaimConfig,
     deps: CanonicalSelfClaimDeps = {},
   ) {
@@ -481,21 +540,59 @@ export class CanonicalSelfClaim {
     this.#canonicalBuzzChannelId = config.canonicalBuzzChannelId ?? CANONICAL_PROJECT_BUZZ_CHANNEL_ID;
   }
 
-  claim(request: CanonicalSelfClaimRequest): Decision<CanonicalSelfClaimReceipt> {
-    const ownerDirective = request.ownerDirective.trim();
-    if (ownerDirective.length < MIN_OWNER_DIRECTIVE_LENGTH) {
-      return deny(
-        ReasonCode.INVALID_ARGUMENT,
-        "ownerDirective must be an explicit, non-trivial approval token",
-        {},
-      );
-    }
+  async claim(request: CanonicalSelfClaimRequest): Promise<Decision<CanonicalSelfClaimReceipt>> {
     if (!UUID_PATTERN.test(request.claimedSessionUuid)) {
       return deny(ReasonCode.INVALID_ARGUMENT, "claimedSessionUuid must be a UUID", {});
     }
     if (request.projectId.trim().length === 0) {
       return deny(ReasonCode.INVALID_ARGUMENT, "projectId is required", {});
     }
+    if (!Number.isSafeInteger(request.expectedBindingGeneration) || request.expectedBindingGeneration <= 0) {
+      return deny(
+        ReasonCode.INVALID_ARGUMENT,
+        "expectedBindingGeneration must be a positive safe integer",
+        { expectedBindingGeneration: request.expectedBindingGeneration },
+      );
+    }
+    if (request.buzzActorId.trim().length === 0) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "buzzActorId is required", {});
+    }
+
+    // Correction 4 — an owner directive is real owner authority, bound to the exact operation,
+    // project, claimant session and generation this attempt names — never a caller-typed string.
+    // Checked here, before derivation even runs, so a fabricated or mis-scoped approval is refused
+    // for that reason specifically rather than folded into a later, less exact denial.
+    if (request.ownerApproval.operation !== SELF_CLAIM_OPERATION) {
+      return deny(
+        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        "owner approval names a different operation",
+        { observed: request.ownerApproval.operation, expected: SELF_CLAIM_OPERATION },
+      );
+    }
+    if (request.ownerApproval.runId !== null || request.ownerApproval.candidateSnapshotDigest !== null) {
+      return deny(
+        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        "owner approval for a canonical self-claim must not bind a run or candidate",
+        {},
+      );
+    }
+    const expectedParameterDigest = canonicalSelfClaimParameterDigest({
+      projectId: request.projectId,
+      claimedSessionUuid: request.claimedSessionUuid,
+      expectedBindingGeneration: request.expectedBindingGeneration,
+    });
+    if (request.ownerApproval.parameterDigest !== expectedParameterDigest) {
+      return deny(
+        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        "owner approval does not bind the exact project, claimant session and generation of this attempt",
+        { observed: request.ownerApproval.parameterDigest, expected: expectedParameterDigest },
+      );
+    }
+    // A currently-admitted approval, checked before derivation runs any process/filesystem I/O.
+    // The atomic, consume-exactly-once check happens again inside `#mutate` — this is the fail-fast
+    // half, not a substitute for it: `assertApproval` alone cannot see a concurrent consumption.
+    const admitted = this.ownerAuthority.assertApproval(request.ownerApproval);
+    if (!admitted.allowed) return admitted as Decision<CanonicalSelfClaimReceipt>;
 
     // Clause 1 — derive independently before anything the caller said is ever consulted.
     const derived = deriveClaimantIdentity(request.callerPid, this.#processInspector, this.#maxAncestryHops);
@@ -575,7 +672,7 @@ export class CanonicalSelfClaim {
     if (!transcript) {
       return deny(
         ReasonCode.NOT_FOUND,
-        "no transcript exists on disk for the derived session",
+        "no transcript exists on disk for the derived conversational actor",
         { sessionUuid: identity.sessionUuid },
       );
     }
@@ -605,9 +702,16 @@ export class CanonicalSelfClaim {
       );
     }
 
-    // Clause 3 — one atomic mutation, or none. Every identity check above is over; nothing past
-    // this point may refuse for a reason this transaction cannot also undo.
-    return this.#mutate(request, identity, image, transcript, ownerDirective);
+    // Correction 5 — the Buzz routing address is resolved here, before the synchronous
+    // transaction opens, never awaited inside it. `sessions.create` accepts `buzzAddress`
+    // directly, so the resolved value is written in the same transaction as everything else even
+    // though resolving it could not run inside that transaction.
+    const buzzAddress = await this.resolveBuzzAddress(request.buzzPurpose);
+    if (!buzzAddress.allowed) return buzzAddress as Decision<CanonicalSelfClaimReceipt>;
+
+    // Clause 3 — one atomic mutation, or none. Every identity and authority check above is over;
+    // nothing past this point may refuse for a reason this transaction cannot also undo.
+    return this.#mutate(request, identity, image, transcript, buzzAddress.value);
   }
 
   #mutate(
@@ -615,7 +719,7 @@ export class CanonicalSelfClaim {
     identity: DerivedClaimantIdentity,
     image: ExecutingImageEvidence,
     transcript: TranscriptEvidence,
-    ownerDirective: string,
+    buzzAddress: string,
   ): Decision<CanonicalSelfClaimReceipt> {
     // `db.txDecision` — not `db.tx` — is load-bearing here. `tx()` treats a denied `Decision` as
     // an ordinary return value and commits it; a nested `bindings.bind()` denial (BindingRegistry
@@ -623,19 +727,60 @@ export class CanonicalSelfClaim {
     // than throwing) would otherwise be committed together with the session row already written
     // below. Only the outermost `txDecision` turns a propagated denial into a real ROLLBACK.
     return this.db.txDecision((): Decision<CanonicalSelfClaimReceipt> => {
-      this.#seedExecutorKind();
+      // Correction 4's generation half: the owner approved this exact next generation for this
+      // exact role key. Checked before any write — including before the owner approval is
+      // consumed — so a stale expectation denies with nothing to roll back yet.
+      const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId: request.projectId });
+      const currentMax = this.db.get<{ maximum: number | null }>(
+        `SELECT MAX(binding_generation) AS maximum FROM assignments WHERE role_key = ?`,
+        [roleKey],
+      )?.maximum ?? 0;
+      const nextGeneration = currentMax + 1;
+      if (nextGeneration !== request.expectedBindingGeneration) {
+        return deny(
+          ReasonCode.CONFLICT,
+          "expected binding generation does not match the next generation for this role",
+          { roleKey, expected: request.expectedBindingGeneration, actual: nextGeneration },
+        );
+      }
+
+      // Correction 4 — consumed exactly once, inside this transaction. A denial anywhere below
+      // rolls this consumption back too, so a refused claim leaves the approval reusable; only a
+      // committed one burns it. `OwnerAuthority.consumeApproval` itself denies a replay or a
+      // presentation against a different candidate — both re-checked here for a non-run operation.
+      const consumed = this.ownerAuthority.consumeApproval(request.ownerApproval, null);
+      if (!consumed.allowed) return consumed as Decision<CanonicalSelfClaimReceipt>;
 
       const created = this.sessions.create({
         provider: "claude",
         model: "claude-cli",
         workdir: identity.cwd,
         osPid: identity.pid,
+        buzzAddress,
       });
       // `bind()` requires a READY session (SESSION_NOT_READY otherwise); `create()` always starts
       // a session in STARTING. This transition sits inside the same transaction, so a legality
       // failure here rolls back the session insert too, exactly like every other denial in `#mutate`.
       const ready = this.sessions.transition(created.sessionId, SessionLifecycle.READY, "canonical self-claim");
       if (!ready.allowed) return ready as Decision<CanonicalSelfClaimReceipt>;
+
+      // Correction 5 — the routable half: this session also authenticates as a Buzz channel
+      // identity, inside the same transaction, or none of it lands. `bindBuzzActor` requires the
+      // session secret `create()` just minted (proving the caller *is* this session) plus the
+      // deployment's own ingress authenticator (proving the actor id is one it recognizes) —
+      // never an identity tuple taken on its own word.
+      if (created.sessionSecret === null) {
+        return deny(
+          ReasonCode.SESSION_SECRET_STORAGE_UNAVAILABLE,
+          "session secret storage is unavailable; a routable claim requires one",
+          { sessionId: created.sessionId },
+        );
+      }
+      const boundBuzzActor = this.sessions.bindBuzzActor(
+        { sessionId: created.sessionId, sessionSecret: created.sessionSecret, buzzActorId: request.buzzActorId },
+        this.buzzActorAuthenticator,
+      );
+      if (!boundBuzzActor.allowed) return boundBuzzActor as Decision<CanonicalSelfClaimReceipt>;
 
       const targetLocator = identity.sessionUuid;
       const claimed: VerifiedTargetBinding = {
@@ -656,7 +801,10 @@ export class CanonicalSelfClaim {
         peerProtocolVersion: request.peerProtocolVersion,
         peerIdentity: request.peerIdentity,
         buzzChannelId: request.buzzChannelId,
-        ownerDirective,
+        buzzActorId: request.buzzActorId,
+        buzzAddress,
+        ownerApprovalDigest: digestOf(request.ownerApproval),
+        expectedBindingGeneration: request.expectedBindingGeneration,
       });
       const authenticatedTarget: AuthenticatedTargetBinding = {
         claimed,
@@ -685,17 +833,8 @@ export class CanonicalSelfClaim {
         derivedSessionUuid: identity.sessionUuid,
         executorImageVersion: image.version,
         executorImagePath: image.imagePath,
+        buzzAddress,
       });
     });
-  }
-
-  /**
-   * Additive data, not a schema change: `executor_kinds` is a plain lookup table and this is the
-   * same `INSERT OR IGNORE` idiom schema.sql itself uses to seed `'hermes'`. No DDL, no migration.
-   */
-  #seedExecutorKind(): void {
-    this.db.run(`INSERT OR IGNORE INTO executor_kinds (executor_kind) VALUES (?)`, [
-      SELF_CLAIM_EXECUTOR_KIND,
-    ]);
   }
 }

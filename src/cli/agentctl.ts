@@ -53,7 +53,7 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
                                            --fenced only when its executor incarnation is still
                                            current: you are stating the execution cannot still write
   agentctl bootstrap hermes --target-bind-executable <path> --hermes-profile <profile> --hermes-home <path> --requested-session-id <id> --expected-lineage-root-digest <sha256> --executor-runtime-identity <identity> -- <command>
-  agentctl claim canonical-cto --caller-pid <pid> --claimed-session-id <uuid> [--claimed-pid <pid>] --project-id <id> --owner-directive <token> --cwd <path> --peer-protocol-version <v> --peer-identity <id> --buzz-channel <id>
+  agentctl claim canonical-cto --claimed-session-id <uuid> --project-id <id> --expected-binding-generation <n> --owner-nonce <nonce> --cwd <path> --peer-protocol-version <v> --peer-identity <id> --buzz-channel <id> --buzz-actor-id <id> --buzz-purpose <purpose>
                                            adopt the existing canonical CTO conversation in place;
                                            never launches a runtime the way bootstrap hermes does
   agentctl daemon status                  daemon mode and health; falls back to the lock file
@@ -232,23 +232,23 @@ export const dispatch = async (
     if (args[0] !== "canonical-cto") return fail(`unknown claim subcommand: ${args[0] ?? ""}`);
     const selectorArgs = args.slice(1);
     if (selectorArgs.length % 2 !== 0) return fail("claim canonical-cto selectors must be option/value pairs");
+    // No `--caller-pid` / `--claimed-pid` selector: correction 3 (#760) removed CLI-supplied
+    // process identity entirely. The daemon derives the connecting peer's pid from the
+    // authenticated operator connection itself; a flag cannot stand in for that without becoming
+    // exactly the "identity authority from CLI flags" this primitive refuses to accept.
     const selectorFields = {
-      "--caller-pid": "callerPid",
       "--claimed-session-id": "claimedSessionUuid",
-      "--claimed-pid": "claimedPid",
       "--project-id": "projectId",
-      "--owner-directive": "ownerDirective",
+      "--expected-binding-generation": "expectedBindingGeneration",
+      "--owner-nonce": "ownerNonce",
       "--cwd": "cwd",
       "--peer-protocol-version": "peerProtocolVersion",
       "--peer-identity": "peerIdentity",
       "--buzz-channel": "buzzChannelId",
+      "--buzz-actor-id": "buzzActorId",
+      "--buzz-purpose": "buzzPurpose",
     } as const;
-    // Every selector is authenticated identity input except --claimed-pid, which is optional:
-    // the claim primitive derives the pid independently and only checks a supplied one against it.
-    const REQUIRED_CLAIM_SELECTORS = [
-      "--caller-pid", "--claimed-session-id", "--project-id", "--owner-directive",
-      "--cwd", "--peer-protocol-version", "--peer-identity", "--buzz-channel",
-    ] as const;
+    const REQUIRED_CLAIM_SELECTORS = Object.keys(selectorFields) as (keyof typeof selectorFields)[];
     const claimSelectors: Record<string, string> = {};
     for (let index = 0; index < selectorArgs.length; index += 2) {
       const option = selectorArgs[index]!;
@@ -262,20 +262,26 @@ export const dispatch = async (
       claimSelectors[field] = value;
     }
     if (REQUIRED_CLAIM_SELECTORS.some((option) => !claimSelectors[selectorFields[option]])) {
-      return fail("claim canonical-cto requires every selector except --claimed-pid");
+      return fail("claim canonical-cto requires every selector");
     }
     const claimPayload = {
-      callerPid: requiredInteger(claimSelectors["callerPid"], "--caller-pid", 1),
       claimedSessionUuid: claimSelectors["claimedSessionUuid"]!,
-      ...(claimSelectors["claimedPid"]
-        ? { claimedPid: requiredInteger(claimSelectors["claimedPid"], "--claimed-pid", 1) }
-        : {}),
       projectId: claimSelectors["projectId"]!,
-      ownerDirective: claimSelectors["ownerDirective"]!,
+      expectedBindingGeneration: requiredInteger(
+        claimSelectors["expectedBindingGeneration"],
+        "--expected-binding-generation",
+        1,
+      ),
+      // The nonce identifies the operator's own owner-approval envelope (correction 4); the
+      // daemon mints the actual `OwnerApprovalReceipt` from it via the same `IngressGuard` route
+      // `owner approve` already uses. It is not the approval itself.
+      ownerNonce: claimSelectors["ownerNonce"]!,
       cwd: claimSelectors["cwd"]!,
       peerProtocolVersion: claimSelectors["peerProtocolVersion"]!,
       peerIdentity: claimSelectors["peerIdentity"]!,
       buzzChannelId: claimSelectors["buzzChannelId"]!,
+      buzzActorId: claimSelectors["buzzActorId"]!,
+      buzzPurpose: claimSelectors["buzzPurpose"]!,
     };
     return call(
       "actor.claimCanonicalCto",
