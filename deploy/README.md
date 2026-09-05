@@ -77,14 +77,32 @@ agentcpd-state migration-plan
 agentcpd-state approve-migration --approved-by "$USER" --confirm-migration
 ```
 
-To roll back a binary, use the pre-migration backup produced by the upgrade and restore it in
-the same operation. The script refuses a binary-only rollback because an older binary must not
-guess at a newer schema.
+To roll back, restore one **sealed rollback pair**: a UUID-named directory under
+`~/.agent-control-plane/rollback-pairs/` holding a WAL-complete database backup, the runtime
+closure that reads it, and the launchd generation and config that starts it, together with an
+exact inventory and a self-excluding `SHA256SUMS`. The database, runtime and launchd members are
+taken **only** from that one validated pair — the operator does not name them separately and the
+script discovers nothing. There is no `latest`, no newest-by-name, and no separately chosen
+pre-migration backup: two independently selected halves are not a pair, and an older binary must
+not guess at a newer schema.
 
 ```bash
 deploy/install-launchd.sh rollback \
-  --database-backup ~/.agent-control-plane/backups/state.sqlite-pre-migration-v11-....sqlite
+  --pair-id <uuid> --expected-index-digest sha256:<hex>
 ```
+
+`--expected-index-digest` is the `SHA256(SHA256SUMS)` retained **outside** the pair, because a
+pair that vouches for its own index vouches for a forgery of itself just as readily. Before
+anything is stopped or replaced, the rollback validates the pair id, that digest, the exact
+inventory and every file digest, the declared schema, runtime and service identity, that every
+member is a regular non-symlink file, and that every member is still inside the pair root after
+its path is resolved.
+
+Seal a pair with `node dist/deploy/rollback-pair.js seal …` — run
+`node dist/deploy/rollback-pair.js --help` for its flags. It states every identity on the command
+line rather than reading any of it from the host, so the same command seals the generation being
+left and, later, the one being moved to; it prints the pair id and the index digest to retain.
+`docs/ops/owner-actions.md` carries the full procedure.
 
 `uninstall` removes only the LaunchAgent plist and launcher. It intentionally leaves the
 database and backups intact.
