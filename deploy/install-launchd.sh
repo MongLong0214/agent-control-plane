@@ -12,7 +12,14 @@ Usage:
   deploy/install-launchd.sh install [--app-root PATH] [--node PATH] [--keychain-service NAME] [--no-start]
   deploy/install-launchd.sh start | stop | restart | status | uninstall
   deploy/install-launchd.sh upgrade --app-root PATH [--node PATH] [--keychain-service NAME]
-  deploy/install-launchd.sh rollback --database-backup PATH
+  deploy/install-launchd.sh rollback --pair-id UUID --expected-index-digest sha256:HEX \
+    --expect-schema-version N --expect-service-generation NAME --expect-node-version vX.Y.Z
+
+rollback restores one sealed pair, named by its UUID under
+$HOME/.agent-control-plane/rollback-pairs/. It selects nothing implicitly: the pair holds the
+WAL-complete database backup, the runtime closure and the launchd generation together, and
+--expected-index-digest is the SHA256(SHA256SUMS) retained outside the pair, without which a
+pair can vouch for a forgery of itself. Prevalidation runs before anything is stopped.
 
 The job always uses $HOME/.agent-control-plane because that is agentcpd's configured
 state root. Secrets never go in the plist: store ACP_MCP_TOKEN and ACP_OPERATOR_TOKEN (both required),
@@ -43,7 +50,11 @@ keychain_service="com.agentcontrolplane.agentcpd"
 buzz_keychain_service="${ACP_BUZZ_KEYCHAIN_SERVICE:-buzz-desktop}"
 buzz_keychain_account="${ACP_BUZZ_KEYCHAIN_ACCOUNT:-secrets}"
 buzz_keychain_identity="${ACP_BUZZ_KEYCHAIN_IDENTITY:-identity}"
-database_backup=""
+pair_id=""
+expected_index_digest=""
+expect_schema_version=""
+expect_service_generation=""
+expect_node_version=""
 no_start=0
 
 while [[ $# -gt 0 ]]; do
@@ -54,8 +65,16 @@ while [[ $# -gt 0 ]]; do
       node_path="${2:-}"; shift 2 ;;
     --keychain-service)
       keychain_service="${2:-}"; shift 2 ;;
-    --database-backup)
-      database_backup="${2:-}"; shift 2 ;;
+    --pair-id)
+      pair_id="${2:-}"; shift 2 ;;
+    --expected-index-digest)
+      expected_index_digest="${2:-}"; shift 2 ;;
+    --expect-schema-version)
+      expect_schema_version="${2:-}"; shift 2 ;;
+    --expect-service-generation)
+      expect_service_generation="${2:-}"; shift 2 ;;
+    --expect-node-version)
+      expect_node_version="${2:-}"; shift 2 ;;
     --no-start)
       no_start=1; shift ;;
     --help|-h)
@@ -78,6 +97,7 @@ launch_agents_dir="$home_dir/Library/LaunchAgents"
 plist_path="$launch_agents_dir/$LABEL.plist"
 launcher_path="$state_dir/agentcpd-launch.sh"
 deploy_backups_dir="$state_dir/deploy-backups"
+rollback_pairs_dir="$state_dir/rollback-pairs"
 domain="gui/$(id -u)"
 job="$domain/$LABEL"
 
@@ -89,6 +109,22 @@ private_directory() {
     chmod 700 "$target"
   fi
   [[ -d "$target" && ! -L "$target" ]] || fail "not a direct directory: $target"
+  local metadata owner mode
+  metadata="$(stat -f '%u %Lp' "$target")"
+  owner="${metadata%% *}"
+  mode="${metadata##* }"
+  [[ "$owner" == "$(id -u)" ]] || fail "directory is not owned by this user: $target"
+  [[ "$mode" == "700" ]] || fail "directory mode must be 0700, found $mode: $target"
+}
+
+# Read-only. `private_directory` creates and chmods, which is a mutation: running it during
+# rollback prevalidation means a refused rollback has already changed the filesystem, and the
+# directory it silently created is one nobody chose to have. Setup mutation belongs to
+# install/upgrade; validation only ever asks.
+assert_existing_private_directory() {
+  local target="$1"
+  [[ ! -L "$target" ]] || fail "refusing symlinked directory: $target"
+  [[ -d "$target" ]] || fail "required directory does not exist: $target"
   local metadata owner mode
   metadata="$(stat -f '%u %Lp' "$target")"
   owner="${metadata%% *}"
@@ -364,25 +400,98 @@ case "$command_name" in
     printf 'removed launchd artifacts only; database and backups remain in %s\n' "$state_dir"
     ;;
   rollback)
-    [[ -n "$database_backup" && "$database_backup" = /* ]] ||
-      fail "rollback requires --database-backup /absolute/pre-migration-backup.sqlite"
+    # The pair is named, never discovered. This branch used to take
+    # `find "$deploy_backups_dir" -maxdepth 1 -type d | sort | tail -n 1` — the newest directory
+    # by name — and separately an operator-supplied database backup. Newest is not approved, and
+    # two independently chosen halves are not a pair: the plist could be from one generation and
+    # the database from another with nothing noticing. One sealed pair holds both.
+    [[ -n "$pair_id" ]] ||
+      fail "rollback requires --pair-id <uuid> naming the sealed pair to restore"
+    [[ "$pair_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] ||
+      fail "rollback pair id must be a UUID, never a name like 'latest': $pair_id"
+    [[ -n "$expected_index_digest" ]] ||
+      fail "rollback requires --expected-index-digest sha256:<hex>, the digest retained outside the pair"
+    [[ "$expected_index_digest" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+      fail "expected index digest must be sha256:<64 hex digits>: $expected_index_digest"
+    # Structural compatibility is not optional. A rollback that does not state which schema,
+    # generation and runtime it is restoring can be applied to a deployment it was never for, and
+    # the pair would have no way to object.
+    [[ "$expect_schema_version" =~ ^[0-9]+$ ]] ||
+      fail "rollback requires --expect-schema-version <integer>, the schema the sealed image is at"
+    [[ -n "$expect_service_generation" ]] ||
+      fail "rollback requires --expect-service-generation <name>, the generation being restored"
+    [[ -n "$expect_node_version" ]] ||
+      fail "rollback requires --expect-node-version <version>, the runtime the sealed closure declares"
     resolve_app_root
     resolve_node
-    private_directory "$state_dir"
-    private_directory "$deploy_backups_dir"
-    local_snapshot="$(find "$deploy_backups_dir" -mindepth 1 -maxdepth 1 -type d -print | sort | tail -n 1)"
-    [[ -n "$local_snapshot" ]] || fail "no prior deployment snapshot is available"
-    private_file "$local_snapshot/$LABEL.plist"
-    [[ -f "$local_snapshot/agentcpd-launch.sh" && ! -L "$local_snapshot/agentcpd-launch.sh" ]] || fail "saved launcher is invalid"
+    # Read-only from here to the last prevalidation line: a refused rollback must leave the
+    # filesystem exactly as it found it, including not having created the directories it looked in.
+    assert_existing_private_directory "$state_dir"
+    assert_existing_private_directory "$rollback_pairs_dir"
+    pair_root="$rollback_pairs_dir/$pair_id"
+    [[ -d "$pair_root" && ! -L "$pair_root" ]] || fail "no sealed rollback pair with this id: $pair_root"
+    pair_root="$(cd -P -- "$pair_root" && pwd)"
+    [[ "${pair_root##*/}" == "$pair_id" ]] ||
+      fail "the sealed pair directory resolves to a different id: $pair_root"
+    validator="$app_root/dist/deploy/rollback-pair.js"
+    [[ -f "$validator" ]] || fail "rollback pair validator build missing: $validator"
+
+    # Prevalidation, before anything is stopped, restored or replaced. The index digest is the one
+    # value deliberately kept outside the pair: a pair that vouches for its own index vouches for
+    # a forged one, because a forger rewrites the index alongside the member it altered.
+    index_shasum="$(/usr/bin/shasum -a 256 "$pair_root/SHA256SUMS")" ||
+      fail "sealed pair index is unreadable: $pair_root/SHA256SUMS"
+    actual_index_digest="sha256:${index_shasum%% *}"
+    [[ "$actual_index_digest" == "$expected_index_digest" ]] ||
+      fail "sealed pair index digest does not match the retained digest: expected $expected_index_digest, found $actual_index_digest"
+
+    # One invocation, one authority. The installer never learns a path inside the pair and never
+    # hands one back in: validate, private verified copy, install and post-condition all happen
+    # inside the command below, so there is no stage directory anyone can name and apply later.
+    # It also states what the deployment *is* — database, service label, app root, install root,
+    # schema, generation and runtime — so a pair sealed for a different one is refused.
+    rollback_flags=(
+      --pair-root "$pair_root"
+      --pair-id "$pair_id"
+      --expected-index-digest "$expected_index_digest"
+      --expect-database "$state_dir/state.sqlite"
+      --expect-service-label "$LABEL"
+      --expect-working-directory "$app_root"
+      --expect-runtime-root "$app_root/dist"
+      --expect-schema-version "$expect_schema_version"
+      --expect-service-generation "$expect_service_generation"
+      --expect-node-version "$expect_node_version"
+      --stage-parent "$state_dir/rollback-stage"
+    )
+
+    # Everything below this line is one generation being replaced. The command installs the sealed
+    # runtime closure, plist, launcher and database together — restoring the database through the
+    # *sealed* state-admin under the *sealed* Node, because pair A's image installed by generation
+    # B's code is the defect this whole mechanism exists to prevent — and puts the previous
+    # generation back if any step fails. A failed rollback therefore ends with the old generation
+    # whole, so the job is started again rather than left down.
+    "$node_path" "$validator" validate "${rollback_flags[@]}" >/dev/null ||
+      fail "sealed rollback pair failed validation: $pair_root"
+
+    # The service state before this rollback touched it. Always starting the job afterwards would
+    # leave a deployment running that the operator had deliberately stopped — a state change
+    # nobody asked for, arrived at through a failure path. So the original state is captured here
+    # and restored on both the success and the compensation path.
+    if job_loaded; then service_was_loaded=1; else service_was_loaded=0; fi
     stop_job
     wait_for_stop
-    "$node_path" "$app_root/dist/db/state-admin.js" restore "$database_backup" \
-      --database "$state_dir/state.sqlite" --confirm-restore
-    cp "$local_snapshot/$LABEL.plist" "$plist_path"
-    cp "$local_snapshot/agentcpd-launch.sh" "$launcher_path"
-    chmod 600 "$plist_path"
-    chmod 700 "$launcher_path"
-    start_job
-    printf 'rolled back deployment and restored database from %s\n' "$database_backup"
+    if ! rollback_report="$("$node_path" "$validator" rollback "${rollback_flags[@]}")"; then
+      if [[ "$service_was_loaded" == "1" ]]; then start_job; fi
+      rm -rf "$state_dir/rollback-stage"
+      fail "rollback failed; the previous generation and the original service state were restored"
+    fi
+    if [[ "$service_was_loaded" == "1" ]]; then start_job; fi
+    applied_generation=""
+    while IFS='=' read -r report_key report_value; do
+      case "$report_key" in
+        ACP_APPLIED_GENERATION) applied_generation="$report_value" ;;
+      esac
+    done <<< "$rollback_report"
+    printf 'rolled back to sealed pair %s (generation %s)\n' "$pair_id" "$applied_generation"
     ;;
 esac
