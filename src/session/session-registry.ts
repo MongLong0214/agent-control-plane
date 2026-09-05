@@ -8,6 +8,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { SessionLifecycle } from "../domain/types.ts";
+import { HOLDER_CLAIMED_KIND_SQL } from "../outbox/outbox.ts";
 
 export interface SessionRecord {
   sessionId: string;
@@ -205,13 +206,28 @@ export class SessionRegistry {
    * so every queued or claimed message addressed to it is fenced here rather than left for
    * a delivery loop to notice. Claimed rows are included: the claim belongs to a runtime
    * that is gone, and reclaiming it would only re-offer the message to the same dead target.
+   *
+   * Holder-claimed kinds are the one exception, and the exclusion is the same one
+   * `Outbox.fenceUndeliverable` makes. Every other kind here is addressed to *this session*, so a
+   * session that is gone means the message is undeliverable. An `OWNER_MESSAGE` is addressed to a
+   * **role**: while it is `PENDING` nobody has been handed it, nothing observable has happened to
+   * it, and it belongs to whoever takes the role next — `Outbox.retargetOrReject` carries it to a
+   * successor on a takeover and terminally closes it on a revoke, settling its ingress claim in the
+   * same transaction either way.
+   *
+   * This write cannot do that. It is direct SQL that knows nothing about ingress claims, so an
+   * owner-message reaching it went terminal with its claim left unresolved — the `(buzz, nonce)`
+   * slot then permanently exempt from `IngressGuard.prune`, and the turn reported outstanding
+   * forever. It also fired *first* in the ordinary failure ordering (the runtime dies, then a
+   * successor binds), so it destroyed the message before the takeover could ever reach it.
    */
   private fenceUndeliveredMessages(sessionId: string, to: SessionLifecycle): string[] {
     if (to !== SessionLifecycle.ERROR && to !== SessionLifecycle.STOPPED) return [];
     const doomed = this.db
       .all<{ message_id: string }>(
         `SELECT message_id FROM outbox
-          WHERE target_session_id = ? AND status IN ('PENDING','IN_FLIGHT')`,
+          WHERE target_session_id = ? AND status IN ('PENDING','IN_FLIGHT')
+            AND kind NOT IN (${HOLDER_CLAIMED_KIND_SQL})`,
         [sessionId],
       )
       .map((row) => row.message_id);
@@ -219,7 +235,8 @@ export class SessionRegistry {
     this.db.run(
       `UPDATE outbox SET status = 'REJECTED', reason_code = ?, claim_token = NULL, claimed_at = NULL,
                          retry_eligible = 0, next_attempt_at = NULL
-        WHERE target_session_id = ? AND status IN ('PENDING','IN_FLIGHT')`,
+        WHERE target_session_id = ? AND status IN ('PENDING','IN_FLIGHT')
+          AND kind NOT IN (${HOLDER_CLAIMED_KIND_SQL})`,
       [ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, sessionId],
     );
     return doomed;

@@ -136,6 +136,18 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string }> = 
     file: "ingress/ingress-guard.ts",
     anchor: "): Decision<TelegramReplyAcknowledgement> => db.txDecision(() => {",
   },
+  {
+    label: "Outbox.completeForHolder",
+    file: "outbox/outbox.ts",
+    anchor:
+      "decision frame it hands the denial straight back, and the outermost frame does the rollback.\n    return this.db.txDecision(() => {",
+  },
+  {
+    label: "Outbox.rejectForHolder",
+    file: "outbox/outbox.ts",
+    anchor:
+      "the ingress claim it closes are one transition, and half of it is worse than none of it.\n    return this.db.txDecision(() => {",
+  },
 ];
 
 /** Every EXEMPT and DEFERRED entry, so a marker drifting out of its body is caught for all of them, not just one. */

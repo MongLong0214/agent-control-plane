@@ -91,6 +91,52 @@ export const buzzMessagePayload = (
   text: input.text,
 });
 
+/**
+ * The whole of what an `OWNER_MESSAGE` outbox row carries: a pointer, and nothing that is the
+ * message.
+ *
+ * `inbound_messages.payload_json` is the only durable copy of an owner's envelope. Writing the
+ * text into the outbox payload as well would make two copies that can disagree — and the one a
+ * holder reads at claim time would be the copy nothing authenticated, since only the ingress row
+ * is the thing the relay's signature was checked against.
+ *
+ * `sourcePayloadDigest` binds the **full signed payload**, not only the text. A digest over the
+ * text alone would still verify after `addressedTo` or `mention` had been rewritten, which is
+ * exactly the substitution `buzzMessagePayload` puts inside the signature to refuse.
+ */
+export interface OwnerMessagePointer {
+  readonly sourceChannel: "buzz";
+  readonly sourceNonce: string;
+  readonly sourcePayloadDigest: string;
+}
+
+/** The pointer for one admitted envelope. Derived, never supplied by a caller. */
+export const ownerMessagePointer = (
+  input: Pick<BuzzMessageIngressInput, "conversation" | "addressedTo" | "mention" | "text">,
+  nonce: string,
+): OwnerMessagePointer => ({
+  sourceChannel: "buzz",
+  sourceNonce: nonce,
+  sourcePayloadDigest: digestOf(buzzMessagePayload(input)),
+});
+
+/**
+ * Reads a stored outbox payload back as a pointer, or answers `null`.
+ *
+ * Structural, and deliberately strict about the extra key: a payload carrying anything beyond
+ * these three is not a pointer this path wrote, and treating it as one would let a second copy of
+ * the message ride along in a field nobody checks.
+ */
+export const ownerMessagePointerOf = (payload: unknown): OwnerMessagePointer | null => {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const { sourceChannel, sourceNonce, sourcePayloadDigest } = payload as Record<string, unknown>;
+  if (sourceChannel !== "buzz") return null;
+  if (typeof sourceNonce !== "string" || sourceNonce.length === 0) return null;
+  if (typeof sourcePayloadDigest !== "string" || sourcePayloadDigest.length === 0) return null;
+  if (Object.keys(payload as Record<string, unknown>).length !== 3) return null;
+  return { sourceChannel, sourceNonce, sourcePayloadDigest };
+};
+
 /** The exact signed request for one Buzz message; the relay computes its HMAC over this. */
 export const buzzMessageSigningRequest = (
   input: Pick<
@@ -341,19 +387,34 @@ export class BuzzMessageIngress {
   }
 
   /**
-   * What this message's turn is, fixed before the CEO is asked. See `TelegramIngress`.
+   * What this message's turn is, fixed before anyone is asked. See `TelegramIngress`.
    *
-   * The id is a fresh UUID rather than derived from the event, so two attempts at the same
-   * message cannot share one identity; the digests say what was attempted, and
-   * `bindingDigest` is the fence against a receipt from a later CEO generation (#639).
+   * `turnRequestId` is a parameter rather than a fresh UUID minted here, and that is the whole of
+   * §2's "the outbox messageId *is* the turn request identity". A role-addressed message's turn is
+   * held open by exactly one durable outbox row, and an id minted independently of that row would
+   * read identically on a passing run while leaving the ingress claim unable to name what is
+   * holding it open — so the claim could not be settled from the row, and pruning could not be
+   * told which row was still pending. The CEO path has no such row and mints a fresh id.
+   *
+   * The digests say what was attempted, and `bindingDigest` is the fence against a receipt from a
+   * later generation (#639) — the *addressed role's* generation, never a bystander's.
    */
-  turnIdentityFor(input: { conversation: string; text: string }, bindingGeneration: number | null): TurnIdentity {
+  turnIdentityFor(
+    input: { conversation: string; text: string },
+    bindingGeneration: number | null,
+    turnRequestId: string,
+  ): TurnIdentity {
     return {
-      turnRequestId: randomUUID(),
+      turnRequestId,
       sessionDigest: digestOf({ channel: "buzz", conversation: input.conversation }),
       promptDigest: digestOf(input.text),
       bindingDigest: digestOf({ bindingGeneration }),
     };
+  }
+
+  /** A fresh turn identity for a turn no durable row names — the CEO's. */
+  freshTurnRequestId(): string {
+    return randomUUID();
   }
 
   /** Takes the right to run this message's handler, once. See `IngressGuard.claimTurn`. */
@@ -383,28 +444,59 @@ export interface CeoTurnDelivery {
   reasonCode: ReasonCode;
 }
 
-/** The daemon-side capabilities this delivery needs, as functions rather than the ControlPlane. */
+/** The exact runtime a role-addressed envelope is admitted against, as the registry holds it. */
+export interface ActiveRoleTarget {
+  bindingGeneration: number;
+  targetSessionId: string;
+}
+
+/** The daemon-side capabilities this path needs, as functions rather than the ControlPlane. */
 export interface BuzzMessageTurnPort {
   /** Delivers one turn to whoever currently holds the CEO binding. */
   deliverToCeo(text: string): Promise<CeoTurnDelivery>;
-  /**
-   * Delivers one turn to whoever currently holds `roleKey`, through B2's live peer.
-   *
-   * The same contract as `deliverToCeo`, including its contact boundary: the peer is asked, or
-   * it is positively established that nothing was asked. Who the holder is gets re-read from the
-   * registry inside the port, not taken from the address this ingress resolved a moment ago.
-   */
-  deliverToRole(roleKey: string, text: string): Promise<CeoTurnDelivery>;
   /** The CEO binding generation this turn is being claimed under, or null if there is none. */
   bindingGeneration(): number | null;
   /**
-   * The same fence for a role-addressed turn: the generation `roleKey` is held at right now.
+   * Runs `body` as **one outer write transaction**, joining nothing and opening nothing else.
    *
-   * Separate from `bindingGeneration` rather than a parameter on it, because the CEO's generation
-   * is the wrong fence for a message addressed to the CTO — a receipt from a superseded CTO would
-   * pass a claim stamped with whichever generation the CEO happened to be at.
+   * §2's atomicity lives here rather than in three well-placed calls: the inbound row, the outbox
+   * row and the turn claim are three writes in three modules, and any ordering of three separate
+   * commits has two windows a crash can land in. A `Decision` returned from `body` commits — that
+   * is how a refused *address* keeps its spent nonce and its journal row — and a throw rolls
+   * everything back, which is how a refused *enqueue* leaves nothing half-admitted behind.
    */
-  roleBindingGeneration(roleKey: string): number | null;
+  atomically<T>(body: () => T): T;
+  /**
+   * The exact active target of `roleKey` right now, from the binding registry alone.
+   *
+   * Also the fence the turn claim is stamped with: the CEO's generation is the wrong fence for a
+   * message addressed to the CTO, because a receipt from a superseded CTO would then pass a claim
+   * stamped with whichever generation the CEO happened to be at.
+   */
+  activeRoleTarget(roleKey: string): ActiveRoleTarget | null;
+  /**
+   * The one non-retargetable outbox row this admission produces, carrying only the pointer.
+   *
+   * Called inside `atomically`, so a denial here is a denial of the whole admission rather than a
+   * message admitted with nowhere to go.
+   */
+  enqueueOwnerMessage(input: {
+    roleKey: string;
+    bindingGeneration: number;
+    targetSessionId: string;
+    nonce: string;
+    pointer: OwnerMessagePointer;
+  }): Decision<{ messageId: string }>;
+  /**
+   * One constant wake to the role's live peer — **after commit, and only after commit**.
+   *
+   * A wake sent from inside the transaction would tell a holder to come and look at a row that
+   * does not exist yet, and a holder fast enough to claim before the commit would be told there is
+   * nothing there. Its outcome never resolves or rejects the durable row: an absent, stale,
+   * unsupported or failed wake leaves the message exactly where it is, queued for whoever attaches
+   * next, which is why no polling path is needed.
+   */
+  wakeRole(roleKey: string): Promise<Decision<void>>;
 }
 
 /** What the relay gets back when a message became a turn. */
@@ -413,9 +505,10 @@ export interface BuzzMessageAnswer {
   /**
    * True only when the CEO peer itself produced the text.
    *
-   * Deliberately narrow: it stays false for a role-addressed message even when that role's peer
-   * answered, because a caller reading it is asking about the CEO. `reasonCode === OK` is the
-   * general "the addressed peer answered" fact and holds for both.
+   * Always false for a role-addressed message, and now for a stronger reason than before: nobody
+   * answered one. `reasonCode === OK` remains the "the addressed peer answered" fact and is
+   * reachable only on the CEO path; a queued role message reports
+   * `UNTRUSTED_CONTENT_IS_DATA` instead, so a relay cannot read stored as answered.
    */
   answeredByCeo: boolean;
   turnRequestId: string;
@@ -423,41 +516,225 @@ export interface BuzzMessageAnswer {
 }
 
 /**
- * An owner's Buzz message, delivered as one turn to whoever currently holds the addressed role.
+ * What one admitted envelope turned out to be, once its address was resolved.
+ *
+ * The role arm carries the outbox row's id because that id *is* the turn request identity, and the
+ * caller past this point has nothing else to name the durable row with.
+ */
+type BuzzMessageAdmission =
+  | { readonly kind: "CEO"; readonly admitted: AdmittedBuzzMessage }
+  | {
+      readonly kind: "ROLE";
+      readonly admitted: AdmittedBuzzMessage;
+      readonly roleKey: string;
+      readonly messageId: string;
+    };
+
+/**
+ * The rollback signal, thrown to undo a half-finished role admission.
+ *
+ * A thrown object rather than a denied return, because the outer frame is `atomically` and a
+ * *returned* denial there commits — which is exactly what the address refusals below need and
+ * exactly what an enqueue refusal must not get. Deliberately not an `Error`: `Db.translate`
+ * inspects an `Error`'s message for SQLite constraint text and would rewrite a message that
+ * happened to contain it, so the signal is a plain object that passes through untouched.
+ */
+const ADMISSION_ROLLBACK = Symbol("buzz-owner-message-admission-rollback");
+interface AdmissionRollback {
+  readonly [ADMISSION_ROLLBACK]: Decision<never>;
+}
+const rollingBack = (decision: Decision<unknown>): AdmissionRollback => ({
+  [ADMISSION_ROLLBACK]: decision as Decision<never>,
+});
+const rolledBackDecision = (err: unknown): Decision<never> | null =>
+  typeof err === "object" && err !== null && ADMISSION_ROLLBACK in err
+    ? (err as AdmissionRollback)[ADMISSION_ROLLBACK]
+    : null;
+
+/**
+ * §2 — role admission produces the inbound row, the exact role target and the outbox row together,
+ * or produces none of them.
+ *
+ * Two kinds of refusal live in one transaction here and they must not be treated alike:
+ *
+ *   returned      the sender or the address was refused. `admit` has already spent the
+ *                 `(buzz, nonce)` slot and, for an unresolvable `p` tag, written its one journal
+ *                 row — and both of those are the authenticated unbound-address semantics this
+ *                 slice preserves exactly. A returned `Decision` commits, so they survive.
+ *   thrown        the envelope was admitted and then something after it refused: no active
+ *                 target, a refused enqueue, a refused claim. Committing any of that would leave a
+ *                 spent nonce addressed to nobody, or a queued message no claim holds open. So it
+ *                 is thrown, and the whole admission is rolled back as if the event had never
+ *                 arrived — the relay may then send it again.
+ */
+const admitBuzzMessage = (
+  ingress: BuzzMessageIngress,
+  port: BuzzMessageTurnPort,
+  input: BuzzMessageIngressInput,
+): Decision<BuzzMessageAdmission> => {
+  try {
+    return port.atomically((): Decision<BuzzMessageAdmission> => {
+      const admitted = ingress.admit(input);
+      if (!admitted.allowed) return admitted as Decision<BuzzMessageAdmission>;
+      const target = admitted.value.target;
+      if (target.kind === "CEO") {
+        return allow(admitted.reasonCode, { kind: "CEO", admitted: admitted.value });
+      }
+
+      // The registry, once, inside the transaction — and the same answer is used for the outbox
+      // row's fence and for the claim's `bindingDigest`. Reading it twice would let the two
+      // disagree across a failover that landed between them.
+      const active = port.activeRoleTarget(target.roleKey);
+      if (!active) {
+        throw rollingBack(
+          deny(
+            ReasonCode.ROLE_PEER_ABSENT,
+            "no session holds the addressed role, so there is nothing to address the message to",
+            { roleKey: target.roleKey },
+          ),
+        );
+      }
+      const enqueued = port.enqueueOwnerMessage({
+        roleKey: target.roleKey,
+        bindingGeneration: active.bindingGeneration,
+        targetSessionId: active.targetSessionId,
+        nonce: admitted.value.nonce,
+        pointer: ownerMessagePointer(input, admitted.value.nonce),
+      });
+      if (!enqueued.allowed) throw rollingBack(enqueued);
+
+      // The claim last, carrying the outbox id. Its unresolved presence is what keeps `prune` off
+      // the one row the pointer resolves to while the outbox row is PENDING or SENT.
+      const claimed = ingress.claimTurn(
+        admitted.value.nonce,
+        ingress.turnIdentityFor(
+          { conversation: admitted.value.conversation, text: admitted.value.text },
+          active.bindingGeneration,
+          enqueued.value.messageId,
+        ),
+      );
+      if (!claimed.allowed) throw rollingBack(claimed);
+
+      return allow(admitted.reasonCode, {
+        kind: "ROLE",
+        admitted: admitted.value,
+        roleKey: target.roleKey,
+        messageId: enqueued.value.messageId,
+      });
+    });
+  } catch (err) {
+    const rolledBack = rolledBackDecision(err);
+    if (rolledBack) return rolledBack;
+    throw err;
+  }
+};
+
+/**
+ * §3 — the durable row is committed, so now, and only now, the holder is told to come and look.
+ *
+ * Nothing here resolves or rejects the message whatever the wake says. A wake is not a delivery:
+ * the message is durable and addressed either way, and the only thing a failed wake costs is
+ * promptness — the next `registerEndpoint` on this role sends one unconditionally and drains
+ * whatever accumulated, which is why this path needs no poller and no retry timer.
+ */
+const queuedForRole = async (
+  port: BuzzMessageTurnPort,
+  admission: Extract<BuzzMessageAdmission, { kind: "ROLE" }>,
+): Promise<Decision<BuzzMessageAnswer>> => {
+  const woken = await port.wakeRole(admission.roleKey);
+  return allow(
+    // Not `OK`. `OK` on this surface has always meant "the addressed peer answered", and nobody
+    // has answered — the envelope was taken as durable data, which is precisely what `admit`
+    // itself reports. Reusing the admission's own code keeps a relay from reading a queued
+    // message as a delivered one.
+    ReasonCode.UNTRUSTED_CONTENT_IS_DATA,
+    {
+      answer: ownerMessageQueuedSentence(woken.allowed ? null : woken.reasonCode),
+      answeredByCeo: false,
+      turnRequestId: admission.messageId,
+      conversation: admission.admitted.conversation,
+    },
+    { queued: true, messageId: admission.messageId, wake: woken.reasonCode },
+  );
+};
+
+/**
+ * What the owner is told once their message is durable.
+ *
+ * Three facts, and this seam observed all three: the row is stored, nobody has read it, and this is
+ * what happened when the wake was attempted. Nothing else is knowable from here.
+ *
+ * **No sentence may say that anyone takes the message.** Not the holder now, not a holder later,
+ * not a successor. That is not a rule about phrasing, it is what the row can keep: the message is
+ * addressed to one generation and one runtime, it reaches a successor only if a takeover carries it
+ * — once, and only from `PENDING` — it is closed outright by a revoke or a second takeover, and a
+ * hand-over that is never acknowledged ends terminal rather than repeated. Every one of those is a
+ * path on which the owner would have been promised something that did not happen.
+ *
+ * The first attempt at this removed one phrase, "the next holder", and put the same promise back in
+ * other words — "its holder takes it over its own connection whenever it next attaches". So the
+ * sentences below are held to a *closed vocabulary* in `buzz-message-ingress.test.ts` rather than to
+ * a list of forbidden phrases: they may use only words enumerated there, and that enumeration is
+ * itself asserted to contain no modal, no forward-looking time word, no verb of receipt and none of
+ * the actor nouns a promise needs a subject from. A synonym is caught for being a new word, not for
+ * having been guessed at in advance.
+ *
+ * `null` means the wake was sent, which is still not a read. And a wake refusal says nothing about
+ * the message at all: `ROLE_PEER_ABSENT` here means no live peer was registered to nudge, not that
+ * the role has no holder — a message is only ever enqueued against an active binding.
+ */
+export const ownerMessageQueuedSentence = (wakeRefusal: string | null): string => {
+  if (wakeRefusal === null) {
+    return "Stored for the role, and a wake was sent to its registered peer. Nobody has read it yet.";
+  }
+  if (wakeRefusal === ReasonCode.ROLE_PEER_ABSENT || wakeRefusal === ReasonCode.ROLE_PEER_STALE) {
+    return "Stored for the role. No peer is attached, so no wake was sent. Nobody has read it yet.";
+  }
+  if (wakeRefusal === ReasonCode.ROLE_PEER_UNSUPPORTED) {
+    return "Stored for the role. No wake endpoint is registered, so no wake was sent. Nobody has read it yet.";
+  }
+  return "Stored for the role. The wake did not land. Nobody has read it yet.";
+};
+
+/**
+ * An owner's Buzz message, admitted as one durable turn for whoever holds the addressed role.
  *
  * This is the receiving half #627 asks for, and the whole of its correctness is what it does
- * *not* do: nothing here starts a session, resumes one, or synthesises a reply. Both ports reach
- * a peer that is already connected and re-authenticated on every request — the mechanism
- * `ARCHITECTURE.md` accepts (peer UDS + transcript observer) rather than the three it rejects.
+ * *not* do: nothing here starts a session, resumes one, or synthesises a reply.
+ *
+ * The two addresses are answered by two different mechanisms, and that asymmetry is deliberate.
+ * The CEO's is a *conversation*: the owner waits on this connection while the CEO answers, and the
+ * answer goes back down it. A role's is a *message*: it is written to the durable outbox, its
+ * holder is woken, and the holder comes and takes it over its own authenticated connection — so
+ * nothing is waited on here, and a role that is between holders costs the message nothing.
  *
  * The address was already resolved, once, inside `admit`. Nothing below re-derives it: an
  * envelope whose `p` tag named no role never reaches this point, so there is no state in which a
  * turn exists for a message that has nowhere to go.
  *
- * The turn is claimed before it runs, for the reason `IngressGuard.claimTurn` gives: the CEO's
- * reply command resumes the owner's own conversation, so running one message twice appends the
- * same exchange twice to a transcript the CEO then carries forward as context.
+ * The turn is claimed before anything runs, for the reason `IngressGuard.claimTurn` gives: the
+ * CEO's reply command resumes the owner's own conversation, so running one message twice appends
+ * the same exchange twice to a transcript the CEO then carries forward as context.
  */
 export const deliverBuzzMessage = async (
   ingress: BuzzMessageIngress,
   port: BuzzMessageTurnPort,
   input: BuzzMessageIngressInput,
 ): Promise<Decision<BuzzMessageAnswer>> => {
-  const admitted = ingress.admit(input);
-  if (!admitted.allowed) return admitted as Decision<BuzzMessageAnswer>;
+  const admission = admitBuzzMessage(ingress, port, input);
+  if (!admission.allowed) return admission as Decision<BuzzMessageAnswer>;
+  if (admission.value.kind === "ROLE") return queuedForRole(port, admission.value);
 
-  const target = admitted.value.target;
+  const admitted = admission.value.admitted;
   const identity = ingress.turnIdentityFor(
-    { conversation: admitted.value.conversation, text: admitted.value.text },
-    target.kind === "CEO" ? port.bindingGeneration() : port.roleBindingGeneration(target.roleKey),
+    { conversation: admitted.conversation, text: admitted.text },
+    port.bindingGeneration(),
+    ingress.freshTurnRequestId(),
   );
-  const claimed = ingress.claimTurn(admitted.value.nonce, identity);
+  const claimed = ingress.claimTurn(admitted.nonce, identity);
   if (!claimed.allowed) return claimed as Decision<BuzzMessageAnswer>;
 
-  const delivered =
-    target.kind === "CEO"
-      ? await port.deliverToCeo(admitted.value.text)
-      : await port.deliverToRole(target.roleKey, admitted.value.text);
+  const delivered = await port.deliverToCeo(admitted.text);
 
   // Which outcomes close the claim, and which leave it outstanding.
   //
@@ -473,15 +750,15 @@ export const deliverBuzzMessage = async (
   // an outcome nobody established, and it is what `IngressGuard.unresolvedTurns` reads.
   const answered = delivered.reasonCode === ReasonCode.OK;
   const closes = delivered.reachedCeo ? answered : !answered;
-  const resolution = closes ? ingress.resolveTurn(admitted.value.nonce) : null;
+  const resolution = closes ? ingress.resolveTurn(admitted.nonce) : null;
 
   return allow(
     delivered.reasonCode,
     {
       answer: delivered.answer,
-      answeredByCeo: target.kind === "CEO" && delivered.reachedCeo && answered,
+      answeredByCeo: delivered.reachedCeo && answered,
       turnRequestId: identity.turnRequestId,
-      conversation: admitted.value.conversation,
+      conversation: admitted.conversation,
     },
     {
       // A bookkeeping write that raced must not cost the owner the CEO's reply, so the answer

@@ -517,6 +517,21 @@ export class BindingRegistry {
             { roleKey, actorId: owner.actor_id, sessionId: input.sessionId },
           );
         }
+        // #760 — the queue moves with the runtime, in this same transaction as the pointer.
+        //
+        // The owner-message lifecycle resolves its holder through this actor, so the instant the
+        // pointer above moves, every row still addressed to the outgoing runtime is addressed to
+        // nobody: the incoming runtime cannot claim it and no sweep will ever touch it, because a
+        // queued holder-claimed row is deliberately exempt from both fences. `retargetOrReject`
+        // does not reach it either — that is the *takeover* fence, keyed on a generation that a
+        // surviving switch does not advance. Doing it after the commit would be a second
+        // transaction that a crash can lose, leaving the pointer moved and the queue behind it.
+        const carried = this.outbox.carryHolderMessagesToRuntime(
+          roleKey,
+          current.bindingGeneration,
+          current.sessionId,
+          input.sessionId,
+        );
         this.audit.record({
           kind: "BINDING_RUNTIME_MOVED",
           roleKey,
@@ -527,6 +542,9 @@ export class BindingRegistry {
             actorId: owner.actor_id,
             generation: current.bindingGeneration,
             reason: input.reason,
+            fromSession: current.sessionId,
+            holderMessagesCarried: carried.carried.length,
+            holderMessagesRejected: carried.rejected.length,
           },
         });
         return allow(ReasonCode.OK, this.require(roleKey));
