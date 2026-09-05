@@ -1,13 +1,15 @@
-import { createConnection, createServer } from "node:net";
-import { chmodSync, existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
+import { createConnection } from "node:net";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OPERATOR_METHOD, type Daemon } from "../../src/daemon/daemon.ts";
 import {
   assertDirectPeer,
   startCanonicalSelfClaimListener,
+  CANONICAL_SELF_CLAIM_SOCKET_FILENAME,
+  MAX_SUN_PATH_BYTES,
   type CanonicalSelfClaimListener,
 } from "../../src/daemon/canonical-self-claim-listener.ts";
 import { executeCanonicalSelfClaimOperator, type CanonicalSelfClaimOperatorDeps } from "../../src/daemon/canonical-self-claim-operator.ts";
@@ -18,6 +20,13 @@ import { makeDefaultTranscriptReader } from "../../src/registry/canonical-self-c
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeStartedOperator, TEST_OPERATOR_TOKEN, type Harness, type StartedOperator } from "../helpers/harness.ts";
 
+// Spies on `node:fs` while keeping every real implementation by default (`{ spy: true }`) — only
+// the one RED test below overrides `chmodSync`, and only for its own single call
+// (`mockImplementationOnce`, restored immediately after). Every other test in this file, and every
+// other `node:fs` call in this one, is untouched. Declared at module scope so vitest's own hoisting
+// applies — inside a `describe` callback it would not run before the imports it needs to intercept.
+vi.mock("node:fs", { spy: true });
+
 /**
  * #760 round 6 — the two rejection directions the CEO's ruling requires (requirement 4), plus
  * the mint method's explicit-boolean requirement (requirement 3) and the pure `peerPid !==
@@ -26,6 +35,18 @@ import { makeStartedOperator, TEST_OPERATOR_TOKEN, type Harness, type StartedOpe
  * value — so they live in their own, lighter file, separate from
  * `canonical-self-claim-listener-claim.test.ts`'s real-process end-to-end tests. See that file's
  * docstring for why the split itself matters here (`vitest.config.ts`'s `pool: "forks"` comment).
+ *
+ * #760 round 8 — what rounds 6 and 7 read as an unexplained, load-correlated 30-second hang in
+ * `startCanonicalSelfClaimListener` had nothing to do with load, the daemon, or the event loop: a
+ * state directory long enough pushed the joined socket path past Darwin's 104-byte `AF_UNIX`
+ * `sun_path` limit, `bind(2)` silently truncated it, and `listen()`'s callback then ran real,
+ * irreversible work (`chmodSync`) against a path the kernel never created — a throw with nothing
+ * downstream to catch it, so the promise never settled. Fixed at the source
+ * (`canonical-self-claim-listener.ts`): a byte-length check before any bind, and the `listen`
+ * callback's own body wrapped so a fault there rejects instead of hanging. This file's fixture
+ * helper (`tempRoot`) now verifies its own margin below instead of assuming a short prefix is
+ * enough, and the two tests in `describe("listener startup...")` below replace every round-7
+ * diagnostic test that used to live in this file.
  */
 
 const roots: string[] = [];
@@ -39,54 +60,30 @@ afterEach(async () => {
   cleanupTempDirs();
 });
 
+/**
+ * `/tmp` directly, never `os.tmpdir()`: on macOS, `TMPDIR` resolves to a long, per-user sandboxed
+ * path (`/var/folders/<hash>/<hash>/T/`, itself 50+ bytes on this host) that leaves almost no
+ * margin before a joined `AF_UNIX` socket path exceeds Darwin's 104-byte `sun_path` limit — the
+ * exact defect this file used to reproduce by accident (#760 round 8). `/tmp` is short and stable
+ * across hosts; the assertion below verifies the margin actually holds for this file's one fixed
+ * socket filename rather than assuming a short prefix is enough on every machine this ever runs on.
+ */
+const TEMP_BASE = "/tmp";
+const SHORT_PREFIX = "ascl-";
+
 const tempRoot = (): string => {
-  const dir = mkdtempSync(join(tmpdir(), "acp-claim-listener-methods-"));
+  const dir = mkdtempSync(join(TEMP_BASE, SHORT_PREFIX));
   roots.push(dir);
+  const socketPath = join(dir, CANONICAL_SELF_CLAIM_SOCKET_FILENAME);
+  const bytes = Buffer.byteLength(socketPath, "utf8");
+  if (bytes > MAX_SUN_PATH_BYTES) {
+    throw new Error(
+      `test fixture directory produces a socket path over the ${MAX_SUN_PATH_BYTES}-byte AF_UNIX ` +
+        `sun_path limit (${bytes} bytes): ${socketPath}`,
+    );
+  }
   return dir;
 };
-
-/**
- * Round 6 found `startCanonicalSelfClaimListener` occasionally not settling within a generous
- * bound when a real `Daemon` with its own already-live operator socket was in the same process.
- * That round's "environment syscall latency" explanation for it was checked directly (round 7)
- * and does not hold: a bare `listen()`+`chmodSync` with no daemon present is sub-millisecond, and
- * three other tests in this same file that never call `startCanonicalSelfClaimListener` complete
- * in ~100ms at the same moment the fourth — which does call it — exceeds this bound. The cause is
- * still open; see the diagnostic test below, which instruments the exact call to tell "the bind
- * itself is slow" apart from "the `listening` event is delivered late", rather than guessing.
- *
- * This wraps `startCanonicalSelfClaimListener`'s own promise, nothing inside it, with a named,
- * bounded deadline, and swallows the orphaned promise's eventual settlement so a run that hits
- * this produces one attributable failure ("listener startup exceeded Xs") instead of a generic
- * test timeout plus an unhandled `ENOENT` from a temp directory `afterEach` already deleted.
- */
-const withNamedTimeout = <T>(promise: Promise<T>, ms: number, label: string): Promise<T> =>
-  new Promise<T>((resolve, reject) => {
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      // Swallow the orphaned promise's eventual settlement (success or failure) — it is no
-      // longer this test's business once the named deadline below has already rejected, and an
-      // unhandled rejection here would just be this same finding reported a second time.
-      promise.catch(() => {});
-      reject(new Error(`${label} exceeded ${ms}ms — cause not yet identified, see the diagnostic test in this file`));
-    }, ms);
-    promise.then(
-      (value) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error: unknown) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        reject(error instanceof Error ? error : new Error(String(error)));
-      },
-    );
-  });
 
 let freshNonces = 0;
 const TEST_SESSION_UUID = "99999999-9999-4999-8999-999999999999";
@@ -94,6 +91,8 @@ const BUZZ_ACTOR_ID = "buzz:canonical-cto";
 const BUZZ_CHANNEL_ID = "channel:test-canonical";
 const PEER_PROTOCOL = "acp.operator/v1";
 const BUZZ_PURPOSE = "continuity:PRIMARY_CTO";
+const TRIVIAL_HANDLER = async (): Promise<Decision<unknown>> =>
+  ({ allowed: true, reasonCode: ReasonCode.OK, value: {} }) as unknown as Decision<unknown>;
 
 const operatorRequest = (
   socketPath: string,
@@ -255,12 +254,8 @@ const startClaimListener = async (
   cp: Harness["cp"],
   root: string,
 ): Promise<CanonicalSelfClaimListener> => {
-  const listener = await withNamedTimeout(
-    startCanonicalSelfClaimListener(daemon, tempRoot(), (peer, params) =>
-      executeCanonicalSelfClaimOperator(peer, params, depsFor(cp, root)),
-    ),
-    30_000,
-    "startCanonicalSelfClaimListener",
+  const listener = await startCanonicalSelfClaimListener(daemon, tempRoot(), (peer, params) =>
+    executeCanonicalSelfClaimOperator(peer, params, depsFor(cp, root)),
   );
   claimListeners.push(listener);
   return listener;
@@ -295,10 +290,7 @@ describe("actor.claimCanonicalCto — method-level rejections and the mint metho
 
     // The exact request/response exchange this test names, with an explicit, separately-bounded
     // assertion that the connection actually finishes closing (deterministic teardown), not only
-    // that a decision arrives. The occasional slow settlement measured in this suite is isolated
-    // to `startCanonicalSelfClaimListener` itself, called just above — see the diagnostic test
-    // below for direct instrumentation of that call; this exchange and its close have not
-    // reproduced a hang once the listener call above actually completes.
+    // that a decision arrives.
     const { decision: daemonStatus, closedWithinBudget } = await claimRequestWithTeardownAssertion(
       listener.socketPath,
       { method: "daemon.status", params: {} },
@@ -319,7 +311,7 @@ describe("actor.claimCanonicalCto — method-level rejections and the mint metho
       expect(ownerApprove.reasonCode).toBe(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED);
       expect(ownerApprove.message).toContain("actor.claimCanonicalCto");
     }
-  }, 60_000);
+  }, 30_000);
 
   it("the operator socket no longer dispatches actor.claimCanonicalCto", async () => {
     const started = await startMintOperator();
@@ -365,438 +357,148 @@ describe("actor.claimCanonicalCto — method-level rejections and the mint metho
   });
 });
 
-/**
- * Round 7's own honest result, ahead of the individual tests below: **not conclusively
- * separated**, and reported as such rather than as a confident finding either way.
- *
- * What is measured and solid: the event loop is not blocked during a slow settlement (150,563
- * `setImmediate` ticks recorded across one 20-second wait); the underlying socket file is never
- * created on disk during that same wait, meaning the `bind(2)` call itself — not event delivery —
- * is what does not complete; a bare, single `listen()` is sub-millisecond regardless of whether a
- * real daemon/operator socket is present, measured at loads 7.95, 37.66 and 42.29; every call
- * shaped like `startCanonicalSelfClaimListener` (real handler, trivial handler, stand-in daemon
- * object, or an inline copy using its exact socket filename and `chmodSync` call) took 20+ seconds
- * whenever measured, at loads 60–118.
- *
- * What is **not** separated: this host's own `uptime` load average climbed monotonically and
- * substantially over the course of this exact diagnostic session — 6 → 9 → 27 → 37 → 42 → 60 → 77
- * → 118 across roughly fifteen minutes of wall clock, driven by other work on this shared host,
- * not by anything this file does. Every fast measurement above was taken *earlier* in that climb
- * and every slow one *later*. A bare, no-daemon control taken at the same *current* extreme load
- * (~100+) was not obtained before this round's time budget ran out, so "a live operator socket is
- * the discriminator" and "this host was simply more loaded by the time each later test ran" remain
- * both consistent with every number recorded here. Reported as an open question rather than closed
- * either way — see the individual tests' own `ROUND7_DIAGNOSTIC*` stdout lines for the exact
- * figures a follow-up (run with `uptime` held low, or on a quieter host) would need to compare
- * against.
- */
-describe("round 7 diagnostic — bind latency vs. delayed listening-event delivery", () => {
-  /**
-   * Round 6's "environment syscall latency" explanation for the occasional slow settlement of
-   * `startCanonicalSelfClaimListener` was withdrawn: a bare `listen()`+`chmodSync` with no daemon
-   * present measures sub-millisecond, and three other tests in this file that never call
-   * `startCanonicalSelfClaimListener` complete in ~100ms at the moment the fourth exceeds a 30s
-   * bound. Loop starvation was also checked and withdrawn — a plain `setTimeout` fired on
-   * schedule while `listen()` alone stayed pending, so the loop was processing timers normally.
-   *
-   * This measures, rather than assumes, which of two different owners a slow settlement would
-   * belong to:
-   *
-   *   - **bind is slow**: the underlying `uv_pipe_bind`/`uv_listen` pair itself takes long to
-   *     return. Node sets `server.listening = true` synchronously, inside that same call stack,
-   *     before queuing the `'listening'` event on `process.nextTick` — so a fast poll of the
-   *     public `.listening` property that only flips true after a long delay is evidence the
-   *     syscall pair itself is what is slow.
-   *   - **the event is delivered late**: `.listening` flips true quickly (the syscalls returned),
-   *     but the queued `'listening'` event does not fire on the following tick the way
-   *     `process.nextTick` promises — evidence of a scheduling-level delay between "the OS says
-   *     this socket is bound" and "this process's JS heard about it", not the syscall pair itself.
-   *
-   * A tick counter, incrementing via a fresh `setImmediate` chain for the whole wait, is recorded
-   * alongside both timestamps as the same falsifiable evidence the coordinator's own withdrawn
-   * loop-starvation check used: if it stops counting, the loop is blocked; if it keeps counting
-   * while the `.listening` flag and the event both wait, the loop is idle-but-unresponsive to this
-   * one handle specifically, which is a third, more specific shape than either withdrawn guess.
-   */
+describe("listener startup — the AF_UNIX sun_path limit (#760 round 8)", () => {
+  it("a normal, under-limit socket path binds and closes cleanly", async () => {
+    const stateDir = tempRoot();
+    const socketPath = join(stateDir, CANONICAL_SELF_CLAIM_SOCKET_FILENAME);
+    expect(Buffer.byteLength(socketPath, "utf8")).toBeLessThan(MAX_SUN_PATH_BYTES + 1);
+
+    const listener = await startCanonicalSelfClaimListener({ lock: { held: () => true } }, stateDir, TRIVIAL_HANDLER);
+    expect(listener.socketPath).toBe(socketPath);
+    expect(existsSync(socketPath)).toBe(true);
+
+    await listener.close();
+    expect(existsSync(socketPath)).toBe(false);
+  });
+
   it(
-    "measures the real startCanonicalSelfClaimListener call against a real daemon with its own already-live operator socket",
+    "an overlong byte-length path is rejected before any bind, with no residue — a character-count check would wrongly allow it",
     async () => {
-      const started = await startMintOperator();
-      const { cp } = started.harness;
-      const root = tempRoot();
-      // The exact minimal counterexample the CEO named: `startMintOperator()` (a real daemon whose
-      // own operator socket is already bound and accepting) then `startCanonicalSelfClaimListener`
-      // — the real function, the real handler, no wrapper timeout — so this measures the exact
-      // call that has been slow, not a substitute for it.
-      const listenerStateDir = tempRoot();
-      const expectedSocketPath = join(listenerStateDir, "agentcpd.claim-canonical-cto.sock");
-      if (existsSync(expectedSocketPath)) unlinkSync(expectedSocketPath);
+      // "文" is 3 bytes in UTF-8 and exactly one UTF-16 code unit: 30 of them add 90 bytes but
+      // only 30 to `.length`. Combined with the fixed socket filename (ASCII, plus the path
+      // separator `join` inserts), the resulting path's *character count* stays comfortably under
+      // 104 while its *UTF-8 byte length* is well past the 103-byte limit — exactly the shape a
+      // `.length`-based check would wrongly let through and a byte-length check must refuse.
+      const overlongStateDir = join(TEMP_BASE, "文".repeat(30));
+      const overlongSocketPath = join(overlongStateDir, CANONICAL_SELF_CLAIM_SOCKET_FILENAME);
+      expect(overlongSocketPath.length, "test setup error: this path is not short in characters").toBeLessThan(104);
+      expect(
+        Buffer.byteLength(overlongSocketPath, "utf8"),
+        "test setup error: this path is not long in UTF-8 bytes",
+      ).toBeGreaterThan(MAX_SUN_PATH_BYTES);
 
-      let ticks = 0;
-      let tickHandle: NodeJS.Immediate | null = null;
-      const tick = (): void => {
-        ticks += 1;
-        tickHandle = setImmediate(tick);
-      };
-      tickHandle = setImmediate(tick);
+      await expect(
+        startCanonicalSelfClaimListener({ lock: { held: () => true } }, overlongStateDir, TRIVIAL_HANDLER),
+      ).rejects.toThrow(/sun_path/);
 
-      // An `AF_UNIX` bind creates the socket's filesystem entry as part of the same synchronous
-      // `bind()` libuv call `listen()` performs alongside it — before Node ever queues the
-      // `'listening'` event on `process.nextTick`. Polling for the file's existence from outside
-      // is therefore evidence of exactly the same moment `server.listening` would flip true
-      // internally, without touching `startCanonicalSelfClaimListener`'s own source to get it.
-      let fileAppearedAt: bigint | null = null;
-      let ticksAtFileAppeared: number | null = null;
-      const poll = setInterval(() => {
-        if (fileAppearedAt === null && existsSync(expectedSocketPath)) {
-          fileAppearedAt = process.hrtime.bigint();
-          ticksAtFileAppeared = ticks;
-        }
-      }, 1);
-      poll.unref?.();
-
-      const t0 = process.hrtime.bigint();
-      const rawPromise = startCanonicalSelfClaimListener(started.daemon, listenerStateDir, (peer, params) =>
-        executeCanonicalSelfClaimOperator(peer, params, depsFor(cp, root)),
-      );
-
-      let outcome: { kind: "resolved"; at: bigint; listener: CanonicalSelfClaimListener } | { kind: "error"; error: unknown };
-      try {
-        const deadlineMs = 20_000;
-        const listener = await Promise.race([
-          rawPromise,
-          new Promise<never>((_resolve, reject) => {
-            setTimeout(() => reject(new Error(`diagnostic: startCanonicalSelfClaimListener did not settle within ${deadlineMs}ms`)), deadlineMs);
-          }),
-        ]);
-        outcome = { kind: "resolved", at: process.hrtime.bigint(), listener };
-      } catch (error) {
-        outcome = { kind: "error", error };
-      }
-
-      clearInterval(poll);
-      if (tickHandle) clearImmediate(tickHandle);
-      // The real promise may still be pending after the race above lost to the deadline —
-      // swallow its eventual settlement so it does not surface as an unrelated unhandled
-      // rejection once this test has already reported its own finding.
-      rawPromise.catch(() => {});
-      rawPromise.then((listener) => { listener.close().catch(() => {}); }).catch(() => {});
-
-      const toMs = (t: bigint): number => Number(t - t0) / 1e6;
-      const evidence = {
-        outcome: outcome.kind,
-        socketFileAppearedMs: fileAppearedAt ? toMs(fileAppearedAt) : null,
-        promiseSettledMs: outcome.kind === "resolved" ? toMs(outcome.at) : null,
-        fileToPromiseSettleMs:
-          fileAppearedAt && outcome.kind === "resolved" ? Number(outcome.at - fileAppearedAt) / 1e6 : null,
-        ticksAtFileAppeared,
-        ticksTotal: ticks,
-      };
-      // Printed rather than only asserted: the numbers are the finding, and the next round needs
-      // them verbatim, not just a pass/fail.
-      process.stdout.write(`ROUND7_DIAGNOSTIC ${JSON.stringify(evidence)}\n`);
-
-      if (outcome.kind === "error") {
-        throw outcome.error instanceof Error ? outcome.error : new Error(String(outcome.error));
-      }
-      await outcome.listener.close();
-
-      // The loop must still be ticking throughout whenever the wait was long enough for a
-      // `setImmediate` to plausibly fire — if it stayed at 0 while the wait ran into double-digit
-      // milliseconds or more, the process was genuinely blocked and every other measurement here
-      // is meaningless. A sub-millisecond settlement legitimately never yields a single tick.
-      const waited = evidence.promiseSettledMs ?? 0;
-      if (waited > 5) {
-        expect(evidence.ticksTotal, `loop produced zero ticks across ${waited}ms — process was blocked`).toBeGreaterThan(0);
-      }
+      // No residue: rejected before `removeStaleSocket`/`createServer`/`listen()` ever ran, so
+      // there is nothing to have created — not even the directory itself.
+      expect(existsSync(overlongStateDir)).toBe(false);
+      expect(existsSync(overlongSocketPath)).toBe(false);
     },
-    25_000,
   );
+});
 
-  /**
-   * The same exact counterexample, with one variable changed: a trivial handler in place of the
-   * real `executeCanonicalSelfClaimOperator` closure. `startCanonicalSelfClaimListener` never
-   * calls its handler before a connection arrives — none did here — so this isolates whether the
-   * handler's own composition (which closes over the real `ControlPlane`'s `db`/`sessions`/
-   * `bindings`/`ownerAuthority`, a new `IngressGuard`, and `CanonicalSelfClaimConfig`) has any
-   * bearing on whether `listen()` itself settles, independent of anything the handler does when
-   * invoked.
-   */
+describe("the listen callback's own fault handling (#760 round 8)", () => {
+  const MODULE_PATH = join(process.cwd(), "src", "daemon", "canonical-self-claim-listener.ts");
+  // The real entry module, not `node_modules/.bin/vitest` — that shim is a `/bin/sh` script and
+  // `execFileSync(process.execPath, [thatShim, ...])` fails before any test runs at all, which
+  // would make the mutation look "killed" for the wrong reason.
+  const VITEST_ENTRY = join(process.cwd(), "node_modules", "vitest", "vitest.mjs");
+  const THIS_FILE = join(process.cwd(), "tests", "process", "canonical-self-claim-listener-methods.test.ts");
+  // No literal parentheses: on this node build, `vitest -t` compiles its argument as a RegExp,
+  // and a pattern containing literal `text (text)` fails to match that exact literal text.
+  const RED_TEST_FILTER = "rejects promptly instead of hanging";
+
   it(
-    "measures the same real startCanonicalSelfClaimListener call with a trivial handler instead",
+    "a fault inside the listen callback (chmodSync throwing) rejects promptly instead of hanging, with no residual handle or file",
     async () => {
-      const started = await startMintOperator();
-      const listenerStateDir = tempRoot();
-      const expectedSocketPath = join(listenerStateDir, "agentcpd.claim-canonical-cto.sock");
-      if (existsSync(expectedSocketPath)) unlinkSync(expectedSocketPath);
-
-      let ticks = 0;
-      let tickHandle: NodeJS.Immediate | null = null;
-      const tick = (): void => {
-        ticks += 1;
-        tickHandle = setImmediate(tick);
-      };
-      tickHandle = setImmediate(tick);
-
-      let fileAppearedAt: bigint | null = null;
-      const poll = setInterval(() => {
-        if (fileAppearedAt === null && existsSync(expectedSocketPath)) {
-          fileAppearedAt = process.hrtime.bigint();
-        }
-      }, 1);
-      poll.unref?.();
-
-      const t0 = process.hrtime.bigint();
-      const rawPromise = startCanonicalSelfClaimListener(
-        started.daemon,
-        listenerStateDir,
-        async () => ({ allowed: true, reasonCode: ReasonCode.OK, value: {} }) as unknown as Decision<unknown>,
-      );
-
-      let outcome: { kind: "resolved"; at: bigint; listener: CanonicalSelfClaimListener } | { kind: "error"; error: unknown };
-      try {
-        const deadlineMs = 20_000;
-        const listener = await Promise.race([
-          rawPromise,
-          new Promise<never>((_resolve, reject) => {
-            setTimeout(() => reject(new Error(`diagnostic: startCanonicalSelfClaimListener (trivial handler) did not settle within ${deadlineMs}ms`)), deadlineMs);
-          }),
-        ]);
-        outcome = { kind: "resolved", at: process.hrtime.bigint(), listener };
-      } catch (error) {
-        outcome = { kind: "error", error };
-      }
-
-      clearInterval(poll);
-      if (tickHandle) clearImmediate(tickHandle);
-      rawPromise.catch(() => {});
-      rawPromise.then((listener) => { listener.close().catch(() => {}); }).catch(() => {});
-
-      const toMs = (t: bigint): number => Number(t - t0) / 1e6;
-      const evidence = {
-        outcome: outcome.kind,
-        socketFileAppearedMs: fileAppearedAt ? toMs(fileAppearedAt) : null,
-        promiseSettledMs: outcome.kind === "resolved" ? toMs(outcome.at) : null,
-        ticksTotal: ticks,
-      };
-      process.stdout.write(`ROUND7_DIAGNOSTIC_TRIVIAL_HANDLER ${JSON.stringify(evidence)}\n`);
-
-      if (outcome.kind === "error") {
-        throw outcome.error instanceof Error ? outcome.error : new Error(String(outcome.error));
-      }
-      await outcome.listener.close();
-    },
-    25_000,
-  );
-
-  /**
-   * Same real daemon and its own already-live operator socket, same trivial handler — the one
-   * remaining variable is the `daemon` argument itself: a stand-in `{lock:{held:()=>true}}` object
-   * instead of `started.daemon`. `startCanonicalSelfClaimListener` never reads this argument
-   * before `listen()` settles either way, so if this one settles quickly while the identical call
-   * above (real `started.daemon`) does not, the discriminator is specifically *passing the real
-   * `Daemon` instance*, not "a real daemon merely existing somewhere in this process".
-   */
-  it(
-    "measures the same call with a stand-in daemon object, real operator socket still live",
-    async () => {
-      await startMintOperator();
-      const listenerStateDir = tempRoot();
-      const expectedSocketPath = join(listenerStateDir, "agentcpd.claim-canonical-cto.sock");
-      if (existsSync(expectedSocketPath)) unlinkSync(expectedSocketPath);
-
-      const t0 = process.hrtime.bigint();
-      const rawPromise = startCanonicalSelfClaimListener(
-        { lock: { held: () => true } },
-        listenerStateDir,
-        async () => ({ allowed: true, reasonCode: ReasonCode.OK, value: {} }) as unknown as Decision<unknown>,
-      );
-
-      let outcome: { kind: "resolved"; at: bigint; listener: CanonicalSelfClaimListener } | { kind: "error"; error: unknown };
-      try {
-        const deadlineMs = 20_000;
-        const listener = await Promise.race([
-          rawPromise,
-          new Promise<never>((_resolve, reject) => {
-            setTimeout(() => reject(new Error(`diagnostic: startCanonicalSelfClaimListener (stand-in daemon) did not settle within ${deadlineMs}ms`)), deadlineMs);
-          }),
-        ]);
-        outcome = { kind: "resolved", at: process.hrtime.bigint(), listener };
-      } catch (error) {
-        outcome = { kind: "error", error };
-      }
-      rawPromise.catch(() => {});
-      rawPromise.then((listener) => { listener.close().catch(() => {}); }).catch(() => {});
-
-      const evidence = {
-        outcome: outcome.kind,
-        promiseSettledMs: outcome.kind === "resolved" ? Number(outcome.at - t0) / 1e6 : null,
-      };
-      process.stdout.write(`ROUND7_DIAGNOSTIC_STANDIN_DAEMON ${JSON.stringify(evidence)}\n`);
-
-      if (outcome.kind === "error") {
-        throw outcome.error instanceof Error ? outcome.error : new Error(String(outcome.error));
-      }
-      await outcome.listener.close();
-    },
-    25_000,
-  );
-
-  /**
-   * The same stand-in-daemon call, structured exactly like the bare-`listen()` controls in this
-   * file: a direct `await`, no `Promise.race`, no separate deadline promise racing it. Every
-   * measurement above that hung used `Promise.race([rawPromise, timeoutPromise])`; every bare
-   * `net.createServer().listen()` control that stayed fast used a direct `await` instead. This
-   * isolates whether that structural difference — not `startCanonicalSelfClaimListener`'s own
-   * code — is what the previous measurements were actually observing.
-   */
-  it(
-    "measures the same stand-in-daemon call with a direct await, no Promise.race",
-    async () => {
-      await startMintOperator();
-      const listenerStateDir = tempRoot();
-      const expectedSocketPath = join(listenerStateDir, "agentcpd.claim-canonical-cto.sock");
-      if (existsSync(expectedSocketPath)) unlinkSync(expectedSocketPath);
-
-      const t0 = process.hrtime.bigint();
-      const listener = await startCanonicalSelfClaimListener(
-        { lock: { held: () => true } },
-        listenerStateDir,
-        async () => ({ allowed: true, reasonCode: ReasonCode.OK, value: {} }) as unknown as Decision<unknown>,
-      );
-      const elapsedMs = Number(process.hrtime.bigint() - t0) / 1e6;
-      process.stdout.write(`ROUND7_DIAGNOSTIC_DIRECT_AWAIT ${JSON.stringify({ elapsedMs })}\n`);
-      await listener.close();
-      expect(elapsedMs).toBeLessThan(20_000);
-    },
-    25_000,
-  );
-
-  /**
-   * The control the two measurements above need: no `makeStartedOperator()` at all, run
-   * immediately in the same file (same moment, same host state) — a bare `net.createServer()`
-   * listening on its own fresh Unix socket path, nothing else running. If this is also slow right
-   * now, the discriminator is this host's own load at the moment the test runs, not "a real
-   * operator socket already live in this process"; if it stays fast while the two tests above (run
-   * moments earlier, same file, same host) are not, the discriminator is the already-live socket.
-   */
-  it(
-    "control: bare listen() with no daemon at all, run at the same moment as the two measurements above",
-    async () => {
-      const listenerStateDir = tempRoot();
-      const socketPath = join(listenerStateDir, "bare-control.sock");
-      if (existsSync(socketPath)) unlinkSync(socketPath);
-
-      const t0 = process.hrtime.bigint();
-      const server = createServer(() => {});
-      await new Promise<void>((resolve, reject) => {
-        server.once("error", reject);
-        server.listen(socketPath, () => {
-          server.removeListener("error", reject);
-          resolve();
-        });
+      const stateDir = tempRoot();
+      const socketPath = join(stateDir, CANONICAL_SELF_CLAIM_SOCKET_FILENAME);
+      const chmod = vi.mocked(chmodSync);
+      chmod.mockImplementationOnce(() => {
+        throw new Error("simulated chmod failure — round 8 RED for the listen-callback wrapper");
       });
-      const elapsedMs = Number(process.hrtime.bigint() - t0) / 1e6;
-      process.stdout.write(`ROUND7_DIAGNOSTIC_BARE_CONTROL ${JSON.stringify({ elapsedMs })}\n`);
-      await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
-      if (existsSync(socketPath)) unlinkSync(socketPath);
-      expect(elapsedMs).toBeLessThan(20_000);
+
+      const t0 = Date.now();
+      let rejection: unknown;
+      try {
+        await startCanonicalSelfClaimListener({ lock: { held: () => true } }, stateDir, TRIVIAL_HANDLER);
+      } catch (error) {
+        rejection = error;
+      } finally {
+        chmod.mockRestore();
+      }
+      const elapsedMs = Date.now() - t0;
+
+      expect(rejection, "expected startCanonicalSelfClaimListener to reject, not hang").toBeInstanceOf(Error);
+      expect(String(rejection)).toContain("simulated chmod failure");
+      // Promptly, not a hang: this is the exact property that used to cost 30 seconds and read as
+      // a dead listener rather than a refusal.
+      expect(elapsedMs).toBeLessThan(5_000);
+      // No residual file: the fault-time cleanup unlinks whatever `bind()` created.
+      expect(existsSync(socketPath)).toBe(false);
+      // No residual handle: a fresh bind at the exact same path must succeed immediately — if the
+      // old handle were still listening, this would fail with `EADDRINUSE` instead.
+      const relisten = await startCanonicalSelfClaimListener({ lock: { held: () => true } }, stateDir, TRIVIAL_HANDLER);
+      await relisten.close();
     },
-    25_000,
+    15_000,
   );
 
-  /**
-   * The narrowest form of the counterexample: `startMintOperator()`, then a **bare**
-   * `net.createServer().listen()` on a fresh Unix socket path — none of this module's own code at
-   * all. If this is also slow, the ownership edge is "a second live `AF_UNIX`-listening
-   * `net.Server` in a process that already has one" as a general property of this host/Node
-   * combination, not anything specific to `startCanonicalSelfClaimListener`.
-   */
   it(
-    "control: bare second listen() (no startCanonicalSelfClaimListener at all) after a real operator socket is already live",
-    async () => {
-      await startMintOperator();
-      const listenerStateDir = tempRoot();
-      const socketPath = join(listenerStateDir, "bare-second.sock");
-      if (existsSync(socketPath)) unlinkSync(socketPath);
-
-      const t0 = process.hrtime.bigint();
-      const server = createServer(() => {});
-      let outcome: { kind: "resolved" } | { kind: "error"; error: unknown };
-      try {
-        await new Promise<void>((resolve, reject) => {
-          server.once("error", reject);
-          const deadline = setTimeout(() => reject(new Error("bare second listen() did not settle within 20000ms")), 20_000);
-          server.listen(socketPath, () => {
-            clearTimeout(deadline);
-            server.removeListener("error", reject);
-            resolve();
+    "the RED above is killed by removing the try/catch around chmodSync — restoring the exact hang this round found",
+    () => {
+      const original = readFileSync(MODULE_PATH, "utf8");
+      const guarded = `      server.listen(socketPath, () => {
+        server.removeListener("error", reject);
+        try {
+          chmodSync(socketPath, 0o600);
+        } catch (err) {
+          // A throw inside this callback is not inside the promise executor's own call stack —
+          // nothing here would otherwise catch it, and the promise above would never settle
+          // (found the hard way: this is exactly what read as a 30-second hang). Bounded-close
+          // the handle this call already opened, then reject — so a callback fault becomes a
+          // refusal, never a wait with no answer.
+          void boundedClose(server).then(() => {
+            reject(err instanceof Error ? err : new Error(String(err)));
           });
-        });
-        outcome = { kind: "resolved" };
-      } catch (error) {
-        outcome = { kind: "error", error };
-      }
-      const elapsedMs = Number(process.hrtime.bigint() - t0) / 1e6;
-      process.stdout.write(`ROUND7_DIAGNOSTIC_BARE_SECOND ${JSON.stringify({ outcome: outcome.kind, elapsedMs })}\n`);
+          return;
+        }
+        resolveListen();
+      });`;
+      const unguarded = `      server.listen(socketPath, () => {
+        server.removeListener("error", reject);
+        chmodSync(socketPath, 0o600);
+        resolveListen();
+      });`;
+      expect(original, "the guarded block was not found verbatim — this mutation is stale").toContain(guarded);
+      const mutated = original.replace(guarded, unguarded);
+      expect(mutated, "mutation did not change anything — the target string was not found").not.toBe(original);
 
-      try { server.close(); } catch { /* may already be unusable */ }
-      if (existsSync(socketPath)) unlinkSync(socketPath);
-
-      if (outcome.kind === "error") {
-        throw outcome.error instanceof Error ? outcome.error : new Error(String(outcome.error));
-      }
-    },
-    25_000,
-  );
-
-  /**
-   * The bare control above, byte-for-byte closer to `startCanonicalSelfClaimListener`'s own body:
-   * the exact same socket filename (`agentcpd.claim-canonical-cto.sock`) and a `chmodSync` call
-   * inside the `listen()` callback, in the same position. Everything else this module's real
-   * function does (`removeStaleSocket`, the exported `async` wrapper, the returned `close`
-   * object) is still absent. If this reproduces the hang, the remaining difference from the
-   * bare-second control is one of these two; if it stays fast, the cause is specifically in
-   * `startCanonicalSelfClaimListener`'s own wrapper (its `async` function shape, its default
-   * parameter, or its `try`/`catch`), not the filename or `chmodSync`.
-   */
-  it(
-    "control: bare listen() using the exact socket filename and chmodSync call this module uses",
-    async () => {
-      await startMintOperator();
-      const listenerStateDir = tempRoot();
-      const socketPath = join(listenerStateDir, "agentcpd.claim-canonical-cto.sock");
-      if (existsSync(socketPath)) unlinkSync(socketPath);
-
-      const t0 = process.hrtime.bigint();
-      const server = createServer(() => {});
-      let outcome: { kind: "resolved" } | { kind: "error"; error: unknown };
+      writeFileSync(MODULE_PATH, mutated);
+      let mutatedFailed = false;
       try {
-        await new Promise<void>((resolve, reject) => {
-          server.once("error", reject);
-          const deadline = setTimeout(() => reject(new Error("did not settle within 20000ms")), 20_000);
-          server.listen(socketPath, () => {
-            clearTimeout(deadline);
-            server.removeListener("error", reject);
-            chmodSync(socketPath, 0o600);
-            resolve();
-          });
-        });
-        outcome = { kind: "resolved" };
-      } catch (error) {
-        outcome = { kind: "error", error };
+        execFileSync(
+          process.execPath,
+          [VITEST_ENTRY, "run", THIS_FILE, "-t", RED_TEST_FILTER],
+          { cwd: process.cwd(), encoding: "utf8", stdio: "pipe", timeout: 90_000 },
+        );
+      } catch {
+        mutatedFailed = true;
+      } finally {
+        writeFileSync(MODULE_PATH, original);
       }
-      const elapsedMs = Number(process.hrtime.bigint() - t0) / 1e6;
-      process.stdout.write(`ROUND7_DIAGNOSTIC_EXACT_SHAPE ${JSON.stringify({ outcome: outcome.kind, elapsedMs })}\n`);
+      expect(mutatedFailed, "removing the try/catch wrapper did not kill the RED test").toBe(true);
 
-      try { server.close(); } catch { /* may already be unusable */ }
-      if (existsSync(socketPath)) unlinkSync(socketPath);
-
-      if (outcome.kind === "error") {
-        throw outcome.error instanceof Error ? outcome.error : new Error(String(outcome.error));
-      }
+      // Restored: the RED test must be green again on the unmutated source.
+      execFileSync(
+        process.execPath,
+        [VITEST_ENTRY, "run", THIS_FILE, "-t", RED_TEST_FILTER],
+        { cwd: process.cwd(), encoding: "utf8", stdio: "pipe", timeout: 90_000 },
+      );
     },
-    25_000,
+    120_000,
   );
 });
 

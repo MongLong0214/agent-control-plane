@@ -37,6 +37,24 @@ import { readOneJsonLineRequest } from "./local-socket-framing.ts";
 
 export const CANONICAL_SELF_CLAIM_METHOD = "actor.claimCanonicalCto";
 
+/** The one filename this listener ever binds; exported so a caller can size a `stateDir` against it. */
+export const CANONICAL_SELF_CLAIM_SOCKET_FILENAME = "agentcpd.claim-canonical-cto.sock";
+
+/**
+ * `sizeof(struct sockaddr_un.sun_path)` on Darwin is 104 bytes, and that array holds the path plus
+ * its NUL terminator — the terminator is not optional and is not this code's to omit, so 103 is
+ * the last usable byte for the path string itself. Found the hard way (#760 round 8): a state
+ * directory long enough to push the joined socket path past this limit makes `bind(2)` silently
+ * truncate at `sun_path`, so the path this process asks for is never the path the kernel creates —
+ * `listen()`'s callback then does real, irreversible work (`chmodSync`) against a file that does
+ * not exist, and every symptom downstream of that (the promise never settling, a "hang" that
+ * "resolves" only when an outer test timeout fires) traces back to this one byte count, not to
+ * anything about scheduling, the daemon, or load. Checked here, before `removeStaleSocket` and
+ * before `createServer` ever run, so an overlong path is refused as a name it cannot use rather
+ * than accepted and left to fail invisibly deeper in the call.
+ */
+export const MAX_SUN_PATH_BYTES = 103;
+
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_LINE_BYTES = 1024 * 1024;
 
@@ -131,6 +149,34 @@ const removeStaleSocket = (path: string): void => {
 const closeSocketServer = (server: Server): Promise<void> =>
   new Promise((resolveClose, reject) => {
     server.close((err) => (err ? reject(err) : resolveClose()));
+  });
+
+/**
+ * Cleanup for a handle this call already opened, after a fault this call caused — never the
+ * caller's own failure to report, so it never rejects on its own account, and it never waits
+ * indefinitely for a `close` that a fault-time handle has no particular reason to still deliver
+ * promptly. `boundMs` is a ceiling on this cleanup attempt alone; the fault that triggered it is
+ * reported by the caller once this settles, not by this function.
+ */
+const boundedClose = (server: Server, boundMs = 5_000): Promise<void> =>
+  new Promise<void>((resolveClose) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      resolveClose();
+    };
+    const timer = setTimeout(finish, boundMs);
+    timer.unref?.();
+    try {
+      server.close(() => {
+        clearTimeout(timer);
+        finish();
+      });
+    } catch {
+      clearTimeout(timer);
+      finish();
+    }
   });
 
 const serveCanonicalSelfClaimConnection = (
@@ -229,7 +275,19 @@ export const startCanonicalSelfClaimListener = async (
   if (!Number.isInteger(requestTimeoutMs) || requestTimeoutMs <= 0) {
     throw new Error("canonical self-claim request timeout must be a positive integer");
   }
-  const socketPath = join(stateDir, "agentcpd.claim-canonical-cto.sock");
+  const socketPath = join(stateDir, CANONICAL_SELF_CLAIM_SOCKET_FILENAME);
+  // Byte length, never `.length` (UTF-16 code units): a path can carry characters whose UTF-8
+  // encoding is wider than one code unit, and `sun_path` is a byte buffer the kernel copies into,
+  // not a character count. Checked before `removeStaleSocket` and before `createServer` — nothing
+  // here has touched the filesystem or opened a handle yet, so a rejection at this line leaves
+  // nothing to clean up.
+  const socketPathBytes = Buffer.byteLength(socketPath, "utf8");
+  if (socketPathBytes > MAX_SUN_PATH_BYTES) {
+    throw new Error(
+      `canonical self-claim socket path exceeds the platform AF_UNIX sun_path limit ` +
+        `(${socketPathBytes} bytes, max ${MAX_SUN_PATH_BYTES}): ${socketPath}`,
+    );
+  }
   removeStaleSocket(socketPath);
   const server = createServer((socket) =>
     serveCanonicalSelfClaimConnection(socket, daemon, handler, requestTimeoutMs),
@@ -239,7 +297,19 @@ export const startCanonicalSelfClaimListener = async (
       server.once("error", reject);
       server.listen(socketPath, () => {
         server.removeListener("error", reject);
-        chmodSync(socketPath, 0o600);
+        try {
+          chmodSync(socketPath, 0o600);
+        } catch (err) {
+          // A throw inside this callback is not inside the promise executor's own call stack —
+          // nothing here would otherwise catch it, and the promise above would never settle
+          // (found the hard way: this is exactly what read as a 30-second hang). Bounded-close
+          // the handle this call already opened, then reject — so a callback fault becomes a
+          // refusal, never a wait with no answer.
+          void boundedClose(server).then(() => {
+            reject(err instanceof Error ? err : new Error(String(err)));
+          });
+          return;
+        }
         resolveListen();
       });
     });

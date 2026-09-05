@@ -1,11 +1,15 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { OPERATOR_METHOD, type Daemon } from "../../src/daemon/daemon.ts";
-import { startCanonicalSelfClaimListener, type CanonicalSelfClaimListener } from "../../src/daemon/canonical-self-claim-listener.ts";
+import {
+  startCanonicalSelfClaimListener,
+  CANONICAL_SELF_CLAIM_SOCKET_FILENAME,
+  MAX_SUN_PATH_BYTES,
+  type CanonicalSelfClaimListener,
+} from "../../src/daemon/canonical-self-claim-listener.ts";
 import {
   executeCanonicalSelfClaimOperator,
   type CanonicalSelfClaimOperatorDeps,
@@ -60,9 +64,26 @@ afterEach(async () => {
   cleanupTempDirs();
 });
 
+/**
+ * `/tmp` directly, never `os.tmpdir()`: on macOS, `TMPDIR` resolves to a long, per-user sandboxed
+ * path (`/var/folders/<hash>/<hash>/T/`, itself 50+ bytes on this host) that leaves almost no
+ * margin before a joined `AF_UNIX` socket path exceeds Darwin's 104-byte `sun_path` limit — the
+ * root cause behind what round 6/7 misread as a load-correlated hang in
+ * `startCanonicalSelfClaimListener` (#760 round 8). `/tmp` is short and stable across hosts; the
+ * assertion below verifies the margin actually holds for this file's one fixed socket filename
+ * rather than assuming a short prefix is enough on every machine this ever runs on.
+ */
 const tempRoot = (): string => {
-  const dir = mkdtempSync(join(tmpdir(), "acp-claim-listener-"));
+  const dir = mkdtempSync(join("/tmp", "ascl-"));
   roots.push(dir);
+  const socketPath = join(dir, CANONICAL_SELF_CLAIM_SOCKET_FILENAME);
+  const bytes = Buffer.byteLength(socketPath, "utf8");
+  if (bytes > MAX_SUN_PATH_BYTES) {
+    throw new Error(
+      `test fixture directory produces a socket path over the ${MAX_SUN_PATH_BYTES}-byte AF_UNIX ` +
+        `sun_path limit (${bytes} bytes): ${socketPath}`,
+    );
+  }
   return dir;
 };
 
