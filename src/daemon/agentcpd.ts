@@ -685,9 +685,26 @@ export const startBuzzMessageIngressListener = async (
         kind: MessageKind.OWNER_MESSAGE,
         payload: input.pointer,
       });
-      return enqueued.allowed
-        ? allow(enqueued.reasonCode, { messageId: enqueued.value.messageId })
-        : (enqueued as Decision<{ messageId: string }>);
+      if (!enqueued.allowed) return enqueued as Decision<{ messageId: string }>;
+      // Suppression is a *replay* answer, and on this path it can only be reached by a redelivery
+      // whose ingress row is gone: `admit` refuses a live `(buzz, nonce)` slot as a replay long
+      // before anything reaches here, and `IngressGuard.prune` keeps that slot alive for as long as
+      // its turn claim is unresolved. So the row this hands back is one whose claim has already
+      // been resolved and pruned — 24 hours and one settled turn ago.
+      //
+      // Returning it would be the fourth way an owner loses a message: outbox rows are never
+      // pruned, so the caller would be handed a terminal row's id, told "Stored for the role", and
+      // a *fresh* turn claim would be attached to an outbox row nothing can ever settle. Refusing
+      // rolls the whole admission back, which leaves no spent nonce and no claim — the relay is
+      // told plainly that this event id is spent rather than being told it was queued.
+      if (enqueued.reasonCode === ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED) {
+        return deny(
+          ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED,
+          "this event id already has an owner-message row, so nothing new was queued for it",
+          { messageId: enqueued.value.messageId, status: enqueued.value.status },
+        );
+      }
+      return allow(enqueued.reasonCode, { messageId: enqueued.value.messageId });
     },
     wakeRole: async (roleKey) =>
       roleConversation
@@ -2015,16 +2032,14 @@ export const deliverAsCeoTurn = async (
  * database and an ingress guard at once — and because the alternative, letting `RoleConversationPort`
  * reach for them itself, would give a transport port database authority it has no business having.
  *
- * The `IngressGuard` constructed here carries **no channel policy at all**, and that is the point
- * rather than an oversight: the only method used is `completeNoReplyAndResolveTurn`, the existing
- * no-reply terminal path, which reads nothing but the database and the clock. With an empty policy
- * map this handle can admit nothing, sign nothing and refuse nothing — it cannot become a second
- * admission authority beside the one `startBuzzMessageIngressListener` owns. The row in
- * `inbound_messages` is the authority either way; this is a caller of the transition, not a second
- * definition of it.
+ * The ingress settlement is **not** here. `Outbox.completeForHolder` and `Outbox.rejectForHolder`
+ * close the source claim inside their own transactions, and they are the single enforcement site
+ * because they are the only one every caller passes through — the ledger below is one of five, next
+ * to a fence sweep, a takeover, a revoke and the claim-path refusal. A copy here would be a second
+ * site that reports coverage it does not independently have: it would settle the two transitions
+ * the outbox already settles, and none of the three it does not.
  */
 export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
-  const settlement = new IngressGuard(cp.db, cp.clock, cp.audit, {});
   /** The pointer on one owner-message row, or a denial naming what is wrong with it. */
   const pointerOn = (messageId: string) => {
     const row = cp.outbox.get(messageId);
@@ -2060,8 +2075,9 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
      * `txDecision`: the denial must commit, or the row would silently return to `PENDING` and be
      * served again with the same broken source forever.
      */
-    claim: (holder: HolderIdentity): Decision<OwnerMessageHandover> =>
-      cp.db.tx((): Decision<OwnerMessageHandover> => {
+    claim: (holder: HolderIdentity): Decision<OwnerMessageHandover> => {
+      try {
+      return cp.db.tx((): Decision<OwnerMessageHandover> => {
         const taken = cp.outbox.claimForHolder(holder);
         const unresolved = taken.unresolved;
         const message = taken.claimed[0];
@@ -2072,7 +2088,18 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
           return allow(ReasonCode.OK, { claimed: null, unresolved, hasMore: taken.hasMore });
         }
         const refuseClaimed = (reasonCode: ReasonCode, why: string): Decision<OwnerMessageHandover> => {
-          cp.outbox.rejectForHolder(message.messageId, holder);
+          const burned = cp.outbox.rejectForHolder(message.messageId, holder);
+          // The reject and the settlement of the ingress claim it closes are one transition inside
+          // `rejectForHolder`, and its `Decision` is the only report that both halves landed.
+          // Discarding it was the fifth loss: the row went terminal, the claim stayed unresolved,
+          // and the caller was handed this branch's refusal as if the burn had been clean.
+          //
+          // A refusal there cannot be *returned* from here, because the outer frame is `tx` and a
+          // returned denial commits — which is exactly what the burn needs and exactly what half a
+          // burn must not get. So it is thrown, the whole claim rolls back, and the row stays
+          // `PENDING` with its claim untouched: a state a person can still act on, unlike a
+          // terminal row holding a nonce forever.
+          if (!burned.allowed) throw rollingBackClaim(burned);
           return deny(reasonCode, why, { messageId: message.messageId });
         };
         const pointer = ownerMessagePointerOf(message.payload);
@@ -2125,7 +2152,13 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
           unresolved,
           hasMore: taken.hasMore,
         });
-      }),
+      });
+      } catch (err) {
+        const rolledBack = rolledBackClaim(err);
+        if (rolledBack) return rolledBack;
+        throw err;
+      }
+    },
 
     /**
      * §6 — the outbox row and the ingress claim close together, or neither closes.
@@ -2134,31 +2167,49 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
      * to `ACKED` beside an ingress claim still reading unresolved is exactly the split state that
      * makes `prune` and `unresolvedTurns` disagree about whether a turn finished.
      *
-     * The ingress side goes through `completeNoReplyAndResolveTurn` and nothing else. `resolveTurn`
-     * would write `repliedAt`, which is the narrow claim that *a reply transport accepted bytes* —
-     * nothing here handed a reply to any transport, and asserting it would tell every later reader
-     * that the owner has an answer they never received.
+     * Both halves happen inside `Outbox.completeForHolder`, which is the single site every caller
+     * of that transition passes through. What this frame adds is the *shape* check the outbox does
+     * not do: that the id names an owner-message carrying a readable pointer at all, so a caller
+     * naming some other row's id is refused before anything moves.
      */
     complete: (messageId: string, holder: HolderIdentity): Decision<void> =>
       cp.db.txDecision((): Decision<void> => {
-        const { pointer, refusal } = pointerOn(messageId);
-        if (!pointer) return refusal;
-        const settled = cp.outbox.completeForHolder(messageId, holder);
-        if (!settled.allowed) return settled;
-        return settlement.completeNoReplyAndResolveTurn(pointer.sourceChannel, pointer.sourceNonce);
+        const { refusal } = pointerOn(messageId);
+        if (refusal) return refusal;
+        return cp.outbox.completeForHolder(messageId, holder);
       }),
 
     /** The same two ledgers, the same transaction, for a holder that refuses the message. */
     reject: (messageId: string, holder: HolderIdentity): Decision<void> =>
       cp.db.txDecision((): Decision<void> => {
-        const { pointer, refusal } = pointerOn(messageId);
-        if (!pointer) return refusal;
-        const settled = cp.outbox.rejectForHolder(messageId, holder);
-        if (!settled.allowed) return settled;
-        return settlement.completeNoReplyAndResolveTurn(pointer.sourceChannel, pointer.sourceNonce);
+        const { refusal } = pointerOn(messageId);
+        if (refusal) return refusal;
+        return cp.outbox.rejectForHolder(messageId, holder);
       }),
   };
 };
+
+/**
+ * The claim path's rollback signal, thrown to undo a hand-over whose burn could not complete.
+ *
+ * A thrown object rather than a denied return, because `ownerMessageLedger.claim`'s frame is
+ * `db.tx` and a *returned* denial there commits — which is what the ordinary source refusals need
+ * (the row must stay burned) and what half a burn must not get. Deliberately not an `Error`:
+ * `Db.translate` inspects an `Error`'s message for SQLite constraint text and would rewrite one
+ * that happened to contain it, so the signal is a plain object that passes through untouched. The
+ * same shape, and the same reasoning, as `admitBuzzMessage`'s.
+ */
+const CLAIM_ROLLBACK = Symbol("owner-message-claim-rollback");
+interface ClaimRollback {
+  readonly [CLAIM_ROLLBACK]: Decision<never>;
+}
+const rollingBackClaim = (decision: Decision<unknown>): ClaimRollback => ({
+  [CLAIM_ROLLBACK]: decision as Decision<never>,
+});
+const rolledBackClaim = (err: unknown): Decision<never> | null =>
+  typeof err === "object" && err !== null && CLAIM_ROLLBACK in err
+    ? (err as ClaimRollback)[CLAIM_ROLLBACK]
+    : null;
 
 /**
  * Exported for test: these sentences are the only thing the owner sees when the CEO route

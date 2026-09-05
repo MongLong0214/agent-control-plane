@@ -473,4 +473,156 @@ describe("an owner's message has exactly one durable copy, and admission produce
       await listener.close();
     }
   }, 30_000);
+
+  /**
+   * §5's refusal path is a terminal transition, so it settles the claim it burns — and it does so
+   * without consulting the pointer, because the pointer is the thing that just failed.
+   *
+   * The row is entered with a payload that is not a readable pointer at all, which is the strongest
+   * form of the case: any settlement that read `sourceNonce` off the outbox row would have nothing
+   * to read. The claim is found the other way round — `turn_claim_json.turnRequestId` **is** the
+   * outbox message id, so the outbox row can always name the claim it is holding open.
+   *
+   * Without this the row ends `REJECTED` while its claim carries no `repliedAt`, no `noReplyAt` and
+   * no `settledAt`: permanently exempt from `prune`, its `(buzz, nonce)` slot never freed, and the
+   * turn reported outstanding forever by a row nothing will ever settle.
+   */
+  it("settles the ingress claim it burns when the claimed row's source cannot be read", async () => {
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+    const session = readyBoundSession(harness, "cto-unreadable", [projectId]);
+
+    const roleConversation = roleConversationFor(harness);
+    roleConversation.attach(fakeRolePeer(), stillHeldBy(session));
+    const listener = await startBuzzMessageIngressListener(
+      harness.cp,
+      tempDir("acp-owner-message-"),
+      { allowedActors: RELAY_ACTORS, secret: SECRET },
+      { ceoConversation: new CeoConversationPort(), ownerActors: [OWNER], roleConversation },
+    );
+
+    try {
+      expect(
+        JSON.parse(
+          (
+            await exchangeSocketLine(
+              listener.socketPath,
+              envelope({ eventId: "evt-unreadable", text: "읽을 수 없게 될 문장" }),
+            )
+          ).trim(),
+        ),
+      ).toMatchObject({ ok: true });
+
+      const target = outboxRows(harness)[0]!;
+      // The claim is outstanding, which is what keeps `prune` off the one durable copy.
+      const before = JSON.parse(inboundRow(harness, "evt-unreadable")!.turn_claim_json!) as {
+        turnRequestId: string;
+        noReplyAt?: unknown;
+      };
+      expect(before.turnRequestId).toBe(target.message_id);
+      expect(before.noReplyAt).toBeUndefined();
+
+      // Not a pointer at all — the malformed end of the same refusal family as a mismatched digest.
+      harness.cp.db.run(`UPDATE outbox SET payload_json = ? WHERE message_id = ?`, [
+        JSON.stringify({}),
+        target.message_id,
+      ]);
+
+      const binding = harness.cp.bindings.active(roleKey)!;
+      const claimed = ownerMessageLedger(harness.cp).claim({
+        roleKey,
+        bindingGeneration: binding.bindingGeneration,
+        targetSessionId: binding.sessionId,
+        sessionIncarnation: binding.sessionIncarnation,
+      });
+      expect(claimed.allowed).toBe(false);
+      expect(claimed.reasonCode).toBe(ReasonCode.OUTBOX_PAYLOAD_DIGEST_MISMATCH);
+      expect(
+        outboxRows(harness).find((row) => row.message_id === target.message_id)?.status,
+      ).toBe("REJECTED");
+
+      // Both halves committed together: the burned row and the claim it was holding open.
+      const after = JSON.parse(inboundRow(harness, "evt-unreadable")!.turn_claim_json!) as {
+        repliedAt?: unknown;
+        noReplyAt?: unknown;
+      };
+      expect(after.noReplyAt).toEqual(expect.any(String));
+      expect(after.repliedAt).toBeUndefined();
+    } finally {
+      await listener.close();
+    }
+  }, 30_000);
+
+  /**
+   * An idempotency key whose row is already terminal must not read as a fresh queued success.
+   *
+   * Outbox rows are never pruned; inbound rows are, 24 hours after their claim resolves. So a
+   * redelivery of a settled event finds no inbound row, is admitted as new, and meets an
+   * `owner-message:<nonce>` key whose row is `ACKED`. `enqueue`'s duplicate suppression hands that
+   * old row straight back, the owner is told "Stored for the role", and a fresh turn claim is
+   * attached to a terminal outbox row that nothing can ever settle — the third way a `(buzz, nonce)`
+   * slot is held open forever.
+   *
+   * The refusal has to leave nothing behind: no inbound row, no claim, and no second outbox row.
+   */
+  it("refuses a redelivery whose idempotency key already belongs to a settled row", async () => {
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+    const session = readyBoundSession(harness, "cto-reused", [projectId]);
+
+    const roleConversation = roleConversationFor(harness);
+    roleConversation.attach(fakeRolePeer(), stillHeldBy(session));
+    const listener = await startBuzzMessageIngressListener(
+      harness.cp,
+      tempDir("acp-owner-message-"),
+      { allowedActors: RELAY_ACTORS, secret: SECRET },
+      { ceoConversation: new CeoConversationPort(), ownerActors: [OWNER], roleConversation },
+    );
+
+    const sent = envelope({ eventId: "evt-reused", text: "한 번만 전달된다" });
+    try {
+      expect(JSON.parse((await exchangeSocketLine(listener.socketPath, sent)).trim())).toMatchObject(
+        { ok: true },
+      );
+
+      const binding = harness.cp.bindings.active(roleKey)!;
+      const holder = {
+        roleKey,
+        bindingGeneration: binding.bindingGeneration,
+        targetSessionId: binding.sessionId,
+        sessionIncarnation: binding.sessionIncarnation,
+      };
+      const ledger = ownerMessageLedger(harness.cp);
+      const taken = ledger.claim(holder);
+      expect(taken.allowed).toBe(true);
+      if (!taken.allowed) return;
+      const messageId = taken.value.claimed!.messageId;
+      expect(ledger.complete(messageId, holder).allowed).toBe(true);
+      expect(harness.cp.outbox.get(messageId)?.status).toBe("ACKED");
+
+      // The 24-hour prune: the claim is resolved, so the inbound row is deleted and its nonce is
+      // free again. The outbox row is not pruned and keeps the idempotency key forever.
+      harness.cp.db.run(`DELETE FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`, [
+        buzzMessageNonce("evt-reused"),
+      ]);
+      expect(inboundRow(harness, "evt-reused")).toBeNull();
+
+      // The relay sends the same event again. Nothing may be queued, and nothing may look queued.
+      const replayed = JSON.parse(
+        (await exchangeSocketLine(listener.socketPath, sent)).trim(),
+      ) as { ok: boolean; answer?: string };
+      expect(replayed.ok).toBe(false);
+      expect(replayed.answer ?? "").not.toContain("Stored for the role");
+
+      // Nothing half-admitted, and no second row: the terminal one is still the only one.
+      expect(inboundRow(harness, "evt-reused")).toBeNull();
+      const rows = outboxRows(harness);
+      expect(rows.map((row) => row.message_id)).toEqual([messageId]);
+      expect(rows[0]!.status).toBe("ACKED");
+    } finally {
+      await listener.close();
+    }
+  }, 30_000);
 });

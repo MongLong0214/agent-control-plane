@@ -664,13 +664,24 @@ const queuedForRole = async (
  * Every sentence says the same two things — it is stored, and nobody has read it — because that is
  * all this seam observed. `null` means the wake landed, which still is not a read: the holder was
  * told to look, and whether it looked is its business and not something this path can see.
+ *
+ * What none of them may say is *who* will take it beyond that. "The next holder to attach takes
+ * it" was an impossible promise on two counts, and both are facts about the row rather than about
+ * the wake. A message is only ever enqueued against an **active** binding — `admitBuzzMessage`
+ * rolls the whole admission back with `ROLE_PEER_ABSENT` when there is none — so a stored message
+ * is never in the "between holders" state that sentence described. And the row it produces is
+ * addressed to that holder's exact generation and session: it reaches a *successor* only through a
+ * takeover retargeting it, and reaches nobody at all if the role is revoked instead.
+ *
+ * A wake refusal says nothing about any of that. `ROLE_PEER_ABSENT` here means the holder
+ * registered no live peer to nudge — not that the role has no holder.
  */
 export const ownerMessageQueuedSentence = (wakeRefusal: string | null): string => {
   if (wakeRefusal === null) {
     return "Stored for the role and its holder was woken. Nobody has read it yet; the holder takes it over its own connection.";
   }
   if (wakeRefusal === ReasonCode.ROLE_PEER_ABSENT || wakeRefusal === ReasonCode.ROLE_PEER_STALE) {
-    return "Stored for the role. Nobody is attached to wake right now — the role may be between holders — and the next holder to attach takes it.";
+    return "Stored for the role. Nobody is attached to wake right now, so its holder takes it over its own connection whenever it next attaches — or whoever takes the role over from it does.";
   }
   if (wakeRefusal === ReasonCode.ROLE_PEER_UNSUPPORTED) {
     return "Stored for the role. Its holder has registered no wake endpoint, so it was not nudged; it takes the message the next time it looks.";

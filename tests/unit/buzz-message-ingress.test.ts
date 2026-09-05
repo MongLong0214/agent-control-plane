@@ -24,6 +24,7 @@ import {
   BuzzMessageIngress,
   buzzMessageNonce,
   buzzMessageSigningRequest,
+  ownerMessageQueuedSentence,
   type BuzzMentionRouter,
 } from "../../src/ingress/buzz-message.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
@@ -1323,5 +1324,48 @@ describe("the daemon's Buzz message ingress", () => {
     // No buzz owner declared is not "any buzz actor"; `main` reads this empty and leaves the
     // message socket closed.
     expect(configuredBuzzMessageOwnerActors([{ channel: "telegram", actor: "12345" }])).toEqual([]);
+  });
+
+  /**
+   * The owner is told only what the holder lifecycle can actually keep.
+   *
+   * "The next holder to attach takes it" was an impossible promise on two counts, and both are
+   * facts about the row rather than about the wake. A message is only ever enqueued against an
+   * *active* binding — `admitBuzzMessage` rolls the whole admission back with `ROLE_PEER_ABSENT`
+   * when there is none — so a stored message is never in the "between holders" state the sentence
+   * described. And the row it produces is addressed to that holder's exact generation and session:
+   * it reaches a *successor* only through a takeover retargeting it, and reaches nobody at all if
+   * the role is revoked instead.
+   *
+   * A wake refusal says nothing about any of that. `ROLE_PEER_ABSENT` here means the holder
+   * registered no live peer to nudge — not that the role has no holder.
+   *
+   * The behavioural half of this — that a takeover really does carry the queued message to the
+   * successor, and that a revoke really does close it — is measured in
+   * `outbox-owner-message-holder.test.ts`. What is measured here is that no sentence claims more
+   * than that.
+   */
+  it("tells the owner what is stored without promising a holder the row cannot reach", () => {
+    const wakeOutcomes = [
+      null,
+      ReasonCode.ROLE_PEER_ABSENT,
+      ReasonCode.ROLE_PEER_STALE,
+      ReasonCode.ROLE_PEER_UNSUPPORTED,
+      ReasonCode.ROLE_PEER_FAILED,
+    ];
+    for (const wake of wakeOutcomes) {
+      const sentence = ownerMessageQueuedSentence(wake);
+      // The two things this seam did observe: it is durable, and nobody has read it.
+      expect(sentence).toContain("Stored for the role");
+      // The promise the lifecycle cannot keep, in either of its spellings.
+      expect(sentence).not.toMatch(/next holder/iu);
+      expect(sentence).not.toMatch(/between holders/iu);
+    }
+
+    // And the branch that carried the promise is still a distinct sentence rather than having been
+    // collapsed into the default — the owner is told why nothing was nudged.
+    expect(ownerMessageQueuedSentence(ReasonCode.ROLE_PEER_ABSENT)).not.toBe(
+      ownerMessageQueuedSentence(null),
+    );
   });
 });

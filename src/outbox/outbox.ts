@@ -8,6 +8,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { FailureClass as FailureClassCode, type FailureClass } from "../domain/types.ts";
+import { IngressGuard } from "../ingress/ingress-guard.ts";
 import {
   type FencedEnvelope,
   HOLDER_CLAIMED_KINDS,
@@ -128,7 +129,7 @@ const KNOWN_FAILURE_CLASSES: ReadonlySet<string> = new Set(Object.values(Failure
  * not an injection surface — but the `'` guard is kept because a kind that ever did come from
  * outside would otherwise turn this into one silently.
  */
-const HOLDER_CLAIMED_KIND_SQL = [...HOLDER_CLAIMED_KINDS]
+export const HOLDER_CLAIMED_KIND_SQL = [...HOLDER_CLAIMED_KINDS]
   .map((kind) => `'${kind.replace(/'/g, "''")}'`)
   .join(", ");
 
@@ -201,11 +202,78 @@ const liveDeliveryTarget = (outboxAlias: "o" | "outbox"): string => `(
  * message or vice versa.
  */
 export class Outbox {
+  /**
+   * The ingress no-reply transition, as a caller rather than as a second definition of it.
+   *
+   * An `OWNER_MESSAGE` is the durable half of an ingress turn: the row in `inbound_messages` holds
+   * that turn's claim open, and `IngressGuard.prune` deliberately never deletes a claim carrying
+   * none of `repliedAt`/`noReplyAt`/`settledAt`. So every transition that takes such a row out of
+   * `PENDING`/`SENT` without handing it to a successor has to settle the claim, in the same
+   * transaction — otherwise the `(buzz, nonce)` slot is held forever by an outbox row that is
+   * terminal and gone, and `doctor` reports a turn nothing will ever finish.
+   *
+   * Built here rather than injected, because every caller of this class would otherwise have to
+   * remember to wire it and a composition that forgot would lose the coupling silently. Carrying
+   * **no channel policy at all** is what keeps it from becoming a second admission authority: with
+   * an empty policy map it can admit nothing, sign nothing and refuse nothing. The only method used
+   * is `completeNoReplyAndResolveTurn`, which reads the database and the clock and nothing else.
+   *
+   * Never `resolveTurn`: that writes `repliedAt`, the narrow claim that a reply transport accepted
+   * bytes. Nothing on this path hands a reply to any transport.
+   */
+  private readonly settlement: IngressGuard;
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
     private readonly audit: AuditLog,
-  ) {}
+  ) {
+    this.settlement = new IngressGuard(db, clock, audit, {});
+  }
+
+  /**
+   * Settles the ingress claim one holder-claimed row is holding open.
+   *
+   * The claim is found by `turn_claim_json.turnRequestId`, which **is** the outbox message id
+   * (`admitBuzzMessage` mints it from the enqueue's own result), and deliberately *not* by reading
+   * the pointer off the row's payload. Two of the transitions that must settle are refusals of a
+   * row whose payload is unreadable or no longer resolves to the source it was enqueued for — a
+   * settlement that trusted that payload would follow it to the wrong turn on exactly the paths it
+   * exists for, or find nothing to follow at all.
+   *
+   * A row with no claim answers `OK`: an owner-message enqueued outside the ingress path is holding
+   * nothing open, which is the same thing `completeNoReplyAndResolveTurn` says for a message that
+   * claimed no turn.
+   */
+  private settleHolderClaim(messageId: string): Decision<void> {
+    const claim = this.db.get<{ channel: string; nonce: string }>(
+      `SELECT channel, nonce FROM inbound_messages
+        WHERE turn_claim_json IS NOT NULL
+          AND json_valid(turn_claim_json) = 1
+          AND json_extract(turn_claim_json, '$.turnRequestId') = ?`,
+      [messageId],
+    );
+    if (!claim) return allow(ReasonCode.OK, undefined);
+    return this.settlement.completeNoReplyAndResolveTurn(claim.channel, claim.nonce);
+  }
+
+  /**
+   * The same coupling for a sweep, which has no `Decision` to hand a refusal back through.
+   *
+   * `fenceUndeliverable` and `retargetOrReject` return counts and id lists, and both run inside a
+   * caller's transaction (a delivery loop, a binding switch). A refused settlement there cannot be
+   * reported as a denial, and committing the outbox half alone is the split state this whole slice
+   * exists to remove — so it throws, and the caller's `db.tx` rolls the whole thing back. Loud and
+   * whole beats quiet and half.
+   */
+  private settleHolderClaimOrThrow(messageId: string): void {
+    const settled = this.settleHolderClaim(messageId);
+    if (settled.allowed) return;
+    throw new Error(
+      `owner-message ${messageId} could not be taken out of the queue: its ingress claim refused ` +
+        `to settle (${settled.reasonCode}), and committing the outbox side alone would strand it`,
+    );
+  }
 
   /**
    * Idempotent by key. A repeated enqueue returns the existing message instead of
@@ -407,15 +475,19 @@ export class Outbox {
         )
         .map(unresolvedOwnerMessage);
 
+      // No `expires_at` here, and none on the candidate read below. A holder-claimed row does not
+      // expire — see `expireOverdue` — and the exclusion has to hold at *every* query that reads
+      // the column, not only at the sweep. Excluding it from the sweep alone produces a subtler
+      // strand than the one it removes: the row keeps `status = 'PENDING'`, so nothing sweeps it
+      // and nothing reports it, while these two conditions mean no holder can ever be handed it.
       const queued =
         this.db.get<{ queued: number }>(
           `SELECT COUNT(*) AS queued FROM outbox o
             WHERE o.kind IN (${HOLDER_CLAIMED_KIND_SQL})
               AND o.status = 'PENDING'
               AND o.role_key = ? AND o.binding_generation = ? AND o.target_session_id = ?
-              AND ${exactHolderTarget("o")}
-              AND o.expires_at > ?`,
-          [...tuple, now],
+              AND ${exactHolderTarget("o")}`,
+          tuple,
         )?.queued ?? 0;
 
       // The block. An outstanding unknown outcome is exactly the state in which handing out more
@@ -429,10 +501,9 @@ export class Outbox {
             AND o.status = 'PENDING'
             AND o.role_key = ? AND o.binding_generation = ? AND o.target_session_id = ?
             AND ${exactHolderTarget("o")}
-            AND o.expires_at > ?
           ORDER BY o.created_at
           LIMIT 1`,
-        [...tuple, now],
+        tuple,
       );
       if (!candidate) return { claimed: [], unresolved, hasMore: false };
 
@@ -484,7 +555,12 @@ export class Outbox {
    * or `EXPIRED` to `ACKED` would rewrite a decision something else already recorded.
    */
   completeForHolder(messageId: string, holder: HolderIdentity): Decision<void> {
-    return this.db.tx(() => {
+    // `txDecision`, not `tx`: this body writes and can then decide against itself, because the
+    // settlement below is the second half of one transition. A denial there has to take the
+    // `ACKED` with it — an outbox row settled beside an ingress claim still reading unresolved is
+    // exactly the split state this whole path exists to remove. Nested inside the ledger's own
+    // decision frame it hands the denial straight back, and the outermost frame does the rollback.
+    return this.db.txDecision(() => {
       const changes = this.db.run(
         `UPDATE outbox SET status = 'ACKED', acked_at = ?
           WHERE message_id = ? AND status = 'SENT'
@@ -500,8 +576,10 @@ export class Outbox {
           holder.sessionIncarnation,
         ],
       ).changes;
-      if (changes === 1) return allow(ReasonCode.OK, undefined);
-      return this.holderTerminalReplay(messageId, holder, "ACKED");
+      if (changes !== 1) return this.holderTerminalReplay(messageId, holder, "ACKED");
+      const settled = this.settleHolderClaim(messageId);
+      if (!settled.allowed) return settled;
+      return allow(ReasonCode.OK, undefined);
     });
   }
 
@@ -513,7 +591,9 @@ export class Outbox {
    * transition here moves out of.
    */
   rejectForHolder(messageId: string, holder: HolderIdentity): Decision<void> {
-    return this.db.tx(() => {
+    // `txDecision` for the same reason as `completeForHolder`: the rejection and the settlement of
+    // the ingress claim it closes are one transition, and half of it is worse than none of it.
+    return this.db.txDecision(() => {
       const changes = this.db.run(
         `UPDATE outbox SET status = 'REJECTED', reason_code = ?,
                            claim_token = NULL, claimed_at = NULL,
@@ -531,8 +611,10 @@ export class Outbox {
           holder.sessionIncarnation,
         ],
       ).changes;
-      if (changes === 1) return allow(ReasonCode.OK, undefined);
-      return this.holderTerminalReplay(messageId, holder, "REJECTED");
+      if (changes !== 1) return this.holderTerminalReplay(messageId, holder, "REJECTED");
+      const settled = this.settleHolderClaim(messageId);
+      if (!settled.allowed) return settled;
+      return allow(ReasonCode.OK, undefined);
     });
   }
 
@@ -723,6 +805,31 @@ export class Outbox {
     const row = this.db.get<RawOutbox>(`SELECT * FROM outbox WHERE message_id = ?`, [messageId]);
     if (!row) return deny(ReasonCode.NOT_FOUND, "unknown message", { messageId });
 
+    // This route is scoped by a *tuple*, not by a message. The `messageId` is whatever the caller
+    // supplied, and everything below checks that the caller holds the row's role generation — so a
+    // caller presenting its own perfectly valid `run_ack` tuple plus an arbitrary id could drive a
+    // holder-claimed row straight to `ACKED`: terminal, and past `completeForHolder`, which is the
+    // only place an owner-message's ingress claim is settled.
+    //
+    // Fail closed on the kind. A holder-claimed message is settled over its holder's own
+    // authenticated connection or not at all, which is the same boundary `claimDeliverable`'s
+    // exclusion draws on the way out — this is that boundary on the way back in.
+    if (HOLDER_CLAIMED_KINDS.has(row.kind as MessageKind)) {
+      this.audit.record({
+        kind: "OUTBOX_ACK_REJECTED",
+        reasonCode: ReasonCode.INVALID_ARGUMENT,
+        runId: row.run_id,
+        sessionId: fromSessionId,
+        roleKey: row.role_key,
+        evidence: { messageId, kind: row.kind, status: row.status, ackGeneration: generation },
+      });
+      return deny(
+        ReasonCode.INVALID_ARGUMENT,
+        "this message is settled over its holder's own connection, not through the generic ack",
+        { messageId, kind: row.kind },
+      );
+    }
+
     // §15.7 / §34.4 — matching the stored envelope is not enough. A late ACK from a
     // generation that has since been revoked is audit-only, as is an ACK for a message
     // that has expired or was already rejected.
@@ -839,10 +946,29 @@ export class Outbox {
     const rejected: string[] = [];
 
     for (const row of pending) {
-      const retargetable =
-        row.status === "PENDING" &&
-        RETARGETABLE_KINDS.has(row.kind as MessageKind) &&
-        row.expires_at > now;
+      const holderClaimed = HOLDER_CLAIMED_KINDS.has(row.kind as MessageKind);
+      const retargetable = holderClaimed
+        ? // A holder-claimed row moves only on a *successor takeover*, and only from `PENDING`.
+          //
+          // `PENDING` means nothing observable has happened to it: nobody was handed it, so the
+          // successor may safely have it — the owner addressed a role, and the role still exists.
+          // `SENT` falls through to the reject below, because its outcome is unknown and replaying
+          // an owner's words into a runtime they were never addressed to is the one thing this
+          // kind must never do.
+          //
+          // `fromGeneration === toGeneration` is the *revoke* shape, not a takeover:
+          // `BindingRegistry.revoke` passes the current generation and session because there is
+          // nothing to retarget onto, then runs its own direct `UPDATE outbox SET status =
+          // 'REJECTED'` over every id returned here as `retargeted`. That write knows nothing about
+          // ingress claims, so an owner-message reaching it would be settled behind this method's
+          // back. Falling through to the reject below — which settles — is what makes that
+          // unreachable rather than merely unused.
+          //
+          // No `expires_at` test: these rows do not expire. See `expireOverdue`.
+          row.status === "PENDING" && toGeneration !== fromGeneration
+        : row.status === "PENDING" &&
+          RETARGETABLE_KINDS.has(row.kind as MessageKind) &&
+          row.expires_at > now;
       if (retargetable) {
         this.db.run(
           `UPDATE outbox SET binding_generation = ?, target_session_id = ?, reason_code = ?
@@ -857,12 +983,15 @@ export class Outbox {
                              retry_eligible = 0, next_attempt_at = NULL
             WHERE message_id = ?`,
           [
-            row.expires_at <= now
+            !holderClaimed && row.expires_at <= now
               ? ReasonCode.OUTBOX_EXPIRED
               : ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
             row.message_id,
           ],
         );
+        // A terminal transition out of `PENDING`/`SENT` with no successor to take it: the ingress
+        // claim this row was holding open closes here, in this same transaction, or nothing does.
+        if (holderClaimed) this.settleHolderClaimOrThrow(row.message_id);
         rejected.push(row.message_id);
       }
     }
@@ -877,11 +1006,28 @@ export class Outbox {
     return { retargeted, rejected };
   }
 
+  /**
+   * A queued message whose delivery window has passed. Holder-claimed kinds have no such window.
+   *
+   * `enqueue` stamps every row with `DEFAULT_TTL_MS` unless the caller names one, so an
+   * `OWNER_MESSAGE` used to become `EXPIRED` thirty minutes after it was written — silently, on the
+   * next `claimDeliverable` or `Daemon.reconcile`, and terminally: `claimForHolder` requires
+   * `PENDING`, `fenceUndeliverable` skips a row that is neither `PENDING`/`IN_FLIGHT` nor `SENT`,
+   * and the holder never learned the message existed.
+   *
+   * A TTL is a statement about a *delivery attempt* — after this instant, stop trying to send. An
+   * owner-message is not sent; it is queued for a holder that comes and takes it, and there is no
+   * instant after which an owner's words stop being addressed to the role. So the kinds are
+   * excluded here, and — because a status the claim path refuses to look at is the same strand
+   * wearing a different word — `claimForHolder`'s two `expires_at` conditions are gone with it.
+   */
   expireOverdue(): number {
     const result = this.db.run(
       `UPDATE outbox SET status = 'EXPIRED', reason_code = ?,
                          retry_eligible = 0, next_attempt_at = NULL
-        WHERE status IN ('PENDING','IN_FLIGHT') AND expires_at <= ?`,
+        WHERE status IN ('PENDING','IN_FLIGHT')
+          AND kind NOT IN (${HOLDER_CLAIMED_KIND_SQL})
+          AND expires_at <= ?`,
       [ReasonCode.OUTBOX_EXPIRED, this.clock.nowIso()],
     );
     return result.changes;
@@ -912,21 +1058,46 @@ export class Outbox {
    * reject a delivery that succeeded. For an owner-message it means the previous holder was handed
    * the payload and never came back; once its target is no longer live, nothing can ever settle
    * it. Without this clause a restart strands it exactly there: the new holder cannot claim it
-   * (wrong incarnation), `SessionRegistry`'s own stop-time fence only looks at `PENDING` and
-   * `IN_FLIGHT`, and so the row sits `SENT` forever. The `NOT liveDeliveryTarget` condition is what
-   * keeps this off a live holder's outstanding message, which stays claimable and settleable.
+   * (wrong incarnation) and so the row sits `SENT` forever. The `NOT liveDeliveryTarget` condition
+   * is what keeps this off a live holder's outstanding message, which stays claimable and
+   * settleable.
+   *
+   * The mirror of that asymmetry is that a holder-claimed row is *excluded* from the
+   * `PENDING`/`IN_FLIGHT` arm, which every other kind is in. A queued owner-message was handed to
+   * nobody, so nothing observable has happened to it and it is still safely movable: it belongs to
+   * whoever takes the role next, and `retargetOrReject` is what moves it there on a takeover or
+   * closes it on a revoke. Fencing it here would be a terminal transition taken by a sweep that has
+   * no successor to offer and no idea a takeover is one instant away.
+   *
+   * Every row this *does* burn out of `SENT` has its ingress claim settled below, in this same
+   * transaction.
    */
   fenceUndeliverable(): number {
-    return this.db.run(
-      `UPDATE outbox SET status = 'REJECTED', reason_code = ?, claim_token = NULL, claimed_at = NULL,
-                         retry_eligible = 0, next_attempt_at = NULL
-        WHERE (
-                status IN ('PENDING','IN_FLIGHT')
-                OR (status = 'SENT' AND kind IN (${HOLDER_CLAIMED_KIND_SQL}))
-              )
-          AND NOT ${liveDeliveryTarget("outbox")}`,
-      [ReasonCode.OUTBOX_STALE_GENERATION_REJECTED],
-    ).changes;
+    return this.db.tx(() => {
+      // Read the holder-claimed rows this call is about to burn *before* burning them: after the
+      // UPDATE their status no longer says which ones moved, and each of them owns an ingress
+      // claim that closes in this same transaction.
+      const stranded = this.db
+        .all<{ message_id: string }>(
+          `SELECT message_id FROM outbox
+            WHERE status = 'SENT' AND kind IN (${HOLDER_CLAIMED_KIND_SQL})
+              AND NOT ${liveDeliveryTarget("outbox")}`,
+        )
+        .map((row) => row.message_id);
+      const changes = this.db.run(
+        `UPDATE outbox SET status = 'REJECTED', reason_code = ?, claim_token = NULL, claimed_at = NULL,
+                           retry_eligible = 0, next_attempt_at = NULL
+          WHERE (
+                  (status IN ('PENDING','IN_FLIGHT')
+                    AND kind NOT IN (${HOLDER_CLAIMED_KIND_SQL}))
+                  OR (status = 'SENT' AND kind IN (${HOLDER_CLAIMED_KIND_SQL}))
+                )
+            AND NOT ${liveDeliveryTarget("outbox")}`,
+        [ReasonCode.OUTBOX_STALE_GENERATION_REJECTED],
+      ).changes;
+      for (const messageId of stranded) this.settleHolderClaimOrThrow(messageId);
+      return changes;
+    });
   }
 
   /**
