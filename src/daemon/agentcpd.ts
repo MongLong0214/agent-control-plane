@@ -31,6 +31,7 @@ import {
   BuzzMessageIngress,
   buzzMessageNonce,
   deliverBuzzMessage,
+  ownerMessagePointerOf,
   type BuzzMentionRouter,
   type BuzzMessageIngressInput,
   type BuzzMessageTurnPort,
@@ -49,7 +50,14 @@ import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
 import { createCtoMcpPort, createCtoServer } from "../mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../mcp/hermes-server.ts";
 import { CeoConversationPort } from "../mcp/ceo-conversation.ts";
-import { RoleConversationPort } from "../mcp/role-conversation.ts";
+import {
+  RoleConversationPort,
+  type OwnerMessageHandover,
+  type OwnerMessageLedger,
+} from "../mcp/role-conversation.ts";
+import { digestOf } from "../core/digest.ts";
+import { MessageKind } from "../outbox/envelope.ts";
+import type { HolderIdentity } from "../outbox/outbox.ts";
 import { respond, type AuthenticatedMcpPeer, type McpPeerAuthenticator } from "../mcp/shared.ts";
 import type { AuthenticatedOperatorPeer, Daemon } from "./daemon.ts";
 
@@ -350,7 +358,7 @@ export const startLocalMcpListeners = async (
     // and `cto.mcp.sock` are already in, two lines above. It is passed rather than derived inside
     // the port so the port never has to know what a deployment's layout is, and so a test that
     // wants a different directory gets one without moving the daemon's.
-    { endpointDir: stateDir },
+    { endpointDir: stateDir, ownerMessages: ownerMessageLedger(cp) },
   );
   const hermes = await startMcpSocket(
     hermesPath,
@@ -415,7 +423,48 @@ export const startLocalMcpListeners = async (
               inputSchema: { endpoint: z.string().min(1) },
             },
             async (args: { endpoint: string }) =>
-              respond(ctoConversation.registerEndpoint(server, args.endpoint)),
+              respond(await ctoConversation.registerEndpoint(server, args.endpoint)),
+          );
+          /*
+           * The three owner-message tools, registered in this same composition — not on a second
+           * server, and not against a durable endpoint registry.
+           *
+           * `roleKey` is the only thing a caller may say, and it is a **lookup key**: it selects
+           * which of this connection's slots to act on. There is deliberately no argument here for
+           * a session, an incarnation, an assignment, a generation, a pid, a client version or a
+           * digest — `RoleConversationPort` derives the whole `HolderIdentity` from `server` (the
+           * object identity `attach` keyed the slot on), from this connection's own authenticator,
+           * and from the binding registry, and it does that again on every call rather than
+           * trusting what was true at handshake. So a caller supplying a different holder tuple has
+           * nowhere to put it, which is stronger than validating one it could have supplied.
+           */
+          server.registerTool(
+            "role_owner_message_claim",
+            {
+              description:
+                "Take at most one owner message addressed to a role this connection currently holds.",
+              inputSchema: { roleKey: z.string().min(1) },
+            },
+            async (args: { roleKey: string }) =>
+              respond(ctoConversation.claimOwnerMessage(server, args.roleKey)),
+          );
+          server.registerTool(
+            "role_owner_message_complete",
+            {
+              description: "Record that this connection took and finished one owner message.",
+              inputSchema: { roleKey: z.string().min(1), messageId: z.string().min(1) },
+            },
+            async (args: { roleKey: string; messageId: string }) =>
+              respond(ctoConversation.completeOwnerMessage(server, args.roleKey, args.messageId)),
+          );
+          server.registerTool(
+            "role_owner_message_reject",
+            {
+              description: "Terminally refuse one owner message this connection was handed.",
+              inputSchema: { roleKey: z.string().min(1), messageId: z.string().min(1) },
+            },
+            async (args: { roleKey: string; messageId: string }) =>
+              respond(ctoConversation.rejectOwnerMessage(server, args.roleKey, args.messageId)),
           );
         }
         return server;
@@ -607,13 +656,45 @@ export const startBuzzMessageIngressListener = async (
   const roleConversation = options.roleConversation ?? null;
   const port: BuzzMessageTurnPort = {
     deliverToCeo: (text) => deliverAsCeoTurn(options.ceoConversation, text),
-    deliverToRole: (roleKey, text) => deliverAsRoleTurn(roleConversation, roleKey, text),
     // Read at claim time, from the binding registry rather than from the peer: the fence is
     // "which CEO generation was this turn claimed under", and the peer cannot be its own
     // authority for that. Telegram's production composition still passes none (#639's seam is
     // unwired there), so this is the first path that records a real generation on a claim.
     bindingGeneration: () => cp.bindings.active(roleKeyFor(Role.CEO))?.bindingGeneration ?? null,
-    roleBindingGeneration: (roleKey) => cp.bindings.active(roleKey)?.bindingGeneration ?? null,
+    // The database's own transaction, not a second one built here. `Db.tx` joins an outer
+    // transaction rather than opening a nested one, so the guard's insert, the outbox's insert and
+    // the claim's compare-and-set all land inside this single BEGIN IMMEDIATE.
+    atomically: (body) => cp.db.tx(body),
+    activeRoleTarget: (roleKey) => {
+      const binding = cp.bindings.active(roleKey);
+      return binding
+        ? { bindingGeneration: binding.bindingGeneration, targetSessionId: binding.sessionId }
+        : null;
+    },
+    enqueueOwnerMessage: (input) => {
+      const enqueued = cp.outbox.enqueue({
+        // The `(buzz, nonce)` slot the guard just consumed *is* the idempotency of this row. A
+        // fresh key would let one event id enqueue twice if it ever reached here twice, and the
+        // outbox's own duplicate suppression is the second line under the ingress replay refusal
+        // rather than a different rule.
+        idempotencyKey: `owner-message:${input.nonce}`,
+        roleKey: input.roleKey,
+        bindingGeneration: input.bindingGeneration,
+        targetSessionId: input.targetSessionId,
+        runId: null,
+        kind: MessageKind.OWNER_MESSAGE,
+        payload: input.pointer,
+      });
+      return enqueued.allowed
+        ? allow(enqueued.reasonCode, { messageId: enqueued.value.messageId })
+        : (enqueued as Decision<{ messageId: string }>);
+    },
+    wakeRole: async (roleKey) =>
+      roleConversation
+        ? await roleConversation.wake(roleKey)
+        : deny(ReasonCode.ROLE_PEER_ABSENT, "no role conversation listener is configured", {
+            roleKey,
+          }),
   };
   const socketPath = join(stateDir, "buzz-message.ingress.sock");
   removeStaleSocket(socketPath);
@@ -1928,56 +2009,155 @@ export const deliverAsCeoTurn = async (
 };
 
 /**
- * `deliverAsCeoTurn` for a message addressed to a role by `p` tag (`#760` B4).
+ * The durable owner-message ledger the connection-bound tools act through (`#760` Q2 §5/§6).
  *
- * The contact boundary is the part that matters, and it is not the same question as "did this
- * succeed". `ROLE_PEER_FAILED` is the one refusal that means the request crossed to the peer and
- * came back unacknowledged — a timeout, a closed transport, an unreadable answer — so the turn is
- * a debt rather than a failure and its claim stays outstanding (B5). Every other refusal is
- * positively established as never having been asked, which is what lets the claim close.
+ * Built here, from the control plane, because this is the only place that holds the outbox, the
+ * database and an ingress guard at once — and because the alternative, letting `RoleConversationPort`
+ * reach for them itself, would give a transport port database authority it has no business having.
  *
- * A null port is that same "never asked": a deployment that did not wire the role listener
- * refuses delivery rather than finding some other recipient for the message.
+ * The `IngressGuard` constructed here carries **no channel policy at all**, and that is the point
+ * rather than an oversight: the only method used is `completeNoReplyAndResolveTurn`, the existing
+ * no-reply terminal path, which reads nothing but the database and the clock. With an empty policy
+ * map this handle can admit nothing, sign nothing and refuse nothing — it cannot become a second
+ * admission authority beside the one `startBuzzMessageIngressListener` owns. The row in
+ * `inbound_messages` is the authority either way; this is a caller of the transition, not a second
+ * definition of it.
  */
-export const deliverAsRoleTurn = async (
-  port: RoleConversationPort | null,
-  roleKey: string,
-  text: string,
-): Promise<CeoTurnDelivery> => {
-  const delivered: Decision<string> = port
-    ? await port.deliver(roleKey, text)
-    : deny(ReasonCode.ROLE_PEER_ABSENT, "no role conversation listener is configured", { roleKey });
-  if (delivered.allowed) {
-    return { answer: delivered.value, reachedCeo: true, reasonCode: ReasonCode.OK };
-  }
-  return {
-    answer: `${roleUnavailableSentence(delivered.reasonCode)} (${delivered.reasonCode})`,
-    reachedCeo: delivered.reasonCode === ReasonCode.ROLE_PEER_FAILED,
-    reasonCode: delivered.reasonCode,
+export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
+  const settlement = new IngressGuard(cp.db, cp.clock, cp.audit, {});
+  /** The pointer on one owner-message row, or a denial naming what is wrong with it. */
+  const pointerOn = (messageId: string) => {
+    const row = cp.outbox.get(messageId);
+    if (!row || row.kind !== MessageKind.OWNER_MESSAGE) {
+      return { pointer: null, refusal: deny(ReasonCode.NOT_FOUND, "no owner message has that id", { messageId }) };
+    }
+    const pointer = ownerMessagePointerOf(row.payload);
+    if (!pointer) {
+      return {
+        pointer: null,
+        refusal: deny(
+          ReasonCode.OUTBOX_PAYLOAD_DIGEST_MISMATCH,
+          "this owner message does not carry a readable source pointer",
+          { messageId },
+        ),
+      };
+    }
+    return { pointer, refusal: null };
   };
-};
 
-/**
- * What the sender is told when a role could not be reached.
- *
- * Same rule as `ceoUnavailableSentence`, and the same trap: none of these may claim more than the
- * seam observed. Absence in particular is not a fault — a role between holders is ordinary
- * operation (`#760` B2) — and a sentence that called it an error would train the reader to treat
- * a normal handover as an incident.
- */
-export const roleUnavailableSentence = (reasonCode: string): string => {
-  if (reasonCode === ReasonCode.ROLE_PEER_ABSENT) {
-    return "No session is attached for that role right now, so nothing was delivered. The role may be between holders; nobody received this message.";
-  }
-  if (reasonCode === ReasonCode.ROLE_PEER_STALE) {
-    return "The session that was attached for that role no longer holds it, so nothing was delivered to it.";
-  }
-  if (reasonCode === ReasonCode.ROLE_PEER_UNSUPPORTED) {
-    return "The session attached for that role cannot receive over this route — it did not offer sampling at handshake.";
-  }
-  // ROLE_PEER_FAILED and anything else: the peer was asked and did not acknowledge. It may have
-  // read the message anyway, so this says nothing about whether it arrived.
-  return "The session holding that role did not acknowledge the delivery. Whether it read the message is not established, so this turn is unresolved rather than failed.";
+  return {
+    /**
+     * §5 — Q1 moves at most one row, and only then is its source re-verified.
+     *
+     * The order is load-bearing in both directions. The transition happens first because a read
+     * that decided whether to move the row would leave a window where a crash loses the message
+     * with no record it was ever handed over. The verification happens second, inside the same
+     * transaction, because a payload handed over on the strength of a pointer nobody re-checked is
+     * a payload from wherever that pointer now points.
+     *
+     * A missing, malformed or mismatched source returns **no text** and terminally rejects the row
+     * this call just claimed — and that rejection is why the outer frame is `tx` rather than
+     * `txDecision`: the denial must commit, or the row would silently return to `PENDING` and be
+     * served again with the same broken source forever.
+     */
+    claim: (holder: HolderIdentity): Decision<OwnerMessageHandover> =>
+      cp.db.tx((): Decision<OwnerMessageHandover> => {
+        const taken = cp.outbox.claimForHolder(holder);
+        const unresolved = taken.unresolved;
+        const message = taken.claimed[0];
+        // Nothing new was handed over: either the queue is empty, or an unresolved hand-over is
+        // blocking it. Both are reported with metadata only — `UnresolvedOwnerMessage` has no
+        // payload field, so "never the payload twice" holds by the shape of what is returned.
+        if (!message) {
+          return allow(ReasonCode.OK, { claimed: null, unresolved, hasMore: taken.hasMore });
+        }
+        const refuseClaimed = (reasonCode: ReasonCode, why: string): Decision<OwnerMessageHandover> => {
+          cp.outbox.rejectForHolder(message.messageId, holder);
+          return deny(reasonCode, why, { messageId: message.messageId });
+        };
+        const pointer = ownerMessagePointerOf(message.payload);
+        if (!pointer) {
+          return refuseClaimed(
+            ReasonCode.OUTBOX_PAYLOAD_DIGEST_MISMATCH,
+            "this owner message does not carry a readable source pointer",
+          );
+        }
+        const source = cp.db.get<{ payload_json: string | null }>(
+          `SELECT payload_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+          [pointer.sourceChannel, pointer.sourceNonce],
+        );
+        if (!source?.payload_json) {
+          return refuseClaimed(
+            ReasonCode.NOT_FOUND,
+            "the single durable copy of this message is gone, so there is nothing to hand over",
+          );
+        }
+        let payload: unknown;
+        try {
+          payload = JSON.parse(source.payload_json) as unknown;
+        } catch {
+          return refuseClaimed(ReasonCode.INVALID_ARGUMENT, "the stored source envelope is not readable");
+        }
+        // The **full** payload, not the text: a digest over the text alone still matches after the
+        // recipient fields inside the signature have been rewritten.
+        if (digestOf(payload) !== pointer.sourcePayloadDigest) {
+          return refuseClaimed(
+            ReasonCode.OUTBOX_PAYLOAD_DIGEST_MISMATCH,
+            "the stored source envelope is not the one this message was enqueued for",
+          );
+        }
+        // Parsed as data, never as instructions (§27.4). A `text` of the wrong type is a source
+        // this route cannot read, not something to coerce into a string.
+        const text = (payload as { text?: unknown }).text;
+        if (typeof text !== "string") {
+          return refuseClaimed(
+            ReasonCode.INVALID_ARGUMENT,
+            "the stored source envelope carries no readable text",
+          );
+        }
+        return allow(ReasonCode.UNTRUSTED_CONTENT_IS_DATA, {
+          claimed: {
+            messageId: message.messageId,
+            text,
+            sourceNonce: pointer.sourceNonce,
+            createdAt: message.createdAt,
+          },
+          unresolved,
+          hasMore: taken.hasMore,
+        });
+      }),
+
+    /**
+     * §6 — the outbox row and the ingress claim close together, or neither closes.
+     *
+     * `txDecision`, so a refusal in the second half rolls the first half back: an outbox row moved
+     * to `ACKED` beside an ingress claim still reading unresolved is exactly the split state that
+     * makes `prune` and `unresolvedTurns` disagree about whether a turn finished.
+     *
+     * The ingress side goes through `completeNoReplyAndResolveTurn` and nothing else. `resolveTurn`
+     * would write `repliedAt`, which is the narrow claim that *a reply transport accepted bytes* —
+     * nothing here handed a reply to any transport, and asserting it would tell every later reader
+     * that the owner has an answer they never received.
+     */
+    complete: (messageId: string, holder: HolderIdentity): Decision<void> =>
+      cp.db.txDecision((): Decision<void> => {
+        const { pointer, refusal } = pointerOn(messageId);
+        if (!pointer) return refusal;
+        const settled = cp.outbox.completeForHolder(messageId, holder);
+        if (!settled.allowed) return settled;
+        return settlement.completeNoReplyAndResolveTurn(pointer.sourceChannel, pointer.sourceNonce);
+      }),
+
+    /** The same two ledgers, the same transaction, for a holder that refuses the message. */
+    reject: (messageId: string, holder: HolderIdentity): Decision<void> =>
+      cp.db.txDecision((): Decision<void> => {
+        const { pointer, refusal } = pointerOn(messageId);
+        if (!pointer) return refusal;
+        const settled = cp.outbox.rejectForHolder(messageId, holder);
+        if (!settled.allowed) return settled;
+        return settlement.completeNoReplyAndResolveTurn(pointer.sourceChannel, pointer.sourceNonce);
+      }),
+  };
 };
 
 /**

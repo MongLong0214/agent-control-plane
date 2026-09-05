@@ -22,7 +22,7 @@ const buzzTurnIsClaimedBeforeTheCeoIsAsked = {
   what: "a Buzz message takes its turn claim before the CEO is asked anything",
   file: "src/ingress/buzz-message.ts",
   find:
-    "  const claimed = ingress.claimTurn(admitted.value.nonce, identity);\n" +
+    "  const claimed = ingress.claimTurn(admitted.nonce, identity);\n" +
     "  if (!claimed.allowed) return claimed as Decision<BuzzMessageAnswer>;\n",
   replace: "",
   killedBy: [

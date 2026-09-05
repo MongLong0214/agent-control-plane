@@ -250,6 +250,36 @@ const resolvesNothing: BuzzMentionRouter = {
 const unboundJournal = (harness: ReturnType<typeof makeHarness>) =>
   harness.cp.audit.all().filter((row) => row.reasonCode === ReasonCode.MENTION_TARGET_UNBOUND);
 
+/**
+ * The `OWNER_MESSAGE` rows the role path enqueued, oldest first.
+ *
+ * The role route is a durable queue now rather than a push: what a role-addressed envelope
+ * produces is one non-retargetable outbox row carrying a pointer, and its holder comes and takes
+ * it over its own authenticated connection. `queuedOwnerMessages` is therefore the observable
+ * these rows assert on, where they used to assert on a fake peer's `sampling/createMessage` calls.
+ */
+const queuedOwnerMessages = (harness: ReturnType<typeof makeHarness>) =>
+  harness.cp.db.all<{
+    message_id: string;
+    status: string;
+    role_key: string;
+    target_session_id: string;
+    payload_json: string;
+  }>(
+    `SELECT message_id, status, role_key, target_session_id, payload_json
+       FROM outbox WHERE kind = 'OWNER_MESSAGE' ORDER BY created_at`,
+    [],
+  );
+
+/** The one durable copy of an admitted envelope's text. */
+const admittedText = (harness: ReturnType<typeof makeHarness>, eventId: string): string | null => {
+  const row = harness.cp.db.get<{ payload_json: string | null }>(
+    `SELECT payload_json FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`,
+    [buzzMessageNonce(eventId)],
+  );
+  return row?.payload_json ? ((JSON.parse(row.payload_json) as { text?: string }).text ?? null) : null;
+};
+
 /** The `(buzz, nonce)` row for one event id, and the turn claim on it if any. */
 const admittedRow = (harness: ReturnType<typeof makeHarness>, eventId: string) =>
   harness.cp.db.get<{ nonce: string; turn_claim_json: string | null }>(
@@ -268,19 +298,33 @@ const until = async (predicate: () => boolean, what: string, timeoutMs = 10_000)
 };
 
 /**
- * A real client on the real `cto.mcp.sock`: credential line, MCP initialize declaring `sampling`,
- * then it answers the server's `sampling/createMessage` requests.
+ * A real client on the real `cto.mcp.sock`: credential line, MCP initialize, then it *asks* for
+ * its own messages the way the runtime does.
  *
- * The production row needs a B2 peer that the daemon itself admitted and attached, not one handed
- * to a port by the test. Shaped after `the-cto-socket-has-a-live-peer.test.ts`, which owns the
- * socket's own rows; nothing here re-measures them.
+ * The route reversed direction in `#760` Q2: the daemon used to push the text over
+ * `sampling/createMessage` and read the peer's reply as the acknowledgement, and this helper used
+ * to stand up a peer that answered those. Nothing pushes now, so what a peer needs is the ability
+ * to call one connection-bound tool. Shaped after `the-cto-socket-has-a-live-peer.test.ts`, which
+ * owns the socket's own rows; nothing here re-measures them.
  */
+interface ToolBody {
+  ok: boolean;
+  reasonCode: string;
+  message?: string;
+  value?: unknown;
+}
+
 const connectRolePeer = async (
   socketPath: string,
   credential: { token: string; sessionId: string; sessionSecret: string },
-): Promise<{ socket: Socket; received: string[]; close: () => Promise<void> }> => {
+): Promise<{
+  socket: Socket;
+  callTool: (name: string, args: Record<string, unknown>) => Promise<ToolBody>;
+  close: () => Promise<void>;
+}> => {
   const socket = createConnection(socketPath);
-  const received: string[] = [];
+  const pending = new Map<number, (body: ToolBody) => void>();
+  let nextId = 2;
   await new Promise<void>((resolve, reject) => {
     socket.once("connect", resolve);
     socket.once("error", reject);
@@ -297,22 +341,18 @@ const connectRolePeer = async (
       const line = buffer.slice(0, newline);
       buffer = buffer.slice(newline + 1);
       if (line.trim().length === 0) continue;
-      let message: { id?: number; method?: string; params?: unknown };
+      let message: { id?: number; method?: string; result?: unknown };
       try {
         message = JSON.parse(line) as typeof message;
       } catch {
         continue;
       }
-      if (message.method !== "sampling/createMessage" || message.id === undefined) continue;
-      const params = message.params as { messages?: { content?: { text?: string } }[] } | undefined;
-      received.push(params?.messages?.[0]?.content?.text ?? "");
-      socket.write(
-        `${JSON.stringify({
-          jsonrpc: "2.0",
-          id: message.id,
-          result: { role: "assistant", model: "test-peer", content: { type: "text", text: "받았다" } },
-        })}\n`,
-      );
+      if (message.method !== undefined || message.id === undefined) continue;
+      const settle = pending.get(message.id);
+      if (!settle) continue;
+      pending.delete(message.id);
+      const result = message.result as { structuredContent?: ToolBody } | undefined;
+      settle(result?.structuredContent ?? { ok: false, reasonCode: "NO_STRUCTURED_CONTENT" });
     }
   });
   socket.write(
@@ -322,14 +362,21 @@ const connectRolePeer = async (
       method: "initialize",
       params: {
         protocolVersion: "2025-11-25",
-        capabilities: { sampling: {} },
+        capabilities: {},
         clientInfo: { name: "buzz-role-peer", version: "1" },
       },
     })}\n${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}\n`,
   );
   return {
     socket,
-    received,
+    callTool: (name, args) =>
+      new Promise<ToolBody>((resolveCall) => {
+        const id = nextId++;
+        pending.set(id, resolveCall);
+        socket.write(
+          `${JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } })}\n`,
+        );
+      }),
     close: () =>
       new Promise<void>((resolve) => {
         if (socket.destroyed) return resolve();
@@ -338,6 +385,20 @@ const connectRolePeer = async (
       }),
   };
 };
+
+/**
+ * A live role peer for the rows that only need one to exist.
+ *
+ * It offers the two members `RoleConversationPort` reads off an SDK server — the object identity
+ * `attach` keys its slot on, and the client version the wake pin checks — and nothing else. It
+ * cannot receive anything, which is the point: after Q2 nothing is pushed to a peer at all.
+ */
+const fakeRolePeer = () =>
+  ({
+    server: {
+      getClientVersion: () => ({ name: "claude-code", version: "2.1.259" }),
+    },
+  }) as never;
 
 describe("the daemon's Buzz message ingress", () => {
   it("delivers an owner's Buzz message to the holder of the active CEO binding without spawning a session child", async () => {
@@ -733,15 +794,14 @@ describe("the daemon's Buzz message ingress", () => {
     }
   });
 
-  it("delivers a `p`-tagged message to the role's live peer, and keeps that address across a session replacement", async () => {
+  it("queues a `p`-tagged message for the role's holder, and keeps that address across a session replacement", async () => {
     const harness = makeHarness();
     const { projectId } = await registerFixtureProject(harness);
     const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
     const first = readyBoundSession(harness, "cto-first", CTO_MENTION, [projectId]);
 
     const roleConversation = roleConversationFor(harness);
-    const firstPeer = fakeCeoPeer("CTO 받았다");
-    roleConversation.attach(firstPeer.server, stillHeldBy(first));
+    roleConversation.attach(fakeRolePeer(), stillHeldBy(first));
     const ceo = fakeCeoPeer("CEO가 답하면 안 된다");
     const ceoConversation = new CeoConversationPort();
     ceoConversation.attach(ceo.server, stillCeo());
@@ -754,10 +814,18 @@ describe("the daemon's Buzz message ingress", () => {
         [envelope({ eventId: "evt-cto", text: "CTO, U6 상태", addressedTo: "CTO", mention: CTO_MENTION })],
         hasReasonCode,
       );
-      expect(JSON.parse(delivered.trim())).toMatchObject({ ok: true, reasonCode: ReasonCode.OK });
-      expect(firstPeer.peer.calls).toEqual(["CTO, U6 상태"]);
+      // Not `OK`: `OK` on this surface means the addressed peer answered, and nobody has. The
+      // message is durable and addressed; that is the whole of what this seam observed.
+      expect(JSON.parse(delivered.trim())).toMatchObject({
+        ok: true,
+        reasonCode: ReasonCode.UNTRUSTED_CONTENT_IS_DATA,
+        answeredByCeo: false,
+      });
+      const queued = queuedOwnerMessages(harness);
+      expect(queued).toHaveLength(1);
+      expect(queued[0]).toMatchObject({ status: "PENDING", role_key: roleKey, target_session_id: first.sessionId });
       // The address decided the recipient. Without this the row above would also pass on an
-      // ingress that delivered every message to the CEO, which is precisely the base behaviour.
+      // ingress that handed every message to the CEO, which is precisely the base behaviour.
       expect(ceo.peer.calls).toEqual([]);
       // Nothing was started to receive it — the same no-fork property the CEO row asserts.
       expect(sessionIds(harness)).toEqual(before);
@@ -781,11 +849,17 @@ describe("the daemon's Buzz message ingress", () => {
         [envelope({ eventId: "evt-cto", text: "CTO, U6 상태", addressedTo: "CTO", mention: CTO_MENTION })],
         hasReasonCode,
       );
+      // Refused, and named for what it is. The turn claim this admission wrote is deliberately
+      // *unresolved* while the outbox row is pending — that is what keeps `prune` off the one
+      // durable copy the queued message points at — so a second copy of the event meets an
+      // unsettled turn rather than a finished one. Both refuse; only this one tells an operator
+      // that the message is still waiting to be taken. It becomes an ordinary
+      // `INGRESS_REPLAY_IGNORED` once its holder settles it, which the end-to-end row shows.
       expect(JSON.parse(replay.trim())).toMatchObject({
         ok: false,
-        reasonCode: ReasonCode.INGRESS_REPLAY_IGNORED,
+        reasonCode: ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN,
       });
-      expect(firstPeer.peer.calls).toEqual(["CTO, U6 상태"]);
+      expect(queuedOwnerMessages(harness)).toHaveLength(1);
 
       // B0/B0b — the session holding the role is replaced, which is ordinary operation. The
       // sender's address is unchanged: the same `p` tag string, and nobody had to learn a new one.
@@ -795,17 +869,26 @@ describe("the daemon's Buzz message ingress", () => {
       ).toBe(ReasonCode.OK);
       const second = readyBoundSession(harness, "cto-second", CTO_MENTION, [projectId]);
       expect(second.sessionId).not.toBe(first.sessionId);
-      const secondPeer = fakeCeoPeer("새 세션이 받았다");
-      roleConversation.attach(secondPeer.server, stillHeldBy(second));
+      roleConversation.attach(fakeRolePeer(), stillHeldBy(second));
 
       const afterReplacement = await exchangeSocketLines(
         listener.socketPath,
         [envelope({ eventId: "evt-cto-2", text: "교체 후에도", addressedTo: "CTO", mention: CTO_MENTION })],
         hasReasonCode,
       );
-      expect(JSON.parse(afterReplacement.trim())).toMatchObject({ ok: true, reasonCode: ReasonCode.OK });
-      expect(secondPeer.peer.calls).toEqual(["교체 후에도"]);
-      expect(firstPeer.peer.calls).toEqual(["CTO, U6 상태"]);
+      expect(JSON.parse(afterReplacement.trim())).toMatchObject({
+        ok: true,
+        reasonCode: ReasonCode.UNTRUSTED_CONTENT_IS_DATA,
+      });
+      // Addressed to the *new* runtime, under the new generation: the outbox row is fenced by the
+      // holder the registry names at admission, not by the one that held the role when the
+      // sender learned the address.
+      const afterQueue = queuedOwnerMessages(harness);
+      expect(afterQueue).toHaveLength(2);
+      expect(afterQueue[1]).toMatchObject({ status: "PENDING", role_key: roleKey, target_session_id: second.sessionId });
+      // And the first message is still exactly where it was — addressed to a runtime that has
+      // gone, waiting for the sweep, never re-pointed at the replacement.
+      expect(afterQueue[0]?.target_session_id).toBe(first.sessionId);
     } finally {
       await listener.close();
     }
@@ -955,8 +1038,7 @@ describe("the daemon's Buzz message ingress", () => {
     const { projectId } = await registerFixtureProject(harness);
     const session = readyBoundSession(harness, "cto-peer", CTO_MENTION, [projectId]);
     const roleConversation = roleConversationFor(harness);
-    const rolePeer = fakeCeoPeer("받았다");
-    roleConversation.attach(rolePeer.server, stillHeldBy(session));
+    roleConversation.attach(fakeRolePeer(), stillHeldBy(session));
     const listener = await startMessageListener(harness, new CeoConversationPort(), roleConversation);
 
     try {
@@ -986,20 +1068,27 @@ describe("the daemon's Buzz message ingress", () => {
       expect(unboundJournal(harness)).toEqual([]);
       expect(admittedRow(harness, "evt-auth-order")).toBeNull();
 
-      // The owner's real event, same id, delivered.
+      // The owner's real event, same id, admitted and queued.
       const delivered = await exchangeSocketLines(
         listener.socketPath,
         [envelope({ eventId: "evt-auth-order", text: "CTO, 상태", addressedTo: "CTO", mention: CTO_MENTION })],
         hasReasonCode,
       );
-      expect(JSON.parse(delivered.trim())).toMatchObject({ ok: true, reasonCode: ReasonCode.OK });
-      expect(rolePeer.peer.calls).toEqual(["CTO, 상태"]);
+      expect(JSON.parse(delivered.trim())).toMatchObject({
+        ok: true,
+        reasonCode: ReasonCode.UNTRUSTED_CONTENT_IS_DATA,
+      });
+      expect(queuedOwnerMessages(harness)).toHaveLength(1);
+      expect(admittedText(harness, "evt-auth-order")).toBe("CTO, 상태");
       expect(unboundJournal(harness)).toEqual([]);
 
       // The same event id again with the `p` tag rewritten to one that resolves to nobody. The
-      // event id is the replay key and it is spent, so this is a replay whatever its tag now
-      // says: rejected before the lookup, so the answered turn gains no second target side
-      // effect and the peer is not asked again.
+      // event id is the replay key and it is spent, so this is refused whatever its tag now says:
+      // rejected before the lookup, so the admitted turn gains no second target side effect and
+      // nothing is enqueued a second time. The code names the queued message's turn as still
+      // unsettled rather than as a finished replay — see the row above — and what this row
+      // measures is that the refusal happens *before* the address is consulted, which the empty
+      // journal is the observable for.
       const rewritten = await exchangeSocketLines(
         listener.socketPath,
         [
@@ -1014,10 +1103,11 @@ describe("the daemon's Buzz message ingress", () => {
       );
       expect(JSON.parse(rewritten.trim())).toMatchObject({
         ok: false,
-        reasonCode: ReasonCode.INGRESS_REPLAY_IGNORED,
+        reasonCode: ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN,
       });
       expect(unboundJournal(harness)).toEqual([]);
-      expect(rolePeer.peer.calls).toEqual(["CTO, 상태"]);
+      // Still one queued message, so the replay produced no second one.
+      expect(queuedOwnerMessages(harness)).toHaveLength(1);
 
       // And a repeated *unbound* event journals once, not once per copy. The first is refused at
       // the address and the second at the replay slot, which is the only reason the count stops.
@@ -1085,7 +1175,7 @@ describe("the daemon's Buzz message ingress", () => {
     }
   });
 
-  it("delivers through the daemon's own composition to a peer the CTO socket admitted", async () => {
+  it("carries an owner's message end to end through the daemon's own composition, and the peer takes it", async () => {
     const harness = makeHarness();
     const { projectId } = await registerFixtureProject(harness);
     const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
@@ -1123,10 +1213,28 @@ describe("the daemon's Buzz message ingress", () => {
         hasReasonCode,
       );
       const body = JSON.parse(delivered.trim()) as { ok: boolean; reasonCode: string; answer?: string };
-      expect(body).toMatchObject({ ok: true, reasonCode: ReasonCode.OK });
-      // The peer's own acknowledgement came back over the Buzz socket the relay called (B5).
-      expect(body.answer).toBe("받았다");
-      expect(peer.received).toEqual(["운영 경로로"]);
+      // Queued, not answered — and the relay is told which, in the code and in the sentence.
+      expect(body).toMatchObject({ ok: true, reasonCode: ReasonCode.UNTRUSTED_CONTENT_IS_DATA });
+      expect(body.answer).toContain("Stored for the role");
+
+      // The other half, over the connection the daemon itself admitted: the holder asks for its
+      // own message by role key and is handed the owner's words. This is the row that joins the
+      // two sockets — a fake peer handed to a port could not show that the ingress, the outbox and
+      // the CTO socket are talking about the same message.
+      const claimed = await peer.callTool("role_owner_message_claim", { roleKey });
+      expect(claimed.ok, claimed.message).toBe(true);
+      expect((claimed.value as { claimed?: { text?: string; messageId?: string } }).claimed?.text).toBe(
+        "운영 경로로",
+      );
+      const messageId = (claimed.value as { claimed: { messageId: string } }).claimed.messageId;
+
+      // And settling it closes both ledgers, through the same connection.
+      const completed = await peer.callTool("role_owner_message_complete", { roleKey, messageId });
+      expect(completed.ok, completed.message).toBe(true);
+      expect(harness.cp.outbox.get(messageId)?.status).toBe("ACKED");
+      expect(
+        JSON.parse(admittedRow(harness, "evt-prod")!.turn_claim_json!) as { noReplyAt?: unknown },
+      ).toMatchObject({ noReplyAt: expect.any(String) });
     } finally {
       await ingress.close();
       await peer.close();
@@ -1139,8 +1247,7 @@ describe("the daemon's Buzz message ingress", () => {
     const { projectId } = await registerFixtureProject(harness);
     const session = readyBoundSession(harness, "cto-peer", CTO_MENTION, [projectId]);
     const roleConversation = roleConversationFor(harness);
-    const rolePeer = fakeCeoPeer("owner에게만 답한다");
-    roleConversation.attach(rolePeer.server, stillHeldBy(session));
+    roleConversation.attach(fakeRolePeer(), stillHeldBy(session));
     const listener = await startMessageListener(harness, new CeoConversationPort(), roleConversation);
 
     try {
@@ -1158,7 +1265,7 @@ describe("the daemon's Buzz message ingress", () => {
         ok: false,
         reasonCode: ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED,
       });
-      expect(rolePeer.peer.calls).toEqual([]);
+      expect(queuedOwnerMessages(harness)).toEqual([]);
       expect(
         harness.cp.db.all(`SELECT nonce FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`, [
           buzzMessageNonce(eventId),
@@ -1176,8 +1283,12 @@ describe("the daemon's Buzz message ingress", () => {
         [envelope({ eventId, text: "CTO, 지금 멈춰", addressedTo: "CTO", mention: CTO_MENTION })],
         hasReasonCode,
       );
-      expect(JSON.parse(delivered.trim())).toMatchObject({ ok: true, reasonCode: ReasonCode.OK });
-      expect(rolePeer.peer.calls).toEqual(["CTO, 지금 멈춰"]);
+      expect(JSON.parse(delivered.trim())).toMatchObject({
+        ok: true,
+        reasonCode: ReasonCode.UNTRUSTED_CONTENT_IS_DATA,
+      });
+      expect(queuedOwnerMessages(harness)).toHaveLength(1);
+      expect(admittedText(harness, eventId)).toBe("CTO, 지금 멈춰");
     } finally {
       await listener.close();
     }

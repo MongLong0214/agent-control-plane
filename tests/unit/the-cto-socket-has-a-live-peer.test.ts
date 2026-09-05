@@ -274,6 +274,17 @@ const readySession = (harness: Harness, model: string) => {
   return { sessionId: session.sessionId, sessionSecret: session.sessionSecret };
 };
 
+/**
+ * The connection-bound claim, called the only way production can call it.
+ *
+ * `roleKey` is a lookup key and the sole argument: there is nowhere in this call for a session, an
+ * incarnation, an assignment, a generation or a client version, so a test cannot accidentally
+ * measure a holder identity the caller supplied. Everything the daemon acts on it derives from the
+ * connection this request arrived on and from the binding registry.
+ */
+const claimAs = (peer: PeerHandle, roleKey: string): Promise<ToolBody> =>
+  peer.callTool("role_owner_message_claim", { roleKey });
+
 describe("a message addressed to the CTO role reaches its holder, and nobody else", () => {
   it("delivers to the canonical PRIMARY_CTO peer over its own socket", async () => {
     const harness = makeHarness();
@@ -295,12 +306,15 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
         "the CTO connection to become the role's live peer",
       );
 
-      const delivered = await listeners.ctoConversation.deliver(roleKey, "addressed to the CTO");
-      if (!delivered.allowed) throw new Error(`delivery refused: ${delivered.message}`);
-      // The peer's own answer is what closes the delivery: `accepted` without it is the fault
-      // this whole issue is about (B5).
-      expect(delivered.value).toBe("received");
-      expect(peer.received).toEqual(["addressed to the CTO"]);
+      // The route is a pull over this same authenticated connection, so the row asks the way
+      // production does: the peer calls the tool, naming its role key as a *lookup key*, and the
+      // daemon derives everything else from the connection and the registry.
+      const claimed = await claimAs(peer, roleKey);
+      expect(claimed.ok, claimed.message).toBe(true);
+      // Nothing is addressed to it, and it is told exactly that — not handed a fabricated message
+      // and not handed somebody else's. `the-owner-message-has-one-durable-copy` covers the
+      // hand-over of a real one; what this row establishes is that the holder can reach the tool.
+      expect(claimed.value).toMatchObject({ claimed: null, hasMore: false });
     } finally {
       await peer.close();
       await listeners.close();
@@ -371,11 +385,16 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
         listeners.ctoConversation.connected(roleKey),
         "a bootstrap or wrong-project peer became the canonical CTO's destination",
       ).toBe(false);
-      const refused = await listeners.ctoConversation.deliver(roleKey, "must not arrive");
-      expect(refused.allowed).toBe(false);
-      expect(refused.reasonCode).toBe(ReasonCode.ROLE_PEER_ABSENT);
-      expect(bootstrapPeer.received, "the bootstrap CTO received the canonical CTO's mail").toEqual([]);
-      expect(strangerPeer.received, "another project's CTO received this project's mail").toEqual([]);
+      // Both connections name the canonical key as a lookup key, which is the only thing either
+      // of them *can* say, and neither becomes its holder. Asked from each connection separately,
+      // because "the port has no peer for that key" and "this connection is not it" are two
+      // different refusals and only one of them is about who asked.
+      const fromBootstrap = await claimAs(bootstrapPeer, roleKey);
+      expect(fromBootstrap.ok).toBe(false);
+      expect(fromBootstrap.reasonCode).toBe(ReasonCode.ROLE_PEER_ABSENT);
+      const fromStranger = await claimAs(strangerPeer, roleKey);
+      expect(fromStranger.ok).toBe(false);
+      expect(fromStranger.reasonCode).toBe(ReasonCode.ROLE_PEER_ABSENT);
     } finally {
       await bootstrapPeer.close();
       await strangerPeer.close();
@@ -455,11 +474,16 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
           "a bootstrap binding became a destination on the primary port",
         ).toBe(false);
 
-        const toA = await listeners.ctoConversation.deliver(keyA, "for project A");
-        if (!toA.allowed) throw new Error(`project A was unreachable: ${toA.message}`);
-        const toB = await listeners.ctoConversation.deliver(keyB, "for project B");
-        if (!toB.allowed) throw new Error(`project B was unreachable: ${toB.message}`);
-        expect(peer.received).toEqual(["for project A", "for project B"]);
+        const toA = await claimAs(peer, keyA);
+        expect(toA.ok, `project A was unreachable: ${toA.message}`).toBe(true);
+        const toB = await claimAs(peer, keyB);
+        expect(toB.ok, `project B was unreachable: ${toB.message}`).toBe(true);
+        // And the bootstrap key stays unreachable from the very same connection, so the two
+        // acceptances above are about which bindings this runtime holds rather than about the
+        // connection being trusted wholesale.
+        const toBootstrap = await claimAs(peer, bootstrapKey);
+        expect(toBootstrap.ok).toBe(false);
+        expect(toBootstrap.reasonCode).toBe(ReasonCode.ROLE_PEER_ABSENT);
       } finally {
         await peer.close();
         await listeners.close();
@@ -507,20 +531,24 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
         listeners.ctoConversation.connected(keyB),
         "a session took the slot of a project another session is the CTO of",
       ).toBe(false);
-      const refused = await listeners.ctoConversation.deliver(keyB, "for project B only");
-      expect(refused.allowed).toBe(false);
+      const refused = await claimAs(peerOne, keyB);
+      expect(refused.ok).toBe(false);
       expect(refused.reasonCode).toBe(ReasonCode.ROLE_PEER_ABSENT);
-      expect(peerOne.received, "S1 received mail addressed to the CTO of project B").toEqual([]);
 
       // And B's own holder reaches it, so the refusal above is about who asked rather than about
       // the project being unreachable.
       const peerTwo = await connectPeer(ctoSocket, { token: TOKEN, ...s2 });
       try {
         await until(() => listeners.ctoConversation.connected(keyB), "S2 to hold its own project");
-        const delivered = await listeners.ctoConversation.deliver(keyB, "for project B only");
-        if (!delivered.allowed) throw new Error(`B's own holder was unreachable: ${delivered.message}`);
-        expect(peerTwo.received).toEqual(["for project B only"]);
-        expect(peerOne.received).toEqual([]);
+        const delivered = await claimAs(peerTwo, keyB);
+        expect(delivered.ok, `B's own holder was unreachable: ${delivered.message}`).toBe(true);
+        // The wrong-role denial, now that B *does* have a live peer: S1's connection naming B's
+        // key is refused for a different reason than before — somebody is attached, and it is not
+        // this connection. Without the `peer.server === server` test this is the call that would
+        // let one connection settle another runtime's messages.
+        const wrongRole = await claimAs(peerOne, keyB);
+        expect(wrongRole.ok).toBe(false);
+        expect(wrongRole.reasonCode).toBe(ReasonCode.ROLE_PEER_STALE);
       } finally {
         await peerTwo.close();
       }
@@ -580,23 +608,22 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
         "the registry did not move project B's runtime",
       ).toBe(s2.sessionId);
 
-      const stale = await listeners.ctoConversation.deliver(keyB, "must not reach the old runtime");
-      expect(stale.allowed).toBe(false);
+      const stale = await claimAs(before, keyB);
+      expect(stale.ok).toBe(false);
       expect(stale.reasonCode).toBe(ReasonCode.ROLE_PEER_STALE);
 
       // The sibling binding is still valid and still on this connection, so the refusal above is
-      // the delivery predicate deciding — not the connection having become ineligible.
-      const toA = await listeners.ctoConversation.deliver(keyA, "still for project A");
-      if (!toA.allowed) throw new Error(`the surviving sibling role was lost: ${toA.message}`);
-      expect(before.received).toEqual(["still for project A"]);
+      // the holder predicate deciding — not the connection having become ineligible.
+      const toA = await claimAs(before, keyA);
+      expect(toA.ok, `the surviving sibling role was lost: ${toA.message}`).toBe(true);
 
       const after = await connectPeer(ctoSocket, { token: TOKEN, ...s2 });
       try {
         await until(() => listeners.ctoConversation.connected(keyB), "the new runtime to hold B");
-        const toB = await listeners.ctoConversation.deliver(keyB, "for the new runtime");
-        if (!toB.allowed) throw new Error(`the new runtime was unreachable: ${toB.message}`);
-        expect(after.received).toEqual(["for the new runtime"]);
-        expect(before.received, "the old runtime received B's mail").toEqual(["still for project A"]);
+        const toB = await claimAs(after, keyB);
+        expect(toB.ok, `the new runtime was unreachable: ${toB.message}`).toBe(true);
+        const oldRuntime = await claimAs(before, keyB);
+        expect(oldRuntime.ok, "the old runtime could still take B's messages").toBe(false);
       } finally {
         await after.close();
       }
@@ -681,21 +708,20 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       // A's own slot is refused, and refusing is what releases it — `connected(keyA)` answers for
       // the recorded slot, so without this the wait below would return on S1's stale entry and the
       // last delivery would measure eviction rather than S2's arrival.
-      const stale = await listeners.ctoConversation.deliver(keyA, "must not reach the old runtime");
-      expect(stale.allowed).toBe(false);
+      const stale = await claimAs(before, keyA);
+      expect(stale.ok).toBe(false);
       expect(stale.reasonCode).toBe(ReasonCode.ROLE_PEER_STALE);
 
-      const toB = await listeners.ctoConversation.deliver(keyB, "still for project B");
-      if (!toB.allowed) throw new Error(`the surviving sibling role was lost: ${toB.message}`);
-      expect(before.received).toEqual(["still for project B"]);
+      const toB = await claimAs(before, keyB);
+      expect(toB.ok, `the surviving sibling role was lost: ${toB.message}`).toBe(true);
 
       const after = await connectPeer(ctoSocket, { token: TOKEN, ...s2 });
       try {
         await until(() => listeners.ctoConversation.connected(keyA), "the new runtime to hold A");
-        const toA = await listeners.ctoConversation.deliver(keyA, "for the new runtime");
-        if (!toA.allowed) throw new Error(`the new runtime was unreachable: ${toA.message}`);
-        expect(after.received).toEqual(["for the new runtime"]);
-        expect(before.received, "the old runtime received A's mail").toEqual(["still for project B"]);
+        const toA = await claimAs(after, keyA);
+        expect(toA.ok, `the new runtime was unreachable: ${toA.message}`).toBe(true);
+        const oldRuntime = await claimAs(before, keyA);
+        expect(oldRuntime.ok, "the old runtime could still take A's messages").toBe(false);
       } finally {
         await after.close();
       }
@@ -737,10 +763,9 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
         () => !listeners.ctoConversation.connected(roleKey),
         "the disconnected peer to stop being the destination",
       );
-      // Nothing is delivered into a socket that has gone: absence is reported as absence.
-      const afterClose = await listeners.ctoConversation.deliver(roleKey, "into a closed socket");
-      expect(afterClose.allowed).toBe(false);
-      expect(afterClose.reasonCode).toBe(ReasonCode.ROLE_PEER_ABSENT);
+      // Absence is reported as absence. The observable is `connected` rather than a refused tool
+      // call, and it has to be: the route is a pull, so the only connection that could ask about
+      // this role is the one that just went, and there is nothing left to ask on.
 
       // Reconnect, then close the *replaced* connection last. Its detach must not clear the peer
       // that took its place — that would strand delivery on nobody while a live session is there.
@@ -758,9 +783,8 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       );
       await replaced.close();
 
-      const delivered = await listeners.ctoConversation.deliver(roleKey, "after the swap");
-      if (!delivered.allowed) throw new Error(`the replacement peer was detached: ${delivered.message}`);
-      expect(replacement.received).toEqual(["after the swap"]);
+      const delivered = await claimAs(replacement, roleKey);
+      expect(delivered.ok, `the replacement peer was detached: ${delivered.message}`).toBe(true);
     } finally {
       for (const peer of opened) await peer.close();
       await listeners.close();
@@ -912,17 +936,28 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       const registered = await peer.callTool("role_wake_endpoint_register", { endpoint: endpoint.path });
       expect(registered.ok).toBe(true);
 
+      // §3's drain: a successful registration sends **one constant wake unconditionally**, before
+      // anything asks whether something is queued. That is what empties a queue that filled while
+      // nobody was attached, and it is why this path needs no poller and no retry timer. Waited on
+      // rather than asserted immediately, because it is sent inside the tool call's own turn.
+      await until(
+        () => endpoint.received.length === 1,
+        "the unconditional wake a successful registration sends",
+      );
+
       const woken = await listeners.ctoConversation.wake(roleKey);
       expect(woken.reasonCode).toBe(ReasonCode.OK);
       expect(woken.allowed).toBe(true);
-      await until(() => endpoint.received.length === 1, "the wake to land on the peer's endpoint");
+      await until(() => endpoint.received.length === 2, "the wake to land on the peer's endpoint");
       // **The byte shape itself**, not merely that something was written. This transport is a
       // version-pinned local runtime contract and the frame is part of that contract: the runtime
       // accepts this envelope because it is the shape it parses, so a row that accepted any bytes
       // would go green against a wake no real 2.1.259 client would ever read.
-      expect(endpoint.received).toEqual([
-        `${JSON.stringify({ type: "user", message: { role: "user", content: "ACP-ROLE-WAKE" } })}\n`,
-      ]);
+      const wakeFrame = `${JSON.stringify({
+        type: "user",
+        message: { role: "user", content: "ACP-ROLE-WAKE" },
+      })}\n`;
+      expect(endpoint.received).toEqual([wakeFrame, wakeFrame]);
       expect(endpoint.received[0]).toBe(ROLE_WAKE_FRAME);
       // And the whole of what it says. Anything else in here — a nonce, a sender, an event id, a
       // count — would make the endpoint a disclosure channel defended only by a file mode, and
@@ -944,7 +979,7 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       const afterClose = await listeners.ctoConversation.wake(roleKey);
       expect(afterClose.allowed).toBe(false);
       expect(afterClose.reasonCode).toBe(ReasonCode.ROLE_PEER_ABSENT);
-      expect(endpoint.received).toEqual([ROLE_WAKE_FRAME]);
+      expect(endpoint.received).toEqual([ROLE_WAKE_FRAME, ROLE_WAKE_FRAME]);
 
       // The half a durable endpoint would get wrong, and the reason a table was refused for this.
       // A successor connection for the same role, from the same session, is the current holder by
@@ -959,7 +994,7 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       const inherited = await listeners.ctoConversation.wake(roleKey);
       expect(inherited.allowed).toBe(false);
       expect(inherited.reasonCode).toBe(ReasonCode.ROLE_PEER_UNSUPPORTED);
-      expect(endpoint.received).toEqual([ROLE_WAKE_FRAME]);
+      expect(endpoint.received).toEqual([ROLE_WAKE_FRAME, ROLE_WAKE_FRAME]);
     } finally {
       await peer.close();
       if (successor) await successor.close();

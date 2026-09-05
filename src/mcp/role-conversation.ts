@@ -3,11 +3,11 @@ import { connect } from "node:net";
 import { dirname, resolve as resolvePath } from "node:path";
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { Role, RoleBinding } from "../domain/types.ts";
+import type { HolderIdentity, UnresolvedOwnerMessage } from "../outbox/outbox.ts";
 import type { AuthenticatedMcpPeer, McpPeerAuthenticator } from "./shared.ts";
 
 /**
@@ -32,8 +32,15 @@ import type { AuthenticatedMcpPeer, McpPeerAuthenticator } from "./shared.ts";
  *
  * This is deliberately narrower than `CeoConversationPort`. That port carries a Telegram turn's
  * budget, its one-at-a-time rule and its `REACHED`/`NEVER_REACHED` contact fact, all of which
- * belong to the owner-conversation route. Delivery of an addressed message needs one thing from
- * the peer: that it took it.
+ * belong to the owner-conversation route.
+ *
+ * **Nothing is pushed at the peer.** The daemon used to hand the text over `sampling/createMessage`
+ * and treat the peer's reply as the acknowledgement; that made the message's only durable home the
+ * in-flight request, so a peer that died mid-turn lost it and a peer that was absent never got it.
+ * The message now lives in the outbox, the peer is sent one constant contentless wake, and the peer
+ * comes and takes it over this same authenticated connection. The wake is the only thing this port
+ * sends; everything that carries the owner's words is a *pull* the holder authorizes by being the
+ * holder.
  */
 interface LivePeer {
   server: McpServer;
@@ -79,14 +86,38 @@ export interface RoleBindingSource {
   currentCandidates(): readonly RoleBinding[];
 }
 
-const isTextContent = (content: unknown): content is { type: "text"; text: string } =>
-  typeof content === "object" &&
-  content !== null &&
-  (content as { type?: unknown }).type === "text" &&
-  typeof (content as { text?: unknown }).text === "string";
+/**
+ * What one owner-message hand-over gives its holder.
+ *
+ * `claimed` is the only thing here that carries the owner's words, and `unresolved` deliberately
+ * cannot: it is `Outbox`'s own payload-free projection, so "never the payload twice" is a property
+ * of the type rather than of this port remembering not to fill one in.
+ */
+export interface OwnerMessageHandover {
+  claimed: {
+    messageId: string;
+    /** The original text, re-read from the single durable copy and parsed as untrusted data. */
+    text: string;
+    sourceNonce: string;
+    createdAt: string;
+  } | null;
+  unresolved: readonly UnresolvedOwnerMessage[];
+  hasMore: boolean;
+}
 
-/** How long the daemon waits for the peer to take a delivery before it calls the peer gone. */
-export const DEFAULT_ROLE_DELIVERY_TIMEOUT_MS = 30_000;
+/**
+ * The durable owner-message ledger, as the connection-bound tools reach it.
+ *
+ * Every method takes a `HolderIdentity` this port derived, never one a caller supplied — see
+ * `#holderFor`. The implementations own the transactions: a claim re-verifies its source and
+ * terminally rejects the row it just took if that source does not check out, and a settle closes
+ * the outbox row and the matching ingress claim together or closes neither.
+ */
+export interface OwnerMessageLedger {
+  claim(holder: HolderIdentity): Decision<OwnerMessageHandover>;
+  complete(messageId: string, holder: HolderIdentity): Decision<void>;
+  reject(messageId: string, holder: HolderIdentity): Decision<void>;
+}
 
 /**
  * How long a wake may take. Much shorter than a delivery, and for a different reason: a delivery
@@ -191,8 +222,14 @@ export class RoleConversationPort {
   readonly #live = new Map<string, LivePeer>();
   readonly #role: Role;
   readonly #bindings: RoleBindingSource;
-  readonly #timeoutMs: number;
-  readonly #maxTokens: number;
+  /**
+   * The durable owner-message ledger, or `null` when the composition wired none.
+   *
+   * `null` fails closed: the tools exist on the connection and refuse, rather than being absent in
+   * a way a caller cannot tell from a role it does not hold. A deployment that forgets this line
+   * loses the ability to take owner messages; it never gains the ability to take somebody else's.
+   */
+  readonly #ownerMessages: OwnerMessageLedger | null;
   /**
    * The one directory a wake endpoint may live directly beneath — the daemon's own 0700 state
    * directory, where `cto.mcp.sock` and `hermes.mcp.sock` already are.
@@ -208,16 +245,14 @@ export class RoleConversationPort {
     role: Role,
     bindings: RoleBindingSource,
     options: {
-      timeoutMs?: number;
-      maxTokens?: number;
       endpointDir?: string;
       wakeTimeoutMs?: number;
+      ownerMessages?: OwnerMessageLedger;
     } = {},
   ) {
     this.#role = role;
     this.#bindings = bindings;
-    this.#timeoutMs = options.timeoutMs ?? DEFAULT_ROLE_DELIVERY_TIMEOUT_MS;
-    this.#maxTokens = options.maxTokens ?? 1024;
+    this.#ownerMessages = options.ownerMessages ?? null;
     this.#endpointDir = options.endpointDir === undefined ? null : resolvePath(options.endpointDir);
     this.#wakeTimeoutMs = options.wakeTimeoutMs ?? DEFAULT_ROLE_WAKE_TIMEOUT_MS;
   }
@@ -457,7 +492,7 @@ export class RoleConversationPort {
    * The client build is pinned here because the endpoint is the client's own artefact: see
    * `C0_QUALIFIED_CLIENT`.
    */
-  registerEndpoint(server: McpServer, endpoint: string): Decision<readonly string[]> {
+  async registerEndpoint(server: McpServer, endpoint: string): Promise<Decision<readonly string[]>> {
     const owned = [...this.#live.entries()].filter(([, peer]) => peer.server === server);
     if (owned.length === 0) {
       return deny(
@@ -496,7 +531,113 @@ export class RoleConversationPort {
       }
     }
     for (const [, peer] of owned) peer.endpoint = validated.value;
-    return allow(ReasonCode.OK, owned.map(([roleKey]) => roleKey));
+    const registered = owned.map(([roleKey]) => roleKey);
+
+    // §3 — one constant wake per registered slot, unconditionally, and this is what makes the
+    // whole path pollerless. A message admitted while nobody was attached is durable and PENDING,
+    // and the wake that would have nudged its holder was refused for want of an endpoint; without
+    // this line the only thing that would ever move it is another owner message. Sending it
+    // unconditionally — rather than only when something is known to be queued — means this port
+    // never has to ask the ledger a question, and an empty queue costs one refused connect.
+    //
+    // The outcome is deliberately discarded. Registration succeeded on the strength of the checks
+    // above; a wake that does not land says nothing about whether the endpoint is registered, and
+    // folding it into this decision would make a correct registration look refused.
+    for (const roleKey of registered) await this.wake(roleKey);
+    return allow(ReasonCode.OK, registered);
+  }
+
+  /**
+   * The exact holder behind one authenticated connection — every field derived, none supplied.
+   *
+   * `roleKey` is a **lookup key and nothing more**. It selects a slot; it does not assert anything
+   * about the caller, and there is deliberately no argument anywhere on this surface in which a
+   * caller could name a session, an incarnation, an assignment, a generation, a pid, a version or
+   * a digest. What the holder *is* comes from two places the caller does not control: the
+   * connection's own authenticator, and the binding registry.
+   *
+   * The `peer.server === server` test is the connection-binding itself. Without it, a session that
+   * legitimately holds one role could name a sibling slot on the same socket and settle another
+   * runtime's messages — the lookup key would have become an address.
+   */
+  #holderFor(server: McpServer, roleKey: string): Decision<HolderIdentity> {
+    const peer = this.#live.get(roleKey);
+    if (!peer) {
+      return deny(ReasonCode.ROLE_PEER_ABSENT, "no session is currently attached for this role", {
+        role: this.#role,
+        roleKey,
+      });
+    }
+    if (peer.server !== server) {
+      return deny(
+        ReasonCode.ROLE_PEER_STALE,
+        "this connection is not the live peer of the role it named",
+        { role: this.#role, roleKey },
+      );
+    }
+    const identity = peer.authenticate();
+    if (!identity.allowed || !this.#isCurrentHolder(peer.binding, identity.value)) {
+      if (this.#live.get(roleKey) === peer) this.#live.delete(roleKey);
+      return deny(
+        ReasonCode.ROLE_PEER_STALE,
+        "the attached peer no longer holds the role its socket was admitted under",
+        { role: this.#role, roleKey, generation: peer.binding.bindingGeneration },
+      );
+    }
+    // From the registry, not from `peer.binding`: the slot's binding is what admission recorded,
+    // and `#isCurrentHolder` has just established that the registry agrees with it. Taking the
+    // values from the authority that was consulted keeps a stale copy out of the write.
+    const current = this.#bindings.active(roleKey);
+    if (!current) {
+      return deny(ReasonCode.ROLE_PEER_STALE, "this role has no active binding", {
+        role: this.#role,
+        roleKey,
+      });
+    }
+    return allow(ReasonCode.OK, {
+      roleKey,
+      bindingGeneration: current.bindingGeneration,
+      targetSessionId: current.sessionId,
+      sessionIncarnation: identity.value.sessionIncarnation!,
+    });
+  }
+
+  #ledger(): Decision<OwnerMessageLedger> {
+    if (!this.#ownerMessages) {
+      return deny(
+        ReasonCode.ROLE_PEER_UNSUPPORTED,
+        "this deployment wired no durable owner-message ledger for this role",
+        { role: this.#role },
+      );
+    }
+    return allow(ReasonCode.OK, this.#ownerMessages);
+  }
+
+  /** Takes at most one of this connection's own owner-messages. See `OwnerMessageLedger`. */
+  claimOwnerMessage(server: McpServer, roleKey: string): Decision<OwnerMessageHandover> {
+    const holder = this.#holderFor(server, roleKey);
+    if (!holder.allowed) return holder as Decision<OwnerMessageHandover>;
+    const ledger = this.#ledger();
+    if (!ledger.allowed) return ledger as Decision<OwnerMessageHandover>;
+    return ledger.value.claim(holder.value);
+  }
+
+  /** Records that this connection took and finished one of its own owner-messages. */
+  completeOwnerMessage(server: McpServer, roleKey: string, messageId: string): Decision<void> {
+    const holder = this.#holderFor(server, roleKey);
+    if (!holder.allowed) return holder as Decision<void>;
+    const ledger = this.#ledger();
+    if (!ledger.allowed) return ledger as Decision<void>;
+    return ledger.value.complete(messageId, holder.value);
+  }
+
+  /** Refuses one of this connection's own owner-messages, terminally. */
+  rejectOwnerMessage(server: McpServer, roleKey: string, messageId: string): Decision<void> {
+    const holder = this.#holderFor(server, roleKey);
+    if (!holder.allowed) return holder as Decision<void>;
+    const ledger = this.#ledger();
+    if (!ledger.allowed) return ledger as Decision<void>;
+    return ledger.value.reject(messageId, holder.value);
   }
 
   /**
@@ -578,78 +719,4 @@ export class RoleConversationPort {
     return allow(ReasonCode.OK, undefined);
   }
 
-  /**
-   * Hands `text` to whoever currently holds the role, and answers whether they took it.
-   *
-   * The acknowledgement is the peer's own reply, because `accepted` without it is the fault this
-   * whole issue is about: a relay that took the bytes is not a reader that saw them (B5).
-   */
-  async deliver(roleKey: string, text: string): Promise<Decision<string>> {
-    const peer = this.#live.get(roleKey);
-    if (!peer) {
-      return deny(
-        ReasonCode.ROLE_PEER_ABSENT,
-        "no session is currently attached for this role, so the message was not delivered",
-        { role: this.#role, roleKey },
-      );
-    }
-
-    // The registry is asked again at send time, against this connection's own authenticated
-    // identity: the holder can move between attach and delivery, and a message addressed to the
-    // role is not the former holder's to receive.
-    const identity = peer.authenticate();
-    if (!identity.allowed || !this.#isCurrentHolder(peer.binding, identity.value)) {
-      if (this.#live.get(roleKey) === peer) this.#live.delete(roleKey);
-      return deny(
-        ReasonCode.ROLE_PEER_STALE,
-        "the attached peer no longer holds the role its socket was admitted under",
-        { role: this.#role, roleKey, generation: peer.binding.bindingGeneration },
-      );
-    }
-
-    if (!peer.server.server.getClientCapabilities()?.sampling) {
-      return deny(
-        ReasonCode.ROLE_PEER_UNSUPPORTED,
-        "the attached peer did not declare the sampling capability delivery travels on",
-        { role: this.#role, roleKey },
-      );
-    }
-
-    let result: Awaited<ReturnType<McpServer["server"]["createMessage"]>>;
-    try {
-      result = await peer.server.server.createMessage(
-        { messages: [{ role: "user", content: { type: "text", text } }], maxTokens: this.#maxTokens },
-        { timeout: this.#timeoutMs },
-      );
-    } catch (error) {
-      // Left as one code on purpose: every branch here means the delivery is unacknowledged, and
-      // B5 makes an unacknowledged delivery a debt that is redelivered rather than a state the
-      // caller distinguishes. The shape is kept in the evidence for the operator.
-      const shape =
-        error instanceof McpError
-          ? error.code === ErrorCode.RequestTimeout
-            ? "timeout"
-            : error.code === ErrorCode.ConnectionClosed
-              ? "connection-closed"
-              : "peer-error"
-          : error instanceof Error && error.message === "Not connected"
-            ? "not-connected"
-            : "unclassified";
-      return deny(
-        ReasonCode.ROLE_PEER_FAILED,
-        "the attached peer did not acknowledge the delivery",
-        { role: this.#role, roleKey, timeoutMs: this.#timeoutMs, shape },
-      );
-    }
-
-    const content = result.content;
-    if (!isTextContent(content)) {
-      return deny(
-        ReasonCode.ROLE_PEER_FAILED,
-        "the attached peer acknowledged with content this text-only route cannot read",
-        { role: this.#role, roleKey, shape: "not-text" },
-      );
-    }
-    return allow(ReasonCode.OK, content.text);
-  }
 }
