@@ -168,9 +168,14 @@ export interface RollbackPairExpectation {
   serviceLabel: string;
   /** The app root this generation installs under. */
   workingDirectory: string;
-  serviceGeneration?: string;
-  nodeVersion?: string;
-  schemaVersion?: number;
+  /** Where the runtime closure is installed. */
+  runtimeRoot: string;
+  /** The schema version the sealed image must be at. */
+  schemaVersion: number;
+  /** The generation being restored, as the approver recorded it. */
+  serviceGeneration: string;
+  /** The runtime version the sealed closure declares. */
+  nodeVersion: string;
 }
 
 const hashFile = (path: string): string => {
@@ -264,11 +269,107 @@ const assertAbsolute = (value: string, what: string): void => {
   }
 };
 
+const XML_ENTITIES: Record<string, string> = {
+  "&amp;": "&",
+  "&lt;": "<",
+  "&gt;": ">",
+  "&quot;": '"',
+  "&apos;": "'",
+};
+
+const unescapeXml = (value: string): string =>
+  value.replace(/&(?:amp|lt|gt|quot|apos);/g, (entity) => XML_ENTITIES[entity] ?? entity);
+
+export type PlistValue = string | string[];
+
+/**
+ * Parses the launchd plist into its top-level keys.
+ *
+ * A substring search over the plist text is not a check on the plist. `text.includes(label)` is
+ * satisfied by the label appearing in an XML comment, in an unrelated key's value, or in a
+ * `StandardOutPath` that happens to contain it — none of which is launchd loading that job. What
+ * decides at load time is the value bound to a key, so that is what this reads.
+ *
+ * Deliberately a closed parser over the shape this repository's own renderer emits — a flat
+ * `<dict>` of `<key>` to `<string>` or `<array>` of `<string>` — rather than a general XML
+ * reader. Anything outside that shape is refused rather than guessed at.
+ */
+export const parsePlistDictionary = (text: string, where: string): Record<string, PlistValue> => {
+  const open = text.indexOf("<dict>");
+  const close = text.lastIndexOf("</dict>");
+  if (open === -1 || close === -1 || close < open) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "the sealed plist has no dictionary to read", { where });
+  }
+  const body = text.slice(open + "<dict>".length, close);
+  const entries: Record<string, PlistValue> = {};
+  const scanner = /<key>([\s\S]*?)<\/key>\s*(<string>[\s\S]*?<\/string>|<array>[\s\S]*?<\/array>|<true\/>|<false\/>|<integer>[\s\S]*?<\/integer>|<dict>[\s\S]*?<\/dict>)/g;
+  for (;;) {
+    const match = scanner.exec(body);
+    if (!match) break;
+    const key = unescapeXml(match[1]!.trim());
+    const raw = match[2]!;
+    if (raw.startsWith("<string>")) {
+      entries[key] = unescapeXml(raw.slice("<string>".length, -"</string>".length));
+    } else if (raw.startsWith("<array>")) {
+      const inner = raw.slice("<array>".length, -"</array>".length);
+      entries[key] = [...inner.matchAll(/<string>([\s\S]*?)<\/string>/g)].map((entry) =>
+        unescapeXml(entry[1]!),
+      );
+    }
+  }
+  return entries;
+};
+
+export interface LauncherBinding {
+  nodePath: string;
+  appRoot: string;
+  /** The entrypoint the launcher executes, relative to the app root. */
+  entrypoint: string;
+}
+
+/** `printf %q` leaves a plain path bare and single-quotes anything that needs it. */
+const unquoteShell = (value: string): string => {
+  const trimmed = value.trim();
+  if (trimmed.length >= 2 && trimmed.startsWith("'") && trimmed.endsWith("'")) {
+    return trimmed.slice(1, -1).replaceAll("'\\''", "'");
+  }
+  return trimmed;
+};
+
+/**
+ * Reads the launcher as the closed grammar the installer generates, rather than searching it.
+ *
+ * The installer writes exactly three things this cares about: an `ACP_NODE_PATH` assignment, an
+ * `ACP_APP_ROOT` assignment, and a final `exec` of the entrypoint under both. A launcher that does
+ * not parse as that grammar is refused — which is the point, because a comment mentioning the
+ * right path satisfies a substring search while binding the daemon to something else entirely.
+ */
+export const parseLauncherBinding = (text: string, where: string): LauncherBinding => {
+  const nodeLine = /^ACP_NODE_PATH=(.+)$/m.exec(text);
+  const appLine = /^ACP_APP_ROOT=(.+)$/m.exec(text);
+  const execLine = /^exec "\$ACP_NODE_PATH" "\$ACP_APP_ROOT\/(.+)"\s*$/m.exec(text);
+  if (!nodeLine?.[1] || !appLine?.[1] || !execLine?.[1]) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "the sealed launcher does not parse as a launcher this deployment generates", {
+      where,
+      boundNode: Boolean(nodeLine),
+      boundAppRoot: Boolean(appLine),
+      boundEntrypoint: Boolean(execLine),
+    });
+  }
+  return {
+    nodePath: unquoteShell(nodeLine[1]),
+    appRoot: unquoteShell(appLine[1]),
+    entrypoint: execLine[1].trim(),
+  };
+};
+
 /**
  * The bindings the plist and launcher must already carry, checked against the identity the pair
- * declares. This is what stops pair A's database from being installed beside generation B's
- * runtime: the sealed launcher names one Node executable and one entrypoint, and if they are not
- * the closure in this pair the pair is refused rather than half-applied.
+ * declares — by parsed field and parsed grammar, never by substring.
+ *
+ * This is what stops pair A's database from being installed beside generation B's runtime: the
+ * sealed launcher binds one Node executable and one entrypoint, and if they are not the closure
+ * in this pair the pair is refused rather than half-applied.
  */
 const assertGenerationBindings = (
   identity: RollbackPairIdentity,
@@ -277,38 +378,48 @@ const assertGenerationBindings = (
   where: string,
 ): void => {
   const { runtime, service } = identity;
-  const expectedLabel = `<key>Label</key>`;
-  if (!plistText.includes(expectedLabel) || !plistText.includes(`<string>${service.label}</string>`)) {
+  const plist = parsePlistDictionary(plistText, where);
+
+  if (plist["Label"] !== service.label) {
     throw acpError(ReasonCode.INTERNAL_ERROR, "the sealed plist does not declare the service label this pair names", {
       where,
-      label: service.label,
+      expected: service.label,
+      found: plist["Label"],
     });
   }
-  if (!plistText.includes(`<string>${service.launcherDestination}</string>`)) {
+  const programArguments = plist["ProgramArguments"];
+  if (
+    !Array.isArray(programArguments) ||
+    programArguments.length !== 1 ||
+    programArguments[0] !== service.launcherDestination
+  ) {
     throw acpError(ReasonCode.INTERNAL_ERROR, "the sealed plist does not run the launcher this pair installs", {
       where,
-      launcherDestination: service.launcherDestination,
+      expected: [service.launcherDestination],
+      found: programArguments,
     });
   }
-  if (
-    !plistText.includes("<key>WorkingDirectory</key>") ||
-    !plistText.includes(`<string>${service.workingDirectory}</string>`)
-  ) {
+  if (plist["WorkingDirectory"] !== service.workingDirectory) {
     throw acpError(ReasonCode.INTERNAL_ERROR, "the sealed plist does not name the working directory this pair installs under", {
       where,
-      workingDirectory: service.workingDirectory,
+      expected: service.workingDirectory,
+      found: plist["WorkingDirectory"],
     });
   }
-  if (!launcherText.includes(`ACP_NODE_PATH=${runtime.nodePath}`)) {
+
+  const launcher = parseLauncherBinding(launcherText, where);
+  if (launcher.nodePath !== runtime.nodePath) {
     throw acpError(ReasonCode.INTERNAL_ERROR, "the sealed launcher is not bound to the Node executable this pair names", {
       where,
-      nodePath: runtime.nodePath,
+      expected: runtime.nodePath,
+      found: launcher.nodePath,
     });
   }
-  if (!launcherText.includes(`ACP_APP_ROOT=${service.workingDirectory}`)) {
+  if (launcher.appRoot !== service.workingDirectory) {
     throw acpError(ReasonCode.INTERNAL_ERROR, "the sealed launcher is not bound to the app root this pair installs under", {
       where,
-      workingDirectory: service.workingDirectory,
+      expected: service.workingDirectory,
+      found: launcher.appRoot,
     });
   }
   const installedEntrypoint = join(runtime.installRoot, runtime.entrypoint);
@@ -320,10 +431,11 @@ const assertGenerationBindings = (
       workingDirectory: service.workingDirectory,
     });
   }
-  if (!launcherText.includes(`"$ACP_APP_ROOT/${fromAppRoot}"`)) {
+  if (launcher.entrypoint !== fromAppRoot) {
     throw acpError(ReasonCode.INTERNAL_ERROR, "the sealed launcher does not execute the entrypoint this pair installs", {
       where,
-      entrypoint: fromAppRoot,
+      expected: fromAppRoot,
+      found: launcher.entrypoint,
     });
   }
 };
@@ -475,6 +587,10 @@ export const sealRollbackPair = async (
       databaseTargetPath: identity.database.targetPath,
       serviceLabel: identity.service.label,
       workingDirectory: identity.service.workingDirectory,
+      runtimeRoot: identity.runtime.installRoot,
+      schemaVersion: identity.schemaVersion,
+      serviceGeneration: identity.service.generation,
+      nodeVersion: identity.runtime.nodeVersion,
     });
 
     if (existsSync(root)) {
@@ -625,6 +741,11 @@ export const validateRollbackPair = (
 
   // The externally retained digest, first, because everything below is read out of files this
   // digest is the only evidence about.
+  // The index is held to every rule a member is held to. It is the file the whole chain hangs
+  // from, and for a while it was the one file exempt from the checks it makes possible: a
+  // hard-linked or link-reached index can be rewritten by whoever holds the other name, and then
+  // every digest below is measured against text an outsider chose.
+  const containedIn = `${root}${sep}`;
   const indexPath = join(root, ROLLBACK_PAIR_INDEX_FILE);
   const indexStat = lstatSync(indexPath);
   if (!indexStat.isFile() || indexStat.isSymbolicLink()) {
@@ -632,7 +753,21 @@ export const validateRollbackPair = (
       indexPath,
     });
   }
-  const indexBytes = readFileSync(indexPath);
+  if (indexStat.nlink !== 1) {
+    throw acpError(ReasonCode.STATE_PATH_INSECURE, "the sealed pair index is hard-linked from outside the pair", {
+      indexPath,
+      links: indexStat.nlink,
+    });
+  }
+  const resolvedIndexPath = realpathSync(indexPath);
+  if (!resolvedIndexPath.startsWith(containedIn)) {
+    throw acpError(ReasonCode.STATE_PATH_INSECURE, "the sealed pair index escapes the sealed pair root once resolved", {
+      indexPath,
+      resolved: resolvedIndexPath,
+    });
+  }
+  const indexIdentity = `${indexStat.dev}:${indexStat.ino}`;
+  const indexBytes = readFileSync(resolvedIndexPath);
   const indexDigest = hashBytes(indexBytes);
   if (indexDigest !== expectation.indexDigest) {
     throw acpError(ReasonCode.INTERNAL_ERROR, "the sealed pair index digest does not match the one retained outside it", {
@@ -671,7 +806,7 @@ export const validateRollbackPair = (
 
   // Every member is a regular, unaliased, non-symlink file, and the path that gets *opened* — the
   // resolved one — is inside this pair. The unresolved string is never used again below.
-  const contained = `${root}${sep}`;
+  const contained = containedIn;
   const resolvedByMember = new Map<string, string>();
   const identityByMember = new Map<string, string>();
   const sizeByMember = new Map<string, number>();
@@ -824,7 +959,14 @@ export const validateRollbackPair = (
   if (new Set(rolePaths).size !== rolePaths.length) {
     throw acpError(ReasonCode.INTERNAL_ERROR, "two roles in the sealed pair are the same member", { root, roles });
   }
-  const roleIdentities = rolePaths.map((member) => identityByMember.get(member)!);
+  // Every role, plus the index and the manifest: no two of them may be the same inode. A pair
+  // whose index and manifest are one file, or whose plist is also its launcher, has fewer
+  // independent artifacts than it claims to have.
+  const roleIdentities = [
+    ...rolePaths.map((member) => identityByMember.get(member)!),
+    indexIdentity,
+    identityByMember.get(ROLLBACK_PAIR_MANIFEST_FILE)!,
+  ];
   if (new Set(roleIdentities).size !== roleIdentities.length) {
     throw acpError(ReasonCode.INTERNAL_ERROR, "two roles in the sealed pair are the same file", { root, roles });
   }
@@ -902,28 +1044,35 @@ export const validateRollbackPair = (
       found: manifest.identity.service.workingDirectory,
     });
   }
-  if (expectation.schemaVersion !== undefined && expectation.schemaVersion !== manifest.identity.schemaVersion) {
+  // None of these is optional. An expectation a caller may omit is an expectation that will be
+  // omitted, and then a pair for one schema, generation, runtime or install root is applied to
+  // another with nothing objecting.
+  if (expectation.schemaVersion !== manifest.identity.schemaVersion) {
     throw acpError(ReasonCode.INTERNAL_ERROR, "the sealed pair is at a different schema version", {
       root,
       expected: expectation.schemaVersion,
       found: manifest.identity.schemaVersion,
     });
   }
-  if (
-    expectation.serviceGeneration !== undefined &&
-    expectation.serviceGeneration !== manifest.identity.service.generation
-  ) {
+  if (expectation.serviceGeneration !== manifest.identity.service.generation) {
     throw acpError(ReasonCode.INTERNAL_ERROR, "the sealed pair states a different service generation", {
       root,
       expected: expectation.serviceGeneration,
       found: manifest.identity.service.generation,
     });
   }
-  if (expectation.nodeVersion !== undefined && expectation.nodeVersion !== manifest.identity.runtime.nodeVersion) {
+  if (expectation.nodeVersion !== manifest.identity.runtime.nodeVersion) {
     throw acpError(ReasonCode.INTERNAL_ERROR, "the sealed pair states a different runtime version", {
       root,
       expected: expectation.nodeVersion,
       found: manifest.identity.runtime.nodeVersion,
+    });
+  }
+  if (canonical(expectation.runtimeRoot) !== manifest.identity.runtime.installRoot) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "the sealed pair installs its runtime somewhere else", {
+      root,
+      expected: canonical(expectation.runtimeRoot),
+      found: manifest.identity.runtime.installRoot,
     });
   }
 
@@ -950,8 +1099,6 @@ export interface StagedRollbackPair {
   runtimeRoot: string;
   stateAdminPath: string;
 }
-
-const STAGE_MANIFEST = "stage.json";
 
 /**
  * Validates a pair and then takes its own copy of every member.
@@ -997,6 +1144,42 @@ export const stageRollbackPair = (
         });
       }
     }
+    // The index and the manifest come into the stage too, and the index is then re-verified from
+    // the copy against the digest retained outside the pair — not against the pair, and not by
+    // trusting the earlier read. Everything installed below is checked against text this stage
+    // holds, so a rewrite of the pair's index after validation changes nothing that runs.
+    for (const member of [ROLLBACK_PAIR_MANIFEST_FILE, ROLLBACK_PAIR_INDEX_FILE]) {
+      copyPrivateFile(join(validated.root, member), join(pairMembers, member));
+      const stagedStat = lstatSync(join(pairMembers, member));
+      if (!stagedStat.isFile() || stagedStat.isSymbolicLink() || stagedStat.nlink !== 1) {
+        throw acpError(ReasonCode.STATE_PATH_INSECURE, "a staged pair artifact is not a private regular file", {
+          stageRoot,
+          member,
+        });
+      }
+    }
+    const stagedIndexBytes = readFileSync(join(pairMembers, ROLLBACK_PAIR_INDEX_FILE));
+    const stagedIndexDigest = hashBytes(stagedIndexBytes);
+    if (stagedIndexDigest !== expectation.indexDigest) {
+      throw acpError(ReasonCode.INTERNAL_ERROR, "the staged index does not match the digest retained outside the pair", {
+        stageRoot,
+        expected: expectation.indexDigest,
+        actual: stagedIndexDigest,
+      });
+    }
+    // And the staged members are measured against the staged index, so the stage is internally
+    // whole on its own terms rather than by inheritance from the pair it came from.
+    const stagedEntries = parseIndex(stagedIndexBytes.toString("utf8"), stageRoot);
+    const stagedDigests = new Map(stagedEntries.map((entry) => [entry.path, entry.sha256]));
+    for (const member of validated.manifest.inventory) {
+      if (stagedDigests.get(member.path) !== hashFile(join(pairMembers, member.path))) {
+        throw acpError(ReasonCode.INTERNAL_ERROR, "a staged member does not match the staged index", {
+          stageRoot,
+          member: member.path,
+        });
+      }
+    }
+
     const identity = validated.manifest.identity;
     assertGenerationBindings(
       identity,
@@ -1187,6 +1370,32 @@ export const applyRollbackPair = (
  * quietly use A and ignore B. On this command that is the difference between rolling back the
  * database an operator named and one they corrected themselves out of, and nothing would say so.
  */
+/**
+ * The whole rollback, under one authority, in one process.
+ *
+ * There is deliberately no way to hand a caller a stage path and let them apply it later. A stage
+ * directory named on a command line is an unauthenticated mutation authority: whoever can name it
+ * can install whatever is in it, and whatever wrote `stage.json` decides what a later `apply`
+ * believes it is installing. So validate, copy, re-verify, install and the post-condition all
+ * happen inside this call, and the stage is created and destroyed within it.
+ *
+ * The caller stops the service before and starts it after; that is the only seam, because
+ * launchctl is theirs to drive.
+ */
+export const rollbackToSealedPair = (
+  pairRoot: string,
+  expectation: RollbackPairExpectation,
+  stageParent: string,
+  options: ApplyOptions = {},
+): AppliedRollbackPair => {
+  const staged = stageRollbackPair(pairRoot, expectation, stageParent);
+  try {
+    return applyRollbackPair(staged, options);
+  } finally {
+    rmSync(staged.stageRoot, { recursive: true, force: true });
+  }
+};
+
 const argumentValue = (argv: readonly string[], flag: string): string | undefined => {
   const occurrences = argv.reduce((count, entry) => (entry === flag ? count + 1 : count), 0);
   if (occurrences > 1) {
@@ -1197,7 +1406,7 @@ const argumentValue = (argv: readonly string[], flag: string): string | undefine
   return argv[at + 1];
 };
 
-const USAGE = `rollback-pair — seal, validate, stage and apply one exact rollback pair
+const USAGE = `rollback-pair — seal, validate and roll back one exact sealed pair
 
   rollback-pair seal --pairs-root DIR --database FILE \\
     --runtime-root DIR --entrypoint REL --state-admin REL \\
@@ -1206,19 +1415,22 @@ const USAGE = `rollback-pair — seal, validate, stage and apply one exact rollb
     --working-directory DIR \\
     --service-label LABEL --service-generation NAME --plist FILE --launcher FILE
 
-  rollback-pair validate|stage --pair-root DIR --pair-id UUID \\
+  rollback-pair validate|rollback --pair-root DIR --pair-id UUID \\
     --expected-index-digest sha256:HEX --expect-database FILE \\
-    --expect-service-label LABEL --expect-working-directory DIR [--stage-parent DIR]
-
-  rollback-pair apply --stage-root DIR
+    --expect-service-label LABEL --expect-working-directory DIR \\
+    --expect-runtime-root DIR --expect-schema-version N \\
+    --expect-service-generation NAME --expect-node-version vX.Y.Z \\
+    [--stage-parent DIR, required by rollback]
 
 seal states every identity rather than probing for it, so the same command seals the generation
 being left and the one being moved to. It prints the pair id and SHA256(SHA256SUMS); retain both
 OUTSIDE the pair, because a pair cannot prove its own index.
 
-validate mutates nothing. stage validates and then takes its own verified copy of every member,
-and apply installs only from that stage: runtime closure, plist, launcher and database together,
-or the previous generation put back.
+validate mutates nothing. rollback does the whole operation under one authority — validate, a
+private verified copy of every member, install of the runtime closure, plist, launcher and
+database together, and the post-condition — or puts the previous generation back. There is no way
+to hand out a stage and apply it later: a stage path on a command line is a mutation authority
+anyone who can name it holds.
 `;
 
 const REQUIRED_SEAL_FLAGS = [
@@ -1246,15 +1458,31 @@ const REQUIRED_USE_FLAGS = [
   "--expect-database",
   "--expect-service-label",
   "--expect-working-directory",
+  "--expect-runtime-root",
+  "--expect-schema-version",
+  "--expect-service-generation",
+  "--expect-node-version",
 ] as const;
 
-const expectationFrom = (supplied: Map<string, string>): RollbackPairExpectation => ({
-  pairId: supplied.get("--pair-id")!,
-  indexDigest: supplied.get("--expected-index-digest")!,
-  databaseTargetPath: supplied.get("--expect-database")!,
-  serviceLabel: supplied.get("--expect-service-label")!,
-  workingDirectory: supplied.get("--expect-working-directory")!,
-});
+const expectationFrom = (supplied: Map<string, string>): RollbackPairExpectation => {
+  const schemaVersion = Number(supplied.get("--expect-schema-version"));
+  if (!Number.isInteger(schemaVersion)) {
+    throw acpError(ReasonCode.INVALID_ARGUMENT, "the expected schema version must be an integer", {
+      value: supplied.get("--expect-schema-version"),
+    });
+  }
+  return {
+    pairId: supplied.get("--pair-id")!,
+    indexDigest: supplied.get("--expected-index-digest")!,
+    databaseTargetPath: supplied.get("--expect-database")!,
+    serviceLabel: supplied.get("--expect-service-label")!,
+    workingDirectory: supplied.get("--expect-working-directory")!,
+    runtimeRoot: supplied.get("--expect-runtime-root")!,
+    schemaVersion,
+    serviceGeneration: supplied.get("--expect-service-generation")!,
+    nodeVersion: supplied.get("--expect-node-version")!,
+  };
+};
 
 const collect = (argv: readonly string[], flags: readonly string[]): Map<string, string> | null => {
   const supplied = new Map<string, string>();
@@ -1306,7 +1534,7 @@ const main = async (argv: readonly string[]): Promise<number> => {
     return 0;
   }
 
-  if (command === "validate" || command === "stage") {
+  if (command === "validate" || command === "rollback") {
     const supplied = collect(argv, REQUIRED_USE_FLAGS);
     if (!supplied) {
       process.stderr.write(USAGE);
@@ -1331,46 +1559,7 @@ const main = async (argv: readonly string[]): Promise<number> => {
       process.stderr.write(USAGE);
       return 2;
     }
-    const stagedPair = stageRollbackPair(supplied.get("--pair-root")!, expectation, stageParent);
-    writeFileSync(
-      join(stagedPair.stageRoot, STAGE_MANIFEST),
-      `${JSON.stringify({ pairId: stagedPair.pairId, manifest: stagedPair.manifest }, null, 2)}\n`,
-      { encoding: "utf8", mode: PRIVATE_FILE_MODE },
-    );
-    process.stdout.write(
-      [
-        `ACP_PAIR_ID=${stagedPair.pairId}`,
-        `ACP_STAGE_ROOT=${stagedPair.stageRoot}`,
-        `ACP_PAIR_SERVICE_GENERATION=${stagedPair.manifest.identity.service.generation}`,
-        "",
-      ].join("\n"),
-    );
-    return 0;
-  }
-
-  if (command === "apply") {
-    const stageRoot = argumentValue(argv, "--stage-root");
-    if (!stageRoot) {
-      process.stderr.write(USAGE);
-      return 2;
-    }
-    assertAbsolute(stageRoot, "the stage root");
-    const stageManifest = JSON.parse(readFileSync(join(stageRoot, STAGE_MANIFEST), "utf8")) as {
-      pairId: string;
-      manifest: RollbackPairManifest;
-    };
-    const manifest = stageManifest.manifest;
-    const pairMembers = join(stageRoot, "pair");
-    const applied = applyRollbackPair({
-      pairId: stageManifest.pairId,
-      stageRoot,
-      manifest,
-      databasePath: join(pairMembers, manifest.database.member),
-      plistPath: join(pairMembers, manifest.identity.service.plist),
-      launcherPath: join(pairMembers, manifest.identity.service.launcher),
-      runtimeRoot: join(pairMembers, "runtime"),
-      stateAdminPath: join(pairMembers, "runtime", manifest.identity.runtime.stateAdmin),
-    });
+    const applied = rollbackToSealedPair(supplied.get("--pair-root")!, expectation, stageParent);
     process.stdout.write(
       [
         `ACP_APPLIED_PAIR_ID=${applied.pairId}`,

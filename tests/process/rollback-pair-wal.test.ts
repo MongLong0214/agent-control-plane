@@ -17,7 +17,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterAll, describe, expect, it } from "vitest";
 
-import { Db } from "../../src/db/database.ts";
+import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
 import {
   applyRollbackPair,
   sealRollbackPair,
@@ -213,6 +213,35 @@ interface GenerationFixture {
 
 const GENERATION_MARKER = "GENERATION.txt";
 
+/** Every flag the one canonical rollback invocation requires. */
+const cliFlags = (
+  fixture: GenerationFixture,
+  sealed: { root: string; pairId: string; indexDigest: string },
+): string[] => [
+  "--pair-root",
+  sealed.root,
+  "--pair-id",
+  sealed.pairId,
+  "--expected-index-digest",
+  sealed.indexDigest,
+  "--expect-database",
+  fixture.databasePath,
+  "--expect-service-label",
+  LABEL,
+  "--expect-working-directory",
+  fixture.appRoot,
+  "--expect-runtime-root",
+  fixture.installRoot,
+  "--expect-schema-version",
+  String(SCHEMA_VERSION),
+  "--expect-service-generation",
+  "generation-a",
+  "--expect-node-version",
+  process.version,
+  "--stage-parent",
+  join(fixture.root, "stage"),
+];
+
 const makeGenerationFixture = (prefix: string): GenerationFixture => {
   const root = tempDir(prefix);
   const appRootRaw = join(root, "app-root");
@@ -274,6 +303,10 @@ const makeGenerationFixture = (prefix: string): GenerationFixture => {
       databaseTargetPath: databasePath,
       serviceLabel: LABEL,
       workingDirectory: appRoot,
+      runtimeRoot: installRoot,
+      schemaVersion: SCHEMA_VERSION,
+      serviceGeneration: "generation-a",
+      nodeVersion: process.version,
     }),
   };
 };
@@ -381,33 +414,9 @@ describe("a rollback installs one whole generation", () => {
     expect(installedGeneration(fixture.installRoot)).toBe("generation-b");
     expect(databaseMarkers(fixture.databasePath)).toEqual(["generation-a", "generation-b"]);
 
-    const staged = spawnSync(
-      process.execPath,
-      [
-        VALIDATOR,
-        "stage",
-        "--pair-root",
-        sealed.root,
-        "--pair-id",
-        sealed.pairId,
-        "--expected-index-digest",
-        sealed.indexDigest,
-        "--expect-database",
-        fixture.databasePath,
-        "--expect-service-label",
-        LABEL,
-        "--expect-working-directory",
-        fixture.appRoot,
-        "--stage-parent",
-        join(fixture.root, "stage"),
-      ],
-      { encoding: "utf8" },
-    );
-    expect(staged.status, staged.stderr).toBe(0);
-    const stageRoot = /ACP_STAGE_ROOT=(.+)/.exec(staged.stdout)?.[1];
-    expect(stageRoot).toBeDefined();
-
-    const applied = spawnSync(process.execPath, [VALIDATOR, "apply", "--stage-root", stageRoot!], {
+    // One invocation. There is no stage to hand back and no second command that could be pointed
+    // at one, which is the whole point: a stage path on a command line is a mutation authority.
+    const applied = spawnSync(process.execPath, [VALIDATOR, "rollback", ...cliFlags(fixture, sealed)], {
       encoding: "utf8",
     });
     expect(applied.status, applied.stderr).toBe(0);
@@ -439,39 +448,53 @@ describe("a rollback installs one whole generation", () => {
     const elsewhere = makeGenerationFixture("acp-rollback-cross-target-other-");
     new Db(elsewhere.databasePath).close();
 
-    const stageArgs = (overrides: Record<string, string> = {}): string[] => {
-      const flags: Record<string, string> = {
-        "--pair-root": sealed.root,
-        "--pair-id": sealed.pairId,
-        "--expected-index-digest": sealed.indexDigest,
-        "--expect-database": fixture.databasePath,
-        "--expect-service-label": LABEL,
-        "--expect-working-directory": fixture.appRoot,
-        "--stage-parent": join(fixture.root, "stage"),
+    const rollbackArgs = (overrides: Record<string, string> = {}): string[] => [
+      VALIDATOR,
+      "rollback",
+      ...Object.entries({
+        ...Object.fromEntries(
+          cliFlags(fixture, sealed)
+            .reduce<string[][]>((pairs, value, at) => {
+              if (at % 2 === 0) pairs.push([value]);
+              else pairs[pairs.length - 1]!.push(value);
+              return pairs;
+            }, [])
+            .map((pair) => [pair[0]!, pair[1]!]),
+        ),
         ...overrides,
-      };
-      return [VALIDATOR, "stage", ...Object.entries(flags).flat()];
-    };
+      }).flat(),
+    ];
 
     for (const [what, overrides] of [
       ["database", { "--expect-database": elsewhere.databasePath }],
       ["service label", { "--expect-service-label": "com.example.other" }],
       ["app root", { "--expect-working-directory": elsewhere.appRoot }],
+      ["generation", { "--expect-service-generation": "generation-nobody-sealed" }],
+      ["runtime version", { "--expect-node-version": "v0.0.0" }],
     ] as const) {
-      const refused = spawnSync(process.execPath, stageArgs(overrides), { encoding: "utf8" });
+      const refused = spawnSync(process.execPath, rollbackArgs(overrides), { encoding: "utf8" });
       expect(refused.status, `${what} mismatch was accepted`).toBe(1);
       expect(refused.stdout).toBe("");
     }
 
     // A repeated flag is refused rather than silently resolved to its first occurrence — which
-    // is how the three rows above passed against an earlier build that never saw the override.
+    // is how the rows above passed against an earlier build that never saw the override.
     const repeated = spawnSync(
       process.execPath,
-      [...stageArgs(), "--expect-database", elsewhere.databasePath],
+      [...rollbackArgs(), "--expect-database", elsewhere.databasePath],
       { encoding: "utf8" },
     );
     expect(repeated.status).toBe(1);
     expect(repeated.stderr).toContain("given more than once");
+
+    // And the retired handoff is really gone: there is no command that takes a stage.
+    const handoff = spawnSync(process.execPath, [VALIDATOR, "apply", "--stage-root", fixture.root], {
+      encoding: "utf8",
+    });
+    expect(handoff.status, "a stage handoff command still exists").not.toBe(0);
+    expect(handoff.stdout, "a stage handoff command still installs something").not.toContain(
+      "ACP_APPLIED_",
+    );
   });
 
   it("puts the previous generation back at every post-stop failure point", async () => {

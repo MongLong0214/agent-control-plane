@@ -12,7 +12,8 @@ Usage:
   deploy/install-launchd.sh install [--app-root PATH] [--node PATH] [--keychain-service NAME] [--no-start]
   deploy/install-launchd.sh start | stop | restart | status | uninstall
   deploy/install-launchd.sh upgrade --app-root PATH [--node PATH] [--keychain-service NAME]
-  deploy/install-launchd.sh rollback --pair-id UUID --expected-index-digest sha256:HEX
+  deploy/install-launchd.sh rollback --pair-id UUID --expected-index-digest sha256:HEX \
+    --expect-schema-version N --expect-service-generation NAME --expect-node-version vX.Y.Z
 
 rollback restores one sealed pair, named by its UUID under
 $HOME/.agent-control-plane/rollback-pairs/. It selects nothing implicitly: the pair holds the
@@ -51,6 +52,9 @@ buzz_keychain_account="${ACP_BUZZ_KEYCHAIN_ACCOUNT:-secrets}"
 buzz_keychain_identity="${ACP_BUZZ_KEYCHAIN_IDENTITY:-identity}"
 pair_id=""
 expected_index_digest=""
+expect_schema_version=""
+expect_service_generation=""
+expect_node_version=""
 no_start=0
 
 while [[ $# -gt 0 ]]; do
@@ -65,6 +69,12 @@ while [[ $# -gt 0 ]]; do
       pair_id="${2:-}"; shift 2 ;;
     --expected-index-digest)
       expected_index_digest="${2:-}"; shift 2 ;;
+    --expect-schema-version)
+      expect_schema_version="${2:-}"; shift 2 ;;
+    --expect-service-generation)
+      expect_service_generation="${2:-}"; shift 2 ;;
+    --expect-node-version)
+      expect_node_version="${2:-}"; shift 2 ;;
     --no-start)
       no_start=1; shift ;;
     --help|-h)
@@ -403,6 +413,15 @@ case "$command_name" in
       fail "rollback requires --expected-index-digest sha256:<hex>, the digest retained outside the pair"
     [[ "$expected_index_digest" =~ ^sha256:[0-9a-f]{64}$ ]] ||
       fail "expected index digest must be sha256:<64 hex digits>: $expected_index_digest"
+    # Structural compatibility is not optional. A rollback that does not state which schema,
+    # generation and runtime it is restoring can be applied to a deployment it was never for, and
+    # the pair would have no way to object.
+    [[ "$expect_schema_version" =~ ^[0-9]+$ ]] ||
+      fail "rollback requires --expect-schema-version <integer>, the schema the sealed image is at"
+    [[ -n "$expect_service_generation" ]] ||
+      fail "rollback requires --expect-service-generation <name>, the generation being restored"
+    [[ -n "$expect_node_version" ]] ||
+      fail "rollback requires --expect-node-version <version>, the runtime the sealed closure declares"
     resolve_app_root
     resolve_node
     # Read-only from here to the last prevalidation line: a refused rollback must leave the
@@ -426,45 +445,46 @@ case "$command_name" in
     [[ "$actual_index_digest" == "$expected_index_digest" ]] ||
       fail "sealed pair index digest does not match the retained digest: expected $expected_index_digest, found $actual_index_digest"
 
-    # Validate, then take our own verified copy of every member, in one process. The shell never
-    # learns a path inside the pair and reopens it later: bytes swapped, or rewritten through a
-    # hard-linked alias, after validation would change the pair and not the stage, and the stage
-    # is what gets installed. This also states what the deployment *is* — database, service label
-    # and app root — so a pair sealed for a different one is refused rather than applied.
-    stage_report="$("$node_path" "$validator" stage --pair-root "$pair_root" \
-      --pair-id "$pair_id" --expected-index-digest "$expected_index_digest" \
-      --expect-database "$state_dir/state.sqlite" \
-      --expect-service-label "$LABEL" \
-      --expect-working-directory "$app_root" \
-      --stage-parent "$state_dir/rollback-stage")" ||
-      fail "sealed rollback pair failed validation: $pair_root"
-    stage_root=""
-    applied_generation=""
-    while IFS='=' read -r report_key report_value; do
-      case "$report_key" in
-        ACP_STAGE_ROOT) stage_root="$report_value" ;;
-        ACP_PAIR_SERVICE_GENERATION) applied_generation="$report_value" ;;
-      esac
-    done <<< "$stage_report"
-    [[ -n "$stage_root" && "$stage_root" == "$state_dir/rollback-stage/"* ]] ||
-      fail "the rollback stage was not created where this deployment keeps it: $stage_root"
-    [[ -d "$stage_root" && ! -L "$stage_root" ]] || fail "the rollback stage is not a direct directory: $stage_root"
+    # One invocation, one authority. The installer never learns a path inside the pair and never
+    # hands one back in: validate, private verified copy, install and post-condition all happen
+    # inside the command below, so there is no stage directory anyone can name and apply later.
+    # It also states what the deployment *is* — database, service label, app root, install root,
+    # schema, generation and runtime — so a pair sealed for a different one is refused.
+    rollback_flags=(
+      --pair-root "$pair_root"
+      --pair-id "$pair_id"
+      --expected-index-digest "$expected_index_digest"
+      --expect-database "$state_dir/state.sqlite"
+      --expect-service-label "$LABEL"
+      --expect-working-directory "$app_root"
+      --expect-runtime-root "$app_root/dist"
+      --expect-schema-version "$expect_schema_version"
+      --expect-service-generation "$expect_service_generation"
+      --expect-node-version "$expect_node_version"
+      --stage-parent "$state_dir/rollback-stage"
+    )
 
-    # Everything below this line is one generation being replaced. `apply` installs the sealed
+    # Everything below this line is one generation being replaced. The command installs the sealed
     # runtime closure, plist, launcher and database together — restoring the database through the
     # *sealed* state-admin under the *sealed* Node, because pair A's image installed by generation
     # B's code is the defect this whole mechanism exists to prevent — and puts the previous
-    # generation back if any step fails. A failed apply therefore ends with the old generation
+    # generation back if any step fails. A failed rollback therefore ends with the old generation
     # whole, so the job is started again rather than left down.
+    "$node_path" "$validator" validate "${rollback_flags[@]}" >/dev/null ||
+      fail "sealed rollback pair failed validation: $pair_root"
     stop_job
     wait_for_stop
-    if ! "$node_path" "$validator" apply --stage-root "$stage_root"; then
+    if ! rollback_report="$("$node_path" "$validator" rollback "${rollback_flags[@]}")"; then
       start_job
-      rm -rf "$stage_root"
       fail "rollback failed and the previous generation was restored; the service was started again"
     fi
     start_job
-    rm -rf "$stage_root"
+    applied_generation=""
+    while IFS='=' read -r report_key report_value; do
+      case "$report_key" in
+        ACP_APPLIED_GENERATION) applied_generation="$report_value" ;;
+      esac
+    done <<< "$rollback_report"
     printf 'rolled back to sealed pair %s (generation %s)\n' "$pair_id" "$applied_generation"
     ;;
 esac

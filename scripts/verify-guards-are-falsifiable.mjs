@@ -3558,6 +3558,28 @@ const GUARDS = [
     ],
   },
   {
+    // Measured: the previous version of the named test extracted only the text between item 6's
+    // two markers and asserted a denylist over it. It passed 5/5 against exactly this mutation —
+    // a destructive command one line *above* the opening marker. The extraction window never
+    // contained it, so nothing ran it and no string search looked for it.
+    //
+    // The test now extracts every indented command line in item 6, in document order, and
+    // compares a full inventory of the app root, the state directory and LaunchAgents — relative
+    // path, type, mode, inode and content digest — before and after the refusal. This row is that
+    // falsifier, kept so the fix cannot quietly regress to a census: with it applied, the named
+    // row fails on the inventory it took, not on a token it happened to be looking for.
+    what: "item 6 runs no destructive command outside the sealed-pair invocation, including above its opening marker",
+    file: "docs/ops/owner-actions.md",
+    find: "<!-- owner-actions:rollback-preflight:start -->\n",
+    replace:
+      '    : > "$APP_ROOT/dist/daemon/agentcpd.js"\n' +
+      "\n" +
+      "<!-- owner-actions:rollback-preflight:start -->\n",
+    killedBy: [
+      "tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts::refuses without a sealed pair, changing nothing anywhere it can reach",
+    ],
+  },
+  {
     // #737 and #745 round 4 left three rows here, each deleting one check from item 6's rollback
     // preflight and asserting the extracted script then ran `rm -rf` against a fixture's live
     // dist. All three are gone, and so is their subject: item 6 no longer builds a rollback out
@@ -3578,10 +3600,8 @@ const GUARDS = [
     // an operator reads during an emergency.
     what: "the documented rollback names an explicit sealed pair rather than letting the installer be run without one",
     file: "docs/ops/owner-actions.md",
-    find:
-      '    bash "$APP_ROOT/deploy/install-launchd.sh" rollback \\\n' +
-      '      --pair-id "$PAIR_ID" --expected-index-digest "$INDEX_DIGEST"\n',
-    replace: '    bash "$APP_ROOT/deploy/install-launchd.sh" rollback\n',
+    find: '      --pair-id "$PAIR_ID" --expected-index-digest "$INDEX_DIGEST" \\\n',
+    replace: "",
     killedBy: [
       "tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts::names a pair id and a retained digest, and carries no split-rollback token",
     ],

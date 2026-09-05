@@ -525,71 +525,44 @@ nobody watched being produced.)
 Never remove the manifest without that first `test`: a manifest whose database exists is half of a
 verified backup, and deleting it is how the failure this section is about gets recreated by hand.
 
-Bytes — nothing in `deploy/install-launchd.sh` snapshots `dist/`; `snapshot_current_deployment`
-only copies the plist and the launcher shell script, and
-that function only runs from the `install`/`upgrade` subcommands, which this procedure does not
-use (the app root and node path are not changing — only the tree's contents are). This copy is
-**forensic evidence**, not the rollback path: item 6 restores a sealed pair, which carries its own
-runtime closure. Keep it anyway — rebuilding from any git commit produces new bytes, not the ones
-that were actually running, and being able to compare the two afterwards is worth the disk:
+Bytes — seal a rollback pair. This replaces the hand-built byte snapshot that used to live here.
+That snapshot copied `dist`, the plist and the launcher into a directory the shell named, hashed
+one file, and wrote a receipt afterwards claiming the database backup and the bytes belonged
+together. They did not: two independently chosen halves are not a pair no matter what a third file
+says about them, and the receipt was only as good as the shell session that wrote it. A sealed
+pair carries the database image, the runtime closure, the plist and the launcher under one id, and
+item 6 restores it as one operation.
 
     set -e
-    BYTES_BACKUP="$HOME/.agent-control-plane/deploy-backups/dist-pre-512-$(date -u +%Y%m%dT%H%M%SZ)"
-    mkdir -p "$BYTES_BACKUP" && chmod 700 "$BYTES_BACKUP"
-    cp -a /Users/isaac/projects/agent-control-plane/dist "$BYTES_BACKUP/dist"
-    # Hash the copy, not the source. A hash of the source proves what was on the live tree, which
-    # is not the thing item 6 will restore from — a truncated or partial copy would carry a
-    # perfectly correct receipt describing bytes that are no longer anywhere.
-    shasum -a 256 "$BYTES_BACKUP/dist/daemon/agentcpd.js" | tee "$BYTES_BACKUP/agentcpd.js.sha256"
-    shasum -a 256 /Users/isaac/projects/agent-control-plane/dist/daemon/agentcpd.js
-    # The two lines above must print the same digest. If they differ, the copy is not the tree.
-    cp "$HOME/Library/LaunchAgents/com.agentcontrolplane.agentcpd.plist" "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist"
-    cp "$HOME/.agent-control-plane/agentcpd-launch.sh" "$BYTES_BACKUP/agentcpd-launch.sh"
-    chmod 600 "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist"
-    chmod 700 "$BYTES_BACKUP/agentcpd-launch.sh"
-    test -s "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist"
-    test -s "$BYTES_BACKUP/agentcpd-launch.sh"
-    test -f "$BYTES_BACKUP/dist/daemon/agentcpd.js"
-    echo "$BYTES_BACKUP"
+    APP_ROOT=/absolute/path/to/agent-control-plane
+    node "$APP_ROOT/dist/deploy/rollback-pair.js" seal \
+      --pairs-root "$HOME/.agent-control-plane/rollback-pairs" \
+      --database "$HOME/.agent-control-plane/state.sqlite" \
+      --runtime-root "$APP_ROOT/dist" \
+      --entrypoint daemon/agentcpd.js --state-admin db/state-admin.js \
+      --node-path "$(command -v node)" --node-version "$(node --version)" \
+      --install-runtime-root "$APP_ROOT/dist" \
+      --install-plist "$HOME/Library/LaunchAgents/com.agentcontrolplane.agentcpd.plist" \
+      --install-launcher "$HOME/.agent-control-plane/agentcpd-launch.sh" \
+      --working-directory "$APP_ROOT" \
+      --service-label com.agentcontrolplane.agentcpd \
+      --service-generation "$(git -C "$APP_ROOT" rev-parse HEAD)" \
+      --plist "$HOME/Library/LaunchAgents/com.agentcontrolplane.agentcpd.plist" \
+      --launcher "$HOME/.agent-control-plane/agentcpd-launch.sh"
 
-The plist and the launcher go into **this execution's** `$BYTES_BACKUP` directory, beside the
-`dist` copy, and `set -e` plus the `test` lines make a partial backup abort rather than look
-complete.
+Record what it prints. `ACP_PAIR_ID` and `ACP_PAIR_INDEX_DIGEST` are the two values item 6 needs,
+and the digest is deliberately the one thing kept **outside** the pair — a pair cannot prove its
+own index. Everything else the rollback needs is inside the pair.
 
-`$BACKUP_PATH` and `$BYTES_BACKUP` are produced by two independent commands — `state-admin.js`
-names the database backup, and the shell names the bytes directory — so **their timestamps are
-not the same value and must not be treated as a shared identity**. An earlier revision of this
-section claimed they were, and a later one tried to fix it with a receipt file written afterwards
-by hand. Neither works: two independently chosen halves are not a pair no matter what a third file
-says about them, and the receipt is only as good as the shell session that wrote it. Seal a pair
-instead — see "The sealed rollback pair" below — and keep this receipt purely as a note about what
-was on the machine at the time:
+`install-launchd.sh` does snapshot the plist and launcher — `snapshot_current_deployment` — but
+it runs from exactly one call site, inside `install|upgrade`, and this procedure calls neither, so
+`deploy-backups/` holds whatever some earlier install left there, or nothing at all. It is not a
+rollback source: **a rollback that restores a plist from a past install is not a rollback of this
+operation.**
 
-    cat > "$BYTES_BACKUP/rollback-receipt.json" <<JSON
-    { "databaseBackup": "$BACKUP_PATH",
-      "bytesBackup": "$BYTES_BACKUP",
-      "agentcpdSha256": "$(cut -d' ' -f1 "$BYTES_BACKUP/agentcpd.js.sha256")" }
-    JSON
-    cat "$BYTES_BACKUP/rollback-receipt.json"
-
-The receipt records what was here; it does not make two backups one operation. That is what the
-sealed pair is for, and item 6 uses nothing else.
-
-That co-location is not tidiness. `install-launchd.sh` does snapshot the plist and launcher —
-`snapshot_current_deployment` in `deploy/install-launchd.sh` — but it runs from exactly
-one call site, inside `install|upgrade`, and this procedure calls neither. So no
-snapshot is created by this run, and `deploy-backups/` holds whatever some earlier install left
-there, or nothing at all.
-
-**A rollback that restores a plist from a past install is not a rollback of this operation.**
-Both halves of item 6 therefore name `$BYTES_BACKUP` explicitly and never let a tool pick.
-
-`install-launchd.sh rollback` used to pick for itself — `find "$deploy_backups_dir" -mindepth 1
--maxdepth 1 -type d | sort | tail -n 1`, the newest directory *by name*. That is the selection
-this section warned about, and it is gone: `rollback` now restores one **sealed pair** named by
-its UUID and refuses to discover anything (see "The sealed rollback pair" below). Neither form
-helps *this* procedure, which creates no pair of its own, so item 6 still names `$BYTES_BACKUP`
-at every step.
+`rollback` used to pick from it — `find … | sort | tail -n 1`, the newest directory *by name*.
+That selection is gone. `rollback` now restores the sealed pair named above and discovers nothing,
+which is why this procedure seals one rather than assembling a rollback out of parts.
 
 **3. Stop the job, then rebuild the candidate, then validate on a throwaway copy — never the
 live file.**
@@ -781,9 +754,11 @@ refuses fail-closed without touching anything. Moving the block out from under t
 editing a command inside it, is not a formatting change: that test extracts from these markers and
 nowhere else, so it fails to find its anchor rather than silently testing stale text.
 
-Set three values first, from the seal recorded under "The sealed rollback pair" below —
-`APP_ROOT` is the deployment checkout, `PAIR_ID` and `INDEX_DIGEST` are what that seal printed and
-you retained outside the pair.
+Set six values first. `APP_ROOT` is the deployment checkout; `PAIR_ID` and `INDEX_DIGEST` are what
+the seal printed and you retained outside the pair; `SCHEMA_VERSION`, `SERVICE_GENERATION` and
+`NODE_VERSION` are what that same pair was sealed for. The last three are not decoration: a
+rollback that does not state which schema, generation and runtime it is restoring can be applied
+to a deployment it was never for, and the pair has no way to object.
 
 <!-- owner-actions:rollback-preflight:start -->
 
@@ -797,8 +772,14 @@ you retained outside the pair.
     test -n "$APP_ROOT"
     test -n "$PAIR_ID"
     test -n "$INDEX_DIGEST"
+    test -n "$SCHEMA_VERSION"
+    test -n "$SERVICE_GENERATION"
+    test -n "$NODE_VERSION"
     bash "$APP_ROOT/deploy/install-launchd.sh" rollback \
-      --pair-id "$PAIR_ID" --expected-index-digest "$INDEX_DIGEST"
+      --pair-id "$PAIR_ID" --expected-index-digest "$INDEX_DIGEST" \
+      --expect-schema-version "$SCHEMA_VERSION" \
+      --expect-service-generation "$SERVICE_GENERATION" \
+      --expect-node-version "$NODE_VERSION"
     bash "$APP_ROOT/deploy/install-launchd.sh" status
 
 <!-- owner-actions:rollback-preflight:end -->

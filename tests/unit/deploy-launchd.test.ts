@@ -353,6 +353,16 @@ const sealPairFor = async (
   return { pair, appRoot, databasePath };
 };
 
+/** Every structural expectation the installer now requires, for a fixture's own pair. */
+const structuralFlags = (fixture: PairFixture): string[] => [
+  "--expect-schema-version",
+  String(fixture.pair.manifest.identity.schemaVersion),
+  "--expect-service-generation",
+  fixture.pair.manifest.identity.service.generation,
+  "--expect-node-version",
+  fixture.pair.manifest.identity.runtime.nodeVersion,
+];
+
 const filesUnder = (directory: string): string[] => {
   const files: string[] = [];
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -719,6 +729,46 @@ describe("launchd deployment artifact", () => {
     expect(existsSync(harness.launchLog)).toBe(false);
   });
 
+  it("refuses a rollback that does not state the schema, generation and runtime it restores", () => {
+    const harness = makeHarness();
+    const base = [
+      "rollback",
+      "--app-root",
+      root,
+      "--node",
+      harness.node,
+      "--pair-id",
+      randomUUID(),
+      "--expected-index-digest",
+      `sha256:${"0".repeat(64)}`,
+    ];
+    const full = [
+      ...base,
+      "--expect-schema-version",
+      "36",
+      "--expect-service-generation",
+      "generation-under-test",
+      "--expect-node-version",
+      "v22.18.0",
+    ];
+
+    // Each structural expectation is required on its own. An expectation a caller may omit is one
+    // that will be omitted, and then a pair for one schema, generation or runtime is applied to a
+    // deployment it was never sealed for with nothing objecting.
+    for (const [omitted, message] of [
+      ["--expect-schema-version", "requires --expect-schema-version"],
+      ["--expect-service-generation", "requires --expect-service-generation"],
+      ["--expect-node-version", "requires --expect-node-version"],
+    ] as const) {
+      const at = full.indexOf(omitted);
+      const without = [...full.slice(0, at), ...full.slice(at + 2)];
+      const result = runInstaller(installer, without, harness);
+      expect(result.status, `rollback accepted a request omitting ${omitted}`).not.toBe(0);
+      expect(result.stderr).toContain(message);
+    }
+    expect(existsSync(harness.launchLog)).toBe(false);
+  });
+
   it("refuses `latest` and every other name that is not a pair id", () => {
     const harness = makeHarness();
     for (const pairId of ["latest", "20260901T000000Z-newest", "..", "../elsewhere"]) {
@@ -765,6 +815,7 @@ describe("launchd deployment artifact", () => {
         fixture.pair.pairId,
         "--expected-index-digest",
         `sha256:${"0".repeat(64)}`,
+        ...structuralFlags(fixture),
       ],
       harness,
     );
@@ -802,6 +853,12 @@ describe("launchd deployment artifact", () => {
         randomUUID(),
         "--expected-index-digest",
         `sha256:${"0".repeat(64)}`,
+        "--expect-schema-version",
+        "36",
+        "--expect-service-generation",
+        "generation-under-test",
+        "--expect-node-version",
+        process.version,
       ],
       harness,
     );
@@ -848,6 +905,7 @@ describe("launchd deployment artifact", () => {
         fixture.pair.pairId,
         "--expected-index-digest",
         fixture.pair.indexDigest,
+        ...structuralFlags(fixture),
       ],
       harness,
     );

@@ -245,6 +245,10 @@ const expectationFor = (
   databaseTargetPath: fixture.databasePath,
   serviceLabel: fixture.sources.launchd.label,
   workingDirectory: fixture.appRoot,
+  runtimeRoot: fixture.sources.install.runtimeRoot,
+  schemaVersion: pair.manifest.identity.schemaVersion,
+  serviceGeneration: fixture.sources.launchd.generation,
+  nodeVersion: fixture.sources.nodeVersion,
   ...overrides,
 });
 
@@ -344,6 +348,43 @@ describe("the exact rollback pair", () => {
     expect(() => validateRollbackPair(pair.root, expectationFor(fixture, pair))).toThrow(
       /hard-linked from outside the pair/,
     );
+  });
+
+  it("refuses an index hard-linked from outside the pair", async () => {
+    const { fixture, pair } = await sealFixture();
+    const index = join(pair.root, ROLLBACK_PAIR_INDEX_FILE);
+    const alias = join(fixture.home, "index-alias-anyone-can-rewrite");
+
+    // The index is the file the whole chain hangs from, and it was for a while the one file
+    // exempt from the rules it makes possible. A second name for its inode means whoever holds
+    // that name can rewrite the text every digest below is measured against.
+    linkSync(index, alias);
+    expect(lstatSync(index).nlink).toBe(2);
+
+    expect(() => validateRollbackPair(pair.root, expectationFor(fixture, pair))).toThrow(
+      /index is hard-linked from outside the pair/,
+    );
+  });
+
+  it("refuses an index and a manifest that are the same file", async () => {
+    const { fixture, pair } = await sealFixture();
+    const index = join(pair.root, ROLLBACK_PAIR_INDEX_FILE);
+    const manifest = join(pair.root, ROLLBACK_PAIR_MANIFEST_FILE);
+
+    // Two roles, one inode: a pair with fewer independent artifacts than it claims to have.
+    const text = readFileSync(index, "utf8");
+    unlinkSync(manifest);
+    linkSync(index, manifest);
+    const forgedDigest = `sha256:${sha256(text)}`;
+
+    // Refused — but by the hard-link guard, not by the role-identity comparison. Sharing an inode
+    // between two roles *is* a second name for that inode, so `nlink` sees it first and the
+    // identity comparison never gets the chance. That comparison is kept as depth for a case this
+    // one cannot construct, and it is recorded here as unkillable-by-this-row rather than left
+    // looking like it earned a kill.
+    expect(() =>
+      validateRollbackPair(pair.root, expectationFor(fixture, pair, { indexDigest: forgedDigest })),
+    ).toThrow(/index is hard-linked from outside the pair/);
   });
 
   it("resolves a member before it compares, refusing one reached through a linked directory", async () => {
@@ -497,6 +538,85 @@ describe("the exact rollback pair", () => {
     expect(() =>
       validateRollbackPair(pair.root, expectationFor(fixture, pair, { indexDigest: forgedDigest })),
     ).toThrow(/not bound to the Node executable this pair names/);
+  });
+
+  it("reads the plist's Label field, not the text around it", async () => {
+    const fixture = makeFixture();
+    // The right label, in a comment. A substring search over the plist text is satisfied by this
+    // and launchd is not: what decides at load time is the value bound to the key.
+    writeFileSync(
+      fixture.sources.launchd.plistPath,
+      [
+        '<?xml version="1.0"?>',
+        "<plist><dict>",
+        `  <!-- ${LABEL} -->`,
+        "  <key>Label</key>",
+        "  <string>com.example.not-this-service</string>",
+        "  <key>ProgramArguments</key>",
+        `  <array><string>${fixture.launcherDestination}</string></array>`,
+        "  <key>WorkingDirectory</key>",
+        `  <string>${fixture.appRoot}</string>`,
+        "</dict></plist>",
+        "",
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+
+    await expect(sealRollbackPair(fixture.pairsRoot, fixture.sources)).rejects.toThrow(
+      /does not declare the service label this pair names/,
+    );
+  });
+
+  it("reads the launcher's binding, not the text around it", async () => {
+    const fixture = makeFixture();
+    // The right Node path, in a comment; the binding points somewhere else entirely. This is the
+    // shape of "restore the database and leave generation B's runtime running".
+    writeFileSync(
+      fixture.sources.launchd.launcherPath,
+      [
+        "#!/bin/bash",
+        `# the approved runtime is ${fixture.sources.nodePath}`,
+        "ACP_NODE_PATH=/opt/generation-b/bin/node",
+        `ACP_APP_ROOT=${fixture.appRoot}`,
+        'exec "$ACP_NODE_PATH" "$ACP_APP_ROOT/dist/daemon/agentcpd.js"',
+        "",
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+
+    await expect(sealRollbackPair(fixture.pairsRoot, fixture.sources)).rejects.toThrow(
+      /not bound to the Node executable this pair names/,
+    );
+  });
+
+  it("refuses a launcher that does not parse as one this deployment generates", async () => {
+    const fixture = makeFixture();
+    writeFileSync(
+      fixture.sources.launchd.launcherPath,
+      "#!/bin/bash\n# every path this pair names, and no binding at all\nexec something-else\n",
+      { mode: 0o600 },
+    );
+
+    await expect(sealRollbackPair(fixture.pairsRoot, fixture.sources)).rejects.toThrow(
+      /does not parse as a launcher this deployment generates/,
+    );
+  });
+
+  it("refuses an expectation that does not match the schema, generation or runtime sealed", async () => {
+    const { fixture, pair } = await sealFixture();
+
+    expect(() =>
+      validateRollbackPair(pair.root, expectationFor(fixture, pair, { schemaVersion: 999 })),
+    ).toThrow(/different schema version/);
+    expect(() =>
+      validateRollbackPair(pair.root, expectationFor(fixture, pair, { serviceGeneration: "generation-b" })),
+    ).toThrow(/different service generation/);
+    expect(() =>
+      validateRollbackPair(pair.root, expectationFor(fixture, pair, { nodeVersion: "v0.0.0" })),
+    ).toThrow(/different runtime version/);
+    expect(() =>
+      validateRollbackPair(pair.root, expectationFor(fixture, pair, { runtimeRoot: join(fixture.home, "elsewhere") })),
+    ).toThrow(/installs its runtime somewhere else/);
   });
 
   it("refuses a declared schema version the sealed image is not at", async () => {
