@@ -881,9 +881,19 @@ class BuzzMentionSubscription {
     if (!validateEvent(event)) return rejected("event-malformed");
     if (!verifyEvent(event)) return rejected("event-signature-invalid");
     if (event.kind !== BUZZ_MENTION_KIND) return rejected("event-wrong-kind");
-    // The `p` filter is the relay's promise; this is the daemon checking it. A relay that widened
-    // the filter would otherwise hand this subscriber someone else's mail to speak for.
-    if (!tagValues(event, "p").some((value) => value === this.#pubkey)) {
+    // Exactly one `p`, and it is this identity. The `p` filter is the relay's promise; this is the
+    // daemon checking it, and a relay that widened the filter would otherwise hand this subscriber
+    // someone else's mail to speak for.
+    //
+    // The cardinality is the half that matters most, for the same reason the `h` check below
+    // enforces one room and harder. Two recipients means the daemon picks which of several
+    // addressees it is and then speaks as that one — and everything downstream is built on the
+    // answer: `mention` becomes the address the seam resolves to a role, so a multi-recipient
+    // envelope admitted here is an owner's message delivered to a role it was not solely sent to.
+    // A membership test would accept exactly that, including the degenerate case where the extra
+    // tag is a duplicate of this identity.
+    const recipients = tagValues(event, "p");
+    if (recipients.length !== 1 || recipients[0] !== this.#pubkey) {
       return rejected("event-not-addressed");
     }
     // Exactly one `h`, non-empty. The `h` tag is the Buzz room, and the room is what the answer

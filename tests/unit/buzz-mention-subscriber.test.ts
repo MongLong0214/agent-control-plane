@@ -192,6 +192,13 @@ const recordingSink = (answer: BuzzMentionAdmission = "DURABLE"): RecordingSink 
 const mentionEvent = (input: {
   author: Uint8Array;
   addressedTo: string;
+  /**
+   * Further `p` recipients, signed alongside the first.
+   *
+   * Inside the signature like every other tag, so a row built with these is a genuinely valid
+   * event that is wrong for one reason only: how many people it is addressed to.
+   */
+  alsoAddressedTo?: readonly string[];
   room?: string | readonly string[];
   text?: string;
   kind?: number;
@@ -203,7 +210,11 @@ const mentionEvent = (input: {
     {
       kind: input.kind ?? BUZZ_MENTION_KIND,
       created_at: input.createdAt ?? 1_800_000_000,
-      tags: [["p", input.addressedTo], ...rooms.map((room) => ["h", room])],
+      tags: [
+        ["p", input.addressedTo],
+        ...(input.alsoAddressedTo ?? []).map((recipient) => ["p", recipient]),
+        ...rooms.map((room) => ["h", room]),
+      ],
       content: input.text ?? "CTO, 지금 상태 보고해줘",
     },
     input.author,
@@ -1309,6 +1320,26 @@ describe("the buzz mention subscriber's relay protocol", () => {
         "EVENT",
         subId,
         mentionEvent({ author: owner, addressedTo: getPublicKey(stranger) }),
+      ],
+    },
+    {
+      what: "an event addressed to this identity twice over",
+      build: ({ owner, pubkey, subId }) => [
+        "EVENT",
+        subId,
+        mentionEvent({ author: owner, addressedTo: pubkey, alsoAddressedTo: [pubkey] }),
+      ],
+    },
+    {
+      what: "an event addressed to this identity and to somebody else at the same time",
+      build: ({ owner, stranger, pubkey, subId }) => [
+        "EVENT",
+        subId,
+        mentionEvent({
+          author: owner,
+          addressedTo: pubkey,
+          alsoAddressedTo: [getPublicKey(stranger)],
+        }),
       ],
     },
     {
