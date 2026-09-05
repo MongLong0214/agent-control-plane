@@ -1327,45 +1327,154 @@ describe("the daemon's Buzz message ingress", () => {
   });
 
   /**
-   * The owner is told only what the holder lifecycle can actually keep.
+   * The owner is told only the three things this seam observed: the message is durable, nobody has
+   * read it, and what happened to the wake. Nothing about who takes it, or when.
    *
-   * "The next holder to attach takes it" was an impossible promise on two counts, and both are
-   * facts about the row rather than about the wake. A message is only ever enqueued against an
-   * *active* binding — `admitBuzzMessage` rolls the whole admission back with `ROLE_PEER_ABSENT`
-   * when there is none — so a stored message is never in the "between holders" state the sentence
-   * described. And the row it produces is addressed to that holder's exact generation and session:
-   * it reaches a *successor* only through a takeover retargeting it, and reaches nobody at all if
-   * the role is revoked instead.
+   * **Why this is not a list of forbidden phrases.** The previous round's acceptance was one row
+   * asserting the text does not match `/next holder/iu`. The text was rewritten to avoid that
+   * phrase — "its holder takes it over its own connection whenever it next attaches", "it takes the
+   * message the next time it looks" — and kept the promise exactly. A blocklist tests one spelling
+   * of one claim; the property is that *no* delivery promise is made, and a blocklist can never be
+   * a test of that, because the next author's synonym is by construction not on the list.
    *
-   * A wake refusal says nothing about any of that. `ROLE_PEER_ABSENT` here means the holder
-   * registered no live peer to nudge — not that the role has no holder.
+   * So the direction is inverted, and it is locked twice:
    *
-   * The behavioural half of this — that a takeover really does carry the queued message to the
-   * successor, and that a revoke really does close it — is measured in
-   * `outbox-owner-message-holder.test.ts`. What is measured here is that no sentence claims more
-   * than that.
+   *   1. **Closed vocabulary.** Every word any sentence may use is enumerated below with the
+   *      observation that licenses it, and a sentence containing anything else fails naming the
+   *      word. A synonym reached for is a word not in the set, so it is caught by construction
+   *      rather than by having been anticipated. The set is also closed under recombination: it
+   *      contains no modal, no forward-looking temporal word and no verb of receipt, so no
+   *      arrangement of these words can say that anyone will get the message.
+   *   2. **The vocabulary itself is guarded.** The obvious way past (1) is to add the synonym to
+   *      the vocabulary, so the vocabulary is asserted disjoint from the classes a delivery promise
+   *      is built out of — modals, forward-looking time words, verbs of receipt and the actor nouns
+   *      a promise needs a subject from. An author who widens the vocabulary to fit a promise fails
+   *      here instead, and this assertion is about the *allow-list*, not about any one sentence, so
+   *      it cannot be satisfied by rewording.
+   *
+   * Neither lock proves the semantic property — no assertion over strings can — but together they
+   * make any new wording an explicit, visible widening of a justified vocabulary that is itself
+   * checked against the vocabulary of a promise. The exact sentences are pinned as well, so a
+   * rewrite has to come here and read this before it can be green.
+   *
+   * The behavioural half — that a takeover really does carry the queued message once, that a second
+   * one closes it, and that a surviving runtime move carries it too — is measured in
+   * `outbox-owner-message-holder.test.ts`. What is measured here is that no sentence claims it.
    */
-  it("tells the owner what is stored without promising a holder the row cannot reach", () => {
+  const OWNER_SENTENCE_VOCABULARY = new Set([
+    // The durable fact.
+    "stored",
+    "for",
+    "the",
+    "role",
+    // The unread fact, as a negative statement about the past: nobody has read it *yet*.
+    "nobody",
+    "has",
+    "read",
+    "it",
+    "yet",
+    // The observed wake outcome, in the past tense, and its three observed refusals.
+    "a",
+    "wake",
+    "was",
+    "sent",
+    "to",
+    "its",
+    "registered",
+    "peer",
+    "no",
+    "endpoint",
+    "is",
+    "attached",
+    "so",
+    "did",
+    "not",
+    "land",
+    // Punctuation-free connective.
+    "and",
+  ]);
+
+  /**
+   * The words a delivery promise is made of. Not a blocklist over the sentences — the vocabulary
+   * above already is — but a constraint on what may ever be *added* to that vocabulary.
+   */
+  const PROMISE_VOCABULARY = [
+    // Modals and futures.
+    "will", "shall", "would", "should", "can", "could", "may", "might", "going", "about",
+    // Forward-looking time.
+    "next", "later", "eventually", "soon", "whenever", "when", "once", "until", "future",
+    "afterwards", "then", "upcoming", "pending", "await", "awaits", "awaiting",
+    // Verbs of receipt and delivery.
+    "take", "takes", "taken", "receive", "receives", "received", "get", "gets", "deliver",
+    "delivers", "delivered", "delivery", "collect", "collects", "collected", "fetch", "fetches",
+    "fetched", "pick", "picks", "picked", "reads", "sees", "looks", "attaches", "arrives",
+    "reaches", "hands", "handed", "claims", "claimed", "consumes", "processes", "answers",
+    // The subjects a promise needs.
+    "holder", "holders", "successor", "successors", "whoever", "someone", "somebody", "recipient",
+    "who", "they", "it's",
+  ];
+
+  const wordsOf = (sentence: string): string[] =>
+    sentence
+      .toLowerCase()
+      .split(/[^a-z']+/u)
+      .filter((word) => word.length > 0);
+
+  it("tells the owner what is stored, using no word a delivery promise could be built from", () => {
+    // Lock 1, first — every word of every sentence comes from the closed vocabulary, so a synonym
+    // for a promise fails without anybody having had to guess which synonym. It is asserted before
+    // the verbatim pins below so that a promise fails *as a promise*, naming the offending words,
+    // rather than as a string that happens to differ from the one on record.
     const wakeOutcomes = [
       null,
       ReasonCode.ROLE_PEER_ABSENT,
       ReasonCode.ROLE_PEER_STALE,
       ReasonCode.ROLE_PEER_UNSUPPORTED,
       ReasonCode.ROLE_PEER_FAILED,
+      // Not a wake code at all: the default arm must be as constrained as the named ones.
+      ReasonCode.INTERNAL_ERROR,
     ];
     for (const wake of wakeOutcomes) {
       const sentence = ownerMessageQueuedSentence(wake);
-      // The two things this seam did observe: it is durable, and nobody has read it.
+      // The two facts every sentence must carry, whatever the wake did.
       expect(sentence).toContain("Stored for the role");
-      // The promise the lifecycle cannot keep, in either of its spellings.
-      expect(sentence).not.toMatch(/next holder/iu);
-      expect(sentence).not.toMatch(/between holders/iu);
+      expect(sentence).toContain("Nobody has read it yet");
+      const foreign = wordsOf(sentence).filter((word) => !OWNER_SENTENCE_VOCABULARY.has(word));
+      expect({ wake, foreign }).toEqual({ wake, foreign: [] });
     }
 
-    // And the branch that carried the promise is still a distinct sentence rather than having been
-    // collapsed into the default — the owner is told why nothing was nudged.
-    expect(ownerMessageQueuedSentence(ReasonCode.ROLE_PEER_ABSENT)).not.toBe(
-      ownerMessageQueuedSentence(null),
+    // Lock 2 — and the vocabulary may not be widened into a promise. This is the assertion an
+    // author reaching for a synonym hits *after* adding it to the set above.
+    const promissory = PROMISE_VOCABULARY.filter((word) => OWNER_SENTENCE_VOCABULARY.has(word));
+    expect(promissory).toEqual([]);
+
+    // The exact sentences, pinned. Any rewrite at all has to come here and read the two locks.
+    expect(ownerMessageQueuedSentence(null)).toBe(
+      "Stored for the role, and a wake was sent to its registered peer. Nobody has read it yet.",
     );
+    expect(ownerMessageQueuedSentence(ReasonCode.ROLE_PEER_ABSENT)).toBe(
+      "Stored for the role. No peer is attached, so no wake was sent. Nobody has read it yet.",
+    );
+    expect(ownerMessageQueuedSentence(ReasonCode.ROLE_PEER_STALE)).toBe(
+      "Stored for the role. No peer is attached, so no wake was sent. Nobody has read it yet.",
+    );
+    expect(ownerMessageQueuedSentence(ReasonCode.ROLE_PEER_UNSUPPORTED)).toBe(
+      "Stored for the role. No wake endpoint is registered, so no wake was sent. Nobody has read it yet.",
+    );
+    expect(ownerMessageQueuedSentence(ReasonCode.ROLE_PEER_FAILED)).toBe(
+      "Stored for the role. The wake did not land. Nobody has read it yet.",
+    );
+
+    // The branches stay distinct: the owner is told which of the four things happened to the wake,
+    // and a collapse into one sentence would take that away.
+    const distinct = new Set(
+      [
+        null,
+        ReasonCode.ROLE_PEER_ABSENT,
+        ReasonCode.ROLE_PEER_UNSUPPORTED,
+        ReasonCode.ROLE_PEER_FAILED,
+      ].map((wake) => ownerMessageQueuedSentence(wake)),
+    );
+    expect(distinct.size).toBe(4);
   });
 });

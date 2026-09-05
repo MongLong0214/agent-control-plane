@@ -134,15 +134,42 @@ export const HOLDER_CLAIMED_KIND_SQL = [...HOLDER_CLAIMED_KINDS]
   .join(", ");
 
 /**
+ * Which runtime holds a role *right now* — one notion of it, shared by every predicate below.
+ *
+ * `assignments.session_id` is the runtime the binding was created against, and it does not move.
+ * `BindingRegistry.switchTo` with `conversation: "SURVIVED"` moves only
+ * `conversational_actors.current_session_id`: the counterpart is the same conversation and its
+ * process is not, so the binding is deliberately not rewritten and the assignment row goes on
+ * naming a runtime that is gone. Two predicates that disagree about which of those is "the holder"
+ * is how an owner's message ends up addressed to a session no connection can present — the row is
+ * unclaimable by the runtime that now holds the role, and a fresh admission for the same role is
+ * refused `OUTBOX_TARGET_NOT_CURRENT` because `activeRoleTarget` answers with the actor's session
+ * while admission checked the assignment's.
+ *
+ * `BindingRegistry.hydrate` already answers the question one way — the actor's pointer, falling
+ * back to the binding's own value for an actor that has not been given a runtime yet — and this is
+ * that same expression rather than a second one. Anything narrower would be a *third* notion of
+ * current holder standing beside the two this reconciles, and the fallback is what keeps every
+ * ordinary binding, whose actor names exactly the assignment's session, answering as it did.
+ *
+ * Moving the pointer is only half of it: the rows already addressed to the outgoing runtime have to
+ * move in the same transaction, which is `carryHolderMessagesToRuntime` below.
+ */
+const HOLDER_ACTOR_JOIN = "LEFT JOIN conversational_actors actor ON actor.actor_id = a.actor_id";
+const CURRENT_HOLDER_SESSION = "COALESCE(actor.current_session_id, a.session_id)";
+const CURRENT_HOLDER_INCARNATION =
+  "COALESCE(actor.current_session_incarnation, a.session_incarnation)";
+
+/**
  * The exact holder, down to the incarnation — the predicate the owner-message lifecycle uses.
  *
  * `liveDeliveryTarget` below asks whether *a* live session holds this role generation. That is the
  * right question for an outward delivery and the wrong one here: a session that was replaced by a
  * respawn keeps its `session_id` and its generation while becoming a different runtime, and the
- * conversation an owner's message was addressed to did not survive that. `assignments`
- * `session_incarnation` is the column that tells the two apart, and it is supplied by the caller
- * from the authenticated connection rather than read back from the row being claimed — a predicate
- * that sourced it from the row would compare the database against itself and match always.
+ * conversation an owner's message was addressed to did not survive that. The current holder's
+ * incarnation is the value that tells the two apart, and it is supplied by the caller from the
+ * authenticated connection rather than read back from the row being claimed — a predicate that
+ * sourced it from the row would compare the database against itself and match always.
  *
  * Where the first three values come from is a parameter, and the predicate itself is written once.
  * `"o"` / `"outbox"` correlate on the outbox row in the statement; `"bound"` takes all four from
@@ -155,11 +182,12 @@ const exactHolderTarget = (source: "o" | "outbox" | "bound"): string => {
   const from = (column: string): string => (source === "bound" ? "?" : `${source}.${column}`);
   return `EXISTS (
   SELECT 1 FROM assignments a
-    JOIN sessions s ON s.session_id = a.session_id
+    ${HOLDER_ACTOR_JOIN}
+    JOIN sessions s ON s.session_id = ${CURRENT_HOLDER_SESSION}
    WHERE a.role_key = ${from("role_key")}
      AND a.binding_generation = ${from("binding_generation")}
-     AND a.session_id = ${from("target_session_id")}
-     AND a.session_incarnation = ?
+     AND ${CURRENT_HOLDER_SESSION} = ${from("target_session_id")}
+     AND ${CURRENT_HOLDER_INCARNATION} = ?
      AND a.status = 'ACTIVE'
      AND s.lifecycle IN ('READY','DRAINING')
 )`;
@@ -168,10 +196,11 @@ const exactHolderTarget = (source: "o" | "outbox" | "bound"): string => {
 const liveDeliveryTarget = (outboxAlias: "o" | "outbox"): string => `(
   EXISTS (
     SELECT 1 FROM assignments a
-      JOIN sessions s ON s.session_id = a.session_id
+      ${HOLDER_ACTOR_JOIN}
+      JOIN sessions s ON s.session_id = ${CURRENT_HOLDER_SESSION}
      WHERE a.role_key = ${outboxAlias}.role_key
        AND a.binding_generation = ${outboxAlias}.binding_generation
-       AND a.session_id = ${outboxAlias}.target_session_id
+       AND ${CURRENT_HOLDER_SESSION} = ${outboxAlias}.target_session_id
        AND a.status = 'ACTIVE'
        AND s.lifecycle IN ('READY','DRAINING')
   )
@@ -956,6 +985,10 @@ export class Outbox {
           // an owner's words into a runtime they were never addressed to is the one thing this
           // kind must never do.
           //
+          // "May safely have it" is once. Whether this row has already been carried is not
+          // readable from its status, so the compare-and-set below asserts it and a row that
+          // fails that assertion falls through to the same reject.
+          //
           // `fromGeneration === toGeneration` is the *revoke* shape, not a takeover:
           // `BindingRegistry.revoke` passes the current generation and session because there is
           // nothing to retarget onto, then runs its own direct `UPDATE outbox SET status =
@@ -969,12 +1002,28 @@ export class Outbox {
         : row.status === "PENDING" &&
           RETARGETABLE_KINDS.has(row.kind as MessageKind) &&
           row.expires_at > now;
-      if (retargetable) {
-        this.db.run(
-          `UPDATE outbox SET binding_generation = ?, target_session_id = ?, reason_code = ?
-             WHERE message_id = ?`,
-          [toGeneration, toSessionId, ReasonCode.OUTBOX_RETARGETED, row.message_id],
-        );
+      // Compare-and-set rather than a bare write, and for a holder-claimed row the set it asserts
+      // includes *this row has not been carried before*. `PENDING` cannot tell the two apart: a
+      // row a previous takeover moved looks exactly like one that was never moved, so `G1 -> G2`
+      // followed by `G2 -> G3` handed the owner's words to a second stranger's conversation and
+      // would hand them to a third. `OUTBOX_RETARGETED` is the mark the first carry left, and a
+      // row already carrying it changes nothing here and falls through to the rejection below —
+      // which settles its ingress claim in this same transaction, rather than leaving it queued
+      // for a generation nobody holds.
+      const carriedOnce = holderClaimed ? " AND (reason_code IS NULL OR reason_code <> ?)" : "";
+      const moved = retargetable
+        ? this.db.run(
+            `UPDATE outbox SET binding_generation = ?, target_session_id = ?, reason_code = ?
+               WHERE message_id = ? AND status = 'PENDING'${carriedOnce}`,
+            holderClaimed
+              ? [
+                  toGeneration, toSessionId, ReasonCode.OUTBOX_RETARGETED, row.message_id,
+                  ReasonCode.OUTBOX_RETARGETED,
+                ]
+              : [toGeneration, toSessionId, ReasonCode.OUTBOX_RETARGETED, row.message_id],
+          ).changes
+        : 0;
+      if (moved === 1) {
         retargeted.push(row.message_id);
       } else {
         this.db.run(
@@ -1004,6 +1053,92 @@ export class Outbox {
     });
 
     return { retargeted, rejected };
+  }
+
+  /**
+   * The owner-message half of a *surviving* switch, called inside that switch's transaction.
+   *
+   * `retargetOrReject` above is the takeover: a new generation, a different counterpart, and the
+   * queued row is carried to it once. This is the other move #493 introduced and nothing here
+   * followed — `conversation: "SURVIVED"`, where the binding is not rewritten at all and only
+   * `conversational_actors.current_session_id` changes. The generation is the same, the
+   * conversation is the same, and the process the row is addressed to is gone.
+   *
+   * So the two statuses part company for the same reason they do on a takeover, and not for the
+   * same reason as each other:
+   *
+   *   `PENDING`  nothing observable happened to it. The counterpart it was addressed to is the one
+   *              still holding the role, so the row is simply re-addressed to where that
+   *              counterpart now runs. It is not stamped `OUTBOX_RETARGETED`: that mark means "was
+   *              carried across a generation to a different conversation", and spending it here
+   *              would cost the message the one takeover it is still entitled to.
+   *   `SENT`     the previous runtime was handed the payload and never came back, so its outcome
+   *              is unknown, and the process that would have known is the one that died. Handing
+   *              it to the new runtime would replay an owner's words into a process that never saw
+   *              them; leaving it would strand it, because no live holder can claim `SENT`. It is
+   *              rejected here and its ingress claim settled in this same transaction.
+   *
+   * A move that goes nowhere is not a move: with the same session on both sides there is no old
+   * runtime for an unresolved hand-over to have died with, and burning it would be this method
+   * inventing a failure out of a no-op.
+   */
+  carryHolderMessagesToRuntime(
+    roleKey: string,
+    bindingGeneration: number,
+    fromSessionId: string,
+    toSessionId: string,
+  ): { carried: string[]; rejected: string[] } {
+    if (fromSessionId === toSessionId) return { carried: [], rejected: [] };
+    return this.db.tx(() => {
+      const rows = this.db.all<RawOutbox>(
+        `SELECT * FROM outbox
+          WHERE role_key = ? AND binding_generation = ? AND target_session_id = ?
+            AND kind IN (${HOLDER_CLAIMED_KIND_SQL})
+            AND status IN ('PENDING','SENT')
+          ORDER BY created_at`,
+        [roleKey, bindingGeneration, fromSessionId],
+      );
+
+      const carried: string[] = [];
+      const rejected: string[] = [];
+      for (const row of rows) {
+        // Exact compare-and-set on the whole tuple the caller named, not on the row id: the read
+        // above and this write are two statements, and a row that stopped being this role's, this
+        // generation's or this runtime's in between must move nothing.
+        const moved =
+          row.status === "PENDING"
+            ? this.db.run(
+                `UPDATE outbox SET target_session_id = ?
+                  WHERE message_id = ? AND status = 'PENDING'
+                    AND kind IN (${HOLDER_CLAIMED_KIND_SQL})
+                    AND role_key = ? AND binding_generation = ? AND target_session_id = ?`,
+                [toSessionId, row.message_id, roleKey, bindingGeneration, fromSessionId],
+              ).changes
+            : 0;
+        if (moved === 1) {
+          carried.push(row.message_id);
+          continue;
+        }
+        this.db.run(
+          `UPDATE outbox SET status = 'REJECTED', reason_code = ?,
+                             claim_token = NULL, claimed_at = NULL,
+                             retry_eligible = 0, next_attempt_at = NULL
+            WHERE message_id = ? AND status IN ('PENDING','SENT')`,
+          [ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, row.message_id],
+        );
+        this.settleHolderClaimOrThrow(row.message_id);
+        rejected.push(row.message_id);
+      }
+
+      this.audit.record({
+        kind: "OUTBOX_FENCE",
+        reasonCode: ReasonCode.OUTBOX_RETARGETED,
+        roleKey,
+        evidence: { bindingGeneration, fromSessionId, toSessionId, carried, rejected },
+      });
+
+      return { carried, rejected };
+    });
   }
 
   /**
@@ -1118,10 +1253,16 @@ export class Outbox {
     kind: MessageKind,
     idempotencyKey: string,
   ): boolean {
+    // The same current holder the delivery predicates use, and for the same reason: after a
+    // surviving runtime move the assignment's own session names a process that is gone, so an
+    // admission that asked it would refuse the owner's next message to a role that plainly has a
+    // holder — the registry hands the caller that holder's session id and this would not admit it.
     const holder = this.db.get(
       `SELECT 1 FROM assignments a
-        JOIN sessions s ON s.session_id = a.session_id
-        WHERE a.role_key = ? AND a.binding_generation = ? AND a.session_id = ?
+        ${HOLDER_ACTOR_JOIN}
+        JOIN sessions s ON s.session_id = ${CURRENT_HOLDER_SESSION}
+        WHERE a.role_key = ? AND a.binding_generation = ?
+          AND ${CURRENT_HOLDER_SESSION} = ?
           AND a.status = 'ACTIVE' AND s.lifecycle IN ('READY','DRAINING')`,
       [roleKey, bindingGeneration, sessionId],
     );

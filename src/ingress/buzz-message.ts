@@ -661,32 +661,39 @@ const queuedForRole = async (
 /**
  * What the owner is told once their message is durable.
  *
- * Every sentence says the same two things — it is stored, and nobody has read it — because that is
- * all this seam observed. `null` means the wake landed, which still is not a read: the holder was
- * told to look, and whether it looked is its business and not something this path can see.
+ * Three facts, and this seam observed all three: the row is stored, nobody has read it, and this is
+ * what happened when the wake was attempted. Nothing else is knowable from here.
  *
- * What none of them may say is *who* will take it beyond that. "The next holder to attach takes
- * it" was an impossible promise on two counts, and both are facts about the row rather than about
- * the wake. A message is only ever enqueued against an **active** binding — `admitBuzzMessage`
- * rolls the whole admission back with `ROLE_PEER_ABSENT` when there is none — so a stored message
- * is never in the "between holders" state that sentence described. And the row it produces is
- * addressed to that holder's exact generation and session: it reaches a *successor* only through a
- * takeover retargeting it, and reaches nobody at all if the role is revoked instead.
+ * **No sentence may say that anyone takes the message.** Not the holder now, not a holder later,
+ * not a successor. That is not a rule about phrasing, it is what the row can keep: the message is
+ * addressed to one generation and one runtime, it reaches a successor only if a takeover carries it
+ * — once, and only from `PENDING` — it is closed outright by a revoke or a second takeover, and a
+ * hand-over that is never acknowledged ends terminal rather than repeated. Every one of those is a
+ * path on which the owner would have been promised something that did not happen.
  *
- * A wake refusal says nothing about any of that. `ROLE_PEER_ABSENT` here means the holder
- * registered no live peer to nudge — not that the role has no holder.
+ * The first attempt at this removed one phrase, "the next holder", and put the same promise back in
+ * other words — "its holder takes it over its own connection whenever it next attaches". So the
+ * sentences below are held to a *closed vocabulary* in `buzz-message-ingress.test.ts` rather than to
+ * a list of forbidden phrases: they may use only words enumerated there, and that enumeration is
+ * itself asserted to contain no modal, no forward-looking time word, no verb of receipt and none of
+ * the actor nouns a promise needs a subject from. A synonym is caught for being a new word, not for
+ * having been guessed at in advance.
+ *
+ * `null` means the wake was sent, which is still not a read. And a wake refusal says nothing about
+ * the message at all: `ROLE_PEER_ABSENT` here means no live peer was registered to nudge, not that
+ * the role has no holder — a message is only ever enqueued against an active binding.
  */
 export const ownerMessageQueuedSentence = (wakeRefusal: string | null): string => {
   if (wakeRefusal === null) {
-    return "Stored for the role and its holder was woken. Nobody has read it yet; the holder takes it over its own connection.";
+    return "Stored for the role, and a wake was sent to its registered peer. Nobody has read it yet.";
   }
   if (wakeRefusal === ReasonCode.ROLE_PEER_ABSENT || wakeRefusal === ReasonCode.ROLE_PEER_STALE) {
-    return "Stored for the role. Nobody is attached to wake right now, so its holder takes it over its own connection whenever it next attaches — or whoever takes the role over from it does.";
+    return "Stored for the role. No peer is attached, so no wake was sent. Nobody has read it yet.";
   }
   if (wakeRefusal === ReasonCode.ROLE_PEER_UNSUPPORTED) {
-    return "Stored for the role. Its holder has registered no wake endpoint, so it was not nudged; it takes the message the next time it looks.";
+    return "Stored for the role. No wake endpoint is registered, so no wake was sent. Nobody has read it yet.";
   }
-  return "Stored for the role. The wake did not land, which says nothing about the message: it is queued and the holder takes it when it next attaches.";
+  return "Stored for the role. The wake did not land. Nobody has read it yet.";
 };
 
 /**
