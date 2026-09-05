@@ -34,6 +34,7 @@ import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
+  constants as fsConstants,
   closeSync,
   copyFileSync,
   existsSync,
@@ -44,8 +45,8 @@ import {
   readSync,
   readdirSync,
   realpathSync,
-  renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
@@ -53,7 +54,8 @@ import { pathToFileURL } from "node:url";
 
 import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { backupDatabase, validateBackup } from "../db/backup.ts";
+import { backupDatabase, captureRollbackPointSync, restoreDatabase, validateBackup } from "../db/backup.ts";
+import { RollbackFilesystem, type RollbackEntry, type RollbackParent } from "../db/fd-vfs.ts";
 import { PRIVATE_FILE_MODE } from "../db/state-preflight.ts";
 
 export const ROLLBACK_PAIR_FORMAT = "agent-control-plane.rollback-pair/v1";
@@ -63,14 +65,30 @@ export const ROLLBACK_PAIR_MANIFEST_FILE = "pair.json";
 const PAIR_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const INDEX_LINE = /^([a-f0-9]{64}) {2}(\S+)$/;
-/** Member paths are POSIX-relative, whitespace-free, and cannot climb out by name. */
-const MEMBER_PATH = /^[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/;
+/**
+ * Member paths are POSIX-relative, whitespace-free, and cannot climb out by name.
+ *
+ * Segments may begin with a dot. The first version of this rule required an alphanumeric first
+ * character, which is fine for a synthetic pair and cannot express a real one: sealing an actual
+ * dependency tree turned up `.npmignore`, `.travis.yml` and a `.bin/` directory immediately. What
+ * this is for is refusing traversal and whitespace, so `.` and `..` are refused by name and a
+ * leading dot is not treated as suspicious on its own.
+ */
+const MEMBER_SEGMENT = /^[A-Za-z0-9._-]+$/;
+const isMemberPath = (value: string): boolean => {
+  if (value.length === 0) return false;
+  return value
+    .split("/")
+    .every((segment) => segment !== "." && segment !== ".." && MEMBER_SEGMENT.test(segment));
+};
 
 export interface RollbackPairMember {
   /** POSIX-style path relative to the pair root. */
   path: string;
   sha256: string;
   bytes: number;
+  /** The permission bits the member is installed with. An executable that arrives 0600 is inert. */
+  mode: number;
 }
 
 export interface RollbackPairIdentity {
@@ -79,7 +97,8 @@ export interface RollbackPairIdentity {
   /** The logical database this pair is a recovery point for, as recorded when it was taken. */
   database: { targetPath: string };
   runtime: {
-    nodePath: string;
+    /** The Node executable, relative to the sealed runtime root. Never an external path. */
+    nodeExecutable: string;
     nodeVersion: string;
     entrypoint: string;
     entrypointSha256: string;
@@ -141,7 +160,15 @@ export interface RollbackPairSources {
   entrypoint: string;
   /** The state maintenance entrypoint, relative to `runtimeRoot`. Applying restores through it. */
   stateAdmin: string;
-  nodePath: string;
+  /**
+   * The Node executable, relative to `runtimeRoot`.
+   *
+   * It is sealed, not referenced. A pair that names an external interpreter is not self-contained:
+   * the rollback it promises is "restore these bytes and run them under whatever `node` happens to
+   * be on this machine afterwards", which is the generation-mixing this whole mechanism exists to
+   * prevent, one layer down. The closure has to be able to run after the external Node is gone.
+   */
+  nodeExecutable: string;
   /** Stated by the caller, never probed: the closure being sealed may not run here. */
   nodeVersion: string;
   /** Where this generation lives when it is installed. */
@@ -223,18 +250,41 @@ const walkTree = (root: string, prefix = ""): Tree => {
   return { files, directories };
 };
 
-const copyPrivateFile = (from: string, to: string): void => {
+/**
+ * Copies one member, preserving the bits that decide whether it can run.
+ *
+ * Forcing every member to 0600 was fine while a pair held only data. It is not fine once the pair
+ * holds the interpreter: an executable installed without its execute bit is an inert file, and the
+ * rollback would put back a generation that cannot start. So the source mode is carried across,
+ * refused if it is group- or world-writable, and recorded in the inventory so validation can see a
+ * mode that drifted.
+ *
+ * `COPYFILE_FICLONE` asks APFS for a copy-on-write clone and falls back to a real copy elsewhere,
+ * which is what makes sealing a 100MB interpreter cost almost nothing on this filesystem.
+ */
+const copyMemberFile = (from: string, to: string): void => {
   const source = lstatSync(from);
   if (!source.isFile() || source.isSymbolicLink()) {
     throw acpError(ReasonCode.STATE_PATH_INSECURE, "a sealed pair member source must be a regular file", { from });
   }
+  const mode = source.mode & 0o7777;
+  if ((mode & 0o022) !== 0) {
+    throw acpError(ReasonCode.STATE_PATH_INSECURE, "a sealed pair member source is group- or world-writable", {
+      from,
+      mode: mode.toString(8),
+    });
+  }
   mkdirSync(dirname(to), { recursive: true, mode: 0o700 });
-  copyFileSync(from, to);
-  chmodSync(to, PRIVATE_FILE_MODE);
+  copyFileSync(from, to, fsConstants.COPYFILE_FICLONE);
+  chmodSync(to, mode);
+};
+
+const copyPrivateFile = (from: string, to: string): void => {
+  copyMemberFile(from, to);
 };
 
 const copyPrivateTree = (from: string, to: string): void => {
-  for (const member of walkTree(from).files) copyPrivateFile(join(from, member), join(to, member));
+  for (const member of walkTree(from).files) copyMemberFile(join(from, member), join(to, member));
 };
 
 const renderIndex = (root: string, members: readonly string[]): string =>
@@ -408,10 +458,11 @@ const assertGenerationBindings = (
   }
 
   const launcher = parseLauncherBinding(launcherText, where);
-  if (launcher.nodePath !== runtime.nodePath) {
-    throw acpError(ReasonCode.INTERNAL_ERROR, "the sealed launcher is not bound to the Node executable this pair names", {
+  const installedNode = join(runtime.installRoot, runtime.nodeExecutable);
+  if (launcher.nodePath !== installedNode) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "the sealed launcher is not bound to the Node executable this pair installs", {
       where,
-      expected: runtime.nodePath,
+      expected: installedNode,
       found: launcher.nodePath,
     });
   }
@@ -440,6 +491,66 @@ const assertGenerationBindings = (
   }
 };
 
+const SYSTEM_LIBRARY_PREFIXES = ["/usr/lib/", "/System/Library/", "/System/iOSSupport/"];
+/** Mach-O magic numbers: 64/32-bit, both endiannesses, and the fat-binary wrappers. */
+const MACH_O_MAGIC = new Set([0xfeedfacf, 0xcffaedfe, 0xfeedface, 0xcefaedfe, 0xcafebabe, 0xbebafeca]);
+
+const isMachO = (path: string): boolean => {
+  const fd = openSync(path, "r");
+  try {
+    const header = Buffer.alloc(4);
+    if (readSync(fd, header, 0, 4, 0) < 4) return false;
+    return MACH_O_MAGIC.has(header.readUInt32BE(0)) || MACH_O_MAGIC.has(header.readUInt32LE(0));
+  } finally {
+    closeSync(fd);
+  }
+};
+
+/**
+ * Refuses a closure that cannot run once everything outside it is gone.
+ *
+ * A pair that carries the interpreter but leaves a dylib behind is self-contained only until the
+ * machine it was sealed on changes, and the way that failure shows up is a rollback that installs
+ * cleanly and then will not start. So every Mach-O in the sealed tree is asked what it links
+ * against, recursively, and anything absolute that is neither a macOS system library nor inside
+ * this tree is a refusal at seal time — where it is a message, rather than at start time, where it
+ * is an outage.
+ *
+ * `@rpath`, `@loader_path` and `@executable_path` references resolve relative to the image that
+ * carries them, so they stay inside the tree by construction and are accepted. macOS system
+ * libraries are the one declared platform boundary: they live in the dyld shared cache and are not
+ * copyable artifacts.
+ */
+const assertClosureIsSelfContained = (runtimeRoot: string): void => {
+  const external: Array<{ member: string; dependency: string }> = [];
+  for (const member of walkTree(runtimeRoot).files) {
+    const absolute = join(runtimeRoot, member);
+    if (!isMachO(absolute)) continue;
+    let linkage: string;
+    try {
+      linkage = execFileSync("/usr/bin/otool", ["-L", absolute], { encoding: "utf8", stdio: "pipe" });
+    } catch {
+      // A Mach-O this host cannot read the linkage of is not evidence that it has none.
+      throw acpError(ReasonCode.INTERNAL_ERROR, "the dynamic linkage of a sealed binary could not be read", {
+        member,
+      });
+    }
+    for (const line of linkage.split("\n").slice(1)) {
+      const dependency = line.trim().split(" ")[0];
+      if (!dependency || !dependency.startsWith("/")) continue;
+      if (SYSTEM_LIBRARY_PREFIXES.some((prefix) => dependency.startsWith(prefix))) continue;
+      if (dependency.startsWith(`${runtimeRoot}/`)) continue;
+      external.push({ member, dependency });
+    }
+  }
+  if (external.length > 0) {
+    throw acpError(ReasonCode.STATE_PATH_INSECURE, "the sealed runtime closure depends on a library outside itself", {
+      runtimeRoot,
+      external,
+    });
+  }
+};
+
 /**
  * Seals one pair, published atomically.
  *
@@ -462,7 +573,6 @@ export const sealRollbackPair = async (
     ["the install plist path", sources.install.plistPath],
     ["the install launcher path", sources.install.launcherPath],
     ["the install working directory", sources.install.workingDirectory],
-    ["the node path", sources.nodePath],
   ] as const) {
     assertAbsolute(value, what);
   }
@@ -477,9 +587,6 @@ export const sealRollbackPair = async (
     workingDirectory: canonical(sources.install.workingDirectory),
   };
   const root = join(pairsRoot, pairId);
-  if (existsSync(root)) {
-    throw acpError(ReasonCode.CONFLICT, "a rollback pair with this id already exists", { root });
-  }
   if (basename(sources.launchd.plistPath) === basename(sources.launchd.launcherPath)) {
     throw acpError(ReasonCode.INVALID_ARGUMENT, "the plist and launcher cannot share a basename inside one pair", {
       plistPath: sources.launchd.plistPath,
@@ -490,10 +597,25 @@ export const sealRollbackPair = async (
   // Owner-only, hidden, and beside the destination so the rename that publishes it is atomic
   // rather than a cross-device copy. Only this directory is ever removed on failure.
   mkdirSync(pairsRoot, { recursive: true, mode: 0o700 });
-  const stage = join(pairsRoot, `.staging-${pairId}-${process.pid}-${randomUUID()}`);
+  const stageName = `.staging-${pairId}-${process.pid}-${randomUUID()}`;
+  const stage = join(pairsRoot, stageName);
   mkdirSync(stage, { mode: 0o700 });
   chmodSync(stage, 0o700);
   const building = join(stage, pairId);
+
+  // Publication and cleanup are anchored on held descriptors and inode identity, not pathnames.
+  // `existsSync(root)` then `renameSync` was a check and a use with a gap between them, and the
+  // gap is where a foreign directory takes the final name; a pathname-only cleanup then removes
+  // whatever is under the stage name when it runs, which after a swap is somebody else's tree.
+  const rollbackFs = RollbackFilesystem.load();
+  const pairsParent = rollbackFs.openParent(pairsRoot);
+  const stageIdentity = rollbackFs.stat(pairsParent, stageName);
+  if (stageIdentity === null || stageIdentity.type !== "dir") {
+    rollbackFs.dispose();
+    throw acpError(ReasonCode.STATE_PATH_INSECURE, "the staging directory vanished as it was created", {
+      stage,
+    });
+  }
 
   try {
     mkdirSync(building, { mode: 0o700 });
@@ -523,11 +645,20 @@ export const sealRollbackPair = async (
     }
     const entrypointMember = `runtime/${sources.entrypoint}`;
     const stateAdminMember = `runtime/${sources.stateAdmin}`;
+    const nodeMember = `runtime/${sources.nodeExecutable}`;
+    const nodeStat = lstatSync(join(building, nodeMember));
+    if ((nodeStat.mode & 0o111) === 0) {
+      throw acpError(ReasonCode.STATE_PATH_INSECURE, "the sealed Node executable has no execute bit", {
+        member: nodeMember,
+        mode: (nodeStat.mode & 0o7777).toString(8),
+      });
+    }
+    assertClosureIsSelfContained(join(building, "runtime"));
     const identity: RollbackPairIdentity = {
       schemaVersion: sealedManifest.schemaVersion,
       database: { targetPath: sealedManifest.source.path },
       runtime: {
-        nodePath: sources.nodePath,
+        nodeExecutable: sources.nodeExecutable,
         nodeVersion: sources.nodeVersion,
         entrypoint: sources.entrypoint,
         entrypointSha256: hashFile(join(building, entrypointMember)),
@@ -564,6 +695,7 @@ export const sealRollbackPair = async (
         path: member,
         sha256: hashFile(join(building, member)),
         bytes: lstatSync(join(building, member)).size,
+        mode: lstatSync(join(building, member)).mode & 0o7777,
       })),
     };
     writeFileSync(join(building, ROLLBACK_PAIR_MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`, {
@@ -593,18 +725,27 @@ export const sealRollbackPair = async (
       nodeVersion: identity.runtime.nodeVersion,
     });
 
-    if (existsSync(root)) {
-      throw acpError(ReasonCode.CONFLICT, "a rollback pair with this id appeared while this one was sealing", { root });
+    // One syscall decides both that the name was free and that it is now ours. A pair id already
+    // taken — by a real pair or by a foreign empty directory that appeared a moment ago — is an
+    // EEXIST refusal, never an overwrite of what is there.
+    const stageParent = rollbackFs.openParent(stage);
+    try {
+      rollbackFs.renameExclusive(stageParent, pairId, pairsParent, pairId);
+    } finally {
+      rollbackFs.closeParent(stageParent);
     }
-    renameSync(building, root);
     return { pairId, root: realpathSync(root), indexPath: join(root, ROLLBACK_PAIR_INDEX_FILE), indexDigest, manifest };
-  } catch (error) {
-    // Only the stage this call created. The final root is never partially written, so there is
-    // nothing there to clean up and nothing of anyone else's to remove.
-    rmSync(stage, { recursive: true, force: true });
-    throw error;
   } finally {
-    rmSync(stage, { recursive: true, force: true });
+    // Only the exact directory this call created, identified by the inode it had when it was
+    // created. If the stage was replaced in the meantime this refuses and leaves the intruder
+    // alone rather than deleting it on somebody else's behalf.
+    try {
+      rollbackFs.removeOwned(pairsParent, stageName, stageIdentity.dev, stageIdentity.ino);
+    } catch {
+      /* A cleanup that refuses must not replace the reason the seal failed. The stage is
+         owner-private and named as a dotfile; leaving it is the safe half of this trade. */
+    }
+    rollbackFs.dispose();
   }
 };
 
@@ -649,7 +790,7 @@ const readPairManifest = (path: string, root: string): RollbackPairManifest => {
     !Number.isInteger(candidate.identity?.schemaVersion) ||
     typeof candidate.identity?.database?.targetPath !== "string" ||
     candidate.identity.database.targetPath.length === 0 ||
-    typeof runtime?.nodePath !== "string" ||
+    typeof runtime?.nodeExecutable !== "string" ||
     typeof runtime.nodeVersion !== "string" ||
     typeof runtime.entrypoint !== "string" ||
     typeof runtime.entrypointSha256 !== "string" ||
@@ -673,7 +814,8 @@ const readPairManifest = (path: string, root: string): RollbackPairManifest => {
         typeof member?.path !== "string" ||
         typeof member.sha256 !== "string" ||
         !DIGEST.test(member.sha256) ||
-        !Number.isInteger(member.bytes),
+        !Number.isInteger(member.bytes) ||
+        !Number.isInteger(member.mode),
     )
   ) {
     throw acpError(ReasonCode.INTERNAL_ERROR, "the sealed pair manifest has an invalid shape", { root });
@@ -796,7 +938,7 @@ export const validateRollbackPair = (
     throw acpError(ReasonCode.INTERNAL_ERROR, "the sealed pair index does not cover the pair manifest", { root });
   }
   for (const member of entryPaths) {
-    if (!MEMBER_PATH.test(member)) {
+    if (!isMemberPath(member)) {
       throw acpError(ReasonCode.STATE_PATH_INSECURE, "a sealed pair member path is not a plain relative path", {
         root,
         member,
@@ -810,6 +952,7 @@ export const validateRollbackPair = (
   const resolvedByMember = new Map<string, string>();
   const identityByMember = new Map<string, string>();
   const sizeByMember = new Map<string, number>();
+  const modeByMember = new Map<string, number>();
   for (const entry of entries) {
     const declared = join(root, entry.path);
     let stat;
@@ -857,6 +1000,7 @@ export const validateRollbackPair = (
     resolvedByMember.set(entry.path, resolved);
     identityByMember.set(entry.path, `${stat.dev}:${stat.ino}`);
     sizeByMember.set(entry.path, stat.size);
+    modeByMember.set(entry.path, stat.mode & 0o7777);
   }
 
   // Nothing extra, and no empty directory hiding between the named members.
@@ -927,6 +1071,23 @@ export const validateRollbackPair = (
         actual: sizeByMember.get(member.path),
       });
     }
+    // A digest says what the bytes are; it says nothing about whether they can run. An executable
+    // whose mode drifted to 0600 installs as an inert file and the generation will not start.
+    if (modeByMember.get(member.path) !== member.mode) {
+      throw acpError(ReasonCode.INTERNAL_ERROR, "a sealed pair member is not at the mode its inventory records", {
+        root,
+        member: member.path,
+        declared: member.mode.toString(8),
+        actual: modeByMember.get(member.path)?.toString(8),
+      });
+    }
+    if ((member.mode & 0o022) !== 0) {
+      throw acpError(ReasonCode.STATE_PATH_INSECURE, "a sealed pair member is group- or world-writable", {
+        root,
+        member: member.path,
+        mode: member.mode.toString(8),
+      });
+    }
   }
   for (const member of indexedInventory) {
     if (!distinctInventory.has(member)) {
@@ -943,6 +1104,7 @@ export const validateRollbackPair = (
     databaseManifest: manifest.database.manifestMember,
     entrypoint: `runtime/${manifest.identity.runtime.entrypoint}`,
     stateAdmin: `runtime/${manifest.identity.runtime.stateAdmin}`,
+    nodeExecutable: `runtime/${manifest.identity.runtime.nodeExecutable}`,
     plist: manifest.identity.service.plist,
     launcher: manifest.identity.service.launcher,
   } as const;
@@ -991,6 +1153,13 @@ export const validateRollbackPair = (
   if (digestByMember.get(roles.stateAdmin) !== manifest.identity.runtime.stateAdminSha256) {
     throw acpError(ReasonCode.INTERNAL_ERROR, "the sealed pair states a state-admin digest its closure is not at", {
       root,
+    });
+  }
+  if (((modeByMember.get(roles.nodeExecutable) ?? 0) & 0o111) === 0) {
+    throw acpError(ReasonCode.STATE_PATH_INSECURE, "the sealed Node executable is not executable in this pair", {
+      root,
+      member: roles.nodeExecutable,
+      mode: modeByMember.get(roles.nodeExecutable)?.toString(8),
     });
   }
 
@@ -1206,35 +1375,83 @@ export const stageRollbackPair = (
   }
 };
 
-const assertReplaceableFile = (path: string, what: string): void => {
+
+
+/**
+ * A destination frozen on a held descriptor and an inode, not on a pathname.
+ *
+ * Verifying `dirname(dest)` and then writing to `dest` walks the directory twice. Renaming the
+ * parent between the two, or replacing a component with a symlink, steers the second walk
+ * somewhere the first never saw — and every pathname-based re-check agrees, because it walks the
+ * new path too. So the parent is held open no-follow for the whole operation and its identity is
+ * recorded; before each mutation the pathname is resolved again and required to still name that
+ * exact object, and the leaf is required to still be the exact object planned.
+ *
+ * The remaining limit is stated rather than hidden: the copy itself still goes through the
+ * pathname, because creating a file through a held descriptor would need a create-capable
+ * `openat` on the primitive's surface and that surface is deliberately five operations wide. What
+ * this closes is the steering *window*: a swap is detected immediately before and immediately
+ * after each mutation and fails closed, rather than being installed silently.
+ */
+interface FrozenDestination {
+  path: string;
+  parent: RollbackParent;
+  parentDev: number;
+  parentIno: number;
+  name: string;
+  /** The leaf as it was at plan time, or null when it was absent. */
+  identity: RollbackEntry | null;
+}
+
+const freezeDestination = (fs: RollbackFilesystem, path: string, what: string): FrozenDestination => {
   assertAbsolute(path, what);
-  const parent = dirname(path);
-  if (!existsSync(parent)) {
+  const parentPath = dirname(path);
+  if (!existsSync(parentPath)) {
     throw acpError(ReasonCode.NOT_FOUND, `${what} has no directory to be installed into`, { path });
   }
-  const parentStat = lstatSync(parent);
-  if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
-    throw acpError(ReasonCode.STATE_PATH_INSECURE, `${what} is inside a directory that is not a direct directory`, {
-      path,
-    });
-  }
-  if (!existsSync(path)) return;
-  const stat = lstatSync(path);
-  if (!stat.isFile() || stat.isSymbolicLink()) {
-    throw acpError(ReasonCode.STATE_PATH_INSECURE, `${what} is not a regular, non-symlink file`, { path });
-  }
+  const parent = fs.openParent(parentPath);
+  const name = basename(path);
+  return { path, parent, parentDev: parent.dev, parentIno: parent.ino, name, identity: fs.stat(parent, name) };
 };
 
-const assertReplaceableDirectory = (path: string, what: string): void => {
-  assertAbsolute(path, what);
-  const parent = dirname(path);
-  if (!existsSync(parent)) {
-    throw acpError(ReasonCode.NOT_FOUND, `${what} has no parent directory`, { path });
+/** Refuses unless the pathname still names the held parent and the leaf is still the same object. */
+const assertDestinationIntact = (
+  fs: RollbackFilesystem,
+  destination: FrozenDestination,
+  what: string,
+): void => {
+  const parentPath = dirname(destination.path);
+  let live;
+  try {
+    live = statSync(parentPath);
+  } catch {
+    throw acpError(ReasonCode.STATE_PATH_INSECURE, `${what} no longer has the directory it was planned in`, {
+      path: destination.path,
+    });
   }
-  if (!existsSync(path)) return;
-  const stat = lstatSync(path);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    throw acpError(ReasonCode.STATE_PATH_INSECURE, `${what} is not a direct directory`, { path });
+  if (live.dev !== destination.parentDev || live.ino !== destination.parentIno) {
+    throw acpError(ReasonCode.STATE_PATH_INSECURE, `${what} now resolves to a different directory than the one verified`, {
+      path: destination.path,
+      planned: { dev: destination.parentDev, ino: destination.parentIno },
+      found: { dev: live.dev, ino: live.ino },
+    });
+  }
+  const now = fs.stat(destination.parent, destination.name);
+  const planned = destination.identity;
+  if (planned === null) {
+    if (now !== null) {
+      throw acpError(ReasonCode.STATE_PATH_INSECURE, `${what} was created by something else after it was planned`, {
+        path: destination.path,
+      });
+    }
+    return;
+  }
+  if (now === null || now.dev !== planned.dev || now.ino !== planned.ino || now.type !== planned.type) {
+    throw acpError(ReasonCode.STATE_PATH_INSECURE, `${what} is no longer the object that was verified`, {
+      path: destination.path,
+      planned: { dev: planned.dev, ino: planned.ino, type: planned.type },
+      found: now,
+    });
   }
 };
 
@@ -1250,7 +1467,15 @@ export interface AppliedRollbackPair {
 
 export interface ApplyOptions {
   /** Test-only fault injection, named for the step it fires after. */
-  failAfter?: "recovery" | "runtime" | "plist" | "launcher" | "database";
+  failAfter?: "recovery" | "runtime" | "plist" | "launcher" | "restoreHelper" | "database" | "cleanup";
+  /**
+   * Test-only seam, fired immediately before a step re-verifies its destination.
+   *
+   * The window this exists to measure cannot be reached from outside: it opens after the plan is
+   * frozen and closes when the step runs. Without a way to act inside it, the re-verification
+   * before each mutation would be code nothing can fail.
+   */
+  onStep?: (step: "runtime" | "plist" | "launcher" | "database") => void;
 }
 
 /**
@@ -1272,94 +1497,177 @@ export const applyRollbackPair = (
   const launcherDestination = identity.service.launcherDestination;
   const databaseDestination = identity.database.targetPath;
 
-  // Every destination checked before the first mutation, so a wrong type is a refusal rather than
-  // a discovery made halfway through replacing a generation.
-  assertReplaceableDirectory(runtimeDestination, "the runtime install root");
-  assertReplaceableFile(plistDestination, "the plist destination");
-  assertReplaceableFile(launcherDestination, "the launcher destination");
-  assertReplaceableFile(databaseDestination, "the database destination");
-
-  const recoveryRoot = join(staged.stageRoot, "recovery");
-  mkdirSync(recoveryRoot, { recursive: true, mode: 0o700 });
-  chmodSync(recoveryRoot, 0o700);
-  const hadRuntime = existsSync(runtimeDestination);
-  const hadPlist = existsSync(plistDestination);
-  const hadLauncher = existsSync(launcherDestination);
-  if (hadRuntime) copyPrivateTree(runtimeDestination, join(recoveryRoot, "runtime"));
-  if (hadPlist) copyPrivateFile(plistDestination, join(recoveryRoot, "plist"));
-  if (hadLauncher) copyPrivateFile(launcherDestination, join(recoveryRoot, "launcher"));
-
-  const compensate = (): void => {
-    if (hadRuntime) {
-      rmSync(runtimeDestination, { recursive: true, force: true });
-      copyPrivateTree(join(recoveryRoot, "runtime"), runtimeDestination);
-    } else rmSync(runtimeDestination, { recursive: true, force: true });
-    if (hadPlist) {
-      copyFileSync(join(recoveryRoot, "plist"), plistDestination);
-      chmodSync(plistDestination, PRIVATE_FILE_MODE);
-    } else rmSync(plistDestination, { force: true });
-    if (hadLauncher) {
-      copyFileSync(join(recoveryRoot, "launcher"), launcherDestination);
-      chmodSync(launcherDestination, 0o700);
-    } else rmSync(launcherDestination, { force: true });
-  };
-
+  const fs = RollbackFilesystem.load();
   try {
-    if (options.failAfter === "recovery") throw acpError(ReasonCode.INTERNAL_ERROR, "injected failure after recovery", {});
-
-    rmSync(runtimeDestination, { recursive: true, force: true });
-    copyPrivateTree(staged.runtimeRoot, runtimeDestination);
-    if (options.failAfter === "runtime") throw acpError(ReasonCode.INTERNAL_ERROR, "injected failure after runtime", {});
-
-    copyFileSync(staged.plistPath, plistDestination);
-    chmodSync(plistDestination, PRIVATE_FILE_MODE);
-    if (options.failAfter === "plist") throw acpError(ReasonCode.INTERNAL_ERROR, "injected failure after plist", {});
-
-    copyFileSync(staged.launcherPath, launcherDestination);
-    chmodSync(launcherDestination, 0o700);
-    if (options.failAfter === "launcher") throw acpError(ReasonCode.INTERNAL_ERROR, "injected failure after launcher", {});
-
-    // The sealed generation restores its own database: its state-admin, under its Node. Running
-    // the current build's restore here would be the defect this pair exists to prevent, one layer
-    // down — pair A's image installed by generation B's code.
-    //
-    // The *resolved* path, and this is not tidiness. A Node entrypoint decides whether it is the
-    // program being run by comparing `import.meta.url` — which is always the real path — against
-    // `process.argv[1]` as given. Hand it a path that traverses a symlink and the comparison
-    // fails, the CLI's main guard never fires, and the process exits 0 having done nothing.
-    // Measured here: `/var/...` versus `/private/var/...` on macOS produced a rollback that
-    // reported success and restored no database at all.
-    const installedStateAdmin = join(realpathSync(runtimeDestination), identity.runtime.stateAdmin);
-    execFileSync(
-      identity.runtime.nodePath,
-      [installedStateAdmin, "restore", staged.databasePath, "--database", databaseDestination, "--confirm-restore"],
-      { encoding: "utf8", stdio: "pipe" },
-    );
-    // Exit zero is a claim, not a result. Whatever the sealed state-admin did, the destination
-    // now has to be the image that was staged, byte for byte, or this rollback did not happen.
-    const restoredDigest = hashFile(databaseDestination);
-    const stagedDigest = hashFile(staged.databasePath);
-    if (restoredDigest !== stagedDigest) {
-      throw acpError(ReasonCode.INTERNAL_ERROR, "the restore reported success without installing the sealed image", {
-        databaseDestination,
-        expected: stagedDigest,
-        actual: restoredDigest,
+    // Every destination frozen on a held descriptor and an inode before the first mutation, so a
+    // wrong type is a refusal rather than a discovery made halfway through replacing a
+    // generation — and so a rename or symlink swap afterwards is detected instead of followed.
+    const plan = {
+      runtime: freezeDestination(fs, runtimeDestination, "the runtime install root"),
+      plist: freezeDestination(fs, plistDestination, "the plist destination"),
+      launcher: freezeDestination(fs, launcherDestination, "the launcher destination"),
+      database: freezeDestination(fs, databaseDestination, "the database destination"),
+    };
+    if (plan.runtime.identity !== null && plan.runtime.identity.type !== "dir") {
+      throw acpError(ReasonCode.STATE_PATH_INSECURE, "the runtime install root is not a direct directory", {
+        path: runtimeDestination,
       });
     }
-    if (options.failAfter === "database") throw acpError(ReasonCode.INTERNAL_ERROR, "injected failure after database", {});
-
-    return {
-      pairId: staged.pairId,
-      generation: identity.service.generation,
-      runtimeRoot: runtimeDestination,
-      plistPath: plistDestination,
-      launcherPath: launcherDestination,
-      databasePath: databaseDestination,
-      recoveryRoot,
+    for (const [what, frozen] of [
+      ["the plist destination", plan.plist],
+      ["the launcher destination", plan.launcher],
+      ["the database destination", plan.database],
+    ] as const) {
+      if (frozen.identity !== null && frozen.identity.type !== "file") {
+        throw acpError(ReasonCode.STATE_PATH_INSECURE, `${what} is not a regular, non-symlink file`, {
+          path: frozen.path,
+        });
+      }
+    }
+    const intact = (what: string): void => {
+      assertDestinationIntact(fs, plan.runtime, "the runtime install root");
+      assertDestinationIntact(fs, plan.plist, "the plist destination");
+      assertDestinationIntact(fs, plan.launcher, "the launcher destination");
+      assertDestinationIntact(fs, plan.database, "the database destination");
+      void what;
     };
-  } catch (error) {
-    compensate();
-    throw error;
+    intact("before securing recovery");
+
+    const recoveryRoot = join(staged.stageRoot, "recovery");
+    mkdirSync(recoveryRoot, { recursive: true, mode: 0o700 });
+    chmodSync(recoveryRoot, 0o700);
+    const hadRuntime = plan.runtime.identity !== null;
+    const hadPlist = plan.plist.identity !== null;
+    const hadLauncher = plan.launcher.identity !== null;
+    const hadDatabase = plan.database.identity !== null;
+
+    // The prior database is secured through the supported WAL-complete path, not copied. A file
+    // copy of a live SQLite database is older than its last commit, so compensating from one
+    // would put back a database that never existed — the same defect the sealed image avoids.
+    const recoveryDatabase = join(recoveryRoot, `${basename(databaseDestination)}`);
+    if (hadDatabase) captureRollbackPointSync(databaseDestination, recoveryDatabase);
+    if (hadRuntime) copyPrivateTree(runtimeDestination, join(recoveryRoot, "runtime"));
+    if (hadPlist) copyPrivateFile(plistDestination, join(recoveryRoot, "plist"));
+    if (hadLauncher) copyPrivateFile(launcherDestination, join(recoveryRoot, "launcher"));
+
+    /** Puts back every half of the previous generation, including its database. */
+    const compensate = (): void => {
+      if (hadRuntime) {
+        rmSync(runtimeDestination, { recursive: true, force: true });
+        copyPrivateTree(join(recoveryRoot, "runtime"), runtimeDestination);
+      } else rmSync(runtimeDestination, { recursive: true, force: true });
+      // Unlink first, always. `copyFileSync` onto an existing name *follows* a symbolic link, so
+      // a compensation that copied straight over the destination would write the recovered plist
+      // through whatever link had replaced it — measured: the attacker's file received the old
+      // plist while the deployment kept the intruder. Removing the name first unlinks the link
+      // itself and never the thing it points at.
+      rmSync(plistDestination, { force: true });
+      if (hadPlist) {
+        copyFileSync(join(recoveryRoot, "plist"), plistDestination);
+        chmodSync(plistDestination, PRIVATE_FILE_MODE);
+      }
+      rmSync(launcherDestination, { force: true });
+      if (hadLauncher) {
+        copyFileSync(join(recoveryRoot, "launcher"), launcherDestination);
+        chmodSync(launcherDestination, 0o700);
+      }
+      // The database last, and only when this call actually replaced it: restoring an image over
+      // a database nothing touched would be a mutation performed by the compensation itself.
+      if (hadDatabase && databaseReplaced) {
+        restoreDatabase(databaseDestination, recoveryDatabase);
+      }
+    };
+
+    let databaseReplaced = false;
+    try {
+      if (options.failAfter === "recovery") {
+        throw acpError(ReasonCode.INTERNAL_ERROR, "injected failure after recovery", {});
+      }
+
+      options.onStep?.("runtime");
+      intact("before installing the runtime");
+      rmSync(runtimeDestination, { recursive: true, force: true });
+      copyPrivateTree(staged.runtimeRoot, runtimeDestination);
+      if (options.failAfter === "runtime") {
+        throw acpError(ReasonCode.INTERNAL_ERROR, "injected failure after runtime", {});
+      }
+
+      options.onStep?.("plist");
+      assertDestinationIntact(fs, plan.plist, "the plist destination");
+      rmSync(plistDestination, { force: true });
+      copyFileSync(staged.plistPath, plistDestination);
+      chmodSync(plistDestination, PRIVATE_FILE_MODE);
+      if (options.failAfter === "plist") {
+        throw acpError(ReasonCode.INTERNAL_ERROR, "injected failure after plist", {});
+      }
+
+      options.onStep?.("launcher");
+      assertDestinationIntact(fs, plan.launcher, "the launcher destination");
+      rmSync(launcherDestination, { force: true });
+      copyFileSync(staged.launcherPath, launcherDestination);
+      chmodSync(launcherDestination, 0o700);
+      if (options.failAfter === "launcher") {
+        throw acpError(ReasonCode.INTERNAL_ERROR, "injected failure after launcher", {});
+      }
+
+      // The sealed generation restores its own database: its state-admin, under its Node. Running
+      // the current build's restore here would be the defect this pair exists to prevent, one
+      // layer down — pair A's image installed by generation B's code.
+      //
+      // The *resolved* path, and this is not tidiness. A Node entrypoint decides whether it is the
+      // program being run by comparing `import.meta.url` — which is always the real path — against
+      // `process.argv[1]` as given. Hand it a path that traverses a symlink and the comparison
+      // fails, the CLI's main guard never fires, and the process exits 0 having done nothing.
+      // Measured: `/var/...` versus `/private/var/...` on macOS produced a rollback that reported
+      // success and restored no database at all.
+      options.onStep?.("database");
+      assertDestinationIntact(fs, plan.database, "the database destination");
+      const installedRuntime = realpathSync(runtimeDestination);
+      const installedStateAdmin = join(installedRuntime, identity.runtime.stateAdmin);
+      const installedNode = join(installedRuntime, identity.runtime.nodeExecutable);
+      if (options.failAfter === "restoreHelper") {
+        throw acpError(ReasonCode.INTERNAL_ERROR, "injected failure after restoreHelper", {});
+      }
+      databaseReplaced = true;
+      execFileSync(
+        installedNode,
+        [installedStateAdmin, "restore", staged.databasePath, "--database", databaseDestination, "--confirm-restore"],
+        { encoding: "utf8", stdio: "pipe" },
+      );
+      // Exit zero is a claim, not a result. Whatever the sealed state-admin did, the destination
+      // now has to be the image that was staged, byte for byte, or this rollback did not happen.
+      const restoredDigest = hashFile(databaseDestination);
+      const stagedDigest = hashFile(staged.databasePath);
+      if (restoredDigest !== stagedDigest) {
+        throw acpError(ReasonCode.INTERNAL_ERROR, "the restore reported success without installing the sealed image", {
+          databaseDestination,
+          expected: stagedDigest,
+          actual: restoredDigest,
+        });
+      }
+      if (options.failAfter === "database") {
+        throw acpError(ReasonCode.INTERNAL_ERROR, "injected failure after database", {});
+      }
+
+      if (options.failAfter === "cleanup") {
+        throw acpError(ReasonCode.INTERNAL_ERROR, "injected failure after cleanup", {});
+      }
+
+      return {
+        pairId: staged.pairId,
+        generation: identity.service.generation,
+        runtimeRoot: runtimeDestination,
+        plistPath: plistDestination,
+        launcherPath: launcherDestination,
+        databasePath: databaseDestination,
+        recoveryRoot,
+      };
+    } catch (error) {
+      compensate();
+      throw error;
+    }
+  } finally {
+    fs.dispose();
   }
 };
 
@@ -1410,7 +1718,7 @@ const USAGE = `rollback-pair — seal, validate and roll back one exact sealed p
 
   rollback-pair seal --pairs-root DIR --database FILE \\
     --runtime-root DIR --entrypoint REL --state-admin REL \\
-    --node-path FILE --node-version vX.Y.Z \\
+    --node-executable REL --node-version vX.Y.Z \\
     --install-runtime-root DIR --install-plist FILE --install-launcher FILE \\
     --working-directory DIR \\
     --service-label LABEL --service-generation NAME --plist FILE --launcher FILE
@@ -1439,7 +1747,7 @@ const REQUIRED_SEAL_FLAGS = [
   "--runtime-root",
   "--entrypoint",
   "--state-admin",
-  "--node-path",
+  "--node-executable",
   "--node-version",
   "--install-runtime-root",
   "--install-plist",
@@ -1508,7 +1816,7 @@ const main = async (argv: readonly string[]): Promise<number> => {
       runtimeRoot: supplied.get("--runtime-root")!,
       entrypoint: supplied.get("--entrypoint")!,
       stateAdmin: supplied.get("--state-admin")!,
-      nodePath: supplied.get("--node-path")!,
+      nodeExecutable: supplied.get("--node-executable")!,
       nodeVersion: supplied.get("--node-version")!,
       install: {
         runtimeRoot: supplied.get("--install-runtime-root")!,

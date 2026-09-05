@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
@@ -8,6 +8,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
@@ -141,8 +142,17 @@ const buildDatabaseWithUncheckpointedCommits = (root: string): WalFixture => {
   mkdirSync(join(runtimeRoot, "db"), { recursive: true, mode: 0o700 });
   writeFileSync(join(runtimeRoot, "daemon", "agentcpd.js"), "// sealed runtime closure\n", { mode: 0o600 });
   writeFileSync(join(runtimeRoot, "db", "state-admin.js"), "// sealed state admin\n", { mode: 0o600 });
+  mkdirSync(join(runtimeRoot, "bin"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(runtimeRoot, "bin", "node"), "#!/bin/bash\nexit 0\n", { mode: 0o755 });
+  chmodSync(join(runtimeRoot, "bin", "node"), 0o755);
   const launcherDestination = join(realpathSync(state), "agentcpd-launch.sh");
-  const artifacts = writeGenerationArtifacts(source, "generation-under-test", appRoot, launcherDestination, "/opt/sealed/bin/node");
+  const artifacts = writeGenerationArtifacts(
+    source,
+    "generation-under-test",
+    appRoot,
+    launcherDestination,
+    join(appRoot, "dist", "bin", "node"),
+  );
 
   return {
     databasePath,
@@ -154,7 +164,7 @@ const buildDatabaseWithUncheckpointedCommits = (root: string): WalFixture => {
       runtimeRoot,
       entrypoint: "daemon/agentcpd.js",
       stateAdmin: "db/state-admin.js",
-      nodePath: "/opt/sealed/bin/node",
+      nodeExecutable: "bin/node",
       nodeVersion: "v22.18.0",
       install: {
         runtimeRoot: join(appRoot, "dist"),
@@ -253,6 +263,7 @@ const makeGenerationFixture = (prefix: string): GenerationFixture => {
   // sibling is outside the install root, so a rollback replaces `dist` and leaves it alone —
   // which is exactly the shape the sealed closure assumes.
   symlinkSync(join(process.cwd(), "node_modules"), join(appRootRaw, "node_modules"));
+  symlinkSync(join(process.cwd(), "native"), join(appRootRaw, "native"));
   const appRoot = realpathSync(appRootRaw);
   const installRoot = join(appRoot, "dist");
   mkdirSync(state, { recursive: true, mode: 0o700 });
@@ -279,14 +290,14 @@ const makeGenerationFixture = (prefix: string): GenerationFixture => {
         generation,
         appRoot,
         launcherDestination,
-        process.execPath,
+        join(installRoot, "bin", "node"),
       );
       return {
         databasePath,
         runtimeRoot,
         entrypoint: "daemon/agentcpd.js",
         stateAdmin: "db/state-admin.js",
-        nodePath: process.execPath,
+        nodeExecutable: "bin/node",
         nodeVersion: process.version,
         install: {
           runtimeRoot: installRoot,
@@ -316,6 +327,14 @@ const runtimeClosureFor = (root: string, generation: string): string => {
   const runtimeRoot = join(root, `runtime-${generation}`);
   cpSync(REPO_DIST, runtimeRoot, { recursive: true });
   writeFileSync(join(runtimeRoot, GENERATION_MARKER), `${generation}\n`, { mode: 0o600 });
+  // The interpreter travels inside the closure. Here it is a shim that hands off to this test
+  // process's own Node — a tiny synthetic stand-in under the same schema, inventory and mode
+  // rules. The heavy row below seals the real 108MB executable and proves the real property.
+  mkdirSync(join(runtimeRoot, "bin"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(runtimeRoot, "bin", "node"), `#!/bin/bash\nexec ${process.execPath} "$@"\n`, {
+    mode: 0o755,
+  });
+  chmodSync(join(runtimeRoot, "bin", "node"), 0o755);
   return runtimeRoot;
 };
 
@@ -389,6 +408,41 @@ describe("a sealed rollback pair carries a WAL-complete image", () => {
   });
 });
 
+
+/**
+ * The real executable closure, sealed once.
+ *
+ * Everything the sealed generation needs to run: the built application tree, the Node executable
+ * that runs it, and the native addon it loads — flattened into the layout a deployment installs,
+ * with no symbolic links, because a pair refuses those. `cp -Rc` asks APFS for clones, which is
+ * what makes carrying a 108MB interpreter cost almost nothing here.
+ *
+ * This is the one heavy fixture in the suite. Every adversarial row uses a tiny synthetic closure
+ * under the same schema, inventory and mode rules; building thirty of these to vary a metadata
+ * field would buy nothing and cost gigabytes.
+ */
+const buildRealClosure = (root: string): string => {
+  const closure = join(root, "real-closure");
+  mkdirSync(join(closure, "bin"), { recursive: true, mode: 0o700 });
+  execFileSync("/bin/cp", ["-Rc", `${REPO_DIST}/.`, closure]);
+  mkdirSync(join(closure, "node_modules"), { recursive: true, mode: 0o700 });
+  for (const pkg of ["better-sqlite3", "bindings", "file-uri-to-path"]) {
+    const found = execFileSync(
+      "/usr/bin/find",
+      ["node_modules/.pnpm", "-maxdepth", "4", "-type", "d", "-path", `*/node_modules/${pkg}`],
+      { encoding: "utf8", cwd: process.cwd() },
+    )
+      .split("\n")
+      .filter(Boolean)[0];
+    if (!found) throw new Error(`the fixture could not find ${pkg} to seal`);
+    // `-L` dereferences pnpm's symlinks: a sealed pair refuses links, and rightly.
+    execFileSync("/bin/cp", ["-RcL", join(process.cwd(), found), join(closure, "node_modules", pkg)]);
+  }
+  execFileSync("/bin/cp", ["-c", process.execPath, join(closure, "bin", "node")]);
+  chmodSync(join(closure, "bin", "node"), 0o755);
+  return closure;
+};
+
 describe("a rollback installs one whole generation", () => {
   it("replaces generation B's runtime and database together, through the built binary", async () => {
     expect(existsSync(VALIDATOR), `${VALIDATOR} is missing — run pnpm build first`).toBe(true);
@@ -436,6 +490,96 @@ describe("a rollback installs one whole generation", () => {
     // The runtime that is installed really is a working closure, not a marker file.
     expect(existsSync(join(fixture.installRoot, "db", "state-admin.js"))).toBe(true);
   });
+
+
+  it("runs the sealed generation after the source, the external Node and node_modules are gone", async () => {
+    const fixture = makeGenerationFixture("acp-rollback-closure-");
+    new Db(fixture.databasePath).close();
+    probeDatabase(fixture.databasePath, "generation-a");
+
+    const closure = buildRealClosure(fixture.root);
+    const sealed = await sealRollbackPair(fixture.pairsRoot, fixture.sourcesFor("generation-a", closure));
+
+    // The pair carries the interpreter and the native addon, with the bits that let them run.
+    const inventory = new Map(sealed.manifest.inventory.map((m) => [m.path, m]));
+    const sealedNode = inventory.get("runtime/bin/node");
+    expect(sealedNode, "the pair does not carry a Node executable").toBeDefined();
+    expect(sealedNode!.mode & 0o111, "the sealed interpreter lost its execute bit").not.toBe(0);
+    expect(
+      [...inventory.keys()].some((path) => path.endsWith(".node")),
+      "the pair does not carry the native addon its runtime loads",
+    ).toBe(true);
+
+    // Generation B is live, and the database has moved on.
+    cpSync(runtimeClosureFor(fixture.root, "generation-b"), fixture.installRoot, {
+      recursive: true,
+      force: true,
+    });
+    probeDatabase(fixture.databasePath, "generation-b");
+    expect(databaseMarkers(fixture.databasePath)).toEqual(["generation-a", "generation-b"]);
+
+    // Everything outside the pair that it could have leaned on is removed before it is used.
+    rmSync(closure, { recursive: true, force: true });
+    expect(existsSync(closure)).toBe(false);
+
+    const staged = stageRollbackPair(
+      sealed.root,
+      fixture.expectation(sealed.pairId, sealed.indexDigest),
+      join(fixture.root, "stage"),
+    );
+    applyRollbackPair(staged);
+
+    // The database came back through the sealed state-admin under the sealed interpreter.
+    expect(databaseMarkers(fixture.databasePath)).toEqual(["generation-a"]);
+    expect(installedGeneration(fixture.installRoot)).toBe("<none>");
+
+    // And the installed generation runs on its own: no PATH, no inherited environment, no
+    // external Node and no external node_modules — and it loads the native addon, which is the
+    // part a pure-JS closure would pass without proving.
+    const installedNode = join(fixture.installRoot, "bin", "node");
+    expect(statSync(installedNode).mode & 0o111).not.toBe(0);
+    const standalone = spawnSync(
+      installedNode,
+      [join(fixture.installRoot, "db", "state-admin.js"), "migration-plan", "--database", fixture.databasePath],
+      { encoding: "utf8", env: { HOME: fixture.root, PATH: "/nonexistent" } },
+    );
+    expect(standalone.status, standalone.stderr).toBe(0);
+    // A real reading from the sealed closure: it opened the database through the sealed native
+    // addon and reported its on-disk version. A module-resolution failure could not get here.
+    expect(standalone.stdout).toContain("onDiskVersion");
+    expect(JSON.parse(standalone.stdout).onDiskVersion).toBeGreaterThan(0);
+  }, 300_000);
+
+  it("refuses a closure that still links a library outside itself", async () => {
+    const fixture = makeGenerationFixture("acp-rollback-linkage-");
+    new Db(fixture.databasePath).close();
+    chmodSync(fixture.databasePath, 0o600);
+    const closure = runtimeClosureFor(fixture.root, "generation-a");
+
+    // A real Mach-O with a real external dependency. The library is built outside the closure and
+    // linked by its absolute install name, which is exactly the shape that makes a pair install
+    // cleanly and then fail to start once the machine it was sealed on has moved on.
+    const scratch = join(fixture.root, "linkage");
+    mkdirSync(scratch, { recursive: true, mode: 0o700 });
+    writeFileSync(join(scratch, "lib.c"), "int acp_external(void){return 0;}\n");
+    writeFileSync(join(scratch, "main.c"), "int acp_external(void);\nint main(void){return acp_external();}\n");
+    execFileSync("/usr/bin/cc", ["-dynamiclib", "-o", join(scratch, "libexternal.dylib"), join(scratch, "lib.c")]);
+    execFileSync("/usr/bin/cc", [
+      "-o",
+      join(closure, "bin", "helper"),
+      join(scratch, "main.c"),
+      join(scratch, "libexternal.dylib"),
+    ]);
+    // The dependency really is outside the closure and really is not a system library.
+    const linkage = execFileSync("/usr/bin/otool", ["-L", join(closure, "bin", "helper")], {
+      encoding: "utf8",
+    });
+    expect(linkage).toContain(join(scratch, "libexternal.dylib"));
+
+    await expect(
+      sealRollbackPair(fixture.pairsRoot, fixture.sourcesFor("generation-a", closure)),
+    ).rejects.toThrow(/depends on a library outside itself/);
+  }, 120_000);
 
   it("refuses a pair sealed for another database or service, through the built binary", async () => {
     const fixture = makeGenerationFixture("acp-rollback-cross-target-");
@@ -505,9 +649,20 @@ describe("a rollback installs one whole generation", () => {
       fixture.pairsRoot,
       fixture.sourcesFor("generation-a", runtimeClosureFor(fixture.root, "generation-a")),
     );
+    // The live database moves on after the seal, so the sealed image and the live file differ.
+    // Without this the database assertions below would hold whether or not anything compensated.
+    probeDatabase(fixture.databasePath, "generation-b");
+    expect(databaseMarkers(fixture.databasePath)).toEqual(["generation-a", "generation-b"]);
 
-    for (const failAfter of ["recovery", "runtime", "plist", "launcher", "database"] as const) {
-      // Restore generation B as the live deployment before each attempt.
+    for (const failAfter of [
+      "recovery",
+      "runtime",
+      "plist",
+      "launcher",
+      "restoreHelper",
+      "database",
+      "cleanup",
+    ] as const) {
       cpSync(runtimeClosureFor(fixture.root, "generation-b"), fixture.installRoot, {
         recursive: true,
         force: true,
@@ -517,13 +672,16 @@ describe("a rollback installs one whole generation", () => {
       const plistBefore = readFileSync(fixture.plistDestination, "utf8");
       const launcherBefore = readFileSync(fixture.launcherDestination, "utf8");
       const runtimeBefore = readdirSync(fixture.installRoot).sort();
+      const databaseBefore = readFileSync(fixture.databasePath);
 
       const staged = stageRollbackPair(
         sealed.root,
         fixture.expectation(sealed.pairId, sealed.indexDigest),
         join(fixture.root, `stage-${failAfter}`),
       );
-      expect(() => applyRollbackPair(staged, { failAfter })).toThrow(new RegExp(`injected failure after ${failAfter}`));
+      expect(() => applyRollbackPair(staged, { failAfter })).toThrow(
+        new RegExp(`injected failure after ${failAfter}`),
+      );
 
       expect(installedGeneration(fixture.installRoot), `runtime was left mixed after ${failAfter}`).toBe(
         "generation-b",
@@ -538,8 +696,63 @@ describe("a rollback installs one whole generation", () => {
         readFileSync(fixture.launcherDestination, "utf8"),
         `launcher was left replaced after ${failAfter}`,
       ).toBe(launcherBefore);
+
+      // Real rows, and real bytes. `restoreHelper` fires before the restore runs and `database`
+      // fires after it succeeded, so this is the assertion that tells a compensation that put the
+      // database back from a rollback that never touched it.
+      expect(databaseMarkers(fixture.databasePath), `database rows lost after ${failAfter}`).toEqual([
+        "generation-a",
+        "generation-b",
+      ]);
+      if (failAfter !== "database" && failAfter !== "cleanup") {
+        expect(
+          readFileSync(fixture.databasePath).equals(databaseBefore),
+          `database bytes changed after ${failAfter}`,
+        ).toBe(true);
+      }
     }
   });
+
+  it("refuses a destination swapped between the plan and the step that uses it", async () => {
+    const fixture = makeGenerationFixture("acp-rollback-toctou-");
+    new Db(fixture.databasePath).close();
+    probeDatabase(fixture.databasePath, "generation-a");
+    const sealed = await sealRollbackPair(
+      fixture.pairsRoot,
+      fixture.sourcesFor("generation-a", runtimeClosureFor(fixture.root, "generation-a")),
+    );
+    cpSync(runtimeClosureFor(fixture.root, "generation-b"), fixture.installRoot, { recursive: true });
+    writeFileSync(fixture.plistDestination, "<!-- generation-b plist -->\n", { mode: 0o600 });
+    writeFileSync(fixture.launcherDestination, "#!/bin/bash\n# generation-b\n", { mode: 0o700 });
+    const launcherBefore = readFileSync(fixture.launcherDestination, "utf8");
+
+    const staged = stageRollbackPair(
+      sealed.root,
+      fixture.expectation(sealed.pairId, sealed.indexDigest),
+      join(fixture.root, "stage"),
+    );
+
+    // The window a pathname-based rollback cannot see: the plan is frozen, and the plist is
+    // replaced by a symlink pointing somewhere else before the step that writes it runs. A
+    // re-check that walked the path again would follow the link and agree.
+    const elsewhere = join(fixture.root, "attacker-target");
+    writeFileSync(elsewhere, "not the deployment\n", { mode: 0o600 });
+    expect(() =>
+      applyRollbackPair(staged, {
+        onStep: (step) => {
+          if (step !== "plist") return;
+          rmSync(fixture.plistDestination, { force: true });
+          symlinkSync(elsewhere, fixture.plistDestination);
+        },
+      }),
+    ).toThrow(/no longer the object that was verified/);
+
+    // The attacker's file was not written through, and the previous generation is whole again.
+    expect(readFileSync(elsewhere, "utf8")).toBe("not the deployment\n");
+    expect(installedGeneration(fixture.installRoot)).toBe("generation-b");
+    expect(readFileSync(fixture.launcherDestination, "utf8")).toBe(launcherBefore);
+    expect(databaseMarkers(fixture.databasePath)).toEqual(["generation-a"]);
+  }, 120_000);
 
   it("refuses a destination of the wrong type before it mutates anything", async () => {
     const fixture = makeGenerationFixture("acp-rollback-destination-");

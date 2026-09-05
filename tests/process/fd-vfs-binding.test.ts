@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { afterAll, describe, expect, it } from "vitest";
 
-import { FdVfsControl } from "../../src/db/fd-vfs.ts";
+import { FdVfsControl, RollbackFilesystem } from "../../src/db/fd-vfs.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -745,4 +745,137 @@ describe("U6-UNIT1 the fd-vfs binds a connection to a verified descriptor", () =
     expect(both.status, "a build claiming both identities produced an artifact").not.toBe(0);
     expect(both.stderr).toMatch(/must never be defined for the shipping build/);
   }, 300_000);
+});
+
+
+/**
+ * The bounded rollback primitive: the four races a pathname-based rollback cannot win.
+ *
+ * Each row here is a counterexample that defeats the Node-stdlib version of the same operation.
+ * `fs` has no `*at` family and no `RENAME_EXCL`, so every one of these is a check on one object
+ * and a mutation on whatever the name means a moment later.
+ */
+describe("the rollback filesystem primitive anchors on descriptors, not names", () => {
+  const withFs = <T>(work: (fs: RollbackFilesystem) => T): T => {
+    const fs = RollbackFilesystem.load();
+    try {
+      return work(fs);
+    } finally {
+      fs.dispose();
+    }
+  };
+
+  it("follows the directory it opened when that directory is renamed underneath it", () => {
+    const root = tempDir("acp-rb-rename-parent-");
+    const original = join(root, "stage");
+    mkdirSync(original, { mode: 0o700 });
+    writeFileSync(join(original, "member"), "sealed\n", { mode: 0o600 });
+
+    withFs((fs) => {
+      const parent = fs.openParent(original);
+      // The name moves; the object does not. A pathname-based check would now be looking at
+      // nothing, or worse at whatever took the old name.
+      renameSync(original, join(root, "moved-away"));
+      mkdirSync(original, { mode: 0o700 });
+      writeFileSync(join(original, "member"), "intruder\n", { mode: 0o600 });
+
+      const entry = fs.stat(parent, "member");
+      expect(entry).not.toBeNull();
+      expect(entry!.size, "the held descriptor followed the pathname instead of the object").toBe(
+        "sealed\n".length,
+      );
+      fs.closeParent(parent);
+    });
+  });
+
+  it("refuses to open a parent reached through a symbolic link, and never follows one", () => {
+    const root = tempDir("acp-rb-symlink-");
+    const real = join(root, "real");
+    mkdirSync(real, { mode: 0o700 });
+    const link = join(root, "link");
+    symlinkSync(real, link);
+    writeFileSync(join(real, "member"), "sealed\n", { mode: 0o600 });
+    symlinkSync(join(root, "elsewhere"), join(real, "steered"));
+
+    withFs((fs) => {
+      expect(() => fs.openParent(link)).toThrow(/refused opening a parent directory/);
+
+      const parent = fs.openParent(real);
+      const steered = fs.stat(parent, "steered");
+      // Reported as the link it is, not as the thing it points at — which does not even exist.
+      expect(steered?.type).toBe("symlink");
+      fs.closeParent(parent);
+    });
+  });
+
+  it("refuses to publish over a foreign directory that took the final name", () => {
+    const root = tempDir("acp-rb-publish-");
+    mkdirSync(join(root, "staging"), { mode: 0o700 });
+    writeFileSync(join(root, "staging", "member"), "sealed\n", { mode: 0o600 });
+
+    withFs((fs) => {
+      const parent = fs.openParent(root);
+      // Exactly the window `existsSync` then `renameSync` leaves open: the destination was absent
+      // when a caller looked and is a foreign empty directory by the time it commits.
+      mkdirSync(join(root, "final"), { mode: 0o700 });
+
+      expect(() => fs.renameExclusive(parent, "staging", parent, "final")).toThrow(
+        /refused publishing a name exclusively/,
+      );
+      // The intruder is intact and the stage is still the caller's.
+      expect(existsSync(join(root, "final", "member"))).toBe(false);
+      expect(existsSync(join(root, "staging", "member"))).toBe(true);
+
+      // And the same call succeeds once the name is genuinely free.
+      renameSync(join(root, "final"), join(root, "taken-elsewhere"));
+      fs.renameExclusive(parent, "staging", parent, "final");
+      expect(existsSync(join(root, "final", "member"))).toBe(true);
+      fs.closeParent(parent);
+    });
+  });
+
+  it("refuses to clean up a stage that was replaced by a foreign one", () => {
+    const root = tempDir("acp-rb-cleanup-");
+    const stage = join(root, "stage");
+    mkdirSync(stage, { mode: 0o700 });
+    writeFileSync(join(stage, "member"), "mine\n", { mode: 0o600 });
+
+    withFs((fs) => {
+      const parent = fs.openParent(root);
+      const mine = fs.stat(parent, "stage")!;
+
+      // Somebody else's tree is now under the name this cleanup was about to remove.
+      renameSync(stage, join(root, "mine-moved"));
+      mkdirSync(stage, { mode: 0o700 });
+      writeFileSync(join(stage, "not-mine"), "theirs\n", { mode: 0o600 });
+
+      expect(() => fs.removeOwned(parent, "stage", mine.dev, mine.ino)).toThrow(
+        /refused removing an owned entry/,
+      );
+      expect(existsSync(join(stage, "not-mine")), "a foreign tree was deleted").toBe(true);
+
+      // The caller's own tree, named by its identity, is still removable.
+      const moved = fs.stat(parent, "mine-moved")!;
+      fs.removeOwned(parent, "mine-moved", moved.dev, moved.ino);
+      expect(existsSync(join(root, "mine-moved"))).toBe(false);
+      fs.closeParent(parent);
+    });
+  });
+
+  it("exposes only the bounded primitive, with no traversal and no generic surface", () => {
+    const root = tempDir("acp-rb-bounded-");
+    mkdirSync(join(root, "child"), { mode: 0o700 });
+
+    withFs((fs) => {
+      const parent = fs.openParent(root);
+      // Names are single components. A primitive that accepted a path would be a traversal API
+      // wearing a narrower name.
+      for (const name of ["..", ".", "child/deeper", "/etc/passwd", ""]) {
+        expect(() => fs.stat(parent, name), `the primitive accepted ${JSON.stringify(name)}`).toThrow(
+          /refused inspecting an entry/,
+        );
+      }
+      fs.closeParent(parent);
+    });
+  });
 });

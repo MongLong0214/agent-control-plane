@@ -255,6 +255,10 @@ const makeDisposableAppRoot = (): string => {
   // inside it. Linking rather than copying keeps the fixture small; what matters is that the
   // sibling sits outside the install root, so a rollback replaces `dist` and leaves it alone.
   symlinkSync(join(root, "node_modules"), join(appRoot, "node_modules"));
+  // `native/` is part of the same closure: the built `dist/db/fd-vfs.js` resolves the extension
+  // relative to itself, so an app root without it has a runtime that cannot load its own
+  // primitive. A real deployment checkout carries both beside `dist`.
+  symlinkSync(join(root, "native"), join(appRoot, "native"));
   return realpathSync(appRoot);
 };
 
@@ -297,6 +301,13 @@ const sealPairFor = async (
   const runtimeRoot = join(source, "runtime");
   cpSync(join(root, "dist"), runtimeRoot, { recursive: true });
   writeFileSync(join(runtimeRoot, GENERATION_MARKER), `${generation}\n`, { mode: 0o600 });
+  // The interpreter travels inside the closure, so the rollback runs the sealed one rather than
+  // whatever `node` this machine happens to have.
+  mkdirSync(join(runtimeRoot, "bin"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(runtimeRoot, "bin", "node"), `#!/bin/bash\nexec ${process.execPath} "$@"\n`, {
+    mode: 0o755,
+  });
+  chmodSync(join(runtimeRoot, "bin", "node"), 0o755);
 
   const launcherDestination = join(realpathSync(state), "agentcpd-launch.sh");
   const plistDestination = join(
@@ -327,7 +338,7 @@ const sealPairFor = async (
     [
       "#!/bin/bash",
       `# ${generation}`,
-      `ACP_NODE_PATH=${process.execPath}`,
+      `ACP_NODE_PATH=${join(appRoot, "dist", "bin", "node")}`,
       `ACP_APP_ROOT=${appRoot}`,
       'exec "$ACP_NODE_PATH" "$ACP_APP_ROOT/dist/daemon/agentcpd.js"',
       "",
@@ -340,7 +351,7 @@ const sealPairFor = async (
     runtimeRoot,
     entrypoint: "daemon/agentcpd.js",
     stateAdmin: "db/state-admin.js",
-    nodePath: process.execPath,
+    nodeExecutable: "bin/node",
     nodeVersion: process.version,
     install: {
       runtimeRoot: join(appRoot, "dist"),
@@ -912,7 +923,16 @@ describe("launchd deployment artifact", () => {
 
     expect(rolledBack.status, rolledBack.stderr).toBe(0);
     expect(existsSync(harness.lock)).toBe(false);
-    expect(subcommands(harness.launchLog)).toEqual(["print", "bootout", "print", "bootstrap", "kickstart"]);
+    // Two `print`s before the bootout: one asks whether the service was running so the original
+    // state can be restored afterwards, one is `stop_job`'s own check.
+    expect(subcommands(harness.launchLog)).toEqual([
+      "print",
+      "print",
+      "bootout",
+      "print",
+      "bootstrap",
+      "kickstart",
+    ]);
 
     // The generation moved as one: runtime closure, plist and launcher are all the named pair's,
     // and none of them is the newer pair nobody approved.
@@ -924,6 +944,48 @@ describe("launchd deployment artifact", () => {
     expect(existsSync(join(appRoot, "dist", "db", "state-admin.js"))).toBe(true);
     // The stage is not left lying around holding a copy of the deployment.
     expect(readdirSync(join(harness.home, ".agent-control-plane", "rollback-stage"))).toEqual([]);
+  });
+
+  it("leaves a deliberately stopped service stopped after a rollback", async () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    // Installed but never started: the operator's chosen state is "stopped".
+    expect(
+      runInstaller(
+        installer,
+        ["install", "--app-root", appRoot, "--node", harness.node, "--no-start"],
+        harness,
+      ).status,
+    ).toBe(0);
+    const fixture = await sealPairFor(harness, appRoot);
+    writeFileSync(harness.launchLog, "");
+
+    const rolledBack = runInstaller(
+      installer,
+      [
+        "rollback",
+        "--app-root",
+        appRoot,
+        "--node",
+        harness.node,
+        "--pair-id",
+        fixture.pair.pairId,
+        "--expected-index-digest",
+        fixture.pair.indexDigest,
+        ...structuralFlags(fixture),
+      ],
+      harness,
+    );
+
+    expect(rolledBack.status, rolledBack.stderr).toBe(0);
+    // The generation was replaced, and the service was not started behind the operator's back.
+    expect(readFileSync(join(appRoot, "dist", GENERATION_MARKER), "utf8").trim()).toBe(
+      "sealed-generation",
+    );
+    const launchctl = subcommands(harness.launchLog);
+    expect(launchctl, "a stopped service was started by the rollback").not.toContain("bootstrap");
+    expect(launchctl).not.toContain("kickstart");
+    expect(existsSync(harness.loaded)).toBe(false);
   });
 
   it("rejects a substring-only installer stub", () => {

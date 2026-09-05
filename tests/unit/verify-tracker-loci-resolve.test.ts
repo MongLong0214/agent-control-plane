@@ -2786,13 +2786,22 @@ describe("verify-tracker-loci-resolve", () => {
   });
 
   it("a word found only inside a multiline Bash string is stale", () => {
-    const body = "`expect` in `deploy/install-launchd.sh`";
+    // The word has to be one that appears in `install-launchd.sh` *only* inside the launcher
+    // heredoc, so a citation of it is stale rather than resolved. `expect` used to be that word
+    // and stopped being one: the sealed-pair rollback added a real `--expect-*` flag family to
+    // the argument parser, so the citation now resolves and this row would be asserting the
+    // opposite of what it is named for. `stdin` is chosen the same way `expect` was — it occurs
+    // twice, both inside the `cat <<'EOF'` body that writes the launcher, and nowhere in code.
+    //
+    // The premise moved; the guard did not. This still measures that a token found only inside a
+    // multiline shell string is reported STALE rather than counted as a live occurrence.
+    const body = "`stdin` in `deploy/install-launchd.sh`";
     const { path, cleanup } = withIssues([{ number: 68962, title: "multiline shell string", body }]);
     try {
       const result = run(path);
       expect(result.status).toBe(1);
       expect(result.stdout).toContain("STALE");
-      expect(result.stdout).toContain("expect");
+      expect(result.stdout).toContain("stdin");
       expect(result.stdout).toContain("does not appear");
     } finally {
       cleanup();

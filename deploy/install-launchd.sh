@@ -472,13 +472,20 @@ case "$command_name" in
     # whole, so the job is started again rather than left down.
     "$node_path" "$validator" validate "${rollback_flags[@]}" >/dev/null ||
       fail "sealed rollback pair failed validation: $pair_root"
+
+    # The service state before this rollback touched it. Always starting the job afterwards would
+    # leave a deployment running that the operator had deliberately stopped — a state change
+    # nobody asked for, arrived at through a failure path. So the original state is captured here
+    # and restored on both the success and the compensation path.
+    if job_loaded; then service_was_loaded=1; else service_was_loaded=0; fi
     stop_job
     wait_for_stop
     if ! rollback_report="$("$node_path" "$validator" rollback "${rollback_flags[@]}")"; then
-      start_job
-      fail "rollback failed and the previous generation was restored; the service was started again"
+      if [[ "$service_was_loaded" == "1" ]]; then start_job; fi
+      rm -rf "$state_dir/rollback-stage"
+      fail "rollback failed; the previous generation and the original service state were restored"
     fi
-    start_job
+    if [[ "$service_was_loaded" == "1" ]]; then start_job; fi
     applied_generation=""
     while IFS='=' read -r report_key report_value; do
       case "$report_key" in

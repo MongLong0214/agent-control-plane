@@ -4,6 +4,9 @@ import { fileURLToPath } from "node:url";
 
 import Database from "better-sqlite3";
 
+import { acpError } from "../core/errors.ts";
+import { ReasonCode } from "../core/reason-codes.ts";
+
 /**
  * Binds a SQLite connection to a descriptor its caller has already verified (`U6` unit 1).
  *
@@ -185,3 +188,167 @@ export const withBoundDescriptor = <T>(
     closeSync(fd);
   }
 };
+
+
+/**
+ * The bounded rollback filesystem primitive.
+ *
+ * A rollback verifies a destination and then mutates it, and a pathname can be made to mean
+ * something else in between: renaming a parent directory, or replacing a component with a symlink,
+ * steers the second walk somewhere the first never saw. Node's standard library cannot close that
+ * — it exposes no `*at` family, only `O_NOFOLLOW`, and `fs.constants` carries no `RENAME_EXCL` —
+ * so the anchor has to come from the extension, where a held directory descriptor can be the
+ * subject of every later operation.
+ *
+ * This surface is deliberately five operations wide. There is no read, no write, no create-file,
+ * no chmod and no traversal: names are single components. It is what an exclusive publication and
+ * an ownership-bound cleanup need, and nothing a caller could build a general filesystem out of.
+ */
+export interface RollbackEntry {
+  type: "dir" | "file" | "symlink" | "other";
+  mode: number;
+  dev: number;
+  ino: number;
+  nlink: number;
+  size: number;
+}
+
+export interface RollbackParent {
+  handle: number;
+  dev: number;
+  ino: number;
+}
+
+const field = (line: string, name: string): string =>
+  new RegExp(`(?:^| )${name}=([^ ]*)`).exec(line)?.[1] ?? "";
+
+/** Every native result is either a value line or `error=WHAT errno=N`; neither is ever guessed. */
+const refuse = (operation: string, line: string, detail: Record<string, unknown>): never => {
+  throw acpError(ReasonCode.STATE_PATH_INSECURE, `the rollback filesystem refused ${operation}`, {
+    ...detail,
+    reason: field(line, "error"),
+    errno: Number(field(line, "errno")),
+  });
+};
+
+export class RollbackFilesystem {
+  readonly #db: InstanceType<typeof Database>;
+  readonly #open = new Set<number>();
+
+  private constructor(db: InstanceType<typeof Database>) {
+    this.#db = db;
+  }
+
+  static load(): RollbackFilesystem {
+    const db = new Database(":memory:");
+    try {
+      db.loadExtension(EXTENSION_PATH);
+    } catch (error) {
+      db.close();
+      throw acpError(ReasonCode.INTERNAL_ERROR, "the fd-vfs extension could not be loaded", {
+        path: EXTENSION_PATH,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    return new RollbackFilesystem(db);
+  }
+
+  /**
+   * Holds a parent directory open, no-follow, and remembers its identity.
+   *
+   * Everything after this is relative to the descriptor rather than to the path, so renaming the
+   * directory afterwards moves the name and not the object being worked on.
+   */
+  openParent(path: string): RollbackParent {
+    const line = String(
+      (this.#db.prepare("SELECT acp_rb_open(?) AS r").get(path) as { r: string }).r,
+    );
+    if (line.startsWith("error=")) refuse("opening a parent directory", line, { path });
+    const parent = {
+      handle: Number(field(line, "handle")),
+      dev: Number(field(line, "dev")),
+      ino: Number(field(line, "ino")),
+    };
+    this.#open.add(parent.handle);
+    return parent;
+  }
+
+  /** `fstatat(AT_SYMLINK_NOFOLLOW)` under the held parent. `null` when the entry is not there. */
+  stat(parent: RollbackParent, name: string): RollbackEntry | null {
+    const line = String(
+      (this.#db.prepare("SELECT acp_rb_stat(?, ?) AS r").get(parent.handle, name) as { r: string }).r,
+    );
+    if (line.startsWith("error=")) {
+      if (field(line, "error") === "STAT") return null;
+      refuse("inspecting an entry", line, { name });
+    }
+    const type = field(line, "type");
+    return {
+      type: type === "dir" || type === "file" || type === "symlink" ? type : "other",
+      mode: Number.parseInt(field(line, "mode"), 8),
+      dev: Number(field(line, "dev")),
+      ino: Number(field(line, "ino")),
+      nlink: Number(field(line, "nlink")),
+      size: Number(field(line, "size")),
+    };
+  }
+
+  /**
+   * `renameatx_np(..., RENAME_EXCL)`: commit the name only if nothing already holds it.
+   *
+   * The check and the use are one syscall, so a foreign directory that appears under the final
+   * name between them is an `EEXIST` rather than something this overwrites.
+   */
+  renameExclusive(from: RollbackParent, fromName: string, to: RollbackParent, toName: string): void {
+    const line = String(
+      (
+        this.#db
+          .prepare("SELECT acp_rb_rename_excl(?, ?, ?, ?) AS r")
+          .get(from.handle, fromName, to.handle, toName) as { r: string }
+      ).r,
+    );
+    if (line !== "ok") refuse("publishing a name exclusively", line, { fromName, toName });
+  }
+
+  /**
+   * Removes an entry under the held parent, and only while it is still the exact object named.
+   *
+   * Cleanup keyed on a pathname removes whatever is at that name when it runs, which after a
+   * foreign replacement is somebody else's tree. Binding it to `(dev, ino)` makes the object the
+   * authority, so a swapped stage is refused rather than deleted on the owner's behalf.
+   */
+  removeOwned(parent: RollbackParent, name: string, dev: number, ino: number): void {
+    const line = String(
+      (
+        this.#db
+          .prepare("SELECT acp_rb_remove_owned(?, ?, ?, ?) AS r")
+          .get(parent.handle, name, dev, ino) as { r: string }
+      ).r,
+    );
+    if (line !== "ok") refuse("removing an owned entry", line, { name, dev, ino });
+  }
+
+  closeParent(parent: RollbackParent): void {
+    this.#db.prepare("SELECT acp_rb_close(?) AS r").get(parent.handle);
+    this.#open.delete(parent.handle);
+  }
+
+  /**
+   * Releases every handle and the connection.
+   *
+   * A cleanup failure must not replace the reason the work failed — the same lesson
+   * `withBoundDescriptor` records above. Callers reach this from a `finally`, so a throw here
+   * would hide the error that actually matters and is the only one they can act on.
+   */
+  dispose(): void {
+    for (const handle of [...this.#open]) {
+      try {
+        this.#db.prepare("SELECT acp_rb_close(?) AS r").get(handle);
+      } catch {
+        /* The descriptor goes with the connection below; nothing here is worth masking with. */
+      }
+    }
+    this.#open.clear();
+    this.#db.close();
+  }
+}

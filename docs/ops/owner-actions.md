@@ -535,12 +535,20 @@ item 6 restores it as one operation.
 
     set -e
     APP_ROOT=/absolute/path/to/agent-control-plane
+    # The closure is what gets sealed, and it carries its own interpreter and dependencies. A pair
+    # that named an external `node` would promise "restore these bytes and run them under whatever
+    # interpreter this machine has later", which is the generation-mixing the pair exists to end.
+    CLOSURE="$HOME/.agent-control-plane/closure-$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "$CLOSURE/bin" && chmod 700 "$CLOSURE"
+    cp -Rc "$APP_ROOT/dist/." "$CLOSURE/"
+    cp -RcL "$APP_ROOT/node_modules" "$CLOSURE/node_modules"
+    cp -c "$(command -v node)" "$CLOSURE/bin/node" && chmod 755 "$CLOSURE/bin/node"
     node "$APP_ROOT/dist/deploy/rollback-pair.js" seal \
       --pairs-root "$HOME/.agent-control-plane/rollback-pairs" \
       --database "$HOME/.agent-control-plane/state.sqlite" \
-      --runtime-root "$APP_ROOT/dist" \
+      --runtime-root "$CLOSURE" \
       --entrypoint daemon/agentcpd.js --state-admin db/state-admin.js \
-      --node-path "$(command -v node)" --node-version "$(node --version)" \
+      --node-executable bin/node --node-version "$(node --version)" \
       --install-runtime-root "$APP_ROOT/dist" \
       --install-plist "$HOME/Library/LaunchAgents/com.agentcontrolplane.agentcpd.plist" \
       --install-launcher "$HOME/.agent-control-plane/agentcpd-launch.sh" \
@@ -829,12 +837,20 @@ the generation it is running under would make a rollback a one-way door. Substit
 checkout path for `$APP_ROOT`:
 
     APP_ROOT=/absolute/path/to/agent-control-plane
+    # The closure is what gets sealed, and it carries its own interpreter and dependencies. A pair
+    # that named an external `node` would promise "restore these bytes and run them under whatever
+    # interpreter this machine has later", which is the generation-mixing the pair exists to end.
+    CLOSURE="$HOME/.agent-control-plane/closure-$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "$CLOSURE/bin" && chmod 700 "$CLOSURE"
+    cp -Rc "$APP_ROOT/dist/." "$CLOSURE/"
+    cp -RcL "$APP_ROOT/node_modules" "$CLOSURE/node_modules"
+    cp -c "$(command -v node)" "$CLOSURE/bin/node" && chmod 755 "$CLOSURE/bin/node"
     node "$APP_ROOT/dist/deploy/rollback-pair.js" seal \
       --pairs-root "$HOME/.agent-control-plane/rollback-pairs" \
       --database "$HOME/.agent-control-plane/state.sqlite" \
-      --runtime-root "$APP_ROOT/dist" \
+      --runtime-root "$CLOSURE" \
       --entrypoint daemon/agentcpd.js --state-admin db/state-admin.js \
-      --node-path "$(command -v node)" --node-version "$(node --version)" \
+      --node-executable bin/node --node-version "$(node --version)" \
       --install-runtime-root "$APP_ROOT/dist" \
       --install-plist "$HOME/Library/LaunchAgents/com.agentcontrolplane.agentcpd.plist" \
       --install-launcher "$HOME/.agent-control-plane/agentcpd-launch.sh" \
@@ -851,10 +867,13 @@ approved-looking name. Seal while the job is stopped — the backup path is WAL-
 the source and both sidecars untouched, but a recovery point is worth more when nothing is writing
 to the file it is a point for.
 
-`--runtime-root` decides what "the closure" is. `dist` alone is right when dependencies do not
-change between generations, because a rollback then replaces `dist` and leaves the sibling
-`node_modules` in place. If dependencies move with the generation, seal the tree that holds both
-and set `--install-runtime-root` to match.
+`--runtime-root` is the closure, and it has to be able to run after everything outside it is gone:
+the built tree, the `node_modules` it resolves, the native addons those load, and the Node
+executable itself, with its execute bit. Sealing recursively inspects the dynamic linkage of every
+Mach-O it carries and **refuses** if anything absolute is neither a macOS system library nor inside
+the closure — macOS system libraries are the one platform boundary, because they live in the dyld
+shared cache and are not copyable artifacts. `cp -Rc` asks APFS for clones, so carrying a 100MB
+interpreter costs almost no disk.
 
 **Retain two values, outside the pair: the pair id, and `SHA256(SHA256SUMS)`.** The second one is
 the whole point. Every digest inside a pair can be rewritten by whoever rewrote a member — a

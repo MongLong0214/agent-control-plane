@@ -32,6 +32,7 @@ import {
   type RollbackPairSources,
   type SealedRollbackPair,
 } from "../../src/deploy/rollback-pair.ts";
+import { RollbackFilesystem } from "../../src/db/fd-vfs.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -106,6 +107,7 @@ const restateInventory = (root: string): void => {
     path: member.path,
     sha256: `sha256:${digestOfFile(join(root, member.path))}`,
     bytes: lstatSync(join(root, member.path)).size,
+    mode: lstatSync(join(root, member.path)).mode & 0o7777,
   }));
   writePairManifest(root, manifest);
 };
@@ -131,7 +133,7 @@ interface FixtureOptions {
   entrypoint?: string;
   stateAdmin?: string;
   nodeVersion?: string;
-  nodePath?: string;
+  nodeExecutable?: string;
 }
 
 /**
@@ -145,17 +147,17 @@ const makeFixture = (generation = "generation-a", options: FixtureOptions = {}):
   const launcherName = options.launcherName ?? "agentcpd-launch.sh";
   const entrypoint = options.entrypoint ?? "daemon/agentcpd.js";
   const stateAdmin = options.stateAdmin ?? "db/state-admin.js";
-  const nodePath = options.nodePath ?? `/opt/${generation}/bin/node`;
+  const nodeExecutable = options.nodeExecutable ?? "bin/node";
 
   const home = tempDir("acp-rollback-pair-");
   // Canonical, because the installer resolves its app root with `cd -P` before comparing and the
   // rendered plist and launcher carry the resolved spelling. A fixture that wrote the
   // unresolved one would be testing a deployment shape that never exists.
   const appRoot = join(home, "app-root");
-  const installRoot = join(appRoot, "dist");
-  mkdirSync(installRoot, { recursive: true, mode: 0o700 });
+  mkdirSync(join(appRoot, "dist"), { recursive: true, mode: 0o700 });
 
   const canonicalAppRoot = realpathSync(appRoot);
+  const installRoot = join(canonicalAppRoot, "dist");
   const state = join(home, "state");
   mkdirSync(state, { recursive: true, mode: 0o700 });
   chmodSync(state, 0o700);
@@ -175,6 +177,14 @@ const makeFixture = (generation = "generation-a", options: FixtureOptions = {}):
   mkdirSync(join(runtimeRoot, stateAdmin, ".."), { recursive: true, mode: 0o700 });
   writeFileSync(join(runtimeRoot, entrypoint), `// ${generation} daemon\n`, { mode: 0o600 });
   writeFileSync(join(runtimeRoot, stateAdmin), `// ${generation} state admin\n`, { mode: 0o600 });
+  // A tiny synthetic closure carrying its own interpreter, under the same schema, inventory and
+  // mode rules production uses. The heavy row in the process suite seals the real one; these rows
+  // are the adversarial ones and must not pay 250MB apiece to vary a field.
+  mkdirSync(join(runtimeRoot, nodeExecutable, ".."), { recursive: true, mode: 0o700 });
+  writeFileSync(join(runtimeRoot, nodeExecutable), `#!/bin/bash\n# ${generation} interpreter\nexit 0\n`, {
+    mode: 0o755,
+  });
+  chmodSync(join(runtimeRoot, nodeExecutable), 0o755);
 
   const plistPath = join(source, `${label}.plist`);
   writeFileSync(
@@ -201,7 +211,7 @@ const makeFixture = (generation = "generation-a", options: FixtureOptions = {}):
     [
       "#!/bin/bash",
       `# ${generation}`,
-      `ACP_NODE_PATH=${nodePath}`,
+      `ACP_NODE_PATH=${join(installRoot, nodeExecutable)}`,
       `ACP_APP_ROOT=${canonicalAppRoot}`,
       `exec "$ACP_NODE_PATH" "$ACP_APP_ROOT/dist/${entrypoint}"`,
       "",
@@ -221,7 +231,7 @@ const makeFixture = (generation = "generation-a", options: FixtureOptions = {}):
       runtimeRoot,
       entrypoint,
       stateAdmin,
-      nodePath,
+      nodeExecutable,
       nodeVersion: options.nodeVersion ?? "v22.18.0",
       install: {
         runtimeRoot: installRoot,
@@ -527,17 +537,23 @@ describe("the exact rollback pair", () => {
 
   it("refuses a sealed launcher not bound to the runtime the pair carries", async () => {
     const { fixture, pair } = await sealFixture();
-    const manifest = readPairManifest(pair.root);
-    // Pair A's members, but the launcher is now said to run some other Node. This is the shape of
-    // "restore the database and leave generation B's runtime in place", declared rather than
-    // stumbled into.
-    manifest.identity.runtime.nodePath = "/opt/generation-b/bin/node";
-    writePairManifest(pair.root, manifest);
+    const launcher = join(pair.root, pair.manifest.identity.service.launcher);
+    // Pair A's members, but the launcher now starts some other interpreter. This is the shape of
+    // "restore the database and leave generation B's runtime running", written into the artifact.
+    writeFileSync(
+      launcher,
+      readFileSync(launcher, "utf8").replace(
+        /^ACP_NODE_PATH=.*$/m,
+        "ACP_NODE_PATH=/opt/generation-b/bin/node",
+      ),
+      { encoding: "utf8", mode: 0o600 },
+    );
+    restateInventory(pair.root);
     const forgedDigest = reindex(pair.root);
 
     expect(() =>
       validateRollbackPair(pair.root, expectationFor(fixture, pair, { indexDigest: forgedDigest })),
-    ).toThrow(/not bound to the Node executable this pair names/);
+    ).toThrow(/not bound to the Node executable this pair installs/);
   });
 
   it("reads the plist's Label field, not the text around it", async () => {
@@ -569,13 +585,12 @@ describe("the exact rollback pair", () => {
 
   it("reads the launcher's binding, not the text around it", async () => {
     const fixture = makeFixture();
-    // The right Node path, in a comment; the binding points somewhere else entirely. This is the
-    // shape of "restore the database and leave generation B's runtime running".
+    // The right interpreter, in a comment; the binding points somewhere else entirely.
     writeFileSync(
       fixture.sources.launchd.launcherPath,
       [
         "#!/bin/bash",
-        `# the approved runtime is ${fixture.sources.nodePath}`,
+        "# the approved runtime is the one this pair installs",
         "ACP_NODE_PATH=/opt/generation-b/bin/node",
         `ACP_APP_ROOT=${fixture.appRoot}`,
         'exec "$ACP_NODE_PATH" "$ACP_APP_ROOT/dist/daemon/agentcpd.js"',
@@ -585,7 +600,7 @@ describe("the exact rollback pair", () => {
     );
 
     await expect(sealRollbackPair(fixture.pairsRoot, fixture.sources)).rejects.toThrow(
-      /not bound to the Node executable this pair names/,
+      /not bound to the Node executable this pair installs/,
     );
   });
 
@@ -641,9 +656,16 @@ describe("the exact rollback pair", () => {
       entrypoint: "bin/successor.js",
       stateAdmin: "bin/successor-state.js",
       nodeVersion: "v24.4.1",
+      nodeExecutable: "bin/successor-node",
     });
 
-    expect(existsSync(forward.fixture.sources.nodePath)).toBe(false);
+    // Each pair carries its own interpreter, with its execute bit intact — nothing about either
+    // depends on an interpreter that happens to be on this machine.
+    for (const sealed of [back.pair, forward.pair]) {
+      const node = join(sealed.root, "runtime", sealed.manifest.identity.runtime.nodeExecutable);
+      expect(existsSync(node)).toBe(true);
+      expect(statSync(node).mode & 0o111).not.toBe(0);
+    }
     expect(treeFingerprint(back.pair.root), "sealing a later pair mutated the earlier one").toBe(
       backFingerprint,
     );
@@ -690,6 +712,64 @@ describe("the exact rollback pair", () => {
 
     const survivors = existsSync(fixture.pairsRoot) ? readdirSync(fixture.pairsRoot) : [];
     expect(survivors, "a failed seal left something under the pairs root").toEqual([]);
+  });
+
+  it("refuses to publish over a foreign directory that took the pair id", async () => {
+    const fixture = makeFixture();
+    const pairId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    mkdirSync(join(fixture.pairsRoot, pairId), { recursive: true, mode: 0o700 });
+    writeFileSync(join(fixture.pairsRoot, pairId, "not-ours"), "someone else was here\n", {
+      mode: 0o600,
+    });
+
+    // `existsSync` then `renameSync` is a check and a use with a gap between them. The exclusive
+    // rename makes the name being free part of the commit, so this is a refusal rather than an
+    // overwrite of a directory nobody in this call created.
+    await expect(sealRollbackPair(fixture.pairsRoot, fixture.sources, pairId)).rejects.toThrow(
+      /publishing a name exclusively/,
+    );
+    expect(
+      readFileSync(join(fixture.pairsRoot, pairId, "not-ours"), "utf8"),
+      "the foreign directory under the pair id was overwritten",
+    ).toContain("someone else was here");
+  });
+
+  it("cleans up only the stage inode it created, never one that replaced it", async () => {
+    const fixture = makeFixture();
+    const fs = RollbackFilesystem.load();
+    try {
+      mkdirSync(fixture.pairsRoot, { recursive: true, mode: 0o700 });
+      const parent = fs.openParent(fixture.pairsRoot);
+      mkdirSync(join(fixture.pairsRoot, "stage"), { mode: 0o700 });
+      const mine = fs.stat(parent, "stage")!;
+
+      // The stage name now holds somebody else's tree.
+      renameSync(join(fixture.pairsRoot, "stage"), join(fixture.pairsRoot, "mine-moved"));
+      mkdirSync(join(fixture.pairsRoot, "stage"), { mode: 0o700 });
+      writeFileSync(join(fixture.pairsRoot, "stage", "theirs"), "not mine\n", { mode: 0o600 });
+
+      expect(() => fs.removeOwned(parent, "stage", mine.dev, mine.ino)).toThrow(
+        /removing an owned entry/,
+      );
+      expect(existsSync(join(fixture.pairsRoot, "stage", "theirs")), "a foreign stage was deleted").toBe(
+        true,
+      );
+      fs.closeParent(parent);
+    } finally {
+      fs.dispose();
+    }
+  });
+
+  it("refuses a member whose mode drifted from the one its inventory records", async () => {
+    const { fixture, pair } = await sealFixture();
+    const node = join(pair.root, "runtime", pair.manifest.identity.runtime.nodeExecutable);
+    // Not one byte changes, so every digest and the retained index digest still agree. An
+    // interpreter at 0600 installs as an inert file and the restored generation cannot start.
+    chmodSync(node, 0o600);
+
+    expect(() => validateRollbackPair(pair.root, expectationFor(fixture, pair))).toThrow(
+      /not at the mode its inventory records/,
+    );
   });
 
   it("changes nothing at all when it refuses, including for a pair that is not there", async () => {
