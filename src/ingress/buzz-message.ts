@@ -35,8 +35,32 @@ export interface BuzzMessageIngressInput {
   conversation: string;
   /** The relay's own event id; the durable replay key for this message. */
   eventId: string;
-  /** Who the relay says the event was addressed to. Only the CEO becomes a turn. */
+  /**
+   * Which recipient class the relay addressed the event to, and the only thing that decides
+   * whether this envelope is for the CEO room or for a role.
+   *
+   * The CEO room is the one recipient reachable without a `p` tag, so `"CEO"` here means the CEO
+   * and `mention` is not consulted. Anything else means the event was addressed to a role, and
+   * then the `p` tag is the address — a role-addressed envelope that carries no usable tag names
+   * nobody and is refused rather than falling back to the CEO.
+   */
   addressedTo: string;
+  /**
+   * The relay's own resolved `p` tag — the Buzz channel identity this event named (`#760` B4).
+   *
+   * The wire form of a Buzz mention is a `p` tag holding a pubkey, and the relay reports which
+   * ones it actually resolved (`mention_pubkeys`). That resolved value is what arrives here: a
+   * channel identity, never a role name. Turning it into a role is this daemon's job and happens
+   * at delivery time, because the session holding a role is replaced as ordinary operation and
+   * the sender must not have to learn a new address when it is (B0/B0b).
+   *
+   * Typed `unknown`, and that is the point rather than laziness. This value is inside the
+   * signature, so it has to reach `buzzMessagePayload` exactly as the relay sent it — a parser
+   * that refused a number or an object here would be deciding something about the *address*
+   * before anything had authenticated the *sender*, which is the ordering B4's review rejected.
+   * A tag of the wrong shape is therefore admitted as data and refused as an address.
+   */
+  mention?: unknown;
   text: string;
   signature?: string | null;
 }
@@ -54,17 +78,25 @@ export const buzzMessageNonce = (eventId: string): string =>
  * point of the whole path.
  */
 export const buzzMessagePayload = (
-  input: Pick<BuzzMessageIngressInput, "conversation" | "addressedTo" | "text">,
+  input: Pick<BuzzMessageIngressInput, "conversation" | "addressedTo" | "mention" | "text">,
 ): Record<string, unknown> => ({
   type: "BUZZ_MESSAGE",
   conversation: input.conversation,
   addressedTo: input.addressedTo,
+  // Inside the signature, always present rather than only when set, and carrying whatever the
+  // relay sent rather than a normalized copy. This line is the whole of what stops a captured
+  // CEO envelope from being replayed with a `p` tag bolted on to redirect it at another role:
+  // remove it and that tampered envelope verifies.
+  mention: input.mention ?? null,
   text: input.text,
 });
 
 /** The exact signed request for one Buzz message; the relay computes its HMAC over this. */
 export const buzzMessageSigningRequest = (
-  input: Pick<BuzzMessageIngressInput, "actor" | "conversation" | "eventId" | "addressedTo" | "text">,
+  input: Pick<
+    BuzzMessageIngressInput,
+    "actor" | "conversation" | "eventId" | "addressedTo" | "mention" | "text"
+  >,
 ): IngressRequest => ({
   channel: "buzz",
   actor: input.actor,
@@ -73,12 +105,75 @@ export const buzzMessageSigningRequest = (
   payload: buzzMessagePayload(input),
 });
 
+/**
+ * Who one admitted envelope is for, once its address has been resolved.
+ *
+ * A role key rather than a session id, and that is the whole of B0: the session holding a role is
+ * replaced routinely, and an address that named one would go stale the moment it did. The key is
+ * resolved here and re-checked against the registry again at delivery, so a holder that moves
+ * between the two moments loses the message rather than a former holder receiving it.
+ */
+export type BuzzMessageTarget =
+  | { readonly kind: "CEO" }
+  | { readonly kind: "ROLE"; readonly roleKey: string };
+
+/** How a role-addressed envelope failed to name exactly one reachable role. */
+export type UnboundMentionShape =
+  /** No `p` tag at all: the field was absent or null on a role-addressed envelope. */
+  | "missing"
+  /** A `p` tag of a shape that cannot be a channel identity — a number, an object, an array. */
+  | "not-a-string"
+  /** A `p` tag that is a string and empty once trimmed. */
+  | "blank"
+  /** A well-formed tag bound to no live session, or to one holding no role. */
+  | "unknown"
+  /** A well-formed tag bound to a session that currently holds more than one role. */
+  | "ambiguous";
+
+/** One `p` tag this path could not turn into an address, as the journal records it. */
+export interface UnboundMentionRecord {
+  actor: string;
+  conversation: string;
+  eventId: string;
+  /** The `p` tag as presented, trimmed; empty when there was none or it was not a string. */
+  mention: string;
+  /** Every role the tag did resolve to — none, or more than one. */
+  candidates: readonly string[];
+  /**
+   * Which of the five ways it failed.
+   *
+   * All five are one refusal to the sender, and they are five different things for whoever reads
+   * the journal: "the relay stopped attaching tags" and "the CTO of two projects has no single
+   * address" need different work, and a single count of unbound events tells them apart from
+   * neither.
+   */
+  shape: UnboundMentionShape;
+}
+
+/**
+ * How a `p` tag becomes a role, and what happens when it does not.
+ *
+ * Supplied rather than reached for, because both halves belong to the daemon's registries and
+ * this module must not acquire database authority to answer a routing question. The contract is
+ * deliberately "every role, unfiltered": collapsing a multi-role answer to its first element is
+ * the defect `MENTION_TARGET_UNBOUND` exists to refuse, and a resolver that returned one role
+ * could not tell "the CTO of one project" from "the CTO of two".
+ */
+export interface BuzzMentionRouter {
+  /** Every canonical role the mentioned identity holds right now. Order is not significant. */
+  rolesFor(mention: string): readonly string[];
+  /** Records one unresolvable tag. Called once per refused envelope, before any turn exists. */
+  journalUnbound(record: UnboundMentionRecord): void;
+}
+
 /** An admitted Buzz message, in the shape the turn machinery needs it. */
 export interface AdmittedBuzzMessage {
   text: string;
   actor: string;
   conversation: string;
   nonce: string;
+  /** Fixed at admission and carried forward, so nothing downstream re-resolves the address. */
+  target: BuzzMessageTarget;
 }
 
 /**
@@ -107,7 +202,11 @@ export class BuzzMessageIngress {
    * identities are supplied separately, from `owner-identities` (#245) rather than from the
    * relay credential, and an empty set is refused here rather than defaulting to the guard's.
    */
-  constructor(private readonly guard: IngressGuard, ownerActors: readonly string[]) {
+  constructor(
+    private readonly guard: IngressGuard,
+    ownerActors: readonly string[],
+    private readonly router: BuzzMentionRouter,
+  ) {
     const owners = ownerActors.map((actor) => actor.trim()).filter((actor) => actor.length > 0);
     if (owners.length === 0) {
       throw new Error("buzz message ingress requires at least one declared buzz owner identity");
@@ -120,7 +219,8 @@ export class BuzzMessageIngress {
   }
 
   /**
-   * Allowlist, HMAC and nonce dedup, in that order, before anything is asked of the CEO.
+   * Owner allowlist, HMAC, nonce dedup, then address — in that order, before anything is asked
+   * of anyone. The address is last on purpose; see the comment at the `guard.admit` call.
    *
    * Signature is required rather than optional: an unsigned Buzz channel would let anything
    * that can reach this socket speak to the owner's CEO as the owner. `bindActor` makes the
@@ -144,37 +244,100 @@ export class BuzzMessageIngress {
         "buzz message ingress requires an actor, conversation, event id and text",
       );
     }
-    if (input.addressedTo !== BUZZ_MESSAGE_RECIPIENT_CEO) {
-      // Refused before admission, so a journal event does not even consume a nonce: it was
-      // never a turn for this daemon to run.
-      return deny(
-        ReasonCode.INVALID_ARGUMENT,
-        "buzz message ingress delivers only events addressed to the CEO",
-        { addressedTo: input.addressedTo },
-      );
-    }
     if (!this.#ownerActors.has(input.actor.trim())) {
-      // Also before admission, and for a second reason beyond the one above: a non-owner on the
+      // Before admission, and for a second reason beyond who may speak: a non-owner on the
       // relay allowlist can produce a *valid* signature, so letting the guard admit it first
       // would consume the `(buzz, nonce)` slot for that event id. The owner's own message for
       // the same event would then be refused as a replay of a turn that never ran.
+      //
+      // It is also ahead of address resolution on purpose. Resolving a `p` tag writes a journal
+      // row when it fails, and a stranger must not be able to make this daemon write one — the
+      // sender's authority and the recipient's address are two separate questions, and answering
+      // the second first would let the second answer the first.
       return deny(
         ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED,
         "buzz message ingress delivers only messages from a declared buzz owner identity",
         { channel: "buzz", actor: input.actor },
       );
     }
-
+    // Authentication and replay first, addressing second — the order B4's review demanded, and
+    // the reason is that every step below writes something an unauthenticated caller must not be
+    // able to cause. `guard.admit` is the only authority for the HMAC, the relay allowlist and
+    // the `(channel, nonce)` replay slot; nothing here re-implements any of the three. Running
+    // the target lookup ahead of it meant a forged signature could still journal a target, and a
+    // duplicate event id with a rewritten `p` tag could journal a second one for a turn that had
+    // already been answered.
     const request = buzzMessageSigningRequest(input);
     const admitted = this.guard.admit({ ...request, signature: input.signature ?? null });
     if (!admitted.allowed) return admitted as Decision<AdmittedBuzzMessage>;
+
+    // Past this line the sender is authenticated and this event id is being seen for the first
+    // time, so the address may be looked up and one journal row may be written. The nonce is
+    // spent either way: the event was admitted, and a later copy of it is a replay whatever its
+    // tag says — which is what stops a repeated unbound event from journalling repeatedly.
+    const target = this.#targetFor(input);
+    if (!target.allowed) return target as Decision<AdmittedBuzzMessage>;
 
     return allow(ReasonCode.UNTRUSTED_CONTENT_IS_DATA, {
       text: input.text,
       actor: input.actor,
       conversation: input.conversation,
       nonce: request.nonce,
+      target: target.value,
     });
+  }
+
+  /**
+   * Who this envelope is for — resolved before admission, so an address nobody holds costs
+   * nothing and consumes nothing.
+   *
+   * Everything the relay says about the recipient is inside the signature, so the question here
+   * is never "is this envelope authentic" but "does this address name exactly one role this
+   * daemon can reach". Anything else — no role, or several — is refused rather than narrowed: a
+   * `find` over the candidates would answer with whichever role the registry happened to return
+   * first, which is delivery by accident rather than by address.
+   */
+  #targetFor(input: BuzzMessageIngressInput): Decision<BuzzMessageTarget> {
+    if (input.addressedTo !== BUZZ_MESSAGE_RECIPIENT_CEO) {
+      // Role-addressed, so the `p` tag is the address and there is no second place to look. The
+      // five ways it can fail to be one are one outcome to the sender and one journal row each:
+      // an absent tag is not "therefore the CEO", because reading it that way would hand a
+      // message meant for some role to the owner's own conversation.
+      const presented = input.mention;
+      const mention = typeof presented === "string" ? presented.trim() : "";
+      const candidates = mention.length === 0 ? [] : [...new Set(this.router.rolesFor(mention))];
+      const roleKey = candidates.length === 1 ? candidates[0] : undefined;
+      if (roleKey === undefined) {
+        const shape: UnboundMentionShape =
+          presented === undefined || presented === null
+            ? "missing"
+            : typeof presented !== "string"
+              ? "not-a-string"
+              : mention.length === 0
+                ? "blank"
+                : candidates.length === 0
+                  ? "unknown"
+                  : "ambiguous";
+        // The one journal row B4 asks for, written here because this is the only place that
+        // knows both the tag and what it resolved to, and after this point there is nothing left
+        // to record: no turn is claimed and nothing is sent to anyone.
+        this.router.journalUnbound({
+          actor: input.actor,
+          conversation: input.conversation,
+          eventId: input.eventId,
+          mention,
+          candidates,
+          shape,
+        });
+        return deny(
+          ReasonCode.MENTION_TARGET_UNBOUND,
+          "the mentioned buzz channel identity does not name exactly one role this daemon can address",
+          { channel: "buzz", target: mention, candidates: candidates.length, shape },
+        );
+      }
+      return allow(ReasonCode.OK, { kind: "ROLE", roleKey });
+    }
+    return allow(ReasonCode.OK, { kind: "CEO" });
   }
 
   /**
@@ -204,13 +367,19 @@ export class BuzzMessageIngress {
   }
 }
 
-/** What the daemon's CEO route reports back about one turn it tried to deliver. */
+/**
+ * What a delivery route reports back about one turn it tried to hand over.
+ *
+ * Named for the CEO because that was the only route when `#750` wrote it; the role route answers
+ * in the same three values, and the field name below is load-bearing in two falsifiability rows
+ * that mutate the line reading it, so it stays as it is rather than being widened by rename.
+ */
 export interface CeoTurnDelivery {
   /** The text to hand the relay for the originating Buzz thread. */
   answer: string;
-  /** The port's own contact boundary: whether the request crossed to the CEO peer (#652). */
+  /** The port's own contact boundary: whether the request crossed to the addressed peer (#652). */
   reachedCeo: boolean;
-  /** `OK` for an answer, or the CEO route's refusal code for a sentence. */
+  /** `OK` for an answer, or the route's refusal code for a sentence. */
   reasonCode: ReasonCode;
 }
 
@@ -218,33 +387,58 @@ export interface CeoTurnDelivery {
 export interface BuzzMessageTurnPort {
   /** Delivers one turn to whoever currently holds the CEO binding. */
   deliverToCeo(text: string): Promise<CeoTurnDelivery>;
+  /**
+   * Delivers one turn to whoever currently holds `roleKey`, through B2's live peer.
+   *
+   * The same contract as `deliverToCeo`, including its contact boundary: the peer is asked, or
+   * it is positively established that nothing was asked. Who the holder is gets re-read from the
+   * registry inside the port, not taken from the address this ingress resolved a moment ago.
+   */
+  deliverToRole(roleKey: string, text: string): Promise<CeoTurnDelivery>;
   /** The CEO binding generation this turn is being claimed under, or null if there is none. */
   bindingGeneration(): number | null;
+  /**
+   * The same fence for a role-addressed turn: the generation `roleKey` is held at right now.
+   *
+   * Separate from `bindingGeneration` rather than a parameter on it, because the CEO's generation
+   * is the wrong fence for a message addressed to the CTO — a receipt from a superseded CTO would
+   * pass a claim stamped with whichever generation the CEO happened to be at.
+   */
+  roleBindingGeneration(roleKey: string): number | null;
 }
 
 /** What the relay gets back when a message became a turn. */
 export interface BuzzMessageAnswer {
   answer: string;
-  /** True only when the CEO peer itself produced the text; false for a route refusal sentence. */
+  /**
+   * True only when the CEO peer itself produced the text.
+   *
+   * Deliberately narrow: it stays false for a role-addressed message even when that role's peer
+   * answered, because a caller reading it is asking about the CEO. `reasonCode === OK` is the
+   * general "the addressed peer answered" fact and holds for both.
+   */
   answeredByCeo: boolean;
   turnRequestId: string;
   conversation: string;
 }
 
 /**
- * An owner's Buzz message, delivered as one turn to the holder of the active CEO binding.
+ * An owner's Buzz message, delivered as one turn to whoever currently holds the addressed role.
  *
  * This is the receiving half #627 asks for, and the whole of its correctness is what it does
- * *not* do: nothing here starts a session, resumes one, or synthesises a reply.
- * `port.deliverToCeo` reaches a peer that is already connected and already authenticated as the
- * CEO on every request — the mechanism `ARCHITECTURE.md` accepts (peer UDS + transcript
- * observer) rather than the three it rejects.
+ * *not* do: nothing here starts a session, resumes one, or synthesises a reply. Both ports reach
+ * a peer that is already connected and re-authenticated on every request — the mechanism
+ * `ARCHITECTURE.md` accepts (peer UDS + transcript observer) rather than the three it rejects.
+ *
+ * The address was already resolved, once, inside `admit`. Nothing below re-derives it: an
+ * envelope whose `p` tag named no role never reaches this point, so there is no state in which a
+ * turn exists for a message that has nowhere to go.
  *
  * The turn is claimed before it runs, for the reason `IngressGuard.claimTurn` gives: the CEO's
  * reply command resumes the owner's own conversation, so running one message twice appends the
  * same exchange twice to a transcript the CEO then carries forward as context.
  */
-export const deliverBuzzMessageToCeo = async (
+export const deliverBuzzMessage = async (
   ingress: BuzzMessageIngress,
   port: BuzzMessageTurnPort,
   input: BuzzMessageIngressInput,
@@ -252,14 +446,18 @@ export const deliverBuzzMessageToCeo = async (
   const admitted = ingress.admit(input);
   if (!admitted.allowed) return admitted as Decision<BuzzMessageAnswer>;
 
+  const target = admitted.value.target;
   const identity = ingress.turnIdentityFor(
     { conversation: admitted.value.conversation, text: admitted.value.text },
-    port.bindingGeneration(),
+    target.kind === "CEO" ? port.bindingGeneration() : port.roleBindingGeneration(target.roleKey),
   );
   const claimed = ingress.claimTurn(admitted.value.nonce, identity);
   if (!claimed.allowed) return claimed as Decision<BuzzMessageAnswer>;
 
-  const delivered = await port.deliverToCeo(admitted.value.text);
+  const delivered =
+    target.kind === "CEO"
+      ? await port.deliverToCeo(admitted.value.text)
+      : await port.deliverToRole(target.roleKey, admitted.value.text);
 
   // Which outcomes close the claim, and which leave it outstanding.
   //
@@ -281,7 +479,7 @@ export const deliverBuzzMessageToCeo = async (
     delivered.reasonCode,
     {
       answer: delivered.answer,
-      answeredByCeo: delivered.reachedCeo && answered,
+      answeredByCeo: target.kind === "CEO" && delivered.reachedCeo && answered,
       turnRequestId: identity.turnRequestId,
       conversation: admitted.value.conversation,
     },

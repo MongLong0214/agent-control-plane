@@ -1,4 +1,4 @@
-import { createConnection } from "node:net";
+import { createConnection, type Socket } from "node:net";
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
@@ -8,11 +8,13 @@ import {
   configuredBuzzMessageOwnerActors,
   startBuzzActorIngressListener,
   startBuzzMessageIngressListener,
+  startDaemonBuzzMessageIngress,
+  startLocalMcpListeners,
 } from "../../src/daemon/agentcpd.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { allow } from "../../src/core/errors.ts";
 import { digestOf } from "../../src/core/digest.ts";
-import { Role, roleKeyFor } from "../../src/domain/types.ts";
+import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import {
   IngressGuard,
   buzzActorBindingSigningRequest,
@@ -22,11 +24,13 @@ import {
   BuzzMessageIngress,
   buzzMessageNonce,
   buzzMessageSigningRequest,
+  type BuzzMentionRouter,
 } from "../../src/ingress/buzz-message.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
+import { RoleConversationPort } from "../../src/mcp/role-conversation.ts";
 import type { McpPeerAuthenticator } from "../../src/mcp/shared.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
-import { bindCeo, makeHarness } from "../helpers/harness.ts";
+import { bindCeo, fixtureManifest, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -114,15 +118,32 @@ const envelope = (input: {
   actor?: string;
   conversation?: string;
   addressedTo?: string;
+  /** `unknown`, so a row can present a `p` tag of the wrong shape the way a relay could. */
+  mention?: unknown;
 }) => {
   const message = {
     actor: input.actor ?? OWNER,
     conversation: input.conversation ?? "buzz-ceo-room",
     eventId: input.eventId,
     addressedTo: input.addressedTo ?? "CEO",
+    // Inside the signature like everything else about the recipient. A `p` tag the relay did not
+    // sign for would be an address anyone on the socket could substitute.
+    mention: input.mention ?? null,
     text: input.text,
   };
   return { ...message, signature: ingressSignature(SECRET, buzzMessageSigningRequest(message)) };
+};
+
+/**
+ * The same envelope with the `mention` key absent from the wire object rather than null.
+ *
+ * The two must be one thing to the signature — the daemon reads an absent field as null before it
+ * computes the payload — and one thing to the address: a role-addressed envelope names nobody
+ * either way. A row that only ever sent an explicit null would not show that.
+ */
+const omitMention = <T extends { mention?: unknown }>(sent: T): Omit<T, "mention"> => {
+  const { mention: _absent, ...rest } = sent;
+  return rest;
 };
 
 /** Every session id the control plane holds, so a fork would show up as a new row. */
@@ -134,13 +155,189 @@ const sessionIds = (harness: ReturnType<typeof makeHarness>): string[] =>
 const startMessageListener = async (
   harness: ReturnType<typeof makeHarness>,
   ceoConversation: CeoConversationPort,
+  roleConversation?: RoleConversationPort,
 ) =>
   startBuzzMessageIngressListener(
     harness.cp,
     tempDir("acp-buzz-message-"),
     { allowedActors: RELAY_ACTORS, secret: SECRET },
-    { ceoConversation, ownerActors: [OWNER] },
+    { ceoConversation, ownerActors: [OWNER], roleConversation },
   );
+
+/**
+ * The `p` tag one of the rows below addresses. It is a Buzz channel identity — the same kind of
+ * string `sessions.buzz_actor_id` holds — and deliberately not a role name: the address the
+ * sender writes is a pubkey the relay can mention, and turning it into a role is the daemon's
+ * job at delivery time (`#760` B0).
+ */
+const CTO_MENTION = "npub-cto-of-record";
+
+/** Deployment authentication for the real MCP sockets the production-composition row uses. */
+const MCP_TOKEN = "buzz-message-ingress-mcp-token";
+
+/** The production writer's authenticator; the relay policy vouches for every actor in a test. */
+const anyBuzzActorIsAuthenticated = { isAllowedActor: () => true };
+
+/** `p`-tag resolution has to see the roles a *live* session holds, so the session is READY. */
+const readyBoundSession = (
+  harness: ReturnType<typeof makeHarness>,
+  model: string,
+  mention: string,
+  projectIds: readonly string[],
+): { sessionId: string; incarnation: string; sessionSecret: string } => {
+  const session = harness.cp.sessions.create({ provider: "scripted", model });
+  expect(
+    harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "test").reasonCode,
+  ).toBe(ReasonCode.OK);
+  for (const projectId of projectIds) {
+    const bound = harness.cp.bindings.bind({
+      role: Role.PRIMARY_CTO,
+      sessionId: session.sessionId,
+      projectId,
+    });
+    if (!bound.allowed) throw new Error(`CTO binding failed: ${bound.message}`);
+  }
+  // The production writer, not a raw UPDATE: `sessions.buzz_actor_id` is the column inbound
+  // resolution reads, and a test that wrote it directly would not be exercising the mapping an
+  // authenticated `bindBuzzActor` establishes.
+  const actor = harness.cp.sessions.bindBuzzActor(
+    { sessionId: session.sessionId, sessionSecret: session.sessionSecret!, buzzActorId: mention },
+    anyBuzzActorIsAuthenticated,
+  );
+  if (!actor.allowed) throw new Error(`buzz actor binding failed: ${actor.message}`);
+  return {
+    sessionId: session.sessionId,
+    incarnation: harness.cp.sessions.require(session.sessionId).incarnation,
+    sessionSecret: session.sessionSecret!,
+  };
+};
+
+/**
+ * B2's port, built the way `startLocalMcpListeners` builds it.
+ *
+ * Its own enforcement (`#isCurrentHolder`) is covered by `the-cto-socket-has-a-live-peer.test.ts`
+ * and is not re-measured here; what these rows measure is whether the ingress hands it the right
+ * role key, and whether nothing is handed to it at all when the `p` tag resolves to no role.
+ */
+const roleConversationFor = (harness: ReturnType<typeof makeHarness>): RoleConversationPort =>
+  new RoleConversationPort(Role.PRIMARY_CTO, {
+    active: (roleKey) => harness.cp.bindings.active(roleKey),
+    currentCandidates: () =>
+      harness.cp.projects
+        .list()
+        .map((project) => harness.cp.bindings.activePrimaryCto(project.projectId))
+        .filter((binding): binding is NonNullable<typeof binding> => binding !== null),
+  });
+
+/** Stands in for the authenticated MCP connection a role's session holds open. */
+const stillHeldBy = (session: { sessionId: string; incarnation: string }): McpPeerAuthenticator =>
+  () =>
+    allow(ReasonCode.OK, {
+      actor: "role-peer",
+      sessionId: session.sessionId,
+      sessionIncarnation: session.incarnation,
+    });
+
+/** For the two rows that build an ingress directly and never present a `p` tag. */
+const resolvesNothing: BuzzMentionRouter = {
+  rolesFor: () => [],
+  journalUnbound: () => {
+    throw new Error("no row that constructs an ingress directly presents a mention");
+  },
+};
+
+/** Every journal row this path writes for a `p` tag it could not turn into an address. */
+const unboundJournal = (harness: ReturnType<typeof makeHarness>) =>
+  harness.cp.audit.all().filter((row) => row.reasonCode === ReasonCode.MENTION_TARGET_UNBOUND);
+
+/** The `(buzz, nonce)` row for one event id, and the turn claim on it if any. */
+const admittedRow = (harness: ReturnType<typeof makeHarness>, eventId: string) =>
+  harness.cp.db.get<{ nonce: string; turn_claim_json: string | null }>(
+    `SELECT nonce, turn_claim_json FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`,
+    [buzzMessageNonce(eventId)],
+  ) ?? null;
+
+/** Waits on a condition the daemon reaches asynchronously, rather than on a fixed delay. */
+const until = async (predicate: () => boolean, what: string, timeoutMs = 10_000): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`timed out waiting for ${what}`);
+};
+
+/**
+ * A real client on the real `cto.mcp.sock`: credential line, MCP initialize declaring `sampling`,
+ * then it answers the server's `sampling/createMessage` requests.
+ *
+ * The production row needs a B2 peer that the daemon itself admitted and attached, not one handed
+ * to a port by the test. Shaped after `the-cto-socket-has-a-live-peer.test.ts`, which owns the
+ * socket's own rows; nothing here re-measures them.
+ */
+const connectRolePeer = async (
+  socketPath: string,
+  credential: { token: string; sessionId: string; sessionSecret: string },
+): Promise<{ socket: Socket; received: string[]; close: () => Promise<void> }> => {
+  const socket = createConnection(socketPath);
+  const received: string[] = [];
+  await new Promise<void>((resolve, reject) => {
+    socket.once("connect", resolve);
+    socket.once("error", reject);
+  });
+  let buffer = "";
+  socket.on("error", () => {
+    /* a peer whose socket is destroyed at teardown is not a failure this row asserts on */
+  });
+  socket.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString();
+    for (;;) {
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) break;
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+      if (line.trim().length === 0) continue;
+      let message: { id?: number; method?: string; params?: unknown };
+      try {
+        message = JSON.parse(line) as typeof message;
+      } catch {
+        continue;
+      }
+      if (message.method !== "sampling/createMessage" || message.id === undefined) continue;
+      const params = message.params as { messages?: { content?: { text?: string } }[] } | undefined;
+      received.push(params?.messages?.[0]?.content?.text ?? "");
+      socket.write(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: { role: "assistant", model: "test-peer", content: { type: "text", text: "받았다" } },
+        })}\n`,
+      );
+    }
+  });
+  socket.write(
+    `${JSON.stringify(credential)}\n${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-11-25",
+        capabilities: { sampling: {} },
+        clientInfo: { name: "buzz-role-peer", version: "1" },
+      },
+    })}\n${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}\n`,
+  );
+  return {
+    socket,
+    received,
+    close: () =>
+      new Promise<void>((resolve) => {
+        if (socket.destroyed) return resolve();
+        socket.once("close", () => resolve());
+        socket.destroy();
+      }),
+  };
+};
 
 describe("the daemon's Buzz message ingress", () => {
   it("delivers an owner's Buzz message to the holder of the active CEO binding without spawning a session child", async () => {
@@ -262,7 +459,8 @@ describe("the daemon's Buzz message ingress", () => {
       });
 
       // A CEO↔CTO journal message in the same room is not a second CEO turn (SSOT §114): only
-      // an envelope the relay addressed to the CEO becomes one.
+      // an envelope the relay addressed to the CEO becomes one. Addressed elsewhere and carrying
+      // no `p` tag, it names nobody — which is a refused address, never a fallback to the CEO.
       const journal = await exchangeSocketLines(
         listener.socketPath,
         [envelope({ eventId: "evt-journal", text: "CTO 보고", addressedTo: "CTO" })],
@@ -270,9 +468,12 @@ describe("the daemon's Buzz message ingress", () => {
       );
       expect(JSON.parse(journal.trim())).toMatchObject({
         ok: false,
-        reasonCode: ReasonCode.INVALID_ARGUMENT,
+        reasonCode: ReasonCode.MENTION_TARGET_UNBOUND,
       });
 
+      // The forged and unallowlisted envelopes above were refused by authentication, so neither
+      // reached the address lookup: only the third one is in the journal.
+      expect(unboundJournal(harness).map((row) => row.evidence["shape"])).toEqual(["missing"]);
       expect(peer.calls).toEqual([]);
     } finally {
       await listener.close();
@@ -357,7 +558,7 @@ describe("the daemon's Buzz message ingress", () => {
     const guard = new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, {
       buzz: { allowedActors: [OWNER] },
     });
-    const ingress = new BuzzMessageIngress(guard, [OWNER]);
+    const ingress = new BuzzMessageIngress(guard, [OWNER], resolvesNothing);
 
     const admitted = ingress.admit({
       actor: OWNER,
@@ -532,6 +733,456 @@ describe("the daemon's Buzz message ingress", () => {
     }
   });
 
+  it("delivers a `p`-tagged message to the role's live peer, and keeps that address across a session replacement", async () => {
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+    const first = readyBoundSession(harness, "cto-first", CTO_MENTION, [projectId]);
+
+    const roleConversation = roleConversationFor(harness);
+    const firstPeer = fakeCeoPeer("CTO 받았다");
+    roleConversation.attach(firstPeer.server, stillHeldBy(first));
+    const ceo = fakeCeoPeer("CEO가 답하면 안 된다");
+    const ceoConversation = new CeoConversationPort();
+    ceoConversation.attach(ceo.server, stillCeo());
+    const listener = await startMessageListener(harness, ceoConversation, roleConversation);
+    const before = sessionIds(harness);
+
+    try {
+      const delivered = await exchangeSocketLines(
+        listener.socketPath,
+        [envelope({ eventId: "evt-cto", text: "CTO, U6 상태", addressedTo: "CTO", mention: CTO_MENTION })],
+        hasReasonCode,
+      );
+      expect(JSON.parse(delivered.trim())).toMatchObject({ ok: true, reasonCode: ReasonCode.OK });
+      expect(firstPeer.peer.calls).toEqual(["CTO, U6 상태"]);
+      // The address decided the recipient. Without this the row above would also pass on an
+      // ingress that delivered every message to the CEO, which is precisely the base behaviour.
+      expect(ceo.peer.calls).toEqual([]);
+      // Nothing was started to receive it — the same no-fork property the CEO row asserts.
+      expect(sessionIds(harness)).toEqual(before);
+
+      // The claim is fenced by the *role's* generation, not the CEO's. A receipt from a
+      // superseded CTO must not pass a claim stamped with whatever the CEO happened to be at.
+      const claim = harness.cp.db.get<{ turn_claim_json: string | null }>(
+        `SELECT turn_claim_json FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`,
+        [buzzMessageNonce("evt-cto")],
+      );
+      expect(JSON.parse(claim!.turn_claim_json!)).toMatchObject({
+        bindingDigest: digestOf({
+          bindingGeneration: harness.cp.bindings.active(roleKey)!.bindingGeneration,
+        }),
+      });
+
+      // The `(channel, nonce)` dedup #750 already owns is the only one: the same event id does
+      // not become a second turn, and nothing was added beside it to make that true.
+      const replay = await exchangeSocketLines(
+        listener.socketPath,
+        [envelope({ eventId: "evt-cto", text: "CTO, U6 상태", addressedTo: "CTO", mention: CTO_MENTION })],
+        hasReasonCode,
+      );
+      expect(JSON.parse(replay.trim())).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.INGRESS_REPLAY_IGNORED,
+      });
+      expect(firstPeer.peer.calls).toEqual(["CTO, U6 상태"]);
+
+      // B0/B0b — the session holding the role is replaced, which is ordinary operation. The
+      // sender's address is unchanged: the same `p` tag string, and nobody had to learn a new one.
+      expect(harness.cp.bindings.revoke(roleKey, "test replacement").reasonCode).toBe(ReasonCode.OK);
+      expect(
+        harness.cp.sessions.transition(first.sessionId, SessionLifecycle.STOPPED, "test").reasonCode,
+      ).toBe(ReasonCode.OK);
+      const second = readyBoundSession(harness, "cto-second", CTO_MENTION, [projectId]);
+      expect(second.sessionId).not.toBe(first.sessionId);
+      const secondPeer = fakeCeoPeer("새 세션이 받았다");
+      roleConversation.attach(secondPeer.server, stillHeldBy(second));
+
+      const afterReplacement = await exchangeSocketLines(
+        listener.socketPath,
+        [envelope({ eventId: "evt-cto-2", text: "교체 후에도", addressedTo: "CTO", mention: CTO_MENTION })],
+        hasReasonCode,
+      );
+      expect(JSON.parse(afterReplacement.trim())).toMatchObject({ ok: true, reasonCode: ReasonCode.OK });
+      expect(secondPeer.peer.calls).toEqual(["교체 후에도"]);
+      expect(firstPeer.peer.calls).toEqual(["CTO, U6 상태"]);
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("makes no turn and no delivery for a `p` tag that is missing, null, not a string, blank, unknown, or ambiguous", async () => {
+    const harness = makeHarness();
+    bindCeo(harness);
+    const a = await registerFixtureProject(harness, "project-a");
+    const b = harness.cp.projects.register({
+      projectId: "project-b",
+      name: "fixture",
+      manifest: fixtureManifest("project-b"),
+      authorization: harness.cp.manifestAuthorizationForTests(fixtureManifest("project-b")),
+    });
+    if (!b.allowed) throw new Error(`second project failed: ${b.message}`);
+    // One session, two projects, both CTO. A legal state — and two roles is not an address.
+    const ambiguous = readyBoundSession(harness, "cto-of-two", "npub-cto-of-two", [
+      a.projectId,
+      "project-b",
+    ]);
+    expect(ambiguous.sessionId).toBeTypeOf("string");
+
+    const roleConversation = roleConversationFor(harness);
+    const ceo = fakeCeoPeer("CEO는 이 중 어느 것도 받지 않는다");
+    const ceoConversation = new CeoConversationPort();
+    ceoConversation.attach(ceo.server, stillCeo());
+    const listener = await startMessageListener(harness, ceoConversation, roleConversation);
+    const before = sessionIds(harness);
+
+    // Every way a role-addressed envelope can fail to name one reachable role. All five are one
+    // outcome to the sender and one journal row each — the socket-boundary shapes included, so a
+    // relay that stopped attaching tags, or attached one of the wrong type, is visible rather
+    // than being reported as a malformed message or silently handed to the CEO.
+    const rows: readonly { label: string; eventId: string; shape: string; wire: unknown }[] = [
+      {
+        label: "no mention key on the wire at all",
+        eventId: "evt-missing",
+        shape: "missing",
+        wire: omitMention(envelope({ eventId: "evt-missing", text: "누구에게도", addressedTo: "CTO" })),
+      },
+      {
+        label: "an explicit null mention",
+        eventId: "evt-null",
+        shape: "missing",
+        wire: envelope({ eventId: "evt-null", text: "누구에게도", addressedTo: "CTO", mention: null }),
+      },
+      {
+        label: "a mention that is a number, not a channel identity",
+        eventId: "evt-number",
+        shape: "not-a-string",
+        wire: envelope({ eventId: "evt-number", text: "누구에게도", addressedTo: "CTO", mention: 42 }),
+      },
+      {
+        label: "a mention that is a list, not a channel identity",
+        eventId: "evt-array",
+        shape: "not-a-string",
+        wire: envelope({
+          eventId: "evt-array",
+          text: "누구에게도",
+          addressedTo: "CTO",
+          mention: ["npub-cto-of-two"],
+        }),
+      },
+      {
+        label: "present but empty",
+        eventId: "evt-empty",
+        shape: "blank",
+        wire: envelope({ eventId: "evt-empty", text: "누구에게도", addressedTo: "CTO", mention: "   " }),
+      },
+      {
+        label: "bound to nobody",
+        eventId: "evt-unbound",
+        shape: "unknown",
+        wire: envelope({
+          eventId: "evt-unbound",
+          text: "누구에게도",
+          addressedTo: "CTO",
+          mention: "npub-nobody-holds-this",
+        }),
+      },
+      {
+        label: "bound to two roles at once",
+        eventId: "evt-ambiguous",
+        shape: "ambiguous",
+        wire: envelope({
+          eventId: "evt-ambiguous",
+          text: "누구에게도",
+          addressedTo: "CTO",
+          mention: "npub-cto-of-two",
+        }),
+      },
+    ];
+
+    try {
+      for (const [index, row] of rows.entries()) {
+        const refused = await exchangeSocketLines(listener.socketPath, [row.wire], hasReasonCode);
+        expect(JSON.parse(refused.trim()), row.label).toMatchObject({
+          ok: false,
+          reasonCode: ReasonCode.MENTION_TARGET_UNBOUND,
+        });
+
+        // No turn. The envelope authenticated, so its replay slot is spent — that is what stops a
+        // resent copy from journalling twice — but nothing claimed a turn against it, which is
+        // the fact `unresolvedTurns` reads and the one that decides whether anyone was asked.
+        const admitted = admittedRow(harness, row.eventId);
+        expect(admitted, row.label).not.toBeNull();
+        expect(admitted?.turn_claim_json, row.label).toBeNull();
+        // No delivery, anywhere. The CEO in particular is not the fallback recipient for a
+        // message this daemon could not address.
+        expect(ceo.peer.calls, row.label).toEqual([]);
+        expect(sessionIds(harness), row.label).toEqual(before);
+        // Exactly one journal row per refused envelope — not zero, which is the silence #760
+        // opens with, and not two.
+        expect(unboundJournal(harness).length, row.label).toBe(index + 1);
+      }
+
+      const journalled = unboundJournal(harness);
+      expect(journalled.map((row) => row.kind)).toEqual(rows.map(() => "BUZZ_MENTION_TARGET_UNBOUND"));
+      expect(journalled.map((row) => row.evidence["shape"])).toEqual(rows.map((row) => row.shape));
+      expect(journalled.at(-2)?.evidence).toMatchObject({
+        channel: "buzz",
+        target: "npub-nobody-holds-this",
+        candidates: 0,
+      });
+      expect(journalled.at(-1)?.evidence).toMatchObject({ target: "npub-cto-of-two", candidates: 2 });
+
+      // The permitted absent mention, unchanged: the CEO room is addressed by `addressedTo` and
+      // has no `p` tag on this path, so a CEO envelope with none is delivered and journals
+      // nothing. Without this the rows above would also pass on an ingress that refused every
+      // envelope carrying no tag.
+      const toCeo = await exchangeSocketLines(
+        listener.socketPath,
+        [omitMention(envelope({ eventId: "evt-ceo-no-mention", text: "CEO, 상태" }))],
+        hasReasonCode,
+      );
+      expect(JSON.parse(toCeo.trim())).toMatchObject({ ok: true, reasonCode: ReasonCode.OK });
+      expect(ceo.peer.calls).toEqual(["CEO, 상태"]);
+      expect(unboundJournal(harness).length).toBe(rows.length);
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("authenticates the sender and rejects the replay before it looks up any target", async () => {
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const session = readyBoundSession(harness, "cto-peer", CTO_MENTION, [projectId]);
+    const roleConversation = roleConversationFor(harness);
+    const rolePeer = fakeCeoPeer("받았다");
+    roleConversation.attach(rolePeer.server, stillHeldBy(session));
+    const listener = await startMessageListener(harness, new CeoConversationPort(), roleConversation);
+
+    try {
+      // A configured owner string is not authentication. Signature verification is the authority
+      // and it runs first, so an unknown `p` tag behind a forged signature never reaches the
+      // lookup — no journal row, and no `(buzz, nonce)` row for the owner's real event to
+      // collide with later.
+      const forged = await exchangeSocketLines(
+        listener.socketPath,
+        [
+          {
+            ...envelope({
+              eventId: "evt-auth-order",
+              text: "위조",
+              addressedTo: "CTO",
+              mention: "npub-nobody-holds-this",
+            }),
+            signature: "forged",
+          },
+        ],
+        hasReasonCode,
+      );
+      expect(JSON.parse(forged.trim())).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.INGRESS_SIGNATURE_INVALID,
+      });
+      expect(unboundJournal(harness)).toEqual([]);
+      expect(admittedRow(harness, "evt-auth-order")).toBeNull();
+
+      // The owner's real event, same id, delivered.
+      const delivered = await exchangeSocketLines(
+        listener.socketPath,
+        [envelope({ eventId: "evt-auth-order", text: "CTO, 상태", addressedTo: "CTO", mention: CTO_MENTION })],
+        hasReasonCode,
+      );
+      expect(JSON.parse(delivered.trim())).toMatchObject({ ok: true, reasonCode: ReasonCode.OK });
+      expect(rolePeer.peer.calls).toEqual(["CTO, 상태"]);
+      expect(unboundJournal(harness)).toEqual([]);
+
+      // The same event id again with the `p` tag rewritten to one that resolves to nobody. The
+      // event id is the replay key and it is spent, so this is a replay whatever its tag now
+      // says: rejected before the lookup, so the answered turn gains no second target side
+      // effect and the peer is not asked again.
+      const rewritten = await exchangeSocketLines(
+        listener.socketPath,
+        [
+          envelope({
+            eventId: "evt-auth-order",
+            text: "CTO, 상태",
+            addressedTo: "CTO",
+            mention: "npub-nobody-holds-this",
+          }),
+        ],
+        hasReasonCode,
+      );
+      expect(JSON.parse(rewritten.trim())).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.INGRESS_REPLAY_IGNORED,
+      });
+      expect(unboundJournal(harness)).toEqual([]);
+      expect(rolePeer.peer.calls).toEqual(["CTO, 상태"]);
+
+      // And a repeated *unbound* event journals once, not once per copy. The first is refused at
+      // the address and the second at the replay slot, which is the only reason the count stops.
+      const unbound = () =>
+        exchangeSocketLines(
+          listener.socketPath,
+          [
+            envelope({
+              eventId: "evt-unbound-twice",
+              text: "누구에게도",
+              addressedTo: "CTO",
+              mention: "npub-nobody-holds-this",
+            }),
+          ],
+          hasReasonCode,
+        );
+      expect(JSON.parse((await unbound()).trim())).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.MENTION_TARGET_UNBOUND,
+      });
+      expect(unboundJournal(harness).length).toBe(1);
+      expect(JSON.parse((await unbound()).trim())).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.INGRESS_REPLAY_IGNORED,
+      });
+      expect(unboundJournal(harness).length).toBe(1);
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("refuses a mention substituted into a validly signed CEO envelope", async () => {
+    const harness = makeHarness();
+    bindCeo(harness);
+    const { projectId } = await registerFixtureProject(harness);
+    const session = readyBoundSession(harness, "cto-peer", CTO_MENTION, [projectId]);
+    const roleConversation = roleConversationFor(harness);
+    const rolePeer = fakeCeoPeer("CTO는 이걸 받으면 안 된다");
+    roleConversation.attach(rolePeer.server, stillHeldBy(session));
+    const ceo = fakeCeoPeer("CEO 답");
+    const ceoConversation = new CeoConversationPort();
+    ceoConversation.attach(ceo.server, stillCeo());
+    const listener = await startMessageListener(harness, ceoConversation, roleConversation);
+
+    try {
+      // A genuine CEO envelope, captured whole. Its signature is not recomputed below — the same
+      // bytes travel, and only the `p` tag is substituted, which is exactly what an attacker who
+      // captured one off the wire can do. It is refused because `mention` is inside the signed
+      // payload; take it out of that payload and this envelope verifies and is delivered.
+      const captured = envelope({ eventId: "evt-substituted", text: "CEO, 상태" });
+      const tampered = { ...captured, mention: CTO_MENTION };
+      expect(tampered.signature).toBe(captured.signature);
+
+      const refused = await exchangeSocketLines(listener.socketPath, [tampered], hasReasonCode);
+      expect(JSON.parse(refused.trim())).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.INGRESS_SIGNATURE_INVALID,
+      });
+      expect(unboundJournal(harness)).toEqual([]);
+      expect(admittedRow(harness, "evt-substituted")).toBeNull();
+      expect(rolePeer.peer.calls).toEqual([]);
+      expect(ceo.peer.calls).toEqual([]);
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("delivers through the daemon's own composition to a peer the CTO socket admitted", async () => {
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+    const session = readyBoundSession(harness, "cto-socket-peer", CTO_MENTION, [projectId]);
+
+    // The real MCP listeners, the real `cto.mcp.sock`, and the real per-connection authenticator
+    // — no port is constructed by this row. `startDaemonBuzzMessageIngress` is the composition
+    // `main` itself calls, so the line that hands the ingress `listeners.ctoConversation` is
+    // inside what this row can kill.
+    const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-buzz-prod-mcp-"), MCP_TOKEN);
+    const ctoSocket = listeners.socketPaths[1];
+    if (!ctoSocket) throw new Error("the CTO MCP listener was not started");
+    const peer = await connectRolePeer(ctoSocket, {
+      token: MCP_TOKEN,
+      sessionId: session.sessionId,
+      sessionSecret: session.sessionSecret,
+    });
+    const ingress = await startDaemonBuzzMessageIngress(
+      harness.cp,
+      tempDir("acp-buzz-prod-"),
+      { allowedActors: RELAY_ACTORS, secret: SECRET },
+      listeners,
+      [OWNER],
+    );
+
+    try {
+      await until(
+        () => listeners.ctoConversation.connected(roleKey),
+        "the CTO connection to become the role's live peer",
+      );
+
+      const delivered = await exchangeSocketLines(
+        ingress.socketPath,
+        [envelope({ eventId: "evt-prod", text: "운영 경로로", addressedTo: "CTO", mention: CTO_MENTION })],
+        hasReasonCode,
+      );
+      const body = JSON.parse(delivered.trim()) as { ok: boolean; reasonCode: string; answer?: string };
+      expect(body).toMatchObject({ ok: true, reasonCode: ReasonCode.OK });
+      // The peer's own acknowledgement came back over the Buzz socket the relay called (B5).
+      expect(body.answer).toBe("받았다");
+      expect(peer.received).toEqual(["운영 경로로"]);
+    } finally {
+      await ingress.close();
+      await peer.close();
+      await listeners.close();
+    }
+  }, 60_000);
+
+  it("does not let a resolvable mention stand in for owner authority", async () => {
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const session = readyBoundSession(harness, "cto-peer", CTO_MENTION, [projectId]);
+    const roleConversation = roleConversationFor(harness);
+    const rolePeer = fakeCeoPeer("owner에게만 답한다");
+    roleConversation.attach(rolePeer.server, stillHeldBy(session));
+    const listener = await startMessageListener(harness, new CeoConversationPort(), roleConversation);
+
+    try {
+      // Everything about this envelope is valid except who sent it — including, now, a `p` tag
+      // that resolves to exactly one live role. Resolving a recipient says nothing about the
+      // sender's authority, and an ingress that let the first answer the second would have made
+      // every ACTIVE relay identity an owner the moment addressing became possible.
+      const eventId = "evt-non-owner-mention";
+      const refused = await exchangeSocketLines(
+        listener.socketPath,
+        [envelope({ eventId, text: "CTO, 지금 멈춰", actor: NON_OWNER, addressedTo: "CTO", mention: CTO_MENTION })],
+        hasReasonCode,
+      );
+      expect(JSON.parse(refused.trim())).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED,
+      });
+      expect(rolePeer.peer.calls).toEqual([]);
+      expect(
+        harness.cp.db.all(`SELECT nonce FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`, [
+          buzzMessageNonce(eventId),
+        ]),
+      ).toEqual([]);
+      // A stranger cannot make this daemon write a journal row either: the refusal is decided
+      // before the address is looked at, so an unauthenticated sender leaves no trace of its
+      // guesses at the deployment's channel identities.
+      expect(unboundJournal(harness)).toEqual([]);
+
+      // The owner's identical envelope goes through, so the row above cannot pass on an ingress
+      // that refused everything.
+      const delivered = await exchangeSocketLines(
+        listener.socketPath,
+        [envelope({ eventId, text: "CTO, 지금 멈춰", addressedTo: "CTO", mention: CTO_MENTION })],
+        hasReasonCode,
+      );
+      expect(JSON.parse(delivered.trim())).toMatchObject({ ok: true, reasonCode: ReasonCode.OK });
+      expect(rolePeer.peer.calls).toEqual(["CTO, 지금 멈춰"]);
+    } finally {
+      await listener.close();
+    }
+  });
+
   it("refuses to construct a message ingress with no declared owner", () => {
     const harness = makeHarness();
     const guard = new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, {
@@ -540,8 +1191,12 @@ describe("the daemon's Buzz message ingress", () => {
 
     // Falling back to the guard's own allowlist is exactly the defect; an absent owner
     // declaration has to close the path rather than widen it.
-    expect(() => new BuzzMessageIngress(guard, [])).toThrow(/declared buzz owner identity/u);
-    expect(() => new BuzzMessageIngress(guard, ["  "])).toThrow(/declared buzz owner identity/u);
+    expect(() => new BuzzMessageIngress(guard, [], resolvesNothing)).toThrow(
+      /declared buzz owner identity/u,
+    );
+    expect(() => new BuzzMessageIngress(guard, ["  "], resolvesNothing)).toThrow(
+      /declared buzz owner identity/u,
+    );
   });
 
   it("takes the message path's owners from owner-identities rather than from the relay allowlist", () => {
