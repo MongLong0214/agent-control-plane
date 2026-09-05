@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { OwnerAuthority } from "../../src/ceo/owner-authority.ts";
 import { AuditLog } from "../../src/db/audit.ts";
 import { Db } from "../../src/db/database.ts";
-import { IngressGuard } from "../../src/ingress/ingress-guard.ts";
+import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import { BindingRegistry } from "../../src/session/binding-registry.ts";
 import { SessionRegistry } from "../../src/session/session-registry.ts";
 import { Outbox } from "../../src/outbox/outbox.ts";
@@ -18,18 +18,27 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
   CANONICAL_SESSION_UUID,
   REQUIRED_EXECUTOR_VERSION,
+  SELF_CLAIM_OPERATION,
 } from "../../src/registry/canonical-self-claim.ts";
-import { executeCanonicalSelfClaimOperator } from "../../src/daemon/canonical-self-claim-operator.ts";
+import {
+  assertDirectPeer,
+  executeCanonicalSelfClaimOperator,
+  type CanonicalSelfClaimOperatorDeps,
+} from "../../src/daemon/canonical-self-claim-operator.ts";
 
 /**
- * #760 round 3 — the production `actor.claimCanonicalCto` operator handler, driven against real
+ * #760 round 4 — the production `actor.claimCanonicalCto` operator handler, driven against real
  * `AF_UNIX` sockets and real spawned processes. Scoped the same way
  * `tests/unit/g5-peercred.test.ts` states its own scope: this calls
  * `executeCanonicalSelfClaimOperator` — the exact function `src/daemon/agentcpd.ts` wires to the
  * socket — directly, rather than standing up the whole daemon (`ControlPlane`, the single-instance
- * lock, the full `startOperatorSocket` listener). What it does not skip is the one property that
- * matters for this round: a real kernel `getsockopt` call against a real connected socket, never a
- * fake peer object, an injected pid, or a mocked credential.
+ * lock, the full `startOperatorSocket` listener, `Daemon.executeApproveCanonicalCtoClaim`'s own
+ * bearer-token dispatch). What it does not skip: a real kernel `getsockopt` call against a real
+ * connected socket, and — the load-bearing property this round adds — that the claiming
+ * connection itself never mints, admits, or otherwise produces the owner approval it presents.
+ * `mintOwnerApprovalOutOfBand` below calls the exact same `IngressGuard.admitOwnerApproval` route
+ * `Daemon.executeApproveCanonicalCtoClaim` does, standing in for that separate, bearer-authenticated
+ * preflight call — never for anything the claiming socket itself could reach.
  */
 
 const roots: string[] = [];
@@ -149,6 +158,9 @@ interface Core {
 
 const OWNER_ACTOR = "isaac";
 const BUZZ_ACTOR_ID = "buzz:canonical-cto";
+const BUZZ_CHANNEL_ID = "channel:test-canonical";
+const PEER_PROTOCOL = "acp.operator/v1";
+const BUZZ_PURPOSE = "continuity:PRIMARY_CTO";
 
 const makeCore = (): Core => {
   const db = new Db(":memory:");
@@ -175,85 +187,111 @@ const insertProject = (core: Core, projectId: string): void => {
 let freshNonces = 0;
 
 /**
- * A fresh, never-yet-admitted nonce. `executeCanonicalSelfClaimOperator` performs the real
- * admission itself (via its own internal `admitOwnerApproval`, using the same `IngressGuard`
- * route `owner approve` uses) — this is deliberately *not* pre-admitted here, unlike the unit
- * test's `mintOwnerApproval` helper. Pre-admitting the same nonce in the test and then handing it
- * to the handler for a *second* admission is exactly the shape that made an early version of this
- * file fail with `INGRESS_REPLAY_IGNORED`: the handler's own admission was correctly refusing a
- * genuine replay the test had unintentionally manufactured.
+ * Stands in for `Daemon.executeApproveCanonicalCtoClaim` — the *separate*, bearer-authenticated
+ * operator method that mints a canonical self-claim owner approval. Never called by, or reachable
+ * from, the claiming socket: `executeCanonicalSelfClaimOperator` only ever *loads* what this
+ * produces, via `(channel="cli", nonce)`. Round 4 correction A exists precisely because an earlier
+ * version let the claiming request assemble and admit this receipt itself.
  */
-const freshNonce = (): string => `operator-test-nonce-${freshNonces++}`;
+const mintOwnerApprovalOutOfBand = (
+  core: Core,
+  input: { projectId: string; claimedSessionUuid: string; expectedBindingGeneration: number; approved?: boolean },
+): string => {
+  const guard = new IngressGuard(core.db, core.clock, core.audit, { cli: { allowedActors: [OWNER_ACTOR] } });
+  const approval = {
+    runId: null,
+    candidateSnapshotDigest: null,
+    operation: SELF_CLAIM_OPERATION,
+    parameters: {
+      domain: SELF_CLAIM_OPERATION,
+      projectId: input.projectId,
+      claimedSessionUuid: input.claimedSessionUuid,
+      role: "PRIMARY_CTO",
+      expectedBindingGeneration: input.expectedBindingGeneration,
+    },
+    idempotencyKey: `claim-canonical-cto:${input.projectId}:${input.expectedBindingGeneration}:${freshNonces}`,
+    approved: input.approved ?? true,
+  };
+  const nonce = `owner-preflight-nonce-${freshNonces++}`;
+  const admitted = guard.admitOwnerApproval(
+    { channel: "cli", actor: OWNER_ACTOR, nonce, payload: ownerApprovalPayload(approval) },
+    approval,
+  );
+  if (!admitted.allowed) throw new Error(`failed to mint an out-of-band owner approval: ${JSON.stringify(admitted)}`);
+  return nonce;
+};
+
+/** A fresh nonce nobody has ever admitted anything under — the shape a self-authorizing caller has. */
+const freshUnadmittedNonce = (): string => `never-admitted-nonce-${freshNonces++}`;
 
 const resolveBuzzAddressFixture = (
   outcome: Decision<string> = allow(ReasonCode.OK, "buzz://test-canonical-cto"),
 ) => async (): Promise<Decision<string>> => outcome;
 
+const depsFor = (core: Core, root: string): CanonicalSelfClaimOperatorDeps => ({
+  db: core.db,
+  clock: core.clock,
+  sessions: core.sessions,
+  bindings: core.bindings,
+  ownerAuthority: core.ownerAuthority,
+  buzzActorAuthenticator: new IngressGuard(core.db, core.clock, core.audit, {
+    buzz: { allowedActors: [BUZZ_ACTOR_ID] },
+  }),
+  resolveBuzzAddress: resolveBuzzAddressFixture(),
+  config: {
+    expectedCwd: realpathSync(root),
+    expectedPeerProtocolVersion: PEER_PROTOCOL,
+    expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
+    canonicalSessionUuid: CANONICAL_SESSION_UUID,
+    canonicalBuzzChannelId: BUZZ_CHANNEL_ID,
+    peerProtocolVersion: PEER_PROTOCOL,
+    buzzChannelId: BUZZ_CHANNEL_ID,
+    buzzActorId: BUZZ_ACTOR_ID,
+    buzzPurpose: BUZZ_PURPOSE,
+  },
+});
+
+/** A real claude-shaped peer, connected over a real socket, with a real transcript in place. */
+const spawnRealClaudePeer = async (root: string): Promise<Socket> => {
+  const claude = writeVersionedClaude(join(root, "versions"), REQUIRED_EXECUTOR_VERSION);
+  const socketPath = join(root, "operator.sock");
+  const accepted = acceptOneConnection(socketPath);
+  const child = spawnConnectingProcess(claude, socketPath, ["--session-id", CANONICAL_SESSION_UUID], root);
+  await waitForStdout(child, "connected");
+  const transcriptRoot = join(root, "transcripts");
+  const projectDir = join(transcriptRoot, "-work-canonical");
+  mkdirSync(projectDir, { recursive: true });
+  writeFileSync(join(projectDir, `${CANONICAL_SESSION_UUID}.jsonl`), '{"line":1}\n');
+  return accepted;
+};
+
 describe("actor.claimCanonicalCto — the real production handler, against real sockets and real processes", () => {
   it(
-    "derives the connecting process's own identity from the kernel and completes a real claim — no fake peer object anywhere",
+    "an independently pre-admitted owner approval succeeds end to end",
     async () => {
       const core = makeCore();
       const projectId = "prj_operator_success";
       insertProject(core, projectId);
-
       const root = tempRoot();
-      const claude = writeVersionedClaude(join(root, "versions"), REQUIRED_EXECUTOR_VERSION);
-      const socketPath = join(root, "operator.sock");
-      const accepted = acceptOneConnection(socketPath);
+      const socket = await spawnRealClaudePeer(root);
 
-      const child = spawnConnectingProcess(claude, socketPath, ["--session-id", CANONICAL_SESSION_UUID], root);
-      await waitForStdout(child, "connected");
-      const socket = await accepted;
-
-      // The transcript `CanonicalSelfClaim`'s default reader looks for — this test does not
-      // inject a fake reader, it places a real file where the real one looks.
-      const transcriptRoot = join(root, "transcripts");
-      const projectDir = join(transcriptRoot, "-work-canonical");
-      mkdirSync(projectDir, { recursive: true });
-      writeFileSync(join(projectDir, `${CANONICAL_SESSION_UUID}.jsonl`), '{"line":1}\n');
-      process.env["ACP_TEST_TRANSCRIPT_ROOT_UNUSED"] = ""; // no-op, keeps intent explicit below
-
-      const ownerNonce = freshNonce();
+      // Minted out of band — never through this test's call to the claim handler itself.
+      const ownerApprovalNonce = mintOwnerApprovalOutOfBand(core, {
+        projectId,
+        claimedSessionUuid: CANONICAL_SESSION_UUID,
+        expectedBindingGeneration: 1,
+      });
 
       const before = rowCounts(core);
       const result = await executeCanonicalSelfClaimOperator(
         socket,
-        {
-          claimedSessionUuid: CANONICAL_SESSION_UUID,
-          projectId,
-          expectedBindingGeneration: 1,
-          ownerNonce,
-          peerProtocolVersion: "acp.operator/v1",
-          buzzChannelId: "channel:test-canonical",
-          buzzActorId: BUZZ_ACTOR_ID,
-          buzzPurpose: "continuity:PRIMARY_CTO",
-        },
-        {
-          db: core.db,
-          clock: core.clock,
-          audit: core.audit,
-          sessions: core.sessions,
-          bindings: core.bindings,
-          ownerAuthority: core.ownerAuthority,
-          buzzActorAuthenticator: new IngressGuard(core.db, core.clock, core.audit, {
-            buzz: { allowedActors: [BUZZ_ACTOR_ID] },
-          }),
-          resolveBuzzAddress: resolveBuzzAddressFixture(),
-          ownerActor: OWNER_ACTOR,
-          config: {
-            expectedCwd: realpathSync(root),
-            expectedPeerProtocolVersion: "acp.operator/v1",
-            expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
-            canonicalSessionUuid: CANONICAL_SESSION_UUID,
-            canonicalBuzzChannelId: "channel:test-canonical",
-          },
-        },
+        { claimedSessionUuid: CANONICAL_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
+        depsFor(core, root),
       );
 
       expect(result.allowed, JSON.stringify(result)).toBe(true);
       if (!result.allowed) return;
-      // The whole point: `callerPid` was never in the request. It came from a real
+      // `callerPid` was never in the request. It came from a real
       // `getsockopt(SOL_LOCAL, LOCAL_PEERPID)` against `socket`'s own fd.
       expect(result.value.derivedSessionUuid).toBe(CANONICAL_SESSION_UUID);
       expect(result.value.binding.role).toBe("PRIMARY_CTO");
@@ -267,7 +305,131 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
   );
 
   it(
-    "wrong-process denial: a real connected peer that is not a claude process is refused, with zero mutation-table rows and only the real ingress-admission audit trail",
+    "correction A's counterexample: the exact same claude peer, presenting only a fresh nonce nobody admitted, cannot self-authorize",
+    async () => {
+      const core = makeCore();
+      const projectId = "prj_operator_self_authorize";
+      insertProject(core, projectId);
+      const root = tempRoot();
+      const socket = await spawnRealClaudePeer(root);
+
+      // No preflight mint anywhere. This is the exact request shape a compromised or malicious
+      // claiming connection would send: a real kernel identity, a nonce it invented, and nothing
+      // an owner ever saw.
+      const ownerApprovalNonce = freshUnadmittedNonce();
+
+      const before = rowCounts(core);
+      const result = await executeCanonicalSelfClaimOperator(
+        socket,
+        { claimedSessionUuid: CANONICAL_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
+        depsFor(core, root),
+      );
+
+      expect(result.allowed).toBe(false);
+      if (result.allowed) return;
+      expect(result.reasonCode).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
+      // Nothing was admitted, so there is no ingress audit trail either — unlike the wrong-process
+      // case below, this denial happens before any lookup could find anything to record against.
+      expect(rowCounts(core)).toEqual(before);
+    },
+    30_000,
+  );
+
+  it("approved:false denies with no new claim state and no new claim audit", async () => {
+    const core = makeCore();
+    const projectId = "prj_operator_rejected";
+    insertProject(core, projectId);
+    const root = tempRoot();
+    const socket = await spawnRealClaudePeer(root);
+
+    const ownerApprovalNonce = mintOwnerApprovalOutOfBand(core, {
+      projectId,
+      claimedSessionUuid: CANONICAL_SESSION_UUID,
+      expectedBindingGeneration: 1,
+      approved: false,
+    });
+
+    const before = rowCounts(core);
+    const result = await executeCanonicalSelfClaimOperator(
+      socket,
+      { claimedSessionUuid: CANONICAL_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
+      depsFor(core, root),
+    );
+
+    expect(result.allowed).toBe(false);
+    if (result.allowed) return;
+    expect(result.reasonCode).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
+    const after = rowCounts(core);
+    for (const table of ["sessions", "conversational_actors", "assignments", "actor_target_bindings", "actor_target_attestations"] as const) {
+      expect(after[table], table).toBe(before[table]);
+    }
+    // The mint's own ingress-admission pair is real and precedes `claim()` entirely (it happened
+    // before this test even called the handler) — no *additional* claim audit rows land on top.
+    expect(after.audit_events).toBe(before.audit_events);
+  });
+
+  it("a wrong-tuple approval (minted for a different project) denies with no new claim state or audit", async () => {
+    const core = makeCore();
+    const projectId = "prj_operator_wrong_tuple";
+    insertProject(core, projectId);
+    const root = tempRoot();
+    const socket = await spawnRealClaudePeer(root);
+
+    const ownerApprovalNonce = mintOwnerApprovalOutOfBand(core, {
+      projectId: "some-other-project",
+      claimedSessionUuid: CANONICAL_SESSION_UUID,
+      expectedBindingGeneration: 1,
+    });
+
+    const before = rowCounts(core);
+    const result = await executeCanonicalSelfClaimOperator(
+      socket,
+      { claimedSessionUuid: CANONICAL_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
+      depsFor(core, root),
+    );
+
+    expect(result.allowed).toBe(false);
+    if (result.allowed) return;
+    expect(result.reasonCode).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
+    expect(result.message).toContain("does not bind the exact project");
+    expect(rowCounts(core)).toEqual(before);
+  });
+
+  it("replaying an already-committed approval's nonce denies with no new claim state or audit", async () => {
+    const core = makeCore();
+    const projectId = "prj_operator_replay";
+    insertProject(core, projectId);
+    const root = tempRoot();
+    const socket = await spawnRealClaudePeer(root);
+
+    const ownerApprovalNonce = mintOwnerApprovalOutOfBand(core, {
+      projectId,
+      claimedSessionUuid: CANONICAL_SESSION_UUID,
+      expectedBindingGeneration: 1,
+    });
+    const deps = depsFor(core, root);
+    const first = await executeCanonicalSelfClaimOperator(
+      socket,
+      { claimedSessionUuid: CANONICAL_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
+      deps,
+    );
+    expect(first.allowed, JSON.stringify(first)).toBe(true);
+    const afterFirst = rowCounts(core);
+
+    // The exact same handle, presented again. `CanonicalSelfClaim`'s generation-CAS denies this
+    // before `OwnerAuthority` is even asked (round 3's own finding, unchanged by this round) —
+    // either way, nothing new lands.
+    const replay = await executeCanonicalSelfClaimOperator(
+      socket,
+      { claimedSessionUuid: CANONICAL_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
+      deps,
+    );
+    expect(replay.allowed).toBe(false);
+    expect(rowCounts(core)).toEqual(afterFirst);
+  });
+
+  it(
+    "wrong-process denial: a real connected peer that is not a claude process is refused, with zero mutation-table rows",
     async () => {
       const core = makeCore();
       const projectId = "prj_operator_wrong_process";
@@ -292,82 +454,44 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
       await waitForStdout(child, "connected");
       const socket = await accepted;
 
-      const ownerNonce = freshNonce();
+      const ownerApprovalNonce = mintOwnerApprovalOutOfBand(core, {
+        projectId,
+        claimedSessionUuid: CANONICAL_SESSION_UUID,
+        expectedBindingGeneration: 1,
+      });
 
       const before = rowCounts(core);
       const result = await executeCanonicalSelfClaimOperator(
         socket,
-        {
-          claimedSessionUuid: CANONICAL_SESSION_UUID,
-          projectId,
-          expectedBindingGeneration: 1,
-          ownerNonce,
-          peerProtocolVersion: "acp.operator/v1",
-          buzzChannelId: "channel:test-canonical",
-          buzzActorId: BUZZ_ACTOR_ID,
-          buzzPurpose: "continuity:PRIMARY_CTO",
-        },
-        {
-          db: core.db,
-          clock: core.clock,
-          audit: core.audit,
-          sessions: core.sessions,
-          bindings: core.bindings,
-          ownerAuthority: core.ownerAuthority,
-          buzzActorAuthenticator: new IngressGuard(core.db, core.clock, core.audit, {
-            buzz: { allowedActors: [BUZZ_ACTOR_ID] },
-          }),
-          resolveBuzzAddress: resolveBuzzAddressFixture(),
-          ownerActor: OWNER_ACTOR,
-          config: {
-            expectedCwd: realpathSync(root),
-            expectedPeerProtocolVersion: "acp.operator/v1",
-            expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
-            canonicalSessionUuid: CANONICAL_SESSION_UUID,
-            canonicalBuzzChannelId: "channel:test-canonical",
-          },
-        },
+        { claimedSessionUuid: CANONICAL_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
+        depsFor(core, root),
       );
 
       expect(result.allowed).toBe(false);
       if (result.allowed) return;
       // Measured, not assumed: this sandbox always runs *inside* a real claude session, so the
       // ancestry walk climbing past this plain child does not stop at "no ancestor at all" — it
-      // keeps climbing (by design, the same way a legitimate multi-hop chain is meant to resolve)
-      // until it reaches that real, ambient claude process, and denies against *its* identity
-      // (cwd/session/version) instead. That is still exactly the property this test is for: the
-      // request body asserts nothing about which process this is, and whichever real process the
-      // kernel-verified connection actually leads to is what gets checked — never a value this
-      // call supplied.
+      // keeps climbing until it reaches that real, ambient claude process, and denies against
+      // *its* identity (cwd/session/version) instead. Still exactly the property under test: the
+      // request asserts nothing about which process this is.
       expect(result.reasonCode).toBe(ReasonCode.CONFLICT);
-
-      // The five mutation tables are exactly unchanged — nothing about this refusal touches the
-      // adoption state `CanonicalSelfClaim`'s own transaction owns.
       const after = rowCounts(core);
       for (const table of ["sessions", "conversational_actors", "assignments", "actor_target_bindings", "actor_target_attestations"] as const) {
         expect(after[table], table).toBe(before[table]);
       }
-      // `audit_events` is *not* zero here, and that is a documented, accepted ordering (see
-      // `admitOwnerApproval`'s comment in src/daemon/canonical-self-claim-operator.ts): the
-      // owner-approval admission is real ingress evidence about the inbound envelope itself
-      // ("this exact nonce, from this exact allowlisted actor, arrived"), independent of and
-      // durable regardless of whether the claim it names later succeeds — exactly like an
-      // ordinary Telegram or Buzz message's admission is recorded before the daemon decides what
-      // to do with it. What must not happen, and does not: any of `CanonicalSelfClaim`'s own
-      // audit rows (`OWNER_APPROVAL_CONSUMED`, `SESSION_CREATED`, `SESSION_LIFECYCLE`,
-      // `SESSION_BUZZ_ACTOR_BOUND`, `BINDING_CREATED`) landing without their matching state.
-      expect(after.audit_events).toBe(before.audit_events + 2);
-      const auditKinds = core.db.all<{ kind: string }>(`SELECT kind FROM audit_events ORDER BY kind`).map((r) => r.kind);
-      expect(auditKinds.sort()).toEqual(["INGRESS_ADMITTED", "OWNER_APPROVAL_INGRESS"]);
     },
     30_000,
   );
 
-  it("refuses when the socket has no live native handle, without ever admitting the owner approval", async () => {
+  it("refuses when the socket has no live native handle, without ever looking up an approval", async () => {
     const core = makeCore();
     const projectId = "prj_operator_dead_socket";
     insertProject(core, projectId);
-    const ownerNonce = freshNonce();
+    const ownerApprovalNonce = mintOwnerApprovalOutOfBand(core, {
+      projectId,
+      claimedSessionUuid: CANONICAL_SESSION_UUID,
+      expectedBindingGeneration: 1,
+    });
 
     const root = tempRoot();
     const socketPath = join(root, "operator.sock");
@@ -383,41 +507,30 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
     const before = rowCounts(core);
     const result = await executeCanonicalSelfClaimOperator(
       client,
-      {
-        claimedSessionUuid: CANONICAL_SESSION_UUID,
-        projectId,
-        expectedBindingGeneration: 1,
-        ownerNonce,
-        peerProtocolVersion: "acp.operator/v1",
-        buzzChannelId: "channel:test-canonical",
-        buzzActorId: BUZZ_ACTOR_ID,
-        buzzPurpose: "continuity:PRIMARY_CTO",
-      },
-      {
-        db: core.db,
-        clock: core.clock,
-        audit: core.audit,
-        sessions: core.sessions,
-        bindings: core.bindings,
-        ownerAuthority: core.ownerAuthority,
-        buzzActorAuthenticator: new IngressGuard(core.db, core.clock, core.audit, {
-          buzz: { allowedActors: [BUZZ_ACTOR_ID] },
-        }),
-        resolveBuzzAddress: resolveBuzzAddressFixture(),
-        ownerActor: OWNER_ACTOR,
-        config: {
-          expectedCwd: realpathSync(root),
-          expectedPeerProtocolVersion: "acp.operator/v1",
-          expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
-        },
-      },
+      { claimedSessionUuid: CANONICAL_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
+      depsFor(core, root),
     );
 
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
     expect(result.reasonCode).toBe(ReasonCode.OPERATOR_UNAUTHENTICATED);
+    // The approval that WAS admitted (out of band) is untouched by this refusal, but the refusal
+    // itself adds nothing on top of it.
     expect(rowCounts(core)).toEqual(before);
 
     if (existsSync(socketPath)) unlinkSync(socketPath);
+  });
+});
+
+describe("correction B — a proxied peer identity is refused before any admission effect", () => {
+  it("denies when peerPid !== effectivePid, a focused counterexample with no real proxy required", () => {
+    const direct = assertDirectPeer({ peerPid: 100, effectivePid: 100, uid: 0, gid: 0 });
+    expect(direct.allowed).toBe(true);
+
+    const proxied = assertDirectPeer({ peerPid: 100, effectivePid: 200, uid: 0, gid: 0 });
+    expect(proxied.allowed).toBe(false);
+    if (proxied.allowed) return;
+    expect(proxied.reasonCode).toBe(ReasonCode.OPERATOR_UNAUTHENTICATED);
+    expect(proxied.evidence).toMatchObject({ peerPid: 100, effectivePid: 200 });
   });
 });

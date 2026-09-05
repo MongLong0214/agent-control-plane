@@ -2679,11 +2679,13 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       {
         mcpToken,
         bootstrapHermes: (params) => hermesBootstrap!.bootstrap(params),
-        claimCanonicalCto: (socket, params) =>
-          executeCanonicalSelfClaimOperator(socket, params, {
+        claimCanonicalCto: (socket, params) => {
+          // #760 round 4 correction C — every deployment fact the claiming request used to
+          // supply now lives here, fixed at composition time, never read from the request body.
+          const canonicalCtoBuzzActorId = process.env["ACP_CANONICAL_CTO_BUZZ_ACTOR_ID"] ?? "buzz:canonical-cto";
+          return executeCanonicalSelfClaimOperator(socket, params, {
             db: cp.db,
             clock: cp.clock,
-            audit: cp.audit,
             sessions: cp.sessions,
             bindings: cp.bindings,
             ownerAuthority: cp.ownerAuthority,
@@ -2691,18 +2693,22 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
             // same way the CLI operator identity is (`ACP_OPERATOR_ACTOR`) — not something a
             // caller asserts and this authenticator merely echoes back.
             buzzActorAuthenticator: new IngressGuard(cp.db, cp.clock, cp.audit, {
-              buzz: { allowedActors: [process.env["ACP_CANONICAL_CTO_BUZZ_ACTOR_ID"] ?? "buzz:canonical-cto"] },
+              buzz: { allowedActors: [canonicalCtoBuzzActorId] },
             }),
             resolveBuzzAddress: resolveCanonicalSelfClaimBuzzAddress,
-            ownerActor: operatorActor,
             config: {
               expectedCwd: process.env["ACP_CANONICAL_CTO_WORKDIR"] ?? process.cwd(),
               expectedPeerProtocolVersion: process.env["ACP_CANONICAL_CTO_PEER_PROTOCOL"] ?? "acp.operator/v1",
               // Matches `executeCanonicalSelfClaimOperator`'s own derivation exactly: both read
               // this daemon's effective uid, never a value either side is told by the other.
               expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
+              peerProtocolVersion: process.env["ACP_CANONICAL_CTO_PEER_PROTOCOL"] ?? "acp.operator/v1",
+              buzzChannelId: process.env["ACP_BUZZ_CHANNEL"] ?? "c37e88d0-8576-48aa-a69c-9cbd54d47be2",
+              buzzActorId: canonicalCtoBuzzActorId,
+              buzzPurpose: process.env["ACP_CANONICAL_CTO_BUZZ_PURPOSE"] ?? "continuity:PRIMARY_CTO",
             },
-          }),
+          });
+        },
       },
     );
     listeners = await startDaemonMcpListeners(cp, stateDir, mcpToken, daemon);
