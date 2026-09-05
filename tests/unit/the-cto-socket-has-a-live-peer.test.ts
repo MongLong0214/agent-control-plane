@@ -157,7 +157,7 @@ const connectPeer = async (
         const settle = pending.get(message.id);
         pending.delete(message.id);
         const result = message.result as { structuredContent?: ToolBody } | undefined;
-        settle?.(result?.structuredContent ?? { ok: false, reasonCode: "NO_STRUCTURED_CONTENT" });
+        settle?.(result?.structuredContent ?? { ok: false, reasonCode: ReasonCode.INTERNAL_ERROR });
         continue;
       }
       if (message.method === "sampling/createMessage" && message.id !== undefined) {
