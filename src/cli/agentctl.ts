@@ -53,7 +53,7 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
                                            --fenced only when its executor incarnation is still
                                            current: you are stating the execution cannot still write
   agentctl bootstrap hermes --target-bind-executable <path> --hermes-profile <profile> --hermes-home <path> --requested-session-id <id> --expected-lineage-root-digest <sha256> --executor-runtime-identity <identity> -- <command>
-  agentctl claim canonical-cto --claimed-session-id <uuid> --project-id <id> --expected-binding-generation <n> --owner-nonce <nonce> --cwd <path> --peer-protocol-version <v> --peer-identity <id> --buzz-channel <id> --buzz-actor-id <id> --buzz-purpose <purpose>
+  agentctl claim canonical-cto --claimed-session-id <uuid> --project-id <id> --expected-binding-generation <n> --owner-nonce <nonce> --peer-protocol-version <v> --peer-identity <id> --buzz-channel <id> --buzz-actor-id <id> --buzz-purpose <purpose>
                                            adopt the existing canonical CTO conversation in place;
                                            never launches a runtime the way bootstrap hermes does
   agentctl daemon status                  daemon mode and health; falls back to the lock file
@@ -236,12 +236,17 @@ export const dispatch = async (
     // process identity entirely. The daemon derives the connecting peer's pid from the
     // authenticated operator connection itself; a flag cannot stand in for that without becoming
     // exactly the "identity authority from CLI flags" this primitive refuses to accept.
+    // Round 3 (#760) — `--cwd` was dropped here after review found it required by this selector
+    // set and never read anywhere in `CanonicalSelfClaim`: the real cwd check (clause 2) compares
+    // the *derived* `identity.cwd` (read from the actual claude ancestor process) against
+    // deployment configuration, never a caller-supplied value. A required flag nothing consumes
+    // is dead surface that a later change could wire up by accident — the exact "identity
+    // authority from CLI flags" shape correction 3 refuses everywhere else.
     const selectorFields = {
       "--claimed-session-id": "claimedSessionUuid",
       "--project-id": "projectId",
       "--expected-binding-generation": "expectedBindingGeneration",
       "--owner-nonce": "ownerNonce",
-      "--cwd": "cwd",
       "--peer-protocol-version": "peerProtocolVersion",
       "--peer-identity": "peerIdentity",
       "--buzz-channel": "buzzChannelId",
@@ -272,11 +277,12 @@ export const dispatch = async (
         "--expected-binding-generation",
         1,
       ),
-      // The nonce identifies the operator's own owner-approval envelope (correction 4); the
-      // daemon mints the actual `OwnerApprovalReceipt` from it via the same `IngressGuard` route
-      // `owner approve` already uses. It is not the approval itself.
+      // The nonce identifies the operator's own owner-approval envelope (correction 4). It is not
+      // the approval itself: no operator handler for this command exists yet (correction 2/3/6 are
+      // reported blockers, not implemented) — a future one is expected to mint the actual
+      // `OwnerApprovalReceipt` from this nonce the same way `owner approve` admits its own, but
+      // that wiring does not exist in this codebase today.
       ownerNonce: claimSelectors["ownerNonce"]!,
-      cwd: claimSelectors["cwd"]!,
       peerProtocolVersion: claimSelectors["peerProtocolVersion"]!,
       peerIdentity: claimSelectors["peerIdentity"]!,
       buzzChannelId: claimSelectors["buzzChannelId"]!,

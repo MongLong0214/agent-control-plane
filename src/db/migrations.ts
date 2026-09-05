@@ -2514,9 +2514,9 @@ const v36: SchemaMigration = {
  * comment above `executor_kinds` in schema.sql) was built alongside this and reverted: v12/v13
  * replay the whole *current* schema.sql when climbing an old database, which would install a
  * schema.sql-defined trigger long before this migration's own place in the chain — and
- * `v21-canonical-turns` (frozen, checksummed, unchangeable) already carries its own
- * `INSERT OR IGNORE INTO executor_kinds VALUES ('hermes')` when it first creates this table.
- * Measured: with the trigger installed, that frozen step's redundant re-seed aborts, and
+ * `v22-canonical-turn-ledger` (frozen, checksummed, unchangeable) both creates this table and
+ * seeds it with `INSERT OR IGNORE INTO executor_kinds VALUES ('hermes')`. Measured: with the
+ * trigger installed, that frozen step's own seed aborts, and
  * `tests/unit/database-migration-restore.test.ts`'s v11-origin chain fails. Reported rather than
  * forced; the seed here is real and safe on its own.
  */

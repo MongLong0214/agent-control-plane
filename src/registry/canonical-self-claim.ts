@@ -452,8 +452,17 @@ export interface CanonicalSelfClaimRequest {
    * `parameterDigest === canonicalSelfClaimParameterDigest({ projectId, claimedSessionUuid,
    * expectedBindingGeneration })`, so a real approval minted for a *different* claim (wrong
    * project, session, role or generation) is rejected before it is ever presented for
-   * consumption. It is consumed exactly once, inside the same transaction as the mutation it
-   * authorises — a denied mutation leaves it unconsumed and reusable; a committed one burns it.
+   * consumption.
+   *
+   * Consumed exactly once **per commit, not per presentation**: `OwnerAuthority.consumeApproval`
+   * runs inside the same transaction as the mutation it authorises, so a denial anywhere in that
+   * transaction — including one after consumption already ran — rolls the consumption back with
+   * everything else. The same receipt is therefore genuinely reusable after a failed attempt and
+   * remains valid until an attempt actually commits (round 3 correction 4, verified directly:
+   * "the same receipt is genuinely reusable after a rollback"). This is deliberate, not an
+   * oversight: refusing to let a caller retry after an unrelated failure (an unauthenticated Buzz
+   * channel identity, a transient denial) with the *same* owner approval would make every such
+   * failure also cost a fresh owner round-trip.
    */
   ownerApproval: OwnerApprovalReceipt;
   /**
@@ -463,8 +472,13 @@ export interface CanonicalSelfClaimRequest {
    * silently approving a different generation than the owner actually saw.
    */
   expectedBindingGeneration: number;
-  /** Reported by the (out-of-scope) transport/caller; compared to the config's expectation. */
-  cwd: string;
+  // No caller-supplied `cwd` field: the real check (clause 2) compares the *derived*
+  // `identity.cwd` — read from the actual claude ancestor process — against
+  // `config.expectedCwd`, the deployment's own authority. A caller-supplied cwd would be an
+  // unused input at best (dead surface a later change could wire up "by accident", the exact
+  // shape correction 3 refuses everywhere else) or a second, redundant identity claim at worst.
+  // Round 3: this field existed, was required by the CLI, and was never read anywhere — removed
+  // rather than silently left as an ignored parameter.
   peerProtocolVersion: string;
   peerIdentity: string;
   buzzChannelId: string;
@@ -567,6 +581,19 @@ export class CanonicalSelfClaim {
         ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
         "owner approval names a different operation",
         { observed: request.ownerApproval.operation, expected: SELF_CLAIM_OPERATION },
+      );
+    }
+    // Round 3 correction 1 — `approved` is a real boolean on an authenticated receipt, and
+    // `approved: false` is exactly what an owner mints when they explicitly *refuse* an
+    // operation. Nothing above this line reads it, so an owner rejection was — before this —
+    // structurally indistinguishable from an approval that happened to also bind the right
+    // operation/project/session/generation. `src/doctor/repair.ts`'s owner-gated repair path
+    // already gates on this (`receipt.approved !== true`); this primitive had no analogous check.
+    if (request.ownerApproval.approved !== true) {
+      return deny(
+        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        "owner approval receipt is not an approval",
+        { approved: request.ownerApproval.approved },
       );
     }
     if (request.ownerApproval.runId !== null || request.ownerApproval.candidateSnapshotDigest !== null) {
