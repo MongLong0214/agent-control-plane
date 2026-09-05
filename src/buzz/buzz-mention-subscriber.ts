@@ -1053,7 +1053,28 @@ export const startBuzzMentionSubscriber = (
     );
   });
 
-  for (const subscription of prepared) subscription.open();
+  // All-or-none, and this is the half the preflight cannot cover.
+  //
+  // The preflight refuses before anything is open, so its failures cost nothing to unwind. A
+  // *construction* failure is different: by the time the second socket throws, the first is open
+  // and listening, and the throw leaves this function without ever returning a handle. That
+  // connection is then unreachable by construction — the caller holds no object, so no later
+  // `close()` can reach it and no reconnect path leads back to it. A partial start at least has
+  // an owner; this would have none.
+  //
+  // Every prepared subscription is closed, including the generation whose socket failed: `open`
+  // claims a generation before it constructs, so closing it is what stops that number from being
+  // treated as live by anything still holding it. `close` on one that never opened is a no-op.
+  //
+  // The original error is rethrown rather than wrapped. The operator needs the constructor's own
+  // failure — a relay refusal, a bad URL, a runtime with no `WebSocket` — and an unwind error in
+  // its place would report that cleanup happened while hiding why startup refused at all.
+  try {
+    for (const subscription of prepared) subscription.open();
+  } catch (err) {
+    for (const subscription of prepared) subscription.close();
+    throw err;
+  }
 
   return {
     socketCount: prepared.length,

@@ -10,6 +10,7 @@ import {
   BUZZ_SUBSCRIBER_CONFIG_FILENAME,
   MAX_RELAY_FRAME_BYTES,
   RELAY_RECONNECT_BACKOFF_MS,
+  nativeRelaySocketFactory,
   parseBuzzSubscriberConfig,
   startBuzzMentionSubscriberFromStateDir,
   type BuzzMentionAdmission,
@@ -408,6 +409,40 @@ const flushMicrotasks = async (): Promise<void> => {
   for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
 };
 
+/**
+ * Two identities that both pass the preflight: two key files, two addresses, two roles.
+ *
+ * Independent on every axis the preflight checks, so nothing about them can refuse startup — which
+ * is what lets the rows below attribute a refusal to the socket construction alone.
+ */
+const twoIdentityDeployment = (): {
+  stateDir: string;
+  registry: BuzzMentionRegistry;
+  clock: VirtualClock;
+  roleKeys: string[];
+} => {
+  const stateDir = tempDir("acp-buzz-two-");
+  const keys = tempDir("acp-buzz-two-keys-");
+  const first = hexIdentity(keys, "cto-one.key");
+  const second = hexIdentity(keys, "cto-two.key");
+  writeConfig(
+    stateDir,
+    configFor([
+      { keyFile: first.keyFile, encoding: "hex" },
+      { keyFile: second.keyFile, encoding: "hex" },
+    ]),
+  );
+  return {
+    stateDir,
+    registry: registryHolding({
+      [first.pubkey]: { roleKey: "PRIMARY_CTO:proj-1", buzzActorId: first.pubkey },
+      [second.pubkey]: { roleKey: "PRIMARY_CTO:proj-2", buzzActorId: second.pubkey },
+    }),
+    clock: virtualClock(),
+    roleKeys: ["PRIMARY_CTO:proj-1", "PRIMARY_CTO:proj-2"],
+  };
+};
+
 /** A subscriber on the **production** adapter: no `openSocket` is injected, only the clock. */
 const startOnNativeAdapter = <T extends BuzzMentionSink>(
   sink: T = recordingSink("DURABLE") as unknown as T,
@@ -716,6 +751,94 @@ describe("the buzz mention subscriber's native WebSocket adapter", () => {
       } finally {
         handle.close();
       }
+    } finally {
+      fake.restore();
+    }
+  });
+
+  /**
+   * Startup is all-or-none, and the reason is narrower than the preflight's.
+   *
+   * The preflight rows above prove that a *validation* failure opens nothing — they can, because
+   * nothing has been opened yet when validation refuses. This is the other half, and it is the one
+   * with teeth: the second socket's construction fails after the first is already open and
+   * listening. If the loop simply propagates, the function throws without ever returning a handle,
+   * so the first connection is live and **unreachable by construction** — the caller has no object
+   * to close, no later `close()` can find it, and no reconnect path leads back to it. It is not a
+   * refused event that got through; it is a process nothing can stop.
+   *
+   * The factory is injected so the second construction can fail on demand, and the first delegates
+   * to the production adapter so the unwind is measured on a real socket's listeners rather than on
+   * a wrapper's boolean.
+   */
+  it("closes what it already opened when a later socket cannot be constructed, and rethrows that failure", () => {
+    const fake = installFakeWebSocket();
+    try {
+      const { stateDir, registry, clock } = twoIdentityDeployment();
+      const boom = new Error("the relay refused the second connection");
+      let constructions = 0;
+      const openSocket: BuzzRelaySocketFactory = (url, handlers) => {
+        constructions += 1;
+        if (constructions === 2) throw boom;
+        return nativeRelaySocketFactory(url, handlers);
+      };
+
+      let thrown: unknown = null;
+      try {
+        startBuzzMentionSubscriberFromStateDir(stateDir, {
+          registry,
+          sink: recordingSink(),
+          openSocket,
+          scheduler: clock.scheduler,
+        });
+      } catch (err) {
+        thrown = err;
+      }
+
+      // The constructor's own failure, unwrapped. An unwind error in its place would tell the
+      // operator that cleanup happened and never why startup refused.
+      expect(thrown).toBe(boom);
+
+      // And the one that did open is gone: closed, deaf, with nothing scheduled behind it and no
+      // third construction attempted.
+      expect(constructions).toBe(2);
+      expect(fake.sockets).toHaveLength(1);
+      expect(fake.sockets[0]!.closeCalls).toBe(1);
+      expect(fake.sockets[0]!.listenerCount()).toBe(0);
+      expect(clock.pending()).toBe(0);
+    } finally {
+      fake.restore();
+    }
+  });
+
+  it("opens one socket per identity when every construction succeeds, and closes both", () => {
+    const fake = installFakeWebSocket();
+    try {
+      const { stateDir, registry, clock, roleKeys } = twoIdentityDeployment();
+      const handle = startBuzzMentionSubscriberFromStateDir(stateDir, {
+        registry,
+        sink: recordingSink(),
+        openSocket: nativeRelaySocketFactory,
+        scheduler: clock.scheduler,
+      });
+
+      // The positive control for the row above: the same two identities, nothing injected to
+      // fail, and both connections are live. Without it, a subscriber that opened nothing at all
+      // would pass the unwind row for the wrong reason.
+      expect(handle.socketCount).toBe(2);
+      expect(handle.roleKeys).toEqual(roleKeys);
+      expect(fake.sockets).toHaveLength(2);
+      for (const socket of fake.sockets) {
+        expect(socket.listenerCount()).toBe(4);
+        expect(socket.closeCalls).toBe(0);
+      }
+
+      handle.close();
+      for (const socket of fake.sockets) {
+        expect(socket.closeCalls).toBe(1);
+        expect(socket.listenerCount()).toBe(0);
+      }
+      expect(clock.pending()).toBe(0);
     } finally {
       fake.restore();
     }
