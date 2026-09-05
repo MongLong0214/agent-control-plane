@@ -72,6 +72,7 @@ import { MessageKind } from "../outbox/envelope.ts";
 import type { HolderIdentity } from "../outbox/outbox.ts";
 import { respond, type AuthenticatedMcpPeer, type McpPeerAuthenticator } from "../mcp/shared.ts";
 import type { AuthenticatedOperatorPeer, Daemon } from "./daemon.ts";
+import { executeCanonicalSelfClaimOperator } from "./canonical-self-claim-operator.ts";
 
 const MAX_MCP_LINE_BYTES = 1024 * 1024;
 const DEFAULT_MCP_HANDSHAKE_TIMEOUT_MS = 5_000;
@@ -226,6 +227,14 @@ export interface LocalOperatorSocketOptions {
   mcpToken?: string;
   /** The sole additional operator method: a fresh-install Hermes authority bootstrap. */
   bootstrapHermes?: (params: Record<string, unknown>) => Promise<Decision<unknown>>;
+  /**
+   * #760 round 3 — the canonical CTO self-claim. Handled here, alongside `bootstrapHermes`,
+   * rather than through `Daemon.handleOperatorRequest`'s generic dispatch: this is the one method
+   * whose authority must be derived from the accepted connection's own kernel credentials
+   * (`src/daemon/canonical-self-claim-operator.ts`), and that connection — the raw `Socket` — is
+   * only ever in scope here, not inside `Daemon`'s method table.
+   */
+  claimCanonicalCto?: (socket: Socket, params: Record<string, unknown>) => Promise<Decision<unknown>>;
 }
 
 interface LiveOperatorBinding extends LocalOperatorCredential {
@@ -1152,6 +1161,25 @@ const serveOperatorRequest = (
       if (!params) return finish(deny(ReasonCode.INVALID_ARGUMENT, "Hermes bootstrap parameters are invalid", {}));
       void options.bootstrapHermes(params).then(finish).catch((error: unknown) => {
         finish(deny(ReasonCode.INTERNAL_ERROR, "Hermes bootstrap request failed", {
+          error: error instanceof Error ? error.message : String(error),
+        }));
+      });
+      return;
+    }
+    if (method === "actor.claimCanonicalCto") {
+      if (!options.claimCanonicalCto) {
+        return finish(deny(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED, "canonical self-claim is not enabled on this socket", {}));
+      }
+      if (!daemon.lock.held()) {
+        return finish(deny(ReasonCode.DAEMON_LOCK_LOST, "daemon lock is not held for canonical self-claim", {}));
+      }
+      const params = operatorRequestParams(value);
+      if (!params) return finish(deny(ReasonCode.INVALID_ARGUMENT, "canonical self-claim parameters are invalid", {}));
+      // The raw `socket` is passed through here, not `peer`: this method's authority comes from
+      // the kernel-verified connection itself (#760 round 3), never from the shared operator
+      // bearer token `authenticateOperatorPeer` checked above.
+      void options.claimCanonicalCto(socket, params).then(finish).catch((error: unknown) => {
+        finish(deny(ReasonCode.INTERNAL_ERROR, "canonical self-claim request failed", {
           error: error instanceof Error ? error.message : String(error),
         }));
       });
@@ -2534,15 +2562,25 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     throw err;
   }
 
-  const buzz = new BuzzAdapter(
-    cp.db,
-    cp.clock,
-    cp.audit,
-    cp.sessions,
-    cp.bindings,
-    cp.outbox,
-    new BuzzCliTransport(process.env["ACP_BUZZ_BINARY"] ?? "buzz", process.env["ACP_BUZZ_CHANNEL"] ?? null),
+  const buzzTransport = new BuzzCliTransport(
+    process.env["ACP_BUZZ_BINARY"] ?? "buzz",
+    process.env["ACP_BUZZ_CHANNEL"] ?? null,
   );
+  const buzz = new BuzzAdapter(cp.db, cp.clock, cp.audit, cp.sessions, cp.bindings, cp.outbox, buzzTransport);
+  // #760 round 3 — a channel address only, deliberately not `BuzzAdapter.connect`: that method
+  // also calls `sessions.setBuzzAddress(sessionId, ...)` for an *existing* session, and the
+  // canonical self-claim primitive resolves its address before the session it belongs to exists
+  // (`sessions.create` accepts `buzzAddress` directly, inside the same transaction that mints it).
+  const resolveCanonicalSelfClaimBuzzAddress = async (purpose: string): Promise<Decision<string>> => {
+    if (!(await buzzTransport.available(purpose))) {
+      return deny(ReasonCode.PROBE_FAILED, "buzz transport is not available", { purpose });
+    }
+    try {
+      return allow(ReasonCode.OK, await buzzTransport.openChannel(purpose));
+    } catch (err) {
+      return deny(ReasonCode.PROBE_FAILED, `buzz connect failed: ${(err as Error).message}`, { purpose });
+    }
+  };
   cp.cto.attach({
     buzz: {
       connect: (sessionId, purpose) => buzz.connect(sessionId, purpose),
@@ -2641,6 +2679,30 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       {
         mcpToken,
         bootstrapHermes: (params) => hermesBootstrap!.bootstrap(params),
+        claimCanonicalCto: (socket, params) =>
+          executeCanonicalSelfClaimOperator(socket, params, {
+            db: cp.db,
+            clock: cp.clock,
+            audit: cp.audit,
+            sessions: cp.sessions,
+            bindings: cp.bindings,
+            ownerAuthority: cp.ownerAuthority,
+            // The canonical CTO's own Buzz channel identity is a deployment fact, configured the
+            // same way the CLI operator identity is (`ACP_OPERATOR_ACTOR`) — not something a
+            // caller asserts and this authenticator merely echoes back.
+            buzzActorAuthenticator: new IngressGuard(cp.db, cp.clock, cp.audit, {
+              buzz: { allowedActors: [process.env["ACP_CANONICAL_CTO_BUZZ_ACTOR_ID"] ?? "buzz:canonical-cto"] },
+            }),
+            resolveBuzzAddress: resolveCanonicalSelfClaimBuzzAddress,
+            ownerActor: operatorActor,
+            config: {
+              expectedCwd: process.env["ACP_CANONICAL_CTO_WORKDIR"] ?? process.cwd(),
+              expectedPeerProtocolVersion: process.env["ACP_CANONICAL_CTO_PEER_PROTOCOL"] ?? "acp.operator/v1",
+              // Matches `executeCanonicalSelfClaimOperator`'s own derivation exactly: both read
+              // this daemon's effective uid, never a value either side is told by the other.
+              expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
+            },
+          }),
       },
     );
     listeners = await startDaemonMcpListeners(cp, stateDir, mcpToken, daemon);
