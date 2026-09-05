@@ -1078,9 +1078,9 @@ export class Outbox {
    *              them; leaving it would strand it, because no live holder can claim `SENT`. It is
    *              rejected here and its ingress claim settled in this same transaction.
    *
-   * A move that goes nowhere is not a move: with the same session on both sides there is no old
-   * runtime for an unresolved hand-over to have died with, and burning it would be this method
-   * inventing a failure out of a no-op.
+   * A move that goes nowhere is not a move: when both ends of the carry name one and the same
+   * runtime, nothing was replaced, so there is no departed runtime for an unresolved hand-over to
+   * have died with, and burning it would be this method inventing a failure out of a no-op.
    */
   carryHolderMessagesToRuntime(
     roleKey: string,
