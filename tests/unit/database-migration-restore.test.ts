@@ -725,7 +725,7 @@ describe("versioned SQLite migration", () => {
       );
       expect(migrated.get<{ migration_id: string }>(
         "SELECT migration_id FROM schema_migrations WHERE version = ?",
-        [SCHEMA_VERSION],
+        [36],
       )).toEqual({ migration_id: "v36-backfill-ingress-receipt-identities-before-freezing-claims" });
     } finally {
       migrated.close();
@@ -1145,7 +1145,8 @@ describe("versioned SQLite migration", () => {
         [33, "v33-back-up-before-telegram-settlement-state"],
         [34, "v34-persist-hermes-target-bind-receipt-evidence"],
         [35, "v35-keep-the-admitted-payload-with-its-inbound-row"],
-        [SCHEMA_VERSION, "v36-backfill-ingress-receipt-identities-before-freezing-claims"],
+        [36, "v36-backfill-ingress-receipt-identities-before-freezing-claims"],
+        [SCHEMA_VERSION, "v37-seed-claude-cli-executor-kind"],
       ]);
       // Stated as properties rather than one `objectContaining` per version. The list above
       // already pins the exact order and ids; this block only ever said "every receipt carries a

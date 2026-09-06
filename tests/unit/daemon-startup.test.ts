@@ -33,12 +33,55 @@ const TELEGRAM_VARIABLES = [
 const BUZZ_VARIABLES = ["ACP_BUZZ_INGRESS_SECRET", "ACP_BUZZ_ALLOWED_ACTORS", "BUZZ_PRIVATE_KEY"] as const;
 const BUZZ_SECRET = "startup-test-buzz-secret";
 const BUZZ_ACTOR = "npub-startup-owner";
+/**
+ * The exact four-variable canonical self-claim activation group (#760), plus the pre-existing,
+ * shared `ACP_BUZZ_CHANNEL` transport setting this group also reads once fully configured.
+ * Deleted from the child's environment unless a case asks for them, for the same reason
+ * `TELEGRAM_VARIABLES` is: an inherited value from the parent process's own environment would
+ * otherwise silently activate or partially activate the feature in every scenario here, and a
+ * green "disabled" row would then be measuring the environment it happened to run in, not the
+ * code.
+ */
+const CANONICAL_ACTIVATION_VARIABLES = [
+  "ACP_CANONICAL_SESSION_UUID",
+  "ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION",
+  "ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH",
+  "ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256",
+  "ACP_BUZZ_CHANNEL",
+] as const;
+
+/**
+ * Every socket/lock filename the startup boundary this suite exercises could have opened, by the
+ * time canonical self-claim activation is evaluated: the operator socket, the session-launch
+ * channel, the single-instance lock, the canonical self-claim socket itself, and both Hermes/CTO
+ * MCP listener sockets `startDaemonMcpListeners` binds. All live directly under `stateRoot`
+ * (`join(root, ".agent-control-plane")`) — see `src/daemon/agentcpd.ts` and
+ * `src/daemon/canonical-self-claim-listener.ts`'s `CANONICAL_SELF_CLAIM_SOCKET_FILENAME` for the
+ * exact literals this list is copied from.
+ *
+ * A no-residue claim is worthless unless the filesystem is actually read for it (#760): asserting
+ * only exit status and log text cannot distinguish a clean teardown from a leaked one, because
+ * `runMain`'s own `finally` deletes `root` recursively before a caller can ever inspect it.
+ * `runMain` takes this snapshot itself, synchronously, at the moment the child exits — before its
+ * `finally` runs — so the observation is real and frozen into the returned result rather than
+ * inferred from what the child chose to print.
+ */
+const RESIDUE_PATHS = [
+  "agentcpd.operator.sock",
+  "cto.launch.sock",
+  "agentcpd.lock",
+  "agentcpd.claim-canonical-cto.sock",
+  "hermes.mcp.sock",
+  "cto.mcp.sock",
+] as const;
 
 interface MainResult {
   status: number | null;
   signal: NodeJS.Signals | null;
   stdout: string;
   stderr: string;
+  /** `true` means that path still existed on disk at the moment the child process exited. */
+  residue: Record<(typeof RESIDUE_PATHS)[number], boolean>;
 }
 
 const runMain = async (input: {
@@ -55,6 +98,8 @@ const runMain = async (input: {
   buzzOwnerIdentity?: boolean;
   /** Drives an owner Buzz message through the daemon's own socket (#627). */
   expectBuzzMessage?: boolean;
+  /** Canonical self-claim activation-group overrides; see `CANONICAL_ACTIVATION_VARIABLES`. */
+  canonical?: NodeJS.ProcessEnv;
 }): Promise<MainResult> => {
   // macOS sockaddr_un paths are short; the repository's temp worktree path is long enough
   // to make the operator socket exceed that OS limit and would test the wrong failure.
@@ -88,11 +133,15 @@ const runMain = async (input: {
     ...(input.realTelegramTransport ? { ACP_STARTUP_TEST_REAL_TELEGRAM_TRANSPORT: "1" } : {}),
     ...(input.expectBuzzMessage ? { ACP_STARTUP_TEST_EXPECT_BUZZ_MESSAGE: "1" } : {}),
     ...(input.telegram ?? {}),
+    ...(input.canonical ?? {}),
   };
   for (const name of TELEGRAM_VARIABLES) {
     if (!(name in (input.telegram ?? {}))) delete environment[name];
   }
   for (const name of BUZZ_VARIABLES) delete environment[name];
+  for (const name of CANONICAL_ACTIVATION_VARIABLES) {
+    if (!(name in (input.canonical ?? {}))) delete environment[name];
+  }
   if (input.buzz) {
     environment["ACP_BUZZ_INGRESS_SECRET"] = BUZZ_SECRET;
     environment["ACP_BUZZ_ALLOWED_ACTORS"] = BUZZ_ACTOR;
@@ -116,7 +165,13 @@ const runMain = async (input: {
       child.once("error", rejectResult);
       child.once("exit", (status, signal) => {
         clearTimeout(timer);
-        resolveResult({ status, signal, stdout, stderr });
+        // Read synchronously, right here, before this function returns: the outer `finally`
+        // below deletes `root` recursively the moment this promise settles, so this is the one
+        // and only point at which the real filesystem state is observable at all.
+        const residue = Object.fromEntries(
+          RESIDUE_PATHS.map((name) => [name, existsSync(join(stateRoot, name))]),
+        ) as MainResult["residue"];
+        resolveResult({ status, signal, stdout, stderr, residue });
       });
     });
   } finally {
@@ -223,6 +278,101 @@ describe("agentcpd main Telegram startup composition", () => {
     expect(result.stdout, diagnostics).toContain("startup test owner prompt observed");
     expect(result.stdout, diagnostics).toContain("startup test owner approval cleared gate");
     expect(result.status, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`).toBe(0);
+  }, 40_000);
+});
+
+describe("#760: canonical self-claim activation is gated at the listener boundary, not at daemon entry", () => {
+  // Synthetic throughout — never a value that names a real deployment's session, channel, path,
+  // hash, or version.
+  const COMPLETE_CANONICAL_ENV: NodeJS.ProcessEnv = {
+    ACP_CANONICAL_SESSION_UUID: "99999999-9999-4999-8999-999999999999",
+    ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION: "0.0.0-startup-test",
+    ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH: "/fake/versions/current/claude",
+    ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256: `sha256:${"0".repeat(64)}`,
+    ACP_BUZZ_CHANNEL: "channel:startup-test-canonical",
+  };
+
+  it("starts the daemon with canonical self-claim disabled when all four activation variables are absent", async () => {
+    // This is the exact regression: a deployment carrying only the pre-existing MCP/operator
+    // configuration (no canonical env vars at all) must reach a normal, running daemon — not
+    // exit before `ControlPlane`, migration refusal, or the operator door can run.
+    const result = await runMain({ seedState: true });
+
+    const diagnostics = `status=${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
+    expect(result.status, diagnostics).toBe(0);
+    expect(result.stdout, diagnostics).toContain("canonical self-claim disabled");
+    expect(result.stdout, diagnostics).not.toContain("canonical self-claim listener started");
+  }, 40_000);
+
+  it("does not activate on ACP_BUZZ_CHANNEL alone — it is a pre-existing shared transport setting, not part of the activation group", async () => {
+    const result = await runMain({
+      seedState: true,
+      canonical: { ACP_BUZZ_CHANNEL: "channel:startup-test-canonical" },
+    });
+
+    const diagnostics = `status=${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
+    expect(result.status, diagnostics).toBe(0);
+    expect(result.stdout, diagnostics).toContain("canonical self-claim disabled");
+    expect(result.stdout, diagnostics).not.toContain("canonical self-claim listener started");
+  }, 40_000);
+
+  /**
+   * Direct filesystem assertions against `result.residue` (captured at child-exit time, before
+   * `runMain`'s own cleanup — see `RESIDUE_PATHS`). Per-path, not a single blanket check: a
+   * failure here names exactly which resource was left open, and a `toEqual` against an
+   * all-false object would report the same generic diff no matter which one leaked.
+   */
+  const expectNoResidue = (result: MainResult, diagnostics: string): void => {
+    for (const name of RESIDUE_PATHS) {
+      expect(result.residue[name], `${name} was left on disk\n${diagnostics}`).toBe(false);
+    }
+  };
+
+  it("fails closed with no residue when only some of the four activation variables are set", async () => {
+    const result = await runMain({
+      seedState: true,
+      canonical: {
+        ACP_CANONICAL_SESSION_UUID: COMPLETE_CANONICAL_ENV["ACP_CANONICAL_SESSION_UUID"]!,
+        ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION: COMPLETE_CANONICAL_ENV["ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION"]!,
+        // ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH and ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256
+        // deliberately absent — this is the partial-configuration case.
+      },
+    });
+
+    const diagnostics =
+      `status=${result.status}\nresidue=${JSON.stringify(result.residue)}\n` +
+      `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
+    expect(result.status, diagnostics).toBe(1);
+    expect(result.stderr, diagnostics).toContain("canonical self-claim activation is partially configured");
+    expect(result.stderr, diagnostics).toContain("ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH");
+    expect(result.stderr, diagnostics).toContain("ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256");
+    expect(result.stdout, diagnostics).not.toContain("canonical self-claim listener started");
+    // No residue, observed directly on the filesystem at the moment the child exited — not
+    // inferred from the log line above, which a startup that leaked every socket and the lock
+    // would still have printed identically.
+    expectNoResidue(result, diagnostics);
+  }, 40_000);
+
+  it("fails closed with no residue when all four activation variables are set but ACP_BUZZ_CHANNEL is not", async () => {
+    const { ACP_BUZZ_CHANNEL: _omit, ...withoutChannel } = COMPLETE_CANONICAL_ENV;
+    const result = await runMain({ seedState: true, canonical: withoutChannel });
+
+    const diagnostics =
+      `status=${result.status}\nresidue=${JSON.stringify(result.residue)}\n` +
+      `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
+    expect(result.status, diagnostics).toBe(1);
+    expect(result.stderr, diagnostics).toContain("ACP_BUZZ_CHANNEL is required");
+    expect(result.stdout, diagnostics).not.toContain("canonical self-claim listener started");
+    expectNoResidue(result, diagnostics);
+  }, 40_000);
+
+  it("starts the canonical self-claim listener when the full synthetic activation group is configured", async () => {
+    const result = await runMain({ seedState: true, canonical: COMPLETE_CANONICAL_ENV });
+
+    const diagnostics = `status=${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
+    expect(result.status, diagnostics).toBe(0);
+    expect(result.stdout, diagnostics).toContain("canonical self-claim listener started");
+    expect(result.stdout, diagnostics).not.toContain("canonical self-claim disabled");
   }, 40_000);
 });
 
