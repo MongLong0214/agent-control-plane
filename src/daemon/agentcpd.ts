@@ -932,6 +932,33 @@ export const startDaemonBuzzMentionSubscriber = (
 };
 
 /**
+ * The daemon's own room and the mention subscriber's rooms, cross-checked.
+ *
+ * A pure comparison, deliberately: `ACP_BUZZ_CHANNEL` is read once, by `main()`, and the
+ * subscriber's handle carries its own configured rooms without ever touching the environment
+ * itself (`src/buzz/buzz-mention-subscriber.ts`) — so this is where the two meet, and it is
+ * exported specifically so that meeting is testable without a daemon subprocess.
+ *
+ * Refuses only when both sides have something to disagree about: an unset `ACP_BUZZ_CHANNEL` or
+ * an unconfigured subscriber (`rooms.length === 0`, meaning no `buzz-nostr-subscriber.json`) leave
+ * nothing to cross-check, and `buzz-adapter.ts`'s own refusal already covers the outbound-only
+ * case. A mismatch here means the daemon would answer a reply in one room while its subscriber
+ * listens in another — silent on both sides, since neither adapter can see the other's binding.
+ */
+export const assertBuzzChannelMatchesSubscriberRooms = (
+  answeringBuzzChannel: string | undefined,
+  subscriberRooms: readonly string[],
+): void => {
+  if (!answeringBuzzChannel || subscriberRooms.length === 0) return;
+  if (subscriberRooms.includes(answeringBuzzChannel)) return;
+  throw new Error(
+    `ACP_BUZZ_CHANNEL (${answeringBuzzChannel}) is not among the Buzz mention subscriber's ` +
+      `configured rooms (${subscriberRooms.join(", ")}); the daemon would answer in one room and ` +
+      "listen in another",
+  );
+};
+
+/**
  * The operator surface is deliberately a one-request protocol rather than a general RPC
  * framework. A dedicated credential is bound to a configured peer and a live listener
  * incarnation before the daemon applies the per-method lock/authority checks. The MCP token
@@ -2796,6 +2823,18 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         );
         process.stdout.write(
           `Buzz mention subscriber sockets: ${buzzMentionSubscriber.socketCount}\n`,
+        );
+        // The room the daemon *answers* in already has a name (`ACP_BUZZ_CHANNEL`, the outbound
+        // adapter's own default-channel route — `buzz-adapter.ts`). The subscriber above now
+        // carries its own, independently configured room list; a room in one and not the other is
+        // silent on both sides — the reply lands somewhere real, and the mention that was never
+        // subscribed to simply never wakes anything. So the two are cross-checked here, once, at
+        // the one point in startup where both values are in hand: this module reads
+        // `ACP_BUZZ_CHANNEL` for the canonical self-claim group above and the subscriber never
+        // reads the environment at all, so the comparison belongs to the caller, not either side.
+        assertBuzzChannelMatchesSubscriberRooms(
+          process.env["ACP_BUZZ_CHANNEL"]?.trim(),
+          buzzMentionSubscriber.rooms,
         );
       }
     }

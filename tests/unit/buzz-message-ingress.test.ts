@@ -8,6 +8,7 @@ import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure
 import { afterAll, describe, expect, it } from "vitest";
 
 import {
+  assertBuzzChannelMatchesSubscriberRooms,
   configuredBuzzMessageOwnerActors,
   startBuzzActorIngressListener,
   startBuzzMessageIngressListener,
@@ -1430,7 +1431,7 @@ describe("the daemon's Buzz message ingress", () => {
       join(buzzStateDir, BUZZ_SUBSCRIBER_CONFIG_FILENAME),
       JSON.stringify({
         relayUrl: "wss://relay.example.invalid/buzz",
-        identities: [{ privateKeyFile: keyFile, encoding: "hex" }],
+        identities: [{ privateKeyFile: keyFile, encoding: "hex", rooms: ["buzz-cto-room"] }],
       }),
     );
 
@@ -1610,7 +1611,7 @@ describe("the daemon's Buzz message ingress", () => {
       join(buzzStateDir, BUZZ_SUBSCRIBER_CONFIG_FILENAME),
       JSON.stringify({
         relayUrl: "wss://relay.example.invalid/buzz",
-        identities: [{ privateKeyFile: keyFile, encoding: "hex" }],
+        identities: [{ privateKeyFile: keyFile, encoding: "hex", rooms: ["buzz-cto-room"] }],
       }),
     );
 
@@ -1921,5 +1922,36 @@ describe("the daemon's Buzz message ingress", () => {
       ].map((wake) => ownerMessageQueuedSentence(wake)),
     );
     expect(distinct.size).toBe(4);
+  });
+});
+
+/**
+ * hscope: the daemon's own room (`ACP_BUZZ_CHANNEL`, the outbound adapter's binding) and the
+ * mention subscriber's configured rooms, cross-checked. A pure function so this is testable
+ * without a daemon subprocess — see its own doc comment in `src/daemon/agentcpd.ts` for why the
+ * comparison lives here rather than in the subscriber itself.
+ */
+describe("the daemon's answering room and its subscriber's rooms are cross-checked at startup", () => {
+  it("passes silently when ACP_BUZZ_CHANNEL is not set, whatever the subscriber's rooms are", () => {
+    expect(() => assertBuzzChannelMatchesSubscriberRooms(undefined, [])).not.toThrow();
+    expect(() => assertBuzzChannelMatchesSubscriberRooms(undefined, ["buzz-cto-room"])).not.toThrow();
+  });
+
+  it("passes silently when the subscriber is not configured, whatever ACP_BUZZ_CHANNEL is", () => {
+    expect(() => assertBuzzChannelMatchesSubscriberRooms("buzz-cto-room", [])).not.toThrow();
+  });
+
+  it("passes when ACP_BUZZ_CHANNEL is among the subscriber's configured rooms", () => {
+    expect(() =>
+      assertBuzzChannelMatchesSubscriberRooms("buzz-cto-room", ["buzz-cto-room", "buzz-other-room"]),
+    ).not.toThrow();
+  });
+
+  it("refuses, naming both values, when ACP_BUZZ_CHANNEL is not among the subscriber's rooms", () => {
+    expect(() =>
+      assertBuzzChannelMatchesSubscriberRooms("buzz-answering-room", ["buzz-other-room"]),
+    ).toThrow(
+      "ACP_BUZZ_CHANNEL (buzz-answering-room) is not among the Buzz mention subscriber's configured rooms (buzz-other-room); the daemon would answer in one room and listen in another",
+    );
   });
 });

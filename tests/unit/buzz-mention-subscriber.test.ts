@@ -155,11 +155,15 @@ const writeConfig = (stateDir: string, value: unknown): void => {
   );
 };
 
-const configFor = (identities: readonly { keyFile: string; encoding: string }[], relayUrl = RELAY) => ({
+const configFor = (
+  identities: readonly { keyFile: string; encoding: string; rooms?: readonly string[] }[],
+  relayUrl = RELAY,
+) => ({
   relayUrl,
   identities: identities.map((identity) => ({
     privateKeyFile: identity.keyFile,
     encoding: identity.encoding,
+    rooms: identity.rooms ?? [ROOM],
   })),
 });
 
@@ -759,7 +763,7 @@ describe("the buzz mention subscriber's native WebSocket adapter", () => {
           .map((raw) => JSON.parse(raw) as unknown[])
           .find((sent) => sent[0] === "REQ") as [string, string, Record<string, unknown>];
         expect(req[2]["since"]).toBeUndefined();
-        expect(Object.keys(req[2])).toEqual(["kinds", "#p"]);
+        expect(Object.keys(req[2])).toEqual(["kinds", "#p", "#h"]);
       } finally {
         handle.close();
       }
@@ -954,7 +958,7 @@ describe("the buzz mention subscriber's config authority", () => {
       what: "a relative key path",
       text: JSON.stringify({
         relayUrl: RELAY,
-        identities: [{ privateKeyFile: "keys/cto.key", encoding: "hex" }],
+        identities: [{ privateKeyFile: "keys/cto.key", encoding: "hex", rooms: [ROOM] }],
       }),
       matches: /absolute normalized path/u,
     },
@@ -962,7 +966,7 @@ describe("the buzz mention subscriber's config authority", () => {
       what: "a key path that has not been normalized",
       text: JSON.stringify({
         relayUrl: RELAY,
-        identities: [{ privateKeyFile: "/tmp/keys/../keys/cto.key", encoding: "hex" }],
+        identities: [{ privateKeyFile: "/tmp/keys/../keys/cto.key", encoding: "hex", rooms: [ROOM] }],
       }),
       matches: /absolute normalized path/u,
     },
@@ -970,7 +974,7 @@ describe("the buzz mention subscriber's config authority", () => {
       what: "an identity with no declared encoding",
       text: JSON.stringify({
         relayUrl: RELAY,
-        identities: [{ privateKeyFile: "/tmp/cto.key" }],
+        identities: [{ privateKeyFile: "/tmp/cto.key", rooms: [ROOM] }],
       }),
       matches: /missing required field\(s\): encoding/u,
     },
@@ -978,7 +982,7 @@ describe("the buzz mention subscriber's config authority", () => {
       what: "an encoding this build cannot read",
       text: JSON.stringify({
         relayUrl: RELAY,
-        identities: [{ privateKeyFile: "/tmp/cto.key", encoding: "base64" }],
+        identities: [{ privateKeyFile: "/tmp/cto.key", encoding: "base64", rooms: [ROOM] }],
       }),
       matches: /encoding must be one of/u,
     },
@@ -986,9 +990,51 @@ describe("the buzz mention subscriber's config authority", () => {
       what: "an unknown field on an identity",
       text: JSON.stringify({
         relayUrl: RELAY,
-        identities: [{ privateKeyFile: "/tmp/cto.key", encoding: "hex", role: "PRIMARY_CTO" }],
+        identities: [{ privateKeyFile: "/tmp/cto.key", encoding: "hex", rooms: [ROOM], role: "PRIMARY_CTO" }],
       }),
       matches: /unknown field\(s\): role/u,
+    },
+    {
+      what: "an identity with no declared rooms",
+      text: JSON.stringify({
+        relayUrl: RELAY,
+        identities: [{ privateKeyFile: "/tmp/cto.key", encoding: "hex" }],
+      }),
+      matches: /missing required field\(s\): rooms/u,
+    },
+    {
+      what: "an identity whose rooms is an empty array",
+      text: JSON.stringify({
+        relayUrl: RELAY,
+        identities: [{ privateKeyFile: "/tmp/cto.key", encoding: "hex", rooms: [] }],
+      }),
+      matches: /rooms must be a non-empty array/u,
+    },
+    {
+      what: "an identity whose rooms carries a duplicate",
+      text: JSON.stringify({
+        relayUrl: RELAY,
+        identities: [{ privateKeyFile: "/tmp/cto.key", encoding: "hex", rooms: [ROOM, ROOM] }],
+      }),
+      matches: /rooms carries a duplicate room/u,
+    },
+    {
+      what: "an identity whose room carries leading or trailing whitespace",
+      text: JSON.stringify({
+        relayUrl: RELAY,
+        identities: [{ privateKeyFile: "/tmp/cto.key", encoding: "hex", rooms: [` ${ROOM}`] }],
+      }),
+      matches: /rooms\[0\] must carry no leading or trailing whitespace/u,
+    },
+    {
+      what: "an identity whose rooms exceeds what the relay accepts per REQ",
+      text: JSON.stringify({
+        relayUrl: RELAY,
+        identities: [
+          { privateKeyFile: "/tmp/cto.key", encoding: "hex", rooms: Array.from({ length: 129 }, (_, i) => `room-${i}`) },
+        ],
+      }),
+      matches: /rooms carries 129 room\(s\), more than the relay accepts per REQ \(128\)/u,
     },
   ];
 
@@ -1307,7 +1353,7 @@ describe("the buzz mention subscriber's config authority", () => {
       parseBuzzSubscriberConfig(
         JSON.stringify({
           relayUrl: "wss://a.invalid",
-          identities: [{ privateKeyFile: "/tmp/cto.key", encoding: "hex" }],
+          identities: [{ privateKeyFile: "/tmp/cto.key", encoding: "hex", rooms: [ROOM] }],
         }),
       ).relayUrl,
     ).toBe("wss://a.invalid");
@@ -1329,7 +1375,7 @@ describe("the buzz mention subscriber's relay protocol", () => {
     }
   });
 
-  it("answers the NIP-42 challenge with a signed auth event, then asks for exactly kind 9 addressed to itself", async () => {
+  it("answers the NIP-42 challenge with a signed auth event, then asks for kind 9 addressed to itself in its configured rooms", async () => {
     const { sockets, handle, identity } = startOne({});
     try {
       const socket = live(sockets);
@@ -1347,9 +1393,18 @@ describe("the buzz mention subscriber's relay protocol", () => {
       await handle.settled();
       const req = sentFrames(socket)[1] as [string, string, Record<string, unknown>];
       expect(req[0]).toBe("REQ");
-      expect(req[2]).toEqual({ kinds: [BUZZ_MENTION_KIND], "#p": [identity.pubkey] });
+      // The property, not a frame-shape literal: kind, recipient, *and room*. `#h` is not
+      // decoration — every kind-9 is channel-scoped on the relay, and a filter with no `#h`
+      // registers there as a global-scope subscription that live fan-out never delivers a
+      // channel-scoped event to (measured on production; see the #674/hscope investigation). A
+      // filter missing this tag can complete NIP-42, reach EOSE and read a full backlog while
+      // never receiving a single live mention — which is exactly the defect this row exists to
+      // catch, and exactly what the two lines this replaces used to pin as correct.
+      expect(req[2]["kinds"]).toEqual([BUZZ_MENTION_KIND]);
+      expect(req[2]["#p"]).toEqual([identity.pubkey]);
+      expect(req[2]["#h"]).toEqual([ROOM]);
       // No `since` on a first connection: there is no durable cursor to read one from.
-      expect(Object.keys(req[2])).toEqual(["kinds", "#p"]);
+      expect(Object.keys(req[2])).toEqual(["kinds", "#p", "#h"]);
     } finally {
       handle.close();
     }
