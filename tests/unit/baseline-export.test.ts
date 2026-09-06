@@ -965,6 +965,7 @@ describe("baseline boundary contracts", () => {
       "v34-persist-hermes-target-bind-receipt-evidence",
       "v35-keep-the-admitted-payload-with-its-inbound-row",
       "v36-backfill-ingress-receipt-identities-before-freezing-claims",
+      "v37-seed-claude-cli-executor-kind",
     ]);
   });
 
