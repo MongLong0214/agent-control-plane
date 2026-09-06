@@ -29,6 +29,35 @@
  * being left and the one being moved to. Applying is the opposite: it must execute the sealed
  * closure, because running pair A's database under generation B's runtime is the defect this
  * whole mechanism exists to prevent.
+ *
+ * ## A pair is bound to an installation, not to a machine — and that is a guarantee
+ *
+ * Nothing in a sealed pair names the host that produced it, and nothing checks one. Every binding
+ * the pair carries is `$HOME`-derived: the database target, the install root, the plist and
+ * launcher destinations and the working directory are all canonical path strings under the
+ * producing user's home, and `validateRollbackPair` compares each of them to the deployment it is
+ * being applied to as a string. So a pair sealed on host A validates and applies on host B for the
+ * same user at the same paths. That is deliberate and is the case this mechanism exists for:
+ * putting a generation back onto a rebuilt machine is disaster recovery, and a host binding would
+ * refuse exactly the rollback that matters most. It adds no exposure either — a pair is only
+ * reachable by naming a path under the user's home, and whoever can plant one there already has
+ * the home directory.
+ *
+ * The database target is therefore compared by canonical path alone, with the device and inode
+ * `src/db/backup.ts`'s `assertRollbackPointAt` insists on deliberately dropped. The two are
+ * answering different questions and do not contradict each other:
+ *
+ *   - `assertRollbackPointAt` runs at migration-approval time, against a database that is still
+ *     the same open file it was when the recovery point was taken moments earlier. Its question is
+ *     *"is this an image of this exact file"*, and #747's answer is dev+ino, because a second
+ *     database that merely occupies the same pathname would otherwise pass.
+ *   - A rollback pair is used at rollback time, and a restore **replaces the inode**. The dev and
+ *     ino the pair saw when it was sealed are legitimately gone by the time it is applied, so
+ *     requiring them would refuse every real rollback — including the second rollback onto a
+ *     database the first one restored. The pair's question is *"which installation is this pair
+ *     for"*, and a canonical path answers it. What the pair does not weaken is the bytes: the
+ *     sealed image, its index and the digest retained outside are a stronger statement about
+ *     content than dev/ino ever was.
  */
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -1305,6 +1334,24 @@ export interface StagedRollbackPair {
   stateAdminPath: string;
 }
 
+export interface StageOptions {
+  /**
+   * Test-only seam, fired immediately before each member is copied into the stage.
+   *
+   * The window this exists to measure cannot be reached from outside: it opens when
+   * `validateRollbackPair` returns and closes when `copyPrivateFile` reads the member again, both
+   * inside this one synchronous call. Without a way to act inside it, the re-verification of every
+   * staged copy below would be code nothing can fail — which is exactly what
+   * `scripts/verify-guards-are-falsifiable.mjs` recorded about it.
+   *
+   * It is reachable only by naming `stageRollbackPair` itself. `rollbackToSealedPair` is the
+   * entrypoint every production caller uses — including this module's own CLI — and it takes
+   * `ApplyOptions`, which has no such field, and calls `stageRollbackPair` with three arguments.
+   * So no production path can open this window, whatever it is handed.
+   */
+  onMember?: (member: RollbackPairMember) => void;
+}
+
 /**
  * Validates a pair and then takes its own copy of every member.
  *
@@ -1317,6 +1364,7 @@ export const stageRollbackPair = (
   pairRoot: string,
   expectation: RollbackPairExpectation,
   stageParent: string,
+  options: StageOptions = {},
 ): StagedRollbackPair => {
   assertAbsolute(stageParent, "the stage parent");
   const validated = validateRollbackPair(pairRoot, expectation);
@@ -1335,6 +1383,7 @@ export const stageRollbackPair = (
       chmodSync(join(pairMembers, directory.path), directory.mode);
     }
     for (const member of validated.manifest.inventory) {
+      options.onMember?.(member);
       copyPrivateFile(join(validated.root, member.path), join(pairMembers, member.path));
     }
     // Re-verified as copies. Hashing the source again would prove nothing about what was copied.
@@ -1354,6 +1403,20 @@ export const stageRollbackPair = (
           member: member.path,
           expected: member.sha256,
           actual,
+        });
+      }
+      // The other half of the same sentence validation says: a digest says what the bytes are, it
+      // says nothing about whether they can run. `copyMemberFile` chmods the copy to the *source's
+      // current* mode and refuses only group- or world-writable, so a drift to 0600 inside the
+      // window above is carried faithfully into the stage and on into the install — an executable
+      // that arrives inert, with every digest, size and index agreeing that nothing happened.
+      const stagedMode = stat.mode & 0o7777;
+      if (stagedMode !== member.mode) {
+        throw acpError(ReasonCode.INTERNAL_ERROR, "a staged rollback member is not at the mode its inventory records", {
+          stageRoot,
+          member: member.path,
+          declared: member.mode.toString(8),
+          actual: stagedMode.toString(8),
         });
       }
     }
