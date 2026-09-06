@@ -160,14 +160,68 @@ launch_agents_directory() {
 resolve_app_root() {
   [[ -d "$app_root" ]] || fail "app root does not exist: $app_root"
   app_root="$(cd -P -- "$app_root" && pwd)"
+  # Both checks run on the canonical path, and before anything is installed, stopped or written.
+  # Canonical is the operative word: an input with neither property can resolve to a path with
+  # one, so a check on what the caller typed would pass while the deployment still breaks.
+  #
+  # Neither message repeats the path back. A refusal is written to an operator's terminal, a log
+  # and often an issue, and the app root is the caller's private filesystem layout; the condition
+  # is what the reader needs, and they already know what they supplied.
+  #
+  # ':' — the launcher exports this app root's runtime interpreter directory as a POSIX PATH
+  # entry, and ':' is the entry separator: such a path splits into two entries that name nothing,
+  # the interpreter becomes unreachable, and a provider CLI whose shebang resolves its interpreter
+  # by name then finds an ambient one or none. A PATH entry cannot represent the path at all.
+  [[ "$app_root" != *:* ]] || fail "app root path cannot contain ':' after canonicalisation, because the launcher exports its runtime interpreter directory as a POSIX PATH entry and ':' separates entries; install from a path without ':'"
+  # '/' — every path this installer derives is "$app_root/..." , which at the filesystem root
+  # yields a leading '//', whose meaning POSIX leaves to the implementation. The sealed rollback
+  # binding canonicalises the same location to a single leading '/', so the two disagree about one
+  # install. Refusing is the narrow answer: making every derived path root-safe would mean
+  # changing how the binding builds paths too, which is a different module and a wider change than
+  # the deployment shape it would buy.
+  [[ "$app_root" != "/" ]] || fail "app root cannot be the filesystem root after canonicalisation, because every path derived from it would carry a leading '//' that the sealed rollback binding canonicalises differently; install into a directory"
   [[ -f "$app_root/dist/daemon/agentcpd.js" ]] || fail "build missing: $app_root/dist/daemon/agentcpd.js"
   [[ -f "$app_root/dist/db/state-admin.js" ]] || fail "state maintenance build missing: $app_root/dist/db/state-admin.js"
   [[ -f "$app_root/deploy/render-launchd-plist.mjs" ]] || fail "plist renderer missing from app root"
 }
 
+# Resolve a path to the real file it finally names: every symlink followed, every directory
+# component canonical. What is pinned has to be the target itself, not a name for it — a pin that
+# records a symlink keeps looking correct after the link is repointed, and the daemon then runs a
+# different provider binary than the one this install accepted. macOS has no `readlink -f`, so the
+# chain is walked here, bounded, and the answer is required to be an absolute regular executable.
+canonical_executable() {
+  local candidate="$1" hops=0 target directory base
+  [[ -n "$candidate" ]] || return 1
+  while [[ -L "$candidate" ]]; do
+    hops=$((hops + 1))
+    [[ "$hops" -le 40 ]] || return 1
+    # A link can stop being readable between the predicate above and this call, and the utility
+    # reports that by printing the path it was given. That line would cross the installer boundary
+    # on its own, ahead of the generic refusal below, which cannot retract it — and a refusal
+    # reaches a terminal, a log and often an issue. The failure is taken silently instead: the
+    # caller learns the path did not resolve, not what the path was.
+    target="$(readlink -- "$candidate" 2>/dev/null)" || return 1
+    if [[ "$target" == /* ]]; then
+      candidate="$target"
+    else
+      candidate="$(dirname -- "$candidate")/$target"
+    fi
+  done
+  directory="$(cd -P -- "$(dirname -- "$candidate")" 2>/dev/null && pwd)" || return 1
+  base="$(basename -- "$candidate")"
+  candidate="${directory%/}/$base"
+  [[ "$candidate" == /* && -f "$candidate" && -x "$candidate" ]] || return 1
+  printf '%s' "$candidate"
+}
+
 resolve_node() {
   if [[ -z "$node_path" ]]; then node_path="$(command -v node || true)"; fi
   [[ "$node_path" = /* && -x "$node_path" ]] || fail "provide an executable absolute Node path with --node"
+  # Canonical before it is copied into the runtime closure, so the generation carries the
+  # interpreter itself rather than whatever a link happens to point at when the copy is taken.
+  node_path="$(canonical_executable "$node_path")" ||
+    fail "the Node path does not resolve to an absolute regular executable"
 }
 
 # A sealed pair's own guarantee is that its bytes plus the interpreter it names is the whole
@@ -239,9 +293,51 @@ resolve_buzz_binary() {
   printf '%s' "$found"
 }
 
+# `resolveExecutable` (src/runtime/cli-adapters.ts) searches the daemon's PATH for the bare names
+# `claude`, `codex` and `grok`. The launcher pins that PATH to a fixed set of directories, so a
+# CLI installed anywhere else is unreachable to the daemon while remaining reachable from the
+# shell that installs it. An unresolvable CLI returns as a bare name, nothing spawns, and the
+# capacity parser has no representation for "the CLI was not there" — it reports the empty stream
+# as no quota. Resolving here, while the installing shell's PATH is visible, is what makes the
+# path available to a daemon that cannot search for it.
+#
+# Only an absolute answer is baked. The daemon runs from a working directory the installing shell
+# does not share, and `resolveExecutable` returns an absolute-looking path unchanged rather than
+# searching, so a relative pin turns a PATH miss into a failure to stat one layer further in.
+resolve_cli_binary() {
+  local name="$1" found=""
+  found="$(command -v "$name" 2>/dev/null || true)"
+  [[ -n "$found" && "$found" == /* ]] || return 0
+  # The canonical target, not the name the shell answered with. A pin that records a symlink still
+  # reads as correct after the link is repointed, and the daemon then runs a different binary than
+  # the one this install resolved and accepted.
+  found="$(canonical_executable "$found")" || return 0
+  printf '%s' "$found"
+}
+
 write_launcher() {
   local temporary="$state_dir/.agentcpd-launch.$$.tmp"
   umask 077
+  # Resolved before the launcher is opened for writing, because stdout inside the block below is
+  # the launcher file and an unresolvable CLI has to reach the operator's terminal instead.
+  #
+  # A CLI that cannot be resolved does not fail the install: `grok` is optional, and a host
+  # without it must still be able to deploy. It is named on stderr instead, because a provider
+  # whose CLI is absent reports no quota rather than an error, which is indistinguishable from a
+  # provider that is simply out of quota unless the install says so.
+  local spec cli pin_variable resolved_cli
+  local cli_pins=()
+  for spec in claude:ACP_RESOLVED_CLAUDE_BINARY codex:ACP_RESOLVED_CODEX_BINARY grok:ACP_RESOLVED_GROK_BINARY; do
+    cli="${spec%%:*}"
+    pin_variable="${spec##*:}"
+    resolved_cli="$(resolve_cli_binary "$cli")"
+    if [[ -z "$resolved_cli" ]]; then
+      printf 'agentcpd installer: could not resolve the %s CLI from this PATH. Nothing is pinned for it, and the %s capacity probe will report no quota rather than an error.\n' \
+        "$cli" "$cli" >&2
+      continue
+    fi
+    cli_pins[${#cli_pins[@]}]="$pin_variable=$resolved_cli"
+  done
   {
     printf '#!/bin/bash\nset -euo pipefail\n'
     printf 'ACP_NODE_PATH=%q\n' "$node_path"
@@ -256,10 +352,25 @@ write_launcher() {
     if [[ -n "$resolved_buzz" ]]; then
       printf 'ACP_RESOLVED_BUZZ_BINARY=%q\n' "$resolved_buzz"
     fi
+    local pin
+    if [[ ${#cli_pins[@]} -gt 0 ]]; then
+      for pin in "${cli_pins[@]}"; do
+        printf '%s=%q\n' "${pin%%=*}" "${pin#*=}"
+      done
+    fi
     printf 'ACP_HOME=%q\n' "$home_dir"
     cat <<'EOF'
 export HOME="$ACP_HOME"
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+# The daemon's PATH is this deployment's own runtime interpreter directory followed by the fixed
+# system directories, and nothing else. A provider CLI is reached by the absolute pin below, never
+# by placing its directory here: a provider's directory holds unrelated executables, and putting
+# it on the daemon's PATH would make every one of them resolvable to a control plane that grants
+# authority by name.
+#
+# The interpreter directory comes first so that a CLI whose shebang resolves its interpreter
+# through the environment receives the interpreter this generation carries, rather than whichever
+# one a system directory happens to hold.
+export PATH="${ACP_NODE_PATH%/*}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 
 required_keychain_value() {
   local account="$1" value=""
@@ -354,6 +465,19 @@ export ACP_CODEX_REVIEWER_HOME="${ACP_CODEX_REVIEWER_HOME:-$ACP_REVIEWER_ROOT/co
 # exists to prevent, reintroduced by a later line.
 if [[ -z "${ACP_BUZZ_BINARY:-}" && -n "${ACP_RESOLVED_BUZZ_BINARY:-}" ]]; then
   export ACP_BUZZ_BINARY="$ACP_RESOLVED_BUZZ_BINARY"
+fi
+
+# The provider CLIs resolved at install time, for the reason recorded above the Buzz block. An
+# operator-supplied value wins; otherwise the daemon is given the path the installer found, which
+# is the only channel by which a CLI outside the fixed PATH is reachable at all.
+if [[ -z "${ACP_CLAUDE_BINARY:-}" && -n "${ACP_RESOLVED_CLAUDE_BINARY:-}" ]]; then
+  export ACP_CLAUDE_BINARY="$ACP_RESOLVED_CLAUDE_BINARY"
+fi
+if [[ -z "${ACP_CODEX_BINARY:-}" && -n "${ACP_RESOLVED_CODEX_BINARY:-}" ]]; then
+  export ACP_CODEX_BINARY="$ACP_RESOLVED_CODEX_BINARY"
+fi
+if [[ -z "${ACP_GROK_BINARY:-}" && -n "${ACP_RESOLVED_GROK_BINARY:-}" ]]; then
+  export ACP_GROK_BINARY="$ACP_RESOLVED_GROK_BINARY"
 fi
 
 exec "$ACP_NODE_PATH" "$ACP_APP_ROOT/dist/daemon/agentcpd.js"

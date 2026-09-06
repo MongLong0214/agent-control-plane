@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { chmodSync, linkSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, linkSync, mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { ManualClock } from "../../src/core/clock.ts";
@@ -9,6 +9,7 @@ import {
   ClaudeCliAdapter,
   CodexCliAdapter,
   GrokCliAdapter,
+  __testing,
 } from "../../src/runtime/cli-adapters.ts";
 import {
   CLAUDE_NON_INTERACTIVE_ARGS,
@@ -1547,6 +1548,167 @@ setInterval(() => {}, 1_000);
     }
     // Deleting Grok from the composition root turns this into a two-provider registry;
     // merely defining a collector elsewhere is not enough to satisfy P0-11.
+  });
+
+  /**
+   * The composition root is the subject of these rows (#785).
+   *
+   * `resolveExecutable` has an absolute-path branch and the launcher exports absolute paths, but
+   * an adapter option that no composition root passes is inert however well either end is tested.
+   * These drive `new ControlPlane` rather than a directly constructed adapter, and observe the
+   * file the adapter hands to its spawn, because that is the only place the joined chain shows.
+   */
+  const providerPinFixtures = (label: string) => {
+    const root = tempDir(label);
+    const binDirectory = join(root, "pinned");
+    mkdirSync(binDirectory, { recursive: true });
+    const pins: Record<string, string> = {};
+    for (const name of ["claude", "codex", "grok"]) {
+      const path = join(binDirectory, name);
+      writeFileSync(path, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      chmodSync(path, 0o755);
+      pins[name] = path;
+    }
+    // On no PATH anywhere in this process, so a pin is the only way these are reachable. Without
+    // this the row could pass through a PATH search and say nothing about the pin.
+    expect(process.env["PATH"] ?? "").not.toContain(binDirectory);
+    return { root, pins };
+  };
+
+  const withPinnedEnvironment = async (
+    pins: Record<string, string | undefined>,
+    body: (spawned: string[]) => Promise<void>,
+  ): Promise<void> => {
+    const variables = { claude: "ACP_CLAUDE_BINARY", codex: "ACP_CODEX_BINARY", grok: "ACP_GROK_BINARY" };
+    const before: Record<string, string | undefined> = {};
+    for (const [name, variable] of Object.entries(variables)) {
+      before[variable] = process.env[variable];
+      const value = pins[name];
+      if (value === undefined) delete process.env[variable];
+      else process.env[variable] = value;
+    }
+    const spawned: string[] = [];
+    __testing.setRunCli(async (file: string) => {
+      spawned.push(file);
+      return { stdout: "", stderr: "", exitCode: 0, timedOut: false, isolationEnforced: false };
+    });
+    try {
+      await body(spawned);
+    } finally {
+      __testing.setRunCli(null);
+      for (const [variable, value] of Object.entries(before)) {
+        if (value === undefined) delete process.env[variable];
+        else process.env[variable] = value;
+      }
+    }
+  };
+
+  const controlPlaneAt = (root: string, adapterOptions?: ConstructorParameters<typeof ControlPlane>[0]["adapterOptions"]) =>
+    new ControlPlane({
+      databasePath: join(root, "state.sqlite"),
+      worktreeRoot: join(root, "worktrees"),
+      capacityDir: join(root, "capacity"),
+      secretsDir: join(root, "secrets"),
+      clock: clock(),
+      ...(adapterOptions ? { adapterOptions } : {}),
+    });
+
+  const probeAll = async (cp: ControlPlane): Promise<void> => {
+    for (const provider of ["claude", "gpt", "grok"]) await cp.providers.require(provider).probeRuntime();
+  };
+
+  it("#785 spawns each provider CLI at the absolute path the launcher pinned, not a bare name", async () => {
+    const { root, pins } = providerPinFixtures("acp-785-provider-pins-");
+    await withPinnedEnvironment(pins, async (spawned) => {
+      const cp = controlPlaneAt(root);
+      try {
+        await probeAll(cp);
+        // `resolveExecutable` realpaths an absolute binary, so the expectation resolves the same
+        // way rather than comparing the raw path.
+        expect(spawned).toEqual([
+          realpathSync(pins["claude"] as string),
+          realpathSync(pins["codex"] as string),
+          realpathSync(pins["grok"] as string),
+        ]);
+        // Never a bare name: that is the state the pins exist to end.
+        for (const file of spawned) expect(file.startsWith("/")).toBe(true);
+      } finally {
+        cp.close();
+      }
+    });
+  });
+
+  it("#785 lets a configured adapter override win over the environment pin", async () => {
+    const { root, pins } = providerPinFixtures("acp-785-provider-override-");
+    const configured = join(root, "pinned", "configured-claude");
+    writeFileSync(configured, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    chmodSync(configured, 0o755);
+    await withPinnedEnvironment(pins, async (spawned) => {
+      // The deployment's configuration is the base and an override replaces only the keys it
+      // names. A caller that states a binary must not have it silently replaced by the host's.
+      const cp = controlPlaneAt(root, { claude: { binary: configured } });
+      try {
+        await probeAll(cp);
+        expect(spawned[0], "the environment pin overrode an explicit configuration").toBe(
+          realpathSync(configured),
+        );
+        // And only the key it named: the other two still come from the environment.
+        expect(spawned[1]).toBe(realpathSync(pins["codex"] as string));
+        expect(spawned[2]).toBe(realpathSync(pins["grok"] as string));
+      } finally {
+        cp.close();
+      }
+    });
+  });
+
+  it("#785 falls back to the PATH search when no pin is exported", async () => {
+    const root = tempDir("acp-785-provider-no-pins-");
+    // A deployment with no pins behaves as it does without them: `undefined` reaches
+    // `options.binary ?? "claude"` and the bare name is searched. Both outcomes of that search are
+    // asserted exactly. "Some absolute path" would be satisfied by whatever this host happens to
+    // have installed and would say nothing about the fallback.
+    const searchable = join(root, "searchable");
+    mkdirSync(searchable, { recursive: true });
+    const onPath: Record<string, string> = {};
+    for (const name of ["claude", "codex", "grok"]) {
+      const path = join(searchable, name);
+      writeFileSync(path, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      chmodSync(path, 0o755);
+      onPath[name] = realpathSync(path);
+    }
+    const emptyPath = join(root, "empty");
+    mkdirSync(emptyPath, { recursive: true });
+
+    const beforePath = process.env["PATH"];
+    try {
+      // Found on PATH: the exact executable that directory holds, and nothing else.
+      process.env["PATH"] = searchable;
+      await withPinnedEnvironment({}, async (spawned) => {
+        const cp = controlPlaneAt(root);
+        try {
+          await probeAll(cp);
+          expect(spawned).toEqual([onPath["claude"], onPath["codex"], onPath["grok"]]);
+        } finally {
+          cp.close();
+        }
+      });
+
+      // Not found on PATH: the exact bare names, which is what resolveExecutable returns when the
+      // search fails. This is the state the pins exist to replace, asserted rather than described.
+      process.env["PATH"] = emptyPath;
+      await withPinnedEnvironment({}, async (spawned) => {
+        const cp = controlPlaneAt(join(root, "second"));
+        try {
+          await probeAll(cp);
+          expect(spawned).toEqual(["claude", "codex", "grok"]);
+        } finally {
+          cp.close();
+        }
+      });
+    } finally {
+      if (beforePath === undefined) delete process.env["PATH"];
+      else process.env["PATH"] = beforePath;
+    }
   });
 });
 
