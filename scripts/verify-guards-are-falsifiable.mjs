@@ -4440,6 +4440,61 @@ const GUARDS = [
       "tests/unit/daemon-doctor-freshness.test.ts::a re-evaluation that fails yields STALE immediately",
     ],
   },
+  {
+    // #774 B1/H3. Before B1, `install-launchd.sh` bound the launcher to whatever `command -v node`
+    // resolved on the installing host — outside the closure a seal actually copies — so this check
+    // always fired against a real installer's own output and no unit anchored it. Neutering it lets
+    // a sealed pair claim a generation that runs under an interpreter it never carries: "these
+    // bytes under whatever node is around later", the exact defect this module exists to end.
+    what: "#774 H3: a sealed launcher not bound to the Node executable this pair installs is refused",
+    file: "src/deploy/rollback-pair.ts",
+    find: "  if (launcher.nodePath !== installedNode) {\n",
+    replace: "  if (false && launcher.nodePath !== installedNode) {\n",
+    killedBy: [
+      "tests/unit/rollback-pair.test.ts::refuses a sealed launcher not bound to the runtime the pair carries",
+    ],
+  },
+  {
+    // A pair's index is retained OUTSIDE it precisely so it cannot vouch for itself — a forger who
+    // rewrites a member and its index line still cannot forge the digest the approver kept apart.
+    // An index that were allowed to list its own file would let that outside digest verify nothing
+    // about the file it is supposed to be independent of.
+    what: "#774 H3: a sealed pair's index cannot cover itself",
+    file: "src/deploy/rollback-pair.ts",
+    find:
+      '  if (uniqueEntryPaths.has(ROLLBACK_PAIR_INDEX_FILE)) {\n' +
+      '    throw acpError(ReasonCode.INTERNAL_ERROR, "the sealed pair index cannot cover itself", { root });\n' +
+      "  }\n",
+    replace: "",
+    killedBy: ["tests/unit/rollback-pair.test.ts::keeps the index self-excluding and refuses one that covers itself"],
+  },
+  {
+    // "Exit zero is a claim, not a result." The sealed state-admin runs under the sealed
+    // interpreter as a subprocess `applyRollbackPair` cannot see inside — a `restore` that returns
+    // 0 without touching the destination (a bug in that binary, or one substituted at seal time)
+    // would otherwise report a rollback that never happened. This is the one guard standing
+    // between an exit code and the byte-for-byte claim a rollback makes.
+    what: "#774 H3: exit zero from the sealed restore is verified against the staged image, not trusted",
+    file: "src/deploy/rollback-pair.ts",
+    find: "      if (restoredDigest !== stagedDigest) {\n",
+    replace: "      if (false && restoredDigest !== stagedDigest) {\n",
+    killedBy: [
+      "tests/process/rollback-pair-wal.test.ts::H3 anchor: refuses a restore that exits zero without installing the sealed database image",
+    ],
+  },
+  // #774 H3 also named the member re-hash at stage time (src/deploy/rollback-pair.ts:1352,
+  // "a rollback member changed between validation and staging") as a fourth anchor. Investigated
+  // and deliberately left out rather than forced in: that check guards a TOCTOU window on the
+  // *source* pair between `validateRollbackPair`'s hash of a member and `copyPrivateFile`'s later
+  // read of the same path, both inside one synchronous `stageRollbackPair` call. No black-box
+  // mutation of the fixtures in tests/unit/rollback-pair.test.ts or
+  // tests/process/rollback-pair-wal.test.ts reaches that window — every existing "swap a member"
+  // row (correctly) mutates either before validation starts or after `stageRollbackPair` has
+  // already returned, and manifest/index cross-checks (src/deploy/rollback-pair.ts:1094) mean the
+  // two records can never be made to disagree going in, so a race actually mid-call is the only
+  // way to trigger it. Confirmed empirically: neutering the check left every test in both files
+  // green. A real anchor here needs a seam this module does not have yet (an injection point around
+  // the copy loop, or a threaded test), which is a follow-up, not a row.
 ];
 
 /**

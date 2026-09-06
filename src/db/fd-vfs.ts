@@ -1,4 +1,4 @@
-import { closeSync, openSync } from "node:fs";
+import { closeSync, existsSync, openSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -38,17 +38,43 @@ export interface FdVfsStats {
   refusal: string;
 }
 
-/** The built extension. Never compiled here: ADR-0010 keeps compilation at install time. */
-const EXTENSION_PATH = join(
-  dirname(fileURLToPath(import.meta.url)),
+/**
+ * The built extension. Never compiled here: ADR-0010 keeps compilation at install time.
+ *
+ * A sealed rollback pair's closure is `dist/.` plus `node_modules` plus the interpreter (see
+ * `src/deploy/rollback-pair.ts`) — nothing outside `dist` travels with it. A path resolved two
+ * directories above this module's own directory reaches the checkout root's `native/`, a sibling
+ * of `dist` that a rollback never touches: after a rollback installs generation A's `dist`, that
+ * sibling is still whatever generation B left there, and the process loads the wrong extension
+ * without either generation's bytes being wrong on their own.
+ *
+ * So the in-tree candidate — one directory up, inside whichever root this module is actually
+ * running from — is tried first: `npm run build` copies the built extension into `dist/native/...`
+ * (see `scripts/copy-native-fd-vfs-into-dist.mjs`), so a compiled, installed, or sealed-and-restored
+ * `dist` always carries its own copy and this candidate always resolves for it. The sibling
+ * candidate two directories up exists only so this module keeps working when a test imports the
+ * `.ts` source directly (`src/db/fd-vfs.ts`) rather than the compiled `dist/db/fd-vfs.js` — there is
+ * no `src/native/`, and there never should be one, so that case falls through to the checkout's own
+ * `native/`, built once at `pnpm install` time. Neither candidate is a guess: whichever is chosen is
+ * chosen because it is the one that exists on disk, and `loadExtension` fails loudly on whichever
+ * path this resolves to if neither does.
+ */
+const EXTENSION_FILENAME = process.platform === "darwin" ? "acp_fd_vfs.dylib" : "acp_fd_vfs.so";
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
+const IN_TREE_EXTENSION_PATH = join(MODULE_DIR, "..", "native", "fd-vfs", "build", "Release", EXTENSION_FILENAME);
+const CHECKOUT_SIBLING_EXTENSION_PATH = join(
+  MODULE_DIR,
   "..",
   "..",
   "native",
   "fd-vfs",
   "build",
   "Release",
-  process.platform === "darwin" ? "acp_fd_vfs.dylib" : "acp_fd_vfs.so",
+  EXTENSION_FILENAME,
 );
+const EXTENSION_PATH = existsSync(IN_TREE_EXTENSION_PATH)
+  ? IN_TREE_EXTENSION_PATH
+  : CHECKOUT_SIBLING_EXTENSION_PATH;
 
 const parseStats = (line: string): FdVfsStats => {
   const field = (name: string): string => new RegExp(`${name}=([^ ]*)`).exec(line)?.[1] ?? "";

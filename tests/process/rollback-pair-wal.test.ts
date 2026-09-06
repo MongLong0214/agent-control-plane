@@ -13,11 +13,12 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import Database from "better-sqlite3";
 import { afterAll, describe, expect, it } from "vitest";
 
+import { isAcpError } from "../../src/core/errors.ts";
 import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
 import {
   applyRollbackPair,
@@ -505,9 +506,12 @@ describe("a rollback installs one whole generation", () => {
     const sealedNode = inventory.get("runtime/bin/node");
     expect(sealedNode, "the pair does not carry a Node executable").toBeDefined();
     expect(sealedNode!.mode & 0o111, "the sealed interpreter lost its execute bit").not.toBe(0);
+    // Specifically `acp_fd_vfs.{dylib,so}` — better-sqlite3's own bundled `.node` addon is also in
+    // this inventory and would satisfy a bare `.node`/generic-addon check without proving anything
+    // about the extension `src/db/fd-vfs.ts` itself loads, which is the one B2 was about.
     expect(
-      [...inventory.keys()].some((path) => path.endsWith(".node")),
-      "the pair does not carry the native addon its runtime loads",
+      [...inventory.keys()].some((path) => path.endsWith("acp_fd_vfs.dylib") || path.endsWith("acp_fd_vfs.so")),
+      "the pair does not carry the acp_fd_vfs extension its runtime loads",
     ).toBe(true);
 
     // Generation B is live, and the database has moved on.
@@ -711,6 +715,107 @@ describe("a rollback installs one whole generation", () => {
         ).toBe(true);
       }
     }
+  });
+
+  it("H1: preserves the original error and the recovery copy when compensation itself fails", async () => {
+    const fixture = makeGenerationFixture("acp-rollback-compensate-fail-");
+    new Db(fixture.databasePath).close();
+    probeDatabase(fixture.databasePath, "generation-a");
+    const sealed = await sealRollbackPair(
+      fixture.pairsRoot,
+      fixture.sourcesFor("generation-a", runtimeClosureFor(fixture.root, "generation-a")),
+    );
+    probeDatabase(fixture.databasePath, "generation-b");
+
+    cpSync(runtimeClosureFor(fixture.root, "generation-b"), fixture.installRoot, {
+      recursive: true,
+      force: true,
+    });
+    writeFileSync(fixture.plistDestination, "<!-- generation-b plist -->\n", { mode: 0o600 });
+    writeFileSync(fixture.launcherDestination, "#!/bin/bash\n# generation-b\n", { mode: 0o700 });
+
+    const stageParent = join(fixture.root, "stage-compensate-fail");
+    const staged = stageRollbackPair(
+      sealed.root,
+      fixture.expectation(sealed.pairId, sealed.indexDigest),
+      stageParent,
+    );
+
+    let caught: unknown;
+    try {
+      applyRollbackPair(staged, { failAfter: "compensate" });
+      throw new Error("applyRollbackPair did not throw with failAfter: compensate");
+    } catch (error) {
+      caught = error;
+    }
+
+    // The original failure is still legible, not swallowed behind a generic "compensation also
+    // failed" message — this is the "does not replace the original error" half of H1.
+    expect(isAcpError(caught), "the thrown value is not a structured AcpError").toBe(true);
+    if (!isAcpError(caught)) throw caught;
+    expect(caught.message).toMatch(/injected failure after runtime/);
+    expect(caught.evidence["compensationFailed"]).toBe(true);
+    expect(caught.evidence["compensationError"]).toMatchObject({
+      message: expect.stringContaining("injected failure inside compensate"),
+    });
+    const recoveryRoot = caught.evidence["recoveryRoot"];
+    expect(typeof recoveryRoot).toBe("string");
+
+    // The "no copy of the previous generation survives anywhere" half of H1. `compensate()`
+    // recovers whatever was live and about to be replaced — generation-b here, installed into
+    // `fixture.installRoot` right above — so that is what the recovery copy must contain, and it
+    // must outlive both cleanups that used to (or still could) delete it wholesale.
+    expect(existsSync(recoveryRoot as string), "the recovery copy does not exist on disk").toBe(true);
+    expect(readFileSync(join(recoveryRoot as string, "runtime", GENERATION_MARKER), "utf8")).toContain(
+      "generation-b",
+    );
+
+    // `rollbackToSealedPair`'s own `finally` removes exactly `staged.stageRoot` on any outcome.
+    rmSync(staged.stageRoot, { recursive: true, force: true });
+    expect(
+      existsSync(recoveryRoot as string),
+      "the recovery copy was removed by the stage's own cleanup",
+    ).toBe(true);
+
+    // `install-launchd.sh`'s rollback branch removes its whole `--stage-parent` wholesale on
+    // failure (`rm -rf "$state_dir/rollback-stage"`). `stageParent` here plays that role.
+    rmSync(stageParent, { recursive: true, force: true });
+    expect(
+      existsSync(recoveryRoot as string),
+      "the recovery copy was removed by the stage-parent's own cleanup",
+    ).toBe(true);
+  });
+
+  it("H3 anchor: refuses a restore that exits zero without installing the sealed database image", async () => {
+    const fixture = makeGenerationFixture("acp-rollback-lying-restore-");
+    new Db(fixture.databasePath).close();
+    probeDatabase(fixture.databasePath, "generation-a");
+
+    // A state-admin that claims success and does nothing: the sealed pair is internally
+    // consistent (this is what was actually sealed, so every digest agrees with itself) but the
+    // interpreter it names never touches the restore destination. "Exit zero is a claim, not a
+    // result" (src/deploy/rollback-pair.ts) is the line this exercises.
+    const closure = runtimeClosureFor(fixture.root, "generation-a");
+    writeFileSync(join(closure, "db", "state-admin.js"), "process.exit(0);\n");
+
+    const sealed = await sealRollbackPair(fixture.pairsRoot, fixture.sourcesFor("generation-a", closure));
+    probeDatabase(fixture.databasePath, "generation-b");
+
+    cpSync(runtimeClosureFor(fixture.root, "generation-b"), fixture.installRoot, {
+      recursive: true,
+      force: true,
+    });
+    writeFileSync(fixture.plistDestination, "<!-- generation-b plist -->\n", { mode: 0o600 });
+    writeFileSync(fixture.launcherDestination, "#!/bin/bash\n# generation-b\n", { mode: 0o700 });
+
+    const staged = stageRollbackPair(
+      sealed.root,
+      fixture.expectation(sealed.pairId, sealed.indexDigest),
+      join(fixture.root, "stage-lying-restore"),
+    );
+    expect(() => applyRollbackPair(staged)).toThrow(
+      /the restore reported success without installing the sealed image/,
+    );
   });
 
   it("carries an empty directory through seal, stage and install", async () => {

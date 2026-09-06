@@ -170,6 +170,43 @@ resolve_node() {
   [[ "$node_path" = /* && -x "$node_path" ]] || fail "provide an executable absolute Node path with --node"
 }
 
+# A sealed pair's own guarantee is that its bytes plus the interpreter it names is the whole
+# runtime — nothing the machine acquires or loses after sealing changes what a restored generation
+# executes. `resolve_node` above answers "what does this host currently call node", which is
+# outside the app root on every host that manages its own interpreter (a version manager, a
+# user-local install) — and a launcher bound to that path is a launcher `sealRollbackPair` refuses
+# to seal at all: it names an interpreter the closure does not carry, converting "this exact
+# generation" into "these bytes under whatever node is around later", which is the defect
+# `assertGenerationBindings` (src/deploy/rollback-pair.ts) exists to end. So the interpreter is
+# cloned into the runtime root itself, once per install/upgrade, and every later step — the
+# launcher this script writes and the closure a seal later copies — is bound to that in-tree copy
+# rather than the host's own PATH resolution.
+install_node_into_runtime() {
+  local dest_dir="$app_root/dist/bin"
+  local dest="$dest_dir/node"
+  mkdir -p "$dest_dir"
+  chmod 755 "$dest_dir"
+  # Idempotent against re-running install/upgrade after this step has already bound `node_path` to
+  # `dest` on a previous run: `cp` onto its own source is undefined at best, so identity is checked
+  # by resolved path rather than assumed from where the flag pointed.
+  if [[ -e "$dest" ]]; then
+    local resolved_src resolved_dest
+    resolved_src="$(cd -P -- "$(dirname -- "$node_path")" && pwd)/$(basename -- "$node_path")"
+    resolved_dest="$(cd -P -- "$(dirname -- "$dest")" && pwd)/$(basename -- "$dest")"
+    if [[ "$resolved_src" == "$resolved_dest" ]]; then
+      node_path="$dest"
+      return 0
+    fi
+  fi
+  rm -f "$dest"
+  # `-c` asks APFS for a clone (near-zero cost for a multi-hundred-megabyte interpreter); a
+  # filesystem that cannot clone still gets a real copy rather than a failure.
+  cp -c "$node_path" "$dest" 2>/dev/null || cp "$node_path" "$dest"
+  chmod 755 "$dest"
+  [[ -x "$dest" ]] || fail "failed to install the Node interpreter into the runtime closure: $dest"
+  node_path="$dest"
+}
+
 keychain_required() {
   local account="$1"
   security find-generic-password -w -s "$keychain_service" -a "$account" >/dev/null 2>&1 ||
@@ -367,6 +404,7 @@ case "$command_name" in
   install|upgrade)
     resolve_app_root
     resolve_node
+    install_node_into_runtime
     private_directory "$state_dir"
     private_directory "$deploy_backups_dir"
     keychain_required ACP_MCP_TOKEN

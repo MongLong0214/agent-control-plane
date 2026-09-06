@@ -255,10 +255,11 @@ const makeDisposableAppRoot = (): string => {
   // inside it. Linking rather than copying keeps the fixture small; what matters is that the
   // sibling sits outside the install root, so a rollback replaces `dist` and leaves it alone.
   symlinkSync(join(root, "node_modules"), join(appRoot, "node_modules"));
-  // `native/` is part of the same closure: the built `dist/db/fd-vfs.js` resolves the extension
-  // relative to itself, so an app root without it has a runtime that cannot load its own
-  // primitive. A real deployment checkout carries both beside `dist`.
-  symlinkSync(join(root, "native"), join(appRoot, "native"));
+  // No `native/` symlink: `dist/db/fd-vfs.js` now resolves the extension inside `dist` itself
+  // (`dist/native/fd-vfs/build/Release/...`), which the `dist` copy above already carries because
+  // `pnpm build` puts it there (`scripts/copy-native-fd-vfs-into-dist.mjs`). A symlink beside
+  // `dist` would rebuild the exact escape hatch B2 closed — this fixture must pass because the
+  // closure is complete, not because the test recreated the sibling path a rollback never restores.
   return realpathSync(appRoot);
 };
 
@@ -430,6 +431,81 @@ describe("launchd deployment artifact", () => {
     expect(readFileSync(harness.securityLog, "utf8")).toContain(
       "find-generic-password -w -s test-service -a ACP_OPERATOR_TOKEN",
     );
+  });
+
+  it("B1: seals the launcher install-launchd.sh actually writes, not a hand-built fixture", async () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    // `sealRollbackPair` canonicalizes every `install.*` destination it is given (`canonical()`,
+    // src/deploy/rollback-pair.ts) — resolving symlinks even for a path that may not exist yet — so
+    // that its recorded identity is stable regardless of which route a caller named a destination
+    // by. On a real deployment `$HOME` is `/Users/<name>`, with no symlink component, so this is a
+    // no-op there. `os.tmpdir()` on macOS sits under `/var`, a symlink to `/private/var`, so a test
+    // `$HOME` needs the same resolution *before* the installer writes anything, or the plist it
+    // writes (raw, unresolved `$HOME`) and the identity the seal records for the same path (always
+    // resolved) name the same file in two different spellings — a fixture artifact, not something
+    // B1 is responsible for.
+    const resolvedHome = realpathSync(harness.home);
+    const installEnv: NodeJS.ProcessEnv = { ...harness.env, HOME: resolvedHome };
+    const installed = spawnSync(
+      "bash",
+      [
+        installer,
+        "install",
+        "--app-root",
+        appRoot,
+        "--node",
+        harness.node,
+        "--keychain-service",
+        "test-service",
+        "--no-start",
+      ],
+      { encoding: "utf8", env: installEnv },
+    );
+    expect(installed.status, installed.stderr ?? "").toBe(0);
+
+    // The installer's own claim: the interpreter is cloned in-tree, not left pointing at whatever
+    // `--node`/`command -v node` named.
+    const installedNodePath = join(appRoot, "dist", "bin", "node");
+    expect(existsSync(installedNodePath), "install-launchd.sh did not clone the interpreter into dist/bin").toBe(
+      true,
+    );
+    expect(statSync(installedNodePath).mode & 0o111, "the cloned interpreter lost its execute bit").not.toBe(0);
+    const launcherTextPath = join(resolvedHome, ".agent-control-plane", "agentcpd-launch.sh");
+    const plistTextPath = join(resolvedHome, "Library", "LaunchAgents", `${label}.plist`);
+    const launcherText = readFileSync(launcherTextPath, "utf8");
+    expect(launcherText).toContain(`ACP_NODE_PATH=${installedNodePath}`);
+
+    // The acceptance test itself: the runbook seals with `--install-runtime-root "$APP_ROOT/dist"
+    // --node-executable bin/node` (docs/ops/owner-actions.md) against exactly the plist and
+    // launcher `install-launchd.sh` wrote — not a fixture that already had the right answer baked
+    // in. Before B1 this threw "the sealed launcher is not bound to the Node executable this pair
+    // installs"; a hand-written launcher fixture never exercised that path at all.
+    const state = join(resolvedHome, ".agent-control-plane");
+    const databasePath = join(state, "b1-acceptance.sqlite");
+    new Db(databasePath).close();
+    chmodSync(databasePath, 0o600);
+    const sealed = await sealRollbackPair(join(state, "rollback-pairs"), {
+      databasePath,
+      runtimeRoot: join(appRoot, "dist"),
+      entrypoint: "daemon/agentcpd.js",
+      stateAdmin: "db/state-admin.js",
+      nodeExecutable: "bin/node",
+      nodeVersion: process.version,
+      install: {
+        runtimeRoot: join(appRoot, "dist"),
+        plistPath: plistTextPath,
+        launcherPath: launcherTextPath,
+        workingDirectory: appRoot,
+      },
+      launchd: {
+        label,
+        generation: "b1-acceptance",
+        plistPath: plistTextPath,
+        launcherPath: launcherTextPath,
+      },
+    });
+    expect(sealed.pairId).toBeTruthy();
   });
 
   it("executes the rendered launcher with distinct MCP and operator credentials", () => {

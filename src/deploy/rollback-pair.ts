@@ -1513,8 +1513,13 @@ export interface AppliedRollbackPair {
 }
 
 export interface ApplyOptions {
-  /** Test-only fault injection, named for the step it fires after. */
-  failAfter?: "recovery" | "runtime" | "plist" | "launcher" | "restoreHelper" | "database" | "cleanup";
+  /**
+   * Test-only fault injection, named for the step it fires after. `"compensate"` is the one
+   * exception to "after": it injects a real failure after the runtime step (so `compensate()` is
+   * actually invoked) and *also* makes `compensate()` itself throw immediately, exercising
+   * compensation's own failure path rather than the failure that triggers it.
+   */
+  failAfter?: "recovery" | "runtime" | "plist" | "launcher" | "restoreHelper" | "database" | "cleanup" | "compensate";
   /**
    * Test-only seam, fired immediately before a step re-verifies its destination.
    *
@@ -1580,8 +1585,20 @@ export const applyRollbackPair = (
     };
     intact("before securing recovery");
 
-    const recoveryRoot = join(staged.stageRoot, "recovery");
-    mkdirSync(recoveryRoot, { recursive: true, mode: 0o700 });
+    // A sibling of the stage parent, deliberately not nested under `staged.stageRoot`: the stage is
+    // exactly what `rollbackToSealedPair`'s own `finally` removes once this call returns *or*
+    // throws, and it is exactly what a caller's own failure handling (`install-launchd.sh`'s
+    // `rollback` branch) `rm -rf`s wholesale when this call fails. A recovery copy nested under
+    // either is deleted by the same cleanup its own failure is supposed to survive — measured: with
+    // it nested there, a compensation that itself throws (full disk, a refused restore) leaves no
+    // copy of the previous generation anywhere, which is not a smaller failure than the rollback it
+    // was protecting against. `staged.stageRoot` is always `join(stageParent, ".rollback-stage-…")`
+    // (see `stageRollbackPair`), so its grandparent is the directory the caller passed as
+    // `stageParent` — one level above the whole staging tree either cleanup removes.
+    const recoveryParent = dirname(dirname(staged.stageRoot));
+    mkdirSync(recoveryParent, { recursive: true, mode: 0o700 });
+    const recoveryRoot = join(recoveryParent, `.rollback-recovery-${staged.pairId}-${process.pid}-${randomUUID()}`);
+    mkdirSync(recoveryRoot, { mode: 0o700 });
     chmodSync(recoveryRoot, 0o700);
     const hadRuntime = plan.runtime.identity !== null;
     const hadPlist = plan.plist.identity !== null;
@@ -1599,6 +1616,14 @@ export const applyRollbackPair = (
 
     /** Puts back every half of the previous generation, including its database. */
     const compensate = (): void => {
+      // Test-only: the fault this row exists for is compensation itself failing (a full disk
+      // during `copyPrivateTree`, a `restoreDatabase` refusal) — not the failure that triggered
+      // compensation, which every other `failAfter` value already exercises. Thrown here, before
+      // any of the puts-back below run, so the recovery copy this call would have consumed is still
+      // exactly what was captured above.
+      if (options.failAfter === "compensate") {
+        throw acpError(ReasonCode.INTERNAL_ERROR, "injected failure inside compensate", {});
+      }
       if (hadRuntime) {
         rmSync(runtimeDestination, { recursive: true, force: true });
         copyPrivateTree(join(recoveryRoot, "runtime"), runtimeDestination);
@@ -1635,7 +1660,10 @@ export const applyRollbackPair = (
       intact("before installing the runtime");
       rmSync(runtimeDestination, { recursive: true, force: true });
       copyPrivateTree(staged.runtimeRoot, runtimeDestination);
-      if (options.failAfter === "runtime") {
+      // `"compensate"` needs a real failure to reach `compensate()` at all — this point works
+      // equally well for that, since compensation runs identically no matter which step triggered
+      // it. The fault under test is inside `compensate()` itself, checked at its own top.
+      if (options.failAfter === "runtime" || options.failAfter === "compensate") {
         throw acpError(ReasonCode.INTERNAL_ERROR, "injected failure after runtime", {});
       }
 
@@ -1710,7 +1738,27 @@ export const applyRollbackPair = (
         recoveryRoot,
       };
     } catch (error) {
-      compensate();
+      try {
+        compensate();
+      } catch (compensationError) {
+        // The original error must not be replaced: whatever caused the rollback to fail is still
+        // the reason a human needs, and losing it behind a generic "compensation also failed"
+        // rethrow is how "behaving correctly while failing" — this module's whole justification —
+        // stops being true right when it matters most. So the thrown error keeps the original's
+        // reason code and message, and gains evidence naming the compensation failure and the
+        // surviving recovery copy — moved outside the stage above specifically so it is still there
+        // to name.
+        const evidence: Record<string, unknown> = isAcpError(error) ? { ...error.evidence } : {};
+        evidence["compensationFailed"] = true;
+        evidence["recoveryRoot"] = recoveryRoot;
+        evidence["compensationError"] = isAcpError(compensationError)
+          ? { reasonCode: compensationError.reasonCode, message: compensationError.message, evidence: compensationError.evidence }
+          : { message: compensationError instanceof Error ? compensationError.message : String(compensationError) };
+        if (isAcpError(error)) {
+          throw acpError(error.reasonCode, error.message, evidence);
+        }
+        throw acpError(ReasonCode.INTERNAL_ERROR, error instanceof Error ? error.message : String(error), evidence);
+      }
       throw error;
     }
   } finally {

@@ -14,7 +14,7 @@
   },
   "scripts": {
     "postinstall": "node scripts/build-native-peercred.mjs && node scripts/build-native-fd-vfs.mjs",
-    "build": "tsc -p tsconfig.build.json && cp src/db/schema.sql dist/db/schema.sql",
+    "build": "tsc -p tsconfig.build.json && cp src/db/schema.sql dist/db/schema.sql && node scripts/copy-native-fd-vfs-into-dist.mjs",
     "declarations:tracker-loci-strip": "tsc --allowJs --checkJs --declaration --emitDeclarationOnly --skipLibCheck --module ESNext --target ES2023 --moduleResolution bundler --outDir scripts/lib scripts/lib/tracker-loci-strip.mjs",
     "declarations:falsifiability-cases": "tsc --allowJs --checkJs --declaration --emitDeclarationOnly --skipLibCheck --module ESNext --target ES2023 --moduleResolution bundler --outDir scripts/lib scripts/lib/falsifiability-cases.mjs",
     "typecheck": "pnpm declarations:tracker-loci-strip && git diff --exit-code -- scripts/lib/tracker-loci-strip.d.mts && pnpm declarations:falsifiability-cases && git diff --exit-code -- scripts/lib/falsifiability-cases.d.mts && tsc --noEmit",

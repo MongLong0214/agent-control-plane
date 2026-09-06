@@ -525,6 +525,21 @@ nobody watched being produced.)
 Never remove the manifest without that first `test`: a manifest whose database exists is half of a
 verified backup, and deleting it is how the failure this section is about gets recreated by hand.
 
+**Prerequisite for the first seal of an existing deployment.** `sealRollbackPair` refuses to seal a
+launcher bound to an interpreter outside the runtime it installs (`assertGenerationBindings`,
+`src/deploy/rollback-pair.ts`) — a launcher naming `$(command -v node)` from the installing host
+promises "restore these bytes and run them under whatever interpreter is around later", exactly the
+generation-mixing a sealed pair exists to end. Since #774, `install-launchd.sh install|upgrade`
+clones the resolved interpreter into `$APP_ROOT/dist/bin/node` and binds the launcher's
+`ACP_NODE_PATH` to that in-tree copy itself, and `pnpm build` places the native `fd-vfs` extension
+at `dist/native/fd-vfs/build/Release/...` so `dist` carries it too — but only from the run that
+does this onward. A deployment installed before #774 is still running the old, externally-bound
+launcher, and **cannot be sealed as it currently runs**: run `install-launchd.sh upgrade --app-root
+"$APP_ROOT" --node "$(command -v node)"` (ordinary operation — stops the job, rewrites the launcher,
+restarts it) once, and only then take the first seal below. A seal attempted against the old
+launcher fails loudly (`assertGenerationBindings`'s own refusal) rather than silently sealing
+something that cannot be restored.
+
 Bytes — seal a rollback pair. This replaces the hand-built byte snapshot that used to live here.
 That snapshot copied `dist`, the plist and the launcher into a directory the shell named, hashed
 one file, and wrote a receipt afterwards claiming the database backup and the bytes belonged
@@ -535,14 +550,18 @@ item 6 restores it as one operation.
 
     set -e
     APP_ROOT=/absolute/path/to/agent-control-plane
-    # The closure is what gets sealed, and it carries its own interpreter and dependencies. A pair
-    # that named an external `node` would promise "restore these bytes and run them under whatever
-    # interpreter this machine has later", which is the generation-mixing the pair exists to end.
+    # The closure is what gets sealed, and it carries its own interpreter, native extension and
+    # dependencies. A pair that named an external `node` (or an extension living outside `dist`)
+    # would promise "restore these bytes and run them under whatever this machine has later",
+    # which is the generation-mixing the pair exists to end. `$APP_ROOT/dist` already carries the
+    # interpreter (`dist/bin/node`) and the extension (`dist/native/...`) as of the prerequisite
+    # above, so this step only has to fold in `node_modules` — it no longer clones `command -v
+    # node` by hand.
     CLOSURE="$HOME/.agent-control-plane/closure-$(date -u +%Y%m%dT%H%M%SZ)"
-    mkdir -p "$CLOSURE/bin" && chmod 700 "$CLOSURE"
+    mkdir -p "$CLOSURE" && chmod 700 "$CLOSURE"
     cp -Rc "$APP_ROOT/dist/." "$CLOSURE/"
     cp -RcL "$APP_ROOT/node_modules" "$CLOSURE/node_modules"
-    cp -c "$(command -v node)" "$CLOSURE/bin/node" && chmod 755 "$CLOSURE/bin/node"
+    chmod 755 "$CLOSURE/bin/node"
     node "$APP_ROOT/dist/deploy/rollback-pair.js" seal \
       --pairs-root "$HOME/.agent-control-plane/rollback-pairs" \
       --database "$HOME/.agent-control-plane/state.sqlite" \
@@ -837,14 +856,20 @@ the generation it is running under would make a rollback a one-way door. Substit
 checkout path for `$APP_ROOT`:
 
     APP_ROOT=/absolute/path/to/agent-control-plane
-    # The closure is what gets sealed, and it carries its own interpreter and dependencies. A pair
-    # that named an external `node` would promise "restore these bytes and run them under whatever
-    # interpreter this machine has later", which is the generation-mixing the pair exists to end.
+    # The closure is what gets sealed, and it carries its own interpreter, native extension and
+    # dependencies. A pair that named an external `node` (or an extension living outside `dist`)
+    # would promise "restore these bytes and run them under whatever this machine has later",
+    # which is the generation-mixing the pair exists to end. Since #774, `install-launchd.sh
+    # install|upgrade` clones the interpreter into `$APP_ROOT/dist/bin/node` and `pnpm build`
+    # places the native `fd-vfs` extension at `dist/native/...` — both already inside `dist`, so
+    # this step only has to fold in `node_modules`. An existing deployment must have run
+    # `install-launchd.sh upgrade` at least once since #774 before its first seal; see the
+    # "Prerequisite for the first seal" paragraph earlier in this document.
     CLOSURE="$HOME/.agent-control-plane/closure-$(date -u +%Y%m%dT%H%M%SZ)"
-    mkdir -p "$CLOSURE/bin" && chmod 700 "$CLOSURE"
+    mkdir -p "$CLOSURE" && chmod 700 "$CLOSURE"
     cp -Rc "$APP_ROOT/dist/." "$CLOSURE/"
     cp -RcL "$APP_ROOT/node_modules" "$CLOSURE/node_modules"
-    cp -c "$(command -v node)" "$CLOSURE/bin/node" && chmod 755 "$CLOSURE/bin/node"
+    chmod 755 "$CLOSURE/bin/node"
     node "$APP_ROOT/dist/deploy/rollback-pair.js" seal \
       --pairs-root "$HOME/.agent-control-plane/rollback-pairs" \
       --database "$HOME/.agent-control-plane/state.sqlite" \
