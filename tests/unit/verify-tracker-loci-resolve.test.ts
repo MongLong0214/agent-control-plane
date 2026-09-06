@@ -2836,4 +2836,327 @@ describe("verify-tracker-loci-resolve", () => {
       cleanup();
     }
   });
+
+  // Issue #780. Five STALE findings on `main` fall into exactly two classes, and both are a
+  // statement about the citation's *grammar* rather than about any one file, so neither is
+  // answered by an allow-list — see the script header's own argument for why there isn't one.
+  //
+  //   Class A  a `~/`-prefixed runtime path (#655, #627) resolved as a repository path. The
+  //            marker means "the home directory" by definition, so the remainder is never a
+  //            repository path and no edit to either issue can make it one.
+  //   Class B  a citation into another repository (#756, #627). The checker is right that none of
+  //            them resolves here; the grammar had no way to say which repository a citation
+  //            means. Round 2 measured which of the three are real, rather than carrying #780's
+  //            body claim that all three exist elsewhere: only `hermes_state_schema.py` does, in
+  //            `MongLong0214/hermes-agent`. `SSOT.md` and `ARCHITECTURE.md` are in no searched
+  //            repository, so the #627 rows below are grammar fixtures and nothing else — they
+  //            pass because of the qualifier, never because the document exists somewhere.
+  //
+  // Every body below is the citation text the real issue actually wrote, not the checker's
+  // rendering of it: what the checker *reported* (`.hermes/state.db`, `SSOT.md:99`) is the
+  // marker-stripped remainder, and the difference between the two is the whole defect.
+  describe("round 26 (#780) home-directory paths and repository-qualified citations", () => {
+    /** `owner/repo` from `origin`, derived the same way the script derives its own identity. */
+    const originSlug = (): string => {
+      const raw = spawnSync("git", ["remote", "get-url", "origin"], { cwd: repoRoot, encoding: "utf8" }).stdout.trim();
+      const match = raw.match(/github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?\/?$/);
+      expect(match, `origin is not a GitHub remote: ${JSON.stringify(raw)}`).not.toBeNull();
+      return `${match![1]}/${match![2]}`;
+    };
+
+    it("[class A] #655's fenced `~/`-prefixed state path is not resolved against this repository", () => {
+      // Verbatim from #655's "The permitted shape" fence, the line that produced
+      // `.agent-control-plane/state.sqlite does not exist`.
+      const body = [
+        "```",
+        "disposable   state directory · database · sockets · lock · runtime root · CEO actor",
+        "shared       the production composition root, and the real Telegram transport",
+        "untouched    ~/.agent-control-plane/state.sqlite · gen1/actorA · production sockets/lock/runtime",
+        "             production agentcpd stays Telegram-unconfigured throughout",
+        "```",
+      ].join("\n");
+      const { path, cleanup } = withIssues([{ number: 9655, title: "class A fenced home path", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(0);
+        expect(result.stdout).toBe("");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class A] #627's inline `~/.hermes/state.db` is not resolved against this repository", () => {
+      // Verbatim from #627's "The damage is measurable" paragraph.
+      const body = "`~/.hermes/state.db`, sessions by size:";
+      const { path, cleanup } = withIssues([{ number: 9627, title: "class A inline home path", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(0);
+        expect(result.stdout).toBe("");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class A] `$HOME/` and `${HOME}/` name the same directory and are excluded the same way", () => {
+      const body = [
+        "The daemon opens $HOME/.agent-control-plane/state.sqlite at startup.",
+        "The launchd plist writes the same file as ${HOME}/.agent-control-plane/state.sqlite.",
+      ].join("\n");
+      const { path, cleanup } = withIssues([{ number: 9781, title: "class A HOME variable forms", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(0);
+        expect(result.stdout).toBe("");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class A guard] a genuine repository citation beside a home path is still checked", () => {
+      const body = "The runtime copy is `~/.hermes/state.db`; the source of truth is `src/does/not/exist.ts:42`.";
+      const { path, cleanup } = withIssues([{ number: 9782, title: "class A guard same line", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(1);
+        expect(result.stdout).toContain("STALE");
+        expect(result.stdout).toContain("src/does/not/exist.ts does not exist");
+        expect(result.stdout).not.toContain("state.db");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class A guard] a tilde inside a word does not open a home path", () => {
+      const body = "The editor's backup marker session~/ is unrelated to `src/does/not/exist.ts:42`.";
+      const { path, cleanup } = withIssues([{ number: 9783, title: "class A guard mid word tilde", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(1);
+        expect(result.stdout).toContain("src/does/not/exist.ts does not exist");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class B] #756's citation, qualified with the repository it means, is EXTERNAL and does not fail", () => {
+      const body = "`MongLong0214/hermes-agent@hermes_state_schema.py:1333`";
+      const { path, cleanup } = withIssues([{ number: 9756, title: "class B qualified python locus", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(0);
+        expect(result.stdout).toContain("EXTERNAL");
+        expect(result.stdout).toContain("MongLong0214/hermes-agent@hermes_state_schema.py:1333");
+        expect(result.stdout).not.toContain("STALE");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class B] #627's `SSOT.md:99` and `ARCHITECTURE.md`, qualified, are EXTERNAL with and without a line", () => {
+      // Grammar only. Neither document exists in `hermes-agent` (its 11,097 paths were enumerated)
+      // nor anywhere else that was searched, so #627's real remedy is prose, not this qualifier —
+      // qualifying a locus that exists nowhere would launder a dead citation into a permanently
+      // unverifiable EXTERNAL. What this row proves is that the *form* reaches EXTERNAL with a
+      // line coordinate and without one. Do not copy these two citations as examples.
+      const body = [
+        "`MongLong0214/hermes-agent@SSOT.md:99` states the rule that Buzz must not fork the CEO.",
+        "Per `MongLong0214/hermes-agent@ARCHITECTURE.md`'s cross-surface coherence contract the accepted",
+        "mechanism is peer UDS + transcript observer.",
+      ].join("\n");
+      const { path, cleanup } = withIssues([{ number: 9784, title: "class B qualified markdown loci", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(0);
+        expect(result.stdout).toContain("MongLong0214/hermes-agent@SSOT.md:99");
+        expect(result.stdout).toContain("MongLong0214/hermes-agent@ARCHITECTURE.md");
+        expect(result.stdout).not.toContain("STALE");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class B] an unqualified citation into another repository is still STALE — the qualifier is opt-in", () => {
+      // #756's text exactly as it stands today. Nothing in it names a repository, so the checker
+      // is right that it does not resolve here, and this stays the answer until the issue is edited.
+      const body = "`hermes_state_schema.py:1333`";
+      const { path, cleanup } = withIssues([{ number: 9785, title: "class B unqualified control", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(1);
+        expect(result.stdout).toContain("STALE");
+        expect(result.stdout).toContain("hermes_state_schema.py does not exist");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class B guard] the qualifier naming this repository cannot silence a real STALE", () => {
+      const body = `\`${originSlug()}@src/does/not/exist.ts:42\` is the culprit.`;
+      const { path, cleanup } = withIssues([{ number: 9786, title: "class B guard self slug", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(1);
+        expect(result.stdout).toContain("STALE");
+        expect(result.stdout).toContain("src/does/not/exist.ts does not exist");
+        expect(result.stdout).not.toContain("EXTERNAL");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class B guard] naming another repository exempts a local path only by making a visible claim", () => {
+      // The honest limit of the form, pinned rather than left to be discovered: a qualifier that
+      // names some other repository does take a citation out of this tree's checking — that is the
+      // feature. What it cannot do is exempt anything *quietly*: the output names the repository
+      // the citation claims, so the claim is contradictable by reading it, which is precisely what
+      // an allow-list entry ("do not check this") is not.
+      const body = "`Someone/elsewhere@src/does/not/exist.ts:42` is the culprit.";
+      const { path, cleanup } = withIssues([{ number: 9789, title: "class B residual limit", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(0);
+        expect(result.stdout).toContain("EXTERNAL");
+        expect(result.stdout).toContain("names Someone/elsewhere, a repository this check does not have");
+        expect(result.stdout).not.toContain("STALE");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class B guard] a symbol row qualified with another repository is EXTERNAL, never silence", () => {
+      const body = "`MongLong0214/hermes-agent@src/continuity/continuity-kernel.ts` — `definitelyNotARealSymbolXYZ`";
+      const { path, cleanup } = withIssues([{ number: 9787, title: "class B guard external symbol row", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(0);
+        expect(result.stdout).toContain("EXTERNAL");
+        expect(result.stdout).toContain("MongLong0214/hermes-agent@src/continuity/continuity-kernel.ts");
+        expect(result.stdout).not.toContain("STALE");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class B guard] a symbol row qualified with this repository is still searched here", () => {
+      const body = `\`${originSlug()}@src/continuity/continuity-kernel.ts\` — \`definitelyNotARealSymbolXYZ\``;
+      const { path, cleanup } = withIssues([{ number: 9788, title: "class B guard self symbol row", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(1);
+        expect(result.stdout).toContain("STALE");
+        expect(result.stdout).toContain("does not appear");
+        expect(result.stdout).not.toContain("EXTERNAL");
+      } finally {
+        cleanup();
+      }
+    });
+  });
+
+  // Round 2 on #780 found a sixth class in `#785`'s own body, and it is the same family as the
+  // tilde: a colon-separated shell search path read as `path:coordinate`.
+  //
+  //     opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+  //     line coordinate syntax is unsupported; …
+  //
+  // The reported text carries its own evidence, exactly as `$HOME/…` reported as `HOME/…` did: the
+  // leading `/` was eaten by the path regex, which cannot begin with one, and the remainder was
+  // read as a relative path with a broken coordinate. A PATH value is a property of the citation's
+  // shape, not a fact about one issue — every issue that quotes a PATH trips it, and `#785` is an
+  // issue *about* a PATH, so it cannot be written without tripping it.
+  describe("round 27 (#780) colon-joined search paths are not citations", () => {
+    it("[class C] #785's generated launcher PATH is not read as a citation with a broken coordinate", () => {
+      // Verbatim from #785's "Measured" section, fence included.
+      const body = [
+        "`deploy/install-launchd.sh`, `write_launcher`, emits:",
+        "",
+        "```",
+        'export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"',
+        "```",
+      ].join("\n");
+      const { path, cleanup } = withIssues([{ number: 9785, title: "class C real PATH value", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(0);
+        expect(result.stdout).toBe("");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class C] a PATH value that appends $PATH is the same shape and is excluded the same way", () => {
+      const body = "The hand-patched launcher runs with PATH=/usr/local/bin:$PATH today.";
+      const { path, cleanup } = withIssues([{ number: 9790, title: "class C variable tail", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(0);
+        expect(result.stdout).toBe("");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class C guard] a real citation on the same line as a PATH value is still checked", () => {
+      const body = "With PATH=/usr/local/bin:/usr/bin the fix is `src/does/not/exist.ts:42`.";
+      const { path, cleanup } = withIssues([{ number: 9791, title: "class C guard same line", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(1);
+        expect(result.stdout).toContain("STALE");
+        expect(result.stdout).toContain("src/does/not/exist.ts does not exist");
+        // The section header, not the word: "UNSUPPORTED means…" is in the standing explanation
+        // block that prints whenever anything fails, so asserting on the bare word passes only by
+        // accident of what else the run happens to print.
+        expect(result.stdout).not.toContain("UNSUPPORTED (");
+        expect(result.stdout).toContain("1 stale, 0 unresolved, 0 unsupported,");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class C guard] a colon-containing line is not exempt wholesale — a broken coordinate is still UNSUPPORTED", () => {
+      // The exclusion is keyed on the *shape of both sides of the colon*, not on the colon. A
+      // relative path with a coordinate that is not a signed decimal is still reported loudly,
+      // which is the branch this class must not quietly widen.
+      const body = "See `README.md:1:2` for the banner.";
+      const { path, cleanup } = withIssues([{ number: 9792, title: "class C guard broken coordinate", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(1);
+        expect(result.stdout).toContain("UNSUPPORTED");
+        expect(result.stdout).toContain("README.md:1:2");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class C guard] one absolute path with a line number is not a list and is still checked", () => {
+      const body = "The build wrote /opt/build/src/does/not/exist.ts:42 before failing.";
+      const { path, cleanup } = withIssues([{ number: 9793, title: "class C guard single element", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(1);
+        expect(result.stdout).toContain("STALE");
+        expect(result.stdout).toContain("does not exist");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class C guard] a colon-joined pair of temporary paths still reports NON_DURABLE", () => {
+      // NON_DURABLE is measured before this class and wins any overlap: `/tmp/a:/tmp/b` is a
+      // custody claim first and a colon-joined list second, and the custody message is the one a
+      // reader needs.
+      const body = "Copied /tmp/a.ts:/tmp/b.ts during the run.";
+      const { path, cleanup } = withIssues([{ number: 9794, title: "class C guard non durable wins", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(1);
+        expect(result.stdout).toContain("NON_DURABLE");
+        expect(result.stdout).toContain("/tmp/a.ts:/tmp/b.ts");
+      } finally {
+        cleanup();
+      }
+    });
+  });
 });
