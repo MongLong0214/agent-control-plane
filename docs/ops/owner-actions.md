@@ -832,6 +832,21 @@ directories it looked in. Read the refusal, fix what it names, and run it again.
 *after* the stop, it has already put the previous generation back and started the service; that is
 a failed rollback, not a half-applied one, and the deployment is where it was before you ran it.
 
+**The recovery copy — present only after a failed put-back, and yours to clear.** Before the first
+mutation, `applyRollbackPair` secures the runtime, plist, launcher and a WAL-complete database
+image of the generation it is about to replace into a private directory beside `state.sqlite`,
+named `.rollback-recovery-<pair id>-<pid>-<uuid>`. On an ordinary successful rollback this copy is
+removed automatically before the command returns — the sealed pair for that generation still exists
+under `rollback-pairs/`, so a second, unbounded copy next to the live database would be redundant
+with it. It survives only when compensation *itself* fails after an error — full disk during the
+runtime copy, a strict schema check refusing the database restore — at which point the copy is the
+one remaining evidence the previous generation existed, and the failed rollback's own error message
+names its path. Nothing removes it automatically in that case, on purpose: a rollback tool that
+deletes the last copy of the previous generation while reporting its own failure is not an undo.
+If you land in this state, read the copy back by hand (it is a plain directory: `runtime/`, `plist`,
+`launcher`, and the database image under its own name) before removing it — there is no janitor for
+it, and none is planned.
+
 ### The sealed rollback pair
 
 A rollback is not "restore the database". It is putting back a **generation**: the database image,

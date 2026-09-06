@@ -1509,7 +1509,15 @@ export interface AppliedRollbackPair {
   plistPath: string;
   launcherPath: string;
   databasePath: string;
-  recoveryRoot: string;
+  /**
+   * `null` on every successful return: the previous generation this copy held is deliberately
+   * gone, and the sealed pair for it still exists under `pair_root` — that is what the sealed-pair
+   * mechanism is for, so a second, unbounded copy beside `state.sqlite` would be redundant with it
+   * rather than a safety net. The directory only ever survives a *failed* compensation, where it is
+   * this rollback's one remaining proof the previous generation existed; that path never reaches
+   * this return at all — it throws, with the surviving path in the thrown error's evidence instead.
+   */
+  recoveryRoot: string | null;
 }
 
 export interface ApplyOptions {
@@ -1728,6 +1736,13 @@ export const applyRollbackPair = (
         throw acpError(ReasonCode.INTERNAL_ERROR, "injected failure after cleanup", {});
       }
 
+      // The recovery copy's only job was to let a *failed* compensation put the previous
+      // generation back. It succeeded without needing to, so the copy is now redundant with the
+      // sealed pair still sitting under `pair_root` — and, unlike that pair, it has no bound and no
+      // owner once this call returns. Removed here, on the one path that reaches this line, rather
+      // than left for a caller that was never told it existed.
+      rmSync(recoveryRoot, { recursive: true, force: true });
+
       return {
         pairId: staged.pairId,
         generation: identity.service.generation,
@@ -1735,7 +1750,7 @@ export const applyRollbackPair = (
         plistPath: plistDestination,
         launcherPath: launcherDestination,
         databasePath: databaseDestination,
-        recoveryRoot,
+        recoveryRoot: null,
       };
     } catch (error) {
       try {

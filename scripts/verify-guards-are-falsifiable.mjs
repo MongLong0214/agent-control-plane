@@ -4482,6 +4482,21 @@ const GUARDS = [
       "tests/process/rollback-pair-wal.test.ts::H3 anchor: refuses a restore that exits zero without installing the sealed database image",
     ],
   },
+  {
+    // #774 H1 round 2. The recovery copy exists solely so a *failed* compensation still has the
+    // previous generation somewhere; on success it is redundant with the sealed pair still under
+    // `pair_root`, unbounded, and sitting beside `state.sqlite`. Neutering the removal leaves it on
+    // disk after every successful rollback, accumulating one per run without bound — the defect
+    // this row exists to catch, since neither `install-launchd.sh` nor any caller ever reads the
+    // returned path to clean it up itself.
+    what: "#774 H1 round 2: a successful rollback removes its own recovery copy rather than leaving it beside the database",
+    file: "src/deploy/rollback-pair.ts",
+    find: "      rmSync(recoveryRoot, { recursive: true, force: true });\n",
+    replace: "",
+    killedBy: [
+      "tests/process/rollback-pair-wal.test.ts::H1 round 2: removes the recovery copy on a successful rollback, leaving no residue in the state directory",
+    ],
+  },
   // #774 H3 also named the member re-hash at stage time (src/deploy/rollback-pair.ts:1352,
   // "a rollback member changed between validation and staging") as a fourth anchor. Investigated
   // and deliberately left out rather than forced in: that check guards a TOCTOU window on the

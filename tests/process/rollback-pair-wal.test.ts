@@ -13,7 +13,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 
 import Database from "better-sqlite3";
 import { afterAll, describe, expect, it } from "vitest";
@@ -784,6 +784,46 @@ describe("a rollback installs one whole generation", () => {
       existsSync(recoveryRoot as string),
       "the recovery copy was removed by the stage-parent's own cleanup",
     ).toBe(true);
+  });
+
+  it("H1 round 2: removes the recovery copy on a successful rollback, leaving no residue in the state directory", async () => {
+    const fixture = makeGenerationFixture("acp-rollback-recovery-cleanup-");
+    new Db(fixture.databasePath).close();
+    probeDatabase(fixture.databasePath, "generation-a");
+    const sealed = await sealRollbackPair(
+      fixture.pairsRoot,
+      fixture.sourcesFor("generation-a", runtimeClosureFor(fixture.root, "generation-a")),
+    );
+    probeDatabase(fixture.databasePath, "generation-b");
+
+    cpSync(runtimeClosureFor(fixture.root, "generation-b"), fixture.installRoot, {
+      recursive: true,
+      force: true,
+    });
+    writeFileSync(fixture.plistDestination, "<!-- generation-b plist -->\n", { mode: 0o600 });
+    writeFileSync(fixture.launcherDestination, "#!/bin/bash\n# generation-b\n", { mode: 0o700 });
+
+    // `recoveryParent = dirname(dirname(staged.stageRoot))`, and `stageRoot` is always
+    // `join(stageParent, ".rollback-stage-…")` — so with `stageParent` one level under
+    // `fixture.root` here, the recovery copy this call creates lands directly in `fixture.root`,
+    // the same directory `state.sqlite` sits in on a real deployment.
+    const stageParent = join(fixture.root, "stage-recovery-cleanup");
+    const staged = stageRollbackPair(
+      sealed.root,
+      fixture.expectation(sealed.pairId, sealed.indexDigest),
+      stageParent,
+    );
+    const applied = applyRollbackPair(staged);
+
+    // The rollback itself succeeded — this is not a compensation-failure row.
+    expect(installedGeneration(fixture.installRoot)).toBe("generation-a");
+    expect(databaseMarkers(fixture.databasePath)).toEqual(["generation-a"]);
+
+    // The returned field says so, and the directory it used to name is actually gone — not merely
+    // unreported.
+    expect(applied.recoveryRoot).toBeNull();
+    const residue = readdirSync(fixture.root).filter((name) => name.startsWith(".rollback-recovery-"));
+    expect(residue, `unexpected recovery residue in the state directory: ${residue.join(", ")}`).toEqual([]);
   });
 
   it("H3 anchor: refuses a restore that exits zero without installing the sealed database image", async () => {
