@@ -17,6 +17,8 @@
  * | Fenced code block | SUPPORTED | A run of at least three backticks or tildes opens it; the closer uses the same marker and at least the opening length. Up to three spaces are measured after the supported container prefix: top level, blockquote markers, or one bullet/ordered-list item and its continuation indentation. |
  * | Markdown inline link | SUPPORTED | `[text](target)` and `[text](<target>)` may target a supported path or blob URL. The destination's closing `)` is consumed as link syntax before trailing quoted content is read. A link title in the destination is UNSUPPORTED and reported. |
  * | Bare path plus line | SUPPORTED | `path:line[-end]` and `path#Lline[-Lend]`, under the path disambiguation rules below. |
+ * | Repository-qualified path | SUPPORTED | `<owner>/<repo>@<path>[:line]`, in a bare citation or on the path side of either symbol form. A slug this check can show is not its own is reported EXTERNAL and not measured against this tree; a slug naming *this* repository is consumed and the path checked here exactly as an unqualified one. |
+ * | Home-directory path | OUT OF GRAMMAR | `~/`, `$HOME/`, and `${HOME}/` name the home directory by definition, so the remainder is never a path in this repository. Excluded from repository resolution rather than reported. |
  * | Same-repository blob URL | SUPPORTED | `https://github.com/<owner>/<repo>/blob/<ref>/<path>` with an optional supported line fragment. A non-line hash is UNSUPPORTED and reported. |
  * | Line number | SUPPORTED | A signed base-10 integer. `line <= 0`, an end before its start, and a coordinate beyond the file are STALE. A coordinate-shaped suffix outside this grammar is UNSUPPORTED and reported. |
  * | Undelimited root filename with no line | OUT OF GRAMMAR | Intentionally ignored as ambiguous prose; unlike an explicit but unsupported form, it is not claimed as a citation the parser read. |
@@ -61,6 +63,21 @@
  *   - a symbol not paired with a path in one of the two supported backtick forms
  *   - URLs other than same-repository GitHub blob URLs
  *   - unquoted prose after an inline citation, and fenced prose that does not read as code
+ *   - a path introduced by a home-directory marker: `~/`, `$HOME/`, or `${HOME}/`
+ *
+ * The home-directory omission (#780) is the one case where "ignored" needs no defence from
+ * corpus evidence, because the marker settles it definitionally: a leading `~/` *means* the home
+ * directory, so what follows it is not a repository path and never can be, and stripping the
+ * marker to resolve the remainder against the worktree converts an unambiguous statement into a
+ * false STALE. `~/.hermes/state.db` was reported as `.hermes/state.db does not exist` and
+ * `$HOME/.agent-control-plane/state.sqlite` as `HOME/.agent-control-plane/state.sqlite does not
+ * exist` — a marker the checker had removed itself, then called missing, exactly the shape round 7
+ * found when a leading dot was being dropped and the manufactured "missing dot" published as a
+ * finding. These are also permanent: no edit to the citing issue can make a home-directory state
+ * database exist inside this repository, and every future runtime path written that way joins
+ * them. That is why this is a rule in the grammar and not an allow-list entry — see "Why there is
+ * no allow-list" below; a tilde prefix is a property of the citation's syntax, not a fact about
+ * one file that goes stale the way the citation would.
  *
  * The undelimited-root omission is deliberate, not silent coverage. On the 2026-08-29 snapshot
  * of all 503 open issues, admitting undelimited root names with extensions present in the tracked
@@ -122,7 +139,9 @@
  * because "still resolves today" is not "will resolve next week". A blob URL with no line
  * fragment is also surfaced: otherwise exit 0 cannot be distinguished from the URL parser never
  * looking at it. ADVISORY does not fail the build by default (`--strict` promotes it); STALE,
- * UNRESOLVED, UNSUPPORTED, and NON_DURABLE do.
+ * UNRESOLVED, UNSUPPORTED, and NON_DURABLE do. EXTERNAL does not fail and `--strict` does not
+ * promote it either: a citation into a repository this check does not have is unverifiable here,
+ * not disagreeing with anything, and there is no stricter reading of "nobody could look".
  *
  * ## Why there is no allow-list for "this citation is legitimately historical"
  *
@@ -926,6 +945,84 @@
  *   one Python file, one shell file, all three YAML files, and both SQL files: 260 tracked files,
  *   every supported-language file in this tree.
  *
+ * ## Round 26: five STALE findings on `main`, two grammar rules missing, and one form deliberately
+ * not built
+ *
+ *   `tracker-loci` had been red on `main` for five days on five STALE findings and nothing else
+ *   (run 34032946168: 5 stale, 0 unresolved, 0 unsupported, 0 non-durable, 8 advisory across 19
+ *   open issues). They fall into exactly two classes, and both are statements about the citation
+ *   *grammar* rather than about any one file — which is what keeps the answer out of the
+ *   allow-list this module refuses on principle.
+ *
+ *   **Class A — a `~/`-prefixed path resolved as a repository path** (`#655`
+ *   `~/.agent-control-plane/state.sqlite`, `#627` `~/.hermes/state.db`). Reported above under
+ *   "Intentionally ignored formats", with the reasoning: the marker settles the question
+ *   definitionally, and dropping it manufactured the missing path it then reported.
+ *
+ *   **Class B — a citation into another repository** (`#756` `hermes_state_schema.py:1333`,
+ *   `#627` `SSOT.md:99` and `ARCHITECTURE.md`). All three files exist — in the Hermes repository,
+ *   not this one. Nothing in the citation said which repository it meant, so the checker was
+ *   *correct* that they do not resolve here; the grammar had no way to write the fact down.
+ *
+ *   The chosen form is `<owner>/<repo>@<path>[:line]` — e.g.
+ *   `MongLong0214/hermes@hermes_state_schema.py:1333`. Two properties decided it, both about what
+ *   the form makes impossible rather than what it makes convenient:
+ *
+ *     1. The full slug is the only name comparable against this repository's own identity
+ *        (`repoSlug`, already derived from `origin` for blob permalinks). A qualifier naming
+ *        *this* repository is therefore consumed and its path measured against this tree exactly
+ *        as an unqualified citation is, so the form cannot be used to excuse a local locus. The
+ *        only route to EXTERNAL is naming a repository this check can show is not its own, which
+ *        is a claim a reader can see and contradict — unlike an allow-list entry, which silences
+ *        by existing. Where `repoSlug` is unknown (no `origin` remote) nothing can be *shown* to
+ *        be elsewhere, so every qualified citation falls back to being checked here — the
+ *        behaviour before this round, and the only non-silencing default.
+ *     2. Requiring the `/` rules out the near miss that killed the shorter `<repo>@<path>`: an
+ *        email address (`user@host.tld`) is exactly that shape, and would have been read as a
+ *        repository named `user` holding a file `host.tld`.
+ *
+ *   Rejected, and why: `<repo>:<path>` (an ordinary English "note: config.yaml" becomes a
+ *   qualified citation and silences a real one — the accidental-application failure); a bare
+ *   `<repo>@<path>` (the email shape above); `<repo>//<path>` (unambiguous against the path
+ *   grammar, which never admits an empty segment, but unreadable and unguessable); and requiring
+ *   a full GitHub blob URL (already parsed here, already unambiguous — but it needs a ref the
+ *   author has to look up, and a form that is painful to write is a real cost when the issues
+ *   have to be edited by hand).
+ *
+ *   EXTERNAL is a category of its own and does not fail the build. Silence was the alternative
+ *   and is the one option ruled out: this module's round-1 review found four defects that were
+ *   each a citation passed *in total silence*, indistinguishable from one that had been checked,
+ *   and a fifth is not being added here. Folding it into STALE was equally wrong, for the reason
+ *   `listIssues` already gives for exit 2 — "nobody could look" is not the same answer as "the
+ *   citations disagree with the tree", and conflating them sends someone hunting a disagreement
+ *   that may not exist. Both symbol forms take the qualifier on their path side for the same
+ *   reason: without it, a qualified symbol row matched nothing at all — not STALE, not EXTERNAL,
+ *   silence — which is that same defect reappearing in the fix for it.
+ *
+ *   **Deliberately not built: a way to write *about* a locus without *citing* it.** `#780`'s body
+ *   argues for one (it generates four ADVISORY entries that way). An escape form that suppresses
+ *   checking is an allow-list with nicer syntax: anyone can wrap a genuine, rotting citation in it
+ *   and mute the check permanently, which is precisely what "Why there is no allow-list" above
+ *   refuses. ADVISORY does not fail the build, so those entries cost nothing today. If it becomes
+ *   load-bearing it needs its own design round, not a rider on this one.
+ *
+ *   The honest limit, stated rather than left to be discovered: naming another repository does
+ *   remove a citation from this tree's checking — that is the whole feature, and no design can
+ *   both exempt external loci and exempt nothing. What the form does guarantee is that the
+ *   exemption is never *silent* and never *unfalsifiable*: the output names the repository the
+ *   citation claims, so a wrong claim is contradicted by reading it, unlike an allow-list entry
+ *   whose only content is "do not check this". And the one direction that could be abused without
+ *   making any claim at all — qualifying a local path with this repository's own slug — resolves
+ *   to ordinary local checking, so it exempts nothing.
+ *
+ *   Verified by fixture rows built from the citation text the real issues actually wrote, not
+ *   from the checker's rendering of it — the difference between the two (`~/.hermes/state.db`
+ *   written, `.hermes/state.db` reported) is the whole of class A. Each class's change was then
+ *   reverted alone against the passing suite to confirm its rows fail without it, and two guard
+ *   rows pin the over-reach direction: a genuine repository citation beside a home path on the
+ *   same line is still checked, and a qualifier naming this repository still reports the real
+ *   STALE it names.
+ *
  * Usage: node scripts/verify-tracker-loci-resolve.mjs [--json] [--strict] [--issues-file=<path>] [--repo-root=<path>]
  */
 import { execFileSync } from "node:child_process";
@@ -1294,6 +1391,8 @@ const resolvePath = (cited) => {
  * an explicit citation-shaped construct is reported and fails instead of disappearing. `out-of-
  * grammar` is reserved for ambiguous prose that this scanner does not claim is a citation.
  */
+const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 const CITATION_GRAMMAR_RULES = Object.freeze([
   Object.freeze({
     context: "inline-code-span",
@@ -1334,6 +1433,30 @@ const CITATION_GRAMMAR_RULES = Object.freeze([
     integerSource: "-?\\d+",
     firstValidLine: 1,
   }),
+  // #780 class B. A citation can name the repository it means, and one that names a repository
+  // this check does not have is reported EXTERNAL rather than measured against this tree. The
+  // separator is `@` after a full `<owner>/<repo>` slug, for two reasons that are both about what
+  // the form makes impossible rather than what it makes convenient: the slug is the only name
+  // comparable against this repository's own identity (`repoSlug`), so a qualifier naming *this*
+  // repository is stripped and the path checked here exactly as before — the form cannot be used
+  // to excuse a local citation; and requiring the slash rules out the shapes a bare `<name>@`
+  // would swallow (an email address, `user@host.tld`, is the near miss that decided it).
+  Object.freeze({
+    context: "repository-qualified-path",
+    support: "supported",
+    slugSeparator: "/",
+    pathSeparator: "@",
+    slugSegmentSource: "[A-Za-z0-9][A-Za-z0-9._-]*",
+  }),
+  // #780 class A. `~/`, `$HOME/`, and `${HOME}/` all name the home directory *by definition*, so
+  // the remainder is never a path in this repository and resolving it here can only ever produce
+  // a false STALE. Out of grammar rather than a category, because there is nothing to report: a
+  // citation that says "not in this tree" and is answered "not in this tree" is not a finding.
+  Object.freeze({
+    context: "home-directory-path",
+    support: "out-of-grammar",
+    prefixes: Object.freeze(["~/", "$HOME/", "${HOME}/"]),
+  }),
   Object.freeze({
     context: "undelimited-root-filename-without-line",
     support: "out-of-grammar",
@@ -1351,6 +1474,8 @@ const FENCE_GRAMMAR = citationGrammar("fenced-code-block");
 const MARKDOWN_LINK_GRAMMAR = citationGrammar("markdown-inline-link");
 const LINE_GRAMMAR = citationGrammar("line-number");
 const BLOB_GRAMMAR = citationGrammar("github-blob-url");
+const HOME_GRAMMAR = citationGrammar("home-directory-path");
+const REPO_QUALIFIER_GRAMMAR = citationGrammar("repository-qualified-path");
 
 const DIRECTORY_PATH_SOURCE = "\\.?[A-Za-z_][\\w-]*(?:/[\\w.-]+)+";
 const ROOT_DOTFILE_SOURCE = "\\.[A-Za-z_][\\w-]*";
@@ -1366,6 +1491,61 @@ const COORDINATE_SHAPED_RE = new RegExp(
   `(?<![\\w.])(${PATH_TOKEN_SOURCE})\\b(?<coordinate>:[^\\s\`'"\\)\\]}>*_]+|#L?[^\\s\`'"\\)\\]}>*_]+)`,
   "g",
 );
+
+// #780 class A: a home-directory marker and everything it qualifies, so no part of it is offered
+// to `PATH_RE` as a repository path. The left boundary is a lookbehind rather than `\b` for the
+// same reason round 7 needed one for a leading dot — `~` and `$` are non-word characters, and a
+// word boundary next to whitespace never fires there, which is how `$HOME/…` came to be reported
+// as `HOME/…`: a marker the checker had removed itself, then called missing. The span runs to the
+// first character that ends a citation in prose (whitespace or a closing delimiter), so a real
+// repository citation later on the same line is untouched.
+const HOME_PREFIX_SOURCE = `(?:${HOME_GRAMMAR.prefixes.map(escapeRegex).join("|")})`;
+const HOME_PATH_RE = new RegExp(`(?<![\\w.$~/-])${HOME_PREFIX_SOURCE}[^\\s\`'"()\\[\\]<>]*`, "g");
+
+// #780 class B: `<owner>/<repo>@<path>[:line]`. The coordinate grammar is the supported one, so a
+// qualified citation carrying a malformed coordinate is not quietly absorbed by this span; the
+// path grammar is `PATH_TOKEN_SOURCE` itself, so the qualifier admits exactly the path shapes the
+// unqualified forms already admit and no others. The left lookbehind excludes `@` so an npm scope
+// (`@scope/pkg@1.2.3`) cannot be read as a slug.
+const REPO_SLUG_SOURCE =
+  `${REPO_QUALIFIER_GRAMMAR.slugSegmentSource}` +
+  `${escapeRegex(REPO_QUALIFIER_GRAMMAR.slugSeparator)}` +
+  `${REPO_QUALIFIER_GRAMMAR.slugSegmentSource}`;
+const REPO_QUALIFIER_PREFIX_SOURCE = `${REPO_SLUG_SOURCE}${escapeRegex(REPO_QUALIFIER_GRAMMAR.pathSeparator)}`;
+const QUALIFIED_COORDINATE_SOURCE =
+  `(?::${SIGNED_LINE_SOURCE}(?:-${SIGNED_LINE_SOURCE})?|#L${SIGNED_LINE_SOURCE}(?:-L?${SIGNED_LINE_SOURCE})?)`;
+const QUALIFIED_PATH_RE = new RegExp(
+  `(?<![\\w.@/-])(?<slug>${REPO_SLUG_SOURCE})${escapeRegex(REPO_QUALIFIER_GRAMMAR.pathSeparator)}` +
+    `(?:${PATH_TOKEN_SOURCE})\\b${QUALIFIED_COORDINATE_SOURCE}?`,
+  "g",
+);
+const REPO_QUALIFIER_SPLIT_RE = new RegExp(
+  `^(${REPO_SLUG_SOURCE})${escapeRegex(REPO_QUALIFIER_GRAMMAR.pathSeparator)}(.+)$`,
+);
+
+/**
+ * Whether a qualifier names a repository this check can *prove* is not the one it is running in.
+ * `repoSlug` is null when there is no `origin` remote to derive an identity from; the honest
+ * answer there is "cannot prove it is elsewhere", and the only non-silencing default is to keep
+ * measuring the path against this tree — which is precisely what this check did before the
+ * qualifier existed, so an origin-less clone loses nothing it had and gains no exemption.
+ */
+const namesAnotherRepository = (slug) => repoSlug !== null && slug.toLowerCase() !== repoSlug;
+
+/**
+ * Splits a repository qualifier off a cited path. A qualifier naming *this* repository is not a
+ * statement about another tree at all — it is this repository's own path written the long way, so
+ * the qualifier is consumed and the path is checked here exactly as an unqualified one would be.
+ * That is what makes the form unusable as an exemption: the only way to reach EXTERNAL is to name
+ * a repository this check can show is not this one, which is a claim a reader can see and
+ * contradict, rather than an entry in a list that silences by existing.
+ */
+const splitRepoQualifier = (cited) => {
+  const match = REPO_QUALIFIER_SPLIT_RE.exec(cited);
+  if (match === null) return { slug: null, path: cited };
+  if (!namesAnotherRepository(match[1])) return { slug: null, path: match[2] };
+  return { slug: match[1], path: match[2] };
+};
 
 // Round 6: this used to be a hand-maintained list of specific extensions (`tsx|ts|mts|mjs|cjs|
 // json|js|plist|py|sh|sql|md|yaml|yml`) — evidence-first (each one added because a real issue
@@ -1538,8 +1718,6 @@ const resolveBlobRefAndPath = (segments) => {
       "no known local branch or tag matches it, and no tracked file tail identifies the boundary; not classified as absent",
   };
 };
-const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
 // One executable answer to "what is a symbol". JavaScript's `\w` and `\b` are ASCII definitions,
 // so they cannot model either Unicode identifiers or a `$` boundary. `ID_Continue` does not include
 // the two join controls that JavaScript permits after the first character, hence their explicit
@@ -1575,8 +1753,13 @@ const QUOTED_SYMBOL_TOKEN_RE = new RegExp(QUOTED_SYMBOL_TOKEN_SOURCE, "gu");
 // The outer citation forms are intentionally wider than the identifier grammar: an explicitly
 // quoted token in one of these positions must reach validation so an unsupported token is loud.
 // Restricting these matchers to valid identifiers would recreate the silent false green.
+// #780 class B: the path side of both symbol forms admits the same optional `<owner>/<repo>@`
+// qualifier the line scanner reads. Without it, a qualified symbol row matched *nothing* — not
+// STALE, not EXTERNAL, silence — which is the one outcome this module's round-1 review named as
+// the defect it exists to end. The qualifier is optional, so an unqualified row is unchanged.
+const SYMBOL_PATH_SOURCE = `(?:${REPO_QUALIFIER_PREFIX_SOURCE})?[\\w./-]+\\.\\w+`;
 const SYMBOL_ROW_RE = new RegExp(
-  "`([\\w./-]+\\.\\w+)`\\s*(?:—|--?)\\s*" +
+  `\`(${SYMBOL_PATH_SOURCE})\`` + "\\s*(?:—|--?)\\s*" +
     `((?:${QUOTED_SYMBOL_TOKEN_SOURCE},?[ \\t]*)+)`,
   "gu",
 );
@@ -1591,7 +1774,7 @@ const SYMBOL_ROW_RE = new RegExp(
 // both genuine, zero incidental matches on anything else in the corpus at the time of that
 // snapshot — see the round 9 commit for the full diff.
 const SYMBOL_PROSE_RE = new RegExp(
-  `${QUOTED_SYMBOL_TOKEN_SOURCE}\\s+in\\s+\`([\\w./-]+\\.\\w+)\``,
+  `${QUOTED_SYMBOL_TOKEN_SOURCE}\\s+in\\s+\`(${SYMBOL_PATH_SOURCE})\``,
   "gu",
 );
 const NON_DURABLE_RE = /(\/private\/tmp\/[^\s`)]+|(?<![\w/])\/tmp\/[^\s`)]+)/g;
@@ -2004,16 +2187,26 @@ const extractFromBody = (body) => {
   const seenSymbolRow = new Set();
   const seenNonDurable = new Set();
   const seenUnsupported = new Set();
+  const seenExternal = new Set();
   const pathCitations = [];
   const symbolCitations = [];
   const nonDurable = [];
   const unsupportedCitations = [];
+  const externalCitations = [];
 
   const noteUnsupported = (citation, reason) => {
     const key = `${citation}:${reason}`;
     if (seenUnsupported.has(key)) return;
     seenUnsupported.add(key);
     unsupportedCitations.push({ citation, reason });
+  };
+
+  // Keyed on the citation text alone so the line scanner and the symbol forms, which see the same
+  // qualified path from two directions, report it once rather than twice.
+  const noteExternal = (citation, slug) => {
+    if (seenExternal.has(citation)) return;
+    seenExternal.add(citation);
+    externalCitations.push({ citation, slug });
   };
 
   for (const rawLine of lines) {
@@ -2036,8 +2229,16 @@ const extractFromBody = (body) => {
       }
     }
 
+    // #780 class A, first because every other scan on this line defers to it. `~/tmp/x` is a
+    // path under the operator's home directory, not the system temporary directory the filesystem
+    // deletes, so NON_DURABLE defers here too rather than reporting a custody claim about a
+    // directory nobody named.
+    const homeSpans = [...rawLine.matchAll(HOME_PATH_RE)].map((m) => [m.index, m.index + m[0].length]);
+    const insideHome = (idx) => homeSpans.some(([start, end]) => idx >= start && idx < end);
+
     const nonDurableSpans = [];
     for (const m of rawLine.matchAll(NON_DURABLE_RE)) {
+      if (insideHome(m.index)) continue;
       const path = m[0].replace(/[.,;:)]+$/, "");
       nonDurableSpans.push([m.index, m.index + path.length]);
       if (!seenNonDurable.has(path)) {
@@ -2054,9 +2255,27 @@ const extractFromBody = (body) => {
     // which is true but redundant and points a reader at "re-derive the claim from the code" for
     // something re-deriving cannot fix.
     const insideNonDurable = (idx) => nonDurableSpans.some(([s, e]) => idx >= s && idx < e);
+
+    // #780 class B. A qualifier naming a repository this check can show is not the one it runs in
+    // masks its whole span from the path scanners below — not because the citation is unimportant
+    // but because measuring it here would answer a question nobody asked. A qualifier naming *this*
+    // repository records no span at all, so the path inside it falls through to `PATH_RE` and is
+    // measured exactly as an unqualified citation is; that is the entire reason the form cannot be
+    // turned into an exemption for a local locus.
+    const externalSpans = [];
+    for (const m of rawLine.matchAll(QUALIFIED_PATH_RE)) {
+      if (insideUrl(m.index) || insideHome(m.index) || insideNonDurable(m.index)) continue;
+      const slug = m.groups.slug;
+      if (!namesAnotherRepository(slug)) continue;
+      externalSpans.push([m.index, m.index + m[0].length]);
+      noteExternal(m[0], slug);
+    }
+    const insideExternal = (idx) => externalSpans.some(([start, end]) => idx >= start && idx < end);
+
     const unsupportedCoordinateSpans = [];
     for (const coordinateMatch of rawLine.matchAll(COORDINATE_SHAPED_RE)) {
       if (insideUrl(coordinateMatch.index) || insideNonDurable(coordinateMatch.index)) continue;
+      if (insideHome(coordinateMatch.index) || insideExternal(coordinateMatch.index)) continue;
       const coordinate = coordinateMatch.groups.coordinate.replace(/[.,;:]+$/, "");
       if (SUPPORTED_COORDINATE_RE.test(coordinate)) continue;
       const raw = `${coordinateMatch[1]}${coordinate}`;
@@ -2162,6 +2381,10 @@ const extractFromBody = (body) => {
     for (const m of rawLine.matchAll(PATH_RE)) {
       if (insideNonDurable(m.index)) continue;
       if (insideUnsupportedCoordinate(m.index)) continue;
+      // A home-directory path is not in this tree by definition, and a citation qualified with
+      // another repository names a tree this check does not have; neither is a claim about a path
+      // here, so neither is resolved as one.
+      if (insideHome(m.index) || insideExternal(m.index)) continue;
       // Any URL, not only a GitHub blob link: a fragment of a hyperlink's text is not a citation
       // in its own right, whether or not it superficially carries a line-number-shaped suffix —
       // that leniency is exactly what let a URL fragment through as a fabricated path before. A
@@ -2210,7 +2433,12 @@ const extractFromBody = (body) => {
   }
 
   for (const m of body.matchAll(SYMBOL_ROW_RE)) {
-    const path = m[1];
+    const qualified = splitRepoQualifier(m[1]);
+    if (qualified.slug !== null) {
+      noteExternal(m[1], qualified.slug);
+      continue;
+    }
+    const path = qualified.path;
     const symbols = [];
     for (const token of m[2].matchAll(QUOTED_SYMBOL_TOKEN_RE)) {
       const symbol = parseSymbolReference(token[1]);
@@ -2236,8 +2464,13 @@ const extractFromBody = (body) => {
   // disclosed as a limitation. Same dedup key shape as the table form above (`path:symbol`), so a
   // symbol cited both ways collapses to one row instead of being reported twice.
   for (const m of body.matchAll(SYMBOL_PROSE_RE)) {
+    const qualified = splitRepoQualifier(m[2]);
+    if (qualified.slug !== null) {
+      noteExternal(m[2], qualified.slug);
+      continue;
+    }
     const symbol = parseSymbolReference(m[1]);
-    const path = m[2];
+    const path = qualified.path;
     if (symbol === null) {
       noteUnsupported(
         m[0],
@@ -2253,7 +2486,7 @@ const extractFromBody = (body) => {
     symbolCitations.push({ raw: m[0], path, symbols: [symbol] });
   }
 
-  return { pathCitations, symbolCitations, nonDurable, unsupportedCitations };
+  return { pathCitations, symbolCitations, nonDurable, unsupportedCitations, externalCitations };
 };
 
 // --- classification ------------------------------------------------------------------------
@@ -2262,12 +2495,25 @@ const unresolved = [];
 const unsupported = [];
 const advisory = [];
 const nonDurableFindings = [];
+// #780 class B. Its own category, and not one that fails: this check has no copy of the named
+// repository, so "not verified" is the only true thing it can say. That is the same distinction
+// `listIssues` already draws with exit 2 — "nobody could look" is not "the citations disagree with
+// the tree", and reporting one as the other sends a reader hunting a disagreement that may not
+// exist. Silence was the alternative and is the one option ruled out: this module's round-1 review
+// found four defects that were each a citation passed without a word, indistinguishable from one
+// that had actually been checked.
+const external = [];
 
 for (const issue of issues) {
-  const { pathCitations, symbolCitations, nonDurable, unsupportedCitations } = extractFromBody(issue.body ?? "");
+  const { pathCitations, symbolCitations, nonDurable, unsupportedCitations, externalCitations } =
+    extractFromBody(issue.body ?? "");
 
   for (const finding of unsupportedCitations) {
     unsupported.push({ issue, citation: finding.citation, reason: finding.reason });
+  }
+
+  for (const finding of externalCitations) {
+    external.push({ issue, citation: finding.citation, slug: finding.slug });
   }
 
   for (const nd of nonDurable) {
@@ -2556,11 +2802,16 @@ const nothingToReport =
   stale.length === 0 &&
   unresolved.length === 0 &&
   unsupported.length === 0 &&
+  external.length === 0 &&
   nonDurableFindings.length === 0 &&
   advisory.length === 0;
 
 if (asJson) {
-  console.log(JSON.stringify({ stale, unresolved, unsupported, advisory, nonDurable: nonDurableFindings }, null, 2));
+  // `external` sits before `nonDurable` deliberately: the round 22 flush test reads the *last*
+  // key to prove a large report was not truncated, and that anchor stays where it was.
+  console.log(
+    JSON.stringify({ stale, unresolved, unsupported, advisory, external, nonDurable: nonDurableFindings }, null, 2),
+  );
 } else if (!nothingToReport) {
   if (stale.length > 0) {
     console.log(`STALE (${stale.length}):`);
@@ -2586,6 +2837,17 @@ if (asJson) {
       console.log(`    ${item.reason}`);
     }
   }
+  if (external.length > 0) {
+    console.log(`\nEXTERNAL (${external.length}):`);
+    for (const item of external) {
+      console.log(`  #${item.issue.number} ${item.issue.title}`);
+      console.log(`    ${item.citation}`);
+      console.log(
+        `    names ${item.slug}, a repository this check does not have — it cannot verify a citation ` +
+          "into a repository it does not have, and does not claim to",
+      );
+    }
+  }
   if (nonDurableFindings.length > 0) {
     console.log(`\nNON_DURABLE (${nonDurableFindings.length}):`);
     for (const item of nonDurableFindings) {
@@ -2603,7 +2865,7 @@ if (asJson) {
   }
   console.log(
     `\n${stale.length} stale, ${unresolved.length} unresolved, ${unsupported.length} unsupported, ` +
-      `${nonDurableFindings.length} non-durable path citation(s), ` +
+      `${external.length} external, ${nonDurableFindings.length} non-durable path citation(s), ` +
       `${advisory.length} advisory ` +
       `(citations that resolve but should name a durable locus) across ${issues.length} open issue(s).`,
   );
@@ -2614,6 +2876,12 @@ if (asJson) {
         "UNSUPPORTED means an explicit citation-shaped form was seen but is outside the grammar above; rewrite it in a supported form.\n" +
         "NON_DURABLE means the citation names something the filesystem does not guarantee to keep;\n" +
         "commit it or accept it is gone. A contradictory issue edit does not repair any of these findings.",
+    );
+  }
+  if (external.length > 0) {
+    console.log(
+      "\nEXTERNAL does not fail the build: this check has no copy of the named repository, so it cannot " +
+        "verify the citation and says so instead of measuring it against this tree.",
     );
   }
   if (

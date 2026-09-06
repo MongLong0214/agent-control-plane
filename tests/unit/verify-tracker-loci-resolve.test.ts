@@ -2836,4 +2836,211 @@ describe("verify-tracker-loci-resolve", () => {
       cleanup();
     }
   });
+
+  // Issue #780. Five STALE findings on `main` fall into exactly two classes, and both are a
+  // statement about the citation's *grammar* rather than about any one file, so neither is
+  // answered by an allow-list — see the script header's own argument for why there isn't one.
+  //
+  //   Class A  a `~/`-prefixed runtime path (#655, #627) resolved as a repository path. The
+  //            marker means "the home directory" by definition, so the remainder is never a
+  //            repository path and no edit to either issue can make it one.
+  //   Class B  a citation into another repository (#756, #627). All three files exist — in the
+  //            Hermes repository. The checker is right that they do not resolve here; the
+  //            grammar had no way to say which repository a citation means.
+  //
+  // Every body below is the citation text the real issue actually wrote, not the checker's
+  // rendering of it: what the checker *reported* (`.hermes/state.db`, `SSOT.md:99`) is the
+  // marker-stripped remainder, and the difference between the two is the whole defect.
+  describe("round 26 (#780) home-directory paths and repository-qualified citations", () => {
+    /** `owner/repo` from `origin`, derived the same way the script derives its own identity. */
+    const originSlug = (): string => {
+      const raw = spawnSync("git", ["remote", "get-url", "origin"], { cwd: repoRoot, encoding: "utf8" }).stdout.trim();
+      const match = raw.match(/github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?\/?$/);
+      expect(match, `origin is not a GitHub remote: ${JSON.stringify(raw)}`).not.toBeNull();
+      return `${match![1]}/${match![2]}`;
+    };
+
+    it("[class A] #655's fenced `~/`-prefixed state path is not resolved against this repository", () => {
+      // Verbatim from #655's "The permitted shape" fence, the line that produced
+      // `.agent-control-plane/state.sqlite does not exist`.
+      const body = [
+        "```",
+        "disposable   state directory · database · sockets · lock · runtime root · CEO actor",
+        "shared       the production composition root, and the real Telegram transport",
+        "untouched    ~/.agent-control-plane/state.sqlite · gen1/actorA · production sockets/lock/runtime",
+        "             production agentcpd stays Telegram-unconfigured throughout",
+        "```",
+      ].join("\n");
+      const { path, cleanup } = withIssues([{ number: 9655, title: "class A fenced home path", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(0);
+        expect(result.stdout).toBe("");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class A] #627's inline `~/.hermes/state.db` is not resolved against this repository", () => {
+      // Verbatim from #627's "The damage is measurable" paragraph.
+      const body = "`~/.hermes/state.db`, sessions by size:";
+      const { path, cleanup } = withIssues([{ number: 9627, title: "class A inline home path", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(0);
+        expect(result.stdout).toBe("");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class A] `$HOME/` and `${HOME}/` name the same directory and are excluded the same way", () => {
+      const body = [
+        "The daemon opens $HOME/.agent-control-plane/state.sqlite at startup.",
+        "The launchd plist writes the same file as ${HOME}/.agent-control-plane/state.sqlite.",
+      ].join("\n");
+      const { path, cleanup } = withIssues([{ number: 9781, title: "class A HOME variable forms", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(0);
+        expect(result.stdout).toBe("");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class A guard] a genuine repository citation beside a home path is still checked", () => {
+      const body = "The runtime copy is `~/.hermes/state.db`; the source of truth is `src/does/not/exist.ts:42`.";
+      const { path, cleanup } = withIssues([{ number: 9782, title: "class A guard same line", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(1);
+        expect(result.stdout).toContain("STALE");
+        expect(result.stdout).toContain("src/does/not/exist.ts does not exist");
+        expect(result.stdout).not.toContain("state.db");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class A guard] a tilde inside a word does not open a home path", () => {
+      const body = "The editor's backup marker session~/ is unrelated to `src/does/not/exist.ts:42`.";
+      const { path, cleanup } = withIssues([{ number: 9783, title: "class A guard mid word tilde", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(1);
+        expect(result.stdout).toContain("src/does/not/exist.ts does not exist");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class B] #756's citation, qualified with the repository it means, is EXTERNAL and does not fail", () => {
+      const body = "`MongLong0214/hermes@hermes_state_schema.py:1333`";
+      const { path, cleanup } = withIssues([{ number: 9756, title: "class B qualified python locus", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(0);
+        expect(result.stdout).toContain("EXTERNAL");
+        expect(result.stdout).toContain("MongLong0214/hermes@hermes_state_schema.py:1333");
+        expect(result.stdout).not.toContain("STALE");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class B] #627's `SSOT.md:99` and `ARCHITECTURE.md`, qualified, are EXTERNAL with and without a line", () => {
+      const body = [
+        "`MongLong0214/hermes@SSOT.md:99` states the rule that Buzz must not fork the CEO.",
+        "Per `MongLong0214/hermes@ARCHITECTURE.md`'s cross-surface coherence contract the accepted",
+        "mechanism is peer UDS + transcript observer.",
+      ].join("\n");
+      const { path, cleanup } = withIssues([{ number: 9784, title: "class B qualified markdown loci", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(0);
+        expect(result.stdout).toContain("MongLong0214/hermes@SSOT.md:99");
+        expect(result.stdout).toContain("MongLong0214/hermes@ARCHITECTURE.md");
+        expect(result.stdout).not.toContain("STALE");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class B] an unqualified citation into another repository is still STALE — the qualifier is opt-in", () => {
+      // #756's text exactly as it stands today. Nothing in it names a repository, so the checker
+      // is right that it does not resolve here, and this stays the answer until the issue is edited.
+      const body = "`hermes_state_schema.py:1333`";
+      const { path, cleanup } = withIssues([{ number: 9785, title: "class B unqualified control", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(1);
+        expect(result.stdout).toContain("STALE");
+        expect(result.stdout).toContain("hermes_state_schema.py does not exist");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class B guard] the qualifier naming this repository cannot silence a real STALE", () => {
+      const body = `\`${originSlug()}@src/does/not/exist.ts:42\` is the culprit.`;
+      const { path, cleanup } = withIssues([{ number: 9786, title: "class B guard self slug", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(1);
+        expect(result.stdout).toContain("STALE");
+        expect(result.stdout).toContain("src/does/not/exist.ts does not exist");
+        expect(result.stdout).not.toContain("EXTERNAL");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class B guard] naming another repository exempts a local path only by making a visible claim", () => {
+      // The honest limit of the form, pinned rather than left to be discovered: a qualifier that
+      // names some other repository does take a citation out of this tree's checking — that is the
+      // feature. What it cannot do is exempt anything *quietly*: the output names the repository
+      // the citation claims, so the claim is contradictable by reading it, which is precisely what
+      // an allow-list entry ("do not check this") is not.
+      const body = "`Someone/elsewhere@src/does/not/exist.ts:42` is the culprit.";
+      const { path, cleanup } = withIssues([{ number: 9789, title: "class B residual limit", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(0);
+        expect(result.stdout).toContain("EXTERNAL");
+        expect(result.stdout).toContain("names Someone/elsewhere, a repository this check does not have");
+        expect(result.stdout).not.toContain("STALE");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class B guard] a symbol row qualified with another repository is EXTERNAL, never silence", () => {
+      const body = "`MongLong0214/hermes@src/continuity/continuity-kernel.ts` — `definitelyNotARealSymbolXYZ`";
+      const { path, cleanup } = withIssues([{ number: 9787, title: "class B guard external symbol row", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(0);
+        expect(result.stdout).toContain("EXTERNAL");
+        expect(result.stdout).toContain("MongLong0214/hermes@src/continuity/continuity-kernel.ts");
+        expect(result.stdout).not.toContain("STALE");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("[class B guard] a symbol row qualified with this repository is still searched here", () => {
+      const body = `\`${originSlug()}@src/continuity/continuity-kernel.ts\` — \`definitelyNotARealSymbolXYZ\``;
+      const { path, cleanup } = withIssues([{ number: 9788, title: "class B guard self symbol row", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout).toBe(1);
+        expect(result.stdout).toContain("STALE");
+        expect(result.stdout).toContain("does not appear");
+        expect(result.stdout).not.toContain("EXTERNAL");
+      } finally {
+        cleanup();
+      }
+    });
+  });
 });
