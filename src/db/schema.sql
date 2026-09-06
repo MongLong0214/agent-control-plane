@@ -1587,11 +1587,25 @@ CREATE TABLE IF NOT EXISTS continuity_state (
 -- than a matter of discipline: a turn requires a binding and an attestation, and only an
 -- authenticated preflight bind can produce them. Admission fails closed at the schema.
 
--- Seeded and immutable, so a new executor cannot be introduced by writing a string.
+-- Seeded and immutable in intent; not yet enforced at this boundary. Nothing here blocks an
+-- application-time `INSERT OR IGNORE INTO executor_kinds` from introducing an unlisted value. A
+-- `BEFORE INSERT` trigger cannot be added the way schema.sql's other triggers normally are: v12/v13
+-- replay the whole *current* schema.sql when climbing from an old database, installing such a
+-- trigger far earlier in a replayed chain than its migration number would suggest.
+-- `v21-canonical-turns` (src/db/migrations.ts, frozen, checksummed, unchangeable) creates this
+-- table and seeds it with its own `INSERT OR IGNORE INTO executor_kinds (executor_kind) VALUES
+-- ('hermes')` — an unconditional insert-blocking trigger installed that early would abort this
+-- frozen step's own, otherwise-harmless re-seed, failing a v11-origin chain replay with
+-- `EXECUTOR_KIND_IMMUTABLE`. Enforcing this needs a version-gated install (the
+-- `REQUIRED_LEDGER_TRIGGERS`/`introducedIn`-scoped mechanism the canonical-turn triggers use,
+-- which schema.sql's plain triggers do not have) or a change to v12/v13's full-replay behavior.
+-- Until one of those lands, a migration is the only place a new executor kind may be introduced.
 CREATE TABLE IF NOT EXISTS executor_kinds (
   executor_kind TEXT PRIMARY KEY
 );
 INSERT OR IGNORE INTO executor_kinds (executor_kind) VALUES ('hermes');
+-- v37 (#760) — the canonical CTO self-claim primitive's target executor family.
+INSERT OR IGNORE INTO executor_kinds (executor_kind) VALUES ('claude-cli');
 
 CREATE TABLE IF NOT EXISTS actor_target_bindings (
   target_binding_id     TEXT PRIMARY KEY,

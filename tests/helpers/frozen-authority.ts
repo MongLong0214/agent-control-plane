@@ -30,10 +30,18 @@ export const TRACE_BYTES_SHA256 =
 export const RECEIPT_BYTES_SHA256 =
   "aa90c6af77754fce9861cb4f57501879c24f66f5616cf46225c5375adfd2a19d";
 
+/**
+ * `src/db/migrations.ts` and `tests/fixtures/schema-v25-lineage.sql` are append-only, frozen
+ * inputs: pinning their exact bytes here means any edit to either file — including one that also
+ * updates its own fixture to match — changes the value a reader compares against, not merely the
+ * file being read. These digests are not recomputed from the files they describe: a pin a run
+ * derives from its own input agrees with whatever it is handed, which is exactly the defect these
+ * pins exist to close.
+ */
 export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string }> = [
   {
     path: "src/db/migrations.ts",
-    sha256: "23d35db447e90a79d487ea3cc0b01c354e75a7e42af4e604afdf981bf7506dfb",
+    sha256: "6d67c8f943deb3f133747f4e7417deaebad0df13647e1ef0292dcaa0130ddce7",
   },
   {
     path: "tests/fixtures/schema-v25-lineage.sql",
