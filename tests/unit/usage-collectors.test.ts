@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { chmodSync, linkSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, linkSync, mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { ManualClock } from "../../src/core/clock.ts";
@@ -9,6 +9,7 @@ import {
   ClaudeCliAdapter,
   CodexCliAdapter,
   GrokCliAdapter,
+  __testing,
 } from "../../src/runtime/cli-adapters.ts";
 import {
   CLAUDE_NON_INTERACTIVE_ARGS,
@@ -1547,6 +1548,128 @@ setInterval(() => {}, 1_000);
     }
     // Deleting Grok from the composition root turns this into a two-provider registry;
     // merely defining a collector elsewhere is not enough to satisfy P0-11.
+  });
+
+  it("#785 spawns each provider CLI at the absolute path the launcher pinned, not a bare name", async () => {
+    // The composition root is the subject. `resolveExecutable` already had an absolute-path
+    // branch and the launcher already baked the paths; what was missing was anything joining
+    // them, so the pins were inert and every probe went on searching a PATH that cannot reach a
+    // user-local bin. This drives `defaultAdapters()` through `new ControlPlane`, not a directly
+    // constructed adapter, because the defect lived in the construction and not in the adapter.
+    const root = tempDir("acp-785-provider-pins-");
+    const pinnedBin = join(root, "pinned-bin");
+    mkdirSync(pinnedBin, { recursive: true });
+    // Deliberately in a directory that is on no PATH anywhere in this process. If the reader is
+    // deleted, `options.binary` is undefined, the adapter falls back to the bare name, and the
+    // PATH search cannot reach here — so the row fails rather than accidentally passing on a
+    // machine that happens to have a real `claude` installed.
+    const pins: Record<string, string> = {};
+    for (const name of ["claude", "codex", "grok"]) {
+      const path = join(pinnedBin, name);
+      writeFileSync(path, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      chmodSync(path, 0o755);
+      pins[name] = path;
+    }
+    expect(process.env["PATH"] ?? "").not.toContain(pinnedBin);
+
+    const before = {
+      claude: process.env["ACP_CLAUDE_BINARY"],
+      codex: process.env["ACP_CODEX_BINARY"],
+      grok: process.env["ACP_GROK_BINARY"],
+    };
+    process.env["ACP_CLAUDE_BINARY"] = pins["claude"] as string;
+    process.env["ACP_CODEX_BINARY"] = pins["codex"] as string;
+    process.env["ACP_GROK_BINARY"] = pins["grok"] as string;
+
+    // The file each adapter would actually hand to `spawn`, captured at the existing seam rather
+    // than inferred. `#binary` is private and has no accessor, so this is the only place the
+    // resolved value is observable without running a real seatbelt probe.
+    const spawned: string[] = [];
+    __testing.setRunCli(async (file: string) => {
+      spawned.push(file);
+      return { stdout: "", stderr: "", exitCode: 0, timedOut: false, isolationEnforced: false };
+    });
+
+    const cp = new ControlPlane({
+      databasePath: join(root, "state.sqlite"),
+      worktreeRoot: join(root, "worktrees"),
+      capacityDir: join(root, "capacity"),
+      secretsDir: join(root, "secrets"),
+      clock: clock(),
+    });
+    try {
+      for (const provider of ["claude", "gpt", "grok"]) {
+        await cp.providers.require(provider).probeRuntime();
+      }
+      // `resolveExecutable` realpaths an absolute binary, and a macOS temp root is itself a
+      // symlink, so the expectation is resolved the same way rather than compared raw.
+      expect(spawned).toEqual([
+        realpathSync(pins["claude"] as string),
+        realpathSync(pins["codex"] as string),
+        realpathSync(pins["grok"] as string),
+      ]);
+      // Not a bare name — the exact failure the pins exist to end, and the one thing a passing
+      // assertion above could still be hiding if the paths ever became relative.
+      for (const file of spawned) expect(file.startsWith("/")).toBe(true);
+    } finally {
+      __testing.setRunCli(null);
+      cp.close();
+      for (const [name, value] of Object.entries(before)) {
+        const variable = `ACP_${name.toUpperCase()}_BINARY`;
+        if (value === undefined) delete process.env[variable];
+        else process.env[variable] = value;
+      }
+    }
+  });
+
+  it("#785 leaves the PATH search exactly as it was when no pin is exported", async () => {
+    // A host with no pins must behave as it did before the reader existed: `undefined` reaches
+    // `options.binary ?? "claude"` and the bare name is searched. Without this, a reader that
+    // exported an empty string instead of leaving the variable unset would send the adapter an
+    // absolute-path branch on "" and break every deployment that has no pins at all.
+    const root = tempDir("acp-785-provider-no-pins-");
+    const before = {
+      claude: process.env["ACP_CLAUDE_BINARY"],
+      codex: process.env["ACP_CODEX_BINARY"],
+      grok: process.env["ACP_GROK_BINARY"],
+    };
+    delete process.env["ACP_CLAUDE_BINARY"];
+    delete process.env["ACP_CODEX_BINARY"];
+    delete process.env["ACP_GROK_BINARY"];
+
+    const spawned: string[] = [];
+    __testing.setRunCli(async (file: string) => {
+      spawned.push(file);
+      return { stdout: "", stderr: "", exitCode: 0, timedOut: false, isolationEnforced: false };
+    });
+    const cp = new ControlPlane({
+      databasePath: join(root, "state.sqlite"),
+      worktreeRoot: join(root, "worktrees"),
+      capacityDir: join(root, "capacity"),
+      secretsDir: join(root, "secrets"),
+      clock: clock(),
+    });
+    try {
+      for (const provider of ["claude", "gpt", "grok"]) {
+        await cp.providers.require(provider).probeRuntime();
+      }
+      // Either this machine has the CLI on PATH and it resolved absolutely, or it does not and
+      // the bare name came back. Both are the pre-existing behaviour; an empty string is not.
+      expect(spawned).toHaveLength(3);
+      for (const [index, name] of ["claude", "codex", "grok"].entries()) {
+        const file = spawned[index] as string;
+        expect(file).not.toBe("");
+        expect(file === name || file.startsWith("/")).toBe(true);
+      }
+    } finally {
+      __testing.setRunCli(null);
+      cp.close();
+      for (const [name, value] of Object.entries(before)) {
+        const variable = `ACP_${name.toUpperCase()}_BINARY`;
+        if (value === undefined) delete process.env[variable];
+        else process.env[variable] = value;
+      }
+    }
   });
 });
 

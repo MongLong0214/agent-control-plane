@@ -158,19 +158,30 @@ if [[ "$target" == "-e" ]]; then
   exec "$ACP_REAL_NODE" "$@"
 fi
 if [[ "$target" == *"agentcpd.js" ]]; then
+  # Resolving a path is not starting the process at it. Live, ~/.local/bin/codex is a
+  # shebang script that reaches node through env, so an absolute pin still fails unless that
+  # interpreter is findable from the PATH too — a way for the pin channel to be insufficient
+  # that neither the "was it handed over" nor the "can PATH find it" field would notice.
+  started_of() {
+    local candidate="\${1:-}"
+    [[ -n "$candidate" ]] || { printf 'unpinned'; return 0; }
+    "$candidate" --version >/dev/null 2>&1 && printf 'started' || printf 'failed'
+  }
   # Fields are appended, never inserted: field position is the whole contract between this stub
   # and its readers, and every existing reader destructures from the front (indices 0-7).
   # Positions 8-10 are what the daemon was *handed*; 11-13 are what the daemon's own PATH can
-  # *find*, which is the question resolveExecutable actually asks. Those are two different
-  # observations and a launcher can satisfy either one without the other.
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
+  # *find*, which is the question resolveExecutable asks when it was handed nothing; 14 is
+  # whether the handed path actually runs. Those are three different observations and a launcher
+  # can satisfy any one of them without the others.
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
     "\${ACP_TELEGRAM_BOT_TOKEN-}" "\${ACP_TELEGRAM_OWNER_ID-}" \
     "\${ACP_TELEGRAM_CHAT_ID-}" "\${ACP_TELEGRAM_WEBHOOK_SECRET-}" \
     "\${BUZZ_PRIVATE_KEY:-<unset>}" "\${ACP_BUZZ_BINARY:-<unset>}" \
     "\${ACP_CLAUDE_BINARY:-<unset>}" "\${ACP_CODEX_BINARY:-<unset>}" "\${ACP_GROK_BINARY:-<unset>}" \
     "$(command -v claude || printf '<unresolvable>')" \
     "$(command -v codex || printf '<unresolvable>')" \
-    "$(command -v grok || printf '<unresolvable>')" >> "$ACP_LAUNCHER_ENV_LOG"
+    "$(command -v grok || printf '<unresolvable>')" \
+    "$(started_of "\${ACP_CLAUDE_BINARY:-}"),$(started_of "\${ACP_CODEX_BINARY:-}"),$(started_of "\${ACP_GROK_BINARY:-}")" >> "$ACP_LAUNCHER_ENV_LOG"
   # Mirrors the real precondition in src/daemon/agentcpd.ts: a Buzz credential without the
   # ingress pair is a startup error, not a degraded mode. Without this, a launcher that
   # exported the key too eagerly would look fine here and put the real daemon in a launchd
@@ -234,6 +245,91 @@ const plistPath = (harness: InstallerHarness): string =>
 
 const launcherPath = (harness: InstallerHarness): string =>
   join(harness.home, ".agent-control-plane", "agentcpd-launch.sh");
+
+const PINNED_LAUNCHER_DIRECTORIES = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
+
+/**
+ * The three provider CLIs as a host actually installs them (#785).
+ *
+ * Two directories, because live `grok` sits under `~/.grok/bin` while the other two are under
+ * `~/.local/bin`; a fixture that put all three in one place would pass a fix that carries exactly
+ * one extra location forward. And `codex` reaches its interpreter through `#!/usr/bin/env`,
+ * because the real one is a `#!/usr/bin/env node` script — resolving codex to an absolute path is
+ * not sufficient on its own unless the interpreter is also findable from the launcher's PATH.
+ * `sh` stands in for `node` so the row keeps the shape of that dependency without depending on
+ * where a particular host installed node; `/bin` is one of the four pinned directories anywhere
+ * this runs.
+ */
+const writeProviderCliFixtures = (harness: InstallerHarness): Record<string, string> => {
+  const userLocalBin = join(harness.home, "user-local-bin");
+  const grokBin = join(harness.home, "grok-bin");
+  mkdirSync(userLocalBin, { recursive: true });
+  mkdirSync(grokBin, { recursive: true });
+  const paths: Record<string, string> = {
+    claude: join(userLocalBin, "claude"),
+    codex: join(userLocalBin, "codex"),
+    grok: join(grokBin, "grok"),
+  };
+  const bodies: Record<string, string> = {
+    claude: "#!/bin/sh\nexit 0\n",
+    codex: "#!/usr/bin/env sh\nexit 0\n",
+    grok: "#!/bin/sh\nexit 0\n",
+  };
+  for (const [name, path] of Object.entries(paths)) {
+    writeFileSync(path, bodies[name] as string, { mode: 0o755 });
+    chmodSync(path, 0o755);
+    // The premise of every row below, asserted rather than assumed: a fixture that happened to
+    // land in a pinned directory would make the assertions pass without the defect present.
+    expect(path.startsWith("/"), `${name} fixture must be an absolute path`).toBe(true);
+    expect(
+      PINNED_LAUNCHER_DIRECTORIES.some((directory) => path.startsWith(`${directory}/`)),
+      `${name} fixture must sit outside the launcher's pinned PATH`,
+    ).toBe(false);
+  }
+  harness.env["PATH"] = `${userLocalBin}:${grokBin}:${harness.env["PATH"] ?? ""}`;
+  return paths;
+};
+
+/** Execute the generated launcher and return what it did, with `security` stubbed as launchd sees it. */
+const runGeneratedLauncher = (harness: InstallerHarness): CommandResult => {
+  const launcherSecurity = join(harness.home, "launcher-security.bash");
+  writeFileSync(launcherSecurity, `security() { "${join(harness.bin, "security")}" "$@"; }\n`, {
+    mode: 0o600,
+  });
+  const launched = spawnSync("bash", [launcherPath(harness)], {
+    encoding: "utf8",
+    env: { ...harness.env, BASH_ENV: launcherSecurity },
+  });
+  return { status: launched.status, stdout: launched.stdout, stderr: launched.stderr };
+};
+
+/** What the daemon saw, by field. Positions are the contract; see the stub in `makeHarness`. */
+const launcherObservations = (harness: InstallerHarness) => {
+  const fields = readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
+  return {
+    handed: { claude: fields[8], codex: fields[9], grok: fields[10] } as Record<string, string | undefined>,
+    onPath: { claude: fields[11], codex: fields[12], grok: fields[13] } as Record<string, string | undefined>,
+    started: fields[14],
+  };
+};
+
+/** Rewrite the installer's own output in place, to remove exactly one of the two channels. */
+const editGeneratedLauncher = (harness: InstallerHarness, edit: (text: string) => string): void => {
+  const path = launcherPath(harness);
+  const before = readFileSync(path, "utf8");
+  const after = edit(before);
+  expect(after, "the launcher edit matched nothing, so the row would measure an unmutated launcher")
+    .not.toBe(before);
+  writeFileSync(path, after, { mode: 0o700 });
+  chmodSync(path, 0o700);
+};
+
+const installForProviderPins = (harness: InstallerHarness): CommandResult =>
+  runInstaller(
+    installer,
+    ["install", "--app-root", root, "--node", harness.node, "--keychain-service", "test-service"],
+    harness,
+  );
 
 const assertRenderedPlist = (harness: InstallerHarness): void => {
   const plist = readFileSync(plistPath(harness), "utf8");
@@ -722,48 +818,15 @@ describe("launchd deployment artifact", () => {
 
   it("#785 hands the daemon each provider CLI at a path its pinned PATH cannot reach", () => {
     const harness = makeHarness();
-    // The #423 defect, three more times over. `resolveExecutable` (src/runtime/cli-adapters.ts)
-    // searches the daemon's PATH for the bare names `claude`, `codex` and `grok`; the launcher
-    // pins that PATH to four system directories, and on the deployed host none of the three is
-    // in any of them. `resolveExecutable` then returns the bare name, nothing spawns, and the
-    // capacity parser — which has no representation for "the CLI was not there" — reports no
-    // quota for all three providers at once. A plausible-looking zero, with nothing raised.
-    const userLocalBin = join(harness.home, "user-local-bin");
-    const grokBin = join(harness.home, "grok-bin");
-    mkdirSync(userLocalBin, { recursive: true });
-    mkdirSync(grokBin, { recursive: true });
-    const cliPaths: Record<string, string> = {
-      claude: join(userLocalBin, "claude"),
-      codex: join(userLocalBin, "codex"),
-      // A second directory on purpose. Live, `grok` is under ~/.grok/bin while the other two are
-      // under ~/.local/bin, so a fix that carries exactly one extra location forward would pass
-      // a fixture that put all three in one place and still fail on the host it was written for.
-      grok: join(grokBin, "grok"),
-    };
-    for (const path of Object.values(cliPaths)) {
-      writeFileSync(path, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-      chmodSync(path, 0o755);
-    }
-    harness.env["PATH"] = `${userLocalBin}:${grokBin}:${harness.env["PATH"] ?? ""}`;
+    // The #423 defect, three more times over. resolveExecutable (src/runtime/cli-adapters.ts)
+    // searches the daemon's PATH for the bare names claude, codex and grok; the launcher pins
+    // that PATH to four system directories, and on the deployed host none of the three is in any
+    // of them. resolveExecutable then returns the bare name, nothing spawns, and the capacity
+    // parser — which has no representation for "the CLI was not there" — reports no quota for all
+    // three providers at once. A plausible-looking zero, with nothing raised.
+    const cliPaths = writeProviderCliFixtures(harness);
 
-    const pinnedDirectories = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
-    for (const [name, path] of Object.entries(cliPaths)) {
-      // The premise of the row, asserted rather than assumed: a fixture that happened to land in
-      // a pinned directory would make everything below pass without the defect being present.
-      expect(path.startsWith("/"), `${name} fixture must be an absolute path`).toBe(true);
-      expect(
-        pinnedDirectories.some((directory) => path.startsWith(`${directory}/`)),
-        `${name} fixture must sit outside the launcher's pinned PATH`,
-      ).toBe(false);
-    }
-
-    expect(
-      runInstaller(
-        installer,
-        ["install", "--app-root", root, "--node", harness.node, "--keychain-service", "test-service"],
-        harness,
-      ).status,
-    ).toBe(0);
+    expect(installForProviderPins(harness).status).toBe(0);
 
     const launcher = readFileSync(launcherPath(harness), "utf8");
     for (const [name, path] of Object.entries(cliPaths)) {
@@ -780,32 +843,82 @@ describe("launchd deployment artifact", () => {
     // The file containing the path is not the daemon receiving it. #423 recorded exactly this:
     // deleting the export while leaving the baked value left every assertion above passing,
     // because the launcher held the right string and handed the daemon nothing. Run it.
-    const launcherSecurity = join(harness.home, "launcher-security.bash");
-    writeFileSync(launcherSecurity, `security() { "${join(harness.bin, "security")}" "$@"; }\n`, {
-      mode: 0o600,
-    });
-    const launched = spawnSync("bash", [launcherPath(harness)], {
-      encoding: "utf8",
-      env: { ...harness.env, BASH_ENV: launcherSecurity },
-    });
+    const launched = runGeneratedLauncher(harness);
     expect(launched.status, launched.stderr).toBe(0);
+    const seen = launcherObservations(harness);
 
-    const [, , , , , , , , claudeBinary, codexBinary, grokBinary, claudeOnPath, codexOnPath, grokOnPath] =
-      readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
+    for (const name of ["claude", "codex", "grok"]) {
+      expect(seen.handed[name], `the launcher never exported a resolved ${name}`).toBe(cliPaths[name]);
+      expect(seen.onPath[name], `the daemon's own PATH cannot reach ${name}`).toBe(cliPaths[name]);
+    }
+    // Resolving is not starting: codex reaches its interpreter through a shebang, so a pinned
+    // path can be correct and still not run.
+    expect(seen.started, "a pinned CLI did not start").toBe("started,started,started");
+  });
 
-    // What the daemon was handed.
-    expect(claudeBinary, "the launcher never exported a resolved claude").toBe(cliPaths["claude"]);
-    expect(codexBinary, "the launcher never exported a resolved codex").toBe(cliPaths["codex"]);
-    expect(grokBinary, "the launcher never exported a resolved grok").toBe(cliPaths["grok"]);
+  it("#785 reaches every provider CLI on the pin alone, with the launcher PATH left as it was", () => {
+    // Independent sufficiency, channel one. The installer's real output is generated first and
+    // then the PATH extension is taken back out of it, leaving only the exported pins. If this
+    // fails, the redundancy is not redundancy — the pins would be a channel nobody could rely on
+    // while looking, in the launcher text, exactly like one.
+    const harness = makeHarness();
+    const cliPaths = writeProviderCliFixtures(harness);
+    expect(installForProviderPins(harness).status).toBe(0);
 
-    // And what the daemon's own PATH can find, which is the different question
-    // `resolveExecutable` asks today: it consults `options.binary ?? "claude"`, and nothing in
-    // production supplies `options.binary`, so PATH is the only channel that reaches it. A
-    // launcher that exports the pins but leaves PATH pinned to the four system directories
-    // satisfies every assertion above and still resolves a bare name in production.
-    expect(claudeOnPath, "the daemon's own PATH cannot reach claude").toBe(cliPaths["claude"]);
-    expect(codexOnPath, "the daemon's own PATH cannot reach codex").toBe(cliPaths["codex"]);
-    expect(grokOnPath, "the daemon's own PATH cannot reach grok").toBe(cliPaths["grok"]);
+    editGeneratedLauncher(harness, (text) =>
+      text.replace(
+        'export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin${ACP_RESOLVED_CLI_PATH:+:$ACP_RESOLVED_CLI_PATH}"',
+        'export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"',
+      ),
+    );
+
+    const launched = runGeneratedLauncher(harness);
+    expect(launched.status, launched.stderr).toBe(0);
+    const seen = launcherObservations(harness);
+
+    for (const name of ["claude", "codex", "grok"]) {
+      // The surviving channel delivers.
+      expect(seen.handed[name], `the pin alone did not reach the daemon for ${name}`).toBe(cliPaths[name]);
+      // And the removed one is genuinely gone, which is what makes the line above mean anything.
+      // Asserted as "not the fixture" rather than "<unresolvable>", because a host that happens
+      // to have a real claude in a pinned directory would resolve something — just not this.
+      expect(seen.onPath[name], `PATH still reaches the ${name} fixture, so nothing was isolated`)
+        .not.toBe(cliPaths[name]);
+    }
+    expect(seen.started, "a CLI reached by pin alone did not start").toBe("started,started,started");
+  });
+
+  it("#785 reaches every provider CLI on the launcher PATH alone, with the pins never exported", () => {
+    // Independent sufficiency, channel two. Same generated launcher, the other half removed: the
+    // three promotions to ACP_*_BINARY are deleted and the extended PATH is left in place.
+    const harness = makeHarness();
+    const cliPaths = writeProviderCliFixtures(harness);
+    expect(installForProviderPins(harness).status).toBe(0);
+
+    editGeneratedLauncher(harness, (text) => {
+      let edited = text;
+      for (const name of ["CLAUDE", "CODEX", "GROK"]) {
+        edited = edited.replace(
+          `if [[ -z "\${ACP_${name}_BINARY:-}" && -n "\${ACP_RESOLVED_${name}_BINARY:-}" ]]; then\n` +
+            `  export ACP_${name}_BINARY="$ACP_RESOLVED_${name}_BINARY"\n` +
+            `fi\n`,
+          "",
+        );
+      }
+      return edited;
+    });
+
+    const launched = runGeneratedLauncher(harness);
+    expect(launched.status, launched.stderr).toBe(0);
+    const seen = launcherObservations(harness);
+
+    for (const name of ["claude", "codex", "grok"]) {
+      expect(seen.onPath[name], `the launcher PATH alone did not reach ${name}`).toBe(cliPaths[name]);
+      expect(seen.handed[name], `${name} was still exported, so nothing was isolated`).toBe("<unset>");
+    }
+    // Nothing was pinned, so there is nothing for the stub to try to start; the PATH field above
+    // is the whole observation for this row.
+    expect(seen.started).toBe("unpinned,unpinned,unpinned");
   });
 
   it("#785 names each provider CLI it could not resolve and installs anyway", () => {

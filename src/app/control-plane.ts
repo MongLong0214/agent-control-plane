@@ -667,6 +667,11 @@ export class ControlPlane {
     // base is this deployment's configuration, which is what makes the caller unable to lose an
     // option it never mentioned.
     const overrides = this.config.adapterOptions ?? {};
+    // Each adapter's `binary` comes from the launcher, which resolves the three provider CLIs at
+    // install time and exports them (#785): launchd hands the daemon a PATH that no user-local
+    // bin is on, and `resolveExecutable` has nowhere else to look. Read before the spread below,
+    // so an explicit override still wins, and left `undefined` when the variable is unset — which
+    // `options.binary ?? "claude"` in the adapter already means "search PATH exactly as before".
     return [
       new ClaudeCliAdapter({
         clock: this.clock,
@@ -676,6 +681,7 @@ export class ControlPlane {
         managedWriteBroker,
         providerCredentialDir: process.env["ACP_CLAUDE_REVIEWER_CONFIG_DIR"],
         reviewerEgress: this.config.reviewerEgress,
+        binary: process.env["ACP_CLAUDE_BINARY"],
               ...overrides.claude,
       }),
       new CodexCliAdapter({
@@ -689,6 +695,7 @@ export class ControlPlane {
         // credential scope because it can contain producer conversations.
         providerCredentialDir: process.env["ACP_CODEX_REVIEWER_HOME"],
         reviewerEgress: this.config.reviewerEgress,
+        binary: process.env["ACP_CODEX_BINARY"],
               ...overrides.gpt,
       }),
       new GrokCliAdapter({
@@ -697,6 +704,7 @@ export class ControlPlane {
         environmentAllowlist: [],
         denyReadPaths: [this.config.databasePath, this.config.secretsDir, this.config.capacityDir, ...credentialDenyPaths],
         providerCredentialDir: process.env["ACP_GROK_CREDENTIAL_DIR"],
+        binary: process.env["ACP_GROK_BINARY"],
               ...overrides.grok,
       }),
     ];

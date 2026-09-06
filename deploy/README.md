@@ -30,6 +30,25 @@ Optional Buzz configuration uses the same Keychain service and these account nam
 Buzz ingress settings must also be installed because the daemon rejects an unauthenticated
 actor-binding setup.
 
+The installer also resolves the three provider CLIs — `claude`, `codex` and `grok` — while the
+installing shell's `PATH` is still visible, and bakes what it finds into the launcher as
+`ACP_RESOLVED_CLAUDE_BINARY`, `ACP_RESOLVED_CODEX_BINARY` and `ACP_RESOLVED_GROK_BINARY`, plus
+`ACP_RESOLVED_CLI_PATH` holding their directories. launchd does not inherit a login shell's
+`PATH`, and the launcher pins its own to `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`, so a
+CLI installed under a user-local bin is invisible to the daemon while working perfectly from a
+terminal. The launcher then supplies each one to the daemon two ways: it promotes the resolved
+path to `ACP_CLAUDE_BINARY` / `ACP_CODEX_BINARY` / `ACP_GROK_BINARY` unless that variable is
+already set, and it appends `ACP_RESOLVED_CLI_PATH` to the pinned `PATH`. Either channel is
+sufficient on its own, which is deliberate: the failure being prevented is silent, so one channel
+going missing must not restore it.
+
+A CLI the installer cannot resolve does not fail the install — `grok` is optional, and a host
+without it must still be able to deploy — but the installer writes a line to stderr naming that
+CLI and stating the consequence, because the alternative is the failure this guards against:
+`resolveExecutable` returns the bare name, nothing spawns, and the capacity probe reports no
+quota rather than an error. Re-running `install` or `upgrade` after installing the CLI picks it
+up; nothing else has to change.
+
 The job uses `~/.agent-control-plane` because that is the daemon's configured state root. The
 installer and runtime both require this directory, its database, worktree root, secrets root,
 and backups to be current-user owned, non-symlinked, and mode `0700`/`0600` as appropriate.
