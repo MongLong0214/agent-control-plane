@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { Db } from "../../src/db/database.ts";
-import { sealRollbackPair, type SealedRollbackPair } from "../../src/deploy/rollback-pair.ts";
+import { parseLauncherBinding, sealRollbackPair, type SealedRollbackPair } from "../../src/deploy/rollback-pair.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -158,10 +158,19 @@ if [[ "$target" == "-e" ]]; then
   exec "$ACP_REAL_NODE" "$@"
 fi
 if [[ "$target" == *"agentcpd.js" ]]; then
-  printf '%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
+  # Fields are appended, never inserted: field position is the whole contract between this stub
+  # and its readers, and every existing reader destructures from the front (indices 0-7).
+  # Positions 8-10 are what the daemon was *handed*; 11-13 are what the daemon's own PATH can
+  # *find*, which is the question resolveExecutable actually asks. Those are two different
+  # observations and a launcher can satisfy either one without the other.
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
     "\${ACP_TELEGRAM_BOT_TOKEN-}" "\${ACP_TELEGRAM_OWNER_ID-}" \
     "\${ACP_TELEGRAM_CHAT_ID-}" "\${ACP_TELEGRAM_WEBHOOK_SECRET-}" \
-    "\${BUZZ_PRIVATE_KEY:-<unset>}" "\${ACP_BUZZ_BINARY:-<unset>}" >> "$ACP_LAUNCHER_ENV_LOG"
+    "\${BUZZ_PRIVATE_KEY:-<unset>}" "\${ACP_BUZZ_BINARY:-<unset>}" \
+    "\${ACP_CLAUDE_BINARY:-<unset>}" "\${ACP_CODEX_BINARY:-<unset>}" "\${ACP_GROK_BINARY:-<unset>}" \
+    "$(command -v claude || printf '<unresolvable>')" \
+    "$(command -v codex || printf '<unresolvable>')" \
+    "$(command -v grok || printf '<unresolvable>')" >> "$ACP_LAUNCHER_ENV_LOG"
   # Mirrors the real precondition in src/daemon/agentcpd.ts: a Buzz credential without the
   # ingress pair is a startup error, not a degraded mode. Without this, a launcher that
   # exported the key too eagerly would look fine here and put the real daemon in a launchd
@@ -709,6 +718,151 @@ describe("launchd deployment artifact", () => {
     const [, , , , , , , resolvedBuzz] =
       readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
     expect(resolvedBuzz, "the launcher never exported the resolved Buzz binary").toBe(buzzPath);
+  });
+
+  it("#785 hands the daemon each provider CLI at a path its pinned PATH cannot reach", () => {
+    const harness = makeHarness();
+    // The #423 defect, three more times over. `resolveExecutable` (src/runtime/cli-adapters.ts)
+    // searches the daemon's PATH for the bare names `claude`, `codex` and `grok`; the launcher
+    // pins that PATH to four system directories, and on the deployed host none of the three is
+    // in any of them. `resolveExecutable` then returns the bare name, nothing spawns, and the
+    // capacity parser — which has no representation for "the CLI was not there" — reports no
+    // quota for all three providers at once. A plausible-looking zero, with nothing raised.
+    const userLocalBin = join(harness.home, "user-local-bin");
+    const grokBin = join(harness.home, "grok-bin");
+    mkdirSync(userLocalBin, { recursive: true });
+    mkdirSync(grokBin, { recursive: true });
+    const cliPaths: Record<string, string> = {
+      claude: join(userLocalBin, "claude"),
+      codex: join(userLocalBin, "codex"),
+      // A second directory on purpose. Live, `grok` is under ~/.grok/bin while the other two are
+      // under ~/.local/bin, so a fix that carries exactly one extra location forward would pass
+      // a fixture that put all three in one place and still fail on the host it was written for.
+      grok: join(grokBin, "grok"),
+    };
+    for (const path of Object.values(cliPaths)) {
+      writeFileSync(path, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      chmodSync(path, 0o755);
+    }
+    harness.env["PATH"] = `${userLocalBin}:${grokBin}:${harness.env["PATH"] ?? ""}`;
+
+    const pinnedDirectories = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
+    for (const [name, path] of Object.entries(cliPaths)) {
+      // The premise of the row, asserted rather than assumed: a fixture that happened to land in
+      // a pinned directory would make everything below pass without the defect being present.
+      expect(path.startsWith("/"), `${name} fixture must be an absolute path`).toBe(true);
+      expect(
+        pinnedDirectories.some((directory) => path.startsWith(`${directory}/`)),
+        `${name} fixture must sit outside the launcher's pinned PATH`,
+      ).toBe(false);
+    }
+
+    expect(
+      runInstaller(
+        installer,
+        ["install", "--app-root", root, "--node", harness.node, "--keychain-service", "test-service"],
+        harness,
+      ).status,
+    ).toBe(0);
+
+    const launcher = readFileSync(launcherPath(harness), "utf8");
+    for (const [name, path] of Object.entries(cliPaths)) {
+      expect(launcher, `${name} was not resolved at install time`).toContain(path);
+    }
+
+    // Additional assignments must not cost the launcher its seal. The rollback pair reads the
+    // launcher as a closed grammar rather than searching it, so this is checked with the real
+    // parser and not by eye.
+    const binding = parseLauncherBinding(launcher, "test:#785");
+    expect(binding.entrypoint).toBe("dist/daemon/agentcpd.js");
+    expect(binding.appRoot).toBe(realpathSync(root));
+
+    // The file containing the path is not the daemon receiving it. #423 recorded exactly this:
+    // deleting the export while leaving the baked value left every assertion above passing,
+    // because the launcher held the right string and handed the daemon nothing. Run it.
+    const launcherSecurity = join(harness.home, "launcher-security.bash");
+    writeFileSync(launcherSecurity, `security() { "${join(harness.bin, "security")}" "$@"; }\n`, {
+      mode: 0o600,
+    });
+    const launched = spawnSync("bash", [launcherPath(harness)], {
+      encoding: "utf8",
+      env: { ...harness.env, BASH_ENV: launcherSecurity },
+    });
+    expect(launched.status, launched.stderr).toBe(0);
+
+    const [, , , , , , , , claudeBinary, codexBinary, grokBinary, claudeOnPath, codexOnPath, grokOnPath] =
+      readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
+
+    // What the daemon was handed.
+    expect(claudeBinary, "the launcher never exported a resolved claude").toBe(cliPaths["claude"]);
+    expect(codexBinary, "the launcher never exported a resolved codex").toBe(cliPaths["codex"]);
+    expect(grokBinary, "the launcher never exported a resolved grok").toBe(cliPaths["grok"]);
+
+    // And what the daemon's own PATH can find, which is the different question
+    // `resolveExecutable` asks today: it consults `options.binary ?? "claude"`, and nothing in
+    // production supplies `options.binary`, so PATH is the only channel that reaches it. A
+    // launcher that exports the pins but leaves PATH pinned to the four system directories
+    // satisfies every assertion above and still resolves a bare name in production.
+    expect(claudeOnPath, "the daemon's own PATH cannot reach claude").toBe(cliPaths["claude"]);
+    expect(codexOnPath, "the daemon's own PATH cannot reach codex").toBe(cliPaths["codex"]);
+    expect(grokOnPath, "the daemon's own PATH cannot reach grok").toBe(cliPaths["grok"]);
+  });
+
+  it("#785 names each provider CLI it could not resolve and installs anyway", () => {
+    const harness = makeHarness();
+    // grok in particular is optional, and a host without it must still be able to deploy. The
+    // `buzz` precedent is followed: bake nothing for that CLI, fail nothing. What must not
+    // happen is silence — today the failure is discoverable nowhere, and the whole point of the
+    // change is that it becomes discoverable at install time.
+    harness.env["PATH"] = `${harness.bin}:/usr/bin:/bin`;
+    for (const name of ["claude", "codex", "grok"]) {
+      // Precondition, not decoration. If the host had one of these in /usr/bin, the assertions
+      // below would pass while measuring nothing at all.
+      expect(
+        spawnSync("bash", ["-c", `command -v ${name}`], { env: harness.env }).status,
+        `${name} must not be resolvable from the installer's PATH for this row to mean anything`,
+      ).not.toBe(0);
+    }
+
+    const installed = runInstaller(
+      installer,
+      ["install", "--app-root", root, "--node", harness.node, "--keychain-service", "test-service"],
+      harness,
+    );
+    // A warning, not a refusal.
+    expect(installed.status, installed.stderr).toBe(0);
+    for (const name of ["claude", "codex", "grok"]) {
+      expect(installed.stderr, `the installer said nothing about ${name}`).toContain(
+        `could not resolve the ${name} CLI`,
+      );
+    }
+    // The consequence, not just the name — an operator who has never read this file has to be
+    // able to tell from the line alone why it matters.
+    expect(installed.stderr).toContain("will report no quota");
+
+    // And nothing is baked for a CLI that was not found: a pin to a bare name would take
+    // `resolveExecutable`'s absolute-path branch and then fail to stat, which is worse than the
+    // PATH search it replaces.
+    const launcher = readFileSync(launcherPath(harness), "utf8");
+    for (const variable of ["ACP_RESOLVED_CLAUDE_BINARY", "ACP_RESOLVED_CODEX_BINARY", "ACP_RESOLVED_GROK_BINARY"]) {
+      expect(launcher, `${variable} was baked for a CLI that was never found`).not.toContain(`${variable}=`);
+    }
+
+    const launcherSecurity = join(harness.home, "launcher-security.bash");
+    writeFileSync(launcherSecurity, `security() { "${join(harness.bin, "security")}" "$@"; }\n`, {
+      mode: 0o600,
+    });
+    const launched = spawnSync("bash", [launcherPath(harness)], {
+      encoding: "utf8",
+      env: { ...harness.env, BASH_ENV: launcherSecurity },
+    });
+    // The daemon still starts. An unresolved provider is a degraded deployment, not a dead one.
+    expect(launched.status, launched.stderr).toBe(0);
+    const [, , , , , , , , claudeBinary, codexBinary, grokBinary] =
+      readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
+    expect(claudeBinary).toBe("<unset>");
+    expect(codexBinary).toBe("<unset>");
+    expect(grokBinary).toBe("<unset>");
   });
 
   it("#423 leaves BUZZ_PRIVATE_KEY unset rather than guessing when neither source has it", () => {

@@ -239,9 +239,58 @@ resolve_buzz_binary() {
   printf '%s' "$found"
 }
 
+# The same failure as `buzz` above, three more times over, and worse — it does not report as a
+# failure at all. `resolveExecutable` (src/runtime/cli-adapters.ts) searches the daemon's PATH
+# for the bare names `claude`, `codex` and `grok`; the launcher pins that PATH to four system
+# directories, and a host that keeps its CLIs under ~/.local/bin or ~/.grok/bin has none of the
+# three in any of them. `resolveExecutable` returns the bare name, nothing spawns, and the
+# capacity parser — which has no representation for "the CLI was not there" — reports no quota
+# for all three providers at once. So resolve here, while the installing shell's PATH is still
+# visible, exactly as the Buzz binary is.
+#
+# A relative answer is refused rather than baked. The daemon runs from a working directory the
+# installing shell never had, so a relative path resolves to nothing at the moment it is used —
+# and `resolveExecutable`'s absolute-path branch hands it back unchanged rather than searching,
+# which turns a PATH miss into a silent stat failure one layer deeper.
+resolve_cli_binary() {
+  local name="$1" found=""
+  found="$(command -v "$name" 2>/dev/null || true)"
+  [[ -n "$found" && "$found" == /* && -x "$found" ]] || return 0
+  printf '%s' "$found"
+}
+
 write_launcher() {
   local temporary="$state_dir/.agentcpd-launch.$$.tmp"
   umask 077
+  # Resolved before the launcher is opened for writing: stdout inside the block below *is* the
+  # launcher file, and an unresolvable CLI has to reach the operator's terminal instead.
+  #
+  # A CLI that cannot be resolved does not fail the install. grok in particular is optional and a
+  # host without it must still be able to deploy, which is the precedent `resolve_buzz_binary`
+  # already sets: bake nothing for it. What it must not be is silent — today this failure is
+  # discoverable nowhere, and reaches production as a plausible-looking zero.
+  local spec cli pin_variable resolved_cli directory
+  local cli_pin_directories=""
+  local cli_pins=()
+  for spec in claude:ACP_RESOLVED_CLAUDE_BINARY codex:ACP_RESOLVED_CODEX_BINARY grok:ACP_RESOLVED_GROK_BINARY; do
+    cli="${spec%%:*}"
+    pin_variable="${spec##*:}"
+    resolved_cli="$(resolve_cli_binary "$cli")"
+    if [[ -z "$resolved_cli" ]]; then
+      printf 'agentcpd installer: could not resolve the %s CLI from this PATH. Nothing is pinned for it, and the %s capacity probe will report no quota rather than an error.\n' \
+        "$cli" "$cli" >&2
+      continue
+    fi
+    cli_pins[${#cli_pins[@]}]="$pin_variable=$resolved_cli"
+    directory="${resolved_cli%/*}"
+    # Appended, never prepended, and only for a directory that actually held one of the three.
+    # The four system directories keep winning every other name the daemon resolves; this adds
+    # reachability for the CLIs that are provably not in them and widens nothing else.
+    case ":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${cli_pin_directories}:" in
+      *":$directory:"*) ;;
+      *) cli_pin_directories="${cli_pin_directories:+$cli_pin_directories:}$directory" ;;
+    esac
+  done
   {
     printf '#!/bin/bash\nset -euo pipefail\n'
     printf 'ACP_NODE_PATH=%q\n' "$node_path"
@@ -256,10 +305,17 @@ write_launcher() {
     if [[ -n "$resolved_buzz" ]]; then
       printf 'ACP_RESOLVED_BUZZ_BINARY=%q\n' "$resolved_buzz"
     fi
+    local pin
+    if [[ ${#cli_pins[@]} -gt 0 ]]; then
+      for pin in "${cli_pins[@]}"; do
+        printf '%s=%q\n' "${pin%%=*}" "${pin#*=}"
+      done
+    fi
+    printf 'ACP_RESOLVED_CLI_PATH=%q\n' "$cli_pin_directories"
     printf 'ACP_HOME=%q\n' "$home_dir"
     cat <<'EOF'
 export HOME="$ACP_HOME"
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin${ACP_RESOLVED_CLI_PATH:+:$ACP_RESOLVED_CLI_PATH}"
 
 required_keychain_value() {
   local account="$1" value=""
@@ -354,6 +410,23 @@ export ACP_CODEX_REVIEWER_HOME="${ACP_CODEX_REVIEWER_HOME:-$ACP_REVIEWER_ROOT/co
 # exists to prevent, reintroduced by a later line.
 if [[ -z "${ACP_BUZZ_BINARY:-}" && -n "${ACP_RESOLVED_BUZZ_BINARY:-}" ]]; then
   export ACP_BUZZ_BINARY="$ACP_RESOLVED_BUZZ_BINARY"
+fi
+
+# The three provider CLIs, pinned at install time for the reason recorded above the Buzz block.
+#
+# Two channels, because the daemon uses two. `resolveExecutable` is reached through PATH today —
+# nothing in production supplies `CliAdapterOptions.binary`, so the PATH line above is what makes
+# a user-local CLI findable at all — while ACP_*_BINARY is the seam a caller can read once one
+# exists, and is what an operator overrides. Setting only one of the two leaves a hole that looks
+# closed from the launcher text.
+if [[ -z "${ACP_CLAUDE_BINARY:-}" && -n "${ACP_RESOLVED_CLAUDE_BINARY:-}" ]]; then
+  export ACP_CLAUDE_BINARY="$ACP_RESOLVED_CLAUDE_BINARY"
+fi
+if [[ -z "${ACP_CODEX_BINARY:-}" && -n "${ACP_RESOLVED_CODEX_BINARY:-}" ]]; then
+  export ACP_CODEX_BINARY="$ACP_RESOLVED_CODEX_BINARY"
+fi
+if [[ -z "${ACP_GROK_BINARY:-}" && -n "${ACP_RESOLVED_GROK_BINARY:-}" ]]; then
+  export ACP_GROK_BINARY="$ACP_RESOLVED_GROK_BINARY"
 fi
 
 exec "$ACP_NODE_PATH" "$ACP_APP_ROOT/dist/daemon/agentcpd.js"
