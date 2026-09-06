@@ -18,6 +18,7 @@
  * | Markdown inline link | SUPPORTED | `[text](target)` and `[text](<target>)` may target a supported path or blob URL. The destination's closing `)` is consumed as link syntax before trailing quoted content is read. A link title in the destination is UNSUPPORTED and reported. |
  * | Bare path plus line | SUPPORTED | `path:line[-end]` and `path#Lline[-Lend]`, under the path disambiguation rules below. |
  * | Repository-qualified path | SUPPORTED | `<owner>/<repo>@<path>[:line]`, in a bare citation or on the path side of either symbol form. A slug this check can show is not its own is reported EXTERNAL and not measured against this tree; a slug naming *this* repository is consumed and the path checked here exactly as an unqualified one. |
+ * | Colon-joined search path | OUT OF GRAMMAR | A run beginning with an absolute path and continuing with one or more `:`-separated absolute paths or `$VAR` references is a shell `PATH` value; its colons are separators, not line coordinates. Excluded from citation extraction. NON_DURABLE is measured first and wins any overlap. |
  * | Home-directory path | OUT OF GRAMMAR | `~/`, `$HOME/`, and `${HOME}/` name the home directory by definition, so the remainder is never a path in this repository. Excluded from repository resolution rather than reported. |
  * | Same-repository blob URL | SUPPORTED | `https://github.com/<owner>/<repo>/blob/<ref>/<path>` with an optional supported line fragment. A non-line hash is UNSUPPORTED and reported. |
  * | Line number | SUPPORTED | A signed base-10 integer. `line <= 0`, an end before its start, and a coordinate beyond the file are STALE. A coordinate-shaped suffix outside this grammar is UNSUPPORTED and reported. |
@@ -64,6 +65,7 @@
  *   - URLs other than same-repository GitHub blob URLs
  *   - unquoted prose after an inline citation, and fenced prose that does not read as code
  *   - a path introduced by a home-directory marker: `~/`, `$HOME/`, or `${HOME}/`
+ *   - a colon-joined shell search path, `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin` among them
  *
  * The home-directory omission (#780) is the one case where "ignored" needs no defence from
  * corpus evidence, because the marker settles it definitionally: a leading `~/` *means* the home
@@ -945,6 +947,41 @@
  *   one Python file, one shell file, all three YAML files, and both SQL files: 260 tracked files,
  *   every supported-language file in this tree.
  *
+ * ## Round 27: the sixth class, found by a review of round 26 rather than by the corpus report it
+ * had already been sitting in
+ *
+ *   `#785`'s own body writes the launcher's generated search path, and the check read it as a
+ *   citation with a broken coordinate:
+ *
+ *       opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+ *       line coordinate syntax is unsupported; use :<signed-decimal>[-<signed-decimal>] …
+ *
+ *   The reported text is itself the evidence, the same way `$HOME/…` reported as `HOME/…` was in
+ *   round 26 and `github/workflows/ci.yml` reported for a citation that had its dot was in round
+ *   7: `PATH_RE`'s first character class is `\.?[A-Za-z_]`, so it cannot begin with `/`, and the
+ *   match silently started one character late. The checker ate the separator, then called what was
+ *   left a broken coordinate. This is a property of the citation's shape and not a fact about one
+ *   issue — every issue that quotes a `PATH` trips it, and `#785` is an issue *about* a `PATH`, so
+ *   it cannot be written without tripping it. That is the trap `#780`'s body already names for its
+ *   own text, arriving for a different issue.
+ *
+ *   The discriminator is the shape of *both* sides of a colon, never the colon itself: the run has
+ *   to begin with an absolute path and each consumed colon has to be followed by another absolute
+ *   path or a shell variable reference. Two things follow structurally rather than by care:
+ *   `src/foo.ts:42` can never be inside such a span at any offset, because the span must start
+ *   with a character `PATH_RE` cannot start with; and `README.md:1:2` is untouched, because its
+ *   colon's right side is a coordinate, so a line that merely contains a colon is not exempt.
+ *
+ *   Rejected: "the text after the colon is not a decimal" (far wider — it swallows every malformed
+ *   coordinate, and reporting those loudly is what the UNSUPPORTED branch is *for*); and "any
+ *   absolute path is out of grammar" (true of this repository, whose tracked paths are all
+ *   relative, and tempting for that reason — but it reaches NON_DURABLE's own `/tmp` citations and
+ *   the round-25 absolute symbol-path rows, which is a much larger change than the defect needs).
+ *   A single absolute path with a coordinate has no separator, is not a list, and is read exactly
+ *   as before. Disclosed cost of the rule as written: a genuine repository path spelled as the
+ *   tail of a two-element list (`/a/b:/c/src/foo.ts`) is excluded — not how anyone cites a locus,
+ *   but what the rule admits.
+ *
  * ## Round 26: five STALE findings on `main`, two grammar rules missing, and one form deliberately
  * not built
  *
@@ -960,12 +997,24 @@
  *   definitionally, and dropping it manufactured the missing path it then reported.
  *
  *   **Class B — a citation into another repository** (`#756` `hermes_state_schema.py:1333`,
- *   `#627` `SSOT.md:99` and `ARCHITECTURE.md`). All three files exist — in the Hermes repository,
- *   not this one. Nothing in the citation said which repository it meant, so the checker was
- *   *correct* that they do not resolve here; the grammar had no way to write the fact down.
+ *   `#627` `SSOT.md:99` and `ARCHITECTURE.md`). Nothing in any of them said which repository it
+ *   meant, so the checker was *correct* that they do not resolve here; the grammar had no way to
+ *   write the fact down.
+ *
+ *   Round 2 measured what those three actually are, rather than carrying `#780`'s body claim that
+ *   all three "exist — in the other repository". Only one does. `hermes_state_schema.py` is real
+ *   in `MongLong0214/hermes-agent` (96,287 bytes, fetched through the contents API). `SSOT.md` and
+ *   `ARCHITECTURE.md` are in no repository that was searched — not `hermes-agent`, whose 11,097
+ *   paths were enumerated, and not this one. They are **dead citations, not external ones**, and
+ *   qualifying them would launder a locus that exists nowhere into a permanently unverifiable
+ *   EXTERNAL, which is the residual disclosed below arriving through the maintainer's hand instead
+ *   of an author's. The `#627`-derived fixtures below are kept as *grammar* fixtures — they pass
+ *   because of the qualifier, not because of the file — and no test comment claims otherwise.
  *
  *   The chosen form is `<owner>/<repo>@<path>[:line]` — e.g.
- *   `MongLong0214/hermes@hermes_state_schema.py:1333`. Two properties decided it, both about what
+ *   `MongLong0214/hermes-agent@hermes_state_schema.py:1333` — a citation verified real, because a
+ *   citation-checking module whose own worked example resolves to nothing is this check's blind
+ *   spot arriving inside its own fix. Two properties decided it, both about what
  *   the form makes impossible rather than what it makes convenient:
  *
  *     1. The full slug is the only name comparable against this repository's own identity
@@ -1448,6 +1497,20 @@ const CITATION_GRAMMAR_RULES = Object.freeze([
     pathSeparator: "@",
     slugSegmentSource: "[A-Za-z0-9][A-Za-z0-9._-]*",
   }),
+  // #780 round 2. A colon-separated shell search path is a list of paths, and its colons are
+  // separators, not line coordinates. The discriminator is the shape of *both* sides of a colon,
+  // never the colon itself: the run has to begin with an absolute path, and each colon has to be
+  // followed by another absolute path or a shell variable reference. A repository citation can
+  // never be inside such a run, because `PATH_RE` cannot begin with `/` at all — which is how
+  // `/opt/homebrew/bin:…` came to be reported as `opt/homebrew/bin:…`, the leading separator eaten
+  // by the same regex that then called the remainder a broken coordinate.
+  Object.freeze({
+    context: "colon-joined-search-path",
+    support: "out-of-grammar",
+    firstElement: "absolute-path",
+    subsequentElements: Object.freeze(["absolute-path", "shell-variable-reference"]),
+    minimumSeparators: 1,
+  }),
   // #780 class A. `~/`, `$HOME/`, and `${HOME}/` all name the home directory *by definition*, so
   // the remainder is never a path in this repository and resolving it here can only ever produce
   // a false STALE. Out of grammar rather than a category, because there is nothing to report: a
@@ -1475,6 +1538,7 @@ const MARKDOWN_LINK_GRAMMAR = citationGrammar("markdown-inline-link");
 const LINE_GRAMMAR = citationGrammar("line-number");
 const BLOB_GRAMMAR = citationGrammar("github-blob-url");
 const HOME_GRAMMAR = citationGrammar("home-directory-path");
+const SEARCH_PATH_GRAMMAR = citationGrammar("colon-joined-search-path");
 const REPO_QUALIFIER_GRAMMAR = citationGrammar("repository-qualified-path");
 
 const DIRECTORY_PATH_SOURCE = "\\.?[A-Za-z_][\\w-]*(?:/[\\w.-]+)+";
@@ -1501,6 +1565,31 @@ const COORDINATE_SHAPED_RE = new RegExp(
 // repository citation later on the same line is untouched.
 const HOME_PREFIX_SOURCE = `(?:${HOME_GRAMMAR.prefixes.map(escapeRegex).join("|")})`;
 const HOME_PATH_RE = new RegExp(`(?<![\\w.$~/-])${HOME_PREFIX_SOURCE}[^\\s\`'"()\\[\\]<>]*`, "g");
+
+// #780 round 2: a shell search-path value. Two properties keep this from becoming a way to exempt
+// a real citation, and both are structural rather than a list of words to skip:
+//
+//   - the run must *begin* with an absolute path, and `PATH_RE` never matches one — its first
+//     character class is `\.?[A-Za-z_]`, so `src/foo.ts:42` cannot be inside this span at any
+//     offset, and the only text the span takes away from the path scanner is the marker-stripped
+//     artifact (`opt/homebrew/bin`) the scanner should never have produced;
+//   - every colon consumed must be followed by another absolute path or a `$VAR`, so a colon whose
+//     right side is a coordinate — valid or malformed — is untouched, and `README.md:1:2` stays a
+//     loud UNSUPPORTED rather than becoming exempt for containing a colon.
+//
+// A single absolute path with a coordinate (`/Users/x/src/foo.ts:42`) has no separator at all and
+// is not a list; it is read exactly as it was before. The disclosed cost of the shape: a genuine
+// repository path written as the tail of a two-element list (`/a/b:/c/src/foo.ts`) is excluded,
+// which is not how anyone cites a locus but is what the rule admits.
+const ABSOLUTE_PATH_ELEMENT_SOURCE = "/[^\\s:`'\"()\\[\\]<>]*";
+const SHELL_VARIABLE_ELEMENT_SOURCE = "\\$\\{?[A-Za-z_][A-Za-z0-9_]*\\}?";
+const SEARCH_PATH_ELEMENT_SOURCE =
+  `(?:${SEARCH_PATH_GRAMMAR.subsequentElements.includes("absolute-path") ? ABSOLUTE_PATH_ELEMENT_SOURCE : ""}` +
+  `|${SHELL_VARIABLE_ELEMENT_SOURCE})`;
+const SEARCH_PATH_LIST_RE = new RegExp(
+  `(?<![\\w.:$~-])${ABSOLUTE_PATH_ELEMENT_SOURCE}(?::${SEARCH_PATH_ELEMENT_SOURCE}){${SEARCH_PATH_GRAMMAR.minimumSeparators},}`,
+  "g",
+);
 
 // #780 class B: `<owner>/<repo>@<path>[:line]`. The coordinate grammar is the supported one, so a
 // qualified citation carrying a malformed coordinate is not quietly absorbed by this span; the
@@ -2256,6 +2345,20 @@ const extractFromBody = (body) => {
     // something re-deriving cannot fix.
     const insideNonDurable = (idx) => nonDurableSpans.some(([s, e]) => idx >= s && idx < e);
 
+    // #780 round 2. NON_DURABLE is measured first and wins any overlap: `/tmp/a:/tmp/b` is a
+    // custody claim before it is a colon-joined list, and "the filesystem will delete this" is the
+    // message a reader needs. A URL is already masked structurally and is skipped for the same
+    // reason `PATH_RE` skips one — a fragment of a hyperlink is not a citation in its own right.
+    const searchPathSpans = [];
+    for (const m of rawLine.matchAll(SEARCH_PATH_LIST_RE)) {
+      const start = m.index;
+      const end = m.index + m[0].length;
+      const overlaps = (spans) => spans.some(([s, e]) => start < e && end > s);
+      if (overlaps(nonDurableSpans) || overlaps(homeSpans) || overlaps(urlSpans)) continue;
+      searchPathSpans.push([start, end]);
+    }
+    const insideSearchPath = (idx) => searchPathSpans.some(([start, end]) => idx >= start && idx < end);
+
     // #780 class B. A qualifier naming a repository this check can show is not the one it runs in
     // masks its whole span from the path scanners below — not because the citation is unimportant
     // but because measuring it here would answer a question nobody asked. A qualifier naming *this*
@@ -2265,6 +2368,7 @@ const extractFromBody = (body) => {
     const externalSpans = [];
     for (const m of rawLine.matchAll(QUALIFIED_PATH_RE)) {
       if (insideUrl(m.index) || insideHome(m.index) || insideNonDurable(m.index)) continue;
+      if (insideSearchPath(m.index)) continue;
       const slug = m.groups.slug;
       if (!namesAnotherRepository(slug)) continue;
       externalSpans.push([m.index, m.index + m[0].length]);
@@ -2276,6 +2380,7 @@ const extractFromBody = (body) => {
     for (const coordinateMatch of rawLine.matchAll(COORDINATE_SHAPED_RE)) {
       if (insideUrl(coordinateMatch.index) || insideNonDurable(coordinateMatch.index)) continue;
       if (insideHome(coordinateMatch.index) || insideExternal(coordinateMatch.index)) continue;
+      if (insideSearchPath(coordinateMatch.index)) continue;
       const coordinate = coordinateMatch.groups.coordinate.replace(/[.,;:]+$/, "");
       if (SUPPORTED_COORDINATE_RE.test(coordinate)) continue;
       const raw = `${coordinateMatch[1]}${coordinate}`;
@@ -2385,6 +2490,9 @@ const extractFromBody = (body) => {
       // another repository names a tree this check does not have; neither is a claim about a path
       // here, so neither is resolved as one.
       if (insideHome(m.index) || insideExternal(m.index)) continue;
+      // A colon-joined search path is a list of absolute paths; none of them is a path in this
+      // repository, and its colons are separators rather than coordinates.
+      if (insideSearchPath(m.index)) continue;
       // Any URL, not only a GitHub blob link: a fragment of a hyperlink's text is not a citation
       // in its own right, whether or not it superficially carries a line-number-shaped suffix —
       // that leniency is exactly what let a URL fragment through as a fabricated path before. A
