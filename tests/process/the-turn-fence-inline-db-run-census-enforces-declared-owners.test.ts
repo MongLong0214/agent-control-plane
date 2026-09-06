@@ -1,13 +1,33 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { spawn } from "node:child_process";
 import { appendFileSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { cp, mkdir, rm } from "node:fs/promises";
+import { cp, mkdir } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 
 import { cleanupTempDirsAsync, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirsAsync);
+
+/**
+ * #783: the ceiling below comes from a measurement rather than a guess, and the measurement is a
+ * ratio rather than a duration, because a duration is a fact about one machine.
+ *
+ * Measured on one quiet developer checkout: the four slowest rows — the ones that copy the whole
+ * installed dependency tree and typecheck — took 5.6s to 5.8s, and the median row took 1.2s. On
+ * the same checkout under load, with `pool: "forks"` running the rest of the suite and a second
+ * checkout's suite running beside it, one of those four rows took 39.7s: it was starved by about
+ * 7x, which is a true reading of a busy machine and not a defect in the check. Vitest's 60s
+ * default therefore left the slowest row about 1.5x of headroom, and it crossed that ceiling twice
+ * in one day on branches touching nothing near this file, each time costing someone an
+ * investigation of a check that was working.
+ *
+ * So the ceiling is set at roughly 30x the slowest row's quiet cost and roughly 4x its worst
+ * observed starved cost: wide enough that crossing it means a child is stuck rather than merely
+ * waiting behind other work, and still narrow enough to catch one that never exits at all.
+ */
+const CENSUS_ROW_TIMEOUT_MS = 180_000;
+vi.setConfig({ testTimeout: CENSUS_ROW_TIMEOUT_MS });
 
 /**
  * #676: a writer census that tries to evaluate JavaScript has no stable edge. Six review rounds
@@ -21,10 +41,23 @@ const CLAIM =
   "Every inline-SQL direct call whose TypeScript property symbol is exactly Db.run and that names a turn-fence table is in that table's declared application owner.";
 
 /**
- * Follow the replace-census process test's clone-then-copy shape: the scratch repository owns
- * every input it runs. Most cases need only the census's TypeScript dependency; the three probes
- * that typecheck and execute get the complete installed dependency tree. Neither form leaves pnpm
- * looking at a modules directory whose resolved target is outside the scratch repository.
+ * The scratch repository owns every input it runs, and it is built from exactly the inputs the
+ * census reads rather than from a clone of the checkout. Most cases need only the census's
+ * TypeScript dependency; the four cases that typecheck — three of which also bundle and run a
+ * counterexample — get the complete installed dependency tree. Neither form leaves pnpm looking
+ * at a modules directory whose resolved target is outside the scratch repository.
+ *
+ * #783 measured where a row's time went, per row, on an idle checkout: the clone cost ~0.57s and
+ * the `tests` tree it carried cost a further ~0.27s inside every `censusOn` call, because
+ * `tsconfig.json` includes `tests/**` in the program the census builds. The census never reads
+ * outside `src/`, so neither bought a row any evidence. What a scratch repository no longer has is
+ * the rest of the checkout — `package.json`, `native`, `docs`, `evidence`, every script but this
+ * census, and git metadata — plus the checkout's own test sources. No row reads any of them; the
+ * `tests` directory below is created empty so the rows that place a probe outside `src/` still
+ * have somewhere to put it. One consequence is deliberate: `tsc --noEmit` in the cases that
+ * typecheck now covers `src` plus their probe, not the whole checkout. That the checkout's tests
+ * typecheck is `pnpm typecheck`'s claim, not this file's, and an unrelated error there used to
+ * fail these rows for a reason that has nothing to do with the boundary they measure.
  */
 interface ChildResult {
   status: number | null;
@@ -53,14 +86,10 @@ const scratchRepo = async (
   dependencies: "typescript" | "all" = "typescript",
 ): Promise<string> => {
   const dir = join(tempDir("acp-writer-census-"), "repo");
-  const cloned = await runChild(
-    "git",
-    ["clone", "--quiet", "--no-hardlinks", "--depth", "1", ROOT, dir],
-    ROOT,
-  );
-  if (cloned.status !== 0) throw new Error(`scratch clone failed: ${cloned.stderr}`);
+  await mkdir(join(dir, "scripts"), { recursive: true });
+  await mkdir(join(dir, "tests"), { recursive: true });
+  await cp(join(ROOT, "tsconfig.json"), join(dir, "tsconfig.json"));
   await cp(join(ROOT, SCRIPT), join(dir, SCRIPT));
-  await rm(join(dir, "src"), { recursive: true, force: true });
   await cp(join(ROOT, "src"), join(dir, "src"), { recursive: true });
   if (dependencies === "all") {
     await cp(join(ROOT, "node_modules"), join(dir, "node_modules"), { recursive: true });
