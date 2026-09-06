@@ -1,8 +1,11 @@
-import { closeSync, openSync } from "node:fs";
+import { closeSync, existsSync, openSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import Database from "better-sqlite3";
+
+import { acpError } from "../core/errors.ts";
+import { ReasonCode } from "../core/reason-codes.ts";
 
 /**
  * Binds a SQLite connection to a descriptor its caller has already verified (`U6` unit 1).
@@ -35,17 +38,43 @@ export interface FdVfsStats {
   refusal: string;
 }
 
-/** The built extension. Never compiled here: ADR-0010 keeps compilation at install time. */
-const EXTENSION_PATH = join(
-  dirname(fileURLToPath(import.meta.url)),
+/**
+ * The built extension. Never compiled here: ADR-0010 keeps compilation at install time.
+ *
+ * A sealed rollback pair's closure is `dist/.` plus `node_modules` plus the interpreter (see
+ * `src/deploy/rollback-pair.ts`) — nothing outside `dist` travels with it. A path resolved two
+ * directories above this module's own directory reaches the checkout root's `native/`, a sibling
+ * of `dist` that a rollback never touches: after a rollback installs generation A's `dist`, that
+ * sibling is still whatever generation B left there, and the process loads the wrong extension
+ * without either generation's bytes being wrong on their own.
+ *
+ * So the in-tree candidate — one directory up, inside whichever root this module is actually
+ * running from — is tried first: `npm run build` copies the built extension into `dist/native/...`
+ * (see `scripts/copy-native-fd-vfs-into-dist.mjs`), so a compiled, installed, or sealed-and-restored
+ * `dist` always carries its own copy and this candidate always resolves for it. The sibling
+ * candidate two directories up exists only so this module keeps working when a test imports the
+ * `.ts` source directly (`src/db/fd-vfs.ts`) rather than the compiled `dist/db/fd-vfs.js` — there is
+ * no `src/native/`, and there never should be one, so that case falls through to the checkout's own
+ * `native/`, built once at `pnpm install` time. Neither candidate is a guess: whichever is chosen is
+ * chosen because it is the one that exists on disk, and `loadExtension` fails loudly on whichever
+ * path this resolves to if neither does.
+ */
+const EXTENSION_FILENAME = process.platform === "darwin" ? "acp_fd_vfs.dylib" : "acp_fd_vfs.so";
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
+const IN_TREE_EXTENSION_PATH = join(MODULE_DIR, "..", "native", "fd-vfs", "build", "Release", EXTENSION_FILENAME);
+const CHECKOUT_SIBLING_EXTENSION_PATH = join(
+  MODULE_DIR,
   "..",
   "..",
   "native",
   "fd-vfs",
   "build",
   "Release",
-  process.platform === "darwin" ? "acp_fd_vfs.dylib" : "acp_fd_vfs.so",
+  EXTENSION_FILENAME,
 );
+const EXTENSION_PATH = existsSync(IN_TREE_EXTENSION_PATH)
+  ? IN_TREE_EXTENSION_PATH
+  : CHECKOUT_SIBLING_EXTENSION_PATH;
 
 const parseStats = (line: string): FdVfsStats => {
   const field = (name: string): string => new RegExp(`${name}=([^ ]*)`).exec(line)?.[1] ?? "";
@@ -185,3 +214,208 @@ export const withBoundDescriptor = <T>(
     closeSync(fd);
   }
 };
+
+
+/**
+ * The bounded rollback filesystem primitive.
+ *
+ * A rollback verifies a destination and then mutates it, and a pathname can be made to mean
+ * something else in between: renaming a parent directory, or replacing a component with a symlink,
+ * steers the second walk somewhere the first never saw. Node's standard library cannot close that
+ * — it exposes no `*at` family, only `O_NOFOLLOW`, and `fs.constants` carries no `RENAME_EXCL` —
+ * so the anchor has to come from the extension, where a held directory descriptor can be the
+ * subject of every later operation.
+ *
+ * This surface is deliberately five operations wide. There is no read, no write, no create-file,
+ * no chmod and no traversal: names are single components. It is what an exclusive publication and
+ * an ownership-bound cleanup need, and nothing a caller could build a general filesystem out of.
+ */
+/**
+ * `dev` and `ino` are `bigint`, and that is not fastidiousness.
+ *
+ * Both are 64-bit and APFS uses the range. A JavaScript number holds 53 bits exactly, so an inode
+ * above that arrives already collided — measured: `Number("9007199254740993")` is
+ * `9007199254740992`, the identity of a different file. An ownership check comparing those would
+ * agree about two different objects, which is the whole property this primitive exists to provide.
+ * They travel as decimal text and are parsed exactly at both ends.
+ */
+export interface RollbackEntry {
+  type: "dir" | "file" | "symlink" | "other";
+  mode: number;
+  dev: bigint;
+  ino: bigint;
+  nlink: bigint;
+  size: bigint;
+}
+
+export interface RollbackParent {
+  /** `slot.generation`. A slot alone would let a reopened slot answer a stale token — an ABA. */
+  token: string;
+  dev: bigint;
+  ino: bigint;
+}
+
+const field = (line: string, name: string): string =>
+  new RegExp(`(?:^| )${name}=([^ ]*)`).exec(line)?.[1] ?? "";
+
+/** Every native result is either a value line or `error=WHAT errno=N`; neither is ever guessed. */
+/**
+ * Parses a 64-bit field exactly, refusing anything that is not a plain decimal integer.
+ *
+ * Exported because the property it carries cannot be reached through the operations above: every
+ * inode this machine can create is below 2^53, so a test driving the real primitive would pass
+ * whether this parsed exactly or went through a JavaScript number. The boundary is real on APFS
+ * and unreachable in a fixture, so it is measured here directly.
+ */
+export const parseExactIdentity = (value: string, what: string): bigint => {
+  if (!/^[0-9]+$/.test(value)) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, `the rollback filesystem returned an unreadable ${what}`, {
+      value,
+    });
+  }
+  return BigInt(value);
+};
+
+const refuse = (operation: string, line: string, detail: Record<string, unknown>): never => {
+  throw acpError(ReasonCode.STATE_PATH_INSECURE, `the rollback filesystem refused ${operation}`, {
+    ...detail,
+    reason: field(line, "error"),
+    errno: Number(field(line, "errno")),
+  });
+};
+
+export class RollbackFilesystem {
+  readonly #db: InstanceType<typeof Database>;
+  readonly #open = new Set<string>();
+
+  private constructor(db: InstanceType<typeof Database>) {
+    this.#db = db;
+  }
+
+  static load(): RollbackFilesystem {
+    const db = new Database(":memory:");
+    try {
+      db.loadExtension(EXTENSION_PATH);
+    } catch (error) {
+      db.close();
+      throw acpError(ReasonCode.INTERNAL_ERROR, "the fd-vfs extension could not be loaded", {
+        path: EXTENSION_PATH,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    return new RollbackFilesystem(db);
+  }
+
+  /**
+   * Holds a parent directory open, no-follow, and remembers its identity.
+   *
+   * Everything after this is relative to the descriptor rather than to the path, so renaming the
+   * directory afterwards moves the name and not the object being worked on.
+   */
+  openParent(path: string): RollbackParent {
+    const line = String(
+      (this.#db.prepare("SELECT acp_rb_open(?) AS r").get(path) as { r: string }).r,
+    );
+    if (line.startsWith("error=")) refuse("opening a parent directory", line, { path });
+    const parent = {
+      token: field(line, "token"),
+      dev: parseExactIdentity(field(line, "dev"), "dev"),
+      ino: parseExactIdentity(field(line, "ino"), "ino"),
+    };
+    if (!/^[0-9]+\.[0-9]+$/.test(parent.token)) {
+      throw acpError(ReasonCode.INTERNAL_ERROR, "the rollback filesystem returned no usable handle", {
+        path,
+      });
+    }
+    this.#open.add(parent.token);
+    return parent;
+  }
+
+  /** `fstatat(AT_SYMLINK_NOFOLLOW)` under the held parent. `null` when the entry is not there. */
+  stat(parent: RollbackParent, name: string): RollbackEntry | null {
+    const line = String(
+      (this.#db.prepare("SELECT acp_rb_stat(?, ?) AS r").get(parent.token, name) as { r: string }).r,
+    );
+    if (line.startsWith("error=")) {
+      if (field(line, "error") === "STAT") return null;
+      refuse("inspecting an entry", line, { name });
+    }
+    const type = field(line, "type");
+    return {
+      type: type === "dir" || type === "file" || type === "symlink" ? type : "other",
+      mode: Number.parseInt(field(line, "mode"), 8),
+      dev: parseExactIdentity(field(line, "dev"), "dev"),
+      ino: parseExactIdentity(field(line, "ino"), "ino"),
+      nlink: parseExactIdentity(field(line, "nlink"), "nlink"),
+      size: parseExactIdentity(field(line, "size"), "size"),
+    };
+  }
+
+  /**
+   * `renameatx_np(..., RENAME_EXCL)`: commit the name only if nothing already holds it.
+   *
+   * The check and the use are one syscall, so a foreign directory that appears under the final
+   * name between them is an `EEXIST` rather than something this overwrites.
+   */
+  renameExclusive(from: RollbackParent, fromName: string, to: RollbackParent, toName: string): void {
+    const line = String(
+      (
+        this.#db
+          .prepare("SELECT acp_rb_rename_excl(?, ?, ?, ?) AS r")
+          .get(from.token, fromName, to.token, toName) as { r: string }
+      ).r,
+    );
+    if (line !== "ok") refuse("publishing a name exclusively", line, { fromName, toName });
+  }
+
+  /**
+   * Removes an entry under the held parent, and only while it is still the exact object named.
+   *
+   * Cleanup keyed on a pathname removes whatever is at that name when it runs, which after a
+   * foreign replacement is somebody else's tree. Binding it to `(dev, ino)` makes the object the
+   * authority, so a swapped stage is refused rather than deleted on the owner's behalf.
+   */
+  removeOwned(parent: RollbackParent, name: string, dev: bigint, ino: bigint): void {
+    const line = String(
+      (
+        this.#db
+          .prepare("SELECT acp_rb_remove_owned(?, ?, ?, ?) AS r")
+          .get(parent.token, name, String(dev), String(ino)) as { r: string }
+      ).r,
+    );
+    if (line !== "ok") refuse("removing an owned entry", line, { name, dev, ino });
+  }
+
+  closeParent(parent: RollbackParent): void {
+    const released = this.#db.prepare("SELECT acp_rb_close(?) AS r").get(parent.token) as {
+      r: number;
+    };
+    this.#open.delete(parent.token);
+    // A failed close is terminal uncertainty, not a tidy-up detail: the descriptor may still be
+    // open and the slot is now poisoned on the native side so nothing can reuse it.
+    if (released.r === -1) {
+      throw acpError(ReasonCode.INTERNAL_ERROR, "a rollback filesystem handle could not be released", {
+        token: parent.token,
+      });
+    }
+  }
+
+  /**
+   * Releases every handle and the connection.
+   *
+   * A cleanup failure must not replace the reason the work failed — the same lesson
+   * `withBoundDescriptor` records above. Callers reach this from a `finally`, so a throw here
+   * would hide the error that actually matters and is the only one they can act on.
+   */
+  dispose(): void {
+    for (const token of [...this.#open]) {
+      try {
+        this.#db.prepare("SELECT acp_rb_close(?) AS r").get(token);
+      } catch {
+        /* The descriptor goes with the connection below; nothing here is worth masking with. */
+      }
+    }
+    this.#open.clear();
+    this.#db.close();
+  }
+}

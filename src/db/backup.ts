@@ -49,7 +49,7 @@ export interface DatabaseBackup {
   schemaVersion: number;
 }
 
-interface BackupManifest {
+export interface BackupManifest {
   format: "agent-control-plane.sqlite-backup/v1";
   databaseFile: string;
   databaseSha256: string;
@@ -339,7 +339,13 @@ const readManifest = (backupPath: string): BackupManifest => {
   }
 };
 
-const validateBackup = (
+/**
+ * Exported for `src/deploy/rollback-pair.ts`, which has to prove a sealed pair's database member
+ * came through the supported backup path — private mode, manifest shape, checksum, integrity,
+ * declared version — rather than being a raw copy of a live SQLite file. The authority on what
+ * "a usable backup" means stays here; the pair validator consumes it instead of restating it.
+ */
+export const validateBackup = (
   backupPath: string,
   options: { assertSchemaInvariants: boolean } = { assertSchemaInvariants: true },
 ): BackupManifest => {

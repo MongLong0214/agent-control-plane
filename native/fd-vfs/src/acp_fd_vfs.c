@@ -55,9 +55,11 @@
 #include <pthread.h>
 #include <time.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <unistd.h>
 SQLITE_EXTENSION_INIT1
 
@@ -1124,6 +1126,419 @@ static void acp_fn_probe(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
 #ifdef _WIN32
 __declspec(dllexport)
 #endif
+
+/*
+ * The bounded rollback primitive.
+ *
+ * A rollback verifies a destination and then mutates it, and between those two moments a pathname
+ * can be made to mean something else. `lstat(parent/x)` then `rename(parent/x, ...)` walks
+ * `parent` twice; renaming `parent` between them, or replacing a component with a symlink, steers
+ * the second walk somewhere the first never saw. Node's standard library cannot close this: it
+ * exposes no `*at` family and only `O_NOFOLLOW`, and `fs.constants` carries no `RENAME_EXCL`, so
+ * there is no way to anchor an operation to a directory a caller is holding or to commit a name
+ * only if it does not already exist.
+ *
+ * So the anchor is a held descriptor. A caller opens the parent directory once, no-follow, and
+ * this records its (dev, ino). Every later operation is relative to that descriptor — never to a
+ * pathname — so renaming the parent afterwards moves the name and not the object, and the work
+ * still lands in the directory that was verified.
+ *
+ * Deliberately narrow. There is no read, no write, no create-file, no chmod and no path traversal:
+ * names are single components, checked as such. The five operations here are exactly what an
+ * exclusive publication and an ownership-bound cleanup need, and nothing else is reachable
+ * through them.
+ */
+
+#define ACP_RB_MAX_HANDLES 8
+#define ACP_RB_MAX_DEPTH 32
+
+/*
+ * A handle slot, and why it carries a generation.
+ *
+ * A bare slot index is an ABA waiting to happen: close slot 3, open something else that lands in
+ * slot 3, and a caller still holding "3" now operates on a directory it never opened. The token is
+ * therefore `slot.generation`, the generation increments on every open, and a token whose
+ * generation does not match the slot is refused rather than resolved.
+ *
+ * `poisoned` is the other half. If `close()` fails the descriptor's fate is unknown — it may still
+ * be open, and reusing the slot would hand a later caller a descriptor that is not what its token
+ * says. Terminal uncertainty is recorded by never freeing the slot again.
+ */
+typedef struct {
+  int fd; /* -1 when free */
+  unsigned long long generation;
+  int poisoned;
+  dev_t dev;
+  ino_t ino;
+} acp_rb_handle;
+
+static acp_rb_handle acp_rb_handles[ACP_RB_MAX_HANDLES];
+static int acp_rb_initialised = 0;
+
+static void acp_rb_init_locked(void) {
+  if (acp_rb_initialised) return;
+  for (int i = 0; i < ACP_RB_MAX_HANDLES; i++) {
+    acp_rb_handles[i].fd = -1;
+    acp_rb_handles[i].generation = 0;
+    acp_rb_handles[i].poisoned = 0;
+  }
+  acp_rb_initialised = 1;
+}
+
+/*
+ * A 64-bit identity argument, carried as decimal text.
+ *
+ * `dev_t` and `ino_t` are 64-bit and APFS uses the range. A JavaScript number cannot hold more
+ * than 53 bits exactly, so an inode above that arrives already collided — `9007199254740993`
+ * becomes `9007199254740992`, which is a different file. Carrying them as text and parsing here
+ * is the only representation that survives the trip, and the parse refuses anything that is not
+ * exactly a decimal integer rather than taking a prefix.
+ */
+static int acp_rb_u64_arg(sqlite3_value *value, unsigned long long *out) {
+  if (sqlite3_value_type(value) != SQLITE_TEXT) return 0;
+  const char *text = (const char *)sqlite3_value_text(value);
+  if (text == 0 || text[0] == 0) return 0;
+  for (const char *c = text; *c != 0; c++) {
+    if (*c < '0' || *c > '9') return 0;
+  }
+  errno = 0;
+  char *end = 0;
+  unsigned long long parsed = strtoull(text, &end, 10);
+  if (errno != 0 || end == 0 || *end != 0) return 0;
+  *out = parsed;
+  return 1;
+}
+
+/* Parses a `slot.generation` token. Returns the live descriptor, or -1 when it names none. */
+static int acp_rb_resolve_locked(sqlite3_value *value, int *slotOut) {
+  if (sqlite3_value_type(value) != SQLITE_TEXT) return -1;
+  const char *text = (const char *)sqlite3_value_text(value);
+  if (text == 0) return -1;
+  char *dot = strchr(text, '.');
+  if (dot == 0 || dot == text || dot[1] == 0) return -1;
+  char slotText[16];
+  size_t slotLen = (size_t)(dot - text);
+  if (slotLen == 0 || slotLen >= sizeof slotText) return -1;
+  memcpy(slotText, text, slotLen);
+  slotText[slotLen] = 0;
+  for (const char *c = slotText; *c != 0; c++) {
+    if (*c < '0' || *c > '9') return -1;
+  }
+  for (const char *c = dot + 1; *c != 0; c++) {
+    if (*c < '0' || *c > '9') return -1;
+  }
+  long slot = strtol(slotText, 0, 10);
+  unsigned long long generation = strtoull(dot + 1, 0, 10);
+  if (slot < 0 || slot >= ACP_RB_MAX_HANDLES) return -1;
+  if (acp_rb_handles[slot].fd < 0) return -1;
+  if (acp_rb_handles[slot].generation != generation) return -1;
+  if (slotOut != 0) *slotOut = (int)slot;
+  return acp_rb_handles[slot].fd;
+}
+
+/* A name this primitive will act on: one component, no separator, not `.` and not `..`. */
+static int acp_rb_name_ok(const char *name) {
+  if (name == 0) return 0;
+  size_t n = strlen(name);
+  if (n == 0 || n > ACP_MAX_BASE) return 0;
+  if (strchr(name, '/') != 0) return 0;
+  if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return 0;
+  return 1;
+}
+
+static void acp_rb_error(sqlite3_context *ctx, const char *what, int err) {
+  char buf[128];
+  snprintf(buf, sizeof buf, "error=%s errno=%d", what, err);
+  sqlite3_result_text(ctx, buf, -1, SQLITE_TRANSIENT);
+}
+
+
+/* open(path, O_DIRECTORY|O_NOFOLLOW) and remember (dev, ino): the anchor everything else uses. */
+static void acp_fn_rb_open(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  if (argc != 1 || sqlite3_value_type(argv[0]) != SQLITE_TEXT) {
+    sqlite3_result_error(ctx, "acp_rb_open(path)", -1);
+    return;
+  }
+  const char *path = (const char *)sqlite3_value_text(argv[0]);
+  if (path == 0 || path[0] != '/' || strlen(path) > ACP_MAX_PATH) {
+    acp_rb_error(ctx, "PATH", EINVAL);
+    return;
+  }
+  if (!acp_state_lock()) {
+    acp_rb_error(ctx, "LOCK", EAGAIN);
+    return;
+  }
+  acp_rb_init_locked();
+  int slot = -1;
+  for (int i = 0; i < ACP_RB_MAX_HANDLES; i++) {
+    if (acp_rb_handles[i].fd < 0 && !acp_rb_handles[i].poisoned) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot < 0) {
+    acp_state_unlock();
+    acp_rb_error(ctx, "HANDLES", EMFILE);
+    return;
+  }
+  if (acp_rb_handles[slot].poisoned) {
+    acp_state_unlock();
+    acp_rb_error(ctx, "POISONED", EIO);
+    return;
+  }
+  int fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) {
+    int e = errno;
+    acp_state_unlock();
+    acp_rb_error(ctx, "OPEN", e);
+    return;
+  }
+  struct stat st;
+  if (fstat(fd, &st) != 0) {
+    int e = errno;
+    close(fd);
+    acp_state_unlock();
+    acp_rb_error(ctx, "FSTAT", e);
+    return;
+  }
+  acp_rb_handles[slot].fd = fd;
+  acp_rb_handles[slot].generation += 1;
+  acp_rb_handles[slot].dev = st.st_dev;
+  acp_rb_handles[slot].ino = st.st_ino;
+  unsigned long long generation = acp_rb_handles[slot].generation;
+  acp_state_unlock();
+  char buf[200];
+  snprintf(buf, sizeof buf, "token=%d.%llu dev=%llu ino=%llu", slot, generation,
+           (unsigned long long)st.st_dev, (unsigned long long)st.st_ino);
+  sqlite3_result_text(ctx, buf, -1, SQLITE_TRANSIENT);
+}
+
+static void acp_fn_rb_close(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  if (argc != 1) {
+    sqlite3_result_error(ctx, "acp_rb_close(token)", -1);
+    return;
+  }
+  if (!acp_state_lock()) {
+    sqlite3_result_int(ctx, 0);
+    return;
+  }
+  acp_rb_init_locked();
+  int slot = -1;
+  int fd = acp_rb_resolve_locked(argv[0], &slot);
+  if (fd < 0) {
+    acp_state_unlock();
+    sqlite3_result_int(ctx, 0);
+    return;
+  }
+  if (close(fd) != 0) {
+    // Terminal uncertainty: the descriptor's fate is unknown, so the slot is never handed out
+    // again. Freeing it would let a later token resolve to a descriptor that is not what it says.
+    acp_rb_handles[slot].poisoned = 1;
+    acp_rb_handles[slot].fd = -1;
+    acp_state_unlock();
+    sqlite3_result_int(ctx, -1);
+    return;
+  }
+  acp_rb_handles[slot].fd = -1;
+  acp_state_unlock();
+  sqlite3_result_int(ctx, 1);
+}
+
+/* fstatat(AT_SYMLINK_NOFOLLOW) relative to the held parent: identity of the entry as it is now. */
+static void acp_fn_rb_stat(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  if (argc != 2 || sqlite3_value_type(argv[1]) != SQLITE_TEXT) {
+    sqlite3_result_error(ctx, "acp_rb_stat(token, name)", -1);
+    return;
+  }
+  const char *name = (const char *)sqlite3_value_text(argv[1]);
+  if (!acp_rb_name_ok(name)) {
+    acp_rb_error(ctx, "NAME", EINVAL);
+    return;
+  }
+  if (!acp_state_lock()) {
+    acp_rb_error(ctx, "LOCK", EAGAIN);
+    return;
+  }
+  acp_rb_init_locked();
+  int fd = acp_rb_resolve_locked(argv[0], 0);
+  if (fd < 0) {
+    acp_state_unlock();
+    acp_rb_error(ctx, "HANDLE", EBADF);
+    return;
+  }
+  struct stat st;
+  int rc = fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW);
+  int e = errno;
+  acp_state_unlock();
+  if (rc != 0) {
+    acp_rb_error(ctx, "STAT", e);
+    return;
+  }
+  const char *type = "other";
+  if (S_ISDIR(st.st_mode)) type = "dir";
+  else if (S_ISLNK(st.st_mode)) type = "symlink";
+  else if (S_ISREG(st.st_mode)) type = "file";
+  char buf[256];
+  snprintf(buf, sizeof buf, "type=%s mode=%o dev=%llu ino=%llu nlink=%llu size=%llu", type,
+           (unsigned)(st.st_mode & 07777), (unsigned long long)st.st_dev,
+           (unsigned long long)st.st_ino, (unsigned long long)st.st_nlink,
+           (unsigned long long)st.st_size);
+  sqlite3_result_text(ctx, buf, -1, SQLITE_TRANSIENT);
+}
+
+/*
+ * renameatx_np(RENAME_EXCL): commit a name only if nothing holds it.
+ *
+ * `existsSync` then `rename` is a check and a use with a gap between them, and the gap is exactly
+ * where a foreign directory appears under the final name. RENAME_EXCL makes the non-existence part
+ * of the commit itself, so a name that was taken in between is an `EEXIST` rather than an
+ * overwrite of somebody else's directory.
+ */
+static void acp_fn_rb_rename_excl(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  if (argc != 4 || sqlite3_value_type(argv[1]) != SQLITE_TEXT ||
+      sqlite3_value_type(argv[3]) != SQLITE_TEXT) {
+    sqlite3_result_error(ctx, "acp_rb_rename_excl(fromToken, fromName, toToken, toName)", -1);
+    return;
+  }
+  const char *fromName = (const char *)sqlite3_value_text(argv[1]);
+  const char *toName = (const char *)sqlite3_value_text(argv[3]);
+  if (!acp_rb_name_ok(fromName) || !acp_rb_name_ok(toName)) {
+    acp_rb_error(ctx, "NAME", EINVAL);
+    return;
+  }
+  if (!acp_state_lock()) {
+    acp_rb_error(ctx, "LOCK", EAGAIN);
+    return;
+  }
+  acp_rb_init_locked();
+  int fromFd = acp_rb_resolve_locked(argv[0], 0);
+  int toFd = acp_rb_resolve_locked(argv[2], 0);
+  if (fromFd < 0 || toFd < 0) {
+    acp_state_unlock();
+    acp_rb_error(ctx, "HANDLE", EBADF);
+    return;
+  }
+#ifdef __APPLE__
+  int rc = renameatx_np(fromFd, fromName, toFd, toName, RENAME_EXCL);
+  int e = errno;
+#else
+  /* Fail closed. `renameat2(RENAME_NOREPLACE)` is the Linux equivalent and is not wired here,
+     because this deployment is macOS and a primitive that silently degraded to a replacing
+     rename would defeat the one property it exists to provide. */
+  int rc = -1;
+  int e = ENOTSUP;
+  (void)fromName;
+  (void)toName;
+#endif
+  acp_state_unlock();
+  if (rc != 0) {
+    acp_rb_error(ctx, "RENAME", e);
+    return;
+  }
+  sqlite3_result_text(ctx, "ok", -1, SQLITE_TRANSIENT);
+}
+
+/* Recursive removal anchored at each level by openat, refusing to descend through a symlink. */
+static int acp_rb_remove_at(int parentFd, const char *name, int depth) {
+  if (depth > ACP_RB_MAX_DEPTH) return ELOOP;
+  struct stat st;
+  if (fstatat(parentFd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) return errno;
+  if (!S_ISDIR(st.st_mode)) {
+    /* A symlink is unlinked, never followed: removing the name is the whole intent. */
+    if (unlinkat(parentFd, name, 0) != 0) return errno;
+    return 0;
+  }
+  int dirFd = openat(parentFd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (dirFd < 0) return errno;
+  int iterFd = dup(dirFd);
+  if (iterFd < 0) {
+    int e = errno;
+    close(dirFd);
+    return e;
+  }
+  DIR *dir = fdopendir(iterFd);
+  if (dir == 0) {
+    int e = errno;
+    close(iterFd);
+    close(dirFd);
+    return e;
+  }
+  int failure = 0;
+  for (;;) {
+    errno = 0;
+    struct dirent *entry = readdir(dir);
+    if (entry == 0) {
+      if (errno != 0) failure = errno;
+      break;
+    }
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+    int rc = acp_rb_remove_at(dirFd, entry->d_name, depth + 1);
+    if (rc != 0) {
+      failure = rc;
+      break;
+    }
+  }
+  closedir(dir);
+  close(dirFd);
+  if (failure != 0) return failure;
+  if (unlinkat(parentFd, name, AT_REMOVEDIR) != 0) return errno;
+  return 0;
+}
+
+/*
+ * Remove one entry under the held parent, and only if it is still the exact object the caller
+ * created.
+ *
+ * A cleanup keyed on a pathname removes whatever is at that name when it runs, which after a
+ * foreign replacement is somebody else's tree. Binding the removal to (dev, ino) means the
+ * authority is the object, not the name: if the stage was swapped, this refuses and leaves the
+ * intruder alone rather than deleting it on the owner's behalf.
+ */
+static void acp_fn_rb_remove_owned(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  unsigned long long wantDev = 0;
+  unsigned long long wantIno = 0;
+  if (argc != 4 || sqlite3_value_type(argv[1]) != SQLITE_TEXT ||
+      !acp_rb_u64_arg(argv[2], &wantDev) || !acp_rb_u64_arg(argv[3], &wantIno)) {
+    sqlite3_result_error(ctx, "acp_rb_remove_owned(token, name, dev, ino)", -1);
+    return;
+  }
+  const char *name = (const char *)sqlite3_value_text(argv[1]);
+  if (!acp_rb_name_ok(name)) {
+    acp_rb_error(ctx, "NAME", EINVAL);
+    return;
+  }
+  if (!acp_state_lock()) {
+    acp_rb_error(ctx, "LOCK", EAGAIN);
+    return;
+  }
+  acp_rb_init_locked();
+  int fd = acp_rb_resolve_locked(argv[0], 0);
+  if (fd < 0) {
+    acp_state_unlock();
+    acp_rb_error(ctx, "HANDLE", EBADF);
+    return;
+  }
+  struct stat st;
+  if (fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+    int e = errno;
+    acp_state_unlock();
+    acp_rb_error(ctx, "STAT", e);
+    return;
+  }
+  if ((unsigned long long)st.st_dev != wantDev || (unsigned long long)st.st_ino != wantIno) {
+    acp_state_unlock();
+    acp_rb_error(ctx, "OWNERSHIP", EPERM);
+    return;
+  }
+  int rc = acp_rb_remove_at(fd, name, 0);
+  acp_state_unlock();
+  if (rc != 0) {
+    acp_rb_error(ctx, "REMOVE", rc);
+    return;
+  }
+  sqlite3_result_text(ctx, "ok", -1, SQLITE_TRANSIENT);
+}
+
 int sqlite3_extension_init(sqlite3 *db, char **err, const sqlite3_api_routines *api) {
   SQLITE_EXTENSION_INIT2(api)
   if (err) *err = 0;
@@ -1142,7 +1557,12 @@ int sqlite3_extension_init(sqlite3 *db, char **err, const sqlite3_api_routines *
   if (sqlite3_create_function(db, "acp_fd_bind", 3, SQLITE_UTF8, 0, acp_fn_bind, 0, 0) != SQLITE_OK ||
       sqlite3_create_function(db, "acp_fd_unbind", 1, SQLITE_UTF8, 0, acp_fn_unbind, 0, 0) != SQLITE_OK ||
       sqlite3_create_function(db, "acp_fd_stats", 0, SQLITE_UTF8, 0, acp_fn_stats, 0, 0) != SQLITE_OK ||
-      sqlite3_create_function(db, "acp_fd_probe", 0, SQLITE_UTF8, 0, acp_fn_probe, 0, 0) != SQLITE_OK) {
+      sqlite3_create_function(db, "acp_fd_probe", 0, SQLITE_UTF8, 0, acp_fn_probe, 0, 0) != SQLITE_OK ||
+      sqlite3_create_function(db, "acp_rb_open", 1, SQLITE_UTF8, 0, acp_fn_rb_open, 0, 0) != SQLITE_OK ||
+      sqlite3_create_function(db, "acp_rb_close", 1, SQLITE_UTF8, 0, acp_fn_rb_close, 0, 0) != SQLITE_OK ||
+      sqlite3_create_function(db, "acp_rb_stat", 2, SQLITE_UTF8, 0, acp_fn_rb_stat, 0, 0) != SQLITE_OK ||
+      sqlite3_create_function(db, "acp_rb_rename_excl", 4, SQLITE_UTF8, 0, acp_fn_rb_rename_excl, 0, 0) != SQLITE_OK ||
+      sqlite3_create_function(db, "acp_rb_remove_owned", 4, SQLITE_UTF8, 0, acp_fn_rb_remove_owned, 0, 0) != SQLITE_OK) {
     return SQLITE_ERROR;
   }
 #ifdef ACP_FD_VFS_TESTING

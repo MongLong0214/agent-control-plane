@@ -3558,42 +3558,53 @@ const GUARDS = [
     ],
   },
   {
-    // #737: the rollback preflight in docs/ops/owner-actions.md item 6 checks every file the
-    // rollback will read before its first destructive command (`rm -rf .../dist`). This row
-    // deletes the launcher check specifically, leaving the other checks around it intact, so a
-    // test that only asserted "some check exists somewhere" could not be fooled by this — the
-    // named test extracts the whole block and runs it against a fixture backup that is otherwise
-    // fully valid and is missing only the launcher file, so with this line gone the extracted
-    // script sails through every remaining check and actually runs `rm -rf` against the fixture's
-    // live dist directory.
-    what: "the rollback preflight refuses a missing launcher backup file before rm -rf runs",
+    // Measured: the previous version of the named test extracted only the text between item 6's
+    // two markers and asserted a denylist over it. It passed 5/5 against exactly this mutation —
+    // a destructive command one line *above* the opening marker. The extraction window never
+    // contained it, so nothing ran it and no string search looked for it.
+    //
+    // The test now extracts every indented command line in item 6, in document order, and
+    // compares a full inventory of the app root, the state directory and LaunchAgents — relative
+    // path, type, mode, inode and content digest — before and after the refusal. This row is that
+    // falsifier, kept so the fix cannot quietly regress to a census: with it applied, the named
+    // row fails on the inventory it took, not on a token it happened to be looking for.
+    what: "item 6 runs no destructive command outside the sealed-pair invocation, including above its opening marker",
     file: "docs/ops/owner-actions.md",
-    find:
-      '    test -s "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist"\n' +
-      '    test -s "$BYTES_BACKUP/agentcpd-launch.sh"\n' +
-      '    test -s "$BACKUP_PATH"\n',
+    find: "<!-- owner-actions:rollback-preflight:start -->\n",
     replace:
-      '    test -s "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist"\n' +
-      '    test -s "$BACKUP_PATH"\n',
-    killedBy: ["tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts"],
+      '    : > "$APP_ROOT/dist/daemon/agentcpd.js"\n' +
+      "\n" +
+      "<!-- owner-actions:rollback-preflight:start -->\n",
+    killedBy: [
+      "tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts::refuses without a sealed pair, changing nothing anywhere it can reach",
+    ],
   },
   {
-    // #737, CEO's second-round finding: the launcher row above did not cover the *other* named
-    // counterexample — nothing mutated the state-admin.js existence/readability guard, so that
-    // half of the fixture had a test but no proof the test could fail. This row deletes both
-    // lines (existence and readability are one guard for this file; deleting only one would still
-    // leave the other blocking `rm -rf`, so it would not be about the file going missing at all).
-    // Reproduced by hand before this row existed: with these two lines removed and the
-    // state-admin-only-missing fixture otherwise fully valid, the extracted script ran `rm -rf`
-    // for real and the named test failed on that — proving the guard was untested, not merely
-    // unwritten.
-    what: "the rollback preflight refuses a missing backup state-admin.js before rm -rf runs",
+    // #737 and #745 round 4 left three rows here, each deleting one check from item 6's rollback
+    // preflight and asserting the extracted script then ran `rm -rf` against a fixture's live
+    // dist. All three are gone, and so is their subject: item 6 no longer builds a rollback out
+    // of a separately named database backup and bytes directory, so there is no preflight to
+    // delete a line from and no destructive command for a missing check to reach. Retired in the
+    // same commit that removed the block, because a row whose `find` names text that is not there
+    // has stopped checking anything while still reporting as a row.
+    //
+    // One row replaces them, and only one, because only one line in the new block is a guard the
+    // regression can kill. Measured both ways before this was written: deleting the explicit
+    // `--pair-id`/`--expected-index-digest` pair fails the named row below, while deleting a
+    // `test -n` line leaves all five rows passing — that one is a convenience for the operator,
+    // not a property anything asserts, and inventing a row for it would be false coverage.
+    //
+    // What this protects: the documented rollback names the sealed pair it restores. Without
+    // these flags the document tells an operator to run a rollback that selects nothing
+    // explicitly, which is the defect the sealed pair exists to remove, restated in the one place
+    // an operator reads during an emergency.
+    what: "the documented rollback names an explicit sealed pair rather than letting the installer be run without one",
     file: "docs/ops/owner-actions.md",
-    find:
-      '    test -f "$BYTES_BACKUP/dist/db/state-admin.js"\n' +
-      '    test -r "$BYTES_BACKUP/dist/db/state-admin.js"\n',
+    find: '      --pair-id "$PAIR_ID" --expected-index-digest "$INDEX_DIGEST" \\\n',
     replace: "",
-    killedBy: ["tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts"],
+    killedBy: [
+      "tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts::names a pair id and a retained digest, and carries no split-rollback token",
+    ],
   },
   {
     // #745 round 4, measured. Every `sqlite3` call in the database-backup block passes
@@ -3675,26 +3686,6 @@ const GUARDS = [
     replace: "",
     killedBy: [
       "tests/process/the-database-backup-step-fails-closed.test.ts::refuses when the backup's user_version does not read as an integer, before publishing a manifest",
-    ],
-  },
-  {
-    // #745 round 4, blocker 2's ordering half — the part that made the schema mismatch dangerous
-    // rather than merely wrong. Item 6's preflight checked that a manifest *existed*; it never
-    // checked that `restoreDatabase` would accept it, and those are different claims. So an
-    // unreadable manifest failed *after* `rm -rf .../dist`, in the procedure you reach for when
-    // things are already broken.
-    //
-    // Deleting the validating restore returns the preflight to existence-checking. The named test
-    // supplies a backup whose file is real, private and integral and whose manifest is exactly
-    // what this document wrote before this round: every remaining check passes, and `rm -rf` runs.
-    what: "the rollback preflight validates the backup through the real restore before rm -rf, not merely that a manifest exists",
-    file: "docs/ops/owner-actions.md",
-    find:
-      '    node "$BYTES_BACKUP/dist/db/state-admin.js" restore "$BACKUP_PATH" \\\n' +
-      '      --database "$ROLLBACK_PREFLIGHT_DIR/state.sqlite" --confirm-restore\n',
-    replace: "",
-    killedBy: [
-      "tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts::refuses to run rm -rf when the backup's manifest is one the real restore validator rejects",
     ],
   },
   {
@@ -4449,6 +4440,76 @@ const GUARDS = [
       "tests/unit/daemon-doctor-freshness.test.ts::a re-evaluation that fails yields STALE immediately",
     ],
   },
+  {
+    // #774 B1/H3. Before B1, `install-launchd.sh` bound the launcher to whatever `command -v node`
+    // resolved on the installing host — outside the closure a seal actually copies — so this check
+    // always fired against a real installer's own output and no unit anchored it. Neutering it lets
+    // a sealed pair claim a generation that runs under an interpreter it never carries: "these
+    // bytes under whatever node is around later", the exact defect this module exists to end.
+    what: "#774 H3: a sealed launcher not bound to the Node executable this pair installs is refused",
+    file: "src/deploy/rollback-pair.ts",
+    find: "  if (launcher.nodePath !== installedNode) {\n",
+    replace: "  if (false && launcher.nodePath !== installedNode) {\n",
+    killedBy: [
+      "tests/unit/rollback-pair.test.ts::refuses a sealed launcher not bound to the runtime the pair carries",
+    ],
+  },
+  {
+    // A pair's index is retained OUTSIDE it precisely so it cannot vouch for itself — a forger who
+    // rewrites a member and its index line still cannot forge the digest the approver kept apart.
+    // An index that were allowed to list its own file would let that outside digest verify nothing
+    // about the file it is supposed to be independent of.
+    what: "#774 H3: a sealed pair's index cannot cover itself",
+    file: "src/deploy/rollback-pair.ts",
+    find:
+      '  if (uniqueEntryPaths.has(ROLLBACK_PAIR_INDEX_FILE)) {\n' +
+      '    throw acpError(ReasonCode.INTERNAL_ERROR, "the sealed pair index cannot cover itself", { root });\n' +
+      "  }\n",
+    replace: "",
+    killedBy: ["tests/unit/rollback-pair.test.ts::keeps the index self-excluding and refuses one that covers itself"],
+  },
+  {
+    // "Exit zero is a claim, not a result." The sealed state-admin runs under the sealed
+    // interpreter as a subprocess `applyRollbackPair` cannot see inside — a `restore` that returns
+    // 0 without touching the destination (a bug in that binary, or one substituted at seal time)
+    // would otherwise report a rollback that never happened. This is the one guard standing
+    // between an exit code and the byte-for-byte claim a rollback makes.
+    what: "#774 H3: exit zero from the sealed restore is verified against the staged image, not trusted",
+    file: "src/deploy/rollback-pair.ts",
+    find: "      if (restoredDigest !== stagedDigest) {\n",
+    replace: "      if (false && restoredDigest !== stagedDigest) {\n",
+    killedBy: [
+      "tests/process/rollback-pair-wal.test.ts::H3 anchor: refuses a restore that exits zero without installing the sealed database image",
+    ],
+  },
+  {
+    // #774 H1 round 2. The recovery copy exists solely so a *failed* compensation still has the
+    // previous generation somewhere; on success it is redundant with the sealed pair still under
+    // `pair_root`, unbounded, and sitting beside `state.sqlite`. Neutering the removal leaves it on
+    // disk after every successful rollback, accumulating one per run without bound — the defect
+    // this row exists to catch, since neither `install-launchd.sh` nor any caller ever reads the
+    // returned path to clean it up itself.
+    what: "#774 H1 round 2: a successful rollback removes its own recovery copy rather than leaving it beside the database",
+    file: "src/deploy/rollback-pair.ts",
+    find: "      rmSync(recoveryRoot, { recursive: true, force: true });\n",
+    replace: "",
+    killedBy: [
+      "tests/process/rollback-pair-wal.test.ts::H1 round 2: removes the recovery copy on a successful rollback, leaving no residue in the state directory",
+    ],
+  },
+  // #774 H3 also named the member re-hash at stage time (src/deploy/rollback-pair.ts:1352,
+  // "a rollback member changed between validation and staging") as a fourth anchor. Investigated
+  // and deliberately left out rather than forced in: that check guards a TOCTOU window on the
+  // *source* pair between `validateRollbackPair`'s hash of a member and `copyPrivateFile`'s later
+  // read of the same path, both inside one synchronous `stageRollbackPair` call. No black-box
+  // mutation of the fixtures in tests/unit/rollback-pair.test.ts or
+  // tests/process/rollback-pair-wal.test.ts reaches that window — every existing "swap a member"
+  // row (correctly) mutates either before validation starts or after `stageRollbackPair` has
+  // already returned, and manifest/index cross-checks (src/deploy/rollback-pair.ts:1094) mean the
+  // two records can never be made to disagree going in, so a race actually mid-call is the only
+  // way to trigger it. Confirmed empirically: neutering the check left every test in both files
+  // green. A real anchor here needs a seam this module does not have yet (an injection point around
+  // the copy loop, or a threaded test), which is a follow-up, not a row.
 ];
 
 /**
