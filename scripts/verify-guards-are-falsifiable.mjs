@@ -4510,6 +4510,22 @@ const GUARDS = [
   // way to trigger it. Confirmed empirically: neutering the check left every test in both files
   // green. A real anchor here needs a seam this module does not have yet (an injection point around
   // the copy loop, or a threaded test), which is a follow-up, not a row.
+  {
+    // hscope/#674. Every kind-9 is channel-scoped on the relay; a `REQ` with no `#h` registers
+    // there as a global-scope subscription, and live fan-out never delivers a channel-scoped event
+    // to one. Without this line the subscriber still completes NIP-42, still reaches EOSE and
+    // still reads a full backlog — everything but the one path #674 is for — and never wakes for a
+    // single live mention. That is the exact defect this whole unit exists to close, reintroduced
+    // by deleting one line, which is why it had a green test (asserting the frame *without* `#h`)
+    // for as long as it did.
+    what: "hscope: the subscriber's REQ carries #h for its configured rooms, not just kind and recipient",
+    file: "src/buzz/buzz-mention-subscriber.ts",
+    find: '      "#h": this.#rooms,\n',
+    replace: "",
+    killedBy: [
+      "tests/unit/buzz-mention-subscriber.test.ts::answers the NIP-42 challenge with a signed auth event, then asks for kind 9 addressed to itself in its configured rooms",
+    ],
+  },
 ];
 
 /**

@@ -68,6 +68,16 @@ export interface BuzzSubscriberIdentityConfig {
   /** An absolute, already-normalized path. Opened `O_NOFOLLOW`; never logged. */
   readonly privateKeyFile: string;
   readonly encoding: BuzzSubscriberKeyEncoding;
+  /**
+   * The rooms this identity's `REQ` is scoped to (`#h`, one entry per Buzz room). Required, not
+   * optional: every kind-9 mention is channel-scoped on the relay, and a `REQ` with no `#h`
+   * registers as a *global*-scope subscription there — which live fan-out never delivers a
+   * channel-scoped event to. An identity with an empty or absent room list would connect,
+   * authenticate, reach EOSE and then never wake for anything published afterward, which is
+   * indistinguishable from a healthy subscriber until the first live mention is lost. Fail-closed
+   * on this field for the same reason every other field here is exact rather than defaulted.
+   */
+  readonly rooms: readonly string[];
 }
 
 /** The whole of what `buzz-nostr-subscriber.json` may say. */
@@ -78,8 +88,12 @@ export interface BuzzSubscriberConfig {
 
 /** Exactly the keys the file may carry, at each of its two levels. */
 const CONFIG_FIELDS: readonly string[] = ["relayUrl", "identities"];
-const IDENTITY_FIELDS: readonly string[] = ["privateKeyFile", "encoding"];
+const IDENTITY_FIELDS: readonly string[] = ["privateKeyFile", "encoding", "rooms"];
 const KEY_ENCODINGS: readonly string[] = ["hex", "nsec"];
+/** The relay refuses a `REQ` naming more explicit channels than this; checked at load rather than
+ * left for the relay to refuse at connect time, so a misconfiguration is an operator-legible
+ * startup error instead of a subscription the relay silently never opens. */
+const MAX_REQ_ROOMS = 128;
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -147,6 +161,38 @@ const requirePrivateKeyFile = (value: unknown, what: string): string => {
   return value;
 };
 
+/**
+ * The rooms one identity's `REQ` is scoped to. Required and non-empty, not repaired: a blank or
+ * whitespace-padded room is checked as a string exactly as it was written, the same way
+ * `privateKeyFile` is, rather than trimmed into something the operator did not type. Duplicates are
+ * refused because a `REQ` naming the same channel twice reports zero true information at the
+ * relay and hides an operator error, and the count is capped at what this relay accepts per `REQ`
+ * so a misconfiguration is a startup error here rather than a subscription the relay silently
+ * never opens.
+ */
+const requireRooms = (value: unknown, what: string): readonly string[] => {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error(`${what}.rooms must be a non-empty array`);
+  }
+  if (value.length > MAX_REQ_ROOMS) {
+    throw new Error(`${what}.rooms carries ${value.length} room(s), more than the relay accepts per REQ (${MAX_REQ_ROOMS})`);
+  }
+  const rooms = value.map((room, roomIndex) => {
+    if (typeof room !== "string" || room.length === 0) {
+      throw new Error(`${what}.rooms[${roomIndex}] must be a non-empty string`);
+    }
+    if (room.trim() !== room) {
+      throw new Error(`${what}.rooms[${roomIndex}] must carry no leading or trailing whitespace`);
+    }
+    return room;
+  });
+  const distinct = new Set(rooms);
+  if (distinct.size !== rooms.length) {
+    throw new Error(`${what}.rooms carries a duplicate room`);
+  }
+  return rooms;
+};
+
 /** Parses the config text, or throws. There is no partial acceptance and no repair. */
 export const parseBuzzSubscriberConfig = (text: string): BuzzSubscriberConfig => {
   let value: unknown;
@@ -174,6 +220,7 @@ export const parseBuzzSubscriberConfig = (text: string): BuzzSubscriberConfig =>
     return {
       privateKeyFile: requirePrivateKeyFile(entry["privateKeyFile"], what),
       encoding: encoding as BuzzSubscriberKeyEncoding,
+      rooms: requireRooms(entry["rooms"], what),
     };
   });
   return { relayUrl, identities };
@@ -625,6 +672,7 @@ class BuzzMentionSubscription {
   readonly #pubkey: string;
   readonly #secretKey: Uint8Array;
   readonly #roleKey: string;
+  readonly #rooms: readonly string[];
   readonly #subscriptionId = randomUUID().replace(/-/gu, "");
 
   #socket: BuzzRelaySocket | null = null;
@@ -652,11 +700,15 @@ class BuzzMentionSubscription {
   /** Frames are handled one at a time; a second must not overtake the first's admission. */
   #queue: Promise<void> = Promise.resolve();
 
-  constructor(deps: SubscriptionDeps, identity: { pubkey: string; secretKey: Uint8Array; roleKey: string }) {
+  constructor(
+    deps: SubscriptionDeps,
+    identity: { pubkey: string; secretKey: Uint8Array; roleKey: string; rooms: readonly string[] },
+  ) {
     this.#deps = deps;
     this.#pubkey = identity.pubkey;
     this.#secretKey = identity.secretKey;
     this.#roleKey = identity.roleKey;
+    this.#rooms = identity.rooms;
   }
 
   /** The volatile high-water mark, for the rows that assert a redelivery window rather than a file. */
@@ -870,9 +922,16 @@ class BuzzMentionSubscription {
     // subscriber subscribed would let the *next* stale event past `#onEvent`'s own guard.
     if (!this.#isCurrent(generation)) return rejected("unknown-subscription");
     this.#subscribed = true;
+    // `#h` is not an optimization: every kind-9 is channel-scoped on the relay, and a filter with
+    // no channel constraint registers as a *global*-scope subscription there — one live fan-out
+    // never delivers a channel-scoped event to. Without this, the historical branch below (EOSE,
+    // `since`) still works, because backlog is a stored query rather than fan-out, and that is
+    // exactly how this defect passed for as long as it did: everything but the one path #674 is
+    // actually for.
     const filter: Record<string, unknown> = {
       kinds: [BUZZ_MENTION_KIND],
       "#p": [this.#pubkey],
+      "#h": this.#rooms,
     };
     if (this.#since !== null) filter["since"] = this.#since;
     this.#send(generation, JSON.stringify(["REQ", this.#subscriptionId, filter]));
@@ -1036,6 +1095,13 @@ export interface BuzzMentionSubscriberHandle {
   readonly relayUrl: string | null;
   /** The roles this daemon subscribes for, in config order. */
   readonly roleKeys: readonly string[];
+  /**
+   * Every room named across every configured identity, deduplicated. Empty exactly when
+   * `socketCount` is zero. Exposed so a caller with its own notion of "the room this daemon
+   * answers in" (`ACP_BUZZ_CHANNEL`) can check it is actually among these rather than assume it —
+   * this module reads no environment variable itself, so that check belongs to the caller.
+   */
+  readonly rooms: readonly string[];
   /** Settles once every frame delivered so far has been handled. For tests; production ignores it. */
   settled(): Promise<void>;
   close(): void;
@@ -1046,6 +1112,7 @@ const DISABLED: BuzzMentionSubscriberHandle = {
   socketCount: 0,
   relayUrl: null,
   roleKeys: [],
+  rooms: [],
   settled: () => Promise.resolve(),
   close: () => {
     /* nothing was opened */
@@ -1085,6 +1152,7 @@ export const startBuzzMentionSubscriber = (
   const seenRoles = new Set<string>();
   const prepared: BuzzMentionSubscription[] = [];
   const roleKeys: string[] = [];
+  const rooms = new Set<string>();
 
   options.config.identities.forEach((identity, index) => {
     const what = `identities[${index}]`;
@@ -1119,11 +1187,13 @@ export const startBuzzMentionSubscriber = (
     seenRoles.add(bound.roleKey);
 
     roleKeys.push(bound.roleKey);
+    for (const room of identity.rooms) rooms.add(room);
     prepared.push(
       new BuzzMentionSubscription(deps, {
         pubkey: material.pubkey,
         secretKey: material.secretKey,
         roleKey: bound.roleKey,
+        rooms: identity.rooms,
       }),
     );
   });
@@ -1155,6 +1225,7 @@ export const startBuzzMentionSubscriber = (
     socketCount: prepared.length,
     relayUrl: options.config.relayUrl,
     roleKeys,
+    rooms: [...rooms],
     settled: async () => {
       for (const subscription of prepared) await subscription.settled();
     },
