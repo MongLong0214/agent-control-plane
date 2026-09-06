@@ -24,13 +24,17 @@ import { Db } from "../../src/db/database.ts";
 import {
   ROLLBACK_PAIR_INDEX_FILE,
   ROLLBACK_PAIR_MANIFEST_FILE,
+  rollbackToSealedPair,
   sealRollbackPair,
   stageRollbackPair,
   validateRollbackPair,
+  type ApplyOptions,
   type RollbackPairExpectation,
   type RollbackPairManifest,
+  type RollbackPairMember,
   type RollbackPairSources,
   type SealedRollbackPair,
+  type StageOptions,
 } from "../../src/deploy/rollback-pair.ts";
 import { RollbackFilesystem } from "../../src/db/fd-vfs.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -799,7 +803,7 @@ describe("the exact rollback pair", () => {
     expect(statSync(fixture.pairsRoot).mode).toBe(rootModeBefore);
   });
 
-  it("stages its own copy, so a member swapped after validation cannot reach an install", async () => {
+  it("stages an independent copy, so rewriting the pair afterwards changes nothing that runs", async () => {
     const { fixture, pair } = await sealFixture();
     const stageParent = join(fixture.home, "stage");
     const staged = stageRollbackPair(pair.root, expectationFor(fixture, pair), stageParent);
@@ -807,8 +811,10 @@ describe("the exact rollback pair", () => {
     const approvedLauncher = readFileSync(staged.launcherPath, "utf8");
     expect(approvedLauncher).toContain("generation-a");
 
-    // The swap a path-returning validator cannot defend against: rewrite the member in the pair
-    // after validation has passed. The stage already holds its own verified copy.
+    // Deliberately after `stageRollbackPair` has returned, which is all this row can reach and all
+    // its name now claims: the stage is a second, independent object, so a later rewrite of the
+    // pair is not a rewrite of what runs. The window *inside* the call — between validation
+    // passing and the copy reading the member again — is the two rows below, which need the seam.
     const inPair = join(pair.root, pair.manifest.identity.service.launcher);
     writeFileSync(inPair, "#!/bin/bash\nexec /tmp/attacker\n", { encoding: "utf8", mode: 0o600 });
 
@@ -822,6 +828,98 @@ describe("the exact rollback pair", () => {
     expect(() => validateRollbackPair(pair.root, expectationFor(fixture, pair))).toThrow(
       /does not match the digest the index gives it/,
     );
+  });
+
+  it("refuses a member rewritten in the window between validation and the copy", async () => {
+    const { fixture, pair } = await sealFixture();
+    const launcherMember = pair.manifest.identity.service.launcher;
+    const opened: string[] = [];
+    const seam: StageOptions = {
+      onMember: (member: RollbackPairMember) => {
+        opened.push(member.path);
+        // Inside the window `stageRollbackPair` opens and closes on its own: validation has
+        // already hashed this member and the copy has not read it yet. Nothing outside the call
+        // can be here, which is why this seam exists at all.
+        if (member.path !== launcherMember) return;
+        writeFileSync(join(pair.root, launcherMember), "#!/bin/bash\nexec /tmp/attacker\n", {
+          encoding: "utf8",
+          mode: 0o600,
+        });
+      },
+    };
+
+    let thrown: unknown;
+    try {
+      stageRollbackPair(pair.root, expectationFor(fixture, pair), join(fixture.home, "stage"), seam);
+    } catch (error) {
+      thrown = error;
+    }
+
+    // Asserted before the refusal, and separately from it: a seam that never fired would leave the
+    // pair untouched and the staging would pass, which is a different failure from the guard being
+    // absent. Read the two apart rather than calling either one a proof of the other.
+    expect(opened).toContain(launcherMember);
+    expect(String(thrown)).toMatch(/a rollback member changed between validation and staging/);
+  });
+
+  it("refuses a member whose mode drifted in the window between validation and the copy", async () => {
+    const { fixture, pair } = await sealFixture();
+    const nodeMember = `runtime/${pair.manifest.identity.runtime.nodeExecutable}`;
+    const opened: string[] = [];
+    const seam: StageOptions = {
+      onMember: (member: RollbackPairMember) => {
+        opened.push(member.path);
+        if (member.path !== nodeMember) return;
+        // Not one byte changes, so every digest, size and the retained index digest still agree,
+        // and `copyMemberFile` carries the drifted mode faithfully into the stage — 0600 is not
+        // group- or world-writable, so its own refusal never fires. An interpreter that arrives
+        // 0600 installs as an inert file and the restored generation cannot start. Validation
+        // refuses exactly this before the window opens; the staged copy has to refuse it after.
+        chmodSync(join(pair.root, nodeMember), 0o600);
+      },
+    };
+
+    let thrown: unknown;
+    try {
+      stageRollbackPair(pair.root, expectationFor(fixture, pair), join(fixture.home, "stage"), seam);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(opened).toContain(nodeMember);
+    expect(String(thrown)).toMatch(/a staged rollback member is not at the mode its inventory records/);
+  });
+
+  it("keeps the staging seam unreachable from the entrypoint production uses", async () => {
+    const { fixture, pair } = await sealFixture();
+    const opened: string[] = [];
+    // One object, offered to both. `StageOptions` is a fourth parameter only `stageRollbackPair`
+    // takes; `rollbackToSealedPair` — what this module's own CLI and `install-launchd.sh` reach —
+    // takes `ApplyOptions` and calls staging with three arguments.
+    const options: ApplyOptions & StageOptions = {
+      onMember: (member: RollbackPairMember) => opened.push(member.path),
+      failAfter: "recovery",
+    };
+
+    // The positive control. Without it an empty `opened` below would be satisfied just as well by
+    // a callback that can never fire, and the row would be measuring nothing.
+    const control = stageRollbackPair(
+      pair.root,
+      expectationFor(fixture, pair),
+      join(fixture.home, "stage-control"),
+      options,
+    );
+    expect(opened.length).toBeGreaterThan(0);
+    rmSync(control.stageRoot, { recursive: true, force: true });
+
+    opened.length = 0;
+    // `failAfter: "recovery"` fires inside `applyRollbackPair`, which runs only once staging has
+    // copied and re-verified every member. So this refusal is itself the proof that the copy loop
+    // ran while holding this exact object — and the seam still did not fire.
+    expect(() =>
+      rollbackToSealedPair(pair.root, expectationFor(fixture, pair), join(fixture.home, "stage-prod"), options),
+    ).toThrow(/injected failure after recovery/);
+    expect(opened).toEqual([]);
   });
 
   it("leaves no stage behind when staging refuses", async () => {

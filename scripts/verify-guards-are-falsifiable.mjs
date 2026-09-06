@@ -4497,19 +4497,34 @@ const GUARDS = [
       "tests/process/rollback-pair-wal.test.ts::H1 round 2: removes the recovery copy on a successful rollback, leaving no residue in the state directory",
     ],
   },
-  // #774 H3 also named the member re-hash at stage time (src/deploy/rollback-pair.ts:1352,
-  // "a rollback member changed between validation and staging") as a fourth anchor. Investigated
-  // and deliberately left out rather than forced in: that check guards a TOCTOU window on the
-  // *source* pair between `validateRollbackPair`'s hash of a member and `copyPrivateFile`'s later
-  // read of the same path, both inside one synchronous `stageRollbackPair` call. No black-box
-  // mutation of the fixtures in tests/unit/rollback-pair.test.ts or
-  // tests/process/rollback-pair-wal.test.ts reaches that window — every existing "swap a member"
-  // row (correctly) mutates either before validation starts or after `stageRollbackPair` has
-  // already returned, and manifest/index cross-checks (src/deploy/rollback-pair.ts:1094) mean the
-  // two records can never be made to disagree going in, so a race actually mid-call is the only
-  // way to trigger it. Confirmed empirically: neutering the check left every test in both files
-  // green. A real anchor here needs a seam this module does not have yet (an injection point around
-  // the copy loop, or a threaded test), which is a follow-up, not a row.
+  {
+    // #779. `copyMemberFile` ends with `chmodSync(to, mode)` taking the *source's current* mode and
+    // refuses only group- or world-writable, so a mode that drifts inside the window
+    // `StageOptions.onMember` opens is carried faithfully into the stage and on into the install.
+    // Every digest, size and index still agrees that nothing happened — validation's own words:
+    // "a digest says what the bytes are; it says nothing about whether they can run", and an
+    // interpreter that arrives 0600 installs as an inert file the generation cannot start on.
+    // Nothing else in the module looks at a staged member's mode; measured by neutering this line,
+    // which left the one row below failing and the other 35 green.
+    what: "#779: a rollback member whose mode drifted between validation and the copy is refused at the stage",
+    file: "src/deploy/rollback-pair.ts",
+    find: "      if (stagedMode !== member.mode) {\n",
+    replace: "      if (false && stagedMode !== member.mode) {\n",
+    killedBy: [
+      "tests/unit/rollback-pair.test.ts::refuses a member whose mode drifted in the window between validation and the copy",
+    ],
+  },
+  // #774 H3 also named the member re-hash at stage time ("a rollback member changed between
+  // validation and staging") as a fourth anchor and deferred it, because reaching the window
+  // between `validateRollbackPair`'s hash and `copyPrivateFile`'s later read needed "a seam this
+  // module does not have yet". #779 added that seam (`StageOptions.onMember`) and the window is now
+  // reachable — but the row still is not written, for a second and different reason found by
+  // measuring it: for a *bytes* rewrite that check is redundant. Neutering it left the window row
+  // still refusing the tampered pair, one guard further down ("a staged member does not match the
+  // staged index"), because the staged index is verified against the digest retained outside the
+  // pair and a rewritten member cannot agree with it. The re-hash narrows *which* error is
+  // reported, not whether the rewrite reaches an install, so a row here would report coverage the
+  // suite already has from elsewhere. The mode check above is the half that had no second guard.
   {
     // hscope/#674. Every kind-9 is channel-scoped on the relay; a `REQ` with no `#h` registers
     // there as a global-scope subscription, and live fan-out never delivers a channel-scoped event
