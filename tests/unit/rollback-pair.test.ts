@@ -282,6 +282,58 @@ const treeFingerprint = (root: string): string =>
     .join("\n");
 
 describe("the exact rollback pair", () => {
+  it("seals normal npm scoped-package members with their bytes and digest intact", async () => {
+    const fixture = makeFixture();
+    const packageRoot = join(fixture.sources.runtimeRoot, "node_modules/@modelcontextprotocol/sdk");
+    mkdirSync(packageRoot, { recursive: true, mode: 0o700 });
+    const contents = "Synthetic scoped-package license fixture\n";
+    writeFileSync(join(packageRoot, "LICENSE"), contents, { mode: 0o600 });
+
+    const pair = await sealRollbackPair(fixture.pairsRoot, fixture.sources);
+    const member = "runtime/node_modules/@modelcontextprotocol/sdk/LICENSE";
+    expect(pair.manifest.inventory).toContainEqual({
+      path: member,
+      sha256: `sha256:${sha256(contents)}`,
+      bytes: Buffer.byteLength(contents),
+      mode: 0o600,
+    });
+    expect(readFileSync(join(pair.root, member), "utf8")).toBe(contents);
+    expect(() => validateRollbackPair(pair.root, expectationFor(fixture, pair))).not.toThrow();
+  });
+
+  it("refuses malformed scopes and insecure member spellings before opening a member", async () => {
+    const { fixture, pair } = await sealFixture();
+    const indexPath = join(pair.root, ROLLBACK_PAIR_INDEX_FILE);
+    const original = readFileSync(indexPath, "utf8");
+    const malformedScopes = ["@", "@@scope", "@.scope", "@_scope", "@Scope", "@sc@ope", "@scope!", "@scope%20"];
+    const members = [
+      ...malformedScopes.map((scope) => `runtime/node_modules/${scope}/sdk/LICENSE`),
+      "runtime/@scope/sdk/LICENSE",
+      "runtime/node_modules/@scope",
+      "runtime/node_modules/@scope/sdk",
+      "runtime/node_modules/@scope/@sdk/LICENSE",
+      "runtime/node_modules/@scope/.sdk/LICENSE",
+      "runtime/node_modules/@scope/../LICENSE",
+      "runtime/node_modules/@scope/./LICENSE",
+      "runtime/node_modules/@scope//LICENSE",
+      "runtime/node_modules/@scope/sdk/..",
+      "runtime/node_modules/@scope/sdk/.",
+      "/runtime/node_modules/@scope/sdk/LICENSE",
+      "runtime/node_modules/@scope/sdk/",
+      "runtime/node_modules/@scope/sdk\\LICENSE",
+      "runtime/node_modules/@scope/sdk/bad name",
+      "runtime/node_modules/@scope/sdk/bad\tname",
+      "",
+    ];
+    for (const member of members) {
+      const index = `${original}${"0".repeat(64)}  ${member}\n`;
+      writeFileSync(indexPath, index, { mode: 0o600 });
+      expect(() => validateRollbackPair(pair.root, expectationFor(fixture, pair, {
+        indexDigest: `sha256:${sha256(index)}`,
+      })), member).toThrow(/plain relative path|index.*line/);
+    }
+  });
+
   it("seals a pair that validates with the retained digest and what the deployment is", async () => {
     const { fixture, pair } = await sealFixture();
 
