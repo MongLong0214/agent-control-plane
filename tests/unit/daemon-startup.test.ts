@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
+import { main } from "../../src/daemon/agentcpd.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -34,7 +35,7 @@ const BUZZ_VARIABLES = ["ACP_BUZZ_INGRESS_SECRET", "ACP_BUZZ_ALLOWED_ACTORS", "B
 const BUZZ_SECRET = "startup-test-buzz-secret";
 const BUZZ_ACTOR = "npub-startup-owner";
 /**
- * The exact four-variable canonical self-claim activation group (#760), plus the pre-existing,
+ * The exact eight-variable canonical self-claim activation group, separate from the pre-existing
  * shared `ACP_BUZZ_CHANNEL` transport setting this group also reads once fully configured.
  * Deleted from the child's environment unless a case asks for them, for the same reason
  * `TELEGRAM_VARIABLES` is: an inherited value from the parent process's own environment would
@@ -47,6 +48,13 @@ const CANONICAL_ACTIVATION_VARIABLES = [
   "ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION",
   "ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH",
   "ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256",
+  "ACP_CANONICAL_CTO_BUZZ_ACTOR_ID",
+  "ACP_CANONICAL_CTO_WORKDIR",
+  "ACP_CANONICAL_CTO_PEER_PROTOCOL",
+  "ACP_CANONICAL_CTO_BUZZ_PURPOSE",
+] as const;
+const CANONICAL_ENVIRONMENT_VARIABLES = [
+  ...CANONICAL_ACTIVATION_VARIABLES,
   "ACP_BUZZ_CHANNEL",
 ] as const;
 
@@ -139,7 +147,7 @@ const runMain = async (input: {
     if (!(name in (input.telegram ?? {}))) delete environment[name];
   }
   for (const name of BUZZ_VARIABLES) delete environment[name];
-  for (const name of CANONICAL_ACTIVATION_VARIABLES) {
+  for (const name of CANONICAL_ENVIRONMENT_VARIABLES) {
     if (!(name in (input.canonical ?? {}))) delete environment[name];
   }
   if (input.buzz) {
@@ -281,7 +289,7 @@ describe("agentcpd main Telegram startup composition", () => {
   }, 40_000);
 });
 
-describe("#760: canonical self-claim activation is gated at the listener boundary, not at daemon entry", () => {
+describe("canonical self-claim activation is an atomic pre-effect daemon contract", () => {
   // Synthetic throughout — never a value that names a real deployment's session, channel, path,
   // hash, or version.
   const COMPLETE_CANONICAL_ENV: NodeJS.ProcessEnv = {
@@ -289,10 +297,46 @@ describe("#760: canonical self-claim activation is gated at the listener boundar
     ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION: "0.0.0-startup-test",
     ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH: "/fake/versions/current/claude",
     ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256: `sha256:${"0".repeat(64)}`,
+    ACP_CANONICAL_CTO_BUZZ_ACTOR_ID: "buzz:startup-test-canonical-cto",
+    ACP_CANONICAL_CTO_WORKDIR: "/synthetic/startup-test-canonical-workdir",
+    ACP_CANONICAL_CTO_PEER_PROTOCOL: "acp.startup-test/v9",
+    ACP_CANONICAL_CTO_BUZZ_PURPOSE: "continuity:STARTUP_TEST_CTO",
     ACP_BUZZ_CHANNEL: "channel:startup-test-canonical",
   };
+  const COMPLETE_CANONICAL_GROUP = Object.fromEntries(
+    CANONICAL_ACTIVATION_VARIABLES.map((name) => [name, COMPLETE_CANONICAL_ENV[name]!]),
+  ) as Record<(typeof CANONICAL_ACTIVATION_VARIABLES)[number], string>;
 
-  it("starts the daemon with canonical self-claim disabled when all four activation variables are absent", async () => {
+  const withCanonicalProcessEnvironment = async (
+    values: NodeJS.ProcessEnv,
+    run: () => Promise<void>,
+  ): Promise<void> => {
+    const before = Object.fromEntries(
+      CANONICAL_ENVIRONMENT_VARIABLES.map((name) => [name, process.env[name]]),
+    ) as Record<(typeof CANONICAL_ENVIRONMENT_VARIABLES)[number], string | undefined>;
+    try {
+      for (const name of CANONICAL_ENVIRONMENT_VARIABLES) delete process.env[name];
+      Object.assign(process.env, values);
+      await run();
+    } finally {
+      for (const name of CANONICAL_ENVIRONMENT_VARIABLES) {
+        const value = before[name];
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  };
+
+  const poisonConfigOptions = (onRead: () => void): Parameters<typeof main>[0] =>
+    Object.defineProperty({}, "config", {
+      enumerable: true,
+      get: () => {
+        onRead();
+        throw new Error("poison config getter was read");
+      },
+    }) as Parameters<typeof main>[0];
+
+  it("starts the daemon with canonical self-claim disabled when all eight activation variables are absent", async () => {
     // This is the exact regression: a deployment carrying only the pre-existing MCP/operator
     // configuration (no canonical env vars at all) must reach a normal, running daemon — not
     // exit before `ControlPlane`, migration refusal, or the operator door can run.
@@ -328,51 +372,126 @@ describe("#760: canonical self-claim activation is gated at the listener boundar
     }
   };
 
-  it("fails closed with no residue when only some of the four activation variables are set", async () => {
+  it("rejects all 254 nonempty proper activation subsets before reading config", async () => {
+    let rejectedSubsets = 0;
+    for (let mask = 1; mask < (1 << CANONICAL_ACTIVATION_VARIABLES.length) - 1; mask += 1) {
+      const subset: NodeJS.ProcessEnv = { ACP_BUZZ_CHANNEL: COMPLETE_CANONICAL_ENV["ACP_BUZZ_CHANNEL"] };
+      for (const [index, name] of CANONICAL_ACTIVATION_VARIABLES.entries()) {
+        if ((mask & (1 << index)) !== 0) subset[name] = COMPLETE_CANONICAL_GROUP[name];
+      }
+      let configReads = 0;
+      await withCanonicalProcessEnvironment(subset, async () => {
+        let rejection: unknown;
+        try {
+          await main(poisonConfigOptions(() => (configReads += 1)));
+        } catch (error) {
+          rejection = error;
+        }
+        const message = rejection instanceof Error ? rejection.message : String(rejection);
+        const missing = CANONICAL_ACTIVATION_VARIABLES.filter((name) => !(name in subset));
+        expect(message, `mask ${mask} did not fail as a partial activation group`).toBe(
+          `canonical self-claim activation is partially configured; missing: ${missing.join(", ")}`,
+        );
+        for (const value of Object.values(subset)) {
+          expect(message, `mask ${mask} disclosed an activation value`).not.toContain(value);
+        }
+      });
+      expect(configReads, `mask ${mask} reached the config getter`).toBe(0);
+      rejectedSubsets += 1;
+    }
+    expect(rejectedSubsets).toBe(254);
+  });
+
+  it("treats an entirely blank or whitespace-only activation group as disabled", async () => {
+    for (const blank of ["", " \t "]) {
+      let configReads = 0;
+      await withCanonicalProcessEnvironment(
+        Object.fromEntries(CANONICAL_ACTIVATION_VARIABLES.map((name) => [name, blank])),
+        async () => {
+          await expect(main(poisonConfigOptions(() => (configReads += 1)))).rejects.toThrow(
+            "poison config getter was read",
+          );
+        },
+      );
+      expect(configReads).toBe(1);
+    }
+  });
+
+  it("treats every blank or whitespace-only group member as partial before reading config", async () => {
+    for (const name of CANONICAL_ACTIVATION_VARIABLES) {
+      for (const blank of ["", " \t "]) {
+        let configReads = 0;
+        await withCanonicalProcessEnvironment(
+          { ...COMPLETE_CANONICAL_ENV, [name]: blank },
+          async () => {
+            await expect(main(poisonConfigOptions(() => (configReads += 1)))).rejects.toThrow(
+              "canonical self-claim activation is partially configured",
+            );
+          },
+        );
+        expect(configReads, `${name}=${JSON.stringify(blank)} reached the config getter`).toBe(0);
+      }
+    }
+  });
+
+  it("fails closed before config when all eight activation variables are set but ACP_BUZZ_CHANNEL is not", async () => {
+    const { ACP_BUZZ_CHANNEL: _omit, ...withoutChannel } = COMPLETE_CANONICAL_ENV;
+    for (const channel of [undefined, "", " \t "]) {
+      let configReads = 0;
+      await withCanonicalProcessEnvironment(
+        { ...withoutChannel, ...(channel === undefined ? {} : { ACP_BUZZ_CHANNEL: channel }) },
+        async () => {
+          await expect(main(poisonConfigOptions(() => (configReads += 1)))).rejects.toThrow(
+            "ACP_BUZZ_CHANNEL is required",
+          );
+        },
+      );
+      expect(configReads).toBe(0);
+    }
+  });
+
+  it("refuses partial or channel-missing activation with no child-exit residue", async () => {
+    const { ACP_BUZZ_CHANNEL: _omit, ...withoutChannel } = COMPLETE_CANONICAL_ENV;
+    for (const canonical of [
+      { ACP_CANONICAL_SESSION_UUID: COMPLETE_CANONICAL_GROUP.ACP_CANONICAL_SESSION_UUID },
+      withoutChannel,
+    ]) {
+      const result = await runMain({ seedState: true, canonical });
+      const diagnostics = `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
+      expect(result.status, diagnostics).toBe(1);
+      expect(result.stderr, diagnostics).toContain(
+        canonical === withoutChannel ? "ACP_BUZZ_CHANNEL is required" : "canonical self-claim activation is partially configured",
+      );
+      expect(result.stdout, diagnostics).not.toContain("canonical self-claim listener started");
+      expectNoResidue(result, diagnostics);
+    }
+  }, 40_000);
+
+  it("keeps full canonical activation alive with no subscriber config and zero subscriber sockets", async () => {
     const result = await runMain({
       seedState: true,
-      canonical: {
-        ACP_CANONICAL_SESSION_UUID: COMPLETE_CANONICAL_ENV["ACP_CANONICAL_SESSION_UUID"]!,
-        ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION: COMPLETE_CANONICAL_ENV["ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION"]!,
-        // ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH and ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256
-        // deliberately absent — this is the partial-configuration case.
-      },
+      buzz: true,
+      buzzOwnerIdentity: true,
+      canonical: COMPLETE_CANONICAL_ENV,
     });
-
-    const diagnostics =
-      `status=${result.status}\nresidue=${JSON.stringify(result.residue)}\n` +
-      `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
-    expect(result.status, diagnostics).toBe(1);
-    expect(result.stderr, diagnostics).toContain("canonical self-claim activation is partially configured");
-    expect(result.stderr, diagnostics).toContain("ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH");
-    expect(result.stderr, diagnostics).toContain("ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256");
-    expect(result.stdout, diagnostics).not.toContain("canonical self-claim listener started");
-    // No residue, observed directly on the filesystem at the moment the child exited — not
-    // inferred from the log line above, which a startup that leaked every socket and the lock
-    // would still have printed identically.
+    const diagnostics = `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
+    expect(result.status, diagnostics).toBe(0);
+    expect(result.stdout, diagnostics).toContain("canonical self-claim listener started");
+    expect(result.stdout, diagnostics).toContain("Buzz mention subscriber sockets: 0");
+    expect(result.stdout, diagnostics).not.toContain("Buzz mention subscriber sockets: 1");
     expectNoResidue(result, diagnostics);
   }, 40_000);
 
-  it("fails closed with no residue when all four activation variables are set but ACP_BUZZ_CHANNEL is not", async () => {
-    const { ACP_BUZZ_CHANNEL: _omit, ...withoutChannel } = COMPLETE_CANONICAL_ENV;
-    const result = await runMain({ seedState: true, canonical: withoutChannel });
-
-    const diagnostics =
-      `status=${result.status}\nresidue=${JSON.stringify(result.residue)}\n` +
-      `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
-    expect(result.status, diagnostics).toBe(1);
-    expect(result.stderr, diagnostics).toContain("ACP_BUZZ_CHANNEL is required");
-    expect(result.stdout, diagnostics).not.toContain("canonical self-claim listener started");
-    expectNoResidue(result, diagnostics);
-  }, 40_000);
-
-  it("starts the canonical self-claim listener when the full synthetic activation group is configured", async () => {
+  it("starts the canonical self-claim listener when the full synthetic eight-variable group is configured", async () => {
     const result = await runMain({ seedState: true, canonical: COMPLETE_CANONICAL_ENV });
 
-    const diagnostics = `status=${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
+    const diagnostics =
+      `status=${result.status}\nresidue=${JSON.stringify(result.residue)}\n` +
+      `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
     expect(result.status, diagnostics).toBe(0);
     expect(result.stdout, diagnostics).toContain("canonical self-claim listener started");
     expect(result.stdout, diagnostics).not.toContain("canonical self-claim disabled");
+    expectNoResidue(result, diagnostics);
   }, 40_000);
 });
 
@@ -404,6 +523,18 @@ describe("#627: an owner's Buzz message reaches the CEO without a session child"
     const diagnostics = `status=${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
     expect(result.status, diagnostics).toBe(0);
     expect(result.stdout, diagnostics).not.toContain("Buzz message ingress started");
+  }, 40_000);
+
+  it("keeps first boot alive with no subscriber config and reports zero subscriber sockets", async () => {
+    // `runMain` gives every case a new state root. Declaring the Buzz owner opens the local ingress
+    // composition, but nothing writes `buzz-nostr-subscriber.json`, so this reaches the real
+    // config-absent subscriber boundary on first boot rather than a direct helper fixture.
+    const result = await runMain({ seedState: true, buzz: true, buzzOwnerIdentity: true });
+
+    const diagnostics = `status=${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
+    expect(result.status, diagnostics).toBe(0);
+    expect(result.stdout, diagnostics).toContain("Buzz mention subscriber sockets: 0");
+    expect(result.stdout, diagnostics).not.toContain("Buzz mention subscriber sockets: 1");
   }, 40_000);
 
   it("leaves the message socket closed when the relay credential names no declared owner", async () => {

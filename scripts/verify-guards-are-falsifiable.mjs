@@ -819,8 +819,8 @@ const GUARDS = [
     // reintroduces exactly that drift.
     what: "the launchd launcher exports every ACP_TELEGRAM_* variable the code reads, not a hand-kept subset",
     file: "deploy/install-launchd.sh",
-    find: "  ACP_TELEGRAM_DEFAULT_PROJECT_ID ACP_TELEGRAM_API_BASE_URL ACP_TELEGRAM_TRANSPORT_RETENTION_MS; do",
-    replace: "  ACP_TELEGRAM_DEFAULT_PROJECT_ID ACP_TELEGRAM_API_BASE_URL; do",
+    find: "  ACP_TELEGRAM_DEFAULT_PROJECT_ID ACP_TELEGRAM_API_BASE_URL ACP_TELEGRAM_TRANSPORT_RETENTION_MS \\",
+    replace: "  ACP_TELEGRAM_DEFAULT_PROJECT_ID ACP_TELEGRAM_API_BASE_URL \\",
     killedBy: [
       "tests/unit/telegram-env-launcher-drift.test.ts::TELEGRAM_ENVIRONMENT_VARIABLES is a subset of the launcher's optional-Keychain export loop",
     ],

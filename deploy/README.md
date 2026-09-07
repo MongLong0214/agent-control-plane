@@ -30,6 +30,31 @@ Optional Buzz configuration uses the same Keychain service and these account nam
 Buzz ingress settings must also be installed because the daemon rejects an unauthenticated
 actor-binding setup.
 
+Canonical self-claim is an optional, atomic activation group. Provision all eight accounts under
+that same Keychain service to enable it:
+
+- `ACP_CANONICAL_SESSION_UUID`
+- `ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION`
+- `ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH`
+- `ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256`
+- `ACP_CANONICAL_CTO_BUZZ_ACTOR_ID`
+- `ACP_CANONICAL_CTO_WORKDIR`
+- `ACP_CANONICAL_CTO_PEER_PROTOCOL`
+- `ACP_CANONICAL_CTO_BUZZ_PURPOSE`
+
+With none present, self-claim is disabled. Empty and whitespace-only values count as absent.
+Any nonempty proper subset refuses startup before config access, database opening, migration,
+or listener creation; diagnostics name missing variables, never their values. With all eight
+present, `ACP_BUZZ_CHANNEL` is also required. Channel-only transport configuration remains valid.
+The actor, workdir, protocol and purpose have no defaults: the configured values are retained
+from daemon entry and passed unchanged to the claim boundary.
+
+The generated launcher clears all eight inherited variables together before its first Keychain
+lookup, then reads each through the existing optional-account loop. These values are not written
+to the plist. Installation does not create `buzz-nostr-subscriber.json`; that separately provisioned
+subscriber config retains its existing authentication contract. Without it, an otherwise configured
+daemon can start with full canonical activation while the subscriber opens zero sockets.
+
 The installer resolves the provider CLIs `claude`, `codex` and `grok` from the installing shell's
 `PATH` and bakes each absolute path into the launcher as `ACP_RESOLVED_CLAUDE_BINARY`,
 `ACP_RESOLVED_CODEX_BINARY` and `ACP_RESOLVED_GROK_BINARY`. The launcher promotes each to

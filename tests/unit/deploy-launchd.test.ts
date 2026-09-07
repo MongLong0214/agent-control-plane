@@ -29,6 +29,16 @@ const deploy = join(root, "deploy");
 const installer = join(deploy, "install-launchd.sh");
 const template = join(deploy, "com.agentcontrolplane.agentcpd.plist.template");
 const label = "com.agentcontrolplane.agentcpd";
+const CANONICAL_ACTIVATION_VARIABLES = [
+  "ACP_CANONICAL_SESSION_UUID",
+  "ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION",
+  "ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH",
+  "ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256",
+  "ACP_CANONICAL_CTO_BUZZ_ACTOR_ID",
+  "ACP_CANONICAL_CTO_WORKDIR",
+  "ACP_CANONICAL_CTO_PEER_PROTOCOL",
+  "ACP_CANONICAL_CTO_BUZZ_PURPOSE",
+] as const;
 
 interface InstallerHarness {
   home: string;
@@ -117,6 +127,13 @@ case "$account" in
   # was never exercised — the fake was masking the property the test is named for.
   ACP_BUZZ_BINARY) [[ "\${ACP_FAKE_BUZZ_BINARY_ITEM:-0}" == "1" ]] || exit 44
                    printf 'keychain-provided-buzz\\n' ;;
+  ACP_CANONICAL_*)
+    case ",\${ACP_CANONICAL_KEYCHAIN_ACCOUNTS:-}," in
+      *,"$account",*) ;;
+      *) exit 44 ;;
+    esac
+    printf 'keychain-%s\\n' "$account"
+    ;;
   ACP_TELEGRAM_*)
     case ",\${ACP_TELEGRAM_KEYCHAIN_ACCOUNTS:-}," in
       *,"$account",*) ;;
@@ -180,9 +197,9 @@ if [[ "$target" == *"agentcpd.js" ]]; then
   # readers, and every reader written before these destructures from the front (indices 0-7).
   # 8-10 are what the daemon was handed, 11-13 what its own PATH can find, 14 whether the handed
   # path runs, 15 which interpreter its PATH resolves, 16 whether an unrelated executable sitting
-  # beside a provider CLI is reachable. They are separate observations and a launcher can satisfy
-  # any of them without the others.
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
+  # beside a provider CLI is reachable, and 17-24 the atomic canonical activation group. They are
+  # separate observations and a launcher can satisfy any of them without the others.
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
     "\${ACP_TELEGRAM_BOT_TOKEN-}" "\${ACP_TELEGRAM_OWNER_ID-}" \
     "\${ACP_TELEGRAM_CHAT_ID-}" "\${ACP_TELEGRAM_WEBHOOK_SECRET-}" \
     "\${BUZZ_PRIVATE_KEY:-<unset>}" "\${ACP_BUZZ_BINARY:-<unset>}" \
@@ -192,7 +209,11 @@ if [[ "$target" == *"agentcpd.js" ]]; then
     "$(command -v grok || printf '<unresolvable>')" \
     "$(started_of "\${ACP_CLAUDE_BINARY:-}"),$(started_of "\${ACP_CODEX_BINARY:-}"),$(started_of "\${ACP_GROK_BINARY:-}")" \
     "$(command -v node || printf '<unresolvable>')" \
-    "$(command -v acp-sibling-probe || printf '<unresolvable>')" >> "$ACP_LAUNCHER_ENV_LOG"
+    "$(command -v acp-sibling-probe || printf '<unresolvable>')" \
+    "\${ACP_CANONICAL_SESSION_UUID-}" "\${ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION-}" \
+    "\${ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH-}" "\${ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256-}" \
+    "\${ACP_CANONICAL_CTO_BUZZ_ACTOR_ID-}" "\${ACP_CANONICAL_CTO_WORKDIR-}" \
+    "\${ACP_CANONICAL_CTO_PEER_PROTOCOL-}" "\${ACP_CANONICAL_CTO_BUZZ_PURPOSE-}" >> "$ACP_LAUNCHER_ENV_LOG"
   # Mirrors the real precondition in src/daemon/agentcpd.ts: a Buzz credential without the
   # ingress pair is a startup error, not a degraded mode. Without this, a launcher that
   # exported the key too eagerly would look fine here and put the real daemon in a launchd
@@ -333,6 +354,9 @@ const launcherObservations = (harness: InstallerHarness) => {
     started: f[14],
     node: f[15],
     sibling: f[16],
+    canonical: Object.fromEntries(
+      CANONICAL_ACTIVATION_VARIABLES.map((name, index) => [name, f[17 + index] ?? ""]),
+    ) as Record<(typeof CANONICAL_ACTIVATION_VARIABLES)[number], string>,
   };
 };
 
@@ -350,6 +374,7 @@ const assertRenderedPlist = (harness: InstallerHarness): void => {
   expect(plist).not.toContain("__ACP_");
   expect(plist).not.toContain("ACP_MCP_TOKEN");
   expect(plist).not.toContain("ACP_TELEGRAM_BOT_TOKEN");
+  for (const name of CANONICAL_ACTIVATION_VARIABLES) expect(plist).not.toContain(name);
 };
 
 /**
@@ -700,6 +725,48 @@ describe("launchd deployment artifact", () => {
     expect(telegramOwner).toBe("");
     expect(telegramChat).toBe("");
     expect(telegramSecret).toBe("");
+  });
+
+  it("clears all inherited canonical activation values together before any Keychain lookup", () => {
+    const harness = makeHarness();
+    for (const name of CANONICAL_ACTIVATION_VARIABLES) {
+      harness.env[name] = `inherited-${name}-must-not-survive`;
+    }
+
+    expect(installWithPins(harness).status).toBe(0);
+    const launcher = readFileSync(launcherPath(harness), "utf8");
+    const clearAt = launcher.indexOf(`unset ${CANONICAL_ACTIVATION_VARIABLES.join(" ")}`);
+    const firstLookupAt = launcher.indexOf('export ACP_MCP_TOKEN="$(required_keychain_value ACP_MCP_TOKEN)"');
+    expect(clearAt, "the canonical group is not cleared by one explicit unset command").toBeGreaterThanOrEqual(0);
+    expect(firstLookupAt, "the required Keychain lookup call is missing").toBeGreaterThan(clearAt);
+
+    const launched = runGeneratedLauncher(harness);
+    expect(launched.status, launched.stderr).toBe(0);
+    expect(launcherObservations(harness).canonical).toEqual(
+      Object.fromEntries(CANONICAL_ACTIVATION_VARIABLES.map((name) => [name, ""])),
+    );
+  });
+
+  it("round-trips the complete canonical group from explicit Keychain accounts only", () => {
+    const harness = makeHarness();
+    harness.env["ACP_CANONICAL_KEYCHAIN_ACCOUNTS"] = CANONICAL_ACTIVATION_VARIABLES.join(",");
+
+    expect(installWithPins(harness).status).toBe(0);
+    expect(existsSync(join(harness.home, ".agent-control-plane", "buzz-nostr-subscriber.json"))).toBe(false);
+    assertRenderedPlist(harness);
+
+    const launched = runGeneratedLauncher(harness);
+    expect(launched.status, launched.stderr).toBe(0);
+    expect(launcherObservations(harness).canonical).toEqual(
+      Object.fromEntries(
+        CANONICAL_ACTIVATION_VARIABLES.map((name) => [name, `keychain-${name}`]),
+      ),
+    );
+    const lookups = readFileSync(harness.securityLog, "utf8");
+    for (const name of CANONICAL_ACTIVATION_VARIABLES) {
+      expect(lookups).toContain(`find-generic-password -w -s test-service -a ${name}`);
+    }
+    expect(existsSync(join(harness.home, ".agent-control-plane", "buzz-nostr-subscriber.json"))).toBe(false);
   });
 
   it("#423 takes BUZZ_PRIVATE_KEY from the desktop store when it has no item of its own", () => {
