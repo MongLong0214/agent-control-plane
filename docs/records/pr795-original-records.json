@@ -1,0 +1,48 @@
+{
+  "schema": "pr795-original-records-v1",
+  "sourceMerge": "d0d885fb41fd8d916d2f5e54bfd50b3bd759dd4c",
+  "pullRequest": "https://github.com/MongLong0214/agent-control-plane/pull/795",
+  "status": "Original drafted records preserved as documentation, not recaptured or upgraded. This artifact does not repair the historical merge trailers or establish the unverified checks.",
+  "originalRecords": [
+    {
+      "sha": "e0b4e86c2bfb0b49285e5f0c64e740001c36a280",
+      "trailers": [
+        {
+          "key": "Warn",
+          "value": "Keep version-probe cwd in the existing invocation-private scratch; do not replace it with shared temporary cwd or broaden filesystem, credential or PATH allowances."
+        },
+        {
+          "key": "Unverified",
+          "value": "Only focused synthetic Claude/Codex version fixtures exercised the native sandbox. Live provider versions, timeout cleanup, full/affected gates and parent review remain unverified; Grok is unchanged."
+        },
+        {
+          "key": "Record-Id",
+          "value": "r-806bafc284d3"
+        },
+        {
+          "key": "Provenance",
+          "value": "drafted"
+        }
+      ],
+      "recordId": "r-806bafc284d3"
+    },
+    {
+      "sha": "5ea8fba488a63c26448cb60954b13e88324e4e93",
+      "trailers": [
+        {
+          "key": "Ruled-out",
+          "value": "overwrite the final signature byte with 00 | can leave a valid signature unchanged"
+        },
+        {
+          "key": "Record-Id",
+          "value": "r-593794147ab9"
+        },
+        {
+          "key": "Provenance",
+          "value": "drafted"
+        }
+      ],
+      "recordId": "r-593794147ab9"
+    }
+  ]
+}
