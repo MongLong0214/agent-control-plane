@@ -1,0 +1,157 @@
+{
+  "qualification": "acp.role-wake-transport/u6",
+  "producedAt": "2026-09-07T14:49:22.501Z",
+  "headSha": "ece5ee417271e83bb756673a0d365ca062a29e41",
+  "client": {
+    "name": "claude-code",
+    "version": "2.1.263",
+    "versionOutput": "2.1.263 (Claude Code)",
+    "imagePath": "~/.local/share/claude/versions/2.1.263",
+    "imageSha256": "ef5d2909c8af49f31ab6d5487e90316777bc2fac170adfe8160716caa8aaf4f9"
+  },
+  "host": {
+    "platform": "darwin",
+    "arch": "arm64",
+    "release": "25.3.0"
+  },
+  "frame": {
+    "symbol": "ROLE_WAKE_FRAME (src/mcp/role-conversation.ts)",
+    "token": "ACP-ROLE-WAKE",
+    "utf8": "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"ACP-ROLE-WAKE\"}}\n",
+    "byteLength": 68,
+    "hex": "7b2274797065223a2275736572222c226d657373616765223a7b22726f6c65223a2275736572222c22636f6e74656e74223a224143502d524f4c452d57414b45227d7d0a",
+    "sha256": "3e1b1f00ff1ef6fd945cffbbd201953dc18d777540848e4035f998352c2701dd"
+  },
+  "runs": [
+    {
+      "shape": "interactive",
+      "injected": true,
+      "command": [
+        "~/.local/share/claude/versions/2.1.263",
+        "--settings",
+        "/private/tmp/acp-u6q-qUSxZf/settings.json",
+        "--setting-sources",
+        "",
+        "--messaging-socket-path",
+        "/private/tmp/acp-u6q-qUSxZf/s/i.sock",
+        "--model",
+        "claude-sonnet-4-5"
+      ],
+      "baselineModelRequests": 1,
+      "modelRequests": 2,
+      "wakeCarryingModelRequests": 1,
+      "followUpAfterInjection": true,
+      "settleMs": 20000,
+      "rawCapturePath": "evidence/local/u6-wake-transport-qualification/interactive-injection/capture.jsonl",
+      "rawSessionLogPath": "evidence/local/u6-wake-transport-qualification/interactive-injection/session.log",
+      "tempRootRemoved": true
+    },
+    {
+      "shape": "interactive",
+      "injected": false,
+      "command": [
+        "~/.local/share/claude/versions/2.1.263",
+        "--settings",
+        "/private/tmp/acp-u6q-Y7JU5s/settings.json",
+        "--setting-sources",
+        "",
+        "--messaging-socket-path",
+        "/private/tmp/acp-u6q-Y7JU5s/s/i.sock",
+        "--model",
+        "claude-sonnet-4-5"
+      ],
+      "baselineModelRequests": 1,
+      "modelRequests": 1,
+      "wakeCarryingModelRequests": 0,
+      "followUpAfterInjection": false,
+      "settleMs": 20000,
+      "rawCapturePath": "evidence/local/u6-wake-transport-qualification/interactive-control/capture.jsonl",
+      "rawSessionLogPath": "evidence/local/u6-wake-transport-qualification/interactive-control/session.log",
+      "tempRootRemoved": true
+    },
+    {
+      "shape": "headless",
+      "injected": true,
+      "command": [
+        "~/.local/share/claude/versions/2.1.263",
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--settings",
+        "/private/tmp/acp-u6q-xRQpOR/settings.json",
+        "--setting-sources",
+        "",
+        "--messaging-socket-path",
+        "/private/tmp/acp-u6q-xRQpOR/s/i.sock",
+        "--model",
+        "claude-sonnet-4-5"
+      ],
+      "baselineModelRequests": 1,
+      "modelRequests": 2,
+      "wakeCarryingModelRequests": 1,
+      "followUpAfterInjection": true,
+      "settleMs": 20000,
+      "rawCapturePath": "evidence/local/u6-wake-transport-qualification/headless-injection/capture.jsonl",
+      "rawSessionLogPath": "evidence/local/u6-wake-transport-qualification/headless-injection/session.log",
+      "tempRootRemoved": true
+    },
+    {
+      "shape": "headless",
+      "injected": false,
+      "command": [
+        "~/.local/share/claude/versions/2.1.263",
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--settings",
+        "/private/tmp/acp-u6q-ckxmCg/settings.json",
+        "--setting-sources",
+        "",
+        "--messaging-socket-path",
+        "/private/tmp/acp-u6q-ckxmCg/s/i.sock",
+        "--model",
+        "claude-sonnet-4-5"
+      ],
+      "baselineModelRequests": 1,
+      "modelRequests": 1,
+      "wakeCarryingModelRequests": 0,
+      "followUpAfterInjection": false,
+      "settleMs": 20000,
+      "rawCapturePath": "evidence/local/u6-wake-transport-qualification/headless-control/capture.jsonl",
+      "rawSessionLogPath": "evidence/local/u6-wake-transport-qualification/headless-control/session.log",
+      "tempRootRemoved": true
+    }
+  ],
+  "verdict": "qualified",
+  "limits": [
+    "One host and one arch. The receipt records which; it says nothing about any other.",
+    "Provider isolation is an ANTHROPIC_BASE_URL override plus a dummy credential, not a network namespace. It bounds where inference went, not everything the process could do.",
+    "The runtime does not hand the token to the model bare: it renders it inside a peer-message preamble of its own before it reaches model input. What is qualified is that the token arrives and starts a turn, not that it arrives unadorned. The preserved capture shows the surrounding text.",
+    "The endpoint-directory policy is untouched by this slice, so registration through registerEndpoint is still refused for a socket outside the daemon state directory. See the finding of that name.",
+    "Interactive start required pre-provisioned answers to the onboarding, workspace-trust and custom-API-key prompts in a throwaway config. A session whose operator answered them differently is outside this reading."
+  ],
+  "findings": [
+    {
+      "id": "endpoint-directory-policy",
+      "statement": "registerEndpoint requires dirname(endpoint) === endpointDir, and the composition root passes the daemon's state directory. A client started the way the deployment starts it binds its inbox at /tmp/cc-socks/<pid>.sock, which is never in that directory, so registration is refused before the version pin is even reached. That policy was a later integration decision rather than a C0 result, so its basis has to be re-argued on its own terms and not folded into this version qualification.",
+      "options": [
+        "Start the client with --messaging-socket-path pointing inside the state directory. This run measured exactly that shape: the interactive client bound where it was told, under a 0700 directory it did not create, and the wake landed. It needs nothing from the daemon and changes no check.",
+        "Re-argue what the composition root passes as endpointDir, and pass a directory the client's own default satisfies. That is a change to a security policy and belongs in its own slice with its own reading.",
+        "Leave both alone and accept that registration is unreachable in the deployed launch shape, which is the status quo and should be said out loud rather than discovered."
+      ]
+    },
+    {
+      "id": "wake-flag-is-not-a-published-interface",
+      "statement": "--messaging-socket-path is accepted by the measured build but does not appear in its --help. That is consistent with what the pin already says about this route -- a version-pinned local runtime contract rather than a supported public interface -- and it is the reason the pin is exact rather than a floor.",
+      "options": [
+        "Keep the pin exact and re-run this qualification on every client bump, which is what the constant's comment already promises."
+      ]
+    }
+  ]
+}

@@ -190,7 +190,7 @@ type EndpointCheck =
   | "owner-unknown-on-this-platform";
 
 /**
- * The client build C0 qualified this transport on.
+ * The client build this transport was qualified on.
  *
  * This route is a **version-pinned local runtime contract**, not a supported public interface and
  * not an external-events API. Nothing outside this deployment may rely on it, and it is expected
@@ -199,8 +199,21 @@ type EndpointCheck =
  * about that build, established by measurement rather than by a published guarantee. So the pin is
  * exact rather than a floor — a newer client is *unqualified*, not *newer than qualified*, until
  * somebody measures it and moves this constant.
+ *
+ * "Somebody measures it" now names a file. `evidence/u6-wake-transport-qualification.json` records
+ * the reading this value rests on — the command, the resolved image and its digest, the host, the
+ * exact `ROLE_WAKE_FRAME` bytes, and both arms of both invocation shapes — and
+ * `tests/feasibility/wake-transport-qualification.test.ts` refuses to let the two disagree. The
+ * C0 pin had no such file: its harness deleted its temp root on exit, so the constant carried a
+ * conclusion whose reading no longer existed, and a conclusion nobody can re-read is indistinguishable
+ * from one nobody took.
+ *
+ * The reading behind this value covers an **interactive** start, which the C0 one did not. That
+ * matters because `isInteractiveClaudeInvocation` (src/registry/canonical-self-claim.ts) refuses
+ * `-p`, `--print`, `--output-format` and `--input-format`: the process that may hold the canonical
+ * claim is exactly the shape a headless-only qualification never observed.
  */
-export const C0_QUALIFIED_CLIENT = { name: "claude-code", version: "2.1.259" } as const;
+export const C0_QUALIFIED_CLIENT = { name: "claude-code", version: "2.1.263" } as const;
 
 /**
  * Owner-only, in the POSIX sense the 0700 state directory already means: no group bits, no other
@@ -358,9 +371,9 @@ export class RoleConversationPort {
    *
    * **The 0700 belongs to the parent, not to the socket file**, and getting that backwards would
    * have rejected every real endpoint. The client binds the socket itself, so its mode is whatever
-   * that process's umask makes it — C0 measured 2.1.259 doing exactly this and chmod'ing only the
-   * *directory* (`tests/feasibility/native-session-inbox/harness.ts`, which sets the socket
-   * directory to 0700 and never touches the socket's own mode). Access is gated by the traversal
+   * that process's umask makes it — C0 measured this and the U6 re-qualification measured it again
+   * on the pinned build, both chmod'ing only the *directory* and never the socket's own mode
+   * (`tests/feasibility/wake-transport-qualification/harness.ts`). Access is gated by the traversal
    * bit on the parent regardless of what the socket file says, so the parent is where the check
    * belongs and where it is sufficient.
    *
@@ -458,7 +471,7 @@ export class RoleConversationPort {
       const endpointStat = lstatSync(endpoint);
       // No mode check here on purpose — see the docstring. The socket is the client's own file,
       // created under the client's umask, and demanding owner-only bits on it would refuse a
-      // correct 2.1.259 endpoint. The 0700 parent above is what makes it unreachable to others.
+      // correct endpoint from the qualified build. The 0700 parent is what makes it unreachable.
       if (endpointStat.isSymbolicLink()) {
         return this.#endpointRefusal("endpoint-is-symlink", "a wake endpoint must not be a symlink");
       }
