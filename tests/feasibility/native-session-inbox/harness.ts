@@ -90,7 +90,11 @@ export interface RunOptions {
    * `type: "user"` frame carrying this text. Omit it for the RED control.
    */
   readonly inject?: string;
-  /** How long to wait for the post-injection turn to reach the provider. */
+  /**
+   * Ceiling on the post-injection wait, shared by both arms -- not a duration either arm is
+   * observed for. The RED control spends all of it; the GREEN arm returns as soon as the turn
+   * reaches the provider.
+   */
   readonly settleMs?: number;
 }
 
@@ -283,8 +287,10 @@ export const runInboxProbe = async (options: RunOptions = {}): Promise<HarnessRe
         settleMs,
       );
     } else {
-      // The RED control waits the same wall-clock. An absence measured over a shorter
-      // window than the presence would not be the same measurement.
+      // The RED control spends the whole ceiling, while the GREEN arm above returns as soon as
+      // its follow-up request appears. So the two arms share a ceiling, not an observed duration:
+      // what this buys is that the absence was never measured over the shorter window, which is
+      // what would make it unreadable. It does not make the two observations equal in length.
       await sleep(settleMs);
     }
 

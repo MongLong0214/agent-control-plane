@@ -105,8 +105,16 @@ export interface ProbeRun {
   readonly wakeCarryingModelRequests: number;
   /** Whether a model request arrived that the baseline had not already produced. */
   readonly followUpAfterInjection: boolean;
-  /** The wall clock both arms waited after the injection point. */
-  readonly settleMs: number;
+  /**
+   * The ceiling on the post-injection wait -- not the span either arm was observed for.
+   *
+   * The control has nothing to stop early for and sleeps the whole ceiling. The injection arm
+   * returns the moment it sees the follow-up request it is waiting for, so its observed span is
+   * this or less, and the instrument does not record which. Equal values across two arms state an
+   * equal maximum window and nothing more; they are not a statement that the arms were watched
+   * for the same length of time.
+   */
+  readonly settleCeilingMs: number;
   /** Repository-relative, and still on disk after this run resolved. */
   readonly rawCapturePath: string;
   readonly rawSessionLogPath: string;
@@ -121,8 +129,33 @@ export interface ProbeRun {
 export interface QualificationReceipt {
   readonly qualification: string;
   readonly producedAt: string;
-  /** The source tree the measurement was taken against; also what stales this file later. */
+  /**
+   * `git rev-parse HEAD` at the moment the receipt was built -- when, not what.
+   *
+   * It is *not* a binding to the instrument. The harness can be, and on 2026-09-07 was, an
+   * uncommitted working tree while HEAD pointed at an unrelated commit, so this field can name a
+   * tree that contains no harness at all. Whether the source that took a reading is identified is
+   * a separate question, and `sourceBinding` is where a receipt answers it.
+   */
   readonly headSha: string;
+
+  /**
+   * Whether the source that produced this reading is identified, stated rather than assumed.
+   *
+   * Optional because the instrument does not compute it: a receipt describes one run, and a
+   * regenerated file is a different run whose binding has to be established for itself. A digest
+   * taken after the fact is evidence of preservation since, never of what executed.
+   */
+  readonly sourceBinding?: {
+    readonly status: "UNKNOWN" | "BOUND";
+    readonly [key: string]: unknown;
+  };
+
+  /** Custody of the artefacts this receipt points at, and of losses in the same work. */
+  readonly evidenceCustody?: { readonly [key: string]: unknown };
+
+  /** Claims corrected after the fact, with what was changed and why. Observations are never here. */
+  readonly corrections?: { readonly [key: string]: unknown };
   readonly client: {
     readonly name: string;
     readonly version: string;
@@ -312,9 +345,14 @@ const removeTempRoot = (root: string): void => {
 
 export interface ProbeOptions {
   readonly shape: ProbeShape;
-  /** Whether to write the frame. Omit for the control arm, which must wait the same wall clock. */
+  /** Whether to write the frame. Omit for the control arm, which spends the whole ceiling. */
   readonly inject: boolean;
-  readonly settleMs?: number;
+  /**
+   * Ceiling on the post-injection wait. The control spends all of it; the injection arm stops
+   * early on its follow-up request. Shared by both arms so the control's window is never the
+   * shorter one -- which is the property that makes its absence readable, not equal observation.
+   */
+  readonly settleCeilingMs?: number;
 }
 
 /**
@@ -324,7 +362,7 @@ export interface ProbeOptions {
  * in the capture is attributable to the frame and to nothing else.
  */
 export const runQualificationProbe = async (options: ProbeOptions): Promise<ProbeRun> => {
-  const settleMs = options.settleMs ?? 20_000;
+  const settleCeilingMs = options.settleCeilingMs ?? 20_000;
   const image = resolveClaudeImage();
   if (image === null) throw new Error("no `claude` image on PATH to qualify");
 
@@ -475,11 +513,16 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
 
     if (options.inject) {
       await writeWakeFrame(socketPath);
-      await waitFor(() => modelRequests().length > baselineModelRequests, settleMs);
+      // Returns as soon as the follow-up appears, so this arm's observed span is at most the
+      // ceiling and in practice less. The ceiling is what the two arms share; the observed span
+      // is not, and nothing here records it.
+      await waitFor(() => modelRequests().length > baselineModelRequests, settleCeilingMs);
     } else {
-      // The control waits the identical wall clock. An absence measured over a shorter window
-      // than the presence is not the same measurement.
-      await sleep(settleMs);
+      // The control has nothing to stop early for, so it spends the whole ceiling. That makes its
+      // window an upper bound on the injection arm's: an absence measured over a window no shorter
+      // than the presence cannot be explained away as having looked for less time. It does not
+      // make the two observations equal in length, and no row should say that it does.
+      await sleep(settleCeilingMs);
     }
 
     const final = modelRequests();
@@ -496,7 +539,7 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
       modelRequests: final.length,
       wakeCarryingModelRequests: final.filter((request) => request.body.includes(ROLE_WAKE_TOKEN)).length,
       followUpAfterInjection: final.length > baselineModelRequests,
-      settleMs,
+      settleCeilingMs,
       rawCapturePath: relative(REPO_ROOT, durableCapture),
       rawSessionLogPath: relative(REPO_ROOT, durableLog),
       // Filled in by the `finally` below, which runs before this promise settles.
@@ -600,6 +643,8 @@ const LIMITS: readonly string[] = [
   "The runtime does not hand the token to the model bare: it renders it inside a peer-message preamble of its own before it reaches model input. What is qualified is that the token arrives and starts a turn, not that it arrives unadorned. The preserved capture shows the surrounding text.",
   "The endpoint-directory policy is untouched by this slice, so registration through registerEndpoint is still refused for a socket outside the daemon state directory. See the finding of that name.",
   "Interactive start required pre-provisioned answers to the onboarding, workspace-trust and custom-API-key prompts in a throwaway config. A session whose operator answered them differently is outside this reading.",
+  "settleCeilingMs is a ceiling on the post-injection wait, not a duration either arm was observed for. The control spends the whole ceiling; the injection arm returns on its first follow-up request. Two arms sharing a ceiling were watched for at most the same time, not for the same time, and the actual spans are not recorded here.",
+  "This file does not identify the instrument that produced it. headSha is git rev-parse HEAD at receipt-build time, which can name a tree that contains no harness -- the harness may be uncommitted while the reading is taken. Unless a sourceBinding block below says otherwise, the source of this reading is UNKNOWN, and a digest computed after the fact would attest preservation since, not what executed.",
 ];
 
 /**
@@ -646,7 +691,7 @@ export const qualify = async (): Promise<{ readonly receipt: QualificationReceip
 
   // Serial, not concurrent. Each arm starts a real client that binds a socket and talks to a
   // loopback server; two of them at once would be measuring a machine under a load the deployment
-  // never puts it under, and the settle windows would no longer be comparable.
+  // never puts it under, and the settle ceilings would no longer bound comparable windows.
   const runs: ProbeRun[] = [];
   for (const shape of ["interactive", "headless"] as const) {
     for (const inject of [true, false]) {

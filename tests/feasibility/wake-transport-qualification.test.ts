@@ -31,7 +31,7 @@ import {
 } from "./wake-transport-qualification/harness.ts";
 import { C0_QUALIFIED_CLIENT, ROLE_WAKE_FRAME, ROLE_WAKE_TOKEN } from "../../src/mcp/role-conversation.ts";
 
-/** Long, because each arm starts a real client and waits out a settle window. */
+/** Long, because each arm starts a real client and waits out a settle ceiling. */
 const PROBE_TIMEOUT_MS = 300_000;
 
 const blocker = interactiveBlocker();
@@ -81,11 +81,29 @@ describe("U6: the wake transport is pinned to a build a receipt qualified", () =
     expect(injection.followUpAfterInjection).toBe(true);
     expect(injection.modelRequests).toBeGreaterThan(injection.baselineModelRequests);
 
-    // The control is only a control if it could have produced a positive: same harness, same
-    // settle window, one input removed.
+    // The control is only a control if it could have produced a positive: same harness, one
+    // input removed, and a settle *ceiling* no shorter than the injection arm's.
+    //
+    // Ceiling, not observation. The injection arm returns the moment its follow-up request
+    // appears, while the control sleeps the whole span, so equal values here say the two arms
+    // had an equal maximum window -- never that they were watched for equally long. What the
+    // control buys is that its absence was not measured over the shorter window; the arms'
+    // actual observed spans are unequal and the instrument does not record them.
     expect(control.wakeCarryingModelRequests).toBe(0);
     expect(control.followUpAfterInjection).toBe(false);
-    expect(control.settleMs).toBe(injection.settleMs);
+    expect(
+      control.settleCeilingMs,
+      "the control's settle ceiling is not the injection arm's, so its absence was measured over a different maximum window",
+    ).toBe(injection.settleCeilingMs);
+
+    // The old name for that field was `settleMs`, documented as "the wall clock both arms
+    // waited" -- which is false for the injection arm. A receipt that still spells it the old
+    // way was written by an instrument that still makes the old claim, so this row fails rather
+    // than reading a corrected field off an uncorrected file.
+    for (const run of receipt.runs) {
+      expect(run.settleCeilingMs, "a run row carries no settle ceiling").toBeGreaterThan(0);
+      expect(Object.keys(run), "a run row still carries the pre-correction `settleMs`").not.toContain("settleMs");
+    }
 
     // The interactive argv is what makes it interactive, so the receipt has to show it.
     for (const flag of ["-p", "--print", "--output-format", "--input-format"]) {
@@ -135,8 +153,10 @@ describe.skipIf(blocker !== null)("U6: the reading, re-taken", () => {
       // A control that could not have gone positive proves nothing about the arm it is a control
       // for. This is the same harness, and the injection arm above is the demonstration that it
       // goes positive when the one withheld input is supplied.
+      // Equal ceilings, which is all `settleCeilingMs` can assert: the injected arm stops on its
+      // follow-up request and the control does not, so their observed spans differ.
       const injected = await probe(true);
-      expect(injected.settleMs).toBe(run.settleMs);
+      expect(injected.settleCeilingMs).toBe(run.settleCeilingMs);
       expect(injected.baselineModelRequests).toBe(run.baselineModelRequests);
       expect(injected.followUpAfterInjection).not.toBe(run.followUpAfterInjection);
     },
