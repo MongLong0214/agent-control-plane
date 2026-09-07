@@ -34,6 +34,8 @@ const TEST_REQUIRED_EXECUTOR_VERSION = "9.0.0-test";
  */
 const SYMLINK_TEST_VERSION_REAL = "1.0.0-symlink-test-real";
 const SYMLINK_TEST_VERSION_DECOY = "9.0.0-symlink-test-decoy";
+/** Synthetic version for the executable-file layout used by current Claude installations. */
+const VERSION_FILE_LAYOUT_TEST_VERSION = "2.0.0-version-file-test";
 
 /**
  * Exercises the *real*, OS-backed implementations this module ships as defaults — never the
@@ -97,6 +99,13 @@ const writeVersionedClaude = (versionsRoot: string, version: string): string => 
   const executable = join(dir, "claude");
   cloneExecutable(executable);
   writeFileSync(join(dir, "package.json"), JSON.stringify({ version }));
+  return executable;
+};
+
+const writeVersionFileExecutable = (versionsRoot: string, version: string): string => {
+  mkdirSync(versionsRoot, { recursive: true });
+  const executable = join(versionsRoot, version);
+  cloneExecutable(executable);
   return executable;
 };
 
@@ -295,6 +304,30 @@ describe("real process ancestry — ps-backed, not a fake", () => {
 
 describe("real executing-image resolution — symlink and image can diverge", () => {
   it(
+    "resolves an executable stored exactly at versions/<version>",
+    async () => {
+      const root = tempRoot();
+      const executable = writeVersionFileExecutable(
+        join(root, "versions"),
+        VERSION_FILE_LAYOUT_TEST_VERSION,
+      );
+      const child = spawnHeld(executable, [], root);
+      await waitUntil(() => child.pid !== undefined, "child pid to be assigned");
+
+      let image = defaultExecutingImageInspector.resolve(child.pid!);
+      for (let attempt = 0; !image && attempt < 40; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        image = defaultExecutingImageInspector.resolve(child.pid!);
+      }
+
+      expect(image, "the filename-layout executing image could not be resolved").not.toBeNull();
+      expect(image!.version).toBe(VERSION_FILE_LAYOUT_TEST_VERSION);
+      expect(image!.imagePath).toBe(realpathSync(executable));
+    },
+    20_000,
+  );
+
+  it(
     "keeps reporting the version the live process actually loaded after its launch symlink is repointed to a decoy",
     async () => {
       const root = tempRoot();
@@ -422,6 +455,23 @@ describe("real executing-image resolution — symlink and image can diverge", ()
     }
     expect(image).not.toBeNull();
     expect(image!.version).toBe(TEST_REQUIRED_EXECUTOR_VERSION);
+  });
+});
+
+describe("executing-image version path parsing — bounded accepted layouts", () => {
+  it.each([
+    ["/tmp/versions//claude", "an empty version"],
+    ["/tmp/versions/9.0.0-test/", "a trailing empty component"],
+    ["/tmp/versions/9.0.0-test/claude/extra", "a path deeper than the legacy layout"],
+  ])("refuses %s (%s)", async (imagePath) => {
+    const module = await import("../../src/registry/canonical-self-claim.ts");
+    const parser = (
+      module as typeof module & {
+        versionFromImagePath?: (candidate: string) => string | null;
+      }
+    ).versionFromImagePath;
+    expect(parser).toBeTypeOf("function");
+    expect(parser!(imagePath)).toBeNull();
   });
 });
 
