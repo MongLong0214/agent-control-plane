@@ -370,7 +370,17 @@ export HOME="$ACP_HOME"
 # The interpreter directory comes first so that a CLI whose shebang resolves its interpreter
 # through the environment receives the interpreter this generation carries, rather than whichever
 # one a system directory happens to hold.
-export PATH="${ACP_NODE_PATH%/*}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+#
+# `/usr/sbin` is last, and is here for `lsof`, which ships only from there. A canonical self-claim
+# resolves the claiming process's executing image by spawning `lsof` under its bare name and
+# consulting no environment, so this PATH is the only channel that reaches that call: without the
+# directory the scan comes back empty, the image resolves to null, and a genuine claim is refused
+# with evidence that names neither the missing tool nor the cause. It is a system directory of the
+# same standing as `/usr/bin` and `/bin` above — root-owned, mode 755, SIP `restricted`, not
+# user-writable, listed in `/etc/paths` as part of the platform's own default PATH, and holding
+# none of the names this control plane grants authority by. That is what separates it from a
+# provider directory, which is user-writable and drags unrelated siblings into reach.
+export PATH="${ACP_NODE_PATH%/*}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin"
 
 required_keychain_value() {
   local account="$1" value=""

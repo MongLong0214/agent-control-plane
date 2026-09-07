@@ -193,13 +193,24 @@ if [[ "$target" == *"agentcpd.js" ]]; then
     [[ -n "$candidate" ]] || { printf 'unpinned'; return 0; }
     "$candidate" --version >/dev/null 2>&1 && printf 'started' || printf 'failed'
   }
+  # Whether the daemon's own PATH reaches the tool a canonical self-claim resolves an executing
+  # image with. lsofEntries (src/registry/canonical-self-claim.ts) spawns the bare name lsof and
+  # consults no environment, so PATH is the only channel by which that call is reachable. The
+  # report is the parsed scan rather than an exit status: an lsof that runs and reports no txt
+  # record resolves no image either, and the claim is refused just the same.
+  lsof_scan() {
+    local out=""
+    out="$(lsof -p $$ -FfptDin 2>/dev/null)" || { printf 'unrunnable'; return 0; }
+    printf '%s' "$out" | grep -q '^ftxt$' && printf 'txt-reported' || printf 'no-txt'
+  }
   # Fields are appended, never inserted: field position is the contract between this stub and its
   # readers, and every reader written before these destructures from the front (indices 0-7).
   # 8-10 are what the daemon was handed, 11-13 what its own PATH can find, 14 whether the handed
   # path runs, 15 which interpreter its PATH resolves, 16 whether an unrelated executable sitting
-  # beside a provider CLI is reachable, and 17-24 the atomic canonical activation group. They are
+  # beside a provider CLI is reachable, 17-24 the atomic canonical activation group, and 25-26
+  # where the bare name lsof resolves and what a real scan through it reports. They are
   # separate observations and a launcher can satisfy any of them without the others.
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
     "\${ACP_TELEGRAM_BOT_TOKEN-}" "\${ACP_TELEGRAM_OWNER_ID-}" \
     "\${ACP_TELEGRAM_CHAT_ID-}" "\${ACP_TELEGRAM_WEBHOOK_SECRET-}" \
     "\${BUZZ_PRIVATE_KEY:-<unset>}" "\${ACP_BUZZ_BINARY:-<unset>}" \
@@ -213,7 +224,8 @@ if [[ "$target" == *"agentcpd.js" ]]; then
     "\${ACP_CANONICAL_SESSION_UUID-}" "\${ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION-}" \
     "\${ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH-}" "\${ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256-}" \
     "\${ACP_CANONICAL_CTO_BUZZ_ACTOR_ID-}" "\${ACP_CANONICAL_CTO_WORKDIR-}" \
-    "\${ACP_CANONICAL_CTO_PEER_PROTOCOL-}" "\${ACP_CANONICAL_CTO_BUZZ_PURPOSE-}" >> "$ACP_LAUNCHER_ENV_LOG"
+    "\${ACP_CANONICAL_CTO_PEER_PROTOCOL-}" "\${ACP_CANONICAL_CTO_BUZZ_PURPOSE-}" \
+    "$(command -v lsof || printf '<unresolvable>')" "$(lsof_scan)" >> "$ACP_LAUNCHER_ENV_LOG"
   # Mirrors the real precondition in src/daemon/agentcpd.ts: a Buzz credential without the
   # ingress pair is a startup error, not a degraded mode. Without this, a launcher that
   # exported the key too eagerly would look fine here and put the real daemon in a launchd
@@ -291,7 +303,7 @@ const launcherPath = (harness: InstallerHarness): string =>
  * that CLI resolvable to the daemon too.
  */
 const EXPECTED_LAUNCHER_PATH_LINE =
-  'export PATH="${ACP_NODE_PATH%/*}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"';
+  'export PATH="${ACP_NODE_PATH%/*}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin"';
 
 /** A PATH holding nothing a provider could be found in, so a row measures the pin and not the host. */
 const isolatedInstallerPath = (harness: InstallerHarness, ...extra: string[]): string =>
@@ -354,6 +366,9 @@ const launcherObservations = (harness: InstallerHarness) => {
     started: f[14],
     node: f[15],
     sibling: f[16],
+    /** Where the daemon's PATH resolves the bare name `lsof`, and what a scan through it reports. */
+    lsof: f[25],
+    lsofScan: f[26],
     canonical: Object.fromEntries(
       CANONICAL_ACTIVATION_VARIABLES.map((name, index) => [name, f[17 + index] ?? ""]),
     ) as Record<(typeof CANONICAL_ACTIVATION_VARIABLES)[number], string>,
@@ -861,8 +876,11 @@ describe("launchd deployment artifact", () => {
     expect(launcher).toContain(buzzPath);
     // And it must be an absolute path the launchd PATH does not have to find.
     expect(buzzPath.startsWith("/")).toBe(true);
-    expect(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"].some((d) => buzzPath.startsWith(`${d}/`)))
-      .toBe(false);
+    expect(
+      ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin"].some((d) =>
+        buzzPath.startsWith(`${d}/`),
+      ),
+    ).toBe(false);
 
     // The file containing the path is not the daemon receiving it. Deleting the export while
     // leaving the baked value made every assertion above still pass — the launcher held the
@@ -982,6 +1000,33 @@ describe("launchd deployment artifact", () => {
     // its PATH has to name the same one: an ambient interpreter ahead of it on PATH would serve a
     // shebang lookup from outside the generation the sealed pair attests to.
     expect(launcherObservations(harness).node).toBe(installedInterpreter());
+  });
+
+  it("reaches lsof from the daemon's PATH, so a canonical self-claim can resolve an executing image", () => {
+    const harness = makeHarness();
+    // On Darwin a canonical self-claim resolves the claiming process's executing image by running
+    // `lsof -p <pid> -FfptDin`, spawned under its bare name by `lsofEntries`
+    // (src/registry/canonical-self-claim.ts). That call consults no environment, so an absolute
+    // path baked into a variable has no reader and the daemon's PATH is the only channel that
+    // reaches it. lsof ships in /usr/sbin; a PATH without that directory turns every scan into an
+    // empty list, the executing image resolves to null, and a genuine claim is refused as CONFLICT
+    // with evidence that carries a pid and names neither the missing tool nor the cause.
+    harness.env["PATH"] = isolatedInstallerPath(harness);
+    expect(installWithPins(harness).status).toBe(0);
+    const launched = runGeneratedLauncher(harness);
+    expect(launched.status, launched.stderr).toBe(0);
+    const seen = launcherObservations(harness);
+
+    // What the daemon's PATH resolves, not what the PATH line reads. A row that searched the
+    // launcher text for /usr/sbin would pass on a PATH that still cannot run the tool.
+    expect(seen.lsof, "the daemon's PATH does not resolve lsof").not.toBe("<unresolvable>");
+    expect(
+      seen.lsof?.startsWith("/"),
+      "lsof resolved to something that is not an absolute path",
+    ).toBe(true);
+    // Resolving is not answering. The claim needs a txt record back from a real scan, so the row
+    // runs one rather than stopping at the lookup.
+    expect(seen.lsofScan, "lsof resolved but reported no executing image").toBe("txt-reported");
   });
 
   it("#785 starts a provider CLI that finds its interpreter through the environment", () => {
