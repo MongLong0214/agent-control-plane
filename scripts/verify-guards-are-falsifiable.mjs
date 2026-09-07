@@ -826,6 +826,22 @@ const GUARDS = [
     ],
   },
   {
+    // The third instance of one shape in this deployment: launchd does not inherit a login shell's
+    // PATH, and a bare-name lookup then fails with nothing in the daemon's own logs to explain it.
+    // #423 was `buzz`, #785 was `claude`/`codex`/`grok`, and this is `lsof`, which ships only from
+    // `/usr/sbin`. `lsofEntries` (src/registry/canonical-self-claim.ts) spawns it under its bare
+    // name and reads no environment, so an absolute pin has no reader and this PATH is the only
+    // channel. Dropping the directory returns every scan empty, resolves the executing image to
+    // null, and refuses a genuine canonical self-claim as CONFLICT.
+    what: "the daemon's PATH reaches lsof, the only channel the canonical self-claim's executing-image resolution has",
+    file: "deploy/install-launchd.sh",
+    find: 'export PATH="${ACP_NODE_PATH%/*}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin"',
+    replace: 'export PATH="${ACP_NODE_PATH%/*}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"',
+    killedBy: [
+      "tests/unit/deploy-launchd.test.ts::reaches lsof from the daemon's PATH, so a canonical self-claim can resolve an executing image",
+    ],
+  },
+  {
     // The #662 hole: a caller that dispatched, reported that nothing ran, and got attempt 2
     // admitted while attempt 1 was still in flight.
     what: "a dispatched turn cannot be reported as never started",

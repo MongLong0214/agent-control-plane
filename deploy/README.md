@@ -70,10 +70,22 @@ is not there its capacity probe reports no quota rather than an error — which 
 names it. Installing the CLI and re-running `install` or `upgrade` pins it.
 
 The launcher's `PATH` is the deployment's own runtime interpreter directory followed by
-`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin` and `/bin`. A provider's own directory is never
-added: it holds executables unrelated to the CLI, and any directory on this `PATH` makes every
-name in it resolvable to the daemon. The interpreter directory comes first so that a CLI whose
-shebang resolves its interpreter by name receives the one this generation carries.
+`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin` and `/usr/sbin`. A provider's own
+directory is never added: it holds executables unrelated to the CLI, and any directory on this
+`PATH` makes every name in it resolvable to the daemon. The interpreter directory comes first so
+that a CLI whose shebang resolves its interpreter by name receives the one this generation
+carries.
+
+`/usr/sbin` is last, and is required for `lsof`, which ships only from there. A canonical
+self-claim resolves the claiming process's executing image by spawning `lsof` under its bare name
+and consulting no environment, so this `PATH` is the only channel that reaches the call: an
+absolute path baked into a variable has no reader. Without the directory every scan returns empty,
+the executing image resolves to null, and a genuine claim is refused as `CONFLICT` with evidence
+that carries a pid and names neither the missing tool nor the cause. It is admitted on the same
+footing as `/usr/bin` and `/bin`: a root-owned, mode `755`, SIP-`restricted`, non-user-writable
+system directory listed in `/etc/paths`, holding none of the names this control plane grants
+authority by. A provider directory is user-writable and carries unrelated siblings, which is why
+one is still never added.
 
 Every executable path is recorded as its canonical target: the `--node` answer and each provider
 CLI are resolved through their symlinks and directory components before being copied, pinned or
