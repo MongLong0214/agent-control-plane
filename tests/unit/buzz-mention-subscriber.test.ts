@@ -1457,6 +1457,20 @@ describe("the buzz mention subscriber's relay protocol", () => {
     }
   });
 
+  const corruptSignature = (sig: string): string => {
+    // Overwriting with 00 can leave a valid signature unchanged; flip one bit instead.
+    const lastByte = (Number.parseInt(sig.slice(-2), 16) ^ 1).toString(16).padStart(2, "0");
+    return `${sig.slice(0, -2)}${lastByte}`;
+  };
+
+  it("changes a signature even when its original final byte is 00", () => {
+    const sig = `${"ab".repeat(63)}00`;
+    const corrupted = corruptSignature(sig);
+    expect(corrupted).not.toBe(sig);
+    expect(corrupted).toMatch(/^[0-9a-f]{128}$/);
+    expect(corrupted.slice(0, -2)).toBe(sig.slice(0, -2));
+  });
+
   /**
    * Everything the relay can put on the wire that must not become a turn.
    *
@@ -1472,7 +1486,9 @@ describe("the buzz mention subscriber's relay protocol", () => {
       what: "an event whose signature does not verify",
       build: ({ owner, pubkey, subId }) => {
         const event = mentionEvent({ author: owner, addressedTo: pubkey });
-        return ["EVENT", subId, { ...event, sig: `${event.sig.slice(0, -2)}00` }];
+        const sig = corruptSignature(event.sig);
+        expect(sig).not.toBe(event.sig);
+        return ["EVENT", subId, { ...event, sig }];
       },
     },
     {
