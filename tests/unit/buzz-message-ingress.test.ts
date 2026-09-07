@@ -340,8 +340,9 @@ const connectRolePeer = async (
    * The client build this connection announces.
    *
    * Defaulted, because only one row needs a specific one: `role_wake_endpoint_register` is pinned
-   * to the qualified 2.1.259 runtime, so the row that registers an endpoint has to arrive as that
-   * build. Every other row is unaffected by what it says here, and passing the pin unconditionally
+   * to one qualified runtime build, so the row that registers an endpoint has to arrive as that
+   * build — named by `C0_QUALIFIED_CLIENT` rather than spelled out, so a re-qualification that
+   * moves the pin does not leave a stale literal behind that still passes. Every other row is unaffected by what it says here, and passing the pin unconditionally
    * would have made those rows quietly depend on a version they never exercise.
    */
   clientInfo: { name: string; version: string } = { name: "buzz-role-peer", version: "1" },
@@ -424,7 +425,7 @@ const connectRolePeer = async (
 const fakeRolePeer = () =>
   ({
     server: {
-      getClientVersion: () => ({ name: "claude-code", version: "2.1.259" }),
+      getClientVersion: () => C0_QUALIFIED_CLIENT,
     },
   }) as never;
 

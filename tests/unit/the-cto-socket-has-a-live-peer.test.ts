@@ -226,8 +226,9 @@ interface EndpointHandle {
 /**
  * Stands in for the socket a woken client binds for itself.
  *
- * Deliberately **not** chmod'd. The real 2.1.259 runtime binds its own socket under its own umask
- * and never touches that file's mode — C0 measured it chmod'ing only the containing directory — so
+ * Deliberately **not** chmod'd. The real qualified runtime binds its own socket under its own umask
+ * and never touches that file's mode — C0 measured it chmod'ing only the containing directory, and
+ * the U6 re-qualification measured the same on the build now pinned — so
  * a helper that tightened the socket here would be testing an endpoint no real client produces, and
  * would have hidden a mode check that rejects every real one. The rows chmod the *directory*
  * instead, which is where the 0700 boundary actually is.
@@ -799,9 +800,11 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
    * proof of nothing; this row is what stands in its place, and every question it asks is one the
    * daemon answers from the filesystem or from the MCP handshake, never from the caller.
    *
-   * Four refusals and one acceptance in one row, because the cap for this commit is two rows and
+   * Five refusals and one acceptance in one row, because the cap for this commit is two rows and
    * each of these branches is separately mutable — the mutations for this row are run against the
-   * dirname check, the socket-type check and the client pin independently.
+   * dirname check, the socket-type check and the client pin independently. The pin is two
+   * comparisons, and the last refusal is the one that reaches the second of them: without it the
+   * version half of the pin is unwatched, which was measured rather than assumed.
    */
   it("takes a wake endpoint only where it can establish the path for itself, from a qualified client", async () => {
     const harness = makeHarness();
@@ -840,6 +843,7 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
 
     const qualified = await connectPeer(ctoSocket, { token: TOKEN, ...session }, C0_QUALIFIED_CLIENT);
     let unqualified: PeerHandle | null = null;
+    let wrongBuild: PeerHandle | null = null;
     try {
       await until(() => qualified.initialized(), "the qualified peer's attach");
 
@@ -889,9 +893,38 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       expect(unpinned.reasonCode).toBe(ReasonCode.ROLE_PEER_UNSUPPORTED);
       expectNoPathLeak(unpinned, privatePaths);
       expect(listeners.ctoConversation.endpointFor(roleKey)).toBeNull();
+
+      // The **vendor is right and the build is wrong**, which is the half of the pin the peer
+      // above cannot reach: it declares a different name too, so `name !== ...` alone refuses it
+      // and the version comparison is never the reason. Measured, not reasoned about — deleting
+      // `client.version !== C0_QUALIFIED_CLIENT.version` from the condition left every row in this
+      // file green. The pin's whole claim is that a *newer build of the same client* is
+      // unqualified rather than newer-than-qualified, and this is the only row that says so.
+      wrongBuild = await connectPeer(ctoSocket, { token: TOKEN, ...session }, {
+        name: C0_QUALIFIED_CLIENT.name,
+        version: `${C0_QUALIFIED_CLIENT.version}.9999-not-the-qualified-build`,
+      });
+      await until(() => wrongBuild?.initialized() === true, "the wrong-build peer's attach");
+      const unqualifiedBuild = await wrongBuild.callTool("role_wake_endpoint_register", {
+        endpoint: good.path,
+      });
+      expect(unqualifiedBuild.ok).toBe(false);
+      expect(unqualifiedBuild.reasonCode).toBe(ReasonCode.ROLE_PEER_UNSUPPORTED);
+      // `presented`/`qualified` are emitted by the pin branch and by nothing else here, so this
+      // pair is what attributes the refusal to the version comparison rather than to any of the
+      // path checks that share the reason code.
+      expect(unqualifiedBuild.evidence?.presented).toBe(
+        `${C0_QUALIFIED_CLIENT.name}/${C0_QUALIFIED_CLIENT.version}.9999-not-the-qualified-build`,
+      );
+      expect(unqualifiedBuild.evidence?.qualified).toBe(
+        `${C0_QUALIFIED_CLIENT.name}/${C0_QUALIFIED_CLIENT.version}`,
+      );
+      expectNoPathLeak(unqualifiedBuild, privatePaths);
+      expect(listeners.ctoConversation.endpointFor(roleKey)).toBeNull();
     } finally {
       await qualified.close();
       if (unqualified) await unqualified.close();
+      if (wrongBuild) await wrongBuild.close();
       await listeners.close();
       await good.close();
       await outside.close();
@@ -952,7 +985,7 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       // **The byte shape itself**, not merely that something was written. This transport is a
       // version-pinned local runtime contract and the frame is part of that contract: the runtime
       // accepts this envelope because it is the shape it parses, so a row that accepted any bytes
-      // would go green against a wake no real 2.1.259 client would ever read.
+      // would go green against a wake no real qualified client would ever read.
       const wakeFrame = `${JSON.stringify({
         type: "user",
         message: { role: "user", content: "ACP-ROLE-WAKE" },
