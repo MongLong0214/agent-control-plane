@@ -447,17 +447,20 @@ export interface ExecutingImageInspector {
  * writable from the binary it sits beside, so it can be forged without touching the realpath or
  * the bytes clause 2 already authenticates — a version read that way proves nothing the other two
  * checks do not already have to hold for separately. The one thing that cannot be forged without
- * also changing the resolved path itself is the path's own `/versions/<version>/<binary>` segment
- * — the layout `~/.local/bin/claude` uses — so that segment, taken verbatim, is the only version
- * authority. It is compared for exact equality against
+ * also changing the resolved path itself is the path's own `/versions/<version>` executable-file
+ * layout, or the legacy `/versions/<version>/<binary>` layout — so that version segment, taken
+ * verbatim, is the only version authority. It is compared for exact equality against
  * `CanonicalSelfClaimConfig.requiredExecutorVersion` afterward; nothing here re-validates its
  * shape, so a deployment's real version and a test's synthetic prerelease segment (e.g.
  * `9.0.0-test`) are read identically.
  */
+const IMAGE_VERSION_FILE_PATTERN = /\/versions\/([^/]+)$/;
 const IMAGE_VERSION_DIRECTORY_PATTERN = /\/versions\/([^/]+)\/[^/]+$/;
 
-const versionFromImagePath = (imagePath: string): string | null =>
-  IMAGE_VERSION_DIRECTORY_PATTERN.exec(imagePath)?.[1] ?? null;
+export const versionFromImagePath = (imagePath: string): string | null =>
+  IMAGE_VERSION_FILE_PATTERN.exec(imagePath)?.[1]
+  ?? IMAGE_VERSION_DIRECTORY_PATTERN.exec(imagePath)?.[1]
+  ?? null;
 
 /**
  * Hashes the bytes reached through an already-open file descriptor, then closes it. A version
