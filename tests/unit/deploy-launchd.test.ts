@@ -8,6 +8,7 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -18,7 +19,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { Db } from "../../src/db/database.ts";
-import { sealRollbackPair, type SealedRollbackPair } from "../../src/deploy/rollback-pair.ts";
+import { parseLauncherBinding, sealRollbackPair, type SealedRollbackPair } from "../../src/deploy/rollback-pair.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -157,11 +158,41 @@ fi
 if [[ "$target" == "-e" ]]; then
   exec "$ACP_REAL_NODE" "$@"
 fi
+if [[ "$target" == *"/acp-provider-cli"* ]]; then
+  # A provider CLI fixture whose shebang resolves its interpreter through the environment arrives
+  # here: env finds this stub on the launcher's PATH and hands it the script. It is executed for
+  # real, because a stub that answered without executing would report a CLI as started on a
+  # launcher whose PATH could not reach an interpreter at all.
+  #
+  # This stub is the copy the installer places in the runtime closure, so the witness below is
+  # only set when the shebang resolved to *that* interpreter. Without it the row is satisfied by
+  # any interpreter the fixed directories happen to hold, and asserts nothing about the closure.
+  export ACP_INTERPRETER_WITNESS=acp-runtime-node
+  exec "$ACP_REAL_NODE" "$@"
+fi
 if [[ "$target" == *"agentcpd.js" ]]; then
-  printf '%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
+  started_of() {
+    local candidate="\${1:-}"
+    [[ -n "$candidate" ]] || { printf 'unpinned'; return 0; }
+    "$candidate" --version >/dev/null 2>&1 && printf 'started' || printf 'failed'
+  }
+  # Fields are appended, never inserted: field position is the contract between this stub and its
+  # readers, and every reader written before these destructures from the front (indices 0-7).
+  # 8-10 are what the daemon was handed, 11-13 what its own PATH can find, 14 whether the handed
+  # path runs, 15 which interpreter its PATH resolves, 16 whether an unrelated executable sitting
+  # beside a provider CLI is reachable. They are separate observations and a launcher can satisfy
+  # any of them without the others.
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
     "\${ACP_TELEGRAM_BOT_TOKEN-}" "\${ACP_TELEGRAM_OWNER_ID-}" \
     "\${ACP_TELEGRAM_CHAT_ID-}" "\${ACP_TELEGRAM_WEBHOOK_SECRET-}" \
-    "\${BUZZ_PRIVATE_KEY:-<unset>}" "\${ACP_BUZZ_BINARY:-<unset>}" >> "$ACP_LAUNCHER_ENV_LOG"
+    "\${BUZZ_PRIVATE_KEY:-<unset>}" "\${ACP_BUZZ_BINARY:-<unset>}" \
+    "\${ACP_CLAUDE_BINARY:-<unset>}" "\${ACP_CODEX_BINARY:-<unset>}" "\${ACP_GROK_BINARY:-<unset>}" \
+    "$(command -v claude || printf '<unresolvable>')" \
+    "$(command -v codex || printf '<unresolvable>')" \
+    "$(command -v grok || printf '<unresolvable>')" \
+    "$(started_of "\${ACP_CLAUDE_BINARY:-}"),$(started_of "\${ACP_CODEX_BINARY:-}"),$(started_of "\${ACP_GROK_BINARY:-}")" \
+    "$(command -v node || printf '<unresolvable>')" \
+    "$(command -v acp-sibling-probe || printf '<unresolvable>')" >> "$ACP_LAUNCHER_ENV_LOG"
   # Mirrors the real precondition in src/daemon/agentcpd.ts: a Buzz credential without the
   # ingress pair is a startup error, not a degraded mode. Without this, a launcher that
   # exported the key too eagerly would look fine here and put the real daemon in a launchd
@@ -206,10 +237,15 @@ const runInstaller = (
   command: string,
   args: readonly string[],
   harness: InstallerHarness,
+  // A relative PATH entry only means anything relative to a working directory. Rows that measure
+  // what the installer does with a relative answer have to run it from the directory that answer
+  // is relative to, or the shell resolves nothing and the row measures absence instead.
+  cwd?: string,
 ): CommandResult => {
   const result = spawnSync("bash", [command, ...args], {
     encoding: "utf8",
     env: harness.env,
+    ...(cwd ? { cwd } : {}),
   });
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 };
@@ -225,6 +261,83 @@ const plistPath = (harness: InstallerHarness): string =>
 
 const launcherPath = (harness: InstallerHarness): string =>
   join(harness.home, ".agent-control-plane", "agentcpd-launch.sh");
+
+/**
+ * The launcher's PATH, as a single literal.
+ *
+ * Asserted whole rather than searched: a provider directory added anywhere in it would satisfy
+ * every "the CLI resolves" assertion in this file while making every unrelated executable beside
+ * that CLI resolvable to the daemon too.
+ */
+const EXPECTED_LAUNCHER_PATH_LINE =
+  'export PATH="${ACP_NODE_PATH%/*}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"';
+
+/** A PATH holding nothing a provider could be found in, so a row measures the pin and not the host. */
+const isolatedInstallerPath = (harness: InstallerHarness, ...extra: string[]): string =>
+  [harness.bin, ...extra, "/usr/bin", "/bin"].join(":");
+
+/** Refuse to measure a pin on a host that already answers for the bare name some other way. */
+const assertProviderUnresolvable = (harness: InstallerHarness, ...names: string[]): void => {
+  for (const name of names) {
+    expect(
+      spawnSync("bash", ["-c", `command -v ${name}`], { env: harness.env }).status,
+      `${name} resolves from the installer's PATH, so this row would measure the host and not the pin`,
+    ).not.toBe(0);
+  }
+};
+
+const writeProviderCli = (path: string, body: string): string => {
+  writeFileSync(path, body, { mode: 0o755 });
+  chmodSync(path, 0o755);
+  // The canonical path, because that is what the installer pins: it resolves every answer to the
+  // real file before recording it, so a fixture compared by the name it was created under would
+  // disagree with a correct pin on any host whose temporary directory is itself a link.
+  return realpathSync(path);
+};
+
+/** A provider CLI that carries its own interpreter, as a compiled one does. */
+const SELF_CONTAINED_CLI = "#!/bin/sh\nexit 0\n";
+/** A provider CLI that reaches its interpreter through the environment, as a packaged script does. */
+const ENV_INTERPRETER_CLI =
+  "#!/usr/bin/env node\n" +
+  'process.exit(process.env.ACP_INTERPRETER_WITNESS === "acp-runtime-node" ? 0 : 1);\n';
+
+const installWithPins = (harness: InstallerHarness): CommandResult =>
+  runInstaller(
+    installer,
+    ["install", "--app-root", root, "--node", harness.node, "--keychain-service", "test-service"],
+    harness,
+  );
+
+/** Execute the generated launcher with `security` stubbed, as launchd would start it. */
+const runGeneratedLauncher = (harness: InstallerHarness): CommandResult => {
+  const launcherSecurity = join(harness.home, "launcher-security.bash");
+  writeFileSync(launcherSecurity, `security() { "${join(harness.bin, "security")}" "$@"; }\n`, {
+    mode: 0o600,
+  });
+  const launched = spawnSync("bash", [launcherPath(harness)], {
+    encoding: "utf8",
+    env: { ...harness.env, BASH_ENV: launcherSecurity },
+  });
+  return { status: launched.status, stdout: launched.stdout, stderr: launched.stderr };
+};
+
+/** What the daemon saw, by field. Positions are the contract; see the stub in `makeHarness`. */
+const launcherObservations = (harness: InstallerHarness) => {
+  const f = readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
+  const byProvider = (a: number, b: number, c: number) =>
+    ({ claude: f[a], codex: f[b], grok: f[c] }) as Record<string, string | undefined>;
+  return {
+    handed: byProvider(8, 9, 10),
+    onPath: byProvider(11, 12, 13),
+    started: f[14],
+    node: f[15],
+    sibling: f[16],
+  };
+};
+
+/** The interpreter the installer copies into the runtime closure, which the launcher binds to. */
+const installedInterpreter = (): string => join(root, "dist", "bin", "node");
 
 const assertRenderedPlist = (harness: InstallerHarness): void => {
   const plist = readFileSync(plistPath(harness), "utf8");
@@ -709,6 +822,461 @@ describe("launchd deployment artifact", () => {
     const [, , , , , , , resolvedBuzz] =
       readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
     expect(resolvedBuzz, "the launcher never exported the resolved Buzz binary").toBe(buzzPath);
+  });
+
+  it("#785 pins each provider CLI absolutely and puts no provider directory on the daemon's PATH", () => {
+    const harness = makeHarness();
+    // Three providers in three directories. `resolveExecutable` (src/runtime/cli-adapters.ts)
+    // searches the daemon's PATH for the bare names, the launcher pins that PATH to a fixed set,
+    // and a CLI installed elsewhere resolves to a bare name that never spawns — reported by the
+    // capacity parser as no quota rather than as an error.
+    const directories = ["a", "b", "c"].map((suffix) => {
+      const directory = join(harness.home, `acp-provider-cli-${suffix}`);
+      mkdirSync(directory, { recursive: true });
+      return directory;
+    });
+    const cli: Record<string, string> = {
+      claude: writeProviderCli(join(directories[0] as string, "claude"), SELF_CONTAINED_CLI),
+      codex: writeProviderCli(join(directories[1] as string, "codex"), SELF_CONTAINED_CLI),
+      grok: writeProviderCli(join(directories[2] as string, "grok"), SELF_CONTAINED_CLI),
+    };
+    harness.env["PATH"] = isolatedInstallerPath(harness, ...directories);
+
+    expect(installWithPins(harness).status).toBe(0);
+
+    const launcher = readFileSync(launcherPath(harness), "utf8");
+    for (const [name, path] of Object.entries(cli)) {
+      expect(launcher, `${name} was not resolved at install time`).toContain(path);
+    }
+    // Whole-line, so that no provider directory can be added anywhere in it.
+    expect(launcher).toContain(EXPECTED_LAUNCHER_PATH_LINE);
+    for (const directory of directories) {
+      expect(launcher, "a provider directory reached the daemon's PATH").not.toContain(
+        `${directory}:`,
+      );
+    }
+    // Extra assignments must not cost the launcher its seal: the rollback pair reads it as a
+    // closed grammar rather than searching it, so this uses the real parser.
+    const binding = parseLauncherBinding(launcher, "test:#785");
+    expect(binding.entrypoint).toBe("dist/daemon/agentcpd.js");
+    expect(binding.appRoot).toBe(realpathSync(root));
+
+    // The file holding a path is not the daemon receiving it: deleting an export while leaving
+    // the baked value passes every assertion above and hands the daemon nothing. Run it.
+    const launched = runGeneratedLauncher(harness);
+    expect(launched.status, launched.stderr).toBe(0);
+    const seen = launcherObservations(harness);
+
+    for (const name of ["claude", "codex", "grok"]) {
+      expect(seen.handed[name], `the launcher never exported a resolved ${name}`).toBe(cli[name]);
+      // The pin is the only channel. If the directory were on PATH, this would resolve and the
+      // row would pass for a reason it does not claim.
+      expect(seen.onPath[name], `${name} is reachable through the daemon's PATH`).toBe(
+        "<unresolvable>",
+      );
+    }
+    expect(seen.started, "a pinned CLI did not start").toBe("started,started,started");
+  });
+
+  it("#785 leaves an executable sitting beside a provider CLI unreachable from the daemon", () => {
+    const harness = makeHarness();
+    // The reason a provider's directory is not added to PATH. A provider installs its CLI beside
+    // whatever else its packaging ships, and this control plane selects executables by name; a
+    // directory on the daemon's PATH makes every one of those names selectable.
+    const directory = join(harness.home, "acp-provider-cli-shared");
+    mkdirSync(directory, { recursive: true });
+    const claude = writeProviderCli(join(directory, "claude"), SELF_CONTAINED_CLI);
+    const sibling = writeProviderCli(join(directory, "acp-sibling-probe"), SELF_CONTAINED_CLI);
+    harness.env["PATH"] = isolatedInstallerPath(harness, directory);
+
+    expect(installWithPins(harness).status).toBe(0);
+    const launched = runGeneratedLauncher(harness);
+    expect(launched.status, launched.stderr).toBe(0);
+    const seen = launcherObservations(harness);
+
+    // The provider CLI arrives, by pin.
+    expect(seen.handed["claude"]).toBe(claude);
+    expect(seen.started?.split(",")[0]).toBe("started");
+    // Its neighbour does not arrive at all, by any channel.
+    expect(seen.sibling, "an unrelated executable beside a provider CLI is resolvable").toBe(
+      "<unresolvable>",
+    );
+    expect(readFileSync(launcherPath(harness), "utf8")).not.toContain(sibling);
+  });
+
+  it("#785 resolves the interpreter to this deployment's own copy, not an ambient one", () => {
+    const harness = makeHarness();
+    harness.env["PATH"] = isolatedInstallerPath(harness);
+    expect(installWithPins(harness).status).toBe(0);
+    const launched = runGeneratedLauncher(harness);
+    expect(launched.status, launched.stderr).toBe(0);
+
+    // The launcher is bound to the interpreter the installer cloned into the runtime closure, and
+    // its PATH has to name the same one: an ambient interpreter ahead of it on PATH would serve a
+    // shebang lookup from outside the generation the sealed pair attests to.
+    expect(launcherObservations(harness).node).toBe(installedInterpreter());
+  });
+
+  it("#785 starts a provider CLI that finds its interpreter through the environment", () => {
+    const harness = makeHarness();
+    // A packaged CLI is commonly a script whose shebang resolves its interpreter by name, so an
+    // absolute pin alone is not enough — the interpreter has to be on the daemon's PATH as well.
+    // It comes from this deployment's runtime closure rather than from the provider's directory,
+    // which stays off PATH entirely.
+    const directory = join(harness.home, "acp-provider-cli-scripted");
+    mkdirSync(directory, { recursive: true });
+    const codex = writeProviderCli(join(directory, "codex"), ENV_INTERPRETER_CLI);
+    harness.env["PATH"] = isolatedInstallerPath(harness, directory);
+
+    expect(installWithPins(harness).status).toBe(0);
+    const launched = runGeneratedLauncher(harness);
+    expect(launched.status, launched.stderr).toBe(0);
+    const seen = launcherObservations(harness);
+
+    expect(seen.handed["codex"]).toBe(codex);
+    // Its own directory is not reachable, so nothing here comes from the provider's location.
+    expect(seen.onPath["codex"]).toBe("<unresolvable>");
+    // And it ran under the interpreter this deployment installed. The fixture exits non-zero
+    // unless the interpreter that executed it was the runtime copy, so an ambient interpreter in
+    // one of the fixed directories cannot satisfy this row in place of the closure's own.
+    expect(
+      seen.started?.split(",")[1],
+      "the env-shebang CLI did not start under this deployment's interpreter",
+    ).toBe("started");
+  });
+
+  it("#785 supports a provider CLI installed outside any bin directory", () => {
+    const harness = makeHarness();
+    // A CLI can sit at a path with no directory worth adding to anything — a native build under
+    // its own root, or a single file. The pin carries it; nothing about its parent directory is
+    // encoded into the daemon's PATH.
+    const grok = writeProviderCli(join(harness.home, "grok"), SELF_CONTAINED_CLI);
+    harness.env["PATH"] = isolatedInstallerPath(harness, harness.home);
+
+    expect(installWithPins(harness).status).toBe(0);
+    const launcher = readFileSync(launcherPath(harness), "utf8");
+    expect(launcher).toContain(grok);
+    expect(launcher).toContain(EXPECTED_LAUNCHER_PATH_LINE);
+    expect(launcher, "the CLI's parent directory was encoded into a PATH").not.toContain(
+      `${harness.home}:`,
+    );
+
+    const launched = runGeneratedLauncher(harness);
+    expect(launched.status, launched.stderr).toBe(0);
+    const seen = launcherObservations(harness);
+    expect(seen.handed["grok"]).toBe(grok);
+    expect(seen.onPath["grok"]).toBe("<unresolvable>");
+    expect(seen.started?.split(",")[2]).toBe("started");
+  });
+
+  it("#785 pins a symlinked CLI at its canonical target and refuses a relative, non-executable or absent one", () => {
+    const harness = makeHarness();
+    // Four ways the installing shell can answer for a name, and what each is worth to a daemon
+    // that runs from a different working directory and cannot search.
+    const real = join(harness.home, "acp-provider-cli-real");
+    mkdirSync(real, { recursive: true });
+    const onPath = join(harness.home, "acp-provider-cli-onpath");
+    mkdirSync(onPath, { recursive: true });
+
+    // A symlink is a name for a file, not the file. What is pinned is the target it resolves to.
+    const claudeTarget = writeProviderCli(join(real, "claude-1.0"), SELF_CONTAINED_CLI);
+    symlinkSync(claudeTarget, join(onPath, "claude"));
+    // A file that is present but not executable is not a CLI; the shell does not answer for it.
+    writeFileSync(join(onPath, "codex"), SELF_CONTAINED_CLI, { mode: 0o644 });
+    chmodSync(join(onPath, "codex"), 0o644);
+    // A relative answer names nothing a daemon in another working directory can reach, and would
+    // reach resolveExecutable's absolute-path branch, which returns it unchanged rather than
+    // searching. `grok` resolves only through a relative PATH entry.
+    const relative = "acp-provider-cli-relative";
+    mkdirSync(join(harness.home, relative), { recursive: true });
+    writeProviderCli(join(harness.home, relative, "grok"), SELF_CONTAINED_CLI);
+
+    harness.env["PATH"] = `${harness.bin}:${onPath}:${relative}:/usr/bin:/bin`;
+    // The premise, asserted rather than assumed: from this working directory the shell really does
+    // answer with the relative spelling. Run anywhere else and it answers with nothing, and the
+    // row below would be measuring an absent CLI while claiming to measure a relative one.
+    const relativeAnswer = spawnSync("bash", ["-c", "command -v grok"], {
+      encoding: "utf8",
+      env: harness.env,
+      cwd: harness.home,
+    });
+    expect(relativeAnswer.stdout.trim(), "the fixture did not produce a relative answer").toBe(
+      `${relative}/grok`,
+    );
+
+    const installed = runInstaller(
+      installer,
+      ["install", "--app-root", root, "--node", harness.node, "--keychain-service", "test-service"],
+      harness,
+      harness.home,
+    );
+    expect(installed.status, installed.stderr).toBe(0);
+
+    const launcher = readFileSync(launcherPath(harness), "utf8");
+    // Pinned as the canonical target, never as the link that named it.
+    expect(launcher).toContain(`ACP_RESOLVED_CLAUDE_BINARY=${realpathSync(claudeTarget)}`);
+    expect(launcher, "the launcher pinned the link rather than its target").not.toContain(
+      `ACP_RESOLVED_CLAUDE_BINARY=${join(onPath, "claude")}`,
+    );
+    // Not pinned: neither the unexecutable file nor anything relative.
+    expect(launcher, "a non-executable file was pinned").not.toContain("ACP_RESOLVED_CODEX_BINARY=");
+    expect(launcher, "a relative path was pinned").not.toContain("ACP_RESOLVED_GROK_BINARY=");
+    expect(launcher).not.toContain(`=${relative}/`);
+    for (const name of ["codex", "grok"]) {
+      expect(installed.stderr).toContain(`could not resolve the ${name} CLI`);
+    }
+
+    const launched = runGeneratedLauncher(harness);
+    expect(launched.status, launched.stderr).toBe(0);
+    const seen = launcherObservations(harness);
+    expect(seen.handed["claude"]).toBe(realpathSync(claudeTarget));
+    expect(seen.started?.split(",")[0]).toBe("started");
+    expect(seen.handed["codex"]).toBe("<unset>");
+    expect(seen.handed["grok"]).toBe("<unset>");
+  });
+
+  it("#785 keeps running the binary it pinned when the symlink that named it is repointed", () => {
+    const harness = makeHarness();
+    // The reason a pin is canonical. A pin that recorded the link would still read as correct
+    // after the link moved, and the daemon would run a provider binary this install never saw.
+    const real = join(harness.home, "acp-provider-cli-real");
+    mkdirSync(real, { recursive: true });
+    const onPath = join(harness.home, "acp-provider-cli-onpath");
+    mkdirSync(onPath, { recursive: true });
+    const accepted = writeProviderCli(join(real, "claude-1.0"), SELF_CONTAINED_CLI);
+    const substitute = writeProviderCli(join(real, "claude-2.0"), SELF_CONTAINED_CLI);
+    const link = join(onPath, "claude");
+    symlinkSync(accepted, link);
+    harness.env["PATH"] = isolatedInstallerPath(harness, onPath);
+
+    expect(installWithPins(harness).status).toBe(0);
+
+    // The link now names a different binary. Nothing about the installed deployment changed.
+    rmSync(link);
+    symlinkSync(substitute, link);
+
+    const launched = runGeneratedLauncher(harness);
+    expect(launched.status, launched.stderr).toBe(0);
+    const seen = launcherObservations(harness);
+    expect(seen.handed["claude"], "repointing the symlink changed which binary the daemon runs").toBe(
+      realpathSync(accepted),
+    );
+    expect(seen.handed["claude"]).not.toBe(realpathSync(substitute));
+  });
+
+  /** A valid app root at `where`: the builds and renderer the installer requires. */
+  const buildAppRootAt = (where: string): string => {
+    mkdirSync(where, { recursive: true });
+    cpSync(join(root, "dist"), join(where, "dist"), { recursive: true });
+    cpSync(join(root, "deploy"), join(where, "deploy"), { recursive: true });
+    symlinkSync(join(root, "node_modules"), join(where, "node_modules"));
+    // The source tree may already carry an interpreter another install put there, and the copy
+    // brings it along. Removing it is what makes its absence attributable to a refusal.
+    rmSync(join(where, "dist", "bin"), { recursive: true, force: true });
+    return where;
+  };
+
+  /** Nothing an install does to the filesystem or the service may have happened. */
+  const expectNothingInstalled = (harness: InstallerHarness, appRoot: string): void => {
+    expect(
+      existsSync(join(appRoot, "dist", "bin", "node")),
+      "the interpreter was installed into a refused app root",
+    ).toBe(false);
+    // The clone creates this directory before it writes the file, so its absence is the earlier
+    // and stricter statement: not even the first step of the first effect ran.
+    expect(
+      existsSync(join(appRoot, "dist", "bin")),
+      "the runtime interpreter directory was created for a refused install",
+    ).toBe(false);
+    expect(existsSync(launcherPath(harness)), "a launcher was written for a refused app root").toBe(false);
+    expect(existsSync(plistPath(harness)), "a plist was rendered for a refused app root").toBe(false);
+    expect(
+      existsSync(join(harness.home, ".agent-control-plane")),
+      "the state directory was created for a refused app root",
+    ).toBe(false);
+    expect(existsSync(harness.launchLog), "launchctl was called for a refused app root").toBe(false);
+  };
+
+  it("#785 refuses an app root that canonicalises onto a path no PATH entry can hold", () => {
+    const harness = makeHarness();
+    // The launcher exports the app root's runtime interpreter directory as a POSIX PATH entry,
+    // where ':' separates entries, so such a path splits into two entries naming nothing.
+    //
+    // The input given here carries no ':' at all — it is a plain symlink that resolves onto one.
+    // A guard placed on what the caller typed accepts this and installs a broken deployment; only
+    // a guard on the canonical path refuses it. That ordering is the property under test, and a
+    // literal colon argument cannot measure it.
+    const parent = tempDir("acp-launchd-colon-approot-");
+    const colonRoot = buildAppRootAt(join(parent, "app:root"));
+    const colonFreeInput = join(parent, "plain-approot");
+    symlinkSync(colonRoot, colonFreeInput);
+    expect(colonFreeInput).not.toContain(":");
+
+    const refused = runInstaller(
+      installer,
+      ["install", "--app-root", colonFreeInput, "--node", harness.node, "--keychain-service", "test-service"],
+      harness,
+    );
+    expect(refused.status, refused.stdout).not.toBe(0);
+    expect(refused.stderr).toContain("cannot contain ':' after canonicalisation");
+
+    // A refusal is written to a terminal, a log and often an issue. The app root is the caller's
+    // private filesystem layout and does not belong in any of them.
+    const output = `${refused.stdout}${refused.stderr}`;
+    expect(output, "the refusal disclosed the canonical app root").not.toContain(colonRoot);
+    expect(output, "the refusal disclosed the supplied app root").not.toContain(colonFreeInput);
+    expect(output, "the refusal disclosed the caller's directory layout").not.toContain(parent);
+
+    expectNothingInstalled(harness, colonRoot);
+
+    // The same tree at a path without the separator installs. Nothing but the ':' differs, so it
+    // is the whole reason for the refusal rather than a property of the fixture.
+    const plainRoot = join(parent, "approot");
+    renameSync(colonRoot, plainRoot);
+    rmSync(colonFreeInput);
+    symlinkSync(plainRoot, colonFreeInput);
+    const accepted = runInstaller(
+      installer,
+      ["install", "--app-root", colonFreeInput, "--node", harness.node, "--keychain-service", "test-service"],
+      harness,
+    );
+    expect(accepted.status, accepted.stderr).toBe(0);
+    expect(readFileSync(launcherPath(harness), "utf8")).toContain(EXPECTED_LAUNCHER_PATH_LINE);
+    // The positive control for the fails-closed assertions: an accepted install does clone the
+    // interpreter, so their absence above is a fact about the refusal rather than an assertion
+    // that could never have observed anything.
+    expect(existsSync(join(plainRoot, "dist", "bin", "node"))).toBe(true);
+  });
+
+  it("#785 refuses the filesystem root as an app root, and binds a real one without a doubled slash", () => {
+    const harness = makeHarness();
+    // Every path the installer derives is "$app_root/...", which at the filesystem root yields a
+    // leading '//' whose meaning POSIX leaves to the implementation — while the sealed rollback
+    // binding canonicalises the same location to a single '/'. The two would disagree about one
+    // install, so the root is refused before anything is written.
+    const refused = runInstaller(
+      installer,
+      ["install", "--app-root", "/", "--node", harness.node, "--keychain-service", "test-service"],
+      harness,
+    );
+    expect(refused.status, refused.stdout).not.toBe(0);
+    expect(refused.stderr).toContain("cannot be the filesystem root");
+    expect(existsSync(launcherPath(harness)), "a launcher was written for the filesystem root").toBe(false);
+    expect(existsSync(plistPath(harness)), "a plist was rendered for the filesystem root").toBe(false);
+    expect(
+      existsSync(join(harness.home, ".agent-control-plane")),
+      "the state directory was created for the filesystem root",
+    ).toBe(false);
+    expect(existsSync(harness.launchLog), "launchctl was called for the filesystem root").toBe(false);
+
+    // And the binding a real app root does produce carries no doubled separator, in the node path
+    // the launcher execs or in the PATH entry derived from it.
+    expect(installWithPins(harness).status).toBe(0);
+    const launcher = readFileSync(launcherPath(harness), "utf8");
+    const binding = parseLauncherBinding(launcher, "test:#785-root");
+    expect(binding.nodePath).not.toContain("//");
+    expect(binding.appRoot).not.toContain("//");
+    expect(launcher).toContain(EXPECTED_LAUNCHER_PATH_LINE);
+    const launched = runGeneratedLauncher(harness);
+    expect(launched.status, launched.stderr).toBe(0);
+    expect(launcherObservations(harness).node, "the daemon's interpreter path is not canonical").toBe(
+      installedInterpreter(),
+    );
+  });
+
+  it("#785 refuses a Node path that does not resolve to a regular executable, before any effect", () => {
+    const harness = makeHarness();
+    // `-x` alone accepts things that are not programs: a directory carries the execute bit, so a
+    // link to one passes an executable test and is then copied into the runtime closure as the
+    // interpreter the whole generation is bound to. Requiring the canonical target to be a regular
+    // file is what rejects it, and it happens before the clone that is the first effect.
+    const appRoot = buildAppRootAt(join(tempDir("acp-launchd-node-shape-"), "approot"));
+    const directory = join(harness.home, "not-a-program");
+    mkdirSync(directory, { recursive: true });
+    const link = join(harness.home, "node-link");
+    symlinkSync(directory, link);
+    expect(statSync(link).isDirectory(), "the fixture must resolve to a directory").toBe(true);
+
+    const refused = runInstaller(
+      installer,
+      ["install", "--app-root", appRoot, "--node", link, "--keychain-service", "test-service"],
+      harness,
+    );
+    expect(refused.status, refused.stdout).not.toBe(0);
+    expect(refused.stderr).toContain("does not resolve to an absolute regular executable");
+    expectNothingInstalled(harness, appRoot);
+  });
+
+  it("#785 says a path did not resolve without saying what the path was", () => {
+    const harness = makeHarness();
+    // A link can stop being readable between the predicate that finds it and the call that reads
+    // it. The utility reports that by printing the path it was given, and that line crosses the
+    // installer boundary on its own — ahead of the generic refusal, which cannot retract it. The
+    // branch is forced here by a `readlink` that fails the way the real one does under that race.
+    const supplied = "ACPSUPPLIEDSENTINEL";
+    const canonical = "ACPCANONICALSENTINEL";
+    const target = writeProviderCli(join(harness.home, `node-${canonical}`), SELF_CONTAINED_CLI);
+    const link = join(harness.home, `node-${supplied}`);
+    symlinkSync(target, link);
+    // Emits both paths the way the real utility emits the one it was handed, so the row measures
+    // suppression of the channel rather than of one particular sentence.
+    writeExecutable(
+      join(harness.bin, "readlink"),
+      `#!/bin/bash\nprintf 'readlink: %s: Permission denied (target %s)\\n' "\${2:-}" "${target}" >&2\nexit 1\n`,
+    );
+
+    const refused = runInstaller(
+      installer,
+      ["install", "--app-root", root, "--node", link, "--keychain-service", "test-service"],
+      harness,
+    );
+    expect(refused.status, refused.stdout).not.toBe(0);
+    // The stable diagnostic is present …
+    expect(refused.stderr).toContain("does not resolve to an absolute regular executable");
+    // … and asserting only that would pass with the leaked line sitting directly above it.
+    const output = `${refused.stdout}${refused.stderr}`;
+    expect(output, "the supplied path leaked through the utility's stderr").not.toContain(supplied);
+    expect(output, "the canonical path leaked through the utility's stderr").not.toContain(canonical);
+    expect(output, "a raw utility diagnostic crossed the installer boundary").not.toContain(
+      "Permission denied",
+    );
+  });
+
+  it("#785 names each provider CLI it could not resolve and installs anyway", () => {
+    const harness = makeHarness();
+    // grok is optional and a host without it must still be able to deploy, so nothing is pinned
+    // and nothing is refused. What it must not be is silent: an absent CLI reports as no quota,
+    // which is indistinguishable from a provider that is out of quota unless the install says so.
+    harness.env["PATH"] = isolatedInstallerPath(harness);
+    assertProviderUnresolvable(harness, "claude", "codex", "grok");
+
+    const installed = installWithPins(harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    for (const name of ["claude", "codex", "grok"]) {
+      expect(installed.stderr, `the installer said nothing about ${name}`).toContain(
+        `could not resolve the ${name} CLI`,
+      );
+    }
+    expect(installed.stderr).toContain("will report no quota");
+
+    // Nothing is baked for a CLI that was not found: a bare name would take the absolute-path
+    // branch in `resolveExecutable` and then fail to stat, which is worse than searching PATH.
+    const launcher = readFileSync(launcherPath(harness), "utf8");
+    for (const variable of [
+      "ACP_RESOLVED_CLAUDE_BINARY",
+      "ACP_RESOLVED_CODEX_BINARY",
+      "ACP_RESOLVED_GROK_BINARY",
+    ]) {
+      expect(launcher, `${variable} was baked for a CLI that was never found`).not.toContain(
+        `${variable}=`,
+      );
+    }
+
+    const launched = runGeneratedLauncher(harness);
+    // The daemon still starts. An unresolved provider is a degraded deployment, not a dead one.
+    expect(launched.status, launched.stderr).toBe(0);
+    const seen = launcherObservations(harness);
+    for (const name of ["claude", "codex", "grok"]) expect(seen.handed[name]).toBe("<unset>");
   });
 
   it("#423 leaves BUZZ_PRIVATE_KEY unset rather than guessing when neither source has it", () => {

@@ -30,6 +30,40 @@ Optional Buzz configuration uses the same Keychain service and these account nam
 Buzz ingress settings must also be installed because the daemon rejects an unauthenticated
 actor-binding setup.
 
+The installer resolves the provider CLIs `claude`, `codex` and `grok` from the installing shell's
+`PATH` and bakes each absolute path into the launcher as `ACP_RESOLVED_CLAUDE_BINARY`,
+`ACP_RESOLVED_CODEX_BINARY` and `ACP_RESOLVED_GROK_BINARY`. The launcher promotes each to
+`ACP_CLAUDE_BINARY`, `ACP_CODEX_BINARY` or `ACP_GROK_BINARY` unless that variable is already set,
+and the daemon passes it to the matching adapter. An absolute pin is the only channel by which a
+CLI outside the launcher's `PATH` is reachable; a configured adapter override takes precedence
+over the environment.
+
+Only an absolute, executable path is pinned. A CLI the installer cannot resolve is named on
+stderr and left unpinned rather than refused, so a host without an optional CLI can still deploy.
+An unpinned provider is searched for on the launcher's `PATH` as any bare name would be, and if it
+is not there its capacity probe reports no quota rather than an error — which is why the installer
+names it. Installing the CLI and re-running `install` or `upgrade` pins it.
+
+The launcher's `PATH` is the deployment's own runtime interpreter directory followed by
+`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin` and `/bin`. A provider's own directory is never
+added: it holds executables unrelated to the CLI, and any directory on this `PATH` makes every
+name in it resolvable to the daemon. The interpreter directory comes first so that a CLI whose
+shebang resolves its interpreter by name receives the one this generation carries.
+
+Every executable path is recorded as its canonical target: the `--node` answer and each provider
+CLI are resolved through their symlinks and directory components before being copied, pinned or
+persisted, and must end at an absolute regular executable. Repointing a symlink after an install
+therefore does not change which binary the daemon runs.
+
+`install`, `upgrade` and `rollback` canonicalise `--app-root` and then refuse two shapes, before
+any file is written, any service is stopped and the runtime interpreter is copied — so a refused
+run leaves nothing behind. A canonical path containing `:` is refused because the launcher exports
+the app root's runtime interpreter directory as a POSIX `PATH` entry, where `:` separates entries.
+The canonical filesystem root is refused because every derived path would carry a leading `//`,
+which the sealed rollback binding canonicalises differently. Both are judged after canonicalisation
+rather than on the supplied string, since a path with neither property can resolve onto one, and
+neither refusal repeats the path back.
+
 The job uses `~/.agent-control-plane` because that is the daemon's configured state root. The
 installer and runtime both require this directory, its database, worktree root, secrets root,
 and backups to be current-user owned, non-symlinked, and mode `0700`/`0600` as appropriate.
