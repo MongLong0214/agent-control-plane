@@ -313,7 +313,8 @@ const productionRunCli = async (
   file: string,
   args: readonly string[],
   options: {
-    cwd: string;
+    /** Undefined selects this invocation's private scratch for a version-only probe. */
+    cwd: string | undefined;
     timeoutMs: number;
     stdin?: string;
     environmentAllowlist?: readonly string[];
@@ -363,7 +364,7 @@ const productionRunCli = async (
     if (active) await active.abandon();
   };
   try {
-    const workdir = realpathSync(options.cwd);
+    const workdir = realpathSync(options.cwd ?? scratch);
     if (options.isolation) {
       assertReviewerIsolation(workdir, options.isolation, options.reviewerCredentialPaths ?? []);
     }
@@ -1578,7 +1579,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
 
   async probeRuntime(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
     const result = await runCli(this.#binary, ["--version"], {
-      cwd: process.cwd(),
+      cwd: undefined,
       timeoutMs: 15_000,
       environmentAllowlist: this.#environmentAllowlist,
       denyReadPaths: this.#denyReadPaths,
@@ -1875,7 +1876,7 @@ export class CodexCliAdapter implements ProviderAdapter {
 
   async probeRuntime(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
     const result = await runCli(this.#binary, ["--version"], {
-      cwd: process.cwd(),
+      cwd: undefined,
       timeoutMs: 15_000,
       environmentAllowlist: this.#environmentAllowlist,
       denyReadPaths: this.#denyReadPaths,
