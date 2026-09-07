@@ -104,11 +104,18 @@ const INDEX_LINE = /^([a-f0-9]{64}) {2}(\S+)$/;
  * leading dot is not treated as suspicious on its own.
  */
 const MEMBER_SEGMENT = /^[A-Za-z0-9._-]+$/;
+const NPM_SCOPE_SEGMENT = /^@[a-z0-9][a-z0-9._-]*$/;
+const NPM_PACKAGE_SEGMENT = /^[a-z0-9][a-z0-9._-]*$/;
 const isMemberPath = (value: string): boolean => {
   if (value.length === 0) return false;
-  return value
-    .split("/")
-    .every((segment) => segment !== "." && segment !== ".." && MEMBER_SEGMENT.test(segment));
+  const segments = value.split("/");
+  return segments.every((segment, index) => {
+    if (segment === "." || segment === "..") return false;
+    if (MEMBER_SEGMENT.test(segment)) return true;
+    // Only a scope directory in node_modules gains a leading @, never arbitrary member names.
+    return NPM_SCOPE_SEGMENT.test(segment) && segments[index - 1] === "node_modules" &&
+      index + 2 < segments.length && NPM_PACKAGE_SEGMENT.test(segments[index + 1]!);
+  });
 };
 
 export interface RollbackPairMember {
