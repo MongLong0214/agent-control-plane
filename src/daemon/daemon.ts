@@ -37,6 +37,11 @@ import {
   type ReclaimedFinalizationAttempt,
   type FinalizationResult,
 } from "./finalizer.ts";
+import {
+  recoverDeadCanonicalBinding,
+  parseDeadBindingRecoveryRequest,
+  type DeadBindingRecoveryReceipt,
+} from "./dead-binding-recovery.ts";
 import { SingleInstanceLock } from "./single-instance.ts";
 
 /**
@@ -224,6 +229,13 @@ export const OPERATOR_METHOD = {
    * of `inbound_messages` rather than trusting anything the claiming request asserts.
    */
   OWNER_APPROVE_CLAIM_CANONICAL_CTO: "owner.approveClaimCanonicalCto",
+  /**
+   * The parked daemon's recovery for CTO_BINDING_POINTS_AT_DEAD_SESSION: release a PRIMARY_CTO
+   * binding whose session's process is provably gone, under an owner approval this call itself
+   * admits. It mints no session and no generation — see `dead-binding-recovery.ts` for why the
+   * spawning `CtoLifecycle.recoveryTakeover` is deliberately not what a parked daemon serves.
+   */
+  BINDING_RECOVER_DEAD: "binding.recoverDead",
   REPAIR_LIST: "repair.list",
   REPAIR_DRY_RUN: "repair.dry-run",
   REPAIR_EXECUTE: "repair.execute",
@@ -251,6 +263,7 @@ export const OPERATOR_MUTATION_METHODS: ReadonlySet<OperatorMethod> = new Set([
   OPERATOR_METHOD.OUTBOX_RETRY,
   OPERATOR_METHOD.OWNER_APPROVE,
   OPERATOR_METHOD.OWNER_APPROVE_CLAIM_CANONICAL_CTO,
+  OPERATOR_METHOD.BINDING_RECOVER_DEAD,
   OPERATOR_METHOD.REPAIR_DRY_RUN,
   OPERATOR_METHOD.REPAIR_EXECUTE,
   OPERATOR_METHOD.CAPACITY_OBSERVE,
@@ -283,6 +296,13 @@ export const BOOTSTRAP_OPERATOR_METHODS: ReadonlySet<OperatorMethod> = new Set([
   // could clear. #668.
   OPERATOR_METHOD.CONVERSATION_UNRESOLVED,
   OPERATOR_METHOD.CONVERSATION_RESOLVE,
+  // The remedy for CTO_BINDING_POINTS_AT_DEAD_SESSION, admitted here for the same reason the
+  // adjudication pair is: without it the doctor named a state that no command reachable from a
+  // parked daemon could clear, and the only door that could clear it was opened after start()
+  // had already refused. This method is narrower than the others on this list, not wider — it
+  // spawns nothing, mints no generation, and releases exactly one binding whose process this
+  // machine can prove is gone, under an owner approval it verifies before it acts.
+  OPERATOR_METHOD.BINDING_RECOVER_DEAD,
   OPERATOR_METHOD.DAEMON_STATUS,
 ]);
 
@@ -322,7 +342,20 @@ export const canParkForBootstrap = (blockingFindings: readonly BlockingFinding[]
       // and until one did, the rule read as "park for capacity" rather than as what it says.
       // Parking does not weaken the quarantine: a claim is refused by the ledger, not by the
       // daemon's mode, so a parked daemon admits no new turn for that actor either.
-      finding.code.startsWith("CANONICAL_TURN_"),
+      finding.code.startsWith("CANONICAL_TURN_") ||
+      // The CRITICAL that used to end the process. It is admitted here only because
+      // `OPERATOR_METHOD.BINDING_RECOVER_DEAD` exists to clear it: this entry and that method
+      // are one change and must not be separated. Alone, this line is the bypass — a daemon
+      // parking on a finding no reachable command can answer, waiting forever behind a held
+      // lock. Alone, that method is unreachable, because the door serving it only opens for a
+      // park this line has to permit.
+      //
+      // Parking is not admission. The daemon holds its lock, serves `BOOTSTRAP_OPERATOR_METHODS`
+      // and nothing else, runs no dispatch, no delivery timer and no continuity coordinator, and
+      // `parkForBootstrap` promotes only after the doctor itself stops blocking. A project that
+      // still owns live runs is refused by `BindingRegistry.revoke` and goes on blocking here,
+      // which is the property this must not cost.
+      finding.code === "CTO_BINDING_POINTS_AT_DEAD_SESSION",
   );
 
 /**
@@ -680,6 +713,17 @@ export class Daemon {
         case OPERATOR_METHOD.OWNER_APPROVE_CLAIM_CANONICAL_CTO:
           return this.executeApproveCanonicalCtoClaim(request, peer);
 
+        case OPERATOR_METHOD.BINDING_RECOVER_DEAD: {
+          const recovered = this.executeDeadBindingRecovery(request, peer);
+          // Only a release that actually happened can change the doctor's mind, so a refused
+          // recovery must not consume the park's wake-up — the same rule the capacity and
+          // adjudication doors follow, for the same reason: an operator who applied the remedy
+          // should not then watch `daemon.status` report the stale finding for a recheck
+          // interval, and one who was refused should not see the daemon act as though they had.
+          if (recovered.allowed && this.#mode === "BOOTSTRAP") this.wakeBootstrap("OBSERVED");
+          return recovered;
+        }
+
         case OPERATOR_METHOD.REPAIR_LIST:
           return allow(ReasonCode.OK, this.cp.repair.catalog());
 
@@ -971,6 +1015,55 @@ export class Daemon {
       approved,
     };
     return this.admitCliOwnerApproval(peer.actor, approval, nonce.value);
+  }
+
+  /**
+   * Releases a canonical PRIMARY_CTO binding whose session's process is provably gone.
+   *
+   * This method admits its own owner-approval envelope rather than loading one an earlier call
+   * left behind, and that is a deliberate departure from `actor.claimCanonicalCto`, which reads
+   * a decision `owner.approveClaimCanonicalCto` minted beforehand
+   * (`canonical-self-claim-operator.ts`'s `loadAdmittedOwnerApproval`). The separation works
+   * there because both calls happen while the daemon is up. It cannot work here: the state this
+   * recovers is one in which `start()` has already refused, and `OWNER_APPROVE` and
+   * `OWNER_APPROVE_CLAIM_CANONICAL_CTO` are both outside `BOOTSTRAP_OPERATOR_METHODS`, so no
+   * approval can be minted while parked and in a real outage none was minted before. Requiring a
+   * pre-existing approval would make the remedy unreachable in exactly the state that needs it —
+   * the defect this whole change removes, reintroduced one layer down.
+   *
+   * Nothing about the verification is weakened to buy that. `admitCliOwnerApproval` is the same
+   * function `owner.approve` and `owner.approveClaimCanonicalCto` call: the same `IngressGuard`,
+   * the same CLI owner allowlist drawn from `cp.config.ownerIdentities`, the same nonce replay
+   * record, and the same `ownerApprovalPayload` envelope digest. The receipt it returns is then
+   * put through `OwnerAuthority.consumeApproval`, which re-runs `assertApproval` against the
+   * durable `inbound_messages` row and the `INGRESS_ADMITTED` audit event before spending it
+   * exactly once. What changes is *when* the envelope is admitted, not *what makes it valid*,
+   * and the admission happens inside the recovery's own transaction so a refusal spends nothing.
+   *
+   * The peer is still the socket's authenticated identity, never a request field:
+   * `peer.actor` comes from the bearer credential the listener bound, and an actor this
+   * deployment has not allowlisted as a CLI owner is refused by the guard before any state is
+   * read.
+   */
+  private executeDeadBindingRecovery(
+    request: OperatorRequest,
+    peer: AuthenticatedOperatorPeer,
+  ): Decision<DeadBindingRecoveryReceipt> {
+    const parsed = parseDeadBindingRecoveryRequest(request.params);
+    if (!parsed.allowed) return parsed;
+    return recoverDeadCanonicalBinding(peer.actor, parsed.value, {
+      db: this.cp.db,
+      audit: this.cp.audit,
+      sessions: this.cp.sessions,
+      bindings: this.cp.bindings,
+      ownerAuthority: this.cp.ownerAuthority,
+      admitOwnerApproval: (actor, approval, nonce) =>
+        this.admitCliOwnerApproval(actor, approval, nonce),
+      // No liveness seam is threaded through here on purpose. The probe's own injection points
+      // exist so `probeSessionLiveness` can be exercised for the codes a test cannot provoke
+      // (EPERM in particular); the daemon path takes the real syscall, so a test that drives
+      // this method is measuring the same question production asks.
+    });
   }
 
   private executeRepair(

@@ -45,6 +45,13 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl actor unregister <id> <generation> <expected-set-generation> <reason>
   agentctl telegram reply acknowledge <nonce> <reason-code> <evidence-digest>
                                            record that a terminal reply was reviewed and will not retry
+  agentctl binding recover-dead <projectId> <sessionId> <incarnation> <generation> <nonce>
+                                           release a PRIMARY_CTO binding whose session's OS process
+                                           this host can prove is gone. Refuses a live session and
+                                           refuses one whose liveness cannot be established. Mints
+                                           no session and no generation; the role is simply left
+                                           unbound. Reachable while agentcpd is parked, which is
+                                           the state this exists for.
   agentctl conversation contradictions     turns whose records disagree, with the ids to cite
   agentctl conversation adjudicate <actor> <turn> <reason-code> <evidence-digest> <id>...
   agentctl conversation unresolved         turns waiting on a person, with what each already holds
@@ -409,6 +416,28 @@ export const dispatch = async (
       return call("capacity.observe", { provider, payload: parsed });
     }
     return fail(`unknown capacity subcommand: ${args[0] ?? ""}`);
+  }
+
+  if (command === "binding") {
+    const [sub, projectId, sessionId, sessionIncarnation, generation, nonce] = args;
+    if (sub === "recover-dead") {
+      return call("binding.recoverDead", {
+        projectId: required(projectId, "projectId"),
+        // Fixed, not taken from the command line. This door recovers the canonical CTO binding
+        // and refuses any other role, so offering a role argument would only invite a request
+        // the daemon is going to refuse.
+        role: "PRIMARY_CTO",
+        sessionId: required(sessionId, "sessionId"),
+        sessionIncarnation: required(sessionIncarnation, "sessionIncarnation"),
+        expectedBindingGeneration: requiredInteger(generation, "expectedBindingGeneration", 1),
+        nonce: required(nonce, "nonce"),
+        // Reaching this command *is* the owner's approval, and the daemon verifies that the actor
+        // behind this connection is an allowlisted owner before it acts. There is deliberately no
+        // `--approved=false` spelling: a rejection is expressed by not running the command.
+        approved: true,
+      });
+    }
+    return fail(`unknown binding subcommand: ${sub ?? ""}`);
   }
 
   if (command === "project") {

@@ -22,6 +22,15 @@ export interface SessionRecord {
   /** §27.2 — the authenticated Buzz channel identity identity this session speaks as, if bound. */
   buzzActorId: string | null;
   osPid: number | null;
+  /**
+   * The start time recorded for `osPid` when it was written, or null where it could not be
+   * established (#505). Exposed because a pid alone cannot answer "is *this* process still
+   * running": pids are reused, so only the `(pid, startedAt)` pair distinguishes the process
+   * this session names from an unrelated one that inherited its number. A reader that has to
+   * *prove* a session dead — rather than merely observe that some process answers — needs both
+   * halves, and `create()` already stores them as one immutable pair for exactly that reason.
+   */
+  osProcessStartedAt: string | null;
   workdir: string | null;
   createdAt: string;
   updatedAt: string;
@@ -406,6 +415,7 @@ interface RawSession {
   buzz_address: string | null;
   buzz_actor_id: string | null;
   os_pid: number | null;
+  os_process_started_at: string | null;
   workdir: string | null;
   created_at: string;
   updated_at: string;
@@ -422,6 +432,7 @@ const hydrate = (row: RawSession): SessionRecord => ({
   buzzAddress: row.buzz_address,
   buzzActorId: row.buzz_actor_id,
   osPid: row.os_pid,
+  osProcessStartedAt: row.os_process_started_at,
   workdir: row.workdir,
   createdAt: row.created_at,
   updatedAt: row.updated_at,
