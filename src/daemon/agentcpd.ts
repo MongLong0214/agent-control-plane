@@ -2513,6 +2513,36 @@ export interface AgentcpdMainContext {
  * single-instance lock, restart reconciliation, the watchdog timer and Buzz delivery.
  */
 export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => {
+  // Classify the complete environment-only group before reading config or acquiring resources.
+  // Blank values are absent; nonblank values are retained exactly for the claim boundary.
+  const CANONICAL_ACTIVATION_VARS = [
+    "ACP_CANONICAL_SESSION_UUID",
+    "ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION",
+    "ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH",
+    "ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256",
+    "ACP_CANONICAL_CTO_BUZZ_ACTOR_ID",
+    "ACP_CANONICAL_CTO_WORKDIR",
+    "ACP_CANONICAL_CTO_PEER_PROTOCOL",
+    "ACP_CANONICAL_CTO_BUZZ_PURPOSE",
+  ] as const;
+  const canonicalActivationValues = Object.fromEntries(
+    CANONICAL_ACTIVATION_VARS.map((name) => [name, process.env[name] ?? ""]),
+  ) as Record<(typeof CANONICAL_ACTIVATION_VARS)[number], string>;
+  const missingCanonicalActivation = CANONICAL_ACTIVATION_VARS.filter(
+    (name) => canonicalActivationValues[name].trim() === "",
+  );
+  const canonicalActivationPresentCount = CANONICAL_ACTIVATION_VARS.length - missingCanonicalActivation.length;
+  if (canonicalActivationPresentCount > 0 && missingCanonicalActivation.length > 0) {
+    throw new Error(
+      `canonical self-claim activation is partially configured; missing: ${missingCanonicalActivation.join(", ")}`,
+    );
+  }
+  // The existing shared transport channel does not activate canonical self-claim by itself.
+  const canonicalBuzzChannelId = process.env["ACP_BUZZ_CHANNEL"]?.trim() ?? "";
+  if (canonicalActivationPresentCount > 0 && !canonicalBuzzChannelId) {
+    throw new Error("ACP_BUZZ_CHANNEL is required once canonical self-claim activation is fully configured");
+  }
+
   const config = options.config ?? defaultConfig();
   const stateDir = dirname(config.databasePath);
   const buzzActorIngressPolicy = configuredBuzzActorIngressPolicy();
@@ -2538,13 +2568,6 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   if (!operatorActor) {
     throw new Error("ACP_OPERATOR_ACTOR or USER is required to establish the operator peer identity");
   }
-  // Canonical self-claim activation (#760) is deliberately *not* validated here, ahead of
-  // `ControlPlane`, migration refusal, signal handlers, or `daemon.start()`: a deployment carrying
-  // only the pre-existing MCP/operator configuration (no canonical env vars at all, which is every
-  // deployment until an operator opts in) must still reach a running daemon rather than exit
-  // before any of that can run — a restart on such a host must not become stop-with-no-start. The
-  // activation group is evaluated below, at the one place it actually gates something: immediately
-  // before the dedicated listener it controls would open.
   const telegramConfig = configuredTelegramLongPollConfig(config.ownerIdentities ?? []);
   const cp = new ControlPlane(config);
 
@@ -2701,23 +2724,6 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         bootstrapHermes: (params) => hermesBootstrap!.bootstrap(params),
       },
     );
-    // The canonical self-claim activation group (#760) is exactly these four variables.
-    // `ACP_BUZZ_CHANNEL` is a pre-existing, shared transport setting used elsewhere in this same
-    // `main()` (the general Buzz CLI transport above) and must not, by itself, activate this
-    // listener — it is required only once all four of these are already present, below.
-    const CANONICAL_ACTIVATION_VARS = [
-      "ACP_CANONICAL_SESSION_UUID",
-      "ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION",
-      "ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH",
-      "ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256",
-    ] as const;
-    const canonicalActivationValues = Object.fromEntries(
-      CANONICAL_ACTIVATION_VARS.map((name) => [name, process.env[name]?.trim() || ""]),
-    ) as Record<(typeof CANONICAL_ACTIVATION_VARS)[number], string>;
-    const canonicalActivationPresentCount = CANONICAL_ACTIVATION_VARS.filter(
-      (name) => canonicalActivationValues[name] !== "",
-    ).length;
-
     if (canonicalActivationPresentCount === 0) {
       // Disabled: no partial credential surface is exposed, no socket is bound, and normal
       // startup continues exactly as it would for a deployment that has never heard of this
@@ -2726,20 +2732,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       process.stdout.write(
         `canonical self-claim disabled: none of ${CANONICAL_ACTIVATION_VARS.join(", ")} is set\n`,
       );
-    } else if (canonicalActivationPresentCount < CANONICAL_ACTIVATION_VARS.length) {
-      // Partial configuration fails closed right here, at the boundary it actually gates — never
-      // globally at daemon entry, and never by silently disabling instead of refusing: a
-      // deployment that set some but not all of these meant to activate this feature and got it
-      // wrong, which is a configuration error to report, not a feature to quietly skip.
-      const missing = CANONICAL_ACTIVATION_VARS.filter((name) => canonicalActivationValues[name] === "");
-      throw new Error(`canonical self-claim activation is partially configured; missing: ${missing.join(", ")}`);
     } else {
-      const canonicalBuzzChannelId = process.env["ACP_BUZZ_CHANNEL"]?.trim();
-      if (!canonicalBuzzChannelId) {
-        throw new Error(
-          "ACP_BUZZ_CHANNEL is required once canonical self-claim activation is fully configured",
-        );
-      }
       const canonicalSessionUuid = canonicalActivationValues["ACP_CANONICAL_SESSION_UUID"];
       const canonicalRequiredExecutorVersion = canonicalActivationValues["ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION"];
       const canonicalExpectedExecutorRealpath =
@@ -2750,10 +2743,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       // against `ACP_OPERATOR_TOKEN`; its only authority is the kernel's own record of who opened
       // this socket, checked by `startCanonicalSelfClaimListener` itself before this handler is
       // ever called.
+      const canonicalCtoBuzzActorId = canonicalActivationValues["ACP_CANONICAL_CTO_BUZZ_ACTOR_ID"];
       canonicalSelfClaim = await startCanonicalSelfClaimListener(daemon, stateDir, (peer, params) => {
-        // Every deployment fact the claiming request could otherwise supply is fixed here, at
-        // composition time, and never read from the request body.
-        const canonicalCtoBuzzActorId = process.env["ACP_CANONICAL_CTO_BUZZ_ACTOR_ID"] ?? "buzz:canonical-cto";
+        // Deployment facts are the entry-time snapshot, never request or callback-time values.
         return executeCanonicalSelfClaimOperator(peer, params, {
           db: cp.db,
           clock: cp.clock,
@@ -2771,15 +2763,15 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
             canonicalSessionUuid,
             requiredExecutorVersion: canonicalRequiredExecutorVersion,
             canonicalBuzzChannelId,
-            expectedCwd: process.env["ACP_CANONICAL_CTO_WORKDIR"] ?? process.cwd(),
-            expectedPeerProtocolVersion: process.env["ACP_CANONICAL_CTO_PEER_PROTOCOL"] ?? "acp.operator/v1",
+            expectedCwd: canonicalActivationValues["ACP_CANONICAL_CTO_WORKDIR"],
+            expectedPeerProtocolVersion: canonicalActivationValues["ACP_CANONICAL_CTO_PEER_PROTOCOL"],
             // Matches the listener's own derivation exactly: both read this daemon's effective
             // uid, never a value either side is told by the other.
             expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
-            peerProtocolVersion: process.env["ACP_CANONICAL_CTO_PEER_PROTOCOL"] ?? "acp.operator/v1",
+            peerProtocolVersion: canonicalActivationValues["ACP_CANONICAL_CTO_PEER_PROTOCOL"],
             buzzChannelId: canonicalBuzzChannelId,
             buzzActorId: canonicalCtoBuzzActorId,
-            buzzPurpose: process.env["ACP_CANONICAL_CTO_BUZZ_PURPOSE"] ?? "continuity:PRIMARY_CTO",
+            buzzPurpose: canonicalActivationValues["ACP_CANONICAL_CTO_BUZZ_PURPOSE"],
             expectedExecutorRealpath: canonicalExpectedExecutorRealpath,
             expectedExecutorSha256: canonicalExpectedExecutorSha256,
           },
