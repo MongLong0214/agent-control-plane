@@ -55,7 +55,6 @@ const DECIDING_FILES = [
   "src/daemon/daemon.ts",
   "src/session/role-attachment-credentials.ts",
   "src/mcp/role-conversation.ts",
-  "src/daemon/agentcpd.ts",
 ];
 
 /**

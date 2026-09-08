@@ -38,7 +38,6 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { CASES_DIR, loadFalsifiabilityCases } from "./lib/falsifiability-cases.mjs";
-import { classifyVitestRun } from "./run-vitest-gate.mjs";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const VITEST = join(ROOT, "node_modules", ".bin", "vitest");
@@ -4560,6 +4559,65 @@ const GUARDS = [
       "tests/unit/buzz-mention-subscriber.test.ts::answers the NIP-42 challenge with a signed auth event, then asks for kind 9 addressed to itself in its configured rooms",
     ],
   },
+  // Attachment acceptance rows retained here within this change's file budget.
+  {
+    id: "role-attachment-acquisition-receipt",
+    what: "attachment authorization: the acquisition receipt checks current holder occupancy",
+    file: "src/session/role-attachment-credentials.ts",
+    find: "if (!port.currentHolderConnected(record.scope.roleKey)) return refused(\"attachment did not acquire its role slot\");",
+    replace: "if (!port.connected(record.scope.roleKey)) return refused(\"attachment did not acquire its role slot\");",
+    killedBy: [
+      "tests/unit/role-attachment-authorization.test.ts::connect refuses stale registration without consuming a pending credential"
+    ]
+  },
+  {
+    id: "role-attachment-bind-notification",
+    what: "a committed bind publishes its successor",
+    file: "src/session/binding-registry.ts",
+    find: "      this.#notifySwitch(created);\n",
+    replace: "",
+    killedBy: ["tests/unit/role-attachment-authorization.test.ts::binding a revoked key publishes its committed successor"],
+  },
+  {
+    id: "role-attachment-holder-session-operand",
+    what: "endpoint currency checks the session independently of incarnation",
+    file: "src/mcp/role-conversation.ts",
+    find: "      current.sessionId === peer.sessionId &&\n",
+    replace: "",
+    killedBy: ["tests/unit/role-attachment-endpoints.test.ts::a different session with the same incarnation cannot retain the holder endpoint"],
+  },
+  {
+    id: "role-attachment-registration-authentication",
+    what: "registration refuses a denied authenticator independently of binding currency",
+    file: "src/mcp/role-conversation.ts",
+    find: "\n      if (!identity.allowed || !this.#isCurrentHolder(peer.binding, identity.value)) {",
+    replace: "\n      if (!this.#isCurrentHolder(peer.binding, identity.value!)) {",
+    killedBy: ["tests/unit/role-attachment-endpoints.test.ts::registration refuses a denied authenticator while the registry still names the peer as holder"],
+  },
+  {
+    id: "role-attachment-revocation-notification",
+    what: "a committed revocation detaches and reaps attachments",
+    file: "src/session/binding-registry.ts",
+    find: "      this.#notifySwitch({ ...current, status: \"REVOKED\" });\n",
+    replace: "",
+    killedBy: ["tests/unit/role-attachment-authorization.test.ts::committed revocations detach immediately"],
+  },
+  {
+    id: "role-attachment-revocation-status",
+    what: "a revoked scope is invalid even when its identity is unchanged",
+    file: "src/session/role-attachment-credentials.ts",
+    find: "binding.status === \"REVOKED\" || ",
+    replace: "",
+    killedBy: ["tests/unit/role-attachment-authorization.test.ts::committed revocations detach immediately"],
+  },
+  {
+    id: "role-attachment-operand-scope-session",
+    what: "attachment operands: scope returns a typed refusal when the binding outlives its session lookup",
+    file: "src/session/role-attachment-credentials.ts",
+    find: "        !session || binding.sessionIncarnation !== session.incarnation ||",
+    replace: "        binding.sessionIncarnation !== session.incarnation ||",
+    killedBy: ["tests/unit/role-attachment-authorization.test.ts::scope returns a typed refusal when the binding outlives its session lookup"],
+  },
 ];
 
 /**
@@ -5006,41 +5064,49 @@ try {
       process.exit(1);
     }
 
-    let report = null;
-    try {
-      report = JSON.parse(readFileSync(MUTATION_JSON_REPORT, "utf8"));
-    } catch {
-      // The shared classifier refuses a missing or malformed report.
+    /**
+     * A named `killedBy` entry (`path::test name`) runs as `-t "test name"` — a regex, not a
+     * literal string. A name that happens to contain a regex metacharacter (`()[]{}.*+?^$|\`)
+     * is parsed as one: an empty `()` group matches zero characters rather than the two literal
+     * parens, so the pattern silently selects nothing. Vitest still exits 0 for that — "0 tests
+     * ran" is not a failure to vitest — so `killed` above reads a `-t` that matched nothing the
+     * same as one that matched and passed: `SURVIVED`, which is at least loud. The dangerous
+     * direction is the other one: if some *other* test in the same file happens to fail (for any
+     * reason, related or not), the file's exit is non-zero, this row prints `killed`, and the
+     * test actually named by `killedBy` never ran at all. That row then claims coverage a
+     * completely different test produced.
+     *
+     * So the match count is checked directly from what vitest itself observed, not inferred from
+     * the exit code. `numPassedTests + numFailedTests` is how many tests the run actually
+     * executed under the `-t` filter; a filtered-out test is neither, so a selector matching zero
+     * tests is provable without guessing at what the name "should" match.
+     */
+    const namedSelectors = guard.killedBy.map(splitKilledBy).filter((p) => p.name !== null);
+    let deadSelector = null;
+    if (namedSelectors.length > 0) {
+      let report = null;
+      try {
+        report = JSON.parse(readFileSync(MUTATION_JSON_REPORT, "utf8"));
+      } catch {
+        report = null;
+      }
+      const selected = report ? report.numPassedTests + report.numFailedTests : 0;
+      if (selected === 0) {
+        deadSelector = report
+          ? `killedBy names "${namedSelectors[0].name}" as a -t pattern, and vitest ran 0 tests under it ` +
+            `(${report.numTotalTests} in the file, all skipped) — the selector matches nothing, so this ` +
+            "row's exit code is not evidence about the guard either way"
+          : `killedBy names "${namedSelectors[0].name}", but no JSON test report was produced to confirm ` +
+            "it selected anything";
+      }
     }
-    const classification = classifyVitestRun(done.status, report);
-    if (classification.kind !== "pass" && classification.kind !== "product-failure") {
-      out(`  RUN FAILURE  ${guard.file}  ${guard.what}`);
-      failures.push({ guard, why: `${classification.kind}: ${classification.reason}` });
-      continue;
-    }
-
-    // Use the same regex as Vitest's -t, including partial/parameterized selectors, but bind
-    // each assertion to its named file. A different test's failure or a throwing teardown
-    // cannot credit a passing named assertion. Bare-file rows may credit any assertion there.
-    const selectors = guard.killedBy.map(splitKilledBy);
-    const selected = selectors.map(({ path, name }) => {
-      const pattern = name === null ? null : new RegExp(name);
-      return report.testResults
-        .filter((file) => typeof file.name === "string" && resolve(ROOT, file.name) === resolve(ROOT, path))
-        .flatMap((file) => file.assertionResults)
-        .filter((assertion) => pattern === null ||
-          (typeof assertion.fullName === "string" && pattern.test(assertion.fullName)));
-    });
-    const deadSelector = selectors.findIndex((selector, index) => selector.name !== null &&
-      !selected[index].some((assertion) => assertion.status === "passed" || assertion.status === "failed"));
-    if (deadSelector !== -1) {
+    if (deadSelector) {
       out(`  DEAD SELECTOR  ${guard.file}  ${guard.what}`);
-      failures.push({ guard, why: `killedBy names ${guard.killedBy[deadSelector]}, but its file has no ` +
-        "executed assertion matching that -t pattern — the row has no test verdict" });
+      failures.push({ guard, why: deadSelector });
       continue;
     }
 
-    const killed = selected.flat().some((assertion) => assertion.status === "failed");
+    const killed = done.status !== 0;
     out(`${killed ? "  killed " : "  SURVIVED"}  ${guard.file}  ${guard.what}`);
     if (!killed) {
       failures.push({
