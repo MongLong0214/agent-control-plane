@@ -133,7 +133,7 @@ export class RoleAttachmentCredentials {
     const attachmentId = credential.attachmentId;
     const record = this.#records.get(attachmentId)!;
     if (record.attached) return refused("attachment credential has already admitted a connection");
-    if (port.role !== Role.PRIMARY_CTO || port.connected(record.scope.roleKey)) {
+    if (port.role !== Role.PRIMARY_CTO || port.currentHolderConnected(record.scope.roleKey)) {
       return deny(ReasonCode.CONFLICT, "attachment requires an empty role slot");
     }
     // Admission already proved the secret. Retain only the ID and hash/scope record in callbacks.

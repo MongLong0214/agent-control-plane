@@ -330,7 +330,7 @@ export class RoleConversationPort {
     for (const binding of this.#bindings.currentCandidates()) {
       if (!this.#isCurrentHolder(binding, peer)) continue;
       if (scopeRoleKey !== undefined && binding.roleKey !== scopeRoleKey) continue;
-      if (this.connected(binding.roleKey)) continue;
+      if (this.currentHolderConnected(binding.roleKey)) continue;
       this.#live.set(binding.roleKey, { server, authenticate, binding, endpoint: null });
       owned.push(binding.roleKey);
     }
@@ -344,6 +344,11 @@ export class RoleConversationPort {
   }
 
   connected(roleKey: string): boolean {
+    return this.#live.has(roleKey);
+  }
+
+  /** Admission revalidates occupancy; connected() remains a snapshot of the stored slot. */
+  currentHolderConnected(roleKey: string): boolean {
     const peer = this.#live.get(roleKey);
     return peer !== undefined && this.#holderFor(peer.server, roleKey).allowed;
   }
