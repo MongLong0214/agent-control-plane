@@ -32,12 +32,14 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
+import { RECORD_TRAILER_KEY_PATTERN } from "./lib/record-trailer-keys.mjs";
+
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const git = (args, input) =>
   execFileSync("git", args, { cwd: ROOT, encoding: "utf8", ...(input === undefined ? {} : { input }) });
 
 /** Trailer keys this project records. A wrapped line under any of them loses the record. */
-const KEYS = /^(Limit|Ruled-out|Warn|Supersedes|Refs|Record-Id):/;
+const KEYS = RECORD_TRAILER_KEY_PATTERN;
 
 /**
  * What the message claims, against what git will actually store.

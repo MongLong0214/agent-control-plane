@@ -17,6 +17,7 @@ import {
   approveReviewedCandidateForFinalization,
   type Harness,
   driveToReviewedCandidate,
+  fixtureManifest,
   installDaemonFinalizerGitHubFixture,
   makeHarness,
   ownerDecisionReceipt,
@@ -82,10 +83,20 @@ const reflectMergedBase = (github: FakeGitHub): void => {
   };
 };
 
+/**
+ * The pinned profile with only the merge strategy moved, derived from the fixture default rather
+ * than restated: a second copy of the profile would let the two drift and still read as pinned.
+ */
+const branchProfileWith = (mergeStrategy: "merge_commit" | "squash") => ({
+  ...fixtureManifest("strategy-probe").branchProfile,
+  mergeStrategy,
+});
+
 const setup = async (options: {
   declareChecks?: boolean;
   humanGate?: readonly string[];
   allowUnsatisfiedHumanGate?: boolean;
+  mergeStrategy?: "merge_commit" | "squash";
 } = {}): Promise<Fixture> => {
   const github = new FakeGitHub();
   reflectMergedBase(github);
@@ -95,7 +106,10 @@ const setup = async (options: {
   const driven = await driveToReviewedCandidate(harness, {
     workBranch: "feature/F1-thing",
     humanGate: options.humanGate,
-    manifestOverrides: options.declareChecks === false ? {} : { ciWorkflows: CI_WORKFLOWS },
+    manifestOverrides: {
+      ...(options.declareChecks === false ? {} : { ciWorkflows: CI_WORKFLOWS }),
+      ...(options.mergeStrategy ? { branchProfile: branchProfileWith(options.mergeStrategy) } : {}),
+    },
   });
 
   github.setBranch("dev", driven.baseHead);
@@ -320,13 +334,17 @@ const mergeForReal = async (fixture: Fixture) => {
   return merged.value.mergeCommitSha;
 };
 
-const mergeInput = (fixture: Fixture, pullNumber: number) => ({
+const mergeInput = (
+  fixture: Fixture,
+  pullNumber: number,
+  mergeStrategy: "merge_commit" | "squash" = "merge_commit",
+) => ({
   runId: fixture.runId,
   repositoryIdentity: fixture.identity,
   pullNumber,
   exactHeadSha: fixture.head,
   expectedBaseSha: fixture.base,
-  mergeStrategy: "merge_commit" as const,
+  mergeStrategy,
   ownerSessionId: fixture.caller.ownerSessionId,
   ownerBindingGeneration: fixture.caller.ownerBindingGeneration,
 });
@@ -1304,5 +1322,94 @@ describe("round-2 review: post-merge coverage and receipts", () => {
     expect(refused.allowed).toBe(false);
     const receipts = fixture.harness.cp.github.receipts(fixture.runId);
     expect(receipts.some((r) => r.operation === "merge_execute")).toBe(false);
+  });
+});
+
+/**
+ * What the daemon actually puts on the wire when it squashes.
+ *
+ * A composer that is correct and not wired to the request is the failure this whole effort is
+ * about: one side prepared, the other side never traversing it. So these read the recorded PUT
+ * body rather than the composer's return value.
+ */
+describe("the outgoing squash message is stated by the daemon, not composed by GitHub", () => {
+  const SESSION_URL = "https://claude.ai/code/session_0000000000000000000000";
+
+  /** The branch's commit messages, in the two shapes that reach `main` today. */
+  const BRANCH_COMMITS = [
+    {
+      message:
+        "feat: the first change\n\n" +
+        "why the first change was made.\n\n" +
+        "Limit: the first commit's record\n" +
+        "Record-Id: r-111111111111\n" +
+        `X-Claude-Session: ${SESSION_URL}\n`,
+    },
+    {
+      message:
+        "docs: the second change\n\n" +
+        "The capture flow could not run, so the context is in this prose.\n" +
+        `Claude-Session: ${SESSION_URL}\n`,
+    },
+  ];
+
+  const mergedPutBody = async (): Promise<{ sha: string; merge_method: string; commit_message?: string }> => {
+    const fixture = await setup({ mergeStrategy: "squash" });
+    const pullNumber = await openPullWithGate(fixture);
+    fixture.github.setPullCommits(pullNumber, BRANCH_COMMITS);
+
+    const merged = await fixture.harness.cp.github.mergeExecute(
+      mergeInput(fixture, pullNumber, "squash"),
+    );
+    if (!merged.allowed) throw new Error(`${merged.reasonCode}: ${merged.message}`);
+
+    const put = fixture.github.calls.filter(
+      (call) => call.method === "PUT" && /\/pulls\/\d+\/merge$/.test(call.path),
+    );
+    expect(put).toHaveLength(1);
+    return put[0]!.body as { sha: string; merge_method: string; commit_message?: string };
+  };
+
+  it("sends a commit_message rather than leaving the composition to COMMIT_MESSAGES", async () => {
+    const body = await mergedPutBody();
+    // The whole defect in one assertion: today the body is `{ sha, merge_method }`, so GitHub
+    // composes the message from the branch's commits and whatever they say lands in `main`.
+    expect(typeof body.commit_message).toBe("string");
+    expect(body.merge_method).toBe("squash");
+  });
+
+  it("publishes no session metadata, in trailer form or in prose form", async () => {
+    const body = await mergedPutBody();
+    expect(body.commit_message).not.toContain("session_0000000000000000000000");
+    expect(body.commit_message).not.toContain("X-Claude-Session");
+    expect(body.commit_message).not.toContain("Claude-Session");
+  });
+
+  it("still carries every record line the branch wrote", async () => {
+    const body = await mergedPutBody();
+    // The other direction, with equal force. Composing our own message is exactly how 129 of 132
+    // record lines were lost once already.
+    expect(body.commit_message).toContain("Limit: the first commit's record");
+    expect(body.commit_message).toContain("Record-Id: r-111111111111");
+    expect(body.commit_message).toContain("The capture flow could not run");
+  });
+
+  it("leaves a merge_commit strategy's request body exactly as it was", async () => {
+    // Scope, stated where it can fail. A merge commit's message is not composed from the branch's
+    // commit messages, and the branch's commits survive it individually, so supplying one there
+    // would add content GitHub never wrote and remove nothing.
+    const fixture = await setup();
+    const pullNumber = await openPullWithGate(fixture);
+    // The branch is given commits deliberately: a merge_commit that composed a message would then
+    // succeed and be caught by the key set below, rather than throwing on an unreadable branch and
+    // being "killed" by an error that says nothing about scope.
+    fixture.github.setPullCommits(pullNumber, BRANCH_COMMITS);
+    const merged = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(merged.allowed).toBe(true);
+
+    const put = fixture.github.calls.find(
+      (call) => call.method === "PUT" && /\/pulls\/\d+\/merge$/.test(call.path),
+    );
+    expect(Object.keys(put!.body as object).sort()).toEqual(["merge_method", "sha"]);
   });
 });
