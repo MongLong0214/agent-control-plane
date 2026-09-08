@@ -4,7 +4,8 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { OwnerApprovalReceipt } from "../../src/ceo/owner-authority.ts";
 import type { Decision } from "../../src/core/errors.ts";
@@ -156,6 +157,32 @@ describe("role attachment over real daemon sockets", () => {
     expect((await (await open(await grant())).register()).ok).toBe(true);
   });
 
+  it("a close before MCP installs onclose permanently spends the attachment", async () => {
+    const credential = await grant();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    // Hold the SDK boundary before it installs transport.onclose. Only the raw socket
+    // listener can invalidate this admission; no initialize request or MCP close runs.
+    const connecting = vi.spyOn(McpServer.prototype, "connect").mockImplementationOnce(async (transport) => {
+      await transport.start();
+      await held;
+    });
+    try {
+      const socket = createConnection(listeners.socketPaths[1]!);
+      sockets.push(socket);
+      await new Promise<void>((resolve, reject) => { socket.once("connect", resolve); socket.once("error", reject); });
+      socket.write(`${JSON.stringify({ token, ...credential })}\n`);
+      await expect.poll(() => connecting.mock.calls.length).toBe(1);
+      expect(listeners.ctoConversation.connected(roleKey)).toBe(true);
+      socket.destroy();
+      await expect.poll(() => listeners.ctoConversation.connected(roleKey)).toBe(false);
+      expect(daemon.attachments.authorize(credential).allowed).toBe(false);
+    } finally {
+      release();
+      connecting.mockRestore();
+    }
+  });
+
   it("an occupied ordinary connection is preserved when attachment admission is refused", async () => {
     const incumbent = await open(subject);
     expect((await incumbent.register()).ok).toBe(true);
@@ -168,6 +195,8 @@ describe("role attachment over real daemon sockets", () => {
   });
 
   it("generation changes refuse registration on an already open attachment", async () => {
+    // This measures revalidation at registration, not eager cleanup on transfer. Successor
+    // admission without an intervening registration is covered by the authorization tests.
     const peer = await open(await grant());
     expect((await peer.register()).ok).toBe(true);
     valueOf(h.cp.bindings.switchTo({ role: Role.PRIMARY_CTO, projectId: "attachment-project",

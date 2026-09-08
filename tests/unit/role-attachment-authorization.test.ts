@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { type Decision, allow } from "../../src/core/errors.ts";
 import type { AttachmentCredential } from "../../src/session/role-attachment-credentials.ts";
@@ -154,6 +154,17 @@ describe("role attachment authorization without sockets", () => {
     expect(issue(receipt).allowed).toBe(false);
   });
 
+  it("unknown approval fields cannot create a second consumption", () => {
+    const receipt = approval();
+    expect(h.cp.ownerAuthority.assertApproval(receipt).allowed).toBe(true);
+    expect(issue(receipt).allowed).toBe(true);
+    const extendedReceipt = { ...receipt, ignored: "x" };
+    const retry = issue(extendedReceipt);
+    expect({ allowed: retry.allowed, consumptions: h.cp.db.all(
+      "SELECT * FROM audit_events WHERE kind = 'OWNER_APPROVAL_CONSUMED'",
+    ).length }).toEqual({ allowed: false, consumptions: 1 });
+  });
+
   it("operator retries never re-serve a plaintext attachment credential", async () => {
     const input = { requestId: randomUUID(), idempotencyKey: randomUUID(), method: "roleAttachment.issue",
       params: { ...subject, roleKey, approval: approval() } };
@@ -195,12 +206,67 @@ describe("role attachment authorization without sockets", () => {
     expect(daemon.attachments.connect(server(), port, credential).allowed).toBe(false);
   });
 
-  it("a same-generation transfer invalidates the former authenticated holder", () => {
+  const expectSuccessorAcquires = (route: "port" | "credential") => {
+    const former = subject;
     const credential = grant();
-    const generation = h.cp.bindings.active(roleKey)!.bindingGeneration;
-    advance("SURVIVED");
-    expect(h.cp.bindings.active(roleKey)!.bindingGeneration).toBe(generation);
+    const binding = h.cp.bindings.active(roleKey)!;
+    const incumbent = server();
+    valueOf(daemon.attachments.connect(incumbent, port, credential));
+    subject = advance("SURVIVED");
+    const successorCredential = grant();
+    const successor = server();
+    // No authorization, connected(), endpoint registration or detach of A between transfer
+    // and B's attach. The admission path must discover and clear the stale incumbent itself.
+    let detachSuccessor: () => void;
+    if (route === "port") {
+      detachSuccessor = port.attach(successor, () => daemon.attachments.authorize(successorCredential), roleKey);
+    } else {
+      const connected = daemon.attachments.connect(successor, port, successorCredential);
+      expect(connected.allowed).toBe(true);
+      detachSuccessor = valueOf(connected);
+    }
+    // The port has no ledger: reaching that refusal proves B owns the receiving server slot.
+    expect(port.claimOwnerMessage(successor, roleKey).reasonCode).toBe(ReasonCode.ROLE_PEER_UNSUPPORTED);
+    detachSuccessor();
+    expect(port.connected(roleKey)).toBe(false);
+    valueOf(h.cp.bindings.switchTo({ role: Role.PRIMARY_CTO, projectId: "attachment-project",
+      ...former, conversation: "SURVIVED", reason: "return to former holder" }));
+    expect(h.cp.bindings.active(roleKey)).toMatchObject({
+      assignmentId: binding.assignmentId, bindingGeneration: binding.bindingGeneration,
+    });
     expect(daemon.attachments.authorize(credential).allowed).toBe(false);
+  };
+
+  it("a same-generation successor acquires the slot via port", () => expectSuccessorAcquires("port"));
+  it("a same-generation successor acquires the slot via credential", () => expectSuccessorAcquires("credential"));
+
+  it("late detach of a former server preserves its successor", () => {
+    const former = subject;
+    const identity = (holder: typeof subject) => () => allow(ReasonCode.OK, {
+      actor: holder.sessionId, sessionId: holder.sessionId,
+      sessionIncarnation: h.cp.sessions.require(holder.sessionId).incarnation,
+    });
+    const detachFormer = port.attach(server(), identity(former));
+    subject = advance("SURVIVED");
+    // Ordinary session authentication remains valid for A. The port must check the registry.
+    const detachSuccessor = port.attach(server(), identity(subject));
+    detachFormer();
+    expect(port.connected(roleKey)).toBe(true);
+    detachSuccessor();
+    expect(port.connected(roleKey)).toBe(false);
+  });
+
+  it("an admitted connection authenticates without retaining the caller credential", () => {
+    const credential = grant();
+    const attachmentId = credential.attachmentId;
+    const attach = vi.spyOn(port, "attach");
+    valueOf(daemon.attachments.connect(server(), port, credential));
+    const authenticate = attach.mock.calls[0]![1];
+    credential.attachmentSecret = "discarded by caller";
+    credential.attachmentId = "discarded by caller";
+    expect(authenticate().allowed).toBe(true);
+    valueOf(daemon.attachments.revoke({ ...subject, attachmentId }));
+    expect(authenticate().allowed).toBe(false);
   });
 
   it("connect refuses an occupied slot without consuming a pending credential", () => {

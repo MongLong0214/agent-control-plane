@@ -36,7 +36,13 @@ interface AttachmentRecord {
 }
 
 const subjectSchema = z.object({ sessionId: z.string().min(1), sessionSecret: z.string().min(1) });
-const issueSchema = subjectSchema.extend({ roleKey: z.string().min(1), approval: z.unknown() });
+// Strip unknown keys at this door: proof and single-use consumption must cover the same receipt.
+const approvalSchema = z.object({
+  channel: z.string(), actor: z.string(), inboundNonce: z.string(), runId: z.string().nullable(),
+  candidateSnapshotDigest: z.string().nullable(), operation: z.string(), parameterDigest: z.string(),
+  idempotencyKey: z.string(), approved: z.boolean(),
+}) satisfies z.ZodType<OwnerApprovalReceipt>;
+const issueSchema = subjectSchema.extend({ roleKey: z.string().min(1), approval: approvalSchema });
 const credentialSchema = z.object({
   attachmentId: z.string().min(1), attachmentSecret: z.string().min(1),
   sessionId: z.string().min(1), sessionIncarnation: z.string().min(1), roleKey: z.string().min(1),
@@ -45,7 +51,11 @@ const credentialSchema = z.object({
 const hash = (secret: string): Buffer => createHash("sha256").update(secret).digest();
 const refused = (message: string): Decision<never> => deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, message);
 
-/** Daemon-local attachment authority. Stores hashes only; no session credential is changed. */
+/**
+ * Daemon-local attachment authority. Retains hashes only; no session credential is changed.
+ * Credentials are single-admission bearer tokens, not proof of the issuing process's identity.
+ * A copied token can be admitted with the listener's deployment token before its first use.
+ */
 export class RoleAttachmentCredentials {
   readonly #records = new Map<string, AttachmentRecord>();
 
@@ -78,7 +88,7 @@ export class RoleAttachmentCredentials {
     if (!authenticated.allowed) return authenticated;
     const scope = this.scope(sessionId, roleKey);
     if (!scope.allowed) return scope;
-    const approval = parsed.data.approval as OwnerApprovalReceipt | undefined;
+    const approval = parsed.data.approval;
     if (!approval || approval.approved !== true || approval.operation !== ROLE_ATTACHMENT_OPERATION ||
         approval.runId !== null || approval.parameterDigest !== digestOf(scope.value)) {
       return deny(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, "owner decision must approve this attachment generation");
@@ -102,9 +112,14 @@ export class RoleAttachmentCredentials {
     }
     const { attachmentId: _id, attachmentSecret: _secret, ...presentedScope } = credential;
     if (digestOf(presentedScope) !== digestOf(record.scope)) return refused("attachment scope does not match issuance");
+    return this.#authorizeRecord(credential.attachmentId, record);
+  }
+
+  #authorizeRecord(attachmentId: string, record: AttachmentRecord): Decision<AuthenticatedMcpPeer> {
+    if (this.#records.get(attachmentId) !== record) return refused("attachment has been invalidated");
     const current = this.scope(record.scope.sessionId, record.scope.roleKey);
     if (!current.allowed || digestOf(current.value) !== digestOf(record.scope)) {
-      this.#invalidate(credential.attachmentId);
+      this.#invalidate(attachmentId);
       return deny(ReasonCode.BINDING_GENERATION_STALE, "attachment generation is no longer ACTIVE");
     }
     return allow(ReasonCode.OK, { actor: record.scope.sessionId,
@@ -115,16 +130,18 @@ export class RoleAttachmentCredentials {
   connect(server: McpServer, port: RoleConversationPort, credential: AttachmentCredential): Decision<() => void> {
     const authorized = this.authorize(credential);
     if (!authorized.allowed) return authorized;
-    const record = this.#records.get(credential.attachmentId)!;
+    const attachmentId = credential.attachmentId;
+    const record = this.#records.get(attachmentId)!;
     if (record.attached) return refused("attachment credential has already admitted a connection");
     if (port.role !== Role.PRIMARY_CTO || port.connected(record.scope.roleKey)) {
       return deny(ReasonCode.CONFLICT, "attachment requires an empty role slot");
     }
-    const detach = port.attach(server, () => this.authorize(credential), record.scope.roleKey);
+    // Admission already proved the secret. Retain only the ID and hash/scope record in callbacks.
+    const detach = port.attach(server, () => this.#authorizeRecord(attachmentId, record), record.scope.roleKey);
     if (!port.connected(record.scope.roleKey)) return refused("attachment did not acquire its role slot");
     record.attached = true;
     record.detach = detach;
-    const close = () => this.#invalidate(credential.attachmentId);
+    const close = () => this.#invalidate(attachmentId);
     const previousClose = server.server.onclose;
     server.server.onclose = () => { close(); previousClose?.(); };
     server.registerTool("role_wake_endpoint_register", {

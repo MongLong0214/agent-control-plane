@@ -302,8 +302,8 @@ export class RoleConversationPort {
   /**
    * Records the peer that may be delivered to, returning its own detach.
    *
-   * An occupied slot stays with its incumbent until detach or an authorization recheck clears
-   * it. Additional authenticated connections do not replace it. A scoped attachment can acquire
+   * Occupancy is revalidated before admission: a current incumbent stays, while a former holder
+   * cannot block its successor after a same-generation transfer. A scoped attachment can acquire
    * only the one generation-approved role, even when its subject holds other roles too.
    */
   attach(server: McpServer, authenticate: McpPeerAuthenticator, scopeRoleKey?: string): () => void {
@@ -330,7 +330,7 @@ export class RoleConversationPort {
     for (const binding of this.#bindings.currentCandidates()) {
       if (!this.#isCurrentHolder(binding, peer)) continue;
       if (scopeRoleKey !== undefined && binding.roleKey !== scopeRoleKey) continue;
-      if (this.#live.has(binding.roleKey)) continue;
+      if (this.connected(binding.roleKey)) continue;
       this.#live.set(binding.roleKey, { server, authenticate, binding, endpoint: null });
       owned.push(binding.roleKey);
     }
@@ -344,7 +344,8 @@ export class RoleConversationPort {
   }
 
   connected(roleKey: string): boolean {
-    return this.#live.has(roleKey);
+    const peer = this.#live.get(roleKey);
+    return peer !== undefined && this.#holderFor(peer.server, roleKey).allowed;
   }
 
   /** The endpoint this role's live peer registered, or `null`. Exported for the wake's own rows. */
