@@ -234,3 +234,190 @@ describe("every record line GitHub would have carried survives the composition",
     }
   });
 });
+
+/**
+ * Content, order and record-block survival, measured together on one message.
+ *
+ * Split fixtures are how a composer passes both halves without ever doing both to the same input:
+ * exclusion proved on one message and preservation on another says nothing about the message that
+ * actually reaches `main`. Every assertion below reads the same `composed` string.
+ *
+ * Order is the property worth its own test rather than an assumed side effect. A composer that
+ * gathers record lines into a set, sorts them, groups them by key or de-duplicates them satisfies
+ * "every line is present" and quietly loses the sequence — and on a single-commit fixture the loss
+ * is invisible, because one commit's lines are already in their own order.
+ */
+describe("one message, both halves, with the record lines in the order the branch wrote them", () => {
+  const SESSION_URL = "https://claude.ai/code/session_0000000000000000000000";
+
+  /**
+   * Three commits whose record lines are deliberately neither sorted nor unique.
+   *
+   * `Provenance: drafted` repeats across all three because that is what real records do — d0d885f
+   * on `main` carries it once per source commit — and a de-duplicating composer would collapse
+   * three lines into one while still passing a membership check.
+   */
+  const branch = [
+    {
+      sha: "a".repeat(40),
+      message:
+        "feat: the first change\n\n" +
+        "why the first change was made.\n\n" +
+        "Warn: the first thing the next person needs\n" +
+        "Limit: the first commit's stated limit\n" +
+        "Record-Id: r-311111111111\n" +
+        "Provenance: drafted\n" +
+        `X-Claude-Session: ${SESSION_URL}\n`,
+    },
+    {
+      sha: "b".repeat(40),
+      message:
+        "fix: the second change\n\n" +
+        "why the second change was made, in prose that must survive.\n\n" +
+        "Ruled-out: an alternative | why it was not taken\n" +
+        "Limit: the second commit's stated limit\n" +
+        "Record-Id: r-122222222222\n" +
+        "Provenance: drafted\n",
+    },
+    {
+      sha: "c".repeat(40),
+      message:
+        "docs: the third change\n\n" +
+        "The capture flow could not run, so the context is in this prose.\n" +
+        `Claude-Session: ${SESSION_URL}\n\n` +
+        "Limit: the third commit's stated limit\n" +
+        "Record-Id: r-233333333333\n" +
+        "Provenance: drafted\n",
+    },
+  ];
+
+  /** The sequence the branch wrote, which is what the merge commit has to still say. */
+  const WRITTEN_IN_THIS_ORDER = [
+    "Warn: the first thing the next person needs",
+    "Limit: the first commit's stated limit",
+    "Record-Id: r-311111111111",
+    "Provenance: drafted",
+    "Ruled-out: an alternative | why it was not taken",
+    "Limit: the second commit's stated limit",
+    "Record-Id: r-122222222222",
+    "Provenance: drafted",
+    "Limit: the third commit's stated limit",
+    "Record-Id: r-233333333333",
+    "Provenance: drafted",
+  ];
+
+  const recordSequence = (message: string): string[] =>
+    message.split("\n").filter((line) => /^(Warn|Limit|Ruled-out|Record-Id|Provenance):/.test(line));
+
+  const composed = composeSquashCommitMessage(branch);
+  const baseline = githubSquashCommitMessage(branch);
+
+  it("has a fixture that can actually catch a sort and a de-duplication", () => {
+    // Guarding the guard. If the expected sequence were already sorted, a composer that sorts
+    // would satisfy it and the order assertion below would be decorative; if it carried no
+    // repeats, a composer that de-duplicates would pass too.
+    expect(WRITTEN_IN_THIS_ORDER).not.toEqual([...WRITTEN_IN_THIS_ORDER].sort());
+    expect(new Set(WRITTEN_IN_THIS_ORDER).size).toBeLessThan(WRITTEN_IN_THIS_ORDER.length);
+  });
+
+  it("keeps every record line in the order the branch wrote it, repeats included", () => {
+    expect(recordSequence(composed)).toEqual(WRITTEN_IN_THIS_ORDER);
+    // And the same sequence GitHub's own composition would have carried, so this is conservation
+    // across the transformation rather than agreement with a list someone typed twice.
+    expect(recordSequence(composed)).toEqual(recordSequence(baseline));
+  });
+
+  it("carries no session metadata anywhere in that same message, prose included", () => {
+    // The other half, on the identical string the assertions above just read.
+    expect(composed).not.toContain("session_0000000000000000000000");
+    for (const key of SESSION_METADATA_KEYS) {
+      expect(composed.split("\n").filter((line) => new RegExp(`^\\s*${key}\\s*:`, "i").test(line))).toEqual([]);
+    }
+    // Prose that merely sits next to the metadata is not collateral.
+    expect(composed).toContain("The capture flow could not run");
+    expect(composed).toContain("why the second change was made, in prose that must survive.");
+  });
+
+  it("loses no line at all except the two metadata lines", () => {
+    const survivors = new Set(composed.split("\n").map((line) => line.trim()));
+    const lost = baseline
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line !== "" && !survivors.has(line));
+    expect(lost).toEqual([`X-Claude-Session: ${SESSION_URL}`, `Claude-Session: ${SESSION_URL}`]);
+  });
+});
+
+/**
+ * What the CommitLore SPEC actually requires of a record, asked of the SPEC rather than assumed.
+ *
+ * SPEC §4 marks no key required: "A record MAY omit every optional key. A commit with no trailers
+ * is not an error." So "the required trailer keys are still present" cannot be tested as a list —
+ * there is no such list to test against, and inventing one would be a second policy beside the
+ * spec's, which is the failure this module already avoids for the record keys.
+ *
+ * Two obligations in the spec are real and conditional, and both are testable here:
+ *
+ *   §2.4 — a paragraph earlier than the last is a *record block* if and only if every line in it
+ *          is a trailer AND it declares `Record-Id:`. A composition that drops a `Record-Id:`, or
+ *          that leaves a non-trailer line inside such a paragraph, silently demotes a record to
+ *          body prose while every line it contains is still technically present.
+ *   §3.1 — the `|` in a `Ruled-out:` value is REQUIRED and the first one separates. Losing it
+ *          turns the record into a `format` violation rather than a missing line.
+ */
+describe("the record blocks the SPEC recognises survive the composition", () => {
+  const SESSION_URL = "https://claude.ai/code/session_0000000000000000000000";
+
+  const branch = [
+    {
+      sha: "d".repeat(40),
+      message:
+        "feat: a change\n\n" +
+        "why.\n\n" +
+        "Ruled-out: the other approach | it hides the exit status\n" +
+        "Record-Id: r-444444444444\n" +
+        `X-Claude-Session: ${SESSION_URL}\n`,
+    },
+    {
+      sha: "e".repeat(40),
+      message: "fix: another change\n\nwhy.\n\nLimit: a stated limit\nRecord-Id: r-555555555555\n",
+    },
+  ];
+
+  /**
+   * §2.4's own test, delegated to git paragraph by paragraph exactly as the spec prescribes: a
+   * synthetic one-line subject in front of the paragraph, and git decides whether it is trailers.
+   * Restating git's rule here is what the repository's `commit-msg` hook was rewritten to stop
+   * doing, and it drifted the first time.
+   */
+  const recordBlockIds = (message: string): string[] => {
+    const paragraphs = message.split(/\n{2,}/).filter((p) => p.trim() !== "");
+    const ids: string[] = [];
+    for (const paragraph of paragraphs) {
+      const parsed = spawnSync("git", ["interpret-trailers", "--parse"], {
+        encoding: "utf8",
+        input: `subject\n\n${paragraph}\n`,
+      }).stdout ?? "";
+      const lines = paragraph.trim().split("\n");
+      const allTrailers = parsed.split("\n").filter((l) => l.trim() !== "").length === lines.length;
+      const id = lines.find((line) => line.startsWith("Record-Id: "));
+      if (allTrailers && id !== undefined) ids.push(id);
+    }
+    return ids;
+  };
+
+  it("recognises the same record blocks, by the same identities, before and after", () => {
+    const baseline = githubSquashCommitMessage(branch);
+    const composed = composeSquashCommitMessage(branch);
+    // The fixture is only meaningful if the baseline had blocks to lose.
+    expect(recordBlockIds(baseline)).toEqual(["Record-Id: r-444444444444", "Record-Id: r-555555555555"]);
+    expect(recordBlockIds(composed)).toEqual(recordBlockIds(baseline));
+  });
+
+  it("keeps the separator SPEC §3.1 marks REQUIRED inside a Ruled-out value", () => {
+    const composed = composeSquashCommitMessage(branch);
+    const ruledOut = composed.split("\n").filter((line) => line.startsWith("Ruled-out: "));
+    expect(ruledOut).toEqual(["Ruled-out: the other approach | it hides the exit status"]);
+    expect(ruledOut[0]!.slice("Ruled-out: ".length).includes(" | ")).toBe(true);
+  });
+});
