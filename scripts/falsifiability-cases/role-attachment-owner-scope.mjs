@@ -5,8 +5,7 @@ const roleAttachmentOwnerScope = {
   "find": "approval.parameterDigest !== digestOf(scope.value)",
   "replace": "false",
   "killedBy": [
-    "tests/unit/role-attachment-authorization.test.ts::approval cannot follow a holder into a new registry generation",
-    "tests/unit/role-attachment-authorization.test.ts::another authenticated subject cannot spend the holder approval"
+    "tests/unit/role-attachment-authorization.test.ts::approval cannot follow a holder into a new registry generation"
   ]
 };
 

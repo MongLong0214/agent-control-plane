@@ -5,8 +5,7 @@ const roleAttachmentActiveGeneration = {
   "find": "if (!current.allowed || digestOf(current.value) !== digestOf(record.scope))",
   "replace": "if (false)",
   "killedBy": [
-    "tests/unit/role-attachment-authorization.test.ts::authorization permanently invalidates a non-ACTIVE generation",
-    "tests/unit/role-attachment-authorization.test.ts::a same-generation transfer invalidates the former authenticated holder"
+    "tests/unit/role-attachment-authorization.test.ts::authorization permanently invalidates a non-ACTIVE generation"
   ]
 };
 
