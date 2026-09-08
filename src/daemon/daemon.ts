@@ -30,6 +30,7 @@ import {
   ownerApprovalPayload,
 } from "../ingress/ingress-guard.ts";
 import type { OwnerApprovalReceipt } from "../ceo/owner-authority.ts";
+import { ROLE_ATTACHMENT_OPERATION, RoleAttachmentCredentials } from "../session/role-attachment-credentials.ts";
 import type { BuzzAdapter } from "../buzz/buzz-adapter.ts";
 import {
   ApprovedRunFinalizer,
@@ -229,6 +230,9 @@ export const OPERATOR_METHOD = {
    * of `inbound_messages` rather than trusting anything the claiming request asserts.
    */
   OWNER_APPROVE_CLAIM_CANONICAL_CTO: "owner.approveClaimCanonicalCto",
+  OWNER_APPROVE_ROLE_ATTACHMENT: "owner.approveRoleAttachment",
+  ROLE_ATTACHMENT_ISSUE: ROLE_ATTACHMENT_OPERATION,
+  ROLE_ATTACHMENT_REVOKE: "roleAttachment.revoke",
   /**
    * The parked daemon's recovery for CTO_BINDING_POINTS_AT_DEAD_SESSION: release a PRIMARY_CTO
    * binding whose session's process is provably gone, under an owner approval this call itself
@@ -263,6 +267,9 @@ export const OPERATOR_MUTATION_METHODS: ReadonlySet<OperatorMethod> = new Set([
   OPERATOR_METHOD.OUTBOX_RETRY,
   OPERATOR_METHOD.OWNER_APPROVE,
   OPERATOR_METHOD.OWNER_APPROVE_CLAIM_CANONICAL_CTO,
+  OPERATOR_METHOD.OWNER_APPROVE_ROLE_ATTACHMENT,
+  OPERATOR_METHOD.ROLE_ATTACHMENT_ISSUE,
+  OPERATOR_METHOD.ROLE_ATTACHMENT_REVOKE,
   OPERATOR_METHOD.BINDING_RECOVER_DEAD,
   OPERATOR_METHOD.REPAIR_DRY_RUN,
   OPERATOR_METHOD.REPAIR_EXECUTE,
@@ -460,6 +467,7 @@ export interface TelegramIngressController {
  */
 export class Daemon {
   readonly lock: SingleInstanceLock;
+  readonly attachments: RoleAttachmentCredentials;
   #timers: NodeJS.Timeout[] = [];
   #startedAt: string | null = null;
   #mode: DaemonMode = "NORMAL";
@@ -515,6 +523,7 @@ export class Daemon {
     mkdirSync(options.stateDir, { recursive: true });
     chmodSync(options.stateDir, 0o700);
     this.lock = new SingleInstanceLock(join(options.stateDir, "agentcpd.lock"));
+    this.attachments = new RoleAttachmentCredentials(cp.sessions, cp.bindings, cp.ownerAuthority);
     this.#finalizer = new ApprovedRunFinalizer(cp, undefined, authorities);
     this.#evidenceExporter = new RunEvidenceExporter(cp.db, cp.artifacts, cp.clock, cp.audit);
   }
@@ -546,7 +555,8 @@ export class Daemon {
     // would silently skip the re-check the whole park is waiting for. It also stops a
     // DAEMON_BOOTSTRAP_MODE denial from being pinned to a key the operator retries after
     // promotion.
-    const key = this.#mode !== "BOOTSTRAP" && OPERATOR_MUTATION_METHODS.has(request.method) && request.idempotencyKey
+    const key = request.method !== OPERATOR_METHOD.ROLE_ATTACHMENT_ISSUE &&
+      this.#mode !== "BOOTSTRAP" && OPERATOR_MUTATION_METHODS.has(request.method) && request.idempotencyKey
       ? `${peer.value.peerId}:${peer.value.incarnation}:${request.idempotencyKey}`
       : undefined;
 
@@ -712,6 +722,29 @@ export class Daemon {
 
         case OPERATOR_METHOD.OWNER_APPROVE_CLAIM_CANONICAL_CTO:
           return this.executeApproveCanonicalCtoClaim(request, peer);
+
+        case OPERATOR_METHOD.OWNER_APPROVE_ROLE_ATTACHMENT: {
+          const sessionId = requiredOperatorString(request.params, "sessionId");
+          if (!sessionId.allowed) return sessionId;
+          const roleKey = requiredOperatorString(request.params, "roleKey");
+          if (!roleKey.allowed) return roleKey;
+          const nonce = requiredOperatorString(request.params, "nonce");
+          if (!nonce.allowed) return nonce;
+          const approved = request.params["approved"];
+          if (typeof approved !== "boolean") return invalidOperatorParam("approved", approved);
+          const scope = this.attachments.scope(sessionId.value, roleKey.value);
+          if (!scope.allowed) return scope;
+          return this.admitCliOwnerApproval(peer.actor, {
+            runId: null, candidateSnapshotDigest: null, operation: ROLE_ATTACHMENT_OPERATION,
+            parameters: scope.value, idempotencyKey: request.idempotencyKey ?? nonce.value, approved,
+          }, nonce.value);
+        }
+
+        case OPERATOR_METHOD.ROLE_ATTACHMENT_ISSUE:
+          return this.attachments.issue(request.params);
+
+        case OPERATOR_METHOD.ROLE_ATTACHMENT_REVOKE:
+          return this.attachments.revoke(request.params);
 
         case OPERATOR_METHOD.BINDING_RECOVER_DEAD: {
           const recovered = this.executeDeadBindingRecovery(request, peer);

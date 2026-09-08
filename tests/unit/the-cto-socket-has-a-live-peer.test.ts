@@ -732,7 +732,7 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
     }
   }, 60_000);
 
-  it("leaves no peer behind when the holder disconnects, and a late close does not detach its replacement", async () => {
+  it("leaves no peer behind on disconnect and an additional connection does not replace the holder", async () => {
     const harness = makeHarness();
     const { projectId } = await registerFixtureProject(harness);
     const session = readySession(harness, "cto-peer");
@@ -768,24 +768,14 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       // call, and it has to be: the route is a pull, so the only connection that could ask about
       // this role is the one that just went, and there is nothing left to ask on.
 
-      // Reconnect, then close the *replaced* connection last. Its detach must not clear the peer
-      // that took its place — that would strand delivery on nobody while a live session is there.
-      const replaced = await open();
-      await until(() => listeners.ctoConversation.connected(roleKey), "the replaced peer to attach");
-      const replacement = await open();
-      // The ordering this row is about — replacement attached *before* the replaced connection
-      // closes — has to be established, not hoped for. `startMcpSocket` runs its factory, and so
-      // `attach`, before it awaits `mcp.connect(transport)`; the server therefore cannot answer
-      // `initialize` on this socket until the replacement is already the recorded peer. A sleep
-      // would only be a guess about scheduling, and would pass for the wrong reason on a slow run.
-      await until(
-        () => replacement.initialized(),
-        "the replacement's initialize response, which the server can only send after its attach ran",
-      );
-      await replaced.close();
-
-      const delivered = await claimAs(replacement, roleKey);
-      expect(delivered.ok, `the replacement peer was detached: ${delivered.message}`).toBe(true);
+      const incumbent = await open();
+      await until(() => incumbent.initialized(), "the incumbent's admission");
+      const additional = await open();
+      await until(() => additional.initialized(), "the additional connection's admission");
+      expect((await claimAs(additional, roleKey)).ok).toBe(false);
+      await additional.close();
+      const delivered = await claimAs(incumbent, roleKey);
+      expect(delivered.ok, `the incumbent peer was detached: ${delivered.message}`).toBe(true);
     } finally {
       for (const peer of opened) await peer.close();
       await listeners.close();
@@ -883,9 +873,9 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       expect(accepted.value).toEqual([roleKey]);
       expect(listeners.ctoConversation.endpointFor(roleKey)).toBe(good.path);
 
-      // Same session, same socket, same everything except the build it declares at handshake. This
-      // connection replaces the first as the role's peer, so it is the current holder by every
-      // other measure, and the pin is the only thing left to refuse it.
+      // Release the slot before admitting another build, so only the build pin can refuse it.
+      await qualified.close();
+      await until(() => !listeners.ctoConversation.connected(roleKey), "the qualified peer to detach");
       unqualified = await connectPeer(ctoSocket, { token: TOKEN, ...session });
       await until(() => unqualified?.initialized() === true, "the unqualified peer's attach");
       const unpinned = await unqualified.callTool("role_wake_endpoint_register", { endpoint: good.path });
@@ -900,6 +890,8 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       // `client.version !== C0_QUALIFIED_CLIENT.version` from the condition left every row in this
       // file green. The pin's whole claim is that a *newer build of the same client* is
       // unqualified rather than newer-than-qualified, and this is the only row that says so.
+      await unqualified.close();
+      await until(() => !listeners.ctoConversation.connected(roleKey), "the unqualified peer to detach");
       wrongBuild = await connectPeer(ctoSocket, { token: TOKEN, ...session }, {
         name: C0_QUALIFIED_CLIENT.name,
         version: `${C0_QUALIFIED_CLIENT.version}.9999-not-the-qualified-build`,

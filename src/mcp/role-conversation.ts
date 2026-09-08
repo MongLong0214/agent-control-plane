@@ -302,13 +302,11 @@ export class RoleConversationPort {
   /**
    * Records the peer that may be delivered to, returning its own detach.
    *
-   * A later connection replaces an earlier one: both authenticated as the session holding this
-   * role's active binding, so the second is a reconnect rather than a takeover, and refusing it
-   * would strand delivery on a socket whose peer has already gone while the daemon has not yet
-   * observed the close. Detach is identity-checked so a late close from the replaced connection
-   * cannot clear its successor.
+   * An occupied slot stays with its incumbent until detach or an authorization recheck clears
+   * it. Additional authenticated connections do not replace it. A scoped attachment can acquire
+   * only the one generation-approved role, even when its subject holds other roles too.
    */
-  attach(server: McpServer, authenticate: McpPeerAuthenticator): () => void {
+  attach(server: McpServer, authenticate: McpPeerAuthenticator, scopeRoleKey?: string): () => void {
     /*
      * **The connection's slots come from the registry, keyed on who it authenticated as.**
      *
@@ -331,6 +329,8 @@ export class RoleConversationPort {
     const owned: string[] = [];
     for (const binding of this.#bindings.currentCandidates()) {
       if (!this.#isCurrentHolder(binding, peer)) continue;
+      if (scopeRoleKey !== undefined && binding.roleKey !== scopeRoleKey) continue;
+      if (this.#live.has(binding.roleKey)) continue;
       this.#live.set(binding.roleKey, { server, authenticate, binding, endpoint: null });
       owned.push(binding.roleKey);
     }
@@ -513,6 +513,13 @@ export class RoleConversationPort {
         "this connection is not the live peer of any binding of this role",
         { role: this.#role },
       );
+    }
+    for (const [roleKey, peer] of owned) {
+      const identity = peer.authenticate();
+      if (!identity.allowed || !this.#isCurrentHolder(peer.binding, identity.value)) {
+        if (this.#live.get(roleKey) === peer) this.#live.delete(roleKey);
+        return deny(ReasonCode.ROLE_PEER_STALE, "the registering peer no longer holds its role");
+      }
     }
     const client = server.server.getClientVersion();
     if (client?.name !== C0_QUALIFIED_CLIENT.name || client.version !== C0_QUALIFIED_CLIENT.version) {
