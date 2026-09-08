@@ -302,6 +302,14 @@ export const recoverDeadCanonicalBinding = (
       // A binding whose session row is gone is a real state, and it is also one in which no
       // liveness can be established: there is no pid to ask about. "Unknown" is a refusal here
       // exactly as it is below, and this refusal names its own remedy rather than guessing.
+      //
+      // This state is knowingly left unrecoverable through this door, and that is a boundary
+      // rather than an omission. The door's whole authority to release a binding rests on
+      // proving that a specific process is gone; a missing session row removes the thing the
+      // proof would be about, so admitting it would mean releasing on the strength of an absence
+      // of evidence. Widening the range to cover it is a separate decision that has not been
+      // made, and it is out of scope for this change — anyone who needs that case answered
+      // should get it decided on its own terms, not by loosening this check.
       return deny(
         ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
         "the bound session record is absent, so its process cannot be proven dead",
