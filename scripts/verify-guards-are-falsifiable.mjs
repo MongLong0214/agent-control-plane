@@ -1936,8 +1936,10 @@ const GUARDS = [
     // doctor named had no socket to reach.
     what: "a contradicted conversation parks the daemon instead of stopping it",
     file: "src/daemon/daemon.ts",
-    find: '      finding.code.startsWith("CANONICAL_TURN_"),',
-    replace: "      false,",
+    // The trailing operator moved from `,` to `||` when the dead-binding clause was appended
+    // below it. The anchor is the clause itself either way; what changed is only what follows it.
+    find: '      finding.code.startsWith("CANONICAL_TURN_") ||',
+    replace: "      false ||",
     killedBy: ["tests/unit/the-quarantine-has-an-operator-door.test.ts"],
   },
   {
