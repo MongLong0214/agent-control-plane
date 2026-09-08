@@ -51,6 +51,8 @@ export class FakeGitHub implements GitHubClient {
   onMerge: ((input: { mergeSha: string; pull: FakePull }) => void) | null = null;
   /** Immutable workflow bytes served by the Contents API when a local checkout lacks a remote merge object. */
   workflowFiles = new Map<string, string>();
+  /** pull number -> the commits it carries, which is what a squash message is composed from. */
+  pullCommits = new Map<number, Array<{ sha: string; commit: { message: string } }>>();
   readonly calls: Array<{ method: string; path: string; body?: unknown }> = [];
   mergeCount = 0;
   #nextId = 100;
@@ -93,6 +95,17 @@ export class FakeGitHub implements GitHubClient {
       const pull = this.pulls.find((p) => p.number === number);
       if (!pull) throw new Error(`no pull ${number}`);
       return pull as unknown as T;
+    }
+    if (method === "GET" && /\/pulls\/\d+\/commits/.test(path)) {
+      const number = Number(/\/pulls\/(\d+)\/commits/.exec(path)![1]);
+      if (!this.pulls.some((p) => p.number === number)) throw new Error(`no pull ${number}`);
+      // Paged the way GitHub pages, so a caller that never advances `page` is visibly reading one
+      // page rather than silently reading a whole branch.
+      const url = new URL(path, "https://github.test");
+      const perPage = Number(url.searchParams.get("per_page") ?? "30");
+      const page = Number(url.searchParams.get("page") ?? "1");
+      const all = this.pullCommits.get(number) ?? [];
+      return all.slice((page - 1) * perPage, page * perPage) as unknown as T;
     }
     if (method === "PUT" && /\/pulls\/\d+\/merge$/.test(path)) {
       const number = Number(/\/pulls\/(\d+)\/merge$/.exec(path)![1]);
@@ -229,6 +242,17 @@ export class FakeGitHub implements GitHubClient {
     }
 
     throw new Error(`FakeGitHub has no handler for ${method} ${path}`);
+  }
+
+  /** Give a pull the branch commit messages GitHub would compose its squash message from. */
+  setPullCommits(pullNumber: number, commits: ReadonlyArray<{ sha?: string; message: string }>): void {
+    this.pullCommits.set(
+      pullNumber,
+      commits.map((commit, index) => ({
+        sha: commit.sha ?? `${index}`.repeat(40).slice(0, 40),
+        commit: { message: commit.message },
+      })),
+    );
   }
 
   /** Register a branch and the sha it points at. */

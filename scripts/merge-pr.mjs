@@ -47,6 +47,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { collapseTrailerParagraphs } from "./lib/collapse-trailer-paragraphs.mjs";
+import { RECORD_TRAILER_KEY_PATTERN } from "./lib/record-trailer-keys.mjs";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const run = (file, args, input) =>
@@ -113,7 +114,7 @@ try {
 }
 
 const composed = readFileSync(draft, "utf8");
-const inherited = composed.split("\n").filter((l) => /^(Limit|Ruled-out|Warn|Supersedes|Refs|Record-Id):/.test(l));
+const inherited = composed.split("\n").filter((l) => RECORD_TRAILER_KEY_PATTERN.test(l));
 process.stdout.write(`  ${inherited.length} record line(s) will be stored on the merge commit\n`);
 const bodyOut = `${draft}.body`;
 writeFileSync(bodyOut, composed.split("\n").slice(2).join("\n"));

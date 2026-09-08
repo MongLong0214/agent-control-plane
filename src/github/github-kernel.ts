@@ -22,6 +22,7 @@ import {
 } from "../guard/managed-write-guard.ts";
 import { hotfixPropagationTargets, requiredBaseFor, validateBranchContract } from "./branch-contract.ts";
 import type { TrustedCredentialStore } from "./credential-store.ts";
+import { type BranchCommitMessage, composeSquashCommitMessage } from "./merge-commit-message.ts";
 
 /**
  * The gate's GitHub-side correlator: run, candidate, and the payload digest that binds the rest.
@@ -1715,6 +1716,13 @@ export class GitHubKernel {
       });
     }
 
+    // What the merge commit will say, decided here rather than left to GitHub. Read before the
+    // reservation so a branch whose commits cannot be listed fails with nothing reserved: the
+    // fallback for an unreadable branch is GitHub's own composition, which is the leak this
+    // states the message to avoid. Only for `squash` — see `outgoingSquashCommitMessage`.
+    const outgoingCommitMessage =
+      method === "squash" ? await this.outgoingSquashCommitMessage(owner, repo, input.pullNumber) : undefined;
+
     const target = this.writeTarget(input.runId, input.repositoryIdentity, preflight.head.ref);
     if (!target.allowed) return target as Decision<{ mergeCommitSha: string; replayed: boolean }>;
 
@@ -1742,7 +1750,11 @@ export class GitHubKernel {
       () => this.api().request<{ sha: string; merged: boolean }>(
         "PUT",
         `/repos/${owner}/${repo}/pulls/${input.pullNumber}/merge`,
-        { sha: input.exactHeadSha, merge_method: method },
+        {
+          sha: input.exactHeadSha,
+          merge_method: method,
+          ...(outgoingCommitMessage !== undefined ? { commit_message: outgoingCommitMessage } : {}),
+        },
       ),
     );
     if (!merged.allowed) {
@@ -1882,6 +1894,61 @@ export class GitHubKernel {
     // merge commit has passed the pinned post-merge checks.
     this.runs.setRepositoryMergeState(input.runId, mergeRepositoryId, "PENDING");
     return allow(ReasonCode.OK, { mergeCommitSha, replayed: false });
+  }
+
+  /**
+   * The message the squash commit will carry, composed from the branch it squashes.
+   *
+   * Squash only, and that is a scope statement rather than an omission. GitHub composes a squash
+   * message from the branch's commit messages (`squash_merge_commit_message = COMMIT_MESSAGES`),
+   * so that is the one method where the merge commit is the thing that publishes them. A
+   * `merge` commit's message is "Merge pull request #N from …" and the branch's commits survive
+   * it individually, so stating a message there would add content GitHub never wrote and remove
+   * nothing. GitHub ignores `commit_message` for `rebase` outright — the commits are replayed as
+   * they are, which no field on this request can change.
+   *
+   * Every failure here is a throw rather than a composed-anyway, because the fallback for "the
+   * branch could not be read" is GitHub's own composition — precisely what this exists to
+   * replace. It runs before the receipt reservation, so a failure leaves nothing reserved.
+   */
+  private async outgoingSquashCommitMessage(
+    owner: string,
+    repo: string,
+    pullNumber: number,
+  ): Promise<string> {
+    const perPage = 100;
+    // GitHub serves at most 250 commits for a pull request, so three pages is its own ceiling and
+    // not a guess. A fourth full page would mean the endpoint's contract changed; truncating a
+    // branch silently is how a record at the end of it disappears, so that is a failure.
+    const maxPages = 3;
+    const commits: BranchCommitMessage[] = [];
+    for (let page = 1; page <= maxPages; page += 1) {
+      const batch = await this.api().request<Array<{ sha?: unknown; commit?: { message?: unknown } }>>(
+        "GET",
+        `/repos/${owner}/${repo}/pulls/${pullNumber}/commits?per_page=${perPage}&page=${page}`,
+      );
+      if (!Array.isArray(batch)) {
+        throw new Error(`pull request ${pullNumber} commits could not be read as a list`);
+      }
+      for (const entry of batch) {
+        const sha = entry?.sha;
+        const message = entry?.commit?.message;
+        if (typeof sha !== "string" || typeof message !== "string") {
+          throw new Error(`pull request ${pullNumber} reported a commit with no readable message`);
+        }
+        commits.push({ sha, message });
+      }
+      if (batch.length < perPage) break;
+      if (page === maxPages) {
+        throw new Error(`pull request ${pullNumber} lists more commits than GitHub will page through`);
+      }
+    }
+    if (commits.length === 0) {
+      // An empty list would compose an empty message, which is a silent way to publish nothing
+      // where the branch had records.
+      throw new Error(`pull request ${pullNumber} reported no commits to compose a message from`);
+    }
+    return composeSquashCommitMessage(commits);
   }
 
   /** Translate the pinned contract vocabulary to GitHub's REST API vocabulary. */
