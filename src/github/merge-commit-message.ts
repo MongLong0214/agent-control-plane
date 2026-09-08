@@ -34,16 +34,18 @@
  * repository's own record keys in `tests/unit/merge-commit-message.test.ts`; that assertion, not a
  * second copy of the record list, is what stops this file from eating a record.
  *
- * The load-bearing assumption, stated because everything here rests on it: a `commit_message` sent
- * with the merge *replaces* the body GitHub would have composed rather than being appended to it.
- * GitHub's own reference calls the field "extra detail to append to automatic commit message",
- * which would mean the opposite — and under that reading this module removes nothing, because the
- * unfiltered composition would still be there. This repository's history says replace: the three
- * squash merges that dropped 129 of 132 record lines dropped them precisely because a supplied
- * body took the place of the branch's messages, and `8ab3342` stored exactly the three trailers in
- * its supplied body's last paragraph rather than those plus the branch's. That is inference from
- * merges already on `main`, not an experiment run against this endpoint, and the first squash the
- * daemon performs is what turns it into an observation.
+ * The load-bearing assumption was measured against the real merge endpoint on 2026-09-08:
+ * a supplied `commit_message` replaces GitHub's composition under this configuration. The reading
+ * came from a different, throwaway private repository configured like this one:
+ * `squash_merge_commit_message = COMMIT_MESSAGES` and
+ * `squash_merge_commit_title = COMMIT_OR_PR_TITLE`. Its two-commit branch carried distinct body
+ * markers, record lines, and a session reference in both trailer and prose form; the merge supplied
+ * `commit_title` and `commit_message`. A marker census of the published squash found the supplied
+ * body present, both branch bodies absent, both forms of the session reference absent, and record
+ * lines present only because the supplied body carried them. The repository was deleted after the
+ * reading. This is evidence about the API under that configuration, not about any merge in this
+ * repository. The daemon was down when these branches merged through the repository's manual path;
+ * its composer governs the merges it performs once deployed.
  */
 
 /** One branch commit, as GitHub's list-commits endpoint reports it. */
