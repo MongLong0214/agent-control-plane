@@ -51,8 +51,8 @@ describe("role attachment authorization without sockets", () => {
     daemon.attachments.issue({ ...subject, roleKey, approval: receipt, ...overrides });
   const grant = () => valueOf(issue());
   const server = () => new McpServer({ name: "attachment-test", version: "1" });
-  const ready = () => {
-    const session = h.cp.sessions.create({ provider: "scripted", model: "fixture" });
+  const ready = (incarnation?: string) => {
+    const session = h.cp.sessions.create({ provider: "scripted", model: "fixture", incarnation });
     valueOf(h.cp.sessions.transition(session.sessionId, SessionLifecycle.READY));
     if (!session.sessionSecret) throw new Error("fixture secret unavailable");
     return { sessionId: session.sessionId, sessionSecret: session.sessionSecret };
@@ -146,6 +146,71 @@ describe("role attachment authorization without sockets", () => {
     const other = ready();
     expect(issue(receipt, other).allowed).toBe(false);
     expect(issue(receipt).allowed).toBe(true);
+  });
+
+  it("scope refuses a non-primary binding before any port can filter its role", () => {
+    const ceo = valueOf(h.cp.bindings.bind({ role: Role.CEO, sessionId: subject.sessionId }));
+    expect(daemon.attachments.scope(subject.sessionId, ceo.roleKey)).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.BINDING_GENERATION_STALE,
+    });
+    expect(daemon.attachments.scope(subject.sessionId, roleKey).allowed).toBe(true);
+  });
+
+  it("scope refuses a different subject even when incarnations are equal", () => {
+    // The registry accepts explicit incarnations; equality cannot stand in for subject identity.
+    const other = ready(h.cp.sessions.require(subject.sessionId).incarnation);
+    expect(daemon.attachments.scope(other.sessionId, roleKey)).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.BINDING_GENERATION_STALE,
+    });
+    expect(daemon.attachments.scope(subject.sessionId, roleKey).allowed).toBe(true);
+  });
+
+  it("scope returns a typed refusal when the binding outlives its session lookup", () => {
+    const get = vi.spyOn(h.cp.sessions, "get").mockReturnValueOnce(null);
+    try {
+      // A typed refusal is the contract here; dereferencing the missing session is not one.
+      expect(daemon.attachments.scope(subject.sessionId, roleKey)).toMatchObject({
+        allowed: false, reasonCode: ReasonCode.BINDING_GENERATION_STALE,
+      });
+      expect(get).toHaveBeenCalledWith(subject.sessionId);
+    } finally {
+      get.mockRestore();
+    }
+    expect(daemon.attachments.scope(subject.sessionId, roleKey).allowed).toBe(true);
+  });
+
+  it("scope refuses a stale incarnation of the same primary subject", () => {
+    const binding = h.cp.bindings.active(roleKey)!;
+    const active = vi.spyOn(h.cp.bindings, "active").mockReturnValueOnce({
+      ...binding, sessionIncarnation: "earlier-incarnation",
+    });
+    try {
+      expect(daemon.attachments.scope(subject.sessionId, roleKey)).toMatchObject({
+        allowed: false, reasonCode: ReasonCode.BINDING_GENERATION_STALE,
+      });
+    } finally {
+      active.mockRestore();
+    }
+    expect(daemon.attachments.scope(subject.sessionId, roleKey).allowed).toBe(true);
+  });
+
+  it("connect refuses an empty non-primary port before attempting admission", () => {
+    const credential = grant();
+    const otherPort = new RoleConversationPort(Role.CEO, {
+      active: (key) => h.cp.bindings.active(key), currentCandidates: () => [],
+    });
+    const attach = vi.spyOn(otherPort, "attach");
+    try {
+      expect(otherPort.currentHolderConnected(roleKey)).toBe(false);
+      expect(daemon.attachments.connect(server(), otherPort, credential)).toMatchObject({
+        allowed: false, reasonCode: ReasonCode.CONFLICT,
+        message: "attachment requires an empty role slot",
+      });
+      expect(attach).not.toHaveBeenCalled();
+      expect(daemon.attachments.connect(server(), port, credential).allowed).toBe(true);
+    } finally {
+      attach.mockRestore();
+    }
   });
 
   it("missing and forged decisions cannot authorize issuance", () => {
@@ -528,6 +593,43 @@ describe("role attachment authorization without sockets", () => {
     expect(port.connected(roleKey)).toBe(false);
     expect(daemon.attachments.authorize(credential).allowed).toBe(false);
     expect(h.cp.sessions.verifySecret(subject.sessionId, subject.sessionSecret).allowed).toBe(true);
+  });
+
+  it("revocation refuses a different subject even when incarnations are equal", () => {
+    const credential = grant();
+    valueOf(daemon.attachments.connect(server(), port, credential));
+    const other = ready(credential.sessionIncarnation);
+    expect(daemon.attachments.revoke({ ...other, attachmentId: credential.attachmentId })).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED,
+      message: "attachment does not belong to the authenticated subject",
+    });
+    expect(port.connected(roleKey)).toBe(true);
+    expect(daemon.attachments.authorize(credential).allowed).toBe(true);
+    expect(daemon.attachments.revoke({ ...subject, attachmentId: credential.attachmentId }).allowed).toBe(true);
+    expect(port.connected(roleKey)).toBe(false);
+  });
+
+  it("revocation refuses a later incarnation of the same authenticated subject", () => {
+    const credential = grant();
+    valueOf(daemon.attachments.connect(server(), port, credential));
+    const authenticated = valueOf(h.cp.sessions.verifySecret(subject.sessionId, subject.sessionSecret));
+    // Isolate a respawned registry result without a transfer notification invalidating the
+    // record first. Subject identity and the presented secret still match.
+    const verify = vi.spyOn(h.cp.sessions, "verifySecret").mockReturnValueOnce(allow(ReasonCode.OK, {
+      ...authenticated, incarnation: "later-incarnation",
+    }));
+    try {
+      expect(daemon.attachments.revoke({ ...subject, attachmentId: credential.attachmentId })).toMatchObject({
+        allowed: false, reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED,
+        message: "attachment does not belong to the authenticated subject",
+      });
+    } finally {
+      verify.mockRestore();
+    }
+    expect(port.connected(roleKey)).toBe(true);
+    expect(daemon.attachments.authorize(credential).allowed).toBe(true);
+    expect(daemon.attachments.revoke({ ...subject, attachmentId: credential.attachmentId }).allowed).toBe(true);
+    expect(port.connected(roleKey)).toBe(false);
   });
 
   it("a stopped subject loses attachment authorization", () => {
