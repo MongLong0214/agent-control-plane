@@ -8,10 +8,10 @@ const theSquashMergeStatesItsOwnCommitMessage = {
   id: "the-squash-merge-states-its-own-commit-message",
   what: "the squash merge request carries the message the daemon composed",
   file: "src/github/github-kernel.ts",
-  find: "          ...(outgoingCommitMessage !== undefined ? { commit_message: outgoingCommitMessage } : {}),",
-  replace: "          ...(outgoingCommitMessage !== undefined ? {} : {}),",
+  find: "            commit_message: outgoingCommitMessage.message,",
+  replace: "",
   killedBy: [
-    "tests/scenarios/github-hardening.test.ts::sends a commit_message rather than leaving the composition to COMMIT_MESSAGES",
+    "tests/unit/github-squash-request.test.ts::sanitizes the actual PUT title and body",
   ],
 };
 

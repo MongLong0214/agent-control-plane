@@ -8,6 +8,7 @@ export interface FakePull {
   state: string;
   html_url: string;
   title?: string;
+  commits?: number;
   body?: string | null;
   merge_commit_sha?: string | null;
 }
@@ -246,10 +247,13 @@ export class FakeGitHub implements GitHubClient {
 
   /** Give a pull the branch commit messages GitHub would compose its squash message from. */
   setPullCommits(pullNumber: number, commits: ReadonlyArray<{ sha?: string; message: string }>): void {
+    const pull = this.pulls.find((entry) => entry.number === pullNumber);
+    if (!pull) throw new Error(`no pull ${pullNumber}`);
+    pull.commits = commits.length;
     this.pullCommits.set(
       pullNumber,
       commits.map((commit, index) => ({
-        sha: commit.sha ?? `${index}`.repeat(40).slice(0, 40),
+        sha: commit.sha ?? (index === commits.length - 1 ? pull.head.sha : String(index).padStart(40, "0")),
         commit: { message: commit.message },
       })),
     );

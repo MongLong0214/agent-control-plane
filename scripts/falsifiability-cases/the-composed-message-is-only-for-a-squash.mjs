@@ -8,10 +8,10 @@ const theComposedMessageIsOnlyForASquash = {
   id: "the-composed-message-is-only-for-a-squash",
   what: "only a squash merge states a composed commit message",
   file: "src/github/github-kernel.ts",
-  find: '      method === "squash" ? await this.outgoingSquashCommitMessage(owner, repo, input.pullNumber) : undefined;',
-  replace: '      method !== "rebase" ? await this.outgoingSquashCommitMessage(owner, repo, input.pullNumber) : undefined;',
+  find: '      method === "squash" ? await this.outgoingSquashCommitMessage(owner, repo, input.pullNumber, preflight) : undefined;',
+  replace: '      method !== "rebase" ? await this.outgoingSquashCommitMessage(owner, repo, input.pullNumber, preflight) : undefined;',
   killedBy: [
-    "tests/scenarios/github-hardening.test.ts::leaves a merge_commit strategy's request body exactly as it was",
+    "tests/unit/github-squash-request.test.ts::leaves non-squash PUT fields unchanged",
   ],
 };
 

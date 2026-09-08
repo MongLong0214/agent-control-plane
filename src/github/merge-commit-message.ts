@@ -156,3 +156,14 @@ export const withoutSessionMetadata = (message: string): string => {
  */
 export const composeSquashCommitMessage = (commits: readonly BranchCommitMessage[]): string =>
   withoutSessionMetadata(githubSquashCommitMessage(commits));
+
+/** COMMIT_OR_PR_TITLE, including GitHub's PR suffix, sanitized before it reaches the PUT. */
+export const composeSquashCommitTitle = (
+  commits: readonly BranchCommitMessage[],
+  pullTitle: string | undefined,
+  pullNumber: number,
+): string => {
+  const subject = (commits.length === 1 ? commits[0]!.message.split("\n")[0] : pullTitle) ?? "";
+  const title = withoutSessionMetadata(subject).trim();
+  return `${title || "Squash pull request"} (#${pullNumber})`;
+};

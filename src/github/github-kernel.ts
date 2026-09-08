@@ -22,7 +22,7 @@ import {
 } from "../guard/managed-write-guard.ts";
 import { hotfixPropagationTargets, requiredBaseFor, validateBranchContract } from "./branch-contract.ts";
 import type { TrustedCredentialStore } from "./credential-store.ts";
-import { type BranchCommitMessage, composeSquashCommitMessage } from "./merge-commit-message.ts";
+import { type BranchCommitMessage, composeSquashCommitMessage, composeSquashCommitTitle } from "./merge-commit-message.ts";
 
 /**
  * The gate's GitHub-side correlator: run, candidate, and the payload digest that binds the rest.
@@ -193,6 +193,7 @@ export interface HumanGateStatusPort {
 
 interface PullRequest {
   number: number;
+  commits?: number;
   head: { sha: string; ref: string };
   base: { sha: string; ref: string };
   merged: boolean;
@@ -1721,7 +1722,7 @@ export class GitHubKernel {
     // fallback for an unreadable branch is GitHub's own composition, which is the leak this
     // states the message to avoid. Only for `squash` — see `outgoingSquashCommitMessage`.
     const outgoingCommitMessage =
-      method === "squash" ? await this.outgoingSquashCommitMessage(owner, repo, input.pullNumber) : undefined;
+      method === "squash" ? await this.outgoingSquashCommitMessage(owner, repo, input.pullNumber, preflight) : undefined;
 
     const target = this.writeTarget(input.runId, input.repositoryIdentity, preflight.head.ref);
     if (!target.allowed) return target as Decision<{ mergeCommitSha: string; replayed: boolean }>;
@@ -1753,7 +1754,10 @@ export class GitHubKernel {
         {
           sha: input.exactHeadSha,
           merge_method: method,
-          ...(outgoingCommitMessage !== undefined ? { commit_message: outgoingCommitMessage } : {}),
+          ...(outgoingCommitMessage !== undefined ? {
+            commit_title: outgoingCommitMessage.title,
+            commit_message: outgoingCommitMessage.message,
+          } : {}),
         },
       ),
     );
@@ -1916,11 +1920,18 @@ export class GitHubKernel {
     owner: string,
     repo: string,
     pullNumber: number,
-  ): Promise<string> {
+    pull: PullRequest,
+  ): Promise<{ title: string; message: string }> {
+    const expectedCount = pull.commits;
+    if (typeof expectedCount !== "number" || !Number.isSafeInteger(expectedCount) || expectedCount < 1) {
+      throw new Error(`pull request ${pullNumber} has no usable exact commit total`);
+    }
+    if (expectedCount > 250) {
+      throw new Error(`pull request ${pullNumber} exceeds GitHub's 250-commit list cap`);
+    }
     const perPage = 100;
-    // GitHub serves at most 250 commits for a pull request, so three pages is its own ceiling and
-    // not a guess. A fourth full page would mean the endpoint's contract changed; truncating a
-    // branch silently is how a record at the end of it disappears, so that is a failure.
+    // The endpoint's 250-commit cap can end in a short page. Page termination alone is no
+    // completeness proof: reconcile with the exact total and head from the checked preflight.
     const maxPages = 3;
     const commits: BranchCommitMessage[] = [];
     for (let page = 1; page <= maxPages; page += 1) {
@@ -1949,7 +1960,16 @@ export class GitHubKernel {
       // where the branch had records.
       throw new Error(`pull request ${pullNumber} reported no commits to compose a message from`);
     }
-    return composeSquashCommitMessage(commits);
+    if (commits.length !== expectedCount || new Set(commits.map((commit) => commit.sha)).size !== commits.length) {
+      throw new Error(`pull request ${pullNumber} commit list does not match its exact commit total`);
+    }
+    if (commits.at(-1)!.sha !== pull.head.sha) {
+      throw new Error(`pull request ${pullNumber} commit list does not end at its exact head`);
+    }
+    return {
+      title: composeSquashCommitTitle(commits, pull.title, pullNumber),
+      message: composeSquashCommitMessage(commits),
+    };
   }
 
   /** Translate the pinned contract vocabulary to GitHub's REST API vocabulary. */
