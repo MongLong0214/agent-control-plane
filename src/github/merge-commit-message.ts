@@ -33,6 +33,17 @@
  * combining into a way to lose a record. `SESSION_METADATA_KEYS` is asserted disjoint from the
  * repository's own record keys in `tests/unit/merge-commit-message.test.ts`; that assertion, not a
  * second copy of the record list, is what stops this file from eating a record.
+ *
+ * The load-bearing assumption, stated because everything here rests on it: a `commit_message` sent
+ * with the merge *replaces* the body GitHub would have composed rather than being appended to it.
+ * GitHub's own reference calls the field "extra detail to append to automatic commit message",
+ * which would mean the opposite — and under that reading this module removes nothing, because the
+ * unfiltered composition would still be there. This repository's history says replace: the three
+ * squash merges that dropped 129 of 132 record lines dropped them precisely because a supplied
+ * body took the place of the branch's messages, and `8ab3342` stored exactly the three trailers in
+ * its supplied body's last paragraph rather than those plus the branch's. That is inference from
+ * merges already on `main`, not an experiment run against this endpoint, and the first squash the
+ * daemon performs is what turns it into an observation.
  */
 
 /** One branch commit, as GitHub's list-commits endpoint reports it. */

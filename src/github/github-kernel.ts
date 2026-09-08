@@ -1904,8 +1904,9 @@ export class GitHubKernel {
    * so that is the one method where the merge commit is the thing that publishes them. A
    * `merge` commit's message is "Merge pull request #N from …" and the branch's commits survive
    * it individually, so stating a message there would add content GitHub never wrote and remove
-   * nothing. GitHub ignores `commit_message` for `rebase` outright — the commits are replayed as
-   * they are, which no field on this request can change.
+   * nothing. `rebase` replays the branch's commits onto the base, so those commit messages land
+   * as themselves whatever this request says — the merge commit's body is not the mechanism that
+   * publishes them, and filtering it there would buy a guarantee this method cannot keep.
    *
    * Every failure here is a throw rather than a composed-anyway, because the fallback for "the
    * branch could not be read" is GitHub's own composition — precisely what this exists to
