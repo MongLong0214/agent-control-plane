@@ -19,6 +19,7 @@ import {
 import { BuzzAdapter, BuzzCliTransport } from "../buzz/buzz-adapter.ts";
 import {
   BUZZ_MENTION_ADDRESSED_TO,
+  BuzzMentionBindingUnavailableError,
   startBuzzMentionSubscriberFromStateDir,
   type BuzzMentionAdmission,
   type BuzzMentionRegistry,
@@ -929,6 +930,24 @@ export const startDaemonBuzzMentionSubscriber = (
     ...(options.openSocket ? { openSocket: options.openSocket } : {}),
     ...(options.scheduler ? { scheduler: options.scheduler } : {}),
   });
+};
+
+/** Like Telegram's refusal path: a missing prerequisite disables only this ingress. */
+const startDaemonBuzzMentionSubscriberOrRefuse = (
+  ...args: Parameters<typeof startDaemonBuzzMentionSubscriber>
+): BuzzMentionSubscriberHandle | null => {
+  try {
+    return startDaemonBuzzMentionSubscriber(...args);
+  } catch (error) {
+    if (!(error instanceof BuzzMentionBindingUnavailableError)) throw error;
+    // Dead-binding recovery deliberately leaves the role unbound. Keep the claim door
+    // available, while preserving the subscriber's all-or-none preflight and delivery checks.
+    process.stderr.write(
+      `Buzz mention subscriber refused: ${error.message}; continuing without Buzz mention subscriber. ` +
+        "After a fresh role claim, restart the daemon to enable mentions.\n",
+    );
+    return null;
+  }
 };
 
 /**
@@ -2807,14 +2826,15 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         // beside the daemon's other state this opens nothing and reports zero sockets, which is
         // every deployment until an operator writes that file. A malformed one is a startup
         // error rather than a quiet zero, because an operator who wrote the file meant it.
-        buzzMentionSubscriber = startDaemonBuzzMentionSubscriber(
+        // An unbound role instead warns and skips the subscriber until the next daemon start.
+        buzzMentionSubscriber = startDaemonBuzzMentionSubscriberOrRefuse(
           cp,
           stateDir,
           buzzActorIngressPolicy,
           buzzMessageIngress,
         );
         process.stdout.write(
-          `Buzz mention subscriber sockets: ${buzzMentionSubscriber.socketCount}\n`,
+          `Buzz mention subscriber sockets: ${buzzMentionSubscriber?.socketCount ?? 0}\n`,
         );
         // The room the daemon *answers* in already has a name (`ACP_BUZZ_CHANNEL`, the outbound
         // adapter's own default-channel route — `buzz-adapter.ts`). The subscriber above now
@@ -2826,7 +2846,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         // reads the environment at all, so the comparison belongs to the caller, not either side.
         assertBuzzChannelMatchesSubscriberRooms(
           process.env["ACP_BUZZ_CHANNEL"]?.trim(),
-          buzzMentionSubscriber.rooms,
+          buzzMentionSubscriber?.rooms ?? [],
         );
       }
     }

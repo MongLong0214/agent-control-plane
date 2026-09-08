@@ -21,7 +21,10 @@ import {
   type BuzzRelaySocketHandlers,
   type BuzzSubscriberScheduler,
 } from "../../src/buzz/buzz-mention-subscriber.ts";
+import { buzzMentionSubscriberRegistry } from "../../src/daemon/agentcpd.ts";
+import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { makeHarness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -2045,6 +2048,49 @@ describe("the buzz mention subscriber's relay protocol", () => {
       expect(clock.delays).toEqual([1_000, 2_000, 1_000]);
     } finally {
       handle.close();
+    }
+  });
+
+  it("delivers no mention after the PRIMARY_CTO binding is revoked in the daemon registry", async () => {
+    const harness = makeHarness();
+    const stateDir = tempDir("acp-sub-revoked-");
+    const identity = hexIdentity(stateDir, "cto.key");
+    const owner = hexIdentity(stateDir, "owner.key");
+    writeConfig(stateDir, configFor([{ keyFile: identity.keyFile, encoding: "hex" }]));
+    const projectId = "subscriber-revoked-project";
+    const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+    harness.cp.db.run(`INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)`, [
+      projectId, "subscriber revoked binding", harness.cp.clock.nowIso(),
+    ]);
+    const session = harness.cp.sessions.create({ provider: "scripted", model: "subscriber-cto" });
+    expect(harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "test").allowed).toBe(true);
+    expect(harness.cp.sessions.bindBuzzActor({
+      sessionId: session.sessionId, sessionSecret: session.sessionSecret!, buzzActorId: identity.pubkey,
+    }, { isAllowedActor: () => true }).allowed).toBe(true);
+    expect(harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId: session.sessionId, projectId }).allowed)
+      .toBe(true);
+
+    const sink = recordingSink();
+    const transport = manualTransport();
+    const registry = buzzMentionSubscriberRegistry(harness.cp);
+    const handle = startBuzzMentionSubscriberFromStateDir(stateDir, {
+      registry, sink, openSocket: transport.factory, scheduler: virtualClock().scheduler,
+    });
+    try {
+      const socket = live(transport.sockets);
+      await authenticate(socket, handle);
+      const subId = (sentFrames(socket)[1] as string[])[1];
+      expect(harness.cp.bindings.revoke(roleKey, "dead canonical binding recovery: test").allowed).toBe(true);
+      expect(registry.primaryCtoBindingFor(identity.pubkey)).toBeNull();
+      socket.handlers.onFrame(frame(["EVENT", subId, mentionEvent({
+        author: owner.secretKey, addressedTo: identity.pubkey,
+      })]));
+      await handle.settled();
+      expect(sink.admitted).toEqual([]);
+      expect(socket.closed).toBe(true);
+    } finally {
+      handle.close();
+      harness.cp.close();
     }
   });
 

@@ -1127,6 +1127,13 @@ export interface BuzzMentionSubscriberOptions {
   readonly scheduler?: BuzzSubscriberScheduler;
 }
 
+/** A role between holders refuses subscription without making daemon startup fatal. */
+export class BuzzMentionBindingUnavailableError extends Error {
+  constructor(identity: string) {
+    super(`${identity} does not currently hold a live PRIMARY_CTO binding`);
+  }
+}
+
 /**
  * Every identity is preflighted before the first socket opens, and any failure opens none.
  *
@@ -1176,7 +1183,7 @@ export const startBuzzMentionSubscriber = (
 
     const bound = deps.registry.primaryCtoBindingFor(material.pubkey);
     if (!bound) {
-      throw new Error(`${what} does not currently hold a live PRIMARY_CTO binding`);
+      throw new BuzzMentionBindingUnavailableError(what);
     }
     if (!constantTimeEquals(bound.buzzActorId, material.pubkey)) {
       throw new Error(`${what} resolves to a session bound to a different channel identity`);
