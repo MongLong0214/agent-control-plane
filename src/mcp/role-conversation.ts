@@ -213,7 +213,7 @@ type EndpointCheck =
  * `-p`, `--print`, `--output-format` and `--input-format`: the process that may hold the canonical
  * claim is exactly the shape a headless-only qualification never observed.
  */
-export const C0_QUALIFIED_CLIENT = { name: "claude-code", version: "2.1.263" } as const;
+export const C0_QUALIFIED_CLIENT = { name: "claude-code", version: "2.1.265" } as const;
 
 /**
  * Owner-only, in the POSIX sense the 0700 state directory already means: no group bits, no other
