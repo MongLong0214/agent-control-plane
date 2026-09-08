@@ -72,7 +72,8 @@ export class RoleAttachmentCredentials {
     bindings.onSwitch((binding) => {
       const current = scopeOf(binding);
       for (const [attachmentId, record] of this.#records) {
-        if (record.scope.roleKey === binding.roleKey && digestOf(record.scope) !== digestOf(current)) {
+        if (record.scope.roleKey === binding.roleKey &&
+            (binding.status === "REVOKED" || digestOf(record.scope) !== digestOf(current))) {
           this.#invalidate(attachmentId);
         }
       }

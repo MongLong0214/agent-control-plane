@@ -32,7 +32,7 @@ const ROOT = fileURLToPath(new URL("..", import.meta.url));
  * refusal" is not a syntactic property — and a list that is wrong is visible, while a heuristic
  * that quietly skips a file is the failure this whole set is about.
  *
- * That argument does not make this list a closure: it has missed newly added authorities twice.
+ * That argument does not make this list a closure: it has missed newly added authorities three times.
  * A check that names its subjects explicitly is blind to subjects added later; adding another
  * name is a rule that will be needed again. This is the fallback, not a claim of discovery.
  *
@@ -54,6 +54,8 @@ const DECIDING_FILES = [
   "src/acceptance/disposable-realm.ts",
   "src/daemon/daemon.ts",
   "src/session/role-attachment-credentials.ts",
+  "src/mcp/role-conversation.ts",
+  "src/daemon/agentcpd.ts",
 ];
 
 /**

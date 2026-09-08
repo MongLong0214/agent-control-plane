@@ -155,7 +155,7 @@ export class BindingRegistry {
     if (ports.tasks) this.#tasks = ports.tasks;
   }
 
-  /** Daemon-local authorities observe committed transfers, including same-generation moves. */
+  /** Daemon-local authorities observe committed binds, revocations and same-generation moves. */
   onSwitch(listener: (binding: Readonly<RoleBinding>) => void): void {
     this.#switchListeners.add(listener);
   }
@@ -359,7 +359,9 @@ export class BindingRegistry {
         runId: input.runId ?? null,
         evidence: { role: input.role, generation, mode: input.mode ?? "PREFERRED" },
       });
-      return allow(ReasonCode.OK, this.require(roleKey));
+      const created = this.require(roleKey);
+      this.#notifySwitch(created);
+      return allow(ReasonCode.OK, created);
     });
   }
 
@@ -662,6 +664,8 @@ export class BindingRegistry {
   }
 
   #notifySwitch(binding: RoleBinding): void {
+    // Every currency-changing route (bind, both switchTo exits, revoke) publishes here.
+    // Revocation keeps the scope identity but publishes status REVOKED so it also ends authority.
     // The caller receives binding before an outer transaction commits; retain our own snapshot.
     const transferred = { ...binding };
     this.db.afterCommit(() => {
@@ -712,6 +716,7 @@ export class BindingRegistry {
         sessionId: current.sessionId,
         evidence: { reason, generation: current.bindingGeneration },
       });
+      this.#notifySwitch({ ...current, status: "REVOKED" });
       return allow(ReasonCode.OK, undefined);
     });
   }

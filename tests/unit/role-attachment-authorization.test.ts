@@ -403,6 +403,44 @@ describe("role attachment authorization without sockets", () => {
     expect(port.connected(roleKey)).toBe(false);
   });
 
+  it.each([false, true])("committed revocations detach immediately and rolled-back revocations preserve attachments: nested=%s", (nested) => {
+    const credential = grant();
+    const pending = grant();
+    valueOf(daemon.attachments.connect(server(), port, credential));
+    const revoke = () => valueOf(h.cp.bindings.revoke(roleKey, "revoke attachment holder"));
+    expect(() => h.cp.db.tx(() => { revoke(); throw new Error("rollback revocation"); }))
+      .toThrow("rollback revocation");
+    h.cp.db.tx(() => {});
+    expect(port.connected(roleKey)).toBe(true);
+    expect(daemon.attachments.authorize(credential).allowed).toBe(true);
+    expect(daemon.attachments.authorize(pending).allowed).toBe(true);
+    if (nested) h.cp.db.tx(() => { revoke(); expect(port.connected(roleKey)).toBe(true); });
+    else revoke();
+    expect(h.cp.bindings.active(roleKey)).toBeNull();
+    expect(port.connected(roleKey)).toBe(false);
+    for (const issued of [credential, pending]) {
+      expect(daemon.attachments.authorize(issued)).toMatchObject({ allowed: false,
+        message: "attachment credential is unknown or invalid" });
+    }
+  });
+
+  it("binding a revoked key publishes its committed successor and discards rolled-back notifications", () => {
+    valueOf(h.cp.bindings.revoke(roleKey, "prepare successor"));
+    const notified = vi.fn();
+    h.cp.bindings.onSwitch(notified);
+    const bind = () => valueOf(h.cp.bindings.bind({ role: Role.PRIMARY_CTO,
+      projectId: "attachment-project", ...subject }));
+    expect(() => h.cp.db.tx(() => { bind(); throw new Error("rollback bind"); })).toThrow("rollback bind");
+    h.cp.db.tx(() => {});
+    expect(notified).not.toHaveBeenCalled();
+    h.cp.db.tx(() => {
+      const successor = bind();
+      expect(notified).not.toHaveBeenCalled();
+      successor.sessionId = "edited return value";
+    });
+    expect(notified).toHaveBeenCalledExactlyOnceWith(h.cp.bindings.active(roleKey));
+  });
+
   it("transfer notification retains its identity when the returned binding is edited", () => {
     const credential = grant();
     const other = ready();
