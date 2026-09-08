@@ -208,6 +208,7 @@ describe("role attachment over real daemon sockets", () => {
     valueOf(h.cp.bindings.switchTo({ role: Role.PRIMARY_CTO, projectId: "attachment-project",
       ...ready(), conversation: "REPLACED", reason: "test transition" }));
     expect((await peer.register()).ok).toBe(false);
+    expect(listeners.ctoConversation.connected(roleKey)).toBe(false);
     expect(listeners.ctoConversation.endpointFor(roleKey)).toBeNull();
   });
 
@@ -216,6 +217,8 @@ describe("role attachment over real daemon sockets", () => {
     const peer = await open(credential);
     expect((await peer.register()).ok).toBe(true);
     valueOf(daemon.attachments.revoke({ ...subject, attachmentId: credential.attachmentId }));
+    // endpointFor revalidates and can delete stale slots; observe cleanup before calling it.
+    expect(listeners.ctoConversation.connected(roleKey)).toBe(false);
     expect(listeners.ctoConversation.endpointFor(roleKey)).toBeNull();
     expect((await peer.register()).ok).toBe(false);
     expect(h.cp.sessions.verifySecret(subject.sessionId, subject.sessionSecret).allowed).toBe(true);
