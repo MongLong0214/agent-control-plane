@@ -148,7 +148,7 @@ export class RoleAttachmentCredentials {
     }
     // Admission already proved the secret. Retain only the ID and hash/scope record in callbacks.
     const detach = port.attach(server, () => this.#authorizeRecord(attachmentId, record), record.scope.roleKey);
-    if (!port.connected(record.scope.roleKey)) return refused("attachment did not acquire its role slot");
+    if (!port.currentHolderConnected(record.scope.roleKey)) return refused("attachment did not acquire its role slot");
     record.attached = true;
     record.detach = detach;
     const close = () => this.#invalidate(attachmentId);

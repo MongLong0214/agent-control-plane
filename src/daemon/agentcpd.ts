@@ -1094,7 +1094,13 @@ const startMcpSocket = async (
           endWithDecision(socket, attached);
           return;
         }
-        // Covers a transport that closes before MCP's own onclose is installed as well.
+        // The ordinary CTO and CEO factories set server.server.onclose to their detach.
+        // The current SDK's Protocol.connect wires transport.onclose synchronously before
+        // SocketTransport.start resumes the paused socket. Fresh servers/transports cannot
+        // hit the already-connected/already-started rejections, so those routes rely on MCP
+        // close, including socket.destroy in catch. Attachments additionally cover SDK/mock
+        // orderings that close or reject before that wiring. Revisit both sibling routes if
+        // an SDK upgrade changes this ordering.
         socket.once("close", attached.value);
         try {
           await mcp.connect(accepted.transport);

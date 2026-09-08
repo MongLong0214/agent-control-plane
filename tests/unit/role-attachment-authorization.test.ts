@@ -547,6 +547,42 @@ describe("role attachment authorization without sockets", () => {
     expect(daemon.attachments.connect(server(), port, credential).allowed).toBe(true);
   });
 
+  it("connect refuses stale registration without consuming a pending credential", () => {
+    let offerScopedBinding = true;
+    port = new RoleConversationPort(Role.PRIMARY_CTO, {
+      active: (key) => h.cp.bindings.active(key),
+      currentCandidates: () => offerScopedBinding ? [h.cp.bindings.active(roleKey)!] : [],
+    });
+    const former = h.cp.sessions.require(subject.sessionId);
+    port.attach(server(), () => allow(ReasonCode.OK, { actor: former.sessionId,
+      sessionId: former.sessionId, sessionIncarnation: former.incarnation }));
+    subject = advance("SURVIVED");
+    const credential = grant();
+    // Production offers every ACTIVE binding. This fixture omits one to prove that
+    // acquisition does not depend on the candidate list clearing a stale registration.
+    offerScopedBinding = false;
+    expect(port.connected(roleKey)).toBe(true);
+    expect(port.currentHolderConnected(roleKey)).toBe(false);
+    expect(daemon.attachments.authorize(credential).allowed).toBe(true);
+    const rejected = server();
+    const registerTool = vi.spyOn(rejected, "registerTool");
+    expect.soft(daemon.attachments.connect(rejected, port, credential)).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED,
+      message: "attachment did not acquire its role slot",
+    });
+    expect.soft(registerTool.mock.calls.length).toBe(0);
+    expect(port.connected(roleKey)).toBe(true);
+    expect(port.currentHolderConnected(roleKey)).toBe(false);
+    // Retrying the same credential proves the refused acquisition left record.attached false.
+    offerScopedBinding = true;
+    const accepted = server();
+    const connected = daemon.attachments.connect(accepted, port, credential);
+    expect(connected.allowed, JSON.stringify(connected)).toBe(true);
+    expect(port.claimOwnerMessage(accepted, roleKey).reasonCode).toBe(ReasonCode.ROLE_PEER_UNSUPPORTED);
+    valueOf(connected)();
+    expect(port.connected(roleKey)).toBe(false);
+  });
+
   it("an attachment never auto-authorizes a sibling role held by the same subject", () => {
     const manifest = fixtureManifest("attachment-sibling");
     valueOf(h.cp.projects.register({ projectId: manifest.projectId, name: "fixture", manifest,
