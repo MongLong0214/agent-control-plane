@@ -1,10 +1,15 @@
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { queryObjects } from "node:v8";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import ts from "typescript";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { OwnerApprovalReceipt } from "../../src/ceo/owner-authority.ts";
+import { digestOf } from "../../src/core/digest.ts";
 import { type Decision, allow } from "../../src/core/errors.ts";
-import type { AttachmentCredential } from "../../src/session/role-attachment-credentials.ts";
+import { approvalSchema, type AttachmentCredential } from "../../src/session/role-attachment-credentials.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
@@ -86,6 +91,10 @@ describe("role attachment authorization without sockets", () => {
       sessionId: subject.sessionId, roleKey, nonce: randomUUID(), approved: true,
     });
     expect(result.allowed, JSON.stringify(result)).toBe(true);
+    const receipt = valueOf(result) as OwnerApprovalReceipt;
+    expect(receipt).toMatchObject({ approved: true, operation: "roleAttachment.issue", runId: null,
+      parameterDigest: digestOf(valueOf(daemon.attachments.scope(subject.sessionId, roleKey))) });
+    expect(h.cp.ownerAuthority.assertApproval(receipt).allowed).toBe(true);
   });
 
   it("session authentication and an admitted owner approval issue a separate attachment credential", async () => {
@@ -118,9 +127,9 @@ describe("role attachment authorization without sockets", () => {
 
   it("another authenticated subject cannot spend the holder approval", () => {
     const receipt = approval();
-    const other = advance("SURVIVED");
+    const other = ready();
     expect(issue(receipt, other).allowed).toBe(false);
-    expect(issue(approval()).allowed).toBe(false);
+    expect(issue(receipt).allowed).toBe(true);
   });
 
   it("missing and forged decisions cannot authorize issuance", () => {
@@ -165,6 +174,53 @@ describe("role attachment authorization without sockets", () => {
     ).length }).toEqual({ allowed: false, consumptions: 1 });
   });
 
+  it("approval schema fields and consumed normal form exactly match the proved receipt", () => {
+    // Interfaces are erased at runtime. Derive their keys from the real declaration with
+    // the type checker, including optional/inherited fields, rather than a second field list.
+    const path = fileURLToPath(new URL("../../src/ceo/owner-authority.ts", import.meta.url));
+    const program = ts.createProgram([path], { types: [], noEmit: true });
+    const checker = program.getTypeChecker();
+    const module = checker.getSymbolAtLocation(program.getSourceFile(path)!)!;
+    const declaration = checker.getExportsOfModule(module).find((symbol) => symbol.name === "OwnerApprovalReceipt")!;
+    const receiptFields = checker.getPropertiesOfType(checker.getDeclaredTypeOfSymbol(declaration))
+      .map((symbol) => symbol.name).sort();
+    expect(Object.keys(approvalSchema.shape).sort()).toEqual(receiptFields);
+
+    const receipt = approval();
+    const provedFields = new Set<string>();
+    const owner = h.cp.ownerAuthority;
+    const assertApproval = owner.assertApproval.bind(owner);
+    const proof = vi.spyOn(owner, "assertApproval").mockImplementation((normalForm) =>
+      assertApproval(new Proxy(normalForm, {
+        get(target, key, receiver) {
+          if (typeof key === "string") provedFields.add(key);
+          return Reflect.get(target, key, receiver);
+        },
+      })));
+    const consumption = vi.spyOn(owner, "consumeApproval");
+    try {
+      // An extended first presentation must succeed after stripping, not be rejected.
+      const extendedReceipt = { ...receipt, ignored: "caller metadata" };
+      expect(issue(extendedReceipt).allowed).toBe(true);
+      expect(consumption).toHaveBeenCalledExactlyOnceWith(receipt, null);
+      const consumed = consumption.mock.calls[0]![0];
+      expect(consumed).toStrictEqual(receipt);
+      expect(Object.keys(consumed).sort()).toEqual(receiptFields);
+      expect(proof).toHaveBeenCalledExactlyOnceWith(consumed);
+      expect(proof.mock.calls[0]![0]).toBe(consumed);
+      expect(proof.mock.results[0]!.value.allowed).toBe(true);
+      expect([...provedFields].sort()).toEqual(receiptFields);
+      const records = h.cp.db.all<{ evidence_json: string }>(
+        "SELECT evidence_json FROM audit_events WHERE kind = 'OWNER_APPROVAL_CONSUMED'",
+      );
+      expect(records).toHaveLength(1);
+      expect(JSON.parse(records[0]!.evidence_json).receiptDigest).toBe(digestOf(consumed));
+    } finally {
+      proof.mockRestore();
+      consumption.mockRestore();
+    }
+  });
+
   it("operator retries never re-serve a plaintext attachment credential", async () => {
     const input = { requestId: randomUUID(), idempotencyKey: randomUUID(), method: "roleAttachment.issue",
       params: { ...subject, roleKey, approval: approval() } };
@@ -201,9 +257,18 @@ describe("role attachment authorization without sockets", () => {
 
   it("authorization permanently invalidates a non-ACTIVE generation", () => {
     const credential = grant();
+    const binding = h.cp.bindings.active(roleKey)!;
     advance();
     expect(daemon.attachments.authorize(credential).allowed).toBe(false);
-    expect(daemon.attachments.connect(server(), port, credential).allowed).toBe(false);
+    // Restoring the former registry view must not revive the deleted credential.
+    const active = vi.spyOn(h.cp.bindings, "active").mockReturnValue(binding);
+    try {
+      expect(daemon.attachments.scope(subject.sessionId, roleKey).allowed).toBe(true);
+      expect(daemon.attachments.authorize(credential).allowed).toBe(false);
+      expect(daemon.attachments.connect(server(), port, credential).allowed).toBe(false);
+    } finally {
+      active.mockRestore();
+    }
   });
 
   const expectSuccessorAcquires = (route: "port" | "credential") => {
@@ -257,13 +322,21 @@ describe("role attachment authorization without sockets", () => {
   });
 
   it("an admitted connection authenticates without retaining the caller credential", () => {
-    const credential = grant();
-    const attachmentId = credential.attachmentId;
+    class CallerCredential {}
     const attach = vi.spyOn(port, "attach");
-    valueOf(daemon.attachments.connect(server(), port, credential));
+    const attachmentId = (() => {
+      const credential = Object.assign(new CallerCredential(), grant());
+      const id = credential.attachmentId;
+      valueOf(daemon.attachments.connect(server(), port, credential));
+      credential.attachmentSecret = "discarded by caller";
+      credential.attachmentId = "discarded by caller";
+      expect(attach.mock.calls[0]![1]().allowed).toBe(true);
+      return id;
+    })();
+    // queryObjects runs a full GC. The live authenticator must not keep the caller's
+    // object reachable, even if it no longer reads that object's secret to authenticate.
+    expect(queryObjects(CallerCredential, { format: "count" })).toBe(0);
     const authenticate = attach.mock.calls[0]![1];
-    credential.attachmentSecret = "discarded by caller";
-    credential.attachmentId = "discarded by caller";
     expect(authenticate().allowed).toBe(true);
     valueOf(daemon.attachments.revoke({ ...subject, attachmentId }));
     expect(authenticate().allowed).toBe(false);
@@ -337,7 +410,7 @@ describe("role attachment authorization without sockets", () => {
     expect(port.connected(roleKey)).toBe(false);
   });
 
-  it("daemon reconstruction restores neither credentials nor approval consumption authority", () => {
+  it("daemon reconstruction forgets attachment credentials and preserves spent approvals", () => {
     const receipt = approval();
     const credential = valueOf(issue(receipt));
     const fresh = new Daemon(h.cp, { stateDir: tempDir("at-") });

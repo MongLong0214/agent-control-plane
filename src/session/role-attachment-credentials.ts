@@ -36,8 +36,9 @@ interface AttachmentRecord {
 }
 
 const subjectSchema = z.object({ sessionId: z.string().min(1), sessionSecret: z.string().min(1) });
-// Strip unknown keys at this door: proof and single-use consumption must cover the same receipt.
-const approvalSchema = z.object({
+// This is strip-normalisation, not rejection: callers may send extra fields, which are discarded.
+// Authorization and single-use consumption receive only this normal form of OwnerApprovalReceipt.
+export const approvalSchema = z.object({
   channel: z.string(), actor: z.string(), inboundNonce: z.string(), runId: z.string().nullable(),
   candidateSnapshotDigest: z.string().nullable(), operation: z.string(), parameterDigest: z.string(),
   idempotencyKey: z.string(), approved: z.boolean(),

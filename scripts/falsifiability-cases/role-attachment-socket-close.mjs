@@ -5,7 +5,7 @@ const roleAttachmentSocketClose = {
   "find": "    const close = () => this.#invalidate(attachmentId);",
   "replace": "    const close = () => {};",
   "killedBy": [
-    "tests/unit/role-attachment-sockets.test.ts::real connection close clears registration and permanently spends the credential"
+    "tests/unit/role-attachment-sockets.test.ts::connection close after MCP initialization clears registration and permanently spends the credential"
   ]
 };
 

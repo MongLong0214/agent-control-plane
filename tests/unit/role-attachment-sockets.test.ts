@@ -146,7 +146,7 @@ describe("role attachment over real daemon sockets", () => {
     expect(listeners.ctoConversation.endpointFor(roleKey)).toBe(endpoint);
   });
 
-  it("real connection close clears registration and permanently spends the credential", async () => {
+  it("connection close after MCP initialization clears registration and permanently spends the credential", async () => {
     const credential = await grant();
     const peer = await open(credential);
     expect((await peer.register()).ok).toBe(true);
@@ -194,7 +194,7 @@ describe("role attachment over real daemon sockets", () => {
     expect((await (await open(credential)).register()).ok).toBe(true);
   });
 
-  it("generation changes refuse registration on an already open attachment", async () => {
+  it("registration revalidation refuses a changed generation on an already open attachment", async () => {
     // This measures revalidation at registration, not eager cleanup on transfer. Successor
     // admission without an intervening registration is covered by the authorization tests.
     const peer = await open(await grant());
