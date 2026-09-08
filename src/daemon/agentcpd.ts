@@ -1763,7 +1763,7 @@ const lifecyclePermitsBoundSocket = (lifecycle: SessionLifecycle, role: Role): b
   lifecycle === SessionLifecycle.READY ||
   (lifecycle === SessionLifecycle.DRAINING && role === Role.PRIMARY_CTO);
 
-const authenticateSocket = (
+export const authenticateSocket = (
   socket: Socket,
   token: string,
   handshakeTimeoutMs: number,
@@ -1984,7 +1984,10 @@ class SocketTransport implements Transport {
     private readonly socket: Socket,
     initial: Buffer,
   ) {
-    this.#buffer = initial;
+    // The handshake remainder is a view over plaintext credentials, even when empty.
+    // Allocate outside the Buffer pool: Buffer.from could share that same backing slab.
+    this.#buffer = Buffer.alloc(initial.length);
+    initial.copy(this.#buffer);
   }
 
   async start(): Promise<void> {
@@ -2011,7 +2014,11 @@ class SocketTransport implements Transport {
   }
 
   private readonly receive = (chunk: Buffer): void => {
-    this.#buffer = Buffer.concat([this.#buffer, chunk]);
+    // A later pooled concat could regain the slab that held the handshake credentials.
+    const next = Buffer.alloc(this.#buffer.length + chunk.length);
+    this.#buffer.copy(next);
+    chunk.copy(next, this.#buffer.length);
+    this.#buffer = next;
     this.processBuffer();
   };
 

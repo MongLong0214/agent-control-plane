@@ -355,6 +355,7 @@ export class RoleConversationPort {
 
   /** The endpoint this role's live peer registered, or `null`. Exported for the wake's own rows. */
   endpointFor(roleKey: string): string | null {
+    if (!this.currentHolderConnected(roleKey)) return null;
     return this.#live.get(roleKey)?.endpoint ?? null;
   }
 
@@ -546,7 +547,7 @@ export class RoleConversationPort {
     // arrive at whichever process actually holds the bind, so the second one is refused rather
     // than quietly aliased onto the first.
     for (const [roleKey, peer] of this.#live) {
-      if (peer.server !== server && peer.endpoint === validated.value) {
+      if (peer.server !== server && peer.endpoint === validated.value && this.currentHolderConnected(roleKey)) {
         return deny(
           ReasonCode.ROLE_PEER_UNSUPPORTED,
           "another live peer of this role already registered that wake endpoint",

@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { OwnerApprovalReceipt } from "../../src/ceo/owner-authority.ts";
 import type { Decision } from "../../src/core/errors.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startDaemonMcpListeners, type LocalMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
@@ -71,7 +72,10 @@ describe("role attachment over real daemon sockets", () => {
         if (newline < 0) break;
         const message = JSON.parse(buffer.slice(0, newline)) as WireMessage;
         buffer = buffer.slice(newline + 1);
-        if (message.ok === false) { fail(new Error(JSON.stringify(message))); continue; }
+        if (message.ok === false) {
+          fail(Object.assign(new Error(JSON.stringify(message)), { refusal: message }));
+          continue;
+        }
         if (message.id !== undefined) {
           const entry = pending.get(message.id);
           pending.delete(message.id);
@@ -153,7 +157,8 @@ describe("role attachment over real daemon sockets", () => {
     peer.socket.destroy();
     await expect.poll(() => listeners.ctoConversation.connected(roleKey)).toBe(false);
     expect(listeners.ctoConversation.endpointFor(roleKey)).toBeNull();
-    await expect(open(credential)).rejects.toThrow();
+    await expect(open(credential)).rejects.toMatchObject({ refusal: { ok: false,
+      reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED, message: "attachment credential is unknown or invalid" } });
     expect((await (await open(await grant())).register()).ok).toBe(true);
   });
 
@@ -187,7 +192,8 @@ describe("role attachment over real daemon sockets", () => {
     const incumbent = await open(subject);
     expect((await incumbent.register()).ok).toBe(true);
     const credential = await grant();
-    await expect(open(credential)).rejects.toThrow();
+    await expect(open(credential)).rejects.toMatchObject({ refusal: { ok: false,
+      reasonCode: ReasonCode.CONFLICT, message: "attachment requires an empty role slot" } });
     expect((await incumbent.register()).ok).toBe(true);
     incumbent.socket.destroy();
     await expect.poll(() => listeners.ctoConversation.connected(roleKey)).toBe(false);
@@ -217,9 +223,12 @@ describe("role attachment over real daemon sockets", () => {
 
   it("the deployment token and the CTO attachment route remain required", async () => {
     const credential = await grant();
-    await expect(open(credential, "wrong")).rejects.toThrow();
-    await expect(open(credential, token, 0)).rejects.toThrow();
-    await expect(open({ ...credential, attachmentSecret: "wrong" })).rejects.toThrow();
+    await expect(open(credential, "wrong")).rejects.toMatchObject({ refusal: { ok: false,
+      reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED, message: "local MCP authentication failed" } });
+    await expect(open(credential, token, 0)).rejects.toMatchObject({ refusal: { ok: false,
+      reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED, message: "this socket does not admit attachments" } });
+    await expect(open({ ...credential, attachmentSecret: "wrong" })).rejects.toMatchObject({ refusal: { ok: false,
+      reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED, message: "attachment credential is unknown or invalid" } });
     expect((await (await open(credential)).register()).ok).toBe(true);
   });
 });
