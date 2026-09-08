@@ -1,4 +1,4 @@
-export default {
+const roleAttachmentLateDetach = {
   "id": "role-attachment-late-detach",
   "what": "attachment authorization: a former receiving server cannot detach its successor",
   "file": "src/mcp/role-conversation.ts",
@@ -8,3 +8,5 @@ export default {
     "tests/unit/role-attachment-authorization.test.ts::late detach of a former server preserves its successor"
   ]
 };
+
+export default roleAttachmentLateDetach;

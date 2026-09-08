@@ -1,4 +1,5 @@
-export default {
+// Deleting the map entry leaves the callback's captured record alive, so each call must check it.
+const roleAttachmentRetainedRecord = {
   "id": "role-attachment-retained-record",
   "what": "attachment authorization: a retained authenticator refuses its invalidated record",
   "file": "src/session/role-attachment-credentials.ts",
@@ -8,3 +9,5 @@ export default {
     "tests/unit/role-attachment-authorization.test.ts::an admitted connection authenticates without retaining the caller credential"
   ]
 };
+
+export default roleAttachmentRetainedRecord;
