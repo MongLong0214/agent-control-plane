@@ -2,6 +2,32 @@
   "qualification": "acp.role-wake-transport/u6",
   "producedAt": "2026-09-07T14:49:22.501Z",
   "headSha": "ece5ee417271e83bb756673a0d365ca062a29e41",
+  "sourceBinding": {
+    "status": "UNKNOWN",
+    "statement": "Nothing in this receipt identifies the instrument that produced it. `headSha` is whatever `git rev-parse HEAD` returned inside qualify(), and at run time HEAD was ece5ee417271e83bb756673a0d365ca062a29e41 (#797, \"the daemon's PATH reaches lsof\") -- a tree that contains no wake-transport harness at all. The harness, the pty driver and the qualify script existed only as uncommitted working-tree bytes while the arms ran, and were first committed about eight minutes after the last arm finished, as 396d88e, squash-merged as bd2dc5e. No digest of any of them was taken while the arms ran. So this receipt cannot be bound to the 396d88e/bd2dc5e source, nor to any other. The source is UNKNOWN. It is recorded as UNKNOWN rather than reconstructed, because a reconstruction would be a guess wearing the shape of a measurement.",
+    "recordedHeadShaMeans": "when this file was built, not what took the reading. The field above is preserved exactly as the run wrote it and has not been corrected to something that would look better.",
+    "lookedFor": [
+      "A harness digest or source snapshot inside this receipt, recorded at run time -- none. The schema had no field for one, which is the mechanism of the gap rather than an oversight in filling it in.",
+      "A committed harness at the recorded head: `git ls-tree -r ece5ee41 | grep wake-transport` returns nothing.",
+      "A stash or snapshot of the working tree from the run window: `git stash list` in the worktree that ran it holds two entries, both unrelated and both weeks older than this work.",
+      "The run's own preserved logs (`evidence/local/.../session.log`): they capture the client's terminal and stderr, which is the subject of the measurement and not the instrument that took it.",
+      "The reflog of the worktree that ran it: HEAD sat at ece5ee4 from 23:26:23 until the 23:57:51 commit, spanning the whole run, which is the same fact from the other side."
+    ],
+    "counterEvidence": "In the worktree that produced this receipt the committed harness file's last write is 2026-09-07T23:48:28+09:00. The run window, read from the durable capture files, runs from 23:47:15 (the interactive-injection capture is created) to 23:49:22 -- which is this receipt's own producedAt, 2026-09-07T14:49:22.501Z. The harness was therefore written during the run, after the first arm had already produced its capture. That is filesystem metadata and not a digest, so it does not prove the bytes differ; it is a positive reason to doubt that the committed bytes are the bytes that took the reading, and no reason at all to assume they are.",
+    "digestsOfTheMergedBytes": {
+      "meaning": "sha256 of each file as committed at bd2dc5e, computed on 2026-09-08 from the git object store. This is evidence of preservation since the merge -- that these bytes are still what #798 merged -- and it is NOT proof of historical execution identity. It does not say these bytes took the reading recorded above, and no digest computed after the fact ever could. It is recorded here so that a later reader can tell drift from the merged form apart from the separate, unanswerable question of what ran.",
+      "caveat": "The correction that added this block edits comments in tests/feasibility/wake-transport-qualification/harness.ts and tests/feasibility/native-session-inbox/harness.ts, so those two files no longer hash to the values below in the working tree. The values are anchored to bd2dc5e on purpose, which is why they are named for it.",
+      "sha256AtBd2dc5e": {
+        "tests/feasibility/wake-transport-qualification/harness.ts": "396efda35f16383a941b38cb5c2466d836a3a683e07d77bdd44f7f431b7cddd7",
+        "tests/feasibility/wake-transport-qualification/pty-session.py": "d687b5ac37e8bbee2e279f2508f6cbe6493360391bd4e046666578c8dac4f533",
+        "tests/feasibility/native-session-inbox/fake-anthropic.ts": "5a7cdefd558c4b4270e74eca691517cd0a9cd813eac8eaf313b80ddff0b48fbc",
+        "tests/feasibility/native-session-inbox/harness.ts": "a4b919ea9a557fe415d97691ec9fdcebb5926b723a4c16f729086a5a74f7f14f",
+        "scripts/qualify-wake-transport.ts": "7b3d352e9c036346aca39bb798a2af4431d46788be1fdc6cec50d2b0e828b122",
+        "src/mcp/role-conversation.ts": "8c380262961bb0c85886f67dc48fef097d09645020ccd7093cd3f93e9c517160"
+      }
+    },
+    "doesNotAffect": "The observations. The counts, the argv, the image digest, the frame bytes and the host in this file are what the run recorded, and an unidentified instrument does not make them untrue -- it makes them unrepeatable from this file alone. Nothing here was re-run, and nothing here was re-measured, to produce this correction."
+  },
   "client": {
     "name": "claude-code",
     "version": "2.1.263",
@@ -41,7 +67,7 @@
       "modelRequests": 2,
       "wakeCarryingModelRequests": 1,
       "followUpAfterInjection": true,
-      "settleMs": 20000,
+      "settleCeilingMs": 20000,
       "rawCapturePath": "evidence/local/u6-wake-transport-qualification/interactive-injection/capture.jsonl",
       "rawSessionLogPath": "evidence/local/u6-wake-transport-qualification/interactive-injection/session.log",
       "tempRootRemoved": true
@@ -64,7 +90,7 @@
       "modelRequests": 1,
       "wakeCarryingModelRequests": 0,
       "followUpAfterInjection": false,
-      "settleMs": 20000,
+      "settleCeilingMs": 20000,
       "rawCapturePath": "evidence/local/u6-wake-transport-qualification/interactive-control/capture.jsonl",
       "rawSessionLogPath": "evidence/local/u6-wake-transport-qualification/interactive-control/session.log",
       "tempRootRemoved": true
@@ -93,7 +119,7 @@
       "modelRequests": 2,
       "wakeCarryingModelRequests": 1,
       "followUpAfterInjection": true,
-      "settleMs": 20000,
+      "settleCeilingMs": 20000,
       "rawCapturePath": "evidence/local/u6-wake-transport-qualification/headless-injection/capture.jsonl",
       "rawSessionLogPath": "evidence/local/u6-wake-transport-qualification/headless-injection/session.log",
       "tempRootRemoved": true
@@ -122,7 +148,7 @@
       "modelRequests": 1,
       "wakeCarryingModelRequests": 0,
       "followUpAfterInjection": false,
-      "settleMs": 20000,
+      "settleCeilingMs": 20000,
       "rawCapturePath": "evidence/local/u6-wake-transport-qualification/headless-control/capture.jsonl",
       "rawSessionLogPath": "evidence/local/u6-wake-transport-qualification/headless-control/session.log",
       "tempRootRemoved": true
@@ -134,7 +160,9 @@
     "Provider isolation is an ANTHROPIC_BASE_URL override plus a dummy credential, not a network namespace. It bounds where inference went, not everything the process could do.",
     "The runtime does not hand the token to the model bare: it renders it inside a peer-message preamble of its own before it reaches model input. What is qualified is that the token arrives and starts a turn, not that it arrives unadorned. The preserved capture shows the surrounding text.",
     "The endpoint-directory policy is untouched by this slice, so registration through registerEndpoint is still refused for a socket outside the daemon state directory. See the finding of that name.",
-    "Interactive start required pre-provisioned answers to the onboarding, workspace-trust and custom-API-key prompts in a throwaway config. A session whose operator answered them differently is outside this reading."
+    "Interactive start required pre-provisioned answers to the onboarding, workspace-trust and custom-API-key prompts in a throwaway config. A session whose operator answered them differently is outside this reading.",
+    "settleCeilingMs is a ceiling on the post-injection wait, not a duration either arm was observed for. The control spends the whole ceiling; the injection arm returns on its first follow-up request. Two arms sharing a ceiling were watched for at most the same time, not for the same time, and the actual spans are not recorded here.",
+    "This file does not identify the instrument that produced it. headSha is git rev-parse HEAD at receipt-build time, which can name a tree that contains no harness -- the harness may be uncommitted while the reading is taken. See sourceBinding: for this reading the source is UNKNOWN, and a digest computed after the fact attests preservation since, not what executed."
   ],
   "findings": [
     {
@@ -153,5 +181,46 @@
         "Keep the pin exact and re-run this qualification on every client bump, which is what the constant's comment already promises."
       ]
     }
-  ]
+  ],
+  "evidenceCustody": {
+    "rawCaptures": {
+      "status": "PARTIAL",
+      "statement": "The rawCapturePath and rawSessionLogPath values are git-ignored paths under evidence/local/ in the worktree that ran the qualification. They are not committed and not reachable from a clone. All eight files are still present there and none has been deleted. Two arms' files are no longer this run's bytes: the interactive-injection and interactive-control capture and log were last written at 2026-09-07T23:55:34+09:00 and 23:55:56+09:00, after this receipt's producedAt of 23:49:22, because the suite's \"reading, re-taken\" rows run the same interactive probe and copy over the same durable paths. The headless pair (23:49:02 and 23:49:22) are this run's. So for the interactive arms these rows point at a later reading of the same arm rather than at the reading the rows record.",
+      "measuredFrom": "filesystem mtime, read on 2026-09-08; metadata rather than a digest, and reported as such"
+    },
+    "unrecoverableLosses": {
+      "status": "UNRECOVERABLE",
+      "note": "Not arms of this qualification, and not evidence for or against anything in it. Recorded here because this receipt is the durable artefact of the same U6 work, and a loss written down nowhere is indistinguishable from a loss quietly replaced. No regenerated file may be substituted for any of these, and nothing may be marked PASS on the strength of a regenerated stand-in.",
+      "destroyedBy": "`rm -rf /private/tmp/acp-u6-*` run by an earlier implementer. A prefix glob, so it took paths its author had not created and did not know were there.",
+      "paths": [
+        "/private/tmp/acp-u6-live-order-readback.json",
+        "/private/tmp/acp-u6-pr792-status-readback.json",
+        "/private/tmp/acp-u6-version-file-layout-commitlore"
+      ]
+    }
+  },
+  "corrections": {
+    "subject": "this receipt as merged at bd2dc5e (PR #798)",
+    "correctedAt": "2026-09-08",
+    "scope": "Claims only. No observation in this file was altered: every command, count, digest, byte string, path and timestamp is exactly what the run recorded. Nothing was re-run and nothing was re-measured. The positive observations -- injection 1 baseline request then 2 with the token in the second, control 1 and 1 with no token, in both the interactive and the headless shape -- are not in question and are unchanged.",
+    "changes": [
+      {
+        "what": "Every run row's `settleMs` is renamed `settleCeilingMs`. The value, 20000, is unchanged.",
+        "why": "The field was documented as \"the wall clock both arms waited after the injection point\", and the receipt was read as asserting the two arms observed for the same duration. That is not what the number is. The control sleeps the whole span; the injection arm waits with a predicate and returns the moment it sees the follow-up request, so its observed span is shorter and is not recorded anywhere. Equal values state an equal ceiling. The name now states that, so a reader cannot take the old claim off the field name.",
+        "doesNotInvalidate": "Nothing. The arms' unequal observed spans do not touch either positive observation, and no arm needs re-running on account of this."
+      },
+      {
+        "what": "`sourceBinding` added, status UNKNOWN. `headSha` is preserved byte for byte.",
+        "why": "See sourceBinding.statement. The receipt named a commit that cannot be the source of the reading, and said nothing about that."
+      },
+      {
+        "what": "`evidenceCustody` added.",
+        "why": "The raw-capture pointers were checked while establishing the source binding and two of the four no longer resolve to this run's bytes; and the three destroyed readback artefacts needed a durable place to stay recorded as a loss."
+      },
+      {
+        "what": "Two entries added to `limits`.",
+        "why": "A limit that lives only in a correction block is one a regenerated receipt drops. These two are also in the producer's LIMITS, so a re-run keeps stating them."
+      }
+    ]
+  }
 }
