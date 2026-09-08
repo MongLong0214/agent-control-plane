@@ -732,7 +732,7 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
     }
   }, 60_000);
 
-  it("leaves no peer behind on disconnect and an additional connection does not replace the holder", async () => {
+  it("leaves no peer behind on disconnect and a reconnect becomes the live CTO peer", async () => {
     const harness = makeHarness();
     const { projectId } = await registerFixtureProject(harness);
     const session = readySession(harness, "cto-peer");
@@ -772,15 +772,41 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       await until(() => incumbent.initialized(), "the incumbent's admission");
       const additional = await open();
       await until(() => additional.initialized(), "the additional connection's admission");
-      expect((await claimAs(additional, roleKey)).ok).toBe(false);
-      await additional.close();
-      const delivered = await claimAs(incumbent, roleKey);
-      expect(delivered.ok, `the incumbent peer was detached: ${delivered.message}`).toBe(true);
+      expect((await claimAs(additional, roleKey)).ok).toBe(true);
+      expect((await claimAs(incumbent, roleKey)).ok).toBe(false);
+      await incumbent.close();
+      const delivered = await claimAs(additional, roleKey);
+      expect(delivered.ok, `the successor peer was detached: ${delivered.message}`).toBe(true);
     } finally {
       for (const peer of opened) await peer.close();
       await listeners.close();
     }
   }, 60_000);
+
+  it("a reconnect becomes the live CEO peer while its incumbent socket stays open", async () => {
+    const harness = makeHarness();
+    const session = readySession(harness, "ceo-peer");
+    expect(harness.cp.bindings.bind({ role: Role.CEO, sessionId: session.sessionId }).allowed).toBe(true);
+    const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-ceo-close-"), TOKEN);
+    const opened: PeerHandle[] = [];
+    try {
+      const first = await connectPeer(listeners.socketPaths[0]!, { token: TOKEN, ...session });
+      opened.push(first);
+      await until(() => first.initialized(), "the first CEO admission");
+      const second = await connectPeer(listeners.socketPaths[0]!, { token: TOKEN, ...session });
+      opened.push(second);
+      await until(() => second.initialized(), "the second CEO admission");
+      expect((await listeners.ceoConversation.ask("reconnected")).allowed).toBe(true);
+      expect(second.received).toEqual(["reconnected"]);
+      expect(first.received).toEqual([]);
+      await first.close();
+      expect((await listeners.ceoConversation.ask("after late close")).allowed).toBe(true);
+      expect(second.received).toEqual(["reconnected", "after late close"]);
+    } finally {
+      for (const peer of opened) await peer.close();
+      await listeners.close();
+    }
+  });
 
   /**
    * `#760` C0 — the wake endpoint, and the two counterexamples that killed the first attempt at it.

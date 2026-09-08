@@ -111,11 +111,27 @@ describe("role attachment authorization without sockets", () => {
       sessionIncarnation: h.cp.sessions.require(subject.sessionId).incarnation });
     const first = new McpServer({ name: "first", version: "1" });
     const second = new McpServer({ name: "second", version: "1" });
-    const detachFirst = port.attach(first, auth);
-    const detachSecond = port.attach(second, auth);
+    const detachFirst = port.attach(first, auth, roleKey);
+    const detachSecond = port.attach(second, auth, roleKey);
     detachSecond();
     expect(port.connected(roleKey)).toBe(true);
     detachFirst();
+    expect(port.connected(roleKey)).toBe(false);
+  });
+
+  it("an ordinary reconnect acquires its holder slot before the incumbent closes", () => {
+    const credential = grant();
+    const auth = () => allow(ReasonCode.OK, { actor: subject.sessionId,
+      sessionId: subject.sessionId, sessionIncarnation: credential.sessionIncarnation });
+    const first = server();
+    const second = server();
+    const detachFirst = port.attach(first, auth);
+    const detachSecond = port.attach(second, auth);
+    expect(port.claimOwnerMessage(second, roleKey).reasonCode).toBe(ReasonCode.ROLE_PEER_UNSUPPORTED);
+    expect(port.claimOwnerMessage(first, roleKey).allowed).toBe(false);
+    detachFirst();
+    expect(port.claimOwnerMessage(second, roleKey).reasonCode).toBe(ReasonCode.ROLE_PEER_UNSUPPORTED);
+    detachSecond();
     expect(port.connected(roleKey)).toBe(false);
   });
 
@@ -266,7 +282,7 @@ describe("role attachment authorization without sockets", () => {
     expect(daemon.attachments.authorize(credential).allowed).toBe(true);
   });
 
-  it("authorization permanently invalidates a non-ACTIVE generation", () => {
+  it("a committed generation change permanently invalidates the credential", () => {
     const credential = grant();
     const binding = h.cp.bindings.active(roleKey)!;
     advance();
@@ -282,12 +298,113 @@ describe("role attachment authorization without sockets", () => {
     }
   });
 
+  it.each([
+    { attached: false, nested: false }, { attached: true, nested: false },
+    { attached: false, nested: true }, { attached: true, nested: true },
+  ])("an unobserved same-generation round trip permanently revokes an attachment: %j", ({ attached, nested }) => {
+    const credential = grant();
+    const binding = h.cp.bindings.active(roleKey)!;
+    const peer = server();
+    if (attached) valueOf(daemon.attachments.connect(peer, port, credential));
+    const roundTrip = () => {
+      advance("SURVIVED");
+      valueOf(h.cp.bindings.switchTo({ role: Role.PRIMARY_CTO, projectId: "attachment-project",
+        ...subject, conversation: "SURVIVED", reason: "unobserved return" }));
+    };
+    if (nested) h.cp.db.tx(roundTrip);
+    else roundTrip();
+    expect(h.cp.bindings.active(roleKey)).toEqual(binding);
+    // No authorization, lookup, or admission ran during the round trip.
+    expect(daemon.attachments.authorize(credential)).toMatchObject({ allowed: false,
+      reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED, message: "attachment credential is unknown or invalid" });
+    expect(daemon.attachments.connect(server(), port, credential).allowed).toBe(false);
+    expect(port.connected(roleKey)).toBe(false);
+    expect(h.cp.sessions.verifySecret(subject.sessionId, subject.sessionSecret).allowed).toBe(true);
+  });
+
+  it("committed transfers detach immediately and rolled-back transfers preserve attachments", () => {
+    const credential = grant();
+    valueOf(daemon.attachments.connect(server(), port, credential));
+    expect(() => h.cp.db.tx(() => { advance("SURVIVED"); throw new Error("rollback transfer"); }))
+      .toThrow("rollback transfer");
+    // An unrelated commit must not flush a notification left behind by rollback.
+    h.cp.db.tx(() => {});
+    expect(port.connected(roleKey)).toBe(true);
+    expect(daemon.attachments.authorize(credential).allowed).toBe(true);
+    h.cp.db.tx(() => {
+      advance("SURVIVED");
+      expect(port.connected(roleKey)).toBe(true);
+    });
+    expect(port.connected(roleKey)).toBe(false);
+  });
+
+  it("transfer notification retains its identity when the returned binding is edited", () => {
+    const credential = grant();
+    const other = ready();
+    h.cp.db.tx(() => {
+      const moved = valueOf(h.cp.bindings.switchTo({ role: Role.PRIMARY_CTO, projectId: "attachment-project",
+        ...other, conversation: "SURVIVED", reason: "move before commit" }));
+      moved.sessionId = credential.sessionId;
+      moved.sessionIncarnation = credential.sessionIncarnation;
+      valueOf(h.cp.bindings.switchTo({ role: Role.PRIMARY_CTO, projectId: "attachment-project",
+        ...subject, conversation: "SURVIVED", reason: "return before commit" }));
+    });
+    expect(daemon.attachments.authorize(credential).allowed).toBe(false);
+  });
+
+  it("a fresh attachment after a round trip survives later commits", () => {
+    const old = grant();
+    advance("SURVIVED");
+    valueOf(h.cp.bindings.switchTo({ role: Role.PRIMARY_CTO, projectId: "attachment-project",
+      ...subject, conversation: "SURVIVED", reason: "return for fresh approval" }));
+    expect(daemon.attachments.authorize(old).allowed).toBe(false);
+    const fresh = grant();
+    valueOf(daemon.attachments.connect(server(), port, fresh));
+    h.cp.db.tx(() => {});
+    expect(daemon.attachments.authorize(fresh).allowed).toBe(true);
+    expect(port.connected(roleKey)).toBe(true);
+  });
+
+  it("authorization rejects a noncurrent snapshot without repairing stored ownership", () => {
+    const credential = grant();
+    valueOf(daemon.attachments.connect(server(), port, credential));
+    const binding = h.cp.bindings.active(roleKey)!;
+    const active = vi.spyOn(h.cp.bindings, "active").mockReturnValue({ ...binding, bindingGeneration: 999 });
+    try {
+      expect(daemon.attachments.authorize(credential).allowed).toBe(false);
+      expect(port.endpointFor(roleKey)).toBeNull();
+      expect(port.connected(roleKey)).toBe(true);
+    } finally {
+      active.mockRestore();
+    }
+    // Reading an inconsistent view cannot manufacture a transfer or a revocation.
+    expect(daemon.attachments.authorize(credential).allowed).toBe(true);
+  });
+
+  it("an unchanged holder and a sibling transfer preserve the approved attachment", () => {
+    const credential = grant();
+    valueOf(daemon.attachments.connect(server(), port, credential));
+    valueOf(h.cp.bindings.switchTo({ role: Role.PRIMARY_CTO, projectId: "attachment-project",
+      ...subject, conversation: "SURVIVED", reason: "same holder" }));
+    expect(daemon.attachments.authorize(credential).allowed).toBe(true);
+    const manifest = fixtureManifest("attachment-sibling");
+    valueOf(h.cp.projects.register({ projectId: manifest.projectId, name: "fixture", manifest,
+      authorization: h.cp.manifestAuthorizationForTests(manifest) }));
+    valueOf(h.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: manifest.projectId, ...subject }));
+    valueOf(h.cp.bindings.switchTo({ role: Role.PRIMARY_CTO, projectId: manifest.projectId,
+      ...ready(), conversation: "SURVIVED", reason: "move sibling" }));
+    expect(daemon.attachments.authorize(credential).allowed).toBe(true);
+    expect(port.connected(roleKey)).toBe(true);
+  });
+
   const expectSuccessorAcquires = (route: "port" | "credential") => {
     const former = subject;
     const credential = grant();
     const binding = h.cp.bindings.active(roleKey)!;
     const incumbent = server();
-    valueOf(daemon.attachments.connect(incumbent, port, credential));
+    // An ordinary socket is not detached by attachment revocation. Admission must repair it.
+    port.attach(incumbent, () => allow(ReasonCode.OK, { actor: former.sessionId,
+      sessionId: former.sessionId, sessionIncarnation: credential.sessionIncarnation }));
     subject = advance("SURVIVED");
     const successorCredential = grant();
     const successor = server();

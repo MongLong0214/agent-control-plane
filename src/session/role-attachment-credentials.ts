@@ -7,7 +7,7 @@ import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../ceo/owner-auth
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { Role, SessionLifecycle } from "../domain/types.ts";
+import { Role, type RoleBinding, SessionLifecycle } from "../domain/types.ts";
 import type { RoleConversationPort } from "../mcp/role-conversation.ts";
 import { type AuthenticatedMcpPeer, respond } from "../mcp/shared.ts";
 import type { BindingRegistry } from "./binding-registry.ts";
@@ -51,6 +51,10 @@ const credentialSchema = z.object({
 });
 const hash = (secret: string): Buffer => createHash("sha256").update(secret).digest();
 const refused = (message: string): Decision<never> => deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, message);
+const scopeOf = (binding: RoleBinding): AttachmentScope => ({
+  sessionId: binding.sessionId, roleKey: binding.roleKey, sessionIncarnation: binding.sessionIncarnation,
+  assignmentId: binding.assignmentId, bindingGeneration: binding.bindingGeneration,
+});
 
 /**
  * Daemon-local attachment authority. Retains hashes only; no session credential is changed.
@@ -64,7 +68,16 @@ export class RoleAttachmentCredentials {
     private readonly sessions: SessionRegistry,
     private readonly bindings: BindingRegistry,
     private readonly owner: OwnerAuthorityPort,
-  ) {}
+  ) {
+    bindings.onSwitch((binding) => {
+      const current = scopeOf(binding);
+      for (const [attachmentId, record] of this.#records) {
+        if (record.scope.roleKey === binding.roleKey && digestOf(record.scope) !== digestOf(current)) {
+          this.#invalidate(attachmentId);
+        }
+      }
+    });
+  }
 
   /** Parameters an authenticated owner approves, read from the ACTIVE registry. */
   scope(sessionId: string, roleKey: string): Decision<AttachmentScope> {
@@ -75,10 +88,7 @@ export class RoleAttachmentCredentials {
         (session.lifecycle !== SessionLifecycle.READY && session.lifecycle !== SessionLifecycle.DRAINING)) {
       return deny(ReasonCode.BINDING_GENERATION_STALE, "attachment requires the current live primary holder");
     }
-    return allow(ReasonCode.OK, {
-      sessionId, roleKey, sessionIncarnation: session.incarnation,
-      assignmentId: binding.assignmentId, bindingGeneration: binding.bindingGeneration,
-    });
+    return allow(ReasonCode.OK, scopeOf(binding));
   }
 
   issue(input: unknown): Decision<AttachmentCredential> {
@@ -120,7 +130,6 @@ export class RoleAttachmentCredentials {
     if (this.#records.get(attachmentId) !== record) return refused("attachment has been invalidated");
     const current = this.scope(record.scope.sessionId, record.scope.roleKey);
     if (!current.allowed || digestOf(current.value) !== digestOf(record.scope)) {
-      this.#invalidate(attachmentId);
       return deny(ReasonCode.BINDING_GENERATION_STALE, "attachment generation is no longer ACTIVE");
     }
     return allow(ReasonCode.OK, { actor: record.scope.sessionId,

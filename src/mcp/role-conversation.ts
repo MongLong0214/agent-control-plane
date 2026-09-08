@@ -302,9 +302,9 @@ export class RoleConversationPort {
   /**
    * Records the peer that may be delivered to, returning its own detach.
    *
-   * Occupancy is revalidated before admission: a current incumbent stays, while a former holder
-   * cannot block its successor after a same-generation transfer. A scoped attachment can acquire
-   * only the one generation-approved role, even when its subject holds other roles too.
+   * An ordinary current holder replaces its earlier connection: the daemon may not yet have
+   * observed that socket closing. A scoped attachment acquires only an empty, approved role.
+   * Admission clears stale occupancy; holder and endpoint lookups only judge it.
    */
   attach(server: McpServer, authenticate: McpPeerAuthenticator, scopeRoleKey?: string): () => void {
     /*
@@ -330,7 +330,8 @@ export class RoleConversationPort {
     for (const binding of this.#bindings.currentCandidates()) {
       if (!this.#isCurrentHolder(binding, peer)) continue;
       if (scopeRoleKey !== undefined && binding.roleKey !== scopeRoleKey) continue;
-      if (this.currentHolderConnected(binding.roleKey)) continue;
+      this.#clearStalePeer(binding.roleKey);
+      if (scopeRoleKey !== undefined && this.#live.has(binding.roleKey)) continue;
       this.#live.set(binding.roleKey, { server, authenticate, binding, endpoint: null });
       owned.push(binding.roleKey);
     }
@@ -347,7 +348,11 @@ export class RoleConversationPort {
     return this.#live.has(roleKey);
   }
 
-  /** Admission revalidates occupancy; connected() remains a snapshot of the stored slot. */
+  #clearStalePeer(roleKey: string): void {
+    if (!this.currentHolderConnected(roleKey)) this.#live.delete(roleKey);
+  }
+
+  /** Pure eligibility lookup; admission owns stale-slot cleanup. connected() is a stored snapshot. */
   currentHolderConnected(roleKey: string): boolean {
     const peer = this.#live.get(roleKey);
     return peer !== undefined && this.#holderFor(peer.server, roleKey).allowed;
@@ -521,10 +526,9 @@ export class RoleConversationPort {
         { role: this.#role },
       );
     }
-    for (const [roleKey, peer] of owned) {
+    for (const [, peer] of owned) {
       const identity = peer.authenticate();
       if (!identity.allowed || !this.#isCurrentHolder(peer.binding, identity.value)) {
-        if (this.#live.get(roleKey) === peer) this.#live.delete(roleKey);
         return deny(ReasonCode.ROLE_PEER_STALE, "the registering peer no longer holds its role");
       }
     }
@@ -604,7 +608,6 @@ export class RoleConversationPort {
     }
     const identity = peer.authenticate();
     if (!identity.allowed || !this.#isCurrentHolder(peer.binding, identity.value)) {
-      if (this.#live.get(roleKey) === peer) this.#live.delete(roleKey);
       return deny(
         ReasonCode.ROLE_PEER_STALE,
         "the attached peer no longer holds the role its socket was admitted under",
@@ -690,7 +693,6 @@ export class RoleConversationPort {
     }
     const identity = peer.authenticate();
     if (!identity.allowed || !this.#isCurrentHolder(peer.binding, identity.value)) {
-      if (this.#live.get(roleKey) === peer) this.#live.delete(roleKey);
       return deny(
         ReasonCode.ROLE_PEER_STALE,
         "the attached peer no longer holds the role its socket was admitted under",

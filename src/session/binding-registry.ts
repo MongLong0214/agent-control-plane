@@ -140,6 +140,7 @@ const LIVE_RUN_STATES = [
  */
 export class BindingRegistry {
   #tasks: TaskGraph | null = null;
+  readonly #switchListeners = new Set<(binding: Readonly<RoleBinding>) => void>();
 
   constructor(
     private readonly db: Db,
@@ -152,6 +153,11 @@ export class BindingRegistry {
   /** Wired after construction because TaskGraph needs no binding registry dependency. */
   attach(ports: { tasks?: TaskGraph }): void {
     if (ports.tasks) this.#tasks = ports.tasks;
+  }
+
+  /** Daemon-local authorities observe committed transfers, including same-generation moves. */
+  onSwitch(listener: (binding: Readonly<RoleBinding>) => void): void {
+    this.#switchListeners.add(listener);
   }
 
   /**
@@ -547,7 +553,9 @@ export class BindingRegistry {
             holderMessagesRejected: carried.rejected.length,
           },
         });
-        return allow(ReasonCode.OK, this.require(roleKey));
+        const binding = this.require(roleKey);
+        this.#notifySwitch(binding);
+        return allow(ReasonCode.OK, binding);
       }
 
       if (current) {
@@ -647,7 +655,17 @@ export class BindingRegistry {
         },
       });
 
-      return allow(ReasonCode.OK, this.require(roleKey));
+      const binding = this.require(roleKey);
+      this.#notifySwitch(binding);
+      return allow(ReasonCode.OK, binding);
+    });
+  }
+
+  #notifySwitch(binding: RoleBinding): void {
+    // The caller receives binding before an outer transaction commits; retain our own snapshot.
+    const transferred = { ...binding };
+    this.db.afterCommit(() => {
+      for (const listener of this.#switchListeners) listener(transferred);
     });
   }
 

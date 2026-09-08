@@ -5,7 +5,7 @@ const roleAttachmentSocketRegistrationOwner = {
   "find": "const owned = [...this.#live.entries()].filter(([, peer]) => peer.server === server);",
   "replace": "const owned = [...this.#live.entries()];",
   "killedBy": [
-    "tests/unit/role-attachment-sockets.test.ts::a different connection cannot register for the attachment holder"
+    "tests/unit/role-attachment-sockets.test.ts::an ordinary holder reconnect takes over an attachment and the former connection cannot register"
   ]
 };
 

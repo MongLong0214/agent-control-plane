@@ -46,7 +46,7 @@ const fixture = async () => {
   const current = attach(second);
   const endpoint = "/attachment-state/wake.sock";
   expect((await port.registerEndpoint(incumbent, endpoint)).allowed).toBe(true);
-  return { port, active, first, second, current, endpoint };
+  return { port, active, first, second, incumbent, current, endpoint };
 };
 
 describe("attachment endpoint reservations", () => {
@@ -55,7 +55,7 @@ describe("attachment endpoint reservations", () => {
     active.set(first.roleKey, { ...first, sessionId: "successor", sessionIncarnation: "successor" });
     // No query or reauthorization of the competitor before registration.
     expect(await port.registerEndpoint(current, endpoint)).toMatchObject({ allowed: true, value: [second.roleKey] });
-    expect(port.connected(first.roleKey)).toBe(false);
+    expect(port.connected(first.roleKey)).toBe(true);
     expect(port.endpointFor(second.roleKey)).toBe(endpoint);
   });
 
@@ -70,9 +70,24 @@ describe("attachment endpoint reservations", () => {
     expect(port.endpointFor(second.roleKey)).toBeNull();
   });
 
+  it("stale registration and wake refuse without repairing stored ownership", async () => {
+    const { port, active, first, incumbent, endpoint } = await fixture();
+    vi.mocked(port.wake).mockRestore();
+    active.set(first.roleKey, { ...first, sessionId: "successor", sessionIncarnation: "successor" });
+    expect(await port.registerEndpoint(incumbent, endpoint)).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.ROLE_PEER_STALE,
+    });
+    expect(port.connected(first.roleKey)).toBe(true);
+    expect(await port.wake(first.roleKey)).toMatchObject({ allowed: false, reasonCode: ReasonCode.ROLE_PEER_STALE });
+    expect(port.connected(first.roleKey)).toBe(true);
+  });
+
   it("endpoint lookup does not expose a former holder registration", async () => {
     const { port, active, first } = await fixture();
     active.set(first.roleKey, { ...first, sessionId: "successor", sessionIncarnation: "successor" });
     expect(port.endpointFor(first.roleKey)).toBeNull();
+    expect(port.connected(first.roleKey)).toBe(true);
+    expect(port.currentHolderConnected(first.roleKey)).toBe(false);
+    expect(port.connected(first.roleKey)).toBe(true);
   });
 });

@@ -141,12 +141,12 @@ describe("role attachment over real daemon sockets", () => {
     expect(h.cp.sessions.verifySecret(subject.sessionId, subject.sessionSecret).allowed).toBe(true);
   });
 
-  it("a different connection cannot register for the attachment holder", async () => {
+  it("an ordinary holder reconnect takes over an attachment and the former connection cannot register", async () => {
     const first = await open(await grant());
     const sibling = await open(subject);
-    expect((await sibling.register()).ok).toBe(false);
+    expect((await first.register()).ok).toBe(false);
     expect(listeners.ctoConversation.endpointFor(roleKey)).toBeNull();
-    expect((await first.register()).ok).toBe(true);
+    expect((await sibling.register()).ok).toBe(true);
     expect(listeners.ctoConversation.endpointFor(roleKey)).toBe(endpoint);
   });
 
@@ -201,14 +201,13 @@ describe("role attachment over real daemon sockets", () => {
   });
 
   it("registration revalidation refuses a changed generation on an already open attachment", async () => {
-    // This measures revalidation at registration, not eager cleanup on transfer. Successor
-    // admission without an intervening registration is covered by the authorization tests.
+    // Transfer itself clears attachment ownership, before a tool or lookup observes it.
     const peer = await open(await grant());
     expect((await peer.register()).ok).toBe(true);
     valueOf(h.cp.bindings.switchTo({ role: Role.PRIMARY_CTO, projectId: "attachment-project",
       ...ready(), conversation: "REPLACED", reason: "test transition" }));
-    expect((await peer.register()).ok).toBe(false);
     expect(listeners.ctoConversation.connected(roleKey)).toBe(false);
+    expect((await peer.register()).ok).toBe(false);
     expect(listeners.ctoConversation.endpointFor(roleKey)).toBeNull();
   });
 
@@ -217,7 +216,6 @@ describe("role attachment over real daemon sockets", () => {
     const peer = await open(credential);
     expect((await peer.register()).ok).toBe(true);
     valueOf(daemon.attachments.revoke({ ...subject, attachmentId: credential.attachmentId }));
-    // endpointFor revalidates and can delete stale slots; observe cleanup before calling it.
     expect(listeners.ctoConversation.connected(roleKey)).toBe(false);
     expect(listeners.ctoConversation.endpointFor(roleKey)).toBeNull();
     expect((await peer.register()).ok).toBe(false);

@@ -250,6 +250,7 @@ export class Db {
   /** Limited compatibility surface for diagnostics; authority must never receive the handle. */
   readonly raw: DatabaseDiagnostics;
   #depth = 0;
+  #afterCommit: Array<() => void> = [];
   #poisoned = false;
   #evidenceWriteMarkerDepth = 0;
   #schemaMigrationMarkerDepth = 0;
@@ -722,11 +723,12 @@ export class Db {
     if (this.#depth > 0) return this.guardSync(fn());
     this.#raw.exec("BEGIN IMMEDIATE");
     this.#depth += 1;
+    let out: T;
     try {
-      const out = this.guardSync(fn());
+      out = this.guardSync(fn());
       this.#raw.exec("COMMIT");
-      return out;
     } catch (err) {
+      this.#afterCommit = [];
       try {
         this.#raw.exec("ROLLBACK");
       } catch {
@@ -737,6 +739,16 @@ export class Db {
     } finally {
       this.#depth -= 1;
     }
+    const committed = this.#afterCommit;
+    this.#afterCommit = [];
+    for (const notify of committed) notify();
+    return out;
+  }
+
+  /** Publish in-memory effects only after the outer transaction commits. Rollback discards them. */
+  afterCommit(notify: () => void): void {
+    if (this.#depth > 0) this.#afterCommit.push(notify);
+    else notify();
   }
 
   /**
