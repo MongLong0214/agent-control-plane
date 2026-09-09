@@ -1,0 +1,4 @@
+Limit: relay subscription (B1), ingress address resolution (B4) and going live are outside this pull request; nothing pushes into the new port yet, so there is no behaviour change
+Limit: RoleConversationPort is deliberately narrower than CeoConversationPort; the Telegram turn budget, the concurrency rules and the REACHED/NEVER_REACHED contact facts belong to the owner-conversation path
+Warn: a connection is not a standing permission: deliver re-runs the same authentication as an inbound tool call every time, and a socket whose binding has moved is dropped there as ROLE_PEER_STALE
+Provenance: reconstructed
