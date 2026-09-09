@@ -31,11 +31,30 @@ const ROOT = fileURLToPath(new URL("..", import.meta.url));
  * Where a refusal is decided. Listed rather than discovered, because "a condition that decides a
  * refusal" is not a syntactic property — and a list that is wrong is visible, while a heuristic
  * that quietly skips a file is the failure this whole set is about.
+ *
+ * That argument does not make this list a closure: it has missed newly added authorities three times.
+ * A check that names its subjects explicitly is blind to subjects added later; adding another
+ * name is a rule that will be needed again. This is the fallback, not a claim of discovery.
+ *
+ * Derivation was investigated here. Applying the existing detector to all src TypeScript files
+ * still skips single-line chains, misses closing operands without its comparison/line-ending
+ * shape, and counts several operands on one line as one. Nearby-anchor matching also cannot
+ * establish that each operand is named. In particular, the attachment authority's connect and
+ * revoke refusals are single-line chains. Discovering files with this same detector would keep
+ * those holes; looking only for `deny` would additionally miss wrappers such as `refused` and
+ * predicates whose caller refuses. Conversely, every logical chain includes routing and value
+ * construction as well as refusals. A safe conservative discovery needs those obligations
+ * answered too, with a detector that actually enumerates their operands, before claiming PASS.
+ *
+ * Retain the explicit fallback until that replacement is available. Print its whole boundary on
+ * every run, including empty files, so the PASS below cannot be mistaken for a source-tree census.
  */
 const DECIDING_FILES = [
   "src/conversation/turn-coordinator.ts",
   "src/acceptance/disposable-realm.ts",
   "src/daemon/daemon.ts",
+  "src/session/role-attachment-credentials.ts",
+  "src/mcp/role-conversation.ts",
 ];
 
 /**
@@ -104,7 +123,13 @@ let operands = 0;
  */
 let singleLine = 0;
 
+process.stdout.write(
+  `CENSUS: scanning ${DECIDING_FILES.length} file(s), selected by the explicit DECIDING_FILES ` +
+    `fallback; no source discovery, 0 file exclusions.\n`,
+);
+
 for (const file of DECIDING_FILES) {
+  process.stdout.write(`  scanned: ${file}\n`);
   const source = readFileSync(join(ROOT, file), "utf8");
   const lines = source.split("\n");
 
@@ -138,6 +163,11 @@ for (const file of DECIDING_FILES) {
 }
 
 const answered = unnamed.filter(({ file, text }) => !UNANSWERED.has(`${file}::${text}`));
+
+process.stdout.write(
+  `CENSUS: scanned ${DECIDING_FILES.length} file(s); selected ${DECIDING_FILES.length} by name, ` +
+    `not by a derived refusal property. Counts below are operand lines; one line may hold several operands.\n`,
+);
 
 if (unnamed.length > 0) {
   for (const { file, line, text } of unnamed) {

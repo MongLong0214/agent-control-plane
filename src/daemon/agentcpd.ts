@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 import type { Transport, TransportSendOptions } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { AttachmentCredential, RoleAttachmentCredentials } from "../session/role-attachment-credentials.ts";
 
 import { ControlPlane, defaultConfig, type ControlPlaneConfig } from "../app/control-plane.ts";
 import { COLLECTOR_TIMEOUT_MS } from "../capacity/usage-collectors.ts";
@@ -156,14 +158,16 @@ export const startDaemonMcpListeners = (
   cp: ControlPlane,
   stateDir: string,
   token: string,
-  daemon: { finalizeApprovedRun(runId: string): void | Promise<unknown> },
+  daemon: { finalizeApprovedRun(runId: string): void | Promise<unknown>; attachments?: RoleAttachmentCredentials },
 ): Promise<LocalMcpListeners> =>
   startLocalMcpListeners(cp, stateDir, token, {
     onCeoApproved: (runId) => daemon.finalizeApprovedRun(runId),
+    ...(daemon.attachments ? { attachments: daemon.attachments } : {}),
   });
 
 /** Tests shorten the deadline without weakening the daemon's production default. */
 export interface LocalMcpListenerOptions {
+  attachments?: RoleAttachmentCredentials;
   handshakeTimeoutMs?: number;
   /** Internal daemon notification after a successful ordinary CEO confirmation. */
   onCeoApproved?: (runId: string) => void | Promise<unknown>;
@@ -505,6 +509,7 @@ export const startLocalMcpListeners = async (
         return server;
       },
       true,
+      options.attachments ? { authority: options.attachments, port: ctoConversation } : undefined,
     );
   } catch (err) {
     await closeSocketServer(hermes);
@@ -1072,11 +1077,39 @@ const startMcpSocket = async (
     credential: PeerCredential,
   ) => ReturnType<typeof createHermesServer>,
   permitPendingHandoffAck = false,
+  attachments?: { authority: RoleAttachmentCredentials; port: RoleConversationPort },
 ): Promise<Server> => {
   removeStaleSocket(path);
   const server = createServer((socket) => {
     void authenticateSocket(socket, token, handshakeTimeoutMs).then(async (accepted) => {
       if (!accepted) return;
+      if ("attachmentId" in accepted.credential) {
+        if (!attachments) {
+          endWithDecision(socket, deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "this socket does not admit attachments"));
+          return;
+        }
+        const mcp = new McpServer({ name: "role-attachment", version: "1" });
+        const attached = attachments.authority.connect(mcp, attachments.port, accepted.credential);
+        if (!attached.allowed) {
+          endWithDecision(socket, attached);
+          return;
+        }
+        // The ordinary CTO and CEO factories set server.server.onclose to their detach.
+        // The current SDK's Protocol.connect wires transport.onclose synchronously before
+        // SocketTransport.start resumes the paused socket. Fresh servers/transports cannot
+        // hit the already-connected/already-started rejections, so those routes rely on MCP
+        // close, including socket.destroy in catch. Attachments additionally cover SDK/mock
+        // orderings that close or reject before that wiring. Revisit both sibling routes if
+        // an SDK upgrade changes this ordering.
+        socket.once("close", attached.value);
+        try {
+          await mcp.connect(accepted.transport);
+        } catch (err) {
+          attached.value();
+          socket.destroy(err instanceof Error ? err : new Error(String(err)));
+        }
+        return;
+      }
       // One server per authenticated connection: the peer identity belongs to the
       // transport, so it can never be re-declared by a tool argument (§21, §27.3).
       const opening = authenticateSocketPeer(cp, accepted.credential, expectedRoles, permitPendingHandoffAck);
@@ -1579,7 +1612,7 @@ const currentBindingsForRoles = (cp: ControlPlane, roles: readonly Role[]): Role
 
 interface AcceptedConnection {
   transport: SocketTransport;
-  credential: PeerCredential;
+  credential: PeerCredential | AttachmentCredential;
 }
 
 interface ActiveBoundSocketPeer {
@@ -1736,7 +1769,7 @@ const lifecyclePermitsBoundSocket = (lifecycle: SessionLifecycle, role: Role): b
   lifecycle === SessionLifecycle.READY ||
   (lifecycle === SessionLifecycle.DRAINING && role === Role.PRIMARY_CTO);
 
-const authenticateSocket = (
+export const authenticateSocket = (
   socket: Socket,
   token: string,
   handshakeTimeoutMs: number,
@@ -1781,7 +1814,9 @@ const authenticateSocket = (
         return reject();
       }
       if (!localMcpTokenMatches(presented, token)) return reject();
-      const credential = presentedCredential(presented);
+      const credential = presented && typeof presented === "object" && "attachmentId" in presented
+        ? presented as AttachmentCredential
+        : presentedCredential(presented);
       if (!credential) return reject();
       socket.pause();
       finish({ transport: new SocketTransport(socket, remainder), credential });
@@ -1955,7 +1990,10 @@ class SocketTransport implements Transport {
     private readonly socket: Socket,
     initial: Buffer,
   ) {
-    this.#buffer = initial;
+    // The handshake remainder is a view over plaintext credentials, even when empty.
+    // Allocate outside the Buffer pool: Buffer.from could share that same backing slab.
+    this.#buffer = Buffer.alloc(initial.length);
+    initial.copy(this.#buffer);
   }
 
   async start(): Promise<void> {
@@ -1982,7 +2020,11 @@ class SocketTransport implements Transport {
   }
 
   private readonly receive = (chunk: Buffer): void => {
-    this.#buffer = Buffer.concat([this.#buffer, chunk]);
+    // A later pooled concat could regain the slab that held the handshake credentials.
+    const next = Buffer.alloc(this.#buffer.length + chunk.length);
+    this.#buffer.copy(next);
+    chunk.copy(next, this.#buffer.length);
+    this.#buffer = next;
     this.processBuffer();
   };
 

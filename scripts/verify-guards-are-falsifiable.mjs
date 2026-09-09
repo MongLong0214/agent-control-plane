@@ -4559,6 +4559,65 @@ const GUARDS = [
       "tests/unit/buzz-mention-subscriber.test.ts::answers the NIP-42 challenge with a signed auth event, then asks for kind 9 addressed to itself in its configured rooms",
     ],
   },
+  // Attachment acceptance rows retained here within this change's file budget.
+  {
+    id: "role-attachment-acquisition-receipt",
+    what: "attachment authorization: the acquisition receipt checks current holder occupancy",
+    file: "src/session/role-attachment-credentials.ts",
+    find: "if (!port.currentHolderConnected(record.scope.roleKey)) return refused(\"attachment did not acquire its role slot\");",
+    replace: "if (!port.connected(record.scope.roleKey)) return refused(\"attachment did not acquire its role slot\");",
+    killedBy: [
+      "tests/unit/role-attachment-authorization.test.ts::connect refuses stale registration without consuming a pending credential"
+    ]
+  },
+  {
+    id: "role-attachment-bind-notification",
+    what: "a committed bind publishes its successor",
+    file: "src/session/binding-registry.ts",
+    find: "      this.#notifySwitch(created, reused.value ?? undefined);\n",
+    replace: "",
+    killedBy: ["tests/unit/role-attachment-authorization.test.ts::binding a revoked key publishes its committed successor"],
+  },
+  {
+    id: "role-attachment-holder-session-operand",
+    what: "endpoint currency checks the session independently of incarnation",
+    file: "src/mcp/role-conversation.ts",
+    find: "      current.sessionId === peer.sessionId &&\n",
+    replace: "",
+    killedBy: ["tests/unit/role-attachment-endpoints.test.ts::a different session with the same incarnation cannot retain the holder endpoint"],
+  },
+  {
+    id: "role-attachment-registration-authentication",
+    what: "registration refuses a denied authenticator independently of binding currency",
+    file: "src/mcp/role-conversation.ts",
+    find: "\n      if (!identity.allowed || !this.#isCurrentHolder(peer.binding, identity.value)) {",
+    replace: "\n      if (!this.#isCurrentHolder(peer.binding, identity.value!)) {",
+    killedBy: ["tests/unit/role-attachment-endpoints.test.ts::registration refuses a denied authenticator while the registry still names the peer as holder"],
+  },
+  {
+    id: "role-attachment-revocation-notification",
+    what: "a committed revocation detaches and reaps attachments",
+    file: "src/session/binding-registry.ts",
+    find: "      this.#notifySwitch({ ...current, status: \"REVOKED\" });\n",
+    replace: "",
+    killedBy: ["tests/unit/role-attachment-authorization.test.ts::committed revocations detach immediately"],
+  },
+  {
+    id: "role-attachment-revocation-status",
+    what: "a revoked scope is invalid even when its identity is unchanged",
+    file: "src/session/role-attachment-credentials.ts",
+    find: "binding.status === \"REVOKED\" || ",
+    replace: "",
+    killedBy: ["tests/unit/role-attachment-authorization.test.ts::committed revocations detach immediately"],
+  },
+  {
+    id: "role-attachment-operand-scope-session",
+    what: "attachment operands: scope returns a typed refusal when the binding outlives its session lookup",
+    file: "src/session/role-attachment-credentials.ts",
+    find: "        !session || binding.sessionIncarnation !== session.incarnation ||",
+    replace: "        binding.sessionIncarnation !== session.incarnation ||",
+    killedBy: ["tests/unit/role-attachment-authorization.test.ts::scope returns a typed refusal when the binding outlives its session lookup"],
+  },
 ];
 
 /**

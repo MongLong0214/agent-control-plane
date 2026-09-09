@@ -140,6 +140,7 @@ const LIVE_RUN_STATES = [
  */
 export class BindingRegistry {
   #tasks: TaskGraph | null = null;
+  readonly #switchListeners = new Set<(binding: Readonly<RoleBinding>) => void>();
 
   constructor(
     private readonly db: Db,
@@ -152,6 +153,11 @@ export class BindingRegistry {
   /** Wired after construction because TaskGraph needs no binding registry dependency. */
   attach(ports: { tasks?: TaskGraph }): void {
     if (ports.tasks) this.#tasks = ports.tasks;
+  }
+
+  /** Daemon-local authorities observe committed binds, revocations and same-generation moves. */
+  onSwitch(listener: (binding: Readonly<RoleBinding>) => void): void {
+    this.#switchListeners.add(listener);
   }
 
   /**
@@ -353,7 +359,9 @@ export class BindingRegistry {
         runId: input.runId ?? null,
         evidence: { role: input.role, generation, mode: input.mode ?? "PREFERRED" },
       });
-      return allow(ReasonCode.OK, this.require(roleKey));
+      const created = this.require(roleKey);
+      this.#notifySwitch(created, reused.value ?? undefined);
+      return allow(ReasonCode.OK, created);
     });
   }
 
@@ -547,7 +555,9 @@ export class BindingRegistry {
             holderMessagesRejected: carried.rejected.length,
           },
         });
-        return allow(ReasonCode.OK, this.require(roleKey));
+        const binding = this.require(roleKey);
+        this.#notifySwitch(binding, owner.actor_id);
+        return allow(ReasonCode.OK, binding);
       }
 
       if (current) {
@@ -647,7 +657,28 @@ export class BindingRegistry {
         },
       });
 
-      return allow(ReasonCode.OK, this.require(roleKey));
+      const binding = this.require(roleKey);
+      this.#notifySwitch(binding);
+      return allow(ReasonCode.OK, binding);
+    });
+  }
+
+  #notifySwitch(binding: RoleBinding, movedActorId?: string): void {
+    // Every currency-changing route (bind, both switchTo exits, revoke) publishes here.
+    // Revocation keeps the scope identity but publishes status REVOKED so it also ends authority.
+    // The caller receives binding before an outer transaction commits; retain our own snapshot.
+    const transferred = { ...binding };
+    // A runtime pointer belongs to the actor, so every active assignment sharing it moves.
+    // Snapshot siblings now too: a second move before commit must not erase the first one.
+    const siblings = movedActorId ? this.db.all<{ role_key: string }>(
+      `SELECT role_key FROM assignments WHERE actor_id = ? AND status = 'ACTIVE' AND role_key <> ?`,
+      [movedActorId, binding.roleKey],
+    ).map(({ role_key }) => this.require(role_key)) : [];
+    const publications = [transferred, ...siblings];
+    this.db.afterCommit(() => {
+      for (const snapshot of publications) {
+        for (const listener of this.#switchListeners) listener(snapshot);
+      }
     });
   }
 
@@ -694,6 +725,7 @@ export class BindingRegistry {
         sessionId: current.sessionId,
         evidence: { reason, generation: current.bindingGeneration },
       });
+      this.#notifySwitch({ ...current, status: "REVOKED" });
       return allow(ReasonCode.OK, undefined);
     });
   }

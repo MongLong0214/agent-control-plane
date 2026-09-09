@@ -208,12 +208,16 @@ type EndpointCheck =
  * conclusion whose reading no longer existed, and a conclusion nobody can re-read is indistinguishable
  * from one nobody took.
  *
+ * Raw captures and logs use fixed, overwriteable local paths, and the three previously recorded
+ * historical losses remain unrecoverable. The raw captures behind the receipt produced at
+ * 2026-09-08T23:01:02.003Z have since been overwritten and are not recoverable.
+ *
  * The reading behind this value covers an **interactive** start, which the C0 one did not. That
  * matters because `isInteractiveClaudeInvocation` (src/registry/canonical-self-claim.ts) refuses
  * `-p`, `--print`, `--output-format` and `--input-format`: the process that may hold the canonical
  * claim is exactly the shape a headless-only qualification never observed.
  */
-export const C0_QUALIFIED_CLIENT = { name: "claude-code", version: "2.1.263" } as const;
+export const C0_QUALIFIED_CLIENT = { name: "claude-code", version: "2.1.265" } as const;
 
 /**
  * Owner-only, in the POSIX sense the 0700 state directory already means: no group bits, no other
@@ -302,13 +306,11 @@ export class RoleConversationPort {
   /**
    * Records the peer that may be delivered to, returning its own detach.
    *
-   * A later connection replaces an earlier one: both authenticated as the session holding this
-   * role's active binding, so the second is a reconnect rather than a takeover, and refusing it
-   * would strand delivery on a socket whose peer has already gone while the daemon has not yet
-   * observed the close. Detach is identity-checked so a late close from the replaced connection
-   * cannot clear its successor.
+   * An ordinary current holder replaces its earlier connection: the daemon may not yet have
+   * observed that socket closing. A scoped attachment acquires only an empty, approved role.
+   * Admission clears stale occupancy; holder and endpoint lookups only judge it.
    */
-  attach(server: McpServer, authenticate: McpPeerAuthenticator): () => void {
+  attach(server: McpServer, authenticate: McpPeerAuthenticator, scopeRoleKey?: string): () => void {
     /*
      * **The connection's slots come from the registry, keyed on who it authenticated as.**
      *
@@ -331,6 +333,9 @@ export class RoleConversationPort {
     const owned: string[] = [];
     for (const binding of this.#bindings.currentCandidates()) {
       if (!this.#isCurrentHolder(binding, peer)) continue;
+      if (scopeRoleKey !== undefined && binding.roleKey !== scopeRoleKey) continue;
+      this.#clearStalePeer(binding.roleKey);
+      if (scopeRoleKey !== undefined && this.#live.has(binding.roleKey)) continue;
       this.#live.set(binding.roleKey, { server, authenticate, binding, endpoint: null });
       owned.push(binding.roleKey);
     }
@@ -347,8 +352,19 @@ export class RoleConversationPort {
     return this.#live.has(roleKey);
   }
 
+  #clearStalePeer(roleKey: string): void {
+    if (!this.currentHolderConnected(roleKey)) this.#live.delete(roleKey);
+  }
+
+  /** Pure eligibility lookup; admission owns stale-slot cleanup. connected() is a stored snapshot. */
+  currentHolderConnected(roleKey: string): boolean {
+    const peer = this.#live.get(roleKey);
+    return peer !== undefined && this.#holderFor(peer.server, roleKey).allowed;
+  }
+
   /** The endpoint this role's live peer registered, or `null`. Exported for the wake's own rows. */
   endpointFor(roleKey: string): string | null {
+    if (!this.currentHolderConnected(roleKey)) return null;
     return this.#live.get(roleKey)?.endpoint ?? null;
   }
 
@@ -514,6 +530,12 @@ export class RoleConversationPort {
         { role: this.#role },
       );
     }
+    for (const [, peer] of owned) {
+      const identity = peer.authenticate();
+      if (!identity.allowed || !this.#isCurrentHolder(peer.binding, identity.value)) {
+        return deny(ReasonCode.ROLE_PEER_STALE, "the registering peer no longer holds its role");
+      }
+    }
     const client = server.server.getClientVersion();
     if (client?.name !== C0_QUALIFIED_CLIENT.name || client.version !== C0_QUALIFIED_CLIENT.version) {
       return deny(
@@ -533,7 +555,7 @@ export class RoleConversationPort {
     // arrive at whichever process actually holds the bind, so the second one is refused rather
     // than quietly aliased onto the first.
     for (const [roleKey, peer] of this.#live) {
-      if (peer.server !== server && peer.endpoint === validated.value) {
+      if (peer.server !== server && peer.endpoint === validated.value && this.currentHolderConnected(roleKey)) {
         return deny(
           ReasonCode.ROLE_PEER_UNSUPPORTED,
           "another live peer of this role already registered that wake endpoint",
@@ -590,7 +612,6 @@ export class RoleConversationPort {
     }
     const identity = peer.authenticate();
     if (!identity.allowed || !this.#isCurrentHolder(peer.binding, identity.value)) {
-      if (this.#live.get(roleKey) === peer) this.#live.delete(roleKey);
       return deny(
         ReasonCode.ROLE_PEER_STALE,
         "the attached peer no longer holds the role its socket was admitted under",
@@ -676,7 +697,6 @@ export class RoleConversationPort {
     }
     const identity = peer.authenticate();
     if (!identity.allowed || !this.#isCurrentHolder(peer.binding, identity.value)) {
-      if (this.#live.get(roleKey) === peer) this.#live.delete(roleKey);
       return deny(
         ReasonCode.ROLE_PEER_STALE,
         "the attached peer no longer holds the role its socket was admitted under",
