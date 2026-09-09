@@ -1,0 +1,5 @@
+Limit: **컷오버는 하지 않습니다.** `buzz-acp` 는 그대로이고 새 소켓을 가리키는 것은 아직 없습니다.
+Limit: **unresolved-conversation park 을 안 했습니다.** **Buzz 에는 그 탈출구를 위한 명령 파서가 없습니다.**
+Limit: `hermes acp` 에는 `--resume` 이 없어 **구조적으로** 자기 세션을 시작합니다.
+Warn: `allowedActors` 가 오너와 허용된 peer 를 구분하지 않습니다 — allowlist 의 peer 가 CEO 를 지목하면 턴을 얻습니다.
+Provenance: reconstructed
