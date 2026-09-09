@@ -11,8 +11,9 @@
  * remembered to do it. Remembering is the part that fails.
  *
  * So the mutation is the test. For each row: apply the edit that removes the guard, run only the
- * tests that claim to cover it, and require at least one of them to fail. A row that survives is
- * reported as a guard nothing is watching.
+ * tests that claim to cover it, and require at least one of their own assertions to fail. Only a
+ * uniquely anchored mutation that still compiles can earn a kill. A row that survives is reported
+ * as a guard nothing is watching; a broken run is reported separately.
  *
  * Two structural failures matter as much as the behavioural ones:
  *
@@ -38,6 +39,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { CASES_DIR, loadFalsifiabilityCases } from "./lib/falsifiability-cases.mjs";
+import { classifyVitestRun } from "./run-vitest-gate.mjs";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const VITEST = join(ROOT, "node_modules", ".bin", "vitest");
@@ -4591,7 +4593,12 @@ const GUARDS = [
     what: "registration refuses a denied authenticator independently of binding currency",
     file: "src/mcp/role-conversation.ts",
     find: "\n      if (!identity.allowed || !this.#isCurrentHolder(peer.binding, identity.value)) {",
-    replace: "\n      if (!this.#isCurrentHolder(peer.binding, identity.value!)) {",
+    // A denied Decision has no value. Bypass authentication using the attached identity, while
+    // still checking its binding against the current registry; no assertion can invent a value.
+    replace: "\n      if (!this.#isCurrentHolder(peer.binding, identity.allowed ? identity.value : {\n" +
+      "        actor: peer.binding.sessionId, sessionId: peer.binding.sessionId,\n" +
+      "        sessionIncarnation: peer.binding.sessionIncarnation,\n" +
+      "      })) {",
     killedBy: ["tests/unit/role-attachment-endpoints.test.ts::registration refuses a denied authenticator while the registry still names the peer as holder"],
   },
   {
@@ -4614,8 +4621,12 @@ const GUARDS = [
     id: "role-attachment-operand-scope-session",
     what: "attachment operands: scope returns a typed refusal when the binding outlives its session lookup",
     file: "src/session/role-attachment-credentials.ts",
-    find: "        !session || binding.sessionIncarnation !== session.incarnation ||",
-    replace: "        binding.sessionIncarnation !== session.incarnation ||",
+    // Drop only the missing-session refusal. Existing sessions still undergo both checks;
+    // narrowing their branch keeps the mutant compilable without a non-null assertion.
+    find: "        !session || binding.sessionIncarnation !== session.incarnation ||\n" +
+      "        (session.lifecycle !== SessionLifecycle.READY && session.lifecycle !== SessionLifecycle.DRAINING)) {",
+    replace: "        (session !== null && (binding.sessionIncarnation !== session.incarnation ||\n" +
+      "        (session.lifecycle !== SessionLifecycle.READY && session.lifecycle !== SessionLifecycle.DRAINING)))) {",
     killedBy: ["tests/unit/role-attachment-authorization.test.ts::scope returns a typed refusal when the binding outlives its session lookup"],
   },
 ];
@@ -4754,8 +4765,8 @@ if (anchorsOnly) {
 
 /**
  * Where each per-mutation run's JSON reporter writes, read back so a `killedBy` selector's
- * *actual* match count can be checked rather than assumed from the exit code — see the
- * dead-selector check below.
+ * *actual* match count and named assertion verdict can be checked rather than assumed from the
+ * exit code — see the shared run classifier and dead-selector check below.
  *
  * Deliberately not `evidence/local/ci-vitest-results.json`, and not merely "not that path by
  * default" — `--outputFile.json=` below pins it, so `vitest.config.ts`'s mapping of the `json`
@@ -4973,23 +4984,6 @@ process.on("uncaughtException", (error) => {
 });
 
 // ---------------------------------------------------------------------------
-// Structural: every anchor still matches, exactly once.
-// ---------------------------------------------------------------------------
-for (const guard of rows) {
-  const text = originals.get(guard.file);
-  const count = text.split(guard.find).length - 1;
-  if (count !== 1) {
-    failures.push({
-      guard,
-      why:
-        count === 0
-          ? "the mutation no longer matches this file — the guard moved, and this row stopped checking anything"
-          : `the mutation matches ${count} places — a row that is not about one specific guard`,
-    });
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Structural: every enforcement locus is claimed by some row.
 // ---------------------------------------------------------------------------
 const symbolsSource = readFileSync(join(ROOT, "scripts/verify-enforcement-symbols.mjs"), "utf8");
@@ -5008,9 +5002,19 @@ const unclaimed = loci.filter((s) => !claimed.has(s));
 // ---------------------------------------------------------------------------
 try {
   for (const guard of rows) {
-    if (failures.some((f) => f.guard === guard)) continue;
     const path = join(ROOT, guard.file);
     const original = originals.get(guard.file);
+    // Verdict acceptance: exactly one home for the mutation, even without --anchors-only.
+    const count = original.split(guard.find).length - 1;
+    if (count !== 1) {
+      failures.push({
+        guard,
+        why: count === 0
+          ? "the mutation no longer matches this file — the guard moved, and this row stopped checking anything"
+          : `the mutation matches ${count} places — a row that is not about one specific guard`,
+      });
+      continue;
+    }
     // The snapshot was taken at startup, and a write from here is a write of that startup
     // content. If someone edited the file since — the run takes minutes, and the natural thing
     // to do while waiting is keep working — restoring the snapshot silently destroys their
@@ -5025,6 +5029,26 @@ try {
     // JSON reporter would otherwise leave the *previous* row's report on disk, and the dead-
     // selector check below would silently score this row against a different guard's numbers.
     rmSync(MUTATION_JSON_REPORT, { force: true });
+    // Verdict acceptance: a mutant that cannot load cannot establish guard coverage. Check the
+    // TypeScript project with the edit applied, so its imports and compiler options are retained.
+    const compileArgs = guard.file.endsWith(".ts")
+      ? [join(ROOT, "node_modules", ".bin", "tsc"), ["--noEmit"]]
+      : guard.file.endsWith(".mjs") ? [process.execPath, ["--check", path]] : null;
+    if (compileArgs) {
+      const compiled = spawnSync(compileArgs[0], compileArgs[1], {
+        cwd: ROOT, encoding: "utf8", timeout: 600_000,
+      });
+      if (compiled.error || compiled.status !== 0) {
+        ours(path, mutated, guard.file, "before restoring");
+        writeFileSync(path, original);
+        out(`  RUN FAILURE  ${guard.file}  ${guard.what}`);
+        failures.push({ guard, why: "mutant did not compile: " +
+          (compiled.error?.message ??
+            (`exit ${compiled.status}, signal ${compiled.signal ?? "none"}\n` +
+              compiled.stdout + compiled.stderr).trim()) });
+        continue;
+      }
+    }
     const done = spawnSync(
       VITEST,
       [
@@ -5064,49 +5088,52 @@ try {
       process.exit(1);
     }
 
-    /**
-     * A named `killedBy` entry (`path::test name`) runs as `-t "test name"` — a regex, not a
-     * literal string. A name that happens to contain a regex metacharacter (`()[]{}.*+?^$|\`)
-     * is parsed as one: an empty `()` group matches zero characters rather than the two literal
-     * parens, so the pattern silently selects nothing. Vitest still exits 0 for that — "0 tests
-     * ran" is not a failure to vitest — so `killed` above reads a `-t` that matched nothing the
-     * same as one that matched and passed: `SURVIVED`, which is at least loud. The dangerous
-     * direction is the other one: if some *other* test in the same file happens to fail (for any
-     * reason, related or not), the file's exit is non-zero, this row prints `killed`, and the
-     * test actually named by `killedBy` never ran at all. That row then claims coverage a
-     * completely different test produced.
-     *
-     * So the match count is checked directly from what vitest itself observed, not inferred from
-     * the exit code. `numPassedTests + numFailedTests` is how many tests the run actually
-     * executed under the `-t` filter; a filtered-out test is neither, so a selector matching zero
-     * tests is provable without guessing at what the name "should" match.
-     */
-    const namedSelectors = guard.killedBy.map(splitKilledBy).filter((p) => p.name !== null);
-    let deadSelector = null;
-    if (namedSelectors.length > 0) {
-      let report = null;
-      try {
-        report = JSON.parse(readFileSync(MUTATION_JSON_REPORT, "utf8"));
-      } catch {
-        report = null;
-      }
-      const selected = report ? report.numPassedTests + report.numFailedTests : 0;
-      if (selected === 0) {
-        deadSelector = report
-          ? `killedBy names "${namedSelectors[0].name}" as a -t pattern, and vitest ran 0 tests under it ` +
-            `(${report.numTotalTests} in the file, all skipped) — the selector matches nothing, so this ` +
-            "row's exit code is not evidence about the guard either way"
-          : `killedBy names "${namedSelectors[0].name}", but no JSON test report was produced to confirm ` +
-            "it selected anything";
-      }
+    let report = null;
+    try {
+      report = JSON.parse(readFileSync(MUTATION_JSON_REPORT, "utf8"));
+    } catch {
+      // The shared classifier refuses a missing or malformed report.
     }
-    if (deadSelector) {
-      out(`  DEAD SELECTOR  ${guard.file}  ${guard.what}`);
-      failures.push({ guard, why: deadSelector });
+    const classification = classifyVitestRun(done.status, report);
+    if (classification.kind !== "pass" && classification.kind !== "product-failure") {
+      out(`  RUN FAILURE  ${guard.file}  ${guard.what}`);
+      failures.push({ guard, why: `${classification.kind}: ${classification.reason}` });
       continue;
     }
 
-    const killed = done.status !== 0;
+    // Use the same regex as Vitest's -t, including partial/parameterized selectors, but bind
+    // each assertion to its named file. A different test's failure or a throwing teardown
+    // cannot credit a passing named assertion. Bare-file rows may credit any assertion there.
+    const selectors = guard.killedBy.map(splitKilledBy);
+    const selected = selectors.map(({ path, name }) => {
+      const pattern = name === null ? null : new RegExp(name);
+      return report.testResults
+        .filter((file) => typeof file.name === "string" && resolve(ROOT, file.name) === resolve(ROOT, path))
+        .flatMap((file) => file.assertionResults)
+        .filter((assertion) => pattern === null ||
+          (typeof assertion.fullName === "string" && pattern.test(assertion.fullName)));
+    });
+    // Vitest reports passed + failed === 0 when -t matches nothing: skipped assertions do not
+    // count as execution. Node's test runner can report a passing file for that same case; this
+    // guard depends on Vitest's reporting and must be re-measured if the runner changes.
+    const executed = report.numPassedTests + report.numFailedTests;
+    const deadSelector = selectors.findIndex((selector, index) => selector.name !== null &&
+      (executed === 0 || !selected[index].some((assertion) =>
+        assertion.status === "passed" || assertion.status === "failed")));
+    if (deadSelector !== -1) {
+      out(`  DEAD SELECTOR  ${guard.file}  ${guard.what}`);
+      failures.push({ guard, why: `killedBy names ${guard.killedBy[deadSelector]}, but its file has no ` +
+        "executed assertion matching that -t pattern — the row has no test verdict" });
+      continue;
+    }
+
+    const killed = selected.flat().some((assertion) => assertion.status === "failed");
+    if (!killed && classification.kind === "product-failure") {
+      out(`  UNRELATED FAILURE  ${guard.file}  ${guard.what}`);
+      failures.push({ guard, why: `${classification.reason}, but none was a named witness: ` +
+        guard.killedBy.join(", ") });
+      continue;
+    }
     out(`${killed ? "  killed " : "  SURVIVED"}  ${guard.file}  ${guard.what}`);
     if (!killed) {
       failures.push({
