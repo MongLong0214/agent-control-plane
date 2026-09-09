@@ -413,7 +413,7 @@ export interface ContinuityReconcileReport {
     provider: string;
   }>;
   pausedRuns: Array<{ runId: string; roleKey: string; reasonCode: string }>;
-  unresolved: Array<{ roleKey: string; reasonCode: string }>;
+  unresolved: Array<{ roleKey: string; reasonCode: ReasonCode }>;
   restored: string[];
   restorationDeferred: Array<{ roleKey: string; reasonCode: string }>;
 }
@@ -1576,7 +1576,7 @@ export class Daemon {
         if (currentStillCovered) continue;
 
         // #811: allocation needs a readable quota; eviction needs evidence against the
-        // incumbent. A failed sensor (including a reading with no numeric bucket) is
+        // incumbent. A failed sensor or an unknown quota window for this capability is
         // neither exhaustion nor a dead runtime. Keep the READY binding and surface the
         // unresolved reading, without making this provider eligible for new work.
         if (
@@ -1584,9 +1584,9 @@ export class Daemon {
           currentCapacity !== null &&
           currentCapacity.runtimeHealth !== "UNAVAILABLE" &&
           (currentCapacity.sensorHealth === "ERROR" ||
-            !currentCapacity.buckets.some((bucket) => Number.isFinite(bucket.remainingPercent)))
+            this.cp.capacity.hasUnknownQuotaFor(currentCapacity, required.capability))
         ) {
-          unresolved.push({ roleKey: required.roleKey, reasonCode: "CAPACITY_SENSOR_FAILED" });
+          unresolved.push({ roleKey: required.roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
           continue;
         }
 
