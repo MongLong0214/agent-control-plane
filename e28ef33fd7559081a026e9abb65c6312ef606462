@@ -1,0 +1,3 @@
+Limit: the CLI's copy loop has neither an iteration bound nor a deadline, so real .backup starvation shows up as a hang rather than a nonzero exit
+Warn: the pre-existing case was sampling - run a writer loop and hope the backup lands in the window between commits - which is a property of host load: the same merge SHA failed on verify (22) and passed on verify (22.18.0)
+Provenance: reconstructed
