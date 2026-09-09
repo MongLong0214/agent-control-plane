@@ -79,7 +79,32 @@ import { executeCanonicalSelfClaimOperator } from "./canonical-self-claim-operat
 import { startCanonicalSelfClaimListener, type CanonicalSelfClaimListener } from "./canonical-self-claim-listener.ts";
 import { readOneJsonLineRequest } from "./local-socket-framing.ts";
 
-const MAX_MCP_LINE_BYTES = 1024 * 1024;
+/**
+ * The bound on one message: the bytes of a single line, measured after the newline that ends it
+ * has been found.
+ *
+ * Until #805 both newline readers on this socket compared it against everything buffered so far,
+ * before looking for a boundary. That bounds a read rather than a message, and a read is the one
+ * thing neither peer chooses: two messages each within the limit were both refused and the
+ * connection destroyed whenever one read happened to deliver the tail of the first alongside the
+ * second, while the same bytes succeeded when the reads landed elsewhere. It was weak in the
+ * other direction too — a line just under the limit passed with most of another message already
+ * behind it, because the comparison ran once per read rather than once per line.
+ */
+export const MAX_MCP_LINE_BYTES = 1024 * 1024;
+/**
+ * The bound on input that has not produced a line yet, so a peer that never writes a newline
+ * cannot grow the buffer without limit.
+ *
+ * One number cannot answer both questions, even though this one is derived from the other. A
+ * buffer with no newline in it is the prefix of a line, so once it is longer than a line may be,
+ * no byte arriving later can make it legal — that is why the value follows `MAX_MCP_LINE_BYTES`
+ * rather than being chosen independently. What differs is *when* it is consulted: only while no
+ * boundary is present. That is what keeps a complete line of exactly `MAX_MCP_LINE_BYTES`
+ * acceptable, since with its terminator such a line occupies one byte more than either bound and
+ * would be refused by any check that measured the buffer without first finding the newline.
+ */
+const MAX_MCP_PENDING_BYTES = MAX_MCP_LINE_BYTES;
 const DEFAULT_MCP_HANDSHAKE_TIMEOUT_MS = 5_000;
 /**
  * The handshake budget covers reaching an authenticated request and nothing after it. Execution
@@ -1802,9 +1827,15 @@ export const authenticateSocket = (
     const transportClosed = (): void => reject(false);
     const receive = (chunk: Buffer): void => {
       buffer = Buffer.concat([buffer, chunk]);
-      if (buffer.length > MAX_MCP_LINE_BYTES) return reject();
       const boundary = buffer.indexOf(0x0a);
-      if (boundary === -1) return;
+      // Nothing here may be measured against the whole buffer: the bytes after the handshake line
+      // are the peer's first messages, handed to the transport below, and refusing the handshake
+      // for their size refuses a credential for something the credential did not say (#805).
+      if (boundary === -1) {
+        if (buffer.length > MAX_MCP_PENDING_BYTES) return reject();
+        return;
+      }
+      if (boundary > MAX_MCP_LINE_BYTES) return reject();
       const line = buffer.subarray(0, boundary).toString("utf8");
       const remainder = buffer.subarray(boundary + 1);
       let presented: unknown;
@@ -2029,13 +2060,15 @@ class SocketTransport implements Transport {
   };
 
   private processBuffer(): void {
-    if (this.#buffer.length > MAX_MCP_LINE_BYTES) {
-      this.error(new Error("MCP message exceeds local transport limit"));
-      this.socket.destroy();
-      return;
-    }
     let boundary = this.#buffer.indexOf(0x0a);
     while (boundary !== -1) {
+      // `boundary` is the byte length of the line it terminates, so this is the message's own
+      // size and not the read's. A line of exactly the limit is still a legal message (#805).
+      if (boundary > MAX_MCP_LINE_BYTES) {
+        this.error(new Error("MCP message exceeds local transport limit"));
+        this.socket.destroy();
+        return;
+      }
       const line = this.#buffer.subarray(0, boundary).toString("utf8");
       this.#buffer = this.#buffer.subarray(boundary + 1);
       try {
@@ -2048,6 +2081,13 @@ class SocketTransport implements Transport {
         return;
       }
       boundary = this.#buffer.indexOf(0x0a);
+    }
+    // What is left has no terminator, so it is the prefix of a line. Past the bound no byte
+    // arriving later can make it a legal message, and holding it would let a peer that never
+    // writes a newline grow this buffer without limit.
+    if (this.#buffer.length > MAX_MCP_PENDING_BYTES) {
+      this.error(new Error("MCP message exceeds local transport limit before its terminator"));
+      this.socket.destroy();
     }
   }
 
