@@ -69,6 +69,12 @@ export const GATES = [
   // does no falsifiability row name. The harness answers "is this guard tested" for the lines
   // someone wrote a row for; it cannot answer which lines nobody did.
   { script: "guards:operands" },
+  // #817 — a fixture that writes a program and execs it wedges macOS Gatekeeper: the assessment
+  // cache is keyed by inode, so a three-line shell script at a fresh inode costs more than a
+  // 100MB signed binary at an existing one. `syspolicyd` wedged this machine twice on 2026-09-09,
+  // the second time for over an hour. Under a second, and its subject is the test suite itself,
+  // which is why it runs before the suite rather than in the mutation job.
+  { script: "guards:new-inode-exec" },
   // #539 lands src/core/peercred.ts unreachable from every live surface on purpose — a new call
   // site (or a ControlPlane export) is a RED mutant here, not a deliverable.
   { script: "guards:peercred-unreachable" },
