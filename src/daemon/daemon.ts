@@ -1575,6 +1575,21 @@ export class Daemon {
         // until the explicit non-preemptive restore path can safely move it.
         if (currentStillCovered) continue;
 
+        // #811: allocation needs a readable quota; eviction needs evidence against the
+        // incumbent. A failed sensor (including a reading with no numeric bucket) is
+        // neither exhaustion nor a dead runtime. Keep the READY binding and surface the
+        // unresolved reading, without making this provider eligible for new work.
+        if (
+          session?.lifecycle === SessionLifecycle.READY &&
+          currentCapacity !== null &&
+          currentCapacity.runtimeHealth !== "UNAVAILABLE" &&
+          (currentCapacity.sensorHealth === "ERROR" ||
+            !currentCapacity.buckets.some((bucket) => Number.isFinite(bucket.remainingPercent)))
+        ) {
+          unresolved.push({ roleKey: required.roleKey, reasonCode: "CAPACITY_SENSOR_FAILED" });
+          continue;
+        }
+
         if (!assignment?.provider) {
           unresolved.push({
             roleKey: required.roleKey,
