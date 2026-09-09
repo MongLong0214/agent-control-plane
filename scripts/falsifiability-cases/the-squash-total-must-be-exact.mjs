@@ -7,8 +7,12 @@ const theSquashTotalMustBeExact = {
   id: "the-squash-total-must-be-exact",
   what: "an absent or invalid exact total cannot start collection",
   file: "src/github/github-kernel.ts",
-  find: "    if (typeof expectedCount !== \"number\" || !Number.isSafeInteger(expectedCount) || expectedCount < 1) {",
-  replace: "    if (false) {",
+  // Keep numeric totals unchanged and unknown totals unusable, but let collection start before the later count check.
+  find: "    const expectedCount = pull.commits;\n" +
+    "    if (typeof expectedCount !== \"number\" || !Number.isSafeInteger(expectedCount) || expectedCount < 1) {\n" +
+    "      throw new Error(`pull request ${pullNumber} has no usable exact commit total`);\n" +
+    "    }",
+  replace: "    const expectedCount = typeof pull.commits === \"number\" ? pull.commits : NaN;",
   killedBy: [
     "tests/unit/github-squash-request.test.ts::refuses an unusable exact commit total",
   ],

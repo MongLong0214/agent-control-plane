@@ -9,7 +9,7 @@
  * that this event was addressed to the CEO, and anything else is refused *before* admission — so
  * a journal event does not even consume a nonce.
  *
- * Mutating the comparison to `if (false)` admits an event addressed to the CTO and delivers it as
+ * Removing the recipient branch admits an event addressed to the CTO and delivers it as
  * a CEO turn, which is the loop above in one message.
  *
  * This row and the seven beside it guard a path that is being *built* rather than one that broke:
@@ -21,8 +21,47 @@ const buzzEventNotAddressedToTheCeoIsNotATurn = {
   id: "buzz-event-not-addressed-to-the-ceo-is-not-a-turn",
   what: "a Buzz event the relay did not address to the CEO does not become a CEO turn",
   file: "src/ingress/buzz-message.ts",
-  find: "    if (input.addressedTo !== BUZZ_MESSAGE_RECIPIENT_CEO) {\n",
-  replace: "    if (false) {\n",
+  // Remove the whole recipient branch; an unreachable body loses its local narrowing too.
+  find: "    if (input.addressedTo !== BUZZ_MESSAGE_RECIPIENT_CEO) {\n" +
+    "      // Role-addressed, so the `p` tag is the address and there is no second place to look. The\n" +
+    "      // five ways it can fail to be one are one outcome to the sender and one journal row each:\n" +
+    "      // an absent tag is not \"therefore the CEO\", because reading it that way would hand a\n" +
+    "      // message meant for some role to the owner's own conversation.\n" +
+    "      const presented = input.mention;\n" +
+    "      const mention = typeof presented === \"string\" ? presented.trim() : \"\";\n" +
+    "      const candidates = mention.length === 0 ? [] : [...new Set(this.router.rolesFor(mention))];\n" +
+    "      const roleKey = candidates.length === 1 ? candidates[0] : undefined;\n" +
+    "      if (roleKey === undefined) {\n" +
+    "        const shape: UnboundMentionShape =\n" +
+    "          presented === undefined || presented === null\n" +
+    "            ? \"missing\"\n" +
+    "            : typeof presented !== \"string\"\n" +
+    "              ? \"not-a-string\"\n" +
+    "              : mention.length === 0\n" +
+    "                ? \"blank\"\n" +
+    "                : candidates.length === 0\n" +
+    "                  ? \"unknown\"\n" +
+    "                  : \"ambiguous\";\n" +
+    "        // The one journal row B4 asks for, written here because this is the only place that\n" +
+    "        // knows both the tag and what it resolved to, and after this point there is nothing left\n" +
+    "        // to record: no turn is claimed and nothing is sent to anyone.\n" +
+    "        this.router.journalUnbound({\n" +
+    "          actor: input.actor,\n" +
+    "          conversation: input.conversation,\n" +
+    "          eventId: input.eventId,\n" +
+    "          mention,\n" +
+    "          candidates,\n" +
+    "          shape,\n" +
+    "        });\n" +
+    "        return deny(\n" +
+    "          ReasonCode.MENTION_TARGET_UNBOUND,\n" +
+    "          \"the mentioned buzz channel identity does not name exactly one role this daemon can address\",\n" +
+    "          { channel: \"buzz\", target: mention, candidates: candidates.length, shape },\n" +
+    "        );\n" +
+    "      }\n" +
+    "      return allow(ReasonCode.OK, { kind: \"ROLE\", roleKey });\n" +
+    "    }\n",
+  replace: "",
   killedBy: [
     "tests/unit/buzz-message-ingress.test.ts::refuses a forged signature, a channel identity that is not allowlisted, and a message not addressed to the CEO",
   ],
