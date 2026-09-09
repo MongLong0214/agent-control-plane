@@ -1,0 +1,5 @@
+Limit: 릴레이 구독(B1)·인그레스 주소 해석(B4)·라이브 전환은 이 PR 범위 밖입니다.
+Ruled-out: `CEO_CONVERSATION_*` 를 역할 중립으로 개명 | 25개 파일 123개 참조로 재서 접었습니다
+Warn: **확인이 있어야 배달이 끝납니다 (B5).** 성공은 peer 자신의 응답입니다. `accepted` 를 완료로 읽는 것이 이 이슈 전체의 원인이었습니다.
+Warn: `STALENESS_REASON_CODES` 에 등록했습니다(census 가 미분류 `_STALE` 을 잡습니다).
+Provenance: reconstructed
