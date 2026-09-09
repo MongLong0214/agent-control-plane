@@ -1,0 +1,5 @@
+Limit: **coalescing 은 안 했습니다** — 자기 라운드가 필요하고, 검증된 절반 하나를 드리는 편이 낫습니다.
+Limit: inbound_messages.payload_json, nullable, backfill 없음 (채울 출처가 없음)
+Warn: **UPDATE 로 닿을 수 있는 필드는 생애주기가 주어지기를 기다리는 필드입니다.**
+Warn: v35 이므로 `#738` 의 승인 게이트(PR #747)가 라이브 배포에서 이것에 대한 승인을 요구합니다.
+Provenance: reconstructed
