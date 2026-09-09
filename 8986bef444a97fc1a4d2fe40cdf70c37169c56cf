@@ -1,0 +1,3 @@
+Limit: the dedicated claim listener is activated only when its deployment configuration is complete, so existing startup modes are otherwise unchanged
+Limit: the FROZEN_BLOBS entry for src/db/migrations.ts was transcribed from a CEO-supplied digest rather than derived in this change
+Provenance: reconstructed
