@@ -1,0 +1,6 @@
+Limit: better-sqlite3 exposes no way to hand a connection a descriptor and its constructor calls sqlite3_open_v2(filename, ..., NULL), so the loadable-extension ABI is the one entry point that reaches the same statically linked SQLite instance
+Limit: src/db/fd-vfs.ts is unreachable from every other module under src/, held by guards:fd-vfs-unreachable; unit 3 adds the call site and deletes that gate in the same change
+Ruled-out: a Node-loaded N-API addon as the load mechanism, as ADR-0010's convention would give | only sqlite3_load_extension reaches the same SQLite instance, so the difference was approved explicitly rather than assumed under ADR-0010
+Warn: iVersion is 1, so SQLite declines WAL on a bound connection silently, returning the old mode rather than erroring - assert the journal mode you got, not the one you asked for
+Warn: SQLite unloads an extension when the connection that loaded it closes while the default-VFS pointer still refers to that library's struct, methods and state; SQLITE_OK_LOAD_PERMANENTLY is what prevents the SIGSEGV, and every case passed alone so it only appeared once two cases shared a process
+Provenance: reconstructed
