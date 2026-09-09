@@ -1,0 +1,3 @@
+Limit: Part B, the mention subscriber, is outside this pull request
+Warn: the shell path scripts/buzz-send.mjs carries the same rules as the library path, because a rule that exists on only one of them turns the other into a bypass
+Provenance: reconstructed
