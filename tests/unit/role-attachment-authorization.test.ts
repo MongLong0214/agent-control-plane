@@ -106,6 +106,45 @@ describe("role attachment authorization without sockets", () => {
     expect(h.cp.sessions.verifySecret(subject.sessionId, subject.sessionSecret).allowed).toBe(true);
   });
 
+  it("first-use window refuses an unattached credential after 60 seconds", () => {
+    const issuedAt = h.clock.nowIso();
+    const credential = grant();
+    h.clock.advance(60_001);
+    expect(daemon.attachments.authorize(credential)).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED,
+      message: "attachment credential first-use window has expired",
+    });
+    h.clock.set(issuedAt);
+    expect(daemon.attachments.authorize(credential).allowed).toBe(false);
+    expect(daemon.attachments.connect(server(), port, credential).allowed).toBe(false);
+  });
+
+  it("first-use window admits a credential inside 60 seconds of issuance", () => {
+    h.clock.advance(60_000);
+    const credential = grant();
+    h.clock.advance(59_999);
+    expect(daemon.attachments.authorize(credential).allowed).toBe(true);
+    expect(daemon.attachments.connect(server(), port, credential).allowed).toBe(true);
+  });
+
+  it("first-use window refuses a credential at the exact deadline", () => {
+    const credential = grant();
+    h.clock.advance(60_000);
+    expect(daemon.attachments.connect(server(), port, credential)).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED,
+      message: "attachment credential first-use window has expired",
+    });
+    expect(port.connected(roleKey)).toBe(false);
+  });
+
+  it("first-use window does not expire an established attachment", () => {
+    const credential = grant();
+    valueOf(daemon.attachments.connect(server(), port, credential));
+    h.clock.advance(60_001);
+    expect(daemon.attachments.authorize(credential).allowed).toBe(true);
+    expect(port.currentHolderConnected(roleKey)).toBe(true);
+  });
+
   it("attach takes an empty slot and a later detach cannot evict its incumbent", () => {
     const auth = () => allow(ReasonCode.OK, { actor: subject.sessionId, ...subject,
       sessionIncarnation: h.cp.sessions.require(subject.sessionId).incarnation });

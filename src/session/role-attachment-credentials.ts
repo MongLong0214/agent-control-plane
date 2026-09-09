@@ -4,6 +4,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../ceo/owner-authority.ts";
+import { type Clock, isoPlus } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -14,6 +15,18 @@ import type { BindingRegistry } from "./binding-registry.ts";
 import type { SessionRegistry } from "./session-registry.ts";
 
 export const ROLE_ATTACHMENT_OPERATION = "roleAttachment.issue";
+
+/**
+ * The operator issues and connects in one operation; one minute gives that local hand-off
+ * scheduling/startup slack while bounding bearer exposure.
+ * This is only an unattached first-use window, not a session or established attachment TTL:
+ * close, explicit revoke, subject/generation change and committed transfer still govern those.
+ * The daemon passes cp.clock; isoPlus follows the existing claim-expiry pattern, adding this
+ * lifetime to the injected wall Clock at issuance.
+ * A forward clock change shortens the wait; a backward change extends a pending window.
+ * Once authorization observes expiry, invalidation prevents clock rollback from reviving it.
+ */
+export const ROLE_ATTACHMENT_FIRST_USE_TTL_MS = 60_000;
 
 export interface AttachmentScope {
   sessionId: string;
@@ -31,6 +44,7 @@ export interface AttachmentCredential extends AttachmentScope {
 interface AttachmentRecord {
   scope: AttachmentScope;
   secretHash: Buffer;
+  firstUseExpiresAt: string;
   attached: boolean;
   detach?: () => void;
 }
@@ -59,7 +73,8 @@ const scopeOf = (binding: RoleBinding): AttachmentScope => ({
 /**
  * Daemon-local attachment authority. Retains hashes only; no session credential is changed.
  * Credentials are single-admission bearer tokens, not proof of the issuing process's identity.
- * A copied token can be admitted with the listener's deployment token before its first use.
+ * A copied token can be admitted with the listener's deployment token before its first use
+ * within the first-use window. Expiry bounds that exposure; it does not prove process identity.
  */
 export class RoleAttachmentCredentials {
   readonly #records = new Map<string, AttachmentRecord>();
@@ -68,6 +83,7 @@ export class RoleAttachmentCredentials {
     private readonly sessions: SessionRegistry,
     private readonly bindings: BindingRegistry,
     private readonly owner: OwnerAuthorityPort,
+    private readonly clock: Clock,
   ) {
     bindings.onSwitch((binding) => {
       const current = scopeOf(binding);
@@ -109,7 +125,8 @@ export class RoleAttachmentCredentials {
     if (!consumed.allowed) return consumed;
     const attachmentId = randomUUID();
     const attachmentSecret = randomBytes(32).toString("hex");
-    this.#records.set(attachmentId, { scope: scope.value, secretHash: hash(attachmentSecret), attached: false });
+    this.#records.set(attachmentId, { scope: scope.value, secretHash: hash(attachmentSecret), attached: false,
+      firstUseExpiresAt: isoPlus(this.clock.nowIso(), ROLE_ATTACHMENT_FIRST_USE_TTL_MS) });
     return allow(ReasonCode.OK, { ...scope.value, attachmentId, attachmentSecret });
   }
 
@@ -129,6 +146,10 @@ export class RoleAttachmentCredentials {
 
   #authorizeRecord(attachmentId: string, record: AttachmentRecord): Decision<AuthenticatedMcpPeer> {
     if (this.#records.get(attachmentId) !== record) return refused("attachment has been invalidated");
+    if (!record.attached && this.clock.nowIso() >= record.firstUseExpiresAt) {
+      this.#invalidate(attachmentId);
+      return refused("attachment credential first-use window has expired");
+    }
     const current = this.scope(record.scope.sessionId, record.scope.roleKey);
     if (!current.allowed || digestOf(current.value) !== digestOf(record.scope)) {
       return deny(ReasonCode.BINDING_GENERATION_STALE, "attachment generation is no longer ACTIVE");
