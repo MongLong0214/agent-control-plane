@@ -13,4 +13,11 @@
 # `exec` replaces this shell rather than forking, so there is exactly one child pid: the caller's
 # stdin, its stdout capture, and its timeout signal reach the producer exactly as they reached a
 # directly-spawned program.
-exec "$HERMES_HOME/node" "$HERMES_HOME/producer.mjs" "$@"
+#
+# The interpreter is bound to a name instead of being spelled inline at the `exec`: saying where
+# the interpreter is, is this file's entire job, so it reads better named, and the name is also
+# the one declaration this file has. tests/unit/verify-tracker-loci-resolve.test.ts's non-JS
+# corpus witness derives a declaration from every tracked `.sh`, so inlining the path again would
+# leave this file with nothing declared and that check would fail on it.
+interpreter="$HERMES_HOME/node"
+exec "$interpreter" "$HERMES_HOME/producer.mjs" "$@"
