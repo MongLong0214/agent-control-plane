@@ -1,0 +1,2 @@
+Ruled-out: renaming reachedCeo, answeredByCeo and CeoTurnDelivery to role-neutral names | the rename breaks two files this pull request cannot touch, so the reason was written into a comment instead
+Provenance: reconstructed
