@@ -21,8 +21,66 @@ ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 CHECK="$ROOT/scripts/verify-trailers-are-parsable.mjs"
 [ -f "$CHECK" ] || exit 0
 
-if ! node "$CHECK" --message-file "$MSG_FILE" >/dev/null 2>&1; then
-  node "$CHECK" --message-file "$MSG_FILE" >&2
+# Which interpreter runs the check (#808).
+#
+# Until #808 this line said `node`, a bare name, so whether the hook checked anything at all
+# depended on the PATH of whoever ran `git` — and git does not hand a hook a login shell's PATH. A
+# commit from a GUI client, an editor or a launchd job arrives here with no `node` on it, which is
+# what CommitLore's own `doctor` reports on this machine today.
+#
+# The order below runs from "the operator's own answer" to "the answer the calling process is
+# already living on", and stops there:
+#
+#   1. `command -v node` — the PATH git actually gave this hook. If it has one, that is the
+#      interpreter the operator arranged for, and no further guessing is warranted.
+#   2. `$NODE` / `$npm_node_execpath` — npm and pnpm set both to the absolute path of the
+#      interpreter running the current package script. `scripts/merge-pr.mjs` under `pnpm merge`
+#      spawns git from inside exactly such a run, so this is not a guess about the host: it names
+#      the runtime the caller is already executing on.
+#
+# Deliberately NOT in the list: well-known host locations (`/opt/homebrew/bin/node`,
+# `/usr/local/bin/node`, a version manager's shims). Those are guesses, and a wrong guess is the
+# *other* half of this defect — the check would run, silently, on a runtime nobody chose, free to
+# disagree with the `engines` range in package.json. Every candidate above was named by the
+# operator or by the process that invoked git. None was invented here.
+NODE_BIN=""
+if command -v node >/dev/null 2>&1; then
+  NODE_BIN=$(command -v node)
+elif [ -n "$NODE" ] && [ -x "$NODE" ]; then
+  NODE_BIN="$NODE"
+elif [ -n "$npm_node_execpath" ] && [ -x "$npm_node_execpath" ]; then
+  NODE_BIN="$npm_node_execpath"
+fi
+
+# "The check refused" and "the check could not run" are different facts, and until #808 they shared
+# one exit path and one sentence: a missing interpreter made the check exit 127, `if !` read that as
+# a refusal, and the hook told the author their well-formed message writes a record git will not
+# store. The stated cause was not the cause.
+#
+# The choice here is to REFUSE the commit, exit 1, and say why.
+#
+#   - Exiting 0 would let every commit on a machine with no `node` on git's PATH be stored
+#     unchecked, with nothing saying so. That failure is silent, durable and machine-wide: it is not
+#     one bad commit, it is a guard that stopped existing while continuing to report success. This
+#     repository has already lost record lines to a check that was green over nothing.
+#   - Exiting 1 blocks work on a machine that merely lacks a PATH entry. That cost is real, but it
+#     is loud, immediate, self-describing, and cleared by putting node on the PATH git uses. It is
+#     also the one case where `--no-verify` is a deliberate, visible act rather than a silent gap.
+#
+# This is not the same call as the two `exit 0` lines above. A missing `$MSG_FILE` or a missing
+# `$CHECK` means this repository, at this commit, has no such rule to enforce. A missing interpreter
+# means the rule exists and the hook could not evaluate it — and a hook that cannot decide must not
+# answer "yes".
+if [ -z "$NODE_BIN" ]; then
+  echo "commit-msg: could not run the trailer check — no Node interpreter found." >&2
+  echo "  tried, in order: PATH (command -v node), \$NODE, \$npm_node_execpath" >&2
+  echo "  This says nothing about your commit message. Git does not run hooks with a login" >&2
+  echo "  shell's PATH; put node on the PATH git uses, or run git from a \`pnpm\` script." >&2
+  exit 1
+fi
+
+if ! "$NODE_BIN" "$CHECK" --message-file "$MSG_FILE" >/dev/null 2>&1; then
+  "$NODE_BIN" "$CHECK" --message-file "$MSG_FILE" >&2
   echo "" >&2
   echo "commit-msg: this message writes a record git will not store." >&2
   exit 1
