@@ -1,0 +1,2 @@
+Warn: there is no platform skip for this native binding the way peercred has one, so a runner that cannot build it is a failure to report
+Provenance: reconstructed
