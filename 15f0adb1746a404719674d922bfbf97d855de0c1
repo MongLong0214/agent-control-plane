@@ -1,0 +1,4 @@
+Limit: no digest of the harness, the pty driver or the qualify script was taken while the arms ran, so the receipt's source binding cannot be named
+Ruled-out: reconstructing the receipt's source binding instead of recording UNKNOWN | a reconstruction is a guess wearing the shape of a measurement
+Warn: settleMs is renamed settleCeilingMs through the receipt and the producer, and a pin fails if a run row carries the old key again
+Provenance: reconstructed
