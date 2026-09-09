@@ -1,0 +1,3 @@
+Limit: an unresolved mention now consumes the (buzz, nonce) replay slot but claims no turn, so it does not show up in unresolvedTurns
+Warn: the target lookup must stay after guard.admit; with #targetFor ahead of it a forged envelope still wrote a target journal row, a re-sent eventId with only the tag changed produced a second side effect, and repeating an unresolved event piled up journal rows
+Provenance: reconstructed
