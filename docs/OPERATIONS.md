@@ -92,6 +92,28 @@ do not use CLI mutation commands as a production substitute for daemon RPC. Read
 [the issue](https://github.com/MongLong0214/agent-control-plane/issues/393) before using
 commands beyond the inspection examples above.
 
+### Starting a client that can receive wakes
+
+Start the Claude Code client with `--messaging-socket-path` pointing to a unique socket
+directly inside the daemon's owner-only state directory, the same directory as
+`cto.mcp.sock`. For the default state root, add
+`--messaging-socket-path "$HOME/.agent-control-plane/cto-client.sock"` to the client launch
+command; choose a distinct filename for each client. Use the directory named by the
+registration refusal if this deployment uses a different state root. ACP does not choose
+the client's messaging socket path.
+
+A socket at `/tmp/cc-socks/<pid>.sock` cannot register as a wake endpoint. The directory
+must remain owner-only (0700), and the endpoint must be a normalized absolute path directly
+in it; symlinks and paths owned by another uid are refused. The client must also satisfy
+the qualified version requirement.
+
+The doctor currently checks role bindings and session liveness, but cannot detect this
+socket-directory mismatch before registration: session records contain no messaging socket
+path. The path first reaches ACP through `role_wake_endpoint_register`, and only accepted
+endpoints are retained. A healthy doctor report therefore does not establish that a bound
+client can receive wakes. Check the client launch command and the registration response;
+the Hermes bootstrap socket is a separate channel and already lives inside the state directory.
+
 ## Deployment prerequisites that are not satisfied here
 
 The file checked in at `deploy/com.agentcontrolplane.agentcpd.plist.template` is a template, not

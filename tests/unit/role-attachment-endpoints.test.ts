@@ -53,6 +53,27 @@ const fixture = async () => {
 };
 
 describe("attachment endpoint reservations", () => {
+  it("directory refusal tells the operator how to start the client without echoing the rejected path", async () => {
+    const { port, second, current } = await fixture();
+    const rejected = "/tmp/cc-socks/private-inbox.sock";
+    const refusal = await port.registerEndpoint(current, rejected);
+
+    expect(refusal).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.ROLE_PEER_UNSUPPORTED,
+      evidence: { role: Role.PRIMARY_CTO, check: "not-under-expected-directory" },
+    });
+    if (refusal.allowed) throw new Error("an outside endpoint was accepted");
+    expect(refusal.message).toBe(
+      "a wake endpoint must sit directly in this deployment's owner-only state directory; " +
+      "start the client with --messaging-socket-path pointing to a socket directly inside /attachment-state",
+    );
+    expect(refusal.evidence).toEqual({ role: Role.PRIMARY_CTO, check: "not-under-expected-directory" });
+    expect(JSON.stringify(refusal)).not.toContain(rejected);
+    expect(JSON.stringify(refusal)).not.toContain("private-inbox.sock");
+    expect(port.endpointFor(second.roleKey)).toBeNull();
+  });
+
   it("registration refuses a denied authenticator while the registry still names the peer as holder", async () => {
     const { port, active, denied, second, current, endpoint } = await fixture();
     denied.add(second.roleKey);
