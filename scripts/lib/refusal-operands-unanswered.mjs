@@ -402,6 +402,14 @@ const groups = [
   },
   {
     file: "src/daemon/daemon.ts",
+    // reconcileContinuity: #811/#812 sensor-failure preservation guard
+    reason: "The sensor-binding witnesses refresh a registered provider and persist a capacity snapshot, so currentCapacity is non-null. A READY unmanaged provider exits through currentStillCovered before this guard. No independent witness reaches this guard with a READY managed provider and no snapshot; simply deleting the null check also breaks TypeScript narrowing for the following capacity reads, which is not a behavioral kill.",
+    operands: [
+      ["currentCapacity !== null",2],
+    ],
+  },
+  {
+    file: "src/daemon/daemon.ts",
     // startTimers
     reason: "This disjunction decides whether a timer publishes progress after overdue/finalized work. It does not itself refuse; independent scheduling/publication observations have not been isolated.",
     operands: [
