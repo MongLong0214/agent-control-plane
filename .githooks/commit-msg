@@ -43,14 +43,66 @@ CHECK="$ROOT/scripts/verify-trailers-are-parsable.mjs"
 # *other* half of this defect — the check would run, silently, on a runtime nobody chose, free to
 # disagree with the `engines` range in package.json. Every candidate above was named by the
 # operator or by the process that invoked git. None was invented here.
+#
+# A candidate is ESTABLISHED before its exit status is trusted, and this is the whole of it.
+#
+# The first version of this resolution accepted `$NODE` on `[ -x "$NODE" ]`. That tests the file,
+# not the runtime: `-x` is true of `/usr/bin/true`, of a shim for a runtime that was uninstalled,
+# of any wrapper that exits 0 — and the hook's entire verdict about your commit message is that
+# file's exit status. So `NODE=/usr/bin/true` made a wrapped `Limit:` pass, which is the one thing
+# this hook exists to refuse. Measured: the hook this replaced refused that message (loudly, for
+# the wrong reason, which is #808); the `-x` version accepted it, silently, and the record was gone.
+# A guard that says yes because something exited 0 is strictly worse than one that says no for the
+# wrong reason.
+#
+# So each candidate is asked a question only a Node interpreter answers, and the answer is read
+# rather than the status:
+#
+#   `-p 'process.versions.node'` evaluates the expression and prints its value. An executable that
+#   merely exits 0 prints nothing and fails. An executable that prints something else fails the
+#   version shape. Nothing about the commit message is involved, and no exit status is consulted:
+#   the check is a property of the interpreter, established before the interpreter is given any
+#   authority over the message.
+#
+# What this does NOT establish: that the executable is trustworthy. Anything that prints a version
+# string passes, so an executable built to impersonate node still gets in. That is a PATH-trust
+# problem, it is older and wider than this hook, and it is not solved here. `command -v node` is
+# consulted first, so an executable named `node` planted early on git's PATH is chosen ahead of
+# `$NODE` — and `pnpm` and `npm` prepend `<repo>/node_modules/.bin`, so a change under review could
+# in principle ship the interpreter that checks it. The hook this replaced resolved `node` through
+# PATH the same way. Narrowed, not closed: measured, a planted `node` that only exits 0 is now
+# refused where it used to pass, and one that prints a version string is accepted by both.
+#
+# Only the first line is read, and it is read with the shell's own `read` rather than `head`. Two
+# reasons, both learned here:
+#
+#   - No external command may be involved. The environment this hook has to survive is one whose
+#     PATH is missing things, which is the whole of #808; a probe spelled with `head` reported "not
+#     an interpreter" for a perfectly good node whenever `head` was not on the PATH either, and a
+#     probe that fails for reasons of its own is a fail-closed with no bottom.
+#   - Stopping at the first line bounds a candidate that writes without stopping — BSD `yes` is the
+#     easy example — which would otherwise hang every commit instead of answering. Residual: a
+#     candidate that writes forever without ever emitting a newline still blocks here.
+answers_as_a_node_interpreter() {
+  "$1" -p 'process.versions.node' 2>/dev/null | {
+    IFS= read -r ANSWER || ANSWER=""
+    case "$ANSWER" in
+      [0-9]*.[0-9]*.[0-9]*) exit 0 ;;
+      *) exit 1 ;;
+    esac
+  }
+}
+
+# The loop falls through rather than stopping at the first candidate that exists: a stale `$NODE`
+# left over from another project must not consume the slot `npm_node_execpath` would have filled.
 NODE_BIN=""
-if command -v node >/dev/null 2>&1; then
-  NODE_BIN=$(command -v node)
-elif [ -n "$NODE" ] && [ -x "$NODE" ]; then
-  NODE_BIN="$NODE"
-elif [ -n "$npm_node_execpath" ] && [ -x "$npm_node_execpath" ]; then
-  NODE_BIN="$npm_node_execpath"
-fi
+for CANDIDATE in "$(command -v node 2>/dev/null)" "$NODE" "$npm_node_execpath"; do
+  [ -n "$CANDIDATE" ] || continue
+  if answers_as_a_node_interpreter "$CANDIDATE"; then
+    NODE_BIN="$CANDIDATE"
+    break
+  fi
+done
 
 # "The check refused" and "the check could not run" are different facts, and until #808 they shared
 # one exit path and one sentence: a missing interpreter made the check exit 127, `if !` read that as
@@ -67,13 +119,31 @@ fi
 #     is loud, immediate, self-describing, and cleared by putting node on the PATH git uses. It is
 #     also the one case where `--no-verify` is a deliberate, visible act rather than a silent gap.
 #
-# This is not the same call as the two `exit 0` lines above. A missing `$MSG_FILE` or a missing
-# `$CHECK` means this repository, at this commit, has no such rule to enforce. A missing interpreter
-# means the rule exists and the hook could not evaluate it — and a hook that cannot decide must not
-# answer "yes".
+# This is a claim about THIS path only, and the file does not follow it everywhere.
+#
+# An earlier draft of this comment said the two `exit 0` lines above are a different call because a
+# missing `$MSG_FILE` or `$CHECK` means "no such rule exists here". That does not survive reading
+# line 22: this hook is sitting there calling `$CHECK`, which is the rule existing. A commit that
+# deletes `scripts/verify-trailers-are-parsable.mjs` and wraps a `Limit:` is accepted, while a
+# machine that merely lacks node is refused. The file was asserting a principle it did not follow.
+#
+# The missing-`$CHECK` path deliberately chooses the other way, and the reason is that the two are
+# different threats rather than the same one seen twice. A deleted checker is a change to the
+# repository: it is in the diff, it is in review, it is in `git log`, and it is the same for every
+# clone. A missing interpreter is a property of one machine at one moment, invisible to everyone
+# else, and it silently disarms the check for whoever has it while the repository still reads as
+# guarded. The first is a decision someone made and can be seen to have made; the second is a gap
+# nobody chose and nobody can see. Refusing here closes the invisible one.
+#
+# That is a reason, not a proof that the split is right. If the missing-`$CHECK` path should also
+# refuse, that is its own unit of work — deleting the checker is a different threat and widening
+# this change to cover it would put two decisions behind one review.
 if [ -z "$NODE_BIN" ]; then
   echo "commit-msg: could not run the trailer check — no Node interpreter found." >&2
   echo "  tried, in order: PATH (command -v node), \$NODE, \$npm_node_execpath" >&2
+  echo "  Each had to answer \`-p process.versions.node\` with a version. An executable that only" >&2
+  echo "  exits 0 is not accepted as an interpreter, because its exit status would then become this" >&2
+  echo "  hook's verdict on your message." >&2
   echo "  This says nothing about your commit message. Git does not run hooks with a login" >&2
   echo "  shell's PATH; put node on the PATH git uses, or run git from a \`pnpm\` script." >&2
   exit 1

@@ -47,22 +47,47 @@ const runCommitMsgWithEnv = (
   return { status: done.status ?? -1, stderr: done.stderr ?? "" };
 };
 
-/** A PATH carrying only what the hook shells out to. `git` is the one external command it runs. */
+/**
+ * A PATH carrying only what the hook shells out to. `git` is the one external command it runs;
+ * `sh` is here so the check below can actually run under this PATH. Without it the probe fails to
+ * start, and "no node here" becomes indistinguishable from "no shell to ask with" — the assertion
+ * would pass on a PATH that resolves node perfectly well.
+ */
 const pathWithoutNode = (): string => {
   const bin = join(tempDir("acp-hook-bin-"), "bin");
   mkdirSync(bin, { recursive: true });
-  const git = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
-  expect(git, "no git to build a PATH from").not.toBe("");
-  symlinkSync(git, join(bin, "git"));
+  for (const name of ["git", "sh"]) {
+    const found = spawnSync("sh", ["-c", `command -v ${name}`], { encoding: "utf8" }).stdout.trim();
+    expect(found, `no ${name} to build a PATH from`).not.toBe("");
+    symlinkSync(found, join(bin, name));
+  }
+  const probe = spawnSync("sh", ["-c", "command -v node"], { encoding: "utf8", env: { PATH: bin } });
+  expect(probe.error, "the probe never ran, so its answer says nothing").toBeUndefined();
   expect(
-    spawnSync("sh", ["-c", "command -v node"], { encoding: "utf8", env: { PATH: bin } }).status,
+    probe.status,
     "this PATH still resolves node, so nothing below measures what it claims",
   ).not.toBe(0);
   return bin;
 };
 
+/**
+ * An executable that exits 0 and answers nothing else. This is exactly what `[ -x "$NODE" ]` sees
+ * when it looks at a real interpreter, which is why the hook may not stop at `-x`.
+ */
+const exitsZeroButIsNotNode = (): string => {
+  const path = join(tempDir("acp-hook-impostor-"), "node-shaped");
+  writeFileSync(path, "#!/bin/sh\nexit 0\n");
+  chmodSync(path, 0o755);
+  return path;
+};
+
 /** The real interpreter, named the way `pnpm run` names it in a hook's environment. */
 const realNode = process.execPath;
+
+const WELL_FORMED = "subject\n\nbody\n\nLimit: one line\n";
+const WRAPPED = "subject\n\nbody\n\nLimit: this wraps across\ntwo lines.\n";
+/** The hook's own sentence about the message. It must not be said about the interpreter. */
+const TRAILER_REFUSAL = "writes a record git will not store";
 
 describe("commit-msg refuses a trailer git will not parse", () => {
   it("refuses a Limit that wraps onto a second line", () => {
@@ -93,11 +118,6 @@ describe("commit-msg refuses a trailer git will not parse", () => {
 });
 
 describe("commit-msg tells a refusal apart from a check it could not run", () => {
-  const WELL_FORMED = "subject\n\nbody\n\nLimit: one line\n";
-  const WRAPPED = "subject\n\nbody\n\nLimit: this wraps across\ntwo lines.\n";
-  /** The hook's own sentence about the message. It must not be said about the interpreter. */
-  const TRAILER_REFUSAL = "writes a record git will not store";
-
   it("does not report a trailer problem when it could not find an interpreter", () => {
     // The defect: `node` was invoked by bare name, so a PATH without it made the check exit 127,
     // which `if !` reads as "the check refused". The hook then blamed a well-formed message for a
@@ -139,6 +159,52 @@ describe("commit-msg tells a refusal apart from a check it could not run", () =>
 
   it("accepts npm_node_execpath as the same answer under its other name", () => {
     const env = { PATH: pathWithoutNode(), HOME: process.env.HOME, npm_node_execpath: realNode };
+    expect(runCommitMsgWithEnv(WELL_FORMED, env).status).toBe(0);
+    expect(runCommitMsgWithEnv(WRAPPED, env).stderr).toContain(TRAILER_REFUSAL);
+  });
+});
+
+describe("commit-msg establishes a candidate is an interpreter before reading its exit status", () => {
+  // `[ -x "$NODE" ]` proves a file is executable. It does not prove the file is node, and the
+  // hook's verdict on the message is nothing but that file's exit status. So an executable that
+  // exits 0 — `/usr/bin/true`, a stale wrapper, a shim for a runtime that was uninstalled — is read
+  // as "the check passed", and the wrapped `Limit:` this hook exists to refuse is stored.
+  //
+  // This is worse than the defect #808 fixed. The old hook refused the same message, for the wrong
+  // reason, loudly. This accepts it, silently, and the record is gone by the time anyone looks.
+
+  it("refuses a wrapped trailer when $NODE names an executable that only exits 0", () => {
+    const done = runCommitMsgWithEnv(WRAPPED, {
+      PATH: pathWithoutNode(),
+      HOME: process.env.HOME,
+      NODE: exitsZeroButIsNotNode(),
+    });
+    expect(
+      done.status,
+      "an exit-0 executable was read as a verdict about the message, so the check never ran",
+    ).toBe(1);
+    expect(done.stderr).toContain("could not run");
+  });
+
+  it("refuses a wrapped trailer when npm_node_execpath names one", () => {
+    const done = runCommitMsgWithEnv(WRAPPED, {
+      PATH: pathWithoutNode(),
+      HOME: process.env.HOME,
+      npm_node_execpath: exitsZeroButIsNotNode(),
+    });
+    expect(done.status).toBe(1);
+    expect(done.stderr).toContain("could not run");
+  });
+
+  it("falls through to a candidate that is an interpreter rather than stopping at the first -x", () => {
+    // Establishing a candidate is only half of it. A `$NODE` left over from another project must
+    // not consume the slot that `npm_node_execpath` would have filled correctly.
+    const env = {
+      PATH: pathWithoutNode(),
+      HOME: process.env.HOME,
+      NODE: exitsZeroButIsNotNode(),
+      npm_node_execpath: realNode,
+    };
     expect(runCommitMsgWithEnv(WELL_FORMED, env).status).toBe(0);
     expect(runCommitMsgWithEnv(WRAPPED, env).stderr).toContain(TRAILER_REFUSAL);
   });
