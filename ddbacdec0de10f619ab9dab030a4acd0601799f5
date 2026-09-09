@@ -1,0 +1,2 @@
+Limit: the lease is an identifier and not a secret; anything able to call these functions can read the memory holding it, and what it buys is that each of the three mistakes is refused instead of absorbed
+Provenance: reconstructed
