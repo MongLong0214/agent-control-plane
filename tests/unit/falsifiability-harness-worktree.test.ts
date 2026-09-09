@@ -86,7 +86,9 @@ describe("the falsifiability harness runs from a linked worktree", () => {
   });
 
   it("refuses to call a row killed when the test run never happened", () => {
-    // A linked worktree has no `node_modules`, so the vitest spawn fails with ENOENT. `spawnSync`
+    // A linked worktree has no `node_modules`, so neither tsc nor vitest is reachable. The
+    // compiler check now refuses first; the verdict process tests also exercise missing Vitest.
+    // Before the compiler check existed, the vitest spawn failed with ENOENT. `spawnSync`
     // reports that as `status: null` with the failure in `error` — and reading only
     // `status !== 0` counted it as a kill. Measured on the commit before the fix: with vitest
     // unable to start, the harness printed `killed`, printed its success banner, and exited 0.

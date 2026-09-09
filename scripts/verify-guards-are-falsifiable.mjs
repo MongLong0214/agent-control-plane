@@ -34,6 +34,7 @@
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -42,6 +43,7 @@ import { CASES_DIR, loadFalsifiabilityCases } from "./lib/falsifiability-cases.m
 import { classifyVitestRun } from "./run-vitest-gate.mjs";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
+const require = createRequire(import.meta.url);
 const VITEST = join(ROOT, "node_modules", ".bin", "vitest");
 /**
  * `symbols` ties a row to the enforcement loci named by the Buzz-transition gate; every symbol in
@@ -5031,23 +5033,49 @@ try {
     rmSync(MUTATION_JSON_REPORT, { force: true });
     // Verdict acceptance: a mutant that cannot load cannot establish guard coverage. Check the
     // TypeScript project with the edit applied, so its imports and compiler options are retained.
-    const compileArgs = guard.file.endsWith(".ts")
-      ? [join(ROOT, "node_modules", ".bin", "tsc"), ["--noEmit"]]
-      : guard.file.endsWith(".mjs") ? [process.execPath, ["--check", path]] : null;
+    const isTypeScript = guard.file.endsWith(".ts");
+    const compileArgs = isTypeScript
+      ? ["--noEmit"]
+      : guard.file.endsWith(".mjs") ? ["--check", path] : null;
     if (compileArgs) {
-      const compiled = spawnSync(compileArgs[0], compileArgs[1], {
-        cwd: ROOT, encoding: "utf8", timeout: 600_000,
-      });
-      if (compiled.error || compiled.status !== 0) {
+      let compiler = isTypeScript ? "tsc (typescript/bin/tsc)" : `${process.execPath} --check`;
+      let compiled;
+      try {
+        // Resolve the installed package, as the TypeScript analysis scripts do. A linked
+        // worktree may have neither the package nor a .bin wrapper; only resolve when needed.
+        if (isTypeScript) {
+          const entrypoint = require.resolve("typescript/bin/tsc");
+          compiler = `tsc (${entrypoint}) via ${process.execPath}`;
+          compileArgs.unshift(entrypoint);
+        }
+        compiled = spawnSync(process.execPath, compileArgs, {
+          cwd: ROOT, encoding: "utf8", timeout: 600_000,
+        });
+      } catch (error) {
+        compiled = { error, status: null };
+      }
+      // A missing tool or interrupted compiler provides no verdict about the mutant.
+      if (compiled.error || compiled.status === null) {
+        ours(path, mutated, guard.file, "before restoring");
+        restoreOnce();
+        out(`  COMPILER UNAVAILABLE  ${guard.file}  ${guard.what}`);
+        out(`verify-guards-are-falsifiable: could not run ${compiler} to completion for this row`);
+        if (isTypeScript) {
+          out(`  searched for typescript/bin/tsc in: ${require.resolve.paths("typescript/bin/tsc").join(", ")}`);
+        }
+        out(`  ${compiled.error?.message ?? `terminated by signal ${compiled.signal ?? "?"}`}`);
+        out("No compiler verdict is available. Refusing to judge this row.");
+        process.exit(1);
+      }
+      if (compiled.status !== 0) {
         ours(path, mutated, guard.file, "before restoring");
         writeFileSync(path, original);
-        out(`  RUN FAILURE  ${guard.file}  ${guard.what}`);
-        failures.push({ guard, why: "mutant did not compile: " +
-          (compiled.error?.message ??
-            (`exit ${compiled.status}, signal ${compiled.signal ?? "none"}\n` +
-              compiled.stdout + compiled.stderr).trim()) });
+        out(`  INVALID MUTANT  ${guard.file}  ${guard.what}`);
+        failures.push({ guard, why: "unusable row: mutant did not compile: " +
+          (`exit ${compiled.status}\n` + compiled.stdout + compiled.stderr).trim() });
         continue;
       }
+      out(`  COMPILED  ${guard.file}  ${guard.what}`);
     }
     const done = spawnSync(
       VITEST,

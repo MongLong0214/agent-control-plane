@@ -11,6 +11,7 @@ afterEach(cleanupTempDirs);
 const run = (statuses: string[], exitCode: number, options: {
   success?: boolean; names?: string[]; file?: string; selector?: string; missing?: boolean;
   malformed?: boolean; noRunner?: boolean; realVitest?: boolean;
+  compiler?: "missing" | "signaled";
   target?: string; original?: string; find?: string; replace?: string;
 } = {}) => {
   const root = realpathSync(tempDir("acp-mutation-verdict-"));
@@ -55,8 +56,12 @@ const run = (statuses: string[], exitCode: number, options: {
     symlinkSync(join(import.meta.dirname, "../../node_modules"), join(root, "node_modules"), "dir");
   } else {
     mkdirSync(join(root, "node_modules/.bin"), { recursive: true });
-    symlinkSync(join(import.meta.dirname, "../../node_modules/typescript"), join(root, "node_modules/typescript"), "dir");
-    symlinkSync(join(import.meta.dirname, "../../node_modules/.bin/tsc"), join(root, "node_modules/.bin/tsc"));
+    if (options.compiler === "signaled") {
+      put("node_modules/typescript/bin/tsc", 'process.kill(process.pid, "SIGTERM");\n');
+    } else if (options.compiler !== "missing") {
+      // The package is reachable without a .bin/tsc wrapper, as in a partially linked checkout.
+      symlinkSync(join(import.meta.dirname, "../../node_modules/typescript"), join(root, "node_modules/typescript"), "dir");
+    }
   }
   if (!options.realVitest && !options.noRunner) {
     // The harness supplies "run" as argv[1]; sh reads that fixture. Executing newly generated
@@ -78,8 +83,9 @@ process.exit(${exitCode});
     "--only=verdict-probe"], { cwd: root, encoding: "utf8" });
   expect(result.error).toBeUndefined();
   expect(readFileSync(join(root, target), "utf8")).toBe(original);
+  expect(existsSync(join(root, ".git/verify-guards-in-flight.json"))).toBe(false);
   return { status: result.status, output: `${result.stdout}${result.stderr}`,
-    ran: existsSync(join(root, "vitest-ran")) };
+    ran: existsSync(join(root, "vitest-ran")), root };
 };
 
 describe("a mutation kill belongs to the named assertion", () => {
@@ -157,8 +163,35 @@ describe("a mutation kill belongs to the named assertion", () => {
 
   it("keeps the did-not-run guard when Vitest cannot start", () => {
     const result = run(["failed"], 1, { noRunner: true });
+    expect(result.output).toContain("could not run");
     expect(result.output).toContain("A run that did not happen cannot kill a guard");
     expect(result.output).not.toMatch(/^  killed /m);
+    expect(result.output).not.toContain("guard(s) removed on purpose");
+    expect(result.status).toBe(1);
+  });
+
+  it("refuses a missing compiler without judging the mutant or running its witness", () => {
+    const result = run(["failed"], 1, { target: "guard.ts", compiler: "missing" });
+    expect(result.output).toContain("COMPILER UNAVAILABLE");
+    expect(result.output).toContain("could not run tsc (typescript/bin/tsc)");
+    expect(result.output).toContain(`searched for typescript/bin/tsc in: ${join(result.root, "scripts/node_modules")}, ${join(result.root, "node_modules")}`);
+    expect(result.output).not.toContain("mutant did not compile");
+    expect(result.output).not.toContain("INVALID MUTANT");
+    expect(result.output).not.toContain("COMPILED");
+    expect(result.output).not.toContain("killed");
+    expect(result.output).not.toContain("guard(s) removed on purpose");
+    expect(result.ran).toBe(false);
+    expect(result.status).toBe(1);
+  });
+
+  it("refuses an interrupted compiler without judging the mutant or running its witness", () => {
+    const result = run(["failed"], 1, { target: "guard.ts", compiler: "signaled" });
+    expect(result.output).toContain("COMPILER UNAVAILABLE");
+    expect(result.output).toContain("terminated by signal SIGTERM");
+    expect(result.output).not.toContain("mutant did not compile");
+    expect(result.output).not.toContain("killed");
+    expect(result.output).not.toContain("guard(s) removed on purpose");
+    expect(result.ran).toBe(false);
     expect(result.status).toBe(1);
   });
 
@@ -167,8 +200,9 @@ describe("a mutation kill belongs to the named assertion", () => {
     { target: "guard.ts", original: "export const guard: boolean = true;\n", find: "true", replace: '"wrong type"' },
   ])("refuses an invalid mutant before running its witness: $target", (options) => {
     const result = run(["failed"], 1, options);
-    expect(result.output).toContain("RUN FAILURE");
-    expect(result.output).toContain("mutant did not compile");
+    expect(result.output).toContain("INVALID MUTANT");
+    expect(result.output).toContain("unusable row: mutant did not compile");
+    expect(result.output).not.toContain("COMPILER UNAVAILABLE");
     expect(result.output).not.toMatch(/^  killed /m);
     expect(result.ran).toBe(false);
     expect(result.status).toBe(1);
@@ -176,6 +210,8 @@ describe("a mutation kill belongs to the named assertion", () => {
 
   it("accepts a TypeScript mutant that compiles and fails its named witness", () => {
     const result = run(["failed"], 1, { target: "guard.ts" });
+    expect(existsSync(join(result.root, "node_modules/.bin/tsc"))).toBe(false);
+    expect(result.output).toContain("COMPILED");
     expect(result.output).toMatch(/^  killed /m);
     expect(result.ran).toBe(true);
     expect(result.status).toBe(0);
