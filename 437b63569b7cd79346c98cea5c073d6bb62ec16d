@@ -1,0 +1,3 @@
+Limit: the ABI is pinned to the amalgamation better-sqlite3 was built from, and sqlite3_extension_init refuses to load if sqlite3_libversion() differs from the SQLITE_VERSION it was compiled against
+Warn: FdVfsControl.load() verifies the VFS actually registered rather than trusting loadExtension to have had an effect; a shim that failed to register would silently send every later open back through the ordinary pathname VFS, which is the behaviour being replaced
+Provenance: reconstructed
