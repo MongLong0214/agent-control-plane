@@ -19,7 +19,20 @@ import { ReasonCode } from "../core/reason-codes.ts";
  * the wording lives with each caller so a future third one is not tempted to import an "operator"
  * string a name never described.
  */
-export const MAX_LOCAL_SOCKET_LINE_BYTES = 1024 * 1024;
+/**
+ * The bound on one framed request: the whole buffer this reader has accumulated, the terminating
+ * newline included. It is not the bound on a line's content, and the name says so because the two
+ * differ by a byte and a caller cannot see which it is getting (#816).
+ *
+ * Measuring the buffer is right here and wrong for a reader that serves a stream. This reader
+ * takes exactly one request per connection and refuses anything after the first newline, so the
+ * buffer is that one request and nothing else; a stream reader's buffer is whatever the kernel
+ * happened to deliver, which is neither peer's choice, and bounding that refuses two legal
+ * messages for arriving together (#805). The consequence to state rather than discover: the
+ * largest content this accepts is one byte short of this number, because the terminator it must
+ * carry is counted too.
+ */
+export const MAX_LOCAL_SOCKET_FRAMED_REQUEST_BYTES = 1024 * 1024;
 
 export interface LocalSocketFrameMessages {
   tooLarge: string;
@@ -41,14 +54,16 @@ export const readOneJsonLineRequest = (
   messages: LocalSocketFrameMessages,
   onLine: (value: unknown) => void,
   onFrameError: (decision: Decision<never>) => void,
-  maxBytes: number = MAX_LOCAL_SOCKET_LINE_BYTES,
+  maxFramedBytes: number = MAX_LOCAL_SOCKET_FRAMED_REQUEST_BYTES,
 ): { dispose(): void } => {
   let buffer = Buffer.alloc(0);
   let done = false;
   const receive = (chunk: Buffer): void => {
     if (done) return;
     buffer = Buffer.concat([buffer, chunk]);
-    if (buffer.length > maxBytes) {
+    // The whole buffer, before the boundary is looked for: the terminator is part of what is
+    // bounded here, so a request whose content is `maxFramedBytes` bytes does not fit.
+    if (buffer.length > maxFramedBytes) {
       done = true;
       socket.removeListener("data", receive);
       onFrameError(deny(ReasonCode.INVALID_ARGUMENT, messages.tooLarge));
