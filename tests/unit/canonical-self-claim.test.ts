@@ -13,13 +13,14 @@ import {
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OwnerAuthority, type OwnerApprovalReceipt, type OwnerAuthorityPort } from "../../src/ceo/owner-authority.ts";
 import { type Decision, allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { roleKeyFor, Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
+import { MessageKind } from "../../src/outbox/envelope.ts";
 import type { BuzzActorAuthenticator } from "../../src/session/session-registry.ts";
 import {
   CanonicalSelfClaim,
@@ -266,6 +267,169 @@ const makeSubject = (
       transcriptReader: options.transcriptReader ?? fakeTranscriptReader(),
     },
   );
+
+const successorFixture = async () => {
+  const core = makeCore();
+  const projectId = "prj_successor";
+  insertProject(core, projectId);
+  const subject = makeSubject(core);
+  const first = await subject.claim(baseRequest(core, projectId));
+  if (!first.allowed) throw new Error(JSON.stringify(first));
+  const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+  // Admit against the original ACTIVE holder; revoke preserves bytes but terminally rejects delivery.
+  const envelope = { idempotencyKey: "owner-late", roleKey, bindingGeneration: 1,
+    targetSessionId: first.value.sessionId, kind: MessageKind.OWNER_MESSAGE,
+    payload: { text: "original owner envelope", nonce: "original-nonce" },
+  };
+  const admitted = core.outbox.enqueue(envelope);
+  expect(admitted.allowed, JSON.stringify(admitted)).toBe(true);
+  const pendingBeforeRevoke = core.db.all<Record<string, unknown>>(`SELECT * FROM outbox`);
+  expect(pendingBeforeRevoke).toEqual([expect.objectContaining({ status: "PENDING" })]);
+  expect(core.bindings.revoke(roleKey, "lost attachment").allowed).toBe(true);
+  // Recovery starts after revoke: preserve its terminal refusal, never resurrect PENDING.
+  const beforeRecovery = core.db.all(`SELECT * FROM outbox`);
+  expect(beforeRecovery).toEqual(pendingBeforeRevoke.map((row) => ({
+    ...row, status: "REJECTED", reason_code: ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
+  })));
+  expect(core.outbox.enqueue({ ...envelope, idempotencyKey: "owner-after-revoke" })).toMatchObject({
+    allowed: false, reasonCode: ReasonCode.OUTBOX_TARGET_NOT_CURRENT,
+  });
+  expect(core.db.all(`SELECT * FROM outbox`)).toEqual(beforeRecovery);
+  const request = baseRequest(core, projectId, {
+    expectedBindingGeneration: 2,
+    ownerApproval: mintOwnerApproval(core, { projectId, claimedSessionUuid: CANON, expectedBindingGeneration: 2 }),
+  });
+  return { core, projectId, subject, first: first.value, request, roleKey };
+};
+
+// Full durable preimages, not counts: rollback must restore pointer, hash, approval and envelope bytes.
+const durableSnapshot = (core: CoreHarness) => core.db.all<{ name: string }>(
+  `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`,
+).map(({ name }) => [name, core.db.all(`SELECT * FROM "${name.replaceAll('"', '""')}"`)]);
+
+describe("same-live successor transaction", () => {
+  it("same-live recovery concurrent claims have exactly one winner", async () => {
+    const { core, subject, request, first } = await successorFixture();
+    const envelopeBefore = core.db.all(`SELECT * FROM outbox`);
+    expect(envelopeBefore).toHaveLength(1);
+    const before = rowCounts(core);
+    const results = await Promise.all([subject.claim(request), subject.claim(request)]);
+    expect(core.db.all(`SELECT * FROM outbox`)).toEqual(envelopeBefore);
+    expect(results.filter((r) => r.allowed)).toHaveLength(1);
+    expect(results.filter((r) => !r.allowed)).toHaveLength(1);
+    expect(rowCounts(core).sessions).toBe(before.sessions + 1);
+    expect(core.db.all(`SELECT session_id FROM sessions WHERE buzz_actor_id = ? AND lifecycle NOT IN ('STOPPED','ERROR')`,
+      ["buzz:canonical-cto"])).toHaveLength(1);
+    expect(core.db.all(`SELECT assignment_id FROM assignments WHERE status = 'ACTIVE'`)).toHaveLength(1);
+    expect(core.sessions.require(first.sessionId).lifecycle).toBe(SessionLifecycle.STOPPED);
+  });
+
+  it.each(["stop", "create", "ready", "buzz", "bind"] as const)(
+    "same-live recovery rollback after real %s callee restores every table and approval", async (stage) => {
+      const { core, subject, request } = await successorFixture();
+      const before = durableSnapshot(core);
+      const envelopeBefore = core.db.all(`SELECT * FROM outbox`);
+      const refusal = deny<never>(ReasonCode.CONFLICT, "injected after real callee", {});
+      let invoked = false;
+      const transition = core.sessions.transition.bind(core.sessions);
+      const create = core.sessions.create.bind(core.sessions);
+      const buzz = core.sessions.bindBuzzActor.bind(core.sessions);
+      const bind = core.bindings.bind.bind(core.bindings);
+      const spies = [
+        vi.spyOn(core.sessions, "transition").mockImplementation((...args) => {
+          const result = transition(...args);
+          if ((stage === "stop" && args[1] === SessionLifecycle.STOPPED) ||
+              (stage === "ready" && args[1] === SessionLifecycle.READY)) {
+            expect(result.allowed).toBe(true); invoked = true; return refusal;
+          }
+          return result;
+        }),
+        vi.spyOn(core.sessions, "create").mockImplementation((...args) => {
+          const result = create(...args);
+          if (stage === "create") { invoked = true; throw new Error("after real create"); }
+          return result;
+        }),
+        vi.spyOn(core.sessions, "bindBuzzActor").mockImplementation((...args) => {
+          const result = buzz(...args);
+          if (stage === "buzz") { expect(result.allowed).toBe(true); invoked = true; return refusal; }
+          return result;
+        }),
+        vi.spyOn(core.bindings, "bind").mockImplementation((...args) => {
+          const result = bind(...args);
+          if (stage === "bind") { expect(result.allowed).toBe(true); invoked = true; return refusal; }
+          return result;
+        }),
+      ];
+      try {
+        if (stage === "create") await expect(subject.claim(request)).rejects.toThrow("after real create");
+        else expect((await subject.claim(request)).allowed).toBe(false);
+        expect(invoked).toBe(true);
+        expect(durableSnapshot(core)).toEqual(before);
+      } finally { spies.forEach((spy) => spy.mockRestore()); }
+      expect((await subject.claim(request)).allowed).toBe(true);
+      expect(core.db.all(`SELECT * FROM outbox`)).toEqual(envelopeBefore);
+    },
+  );
+
+  it.each(["execution", "pipeline", "resource", "other-live-holder"] as const)(
+    "same-live recovery refuses outstanding %s after assignment revocation", async (kind) => {
+      const { core, first, request, subject, projectId } = await successorFixture();
+      const now = core.clock.nowIso();
+      core.db.run(`INSERT INTO runs (run_id, project_id, kind, execution_mode, priority, state, goal, contract_digest, created_at)
+        VALUES ('run_other', ?, 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'ACTIVE', 'fixture', 'fixture', ?)`, [projectId, now]);
+      if (kind === "execution") {
+        core.db.run(`INSERT INTO tasks (task_id, run_id, title, category, state, spec_json, created_at, updated_at)
+          VALUES ('task_live', 'run_other', 'fixture', 'test', 'RUNNING', '{}', ?, ?)`, [now, now]);
+        expect(core.bindings.bind({ role: Role.WORKER, taskId: "task_live", runId: "run_other", sessionId: first.sessionId }).allowed).toBe(true);
+        core.db.run(`INSERT INTO task_executions (execution_id, run_id, task_id, attempt, owner_binding_generation,
+          worker_session_id, provider, model, started_at, status)
+          VALUES ('exec_live', 'run_other', 'task_live', 1, 1, ?, 'fixture', 'fixture', ?, 'RUNNING')`, [first.sessionId, now]);
+        expect(core.bindings.revoke("WORKER:task_live", "fixture revoked but executing").allowed).toBe(true);
+      } else if (kind === "pipeline") {
+        core.db.run(`INSERT INTO candidate_pipeline_attempts (run_id, attempt_id, owner_session_id, owner_binding_generation,
+          state, started_at, deadline_at) VALUES ('run_other', 'pipeline_live', ?, 1, 'RUNNING', ?, ?)`, [first.sessionId, now, now]);
+      } else if (kind === "resource") {
+        core.db.run(`INSERT INTO resource_claims (claim_id, repository_identity, branch, run_id, owner_session_id,
+          owner_binding_generation, acquired_at, expires_at, status)
+          VALUES ('claim_live', 'fixture', 'fixture', 'run_other', ?, 1, ?, ?, 'HELD')`, [first.sessionId, now, now]);
+      } else {
+        const other = core.sessions.create({ provider: "fixture", model: "fixture" });
+        expect(core.sessions.transition(other.sessionId, SessionLifecycle.READY).allowed).toBe(true);
+        const bound = core.bindings.bind({ role: Role.CEO, sessionId: other.sessionId });
+        if (!bound.allowed) throw new Error(JSON.stringify(bound));
+        core.db.run(`UPDATE conversational_actors SET current_session_id = ?, current_session_incarnation = ?
+          WHERE actor_id = (SELECT actor_id FROM assignments WHERE assignment_id = ?)`,
+        [first.sessionId, core.sessions.require(first.sessionId).incarnation, bound.value.assignmentId]);
+      }
+      const before = durableSnapshot(core);
+      expect((await subject.claim(request)).allowed).toBe(false);
+      expect(durableSnapshot(core)).toEqual(before);
+    },
+  );
+
+  it.each(["pid", "start", "buzz", "draining", "active", "work"] as const)(
+    "same-live recovery refuses %s mismatch without effects", async (condition) => {
+      const { core, first, request, roleKey, projectId } = await successorFixture();
+      let subject = makeSubject(core);
+      if (condition === "pid") subject = makeSubject(core, {
+        chain: [standardChain()[0]!, { ...standardChain()[1]!, ppid: 11 }, claudeAncestor({ pid: 11 })],
+      });
+      if (condition === "start") subject = makeSubject(core, { chain: standardChain({ startedAt: "different lifetime" }) });
+      if (condition === "buzz") request.buzzActorId = "buzz:other";
+      if (condition === "draining") expect(core.sessions.transition(first.sessionId, SessionLifecycle.DRAINING).allowed).toBe(true);
+      if (condition === "active") expect(core.bindings.bind({ role: Role.CEO, sessionId: first.sessionId }).allowed).toBe(true);
+      if (condition === "work") core.db.run(
+        `INSERT INTO runs (run_id, project_id, kind, execution_mode, priority, state, goal, contract_digest,
+          owner_session_id, owner_session_incarnation, owner_binding_generation, owner_role_key, created_at)
+         VALUES ('run_busy', ?, 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'BLOCKED_POST_MERGE', 'fixture', 'fixture', ?, ?, 1, ?, ?)`,
+        [projectId, first.sessionId, core.sessions.require(first.sessionId).incarnation, roleKey, core.clock.nowIso()],
+      );
+      const before = durableSnapshot(core);
+      expect((await subject.claim(request)).allowed).toBe(false);
+      expect(durableSnapshot(core)).toEqual(before);
+    },
+  );
+});
 
 describe("deployment identity is required, deployment-private configuration (#760)", () => {
   it("fails closed, before any effect, when a required deployment value is missing or blank", () => {
@@ -1111,6 +1275,66 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(rowCounts(core)).toEqual(afterFirst);
   });
 
+  it("same-live recovery replaces the runtime while preserving the live actor", async () => {
+    const core = makeCore();
+    const projectId = "prj_same_live";
+    insertProject(core, projectId);
+    const subject = makeSubject(core);
+    const first = await subject.claim(baseRequest(core, projectId));
+    expect(first.allowed).toBe(true);
+    if (!first.allowed) return;
+    const session = core.sessions.require(first.value.sessionId);
+    const oldHash = core.db.get(`SELECT session_secret_hash FROM sessions WHERE session_id = ?`, [session.sessionId]);
+    const actorBefore = core.db.get<{ actor_id: string }>(`SELECT actor_id FROM assignments WHERE assignment_id = ?`,
+      [first.value.binding.assignmentId]);
+    const targetBefore = core.db.all(`SELECT * FROM actor_target_bindings`);
+    expect(core.bindings.revoke(roleKeyFor(Role.PRIMARY_CTO, { projectId }), "recover").allowed).toBe(true);
+    const request = baseRequest(core, projectId, {
+      expectedBindingGeneration: 2,
+      ownerApproval: mintOwnerApproval(core, { projectId, claimedSessionUuid: CANON, expectedBindingGeneration: 2 }),
+    });
+    const before = rowCounts(core);
+    const recovered = await subject.claim(request);
+    expect(recovered.allowed, JSON.stringify(recovered)).toBe(true);
+    if (!recovered.allowed) return;
+    // Actor identity is durable; an ACP session row is a replaceable runtime.
+    expect(recovered.value.sessionId).not.toBe(first.value.sessionId);
+    const successor = core.sessions.require(recovered.value.sessionId);
+    expect(successor.incarnation).not.toBe(session.incarnation);
+    expect(successor).toMatchObject({
+      lifecycle: SessionLifecycle.READY, osPid: session.osPid,
+      osProcessStartedAt: session.osProcessStartedAt, workdir: session.workdir,
+      buzzActorId: session.buzzActorId, buzzAddress: session.buzzAddress,
+    });
+    expect(core.sessions.require(first.value.sessionId)).toMatchObject({
+      ...session, lifecycle: SessionLifecycle.STOPPED, stoppedAt: expect.any(String),
+      updatedAt: expect.any(String),
+    });
+    expect(recovered.value.binding.bindingGeneration).toBe(2);
+    expect(recovered.value.derivedSessionUuid).toBe(first.value.derivedSessionUuid);
+    expect(core.db.get(`SELECT session_secret_hash FROM sessions WHERE session_id = ?`, [session.sessionId])).toEqual(oldHash);
+    expect(core.db.all(`SELECT * FROM actor_target_bindings`)).toEqual(targetBefore);
+    expect(core.db.get(`SELECT actor_id FROM assignments WHERE assignment_id = ?`,
+      [recovered.value.binding.assignmentId])).toEqual(actorBefore);
+    expect(core.db.get(`SELECT current_session_id, current_session_incarnation FROM conversational_actors WHERE actor_id = ?`,
+      [actorBefore!.actor_id])).toEqual({ current_session_id: successor.sessionId, current_session_incarnation: successor.incarnation });
+    expect(core.db.all<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events WHERE session_id = ? AND kind = 'SESSION_LIFECYCLE'`,
+      [successor.sessionId]).some((event) => event.evidence_json.includes(session.sessionId))).toBe(true);
+    expect(recovered.value.sessionSecret).not.toBe(first.value.sessionSecret);
+    expect(first.value.sessionSecret).not.toBeNull();
+    expect(recovered.value.sessionSecret).not.toBeNull();
+    expect(core.sessions.verifySecret(first.value.sessionId, first.value.sessionSecret!).allowed).toBe(false);
+    expect(core.sessions.verifySecret(recovered.value.sessionId, recovered.value.sessionSecret!).allowed).toBe(true);
+    const after = rowCounts(core);
+    expect(after.sessions).toBe(before.sessions + 1);
+    expect(after.conversational_actors).toBe(before.conversational_actors);
+    expect(after.actor_target_bindings).toBe(before.actor_target_bindings);
+    expect(after.assignments).toBe(before.assignments + 1);
+    expect(after.actor_target_attestations).toBe(before.actor_target_attestations + 1);
+    expect((await subject.claim(request)).allowed).toBe(false);
+    expect(rowCounts(core)).toEqual(after);
+  });
+
   it("clause 4 restore — the same external session, reclaimed after a revoke, reuses the actor and target binding rather than minting a second owner", async () => {
     const core = makeCore();
     const projectId = "prj_restore";
@@ -1424,7 +1648,7 @@ describe("adversarial mutations — each must kill its guard, not merely delete 
             "return this.db.txDecision((): Decision<CanonicalSelfClaimReceipt> => {",
             "return this.db.tx((): Decision<CanonicalSelfClaimReceipt> => {",
           ),
-        "clause 3 — a duplicate live actor is refused with zero additional rows",
+        "same-live recovery rollback after real bind callee",
         true,
       );
     },

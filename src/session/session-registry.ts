@@ -177,7 +177,8 @@ export class SessionRegistry {
       ? Buffer.from(row.session_secret_hash!, "hex")
       : Buffer.alloc(SESSION_SECRET_BYTES);
     const matches = timingSafeEqual(expected, stored);
-    if (!validStoredHash || !matches) {
+    if (!validStoredHash || !matches ||
+        row.lifecycle === SessionLifecycle.STOPPED || row.lifecycle === SessionLifecycle.ERROR) {
       return deny(ReasonCode.SESSION_SECRET_INVALID, "session secret does not authenticate this session", {
         sessionId,
       });

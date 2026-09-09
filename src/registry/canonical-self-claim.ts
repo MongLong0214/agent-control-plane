@@ -1090,12 +1090,76 @@ export class CanonicalSelfClaim {
       const stillLiveAtCommit = this.#assertClaimantStillLive(identity);
       if (!stillLiveAtCommit.allowed) return stillLiveAtCommit as Decision<CanonicalSelfClaimReceipt>;
 
+      // A live canonical actor may replace only its exact revoked runtime attachment.
+      // This is not dead-process recovery and grants no authority over another holder.
+      const incumbent = this.db.get<{
+        actor_id: string; current_session_id: string; current_session_incarnation: string;
+        target_binding_id: string;
+      }>(
+        `SELECT a.actor_id, a.current_session_id, a.current_session_incarnation, t.target_binding_id
+           FROM conversational_actors a JOIN actor_target_bindings t ON t.target_actor_id = a.actor_id
+          WHERE t.executor_kind = ? AND t.target_locator = ? AND t.target_locator_digest = ?`,
+        [SELF_CLAIM_EXECUTOR_KIND, identity.sessionUuid, sha256(identity.sessionUuid)],
+      );
+      const predecessor = incumbent ? this.sessions.get(incumbent.current_session_id) : null;
+      let predecessorSessionId: string | null = null;
+      if (incumbent && predecessor &&
+          predecessor.lifecycle !== SessionLifecycle.STOPPED && predecessor.lifecycle !== SessionLifecycle.ERROR) {
+        const active = this.db.get(
+          `SELECT 1 FROM assignments a JOIN conversational_actors c ON c.actor_id = a.actor_id
+            WHERE a.status = 'ACTIVE' AND (a.actor_id = ? OR a.session_id = ? OR c.current_session_id = ?)`,
+          [incumbent.actor_id, predecessor.sessionId, predecessor.sessionId],
+        );
+        if (active) return deny(ReasonCode.BINDING_ALREADY_ACTIVE, "live actor or session still holds an assignment", {});
+        const revoked = this.db.get(
+          `SELECT 1 FROM assignments a JOIN actor_target_attestations t ON t.assignment_id = a.assignment_id
+            WHERE a.role_key = ? AND a.binding_generation = ? AND a.status = 'REVOKED'
+              AND a.actor_id = ? AND a.session_id = ? AND a.session_incarnation = ?
+              AND t.target_binding_id = ? AND t.binding_generation = a.binding_generation
+              AND t.executor_session_id = a.session_id AND t.executor_session_incarnation = a.session_incarnation`,
+          [roleKey, currentMax, incumbent.actor_id, predecessor.sessionId, predecessor.incarnation,
+            incumbent.target_binding_id],
+        );
+        const work = this.db.get(
+          `SELECT 1 FROM runs r WHERE r.state NOT IN ('COMPLETED','FAILED','CANCELLED')
+            AND (r.owner_session_id = ? OR EXISTS (
+              SELECT 1 FROM assignments a WHERE a.actor_id = ? AND a.role_key = r.owner_role_key
+                AND a.binding_generation = r.owner_binding_generation
+                AND a.session_id = r.owner_session_id AND a.session_incarnation = r.owner_session_incarnation))`,
+          [predecessor.sessionId, incumbent.actor_id],
+        );
+        // Revocation alone does not stop a worker or release an independently held lease.
+        const outstanding = this.db.get(
+          `WITH runtimes AS (
+             SELECT ? AS session_id UNION SELECT session_id FROM assignments WHERE actor_id = ?
+           )
+           SELECT 1 FROM task_executions WHERE status = 'RUNNING' AND worker_session_id IN (SELECT session_id FROM runtimes)
+           UNION ALL SELECT 1 FROM candidate_pipeline_attempts WHERE state = 'RUNNING' AND owner_session_id IN (SELECT session_id FROM runtimes)
+           UNION ALL SELECT 1 FROM resource_claims WHERE status = 'HELD' AND owner_session_id IN (SELECT session_id FROM runtimes)`,
+          [predecessor.sessionId, incumbent.actor_id],
+        );
+        if (!revoked || work || outstanding || predecessor.lifecycle !== SessionLifecycle.READY ||
+            incumbent.current_session_incarnation !== predecessor.incarnation ||
+            predecessor.osPid !== identity.pid || predecessor.osProcessStartedAt !== identity.startedAt ||
+            predecessor.workdir !== identity.cwd || predecessor.buzzActorId !== request.buzzActorId ||
+            predecessor.buzzAddress !== buzzAddress || predecessor.provider !== "claude" ||
+            predecessor.model !== "claude-cli") {
+          return deny(ReasonCode.CONFLICT, "same-live recovery requires the exact idle revoked runtime", {});
+        }
+        predecessorSessionId = predecessor.sessionId;
+      }
+
       // Consumed exactly once, inside this transaction. A denial anywhere below rolls this
       // consumption back too, so a refused claim leaves the approval reusable; only a committed
       // one burns it. `OwnerAuthority.consumeApproval` itself denies a replay or a presentation
       // against a different candidate — both re-checked here for a non-run operation.
       const consumed = this.ownerAuthority.consumeApproval(request.ownerApproval, null);
       if (!consumed.allowed) return consumed as Decision<CanonicalSelfClaimReceipt>;
+      if (predecessorSessionId !== null) {
+        const stopped = this.sessions.transition(predecessorSessionId, SessionLifecycle.STOPPED,
+          `canonical same-live successor generation ${nextGeneration}`);
+        if (!stopped.allowed) return stopped as Decision<CanonicalSelfClaimReceipt>;
+      }
 
       const created = this.sessions.create({
         provider: "claude",
@@ -1111,7 +1175,9 @@ export class CanonicalSelfClaim {
       // `bind()` requires a READY session (SESSION_NOT_READY otherwise); `create()` always starts
       // a session in STARTING. This transition sits inside the same transaction, so a legality
       // failure here rolls back the session insert too, exactly like every other denial in `#mutate`.
-      const ready = this.sessions.transition(created.sessionId, SessionLifecycle.READY, "canonical self-claim");
+      const ready = this.sessions.transition(created.sessionId, SessionLifecycle.READY,
+        predecessorSessionId === null ? "canonical self-claim" :
+          `canonical same-live successor of ${predecessorSessionId}, generation ${nextGeneration}`);
       if (!ready.allowed) return ready as Decision<CanonicalSelfClaimReceipt>;
 
       // The routable half: this session also authenticates as a Buzz channel identity, inside the
@@ -1140,6 +1206,8 @@ export class CanonicalSelfClaim {
       };
       const attestationDigest = digestOf({
         domain: "acp.canonical-self-claim",
+        predecessorSessionId,
+        successorSessionId: created.sessionId,
         sessionUuid: identity.sessionUuid,
         pid: identity.pid,
         startedAt: identity.startedAt,
