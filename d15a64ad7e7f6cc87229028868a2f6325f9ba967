@@ -1,0 +1,3 @@
+Limit: the ledger is append-only, so rows already stored without a digest are read forever, and coverage is therefore decided on the reading side
+Limit: a falsifiability case row has no field for why it exists, so the difference between guarding a defect that was hit and pinning a property claimed already broken lives only in a JSDoc the loader does not read
+Provenance: reconstructed
