@@ -1,0 +1,3 @@
+Limit: every door that could perform the recovery the doctor recommends opens only after start() returns, so the remedy was unreachable in exactly the state that raised the finding
+Limit: a binding whose session row is absent entirely stays refused, because a missing row removes the thing the proof would be about
+Provenance: reconstructed
