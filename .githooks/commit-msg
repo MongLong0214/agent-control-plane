@@ -21,8 +21,126 @@ ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 CHECK="$ROOT/scripts/verify-trailers-are-parsable.mjs"
 [ -f "$CHECK" ] || exit 0
 
-if ! node "$CHECK" --message-file "$MSG_FILE" >/dev/null 2>&1; then
-  node "$CHECK" --message-file "$MSG_FILE" >&2
+# Which interpreter runs the check (#808).
+#
+# `command -v node`, and nothing else.
+#
+# Until #808 this line said `node`, a bare name. Whether the hook checked anything at all then
+# depended on the PATH of whoever ran `git`, and git does not hand a hook a login shell's PATH: a
+# commit from a GUI client, an editor or a launchd job arrives here with no `node` on it, which is
+# what CommitLore's own `doctor` reports on this machine today. The ticket is that the resulting
+# exit 127 was read by `if !` as a refusal, so the hook told the author that their well-formed
+# message writes a record git will not store. The stated cause was not the cause. That is what is
+# fixed, below, by telling "the check refused" apart from "the check could not run".
+#
+# The ticket is NOT that the hook must find an interpreter the operator did not put on git's PATH.
+# Two rounds of this change tried to, and the record of those two rounds is the argument for
+# stopping:
+#
+#   round 1  `$NODE` and `$npm_node_execpath` accepted on `[ -x ... ]`. That tests the file, not
+#            the runtime, and the hook's entire verdict on a commit message is that file's exit
+#            status — so `NODE=/usr/bin/true` made a wrapped `Limit:` pass. A fail-open introduced
+#            by the fix for a fail-loud.
+#   round 2  each candidate asked `-p 'process.versions.node'`, with the first line of its answer
+#            read in place of its status. Measured on that version: a real node under an ordinary
+#            `NODE_OPTIONS=--require <module that writes a line>` prints `boot` ahead of its
+#            version, so the probe rejected the interpreter it was standing on and refused a
+#            well-formed commit with "no Node interpreter found" while node sat on PATH. A `$NODE`
+#            naming `echo 1.2.3; exec sleep 20` answered the question correctly and then held the
+#            pipeline open with no timeout — 60s, no fall-through to the real interpreter behind
+#            it, and the check finally run on the impostor, which accepted the wrapped `Limit:`.
+#            And the first line was read whatever its length, because stopping at a newline was
+#            the only bound there was.
+#
+# Each round closed one hole in the fallbacks and opened another. A third would add a timeout, a
+# byte cap and a fix for the stdout channel, and would still accept `#!/bin/sh` + `echo 1.2.3`:
+# asking a candidate to print a version raises the cost of impersonating an interpreter from
+# `exit 0` to two lines of sh, and calls that establishing one. Worse, it hands a program the
+# hook does not trust an unbounded, untimed channel into the hook — which is more surface than
+# reading its exit status, not less.
+#
+# Every one of those failures exists only because a candidate that is not on git's PATH is
+# consulted at all. So the fallbacks are gone, and with them the probe that existed to make them
+# safe. What is left is smaller than what #808 started with.
+#
+# What the fallbacks were for, measured rather than assumed. The claim was that `pnpm merge` runs
+# `scripts/merge-pr.mjs`, which spawns git from inside a package script, where npm and pnpm set
+# both variables to the interpreter they are already on. On this machine:
+#
+#   - under `pnpm run`, `command -v node` already resolves (`~/.local/bin/node`) and is consulted
+#     first, so `$NODE` — which is `~/.hermes/node/bin/node`, a *different* interpreter — is never
+#     reached;
+#   - the case where it would be reached, a package script whose PATH has no node, cannot arise
+#     here: both `npm` and `pnpm` are `#!/usr/bin/env node` scripts and do not start at all
+#     (`env: node: No such file or directory`).
+#
+# So the fallback never fired in the scenario it was written for. Not established: a standalone
+# `pnpm` carrying its own runtime can start without node on PATH, and whether it then puts node on
+# a script's PATH was not measured.
+#
+# The cost, stated rather than implied: an operator whose git PATH has no node, but who has `$NODE`
+# set by hand, now gets a refusal instead of a check. The refusal below names that variable and
+# says what to do about it, which is more than round 1 gave the commit it silently waved through
+# or round 2 gave the one it hung.
+#
+# What remains defeatable, and was before any of this: an executable named `node` early on the PATH
+# git gives this hook is chosen, is run, and its exit status becomes the verdict on the message —
+# and `pnpm` and `npm` prepend `<repo>/node_modules/.bin`, so a change under review could in
+# principle ship the interpreter that checks it. That is a PATH-trust problem, older and wider than
+# this hook; the hook this replaced resolved `node` through PATH the same way, and neither probe
+# closed it. Making the checker prove it ran — rather than the interpreter prove it is one — is the
+# only thing that would, and it is a change to `scripts/verify-trailers-are-parsable.mjs`, which is
+# its own unit of work.
+NODE_BIN=$(command -v node 2>/dev/null)
+
+# "The check refused" and "the check could not run" are different facts, and until #808 they shared
+# one exit path and one sentence: a missing interpreter made the check exit 127, `if !` read that as
+# a refusal, and the hook told the author their well-formed message writes a record git will not
+# store. The stated cause was not the cause.
+#
+# The choice here is to REFUSE the commit, exit 1, and say why.
+#
+#   - Exiting 0 would let every commit on a machine with no `node` on git's PATH be stored
+#     unchecked, with nothing saying so. That failure is silent, durable and machine-wide: it is not
+#     one bad commit, it is a guard that stopped existing while continuing to report success. This
+#     repository has already lost record lines to a check that was green over nothing.
+#   - Exiting 1 blocks work on a machine that merely lacks a PATH entry. That cost is real, but it
+#     is loud, immediate, self-describing, and cleared by putting node on the PATH git uses. It is
+#     also the one case where `--no-verify` is a deliberate, visible act rather than a silent gap.
+#
+# This is a claim about THIS path only, and the file does not follow it everywhere.
+#
+# An earlier draft of this comment said the two `exit 0` lines above are a different call because a
+# missing `$MSG_FILE` or `$CHECK` means "no such rule exists here". That does not survive reading
+# the `[ -f "$CHECK" ] || exit 0` line above — named by its content rather than its line number,
+# because this comment has already outlived one edit that moved it: this hook is sitting there
+# calling `$CHECK`, which is the rule existing. A commit that
+# deletes `scripts/verify-trailers-are-parsable.mjs` and wraps a `Limit:` is accepted, while a
+# machine that merely lacks node is refused. The file was asserting a principle it did not follow.
+#
+# The missing-`$CHECK` path deliberately chooses the other way, and the reason is that the two are
+# different threats rather than the same one seen twice. A deleted checker is a change to the
+# repository: it is in the diff, it is in review, it is in `git log`, and it is the same for every
+# clone. A missing interpreter is a property of one machine at one moment, invisible to everyone
+# else, and it silently disarms the check for whoever has it while the repository still reads as
+# guarded. The first is a decision someone made and can be seen to have made; the second is a gap
+# nobody chose and nobody can see. Refusing here closes the invisible one.
+#
+# That is a reason, not a proof that the split is right. If the missing-`$CHECK` path should also
+# refuse, that is its own unit of work — deleting the checker is a different threat and widening
+# this change to cover it would put two decisions behind one review.
+if [ -z "$NODE_BIN" ]; then
+  echo "commit-msg: could not run the trailer check — no \`node\` on the PATH git gave this hook." >&2
+  echo "  This says nothing about your commit message." >&2
+  echo "  Git does not run hooks with a login shell's PATH. Put node on the PATH git uses." >&2
+  echo "  \$NODE and \$npm_node_execpath are deliberately NOT consulted. Two rounds of consulting" >&2
+  echo "  them cost a fail-open, a hung commit and a refusal of a message on a machine with node" >&2
+  echo "  right there on PATH; the reasoning is in .githooks/commit-msg." >&2
+  exit 1
+fi
+
+if ! "$NODE_BIN" "$CHECK" --message-file "$MSG_FILE" >/dev/null 2>&1; then
+  "$NODE_BIN" "$CHECK" --message-file "$MSG_FILE" >&2
   echo "" >&2
   echo "commit-msg: this message writes a record git will not store." >&2
   exit 1
