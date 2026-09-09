@@ -1,0 +1,3 @@
+Limit: this unit wires nothing: src/db/fd-vfs.ts remains unreachable from every other module under src/, held by guards:fd-vfs-unreachable
+Warn: releasing when nothing is bound succeeds deliberately, so that a bracket can run its release unconditionally without tracking how far its acquire got
+Provenance: reconstructed
