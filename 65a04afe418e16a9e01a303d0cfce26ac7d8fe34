@@ -1,0 +1,3 @@
+Limit: An unapproved older DB must fail closed before any persistent mutation, including user_version, journal mode, main DB bytes, -wal/-shm/-journal sidecars, or target identity/approval artifacts.
+Record-Id: r-747wal
+Provenance: inherited 56baaaef51092b2ddd639f7bbde1f029f9dfd5ce
