@@ -1,0 +1,5 @@
+Limit: **소켓 경계에서 `mention` 의 타입을 검사하지 않습니다.**
+Ruled-out: `reachedCeo` / `answeredByCeo` / `CeoTurnDelivery` 개명 | 개명은 이 PR 이 건드릴 수 없는 파일 두 개를 깨뜨리므로, 이름 대신 주석에 이유를 적었습니다
+Warn: 인증·리플레이는 `guard.admit` 안에서 먼저 끝나고 그 뒤에만 주소를 조회합니다 — `#targetFor` 가 `guard.admit` 앞에 있으면 위조 서명이 달린 봉투가 대상 저널 행을 씁니다
+Warn: `MENTION_TARGET_UNBOUND` 거부가 이제 `(buzz, nonce)` 슬롯을 **소비합니다**.
+Provenance: reconstructed
