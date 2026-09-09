@@ -1,0 +1,129 @@
+Limit: The installed Claude Code MCP client handshake declares no sampling capability, so the daemon sampling/createMessage delivery cannot reach a real session
+Limit: The runtime refuses to bind the session inbox unless the socket directory is mode 0700, and mkdir honours umask so the mode argument alone does not achieve it
+Ruled-out: MCP Channels as the wake transport | a previous attempt burned its exploration budget on it and it is superseded
+Ruled-out: MCP sampling/createMessage as the wake transport | the real client handshake declares no sampling, so no wiring can make it arrive
+Ruled-out: asserting on the socket, the CLI stdout stream, or the session JSONL | all three go green on a wake that was accepted and then dropped before inference
+Ruled-out: authenticating the injection with CLAUDE_CODE_MESSAGING_TOKEN | on macOS the peer is identified from the socket itself, so the token is never read or stored
+Warn: Take the measurement at the fake provider request body. That is the only observation point downstream of everything the runtime does with the frame
+Warn: This test measures an installed binary. It skips where the claude CLI is not on PATH rather than passing, because a pass there would be a statement about nothing
+Blast: local
+Undo: easy
+Certainty: firm
+Unverified: The auth-line path of the inbox protocol was never exercised; it is untested on platforms without socket-credential peer identification
+Record-Id: r-c0wake1
+Provenance: inherited 50ae7f78c0afe2d2d5f97c70f8229721005f8f83
+
+Limit: ANTHROPIC_BASE_URL and the proxy variables redirect model/provider traffic and are not a network namespace, so the row may claim only what that reaches
+Limit: There are live processes on this machine that must survive, so no pattern-matched or sweep-style kill is permitted anywhere in this harness
+Ruled-out: process.kill(pid) with a pid captured earlier | once the kernel reaps the process that number is available for reuse, so a signal sent a moment too late lands on whatever inherited it
+Ruled-out: polling exitCode on an interval to detect the child's exit | it carries the same race in a form that is harder to see
+Ruled-out: raising the wedged-child error unconditionally from finally | a throw there replaces whatever the try block threw, overwriting the probe's own diagnosis
+Warn: The removal must stay last in finally: after the child is reaped and after the fake server is closed. A live child can recreate the socket, and the server owns the capture file inside that root
+Warn: The teardown row is what keeps this honest. Replacing the rmSync call with a no-op fails it on the existsSync assertion, and reverting to the un-awaited kill fails it on the exit-state assertion
+Blast: local
+Certainty: firm
+Record-Id: r-c0tear1
+Follows: r-c0wake1
+Provenance: inherited 420bd4b3d1dc158cd8ff85e9b03567671a2d1e61
+
+Limit: the 0700 requirement belongs to the parent directory rather than to the socket file: the runtime chmods only the socket directory and never the socket file itself
+Limit: a Node connect error's message embeds the path it was given, so a failed wake reports a fixed shape rather than forwarding the message
+Ruled-out: reading a pid's argv to prove the registering process owns the endpoint socket | the pid and argv were caller-supplied, so they are no evidence that this pid owns that socket
+Ruled-out: a durable session_inbox_endpoints table for endpoint availability | it makes a second authority for a live capability; availability must die with the authenticated MCP connection
+Warn: the wake frame shape is part of the version-pinned contract; sending the bare token instead would be a different protocol that happens to reach the same file
+Blast: module
+Undo: easy
+Certainty: firm
+Unverified: mutating the endpoint normalization condition to false left the row green, so that line is a statement of intent rather than an independently falsifiable guard
+Record-Id: r-5a23a50df5ec
+Provenance: inherited 594af7921a0dab5031ff5f94cabf315f256fdac5
+
+Limit: a Decision's evidence is persisted into audit rows and handed back to callers, so a refused endpoint may carry no path, directory, or fragment of either
+Ruled-out: a single opaque refusal with no category | an operator still has to know which check refused to act on it
+Ruled-out: asserting the absence of a hardcoded path literal | a literal keeps passing if the production code changes which path it echoes
+Warn: a fixture basename that is a substring of a refusal category makes the leak check pass for a reason unrelated to a leak
+Blast: local
+Undo: easy
+Certainty: firm
+Record-Id: r-31e6f2565726
+Provenance: inherited 4a1c005ad4da805bfae153969be89250888a7b0e
+
+Limit: The Hermes receipt route ReceiptLookupQuery is abandoned, so nothing here may add a column or a migration and the lifecycle is built only from facts the outbox row and assignments already carry.
+Ruled-out: a second hand-written copy of the exact-holder predicate on the replay read-back | the two copies drifted until the replay path had no sessions join at all
+Ruled-out: a caller-supplied batch size on claimForHolder | a holder that asked for twenty-five and then died put twenty-five owner-messages into the unknown-outcome path instead of one
+Warn: A STOPPED session keeps its ACTIVE assignment row, so the assignment-only copy answered same holder for a runtime that is gone and handed it a settled-successfully verdict.
+Warn: The compare-and-set must carry role_key, binding_generation and target_session_id as the caller's own values; without them the EXISTS correlates on the row's own columns and matches whenever two runtimes share an incarnation string.
+Warn: Only holder-claimed kinds are swept out of SENT by fenceUndeliverable and retargetOrReject; for an outward delivery SENT means the transport succeeded and an ACK may still legitimately arrive, so widening that clause would fence deliveries that worked.
+Blast: module
+Undo: easy
+Certainty: firm
+Unverified: tests/unit/deploy-launchd.test.ts fails nine rows, and it fails them identically with src/outbox reverted to HEAD and this test file removed, so it is independent of this slice and unverified here.
+Record-Id: r-6f627821a18c
+Provenance: inherited de97c6737eb6b200190d461c40051b4932164ef9
+
+Limit: inbound_messages.payload_json is the only durable copy of an owner's envelope, so the outbox row carries a pointer and the digest binds the full signed payload rather than only the text.
+Limit: An INBOUND_PAYLOAD_IMMUTABLE trigger refuses a rewrite of the stored envelope, so a source digest mismatch can only be produced from the outbox side.
+Ruled-out: making the ledger's claim a db.txDecision | a mismatched source must terminally reject the row it just claimed, and that rejection has to commit
+Ruled-out: calling resolveTurn to settle an owner message | It writes repliedAt, the narrow claim that a reply transport accepted bytes
+Warn: The outer admission frame is db.tx rather than db.txDecision: txDecision rolls back on every denial, including the two refusals that must commit.
+Warn: The rollback signal is a plain object rather than an Error, because Db.translate inspects an Error's message for SQLite constraint text.
+Warn: A replay of a queued event id now reports INGRESS_TURN_OUTCOME_UNKNOWN instead of INGRESS_REPLAY_IGNORED while the outbox row is pending.
+Warn: The peer.server === server test is the connection binding; without it a session holding one role could settle another runtime's messages.
+Blast: module
+Undo: costly
+Certainty: firm
+Unverified: The slice was committed as one commit rather than in stages: no intermediate split of the push-to-pull change compiles, so no staged intermediate was built or run.
+Record-Id: r-aa7e6f0b78c9
+Provenance: inherited ba7490310cf14bd0e6372d1170d3db066317a175
+
+Limit: The ceiling for this slice is scripts/falsifiability-cases/ and nothing else: no src/** and no tests/** bytes
+Limit: The brief was capped mid-slice at four guards and a maximum of four new case files
+Ruled-out: restoring the mutated file by reversing the substitution | reversing it is another string edit that can silently land in the wrong place
+Ruled-out: anchoring the exact-holder case on the incarnation column | dropping the incarnation placeholder would misalign the bound parameters and the row would die of a binding error instead of the guard
+Warn: The gate's own pass only says every anchor resolves once, and that says nothing about whether the case still kills anything
+Blast: local
+Undo: easy
+Certainty: firm
+Unverified: The sibling throw rollingBack(claimed) on the turn claim is not reachable through this admission path, because admit inserts the row one statement earlier in the same transaction and claimTurn cannot deny against it
+Unverified: the exclusion of OWNER_MESSAGE from the generic delivery sweep, the compare-and-set carrying the caller's full tuple in the UPDATE itself, and the unconditional wake a successful endpoint registration sends
+Record-Id: r-5a8ecd926ca2
+Provenance: inherited d4c41932f48a8f5d4f4d66b33e1dffa4cde2b128
+
+Limit: The reason codes are an external contract: src/core/reason-codes.ts says so in its header, so a code cannot be minted for a condition only a test harness reaches.
+Ruled-out: adding NO_STRUCTURED_CONTENT to the reason code catalogue | catalogue that production denials draw from, so a helper that mints its own code enlarges the published contract
+Warn: A reason literal written in tests/** is measured against src/core/reason-codes.ts by the static outflow census, so a socket helper that invents a code is a raw CI FAIL in both Node matrix jobs, not stale infra.
+Blast: local
+Undo: easy
+Certainty: firm
+Unverified: No broad or final lanes were run: no full gates, no scenario or e2e sweeps, no full unit sweep.
+Record-Id: r-q4socketreason
+Provenance: inherited bc7afa26166d264a418427a5f08a46d1e887d90d
+
+Limit: No schema, no migration, no new storage, no polling and no new reason code were available, so the lifecycle is built only from the outbox row, assignments and the existing turn claim.
+Limit: The ingress claim is found by turn_claim_json.turnRequestId rather than by the row's own pointer, because two of the transitions that must settle are refusals of a row whose pointer is unreadable.
+Ruled-out: settling from the ownerMessagePointer on the outbox payload | two of the refusal paths that must settle are exactly the paths where that payload no longer resolves
+Ruled-out: a reconciler or a global callback that settles ingress claims after the fact | the settlement has to be in the same transaction as the outbox transition, or a crash between them leaves the split state
+Ruled-out: adding OWNER_MESSAGE to RETARGETABLE_KINDS | the two sets say opposite things about a kind and an existing row asserts OWNER_MESSAGE is not in it
+Warn: a queued OWNER_MESSAGE must not be terminally rejected by any generic sweep, so both fence sweeps exclude holder-claimed kinds from their PENDING arm and only retargetOrReject moves or closes such a row
+Warn: completeForHolder and rejectForHolder are the single settlement site, and a second copy in the ledger would cover two of the five transitions and none of the other three
+Warn: retargetOrReject must never return an OWNER_MESSAGE in retargeted when fromGeneration equals toGeneration, because revoke runs its own direct UPDATE over that list and would settle the outbox row without touching the ingress claim
+Warn: excluding holder-claimed kinds from the expiry sweep alone is not enough, because the two expires_at conditions inside claimForHolder would still make the row unclaimable while it kept looking healthy
+Blast: module
+Undo: costly
+Certainty: firm
+Unverified: no broad or final lanes were run, so no full gates, no scenario or e2e sweeps, and no full unit sweep
+Record-Id: r-0f432a9a48ac
+Provenance: inherited 6a30314ea7b92b6aefe732cf50432f1885a1372e
+
+Limit: the two notions of current holder had to be reconciled inside the same transaction as the move, so binding-registry.ts was widened into the change set: there is no other site
+Ruled-out: a blocklist of forbidden phrases for the owner-facing sentences | one spelling of one claim, and the next author's synonym is by construction not on the list
+Ruled-out: a fourth predicate expressing current holder its own way | it would be a third notion of current holder beside the two this reconciles
+Warn: liveDeliveryTarget had to move to the same notion as exactHolderTarget; changing only the exact predicate would have made fenceUndeliverable reject a live holder's outstanding message
+Warn: the surviving-move carry does not stamp OUTBOX_RETARGETED, because that mark means carried across a generation to a different conversation
+Warn: PENDING cannot tell a row that was carried once from one that was never moved, which is why the retarget is a compare-and-set on the absence of the mark
+Blast: module
+Undo: easy
+Certainty: firm
+Unverified: neither vocabulary lock proves the semantic property; no assertion over strings can
+Record-Id: r-4d48683ad307
+Provenance: inherited c2ce54fcead5e6fd1df453c4562c6a25e6a25835
