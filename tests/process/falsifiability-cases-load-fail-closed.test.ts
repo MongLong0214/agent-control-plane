@@ -151,8 +151,14 @@ describe("a broken case module stops the harness before the run starts", () => {
    *
    * A linked worktree at `HEAD` rather than the working copy — the same rule the harness itself
    * follows and the same one the worktree regression test follows, so this exercises the committed
-   * harness. `--only` is given a filter that matches no row, so a healthy tree finishes in a moment
-   * with exit 0; the only difference between the two halves below is the broken module on disk.
+   * harness. `--anchors-only` is the mode it runs in: read-only, no vitest, done in a moment, and
+   * — this is the part that matters — it does real work of its own on a healthy tree, so the
+   * control below is a run that demonstrably got past the loader rather than one that had nothing
+   * to do either way. The only difference between the two halves is the broken module on disk.
+   *
+   * It used to pass `--only=` a filter that matched no row, which finished quickly for the wrong
+   * reason: a zero-row selection printed PASS over an empty table. That is refused now, and the
+   * control has to earn its exit 0 instead of inheriting it from a sweep with no subject.
    */
   const inWorktreeWithCase = (
     caseFile: string | null,
@@ -167,7 +173,7 @@ describe("a broken case module stops the harness before the run starts", () => {
       run(
         spawnSync(
           process.execPath,
-          [join(worktree, "scripts", "verify-guards-are-falsifiable.mjs"), "--only=__matches_no_row__"],
+          [join(worktree, "scripts", "verify-guards-are-falsifiable.mjs"), "--anchors-only"],
           { cwd: worktree, encoding: "utf8" },
         ),
       );
@@ -179,7 +185,12 @@ describe("a broken case module stops the harness before the run starts", () => {
 
   it("passes on an unmodified checkout, so the failure below is the broken case and nothing else", () => {
     inWorktreeWithCase(null, "", (result) => {
-      expect(`${result.stdout ?? ""}${result.stderr ?? ""}`).not.toContain("could not be loaded");
+      const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+
+      expect(output).not.toContain("could not be loaded");
+      // The control has to reach the mode's own work, not merely exit 0. Its absence below is
+      // what makes "the loader stopped it" a measurement rather than an inference.
+      expect(output).toContain("anchor(s) still match");
       expect(result.status).toBe(0);
     });
   });
@@ -196,6 +207,7 @@ describe("a broken case module stops the harness before the run starts", () => {
       // have been reached — the `what:` count is the one that answered 298 about a file that did
       // not parse.
       expect(output).not.toContain("`what:` line(s)");
+      expect(output).not.toContain("anchor(s) still match");
       expect(output).not.toContain("RESULT: PASS");
     });
   });
