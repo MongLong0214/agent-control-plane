@@ -1,0 +1,5 @@
+Limit: not fixed and stated: unresolved rows are never cleaned up, so one is left permanently per timeout and the owner has to keep prefixing /again from then on
+Limit: user_version = 25, so turn_claim_json (v30) is not in the live deployment yet and this change alters nothing there until that deployment moves forward
+Warn: outcomeWithReply hardcodes turnAnswered: false and takes no parameter, so a site that forgets the wiring leaves the turn as a visible unknown that doctor raises and the owner hears; the default it replaces failed the other way, silently
+Warn: storedState rebuilds the row field by field instead of casting it, which silently dropped turnAnswered between the reservation and the restart read; dropping it makes every recovered claim read as unanswered, and that is the fail-closed direction, the easiest failure to pass over
+Provenance: reconstructed
