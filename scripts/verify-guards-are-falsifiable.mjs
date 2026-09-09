@@ -4574,7 +4574,7 @@ const GUARDS = [
     id: "role-attachment-bind-notification",
     what: "a committed bind publishes its successor",
     file: "src/session/binding-registry.ts",
-    find: "      this.#notifySwitch(created);\n",
+    find: "      this.#notifySwitch(created, reused.value ?? undefined);\n",
     replace: "",
     killedBy: ["tests/unit/role-attachment-authorization.test.ts::binding a revoked key publishes its committed successor"],
   },

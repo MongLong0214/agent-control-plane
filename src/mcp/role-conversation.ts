@@ -208,6 +208,10 @@ type EndpointCheck =
  * conclusion whose reading no longer existed, and a conclusion nobody can re-read is indistinguishable
  * from one nobody took.
  *
+ * Raw captures and logs use fixed, overwriteable local paths, and the three previously recorded
+ * historical losses remain unrecoverable. The raw captures behind the receipt produced at
+ * 2026-09-08T23:01:02.003Z have since been overwritten and are not recoverable.
+ *
  * The reading behind this value covers an **interactive** start, which the C0 one did not. That
  * matters because `isInteractiveClaudeInvocation` (src/registry/canonical-self-claim.ts) refuses
  * `-p`, `--print`, `--output-format` and `--input-format`: the process that may hold the canonical

@@ -484,6 +484,77 @@ describe("role attachment authorization without sockets", () => {
     expect(daemon.attachments.authorize(credential).allowed).toBe(true);
   });
 
+  it.each([
+    ["bind", false], ["bind", true], ["SURVIVED", false], ["SURVIVED", true],
+  ] as const)("shared actor transfers invalidate both role attachments: %s roundTrip=%s", (route, roundTrip) => {
+    const verifiedTarget = { executorKind: "hermes", targetLocator: "shared-attachment-target",
+      targetLocatorDigest: digestOf("shared-attachment-target") };
+    valueOf(h.cp.bindings.revoke(roleKey, "establish shared actor"));
+    valueOf(h.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: "attachment-project",
+      ...subject, verifiedTarget }));
+    for (const projectId of ["attachment-sibling", "attachment-reuse"]) {
+      const manifest = fixtureManifest(projectId);
+      valueOf(h.cp.projects.register({ projectId, name: "fixture", manifest,
+        authorization: h.cp.manifestAuthorizationForTests(manifest) }));
+    }
+    const sibling = valueOf(h.cp.bindings.bind({ role: Role.PRIMARY_CTO,
+      projectId: "attachment-sibling", ...subject, verifiedTarget }));
+    const keys = [roleKey, sibling.roleKey];
+    expect(h.cp.db.all("SELECT DISTINCT actor_id FROM assignments WHERE status = 'ACTIVE' AND role_key IN (?, ?)", keys))
+      .toHaveLength(1);
+    port = new RoleConversationPort(Role.PRIMARY_CTO, {
+      active: (key) => h.cp.bindings.active(key), currentCandidates: () => keys.map((key) => h.cp.bindings.require(key)),
+    });
+    const credentials = keys.map((key) => {
+      const scope = valueOf(daemon.attachments.scope(subject.sessionId, key));
+      const credential = valueOf(issue(approval({ parameters: scope }), { roleKey: key }));
+      valueOf(daemon.attachments.connect(server(), port, credential));
+      return credential;
+    });
+    const other = ready();
+    const move = () => route === "bind"
+      ? valueOf(h.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: "attachment-reuse", ...other, verifiedTarget }))
+      : valueOf(h.cp.bindings.switchTo({ role: Role.PRIMARY_CTO, projectId: "attachment-project",
+        ...other, conversation: "SURVIVED", reason: "move shared actor" }));
+    const notified = vi.fn();
+    h.cp.bindings.onSwitch(notified);
+    expect(() => h.cp.db.tx(() => { move(); throw new Error("rollback shared move"); }))
+      .toThrow("rollback shared move");
+    h.cp.db.tx(() => {});
+    expect(notified).not.toHaveBeenCalled();
+    for (const credential of credentials) {
+      expect(daemon.attachments.authorize(credential).allowed).toBe(true);
+      expect(port.connected(credential.roleKey)).toBe(true);
+    }
+    const returnToSubject = () => valueOf(h.cp.bindings.switchTo({ role: Role.PRIMARY_CTO,
+      projectId: "attachment-project", ...subject, conversation: "SURVIVED", reason: "return shared actor" }));
+    h.cp.db.tx(() => {
+      move();
+      for (const key of keys) {
+        expect(h.cp.bindings.require(key).sessionId).toBe(other.sessionId);
+        expect(port.connected(key)).toBe(true);
+      }
+      if (roundTrip) returnToSubject();
+      expect(notified).not.toHaveBeenCalled();
+    });
+    // Check every record together: stale authority alone would leave the bearer stored.
+    expect(credentials.map((credential) => daemon.attachments.authorize(credential))).toEqual(
+      credentials.map(() => expect.objectContaining({ allowed: false,
+        message: "attachment credential is unknown or invalid" })),
+    );
+    expect(keys.map((key) => port.connected(key))).toEqual([false, false]);
+    for (const key of keys) {
+      expect(notified.mock.calls.filter(([binding]) => binding.roleKey === key && binding.sessionId === other.sessionId))
+        .toHaveLength(1);
+    }
+    if (!roundTrip) returnToSubject();
+    for (const credential of credentials) {
+      expect(h.cp.bindings.require(credential.roleKey).sessionId).toBe(subject.sessionId);
+      expect(daemon.attachments.authorize(credential)).toMatchObject({ allowed: false,
+        message: "attachment credential is unknown or invalid" });
+    }
+  });
+
   it("an unchanged holder and a sibling transfer preserve the approved attachment", () => {
     const credential = grant();
     valueOf(daemon.attachments.connect(server(), port, credential));
@@ -494,6 +565,8 @@ describe("role attachment authorization without sockets", () => {
     valueOf(h.cp.projects.register({ projectId: manifest.projectId, name: "fixture", manifest,
       authorization: h.cp.manifestAuthorizationForTests(manifest) }));
     valueOf(h.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: manifest.projectId, ...subject }));
+    expect(h.cp.db.all("SELECT DISTINCT actor_id FROM assignments WHERE status = 'ACTIVE' AND role_key IN (?, ?)",
+      [roleKey, roleKeyFor(Role.PRIMARY_CTO, { projectId: manifest.projectId })])).toHaveLength(2);
     valueOf(h.cp.bindings.switchTo({ role: Role.PRIMARY_CTO, projectId: manifest.projectId,
       ...ready(), conversation: "SURVIVED", reason: "move sibling" }));
     expect(daemon.attachments.authorize(credential).allowed).toBe(true);

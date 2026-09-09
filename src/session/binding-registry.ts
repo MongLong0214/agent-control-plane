@@ -360,7 +360,7 @@ export class BindingRegistry {
         evidence: { role: input.role, generation, mode: input.mode ?? "PREFERRED" },
       });
       const created = this.require(roleKey);
-      this.#notifySwitch(created);
+      this.#notifySwitch(created, reused.value ?? undefined);
       return allow(ReasonCode.OK, created);
     });
   }
@@ -556,7 +556,7 @@ export class BindingRegistry {
           },
         });
         const binding = this.require(roleKey);
-        this.#notifySwitch(binding);
+        this.#notifySwitch(binding, owner.actor_id);
         return allow(ReasonCode.OK, binding);
       }
 
@@ -663,13 +663,22 @@ export class BindingRegistry {
     });
   }
 
-  #notifySwitch(binding: RoleBinding): void {
+  #notifySwitch(binding: RoleBinding, movedActorId?: string): void {
     // Every currency-changing route (bind, both switchTo exits, revoke) publishes here.
     // Revocation keeps the scope identity but publishes status REVOKED so it also ends authority.
     // The caller receives binding before an outer transaction commits; retain our own snapshot.
     const transferred = { ...binding };
+    // A runtime pointer belongs to the actor, so every active assignment sharing it moves.
+    // Snapshot siblings now too: a second move before commit must not erase the first one.
+    const siblings = movedActorId ? this.db.all<{ role_key: string }>(
+      `SELECT role_key FROM assignments WHERE actor_id = ? AND status = 'ACTIVE' AND role_key <> ?`,
+      [movedActorId, binding.roleKey],
+    ).map(({ role_key }) => this.require(role_key)) : [];
+    const publications = [transferred, ...siblings];
     this.db.afterCommit(() => {
-      for (const listener of this.#switchListeners) listener(transferred);
+      for (const snapshot of publications) {
+        for (const listener of this.#switchListeners) listener(snapshot);
+      }
     });
   }
 
