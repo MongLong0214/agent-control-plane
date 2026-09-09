@@ -1,0 +1,3 @@
+Limit: while the daemon is refusing, neither DAEMON_STATUS nor doctor can be opened, because both need the ControlPlane that failed to open
+Warn: exit 0 means a refused daemon stays down until someone raises it, which makes the refusal quiet: only the refusal report, agentctl daemon status and agentcpd.err.log say so
+Provenance: reconstructed
