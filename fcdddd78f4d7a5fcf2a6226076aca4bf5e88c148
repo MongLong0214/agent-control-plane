@@ -1,0 +1,4 @@
+Limit: ledger 가 append-only 라 이미 저장된 digest 없는 행은 영원히 읽히므로, 커버리지는 읽는 쪽에서 결정합니다
+Limit: `ALLOWED_FIELDS` 가 모르는 키를 거부하는 것은 맞는 본능인데, **이 row 가 왜 존재하는지** 를 담을 필드가 없습니다.
+Warn: **두 곳이 중복이 아닙니다** — 하나는 쓰기를 거부하고 다른 하나는 이미 원장에 있는 행을 세지 않습니다.
+Provenance: reconstructed
