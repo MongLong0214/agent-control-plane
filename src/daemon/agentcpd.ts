@@ -80,8 +80,11 @@ import { startCanonicalSelfClaimListener, type CanonicalSelfClaimListener } from
 import { readOneJsonLineRequest } from "./local-socket-framing.ts";
 
 /**
- * The bound on one message: the bytes of a single line, measured after the newline that ends it
- * has been found.
+ * The bound on one message: the bytes of a single line, terminator excluded, measured after the
+ * newline that ends it has been found. Only the two readers that serve a stream of messages —
+ * `SocketTransport.processBuffer` and the MCP handshake — measure this, and this comment speaks
+ * for them alone. The single-request readers on this daemon's other local sockets bound the whole
+ * framed request instead and name `MAX_MCP_FRAMED_REQUEST_BYTES` for it (#816).
  *
  * Until #805 both newline readers on this socket compared it against everything buffered so far,
  * before looking for a boundary. That bounds a read rather than a message, and a read is the one
@@ -105,6 +108,25 @@ export const MAX_MCP_LINE_BYTES = 1024 * 1024;
  * would be refused by any check that measured the buffer without first finding the newline.
  */
 const MAX_MCP_PENDING_BYTES = MAX_MCP_LINE_BYTES;
+/**
+ * The bound on one framed request: the whole buffer, the terminating newline included, at the
+ * readers on this daemon's single-request local sockets — the session launch credential channel,
+ * the two Buzz ingress endpoints, and the operator socket by way of `readOneJsonLineRequest`.
+ *
+ * Those readers measure the buffer before looking for a boundary and are right to (#805 changed
+ * only the two stream readers): each takes exactly one request per connection and refuses any
+ * byte after the first newline, so their buffer is that one request rather than whatever a read
+ * happened to deliver. What was wrong is that they said `MAX_MCP_LINE_BYTES` while doing it, so a
+ * call site could not tell which of the two measurements it was under, and the difference is real:
+ * a line of exactly `MAX_MCP_LINE_BYTES` content is a legal message to the transport and one byte
+ * too long for these, because here the terminator is counted too (#816).
+ *
+ * The value is derived rather than chosen, for the reason `MAX_MCP_PENDING_BYTES` is: a second
+ * independent number can drift away from the line bound, and nothing about these sockets wants a
+ * request budget that is not the message budget. Only the measurement differs, so only the name
+ * does.
+ */
+const MAX_MCP_FRAMED_REQUEST_BYTES = MAX_MCP_LINE_BYTES;
 const DEFAULT_MCP_HANDSHAKE_TIMEOUT_MS = 5_000;
 /**
  * The handshake budget covers reaching an authenticated request and nothing after it. Execution
@@ -1278,7 +1300,7 @@ const serveOperatorRequest = (
       });
     },
     (decision) => finish(decision),
-    MAX_MCP_LINE_BYTES,
+    MAX_MCP_FRAMED_REQUEST_BYTES,
   );
   socket.once("error", () => {
     if (timeout) clearTimeout(timeout);
@@ -1356,7 +1378,7 @@ const serveSessionLaunchCredential = (
   const refuse = (): void => finish({ ok: false, reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED });
   const receive = (chunk: Buffer): void => {
     buffer = Buffer.concat([buffer, chunk]);
-    if (buffer.length > MAX_MCP_LINE_BYTES) return refuse();
+    if (buffer.length > MAX_MCP_FRAMED_REQUEST_BYTES) return refuse();
     const boundary = buffer.indexOf(0x0a);
     if (boundary === -1) return;
     if (buffer.subarray(boundary + 1).length > 0) return refuse();
@@ -1412,7 +1434,7 @@ const serveBuzzActorBinding = (socket: Socket, ingress: BuzzActorIngress): void 
   };
   const receive = (chunk: Buffer): void => {
     buffer = Buffer.concat([buffer, chunk]);
-    if (buffer.length > MAX_MCP_LINE_BYTES) {
+    if (buffer.length > MAX_MCP_FRAMED_REQUEST_BYTES) {
       return finish(deny(ReasonCode.INVALID_ARGUMENT, "Buzz channel identity ingress message exceeds local transport limit"));
     }
     const boundary = buffer.indexOf(0x0a);
@@ -1498,7 +1520,7 @@ const serveBuzzMessageTurn = (
   }
   const receive = (chunk: Buffer): void => {
     buffer = Buffer.concat([buffer, chunk]);
-    if (buffer.length > MAX_MCP_LINE_BYTES) {
+    if (buffer.length > MAX_MCP_FRAMED_REQUEST_BYTES) {
       return finish(deny(ReasonCode.INVALID_ARGUMENT, "Buzz message exceeds local transport limit"));
     }
     const boundary = buffer.indexOf(0x0a);
