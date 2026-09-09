@@ -1,0 +1,90 @@
+Warn: Attachment credentials have their own lifetime; they do not replace, re-serve, revoke or rotate the session secret.
+Warn: Keep the daemon slot under the receiving server object identity; an attachment acquires an empty slot and never replaces its live holder.
+Unverified: Socket-dependent connection ownership, close invalidation and the four socket mutation rows await the operator run.
+Record-Id: r-9082b1eca826
+Provenance: inherited 2564a81e34553ba81714d7c3641ff0e336e3d4f5
+
+Limit: The falsifiability harness accepts one named test per mutation row.
+Record-Id: r-34ed9bf9ff05
+Provenance: inherited d4e251611a96b3f77d15f038388694e822af0493
+
+Warn: Keep roleAttachment.issue out of the operator idempotency cache; a cached retry can re-serve its plaintext attachment credential.
+Warn: The refusal-operand checker needs an unquoted find key and an anchor containing the full deciding line, including const key =; a mutation can kill its test while remaining invisible to this check.
+Unverified: Full gate acceptance remains unverified in the execution sandbox: process inspection via ps is denied and the isolated-home test fails with SANDBOX_CHILD_CLEANUP_FAILED.
+Record-Id: r-33015efa341a
+Provenance: inherited b4fc703c4e40b831132d85f47c5e02f01db1d28b
+
+Limit: Normalize owner approval receipts at attachment issuance; owner-authority consumption keying is outside this change.
+Limit: Attachment credentials remain bearer tokens; binding them to the issuing process requires peer identity proof beyond the existing handshake.
+Warn: Revalidate occupancy at admission because the port owns the slot; preserve current incumbents and receiving-server identity on detach.
+Warn: Keep plaintext credentials out of retained authentication callbacks; retain the attachment ID and hash/scope record.
+Unverified: Socket tests and socket mutation rows, including the pre-MCP close assertion, require a socket-capable environment; the local attempt failed in listener setup with EPERM.
+Unverified: Full gates are not green in the execution sandbox: gates 1-20 passed; the stalled test gate was interrupted with exit 130 after environment failures.
+Record-Id: r-238475016983
+Provenance: inherited d0f9a62934a833b990aae38497569a5ef7335784
+
+Warn: Keep connected() observational and revalidate holder occupancy explicitly at admission; reauthenticating during inspection masks missing detach cleanup.
+Record-Id: r-7a0b6e577c8e
+Follows: r-238475016983
+Provenance: inherited 7bf80ae5611f20a17adad0f971eb64bc662ffef4
+
+Warn: Keep falsifiability case files as named const declarations followed by export default <name>.
+Record-Id: r-d5317eb33a3a
+Provenance: inherited d13321da9dee11bacda6414d43d073eb2fa4ad93
+
+Limit: Shared owner-authority consumption-key changes remain a separate rollback unit that must preserve existing consumption records and in-flight approvals.
+Warn: Keep attachment schema fields equal to the declared receipt fields and pass the proved normal form to consumption; derive field sets instead of copying literal lists.
+Record-Id: r-976e4e6ef07a
+Provenance: inherited aadc7b4f1ce3ffef04e1aca294d129f20201ecd5
+
+Limit: Same-generation round-trip invalidation: an unobserved holder move away and back to the original tuple has no attachment epoch or remembered invalidation; a fence or notification is deferred.
+Limit: A1 measures schema/declaration key equality and proved/consumed object identity only. Its read proxy was removed because field readership cannot establish proof dependence; the shared owner authority remains unchanged.
+Unverified: Gates 1-20 passed in a disposable checkout; gate 21 was interrupted after environment-dependent failures. Socket refusal assertions could not run because listener setup fails with listen EPERM.
+Record-Id: r-63406b080c5d
+Provenance: inherited aa336d5738fdd7a5050fa51ee5f124ded82a40f0
+
+Warn: Assert attachment slot cleanup with connected() before endpointFor() or currentHolderConnected(); those lookups revalidate and can delete the stale slot being observed.
+Unverified: The corrected revocation and changed-generation socket tests could not reach their assertions because listeners fail with EPERM; RED/GREEN was demonstrated only in a reduced harness using production attachment and registration code.
+Record-Id: r-d8ff13a3caaf
+Provenance: inherited b3d1f97a93943f1f5da197b54d23bf386787ab5b
+
+Warn: Preserve ordinary current-holder reconnect takeover so recovery does not wait for the earlier socket to close; scoped attachments acquire empty slots only.
+Warn: Invalidate attachments from committed transfers and keep holder lookup free of repair; rollback must preserve credentials.
+Unverified: Real Unix socket regressions remain blocked by listen EPERM even at a short path inside this worktree.
+Record-Id: r-a3afe636d019
+Provenance: inherited 7fe29338872379a8c72778366383b65b0ac90822
+
+Limit: Subject derivation remains unimplemented. The existing detector skips single-line guards and some chain tails, combines operands sharing a line, ignores quoted find keys, and credits nearby anchors. Reusing it for discovery would retain quiet gaps; the four-file list is the authorized fallback, not a complete refusal census.
+Warn: a check that names its subjects explicitly is blind to every subject added after it was written, and "add the new one to the list" is a rule that will be needed again.
+Unverified: Gates 1-20 passed in a disposable checkout. Gate 21 was interrupted after confirmed listener restrictions and further sandbox-dependent failures; the gate process exited 130. The full suite did not complete.
+Record-Id: r-e5a9954b397c
+Provenance: inherited 917ea39310a82ac2e445f540b3d4431d1521831b
+
+Limit: The CTO and CEO routes retain their existing detach callbacks; synchronous SDK close wiring is documented instead of adding duplicate cleanup.
+Warn: Keep both attachment admission checks on currentHolderConnected so a stale registration cannot spend a credential without acquiring its role slot.
+Unverified: Gates 1-20 passed in a disposable checkout. Gate 21 was interrupted after failures and the command exited 1; Unix socket listening is blocked by EPERM.
+Record-Id: r-6d3a6dc23519
+Provenance: inherited a96780ae21995394f9d34188ed682a5847417817
+
+Limit: Revocation retains the binding scope identity; its committed notification must carry REVOKED status to reap attachments.
+Warn: The explicit refusal-file list has missed newly added authorities three times and still needs manual additions; safe source discovery remains follow-up work.
+Unverified: Real socket attachment coverage remains unverified: baseline tests fail in setup with listen EPERM, so their mutant failures cannot establish coverage.
+Record-Id: r-54789710338f
+Provenance: inherited 16013b69d9c9654f1dd368365b79ea030ee8920c
+
+Limit: Keep this change within 77 files; the global mutation verdict fix and whole-daemon census are independent follow-up units. Acquisition-receipt and real-connection cleanup acceptances remain.
+Warn: This PR's full mutation evidence was taken under a corrected verdict that is not part of this PR; the shipped harness still infers kills from exit code. Do not present coverage as unqualified completed security verification.
+Unverified: Gates 1-20 passed on candidate and base; gate 21 was interrupted after sandbox failures and waits. Neither 21/21 nor every suite failure being pre-existing is established.
+Record-Id: r-e135ed1ed7c1
+Evidence: evidence/local/scope-ruling/handoff.md
+Provenance: inherited 126904545aedf4098d53f9fcd3bfefa6201e625a
+
+Warn: Run wake qualification after a client upgrade before moving C0_QUALIFIED_CLIENT; commit the measured receipt and matching pin together.
+Unverified: The regenerated receipt has no sourceBinding block. Its retained limit leaves execution source UNKNOWN; present-day source agreement does not establish which bytes executed.
+Record-Id: r-8d85647ba445
+Provenance: inherited 3aca14b27485f5a1630cee26ad5f697d6d7a0906
+
+Limit: Shared actor moves must publish committed snapshots for every affected binding while preserving rollback-discard and round-trip semantics.
+Warn: The raw captures behind this wake-transport receipt are not recoverable; retain the custody limitation outside receipt regeneration.
+Record-Id: r-1a18a6904129
+Provenance: inherited 50fae1151ca18b30fda160e7d6ea08c7366ffd82
