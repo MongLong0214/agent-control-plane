@@ -1,0 +1,4 @@
+Limit: Part B(멘션 구독자)는 이 PR 범위 밖입니다.
+Ruled-out: `#761` 을 그대로 공개 main 계보에 넣기 | 조상 커밋이 개인 이메일 신원을 달고 있어 공개 main 계보에 들어갈 수 없으므로 superseded 로 보존하고, 이 PR 이 그 자리를 대신합니다
+Warn: 한쪽에만 있는 규칙은 다른 쪽을 우회로로 만듭니다.
+Provenance: reconstructed
