@@ -1,0 +1,3 @@
+Warn: there is no platform skip for the descriptor binding: it was measured working on darwin arm64 and x64 and on linux aarch64 and x86_64, so a runner that cannot build it is a failure to report, not a case to skip
+Warn: verify that the VFS actually registered instead of trusting loadExtension to have had an effect: a shim that failed to register leaves every later open going through the ordinary pathname VFS, which is the behaviour being replaced, arrived at silently
+Provenance: reconstructed
