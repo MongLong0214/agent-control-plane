@@ -848,10 +848,19 @@ export class CapacityMonitor {
     );
   }
 
-  /** Missing quota for any applicable window cannot establish that an incumbent is exhausted. */
+  /** Whether any applicable window is unread; a separate known window may still be exhausted. */
   hasUnknownQuotaFor(capacity: ProviderCapacity, capability: string): boolean {
     const applicable = this.applicableBucketsFor(capacity, capability);
     return applicable.length === 0 || applicable.some((bucket) => !Number.isFinite(bucket.remainingPercent));
+  }
+
+  /** One observed exhausted window is evidence against an incumbent using this capability. */
+  hasExhaustedQuotaFor(capacity: ProviderCapacity, capability: string): boolean {
+    return this.applicableBucketsFor(capacity, capability).some((bucket) =>
+      bucket.remainingPercent !== null &&
+      Number.isFinite(bucket.remainingPercent) &&
+      bucket.remainingPercent <= this.#options.exhaustedPercent,
+    );
   }
 
   private applicableBucketsFor(capacity: ProviderCapacity, capability: string): CapacityBucket[] {

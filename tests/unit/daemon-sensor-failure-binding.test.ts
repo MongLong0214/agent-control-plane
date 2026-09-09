@@ -22,17 +22,18 @@ afterEach(() => {
   cleanupTempDirs();
 });
 
-const makeIncumbent = () => {
+const makeIncumbent = (providers: "claude" | "claude-and-gpt" | "none" = "claude") => {
   const root = tempDir("acp-sensor-binding-");
   const clock = new ManualClock("2026-09-08T00:00:00.000Z");
   const claude = new ProductionTestAdapter(clock, "claude");
+  const gpt = new ProductionTestAdapter(clock, "gpt");
   const cp = new ControlPlane({
     databasePath: join(root, "state.sqlite"),
     worktreeRoot: join(root, "worktrees"),
     capacityDir: join(root, "capacity"),
     secretsDir: join(root, "secrets"),
     clock,
-    adapters: [claude],
+    adapters: providers === "none" ? [] : providers === "claude-and-gpt" ? [claude, gpt] : [claude],
     capacity: { exhaustedPercent: 2 },
     allowTestEvidenceWriters: true,
   });
@@ -70,7 +71,7 @@ const makeIncumbent = () => {
 describe("daemon incumbent capacity reconciliation", () => {
   it("#811: a READY CTO binding survives a failed capacity sensor", async () => {
     expectTypeOf<ContinuityReconcileReport["unresolved"][number]["reasonCode"]>().toEqualTypeOf<ReasonCode>();
-    const { cp, daemon, roleKey, incumbent } = makeIncumbent();
+    const { cp, daemon, roleKey, incumbent } = makeIncumbent("claude-and-gpt");
 
     const report = await daemon.reconcileContinuity("usage collector timed out");
 
@@ -81,7 +82,8 @@ describe("daemon incumbent capacity reconciliation", () => {
     });
     expect(cp.capacity.current("claude")?.buckets.every((bucket) => bucket.remainingPercent === null)).toBe(true);
     expect(cp.sessions.require(incumbent.sessionId).lifecycle).toBe(SessionLifecycle.READY);
-    expect(report?.plan.assignments.find((assignment) => assignment.roleKey === roleKey)?.provider).toBeNull();
+    expect(cp.capacity.isRoutableFor(cp.capacity.current("gpt")!, "cto")).toBe(true);
+    expect(report?.plan.assignments.find((assignment) => assignment.roleKey === roleKey)?.provider).toBe("gpt");
     expect(cp.bindings.active(roleKey), "READY incumbent must survive an unread capacity sensor").toEqual(incumbent);
     expect(report?.unresolved).toContainEqual({ roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
     expect(report?.pausedRuns).toEqual([]);
@@ -92,7 +94,7 @@ describe("daemon incumbent capacity reconciliation", () => {
   });
 
   it("#811: an ERROR sensor with numeric buckets still preserves the READY incumbent", async () => {
-    const { cp, claude, daemon, unread, roleKey, incumbent } = makeIncumbent();
+    const { cp, claude, daemon, unread, roleKey, incumbent } = makeIncumbent("claude-and-gpt");
     claude.setCapacity({
       ...unread,
       buckets: [{ id: "rolling", remainingPercent: 95, resetAt: null, capabilities: ["cto"] }],
@@ -100,6 +102,7 @@ describe("daemon incumbent capacity reconciliation", () => {
 
     const report = await daemon.reconcileContinuity("sensor failed despite a numeric bucket");
 
+    expect(report?.plan.assignments.find((assignment) => assignment.roleKey === roleKey)?.provider).toBe("gpt");
     expect(cp.bindings.active(roleKey)).toEqual(incumbent);
     expect(report?.unresolved).toContainEqual({ roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
   });
@@ -108,18 +111,19 @@ describe("daemon incumbent capacity reconciliation", () => {
     { name: "empty", buckets: [] },
     { name: "all unknown", buckets: [{ id: "rolling", remainingPercent: null, resetAt: null, capabilities: ["cto"] }] },
   ])("#811: a $name reading without ERROR preserves the READY incumbent", async ({ buckets }) => {
-    const { cp, claude, daemon, unread, roleKey, incumbent } = makeIncumbent();
+    const { cp, claude, daemon, unread, roleKey, incumbent } = makeIncumbent("claude-and-gpt");
     claude.setCapacity({ ...unread, sensorHealth: "HEALTHY", buckets, error: undefined });
 
     const report = await daemon.reconcileContinuity("no quota bucket was read");
 
     expect(cp.capacity.current("claude")).toMatchObject({ sensorHealth: "HEALTHY", allocationAdmission: "SUSPENDED" });
+    expect(report?.plan.assignments.find((assignment) => assignment.roleKey === roleKey)?.provider).toBe("gpt");
     expect(cp.bindings.active(roleKey)).toEqual(incumbent);
     expect(report?.unresolved).toContainEqual({ roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
   });
 
   it.each(["worker", "cto"])("#812 R2: an unknown applicable bucket preserves the READY incumbent (numeric %s bucket)", async (numericCapability) => {
-    const { cp, claude, daemon, unread, roleKey, incumbent } = makeIncumbent();
+    const { cp, claude, daemon, unread, roleKey, incumbent } = makeIncumbent("claude-and-gpt");
     claude.setCapacity({
       ...unread,
       sensorHealth: "HEALTHY",
@@ -135,7 +139,8 @@ describe("daemon incumbent capacity reconciliation", () => {
     const capacity = cp.capacity.current("claude")!;
     expect(capacity).toMatchObject({ sensorHealth: "HEALTHY", allocationAdmission: "OPEN", unknownBuckets: ["weekly"] });
     expect(cp.capacity.isRoutableFor(capacity, "cto")).toBe(false);
-    expect(report?.plan.assignments.find((assignment) => assignment.roleKey === roleKey)?.provider).toBeNull();
+    expect(cp.capacity.isRoutableFor(cp.capacity.current("gpt")!, "cto")).toBe(true);
+    expect(report?.plan.assignments.find((assignment) => assignment.roleKey === roleKey)?.provider).toBe("gpt");
     expect(cp.sessions.require(incumbent.sessionId).lifecycle).toBe(SessionLifecycle.READY);
     expect(cp.bindings.active(roleKey), "READY incumbent must survive an unknown applicable capacity bucket").toEqual(incumbent);
     expect(report?.unresolved).toContainEqual({ roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
@@ -159,6 +164,63 @@ describe("daemon incumbent capacity reconciliation", () => {
 
     expect(cp.capacity.current("claude")).toMatchObject({ sensorHealth: "HEALTHY", unknownBuckets: ["weekly"] });
     expect(cp.bindings.active(roleKey)).toBeNull();
+    expect(report?.unresolved).toContainEqual({ roleKey, reasonCode: ReasonCode.COVERAGE_NONE });
+  });
+
+  it("#812 B1: exhausted worker quota does not evict an incumbent with unknown CTO quota", async () => {
+    const { cp, claude, daemon, unread, roleKey, incumbent } = makeIncumbent("claude-and-gpt");
+    claude.setCapacity({
+      ...unread,
+      sensorHealth: "HEALTHY",
+      buckets: [
+        { id: "rolling", remainingPercent: 0, resetAt: null, capabilities: ["worker"] },
+        { id: "weekly", remainingPercent: null, resetAt: null, capabilities: ["cto"] },
+      ],
+      error: undefined,
+    });
+
+    const report = await daemon.reconcileContinuity("exhaustion applies only to worker quota");
+
+    expect(report?.plan.assignments.find((assignment) => assignment.roleKey === roleKey)?.provider).toBe("gpt");
+    expect(cp.bindings.active(roleKey), "worker exhaustion is not evidence against the CTO incumbent").toEqual(incumbent);
+    expect(report?.unresolved).toContainEqual({ roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
+    expect(report?.reassigned).toEqual([]);
+  });
+
+  it("#812 B2: a READY managed provider without a snapshot reaches uncovered reconciliation", async () => {
+    const { cp, daemon, roleKey, incumbent } = makeIncumbent("none");
+    expect(cp.sessions.require(incumbent.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+    expect(cp.capacity.manages("claude")).toBe(true);
+    expect(cp.capacity.current("claude")).toBeNull();
+
+    await expect(daemon.reconcileContinuity("no registered adapter has produced a snapshot"))
+      .resolves.toMatchObject({
+        unresolved: [{ roleKey, reasonCode: ReasonCode.COVERAGE_NONE }],
+        reassigned: [],
+      });
+
+    expect(cp.capacity.current("claude")).toBeNull();
+    expect(cp.bindings.active(roleKey)).toBeNull();
+  });
+
+  it.each([0, 2])("#812 B1: observed exhaustion at %s percent dominates an unknown applicable window", async (remainingPercent) => {
+    const { cp, claude, daemon, unread, roleKey } = makeIncumbent();
+    claude.setCapacity({
+      ...unread,
+      sensorHealth: "HEALTHY",
+      buckets: [
+        { id: "rolling", remainingPercent, resetAt: null, capabilities: ["cto"] },
+        { id: "weekly", remainingPercent: null, resetAt: null, capabilities: ["cto"] },
+      ],
+      error: undefined,
+    });
+
+    const report = await daemon.reconcileContinuity("observed exhaustion beside an unread window");
+
+    const capacity = cp.capacity.current("claude")!;
+    expect(capacity).toMatchObject({ sensorHealth: "HEALTHY", runtimeHealth: "HEALTHY", unknownBuckets: ["weekly"] });
+    expect(cp.capacity.isRoutableFor(capacity, "cto")).toBe(false);
+    expect(cp.bindings.active(roleKey), "observed CTO exhaustion must revoke the incumbent despite an unknown CTO window").toBeNull();
     expect(report?.unresolved).toContainEqual({ roleKey, reasonCode: ReasonCode.COVERAGE_NONE });
   });
 
