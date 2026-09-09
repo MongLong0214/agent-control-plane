@@ -523,7 +523,7 @@ export class Daemon {
     mkdirSync(options.stateDir, { recursive: true });
     chmodSync(options.stateDir, 0o700);
     this.lock = new SingleInstanceLock(join(options.stateDir, "agentcpd.lock"));
-    this.attachments = new RoleAttachmentCredentials(cp.sessions, cp.bindings, cp.ownerAuthority);
+    this.attachments = new RoleAttachmentCredentials(cp.sessions, cp.bindings, cp.ownerAuthority, cp.clock);
     this.#finalizer = new ApprovedRunFinalizer(cp, undefined, authorities);
     this.#evidenceExporter = new RunEvidenceExporter(cp.db, cp.artifacts, cp.clock, cp.audit);
   }
