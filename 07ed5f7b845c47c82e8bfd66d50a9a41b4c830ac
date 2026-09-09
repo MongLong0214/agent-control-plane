@@ -1,0 +1,4 @@
+Limit: the remedy an unbound role leads to, a fresh canonical self-claim, needs the claim socket, which existed only inside each doomed startup for well under a second
+Ruled-out: a bare catch around the subscriber's startup failure | a bare one would let the daemon come up quietly broken the next time something else fails there
+Warn: the crash happens after daemon.start() returns allowed, so clearCrashLoop() has already run and crash-loop.json cannot see it; launchd's own runs counter is the honest signal
+Provenance: reconstructed
