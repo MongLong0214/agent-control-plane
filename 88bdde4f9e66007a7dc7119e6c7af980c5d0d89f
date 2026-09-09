@@ -1,0 +1,3 @@
+Limit: this is the receiving side only and performs no cutover: buzz-acp is unchanged and nothing yet points at the new socket, so on the live host the next daemon restart only opens one more socket nobody connects to
+Warn: the unresolved-conversation park was written down and deliberately not built: Buzz has no command parser for the escape hatch, and a park without one would lock the owner's channel permanently on a single timeout
+Provenance: reconstructed
