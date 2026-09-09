@@ -83,7 +83,8 @@ interface ToolBody {
 }
 
 /**
- * A refused endpoint must disclose no path — not the endpoint, not the directory, not a fragment.
+ * A refused endpoint must not disclose any of the private paths supplied to this assertion.
+ * Only the directory-mismatch remedy names the configured directory; rejected paths stay private.
  *
  * A `Decision`'s evidence is persisted and returned to callers, so a refusal that echoed the path
  * would publish a private local path to every reader of a failed registration. `wake` re-runs the
@@ -853,8 +854,8 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
     const notASocket = join(stateDir, "plain-regular-file");
     writeFileSync(notASocket, "", { mode: 0o600 });
 
-    // Every private path this row put in front of the daemon. No refusal below may echo any of
-    // them, in any field, whole or by basename.
+    // Every private path this row put in front of the daemon. The directory-mismatch remedy
+    // may name stateDir; no other path is disclosed, in any field, whole or by basename.
     const privatePaths = [good.path, outside.path, notASocket, stateDir, elsewhere];
 
     const qualified = await connectPeer(ctoSocket, { token: TOKEN, ...session }, C0_QUALIFIED_CLIENT);
@@ -869,7 +870,12 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       expect(away.ok).toBe(false);
       expect(away.reasonCode).toBe(ReasonCode.ROLE_PEER_UNSUPPORTED);
       expect(away.evidence?.check).toBe("not-under-expected-directory");
-      expectNoPathLeak(away, privatePaths);
+      expect(away.message).toBe(
+        "a wake endpoint must sit directly in this deployment's owner-only state directory; " +
+        `start the client with --messaging-socket-path pointing to a socket directly inside ${stateDir}`,
+      );
+      expect(away.evidence).toEqual({ role: Role.PRIMARY_CTO, check: "not-under-expected-directory" });
+      expectNoPathLeak(away, [good.path, outside.path, notASocket, elsewhere]);
 
       // A traversal that *resolves* into the state directory is refused too — but by the parent
       // check above, not by the normalization line that reads as though it owns this case. That

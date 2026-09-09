@@ -440,7 +440,8 @@ export class RoleConversationPort {
     if (dirname(endpoint) !== dir) {
       return this.#endpointRefusal(
         "not-under-expected-directory",
-        "a wake endpoint must sit directly in this deployment's owner-only state directory",
+        "a wake endpoint must sit directly in this deployment's owner-only state directory; " +
+          `start the client with --messaging-socket-path pointing to a socket directly inside ${dir}`,
       );
     }
     const uid = process.getuid?.();
