@@ -1,0 +1,4 @@
+Limit: `lstat(path)` and `open(path)` are two syscalls and a rename between them is invisible to both
+Limit: Replaces #767, which carried one commit with a non-noreply author identity. No history was rewritten.
+Warn: take the lease before anything is opened or bound — leaving exclusivity to `Db` is wrong because the bound VFS's locking methods are deliberately no-ops
+Provenance: reconstructed
