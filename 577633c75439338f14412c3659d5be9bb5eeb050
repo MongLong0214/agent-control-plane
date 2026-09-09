@@ -1,0 +1,5 @@
+Limit: The default VFS is process-global, so *who is bound* is process-global too.
+Limit: It still wires nothing — `src/db/fd-vfs.ts` remains unreachable from every other module under `src/`, held by `guards:fd-vfs-unreachable`.
+Warn: The lease is an identifier, not a secret — anything able to call these functions can read the memory holding it
+Warn: Releasing when nothing is bound succeeds, deliberately: a bracket has to be able to run its release unconditionally, without tracking how far its acquire got.
+Provenance: reconstructed
