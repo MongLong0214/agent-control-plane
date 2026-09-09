@@ -1,195 +1,152 @@
 #!/usr/bin/env node
 /**
- * Reports every operand of a multi-condition refusal that no falsifiability row names.
+ * Derive the census from source syntax, including files not yet tracked by git.
+ * A deciding candidate contains a &&/|| expression. This conservatively includes predicates
+ * whose caller refuses, validation, routing and value construction: refusal is not a syntax type.
+ * Files without those expressions are not selected, not excluded. Named file exclusions are
+ * an unanswered pre-existing backlog, not a claim that those files do not decide refusals.
  *
- * Three of the four findings in this branch's final review came from one question, asked by hand:
- * take a `&&`/`||` chain that decides a refusal, replace each operand with `true`, and see what
- * dies. It found the retry rule's completion count (which I had documented as unkillable), the
- * per-actor boundary of the adjudication door, and, indirectly, a receipt condition whose row had
- * been deleted by a copy-paste.
- *
- * The falsifiability harness answers "is this guard tested" for the lines someone thought to write
- * a row for. It cannot answer "which lines has nobody written a row for", because its subject is
- * its own table. This asks that, over the operands — the pieces most likely to be covered by a
- * neighbour and therefore to look tested when they are not.
- *
- * What it does NOT do, and this matters as much as what it does: it does not run anything. An
- * operand named by a row may still be unwatched if the row's test passes for another reason, and
- * only the sweep can say. This narrows where to look; it does not certify.
- *
- * Usage: verify-refusal-operands-are-watched.mjs [--json]
+ * Each operand is counted, including chain tails, nested chains and single-line chains.
+ * A row names an operand only if its unique find anchor in THAT file contains the entire operand.
+ * Neighbouring anchors and rows for other files earn no credit. Named is not tested: this reads
+ * declarations; only mutation runs establish test dependence. Usage: node <this script>
  */
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import ts from "typescript";
+
 import { CASES_DIR } from "./lib/falsifiability-cases.mjs";
+import { FILE_EXCLUSIONS } from "./lib/refusal-operand-exclusions.mjs";
+import { UNANSWERED } from "./lib/refusal-operands-unanswered.mjs";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
+const read = (file) => readFileSync(join(ROOT, file), "utf8");
+const parse = (file, source) => ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true);
+const walk = (node, visit) => {
+  visit(node);
+  ts.forEachChild(node, (child) => walk(child, visit));
+};
+const logical = (node) => ts.isBinaryExpression(node) &&
+  (node.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken ||
+    node.operatorToken.kind === ts.SyntaxKind.BarBarToken);
+const unparen = (node) => ts.isParenthesizedExpression(node) ? unparen(node.expression) : node;
 
-/**
- * Where a refusal is decided. Listed rather than discovered, because "a condition that decides a
- * refusal" is not a syntactic property — and a list that is wrong is visible, while a heuristic
- * that quietly skips a file is the failure this whole set is about.
- *
- * That argument does not make this list a closure: it has missed newly added authorities three times.
- * A check that names its subjects explicitly is blind to subjects added later; adding another
- * name is a rule that will be needed again. This is the fallback, not a claim of discovery.
- *
- * Derivation was investigated here. Applying the existing detector to all src TypeScript files
- * still skips single-line chains, misses closing operands without its comparison/line-ending
- * shape, and counts several operands on one line as one. Nearby-anchor matching also cannot
- * establish that each operand is named. In particular, the attachment authority's connect and
- * revoke refusals are single-line chains. Discovering files with this same detector would keep
- * those holes; looking only for `deny` would additionally miss wrappers such as `refused` and
- * predicates whose caller refuses. Conversely, every logical chain includes routing and value
- * construction as well as refusals. A safe conservative discovery needs those obligations
- * answered too, with a detector that actually enumerates their operands, before claiming PASS.
- *
- * Retain the explicit fallback until that replacement is available. Print its whole boundary on
- * every run, including empty files, so the PASS below cannot be mistaken for a source-tree census.
- */
-const DECIDING_FILES = [
-  "src/conversation/turn-coordinator.ts",
-  "src/acceptance/disposable-realm.ts",
-  "src/daemon/daemon.ts",
-  "src/session/role-attachment-credentials.ts",
-  "src/mcp/role-conversation.ts",
-];
-
-/**
- * Operands this check has reported and nobody has answered yet.
- *
- * Named individually, with what they decide, so the list cannot grow by someone adding a file
- * pattern. Each is a real answer owed — an operand of a refusal that no row names — and the
- * reason it is here rather than fixed is written beside it.
- */
-const UNANSWERED = new Map([
-  [
-    // Keyed by the operand's text, not its line. The first version keyed on `file:line` and this
-    // very entry went stale the first time something above it in daemon.ts grew — the check then
-    // reported a known-and-printed operand as a new failure, which is a reference that drifts
-    // away from what it names while still looking precise.
-    "src/daemon/daemon.ts::session?.lifecycle === SessionLifecycle.READY &&",
-    "capacity failover, outside the ledger work this table was built for. Reported rather than " +
-      "silenced: it is one operand of whether a session still covers its role.",
-  ],
-]);
-
-const harness = readFileSync(join(ROOT, "scripts/verify-guards-are-falsifiable.mjs"), "utf8");
-const table = /const GUARDS = \[([\s\S]*?)\n\];/.exec(harness);
-if (table === null) {
-  process.stdout.write("  could not read the GUARDS table\n\nRESULT: FAIL — nothing was compared.\n");
-  process.exit(2);
-}
-/** Every `find:` anchor in a source, so an operand appearing inside one counts as named. */
-const anchorsIn = (source) =>
-  [...source.matchAll(/find:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')/g)].map((m) =>
-    (m[1] ?? m[2] ?? "").replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\"),
-  );
-
-/**
- * #741 moved rows out of the array and into one module per case. Reading only the array would
- * make every migrated row invisible here, and this check reports an operand no row names — so a
- * row it cannot see becomes an operand it declares unwatched. That is the failure mode this whole
- * family of checks exists to catch, arriving in the checker rather than in the checked.
- *
- * Read as text with the same regex rather than imported: this script is synchronous and
- * dependency-free by the same PRD §17.4 contract as the harness, and its subject is what a row
- * *names*, not what it does.
- */
-const casesDir = join(ROOT, CASES_DIR);
-const caseSources = existsSync(casesDir)
-  ? readdirSync(casesDir)
-      .filter((name) => name.endsWith(".mjs"))
-      .sort()
-      .map((name) => readFileSync(join(casesDir, name), "utf8"))
+// Read declarations without executing the harness. Quoted keys, escapes, literal templates and
+// concatenated literal anchors are syntax too; the previous regex silently dropped these forms.
+const literal = (node) => {
+  if (!node) return undefined;
+  if (ts.isStringLiteralLike(node)) return node.text;
+  if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const left = literal(node.left), right = literal(node.right);
+    if (left !== undefined && right !== undefined) return left + right;
+  }
+  return undefined;
+};
+const rows = [], problems = [];
+const caseFiles = existsSync(join(ROOT, CASES_DIR))
+  ? readdirSync(join(ROOT, CASES_DIR)).filter((name) => name.endsWith(".mjs"))
+      .sort().map((name) => join(CASES_DIR, name))
   : [];
-const anchors = [table[1], ...caseSources].flatMap(anchorsIn);
-
-const unnamed = [];
-let operands = 0;
-/**
- * Chains written entirely on one line, which this check does not examine.
- *
- * It looks for a line that *ends* in `&&`/`||` and the line that closes such a run, so
- * `if (a === "" || b === "") {` is invisible to it — including the one added with #668's resolution
- * guard. Widening the detector to take them would pull in every argument-validation chain in
- * `daemon.ts` and demand a falsifiability row for each `typeof x !== "string"`, which buries the
- * operands this exists to surface.
- *
- * So they are counted and reported rather than silently dropped. A check that narrows its own
- * subject and does not say so is the shape this file was written against.
- */
-let singleLine = 0;
-
-process.stdout.write(
-  `CENSUS: scanning ${DECIDING_FILES.length} file(s), selected by the explicit DECIDING_FILES ` +
-    `fallback; no source discovery, 0 file exclusions.\n`,
-);
-
-for (const file of DECIDING_FILES) {
-  process.stdout.write(`  scanned: ${file}\n`);
-  const source = readFileSync(join(ROOT, file), "utf8");
-  const lines = source.split("\n");
-
-  lines.forEach((line, index) => {
-    const trimmed = line.trim();
-    // An operand of a chain: a line ending in `&&` or `||`, or the line that closes one with `;`
-    // or `) {`. Comments and strings are skipped — a `&&` inside prose is not a condition.
-    if (trimmed.startsWith("//") || trimmed.startsWith("*")) return;
-    const isOperand =
-      /(&&|\|\|)\s*$/.test(trimmed) ||
-      (/^[^/]*\b(?:===|!==|<|>|<=|>=|\?\?)\b/.test(trimmed) && /(;|\)\s*\{)\s*$/.test(trimmed) &&
-        /(&&|\|\|)\s*$/.test((lines[index - 1] ?? "").trim()));
-    if (!isOperand) {
-      if (/(&&|\|\|)/.test(trimmed) && /(;|\)\s*\{)\s*$/.test(trimmed)) singleLine += 1;
-      return;
+for (const file of ["scripts/verify-guards-are-falsifiable.mjs", ...caseFiles]) {
+  const tree = parse(file, read(file));
+  if (tree.parseDiagnostics.length) problems.push(`${file}: cannot parse row declarations`);
+  const declarations = new Map();
+  walk(tree, (node) => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
+      declarations.set(node.name.text, node.initializer);
     }
-    operands += 1;
-    // A row's anchor is often several lines, and an operand belongs to it when the anchor contains
-    // that line *or* an adjacent one — a mutation replacing a whole `every(...)` covers each
-    // operand inside it. Comparing the trimmed line against the anchor's own trimmed lines is what
-    // makes that true; the first version compared raw text and called two watched operands
-    // unnamed, which is a report that sends someone to write a test that already exists.
-    const anchorLines = anchors.flatMap((anchor) => anchor.split("\n").map((one) => one.trim()));
-    if (anchorLines.some((one) => one !== "" && (one === trimmed || one.includes(trimmed)))) return;
-    // And an operand inside a block a row replaces wholesale: look for the nearest enclosing call
-    // an anchor names.
-    const enclosing = lines.slice(Math.max(0, index - 6), index).map((one) => one.trim());
-    if (enclosing.some((one) => one !== "" && anchorLines.some((a) => a.includes(one)))) return;
-    unnamed.push({ file, line: index + 1, text: trimmed });
   });
-}
-
-const answered = unnamed.filter(({ file, text }) => !UNANSWERED.has(`${file}::${text}`));
-
-process.stdout.write(
-  `CENSUS: scanned ${DECIDING_FILES.length} file(s); selected ${DECIDING_FILES.length} by name, ` +
-    `not by a derived refusal property. Counts below are operand lines; one line may hold several operands.\n`,
-);
-
-if (unnamed.length > 0) {
-  for (const { file, line, text } of unnamed) {
-    const known = UNANSWERED.get(`${file}::${text}`);
-    process.stdout.write(`  ${file}:${line}${known ? "  (known)" : ""}\n    ${text}\n`);
-    if (known) process.stdout.write(`    ${known}\n`);
+  const exported = tree.statements.find(ts.isExportAssignment)?.expression;
+  const subject = file.endsWith("/verify-guards-are-falsifiable.mjs")
+    ? declarations.get("GUARDS")
+    : exported && ts.isIdentifier(exported) ? declarations.get(exported.text) : exported;
+  const objects = subject && ts.isArrayLiteralExpression(subject) ? [...subject.elements] : [subject];
+  for (const node of objects) {
+    if (!node || !ts.isObjectLiteralExpression(node)) {
+      problems.push(`${file}: cannot read declared row object`);
+      continue;
+    }
+    const properties = new Map(node.properties.filter(ts.isPropertyAssignment)
+      .map((property) => [property.name.text, property.initializer]));
+    if (properties.has("skip") && properties.get("skip").kind !== ts.SyntaxKind.FalseKeyword) continue;
+    const target = literal(properties.get("file")), find = literal(properties.get("find"));
+    if (target === undefined || find === undefined || !find.length) {
+      problems.push(`${file}: file/find must be nonempty literals or literal concatenations`);
+      continue;
+    }
+    rows.push({ file: target, find });
   }
 }
 
-if (answered.length > 0) {
-  process.stdout.write(
-    `\nEach of these is one operand of a refusal, and no falsifiability row names it. Replace it\n` +
-      `with \`true\` and run the suite: if nothing dies, the refusal it belongs to is decided by a\n` +
-      `line nothing is watching.\n` +
-      `RESULT: FAIL — ${answered.length} of ${operands} refusal operand(s) are named by no row.\n`,
-  );
+const sourceFiles = (directory) => readdirSync(join(ROOT, directory), { withFileTypes: true })
+  .flatMap((entry) => entry.isDirectory() ? sourceFiles(join(directory, entry.name))
+    : entry.isFile() && /\.(?:[cm]?ts|tsx)$/.test(entry.name) ? [join(directory, entry.name)] : [])
+  .sort();
+const files = sourceFiles("src"), candidates = [];
+for (const file of files) {
+  const source = read(file), tree = parse(file, source), operands = new Map();
+  if (tree.parseDiagnostics.length) problems.push(`${file}: cannot parse source`);
+  walk(tree, (node) => {
+    if (!logical(node)) return;
+    for (const side of [node.left, node.right]) {
+      const operand = unparen(side);
+      if (!logical(operand)) operands.set(operand.getStart(tree), operand);
+    }
+  });
+  if (operands.size) candidates.push({ file, source, tree, operands });
+}
+const excluded = candidates.filter(({ file }) => FILE_EXCLUSIONS.has(file));
+const selected = candidates.filter(({ file }) => !FILE_EXCLUSIONS.has(file));
+for (const [file, reason] of FILE_EXCLUSIONS) {
+  if (!candidates.some((candidate) => candidate.file === file) || !reason.trim()) {
+    problems.push(`${file}: stale file exclusion or missing unanswered-backlog reason`);
+  }
+}
+process.stdout.write(
+  `CENSUS: scanned ${files.length} file(s); selected ${selected.length} deciding file(s); ` +
+    `excluded ${excluded.length} deciding file(s) with unanswered operands; ` +
+    `${files.length - candidates.length} file(s) contain no &&/|| operands.\n`,
+);
+
+let total = 0, named = 0, known = 0;
+const missing = [], consumed = new Set();
+for (const { file, source, tree, operands } of selected) {
+  const ranges = rows.filter((row) => row.file === file).flatMap(({ find }) => {
+    const start = source.indexOf(find);
+    return start >= 0 && source.indexOf(find, start + 1) < 0 ? [{ start, end: start + find.length }] : [];
+  });
+  const occurrences = new Map();
+  for (const [start, operand] of [...operands].sort(([a], [b]) => a - b)) {
+    total += 1;
+    const text = operand.getText(tree), occurrence = (occurrences.get(text) ?? 0) + 1;
+    occurrences.set(text, occurrence);
+    const key = `${file}::${text}::${occurrence}`;
+    if (ranges.some((range) => start >= range.start && operand.end <= range.end)) {
+      named += 1;
+      continue;
+    }
+    const reason = UNANSWERED.get(key);
+    if (reason) { known += 1; consumed.add(key); }
+    missing.push({ file, line: tree.getLineAndCharacterOfPosition(start).line + 1, text, reason });
+  }
+}
+// Each debt names one occurrence. A new repeated operand cannot silently inherit the old entry.
+for (const key of UNANSWERED.keys()) {
+  if (!consumed.has(key)) problems.push(`stale UNANSWERED entry: ${key}`);
+}
+for (const { file, line, text, reason } of missing) {
+  process.stdout.write(`  ${file}:${line}${reason ? "  UNANSWERED" : "  UNNAMED"}\n    ${text}\n`);
+  if (reason) process.stdout.write(`    ${reason}\n`);
+}
+for (const problem of problems) process.stdout.write(`  ERROR: ${problem}\n`);
+const unknown = missing.length - known;
+if (unknown || problems.length) {
+  process.stdout.write(`RESULT: FAIL — ${unknown} of ${total} operand(s) have no row or UNANSWERED reason; ` +
+    `${problems.length} declaration error(s); ${known} known and unanswered.\n`);
   process.exit(1);
 }
-
-process.stdout.write(
-  `RESULT: PASS — ${operands - UNANSWERED.size} of ${operands} refusal operand(s) in ` +
-    `${DECIDING_FILES.length} file(s) are named by a falsifiability row, ` +
-    `${UNANSWERED.size} known and unanswered. ${singleLine} chain(s) written on one line were not ` +
-    `examined. Named is not tested; only the full sweep says that.\n`,
-);
+process.stdout.write(`RESULT: PASS — ${named} of ${total} operand(s) in ${selected.length} file(s) ` +
+  `are named by a falsifiability row; ${known} known and unanswered; ${excluded.length} excluded files' ` +
+  `operands remain unanswered. Named is not tested; this is not complete coverage.\n`);
