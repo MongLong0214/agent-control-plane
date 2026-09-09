@@ -1,0 +1,18 @@
+Limit: the admission seam already owns replay refusal, so the subscriber holds no dedup and no durable cursor
+Limit: since is inclusive, so a reconnect asks for the event that set the mark again and the seam refuses it
+Ruled-out: a durable subscriber cursor file | it would have made reconnect cheaper and made replay refusal have two owners
+Ruled-out: a seen-event set inside the subscriber | same reason: a second authority for a question the seam already answers
+Ruled-out: a second ingress and port built inside the subscriber composition | two IngressGuards over one database is the same defect one level down
+Ruled-out: calling cp.outbox.enqueue directly from the sink | it bypasses the owner allowlist, the replay slot, address resolution and the single-transaction admission
+Ruled-out: an ACP_BUZZ_RELAY_URL environment fallback | it would have made the config file stop being the authority
+Ruled-out: nostr-tools Relay and SimplePool | they bring their own socket, reconnect policy and subscription bookkeeping
+Warn: the preflight must stay one complete pass before the first socket; opening as it validates leaves a partial start that reads as success
+Warn: keep the deep freeze after verifyEvent: verifyEvent writes its verification marker onto the object it is given
+Warn: no thrown message here may name a key path or key bytes; they reach stderr and a chat room
+Warn: a RETRY must not advance the cursor; it closes the socket and leaves the window where it was
+Blast: module
+Undo: easy
+Certainty: firm
+Unverified: no live relay, key, service or database was exercised; the subscriber is dormant until an operator writes the config file and #627 is not retired
+Record-Id: r-193af16ec4c2
+Provenance: inherited c10fe67489319d7896fb1dcd20c25f0c76c6bdef
