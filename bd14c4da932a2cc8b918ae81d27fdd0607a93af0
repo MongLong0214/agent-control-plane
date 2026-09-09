@@ -1,0 +1,2 @@
+Limit: the chain test starts only from the v11 fixture, whose second step replays today's whole schema.sql, and that replay hides every ordering defect from v13 through v28
+Provenance: reconstructed
