@@ -1,0 +1,6 @@
+Limit: the composition rests on the untested assumption that GitHub's commit_message replaces the composed squash body rather than being appended to it; the evidence is merges already on main, not a call against this endpoint
+Limit: commit_title is deliberately not sent, so GitHub still composes the squash title and its (#N) suffix is not reproduced here
+Limit: the composition does not collapse the per-commit trailer paragraphs, so git still stores only the last one
+Limit: the composed message is sent for squash only; merge_commit request bodies are asserted byte-identical to before
+Warn: the record-key list now lives once in scripts/lib/record-trailer-keys.mjs; widening it there also widens what the commit-msg hook refuses
+Provenance: reconstructed
