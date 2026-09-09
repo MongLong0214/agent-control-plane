@@ -1,0 +1,2 @@
+Limit: lstat(path) and open(path) are two syscalls and a rename between them is invisible to both, so the operator's pathname is resolved once into a descriptor and every later decision is about that object
+Provenance: reconstructed
