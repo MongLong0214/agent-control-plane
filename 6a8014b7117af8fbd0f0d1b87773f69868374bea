@@ -1,0 +1,3 @@
+Limit: relay subscription (B1), the re-delivery debt (B5) and the bidirectional path (B7) are outside this unit; it only attaches an address to the port B2 created
+Warn: do not type-check mention at the socket boundary: it is inside the signature and must reach buzzMessagePayload as the relay sent it, or a bad address gets judged before the sender is authenticated and reported as a malformed message
+Provenance: reconstructed
