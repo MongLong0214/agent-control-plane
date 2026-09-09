@@ -1,0 +1,5 @@
+Limit: `better-sqlite3` exposes no way to hand a connection a descriptor, and its constructor calls `sqlite3_open_v2(filename, ..., NULL)`.
+Limit: `src/db/fd-vfs.ts` is unreachable from every other module under `src/`, held by `guards:fd-vfs-unreachable`
+Warn: `iVersion` is 1, so SQLite declines to enter WAL mode on a bound connection and stays on a rollback journal. It declines *silently*, returning the old mode rather than erroring — unit 3 must assert the mode it got rather than the mode it asked for.
+Warn: SQLite unloads an extension when the connection that loaded it closes while the default-VFS pointer still refers to that library's struct, methods and state — the regression test runs in a child process because a segmentation fault kills a test worker instead of failing an assertion
+Provenance: reconstructed
