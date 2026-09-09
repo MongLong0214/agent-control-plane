@@ -1,0 +1,2 @@
+Limit: allowedActors does not distinguish the owner from a permitted peer, so any peer on the allowlist that addresses the CEO gets a turn
+Provenance: reconstructed
