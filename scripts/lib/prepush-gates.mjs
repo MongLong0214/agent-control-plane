@@ -224,7 +224,7 @@ export const RUNNER_SCRIPT_WORDS = ["node", "scripts/run-prepush-gates.mjs"];
 export const VERIFICATION_OUTSIDE_THE_RUNNER = new Map([
   [
     "guard-falsifiability:pnpm guards:falsifiable",
-    "the full mutation sweep is over an hour and edits the working tree in place; it has its own job for that reason, and a pre-push gate nobody waits for is not a gate. `guards:anchors` is its seconds-long half and is in the runner.",
+    "the full mutation sweep is 548 rows and edits the working tree in place; it has its own jobs for that reason — one checkout per `--shard=`, since a shard sharing a tree would read another shard's mutant — and a pre-push gate nobody waits for is not a gate. `guards:anchors` is its seconds-long half and is in the runner.",
   ],
   [
     "traceability:pnpm trace",
