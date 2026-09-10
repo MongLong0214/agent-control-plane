@@ -27,10 +27,18 @@ afterAll(cleanupTempDirs);
  * against uncommitted guarded files — but it does mean an in-progress edit to the script shows up
  * here as a failure until it is committed.
  *
- * `--only` is given a filter that matches no row on purpose. The sentinel is written before any
- * row runs, so an empty selection still exercises the path resolution and the write, and the run
- * finishes in a moment without spawning vitest. The bug is fatal at that write; a passing exit is
- * the whole assertion.
+ * The run below selects one real row and expects exit 1. That is not a weaker assertion than the
+ * exit 0 it used to make, it is a sharper one. This test previously reached the sentinel by way of
+ * an `--only=` filter that matched nothing, because a zero-row run wrote the sentinel and then
+ * printed PASS. That PASS-over-nothing is now refused outright, and the refusal exits *above* the
+ * sentinel — so keeping the old command and merely flipping the expected status would leave this
+ * test asserting nothing at all about the path it is named for.
+ *
+ * So the row is real and the worktree has no `node_modules`: the harness snapshots, writes the
+ * sentinel, mutates, and then refuses at the compiler it cannot reach. Reaching that refusal is
+ * the proof the write returned, because it lives far below the write. Measured against the
+ * original defect reintroduced by hand: the process dies at the write with `ENOENT` and never
+ * prints `could not run`, so both assertions below fail on it.
  */
 const REPO_ROOT = join(import.meta.dirname, "..", "..");
 
@@ -55,7 +63,7 @@ describe("the falsifiability harness runs from a linked worktree", () => {
     expect(output).toContain("RESULT: PASS");
   });
 
-  it("resolves its sentinel into the worktree's own git directory and completes", () => {
+  it("resolves its sentinel into the worktree's own git directory, writes it, and clears it", () => {
     const parent = tempDir("acp-wt-regression-");
     const worktree = join(parent, "checkout");
     const head = git(["rev-parse", "HEAD"], REPO_ROOT);
@@ -70,12 +78,21 @@ describe("the falsifiability harness runs from a linked worktree", () => {
 
       const run = spawnSync(
         process.execPath,
-        [join(worktree, "scripts", "verify-guards-are-falsifiable.mjs"), "--only=__matches_no_row__"],
+        [
+          join(worktree, "scripts", "verify-guards-are-falsifiable.mjs"),
+          "--only=an attempt numbered below one",
+        ],
         { cwd: worktree, encoding: "utf8" },
       );
 
-      expect(`${run.stdout ?? ""}${run.stderr ?? ""}`).not.toContain("ENOENT");
-      expect(run.status).toBe(0);
+      const output = `${run.stdout ?? ""}${run.stderr ?? ""}`;
+      expect(output).not.toContain("ENOENT");
+      expect(output).not.toContain("ENOTDIR");
+      // The write is the subject, and this is how its success is observed: the compiler refusal
+      // sits hundreds of lines below the sentinel write, so the run cannot print this without
+      // having got past it. With the path bug it prints a stack trace instead.
+      expect(output).toContain("could not run");
+      expect(run.status).toBe(1);
       // The harness clears the sentinel on its way out, so its absence afterwards is the
       // successful case. Its presence would mean the run died holding one.
       expect(existsSync(gitPath)).toBe(false);

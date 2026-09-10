@@ -107,11 +107,38 @@ jobs:
   # broken. Each check now starts from its own checkout and still runs when verify-matrix fails.
   # The shared setup-node cache key is the lockfile hash, so the dependency store remains reusable
   # across jobs even though no working tree is shared.
+  #
+  # Sharded, and the shards are separate *checkouts* rather than separate processes in one. The
+  # harness edits the working tree in place and restores it, so two rows running against one tree
+  # would let the second read the first's mutant as the real source — that is why it has never run
+  # alongside `vitest` and never twice at once. A matrix leg is its own runner with its own clone,
+  # so nothing about that rule is being bent here: what moves is which rows a process runs, not how
+  # any row is judged.
+  #
+  # 553 rows (548 after the `skip:` ones), measured, at roughly ten seconds apiece — an hour and a
+  # half of wall-clock on the single job this replaces, on every PR, as the whole critical path.
+  # Four legs because that is the wall-clock target and because four is the smallest number that
+  # reaches it; each leg also pays the fixed setup below (checkout, install, three native builds),
+  # so the per-job total falls by less than four, and more legs buy less each time while asking
+  # macOS runner slots this account has only been measured supplying three of at once.
+  #
+  # `shard: ["1/4", ...]` rather than an index and a separate total: one literal per leg means the
+  # count cannot disagree with itself. What the literals *cannot* say is that all four are here —
+  # deleting one leaves three green jobs and a quarter of the table unchecked — so
+  # `tests/process/the-falsifiability-sweep-is-sharded-without-gaps.test.ts` reads this list back
+  # out of this file and proves it partitions the table.
   guard-falsifiability:
     name: guard falsifiability
     needs: verify-matrix
     if: always()
     runs-on: macos-15
+    strategy:
+      # A shard that fails must not cancel the others. Each leg checks a disjoint quarter, so
+      # cancelling the rest converts one known failure into three unknown results — and a
+      # `cancelled` leg is exactly the state the gate job below reads as not-success.
+      fail-fast: false
+      matrix:
+        shard: ["1/4", "2/4", "3/4", "4/4"]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
@@ -125,7 +152,35 @@ jobs:
       - run: pnpm rebuild better-sqlite3
       - run: pnpm native:peercred:build
       - run: pnpm native:fd-vfs:build
-      - run: pnpm guards:falsifiable
+      # The harness refuses a shard argument that selects no row, so a mistyped or out-of-range
+      # leg is a red job rather than a PASS printed over an empty table.
+      - run: pnpm guards:falsifiable --shard=${{ matrix.shard }}
+
+  # The sweep's verdict, in one place, now that no single job holds it.
+  #
+  # Before the matrix, `guard falsifiability` was one check and its colour was the answer. A matrix
+  # turns that name into `guard falsifiability (1/4)` and three more, and GitHub reports a job that
+  # never ran as `skipped` — which reads as satisfied, not as unknown. So this job carries the bare
+  # name, needs every leg, and decides from the aggregate result. `if: always()` and an allow-list
+  # on `== 'success'` are the same two rules `verify-gate` below runs on, for the same reason:
+  # `failure`, `cancelled` and `skipped` must all be red here, and only `success` green.
+  guard-falsifiability-gate:
+    name: guard falsifiability
+    needs: [guard-falsifiability]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: require every falsifiability shard to have actually succeeded
+        run: |
+          shards="${{ needs.guard-falsifiability.result }}"
+          # Print the input before deciding on it, the same readback verify-gate prints: a gate
+          # that only announces its verdict cannot be told apart from one reading the wrong field.
+          echo "needs.guard-falsifiability.result=${shards}"
+          if [ "$shards" != "success" ]; then
+            echo "at least one falsifiability shard did not succeed — the sweep did not pass"
+            exit 1
+          fi
+          echo "every falsifiability shard succeeded"
 
   # Traceability needs a complete Vitest JSON result, and it consumes the one the gate judged
   # rather than making its own. A second execution is a different run: whatever it reports is a

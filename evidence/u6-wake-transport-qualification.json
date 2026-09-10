@@ -1,13 +1,13 @@
 {
   "qualification": "acp.role-wake-transport/u6",
-  "producedAt": "2026-09-08T23:01:02.003Z",
-  "headSha": "126904545aedf4098d53f9fcd3bfefa6201e625a",
+  "producedAt": "2026-09-09T14:48:17.913Z",
+  "headSha": "fbbdb552e1d31b29cb640a4ef0e081970bbb011c",
   "client": {
     "name": "claude-code",
-    "version": "2.1.265",
-    "versionOutput": "2.1.265 (Claude Code)",
-    "imagePath": "~/.local/share/claude/versions/2.1.265",
-    "imageSha256": "164b09eb800dedb9bb06304129fbf07743ab9db972ae07333ef4f18cde0cb8d5"
+    "version": "2.1.266",
+    "versionOutput": "2.1.266 (Claude Code)",
+    "imagePath": "~/.local/share/claude/versions/2.1.266",
+    "imageSha256": "553d1b9e9e7068b275c0a783c7e139ff6503096f286e674c8c919379fb0eca62"
   },
   "host": {
     "platform": "darwin",
@@ -27,13 +27,13 @@
       "shape": "interactive",
       "injected": true,
       "command": [
-        "~/.local/share/claude/versions/2.1.265",
+        "~/.local/share/claude/versions/2.1.266",
         "--settings",
-        "/private/tmp/acp-u6q-w8evAg/settings.json",
+        "/private/tmp/acp-u6q-3S4JdQ/settings.json",
         "--setting-sources",
         "",
         "--messaging-socket-path",
-        "/private/tmp/acp-u6q-w8evAg/s/i.sock",
+        "/private/tmp/acp-u6q-3S4JdQ/s/i.sock",
         "--model",
         "claude-sonnet-4-5"
       ],
@@ -50,13 +50,13 @@
       "shape": "interactive",
       "injected": false,
       "command": [
-        "~/.local/share/claude/versions/2.1.265",
+        "~/.local/share/claude/versions/2.1.266",
         "--settings",
-        "/private/tmp/acp-u6q-a06bmK/settings.json",
+        "/private/tmp/acp-u6q-1Le6iq/settings.json",
         "--setting-sources",
         "",
         "--messaging-socket-path",
-        "/private/tmp/acp-u6q-a06bmK/s/i.sock",
+        "/private/tmp/acp-u6q-1Le6iq/s/i.sock",
         "--model",
         "claude-sonnet-4-5"
       ],
@@ -73,7 +73,7 @@
       "shape": "headless",
       "injected": true,
       "command": [
-        "~/.local/share/claude/versions/2.1.265",
+        "~/.local/share/claude/versions/2.1.266",
         "-p",
         "--input-format",
         "stream-json",
@@ -81,11 +81,11 @@
         "stream-json",
         "--verbose",
         "--settings",
-        "/private/tmp/acp-u6q-w2Iy6t/settings.json",
+        "/private/tmp/acp-u6q-xWfdy9/settings.json",
         "--setting-sources",
         "",
         "--messaging-socket-path",
-        "/private/tmp/acp-u6q-w2Iy6t/s/i.sock",
+        "/private/tmp/acp-u6q-xWfdy9/s/i.sock",
         "--model",
         "claude-sonnet-4-5"
       ],
@@ -102,7 +102,7 @@
       "shape": "headless",
       "injected": false,
       "command": [
-        "~/.local/share/claude/versions/2.1.265",
+        "~/.local/share/claude/versions/2.1.266",
         "-p",
         "--input-format",
         "stream-json",
@@ -110,11 +110,11 @@
         "stream-json",
         "--verbose",
         "--settings",
-        "/private/tmp/acp-u6q-O9gIjG/settings.json",
+        "/private/tmp/acp-u6q-SbDrI0/settings.json",
         "--setting-sources",
         "",
         "--messaging-socket-path",
-        "/private/tmp/acp-u6q-O9gIjG/s/i.sock",
+        "/private/tmp/acp-u6q-SbDrI0/s/i.sock",
         "--model",
         "claude-sonnet-4-5"
       ],

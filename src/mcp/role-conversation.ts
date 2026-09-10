@@ -209,15 +209,17 @@ type EndpointCheck =
  * from one nobody took.
  *
  * Raw captures and logs use fixed, overwriteable local paths, and the three previously recorded
- * historical losses remain unrecoverable. The raw captures behind the receipt produced at
- * 2026-09-08T23:01:02.003Z have since been overwritten and are not recoverable.
+ * historical losses remain unrecoverable. Each re-qualification writes over the previous run's
+ * captures in place, so only the newest reading's raw files exist: the ones behind the receipt
+ * produced at 2026-09-08T23:01:02.003Z were overwritten by the 2026-09-09T14:48:17.913Z run this
+ * value now rests on, and are not recoverable.
  *
  * The reading behind this value covers an **interactive** start, which the C0 one did not. That
  * matters because `isInteractiveClaudeInvocation` (src/registry/canonical-self-claim.ts) refuses
  * `-p`, `--print`, `--output-format` and `--input-format`: the process that may hold the canonical
  * claim is exactly the shape a headless-only qualification never observed.
  */
-export const C0_QUALIFIED_CLIENT = { name: "claude-code", version: "2.1.265" } as const;
+export const C0_QUALIFIED_CLIENT = { name: "claude-code", version: "2.1.266" } as const;
 
 /**
  * Owner-only, in the POSIX sense the 0700 state directory already means: no group bits, no other
