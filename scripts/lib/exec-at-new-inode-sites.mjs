@@ -31,8 +31,9 @@ export const ALLOWED = new Map([
 
 /** Real instances of the defect, each owned by a named follow-up unit of #817. */
 export const UNFIXED = new Map([
-  [
-    "tests/unit/hermes-target-bind.test.ts::id:executable in makeFixture",
-    "#817 follow-up: writes a Node script, chmods it 0o700, and hands it to `runHermesTargetBind` as the program to spawn — a three-line script at a new inode, the shape measured at over 120 seconds. The fix is for the fixture to name an interpreter and pass the script as an argument.",
-  ],
+  // Empty, and that is the finished state of #817 rather than a gap: all three measured sites are
+  // repaired — the two `cloneExecutable` clone-and-spawn helpers below by this unit, and
+  // `hermes-target-bind.test.ts` by the checked-in shim in #821. An entry here is a *declared*
+  // instance of the defect, so leaving a repaired one behind is itself a guard failure (the stale
+  // check), and adding one back is how a real instance would be admitted without review.
 ]);

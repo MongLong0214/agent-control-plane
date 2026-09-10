@@ -1,6 +1,7 @@
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { digestOf } from "../../src/core/digest.ts";
@@ -40,17 +41,27 @@ const makeResponse = (overrides: Record<string, unknown> = {}) => {
   return { ...publicFields, receipt_digest: digestOf(publicFields) };
 };
 
+/**
+ * #817 — the producer this suite spawns is a checked-in shell file, not one written per test.
+ *
+ * `runHermesTargetBind` spawns the path it is handed with its own fixed argv, so the fixture has no
+ * slot in which to name an interpreter, and the program really must be an executable at a path.
+ * Writing that program per test put it at a new inode, which macOS assesses from zero — over 120
+ * seconds on this machine, wedging syspolicyd. The executable is therefore fixed and already
+ * assessed, and everything that varies per test is data it reads: `producer.mjs` is never marked
+ * executable and is only ever an argument to Node.
+ */
+const producerShim = fileURLToPath(new URL("../fixtures/hermes-target-bind-producer.sh", import.meta.url));
+
 const makeFixture = (mode: FixtureMode) => {
   const root = mkdtempSync(join(tmpdir(), "acp-hermes-target-bind-"));
   roots.push(root);
-  const executable = join(root, "hermes-target-bind-fixture");
   const response =
     mode === "wrong-root"
       ? makeResponse({ lineage_root_digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222" })
       : makeResponse();
   if (mode === "wrong-receipt") response.receipt_digest = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
-  const script = `#!${process.execPath}
-const expectedRequest = ${JSON.stringify(request)};
+  const script = `const expectedRequest = ${JSON.stringify(request)};
 const response = ${JSON.stringify(response)};
 const mode = ${JSON.stringify(mode)};
 const same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
@@ -71,9 +82,9 @@ process.stdin.on("end", () => {
   process.stdout.write(JSON.stringify(response));
 });
 `;
-  writeFileSync(executable, script, { mode: 0o700 });
-  chmodSync(executable, 0o700);
-  return { executable, root, response };
+  writeFileSync(join(root, "producer.mjs"), script);
+  symlinkSync(process.execPath, join(root, "node"));
+  return { executable: producerShim, root, response };
 };
 
 const invoke = (mode: FixtureMode) => {
