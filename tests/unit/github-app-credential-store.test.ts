@@ -31,14 +31,13 @@ const appPermissions = {
   statuses: "write",
 };
 
-/** The narrowed target shape from #575: drops merge_queues/statuses, adds actions: read. */
+/** The narrowed target shape from #575: drops merge_queues and statuses, adds nothing. */
 const narrowedAppPermissions = {
   checks: "write",
   contents: "write",
   issues: "write",
   metadata: "read",
   pull_requests: "write",
-  actions: "read",
 };
 
 const storeWithPermissions = (
@@ -359,7 +358,7 @@ describe("GitHub App credential store", () => {
     expect(result.allowed).toBe(true);
   });
 
-  it("accepts the narrowed post-575 target grant shape with merge_queues and statuses dropped and actions read added", async () => {
+  it("accepts the narrowed post-575 target grant shape with merge_queues and statuses dropped", async () => {
     const files = makeAppFiles();
     const store = storeWithPermissions(files, narrowedAppPermissions);
 
@@ -389,8 +388,8 @@ describe("GitHub App credential store", () => {
 
   it("refuses a grant shape missing one key", async () => {
     const files = makeAppFiles();
-    const { actions: _dropped, ...withoutActions } = narrowedAppPermissions;
-    const store = storeWithPermissions(files, withoutActions);
+    const { metadata: _dropped, ...withoutMetadata } = narrowedAppPermissions;
+    const store = storeWithPermissions(files, withoutMetadata);
 
     const result = await store.githubApi({ method: "GET", path: "/user" });
     expect(result.allowed).toBe(false);
@@ -405,10 +404,14 @@ describe("GitHub App credential store", () => {
     const result = await store.githubApi({ method: "GET", path: "/user" });
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
-    // Both approved shapes must be nameable from the message: the deployed 7-permission
-    // grant (via a permission only it carries) and the narrowed target (via `actions:read`,
-    // which only the narrowed shape carries).
+    // Both approved shapes must be nameable from the message. The deployed 7-permission
+    // grant has a permission only it carries; the narrowed target does not, because its
+    // keys are a strict subset of the deployed one's. So the narrowed shape is identified
+    // by its whole rendering — which is the thing an operator actually has to reproduce in
+    // GitHub settings, and which a message naming only the deployed shape cannot supply.
     expect(result.message).toContain("merge_queues:write");
-    expect(result.message).toContain("actions:read");
+    expect(result.message).toContain(
+      "{checks:write, contents:write, issues:write, metadata:read, pull_requests:write}",
+    );
   });
 });
