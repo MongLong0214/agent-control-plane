@@ -14,23 +14,32 @@ Its jobs, and what each contributes to that check:
 
 - `verify-matrix`, displayed as `verify`, runs the main build and test steps on Node 22.18.0 and
   the current Node 22 release, producing `verify (22.18.0)` and `verify (22)` checks;
-- `guard-falsifiability`, displayed as `guard falsifiability`, runs the mutation sweep in its own
-  clean checkout after the matrix;
+- `guard-falsifiability`, displayed as `guard falsifiability`, runs the mutation sweep after the
+  matrix, split four ways: each leg is its own clean checkout running `--shard=<n>/4`, because the
+  harness edits the working tree in place and two shards sharing a tree would read each other's
+  mutants. GitHub appends the matrix value to the job's check name, so these report as
+  `guard falsifiability (1/4)` and three more, and `guard-falsifiability-gate` — carrying the bare
+  `guard falsifiability` name and needing every leg under `if: always()` — is what turns four
+  results into one verdict. A leg missing from that matrix would leave a quarter of the table
+  unchecked behind green results, so
+  `tests/process/the-falsifiability-sweep-is-sharded-without-gaps.test.ts` reads the shard list out
+  of `ci.yml` and requires it to partition the row table;
 - `traceability`, displayed as `traceability`, checks out clean and consumes the Vitest JSON the
   gate judged, downloaded from the `22.18.0` matrix leg of the same run. It does not run the suite
   again: a second execution is a different run, so a report built from it describes something no
   gate examined. A missing or empty artifact fails the job rather than falling back to a fresh run;
 - `ssot`, displayed as `SSOT reconciliation`, runs the reconciliation check in its own checkout;
   and
-- `verify-gate`, displayed as bare `verify`, needs all four preceding jobs and runs under
-  `if: always()` so only four explicit `success` results pass it.
+- `verify-gate`, displayed as bare `verify`, needs `verify-matrix` and runs under `if: always()`
+  so only an explicit `success` result passes it.
 
-The first four jobs are therefore transitively required by the bare `verify` gate; they are not
-separate branch-protection contexts. The required context remains `verify` with GitHub Actions App
-id `15368`. Existing protection that already requires that pinned context needs no settings change
-for this workflow split, and the commands below remain current. Registering the four component
-checks separately would be a repository-owner policy change and is not part of this document or
-the workflow change.
+Only `verify-matrix` is therefore transitively required by the bare `verify` gate — read `ci.yml`,
+not this list, for what any other job gates today. The remaining jobs run, report and are read, but
+they are not branch-protection contexts and are not reached through `verify`. The required context
+remains `verify` with GitHub Actions App id `15368`. Existing protection that already requires that
+pinned context needs no settings change for this workflow split, and the commands below remain
+current. Registering the component checks separately would be a repository-owner policy change and
+is not part of this document or the workflow change.
 
 Applying this is an owner action: it changes repository settings.
 

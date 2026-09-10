@@ -413,7 +413,7 @@ export interface ContinuityReconcileReport {
     provider: string;
   }>;
   pausedRuns: Array<{ runId: string; roleKey: string; reasonCode: string }>;
-  unresolved: Array<{ roleKey: string; reasonCode: string }>;
+  unresolved: Array<{ roleKey: string; reasonCode: ReasonCode }>;
   restored: string[];
   restorationDeferred: Array<{ roleKey: string; reasonCode: string }>;
 }
@@ -1574,6 +1574,23 @@ export class Daemon {
         // That is restoration, not failure, and §15.8 keeps the acting owner in place
         // until the explicit non-preemptive restore path can safely move it.
         if (currentStillCovered) continue;
+
+        // #811: allocation needs a readable quota; eviction needs evidence against the
+        // incumbent. An observed exhausted window dominates an unread window beside it.
+        // Otherwise a failed sensor or unknown quota is neither exhaustion nor a dead
+        // runtime. Keep the READY binding and surface the
+        // unresolved reading, without making this provider eligible for new work.
+        if (
+          session?.lifecycle === SessionLifecycle.READY &&
+          currentCapacity !== null &&
+          currentCapacity.runtimeHealth !== "UNAVAILABLE" &&
+          !this.cp.capacity.hasExhaustedQuotaFor(currentCapacity, required.capability) &&
+          (currentCapacity.sensorHealth === "ERROR" ||
+            this.cp.capacity.hasUnknownQuotaFor(currentCapacity, required.capability))
+        ) {
+          unresolved.push({ roleKey: required.roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
+          continue;
+        }
 
         if (!assignment?.provider) {
           unresolved.push({

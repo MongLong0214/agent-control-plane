@@ -30,6 +30,11 @@
  * Runs in CI as its own step, never alongside `vitest`: it edits the working tree in place and
  * restores it, so a concurrent run would read a mutated file as the real one.
  *
+ * That rule is about one checkout, and `--shard=<index>/<total>` is the split it leaves open: each
+ * shard is a separate CI job with a separate checkout, mutating only its own tree, so no process
+ * ever reads another's mutant. The partition is exact by construction and `--shard-report=<total>`
+ * proves it — see the comment on `assignShards`.
+ *
  * Dependency-free, in the shape of the other verify scripts (PRD §17.4).
  */
 import { execFileSync, spawnSync } from "node:child_process";
@@ -4818,11 +4823,97 @@ const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".
  */
 const anchorsOnly = process.argv.includes("--anchors-only");
 
-const rows = ALL_ROWS.filter((g) => !g.skip).filter(
-  (g) => !only || g.what.includes(only) || g.file.includes(only) || (g.id ?? "").includes(only),
-);
-
 const out = (line) => process.stdout.write(line + "\n");
+
+/**
+ * A selector that names no row is refused, never run.
+ *
+ * `--only=` matching nothing printed `RESULT: PASS` over zero rows, and that reading has been
+ * believed four separate times. A selection is a claim about which rows this process is
+ * responsible for; a selection that resolves to none is a claim nobody can act on, so it exits
+ * non-zero with the same last-line contract as every other failure here.
+ */
+const refuseSelection = (detail) => {
+  out(`verify-guards-are-falsifiable: ${detail}`);
+  out("\nRESULT: FAIL — the selection named no row, so nothing was run.");
+  process.exit(1);
+};
+
+/**
+ * Splitting the sweep across processes, one shard per CI job.
+ *
+ * The rule in this file's header — never alongside `vitest`, never two of these at once — is about
+ * *one checkout*: a row mutates a file in place, so a second process reading that file reads a
+ * mutant as the real source. It says nothing about two checkouts, and that is the seam this uses.
+ * Each shard is its own job with its own tree, mutating only its own copy, and nothing about how a
+ * row is judged changes.
+ *
+ * `--shard=<index>/<total>`, 1-based. The partition has to be *exact*, not merely even: a row in
+ * two shards wastes a runner, and a row in none is a guard nobody is checking while several green
+ * jobs say the sweep passed — the same "coverage implied, not observed" shape this whole harness
+ * exists to refuse. So the assignment is a pure function of the row's own content:
+ *
+ *   1. every row gets a key made only of what it says (`id`, `what`, `file`, `find`)
+ *   2. the keys are sorted with the default code-unit comparator — the same one the case loader
+ *      uses, for the same reason: `localeCompare` is not identical across machines
+ *   3. position `n` in that order belongs to shard `n % total`
+ *
+ * Nothing there reads a directory listing, an mtime, or the order rows happened to arrive in, so
+ * two shards on two runners cannot disagree about who owns a row. Duplicate keys are the one way
+ * that could break — a tie leaves the sort falling back to arrival order, which *is* the
+ * filesystem ordering this is meant not to depend on — so a duplicate is refused, not assigned.
+ */
+const partitionKeyFor = (guard) => JSON.stringify([guard.id ?? "", guard.what, guard.file, guard.find]);
+
+const assignShards = (allRows, total) => {
+  const rowByKey = new Map();
+  for (const guard of allRows) {
+    const key = partitionKeyFor(guard);
+    if (rowByKey.has(key)) {
+      out(`verify-guards-are-falsifiable: two rows share the partition key ${key}.`);
+      out("  Sharding would order them by arrival, which is the ordering this partition must not use.");
+      out("\nRESULT: FAIL — the row table cannot be partitioned.");
+      process.exit(1);
+    }
+    rowByKey.set(key, guard);
+  }
+  const assignment = new Map();
+  for (const [position, key] of [...rowByKey.keys()].sort().entries()) {
+    assignment.set(rowByKey.get(key), (position % total) + 1);
+  }
+  return assignment;
+};
+
+const parseShard = (value) => {
+  const match = /^(\d+)\/(\d+)$/.exec(value);
+  if (match === null) {
+    refuseSelection(`--shard=${value} is not <index>/<total> with a 1-based index (for example --shard=1/4).`);
+  }
+  const index = Number(match[1]);
+  const total = Number(match[2]);
+  if (total < 1) {
+    refuseSelection(`--shard=${value} asks for ${total} shard(s); a table split into no shards runs no row.`);
+  }
+  if (index < 1 || index > total) {
+    refuseSelection(`--shard=${value} names shard ${index} of ${total}; the index runs from 1 to ${total}.`);
+  }
+  return { index, total };
+};
+
+const shardArgument = process.argv.find((a) => a.startsWith("--shard="))?.slice("--shard=".length);
+if (shardArgument !== undefined && only !== undefined) {
+  refuseSelection(
+    "--shard and --only both narrow the table, and a shard of a filter is not a shard of the sweep:" +
+      " the union of every shard would quietly be a subset. Use one or the other.",
+  );
+}
+const shard = shardArgument === undefined ? null : parseShard(shardArgument);
+const shardAssignment = shard === null ? null : assignShards(ALL_ROWS, shard.total);
+
+const rows = ALL_ROWS.filter((g) => !g.skip)
+  .filter((g) => !only || g.what.includes(only) || g.file.includes(only) || (g.id ?? "").includes(only))
+  .filter((g) => shardAssignment === null || shardAssignment.get(g) === shard.index);
+
 const failures = [];
 
 /**
@@ -4859,6 +4950,83 @@ if (declaredWhats !== GUARDS.length) {
   out("  A missing `},{` merges two rows into one object; the earlier one is discarded in silence.");
   out(`\nRESULT: FAIL — ${declaredWhats - GUARDS.length} row(s) were lost to a merged literal.`);
   process.exit(1);
+}
+
+/**
+ * `--shard-report=<total>`: prove the partition rather than assert it, and run nothing.
+ *
+ * "Each shard is about a quarter of the rows" is the claim a reader makes from four counts, and it
+ * is not the claim that matters. What matters is that the four sets *union to the whole table* and
+ * *intersect nowhere* — the sizes can look right while a row sits in two shards and another sits
+ * in none. This computes both, prints what it inspected, and exits non-zero when the sets are not
+ * a partition. `tests/process/the-falsifiability-sweep-is-sharded-without-gaps.test.ts` runs it
+ * for the shard count `ci.yml` actually declares, so a leg dropped from that matrix is a red
+ * build rather than a silent hole.
+ *
+ * Read-only, and above every write below for the same reason `--anchors-only` is: no snapshot, no
+ * sentinel, no temp directory, safe to run while a real sweep is mid-mutation.
+ */
+const shardReport = process.argv.find((a) => a.startsWith("--shard-report="))?.slice("--shard-report=".length);
+if (shardReport !== undefined) {
+  if (!/^\d+$/.test(shardReport) || Number(shardReport) < 1) {
+    refuseSelection(`--shard-report=${shardReport} is not a shard count of 1 or more.`);
+  }
+  const total = Number(shardReport);
+  const assignment = assignShards(ALL_ROWS, total);
+  const runnable = ALL_ROWS.filter((g) => !g.skip);
+  out(`verify-guards-are-falsifiable: partitioning ${ALL_ROWS.length} row(s) into ${total} shard(s)`);
+  const claimedBy = new Map();
+  const empty = [];
+  let runnableAcrossShards = 0;
+  for (let index = 1; index <= total; index++) {
+    const mine = ALL_ROWS.filter((g) => assignment.get(g) === index);
+    for (const guard of mine) claimedBy.set(guard, (claimedBy.get(guard) ?? 0) + 1);
+    const mineRunnable = mine.filter((g) => !g.skip).length;
+    runnableAcrossShards += mineRunnable;
+    if (mineRunnable === 0) empty.push(index);
+    out(`  shard ${index}/${total}: ${mine.length} row(s), ${mineRunnable} of them runnable`);
+  }
+  const overlapping = [...claimedBy.values()].filter((count) => count > 1).length;
+  const unassigned = ALL_ROWS.length - claimedBy.size;
+  out(
+    `  union ${claimedBy.size} of ${ALL_ROWS.length} row(s); ${overlapping} row(s) in more than one` +
+      ` shard; ${unassigned} row(s) in none`,
+  );
+  out(`  ${runnableAcrossShards} runnable row(s) across the shards; the unsharded run has ${runnable.length}`);
+  const broken = [];
+  if (overlapping !== 0) broken.push(`${overlapping} row(s) are in more than one shard`);
+  if (unassigned !== 0) broken.push(`${unassigned} row(s) are in no shard`);
+  if (runnableAcrossShards !== runnable.length) {
+    broken.push(`the shards run ${runnableAcrossShards} rows and the unsharded run runs ${runnable.length}`);
+  }
+  // A shard with nothing in it is the zero-row PASS arriving through the matrix instead of
+  // through `--only=`: the job would refuse at run time, and this says so before the runner is
+  // spent on it.
+  if (empty.length > 0) broken.push(`shard(s) ${empty.join(", ")} would select no runnable row`);
+  if (broken.length > 0) {
+    out("");
+    for (const reason of broken) out(`  ${reason}`);
+    out(`\nRESULT: FAIL — the ${total} shards are not a partition of the row table.`);
+    process.exit(1);
+  }
+  out("Every row is in exactly one shard, and the shards run exactly what the unsharded sweep runs.");
+  out("RESULT: PASS");
+  process.exit(0);
+}
+
+if (rows.length === 0) {
+  refuseSelection(
+    `no row out of ${ALL_ROWS.length} was selected by ` +
+      (shard === null ? `--only=${only}` : `--shard=${shard.index}/${shard.total}`) +
+      ". Zero rows is not a clean sweep; it is a sweep with no subject.",
+  );
+}
+
+if (shard !== null) {
+  out(
+    `verify-guards-are-falsifiable: shard ${shard.index}/${shard.total} — ${rows.length} of ` +
+      `${ALL_ROWS.filter((g) => !g.skip).length} runnable row(s). A green shard is not a green sweep.`,
+  );
 }
 
 if (anchorsOnly) {
@@ -5350,6 +5518,15 @@ if (failures.length > 0 || unclaimed.length > 0) {
 
 out("");
 out(`verify-guards-are-falsifiable: ${rows.length} guard(s) removed on purpose, each killed a named test`);
+// Said again at the end, where a reader who scrolled to `RESULT:` is looking. One shard's PASS is
+// a statement about its own rows and nothing else; the sweep passed only if every shard did, and
+// that judgement lives in the job that needs them all.
+if (shard !== null) {
+  out(
+    `That is shard ${shard.index} of ${shard.total}; the other ${shard.total - 1} shard(s) hold the rest ` +
+      "of the table, and only all of them together are the sweep.",
+  );
+}
 out(`${loci.length} enforcement locus/loci from verify-enforcement-symbols.mjs are all claimed.`);
 out("A mutation proves the test is coupled to the guard, not that it asserts the right thing.");
 out("RESULT: PASS");
