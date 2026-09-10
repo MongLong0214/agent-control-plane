@@ -32,14 +32,6 @@ export const ALLOWED = new Map([
 /** Real instances of the defect, each owned by a named follow-up unit of #817. */
 export const UNFIXED = new Map([
   [
-    "tests/process/canonical-self-claim-identity.test.ts::id:dest in cloneExecutable",
-    "#817 follow-up: `cp -c` clones the ~100MB node binary to a fresh inode and spawns it, which is the most expensive instance measured. The fixture needs a distinct path that lsof and realpath do not collapse, and `linkSync` gives that at the cached inode. Owned by the unit that repairs the call sites; this unit added the check only.",
-  ],
-  [
-    "tests/process/canonical-self-claim-listener-claim.test.ts::id:dest in cloneExecutable",
-    "#817 follow-up: the same `cp -c` clone-and-spawn helper as canonical-self-claim-identity.test.ts, in the listener's claim test. Repaired together with it.",
-  ],
-  [
     "tests/unit/hermes-target-bind.test.ts::id:executable in makeFixture",
     "#817 follow-up: writes a Node script, chmods it 0o700, and hands it to `runHermesTargetBind` as the program to spawn — a three-line script at a new inode, the shape measured at over 120 seconds. The fix is for the fixture to name an interpreter and pass the script as an argument.",
   ],
