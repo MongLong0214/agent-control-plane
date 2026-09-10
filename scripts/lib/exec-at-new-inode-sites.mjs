@@ -39,8 +39,4 @@ export const UNFIXED = new Map([
     "tests/process/canonical-self-claim-listener-claim.test.ts::id:dest in cloneExecutable",
     "#817 follow-up: the same `cp -c` clone-and-spawn helper as canonical-self-claim-identity.test.ts, in the listener's claim test. Repaired together with it.",
   ],
-  [
-    "tests/unit/hermes-target-bind.test.ts::id:executable in makeFixture",
-    "#817 follow-up: writes a Node script, chmods it 0o700, and hands it to `runHermesTargetBind` as the program to spawn — a three-line script at a new inode, the shape measured at over 120 seconds. The fix is for the fixture to name an interpreter and pass the script as an argument.",
-  ],
 ]);
