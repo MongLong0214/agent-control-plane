@@ -211,8 +211,9 @@ type EndpointCheck =
  * Raw captures and logs use fixed, overwriteable local paths, and the three previously recorded
  * historical losses remain unrecoverable. Each re-qualification writes over the previous run's
  * captures in place, so only the newest reading's raw files exist: the ones behind the receipt
- * produced at 2026-09-08T23:01:02.003Z were overwritten by the 2026-09-09T14:48:17.913Z run this
- * value now rests on, and are not recoverable.
+ * produced at 2026-09-08T23:01:02.003Z were overwritten by the 2026-09-09T14:48:17.913Z run, and
+ * those in turn by the 2026-09-11T08:55:21.640Z run this value now rests on. No superseded capture
+ * is recoverable.
  *
  * The reading behind this value covers an **interactive** start, which the C0 one did not. That
  * matters because `isInteractiveClaudeInvocation` (src/registry/canonical-self-claim.ts) refuses
