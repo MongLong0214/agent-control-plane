@@ -5103,6 +5103,46 @@ const MUTATION_JSON_REPORT = join(MUTATION_REPORT_DIR, "vitest-results.json");
 // not a correctness requirement the way `restoreOnce()` is.
 process.on("exit", () => rmSync(MUTATION_REPORT_DIR, { recursive: true, force: true }));
 
+/**
+ * The unmutated verdict for every named test, when this run was given one.
+ *
+ * A kill is a *difference*: the named test passed before the guard was removed and failed after.
+ * This harness only ever measured the second half, so a test that was already failing for its own
+ * reasons — a listener that cannot bind, a fixture that throws, an environment this row never
+ * touches — was counted as killed by whatever mutation happened to be applied at the time.
+ *
+ * Measured rather than argued (#828). A row whose `find` replaced `MAX_ANCESTRY_HOPS = 64` with
+ * `65` — a constant the named test never reads — was reported `killed`, and the sweep returned
+ * `RESULT: PASS`, because the named test threw `EPERM` on every run. The existing guards do not
+ * reach it: `DEAD SELECTOR` fires only when no assertion *executed*, and a failure is an
+ * execution; `UNRELATED FAILURE` is checked only under `!killed`.
+ *
+ * The baseline is the suite result the `verify` matrix already produced for this same commit, so
+ * this costs no extra execution. CI passes it through `ACP_FALSIFIABILITY_BASELINE`; a local run
+ * usually has none, and then this check is *announced as skipped* rather than silently dropped —
+ * a coverage check that quietly stops checking is the thing this whole file exists against.
+ */
+const BASELINE_PATH = process.env["ACP_FALSIFIABILITY_BASELINE"] ?? null;
+
+/** `fullName` of every assertion the baseline run reports as passing, keyed by resolved file. */
+const loadBaseline = () => {
+  if (BASELINE_PATH === null) return null;
+  const parsed = JSON.parse(readFileSync(BASELINE_PATH, "utf8"));
+  const passing = new Map();
+  for (const file of parsed.testResults ?? []) {
+    if (typeof file.name !== "string") continue;
+    const key = resolve(ROOT, file.name);
+    const names = passing.get(key) ?? new Set();
+    for (const assertion of file.assertionResults ?? []) {
+      if (assertion.status === "passed" && typeof assertion.fullName === "string") names.add(assertion.fullName);
+    }
+    passing.set(key, names);
+  }
+  return passing;
+};
+
+const BASELINE = loadBaseline();
+
 // ---------------------------------------------------------------------------
 // Safety. This edits tracked files in place. A dirty guarded file means a crash
 // mid-run would be indistinguishable from the author's own work in progress.
@@ -5464,6 +5504,24 @@ try {
     }
 
     const killed = selected.flat().some((assertion) => assertion.status === "failed");
+    // A kill is a difference, and this is the half that was missing. Checked only when the row
+    // claims one: a row that did not kill is already failing below for the stronger reason.
+    if (killed && BASELINE !== null) {
+      const untrusted = selectors.findIndex(({ path, name }) => {
+        // A bare-file row credits any assertion in the file, so there is no single named verdict
+        // to compare against; its own looseness is what `deadSelector` and the `what` text carry.
+        if (name === null) return false;
+        const pattern = new RegExp(name);
+        const passingThere = BASELINE.get(resolve(ROOT, path)) ?? new Set();
+        return ![...passingThere].some((fullName) => pattern.test(fullName));
+      });
+      if (untrusted !== -1) {
+        out(`  UNTRUSTED KILL  ${guard.file}  ${guard.what}`);
+        failures.push({ guard, why: `${guard.killedBy[untrusted]} does not pass in the unmutated ` +
+          "baseline, so its failure under the mutation is not evidence the guard is watched" });
+        continue;
+      }
+    }
     if (!killed && classification.kind === "product-failure") {
       out(`  UNRELATED FAILURE  ${guard.file}  ${guard.what}`);
       failures.push({ guard, why: `${classification.reason}, but none was a named witness: ` +
@@ -5518,6 +5576,16 @@ if (failures.length > 0 || unclaimed.length > 0) {
 
 out("");
 out(`verify-guards-are-falsifiable: ${rows.length} guard(s) removed on purpose, each killed a named test`);
+// Stated every run, both ways. "Killed" means the named test failed under the mutation; whether it
+// *passed* without one is a separate fact, and a run with no baseline has not established it. A
+// check that stops checking must say so out loud — that is the whole subject of this file.
+out(
+  BASELINE === null
+    ? "No unmutated baseline was supplied (ACP_FALSIFIABILITY_BASELINE), so no kill here was " +
+      "checked against a passing verdict: a test already failing for its own reasons would read " +
+      "as killed by any mutation."
+    : `Every kill above was also required to pass in the unmutated baseline (${BASELINE_PATH}).`,
+);
 // Said again at the end, where a reader who scrolled to `RESULT:` is looking. One shard's PASS is
 // a statement about its own rows and nothing else; the sweep passed only if every shard did, and
 // that judgement lives in the job that needs them all.
