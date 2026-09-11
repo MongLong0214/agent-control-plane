@@ -152,9 +152,25 @@ jobs:
       - run: pnpm rebuild better-sqlite3
       - run: pnpm native:peercred:build
       - run: pnpm native:fd-vfs:build
+      # The unmutated verdict for every named test, from the matrix leg the gate judged, on this
+      # same commit. A kill is a difference — the named test passed before the guard was removed
+      # and failed after — and without this the sweep only ever measured the second half, so a
+      # test already failing for its own reasons read as killed by any mutation (#828).
+      #
+      # Not a second execution: re-running the suite here would be a different run, and a verdict
+      # from a run no gate looked at is the thing `traceability` refuses just below for the same
+      # reason. `test -s` keeps a missing artifact from reading as a satisfied baseline, rather
+      # than letting the harness fall back to its no-baseline mode where every kill is trusted.
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: vitest-results-22.18.0
+          path: evidence/baseline
+      - run: test -s evidence/baseline/ci-vitest-results.json
       # The harness refuses a shard argument that selects no row, so a mistyped or out-of-range
       # leg is a red job rather than a PASS printed over an empty table.
       - run: pnpm guards:falsifiable --shard=${{ matrix.shard }}
+        env:
+          ACP_FALSIFIABILITY_BASELINE: ${{ github.workspace }}/evidence/baseline/ci-vitest-results.json
 
   # The sweep's verdict, in one place, now that no single job holds it.
   #
