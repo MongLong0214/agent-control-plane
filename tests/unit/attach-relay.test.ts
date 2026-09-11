@@ -102,13 +102,29 @@ describe("the canonical CTO attach relay", () => {
   };
 
   /** One scripted line, then end — the shape `canonical-self-claim-listener.ts` answers with. */
-  const fakeClaim = (response: unknown): Promise<Server> =>
+  const fakeClaim = (response: unknown): Promise<Server> => fakeClaimLine(JSON.stringify(response));
+
+  /**
+   * The same, with the response body written verbatim. A body that is not an object at all — `null`,
+   * a number, an array — has no JS value this file could pass through `JSON.stringify` and get back,
+   * and those are exactly the inputs the receipt guards exist for.
+   */
+  const fakeClaimLine = (body: string): Promise<Server> =>
     listen(
       createServer((socket) => {
-        socket.once("data", () => socket.end(`${JSON.stringify(response)}\n`));
+        socket.once("data", () => socket.end(`${body}\n`));
       }),
       claimPath,
     );
+
+  /** Stands in for the daemon's side of `cto.mcp.sock` for one scripted first line. */
+  const fakeMcp = (firstLine: string, path = join(stateDir, "r.sock")): Promise<string> =>
+    listen(
+      createServer((socket) => {
+        socket.once("data", () => socket.end(`${firstLine}\n`));
+      }),
+      path,
+    ).then(() => path);
 
   const receipt = (): unknown => ({
     allowed: true,
@@ -137,12 +153,16 @@ describe("the canonical CTO attach relay", () => {
         if (newline < 0) break;
         const line = pendingText.slice(0, newline);
         pendingText = pendingText.slice(newline + 1);
-        let message: Wire;
+        let message: Wire | null;
         try {
-          message = JSON.parse(line) as Wire;
+          message = JSON.parse(line) as Wire | null;
         } catch {
           continue;
         }
+        // The daemon is not the only thing that writes this stream in these tests: a fixture that
+        // scripts a non-object first line is exercising exactly the relay guard that lets such a
+        // line through untouched, so this reader has to survive reading one back.
+        if (!message || typeof message !== "object") continue;
         if (message.id !== undefined) pending.get(message.id)?.(message);
       }
     });
@@ -377,5 +397,119 @@ describe("the canonical CTO attach relay", () => {
     const relay = drive(junkPath);
     expect(await settles(relay.exit)).toBe(ATTACH_EXIT.PROTOCOL);
     expect(relay.out()).toBe("");
+  });
+
+  /*
+   * The receipt and handshake-reply guards below decide exit 6 against exit 3 and exit 4 — whether
+   * a credential is usable at all — so `pnpm guards:operands` wants each operand accounted for.
+   *
+   * Four of the sixteen have no independent witness and are recorded as owed in
+   * `scripts/lib/refusal-operands-unanswered.mjs`. The rest are witnessed here, and the witnesses
+   * were measured one operand at a time against a baseline of nineteen inputs rather than reasoned
+   * about: a non-string field and an empty-string field are separable inputs that take separate
+   * branches, and a `null` body is separable from every other non-object because `typeof null` is
+   * `"object"` and the neighbouring operand cannot catch it.
+   */
+
+  it("treats a claim response body that is not an object as a protocol failure, never as a crash", async () => {
+    // `null` is the one non-object the `typeof` operand beside it cannot catch. Without the guard
+    // the next line reads `.allowed` off it and the relay dies with a stack trace on the stderr
+    // Claude Code files as its MCP server log.
+    await fakeClaimLine("null");
+    const relay = drive(mcpPath);
+    expect(await settles(relay.exit)).toBe(ATTACH_EXIT.PROTOCOL);
+    expect(relay.err()).toBe("attach: claim receipt malformed\n");
+    expect(relay.out()).toBe("");
+  });
+
+  it("treats a receipt whose value is null as a protocol failure, never as a crash", async () => {
+    await fakeClaimLine(JSON.stringify({ allowed: true, reasonCode: ReasonCode.OK, value: null }));
+    const relay = drive(mcpPath);
+    expect(await settles(relay.exit)).toBe(ATTACH_EXIT.PROTOCOL);
+    expect(relay.err()).toBe("attach: claim receipt malformed\n");
+    expect(relay.out()).toBe("");
+  });
+
+  it("refuses a receipt whose sessionId is not a non-empty string before it reaches the mcp socket", async () => {
+    // Both inputs run against the real listener, so a relay that stopped checking would present the
+    // bad credential and come back with the daemon's own refusal — exit 4, not exit 6.
+    for (const sessionId of [42, ""]) {
+      await fakeClaimLine(
+        JSON.stringify({
+          allowed: true,
+          reasonCode: ReasonCode.OK,
+          value: { sessionId, sessionSecret: subject.sessionSecret },
+        }),
+      );
+      const relay = drive(mcpPath);
+      expect(await settles(relay.exit)).toBe(ATTACH_EXIT.PROTOCOL);
+      expect(relay.err()).toBe("attach: claim receipt malformed\n");
+      for (const server of servers.splice(0)) {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    }
+  });
+
+  it("refuses a receipt whose sessionSecret is not a non-empty string before it reaches the mcp socket", async () => {
+    for (const sessionSecret of [42, ""]) {
+      await fakeClaimLine(
+        JSON.stringify({
+          allowed: true,
+          reasonCode: ReasonCode.OK,
+          value: { sessionId: subject.sessionId, sessionSecret },
+        }),
+      );
+      const relay = drive(mcpPath);
+      expect(await settles(relay.exit)).toBe(ATTACH_EXIT.PROTOCOL);
+      expect(relay.err()).toBe("attach: claim receipt malformed\n");
+      for (const server of servers.splice(0)) {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    }
+  });
+
+  it("reports a claim denial with no stable reason code as a protocol failure, not as a refusal", async () => {
+    // A code the catalogue does not declare must not reach stderr. An array answers `.length` and a
+    // string of length zero answers `typeof`, so each operand is refused by the other's blind spot.
+    for (const reasonCode of [["X"], ""]) {
+      await fakeClaimLine(JSON.stringify({ allowed: false, reasonCode }));
+      const relay = drive(mcpPath);
+      expect(await settles(relay.exit)).toBe(ATTACH_EXIT.PROTOCOL);
+      expect(relay.err()).toBe("attach: claim receipt malformed\n");
+      for (const server of servers.splice(0)) {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    }
+  });
+
+  it("forwards a first line that is not an object as client traffic, never as a refusal to parse", async () => {
+    // The daemon writes a refusal only as an object with `ok: false`. Anything else is the client's
+    // own stream and crosses unread — including the two shapes the `in` operator cannot be asked
+    // about, which without their guards throw instead of being forwarded.
+    for (const firstLine of ["null", "42"]) {
+      await fakeClaim(receipt());
+      const path = await fakeMcp(firstLine, join(stateDir, `r${firstLine}.sock`));
+      const relay = drive(path);
+      expect(await settles(relay.exit)).toBe(ATTACH_EXIT.STREAM_CLOSED);
+      expect(relay.out()).toBe(`${firstLine}\n`);
+      expect(relay.err()).toBe("");
+      for (const server of servers.splice(0)) {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    }
+  });
+
+  it("reports a handshake refusal with no stable reason code as a protocol failure", async () => {
+    for (const [index, reasonCode] of [["X"], ""].entries()) {
+      await fakeClaim(receipt());
+      const path = await fakeMcp(JSON.stringify({ ok: false, reasonCode }), join(stateDir, `q${index}.sock`));
+      const relay = drive(path);
+      expect(await settles(relay.exit)).toBe(ATTACH_EXIT.PROTOCOL);
+      expect(relay.err()).toBe("attach: handshake reply malformed\n");
+      expect(relay.out()).toBe("");
+      for (const server of servers.splice(0)) {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    }
   });
 });

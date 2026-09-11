@@ -835,6 +835,26 @@ const groups = [
       ["!approval",1],
     ],
   },
+  {
+    file: "src/cli/attach-relay.ts",
+    // performClaim, receipt body and receipt value shape
+    reason: "The field checks below refuse the same inputs. A number, a string or an array body reaches finish({malformed}) through typeof value.sessionId !== \"string\" after the cast, and a non-object value reaches it the same way, so removing either operand changes no observable. Measured one operand at a time against nineteen inputs covering every non-object JSON body and value: only the null cases differ, and those are the operands beside these, which carry rows.",
+    operands: [
+      ["typeof parsed !== \"object\"",1],
+      ["Array.isArray(parsed)",1],
+      ["typeof value !== \"object\"",1],
+    ],
+  },
+  {
+    file: "src/cli/attach-relay.ts",
+    // classifyFirstLine, first-line body shape
+    reason: "A witness exists and is asserted — \"forwards a first line that is not an object as client traffic\" drives both null and 42 — but no isolated mutant type-checks: these two operands are the narrowing that the following \"jsonrpc\" in parsed test depends on, so removing either alone fails to compile, and a mutation wide enough to compile would also span Array.isArray(parsed), which has no witness of its own. Array.isArray is unwitnessed because an array reaches the same traffic outcome through body.ok !== false below.",
+    operands: [
+      ["!parsed",2],
+      ["typeof parsed !== \"object\"",2],
+      ["Array.isArray(parsed)",2],
+    ],
+  },
 ];
 
 export const UNANSWERED = new Map(groups.flatMap(({ file, reason, operands }) =>
