@@ -188,22 +188,25 @@ const APPROVED_APP_PERMISSION_SHAPES: ReadonlyArray<Readonly<Record<string, "rea
     statuses: "write",
   },
   {
-    // The #575 target: merge_queues and statuses are dropped (no `/merge-queue` endpoint is
-    // ever called, and the Gate publishes a check-run, not a commit status), and actions:
-    // read is added. actions: read is not required against a public repository — GitHub
-    // permits an installation token to read a public repository's Actions run data
-    // (`GET /repos/:o/:r/actions/runs/:id`, called from
-    // `assertTrustedWorkflowCheck` in github-kernel.ts) with only metadata: read — but it
-    // is required the moment the App is installed on a private repository, where that same
-    // call needs the permission explicitly. #240's two-repository run makes a private
-    // installation reachable, so the permission has to be in the approved shape before
-    // that lands, not after it fails in production.
+    // The #575 target: merge_queues and statuses are dropped, because no `/merge-queue`
+    // endpoint is ever called and the Gate publishes a check-run rather than a commit
+    // status. Nothing is added.
+    //
+    // This shape carried `actions: read` until 2026-09-11. That entry was justified solely
+    // by a private installation: `assertTrustedWorkflowCheck` in github-kernel.ts reads a
+    // run via `GET /repos/:o/:r/actions/runs/:id`, which an installation token may already
+    // do against a *public* repository with only metadata: read, and which needs the
+    // permission explicitly only against a private one. The owner has since ruled out
+    // operating any private repository, so that installation is not reachable and the
+    // permission has no remaining justification. A permission kept for a scenario that
+    // cannot occur is indistinguishable, at the point it is finally exercised, from one
+    // that was needed — so it is removed rather than left inert. Restoring it means
+    // restoring the private-repository decision first.
     checks: "write",
     contents: "write",
     issues: "write",
     metadata: "read",
     pull_requests: "write",
-    actions: "read",
   },
 ];
 
