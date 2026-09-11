@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { createConnection } from "node:net";
@@ -7,7 +6,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { defaultConfig } from "../app/control-plane.ts";
-import { ATTACH_EXIT, runAttachRelay, type AttachRelayClaim } from "./attach-relay.ts";
+import { runAttachRelayCommand, type AttachRelayClaim } from "./attach-relay.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -279,48 +278,16 @@ const dispatchCanonicalSelfClaim = (args: string[], config: { databasePath: stri
   );
 };
 
-/**
- * The deployment token, read from the same Keychain item the launchd launcher reads
- * (`deploy/install-launchd.sh`), with `execFileSync` and no shell.
- *
- * It is deliberately not a selector and not production configuration: a command line is
- * world-readable through `ps`, and the MCP server entry the owner writes for the canonical
- * session sets no environment at all, so `ps -E` on the relay shows no ACP secret either.
- * `ACP_MCP_TOKEN` in the environment is honoured only so a test can hand a spawned relay a
- * synthetic token — the same boundary the Keychain has for a same-uid reader.
- */
-const resolveMcpToken = (): string | null => {
-  const fromEnv = process.env["ACP_MCP_TOKEN"];
-  if (fromEnv && fromEnv.length > 0) return fromEnv;
-  const service = process.env["ACP_KEYCHAIN_SERVICE"] ?? "com.agentcontrolplane.agentcpd";
-  try {
-    const found = execFileSync(
-      "security",
-      ["find-generic-password", "-w", "-s", service, "-a", "ACP_MCP_TOKEN"],
-      // stderr is discarded rather than inherited: this command's failure prose is not something
-      // to put on the stderr of a process whose stderr is Claude Code's MCP server log.
-      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-    ).replace(/\n+$/, "");
-    return found.length > 0 ? found : null;
-  } catch {
-    return null;
-  }
-};
-
 const dispatchAttach = (args: string[], config: { databasePath: string }): Promise<number> => {
   if (args[0] !== "canonical-cto") return Promise.resolve(fail(`unknown attach subcommand: ${args[0] ?? ""}`));
   const parsed = parseCanonicalClaimSelectors(args.slice(1), "attach canonical-cto");
   if (!parsed.ok) return Promise.resolve(fail(parsed.message));
-  const mcpToken = resolveMcpToken();
-  if (mcpToken === null) {
-    process.stderr.write("attach: mcp token unavailable\n");
-    return Promise.resolve(ATTACH_EXIT.UNAVAILABLE);
-  }
-  return runAttachRelay(
+  // No token is named, passed or read on this path. The relay acquires the deployment credential
+  // inside its own module, where nothing in this one can reach it (#827).
+  return runAttachRelayCommand(
     {
       claimSocketPath: claimCanonicalCtoSocketPath(config),
       mcpSocketPath: process.env["ACP_CTO_MCP_SOCKET"] ?? join(config.databasePath, "..", "cto.mcp.sock"),
-      mcpToken,
       claim: parsed.selectors,
     },
     { stdin: process.stdin, stdout: process.stdout, stderr: process.stderr },

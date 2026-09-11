@@ -711,7 +711,38 @@ describe("authenticated operator socket (#393/#405)", () => {
     expect(source).not.toMatch(/new ControlPlane\s*\(/);
     expect(source).not.toMatch(/ControlPlane/);
     expect(source).not.toMatch(/new Db\s*\(|writeFileSync|mkdirSync|IngressGuard/);
-    expect(source).not.toMatch(/ACP_MCP_TOKEN|ACP_OWNER_ACTOR/);
+    expect(source).not.toMatch(/ACP_OWNER_ACTOR/);
+    /*
+     * A boundary that moved, and why it still holds (#827).
+     *
+     * `ACP_MCP_TOKEN` was named here by 1abde15 because of what the *operator socket* accepted in
+     * 2026-08: it fell back to the MCP credential when no dedicated one existed, so a CLI that read
+     * that value could authenticate to it. The server-side half of that fix makes the string
+     * irrelevant — `startOperatorSocket` throws when the two tokens are equal and when the operator
+     * token is absent (both asserted above in this file), and `authenticateOperatorPeer` compares
+     * only against the operator binding's own token. Holding the MCP token now grants nothing on
+     * the operator socket; on the MCP sockets it is a deployment gate that admits nobody without a
+     * session secret the registry issues once, in a claim receipt.
+     *
+     * So the string was never the property. The property is module scope: the operator client must
+     * not be able to *acquire* a credential, which is what its neighbours above assert about
+     * `ControlPlane`, `Db` and `IngressGuard` — "this module cannot compose them", not "this process
+     * never touches them". That reading is also why `agentctl claim canonical-cto` landed three
+     * weeks after this guard without tripping it.
+     *
+     * This is wider than the line it replaces, not narrower: it forbids acquiring a credential by
+     * any route rather than containing one name. It holds on `origin/main`, where this file has no
+     * `child_process` at all.
+     */
+    expect(source).not.toMatch(/ACP_MCP_TOKEN|find-generic-password|execFileSync|child_process/);
+    // The repair itself. `agentctl attach` runs a relay that must present the deployment token, and
+    // the resolver now lives in the relay's own module — reachable from its one caller there and
+    // exported to nobody, so no operator path in any module can name it. Exporting it would put it
+    // back within reach of this file while leaving the assertion above green.
+    const relaySource = readFileSync(new URL("../../src/cli/attach-relay.ts", import.meta.url), "utf8");
+    expect(relaySource).toMatch(/const resolveMcpToken/);
+    expect(relaySource).not.toMatch(/export\s+(?:const|function|async function)\s+resolveMcpToken/);
+    expect(relaySource).not.toMatch(/resolveMcpToken[^\n]*\}\s*from|export\s*\{[^}]*resolveMcpToken/);
     expect(source).toMatch(/createOperatorClient/);
     expect(source).toMatch(/no direct database fallback/);
     // Capability issuance remains a daemon composition concern; the client only serializes

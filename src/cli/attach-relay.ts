@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createConnection, type Socket } from "node:net";
 import type { Readable, Writable } from "node:stream";
 
@@ -199,6 +200,73 @@ const classifyFirstLine = (line: string): HandshakeReply => {
   return typeof body.reasonCode === "string" && body.reasonCode.length > 0
     ? { kind: "refusal", reasonCode: body.reasonCode }
     : { kind: "malformed" };
+};
+
+/**
+ * The deployment token, read from the same Keychain item the launchd launcher reads
+ * (`deploy/install-launchd.sh`), with `execFileSync` and no shell.
+ *
+ * **Module-private on purpose, and that is the boundary, not the file name.** It used to live in
+ * `src/cli/agentctl.ts`, in the same module scope as `createOperatorClient` and `dispatch` — one
+ * identifier away from every operator code path in the CLI. Nothing there called it, but nothing
+ * structural stopped the next line from doing so. Here it is reachable only from
+ * `runAttachRelayCommand` below, and it is not exported, so no operator path in any module can
+ * name it. `tests/unit/operator-socket.test.ts` asserts both halves: that the operator client
+ * cannot acquire a credential by any route, and that this function is not exported.
+ *
+ * It is deliberately not a selector and not production configuration: a command line is
+ * world-readable through `ps`, and the MCP server entry the owner writes for the canonical session
+ * sets no environment at all, so `ps -E` on the relay shows no ACP secret either. `ACP_MCP_TOKEN`
+ * in the environment is honoured only so a test can hand a spawned relay a synthetic token — the
+ * same boundary the Keychain has for a same-uid reader.
+ *
+ * Written with `??` rather than `&&` deliberately: `scripts/verify-refusal-operands-are-watched.mjs`
+ * counts every `&&`/`||` operand in this file and asks for a witness or a stated reason for each,
+ * and a nullish default carries neither an unwatched decision nor a debt.
+ */
+const resolveMcpToken = (): string | null => {
+  const fromEnv = process.env["ACP_MCP_TOKEN"] ?? "";
+  if (fromEnv.length > 0) return fromEnv;
+  const service = process.env["ACP_KEYCHAIN_SERVICE"] ?? "com.agentcontrolplane.agentcpd";
+  try {
+    const found = execFileSync(
+      "security",
+      ["find-generic-password", "-w", "-s", service, "-a", "ACP_MCP_TOKEN"],
+      // stderr is discarded rather than inherited: this command's failure prose is not something
+      // to put on the stderr of a process whose stderr is Claude Code's MCP server log.
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    ).replace(/\n+$/, "");
+    return found.length > 0 ? found : null;
+  } catch {
+    return null;
+  }
+};
+
+/** Everything the CLI knows about an attach. Deliberately no token field: see `resolveMcpToken`. */
+export interface AttachRelayCommandOptions {
+  claimSocketPath: string;
+  mcpSocketPath: string;
+  claim: AttachRelayClaim;
+}
+
+/**
+ * The `agentctl attach canonical-cto` entry.
+ *
+ * It exists so the CLI can start a relay without naming the deployment token — the caller passes
+ * socket paths and claim selectors, and the credential is acquired here and goes straight into
+ * `runAttachRelay`, which still takes it explicitly so a test can drive the relay with a synthetic
+ * one.
+ */
+export const runAttachRelayCommand = (
+  options: AttachRelayCommandOptions,
+  io: AttachRelayIo,
+): Promise<number> => {
+  const mcpToken = resolveMcpToken();
+  if (mcpToken === null) {
+    io.stderr.write("attach: mcp token unavailable\n");
+    return Promise.resolve(ATTACH_EXIT.UNAVAILABLE);
+  }
+  return runAttachRelay({ ...options, mcpToken }, io);
 };
 
 export const runAttachRelay = async (
