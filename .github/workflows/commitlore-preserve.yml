@@ -1,0 +1,65 @@
+name: CommitLore squash inheritance
+
+# A squash merge replaces a branch's commits with one that does not carry their trailers, and
+# GitHub performs that merge on its own servers where no local hook runs. `merge-pr.mjs` handles
+# the merges this repository makes deliberately — it calls `commitlore squash-preserve` before
+# merging — but the **Squash and merge** button is enabled (`allow_squash_merge: true`), and a
+# press of it drops the branch's records silently while showing the author a green merge. This
+# action is the only thing with what it needs at that moment: the pull request, its commits, and
+# the commit they were squashed into. Filed as #829.
+#
+# Measured on this repository before adding it: two `Follows:` references already dangle
+# (`commitlore stale`), and both parents exist only on pre-squash branch commits unreachable from
+# main — the loss this closes has already happened twice.
+#
+# `pull_request_target`, not `pull_request`: a pull request from a fork gets a read-only token on
+# `pull_request`, so the job would build the record and then fail to publish it.
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  contents: write # the one push to refs/notes/commitlore
+
+concurrency:
+  group: commitlore-notes
+  cancel-in-progress: false
+
+jobs:
+  preserve:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # the merge commit is on the base branch, and a closed pull request has no merge ref
+          # left to check out
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
+
+      # the mirror this action writes; publishing from a checkout that never read it would fork
+      # the notes history
+      - run: git fetch --no-tags origin '+refs/notes/commitlore:refs/notes/commitlore'
+
+      # a squash merge usually deletes the branch, and then the pull request's own ref is the only
+      # one still reaching the commits that carry records
+      - run: git fetch --no-tags --force origin
+          '+refs/pull/${{ github.event.pull_request.number }}/head:refs/commitlore/pr-head'
+
+      # The action runs CommitLore from a checkout of that repository: the package is private, so
+      # there is no published npm name to fall back to. `dist/` is committed, so nothing builds.
+      #
+      # Pinned to v1.2.16, not the v1.2.17 the upstream README prints — that tag does not exist
+      # (`git tag -l` tops out at v1.2.16), and copying the README verbatim yields a job that
+      # cannot resolve the action and fails *after* the merge, where nobody looks. Filed upstream
+      # as MongLong0214/commitlore#938. Both refs below must move together.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: MongLong0214/commitlore
+          ref: v1.2.16
+          path: .commitlore-cli
+          persist-credentials: false
+
+      - uses: MongLong0214/commitlore/action/preserve@v1.2.16
+        with:
+          cli-path: .commitlore-cli/dist/cli.js
