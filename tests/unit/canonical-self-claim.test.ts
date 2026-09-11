@@ -1422,6 +1422,58 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
   });
 
   /**
+   * "Unknown is never gone" — the half of the liveness read that nothing else in this file
+   * reaches. The sibling test below supplies a live predecessor with a readable token; this one
+   * supplies a live predecessor whose token cannot be read, which is a real shape on the default
+   * inspector (`ps` answers while `readProcessStartToken` returns null on a native or kernel
+   * failure), not a contrived one.
+   *
+   * The consequence of reading it the other way is not a missed refusal, it is an eviction: an
+   * unreadable token on a *live* pid would take the abandoned-runtime path, skip every #824
+   * ownership guard, transition the live holder to STOPPED and hand the role to a stranger
+   * whenever the assignment happens to be REVOKED. So the assertion is the reason code and the
+   * message — the same-live branch answering — not merely that something refused.
+   */
+  it("a predecessor pid that is live but whose start token cannot be read is not gone", async () => {
+    const core = makeCore();
+    const projectId = "prj_unreadable_token";
+    insertProject(core, projectId);
+    const first = await makeSubject(core).claim(baseRequest(core, projectId));
+    expect(first.allowed, JSON.stringify(first)).toBe(true);
+    if (!first.allowed) return;
+    const predecessor = core.sessions.require(first.value.sessionId);
+    expect(predecessor.osProcessStartedAt).not.toBeNull();
+    expect(core.bindings.revoke(roleKeyFor(Role.PRIMARY_CTO, { projectId }), "lost attachment").allowed).toBe(true);
+
+    // pid 10 — the predecessor's own runtime — is still there; only its start token is unreadable.
+    // The claimant is pid 11, a different process on the same ancestry.
+    const unreadable = [
+      standardChain()[0]!,
+      { ...standardChain()[1]!, ppid: 11 },
+      claudeAncestor({ pid: 11 }),
+      claudeAncestor({ pid: 10, startedAt: null }),
+    ];
+    const observed = chainInspector(unreadable).snapshot(predecessor.osPid!);
+    expect(observed).not.toBeNull();
+    expect(observed?.startedAt).toBeNull();
+
+    const request = baseRequest(core, projectId, {
+      expectedBindingGeneration: 2,
+      ownerApproval: mintOwnerApproval(core, { projectId, claimedSessionUuid: CANON, expectedBindingGeneration: 2 }),
+    });
+    const before = durableSnapshot(core);
+    const refused = await makeSubject(core, { chain: unreadable }).claim(request);
+    expect(refused.allowed).toBe(false);
+    if (refused.allowed) return;
+    expect(refused.reasonCode).toBe(ReasonCode.CONFLICT);
+    // The same-live branch is what answered; an unreadable token did not route this to the
+    // abandoned-runtime path and then refuse for some unrelated reason further down.
+    expect(refused.message).toBe("same-live recovery requires the exact idle revoked runtime");
+    expect(durableSnapshot(core)).toEqual(before);
+    expect(core.sessions.require(predecessor.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+  });
+
+  /**
    * #824's recycled-pid property, on the shape #831 leaves reachable. The claimant occupies the
    * predecessor's pid under a different start token, so the recorded process is gone and the claim
    * is the ordinary one. What must not happen is the claimant being credited with the
