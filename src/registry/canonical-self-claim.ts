@@ -112,7 +112,24 @@ export interface ProcessSnapshot {
    * see `argv` for that.
    */
   command: string;
+  /**
+   * The working directory this snapshot actually observed, or `null` when it observed none.
+   *
+   * `null` is never an observation of a different directory. It means the probe produced no
+   * answer — see `cwdProbeFailure` for whether the probe ran at all. Reading `null` as a value
+   * that failed to match is exactly what left the canonical PRIMARY_CTO role unclaimable while
+   * its working directory was correct (#834).
+   */
   cwd: string | null;
+  /**
+   * Non-null when the probe that would have read `cwd` could not run — it timed out, or lsof was
+   * not reachable. `null` covers both the ordinary case (the probe ran) and the case where it ran
+   * and reported no `cwd` descriptor; neither of those is a failure of the probe itself.
+   *
+   * Required rather than optional on purpose. An inspector that does not state this has not
+   * stated that the probe succeeded, and a missing field would silently read as "it did".
+   */
+  cwdProbeFailure: LsofProbeFailure | null;
   /**
    * An opaque, native-resolution process-start token (`../core/process-argv.ts`'s
    * `readProcessStartToken`) — never `ps -o lstart=`'s whole-second rendered text, which a
@@ -145,25 +162,95 @@ interface LsofEntry {
 }
 
 /**
- * Parses `lsof -p <pid> -FfptDin`'s field-per-line output into (fd, type, name, device, inode)
- * tuples.
+ * Why an `lsof` scan produced nothing, when it produced nothing because it never ran to completion.
+ *
+ * This type exists so that "the probe failed" cannot be spelled the same way as "the probe ran and
+ * the answer was empty". Both used to be `[]`, and every consumer below read `[]` as a definite
+ * negative about the process — which is how a claim whose working directory was exactly right came
+ * to be refused for a working directory that did not match (#834).
+ */
+export interface LsofProbeFailure {
+  /** The process the scan was about — the claimant, not this daemon. */
+  pid: number;
+  /** The budget the scan was given, in milliseconds; `TIMED_OUT` means it outlived this. */
+  timeoutMs: number;
+  /**
+   * `TIMED_OUT` when the scan outlived `timeoutMs` and was killed — the #834 signature, measured
+   * at 30.07s against a 5_000ms budget. `SCAN_FAILED` for everything else: lsof not on the PATH
+   * this process was launched with (the recurring #423/#785/`deploy/install-launchd.sh` shape),
+   * a non-zero exit, or a spawn that failed outright.
+   */
+  kind: "TIMED_OUT" | "SCAN_FAILED";
+  /** The OS error code when there was one (`ENOENT` when lsof is not on the PATH), else `null`. */
+  errorCode: string | null;
+  /** lsof's own exit status when it ran and exited non-zero, else `null`. */
+  exitStatus: number | null;
+}
+
+/** The outcome of one scan: entries that were genuinely read, or the reason none were. */
+type LsofScan =
+  | { ok: true; entries: LsofEntry[] }
+  | { ok: false; failure: LsofProbeFailure };
+
+/**
+ * The exact argv `lsofEntries` passes. Exported so a test can pin the flags rather than the
+ * timing of a scan, which is what a later edit would otherwise quietly drop.
+ *
+ * `-n` and `-P` suppress name resolution — `-n` for hostnames, `-P` for service port names — and
+ * neither changes a single byte this module reads. The field selector is `f p t D i n`: fd, pid,
+ * type, device, inode, and lsof's *name* field. The two entries anything here consults are the
+ * `cwd` DIR entry and the `txt` REG entry, and for both of those the name field is a filesystem
+ * path, which `-n` and `-P` do not touch at all. What they suppress is the name rendering of
+ * network entries — the IPv4/IPv6 sockets this module never looks at.
+ *
+ * Their absence is what took the canonical PRIMARY_CTO role off production (#834). Without `-n`,
+ * lsof does a reverse-DNS lookup for every network descriptor the claimant holds before it prints
+ * anything at all, because the output is one stream: measured against the live canonical claude
+ * process (53 descriptors, 7 of them IPv4), `lsof -p <pid> -FfptDin` took 30.07s / 30.08s / 30.08s
+ * over three runs, and `lsof -n -p <pid> -FfptDin` took 0.05s — 600x. `SUBPROCESS_TIMEOUT_MS` is
+ * 5_000, so the scan was killed every time and the claim never saw the cwd that was sitting three
+ * descriptors away.
+ */
+export const lsofScanArgv = (pid: number): string[] => ["-n", "-P", "-p", String(pid), "-FfptDin"];
+
+/**
+ * Parses `lsof -n -P -p <pid> -FfptDin`'s field-per-line output into (fd, type, name, device,
+ * inode) tuples, or reports why it could not.
  *
  * This one call is what the default cwd and executing-image lookups below are both built on.
  * `comm=` truncates a resolved path once it exceeds `ps`'s short-name column width, so this reads
  * lsof's own name field instead of any `ps` short-name column. Device and inode are requested
  * alongside the path in the same scan — deriving them from a second, separate `lsof` call would
  * let a path swapped in between the two calls go uncaught.
+ *
+ * A scan that could not run returns `{ ok: false }`, never an empty entry list. The two are
+ * different facts and the callers below act on them differently; folding them together is the
+ * defect this signature exists to make unspellable.
  */
-const lsofEntries = (pid: number): LsofEntry[] => {
+const lsofEntries = (pid: number): LsofScan => {
   let out: string;
   try {
-    out = execFileSync("lsof", ["-p", String(pid), "-FfptDin"], {
+    out = execFileSync("lsof", lsofScanArgv(pid), {
       encoding: "utf8",
       timeout: SUBPROCESS_TIMEOUT_MS,
       stdio: ["ignore", "pipe", "ignore"],
     });
-  } catch {
-    return [];
+  } catch (error) {
+    // `execFileSync` sets `killed` when it is the timeout that ended the child, which is the one
+    // case whose repair is "the scan needs to be cheaper or the budget bigger" rather than "lsof
+    // is not reachable". Distinguishing them here is what puts the right next step in the
+    // operator's hands; a single "scan failed" would send both diagnoses the same way.
+    const failed = error as { killed?: boolean; code?: unknown; status?: unknown };
+    return {
+      ok: false,
+      failure: {
+        pid,
+        timeoutMs: SUBPROCESS_TIMEOUT_MS,
+        kind: failed.killed === true ? "TIMED_OUT" : "SCAN_FAILED",
+        errorCode: typeof failed.code === "string" ? failed.code : null,
+        exitStatus: typeof failed.status === "number" ? failed.status : null,
+      },
+    };
   }
   const entries: LsofEntry[] = [];
   let fd = "";
@@ -180,7 +267,7 @@ const lsofEntries = (pid: number): LsofEntry[] => {
     if (tag === "i") { inode = value; continue; }
     if (tag === "n") entries.push({ fd, type, name: value, device, inode });
   }
-  return entries;
+  return { ok: true, entries };
 };
 
 const psField = (pid: number, field: string): string | null => {
@@ -204,14 +291,26 @@ const psField = (pid: number, field: string): string | null => {
  * Linux exposes the live cwd directly; everywhere else (this deployment runs on Darwin) falls
  * back to lsof's own `cwd` file descriptor, which the kernel — not a later filesystem lookup —
  * populated at the time the descriptor was opened.
+ *
+ * Returns the two facts separately, because they answer different questions. `cwd` is a directory
+ * this function actually observed. `probeFailure` is non-null only when the scan that would have
+ * read it could not run at all, and it is the evidence the refusal needs in order to say so. A
+ * `cwd` of `null` with a `null` `probeFailure` is the third state — the scan ran and reported no
+ * `cwd` descriptor — and it is still not an observation of a *different* directory. No caller may
+ * read a `null` `cwd` as a mismatch, whichever of the two produced it.
  */
-const resolveProcessCwd = (pid: number): string | null => {
+const resolveProcessCwd = (pid: number): { cwd: string | null; probeFailure: LsofProbeFailure | null } => {
   try {
-    return realpathSync(`/proc/${pid}/cwd`);
+    return { cwd: realpathSync(`/proc/${pid}/cwd`), probeFailure: null };
   } catch {
     /* not Linux, or the process is gone; fall through to lsof */
   }
-  return lsofEntries(pid).find((entry) => entry.fd === "cwd" && entry.type === "DIR")?.name ?? null;
+  const scan = lsofEntries(pid);
+  if (!scan.ok) return { cwd: null, probeFailure: scan.failure };
+  return {
+    cwd: scan.entries.find((entry) => entry.fd === "cwd" && entry.type === "DIR")?.name ?? null,
+    probeFailure: null,
+  };
 };
 
 export const defaultProcessAncestryInspector: ProcessAncestryInspector = {
@@ -221,11 +320,13 @@ export const defaultProcessAncestryInspector: ProcessAncestryInspector = {
     if (ppidRaw === null || command === null) return null;
     const ppid = Number.parseInt(ppidRaw, 10);
     if (!Number.isSafeInteger(ppid)) return null;
+    const workdir = resolveProcessCwd(pid);
     return {
       pid,
       ppid,
       command,
-      cwd: resolveProcessCwd(pid),
+      cwd: workdir.cwd,
+      cwdProbeFailure: workdir.probeFailure,
       startedAt: readProcessStartToken(pid),
       argv: readProcessArgv(pid),
     };
@@ -338,7 +439,10 @@ export interface DerivedClaimantIdentity {
   pid: number;
   ppid: number;
   startedAt: string | null;
+  /** Observed, or `null` for "not observed" — never "observed to be something else". */
   cwd: string | null;
+  /** Carried through from the snapshot so a refusal can say the probe failed, and how. */
+  cwdProbeFailure: LsofProbeFailure | null;
   argv: readonly string[];
   sessionUuid: string;
 }
@@ -402,6 +506,7 @@ export const deriveClaimantIdentity = (
         ppid: snapshot.ppid,
         startedAt: snapshot.startedAt,
         cwd: snapshot.cwd,
+        cwdProbeFailure: snapshot.cwdProbeFailure,
         argv: snapshot.argv,
         sessionUuid,
       });
@@ -433,8 +538,27 @@ export interface ExecutingImageEvidence {
   sha256: string;
 }
 
+/**
+ * The scan that would have named the executing image could not run. Distinguished from `null` for
+ * the same reason `cwd` is (#834): `null` means the image was looked at and is not one this
+ * deployment can accept, and this means nobody looked. The one-key shape is the discriminator —
+ * `ExecutingImageEvidence` never carries `probeFailure`.
+ */
+export interface ExecutingImageProbeFailure {
+  probeFailure: LsofProbeFailure;
+}
+
+export const isExecutingImageProbeFailure = (
+  resolution: ExecutingImageEvidence | ExecutingImageProbeFailure | null,
+): resolution is ExecutingImageProbeFailure => resolution !== null && "probeFailure" in resolution;
+
 export interface ExecutingImageInspector {
-  resolve(pid: number): ExecutingImageEvidence | null;
+  /**
+   * The image, `null` when the scan ran and produced no usable image, or a probe failure when the
+   * scan itself could not run. An implementation that cannot fail its probe may keep returning
+   * only the first two — the union is wider than what it produces, not narrower.
+   */
+  resolve(pid: number): ExecutingImageEvidence | ExecutingImageProbeFailure | null;
 }
 
 /**
@@ -559,7 +683,13 @@ export const defaultExecutingImageInspector: ExecutingImageInspector = {
     // Darwin (and any other platform lsof can answer for): one lsof scan is the single source for
     // both the reported path and the device+inode `fstat` verifies the opened FD against — two
     // separate scans could each see a different reality if a path were swapped in between them.
-    const entry = lsofEntries(pid).find((candidate) => candidate.fd === "txt" && candidate.type === "REG");
+    const scan = lsofEntries(pid);
+    // The image resolution has exactly one channel on this platform, and a channel that did not
+    // run says nothing about the image that would have come back through it. This is the same
+    // `lsof` scan the cwd lookup uses and it fails the same two ways — a timeout, or an
+    // unreachable lsof — so it is reported the same way rather than collapsed into `null`.
+    if (!scan.ok) return { probeFailure: scan.failure };
+    const entry = scan.entries.find((candidate) => candidate.fd === "txt" && candidate.type === "REG");
     if (!entry) return null;
     const imagePath = entry.name;
     const version = versionFromImagePath(imagePath);
@@ -924,8 +1054,28 @@ export class CanonicalSelfClaim {
         { pid: identity.pid },
       );
     }
-    // Clause 2 — cwd.
-    if (identity.cwd === null || identity.cwd !== this.config.expectedCwd) {
+    // Clause 2 — cwd. A probe that could not run is not a value that did not match (#834).
+    //
+    // These two refusals deny identically — nothing is admitted here that was refused before, and
+    // nothing that was admitted is now refused. What changes is which fact the operator is told,
+    // and that is the whole repair: the daemon's claim socket puts only the `reasonCode` on the
+    // wire (`publicClaimResponse`, src/daemon/canonical-self-claim-listener.ts), so a probe
+    // failure arriving as `CONFLICT` is indistinguishable from a genuinely wrong workdir, and it
+    // sends the operator to check a directory that was already correct. It cost most of a day.
+    //
+    // `null` here covers both shapes of "not observed": the scan could not run (`cwdProbeFailure`
+    // is non-null and names the timeout or the OS error), or it ran and reported no `cwd`
+    // descriptor (`cwdProbeFailure` is null). Neither is an observation of a different directory,
+    // so neither may be reported as one — the same distinction `CONTRACT_UNVERIFIED` draws for a
+    // pinned contract that could not be produced to compare (#448).
+    if (identity.cwd === null) {
+      return deny(
+        ReasonCode.PROBE_FAILED,
+        "the claude ancestor's working directory could not be read, so this says nothing about whether it is the canonical workdir",
+        { pid: identity.pid, probe: "lsof", probeFailure: identity.cwdProbeFailure },
+      );
+    }
+    if (identity.cwd !== this.config.expectedCwd) {
       return deny(
         ReasonCode.CONFLICT,
         "the claude ancestor's working directory does not match the expected canonical workdir",
@@ -943,6 +1093,18 @@ export class CanonicalSelfClaim {
     // Clause 2 — target version exactly the configured required executor version, from the
     // executing image.
     const image = this.#imageInspector.resolve(identity.pid);
+    // The second consumer of the same scan, and the same distinction (#834). On Darwin the
+    // executing image is reached only through `lsof`, so an lsof that times out or is missing
+    // from the daemon's PATH resolves every image to nothing — which used to refuse a genuine
+    // claim as `CONFLICT`, the exact wrong-direction diagnosis the PATH row in
+    // `scripts/falsifiability-cases/` already names as this deployment's recurring shape.
+    if (isExecutingImageProbeFailure(image)) {
+      return deny(
+        ReasonCode.PROBE_FAILED,
+        "the claude ancestor's executing image could not be scanned, so this says nothing about which image it is",
+        { pid: identity.pid, probe: "lsof", probeFailure: image.probeFailure },
+      );
+    }
     if (!image) {
       return deny(
         ReasonCode.CONFLICT,

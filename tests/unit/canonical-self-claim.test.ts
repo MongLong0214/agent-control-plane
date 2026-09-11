@@ -30,9 +30,11 @@ import {
   extractSessionUuidFromArgv,
   isInteractiveClaudeInvocation,
   looksLikeClaudeInvocation,
+  lsofScanArgv,
   type CanonicalSelfClaimConfig,
   type CanonicalSelfClaimRequest,
   type ExecutingImageInspector,
+  type LsofProbeFailure,
   type ProcessAncestryInspector,
   type ProcessSnapshot,
   type TranscriptReader,
@@ -106,6 +108,7 @@ const claudeAncestor = (overrides: Partial<ProcessSnapshot> = {}, sessionUuid = 
   argv: ["/opt/claude/claude", "--session-id", sessionUuid],
   command: `/opt/claude/claude --session-id ${sessionUuid}`,
   cwd: CWD,
+  cwdProbeFailure: null,
   startedAt: "Fri Jan  1 00:00:00 2027",
   ...overrides,
 });
@@ -117,9 +120,11 @@ const standardChain = (overrides: Partial<ProcessSnapshot> = {}, sessionUuid = C
     argv: ["/usr/bin/node", "/opt/acp/mcp-server.js"],
     command: "/usr/bin/node /opt/acp/mcp-server.js",
     cwd: CWD,
+    cwdProbeFailure: null,
     startedAt: "t1",
   },
-  { pid: 50, ppid: 10, argv: ["/bin/zsh", "-c", "foo"], command: "/bin/zsh -c foo", cwd: CWD, startedAt: "t2" },
+  { pid: 50, ppid: 10, argv: ["/bin/zsh", "-c", "foo"], command: "/bin/zsh -c foo", cwd: CWD,
+    cwdProbeFailure: null, startedAt: "t2" },
   claudeAncestor(overrides, sessionUuid),
 ];
 
@@ -129,6 +134,20 @@ const fakeImageInspector = (
   sha256 = TEST_EXPECTED_EXECUTOR_SHA256,
 ): ExecutingImageInspector => ({
   resolve: () => ({ imagePath, version, sha256 }),
+});
+
+/** The #834 signature: a scan killed by its own timeout, so it read nothing about the process. */
+const TIMED_OUT_SCAN: LsofProbeFailure = {
+  pid: 10,
+  timeoutMs: 5_000,
+  kind: "TIMED_OUT",
+  errorCode: null,
+  exitStatus: null,
+};
+
+/** An inspector whose one channel to the image — the lsof scan — never ran. */
+const unscannableImageInspector = (): ExecutingImageInspector => ({
+  resolve: () => ({ probeFailure: TIMED_OUT_SCAN }),
 });
 
 const fakeTranscriptReader = (present = true): TranscriptReader => ({
@@ -563,9 +582,11 @@ describe("pure identity-derivation helpers", () => {
           argv: ["/usr/bin/node", "/opt/acp/mcp-server.js"],
           command: "/usr/bin/node /opt/acp/mcp-server.js",
           cwd: CWD,
+          cwdProbeFailure: null,
           startedAt: "t1",
         },
-        { pid: 50, ppid: 1, argv: ["/bin/zsh", "-c", "foo"], command: "/bin/zsh -c foo", cwd: CWD, startedAt: "t2" },
+        { pid: 50, ppid: 1, argv: ["/bin/zsh", "-c", "foo"], command: "/bin/zsh -c foo", cwd: CWD,
+          cwdProbeFailure: null, startedAt: "t2" },
       ]),
     );
     expect(withoutClaude.allowed).toBe(false);
@@ -581,6 +602,7 @@ describe("pure identity-derivation helpers", () => {
           argv: ["/usr/local/bin/claude", "--print", "hi"],
           command: "/usr/local/bin/claude --print hi",
           cwd: CWD,
+          cwdProbeFailure: null,
           startedAt: "t1",
         },
       ]),
@@ -592,7 +614,8 @@ describe("pure identity-derivation helpers", () => {
     const cyclic = deriveClaimantIdentity(
       100,
       chainInspector([
-        { pid: 100, ppid: 100, argv: ["/usr/bin/node", "x.js"], command: "/usr/bin/node x.js", cwd: CWD, startedAt: "t1" },
+        { pid: 100, ppid: 100, argv: ["/usr/bin/node", "x.js"], command: "/usr/bin/node x.js", cwd: CWD,
+          cwdProbeFailure: null, startedAt: "t1" },
       ]),
     );
     expect(cyclic.allowed).toBe(false);
@@ -603,7 +626,8 @@ describe("pure identity-derivation helpers", () => {
   it("a hop whose argv is unavailable refuses immediately, rather than being silently treated as 'not claude' and climbed past", () => {
     const unavailable = deriveClaimantIdentity(
       100,
-      chainInspector([{ pid: 100, ppid: 1, argv: null, command: "/opt/claude/claude --session-id " + CANON, cwd: CWD, startedAt: "t1" }]),
+      chainInspector([{ pid: 100, ppid: 1, argv: null, command: "/opt/claude/claude --session-id " + CANON,
+        cwd: CWD, cwdProbeFailure: null, startedAt: "t1" }]),
     );
     expect(unavailable.allowed, JSON.stringify(unavailable)).toBe(false);
     if (unavailable.allowed) throw new Error("unreachable");
@@ -951,6 +975,78 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(result.message).toContain("working directory does not match");
     expect(rowCounts(core)).toEqual(before);
   });
+
+  it(
+    "clause 2 — a working directory the probe never read refuses as a failed probe, not as a mismatch",
+    async () => {
+      // #834, measured on the live deployment: `lsof -p <pid> -FfptDin` without `-n` does reverse
+      // DNS on every IPv4 socket the claimant holds. Against the real canonical claude process
+      // (53 descriptors, 7 of them IPv4) that scan took 30.07s, three runs, consistent, against a
+      // `SUBPROCESS_TIMEOUT_MS` of 5_000. The scan was killed, `lsofEntries` returned `[]`, the
+      // cwd resolved to null, and the claim refused with "the claude ancestor's working directory
+      // does not match the expected canonical workdir" — while `lsof -a -p <pid> -d cwd` reported
+      // exactly the configured `expectedCwd`. The directory matched; the probe that would have
+      // read it never ran, and the refusal named the wrong thing.
+      //
+      // A null cwd is what a probe that produced no answer looks like at this seam. It is not an
+      // observation of a different directory, and it must not be reported as one.
+      const core = makeCore();
+      const projectId = "prj_cwd_probe_failed";
+      insertProject(core, projectId);
+      const subject = makeSubject(core, { chain: standardChain({ cwd: null }) });
+      const request = baseRequest(core, projectId);
+      const before = rowCounts(core);
+      const result = await subject.claim(request);
+
+      expect(result.allowed).toBe(false);
+      if (result.allowed) return;
+      expect(result.reasonCode).toBe(ReasonCode.PROBE_FAILED);
+      expect(result.message).toContain("working directory could not be read");
+      expect(result.message).not.toContain("does not match");
+      expect(result.evidence).toMatchObject({ pid: 10 });
+      expect(rowCounts(core)).toEqual(before);
+    },
+  );
+
+  it(
+    "the lsof scan asks for numeric names, so a claimant's sockets cannot stall it past its own timeout",
+    () => {
+      // Asserted on the argv the module passes, never on how long a scan takes. A timing
+      // assertion here would be flaky on a machine with no network entries to resolve, and it
+      // would not say which flag it is about when it failed.
+      //
+      // The fields requested are `f p t D i n` — fd, pid, type, device, inode, and lsof's *name*
+      // field. The only two entries this module reads are the `cwd` DIR entry and the `txt` REG
+      // entry, whose name field is a filesystem path; `-n`/`-P` change nothing about those. They
+      // suppress hostname and port-name resolution on the network entries nothing here consults,
+      // which is the 30.07s → 0.05s the canonical claim's cwd lookup was losing.
+      expect(lsofScanArgv(22828)).toEqual(["-n", "-P", "-p", "22828", "-FfptDin"]);
+    },
+  );
+
+  it(
+    "clause 2 — an executing image the scan never reached refuses as a failed probe, not as a conflict",
+    async () => {
+      // The second consumer of the same scan. On Darwin `lsof` is the only channel to the
+      // executing image, so a timed-out or unreachable lsof resolves every image to nothing —
+      // and that used to refuse a genuine canonical claim as CONFLICT, telling the operator the
+      // running binary was wrong when nothing had looked at it.
+      const core = makeCore();
+      const projectId = "prj_image_probe_failed";
+      insertProject(core, projectId);
+      const subject = makeSubject(core, { imageInspector: unscannableImageInspector() });
+      const request = baseRequest(core, projectId);
+      const before = rowCounts(core);
+      const result = await subject.claim(request);
+
+      expect(result.allowed).toBe(false);
+      if (result.allowed) return;
+      expect(result.reasonCode).toBe(ReasonCode.PROBE_FAILED);
+      expect(result.message).toContain("executing image could not be scanned");
+      expect(result.evidence).toMatchObject({ pid: 10, probe: "lsof", probeFailure: TIMED_OUT_SCAN });
+      expect(rowCounts(core)).toEqual(before);
+    },
+  );
 
   it("clause 2 — peer protocol version must match the deployment's expectation", async () => {
     const core = makeCore();
