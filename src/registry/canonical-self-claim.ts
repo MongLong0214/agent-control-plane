@@ -1282,6 +1282,18 @@ export class CanonicalSelfClaim {
    * declared a live incumbent gone and let a challenger take the role. The doc was right and the
    * code did the opposite of it.
    *
+   * **This also moves where existence is decided, and that is a second behaviour change.** The old
+   * branch judged existence from `ps` (the ancestry snapshot); this one judges it from
+   * `kill(pid, 0)`. Measured across every combination of `(pid, recorded token, snapshot answer,
+   * signal answer)`, the two disagree in 23 of 128 — 21 of them the fail-closed direction this
+   * change is for, and **two the other way**: when the kernel says `ESRCH` while `ps` still shows
+   * the process, the old code refused and this one evicts. `probeSessionLiveness` signals first
+   * and returns `DEAD` on `ESRCH` before the start-token probe runs at all, so the snapshot's
+   * answer stops mattering. That is the right authority — `kill` asks the kernel now, `ps` output
+   * can be older — but it is a widening, and a reader comparing this to the old branch should not
+   * have to rediscover it. `EPERM` stays `ALIVE`, which is the case where a live process cannot be
+   * signalled, and both versions refuse there.
+   *
    * `probeSessionLiveness` (`../daemon/dead-binding-recovery.ts`) already answers exactly this
    * question in three values for exactly this reason — its own comment says `EPERM` "means the pid
    * exists and belongs to someone else, and reading that as dead would let a live incumbent be
