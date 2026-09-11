@@ -121,7 +121,7 @@ describe("role attachment authorization without sockets", () => {
       }, {
         processInspector: { snapshot: (pid) => pid === 10 ? {
           pid: 10, ppid: 1, argv: ["/fake/claude", "--session-id", uuid], command: "fixture",
-          cwd: "/fake/work", startedAt: "fixture-start",
+          cwd: "/fake/work", cwdProbeFailure: null, startedAt: "fixture-start",
         } : null },
         imageInspector: { resolve: () => ({ imagePath: "/fake/claude", version: "0.0.0-test", sha256: `sha256:${"0".repeat(64)}` }) },
         transcriptReader: { locate: () => ({ path: "/fake/transcript", sizeBytes: 1 }) },

@@ -23,9 +23,26 @@ import {
   defaultProcessAncestryInspector,
   deriveClaimantIdentity,
   extractSessionUuidFromArgv,
+  isExecutingImageProbeFailure,
   looksLikeClaudeInvocation,
   makeDefaultTranscriptReader,
+  type ExecutingImageEvidence,
 } from "../../src/registry/canonical-self-claim.ts";
+
+/**
+ * The real inspector reports three outcomes; every test below is about the two that describe the
+ * image the OS actually loaded. The third — a scan that could not run at all (#834) — is a fault
+ * in this harness's own environment rather than a statement about any image, so it is raised here
+ * instead of narrowed away: folding it into `null` would let a machine with no reachable `lsof`
+ * report every one of these tests as having observed "no image".
+ */
+const resolvedImage = (pid: number): ExecutingImageEvidence | null => {
+  const resolution = defaultExecutingImageInspector.resolve(pid);
+  if (isExecutingImageProbeFailure(resolution)) {
+    throw new Error(`the lsof scan for pid ${pid} could not run: ${JSON.stringify(resolution.probeFailure)}`);
+  }
+  return resolution;
+};
 
 /** Synthetic — never a value that names a real deployment's version. */
 const TEST_REQUIRED_EXECUTOR_VERSION = "9.0.0-test";
@@ -225,6 +242,10 @@ describe("real process ancestry — ps-backed, not a fake", () => {
     // resolved path, so the comparison side has to be resolved the same way rather than compared
     // against the unresolved `tmpdir()`-based root.
     expect(snapshot!.cwd).toBe(realpathSync(root));
+    // The positive control for #834's repair: the scan genuinely ran. Without this, a `cwd` that
+    // matched could never be told apart from a `cwd` the probe failed to read — which is the
+    // whole defect, and it is also what a broken `-n`/`-P` field parse would look like here.
+    expect(snapshot!.cwdProbeFailure).toBeNull();
   });
 
   it(
@@ -373,10 +394,10 @@ describe("real executing-image resolution — symlink and image can diverge", ()
       const child = spawnHeld(executable, [], root);
       await waitUntil(() => child.pid !== undefined, "child pid to be assigned");
 
-      let image = defaultExecutingImageInspector.resolve(child.pid!);
+      let image = resolvedImage(child.pid!);
       for (let attempt = 0; !image && attempt < 40; attempt += 1) {
         await new Promise((resolve) => setTimeout(resolve, 25));
-        image = defaultExecutingImageInspector.resolve(child.pid!);
+        image = resolvedImage(child.pid!);
       }
 
       expect(image, "the filename-layout executing image could not be resolved").not.toBeNull();
@@ -401,10 +422,10 @@ describe("real executing-image resolution — symlink and image can diverge", ()
       await waitUntil(() => child.pid !== undefined, "child pid to be assigned");
       const pid = child.pid!;
 
-      let before = defaultExecutingImageInspector.resolve(pid);
+      let before = resolvedImage(pid);
       for (let attempt = 0; !before && attempt < 40; attempt += 1) {
         await new Promise((resolve) => setTimeout(resolve, 25));
-        before = defaultExecutingImageInspector.resolve(pid);
+        before = resolvedImage(pid);
       }
       expect(before, "the executing image could not be resolved before the repoint").not.toBeNull();
       expect(before!.version).toBe(SYMLINK_TEST_VERSION_REAL);
@@ -413,7 +434,7 @@ describe("real executing-image resolution — symlink and image can diverge", ()
       unlinkSync(launchPath);
       symlinkSync(decoyExecutable, launchPath);
 
-      const after = defaultExecutingImageInspector.resolve(pid);
+      const after = resolvedImage(pid);
       expect(after, "the executing image could not be resolved after the repoint").not.toBeNull();
       // The property under test: still the real version, the image this pid actually loaded —
       // not the decoy the symlink now points at.
@@ -438,10 +459,10 @@ describe("real executing-image resolution — symlink and image can diverge", ()
       await waitUntil(() => child.pid !== undefined, "child pid to be assigned");
       const pid = child.pid!;
 
-      let before = defaultExecutingImageInspector.resolve(pid);
+      let before = resolvedImage(pid);
       for (let attempt = 0; !before && attempt < 40; attempt += 1) {
         await new Promise((resolve) => setTimeout(resolve, 25));
-        before = defaultExecutingImageInspector.resolve(pid);
+        before = resolvedImage(pid);
       }
       expect(before, "the executing image could not be resolved before the swap").not.toBeNull();
 
@@ -460,7 +481,7 @@ describe("real executing-image resolution — symlink and image can diverge", ()
       writeFileSync(decoyPath, "not the real image");
       renameSync(decoyPath, before!.imagePath);
 
-      const after = defaultExecutingImageInspector.resolve(pid);
+      const after = resolvedImage(pid);
       if (process.platform === "linux") {
         // `/proc/<pid>/exe` is a magic symlink the kernel resolves to the live mapped image at
         // `open()` time — it never re-reads the swapped path at all, so resolution on this
@@ -494,10 +515,10 @@ describe("real executing-image resolution — symlink and image can diverge", ()
     const child = spawnHeld(claude, [], root);
     await waitUntil(() => child.pid !== undefined, "child pid to be assigned");
 
-    let image = defaultExecutingImageInspector.resolve(child.pid!);
+    let image = resolvedImage(child.pid!);
     for (let attempt = 0; !image && attempt < 40; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 25));
-      image = defaultExecutingImageInspector.resolve(child.pid!);
+      image = resolvedImage(child.pid!);
     }
     expect(image, "the executing image could not be resolved").not.toBeNull();
     expect(image!.version).toBe(SYMLINK_TEST_VERSION_REAL);
@@ -510,10 +531,10 @@ describe("real executing-image resolution — symlink and image can diverge", ()
     const child = spawnHeld(claude, [], root);
     await waitUntil(() => child.pid !== undefined, "child pid to be assigned");
 
-    let image = defaultExecutingImageInspector.resolve(child.pid!);
+    let image = resolvedImage(child.pid!);
     for (let attempt = 0; !image && attempt < 40; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 25));
-      image = defaultExecutingImageInspector.resolve(child.pid!);
+      image = resolvedImage(child.pid!);
     }
     expect(image).not.toBeNull();
     expect(image!.version).toBe(TEST_REQUIRED_EXECUTOR_VERSION);
