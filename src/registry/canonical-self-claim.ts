@@ -1052,6 +1052,33 @@ export class CanonicalSelfClaim {
     return allow(ReasonCode.OK, true);
   }
 
+  /**
+   * Whether the predecessor session's *process* is provably gone — not whether its row says so.
+   *
+   * A `sessions.lifecycle` is a record this daemon wrote; a process's liveness is a fact the
+   * kernel holds. Nothing transitions a row when its runtime dies, so a READY row routinely
+   * outlives the process it names (`doctor` reports exactly this as `SESSION_PROCESS_MISSING`,
+   * blocking, and has no way to act on it). Same-live recovery is about a *live* actor replacing
+   * its own revoked attachment, so it must be entered on the process fact, never on the row.
+   *
+   * The pin is the same `(osPid, native start token)` pair the rest of this file uses to name one
+   * OS process, read through the same `#processInspector` seam `deriveClaimantIdentity` and
+   * `#assertClaimantStillLive` use — never a raw kernel call, so a test with a synthetic ancestry
+   * is answered by that same fake.
+   *
+   * "Unknown" is never "gone". An unrecorded pair, or a pid that exists but whose start token
+   * cannot be read, both return `false` and leave the strict same-live branch engaged: widening
+   * this from "proven dead" to "not proven alive" is the single edit that would turn recovery into
+   * eviction of a live holder whose probe merely failed.
+   */
+  #predecessorProcessIsGone(osPid: number | null, osProcessStartedAt: string | null): boolean {
+    if (osPid === null || osProcessStartedAt === null) return false;
+    const observed = this.#processInspector.snapshot(osPid);
+    if (observed === null) return true;
+    if (observed.startedAt === null) return false;
+    return observed.startedAt !== osProcessStartedAt;
+  }
+
   #mutate(
     request: CanonicalSelfClaimRequest,
     identity: DerivedClaimantIdentity,
@@ -1103,7 +1130,29 @@ export class CanonicalSelfClaim {
       );
       const predecessor = incumbent ? this.sessions.get(incumbent.current_session_id) : null;
       let predecessorSessionId: string | null = null;
-      if (incumbent && predecessor &&
+      /**
+       * The #831 path. Non-null only when the predecessor row is non-terminal while its process is
+       * measurably gone: the row is reconciled to the fact, it is not replaced in place, and this
+       * claim adopts nothing from it.
+       */
+      let abandonedRuntimeSessionId: string | null = null;
+      // Liveness of a row is not liveness of a process (#831). This branch's subject is a *live*
+      // runtime replacing its own revoked attachment, so a predecessor whose recorded
+      // `(osPid, start token)` pair no longer resolves to a running process is not its case at
+      // all, and a rule about a live actor must not answer for an actor that no longer exists.
+      const predecessorRuntimeIsGone = predecessor !== null &&
+        this.#predecessorProcessIsGone(predecessor.osPid, predecessor.osProcessStartedAt);
+      if (incumbent && predecessor && predecessorRuntimeIsGone &&
+          predecessor.lifecycle !== SessionLifecycle.STOPPED && predecessor.lifecycle !== SessionLifecycle.ERROR) {
+        // Falling through alone does not reach the ordinary claim: `sessions_buzz_actor` is a
+        // partial unique index over *live* rows, so a dead runtime left at READY keeps the
+        // canonical Buzz identity and the ordinary claim below dies at `bindBuzzActor` with
+        // SESSION_BUZZ_ACTOR_ALREADY_BOUND instead of CONFLICT — measured, same refusal, different
+        // code. The restore path this claim then takes states the same precondition (a genuine
+        // restart leaves the old session terminal), so the row is reconciled to the process fact
+        // below, inside this transaction, and rolls back with everything else if anything denies.
+        abandonedRuntimeSessionId = predecessor.sessionId;
+      } else if (incumbent && predecessor &&
           predecessor.lifecycle !== SessionLifecycle.STOPPED && predecessor.lifecycle !== SessionLifecycle.ERROR) {
         const active = this.db.get(
           `SELECT 1 FROM assignments a JOIN conversational_actors c ON c.actor_id = a.actor_id
@@ -1155,6 +1204,11 @@ export class CanonicalSelfClaim {
       // against a different candidate — both re-checked here for a non-run operation.
       const consumed = this.ownerAuthority.consumeApproval(request.ownerApproval, null);
       if (!consumed.allowed) return consumed as Decision<CanonicalSelfClaimReceipt>;
+      if (abandonedRuntimeSessionId !== null) {
+        const reconciled = this.sessions.transition(abandonedRuntimeSessionId, SessionLifecycle.STOPPED,
+          `canonical predecessor runtime is gone; row reconciled before generation ${nextGeneration}`);
+        if (!reconciled.allowed) return reconciled as Decision<CanonicalSelfClaimReceipt>;
+      }
       if (predecessorSessionId !== null) {
         const stopped = this.sessions.transition(predecessorSessionId, SessionLifecycle.STOPPED,
           `canonical same-live successor generation ${nextGeneration}`);
