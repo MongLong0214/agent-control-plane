@@ -31,6 +31,7 @@ import {
   isInteractiveClaudeInvocation,
   looksLikeClaudeInvocation,
   lsofScanArgv,
+  probeFailureKind,
   type CanonicalSelfClaimConfig,
   type CanonicalSelfClaimRequest,
   type ExecutingImageInspector,
@@ -1021,6 +1022,48 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       // suppress hostname and port-name resolution on the network entries nothing here consults,
       // which is the 30.07s → 0.05s the canonical claim's cwd lookup was losing.
       expect(lsofScanArgv(22828)).toEqual(["-n", "-P", "-p", "22828", "-FfptDin"]);
+    },
+  );
+
+  it(
+    "a probe killed by its own budget classifies as TIMED_OUT, and an exit status does not",
+    () => {
+      // The subject is the shape of the error object, not the speed of any scan, so this needs no
+      // clock and no child. 239aa3d ruled out pinning a real scan with a timing assertion — flaky
+      // on a host with nothing to resolve, and a failure would say "slow" rather than name the
+      // defect — and that reasoning is why the classifier is a separate function to begin with.
+      expect(probeFailureKind({ code: "ETIMEDOUT" })).toBe("TIMED_OUT");
+      expect(probeFailureKind({ code: "ENOENT" })).toBe("SCAN_FAILED");
+      expect(probeFailureKind({})).toBe("SCAN_FAILED");
+
+      // The field the branch used to test. `killed` decides nothing now, and asserting that is the
+      // point: a future edit that reinstates it would pass every other row in this file (#838).
+      expect(probeFailureKind({ killed: true } as { code?: unknown })).toBe("SCAN_FAILED");
+    },
+  );
+
+  it(
+    "execFileSync reports a timeout as ETIMEDOUT and never sets killed",
+    () => {
+      // The assumption the classifier rests on, pinned against the library rather than restated in
+      // a comment. This is the exact thing that was wrong: the previous code asserted in prose that
+      // `execFileSync` sets `killed` on a timeout, so `TIMED_OUT` was unreachable on every path and
+      // a review that read the justification found a reason rather than a bug.
+      //
+      // Not a timing assertion. `sleep 5` against a 200ms budget is a 25x margin, so a slow host
+      // cannot flip it, and neither lsof nor name resolution is involved. It fails only if Node
+      // changes which fields it puts on the error — which is precisely when the classifier breaks.
+      let thrown: { killed?: unknown; code?: unknown; signal?: unknown } | null = null;
+      try {
+        execFileSync("sleep", ["5"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 200 });
+      } catch (error) {
+        thrown = error as { killed?: unknown; code?: unknown; signal?: unknown };
+      }
+
+      expect(thrown).not.toBeNull();
+      expect(thrown?.code).toBe("ETIMEDOUT");
+      expect(thrown?.killed).toBeUndefined();
+      expect(probeFailureKind(thrown ?? {})).toBe("TIMED_OUT");
     },
   );
 
