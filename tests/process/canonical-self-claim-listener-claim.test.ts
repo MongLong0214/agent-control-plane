@@ -1,6 +1,19 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  copyFileSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { OPERATOR_METHOD, type Daemon } from "../../src/daemon/daemon.ts";
@@ -90,25 +103,87 @@ const tempRoot = (): string => {
   return dir;
 };
 
-const cloneExecutable = (dest: string): void => {
-  mkdirSync(join(dest, ".."), { recursive: true });
+const nodeImage = statSync(process.execPath);
+
+/**
+ * Where the "claude" executable images live: **outside** every per-test temp root, so they
+ * survive `afterEach` and the run itself, and keyed by the identity of the node build they were
+ * copied from, so a node upgrade gets its own set rather than silently reusing the old bytes.
+ * Deliberately the same root, and the same `9.0.0-test` image, that
+ * `canonical-self-claim-identity.test.ts` builds — Vitest's `pool: "forks"` runs the two files in
+ * separate processes, and neither should pay for the other's copy.
+ */
+const IMAGE_FIXTURE_ROOT = join(
+  tmpdir(),
+  `acp-exec-image-fixtures-${createHash("sha256")
+    .update(`${nodeImage.dev}:${nodeImage.ino}:${nodeImage.mtimeMs}:${nodeImage.size}`)
+    .digest("hex")
+    .slice(0, 16)}`,
+);
+
+/**
+ * A copy-on-write clone of the running node binary where the filesystem supports one (APFS via
+ * `cp -c`, btrfs/xfs via `cp --reflink`), a full byte copy where it does not — about *disk*
+ * only. The new inode carries its own signature assessment either way, which is what
+ * `writeVersionedClaude` below exists to stop paying repeatedly.
+ */
+const copyToStaging = (staging: string): void => {
   try {
-    execFileSync("cp", ["-c", process.execPath, dest], { stdio: "ignore" });
+    execFileSync("cp", ["-c", process.execPath, staging], { stdio: "ignore" });
     return;
   } catch { /* not APFS */ }
   try {
-    execFileSync("cp", ["--reflink=auto", process.execPath, dest], { stdio: "ignore" });
+    execFileSync("cp", ["--reflink=auto", process.execPath, staging], { stdio: "ignore" });
     return;
   } catch { /* no reflink */ }
-  execFileSync("cp", [process.execPath, dest]);
+  copyFileSync(process.execPath, staging);
 };
 
-const writeVersionedClaude = (versionsRoot: string, version: string): string => {
-  const dir = join(versionsRoot, version);
-  mkdirSync(dir, { recursive: true });
-  const executable = join(dir, "claude");
-  cloneExecutable(executable);
-  writeFileSync(join(dir, "package.json"), JSON.stringify({ version }));
+/**
+ * A real "claude"-shaped executable — a copy of the running node binary — at a **stable, reused**
+ * path, created the first time this version is asked for and handed straight back on every later
+ * call, in this run and in every later one.
+ *
+ * The reuse is the point, and it is a Gatekeeper cost. macOS assesses an executable's code
+ * signature once per *inode*, at that inode's first exec, and caches the verdict against it:
+ * measured on this machine against `process.execPath` (a ~113MB universal Mach-O), the first exec
+ * of a freshly created copy costs ~1.6s of `syspolicyd` work and every later exec of that same
+ * file ~0.02s. This helper used to clone a fresh file — a fresh inode — for every claim, so one
+ * run of this file paid that assessment eight times over; enough of that load wedges `syspolicyd`
+ * machine-wide (#817).
+ *
+ * A hardlink cannot replace the copy: `lsof` reports an inode's *primary* link, so a second link
+ * to the real node binary is reported at the real node binary's own path, where the version this
+ * whole file turns on — the `/versions/<version>/` segment — does not appear at all. Measured on
+ * this machine, not assumed.
+ *
+ * Published by cloning to a private staging path and `link()`ing that into place, so the
+ * destination never exists half-written and is never replaced under a process already executing
+ * it — the hazard `depsFor` below used to have to work around by hand.
+ */
+const writeVersionedClaude = (version: string): string => {
+  const executable = join(IMAGE_FIXTURE_ROOT, "versions", version, "claude");
+  mkdirSync(dirname(executable), { recursive: true });
+  let usable = false;
+  try {
+    // Anything of the right size here is a previous run's copy of this same node build — the root
+    // is keyed by that build — so it is reused as is.
+    usable = statSync(executable).size === nodeImage.size;
+    if (!usable) unlinkSync(executable);
+  } catch {
+    /* nothing there yet */
+  }
+  if (!usable) {
+    const staging = `${executable}.staging-${process.pid}-${randomUUID()}`;
+    copyToStaging(staging);
+    try {
+      linkSync(staging, executable);
+    } catch {
+      /* a concurrent fork published first; its file is the one every reader now sees */
+    }
+    unlinkSync(staging);
+  }
+  writeFileSync(join(dirname(executable), "package.json"), JSON.stringify({ version }));
   return executable;
 };
 
@@ -181,7 +256,7 @@ const claimAsRealClaudeProcess = (
   requestBody: Record<string, unknown>,
   sessionUuid: string = TEST_SESSION_UUID,
 ): Promise<Decision<unknown>> => {
-  const claude = writeVersionedClaude(join(root, "versions"), TEST_REQUIRED_EXECUTOR_VERSION);
+  const claude = writeVersionedClaude(TEST_REQUIRED_EXECUTOR_VERSION);
   writeTranscriptFixture(root, sessionUuid);
   const child = spawnAndSendOneRequest(claude, socketPath, ["--session-id", sessionUuid], root, requestBody);
   return waitForClaimResult(child);
@@ -309,18 +384,14 @@ const depsFor = (
   options: { sessionUuid?: string; maxAncestryHops?: number } = {},
 ): CanonicalSelfClaimOperatorDeps => {
   // This runs inside the request handler closure, so it executes on every request — after
-  // `claimAsRealClaudeProcess` has already written this exact fixture and spawned the claiming
-  // process from it. `writeVersionedClaude` clones a fresh file, with a new inode, on every call,
-  // even though the bytes are always identical, so calling it again here would silently replace
-  // the file out from under a process that is already running the earlier inode — exactly the
-  // resolved-path-vs-live-image mismatch clause 2's image check exists to refuse. Only write when
-  // nothing is there yet (the wrong-process test, which never spawns a claude process at all and
-  // so never gets a fixture from elsewhere); otherwise read the file
-  // `claimAsRealClaudeProcess` (or an earlier call to this same function) already put in place.
-  const claudePath = join(root, "versions", TEST_REQUIRED_EXECUTOR_VERSION, "claude");
-  if (!existsSync(claudePath)) {
-    writeVersionedClaude(join(root, "versions"), TEST_REQUIRED_EXECUTOR_VERSION);
-  }
+  // `claimAsRealClaudeProcess` has already asked for this exact fixture and spawned the claiming
+  // process from it. `writeVersionedClaude` returns the *same file* every time rather than a new
+  // inode, so asking again here cannot replace anything out from under a process already running
+  // that image — the resolved-path-vs-live-image mismatch clause 2's image check exists to
+  // refuse. The call is unconditional precisely because it is now idempotent: the wrong-process
+  // test never spawns a claude process at all, and still needs a real path and real bytes to
+  // configure the expectation against.
+  const claudePath = writeVersionedClaude(TEST_REQUIRED_EXECUTOR_VERSION);
   const expectedExecutorRealpath = realpathSync(claudePath);
   const expectedExecutorSha256 = sha256(readFileSync(claudePath));
   return {

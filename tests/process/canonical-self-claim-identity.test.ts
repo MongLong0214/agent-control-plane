@@ -1,18 +1,21 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import {
   copyFileSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
@@ -58,7 +61,8 @@ afterEach(async () => {
       try { process.kill(child.pid, "SIGKILL"); } catch { /* already gone */ }
     }
   }
-  // Give the kernel a moment to reap before the temp root that backed the exec image is removed.
+  // Give the kernel a moment to reap before the temp roots these children ran in are removed.
+  // The exec images themselves live under `IMAGE_FIXTURE_ROOT`, which is never removed.
   await new Promise((resolve) => setTimeout(resolve, 50));
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -69,45 +73,103 @@ const tempRoot = (): string => {
   return dir;
 };
 
+const nodeImage = statSync(process.execPath);
+
 /**
- * A real, independent executable file at `dest` — a clonefile copy of the running node binary
- * where the platform supports it (instant, near-zero cost on APFS/btrfs/xfs), falling back to a
- * plain copy otherwise. Never a symlink: lsof/`/proc` resolve a symlink straight through to its
- * target, so two symlinks to the same node binary would collapse into one indistinguishable
- * image. A clone is a genuinely separate file the kernel maps as its own executing image.
+ * Where the executable images below live: **outside** every per-test temp root, so they survive
+ * `afterEach` and the run itself, and keyed by the identity of the node build they were copied
+ * from, so a node upgrade gets its own set rather than silently reusing the old bytes.
  */
-const cloneExecutable = (dest: string): void => {
-  mkdirSync(join(dest, ".."), { recursive: true });
+const IMAGE_FIXTURE_ROOT = join(
+  tmpdir(),
+  `acp-exec-image-fixtures-${createHash("sha256")
+    .update(`${nodeImage.dev}:${nodeImage.ino}:${nodeImage.mtimeMs}:${nodeImage.size}`)
+    .digest("hex")
+    .slice(0, 16)}`,
+);
+
+/**
+ * A copy-on-write clone of the running node binary where the filesystem supports one (APFS via
+ * `cp -c`, btrfs/xfs via `cp --reflink`), a full byte copy where it does not. This is only about
+ * *disk*: measured here, `cp -c` of the ~113MB node binary costs 12KB and a byte copy costs
+ * 113MB, while `fs.copyFileSync`'s own `COPYFILE_FICLONE` flag turned out to clone nothing on
+ * this host. Either way the result is a new inode carrying its own signature assessment, which is
+ * why `reusableExecutableImage` reuses the *path* rather than merely making the copy cheap.
+ */
+const copyToStaging = (staging: string): void => {
   try {
-    execFileSync("cp", ["-c", process.execPath, dest], { stdio: "ignore" });
+    execFileSync("cp", ["-c", process.execPath, staging], { stdio: "ignore" });
     return;
   } catch {
-    /* not APFS, or not macOS; fall through to a plain copy */
+    /* not APFS, or not macOS; fall through */
   }
   try {
-    execFileSync("cp", ["--reflink=auto", process.execPath, dest], { stdio: "ignore" });
+    execFileSync("cp", ["--reflink=auto", process.execPath, staging], { stdio: "ignore" });
     return;
   } catch {
     /* no reflink support either */
   }
-  copyFileSync(process.execPath, dest);
+  copyFileSync(process.execPath, staging);
 };
 
-const writeVersionedClaude = (versionsRoot: string, version: string): string => {
-  const dir = join(versionsRoot, version);
-  mkdirSync(dir, { recursive: true });
-  const executable = join(dir, "claude");
-  cloneExecutable(executable);
-  writeFileSync(join(dir, "package.json"), JSON.stringify({ version }));
+/**
+ * A real, independent executable file at a **stable, reused** path under `IMAGE_FIXTURE_ROOT` —
+ * copied from the running node binary the first time this exact relative path is asked for, and
+ * handed straight back on every later call, in this run and in every later one.
+ *
+ * The reuse is the point, and it is a Gatekeeper cost, not a disk cost. macOS assesses an
+ * executable's code signature once per *inode*, at that inode's first exec, and caches the
+ * verdict against it. Measured on this machine against `process.execPath` (a ~113MB universal
+ * Mach-O): first exec of a freshly created copy ~1.6s of `syspolicyd` work, every later exec of
+ * that same file ~0.02s. This helper used to make a fresh clone — a fresh inode — for every
+ * fixture, so one run of this file paid that assessment nine times over; enough of that load
+ * wedges `syspolicyd` machine-wide (#817).
+ *
+ * A hardlink is not a substitute for the copy: `lsof` reports an inode's *primary* link, so a
+ * second link to the real node binary is reported at the real node binary's own path, where
+ * `versionFromImagePath` finds no `/versions/<version>/` segment at all. Measured on this
+ * machine, not assumed. A symlink is not a substitute either: lsof and `/proc` resolve a symlink
+ * straight through to its target, so two symlinks to the same node binary would collapse into
+ * one indistinguishable image. A copy is a genuinely separate file the kernel maps as its own
+ * executing image, and that is still what this returns.
+ *
+ * Published by copying to a private staging path and `link()`ing that into place: the destination
+ * never exists half-written, and is never replaced under a process already executing it — a
+ * concurrently running test file (this root is shared with
+ * `canonical-self-claim-listener-claim.test.ts`, which needs the same `9.0.0-test` image) either
+ * wins the link or loses it and uses the winner's file.
+ */
+const reusableExecutableImage = (relativePath: string): string => {
+  const dest = join(IMAGE_FIXTURE_ROOT, relativePath);
+  mkdirSync(dirname(dest), { recursive: true });
+  try {
+    // Anything of the right size here is a previous run's copy of this same node build — the
+    // root is keyed by that build. A wrong size means the entry was replaced by something else
+    // (the image-swap test below does exactly that, deliberately), so it is rebuilt.
+    if (statSync(dest).size === nodeImage.size) return dest;
+    unlinkSync(dest);
+  } catch {
+    /* nothing usable there yet */
+  }
+  const staging = `${dest}.staging-${process.pid}-${randomUUID()}`;
+  copyToStaging(staging);
+  try {
+    linkSync(staging, dest);
+  } catch {
+    /* a concurrent fork published first; its file is the one every reader now sees */
+  }
+  unlinkSync(staging);
+  return dest;
+};
+
+const writeVersionedClaude = (version: string): string => {
+  const executable = reusableExecutableImage(join("versions", version, "claude"));
+  writeFileSync(join(dirname(executable), "package.json"), JSON.stringify({ version }));
   return executable;
 };
 
-const writeVersionFileExecutable = (versionsRoot: string, version: string): string => {
-  mkdirSync(versionsRoot, { recursive: true });
-  const executable = join(versionsRoot, version);
-  cloneExecutable(executable);
-  return executable;
-};
+const writeVersionFileExecutable = (version: string): string =>
+  reusableExecutableImage(join("versions", version));
 
 const waitUntil = async (predicate: () => boolean, description: string, timeoutMs = 10_000): Promise<void> => {
   const deadline = Date.now() + timeoutMs;
@@ -118,8 +180,8 @@ const waitUntil = async (predicate: () => boolean, description: string, timeoutM
 };
 
 /**
- * The stand-in "claude" executable is actually a clone of the `node` binary (see
- * `cloneExecutable`), so its own CLI flag parser is node's — and node parses every `--foo`
+ * The stand-in "claude" executable is actually a copy of the `node` binary (see
+ * `reusableExecutableImage`), so its own CLI flag parser is node's — and node parses every `--foo`
  * token *before* the first positional argument as one of its own flags, exiting with
  * "bad option" on anything it does not recognize. `-e <script>` has to come
  * first; identity-bearing flags like `--session-id` are appended after a positional guard token
@@ -139,7 +201,7 @@ const spawnHeld = (executable: string, identityArgs: readonly string[], cwd: str
 describe("real process ancestry — ps-backed, not a fake", () => {
   it("reports the exact command line, a resolvable start time, and the real cwd of a live process", async () => {
     const root = tempRoot();
-    const claude = writeVersionedClaude(join(root, "versions"), TEST_REQUIRED_EXECUTOR_VERSION);
+    const claude = writeVersionedClaude(TEST_REQUIRED_EXECUTOR_VERSION);
     const sessionUuid = "33333333-3333-4333-8333-333333333333";
     const child = spawnHeld(claude, ["--session-id", sessionUuid], root);
     await waitUntil(() => child.pid !== undefined, "child pid to be assigned");
@@ -169,7 +231,7 @@ describe("real process ancestry — ps-backed, not a fake", () => {
     "the real OS argv reader keeps one positional argument containing spaces and selector-looking text as exactly one argv element",
     async () => {
       const root = tempRoot();
-      const claude = writeVersionedClaude(join(root, "versions"), TEST_REQUIRED_EXECUTOR_VERSION);
+      const claude = writeVersionedClaude(TEST_REQUIRED_EXECUTOR_VERSION);
       const sessionUuid = "55555555-5555-4555-8555-555555555555";
       // `spawn` with an argument array never goes through a shell, so this one array element
       // reaches the kernel as exactly one argv entry — the shape a real attacker-controlled or
@@ -256,14 +318,14 @@ describe("real process ancestry — ps-backed, not a fake", () => {
 
   it("walks a real two-hop ancestry (grandchild -> claude parent) to the claude process", async () => {
     const root = tempRoot();
-    const claude = writeVersionedClaude(join(root, "versions"), TEST_REQUIRED_EXECUTOR_VERSION);
+    const claude = writeVersionedClaude(TEST_REQUIRED_EXECUTOR_VERSION);
     const sessionUuid = "44444444-4444-4444-8444-444444444444";
     const resultPath = join(root, "grandchild-pid.txt");
     // The "claude" process spawns a plain, non-claude grandchild and writes its pid to disk —
     // this is a real parent/child relationship the kernel tracks, not a constructed fixture.
     //
     // The grandchild must NOT be launched via `process.execPath` *as read inside the spawned
-    // script* — that clone of node is itself named "claude" (see `cloneExecutable`), so a
+    // script* — that copy of node is itself named "claude" (see `reusableExecutableImage`), so a
     // grandchild spawned through its own `process.execPath` would look like a second claude
     // ancestor and get matched immediately at hop zero instead of exercising a real climb.
     // `realNodeExecPath` is this outer, genuinely-node-named test process's own path instead.
@@ -307,10 +369,7 @@ describe("real executing-image resolution — symlink and image can diverge", ()
     "resolves an executable stored exactly at versions/<version>",
     async () => {
       const root = tempRoot();
-      const executable = writeVersionFileExecutable(
-        join(root, "versions"),
-        VERSION_FILE_LAYOUT_TEST_VERSION,
-      );
+      const executable = writeVersionFileExecutable(VERSION_FILE_LAYOUT_TEST_VERSION);
       const child = spawnHeld(executable, [], root);
       await waitUntil(() => child.pid !== undefined, "child pid to be assigned");
 
@@ -331,9 +390,8 @@ describe("real executing-image resolution — symlink and image can diverge", ()
     "keeps reporting the version the live process actually loaded after its launch symlink is repointed to a decoy",
     async () => {
       const root = tempRoot();
-      const versionsRoot = join(root, "versions");
-      const realExecutable = writeVersionedClaude(versionsRoot, SYMLINK_TEST_VERSION_REAL);
-      writeVersionedClaude(versionsRoot, SYMLINK_TEST_VERSION_DECOY);
+      const realExecutable = writeVersionedClaude(SYMLINK_TEST_VERSION_REAL);
+      const decoyExecutable = writeVersionedClaude(SYMLINK_TEST_VERSION_DECOY);
       const binDir = join(root, "bin");
       mkdirSync(binDir, { recursive: true });
       const launchPath = join(binDir, "claude");
@@ -353,7 +411,7 @@ describe("real executing-image resolution — symlink and image can diverge", ()
 
       // Repoint the launch symlink while the process keeps running.
       unlinkSync(launchPath);
-      symlinkSync(join(versionsRoot, SYMLINK_TEST_VERSION_DECOY, "claude"), launchPath);
+      symlinkSync(decoyExecutable, launchPath);
 
       const after = defaultExecutingImageInspector.resolve(pid);
       expect(after, "the executing image could not be resolved after the repoint").not.toBeNull();
@@ -375,8 +433,7 @@ describe("real executing-image resolution — symlink and image can diverge", ()
     "refuses rather than hashes a decoy when the resolved image path is replaced after the running process opened it",
     async () => {
       const root = tempRoot();
-      const versionsRoot = join(root, "versions");
-      const claude = writeVersionedClaude(versionsRoot, "1.0.0-fd-swap-test");
+      const claude = writeVersionedClaude("1.0.0-fd-swap-test");
       const child = spawnHeld(claude, [], root);
       await waitUntil(() => child.pid !== undefined, "child pid to be assigned");
       const pid = child.pid!;
@@ -393,6 +450,12 @@ describe("real executing-image resolution — symlink and image can diverge", ()
       // replaced inode alive as long as something still references it) — the path now names a
       // different file than the one still executing, exactly the shape a resolve-then-reopen race
       // would hit.
+      //
+      // This is the one image `reusableExecutableImage` cannot hand back to the next run: after
+      // the rename, no path names that inode any more, and a second link taken beforehand would
+      // *be* a surviving path — enough for `lsof` to report the image as still resolvable and for
+      // the assertion below to stop measuring anything. So this version alone is rebuilt once per
+      // run; the size check in `reusableExecutableImage` is what notices the decoy left here.
       const decoyPath = `${before!.imagePath}.decoy`;
       writeFileSync(decoyPath, "not the real image");
       renameSync(decoyPath, before!.imagePath);
@@ -422,10 +485,9 @@ describe("real executing-image resolution — symlink and image can diverge", ()
     // the version-directory layout, could produce — and asserts the resolved version is still the
     // real one, unmoved by the forgery.
     const root = tempRoot();
-    const versionsRoot = join(root, "versions");
-    const claude = writeVersionedClaude(versionsRoot, SYMLINK_TEST_VERSION_REAL);
+    const claude = writeVersionedClaude(SYMLINK_TEST_VERSION_REAL);
     writeFileSync(
-      join(versionsRoot, SYMLINK_TEST_VERSION_REAL, "package.json"),
+      join(dirname(claude), "package.json"),
       JSON.stringify({ version: "0.0.1-forged-manifest-version" }),
     );
 
@@ -444,7 +506,7 @@ describe("real executing-image resolution — symlink and image can diverge", ()
 
   it("resolves the exact required version end to end", async () => {
     const root = tempRoot();
-    const claude = writeVersionedClaude(join(root, "versions"), TEST_REQUIRED_EXECUTOR_VERSION);
+    const claude = writeVersionedClaude(TEST_REQUIRED_EXECUTOR_VERSION);
     const child = spawnHeld(claude, [], root);
     await waitUntil(() => child.pid !== undefined, "child pid to be assigned");
 
