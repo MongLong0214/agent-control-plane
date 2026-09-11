@@ -467,7 +467,7 @@ describe("canonical self-claim activation is an atomic pre-effect daemon contrac
     }
   }, 40_000);
 
-  it("keeps full canonical activation alive with no subscriber config and zero subscriber sockets", async () => {
+  it("keeps full canonical activation alive with no subscriber config and zero configured subscriber identities", async () => {
     const result = await runMain({
       seedState: true,
       buzz: true,
@@ -525,7 +525,7 @@ describe("#627: an owner's Buzz message reaches the CEO without a session child"
     expect(result.stdout, diagnostics).not.toContain("Buzz message ingress started");
   }, 40_000);
 
-  it("keeps first boot alive with no subscriber config and reports zero subscriber sockets", async () => {
+  it("keeps first boot alive with no subscriber config and reports zero configured subscriber identities", async () => {
     // `runMain` gives every case a new state root. Declaring the Buzz owner opens the local ingress
     // composition, but nothing writes `buzz-nostr-subscriber.json`, so this reaches the real
     // config-absent subscriber boundary on first boot rather than a direct helper fixture.
