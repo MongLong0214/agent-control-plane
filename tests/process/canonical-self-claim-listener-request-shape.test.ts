@@ -69,11 +69,19 @@ interface Recorder {
   calls: { peer: AuthenticatedClaimPeer; params: Record<string, unknown> }[];
 }
 
-/** A listener whose handler records every call and always allows, so reaching it is visible. */
-const startRecordingListener = async (): Promise<Recorder> => {
+/**
+ * A listener whose handler records every call and always allows, so reaching it is visible.
+ *
+ * `lock` is a parameter rather than a constant because every fixture here supplied
+ * `held: () => true`, which left `DAEMON_LOCK_LOST` with no test at all — deleting its guard kept
+ * the suite green (#843).
+ */
+const startRecordingListener = async (
+  lock: { held(): boolean } = { held: () => true },
+): Promise<Recorder> => {
   const calls: Recorder["calls"] = [];
   const listener = await startCanonicalSelfClaimListener(
-    { lock: { held: () => true } },
+    { lock },
     tempRoot(),
     async (peer, params) => {
       calls.push({ peer, params });
@@ -122,6 +130,46 @@ const expectInvalidArgument = (decision: Decision<unknown>): void => {
   if (decision.allowed) return;
   expect(decision.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
 };
+
+describe("the claim socket refuses a claim when the daemon no longer holds its lock", () => {
+  /**
+   * #843. The daemon lock is what makes exactly one process the authority behind this socket. A
+   * daemon that has lost it must stop answering claims, or two processes answer the same claim and
+   * the socket stops meaning one authority.
+   *
+   * There was no test at all before this one: every fixture in this file and its sibling supplied
+   * `held: () => true`, so the false branch was never entered and deleting the whole guard left
+   * the suite green. The operand is a unary `!`, which the refusal-operand census does not select
+   * (`verify-refusal-operands-are-watched.mjs:31-33`), so nothing demanded a witness for it either
+   * — #839.
+   */
+  it("refuses a well-formed claim with DAEMON_LOCK_LOST and never reaches the handler", async () => {
+    const { listener, calls } = await startRecordingListener({ held: () => false });
+
+    // A request that is valid in every other respect: the right method, an object, a usable params
+    // object. Anything malformed would be refused earlier and would prove nothing about the lock.
+    const decision = await send(listener.socketPath, { method: CANONICAL_SELF_CLAIM_METHOD, params: {} });
+
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) return;
+    // The exact code, not merely a denial. `publicClaimResponse` puts nothing but `reasonCode` on
+    // the wire, so a caller cannot tell an unheld lock from a bad method or a failed claim by any
+    // other field — which is precisely why this assertion has to name the code.
+    expect(decision.reasonCode).toBe(ReasonCode.DAEMON_LOCK_LOST);
+    // The handler is the claim itself. Reaching it with no lock is the failure this guards.
+    expect(calls).toHaveLength(0);
+  });
+
+  it("still answers the same request once the lock is held, so the refusal is the lock and nothing else", async () => {
+    // The control. Without it, a mutation that broke request dispatch entirely would satisfy the
+    // row above — every request would refuse, including this one, and the test would read as
+    // "the lock guard works".
+    const { listener, calls } = await startRecordingListener({ held: () => true });
+    const decision = await send(listener.socketPath, { method: CANONICAL_SELF_CLAIM_METHOD, params: {} });
+    expect(decision.allowed).toBe(true);
+    expect(calls).toHaveLength(1);
+  });
+});
 
 describe("the claim socket refuses a request line that is not a JSON object", () => {
   it("refuses a number request line as an invalid argument, never as an unrecognized method", async () => {
