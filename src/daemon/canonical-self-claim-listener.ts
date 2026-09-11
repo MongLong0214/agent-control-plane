@@ -114,8 +114,26 @@ export const assertDirectPeer = (credentials: PeerCredentials): Decision<PeerCre
  * conversation transcript and working directory) is `CanonicalSelfClaim.claim()`'s job,
  * unchanged; this only answers "is this a trustworthy direct local peer at all".
  */
-const authenticateClaimPeer = (socket: Socket): Decision<AuthenticatedClaimPeer> => {
-  const credentials = derivePeerCredentialsFromSocket(socket);
+const authenticateClaimPeer = (socket: Socket): Decision<AuthenticatedClaimPeer> =>
+  authenticateClaimCredentials(derivePeerCredentialsFromSocket(socket), process.geteuid?.());
+
+/**
+ * The same three refusals, over values rather than over a socket — the shape `assertDirectPeer`
+ * was already split out into, extended to its two neighbours.
+ *
+ * Both of those were untested until #843, and neither was reachable by a test: one needs kernel
+ * credential derivation to fail, the other needs a peer at a different uid, and a unit test can
+ * construct neither through a real `Socket`. `assertDirectPeer`'s own comment names that as the
+ * reason it is a pure function; the argument applies unchanged to the refusals above and below it.
+ *
+ * `euid` is passed rather than read here so a test can state which uid the daemon is, instead of
+ * asserting against whatever uid happens to be running the suite — an assertion that would pass
+ * for the wrong reason on any machine where they coincide, which is every machine that runs it.
+ */
+export const authenticateClaimCredentials = (
+  credentials: PeerCredentials | null,
+  euid: number | undefined,
+): Decision<AuthenticatedClaimPeer> => {
   if (credentials === null) {
     return deny(
       ReasonCode.OPERATOR_UNAUTHENTICATED,
@@ -125,7 +143,7 @@ const authenticateClaimPeer = (socket: Socket): Decision<AuthenticatedClaimPeer>
   }
   const direct = assertDirectPeer(credentials);
   if (!direct.allowed) return direct as Decision<AuthenticatedClaimPeer>;
-  if (credentials.uid !== process.geteuid?.()) {
+  if (credentials.uid !== euid) {
     return deny(
       ReasonCode.OPERATOR_UNAUTHENTICATED,
       "the connecting peer's effective uid does not match this daemon's own",
