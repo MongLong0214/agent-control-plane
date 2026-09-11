@@ -407,14 +407,20 @@ describe("same-live successor transaction", () => {
     },
   );
 
-  it.each(["pid", "start", "buzz", "draining", "active", "work"] as const)(
+  /**
+   * `pid` and `start` were rows in this table until #831. Both built a predecessor whose process
+   * did not exist — `pid` left the recorded pid out of the ancestry entirely, `start` put a
+   * differently-started process at it — and asserted a refusal. That is the restart case, not a
+   * mismatch case: the refusal they pinned is the one that left the canonical role unclaimable on
+   * production. What each was protecting still is, in a test that supplies the live predecessor
+   * the name implies — "a predecessor whose process is alive under a pid the claimant does not
+   * share stays refused" and "a recycled pid never lets the claimant inherit the predecessor's
+   * runtime" below.
+   */
+  it.each(["buzz", "draining", "active", "work"] as const)(
     "same-live recovery refuses %s mismatch without effects", async (condition) => {
       const { core, first, request, roleKey, projectId } = await successorFixture();
-      let subject = makeSubject(core);
-      if (condition === "pid") subject = makeSubject(core, {
-        chain: [standardChain()[0]!, { ...standardChain()[1]!, ppid: 11 }, claudeAncestor({ pid: 11 })],
-      });
-      if (condition === "start") subject = makeSubject(core, { chain: standardChain({ startedAt: "different lifetime" }) });
+      const subject = makeSubject(core);
       if (condition === "buzz") request.buzzActorId = "buzz:other";
       if (condition === "draining") expect(core.sessions.transition(first.sessionId, SessionLifecycle.DRAINING).allowed).toBe(true);
       if (condition === "active") expect(core.bindings.bind({ role: Role.CEO, sessionId: first.sessionId }).allowed).toBe(true);
@@ -1333,6 +1339,216 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(after.actor_target_attestations).toBe(before.actor_target_attestations + 1);
     expect((await subject.claim(request)).allowed).toBe(false);
     expect(rowCounts(core)).toEqual(after);
+  });
+
+  /**
+   * #831 — the ordinary case. A session row's `lifecycle` is a record this process wrote; a
+   * process's liveness is a fact the kernel holds. The predecessor row below still says READY
+   * because nothing transitioned it when its process died, and the restarted runtime is a
+   * genuinely different OS process. Same-live recovery is about a *live* runtime replacing its own
+   * revoked attachment, so it has nothing to say here and must not answer for this case.
+   */
+  it("a restarted canonical runtime claims the next generation when the predecessor row is READY and its process is gone", async () => {
+    const core = makeCore();
+    const projectId = "prj_dead_predecessor";
+    insertProject(core, projectId);
+    const first = await makeSubject(core).claim(baseRequest(core, projectId));
+    expect(first.allowed, JSON.stringify(first)).toBe(true);
+    if (!first.allowed) return;
+    const predecessor = core.sessions.require(first.value.sessionId);
+    // The exact production state: the row was never reconciled, so it still reads READY.
+    expect(predecessor.lifecycle).toBe(SessionLifecycle.READY);
+    expect(core.bindings.revoke(roleKeyFor(Role.PRIMARY_CTO, { projectId }), "lost attachment").allowed).toBe(true);
+
+    // The restart: a different OS process, and the pid the row still names resolves to nothing.
+    const restarted = [
+      standardChain()[0]!,
+      { ...standardChain()[1]!, ppid: 11 },
+      claudeAncestor({ pid: 11, startedAt: "Fri Jan  1 02:00:00 2027" }),
+    ];
+    expect(chainInspector(restarted).snapshot(predecessor.osPid!)).toBeNull();
+
+    const claimed = await makeSubject(core, { chain: restarted }).claim(baseRequest(core, projectId, {
+      expectedBindingGeneration: 2,
+      ownerApproval: mintOwnerApproval(core, { projectId, claimedSessionUuid: CANON, expectedBindingGeneration: 2 }),
+    }));
+    expect(claimed.allowed, JSON.stringify(claimed)).toBe(true);
+    if (!claimed.allowed) return;
+    expect(claimed.value.binding.bindingGeneration).toBe(2);
+    expect(claimed.value.sessionId).not.toBe(first.value.sessionId);
+    const successor = core.sessions.require(claimed.value.sessionId);
+    // The successor is the new process, never the pair the dead row named.
+    expect(successor).toMatchObject({ osPid: 11, osProcessStartedAt: "Fri Jan  1 02:00:00 2027" });
+    // Exactly one live session speaks as the canonical Buzz identity; the dead row is terminal.
+    expect(core.sessions.require(first.value.sessionId).lifecycle).toBe(SessionLifecycle.STOPPED);
+    expect(core.db.all(
+      `SELECT session_id FROM sessions WHERE buzz_actor_id = ? AND lifecycle NOT IN ('STOPPED','ERROR')`,
+      ["buzz:canonical-cto"],
+    )).toEqual([{ session_id: successor.sessionId }]);
+  });
+
+  /**
+   * The door #831 must not open. A dead process is not a released role: the incumbent's assignment
+   * is still ACTIVE, and reconciling its runtime row says nothing about that. Seizing a held
+   * binding on the strength of a missing process is `binding recover-dead`'s operation, with its
+   * own proof and its own audit record, not a side effect of claiming.
+   */
+  it("a dead predecessor whose assignment is still ACTIVE does not hand the role to the restarted claimant", async () => {
+    const core = makeCore();
+    const projectId = "prj_dead_but_held";
+    insertProject(core, projectId);
+    const first = await makeSubject(core).claim(baseRequest(core, projectId));
+    expect(first.allowed, JSON.stringify(first)).toBe(true);
+    if (!first.allowed) return;
+    // Deliberately no revoke: the binding stays ACTIVE while the runtime behind it dies.
+    expect(core.db.all(`SELECT assignment_id FROM assignments WHERE status = 'ACTIVE'`)).toHaveLength(1);
+
+    const restarted = [
+      standardChain()[0]!,
+      { ...standardChain()[1]!, ppid: 11 },
+      claudeAncestor({ pid: 11, startedAt: "Fri Jan  1 02:00:00 2027" }),
+    ];
+    const request = baseRequest(core, projectId, {
+      expectedBindingGeneration: 2,
+      ownerApproval: mintOwnerApproval(core, { projectId, claimedSessionUuid: CANON, expectedBindingGeneration: 2 }),
+    });
+    const before = durableSnapshot(core);
+    const refused = await makeSubject(core, { chain: restarted }).claim(request);
+    expect(refused.allowed).toBe(false);
+    if (refused.allowed) return;
+    expect(refused.reasonCode).toBe(ReasonCode.BINDING_ALREADY_ACTIVE);
+    // Including the predecessor's lifecycle: the reconciliation rolls back with the refusal.
+    expect(durableSnapshot(core)).toEqual(before);
+  });
+
+  /**
+   * "Unknown is never gone" — the half of the liveness read that nothing else in this file
+   * reaches. The sibling test below supplies a live predecessor with a readable token; this one
+   * supplies a live predecessor whose token cannot be read, which is a real shape on the default
+   * inspector (`ps` answers while `readProcessStartToken` returns null on a native or kernel
+   * failure), not a contrived one.
+   *
+   * The consequence of reading it the other way is not a missed refusal, it is an eviction: an
+   * unreadable token on a *live* pid would take the abandoned-runtime path, skip every #824
+   * ownership guard, transition the live holder to STOPPED and hand the role to a stranger
+   * whenever the assignment happens to be REVOKED. So the assertion is the reason code and the
+   * message — the same-live branch answering — not merely that something refused.
+   */
+  it("a predecessor pid that is live but whose start token cannot be read is not gone", async () => {
+    const core = makeCore();
+    const projectId = "prj_unreadable_token";
+    insertProject(core, projectId);
+    const first = await makeSubject(core).claim(baseRequest(core, projectId));
+    expect(first.allowed, JSON.stringify(first)).toBe(true);
+    if (!first.allowed) return;
+    const predecessor = core.sessions.require(first.value.sessionId);
+    expect(predecessor.osProcessStartedAt).not.toBeNull();
+    expect(core.bindings.revoke(roleKeyFor(Role.PRIMARY_CTO, { projectId }), "lost attachment").allowed).toBe(true);
+
+    // pid 10 — the predecessor's own runtime — is still there; only its start token is unreadable.
+    // The claimant is pid 11, a different process on the same ancestry.
+    const unreadable = [
+      standardChain()[0]!,
+      { ...standardChain()[1]!, ppid: 11 },
+      claudeAncestor({ pid: 11 }),
+      claudeAncestor({ pid: 10, startedAt: null }),
+    ];
+    const observed = chainInspector(unreadable).snapshot(predecessor.osPid!);
+    expect(observed).not.toBeNull();
+    expect(observed?.startedAt).toBeNull();
+
+    const request = baseRequest(core, projectId, {
+      expectedBindingGeneration: 2,
+      ownerApproval: mintOwnerApproval(core, { projectId, claimedSessionUuid: CANON, expectedBindingGeneration: 2 }),
+    });
+    const before = durableSnapshot(core);
+    const refused = await makeSubject(core, { chain: unreadable }).claim(request);
+    expect(refused.allowed).toBe(false);
+    if (refused.allowed) return;
+    expect(refused.reasonCode).toBe(ReasonCode.CONFLICT);
+    // The same-live branch is what answered; an unreadable token did not route this to the
+    // abandoned-runtime path and then refuse for some unrelated reason further down.
+    expect(refused.message).toBe("same-live recovery requires the exact idle revoked runtime");
+    expect(durableSnapshot(core)).toEqual(before);
+    expect(core.sessions.require(predecessor.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+  });
+
+  /**
+   * #824's recycled-pid property, on the shape #831 leaves reachable. The claimant occupies the
+   * predecessor's pid under a different start token, so the recorded process is gone and the claim
+   * is the ordinary one. What must not happen is the claimant being credited with the
+   * predecessor's runtime: the successor row records the claimant's own verified pair, so the two
+   * rows stay distinguishable as different processes despite sharing a pid.
+   */
+  it("a recycled pid never lets the claimant inherit the predecessor's runtime", async () => {
+    const core = makeCore();
+    const projectId = "prj_recycled_pid";
+    insertProject(core, projectId);
+    const first = await makeSubject(core).claim(baseRequest(core, projectId));
+    expect(first.allowed, JSON.stringify(first)).toBe(true);
+    if (!first.allowed) return;
+    const predecessor = core.sessions.require(first.value.sessionId);
+    expect(core.bindings.revoke(roleKeyFor(Role.PRIMARY_CTO, { projectId }), "lost attachment").allowed).toBe(true);
+
+    // Same pid, different lifetime: the process the row named is gone and another holds its number.
+    const recycled = standardChain({ startedAt: "different lifetime" });
+    expect(chainInspector(recycled).snapshot(predecessor.osPid!)?.startedAt).not.toBe(predecessor.osProcessStartedAt);
+
+    const claimed = await makeSubject(core, { chain: recycled }).claim(baseRequest(core, projectId, {
+      expectedBindingGeneration: 2,
+      ownerApproval: mintOwnerApproval(core, { projectId, claimedSessionUuid: CANON, expectedBindingGeneration: 2 }),
+    }));
+    expect(claimed.allowed, JSON.stringify(claimed)).toBe(true);
+    if (!claimed.allowed) return;
+    const successor = core.sessions.require(claimed.value.sessionId);
+    expect(successor.sessionId).not.toBe(predecessor.sessionId);
+    // The claimant's own pair, never the predecessor's — a same-live recovery would have required
+    // these two to be equal, which is exactly the claim a recycled pid may not make.
+    expect(successor.osPid).toBe(predecessor.osPid);
+    expect(successor.osProcessStartedAt).toBe("different lifetime");
+    expect(successor.osProcessStartedAt).not.toBe(predecessor.osProcessStartedAt);
+    expect(core.sessions.require(predecessor.sessionId).lifecycle).toBe(SessionLifecycle.STOPPED);
+  });
+
+  /**
+   * The other half of the same question, and the one that must stay shut: the predecessor's
+   * `(osPid, start token)` pair *does* resolve to a live process, and the claimant is a different
+   * one. That is a foreign live holder, and #824 refuses it. Asserting the reason code — not just
+   * refusal — is what separates this from the unrelated `bindBuzzActor` denial a deleted branch
+   * would produce instead.
+   */
+  it("a predecessor whose process is alive under a pid the claimant does not share stays refused", async () => {
+    const core = makeCore();
+    const projectId = "prj_foreign_live";
+    insertProject(core, projectId);
+    const first = await makeSubject(core).claim(baseRequest(core, projectId));
+    expect(first.allowed, JSON.stringify(first)).toBe(true);
+    if (!first.allowed) return;
+    const predecessor = core.sessions.require(first.value.sessionId);
+    expect(core.bindings.revoke(roleKeyFor(Role.PRIMARY_CTO, { projectId }), "lost attachment").allowed).toBe(true);
+
+    // pid 10 — the predecessor's own runtime — is still running, under the exact pair the row
+    // recorded. The claimant is pid 11, a different process on the same ancestry.
+    const foreign = [
+      standardChain()[0]!,
+      { ...standardChain()[1]!, ppid: 11 },
+      claudeAncestor({ pid: 11 }),
+      claudeAncestor({ pid: 10 }),
+    ];
+    expect(chainInspector(foreign).snapshot(predecessor.osPid!)?.startedAt).toBe(predecessor.osProcessStartedAt);
+
+    // Built — and its approval minted — before the snapshot, so the mint's own ingress rows are
+    // not read back as drift the refusal failed to roll back.
+    const request = baseRequest(core, projectId, {
+      expectedBindingGeneration: 2,
+      ownerApproval: mintOwnerApproval(core, { projectId, claimedSessionUuid: CANON, expectedBindingGeneration: 2 }),
+    });
+    const before = durableSnapshot(core);
+    const refused = await makeSubject(core, { chain: foreign }).claim(request);
+    expect(refused.allowed).toBe(false);
+    if (refused.allowed) return;
+    expect(refused.reasonCode).toBe(ReasonCode.CONFLICT);
+    expect(durableSnapshot(core)).toEqual(before);
   });
 
   it("clause 4 restore — the same external session, reclaimed after a revoke, reuses the actor and target binding rather than minting a second owner", async () => {
