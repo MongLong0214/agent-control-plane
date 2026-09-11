@@ -835,6 +835,36 @@ const groups = [
       ["!approval",1],
     ],
   },
+  {
+    file: "src/cli/attach-relay.ts",
+    // performClaim, receipt body and receipt value shape
+    reason: "NO WITNESS. The field checks below refuse the same inputs. A number, a string or an array body reaches finish({malformed}) through typeof value.sessionId !== \"string\" after the cast, and a non-object value reaches it the same way, so removing either operand changes no observable. Measured one operand at a time against nineteen inputs covering every non-object JSON body and value: only the null cases differ, and those are the operands beside these, which carry rows.",
+    operands: [
+      ["typeof parsed !== \"object\"",1],
+      ["Array.isArray(parsed)",1],
+      ["typeof value !== \"object\"",1],
+    ],
+  },
+  {
+    file: "src/cli/attach-relay.ts",
+    // classifyFirstLine, null and non-object first lines
+    // This entry is NOT "no witness was found". The witness exists and runs; what does not exist
+    // is a mutation that isolates these operands. The two read the same in a census listing and
+    // mean opposite things, so the reason names the test and the exact obstruction.
+    reason: "WITNESSED BUT NOT ISOLABLE. The witness is tests/unit/attach-relay.test.ts :: \"forwards a first line that is not an object as client traffic, never as a refusal to parse\", which drives a first line of null and of 42 and asserts each is forwarded to the client verbatim; without either operand that test fails, because the following `\"jsonrpc\" in parsed` throws on both. No row can credit them: these operands ARE the narrowing that `in` depends on, so the isolated mutant does not type-check (removing !parsed gives TS18047 'parsed is possibly null'; removing the typeof gives TS2638), and the smallest mutation that does compile spans Array.isArray(parsed) as well, which has no witness of its own and would be credited without one.",
+    operands: [
+      ["!parsed",2],
+      ["typeof parsed !== \"object\"",2],
+    ],
+  },
+  {
+    file: "src/cli/attach-relay.ts",
+    // classifyFirstLine, array first line
+    reason: "NO WITNESS. An array first line reaches the same traffic outcome through body.ok !== false below — [1].ok is undefined, which is not false — so removing this operand changes no observable. Measured by removing it alone and diffing nineteen inputs against a recorded baseline, not inferred.",
+    operands: [
+      ["Array.isArray(parsed)",2],
+    ],
+  },
 ];
 
 export const UNANSWERED = new Map(groups.flatMap(({ file, reason, operands }) =>

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { defaultConfig } from "../app/control-plane.ts";
+import { runAttachRelayCommand, type AttachRelayClaim } from "./attach-relay.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -64,6 +65,12 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
                                            adopt the existing canonical CTO conversation in place;
                                            never launches a runtime the way bootstrap hermes does;
                                            reaches its own token-less socket, never ACP_OPERATOR_TOKEN
+  agentctl attach canonical-cto --claimed-session-id <uuid> --project-id <id> --expected-binding-generation <n> --owner-approval-nonce <nonce>
+                                           claim in memory, then relay this process's own stdin and
+                                           stdout to the CTO MCP socket as the claimed session.
+                                           Spawned by the canonical Claude Code as its stdio MCP
+                                           server, never run by hand: it prints no receipt, reaches
+                                           no ACP_OPERATOR_TOKEN, and never reconnects
   agentctl daemon status                  daemon mode and health; falls back to the lock file
 `;
 
@@ -127,6 +134,14 @@ export const main = async (argv: string[]): Promise<number> => {
     return dispatchCanonicalSelfClaim(rest, config);
   }
 
+  // The attach relay is the claimant's own process continued: it performs the same token-less
+  // claim and then carries the canonical Claude Code's MCP traffic. It sits above the
+  // `ACP_OPERATOR_TOKEN` read for exactly the reason the claim branch does, and the same grep
+  // proves it — a relay that could read the owner/admin credential would be a claimant holding it.
+  if (command === "attach") {
+    return dispatchAttach(rest, config);
+  }
+
   const owner = rest.includes("--owner");
   const args = rest.filter((arg) => arg !== "--owner");
 
@@ -181,11 +196,20 @@ export const main = async (argv: string[]): Promise<number> => {
  * client: it builds its own, pointed at the dedicated self-claim socket, and reads no bearer
  * credential at all (#760).
  */
-const dispatchCanonicalSelfClaim = (args: string[], config: { databasePath: string }): Promise<number> => {
-  if (args[0] !== "canonical-cto") return Promise.resolve(fail(`unknown claim subcommand: ${args[0] ?? ""}`));
-  const selectorArgs = args.slice(1);
+type CanonicalClaimSelectorParse =
+  | { ok: true; selectors: AttachRelayClaim }
+  | { ok: false; message: string };
+
+/**
+ * The selector argv both `claim canonical-cto` and `attach canonical-cto` take, parsed once.
+ *
+ * Shared deliberately: `attach` performs the same claim, so an argv the two commands disagreed
+ * about would be an owner who approved one shape and a relay that sent another. `label` names the
+ * command in the refusal so the operator reads the one they typed.
+ */
+const parseCanonicalClaimSelectors = (selectorArgs: string[], label: string): CanonicalClaimSelectorParse => {
   if (selectorArgs.length % 2 !== 0) {
-    return Promise.resolve(fail("claim canonical-cto selectors must be option/value pairs"));
+    return { ok: false, message: `${label} selectors must be option/value pairs` };
   }
   // No `--caller-pid` / `--claimed-pid` selector: the daemon derives the connecting peer's
   // identity from the kernel-authenticated socket itself; a flag cannot stand in for that.
@@ -204,15 +228,15 @@ const dispatchCanonicalSelfClaim = (args: string[], config: { databasePath: stri
     const option = selectorArgs[index]!;
     const value = selectorArgs[index + 1]!;
     const field = selectorFields[option as keyof typeof selectorFields];
-    if (!field) return Promise.resolve(fail(`unknown claim canonical-cto selector: ${option}`));
-    if (claimSelectors[field]) return Promise.resolve(fail(`duplicate claim canonical-cto selector: ${option}`));
+    if (!field) return { ok: false, message: `unknown ${label} selector: ${option}` };
+    if (claimSelectors[field]) return { ok: false, message: `duplicate ${label} selector: ${option}` };
     if (!value || !value.trim() || value.includes("\0")) {
-      return Promise.resolve(fail(`claim canonical-cto selector requires a non-empty value: ${option}`));
+      return { ok: false, message: `${label} selector requires a non-empty value: ${option}` };
     }
     claimSelectors[field] = value;
   }
   if (REQUIRED_CLAIM_SELECTORS.some((option) => !claimSelectors[selectorFields[option]])) {
-    return Promise.resolve(fail("claim canonical-cto requires every selector"));
+    return { ok: false, message: `${label} requires every selector` };
   }
   let expectedBindingGeneration: number;
   try {
@@ -222,24 +246,52 @@ const dispatchCanonicalSelfClaim = (args: string[], config: { databasePath: stri
       1,
     );
   } catch (err) {
-    return Promise.resolve(fail((err as Error).message));
+    return { ok: false, message: (err as Error).message };
   }
-  const params = {
-    claimedSessionUuid: claimSelectors["claimedSessionUuid"]!,
-    projectId: claimSelectors["projectId"]!,
-    expectedBindingGeneration,
-    // The `(channel="cli", nonce)` handle naming an owner approval a separate,
-    // bearer-authenticated `owner.approveClaimCanonicalCto` call already admitted. This
-    // connection never mints or admits one itself.
-    ownerApprovalNonce: claimSelectors["ownerApprovalNonce"]!,
+  return {
+    ok: true,
+    selectors: {
+      claimedSessionUuid: claimSelectors["claimedSessionUuid"]!,
+      projectId: claimSelectors["projectId"]!,
+      expectedBindingGeneration,
+      // The `(channel="cli", nonce)` handle naming an owner approval a separate,
+      // bearer-authenticated `owner.approveClaimCanonicalCto` call already admitted. This
+      // connection never mints or admits one itself.
+      ownerApprovalNonce: claimSelectors["ownerApprovalNonce"]!,
+    },
   };
-  const socketPath =
-    process.env["ACP_CLAIM_CANONICAL_CTO_SOCKET"] ??
-    join(config.databasePath, "..", "agentcpd.claim-canonical-cto.sock");
-  return exchangeCanonicalSelfClaimRequest(socketPath, params).then((decision) => {
-    print(decision.allowed ? decision.value : decision);
-    return decision.allowed ? 0 : 1;
-  });
+};
+
+const claimCanonicalCtoSocketPath = (config: { databasePath: string }): string =>
+  process.env["ACP_CLAIM_CANONICAL_CTO_SOCKET"] ??
+  join(config.databasePath, "..", "agentcpd.claim-canonical-cto.sock");
+
+const dispatchCanonicalSelfClaim = (args: string[], config: { databasePath: string }): Promise<number> => {
+  if (args[0] !== "canonical-cto") return Promise.resolve(fail(`unknown claim subcommand: ${args[0] ?? ""}`));
+  const parsed = parseCanonicalClaimSelectors(args.slice(1), "claim canonical-cto");
+  if (!parsed.ok) return Promise.resolve(fail(parsed.message));
+  return exchangeCanonicalSelfClaimRequest(claimCanonicalCtoSocketPath(config), { ...parsed.selectors }).then(
+    (decision) => {
+      print(decision.allowed ? decision.value : decision);
+      return decision.allowed ? 0 : 1;
+    },
+  );
+};
+
+const dispatchAttach = (args: string[], config: { databasePath: string }): Promise<number> => {
+  if (args[0] !== "canonical-cto") return Promise.resolve(fail(`unknown attach subcommand: ${args[0] ?? ""}`));
+  const parsed = parseCanonicalClaimSelectors(args.slice(1), "attach canonical-cto");
+  if (!parsed.ok) return Promise.resolve(fail(parsed.message));
+  // No token is named, passed or read on this path. The relay acquires the deployment credential
+  // inside its own module, where nothing in this one can reach it (#827).
+  return runAttachRelayCommand(
+    {
+      claimSocketPath: claimCanonicalCtoSocketPath(config),
+      mcpSocketPath: process.env["ACP_CTO_MCP_SOCKET"] ?? join(config.databasePath, "..", "cto.mcp.sock"),
+      claim: parsed.selectors,
+    },
+    { stdin: process.stdin, stdout: process.stdout, stderr: process.stderr },
+  );
 };
 
 export const dispatch = async (
