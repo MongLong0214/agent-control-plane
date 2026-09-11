@@ -187,6 +187,34 @@ export interface LsofProbeFailure {
   exitStatus: number | null;
 }
 
+/**
+ * Which failure a synchronous child-process probe suffered, from the error it threw.
+ *
+ * Read `code`, not `killed`. **`execFileSync` does not set `killed`** — the field this branch used
+ * to test was never present, so `TIMED_OUT` was unreachable on every path and every probe failure
+ * was reported as `SCAN_FAILED` (#838). Measured on Node 22.23.2:
+ *
+ * ```
+ * sleep 5, timeout 200ms   killed=undefined signal=SIGTERM code=ETIMEDOUT status=null
+ * ps on a dead pid         killed=undefined signal=null    code=undefined  status=1
+ * ```
+ *
+ * The consequence was not cosmetic: #834 was a real 30.07s lsof timeout, and the classification
+ * added in its own fix would have reported it as "lsof is not reachable", sending the diagnosis
+ * toward the PATH shape (#423/#785) instead of toward the budget.
+ *
+ * `signal === "SIGTERM"` is the other candidate and is weaker — a child killed by an unrelated
+ * SIGTERM would read as a timeout, while `ETIMEDOUT` is set by the timeout path alone.
+ *
+ * Exported and separate from `lsofEntries` so the split can be tested without a clock: the subject
+ * is the shape of the error object, not the speed of any scan. 239aa3d ruled out pinning a real
+ * scan with a timing assertion — flaky on a host with nothing to resolve, and a failure would say
+ * "slow" rather than name the defect — and that reasoning still holds; this keeps the split
+ * witnessable without reopening it.
+ */
+export const probeFailureKind = (failed: { code?: unknown }): "TIMED_OUT" | "SCAN_FAILED" =>
+  failed.code === "ETIMEDOUT" ? "TIMED_OUT" : "SCAN_FAILED";
+
 /** The outcome of one scan: entries that were genuinely read, or the reason none were. */
 type LsofScan =
   | { ok: true; entries: LsofEntry[] }
@@ -236,17 +264,17 @@ const lsofEntries = (pid: number): LsofScan => {
       stdio: ["ignore", "pipe", "ignore"],
     });
   } catch (error) {
-    // `execFileSync` sets `killed` when it is the timeout that ended the child, which is the one
-    // case whose repair is "the scan needs to be cheaper or the budget bigger" rather than "lsof
-    // is not reachable". Distinguishing them here is what puts the right next step in the
-    // operator's hands; a single "scan failed" would send both diagnoses the same way.
-    const failed = error as { killed?: boolean; code?: unknown; status?: unknown };
+    // Which of the two failures this was decides the operator's next step — "the scan needs to be
+    // cheaper or the budget bigger" against "lsof is not reachable" — and a single "scan failed"
+    // would send both diagnoses the same way. `probeFailureKind` owns that split; see its comment
+    // for why the field it reads is `code` and not `killed`.
+    const failed = error as { code?: unknown; status?: unknown };
     return {
       ok: false,
       failure: {
         pid,
         timeoutMs: SUBPROCESS_TIMEOUT_MS,
-        kind: failed.killed === true ? "TIMED_OUT" : "SCAN_FAILED",
+        kind: probeFailureKind(failed),
         errorCode: typeof failed.code === "string" ? failed.code : null,
         exitStatus: typeof failed.status === "number" ? failed.status : null,
       },
