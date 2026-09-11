@@ -10,11 +10,13 @@ import {
   BUZZ_SUBSCRIBER_CONFIG_FILENAME,
   MAX_RELAY_FRAME_BYTES,
   RELAY_RECONNECT_BACKOFF_MS,
+  ROLE_NOT_HELD_REPORT_AFTER,
   nativeRelaySocketFactory,
   parseBuzzSubscriberConfig,
   startBuzzMentionSubscriberFromStateDir,
   type BuzzMentionAdmission,
   type BuzzMentionRegistry,
+  type BuzzMentionRoleNotHeldReport,
   type BuzzMentionSink,
   type BuzzMentionSubscriberHandle,
   type BuzzRelaySocketFactory,
@@ -2143,6 +2145,136 @@ describe("the buzz mention subscriber's relay protocol", () => {
       expect((sentFrames(second)[1] as [string, string, Record<string, unknown>])[2]["since"]).toBeUndefined();
     } finally {
       handle.close();
+    }
+  });
+
+  /**
+   * One identity, one role it may or may not hold, and a reporter the test can read.
+   *
+   * Built here rather than on `startOne` because every row below moves the binding under the
+   * subscriber, which `startOne`'s fixed registry cannot express.
+   */
+  const startOneWhoseBindingMoves = (): {
+    handle: BuzzMentionSubscriberHandle;
+    identity: Identity;
+    owner: Identity;
+    reports: BuzzMentionRoleNotHeldReport[];
+    clock: VirtualClock;
+    sockets: ManualSocket[];
+    sink: RecordingSink;
+    hold: (bound: { roleKey: string; buzzActorId: string } | null) => void;
+  } => {
+    const stateDir = tempDir("acp-buzz-sub-run-");
+    const keys = tempDir("acp-buzz-keys-run-");
+    const identity = hexIdentity(keys, "cto.key");
+    const owner = hexIdentity(keys, "owner.key");
+    writeConfig(stateDir, configFor([{ keyFile: identity.keyFile, encoding: "hex" }]));
+    const sink = recordingSink();
+    const clock = virtualClock();
+    const transport = manualTransport();
+    const reports: BuzzMentionRoleNotHeldReport[] = [];
+    let held: { roleKey: string; buzzActorId: string } | null = {
+      roleKey: ROLE_KEY,
+      buzzActorId: identity.pubkey,
+    };
+    const handle = startBuzzMentionSubscriberFromStateDir(stateDir, {
+      registry: { primaryCtoBindingFor: () => held },
+      sink,
+      openSocket: transport.factory,
+      scheduler: clock.scheduler,
+      reportRoleNotHeld: (report) => reports.push(report),
+    });
+    return {
+      handle,
+      identity,
+      owner,
+      reports,
+      clock,
+      sockets: transport.sockets,
+      sink,
+      hold: (bound) => {
+        held = bound;
+      },
+    };
+  };
+
+  /**
+   * One mention, delivered on whatever connection is live, and the reconnect timer fired.
+   *
+   * The fire is what makes the next call a *consecutive* attempt rather than a second attempt on
+   * a socket the subscriber already dropped: a `role-not-held` rejection closes the connection,
+   * so without it every later delivery would arrive on a dead generation and be fenced out.
+   */
+  const deliverMention = async (
+    context: ReturnType<typeof startOneWhoseBindingMoves>,
+    createdAt: number,
+  ): Promise<void> => {
+    const socket = live(context.sockets);
+    await authenticate(socket, context.handle);
+    const subId = (sentFrames(socket)[1] as string[])[1] ?? "";
+    socket.handlers.onFrame(
+      frame([
+        "EVENT",
+        subId,
+        mentionEvent({ author: context.owner.secretKey, addressedTo: context.identity.pubkey, createdAt }),
+      ]),
+    );
+    await context.handle.settled();
+    context.clock.fireAll();
+  };
+
+  it("reports a role-not-held run that has stopped being explicable as a race", async () => {
+    const context = startOneWhoseBindingMoves();
+    try {
+      // The binding is gone and stays gone. Every rejection below takes the identical code path
+      // the single-event race takes, which is the whole difficulty: only the run tells them apart.
+      context.hold(null);
+      for (let attempt = 1; attempt <= ROLE_NOT_HELD_REPORT_AFTER; attempt += 1) {
+        expect(context.reports).toEqual([]);
+        await deliverMention(context, 1_800_002_000 + attempt);
+      }
+      expect(context.reports).toEqual([
+        {
+          identityPubkey: context.identity.pubkey,
+          roleKey: ROLE_KEY,
+          consecutive: ROLE_NOT_HELD_REPORT_AFTER,
+        },
+      ]);
+      expect(context.sink.admitted).toEqual([]);
+
+      // Once, for the whole run. A condition that repeats every thirty seconds and reports every
+      // time is a condition an operator filters out.
+      await deliverMention(context, 1_800_009_000);
+      expect(context.reports).toHaveLength(1);
+    } finally {
+      context.handle.close();
+    }
+  });
+
+  it("says nothing about a single role-not-held, which is the race the reconnect is for", async () => {
+    const context = startOneWhoseBindingMoves();
+    try {
+      // Exactly the case the code comment describes: the registry is mid-settle, one event is
+      // rejected, and the next attempt finds the binding. Reporting here would train an operator
+      // to skip the line that matters.
+      context.hold(null);
+      await deliverMention(context, 1_800_002_001);
+      expect(context.reports).toEqual([]);
+
+      context.hold({ roleKey: ROLE_KEY, buzzActorId: context.identity.pubkey });
+      await deliverMention(context, 1_800_002_002);
+      expect(context.reports).toEqual([]);
+      expect(context.sink.admitted).toHaveLength(1);
+
+      // And the run restarted, rather than resuming where the race left it: four more rejections
+      // after a binding that answered are still four, not five.
+      context.hold(null);
+      for (let attempt = 1; attempt < ROLE_NOT_HELD_REPORT_AFTER; attempt += 1) {
+        await deliverMention(context, 1_800_003_000 + attempt);
+      }
+      expect(context.reports).toEqual([]);
+    } finally {
+      context.handle.close();
     }
   });
 
