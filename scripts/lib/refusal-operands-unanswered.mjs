@@ -1,5 +1,6 @@
 /**
- * Every remaining unisolated operand in the six source files touched by #804.
+ * Every remaining unisolated operand in the six source files touched by #804, and in
+ * `canonical-self-claim-listener.ts`, which left the file-exclusion backlog under #833.
  * These are answers owed, not claims of unkillability or completed coverage. Each reason states
  * the missing independent witness or the neighbouring invariant that masks removal.
  * The 89-file backlog lives separately in refusal-operand-exclusions.mjs.
@@ -863,6 +864,32 @@ const groups = [
     reason: "NO WITNESS. An array first line reaches the same traffic outcome through body.ok !== false below — [1].ok is undefined, which is not false — so removing this operand changes no observable. Measured by removing it alone and diffing nineteen inputs against a recorded baseline, not inferred.",
     operands: [
       ["Array.isArray(parsed)",2],
+    ],
+  },
+  {
+    file: "src/daemon/canonical-self-claim-listener.ts",
+    // rawFd, the socket handle itself
+    // This entry is not "a test was not written". No input reaches the branch AND no row could
+    // credit it if one did, so both halves are stated: an absence of reach, and an obstruction.
+    reason: "NO WITNESS AND NOT ISOLABLE. `_handle` is non-null on every socket this listener is handed \u2014 measured on a real AF_UNIX accept, where it is an object whose `fd` is a number \u2014 and becomes null only after `destroy()`, which no peer can cause before the connection listener runs. There is therefore no input that reaches the null branch and no test that drives it. Nor could a row credit this operand if one did: the isolated mutant does not type-check (removing `handle &&` gives TS18049 \"'handle' is possibly 'null' or 'undefined'\" at both reads on that line), and the smallest mutation that does compile spans `typeof handle.fd === \"number\"` beside it, which has no witness of its own and would be credited without one.",
+    operands: [
+      ["handle",1],
+    ],
+  },
+  {
+    file: "src/daemon/canonical-self-claim-listener.ts",
+    // rawFd, the shape of the handle's fd field
+    reason: "NO WITNESS. `_handle.fd` is a number on every socket this platform hands the listener \u2014 measured on a real AF_UNIX accept: `typeof _handle.fd` is \"number\". This operand defends against a Node-internal shape reached through a cast (Node exposes no public API for a socket's raw fd), and no reachable input produces a handle whose `fd` is not a number, so removing it changes no observable. Measured, not inferred: the isolated mutant `return handle ? handle.fd : null;` compiles under `tsc --noEmit` and the three canonical self-claim listener suites pass 27 of 27 against it.",
+    operands: [
+      ["typeof handle.fd === \"number\"",1],
+    ],
+  },
+  {
+    file: "src/daemon/canonical-self-claim-listener.ts",
+    // serveCanonicalSelfClaimConnection, the params falsiness check
+    reason: "NO WITNESS. The `?? {}` on the line above absorbs both nullish values, so `rawParams` is never null or undefined here; every remaining falsy JSON value \u2014 false, 0, -0 and the empty string \u2014 has a typeof of boolean, number or string, so `typeof rawParams !== \"object\"` beside it is true whenever this operand is. Removing it changes no observable. Measured one operand at a time over all fifteen JSON-expressible params shapes (absent, null, 0, -0, 1, -1, 1.5, \"\", \"x\", false, true, [], [1], {}, {a:1}): zero differ.",
+    operands: [
+      ["!rawParams",1],
     ],
   },
 ];
