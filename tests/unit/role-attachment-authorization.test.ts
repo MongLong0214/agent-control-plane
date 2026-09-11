@@ -14,6 +14,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
+import { CanonicalSelfClaim, SELF_CLAIM_OPERATION } from "../../src/registry/canonical-self-claim.ts";
 import { RoleConversationPort } from "../../src/mcp/role-conversation.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { fixtureManifest, makeHarness, TEST_OWNER, type Harness } from "../helpers/harness.ts";
@@ -104,6 +105,59 @@ describe("role attachment authorization without sockets", () => {
     expect(credential.attachmentSecret).toEqual(expect.any(String));
     expect(credential.attachmentSecret).not.toBe(subject.sessionSecret);
     expect(h.cp.sessions.verifySecret(subject.sessionId, subject.sessionSecret).allowed).toBe(true);
+  });
+
+  it("canonical same-live successor issues a new attachment without inheriting old or foreign authority", async () => {
+    const uuid = "11111111-1111-4111-8111-111111111111";
+    const projectId = "attachment-project";
+    const guard = new IngressGuard(h.cp.db, h.clock, h.cp.audit, {
+      cli: { allowedActors: [TEST_OWNER.actor] }, buzz: { allowedActors: ["buzz:fixture"] },
+    });
+    const recovery = new CanonicalSelfClaim(h.cp.db, h.clock, h.cp.sessions, h.cp.bindings,
+      h.cp.ownerAuthority, guard, async () => allow(ReasonCode.OK, "buzz://fixture"), {
+        canonicalSessionUuid: uuid, requiredExecutorVersion: "0.0.0-test", canonicalBuzzChannelId: "fixture",
+        expectedExecutorRealpath: "/fake/claude", expectedExecutorSha256: `sha256:${"0".repeat(64)}`,
+        expectedCwd: "/fake/work", expectedPeerProtocolVersion: "fixture", expectedPeerIdentity: "fixture",
+      }, {
+        processInspector: { snapshot: (pid) => pid === 10 ? {
+          pid: 10, ppid: 1, argv: ["/fake/claude", "--session-id", uuid], command: "fixture",
+          cwd: "/fake/work", startedAt: "fixture-start",
+        } : null },
+        imageInspector: { resolve: () => ({ imagePath: "/fake/claude", version: "0.0.0-test", sha256: `sha256:${"0".repeat(64)}` }) },
+        transcriptReader: { locate: () => ({ path: "/fake/transcript", sizeBytes: 1 }) },
+      });
+    const claim = async (generation: number) => {
+      const decision = { runId: null, candidateSnapshotDigest: null, operation: SELF_CLAIM_OPERATION,
+        parameters: { domain: SELF_CLAIM_OPERATION, projectId, claimedSessionUuid: uuid,
+          role: "PRIMARY_CTO", expectedBindingGeneration: generation }, idempotencyKey: randomUUID(), approved: true };
+      const receipt = valueOf(guard.admitOwnerApproval({ channel: "cli", actor: TEST_OWNER.actor,
+        nonce: randomUUID(), payload: ownerApprovalPayload(decision) }, decision));
+      return valueOf(await recovery.claim({ callerPid: 10, claimedSessionUuid: uuid, projectId,
+        expectedBindingGeneration: generation, ownerApproval: receipt, peerProtocolVersion: "fixture",
+        peerIdentity: "fixture", buzzChannelId: "fixture", buzzActorId: "buzz:fixture", buzzPurpose: "fixture" }));
+    };
+    valueOf(h.cp.bindings.revoke(roleKey, "canonical fixture"));
+    const first = await claim(2);
+    subject = { sessionId: first.sessionId, sessionSecret: first.sessionSecret! };
+    const oldSubject = subject;
+    const oldCredential = grant();
+    expect(daemon.attachments.authorize(oldCredential).allowed).toBe(true);
+    const actor = h.cp.db.get(`SELECT actor_id FROM assignments WHERE assignment_id = ?`, [first.binding.assignmentId]);
+    valueOf(h.cp.bindings.revoke(roleKey, "lost attachment"));
+    const successor = await claim(3);
+    subject = { sessionId: successor.sessionId, sessionSecret: successor.sessionSecret! };
+    expect(h.cp.db.get(`SELECT actor_id FROM assignments WHERE assignment_id = ?`, [successor.binding.assignmentId])).toEqual(actor);
+    expect(daemon.attachments.authorize(oldCredential).allowed).toBe(false);
+    const receipt = approval();
+    expect(issue(receipt, oldSubject).allowed).toBe(false);
+    expect(issue(receipt, ready()).allowed).toBe(false);
+    expect(issue(receipt, { roleKey: "CEO" }).allowed).toBe(false);
+    const credential = valueOf(issue(receipt));
+    expect(credential.sessionId).toBe(successor.sessionId);
+    expect(credential.bindingGeneration).toBe(3);
+    expect(daemon.attachments.authorize(credential).allowed).toBe(true);
+    expect(daemon.attachments.connect(server(), port, credential).allowed).toBe(true);
+    expect(port.currentHolderConnected(roleKey)).toBe(true);
   });
 
   it("first-use window refuses an unattached credential after 60 seconds", () => {

@@ -8,7 +8,7 @@ import { isAcpError } from "../../src/core/errors.ts";
 import { newAssignmentId, normalizeRemoteIdentity } from "../../src/core/ids.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { canTransition, isTerminal } from "../../src/domain/run-state.ts";
-import { RunState } from "../../src/domain/types.ts";
+import { RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import { ManagedWriteGuard, ReadOperation, WriteOperation } from "../../src/guard/managed-write-guard.ts";
 import { fakeWorkspaceProbe, realWorkspaceProbe } from "../../src/guard/workspace-probe.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
@@ -156,6 +156,32 @@ describe("database hard constraints (PRD §30.2)", () => {
       db.run(`UPDATE sessions SET session_secret_hash = 'sha256:second' WHERE session_id = ?`, [seeded.sessionId]),
     ).toThrowError(/SESSION_SECRET_HASH_IMMUTABLE/);
   });
+
+  it.each([SessionLifecycle.STOPPED, SessionLifecycle.ERROR])(
+    "terminal %s secret is invalid while successor and immutable-hash guards remain intact", (terminal) => {
+      const { db, sessions } = makeCore();
+      const old = sessions.create({ provider: "claude", model: "fixture" });
+      expect(sessions.verifySecret(old.sessionId, old.sessionSecret!).allowed).toBe(true);
+      expect(sessions.transition(old.sessionId, SessionLifecycle.READY).allowed).toBe(true);
+      expect(sessions.verifySecret(old.sessionId, "wrong").allowed).toBe(false);
+      const hash = db.get(`SELECT session_secret_hash FROM sessions WHERE session_id = ?`, [old.sessionId]);
+      expect(sessions.transition(old.sessionId, terminal).allowed).toBe(true);
+      expect(sessions.verifySecret(old.sessionId, old.sessionSecret!)).toMatchObject({
+        allowed: false, reasonCode: ReasonCode.SESSION_SECRET_INVALID,
+      });
+      const next = sessions.create({ provider: "claude", model: "fixture" });
+      expect(sessions.transition(next.sessionId, SessionLifecycle.READY).allowed).toBe(true);
+      expect(sessions.verifySecret(next.sessionId, next.sessionSecret!).allowed).toBe(true);
+      expect(sessions.verifySecret(next.sessionId, old.sessionSecret!).allowed).toBe(false);
+      for (const replacement of [null, "0".repeat(64)]) {
+        expect(() => db.run(`UPDATE sessions SET session_secret_hash = ? WHERE session_id = ?`,
+          [replacement, old.sessionId])).toThrow(/SESSION_SECRET_HASH_IMMUTABLE/);
+      }
+      expect(() => db.run(`INSERT OR REPLACE INTO sessions SELECT * FROM sessions WHERE session_id = ?`,
+        [old.sessionId])).toThrow(/SESSION_NO_REPLACE/);
+      expect(db.get(`SELECT session_secret_hash FROM sessions WHERE session_id = ?`, [old.sessionId])).toEqual(hash);
+    },
+  );
 
   it("keeps a session's channel identity write-once (CP-HI-02)", () => {
     // Channel identity is write-once so allowlist membership cannot be moved onto a live
