@@ -47,8 +47,26 @@ import { ROLE_WAKE_FRAME, ROLE_WAKE_TOKEN } from "../../../src/mcp/role-conversa
 /** The repository this harness writes its durable artefacts under. Never anywhere else. */
 export const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 
-/** Where a run's raw capture is left. Git-ignored, so it survives the run without being a claim. */
+/**
+ * Where a *qualification* run leaves its raw capture — the directory `rawCapturePath` names in the
+ * committed receipt. Git-ignored, so it survives the run without being a claim.
+ *
+ * Only `qualify()` may write here. An ordinary `pnpm test` runs the same probe and used to write
+ * to this same directory, which meant the receipt's pointers stopped being evidence the moment
+ * anyone ran the suite: a reader following one got a capture from a different run, with nothing
+ * saying so (#837). The receipt's own summary numbers were never affected — they are values in
+ * committed JSON — but a pointer that claims more durability than it has is worse than no pointer.
+ */
 export const RAW_CAPTURE_DIR = "evidence/local/u6-wake-transport-qualification";
+
+/**
+ * Where the *suite's* probe leaves its capture. Deliberately a directory no receipt ever names.
+ *
+ * Separate constant rather than a temp dir, because the capture is still worth keeping after a
+ * failing test run — it is the whole diagnostic — and because a name beside the qualification
+ * one makes the split visible to whoever reads either.
+ */
+export const SUITE_CAPTURE_DIR = "evidence/local/u6-wake-transport-probe";
 
 /** The committed receipt this qualification produces, and the one the pin row reads back. */
 export const RECEIPT_PATH = "evidence/u6-wake-transport-qualification.json";
@@ -353,6 +371,16 @@ export interface ProbeOptions {
    * shorter one -- which is the property that makes its absence readable, not equal observation.
    */
   readonly settleCeilingMs?: number;
+  /**
+   * Which directory this run's durable capture goes in — `RAW_CAPTURE_DIR` for a qualification,
+   * `SUITE_CAPTURE_DIR` for the suite.
+   *
+   * Required, with no default, and that is the point. A default is what let the suite and the
+   * qualification write to one directory for as long as both existed; whichever value a default
+   * carried, the other caller would be the one silently writing somewhere it did not mean to.
+   * Making it a decision at each call site is the guard (#837).
+   */
+  readonly captureDir: string;
 }
 
 /**
@@ -418,7 +446,7 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
   let failure: unknown;
   let run: ProbeRun | undefined;
 
-  const durableDir = join(REPO_ROOT, RAW_CAPTURE_DIR, `${options.shape}-${options.inject ? "injection" : "control"}`);
+  const durableDir = join(REPO_ROOT, options.captureDir, `${options.shape}-${options.inject ? "injection" : "control"}`);
   const durableCapture = join(durableDir, "capture.jsonl");
   const durableLog = join(durableDir, "session.log");
 
@@ -695,7 +723,7 @@ export const qualify = async (): Promise<{ readonly receipt: QualificationReceip
   const runs: ProbeRun[] = [];
   for (const shape of ["interactive", "headless"] as const) {
     for (const inject of [true, false]) {
-      runs.push(await runQualificationProbe({ shape, inject }));
+      runs.push(await runQualificationProbe({ shape, inject, captureDir: RAW_CAPTURE_DIR }));
     }
   }
 

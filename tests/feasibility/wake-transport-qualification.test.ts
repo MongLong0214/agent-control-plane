@@ -22,6 +22,7 @@ import { describe, expect, it } from "vitest";
 import {
   RECEIPT_PATH,
   QUALIFICATION_ID,
+  SUITE_CAPTURE_DIR,
   armPassed,
   interactiveBlocker,
   readReceipt,
@@ -127,7 +128,10 @@ describe.skipIf(blocker !== null)("U6: the reading, re-taken", () => {
     if (existing) return existing;
     // Started once and shared: each arm costs a real client start, and two rows asking the same
     // question twice would measure the same thing at twice the price.
-    const started = runQualificationProbe({ shape: "interactive", inject });
+    // SUITE_CAPTURE_DIR, never RAW_CAPTURE_DIR: this run is a check, not a qualification, and the
+    // receipt's `rawCapturePath` rows must keep pointing at the run that produced the receipt
+    // (#837). The parameter is required precisely so this line has to say which one it is.
+    const started = runQualificationProbe({ shape: "interactive", inject, captureDir: SUITE_CAPTURE_DIR });
     measured.set(key, started);
     return started;
   };
