@@ -477,8 +477,8 @@ describe("canonical self-claim activation is an atomic pre-effect daemon contrac
     const diagnostics = `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
     expect(result.status, diagnostics).toBe(0);
     expect(result.stdout, diagnostics).toContain("canonical self-claim listener started");
-    expect(result.stdout, diagnostics).toContain("Buzz mention subscriber sockets: 0");
-    expect(result.stdout, diagnostics).not.toContain("Buzz mention subscriber sockets: 1");
+    expect(result.stdout, diagnostics).toContain("Buzz mention subscriber configured identities: 0");
+    expect(result.stdout, diagnostics).not.toContain("Buzz mention subscriber configured identities: 1");
     expectNoResidue(result, diagnostics);
   }, 40_000);
 
@@ -533,8 +533,8 @@ describe("#627: an owner's Buzz message reaches the CEO without a session child"
 
     const diagnostics = `status=${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
     expect(result.status, diagnostics).toBe(0);
-    expect(result.stdout, diagnostics).toContain("Buzz mention subscriber sockets: 0");
-    expect(result.stdout, diagnostics).not.toContain("Buzz mention subscriber sockets: 1");
+    expect(result.stdout, diagnostics).toContain("Buzz mention subscriber configured identities: 0");
+    expect(result.stdout, diagnostics).not.toContain("Buzz mention subscriber configured identities: 1");
   }, 40_000);
 
   it("leaves the message socket closed when the relay credential names no declared owner", async () => {
