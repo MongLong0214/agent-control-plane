@@ -229,15 +229,40 @@ export const runAttachRelay = async (
   return new Promise<number>((resolveRelay) => {
     const socket: Socket = createConnection(options.mcpSocketPath);
     let settled = false;
+    let resolved = false;
     let connected = false;
     let stdinEnded = false;
+    let stdoutFailed = false;
     let peeked = Buffer.alloc(0);
+    const settle = (code: number): void => {
+      if (resolved) return;
+      resolved = true;
+      resolveRelay(code);
+    };
+    /**
+     * Resolving is the last thing that happens, and it may not happen until stdout has flushed.
+     *
+     * The CLI turns this promise's value into `process.exit`, and stdout is a **pipe** under Claude
+     * Code, not a TTY. `process.exit` keeps only what the kernel has already accepted and discards
+     * whatever is still in Node's userspace write buffer — measured on this host at 34 470 of
+     * 100 006 bytes lost — so resolving while a write is outstanding truncates the daemon's own MCP
+     * stream and hands Claude Code a JSON-RPC line that stops mid-token. `writableEnded` is not the
+     * condition to wait on: `socket.pipe` has usually already called `end` by this point, and the
+     * bytes are still queued. `writableFinished` / the `finish` event is the one that means flushed.
+     *
+     * `stdin` is unpiped and paused first, so this wait is never a wait on the *other* direction:
+     * the socket is destroyed, and leaving the client's stdin flowing into it would trade a
+     * truncation for a hang, which is not a repair.
+     */
     const finish = (code: number): void => {
       if (settled) return;
       settled = true;
       socket.destroy();
+      io.stdin.unpipe(socket);
+      io.stdin.pause();
+      if (stdoutFailed || io.stdout.writableFinished) return settle(code);
+      io.stdout.once("finish", () => settle(code));
       if (!io.stdout.writableEnded) io.stdout.end();
-      resolveRelay(code);
     };
     const protocolFailure = (): void => {
       io.stderr.write("attach: handshake reply malformed\n");
@@ -269,7 +294,13 @@ export const runAttachRelay = async (
       stdinEnded = true;
     });
     io.stdin.once("error", () => finish(ATTACH_EXIT.STREAM_CLOSED));
-    io.stdout.once("error", () => finish(ATTACH_EXIT.STREAM_CLOSED));
+    io.stdout.once("error", () => {
+      // A stdout that errors will never emit `finish`, so the flush above has to stop waiting on
+      // it. This is the reader having gone away — there is nothing left to deliver to.
+      stdoutFailed = true;
+      if (settled) settle(ATTACH_EXIT.STREAM_CLOSED);
+      else finish(ATTACH_EXIT.STREAM_CLOSED);
+    });
     socket.once("connect", () => {
       connected = true;
       // One write, one string, one reference. The order is the whole correctness argument: this
