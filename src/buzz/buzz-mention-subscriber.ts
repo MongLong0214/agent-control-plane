@@ -60,6 +60,28 @@ export const MAX_RELAY_FRAME_BYTES = 256 * 1024;
  */
 export const RELAY_RECONNECT_BACKOFF_MS: readonly number[] = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
 
+/**
+ * How many consecutive `role-not-held` rejections for one identity stop being a race.
+ *
+ * The rejection itself is benign once and catastrophic when it persists, and the two are the same
+ * code path — so the only thing that tells them apart is how many times in a row it ran. A single
+ * one is the registry settling between a preflight and an event, which is ordinary operation and
+ * is deliberately silent; a run of them is a binding that is simply gone, and the loop below will
+ * then repeat every thirty seconds for as long as the daemon is up, saying nothing. That ran for
+ * 23 hours once (#811) while an operator relayed every message by hand.
+ *
+ * Five, because a race cannot reach it. Each rejection is an *independent* re-read of the
+ * registry, taken on its own connection, and the registry answers from one committed SQLite
+ * transaction — so five of them is not one glance repeated but five settled answers. They are also
+ * spread across four reconnect cycles: the socket is dropped before `EOSE` can reset `#attempt`,
+ * so the schedule grows, and the fifth rejection is about fifteen seconds after the first (1+2+4+8)
+ * — four seconds even at the backoff floor. No binding handoff spans either.
+ *
+ * It is not smaller because the report must never be the ordinary case: an operator who is told
+ * about every race learns to skip the line, and the one that matters is the same line.
+ */
+export const ROLE_NOT_HELD_REPORT_AFTER = 5;
+
 /** How an identity's secret key is written in its file. Declared, never sniffed. */
 export type BuzzSubscriberKeyEncoding = "hex" | "nsec";
 
@@ -421,6 +443,29 @@ export type BuzzRelaySocketFactory = (
   handlers: BuzzRelaySocketHandlers,
 ) => BuzzRelaySocket;
 
+/** One identity's `role-not-held` run, at the moment it stopped being explicable as a race. */
+export interface BuzzMentionRoleNotHeldReport {
+  /** The channel identity this subscriber speaks as. Public material: it is the `p` tag on the wire. */
+  readonly identityPubkey: string;
+  /** The role this subscriber was started for and is still trying to hold. */
+  readonly roleKey: string;
+  /** How many consecutive rejections produced this report. Equal to `ROLE_NOT_HELD_REPORT_AFTER`. */
+  readonly consecutive: number;
+}
+
+/**
+ * Where a persistent `role-not-held` condition is reported.
+ *
+ * Injected like every other collaborator here, so a test asserts on a value rather than on a file
+ * descriptor, and defaulted so a caller cannot obtain the silence this seam exists to end.
+ *
+ * This is not a rejection reason and does not widen `BuzzMentionRejection`'s rule that none of
+ * them is ever spoken: nothing is told this but the operator's own log, it names no event and no
+ * check, and the two fields it carries are a public key and a role key — neither derived from a
+ * key file's secret half.
+ */
+export type BuzzMentionRoleNotHeldReporter = (report: BuzzMentionRoleNotHeldReport) => void;
+
 /**
  * The timer seam. Injected so the reconnect schedule is a thing a test can *step*, rather than a
  * thing a test has to outlast: a table that proved the 30s cap by sleeping 61 seconds would be a
@@ -536,6 +581,23 @@ export const nativeRelaySocketFactory: BuzzRelaySocketFactory = (url, handlers) 
     },
     close: () => retire(false),
   };
+};
+
+/**
+ * `process.stderr`, which is what the daemon already reports an unbound role on.
+ *
+ * The same subject reaches an operator by the same route whether it was refused at startup
+ * (`BuzzMentionBindingUnavailableError`, reported by `agentcpd`) or went away afterwards, and
+ * launchd captures that stream for both. A queryable `daemon.status` field was the alternative
+ * and is not this change: it would make the subscriber a second authority on its own health,
+ * reachable only by someone who already suspected something, and the defect was that nobody did.
+ */
+const nativeRoleNotHeldReporter: BuzzMentionRoleNotHeldReporter = (report) => {
+  process.stderr.write(
+    `Buzz mention subscriber: ${report.identityPubkey} has not held ${report.roleKey} for ` +
+      `${report.consecutive} consecutive relay events; mentions for that role are not being ` +
+      "delivered. The subscriber keeps reconnecting; a fresh role claim is what ends this.\n",
+  );
 };
 
 /** `setTimeout` behind the seam. Unreferenced, so a subscriber never holds the process open. */
@@ -658,6 +720,7 @@ interface SubscriptionDeps {
   readonly registry: BuzzMentionRegistry;
   readonly openSocket: BuzzRelaySocketFactory;
   readonly scheduler: BuzzSubscriberScheduler;
+  readonly reportRoleNotHeld: BuzzMentionRoleNotHeldReporter;
 }
 
 /**
@@ -695,6 +758,13 @@ class BuzzMentionSubscription {
   /** The volatile high-water mark. Inclusive: `since` is `>=` on the wire. */
   #since: number | null = null;
   #attempt = 0;
+  /**
+   * Consecutive `role-not-held` rejections, reset by the first one that holds.
+   *
+   * Per subscription, which is per identity: one socket asserts one pubkey, so this counts a run
+   * for exactly the identity the report names and cannot be advanced by another one's trouble.
+   */
+  #roleNotHeldRun = 0;
   #timer: number | null = null;
   #stopped = false;
   /** Frames are handled one at a time; a second must not overtake the first's admission. */
@@ -835,6 +905,23 @@ class BuzzMentionSubscription {
    * destructive thing a frame handler can do — it closes a live socket — so it is the last place
    * that should be willing to act on behalf of a connection that has already gone.
    */
+  /**
+   * The run, and the one report it produces.
+   *
+   * Reported at exactly the threshold rather than on every rejection past it. A condition that
+   * repeats every thirty seconds would otherwise write two thousand identical lines a day, and a
+   * line an operator scrolls past is the silence this change is for, spelled differently.
+   */
+  #noteRoleNotHeld(): void {
+    this.#roleNotHeldRun += 1;
+    if (this.#roleNotHeldRun !== ROLE_NOT_HELD_REPORT_AFTER) return;
+    this.#deps.reportRoleNotHeld({
+      identityPubkey: this.#pubkey,
+      roleKey: this.#roleKey,
+      consecutive: this.#roleNotHeldRun,
+    });
+  }
+
   #reconnect(generation: number): void {
     if (!this.#isCurrent(generation)) return;
     this.#drop();
@@ -1037,9 +1124,16 @@ class BuzzMentionSubscription {
     if (!bound || bound.roleKey !== this.#roleKey || !constantTimeEquals(bound.buzzActorId, this.#pubkey)) {
       // A race, not a refusal: the cursor is preserved and the socket goes, so the same event is
       // asked for again once the registry has settled.
+      //
+      // Counted, because "the registry has settled" is a thing this loop asserts and never checks.
+      // The reconnect policy is unchanged and correct — what was missing is any way to tell a
+      // settling registry from one that has nothing left to settle into.
+      this.#noteRoleNotHeld();
       this.#reconnect(generation);
       return rejected("role-not-held");
     }
+    // The run ends here and only here: the binding answered, so whatever it was, it was a race.
+    this.#roleNotHeldRun = 0;
 
     const frozen: BuzzMentionEvent = deepFreeze(event);
     const admission = await this.#deps.sink.admit({
@@ -1125,6 +1219,8 @@ export interface BuzzMentionSubscriberOptions {
   readonly sink: BuzzMentionSink;
   readonly openSocket?: BuzzRelaySocketFactory;
   readonly scheduler?: BuzzSubscriberScheduler;
+  /** Defaulted, never absent: an omitted reporter would restore the silence, not opt out of it. */
+  readonly reportRoleNotHeld?: BuzzMentionRoleNotHeldReporter;
 }
 
 /** A role between holders refuses subscription without making daemon startup fatal. */
@@ -1151,6 +1247,7 @@ export const startBuzzMentionSubscriber = (
     registry: options.registry,
     openSocket: options.openSocket ?? nativeRelaySocketFactory,
     scheduler: options.scheduler ?? nativeSubscriberScheduler(),
+    reportRoleNotHeld: options.reportRoleNotHeld ?? nativeRoleNotHeldReporter,
   };
 
   const seenPaths = new Set<string>();
