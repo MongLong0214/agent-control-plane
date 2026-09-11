@@ -702,6 +702,52 @@ type BuzzMentionRejection =
   | "event-conversation-unusable"
   | "role-not-held";
 
+/**
+ * What this subscriber has actually seen, as opposed to what it was configured to see.
+ *
+ * The only operator-visible signal for this path was `socketCount`, which is the number of
+ * configured identities captured once at startup — not a connection, not a subscription, and
+ * certainly not a frame. A subscriber that authenticates, reaches EOSE and never wakes again is
+ * indistinguishable from a healthy one under that number, and this file's own comment says so
+ * (`BuzzSubscriberIdentity.rooms`). #841.
+ *
+ * `framesHandled` is the fact that was missing: zero means nothing arrived, and that is a
+ * different repair from "arrived and was refused". The rejection tally separates the second case
+ * into its reasons, because "the relay stopped attaching `p` tags" and "this runtime is the CTO of
+ * two projects" are different problems that a bare refusal count cannot tell apart.
+ */
+export interface BuzzMentionCounters {
+  /** Frames that reached `#handleFrame`, whatever became of them. */
+  readonly framesHandled: number;
+  /** Frames that produced an admission attempt — the only outcome that can reach a session. */
+  readonly admitted: number;
+  /** One entry per rejection reason actually seen; absent reasons are absent, never zero rows. */
+  readonly rejections: Readonly<Record<string, number>>;
+}
+
+/** Accumulates one subscription's outcomes. Plain counters: no sampling, no decay, no reset. */
+class FrameTally {
+  #framesHandled = 0;
+  #admitted = 0;
+  readonly #rejections = new Map<BuzzMentionRejection, number>();
+
+  record(outcome: BuzzMentionFrameOutcome): void {
+    this.#framesHandled += 1;
+    if (outcome.admission !== null) this.#admitted += 1;
+    if (outcome.rejected !== null) {
+      this.#rejections.set(outcome.rejected, (this.#rejections.get(outcome.rejected) ?? 0) + 1);
+    }
+  }
+
+  snapshot(): BuzzMentionCounters {
+    return {
+      framesHandled: this.#framesHandled,
+      admitted: this.#admitted,
+      rejections: Object.fromEntries(this.#rejections),
+    };
+  }
+}
+
 /** What one identity's connection did with one frame. */
 interface BuzzMentionFrameOutcome {
   readonly rejected: BuzzMentionRejection | null;
@@ -769,6 +815,7 @@ class BuzzMentionSubscription {
   #stopped = false;
   /** Frames are handled one at a time; a second must not overtake the first's admission. */
   #queue: Promise<void> = Promise.resolve();
+  readonly #tally = new FrameTally();
 
   constructor(
     deps: SubscriptionDeps,
@@ -809,7 +856,11 @@ class BuzzMentionSubscription {
           // is not the last, because `#handleFrame` suspends on the sink.
           if (!this.#isCurrent(generation)) return;
           try {
-            await this.#handleFrame(raw, generation);
+            // The outcome was discarded here, which is why "connected and silent" and "receiving
+            // and refusing" looked the same from outside (#841). Counted before anything can
+            // throw past it; a sink that throws is handled below and is not a frame that never
+            // arrived.
+            this.#tally.record(await this.#handleFrame(raw, generation));
           } catch {
             // A sink that threw established nothing about the message, so this is the `RETRY`
             // shape and is treated as one: the cursor stays where it is and the socket goes.
@@ -926,6 +977,10 @@ class BuzzMentionSubscription {
     if (!this.#isCurrent(generation)) return;
     this.#drop();
     this.#onClose();
+  }
+
+  counters(): BuzzMentionCounters {
+    return this.#tally.snapshot();
   }
 
   async #handleFrame(raw: string, generation: number): Promise<BuzzMentionFrameOutcome> {
@@ -1184,8 +1239,21 @@ class BuzzMentionSubscription {
 
 /** What a started subscriber offers its caller, and what a disabled one offers instead. */
 export interface BuzzMentionSubscriberHandle {
-  /** How many relay connections this daemon holds open. Zero whenever the path is not configured. */
+  /**
+   * How many identities this daemon was *configured* to subscribe as, fixed at startup.
+   *
+   * Not a liveness signal, and it used to be documented as one ("how many relay connections this
+   * daemon holds open"). It is `prepared.length`, captured once; a socket that later dropped, an
+   * authentication that never completed, a `REQ` the relay refused — none of them move it. Read
+   * `counters()` for what this subscriber has actually seen (#841).
+   */
   readonly socketCount: number;
+  /**
+   * Receipt, summed across every identity. `framesHandled === 0` on a subscriber that has been up
+   * for a while is the reading that separates "connected and receiving nothing" from "receiving
+   * and refusing", which no number here could distinguish before.
+   */
+  counters(): BuzzMentionCounters;
   readonly relayUrl: string | null;
   /** The roles this daemon subscribes for, in config order. */
   readonly roleKeys: readonly string[];
@@ -1204,6 +1272,7 @@ export interface BuzzMentionSubscriberHandle {
 /** The disabled outcome, stated rather than implied by a null. */
 const DISABLED: BuzzMentionSubscriberHandle = {
   socketCount: 0,
+  counters: () => ({ framesHandled: 0, admitted: 0, rejections: {} }),
   relayUrl: null,
   roleKeys: [],
   rooms: [],
@@ -1327,6 +1396,23 @@ export const startBuzzMentionSubscriber = (
 
   return {
     socketCount: prepared.length,
+    // Summed rather than per-identity: the operator question this answers is "is anything
+    // arriving at all", and a per-identity breakdown is a later refinement of an answer that does
+    // not exist yet.
+    counters: () => {
+      const totals = prepared.map((subscription) => subscription.counters());
+      const rejections: Record<string, number> = {};
+      for (const one of totals) {
+        for (const [reason, count] of Object.entries(one.rejections)) {
+          rejections[reason] = (rejections[reason] ?? 0) + count;
+        }
+      }
+      return {
+        framesHandled: totals.reduce((sum, one) => sum + one.framesHandled, 0),
+        admitted: totals.reduce((sum, one) => sum + one.admitted, 0),
+        rejections,
+      };
+    },
     relayUrl: options.config.relayUrl,
     roleKeys,
     rooms: [...rooms],
