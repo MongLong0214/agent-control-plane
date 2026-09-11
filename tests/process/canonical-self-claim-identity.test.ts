@@ -215,6 +215,37 @@ const spawnHeld = (executable: string, identityArgs: readonly string[], cwd: str
   return child;
 };
 
+/**
+ * #826. The new-inode census (`scripts/verify-tests-do-not-exec-new-inodes.mjs`) pairs a creation
+ * site with an exec site inside one file, and its own footer says what that cannot see: "Syntax
+ * only, one file at a time". Reuse is a runtime property, so removing it — recopying on every run
+ * while keeping the staging copy, the `linkSync` and the exec of `dest` exactly as they are —
+ * leaves that census reporting PASS while #817 returns in full at the most expensive site measured.
+ *
+ * This asserts the property instead of the syntax. Two publishes of one relative path must be one
+ * inode, because Gatekeeper assesses per inode: ~1.6s of `syspolicyd` work for a fresh Mach-O
+ * against ~0.02s for one already assessed, and enough of the former wedges it machine-wide.
+ */
+describe("the reusable executable image is reused, not recreated", () => {
+  it("publishes one inode for one relative path, so Gatekeeper assesses it once", () => {
+    // A path no other test in this file publishes, so the two calls below are the only writers
+    // and a shared `IMAGE_FIXTURE_ROOT` from a concurrent file cannot be what makes them agree.
+    const relative = join("versions", "9.9.9-inode-reuse-probe", "claude");
+
+    const first = reusableExecutableImage(relative);
+    const firstStat = statSync(first);
+
+    const second = reusableExecutableImage(relative);
+    const secondStat = statSync(second);
+
+    expect(second).toBe(first);
+    // The inode, not the path or the size. A recopy publishes the same bytes at the same path and
+    // passes every weaker assertion — it is precisely the change that would be invisible.
+    expect(secondStat.ino).toBe(firstStat.ino);
+    expect(secondStat.dev).toBe(firstStat.dev);
+  });
+});
+
 describe("real process ancestry — ps-backed, not a fake", () => {
   it("reports the exact command line, a resolvable start time, and the real cwd of a live process", async () => {
     const root = tempRoot();
