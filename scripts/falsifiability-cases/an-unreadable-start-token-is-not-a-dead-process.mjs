@@ -18,8 +18,8 @@ const anUnreadableStartTokenIsNotADeadProcess = {
   id: "an-unreadable-start-token-is-not-a-dead-process",
   what: "a live pid whose start token cannot be read is unknown, not gone, so the strict same-live branch stays engaged",
   file: "src/registry/canonical-self-claim.ts",
-  find: "    if (observed.startedAt === null) return false;\n",
-  replace: "    if (observed.startedAt === null) return true;\n",
+  find: '      }) === "DEAD"\n',
+  replace: '      }) !== "ALIVE"\n',
   killedBy: [
     "tests/unit/canonical-self-claim.test.ts::a predecessor pid that is live but whose start token cannot be read is not gone",
   ],

@@ -12,10 +12,10 @@
  */
 const aPredecessorRowIsNotAPredecessorProcess = {
   id: "a-predecessor-row-is-not-a-predecessor-process",
-  what: "a predecessor pid that resolves to no process is gone, so the restarted claim is not the same-live branch's case",
+  what: "the existence probe is what establishes death; without it no predecessor is ever gone",
   file: "src/registry/canonical-self-claim.ts",
-  find: "    if (observed === null) return true;\n",
-  replace: "    if (observed === null) return false;\n",
+  find: "        signal: this.#processSignal,\n",
+  replace: "        signal: () => undefined,\n",
   killedBy: [
     "tests/unit/canonical-self-claim.test.ts::a restarted canonical runtime claims the next generation when the predecessor row is READY and its process is gone",
   ],
