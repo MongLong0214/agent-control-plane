@@ -14,12 +14,13 @@ const aProbeTimeoutIsNotAnUnreachableBinary = {
   file: "src/registry/canonical-self-claim.ts",
   find: '  failed.code === "ETIMEDOUT" ? "TIMED_OUT" : "SCAN_FAILED";\n',
   replace: '  "SCAN_FAILED";\n',
-  // Both rows call `probeFailureKind`, so both die under this mutation. The harness runs only the
-  // first — `vitestArgsFor` passes one `-t` per entry — but listing one would leave the record
-  // saying the neighbour survives, and it does not.
+  // One entry, because `vitestArgsFor` builds a single `-t` pattern and throws on two distinct
+  // names (`verify-guards-are-falsifiable.mjs:91-93`). Recorded here instead: the very next
+  // `it()`, "execFileSync reports a timeout as ETIMEDOUT and never sets killed", also dies under
+  // this mutation, because it calls `probeFailureKind` on a real throw. Measured with no `-t`
+  // filter: 2 failed, 73 passed. The 73 are the neighbours.
   killedBy: [
     "tests/unit/canonical-self-claim.test.ts::a probe killed by its own budget classifies as TIMED_OUT, and an exit status does not",
-    "tests/unit/canonical-self-claim.test.ts::execFileSync reports a timeout as ETIMEDOUT and never sets killed",
   ],
 };
 
