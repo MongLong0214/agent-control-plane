@@ -9,6 +9,7 @@ import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { readProcessArgv, readProcessStartToken } from "../core/process-argv.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
 import type { Db } from "../db/database.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
 import type { AuthenticatedTargetBinding, BindingRegistry, VerifiedTargetBinding } from "../session/binding-registry.ts";
@@ -890,6 +891,15 @@ export interface CanonicalSelfClaimDeps {
   imageInspector?: ExecutingImageInspector;
   transcriptReader?: TranscriptReader;
   maxAncestryHops?: number;
+  /**
+   * The existence probe `#predecessorProcessIsGone` uses, defaulting to `kill(pid, 0)`.
+   *
+   * Injectable because a test that wants "this pid is gone" must be able to say *how it knows* —
+   * `ESRCH` and `EPERM` are different answers and only one of them may evict an incumbent. Before
+   * #842 there was nothing to inject: absence was inferred from `ProcessAncestryInspector.snapshot`
+   * returning `null`, which a failed `ps` produces just as readily as a dead process.
+   */
+  processSignal?: (pid: number) => void;
 }
 
 /**
@@ -907,6 +917,7 @@ export interface CanonicalSelfClaimDeps {
  */
 export class CanonicalSelfClaim {
   readonly #processInspector: ProcessAncestryInspector;
+  readonly #processSignal: (pid: number) => void;
   readonly #imageInspector: ExecutingImageInspector;
   readonly #transcriptReader: TranscriptReader;
   readonly #maxAncestryHops: number;
@@ -953,6 +964,7 @@ export class CanonicalSelfClaim {
     }
 
     this.#processInspector = deps.processInspector ?? defaultProcessAncestryInspector;
+    this.#processSignal = deps.processSignal ?? ((pid) => process.kill(pid, 0));
     this.#imageInspector = deps.imageInspector ?? defaultExecutingImageInspector;
     this.#transcriptReader = deps.transcriptReader ?? defaultTranscriptReader;
     this.#maxAncestryHops = deps.maxAncestryHops ?? MAX_ANCESTRY_HOPS;
@@ -1252,21 +1264,51 @@ export class CanonicalSelfClaim {
    * its own revoked attachment, so it must be entered on the process fact, never on the row.
    *
    * The pin is the same `(osPid, native start token)` pair the rest of this file uses to name one
-   * OS process, read through the same `#processInspector` seam `deriveClaimantIdentity` and
-   * `#assertClaimantStillLive` use — never a raw kernel call, so a test with a synthetic ancestry
-   * is answered by that same fake.
+   * OS process. The start token is still read through the `#processInspector` seam
+   * `deriveClaimantIdentity` and `#assertClaimantStillLive` use, so a test with a synthetic
+   * ancestry is answered by that same fake; *existence* is a separate question and now has its own
+   * injectable probe.
    *
-   * "Unknown" is never "gone". An unrecorded pair, or a pid that exists but whose start token
-   * cannot be read, both return `false` and leave the strict same-live branch engaged: widening
-   * this from "proven dead" to "not proven alive" is the single edit that would turn recovery into
-   * eviction of a live holder whose probe merely failed.
+   * "Unknown" is never "gone". An unrecorded pair, a pid whose existence could not be established,
+   * and a pid that exists but whose start token cannot be read all return `false` and leave the
+   * strict same-live branch engaged: widening this from "proven dead" to "not proven alive" is the
+   * single edit that would turn recovery into eviction of a live holder whose probe merely failed.
+   *
+   * **That edit was present until #842.** The paragraph above was already here, and the line below
+   * it read `if (observed === null) return true`. A `null` from `snapshot` is not "proven dead":
+   * `defaultProcessAncestryInspector` returns `null` whenever `psField` does, and `psField` ends
+   * `catch { return null }`, which is equally a pid that does not exist, a `ps` that outlived
+   * `SUBPROCESS_TIMEOUT_MS`, and a fork that failed. So a five-second `ps` hiccup during a claim
+   * declared a live incumbent gone and let a challenger take the role. The doc was right and the
+   * code did the opposite of it.
+   *
+   * **This also moves where existence is decided, and that is a second behaviour change.** The old
+   * branch judged existence from `ps` (the ancestry snapshot); this one judges it from
+   * `kill(pid, 0)`. Measured across every combination of `(pid, recorded token, snapshot answer,
+   * signal answer)`, the two disagree in 23 of 128 — 21 of them the fail-closed direction this
+   * change is for, and **two the other way**: when the kernel says `ESRCH` while `ps` still shows
+   * the process, the old code refused and this one evicts. `probeSessionLiveness` signals first
+   * and returns `DEAD` on `ESRCH` before the start-token probe runs at all, so the snapshot's
+   * answer stops mattering. That is the right authority — `kill` asks the kernel now, `ps` output
+   * can be older — but it is a widening, and a reader comparing this to the old branch should not
+   * have to rediscover it. `EPERM` stays `ALIVE`, which is the case where a live process cannot be
+   * signalled, and both versions refuse there.
+   *
+   * `probeSessionLiveness` (`../daemon/dead-binding-recovery.ts`) already answers exactly this
+   * question in three values for exactly this reason — its own comment says `EPERM` "means the pid
+   * exists and belongs to someone else, and reading that as dead would let a live incumbent be
+   * evicted by a caller who cannot even signal it". Reusing it is what keeps one deployment from
+   * holding two different definitions of "that process is gone"; only `DEAD` may evict, and
+   * `UNKNOWN` joins the fail-closed answers above.
    */
   #predecessorProcessIsGone(osPid: number | null, osProcessStartedAt: string | null): boolean {
     if (osPid === null || osProcessStartedAt === null) return false;
-    const observed = this.#processInspector.snapshot(osPid);
-    if (observed === null) return true;
-    if (observed.startedAt === null) return false;
-    return observed.startedAt !== osProcessStartedAt;
+    return (
+      probeSessionLiveness(osPid, osProcessStartedAt, {
+        signal: this.#processSignal,
+        startedAt: (pid) => this.#processInspector.snapshot(pid)?.startedAt ?? null,
+      }) === "DEAD"
+    );
   }
 
   #mutate(

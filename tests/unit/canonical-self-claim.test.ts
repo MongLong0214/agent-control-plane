@@ -98,6 +98,25 @@ const chainInspector = (chain: readonly ProcessSnapshot[]): ProcessAncestryInspe
   snapshot: (pid) => chain.find((entry) => entry.pid === pid) ?? null,
 });
 
+/**
+ * The existence probe that matches a synthetic ancestry: a pid in the chain answers, one outside
+ * it raises `ESRCH`.
+ *
+ * Default rather than per-test, because before #842 existence was *inferred* from
+ * `chainInspector.snapshot(pid) === null` and every test was written against that inference. This
+ * keeps those tests saying what they always said. What changes is that they now say it — the
+ * production path no longer reads a `null` snapshot as proof of death, so a test that wants
+ * "gone" has to supply a probe that reports gone.
+ *
+ * Nothing here may fall through to the real `process.kill`: pids like 10 and 11 are live system
+ * processes on a Darwin host, so a test that reached the kernel would answer `EPERM` and pass or
+ * fail on what else happens to be running.
+ */
+const signalFromChain = (chain: readonly ProcessSnapshot[]) => (pid: number): void => {
+  if (chain.some((entry) => entry.pid === pid)) return;
+  throw Object.assign(new Error(`no such process: ${pid}`), { code: "ESRCH" });
+};
+
 const claudeAncestor = (overrides: Partial<ProcessSnapshot> = {}, sessionUuid = CANON): ProcessSnapshot => ({
   pid: 10,
   ppid: 1,
@@ -270,6 +289,7 @@ const makeSubject = (
     ownerAuthority?: OwnerAuthorityPort;
     buzzActorAuthenticator?: BuzzActorAuthenticator;
     resolveBuzzAddress?: (purpose: string) => Promise<Decision<string>>;
+    processSignal?: (pid: number) => void;
   } = {},
 ): CanonicalSelfClaim =>
   new CanonicalSelfClaim(
@@ -285,6 +305,7 @@ const makeSubject = (
       processInspector: chainInspector(options.chain ?? standardChain()),
       imageInspector: options.imageInspector ?? fakeImageInspector(),
       transcriptReader: options.transcriptReader ?? fakeTranscriptReader(),
+      processSignal: options.processSignal ?? signalFromChain(options.chain ?? standardChain()),
     },
   );
 
@@ -1524,6 +1545,64 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       `SELECT session_id FROM sessions WHERE buzz_actor_id = ? AND lifecycle NOT IN ('STOPPED','ERROR')`,
       ["buzz:canonical-cto"],
     )).toEqual([{ session_id: successor.sessionId }]);
+  });
+
+  /**
+   * #842. The twin of the test above, differing in exactly one fact: the ancestry probe answers
+   * `null` for the predecessor's pid — as it does when `ps` outlives `SUBPROCESS_TIMEOUT_MS` — but
+   * the process is there and answers a signal.
+   *
+   * Until #842 a `null` snapshot *was* the death certificate, so this claim succeeded and the role
+   * moved off a live incumbent because a probe was slow. The two tests share a chain and differ
+   * only in `processSignal`, which is what makes the distinction the subject rather than a
+   * side effect of some other difference.
+   *
+   * `EPERM` is the signal error used deliberately: it is the case where the kernel confirms the
+   * pid exists and this process may not signal it, which is the strongest "alive" a failed signal
+   * can report. A probe that cannot even decide (`UNKNOWN`) is the same refusal for a weaker
+   * reason, and the branch treats both the same way on purpose.
+   */
+  it("a predecessor whose ancestry probe failed but whose process answers a signal keeps the role", async () => {
+    const core = makeCore();
+    const projectId = "prj_probe_failed_not_dead";
+    insertProject(core, projectId);
+    const first = await makeSubject(core).claim(baseRequest(core, projectId));
+    expect(first.allowed, JSON.stringify(first)).toBe(true);
+    if (!first.allowed) return;
+    const predecessor = core.sessions.require(first.value.sessionId);
+    expect(predecessor.lifecycle).toBe(SessionLifecycle.READY);
+    expect(core.bindings.revoke(roleKeyFor(Role.PRIMARY_CTO, { projectId }), "lost attachment").allowed).toBe(true);
+
+    // Byte-for-byte the chain from the test above: the predecessor's pid resolves to nothing.
+    const restarted = [
+      standardChain()[0]!,
+      { ...standardChain()[1]!, ppid: 11 },
+      claudeAncestor({ pid: 11, startedAt: "Fri Jan  1 02:00:00 2027" }),
+    ];
+    expect(chainInspector(restarted).snapshot(predecessor.osPid!)).toBeNull();
+
+    const claimed = await makeSubject(core, {
+      chain: restarted,
+      // The one difference. The pid is not in the chain, so the default probe would raise ESRCH
+      // and the claim would succeed; EPERM says the process is there.
+      processSignal: (pid) => {
+        if (pid === predecessor.osPid) {
+          throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+        }
+      },
+    }).claim(baseRequest(core, projectId, {
+      expectedBindingGeneration: 2,
+      ownerApproval: mintOwnerApproval(core, { projectId, claimedSessionUuid: CANON, expectedBindingGeneration: 2 }),
+    }));
+
+    expect(claimed.allowed, JSON.stringify(claimed)).toBe(false);
+    // The incumbent is untouched: still READY, still holding the canonical Buzz identity. A role
+    // handed away and handed back would satisfy a bare "refused" assertion; this does not.
+    expect(core.sessions.require(first.value.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+    expect(core.db.all(
+      `SELECT session_id FROM sessions WHERE buzz_actor_id = ? AND lifecycle NOT IN ('STOPPED','ERROR')`,
+      ["buzz:canonical-cto"],
+    )).toEqual([{ session_id: first.value.sessionId }]);
   });
 
   /**
