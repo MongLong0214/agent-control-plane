@@ -140,9 +140,30 @@ for (const [file, reason] of FILE_EXCLUSIONS) {
     problems.push(`${file}: stale file exclusion or missing unanswered-backlog reason`);
   }
 }
+// Printed rather than written into either list's header prose. Three branches in a row
+// decremented the same literal from their own base and the rebase conflicted on the number
+// instead of on any logic (#833); resolving one of those by arithmetic is the exact staleness
+// the header warns about, so the header no longer states it and this does.
+const excludedOperands = excluded.reduce((sum, { operands }) => sum + operands.size, 0);
+const selectedOperands = selected.reduce((sum, { operands }) => sum + operands.size, 0);
+const repositoryOperands = candidates.reduce((sum, { operands }) => sum + operands.size, 0);
+// The two parts must be the whole. A number that is merely printed can be frozen at whatever it
+// happened to be — which is how the header prose stayed plausible through three removals — and a
+// frozen number is undetectable on the commit that freezes it. This is what makes it detectable:
+// the split has to reconcile with the population it was split from, so freezing either side is a
+// refusal rather than a quietly wrong report.
+if (selectedOperands + excludedOperands !== repositoryOperands) {
+  process.stdout.write(
+    `RESULT: FAIL — the census's own split does not reconcile: ${selectedOperands} selected + ` +
+      `${excludedOperands} excluded != ${repositoryOperands} counted across ` +
+      `${candidates.length} deciding file(s). One of these is not being derived from the lists.\n`,
+  );
+  process.exit(1);
+}
 process.stdout.write(
-  `CENSUS: scanned ${files.length} file(s); selected ${selected.length} deciding file(s); ` +
-    `excluded ${excluded.length} deciding file(s) with unanswered operands; ` +
+  `CENSUS: scanned ${files.length} file(s); selected ${selected.length} deciding file(s) ` +
+    `holding ${selectedOperands} operand(s); excluded ${excluded.length} deciding file(s) ` +
+    `holding ${excludedOperands} unanswered operand(s), ${repositoryOperands} in total; ` +
     `${files.length - candidates.length} file(s) contain no &&/|| operands.\n` +
     // Printed every run, next to the numbers it qualifies. The selected/excluded split above is
     // about which *files* this census reads; this line is about which *refusals* it can see at
@@ -190,5 +211,6 @@ if (unknown || problems.length) {
   process.exit(1);
 }
 process.stdout.write(`RESULT: PASS — ${named} of ${total} operand(s) in ${selected.length} file(s) ` +
-  `are named by a falsifiability row; ${known} known and unanswered; ${excluded.length} excluded files' ` +
-  `operands remain unanswered. Named is not tested; this is not complete coverage.\n`);
+  `are named by a falsifiability row; ${known} known and unanswered; ${excludedOperands} operand(s) ` +
+  `in ${excluded.length} excluded file(s) remain unanswered. ` +
+  `Named is not tested; this is not complete coverage.\n`);
