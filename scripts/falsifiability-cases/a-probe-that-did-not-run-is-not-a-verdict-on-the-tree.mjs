@@ -8,15 +8,21 @@
  * return by throwing `GIT_TIMEOUT`, which fell into the same catch, and a real work tree was
  * reported as not being one. A merge-gate review reproduced it at 403 ms on a genuine work tree.
  *
- * The mutation inverts the test, which sends a probe that did not run to the `NOT_FOUND` branch —
- * the shipped defect — and git's real answer to the probe branch. It is killed by the case whose
- * git cannot be resolved at all: the same "did not run" class as a timeout, and the only member of
- * it a test can produce without waiting out a bound.
+ * The mutation replaces git's own answer with "the evidence carries a numeric exit code", which is
+ * the discriminator the **first** repair of this defect used and a merge-gate review disproved two
+ * ways. The killing case is the 128 one on purpose: the mutant and the real code answer
+ * *identically* for a missing binary, because that shape carries `failureCode` and no `exitCode` —
+ * so only a numeric exit on a real work tree separates them, which is what `fatal: detected
+ * dubious ownership` produces. Measured: naming the missing-binary case left the row SURVIVED.
  *
- * Inverted rather than forced to `if (true)`, and that is not a style choice. `if (true)` makes
- * the statements after the block unreachable, TypeScript does not apply narrowing in unreachable
- * code, and `err` reverts to `unknown` — the mutant then dies of TS18046 rather than of a test,
- * which is not a row. Measured with `--only` before this sentence was written.
+ * `git()` was also synthesizing `exitCode: 1` for a child killed by an outside signal, and
+ * `rev-parse` exits **128** for every fatal — `fatal: detected dubious ownership` on a path that
+ * *is* a work tree. So the mutant is not a hypothetical: it is the shipped code of the previous
+ * round, and both of its triggers have their own killing cases in the same file.
+ *
+ * Only git's words establish non-membership. That is the rule `probeWorktree`
+ * (src/guard/workspace-probe.ts) already applied to this same question, and this site now shares
+ * it rather than inventing a second answer.
  *
  * Its sibling case in the same file is the control: a plain directory, with git working, must
  * still be `NOT_FOUND`. Without it a registry that forwarded *everything* would pass the row while
@@ -27,10 +33,10 @@ const aProbeThatDidNotRunIsNotAVerdictOnTheTree = {
   id: "a-probe-that-did-not-run-is-not-a-verdict-on-the-tree",
   what: "a work-tree probe that could not run refuses as a probe failure, never as a claim that the path is no work tree",
   file: "src/registry/repository-registry.ts",
-  find: '    if (typeof err.evidence["exitCode"] === "number") {\n',
-  replace: '    if (typeof err.evidence["exitCode"] !== "number") {\n',
+  find: "    if (namesNoWorkTree(err.message)) {\n",
+  replace: '    if (typeof err.evidence["exitCode"] === "number") {\n',
   killedBy: [
-    "tests/unit/a-probe-that-did-not-run-is-not-an-answer-about-the-tree.test.ts::does not tell the owner a real work tree is not one when git could not run",
+    "tests/unit/a-probe-that-did-not-run-is-not-an-answer-about-the-tree.test.ts::does not read a fatal 128 as git answering, when the path is a work tree",
   ],
 };
 

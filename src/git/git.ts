@@ -140,24 +140,39 @@ export const git = async (
     // a *string* `code`, so `e.code ?? 1` produced the string as an exit code and `allowFailure`
     // handed it to a caller reading `exitCode !== 0` as "git said no" — the collapse #859 exists
     // to remove, one shape narrower than before.
-    const didNotRun = timedOut || typeof e.code === "string";
-    const numericExit = typeof e.code === "number" ? e.code : 1;
+    // A child that produced no exit code did not answer, whatever killed it. `killed` is Node's
+    // own flag for "I sent the signal", so it is **false** when launchd, systemd, an OOM kill or a
+    // stray `pkill` is what ended the process — measured on Node 22 as
+    // `{ code: null, signal: "SIGTERM", killed: false }`. An earlier version of this file tested
+    // `killed` and so classified that shape as git answering, then manufactured `exitCode: 1` for
+    // it, which is the value `git status --porcelain` uses to say *no*. A merge-gate review
+    // reproduced the whole collapse from there.
+    const signalled = (e.code ?? null) === null;
+    const didNotRun = timedOut || typeof e.code === "string" || signalled;
     const detail = timedOut
       ? `git ${args.join(" ")} exceeded its ${timeout}ms bound and was killed`
       : typeof e.code === "string"
         ? `git ${args.join(" ")} did not run: ${e.code}`
-        : `git ${args.join(" ")} failed: ${e.stderr ?? e.message}`;
+        : signalled
+          ? `git ${args.join(" ")} was killed by ${e.signal ?? "an unknown signal"} without answering`
+          : `git ${args.join(" ")} failed: ${e.stderr ?? e.message}`;
     if (options.allowFailure && !didNotRun) {
-      return { stdout: e.stdout ?? "", stderr: e.stderr ?? e.message ?? "", exitCode: numericExit };
+      // Reached only when `e.code` really is a number, so nothing is synthesized here.
+      return { stdout: e.stdout ?? "", stderr: e.stderr ?? e.message ?? "", exitCode: e.code as number };
     }
     return fail(timedOut ? ReasonCode.GIT_TIMEOUT : ReasonCode.INTERNAL_ERROR, detail, {
       cwd,
       args,
+      // No `exitCode` unless the child produced one. Three shapes, three distinct evidence keys,
+      // so a reader can tell "git answered" from "git did not" structurally rather than by the
+      // presence of a number this function invented.
       ...(timedOut
         ? { timeoutMs: timeout }
         : typeof e.code === "string"
           ? { failureCode: e.code }
-          : { exitCode: numericExit }),
+          : signalled
+            ? { signal: e.signal ?? null }
+            : { exitCode: e.code as number }),
     });
   }
 };

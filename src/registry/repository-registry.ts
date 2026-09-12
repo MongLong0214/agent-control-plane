@@ -48,6 +48,17 @@ export interface RepositoryInspection {
  */
 
 /**
+ * Whether git itself said this path is not in a work tree.
+ *
+ * Two spellings, because `rev-parse` uses both depending on which sub-question it was asked, and
+ * a reader that knows only one of them turns the other into a probe failure — the safe direction,
+ * but still a wrong answer. Nothing else counts: git exits 128 for *every* fatal, so the code
+ * cannot carry this distinction.
+ */
+const namesNoWorkTree = (message: string): boolean =>
+  /not a git repository/iu.test(message) || /must be run in a work tree/iu.test(message);
+
+/**
  * The work tree root, or the refusal that says why there is no answer.
  *
  * `toplevel` can end two ways that are not the same claim: git answering "this is not a work
@@ -68,12 +79,24 @@ const toplevelOrRefusal = async (path: string): Promise<Decision<string>> => {
     // Narrow on purpose: an `AcpError` is `git()`'s own verdict, and which verdict decides what
     // this function may claim.
     if (!isAcpError(err)) throw err;
-    // git ran and answered. `rev-parse --show-toplevel` outside a work tree exits 128 — that is
-    // the *only* way the original blanket catch could legitimately reach `NOT_FOUND`, and losing
-    // it would trade one wrong answer for another. `git()` puts a numeric `exitCode` in evidence
-    // exactly when a process ran and returned one, and `timeoutMs` / `failureCode` when it did
-    // not, so the distinction is read from the verdict rather than re-derived from a message.
-    if (typeof err.evidence["exitCode"] === "number") {
+    // Only git's own non-membership answer establishes non-membership — the rule
+    // `probeWorktree` (src/guard/workspace-probe.ts) already applies to this same question, and
+    // the one this site got wrong twice.
+    //
+    // The first repair keyed on "the evidence carries a numeric exitCode", on the belief that
+    // `git()` produced one exactly when a process ran and answered. A merge-gate review disproved
+    // both halves: `git()` was synthesizing `1` for a child killed by an external signal, and
+    // `rev-parse` exits **128** for every fatal — `fatal: detected dubious ownership in repository
+    // at '…'` is 128 on a path that *is* a work tree, which a checkout made by another uid
+    // produces routinely. So an exit code is a shape, not an answer.
+    //
+    // git's own words are the answer. Everything else — dubious ownership, EACCES, a missing
+    // binary, a signal, a timeout — is a probe that did not complete and refuses as one.
+    // Read from the message, not from evidence. `git()` puts git's stderr in the refusal's message
+    // for the exit-code shape and deliberately keeps it out of evidence — evidence is persisted
+    // into audit rows, and raw error text is a wider surface than the named fields this module
+    // already records.
+    if (namesNoWorkTree(err.message)) {
       return deny(ReasonCode.NOT_FOUND, "path is not inside a git work tree", { path });
     }
     return deny(
