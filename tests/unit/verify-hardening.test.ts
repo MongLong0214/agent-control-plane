@@ -382,6 +382,54 @@ describe("verification hardening findings", () => {
     expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONTRACT_UNVERIFIED });
   });
 
+  it("refuses a declared path that is not repository-relative, and normalises the ones that are", async () => {
+    const { harness, repository, runA, runB } = await concurrentProjectCandidates();
+    const base = {
+      runId: runA.runId,
+      ownerSessionId: runA.ownerSessionId!,
+      ownerBindingGeneration: runA.ownerBindingGeneration!,
+      ownerRoleKey: runA.ownerRoleKey!,
+      repositoryIdentity: repository.identity,
+    };
+
+    // The positive control. Without it every refusal below is also what a registry that refused
+    // every acquire would produce.
+    expect(harness.cp.claims.acquire({ ...base, declaredPaths: ["src/a.ts"] }).allowed).toBe(true);
+
+    // One input per operand of the normaliser's refusal, each refused by its own operand alone:
+    //   ""        refused, but by the normaliser's tail as much as by its first operand — that
+    //             operand's mutation SURVIVED, and it is answered as such rather than with a row
+    //   "a\0b"    only `.includes("\0")`      — a NUL would truncate the path at any C boundary
+    //   "/etc/x"  only `.startsWith("/")`      — absolute, so not repository-relative
+    //   "C:/x"    only the drive-letter regex  — absolute on Windows, and `startsWith("/")` is false
+    for (const path of ["", "a\u0000b", "/etc/x", "C:/x"]) {
+      expect(harness.cp.claims.acquire({ ...base, declaredPaths: [path] }), path).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.INVALID_ARGUMENT,
+      });
+    }
+
+    // `\` is a separator too, so a backslash spelling is the *same* path, not a new one. A second
+    // run asking for it is refused as already held — which is the observable that says the
+    // normalisation happened. Without it `src\a.ts` would be a path nobody holds.
+    const second = harness.cp.claims.acquire({
+      runId: runB.runId,
+      ownerSessionId: runB.ownerSessionId!,
+      ownerBindingGeneration: runB.ownerBindingGeneration!,
+      ownerRoleKey: runB.ownerRoleKey!,
+      repositoryIdentity: repository.identity,
+      declaredPaths: ["src\\a.ts"],
+    });
+    // The refusal names the *normalised* path, which is what says the normalisation happened:
+    // the request spelled it with a backslash and the evidence comes back with a slash. Without
+    // the separator rewrite this would be a path nobody holds, and the acquire would succeed.
+    expect(second).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.CLAIM_PATH_CONFLICT,
+      evidence: { path: "src/a.ts", heldByRun: runA.runId },
+    });
+  });
+
   it("lets different-branch verifications obtain distinct disposable worktrees while a checkout claim is held", async () => {
     const { harness, manifest, repository, runA, runB, snapshotFor, storeSnapshot } = await concurrentProjectCandidates();
     const claim = harness.cp.claims.acquire({

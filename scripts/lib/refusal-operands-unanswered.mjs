@@ -3,10 +3,10 @@
  * `canonical-self-claim-listener.ts`, which left the file-exclusion backlog under #833.
  * These are answers owed, not claims of unkillability or completed coverage. Each reason states
  * the missing independent witness or the neighbouring invariant that masks removal.
- * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 88 files
- * holding 3,489 operands, measured at this commit. It said 89 until this one; #840 removed a
- * file from that list and left the count here, which is the shape of staleness a number in
- * prose always has. The count is stated because it is the one thing a reader needs in order to
+ * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 87 files
+ * holding 3,476 operands, measured at this commit. It said 89, then 88; #840 and then
+ * `src/claims/claim-registry.ts` left that list and the count here did not follow, which is the
+ * shape of staleness a number in prose always has. The count is stated because it is the one thing a reader needs in order to
  * size lifting the list, and derived nowhere.
  *
  * Entries name source text and its occurrence, never a line coordinate. Identical new operands
@@ -14,6 +14,51 @@
  * sol-simplify: requested explicit operand debts; remove each when an independent row replaces it.
  */
 const groups = [
+  {
+    file: "src/claims/claim-registry.ts",
+    // normalizePath — the empty-input refusal, masked by the function's own tail.
+    reason: "Measured, not argued: the mutation SURVIVED. The empty string reaches the segment loop as one empty segment, the loop skips it, and the tail `normalized.length > 0 ? normalized.join(\"/\") : null` returns null regardless — so removing this operand changes no observable. It is an early exit, not a refusal only it can make, and no input is empty here and non-empty after normalisation. The first draft of this entry was a falsifiability row whose own docstring stated this masking and claimed a kill anyway; the harness disagreed.",
+    operands: [
+      ["separatorsNormalized.length === 0",1],
+    ],
+  },
+  {
+    file: 'src/claims/claim-registry.ts',
+    // acquire — the worktree-id presence triple.
+    reason: "The two presence operands cannot be witnessed apart from a type error: with either removed, `request.worktreeId.trim()` runs against the value it was guarding and throws a TypeError rather than returning a decision, and `worktreeId` is optional so TypeScript refuses the mutant outright. The blankness operand is reachable — a whitespace-only worktree id — but the acquire fixture that gets far enough to evaluate it is the concurrency one, and it asserts worktree identity rather than argument validation. That is an answer owed, not a claim that nothing can kill it.",
+    operands: [
+      ["request.worktreeId !== undefined",1],
+      ["request.worktreeId !== null",1],
+      ["!request.worktreeId.trim()",1],
+    ],
+  },
+  {
+    file: 'src/claims/claim-registry.ts',
+    // acquire — the canonical-worktree refusal pair.
+    reason: "`canonicalWorktree` is null exactly when `request.worktreeId` is falsy, and removing the truthiness check makes `.allowed` a type error on a `| null` value, so no mutant compiles. Its neighbour needs a fixture whose canonical-worktree resolution refuses — a worktree id that is not the repository checkout — and the existing claim tests supply the checkout path precisely so that it resolves.",
+    operands: [
+      ["canonicalWorktree",1],
+      ["!canonicalWorktree.allowed",1],
+    ],
+  },
+  {
+    file: 'src/claims/claim-registry.ts',
+    // normalizePath — the two skipped segment forms.
+    reason: "Both are normalisation rather than refusal, and the observable they would change is the stored path: without them `a//b` and `a/./b` keep their empty and dot segments. The test that reaches this code asserts the *refusal* forms and the separator rewrite, and distinguishing these two needs a claim whose declared path carries a redundant separator or a dot segment and an assertion on the stored value. Owed.",
+    operands: [
+      ['segment === ""',1],
+      ['segment === "."',1],
+    ],
+  },
+  {
+    file: 'src/claims/claim-registry.ts',
+    // sharesDirectory — advisory overlap reporting.
+    reason: "`advisoryOverlaps` is advice, not a refusal, and nothing in the suite reads it. `da.length > 0` keeps two root-level files from counting as one directory, and `da === db` is the comparison itself; witnessing either needs a test that holds claims in two runs and asserts the returned overlap list. Until something consumes that list, a row here would pin a value no caller reads.",
+    operands: [
+      ["da.length > 0",1],
+      ["da === db",1],
+    ],
+  },
   {
     file: "src/daemon/agentcpd.ts",
     // startLocalMcpListeners
