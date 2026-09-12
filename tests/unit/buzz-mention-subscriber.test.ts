@@ -2420,13 +2420,19 @@ describe("the buzz mention subscriber's relay protocol", () => {
       expect((sentFrames(second)[1] as [string, string, Record<string, unknown>])[2]["since"]).toBeUndefined();
 
       // The frame is counted. `record` is the outer call around `#handleFrame`, so a throwing sink
-      // used to skip it entirely and leave the `EVENT` invisible to all three numbers — measured
-      // as `framesHandled: 2` before this. That matters beyond one count: `framesHandled === 0` is
-      // the evidence `BUZZ_MENTION_SUBSCRIBER_SILENT` fires on, so a seam throwing on every event
-      // presented as a quiet relay and sent the operator to the wrong side (#870).
+      // used to skip it entirely and leave the `EVENT` invisible to all three numbers. Measured on
+      // this body: 4 without the fix, 5 with it — the scenario reconnects, so a second AUTH/OK
+      // pair is counted too. That matters beyond one count: `framesHandled === 0` is the evidence
+      // `BUZZ_MENTION_SUBSCRIBER_SILENT` fires on, so a seam throwing on every event presented as
+      // a quiet relay and sent the operator to the wrong side (#870).
       const threw = handle.counters();
+      // The number the change is named for, asserted directly. Without this line the case passes
+      // only because `FrameTally.record` increments `#framesHandled` unconditionally in the same
+      // method that fills the rejection bucket — make that increment conditional and the
+      // silent-relay defect returns with this test still green.
+      expect(threw.framesHandled).toBe(5);
       expect(threw.admitted).toBe(0);
-      expect(threw.rejections["seam-threw"]).toBe(1);
+      expect(threw.rejections["frame-handler-threw"]).toBe(1);
       // Its own reason, not the retry bucket: both end the same way for the connection, and only
       // one of them means the seam is failing rather than the role's peer being absent.
       expect(threw.rejections["admission-retry-pending"]).toBeUndefined();
