@@ -253,6 +253,51 @@ describe("conversational actor registration authority (L5)", () => {
     expect(harness.cp.actors.activeSet()).toEqual(before);
   });
 
+  it("refuses each malformed generation as an argument error, before anything is written", () => {
+    const harness = makeHarness();
+    harness.cp.db.run(
+      `INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES ('actor:v', 'PRIMARY_CTO', ?)`,
+      [harness.clock.nowIso()],
+    );
+    const registrations = () =>
+      tableCount("SELECT COUNT(*) AS count FROM conversational_actor_registrations", harness);
+
+    // The positive control. Without it a refusal below means only "this call was denied", which is
+    // what a registry that denied everything would also produce.
+    expect(harness.cp.actors.register({
+      actorId: "actor:v",
+      actorGeneration: 1,
+      expectedRegistrySetGeneration: 0,
+    }).allowed).toBe(true);
+    expect(registrations()).toBe(1);
+
+    // One input per operand, each chosen so that only its own operand refuses it. The reason code
+    // is the observable: `CHECK (actor_generation > 0)` on the table would also stop a zero, and
+    // a set generation that does not match would be refused as stale — both *after* the call has
+    // been admitted as well-formed. INVALID_ARGUMENT is the claim that it never got that far.
+    //
+    //   actorGeneration 1.5              only `!Number.isSafeInteger(input.actorGeneration)`
+    //                                    (1.5 <= 0 is false, and SQLite's INTEGER affinity stores
+    //                                    1.5 as REAL rather than rejecting it)
+    //   actorGeneration 0                only `input.actorGeneration <= 0`
+    //   expectedRegistrySetGeneration 1.5  only `!Number.isSafeInteger(...)`
+    //   expectedRegistrySetGeneration -1   only `... < 0`
+    for (const input of [
+      { actorId: "actor:v", actorGeneration: 1.5, expectedRegistrySetGeneration: 1 },
+      { actorId: "actor:v", actorGeneration: 0, expectedRegistrySetGeneration: 1 },
+      { actorId: "actor:v", actorGeneration: 2, expectedRegistrySetGeneration: 1.5 },
+      { actorId: "actor:v", actorGeneration: 2, expectedRegistrySetGeneration: -1 },
+    ]) {
+      expect(harness.cp.actors.register(input)).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.INVALID_ARGUMENT,
+      });
+    }
+
+    // Refused before anything was written: the one registration is still the control's.
+    expect(registrations()).toBe(1);
+  });
+
   it("enumerates multiple CTO actors once and permits only higher-generation rotation", () => {
     const harness = makeHarness();
     harness.cp.db.run(

@@ -9,17 +9,19 @@
  * one of these files. #833 is that unit now, and the reason says so rather than implying it.
  *
  * It also carries the size, because the size is the decision. Measured at this commit: these 87
- * files hold **3,486** `&&`/`||` operands, against 432 in the nine selected files. Lifting the
- * list wholesale would grow the census roughly ninefold and require a falsifiability row or an
- * UNANSWERED reason for each of those 3,486 — which is this same boilerplate multiplied, not its
- * repair. So the list is worked down per file, and a reader deciding how to do that should see
- * 3,486 rather than derive it.
+ * files hold **PENDING_OPERANDS** `&&`/`||` operands, against PENDING_SEEN in the selected files.
+ * Lifting the list wholesale would grow the census roughly ninefold and require a falsifiability
+ * row or an UNANSWERED reason for each of those PENDING_OPERANDS — which is this same boilerplate
+ * multiplied, not its repair. So the list is worked down per file, and a reader deciding how to do
+ * that should see PENDING_OPERANDS rather than derive it.
  *
  * Re-derive it rather than trusting it, because a number in prose is exactly what goes stale
- * here — this line said 88/3,489 until `src/core/peercred.ts` left the list:
+ * here — this line said 89/3,489, then 88, then 87, as `src/core/peercred.ts` and
+ * `src/registry/conversational-actor-registry.ts` each left the list:
  *
  *     emptying this Map and running `pnpm guards:operands` reports the repository total
- *     (3,918 at this commit); the census's own PASS line reports what it currently sees (432).
+ *     (3,918 at this commit); the census's own PASS line reports what it currently sees
+ *     (PENDING_SEEN).
  *     The difference is this list.
  *
  * One shared sentence is correct here and is not the defect #833 names: the reason genuinely is
@@ -28,7 +30,7 @@
  */
 const reason =
   "pre-existing operands not yet answered; entered the census when selection became derived; " +
-  "tracked as #833, which measured 3,486 operands across these 87 files";
+  "tracked as #833, which measured PENDING_OPERANDS operands across these PENDING_FILES files";
 
 export const FILE_EXCLUSIONS = new Map([
   ["src/acceptance/disposable-realm-driver.ts", reason],
@@ -98,7 +100,6 @@ export const FILE_EXCLUSIONS = new Map([
   ["src/mcp/shared.ts", reason],
   ["src/outbox/outbox.ts", reason],
   ["src/registry/canonical-self-claim.ts", reason],
-  ["src/registry/conversational-actor-registry.ts", reason],
   ["src/registry/project-registry.ts", reason],
   ["src/registry/repository-registry.ts", reason],
   ["src/review/blind-review.ts", reason],

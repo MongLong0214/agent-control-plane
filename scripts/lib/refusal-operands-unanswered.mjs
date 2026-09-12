@@ -3,10 +3,11 @@
  * `canonical-self-claim-listener.ts`, which left the file-exclusion backlog under #833.
  * These are answers owed, not claims of unkillability or completed coverage. Each reason states
  * the missing independent witness or the neighbouring invariant that masks removal.
- * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 87 files
- * holding 3,486 operands, measured at this commit. It said 89, then 88; #840 and then
- * `src/core/peercred.ts` left that list and the count here did not follow, which is the shape of
- * staleness a number in prose always has. The count is stated because it is the one thing a reader needs in order to
+ * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — PENDING_FILES files
+ * holding PENDING_COUNT operands, measured at this commit. It said 89, then 88, then 87; #840,
+ * `src/core/peercred.ts` and `src/registry/conversational-actor-registry.ts` each left that list
+ * and the count here did not follow, which is the shape of staleness a number in prose always has.
+ * The count is stated because it is the one thing a reader needs in order to
  * size lifting the list, and derived nowhere.
  *
  * Entries name source text and its occurrence, never a line coordinate. Identical new operands
@@ -30,6 +31,15 @@ const groups = [
     operands: [
       ["startedSubscriber",1],
       ["startedSubscriber.socketCount > 0",1],
+    ],
+  },
+  {
+    file: "src/registry/conversational-actor-registry.ts",
+    // The two null-guards in front of the monotonic comparison.
+    reason: "Neither guard has an independent witness, because the operand they protect cannot observe the difference. `validateGenerationInput` has already refused any actorGeneration that is not a positive safe integer, and for every positive n: `n <= null` is `n <= 0`, which is false, and `n <= undefined` is a NaN comparison, which is also false. So with either guard removed the denial is skipped on exactly the inputs it was skipped on before. The `undefined` case additionally cannot arise here — the query is `SELECT MAX(...)`, an aggregate, which returns a row even when the table is empty. Witnessing these would mean admitting a non-positive generation, which is the neighbouring invariant's job.",
+    operands: [
+      ["prior?.actor_generation !== null",1],
+      ["prior?.actor_generation !== undefined",1],
     ],
   },
   {
