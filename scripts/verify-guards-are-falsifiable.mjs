@@ -5117,6 +5117,14 @@ process.on("exit", () => rmSync(MUTATION_REPORT_DIR, { recursive: true, force: t
  * reach it: `DEAD SELECTOR` fires only when no assertion *executed*, and a failure is an
  * execution; `UNRELATED FAILURE` is checked only under `!killed`.
  *
+ * `DEAD SELECTOR` reads `testResults[].assertionResults[]`, so it depends on Vitest's JSON
+ * reporter keeping that shape. **Re-measure it if the runner changes.** A reporter that renames or
+ * flattens those arrays makes the loop find zero assertions, and zero executed assertions is
+ * exactly what this verdict means — so a reporting change reads as every selector being dead, or,
+ * if it yields an empty list where the guard expects absence, as nothing being dead at all. Which
+ * of the two it degrades into is not something the code can tell you; that is why the instruction
+ * is to measure rather than to reason about it.
+ *
  * The baseline is the suite result the `verify` matrix already produced for this same commit, so
  * this costs no extra execution. CI passes it through `ACP_FALSIFIABILITY_BASELINE`; a local run
  * usually has none, and then this check is *announced as skipped* rather than silently dropped —
