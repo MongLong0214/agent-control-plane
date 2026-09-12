@@ -11,8 +11,25 @@ name: project-ci
 on:
   push:
     branches: [main, 'release/**', 'hotfix/**']
+  # No base filter. `branches` under `pull_request` matches the PR's *base*, so every prefix a
+  # pull request can target has to be listed or that PR gets no checks at all — and a list of
+  # prefixes goes stale exactly like any other check keyed by a name rather than by content.
+  #
+  # It already had. Measured 2026-09-12 against `git ls-remote --heads origin`: `fix/` 56,
+  # `feat/` 39, `terra10/` 27, `docs/` 9, `test/` 3, and `feature/` — the prefix this filter
+  # named — **1**. `release/` was 0, and no merge commit in this repository's history came from a
+  # `feature/` branch. So the filter covered `main` and effectively nothing else, and #855, based
+  # on a `feat/` branch, got **zero** check runs.
+  #
+  # Zero checks is worse than a red one. `gh pr list --json statusCheckRollup` summarises it as
+  # `fail=0 pend=0`, which is indistinguishable from all-green, and a base branch carries no
+  # protection rules to notice. `scripts/merge-pr.mjs:133` is what actually caught it — "no check
+  # reported on <sha>. A green claim needs a run." — and `gh pr merge` goes around that.
+  #
+  # Ruled out: listing `feat/**` and `fix/**` beside the others. It fixes today's two prefixes and
+  # leaves the same mechanism in place for the next one, with no check that would notice — which
+  # is how this filter came to name a prefix used once (#857).
   pull_request:
-    branches: [main, 'feature/**', 'release/**']
 jobs:
   # This job's id used to be `verify`, which is also the literal string branch protection
   # requires (contexts: ["verify"]). Adding the matrix below made every check GitHub reports for
