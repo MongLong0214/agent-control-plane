@@ -1,0 +1,16 @@
+Limit: this makes a seam refusal observable in the subscriber's counters; it does not make the ingress-side refusal observable on the ingress side, where the pre-guard check still writes nothing by design
+Ruled-out: writing an audit row for the pre-guard owner-allowlist refusal | that check sits ahead of `guard.admit` so an unauthenticated sender cannot cause a write, and adding one there reopens exactly that
+Ruled-out: a bare refusal counter | #855's docstring already argued the reasons must be separable — "the relay stopped attaching p tags" and "this runtime is the CTO of two projects" are different repairs
+Warn: `admitted` promises reachability, not attempt; any new admission answer that cannot reach a session has to be excluded here too
+Provenance: inherited 228ecc940671212097f6cb94730b0f9d59d56091
+
+Limit: the four reasons are one bucket per seam answer, not per seam reason code — `admission-refused` still collapses every refusal cause, which the ingress path records separately
+Limit: a frame whose seam throws is counted by none of the three numbers; that is #870, at a site this commit does not touch
+Ruled-out: keeping the attempt reading and publishing admissionAttempts/delivered as separate fields | smaller, but it leaves the delivery question to a reader's arithmetic on a surface whose purpose is to answer it
+Ruled-out: counting ALREADY_DURABLE as a delivery | measured: the number then tracks reconnects, and a delivery counter that moves without a delivery is not one
+Provenance: inherited a2fa331cfce849cba77abf380a9fab15988dd6ea
+
+Limit: the already-durable bucket still carries two causes under one name, because the admission seam hands this surface an enum and not a reason code
+Limit: framesHandled is a floor rather than a total while a frame whose seam throws is counted nowhere — that is #870, fixed on its own branch and not folded in here
+Ruled-out: asserting a literal framesHandled in the healthy-delivery case | it would pin the NIP-42 handshake's frame count to a case about relay chatter, and break on any protocol change that is not this surface's subject
+Provenance: inherited 3bb4130d5c007e46c8034c699c9bc0eb476b8663
