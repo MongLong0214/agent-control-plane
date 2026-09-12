@@ -62,6 +62,27 @@ describe("every git call has a time bound", () => {
     expect(status.exitCode).toBe(0);
   });
 
+  it("treats a child killed from outside as a probe that did not run, not as exit 1", async () => {
+    // `promisify(execFile)` reports a timeout as `{ code: null, signal: "SIGTERM", killed: true }`,
+    // and `killed` is Node's flag for *"I sent the signal"*. A child ended by launchd, systemd, an
+    // OOM kill or a stray `pkill` arrives with the same shape and `killed: false` — so a test on
+    // `killed` calls that git answering, and the previous code then synthesized `exitCode: 1`,
+    // which is what `git status --porcelain` uses to say no.
+    //
+    // The fake git kills *itself*, which is exactly what this process not calling `kill` looks
+    // like from Node's side.
+    const bin = mkdtempSync(join(tmpdir(), "acp-selfkill-git-"));
+    made.push(bin);
+    writeFileSync(join(bin, "git"), "#!/bin/sh\nkill -TERM $$\n");
+    chmodSync(join(bin, "git"), 0o755);
+    process.env.PATH = bin;
+
+    // `allowFailure` must not turn it into an answer: the refusal is the point.
+    await expect(git(cwd, ["status", "--porcelain"], { allowFailure: true })).rejects.toMatchObject({
+      evidence: { signal: "SIGTERM" },
+    });
+  });
+
   it("refuses a non-positive bound rather than passing it to Node as no bound", async () => {
     // `timeout: 0` is how Node spells *no* timeout, and the census that enforces this rule reads
     // only whether the option is present. So zero is the one value that removes the bound while
