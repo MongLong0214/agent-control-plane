@@ -8,27 +8,27 @@
  * `gh issue list --limit 300` returned no such issue — the sentence pointed at nothing, for every
  * one of these files. #833 is that unit now, and the reason says so rather than implying it.
  *
- * It also carries the size, because the size is the decision. Measured at this commit: these 87
- * files hold **3,486** `&&`/`||` operands, against 432 in the nine selected files. Lifting the
+ * It also carries the size, because the size is the decision. Measured at this commit: these 86
+ * files hold **3,481** `&&`/`||` operands, against 441 in the selected files. Lifting the
  * list wholesale would grow the census roughly ninefold and require a falsifiability row or an
- * UNANSWERED reason for each of those 3,486 — which is this same boilerplate multiplied, not its
+ * UNANSWERED reason for each of those 3,481 — which is this same boilerplate multiplied, not its
  * repair. So the list is worked down per file, and a reader deciding how to do that should see
- * 3,486 rather than derive it.
+ * 3,481 rather than derive it.
  *
  * Re-derive it rather than trusting it, because a number in prose is exactly what goes stale
  * here — this line said 88/3,489 until `src/core/peercred.ts` left the list:
  *
  *     emptying this Map and running `pnpm guards:operands` reports the repository total
- *     (3,918 at this commit); the census's own PASS line reports what it currently sees (432).
+ *     (3,922 at this commit); the census's own PASS line reports what it currently sees (441).
  *     The difference is this list.
  *
  * One shared sentence is correct here and is not the defect #833 names: the reason genuinely is
- * one reason. Inventing 87 different sentences for 87 files whose backlog has one cause would be
+ * one reason. Inventing 86 different sentences for 86 files whose backlog has one cause would be
  * boilerplate wearing a disguise. What was wrong was that the sentence was false.
  */
 const reason =
   "pre-existing operands not yet answered; entered the census when selection became derived; " +
-  "tracked as #833, which measured 3,486 operands across these 87 files";
+  "tracked as #833, which measured 3,481 operands across these 86 files";
 
 export const FILE_EXCLUSIONS = new Map([
   ["src/acceptance/disposable-realm-driver.ts", reason],
