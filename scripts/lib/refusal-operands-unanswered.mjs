@@ -3,12 +3,11 @@
  * `canonical-self-claim-listener.ts`, which left the file-exclusion backlog under #833.
  * These are answers owed, not claims of unkillability or completed coverage. Each reason states
  * the missing independent witness or the neighbouring invariant that masks removal.
- * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 86 files
- * holding 3,479 operands, measured at this commit. It said 89, then 88, then 87; #840,
- * `src/core/peercred.ts` and `src/registry/conversational-actor-registry.ts` each left that list
- * and the count here did not follow, which is the shape of staleness a number in prose always has.
- * The count is stated because it is the one thing a reader needs in order to
- * size lifting the list, and derived nowhere.
+ * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs. Its size used
+ * to be restated here and went stale every time a file left that list — 89, then 88, then 87,
+ * each step landing in whichever of the two files the branch happened to touch. `pnpm
+ * guards:operands` now prints both counts from the lists themselves, so neither header states a
+ * number that can disagree with what it describes.
  *
  * Entries name source text and its occurrence, never a line coordinate. Identical new operands
  * exceed the recorded occurrences and fail. Remove an entry when its row is established.
