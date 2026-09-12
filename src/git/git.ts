@@ -289,9 +289,43 @@ export const removeWorktree = async (
   );
 };
 
+/**
+ * Which worktrees git knows about, or a refusal.
+ *
+ * This used to answer `[]` for a nonzero exit, and an empty list is not "git has no worktrees" --
+ * it is "nothing was read". Every reader here decides something about the filesystem from the
+ * answer, and four of the five read absence as a fact:
+ *
+ *   verify/worktree.ts:65   create()   -- an id already in use looks free, so the CONFLICT guard
+ *                                        passes and two runs can claim one path
+ *   verify/worktree.ts:133  destroy()  -- the `remaining` check certifies ISOLATION_LOST did not
+ *                                        happen, having observed nothing. This was reproduced by
+ *                                        a merge-gate review on a repository with two real
+ *                                        worktrees: exit 128, `fatal: detected dubious ownership`,
+ *                                        listing `[]`, removal "verified"
+ *   verify/worktree.ts:181  orphans()  -- reports a clean root, which the doctor prints as a
+ *                                        finding's absence
+ *   verify/worktree.ts:111  the post-add cleanup -- skips removing a tree whose integrity check
+ *                                        just failed, which is the one thing that block exists
+ *                                        to prevent. That site therefore treats a refusal as
+ *                                        "presence unknown" and removes anyway
+ *
+ * `worktree list --porcelain` exits 0 in any work tree, listing at least the main one, so a
+ * nonzero exit is never the shape of an empty repository. The #869 time bound already made the
+ * signal, timeout and `ENOENT` shapes throw past `allowFailure`; a genuine nonzero exit -- 128 for
+ * every git fatal -- was the one that still arrived here as data.
+ */
 export const listWorktrees = async (cwd: string): Promise<Array<{ path: string; head: string }>> => {
   const out = await git(cwd, ["worktree", "list", "--porcelain"], { allowFailure: true });
-  if (out.exitCode !== 0) return [];
+  if (out.exitCode !== 0) {
+    // No stderr in evidence: it lands in audit rows, and git's message can carry a path the
+    // caller never supplied. The exit code is what distinguishes this from an empty listing.
+    fail(ReasonCode.INTERNAL_ERROR, "the git worktree listing did not complete, so which worktrees exist is unknown", {
+      cwd,
+      exitCode: out.exitCode,
+      probe: "worktree list --porcelain",
+    });
+  }
   const entries: Array<{ path: string; head: string }> = [];
   let path = "";
   for (const line of out.stdout.split("\n")) {

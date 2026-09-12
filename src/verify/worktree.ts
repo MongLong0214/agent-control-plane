@@ -1,7 +1,7 @@
 import { existsSync, lstatSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
-import { type Decision, deny, fail } from "../core/errors.ts";
+import { type Decision, deny, fail, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import {
@@ -108,8 +108,22 @@ export class WorktreeManager {
     } catch (error) {
       // A failed post-add integrity check must not leave the potentially tampered tree
       // available for a later command. The path was just proven to be under our root.
-      const after = await listWorktrees(repositoryPath);
-      if (after.some((entry) => canonical(entry.path) === path)) {
+      //
+      // This is the one reader for which a refused listing must not propagate. It is inside the
+      // catch of the integrity failure, so throwing here replaces the diagnosis the caller needs
+      // with a secondary error -- and skipping the removal is worse still, because an unreadable
+      // listing used to answer `[]` and `[]` skipped it, leaving exactly the tree these lines
+      // exist to take away. So a listing that did not complete means *presence unknown*, and
+      // unknown removes: `worktree remove` on a path git does not know is a refusal we absorb,
+      // while a tree left behind is not.
+      let after: Array<{ path: string; head: string }> | null = null;
+      try {
+        after = await listWorktrees(repositoryPath);
+      } catch (listingError) {
+        if (!isAcpError(listingError)) throw listingError;
+        after = null;
+      }
+      if (after === null || after.some((entry) => canonical(entry.path) === path)) {
         requireAllowed(await removeWorktree(repositoryPath, path, authorization.remove));
       }
       if (existsSync(path)) {
