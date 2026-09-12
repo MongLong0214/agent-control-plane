@@ -942,6 +942,43 @@ export class Doctor {
   private checkCanonicalTurns(): Finding[] {
     const findings: Finding[] = [];
 
+    // Every check below is a query against `canonical_turns`, and on the live deployment that
+    // table has held zero rows for 26 days while 30,789 audit events accumulated (#858). Zero
+    // rows means zero findings, so the doctor reports the ledger green by never looking at a
+    // turn — the operator reads "no unresolved turns" where the honest statement is "no turns".
+    //
+    // The condition is not emptiness. A fresh install is legitimately empty and warning about
+    // it would be noise. It is emptiness *while the other authority has claims*: turns are
+    // being taken through `IngressGuard.claimTurn()` into `inbound_messages.turn_claim_json`
+    // (`telegram-router.ts`, `buzz-message.ts`) and none of them reach the canonical ledger,
+    // because `ConversationTurnCoordinator.claim()` has no production caller.
+    //
+    // This says so and decides nothing. Which of the two ledgers becomes authoritative is
+    // #858's open question; that this one is unobserved is true either way, and an operator
+    // acting on a green CANONICAL_TURN_* result today is acting on an unasked question.
+    const canonicalTurns = this.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM canonical_turns`);
+    const ingressClaims = this.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM inbound_messages WHERE turn_claim_json IS NOT NULL`,
+    );
+    if ((canonicalTurns?.n ?? 0) === 0 && (ingressClaims?.n ?? 0) > 0) {
+      findings.push({
+        code: "CANONICAL_TURN_LEDGER_UNOBSERVED",
+        // Not an ERROR: nothing is wedged, and nothing an operator does clears it. It is a
+        // standing reduction in what the other findings in this group can mean, which is the
+        // thing a WARN on a diagnostic surface is for.
+        severity: "WARN",
+        scope: "conversation",
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: {
+          canonicalTurns: canonicalTurns?.n ?? 0,
+          ingressClaims: ingressClaims?.n ?? 0,
+        },
+        recommendedAction:
+          "read turn health from TURN_OUTCOME_UNKNOWN, which queries the ledger production writes. Treat every CANONICAL_TURN_* result in this report as unobserved rather than clean: the canonical ledger has no production writer (#858), so its checks, its 36 ledger triggers and the daemon's turn_reconcile sweep all pass on an empty row set",
+      });
+    }
+
     const inDoubt = this.db.all<{ turn_request_id: string; target_actor_id: string; claimed_at: string }>(
       `SELECT turn_request_id, target_actor_id, claimed_at FROM canonical_turns
         WHERE lifecycle_state = 'IN_DOUBT'

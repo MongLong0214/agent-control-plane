@@ -218,3 +218,57 @@ describe("doctor surfaces a disagreement between authorities", () => {
     expect(finding(await h.cp.doctor.run("system"), "CANONICAL_TURN_CONTRADICTED")).toBeUndefined();
   });
 });
+
+/**
+ * The check above is only meaningful while the ledger has rows in it, and on the live deployment
+ * it has had none for 26 days (#858). Zero rows means zero findings, so a report an operator
+ * reads as "no unresolved turns" is actually "no turns" — the shape of a green check that
+ * measured nothing.
+ *
+ * `CANONICAL_TURN_LEDGER_UNOBSERVED` states that, and states nothing about which of the two turn
+ * ledgers should win: that is #858's open question, and this is true either way.
+ */
+describe("the canonical ledger says when it is unobserved", () => {
+  it("stays quiet on a deployment that has taken no turns at all", async () => {
+    // An empty install is legitimately empty. Warning here would make the finding permanent
+    // furniture, which is the failure the first case in this file is written against.
+    const h = makeHarness();
+
+    expect(
+      finding(await h.cp.doctor.run("system"), "CANONICAL_TURN_LEDGER_UNOBSERVED"),
+    ).toBeUndefined();
+  });
+
+  it("reports the gap once ingress has claims the canonical ledger never received", async () => {
+    const h = makeHarness();
+    // Exactly what production does today: `IngressGuard.claimTurn()` writes the claim into
+    // `inbound_messages` and nothing calls `ConversationTurnCoordinator.claim()`.
+    admitInbound(h, { nonce: "ingress-only", payload: {} });
+    h.cp.db.run(
+      `UPDATE inbound_messages SET turn_claim_json = ? WHERE nonce = ?`,
+      [JSON.stringify({ state: "TURN_CLAIMED", repliedAt: null }), "ingress-only"],
+    );
+
+    const found = finding(await h.cp.doctor.run("system"), "CANONICAL_TURN_LEDGER_UNOBSERVED");
+    expect(found?.severity).toBe("WARN");
+    expect(found?.blocking).toBe(false);
+    expect(found?.observedEvidence["canonicalTurns"]).toBe(0);
+    expect(found?.observedEvidence["ingressClaims"]).toBe(1);
+    // The remedy has to name the ledger production actually writes, or the operator is left
+    // with a warning and no other surface to read.
+    expect(found?.recommendedAction).toContain("TURN_OUTCOME_UNKNOWN");
+  });
+
+  it("falls silent as soon as one turn reaches the canonical ledger", async () => {
+    // The finding is about an unwritten ledger, not about a quiet one. A single canonical row
+    // — which is what closing #858 produces — has to clear it, or it becomes furniture the
+    // moment the writer lands.
+    const h = makeHarness();
+    const actorId = target(h, "observed");
+    claim(h, actorId, "canonical-reached");
+
+    expect(
+      finding(await h.cp.doctor.run("system"), "CANONICAL_TURN_LEDGER_UNOBSERVED"),
+    ).toBeUndefined();
+  });
+});
