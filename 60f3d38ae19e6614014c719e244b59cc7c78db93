@@ -1,0 +1,9 @@
+Limit: `BUZZ_MENTION_SUBSCRIBER_SILENT` has no test — `supplementalSystemFindings` is private and the grace window makes it clock-dependent; `health.json` is the surface these rows cover, and the finding is the same two numbers in a different shape
+Limit: a frame refused before `#handleFrame` (a stale generation at the head of the queue) is counted nowhere, so `framesHandled` is "what this connection handled", not "what the relay sent"
+Ruled-out: reporting zeroes instead of null when no subscriber is configured | "not set up" and "set up and receiving nothing" would render identically, which is the conflation this change exists to end
+Ruled-out: adding the counters to the Doctor constructor | it already takes seventeen arguments and every call site would change; `run()`'s existing `supplementalFindings` is the seam for exactly this
+Warn: `framesHandled === 0` on a long-running subscriber means nothing arrived — it does not distinguish a relay that sent nothing from a subscription that never really authenticated
+Blast: module
+Undo: easy
+Certainty: firm
+Provenance: inherited 60f3d38ae19e6614014c719e244b59cc7c78db93
