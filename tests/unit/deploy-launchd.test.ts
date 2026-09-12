@@ -548,10 +548,32 @@ const structuralFlags = (fixture: PairFixture): string[] => [
  * reaching for "list the files" would have had two choices with nothing marking which is right.
  */
 const treeFiles = (): string[] =>
-  execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], {
-    cwd: root,
-    encoding: "utf8",
-  })
+  execFileSync(
+    "git",
+    // `-c core.excludesFile=/dev/null` because `--exclude-standard` consults three ignore
+    // sources and only one of them belongs to this repository: `.gitignore`, then
+    // `.git/info/exclude`, then the **user's** global excludes. A merge-gate review demonstrated
+    // both directions — with `*.plist` in a global excludes file an untracked `stray.plist` in
+    // the repository root left this case passing, and without it the same tree failed. The claim
+    // this census makes is about the repository's tree, so the answer must come from rules the
+    // repository committed and not from whatever a developer has configured.
+    //
+    // `.git/info/exclude` is per-clone and also not committed; it stays honoured because a
+    // maintainer's own clone-local exclusion is a deliberate statement about that checkout, while
+    // a global excludes file is a statement about every repository the developer touches.
+    ["-c", "core.excludesFile=/dev/null", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+    {
+      cwd: root,
+      encoding: "utf8",
+      // A bound, because vitest's `testTimeout` cannot provide one here: a synchronous child
+      // blocks the worker's event loop, so the runner only reports the overrun *after* the child
+      // returns. Measured by the review: a `{ timeout: 1000 }` case around
+      // `execFileSync("sleep", ["6"])` ran the full 6.01 s. Normal cost of this call is 15-25 ms,
+      // so the bound is two orders of magnitude clear of it and exists for the wedged cases — a
+      // stale lock in a `.git` on a network mount, an unresponsive filesystem under `--others`.
+      timeout: 30_000,
+    },
+  )
     .split("\0")
     .filter((entry) => entry.length > 0)
     .map((entry) => join(root, entry));
