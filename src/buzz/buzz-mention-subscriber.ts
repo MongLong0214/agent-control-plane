@@ -704,6 +704,16 @@ type BuzzMentionRejection =
    */
   | "admission-retry-pending"
   /**
+  /**
+   * The sink threw rather than answering. Behaviourally the `RETRY` shape — nothing was
+   * established, the cursor stays, the socket goes — but a different cause, and the one an
+   * operator has to tell apart: a seam that throws on every event leaves the subscriber looking
+   * *silent*, which is what `BUZZ_MENTION_SUBSCRIBER_SILENT` fires on. Counted separately from
+   * `admission-retry-pending` so "the role's peer is down" and "the seam is failing" are not one
+   * number.
+   */
+  | "seam-threw"
+  /**
    * The sink answered `ALREADY_DURABLE`: a durable copy of this event exists already. It has its
    * own reason because `since` is inclusive, so every reconnect re-requests the boundary event and
    * the seam answers this — counting it as an admission made the number climb with reconnect count
@@ -915,9 +925,13 @@ class BuzzMentionSubscription {
           if (!this.#isCurrent(generation)) return;
           try {
             // The outcome was discarded here, which is why "connected and silent" and "receiving
-            // and refusing" looked the same from outside (#841). Counted before anything can
-            // throw past it; a sink that throws is handled below and is not a frame that never
-            // arrived.
+            // and refusing" looked the same from outside (#841).
+            //
+            // `record` is the *outer* call, so it runs only if `#handleFrame` resolves. An earlier
+            // version of this comment claimed the frame was "counted before anything can throw
+            // past it"; a merge-gate review measured the opposite — a sink that threw left the
+            // `EVENT` frame invisible to all three counters (`framesHandled: 2`). The catch counts
+            // it now, which is why that claim is gone from here (#870).
             this.#tally.record(await this.#handleFrame(raw, generation));
           } catch {
             // A sink that threw established nothing about the message, so this is the `RETRY`
@@ -928,6 +942,12 @@ class BuzzMentionSubscription {
             // Conditional on the generation, and that is the whole of the second defect: a
             // rejection arriving after this connection was replaced used to reach an
             // unconditional `#reconnect()` and drop *the replacement's* socket.
+            //
+            // Recorded before the reconnect, and unconditionally: the frame arrived whatever the
+            // generation says about where its answer belongs, and `framesHandled === 0` is the
+            // evidence `BUZZ_MENTION_SUBSCRIBER_SILENT` fires on. A seam throwing on every event
+            // would otherwise present as a quiet relay.
+            this.#tally.record({ rejected: "seam-threw", admission: null });
             this.#reconnect(generation);
           }
         });
