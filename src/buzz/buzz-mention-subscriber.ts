@@ -690,6 +690,13 @@ const tagValues = (event: RelayEvent, name: string): string[] =>
  * a key file's contents.
  */
 type BuzzMentionRejection =
+  /**
+   * The sink answered `REFUSED`. Not a frame this subscriber found fault with — it verified,
+   * addressed and resolved a role for it, and the admission seam turned it down. Counted as a
+   * rejection reason rather than as an admission, because `admitted` promises "the only outcome
+   * that can reach a session" and a refusal reaches none.
+   */
+  | "admission-refused"
   | "frame-too-large"
   | "frame-not-json"
   | "frame-not-a-message"
@@ -733,7 +740,11 @@ class FrameTally {
 
   record(outcome: BuzzMentionFrameOutcome): void {
     this.#framesHandled += 1;
-    if (outcome.admission !== null) this.#admitted += 1;
+    // `REFUSED` is an answer, not an admission. Counting it here made a refusal indistinguishable
+    // from a delivery in `health.json`, which is the one place an operator looks to tell "nothing
+    // arrived" from "arrived and was turned down" — and the interface above already promised the
+    // second reading.
+    if (outcome.admission !== null && outcome.admission !== "REFUSED") this.#admitted += 1;
     if (outcome.rejected !== null) {
       this.#rejections.set(outcome.rejected, (this.#rejections.get(outcome.rejected) ?? 0) + 1);
     }
@@ -1219,7 +1230,10 @@ class BuzzMentionSubscription {
     // A refusal moves nothing. It is deterministic, so there is nothing to retry and no reason to
     // drop the connection — and it is reachable by anyone who can sign an event, so it must not be
     // allowed to choose where the window sits. See `BuzzMentionAdmission`.
-    if (admission === "REFUSED") return { rejected: null, admission };
+    // Named as its own rejection reason so the tally can separate it from the frames this
+    // subscriber refused on its own. Both are "did not reach a session"; only one of them is
+    // about the relay or the addressing, and an operator repairing the wrong half is the cost.
+    if (admission === "REFUSED") return { rejected: "admission-refused", admission };
 
     // The second guard, and it is independent of the first on purpose. Refusing to trust a
     // *refusal* covers the stranger; it does nothing about an event this daemon accepted as
