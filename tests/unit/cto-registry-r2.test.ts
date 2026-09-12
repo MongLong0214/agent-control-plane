@@ -89,18 +89,21 @@ const completeContractChangeWithGrant = async (
   harness: Harness,
   projectId: string,
   manifestDigest: string,
+  // `run_artifacts.content_json` is immutable by trigger, so a test that needs a *wrong* grant
+  // cannot rewrite this one — it has to be the only grant the run ever had. Hence the override.
+  perturb: (grant: Record<string, unknown>) => unknown = (grant) => grant,
 ) => {
   const finalized = await finalizeNoRepositoryRun(harness, projectId, CONTRACT);
   const { runId, candidateSnapshotDigest } = finalized;
 
-  const grant = {
+  const grant = perturb({
     schema: "acp.manifest-activation-grant.v1",
     projectId,
     runId,
     runKind: "CONTRACT_CHANGE",
     manifestDigest,
     candidateSnapshotDigest,
-  };
+  });
   harness.cp.db.run(
     `INSERT INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest,
                                 content_json, produced_by, created_at)
@@ -303,6 +306,60 @@ describe("round-2 registry regressions", () => {
     }, manifestAuthorizationForRun(harness, projectId, manifestB, runId));
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.MANIFEST_ACTIVATION_EVIDENCE_MISSING);
+  });
+
+  it("refuses an activation grant that differs from the run in any single field", async () => {
+    // One perturbation per operand of the grant's comparison against the run. Each variant differs
+    // from a valid grant in exactly one field, so a variant that survives its operand is
+    // *activated*, not refused differently. Each needs its own run: `run_artifacts` is immutable,
+    // so the wrong grant has to be the only grant that run ever had.
+    //
+    // The wrong-type variants are here too, and they are deliberately *not* claimed as witnesses
+    // for `parseActivationGrant`'s type checks — measured, those five mutants SURVIVE. A grant
+    // carrying `projectId: 7` parses without the typeof check and is then refused by the
+    // comparison, because 7 is not that string. Nothing can separate them: a witness would need a
+    // value that is not a string and is nevertheless `===` to the expected one.
+    const variants: Array<[string, (g: Record<string, unknown>) => unknown]> = [
+      ["schema", (g) => ({ ...g, schema: "acp.manifest-activation-grant.v0" })],
+      ["projectId is not a string", (g) => ({ ...g, projectId: 7 })],
+      ["runId is not a string", (g) => ({ ...g, runId: 7 })],
+      ["runKind is neither kind", (g) => ({ ...g, runKind: "SOMETHING_ELSE" })],
+      ["manifestDigest is not a string", (g) => ({ ...g, manifestDigest: 7 })],
+      ["candidateSnapshotDigest is not a string", (g) => ({ ...g, candidateSnapshotDigest: 7 })],
+      ["projectId names another project", (g) => ({ ...g, projectId: `${String(g["projectId"])}-other` })],
+      ["runId names another run", (g) => ({ ...g, runId: `${String(g["runId"])}-other` })],
+      ["runKind is the other kind", (g) => ({ ...g, runKind: "PROJECT_BOOTSTRAP" })],
+      ["manifestDigest is another manifest", (g) => ({ ...g, manifestDigest: `${String(g["manifestDigest"])}0` })],
+      ["candidateSnapshotDigest is another candidate",
+        (g) => ({ ...g, candidateSnapshotDigest: `${String(g["candidateSnapshotDigest"])}0` })],
+    ];
+
+    // A harness per variant, because finalizing a run binds the CEO role and a role key holds one
+    // active binding at a time. The last entry is the positive control: an untouched grant through
+    // the same path must activate, or every refusal above is also what refusing everything looks
+    // like.
+    const perVariant = [...variants, ["an untouched grant", undefined] as const];
+    for (const [name, perturb] of perVariant) {
+      const harness = makeHarness();
+      const { projectId } = await registerFixtureProject(harness);
+      const revised = { ...fixtureManifest(projectId), postMergeCommands: ["verify"] };
+      const stored = harness.cp.projects.storeManifest(revised, harness.cp.manifestAuthorizationForTests(revised));
+      if (!stored.allowed) throw new Error(stored.message);
+      const runId = perturb === undefined
+        ? await completeContractChangeWithGrant(harness, projectId, stored.value)
+        : await completeContractChangeWithGrant(harness, projectId, stored.value, perturb);
+      const activated = harness.cp.projects.activateManifest(projectId, revised,
+        { runKind: "CONTRACT_CHANGE", runId },
+        manifestAuthorizationForRun(harness, projectId, revised, runId));
+      if (perturb === undefined) {
+        expect(activated, name).toMatchObject({ allowed: true });
+      } else {
+        expect(activated, name).toMatchObject({
+          allowed: false,
+          reasonCode: ReasonCode.MANIFEST_ACTIVATION_EVIDENCE_MISSING,
+        });
+      }
+    }
   });
 
   it("#153 marks every project repository drifted with the activated manifest digest", async () => {

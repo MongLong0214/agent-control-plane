@@ -3,10 +3,10 @@
  * `canonical-self-claim-listener.ts`, which left the file-exclusion backlog under #833.
  * These are answers owed, not claims of unkillability or completed coverage. Each reason states
  * the missing independent witness or the neighbouring invariant that masks removal.
- * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 88 files
- * holding 3,489 operands, measured at this commit. It said 89 until this one; #840 removed a
- * file from that list and left the count here, which is the shape of staleness a number in
- * prose always has. The count is stated because it is the one thing a reader needs in order to
+ * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 87 files
+ * holding 3,462 operands, measured at this commit. It said 89, then 88; #840 and then
+ * `src/registry/project-registry.ts` left that list and the count here did not follow, which is
+ * the shape of staleness a number in prose always has. The count is stated because it is the one thing a reader needs in order to
  * size lifting the list, and derived nowhere.
  *
  * Entries name source text and its occurrence, never a line coordinate. Identical new operands
@@ -14,6 +14,84 @@
  * sol-simplify: requested explicit operand debts; remove each when an independent row replaces it.
  */
 const groups = [
+  {
+    file: 'src/registry/project-registry.ts',
+    // parseActivationGrant — the type checks, each masked by its own comparison.
+    reason: "Measured, not argued: all five mutants SURVIVED. Each of these type checks is masked by the comparison that follows it. Remove `typeof value.projectId !== \"string\"` and a grant carrying `projectId: 7` still parses \u2014 and is then refused by `content?.projectId === projectId`, because 7 is not that string. The same holds for runId, manifestDigest, candidateSnapshotDigest and the runKind pair. Witnessing one alone would need a value that is not a string and is nevertheless `===` to the expected string, which cannot exist. These are defence in depth against a caller that reads the parsed grant without comparing it; the comparisons all carry rows.",
+    operands: [
+      ["typeof value.projectId !== \"string\"",1],
+      ["typeof value.runId !== \"string\"",1],
+      ["typeof value.manifestDigest !== \"string\"",1],
+      ["typeof value.candidateSnapshotDigest !== \"string\"",1],
+      ["value.runKind !== \"CONTRACT_CHANGE\"",1],
+    ],
+  },
+  {
+    file: 'src/registry/project-registry.ts',
+    // The grant comparison that also narrows the parsed value.
+    reason: "Measured: the mutant does not compile. `content?.projectId === projectId` is what narrows `content` from `ActivationGrant | null`, so removing it makes every `content.<field>` below a type error. TypeScript enforces this one \u2014 the four comparisons after it carry rows and are what a test can kill.",
+    operands: [
+      ["content?.projectId === projectId",1],
+    ],
+  },
+  {
+    file: 'src/registry/project-registry.ts',
+    // activateManifest — the run-kind and authorization gate
+    reason: "The run-kind pair refuses an activation attempted through a kind this path does not serve, and the authorization triple refuses one whose managed authorization is absent or bound to another project or run. Each needs its own malformed `via`/authorization pair: the existing tests build a matching one because their subject is what happens after it matches. Reachable, not witnessed \u2014 answers owed.",
+    operands: [
+      ["via.runKind !== \"CONTRACT_CHANGE\"",1],
+      ["via.runKind !== \"PROJECT_BOOTSTRAP\"",1],
+      ["!authorization",1],
+      ["authorization.projectId !== projectId",1],
+      ["authorization.runId !== via.runId",1],
+    ],
+  },
+  {
+    file: 'src/registry/project-registry.ts',
+    // storeManifest — suspension and owner approval
+    reason: "`suspended` and `!ownerApproved` are the two states in which a manifest may not be stored at all. Witnessing them needs a project suspended, and one whose owner approval is absent, at the moment of the store \u2014 the guard tests drive a rejecting guard rather than these two states.",
+    operands: [
+      ["suspended",1],
+      ["!ownerApproved",1],
+    ],
+  },
+  {
+    file: 'src/registry/project-registry.ts',
+    // storeManifest — authorization binding
+    reason: "These two are why a managed authorization cannot be reused across projects or across manifest revisions: it must name this manifest's project and the digest it was issued against. `manifest-guard.test.ts` asserts the positive \u2014 'requires managed authorization bound to the exact project and manifest digest' \u2014 through the guard, not through a mismatched authorization reaching these comparisons. Owed.",
+    operands: [
+      ["authorization.projectId !== manifest.projectId",1],
+      ["authorization.expectedManifestDigest !== digest",1],
+    ],
+  },
+  {
+    file: 'src/registry/project-registry.ts',
+    // activateManifest — the run the grant must belong to
+    reason: "Five conditions on the run itself: that it exists, belongs to this project, is of the declared kind, completed, and has a current candidate digest. `!run` additionally cannot be mutated in isolation \u2014 removing it leaves `run` typed `| undefined` and every field access below a type error. The other four need a run in each wrong state, and the fixture finalizes a correct one because that is what the tests after it are about.",
+    operands: [
+      ["!run",1],
+      ["run.project_id !== projectId",1],
+      ["run.kind !== via.runKind",1],
+      ["run.state !== \"COMPLETED\"",1],
+      ["!run.current_candidate_digest",1],
+    ],
+  },
+  {
+    file: 'src/registry/project-registry.ts',
+    // activateManifest — the artifact row's own candidate digest
+    reason: "The grant's *content* naming the right candidate carries a row; this operand is the artifact **row**'s column saying the same thing. Separating them needs an artifact whose stored `candidate_snapshot_digest` column disagrees with the candidate digest inside its own JSON \u2014 a row the production writer never produces, and one the immutability trigger makes awkward to construct afterwards. Owed, and narrow.",
+    operands: [
+      ["row.candidate_snapshot_digest === run.current_candidate_digest",1],
+    ],
+  },
+  {
+    file: 'src/registry/project-registry.ts',
+    // parseActivationGrant — the second half of the run-kind check
+    reason: "`value.runKind !== \"CONTRACT_CHANGE\"` carries a row; this is the other disjunct. A grant whose runKind is neither kind is refused by the pair, and no single value reaches only this one \u2014 `PROJECT_BOOTSTRAP` satisfies it and is refused later by the comparison against `via.runKind`, which has its own row. Witnessing it alone would need a runKind that is PROJECT_BOOTSTRAP here and not PROJECT_BOOTSTRAP there, which is one value.",
+    operands: [
+      ["value.runKind !== \"PROJECT_BOOTSTRAP\"",1],
+    ],
+  },
   {
     file: "src/daemon/agentcpd.ts",
     // startLocalMcpListeners
