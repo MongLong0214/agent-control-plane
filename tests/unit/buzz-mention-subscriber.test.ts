@@ -1483,6 +1483,24 @@ describe("the buzz mention subscriber's relay protocol", () => {
    * the positive control: delete any single check below and exactly the row named for it goes
    * green, because nothing else in this file would notice.
    */
+  /**
+   * One event id forged so it cannot be the hash of what was signed.
+   *
+   * Defined once and used by both the forgery row and the property case below, because two copies
+   * of this rule is a second authority over it — measured: the falsifiability row reported
+   * SURVIVED while a duplicate in the property case kept answering correctly.
+   *
+   * A first version substituted fixed characters (`id.slice(0, -2) + "00"`), which is a **no-op**
+   * for the one id in 256 that already ends in `00`. The subscriber then receives the original
+   * event, admits it correctly, and the row reads that as a forgery being accepted — CI failed
+   * exactly that way on a branch that does not touch this file. Reproduced at 0.43% of random ids.
+   *
+   * Flipping the last nibble differs for every id (0 of 200,000 unchanged) and stays 64 lowercase
+   * hex characters, so the shape checks upstream still see an id.
+   */
+  const forgeEventId = (id: string): string =>
+    `${id.slice(0, -1)}${id.slice(-1) === "0" ? "1" : "0"}`;
+
   const REFUSED_EVENTS: readonly {
     what: string;
     build: (input: { owner: Uint8Array; stranger: Uint8Array; pubkey: string; subId: string }) => unknown[];
@@ -1507,7 +1525,15 @@ describe("the buzz mention subscriber's relay protocol", () => {
       what: "an event whose id is not the hash of what was signed",
       build: ({ owner, pubkey, subId }) => {
         const event = mentionEvent({ author: owner, addressedTo: pubkey });
-        return ["EVENT", subId, { ...event, id: `${event.id.slice(0, -2)}00` }];
+        // The forged id has to *differ*, and a fixed replacement does not guarantee that: the id
+        // is a hash, so one run in 256 ends in `00` already and `slice(0, -2) + "00"` hands the
+        // subscriber the original event. It then admits it, correctly, and the case fails claiming
+        // a forgery was accepted. Measured on CI at 0.43% of runs (1/256), on a branch that does
+        // not touch this file.
+        //
+        // Flipping the last nibble is different in every case, and stays a 64-character lowercase
+        // hex string so the shape checks upstream still see an id.
+        return ["EVENT", subId, { ...event, id: forgeEventId(event.id) }];
       },
     },
     {
@@ -1759,6 +1785,22 @@ describe("the buzz mention subscriber's relay protocol", () => {
       expect(clock.pending()).toBe(1);
     } finally {
       handle.close();
+    }
+  });
+
+  it("forges an id that differs from the original for every id, including one that already ends in the substitute", () => {
+    // The defect this replaced could not be caught by running the forgery case: on 255 ids out of
+    // 256 the substitution differs and the case passes. So the property is asserted directly, over
+    // the boundary the old form got wrong — an id already ending in the characters it substitutes.
+    for (const id of [
+      `${"a".repeat(62)}00`, // the case the fixed substitution turned into a no-op
+      `${"f".repeat(62)}01`,
+      `${"0".repeat(64)}`,
+      `${"9".repeat(63)}0`,
+    ]) {
+      const forged = forgeEventId(id);
+      expect(forged, `forgery matched the original for ${id}`).not.toBe(id);
+      expect(forged).toMatch(/^[0-9a-f]{64}$/u);
     }
   });
 
