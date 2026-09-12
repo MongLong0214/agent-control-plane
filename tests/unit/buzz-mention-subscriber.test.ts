@@ -2403,6 +2403,18 @@ describe("the buzz mention subscriber's relay protocol", () => {
       const second = live(sockets);
       await authenticate(second, handle);
       expect((sentFrames(second)[1] as [string, string, Record<string, unknown>])[2]["since"]).toBeUndefined();
+
+      // The frame is counted. `record` is the outer call around `#handleFrame`, so a throwing sink
+      // used to skip it entirely and leave the `EVENT` invisible to all three numbers — measured
+      // as `framesHandled: 2` before this. That matters beyond one count: `framesHandled === 0` is
+      // the evidence `BUZZ_MENTION_SUBSCRIBER_SILENT` fires on, so a seam throwing on every event
+      // presented as a quiet relay and sent the operator to the wrong side (#870).
+      const threw = handle.counters();
+      expect(threw.admitted).toBe(0);
+      expect(threw.rejections["seam-threw"]).toBe(1);
+      // Its own reason, not the retry bucket: both end the same way for the connection, and only
+      // one of them means the seam is failing rather than the role's peer being absent.
+      expect(threw.rejections["admission-retry-pending"]).toBeUndefined();
     } finally {
       handle.close();
     }
