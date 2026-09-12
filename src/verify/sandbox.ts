@@ -310,6 +310,36 @@ const hardAddressSpaceAvailable = (): boolean => memoryLimitForPlatform() === "h
 
 const RSS_SAMPLE_INTERVAL_MS = 100;
 
+/**
+ * Every `ps` this file runs is bounded in time, because the sandbox awaits those probes
+ * unconditionally and `command.timeoutSeconds` binds the child, never our own waiting.
+ *
+ * The value is not chosen here. `src/core/process-identity.ts` runs the *same* probe —
+ * `ps -o lstart= -p <pid>` — already bounded at 5s, and its docstring names this file while
+ * explaining why the two are deliberately separate implementations: "that one is async and runs
+ * inside the sandbox supervisor's event loop, while session registration is synchronous and on
+ * the write path." The split was intended. The bound diverging across it was not, and because a
+ * comment declared the two equivalent, nothing compared them (#859).
+ *
+ * Measured (#844): with a `ps` made to take 60s and nothing else changed, a command needing 50ms
+ * against a 3-second budget took **180,086ms** unbounded and **15,079ms** bounded — three probes
+ * serialised, each paying the bound instead of the latency. At 8s per `ps` the same command came
+ * back `ERROR` / `SANDBOX_CHILD_CLEANUP_FAILED` after 24,081ms, and `#167`'s escalation test spent
+ * 24,543ms against a one-second subject timeout. On CI that shape consumed the runner's full
+ * 60,022ms budget on one lane while the other lane passed the same commit.
+ *
+ * Limit, stated rather than left to be discovered: this bounds the wait, not the verdict. A probe
+ * that hits the bound still lands on the existing "could not be proved" path — which CP-HI-08
+ * makes a refusal on purpose — so a machine slow enough to exceed it refuses instead of hanging,
+ * and is still told it failed containment rather than that the host could not answer. Relabelling
+ * that refusal is #859's other half and is deliberately not in this change.
+ *
+ * Ruled out: deriving the bound from `command.timeoutSeconds`. Half of these probes run during
+ * cleanup, after the child is gone and its budget is spent, so there is no subject budget left to
+ * derive from at the moment they need a bound.
+ */
+const PROCESS_PROBE_TIMEOUT_MS = 5_000;
+
 const seatbeltAvailable = (): boolean => existsSync("/usr/bin/sandbox-exec");
 
 /**
@@ -970,7 +1000,10 @@ interface ProcessIdentity {
 const processIdentity = async (pid: number | undefined): Promise<ProcessIdentity | null> => {
   if (!pid) return null;
   try {
-    const { stdout } = await exec("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
+    const { stdout } = await exec("ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf8",
+      timeout: PROCESS_PROBE_TIMEOUT_MS,
+    });
     const startedAt = stdout.trim();
     return startedAt ? { pid, startedAt } : null;
   } catch {
@@ -1048,7 +1081,10 @@ const reapKnownProcess = async (identity: ProcessIdentity): Promise<boolean> => 
 const processGroupMembers = async (pid: number | undefined): Promise<number[] | null> => {
   if (!pid) return null;
   try {
-    const { stdout } = await exec("ps", ["-o", "pid=", "-g", String(pid)], { encoding: "utf8" });
+    const { stdout } = await exec("ps", ["-o", "pid=", "-g", String(pid)], {
+      encoding: "utf8",
+      timeout: PROCESS_PROBE_TIMEOUT_MS,
+    });
     return stdout
       .split("\n")
       .map((line) => Number.parseInt(line.trim(), 10))
@@ -1109,7 +1145,10 @@ const processGroupReaped = async (
     if (current && current.startedAt === startedAt) return false;
   }
   try {
-    const { stdout } = await exec("ps", ["-o", "pid=", "-g", String(pid)], { encoding: "utf8" });
+    const { stdout } = await exec("ps", ["-o", "pid=", "-g", String(pid)], {
+      encoding: "utf8",
+      timeout: PROCESS_PROBE_TIMEOUT_MS,
+    });
     return stdout.trim().length === 0;
   } catch (err) {
     const failure = err as { code?: number; stdout?: string };
@@ -1121,7 +1160,10 @@ const processGroupReaped = async (
 const groupRssMb = async (pid: number | undefined): Promise<number | null> => {
   if (!pid) return null;
   try {
-    const { stdout } = await exec("ps", ["-o", "rss=", "-g", String(pid)], { encoding: "utf8" });
+    const { stdout } = await exec("ps", ["-o", "rss=", "-g", String(pid)], {
+      encoding: "utf8",
+      timeout: PROCESS_PROBE_TIMEOUT_MS,
+    });
     const rssPages = stdout
       .split("\n")
       .map((line) => Number.parseInt(line.trim(), 10))
