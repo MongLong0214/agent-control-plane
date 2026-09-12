@@ -56,6 +56,7 @@
     "schema:denials": "node scripts/verify-trigger-denials-are-typed.mjs",
     "schema:registry": "node scripts/verify-every-trigger-is-required.mjs",
     "guards:operands": "node scripts/verify-refusal-operands-are-watched.mjs",
+    "guards:subprocess-bounds": "node scripts/verify-subprocess-calls-are-bounded.mjs",
     "guards:new-inode-exec": "node scripts/verify-tests-do-not-exec-new-inodes.mjs",
     "verify:fresh-database": "tsx scripts/verify-fresh-database.ts",
     "probe:daemon-startup": "tsx scripts/probe-daemon-startup.ts",
