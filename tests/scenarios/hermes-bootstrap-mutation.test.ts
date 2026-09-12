@@ -115,10 +115,17 @@ const record = (name, chunk) => {
   responses[name] = JSON.parse(buffers[name].slice(0, boundary));
   if (responses.first && responses.replay) {
     // Renamed into place rather than written to the result path, because the reader waits for that
-    // path to exist and then parses it. writeFileSync makes the path exist before its bytes are
-    // necessarily visible to another process, and process.exit on the next line does not wait for
-    // what the kernel has not taken - so the reader could parse an empty file and fail with
-    // "Unexpected end of JSON input". Observed once in CI; this file passes 13/13 alone.
+    // path to exist and then parses it. The window is inside writeFileSync itself: open(2) with
+    // O_CREAT|O_TRUNC makes the path visible at zero bytes, and the write(2) that fills it comes
+    // after. A reader polling existsSync between those two calls parses an empty file and fails
+    // with "Unexpected end of JSON input". Observed once in CI; this file passes 13/13 alone.
+    //
+    // Not process.exit dropping unflushed bytes, which is what an earlier version of this comment
+    // said. A merge-gate review measured the property with no process.exit anywhere in the writer
+    // and still produced 514 empty-file parse failures in 6,568 reads. The wrong reading is not
+    // harmless: under it a writer that keeps running looks safe, and that is exactly the pid write
+    // in tests/fixtures/hermes-ceo-reference.cjs that the first repair skipped.
+    //
     // rename on one filesystem is atomic, so the path appears complete or not at all.
     const partial = resultPath + ".partial";
     fs.writeFileSync(partial, JSON.stringify(responses));
@@ -154,15 +161,6 @@ replay.once("connect", sendFirst);
  * all. A writer that `writeFileSync`s straight to this path would reintroduce the race this helper
  * cannot see: the path exists, the bytes may not be there yet, and the reader's `JSON.parse` fails
  * with `Unexpected end of JSON input`. Observed once in CI (#874).
- */
-/**
- * The property that makes `waitForPath`'s existence check sound, asserted on the runtime scripts
- * themselves.
- *
- * The race it replaces is probabilistic — one CI run in an unknown number — so no single execution
- * can witness it. What can be witnessed is the invariant: no script in this file writes its result
- * straight to the path a reader waits on. That is checkable, and it is what breaks if someone
- * "simplifies" the rename away.
  */
 const waitForPath = async (path: string, description: string, timeoutMs = 10_000): Promise<void> => {
   const deadline = Date.now() + timeoutMs;
@@ -384,10 +382,17 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
   });
 
   it("writes a parsed result only through a rename, so waiting on existence is sound", () => {
-    // The race this guards is probabilistic — one CI run in an unknown number — so no single
-    // execution can witness it. The invariant can be: the script whose result a reader *parses*
-    // must not write straight to the path that reader waits on, because `existsSync` becoming true
-    // is not the bytes being visible and `process.exit` does not wait for the kernel.
+    // The property that makes `waitForPath`'s existence check sound, asserted on the one runtime
+    // script this file's readers parse.
+    //
+    // The race is probabilistic — one CI run in an unknown number — so no single execution can
+    // witness it. The invariant can be: the script whose result a reader *parses* must not write
+    // straight to the path that reader waits on, because the path becomes visible at
+    // `open(O_CREAT|O_TRUNC)` and the bytes arrive on the `write(2)` after it.
+    //
+    // The claim is about `REPLAY_RUNTIME` and nothing wider. `MARKED_RUNTIME`'s path is only ever
+    // existence-checked and never read, and `GATED_RUNTIME`'s gate is written by the test, so
+    // neither is in this class — a merge-gate review swept both and cleared them.
     //
     // Asserted on the script source, which is the thing that would change if someone removed the
     // rename. `#874`.
@@ -397,6 +402,13 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
     // `writeFileSync` naming it must be the temporary one.
     expect(REPLAY_RUNTIME).not.toMatch(/writeFileSync\(resultPath[,)]/u);
     expect(REPLAY_RUNTIME).toMatch(/renameSync\(partial, resultPath\)/u);
+    // F4: the assertions above are about a constant, and a constant is only evidence about the
+    // run if it is the one the run executes. Without this line a second runtime constant, or a
+    // different script handed to `commandFor`, leaves every assertion above green while the
+    // reader's `JSON.parse` goes back to racing.
+    const source = readFileSync(join(process.cwd(), "tests", "scenarios", "hermes-bootstrap-mutation.test.ts"), "utf8");
+    expect(source, "the replay case no longer runs REPLAY_RUNTIME, so the checks above describe a script nothing executes")
+      .toContain("commandFor(REPLAY_RUNTIME, replayPath)");
   });
 
   it("refuses a proof replay from a connection that was already preconnected", async () => {

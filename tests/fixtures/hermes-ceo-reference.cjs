@@ -47,11 +47,15 @@ const resultPath = process.argv[5];
  * Publish a file the test is polling for with `existsSync`.
  *
  * Every path this process writes is awaited by `tests/process/hermes-bootstrap-process.test.ts`
- * with an `existsSync` poll and then read. `writeFileSync` makes the path exist at `open(2)`, not
- * when the bytes land, and three of the four writes here are followed immediately by
- * `process.exit`, which drops whatever the kernel has not taken. So the reader can win: it sees
- * the name, reads a prefix, and — depending on the path — gets `Unexpected end of JSON input`
- * (#874), or something quieter.
+ * with an `existsSync` poll and then read. The window is inside `writeFileSync`: `open(2)` with
+ * `O_CREAT|O_TRUNC` makes the path visible at zero bytes, and the `write(2)` that fills it comes
+ * after. A reader polling between those two calls sees the name, reads a prefix, and — depending
+ * on the path — gets `Unexpected end of JSON input` (#874), or something quieter.
+ *
+ * `process.exit` is *not* what makes this happen, which matters here specifically: the `pidPath`
+ * write below is followed by the rest of the scenario rather than by an exit, and reading the
+ * mechanism as "exit drops unflushed bytes" is what made that write look safe and left it
+ * unfixed through one round of repair.
  *
  * The quiet ones are why this is not only about JSON. `Number("")` is `0` and `Number("123")` is
  * an integer, so a truncated or empty pid file passes `Number.isInteger`, and the test then either

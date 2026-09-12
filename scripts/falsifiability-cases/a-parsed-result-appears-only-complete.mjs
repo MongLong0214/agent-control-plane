@@ -2,12 +2,19 @@
  * #874 — a reader that waits for a file to *exist* and then parses it needs the file to appear
  * complete, and only a rename gives that.
  *
- * `waitForPath` loops on `existsSync`. `writeFileSync` makes a path exist before its bytes are
- * necessarily visible to another process, and the runtime script called `process.exit(0)` on the
- * next line — which does not wait for what the kernel has not taken. So the reader could
- * `JSON.parse("")` and fail with `Unexpected end of JSON input`. Observed once in CI on a branch
- * that does not touch this file; the file passes 13/13 alone, which is what made it look
- * environmental.
+ * `waitForPath` loops on `existsSync`, and the window is inside `writeFileSync` itself:
+ * `open(2)` with `O_CREAT|O_TRUNC` makes the path visible at zero bytes, and the `write(2)` that
+ * fills it comes after. A reader polling between those two calls gets `JSON.parse("")` and
+ * `Unexpected end of JSON input`. Observed once in CI on a branch that does not touch this file;
+ * the file passes 13/13 alone, which is what made it look environmental.
+ *
+ * An earlier version of this paragraph blamed `process.exit(0)` on the next line for dropping
+ * bytes the kernel had not taken. That is not the mechanism, and the error was not harmless: a
+ * merge-gate review reproduced the property with no `process.exit` anywhere in the writer and
+ * still got 514 empty-file parse failures in 6,568 reads. Under the wrong reading a writer that
+ * keeps running looks safe, which is precisely why the first repair skipped the `pidPath` write
+ * in `tests/fixtures/hermes-ceo-reference.cjs` — the one whose failure is silent rather than a
+ * parse error.
  *
  * `rename` on one filesystem is atomic, so "exists" and "is parseable" become one event.
  *
