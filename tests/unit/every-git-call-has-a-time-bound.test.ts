@@ -55,6 +55,14 @@ describe("every git call has a time bound", () => {
   it("leaves an ordinary git alone — the control", async () => {
     // Without this the two refusals above are also what a wrapper that refused every git would
     // produce. Run with the real git on PATH and a real repository.
+    //
+    // The trap the `afterEach` above documents reaches here too, and here it is worse: assigning
+    // `undefined` sets the literal string "undefined", so the control would fail for a missing git
+    // rather than for the property it measures. A control that can fail for the wrong reason
+    // certifies nothing, so an unset PATH is refused by name instead of silently substituted.
+    if (restorePath === undefined) {
+      throw new Error("PATH is unset in this worker, so the control cannot reach a real git");
+    }
     process.env.PATH = restorePath;
     const initialised = await git(cwd, ["init", "--quiet"], { allowFailure: true });
     expect(initialised.exitCode).toBe(0);
