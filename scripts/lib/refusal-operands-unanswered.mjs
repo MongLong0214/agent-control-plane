@@ -3,8 +3,8 @@
  * `canonical-self-claim-listener.ts`, which left the file-exclusion backlog under #833.
  * These are answers owed, not claims of unkillability or completed coverage. Each reason states
  * the missing independent witness or the neighbouring invariant that masks removal.
- * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 87 files
- * holding 3,486 operands, measured at this commit. It said 89, then 88; #840 and then
+ * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 86 files
+ * holding 3,480 operands, measured at this commit. It said 89, then 88; #840 and then
  * `src/core/peercred.ts` left that list and the count here did not follow, which is the shape of
  * staleness a number in prose always has. The count is stated because it is the one thing a reader needs in order to
  * size lifting the list, and derived nowhere.
@@ -14,6 +14,15 @@
  * sol-simplify: requested explicit operand debts; remove each when an independent row replaces it.
  */
 const groups = [
+  {
+    file: "src/mcp/shared.ts",
+    // reservationExpired — the two parse guards in front of the TTL comparison.
+    reason: "Neither guard has an independent witness, because the operand they protect cannot observe the difference. Date.parse returns NaN on an unparsable value, and NaN - x >= TTL is already false, so with either guard removed an unparsable timestamp is still not expired. Measured rather than reasoned: the TTL comparison's own row kills on a reservation one millisecond short of expiry, and no input distinguishes the guards from it. They state the intent that an unreadable received_at fails closed, which the arithmetic happens to give for free.",
+    operands: [
+      ["Number.isFinite(reservedAtMs)",1],
+      ["Number.isFinite(nowMs)",1],
+    ],
+  },
   {
     file: "src/daemon/daemon.ts",
     // buzzMentionSubscriberFindings
