@@ -285,6 +285,28 @@ describe("the gate job's shape, not only its commands", () => {
     expect(result.stderr).toContain('the gate step sets "NODE_OPTIONS"');
   });
 
+  it("audits the pull request's own commits, not the base branch side of the merge ref", () => {
+    // Not a parity question, which is why it reads the real workflow rather than a copy: the two
+    // gate sets can agree perfectly while the range one of them is handed is the wrong range.
+    //
+    // On a pull_request event the checkout is the merge ref, so `HEAD` is a commit GitHub
+    // composed and its first parent is the base branch tip. `base.sha..HEAD` therefore audits
+    // every commit the base branch gained since `base.sha`, including squash merges composed by
+    // GitHub's own button -- which no commit-msg hook can reach, and which cannot be corrected
+    // without rewriting the base branch. Measured on 2026-09-13: the #867 squash `573f7eab`
+    // carries eleven record-trailer lines of which git parses three, and it turned #866 and #873
+    // red simultaneously for a commit neither authored. `{0}..{1}` with the head SHA is the pull
+    // request's own commits and nothing else.
+    const line = readFileSync(join(REPO_ROOT, WORKFLOW), "utf8")
+      .split("\n")
+      .find((text) => text.includes("ACP_TRAILERS_RANGE:"));
+
+    expect(line, "ci.yml no longer sets ACP_TRAILERS_RANGE, so this guard has no subject").toBeDefined();
+    expect(line).toContain("github.event.pull_request.head.sha");
+    // The exact defective form, named rather than described: a range ending at the merge ref.
+    expect(line).not.toContain("{0}..HEAD");
+  });
+
   it("refuses an action in the gate job that no declaration names", () => {
     const repoRoot = copyOfThisRepository();
     editWorkflow(repoRoot, (text) => text.replace(GATE_STEP, `      - uses: some/verifier-action@v1\n${GATE_STEP}`));
