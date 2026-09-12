@@ -1,0 +1,5 @@
+Limit: the bound is not chosen here: src/core/process-identity.ts runs the same `ps -o lstart=` probe already bounded at 5s, and its docstring names src/verify/sandbox.ts
+Ruled-out: deriving the probe bound from command.timeoutSeconds | half of these probes run during cleanup, after the child is gone and its budget is spent
+Warn: this bounds the wait, not the verdict — a probe that hits the bound still lands on the containment-could-not-be-proved refusal, so a machine slow enough to exceed it refuses instead of hanging
+Record-Id: r-071df022536e
+Provenance: inherited 50e39914d0143113f021888f417eab76053c3ccd
