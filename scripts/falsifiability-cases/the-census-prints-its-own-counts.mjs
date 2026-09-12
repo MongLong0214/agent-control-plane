@@ -12,17 +12,27 @@
  * mutation breaks that sum, and the script refuses rather than printing a report nobody can
  * check.
  *
- * Killed by the reconciliation case, which runs the census and reads its CENSUS line. Under the
- * mutation the census exits non-zero before printing one, so `execFileSync` throws and the case
- * dies — the refusal is the product's, not the test's.
+ * Killed by the reconciliation case, which runs the census and reads its CENSUS line, and the
+ * kill is the *test's assertion* — `selected + excluded` against the whole, read off a
+ * successfully printed line. An earlier version of this docstring credited the product's refusal
+ * instead, and a merge-gate review showed that is not the mechanism: with the refusal block
+ * deleted, this mutation is still killed by that assertion. Claiming otherwise is the unearned
+ * attribution `splitKilledBy` in `verify-guards-are-falsifiable.mjs` exists to find.
+ *
+ * The refusal has its own row now — `the-reconciliation-refusal-is-witnessed` — because nothing
+ * here reaches it. `selected` and `excluded` are complementary filters over one `candidates`
+ * list, so the sum is a tautology over any repository state and the branch fires only for a
+ * census that has stopped deriving a number.
  *
  * An earlier version of that case copied the census into `scripts/` and froze a number in the
- * copy. The copy had to sit exactly one level below the repository root (`ROOT` is
- * `new URL("..", import.meta.url)`) and `scripts/` is the only such place where both `./lib/*`
- * and `typescript` resolve — which is also what
- * `tests/process/every-script-has-a-plausible-caller.test.ts` enumerates. Under the full suite the
- * two raced and that test failed on a stray direct child of `scripts/`. Mutating the real file is
- * the harness's own job, so the copy was removed rather than relocated.
+ * copy, and this docstring then claimed a relocated fixture was impossible: the copy had to sit
+ * one level below the repository root (`ROOT` is `new URL("..", import.meta.url)`) and `scripts/`
+ * was said to be the only such place where both `./lib/*` and `typescript` resolve. **That was
+ * wrong**, and `tests/process/the-refusal-operand-census-derives-subjects.test.ts` already
+ * contained the counterexample: a `mkdtempSync` root with a stubbed `scripts/lib`, a symlinked
+ * `node_modules`, and the census copied in. The real defect in the `scripts/` copy was the race
+ * against `every-script-has-a-plausible-caller.test.ts`, which enumerates direct children of
+ * `scripts/`; the fix was the temporary root, not the removal of the fixture.
  */
 const theCensusPrintsItsOwnCounts = {
   id: "the-census-prints-its-own-counts",

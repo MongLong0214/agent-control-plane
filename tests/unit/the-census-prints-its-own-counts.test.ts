@@ -29,20 +29,19 @@ const HEADERS = [
 
 describe("the census prints the counts its headers used to restate", () => {
   it("reconciles its split with the population it came from, or exits non-zero", () => {
-    // The first version of this case copied the census into `scripts/`, froze a
-    // number in the copy and asserted the copy refused. That copy had to sit
-    // exactly one level below the repository root — `ROOT` is
-    // `new URL("..", import.meta.url)` — and `scripts/` is the only such place
-    // where `./lib/*` and `typescript` both resolve. It is also what
-    // `tests/process/every-script-has-a-plausible-caller.test.ts` enumerates,
-    // so under the full suite the two raced and that test failed on a stray
-    // direct child of `scripts/`. Measured: `passes on the working tree as it
-    // stands` went red with both files in one run.
+    // What this case does and does not witness. It runs the real census and
+    // reads the line it printed, so it covers "the census completes and its
+    // three totals are consistent". It does **not** witness the reconciliation
+    // *refusal*: the census gates on reconciliation before printing, so any
+    // CENSUS line this case can parse necessarily reconciles, and the sum
+    // assertion below is downstream of that gate.
     //
-    // No copy is needed. The falsifiability row mutates the real file to a
-    // *wrong* literal, and the census then refuses its own arithmetic — so
-    // this case only has to assert that the unmutated census exits 0 and that
-    // its parts sum to its whole.
+    // An earlier version of this comment claimed the refusal was the kill
+    // mechanism for the falsifiability row. A merge-gate review disproved it —
+    // with the refusal block deleted, the row's mutation is still killed, by
+    // this case's own arithmetic. The refusal is witnessed instead by
+    // `tests/process/the-refusal-operand-census-derives-subjects.test.ts`,
+    // which runs a copy with one total frozen in a temporary root.
     const line = census().split("\n").find((one) => one.startsWith("CENSUS:")) ?? "";
     const match = CENSUS_LINE.exec(line);
     expect(match).not.toBeNull();
@@ -60,26 +59,61 @@ describe("the census prints the counts its headers used to restate", () => {
     expect(selected + excluded).toBe(total);
     expect(total).toBeGreaterThan(0);
     expect(selected).toBeGreaterThan(0);
-    expect(excluded).toBeGreaterThan(0);
+    // Not `excluded > 0`. Emptying `FILE_EXCLUSIONS` is #833's declared goal, and an assertion
+    // that goes red on the day the backlog is finished would fail under a name that promises
+    // something else entirely. Zero excluded operands is a correct census; the sum above is what
+    // carries the claim either way.
+    expect(excluded).toBeGreaterThanOrEqual(0);
   });
 
   it("keeps those counts out of the headers that describe the lists", () => {
     const line = census().split("\n").find((one) => one.startsWith("CENSUS:")) ?? "";
-    const match = /excluded (\d+) deciding file\(s\) holding (\d+) unanswered operand\(s\)/.exec(line);
-    const files = match?.[1] ?? "";
-    const operands = match?.[2] ?? "";
-    // Both spellings, because the prose that went stale wrote thousands with a separator.
-    const grouped = operands.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    const match = CENSUS_LINE.exec(line);
+    expect(match).not.toBeNull();
+    const counted = {
+      "selected operand count": match?.[1] ?? "",
+      "excluded file count": match?.[2] ?? "",
+      "excluded operand count": match?.[3] ?? "",
+      "repository operand count": match?.[4] ?? "",
+    };
 
     for (const path of HEADERS) {
-      const header = readFileSync(path, "utf8").split("export const")[0] ?? "";
-      // A file that states today's true count is the failure: it is true now and silently wrong
-      // at the next removal, which is when someone is reading it to decide what to do next.
-      expect(header, `${path} restates the operand count`).not.toContain(operands);
-      expect(header, `${path} restates the operand count`).not.toContain(grouped);
-      expect(header, `${path} restates the excluded file count`).not.toMatch(
-        new RegExp(`${files}\\s+(?:deciding\\s+)?files?`),
-      );
+      const header = leadingComment(path);
+      for (const [what, value] of Object.entries(counted)) {
+        expect(header, `${path} restates the ${what}`).not.toMatch(countedAs(value));
+      }
     }
   });
 });
+
+/**
+ * A file's leading block comment, and nothing after it.
+ *
+ * Not `split("export const")[0]`, which a merge-gate review measured as **46,870 of 47,040
+ * characters** for `refusal-operands-unanswered.mjs` — its `UNANSWERED` export comes after the
+ * whole data array, so that slice is the file. A bare substring test over 47KB of data collides
+ * with 38 of the values the count can take, `833` and `804` among them: the tracking issue numbers
+ * written in the very headers being checked, and `#833` is the issue whose completion drives the
+ * count downward into its own alarm.
+ */
+const leadingComment = (path: string): string => {
+  const text = readFileSync(path, "utf8");
+  const end = text.indexOf("*/");
+  return end === -1 ? "" : text.slice(0, end + 2);
+};
+
+/**
+ * The number as a *restated count*, which is a number followed by what it counts.
+ *
+ * The property is "no header states a count that can drift from the census", not "no header
+ * contains these digits". An issue reference, a line number or a date is not a restatement, and a
+ * guard that cannot tell them apart fails on prose it should permit — which is worse than silence,
+ * because it fails under a name that says the header is stale.
+ *
+ * Both spellings of thousands, because the prose that actually went stale wrote a separator.
+ */
+const countedAs = (value: string): RegExp => {
+  const grouped = value.replace(/\B(?=(\d{3})+(?!\d))/gu, ",");
+  const digits = value === grouped ? value : `(?:${value}|${grouped})`;
+  return new RegExp(`\\b${digits}\\s+(?:unanswered\\s+|deciding\\s+)?(?:operands?|files?)\\b`, "u");
+};

@@ -153,10 +153,18 @@ const repositoryOperands = candidates.reduce((sum, { operands }) => sum + operan
 // the split has to reconcile with the population it was split from, so freezing either side is a
 // refusal rather than a quietly wrong report.
 if (selectedOperands + excludedOperands !== repositoryOperands) {
+  // Everything collected up to here comes out first. This exit is before the ordinary problem
+  // report, so without these two lines a reconciliation failure would swallow every declaration
+  // error already found — a stale exclusion, an unreadable row object, a file that would not
+  // parse — and the operator would repair the arithmetic and then discover the rest one run at a
+  // time. It costs nothing while the branch is unreachable and it is the whole report the first
+  // time it fires.
+  for (const problem of problems) process.stdout.write(`  ERROR: ${problem}\n`);
   process.stdout.write(
     `RESULT: FAIL — the census's own split does not reconcile: ${selectedOperands} selected + ` +
       `${excludedOperands} excluded != ${repositoryOperands} counted across ` +
-      `${candidates.length} deciding file(s). One of these is not being derived from the lists.\n`,
+      `${candidates.length} deciding file(s). One of these is not being derived from the lists. ` +
+      `${problems.length} declaration error(s) found before this refusal are reported above.\n`,
   );
   process.exit(1);
 }
