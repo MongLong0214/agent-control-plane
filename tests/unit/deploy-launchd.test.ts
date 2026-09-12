@@ -528,16 +528,33 @@ const structuralFlags = (fixture: PairFixture): string[] => [
   fixture.pair.manifest.identity.runtime.nodeVersion,
 ];
 
-const filesUnder = (directory: string): string[] => {
-  const files: string[] = [];
-  for (const entry of readdirSync(directory, { withFileTypes: true })) {
-    if (entry.name === ".git") continue;
-    const path = join(directory, entry.name);
-    if (entry.isDirectory()) files.push(...filesUnder(path));
-    else if (entry.isFile()) files.push(path);
-  }
-  return files;
-};
+/**
+ * The repository tree as git sees it: tracked files plus untracked ones that are not ignored.
+ *
+ * `filesUnder(root)` walks the filesystem and skips only `.git`, so it also reads everything under
+ * `evidence/local/` — which `.gitignore` covers and which the harnesses fill with scratch. A
+ * 17 MB `evidence/local/mutation-verdict/gates-checkout/` left behind on 2026-09-09 holds its own
+ * copy of `deploy/com.agentcontrolplane.agentcpd.plist.template`, and the "only plist artifact in
+ * the tree" assertion failed on it — locally only, because a fresh CI checkout has no
+ * `evidence/local/` at all. A test that passes on the runner and fails on every machine carrying
+ * ordinary scratch is a test nobody can use to decide anything.
+ *
+ * Asking git is not a workaround for that; it is what the assertion already meant. "In the tree"
+ * is a statement about what this repository contains, and `.gitignore` is where this repository
+ * says what it does not.
+ *
+ * The filesystem walk this replaced is deleted rather than left beside it. An unused helper that
+ * enumerates the tree the wrong way is an invitation to the same failure, and the next person
+ * reaching for "list the files" would have had two choices with nothing marking which is right.
+ */
+const treeFiles = (): string[] =>
+  execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], {
+    cwd: root,
+    encoding: "utf8",
+  })
+    .split("\0")
+    .filter((entry) => entry.length > 0)
+    .map((entry) => join(root, entry));
 
 describe("launchd deployment artifact", () => {
   it("renders a loadable plist with absolute paths and no secret or unresolved placeholder", () => {
@@ -1767,9 +1784,9 @@ exit 0
   });
 
   it("keeps the template as the only plist artifact in the tree", () => {
-    const loadable = filesUnder(root).filter((path) => path.endsWith(".plist"));
-    expect(loadable).toEqual([]);
+    const tree = treeFiles();
+    expect(tree.filter((path) => path.endsWith(".plist"))).toEqual([]);
     expect(readFileSync(template, "utf8")).toContain("__ACP_");
-    expect(filesUnder(root).filter((path) => path.endsWith(".plist.template"))).toEqual([template]);
+    expect(tree.filter((path) => path.endsWith(".plist.template"))).toEqual([template]);
   });
 });
