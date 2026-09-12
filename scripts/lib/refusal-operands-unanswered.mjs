@@ -33,6 +33,14 @@ const groups = [
     ],
   },
   {
+    file: "src/ceo/human-gate.ts",
+    // `matches` — the full-name half of `text.includes(normalise(trigger)) || phrases.some(...)`.
+    reason: "Measured across the whole table: all 10 triggers' normalised names contain at least one of their own phrases, so the full-name check can never be the only operand that fires. The only input it alone answers is a trigger whose phrase array is empty — which the Record type permits and no test can inject, because HUMAN_GATE_TRIGGERS is a module const with no seam. The operand is defence against that table being narrowed, and the phrase half carries every trigger that exists.",
+    operands: [
+      ["text.includes(normalise(trigger))",1],
+    ],
+  },
+  {
     file: "src/daemon/agentcpd.ts",
     // startLocalMcpListeners
     reason: "Listener timeout validation is not isolated by the connection fixture: it starts with a valid timeout. An independent witness must distinguish fractional and nonpositive values before any listener is installed.",

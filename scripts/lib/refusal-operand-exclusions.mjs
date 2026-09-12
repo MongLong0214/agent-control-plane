@@ -42,7 +42,6 @@ export const FILE_EXCLUSIONS = new Map([
   ["src/buzz/buzz-mention-subscriber.ts", reason],
   ["src/capacity/capacity-monitor.ts", reason],
   ["src/capacity/usage-collectors.ts", reason],
-  ["src/ceo/human-gate.ts", reason],
   ["src/ceo/owner-authority.ts", reason],
   ["src/ceo/production-gate.ts", reason],
   ["src/claims/claim-registry.ts", reason],
