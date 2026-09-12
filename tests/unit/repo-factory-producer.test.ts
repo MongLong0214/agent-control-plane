@@ -6,6 +6,7 @@ import {
   readFileSync,
   readdirSync,
   statSync,
+  rmSync,
   symlinkSync,
   writeFileSync,
   type Stats,
@@ -75,6 +76,56 @@ const basePlan = (): RepoFactoryPlanFixture => ({
   verificationCommandId: "local-clean-tree",
   verificationKind: "CLEAN_TREE",
   githubOperations: [],
+});
+
+describe("a killed git does not strand its own checkout (#871)", () => {
+  let restorePath: string | undefined;
+  const made: string[] = [];
+
+  afterEach(() => {
+    if (restorePath === undefined) delete process.env.PATH;
+    else process.env.PATH = restorePath;
+    for (const dir of made.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("cleans up after a git that could not run, so the same operation can still be retried", async () => {
+    const { workDir } = makeSandbox();
+    const plan = basePlan();
+
+    // A git that cannot run at all. `GIT_TIMEOUT` is the same class and the one production hits,
+    // but reaching it needs a 120 s bound to expire; an unresolvable binary throws from `git()`
+    // through the identical path, immediately.
+    const emptyBin = mkdtempSync(join(tmpdir(), "acp-no-git-producer-"));
+    made.push(emptyBin);
+    restorePath = process.env.PATH;
+    process.env.PATH = emptyBin;
+
+    // It *throws* rather than denying: `git()` refuses a call that did not run, and this producer
+    // has no handler for that — measured, not assumed. The cleanup has to happen on the way out.
+    await expect(
+      produceRepoFactoryResult({
+        plan,
+        workDir,
+        clock: new ManualClock("2026-09-13T00:00:00.000Z"),
+      }),
+    ).rejects.toMatchObject({ evidence: { failureCode: "ENOENT" } });
+
+    // The claim. Before the cleanup ran on a throw, the checkout and its ownership marker survived
+    // and `createCheckoutLeafOrDeny` refused every retry with `EEXIST` — permanently, by the exact
+    // mechanism the ownership marker exists to prevent.
+    process.env.PATH = restorePath;
+    const retry = await produceRepoFactoryResult({
+      plan,
+      workDir,
+      clock: new ManualClock("2026-09-13T00:01:00.000Z"),
+    });
+
+    if (!retry.allowed) {
+      expect(retry.message).not.toContain("already exists");
+      throw new Error(`the retry was refused: ${retry.reasonCode} ${retry.message}`);
+    }
+    expect(retry.value.repositories).toHaveLength(1);
+  });
 });
 
 describe("repo factory producer (#246)", () => {
