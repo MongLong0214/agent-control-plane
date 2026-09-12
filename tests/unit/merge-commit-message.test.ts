@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import {
   SESSION_METADATA_KEYS,
   composeSquashCommitMessage,
+  composeSquashCommitTitle,
   githubSquashCommitMessage,
   withoutSessionMetadata,
 } from "../../src/github/merge-commit-message.ts";
@@ -419,5 +420,56 @@ describe("the record blocks the SPEC recognises survive the composition", () => 
     const ruledOut = composed.split("\n").filter((line) => line.startsWith("Ruled-out: "));
     expect(ruledOut).toEqual(["Ruled-out: the other approach | it hides the exit status"]);
     expect(ruledOut[0]!.slice("Ruled-out: ".length).includes(" | ")).toBe(true);
+  });
+});
+
+/**
+ * `composeSquashCommitTitle` builds COMMIT_OR_PR_TITLE for the squash PUT, and until #833 it had
+ * no test at all — both operands of its `title || "Squash pull request"` fallback were unanswered
+ * in the census because this file was on the exclusion list.
+ *
+ * The fallback is not decoration. The subject is sanitized before it is used, so a subject that
+ * consists only of session metadata, or a multi-commit branch whose pull title is absent, leaves
+ * an empty string — and an empty COMMIT_OR_PR_TITLE would publish `(#7)` as the commit subject of
+ * a merge into `main`.
+ */
+describe("the squash title survives a subject that sanitizes to nothing", () => {
+  it("uses the real subject when there is one", () => {
+    const title = composeSquashCommitTitle(
+      [{ sha: "a".repeat(40), message: "fix: the probe states its bound\n\nbody" }],
+      "a pull title nobody should see here",
+      7,
+    );
+
+    // The single-commit branch takes the commit's own subject, not the pull title.
+    expect(title).toBe("fix: the probe states its bound (#7)");
+  });
+
+  it("falls back rather than publishing a bare number as the subject", () => {
+    // Two commits with no pull title: `subject` is `?? ""`, so the sanitized title is empty.
+    const title = composeSquashCommitTitle(
+      [
+        { sha: "a".repeat(40), message: "first\n" },
+        { sha: "b".repeat(40), message: "second\n" },
+      ],
+      undefined,
+      7,
+    );
+
+    expect(title).toBe("Squash pull request (#7)");
+    // The assertion that matters: whatever the fallback says, the subject is not empty.
+    expect(title.startsWith(" (#")).toBe(false);
+  });
+
+  it("falls back when the subject is nothing but session metadata", () => {
+    // The sanitizer removes these keys wherever they appear, including a first line — which is
+    // the reachable version of the empty subject on a one-commit branch.
+    const title = composeSquashCommitTitle(
+      [{ sha: "a".repeat(40), message: `${SESSION_METADATA_KEYS[0]}: ${SESSION_URL}\n` }],
+      undefined,
+      7,
+    );
+
+    expect(title).toBe("Squash pull request (#7)");
   });
 });
