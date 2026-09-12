@@ -3,10 +3,10 @@
  * `canonical-self-claim-listener.ts`, which left the file-exclusion backlog under #833.
  * These are answers owed, not claims of unkillability or completed coverage. Each reason states
  * the missing independent witness or the neighbouring invariant that masks removal.
- * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 88 files
- * holding 3,489 operands, measured at this commit. It said 89 until this one; #840 removed a
- * file from that list and left the count here, which is the shape of staleness a number in
- * prose always has. The count is stated because it is the one thing a reader needs in order to
+ * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 87 files
+ * holding 3,469 operands, measured at this commit. It said 89, then 88; #840 and then
+ * `src/daemon/canonical-self-claim-operator.ts` left that list and the count here did not follow,
+ * which is the shape of staleness a number in prose always has. The count is stated because it is the one thing a reader needs in order to
  * size lifting the list, and derived nowhere.
  *
  * Entries name source text and its occurrence, never a line coordinate. Identical new operands
@@ -14,6 +14,53 @@
  * sol-simplify: requested explicit operand debts; remove each when an independent row replaces it.
  */
 const groups = [
+  {
+    file: 'src/daemon/canonical-self-claim-operator.ts',
+    // parseCanonicalSelfClaimOperatorRequest — the three isNonEmptyString calls, and the typeof
+    // half of the predicate they share.
+    reason: "Measured, not argued: all four mutants fail to compile. `isNonEmptyString` is a type predicate (`value is string`), so each call is what narrows its field from `unknown`; removing one leaves the field `unknown` and the function's own return type stops type-checking (TS2322: 'unknown' is not assignable to 'string'). Removing the predicate's typeof half does the same to `value.length`. TypeScript enforces these four, and a falsifiability row cannot exist for a guard whose removal the compiler refuses. The predicate's other half — `value.length > 0` — survives removal and carries a row, which is how the two halves are told apart.",
+    operands: [
+      ['typeof value === "string"',1],
+      ["!isNonEmptyString(claimedSessionUuid)",1],
+      ["!isNonEmptyString(projectId)",1],
+      ["!isNonEmptyString(ownerApprovalNonce)",1],
+    ],
+  },
+  {
+    file: 'src/daemon/canonical-self-claim-operator.ts',
+    // isStoredOwnerApprovalPayload — the object-shape triple.
+    reason: "These three sit behind `loadAdmittedOwnerApproval`, which is private and reached only through `executeCanonicalSelfClaimOperator`. Witnessing them means a harness that seeds an `inbound_messages` row at channel 'cli' with a payload that is null, a primitive, or an array, then drives the operator far enough to read it — the existing listener tests stop at the request line and never reach the stored approval. Answers owed, and the fixture is the same one the eight field checks below need.",
+    operands: [
+      ["value === null",1],
+      ['typeof value !== "object"',1],
+      ["Array.isArray(value)",1],
+    ],
+  },
+  {
+    file: 'src/daemon/canonical-self-claim-operator.ts',
+    // isStoredOwnerApprovalPayload — the field-shape checks.
+    reason: "Same fixture, one seeded payload per operand: a stored approval whose type is not OWNER_APPROVAL, whose runId or candidateSnapshotDigest is neither null nor a string, or whose operation, parameterDigest, idempotencyKey or approved has the wrong type. Each is the only operand that refuses its own malformation, so each needs its own seeded row rather than one malformed payload standing for all eight. Answers owed.",
+    operands: [
+      ['record["type"] === "OWNER_APPROVAL"',1],
+      ['record["runId"] === null',1],
+      ['typeof record["runId"] === "string"',1],
+      ['record["candidateSnapshotDigest"] === null',1],
+      ['typeof record["candidateSnapshotDigest"] === "string"',1],
+      ['typeof record["operation"] === "string"',1],
+      ['typeof record["parameterDigest"] === "string"',1],
+      ['typeof record["idempotencyKey"] === "string"',1],
+      ['typeof record["approved"] === "boolean"',1],
+    ],
+  },
+  {
+    file: 'src/daemon/canonical-self-claim-operator.ts',
+    // loadAdmittedOwnerApproval — the row-presence pair.
+    reason: "`!row` cannot be mutated in isolation: removing it leaves `row` typed `| undefined` and `row.payload_json` a type error, so the harness refuses the mutant. Its neighbour needs the same seeded-row fixture as the checks above, with `payload_json` null — the state a row admitted by a build older than the column leaves behind, which is exactly what the docstring above this function says it is for.",
+    operands: [
+      ["!row",1],
+      ["row.payload_json === null",1],
+    ],
+  },
   {
     file: "src/daemon/agentcpd.ts",
     // startLocalMcpListeners
