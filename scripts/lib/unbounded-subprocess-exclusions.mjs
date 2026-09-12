@@ -24,18 +24,24 @@
  */
 const reason = "not yet bounded; entered the census when it was first taken; tracked as #859";
 
+// Two calls are unbounded on purpose rather than pending, so they carry their own reason. A
+// shared "not yet" sentence would say something false about them and would invite someone to
+// close the gap by adding a timeout that breaks the operation.
+const deliberate = {
+  restore:
+    "deliberately unbounded: this is the state-admin database restore inside a rollback. A " +
+    "timeout here kills the process mid-write, and the pair exists precisely because the " +
+    "database must end up whole — a partial restore is the state rollback is meant to escape. " +
+    "It is bounded by the operator watching it, not by a number.",
+  trace:
+    "deliberately unbounded: this is the full Vitest run behind `pnpm trace`, whose duration is " +
+    "the suite's own and grows with it. Any bound is a guess that turns a slow suite into a " +
+    "missing traceability report, and the caller is a developer or a CI job that already has a " +
+    "timeout of its own.",
+};
+
 export const UNBOUNDED_SUBPROCESS_EXCLUSIONS = new Map([
-  ["src/ceo/production-gate.ts:867", reason],
-  ["src/cli/attach-relay.ts:232", reason],
-  ["src/deploy/rollback-pair.ts:582", reason],
-  ["src/deploy/rollback-pair.ts:1785", reason],
-  ["src/doctor/doctor.ts:1208", reason],
+  ["src/deploy/rollback-pair.ts:1791", deliberate.restore],
   ["src/git/git.ts:77", reason],
-  ["src/guard/workspace-probe.ts:49", reason],
-  ["src/guard/workspace-probe.ts:72", reason],
-  ["src/registry/repository-registry.ts:418", reason],
-  ["src/registry/repository-registry.ts:430", reason],
-  ["src/tools/traceability.ts:300", reason],
-  ["src/tools/traceability.ts:303", reason],
-  ["src/tools/traceability.ts:469", reason],
+  ["src/tools/traceability.ts:477", deliberate.trace],
 ]);
