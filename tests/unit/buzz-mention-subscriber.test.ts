@@ -1883,6 +1883,16 @@ describe("the buzz mention subscriber's relay protocol", () => {
       expect(first.closed).toBe(false);
       expect(clock.pending()).toBe(0);
 
+      // And the tally says what happened. `admitted` promises "the only outcome that can reach a
+      // session"; a refusal reaches none, so it belongs under a reason and not in that number.
+      // Counting it as admitted made `health.json` read a refusal as a delivery, in the one place
+      // an operator looks to tell "nothing arrived" from "arrived and was turned down".
+      // `framesHandled` is 3 here, not 1: the auth challenge and the EOSE reach `#handleFrame`
+      // too. What matters is the split between the other two numbers.
+      const refusedCounters = handle.counters();
+      expect(refusedCounters.admitted).toBe(0);
+      expect(refusedCounters.rejections["admission-refused"]).toBe(1);
+
       first.handlers.onClose();
       clock.fireAll();
       const second = live(sockets);
