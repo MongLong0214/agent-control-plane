@@ -3,8 +3,8 @@
  * `canonical-self-claim-listener.ts`, which left the file-exclusion backlog under #833.
  * These are answers owed, not claims of unkillability or completed coverage. Each reason states
  * the missing independent witness or the neighbouring invariant that masks removal.
- * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 87 files
- * holding 3,486 operands, measured at this commit. It said 89, then 88; #840 and then
+ * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 86 files
+ * holding 3,481 operands, measured at this commit. It said 89, then 88; #840 and then
  * `src/core/peercred.ts` left that list and the count here did not follow, which is the shape of
  * staleness a number in prose always has. The count is stated because it is the one thing a reader needs in order to
  * size lifting the list, and derived nowhere.
@@ -14,6 +14,16 @@
  * sol-simplify: requested explicit operand debts; remove each when an independent row replaces it.
  */
 const groups = [
+  {
+    file: "src/export/experiment-isolation.ts",
+    // sameOrNested — all three operands, masked by the caller asking it symmetrically.
+    reason: "The caller asks sameOrNested twice, once per direction, and that symmetry masks every operand inside it. Measured on the five shapes this caller can produce: fromRoot of \"\" and \"sub\" are nested with or without the empty check, because \"\" starts with no \"..\" and contains no \"../\" either; a sibling gives \"../other\", which the includes operand rejects on its own; and the one shape where !startsWith(\"..\") alone decides is fromRoot === \"..\", the candidate being the immediate parent of the root — but immediate-parent in one direction is immediate-child in the other, so the symmetric call is already true and the condition does not move. A row for any of the three would be a row no input can kill. The two directions of the call itself do have witnesses and carry rows.",
+    operands: [
+      ["fromRoot === \"\"",1],
+      ["!fromRoot.startsWith(\"..\")",1],
+      ["!fromRoot.includes(`..${process.platform === \"win32\" ? \"\\\\\" : \"/\"}`)",1],
+    ],
+  },
   {
     file: "src/daemon/daemon.ts",
     // buzzMentionSubscriberFindings

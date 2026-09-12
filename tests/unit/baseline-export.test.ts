@@ -908,6 +908,49 @@ describe("baseline boundary contracts", () => {
     expect(prepared.value.runtimeEnforcement).toBe("NOT_AVAILABLE_IN_V1");
   });
 
+  /**
+   * The artifact-root check is a **symmetric** pair, and only one direction was covered: an
+   * experiment root under the production root. Nesting the other way is the same violation for
+   * the same reason — either root containing the other means a write on one side lands inside
+   * the other's tree — and `sameOrNested` is not symmetric on its own, which is why the caller
+   * asks it twice.
+   *
+   * None of the three operands *inside* `sameOrNested` can be witnessed from here, and the
+   * reason is this caller's symmetry rather than anything about `relative()`. Measured: the only
+   * shape where `!fromRoot.startsWith("..")` alone decides is `fromRoot === ".."` — the
+   * candidate being the immediate parent of the root — and immediate-parent in one direction is
+   * immediate-child in the other, so the symmetric call is already `true` and the condition does
+   * not move. The census carries that as a written reason.
+   */
+  it("refuses a production root nested inside the experiment root, not only the other way", () => {
+    const inverted = validateExperimentIsolation({
+      experimentId: "acp2-holdout-1",
+      experimentDatabasePath: "/tmp/acp2/acp2-holdout-1.sqlite",
+      experimentArtifactRoot: "/tmp/acp2/artifacts",
+      productionDatabasePath: "/tmp/production/state.sqlite",
+      productionArtifactRoot: "/tmp/acp2/artifacts/production",
+    });
+
+    expect(inverted.allowed).toBe(false);
+  });
+
+  it("does not read a shared path prefix as nesting", () => {
+    // `artifacts` and `artifacts-production` share a prefix and neither contains the other. A
+    // containment check written as `candidate.startsWith(root)` would call this nested; going
+    // through `relative()` does not. The control for the two rows above, and the reason the
+    // operands inside `sameOrNested` carry a written reason rather than rows — see that reason
+    // for the measurement.
+    const separate = validateExperimentIsolation({
+      experimentId: "acp2-holdout-1",
+      experimentDatabasePath: "/tmp/acp2/acp2-holdout-1.sqlite",
+      experimentArtifactRoot: "/tmp/acp2/artifacts/holdout",
+      productionDatabasePath: "/tmp/production/state.sqlite",
+      productionArtifactRoot: "/tmp/acp2/artifacts-production",
+    });
+
+    expect(separate.allowed).toBe(true);
+  });
+
   it("keeps the Repo Factory result boundary strict and the baseline migration ordered", () => {
     const result = {
       schema: REPO_FACTORY_RESULT_SCHEMA_ID,
