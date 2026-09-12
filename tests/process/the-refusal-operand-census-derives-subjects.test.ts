@@ -1,12 +1,30 @@
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { afterEach, expect, it } from "vitest";
 
 const roots: string[] = [];
-const fixture = () => {
+/**
+ * A disposable repository root the census can run against.
+ *
+ * `freeze` rewrites one line of the copied census before it runs, which is the only way to reach
+ * the reconciliation refusal: `selected` and `excluded` are complementary filters over the same
+ * `candidates`, so their operand counts sum to the repository's by construction and no arrangement
+ * of *source files* can make the check fire. The branch is reachable only from a census that has
+ * stopped deriving one of its numbers — which is the condition it exists to catch, and which
+ * arrives as an edit to the script, not as data.
+ */
+const fixture = (freeze?: { readonly find: string; readonly replace: string }) => {
   const root = mkdtempSync(join(tmpdir(), "acp-derived-operands-"));
   roots.push(root);
   const write = (file: string, text: string) => {
@@ -19,7 +37,19 @@ const fixture = () => {
   write("scripts/verify-guards-are-falsifiable.mjs", "const GUARDS = [];");
   mkdirSync(join(root, "src"));
   symlinkSync(join(process.cwd(), "node_modules"), join(root, "node_modules"), "dir");
-  copyFileSync("scripts/verify-refusal-operands-are-watched.mjs", join(root, "scripts/verify-refusal-operands-are-watched.mjs"));
+  const censusPath = join(root, "scripts/verify-refusal-operands-are-watched.mjs");
+  if (freeze === undefined) {
+    copyFileSync("scripts/verify-refusal-operands-are-watched.mjs", censusPath);
+  } else {
+    const source = readFileSync("scripts/verify-refusal-operands-are-watched.mjs", "utf8");
+    // Refuse a substitution that did not apply. A `replace` that silently matched nothing would
+    // run the unmodified census, the refusal would not fire, and the case would report the
+    // absence of its own edit as the absence of the defect.
+    if (!source.includes(freeze.find)) {
+      throw new Error(`the census no longer contains the line this case freezes: ${freeze.find}`);
+    }
+    writeFileSync(censusPath, source.replace(freeze.find, freeze.replace));
+  }
   return { write, run: () => spawnSync(process.execPath, ["scripts/verify-refusal-operands-are-watched.mjs"], {
     cwd: root, encoding: "utf8",
   }) };
@@ -136,4 +166,31 @@ it("reports how many branch conditions it could never select, not just the ones 
   // Said out loud, because `while`, `switch` and `??` are not counted either — a reader must not
   // read 4 as the total number of ways this file decides anything.
   expect(reach).toContain("lower bound");
+});
+
+it("refuses its own report when one of the three totals has stopped being derived", () => {
+  // The defect this branch exists to catch, injected: one total is a literal instead of a
+  // reduction over its list. That is exactly the shape the header prose had for three removals —
+  // plausible, and wrong from the next change onward.
+  //
+  // A frozen value equal to today's truth is indistinguishable from a derived one, so the
+  // injected literal is deliberately *not* today's value. With one deciding file holding two
+  // operands and nothing excluded, the parts are 2 and a frozen 1 against a whole of 2.
+  const { write, run } = fixture({
+    find: "const excludedOperands = excluded.reduce((sum, { operands }) => sum + operands.size, 0);",
+    replace: "const excludedOperands = 1;",
+  });
+  write("src/a-future-authority.ts", "export const eligible = (a: boolean, b: boolean) => a && b;");
+  const result = run();
+
+  expect(result.status).toBe(1);
+  expect(result.stdout).toContain(
+    "RESULT: FAIL — the census's own split does not reconcile: 2 selected + 1 excluded " +
+      "!= 2 counted across 1 deciding file(s). One of these is not being derived from the " +
+      "lists. 0 declaration error(s) found before this refusal are reported above.",
+  );
+  // And it refuses *instead of* reporting, rather than reporting and also complaining: a census
+  // that printed a CENSUS line here would hand a reader numbers whose split it had just
+  // disproved, and a downstream reader parsing that line would take them.
+  expect(result.stdout).not.toContain("CENSUS: scanned");
 });
