@@ -64,6 +64,26 @@ const authorizeGitMutation = async (
 };
 
 /**
+ * How long any one git invocation may take before it is killed.
+ *
+ * `maxBuffer` above bounds how much a git command may *say*; nothing bounded how long it may take.
+ * `promisify(execFile)` without a `timeout` waits forever, so a git that never returns — an index
+ * lock another process holds, a stalled filesystem, a credential helper waiting on a prompt that
+ * has no terminal — stops the caller rather than failing it (#859).
+ *
+ * 120s is chosen from what this wrapper is actually used for, measured rather than guessed: every
+ * call site is local. `grep` across `src/` finds rev-parse, status, diff, show, cat-file, ls-tree,
+ * merge-base, symbolic-ref, remote, branch, init, add, and worktree add/remove/list/prune — and
+ * **no** fetch, clone, push, pull or ls-remote. So no legitimate use waits on a network, and the
+ * slowest plausible one is `worktree add --detach` writing a working tree.
+ *
+ * A caller that needs longer passes `timeoutMs`. That is the affordance a blanket bound has to
+ * have: the alternative to a per-call override is picking one number large enough for the worst
+ * case, which is the same as having no bound for every other case.
+ */
+const DEFAULT_GIT_TIMEOUT_MS = 120_000;
+
+/**
  * argv-only git invocation. There is no shell in the path, so no interpolation,
  * pipes or redirection can be smuggled through a branch name or path
  * (Integration §12: "기본 `sh -c`, Pipe, Redirect, Command Substitution 금지").
@@ -71,24 +91,88 @@ const authorizeGitMutation = async (
 export const git = async (
   cwd: string,
   args: readonly string[],
-  options: { allowFailure?: boolean } = {},
+  options: { allowFailure?: boolean; timeoutMs?: number } = {},
 ): Promise<GitResult> => {
+  // `?? ` would pass a caller's `0` straight through, and Node reads `timeout: 0` as *no*
+  // timeout — so the one value that removes the bound would still census as bounded, because
+  // `verify-subprocess-calls-are-bounded.mjs` reads the property's presence and never its value.
+  // No caller passes 0 today; this refuses the affordance rather than waiting for one to.
+  const requested = options.timeoutMs;
+  if (requested !== undefined && requested <= 0) {
+    fail(ReasonCode.INVALID_ARGUMENT, "a git time bound must be a positive number of milliseconds", {
+      cwd,
+      args,
+      timeoutMs: requested,
+    });
+  }
+  const timeout = requested ?? DEFAULT_GIT_TIMEOUT_MS;
   try {
     const { stdout, stderr } = await exec("git", ["-C", cwd, ...args], {
       maxBuffer: MAX_BUFFER,
       encoding: "utf8",
+      timeout,
       env: { ...sanitizedGitEnv() },
     });
     return { stdout, stderr, exitCode: 0 };
   } catch (err) {
-    const e = err as { stdout?: string; stderr?: string; code?: number; message?: string };
-    if (options.allowFailure) {
-      return { stdout: e.stdout ?? "", stderr: e.stderr ?? e.message ?? "", exitCode: e.code ?? 1 };
+    const e = err as {
+      stdout?: string;
+      stderr?: string;
+      code?: number | string | null;
+      signal?: string | null;
+      killed?: boolean;
+      message?: string;
+    };
+    // A timeout is not git answering. Measured: `promisify(execFile)` reports a killed-by-timeout
+    // child as `{ code: null, signal: "SIGTERM", killed: true }` — note `code` is null, not
+    // "ETIMEDOUT" as the synchronous family reports. So `e.code ?? 1` would have called it exit 1,
+    // which is indistinguishable from git refusing, and `allowFailure` callers would have read
+    // "the answer is no" where the truth is "the check could not run" (#859).
+    const timedOut = e.killed === true && e.signal === "SIGTERM" && (e.code ?? null) === null;
+    // Measured on this repository's runtime (Node 22), the three shapes that are *not* git
+    // answering:
+    //
+    //   timeout    { code: null,                                signal: "SIGTERM", killed: true }
+    //   maxBuffer  { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", name: "RangeError" }
+    //   no binary  { code: "ENOENT" }
+    //
+    // All three mean the check did not run, and only the first was separated. The other two have
+    // a *string* `code`, so `e.code ?? 1` produced the string as an exit code and `allowFailure`
+    // handed it to a caller reading `exitCode !== 0` as "git said no" — the collapse #859 exists
+    // to remove, one shape narrower than before.
+    // A child that produced no exit code did not answer, whatever killed it. `killed` is Node's
+    // own flag for "I sent the signal", so it is **false** when launchd, systemd, an OOM kill or a
+    // stray `pkill` is what ended the process — measured on Node 22 as
+    // `{ code: null, signal: "SIGTERM", killed: false }`. An earlier version of this file tested
+    // `killed` and so classified that shape as git answering, then manufactured `exitCode: 1` for
+    // it, which is the value `git status --porcelain` uses to say *no*. A merge-gate review
+    // reproduced the whole collapse from there.
+    const signalled = (e.code ?? null) === null;
+    const didNotRun = timedOut || typeof e.code === "string" || signalled;
+    const detail = timedOut
+      ? `git ${args.join(" ")} exceeded its ${timeout}ms bound and was killed`
+      : typeof e.code === "string"
+        ? `git ${args.join(" ")} did not run: ${e.code}`
+        : signalled
+          ? `git ${args.join(" ")} was killed by ${e.signal ?? "an unknown signal"} without answering`
+          : `git ${args.join(" ")} failed: ${e.stderr ?? e.message}`;
+    if (options.allowFailure && !didNotRun) {
+      // Reached only when `e.code` really is a number, so nothing is synthesized here.
+      return { stdout: e.stdout ?? "", stderr: e.stderr ?? e.message ?? "", exitCode: e.code as number };
     }
-    return fail(ReasonCode.INTERNAL_ERROR, `git ${args.join(" ")} failed: ${e.stderr ?? e.message}`, {
+    return fail(timedOut ? ReasonCode.GIT_TIMEOUT : ReasonCode.INTERNAL_ERROR, detail, {
       cwd,
       args,
-      exitCode: e.code ?? 1,
+      // No `exitCode` unless the child produced one. Three shapes, three distinct evidence keys,
+      // so a reader can tell "git answered" from "git did not" structurally rather than by the
+      // presence of a number this function invented.
+      ...(timedOut
+        ? { timeoutMs: timeout }
+        : typeof e.code === "string"
+          ? { failureCode: e.code }
+          : signalled
+            ? { signal: e.signal ?? null }
+            : { exitCode: e.code as number }),
     });
   }
 };

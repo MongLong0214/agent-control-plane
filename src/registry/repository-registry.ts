@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 
 import type { Clock } from "../core/clock.ts";
-import { type Decision, allow, deny, fail } from "../core/errors.ts";
+import { allow, deny, fail, isAcpError, type Decision } from "../core/errors.ts";
 import { newRepositoryId, normalizeRemoteIdentity } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
@@ -46,6 +46,71 @@ export interface RepositoryInspection {
  * carries one is rejected upstream by `assertPortableManifest`; this registry is where
  * the local truth is allowed to live.
  */
+
+/**
+ * Whether git itself said this path is not in a work tree.
+ *
+ * Two spellings, because `rev-parse` uses both depending on which sub-question it was asked, and
+ * a reader that knows only one of them turns the other into a probe failure — the safe direction,
+ * but still a wrong answer. Nothing else counts: git exits 128 for *every* fatal, so the code
+ * cannot carry this distinction.
+ */
+const namesNoWorkTree = (message: string): boolean =>
+  /not a git repository/iu.test(message) || /must be run in a work tree/iu.test(message);
+
+/**
+ * The work tree root, or the refusal that says why there is no answer.
+ *
+ * `toplevel` can end two ways that are not the same claim: git answering "this is not a work
+ * tree", and git never answering at all — its bound reached, its binary missing, its output
+ * overflowed. The blanket `.catch(() => null)` this replaces read both as the first, so a
+ * `GIT_TIMEOUT` on a real work tree came back as `NOT_FOUND`, *"path is not inside a git work
+ * tree"* — a positive statement about the filesystem that was false.
+ *
+ * No test caught it because before `git()` had a bound the same call **hung** instead: the bound
+ * is what turned a hang into a wrong answer, at a site the bound's own commit did not touch. A
+ * probe that could not run must not be readable as its subject answering (#859).
+ */
+const toplevelOrRefusal = async (path: string): Promise<Decision<string>> => {
+  let root: string;
+  try {
+    root = await toplevel(path);
+  } catch (err) {
+    // Narrow on purpose: an `AcpError` is `git()`'s own verdict, and which verdict decides what
+    // this function may claim.
+    if (!isAcpError(err)) throw err;
+    // Only git's own non-membership answer establishes non-membership — the rule
+    // `probeWorktree` (src/guard/workspace-probe.ts) already applies to this same question, and
+    // the one this site got wrong twice.
+    //
+    // The first repair keyed on "the evidence carries a numeric exitCode", on the belief that
+    // `git()` produced one exactly when a process ran and answered. A merge-gate review disproved
+    // both halves: `git()` was synthesizing `1` for a child killed by an external signal, and
+    // `rev-parse` exits **128** for every fatal — `fatal: detected dubious ownership in repository
+    // at '…'` is 128 on a path that *is* a work tree, which a checkout made by another uid
+    // produces routinely. So an exit code is a shape, not an answer.
+    //
+    // git's own words are the answer. Everything else — dubious ownership, EACCES, a missing
+    // binary, a signal, a timeout — is a probe that did not complete and refuses as one.
+    // Read from the message, not from evidence. `git()` puts git's stderr in the refusal's message
+    // for the exit-code shape and deliberately keeps it out of evidence — evidence is persisted
+    // into audit rows, and raw error text is a wider surface than the named fields this module
+    // already records.
+    if (namesNoWorkTree(err.message)) {
+      return deny(ReasonCode.NOT_FOUND, "path is not inside a git work tree", { path });
+    }
+    return deny(
+      err.reasonCode,
+      "the git work-tree probe did not complete, so whether this path is inside a work tree is unknown",
+      { path, probe: "rev-parse --show-toplevel" },
+    );
+  }
+  if (root.length === 0) {
+    return deny(ReasonCode.NOT_FOUND, "path is not inside a git work tree", { path });
+  }
+  return allow(ReasonCode.OK, root);
+};
+
 export class RepositoryRegistry {
   constructor(
     private readonly db: Db,
@@ -62,10 +127,9 @@ export class RepositoryRegistry {
     identity?: string;
   }): Promise<Decision<RepositoryRecord>> {
     const path = canonical(input.checkoutPath);
-    const root = await toplevel(path).catch(() => null);
-    if (!root) {
-      return deny(ReasonCode.NOT_FOUND, "path is not inside a git work tree", { path });
-    }
+    const rootDecision = await toplevelOrRefusal(path);
+    if (!rootDecision.allowed) return rootDecision as Decision<RepositoryRecord>;
+    const root = rootDecision.value;
 
     const observedRemote = await remoteUrl(root);
     const observedIdentity = observedRemote ? normalizeRemoteIdentity(observedRemote) : null;
@@ -184,8 +248,9 @@ export class RepositoryRegistry {
     runId: string,
   ): Promise<Decision<RepositoryRecord>> {
     const path = canonical(checkoutPath);
-    const root = await toplevel(path).catch(() => null);
-    if (!root) return deny(ReasonCode.NOT_FOUND, "path is not inside a git work tree", { path });
+    const rootDecision = await toplevelOrRefusal(path);
+    if (!rootDecision.allowed) return rootDecision as Decision<RepositoryRecord>;
+    const root = rootDecision.value;
 
     const observedRemote = await remoteUrl(root);
     const identity = observedRemote
