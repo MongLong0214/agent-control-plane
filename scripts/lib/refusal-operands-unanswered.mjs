@@ -3,10 +3,10 @@
  * `canonical-self-claim-listener.ts`, which left the file-exclusion backlog under #833.
  * These are answers owed, not claims of unkillability or completed coverage. Each reason states
  * the missing independent witness or the neighbouring invariant that masks removal.
- * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 88 files
- * holding 3,489 operands, measured at this commit. It said 89 until this one; #840 removed a
- * file from that list and left the count here, which is the shape of staleness a number in
- * prose always has. The count is stated because it is the one thing a reader needs in order to
+ * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 87 files
+ * holding 3,434 operands, measured at this commit. It said 89, then 88; #840 and then
+ * `src/registry/canonical-self-claim.ts` left that list and the count here did not follow, which
+ * is the shape of staleness a number in prose always has. The count is stated because it is the one thing a reader needs in order to
  * size lifting the list, and derived nowhere.
  *
  * Entries name source text and its occurrence, never a line coordinate. Identical new operands
@@ -14,6 +14,105 @@
  * sol-simplify: requested explicit operand debts; remove each when an independent row replaces it.
  */
 const groups = [
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // process and fd table parsing (lsof, ps)
+    reason: "Every operand here reads a row of a real process or file-descriptor table and decides whether it is the row being looked for. Witnessing one means a fixture that supplies a crafted table: an lsof entry whose fd is cwd but whose type is not DIR, a ps row with a command and no ppid, an argv whose first element does not end in claude, a candidate whose device or inode is absent, a stat whose device or inode disagrees with the reported one, a txt entry that is not REG, a snapshot whose ppid is 1 or is the caller itself. The inspectors are injectable, so this is reachable \u2014 the suite simply has no fixture that shapes their output per operand. These are the identity checks the claim rests on, so the debt is worth stating plainly rather than leaving the file excluded.",
+    operands: [
+      ["entry.fd === \"cwd\"",1],
+      ["entry.type === \"DIR\"",1],
+      ["ppidRaw === null",1],
+      ["command === null",1],
+      ["firstElement !== undefined",1],
+      ["/(^|\\/)claude$/.test(firstElement)",1],
+      ["snapshot.ppid <= 1",1],
+      ["snapshot.ppid === current",1],
+      ["entry.device === null",1],
+      ["entry.inode === null",1],
+      ["stat.dev !== reportedDevice",1],
+      ["stat.ino !== reportedInode",1],
+      ["candidate.fd === \"txt\"",1],
+      ["candidate.type === \"REG\"",1],
+    ],
+  },
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // argv flag extraction
+    reason: "These four decide whether a flag is present and what its value is: an absent value, an empty one, a bare `--flag` and a `--flag=value` spelling. Each needs an argv fixture with that exact shape, and the existing tests supply one well-formed argv rather than a family of malformed ones.",
+    operands: [
+      ["rawValue === undefined",1],
+      ["rawValue === \"\"",1],
+      ["token === flag",1],
+      ["token.startsWith(`${flag}=`)",1],
+    ],
+  },
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // caller pid validation
+    reason: "A caller pid that is not a safe integer and one that is not positive. Both are reachable through the claim socket, and the listener tests that drive malformed request lines stop before the pid is read. Owed.",
+    operands: [
+      ["!Number.isSafeInteger(callerPid)",1],
+      ["callerPid <= 0",1],
+    ],
+  },
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // deployment config type check
+    reason: "The blank half of this pair carries a row; this half needs a config value that is present and not a string. Every override the construction test supplies is a string, so nothing distinguishes it today.",
+    operands: [
+      ["typeof value !== \"string\"",1],
+    ],
+  },
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // owner approval and claimed pid
+    reason: "The approval pair decides whether a stored approval carries a runId and a candidate snapshot digest; the claimed-pid pair decides whether a caller-supplied pid is present and whether it matches the identity the daemon observed. Each needs its own minted approval or its own request shape, and the claim tests mint one well-formed approval and let the pid default.",
+    operands: [
+      ["request.ownerApproval.runId !== null",1],
+      ["request.ownerApproval.candidateSnapshotDigest !== null",1],
+      ["request.claimedPid !== undefined",1],
+      ["request.claimedPid !== identity.pid",1],
+    ],
+  },
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // dead-binding probe inputs
+    reason: "`#predecessorProcessIsGone` already carries a row for its verdict (#846). These two are its guards against a predecessor row that never recorded a pid or a start token, and separating them needs a stored predecessor missing exactly one of the two \u2014 a row shape the fixtures do not currently build.",
+    operands: [
+      ["osPid === null",1],
+      ["osProcessStartedAt === null",1],
+    ],
+  },
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // same-live recovery — the exact-idle-revoked-runtime comparison
+    reason: "Twenty-three operands across two guards and one refusal, and they share a fixture: a live runtime reclaiming its own revoked attachment, with exactly one field perturbed per operand. The refusal at the end is deliberately a conjunction of eleven equalities \u2014 revoked, no work, no outstanding claims, READY, matching incarnation, pid, start token, workdir, buzz actor, buzz address, provider and model \u2014 because `same-live recovery requires the exact idle revoked runtime`. Witnessing them means twenty-three scenarios that differ from the allowed one in a single field, and the suite has the allowed one. This is the largest single debt in this file and the most worth paying: every operand here is a condition under which a live runtime is permitted to take over an actor identity.",
+    operands: [
+      ["predecessor !== null",1],
+      ["this.#predecessorProcessIsGone(predecessor.osPid, predecessor.osProcessStartedAt)",1],
+      ["incumbent",1],
+      ["incumbent",2],
+      ["predecessor",1],
+      ["predecessor",2],
+      ["predecessorRuntimeIsGone",1],
+      ["predecessor.lifecycle !== SessionLifecycle.STOPPED",1],
+      ["predecessor.lifecycle !== SessionLifecycle.STOPPED",2],
+      ["predecessor.lifecycle !== SessionLifecycle.ERROR",1],
+      ["predecessor.lifecycle !== SessionLifecycle.ERROR",2],
+      ["!revoked",1],
+      ["work",1],
+      ["outstanding",1],
+      ["predecessor.lifecycle !== SessionLifecycle.READY",1],
+      ["incumbent.current_session_incarnation !== predecessor.incarnation",1],
+      ["predecessor.osPid !== identity.pid",1],
+      ["predecessor.osProcessStartedAt !== identity.startedAt",1],
+      ["predecessor.workdir !== identity.cwd",1],
+      ["predecessor.buzzActorId !== request.buzzActorId",1],
+      ["predecessor.buzzAddress !== buzzAddress",1],
+      ["predecessor.provider !== \"claude\"",1],
+      ["predecessor.model !== \"claude-cli\"",1],
+    ],
+  },
   {
     file: "src/daemon/agentcpd.ts",
     // startLocalMcpListeners

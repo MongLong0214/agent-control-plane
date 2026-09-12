@@ -1923,11 +1923,17 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     insertProject(core, projectId);
     const subject = makeSubject(core);
 
-    const result = await subject.claim(baseRequest(core, projectId, { expectedBindingGeneration: 0 }));
-
-    expect(result.allowed).toBe(false);
-    if (result.allowed) return;
-    expect(result.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
+    // Two inputs, because the guard is two operands and each catches only its own. Zero is a safe
+    // integer, so `!Number.isSafeInteger` never sees it; 1.5 is not `<= 0`, so the comparison
+    // never sees that. A generation that is not a whole number would otherwise reach the
+    // optimistic-concurrency comparison against a stored one and be answered as stale, which is a
+    // different answer to a different question.
+    for (const expectedBindingGeneration of [0, 1.5]) {
+      const result = await subject.claim(baseRequest(core, projectId, { expectedBindingGeneration }));
+      expect(result.allowed, String(expectedBindingGeneration)).toBe(false);
+      if (result.allowed) return;
+      expect(result.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
+    }
   });
 });
 
