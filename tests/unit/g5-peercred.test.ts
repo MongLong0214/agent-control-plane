@@ -185,8 +185,23 @@ describe("getPeerCredentials", () => {
         // `fd + 2**32` would reach the addon, ToInt32 would fold it right back down to `fd`,
         // and the caller would silently get this real socket's credentials back for a number
         // that looks nothing like a small fd. The guard must refuse it before that happens.
-        const wrapped = fd + 2 ** 32;
-        expect(getPeerCredentials(wrapped)).toBeNull();
+        //
+        // Three forms, because the guard is three operands and each one is the only thing that
+        // catches its form. Measured: every one of these folds to exactly `fd` under ToInt32,
+        // and the assertion above proves `fd` returns credentials — so a form that survives its
+        // operand does not return null, it returns *this socket's* identity.
+        //
+        //   fd + 2**32   safe integer, not negative, above int32   → only `fd > MAX_FD`
+        //   fd - 2**32   safe integer, below int32, negative       → only `fd < 0`
+        //   fd + 0.5     not a safe integer, in range, not negative → only `!isSafeInteger`
+        //
+        // The earlier platform-independent cases (`-1`, `1.5`, `NaN`, `2**32 + 5`) cannot do
+        // this: each folds to a small fd that is not a connected socket here, so the kernel call
+        // fails and the result is null whether the operand refused it or not. Only a fd this
+        // test knows is live can tell a refusal apart from a failure.
+        expect(getPeerCredentials(fd + 2 ** 32)).toBeNull();
+        expect(getPeerCredentials(fd - 2 ** 32)).toBeNull();
+        expect(getPeerCredentials(fd + 0.5)).toBeNull();
       } finally {
         cleanup();
       }
