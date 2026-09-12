@@ -2034,6 +2034,11 @@ export class Daemon {
 
   private buzzMentionSubscriberFindings(): Finding[] {
     const receipt = this.#buzzMentionReceipt;
+    // Kept as one condition rather than split onto two lines. Split, each becomes a plain
+    // comparison, and the operand census selects operands of `&&`/`||` only — #839 prints that
+    // reach every run — so both would leave the census entirely. Neither can carry a
+    // falsifiability row (see refusal-operands-unanswered.mjs for why), and an operand that is
+    // counted and owed is worth more than one that is invisible.
     if (!receipt || receipt.configuredIdentities === 0) return [];
     const counters = receipt.counters();
     if (counters.framesHandled > 0) return [];
