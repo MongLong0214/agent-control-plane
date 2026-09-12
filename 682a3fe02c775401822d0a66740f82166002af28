@@ -1,0 +1,4 @@
+Limit: the killing test is darwin-gated, so these three rows are established by the macOS lanes only; elsewhere the addon never loads and every fd returns null, which is indistinguishable from a refusal
+Warn: the platform-independent cases (-1, 1.5, NaN, 2**32+5) cannot kill these rows — each folds to an fd that is not a connected socket, so the result is null whether the operand refused it or not; only a fd the test knows is live separates a refusal from a failure
+Record-Id: r-efe2cbddbabc
+Provenance: inherited 682a3fe02c775401822d0a66740f82166002af28
