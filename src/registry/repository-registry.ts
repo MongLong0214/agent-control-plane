@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 
 import type { Clock } from "../core/clock.ts";
-import { type Decision, allow, deny, fail } from "../core/errors.ts";
+import { allow, deny, fail, isAcpError, type Decision } from "../core/errors.ts";
 import { newRepositoryId, normalizeRemoteIdentity } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
@@ -46,6 +46,48 @@ export interface RepositoryInspection {
  * carries one is rejected upstream by `assertPortableManifest`; this registry is where
  * the local truth is allowed to live.
  */
+
+/**
+ * The work tree root, or the refusal that says why there is no answer.
+ *
+ * `toplevel` can end two ways that are not the same claim: git answering "this is not a work
+ * tree", and git never answering at all — its bound reached, its binary missing, its output
+ * overflowed. The blanket `.catch(() => null)` this replaces read both as the first, so a
+ * `GIT_TIMEOUT` on a real work tree came back as `NOT_FOUND`, *"path is not inside a git work
+ * tree"* — a positive statement about the filesystem that was false.
+ *
+ * No test caught it because before `git()` had a bound the same call **hung** instead: the bound
+ * is what turned a hang into a wrong answer, at a site the bound's own commit did not touch. A
+ * probe that could not run must not be readable as its subject answering (#859).
+ */
+const toplevelOrRefusal = async (path: string): Promise<Decision<string>> => {
+  let root: string;
+  try {
+    root = await toplevel(path);
+  } catch (err) {
+    // Narrow on purpose: an `AcpError` is `git()`'s own verdict, and which verdict decides what
+    // this function may claim.
+    if (!isAcpError(err)) throw err;
+    // git ran and answered. `rev-parse --show-toplevel` outside a work tree exits 128 — that is
+    // the *only* way the original blanket catch could legitimately reach `NOT_FOUND`, and losing
+    // it would trade one wrong answer for another. `git()` puts a numeric `exitCode` in evidence
+    // exactly when a process ran and returned one, and `timeoutMs` / `failureCode` when it did
+    // not, so the distinction is read from the verdict rather than re-derived from a message.
+    if (typeof err.evidence["exitCode"] === "number") {
+      return deny(ReasonCode.NOT_FOUND, "path is not inside a git work tree", { path });
+    }
+    return deny(
+      err.reasonCode,
+      "the git work-tree probe did not complete, so whether this path is inside a work tree is unknown",
+      { path, probe: "rev-parse --show-toplevel" },
+    );
+  }
+  if (root.length === 0) {
+    return deny(ReasonCode.NOT_FOUND, "path is not inside a git work tree", { path });
+  }
+  return allow(ReasonCode.OK, root);
+};
+
 export class RepositoryRegistry {
   constructor(
     private readonly db: Db,
@@ -62,10 +104,9 @@ export class RepositoryRegistry {
     identity?: string;
   }): Promise<Decision<RepositoryRecord>> {
     const path = canonical(input.checkoutPath);
-    const root = await toplevel(path).catch(() => null);
-    if (!root) {
-      return deny(ReasonCode.NOT_FOUND, "path is not inside a git work tree", { path });
-    }
+    const rootDecision = await toplevelOrRefusal(path);
+    if (!rootDecision.allowed) return rootDecision as Decision<RepositoryRecord>;
+    const root = rootDecision.value;
 
     const observedRemote = await remoteUrl(root);
     const observedIdentity = observedRemote ? normalizeRemoteIdentity(observedRemote) : null;
@@ -184,8 +225,9 @@ export class RepositoryRegistry {
     runId: string,
   ): Promise<Decision<RepositoryRecord>> {
     const path = canonical(checkoutPath);
-    const root = await toplevel(path).catch(() => null);
-    if (!root) return deny(ReasonCode.NOT_FOUND, "path is not inside a git work tree", { path });
+    const rootDecision = await toplevelOrRefusal(path);
+    if (!rootDecision.allowed) return rootDecision as Decision<RepositoryRecord>;
+    const root = rootDecision.value;
 
     const observedRemote = await remoteUrl(root);
     const identity = observedRemote

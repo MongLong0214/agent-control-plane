@@ -3,7 +3,7 @@
  */
 const everyGitCallHasATimeBound = {
   id: 'every-git-call-has-a-time-bound',
-  what: 'no git invocation can outlive its bound, so a git that never returns fails the caller instead of stopping it',
+  what: 'every call through git() carries a bound, so a git that never returns fails its caller instead of stopping it',
   file: "src/git/git.ts",
   find: '      timeout,\n',
   replace: '\n',
