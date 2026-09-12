@@ -1,0 +1,5 @@
+Limit: presence of a timeout property is all this proves: it does not read the value, and it cannot tell whether the caller distinguishes a probe that could not answer from a subject that said no
+Ruled-out: matching the calls with a regex | the first census written that way counted RegExp.prototype.exec and a seatbelt policy string containing process-exec
+Warn: the exclusion list is keyed by path:line and the census fails on an entry that no longer matches, because a moved line would otherwise excuse whatever call now sits there
+Record-Id: r-c05086e5936e
+Provenance: inherited 3d739551d74837307ae57b921ce9143d08503131
