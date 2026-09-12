@@ -1,0 +1,5 @@
+Limit: this fixes the one assertion that walked the tree; nothing here stops another test from walking the filesystem, and two others in this repository still do
+Ruled-out: deleting evidence/local/mutation-verdict/gates-checkout | it is a 2026-09-09 measurement someone recorded, and removing it to make today's run green leaves the class open for the next machine
+Ruled-out: excluding evidence/ by name in the walk | the ignore list is the authority on what is not in the tree, and a hand-kept exclusion beside it is a second authority that drifts
+Warn: `git ls-files --cached --others --exclude-standard` answers about the tree, not the filesystem — a test that genuinely needs to see ignored files must not use it
+Provenance: inherited a1df2b40a40a009bf42ab66721bd4a53d18973da
