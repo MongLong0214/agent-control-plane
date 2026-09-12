@@ -3,7 +3,11 @@
  * `canonical-self-claim-listener.ts`, which left the file-exclusion backlog under #833.
  * These are answers owed, not claims of unkillability or completed coverage. Each reason states
  * the missing independent witness or the neighbouring invariant that masks removal.
- * The 89-file backlog lives separately in refusal-operand-exclusions.mjs.
+ * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 88 files
+ * holding 3,489 operands, measured at this commit. It said 89 until this one; #840 removed a
+ * file from that list and left the count here, which is the shape of staleness a number in
+ * prose always has. The count is stated because it is the one thing a reader needs in order to
+ * size lifting the list, and derived nowhere.
  *
  * Entries name source text and its occurrence, never a line coordinate. Identical new operands
  * exceed the recorded occurrences and fail. Remove an entry when its row is established.

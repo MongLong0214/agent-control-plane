@@ -1,10 +1,27 @@
 /**
- * Pre-existing operands not yet answered; entered the census when selection became derived;
- * tracked as their own unit. These files have NOT been assessed as non-deciding.
+ * Pre-existing operands not yet answered; entered the census when selection became derived.
+ * These files have NOT been assessed as non-deciding.
  * Remove a name to bring its operands into scope; no inclusion list exists.
  * sol-simplify: the requested backlog remains visible; remove entries as their operands are answered.
+ *
+ * The reason used to end "tracked as its own unit" and name no unit. When #833 measured that,
+ * `gh issue list --limit 300` returned no such issue — the sentence pointed at nothing, for every
+ * one of these files. #833 is that unit now, and the reason says so rather than implying it.
+ *
+ * It also carries the size, because the size is the decision. Measured at this commit: these 88
+ * files hold **3,489** `&&`/`||` operands, against 429 in the eight selected files. Lifting the
+ * list wholesale would grow the census roughly ninefold and require a falsifiability row or an
+ * UNANSWERED reason for each of those 3,489 — which is this same boilerplate multiplied, not its
+ * repair. So the list is worked down per file, and a reader deciding how to do that should see
+ * 3,489 rather than derive it.
+ *
+ * One shared sentence is correct here and is not the defect #833 names: the reason genuinely is
+ * one reason. Inventing 88 different sentences for 88 files whose backlog has one cause would be
+ * boilerplate wearing a disguise. What was wrong was that the sentence was false.
  */
-const reason = "pre-existing operands not yet answered; entered the census when selection became derived; tracked as its own unit";
+const reason =
+  "pre-existing operands not yet answered; entered the census when selection became derived; " +
+  "tracked as #833, which measured 3,489 operands across these 88 files";
 
 export const FILE_EXCLUSIONS = new Map([
   ["src/acceptance/disposable-realm-driver.ts", reason],
