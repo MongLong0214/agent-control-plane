@@ -10,6 +10,7 @@ import type { RequiredRole, RoleCoveragePlan } from "../continuity/continuity-ke
 import { digestOf } from "../core/digest.ts";
 import { acpError, type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
+import type { BuzzMentionCounters } from "../buzz/buzz-mention-subscriber.ts";
 import { CONTINUITY_MODE_MAX_AGE_MS } from "../run/run-engine.ts";
 import {
   resolveDoctorHealth,
@@ -67,6 +68,16 @@ import { SingleInstanceLock } from "./single-instance.ts";
  * It is the wrong budget for that periodic refresh, and it was being used there too. See
  * `sweepBudgetMs`.
  */
+/**
+ * How long a mention subscriber may report zero frames before that is worth saying.
+ *
+ * Ten minutes, chosen against the two things it has to sit between: a daemon restart, after which
+ * zero is simply "nothing has been sent yet", and a real delivery outage, where zero is the only
+ * symptom there is. Shorter and every restart reports a defect; much longer and the one signal
+ * for this path stays quiet through an afternoon of lost mentions.
+ */
+const BUZZ_MENTION_SILENCE_GRACE_MS = 600_000;
+
 const STARTUP_CAPACITY_REFRESH_BUDGET_MS = 15_000;
 
 /**
@@ -482,6 +493,14 @@ export class Daemon {
   // Unset until `main`'s composition root reports Telegram's outcome — `null` renders in
   // `health.json` as "this daemon has no opinion yet", distinct from `configured: false`.
   #telegramIngress: IngressChannelStatus | null = null;
+  /**
+   * The mention subscriber's receipt, and when it started counting.
+   *
+   * A handle rather than a snapshot: the counters move while the daemon runs, and a value copied
+   * at startup would be the same mistake `socketCount` was — a number captured once and read as
+   * a live one (#841).
+   */
+  #buzzMentionReceipt: { startedAtMs: number; configuredIdentities: number; counters(): BuzzMentionCounters } | null = null;
   #telegramIngressController: TelegramIngressController | null = null;
   #continuityCoordinatorInstalled = false;
   #continuityReconciling = false;
@@ -640,12 +659,12 @@ export class Daemon {
           // is the on-demand escape hatch. A targeted or non-system call is diagnostic only,
           // exactly as before, and does not touch the persisted snapshot.
           if (scope === "system" && target === undefined) {
-            return allow(ReasonCode.OK, await this.runSystemDoctorCheck(this.telegramIngressFindings()));
+            return allow(ReasonCode.OK, await this.runSystemDoctorCheck(this.supplementalSystemFindings()));
           }
           return allow(ReasonCode.OK, await this.cp.doctor.run(
             scope,
             target as string | undefined,
-            scope === "system" ? this.telegramIngressFindings() : [],
+            scope === "system" ? this.supplementalSystemFindings() : [],
           ));
         }
 
@@ -1962,6 +1981,19 @@ export class Daemon {
    * written into `health.json` immediately rather than waiting for the next periodic tick. A
    * listener that stops after startup must replace its earlier running state just as promptly.
    */
+  /**
+   * Installs the mention subscriber's counters so `doctor` can read receipt rather than config.
+   *
+   * The composition root calls this once, with the handle it just started. Nothing here polls it;
+   * `buzzMentionSubscriberFindings` reads it at the moment a report is produced.
+   */
+  setBuzzMentionReceipt(receipt: { configuredIdentities: number; counters(): BuzzMentionCounters }): void {
+    this.#buzzMentionReceipt = { startedAtMs: Date.now(), ...receipt };
+    // Written immediately, as `setTelegramIngressStatus` does: an operator reading `health.json`
+    // after startup must see that a subscriber exists, without waiting for whatever writes next.
+    this.writeHealth(null);
+  }
+
   setTelegramIngressStatus(status: IngressChannelStatus): void {
     this.#telegramIngress = status;
     this.writeHealth(null);
@@ -1975,6 +2007,60 @@ export class Daemon {
   /** A closing old listener cannot detach a replacement installed after it. */
   detachTelegramIngressController(controller: TelegramIngressController): void {
     if (this.#telegramIngressController === controller) this.#telegramIngressController = null;
+  }
+
+  /**
+   * Whether anything has actually arrived on the Buzz mention path.
+   *
+   * The only operator-visible number here used to be the count of *configured identities*, which
+   * moves for neither of the two states an operator needs to tell apart: a subscriber that is
+   * connected and receiving nothing, and one that is receiving and refusing. #674 could not be
+   * closed for that reason — there was no observable that a successful delivery would change.
+   *
+   * Silence is only a finding once there has been time for it to mean something. A subscriber
+   * that started ninety seconds ago has counted nothing because nothing has been sent, which is
+   * not a fault; the grace window is what keeps this from reporting every restart as a defect.
+   */
+  /**
+   * Every supplemental finding a system-scope report carries, in one place.
+   *
+   * Two call sites used to pass `telegramIngressFindings()` directly, so a third channel meant
+   * editing both and hoping. A reader comparing them could not tell a deliberate difference from
+   * an omission.
+   */
+  private supplementalSystemFindings(): Finding[] {
+    return [...this.telegramIngressFindings(), ...this.buzzMentionSubscriberFindings()];
+  }
+
+  private buzzMentionSubscriberFindings(): Finding[] {
+    const receipt = this.#buzzMentionReceipt;
+    // Kept as one condition rather than split onto two lines. Split, each becomes a plain
+    // comparison, and the operand census selects operands of `&&`/`||` only — #839 prints that
+    // reach every run — so both would leave the census entirely. Neither can carry a
+    // falsifiability row (see refusal-operands-unanswered.mjs for why), and an operand that is
+    // counted and owed is worth more than one that is invisible.
+    if (!receipt || receipt.configuredIdentities === 0) return [];
+    const counters = receipt.counters();
+    if (counters.framesHandled > 0) return [];
+    if (Date.now() - receipt.startedAtMs < BUZZ_MENTION_SILENCE_GRACE_MS) return [];
+    return [{
+      code: "BUZZ_MENTION_SUBSCRIBER_SILENT",
+      severity: "WARN",
+      scope: "buzz",
+      blocking: false,
+      confidence: "HIGH",
+      // The numbers side by side, because their disagreement is the whole diagnosis: identities
+      // configured says the subscriber was set up, frames handled says nothing has arrived.
+      observedEvidence: {
+        configuredIdentities: receipt.configuredIdentities,
+        framesHandled: 0,
+        admitted: 0,
+        upForMs: Date.now() - receipt.startedAtMs,
+      },
+      recommendedAction:
+        "no relay frame has reached this subscriber; check that the relay is delivering to the " +
+        "configured rooms and that the subscription authenticated, rather than that the daemon is up",
+    }];
   }
 
   private telegramIngressFindings(): Finding[] {
@@ -2026,6 +2112,17 @@ export class Daemon {
       // read back from whatever was last persisted. A caller that never advances the doctor
       // still gets a correct answer here: age is derived from `checkedAt`, not cached.
       doctor: this.currentDoctorHealth(),
+      // Receipt, beside the configuration. `configuredIdentities` is what the subscriber was set
+      // up to be and never moves; `framesHandled` is what has arrived. An operator reading this
+      // file can tell "connected and silent" from "receiving and refusing" — which no number on
+      // this surface could do before (#674, #841). `null` when no subscriber is configured, which
+      // is a different state from one configured and silent.
+      buzzMention: this.#buzzMentionReceipt
+        ? {
+            configuredIdentities: this.#buzzMentionReceipt.configuredIdentities,
+            ...this.#buzzMentionReceipt.counters(),
+          }
+        : null,
       timerHealth: {
         status: this.#timerFailures.size === 0 ? "HEALTHY" : "DEGRADED",
         failures: Object.fromEntries(this.#timerFailures),

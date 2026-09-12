@@ -15,6 +15,24 @@
  */
 const groups = [
   {
+    file: "src/daemon/daemon.ts",
+    // buzzMentionSubscriberFindings
+    reason: "Neither operand can carry a row. `!receipt` cannot be mutated in isolation at all: removing it leaves `receipt` typed `| null`, and every later use of it fails TS18047, so the harness refuses the mutant as uncompilable — TypeScript is what enforces this one, not a test. `receipt.configuredIdentities === 0` compiles when removed but nothing can kill it: `setBuzzMentionReceipt` has one production caller, the agentcpd startup block, and it sets the receipt only behind `socketCount > 0`, so a receipt with zero configured identities cannot reach this line. It is defence for a caller that does not exist yet.",
+    operands: [
+      ["!receipt",1],
+      ["receipt.configuredIdentities === 0",1],
+    ],
+  },
+  {
+    file: "src/daemon/agentcpd.ts",
+    // The startup block that hands the subscriber's receipt to the daemon.
+    reason: "Both operands need a daemon-startup fixture that reaches this block, and the listener-only tests do not have one. `startedSubscriber` is null on exactly one path — `startDaemonBuzzMentionSubscriberOrRefuse` swallowing a BuzzMentionBindingUnavailableError after dead-binding recovery left the role unbound — and `socketCount > 0` is false on exactly one other, the DISABLED handle returned when the Buzz config is absent. Each is reachable in production and neither is constructible from the unit level, so these are answers owed rather than claims of unkillability.",
+    operands: [
+      ["startedSubscriber",1],
+      ["startedSubscriber.socketCount > 0",1],
+    ],
+  },
+  {
     file: "src/daemon/agentcpd.ts",
     // startLocalMcpListeners
     reason: "Listener timeout validation is not isolated by the connection fixture: it starts with a valid timeout. An independent witness must distinguish fractional and nonpositive values before any listener is installed.",

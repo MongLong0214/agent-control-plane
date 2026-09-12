@@ -2940,6 +2940,21 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         process.stdout.write(
           `Buzz mention subscriber configured identities: ${buzzMentionSubscriber?.socketCount ?? 0}\n`,
         );
+        // Hand `doctor` the counters, not this number. The line above is what the subscriber was
+        // *configured* to be and is printed once; `doctor` needs what it has actually received,
+        // and that is the only thing that can tell "connected and silent" from "receiving and
+        // refusing" (#674, #841). Only when a subscriber exists: a deployment without one has
+        // nothing to be silent about.
+        // Captured into a const: `buzzMentionSubscriber` is a `let` the startup path reassigns,
+        // and a closure over it would read whatever it holds when `doctor` runs rather than the
+        // subscriber this block is about — which is also why TypeScript refuses to narrow it here.
+        const startedSubscriber = buzzMentionSubscriber;
+        if (startedSubscriber && startedSubscriber.socketCount > 0) {
+          daemon.setBuzzMentionReceipt({
+            configuredIdentities: startedSubscriber.socketCount,
+            counters: () => startedSubscriber.counters(),
+          });
+        }
         // The room the daemon *answers* in already has a name (`ACP_BUZZ_CHANNEL`, the outbound
         // adapter's own default-channel route — `buzz-adapter.ts`). The subscriber above now
         // carries its own, independently configured room list; a room in one and not the other is
