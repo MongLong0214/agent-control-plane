@@ -2375,3 +2375,69 @@ describe("the buzz mention subscriber's relay protocol", () => {
     expect(sockets).toHaveLength(1);
   });
 });
+
+/**
+ * #841. The only operator-visible number for this path was `socketCount`, which is the count of
+ * configured identities captured once at startup. A subscriber that authenticates, reaches EOSE
+ * and then never wakes again reads exactly like a healthy one under it, and that is not a
+ * hypothetical: two live probes into the configured room produced no ingress row of any kind, and
+ * nothing available could say whether the frames had arrived and been refused or never arrived.
+ *
+ * These rows pin the distinction rather than the number. What matters is that `framesHandled` and
+ * `socketCount` can disagree — one is receipt, the other is configuration.
+ */
+describe("the buzz mention subscriber counts what it receives", () => {
+  it("reports a configured identity and no frames at all before anything arrives", async () => {
+    const { handle } = startOne({});
+    await handle.settled();
+
+    // The exact shape of the defect: configuration says one, receipt says nothing.
+    expect(handle.socketCount).toBe(1);
+    expect(handle.counters().framesHandled).toBe(0);
+    expect(handle.counters().admitted).toBe(0);
+    expect(handle.counters().rejections).toEqual({});
+  });
+
+  it("counts a frame it refuses, under the reason it refused it", async () => {
+    const { handle, sockets } = startOne({});
+    await handle.settled();
+
+    // Not JSON at all — refused at the first gate in `#handleFrame`, before any event is read.
+    sockets[0]!.handlers.onFrame("this is not a frame");
+    await handle.settled();
+
+    const counters = handle.counters();
+    expect(counters.framesHandled).toBe(1);
+    expect(counters.admitted).toBe(0);
+    // The reason, not just a total. "the relay stopped attaching p tags" and "this runtime holds
+    // two roles" are different repairs, and a bare refusal count cannot tell them apart.
+    expect(counters.rejections["frame-not-json"]).toBe(1);
+    // Unmoved, and that is the point of having both numbers.
+    expect(handle.socketCount).toBe(1);
+  });
+
+  it("keeps counting across the reconnect a refused frame causes", async () => {
+    const { handle, sockets, clock } = startOne({});
+    await handle.settled();
+
+    sockets[0]!.handlers.onFrame("not json");
+    await handle.settled();
+
+    // The refusal drops the socket, and the reconnect waits on a backoff timer. Firing it is what
+    // produces the second socket — without this the frame below goes to the dropped connection,
+    // is refused as a stale generation before `#handleFrame`, and never reaches the tally. That
+    // is the subscriber behaving correctly and the test measuring nothing.
+    expect(clock.pending()).toBeGreaterThan(0);
+    clock.fireAll();
+    await handle.settled();
+    expect(sockets.length).toBeGreaterThan(1);
+
+    sockets.at(-1)!.handlers.onFrame("still not json");
+    await handle.settled();
+
+    // Two frames, both counted. A tally that reset with the connection would report one, and a
+    // subscriber losing every frame it receives would then look quiet rather than busy.
+    expect(handle.counters().framesHandled).toBe(2);
+    expect(handle.counters().rejections["frame-not-json"]).toBe(2);
+  });
+});

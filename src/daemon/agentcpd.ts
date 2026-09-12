@@ -2938,7 +2938,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
           buzzMessageIngress,
         );
         process.stdout.write(
-          `Buzz mention subscriber sockets: ${buzzMentionSubscriber?.socketCount ?? 0}\n`,
+          `Buzz mention subscriber configured identities: ${buzzMentionSubscriber?.socketCount ?? 0}\n`,
         );
         // The room the daemon *answers* in already has a name (`ACP_BUZZ_CHANNEL`, the outbound
         // adapter's own default-channel route — `buzz-adapter.ts`). The subscriber above now
