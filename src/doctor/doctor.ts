@@ -1036,8 +1036,33 @@ export class Doctor {
       // `lastObservedHead` is the acknowledged baseline. A diagnostic must not call the
       // registry's mutating observation API because that would acknowledge an owner
       // change merely by looking at it (§25, §33.5).
-      const head = await tryRevParse(repository.checkoutPath, "HEAD");
-      const clean = head ? await isClean(repository.checkoutPath) : false;
+      // Per repository, like `checkWorktrees` does three methods down, and for the reason that
+      // method already knew: one unreachable checkout must not discard the whole report. Since
+      // `git()` gained a time bound these two calls can *refuse* rather than hang — a slow
+      // checkout now throws `GIT_TIMEOUT` — and without this the throw leaves `doctor.run()`
+      // carrying every unrelated finding already collected with it (#859).
+      let head: string | null;
+      let clean: boolean;
+      try {
+        head = await tryRevParse(repository.checkoutPath, "HEAD");
+        clean = head ? await isClean(repository.checkoutPath) : false;
+      } catch (err) {
+        findings.push({
+          code: "REPOSITORY_PROBE_FAILED",
+          severity: "ERROR",
+          scope: `repository:${repository.identity}`,
+          blocking: true,
+          confidence: "HIGH",
+          observedEvidence: {
+            checkoutPath: repository.checkoutPath,
+            error: safeErrorMessage(err),
+          },
+          recommendedAction:
+            "the repository probe did not complete, so this checkout's drift state is unknown; " +
+            "check that the checkout is reachable and that git responds there",
+        });
+        continue;
+      }
       const driftState =
         head === null ? "UNKNOWN" : head === repository.lastObservedHead && clean ? "IN_SYNC" : "DRIFTED";
 

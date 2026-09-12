@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -18,9 +18,11 @@ import { git } from "../../src/git/git.ts";
 describe("every git call has a time bound", () => {
   let restorePath: string | undefined;
   let cwd = "";
+  const made: string[] = [];
 
   beforeEach(() => {
     const bin = mkdtempSync(join(tmpdir(), "acp-slow-git-"));
+    made.push(bin);
     // Resolved through PATH by this process. The sanitised env `git()` builds keeps PATH, which is
     // what makes this reachable at all — and is also why a caller cannot assume a fast git.
     writeFileSync(join(bin, "git"), "#!/bin/sh\nsleep 60\nexec /usr/bin/git \"$@\"\n");
@@ -28,10 +30,15 @@ describe("every git call has a time bound", () => {
     restorePath = process.env.PATH;
     process.env.PATH = `${bin}:${restorePath ?? ""}`;
     cwd = mkdtempSync(join(tmpdir(), "acp-git-bound-"));
+    made.push(cwd);
   });
 
   afterEach(() => {
-    process.env.PATH = restorePath;
+    // Assigning `undefined` to a `process.env` member sets the literal string "undefined", which
+    // would leave every later test in this worker with a PATH of one nonexistent directory.
+    if (restorePath === undefined) delete process.env.PATH;
+    else process.env.PATH = restorePath;
+    for (const dir of made.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 
   it("kills a git that outlives its bound and says git never answered", async () => {
@@ -53,6 +60,18 @@ describe("every git call has a time bound", () => {
     expect(initialised.exitCode).toBe(0);
     const status = await git(cwd, ["status", "--porcelain"]);
     expect(status.exitCode).toBe(0);
+  });
+
+  it("refuses a non-positive bound rather than passing it to Node as no bound", async () => {
+    // `timeout: 0` is how Node spells *no* timeout, and the census that enforces this rule reads
+    // only whether the option is present. So zero is the one value that removes the bound while
+    // still counting as bounded, and it is refused before it can be handed over.
+    await expect(git(cwd, ["status"], { timeoutMs: 0 })).rejects.toMatchObject({
+      reasonCode: ReasonCode.INVALID_ARGUMENT,
+    });
+    await expect(git(cwd, ["status"], { timeoutMs: -1 })).rejects.toMatchObject({
+      reasonCode: ReasonCode.INVALID_ARGUMENT,
+    });
   });
 
   it("does not let allowFailure turn a timeout into an exit code", async () => {

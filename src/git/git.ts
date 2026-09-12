@@ -93,7 +93,19 @@ export const git = async (
   args: readonly string[],
   options: { allowFailure?: boolean; timeoutMs?: number } = {},
 ): Promise<GitResult> => {
-  const timeout = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS;
+  // `?? ` would pass a caller's `0` straight through, and Node reads `timeout: 0` as *no*
+  // timeout — so the one value that removes the bound would still census as bounded, because
+  // `verify-subprocess-calls-are-bounded.mjs` reads the property's presence and never its value.
+  // No caller passes 0 today; this refuses the affordance rather than waiting for one to.
+  const requested = options.timeoutMs;
+  if (requested !== undefined && requested <= 0) {
+    fail(ReasonCode.INVALID_ARGUMENT, "a git time bound must be a positive number of milliseconds", {
+      cwd,
+      args,
+      timeoutMs: requested,
+    });
+  }
+  const timeout = requested ?? DEFAULT_GIT_TIMEOUT_MS;
   try {
     const { stdout, stderr } = await exec("git", ["-C", cwd, ...args], {
       maxBuffer: MAX_BUFFER,
@@ -106,7 +118,7 @@ export const git = async (
     const e = err as {
       stdout?: string;
       stderr?: string;
-      code?: number | null;
+      code?: number | string | null;
       signal?: string | null;
       killed?: boolean;
       message?: string;
@@ -117,16 +129,35 @@ export const git = async (
     // which is indistinguishable from git refusing, and `allowFailure` callers would have read
     // "the answer is no" where the truth is "the check could not run" (#859).
     const timedOut = e.killed === true && e.signal === "SIGTERM" && (e.code ?? null) === null;
+    // Measured on this repository's runtime (Node 22), the three shapes that are *not* git
+    // answering:
+    //
+    //   timeout    { code: null,                                signal: "SIGTERM", killed: true }
+    //   maxBuffer  { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", name: "RangeError" }
+    //   no binary  { code: "ENOENT" }
+    //
+    // All three mean the check did not run, and only the first was separated. The other two have
+    // a *string* `code`, so `e.code ?? 1` produced the string as an exit code and `allowFailure`
+    // handed it to a caller reading `exitCode !== 0` as "git said no" — the collapse #859 exists
+    // to remove, one shape narrower than before.
+    const didNotRun = timedOut || typeof e.code === "string";
+    const numericExit = typeof e.code === "number" ? e.code : 1;
     const detail = timedOut
       ? `git ${args.join(" ")} exceeded its ${timeout}ms bound and was killed`
-      : `git ${args.join(" ")} failed: ${e.stderr ?? e.message}`;
-    if (options.allowFailure && !timedOut) {
-      return { stdout: e.stdout ?? "", stderr: e.stderr ?? e.message ?? "", exitCode: e.code ?? 1 };
+      : typeof e.code === "string"
+        ? `git ${args.join(" ")} did not run: ${e.code}`
+        : `git ${args.join(" ")} failed: ${e.stderr ?? e.message}`;
+    if (options.allowFailure && !didNotRun) {
+      return { stdout: e.stdout ?? "", stderr: e.stderr ?? e.message ?? "", exitCode: numericExit };
     }
     return fail(timedOut ? ReasonCode.GIT_TIMEOUT : ReasonCode.INTERNAL_ERROR, detail, {
       cwd,
       args,
-      ...(timedOut ? { timeoutMs: timeout } : { exitCode: e.code ?? 1 }),
+      ...(timedOut
+        ? { timeoutMs: timeout }
+        : typeof e.code === "string"
+          ? { failureCode: e.code }
+          : { exitCode: numericExit }),
     });
   }
 };
