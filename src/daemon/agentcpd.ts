@@ -47,6 +47,7 @@ import {
   buzzMessageSigningRequest,
   deliverBuzzMessage,
   ownerMessagePointerOf,
+  type BuzzCollaborationAuthority,
   type BuzzMentionRouter,
   type BuzzMessageIngressInput,
   type BuzzMessageTurnPort,
@@ -729,6 +730,13 @@ export const startBuzzMessageIngressListener = async (
      * A composition that forgets to wire it loses delivery, never gains a wrong recipient.
      */
     roleConversation?: RoleConversationPort;
+    /**
+     * #674's second door, and it is opt-in for the same reason `roleConversation` is: absent, no
+     * non-owner is admitted and the deployment behaves exactly as it did before the seam existed.
+     * The daemon supplies the registry-backed one; a test that wants the owner-only door simply
+     * leaves it out.
+     */
+    collaboration?: BuzzCollaborationAuthority;
   },
 ): Promise<LocalBuzzMessageIngress> => {
   if (!policy.secret || policy.secret.trim().length === 0) {
@@ -739,7 +747,12 @@ export const startBuzzMessageIngressListener = async (
   // `policy.allowedActors` is the relay credential's list and admits every ACTIVE Buzz channel
   // identity; `ownerActors` is who may speak to the CEO as the owner. Passing the first for the
   // second is the defect this argument exists to make impossible to write by accident.
-  const ingress = new BuzzMessageIngress(guard, options.ownerActors, buzzMentionRouter(cp));
+  const ingress = new BuzzMessageIngress(
+    guard,
+    options.ownerActors,
+    buzzMentionRouter(cp),
+    options.collaboration ?? null,
+  );
   const roleConversation = options.roleConversation ?? null;
   const port: BuzzMessageTurnPort = {
     deliverToCeo: (text) => deliverAsCeoTurn(options.ceoConversation, text),
@@ -851,7 +864,133 @@ export const startDaemonBuzzMessageIngress = (
     // this line resolution still happens and every role delivery refuses with ROLE_PEER_ABSENT,
     // which is the state that had a person carrying messages between the two roles.
     roleConversation: listeners.ctoConversation,
+    // #674: the CTO's own reports reach the CEO as the CTO, rather than needing the owner to
+    // carry them. The grant is one relation and the registry decides whether it currently holds.
+    collaboration: buzzCollaborationAuthority(cp),
   });
+
+/**
+ * Which role may address which, as the assignment registry answers it (#674).
+ *
+ * One relation, written out: a project's `PRIMARY_CTO` may address the `CEO`. Nothing else, and
+ * the table is a literal rather than a configuration surface because a relation is an authority
+ * decision and a deployment that can add one from a file has moved that decision out of review.
+ * The reverse direction is deliberately absent: the owner already reaches every role through the
+ * owner path, and the CEO role speaking *as itself* to a CTO is a separate grant nobody has asked
+ * for.
+ */
+const BUZZ_COLLABORATION_RELATIONS: ReadonlyMap<Role, readonly Role[]> = new Map([
+  [Role.PRIMARY_CTO, [Role.CEO] as readonly Role[]],
+]);
+
+/**
+ * The production `BuzzCollaborationAuthority`: both answers come from the registry, and neither
+ * from the envelope.
+ *
+ * `senderRoleFor` resolves the verified relay pubkey the same way `buzzMentionRouter` resolves a
+ * `p` tag — a live session carrying that `buzz_actor_id`, and exactly one current binding on it.
+ * The same rule on both sides is the point: an identity that cannot be addressed unambiguously
+ * cannot speak unambiguously either, and a sender holding two roles would otherwise act with the
+ * union of their grants.
+ *
+ * `admitRelation` re-reads both bindings rather than trusting the key it was handed. That is the
+ * revoke/rebind window: `senderRoleFor` ran before `guard.admit` and before the `p` tag was
+ * resolved, so between that answer and this one the sender's assignment can have been revoked and
+ * the target's binding can have moved to a new generation. Both are refusals here, and the
+ * generation that survives into the grant is the one read at this moment — which is what the
+ * delivery-time `bindingDigest` fence is then compared against.
+ */
+export const buzzCollaborationAuthority = (
+  cp: ControlPlane,
+  /**
+   * The relation table, injectable for one reason that is not convenience: with the production
+   * table's single `PRIMARY_CTO → CEO` entry, both sides are never project-scoped at once, so the
+   * same-project comparison below is unreachable and an unreachable branch cannot be shown to
+   * work or to matter. A test supplies a project-scoped pair to reach it. Production passes
+   * nothing and gets the one relation.
+   */
+  relations: ReadonlyMap<Role, readonly Role[]> = BUZZ_COLLABORATION_RELATIONS,
+): BuzzCollaborationAuthority => {
+  const currentBindingFor = (roleKey: string): RoleBinding | null =>
+    currentBindingsForRoles(cp, MENTIONABLE_ROLES).find((binding) => binding.roleKey === roleKey) ??
+    null;
+  return {
+    senderRoleFor: (actor) => {
+      const channelIdentity = actor.trim();
+      if (channelIdentity.length === 0) return null;
+      const session = cp.db.get<{ session_id: string }>(
+        `SELECT session_id FROM sessions
+          WHERE buzz_actor_id = ? AND lifecycle IN ('READY','DRAINING')`,
+        [channelIdentity],
+      );
+      if (!session) return null;
+      const held = currentBindingsForRoles(cp, MENTIONABLE_ROLES).filter(
+        (binding) => binding.sessionId === session.session_id,
+      );
+      // Exactly one, never the first of several: see the docstring above.
+      if (held.length !== 1) return null;
+      return held[0]!.roleKey;
+    },
+    admitRelation: ({ senderRoleKey, targetRoleKey, conversation }) => {
+      const sender = currentBindingFor(senderRoleKey);
+      if (sender === null) {
+        return deny(
+          ReasonCode.INGRESS_RELATION_NOT_PERMITTED,
+          "the sending role no longer holds a current assignment",
+          { channel: "buzz", senderRoleKey },
+        );
+      }
+      const target = currentBindingFor(targetRoleKey);
+      if (target === null) {
+        return deny(
+          ReasonCode.INGRESS_RELATION_NOT_PERMITTED,
+          "the addressed role no longer holds a current assignment",
+          { channel: "buzz", senderRoleKey, targetRoleKey },
+        );
+      }
+      const permitted = relations.get(sender.role) ?? [];
+      if (!permitted.includes(target.role)) {
+        return deny(
+          ReasonCode.INGRESS_RELATION_NOT_PERMITTED,
+          "this deployment grants no collaboration from the sending role to the addressed role",
+          { channel: "buzz", senderRoleKey, targetRoleKey },
+        );
+      }
+      // The room is required of every relation, scoped or not: it is the only scope a pair with an
+      // unscoped side shares, and a judgement made without it would be made in no scope at all.
+      if (conversation.length === 0) {
+        return deny(
+          ReasonCode.INGRESS_RELATION_NOT_PERMITTED,
+          "a collaboration relation is judged in a named room and this envelope carries none",
+          { channel: "buzz", senderRoleKey, targetRoleKey },
+        );
+      }
+      // Scope, as nested tests rather than one conjunction, because each of the three answers is
+      // a different statement about the pair: both scoped and equal is a project relation, both
+      // scoped and different is a refusal, and either side unscoped — `CEO` is bound with no
+      // scope — is a relation the room alone scopes.
+      const unscoped = allow(ReasonCode.OK, {
+        senderRoleKey: sender.roleKey,
+        projectId: null,
+        targetGeneration: target.bindingGeneration,
+      });
+      if (sender.projectId === null) return unscoped;
+      if (target.projectId === null) return unscoped;
+      if (sender.projectId !== target.projectId) {
+        return deny(
+          ReasonCode.INGRESS_RELATION_NOT_PERMITTED,
+          "the sending and addressed roles are scoped to different projects",
+          { channel: "buzz", senderRoleKey, targetRoleKey },
+        );
+      }
+      return allow(ReasonCode.OK, {
+        senderRoleKey: sender.roleKey,
+        projectId: sender.projectId,
+        targetGeneration: target.bindingGeneration,
+      });
+    },
+  };
+};
 
 /**
  * The registry answer the relay subscriber preflights against (#760 Part C).
