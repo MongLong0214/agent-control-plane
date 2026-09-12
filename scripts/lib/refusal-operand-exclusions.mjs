@@ -9,7 +9,7 @@
  * one of these files. #833 is that unit now, and the reason says so rather than implying it.
  *
  * It also carries the size, because the size is the decision. Measured at this commit: these 87
- * files hold **3,479** `&&`/`||` operands, against 439 in the selected files.
+ * files hold **3,479** `&&`/`||` operands, against 443 in the selected files.
  * Lifting the list wholesale would grow the census roughly ninefold and require a falsifiability
  * row or an UNANSWERED reason for each of those 3,479 — which is this same boilerplate
  * multiplied, not its repair. So the list is worked down per file, and a reader deciding how to do
@@ -20,8 +20,8 @@
  * `src/registry/conversational-actor-registry.ts` each left the list:
  *
  *     emptying this Map and running `pnpm guards:operands` reports the repository total
- *     (3,918 at this commit); the census's own PASS line reports what it currently sees
- *     (439).
+ *     (3,922 at this commit); the census's own PASS line reports what it currently sees
+ *     (443).
  *     The difference is this list.
  *
  * One shared sentence is correct here and is not the defect #833 names: the reason genuinely is
