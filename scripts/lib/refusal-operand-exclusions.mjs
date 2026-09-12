@@ -9,11 +9,11 @@
  * one of these files. #833 is that unit now, and the reason says so rather than implying it.
  *
  * It also carries the size, because the size is the decision. Measured at this commit: these 87
- * files hold **PENDING_OPERANDS** `&&`/`||` operands, against PENDING_SEEN in the selected files.
+ * files hold **3,479** `&&`/`||` operands, against 439 in the selected files.
  * Lifting the list wholesale would grow the census roughly ninefold and require a falsifiability
- * row or an UNANSWERED reason for each of those PENDING_OPERANDS — which is this same boilerplate
+ * row or an UNANSWERED reason for each of those 3,479 — which is this same boilerplate
  * multiplied, not its repair. So the list is worked down per file, and a reader deciding how to do
- * that should see PENDING_OPERANDS rather than derive it.
+ * that should see 3,479 rather than derive it.
  *
  * Re-derive it rather than trusting it, because a number in prose is exactly what goes stale
  * here — this line said 89/3,489, then 88, then 87, as `src/core/peercred.ts` and
@@ -21,16 +21,16 @@
  *
  *     emptying this Map and running `pnpm guards:operands` reports the repository total
  *     (3,918 at this commit); the census's own PASS line reports what it currently sees
- *     (PENDING_SEEN).
+ *     (439).
  *     The difference is this list.
  *
  * One shared sentence is correct here and is not the defect #833 names: the reason genuinely is
- * one reason. Inventing 87 different sentences for 87 files whose backlog has one cause would be
+ * one reason. Inventing 86 different sentences for 86 files whose backlog has one cause would be
  * boilerplate wearing a disguise. What was wrong was that the sentence was false.
  */
 const reason =
   "pre-existing operands not yet answered; entered the census when selection became derived; " +
-  "tracked as #833, which measured PENDING_OPERANDS operands across these PENDING_FILES files";
+  "tracked as #833, which measured 3,479 operands across these 86 files";
 
 export const FILE_EXCLUSIONS = new Map([
   ["src/acceptance/disposable-realm-driver.ts", reason],

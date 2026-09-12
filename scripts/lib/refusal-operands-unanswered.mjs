@@ -3,8 +3,8 @@
  * `canonical-self-claim-listener.ts`, which left the file-exclusion backlog under #833.
  * These are answers owed, not claims of unkillability or completed coverage. Each reason states
  * the missing independent witness or the neighbouring invariant that masks removal.
- * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — PENDING_FILES files
- * holding PENDING_COUNT operands, measured at this commit. It said 89, then 88, then 87; #840,
+ * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 86 files
+ * holding 3,479 operands, measured at this commit. It said 89, then 88, then 87; #840,
  * `src/core/peercred.ts` and `src/registry/conversational-actor-registry.ts` each left that list
  * and the count here did not follow, which is the shape of staleness a number in prose always has.
  * The count is stated because it is the one thing a reader needs in order to
