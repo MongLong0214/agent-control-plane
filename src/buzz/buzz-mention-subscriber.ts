@@ -704,10 +704,17 @@ type BuzzMentionRejection =
    */
   | "admission-retry-pending"
   /**
-   * The sink answered `ALREADY_DURABLE`: this event's durable copy exists from an earlier pass.
-   * Not a failure and not a new delivery. It has its own reason because `since` is inclusive, so
-   * every reconnect re-requests the boundary event and the seam answers this — counting it as an
-   * admission made the number climb with reconnect count instead of with delivery count.
+   * The sink answered `ALREADY_DURABLE`: a durable copy of this event exists already. It has its
+   * own reason because `since` is inclusive, so every reconnect re-requests the boundary event and
+   * the seam answers this — counting it as an admission made the number climb with reconnect count
+   * instead of with delivery count.
+   *
+   * **Not uniformly benign, and the name understates it.** `SUBSCRIBER_ALREADY_DURABLE_CODES`
+   * (src/daemon/agentcpd.ts) folds in `INGRESS_TURN_OUTCOME_UNKNOWN` — a turn that was claimed and
+   * whose outcome nobody recorded — beside the ordinary replay. So a count here means "a durable
+   * copy exists", not "this was answered": one of its causes is precisely the state the reason
+   * codes exist to keep separate from a replay. Measured by a merge-gate review; splitting the
+   * bucket needs the seam to pass its code through, which this surface does not receive.
    */
   | "admission-already-durable"
   | "frame-too-large"
@@ -754,10 +761,18 @@ export interface BuzzMentionCounters {
    * zero rows.
    *
    * Wider than "rejection": `admission-already-durable` is not a rejection, and it is here for the
-   * accounting rather than as a complaint — what the three numbers together say is
-   * `framesHandled = admitted + Σrejections + frames whose connection was replaced mid-answer`.
-   * That last term is deliberately unattributed; see the stale-tail branch in
-   * `#admitEvent`.
+   * accounting rather than as a complaint. The identity is
+   *
+   *     framesHandled = admitted
+   *                   + Σrejections
+   *                   + protocol frames that carry no verdict
+   *                   + frames whose connection was replaced mid-answer
+   *
+   * The third term is the one an earlier version of this comment omitted, and a merge-gate review
+   * measured the difference on a healthy run: `ACCEPTED` is returned for the AUTH challenge, the
+   * NIP-42 `OK`, `EOSE` and `NOTICE`, so those frames are in `framesHandled` and in neither of the
+   * other two. A reader subtracting without that term concludes the subscriber lost events. The
+   * fourth term is the stale tail, deliberately unattributed; see the branch in `#admitEvent`.
    */
   readonly rejections: Readonly<Record<string, number>>;
 }
@@ -1253,11 +1268,15 @@ class BuzzMentionSubscription {
     // an advance would move the live connection's request window on the strength of a dead
     // connection's answer. The message itself is not lost by either — the seam has it, or it does
     // not, and an unadvanced mark simply means the replacement asks for it again.
-    // Unattributed on purpose, and it is the one term of the accounting that is. The answer
-    // belongs to a connection that no longer exists; filing it under the live tally's reasons
-    // would credit or blame the replacement for something it never asked, and the replacement
-    // will ask again. So the frame is recorded in `framesHandled` and nowhere else, which is why
-    // that identity has a third term rather than being `admitted + Σrejections`.
+    // Unattributed on purpose. The answer belongs to a connection that no longer exists; filing it
+    // under the live tally's reasons would credit or blame the replacement for something it never
+    // asked, and the replacement will ask again.
+    //
+    // "Recorded in `framesHandled` and nowhere else" is how an earlier version of this comment put
+    // it, and a merge-gate review caught the exception: the outcome carries `admission` through, so
+    // a stale `DURABLE` still increments `admitted`. That is the one attribution a stale tail
+    // makes, and it is the defensible one — the seam did make the event durable, whoever was
+    // listening. Every other stale answer lands in `framesHandled` alone.
     if (!this.#isCurrent(generation)) return { rejected: null, admission };
 
     if (admission === "RETRY") {

@@ -1778,6 +1778,21 @@ describe("the buzz mention subscriber's relay protocol", () => {
       socket.handlers.onFrame(frame(["EVENT", subId, good]));
       await handle.settled();
       expect(sink.admitted).toHaveLength(1);
+
+      // `admitted` is now defined as deliveries and nothing else, so something has to witness that
+      // it is ever non-zero — otherwise the narrowing could have gone one step too far and every
+      // test would still pass. A merge-gate review named that gap; this is the case that closes it,
+      // because it is the only one with a healthy `DURABLE` delivery.
+      const counters = handle.counters();
+      expect(counters.admitted).toBe(1);
+      expect(counters.rejections).toEqual({});
+
+      // And the accounting identity's third term, in the same breath. This case feeds a `NOTICE`
+      // and a `COUNT` on purpose, and `authenticate` sends the AUTH challenge and the NIP-42 `OK`,
+      // so `framesHandled` exceeds `admitted + Σrejections` by exactly the protocol frames that
+      // carry no verdict. Asserting the inequality rather than a literal keeps this from pinning
+      // the handshake's frame count, which is not this case's subject.
+      expect(counters.framesHandled).toBeGreaterThan(counters.admitted);
     } finally {
       handle.close();
     }
