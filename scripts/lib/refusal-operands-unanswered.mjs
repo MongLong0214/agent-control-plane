@@ -3,10 +3,10 @@
  * `canonical-self-claim-listener.ts`, which left the file-exclusion backlog under #833.
  * These are answers owed, not claims of unkillability or completed coverage. Each reason states
  * the missing independent witness or the neighbouring invariant that masks removal.
- * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 88 files
- * holding 3,489 operands, measured at this commit. It said 89 until this one; #840 removed a
- * file from that list and left the count here, which is the shape of staleness a number in
- * prose always has. The count is stated because it is the one thing a reader needs in order to
+ * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 87 files
+ * holding 3,475 operands, measured at this commit. It said 89, then 88; #840 and then
+ * `src/session/session-registry.ts` left that list and the count here did not follow, which is
+ * the shape of staleness a number in prose always has. The count is stated because it is the one thing a reader needs in order to
  * size lifting the list, and derived nowhere.
  *
  * Entries name source text and its occurrence, never a line coordinate. Identical new operands
@@ -14,6 +14,50 @@
  * sol-simplify: requested explicit operand debts; remove each when an independent row replaces it.
  */
 const groups = [
+  {
+    file: 'src/session/session-registry.ts',
+    // verifySecret — the stored-hash readability pair.
+    reason: "Neither operand can be witnessed while the schema holds. `session_secret_hash` is written once by `create()` with a value this regex accepts, and the CP-HI-02 trigger refuses every UPDATE and every INSERT OR REPLACE against it (SESSION_SECRET_HASH_IMMUTABLE) — so the malformed stored hash these two defend against cannot be constructed without dropping that trigger, which is a different subject. The typeof half is additionally masked: `RegExp.test` coerces, and no non-string coerces to sixty-four hex characters, so `validStoredHash` is false with or without it.",
+    operands: [
+      ['typeof row.session_secret_hash === "string"',1],
+      ["SESSION_SECRET_HASH.test(row.session_secret_hash)",1],
+    ],
+  },
+  {
+    file: 'src/session/session-registry.ts',
+    // verifySecret — the unreadable-hash refusal, masked by its neighbour.
+    reason: "Masked by `!matches`, which carries a row. When the stored hash is unreadable the code compares against a zero buffer, and the SHA-256 of a real secret is not sixty-four zero bytes, so `timingSafeEqual` is false and the denial happens anyway. Removing this operand changes no observable; witnessing it would mean constructing a secret whose hash is all zeros.",
+    operands: [
+      ["!validStoredHash",1],
+    ],
+  },
+  {
+    file: 'src/session/session-registry.ts',
+    // fenceUndeliveredMessages — the terminal-transition pair.
+    reason: "Both need a fixture that transitions a session with PENDING or IN_FLIGHT outbox rows into one specific terminal state and asserts those rows were fenced. The existing tests transition sessions but assert lifecycle and secret behaviour, not the outbox side effect, so neither terminal value is independently witnessed. These are answers owed: the docstring above the method records that this fence once fired first in the ordinary failure ordering and destroyed the message before a takeover could reach it, which is precisely the behaviour a witness would pin.",
+    operands: [
+      ["to !== SessionLifecycle.ERROR",1],
+      ["to !== SessionLifecycle.STOPPED",1],
+    ],
+  },
+  {
+    file: 'src/session/session-registry.ts',
+    // acquireBuzzActorIdentity — the terminal-session refusal pair.
+    reason: "Both need a fixture that authenticates a session, transitions it to one specific terminal state, and then asks for an actor identity. The SESSION_NOT_READY assertions elsewhere reach that reason code through other paths (binding and dispatch), so they do not distinguish either operand here.",
+    operands: [
+      ["authenticated.value.lifecycle === SessionLifecycle.STOPPED",1],
+      ["authenticated.value.lifecycle === SessionLifecycle.ERROR",1],
+    ],
+  },
+  {
+    file: 'src/session/session-registry.ts',
+    // The catch that converts one trigger denial into a typed refusal.
+    reason: "`isAcpError(err)` cannot be mutated at all: `err` is `unknown` in a catch, and removing the guard makes `err.reasonCode` a type error, so the harness refuses the mutant as uncompilable — TypeScript enforces this one rather than a test. Its neighbour compiles when removed but the existing witness cannot kill it: the test that reaches this catch throws exactly SESSION_BUZZ_ACTOR_ALREADY_BOUND, and `deny(err.reasonCode, ...)` reproduces the same answer with the operand gone. Witnessing it means a fixture whose insert throws a *different* AcpError, which the trigger set does not currently produce here.",
+    operands: [
+      ["isAcpError(err)",1],
+      ["err.reasonCode === ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND",1],
+    ],
+  },
   {
     file: "src/daemon/agentcpd.ts",
     // startLocalMcpListeners
