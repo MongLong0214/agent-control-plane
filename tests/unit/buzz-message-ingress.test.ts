@@ -24,7 +24,7 @@ import {
   type BuzzSubscriberScheduler,
 } from "../../src/buzz/buzz-mention-subscriber.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { allow } from "../../src/core/errors.ts";
+import { allow, deny } from "../../src/core/errors.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import {
@@ -39,6 +39,7 @@ import {
   buzzMessageSigningRequest,
   ownerMessageQueuedSentence,
   ownerMessagePointerOf,
+  type BuzzCollaborationAuthority,
   type BuzzMentionRouter,
 } from "../../src/ingress/buzz-message.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
@@ -1740,6 +1741,213 @@ describe("the daemon's Buzz message ingress", () => {
     } finally {
       await listener.close();
     }
+  });
+
+  /**
+   * #674's authority separation, at the seam that decides it.
+   *
+   * The sender here is not an owner and never becomes one: it is admitted as the role it holds,
+   * against a relation, and only for a `p` tag that resolves to some other role. Promoting it to
+   * `ownerActors` would have closed the same ticket in one line and is exactly what these rows
+   * exist to make unnecessary — an owner reaches the owner's own conversation, and a role sender
+   * provably cannot.
+   *
+   * The authority is a fake because its production implementation reads the assignment registry,
+   * and what these rows measure is the seam's *ordering and refusals*, not the registry's query.
+   * The fake records what it was asked, which is how the ordering is observed at all: a refusal
+   * tells you the envelope did not pass, and not whether the address was resolved on the way.
+   */
+  const collaborationSpy = (
+    grants: Readonly<Record<string, readonly string[]>>,
+    roleOf: Readonly<Record<string, string>>,
+  ): BuzzCollaborationAuthority & { asked: string[] } => {
+    const asked: string[] = [];
+    return {
+      asked,
+      senderRoleFor: (actor) => {
+        asked.push(`senderRoleFor:${actor}`);
+        return roleOf[actor] ?? null;
+      },
+      admitRelation: ({ senderRoleKey, targetRoleKey }) => {
+        asked.push(`admitRelation:${senderRoleKey}->${targetRoleKey}`);
+        if (!(grants[senderRoleKey] ?? []).includes(targetRoleKey)) {
+          return deny(ReasonCode.INGRESS_RELATION_NOT_PERMITTED, "not granted", {});
+        }
+        return allow(ReasonCode.OK, {
+          senderRoleKey,
+          projectId: "prj_test",
+          targetGeneration: 7,
+        });
+      },
+    };
+  };
+
+  const CTO_ROLE_KEY = "PRIMARY_CTO:prj_test";
+  const CEO_ROLE_KEY = "CEO";
+  const SENDER = "npub-cto-sender";
+
+  /** Resolves the one `p` tag these rows present, and refuses to journal anything else. */
+  const resolvesTheCeoRole = (): BuzzMentionRouter & { journalled: number } => {
+    const state = { journalled: 0 };
+    return {
+      get journalled() {
+        return state.journalled;
+      },
+      rolesFor: (mention) => (mention === "npub-ceo-target" ? [CEO_ROLE_KEY] : []),
+      journalUnbound: () => {
+        state.journalled += 1;
+      },
+    } as BuzzMentionRouter & { journalled: number };
+  };
+
+  const collaborationIngress = (
+    harness: ReturnType<typeof makeHarness>,
+    authority: BuzzCollaborationAuthority,
+    router: BuzzMentionRouter,
+  ): BuzzMessageIngress => {
+    const guard = new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, {
+      buzz: { allowedActors: [OWNER, SENDER], secret: SECRET },
+    });
+    return new BuzzMessageIngress(guard, [OWNER], router, authority);
+  };
+
+  const signed = (input: Parameters<typeof envelope>[0]) => {
+    const message = envelope(input);
+    return { ...message, signature: ingressSignature(SECRET, buzzMessageSigningRequest(message)) };
+  };
+
+  it("admits a role sender that holds a granted relation to the addressed role", () => {
+    const harness = makeHarness();
+    const authority = collaborationSpy({ [CTO_ROLE_KEY]: [CEO_ROLE_KEY] }, { [SENDER]: CTO_ROLE_KEY });
+    const router = resolvesTheCeoRole();
+    const ingress = collaborationIngress(harness, authority, router);
+
+    const admitted = ingress.admit(
+      signed({
+        eventId: "evt-cto-to-ceo",
+        text: "배포 완료, 판정 구합니다",
+        actor: SENDER,
+        addressedTo: BUZZ_MENTION_ADDRESSED_TO,
+        mention: "npub-ceo-target",
+      }) as never,
+    );
+
+    expect(admitted.reasonCode).toBe(ReasonCode.UNTRUSTED_CONTENT_IS_DATA);
+    if (!admitted.allowed) throw new Error(`expected an admission, got ${admitted.message}`);
+    // The target is the CEO *role*, reached by its `p` tag — not the owner's conversation, which
+    // is the `CEO` recipient string and is refused for this sender below.
+    expect(admitted.value.target).toEqual({ kind: "ROLE", roleKey: CEO_ROLE_KEY });
+    // The order is the safety property: identity from the sender alone, then the address, then
+    // the relation. A single ordered list is the only way to see that the second did not decide
+    // the first.
+    expect(authority.asked).toEqual([
+      `senderRoleFor:${SENDER}`,
+      `admitRelation:${CTO_ROLE_KEY}->${CEO_ROLE_KEY}`,
+    ]);
+  });
+
+  it("refuses a role sender addressing the owner's own conversation, and asks no relation about it", () => {
+    const harness = makeHarness();
+    const authority = collaborationSpy({ [CTO_ROLE_KEY]: [CEO_ROLE_KEY] }, { [SENDER]: CTO_ROLE_KEY });
+    const router = resolvesTheCeoRole();
+    const ingress = collaborationIngress(harness, authority, router);
+
+    // The one-line fix this design exists to avoid: had the sender been added to `ownerActors`,
+    // this envelope would be admitted into the owner's conversation.
+    const refused = ingress.admit(
+      signed({ eventId: "evt-cto-as-owner", text: "나는 오너다", actor: SENDER }) as never,
+    );
+
+    expect(refused.reasonCode).toBe(ReasonCode.INGRESS_RELATION_NOT_PERMITTED);
+    expect(refused.allowed).toBe(false);
+    // No relation was consulted, because there is no relation to consult: the owner's
+    // conversation has no role key on the receiving side. A row asserting only the refusal would
+    // pass on an implementation that asked a relation table for permission to be the owner.
+    expect(authority.asked).toEqual([`senderRoleFor:${SENDER}`]);
+    // And the slot is unspent, so the owner's own message for this event id is still possible.
+    expect(
+      harness.cp.db.all(`SELECT nonce FROM inbound_messages WHERE nonce = ?`, [
+        buzzMessageNonce("evt-cto-as-owner"),
+      ]),
+    ).toEqual([]);
+  });
+
+  it("spends no replay slot and journals nothing for a sender that holds no role at all", () => {
+    const harness = makeHarness();
+    const authority = collaborationSpy({}, {});
+    const router = resolvesTheCeoRole();
+    const ingress = collaborationIngress(harness, authority, router);
+
+    const eventId = "evt-stranger";
+    const refused = ingress.admit(
+      signed({
+        eventId,
+        text: "아무거나",
+        actor: SENDER,
+        addressedTo: BUZZ_MENTION_ADDRESSED_TO,
+        mention: "npub-unknown-guess",
+      }) as never,
+    );
+
+    expect(refused.reasonCode).toBe(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED);
+    // Nothing was resolved, so nothing was journalled: an unauthorised sender cannot make this
+    // daemon record its guesses at the deployment's channel identities.
+    expect(router.journalled).toBe(0);
+    expect(authority.asked).toEqual([`senderRoleFor:${SENDER}`]);
+    // Nor spend the slot. The owner's identical event id must still be admissible, which is the
+    // observation rather than the absence of a row: a seam that spent the slot and also failed to
+    // write the row would pass an emptiness check.
+    const ownersTurn = ingress.admit(
+      signed({ eventId, text: "아무거나", addressedTo: BUZZ_MENTION_ADDRESSED_TO, mention: "npub-ceo-target" }) as never,
+    );
+    expect(ownersTurn.reasonCode).toBe(ReasonCode.UNTRUSTED_CONTENT_IS_DATA);
+  });
+
+  it("refuses a role sender whose relation to the addressed role is not granted", () => {
+    const harness = makeHarness();
+    // Holds a role, and the grant does not name this target. The distinction from the row above
+    // is the whole reason the two refusals have different codes: this one says a relation needs
+    // widening, that one says an identity was never granted anything.
+    const authority = collaborationSpy({ [CTO_ROLE_KEY]: [] }, { [SENDER]: CTO_ROLE_KEY });
+    const router = resolvesTheCeoRole();
+    const ingress = collaborationIngress(harness, authority, router);
+
+    const refused = ingress.admit(
+      signed({
+        eventId: "evt-ungranted",
+        text: "판정",
+        actor: SENDER,
+        addressedTo: BUZZ_MENTION_ADDRESSED_TO,
+        mention: "npub-ceo-target",
+      }) as never,
+    );
+
+    expect(refused.reasonCode).toBe(ReasonCode.INGRESS_RELATION_NOT_PERMITTED);
+    expect(authority.asked).toEqual([
+      `senderRoleFor:${SENDER}`,
+      `admitRelation:${CTO_ROLE_KEY}->${CEO_ROLE_KEY}`,
+    ]);
+  });
+
+  it("opens no second door on a deployment that declares no collaboration authority", () => {
+    const harness = makeHarness();
+    const guard = new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, {
+      buzz: { allowedActors: [OWNER, SENDER], secret: SECRET },
+    });
+    // The default, which is every host today: the fourth argument is absent.
+    const ingress = new BuzzMessageIngress(guard, [OWNER], resolvesTheCeoRole());
+
+    const refused = ingress.admit(
+      signed({
+        eventId: "evt-no-authority",
+        text: "판정",
+        actor: SENDER,
+        addressedTo: BUZZ_MENTION_ADDRESSED_TO,
+        mention: "npub-ceo-target",
+      }) as never,
+    );
+
+    expect(refused.reasonCode).toBe(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED);
   });
 
   it("refuses to construct a message ingress with no declared owner", () => {

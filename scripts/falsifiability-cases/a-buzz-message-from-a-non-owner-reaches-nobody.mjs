@@ -9,17 +9,19 @@
  * refusal costs a nonce as well as a turn: a non-owner cannot burn the `(buzz, eventId)` slot
  * the owner's own message needs.
  *
- * Mutating this to `if (false)` restores exactly the shipped defect — the surviving checks
- * (signature, recipient, nonce, guard allowlist) all pass for that actor, which is why the test
- * that kills this row sends the *same* envelope twice, once as the non-owner and once as the
- * owner.
+ * The check moved when #674 added the collaboration door: `admit` now asks `#senderRoleFor`
+ * which door a sender comes through, and the owner set is consulted there. Mutating that line to
+ * return the owner sentinel unconditionally restores exactly the shipped defect — every sender
+ * becomes the owner — and the surviving checks (signature, recipient, nonce, guard allowlist) all
+ * pass for that actor, which is why the test that kills this row sends the *same* envelope twice,
+ * once as the non-owner and once as the owner.
  */
 const aBuzzMessageFromANonOwnerReachesNobody = {
   id: "a-buzz-message-from-a-non-owner-reaches-nobody",
   what: "a Buzz message from an allowlisted non-owner is not delivered to the CEO",
   file: "src/ingress/buzz-message.ts",
-  find: "    if (!this.#ownerActors.has(input.actor.trim())) {\n",
-  replace: "    if (false) {\n",
+  find: "    if (this.#ownerActors.has(actor)) return OWNER_SENDER;\n",
+  replace: "    return OWNER_SENDER;\n",
   killedBy: [
     "tests/unit/buzz-message-ingress.test.ts::refuses an ACTIVE non-owner's otherwise valid CEO envelope, and still delivers the owner's identical one",
   ],

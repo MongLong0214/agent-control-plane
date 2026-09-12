@@ -18,6 +18,17 @@ import type { IngressGuard, IngressRequest, TurnClaim, TurnIdentity } from "./in
 export const BUZZ_MESSAGE_RECIPIENT_CEO = "CEO";
 
 /**
+ * What `#senderRoleFor` answers for a declared owner: authorised, and not as a role.
+ *
+ * A sentinel rather than a boolean beside the role key, because the two facts are one decision
+ * with three outcomes — owner, role holder, neither — and a pair of values admits a fourth
+ * combination that means nothing. It is deliberately not a legal role key: role keys are
+ * `roleKeyFor(role, projectId)` and carry a project, so no assignment can ever produce this
+ * string and no relation can be written for it.
+ */
+const OWNER_SENDER = "owner";
+
+/**
  * Nonces for this path are prefixed so they cannot collide with the actor-binding path's.
  *
  * Both paths are the `buzz` channel and therefore share one `(channel, nonce)` dedup space in
@@ -205,6 +216,52 @@ export interface UnboundMentionRecord {
  * the defect `MENTION_TARGET_UNBOUND` exists to refuse, and a resolver that returned one role
  * could not tell "the CTO of one project" from "the CTO of two".
  */
+/**
+ * One collaboration grant, as the authority that derived it describes it.
+ *
+ * Facts rather than a verdict: the caller records what was granted, and an operator reading a
+ * refused or admitted envelope can see which role the sender was acting as and under which
+ * generation of the target. A bare boolean would leave both unanswerable from the audit trail.
+ */
+export interface BuzzCollaborationGrant {
+  /** The role the sender currently holds, derived from its own assignment — never self-declared. */
+  readonly senderRoleKey: string;
+  /** The project both roles are in. The relation is refused across projects, so there is one. */
+  readonly projectId: string;
+  /** The addressed role's binding generation at the moment the relation was judged. */
+  readonly targetGeneration: number;
+}
+
+/**
+ * Whether a non-owner sender may address a role, and as what.
+ *
+ * Two methods rather than one, and the split is the whole of this seam's safety. `senderRoleFor`
+ * answers from the sender alone, so it can run *before* the replay slot is spent and before the
+ * `p` tag is resolved — an identity this daemon has granted nothing must not be able to consume a
+ * nonce or make the daemon journal its guesses at the deployment's channel identities. Only once
+ * that has answered does the address get resolved and `admitRelation` judge the pair.
+ *
+ * Supplied rather than reached for, like `BuzzMentionRouter`: the facts live in the assignment
+ * registry, and this module must not acquire database authority to answer an authority question.
+ * Absent — the default — the collaboration door does not exist and only declared owners are
+ * admitted, which is the behaviour every deployment has today.
+ */
+export interface BuzzCollaborationAuthority {
+  /**
+   * The role this actor currently holds, or null when it holds none.
+   *
+   * Derived from the actor presented by the ingress, which is the pubkey the relay event's own
+   * signature covers (`verifyEvent`, then `actor: request.event.pubkey`) — so this is a lookup
+   * keyed by a cryptographically established identity, not by a claim inside the payload.
+   */
+  senderRoleFor(actor: string): string | null;
+  /** Whether `senderRoleKey` may address `targetRoleKey` right now, and under what facts. */
+  admitRelation(input: {
+    readonly senderRoleKey: string;
+    readonly targetRoleKey: string;
+  }): Decision<BuzzCollaborationGrant>;
+}
+
 export interface BuzzMentionRouter {
   /** Every canonical role the mentioned identity holds right now. Order is not significant. */
   rolesFor(mention: string): readonly string[];
@@ -252,6 +309,12 @@ export class BuzzMessageIngress {
     private readonly guard: IngressGuard,
     ownerActors: readonly string[],
     private readonly router: BuzzMentionRouter,
+    /**
+     * Absent by default, and that default is the deployment every host runs today: with no
+     * collaboration authority there is no second door, and only a declared owner is admitted.
+     * Supplying one opens role-to-role delivery for exactly the relations it grants.
+     */
+    private readonly collaboration: BuzzCollaborationAuthority | null = null,
   ) {
     const owners = ownerActors.map((actor) => actor.trim()).filter((actor) => actor.length > 0);
     if (owners.length === 0) {
@@ -290,21 +353,40 @@ export class BuzzMessageIngress {
         "buzz message ingress requires an actor, conversation, event id and text",
       );
     }
-    if (!this.#ownerActors.has(input.actor.trim())) {
-      // Before admission, and for a second reason beyond who may speak: a non-owner on the
-      // relay allowlist can produce a *valid* signature, so letting the guard admit it first
-      // would consume the `(buzz, nonce)` slot for that event id. The owner's own message for
-      // the same event would then be refused as a replay of a turn that never ran.
-      //
-      // It is also ahead of address resolution on purpose. Resolving a `p` tag writes a journal
-      // row when it fails, and a stranger must not be able to make this daemon write one — the
-      // sender's authority and the recipient's address are two separate questions, and answering
-      // the second first would let the second answer the first.
+    // Two doors, and both are answered here — before admission, and for a second reason beyond
+    // who may speak: a sender on the relay allowlist can produce a *valid* signature, so letting
+    // the guard admit it first would consume the `(buzz, nonce)` slot for that event id. The
+    // owner's own message for the same event would then be refused as a replay of a turn that
+    // never ran.
+    //
+    // It is also ahead of address resolution on purpose. Resolving a `p` tag writes a journal
+    // row when it fails, and a sender this daemon has granted nothing must not be able to make it
+    // write one — the sender's authority and the recipient's address are two separate questions,
+    // and answering the second first would let the second answer the first. That is why the
+    // collaboration authority is asked about the *sender alone* at this point: the relation needs
+    // the address, so it is judged after resolution, and the identity does not.
+    const actor = input.actor.trim();
+    const senderRoleKey = this.#senderRoleFor(actor);
+    if (senderRoleKey === null) {
       return deny(
         ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED,
         "buzz message ingress delivers only messages from a declared buzz owner identity",
         { channel: "buzz", actor: input.actor },
       );
+    }
+    if (senderRoleKey !== OWNER_SENDER) {
+      // The owner's own conversation stays the owner's. A role holder addressing `CEO` is not
+      // reaching the CEO *role* — that is a `p` tag, resolved below — it is reaching the
+      // conversation the owner speaks through, and granting a role that would be promoting it to
+      // owner by the back door. Refused here rather than at the relation, because there is no
+      // relation to judge: this address has no role key on either side.
+      if (input.addressedTo === BUZZ_MESSAGE_RECIPIENT_CEO) {
+        return deny(
+          ReasonCode.INGRESS_RELATION_NOT_PERMITTED,
+          "a role sender may not address the owner's own conversation",
+          { channel: "buzz", senderRoleKey },
+        );
+      }
     }
     // Authentication and replay first, addressing second — the order B4's review demanded, and
     // the reason is that every step below writes something an unauthenticated caller must not be
@@ -324,6 +406,12 @@ export class BuzzMessageIngress {
     const target = this.#targetFor(input);
     if (!target.allowed) return target as Decision<AdmittedBuzzMessage>;
 
+    // The relation, judged only now that both sides have names. The owner reaches this line with
+    // `OWNER_SENDER` and is not asked: its authority is the declared owner identity itself, and
+    // routing it through a relation table would make the owner's path depend on a grant.
+    const related = this.#admitRelation(senderRoleKey, target.value);
+    if (!related.allowed) return related as Decision<AdmittedBuzzMessage>;
+
     return allow(ReasonCode.UNTRUSTED_CONTENT_IS_DATA, {
       text: input.text,
       actor: input.actor,
@@ -331,6 +419,58 @@ export class BuzzMessageIngress {
       nonce: request.nonce,
       target: target.value,
     });
+  }
+
+  /**
+   * Which door this sender comes through: the owner's, a role's, or none.
+   *
+   * The owner is checked first and answers on its own. Asking the collaboration authority about a
+   * declared owner would make the owner's admission depend on an assignment the owner does not
+   * need to hold — and on a host where the authority is absent, which is every host today, it
+   * would have no answer to give.
+   */
+  #senderRoleFor(actor: string): string | null {
+    if (this.#ownerActors.has(actor)) return OWNER_SENDER;
+    if (this.collaboration === null) return null;
+    const senderRoleKey = this.collaboration.senderRoleFor(actor);
+    if (senderRoleKey === null) return null;
+    // A blank or whitespace key is not a role; treating it as one would let a misconfigured
+    // authority open the door with a value no relation can be written against.
+    if (senderRoleKey.trim().length === 0) return null;
+    return senderRoleKey.trim();
+  }
+
+  /**
+   * Whether this sender may address this target, for the two senders that reach it.
+   *
+   * The owner is not asked. A role sender is, and the answer must carry the grant's facts — the
+   * sender's own role, the project both are in, and the addressed role's generation at the moment
+   * of judgement — so that what was granted is recoverable from the record rather than inferred
+   * from the fact that nothing refused.
+   */
+  #admitRelation(senderRoleKey: string, target: BuzzMessageTarget): Decision<BuzzCollaborationGrant | null> {
+    if (senderRoleKey === OWNER_SENDER) return allow(ReasonCode.OK, null);
+    if (target.kind !== "ROLE") {
+      // Unreachable through `admit`, which refuses a role sender addressing the owner's
+      // conversation before the address is resolved. Stated rather than assumed: a later caller
+      // that resolved the target first would otherwise arrive here with `CEO` and be granted it.
+      return deny(
+        ReasonCode.INGRESS_RELATION_NOT_PERMITTED,
+        "a role sender may not address the owner's own conversation",
+        { channel: "buzz", senderRoleKey },
+      );
+    }
+    if (this.collaboration === null) {
+      // Unreachable for the same reason — a null authority answers `null` for every non-owner, so
+      // no role sender gets this far. Refusing rather than allowing keeps the absence of an
+      // authority meaning "no collaboration" at both sites instead of only at the first.
+      return deny(
+        ReasonCode.INGRESS_RELATION_NOT_PERMITTED,
+        "this deployment grants no role-to-role collaboration",
+        { channel: "buzz", senderRoleKey },
+      );
+    }
+    return this.collaboration.admitRelation({ senderRoleKey, targetRoleKey: target.roleKey });
   }
 
   /**

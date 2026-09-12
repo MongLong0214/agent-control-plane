@@ -236,6 +236,15 @@ export const ReasonCode = {
 
   // --- ingress -------------------------------------------------------------
   INGRESS_ACTOR_NOT_ALLOWLISTED: "INGRESS_ACTOR_NOT_ALLOWLISTED",
+  /**
+   * The sender is authenticated and does hold a role, and that role may not address this target.
+   *
+   * Told apart from `INGRESS_ACTOR_NOT_ALLOWLISTED` on purpose: that one means the sender holds no
+   * authority on this daemon at all, and the two call for opposite work. One is an identity that
+   * was never granted anything; the other is a granted identity reaching outside its grant, which
+   * is the only one of the two that says a relation needs widening.
+   */
+  INGRESS_RELATION_NOT_PERMITTED: "INGRESS_RELATION_NOT_PERMITTED",
   INGRESS_CHAT_NOT_ALLOWLISTED: "INGRESS_CHAT_NOT_ALLOWLISTED",
   INGRESS_SIGNATURE_INVALID: "INGRESS_SIGNATURE_INVALID",
   INGRESS_REPLAY_IGNORED: "INGRESS_REPLAY_IGNORED",
