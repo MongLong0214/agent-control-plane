@@ -1792,11 +1792,19 @@ describe("the buzz mention subscriber's relay protocol", () => {
     // The defect this replaced could not be caught by running the forgery case: on 255 ids out of
     // 256 the substitution differs and the case passes. So the property is asserted directly, over
     // the boundary the old form got wrong — an id already ending in the characters it substitutes.
+    //
+    // The probes sweep all sixteen final hex digits rather than sampling a few. The forger decides
+    // on that one character, so it is the dimension a wrong forger divides: a form that returns the
+    // id unchanged outside `{0, 1}` is the identity on 14/16 of real ids and passes a probe set that
+    // only ends in `0` or `1`. That variant was measured green against the earlier four-probe set.
+    const finalDigits = "0123456789abcdef".split("");
     for (const id of [
       `${"a".repeat(62)}00`, // the case the fixed substitution turned into a no-op
       `${"f".repeat(62)}01`,
       `${"0".repeat(64)}`,
       `${"9".repeat(63)}0`,
+      ...finalDigits.map((digit) => `${"e".repeat(63)}${digit}`),
+      ...finalDigits.map((digit) => `${"c".repeat(32)}${"7".repeat(31)}${digit}`),
     ]) {
       const forged = forgeEventId(id);
       expect(forged, `forgery matched the original for ${id}`).not.toBe(id);
