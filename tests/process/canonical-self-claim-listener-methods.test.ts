@@ -7,6 +7,7 @@ import { main as agentctlMain } from "../../src/cli/agentctl.ts";
 import { OPERATOR_METHOD, type Daemon } from "../../src/daemon/daemon.ts";
 import {
   assertDirectPeer,
+  authenticateClaimCredentials,
   startCanonicalSelfClaimListener,
   CANONICAL_SELF_CLAIM_SOCKET_FILENAME,
   MAX_SUN_PATH_BYTES,
@@ -479,6 +480,61 @@ describe("the listen callback's own fault handling (#760)", () => {
     },
     15_000,
   );
+});
+
+/**
+ * #843. Two of the three refusals in `authenticateClaimCredentials` had no test at all, and
+ * deleting either left the suite green. Both guard the claim socket's answer to "is this a
+ * trustworthy direct local peer" — the one identity question the listener answers itself, before a
+ * byte of the request is read.
+ *
+ * Neither was reachable through a real `Socket`: one needs kernel credential derivation to fail,
+ * the other a peer at a different uid. That is the same argument `assertDirectPeer` already
+ * carries for being a pure function, applied to the refusals either side of it.
+ */
+describe("the claim socket's own identity check refuses what it cannot vouch for", () => {
+  const SAME_UID = 501;
+  const OTHER_UID = 502;
+  const ok = { peerPid: 100, effectivePid: 100, uid: SAME_UID, gid: 20 };
+
+  it("admits a direct local peer at this daemon's own uid", () => {
+    // The control. Without it every refusal row below is satisfied by an implementation that
+    // refuses everything, and "the guard works" would be indistinguishable from "nothing passes".
+    const decision = authenticateClaimCredentials(ok, SAME_UID);
+    expect(decision.allowed).toBe(true);
+    if (!decision.allowed) return;
+    expect(decision.value).toEqual({ peerPid: 100, uid: SAME_UID });
+  });
+
+  it("refuses a peer whose kernel credentials could not be established", () => {
+    // `derivePeerCredentialsFromSocket` answers null when the socket has no raw fd or the kernel
+    // refuses the lookup. Absence of an identity is not a weak identity — it is none.
+    const decision = authenticateClaimCredentials(null, SAME_UID);
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) return;
+    expect(decision.reasonCode).toBe(ReasonCode.OPERATOR_UNAUTHENTICATED);
+  });
+
+  it("refuses a peer at a different uid, even when it is a direct connection", () => {
+    // Direct on every other axis: peerPid === effectivePid, so this is refused by the uid check
+    // and by nothing else. Reusing one uid for both sides would let the row pass on a machine
+    // where the suite and the fixture happen to share one.
+    const decision = authenticateClaimCredentials({ ...ok, uid: OTHER_UID }, SAME_UID);
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) return;
+    expect(decision.reasonCode).toBe(ReasonCode.OPERATOR_UNAUTHENTICATED);
+    expect(decision.evidence).toMatchObject({ observedUid: OTHER_UID });
+  });
+
+  it("refuses when this daemon cannot read its own euid, rather than treating that as a match", () => {
+    // `process.geteuid` is absent on some platforms, so `euid` is `undefined` there. A peer uid
+    // can never equal it, and the refusal is the fail-closed reading — the alternative is a
+    // platform where the uid check silently admits everyone.
+    const decision = authenticateClaimCredentials(ok, undefined);
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) return;
+    expect(decision.reasonCode).toBe(ReasonCode.OPERATOR_UNAUTHENTICATED);
+  });
 });
 
 describe("a proxied peer identity is refused before any admission effect", () => {
