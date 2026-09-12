@@ -16,6 +16,18 @@
  */
 const groups = [
   {
+    file: "src/guard/workspace-probe.ts",
+    // currentBranch — the detached/empty pair, and the stderr fallback chain in the error reason.
+    reason: "realWorkspaceProbe calls execFileSync directly with no injectable seam, and every test in this repository exercises fakeWorkspaceProbe instead, so no test enters these lines at all. Measured against a real repository: a detached checkout yields \"HEAD\" and no state yields an empty string — 5 bytes including the newline even immediately after init — so out.length === 0 has no reachable witness either way. The stderr chain is inside the catch branch, which needs git to fail for a reason other than not-a-repository (absent binary, dubious ownership, EACCES); reaching it from a unit test means manipulating PATH or file modes around a direct execFileSync. The two isWithin operands beside them are exported and carry rows.",
+    operands: [
+      ["\"\"",1],
+      ["stderr",1],
+      ["e.message",1],
+      ["out === \"HEAD\"",1],
+      ["out.length === 0",1],
+    ],
+  },
+  {
     file: "src/daemon/daemon.ts",
     // buzzMentionSubscriberFindings
     reason: "Neither operand can carry a row. `!receipt` cannot be mutated in isolation at all: removing it leaves `receipt` typed `| null`, and every later use of it fails TS18047, so the harness refuses the mutant as uncompilable — TypeScript is what enforces this one, not a test. `receipt.configuredIdentities === 0` compiles when removed but nothing can kill it: `setBuzzMentionReceipt` has one production caller, the agentcpd startup block, and it sets the receipt only behind `socketCount > 0`, so a receipt with zero configured identities cannot reach this line. It is defence for a caller that does not exist yet.",

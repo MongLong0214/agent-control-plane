@@ -88,7 +88,6 @@ export const FILE_EXCLUSIONS = new Map([
   ["src/github/github-kernel.ts", reason],
   ["src/github/merge-commit-message.ts", reason],
   ["src/guard/managed-write-guard.ts", reason],
-  ["src/guard/workspace-probe.ts", reason],
   ["src/ingress/buzz-message.ts", reason],
   ["src/ingress/ingress-guard.ts", reason],
   ["src/ingress/telegram-polling.ts", reason],
