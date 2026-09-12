@@ -3,10 +3,10 @@
  * `canonical-self-claim-listener.ts`, which left the file-exclusion backlog under #833.
  * These are answers owed, not claims of unkillability or completed coverage. Each reason states
  * the missing independent witness or the neighbouring invariant that masks removal.
- * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 88 files
- * holding 3,489 operands, measured at this commit. It said 89 until this one; #840 removed a
- * file from that list and left the count here, which is the shape of staleness a number in
- * prose always has. The count is stated because it is the one thing a reader needs in order to
+ * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 78 files
+ * holding 3456 operands, measured at this commit. It said 89, then 88; #840 and then ten
+ * small files left that list and the count here did not follow, which is the shape of staleness a
+ * number in prose always has. The count is stated because it is the one thing a reader needs in order to
  * size lifting the list, and derived nowhere.
  *
  * Entries name source text and its occurrence, never a line coordinate. Identical new operands
@@ -14,6 +14,97 @@
  * sol-simplify: requested explicit operand debts; remove each when an independent row replaces it.
  */
 const groups = [
+  {
+    file: 'src/bootstrap/repo-factory-result.ts',
+    // the bootstrap result's shape and reread evidence
+    reason: "The first pair narrows an unknown parsed payload \u2014 `input` cannot be mutated alone (`typeof null === \"object\"` would then admit null and every field access below becomes a type error), and the typeof half needs a payload that is a primitive rather than an object. The second pair is two independent pieces of evidence about the same reread: that it was verified, and that it happened. Witnessing them apart needs a result claiming one without the other, which the producer does not emit and only a hand-built fixture would.",
+    operands: [
+      ["input",1],
+      ["typeof input === \"object\"",1],
+      ["!r.verified",1],
+      ["!r.rereadAt",1],
+    ],
+  },
+  {
+    file: 'src/conversation/settle-from-contact.ts',
+    // a refusal that is specifically a conflict
+    reason: "`!decision.allowed` is what narrows the decision before `reasonCode` is read, so it cannot be mutated alone. Its neighbour needs a settle attempt refused with something other than CONFLICT reaching this line \u2014 the fixtures drive the conflict path, because that is the one this branch exists for.",
+    operands: [
+      ["!decision.allowed",1],
+      ["decision.reasonCode === ReasonCode.CONFLICT",1],
+    ],
+  },
+  {
+    file: 'src/export/acceptance-report.ts',
+    // activity window and positive-number coercion
+    reason: "The activity pair needs a report whose first activity is known and whose last is not, or the reverse \u2014 a half-open window the recorder does not produce. The coercion pair guards a value read back from a record: the typeof half cannot be mutated without a type error on the comparison, and the positive half needs a stored zero or negative where a duration is expected, which nothing writes today.",
+    operands: [
+      ["firstActivityAt !== null",1],
+      ["lastActivityAt !== null",1],
+      ["typeof value === \"number\"",1],
+      ["value > 0",1],
+    ],
+  },
+  {
+    file: 'src/mcp/hermes-server.ts',
+    // the CEO-approved callback gate
+    reason: "Three conditions before an approval callback fires: the decision was allowed, its state is CEO_APPROVED, and a callback was supplied. `decision.allowed` narrows the decision so it cannot be mutated alone; the state check needs an allowed decision in some other state reaching this line; and the callback presence needs a server constructed without `onCeoApproved`, which every fixture supplies because the tests are about what the callback receives.",
+    operands: [
+      ["decision.allowed",1],
+      ["decision.value.state === RunState.CEO_APPROVED",1],
+      ["options.onCeoApproved",1],
+    ],
+  },
+  {
+    file: 'src/runtime/provider.ts',
+    // managed-write field presence
+    reason: "A writable runtime invocation must name its task receipt and assigned worktree. The typeof half cannot be mutated \u2014 `.trim()` on a non-string is a type error \u2014 and the blank half needs a field that is present and whitespace-only, which the harness's write requests never build. The refusal itself is witnessed (WRITE_REQUIRES_MANAGED_RUN is asserted elsewhere); what is owed is telling the two malformations apart.",
+    operands: [
+      ["typeof value !== \"string\"",1],
+      ["value.trim().length === 0",1],
+    ],
+  },
+  {
+    file: 'src/runtime/scripted-adapter.ts',
+    // session handle provenance
+    reason: "Both pairs check that a handle belongs to this adapter: one before use, one before resume. `!handle` cannot be mutated alone for the usual narrowing reason. The provider comparisons and the known-session check need a handle minted by a *different* adapter instance, or one whose external session id this adapter never issued \u2014 a cross-adapter fixture the scripted tests do not build because each test owns one adapter.",
+    operands: [
+      ["!handle",1],
+      ["handle.provider !== this.provider",1],
+      ["handle.provider !== this.provider",2],
+      ["!this.#knownSessions.has(handle.externalSessionId)",1],
+    ],
+  },
+  {
+    file: 'src/snapshot/candidate-snapshot.ts',
+    // manifest drift and the metadata marker
+    reason: "The drift pair distinguishes a probe that reported no manifest digest from one that reported a different digest \u2014 `!== undefined` guards the comparison beside it, so separating them needs a probe result with the field absent while the repository has a digest. The marker pair is a containment check and an existence check: `!isWithin(metadataRoot, marker)` refuses a marker path that escapes the metadata root, and witnessing it needs a snapshot whose marker path is outside that root \u2014 which is the attack this guard exists for and which no fixture constructs. That one is the most worth paying of the four.",
+    operands: [
+      ["probe.activeManifestDigest !== undefined",1],
+      ["(probe.activeManifestDigest ?? null) !== repo.manifestDigest",1],
+      ["!isWithin(metadataRoot, marker)",1],
+      ["!existsSync(marker)",1],
+    ],
+  },
+  {
+    file: "src/core/digest.ts",
+    // isDigest — the typeof half.
+    reason: "Measured: the mutant does not compile. `typeof value === \"string\"` is what narrows `value` from `unknown`, so removing it makes `.test(value)` a type error and the harness refuses the mutant. TypeScript enforces this one; the pattern half survives removal and carries a row, which is how the two are told apart.",
+    operands: [
+      ["typeof value === \"string\"",1],
+    ],
+  },
+  {
+    file: "src/core/process-identity.ts",
+    // processStartedAt — every rejection returns null.
+    reason: "Measured, not argued: both mutants SURVIVED. Every rejection path in `processStartedAt` returns null \u2014 including the `catch`, which the function's own docstring says is deliberate (\"a pid that cannot be identified is unverifiable, and the callers treat unverifiable as resolves to nothing\"). So a fractional or non-positive pid that gets past these operands reaches `ps -p 1.5`, ps fails, and the caller sees exactly the null it would have seen. The guards are there to avoid spawning ps at all, and that is not observable through the return value: witnessing them needs an injectable spawn, which this function deliberately does not take. The two presence operands beside them (`pid === null`, `pid === undefined`) are masked the same way and additionally cannot be mutated without a type error.",
+    operands: [
+      ["pid === null",1],
+      ["pid === undefined",1],
+      ["!Number.isSafeInteger(pid)",1],
+      ["pid <= 0",1],
+    ],
+  },
   {
     file: "src/daemon/agentcpd.ts",
     // startLocalMcpListeners

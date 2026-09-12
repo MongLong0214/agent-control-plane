@@ -8,20 +8,27 @@
  * `gh issue list --limit 300` returned no such issue — the sentence pointed at nothing, for every
  * one of these files. #833 is that unit now, and the reason says so rather than implying it.
  *
- * It also carries the size, because the size is the decision. Measured at this commit: these 88
- * files hold **3,489** `&&`/`||` operands, against 429 in the eight selected files. Lifting the
+ * It also carries the size, because the size is the decision. Measured at this commit: these 78
+ * files hold **3456** `&&`/`||` operands, against 462 in the eighteen selected files. Lifting the
  * list wholesale would grow the census roughly ninefold and require a falsifiability row or an
- * UNANSWERED reason for each of those 3,489 — which is this same boilerplate multiplied, not its
+ * UNANSWERED reason for each of those 3456 — which is this same boilerplate multiplied, not its
  * repair. So the list is worked down per file, and a reader deciding how to do that should see
- * 3,489 rather than derive it.
+ * 3456 rather than derive it.
+ *
+ * Re-derive it rather than trusting it, because a number in prose is exactly what goes stale here
+ * — this line said 88/3,489 until ten small files left the list at once:
+ *
+ *     emptying this Map and running `pnpm guards:operands` reports the repository total
+ *     (3918 at this commit); the census's own PASS line reports what it currently sees (462).
+ *     The difference is this list.
  *
  * One shared sentence is correct here and is not the defect #833 names: the reason genuinely is
- * one reason. Inventing 88 different sentences for 88 files whose backlog has one cause would be
+ * one reason. Inventing 78 different sentences for 78 files whose backlog has one cause would be
  * boilerplate wearing a disguise. What was wrong was that the sentence was false.
  */
 const reason =
   "pre-existing operands not yet answered; entered the census when selection became derived; " +
-  "tracked as #833, which measured 3,489 operands across these 88 files";
+  "tracked as #833, which measured 3456 operands across these 78 files";
 
 export const FILE_EXCLUSIONS = new Map([
   ["src/acceptance/disposable-realm-driver.ts", reason],
@@ -30,7 +37,6 @@ export const FILE_EXCLUSIONS = new Map([
   ["src/bootstrap/activation.ts", reason],
   ["src/bootstrap/hermes-bootstrap.ts", reason],
   ["src/bootstrap/repo-factory-producer.ts", reason],
-  ["src/bootstrap/repo-factory-result.ts", reason],
   ["src/buzz/buzz-adapter.ts", reason],
   ["src/buzz/buzz-mention-subscriber.ts", reason],
   ["src/capacity/capacity-monitor.ts", reason],
@@ -43,13 +49,10 @@ export const FILE_EXCLUSIONS = new Map([
   ["src/continuity/continuity-kernel.ts", reason],
   ["src/contracts/manifest.ts", reason],
   ["src/contracts/verification-command.ts", reason],
-  ["src/conversation/settle-from-contact.ts", reason],
   ["src/conversation/turn-coordinator.ts", reason],
-  ["src/core/digest.ts", reason],
   ["src/core/errors.ts", reason],
   ["src/core/peercred.ts", reason],
   ["src/core/process-argv.ts", reason],
-  ["src/core/process-identity.ts", reason],
   ["src/cto/cto-lifecycle.ts", reason],
   ["src/daemon/canonical-self-claim-operator.ts", reason],
   ["src/daemon/dead-binding-recovery.ts", reason],
@@ -67,8 +70,6 @@ export const FILE_EXCLUSIONS = new Map([
   ["src/deploy/rollback-pair.ts", reason],
   ["src/doctor/doctor.ts", reason],
   ["src/doctor/repair.ts", reason],
-  ["src/domain/run-state.ts", reason],
-  ["src/export/acceptance-report.ts", reason],
   ["src/export/baseline-contract.ts", reason],
   ["src/export/baseline-recorder.ts", reason],
   ["src/export/experiment-isolation.ts", reason],
@@ -88,7 +89,6 @@ export const FILE_EXCLUSIONS = new Map([
   ["src/ingress/telegram.ts", reason],
   ["src/mcp/ceo-conversation.ts", reason],
   ["src/mcp/cto-server.ts", reason],
-  ["src/mcp/hermes-server.ts", reason],
   ["src/mcp/shared.ts", reason],
   ["src/outbox/outbox.ts", reason],
   ["src/registry/canonical-self-claim.ts", reason],
@@ -103,11 +103,8 @@ export const FILE_EXCLUSIONS = new Map([
   ["src/runtime/hermes-acp-client.ts", reason],
   ["src/runtime/hermes-ceo.ts", reason],
   ["src/runtime/hermes-target-bind.ts", reason],
-  ["src/runtime/provider.ts", reason],
   ["src/runtime/reviewer-egress.ts", reason],
-  ["src/runtime/scripted-adapter.ts", reason],
   ["src/session/session-registry.ts", reason],
-  ["src/snapshot/candidate-snapshot.ts", reason],
   ["src/tools/traceability.ts", reason],
   ["src/verify/sandbox.ts", reason],
   ["src/verify/verification-engine.ts", reason],
