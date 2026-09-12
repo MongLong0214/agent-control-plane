@@ -561,10 +561,37 @@ export const produceRepoFactoryResult = async (
     `${JSON.stringify({ bootstrapOperationId: plan.bootstrapOperationId })}\n`,
   );
   const cleanup = (): void => cleanupOwnedCheckout(workDir, localRepoPath, plan.bootstrapOperationId);
+  /**
+   * Every git call below, with the cleanup its denial paths already run.
+   *
+   * `cleanup()` was on each *denial* path and on none of the throwing ones. That was harmless
+   * while these calls could not throw — three of them pass `allowFailure: true` and returned a
+   * nonzero exit code instead — and #859's time bound changed it: a git that outlives its bound
+   * now raises `GIT_TIMEOUT`. The throw skipped `cleanup()`, the checkout and its ownership marker
+   * survived, and `createCheckoutLeafOrDeny` then refused **every** retry with `EEXIST` —
+   * "a same-named resource with unknown provenance is a collision, not a resume". That is the
+   * opposite of what the marker is for, in this function's own words: it exists "so the same
+   * operation can be retried rather than being permanently refused by its own leftover collision".
+   *
+   * So one slow git made the operation permanently unretryable, by the exact mechanism the marker
+   * was added to prevent. `git add` below has no `allowFailure` and could already throw, so this
+   * is a pre-existing hole the bound widened rather than opened (#871).
+   */
+  const gitOrCleanup = async (
+    args: readonly string[],
+    options: { allowFailure?: boolean } = {},
+  ): Promise<Awaited<ReturnType<typeof git>>> => {
+    try {
+      return await git(localRepoPath, args, options);
+    } catch (err) {
+      cleanup();
+      throw err;
+    }
+  };
 
   const createdAt = clock.nowIso();
 
-  const init = await git(localRepoPath, ["init", "-b", plan.defaultBranch], { allowFailure: true });
+  const init = await gitOrCleanup(["init", "-b", plan.defaultBranch], { allowFailure: true });
   if (init.exitCode !== 0) {
     cleanup();
     return deny(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT, "local git init failed", {
@@ -588,9 +615,8 @@ export const produceRepoFactoryResult = async (
 
   // Only the bootstrap content file is tracked — the ownership marker above is bookkeeping
   // for this function's own retry/cleanup logic, not part of the repository's real content.
-  await git(localRepoPath, ["add", ".repo-factory-bootstrap.json"]);
-  const commit = await git(
-    localRepoPath,
+  await gitOrCleanup(["add", ".repo-factory-bootstrap.json"]);
+  const commit = await gitOrCleanup(
     [
       "-c", "user.email=repo-factory@local",
       "-c", "user.name=Repo Factory",
@@ -621,7 +647,7 @@ export const produceRepoFactoryResult = async (
   // that denies is a genuine observation, not a fabricated one, and it must refuse rather
   // than record PASS regardless.
   const verificationSpec = VERIFICATION_KINDS[plan.verificationKind];
-  const verificationRun = await git(localRepoPath, verificationSpec.argv, { allowFailure: true });
+  const verificationRun = await gitOrCleanup(verificationSpec.argv, { allowFailure: true });
   const verificationJudged = verificationSpec.judge(verificationRun);
   if (!verificationJudged.allowed) {
     cleanup();
@@ -639,7 +665,7 @@ export const produceRepoFactoryResult = async (
     );
   }
 
-  const trackedRun = await git(localRepoPath, ["ls-tree", "-r", "--name-only", "HEAD"], { allowFailure: true });
+  const trackedRun = await gitOrCleanup(["ls-tree", "-r", "--name-only", "HEAD"], { allowFailure: true });
   const tracked = trackedFilesOrDeny(trackedRun);
   if (!tracked.allowed) {
     cleanup();
