@@ -114,7 +114,15 @@ const record = (name, chunk) => {
   if (boundary === -1) return;
   responses[name] = JSON.parse(buffers[name].slice(0, boundary));
   if (responses.first && responses.replay) {
-    fs.writeFileSync(resultPath, JSON.stringify(responses));
+    // Renamed into place rather than written to the result path, because the reader waits for that
+    // path to exist and then parses it. writeFileSync makes the path exist before its bytes are
+    // necessarily visible to another process, and process.exit on the next line does not wait for
+    // what the kernel has not taken - so the reader could parse an empty file and fail with
+    // "Unexpected end of JSON input". Observed once in CI; this file passes 13/13 alone.
+    // rename on one filesystem is atomic, so the path appears complete or not at all.
+    const partial = resultPath + ".partial";
+    fs.writeFileSync(partial, JSON.stringify(responses));
+    fs.renameSync(partial, resultPath);
     process.exit(0);
   }
 };
@@ -138,6 +146,24 @@ first.once("connect", sendFirst);
 replay.once("connect", sendFirst);
 `;
 
+/**
+ * Waits for a result path to appear.
+ *
+ * Existence is a sufficient signal only because the writer renames its result into place from a
+ * `.partial` name — `rename` is atomic on one filesystem, so the path appears complete or not at
+ * all. A writer that `writeFileSync`s straight to this path would reintroduce the race this helper
+ * cannot see: the path exists, the bytes may not be there yet, and the reader's `JSON.parse` fails
+ * with `Unexpected end of JSON input`. Observed once in CI (#874).
+ */
+/**
+ * The property that makes `waitForPath`'s existence check sound, asserted on the runtime scripts
+ * themselves.
+ *
+ * The race it replaces is probabilistic — one CI run in an unknown number — so no single execution
+ * can witness it. What can be witnessed is the invariant: no script in this file writes its result
+ * straight to the path a reader waits on. That is checkable, and it is what breaks if someone
+ * "simplifies" the rename away.
+ */
 const waitForPath = async (path: string, description: string, timeoutMs = 10_000): Promise<void> => {
   const deadline = Date.now() + timeoutMs;
   while (!existsSync(path)) {
@@ -355,6 +381,22 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
 
   it("refuses when the daemon lock is lost at the pre-constitution fence", async () => {
     await runLockLossCase(FENCES.constitution, "constitution-fence", true);
+  });
+
+  it("writes a parsed result only through a rename, so waiting on existence is sound", () => {
+    // The race this guards is probabilistic — one CI run in an unknown number — so no single
+    // execution can witness it. The invariant can be: the script whose result a reader *parses*
+    // must not write straight to the path that reader waits on, because `existsSync` becoming true
+    // is not the bytes being visible and `process.exit` does not wait for the kernel.
+    //
+    // Asserted on the script source, which is the thing that would change if someone removed the
+    // rename. `#874`.
+    expect(REPLAY_RUNTIME).toContain("renameSync");
+    expect(REPLAY_RUNTIME).toContain(".partial");
+    // And not a direct write to the awaited path. `resultPath` is that path; the only
+    // `writeFileSync` naming it must be the temporary one.
+    expect(REPLAY_RUNTIME).not.toMatch(/writeFileSync\(resultPath[,)]/u);
+    expect(REPLAY_RUNTIME).toMatch(/renameSync\(partial, resultPath\)/u);
   });
 
   it("refuses a proof replay from a connection that was already preconnected", async () => {
