@@ -47,18 +47,40 @@ jobs:
           '+refs/pull/${{ github.event.pull_request.number }}/head:refs/commitlore/pr-head'
 
       # The action runs CommitLore from a checkout of that repository: the package is private, so
-      # there is no published npm name to fall back to. `dist/` is committed, so nothing builds.
+      # there is no published npm name to fall back to. `dist/` is committed, so nothing builds —
+      # but committed `dist/` removes the *build* step, not the *install* step, and reading it as
+      # both is what left this job red on six consecutive merges. `dist/cli.js` opens with
+      # `import { Command } from 'commander'`, a bare specifier, so without `node_modules` it dies
+      # in ESM resolution before parsing anything:
       #
-      # Pinned to v1.2.16, not the v1.2.17 the upstream README prints — that tag does not exist
-      # (`git tag -l` tops out at v1.2.16), and copying the README verbatim yields a job that
-      # cannot resolve the action and fails *after* the merge, where nobody looks. Filed upstream
-      # as MongLong0214/commitlore#938. Both refs below must move together.
+      #     node:internal/modules/package_json_reader:314
+      #       throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+      #
+      # Reproduced by cloning v1.2.16 and running `node dist/cli.js --version` with no install:
+      # the same trace. After `npm ci --omit=dev --ignore-scripts`: `1.2.16`.
+      #
+      # Pinned to v1.2.16. The comment here used to say v1.2.17 "does not exist"; it does now, and
+      # MongLong0214/commitlore#938 closed on 2026-09-12. The pin stays because `dist/cli.js` is
+      # byte-identical across the two tags (12,331 bytes both), so bumping buys nothing measurable
+      # — and the missing tag was never this job's failure. Both refs below must move together.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: MongLong0214/commitlore
           ref: v1.2.16
           path: .commitlore-cli
           persist-credentials: false
+
+      # `--omit=dev` because only the runtime imports are needed, and
+      # `--ignore-scripts` because this installs a third-party lockfile into a job that holds a
+      # token with `contents: write` on refs/notes/commitlore.
+      - run: npm ci --omit=dev --ignore-scripts
+        working-directory: .commitlore-cli
+
+      # The install is only useful if the CLI actually starts, and this job's whole failure mode
+      # was a CLI that could not. One version call, before the action, so a resolution failure is
+      # reported as one rather than as "cannot parse the merge message".
+      - run: node dist/cli.js --version
+        working-directory: .commitlore-cli
 
       - uses: MongLong0214/commitlore/action/preserve@v1.2.16
         with:
