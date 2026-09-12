@@ -1,23 +1,29 @@
 /**
- * #674 — a refusal is counted under a reason, not as an admission.
+ * #674 — `admitted` counts deliveries, and the other three answers each carry their own reason.
  *
- * `BuzzMentionCounters.admitted` promises *"frames that produced an admission attempt — the only
- * outcome that can reach a session"*. `REFUSED` reaches none, and the tally was counting it there
- * anyway: `outcome.admission !== null` is true for a refusal.
+ * `BuzzMentionAdmission` has four values and only `DURABLE` is a delivery. The tally counted all
+ * four (`outcome.admission !== null`), so `health.json` read a refusal, a retry and a replay as
+ * deliveries — in the one place an operator looks to tell "nothing arrived" from "arrived and did
+ * not get through", which is what #855 added that surface for.
  *
- * The mutation restores that. `health.json` then reads a refused event as a delivered one, in the
- * one place an operator looks to tell "nothing arrived" from "arrived and was turned down" — and
- * #855 added that surface precisely to separate those two.
+ * A first repair excluded only `REFUSED`, and a merge-gate review measured what that left:
+ * `RETRY` reporting `admitted: 1` with an empty `rejections` while the role's peer was down
+ * (`ROLE_PEER_ABSENT` — nothing reaching any session), and `ALREADY_DURABLE` incrementing once per
+ * reconnect for a single message, because `since` is inclusive and every reconnect re-requests the
+ * boundary event. So the predicate is now positive — `=== "DURABLE"` — and the mutation restores
+ * the whole original defect rather than a third of it.
  *
- * Killed by the seam-refusal case, which drives a real `REFUSED` answer through the subscriber and
- * asserts `admitted === 0` with the refusal under `rejections["admission-refused"]`. Measured both
- * ways: with the mutation, `admitted` is 1.
+ * Killed by the seam-refusal case. The sibling answers have their own cases beside it
+ * (`does not advance the mark for a retryable admission`,
+ * `advances the mark for an already-durable event without counting a second delivery`), each
+ * asserting `admitted === 0` with its own reason counted; this row names one because a row names
+ * exactly one test.
  */
 const aRefusedAdmissionIsNotAnAdmittedOne = {
   id: "a-refused-admission-is-not-an-admitted-one",
-  what: "a refused admission is counted under its own reason rather than as an admission, so health.json cannot read a refusal as a delivery",
+  what: "only a durable admission is counted as one, so health.json cannot read a refusal, a retry or a replay as a delivery",
   file: "src/buzz/buzz-mention-subscriber.ts",
-  find: 'if (outcome.admission !== null && outcome.admission !== "REFUSED") this.#admitted += 1;',
+  find: 'if (outcome.admission === "DURABLE") this.#admitted += 1;',
   replace: "if (outcome.admission !== null) this.#admitted += 1;",
   killedBy: [
     "tests/unit/buzz-mention-subscriber.test.ts::keeps the connection and moves nothing when the seam refuses the event",
