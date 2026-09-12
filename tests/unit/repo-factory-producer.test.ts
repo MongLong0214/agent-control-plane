@@ -380,6 +380,23 @@ describe("repo factory producer (#246)", () => {
       const refused = ensureDirectoryLevel(symlinked);
       expect(refused.allowed).toBe(false);
     });
+
+    it("ensureDirectoryLevel refuses a regular file occupying the name it needs", () => {
+      // The symlink case above does not reach `!stat.isDirectory()`'s own work: `statEntry` is
+      // `lstatSync`, so a symlink already fails the directory test and either operand alone
+      // refuses it. A plain file is the input only the directory test answers — `isSymbolicLink()`
+      // is false for it — and without that operand this producer would treat a file as a
+      // directory it may write a repository into.
+      const { sandbox } = makeSandbox();
+      const occupied = join(sandbox, "a-plain-file");
+      writeFileSync(occupied, "not a directory", { flag: "wx" });
+
+      const refused = ensureDirectoryLevel(occupied);
+
+      expect(refused.allowed).toBe(false);
+      // Still a file: the refusal must not have replaced or removed what it found.
+      expect(statSync(occupied).isFile()).toBe(true);
+    });
   });
 
   /**

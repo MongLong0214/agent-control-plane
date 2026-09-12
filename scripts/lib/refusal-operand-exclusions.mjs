@@ -36,7 +36,6 @@ export const FILE_EXCLUSIONS = new Map([
   ["src/app/control-plane.ts", reason],
   ["src/bootstrap/activation.ts", reason],
   ["src/bootstrap/hermes-bootstrap.ts", reason],
-  ["src/bootstrap/repo-factory-producer.ts", reason],
   ["src/bootstrap/repo-factory-result.ts", reason],
   ["src/buzz/buzz-adapter.ts", reason],
   ["src/buzz/buzz-mention-subscriber.ts", reason],

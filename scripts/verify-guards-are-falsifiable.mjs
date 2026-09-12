@@ -4412,21 +4412,14 @@ const GUARDS = [
     replace: "    mkdirSync(localRepoPath, { mode: SAFE_DIRECTORY_MODE, recursive: true });\n",
     killedBy: ["tests/unit/repo-factory-producer.test.ts"],
   },
-  {
-    // CEO review round 6, defect 1 — `statSync` follows a symlink and reports its *target*'s
-    // identity, not the entry's own. `assertParentChainNotAttackerWritable` computed
-    // `dirname(workDir)` through a symlink (`unsafeGrandparent/link -> safeTarget`, the
-    // target 0700 and owned by this process) and, under the previous `statSync`-based check,
-    // judged `safeTarget` as safe without ever examining `link` itself or the unsafe
-    // directory that actually governs whether that entry can be renamed. Neutering the
-    // symlink/non-directory check here reproduces exactly that: a symlink anywhere in the
-    // chain is judged by whatever it resolves to, rather than refused outright.
-    what: "judgeRealDirectoryEntry refuses a symlink outright rather than judging whatever it resolves to",
-    file: "src/bootstrap/repo-factory-producer.ts",
-    find: "  if (stat.isSymbolicLink() || !stat.isDirectory()) {\n",
-    replace: "  if (false && (stat.isSymbolicLink() || !stat.isDirectory())) {\n",
-    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
-  },
+  // CEO review round 6, defect 1's row lived here and anchored the whole
+  // `if (stat.isSymbolicLink() || !stat.isDirectory())` line, which credited both operands to a
+  // mutation that neutered the condition as a unit. #833 measured what each operand is worth
+  // separately and moved it to
+  // `scripts/falsifiability-cases/a-directory-judgement-refuses-a-plain-file.mjs`, where the
+  // directory test carries the row and the symlink test carries a written reason: under
+  // `lstatSync` a symlink already fails the directory test, so removing the symlink operand
+  // changes no outcome this repository can produce.
   {
     // CEO review round 6, defect 2 — an explicit `mode` on `mkdirSync` is still subject to
     // the process umask, and the previous shape returned `allow` the instant `mkdirSync`

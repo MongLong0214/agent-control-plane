@@ -15,6 +15,14 @@
  */
 const groups = [
   {
+    file: "src/bootstrap/repo-factory-producer.ts",
+    // judgeRealDirectoryEntry — the symlink half of `isSymbolicLink() || !isDirectory()`.
+    reason: "statEntry is lstatSync, so a symlink reports isDirectory() === false and the directory test refuses it first; measured against the existing symlink case, removing this operand changes no outcome. The only state it alone answers is isSymbolicLink() && isDirectory(), which lstat cannot produce and no racer can leave behind, so a crafted stat asserting it would test a shape production cannot reach. The operand is defence against statEntry becoming statSync again, which is the exact defect CEO review round 6 found; until then the line's row belongs to the directory half.",
+    operands: [
+      ["stat.isSymbolicLink()",1],
+    ],
+  },
+  {
     file: "src/daemon/agentcpd.ts",
     // startLocalMcpListeners
     reason: "Listener timeout validation is not isolated by the connection fixture: it starts with a valid timeout. An independent witness must distinguish fractional and nonpositive values before any listener is installed.",
