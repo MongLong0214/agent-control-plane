@@ -109,9 +109,25 @@ jobs:
       # ACP_TRAILERS_RANGE is the one workflow-specific value the runner takes: which commits to
       # read is a property of the event GitHub is handling, not of the gate. Unset locally, where
       # the check uses its own default of `origin/main..HEAD`.
+      #
+      # The far end is the pull request's **head**, never the checkout's `HEAD`. On a pull_request
+      # event `actions/checkout` gives us the merge ref, so `HEAD` is a commit GitHub composed:
+      #
+      #     HEAD is now at 12db39f Merge b47512d... into 573f7eab...
+      #
+      # Its first parent is the base branch tip, so `base.sha..HEAD` sweeps in every commit the
+      # base branch gained since `base.sha` — including squash merges GitHub's own button composed,
+      # which no commit-msg hook can reach and which nobody can fix without rewriting the base
+      # branch. One such merge then fails this gate on *every* open pull request based before it,
+      # for a commit none of them authored. Measured: `573f7eab` (the #867 squash) carries eleven
+      # record-trailer lines in its body, of which git parses three, and it turned two green pull
+      # requests red at once. Its records were not lost -- `commitlore-preserve` attached them as
+      # notes -- so the only thing the failure established was that the range was wrong.
+      #
+      # `base.sha..head.sha` is the pull request's own commits and nothing else.
       - run: pnpm gates
         env:
-          ACP_TRAILERS_RANGE: ${{ github.event.pull_request.base.sha && format('{0}..HEAD', github.event.pull_request.base.sha) || 'HEAD~1..HEAD' }}
+          ACP_TRAILERS_RANGE: ${{ github.event.pull_request.base.sha && format('{0}..{1}', github.event.pull_request.base.sha, github.event.pull_request.head.sha) || 'HEAD~1..HEAD' }}
       - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         if: always()
         with:
