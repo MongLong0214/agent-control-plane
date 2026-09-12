@@ -32,7 +32,13 @@ it("discovers an unwritten name by its operands and ignores operators in prose",
   write("src/prose.ts", '// deny(a && b);\nexport const label = "a || b";');
   const result = run();
   expect(result.status).toBe(1);
-  expect(result.stdout).toContain("scanned 2 file(s); selected 1 deciding file(s); excluded 0 deciding file(s)");
+  // The operand counts are asserted, not only the file counts: this branch made them derived,
+  // and a fixture is where that is cheapest to pin. Two operands in the one deciding file, none
+  // excluded, and the parts summing to the whole.
+  expect(result.stdout).toContain(
+    "scanned 2 file(s); selected 1 deciding file(s) holding 2 operand(s); " +
+      "excluded 0 deciding file(s) holding 0 unanswered operand(s), 2 in total",
+  );
   expect(result.stdout).toContain("1 file(s) contain no &&/|| operands");
   expect(result.stdout).toContain("2 of 2 operand(s) have no row or UNANSWERED reason");
 });
@@ -43,11 +49,19 @@ it("removing the only exclusion brings every operand into scope", () => {
   write("scripts/lib/refusal-operand-exclusions.mjs", 'export const FILE_EXCLUSIONS = new Map([["src/legacy.ts", "pre-existing operands not yet answered"]]);');
   const excluded = run();
   expect(excluded.status).toBe(0);
-  expect(excluded.stdout).toContain("scanned 1 file(s); selected 0 deciding file(s); excluded 1 deciding file(s)");
+  // The excluded operand count moves with the Map — the fixture-level form of the
+  // reconciliation the census now refuses on.
+  expect(excluded.stdout).toContain(
+    "scanned 1 file(s); selected 0 deciding file(s) holding 0 operand(s); " +
+      "excluded 1 deciding file(s) holding 2 unanswered operand(s), 2 in total",
+  );
   write("scripts/lib/refusal-operand-exclusions.mjs", "export const FILE_EXCLUSIONS = new Map([]);");
   const included = run();
   expect(included.status).toBe(1);
-  expect(included.stdout).toContain("scanned 1 file(s); selected 1 deciding file(s); excluded 0 deciding file(s)");
+  expect(included.stdout).toContain(
+    "scanned 1 file(s); selected 1 deciding file(s) holding 2 operand(s); " +
+      "excluded 0 deciding file(s) holding 0 unanswered operand(s), 2 in total",
+  );
   expect(included.stdout).toContain("2 of 2 operand(s) have no row or UNANSWERED reason");
 });
 
