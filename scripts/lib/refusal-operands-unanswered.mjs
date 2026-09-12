@@ -16,6 +16,15 @@
  */
 const groups = [
   {
+    file: "src/ingress/telegram.ts",
+    // authenticatedRequest — the two presence guards in front of the id checks.
+    reason: "Neither can carry a row: removing either makes the mutant fail to compile with TS18048, because these guards are what narrow message.from and message.chat before message.from.id and message.chat.id are read. Measured both ways with tsc --noEmit. TypeScript is what enforces these two, and it is stronger than a test — a test can be skipped, a type error cannot be merged. The three isSafeInteger operands beside them each have an independent witness and carry rows.",
+    operands: [
+      ["!message.from",1],
+      ["!message.chat",1],
+    ],
+  },
+  {
     file: "src/daemon/daemon.ts",
     // buzzMentionSubscriberFindings
     reason: "Neither operand can carry a row. `!receipt` cannot be mutated in isolation at all: removing it leaves `receipt` typed `| null`, and every later use of it fails TS18047, so the harness refuses the mutant as uncompilable — TypeScript is what enforces this one, not a test. `receipt.configuredIdentities === 0` compiles when removed but nothing can kill it: `setBuzzMentionReceipt` has one production caller, the agentcpd startup block, and it sets the receipt only behind `socketCount > 0`, so a receipt with zero configured identities cannot reach this line. It is defence for a caller that does not exist yet.",

@@ -93,7 +93,6 @@ export const FILE_EXCLUSIONS = new Map([
   ["src/ingress/ingress-guard.ts", reason],
   ["src/ingress/telegram-polling.ts", reason],
   ["src/ingress/telegram-router.ts", reason],
-  ["src/ingress/telegram.ts", reason],
   ["src/mcp/ceo-conversation.ts", reason],
   ["src/mcp/cto-server.ts", reason],
   ["src/mcp/hermes-server.ts", reason],
