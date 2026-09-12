@@ -1205,7 +1205,11 @@ const memoryPressurePercent = async (): Promise<number | null> => {
 
 const swapUsage = async (): Promise<number | null> => {
   try {
-    const { stdout } = await exec("sysctl", ["-n", "vm.swapusage"], { encoding: "utf8" });
+    // Bounded: a doctor probe that never returns makes the whole report never return (#859).
+    const { stdout } = await exec("sysctl", ["-n", "vm.swapusage"], {
+      encoding: "utf8",
+      timeout: 5_000,
+    });
     const used = /used\s*=\s*([\d.]+)M/.exec(stdout)?.[1];
     return used ? Number.parseFloat(used) : null;
   } catch {

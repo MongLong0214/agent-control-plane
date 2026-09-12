@@ -234,7 +234,11 @@ const resolveMcpToken = (): string | null => {
       ["find-generic-password", "-w", "-s", service, "-a", "ACP_MCP_TOKEN"],
       // stderr is discarded rather than inherited: this command's failure prose is not something
       // to put on the stderr of a process whose stderr is Claude Code's MCP server log.
-      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+      //
+      // Bounded: `security` can wait on a keychain the user has not unlocked, and this runs inside
+      // an MCP server's startup where a wait is indistinguishable from a hang (#859). The catch
+      // below already reads a failure as "no token", which is the fail-closed direction.
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000 },
     ).replace(/\n+$/, "");
     return found.length > 0 ? found : null;
   } catch {

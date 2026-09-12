@@ -297,10 +297,18 @@ export const passedScenarioReferences = (
  * looks complete and says nothing.
  */
 const measuredCommit = (): string => {
-  const head = spawnSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" });
+  // Bounded, and the two outcomes kept apart. Unbounded, a git that never returns made this
+  // function never return; bounded but undistinguished, `status !== 0` would have reported a
+  // killed probe as "not a git checkout" — a sentence that reads complete and is false (#859).
+  // The bound is written out at each call rather than shared through a variable: the operand and
+  // subprocess censuses read the options object at the call site, and an options *reference* is
+  // invisible to them. A check that cannot see a bound reports the call as unbounded, which is the
+  // same failure as not having one (#859).
+  const head = spawnSync("git", ["rev-parse", "HEAD"], { encoding: "utf8", timeout: 10_000 });
+  if (head.error !== undefined) return "(unknown — the git probe did not answer)";
   const sha = head.status === 0 ? head.stdout.trim() : "";
   if (!sha) return "(unknown — not a git checkout)";
-  const dirty = spawnSync("git", ["status", "--porcelain"], { encoding: "utf8" });
+  const dirty = spawnSync("git", ["status", "--porcelain"], { encoding: "utf8", timeout: 10_000 });
   // A dirty tree matters here: the counts came from working-tree files, so naming only the
   // commit would attribute them to a tree that does not contain what was measured.
   return dirty.status === 0 && dirty.stdout.trim().length > 0 ? `${sha} (working tree modified)` : sha;

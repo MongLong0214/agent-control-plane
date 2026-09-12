@@ -418,6 +418,9 @@ const gitHead = (checkoutPath: string): string | null => {
     const head = execFileSync("git", ["-C", checkoutPath, "rev-parse", "HEAD"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
+      // Bounded: the catch below already reads a failure as "no head", so an unbounded wait was
+      // the one outcome this function had no answer for (#859).
+      timeout: 10_000,
     }).trim();
     return head || null;
   } catch {
@@ -430,6 +433,7 @@ const gitClean = (checkoutPath: string): boolean => {
     return execFileSync("git", ["-C", checkoutPath, "status", "--porcelain"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
+      timeout: 10_000,
     }).trim().length === 0;
   } catch {
     return false;

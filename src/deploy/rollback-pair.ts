@@ -579,7 +579,13 @@ const assertClosureIsSelfContained = (runtimeRoot: string): void => {
     if (!isMachO(absolute)) continue;
     let linkage: string;
     try {
-      linkage = execFileSync("/usr/bin/otool", ["-L", absolute], { encoding: "utf8", stdio: "pipe" });
+      // Bounded: reading a Mach-O's linkage is a local read, and the catch below already turns a
+      // failure into a refusal rather than an assumption (#859).
+      linkage = execFileSync("/usr/bin/otool", ["-L", absolute], {
+        encoding: "utf8",
+        stdio: "pipe",
+        timeout: 10_000,
+      });
     } catch {
       // A Mach-O this host cannot read the linkage of is not evidence that it has none.
       throw acpError(ReasonCode.INTERNAL_ERROR, "the dynamic linkage of a sealed binary could not be read", {
