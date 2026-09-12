@@ -1,0 +1,5 @@
+Limit: the counts in both comments are prose, derived by nothing — the same staleness that made "89" wrong; `CENSUS REACH` (#853) prints the repo-wide ratio each run, but the per-list operand total is not printed anywhere
+Ruled-out: lifting the exclusion list in one change | 3,489 operands would each need a row or an UNANSWERED reason, and nobody can write 3,489 honest reasons — the result would be one sentence repeated 3,489 times instead of 88
+Ruled-out: writing a distinct reason per excluded file | their backlog has one cause, so 88 sentences would differ in wording and not in content, which is the thing #833 objects to rather than its fix
+Warn: these counts move when a file leaves the list; whoever removes an entry updates both numbers, or leaves the next reader the defect this commit repaired
+Provenance: inherited 15898c79ad311f08eeacb1bafce397845ca0398b
