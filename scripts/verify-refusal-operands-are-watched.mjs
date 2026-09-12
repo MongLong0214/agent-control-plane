@@ -85,6 +85,39 @@ const sourceFiles = (directory) => readdirSync(join(ROOT, directory), { withFile
     : entry.isFile() && /\.(?:[cm]?ts|tsx)$/.test(entry.name) ? [join(directory, entry.name)] : [])
   .sort();
 const files = sourceFiles("src"), candidates = [];
+/**
+ * Branch conditions this census cannot select, counted so its coverage is stated rather than
+ * implied.
+ *
+ * `logical()` selects an operand only inside a `&&` or `||`. A refusal decided any other way — a
+ * single-condition `if`, a ternary, a unary `!` — is invisible: no row, no UNANSWERED entry, and a
+ * PASS that says nothing about it. That is the selector's shape, not a bug in it, and #834 is what
+ * it costs: `observed.startedAt === null` is a plain comparison, so no witness was ever demanded
+ * for the branch that took the canonical role offline, and none would have been after the
+ * exclusions in #833 were lifted either.
+ *
+ * Counting them does not demand witnesses — that is #839's own question and a much larger change.
+ * It replaces an unstated ratio with a printed one, so the next person sizing that work reads the
+ * number instead of deriving it, and so a file that grows a hundred unselected refusals says so.
+ */
+const branchConditions = (tree) => {
+  let total = 0;
+  let selectable = 0;
+  walk(tree, (node) => {
+    const condition = ts.isIfStatement(node)
+      ? node.expression
+      : ts.isConditionalExpression(node)
+        ? node.condition
+        : null;
+    if (condition === null) return;
+    total += 1;
+    if (logical(unparen(condition))) selectable += 1;
+  });
+  return { total, selectable };
+};
+
+let conditionsSeen = 0;
+let conditionsSelectable = 0;
 for (const file of files) {
   const source = read(file), tree = parse(file, source), operands = new Map();
   if (tree.parseDiagnostics.length) problems.push(`${file}: cannot parse source`);
@@ -95,6 +128,9 @@ for (const file of files) {
       if (!logical(operand)) operands.set(operand.getStart(tree), operand);
     }
   });
+  const conditions = branchConditions(tree);
+  conditionsSeen += conditions.total;
+  conditionsSelectable += conditions.selectable;
   if (operands.size) candidates.push({ file, source, tree, operands });
 }
 const excluded = candidates.filter(({ file }) => FILE_EXCLUSIONS.has(file));
@@ -107,7 +143,13 @@ for (const [file, reason] of FILE_EXCLUSIONS) {
 process.stdout.write(
   `CENSUS: scanned ${files.length} file(s); selected ${selected.length} deciding file(s); ` +
     `excluded ${excluded.length} deciding file(s) with unanswered operands; ` +
-    `${files.length - candidates.length} file(s) contain no &&/|| operands.\n`,
+    `${files.length - candidates.length} file(s) contain no &&/|| operands.\n` +
+    // Printed every run, next to the numbers it qualifies. The selected/excluded split above is
+    // about which *files* this census reads; this line is about which *refusals* it can see at
+    // all, and the second number is the smaller one by an order of magnitude (#839).
+    `CENSUS REACH: ${conditionsSelectable} of ${conditionsSeen} branch condition(s) are &&/|| and ` +
+    `can carry an operand; the other ${conditionsSeen - conditionsSelectable} decide a branch in a ` +
+    `form this census never asks about. Counting \`if\` and ternary only, so this is a lower bound.\n`,
 );
 
 let total = 0, named = 0, known = 0;

@@ -84,3 +84,42 @@ it("does not let an unanswered occurrence hide a new repeated operand", () => {
   expect(result.status).toBe(1);
   expect(result.stdout).toContain("1 of 3 operand(s) have no row or UNANSWERED reason");
 });
+
+/**
+ * #839. The census selects an operand only inside a `&&` or `||`, so a refusal decided by a single
+ * comparison, a ternary or a unary `!` is invisible to it — no row, no UNANSWERED entry, and a
+ * PASS that says nothing about it. #834 is what that cost: `observed.startedAt === null` is a plain
+ * comparison, so nothing ever demanded a witness for the branch that took the canonical role
+ * offline, and nothing would have after #833's exclusions were lifted either.
+ *
+ * This does not demand witnesses for those conditions — that is the larger change #839 is about.
+ * It requires the census to *state its own reach*, so the ratio is printed rather than derived by
+ * whoever next tries to size the work.
+ */
+it("reports how many branch conditions it could never select, not just the ones it did", () => {
+  const { write, run } = fixture();
+  // Four conditions, one selectable. The other three are exactly the forms that took #834's
+  // branch out of reach: a plain comparison, a unary negation, and a ternary.
+  write(
+    "src/reach.ts",
+    [
+      "export const f = (a: number, b: number, c: boolean) => {",
+      "  if (a === 1 && b === 2) return 'selectable';",
+      "  if (a === 3) return 'plain comparison';",
+      "  if (!c) return 'unary';",
+      "  return c ? 'ternary' : 'no';",
+      "};",
+      "",
+    ].join("\n"),
+  );
+
+  const reach = run().stdout.split("\n").find((line) => line.startsWith("CENSUS REACH:")) ?? "";
+
+  // The numbers, not merely that a line exists: a report that always said "0 of 0" would satisfy
+  // any weaker assertion while telling an operator nothing.
+  expect(reach).toContain("1 of 4 branch condition(s)");
+  expect(reach).toContain("the other 3 decide a branch in a form this census never asks about");
+  // Said out loud, because `while`, `switch` and `??` are not counted either — a reader must not
+  // read 4 as the total number of ways this file decides anything.
+  expect(reach).toContain("lower bound");
+});
