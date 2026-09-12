@@ -226,8 +226,17 @@ export interface UnboundMentionRecord {
 export interface BuzzCollaborationGrant {
   /** The role the sender currently holds, derived from its own assignment — never self-declared. */
   readonly senderRoleKey: string;
-  /** The project both roles are in. The relation is refused across projects, so there is one. */
-  readonly projectId: string;
+  /**
+   * The project both roles are in, or null when the relation is not scoped by one.
+   *
+   * Nullable because the shape of the deployment forces it: `CEO` is bound by
+   * `roleKeyFor(Role.CEO)` with no scope and its binding carries `projectId: null`, so the one
+   * relation #674 is about — a project's CTO reaching the CEO — has no common project to compare.
+   * What those two do share is the room, which is why `conversation` is part of the judgement
+   * below. A grant that reported a project here anyway would be reporting the sender's, and a
+   * reader would take it for the pair's.
+   */
+  readonly projectId: string | null;
   /** The addressed role's binding generation at the moment the relation was judged. */
   readonly targetGeneration: number;
 }
@@ -255,10 +264,18 @@ export interface BuzzCollaborationAuthority {
    * keyed by a cryptographically established identity, not by a claim inside the payload.
    */
   senderRoleFor(actor: string): string | null;
-  /** Whether `senderRoleKey` may address `targetRoleKey` right now, and under what facts. */
+  /**
+   * Whether `senderRoleKey` may address `targetRoleKey` right now, and under what facts.
+   *
+   * `conversation` is the room the envelope arrived in, and it is a parameter rather than
+   * something the authority looks up because it is the only scope the CTO-to-CEO relation shares:
+   * the CEO's binding carries no project. An authority free to choose its own scope could satisfy
+   * "same project or channel" by picking whichever one happened to match.
+   */
   admitRelation(input: {
     readonly senderRoleKey: string;
     readonly targetRoleKey: string;
+    readonly conversation: string;
   }): Decision<BuzzCollaborationGrant>;
 }
 
@@ -409,7 +426,7 @@ export class BuzzMessageIngress {
     // The relation, judged only now that both sides have names. The owner reaches this line with
     // `OWNER_SENDER` and is not asked: its authority is the declared owner identity itself, and
     // routing it through a relation table would make the owner's path depend on a grant.
-    const related = this.#admitRelation(senderRoleKey, target.value);
+    const related = this.#admitRelation(senderRoleKey, target.value, input.conversation.trim());
     if (!related.allowed) return related as Decision<AdmittedBuzzMessage>;
 
     return allow(ReasonCode.UNTRUSTED_CONTENT_IS_DATA, {
@@ -448,7 +465,11 @@ export class BuzzMessageIngress {
    * of judgement — so that what was granted is recoverable from the record rather than inferred
    * from the fact that nothing refused.
    */
-  #admitRelation(senderRoleKey: string, target: BuzzMessageTarget): Decision<BuzzCollaborationGrant | null> {
+  #admitRelation(
+    senderRoleKey: string,
+    target: BuzzMessageTarget,
+    conversation: string,
+  ): Decision<BuzzCollaborationGrant | null> {
     if (senderRoleKey === OWNER_SENDER) return allow(ReasonCode.OK, null);
     if (target.kind !== "ROLE") {
       // Unreachable through `admit`, which refuses a role sender addressing the owner's
@@ -470,7 +491,7 @@ export class BuzzMessageIngress {
         { channel: "buzz", senderRoleKey },
       );
     }
-    return this.collaboration.admitRelation({ senderRoleKey, targetRoleKey: target.roleKey });
+    return this.collaboration.admitRelation({ senderRoleKey, targetRoleKey: target.roleKey, conversation });
   }
 
   /**

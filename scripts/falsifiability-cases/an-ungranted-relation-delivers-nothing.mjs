@@ -14,9 +14,9 @@ const anUngrantedRelationDeliversNothing = {
   id: "an-ungranted-relation-delivers-nothing",
   what: "a relation the authority refuses refuses the envelope",
   file: "src/ingress/buzz-message.ts",
-  find: "    return this.collaboration.admitRelation({ senderRoleKey, targetRoleKey: target.roleKey });\n",
+  find: "    return this.collaboration.admitRelation({ senderRoleKey, targetRoleKey: target.roleKey, conversation });\n",
   replace:
-    "    this.collaboration.admitRelation({ senderRoleKey, targetRoleKey: target.roleKey });\n    return allow(ReasonCode.OK, null);\n",
+    "    this.collaboration.admitRelation({ senderRoleKey, targetRoleKey: target.roleKey, conversation });\n    return allow(ReasonCode.OK, null);\n",
   killedBy: [
     "tests/unit/buzz-message-ingress.test.ts::refuses a role sender whose relation to the addressed role is not granted",
   ],

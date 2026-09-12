@@ -1768,14 +1768,17 @@ describe("the daemon's Buzz message ingress", () => {
         asked.push(`senderRoleFor:${actor}`);
         return roleOf[actor] ?? null;
       },
-      admitRelation: ({ senderRoleKey, targetRoleKey }) => {
-        asked.push(`admitRelation:${senderRoleKey}->${targetRoleKey}`);
+      admitRelation: ({ senderRoleKey, targetRoleKey, conversation }) => {
+        // The room is recorded with the pair, because the ordering assertions below are also the
+        // only place that shows the authority was told which room the envelope arrived in — a
+        // relation judged without it could satisfy "same project or channel" by choosing.
+        asked.push(`admitRelation:${senderRoleKey}->${targetRoleKey}@${conversation}`);
         if (!(grants[senderRoleKey] ?? []).includes(targetRoleKey)) {
           return deny(ReasonCode.INGRESS_RELATION_NOT_PERMITTED, "not granted", {});
         }
         return allow(ReasonCode.OK, {
           senderRoleKey,
-          projectId: "prj_test",
+          projectId: null,
           targetGeneration: 7,
         });
       },
@@ -1842,7 +1845,7 @@ describe("the daemon's Buzz message ingress", () => {
     // the first.
     expect(authority.asked).toEqual([
       `senderRoleFor:${SENDER}`,
-      `admitRelation:${CTO_ROLE_KEY}->${CEO_ROLE_KEY}`,
+      `admitRelation:${CTO_ROLE_KEY}->${CEO_ROLE_KEY}@buzz-ceo-room`,
     ]);
   });
 
@@ -1925,7 +1928,7 @@ describe("the daemon's Buzz message ingress", () => {
     expect(refused.reasonCode).toBe(ReasonCode.INGRESS_RELATION_NOT_PERMITTED);
     expect(authority.asked).toEqual([
       `senderRoleFor:${SENDER}`,
-      `admitRelation:${CTO_ROLE_KEY}->${CEO_ROLE_KEY}`,
+      `admitRelation:${CTO_ROLE_KEY}->${CEO_ROLE_KEY}@buzz-ceo-room`,
     ]);
   });
 
