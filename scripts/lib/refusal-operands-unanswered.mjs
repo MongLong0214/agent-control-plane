@@ -3,10 +3,10 @@
  * `canonical-self-claim-listener.ts`, which left the file-exclusion backlog under #833.
  * These are answers owed, not claims of unkillability or completed coverage. Each reason states
  * the missing independent witness or the neighbouring invariant that masks removal.
- * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 88 files
- * holding 3,489 operands, measured at this commit. It said 89 until this one; #840 removed a
- * file from that list and left the count here, which is the shape of staleness a number in
- * prose always has. The count is stated because it is the one thing a reader needs in order to
+ * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs — 87 files
+ * holding 3,457 operands, measured at this commit. It said 89, then 88; #840 and then
+ * `src/registry/repository-registry.ts` left that list and the count here did not follow, which
+ * is the shape of staleness a number in prose always has. The count is stated because it is the one thing a reader needs in order to
  * size lifting the list, and derived nowhere.
  *
  * Entries name source text and its occurrence, never a line coordinate. Identical new operands
@@ -14,6 +14,79 @@
  * sol-simplify: requested explicit operand debts; remove each when an independent row replaces it.
  */
 const groups = [
+  {
+    file: 'src/registry/repository-registry.ts',
+    // register — identity agreement with the checkout
+    reason: "A supplied identity that disagrees with the one observed from the checkout. Witnessing the pair needs a checkout whose observed identity is known and a register call that names a different one; the existing tests supply either the observed identity or none. The two presence operands additionally cannot be mutated in isolation \u2014 removing one leaves a possibly-undefined value on the other side of the comparison.",
+    operands: [
+      ["input.identity",1],
+      ["observedIdentity",1],
+      ["input.identity !== observedIdentity",1],
+    ],
+  },
+  {
+    file: 'src/registry/repository-registry.ts',
+    // register and rename — a second identity for one checkout (both occurrences)
+    reason: "Both occurrences guard the same property at two call sites: one checkout path may not carry two identities. `#154 refuses a second identity for the same canonical checkout` drives the refusal, but supplies no other binding, so it cannot separate the presence check from the comparison \u2014 with either removed the same test still refuses, for the other operand's reason. Separating them needs a path with no existing registration reaching the same line, at each site.",
+    operands: [
+      ["existingAtPath",1],
+      ["existingAtPath.identity !== identity",1],
+      ["existingAtPath",2],
+      ["existingAtPath.identity !== identity",2],
+    ],
+  },
+  {
+    file: 'src/registry/repository-registry.ts',
+    // register — a registered identity at a different path
+    reason: "The three operands of the conflict that keeps one identity at one path. `existing` cannot be mutated alone (the fields below it become type errors), and separating the registration-state check from the path comparison needs a TEMPORARY registration at a different path \u2014 a state the fixtures build only for the temporary-scope refusal below.",
+    operands: [
+      ["existing",1],
+      ["existing.registration === \"REGISTERED\"",1],
+      ["existing.checkoutPath !== rootPath",1],
+    ],
+  },
+  {
+    file: 'src/registry/repository-registry.ts',
+    // register — the binding-change gate's own presence check
+    reason: "`hasBindingChange` carries eight rows of its own. These two are the call site: the presence check cannot be mutated alone for the usual reason, and the call itself is what those eight rows already witness through this same path.",
+    operands: [
+      ["existing",2],
+      ["hasBindingChange(existing, input)",1],
+    ],
+  },
+  {
+    file: 'src/registry/repository-registry.ts',
+    // register — a run-scoped temporary repository
+    reason: "A temporary repository may not be promoted by re-registration, and may not be adopted by another run. Witnessing them apart needs a temporary registration re-registered by its own run and by a different one; the fixtures create temporary repositories for a single run.",
+    operands: [
+      ["record.registration === \"TEMPORARY\"",1],
+      ["record.temporaryForRun !== runId",1],
+    ],
+  },
+  {
+    file: 'src/registry/repository-registry.ts',
+    // observed / drift — head and cleanliness (clean appears at both decisions)
+    reason: "Seven operands across the drift decision: whether the observed head still matches the accepted one, whether the checkout is clean, and what an unreadable head means. `#156 and #227 retain the accepted head after repeated observations of an out-of-band move` drives the matched-head path, and separating the rest needs a checkout that is dirty, one whose head cannot be read, and one already marked DRIFTED \u2014 three git states no fixture builds today.",
+    operands: [
+      ["observedHead === record.lastObservedHead",1],
+      ["clean",1],
+      ["currentHead !== null",1],
+      ["gitClean(record.checkoutPath)",1],
+      ["record.driftState === \"DRIFTED\"",1],
+      ["currentHead === null",1],
+      ["currentHead === record.lastObservedHead",1],
+      ["clean",2],
+    ],
+  },
+  {
+    file: 'src/registry/repository-registry.ts',
+    // head reading — an empty rev-parse is not a head
+    reason: "`return head || null` after `git rev-parse HEAD`. The `null` operand is a literal and has nothing to witness; the truthiness operand needs a checkout where rev-parse exits zero with empty output, which is not a state git produces on a repository that has a HEAD. The catch above already turns every failure into null, so this is the narrow case of success-with-no-output.",
+    operands: [
+      ["head",1],
+      ["null",1],
+    ],
+  },
   {
     file: "src/daemon/agentcpd.ts",
     // startLocalMcpListeners

@@ -362,6 +362,45 @@ describe("round-2 registry regressions", () => {
     expect(retried.value.activeManifestDigest).toBe(first.value.activeManifestDigest);
   });
 
+  it("refuses a re-registration that changes any one binding field", async () => {
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const repository = makeRepo();
+    const base = {
+      checkoutPath: repository,
+      identity: "local-binding",
+      projectId,
+      repositoryRole: "secondary" as const,
+      activeManifestDigest: harness.cp.projects.require(projectId).activeManifestDigest,
+      trustClass: "UNTRUSTED" as const,
+    };
+    const first = await harness.cp.repositories.register(base);
+    if (!first.allowed) throw new Error(first.message);
+
+    // One changed field per operand of `hasBindingChange`. Each is the only comparison that sees
+    // its own change: the other three fields are re-supplied unchanged, so a variant that survives
+    // its operand is *accepted* and the binding moves without an activation.
+    //
+    // The `!== undefined` half of each pair is witnessed by "#155 preserves trust and project
+    // bindings" above, which re-registers with all four omitted and expects success — remove any
+    // of those four and `undefined !== <stored value>` makes this refuse a plain retry.
+    const variants: Array<[string, Record<string, unknown>]> = [
+      ["projectId", { ...base, projectId: `${projectId}-other` }],
+      ["repositoryRole", { ...base, repositoryRole: "primary" }],
+      ["activeManifestDigest", { ...base, activeManifestDigest: `${String(base.activeManifestDigest)}0` }],
+      ["trustClass", { ...base, trustClass: "OWNER_TRUSTED" }],
+    ];
+    for (const [name, input] of variants) {
+      expect(await harness.cp.repositories.register(input as never), name).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.REPOSITORY_BINDING_CHANGE_REQUIRES_ACTIVATION,
+      });
+    }
+
+    // The control, through the same path: re-registering the identical binding is idempotent.
+    expect((await harness.cp.repositories.register(base)).allowed).toBe(true);
+  });
+
   it("#156 and #227 retain the accepted head after repeated observations of an out-of-band move", async () => {
     const harness = makeHarness();
     const { repositoryId, identity } = await registerFixtureProject(harness);
