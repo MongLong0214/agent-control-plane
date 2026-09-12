@@ -1778,6 +1778,21 @@ describe("the buzz mention subscriber's relay protocol", () => {
       socket.handlers.onFrame(frame(["EVENT", subId, good]));
       await handle.settled();
       expect(sink.admitted).toHaveLength(1);
+
+      // `admitted` is now defined as deliveries and nothing else, so something has to witness that
+      // it is ever non-zero — otherwise the narrowing could have gone one step too far and every
+      // test would still pass. A merge-gate review named that gap; this is the case that closes it,
+      // because it is the only one with a healthy `DURABLE` delivery.
+      const counters = handle.counters();
+      expect(counters.admitted).toBe(1);
+      expect(counters.rejections).toEqual({});
+
+      // And the accounting identity's third term, in the same breath. This case feeds a `NOTICE`
+      // and a `COUNT` on purpose, and `authenticate` sends the AUTH challenge and the NIP-42 `OK`,
+      // so `framesHandled` exceeds `admitted + Σrejections` by exactly the protocol frames that
+      // carry no verdict. Asserting the inequality rather than a literal keeps this from pinning
+      // the handshake's frame count, which is not this case's subject.
+      expect(counters.framesHandled).toBeGreaterThan(counters.admitted);
     } finally {
       handle.close();
     }
@@ -1852,6 +1867,59 @@ describe("the buzz mention subscriber's relay protocol", () => {
       // No `since` at all: nothing was ever established about this event, so the window is
       // exactly where it was before it arrived.
       expect(req[2]["since"]).toBeUndefined();
+      // And the tally says a retry, not a delivery. This is `ROLE_PEER_ABSENT` in production —
+      // the role's peer is down and nothing is reaching a session — and it used to report
+      // `admitted: 1` with an empty `rejections`, which is the reading an operator would act on
+      // by looking at the relay instead of at the peer.
+      const retryCounters = handle.counters();
+      expect(retryCounters.admitted).toBe(0);
+      expect(retryCounters.rejections["admission-retry-pending"]).toBe(1);
+    } finally {
+      handle.close();
+    }
+  });
+
+  it("advances the mark for an already-durable event without counting a second delivery", async () => {
+    const { sockets, handle, identity, owner, sink, clock } = startOne({ answer: "ALREADY_DURABLE" });
+    try {
+      const first = live(sockets);
+      await authenticate(first, handle);
+      const subId = (sentFrames(first)[1] as string[])[1] ?? "";
+      const event = mentionEvent({
+        author: owner.secretKey,
+        addressedTo: identity.pubkey,
+        createdAt: 1_800_000_700,
+      });
+      first.handlers.onFrame(frame(["EVENT", subId, event]));
+      await handle.settled();
+
+      // The mark still moves: `since` is inclusive, so a replay whose mark never advanced would
+      // be re-requested on every reconnect forever.
+      expect(sink.admitted).toHaveLength(1);
+      expect(first.closed).toBe(false);
+
+      const once = handle.counters();
+      expect(once.admitted).toBe(0);
+      expect(once.rejections["admission-already-durable"]).toBe(1);
+
+      // The property a merge-gate review measured on the old counter. Every reconnect re-requests
+      // the boundary event, so the seam answers this again — and `admitted` used to climb by one
+      // each time. One message must not read as two deliveries however many times the relay
+      // flaps.
+      first.handlers.onClose();
+      clock.fireAll();
+      const second = live(sockets);
+      await authenticate(second, handle);
+      const req = sentFrames(second)[1] as [string, string, Record<string, unknown>];
+      expect(req[2]["since"]).toBe(1_800_000_700);
+      const secondSubId = (sentFrames(second)[1] as string[])[1] ?? "";
+      second.handlers.onFrame(frame(["EVENT", secondSubId, event]));
+      await handle.settled();
+
+      const twice = handle.counters();
+      expect(twice.admitted).toBe(0);
+      expect(twice.rejections["admission-already-durable"]).toBe(2);
+      expect(twice.framesHandled).toBeGreaterThan(once.framesHandled);
     } finally {
       handle.close();
     }
@@ -1882,6 +1950,20 @@ describe("the buzz mention subscriber's relay protocol", () => {
       // Deterministic, so there is nothing to retry and no reason to drop a working socket.
       expect(first.closed).toBe(false);
       expect(clock.pending()).toBe(0);
+
+      // And the tally says what happened. `admitted` counts frames the seam made newly durable;
+      // a refusal makes none, so it belongs under a reason and not in that number. Counting it as
+      // admitted made `health.json` read a refusal as a delivery, in the one place an operator
+      // looks to tell "nothing arrived" from "arrived and did not get through".
+      //
+      // `framesHandled` is 3 here, not 1, and the three are the AUTH challenge, the NIP-42 `OK`
+      // and the `EVENT` — `authenticate()` sends the first two. An earlier version of this comment
+      // said "the auth challenge and the EOSE"; no EOSE is sent in this case. The count was right
+      // and the frames were misnamed, which a merge-gate review caught. What matters is the split
+      // between the other two numbers.
+      const refusedCounters = handle.counters();
+      expect(refusedCounters.admitted).toBe(0);
+      expect(refusedCounters.rejections["admission-refused"]).toBe(1);
 
       first.handlers.onClose();
       clock.fireAll();

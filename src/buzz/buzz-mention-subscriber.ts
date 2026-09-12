@@ -690,6 +690,33 @@ const tagValues = (event: RelayEvent, name: string): string[] =>
  * a key file's contents.
  */
 type BuzzMentionRejection =
+  /**
+   * The sink answered `REFUSED`. Not a frame this subscriber found fault with — it verified,
+   * addressed and resolved a role for it, and the admission seam turned it down.
+   */
+  | "admission-refused"
+  /**
+   * The sink answered `RETRY`: the addressed role is between holders, nothing was spent, and the
+   * event will be asked for again. In production this is `ROLE_PEER_ABSENT` — the role's peer is
+   * down and *no* message is reaching a session — so it is the reading an operator most needs
+   * separated from a delivery, and from "the relay went quiet", which is what `framesHandled`
+   * answers.
+   */
+  | "admission-retry-pending"
+  /**
+   * The sink answered `ALREADY_DURABLE`: a durable copy of this event exists already. It has its
+   * own reason because `since` is inclusive, so every reconnect re-requests the boundary event and
+   * the seam answers this — counting it as an admission made the number climb with reconnect count
+   * instead of with delivery count.
+   *
+   * **Not uniformly benign, and the name understates it.** `SUBSCRIBER_ALREADY_DURABLE_CODES`
+   * (src/daemon/agentcpd.ts) folds in `INGRESS_TURN_OUTCOME_UNKNOWN` — a turn that was claimed and
+   * whose outcome nobody recorded — beside the ordinary replay. So a count here means "a durable
+   * copy exists", not "this was answered": one of its causes is precisely the state the reason
+   * codes exist to keep separate from a replay. Measured by a merge-gate review; splitting the
+   * bucket needs the seam to pass its code through, which this surface does not receive.
+   */
+  | "admission-already-durable"
   | "frame-too-large"
   | "frame-not-json"
   | "frame-not-a-message"
@@ -719,9 +746,34 @@ type BuzzMentionRejection =
 export interface BuzzMentionCounters {
   /** Frames that reached `#handleFrame`, whatever became of them. */
   readonly framesHandled: number;
-  /** Frames that produced an admission attempt — the only outcome that can reach a session. */
+  /**
+   * Frames the seam made newly durable — `DURABLE`, and nothing else.
+   *
+   * Narrowed from "produced an admission attempt", which was true of all four answers and so
+   * could not tell a delivery from a refusal. The other three each carry their own reason below,
+   * because every one of them is a frame that arrived and did not newly reach a session, and they
+   * call for different repairs: a refusal is about authority, a retry is about the role's peer
+   * being down, and an already-durable is about a reconnect asking for the boundary event again.
+   */
   readonly admitted: number;
-  /** One entry per rejection reason actually seen; absent reasons are absent, never zero rows. */
+  /**
+   * One entry per reason a frame did not newly reach a session; absent reasons are absent, never
+   * zero rows.
+   *
+   * Wider than "rejection": `admission-already-durable` is not a rejection, and it is here for the
+   * accounting rather than as a complaint. The identity is
+   *
+   *     framesHandled = admitted
+   *                   + Σrejections
+   *                   + protocol frames that carry no verdict
+   *                   + frames whose connection was replaced mid-answer
+   *
+   * The third term is the one an earlier version of this comment omitted, and a merge-gate review
+   * measured the difference on a healthy run: `ACCEPTED` is returned for the AUTH challenge, the
+   * NIP-42 `OK`, `EOSE` and `NOTICE`, so those frames are in `framesHandled` and in neither of the
+   * other two. A reader subtracting without that term concludes the subscriber lost events. The
+   * fourth term is the stale tail, deliberately unattributed; see the branch in `#admitEvent`.
+   */
   readonly rejections: Readonly<Record<string, number>>;
 }
 
@@ -733,7 +785,13 @@ class FrameTally {
 
   record(outcome: BuzzMentionFrameOutcome): void {
     this.#framesHandled += 1;
-    if (outcome.admission !== null) this.#admitted += 1;
+    // `DURABLE` and nothing else. Three of the four answers are not deliveries, and an earlier
+    // version of this line excluded only `REFUSED` — which left `RETRY` reporting a delivery while
+    // the role's peer was down, and `ALREADY_DURABLE` incrementing once per reconnect for one
+    // message. A merge-gate review measured both. `health.json` is the one place an operator looks
+    // to tell "nothing arrived" from "arrived and did not get through", so the number that names
+    // deliveries counts deliveries.
+    if (outcome.admission === "DURABLE") this.#admitted += 1;
     if (outcome.rejected !== null) {
       this.#rejections.set(outcome.rejected, (this.#rejections.get(outcome.rejected) ?? 0) + 1);
     }
@@ -1210,16 +1268,25 @@ class BuzzMentionSubscription {
     // an advance would move the live connection's request window on the strength of a dead
     // connection's answer. The message itself is not lost by either — the seam has it, or it does
     // not, and an unadvanced mark simply means the replacement asks for it again.
+    // Unattributed on purpose. The answer belongs to a connection that no longer exists; filing it
+    // under the live tally's reasons would credit or blame the replacement for something it never
+    // asked, and the replacement will ask again.
+    //
+    // "Recorded in `framesHandled` and nowhere else" is how an earlier version of this comment put
+    // it, and a merge-gate review caught the exception: the outcome carries `admission` through, so
+    // a stale `DURABLE` still increments `admitted`. That is the one attribution a stale tail
+    // makes, and it is the defensible one — the seam did make the event durable, whoever was
+    // listening. Every other stale answer lands in `framesHandled` alone.
     if (!this.#isCurrent(generation)) return { rejected: null, admission };
 
     if (admission === "RETRY") {
       this.#reconnect(generation);
-      return { rejected: null, admission };
+      return { rejected: "admission-retry-pending", admission };
     }
     // A refusal moves nothing. It is deterministic, so there is nothing to retry and no reason to
     // drop the connection — and it is reachable by anyone who can sign an event, so it must not be
     // allowed to choose where the window sits. See `BuzzMentionAdmission`.
-    if (admission === "REFUSED") return { rejected: null, admission };
+    if (admission === "REFUSED") return { rejected: "admission-refused", admission };
 
     // The second guard, and it is independent of the first on purpose. Refusing to trust a
     // *refusal* covers the stranger; it does nothing about an event this daemon accepted as
@@ -1233,6 +1300,10 @@ class BuzzMentionSubscription {
     // *up* is what the outer `Math.max` refuses — the mark only ever moves forward.
     const claimed = Math.min(event.created_at, this.#deps.scheduler.nowSeconds());
     this.#since = Math.max(this.#since ?? 0, claimed);
+    // Both remaining answers advance the mark — a replay must not be re-requested forever — and
+    // only what they are *called* differs. `DURABLE` is the delivery; `ALREADY_DURABLE` is the
+    // boundary event arriving again because `since` is inclusive.
+    if (admission === "ALREADY_DURABLE") return { rejected: "admission-already-durable", admission };
     return { rejected: null, admission };
   }
 }
