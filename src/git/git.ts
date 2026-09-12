@@ -64,6 +64,26 @@ const authorizeGitMutation = async (
 };
 
 /**
+ * How long any one git invocation may take before it is killed.
+ *
+ * `maxBuffer` above bounds how much a git command may *say*; nothing bounded how long it may take.
+ * `promisify(execFile)` without a `timeout` waits forever, so a git that never returns — an index
+ * lock another process holds, a stalled filesystem, a credential helper waiting on a prompt that
+ * has no terminal — stops the caller rather than failing it (#859).
+ *
+ * 120s is chosen from what this wrapper is actually used for, measured rather than guessed: every
+ * call site is local. `grep` across `src/` finds rev-parse, status, diff, show, cat-file, ls-tree,
+ * merge-base, symbolic-ref, remote, branch, init, add, and worktree add/remove/list/prune — and
+ * **no** fetch, clone, push, pull or ls-remote. So no legitimate use waits on a network, and the
+ * slowest plausible one is `worktree add --detach` writing a working tree.
+ *
+ * A caller that needs longer passes `timeoutMs`. That is the affordance a blanket bound has to
+ * have: the alternative to a per-call override is picking one number large enough for the worst
+ * case, which is the same as having no bound for every other case.
+ */
+const DEFAULT_GIT_TIMEOUT_MS = 120_000;
+
+/**
  * argv-only git invocation. There is no shell in the path, so no interpolation,
  * pipes or redirection can be smuggled through a branch name or path
  * (Integration §12: "기본 `sh -c`, Pipe, Redirect, Command Substitution 금지").
@@ -71,24 +91,42 @@ const authorizeGitMutation = async (
 export const git = async (
   cwd: string,
   args: readonly string[],
-  options: { allowFailure?: boolean } = {},
+  options: { allowFailure?: boolean; timeoutMs?: number } = {},
 ): Promise<GitResult> => {
+  const timeout = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS;
   try {
     const { stdout, stderr } = await exec("git", ["-C", cwd, ...args], {
       maxBuffer: MAX_BUFFER,
       encoding: "utf8",
+      timeout,
       env: { ...sanitizedGitEnv() },
     });
     return { stdout, stderr, exitCode: 0 };
   } catch (err) {
-    const e = err as { stdout?: string; stderr?: string; code?: number; message?: string };
-    if (options.allowFailure) {
+    const e = err as {
+      stdout?: string;
+      stderr?: string;
+      code?: number | null;
+      signal?: string | null;
+      killed?: boolean;
+      message?: string;
+    };
+    // A timeout is not git answering. Measured: `promisify(execFile)` reports a killed-by-timeout
+    // child as `{ code: null, signal: "SIGTERM", killed: true }` — note `code` is null, not
+    // "ETIMEDOUT" as the synchronous family reports. So `e.code ?? 1` would have called it exit 1,
+    // which is indistinguishable from git refusing, and `allowFailure` callers would have read
+    // "the answer is no" where the truth is "the check could not run" (#859).
+    const timedOut = e.killed === true && e.signal === "SIGTERM" && (e.code ?? null) === null;
+    const detail = timedOut
+      ? `git ${args.join(" ")} exceeded its ${timeout}ms bound and was killed`
+      : `git ${args.join(" ")} failed: ${e.stderr ?? e.message}`;
+    if (options.allowFailure && !timedOut) {
       return { stdout: e.stdout ?? "", stderr: e.stderr ?? e.message ?? "", exitCode: e.code ?? 1 };
     }
-    return fail(ReasonCode.INTERNAL_ERROR, `git ${args.join(" ")} failed: ${e.stderr ?? e.message}`, {
+    return fail(timedOut ? ReasonCode.GIT_TIMEOUT : ReasonCode.INTERNAL_ERROR, detail, {
       cwd,
       args,
-      exitCode: e.code ?? 1,
+      ...(timedOut ? { timeoutMs: timeout } : { exitCode: e.code ?? 1 }),
     });
   }
 };
