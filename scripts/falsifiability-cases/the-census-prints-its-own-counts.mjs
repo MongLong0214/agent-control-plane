@@ -36,8 +36,23 @@
  */
 const theCensusPrintsItsOwnCounts = {
   id: "the-census-prints-its-own-counts",
-  what: "the operand totals the census reports are summed from the lists it loaded and must reconcile with the whole population, so neither side can be frozen at a literal",
+  what: "the operand totals the census reports are summed from the lists it loaded and must reconcile with the whole population, so a frozen part is a refusal on the spot -- the whole is the one term this arithmetic cannot check",
   file: "scripts/verify-refusal-operands-are-watched.mjs",
+  // The asymmetry the `what` names, measured, because it is not obvious and the
+  // earlier wording ("neither side") was false about it:
+  //
+  //   freeze `selectedOperands` or `excludedOperands`  ->  parts stop summing to the
+  //     whole, and the next list edit is refused. This row is that case.
+  //   freeze `repositoryOperands`                      ->  moving a file *between* the
+  //     lists leaves `selected + excluded` unchanged, so the frozen whole still
+  //     reconciles. It is caught only when `src/` independently gains or loses an
+  //     operand. A row for it would report SURVIVED, which is why there is none.
+  //
+  // That blind spot covers exactly the edit #833 consists of -- moving files out of
+  // the exclusion list -- so it is named here rather than left to be rediscovered.
+  // In practice `src/` churn closes it within days, which is why it is a stated limit
+  // and not a blocker.
+  //
   // A *wrong* literal, deliberately. One equal to today's value is
   // indistinguishable from a derived number on the commit that writes it, which
   // is how the header prose survived three removals looking plausible — so the

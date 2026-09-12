@@ -21,8 +21,19 @@
  *     pnpm guards:operands
  *     CENSUS: … excluded N deciding file(s) holding M unanswered operand(s)
  *
- * The census counts this Map every run, so the number cannot disagree with the list. For the
- * repository total, empty the Map and run it again; the difference is this list.
+ * The census counts this Map every run, so the number cannot disagree with the list. It prints all
+ * three numbers in that one line -- selected, excluded, and the repository total -- so the size of
+ * this list is the total minus the selected count and needs no second run.
+ *
+ * An earlier version of this paragraph said to empty the Map and run it again for the total. That
+ * instruction outlived the line above it and became worse than unnecessary: with the Map emptied
+ * every excused operand becomes an unanswered one, so the census refuses and exits non-zero.
+ * Following it produces a red gate and no total at all.
+ *
+ * No figure appears in this paragraph, and that is the rule rather than an accident: the guard in
+ * tests/unit/the-census-prints-its-own-counts.test.ts refuses a header that restates any count the
+ * census derives. It caught the first draft of these very sentences, which quoted the refusal's
+ * numbers.
  *
  * One shared sentence is correct here and is not the defect #833 names: the reason genuinely is
  * one reason. Inventing a different sentence per file, for files whose backlog has one cause,

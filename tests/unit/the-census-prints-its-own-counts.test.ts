@@ -59,11 +59,13 @@ describe("the census prints the counts its headers used to restate", () => {
     expect(selected + excluded).toBe(total);
     expect(total).toBeGreaterThan(0);
     expect(selected).toBeGreaterThan(0);
-    // Not `excluded > 0`. Emptying `FILE_EXCLUSIONS` is #833's declared goal, and an assertion
-    // that goes red on the day the backlog is finished would fail under a name that promises
-    // something else entirely. Zero excluded operands is a correct census; the sum above is what
-    // carries the claim either way.
-    expect(excluded).toBeGreaterThanOrEqual(0);
+    // No assertion on `excluded` on purpose, and not merely because `> 0` would be wrong.
+    // Emptying `FILE_EXCLUSIONS` is #833's declared goal, so an assertion that goes red on the
+    // day the backlog is finished would fail under a name that promises something else entirely.
+    // And `>= 0` is not the safe version of it: `excluded` arrives through `Number` from a
+    // `(\d+)` capture, so it is non-negative by construction and the line could not have gone
+    // red for any input. It read as a verdict while carrying none. The sum above is what carries
+    // the claim either way.
   });
 
   it("sees a restated count through the decoration these headers actually used", () => {
