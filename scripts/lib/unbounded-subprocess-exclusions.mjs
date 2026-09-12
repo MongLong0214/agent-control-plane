@@ -30,7 +30,6 @@ export const UNBOUNDED_SUBPROCESS_EXCLUSIONS = new Map([
   ["src/deploy/rollback-pair.ts:582", reason],
   ["src/deploy/rollback-pair.ts:1785", reason],
   ["src/doctor/doctor.ts:1208", reason],
-  ["src/git/git.ts:77", reason],
   ["src/guard/workspace-probe.ts:49", reason],
   ["src/guard/workspace-probe.ts:72", reason],
   ["src/registry/repository-registry.ts:418", reason],
