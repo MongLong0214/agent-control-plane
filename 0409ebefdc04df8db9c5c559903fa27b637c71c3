@@ -1,0 +1,11 @@
+Limit: the null-credentials row mutates to an admit rather than deleting the branch, because deleting it does not typecheck — `credentials` is `PeerCredentials | null` and every line below narrows on it
+Limit: `if (false)` is unusable as a mutation anywhere a narrowed value is read inside the block; comparing a field with itself is the cheapest form that keeps the block reachable
+Ruled-out: driving these through a real socket by constructing a proxied or foreign-uid peer | a unit test can produce neither, which is why `assertDirectPeer` was already extracted and is the precedent this follows
+Ruled-out: reading `process.geteuid?.()` inside the pure function | the uid-mismatch test would then compare the suite's own uid against itself and pass without distinguishing anything
+Warn: `authenticateClaimCredentials` is the whole identity check — all three refusals return the same `OPERATOR_UNAUTHENTICATED`, so the evidence object is the only thing separating them and `publicClaimResponse` strips it before the wire
+Warn: a falsifiability mutation must typecheck, not merely run — verify a new row with `tsc --noEmit` on the mutated tree, because vitest alone will pass a mutant the harness refuses
+Blast: local
+Undo: easy
+Certainty: firm
+Unverified: the full mutation sweep was not run locally — CI owns it; both new rows were mutated and reverted by hand against the whole test file, and anchors-only passes
+Provenance: inherited 0409ebefdc04df8db9c5c559903fa27b637c71c3
