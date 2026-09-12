@@ -1,0 +1,5 @@
+Limit: this fixes which commits are audited and not the squash itself, so a future GitHub squash still produces a body whose mid-message trailer blocks git will not parse -- the notes remain the record and the message remains unparsable
+Ruled-out: rewriting 573f7eab so its trailers parse | it is on main, every open pull request and every clone descends from it, and the records it would recover are already attached as notes
+Ruled-out: excluding merge commits from the audit | the defect is not that HEAD is a merge, it is that the range reaches the base branch at all; a squash arrives as an ordinary single commit and would still be swept in
+Warn: base.sha is the base tip when the event fired and can lag main, so the range is the pull request's commits only because the head does not contain main's newer ones -- a merge of main into the branch puts them back in scope
+Provenance: inherited 661ea75ee3df904640073b65d95039e528ac6ac1
