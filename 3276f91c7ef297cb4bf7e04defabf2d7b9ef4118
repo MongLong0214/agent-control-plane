@@ -1,0 +1,5 @@
+Limit: the test reads the workflow's text, so it cannot tell whether `npm ci` succeeds on the runner; the version call is what covers that, and only at run time
+Ruled-out: bumping the action pin to v1.2.17 | dist/cli.js is byte-identical across both tags, so the bump changes nothing and the absent tag was never the failure
+Ruled-out: treating the red check as a known-broken third-party step | it guards silent record loss on the Squash button, and two `Follows:` references on this repository already dangle from exactly that loss
+Warn: a committed dist/ removes the build step and not the install step; any vendored CLI with a bare import needs node_modules regardless of whether it needs a compiler
+Provenance: inherited bc64900d0a914ce087e752392357419393442f0b
