@@ -49,6 +49,9 @@ export const realWorkspaceProbe: WorkspaceProbe = {
       const out = execFileSync("git", ["-C", start, "rev-parse", "--show-toplevel"], {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
+        // Bounded: this probe decides whether a path is inside a workspace, and a guard that
+        // cannot answer must refuse rather than wait (#859).
+        timeout: 10_000,
         env: gitProbeEnv(),
       });
       return { status: "INSIDE", toplevel: realpathSync(out.trim()) };
@@ -72,6 +75,7 @@ export const realWorkspaceProbe: WorkspaceProbe = {
       const out = execFileSync("git", ["-C", toplevel, "rev-parse", "--abbrev-ref", "HEAD"], {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
+        timeout: 10_000,
         env: gitProbeEnv(),
       }).trim();
       return out === "HEAD" || out.length === 0 ? null : out;
