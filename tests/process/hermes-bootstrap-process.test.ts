@@ -160,6 +160,28 @@ describe("the reference runtime and the product agree on the protocol", () => {
     }
   });
 
+  it("publishes every awaited path by rename, so no reader can parse a half-written file", () => {
+    // #874/#875. This process test polls four paths with `existsSync` and then reads them, and
+    // the fixture used to `writeFileSync` straight into each one — three of the four followed
+    // immediately by `process.exit`, which drops whatever the kernel has not taken. A merge-gate
+    // review reproduced the property on this exact shape: 514 `Unexpected end of JSON input` in
+    // 6,568 reads.
+    //
+    // Asserting over the fixture's source is the only reachable form: the race is probabilistic,
+    // so no single run of the spawned process witnesses it, and the reviewed sibling case in
+    // `tests/scenarios/hermes-bootstrap-mutation.test.ts` proved the same property about a
+    // different runtime while this one — which executes in every CI leg — kept the defect.
+    const reference = readFileSync(HERMES_RUNTIME, "utf8");
+
+    expect(reference).toContain("fs.renameSync(staging, path)");
+    // The bytes go to a staging name, never to the awaited one. A `writeFileSync` whose first
+    // argument is any of the four awaited paths is the defect, spelled exactly as it was.
+    for (const awaited of ["pidPath", "secretPath", "resultPath"]) {
+      expect(reference, `the fixture writes ${awaited} without renaming into place`)
+        .not.toContain(`fs.writeFileSync(${awaited}`);
+    }
+  });
+
   it("both declare sampling, and the product's declaration is proved on a live socket", () => {
     // The fixture's declaration is still only readable as text — driving an owner message
     // through `Server.createMessage` needs Telegram ingress, which this process test has no way
@@ -314,8 +336,16 @@ process.stdin.on("end", () => {
       expect(bootstrap.stdout).not.toContain("sessionSecret");
       await waitUntil(() => existsSync(pidPath), "Hermes runtime launch");
       await waitUntil(() => existsSync(secretPath), "session secret delivery");
-      runtimePid = Number(readFileSync(pidPath, "utf8"));
-      expect(Number.isInteger(runtimePid)).toBe(true);
+      // Read the bytes once and assert on them, not on `Number`'s reading of them. `Number("")`
+      // is `0` and `Number("123")` is an integer, so `Number.isInteger` alone is satisfied by
+      // exactly the two failures this line exists to catch — an empty pid file and a truncated
+      // prefix. The first then skips the `process.kill` in the `finally` below (0 is falsy),
+      // leaking the spawned runtime; the second sends SIGTERM to an unrelated process on this
+      // host. Both are quieter than the JSON parse error #874 names and come from the same race.
+      const pidText = readFileSync(pidPath, "utf8");
+      expect(pidText, "the pid file was read before it was complete").toMatch(/^[0-9]+$/u);
+      runtimePid = Number(pidText);
+      expect(runtimePid).toBeGreaterThan(0);
 
       await stopDaemon(firstDaemon);
       if (firstDaemon) capturedDaemonOutput += daemonOutput(firstDaemon);
@@ -366,7 +396,10 @@ process.stdin.on("end", () => {
       writeFileSync(continuePath, "cleanup\n", { mode: 0o600 });
       await stopDaemon(secondDaemon);
       await stopDaemon(firstDaemon);
-      if (runtimePid && Number.isInteger(runtimePid)) {
+      // `> 0` rather than `Number.isInteger`, for the same reason as the assertion above: a pid
+      // of 0 is not a process this test spawned, and signalling a pid it did not establish is
+      // worse than leaking one.
+      if (runtimePid !== null && Number.isInteger(runtimePid) && runtimePid > 0) {
         try { process.kill(runtimePid, "SIGTERM"); } catch { /* already gone */ }
       }
       rmSync(root, { recursive: true, force: true });
