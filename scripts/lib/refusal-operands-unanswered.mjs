@@ -17,6 +17,29 @@
  */
 const groups = [
   {
+    file: "src/daemon/canonical-self-claim-operator.ts",
+    // isStoredOwnerApprovalPayload's two structural guards, in front of the field checks.
+    reason: "Both are subsumed at runtime by the `record[\"type\"] === \"OWNER_APPROVAL\"` check one line down, and both mutants were run and SURVIVED. Remove `typeof value !== \"object\"` and a string payload reaches `record[\"type\"]`, where indexing a string yields `undefined`, which is not the literal — refused, same code, same message. Remove `Array.isArray(value)` and an array reaches the same read with the same outcome. They are kept because the coincidence is in the *next* check rather than in these: a future envelope whose first field happened to be one an array or a string could carry would make both load-bearing again, and nothing about the type check announces that it is doing this work.",
+    operands: [
+      ["typeof value !== \"object\"",1],
+      ["Array.isArray(value)",1],
+    ],
+  },
+  {
+    file: "src/daemon/canonical-self-claim-operator.ts",
+    // The request-field checks TypeScript enforces, and the one a second authority re-checks.
+    reason: "Five of these six cannot carry a row and the harness says so: `isNonEmptyString` is a type predicate, so removing any `!isNonEmptyString(...)` operand — or the `typeof value === \"string\"` inside it, or the `!row` guard that narrows a `| undefined` row — leaves an `unknown` or possibly-undefined value flowing into a `string` field, and the mutant refuses to compile. TypeScript is the enforcement site, not a test. The sixth, `!Number.isSafeInteger(expectedBindingGeneration)`, compiles when removed and SURVIVED: `CanonicalSelfClaim.claim()` re-checks the same property (`canonical-self-claim.ts`, \"expectedBindingGeneration must be a positive safe integer\") and denies with the same `INVALID_ARGUMENT`, so no input distinguishes the two. That is a second authority on one fact rather than defence in depth, and it is worth saying plainly: this operand's only effect today is to refuse earlier and with a different message.",
+    operands: [
+      ["typeof value === \"string\"",1],
+      ["!isNonEmptyString(claimedSessionUuid)",1],
+      ["!isNonEmptyString(projectId)",1],
+      ["!Number.isSafeInteger(expectedBindingGeneration)",1],
+      ["!isNonEmptyString(ownerApprovalNonce)",1],
+      ["!row",1],
+      ["row.payload_json === null",1],
+    ],
+  },
+  {
     file: "src/session/session-registry.ts",
     // verifySecret's stored-hash shape check.
     reason: "`typeof row.session_secret_hash === \"string\"` has no runtime effect its neighbouring regex does not already have, measured rather than argued: removing it leaves `SESSION_SECRET_HASH.test(row.session_secret_hash!)`, and for a NULL hash `RegExp.test` coerces its argument to the string \"null\", which the 64-hex pattern rejects — so `validStoredHash` is false either way and the row is refused with the same code. That mutant was run against a case built for exactly that input (a raw-inserted pre-migration row with a NULL hash) and SURVIVED. What the operand actually enforces is the type narrowing: without it the expression does not compile without a non-null assertion, which is what the surviving mutant had to add to get past `tsc`, so TypeScript is the enforcement site. Its sibling `SESSION_SECRET_HASH.test(...)` carries the runtime half and has a row of its own.",

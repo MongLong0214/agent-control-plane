@@ -77,7 +77,6 @@ export const FILE_EXCLUSIONS = new Map([
   ["src/core/process-argv.ts", reason],
   ["src/core/process-identity.ts", reason],
   ["src/cto/cto-lifecycle.ts", reason],
-  ["src/daemon/canonical-self-claim-operator.ts", reason],
   ["src/daemon/dead-binding-recovery.ts", reason],
   ["src/daemon/finalizer.ts", reason],
   ["src/daemon/single-instance.ts", reason],
