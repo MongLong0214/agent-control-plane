@@ -22,6 +22,18 @@
  * sol-simplify: the backlog stays visible; remove entries as the orderings are made total (#858).
  */
 export const PARTIAL_TIMESTAMP_ORDERINGS = new Map([
+  // Not a backlog item that will be worked down like the others. `src/db/migrations.ts` is a
+  // frozen, append-only input whose exact bytes are pinned in `tests/helpers/frozen-authority.ts`
+  // from a digest an authority outside this change supplied — the pin is deliberately not
+  // recomputed from the file, because "a pin a run derives from its own input agrees with whatever
+  // it is handed" is the defect it exists to close.
+  //
+  // So adding a tiebreaker here is not mine to do. I did it, and the pin caught it: the file's
+  // digest moved to 7520049c… against a pinned 6d67c8f9…, and the migration test failed. Reverted.
+  // The ordering is a `LIMIT 1` that picks which row is named in a v35 refusal message, so the
+  // consequence of the tie is a person sent to the wrong nonce — real, and still not a reason to
+  // edit a frozen input without the authority that froze it.
+  ["src/db/migrations.ts:2293", "ORDER BY received_at ASC"],
   ["src/conversation/turn-coordinator.ts:1169", "ORDER BY claimed_at ASC"],
   ["src/conversation/turn-coordinator.ts:1757", "ORDER BY claimed_at ASC"],
   ["src/cto/cto-lifecycle.ts:783", "ORDER BY created_at DESC"],
