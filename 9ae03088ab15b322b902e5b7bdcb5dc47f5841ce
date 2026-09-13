@@ -1,0 +1,10 @@
+Limit: the CEO refused the changed-file-only proposal because it defers cross-file regression to the main sweep, which is a quality reduction; main's full sweep is additional defence and never a substitute for what a PR missed
+Limit: this unit wires nothing — ci.yml and the sweep's own selection are untouched, so the full sweep still runs everywhere and only a later unit may narrow it
+Ruled-out: selecting on row.file alone | refused, because a row stops being killed by a change to its witness, to a helper that witness inherits, or to a module the mutated file calls, and none of those touch row.file
+Warn: an undecidable dependency must stay FULL: deleting that branch looks like a simplification and silently turns an absent answer from run-everything into run-nothing-for-this-file
+Blast: module
+Undo: easy
+Certainty: firm
+Unverified: the three rows were measured killed by local --only runs with no baseline artifact supplied; the file's eleven cases pass unmutated, which is the baseline those kills rest on
+Record-Id: r-affectedclosurecontract885
+Provenance: inherited 9c06844f6f1f6f765e84cf5c986d0fcf56e11d46
