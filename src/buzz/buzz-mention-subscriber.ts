@@ -704,6 +704,28 @@ type BuzzMentionRejection =
    */
   | "admission-retry-pending"
   /**
+   * Handling the frame threw rather than answering it. Behaviourally the `RETRY` shape — nothing
+   * was established, the cursor stays, the socket goes — but a different cause, and the one an
+   * operator has to tell apart: a handler that throws on every event leaves the subscriber
+   * looking *silent*, which is what `BUZZ_MENTION_SUBSCRIBER_SILENT` fires on. Counted separately
+   * from `admission-retry-pending` so "the role's peer is down" and "handling is failing" are not
+   * one number.
+   *
+   * **Named for what the catch can establish, which is not the sink.** It was `seam-threw` until a
+   * merge-gate review named three other throws the same catch collects: `finalizeEvent` in
+   * `#onAuthChallenge`, `this.#socket?.send(frame)`, and the live
+   * `registry.primaryCtoBindingFor(...)` read inside `#onEvent`. The sink is the dominant source
+   * and the one this reason was added for, but a registry or transport failure filed as a *seam*
+   * failure sends the operator to the wrong side on evidence about something else — the same
+   * misdirection this reason exists to repair, one bucket over.
+   *
+   * Narrowing the guarded region to the `sink.admit` call would have made the old name true, and
+   * was not taken: a throw there deliberately drops the socket, and returning a rejection from
+   * `#onEvent` instead would leave the connection up. That is a behaviour change, not a naming
+   * one.
+   */
+  | "frame-handler-threw"
+  /**
    * The sink answered `ALREADY_DURABLE`: a durable copy of this event exists already. It has its
    * own reason because `since` is inclusive, so every reconnect re-requests the boundary event and
    * the seam answers this — counting it as an admission made the number climb with reconnect count
@@ -915,9 +937,13 @@ class BuzzMentionSubscription {
           if (!this.#isCurrent(generation)) return;
           try {
             // The outcome was discarded here, which is why "connected and silent" and "receiving
-            // and refusing" looked the same from outside (#841). Counted before anything can
-            // throw past it; a sink that throws is handled below and is not a frame that never
-            // arrived.
+            // and refusing" looked the same from outside (#841).
+            //
+            // `record` is the *outer* call, so it runs only if `#handleFrame` resolves. An earlier
+            // version of this comment claimed the frame was "counted before anything can throw
+            // past it"; a merge-gate review measured the opposite — a sink that threw left the
+            // `EVENT` frame invisible to all three counters (`framesHandled: 2`). The catch counts
+            // it now, which is why that claim is gone from here (#870).
             this.#tally.record(await this.#handleFrame(raw, generation));
           } catch {
             // A sink that threw established nothing about the message, so this is the `RETRY`
@@ -928,6 +954,20 @@ class BuzzMentionSubscription {
             // Conditional on the generation, and that is the whole of the second defect: a
             // rejection arriving after this connection was replaced used to reach an
             // unconditional `#reconnect()` and drop *the replacement's* socket.
+            //
+            // Recorded before the reconnect, and unconditionally: the frame arrived whatever the
+            // generation says about where its answer belongs, and `framesHandled === 0` is the
+            // evidence `BUZZ_MENTION_SUBSCRIBER_SILENT` fires on. A handler throwing on every
+            // event would otherwise present as a quiet relay.
+            //
+            // Unconditional is the documented exception to the stale-tail policy stated at
+            // `#onEvent` and carried in `BuzzMentionCounters`: a stale answer normally lands in
+            // `framesHandled` alone, unattributed, because the answer belongs to a connection that
+            // no longer exists. A *throw* is different — it is evidence about this runtime's
+            // handler rather than about where the answer belongs, and suppressing it when the
+            // socket happened to be replaced mid-flight would hide exactly the persistent failure
+            // this reason was added to surface.
+            this.#tally.record({ rejected: "frame-handler-threw", admission: null });
             this.#reconnect(generation);
           }
         });
