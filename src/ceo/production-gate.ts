@@ -867,6 +867,9 @@ export class ProductionGate {
           return execFileSync("git", ["-C", participant.checkoutPath, ...args], {
             encoding: "utf8",
             stdio: ["ignore", "pipe", "ignore"],
+            // A read of a participant checkout cannot be allowed to hold the gate open. An index
+            // lock another process holds has no deadline of its own (#859).
+            timeout: 30_000,
           }).trim();
         } catch {
           return null;
