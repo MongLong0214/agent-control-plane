@@ -21,13 +21,18 @@ import type { TelegramRouteOutcome } from "../ingress/telegram-router.ts";
 import type { TelegramUpdate } from "../ingress/telegram.ts";
 import {
   REALM_EVIDENCE_CLAIM,
+  type HermesSharedStateObservation,
   type OwnedProcess,
+  type ProbeToolCensus,
   type ProductionCensus,
   type RealmPaths,
   assertDisposableWorkspaceRoot,
+  assertProbeToolsMeasuredOff,
   assertProductionUnchanged,
   censusProduction,
+  classifyHermesContention,
   classifyProbeSignal,
+  hermesContentionReport,
   mayTerminate,
   planDisposableRealm,
   productionRoot,
@@ -264,6 +269,67 @@ const SYNTHETIC_SAFETY_CONDITIONS: readonly SyntheticSafetyCondition[] = [
       "The requested claim matched the only permitted sentence and every CHECKED_BY_RUN step was matched to an execution marker before this artifact was returned.",
   },
 ];
+
+/**
+ * Conditions 3 and 6 of #655's safety list, derived rather than declared.
+ *
+ * The eight rows above are hand-written sentences about what this artifact did, which is adequate
+ * while the sentence and the run are written together. It is not adequate for these two, because
+ * both are *preconditions on starting*: a row saying "the tool surface was measured off" is
+ * exactly what a run that never looked would also print. So these two rows are computed by calling
+ * the decisions themselves, and the status is whatever those decisions return.
+ *
+ * Synthetic mode starts no probe child and opens no shared Hermes database, so the honest inputs
+ * are `measuredAt: null` and `observedAt: null` — and both decisions refuse on those, which is the
+ * point. `ASSERTED_ONLY` here is a derived refusal carrying the decision's own words, not a
+ * caveat someone remembered to write. When a mode exists that does take these observations, the
+ * same two calls turn `CHECKED_BY_RUN` without this table being edited.
+ */
+export const derivedSafetyConditions = (
+  census: ProbeToolCensus,
+  shared: HermesSharedStateObservation,
+): readonly [SyntheticSafetyCondition, SyntheticSafetyCondition] => {
+  const tools = assertProbeToolsMeasuredOff(census);
+  const contention = classifyHermesContention(shared);
+  return [
+    {
+      condition: "Tool side effects are restricted to a closed allowlist, measured rather than assumed",
+      status: tools.allowed ? "CHECKED_BY_RUN" : "ASSERTED_ONLY",
+      detail: tools.allowed
+        ? `Every tool in PROBE_FORBIDDEN_TOOLS was measured off at ${census.measuredAt ?? "an unrecorded time"} against ${census.targetRoot}.`
+        : tools.message,
+    },
+    {
+      condition: "Contention on the shared Hermes state.db is itself the result, and the run stops",
+      status: contention === "PROCEED" ? "CHECKED_BY_RUN" : "ASSERTED_ONLY",
+      detail:
+        contention === "STOP_AND_REPORT"
+          ? hermesContentionReport(shared)
+          : contention === "PROCEED"
+            ? `The shared database at ${shared.databasePath} was inspected at ${shared.observedAt ?? "an unrecorded time"} and no second holder was observed: ${shared.detail}`
+            : `The shared database at ${shared.databasePath} was not inspected by this artifact, so contention is undecided rather than absent: ${shared.detail}`,
+    },
+  ];
+};
+
+/**
+ * What synthetic mode can honestly say it observed about the two preconditions: nothing.
+ *
+ * Written as values beside the decisions that read them so the refusal has one origin. A future
+ * mode replaces these, not the rows.
+ */
+const SYNTHETIC_PROBE_TOOL_CENSUS: ProbeToolCensus = {
+  measuredAt: null,
+  targetRoot: "(no probe child is started in synthetic mode)",
+  tools: {},
+};
+
+const SYNTHETIC_HERMES_SHARED_STATE: HermesSharedStateObservation = {
+  observedAt: null,
+  databasePath: "(the live Hermes state.db is not opened in synthetic mode)",
+  contended: null,
+  detail: "synthetic mode drives an injected transport and never shares a database with the gateway",
+};
 
 export interface SyntheticDisposableRealmEvidence {
   readonly mode: "SYNTHETIC";
@@ -1106,6 +1172,9 @@ export const runSyntheticDisposableRealmProbe = async (
     ...result.value,
     workspaceRemoved: true,
     steps,
-    safetyConditions: SYNTHETIC_SAFETY_CONDITIONS.map((condition) => ({ ...condition })),
+    safetyConditions: [
+      ...SYNTHETIC_SAFETY_CONDITIONS.map((condition) => ({ ...condition })),
+      ...derivedSafetyConditions(SYNTHETIC_PROBE_TOOL_CENSUS, SYNTHETIC_HERMES_SHARED_STATE),
+    ],
   });
 };

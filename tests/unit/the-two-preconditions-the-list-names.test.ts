@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { derivedSafetyConditions } from "../../src/acceptance/disposable-realm-driver.ts";
 import {
   PROBE_FORBIDDEN_TOOLS,
   assertProbeToolsMeasuredOff,
@@ -120,5 +121,74 @@ describe("condition 6 — contention on the shared Hermes database is the result
     expect(report).toContain("a second writer holds the -wal");
     expect(report).toContain("No process this run did not start was signalled");
     expect(report).toContain("nothing about the probe's subject was exercised");
+  });
+});
+
+/**
+ * The two decisions above are only worth having if the acceptance artifact reaches them. They did
+ * not: `SYNTHETIC_SAFETY_CONDITIONS` listed eight hand-written rows for #655's eight conditions and
+ * silently covered six, so conditions 3 and 6 were named in the issue, decided in this module, and
+ * absent from the only artifact anyone reads.
+ *
+ * These assert the join, and they assert it is a *derivation*. A row whose status is typed into the
+ * table reads identically to one a decision returned — which is the same failure one level up as
+ * "did anyone look".
+ */
+describe("the artifact's rows for conditions 3 and 6", () => {
+  const measuredOff = (): ProbeToolCensus => ({
+    measuredAt: "2026-09-14T00:00:00.000Z",
+    targetRoot: "/tmp/probe-root",
+    tools: Object.fromEntries(PROBE_FORBIDDEN_TOOLS.map((tool) => [tool, false])),
+  });
+
+  const quiet = (): HermesSharedStateObservation => ({
+    observedAt: "2026-09-14T00:00:00.000Z",
+    databasePath: "/Users/fixture/.hermes/state.db",
+    contended: false,
+    detail: "one holder, no foreign -wal",
+  });
+
+  it("carries the decision's own refusal when nothing was observed, not a caveat someone wrote", () => {
+    const [tools, contention] = derivedSafetyConditions(
+      { measuredAt: null, targetRoot: "/tmp/probe-root", tools: {} },
+      { observedAt: null, databasePath: "/Users/fixture/.hermes/state.db", contended: null, detail: "not inspected" },
+    );
+
+    expect(tools.status).toBe("ASSERTED_ONLY");
+    expect(tools.detail).toContain("never measured");
+    expect(contention.status).toBe("ASSERTED_ONLY");
+    expect(contention.detail).toContain("undecided rather than absent");
+  });
+
+  it("turns to CHECKED_BY_RUN on observations that satisfy the conditions, without the table changing", () => {
+    // This is what kills a hand-written row: the same table, different inputs, different status.
+    const [tools, contention] = derivedSafetyConditions(measuredOff(), quiet());
+
+    expect(tools.status).toBe("CHECKED_BY_RUN");
+    expect(tools.detail).toContain("/tmp/probe-root");
+    expect(contention.status).toBe("CHECKED_BY_RUN");
+    expect(contention.detail).toContain("no second holder was observed");
+  });
+
+  it("keeps a single enabled tool out of CHECKED_BY_RUN, naming the tool", () => {
+    const [tools] = derivedSafetyConditions(
+      { ...measuredOff(), tools: { ...measuredOff().tools, bash: true } },
+      quiet(),
+    );
+
+    expect(tools.status).toBe("ASSERTED_ONLY");
+    expect(tools.detail).toContain("side effects leave the realm");
+  });
+
+  it("makes an observed contention the row's own report rather than a stop with no finding", () => {
+    const [, contention] = derivedSafetyConditions(measuredOff(), {
+      ...quiet(),
+      contended: true,
+      detail: "a second writer holds the -wal",
+    });
+
+    expect(contention.status).toBe("ASSERTED_ONLY");
+    expect(contention.detail).toContain("a second writer holds the -wal");
+    expect(contention.detail).toContain("No process this run did not start was signalled");
   });
 });
