@@ -15,6 +15,8 @@ import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { runBoundedChild } from "../helpers/bounded-child.ts";
+
 import { OwnerAuthority, type OwnerApprovalReceipt, type OwnerAuthorityPort } from "../../src/ceo/owner-authority.ts";
 import { type Decision, allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -1939,6 +1941,23 @@ describe("adversarial mutations — each must kill its guard, not merely delete 
   const TEST_RELATIVE_PATH = ["tests", "unit", "canonical-self-claim.test.ts"] as const;
 
   /**
+   * #872. Each nested run takes ~800ms on an idle host. This bound is not a performance
+   * assertion — it is the point past which the child is a wedge rather than a slow answer, and
+   * it must stay below the enclosing `it` timeout so the failure names this command instead of
+   * being reported against whichever test the worker happened to hold. The measurement that
+   * motivated it: one such run took 202,353ms under full-suite load while `execFileSync` blocked
+   * the event loop, so the enclosing 60s timeout could not fire at all.
+   */
+  const NESTED_RUN_BUDGET_MS = 120_000;
+
+  /**
+   * Deliberately above `NESTED_RUN_BUDGET_MS` plus the scratch-tree copy that happens outside the
+   * bound, so the bound is what fires on a wedged child. If this were the tighter of the two, the
+   * failure would again be a bare per-test timeout that names no command and reaps no group.
+   */
+  const MUTATION_TEST_TIMEOUT_MS = 180_000;
+
+  /**
    * A disposable, independent copy of this repository's `src/` and `tests/` trees under a fresh
    * temp directory outside every checked-out worktree. A mutation is applied only inside this
    * copy; the checked-out tree at `AUTHORITY_ROOT` is opened for reading here, never for writing.
@@ -2007,11 +2026,11 @@ describe("adversarial mutations — each must kill its guard, not merely delete 
    * about how a fresh OS process resolves ES module specifiers, not something either process
    * caches or shares — the module this run loaded can only be the scratch copy.
    */
-  const proveMutationOutcome = (
+  const proveMutationOutcome = async (
     mutate: (source: string) => string,
     testNameFragment: string,
     expectKilled: boolean,
-  ): void => {
+  ): Promise<void> => {
     const authorityBytesBefore = readFileSync(AUTHORITY_MODULE_PATH, "utf8");
     const scratchRoot = buildScratchRepo();
     try {
@@ -2035,31 +2054,66 @@ describe("adversarial mutations — each must kill its guard, not merely delete 
       expect(readFileSync(AUTHORITY_MODULE_PATH, "utf8")).toBe(authorityBytesBefore);
 
       const resultPath = join(scratchRoot, "mutation-result.json");
-      let failed = false;
-      try {
-        execFileSync(
-          process.execPath,
-          [
-            join(scratchRoot, "node_modules", "vitest", "vitest.mjs"),
-            "run",
-            // Relative to `cwd` (set to `scratchRoot` below), not `scratchTestFile`'s absolute
-            // form: this Vitest build's file-filter matching does not resolve an absolute
-            // positional argument against a narrowed `include` pattern the way it resolves a
-            // relative one.
-            TEST_RELATIVE_PATH.join("/"),
-            "-t",
-            testNameFragment,
-            "--reporter=json",
-            `--outputFile.json=${resultPath}`,
-          ],
-          { cwd: scratchRoot, encoding: "utf8", stdio: "pipe" },
-        );
-      } catch {
-        failed = true;
-      }
+      const nested = await runBoundedChild(
+        process.execPath,
+        [
+          join(scratchRoot, "node_modules", "vitest", "vitest.mjs"),
+          "run",
+          // Relative to `cwd` (set to `scratchRoot` below), not `scratchTestFile`'s absolute
+          // form: this Vitest build's file-filter matching does not resolve an absolute
+          // positional argument against a narrowed `include` pattern the way it resolves a
+          // relative one.
+          TEST_RELATIVE_PATH.join("/"),
+          "-t",
+          testNameFragment,
+          "--reporter=json",
+          `--outputFile.json=${resultPath}`,
+        ],
+        { cwd: scratchRoot, budgetMs: NESTED_RUN_BUDGET_MS },
+      );
 
-      const resultJson = JSON.parse(readFileSync(resultPath, "utf8")) as { testResults: Array<{ name: string }> };
-      expect(resultJson.testResults[0]?.name).toBe(scratchTestFile);
+      // The three ways this child can end are three different facts, and only the third is a
+      // statement about the mutation. A child that never started, or that was reaped at its
+      // budget, throws out of `runBoundedChild` naming the argv. A child that ran but produced no
+      // report is named here, with its status and the tail of what it said. Only a child that ran
+      // and wrote its report gets its exit status read as a verdict — which is what `expectKilled`
+      // is about to assert on.
+      if (!existsSync(resultPath)) {
+        throw new Error(
+          `the nested vitest run exited ${nested.status} without writing ${resultPath}, so it never ` +
+            `reported on "${testNameFragment}" and its status is not evidence about the mutation. ` +
+            `stderr tail: ${nested.stderr.slice(-800)}`,
+        );
+      }
+      const report = JSON.parse(readFileSync(resultPath, "utf8")) as {
+        numPassedTests: number;
+        numFailedTests: number;
+        testResults: Array<{ name: string }>;
+      };
+      expect(report.testResults[0]?.name).toBe(scratchTestFile);
+
+      // `-t` compiles to a RegExp, so a retitled test, a typo, or a title whose punctuation the
+      // pattern does not match selects nothing — and a run that selected nothing exits 0 with
+      // every test skipped. Measured: replacing one fragment with an unmatchable string left the
+      // `expectKilled: false` row green while no test had run, so the row's documented finding
+      // was being reported as confirmed by a run that observed nothing.
+      const executed = report.numPassedTests + report.numFailedTests;
+      expect(
+        executed,
+        `the -t fragment ${JSON.stringify(testNameFragment)} selected no test in the scratch copy, ` +
+          "so this run says nothing about the mutation",
+      ).toBeGreaterThan(0);
+
+      // The report is the authority on what the run found; the exit status is a second reading of
+      // the same fact. When they disagree the child ended for a reason outside the mutation, and
+      // neither number may be read as a verdict about it.
+      const failed = report.numFailedTests > 0;
+      expect(
+        failed,
+        `the nested run's report (${report.numFailedTests} failed of ${executed} executed) and its ` +
+          `exit status (${nested.status}) disagree, so the run ended for a reason this harness did ` +
+          `not ask about. stderr tail: ${nested.stderr.slice(-800)}`,
+      ).toBe(nested.status !== 0);
 
       expect(
         failed,
@@ -2075,8 +2129,8 @@ describe("adversarial mutations — each must kill its guard, not merely delete 
 
   it(
     "atomicity: swapping the outer db.txDecision for db.tx lets a denied bind's session insert survive",
-    () => {
-      proveMutationOutcome(
+    async () => {
+      await proveMutationOutcome(
         (source) =>
           source.replace(
             "return this.db.txDecision((): Decision<CanonicalSelfClaimReceipt> => {",
@@ -2086,13 +2140,13 @@ describe("adversarial mutations — each must kill its guard, not merely delete 
         true,
       );
     },
-    60_000,
+    MUTATION_TEST_TIMEOUT_MS,
   );
 
   it(
     "identity substitution: trusting the caller's claimed UUID instead of the derived one un-kills the mismatch refusal",
-    () => {
-      proveMutationOutcome(
+    async () => {
+      await proveMutationOutcome(
         (source) =>
           source.replace(
             "if (identity.sessionUuid !== request.claimedSessionUuid.toLowerCase()) {",
@@ -2102,25 +2156,25 @@ describe("adversarial mutations — each must kill its guard, not merely delete 
         true,
       );
     },
-    60_000,
+    MUTATION_TEST_TIMEOUT_MS,
   );
 
   it(
     "pid-without-start-time: deleting the start-time pairing check admits a caller whose process identity was never confirmed",
-    () => {
-      proveMutationOutcome(
+    async () => {
+      await proveMutationOutcome(
         (source) => source.replace("if (identity.startedAt === null) {", "if (false) {"),
         "clause 2 — pid and start time as a pair",
         true,
       );
     },
-    60_000,
+    MUTATION_TEST_TIMEOUT_MS,
   );
 
   it(
     "owner-rejection bypass: deleting the approved!==true check lets an explicit refusal authorise the claim it names",
-    () => {
-      proveMutationOutcome(
+    async () => {
+      await proveMutationOutcome(
         (source) => source.replace("if (request.ownerApproval.approved !== true) {", "if (false) {"),
         // Not the parenthesised full title: `vitest -t` compiles its argument as a RegExp on this
         // node build, and a pattern containing literal `text (text)` fails to match that exact
@@ -2129,7 +2183,7 @@ describe("adversarial mutations — each must kill its guard, not merely delete 
         true,
       );
     },
-    60_000,
+    MUTATION_TEST_TIMEOUT_MS,
   );
 
   /**
@@ -2141,8 +2195,8 @@ describe("adversarial mutations — each must kill its guard, not merely delete 
    */
   it(
     "consume-once bypass: removing the call does not fail the replay test, because the generation check is a redundant, earlier guard for this exact scenario",
-    () => {
-      proveMutationOutcome(
+    async () => {
+      await proveMutationOutcome(
         (source) =>
           source.replace(
             "const consumed = this.ownerAuthority.consumeApproval(request.ownerApproval, null);\n      if (!consumed.allowed) return consumed as Decision<CanonicalSelfClaimReceipt>;",
@@ -2152,6 +2206,6 @@ describe("adversarial mutations — each must kill its guard, not merely delete 
         false,
       );
     },
-    60_000,
+    MUTATION_TEST_TIMEOUT_MS,
   );
 });
