@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { symlinkSync } from "node:fs";
 
@@ -202,6 +202,88 @@ describe("guard refuses arguments it cannot authorise reliably", () => {
     expect(decision.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
     expect(effectInvoked).toBe(false);
   });
+});
+
+describe("the worktree mutators' time bound", () => {
+  /**
+   * #878. `git()`'s docblock justifies a blanket 120s bound by naming `worktree add --detach` as
+   * the slowest plausible call and `timeoutMs` as the affordance that makes a blanket bound safe.
+   * For one release the three worktree mutators took no timeout and passed none, so that call was
+   * the one call no caller could give more time -- the argument for the bound with its premise
+   * missing.
+   *
+   * The witness is one fake git and two different bounds. If the option did not reach `git()`,
+   * both calls would take the same path; they do not, and that is the whole claim.
+   */
+  /**
+   * Slow for `worktree add` only; every other subcommand is the real git.
+   *
+   * A blanket sleep also slows the guard's own workspace probe, which shells out per call — the
+   * first draft of this case took 20s for that reason and measured the probe as much as the
+   * mutator. Narrowing it keeps the subject to the one call under test.
+   */
+  const gitSlowOnWorktreeAdd = (seconds: number): string => {
+    const bin = tempDir("acp-slow-git-");
+    const real = execFileSync("/usr/bin/env", ["sh", "-c", "command -v git"], { encoding: "utf8" }).trim();
+    writeFileSync(
+      join(bin, "git"),
+      ["#!/bin/sh", 'for a in "$@"; do', '  if [ "$a" = "add" ]; then', `    sleep ${seconds}`, "    exit 0", "  fi", "done", `exec ${real} "$@"`, ""].join("\n"),
+    );
+    chmodSync(join(bin, "git"), 0o755);
+    return bin;
+  };
+
+  const authorizationFor = (
+    seeded: ReturnType<typeof seedRun>,
+    guard: ManagedWriteGuard,
+    path: string,
+  ) => ({
+    guard,
+    request: {
+      operation: WriteOperation.GIT_WORKTREE,
+      targetPath: path,
+      repositoryIdentity: seeded.identity,
+      targetBranch: "dev",
+      targetWorktreeId: canonical(path),
+      worktreeAction: WorktreeAction.ADD,
+      runId: seeded.runId,
+      sessionId: seeded.sessionId,
+      bindingGeneration: seeded.generation,
+      actor: "bound-test",
+    },
+  });
+
+  it("refuses under a bound it cannot meet and succeeds under one it can", async () => {
+    const { guard, seeded, repo } = setup();
+    const path = join(tempDir("acp-bound-worktree-"), "candidate");
+    const restorePath = process.env.PATH;
+    process.env.PATH = `${gitSlowOnWorktreeAdd(3)}:${restorePath ?? ""}`;
+    try {
+      const startedMs = Date.now();
+      const tooShort = await addWorktree(repo, path, "HEAD", authorizationFor(seeded, guard, path), {
+        timeoutMs: 1_000,
+      });
+      const refusedAfterMs = Date.now() - startedMs;
+
+      expect(tooShort.allowed, "a 1s bound did not reach the git call").toBe(false);
+      // Refused *early*, which is what a bound does and what a plain failure would not: the fake
+      // git exits 0 after three seconds, so anything that waited for it would have succeeded.
+      expect(refusedAfterMs).toBeLessThan(3_000);
+      // Not asserted on `reasonCode`: `ManagedWriteGuard` erases `GIT_TIMEOUT` to `INTERNAL_ERROR`
+      // on the way out, which `4391442f` recorded as a known limit and filed separately. Asserting
+      // the code here would pin that erasure in place as if it were the contract.
+
+      const longEnough = await addWorktree(repo, path, "HEAD", authorizationFor(seeded, guard, path), {
+        timeoutMs: 8_000,
+      });
+      expect(longEnough.allowed, "the raised bound did not reach the git call either").toBe(true);
+    } finally {
+      // Assigning `undefined` stores the literal string "undefined", which would leave every
+      // later test in this worker with a PATH of one nonexistent directory.
+      if (restorePath === undefined) delete process.env.PATH;
+      else process.env.PATH = restorePath;
+    }
+  }, 20_000);
 });
 
 describe("P0-12 guarded worktree and source fences", () => {

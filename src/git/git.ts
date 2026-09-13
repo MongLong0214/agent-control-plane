@@ -80,6 +80,12 @@ const authorizeGitMutation = async (
  * A caller that needs longer passes `timeoutMs`. That is the affordance a blanket bound has to
  * have: the alternative to a per-call override is picking one number large enough for the worst
  * case, which is the same as having no bound for every other case.
+ *
+ * The affordance has to *reach* the call this paragraph worries about, and for one release it did
+ * not. `addWorktree`, `removeWorktree` and `pruneWorktrees` took no timeout and passed none, so
+ * `worktree add --detach` -- the call named above as the slowest plausible one -- was the single
+ * call no caller could give more time. An escape hatch nothing can open is not an answer to the
+ * bound; it is the argument for the bound with its premise missing (#878).
  */
 const DEFAULT_GIT_TIMEOUT_MS = 120_000;
 
@@ -265,13 +271,16 @@ export const addWorktree = async (
   path: string,
   ref: string,
   authorization?: GuardedGitEffect,
+  options: { timeoutMs?: number } = {},
 ): Promise<Decision<void>> => {
   return authorizeGitMutation(
     authorization,
     path,
     WorktreeAction.ADD,
     cwd,
-    () => git(cwd, ["-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", path, ref]),
+    () => git(cwd, ["-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", path, ref], {
+      ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+    }),
   );
 };
 
@@ -279,13 +288,17 @@ export const removeWorktree = async (
   cwd: string,
   path: string,
   authorization?: GuardedGitEffect,
+  options: { timeoutMs?: number } = {},
 ): Promise<Decision<void>> => {
   return authorizeGitMutation(
     authorization,
     path,
     WorktreeAction.REMOVE,
     cwd,
-    () => git(cwd, ["worktree", "remove", "--force", path], { allowFailure: true }),
+    () => git(cwd, ["worktree", "remove", "--force", path], {
+      allowFailure: true,
+      ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+    }),
   );
 };
 
@@ -338,12 +351,16 @@ export const listWorktrees = async (cwd: string): Promise<Array<{ path: string; 
 export const pruneWorktrees = async (
   cwd: string,
   authorization?: GuardedGitEffect,
+  options: { timeoutMs?: number } = {},
 ): Promise<Decision<void>> => {
   return authorizeGitMutation(
     authorization,
     cwd,
     WorktreeAction.PRUNE,
     cwd,
-    () => git(cwd, ["worktree", "prune"], { allowFailure: true }),
+    () => git(cwd, ["worktree", "prune"], {
+      allowFailure: true,
+      ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+    }),
   );
 };
