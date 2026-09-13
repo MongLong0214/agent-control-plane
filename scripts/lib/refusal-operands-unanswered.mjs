@@ -17,6 +17,40 @@
  */
 const groups = [
   {
+    file: "src/session/session-registry.ts",
+    // verifySecret's stored-hash shape check.
+    reason: "`typeof row.session_secret_hash === \"string\"` has no runtime effect its neighbouring regex does not already have, measured rather than argued: removing it leaves `SESSION_SECRET_HASH.test(row.session_secret_hash!)`, and for a NULL hash `RegExp.test` coerces its argument to the string \"null\", which the 64-hex pattern rejects — so `validStoredHash` is false either way and the row is refused with the same code. That mutant was run against a case built for exactly that input (a raw-inserted pre-migration row with a NULL hash) and SURVIVED. What the operand actually enforces is the type narrowing: without it the expression does not compile without a non-null assertion, which is what the surviving mutant had to add to get past `tsc`, so TypeScript is the enforcement site. Its sibling `SESSION_SECRET_HASH.test(...)` carries the runtime half and has a row of its own.",
+    operands: [
+      ["typeof row.session_secret_hash === \"string\"",1],
+    ],
+  },
+  {
+    file: "src/session/session-registry.ts",
+    // verifySecret's stored-hash guard inside the refusal condition.
+    reason: "`!validStoredHash` is defence in depth behind `!matches`, and the zero-buffer fallback is what makes it unkillable. When the stored hash is not a hash, `stored` is `Buffer.alloc(SESSION_SECRET_BYTES)` — all zeros — so `timingSafeEqual(expected, stored)` compares the presented secret's hash against 32 zero bytes and returns false. Removing this operand therefore denies on `!matches` for exactly the same inputs, with the same reason code. Killing it would require a secret whose SHA-256 is 32 zero bytes, which is a preimage rather than a test case. It is kept because the fallback and the guard are one decision: a later change making `stored` anything but constant zeros would make this operand load-bearing again, and the comparison it protects has no other check.",
+    operands: [
+      ["!validStoredHash",1],
+    ],
+  },
+  {
+    file: "src/session/session-registry.ts",
+    // bindBuzzActor's terminal-lifecycle refusal.
+    reason: "Both operands are unreachable from this call site, and the guard that pre-empts them is eleven lines up in the same file. `bindBuzzActor` begins with `this.verifySecret(input.sessionId, input.sessionSecret)` and returns on refusal; `verifySecret` already denies `SESSION_SECRET_INVALID` when `row.lifecycle` is STOPPED or ERROR. So `authenticated.value.lifecycle` cannot be terminal when this condition is evaluated, and both mutants were run against the existing actor-release case and SURVIVED — the measurement, not the argument. They are kept because the refusal they would produce is a different one (`SESSION_NOT_READY`, naming the lifecycle) and because the coupling to `verifySecret` is implicit: a future change that authenticated a terminal session on purpose, or split the secret check out, would make this the only check, and nothing would fail to say so.",
+    operands: [
+      ["authenticated.value.lifecycle === SessionLifecycle.STOPPED",1],
+      ["authenticated.value.lifecycle === SessionLifecycle.ERROR",1],
+    ],
+  },
+  {
+    file: "src/session/session-registry.ts",
+    // The catch that discriminates the actor-conflict error from every other throw.
+    reason: "`isAcpError(err)` is enforced by TypeScript, not by a test: `err` is `unknown`, so removing the type guard makes the next two reads fail TS18046 and the harness refuses the mutant as uncompilable (measured: exit 2, three errors at 331:11 and 332). `err.reasonCode === ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND` compiles when removed and SURVIVED, because this `db.run` can raise exactly one AcpError. The two constraints on `sessions.buzz_actor_id` map to different codes — the partial unique index to ALREADY_BOUND and `sessions_buzz_actor_immutable` to IMMUTABLE — but the statement's own `WHERE session_id = ? AND (buzz_actor_id IS NULL OR buzz_actor_id = ?)` pre-empts the trigger: a session already holding a different actor matches zero rows and is denied through the `changes !== 1` branch, so the trigger never fires from here. With one reachable code, no input distinguishes the equality. It stays because the trigger becomes reachable the moment that WHERE clause is widened, and then swallowing IMMUTABLE as ALREADY_BOUND would report a write-once violation as a contention.",
+    operands: [
+      ["isAcpError(err)",1],
+      ["err.reasonCode === ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND",1],
+    ],
+  },
+  {
     file: "src/daemon/daemon.ts",
     // buzzMentionSubscriberFindings
     reason: "Neither operand can carry a row. `!receipt` cannot be mutated in isolation at all: removing it leaves `receipt` typed `| null`, and every later use of it fails TS18047, so the harness refuses the mutant as uncompilable — TypeScript is what enforces this one, not a test. `receipt.configuredIdentities === 0` compiles when removed but nothing can kill it: `setBuzzMentionReceipt` has one production caller, the agentcpd startup block, and it sets the receipt only behind `socketCount > 0`, so a receipt with zero configured identities cannot reach this line. It is defence for a caller that does not exist yet.",
