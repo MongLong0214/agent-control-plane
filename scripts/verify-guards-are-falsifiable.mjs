@@ -4793,6 +4793,49 @@ const GUARDS = [
  * skips what it cannot read is worse than the single array it replaces: the array at least died
  * loudly, while a skipped module subtracts a row and leaves the survivors reporting a full sweep.
  */
+/**
+ * An argument this harness does not recognise is refused before anything is read or written.
+ *
+ * #897. Every option below is read by looking for the one it wants and ignoring the rest, and
+ * "no selector was given" is how the full sweep is asked for. So an argument that is not one of
+ * these — `--help`, `--dry-run`, or a shard typed `--shrad=1/4` — is not a no-op. It starts a
+ * hundred-minute run that mutates 83 source files in the working tree, one at a time.
+ *
+ * A mistyped shard is the worst of them, because it succeeds: the operator believes the run was
+ * narrowed to a quarter, four jobs each believe the same, and every one of them sweeps the whole
+ * table.
+ *
+ * Measured, twice, by me: `--anchors` (the flag is `--anchors-only`) ran a 70-minute sweep where a
+ * seconds-long check was wanted, and `--help` ran one that was killed at the wall clock and left a
+ * mutant in `src/conversation/turn-coordinator.ts` — the `held?.target_actor_id !== …` operand that
+ * keeps an operator from settling another conversation's turn. Nothing was published, but the note
+ * I wrote after the first occurrence did not stop the second: a named site is not an enforcement
+ * site, and only the parser runs.
+ *
+ * The sibling parser already refuses this (`run-prepush-gates.mjs`: "gates: unrecognised
+ * argument(s)"), which made this one repository with two argument parsers where only the one that
+ * does not write to `src/` was fail-closed. Exit 2 for the same reason it does: a usage error is
+ * not a failing sweep, and a caller reading the status should be able to tell them apart.
+ */
+const KNOWN_VALUED_ARGUMENTS = ["--only=", "--shard=", "--shard-report="];
+const KNOWN_FLAGS = ["--anchors-only"];
+const unrecognisedArguments = process.argv
+  .slice(2)
+  .filter(
+    (argument) =>
+      !KNOWN_FLAGS.includes(argument) &&
+      !KNOWN_VALUED_ARGUMENTS.some((prefix) => argument.startsWith(prefix)),
+  );
+if (unrecognisedArguments.length > 0) {
+  process.stderr.write(
+    `verify-guards-are-falsifiable: unrecognised argument(s): ${unrecognisedArguments.join(" ")}\n` +
+      `this harness knows ${[...KNOWN_FLAGS, ...KNOWN_VALUED_ARGUMENTS].join(" ")} and nothing else.\n` +
+      "an argument it does not know is not ignored safely: with no selector it sweeps every row,\n" +
+      "mutating source files in this working tree for as long as that takes.\n",
+  );
+  process.exit(2);
+}
+
 let CASES;
 try {
   CASES = await loadFalsifiabilityCases(ROOT);
