@@ -875,7 +875,11 @@ export class IngressGuard {
    * consequence of which index the planner picked, and one more predicate or one more index is
    * enough to change that without changing a line of this method. `nonce` closes it for good
    * because `(channel, nonce)` is this table's primary key, so within one channel
-   * `(received_at, nonce)` is a total order over every row this query can return.
+   * `(received_at, nonce)` is a total order over every row this query can return — **and only
+   * because this query fixes the channel.** The pair is total within one channel, where `nonce` is
+   * unique; across channels it is not, because two channels may use the same nonce. A caller that
+   * drops the `WHERE channel = ?` needs `(received_at, channel, nonce)`, which is what the two
+   * doctor queries and the v35 migration use, none of which narrow by channel.
    *
    * This is the ordering half of #858's contract — *ordering must not rest on `received_at`
    * alone* — and the precondition for #631's coalescing, where the members of one turn are ordered
