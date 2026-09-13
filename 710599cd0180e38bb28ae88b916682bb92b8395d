@@ -1,0 +1,29 @@
+Limit: the reconciliation proves the split covers the population, not that either list is right; a file wrongly excluded still reconciles
+Ruled-out: resolving the rebase conflict by adding the two decrements | that is the staleness the header warned about, performed by hand, and it would have been correct only until the next removal
+Ruled-out: asserting the printed file count equals FILE_EXCLUSIONS.size | measured SURVIVED under --only, because freezing the operand total does not move the file count
+Warn: the probe must sit at the same directory depth as the census, because ROOT is derived from import.meta.url; one level deeper it fails on ENOENT with an empty stdout that reads like a kill
+Provenance: inherited 5f08f14aacbb2c8bda80f4482a7541a6f4fdb26a
+
+Warn: this test asserts the CENSUS line as a contiguous substring, so any change to that line's wording breaks it; that is the intent — the line is a published format — but it means the wording and these three assertions move together
+Provenance: inherited 6d4bd5131e4777074d5aa477e2424d3860e70d39
+
+Limit: the reconciliation branch stays unreachable from repository data by construction, so its only witness is a source-mutating fixture and a falsifiability row
+Ruled-out: matching the count as a bare substring in the header | 38 values collide with existing text, including the issue numbers the headers cite
+Ruled-out: asserting the refusal from the unit case that reads the CENSUS line | the census gates on reconciliation before printing, so any line that case can parse necessarily reconciles
+Provenance: inherited 3d8cbbade52fc37eb197860d655dd227dcef600b
+
+Limit: the noun set is operands/files/total, so a header inventing a fourth word for the same count evades it — the property is checkable only against the vocabulary the census itself prints
+Ruled-out: matching digits anywhere in the header | every issue number, line number and date in the prose becomes a failure, which is the guard that gets deleted rather than fixed
+Ruled-out: keeping the "" return for a missing block comment | it is absence read as compliance, the exact class this series is about
+Provenance: inherited 6adbc852759f4bd2a1fb0238f627dec5f06a1957
+
+Limit: the reconciliation cannot see a frozen repository total, and no falsifiability row can witness that gap because the mutation still reconciles -- it is caught only when src/ independently gains or loses an operand
+Ruled-out: adding a row that freezes repositoryOperands | the parts still sum to the frozen whole, so the mutant answers exactly as the real code does and the row reports SURVIVED, which is a witness that certifies nothing
+Warn: no count may appear in these exclusion-list headers, including inside a quoted example of the census refusing -- the header guard reads quoted output as a restated count and is right to
+Provenance: inherited 1f3e826c718eb282017a4a2d3b8201547e4c11a9
+
+Limit: the guard's forbidden set is derived from live repository state, so it cannot detect an already-stale figure -- a header restating a wrong count passes and one restating the right count fails, which is correct for the threat model and is now said in the docstring rather than implied
+Ruled-out: keeping normaliseHeaderText and adding a form only it can satisfy | the form would have to be a count separated from its noun by more than forty raw characters that collapses under forty once continuations are stripped, which no header in this repository resembles -- inventing one to justify a stage is the attribution problem in a new shape
+Ruled-out: narrowing the predicate so historical numerals stop colliding | the predicate is right and the prose is what states a number it does not mean; narrowing it would lose the restatements the guard exists for
+Warn: spelled-out numerals are load-bearing in those two headers -- writing `87` back as digits reintroduces a red the day the live count reaches it
+Provenance: inherited a06ac18d4495813e7e432e27c659a1a9e5fd6e5a
