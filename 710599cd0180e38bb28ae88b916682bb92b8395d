@@ -1,0 +1,5 @@
+Limit: the guard's forbidden set is derived from live repository state, so it cannot detect an already-stale figure -- a header restating a wrong count passes and one restating the right count fails, which is correct for the threat model and is now said in the docstring rather than implied
+Ruled-out: keeping normaliseHeaderText and adding a form only it can satisfy | the form would have to be a count separated from its noun by more than forty raw characters that collapses under forty once continuations are stripped, which no header in this repository resembles -- inventing one to justify a stage is the attribution problem in a new shape
+Ruled-out: narrowing the predicate so historical numerals stop colliding | the predicate is right and the prose is what states a number it does not mean; narrowing it would lose the restatements the guard exists for
+Warn: spelled-out numerals are load-bearing in those two headers -- writing `87` back as digits reintroduces a red the day the live count reaches it
+Provenance: inherited 710599cd0180e38bb28ae88b916682bb92b8395d
