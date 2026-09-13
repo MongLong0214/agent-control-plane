@@ -70,8 +70,31 @@ const CONTRACT: TaskContract = {
  * would be a guess: it can be in use, and a fixture that quietly found the session alive would
  * turn these cases green for a reason that has nothing to do with what they measure.
  */
+const DEAD_PID_BUDGET_MS = 30_000;
+
 const deadPid = (): number => {
-  const finished = spawnSync("/usr/bin/true", [], { stdio: "ignore" });
+  // Bounded even though the child is `/usr/bin/true` (#872). What makes an immediate-exit child
+  // hang is not the child: `spawnSync` blocks the event loop, so vitest's per-test timeout cannot
+  // interrupt one, and a host whose exec path is wedged — Gatekeeper assessing a new inode is the
+  // measured case here — stops the worker rather than this test. vitest then reports a timeout
+  // against whichever test that worker happened to be holding, so the file that fails is not the
+  // file that hung.
+  //
+  // `spawnSync` rather than the group-reaping helper in `tests/helpers/bounded-child.ts`, and the
+  // reason is this function's deliverable: it needs the pid of a child that has *already been
+  // reaped*, which is a property only the synchronous form has. `/usr/bin/true` starts no
+  // grandchild, so there is no group for that helper to add anything to.
+  const finished = spawnSync("/usr/bin/true", [], { stdio: "ignore", timeout: DEAD_PID_BUDGET_MS });
+  // A killed child is refused rather than read. `signal` is what says so: `spawnSync` leaves
+  // `killed` unset on this path (measured elsewhere in this repository at `killed: null` beside a
+  // real SIGTERM), and a timed-out child's pid names a process the kernel may not have reaped yet
+  // — which would make the `kill(pid, 0)` below pass for the wrong reason.
+  if (finished.signal !== null) {
+    throw new Error(
+      `/usr/bin/true did not exit within ${DEAD_PID_BUDGET_MS}ms (signal ${finished.signal}); ` +
+        "its pid is not a reaped pid, so it cannot stand in for a dead session",
+    );
+  }
   const pid = finished.pid;
   if (typeof pid !== "number" || pid <= 0) throw new Error("could not obtain a reaped child pid");
   expect(() => process.kill(pid, 0)).toThrow();
