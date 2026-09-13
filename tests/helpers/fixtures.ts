@@ -82,8 +82,45 @@ const GIT_ENV = {
   GIT_CONFIG_NOSYSTEM: "1",
 };
 
-export const gitSync = (cwd: string, args: readonly string[]): string =>
-  execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", env: GIT_ENV }).trim();
+/**
+ * #872. Every `git` this helper runs is against a temp repository and answers in well under a
+ * second; the bound exists for the case where it does not answer at all. An unbounded
+ * `execFileSync` holds the worker's event loop forever, which means Vitest's own 60s per-test
+ * timeout never fires, and the timeout it eventually reports lands on whichever test that stalled
+ * worker happened to be holding — not on the one that hung.
+ *
+ * 30s rather than the `runBoundedChild` treatment: this signature is synchronous and has 155 call
+ * sites, so making it async is its own change. A `timeout` here is strictly weaker — it still
+ * blocks the loop for up to the bound, and it signals only the direct child — but it converts
+ * "forever" into a failure that names itself, and it stays well below `testTimeout` so it is the
+ * one that fires.
+ */
+const GIT_BUDGET_MS = 30_000;
+
+/**
+ * `execFileSync` reports a timeout as `code: "ETIMEDOUT"` and leaves `killed` unset — measured in
+ * this repository, where a comment asserting the opposite was the alibi for an always-false
+ * branch. So the budget is read from `code`, and every other failure keeps its own message.
+ */
+const named = (what: string, error: unknown): Error => {
+  const failed = error as { code?: string; stderr?: string | Buffer; message?: string };
+  if (failed.code === "ETIMEDOUT") {
+    return new Error(`${what} did not answer within ${GIT_BUDGET_MS}ms — this is the bound, not a git verdict`);
+  }
+  return new Error(`${what} failed: ${failed.stderr?.toString().trim() || failed.message || String(error)}`);
+};
+
+export const gitSync = (cwd: string, args: readonly string[]): string => {
+  try {
+    return execFileSync("git", ["-C", cwd, ...args], {
+      encoding: "utf8",
+      env: GIT_ENV,
+      timeout: GIT_BUDGET_MS,
+    }).trim();
+  } catch (error) {
+    throw named(`git -C ${cwd} ${args.join(" ")}`, error);
+  }
+};
 
 /** A real git repository with a base branch, used for snapshot and verification tests. */
 export const makeRepo = (
@@ -91,7 +128,11 @@ export const makeRepo = (
   baseBranch = "dev",
 ): string => {
   const dir = tempDir("acp-repo-");
-  execFileSync("git", ["init", "-q", "-b", baseBranch, dir], { env: GIT_ENV });
+  try {
+    execFileSync("git", ["init", "-q", "-b", baseBranch, dir], { env: GIT_ENV, timeout: GIT_BUDGET_MS });
+  } catch (error) {
+    throw named(`git init -b ${baseBranch} ${dir}`, error);
+  }
   writeFiles(dir, files);
   gitSync(dir, ["add", "-A"]);
   gitSync(dir, ["commit", "-q", "-m", "base"]);
