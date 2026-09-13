@@ -406,7 +406,7 @@ export class RepositoryRegistry {
 
   byProject(projectId: string): RepositoryRecord[] {
     return this.db
-      .all<RawRepository>(`SELECT * FROM repositories WHERE project_id = ? ORDER BY created_at`, [
+      .all<RawRepository>(`SELECT * FROM repositories WHERE project_id = ? ORDER BY created_at, repository_id`, [
         projectId,
       ])
       .map(hydrate);
@@ -414,7 +414,7 @@ export class RepositoryRegistry {
 
   list(): RepositoryRecord[] {
     return this.db
-      .all<RawRepository>(`SELECT * FROM repositories ORDER BY created_at`)
+      .all<RawRepository>(`SELECT * FROM repositories ORDER BY created_at, repository_id`)
       .map(hydrate);
   }
 
