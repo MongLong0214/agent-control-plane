@@ -44,6 +44,7 @@ import {
   parseDeadBindingRecoveryRequest,
   type DeadBindingRecoveryReceipt,
 } from "./dead-binding-recovery.ts";
+import { C0_QUALIFIED_CLIENT } from "../mcp/role-conversation.ts";
 import { SingleInstanceLock } from "./single-instance.ts";
 
 /**
@@ -501,6 +502,12 @@ export class Daemon {
    * a live one (#841).
    */
   #buzzMentionReceipt: { startedAtMs: number; configuredIdentities: number; counters(): BuzzMentionCounters } | null = null;
+  /**
+   * The deployment's canonical-claim executor pin, as the composition root read it. Null when
+   * canonical self-claim is not activated, which is not a disagreement — there is no pin to
+   * disagree with.
+   */
+  #canonicalExecutorVersion: string | null = null;
   #telegramIngressController: TelegramIngressController | null = null;
   #continuityCoordinatorInstalled = false;
   #continuityReconciling = false;
@@ -2028,8 +2035,76 @@ export class Daemon {
    * editing both and hoping. A reader comparing them could not tell a deliberate difference from
    * an omission.
    */
+  /**
+   * Installs the deployment's canonical-claim executor pin so the report can compare it against
+   * the build the wake transport was qualified on.
+   *
+   * A setter rather than a constructor argument, for the reason recorded when the mention
+   * counters took the same route: the Doctor constructor already takes seventeen arguments and
+   * `run()`'s `supplementalFindings` is the seam this belongs on. The composition root calls it
+   * once, from inside the activation block, so a deployment with canonical self-claim disabled
+   * leaves it null and raises nothing.
+   */
+  setCanonicalExecutorVersion(version: string): void {
+    this.#canonicalExecutorVersion = version;
+  }
+
+  /**
+   * The claim's executor pin and the wake transport's client pin must name the same build.
+   *
+   * They are the two halves of one end state -- `canonical-self-claim.ts` clause 2 decides which
+   * process may *hold* the canonical binding, `registerEndpoint` decides which may *register the
+   * wake transport for it* -- and they are pinned in different places, in different formats, read
+   * at different times. A deployment where they disagree admits no process at all: one side
+   * refuses whichever build the other accepts.
+   *
+   * Nothing noticed that for two days (#886). Each pin is internally consistent, and the failure
+   * is asymmetric in the worst direction: the claim on the stale side **succeeds**, producing
+   * `ACTIVE 1` and a live pid, and the absence only appears when a wake is attempted. That is the
+   * state #674 already records under a different cause -- a binding reading ACTIVE while nothing
+   * can reach it.
+   *
+   * Only the version is compared. `C0_QUALIFIED_CLIENT` carries a name and a version; the
+   * deployment pin carries a version, a realpath and a digest. There is no counterpart for the
+   * digest, so "they agree" can only mean "they name the same build" -- never "they were
+   * qualified on the same bytes". Claiming the second would be the comment-as-guard shape this
+   * check exists to remove.
+   *
+   * Reported rather than refused. A startup refusal is the closer analogue to the activation
+   * group's own partial-configuration throw, and it would take a running deployment down the
+   * moment it is installed; that call is the owner's and is tracked on #886.
+   */
+  private canonicalExecutorPinFindings(): Finding[] {
+    const deployed = this.#canonicalExecutorVersion;
+    if (deployed === null || deployed === C0_QUALIFIED_CLIENT.version) return [];
+    return [{
+      code: "CANONICAL_EXECUTOR_PIN_DISAGREES_WITH_WAKE_TRANSPORT",
+      severity: "ERROR",
+      scope: "system",
+      blocking: false,
+      confidence: "HIGH",
+      // Both versions and both authorities, because the repair is to move one of them and the
+      // operator has to know which side is configuration and which side is the build.
+      observedEvidence: {
+        deploymentExecutorPin: deployed,
+        deploymentPinSource: "ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION",
+        wakeTransportQualifiedClient: `${C0_QUALIFIED_CLIENT.name}/${C0_QUALIFIED_CLIENT.version}`,
+        wakeTransportPinSource: "src/mcp/role-conversation.ts C0_QUALIFIED_CLIENT",
+      },
+      recommendedAction:
+        "no process can both hold the canonical claim and register its wake transport while these " +
+        "disagree: a claimant on the deployment's pin is refused ROLE_PEER_UNSUPPORTED at " +
+        "registerEndpoint, and one on the qualified build is refused at the claim. Move the " +
+        "deployment pin to the qualified build, whose receipt is in evidence/, and restart",
+    }];
+  }
+
   private supplementalSystemFindings(): Finding[] {
-    return [...this.telegramIngressFindings(), ...this.buzzMentionSubscriberFindings()];
+    return [
+      ...this.telegramIngressFindings(),
+      ...this.buzzMentionSubscriberFindings(),
+      ...this.canonicalExecutorPinFindings(),
+    ];
   }
 
   private buzzMentionSubscriberFindings(): Finding[] {

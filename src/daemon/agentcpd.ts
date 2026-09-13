@@ -2869,6 +2869,12 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     } else {
       const canonicalSessionUuid = canonicalActivationValues["ACP_CANONICAL_SESSION_UUID"];
       const canonicalRequiredExecutorVersion = canonicalActivationValues["ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION"];
+      // Handed to the daemon so the system report can compare it against the build the wake
+      // transport was qualified on (#886). Inside the activation block on purpose: a deployment
+      // that never activated canonical self-claim has no pin, and a null there is the absence of
+      // a claim rather than a disagreement. The check above already refuses a *partial* group;
+      // this covers the group that is complete and contradicts itself one step later.
+      daemon.setCanonicalExecutorVersion(canonicalRequiredExecutorVersion);
       const canonicalExpectedExecutorRealpath =
         canonicalActivationValues["ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH"];
       const canonicalExpectedExecutorSha256 = canonicalActivationValues["ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256"];
