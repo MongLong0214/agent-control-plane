@@ -1,0 +1,9 @@
+Limit: the property case pins the forging helper's arithmetic, not that the subscriber refuses a forged id — that is the existing case, which this makes reliable rather than replaces
+Ruled-out: re-running the failed CI job | it passes 255 times in 256, so a green re-run would have certified the defect instead of finding it
+Ruled-out: randomising the substitute until it differs | a loop whose exit depends on the value it is testing is a worse thing to read than an unconditional flip
+Provenance: inherited fe28f12e96ab28d3e19ec8584d65f5a78e6bb432
+
+Limit: the sweep bounds only the dimension this forger decides on, so a forger keyed on some other position of the id would still be unmeasured here
+Ruled-out: adding only the two probes the review named | two samples leave twelve of the sixteen final digits unprobed, and the digit is the class the variant exploits, so enumerating it costs the same two lines and closes the class instead of the example
+Warn: the falsifiability row for this rule anchors on the helper's body line rather than on this probe array, so an edit there detaches the row and only `guards:anchors` says so
+Provenance: inherited f068c594481f936af530e3e6c8d07997fb4f1da4
