@@ -101,6 +101,20 @@ describe("a subscriber whose handling fails on every frame says so (#880)", () =
     expect(findings).toContainEqual(expect.objectContaining({ code: HANDLING_FAILING }));
   });
 
+  it("stays quiet when no frame has produced a verdict at all — zero throws out of zero is not failing", async () => {
+    // The state this fires on must not include a subscriber that has connected and been sent
+    // nothing. Two protocol frames, no verdicts: the throw count and the verdict count are both
+    // zero, so an equality without the positivity test would hold and report handling as failing
+    // on a subscriber whose handling has never run. That state has its own finding
+    // (`BUZZ_MENTION_SUBSCRIBER_SILENT`) and a grace window this one deliberately does not have.
+    const findings = await findingsFor(
+      { framesHandled: 2, admitted: 0, rejections: {} },
+      "no-verdicts",
+    );
+
+    expect(findings).not.toContainEqual(expect.objectContaining({ code: HANDLING_FAILING }));
+  });
+
   it("stays quiet when frames were refused for authority rather than by a throw", async () => {
     // `event-not-addressed` is a relay/addressing repair and `frame-handler-threw` is a runtime
     // one. A finding that fired on any nonzero rejection total would send the operator to the
