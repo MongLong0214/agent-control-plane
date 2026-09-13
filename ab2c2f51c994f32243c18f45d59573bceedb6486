@@ -1,0 +1,18 @@
+Limit: this changes no behaviour today: with nonce ASC removed the query still answers nonce-ordered, because PRIMARY KEY (channel, nonce) gives the table an implicit index and WHERE channel = ? makes it the access path
+Limit: measured 400 consecutive systemClock.nowIso() calls returning one distinct timestamp, and the harness ManualClock is fixed so every test row shares a stamp unless the test advances it
+Warn: the three test rows pin the order the product answers and cannot kill the tiebreaker; a green run there is not evidence that the ORDER BY is what produces the order
+Blast: module
+Undo: easy
+Certainty: firm
+Record-Id: r-receivedatnottotalorder858
+Provenance: inherited cd30f09e0747e006f197b1255b23250141a1ca7d
+
+Limit: the census reads the presence of a second ordering term, not whether the pair is unique: ORDER BY received_at, actor passes and is still not a total order
+Limit: 20 of src/'s timestamp orderings are still partial and named in the backlog list, so a passing census is not a totally ordered codebase
+Ruled-out: patching the four sites and stopping | decided against, because they shared one definition of still-outstanding and a comment saying so while the ordering beside it was copied four times and diverged in silence; the census is what refuses the fifth copy
+Warn: the first version of the regex asked whether a term followed the timestamp and reported ORDER BY bucket_id ASC, observed_at DESC as partial — a tiebreaker does not have to come after the column it breaks ties for
+Blast: module
+Undo: easy
+Certainty: firm
+Record-Id: r-timestampordertotal858
+Provenance: inherited 609f4410796e39174c5a4a2e4d8a2373106c664d
