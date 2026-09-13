@@ -4818,7 +4818,7 @@ const GUARDS = [
  * not a failing sweep, and a caller reading the status should be able to tell them apart.
  */
 const KNOWN_VALUED_ARGUMENTS = ["--only=", "--shard=", "--shard-report="];
-const KNOWN_FLAGS = ["--anchors-only"];
+const KNOWN_FLAGS = ["--anchors-only", "--print-rows"];
 const unrecognisedArguments = process.argv
   .slice(2)
   .filter(
