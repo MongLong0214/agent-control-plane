@@ -160,8 +160,13 @@ describe("the artifact's rows for conditions 3 and 6", () => {
     expect(contention.detail).toContain("undecided rather than absent");
   });
 
-  it("turns to CHECKED_BY_RUN on observations that satisfy the conditions, without the table changing", () => {
-    // This is what kills a hand-written row: the same table, different inputs, different status.
+  it("is connected to the decisions: substituted observations change the rows, the table does not", () => {
+    // **Connectivity evidence only.** These observations are literals written here; nothing
+    // measured them, and a row reading CHECKED_BY_RUN because a test handed the decision a clean
+    // census is not evidence that any tool surface was ever inspected. What it shows is that the
+    // rows come from the decisions rather than from a table someone typed — the same table, other
+    // inputs, other statuses. The production path supplies the absent observations above, and this
+    // change adds no way for a null observation to become a measurement.
     const [tools, contention] = derivedSafetyConditions(measuredOff(), quiet());
 
     expect(tools.status).toBe("CHECKED_BY_RUN");

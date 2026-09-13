@@ -282,8 +282,13 @@ const SYNTHETIC_SAFETY_CONDITIONS: readonly SyntheticSafetyCondition[] = [
  * Synthetic mode starts no probe child and opens no shared Hermes database, so the honest inputs
  * are `measuredAt: null` and `observedAt: null` — and both decisions refuse on those, which is the
  * point. `ASSERTED_ONLY` here is a derived refusal carrying the decision's own words, not a
- * caveat someone remembered to write. When a mode exists that does take these observations, the
- * same two calls turn `CHECKED_BY_RUN` without this table being edited.
+ * caveat someone remembered to write.
+ *
+ * `ASSERTED_ONLY` is neither a measurement nor a licence to run. It records that this artifact did
+ * not observe the condition, and it is not substitute evidence for the observed round trip #655 is
+ * open for. A mode that does take these observations is a separate change from this table, and
+ * nothing here promotes a null observation into a measurement: when such a mode exists, the same
+ * two calls answer `CHECKED_BY_RUN` without this table being edited.
  */
 export const derivedSafetyConditions = (
   census: ProbeToolCensus,
