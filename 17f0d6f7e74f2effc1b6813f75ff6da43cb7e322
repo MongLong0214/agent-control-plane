@@ -1,0 +1,39 @@
+Limit: the producer's cleanup-skip is not fixed here and is filed separately; a killed `git worktree add` can still leave a half-written tree with `GIT_TIMEOUT` erased to `INTERNAL_ERROR` by ManagedWriteGuard
+Limit: the new probe distinction reads `git()`'s evidence shape, so a future change to what `git()` puts in evidence moves this decision without touching this file
+Ruled-out: letting the AcpError out of register() unchanged | the caller is an owner-facing registration path and an unhandled throw there is a worse answer than a refusal that names the probe
+Ruled-out: keeping the blanket catch and matching on git's stderr text | the message is git's to change, and the verdict already carries the distinction structurally
+Provenance: inherited aa0e89e96abcfe17782030a7883ae02ccb61192a
+
+Limit: the row proves the two causes are told apart, not that the messages either branch produces are right
+Provenance: inherited 4c40a42ae63595866838809e5528cb93e8f4eacf
+
+Limit: the entries are still line-keyed, so the next edit above any of them breaks the gate again
+Provenance: inherited 88d116918aa313cf5bf27b30f3d3b466cf6298ad
+
+Limit: listWorktrees still returns [] for a genuine nonzero, so checkWorktrees would report no orphans for a fatal — filed separately; the signal and timeout half of that exposure is closed here, because those shapes no longer pass through allowFailure at all
+Limit: the non-membership match is git's English, so a localised git would refuse as a probe failure rather than answering — the safe direction, and git's own porcelain guarantees are why the strings are stable enough to match
+Ruled-out: keying the distinction on the exit code | 128 is git's code for every fatal, so it cannot carry membership, and a signalled child has no code at all
+Ruled-out: putting git's stderr into the refusal's evidence | evidence lands in audit rows and this module already records the path it needs
+Provenance: inherited d490acf42730837086c2b82a346311f7363ce031
+
+Limit: still line-keyed, so the next edit above any of the twelve entries breaks the gate again
+Provenance: inherited ae4b2ec2ea981c42f409f75e4a2f7f19f7cdcc28
+
+Warn: this file restores PATH in two places and only the afterEach carries the reason, so a third restore added without reading it repeats the bug the review found
+Provenance: inherited 55abe770595b751eb6d69a9d90dadb7d924d1156
+
+Limit: only orphans() is exercised through a reader; the other four reach the same refusal through the same call but are covered by propagation rather than by a case, because create() and destroy() need the managed-write guard fixture
+Ruled-out: giving listWorktrees a Decision return instead of a throw | five call sites read the array directly and three of them are inside expressions, so a Decision would put the unwrapping at every reader and leave each free to default to empty again
+Ruled-out: letting the :111 cleanup propagate the refusal like the other four | it sits in the catch of the integrity failure, so it would replace the diagnosis the caller needs with a secondary error about the listing
+Warn: the fixture makes git fatal by writing core.repositoryformatversion, so anything that runs git in that repository afterwards also fails -- assert the refusal last, or reset the value first
+Provenance: inherited 6a6b782fb08f8bb2cfb9b6515e8b4dee1c11afc4
+
+Limit: the fake git is on PATH for the whole third case, so it also answers any git the snapshot runs after the refusal -- the assertion is on the refusal's own wording, not on a call count
+Ruled-out: driving the fatal with core.repositoryformatversion as the listing test does | rev-parse --git-common-dir runs first in the same function with no allowFailure, so the run refuses before reaching the line under test and the case would certify nothing
+Warn: assertWorktreeBinding returns immediately when worktreeId is null, which is why 500 tests could pass over an inverted guard -- any new case for this function has to pass a worktreeId or it measures the early return
+Provenance: inherited 70cd183b21cc460932680522bfb7e0cd8428542c
+
+Limit: the case reaches the catch through isClean only, so a refusal from tryRevParse is still covered by the ordinary REPOSITORY_UNREADABLE path and not by this finding
+Ruled-out: stubbing the probe with vi.spyOn as the sibling worktree case does | it measures the catch while leaving unmeasured which real git shapes can reach it, and the reachable set here is one call out of two
+Warn: core.bare makes every later git in that checkout fatal, so a case that needs the repository again afterwards must unset it first
+Provenance: inherited 76a5c3888bad45194c5f895f3380b82b710b764c
