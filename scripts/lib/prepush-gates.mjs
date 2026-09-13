@@ -77,6 +77,13 @@ export const GATES = [
   // probe existed twice, one copy bounded at 5s and one not, under a comment declaring them
   // equivalent. This gate is what makes the next unbounded copy arrive loudly.
   { script: "guards:subprocess-bounds" },
+  // #858 — a timestamp ORDER BY names a tiebreaker, or is named in the backlog. `received_at` is
+  // millisecond ISO text and 400 consecutive clock reads shared one millisecond, so an order over
+  // it alone is partial and SQLite returns ties in whatever the access path yields. Four sites took
+  // the first row as "the oldest" and handed its channel and nonce to a person; which row that was
+  // had been decided by an index choice. They shared one definition of "still outstanding" and a
+  // comment saying so, while the ordering beside it was copied four times.
+  { script: "guards:timestamp-orderings" },
   // #817 — a fixture that writes a program and execs it wedges macOS Gatekeeper: the assessment
   // cache is keyed by inode, so a three-line shell script at a fresh inode costs more than a
   // 100MB signed binary at an existing one. `syspolicyd` wedged this machine twice on 2026-09-09,

@@ -853,6 +853,39 @@ export class IngressGuard {
    *
    * Ordered oldest first: the question this answers is "what is still outstanding", and the
    * oldest outstanding turn is the one that has been unanswered longest.
+   *
+   * **`received_at` is not a total order. `nonce` is the tiebreaker that says so in the SQL.**
+   * Measured 2026-09-13 (#858): `systemClock.nowIso()` — `new Date().toISOString()` in production,
+   * as the note at the top of this file says — returned **one** distinct timestamp across 400
+   * consecutive calls. `received_at` is millisecond ISO text, so every message admitted inside the
+   * same millisecond carries the same string, and a batch of owner messages is exactly the case
+   * that arrives that way. The harness is stricter still: `ManualClock` is fixed, so every row a
+   * test builds shares a timestamp unless the test advances it — a test asserting an order through
+   * `received_at` alone asserts nothing.
+   *
+   * **What `nonce ASC` does not do is change today's answer, and the control said so.** Removing it
+   * again leaves this query returning the same nonce-ordered result, because `PRIMARY KEY (channel,
+   * nonce)` gives a rowid table an implicit index and `WHERE channel = ?` makes it the access path:
+   * the scan already arrives in `(channel, nonce)` order, and a stable sort on an all-equal
+   * `received_at` leaves it there. Measured — three databases holding the same three messages
+   * written in three different orders, rowid orders `m-1,m-2,m-3` / `m-3,m-2,m-1` /
+   * `m-2,m-3,m-1`, and all three answered `m-1,m-2,m-3` with the tiebreaker absent.
+   *
+   * So this is not a bug fix. It is an **undeclared property being declared**: the order was a
+   * consequence of which index the planner picked, and one more predicate or one more index is
+   * enough to change that without changing a line of this method. `nonce` closes it for good
+   * because `(channel, nonce)` is this table's primary key, so within one channel
+   * `(received_at, nonce)` is a total order over every row this query can return — **and only
+   * because this query fixes the channel.** The pair is total within one channel, where `nonce` is
+   * unique; across channels it is not, because two channels may use the same nonce. A caller that
+   * drops the `WHERE channel = ?` needs `(received_at, channel, nonce)`, which is what the two
+   * doctor queries and the v35 migration use, none of which narrow by channel.
+   *
+   * This is the ordering half of #858's contract — *ordering must not rest on `received_at`
+   * alone* — and the precondition for #631's coalescing, where the members of one turn are ordered
+   * by a fixed ordinal rather than by the clock. This query orders *turns*, not the members of
+   * one; `canonical_turn_sources.batch_ordinal` is that other order and already carries
+   * `UNIQUE (turn_request_id, batch_ordinal)`.
    */
   unresolvedTurns(channel: string, sessionDigest: string): readonly UnresolvedTurn[] {
     const rows = this.db.all<{
@@ -868,7 +901,7 @@ export class IngressGuard {
           AND json_extract(turn_claim_json, '$.settledAt') IS NULL
           AND json_extract(turn_claim_json, '$.noReplyAt') IS NULL
           AND json_extract(turn_claim_json, '$.sessionDigest') IS ?
-        ORDER BY received_at ASC`,
+        ORDER BY received_at ASC, nonce ASC`,
       [channel, sessionDigest],
     );
     return rows.map((row) => ({
