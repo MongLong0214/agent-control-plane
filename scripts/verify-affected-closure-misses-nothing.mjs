@@ -57,61 +57,62 @@ if (!Number.isInteger(COMMITS) || COMMITS < 1) {
   process.exit(2);
 }
 
+/**
+ * The harness's own table, bounded. `--print-rows` writes nothing and exits above the first
+ * filesystem write, but it is still a child of a script that mutates source when invoked any other
+ * way, so it gets the same time bound every other child in this repository gets (#872).
+ */
+const runBoundedRows = async () => {
+  const out = execFileSync("node", [join(ROOT, "scripts/verify-guards-are-falsifiable.mjs"), "--print-rows"], {
+    cwd: ROOT,
+    encoding: "utf8",
+    timeout: 120_000,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  return JSON.parse(out);
+};
+
 const git = (argv) => execFileSync("git", argv, { cwd: ROOT, encoding: "utf8", timeout: 30_000 }).trim();
 
+
 /**
- * `definedIn` is derived from the id, and the derivation is checked rather than trusted: the case
- * loader does not report which module a row came from, and the convention is
- * `scripts/falsifiability-cases/<id>.mjs`. A derived path that is not on disk is a refusal, not a
- * silently absent term — without it a change to one case file would fall through to whatever
- * coarser rule catches the directory.
+ * The whole table, from the harness that owns it.
+ *
+ * `loadFalsifiabilityCases` returns only the case directory; the other rows are an inline literal
+ * inside the harness. Reading that literal with a parser would put a second authority on the row
+ * table, and `export` is not available either — the harness is a script, so importing it runs the
+ * sweep, measured as its own dirty-tree refusal. `--print-rows` (#885) is the owner handing it
+ * over: it emits `ALL_ROWS` and exits above every filesystem write.
+ *
+ * Keyed by `partitionKey` rather than `id` because most inline rows carry none, and that key is
+ * the one `assignShards` already refuses duplicates on — so uniqueness here is the uniqueness the
+ * sweep itself requires rather than a property invented for this check.
+ *
+ * `definedIn` is attached only to case-directory rows, derived from the id and checked against
+ * disk. The inline rows have no separate definition file: they are declared inside the harness,
+ * and a change to the harness is global scope, so the term would be redundant and inventing a
+ * path for it would be a second authority of exactly the kind avoided above.
  */
-const rows = (await loadFalsifiabilityCases(ROOT)).map((row) => ({
-  id: row.id,
+const printed = await runBoundedRows();
+const casesById = new Map(
+  (await loadFalsifiabilityCases(ROOT)).map((row) => [row.id, `${CASES_DIR}/${row.id}.mjs`]),
+);
+const rows = printed.rows.map((row) => ({
+  id: row.partitionKey,
   file: row.file,
   killedBy: row.killedBy,
-  definedIn: `${CASES_DIR}/${row.id}.mjs`,
+  ...(row.id !== undefined && casesById.has(row.id) ? { definedIn: casesById.get(row.id) } : {}),
 }));
-const misderived = rows.filter((row) => row.definedIn !== undefined && !existsSync(join(ROOT, row.definedIn)));
+const misderived = [...casesById.values()].filter((path) => !existsSync(join(ROOT, path)));
 if (misderived.length > 0) {
   process.stdout.write(
     `verify-affected-closure-misses-nothing: ${misderived.length} row id(s) do not name a module on disk.\n`,
   );
-  for (const row of misderived.slice(0, 10)) process.stdout.write(`  NO SUCH MODULE  ${row.id} -> ${row.definedIn}\n`);
+  for (const path of misderived.slice(0, 10)) process.stdout.write(`  NO SUCH MODULE  ${path}\n`);
   process.stdout.write("\nRESULT: FAIL — a row whose definition cannot be located cannot be selected by it.\n");
   process.exit(1);
 }
-
-/**
- * **The rows this check cannot enumerate, and why that forbids narrowing today.**
- *
- * The sweep partitions 632 rows; `loadFalsifiabilityCases` returns only the case directory. The
- * rest live in an inline `GUARDS` array inside the harness. A change to the harness is global
- * scope, so those rows are never narrowed *away* by the closure — but they are also never
- * *selected* by it, because they are not in this table at all. A runner built on a table missing
- * 385 rows would skip every one of them on a change to its own file or witness, which is exactly
- * the missed row this unit exists to rule out.
- *
- * **The blocker is not a missing `export`, and I tried that first.** Adding one makes the array
- * reachable and makes this check unusable: the harness is a script, so importing it *runs the
- * sweep* — the attempt ended in its dirty-tree refusal, having started a mutation run. Reading the
- * array out of the file with a parser instead would put a second authority on the row table, which
- * is the shape this whole area keeps failing on.
- *
- * So the real blocker is structural: the table and the runner are the same module, and the table
- * cannot be read without executing the runner. Until the array moves to a module of its own — or
- * the harness stops executing on import — unit 2 cannot cover the whole sweep and no narrowing is
- * permitted. This check refuses rather than passing on 39% of the rows.
- */
-const sweepTotal = Number(
-  /partitioning (\d+) row/.exec(
-    execFileSync("node", [join(ROOT, "scripts/verify-guards-are-falsifiable.mjs"), "--shard-report=1"], {
-      cwd: ROOT,
-      encoding: "utf8",
-      timeout: 120_000,
-    }),
-  )?.[1] ?? "0",
-);
+const sweepTotal = printed.total;
 const files = moduleFilesUnder(ROOT, ["src", "tests", "scripts"]);
 const { imports, undecidable } = buildImportGraph(ROOT, files);
 if (undecidable.length > 0) {
@@ -250,29 +251,33 @@ for (const one of report) {
 }
 for (const one of disagreements) process.stdout.write(`  DISAGREEMENT  ${JSON.stringify(one)}\n`);
 
-if (rows.length !== sweepTotal) {
+// Identity, not cardinality. Every row the harness printed is in this table under its own
+// partition key, and the harness refuses duplicate keys itself, so this is a set equality rather
+// than the count comparison the first version of this file settled for — equal cardinalities
+// could not have excluded one omitted row replaced by another.
+const printedKeys = new Set(printed.rows.map((row) => row.partitionKey));
+if (printedKeys.size !== rows.length || rows.some((row) => !printedKeys.has(row.id))) {
   process.stdout.write(
-    `  NOT ENUMERABLE  ${sweepTotal - rows.length} of ${sweepTotal} row(s) live in the harness's inline ` +
-      "GUARDS array and cannot be listed from outside it.\n" +
-      "                 and this is a count, not an identity reconciliation: equal cardinalities " +
-      "could not exclude one omitted row replaced by another.\n",
+    `  TABLE MISMATCH  the harness printed ${printed.rows.length} row(s) with ${printedKeys.size} ` +
+      `distinct key(s); this check holds ${rows.length}.\n`,
   );
 }
 
-if (disagreements.length > 0 || rows.length !== sweepTotal) {
+const tableMismatch = printedKeys.size !== rows.length || rows.some((row) => !printedKeys.has(row.id));
+if (disagreements.length > 0 || tableMismatch) {
   process.stdout.write(
     disagreements.length > 0
       ? "\nRESULT: FAIL — the forward closure and reverse reachability name different rows, so one " +
         "of them is wrong and a row may be missed.\n"
-      : "\nRESULT: FAIL — the two traversals agree on every row this can enumerate, and that is " +
-        "not the whole table. The harness holds the other rows and runs the sweep when imported, " +
-        "so the table has to move to its own module before this can cover it; until then no " +
-        "narrowing is permitted.\n",
+      : "\nRESULT: FAIL — the table this check holds is not the table the harness printed.\n",
   );
   process.exit(1);
 }
 process.stdout.write(
-  "\nRESULT: PASS — on every set above, the closure selects exactly the rows reverse reachability " +
-    "finds, and selected plus unaffected is the whole table. This is agreement between two " +
-    "traversals, not proof that reachability is the right relation.\n",
+  `\nRESULT: PASS — on every set above, the closure selects exactly the rows reverse reachability ` +
+    `finds, over all ${rows.length} row(s) the harness printed, keyed by the partition key it ` +
+    "refuses duplicates on.\n" +
+    "  What this is: agreement between two traversals of one graph. What it is not: proof that " +
+    "reachability is the right relation, that the graph is complete, or — for a FULL verdict — " +
+    "any comparison at all, since those skip the reverse computation.\n",
 );
