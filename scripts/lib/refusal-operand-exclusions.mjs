@@ -131,7 +131,6 @@ export const FILE_EXCLUSIONS = new Map([
   ["src/runtime/provider.ts", reason],
   ["src/runtime/reviewer-egress.ts", reason],
   ["src/runtime/scripted-adapter.ts", reason],
-  ["src/session/session-registry.ts", reason],
   ["src/snapshot/candidate-snapshot.ts", reason],
   ["src/tools/traceability.ts", reason],
   ["src/verify/sandbox.ts", reason],
