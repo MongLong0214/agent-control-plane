@@ -1,0 +1,5 @@
+Limit: only the version is compared: C0_QUALIFIED_CLIENT carries a name and a version while the deployment pin carries a version, a realpath and a digest, so agreement can only mean the two name the same build and never that they were qualified on the same bytes
+Ruled-out: refusing startup on disagreement, beside the activation group's own partial-configuration throw | it is the closer analogue but would take a running deployment down the moment it is installed, and that call is the owner's
+Warn: the failure this reports is asymmetric in the worst direction -- a claim on the stale side succeeds and produces ACTIVE 1 with a live pid, and the absence only appears when a wake is attempted, so ACTIVE is not evidence the end state holds
+Record-Id: r-1a1b627bef70
+Provenance: inherited 5aa84a28c2b2827134ecc4d05182fef35b19d6ab
