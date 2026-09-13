@@ -13,6 +13,7 @@ import type { AttachmentCredential, RoleAttachmentCredentials } from "../session
 
 import { ControlPlane, defaultConfig, type ControlPlaneConfig } from "../app/control-plane.ts";
 import { COLLECTOR_TIMEOUT_MS } from "../capacity/usage-collectors.ts";
+import { REPOSITORY_SWEEP_BUDGET_MS } from "../doctor/doctor.ts";
 import {
   DEFAULT_RUNTIME_TIMEOUT_MS as HERMES_RUNTIME_TIMEOUT_MS,
   createHermesBootstrapAuthority,
@@ -154,12 +155,22 @@ const PROVIDER_BUDGET_SLOTS = 3;
  * is #609 again in a different dress. So the doctor's budget is derived from the collector budget
  * rather than picked, and grows when that grows.
  *
+ * **Derived from every sequential cost in the pass, not only the collectors.** That sentence was
+ * once true about collectors and incomplete about the pass: `checkRepositories` probes each
+ * registered repository with two git calls, and until #877 those inherited `git()`'s blanket 120s,
+ * so one slow checkout after slow collectors expired this budget and discarded the partial report
+ * the doctor had just been taught to preserve. `REPOSITORY_SWEEP_BUDGET_MS` is that sweep's own
+ * deadline, and it is a term here so the derivation covers what the pass actually spends.
+ *
  * `bootstrap.hermes` gets more than the runtime budget it waits on, for the same reason the
  * client budget exceeds the server's: two equal deadlines racing is how one healthy daemon
  * reported two different reason codes for one failure.
  */
 export const OPERATOR_METHOD_BUDGET_MS: Readonly<Record<string, number>> = {
-  "doctor.run": PROVIDER_BUDGET_SLOTS * COLLECTOR_TIMEOUT_MS + DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS,
+  "doctor.run":
+    PROVIDER_BUDGET_SLOTS * COLLECTOR_TIMEOUT_MS
+    + REPOSITORY_SWEEP_BUDGET_MS
+    + DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS,
   "bootstrap.hermes": HERMES_RUNTIME_TIMEOUT_MS + DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS,
 };
 

@@ -593,8 +593,14 @@ export const dispatch = async (
  * or as having lost its lock — neither of which was true (#609). Writing the client's number by
  * hand puts that race one edit away from returning; a test asserts the inequality as well,
  * because a derivation can still be edited into equality.
+ *
+ * 200s = the widest method budget (185s: 3 x 45s collectors + 20s repository sweep + 30s) plus the
+ * same 15s of headroom the previous 180s carried over the previous 165s. It was raised because
+ * #877 added the sweep term to that budget, and `operator-socket.test.ts` refused the commit that
+ * added it -- which is the mechanism this docblock describes doing its job rather than a number
+ * that drifted. Anything that widens a method budget has to come back through here.
  */
-export const DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS = 180_000;
+export const DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS = 200_000;
 
 /**
  * The wire framing every local socket client in this file shares: write one JSON line, read one
