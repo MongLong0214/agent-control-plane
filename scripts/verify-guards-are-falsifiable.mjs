@@ -4907,10 +4907,60 @@ if (shardArgument !== undefined && only !== undefined) {
       " the union of every shard would quietly be a subset. Use one or the other.",
   );
 }
+/**
+ * `--select-keys=<file>`: run only the rows whose partition key is listed, one per line.
+ *
+ * #885. A pull request spends 7,423 macOS slot-seconds and 6,100 of them re-run every row; queue
+ * time is slot-seconds divided by slots, so running fewer rows per pull request is the only lever
+ * on that 82%. It is also a reduction in what a pull request proves, which is why the selection is
+ * computed by `scripts/run-affected-falsifiability.mjs` from a declared relation rather than here,
+ * and why `main` keeps sweeping everything — that full sweep is additional defence, never a
+ * substitute for what a pull request missed.
+ *
+ * **Keys, not ids.** Selecting by `id` was ruled out rather than merely avoided: 378 of the 385
+ * inline rows carry no `id`, so an id-keyed selection would name
+ * a handful of rows and silently drop the rest. `partitionKeyFor` is content-derived and
+ * `assignShards` already refuses duplicates on it.
+ *
+ * **A key that matches no row is refused, not ignored.** A selection that quietly shrinks is the
+ * failure this whole area is about: the run would be green, faster, and about a different set than
+ * the one the caller computed.
+ *
+ * **It composes with `--shard`, and `--only` deliberately does not.** The refusal below says why
+ * `--only` cannot be sharded — "the union of every shard would quietly be a subset" — and that is
+ * exactly right for a filter a human typed to look at one row. Here the subset *is* the intended
+ * scope, it was computed and reconciled before the run, and the four shards must union to it. So
+ * the union being a subset of the whole table is the declared behaviour rather than an accident,
+ * and `--shard-report` still proves the partition over whatever set is selected.
+ */
+const selectKeysArgument = process.argv.find((a) => a.startsWith("--select-keys="))?.slice("--select-keys=".length);
+let selectedKeys = null;
+if (selectKeysArgument !== undefined) {
+  if (only !== undefined) {
+    refuseSelection("--select-keys and --only both narrow the table; use one or the other.");
+  }
+  let listed;
+  try {
+    listed = readFileSync(selectKeysArgument, "utf8");
+  } catch (error) {
+    refuseSelection(`--select-keys=${selectKeysArgument} could not be read: ${(error && error.message) || error}`);
+  }
+  selectedKeys = new Set(listed.split("\n").map((line) => line.trim()).filter((line) => line.length > 0));
+  const known = new Set(ALL_ROWS.map((guard) => partitionKeyFor(guard)));
+  const unmatched = [...selectedKeys].filter((key) => !known.has(key));
+  if (unmatched.length > 0) {
+    out(`verify-guards-are-falsifiable: ${unmatched.length} selected key(s) name no row in this table.`);
+    for (const key of unmatched.slice(0, 5)) out(`  NO SUCH ROW  ${key}`);
+    out("\nRESULT: FAIL — a selection that silently shrinks is a smaller sweep reported as the one asked for.");
+    process.exit(1);
+  }
+}
+
 const shard = shardArgument === undefined ? null : parseShard(shardArgument);
 const shardAssignment = shard === null ? null : assignShards(ALL_ROWS, shard.total);
 
 const rows = ALL_ROWS.filter((g) => !g.skip)
+  .filter((g) => selectedKeys === null || selectedKeys.has(partitionKeyFor(g)))
   .filter((g) => !only || g.what.includes(only) || g.file.includes(only) || (g.id ?? "").includes(only))
   .filter((g) => shardAssignment === null || shardAssignment.get(g) === shard.index);
 
@@ -5029,14 +5079,23 @@ if (shardReport !== undefined) {
     refuseSelection(`--shard-report=${shardReport} is not a shard count of 1 or more.`);
   }
   const total = Number(shardReport);
-  const assignment = assignShards(ALL_ROWS, total);
-  const runnable = ALL_ROWS.filter((g) => !g.skip);
-  out(`verify-guards-are-falsifiable: partitioning ${ALL_ROWS.length} row(s) into ${total} shard(s)`);
+  // The table the sweep would actually run, not the whole one. With `--select-keys` the run is
+  // narrowed before sharding, so a partition proof over `ALL_ROWS` would be a proof about a
+  // different set than the one four jobs are about to split — the shape this report exists to
+  // refuse, one level up. Measured while writing this: without the line below, `--select-keys`
+  // naming two rows still reported 641 partitioned into four.
+  const table = selectedKeys === null ? ALL_ROWS : ALL_ROWS.filter((g) => selectedKeys.has(partitionKeyFor(g)));
+  const assignment = assignShards(table, total);
+  const runnable = table.filter((g) => !g.skip);
+  out(
+    `verify-guards-are-falsifiable: partitioning ${table.length} row(s) into ${total} shard(s)` +
+      (selectedKeys === null ? "" : ` (selected from ${ALL_ROWS.length})`),
+  );
   const claimedBy = new Map();
   const empty = [];
   let runnableAcrossShards = 0;
   for (let index = 1; index <= total; index++) {
-    const mine = ALL_ROWS.filter((g) => assignment.get(g) === index);
+    const mine = table.filter((g) => assignment.get(g) === index);
     for (const guard of mine) claimedBy.set(guard, (claimedBy.get(guard) ?? 0) + 1);
     const mineRunnable = mine.filter((g) => !g.skip).length;
     runnableAcrossShards += mineRunnable;
@@ -5044,9 +5103,9 @@ if (shardReport !== undefined) {
     out(`  shard ${index}/${total}: ${mine.length} row(s), ${mineRunnable} of them runnable`);
   }
   const overlapping = [...claimedBy.values()].filter((count) => count > 1).length;
-  const unassigned = ALL_ROWS.length - claimedBy.size;
+  const unassigned = table.length - claimedBy.size;
   out(
-    `  union ${claimedBy.size} of ${ALL_ROWS.length} row(s); ${overlapping} row(s) in more than one` +
+    `  union ${claimedBy.size} of ${table.length} row(s); ${overlapping} row(s) in more than one` +
       ` shard; ${unassigned} row(s) in none`,
   );
   out(`  ${runnableAcrossShards} runnable row(s) across the shards; the unsharded run has ${runnable.length}`);
@@ -5059,7 +5118,16 @@ if (shardReport !== undefined) {
   // A shard with nothing in it is the zero-row PASS arriving through the matrix instead of
   // through `--only=`: the job would refuse at run time, and this says so before the runner is
   // spent on it.
-  if (empty.length > 0) broken.push(`shard(s) ${empty.join(", ")} would select no runnable row`);
+  //
+  // Not under `--select-keys`, and the exception is narrow. There the selection is the declared
+  // scope, and a pull request touching one file legitimately selects fewer rows than there are
+  // shards — measured: two keys against four shards left shards 3 and 4 empty and this reported
+  // the partition broken. What the rule was guarding against is a *mistyped range* silently
+  // running nothing; with a selection, the key list was already checked row by row above and a key
+  // naming no row is refused there, so the thing this line watches for cannot arrive that way.
+  if (empty.length > 0 && selectedKeys === null) {
+    broken.push(`shard(s) ${empty.join(", ")} would select no runnable row`);
+  }
   if (broken.length > 0) {
     out("");
     for (const reason of broken) out(`  ${reason}`);
