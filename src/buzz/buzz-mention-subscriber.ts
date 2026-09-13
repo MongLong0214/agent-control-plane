@@ -706,10 +706,16 @@ type BuzzMentionRejection =
   /**
    * Handling the frame threw rather than answering it. Behaviourally the `RETRY` shape — nothing
    * was established, the cursor stays, the socket goes — but a different cause, and the one an
-   * operator has to tell apart: a handler that throws on every event leaves the subscriber
-   * looking *silent*, which is what `BUZZ_MENTION_SUBSCRIBER_SILENT` fires on. Counted separately
-   * from `admission-retry-pending` so "the role's peer is down" and "handling is failing" are not
-   * one number.
+   * operator has to tell apart. Counted separately from `admission-retry-pending` so "the role's
+   * peer is down" and "handling is failing" are not one number.
+   *
+   * **This bucket is now read, and the sentence that used to be here was stale.** It said a
+   * handler throwing on every event "leaves the subscriber looking *silent*, which is what
+   * `BUZZ_MENTION_SUBSCRIBER_SILENT` fires on". That stopped being true the moment #870 counted
+   * the frame: `framesHandled > 0` suppresses the silent finding, so the state had no finding at
+   * all until `BUZZ_MENTION_SUBSCRIBER_HANDLING_FAILING` (`src/daemon/daemon.ts`) was given this
+   * count to read. A comment describing the diagnosis a bucket produces goes stale when the
+   * diagnosis moves, and this one outlived its own repair by two merges.
    *
    * **Named for what the catch can establish, which is not the sink.** It was `seam-threw` until a
    * merge-gate review named three other throws the same catch collects: `finalizeEvent` in
