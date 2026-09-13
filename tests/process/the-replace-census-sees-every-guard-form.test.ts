@@ -1,8 +1,8 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { execFileSync, spawnSync } from "node:child_process";
 import { copyFileSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { runBoundedChild } from "../helpers/bounded-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -23,26 +23,52 @@ const ROOT = process.cwd();
 const SCRIPT = "scripts/verify-append-only-tables-are-closed.mjs";
 const REGISTRY = "scripts/verify-every-trigger-is-required.mjs";
 
+/**
+ * Every child this file starts goes through `runBoundedChild` (#872), which bounds the child *and*
+ * reaps its process group. The group half is not decoration: `spawnSync`'s own timeout reaps the
+ * direct child only, measured at `grandchildStillAlive: true` against a two-generation hang, so a
+ * bound without it returns on time and leaves the wedge for the next test.
+ *
+ * Generous on purpose: the clone copies this repository and each `node` start pays whatever
+ * Gatekeeper charges for a script at a new inode, measured in whole seconds on a loaded host. The
+ * bound is not a performance assertion — it is the difference between a wedged child failing this
+ * file and a wedged child stopping the worker, which vitest then reports against whichever test
+ * that worker happened to be holding.
+ */
+const CHILD_BUDGET_MS = 120_000;
+
 /** A throwaway clone carrying the working-tree census, so this measures the script being edited. */
-const scratchRepo = (): string => {
+const scratchRepo = async (): Promise<string> => {
   const dir = join(tempDir("acp-census-"), "repo");
-  execFileSync("git", ["clone", "--quiet", "--no-hardlinks", "--depth", "1", ROOT, dir]);
+  const cloned = await runBoundedChild(
+    "git",
+    ["clone", "--quiet", "--no-hardlinks", "--depth", "1", ROOT, dir],
+    { budgetMs: CHILD_BUDGET_MS },
+  );
+  // A clone that failed is not a census verdict either, and its stderr is the only thing that says
+  // why — an unchecked non-zero here would surface later as a missing file.
+  if (cloned.status !== 0) {
+    throw new Error(`the scratch clone exited ${cloned.status}: ${cloned.stderr.trim()}`);
+  }
   copyFileSync(join(ROOT, SCRIPT), join(dir, SCRIPT));
   copyFileSync(join(ROOT, "src/db/schema.sql"), join(dir, "src/db/schema.sql"));
   return dir;
 };
 
-const censusOn = (schema: string): { status: number | null; stdout: string } => {
-  const repo = scratchRepo();
+/** The one place a census child is started, so the bound cannot be omitted at a call site. */
+const runIn = (repo: string, script: string): Promise<{ status: number; stdout: string }> =>
+  runBoundedChild(process.execPath, [script], { cwd: repo, budgetMs: CHILD_BUDGET_MS });
+
+const censusOn = async (schema: string): Promise<{ status: number; stdout: string }> => {
+  const repo = await scratchRepo();
   writeFileSync(join(repo, "src/db/schema.sql"), schema);
-  const done = spawnSync("node", [SCRIPT], { cwd: repo, encoding: "utf8" });
-  return { status: done.status, stdout: done.stdout };
+  return runIn(repo, SCRIPT);
 };
 
 const CURRENT = () => readFileSync(join(ROOT, "src/db/schema.sql"), "utf8");
 
 describe("the REPLACE census reports a table guarded in the form it could not see", () => {
-  it("fails on a table whose only guard is BEFORE UPDATE OF a column", () => {
+  it("fails on a table whose only guard is BEFORE UPDATE OF a column", async () => {
     const injected = `${CURRENT()}
 CREATE TABLE IF NOT EXISTS census_probe_table (
   probe_id TEXT PRIMARY KEY,
@@ -55,13 +81,13 @@ BEGIN
   SELECT RAISE(ABORT, 'CENSUS_PROBE_IMMUTABLE');
 END;
 `;
-    const done = censusOn(injected);
+    const done = await censusOn(injected);
 
     expect(done.stdout).toContain("census_probe_table");
     expect(done.status).toBe(1);
   });
 
-  it("is not satisfied by an INSERT trigger that is a validator rather than a REPLACE guard", () => {
+  it("is not satisfied by an INSERT trigger that is a validator rather than a REPLACE guard", async () => {
     // The first version skipped any table carrying any BEFORE INSERT trigger, which exempted two
     // tables for holding shape validators — triggers that say nothing about a key already present.
     const injected = `${CURRENT()}
@@ -83,14 +109,14 @@ BEGIN
   SELECT RAISE(ABORT, 'CENSUS_PROBE_SECRET_REQUIRED');
 END;
 `;
-    const done = censusOn(injected);
+    const done = await censusOn(injected);
 
     expect(done.stdout).toContain("census_probe_table");
     expect(done.status).toBe(1);
   });
 
-  it("passes on the schema as it stands, so the two failures above are about the probe", () => {
-    const done = censusOn(CURRENT());
+  it("passes on the schema as it stands, so the two failures above are about the probe", async () => {
+    const done = await censusOn(CURRENT());
 
     expect(done.stdout).toContain("RESULT: PASS");
     expect(done.status).toBe(0);
@@ -98,7 +124,7 @@ END;
 });
 
 describe("a no_replace trigger has to name what a REPLACE would collide on", () => {
-  it("fails on a guard that names none of its table's keys", () => {
+  it("fails on a guard that names none of its table's keys", async () => {
     // The guard exists, is named correctly, and refuses nothing. Its presence used to be all the
     // census asked for — a check satisfied by a name.
     const injected = `${CURRENT()}
@@ -119,13 +145,13 @@ BEGIN
   SELECT RAISE(ABORT, 'CENSUS_PROBE_NO_REPLACE');
 END;
 `;
-    const done = censusOn(injected);
+    const done = await censusOn(injected);
 
     expect(done.stdout).toContain("census_probe_table");
     expect(done.status).toBe(1);
   });
 
-  it("fails on a guard that names only part of a composite key", () => {
+  it("fails on a guard that names only part of a composite key", async () => {
     // Naming less than the key refuses legitimate inserts — measured once, on a registry whose
     // rotation this shape blocked — and naming a key that is not the whole one lets the collision
     // it was written for through.
@@ -149,7 +175,7 @@ BEGIN
   SELECT RAISE(ABORT, 'CENSUS_PROBE_NO_REPLACE');
 END;
 `;
-    const done = censusOn(injected);
+    const done = await censusOn(injected);
 
     expect(done.stdout).toContain("census_probe_table");
     expect(done.status).toBe(1);
@@ -157,7 +183,7 @@ END;
 });
 
 describe("a partial unique index is a key the census demands too", () => {
-  it("fails on a guard that ignores a partial index's predicate", () => {
+  it("fails on a guard that ignores a partial index's predicate", async () => {
     // Dropping partial indexes from the rule leaves a real hole: measured, a REPLACE colliding
     // inside `WHERE state = 'ACTIVE'` deleted the existing row and said nothing. Keeping the
     // columns without the predicate refuses legitimate inserts instead — fifty-seven of them.
@@ -185,7 +211,7 @@ BEGIN
   SELECT RAISE(ABORT, 'CENSUS_PROBE_NO_REPLACE');
 END;
 `;
-    const done = censusOn(injected);
+    const done = await censusOn(injected);
 
     expect(done.stdout).toContain("census_probe_table");
     expect(done.stdout).toContain("where state = 'ACTIVE'");
@@ -194,7 +220,7 @@ END;
 });
 
 describe("a trigger the schema declares is watched by a required registry", () => {
-  it("fails on a trigger no registry names", () => {
+  it("fails on a trigger no registry names", async () => {
     // `assertLoadBearingInvariants` refuses to open a database missing any trigger in those
     // registries. One that is declared and named by none is created on a fresh install and never
     // checked again: drop it from a live database and nothing notices.
@@ -205,19 +231,19 @@ BEGIN
   SELECT RAISE(ABORT, 'PROBE_UNWATCHED');
 END;
 `;
-    const repo = scratchRepo();
+    const repo = await scratchRepo();
     writeFileSync(join(repo, "src/db/schema.sql"), injected);
     copyFileSync(join(ROOT, REGISTRY), join(repo, REGISTRY));
-    const done = spawnSync("node", [REGISTRY], { cwd: repo, encoding: "utf8" });
+    const done = await runIn(repo, REGISTRY);
 
     expect(done.stdout).toContain("probe_unwatched");
     expect(done.status).toBe(1);
   });
 
-  it("passes on the schema as it stands", () => {
-    const repo = scratchRepo();
+  it("passes on the schema as it stands", async () => {
+    const repo = await scratchRepo();
     copyFileSync(join(ROOT, REGISTRY), join(repo, REGISTRY));
-    const done = spawnSync("node", [REGISTRY], { cwd: repo, encoding: "utf8" });
+    const done = await runIn(repo, REGISTRY);
 
     expect(done.stdout).toContain("RESULT: PASS");
     expect(done.status).toBe(0);
@@ -225,12 +251,12 @@ END;
 });
 
 describe("a registry entry names a version that installs it", () => {
-  it("fails when an entry is required from a version whose migration does not install it", () => {
+  it("fails when an entry is required from a version whose migration does not install it", async () => {
     // `assertLoadBearingInvariants` skips an entry whose `introducedIn` exceeds the database's
     // version. Claim too high and the trigger is never required where it exists; claim too low and
     // an older database is refused for missing something its version never installed. Neither is
     // an absent trigger, which is all the other check can see.
-    const repo = scratchRepo();
+    const repo = await scratchRepo();
     copyFileSync(join(ROOT, REGISTRY), join(repo, REGISTRY));
     const migrations = join(repo, "src/db/migrations.ts");
     writeFileSync(
@@ -238,7 +264,7 @@ describe("a registry entry names a version that installs it", () => {
       readFileSync(join(ROOT, "src/db/migrations.ts"), "utf8").replace('  "sessions_no_replace",\n', ""),
     );
 
-    const done = spawnSync("node", [REGISTRY], { cwd: repo, encoding: "utf8" });
+    const done = await runIn(repo, REGISTRY);
 
     expect(done.stdout).toContain("sessions_no_replace");
     expect(done.status).toBe(1);
@@ -258,22 +284,22 @@ BEGIN
 END;
 `;
 
-  it("is seen by the REPLACE census", () => {
+  it("is seen by the REPLACE census", async () => {
     // Every trigger in this schema is written with `IF NOT EXISTS` today, and both patterns
     // required it — so a trigger added without it was invisible to two gates at once while both
     // printed PASS. Third time on this branch a pattern has been narrower than what it enumerates.
-    const done = censusOn(withoutIfNotExists());
+    const done = await censusOn(withoutIfNotExists());
 
     expect(done.stdout).toContain("census_probe_table");
     expect(done.status).toBe(1);
   });
 
-  it("is seen by the required-registry check", () => {
-    const repo = scratchRepo();
+  it("is seen by the required-registry check", async () => {
+    const repo = await scratchRepo();
     copyFileSync(join(ROOT, REGISTRY), join(repo, REGISTRY));
     writeFileSync(join(repo, "src/db/schema.sql"), withoutIfNotExists());
 
-    const done = spawnSync("node", [REGISTRY], { cwd: repo, encoding: "utf8" });
+    const done = await runIn(repo, REGISTRY);
 
     expect(done.stdout).toContain("census_probe_immutable");
     expect(done.status).toBe(1);
@@ -281,11 +307,11 @@ END;
 });
 
 describe("a registry entry wrapped across lines is the same entry", () => {
-  it("is recognised, rather than reported as a trigger no registry names", () => {
+  it("is recognised, rather than reported as a trigger no registry names", async () => {
     // The pattern required one line. Re-formatting an entry made the gate say the trigger was
     // "named by no required registry" — a true failure with a false reason, and the reason is what
     // whoever reads it acts on: they would add a duplicate entry for something already there.
-    const repo = scratchRepo();
+    const repo = await scratchRepo();
     copyFileSync(join(ROOT, REGISTRY), join(repo, REGISTRY));
     const migrations = join(repo, "src/db/migrations.ts");
     writeFileSync(
@@ -296,7 +322,7 @@ describe("a registry entry wrapped across lines is the same entry", () => {
       ),
     );
 
-    const done = spawnSync("node", [REGISTRY], { cwd: repo, encoding: "utf8" });
+    const done = await runIn(repo, REGISTRY);
 
     expect(done.stdout).toContain("RESULT: PASS");
     expect(done.status).toBe(0);
@@ -304,7 +330,7 @@ describe("a registry entry wrapped across lines is the same entry", () => {
 });
 
 describe("a UNIQUE declared on the column is a key too", () => {
-  it("fails on a guard that ignores an inline UNIQUE", () => {
+  it("fails on a guard that ignores an inline UNIQUE", async () => {
     // Only the parenthesised `UNIQUE (...)` form was read. `github_receipts.idempotency_key` is
     // written `idempotency_key TEXT NOT NULL UNIQUE`, and its guard checked `receipt_id` alone —
     // so a REPLACE on a different receipt id carrying the same idempotency key deleted the row
@@ -328,7 +354,7 @@ BEGIN
   SELECT RAISE(ABORT, 'CENSUS_PROBE_NO_REPLACE');
 END;
 `;
-    const done = censusOn(injected);
+    const done = await censusOn(injected);
 
     expect(done.stdout).toContain("ticket");
     expect(done.status).toBe(1);
