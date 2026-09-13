@@ -8,29 +8,47 @@
  * `gh issue list --limit 300` returned no such issue — the sentence pointed at nothing, for every
  * one of these files. #833 is that unit now, and the reason says so rather than implying it.
  *
- * It also carries the size, because the size is the decision. Measured at this commit: these 87
- * files hold **3,479** `&&`/`||` operands, against 443 in the selected files.
- * Lifting the list wholesale would grow the census roughly ninefold and require a falsifiability
- * row or an UNANSWERED reason for each of those 3,479 — which is this same boilerplate
- * multiplied, not its repair. So the list is worked down per file, and a reader deciding how to do
- * that should see 3,479 rather than derive it.
+ * The size is the decision — lifting the list wholesale would grow the census by an order of
+ * magnitude and require a falsifiability row or an UNANSWERED reason for every operand in it,
+ * which is this same boilerplate multiplied rather than its repair. So the list is worked down
+ * per file, and a reader deciding how to do that needs the number.
  *
- * Re-derive it rather than trusting it, because a number in prose is exactly what goes stale
- * here — this line said 89/3,489, then 88, then 87, as `src/core/peercred.ts` and
- * `src/registry/conversational-actor-registry.ts` each left the list:
+ * **The number is not written here.** It was, three times, and each time it went stale: the line
+ * said eighty-nine, then eighty-eight, then eighty-seven as files left the list, and three
+ * branches that each decremented it from their own base made the rebase conflict on the literal
+ * instead of on any logic. Resolving one of those by adding the decrements is precisely the
+ * staleness the line itself warned about.
  *
- *     emptying this Map and running `pnpm guards:operands` reports the repository total
- *     (3,922 at this commit); the census's own PASS line reports what it currently sees
- *     (443).
- *     The difference is this list.
+ * Spelled out, not written as digits, and that is not style. The guard forbids *today's count*
+ * rather than any number, so a historical figure sitting here as a numeral goes red the day the
+ * live count drifts onto it -- a merge-gate review measured `87` here and `89` in the sibling
+ * header as already matchable, and `excluded` walks toward them as #833 is worked down. The
+ * collision is in the prose, not in the predicate, so the prose is what changes.
+ *
+ *     pnpm guards:operands
+ *     CENSUS: … excluded N deciding file(s) holding M unanswered operand(s)
+ *
+ * The census counts this Map every run, so the number cannot disagree with the list. It prints all
+ * three numbers in that one line -- selected, excluded, and the repository total -- so the size of
+ * this list is the total minus the selected count and needs no second run.
+ *
+ * An earlier version of this paragraph said to empty the Map and run it again for the total. That
+ * instruction outlived the line above it and became worse than unnecessary: with the Map emptied
+ * every excused operand becomes an unanswered one, so the census refuses and exits non-zero.
+ * Following it produces a red gate and no total at all.
+ *
+ * No figure appears in this paragraph, and that is the rule rather than an accident: the guard in
+ * tests/unit/the-census-prints-its-own-counts.test.ts refuses a header that restates any count the
+ * census derives. It caught the first draft of these very sentences, which quoted the refusal's
+ * numbers.
  *
  * One shared sentence is correct here and is not the defect #833 names: the reason genuinely is
- * one reason. Inventing 86 different sentences for 86 files whose backlog has one cause would be
- * boilerplate wearing a disguise. What was wrong was that the sentence was false.
+ * one reason. Inventing a different sentence per file, for files whose backlog has one cause,
+ * would be boilerplate wearing a disguise. What was wrong was that the sentence was false.
  */
 const reason =
   "pre-existing operands not yet answered; entered the census when selection became derived; " +
-  "tracked as #833, which measured 3,479 operands across these 86 files";
+  "tracked as #833; `pnpm guards:operands` prints how many operands this list still covers";
 
 export const FILE_EXCLUSIONS = new Map([
   ["src/acceptance/disposable-realm-driver.ts", reason],
