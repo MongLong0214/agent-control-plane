@@ -1,0 +1,5 @@
+Limit: the enforcement covers the replay case's command only; another case in this file that spawns a runtime and parses its result would need the same three lines, and nothing here derives that
+Ruled-out: keeping the standalone case as the enforcement site | a guard that builds its own subject cannot see a re-pointing of the call site, which is the evasion that was reproduced twice
+Ruled-out: asserting on the argv by a fixed index | targetSelectors is spread in and its length varies, so the index moved and read a selector instead of the script -- measured, argv[6] was --hermes-home
+Warn: `342697a`'s Ruled-out line about run-time assertion is wrong and is corrected here -- observing the spawn and binding to the passed value are different things, and reading them as one cost a review round
+Provenance: inherited b6a33d86a78c93df7942517612c185b64f3956d6
