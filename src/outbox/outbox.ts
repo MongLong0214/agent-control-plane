@@ -431,7 +431,7 @@ export class Outbox {
             -- never judged retryable, so it is not picked up.
             AND (o.attempts = 0 OR o.retry_eligible = 1)
             AND ${liveDeliveryTarget("o")}
-          ORDER BY o.created_at, o.message_id
+          ORDER BY o.created_at, o.idempotency_key
           LIMIT ?`,
         [now, now, limit],
       );
@@ -524,8 +524,17 @@ export class Outbox {
       // given neither payload until it settles the first.
       if (unresolved.length > 0) return { claimed: [], unresolved, hasMore: queued > 0 };
 
-      // `ORDER BY o.created_at, o.message_id` — the tiebreaker is load-bearing here and this is
-      // the site where saying so matters most (#858).
+      // ORDER BY o.created_at, o.idempotency_key — the tiebreaker is load-bearing here and this
+      // is the site where saying so matters most (#858).
+      //
+      // `idempotency_key` and not `message_id`, which the other eleven orderings use. Both are
+      // arbitrary strings, so neither gives arrival order; the difference is that the schema
+      // guarantees this one. `message_id TEXT PRIMARY KEY` carries no NOT NULL, and SQLite
+      // permits NULL in a non-INTEGER primary key — measured, two NULL-id rows insert and the
+      // composite ties again. `idempotency_key` is `TEXT NOT NULL` with a full UNIQUE index
+      // (`outbox_idempotency`), so the pair is total without a migration. The eleven `.all()`
+      // orderings keep `message_id`: they return complete sets, where a tie reorders a list and
+      // omits nothing. These two are the only sites where a tie changes *which row* is chosen.
       //
       // `created_at` is millisecond ISO text, and 400 consecutive `systemClock.nowIso()` calls
       // were measured returning one distinct timestamp. This query is `LIMIT 1`: it decides which
@@ -545,7 +554,7 @@ export class Outbox {
             AND o.status = 'PENDING'
             AND o.role_key = ? AND o.binding_generation = ? AND o.target_session_id = ?
             AND ${exactHolderTarget("o")}
-          ORDER BY o.created_at, o.message_id
+          ORDER BY o.created_at, o.idempotency_key
           LIMIT 1`,
         tuple,
       );
