@@ -1,0 +1,6 @@
+Limit: the throw bucket is compared against the frames that produced a verdict, not against framesHandled: a real connection always carries AUTH/OK/EOSE/NOTICE frames that produce none, and a denominator including them could never reach equality on a real connection
+Limit: the equality is cumulative since process start, so a restart during a persistent handling failure restarts the evidence -- the same per-process limit #811 recorded, reached here without adding state
+Ruled-out: a consecutive-run counter in the shape of #noteRoleNotHeld | it needs its own per-process state and records the same restart limit, while the counters' documented identity already gives a condition one non-throw verdict breaks permanently
+Warn: the frame-handler-threw docblock claimed this state fires BUZZ_MENTION_SUBSCRIBER_SILENT; that stopped being true when #870 counted the frame, and a comment describing the diagnosis a bucket produces goes stale when the diagnosis moves
+Record-Id: r-61d85f478f38
+Provenance: inherited 75dc95b7d7009063e877f867c4554c1a697ee681
