@@ -12,12 +12,20 @@
  * mutation breaks that sum, and the script refuses rather than printing a report nobody can
  * check.
  *
- * Killed by the reconciliation case, which runs the census and reads its CENSUS line, and the
- * kill is the *test's assertion* — `selected + excluded` against the whole, read off a
- * successfully printed line. An earlier version of this docstring credited the product's refusal
- * instead, and a merge-gate review showed that is not the mechanism: with the refusal block
- * deleted, this mutation is still killed by that assertion. Claiming otherwise is the unearned
- * attribution `splitKilledBy` in `verify-guards-are-falsifiable.mjs` exists to find.
+ * Both halves of the attribution, in order, because this sentence has now been wrong in each
+ * direction once and a third review had to measure it:
+ *
+ *   at HEAD          the census **refuses** and exits 1, `execFileSync` throws, and the named
+ *                    case fails before any assertion runs. The kill is the product's refusal,
+ *                    shared with `the-reconciliation-refusal-is-witnessed`. There is no
+ *                    successfully printed CENSUS line to read.
+ *   refusal deleted  the census prints `… excluded 86 … holding 1 unanswered operand(s), 3922 in
+ *                    total` and this case's own sum assertion fails: `expected 444 to be 3922`.
+ *
+ * So the row is independently earned -- it does not depend on the refusal existing -- and at the
+ * configuration that actually ships, the refusal is what kills it. Stating only the second is the
+ * unearned attribution `splitKilledBy` in `verify-guards-are-falsifiable.mjs` exists to find;
+ * stating only the first hides that the row stands without it.
  *
  * The refusal has its own row now — `the-reconciliation-refusal-is-witnessed` — because nothing
  * here reaches it. `selected` and `excluded` are complementary filters over one `candidates`

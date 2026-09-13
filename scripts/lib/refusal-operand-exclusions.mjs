@@ -14,9 +14,16 @@
  * per file, and a reader deciding how to do that needs the number.
  *
  * **The number is not written here.** It was, three times, and each time it went stale: the line
- * said 89, then 88, then 87 as files left the list, and three branches that each decremented it
- * from their own base made the rebase conflict on the literal instead of on any logic. Resolving
- * one of those by adding the decrements is precisely the staleness the line itself warned about.
+ * said eighty-nine, then eighty-eight, then eighty-seven as files left the list, and three
+ * branches that each decremented it from their own base made the rebase conflict on the literal
+ * instead of on any logic. Resolving one of those by adding the decrements is precisely the
+ * staleness the line itself warned about.
+ *
+ * Spelled out, not written as digits, and that is not style. The guard forbids *today's count*
+ * rather than any number, so a historical figure sitting here as a numeral goes red the day the
+ * live count drifts onto it -- a merge-gate review measured `87` here and `89` in the sibling
+ * header as already matchable, and `excluded` walks toward them as #833 is worked down. The
+ * collision is in the prose, not in the predicate, so the prose is what changes.
  *
  *     pnpm guards:operands
  *     CENSUS: … excluded N deciding file(s) holding M unanswered operand(s)

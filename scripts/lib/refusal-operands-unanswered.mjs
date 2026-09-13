@@ -4,8 +4,10 @@
  * These are answers owed, not claims of unkillability or completed coverage. Each reason states
  * the missing independent witness or the neighbouring invariant that masks removal.
  * The file-exclusion backlog lives separately in refusal-operand-exclusions.mjs. Its size used
- * to be restated here and went stale every time a file left that list — 89, then 88, then 87,
- * each step landing in whichever of the two files the branch happened to touch. `pnpm
+ * to be restated here and went stale every time a file left that list — eighty-nine, then
+ * eighty-eight, then eighty-seven, each step landing in whichever of the two files the branch
+ * happened to touch. (Spelled out: the guard forbids today's count, not any number, so a
+ * historical numeral here goes red the day the live count drifts onto it.) `pnpm
  * guards:operands` now prints both counts from the lists themselves, so neither header states a
  * number that can disagree with what it describes.
  *

@@ -90,7 +90,14 @@ describe("the census prints the counts its headers used to restate", () => {
     // And the other direction, which is why the window is bounded and `#` is excluded: an issue
     // reference is not a size claim, and neither is a number that reaches its noun only by
     // stepping over another number.
-    expect(countedAs("833").test(normaliseHeaderText("see #833 for the 86 files"))).toBe(false);
+    //
+    // The `#` case reaches its noun on purpose. An earlier version used `"see #833 for the 86
+    // files"`, which a merge-gate review measured as false **with and without** `(?<!#)` -- the
+    // window already stops at the `8` of `86` before it can reach `files`, so the assertion
+    // witnessed the window and never the exclusion. Measured discriminators: this string, and
+    // `"the #443 operands"`, are true without `(?<!#)` and false with it.
+    expect(countedAs("833").test(normaliseHeaderText("#833 files left the list"))).toBe(false);
+    expect(countedAs("443").test(normaliseHeaderText("the #443 operands"))).toBe(false);
     expect(countedAs("443").test(normaliseHeaderText("443 and then 86 files"))).toBe(false);
   });
 
@@ -121,16 +128,24 @@ describe("the census prints the counts its headers used to restate", () => {
  * characters** for `refusal-operands-unanswered.mjs` — its `UNANSWERED` export comes after the
  * whole data array, so that slice is the file.
  *
- * And not the raw comment either. The second round of the same review injected the removed prose's
- * own typography and watched three of four counts walk past the guard:
+ * And not the raw comment either -- for one of the three reasons an earlier version of this
+ * docblock gave. The second round of the same review injected the removed prose's own typography
+ * and watched three counts walk past the guard:
  *
- *   `**3,479** \`&&\`/\`||\` operands`   the decoration breaks the digits-then-noun adjacency
- *   `these 86\n * files`                 the block-comment continuation breaks the whitespace run
+ *   `**3,479** \`&&\`/\`||\` operands`   decoration between the digits and the noun
+ *   `these 86\n * files`                 a block-comment continuation between them
  *   a `//`-style header                   no `*\/` at all, so the old slice returned "" and the
  *                                         assertion passed against nothing — absence as compliance
  *
- * So the continuations and the decoration come out, the header collapses to one line, and a header
- * that is not a block comment **refuses** rather than reading as empty.
+ * **Only the third is closed here.** A third round measured the other two: `countedAs`'s bounded
+ * `[^0-9]{0,40}?` window already steps over decoration and continuations, so stripping them first
+ * changed no match decision anywhere -- values `0..5000` against both real headers and all three
+ * injected forms produced identical results with the normalisation fully disabled. The earlier
+ * claim that the strip is what sees through typography credited an inert stage; the window is what
+ * carries the property, and it was added in the same commit.
+ *
+ * So this reader does one thing: it refuses a header that is not a block comment, rather than
+ * reading as empty. The header is handed on as written.
  */
 const normalisedHeader = (path: string): string => {
   const text = readFileSync(path, "utf8");
@@ -141,14 +156,22 @@ const normalisedHeader = (path: string): string => {
   return normaliseHeaderText(text.slice(0, end + 2));
 };
 
-/** The normalisation, separated so it can be measured on prose rather than only on this repository's files. */
-const normaliseHeaderText = (header: string): string =>
-  header
-    // ` * ` continuations first: they sit between a number and its noun.
-    .replace(/^[ \t]*\*[ \t]?/gmu, " ")
-    // Every decoration the repository has used around a count — bold, backticks, brackets.
-    .replace(/[^0-9A-Za-z,#\s]/gu, " ")
-    .replace(/\s+/gu, " ");
+/**
+ * Kept as the seam the prose cases go through, and deliberately the identity.
+ *
+ * It was three `replace` calls -- strip ` * ` continuations, blank decoration, collapse
+ * whitespace. A merge-gate review measured each in turn against the file's whole assertion set
+ * and against values `0..5000` on both real headers: every one could be deleted with nothing
+ * failing and no match decision changing. `countedAs`'s `[^0-9]{0,40}?` window subsumes all of
+ * them, and the two were added in the same commit, so the cleanup's own regression test passed
+ * with the cleanup gone.
+ *
+ * Deleted rather than kept with an honest comment, because a stage that changes nothing is a
+ * stage the next reader has to re-measure to find that out. The function stays so the prose cases
+ * read the same way the file cases do -- if a future header defeats the window, the repair has a
+ * place to go and a name already in the assertions.
+ */
+const normaliseHeaderText = (header: string): string => header;
 
 /**
  * The number as a *restated count*: digits, then within a short window, what they count.

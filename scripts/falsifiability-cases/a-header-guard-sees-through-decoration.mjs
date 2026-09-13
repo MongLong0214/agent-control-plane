@@ -10,6 +10,13 @@
  *   a `//`-style header                  no `*\/`, so the slice returned "" and the assertion
  *                                        passed against nothing — absence read as compliance
  *
+ * **The repair is the bounded window, not the normalisation that was added beside it.** A third
+ * round measured each cleanup stage in turn -- strip continuations, blank decoration, collapse
+ * whitespace -- against the whole assertion set and against values `0..5000` on both real
+ * headers: every one could be deleted with nothing failing. `[^0-9]{0,40}?` already steps over
+ * typography, so the cleanup's own regression test passed with the cleanup gone. The stage is
+ * deleted and this row now names what actually carries the property.
+ *
  * Worse, the guard's apparent teeth were coincidental: splicing the base headers back in failed on
  * `86 files` inside a sentence that states no size, while none of `3,479`, `3,922` or `443` — the
  * numbers that actually went stale and that this series exists to remove — matched at all.
