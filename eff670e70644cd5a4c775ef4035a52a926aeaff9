@@ -1,0 +1,5 @@
+Limit: each of the six anchors is scoped to the single operand its mutation removes, not to the condition's line; the wider form was ruled out on dbe5abe because the census credits every operand inside an anchor and one anchor would have named several while testing one mutation
+Limit: two of the twelve operands are unkillable and carry written reasons instead of rows: the typeof check is subsumed at runtime by its neighbouring regex and is enforced by TypeScript, and !validStoredHash is defence in depth behind !matches because a malformed hash makes the stored buffer all zeros
+Warn: four of the six rows sit two to a line, so one edit to either condition kills both of that line's anchors at once; the seconds-long anchors check is what reports it rather than the full sweep
+Record-Id: r-4a98e71e4a53
+Provenance: inherited eff670e70644cd5a4c775ef4035a52a926aeaff9
