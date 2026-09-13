@@ -1,0 +1,4 @@
+Limit: a throw from something other than a git call in that region — a `writeFileSync`, an ownership precheck — still skips cleanup; the wrapper covers the calls that gained the ability to throw, not the whole region
+Ruled-out: a try/catch around the whole region | the diff is 130 lines of re-indentation for a hole whose every measured member is a git call, and review cost is part of the fix
+Ruled-out: extracting the region into its own function | seven closure parameters, and the extraction is a refactor this defect does not need
+Provenance: inherited 7fb9f6b56e3f0687d905f0be1e1b14a2a9cff839
