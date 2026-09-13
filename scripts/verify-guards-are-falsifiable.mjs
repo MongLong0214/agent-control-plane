@@ -1621,7 +1621,7 @@ const GUARDS = [
   {
     what: "the client budget outlasts the widest budget any daemon method may take",
     file: "src/cli/agentctl.ts",
-    find: "export const DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS = 180_000;",
+    find: "export const DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS = 200_000;",
     replace: "export const DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS = 5_000;",
     killedBy: ["tests/unit/operator-socket.test.ts"],
   },
