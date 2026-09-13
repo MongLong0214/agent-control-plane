@@ -1,0 +1,4 @@
+Limit: the census file's own bound has no witness and cannot have one: its tests pass with or without a timeout, so nothing fails for its absence -- the group-signal half is witnessed by a row, the presence of a budget at a call site is not
+Warn: spawnSync blocks the event loop so vitest's per-test timeout cannot interrupt one; the worker stops and vitest reports a timeout against whichever test that worker was holding, which is why the file that fails is not the file that hung
+Record-Id: r-73dc4cf6e724
+Provenance: inherited d9d6f9a6f210b08d830f6d35d36e209403331596
