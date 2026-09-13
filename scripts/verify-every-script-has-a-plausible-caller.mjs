@@ -37,7 +37,20 @@ const asJson = process.argv.includes("--json");
 
 /** Deliberately manual entrypoints may be named here. Stale entries and blank reasons fail. */
 const EXEMPT = {
-  // (currently empty)
+  // #885 unit 2. This one refuses on purpose — it exits 1 while the evidence it must produce is
+  // not yet obtainable, and that refusal is its deliverable. Wiring it into the gate set or into a
+  // CI-selected test would either turn every build red for a property nobody has claimed, or
+  // invite the next person to relax it into passing, which is the failure it exists to name. It is
+  // run by hand, and its output is the record of what the selective-sweep work is waiting for.
+  //
+  // Remove this entry when the evidence exists and it can pass; do not remove it by giving the
+  // script a caller while it still refuses.
+  // Keyed by bare filename: `scriptFiles` is a `readdirSync` of `scripts/`, while the failure
+  // message prints the path form. The display form is not the key form, and writing the
+  // printed string here leaves the exemption silently unmatched.
+  "verify-affected-closure-misses-nothing.mjs":
+    "deliberately manual: it exits 1 until #885's remaining evidence exists, so a caller would " +
+    "make every build red for a property nobody has claimed",
 };
 
 const PACKAGE_MANAGERS = new Set(["pnpm", "npm", "yarn"]);
