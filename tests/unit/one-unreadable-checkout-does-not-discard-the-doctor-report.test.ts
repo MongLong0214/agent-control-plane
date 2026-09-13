@@ -25,6 +25,8 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
+import { ManualClock } from "../../src/core/clock.ts";
+import { REPOSITORY_SWEEP_BUDGET_MS } from "../../src/doctor/doctor.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeRepo } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
 
@@ -77,6 +79,50 @@ describe("a repository probe that did not complete", () => {
     // rejecting and there is no report to read at all.
     const driftFinding = report.findings.find((finding) => finding.code === "REPOSITORY_DRIFT");
     expect(driftFinding?.scope).toBe("repository:local:probe-answers");
+  });
+
+  it("reports the checkouts the sweep did not reach instead of omitting them", async () => {
+    // #877. Each probe used to inherit `git()`'s blanket 120s, so N repositories could cost
+    // N x 120s inside a `doctor.run` budget of 165s — and the expiry discarded the partial report
+    // the per-repository catch above exists to preserve. The guard worked and the operator never
+    // saw its finding.
+    //
+    // The sweep now holds one deadline for all of them. The clock advances past it between
+    // repositories here, which is why this is checkable at all: a real filesystem slow enough to
+    // exhaust 20s is not something a unit test should have to produce.
+    //
+    // An absent finding reads as a healthy checkout, so "I did not get to this one" has to be a
+    // finding rather than a silence.
+    class AdvancingClock extends ManualClock {
+      #calls = 0;
+
+      override now(): Date {
+        // The sweep reads the clock once for the deadline and once per repository. Jumping the
+        // whole budget on the second read puts the first repository inside it and everything
+        // after it outside, which is the boundary this case is about.
+        this.#calls += 1;
+        if (this.#calls === 2) this.advance(REPOSITORY_SWEEP_BUDGET_MS + 1);
+        return super.now();
+      }
+    }
+
+    const harness = makeHarness({ clock: new AdvancingClock("2026-09-13T00:00:00.000Z") });
+    const first = makeRepo({ "README.md": "# probed\n" });
+    const second = makeRepo({ "README.md": "# not reached\n" });
+    await register(harness, first, "local:probed");
+    await register(harness, second, "local:not-reached");
+
+    const report = await harness.cp.doctor.run("system");
+
+    const notReached = report.findings.filter((finding) => finding.code === "REPOSITORY_PROBE_NOT_REACHED");
+    expect(notReached.map((finding) => finding.scope)).toContain("repository:local:not-reached");
+    // Reported, not blocking: an unprobed checkout is an unknown, and an unknown must not read as
+    // a failure of the thing it could not look at.
+    expect(notReached[0]?.blocking).toBe(false);
+    expect(notReached[0]?.observedEvidence).toMatchObject({ sweepBudgetMs: REPOSITORY_SWEEP_BUDGET_MS });
+    // And the report survived, which is the whole point of bounding the sweep rather than each
+    // probe: findings collected before it are still here.
+    expect(report.findings.length).toBeGreaterThan(notReached.length);
   });
 
   it("is absent when both checkouts answer — the control", async () => {

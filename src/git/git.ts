@@ -196,8 +196,15 @@ const sanitizedGitEnv = (): NodeJS.ProcessEnv => ({
 export const revParse = async (cwd: string, ref: string): Promise<string> =>
   (await git(cwd, ["rev-parse", "--verify", `${ref}^{commit}`])).stdout.trim();
 
-export const tryRevParse = async (cwd: string, ref: string): Promise<string | null> => {
-  const out = await git(cwd, ["rev-parse", "--verify", `${ref}^{commit}`], { allowFailure: true });
+export const tryRevParse = async (
+  cwd: string,
+  ref: string,
+  options: { timeoutMs?: number } = {},
+): Promise<string | null> => {
+  const out = await git(cwd, ["rev-parse", "--verify", `${ref}^{commit}`], {
+    allowFailure: true,
+    ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+  });
   return out.exitCode === 0 ? out.stdout.trim() : null;
 };
 
@@ -216,8 +223,13 @@ export const remoteUrl = async (cwd: string, remote = "origin"): Promise<string 
   return out.exitCode === 0 ? out.stdout.trim() : null;
 };
 
-export const isClean = async (cwd: string): Promise<boolean> =>
-  (await git(cwd, ["status", "--porcelain"])).stdout.trim().length === 0;
+export const isClean = async (
+  cwd: string,
+  options: { timeoutMs?: number } = {},
+): Promise<boolean> =>
+  (await git(cwd, ["status", "--porcelain"], {
+    ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+  })).stdout.trim().length === 0;
 
 export const mergeBase = async (cwd: string, a: string, b: string): Promise<string | null> => {
   const out = await git(cwd, ["merge-base", a, b], { allowFailure: true });

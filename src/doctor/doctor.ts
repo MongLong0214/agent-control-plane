@@ -42,6 +42,21 @@ const UNRESOLVED_TURN_ESCALATION_MINUTES = 15;
 export type Severity = "INFO" | "WARN" | "ERROR" | "CRITICAL";
 
 /** PRD §25.4 — the finding contract. */
+/**
+ * How long the repository sweep may take in total, across every registered repository.
+ *
+ * Not a per-repository bound. Each probe inherits `git()`'s blanket 120s unless told otherwise, so
+ * N repositories could cost N x 120s inside a `doctor.run` budget of 165s -- and the pass's cost
+ * growing with the registry is what made `OPERATOR_METHOD_BUDGET_MS`'s "derived, not picked"
+ * docblock stop being true. A deadline keeps that cost constant, and this is the term the budget
+ * adds for it (#877).
+ *
+ * 20s is the share, not a measurement of the work: a healthy `rev-parse` plus `status` on a local
+ * checkout is milliseconds, so this is headroom for a filesystem that has gone slow rather than a
+ * time the sweep is expected to use. The repositories the deadline does not reach are reported.
+ */
+export const REPOSITORY_SWEEP_BUDGET_MS = 20_000;
+
 export interface Finding {
   code: string;
   severity: Severity;
@@ -1032,7 +1047,42 @@ export class Doctor {
 
   private async checkRepositories(): Promise<Finding[]> {
     const findings: Finding[] = [];
+    // **A deadline for the sweep, not a bound per repository.**
+    //
+    // Each probe used to inherit `git()`'s blanket 120s, so N registered repositories could cost
+    // N x 120s inside a `doctor.run` whose whole budget is 165s. One slow checkout after slow
+    // collectors therefore expired the method and threw away the partial report that the
+    // per-repository `catch` below exists to preserve — the guard worked and the operator never
+    // saw its finding (#877).
+    //
+    // A per-repository bound cannot fix that, because the pass's cost would still grow with the
+    // registry. A deadline makes the sweep's cost constant in the number of repositories, which
+    // is the property `OPERATOR_METHOD_BUDGET_MS`'s derivation needs in order to stay true, and
+    // `REPOSITORY_SWEEP_BUDGET_MS` is the term that budget adds for it.
+    //
+    // What the deadline does not reach is reported, not skipped silently: "I did not get to this
+    // repository" is a finding, and an absent finding reads as a healthy checkout.
+    const deadlineMs = this.clock.now().getTime() + REPOSITORY_SWEEP_BUDGET_MS;
     for (const repository of this.repositories.list()) {
+      const remainingMs = deadlineMs - this.clock.now().getTime();
+      if (remainingMs <= 0) {
+        findings.push({
+          code: "REPOSITORY_PROBE_NOT_REACHED",
+          severity: "WARN",
+          scope: `repository:${repository.identity}`,
+          blocking: false,
+          confidence: "HIGH",
+          observedEvidence: {
+            checkoutPath: repository.checkoutPath,
+            sweepBudgetMs: REPOSITORY_SWEEP_BUDGET_MS,
+          },
+          recommendedAction:
+            "the repository sweep ran out of its budget before reaching this checkout, so its " +
+            "drift state is unknown; the checkouts probed before it are the ones this report " +
+            "covers",
+        });
+        continue;
+      }
       // `lastObservedHead` is the acknowledged baseline. A diagnostic must not call the
       // registry's mutating observation API because that would acknowledge an owner
       // change merely by looking at it (§25, §33.5).
@@ -1044,8 +1094,15 @@ export class Doctor {
       let head: string | null;
       let clean: boolean;
       try {
-        head = await tryRevParse(repository.checkoutPath, "HEAD");
-        clean = head ? await isClean(repository.checkoutPath) : false;
+        head = await tryRevParse(repository.checkoutPath, "HEAD", { timeoutMs: remainingMs });
+        // Re-read the clock rather than reusing `remainingMs`: the first probe has already spent
+        // part of it, and handing the same number twice is how a two-probe repository costs twice
+        // the share the deadline allotted it.
+        clean = head
+          ? await isClean(repository.checkoutPath, {
+              timeoutMs: Math.max(1, deadlineMs - this.clock.now().getTime()),
+            })
+          : false;
       } catch (err) {
         findings.push({
           code: "REPOSITORY_PROBE_FAILED",

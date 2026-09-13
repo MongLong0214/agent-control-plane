@@ -1605,10 +1605,10 @@ const GUARDS = [
     killedBy: ["tests/unit/operator-socket.test.ts"],
   },
   {
-    what: "the doctor's budget is sized against what a doctor pass waits on, not a round number",
+    what: "the doctor's budget is sized against every sequential cost a doctor pass waits on, not a round number",
     file: "src/daemon/agentcpd.ts",
-    find: "  \"doctor.run\": PROVIDER_BUDGET_SLOTS * COLLECTOR_TIMEOUT_MS + DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS,",
-    replace: "  \"doctor.run\": DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS,",
+    find: "    PROVIDER_BUDGET_SLOTS * COLLECTOR_TIMEOUT_MS\n    + REPOSITORY_SWEEP_BUDGET_MS\n    + DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS,",
+    replace: "    DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS,",
     killedBy: ["tests/unit/operator-socket.test.ts"],
   },
   {
