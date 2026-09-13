@@ -2290,7 +2290,7 @@ const v35: SchemaMigration = {
              AND json_extract(turn_claim_json, '$.noReplyAt') IS NULL THEN 1
             ELSE 0
           END = 1
-        ORDER BY received_at ASC
+        ORDER BY received_at ASC, channel ASC, nonce ASC
         LIMIT 1`,
     ).get() as { channel: string; nonce: string } | undefined;
     if (unrecoverable) {

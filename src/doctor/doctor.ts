@@ -834,7 +834,7 @@ export class Doctor {
           AND json_type(result_json, '$.reply') = 'object'
           AND json_extract(result_json, '$.deliveryStatus') IN ('UNANSWERABLE', 'UNRESOLVED')
           AND json_type(result_json, '$.operatorResolution') IS NULL
-        ORDER BY received_at ASC`,
+        ORDER BY received_at ASC, channel ASC, nonce ASC`,
     );
     if (rows.length === 0) return [];
 
@@ -918,7 +918,7 @@ export class Doctor {
           AND json_extract(turn_claim_json, '$.repliedAt') IS NULL
           AND json_extract(turn_claim_json, '$.settledAt') IS NULL
           AND json_extract(turn_claim_json, '$.noReplyAt') IS NULL
-        ORDER BY received_at ASC`,
+        ORDER BY received_at ASC, channel ASC, nonce ASC`,
     );
     if (rows.length === 0) return [];
 
