@@ -5364,6 +5364,18 @@ const originals = new Map(files.map((f) => [f, readFileSync(join(ROOT, f), "utf8
 writeFileSync(
   INFLIGHT,
   JSON.stringify({
+    // #897: who is holding this, so a reader can tell a live sweep from a crashed one. The
+    // pre-commit hook refuses while this file exists and tells the author to "reconcile by hand",
+    // which is the right refusal and the wrong advice when the run is simply still going. It is
+    // also the wrong advice when the run is dead, because `repairAbandonedRun` above does that
+    // automatically on the next sweeping run — measured: a leftover mutation and its sentinel both
+    // cleared by one `--only=` run, with the restore named in the output.
+    //
+    // Recorded, not enforced: a pid can be reused, and this harness must not decide that a live
+    // process is dead on the strength of a number. It is here for a person and for a hook message
+    // to read, which is why `startedAt` sits beside it — the two together are cheap to sanity-check
+    // and neither is treated as proof.
+    heldBy: { pid: process.pid, startedAt: new Date().toISOString() },
     originals: Object.fromEntries(originals),
     mutations: Object.fromEntries(
       files.map((file) => [
@@ -5422,6 +5434,21 @@ const restoreOnce = () => {
     restore();
   }
 };
+/**
+ * A signal asks the run to stop; it cannot make it stop while it is inside a child.
+ *
+ * #897. The handler below was already here and it does not fire during a sweep, because every row
+ * runs its compile check and its named test through `spawnSync` — the main thread is blocked, so
+ * nothing schedules the handler. Measured: `kill -TERM` on a sweeping process neither terminated
+ * it nor restored anything; the process kept going and kept mutating. That is the same mechanism
+ * as #872, one level up.
+ *
+ * So the row loop yields one turn of the event loop between rows, which is what gives this handler
+ * its chance to run at all. That bounds the window from "the rest of the run" to "the row in
+ * flight" — seconds rather than the hour and a half it was. It does not make a signal immediate,
+ * and this says so rather than implying it: `SIGKILL` still cannot be handled, and the harness's
+ * own `repairAbandonedRun` on the next sweeping run is what covers that case.
+ */
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
   process.on(signal, () => {
     restoreOnce();
@@ -5452,6 +5479,19 @@ const unclaimed = loci.filter((s) => !claimed.has(s));
 // ---------------------------------------------------------------------------
 try {
   for (const guard of rows) {
+    // One turn of the event loop, so a pending signal handler can run.
+    //
+    // Written first as a flag the handler sets and this line reads, and **measured not working**:
+    // the handler cannot run either, so the flag was never set. The row loop is synchronous from
+    // the first row to the last, and Node delivers a signal only when the loop gets control — so
+    // during a sweep it never gets one. `kill -TERM` on a sweeping process left it alive and still
+    // mutating, twice, before and after that first attempt.
+    //
+    // Yielding here is what gives the handler its turn. The handler already restores and exits;
+    // nothing else is needed, and the flag it was reading has been removed rather than kept as
+    // decoration. The window is now one row rather than the rest of the run, and `SIGKILL` is
+    // still unhandleable — `repairAbandonedRun` on the next sweeping run covers that.
+    await new Promise((resolve) => setImmediate(resolve));
     const path = join(ROOT, guard.file);
     const original = originals.get(guard.file);
     // Verdict acceptance: exactly one home for the mutation, even without --anchors-only.
