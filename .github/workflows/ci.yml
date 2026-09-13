@@ -270,7 +270,22 @@ jobs:
     name: SSOT reconciliation
     needs: verify-matrix
     if: always()
-    runs-on: macos-15
+    # Measured, not assumed (#885). This job builds no native addon and starts no test runner: its
+    # only steps after checkout are `pnpm install` and `node scripts/ssot-report.mjs`, whose imports
+    # are four node builtins and whose only external command is `gh`. Nothing in it is Darwin-shaped,
+    # and it was on `macos-15` because every job here was.
+    #
+    # Ruled out at the same time: moving `traceability` with it. `src/tools/traceability.ts` imports
+    # no native addon either, but it can spawn vitest directly (`traceability.ts:477`) when it has no
+    # result set to read. CI feeds it the artifact and `test -s` fails the job without one, so that
+    # path should not run — "should not" is the wrong footing for moving a job to a platform where
+    # the suite it would start cannot pass. That move waits until the fallback is removed or
+    # explicitly refused, as its own change.
+    #
+    # The four macOS legs that stay are the ones that run the suite: `verify` (×2) and
+    # `guard falsifiability` (×4). Both build `native:peercred` and `native:fd-vfs` and then execute
+    # tests that read `lsof`, launchd and peer credentials.
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       issues: read
