@@ -4966,6 +4966,63 @@ if (declaredWhats !== GUARDS.length) {
  * Read-only, and above every write below for the same reason `--anchors-only` is: no snapshot, no
  * sentinel, no temp directory, safe to run while a real sweep is mid-mutation.
  */
+/**
+ * `--print-rows`: emit this file's own row table as JSON and exit, writing nothing.
+ *
+ * #885 unit 2 needs the whole table and could only enumerate the 247 rows in the case directory:
+ * the other 385 are the `GUARDS` literal above, and the module that holds them is a script, so
+ * importing it runs the sweep. Measured — adding `export` and importing ended in this file's own
+ * dirty-tree refusal. Reading the literal with a parser instead would put a second authority on
+ * the row table, which is the failure that area keeps repeating, so the table is emitted by the
+ * thing that owns it.
+ *
+ * **Placed here, immediately after the inline-table integrity check and above `--shard-report`,
+ * and the position was measured rather than chosen.** "Before the dirty check" is not enough: the
+ * first filesystem write is the mutation-report temp directory further down, and the
+ * abandoned-run repair below that can rewrite a source file before the dirty check is reached.
+ * Everything above this line reads. gpt-6-astra read that order out of this file and it was more
+ * precise than my own reading of it.
+ *
+ * Three details, each a measured consequence rather than a preference:
+ *
+ * 1. **`ALL_ROWS`, not `rows`.** The filtered set drops skipped entries and applies `--only` and
+ *    `--shard`, so a consumer reconciling the table against the sweep would be handed a subset
+ *    and told it was the whole.
+ * 2. **`partitionKey` travels with every row.** 378 of the 385 inline rows carry no `id`
+ *    (measured: 385 entries, 7 with one), so an `id`-keyed consumer would collapse them into one.
+ *    This is the same content-derived key `assignShards` refuses duplicates on, so a consumer
+ *    inherits that uniqueness rather than inventing its own.
+ * 3. **`stdout` is awaited before exiting.** The table is ~290KB. `process.exit` immediately
+ *    after a write of that size delivers 65,536 bytes with a zero status — the pipe truncation
+ *    this repository has already measured and recorded. Exiting inside the callback also keeps
+ *    the sweep below from running on the fall-through.
+ */
+if (process.argv.includes("--print-rows")) {
+  const payload = JSON.stringify(
+    {
+      total: ALL_ROWS.length,
+      runnable: ALL_ROWS.filter((guard) => !guard.skip).length,
+      rows: ALL_ROWS.map((guard) => ({
+        partitionKey: partitionKeyFor(guard),
+        ...(guard.id === undefined ? {} : { id: guard.id }),
+        what: guard.what,
+        file: guard.file,
+        killedBy: guard.killedBy ?? [],
+        skip: guard.skip === undefined ? false : guard.skip,
+      })),
+    },
+    null,
+    0,
+  );
+  // Awaited rather than exited from the write callback: this module already uses top-level await
+  // for the case load, and scheduling the exit in a callback would let execution fall through into
+  // the sweep while the write drained.
+  await new Promise((resolve) => {
+    process.stdout.write(`${payload}\n`, resolve);
+  });
+  process.exit(0);
+}
+
 const shardReport = process.argv.find((a) => a.startsWith("--shard-report="))?.slice("--shard-report=".length);
 if (shardReport !== undefined) {
   if (!/^\d+$/.test(shardReport) || Number(shardReport) < 1) {
