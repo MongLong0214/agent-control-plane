@@ -177,6 +177,22 @@ const commandFor = (script: string, ...args: string[]): string[] => [
   ...args,
 ];
 
+/**
+ * The one command the replay case runs, so the guard below and the case cannot diverge.
+ *
+ * It exists because the first attempt at that guard read this file's own source and asserted it
+ * contained the literal `commandFor(REPLAY_RUNTIME, replayPath)` -- a literal that was inside the
+ * assertion, so `toContain` matched the expectation's own text and passed whatever the case
+ * executed. A merge-gate review reproduced the evasion twice: pointing the case at
+ * `MARKED_RUNTIME` left the guard green, and a second constant derived from `REPLAY_RUNTIME` with
+ * the rename collapsed back to a direct write ran 14/14 with the reader parsing a racing file.
+ *
+ * No text search over this file can close that, because any literal becomes part of the file the
+ * moment it is written. So the guard reads the *value* this function returns, and pointing the
+ * case elsewhere means editing the function the guard reads.
+ */
+const replayCommand = (resultPath: string): string[] => commandFor(REPLAY_RUNTIME, resultPath);
+
 const bootstrapOptions = (stateDir: string, authorityHeld?: () => boolean) => ({
   stateDir,
   mcpSocketPath: join(stateDir, "hermes.mcp.sock"),
@@ -396,19 +412,18 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
     //
     // Asserted on the script source, which is the thing that would change if someone removed the
     // rename. `#874`.
-    expect(REPLAY_RUNTIME).toContain("renameSync");
-    expect(REPLAY_RUNTIME).toContain(".partial");
+    // Read from the command the replay case actually builds, not from the constant beside it. A
+    // constant is evidence about the run only if it is the one the run executes, and the first
+    // version of this guard asserted that by searching this file's own source for a literal that
+    // was inside the assertion -- so it matched itself and passed whatever the case ran.
+    const script = replayCommand("/unused")[2] ?? "";
+
+    expect(script).toContain("renameSync");
+    expect(script).toContain(".partial");
     // And not a direct write to the awaited path. `resultPath` is that path; the only
     // `writeFileSync` naming it must be the temporary one.
-    expect(REPLAY_RUNTIME).not.toMatch(/writeFileSync\(resultPath[,)]/u);
-    expect(REPLAY_RUNTIME).toMatch(/renameSync\(partial, resultPath\)/u);
-    // F4: the assertions above are about a constant, and a constant is only evidence about the
-    // run if it is the one the run executes. Without this line a second runtime constant, or a
-    // different script handed to `commandFor`, leaves every assertion above green while the
-    // reader's `JSON.parse` goes back to racing.
-    const source = readFileSync(join(process.cwd(), "tests", "scenarios", "hermes-bootstrap-mutation.test.ts"), "utf8");
-    expect(source, "the replay case no longer runs REPLAY_RUNTIME, so the checks above describe a script nothing executes")
-      .toContain("commandFor(REPLAY_RUNTIME, replayPath)");
+    expect(script).not.toMatch(/writeFileSync\(resultPath[,)]/u);
+    expect(script).toMatch(/renameSync\(partial, resultPath\)/u);
   });
 
   it("refuses a proof replay from a connection that was already preconnected", async () => {
@@ -422,7 +437,7 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
 
     try {
       const result = await authority.bootstrap(withTarget({
-        command: commandFor(REPLAY_RUNTIME, replayPath),
+        command: replayCommand(replayPath),
       }));
       await waitForPath(replayPath, "preconnected proof replay response");
       const replay = JSON.parse(readFileSync(replayPath, "utf8")) as {

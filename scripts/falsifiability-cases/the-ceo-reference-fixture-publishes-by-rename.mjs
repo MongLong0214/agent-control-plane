@@ -1,9 +1,16 @@
 /**
- * #874/#875. `tests/process/hermes-bootstrap-process.test.ts` polls four paths with `existsSync`
- * and then reads them; the fixture used to `writeFileSync` straight into each, three of the four
- * followed immediately by `process.exit`, which drops whatever the kernel has not taken. A
- * merge-gate review reproduced the property on this exact shape: 514 `Unexpected end of JSON
- * input` in 6,568 reads.
+ * #874/#875. `tests/process/hermes-bootstrap-process.test.ts` polls **three** paths with
+ * `existsSync` and then reads them -- the fourth path the fixture is handed, `continuePath`, is
+ * written by the test and polled by the fixture, so nothing parses it. The fixture used to
+ * `writeFileSync` straight into all four, **two** of them (the two `resultPath` writes) followed
+ * immediately by `process.exit`.
+ *
+ * The exit is not the window. `open(2)` with `O_CREAT|O_TRUNC` makes the path visible at zero
+ * bytes and the `write(2)` that fills it comes after; a merge-gate review reproduced the property
+ * with no `process.exit` anywhere in the writer and got 514 `Unexpected end of JSON input` in
+ * 6,568 reads. The count is corrected here because the commit this row belongs to exists to
+ * replace a record whose mechanism was wrong, and the first correction inflated how many sites
+ * the exit sat behind -- which is the same misreading, one revision later.
  *
  * The pid path carried the quieter consequences. `Number("")` is 0 and `Number("123")` is an
  * integer, so `Number.isInteger` was satisfied by exactly the failures it existed to catch: an

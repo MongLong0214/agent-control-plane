@@ -161,11 +161,14 @@ describe("the reference runtime and the product agree on the protocol", () => {
   });
 
   it("publishes every awaited path by rename, so no reader can parse a half-written file", () => {
-    // #874/#875. This process test polls four paths with `existsSync` and then reads them, and
-    // the fixture used to `writeFileSync` straight into each one — three of the four followed
-    // immediately by `process.exit`, which drops whatever the kernel has not taken. A merge-gate
-    // review reproduced the property on this exact shape: 514 `Unexpected end of JSON input` in
-    // 6,568 reads.
+    // #874/#875. This process test polls **three** paths with `existsSync` and then reads them —
+    // `continuePath` is the fourth the fixture is handed, but the test writes it and the fixture
+    // polls it, so nothing parses it. The fixture used to `writeFileSync` straight into all four,
+    // **two** of them (the two `resultPath` writes) followed immediately by `process.exit`. The
+    // window is not the exit: `open(2)` with `O_CREAT|O_TRUNC` makes the path visible at zero
+    // bytes and the `write(2)` that fills it comes after. A merge-gate review reproduced the
+    // property with no `process.exit` anywhere in the writer: 514 `Unexpected end of JSON input`
+    // in 6,568 reads.
     //
     // Asserting over the fixture's source is the only reachable form: the race is probabilistic,
     // so no single run of the spawned process witnesses it, and the reviewed sibling case in
@@ -336,15 +339,26 @@ process.stdin.on("end", () => {
       expect(bootstrap.stdout).not.toContain("sessionSecret");
       await waitUntil(() => existsSync(pidPath), "Hermes runtime launch");
       await waitUntil(() => existsSync(secretPath), "session secret delivery");
-      // Read the bytes once and assert on them, not on `Number`'s reading of them. `Number("")`
-      // is `0` and `Number("123")` is an integer, so `Number.isInteger` alone is satisfied by
-      // exactly the two failures this line exists to catch — an empty pid file and a truncated
-      // prefix. The first then skips the `process.kill` in the `finally` below (0 is falsy),
-      // leaking the spawned runtime; the second sends SIGTERM to an unrelated process on this
-      // host. Both are quieter than the JSON parse error #874 names and come from the same race.
+      // Read the bytes and assert on them, not on `Number`'s reading of them: `Number("")` is `0`
+      // and `Number.isInteger(0)` is true, so the old check was satisfied by an empty pid file —
+      // the read this fixture's race could produce.
+      //
+      // **What this covers and what it does not.** The regex rejects an empty or non-numeric read.
+      // It cannot reject a *truncated but numeric* prefix: `123` cut from `12345` matches, and
+      // signalling it would send SIGTERM to an unrelated process on this host. Shape is not
+      // provenance, and this line only checks shape. The truncation is prevented at the source
+      // instead — the fixture publishes by rename, pinned by the guard at `:176-182` — so this is
+      // defense in depth with a bounded claim, not a check that establishes the pid is ours.
+      // Establishing that needs the daemon's own `runtimePid`, which reaches the bootstrap socket
+      // response and not this CLI's stdout.
+      //
+      // The assignment comes before the assertion so a bad read leaves `runtimePid` null rather
+      // than a number: the `finally` below then signals nothing, which leaks the spawned runtime
+      // and is the right trade. Signalling a pid this test did not establish is worse than
+      // leaking one, and the leak is visible in the failure while a stray SIGTERM is not.
       const pidText = readFileSync(pidPath, "utf8");
+      runtimePid = /^[0-9]+$/u.test(pidText) ? Number(pidText) : null;
       expect(pidText, "the pid file was read before it was complete").toMatch(/^[0-9]+$/u);
-      runtimePid = Number(pidText);
       expect(runtimePid).toBeGreaterThan(0);
 
       await stopDaemon(firstDaemon);
