@@ -42,7 +42,37 @@ const pidPath = process.argv[2];
 const continuePath = process.argv[3];
 const secretPath = process.argv[4];
 const resultPath = process.argv[5];
-fs.writeFileSync(pidPath, String(process.pid));
+
+/**
+ * Publish a file the test is polling for with `existsSync`.
+ *
+ * Every path this process writes is awaited by `tests/process/hermes-bootstrap-process.test.ts`
+ * with an `existsSync` poll and then read. The window is inside `writeFileSync`: `open(2)` with
+ * `O_CREAT|O_TRUNC` makes the path visible at zero bytes, and the `write(2)` that fills it comes
+ * after. A reader polling between those two calls sees the name, reads a prefix, and — depending
+ * on the path — gets `Unexpected end of JSON input` (#874), or something quieter.
+ *
+ * `process.exit` is *not* what makes this happen, which matters here specifically: the `pidPath`
+ * write below is followed by the rest of the scenario rather than by an exit, and reading the
+ * mechanism as "exit drops unflushed bytes" is what made that write look safe and left it
+ * unfixed through one round of repair.
+ *
+ * The quiet ones are why this is not only about JSON. `Number("")` is `0` and `Number("123")` is
+ * an integer, so a truncated or empty pid file passes `Number.isInteger`, and the test then either
+ * skips its `process.kill` cleanup (0 is falsy, leaking the spawned runtime) or sends SIGTERM to
+ * an unrelated process on the CI host.
+ *
+ * `rename(2)` within one filesystem is atomic, so the awaited name appears only once the content
+ * is complete. Measured by a merge-gate review on this exact shape: 514 `Unexpected end of JSON
+ * input` in 6,568 reads without it.
+ */
+const publish = (path, contents, options) => {
+  const staging = `${path}.partial`;
+  fs.writeFileSync(staging, contents, options);
+  fs.renameSync(staging, path);
+};
+
+publish(pidPath, String(process.pid));
 
 const waitForFile = (path) => new Promise((resolve) => {
   const timer = setInterval(() => {
@@ -177,12 +207,12 @@ const mcp = (sessionId, sessionSecret) => new Promise((resolve, reject) => {
 // The handshake returns the secret before the daemon restart. The runtime retains it only
 // in this process and never writes it to stdout, stderr, an audit record, or the result file.
 bootstrap().then(async ({ sessionId, sessionSecret }) => {
-  fs.writeFileSync(secretPath, sessionSecret, { mode: 0o600 });
+  publish(secretPath, sessionSecret, { mode: 0o600 });
   await waitForFile(continuePath);
   const result = await mcp(sessionId, sessionSecret);
   const projectText = JSON.stringify(result.project);
   const doctorText = JSON.stringify(result.doctor);
-  fs.writeFileSync(resultPath, JSON.stringify({
+  publish(resultPath, JSON.stringify({
     projectResponseId: result.project.id,
     doctorResponseId: result.doctor.id,
     projectAuthenticated: !projectText.includes("MCP_PEER_UNAUTHENTICATED"),
@@ -191,6 +221,6 @@ bootstrap().then(async ({ sessionId, sessionSecret }) => {
   }));
   process.exit(0);
 }).catch((error) => {
-  fs.writeFileSync(resultPath, JSON.stringify({ error: String(error).slice(0, 200) }));
+  publish(resultPath, JSON.stringify({ error: String(error).slice(0, 200) }));
   process.exit(2);
 });

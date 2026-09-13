@@ -114,7 +114,22 @@ const record = (name, chunk) => {
   if (boundary === -1) return;
   responses[name] = JSON.parse(buffers[name].slice(0, boundary));
   if (responses.first && responses.replay) {
-    fs.writeFileSync(resultPath, JSON.stringify(responses));
+    // Renamed into place rather than written to the result path, because the reader waits for that
+    // path to exist and then parses it. The window is inside writeFileSync itself: open(2) with
+    // O_CREAT|O_TRUNC makes the path visible at zero bytes, and the write(2) that fills it comes
+    // after. A reader polling existsSync between those two calls parses an empty file and fails
+    // with "Unexpected end of JSON input". Observed once in CI; this file passes 13/13 alone.
+    //
+    // Not process.exit dropping unflushed bytes, which is what an earlier version of this comment
+    // said. A merge-gate review measured the property with no process.exit anywhere in the writer
+    // and still produced 514 empty-file parse failures in 6,568 reads. The wrong reading is not
+    // harmless: under it a writer that keeps running looks safe, and that is exactly the pid write
+    // in tests/fixtures/hermes-ceo-reference.cjs that the first repair skipped.
+    //
+    // rename on one filesystem is atomic, so the path appears complete or not at all.
+    const partial = resultPath + ".partial";
+    fs.writeFileSync(partial, JSON.stringify(responses));
+    fs.renameSync(partial, resultPath);
     process.exit(0);
   }
 };
@@ -138,6 +153,15 @@ first.once("connect", sendFirst);
 replay.once("connect", sendFirst);
 `;
 
+/**
+ * Waits for a result path to appear.
+ *
+ * Existence is a sufficient signal only because the writer renames its result into place from a
+ * `.partial` name — `rename` is atomic on one filesystem, so the path appears complete or not at
+ * all. A writer that `writeFileSync`s straight to this path would reintroduce the race this helper
+ * cannot see: the path exists, the bytes may not be there yet, and the reader's `JSON.parse` fails
+ * with `Unexpected end of JSON input`. Observed once in CI (#874).
+ */
 const waitForPath = async (path: string, description: string, timeoutMs = 10_000): Promise<void> => {
   const deadline = Date.now() + timeoutMs;
   while (!existsSync(path)) {
@@ -152,6 +176,28 @@ const commandFor = (script: string, ...args: string[]): string[] => [
   script,
   ...args,
 ];
+
+/**
+ * The one command the replay case runs, so the guard below and the case cannot diverge.
+ *
+ * It exists because the first attempt at that guard read this file's own source and asserted it
+ * contained the literal `commandFor(REPLAY_RUNTIME, replayPath)` -- a literal that was inside the
+ * assertion, so `toContain` matched the expectation's own text and passed whatever the case
+ * executed. A merge-gate review reproduced the evasion twice: pointing the case at
+ * `MARKED_RUNTIME` left the guard green, and a second constant derived from `REPLAY_RUNTIME` with
+ * the rename collapsed back to a direct write ran 14/14 with the reader parsing a racing file.
+ *
+ * No text search over this file can close that, because any literal becomes part of the file the
+ * moment it is written.
+ *
+ * Nor does reading this function's return value from a standalone case: a third round showed that
+ * a guard calling `replayCommand("/unused")` observes a command it built for itself, so a sibling
+ * constant handed to `bootstrap` at the call site still ran 14/14 with the reader parsing a racing
+ * file. The enforcement therefore sits **inside the replay case**, on the array that call passes.
+ * This function's value is to keep one construction, so the case and its assertion cannot drift
+ * apart by editing one of two spellings.
+ */
+const replayCommand = (resultPath: string): string[] => commandFor(REPLAY_RUNTIME, resultPath);
 
 const bootstrapOptions = (stateDir: string, authorityHeld?: () => boolean) => ({
   stateDir,
@@ -357,6 +403,35 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
     await runLockLossCase(FENCES.constitution, "constitution-fence", true);
   });
 
+  it("writes a parsed result only through a rename, so waiting on existence is sound", () => {
+    // The property that makes `waitForPath`'s existence check sound, asserted on the one runtime
+    // script this file's readers parse.
+    //
+    // The race is probabilistic — one CI run in an unknown number — so no single execution can
+    // witness it. The invariant can be: the script whose result a reader *parses* must not write
+    // straight to the path that reader waits on, because the path becomes visible at
+    // `open(O_CREAT|O_TRUNC)` and the bytes arrive on the `write(2)` after it.
+    //
+    // The claim is about `REPLAY_RUNTIME` and nothing wider. `MARKED_RUNTIME`'s path is only ever
+    // existence-checked and never read, and `GATED_RUNTIME`'s gate is written by the test, so
+    // neither is in this class — a merge-gate review swept both and cleared them.
+    //
+    // **This case is documentation, not the enforcement site.** The enforcement lives inside the
+    // replay case, on the exact array it hands to `authority.bootstrap`. Two earlier attempts to
+    // enforce it from here were evaded: a source-text search matched its own literal, and this
+    // evaluated form reads a command the guard builds for itself, which a re-pointing of the
+    // call site leaves untouched. Keeping this case while the call site went unchecked is what
+    // made the state read as covered, so the claim is stated plainly here instead.
+    const script = replayCommand("/unused")[2] ?? "";
+
+    expect(script).toContain("renameSync");
+    expect(script).toContain(".partial");
+    // And not a direct write to the awaited path. `resultPath` is that path; the only
+    // `writeFileSync` naming it must be the temporary one.
+    expect(script).not.toMatch(/writeFileSync\(resultPath[,)]/u);
+    expect(script).toMatch(/renameSync\(partial, resultPath\)/u);
+  });
+
   it("refuses a proof replay from a connection that was already preconnected", async () => {
     const harness = makeHarness();
     const stateDir = tempDir("hb-r-");
@@ -367,9 +442,19 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
     );
 
     try {
-      const result = await authority.bootstrap(withTarget({
-        command: commandFor(REPLAY_RUNTIME, replayPath),
-      }));
+      // **The enforcement site.** The invariant is asserted on the exact array this call passes,
+      // not on a constant beside it and not on a command the guard builds for itself. Two earlier
+      // forms were evaded by a merge-gate review precisely because the assertion could be left
+      // behind by re-pointing this line: a source-text search matched its own literal, and an
+      // evaluated `replayCommand("/unused")` was a fresh call the guard made rather than the one
+      // the case runs. Binding it to `command` means a sibling constant handed to `bootstrap` is
+      // a sibling constant this assertion reads.
+      const command = replayCommand(replayPath);
+      expect(command[2], "the replay case runs a script that writes straight to the awaited path")
+        .toMatch(/renameSync\(partial, resultPath\)/u);
+      expect(command[2]).not.toMatch(/writeFileSync\(resultPath[,)]/u);
+
+      const result = await authority.bootstrap(withTarget({ command }));
       await waitForPath(replayPath, "preconnected proof replay response");
       const replay = JSON.parse(readFileSync(replayPath, "utf8")) as {
         first: { ok: boolean };

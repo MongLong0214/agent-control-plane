@@ -160,6 +160,39 @@ describe("the reference runtime and the product agree on the protocol", () => {
     }
   });
 
+  it("publishes every awaited path by rename, so no reader can parse a half-written file", () => {
+    // #874/#875. This process test polls **three** paths with `existsSync` and then reads them —
+    // `continuePath` is the fourth the fixture is handed, but the test writes it and the fixture
+    // polls it, so nothing parses it. The fixture used to `writeFileSync` straight into all four,
+    // **two** of them (the two `resultPath` writes) followed immediately by `process.exit`. The
+    // window is not the exit: `open(2)` with `O_CREAT|O_TRUNC` makes the path visible at zero
+    // bytes and the `write(2)` that fills it comes after. A merge-gate review reproduced the
+    // property with no `process.exit` anywhere in the writer: 514 `Unexpected end of JSON input`
+    // in 6,568 reads.
+    //
+    // Asserting over the fixture's source is the only reachable form: the race is probabilistic,
+    // so no single run of the spawned process witnesses it, and the reviewed sibling case in
+    // `tests/scenarios/hermes-bootstrap-mutation.test.ts` proved the same property about a
+    // different runtime while this one — which executes in every CI leg — kept the defect.
+    const reference = readFileSync(HERMES_RUNTIME, "utf8");
+
+    expect(reference).toContain("fs.renameSync(staging, path)");
+    // Derived, not listed. An earlier version iterated `["pidPath", "secretPath", "resultPath"]`,
+    // which was right on the day it was written and is a second copy of the fixture's argv: a
+    // fifth path added there and awaited here would sit outside a guard whose title says *every*.
+    // The fixture's own shape answers it instead — every `fs.writeFileSync(` in it must name the
+    // staging path, so any future awaited path is covered without an edit in this file.
+    const writes = [...reference.matchAll(/fs\.writeFileSync\(\s*([A-Za-z_$][\w$]*)/gu)]
+      .map((match) => match[1]);
+
+    expect(writes.length, "the fixture no longer writes anything, so this guard has no subject")
+      .toBeGreaterThan(0);
+    for (const target of writes) {
+      expect(target, "a fixture write goes straight to a path a reader may already be polling")
+        .toBe("staging");
+    }
+  });
+
   it("both declare sampling, and the product's declaration is proved on a live socket", () => {
     // The fixture's declaration is still only readable as text — driving an owner message
     // through `Server.createMessage` needs Telegram ingress, which this process test has no way
@@ -297,7 +330,7 @@ process.stdin.on("end", () => {
       firstDaemon = launchDaemon(env);
       await waitForDaemonStart(firstDaemon, "initial agentcpd");
 
-      const bootstrap = await runAgentctl(env, [
+      const argv = [
         "bootstrap",
         "hermes",
         ...targetSelectors,
@@ -308,14 +341,48 @@ process.stdin.on("end", () => {
         continuePath,
         secretPath,
         resultPath,
-      ]);
+      ];
+      // Bound to the argv this call passes, not to the constant beside it. The guard above reads
+      // `HERMES_RUNTIME`'s source and this line spawns `HERMES_RUNTIME`; before this, the two were
+      // joined only by both naming the same identifier, so a copied fixture with the publication
+      // collapsed and spawned from here would have left that guard green. A merge-gate review
+      // reproduced exactly that shape one file over and named this as its second site.
+      // Located from `--` rather than by a fixed index: `targetSelectors` is spread in above and
+      // its length varies, so a literal position silently reads a selector instead of the script.
+      // (It did: `argv[6]` opened `--hermes-home`.) After `--` come the interpreter and then the
+      // script, so the script is `--` + 2.
+      const spawned = argv[argv.indexOf("--") + 2] ?? "";
+      expect(spawned, "the argv no longer carries a script after the interpreter").toBe(HERMES_RUNTIME);
+      expect(readFileSync(spawned, "utf8"), "the spawned runtime writes without renaming into place")
+        .toContain("fs.renameSync(staging, path)");
+
+      const bootstrap = await runAgentctl(env, argv);
       expect(bootstrap.code, bootstrap.stderr || bootstrap.stdout).toBe(0);
       expect(bootstrap.stdout).toContain('"bindingGeneration": 1');
       expect(bootstrap.stdout).not.toContain("sessionSecret");
       await waitUntil(() => existsSync(pidPath), "Hermes runtime launch");
       await waitUntil(() => existsSync(secretPath), "session secret delivery");
-      runtimePid = Number(readFileSync(pidPath, "utf8"));
-      expect(Number.isInteger(runtimePid)).toBe(true);
+      // Read the bytes and assert on them, not on `Number`'s reading of them: `Number("")` is `0`
+      // and `Number.isInteger(0)` is true, so the old check was satisfied by an empty pid file —
+      // the read this fixture's race could produce.
+      //
+      // **What this covers and what it does not.** The regex rejects an empty or non-numeric read.
+      // It cannot reject a *truncated but numeric* prefix: `123` cut from `12345` matches, and
+      // signalling it would send SIGTERM to an unrelated process on this host. Shape is not
+      // provenance, and this line only checks shape. The truncation is prevented at the source
+      // instead — the fixture publishes by rename, pinned by the guard at `:176-182` — so this is
+      // defense in depth with a bounded claim, not a check that establishes the pid is ours.
+      // Establishing that needs the daemon's own `runtimePid`, which reaches the bootstrap socket
+      // response and not this CLI's stdout.
+      //
+      // The assignment comes before the assertion so a bad read leaves `runtimePid` null rather
+      // than a number: the `finally` below then signals nothing, which leaks the spawned runtime
+      // and is the right trade. Signalling a pid this test did not establish is worse than
+      // leaking one, and the leak is visible in the failure while a stray SIGTERM is not.
+      const pidText = readFileSync(pidPath, "utf8");
+      runtimePid = /^[0-9]+$/u.test(pidText) ? Number(pidText) : null;
+      expect(pidText, "the pid file was read before it was complete").toMatch(/^[0-9]+$/u);
+      expect(runtimePid).toBeGreaterThan(0);
 
       await stopDaemon(firstDaemon);
       if (firstDaemon) capturedDaemonOutput += daemonOutput(firstDaemon);
@@ -366,7 +433,10 @@ process.stdin.on("end", () => {
       writeFileSync(continuePath, "cleanup\n", { mode: 0o600 });
       await stopDaemon(secondDaemon);
       await stopDaemon(firstDaemon);
-      if (runtimePid && Number.isInteger(runtimePid)) {
+      // `> 0` rather than `Number.isInteger`, for the same reason as the assertion above: a pid
+      // of 0 is not a process this test spawned, and signalling a pid it did not establish is
+      // worse than leaking one.
+      if (runtimePid !== null && Number.isInteger(runtimePid) && runtimePid > 0) {
         try { process.kill(runtimePid, "SIGTERM"); } catch { /* already gone */ }
       }
       rmSync(root, { recursive: true, force: true });
