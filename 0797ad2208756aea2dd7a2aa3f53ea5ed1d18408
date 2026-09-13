@@ -1,0 +1,9 @@
+Limit: the option reaches git() and nothing above passes it -- WorktreeManager.create still calls addWorktree without a timeout, so the affordance is reachable by a caller and not yet used by this repository's own
+Ruled-out: asserting reasonCode GIT_TIMEOUT on the refusal | ManagedWriteGuard erases it to INTERNAL_ERROR, a limit recorded on 4391442f, and pinning the erased code would make a future fix of it look like a regression
+Ruled-out: a fake git that sleeps for every subcommand | the guard's workspace probe shells out per call, so the case took 20s and measured the probe rather than the mutator
+Warn: the bound is per invocation, so a caller raising it for `worktree add` does not raise it for the `worktree remove` that cleans up after a failure
+Provenance: inherited 34c59e8e1bd723c78fac0244714f13b8efacb752
+
+Limit: the row covers addWorktree only; removeWorktree and pruneWorktrees take the same option through the same spread and are covered by reading, not by a witness
+Ruled-out: mutating by deleting the timeoutMs parameter | the three call sites stop type-checking, so the mutant dies of tsc and the row would credit a kill the test never made
+Provenance: inherited 8fa259eaca1159b4fa468c545687ee2f718de6de
