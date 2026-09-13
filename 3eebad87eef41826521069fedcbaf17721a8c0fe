@@ -1,0 +1,11 @@
+Limit: 20s is a share rather than a measurement -- a healthy rev-parse plus status on a local checkout is milliseconds, so the number is headroom for a filesystem that has gone slow and not a time the sweep is expected to use
+Limit: checkWorktrees runs after this sweep with no deadline of its own, so the same growth-with-the-registry shape remains one method down; it is not reached by this change
+Ruled-out: a per-repository timeoutMs instead of a sweep deadline | the pass's total still grows with the number of registered repositories, which is the term the budget derivation cannot carry
+Ruled-out: raising the doctor.run budget to cover N x 120s | N is registry state, so the budget becomes unbounded in principle and the derivation stops being a derivation
+Warn: the deadline is read from this.clock, so a test that passes a ManualClock and never advances it will never see the not-reached path -- that is deliberate and is what makes the boundary testable
+Provenance: inherited 2bc7980c797ad6db929ca3b4c8a571a0e85d8f1d
+
+Limit: the headroom is 15s because that is what the previous pair carried, not because 15s was measured to be enough for the gap between a client giving up and a daemon answering
+Ruled-out: deriving the client budget from MAX_OPERATOR_METHOD_BUDGET_MS | the constant's docblock refuses the import on purpose, and the test already reconciles the pair
+Warn: this number is anchored by a falsifiability row as a literal, so changing it needs the row re-pointed in the same commit -- the pre-commit hook refuses otherwise, which is how this one was caught
+Provenance: inherited 417cdab77a405afdd148a2ca357ff45a99601c74
