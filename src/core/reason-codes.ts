@@ -265,6 +265,16 @@ export const ReasonCode = {
   OPERATOR_METHOD_NOT_ALLOWED: "OPERATOR_METHOD_NOT_ALLOWED",
   /** An authenticated operator method outlived its execution budget. Not an authentication fact. */
   OPERATOR_REQUEST_TIMEOUT: "OPERATOR_REQUEST_TIMEOUT",
+  /**
+   * A git invocation was killed for exceeding its bound, so git never answered.
+   *
+   * Distinguished from `INTERNAL_ERROR` on purpose, and it is the whole reason the bound was worth
+   * adding: `promisify(execFile)` reports a timed-out child as `{ code: null, signal: "SIGTERM",
+   * killed: true }`, and the previous `e.code ?? 1` turned that into exit 1 — the same value git
+   * uses to say no. A caller reading `allowFailure` could not tell "the working tree is dirty"
+   * from "the check did not run", which is the collapse #859 exists to remove.
+   */
+  GIT_TIMEOUT: "GIT_TIMEOUT",
   /** Ordinary conversation arrived while no CEO peer held an authenticated socket. */
   CEO_CONVERSATION_UNAVAILABLE: "CEO_CONVERSATION_UNAVAILABLE",
   /** The connected CEO peer did not declare the `sampling` capability at handshake. */

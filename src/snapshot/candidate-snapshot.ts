@@ -332,4 +332,16 @@ const assertWorktreeBinding = async (input: SnapshotRepositoryInput): Promise<vo
       symbolicHead: symbolicHead.stdout.trim(),
     });
   }
+  // `-q` makes exit **1** git's answer "HEAD is not a symbolic ref", which is what detached means
+  // here. Every other nonzero is a fatal — git uses 128 for all of them, `dubious ownership`
+  // included — and reading those as "detached" let this assertion *pass* having observed nothing.
+  // That is the worse direction than a wrong refusal: it certifies the property it was asked to
+  // check. Found by a merge-gate review as a sibling of the same class in `git()`.
+  if (symbolicHead.exitCode !== 1) {
+    fail(ReasonCode.SNAPSHOT_STALE, "the candidate worktree's HEAD could not be read", {
+      worktreeId: input.worktreeId,
+      checkoutPath: checkout,
+      exitCode: symbolicHead.exitCode,
+    });
+  }
 };
