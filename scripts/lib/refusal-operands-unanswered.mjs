@@ -40,6 +40,73 @@ const groups = [
     ],
   },
   {
+    file: "src/registry/canonical-self-claim.ts",
+    // The same-live recovery branch (#831) — reachable in production, no fixture distinguishes it.
+    reason: "Twenty operands in the two predecessor branches, every one run and either SURVIVED or refused as an uncompilable mutant. This is the code #831 was about — a rule keyed on a session row's lifecycle rather than on a process's liveness — so the reasons matter more here than the count does.\n\nUncompilable, TypeScript enforcing: `predecessor !== null` narrows before `predecessor.osPid` is read, and the `incumbent`/`predecessor` truthiness guards at the second branch narrow `| null` rows the block then dereferences. Removing any of the three leaves a possibly-null value flowing into a field read.\n\nSubsumed, measured SURVIVED: `osPid === null` and `osProcessStartedAt === null` in `#predecessorProcessIsGone` are each caught by the other plus `probeSessionLiveness`'s own fail-closed `UNKNOWN`, which is the answer the docblock says joins the fail-closed set; `#predecessorProcessIsGone(...)` itself survives because the fixtures whose predecessor row is READY also have a gone process, so the conjunct never decides alone; the two `incumbent`/`predecessor` guards on the first branch survive because no fixture reaches it without both.\n\nAnswers owed — reachable and unfixtured: `!revoked`, `incumbent.current_session_incarnation !== predecessor.incarnation`, `predecessor.osPid !== identity.pid`, `predecessor.osProcessStartedAt !== identity.startedAt`, `predecessor.workdir !== identity.cwd`, `predecessor.buzzAddress !== buzzAddress`, `predecessor.provider !== \"claude\"` and `predecessor.model !== \"claude-cli\"` are eight conjuncts of one eleven-way refusal, and the suite's mismatch cases exercise four of them; the four lifecycle exclusions across both branches survive because every fixture's predecessor is READY or DRAINING rather than STOPPED or ERROR. Each needs a fixture that differs in exactly one field, which is a real gap and stated as one rather than as unkillability.",
+    operands: [
+      ["predecessor !== null",1],
+      ["this.#predecessorProcessIsGone(predecessor.osPid, predecessor.osProcessStartedAt)",1],
+      ["osPid === null",1],
+      ["osProcessStartedAt === null",1],
+      ["incumbent",1],
+      ["predecessor",1],
+      ["predecessor.lifecycle !== SessionLifecycle.STOPPED",1],
+      ["predecessor.lifecycle !== SessionLifecycle.ERROR",1],
+      ["incumbent",2],
+      ["predecessor",2],
+      ["predecessor.lifecycle !== SessionLifecycle.STOPPED",2],
+      ["predecessor.lifecycle !== SessionLifecycle.ERROR",2],
+      ["!revoked",1],
+      ["incumbent.current_session_incarnation !== predecessor.incarnation",1],
+      ["predecessor.osPid !== identity.pid",1],
+      ["predecessor.osProcessStartedAt !== identity.startedAt",1],
+      ["predecessor.workdir !== identity.cwd",1],
+      ["predecessor.buzzAddress !== buzzAddress",1],
+      ["predecessor.provider !== \"claude\"",1],
+      ["predecessor.model !== \"claude-cli\"",1],
+    ],
+  },
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // NO WITNESS — the operand's own effect is subsumed, so no input can distinguish it.
+    reason: "Three operands whose removal changes nothing observable, each measured rather than argued. `firstElement !== undefined` (looksLikeClaudeInvocation): the mutant needs a non-null assertion to compile, and `/(^|\\/)claude$/.test(undefined!)` coerces to the string \"undefined\", which does not match — SURVIVED. `typeof value !== \"string\"` (requireDeploymentValue): every caller reaches it through a `CanonicalSelfClaimConfig` field typed `string`, so a non-string cannot arrive without bypassing the type; removing the operand leaves `value.trim()`, which would throw rather than refuse if one ever did — SURVIVED, and TypeScript is what stands between that throw and a caller. `stat.dev !== reportedDevice` (openVerifiedDarwinImageFd): its sibling inode check catches every fixture, and distinguishing it needs a decoy on a *different device* — a cross-device fixture this suite has no way to build on one volume. All three are kept because each is the half that would matter first if the other changed.",
+    operands: [
+      ["firstElement !== undefined",1],
+      ["typeof value !== \"string\"",1],
+      ["stat.dev !== reportedDevice",1],
+    ],
+  },
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // TYPESCRIPT IS THE ENFORCEMENT SITE — the mutant does not compile, so no test can kill it.
+    reason: "Five operands the harness refused as uncompilable mutants, which is the answer rather than a gap. `ppidRaw === null` and `command === null` narrow two `string | null` reads before `Number.parseInt` and the argv split; removing either leaves `null` flowing into a `string` parameter. `rawValue === undefined` narrows before `rawValue.toLowerCase()`. `entry.device === null` and `entry.inode === null` narrow before `BigInt(...)`. In each case the guard is what makes the next line type-check, so the property is enforced at compile time and a row claiming a test proves it would be claiming the wrong thing.",
+    operands: [
+      ["ppidRaw === null",1],
+      ["command === null",1],
+      ["rawValue === undefined",1],
+      ["entry.device === null",1],
+      ["entry.inode === null",1],
+    ],
+  },
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // WITNESSED BUT NOT ISOLABLE — reachable in production, no input in this suite reaches it.
+    reason: "Eleven operands that are answers owed rather than claims of unkillability. Each is reachable in production and none of this suite's inputs distinguishes it; all eleven were run and SURVIVED, several after the killedBy was retargeted at a better-fitting case first. `!Number.isSafeInteger(callerPid)` and `callerPid <= 0`: callerPid arrives from the kernel peer credential the claim socket established, so no production caller and no test supplies a malformed one — defence for a caller that cannot exist yet. `request.claimedPid !== identity.pid`: no case supplies a *matching* claimedPid, so removing the inequality (leaving the `!== undefined` half) refuses nothing any test asks for. `entry.fd === \"cwd\"` and `entry.type === \"DIR\"`: the synthetic lsof scans carry a single cwd/DIR entry, so neither half selects differently; distinguishing them needs a scan with a decoy directory or a non-directory `cwd`. `rawValue === \"\"`: a selector with a following token is always present in the fixtures, so the empty-attached-value path is reached only through its sibling. `runId !== null` and `candidateSnapshotDigest !== null`: no case presents an approval that binds a run or a candidate, which is what this refusal exists to reject. `!Number.isSafeInteger(request.expectedBindingGeneration)`: the suite supplies non-positive generations but never a fractional one. `candidate.fd === \"txt\"` and `candidate.type === \"REG\"`: the synthetic scans carry one txt/REG entry, so neither half discriminates. Every one of these is a fixture this suite does not have rather than a property nothing enforces, and that distinction is why they are listed separately from the group above.",
+    operands: [
+      ["!Number.isSafeInteger(callerPid)",1],
+      ["callerPid <= 0",1],
+      ["request.claimedPid !== identity.pid",1],
+      ["entry.fd === \"cwd\"",1],
+      ["entry.type === \"DIR\"",1],
+      ["rawValue === \"\"",1],
+      ["request.ownerApproval.runId !== null",1],
+      ["request.ownerApproval.candidateSnapshotDigest !== null",1],
+      ["!Number.isSafeInteger(request.expectedBindingGeneration)",1],
+      ["candidate.fd === \"txt\"",1],
+      ["candidate.type === \"REG\"",1],
+    ],
+  },
+  {
     file: "src/session/session-registry.ts",
     // verifySecret's stored-hash shape check.
     reason: "`typeof row.session_secret_hash === \"string\"` has no runtime effect its neighbouring regex does not already have, measured rather than argued: removing it leaves `SESSION_SECRET_HASH.test(row.session_secret_hash!)`, and for a NULL hash `RegExp.test` coerces its argument to the string \"null\", which the 64-hex pattern rejects — so `validStoredHash` is false either way and the row is refused with the same code. That mutant was run against a case built for exactly that input (a raw-inserted pre-migration row with a NULL hash) and SURVIVED. What the operand actually enforces is the type narrowing: without it the expression does not compile without a non-null assertion, which is what the surviving mutant had to add to get past `tsc`, so TypeScript is the enforcement site. Its sibling `SESSION_SECRET_HASH.test(...)` carries the runtime half and has a row of its own.",
