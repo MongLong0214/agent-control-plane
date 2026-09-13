@@ -28,7 +28,17 @@ import { join } from "node:path";
  * has to be measured as processes, not inferred from a delivery that succeeded.
  */
 const childPids = (): string[] => {
-  const listed = spawnSync("ps", ["-A", "-o", "pid=,ppid=,command="], { encoding: "utf8" });
+  // #872: bounded, because an unbounded `spawnSync` holds this worker's event loop and Vitest's
+  // per-test timeout then fires against whichever test that worker was holding. A `ps` that
+  // cannot answer is exactly the shape this repository has already measured — an `lsof` without
+  // `-n` took 30s against a 5s budget and the refusal named the wrong thing.
+  const listed = spawnSync("ps", ["-A", "-o", "pid=,ppid=,command="], { encoding: "utf8", timeout: 15_000 });
+  // On a timeout `spawnSync` sets `error.code` to "ETIMEDOUT" and leaves `status` null, so the
+  // status check below would report a budget expiry as a `ps` that answered with a failure.
+  // `killed` is deliberately not consulted: it is not set on this path.
+  if ((listed.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT") {
+    throw new Error("ps did not answer within 15000ms — this is the bound, not a process listing");
+  }
   if (listed.status !== 0) throw new Error(`could not list processes: ${listed.stderr}`);
   const children: string[] = [];
   for (const line of listed.stdout.split("\n")) {
