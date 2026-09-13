@@ -188,8 +188,14 @@ const commandFor = (script: string, ...args: string[]): string[] => [
  * the rename collapsed back to a direct write ran 14/14 with the reader parsing a racing file.
  *
  * No text search over this file can close that, because any literal becomes part of the file the
- * moment it is written. So the guard reads the *value* this function returns, and pointing the
- * case elsewhere means editing the function the guard reads.
+ * moment it is written.
+ *
+ * Nor does reading this function's return value from a standalone case: a third round showed that
+ * a guard calling `replayCommand("/unused")` observes a command it built for itself, so a sibling
+ * constant handed to `bootstrap` at the call site still ran 14/14 with the reader parsing a racing
+ * file. The enforcement therefore sits **inside the replay case**, on the array that call passes.
+ * This function's value is to keep one construction, so the case and its assertion cannot drift
+ * apart by editing one of two spellings.
  */
 const replayCommand = (resultPath: string): string[] => commandFor(REPLAY_RUNTIME, resultPath);
 
@@ -410,12 +416,12 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
     // existence-checked and never read, and `GATED_RUNTIME`'s gate is written by the test, so
     // neither is in this class — a merge-gate review swept both and cleared them.
     //
-    // Asserted on the script source, which is the thing that would change if someone removed the
-    // rename. `#874`.
-    // Read from the command the replay case actually builds, not from the constant beside it. A
-    // constant is evidence about the run only if it is the one the run executes, and the first
-    // version of this guard asserted that by searching this file's own source for a literal that
-    // was inside the assertion -- so it matched itself and passed whatever the case ran.
+    // **This case is documentation, not the enforcement site.** The enforcement lives inside the
+    // replay case, on the exact array it hands to `authority.bootstrap`. Two earlier attempts to
+    // enforce it from here were evaded: a source-text search matched its own literal, and this
+    // evaluated form reads a command the guard builds for itself, which a re-pointing of the
+    // call site leaves untouched. Keeping this case while the call site went unchecked is what
+    // made the state read as covered, so the claim is stated plainly here instead.
     const script = replayCommand("/unused")[2] ?? "";
 
     expect(script).toContain("renameSync");
@@ -436,9 +442,19 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
     );
 
     try {
-      const result = await authority.bootstrap(withTarget({
-        command: replayCommand(replayPath),
-      }));
+      // **The enforcement site.** The invariant is asserted on the exact array this call passes,
+      // not on a constant beside it and not on a command the guard builds for itself. Two earlier
+      // forms were evaded by a merge-gate review precisely because the assertion could be left
+      // behind by re-pointing this line: a source-text search matched its own literal, and an
+      // evaluated `replayCommand("/unused")` was a fresh call the guard made rather than the one
+      // the case runs. Binding it to `command` means a sibling constant handed to `bootstrap` is
+      // a sibling constant this assertion reads.
+      const command = replayCommand(replayPath);
+      expect(command[2], "the replay case runs a script that writes straight to the awaited path")
+        .toMatch(/renameSync\(partial, resultPath\)/u);
+      expect(command[2]).not.toMatch(/writeFileSync\(resultPath[,)]/u);
+
+      const result = await authority.bootstrap(withTarget({ command }));
       await waitForPath(replayPath, "preconnected proof replay response");
       const replay = JSON.parse(readFileSync(replayPath, "utf8")) as {
         first: { ok: boolean };

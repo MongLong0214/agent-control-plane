@@ -177,11 +177,19 @@ describe("the reference runtime and the product agree on the protocol", () => {
     const reference = readFileSync(HERMES_RUNTIME, "utf8");
 
     expect(reference).toContain("fs.renameSync(staging, path)");
-    // The bytes go to a staging name, never to the awaited one. A `writeFileSync` whose first
-    // argument is any of the four awaited paths is the defect, spelled exactly as it was.
-    for (const awaited of ["pidPath", "secretPath", "resultPath"]) {
-      expect(reference, `the fixture writes ${awaited} without renaming into place`)
-        .not.toContain(`fs.writeFileSync(${awaited}`);
+    // Derived, not listed. An earlier version iterated `["pidPath", "secretPath", "resultPath"]`,
+    // which was right on the day it was written and is a second copy of the fixture's argv: a
+    // fifth path added there and awaited here would sit outside a guard whose title says *every*.
+    // The fixture's own shape answers it instead — every `fs.writeFileSync(` in it must name the
+    // staging path, so any future awaited path is covered without an edit in this file.
+    const writes = [...reference.matchAll(/fs\.writeFileSync\(\s*([A-Za-z_$][\w$]*)/gu)]
+      .map((match) => match[1]);
+
+    expect(writes.length, "the fixture no longer writes anything, so this guard has no subject")
+      .toBeGreaterThan(0);
+    for (const target of writes) {
+      expect(target, "a fixture write goes straight to a path a reader may already be polling")
+        .toBe("staging");
     }
   });
 
@@ -322,7 +330,7 @@ process.stdin.on("end", () => {
       firstDaemon = launchDaemon(env);
       await waitForDaemonStart(firstDaemon, "initial agentcpd");
 
-      const bootstrap = await runAgentctl(env, [
+      const argv = [
         "bootstrap",
         "hermes",
         ...targetSelectors,
@@ -333,7 +341,22 @@ process.stdin.on("end", () => {
         continuePath,
         secretPath,
         resultPath,
-      ]);
+      ];
+      // Bound to the argv this call passes, not to the constant beside it. The guard above reads
+      // `HERMES_RUNTIME`'s source and this line spawns `HERMES_RUNTIME`; before this, the two were
+      // joined only by both naming the same identifier, so a copied fixture with the publication
+      // collapsed and spawned from here would have left that guard green. A merge-gate review
+      // reproduced exactly that shape one file over and named this as its second site.
+      // Located from `--` rather than by a fixed index: `targetSelectors` is spread in above and
+      // its length varies, so a literal position silently reads a selector instead of the script.
+      // (It did: `argv[6]` opened `--hermes-home`.) After `--` come the interpreter and then the
+      // script, so the script is `--` + 2.
+      const spawned = argv[argv.indexOf("--") + 2] ?? "";
+      expect(spawned, "the argv no longer carries a script after the interpreter").toBe(HERMES_RUNTIME);
+      expect(readFileSync(spawned, "utf8"), "the spawned runtime writes without renaming into place")
+        .toContain("fs.renameSync(staging, path)");
+
+      const bootstrap = await runAgentctl(env, argv);
       expect(bootstrap.code, bootstrap.stderr || bootstrap.stdout).toBe(0);
       expect(bootstrap.stdout).toContain('"bindingGeneration": 1');
       expect(bootstrap.stdout).not.toContain("sessionSecret");
