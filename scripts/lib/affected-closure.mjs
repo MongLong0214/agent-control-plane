@@ -54,7 +54,17 @@ export const GLOBAL_SCOPE_PATHS = Object.freeze([
 ]);
 
 /** A change under any of these decides how the sweep is invoked at all. */
-export const GLOBAL_SCOPE_PREFIXES = Object.freeze([".github/workflows/", "scripts/falsifiability-cases/"]);
+/**
+ * A change under this decides how the sweep is invoked at all.
+ *
+ * `scripts/falsifiability-cases/` was in this list and was measured out of it. Against twelve real
+ * changed-file sets from `origin/main`, nine resolved to FULL and eight of those were commits that
+ * touched one or more case modules — the closure was answering "the whole table" for a change to a
+ * single row's own text. The contract names a row-definition change as a *selection* input, not a
+ * full-sweep trigger, and `definedIn` is the term that carries it: a new case module selects the
+ * row it declares, and a deleted one removes a row there is nothing left to run.
+ */
+export const GLOBAL_SCOPE_PREFIXES = Object.freeze([".github/workflows/"]);
 
 /**
  * `killedBy` entries are `<test file>::<test name>`. The name half names the verdict; the file
