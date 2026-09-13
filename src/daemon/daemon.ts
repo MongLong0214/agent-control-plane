@@ -2041,6 +2041,51 @@ export class Daemon {
     // counted and owed is worth more than one that is invisible.
     if (!receipt || receipt.configuredIdentities === 0) return [];
     const counters = receipt.counters();
+    // Checked *before* the `framesHandled > 0` return below, and that order is the whole finding.
+    // #870 made a frame whose handler threw count, which was right — it ended a misdiagnosis that
+    // sent the operator to the relay. It also moved this state from "reported wrongly" to
+    // "reported not at all": the frame is counted, so silence is suppressed, and the rejection
+    // tally no `src/` reader consults is the only remaining trace.
+    //
+    // The condition is the counters' own documented identity, not a new measurement:
+    //
+    //     framesHandled = admitted + Σrejections + protocol frames + stale-tail frames
+    //
+    // so `admitted + Σrejections` is the frames that produced a verdict, and comparing the throw
+    // bucket against *that* rather than against `framesHandled` is what keeps the AUTH challenge,
+    // the NIP-42 `OK`, `EOSE` and `NOTICE` from diluting it — those carry no verdict, and a
+    // denominator including them could never reach equality on a real connection.
+    //
+    // No window, no ratio and no run counter. A single frame that produced any other verdict
+    // breaks the equality permanently for this process, so one transient throw cannot fire this,
+    // and the per-process scope is a property of the counters rather than state this adds —
+    // `#noteRoleNotHeld`'s run counter (#811) needed its own and records the same restart limit.
+    const handlerThrew = counters.rejections["frame-handler-threw"] ?? 0;
+    const verdicts =
+      counters.admitted + Object.values(counters.rejections).reduce((sum, one) => sum + one, 0);
+    if (handlerThrew > 0 && handlerThrew === verdicts) {
+      return [{
+        code: "BUZZ_MENTION_SUBSCRIBER_HANDLING_FAILING",
+        severity: "WARN",
+        scope: "buzz",
+        blocking: false,
+        confidence: "HIGH",
+        // Both numbers, for the same reason the silent finding prints both: `framesHandled`
+        // says the relay is delivering, and a throw count equal to every verdict says this
+        // runtime is what is failing. Either alone reads as the other diagnosis.
+        observedEvidence: {
+          configuredIdentities: receipt.configuredIdentities,
+          framesHandled: counters.framesHandled,
+          admitted: counters.admitted,
+          frameHandlerThrew: handlerThrew,
+          upForMs: Date.now() - receipt.startedAtMs,
+        },
+        recommendedAction:
+          "every frame this subscriber answered was answered by a throw, so the relay is " +
+          "delivering and handling is failing; read the daemon log for the throw rather than " +
+          "checking the relay or the subscription",
+      }];
+    }
     if (counters.framesHandled > 0) return [];
     if (Date.now() - receipt.startedAtMs < BUZZ_MENTION_SILENCE_GRACE_MS) return [];
     return [{
