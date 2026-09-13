@@ -688,6 +688,8 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
       //
       // So the assertion is a *refusal*: with the first repository merged and its post-merge
       // verification not yet answered, a merge of the second must be denied and say why.
+      // Only the ordering claim is two-repository. It needs a dependent to be ordered behind
+      // something, and a single participant has neither an order nor a dependent.
       if (secondRepositoryId) {
         const ordered = cp.runs.repositoriesOf(runId);
         evidence["mergeOrder"] = ordered.map((entry) => ({
@@ -707,36 +709,49 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
           "a dependent was blocked before any repository had merged",
         ).toBe(true);
         evidence["dependentGate"] = { beforeAnyMerge: beforeAnyMerge.reasonCode };
-
-        // The merge itself goes through the production entry point. `finalizeApprovedRun` is
-        // what the daemon calls on a CEO-approved run, and it already walks the participants in
-        // `merge_order`, awaiting each post-merge before the next merge.
-        //
-        // The refusal that gate produces is *not* asserted here, and cannot usefully be: the
-        // finalizer never attempts the second merge early, so there is no moment in this path
-        // where a well-behaved caller is refused. That property is proved against the kernel in
-        // github-kernel.test.ts (#521), where the moment can be constructed. What this run
-        // proves is the end-to-end consequence — both repositories merged, in the declared
-        // order, each with its own post-merge verification.
-        const daemon = new Daemon(cp, { stateDir: tempDir("acp-two-repo-finalizer-") });
-        const finalized = await daemon.finalizeApprovedRun(runId);
-        expect(
-          finalized.allowed,
-          `finalization refused: ${finalized.allowed ? "" : `${finalized.reasonCode} ${finalized.message}`}`,
-        ).toBe(true);
-
-        const settled = cp.runs.repositoriesOf(runId);
-        evidence["mergeSequence"] = settled.map((entry) => ({
-          identity: entry.identity,
-          mergeOrder: entry.mergeOrder,
-          mergeState: entry.mergeState,
-        }));
-        expect(
-          settled.map((entry) => entry.mergeState),
-          "both participants must reach MERGED — a repository left PENDING means its post-merge never answered",
-        ).toEqual(["MERGED", "MERGED"]);
-        await daemon.stop();
       }
+
+      // #512 — finalisation runs for every participant count, not only for two.
+      //
+      // This call sat inside the `secondRepositoryId` branch above, so a **single-repository run
+      // never reached the production finalisation entry point at all**. That is exactly #512's
+      // scope — "one document-only change through CEO_APPROVED, daemon finalisation" — and the
+      // run that was supposed to prove it stopped at `CEO_APPROVED` and wrote its evidence file
+      // without ever calling the daemon. Every assertion in this test still passed, because a
+      // branch nobody enters asserts nothing.
+      //
+      // `finalizeApprovedRun` is what the daemon calls on a CEO-approved run (`agentcpd.ts:222`,
+      // `onCeoApproved`). It walks the participants in `merge_order`, awaiting each post-merge
+      // before the next merge, so it is the same code path for one participant and for two.
+      //
+      // The dependent-gate refusal is *not* asserted here and cannot usefully be: the finalizer
+      // never attempts a later merge early, so there is no moment in this path where a
+      // well-behaved caller is refused. That property is proved against the kernel in
+      // github-kernel.test.ts (#521), where the moment can be constructed. What this run proves
+      // is the end-to-end consequence — every declared participant merged, in the declared
+      // order, each with its own post-merge verification.
+      const daemon = new Daemon(cp, { stateDir: tempDir("acp-finalizer-") });
+      const finalized = await daemon.finalizeApprovedRun(runId);
+      expect(
+        finalized.allowed,
+        `finalization refused: ${finalized.allowed ? "" : `${finalized.reasonCode} ${finalized.message}`}`,
+      ).toBe(true);
+
+      const settled = cp.runs.repositoriesOf(runId);
+      evidence["mergeSequence"] = settled.map((entry) => ({
+        identity: entry.identity,
+        mergeOrder: entry.mergeOrder,
+        mergeState: entry.mergeState,
+      }));
+      // Derived from the participants the run actually declared, not typed as a literal: a
+      // hardcoded `["MERGED", "MERGED"]` is what confined this whole block to the two-repository
+      // case, and a hardcoded `["MERGED"]` would confine it to the one-repository case instead.
+      expect(
+        settled.map((entry) => entry.mergeState),
+        "every participant must reach MERGED — one left PENDING means its post-merge never answered",
+      ).toEqual(settled.map(() => "MERGED"));
+      expect(settled.length, "the run declared no participants to finalise").toBeGreaterThan(0);
+      await daemon.stop();
       evidence["doctor"] = await cp.doctor.run("project", projectId);
       evidence["telemetry"] = {
         run: cp.telemetry.query("run"),
