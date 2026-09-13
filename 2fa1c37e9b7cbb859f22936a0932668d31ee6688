@@ -1,0 +1,9 @@
+Limit: the record names that the seam threw, not what it threw — a bounded reason string, with no error text on a surface this branch keeps free of anything a sender controls
+Ruled-out: try/finally around the record | the finally would have to invent an outcome for the resolved path too, and the resolved path already has one
+Ruled-out: folding this into the retry bucket | a failing seam and an absent role peer are different repairs, and one count cannot ask for either
+Provenance: inherited 8afa65d94e33b5b735f4df0a58b34c45457ab5a5
+
+Limit: the rename makes the reason honest about its own catch but does not separate the sink from the three other throws -- an operator still cannot tell a failing seam from a failing registry read by the counter alone
+Ruled-out: narrowing the try to the sink.admit call so the old name becomes true | a throw there drops the socket on purpose, and returning a rejection from #onEvent instead leaves the connection up, which is a behaviour change rather than the naming fix this NIT asked for
+Warn: the counter key is an operator-facing surface in health.json, so this rename changes what an existing dashboard or grep would match
+Provenance: inherited 78455e49cd189ca432b2deb93d36956f5fa2badd
