@@ -1,4 +1,4 @@
-import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
@@ -6,6 +6,7 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { restoreDatabase } from "../../src/db/backup.ts";
 import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
+import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -140,7 +141,7 @@ const minimalPath = (...extraDirs: string[]): string =>
   [...extraDirs, "/bin", "/usr/bin", dirname(process.execPath)].join(":");
 
 const buildScratchDatabase = (path: string): void => {
-  execFileSync("sqlite3", [
+  boundedExecFileSync("sqlite3", [
     path,
     "PRAGMA journal_mode=DELETE;",
     "PRAGMA user_version=25;",
@@ -158,7 +159,7 @@ interface RunResult {
 }
 
 const runExtractedBackup = (fixtureHome: string, path: string): RunResult => {
-  const proc = spawnSync(BASH, ["-x", "-c", extractDatabaseBackupScript()], {
+  const proc = boundedSpawnSync(BASH, ["-x", "-c", extractDatabaseBackupScript()], {
     cwd: fixtureHome,
     encoding: "utf8",
     env: { HOME: fixtureHome, PATH: path },
@@ -246,10 +247,10 @@ const finalPathsFor = (fixtureHome: string): { backupsDir: string; finalDb: stri
  * comparison that can never match once the manifest is the shape the validator accepts.
  */
 const sha256Of = (path: string): string =>
-  `sha256:${execFileSync("shasum", ["-a", "256", path], { encoding: "utf8" }).trim().split(/\s+/)[0] ?? ""}`;
+  `sha256:${boundedExecFileSync("shasum", ["-a", "256", path], { encoding: "utf8" }).trim().split(/\s+/)[0] ?? ""}`;
 
 const listing = (dir: string): string[] =>
-  spawnSync("find", [dir, "-mindepth", "1"], { encoding: "utf8" })
+  boundedSpawnSync("find", [dir, "-mindepth", "1"], { encoding: "utf8" })
     .stdout.trim()
     .split("\n")
     .filter((line) => line.length > 0);
@@ -361,7 +362,7 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
     // must never be reached once the backup command itself has failed.
     expect(result.stderr).not.toContain("PRAGMA integrity_check");
     // Nothing left behind under a final (non-temporary) name.
-    const listing = spawnSync("find", [join(fixtureHome, ".agent-control-plane", "backups"), "-maxdepth", "1", "-name", "state-*.sqlite", "!", "-name", ".*"], { encoding: "utf8" });
+    const listing = boundedSpawnSync("find", [join(fixtureHome, ".agent-control-plane", "backups"), "-maxdepth", "1", "-name", "state-*.sqlite", "!", "-name", ".*"], { encoding: "utf8" });
     expect((listing.stdout ?? "").trim()).toBe("");
   });
 
@@ -429,7 +430,7 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
     expect(result.code).not.toBe(0);
     expect(result.stderr).toContain("not ok");
     // No file was ever renamed to the final (non-temporary) name.
-    const listing = spawnSync(
+    const listing = boundedSpawnSync(
       "find",
       [join(fixtureHome, ".agent-control-plane", "backups"), "-maxdepth", "1", "-name", "state-*.sqlite", "!", "-name", ".*"],
       { encoding: "utf8" },
@@ -471,7 +472,7 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
     });
 
     // Give the writer a head start so the backup genuinely overlaps live writes.
-    execFileSync("sleep", ["1"]);
+    boundedExecFileSync("sleep", ["1"]);
 
     const result = runExtractedBackup(fixtureHome, minimalPath());
 
@@ -489,7 +490,7 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
     expect(Number(writerStdout.trim())).toBeGreaterThan(0);
 
     const backupsDir = join(fixtureHome, ".agent-control-plane", "backups");
-    const listing = spawnSync(
+    const listing = boundedSpawnSync(
       "find",
       [backupsDir, "-maxdepth", "1", "-name", "state-*.sqlite", "!", "-name", ".*"],
       { encoding: "utf8" },
@@ -501,7 +502,7 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
       throw new Error("expected exactly one backup file but found none");
     }
 
-    const integrity = execFileSync("sqlite3", [backupFile, "PRAGMA integrity_check;"], {
+    const integrity = boundedExecFileSync("sqlite3", [backupFile, "PRAGMA integrity_check;"], {
       encoding: "utf8",
     }).trim();
     expect(integrity).toBe("ok");
@@ -509,7 +510,7 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
     // The source must still be open and writable after the backup — the online backup API's
     // whole point, versus a raw `cp` that could contend with or corrupt a live writer.
     const rowCountAfter = Number(
-      execFileSync("sqlite3", [dbPath, "insert into t values (999); select count(*) from t;"], {
+      boundedExecFileSync("sqlite3", [dbPath, "insert into t values (999); select count(*) from t;"], {
         encoding: "utf8",
       }).trim(),
     );
@@ -545,14 +546,14 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
       throw new Error("expected exactly one published backup after the lock was waited out");
     }
     expect(
-      execFileSync("sqlite3", [backupFile, "PRAGMA integrity_check;"], { encoding: "utf8" }).trim(),
+      boundedExecFileSync("sqlite3", [backupFile, "PRAGMA integrity_check;"], { encoding: "utf8" }).trim(),
     ).toBe("ok");
     expect(existsSync(`${backupFile}.manifest.json`)).toBe(true);
 
     // The source outlives the wait: the holder's transaction rolled back, and it is still writable.
     expect(
       Number(
-        execFileSync("sqlite3", [dbPath, "insert into t values (999); select count(*) from t;"], {
+        boundedExecFileSync("sqlite3", [dbPath, "insert into t values (999); select count(*) from t;"], {
           encoding: "utf8",
         }).trim(),
       ),
@@ -668,7 +669,7 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
     // with its own (independently built, separately verified) copy.
     expect(sha256Of(finalFile)).toBe(winnerSha256);
 
-    const integrity = execFileSync("sqlite3", [finalFile, "PRAGMA integrity_check;"], {
+    const integrity = boundedExecFileSync("sqlite3", [finalFile, "PRAGMA integrity_check;"], {
       encoding: "utf8",
     }).trim();
     expect(integrity).toBe("ok");
@@ -745,7 +746,7 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
     // rather than letting `sqlite3 -readonly` fail it with a bare errno.
     const source = join(stateDir, "state.sqlite");
     new Db(source).close();
-    execFileSync("sqlite3", [source, "PRAGMA journal_mode=DELETE;"]);
+    boundedExecFileSync("sqlite3", [source, "PRAGMA journal_mode=DELETE;"]);
     for (const sidecar of [`${source}-wal`, `${source}-shm`]) {
       if (existsSync(sidecar)) unlinkSync(sidecar);
     }
@@ -805,7 +806,7 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
       if (existsSync(sidecar)) unlinkSync(sidecar);
     }
     expect(
-      execFileSync("od", ["-An", "-tu1", "-j18", "-N1", source], { encoding: "utf8" }).trim(),
+      boundedExecFileSync("od", ["-An", "-tu1", "-j18", "-N1", source], { encoding: "utf8" }).trim(),
     ).toBe("2");
 
     const result = runExtractedBackup(fixtureHome, minimalPath());
@@ -919,7 +920,7 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
     // Move the source on before releasing the stalled run, so its own copy is genuinely different
     // bytes. Without this both runs copy an identical database and an overwrite is
     // indistinguishable from no overwrite — the assertion would pass against the defect.
-    execFileSync("sqlite3", [
+    boundedExecFileSync("sqlite3", [
       dbPath,
       "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<2000) INSERT INTO t SELECT x FROM c;",
     ]);

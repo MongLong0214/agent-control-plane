@@ -1,4 +1,3 @@
-import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
@@ -27,6 +26,7 @@ import {
   type RollbackPairExpectation,
   type RollbackPairSources,
 } from "../../src/deploy/rollback-pair.ts";
+import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -425,10 +425,10 @@ describe("a sealed rollback pair carries a WAL-complete image", () => {
 const buildRealClosure = (root: string): string => {
   const closure = join(root, "real-closure");
   mkdirSync(join(closure, "bin"), { recursive: true, mode: 0o700 });
-  execFileSync("/bin/cp", ["-Rc", `${REPO_DIST}/.`, closure]);
+  boundedExecFileSync("/bin/cp", ["-Rc", `${REPO_DIST}/.`, closure]);
   mkdirSync(join(closure, "node_modules"), { recursive: true, mode: 0o700 });
   for (const pkg of ["better-sqlite3", "bindings", "file-uri-to-path"]) {
-    const found = execFileSync(
+    const found = boundedExecFileSync(
       "/usr/bin/find",
       ["node_modules/.pnpm", "-maxdepth", "4", "-type", "d", "-path", `*/node_modules/${pkg}`],
       { encoding: "utf8", cwd: process.cwd() },
@@ -437,9 +437,9 @@ const buildRealClosure = (root: string): string => {
       .filter(Boolean)[0];
     if (!found) throw new Error(`the fixture could not find ${pkg} to seal`);
     // `-L` dereferences pnpm's symlinks: a sealed pair refuses links, and rightly.
-    execFileSync("/bin/cp", ["-RcL", join(process.cwd(), found), join(closure, "node_modules", pkg)]);
+    boundedExecFileSync("/bin/cp", ["-RcL", join(process.cwd(), found), join(closure, "node_modules", pkg)]);
   }
-  execFileSync("/bin/cp", ["-c", process.execPath, join(closure, "bin", "node")]);
+  boundedExecFileSync("/bin/cp", ["-c", process.execPath, join(closure, "bin", "node")]);
   chmodSync(join(closure, "bin", "node"), 0o755);
   return closure;
 };
@@ -471,7 +471,7 @@ describe("a rollback installs one whole generation", () => {
 
     // One invocation. There is no stage to hand back and no second command that could be pointed
     // at one, which is the whole point: a stage path on a command line is a mutation authority.
-    const applied = spawnSync(process.execPath, [VALIDATOR, "rollback", ...cliFlags(fixture, sealed)], {
+    const applied = boundedSpawnSync(process.execPath, [VALIDATOR, "rollback", ...cliFlags(fixture, sealed)], {
       encoding: "utf8",
     });
     expect(applied.status, applied.stderr).toBe(0);
@@ -542,7 +542,7 @@ describe("a rollback installs one whole generation", () => {
     // part a pure-JS closure would pass without proving.
     const installedNode = join(fixture.installRoot, "bin", "node");
     expect(statSync(installedNode).mode & 0o111).not.toBe(0);
-    const standalone = spawnSync(
+    const standalone = boundedSpawnSync(
       installedNode,
       [join(fixture.installRoot, "db", "state-admin.js"), "migration-plan", "--database", fixture.databasePath],
       { encoding: "utf8", env: { HOME: fixture.root, PATH: "/nonexistent" } },
@@ -567,15 +567,15 @@ describe("a rollback installs one whole generation", () => {
     mkdirSync(scratch, { recursive: true, mode: 0o700 });
     writeFileSync(join(scratch, "lib.c"), "int acp_external(void){return 0;}\n");
     writeFileSync(join(scratch, "main.c"), "int acp_external(void);\nint main(void){return acp_external();}\n");
-    execFileSync("/usr/bin/cc", ["-dynamiclib", "-o", join(scratch, "libexternal.dylib"), join(scratch, "lib.c")]);
-    execFileSync("/usr/bin/cc", [
+    boundedExecFileSync("/usr/bin/cc", ["-dynamiclib", "-o", join(scratch, "libexternal.dylib"), join(scratch, "lib.c")]);
+    boundedExecFileSync("/usr/bin/cc", [
       "-o",
       join(closure, "bin", "helper"),
       join(scratch, "main.c"),
       join(scratch, "libexternal.dylib"),
     ]);
     // The dependency really is outside the closure and really is not a system library.
-    const linkage = execFileSync("/usr/bin/otool", ["-L", join(closure, "bin", "helper")], {
+    const linkage = boundedExecFileSync("/usr/bin/otool", ["-L", join(closure, "bin", "helper")], {
       encoding: "utf8",
     });
     expect(linkage).toContain(join(scratch, "libexternal.dylib"));
@@ -620,14 +620,14 @@ describe("a rollback installs one whole generation", () => {
       ["generation", { "--expect-service-generation": "generation-nobody-sealed" }],
       ["runtime version", { "--expect-node-version": "v0.0.0" }],
     ] as const) {
-      const refused = spawnSync(process.execPath, rollbackArgs(overrides), { encoding: "utf8" });
+      const refused = boundedSpawnSync(process.execPath, rollbackArgs(overrides), { encoding: "utf8" });
       expect(refused.status, `${what} mismatch was accepted`).toBe(1);
       expect(refused.stdout).toBe("");
     }
 
     // A repeated flag is refused rather than silently resolved to its first occurrence — which
     // is how the rows above passed against an earlier build that never saw the override.
-    const repeated = spawnSync(
+    const repeated = boundedSpawnSync(
       process.execPath,
       [...rollbackArgs(), "--expect-database", elsewhere.databasePath],
       { encoding: "utf8" },
@@ -636,7 +636,7 @@ describe("a rollback installs one whole generation", () => {
     expect(repeated.stderr).toContain("given more than once");
 
     // And the retired handoff is really gone: there is no command that takes a stage.
-    const handoff = spawnSync(process.execPath, [VALIDATOR, "apply", "--stage-root", fixture.root], {
+    const handoff = boundedSpawnSync(process.execPath, [VALIDATOR, "apply", "--stage-root", fixture.root], {
       encoding: "utf8",
     });
     expect(handoff.status, "a stage handoff command still exists").not.toBe(0);

@@ -1,4 +1,3 @@
-import { execFileSync, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
@@ -20,6 +19,7 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { Db } from "../../src/db/database.ts";
 import { parseLauncherBinding, sealRollbackPair, type SealedRollbackPair } from "../../src/deploy/rollback-pair.ts";
+import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -275,7 +275,7 @@ const runInstaller = (
   // is relative to, or the shell resolves nothing and the row measures absence instead.
   cwd?: string,
 ): CommandResult => {
-  const result = spawnSync("bash", [command, ...args], {
+  const result = boundedSpawnSync("bash", [command, ...args], {
     encoding: "utf8",
     env: harness.env,
     ...(cwd ? { cwd } : {}),
@@ -313,7 +313,7 @@ const isolatedInstallerPath = (harness: InstallerHarness, ...extra: string[]): s
 const assertProviderUnresolvable = (harness: InstallerHarness, ...names: string[]): void => {
   for (const name of names) {
     expect(
-      spawnSync("bash", ["-c", `command -v ${name}`], { env: harness.env }).status,
+      boundedSpawnSync("bash", ["-c", `command -v ${name}`], { env: harness.env }).status,
       `${name} resolves from the installer's PATH, so this row would measure the host and not the pin`,
     ).not.toBe(0);
   }
@@ -348,7 +348,7 @@ const runGeneratedLauncher = (harness: InstallerHarness): CommandResult => {
   writeFileSync(launcherSecurity, `security() { "${join(harness.bin, "security")}" "$@"; }\n`, {
     mode: 0o600,
   });
-  const launched = spawnSync("bash", [launcherPath(harness)], {
+  const launched = boundedSpawnSync("bash", [launcherPath(harness)], {
     encoding: "utf8",
     env: { ...harness.env, BASH_ENV: launcherSecurity },
   });
@@ -548,7 +548,7 @@ const structuralFlags = (fixture: PairFixture): string[] => [
  * reaching for "list the files" would have had two choices with nothing marking which is right.
  */
 const treeFiles = (): string[] =>
-  execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], {
+  boundedExecFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], {
     cwd: root,
     encoding: "utf8",
   })
@@ -559,7 +559,7 @@ const treeFiles = (): string[] =>
 describe("launchd deployment artifact", () => {
   it("renders a loadable plist with absolute paths and no secret or unresolved placeholder", () => {
     const output = join(tempDir("acp-launchd-render-"), "agentcpd.plist");
-    execFileSync(process.execPath, [
+    boundedExecFileSync(process.execPath, [
       join(deploy, "render-launchd-plist.mjs"),
       template,
       output,
@@ -617,7 +617,7 @@ describe("launchd deployment artifact", () => {
     // B1 is responsible for.
     const resolvedHome = realpathSync(harness.home);
     const installEnv: NodeJS.ProcessEnv = { ...harness.env, HOME: resolvedHome };
-    const installed = spawnSync(
+    const installed = boundedSpawnSync(
       "bash",
       [
         installer,
@@ -702,7 +702,7 @@ describe("launchd deployment artifact", () => {
     };
     delete launcherEnv["ACP_MCP_TOKEN"];
     delete launcherEnv["ACP_OPERATOR_TOKEN"];
-    const launched = spawnSync("bash", [launcherPath(harness)], {
+    const launched = boundedSpawnSync("bash", [launcherPath(harness)], {
       encoding: "utf8",
       env: launcherEnv,
     });
@@ -745,7 +745,7 @@ describe("launchd deployment artifact", () => {
     };
     delete launcherEnv["ACP_MCP_TOKEN"];
     delete launcherEnv["ACP_OPERATOR_TOKEN"];
-    const launched = spawnSync("bash", [launcherPath(harness)], {
+    const launched = boundedSpawnSync("bash", [launcherPath(harness)], {
       encoding: "utf8",
       env: launcherEnv,
     });
@@ -830,7 +830,7 @@ describe("launchd deployment artifact", () => {
     const launcherEnv: NodeJS.ProcessEnv = { ...harness.env, BASH_ENV: launcherSecurity };
     delete launcherEnv["BUZZ_PRIVATE_KEY"];
 
-    expect(spawnSync("bash", [launcherPath(harness)], { encoding: "utf8", env: launcherEnv }).status)
+    expect(boundedSpawnSync("bash", [launcherPath(harness)], { encoding: "utf8", env: launcherEnv }).status)
       .toBe(0);
 
     const [, , , , , , buzzKey] = readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
@@ -908,7 +908,7 @@ describe("launchd deployment artifact", () => {
       `security() { "${join(harness.bin, "security")}" "$@"; }\n`,
       { mode: 0o600 },
     );
-    const launched = spawnSync("bash", [launcherPath(harness)], {
+    const launched = boundedSpawnSync("bash", [launcherPath(harness)], {
       encoding: "utf8",
       env: { ...harness.env, BASH_ENV: launcherSecurity },
     });
@@ -1124,7 +1124,7 @@ describe("launchd deployment artifact", () => {
     // The premise, asserted rather than assumed: from this working directory the shell really does
     // answer with the relative spelling. Run anywhere else and it answers with nothing, and the
     // row below would be measuring an absent CLI while claiming to measure a relative one.
-    const relativeAnswer = spawnSync("bash", ["-c", "command -v grok"], {
+    const relativeAnswer = boundedSpawnSync("bash", ["-c", "command -v grok"], {
       encoding: "utf8",
       env: harness.env,
       cwd: harness.home,
@@ -1430,7 +1430,7 @@ describe("launchd deployment artifact", () => {
     delete launcherEnv["BUZZ_PRIVATE_KEY"];
 
     // Absent is the correct outcome: the daemon must start, and `available()` refuses.
-    const launched = spawnSync("bash", [launcherPath(harness)], {
+    const launched = boundedSpawnSync("bash", [launcherPath(harness)], {
       encoding: "utf8",
       env: launcherEnv,
     });
@@ -1769,7 +1769,7 @@ describe("launchd deployment artifact", () => {
 exit 0
 `;
     writeExecutable(stub, stubText);
-    execFileSync("bash", ["-n", stub]);
+    boundedExecFileSync("bash", ["-n", stub]);
     for (const token of ["rollback", "--pair-id", "find-generic-password", "render-launchd-plist.mjs"]) {
       expect(stubText).toContain(token);
     }
