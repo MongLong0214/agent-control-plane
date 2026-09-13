@@ -63,6 +63,16 @@ const partial = [];
 for (const file of files) {
   const lines = readFileSync(file, "utf8").split("\n");
   for (const [index, line] of lines.entries()) {
+    // A comment is not an ordering. Measured on this census's own first version: the prose added
+    // beside the `LIMIT 1` in `src/outbox/outbox.ts` quotes the query — `ORDER BY o.created_at,
+    // o.message_id` — and was counted as a thirty-first satisfied site, so the census reported one
+    // more total ordering than the file has. That is this guard failing the way the defects it
+    // exists to find fail: a sentence about a property standing in for the property.
+    //
+    // Lines that *begin* with a comment marker only. A trailing `//` after code on the same line
+    // is not stripped, because telling that apart from a `//` inside a string needs a parser, and
+    // a line carrying both real SQL and a comment still carries the real SQL.
+    if (/^\s*(?:\/\/|\*\/|\*|\/\*)/.test(line)) continue;
     const match = /ORDER BY\s+([A-Za-z0-9_., \t]+?(?:ASC|DESC)?)\s*(?:`|$|LIMIT|\))/i.exec(line);
     if (match === null) continue;
     const terms = match[1];
