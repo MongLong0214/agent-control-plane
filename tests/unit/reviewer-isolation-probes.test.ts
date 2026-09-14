@@ -1,10 +1,10 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { existsSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 
 import { ManualClock } from "../../src/core/clock.ts";
 import { CodexCliAdapter, __testing, reviewerEnvironment } from "../../src/runtime/cli-adapters.ts";
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -12,7 +12,7 @@ afterAll(cleanupTempDirs);
 const seatbeltCanApply = (): boolean =>
   process.platform === "darwin" &&
   existsSync("/usr/bin/sandbox-exec") &&
-  spawnSync("/usr/bin/sandbox-exec", ["-p", "(version 1)\n(allow default)", "/usr/bin/true"]).status === 0;
+  boundedSpawnSync("/usr/bin/sandbox-exec", ["-p", "(version 1)\n(allow default)", "/usr/bin/true"]).status === 0;
 
 describe("CP-HI-04 reviewer isolation probes", () => {
   it("P0-07 fixes the Codex reviewer to GPT-5.6 Sol xhigh and uses only its provider thread id", () => {

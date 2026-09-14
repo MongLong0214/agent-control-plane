@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { join } from "node:path";
@@ -11,6 +10,7 @@ import { sha256 } from "../../src/core/digest.ts";
 import { ClaudeCliAdapter, __testing } from "../../src/runtime/cli-adapters.ts";
 import type { ReviewerEgressConfig } from "../../src/runtime/provider.ts";
 import { acquireReviewerEgress } from "../../src/runtime/reviewer-egress.ts";
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -18,7 +18,7 @@ afterAll(cleanupTempDirs);
 const seatbeltCanApply = (): boolean =>
   process.platform === "darwin" &&
   existsSync("/usr/bin/sandbox-exec") &&
-  spawnSync("/usr/bin/sandbox-exec", ["-p", "(version 1)\n(allow default)", "/usr/bin/true"]).status === 0;
+  boundedSpawnSync("/usr/bin/sandbox-exec", ["-p", "(version 1)\n(allow default)", "/usr/bin/true"]).status === 0;
 
 const liveIt = seatbeltCanApply() ? it : it.skip;
 
