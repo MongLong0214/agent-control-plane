@@ -1,0 +1,19 @@
+Limit: both gates take an observation object with a nullable when, not a boolean, because a check that reads a flag cannot tell not-having-looked from having-looked-and-found-nothing -- that distinction is the whole of what these two conditions ask for
+Warn: the forbidden tool list is named here rather than derived from the probe child's own configuration; a list read out of the thing being judged is not an allowlist, it is a restatement
+Record-Id: r-88da174ec81d
+Provenance: inherited 5be6dabe30e4e86cd4c42f4892f4352a0e1d6183
+
+Limit: `CHECKED_BY_RUN` is unreachable today for both rows | synthetic mode starts no probe child and opens no shared Hermes database, so the only honest inputs refuse; this commit makes the conditions reachable and reported, not observed
+Ruled-out: taking a real tool census here | it needs a probe child, and synthetic mode exists precisely because starting one is what #655 is still blocked on
+Warn: the driver test asserts the exact row list with toEqual, so any further condition added to the artifact fails there first — that is the ratchet working, not a broken test
+Blast: module
+Undo: easy
+Certainty: firm
+Provenance: inherited 8e57216c91208fac596f69febe3e3a83123acd72
+
+Limit: `CHECKED_BY_RUN` is unreachable for both rows on every path this repository has today | synthetic mode starts no probe child and opens no shared Hermes database, so the only honest inputs refuse
+Warn: the two rows make the conditions reachable and reported, not observed; reading a completed synthetic artifact as covering conditions 3 and 6 is the error this wording exists to prevent
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited 4d3cbdbe11c8b0429181ada85af8800c2e888c11
