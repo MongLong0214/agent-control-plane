@@ -1,9 +1,9 @@
-import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
+import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -43,11 +43,11 @@ afterAll(cleanupTempDirs);
 const REPO_ROOT = join(import.meta.dirname, "..", "..");
 
 const git = (args: readonly string[], cwd: string): string =>
-  execFileSync("git", [...args], { cwd, encoding: "utf8" }).trim();
+  boundedExecFileSync("git", [...args], { cwd, encoding: "utf8" }).trim();
 
 describe("the falsifiability harness runs from a linked worktree", () => {
   it("keeps anchors-only read-only even when the temp root cannot contain a directory", () => {
-    const run = spawnSync(
+    const run = boundedSpawnSync(
       process.execPath,
       [join(REPO_ROOT, "scripts", "verify-guards-are-falsifiable.mjs"), "--anchors-only"],
       {
@@ -76,7 +76,7 @@ describe("the falsifiability harness runs from a linked worktree", () => {
       const gitPath = git(["rev-parse", "--git-path", "verify-guards-in-flight.json"], worktree);
       expect(gitPath.startsWith(worktree)).toBe(false);
 
-      const run = spawnSync(
+      const run = boundedSpawnSync(
         process.execPath,
         [
           join(worktree, "scripts", "verify-guards-are-falsifiable.mjs"),
@@ -121,7 +121,7 @@ describe("the falsifiability harness runs from a linked worktree", () => {
     try {
       expect(existsSync(join(worktree, "node_modules"))).toBe(false);
 
-      const run = spawnSync(
+      const run = boundedSpawnSync(
         process.execPath,
         [
           join(worktree, "scripts", "verify-guards-are-falsifiable.mjs"),
