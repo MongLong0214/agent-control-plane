@@ -1,10 +1,10 @@
-import { spawnSync } from "node:child_process";
 import { chmodSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { afterAll, describe, expect, it } from "vitest";
 
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -55,7 +55,7 @@ const run = (
   args: readonly string[],
   options: { body?: string; binary: string; key?: string | null },
 ) =>
-  spawnSync(process.execPath, [script, ...args, "--binary", options.binary], {
+  boundedSpawnSync(process.execPath, [script, ...args, "--binary", options.binary], {
     input: options.body ?? "hello\n",
     encoding: "utf8",
     env: {
@@ -80,7 +80,7 @@ describe("#760 the shell send path", () => {
     expect(result.stderr).toContain("pubkey");
     // Nothing was sent. A refusal after the send would leave the unaddressed message in the
     // room, which is the outcome, not a warning about it.
-    expect(spawnSync("cat", [relay.log], { encoding: "utf8" }).stdout).toBe("");
+    expect(boundedSpawnSync("cat", [relay.log], { encoding: "utf8" }).stdout).toBe("");
   });
 
   it("refuses when the identity to sign with was not stated", () => {
@@ -94,7 +94,7 @@ describe("#760 the shell send path", () => {
 
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("BUZZ_PRIVATE_KEY");
-    expect(spawnSync("cat", [relay.log], { encoding: "utf8" }).stdout).toBe("");
+    expect(boundedSpawnSync("cat", [relay.log], { encoding: "utf8" }).stdout).toBe("");
   });
 
   it("fails when the relay accepted the event without resolving the recipient", () => {
@@ -121,7 +121,7 @@ describe("#760 the shell send path", () => {
 
     expect(result.status, result.stderr).toBe(0);
     const argv = JSON.parse(
-      spawnSync("cat", [relay.log], { encoding: "utf8" }).stdout.trim(),
+      boundedSpawnSync("cat", [relay.log], { encoding: "utf8" }).stdout.trim(),
     ) as string[];
     expect(argv).toEqual([
       "messages",
@@ -153,6 +153,6 @@ describe("#760 the shell send path", () => {
     });
 
     expect(result.status).not.toBe(0);
-    expect(spawnSync("cat", [relay.log], { encoding: "utf8" }).stdout).toBe("");
+    expect(boundedSpawnSync("cat", [relay.log], { encoding: "utf8" }).stdout).toBe("");
   });
 });

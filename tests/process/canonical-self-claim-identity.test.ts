@@ -1,4 +1,4 @@
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   copyFileSync,
@@ -17,6 +17,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { boundedExecFileSync } from "../helpers/bounded-sync-child.ts";
 
 import {
   defaultExecutingImageInspector,
@@ -115,13 +116,13 @@ const IMAGE_FIXTURE_ROOT = join(
  */
 const copyToStaging = (staging: string): void => {
   try {
-    execFileSync("cp", ["-c", process.execPath, staging], { stdio: "ignore" });
+    boundedExecFileSync("cp", ["-c", process.execPath, staging], { stdio: "ignore" });
     return;
   } catch {
     /* not APFS, or not macOS; fall through */
   }
   try {
-    execFileSync("cp", ["--reflink=auto", process.execPath, staging], { stdio: "ignore" });
+    boundedExecFileSync("cp", ["--reflink=auto", process.execPath, staging], { stdio: "ignore" });
     return;
   } catch {
     /* no reflink support either */
@@ -355,8 +356,8 @@ describe("real process ancestry — ps-backed, not a fake", () => {
 
     // `ps -o lstart=` renders to whole-second, locale text; two back-to-back spawns commonly land
     // in the same rendered second.
-    const renderedA = execFileSync("ps", ["-o", "lstart=", "-p", String(a.pid)], { encoding: "utf8" }).trim();
-    const renderedB = execFileSync("ps", ["-o", "lstart=", "-p", String(b.pid)], { encoding: "utf8" }).trim();
+    const renderedA = boundedExecFileSync("ps", ["-o", "lstart=", "-p", String(a.pid)], { encoding: "utf8" }).trim();
+    const renderedB = boundedExecFileSync("ps", ["-o", "lstart=", "-p", String(b.pid)], { encoding: "utf8" }).trim();
 
     // The native-resolution token still tells the two processes apart regardless of whether the
     // rendered-text mechanism would have collided them; the rendered pair rides along in the
@@ -399,7 +400,7 @@ describe("real process ancestry — ps-backed, not a fake", () => {
     }, "the grandchild pid file");
 
     const grandchildPid = Number.parseInt(
-      execFileSync("cat", [resultPath], { encoding: "utf8" }).trim(),
+      boundedExecFileSync("cat", [resultPath], { encoding: "utf8" }).trim(),
       10,
     );
     expect(Number.isSafeInteger(grandchildPid)).toBe(true);
@@ -475,7 +476,7 @@ describe("real executing-image resolution — symlink and image can diverge", ()
       // Contrast case, spelled out: a naive implementation reading "the symlink's current
       // target" instead of "the image this pid actually loaded" would report the decoy version
       // here — wrong, and exactly what `defaultExecutingImageInspector` above does not report.
-      const naiveSymlinkRead = execFileSync("readlink", [launchPath], { encoding: "utf8" }).trim();
+      const naiveSymlinkRead = boundedExecFileSync("readlink", [launchPath], { encoding: "utf8" }).trim();
       expect(naiveSymlinkRead).toContain(SYMLINK_TEST_VERSION_DECOY);
     },
     20_000,
