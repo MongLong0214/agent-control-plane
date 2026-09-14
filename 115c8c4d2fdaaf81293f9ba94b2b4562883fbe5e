@@ -1,0 +1,48 @@
+Limit: all five tiebreaker columns are `TEXT PRIMARY KEY` without `NOT NULL`, and SQLite permits NULL there — astra inserted two NULL-id rows per table against the real schema and triggers and each composite still tied; I reproduced the SQLite behaviour directly. Not reachable from `src/`, where every id is typed `string`, but a raw-SQL writer is in this repository's threat model
+Limit: closing that needs `NOT NULL` on those columns, which is a migration, and `src/db/migrations.ts` is byte-pinned in `tests/helpers/frozen-authority.ts` by a digest deliberately never recomputed — so it is the pinning authority's to allow, not mine
+Limit: the scan reads single lines, so double-quoted SQL, an ordering column supplied by interpolation, and any timestamp column outside the five named here are invisible to it
+Warn: appending the term costs the outbox queries an index-ordered early exit — astra reported an added temporary B-tree in the delivery and unresolved queries, and the holder `LIMIT 1` moving from `outbox_pending` to `outbox_role` plus a sort. No composite index covers the new order. I did not re-measure the plans myself; it is attributed evidence, and no workload shows a regression
+Blast: module
+Undo: easy
+Certainty: firm
+Provenance: inherited f9e087bafd7d182489636344a44b3e1ba174f4a2
+
+Limit: this closes the counterexample at the two sites that choose a row | `projects` and `sessions` orderings remain total only for non-null ids, which is a property of their writers and not of their schema
+Limit: `idempotency_key` is unique across the whole table, not within one `created_at`, which is stronger than needed and is what makes the pair total; it still says nothing about arrival order
+Ruled-out: `rowid` as a general tiebreaker | the CEO's ruling is that an extra key is not a general solution before its validity is checked per table and per query, and `rowid` is not stable across a `VACUUM`/rebuild the way a declared unique column is
+Ruled-out: adding `NOT NULL` to the five id columns | that is a migration, `src/db/migrations.ts` is byte-pinned by an authority outside this change, and the CEO refused both the unfreeze and the constraint-only change without a rollback design
+Warn: the eleven `.all()` orderings are total only because their ids are non-null in practice; the census cannot see that distinction, and its own RESULT line says presence of a second term is all it proves
+Blast: module
+Undo: easy
+Certainty: firm
+Provenance: inherited 769d207c9d2f2048449c50d4e1887ec02a1e538b
+
+Limit: the two queries' order is total only by SQLite's incidental rowid ordering | that is not a guarantee — a `VACUUM` or a rebuild renumbers rowids — so the product is relying on a property no declaration states, which is exactly what #858 is about and is not fixed here
+Ruled-out: `idempotency_key` as the tiebreaker | it does close the NULL counterexample and needs no migration, and it fails the same regression, because the problem is not which arbitrary column but that an arbitrary column replaces arrival order
+Ruled-out: changing the test to expect the new first row | the test asserts the message it queued, which is the product's contract; making it accept whichever row the sort happens to yield would delete the assertion rather than satisfy it
+Warn: giving these two real arrival order needs a column that records it, which is a migration, and `src/db/migrations.ts` is frozen — so this stays open until that unit exists
+Blast: module
+Undo: easy
+Certainty: firm
+Provenance: inherited b97f1d0cdf65e4fde0b9e9b80d3097cac7af2b42
+
+Limit: split across two commits because the first was truncated by a failed `git add` | the tree is what matters and is correct here, but anyone reading `b97f1d0c` alone sees a test deleted with no product change to justify it
+Blast: module
+Undo: easy
+Certainty: firm
+Provenance: inherited 515c9515d7909a866e0222d48b5904a22774f85d
+
+Limit: "a tiebreaker changes the row" is measured; *why* today's answer satisfies that consumer is not | establishing it needs a query plan and the production path, and neither is in this PR
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited a056a8bbe23395d24ea842ed726950c9eaca9e7c
+
+Limit: `rowid` is SQLite's, not this schema's | a `VACUUM` or a table rebuild renumbers it, and a delete permits reuse because this table is not `AUTOINCREMENT` — both reorder only rows already tied on `created_at`, and nothing reads the number itself
+Limit: this does not give the query a declared arrival order | making arrival something the schema states is a migration and stays #858's, and the census still proves only that a second term exists
+Ruled-out: `message_id` and `idempotency_key` | each closes the tie and changes the row, which the regression test catches; `idempotency_key` additionally fixes the NULL counterexample and still fails the same way, so total order was never the property in question here
+Warn: `o.rowid` is written explicitly rather than relying on the implicit scan order it happens to match today — the point is that the order becomes a property of the SQL rather than of a plan
+Blast: module
+Undo: easy
+Certainty: firm
+Provenance: inherited d4d30a8053d49dd8e9d536cfac2b1dcda75b8177
