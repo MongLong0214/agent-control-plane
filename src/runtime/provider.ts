@@ -1,3 +1,5 @@
+import type { Role } from "../domain/types.ts";
+
 import { deny, type Decision } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { ManagedWriteGuard, WriteOperation } from "../guard/managed-write-guard.ts";
@@ -495,8 +497,16 @@ class CapacityObservedAdapter implements ProviderAdapter {
   }
 }
 
+/**
+ * `(provider, role)` as one key. NUL because it cannot occur in either part, so no provider name
+ * plus role can collide with a different pair — the classic separator bug this avoids by picking a
+ * byte the inputs cannot contain rather than one that merely looks unlikely.
+ */
+const roleScopedKey = (provider: string, role: Role): string => `${provider}\u0000${role}`;
+
 export class ProviderRegistry {
   readonly #adapters = new Map<string, ProviderAdapter>();
+  readonly #roleScoped = new Map<string, ProviderAdapter>();
   #capacity: RuntimeCapacityObserver | null = null;
 
   /**
@@ -506,6 +516,49 @@ export class ProviderRegistry {
    */
   attachCapacity(capacity: RuntimeCapacityObserver): void {
     this.#capacity = capacity;
+  }
+
+  /**
+   * A role-scoped registration, for a provider whose adapter must differ by who is using it.
+   *
+   * #512. One `ClaudeCliAdapter` served every role, and its `providerCredentialDir` came from
+   * `ACP_CLAUDE_REVIEWER_CONFIG_DIR` — the blind reviewer's scope, which exists so a review runs
+   * under an identity that cannot read the producer's transcript store. Every caller shared it,
+   * so the probe asking whether the *CTO* session was alive authenticated as the reviewer and the
+   * dispatch refused with `SESSION_NOT_READY`, naming the session for a failure about identity.
+   *
+   * Keyed by `(provider, role)` rather than by provider. `insert` already refuses a duplicate
+   * provider, so two Claude adapters could not both be registered under the old key — the failure
+   * would have been a throw at composition rather than one silently overwriting the other, and
+   * neither is the behaviour wanted.
+   */
+  registerForRole(adapter: ProviderAdapter, role: Role): void {
+    if (!adapter.isProduction) {
+      throw new Error(`non-production adapter '${adapter.provider}' cannot be registered for production`);
+    }
+    const key = roleScopedKey(adapter.provider, role);
+    if (this.#roleScoped.has(key)) {
+      throw new Error(`provider '${adapter.provider}' is already registered for role '${role}'`);
+    }
+    this.#roleScoped.set(key, adapter);
+  }
+
+  /**
+   * The adapter for this provider *in this role*.
+   *
+   * Falls back to an unscoped registration, which is what a provider with no role-specific
+   * identity has. It does **not** fall back the other way: asking for a provider that has
+   * role-scoped adapters without naming a role is refused by `require`, because picking one of
+   * them arbitrarily is how the identity confusion above happened.
+   */
+  requireForRole(provider: string, role: Role): ProviderAdapter {
+    const scoped = this.#roleScoped.get(roleScopedKey(provider, role));
+    if (scoped) return this.observed(scoped);
+    const shared = this.#adapters.get(provider);
+    if (!shared) {
+      throw new Error(`no adapter registered for provider '${provider}' in role '${role}'`);
+    }
+    return this.observed(shared);
   }
 
   /** Production registration is an explicit trusted act, never a test convenience. */
@@ -534,15 +587,48 @@ export class ProviderRegistry {
     this.#adapters.set(adapter.provider, adapter);
   }
 
+  /**
+   * Refuses on the same terms as `require`, and for a sharper reason: this one answers `null` for
+   * "not registered", and callers read that as a refusal they can report. Returning `null` for
+   * "registered, but you did not say as whom" would make an ambiguity indistinguishable from an
+   * absence — the caller would deny with `NOT_FOUND` and nobody would learn that an identity was
+   * there to be chosen. The first version of this unit guarded only `require` and left that hole;
+   * `cto-lifecycle.ts:838` and `:944` both reach the registry through `get`.
+   */
   get(provider: string): ProviderAdapter | null {
+    if (this.hasRoleScoped(provider)) {
+      throw new Error(
+        `provider '${provider}' has role-scoped adapters; use requireForRole(provider, role)`,
+      );
+    }
     const adapter = this.#adapters.get(provider);
     return adapter ? this.observed(adapter) : null;
   }
 
+  /**
+   * Refuses when the provider has role-scoped adapters. Answering here would mean choosing one of
+   * them for a caller that did not say which identity it is acting as, and that choice is exactly
+   * what #512 got wrong. A caller that genuinely has no role — the capacity monitor asking whether
+   * a provider is production — keeps using this and keeps working, because such providers have no
+   * role-scoped registration to be ambiguous about.
+   */
   require(provider: string): ProviderAdapter {
+    if (this.hasRoleScoped(provider)) {
+      throw new Error(
+        `provider '${provider}' has role-scoped adapters; use requireForRole(provider, role)`,
+      );
+    }
     const adapter = this.#adapters.get(provider);
     if (!adapter) throw new Error(`no adapter registered for provider '${provider}'`);
     return this.observed(adapter);
+  }
+
+  /** Whether any role-scoped adapter exists for this provider. */
+  hasRoleScoped(provider: string): boolean {
+    for (const key of this.#roleScoped.keys()) {
+      if (key.startsWith(`${provider}\u0000`)) return true;
+    }
+    return false;
   }
 
   list(): ProviderAdapter[] {
