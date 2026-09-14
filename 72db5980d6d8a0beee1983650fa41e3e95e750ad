@@ -1,0 +1,6 @@
+Limit: the notes push is `commitlore sync` and inherits its 2s remote budget | a slow remote leaves the records local, which the sync line says, and the next push retries — the warning path prints the command either way
+Warn: this runs after `gh pr merge` returns, so a crash between the two leaves a merge with the message's last paragraph and no note — narrower than today, where every merge is in that state, and not zero
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited 4b575b1d784c448557214057abb56ca0255d6c52
