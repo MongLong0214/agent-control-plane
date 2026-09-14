@@ -1,6 +1,5 @@
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
 import { afterAll, describe, expect, it } from "vitest";
 import {
   chmodSync,
@@ -29,6 +28,7 @@ import { isAcpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { systemClock } from "../../src/core/clock.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { TestProductionAdapter } from "../helpers/production-adapter.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
@@ -1424,7 +1424,7 @@ describe("backup and restore drill", () => {
     source.close();
 
     const backupModule = new URL("../../src/db/backup.ts", import.meta.url).href;
-    const child = spawnSync(
+    const child = boundedSpawnSync(
       process.execPath,
       [
         "--import",
@@ -1460,7 +1460,7 @@ describe("backup and restore drill", () => {
     source.close();
 
     const databaseModule = new URL("../../src/db/database.ts", import.meta.url).href;
-    const writer = spawnSync(
+    const writer = boundedSpawnSync(
       process.execPath,
       [
         "--import",
@@ -1490,7 +1490,7 @@ describe("backup and restore drill", () => {
     expect(originalSidecars.has("-wal")).toBe(true);
 
     const backupModule = new URL("../../src/db/backup.ts", import.meta.url).href;
-    const restore = spawnSync(
+    const restore = boundedSpawnSync(
       process.execPath,
       [
         "--import",
@@ -1626,7 +1626,7 @@ describe("backup and restore drill", () => {
 describe("fresh database recovery verifier", () => {
   it("migrates pinned v11 and restores it after the injected post-v12 failure", () => {
     const script = fileURLToPath(new URL("../../scripts/verify-fresh-database.ts", import.meta.url));
-    const result = spawnSync(process.execPath, ["--import", "tsx", script, "--json"], {
+    const result = boundedSpawnSync(process.execPath, ["--import", "tsx", script, "--json"], {
       cwd: fileURLToPath(new URL("../..", import.meta.url)),
       encoding: "utf8",
     });
