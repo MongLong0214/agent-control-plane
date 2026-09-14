@@ -34,10 +34,7 @@ export const UNBOUNDED_SUBPROCESS_TEST_BUDGETS = new Map([
   ["tests/process/every-script-has-a-plausible-caller.test.ts", 2],
   ["tests/process/harness-refuses-concurrent-edits.test.ts", 1],
   ["tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts", 2],
-  ["tests/unit/handoff-p1-boundaries.test.ts", 1],
-  ["tests/unit/local-write-broker.test.ts", 1],
   ["tests/unit/operator-socket.test.ts", 2],
   ["tests/unit/repo-factory-producer.test.ts", 1],
   ["tests/unit/tracker-loci-strip-invariants.test.ts", 1],
-  ["tests/unit/verify-r2.test.ts", 1],
 ]);
