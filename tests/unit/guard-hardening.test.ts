@@ -1,5 +1,4 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { symlinkSync } from "node:fs";
@@ -31,6 +30,7 @@ import {
   transitionSeededRun,
   seedActor,
 } from "../helpers/fixtures.ts";
+import { boundedExecFileSync } from "../helpers/bounded-sync-child.ts";
 import { makeHarness } from "../helpers/harness.ts";
 import { WorktreeManager, type WorktreeAuthorization } from "../../src/verify/worktree.ts";
 
@@ -224,7 +224,7 @@ describe("the worktree mutators' time bound", () => {
    */
   const gitSlowOnWorktreeAdd = (seconds: number): string => {
     const bin = tempDir("acp-slow-git-");
-    const real = execFileSync("/usr/bin/env", ["sh", "-c", "command -v git"], { encoding: "utf8" }).trim();
+    const real = boundedExecFileSync("/usr/bin/env", ["sh", "-c", "command -v git"], { encoding: "utf8" }).trim();
     writeFileSync(
       join(bin, "git"),
       ["#!/bin/sh", 'for a in "$@"; do', '  if [ "$a" = "add" ]; then', `    sleep ${seconds}`, "    exit 0", "  fi", "done", `exec ${real} "$@"`, ""].join("\n"),
@@ -1112,7 +1112,7 @@ describe("guard binds each operation to exactly one repository", () => {
     const { guard, seeded, repo } = setup();
     const nested = join(repo, "vendor", "inner");
     mkdirSync(nested, { recursive: true });
-    execFileSync("git", ["init", "-q", "-b", "main", nested]);
+    boundedExecFileSync("git", ["init", "-q", "-b", "main", nested]);
     writeFiles(nested, { "x.ts": "export const x = 1;\n" });
 
     const decision = guard.evaluate(managedRequest(seeded, { targetPath: join(nested, "x.ts") }));
