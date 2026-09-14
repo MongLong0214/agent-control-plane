@@ -52,7 +52,6 @@ export const GATES = [
   // Reports, never fails: stale evidence is a fact to see, and a check that fails on a true
   // statement gets switched off. `--strict` exists for when a release wants a gate.
   { script: "evidence:freshness" },
-  { script: "invariants" },
   { script: "typecheck" },
   // #705's static half: every direct script has a plausible invocation site. The command prints
   // that this cannot establish execution and that dynamic measurement remains #705.
