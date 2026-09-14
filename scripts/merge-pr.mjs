@@ -156,4 +156,31 @@ if (dryRun) {
 
 // 4. Merge the head that was checked, not whatever the head is by now, with the body that was checked.
 run("gh", ["pr", "merge", number, "--squash", "--match-head-commit", head, "--subject", subject, "--body-file", bodyOut]);
+
+// 5. The same records, onto the notes ref. The message above carries them as trailers and git
+//    keeps only the last paragraph of them — `squash-preserve` says so itself when it composes the
+//    draft, and this repository has already paid for it: nine of the last twenty-five merges lost
+//    trailers that way, and two of those had no note either, so the records existed nowhere until
+//    they were recovered by hand. A note is not parsed as a trailer block, so every record
+//    survives there whatever git does with the message.
+//
+//    After the merge because the target is the merge commit, which does not exist until now. A
+//    failure here is reported and does not fail the merge: the merge is done and irreversible, and
+//    the recovery is `commitlore squash-preserve <range> --target <sha>` run again by hand.
+const merged = run("gh", ["pr", "view", number, "--json", "mergeCommit", "--jq", ".mergeCommit.oid"]).trim();
+if (!/^[0-9a-f]{40}$/u.test(merged)) {
+  process.stdout.write(`\n  WARN  could not read the merge commit id (${merged || "empty"}); records are on the message only.\n`);
+} else {
+  try {
+    run("git", ["fetch", "origin", "--quiet"]);
+    process.stdout.write(run("commitlore", ["squash-preserve", `${pr.baseRefOid}..${head}`, "--target", merged]));
+    run("commitlore", ["sync"]);
+    process.stdout.write(`  records mirrored onto ${merged.slice(0, 7)} and published\n`);
+  } catch (error) {
+    process.stdout.write(String(error.stdout ?? error.stderr ?? ""));
+    process.stdout.write(`\n  WARN  the note for ${merged.slice(0, 7)} was not written. Recover with:\n`);
+    process.stdout.write(`        commitlore squash-preserve ${pr.baseRefOid}..${head} --target ${merged} && commitlore sync\n`);
+  }
+}
+
 process.stdout.write(`\nRESULT: PASS — #${number} merged at ${head.slice(0, 7)}.\n`);
