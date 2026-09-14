@@ -28,8 +28,6 @@
  * sol-simplify: the backlog stays visible; remove entries as the calls are bounded (#872).
  */
 export const UNBOUNDED_SUBPROCESS_TEST_BUDGETS = new Map([
-  ["tests/e2e/real-component-integration.test.ts", 6],
-  ["tests/process/every-script-has-a-plausible-caller.test.ts", 2],
   ["tests/unit/tracker-loci-strip-invariants.test.ts", 1],
   ["tests/unit/verify-tracker-loci-resolve.test.ts", 19],
 ]);
