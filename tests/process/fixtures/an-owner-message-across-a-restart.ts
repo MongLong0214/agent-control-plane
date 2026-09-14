@@ -14,7 +14,6 @@
  * the database alone — it is the poller confirming Telegram's only copy away while producing no
  * answer, and only a real poll does that.
  */
-import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { systemClock } from "../../../src/core/clock.ts";
@@ -26,6 +25,7 @@ import { startDaemonTelegramListener } from "../../../src/daemon/agentcpd.ts";
 import { TelegramInterruption } from "../../../src/ingress/telegram-router.ts";
 import type { TelegramBotTransport } from "../../../src/ingress/telegram-polling.ts";
 import type { TelegramUpdate } from "../../../src/ingress/telegram.ts";
+import { boundedSpawnSync } from "../../helpers/bounded-sync-child.ts";
 import { bindCeo, makeHarness, TEST_OWNER } from "../../helpers/harness.ts";
 
 export const OWNER_ID = "424242";
@@ -247,7 +247,7 @@ export const runInItsOwnProcess = <T>(
   mode: "lose" | "redeliver" | "recover" | "next-message",
   ...args: readonly string[]
 ): T => {
-  const done = spawnSync(process.execPath, ["--import", "tsx", SCRIPT, mode, ...args], {
+  const done = boundedSpawnSync(process.execPath, ["--import", "tsx", SCRIPT, mode, ...args], {
     encoding: "utf8",
     cwd: fileURLToPath(new URL("../../..", import.meta.url)),
     env: { ...process.env, NODE_OPTIONS: "" },

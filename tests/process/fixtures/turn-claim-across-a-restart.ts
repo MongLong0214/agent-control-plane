@@ -13,7 +13,6 @@
  * never left memory would satisfy it. Nothing in that test can fail if the write never reached the
  * file.
  */
-import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { systemClock } from "../../../src/core/clock.ts";
@@ -26,6 +25,7 @@ import { startDaemonTelegramListener } from "../../../src/daemon/agentcpd.ts";
 import { TelegramInterruption } from "../../../src/ingress/telegram-router.ts";
 import type { TelegramBotTransport } from "../../../src/ingress/telegram-polling.ts";
 import type { TelegramUpdate } from "../../../src/ingress/telegram.ts";
+import { boundedSpawnSync } from "../../helpers/bounded-sync-child.ts";
 import { bindCeo, makeHarness, TEST_OWNER } from "../../helpers/harness.ts";
 
 export const OWNER_ID = "424242";
@@ -154,7 +154,7 @@ const SCRIPT = fileURLToPath(import.meta.url);
 
 /** Runs one half in its own OS process and returns what it printed. */
 export const runInItsOwnProcess = <T>(mode: "claim" | "read", ...args: readonly string[]): T => {
-  const done = spawnSync(process.execPath, ["--import", "tsx", SCRIPT, mode, ...args], {
+  const done = boundedSpawnSync(process.execPath, ["--import", "tsx", SCRIPT, mode, ...args], {
     encoding: "utf8",
     cwd: fileURLToPath(new URL("../../..", import.meta.url)),
     env: { ...process.env, NODE_OPTIONS: "" },
