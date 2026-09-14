@@ -1,10 +1,10 @@
-import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { fixtureManifest, makeHarness } from "../helpers/harness.ts";
 import { applyPassingChange } from "../helpers/harness.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
@@ -88,7 +88,7 @@ type SandboxTest = () => void | Promise<void>;
 const usablePython3 = (): string => {
   for (const candidate of ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]) {
     if (!existsSync(candidate)) continue;
-    const probe = spawnSync(candidate, ["--version"], { encoding: "utf8" });
+    const probe = boundedSpawnSync(candidate, ["--version"], { encoding: "utf8" });
     if (probe.status === 0) return candidate;
   }
   return "/usr/bin/python3";
