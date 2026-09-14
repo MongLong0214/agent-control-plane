@@ -1,8 +1,9 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync, rmSync} from "node:fs";
 import { join, resolve } from "node:path";
 
+import { boundedExecFileSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -72,7 +73,7 @@ describe("the falsifiability harness, when a guarded file changes underneath it"
       rmSync(
         resolve(
           ROOT,
-          execFileSync("git", ["rev-parse", "--git-path", "verify-guards-in-flight.json"], {
+          boundedExecFileSync("git", ["rev-parse", "--git-path", "verify-guards-in-flight.json"], {
             cwd: ROOT,
             encoding: "utf8",
           }).trim(),
