@@ -2,7 +2,7 @@
  * How many blocking subprocess calls each file under `tests/` still makes without a time bound.
  *
  * `src/` is nearly bounded and its two remaining calls are named one by one in
- * `unbounded-subprocess-exclusions.mjs`. `tests/` is not: 181 calls across 56 files, which is
+ * `unbounded-subprocess-exclusions.mjs`. `tests/` is not: 162 calls across 55 files, which is
  * where the #872 failure actually lived. A blocking call in a test is not a lesser problem than
  * one in the product — `spawnSync` holds the event loop, so Vitest's own per-test timeout cannot
  * interrupt it, and Vitest then reports the timeout against whichever test the stalled worker
@@ -80,5 +80,4 @@ export const UNBOUNDED_SUBPROCESS_TEST_BUDGETS = new Map([
   ["tests/unit/usage-collectors.test.ts", 1],
   ["tests/unit/verify-r2.test.ts", 1],
   ["tests/unit/verify-stale-coordinate-literals.test.ts", 1],
-  ["tests/unit/verify-tracker-loci-resolve.test.ts", 19],
 ]);

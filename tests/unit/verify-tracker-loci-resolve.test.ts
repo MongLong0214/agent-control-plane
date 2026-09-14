@@ -1,4 +1,9 @@
 import { spawnSync } from "node:child_process";
+import type {
+  SpawnSyncOptions,
+  SpawnSyncOptionsWithStringEncoding,
+  SpawnSyncReturns,
+} from "node:child_process";
 import {
   chmodSync,
   cpSync,
@@ -50,14 +55,66 @@ const withIssues = (issues: IssueFixture[]) => {
   return { path, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 };
 
+/**
+ * Every child this file starts, with a time bound (#872).
+ *
+ * Nineteen `spawnSync` calls here ran unbounded: two that execute the tracker-loci script and
+ * seventeen `git` fixture operations. An unbounded `spawnSync` holds the worker's event loop, so
+ * vitest's own 60s per-test timeout cannot interrupt one, and the timeout it eventually reports
+ * lands on whichever test that stalled worker happened to be holding — the file that fails is not
+ * the file that hung.
+ *
+ * 30s, which is well under `testTimeout` so the bound is what fires, and roughly fifty times what
+ * any of these takes on an idle host. It is a wedge threshold, not a performance assertion.
+ *
+ * A timeout is weaker than `runBoundedChild`: it still blocks the loop for up to the bound and it
+ * signals only the direct child. It is what fits a synchronous call site, and it converts "forever"
+ * into a failure that names the command. `killed` is deliberately not read — measured in this
+ * repository, a `spawnSync` timeout gives `status: null`, `signal: "SIGTERM"`, `killed: undefined`
+ * and `error.code: "ETIMEDOUT"`, so the budget is recognised from `error.code` and every other
+ * failure keeps its own shape.
+ */
+const CHILD_BUDGET_MS = 30_000;
+
+function bounded(
+  file: string,
+  options: SpawnSyncOptionsWithStringEncoding,
+): SpawnSyncReturns<string>;
+function bounded(
+  file: string,
+  argv: readonly string[],
+  options: SpawnSyncOptionsWithStringEncoding,
+): SpawnSyncReturns<string>;
+function bounded(file: string, argv?: readonly string[], options?: SpawnSyncOptions): SpawnSyncReturns<Buffer>;
+// The overloads mirror `spawnSync`'s own, including its two-argument form. Collapsing them into one
+// signature was the first attempt and it changed what callers get back: every `encoding: "utf8"`
+// site started seeing `Buffer`, so `stdout + stderr` stopped type-checking. A wrapper that narrows
+// its subject's type is a wrapper that changes it.
+function bounded(
+  file: string,
+  argvOrOptions?: readonly string[] | SpawnSyncOptions,
+  maybeOptions?: SpawnSyncOptions,
+): SpawnSyncReturns<string> | SpawnSyncReturns<Buffer> {
+  const argv = Array.isArray(argvOrOptions) ? [...(argvOrOptions as readonly string[])] : [];
+  const options = (Array.isArray(argvOrOptions) ? maybeOptions : (argvOrOptions as SpawnSyncOptions)) ?? {};
+  const result = spawnSync(file, argv, { ...options, timeout: CHILD_BUDGET_MS });
+  if ((result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT") {
+    throw new Error(
+      `${file} ${argv.join(" ")} did not answer within ${CHILD_BUDGET_MS}ms — this is the bound, ` +
+        "not a verdict about what it was measuring",
+    );
+  }
+  return result as SpawnSyncReturns<string>;
+}
+
 const run = (issuesPath: string, extraArgs: string[] = []) =>
-  spawnSync(process.execPath, [scriptPath, `--issues-file=${issuesPath}`, ...extraArgs], {
+  bounded(process.execPath, [scriptPath, `--issues-file=${issuesPath}`, ...extraArgs], {
     cwd: repoRoot,
     encoding: "utf8",
   });
 
 const runLive = (env: NodeJS.ProcessEnv) =>
-  spawnSync(process.execPath, [scriptPath], {
+  bounded(process.execPath, [scriptPath], {
     cwd: repoRoot,
     encoding: "utf8",
     env: { ...process.env, ...env },
@@ -358,7 +415,7 @@ describe("verify-tracker-loci-resolve", () => {
     const dir = mkdtempSync(join(tmpdir(), "acp-tracker-loci-scheduled-"));
     const checkout = join(dir, "checkout");
     try {
-      const cloned = spawnSync("git", ["clone", "--quiet", "--no-hardlinks", "--local", repoRoot, checkout], {
+      const cloned = bounded("git", ["clone", "--quiet", "--no-hardlinks", "--local", repoRoot, checkout], {
         encoding: "utf8",
       });
       expect(cloned.status, cloned.stdout + cloned.stderr).toBe(0);
@@ -409,7 +466,7 @@ describe("verify-tracker-loci-resolve", () => {
       );
       chmodSync(fakeGh, 0o755);
 
-      const result = spawnSync(entrypoint!, {
+      const result = bounded(entrypoint!, {
         cwd: checkout,
         encoding: "utf8",
         shell: true,
@@ -1965,9 +2022,9 @@ describe("verify-tracker-loci-resolve", () => {
       try {
         writeFileSync(join(dir, "plain.yml"), "description: it's plain\nAFTER_PLAIN_SCALAR: true\n");
         writeFileSync(join(dir, "block.yml"), "run: |\n  echo it's block text\nAFTER_BLOCK_SCALAR: true\n");
-        spawnSync("git", ["init", "-q", "."], { cwd: dir });
-        spawnSync("git", ["add", "-A"], { cwd: dir });
-        spawnSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "fixture"], {
+        bounded("git", ["init", "-q", "."], { cwd: dir });
+        bounded("git", ["add", "-A"], { cwd: dir });
+        bounded("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "fixture"], {
           cwd: dir,
         });
 
@@ -2046,9 +2103,9 @@ describe("verify-tracker-loci-resolve", () => {
       const dir = mkdtempSync(join(tmpdir(), "acp-tracker-loci-sql-"));
       try {
         writeFileSync(join(dir, "sample.sql"), sqlText);
-        spawnSync("git", ["init", "-q", "."], { cwd: dir });
-        spawnSync("git", ["add", "-A"], { cwd: dir });
-        spawnSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "fixture"], {
+        bounded("git", ["init", "-q", "."], { cwd: dir });
+        bounded("git", ["add", "-A"], { cwd: dir });
+        bounded("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "fixture"], {
           cwd: dir,
         });
         const issuesPath = join(dir, "issues.json");
@@ -2302,7 +2359,7 @@ describe("verify-tracker-loci-resolve", () => {
     });
 
     it("a GitHub blob URL can use a commit SHA instead of a branch", () => {
-      const sha = spawnSync("git", ["rev-parse", "HEAD"], { cwd: repoRoot, encoding: "utf8" }).stdout.trim();
+      const sha = bounded("git", ["rev-parse", "HEAD"], { cwd: repoRoot, encoding: "utf8" }).stdout.trim();
       const body = `See https://github.com/MongLong0214/agent-control-plane/blob/${sha}/README.md#L1.`;
       const { path, cleanup } = withIssues([{ number: 68945, title: "SHA blob URL", body }]);
       try {
@@ -2374,7 +2431,7 @@ describe("verify-tracker-loci-resolve", () => {
     });
 
     it("every tracked supported language file keeps a real code witness visible through the production CLI", () => {
-      const listed = spawnSync(
+      const listed = bounded(
         "git",
         ["ls-files", "*.ts", "*.tsx", "*.js", "*.mjs", "*.cjs", "*.mts"],
         { cwd: repoRoot, encoding: "utf8" },
@@ -2418,7 +2475,7 @@ describe("verify-tracker-loci-resolve", () => {
         };
       });
 
-      const otherListed = spawnSync("git", ["ls-files", "*.py", "*.sh", "*.yaml", "*.yml", "*.sql"], {
+      const otherListed = bounded("git", ["ls-files", "*.py", "*.sh", "*.yaml", "*.yml", "*.sql"], {
         cwd: repoRoot,
         encoding: "utf8",
       });
@@ -2734,22 +2791,22 @@ describe("verify-tracker-loci-resolve", () => {
       const dir = mkdtempSync(join(tmpdir(), "acp-tracker-loci-local-ref-"));
       try {
         writeFileSync(join(dir, "tracked.txt"), "tracked\n");
-        expect(spawnSync("git", ["init", "-q", "."], { cwd: dir }).status).toBe(0);
-        expect(spawnSync("git", ["add", "-A"], { cwd: dir }).status).toBe(0);
+        expect(bounded("git", ["init", "-q", "."], { cwd: dir }).status).toBe(0);
+        expect(bounded("git", ["add", "-A"], { cwd: dir }).status).toBe(0);
         expect(
-          spawnSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "fixture"], {
+          bounded("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "fixture"], {
             cwd: dir,
           }).status,
         ).toBe(0);
         expect(
-          spawnSync(
+          bounded(
             "git",
             ["remote", "add", "origin", "https://github.com/MongLong0214/agent-control-plane.git"],
             { cwd: dir },
           ).status,
         ).toBe(0);
         expect(
-          spawnSync("git", ["update-ref", "refs/heads/tracker-loci-review/reviewer-short-ref", "HEAD"], {
+          bounded("git", ["update-ref", "refs/heads/tracker-loci-review/reviewer-short-ref", "HEAD"], {
             cwd: dir,
           }).status,
         ).toBe(0);
@@ -2858,7 +2915,7 @@ describe("verify-tracker-loci-resolve", () => {
   describe("round 26 (#780) home-directory paths and repository-qualified citations", () => {
     /** `owner/repo` from `origin`, derived the same way the script derives its own identity. */
     const originSlug = (): string => {
-      const raw = spawnSync("git", ["remote", "get-url", "origin"], { cwd: repoRoot, encoding: "utf8" }).stdout.trim();
+      const raw = bounded("git", ["remote", "get-url", "origin"], { cwd: repoRoot, encoding: "utf8" }).stdout.trim();
       const match = raw.match(/github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?\/?$/);
       expect(match, `origin is not a GitHub remote: ${JSON.stringify(raw)}`).not.toBeNull();
       return `${match![1]}/${match![2]}`;
