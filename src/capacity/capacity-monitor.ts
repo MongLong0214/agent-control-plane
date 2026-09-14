@@ -3,7 +3,8 @@ import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import type { CapacityBucket, CapacityReading, ProviderRegistry } from "../runtime/provider.ts";
+import type { Role } from "../domain/types.ts";
+import type { CapacityBucket, CapacityReading, ProviderRegistry, RoleCapacityBinding } from "../runtime/provider.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import { USAGE_PROVIDERS } from "./usage-collectors.ts";
 
@@ -72,6 +73,10 @@ export interface ProviderCapacity extends CapacityReading {
    * because a human had typed a number would be presenting a probe failure as a pass.
    */
   supersededCollectorError?: { source: string; error: string | null };
+}
+
+export interface RoleProviderCapacity extends ProviderCapacity {
+  binding: { provider: string; role: Role; generation: number | null };
 }
 
 /** PRD §14.2 — the six points at which a refresh is mandatory. */
@@ -304,7 +309,57 @@ export interface ProviderFailureContinuity {
  * of routing on an unknown quota (§14.3).
  */
 export class CapacityMonitor {
+  // Deliberately not persisted: provider-global rows cannot represent role provenance.
+  readonly #roleSnapshots = new WeakMap<RoleCapacityBinding, CapacityReading>();
   readonly #options: Required<CapacityOptions>;
+
+  /** Measurement-only port; not yet wired into durable admission/continuity consumers. */
+  async refreshForRole(provider: string, role: Role): Promise<RoleProviderCapacity> {
+    const binding = this.providers.capacityBindingForRole(provider, role);
+    if (!binding) return this.unknownRoleCapacity(provider, role);
+    let reading: CapacityReading;
+    try {
+      reading = await binding.adapter.probeCapacity();
+      if (reading.provider !== provider) {
+        this.#roleSnapshots.delete(binding);
+        return this.unknownRoleCapacity(provider, role);
+      }
+    } catch {
+      this.#roleSnapshots.delete(binding);
+      return this.unknownRoleCapacity(provider, role);
+    }
+    if (this.providers.capacityBindingForRole(provider, role) !== binding) {
+      return this.unknownRoleCapacity(provider, role);
+    }
+    this.#roleSnapshots.set(binding, structuredClone(reading));
+    return this.roleCapacity(binding, reading);
+  }
+
+  currentForRole(provider: string, role: Role): RoleProviderCapacity | null {
+    const binding = this.providers.capacityBindingForRole(provider, role);
+    if (!binding) return null;
+    const reading = this.#roleSnapshots.get(binding);
+    return reading ? this.roleCapacity(binding, reading) : null;
+  }
+
+  private roleCapacity(binding: RoleCapacityBinding, reading: CapacityReading): RoleProviderCapacity {
+    return {
+      ...this.enrich(structuredClone(reading)),
+      binding: { provider: binding.provider, role: binding.role, generation: binding.generation },
+    };
+  }
+
+  private unknownCapacity(provider: string): ProviderCapacity {
+    return this.enrich({ provider, sensorHealth: "ERROR", runtimeHealth: "UNKNOWN",
+      observedAt: this.clock.nowIso(), source: "role-capacity-unavailable", buckets: [] });
+  }
+
+  private unknownRoleCapacity(provider: string, role: Role): RoleProviderCapacity {
+    return {
+      ...this.unknownCapacity(provider),
+      binding: { provider, role, generation: null },
+    };
+  }
   #providerFailureContinuity: ProviderFailureContinuity | null = null;
 
   constructor(
@@ -332,11 +387,13 @@ export class CapacityMonitor {
       // blind-review and provider-switch admission each pass their exact target) — that is
       // the "asked for" path #735 preserves. Only the unattended case, where nobody named a
       // provider, consults the exclusion list.
+      const ambiguous = providerIds?.filter((id) => this.providers.hasRoleScoped(id)) ?? [];
       const adapters = providerIds
-        ? providerIds.map((id) => this.providers.require(id))
-        : this.providers.list().filter((adapter) => this.isAutoProbeEnabled(adapter.provider));
+        ? providerIds.filter((id) => !this.providers.hasRoleScoped(id)).map((id) => this.providers.require(id))
+        : this.providers.list().filter((adapter) =>
+          !this.providers.hasRoleScoped(adapter.provider) && this.isAutoProbeEnabled(adapter.provider));
 
-      const readings: ProviderCapacity[] = [];
+      const readings: ProviderCapacity[] = ambiguous.map((provider) => this.unknownCapacity(provider));
       for (const adapter of adapters) {
         let reading: CapacityReading;
         try {
@@ -585,6 +642,10 @@ export class CapacityMonitor {
         { target: null },
       );
     }
+    if (this.providers.hasRoleScoped(target.provider)) {
+      return deny(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
+        "role-scoped capacity is not available through provider-only admission", { provider: target.provider });
+    }
     if (!this.providers.has(target.provider)) {
       await this.refresh(trigger);
       return deny(
@@ -752,6 +813,7 @@ export class CapacityMonitor {
 
   /** Latest known state for a provider, recomputed from the newest stored buckets. */
   current(provider: string): ProviderCapacity | null {
+    if (this.providers.hasRoleScoped(provider)) return this.unknownCapacity(provider);
     const rows = this.db.all<RawCapacity>(
       `SELECT * FROM capacity_snapshots
         WHERE provider = ? AND observed_at = (
@@ -794,6 +856,7 @@ export class CapacityMonitor {
   providersFor(capability: string): ProviderCapacity[] {
     return this.all().filter(
       (c) =>
+        !this.providers.hasRoleScoped(c.provider) &&
         this.providers.require(c.provider).isProduction &&
         c.allocationAdmission !== "SUSPENDED" &&
         c.runtimeHealth !== "UNAVAILABLE" &&

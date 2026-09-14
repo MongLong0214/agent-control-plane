@@ -504,7 +504,16 @@ class CapacityObservedAdapter implements ProviderAdapter {
  */
 const roleScopedKey = (provider: string, role: Role): string => `${provider}\u0000${role}`;
 
+export interface RoleCapacityBinding {
+  readonly provider: string;
+  readonly role: Role;
+  readonly generation: number;
+  readonly adapter: ProviderAdapter;
+}
+
 export class ProviderRegistry {
+  readonly #capacityBindings = new Map<string, RoleCapacityBinding>();
+  #capacityGeneration = 0;
   readonly #adapters = new Map<string, ProviderAdapter>();
   readonly #roleScoped = new Map<string, ProviderAdapter>();
   #capacity: RuntimeCapacityObserver | null = null;
@@ -541,6 +550,27 @@ export class ProviderRegistry {
       throw new Error(`provider '${adapter.provider}' is already registered for role '${role}'`);
     }
     this.#roleScoped.set(key, adapter);
+    this.#capacityBindings.set(key, Object.freeze({
+      provider: adapter.provider, role, generation: ++this.#capacityGeneration, adapter,
+    }));
+  }
+
+  /**
+   * Explicit scope-change notification. This generation is process-local registration
+   * evidence, NOT automatic detection of a credential/account change. The owner must
+   * invalidate before changing scope; a fresh probe is required before reusing capacity.
+   */
+  invalidateCapacityForRole(provider: string, role: Role): void {
+    const binding = this.capacityBindingForRole(provider, role);
+    if (!binding) return;
+    this.#capacityBindings.set(roleScopedKey(provider, role), Object.freeze({
+      ...binding, generation: ++this.#capacityGeneration,
+    }));
+  }
+
+  /** Capacity never falls back to a default or another role's adapter. */
+  capacityBindingForRole(provider: string, role: Role): RoleCapacityBinding | null {
+    return this.#capacityBindings.get(roleScopedKey(provider, role)) ?? null;
   }
 
   /**
