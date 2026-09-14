@@ -15,18 +15,18 @@
  * So this file's first job is reachability, proven in the two directions real git can produce,
  * and only then the fatal.
  */
-import { execFileSync } from "node:child_process";
 import { chmodSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { ManualClock } from "../../src/core/clock.ts";
 import { buildCandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
+import { boundedExecFileSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, gitSync, makeRepo, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
 
-const REAL_GIT = execFileSync("/usr/bin/env", ["sh", "-c", "command -v git"], {
+const REAL_GIT = boundedExecFileSync("/usr/bin/env", ["sh", "-c", "command -v git"], {
   encoding: "utf8",
 }).trim();
 
