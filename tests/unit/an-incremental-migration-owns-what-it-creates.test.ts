@@ -1,12 +1,12 @@
 import Database from "better-sqlite3";
 import { chmodSync, readFileSync, writeFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
 import { MIGRATIONS } from "../../src/db/migrations.ts";
+import { boundedExecFileSync } from "../helpers/bounded-sync-child.ts";
 import {
   FROZEN_BLOBS,
   driftedBlobs,
@@ -302,7 +302,7 @@ describe("#762 snapshot replays are not object owners", () => {
     // An imported function can reach the replay only if its module imports it. That is a fact
     // about the import graph, not about the walk, so it is measured here: production has exactly
     // one file naming the replay, and a second one would make every external edge unaccounted.
-    const producers = execFileSync(
+    const producers = boundedExecFileSync(
       "git",
       ["grep", "-l", REPLAY_FUNCTION, "--", "src"],
       { cwd: repoRoot, encoding: "utf8" },
