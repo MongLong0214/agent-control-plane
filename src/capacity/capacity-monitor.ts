@@ -256,6 +256,12 @@ const operatorObservationFromSource = (source: string): OperatorObservationProve
 };
 
 export interface DynamicReserveDemand {
+  /**
+   * Provenance of all scoped demand/burn numbers, supplied by the trusted allocator.
+   * Capacity generation is not an assignment generation. Provider-global DB history
+   * has no such provenance and must not be relabelled as a scoped measurement.
+   */
+  binding?: { provider: string; role: Role; generation: number };
   criticalRoleInvocations: number;
   expectedReviews: number;
   inFlightRuns: number;
@@ -282,6 +288,8 @@ export interface DynamicReserveDemand {
 /** The allocation selected by the caller after role routing, before it is activated. */
 export interface DispatchCapacityTarget {
   provider: string;
+  /** Explicit role selection; omitted only for a provider without scoped bindings. */
+  role?: Role;
   capabilities: readonly string[];
   /** Only lower-priority worker fan-out may consume the dynamic reserve. */
   priority?: "critical" | "worker";
@@ -313,7 +321,7 @@ export class CapacityMonitor {
   readonly #roleSnapshots = new WeakMap<RoleCapacityBinding, CapacityReading>();
   readonly #options: Required<CapacityOptions>;
 
-  /** Measurement-only port; not yet wired into durable admission/continuity consumers. */
+  /** Exact-binding measurement used by explicit-role admission; never provider-global persistence. */
   async refreshForRole(provider: string, role: Role): Promise<RoleProviderCapacity> {
     const binding = this.providers.capacityBindingForRole(provider, role);
     if (!binding) return this.unknownRoleCapacity(provider, role);
@@ -642,11 +650,11 @@ export class CapacityMonitor {
         { target: null },
       );
     }
-    if (this.providers.hasRoleScoped(target.provider)) {
+    if (target.role === undefined && this.providers.hasRoleScoped(target.provider)) {
       return deny(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
         "role-scoped capacity is not available through provider-only admission", { provider: target.provider });
     }
-    if (!this.providers.has(target.provider)) {
+    if (target.role === undefined && !this.providers.has(target.provider)) {
       await this.refresh(trigger);
       return deny(
         ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
@@ -655,7 +663,8 @@ export class CapacityMonitor {
       );
     }
     if (target.capabilities.length === 0) {
-      await this.refresh(trigger, [target.provider]);
+      if (target.role === undefined) await this.refresh(trigger, [target.provider]);
+      else await this.refreshForRole(target.provider, target.role);
       return deny(
         ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
         `${operation} capacity admission requires at least one required capability`,
@@ -675,9 +684,26 @@ export class CapacityMonitor {
     // probing here costs a failed probe and changes nothing — while a probe that *succeeds*
     // is a live measurement, and a live measurement is exactly what this gate exists to ask
     // for.
-    const readings = await this.refresh(trigger, [target.provider]);
-
-    const production = readings.filter((r) => this.providers.require(r.provider).isProduction);
+    let production: ProviderCapacity[];
+    if (target.role !== undefined) {
+      const binding = this.providers.capacityBindingForRole(target.provider, target.role);
+      const reading = await this.refreshForRole(target.provider, target.role);
+      if (trigger === RefreshTrigger.PROVIDER_SWITCH_OR_FAILURE && this.#providerFailureContinuity) {
+        await this.#providerFailureContinuity.evaluate(`capacity refresh after provider switch or allocation failure: ${target.provider}`);
+      }
+      // This guards explicit registry invalidation across awaits, not unannounced
+      // credential changes after lookup. Re-enrich below to apply TTL at decision time.
+      if (!binding || !binding.adapter.isProduction ||
+          this.providers.capacityBindingForRole(target.provider, target.role) !== binding ||
+          reading.binding.generation !== binding.generation) {
+        return deny(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
+          "the selected role capacity binding is unavailable or invalidated", { provider: target.provider, role: target.role });
+      }
+      production = [this.roleCapacity(binding, reading)];
+    } else {
+      const readings = await this.refresh(trigger, [target.provider]);
+      production = readings.filter((r) => this.providers.require(r.provider).isProduction);
+    }
     if (production.length === 0) {
       return deny(
         ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
@@ -732,6 +758,14 @@ export class CapacityMonitor {
     }
 
     if (target.priority === "worker") {
+      const demandBinding = target.reserveDemand?.binding;
+      const selectedBinding = "binding" in selected ? (selected as RoleProviderCapacity).binding : undefined;
+      if ((selectedBinding && (!demandBinding ||
+          demandBinding.provider !== selectedBinding.provider || demandBinding.role !== selectedBinding.role ||
+          demandBinding.generation !== selectedBinding.generation)) || (!selectedBinding && demandBinding)) {
+        return deny(ReasonCode.CAPACITY_ADMISSION_CONSERVE,
+          "worker reserve demand must belong to the selected capacity binding", { provider: selected.provider });
+      }
       if (!target.reserveDemand) {
         return deny(
           ReasonCode.CAPACITY_ADMISSION_CONSERVE,
