@@ -1,0 +1,29 @@
+Limit: this compares two declared numbers and runs nothing | a budget below what a green run costs still passes here, so fitting is not sufficiency
+Limit: hand-reading every converted file missed two of the four instances | the gate's first run found `canonical-self-claim-identity.test.ts:479` and a second site in the backup file, both taking the 55s default inside a 20s case
+Ruled-out: guessing at a case timeout this check cannot evaluate | a check that guesses at an expression it cannot evaluate is worse than one that says it could not read it, so anything unfoldable stays unresolved and is reported
+Record-Id: r-fa8e51ba55c2
+Provenance: inherited 590db2f9dc8be0c80520b995331598b8afe1f674
+
+Limit: `harness-refuses-concurrent-edits` still uses bare `spawn` for the writer it races | that one is detached and out of this census's scope by design — the file's subject is the race, and the async child is what makes the race observable
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited 6d2f170f180bce5e690d2d17bfd4b120392f02a7
+
+Limit: the three `execFile` timeouts are checked by the census's syntax, not by a case | nothing here fails if a later edit drops one, beyond the census noticing the count went up
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited f9eb76ff5adfab4f978e26078f1d463337c40659
+
+Limit: the e2e conversion is unexecuted locally | it runs only where the component-integration project is configured, so the first real exercise of these six bounds is that environment
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited d425bca4a93a0f0575645d1ad2ac700b408ba0b7
+
+Limit: zero unbounded calls is not zero wedges | every bound here is `spawnSync`'s own, which signals the direct child and not its process group, so a grandchild still survives (measured: `grandchildStillAlive: true`) — what changed is that "forever" is now a failure naming the command
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited 190dadbb2303d2fd22b99ac9a8971537d99f6d0e
