@@ -1,10 +1,10 @@
-import { spawnSync } from "node:child_process";
 import { createServer, type AddressInfo } from "node:net";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 
 import { afterAll, describe, expect, it, vi } from "vitest";
 
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { ControlPlane, defaultConfig } from "../../src/app/control-plane.ts";
 import {
   parseVerificationCommand,
@@ -136,7 +136,7 @@ for probe in probes:
 const usablePython3 = (): string => {
   for (const candidate of ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]) {
     if (!existsSync(candidate)) continue;
-    if (spawnSync(candidate, ["--version"], { encoding: "utf8" }).status === 0) return candidate;
+    if (boundedSpawnSync(candidate, ["--version"], { encoding: "utf8" }).status === 0) return candidate;
   }
   return "/usr/bin/python3";
 };
