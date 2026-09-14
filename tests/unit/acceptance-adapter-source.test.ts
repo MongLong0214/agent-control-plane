@@ -1,10 +1,10 @@
-import { spawnSync } from "node:child_process";
 import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { acpScratchDir } from "../../src/core/scratch-root.ts";
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 
 /**
  * Four adapter options were lost one at a time because `adapters:` replaces what `ControlPlane`
@@ -21,7 +21,7 @@ afterAll(() => {
 
 describe("the acceptance overrides adapter options rather than replacing adapters (#552)", () => {
   it("passes against the tree as committed", () => {
-    const result = spawnSync(process.execPath, [script], { cwd: repoRoot, encoding: "utf8" });
+    const result = boundedSpawnSync(process.execPath, [script], { cwd: repoRoot, encoding: "utf8" });
     expect(result.status, result.stdout + result.stderr).toBe(0);
   });
 
@@ -37,7 +37,7 @@ describe("the acceptance overrides adapter options rather than replacing adapter
       `${readFileSync(acceptance, "utf8")}\nconst regression = new ClaudeCliAdapter({ clock });\n`,
     );
 
-    const result = spawnSync(process.execPath, [join(dir, "scripts", "verify-acceptance-adapter-source.mjs")], {
+    const result = boundedSpawnSync(process.execPath, [join(dir, "scripts", "verify-acceptance-adapter-source.mjs")], {
       encoding: "utf8",
     });
     expect(result.status, "the acceptance replaced the deployment's adapters unnoticed").toBe(1);

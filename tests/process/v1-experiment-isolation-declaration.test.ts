@@ -1,10 +1,10 @@
-import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { expect, it } from "vitest";
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const script = join(root, "scripts", "verify-v1-experiment-isolation-declaration.mjs");
@@ -23,7 +23,7 @@ interface Census {
 const census = (fixtureRoot?: string): { exitCode: number | null; report: Census } => {
   const args = [script, "--json"];
   if (fixtureRoot) args.push(`--root=${fixtureRoot}`);
-  const result = spawnSync(process.execPath, args, { cwd: root, encoding: "utf8" });
+  const result = boundedSpawnSync(process.execPath, args, { cwd: root, encoding: "utf8" });
   if (result.error) throw result.error;
   try {
     return { exitCode: result.status, report: JSON.parse(result.stdout) as Census };

@@ -431,7 +431,7 @@ export class Outbox {
             -- never judged retryable, so it is not picked up.
             AND (o.attempts = 0 OR o.retry_eligible = 1)
             AND ${liveDeliveryTarget("o")}
-          ORDER BY o.created_at
+          ORDER BY o.created_at, o.rowid
           LIMIT ?`,
         [now, now, limit],
       );
@@ -499,7 +499,7 @@ export class Outbox {
               AND o.status = 'SENT'
               AND o.role_key = ? AND o.binding_generation = ? AND o.target_session_id = ?
               AND ${exactHolderTarget("o")}
-            ORDER BY o.created_at`,
+            ORDER BY o.created_at, o.message_id`,
           tuple,
         )
         .map(unresolvedOwnerMessage);
@@ -524,13 +524,54 @@ export class Outbox {
       // given neither payload until it settles the first.
       if (unresolved.length > 0) return { claimed: [], unresolved, hasMore: queued > 0 };
 
+      // ORDER BY o.created_at, o.message_id — the tiebreaker is load-bearing here and this is
+      // the site where saying so matters most (#858).
+      //
+      // Two things this pair does not give, both measured rather than assumed.
+      //
+      // It is not total at the schema level: `message_id TEXT PRIMARY KEY` carries no `NOT NULL`
+      // and SQLite permits NULL in a non-INTEGER primary key, so two NULL-id rows insert and the
+      // composite ties again. Not reachable from `src/`, where every writer mints through
+      // `newMessageId()`, but a raw-SQL writer is in this repository's threat model.
+      //
+      // `o.rowid`, and the reason is which orders a tiebreaker preserves. Two minted ids were
+      // tried and both changed *which row* this `LIMIT` returns —
+      // `outbox-owner-message-holder.test.ts` expected the message it had queued and got another,
+      // under `message_id` and again under `idempotency_key`. `rowid` does not:
+      //
+      //     inserted c, a, b        ORDER BY created_at              -> c
+      //                             ORDER BY created_at, message_id  -> a   (a different row)
+      //                             ORDER BY created_at, rowid       -> c   (the same row)
+      //
+      // A minted id sorts arbitrarily; rowid is assigned in insertion order, which for a queue is
+      // the order the rows arrived. So this pair is total *and* keeps the answer the untied query
+      // already gave, which is the part a census cannot check and a consumer can.
+      //
+      // What it is not: a declared contract. `rowid` is SQLite's, not this schema's — a `VACUUM`
+      // or a table rebuild renumbers it, and a delete lets a value be reused, because this table
+      // is not `AUTOINCREMENT`. Both only reorder rows that are already tied on `created_at`, and
+      // nothing here reads the number itself. Making arrival order a column the schema states is a
+      // migration and remains #858's, not this query's.
+      //
+      // `created_at` is millisecond ISO text, and 400 consecutive `systemClock.nowIso()` calls
+      // were measured returning one distinct timestamp. This query is `LIMIT 1`: it decides which
+      // PENDING message the holder is handed next. With a tie and no second term, that choice was
+      // the query planner's, so two owner messages queued in the same millisecond had no defined
+      // order of answering.
+      //
+      // What the tiebreaker does and does not buy, stated rather than implied: `message_id` is
+      // random (`msg_97aa06bf…`), not time-ordered, so `(created_at, message_id)` is **total and
+      // reproducible, and it is not arrival order**. Within one millisecond the winner is
+      // arbitrary — but the same arbitrary one on every run and every replica, which is what the
+      // planner's choice was not. Making it arrival order needs a monotonic column, which is a
+      // schema change and is not this.
       const candidate = this.db.get<RawOutbox>(
         `SELECT o.* FROM outbox o
           WHERE o.kind IN (${HOLDER_CLAIMED_KIND_SQL})
             AND o.status = 'PENDING'
             AND o.role_key = ? AND o.binding_generation = ? AND o.target_session_id = ?
             AND ${exactHolderTarget("o")}
-          ORDER BY o.created_at
+          ORDER BY o.created_at, o.rowid
           LIMIT 1`,
         tuple,
       );
@@ -1095,7 +1136,7 @@ export class Outbox {
           WHERE role_key = ? AND binding_generation = ? AND target_session_id = ?
             AND kind IN (${HOLDER_CLAIMED_KIND_SQL})
             AND status IN ('PENDING','SENT')
-          ORDER BY created_at`,
+          ORDER BY created_at, message_id`,
         [roleKey, bindingGeneration, fromSessionId],
       );
 
@@ -1180,7 +1221,7 @@ export class Outbox {
 
   listByRun(runId: string): OutboxMessage[] {
     return this.db
-      .all<RawOutbox>(`SELECT * FROM outbox WHERE run_id = ? ORDER BY created_at`, [runId])
+      .all<RawOutbox>(`SELECT * FROM outbox WHERE run_id = ? ORDER BY created_at, message_id`, [runId])
       .map(hydrate);
   }
 

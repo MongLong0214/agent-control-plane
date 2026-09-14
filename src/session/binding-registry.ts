@@ -770,7 +770,7 @@ export class BindingRegistry {
          LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
         WHERE a.run_id = ?
             OR task_id IN (SELECT task_id FROM tasks WHERE run_id = ?)
-          ORDER BY created_at`,
+          ORDER BY created_at, assignment_id`,
         [runId, runId],
       )
       .map(hydrate);
@@ -778,7 +778,7 @@ export class BindingRegistry {
 
   bySession(sessionId: string): RoleBinding[] {
     return this.db
-      .all<RawAssignment>(`SELECT * FROM assignments WHERE session_id = ? ORDER BY created_at`, [
+      .all<RawAssignment>(`SELECT * FROM assignments WHERE session_id = ? ORDER BY created_at, assignment_id`, [
         sessionId,
       ])
       .map(hydrate);

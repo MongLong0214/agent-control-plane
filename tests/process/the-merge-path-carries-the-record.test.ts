@@ -1,8 +1,8 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { spawnSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { collapseTrailerParagraphs } from "../../scripts/lib/collapse-trailer-paragraphs.mjs";
 
@@ -35,7 +35,7 @@ const ROOT = process.cwd();
 const verify = (message: string): { status: number; stdout: string } => {
   const file = join(tempDir("acp-trailer-msg-"), "MESSAGE");
   writeFileSync(file, message);
-  const out = spawnSync(
+  const out = boundedSpawnSync(
     process.execPath,
     [join(ROOT, "scripts/verify-trailers-are-parsable.mjs"), "--message-file", file],
     { cwd: ROOT, encoding: "utf8" },
@@ -106,7 +106,7 @@ describe("the trailer check sees what git stores, not what the message looks lik
 
   it("reports a range it cannot resolve as a failure, not as a clean result", () => {
     // A check that answers without having looked is the shape this whole file is about.
-    const out = spawnSync(
+    const out = boundedSpawnSync(
       process.execPath,
       [join(ROOT, "scripts/verify-trailers-are-parsable.mjs"), "refs/nothing/here..HEAD"],
       { cwd: ROOT, encoding: "utf8" },
@@ -140,7 +140,7 @@ describe("the inherited records are collapsed into one block git will keep", () 
     expect(collapsed).toContain("the first commit's record.\nProvenance: inherited aaaaaaa\nLimit:");
     // The property, stated where it can fail: git keeps every line, and each record still precedes
     // the provenance it belongs to.
-    const parsed = spawnSync("git", ["interpret-trailers", "--parse"], {
+    const parsed = boundedSpawnSync("git", ["interpret-trailers", "--parse"], {
       cwd: ROOT,
       encoding: "utf8",
       input: collapsed,
@@ -163,7 +163,7 @@ describe("the inherited records are collapsed into one block git will keep", () 
 
 describe("the merge path asks before the commit exists", () => {
   it("refuses arguments it cannot check rather than merging on a default", () => {
-    const out = spawnSync(process.execPath, [join(ROOT, "scripts/merge-pr.mjs")], {
+    const out = boundedSpawnSync(process.execPath, [join(ROOT, "scripts/merge-pr.mjs")], {
       cwd: ROOT,
       encoding: "utf8",
     });

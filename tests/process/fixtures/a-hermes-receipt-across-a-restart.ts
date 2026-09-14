@@ -3,7 +3,6 @@
  * uses the production HermesReceiptPort seam, not a hand-built receipt object, so the test can
  * distinguish a terminal executor result from a caller merely repeating the turn identity.
  */
-import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { canonicalJson, digestOf } from "../../../src/core/digest.ts";
@@ -15,6 +14,7 @@ import type { TelegramBotTransport } from "../../../src/ingress/telegram-polling
 import type { TelegramUpdate } from "../../../src/ingress/telegram.ts";
 import type { HermesAcpResult } from "../../../src/runtime/hermes-acp-client.ts";
 import type { HermesAcpExecute, HermesReceiptPortOptions } from "../../../src/runtime/hermes-receipt-port.ts";
+import { boundedSpawnSync } from "../../helpers/bounded-sync-child.ts";
 import { bindCeo, makeHarness, TEST_OWNER } from "../../helpers/harness.ts";
 
 export const OWNER_ID = "424242";
@@ -245,7 +245,7 @@ const restart = async (root: string, mode: ReceiptMode): Promise<RestartReport> 
 const SCRIPT = fileURLToPath(import.meta.url);
 
 export const runInItsOwnProcess = <T>(mode: "claim" | "restart", ...args: readonly string[]): T => {
-  const done = spawnSync(process.execPath, ["--import", "tsx", SCRIPT, mode, ...args], {
+  const done = boundedSpawnSync(process.execPath, ["--import", "tsx", SCRIPT, mode, ...args], {
     encoding: "utf8",
     cwd: fileURLToPath(new URL("../../..", import.meta.url)),
     env: { ...process.env, NODE_OPTIONS: "" },

@@ -1,5 +1,4 @@
 import { describe, expect, it } from "vitest";
-import { spawnSync } from "node:child_process";
 
 import {
   SESSION_METADATA_KEYS,
@@ -8,6 +7,7 @@ import {
   withoutSessionMetadata,
 } from "../../src/github/merge-commit-message.ts";
 import { RECORD_TRAILER_KEYS } from "../../scripts/lib/record-trailer-keys.mjs";
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 
 /**
  * What the daemon publishes into `main` when it squashes an approved pull request.
@@ -29,7 +29,7 @@ const SESSION_URL = "https://claude.ai/code/session_0000000000000000000000";
 
 /** Lines git will store as trailers, asked of git rather than of a regex that restates its rule. */
 const parsedTrailers = (message: string): string[] =>
-  (spawnSync("git", ["interpret-trailers", "--parse"], { encoding: "utf8", input: message }).stdout ?? "")
+  (boundedSpawnSync("git", ["interpret-trailers", "--parse"], { encoding: "utf8", input: message }).stdout ?? "")
     .split("\n")
     .filter((line) => line.trim() !== "");
 
@@ -394,7 +394,7 @@ describe("the record blocks the SPEC recognises survive the composition", () => 
     const paragraphs = message.split(/\n{2,}/).filter((p) => p.trim() !== "");
     const ids: string[] = [];
     for (const paragraph of paragraphs) {
-      const parsed = spawnSync("git", ["interpret-trailers", "--parse"], {
+      const parsed = boundedSpawnSync("git", ["interpret-trailers", "--parse"], {
         encoding: "utf8",
         input: `subject\n\n${paragraph}\n`,
       }).stdout ?? "";
