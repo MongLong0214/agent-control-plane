@@ -692,7 +692,7 @@ export class CtoLifecycle {
 
     if (current && session && session.lifecycle !== SessionLifecycle.STOPPED) {
       try {
-        await this.providers.require(session.provider).stopSession({
+        await this.providers.requireForRole(session.provider, Role.PRIMARY_CTO).stopSession({
           externalSessionId: current.sessionId,
           provider: session.provider,
           model: session.model,
@@ -835,7 +835,9 @@ export class CtoLifecycle {
 
   /** Fresh session → Buzz → doctor readiness. Any failed step stops the activation. */
   private async spawn(projectId: string, purpose: string): Promise<Decision<string>> {
-    const adapter = this.providers.get(this.preference.provider);
+    const adapter = this.providers.hasRoleScoped(this.preference.provider)
+      ? this.providers.requireForRole(this.preference.provider, Role.PRIMARY_CTO)
+      : this.providers.get(this.preference.provider);
     if (!adapter) {
       return deny(ReasonCode.NOT_FOUND, "no adapter for the preferred CTO provider", {
         provider: this.preference.provider,
@@ -941,7 +943,9 @@ export class CtoLifecycle {
    * the probe addresses the provider's own id rather than the control plane's alias.
    */
   private async probeBoundSession(session: SessionRecord): Promise<Decision<void>> {
-    const adapter = this.providers.get(session.provider);
+    const adapter = this.providers.hasRoleScoped(session.provider)
+      ? this.providers.requireForRole(session.provider, Role.PRIMARY_CTO)
+      : this.providers.get(session.provider);
     if (!adapter) {
       return deny(ReasonCode.SESSION_NOT_READY, "no adapter can prove the bound CTO session is live", {
         provider: session.provider,
@@ -955,7 +959,7 @@ export class CtoLifecycle {
     const session = this.sessions.get(sessionId);
     if (!session || session.lifecycle === SessionLifecycle.STOPPED) return;
     try {
-      await this.providers.require(session.provider).stopSession({
+      await this.providers.requireForRole(session.provider, Role.PRIMARY_CTO).stopSession({
         externalSessionId: sessionId,
         provider: session.provider,
         model: session.model,
