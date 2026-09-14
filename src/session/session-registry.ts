@@ -384,17 +384,17 @@ export class SessionRegistry {
 
   list(lifecycle?: SessionLifecycle): SessionRecord[] {
     const rows = lifecycle
-      ? this.db.all<RawSession>(`SELECT * FROM sessions WHERE lifecycle = ? ORDER BY created_at`, [
+      ? this.db.all<RawSession>(`SELECT * FROM sessions WHERE lifecycle = ? ORDER BY created_at, session_id`, [
           lifecycle,
         ])
-      : this.db.all<RawSession>(`SELECT * FROM sessions ORDER BY created_at`);
+      : this.db.all<RawSession>(`SELECT * FROM sessions ORDER BY created_at, session_id`);
     return rows.map(hydrate);
   }
 
   live(): SessionRecord[] {
     return this.db
       .all<RawSession>(
-        `SELECT * FROM sessions WHERE lifecycle IN ('STARTING','READY','DRAINING') ORDER BY created_at`,
+        `SELECT * FROM sessions WHERE lifecycle IN ('STARTING','READY','DRAINING') ORDER BY created_at, session_id`,
       )
       .map(hydrate);
   }

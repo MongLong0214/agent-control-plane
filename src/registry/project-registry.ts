@@ -225,7 +225,7 @@ export class ProjectRegistry {
 
   list(): ProjectRecord[] {
     return this.db
-      .all<RawProject>(`SELECT * FROM projects ORDER BY created_at`)
+      .all<RawProject>(`SELECT * FROM projects ORDER BY created_at, project_id`)
       .map((row) => this.hydrate(row));
   }
 

@@ -71,6 +71,31 @@ describe("a timestamp ordering names a tiebreaker", () => {
     expect(stdout).toContain("0 timestamp ordering(s)");
   });
 
+  it("does not let prose about an ordering count as the ordering", async () => {
+    // The case that made this necessary: a comment quoting the query it explains was counted as a
+    // satisfied site, so `src/` reported one more total ordering than it has. A census a comment
+    // can satisfy measures the prose beside the code, which is the failure it exists to find.
+    const root = treeWith({
+      "probe.ts":
+        "// `ORDER BY o.created_at, o.message_id` — the tiebreaker is load-bearing here\n" +
+        " * ORDER BY created_at, message_id\n" +
+        "/* ORDER BY created_at, message_id */\n",
+    });
+    const { status, stdout } = await run([`--root=${root}`]);
+    expect(status).toBe(0);
+    expect(stdout).toContain("0 timestamp ordering(s)");
+  });
+
+  it("still reads a real ordering on a line that also carries a trailing comment", async () => {
+    // The stated boundary of the fix above: only a line that *begins* as a comment is skipped.
+    const root = treeWith({
+      "probe.ts": "const q = `... ORDER BY created_at`; // ORDER BY created_at, id\n",
+    });
+    const { status, stdout } = await run([`--root=${root}`]);
+    expect(status).toBe(1);
+    expect(stdout).toContain("0 name a tiebreaker and 1 do not");
+  });
+
   it("refuses an argument it does not know rather than scanning something unintended", async () => {
     const { status, stderr } = await run(["--help"]);
     expect(status).toBe(2);
