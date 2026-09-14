@@ -267,7 +267,7 @@ describe("U6-UNIT3 migrate-approved-copy runs in the file it verified", () => {
     const barrier = (label: string) => {
       const ready = join(dir, `${label}-ready.fifo`);
       const release = join(dir, `${label}-release.fifo`);
-      expect(spawnSync("mkfifo", [ready, release]).status, "mkfifo").toBe(0);
+      expect(spawnSync("mkfifo", [ready, release], { timeout: 30_000 }).status, "mkfifo").toBe(0);
       const preload = join(dir, `${label}-preload.mjs`);
       writeFileSync(
         preload,
