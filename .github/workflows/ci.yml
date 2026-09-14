@@ -11,6 +11,11 @@ name: project-ci
 on:
   push:
     branches: [main, 'release/**', 'hotfix/**']
+  # A daily full run is what keeps `main` swept after the mutation shards stopped running on
+  # `push` — see `guard-falsifiability`'s own condition below for why that duplication was the
+  # thing to remove rather than to retry.
+  schedule:
+    - cron: '41 5 * * *'
   # No base filter. `branches` under `pull_request` matches the PR's *base*, so every prefix a
   # pull request can target has to be listed or that PR gets no checks at all — and a list of
   # prefixes goes stale exactly like any other check keyed by a name rather than by content.
@@ -163,7 +168,20 @@ jobs:
   guard-falsifiability:
     name: guard falsifiability
     needs: verify-matrix
-    if: always()
+    # Not on `push`. A squash merge lands the same tree the pull request's merge commit already
+    # swept, so the post-merge shards re-derive a verdict that exists — and they are the expensive
+    # four of the run: measured on this repository, 113 of a main run's 139 macOS-minutes, 81%.
+    # With runner supply observed at three concurrent macOS jobs, every merge put four more in
+    # front of the next pull request; seven merges in one session is 791 minutes of queue spent
+    # re-proving merged trees.
+    #
+    # `a9c8c56a` already ruled on this shape for the suite itself — "it was a duplicate execution,
+    # and the fix is to not run it twice" — and the same reading applies one job over.
+    #
+    # `main` is not left unswept: the daily `schedule` above runs the whole workflow, this job
+    # included, and `schedule` is not `push`. What is given up is the hours between a merge and
+    # that run, on a tree a pull request had already swept green.
+    if: always() && github.event_name != 'push'
     runs-on: macos-15
     strategy:
       # A shard that fails must not cancel the others. Each leg checks a disjoint quarter, so
