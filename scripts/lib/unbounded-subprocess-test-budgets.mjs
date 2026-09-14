@@ -2,8 +2,8 @@
  * How many blocking subprocess calls each file under `tests/` still makes without a time bound.
  *
  * `src/` is nearly bounded and its two remaining calls are named one by one in
- * `unbounded-subprocess-exclusions.mjs`. `tests/` is not: 162 calls across 55 files, which is
- * where the #872 failure actually lived. A blocking call in a test is not a lesser problem than
+ * `unbounded-subprocess-exclusions.mjs`. `tests/` was not: 181 calls across 56 files when this
+ * census was first taken, which is where the #872 failure actually lived. A blocking call in a test is not a lesser problem than
  * one in the product — `spawnSync` holds the event loop, so Vitest's own per-test timeout cannot
  * interrupt it, and Vitest then reports the timeout against whichever test the stalled worker
  * happened to be holding. Measured: three consecutive full-suite runs produced three *different*
@@ -23,10 +23,21 @@
  * Remove an entry by bounding its calls. `tests/helpers/bounded-child.ts` is the shape that
  * works for a child that can hang: it spawns rather than blocks, and reaps the child's whole
  * process group at the budget, because `spawnSync`'s own `timeout` signals only the direct child
- * (measured: `grandchildStillAlive: true`).
+ * (measured: `grandchildStillAlive: true`). Most of the backlog took the weaker synchronous bound
+ * in `tests/helpers/bounded-sync-child.ts` instead, because the sites are synchronous and making
+ * them async is a different change repeated a hundred times; that file states the difference.
  *
- * sol-simplify: the backlog stays visible; remove entries as the calls are bounded (#872).
+ * **The map is empty, and it stays.** 181 -> 0. Every blocking call under `tests/` now states a
+ * time bound, so there is no backlog left to make visible — but an empty allow-list is not a dead
+ * one. It is the ratchet at its end position: the census reads a file with no entry as permitting
+ * zero unbounded calls, so the *next* one fails whichever file it lands in, with no entry to
+ * quietly raise. Deleting this map would delete that, and the census would have to be taught the
+ * rule some other way.
+ *
+ * Two calls remain unbounded in the whole repository, both under `src/` and both on purpose, each
+ * with its own reason in `unbounded-subprocess-exclusions.mjs`. Neither is a backlog item.
+ *
+ * sol-simplify: the backlog is closed; the empty map is the ratchet, not a leftover (#872).
  */
 export const UNBOUNDED_SUBPROCESS_TEST_BUDGETS = new Map([
-  ["tests/unit/tracker-loci-strip-invariants.test.ts", 1],
 ]);

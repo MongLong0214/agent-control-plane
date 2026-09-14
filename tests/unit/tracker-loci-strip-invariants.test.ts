@@ -1,5 +1,7 @@
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
+
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import {
   blankKeepingNewlines,
   stripHashComments,
@@ -625,11 +627,10 @@ describe("tracker-loci strip invariants", () => {
     });
 
     it("every parsed regex and division token in the tracked JS family keeps its lexical role", () => {
-      const { spawnSync } = require("node:child_process");
       const fs = require("node:fs");
       const path = require("node:path");
       const repoRoot = path.join(__dirname, "..", "..");
-      const listed = spawnSync("git", ["ls-files", "*.ts", "*.tsx", "*.js", "*.mjs", "*.cjs", "*.mts"], {
+      const listed = boundedSpawnSync("git", ["ls-files", "*.ts", "*.tsx", "*.js", "*.mjs", "*.cjs", "*.mts"], {
         cwd: repoRoot,
         encoding: "utf8",
       });
