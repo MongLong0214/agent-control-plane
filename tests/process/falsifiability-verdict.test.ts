@@ -1,9 +1,9 @@
-import { execFileSync, spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterEach(cleanupTempDirs);
@@ -75,11 +75,11 @@ ${options.missing ? "" : `fs.writeFileSync(path, ${JSON.stringify(options.malfor
 process.exit(${exitCode});
 `);
   }
-  const git = (args: string[]) => execFileSync("git", args, { cwd: root, encoding: "utf8" });
+  const git = (args: string[]) => boundedExecFileSync("git", args, { cwd: root, encoding: "utf8" });
   git(["init", "--quiet"]);
   git(["add", target]);
   git(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "Create guard fixture"]);
-  const result = spawnSync(process.execPath, [join(root, "scripts/verify-guards-are-falsifiable.mjs"),
+  const result = boundedSpawnSync(process.execPath, [join(root, "scripts/verify-guards-are-falsifiable.mjs"),
     "--only=verdict-probe"], { cwd: root, encoding: "utf8" });
   expect(result.error).toBeUndefined();
   expect(readFileSync(join(root, target), "utf8")).toBe(original);

@@ -1,9 +1,11 @@
-import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
+import type { SpawnSyncReturns } from "node:child_process";
+
 import { afterAll, describe, expect, it } from "vitest";
 
+import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { CASES_DIR, loadFalsifiabilityCases } from "../../scripts/lib/falsifiability-cases.mjs";
 
@@ -144,7 +146,7 @@ describe("the falsifiability case loader is fail-closed", () => {
 
 describe("a broken case module stops the harness before the run starts", () => {
   const git = (args: readonly string[], cwd: string): string =>
-    execFileSync("git", [...args], { cwd, encoding: "utf8" }).trim();
+    boundedExecFileSync("git", [...args], { cwd, encoding: "utf8" }).trim();
 
   /**
    * The whole of acceptance 2, end to end, through the real script.
@@ -163,7 +165,7 @@ describe("a broken case module stops the harness before the run starts", () => {
   const inWorktreeWithCase = (
     caseFile: string | null,
     body: string,
-    run: (result: ReturnType<typeof spawnSync>) => void,
+    run: (result: SpawnSyncReturns<string>) => void,
   ): void => {
     const parent = tempDir("acp-741-e2e-");
     const worktree = join(parent, "checkout");
@@ -171,7 +173,7 @@ describe("a broken case module stops the harness before the run starts", () => {
     try {
       if (caseFile !== null) writeFileSync(join(worktree, CASES_DIR, caseFile), body);
       run(
-        spawnSync(
+        boundedSpawnSync(
           process.execPath,
           [join(worktree, "scripts", "verify-guards-are-falsifiable.mjs"), "--anchors-only"],
           { cwd: worktree, encoding: "utf8" },
