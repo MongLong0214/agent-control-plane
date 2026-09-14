@@ -1,0 +1,16 @@
+Limit: the denial probe needs a path that exists, and with an empty deny list its only candidates are the ambient ~/.claude and ~/.codex
+Warn: do not give a reviewer-isolation case an empty denyReadPaths: the attestation then depends on the developer's home directory and the case turns red on any clean host
+Blast: local
+Certainty: firm
+Record-Id: r-1655b6b483f0
+Evidence: tests/unit/reviewer-isolation-probes.test.ts
+Provenance: inherited 50857fa137420b858dda41594cb91df39cb50f94
+
+Limit: `list()` hands out a role-scoped adapter as a provider's representative | no current consumer dispatches through it, but one that did would act in whichever role registered first
+Limit: eighteen operands are recorded as unanswered, not tested | each states the measurement and the counterexample that would make it decisive, and none of them has a witness today
+Ruled-out: adding an unscoped `register()` for the role-scoped adapters | `register` refuses a duplicate provider, so one of the two Claude adapters would win and a role-less `require` would silently get it
+Ruled-out: relaxing the role-less refusal in `require`/`get` | the callers that hit it were asking provider-level questions, so the fix belongs at the call site
+Blast: module
+Undo: easy
+Certainty: firm
+Provenance: inherited 31c39ce235f8672c44b7d0408b8d3543e6410e0d
