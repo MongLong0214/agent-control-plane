@@ -478,10 +478,33 @@ const staticArgvEntrypoint = (executable, argv, name, constants) => {
   return Boolean(elements[entryAt]) && expressionResolvesToScript(elements[entryAt], name, constants);
 };
 
+/**
+ * The shapes that put a script path in argv, including the two bounded wrappers.
+ *
+ * `boundedSpawnSync` and `boundedExecFileSync` (tests/helpers/bounded-sync-child.ts) take
+ * `(file, argv, options)` exactly as their subjects do and forward both unchanged, adding only a
+ * `timeout`. So argv[1] is still where the script path is, and this scan reads the same position
+ * it always did.
+ *
+ * They are listed by name rather than resolved through the import, which is the opposite of the
+ * decision `verify-tests-do-not-exec-new-inodes.mjs` makes about the same two names. The reason is
+ * this census's own semantics: it counts *plausible* sites and says so — a locally defined fake
+ * named `spawnSync` already counts here, and has a case pinning that. A census that credits a fake
+ * and refuses a real wrapper because the import was spelled differently would be inconsistent with
+ * itself.
+ *
+ * Measured, #872: converting test files to the wrappers took `buzz-send.mjs` and
+ * `verify-tx-denial-sites.mjs` from one plausible caller each to none, and this census failed for
+ * scripts nothing had changed. A check that names the callers it understands goes stale the moment
+ * a caller is rewritten — which is the same failure #705 created it to catch, arriving from the
+ * other direction.
+ */
+const ARGV_EXEC_APIS = ["spawn", "spawnSync", "execFile", "execFileSync", "boundedSpawnSync", "boundedExecFileSync"];
+
 const testFileHasPlausibleSpawn = (source, scriptName) => {
   const masked = maskNonCode(source);
   const constants = constantsIn(source, masked);
-  const call = /\b(?:spawn|spawnSync|execFile|execFileSync)\s*\(/g;
+  const call = new RegExp(String.raw`\b(?:${ARGV_EXEC_APIS.join("|")})\s*\(`, "g");
   for (const match of masked.matchAll(call)) {
     const openAt = match.index + match[0].lastIndexOf("(");
     const closeAt = findClosingParen(masked, openAt);
