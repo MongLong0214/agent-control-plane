@@ -52,8 +52,6 @@ export const UNBOUNDED_SUBPROCESS_TEST_BUDGETS = new Map([
   ["tests/unit/an-approval-is-a-capability-over-one-database.test.ts", 3],
   ["tests/unit/an-incremental-migration-owns-what-it-creates.test.ts", 1],
   ["tests/unit/an-unreadable-worktree-listing-is-not-an-empty-one.test.ts", 1],
-  ["tests/unit/doctor-daemon-r2.test.ts", 2],
-  ["tests/unit/guard-hardening.test.ts", 2],
   ["tests/unit/handoff-p1-boundaries.test.ts", 1],
   ["tests/unit/local-write-broker.test.ts", 1],
   ["tests/unit/operator-socket.test.ts", 2],
