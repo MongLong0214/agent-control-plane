@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import { chmodSync, closeSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
@@ -8,6 +7,7 @@ import Database from "better-sqlite3";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { FdVfsControl, withBoundDescriptor } from "../../src/db/fd-vfs.ts";
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -88,7 +88,7 @@ const compileTestingArtifact = (label: string, transform?: (source: string) => s
     "deps",
     "sqlite3",
   );
-  const result = spawnSync(
+  const result = boundedSpawnSync(
     process.env["CC"] ?? "cc",
     ["-O1", "-fPIC", "-shared", "-DACP_FD_VFS_TESTING", `-I${includes}`, "-o", out, source],
     { encoding: "utf8" },
@@ -307,7 +307,7 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
       { mode: 0o600 },
     );
 
-    const run = spawnSync(process.execPath, ["--import", "tsx", driver], { encoding: "utf8" });
+    const run = boundedSpawnSync(process.execPath, ["--import", "tsx", driver], { encoding: "utf8" });
     expect(run.status, `${label} race driver failed: ${run.stderr}`).toBe(0);
     expect(run.stderr, `${label} race driver warned: ${run.stderr}`).toBe("");
     return JSON.parse(run.stdout) as ReturnType<typeof raceWith>;
@@ -446,7 +446,7 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
       ].join("\n"),
       { mode: 0o600 },
     );
-    const run = spawnSync(process.execPath, ["--import", "tsx", script], { encoding: "utf8" });
+    const run = boundedSpawnSync(process.execPath, ["--import", "tsx", script], { encoding: "utf8" });
     expect(run.status, `entropy child failed: ${run.stderr}`).toBe(0);
     const report = JSON.parse(run.stdout) as Record<string, { bound: boolean; lease?: string } | string>;
 
@@ -505,7 +505,7 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
       ].join("\n"),
       { mode: 0o600 },
     );
-    const run = spawnSync(process.execPath, ["--import", "tsx", script], { encoding: "utf8" });
+    const run = boundedSpawnSync(process.execPath, ["--import", "tsx", script], { encoding: "utf8" });
     expect(run.status, `broken-lock child failed: ${run.stderr}`).toBe(0);
     const report = JSON.parse(run.stdout) as { broken: string[][]; healthy: string[] };
 
@@ -573,7 +573,7 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
     // The child is bounded, because the failure this detects is a process that never finishes: a
     // worker blocked inside a native mutex cannot be terminated from JavaScript, so under the leak
     // the child hangs rather than reporting. The bound turns that into an observation.
-    const run = spawnSync(process.execPath, ["--import", "tsx", script], {
+    const run = boundedSpawnSync(process.execPath, ["--import", "tsx", script], {
       encoding: "utf8",
       timeout: 60_000,
       killSignal: "SIGKILL",
@@ -671,7 +671,7 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
       ].join("\n"),
       { mode: 0o600 },
     );
-    const run = spawnSync(process.execPath, ["--import", "tsx", script], { encoding: "utf8" });
+    const run = boundedSpawnSync(process.execPath, ["--import", "tsx", script], { encoding: "utf8" });
     expect(run.status, `unlock-failure child failed: ${run.stderr}`).toBe(0);
     const report = JSON.parse(run.stdout) as Record<string, string[]>;
 
@@ -724,7 +724,7 @@ describe("U6-UNIT2 a binding is held under a lease", () => {
       ].join("\n"),
       { mode: 0o600 },
     );
-    const run = spawnSync(process.execPath, ["--import", "tsx", script], {
+    const run = boundedSpawnSync(process.execPath, ["--import", "tsx", script], {
       encoding: "utf8",
       timeout: 60_000,
       killSignal: "SIGKILL",
