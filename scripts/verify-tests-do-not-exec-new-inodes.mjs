@@ -86,7 +86,23 @@ const SOURCE = /\.(?:[cm]?[jt]s|tsx)$/u;
 const SKIP_DIRECTORIES = new Set(["node_modules", ".git", "dist"]);
 
 /** argv[0] is the program. `exec`/`execSync` take a command string and are a documented blind spot. */
-const EXEC_APIS = new Set(["spawn", "spawnSync", "execFile", "execFileSync", "fork"]);
+const NATIVE_EXEC_APIS = new Set(["spawn", "spawnSync", "execFile", "execFileSync", "fork"]);
+
+/**
+ * Wrappers read as exec APIs **only when the file imported them from the helper below**.
+ *
+ * The first version of this listed the two names beside the native ones and trusted the spelling.
+ * A review built a synthetic imported `boundedSpawnSync` that executes its *second* argument and
+ * showed the result: the site moved from `UNRESOLVED` to `NOT DECIDED`, which does not fail. So a
+ * differently shaped function wearing one of these names would have been read at argv[0] and its
+ * other arguments left unexamined — a false negative this check invented for itself.
+ *
+ * Resolving the import is what makes the name mean something. It is per-file and syntactic like
+ * the rest of this script: an alias (`import { boundedSpawnSync as run }`) binds the local name to
+ * the same helper, and anything imported from elsewhere is not an exec API here.
+ */
+const WRAPPER_EXEC_MODULE = /(?:^|\/)tests\/helpers\/bounded-sync-child\.ts$|^\.{1,2}(?:\/\.\.)*\/helpers\/bounded-sync-child\.ts$/u;
+const WRAPPER_EXEC_EXPORTS = new Set(["boundedSpawnSync", "boundedExecFileSync"]);
 /** A copy is new bytes at a new inode; a hardlink is not, which is the whole point. */
 const COPY_TOOLS = new Set(["cp", "ditto", "install", "rsync"]);
 /** Names that introduce a scope. Block scope is deliberately not one of them; see the header. */
@@ -184,6 +200,22 @@ const makeUnion = () => {
 
 const analyse = (file, source) => {
   const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true);
+
+  // The local names this file bound to the bounded wrappers, by reading its own imports. A name
+  // that was not imported from that module is not one of them, whatever it is spelled.
+  const wrapperNames = new Set();
+  for (const statement of tree.statements) {
+    if (!ts.isImportDeclaration(statement)) continue;
+    const from = statement.moduleSpecifier;
+    if (!ts.isStringLiteralLike(from) || !WRAPPER_EXEC_MODULE.test(from.text)) continue;
+    const bindings = statement.importClause?.namedBindings;
+    if (!bindings || !ts.isNamedImports(bindings)) continue;
+    for (const element of bindings.elements) {
+      const exported = (element.propertyName ?? element.name).text;
+      if (WRAPPER_EXEC_EXPORTS.has(exported)) wrapperNames.add(element.name.text);
+    }
+  }
+  const isExecApi = (name) => NATIVE_EXEC_APIS.has(name) || wrapperNames.has(name);
   const enclosing = (node) => {
     let walker = node.parent;
     while (walker && !isScope(walker)) walker = walker.parent;
@@ -349,7 +381,7 @@ const analyse = (file, source) => {
       record(args[1], "copy", node);
     }
     // A locally declared `spawn` is a wrapper, not `node:child_process`; it is followed, not read.
-    if (name && EXEC_APIS.has(name) && !local && args[0]) {
+    if (name && isExecApi(name) && !local && args[0]) {
       const program = unparen(args[0]);
       const tool = ts.isStringLiteralLike(program) ? program.text.split("/").pop() : undefined;
       const vector = unparen(args[1]);
@@ -362,7 +394,7 @@ const analyse = (file, source) => {
 
     // A path handed to a function this file does not declare is a path this check stops following.
     // An argument vector is data for another program, so the exec APIs are read at argv[0] only.
-    if (name && !local && !INERT.has(name) && !EXEC_APIS.has(name)) {
+    if (name && !local && !INERT.has(name) && !isExecApi(name)) {
       for (const argument of args) {
         const reachable = [];
         const collect = (value) => {
