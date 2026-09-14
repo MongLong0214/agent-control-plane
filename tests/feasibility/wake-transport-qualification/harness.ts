@@ -715,7 +715,11 @@ export const qualify = async (): Promise<{ readonly receipt: QualificationReceip
   const blocker = interactiveBlocker();
   if (blocker !== null) throw new Error(`cannot take the interactive reading: ${blocker}`);
 
-  const headSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: REPO_ROOT, encoding: "utf8" }).trim();
+  const headSha = execFileSync("git", ["rev-parse", "HEAD"], {
+    cwd: REPO_ROOT,
+    encoding: "utf8",
+    timeout: 30_000,
+  }).trim();
 
   // Serial, not concurrent. Each arm starts a real client that binds a socket and talks to a
   // loopback server; two of them at once would be measuring a machine under a load the deployment
