@@ -1,8 +1,8 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -23,7 +23,7 @@ const runCommitMsg = (message: string): number => {
   const dir = tempDir("acp-hook-msg-");
   const file = join(dir, "COMMIT_EDITMSG");
   writeFileSync(file, message);
-  return spawnSync(hook("commit-msg"), [file], { cwd: ROOT, encoding: "utf8" }).status ?? -1;
+  return boundedSpawnSync(hook("commit-msg"), [file], { cwd: ROOT, encoding: "utf8" }).status ?? -1;
 };
 
 /**
@@ -43,7 +43,7 @@ const runCommitMsgWithEnv = (
   const dir = tempDir("acp-hook-env-");
   const file = join(dir, "COMMIT_EDITMSG");
   writeFileSync(file, message);
-  const done = spawnSync(hook("commit-msg"), [file], { cwd: ROOT, encoding: "utf8", env });
+  const done = boundedSpawnSync(hook("commit-msg"), [file], { cwd: ROOT, encoding: "utf8", env });
   return { status: done.status ?? -1, stderr: done.stderr ?? "" };
 };
 
@@ -57,11 +57,11 @@ const pathWithoutNode = (): string => {
   const bin = join(tempDir("acp-hook-bin-"), "bin");
   mkdirSync(bin, { recursive: true });
   for (const name of ["git", "sh"]) {
-    const found = spawnSync("sh", ["-c", `command -v ${name}`], { encoding: "utf8" }).stdout.trim();
+    const found = boundedSpawnSync("sh", ["-c", `command -v ${name}`], { encoding: "utf8" }).stdout.trim();
     expect(found, `no ${name} to build a PATH from`).not.toBe("");
     symlinkSync(found, join(bin, name));
   }
-  const probe = spawnSync("sh", ["-c", "command -v node"], { encoding: "utf8", env: { PATH: bin } });
+  const probe = boundedSpawnSync("sh", ["-c", "command -v node"], { encoding: "utf8", env: { PATH: bin } });
   expect(probe.error, "the probe never ran, so its answer says nothing").toBeUndefined();
   expect(
     probe.status,
@@ -92,7 +92,7 @@ const realNode = process.execPath;
 const pathWithNode = (): string => {
   const bin = pathWithoutNode();
   symlinkSync(realNode, join(bin, "node"));
-  const probe = spawnSync("sh", ["-c", "command -v node"], { encoding: "utf8", env: { PATH: bin } });
+  const probe = boundedSpawnSync("sh", ["-c", "command -v node"], { encoding: "utf8", env: { PATH: bin } });
   expect(probe.status, "this PATH resolves no node, so nothing below measures it").toBe(0);
   return bin;
 };
@@ -135,7 +135,7 @@ const runCommitMsgBounded = (
   const file = join(dir, "COMMIT_EDITMSG");
   writeFileSync(file, message);
   const started = Date.now();
-  const done = spawnSync(hook("commit-msg"), [file], {
+  const done = boundedSpawnSync(hook("commit-msg"), [file], {
     cwd: ROOT,
     encoding: "utf8",
     env,
@@ -361,14 +361,14 @@ describe("pre-commit refuses while the falsifiability harness holds a mutation",
     const fake = join(tempDir("acp-hook-sentinel-"), "repo");
     mkdirSync(fake, { recursive: true });
     chmodSync(fake, 0o700);
-    expect(spawnSync("git", ["init", "-q"], { cwd: fake }).status).toBe(0);
+    expect(boundedSpawnSync("git", ["init", "-q"], { cwd: fake }).status).toBe(0);
 
-    const gitDir = spawnSync("git", ["rev-parse", "--git-dir"], { cwd: fake, encoding: "utf8" })
+    const gitDir = boundedSpawnSync("git", ["rev-parse", "--git-dir"], { cwd: fake, encoding: "utf8" })
       .stdout.trim();
     const sentinel = join(fake, gitDir, "verify-guards-in-flight.json");
     writeFileSync(sentinel, "{}");
     try {
-      const refused = spawnSync(hook("pre-commit"), [], { cwd: fake, encoding: "utf8" });
+      const refused = boundedSpawnSync(hook("pre-commit"), [], { cwd: fake, encoding: "utf8" });
       expect(refused.status).toBe(1);
       expect(refused.stderr).toContain("mutation applied");
     } finally {
@@ -387,7 +387,7 @@ describe("pre-commit refuses while the falsifiability harness holds a mutation",
     const fake = join(tempDir("acp-hook-unfiltered-"), "repo");
     mkdirSync(join(fake, "scripts"), { recursive: true });
     chmodSync(fake, 0o700);
-    expect(spawnSync("git", ["init", "-q"], { cwd: fake }).status).toBe(0);
+    expect(boundedSpawnSync("git", ["init", "-q"], { cwd: fake }).status).toBe(0);
 
     const marker = join(fake, "ran");
     writeFileSync(
@@ -402,7 +402,7 @@ describe("pre-commit refuses while the falsifiability harness holds a mutation",
     );
 
     // Nothing staged at all — the case the old filter skipped.
-    const done = spawnSync(hook("pre-commit"), [], { cwd: fake, encoding: "utf8" });
+    const done = boundedSpawnSync(hook("pre-commit"), [], { cwd: fake, encoding: "utf8" });
     expect(done.status).toBe(0);
     expect(existsSync(marker), "the hook did not run the anchors pass").toBe(true);
   });
