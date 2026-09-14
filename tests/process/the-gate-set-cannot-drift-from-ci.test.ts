@@ -7,11 +7,11 @@
  * `.github/workflows/`, not to a hand-written fixture. A fixture would be a third description of
  * the gate set, free to stop resembling the two it is meant to hold together.
  */
-import { spawnSync } from "node:child_process";
 import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 
 /**
  * Temporary directories, kept local on purpose.
@@ -38,7 +38,7 @@ const RUNNER = join(REPO_ROOT, "scripts", "run-prepush-gates.mjs");
 const WORKFLOW = join(".github", "workflows", "ci.yml");
 
 const parity = (repoRoot: string) =>
-  spawnSync(process.execPath, [PARITY, `--repo-root=${repoRoot}`], { cwd: REPO_ROOT, encoding: "utf8" });
+  boundedSpawnSync(process.execPath, [PARITY, `--repo-root=${repoRoot}`], { cwd: REPO_ROOT, encoding: "utf8" });
 
 /** A copy of the real package.json and workflows, which the divergences below then damage. */
 const copyOfThisRepository = (): string => {
@@ -457,7 +457,7 @@ const runnerEnv = (stub?: { path: string }): NodeJS.ProcessEnv => ({
 });
 
 const runRunner = (stub: { path: string }, args: string[] = []) =>
-  spawnSync(process.execPath, [RUNNER, ...args], {
+  boundedSpawnSync(process.execPath, [RUNNER, ...args], {
     cwd: REPO_ROOT,
     encoding: "utf8",
     env: runnerEnv(stub),
@@ -474,7 +474,7 @@ describe("the pre-push gate runner", () => {
 
     expect(result.status, result.stdout).toBe(0);
     const ran = invocations(stub.log);
-    const listed = spawnSync(process.execPath, [RUNNER, "--list"], { cwd: REPO_ROOT, encoding: "utf8", env: runnerEnv() })
+    const listed = boundedSpawnSync(process.execPath, [RUNNER, "--list"], { cwd: REPO_ROOT, encoding: "utf8", env: runnerEnv() })
       .stdout.split("\n")
       .filter(Boolean)
       .map((line) => line.replace(/^\S+\s+pnpm\s+/, ""));

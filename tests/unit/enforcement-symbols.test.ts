@@ -1,10 +1,10 @@
-import { spawnSync } from "node:child_process";
 import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { acpScratchDir } from "../../src/core/scratch-root.ts";
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 
 /**
  * The transition gate names an **enforcement locus** per proof — the production symbol whose
@@ -30,7 +30,7 @@ afterAll(() => {
 
 describe("the gate's enforcement loci still exist (#512 transition gate)", () => {
   it("passes against the tree as committed", () => {
-    const result = spawnSync(process.execPath, [script], { cwd: repoRoot, encoding: "utf8" });
+    const result = boundedSpawnSync(process.execPath, [script], { cwd: repoRoot, encoding: "utf8" });
     expect(result.status, result.stdout + result.stderr).toBe(0);
   });
 
@@ -48,7 +48,7 @@ describe("the gate's enforcement loci still exist (#512 transition gate)", () =>
       readFileSync(target, "utf8").replaceAll("dependentMergeBlocked", "dependentMergeGuarded"),
     );
 
-    const result = spawnSync(process.execPath, [join(dir, "scripts", "verify-enforcement-symbols.mjs")], {
+    const result = boundedSpawnSync(process.execPath, [join(dir, "scripts", "verify-enforcement-symbols.mjs")], {
       encoding: "utf8",
     });
     expect(result.status, "a renamed enforcement locus passed unnoticed").toBe(1);
