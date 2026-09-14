@@ -22,9 +22,17 @@ import type {
  * `spawnSync` stops vitest's own per-test timeout from ever firing, and the timeout it eventually
  * reports lands on whichever test the stalled worker happened to be holding.
  *
- * 55s: just under the `testTimeout: 60_000` that governs the smallest enclosing test in every
- * file using this helper, so the bound is what fires and names itself rather than a per-test
- * timeout landing on another test.
+ * 55s: just under this repository's `testTimeout: 60_000`, so for a case that takes the global
+ * limit the bound is what fires and names itself rather than a per-test timeout landing on
+ * another test.
+ *
+ * **It is the default, not a guarantee about the call site.** A case that declares its own
+ * shorter timeout is over before 55s could fire, and there the default is not a bound at all —
+ * found in `the-database-backup-step-fails-closed.test.ts`, where one case declares `20_000` and
+ * its three children are a `find` and two `sqlite3` invocations. Those pass their own
+ * `timeout`. Anything converted into a case with a timeout under this default has to do the
+ * same, and nothing here can check that: this helper cannot see the timeout of the `it` that
+ * encloses its caller.
  *
  * The number is a wedge threshold, and it had to be measured to stay one. 30s was the first value,
  * chosen because it reads as generous; on an idle host `rollback-pair-wal.test.ts`'s

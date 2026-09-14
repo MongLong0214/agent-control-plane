@@ -7,6 +7,17 @@ import { afterAll, describe, expect, it } from "vitest";
 import { restoreDatabase } from "../../src/db/backup.ts";
 import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
 import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
+
+/**
+ * The shared helper's default is 55s, chosen to sit under this repository's 60s `testTimeout`. One
+ * case in this file declares its own `20_000`, and a default larger than the enclosing timeout is
+ * not a bound at all — the case is over before it could fire, so a wedged `find` or `sqlite3` there
+ * would still be reported against whichever test the stalled worker held.
+ *
+ * 10s: comfortably above what a `find` over one directory and an `integrity_check` on this
+ * fixture's database cost, and under the case's own limit so the failure names the command.
+ */
+const QUICK_CHILD_BUDGET_MS = 10_000;
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -493,7 +504,7 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
     const listing = boundedSpawnSync(
       "find",
       [backupsDir, "-maxdepth", "1", "-name", "state-*.sqlite", "!", "-name", ".*"],
-      { encoding: "utf8" },
+      { encoding: "utf8", timeout: QUICK_CHILD_BUDGET_MS },
     );
     const backupFiles = listing.stdout.trim().split("\n").filter((line) => line.length > 0);
     expect(backupFiles.length).toBe(1);
@@ -504,6 +515,7 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
 
     const integrity = boundedExecFileSync("sqlite3", [backupFile, "PRAGMA integrity_check;"], {
       encoding: "utf8",
+      timeout: QUICK_CHILD_BUDGET_MS,
     }).trim();
     expect(integrity).toBe("ok");
 
@@ -512,6 +524,7 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
     const rowCountAfter = Number(
       boundedExecFileSync("sqlite3", [dbPath, "insert into t values (999); select count(*) from t;"], {
         encoding: "utf8",
+        timeout: QUICK_CHILD_BUDGET_MS,
       }).trim(),
     );
     expect(rowCountAfter).toBeGreaterThan(3);
