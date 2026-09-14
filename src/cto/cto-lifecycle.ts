@@ -1011,9 +1011,14 @@ const probeSessionHealth = async (
     });
   }
   if (health !== "HEALTHY") {
+    // The adapter's own account of the refusal when it kept one. Without it this denial is the
+    // single word `UNAVAILABLE`, and #512's acceptance run stopped here with no way to tell an
+    // authentication failure inside the sandbox from a first call that outran the probe's bound.
+    const diagnostic = (adapter as { lastProbeDiagnostic?: string }).lastProbeDiagnostic;
     return deny(ReasonCode.SESSION_NOT_READY, "provider cannot prove the CTO session is ready", {
       provider: adapter.provider,
       runtimeHealth: health,
+      ...(diagnostic === undefined ? {} : { probeDiagnostic: diagnostic }),
     });
   }
   return allow(ReasonCode.OK, undefined);

@@ -480,6 +480,17 @@ class CapacityObservedAdapter implements ProviderAdapter {
     return this.inner.probeSession(handle);
   }
 
+  /**
+   * The wrapped adapter's account of its last probe refusal.
+   *
+   * Measured on #512: the adapter records why it answered `UNAVAILABLE`, and the caller that turns
+   * that into a dispatch denial reaches the adapter through this wrapper — so without this the
+   * diagnostic exists and is invisible, and the acceptance run reports one word.
+   */
+  get lastProbeDiagnostic(): string | undefined {
+    return (this.inner as { lastProbeDiagnostic?: string }).lastProbeDiagnostic;
+  }
+
   async probeCapacity(): Promise<CapacityReading> {
     return this.inner.probeCapacity();
   }

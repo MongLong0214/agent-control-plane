@@ -1401,6 +1401,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
   } as const;
 
   readonly #binary: string;
+  #probeDiagnostic: string | undefined;
   readonly #clock: Clock;
   readonly #capacityFile: string;
   readonly #freshnessMs: number;
@@ -1589,7 +1590,10 @@ export class ClaudeCliAdapter implements ProviderAdapter {
   }
 
   async probeSession(handle: SessionHandle): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
-    if (handle.provider !== this.provider) return "UNAVAILABLE";
+    if (handle.provider !== this.provider) {
+      this.#probeDiagnostic = `handle is for provider ${handle.provider}, this adapter is ${this.provider}`;
+      return "UNAVAILABLE";
+    }
     const result = await runCli(this.#binary, [
       "-p", "--output-format", "json", "--model", handle.model, "--session-id", handle.externalSessionId,
     ], {
@@ -1600,9 +1604,27 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       denyReadPaths: this.#denyReadPaths,
       providerCredentialDir: this.#providerCredentialDir,
     });
-    if (result.exitCode !== 0 || result.timedOut) return "UNAVAILABLE";
+    if (result.exitCode !== 0 || result.timedOut) {
+      // Why, not just that. This probe is the gate every dispatch passes, and its refusal reaches
+      // the caller as one word: `runtimeHealth: "UNAVAILABLE"`. Measured on #512 — the same
+      // arguments run by hand exit 0, so the refusal is about *how this adapter runs the CLI*
+      // (credential directory, environment allowlist, deny-read paths, the 30s bound) and none of
+      // that is recoverable from the word. Two candidates cannot be told apart without it: an
+      // authentication failure inside the sandbox, and a first call whose cache warm-up outruns
+      // the bound.
+      this.#probeDiagnostic = result.timedOut
+        ? `timed out after 30000ms`
+        : `exit ${String(result.exitCode)}${result.stderr ? `: ${result.stderr.trim().slice(0, 400)}` : " with no stderr"}`;
+      return "UNAVAILABLE";
+    }
+    this.#probeDiagnostic = undefined;
     const sessionId = safeParse(result.stdout)?.["session_id"];
     return sessionId !== undefined && sessionId !== handle.externalSessionId ? "DEGRADED" : "HEALTHY";
+  }
+
+  /** What the last refusal actually said, for a caller that would otherwise report one word. */
+  get lastProbeDiagnostic(): string | undefined {
+    return this.#probeDiagnostic;
   }
 
   async probeCapacity(): Promise<CapacityReading> {
