@@ -702,7 +702,10 @@ export class CapacityMonitor {
       production = [this.roleCapacity(binding, reading)];
     } else {
       const readings = await this.refresh(trigger, [target.provider]);
-      production = readings.filter((r) => this.providers.require(r.provider).isProduction);
+      // `representative`, not `require`: no role was named here, and `require` refuses that on
+      // purpose. Asking it anyway made the refusal an exception on a path whose question —
+      // "is this provider a production one" — has nothing to do with identity.
+      production = readings.filter((r) => this.providers.representative(r.provider)?.isProduction === true);
     }
     if (production.length === 0) {
       return deny(
@@ -890,8 +893,12 @@ export class CapacityMonitor {
   providersFor(capability: string): ProviderCapacity[] {
     return this.all().filter(
       (c) =>
+        // Role-scoped providers stay out of role-less capability selection by design: their
+        // capacity is per role (`currentForRole`), so there is no provider-wide reading to
+        // route on. The `representative` read below answers `isProduction` for the ones that
+        // remain, without `require`'s role refusal turning a provider-level question into a throw.
         !this.providers.hasRoleScoped(c.provider) &&
-        this.providers.require(c.provider).isProduction &&
+        this.providers.representative(c.provider)?.isProduction === true &&
         c.allocationAdmission !== "SUSPENDED" &&
         c.runtimeHealth !== "UNAVAILABLE" &&
         c.runtimeHealth !== "UNKNOWN" &&

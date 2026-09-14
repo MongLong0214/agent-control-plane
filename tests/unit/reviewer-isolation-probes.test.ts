@@ -78,7 +78,16 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
       capacityFile: join(packet, "capacity.json"), binary, reviewerCodexHome: root,
       reviewerEgress: { profilePath, proxyPath, runtimeDir: join(fixture, "lease"), port,
         providerEndpoints: { gpt: ["api.openai.com"] } } });
-    const isolation = { packetRoot: packet, denyReadPaths: [], emptyEnvironment: true as const,
+    // The denial probe needs a path that actually exists, and with an empty deny list the only
+    // candidates are the ambient `~/.claude` and `~/.codex`. Those exist on a developer's machine
+    // and on no clean host, so this case attested here and refused on a GitHub runner with
+    // "reviewer isolation has no existing transcript path to probe" — green locally, red in CI,
+    // for a reason that is not about the code under test. The sibling #360 case below already
+    // owns its probe target; this one now does too.
+    const producerTranscript = join(fixture, "producer-history.jsonl");
+    writeFileSync(producerTranscript, "private producer reasoning");
+    const isolation = { packetRoot: packet, denyReadPaths: [producerTranscript],
+      emptyEnvironment: true as const,
       network: "provider-only" as const, tools: "none" as const };
     try {
       const handle = await adapter.startSession({ model: "gpt-5.6-sol", effort: "xhigh",
