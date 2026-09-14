@@ -5,6 +5,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
+import { CHILD_BUDGET_MS } from "../helpers/bounded-sync-child.ts";
 import { DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS, createOperatorClient, dispatch } from "../../src/cli/agentctl.ts";
 import { OPERATOR_METHOD } from "../../src/daemon/daemon.ts";
 import {
@@ -452,6 +453,7 @@ describe("authenticated operator socket (#393/#405)", () => {
             ACP_OPERATOR_TOKEN: OPERATOR_TOKEN,
           },
           maxBuffer: 2 * 1024 * 1024,
+          timeout: CHILD_BUDGET_MS,
         },
       );
 
@@ -646,6 +648,7 @@ describe("authenticated operator socket (#393/#405)", () => {
             },
             encoding: "utf8",
             maxBuffer: 2 * 1024 * 1024,
+            timeout: CHILD_BUDGET_MS,
           },
           (error, stdout, stderr) => resolve({ error, stdout, stderr }),
         );
@@ -696,6 +699,7 @@ describe("authenticated operator socket (#393/#405)", () => {
           ACP_OPERATOR_TOKEN: OPERATOR_TOKEN,
         },
         maxBuffer: 2 * 1024 * 1024,
+        timeout: CHILD_BUDGET_MS,
       },
     ).catch((error: { stdout?: string; stderr?: string; code?: number }) => error);
 
