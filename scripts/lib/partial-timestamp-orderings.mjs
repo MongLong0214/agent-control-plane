@@ -34,20 +34,26 @@ export const PARTIAL_TIMESTAMP_ORDERINGS = new Map([
   // consequence of the tie is a person sent to the wrong nonce — real, and still not a reason to
   // edit a frozen input without the authority that froze it.
   ["src/db/migrations.ts:2293", "ORDER BY received_at ASC"],
-  // The two `LIMIT` queries in the outbox, put back after a tiebreaker was tried and measured to
-  // be a regression. Both decide *which* owner message is answered next, not merely the order of a
-  // list, and today that choice is SQLite's incidental rowid order — which is insertion order, and
-  // therefore in practice arrival order. Appending `message_id` replaces that with a random
-  // string's sort: `outbox-owner-message-holder.test.ts` expected the message it had queued and
-  // got a different one. `idempotency_key` was tried too, for a different reason — it is
-  // `TEXT NOT NULL` with a full UNIQUE index, so the pair would be total with no migration, while
-  // `message_id TEXT PRIMARY KEY` permits NULL in SQLite — and it fails the same way.
+  // The two `LIMIT` queries in the outbox, put back after a tiebreaker was tried twice and
+  // measured to be a regression both times. Both decide *which* owner message is answered next,
+  // not merely the order of a list.
   //
-  // So the tie here is not closed by picking a better arbitrary column. Both candidates are
-  // equally arbitrary; what the product relies on is arrival order, and no column records it.
-  // Giving this query one is a migration and is its own unit.
+  // What was measured, and only this: appending a string tiebreaker changes which row comes back.
+  // `outbox-owner-message-holder.test.ts` expected the message it had queued and got a different
+  // one under `message_id`, and the same under `idempotency_key` — which was tried for a separate
+  // reason, being `TEXT NOT NULL` with a full UNIQUE index where `message_id TEXT PRIMARY KEY`
+  // permits NULL in SQLite.
+  //
+  // What was NOT measured, and must not be read here: that the untied order is always rowid, or
+  // that rowid is the product's arrival order. No query plan was taken and no production path was
+  // traced. The honest statement is narrower — today's answer satisfies a consumer that these two
+  // candidates do not, and why it does is unestablished.
+  //
+  // Open, and deliberately not settled in that PR: whether any durable ordering basis already
+  // exists for these rows, and what "arrival" is to be measured against in the first place. Until
+  // both have an answer, a new column is a guess about the remedy rather than the remedy.
   ["src/outbox/outbox.ts:434", "ORDER BY o.created_at"],
-  ["src/outbox/outbox.ts:564", "ORDER BY o.created_at"],
+  ["src/outbox/outbox.ts:563", "ORDER BY o.created_at"],
   ["src/conversation/turn-coordinator.ts:1169", "ORDER BY claimed_at ASC"],
   ["src/conversation/turn-coordinator.ts:1757", "ORDER BY claimed_at ASC"],
   ["src/cto/cto-lifecycle.ts:783", "ORDER BY created_at DESC"],

@@ -534,14 +534,13 @@ export class Outbox {
       // composite ties again. Not reachable from `src/`, where every writer mints through
       // `newMessageId()`, but a raw-SQL writer is in this repository's threat model.
       //
-      // And it is not arrival order. `idempotency_key` was tried here for the first property —
-      // it is `TEXT NOT NULL` with a full `UNIQUE` index, so the pair would be total with no
-      // migration — and it failed on the second: swapping it changed *which row* this `LIMIT`
-      // returns, and `outbox-owner-message-holder.test.ts` caught it by expecting the message it
-      // had queued and getting a different one. Both orders are equally arbitrary under a tie, so
-      // neither is more right; what the test was relying on is that `message_id` happened to put
-      // its row first. Giving this query real arrival order needs a column that records it, which
-      // is a migration, and is its own unit.
+      // And a tiebreaker here is not free. Two were tried — `message_id`, and `idempotency_key`
+      // for the property above — and both changed *which row* this `LIMIT` returns:
+      // `outbox-owner-message-holder.test.ts` expected the message it had queued and got another,
+      // each time. That is what the comparison shows and all it shows. It is not evidence that
+      // the untied order is rowid, nor that rowid is this queue's arrival order; no query plan was
+      // taken. So the tie stays open here rather than closed by a column that makes the census
+      // quiet, and what "arrival" should be measured against is itself an open question (#858).
       //
       // `created_at` is millisecond ISO text, and 400 consecutive `systemClock.nowIso()` calls
       // were measured returning one distinct timestamp. This query is `LIMIT 1`: it decides which
