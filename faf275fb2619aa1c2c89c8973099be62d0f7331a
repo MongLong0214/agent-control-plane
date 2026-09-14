@@ -1,0 +1,30 @@
+Limit: the bound signals only the direct child, so a grandchild of a wedged call survives the run; tests/helpers/bounded-child.ts is the shape that reaps the group, and converting these sites to it means making three files' worth of synchronous call sites async
+Limit: 55s is derived from this repository's global testTimeout, so a file that lowers its own testTimeout below 55s would make the per-test timeout fire first and the bound silent again
+Ruled-out: raising the three slow tests' own `it` timeouts instead of the child budget | it would hide that "replaces generation B's runtime and database together" already costs 39.4s against a 60s limit, which is a thin margin this change should not paper over
+Warn: `killed` is never consulted on either path; measured here a timeout gives status null, signal SIGTERM, killed undefined and error.code ETIMEDOUT, and a comment asserting otherwise was once the alibi for an always-false branch in this repository
+Warn: the codemod that did the substitution deleted the whole `node:child_process` import line, including members still in use, and the regex that decided which to restore matched `RegExp.prototype.exec(` as a use of `exec` — both were caught by tsc and eslint, not by review
+Blast: module
+Undo: easy
+Certainty: firm
+Provenance: inherited c53de214448753d8e586813ce00c75328b53565e
+
+Limit: the check is name-based, so a differently-shaped function later given either name would be read as an exec API without anyone noticing | the witness above is the only thing tying the name to the shape
+Warn: the not-decided list grew 72 -> 74 — the converted files' remaining creations are now followed as far as a non-argv[0] position, which is unread rather than cleared
+Blast: module
+Undo: easy
+Certainty: firm
+Provenance: inherited 08a63f485fbdb6eb4390aef6065ee7666821f79a
+
+Limit: nothing enforces the rule the docstring now states | a future conversion into a short-timeout case gets a default that cannot fire, and the only signal is that the case fails somewhere else — which is the original defect wearing the fix's clothes
+Warn: the sweep that found this asked each file for its smallest `}, N);` literal; a timeout passed some other way — a describe-level option, a config override for one path — would not have been seen
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited fe17011d69c82682ab2b09e11beb4f5c04576768
+
+Limit: the import resolution is per-file and syntactic like the rest of this script | a re-export through a third module, or a name reassigned after import, is not followed — narrower than the name-trusting version was wide, and stated rather than implied
+Warn: the new case observes the options handed to `spawnSync`/`execFileSync`, not a child that actually died at 55s; it proves the number is forwarded, and the review's own 55,002ms run is the evidence that forwarding it has the effect the name claims
+Blast: module
+Undo: easy
+Certainty: firm
+Provenance: inherited 2884c286da09d5696eee357945fc4d8bb36886ba
