@@ -638,9 +638,15 @@ export class ProviderRegistry {
   /**
    * Refuses when the provider has role-scoped adapters. Answering here would mean choosing one of
    * them for a caller that did not say which identity it is acting as, and that choice is exactly
-   * what #512 got wrong. A caller that genuinely has no role — the capacity monitor asking whether
-   * a provider is production — keeps using this and keeps working, because such providers have no
-   * role-scoped registration to be ambiguous about.
+   * what #512 got wrong.
+   *
+   * This used to add that a role-less caller "keeps working, because such providers have no
+   * role-scoped registration to be ambiguous about". That sentence was false the moment #917
+   * registered Claude per role, and being written down is what made the gap look closed: the
+   * capacity monitor does not call this, it calls `list()`, and `list()` had lost the provider
+   * entirely. A role-less caller that wants the provider *set* uses `list()`, which enumerates
+   * role-scoped providers too; one that wants an adapter to act through still has to say which
+   * role it is acting as.
    */
   require(provider: string): ProviderAdapter {
     if (this.hasRoleScoped(provider)) {
@@ -661,13 +667,84 @@ export class ProviderRegistry {
     return false;
   }
 
-  list(): ProviderAdapter[] {
-    return [...this.#adapters.values()].map((adapter) => this.observed(adapter));
+  /**
+   * Every provider this deployment has, once each — **not** which adapter answers for a role.
+   *
+   * Those are two different questions and this method answers only the first. `require`/`get`
+   * answer the second and refuse without a role, deliberately; enumerating has no such ambiguity
+   * to refuse, because a provider is present or it is not.
+   *
+   * Reading `#adapters` alone was correct until a provider existed *only* under role-scoped keys.
+   * #917 made that real — the CTO and reviewer Claude adapters are registered per role and never
+   * unscoped — and `list()` silently lost `claude`. Measured on that head: the production default
+   * registry returned `['gpt','grok']`, and the failure reached past the test. Every consumer of
+   * `list()`/`production()` asks for the provider *set*:
+   *
+   *   capacity-monitor.ts   which providers to collect capacity for
+   *   daemon.ts             providerCount, and the sweep budget derived from its length
+   *   continuity-kernel.ts  `.map(a => a.provider)` twice, for coverage
+   *   doctor.ts             `adapter.provider`, for capacity-file age
+   *
+   * None of them dispatches work through the adapter, so none of them needs the role-correct one.
+   * They need to know `claude` is here.
+   *
+   * Deduplicated by provider, and that is not an implementation detail: the two Claude adapters
+   * share one `capacityFile`, so enumerating both would collect the same provider's capacity twice
+   * and inflate `providerCount` and the sweep budget with it. The unscoped registration wins when
+   * both exist, because a deployment that registered one unscoped said which adapter represents
+   * the provider.
+   */
+  /**
+   * One adapter that stands for this provider, role-scoped or not — for **provider-level facts
+   * only**, never to act through.
+   *
+   * `require`/`get` refuse without a role on purpose: choosing an identity for a caller that did
+   * not name one is what #512 got wrong. But several callers do not want an identity at all. They
+   * want `isProduction`, or whether the provider can be probed for liveness — facts that are true
+   * of the provider, not of the role. Before this existed they called `require()` and got the
+   * refusal, and the refusal then had to be swallowed somewhere: `daemon.ts` caught it and recorded
+   * `runtimeHealth: "UNAVAILABLE"`, so *you asked without a role* was persisted as *this provider
+   * is dead*, permanently and with no error anywhere.
+   *
+   * Separating the two questions is what keeps that from happening again. A caller that wants to
+   * dispatch still has to say which role it is acting as, and this returns nothing it could
+   * legitimately dispatch with — the docstring is the contract, and `requireForRole` is the door.
+   */
+  representative(provider: string): ProviderAdapter | null {
+    const shared = this.#adapters.get(provider);
+    if (shared) return this.observed(shared);
+    for (const [key, adapter] of this.#roleScoped) {
+      if (key.startsWith(`${provider}\u0000`)) return this.observed(adapter);
+    }
+    return null;
   }
 
-  /** Adapters eligible for real work. Excludes anything that fabricates responses. */
+  list(): ProviderAdapter[] {
+    const byProvider = new Map<string, ProviderAdapter>(this.#adapters);
+    for (const adapter of this.#roleScoped.values()) {
+      if (!byProvider.has(adapter.provider)) byProvider.set(adapter.provider, adapter);
+    }
+    return [...byProvider.values()].map((adapter) => this.observed(adapter));
+  }
+
+  /**
+   * Adapters eligible for real work **without a role named**. Excludes anything that fabricates
+   * responses, and excludes role-scoped providers.
+   *
+   * This is the shared production inventory, and a role-scoped provider is deliberately not in it:
+   * its adapters exist per identity, so answering "use this one" to a caller that named no role is
+   * the choice #512 got wrong. Coverage for such a provider comes through its role binding
+   * (`capacityBindingForRole`, continuity-kernel.ts:549), which is what
+   * `covers a bound role-only provider absent from the shared production inventory` pins.
+   *
+   * `list()` is the other question and keeps the other answer: it enumerates every provider this
+   * deployment has, role-scoped included, because `providerCount`, the sweep budget derived from
+   * its length, and doctor's per-provider reads are facts about the provider set and go wrong when
+   * a provider silently leaves it. #917 collapsed the two — role-scoped Claude vanished from both
+   * — and the two tests that disagreed about it were each right about their own question.
+   */
   production(): ProviderAdapter[] {
-    return this.list().filter((a) => a.isProduction);
+    return this.list().filter((a) => a.isProduction && !this.hasRoleScoped(a.provider));
   }
 
   private observed(adapter: ProviderAdapter): ProviderAdapter {

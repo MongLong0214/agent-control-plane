@@ -109,8 +109,25 @@ const stableOutcome = (report: StartupReport) => report.stages.map((stage, index
 // `cp.capacity.all()` only reports providers a refresh actually persisted a row for. Do not
 // add it back here; that would be re-introducing the always-failing unattended probe this
 // retirement removed.
+/**
+ * `claude` reports `role-capacity-unavailable` here, and that is the contract rather than a loss.
+ *
+ * #917 registered Claude per role (CTO and reviewer identities), and a role-scoped provider has no
+ * provider-wide capacity to report — it has one reading per role. `CapacityMonitor.refresh` treats
+ * such a provider as ambiguous on purpose and returns `unknownCapacity`. The startup probe names
+ * no role, so this is what it can honestly say.
+ *
+ * The measurement is not lost, and that is the part worth checking before accepting this value:
+ * `continuity-kernel.ts:260` calls `refreshForRole(provider, role)` and `:139`/`:150` read
+ * `currentForRole`, so Claude's capacity is collected once a role is bound. Were that not true,
+ * this constant would be papering over a provider that had stopped being measured — which is
+ * exactly the failure the `not.toHaveProperty("grok")` assertion below exists to make visible.
+ *
+ * What this case is actually about — that startup outcomes do not depend on provider login files —
+ * is unchanged: both runs still produce identical sources.
+ */
 const isolatedSources = {
-  claude: "daemon-startup-probe-isolated:claude",
+  claude: "role-capacity-unavailable",
   gpt: "daemon-startup-probe-isolated:gpt",
 };
 
