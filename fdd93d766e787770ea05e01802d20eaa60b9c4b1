@@ -1,0 +1,30 @@
+Limit: these still block the worker for as long as the harness runs | the bound converts "forever" into a named failure and nothing more; `falsifiability-verdict` remains ~4s of a worker's wall clock
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited 0526eadf61bc31972119be56aecf62935dd9d8e7
+
+Limit: the module-scope bound still blocks collection for up to 55s before it names itself | a module-scope child cannot be made async without restructuring what the constant is for, so the weaker sync bound is what fits
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited 8d71ead884939e1c18ea89e218ce264f3c7dab56
+
+Limit: the two seatbelt probes decide whether ten cases run, and a bounded failure there fails the file rather than skipping it | that is the intended direction — a host whose sandbox-exec hangs should not quietly report the isolation cases as skipped
+Ruled-out: giving `mkfifo` the 55s default | it is inside a 20s case, so the default would be unreachable and the file would carry a bound that can never fire
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited 83d138387aa79e48b80c6bc2e28e2eac279b0d5e
+
+Limit: a bound on the helper is not a bound on what the script does inside it | these scripts walk the repository, and a walk that gets slower stays invisible until it crosses 55s
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited f309b493e9013312dab683f491abc962674593db
+
+Limit: the bound turns a wedged xcrun into a failed probe, not a skipped candidate | the loop then fails the file rather than falling through to the next path, which is the honest outcome but not the loop's own contract
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited 2fdae7373383f97a94dd84b9f4dd16c0df2e7c4e
