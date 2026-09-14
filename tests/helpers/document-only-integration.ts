@@ -16,7 +16,7 @@ export function assertMeasuredCapacity(readings: ProviderCapacity[], expectedPro
     const reading = matches[0];
     if (matches.length !== 1 || !reading || reading.operatorObservation
         || reading.sensorHealth !== "HEALTHY" || reading.runtimeHealth !== "HEALTHY"
-        || reading.allocationAdmission !== "OPEN" || reading.buckets.length === 0
+        || (reading.allocationAdmission !== "OPEN" && reading.allocationAdmission !== "CONSERVE") || reading.buckets.length === 0
         || reading.buckets.some((bucket) => typeof bucket.remainingPercent !== "number"
           || !Number.isFinite(bucket.remainingPercent) || bucket.remainingPercent <= 0 || bucket.remainingPercent > 100)) {
       throw new Error(`CAPACITY_UNKNOWN_NOT_ROUTABLE: ${provider}; measured collector admission required`);

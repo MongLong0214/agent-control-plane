@@ -161,6 +161,23 @@ describe("document-only component input", () => {
       expect(lookup).toHaveBeenCalledExactlyOnceWith("claude", Role.PRIMARY_CTO);
     } finally { vi.restoreAllMocks(); cp.close(); }
   });
+  it("accepts the measured HEALTHY 20 percent CONSERVE counterexample without changing admission policy", async () => {
+    const { assertMeasuredCapacity, measureDocumentCapacity } = await import("../helpers/document-only-integration.ts");
+    const { cp, clock, gpt, claude } = makePlane();
+    try {
+      claude.setCapacity(healthy("claude", clock));
+      // Offline regression of the failed collector shape, not a live quota observation.
+      gpt.setCapacity(reading("gpt", clock, [{ id: "7d", remainingPercent: 20,
+        resetAt: "2026-09-19T08:14:51.000Z", capabilities: ["ceo", "blind-review", "worker", "luna-worker"] }]));
+      const [measured] = await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["gpt"]);
+      expect(measured).toMatchObject({ sensorHealth: "HEALTHY", runtimeHealth: "HEALTHY", allocationAdmission: "CONSERVE" });
+      expect(cp.capacity.isRoutableFor(measured!, "blind-review")).toBe(true);
+      const readings = [measured!];
+      expect(assertMeasuredCapacity(readings, ["gpt"])).toBe(readings);
+      expect((await measureDocumentCapacity(cp.capacity, cp.providers)).find((entry) => entry.provider === "gpt"))
+        .toMatchObject({ allocationAdmission: "CONSERVE", buckets: [{ remainingPercent: 20 }] });
+    } finally { cp.close(); }
+  });
   it("unknown measured capacity fails closed; a measured reading is not rewritten", async () => {
     const { assertMeasuredCapacity } = await import("../helpers/document-only-integration.ts");
     const readings: ProviderCapacity[] = ["claude", "gpt"].map((provider) => ({
@@ -170,11 +187,28 @@ describe("document-only component input", () => {
     }));
     expect(assertMeasuredCapacity(readings)).toBe(readings);
     expect(() => assertMeasuredCapacity([])).toThrow("CAPACITY_UNKNOWN_NOT_ROUTABLE");
-    for (const bad of [
-      { sensorHealth: "ERROR" }, { runtimeHealth: "UNKNOWN" }, { allocationAdmission: "SUSPENDED" },
-      { buckets: [] }, { buckets: [{ ...readings[0]!.buckets[0], remainingPercent: null }] },
-      { operatorObservation: { actor: "not-a-measurement" } },
-    ]) expect(() => assertMeasuredCapacity([{ ...readings[0], ...bad }, readings[1]] as ProviderCapacity[])).toThrow("CAPACITY_UNKNOWN_NOT_ROUTABLE");
+    expect(() => assertMeasuredCapacity([readings[0]!, readings[0]!])).toThrow("CAPACITY_UNKNOWN_NOT_ROUTABLE");
+    expect(() => assertMeasuredCapacity(readings, ["claude", "claude"])).toThrow("CAPACITY_UNKNOWN_NOT_ROUTABLE");
+    expect(() => assertMeasuredCapacity([], [])).toThrow("CAPACITY_UNKNOWN_NOT_ROUTABLE");
+    for (const allocationAdmission of ["OPEN", "CONSERVE"] as const) {
+      for (const remainingPercent of [Number.MIN_VALUE, 20, 100]) {
+        const valid = [{ ...readings[0]!, allocationAdmission,
+          buckets: [{ ...readings[0]!.buckets[0]!, remainingPercent }] }, readings[1]!];
+        const before = structuredClone(valid);
+        expect(assertMeasuredCapacity(valid)).toBe(valid);
+        expect(valid).toEqual(before);
+      }
+      for (const bad of [
+        ...["ERROR", "UNKNOWN", "STALE"].map((sensorHealth) => ({ sensorHealth })),
+        ...["UNKNOWN", "UNAVAILABLE"].map((runtimeHealth) => ({ runtimeHealth })),
+        ...["SUSPENDED", "UNKNOWN", "unexpected", undefined].map((admission) => ({ allocationAdmission: admission })),
+        { buckets: [] },
+        ...[null, NaN, Infinity, -Infinity, -1, 0, 100.01, "20"].map((remainingPercent) =>
+          ({ buckets: [{ ...readings[0]!.buckets[0], remainingPercent }] })),
+        { operatorObservation: { actor: "not-a-measurement" } },
+      ]) expect(() => assertMeasuredCapacity([{ ...readings[0], allocationAdmission, ...bad }, readings[1]] as ProviderCapacity[]))
+        .toThrow("CAPACITY_UNKNOWN_NOT_ROUTABLE");
+    }
   });
   it("the existing caller consumes the document input before constructing provider state", () => {
     const source = driver();
@@ -376,6 +410,30 @@ describe("exact-role mandatory coverage", () => {
       await expect(measureDocumentCapacity(cp.capacity, cp.providers)).rejects.toThrow("CAPACITY_UNKNOWN_NOT_ROUTABLE");
       expect(cp.capacity.currentForRole("claude", Role.PRIMARY_CTO)?.allocationAdmission).toBe("OPEN");
     } finally { cp.db.close(); }
+  });
+  it.each(["generation", "superseded", "capability"])("rejects document measurement role %s invalidation under CONSERVE", async (kind) => {
+    const { measureDocumentCapacity } = await import("../helpers/document-only-integration.ts");
+    const { cp, clock, gpt, claude } = makePlane();
+    try {
+      gpt.setCapacity(healthy("gpt", clock));
+      claude.setCapacity(reading("claude", clock, [{ id: "rolling", remainingPercent: 20, resetAt: null,
+        capabilities: kind === "capability" ? ["worker"] : CAPABILITIES }]));
+      for (const role of [Role.CEO, Role.BOOTSTRAP_CTO, Role.PRIMARY_CTO, Role.WORKER, Role.BLIND_REVIEWER]) {
+        cp.providers.registerForRole(claude, role);
+      }
+      const refresh = cp.capacity.refreshForRole.bind(cp.capacity);
+      vi.spyOn(cp.capacity, "refreshForRole").mockImplementation(async (provider, role) => {
+        const measured = await refresh(provider, role);
+        if (kind === "generation" && role === Role.CEO) {
+          return { ...measured, binding: { ...measured.binding, generation: (measured.binding.generation ?? 0) + 1 } };
+        }
+        if (kind === "superseded" && role === Role.BLIND_REVIEWER) cp.providers.invalidateCapacityForRole("claude", Role.CEO);
+        return measured;
+      });
+      const reason = kind === "generation" ? "role binding unavailable"
+        : kind === "superseded" ? "role binding superseded" : "role capability unavailable";
+      await expect(measureDocumentCapacity(cp.capacity, cp.providers)).rejects.toThrow(reason);
+    } finally { vi.restoreAllMocks(); cp.close(); }
   });
   it("composes the original six Claude roles without sharing reviewer identity", async () => {
     const root = tempDir("acp-role-composition-");
