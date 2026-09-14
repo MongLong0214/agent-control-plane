@@ -136,6 +136,30 @@ describe("document-only component input", () => {
     expect(config.adapterOptions.claude).not.toHaveProperty("providerCredentialDir");
     expect(config.adapterOptions.claude.reviewerEgress.profilePath).toBe("/confined/reviewer.sb");
     expect(config.adapterOptions.gpt.providerCredentialDir).toBe("/operator/.acp-reviewer/codex");
+
+    // Execute the driver's constructor and planning lookup with the real default adapters.
+    // No auth/capacity probe or provider invocation is needed to reach this boundary.
+    const root = tempDir("acp-planning-role-");
+    const cp: ControlPlane = construct(ControlPlane, join, root,
+      new ManualClock("2026-08-12T00:00:00.000Z"),
+      () => ({ profilePath: join(root, "reviewer.sb") }), [], "test-model", { env: { HOME: root } });
+    try {
+      expect(() => cp.providers.require("claude")).toThrow("has role-scoped adapters");
+      const primary = cp.providers.capacityBindingForRole("claude", Role.PRIMARY_CTO)!.adapter;
+      expect(primary).toBeInstanceOf(ClaudeCliAdapter);
+      expect(primary).not.toBe(cp.providers.capacityBindingForRole("claude", Role.BLIND_REVIEWER)!.adapter);
+      const lookup = vi.spyOn(cp.providers, "requireForRole");
+      const statements = source.match(/^\s*const ctoAdapter = cp\.providers\.[^;]+;/gm);
+      expect(statements).toHaveLength(1);
+      const select = new Function("cp", `${statements![0]} return ctoAdapter;`);
+      const selected: ProviderAdapter = select(cp);
+      expect(selected.isProduction).toBe(true);
+      expect(selected.provider).toBe("claude");
+      // requireForRole returns a fresh capacity-observing wrapper on each lookup.
+      expect(selected).toBe(lookup.mock.results[0]!.value);
+      // Several producer roles share an adapter: identity alone cannot prove the caller role.
+      expect(lookup).toHaveBeenCalledExactlyOnceWith("claude", Role.PRIMARY_CTO);
+    } finally { vi.restoreAllMocks(); cp.close(); }
   });
   it("unknown measured capacity fails closed; a measured reading is not rewritten", async () => {
     const { assertMeasuredCapacity } = await import("../helpers/document-only-integration.ts");

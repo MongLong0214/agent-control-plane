@@ -386,7 +386,7 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
       };
 
       // --- the real Primary CTO session produces the lean plan -------------
-      const ctoAdapter = cp.providers.require("claude");
+      const ctoAdapter = cp.providers.requireForRole("claude", "PRIMARY_CTO");
       const planning = await ctoAdapter.invoke({
         prompt: [
           "You are the Primary CTO for this run. Remove unnecessary complexity.",
