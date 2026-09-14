@@ -3,6 +3,7 @@ import { ExecutionMode, Role, RunKind, SessionLifecycle } from "../../src/domain
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
+import { BlindReviewGate } from "../../src/review/blind-review.ts";
 import type { VerificationReport } from "../../src/verify/verification-engine.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeHarness, registerFixtureProject } from "../helpers/harness.ts";
@@ -98,11 +99,77 @@ const preparedReview = async () => {
     VALUES (?, ?, ?, 'verify', ?, 'local', ?, ?, ?, 0, 'sha256:fixture', 0, 'PASS', NULL)`,
   [`${run.runId}:verify`, run.runId, digest, repo.identity, repo.candidateHead, now, now]);
   h.scripted.script({ match: /Candidate review/, text: reviewerPass([`${repo.identity}:src/app.js`]) });
-  return { ...setup, invoke: () => h.cp.review.controlPlaneInvoker()({
+  const request = {
     runId: run.runId, projectId, executionMode: run.executionMode, snapshot,
     contract, contractDigest: run.contractDigest, verification,
-  }) };
+  };
+  return { ...setup, request, invoke: () => h.cp.review.controlPlaneInvoker()(request) };
 };
+
+const reviewWithFallback = async () => {
+  const setup = await preparedReview();
+  const { h, request } = setup;
+  const { cp, clock } = h;
+  const fallback = new TestProductionAdapter(clock, "claude");
+  cp.providers.register(fallback);
+  fallback.setCapacity({ ...capacity(h, "blind-review"), provider: "claude" });
+  fallback.script({ match: /Candidate review/,
+    text: reviewerPass([`${request.snapshot.repositories[0]!.identity}:src/app.js`]) });
+  const gate = new BlindReviewGate(clock, cp.db, cp.audit, cp.artifacts,
+    cp.evidenceWritersForTests().BLIND_REVIEW, cp.sessions, cp.bindings, cp.providers,
+    cp.repositories, cp.telemetry, {
+      preferred: { provider: "scripted", model: "preferred-reviewer", effort: null },
+      fallbacks: [{ provider: "claude", model: "fallback-reviewer", effort: null }],
+    });
+  gate.attach({ capacity: cp.capacity });
+  return { ...setup, fallback, invoke: () => gate.controlPlaneInvoker()(request) };
+};
+
+describe("reviewer scope fallback boundary", () => {
+  it.each([
+    ["unknown", false], ["throws", false], ["unknown", true], ["throws", true],
+  ] as const)("denies %s preferred scope (after runtime=%s) before a healthy fallback", async (failure, afterRuntime) => {
+    const { h, fallback, invoke } = await reviewWithFallback();
+    const lookup = h.cp.providers.hasRoleScoped.bind(h.cp.providers);
+    const breakScope = () => vi.spyOn(h.cp.providers, "hasRoleScoped").mockImplementation((provider) => {
+      if (provider !== "scripted") return lookup(provider);
+      if (failure === "throws") throw new Error("lookup unavailable");
+      return undefined as unknown as boolean;
+    });
+    if (afterRuntime) {
+      const probe = h.scripted.probeRuntime.bind(h.scripted);
+      vi.spyOn(h.scripted, "probeRuntime").mockImplementation(async () => {
+        const health = await probe();
+        breakScope();
+        return health;
+      });
+    } else breakScope();
+    const preferredStart = vi.spyOn(h.scripted, "startSession");
+    const fallbackStart = vi.spyOn(fallback, "startSession");
+    const create = vi.spyOn(h.cp.sessions, "create");
+    expect(await invoke()).toMatchObject({ allowed: false, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
+    expect(preferredStart).not.toHaveBeenCalled();
+    expect(fallbackStart).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+    expect(h.scripted.invocations).toHaveLength(0);
+    expect(fallback.invocations).toHaveLength(0);
+    expect(h.cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toHaveLength(0);
+  });
+
+  it.each(["capacity", "outage"] as const)("preserves healthy fallback after preferred %s", async (failure) => {
+    const { h, fallback, invoke } = await reviewWithFallback();
+    if (failure === "capacity") h.scripted.setCapacity(capacity(h, "blind-review", 0));
+    else h.scripted.setRuntimeHealth("UNAVAILABLE");
+    const preferredStart = vi.spyOn(h.scripted, "startSession");
+    const fallbackStart = vi.spyOn(fallback, "startSession");
+    expect(await invoke()).toMatchObject({ allowed: true, reasonCode: ReasonCode.REVIEW_PASS,
+      value: { provider: "claude" } });
+    expect(preferredStart).not.toHaveBeenCalled();
+    expect(h.scripted.invocations).toHaveLength(0);
+    expect(fallbackStart).toHaveBeenCalledOnce();
+    expect(fallback.invocations).toHaveLength(1);
+  });
+});
 
 describe("real reviewer role admission", () => {
   it.each([false, true])("admits reviewer with only reviewer quota (scoped=%s)", async (scoped) => {
@@ -216,8 +283,7 @@ describe("caller fail-closed controls", () => {
       if (failure === "throws") throw new Error("lookup unavailable");
       return undefined as unknown as boolean;
     });
-    if (failure === "throws") await expect(invoke()).rejects.toThrow("lookup unavailable");
-    else expect(await invoke()).toMatchObject({ allowed: false, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
+    expect(await invoke()).toMatchObject({ allowed: false, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
     expect(start).not.toHaveBeenCalled();
     expect(h.scripted.invocations).toHaveLength(0);
   });
