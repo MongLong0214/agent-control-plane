@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import {
   copyFileSync,
   mkdirSync,
@@ -12,6 +11,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { afterEach, expect, it } from "vitest";
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 
 const roots: string[] = [];
 /**
@@ -50,7 +50,7 @@ const fixture = (freeze?: { readonly find: string; readonly replace: string }) =
     }
     writeFileSync(censusPath, source.replace(freeze.find, freeze.replace));
   }
-  return { write, run: () => spawnSync(process.execPath, ["scripts/verify-refusal-operands-are-watched.mjs"], {
+  return { write, run: () => boundedSpawnSync(process.execPath, ["scripts/verify-refusal-operands-are-watched.mjs"], {
     cwd: root, encoding: "utf8",
   }) };
 };
