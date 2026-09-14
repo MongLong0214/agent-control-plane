@@ -483,7 +483,7 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
     });
 
     // Give the writer a head start so the backup genuinely overlaps live writes.
-    boundedExecFileSync("sleep", ["1"]);
+    boundedExecFileSync("sleep", ["1"], { timeout: QUICK_CHILD_BUDGET_MS });
 
     const result = runExtractedBackup(fixtureHome, minimalPath());
 
