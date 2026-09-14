@@ -748,7 +748,7 @@ export class ControlPlane {
         // A reviewer can only use this deployment-provisioned dedicated CODEX_HOME. The
         // ordinary ~/.codex tree is intentionally never repurposed as a blind-review
         // credential scope because it can contain producer conversations.
-        providerCredentialDir: process.env["ACP_CODEX_REVIEWER_HOME"],
+        reviewerCodexHome: process.env["ACP_REVIEWER_CODEX_HOME"],
         reviewerEgress: this.config.reviewerEgress,
         binary: process.env["ACP_CODEX_BINARY"],
               ...overrides.gpt,
