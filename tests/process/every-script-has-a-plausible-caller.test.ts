@@ -1,8 +1,8 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -47,7 +47,7 @@ const scratchRepo = (): string => {
 };
 
 const run = (dir: string, args: string[] = []): { status: number | null; stdout: string; stderr: string } => {
-  const done = spawnSync("node", [SCRIPT, ...args], { cwd: dir, encoding: "utf8" });
+  const done = boundedSpawnSync("node", [SCRIPT, ...args], { cwd: dir, encoding: "utf8" });
   return { status: done.status, stdout: done.stdout, stderr: done.stderr };
 };
 
@@ -146,7 +146,7 @@ const runFixtureTest = (
 ): { status: number | null; stdout: string; stderr: string } => {
   const nodeModules = join(dir, "node_modules");
   if (!existsSync(nodeModules)) symlinkSync(join(ROOT, "node_modules"), nodeModules, "dir");
-  const done = spawnSync(process.execPath, [VITEST, "run", testFile, "--config", "vitest.config.ts"], {
+  const done = boundedSpawnSync(process.execPath, [VITEST, "run", testFile, "--config", "vitest.config.ts"], {
     cwd: dir,
     encoding: "utf8",
     env: { ...process.env, CI: "", ACP_SCRIPT_CALLER_MARKER: marker },
