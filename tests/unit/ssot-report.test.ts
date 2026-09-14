@@ -1,9 +1,9 @@
-import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 
 interface IssueFixture {
   number: number;
@@ -17,7 +17,7 @@ const reportScript = join(repoRoot, "scripts", "ssot-report.mjs");
 const issueFixture = join(repoRoot, "tests", "fixtures", "ssot-report-issues.json");
 
 const runReport = (args: string[], cwd = repoRoot) =>
-  spawnSync(process.execPath, [reportScript, ...args], {
+  boundedSpawnSync(process.execPath, [reportScript, ...args], {
     cwd,
     encoding: "utf8",
   });
