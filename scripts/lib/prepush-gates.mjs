@@ -77,6 +77,13 @@ export const GATES = [
   // probe existed twice, one copy bounded at 5s and one not, under a comment declaring them
   // equivalent. This gate is what makes the next unbounded copy arrive loudly.
   { script: "guards:subprocess-bounds" },
+  // #872 — a bounded child's budget fires before the case containing it times out. The sibling gate
+  // above proves a `timeout` is stated; it deliberately never reads the value. That leaves the
+  // shape this one catches: the helper's 55s default sitting inside a case that declares 20s, where
+  // the case times out first and the bound names nothing — the original defect wearing the fix's
+  // clothes. The helper's own record said nothing enforced the rule, and it was right twice: two
+  // sites that reading every converted file by hand had missed failed this gate's first run.
+  { script: "guards:child-budgets" },
   // #858 — a timestamp ORDER BY names a tiebreaker, or is named in the backlog. `received_at` is
   // millisecond ISO text and 400 consecutive clock reads shared one millisecond, so an order over
   // it alone is partial and SQLite returns ties in whatever the access path yields. Four sites took
