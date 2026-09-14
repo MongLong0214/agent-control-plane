@@ -1,0 +1,6 @@
+Limit: the list is still a list of names | a third wrapper added later is invisible here until someone adds it, and the failure will again point at a script nobody touched
+Ruled-out: resolving the import as the inode guard does | this census credits a local fake by design, so import resolution would make it stricter about wrappers than about the thing the wrappers replaced
+Blast: module
+Undo: easy
+Certainty: firm
+Provenance: inherited 8c488896b86dbe0a0515f69058392fbae26829e3
