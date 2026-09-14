@@ -7,6 +7,7 @@ import { claimReviewerCodexHome, provisionReviewerCodexHome } from "../../src/ru
 
 import { ManualClock } from "../../src/core/clock.ts";
 import { CodexCliAdapter, __testing, reviewerEnvironment } from "../../src/runtime/cli-adapters.ts";
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -14,7 +15,7 @@ afterAll(cleanupTempDirs);
 const seatbeltCanApply = (): boolean =>
   process.platform === "darwin" &&
   existsSync("/usr/bin/sandbox-exec") &&
-  spawnSync("/usr/bin/sandbox-exec", ["-p", "(version 1)\n(allow default)", "/usr/bin/true"]).status === 0;
+  boundedSpawnSync("/usr/bin/sandbox-exec", ["-p", "(version 1)\n(allow default)", "/usr/bin/true"]).status === 0;
 
 describe("CP-HI-04 reviewer isolation probes", () => {
   it("runs private Codex bootstrap and resume through the real local egress lease", async () => {
