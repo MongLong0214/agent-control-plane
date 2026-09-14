@@ -12,8 +12,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { PROJECT_MANIFEST_SCHEMA_ID, type ProjectManifest } from "../../src/contracts/manifest.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import { ExecutionMode, RunState, SessionLifecycle } from "../../src/domain/types.ts";
-import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
-import type { TaskContract } from "../../src/run/run-engine.ts";
+import { validateDocumentInput, applyDocumentInput, measureDocumentCapacity } from "../helpers/document-only-integration.ts";
 import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import { bindWorkerForTask } from "../helpers/harness.ts";
 
@@ -25,8 +24,9 @@ import { bindWorkerForTask } from "../helpers/harness.ts";
  * headless Claude reviewer, a candidate snapshot, and the component-level gates. It
  * deliberately constructs `ControlPlane` and invokes component APIs directly; the worker
  * edit also uses `writeFileSync` and git directly. It therefore does not exercise the
- * deployed Hermes or CTO MCP transports, Buzz, the daemon-managed worker runtime, GitHub
- * App merge, or post-merge verification. Those surfaces require deployment E2E evidence.
+ * deployed Hermes or CTO MCP transports, Buzz, or the daemon-managed worker runtime.
+ * The production finalizer is called directly on disposable state, not on the canonical
+ * daemon. Its result is component evidence, not deployment E2E certification.
  *
  * Opt in with ACP_COMPONENT_INTEGRATION=1 because it spends real provider quota.
  */
@@ -88,31 +88,11 @@ const EVIDENCE_FILE =
 /** The identity this deployment allowlists in `~/.agent-control-plane/owner-identities`. */
 const OWNER = { channel: "cli", actor: process.env["USER"] ?? "" } as const;
 
-const CONTRACT: TaskContract = {
-  goal: "Add a documented helper that reports the reason-code catalogue size",
-  why: "Operators need a machine-readable count of the stable reason codes when auditing denials",
-  scope: ["src/core/reason-codes.ts"],
-  nonGoals: ["renaming any existing reason code"],
-  acceptance: [
-    // The criteria name the evidence this run actually produces. The full typecheck
-    // needs installed dependencies and so belongs to CI as TRUSTED_CI evidence; stating
-    // it here would promise evidence the local verification cannot supply.
-    "the reason-code contract check (scripts/verify-reason-codes.mjs) passes at the exact candidate head",
-    "no existing reason code string is removed or renamed",
-    "nothing outside src/core/reason-codes.ts is modified",
-  ],
-  priority: "NORMAL",
-  // A GUARDED run is exactly the one that must not complete on machine evidence alone
-  // (§12.3, §21), so the gate is real and an allowlisted owner has to clear it.
-  humanGate: MODE === "GUARDED" ? ["owner approval before a guarded change is published"] : [],
-  references: ["PRD §40 Explainability"],
-};
-
-const manifestFor = (projectId: string): ProjectManifest => ({
+const manifestFor = (projectId: string, identity: string): ProjectManifest => ({
   schema: PROJECT_MANIFEST_SCHEMA_ID,
   projectId,
   repositories: [
-    { role: "primary", remote: "github:MongLong0214/agent-control-plane", manifestRoot: "." },
+    { role: "primary", remote: identity, manifestRoot: "." },
     // The manifest has to describe the second participant, not just the run (#512). The
     // repository registry does not check a registered role against the manifest, so a missing
     // declaration here does not fail at registration — it fails much later, when the secondary's
@@ -190,6 +170,18 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
   it(
     `drives ${MODE} through direct component calls to verification, fresh blind review, packet, and confirm`,
     async () => {
+      // Explicit approved input is required before provider state or remote writes. A component
+      // CEO fixture is not canonical live owner evidence, even when real providers are used.
+      const inputPath = process.env["ACP_COMPONENT_INTEGRATION_DOCUMENT_INPUT"];
+      if (!inputPath || SECOND_PROJECT || SECOND_IDENTITY) throw new Error("DOCUMENT_INPUT_SINGLE_REPO_REQUIRED");
+      const documentInput = validateDocumentInput(REAL_PROJECT, JSON.parse(readFileSync(inputPath, "utf8")));
+      const CONTRACT = documentInput.contract;
+      if (!["SIMPLE", "STANDARD", "GUARDED"].includes(MODE)
+          || (MODE === "GUARDED" && CONTRACT.humanGate.length === 0)) throw new Error("DOCUMENT_INPUT_INVALID_MODE_GATE");
+      const remoteHead = execFileSync("git", ["-C", REAL_PROJECT, "ls-remote", "origin", "refs/heads/main"], {
+        encoding: "utf8", timeout: 30_000,
+      }).trim().split("\t")[0];
+      if (remoteHead !== documentInput.baseHead) throw new Error("DOCUMENT_INPUT_STALE_REMOTE_MAIN");
       const root = tempDir("acp-component-integration-");
       const checkout = join(root, "project");
 
@@ -214,12 +206,12 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
       // every change arrives on one. Combined with being opt-in, that is why it drifted until
       // it failed at its first step. The branch contract still wants a real long-lived branch,
       // so this checks one out instead of relaxing the contract to match the runner.
-      gitSync(checkout, ["checkout", "--quiet", MANIFEST_DEFAULT_BRANCH]);
+      gitSync(checkout, ["checkout", "--quiet", "-B", MANIFEST_DEFAULT_BRANCH, documentInput.baseHead]);
+      validateDocumentInput(checkout, documentInput);
       expect(gitSync(checkout, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe(MANIFEST_DEFAULT_BRANCH);
 
-      // The host's own declaration, read once: it authorises the owner and it names the actor
-      // who may author a capacity observation. Inventing a second actor here would make the
-      // observation prove itself rather than the deployment.
+      // Read the host's owner declaration; this does not attest a provider quota or turn
+      // the disposable component CEO below into a canonical owner session.
       const ownerIdentities = readOwnerIdentities(
         join(process.env["HOME"] ?? "", ".agent-control-plane", "owner-identities"),
       );
@@ -234,6 +226,8 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
         worktreeRoot: join(root, "worktrees"),
         capacityDir: join(root, "capacity"),
         secretsDir: join(root, "secrets"),
+        // Explicit trusted operator input; never copy credentials into disposable state.
+        githubAppEnvFile: process.env["ACP_GITHUB_APP_ENV_FILE"],
         clock: systemClock,
         // Overrides, not replacements (#552). `adapters:` would discard every option
         // ControlPlane passes and make each one this test's responsibility — four were lost that
@@ -247,10 +241,8 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
             reviewerEgress: ACCEPTANCE_REVIEWER_EGRESS(root),
           },
           claude: {
-            // The reviewer profile denies `~/.claude` — the producer's transcript store — so the
-            // reviewer needs its own scoped identity. `providerCredentialDir` is the only thing
-            // that exports CLAUDE_CONFIG_DIR.
-            providerCredentialDir: join(process.env["HOME"] ?? "", ".agent-control-plane", "reviewer", "claude"),
+            // Shared overrides reach both roles. Let ControlPlane supply reviewer-only
+            // ACP_CLAUDE_REVIEWER_CONFIG_DIR without changing the CTO's OAuth identity.
             reviewerEgress: ACCEPTANCE_REVIEWER_EGRESS(root),
           },
         },
@@ -278,98 +270,20 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
         },
       });
 
-      // The owner supplies the capacity file; without it the sensor fails closed and
-      // dispatch is refused, which is the documented behaviour rather than a guess.
-      mkdirSync(join(root, "capacity"), { recursive: true });
-      writeFileSync(
-        join(root, "capacity", "claude.json"),
-        JSON.stringify({
-          observedAt: new Date().toISOString(),
-          runtimeHealth: "HEALTHY",
-          buckets: [
-            {
-              id: "rolling-5h",
-              remainingPercent: 75,
-              resetAt: null,
-              capabilities: ["ceo", "cto", "blind-review", "worker"],
-            },
-          ],
-        }),
-      );
-      // The reviewer is gpt, and capacity is per provider. Seeding only claude left review
-      // refused CAPACITY_UNKNOWN_NOT_ROUTABLE: dispatch had a routable provider and the
-      // reviewer did not.
-      writeFileSync(
-        join(root, "capacity", "gpt.json"),
-        JSON.stringify({
-          observedAt: new Date().toISOString(),
-          runtimeHealth: "HEALTHY",
-          buckets: [
-            {
-              id: "rolling-5h",
-              remainingPercent: 75,
-              resetAt: null,
-              capabilities: ["ceo", "cto", "blind-review", "worker"],
-            },
-          ],
-        }),
-      );
-
-      // Writing the file is not enough: the monitor only holds a reading once a refresh has
-      // read it, and in production that is the daemon's sensor tick. This test drives
-      // components directly, so nothing ticked and dispatch refused
-      // CAPACITY_UNKNOWN_NOT_ROUTABLE — the sensor had no reading rather than a bad one.
-      // The collector runs for real here and cannot read quota on this host: the Claude CLI's
-      // interactive /usage output carries no parseable window, so the reading comes back
-      // sensorHealth ERROR and overwrites the seeded file. That is #424's exact scenario, and
-      // the operator observation is the mechanism built for it — an authenticated reading that
-      // outlives a collector which cannot see quota. Supplying one is what a real operator
-      // does via `agentctl capacity observe`, not a way around the sensor.
-      await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["claude", "gpt"]);
-      const observed = await cp.capacity.observe({
-        provider: "claude",
-        observedAt: new Date().toISOString(),
-        actor: cliOwner.actor,
-        source: AGENTCTL_CAPACITY_OBSERVATION_SOURCE,
-        runtimeHealth: "HEALTHY",
-        buckets: [{
-          id: "owner-observed-window",
-          remainingPercent: 75,
-          resetAt: null,
-          capabilities: ["ceo", "cto", "worker", "blind-review"],
-        }],
-      });
-      if (!observed.allowed) {
-        throw new Error(`capacity observation refused: ${observed.reasonCode} ${observed.message}`);
-      }
-      // The same operator observation for the reviewer's provider. Its collector cannot read
-      // quota here either, so the authenticated reading is what makes review routable.
-      const observedGpt = await cp.capacity.observe({
-        provider: "gpt",
-        observedAt: new Date().toISOString(),
-        actor: cliOwner.actor,
-        source: AGENTCTL_CAPACITY_OBSERVATION_SOURCE,
-        runtimeHealth: "HEALTHY",
-        buckets: [{
-          id: "owner-observed-window",
-          remainingPercent: 75,
-          resetAt: null,
-          capabilities: ["ceo", "cto", "worker", "blind-review"],
-        }],
-      });
-      if (!observedGpt.allowed) {
-        throw new Error(`gpt capacity observation refused: ${observedGpt.reasonCode} ${observedGpt.message}`);
-      }
-      expect(
-        cp.capacity.current("claude")?.allocationAdmission,
-        "claude capacity is not routable, so no run can be dispatched",
-      ).toBe("OPEN");
-
-      const evidence: Record<string, unknown> = {};
+      // Existing collectors own these readings. Unknown/error is a terminal blocker;
+      // never seed a quota file or author an authenticated operator observation.
+      const measuredCapacity = await measureDocumentCapacity(cp.capacity, cp.providers);
+      const evidence: Record<string, unknown> = {
+        evidenceKind: "disposable-component",
+        canonicalLiveEvidence: false,
+        approvedInput: { baseHead: documentInput.baseHead, repositoryIdentity: documentInput.repositoryIdentity,
+          contract: CONTRACT, patchDigest: sha256(documentInput.patch) },
+        measuredCapacity,
+      };
 
       // --- manual registration, no Repo Factory ----------------------------
       const projectId = "agent-control-plane";
-      const initialManifest = manifestFor(projectId);
+      const initialManifest = manifestFor(projectId, documentInput.repositoryIdentity);
       const project = cp.projects.register({
         projectId,
         name: "agent-control-plane",
@@ -385,7 +299,7 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
         projectId,
         repositoryRole: "primary",
         activeManifestDigest: project.value.activeManifestDigest,
-        identity: "github:MongLong0214/agent-control-plane",
+        identity: documentInput.repositoryIdentity,
       });
       expect(repository.allowed).toBe(true);
       if (!repository.allowed) return;
@@ -425,7 +339,7 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
         activityBeforeCto: cp.projects.require(projectId).activity,
       };
 
-      // Hermes is the CEO endpoint; it is a distinct session from the CTO and reviewer.
+      // Disposable component CEO fixture; not the canonical Hermes endpoint or live owner proof.
       const hermes = cp.sessions.create({ provider: "hermes", model: "operator" });
       cp.sessions.transition(hermes.sessionId, SessionLifecycle.READY, "operator endpoint");
       cp.bindings.bind({ roleKey: "CEO", role: "CEO", sessionId: hermes.sessionId });
@@ -433,7 +347,7 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
       // --- DIRECT cannot write --------------------------------------------
       const directAttempt = cp.guard.evaluate({
         operation: "FILE_MUTATION",
-        targetPath: join(checkout, "src/core/reason-codes.ts"),
+        targetPath: join(checkout, CONTRACT.scope[0]!),
         claimedClassification: "DIRECT",
       });
       expect(directAttempt.allowed).toBe(false);
@@ -472,7 +386,7 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
       };
 
       // --- the real Primary CTO session produces the lean plan -------------
-      const ctoAdapter = cp.providers.require("claude");
+      const ctoAdapter = cp.providers.requireForRole("claude", "PRIMARY_CTO");
       const planning = await ctoAdapter.invoke({
         prompt: [
           "You are the Primary CTO for this run. Remove unnecessary complexity.",
@@ -501,14 +415,14 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
       };
 
       const submitted = cp.tasks.submit(runId, [
-        { key: "impl", title: "add the reason-code count helper", category: "implementation" },
-        { key: "verify", title: "confirm the typecheck passes", category: "test", dependsOn: ["impl"] },
+        { key: "impl", title: CONTRACT.goal, category: "implementation" },
+        { key: "verify", title: "verify the approved document diff", category: "test", dependsOn: ["impl"] },
       ]);
       expect(submitted.allowed).toBe(true);
       if (!submitted.allowed) return;
 
       cp.artifacts.put(runId, "PLAN", {
-        summary: "single-file helper, no new abstraction",
+        summary: CONTRACT.goal,
         source: "primary-cto",
         raw: planning.json ?? planning.text.slice(0, 2000),
       });
@@ -520,8 +434,8 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
         ownerBindingGeneration: run.ownerBindingGeneration!,
         ownerRoleKey: run.ownerRoleKey!,
         repositoryIdentity: repository.value.identity,
-        branch: "task/E2E-1-reason-code-count",
-        declaredPaths: ["src/core/reason-codes.ts"],
+        branch: "task/component-integration-document",
+        declaredPaths: CONTRACT.scope,
       });
       expect(claim.allowed).toBe(true);
 
@@ -541,17 +455,9 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
       expect(implExecution.allowed).toBe(true);
       if (!implExecution.allowed) return;
 
-      gitSync(checkout, ["checkout", "-q", "-b", "task/component-integration-1-reason-code-count"]);
-      const target = join(checkout, "src/core/reason-codes.ts");
-      const addition = [
-        "",
-        "/** Number of stable reason codes in the catalogue; used when auditing denials. */",
-        "export const reasonCodeCount = (): number => ALL.size;",
-        "",
-      ].join("\n");
-      writeFileSync(target, `${readUtf8(target)}${addition}`);
-      gitSync(checkout, ["add", "-A"]);
-      gitSync(checkout, ["commit", "-q", "-m", "feat(core): expose the reason-code catalogue size"]);
+      gitSync(checkout, ["checkout", "-q", "-b", "task/component-integration-document"]);
+      applyDocumentInput(checkout, documentInput);
+      gitSync(checkout, ["commit", "-q", "-m", "docs: apply the approved document-only dogfood change"]);
       const candidateHead = gitSync(checkout, ["rev-parse", "HEAD"]);
 
       cp.tasks.finishExecution(implExecution.value.executionId, {
@@ -579,7 +485,7 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
         runId,
         ownerSessionId: run.ownerSessionId!,
         ownerBindingGeneration: run.ownerBindingGeneration!,
-        resultSummary: "added reasonCodeCount() with no change to any existing code string",
+        resultSummary: CONTRACT.goal,
         recommendation: "merge",
         residualRisk: [],
       });
@@ -688,6 +594,8 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
       //
       // So the assertion is a *refusal*: with the first repository merged and its post-merge
       // verification not yet answered, a merge of the second must be denied and say why.
+      // Only the ordering claim is two-repository. It needs a dependent to be ordered behind
+      // something, and a single participant has neither an order nor a dependent.
       if (secondRepositoryId) {
         const ordered = cp.runs.repositoriesOf(runId);
         evidence["mergeOrder"] = ordered.map((entry) => ({
@@ -707,18 +615,33 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
           "a dependent was blocked before any repository had merged",
         ).toBe(true);
         evidence["dependentGate"] = { beforeAnyMerge: beforeAnyMerge.reasonCode };
+      }
 
-        // The merge itself goes through the production entry point. `finalizeApprovedRun` is
-        // what the daemon calls on a CEO-approved run, and it already walks the participants in
-        // `merge_order`, awaiting each post-merge before the next merge.
-        //
-        // The refusal that gate produces is *not* asserted here, and cannot usefully be: the
-        // finalizer never attempts the second merge early, so there is no moment in this path
-        // where a well-behaved caller is refused. That property is proved against the kernel in
-        // github-kernel.test.ts (#521), where the moment can be constructed. What this run
-        // proves is the end-to-end consequence — both repositories merged, in the declared
-        // order, each with its own post-merge verification.
-        const daemon = new Daemon(cp, { stateDir: tempDir("acp-two-repo-finalizer-") });
+      // #512 — finalisation runs for every participant count, not only for two.
+      //
+      // This call sat inside the `secondRepositoryId` branch above, so a **single-repository run
+      // never reached the production finalisation entry point at all**. That is exactly #512's
+      // scope — "one document-only change through CEO_APPROVED, daemon finalisation" — and the
+      // run that was supposed to prove it stopped at `CEO_APPROVED` and wrote its evidence file
+      // without ever calling the daemon. Every assertion in this test still passed, because a
+      // branch nobody enters asserts nothing.
+      //
+      // `finalizeApprovedRun` is what the daemon calls on a CEO-approved run (`agentcpd.ts:222`,
+      // `onCeoApproved`). It walks the participants in `merge_order`, awaiting each post-merge
+      // before the next merge, so it is the same code path for one participant and for two.
+      //
+      // The dependent-gate refusal is *not* asserted here and cannot usefully be: the finalizer
+      // never attempts a later merge early, so there is no moment in this path where a
+      // well-behaved caller is refused. That property is proved against the kernel in
+      // github-kernel.test.ts (#521), where the moment can be constructed. What this run proves
+      // is the end-to-end consequence — every declared participant merged, in the declared
+      // order, each with its own post-merge verification.
+      const daemon = new Daemon(cp, { stateDir: tempDir("acp-finalizer-") });
+      try {
+        // Use the existing public lock lifecycle without start()'s unrelated capacity
+        // refresh, queued-run resume, automatic finalization and periodic timers.
+        const acquired = daemon.lock.acquire(cp.clock.nowIso());
+        expect(acquired.allowed, `finalizer lock refused: ${acquired.reasonCode}`).toBe(true);
         const finalized = await daemon.finalizeApprovedRun(runId);
         expect(
           finalized.allowed,
@@ -731,10 +654,15 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
           mergeOrder: entry.mergeOrder,
           mergeState: entry.mergeState,
         }));
+        // Derived from the participants the run actually declared, not typed as a literal: a
+        // hardcoded `["MERGED", "MERGED"]` is what confined this whole block to the two-repository
+        // case, and a hardcoded `["MERGED"]` would confine it to the one-repository case instead.
         expect(
           settled.map((entry) => entry.mergeState),
-          "both participants must reach MERGED — a repository left PENDING means its post-merge never answered",
-        ).toEqual(["MERGED", "MERGED"]);
+          "every participant must reach MERGED — one left PENDING means its post-merge never answered",
+        ).toEqual(settled.map(() => "MERGED"));
+        expect(settled.length, "the run declared no participants to finalise").toBeGreaterThan(0);
+      } finally {
         await daemon.stop();
       }
       evidence["doctor"] = await cp.doctor.run("project", projectId);
@@ -760,5 +688,3 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
     30 * 60 * 1000,
   );
 });
-
-const readUtf8 = (path: string): string => readFileSync(path, "utf8");

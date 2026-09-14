@@ -420,7 +420,10 @@ export class BlindReviewGate {
 
     for (const preference of [this.preferences.preferred, ...this.preferences.fallbacks]) {
       const isPreferred = preference === this.preferences.preferred;
-      const adapter = this.providers.hasRoleScoped(preference.provider)
+      // Unknown registry scope is not an availability proof authorizing fallback.
+      const scope = this.reviewerScope(preference.provider);
+      if (!scope.allowed) return scope;
+      const adapter = scope.value
         ? this.providers.requireForRole(preference.provider, Role.BLIND_REVIEWER)
         : this.providers.get(preference.provider);
       if (!adapter) {
@@ -449,6 +452,10 @@ export class BlindReviewGate {
         continue;
       }
       const health = await adapter.probeRuntime();
+      // The awaited probe may invalidate scope. Stop before treating any subsequent
+      // denial as capacity exhaustion or an outage eligible for another provider.
+      const admissionScope = this.reviewerScope(preference.provider);
+      if (!admissionScope.allowed) return admissionScope;
       if (health === "UNAVAILABLE") {
         attempts.push({ preference, reason: "runtime unavailable" });
         continue;
@@ -456,7 +463,7 @@ export class BlindReviewGate {
       // A runtime probe does not allocate a reviewer. Once a provider is healthy enough
       // to constitute one, refresh and admit immediately before `startSession`; this is
       // the capacity precondition for the allocation, not a best-effort observation.
-      const capacity = await this.admitReviewer(preference.provider);
+      const capacity = await this.admitReviewer(preference.provider, admissionScope);
       if (!capacity.allowed) {
         capacityFailure ??= capacity;
         attempts.push({ preference, reason: capacity.reasonCode });
@@ -1275,15 +1282,28 @@ export class BlindReviewGate {
     return allow(ReasonCode.OK, { ...request, contract: contract.content, verification: report });
   }
 
+  /** Registry uncertainty must remain distinct from fallback-eligible capacity denial. */
+  private reviewerScope(provider: string): Decision<boolean> {
+    try {
+      const scoped = this.providers.hasRoleScoped(provider);
+      if (typeof scoped !== "boolean") throw new Error("unknown provider scope");
+      return allow(ReasonCode.OK, scoped);
+    } catch {
+      return deny(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE, "provider role scope is unavailable", { provider });
+    }
+  }
+
   /**
    * Standalone unit gates may exercise packet parsing without a composition root. Every
    * production `ControlPlane` attaches this port; its presence makes reviewer capacity a
    * precondition instead of a best-effort probe hidden in the runtime adapter.
    */
-  private async admitReviewer(provider: string): Promise<Decision<void>> {
+  private async admitReviewer(provider: string, scope = this.reviewerScope(provider)): Promise<Decision<void>> {
+    if (!scope.allowed) return scope;
     if (!this.#capacity) return allow(ReasonCode.OK, undefined);
     return this.#capacity.refreshForBlindReview({
       provider,
+      ...(scope.value ? { role: Role.BLIND_REVIEWER } : {}),
       capabilities: ["blind-review"],
       priority: "critical",
     });

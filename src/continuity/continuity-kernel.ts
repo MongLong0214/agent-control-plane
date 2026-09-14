@@ -130,15 +130,28 @@ export class ContinuityKernel {
   /** §15.3 — computed before any failover, never after. */
   computeCoveragePlan(): RoleCoveragePlan {
     const requiredRoles = this.requiredRoles();
-    const productionProviders = new Set(this.providers.production().map((adapter) => adapter.provider));
-    const capacities = this.capacity.all().filter((capacity) => productionProviders.has(capacity.provider));
-    const byProvider = new Map(capacities.map((c) => [c.provider, c]));
+    const productionProviders = this.coverageProviders(requiredRoles);
+    const byProvider = new Map<string, ProviderCapacity>();
+    for (const provider of productionProviders) {
+      if (this.providers.hasRoleScoped(provider)) {
+        for (const role of new Set(requiredRoles.map((required) => required.role))) {
+          // Diagnostic UNKNOWN remains UNKNOWN. It is never relabelled as role evidence.
+          const capacity = this.capacity.currentForRole(provider, role) ?? this.capacity.current(provider);
+          if (capacity) byProvider.set(`${provider}:${role}`, capacity);
+        }
+      } else {
+        const capacity = this.capacity.current(provider);
+        if (capacity) byProvider.set(provider, capacity);
+      }
+    }
 
-    const usable = (provider: string, capability: string): ProviderCapacity | null => {
-      const capacity = byProvider.get(provider);
+    const usable = (provider: string, required: RequiredRole): ProviderCapacity | null => {
+      const capacity = this.providers.hasRoleScoped(provider)
+        ? this.capacity.currentForRole(provider, required.role)
+        : byProvider.get(provider);
       if (!capacity) return null;
-      // Same routability rule the monitor applies: an unknown bucket is not routable.
-      return this.capacity.isRoutableFor(capacity, capability) ? capacity : null;
+      // currentForRole checks the current registration identity, not another role's quota.
+      return this.capacity.isRoutableFor(capacity, required.capability) ? capacity : null;
     };
 
     const assignments: RoleCoveragePlan["assignments"] = [];
@@ -150,7 +163,7 @@ export class ContinuityKernel {
     // The §15.1 order first, then any other registered provider that can serve the
     // capability. Coverage must reflect the providers this deployment actually has, not a
     // hardcoded roster: an unlisted provider is a fallback, not an absence of coverage.
-    const registered = this.providers.production().map((adapter) => adapter.provider);
+    const registered = [...productionProviders];
     const candidatesFor = (capability: string): string[] => {
       const ranked = (PREFERENCE[capability] ?? []).filter((p) => byProvider.has(p) || registered.includes(p));
       // §14.5 — an optional provider never becomes coverage on its own. It is a
@@ -166,8 +179,8 @@ export class ContinuityKernel {
       const taken = usedByGroup.get(role.isolationGroup) ?? new Set<string>();
 
       const candidate =
-        preferred.find((p) => usable(p, role.capability) !== null && !taken.has(p)) ??
-        preferred.find((p) => usable(p, role.capability) !== null) ??
+        preferred.find((p) => usable(p, role) !== null && !taken.has(p)) ??
+        preferred.find((p) => usable(p, role) !== null) ??
         null;
 
       if (!candidate) {
@@ -241,6 +254,12 @@ export class ContinuityKernel {
    */
   async evaluate(reason: string): Promise<RoleCoveragePlan> {
     await this.capacity.refresh(RefreshTrigger.CONTINUITY_EVALUATION);
+    for (const provider of this.coverageProviders(this.requiredRoles())) {
+      if (!this.providers.hasRoleScoped(provider)) continue;
+      for (const role of new Set(this.requiredRoles().map((required) => required.role))) {
+        await this.capacity.refreshForRole(provider, role);
+      }
+    }
     const plan = this.computeCoveragePlan();
     let previous: ContinuityMode = ContinuityMode.NORMAL;
     let transitioned = false;
@@ -513,6 +532,24 @@ export class ContinuityKernel {
   }
 
 
+  private coverageProviders(requiredRoles: readonly RequiredRole[]): Set<string> {
+    const shared = new Set(this.providers.production().map((adapter) => adapter.provider));
+    // production() enumerates shared adapters only. Preserve preferred scoped routes and
+    // every live binding/execution provider without pretending the shared list is complete.
+    const candidates = new Set([...shared, ...Object.values(PREFERENCE).flat()]);
+    for (const required of requiredRoles) {
+      const binding = this.bindings.active(required.roleKey);
+      const session = binding && this.sessions.get(binding.sessionId);
+      if (session) candidates.add(session.provider);
+    }
+    for (const execution of this.db.all<{ provider: string }>(
+      `SELECT DISTINCT provider FROM task_executions WHERE status = 'RUNNING'`,
+    )) candidates.add(execution.provider);
+    return new Set([...candidates].filter((provider) => shared.has(provider) || requiredRoles.some(
+      (required) => this.providers.capacityBindingForRole(provider, required.role)?.adapter.isProduction,
+    )));
+  }
+
   private requiredRoles(): RequiredRole[] {
     const roles: RequiredRole[] = [
       {
@@ -584,7 +621,27 @@ export class ContinuityKernel {
       });
     }
 
-    return roles;
+    // Bound critical actors remain requirements even before dispatch or while a project
+    // is inactive. Optional adversarial review is not promoted to a critical dependency;
+    // WORKER demand remains the RUNNING execution roster above, never all old bindings.
+    for (const row of this.db.all<{ role_key: string }>(
+      `SELECT role_key FROM assignments WHERE status = 'ACTIVE'
+         AND role IN ('CEO', 'BOOTSTRAP_CTO', 'PRIMARY_CTO', 'BLIND_REVIEWER')`,
+    )) {
+      const binding = this.bindings.active(row.role_key);
+      if (!binding || roles.some((required) => required.roleKey === binding.roleKey)) continue;
+      roles.push({
+        roleKey: binding.roleKey,
+        role: binding.role,
+        capability: binding.role === Role.CEO ? "ceo" : binding.role === Role.BLIND_REVIEWER ? "blind-review" : "cto",
+        projectId: binding.projectId,
+        runId: binding.runId,
+        taskId: binding.taskId,
+        isolationGroup: binding.projectId ? `project:${binding.projectId}` : binding.runId ? `run:${binding.runId}` : "global",
+        inFlight: true,
+      });
+    }
+    return [...new Map(roles.map((required) => [required.roleKey, required])).values()];
   }
 
   /** Constitute a real, routable provider session before it is allowed to own a role. */

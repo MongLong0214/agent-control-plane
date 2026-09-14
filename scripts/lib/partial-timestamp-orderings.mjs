@@ -40,5 +40,5 @@ export const PARTIAL_TIMESTAMP_ORDERINGS = new Map([
   ["src/daemon/agentcpd.ts:1792", "ORDER BY created_at"],
   ["src/github/github-kernel.ts:3419", "ORDER BY created_at DESC"],
   ["src/github/github-kernel.ts:3845", "ORDER BY created_at"],
-  ["src/run/run-engine.ts:1045", "ORDER BY created_at"],
+  ["src/run/run-engine.ts:1075", "ORDER BY created_at"],
 ]);

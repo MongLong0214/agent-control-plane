@@ -1614,7 +1614,14 @@ setInterval(() => {}, 1_000);
     });
 
   const probeAll = async (cp: ControlPlane): Promise<void> => {
-    for (const provider of ["claude", "gpt", "grok"]) await cp.providers.require(provider).probeRuntime();
+    // `representative`, not `require`: this probes the *binary* each provider was pinned to, which
+    // is a provider-level fact. `require` refuses a role-less caller by design (#512), and after
+    // #917 registered Claude per role that refusal is what this loop would hit.
+    for (const provider of ["claude", "gpt", "grok"]) {
+      const adapter = cp.providers.representative(provider);
+      if (!adapter) throw new Error(`no adapter enumerated for ${provider}`);
+      await adapter.probeRuntime();
+    }
   };
 
   it("#785 spawns each provider CLI at the absolute path the launcher pinned, not a bare name", async () => {

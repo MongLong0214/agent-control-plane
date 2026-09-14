@@ -1238,11 +1238,23 @@ export class Daemon {
     // The operator reports quota, not executable liveness. Preserve that distinction by
     // obtaining runtime health from the registered adapter before the observation enters
     // capacity admission; a failed liveness probe makes the persisted reading non-routable.
+    //
+    // `representative`, not `require`. Liveness is a fact about the provider's executable, not
+    // about which role is acting, and `require` refuses a role-less caller — so this used to throw
+    // for any role-scoped provider and the bare `catch` below recorded it as `UNAVAILABLE`. That
+    // made "you asked without a role" indistinguishable from "the binary does not run", silently
+    // and forever. The catch stays, because a real probe failure still has to land here; what
+    // changed is that the role refusal no longer reaches it.
     let runtimeHealth: "HEALTHY" | "DEGRADED" | "UNAVAILABLE";
-    try {
-      runtimeHealth = await this.cp.providers.require(provider.value).probeRuntime();
-    } catch {
+    const adapter = this.cp.providers.representative(provider.value);
+    if (!adapter) {
       runtimeHealth = "UNAVAILABLE";
+    } else {
+      try {
+        runtimeHealth = await adapter.probeRuntime();
+      } catch {
+        runtimeHealth = "UNAVAILABLE";
+      }
     }
     return this.cp.capacity.observe({
       provider: provider.value,

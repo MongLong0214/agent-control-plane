@@ -17,6 +17,59 @@
  */
 const groups = [
   {
+    file: "src/runtime/reviewer-codex-home.ts",
+    // path-shape
+    reason: "NO WITNESS. Measured by weakening the whole condition to its first operand and running all five cases in tests/unit/reviewer-codex-home.test.ts: 5 passed. The shape check is pre-empted by the three privateDirectory() calls below it \u2014 a path that is not <namespace>/<uuid>/home still fails on the namespace, capsule or home directory it does not own, so no fixture distinguishes which check refused. The operands stay because that pre-emption is implicit: a deployment that relaxed the directory checks, or a capsule created with the right mode under the wrong parent, would make this the only thing naming where a private home may live.",
+    operands: [
+      ["resolve(root) !== root",1],
+      ["basename(root) !== \"home\"",1],
+      ["dirname(capsule) !== namespace()",1],
+      ["!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(basename(capsule))",1],
+    ],
+  },
+  {
+    file: "src/runtime/reviewer-codex-home.ts",
+    // symlink-ancestor
+    reason: "NO WITNESS. Measured by replacing the loop body's condition with `false` and running all five cases: 5 passed. privateDirectory() re-checks isSymbolicLink and realpathSync on the namespace, capsule and home, so every symlink the fixtures build is caught one frame later. The walk stays because it is the only check above the namespace: a symlink at ~/.agent-control-plane or higher turns the private namespace into a shared credential store, and no fixture yet builds one.",
+    operands: [
+      ["lstatSync(path).isSymbolicLink()",1],
+      ["realpathSync(path) !== path",2],
+    ],
+  },
+  {
+    file: "src/runtime/reviewer-codex-home.ts",
+    // receipt-stat
+    reason: "NO WITNESS. Measured by weakening the condition to `!stat.isFile()` and running all five cases: 5 passed. Every fixture that damages the receipt replaces the home or capsule too, so the identity comparison below fails first and nothing distinguishes a hardlinked, group-readable or oversized receipt from an absent one. The operands stay because each names a different way the receipt stops being this capsule's own record \u2014 a second link, another uid, a widened mode, a payload \u2014 and none of those needs the home to change.",
+    operands: [
+      ["!stat.isFile()",1],
+      ["stat.isSymbolicLink()",2],
+      ["stat.nlink !== 1",1],
+      ["stat.uid !== process.getuid?.()",2],
+      ["(stat.mode & 0o7777) !== 0o600",1],
+      ["stat.size > 2048",1],
+    ],
+  },
+  {
+    file: "src/runtime/reviewer-codex-home.ts",
+    // receipt-shape
+    reason: "NO WITNESS. Measured by dropping the key-set comparison and running all five cases: 5 passed. A receipt carrying extra or missing keys still fails the four device/inode comparisons below whenever the fixtures alter it. The operand stays because the key set is what makes JSON.parse's result the declared shape rather than whatever parsed: a receipt with the right four inode fields and an extra key would otherwise be admitted and frozen into the binding.",
+    operands: [
+      ["Object.keys(identity).sort().join(\",\") !== \"capsuleDev,capsuleIno,dev,ino,root\"",1],
+      ["identity.root !== root",1],
+    ],
+  },
+  {
+    file: "src/runtime/reviewer-codex-home.ts",
+    // claim-identity
+    reason: "NO WITNESS. Measured by weakening the condition to `identity.dev !== home.dev` and running all five cases: 5 passed. The fixtures that move a home change its device and inode together, so the first operand catches them and the other three are never the deciding one. They stay because a same-device replacement \u2014 a rename within one filesystem, which is the ordinary case \u2014 changes the inode and not the device, and then identity.ino is the only comparison that refuses.",
+    operands: [
+      ["identity.dev !== home.dev",1],
+      ["identity.ino !== home.ino",1],
+      ["identity.capsuleDev !== capsule.dev",1],
+      ["identity.capsuleIno !== capsule.ino",1],
+    ],
+  },
+  {
     file: "src/daemon/canonical-self-claim-operator.ts",
     // isStoredOwnerApprovalPayload's two structural guards, in front of the field checks.
     reason: "Both are subsumed at runtime by the `record[\"type\"] === \"OWNER_APPROVAL\"` check one line down, and both mutants were run and SURVIVED. Remove `typeof value !== \"object\"` and a string payload reaches `record[\"type\"]`, where indexing a string yields `undefined`, which is not the literal — refused, same code, same message. Remove `Array.isArray(value)` and an array reaches the same read with the same outcome. They are kept because the coincidence is in the *next* check rather than in these: a future envelope whose first field happened to be one an array or a string could carry would make both load-bearing again, and nothing about the type check announces that it is doing this work.",

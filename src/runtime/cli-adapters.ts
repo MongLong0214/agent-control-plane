@@ -16,6 +16,7 @@ import { randomUUID } from "node:crypto";
 import type { Clock } from "../core/clock.ts";
 import { disposableWorkspaceLocation } from "../core/disposable-workspace-root.ts";
 import { acpScratchDir } from "../core/scratch-root.ts";
+import { assertReviewerCodexHome, claimReviewerCodexHome, type ReviewerCodexHome } from "./reviewer-codex-home.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import {
   ClaudeUsageCollector,
@@ -74,6 +75,8 @@ export interface CliAdapterOptions {
    * "Not logged in", and dispatch then fails SESSION_NOT_READY).
    */
   providerCredentialDir?: string;
+  /** Explicit independently provisioned, single-session private Codex home; never a shared store. */
+  reviewerCodexHome?: string;
   /** Dependency-injection seam for a real /usage collector; production supplies one below. */
   usageCollector?: UsageCollector;
   /** Observations beyond this lead are not valid freshness evidence. */
@@ -325,6 +328,8 @@ const productionRunCli = async (
     isolation?: NonNullable<InvocationRequest["isolation"]>;
     /** Provider state the reviewer CLI must read to authenticate, never inherited wholesale. */
     reviewerCredentialPaths?: readonly string[];
+    /** Branded, identity-checked single-session home; never a caller-supplied write path. */
+    reviewerPrivateHome?: ReviewerCodexHome;
     /** Provider config root used while HOME points at the packet directory. */
     reviewerConfigDirectory?: string;
     /** A provider-specific reviewer environment, constructed rather than inherited. */
@@ -367,6 +372,7 @@ const productionRunCli = async (
     const workdir = realpathSync(options.cwd ?? scratch);
     if (options.isolation) {
       assertReviewerIsolation(workdir, options.isolation, options.reviewerCredentialPaths ?? []);
+      if (options.reviewerPrivateHome) assertReviewerCodexHome(options.reviewerPrivateHome);
     }
     const isolated = options.isolation !== undefined;
     if (isolated) {
@@ -403,6 +409,7 @@ const productionRunCli = async (
           options.reviewerCredentialPaths ?? [],
           options.reviewerExecutablePaths ?? [],
           egress?.port,
+          options.reviewerPrivateHome,
         )
       : runtimeProfile(
           workdir,
@@ -468,6 +475,7 @@ const productionRunCli = async (
     }>((resolve) => {
       let child: ReturnType<typeof spawn>;
       try {
+        if (options.reviewerPrivateHome) assertReviewerCodexHome(options.reviewerPrivateHome);
         child = spawn("/usr/bin/sandbox-exec", reviewerSandboxArgs(
           profile,
           file,
@@ -1234,7 +1242,15 @@ const reviewerProfile = (
   credentialPaths: readonly string[],
   additionalExecutables: readonly string[] = [],
   egressPort?: number,
+  privateHome?: ReviewerCodexHome,
 ): string => {
+  if (privateHome) {
+    assertReviewerCodexHome(privateHome);
+    const capsule = dirname(privateHome.root);
+    if (packetRoot === capsule || packetRoot.startsWith(`${capsule}/`) || capsule.startsWith(`${packetRoot}/`)) {
+      throw new Error("private reviewer home overlaps packet");
+    }
+  }
   const disposableWorkspaceRoot = disposableWorkspaceLocation().workspaceRoot;
   const lines = ["(version 1)", "(allow default)"];
   const sensitive = [
@@ -1297,11 +1313,37 @@ const reviewerProfile = (
   // The path is resolved deliberately: seatbelt matches resolved paths and `/var` is a symlink to
   // `/private/var`, so an allowance written from `TMPDIR` silently fails to match.
   const perUserTemp = resolvePath(tmpdir());
-  if (perUserTemp) lines.push(`(allow file-write* (subpath ${quote(perUserTemp)}))`);
+  if (perUserTemp && !privateHome) lines.push(`(allow file-write* (subpath ${quote(perUserTemp)}))`);
   // The fixed disposable allocator can be below the allowed temp root on hosts whose OS default is
   // `/tmp`. Carve it back out after that allowance: ACP evidence may not become reviewer-writable
   // merely because the two system roots coincide on one platform.
   lines.push(`(deny file-write* (subpath ${quote(resolvePath(disposableWorkspaceRoot))}))`);
+  if (privateHome) {
+    // Deny owner home and every sibling/capsule, then reopen only the selected root,
+    // packet and exact native executable/runtime files. No global temp write grant.
+    for (const home of new Set([homedir(), process.env.HOME].filter((value): value is string => Boolean(value)))) {
+      lines.push(`(deny file-read* (subpath ${quote(resolvePath(home))}))`);
+    }
+    lines.push(`(allow file-read* (subpath ${quote(packetRoot)}))`);
+    for (const path of [executable, process.execPath, ...additionalExecutables]) {
+      lines.push(`(allow file-read* (literal ${quote(resolvePath(path))}))`);
+    }
+    lines.push(`(allow file-read* file-write* (subpath ${quote(privateHome.root)}))`);
+    // realpath needs metadata on the exact ancestors, not directory contents or writes.
+    // Without this, native Codex refuses CODEX_HOME before runtime/auth initialization.
+    for (const target of [privateHome.root, packetRoot, executable]) {
+      for (let parent = dirname(resolvePath(target)); parent !== dirname(parent); parent = dirname(parent)) {
+        lines.push(`(allow file-read-metadata (literal ${quote(parent)}))`);
+      }
+    }
+    // Private homes are disjoint from explicit withheld inputs. Never override their deny.
+    for (const path of denyReadPaths.map(resolvePath)) {
+      if (path === privateHome.root || path.startsWith(`${privateHome.root}/`) || privateHome.root.startsWith(`${path}/`)) {
+        throw new Error("private reviewer home overlaps withheld input");
+      }
+      lines.push(`(deny file-read* file-write* (subpath ${quote(path)}))`);
+    }
+  }
   return lines.join("\n");
 };
 
@@ -1731,7 +1773,10 @@ export class CodexCliAdapter implements ProviderAdapter {
   readonly #providerCredentialDir: string | undefined;
   readonly #reviewerEgress: ReviewerEgressConfig | undefined;
   readonly #managedWriteBroker: ManagedInvocationWriteBroker | undefined;
+  readonly #reviewerCodexHome: string | undefined;
   readonly #reviewerSessions = new Map<string, {
+    home: ReviewerCodexHome;
+    busy: boolean;
     workdir: string;
     model: string;
     effort: string | null;
@@ -1766,6 +1811,7 @@ export class CodexCliAdapter implements ProviderAdapter {
     //
     // Session isolation is untouched: `runtimeEnvironment` and the seatbelt profile still
     // receive it, and no profile deny is relaxed.
+    this.#reviewerCodexHome = options.reviewerCodexHome;
     this.#usageCollector = options.usageCollector ?? new CodexUsageCollector({
       clock: this.#clock,
       binary: this.#binary,
@@ -1906,21 +1952,27 @@ export class CodexCliAdapter implements ProviderAdapter {
    * The answer turn then uses `exec resume <thread_id>` under the same profile.
    */
   private async startPacketReviewerSession(spec: SessionSpec): Promise<SessionHandle> {
-    if (!this.#providerCredentialDir) {
+    if (!this.#reviewerCodexHome) {
       throw new ProviderSessionProvisionError(
         ReasonCode.ISOLATION_LOST,
-        "Codex packet reviewer requires a dedicated CODEX_HOME credential scope",
+        "Codex packet reviewer requires a dedicated private CODEX_HOME credential scope",
       );
     }
-    const credentialPaths = codexCredentialPaths(this.#providerCredentialDir);
+    let home: ReviewerCodexHome;
+    try { home = claimReviewerCodexHome(this.#reviewerCodexHome); } catch {
+      throw new ProviderSessionProvisionError(ReasonCode.ISOLATION_LOST, "invalid or already claimed private reviewer CODEX_HOME");
+    }
+    const credentialPaths = codexCredentialPaths(home.root);
     const args = codexReviewerArgs("bootstrap", spec.model, spec.effort);
-    const result = await runCli(this.#binary, args, {
+    const nativeBinary = codexReviewerExecutables(this.#binary).at(-1)!;
+    const result = await runCli(nativeBinary, args, {
       cwd: spec.workdir,
       timeoutMs: 60_000,
       stdin: "This is a packet-only reviewer session identity handshake. Reply exactly READY and do not use tools.",
       isolation: spec.isolation,
       reviewerCredentialPaths: credentialPaths,
-      reviewerEnvironment: codexReviewerEnvironment(spec.workdir, this.#providerCredentialDir),
+      reviewerPrivateHome: home,
+      reviewerEnvironment: codexReviewerEnvironment(spec.workdir, home.root),
       reviewerExecutablePaths: codexReviewerExecutables(this.#binary),
       reviewerEgress: this.#reviewerEgress,
       reviewerProvider: this.provider,
@@ -1946,6 +1998,8 @@ export class CodexCliAdapter implements ProviderAdapter {
       );
     }
     this.#reviewerSessions.set(providerSessionId, {
+      home,
+      busy: false,
       workdir: spec.workdir,
       model: spec.model,
       effort: spec.effort ?? null,
@@ -1969,10 +2023,11 @@ export class CodexCliAdapter implements ProviderAdapter {
     if (
       !expectedSessionId ||
       !constituted ||
+      constituted.busy ||
       constituted.workdir !== request.workdir ||
       constituted.model !== model ||
       constituted.effort !== (request.effort ?? null) ||
-      !this.#providerCredentialDir
+      !this.#reviewerCodexHome
     ) {
       return refusedInvocation(
         request,
@@ -1983,19 +2038,25 @@ export class CodexCliAdapter implements ProviderAdapter {
       );
     }
 
+    try { assertReviewerCodexHome(constituted.home); } catch {
+      return refusedInvocation(request, this.provider, model, started, "private reviewer home identity changed");
+    }
+    constituted.busy = true;
     const args = codexReviewerArgs("resume", model, request.effort, expectedSessionId);
-    const result = await runCli(this.#binary, args, {
+    const nativeBinary = codexReviewerExecutables(this.#binary).at(-1)!;
+    const result = await runCli(nativeBinary, args, {
       cwd: request.workdir,
       timeoutMs: request.timeoutMs,
       stdin: request.systemPrompt ? `${request.systemPrompt}\n\n---\n\n${request.prompt}` : request.prompt,
       isolation: request.isolation,
-      reviewerCredentialPaths: codexCredentialPaths(this.#providerCredentialDir),
-      reviewerEnvironment: codexReviewerEnvironment(request.workdir, this.#providerCredentialDir),
+      reviewerCredentialPaths: codexCredentialPaths(constituted.home.root),
+      reviewerPrivateHome: constituted.home,
+      reviewerEnvironment: codexReviewerEnvironment(request.workdir, constituted.home.root),
       reviewerExecutablePaths: codexReviewerExecutables(this.#binary),
       reviewerEgress: this.#reviewerEgress,
       reviewerProvider: this.provider,
       reviewerEgressPhase: "reviewer-invocation",
-    });
+    }).finally(() => { constituted.busy = false; });
     const observedSessionId = codexThreadId(result.stdout);
     const sessionMatches = !observedSessionId || observedSessionId === expectedSessionId;
     const text = codexLastAgentMessage(result.stdout) ?? result.stdout;
