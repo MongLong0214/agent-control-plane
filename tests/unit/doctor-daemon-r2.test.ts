@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { join } from "node:path";
@@ -18,6 +17,7 @@ import { ExecutionMode, Role, RunState, SessionLifecycle } from "../../src/domai
 import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 import { buzzActorBindingSigningRequest, ingressSignature } from "../../src/ingress/ingress-guard.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
+import { boundedExecFileSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { bindCeo, bindWorker, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
 
@@ -205,8 +205,8 @@ describe("round 2 doctor regressions", () => {
     const { harness } = await createQueuedRun();
     const baseline = harness.cp.repositories.list()[0]!;
     writeFileSync(join(harness.repoPath, "README.md"), "# owner changed this out of band\n");
-    execFileSync("git", ["add", "README.md"], { cwd: harness.repoPath });
-    execFileSync("git", ["commit", "-m", "owner change"], { cwd: harness.repoPath });
+    boundedExecFileSync("git", ["add", "README.md"], { cwd: harness.repoPath });
+    boundedExecFileSync("git", ["commit", "-m", "owner change"], { cwd: harness.repoPath });
 
     const first = await harness.cp.doctor.run("system");
     const second = await harness.cp.doctor.run("system");
