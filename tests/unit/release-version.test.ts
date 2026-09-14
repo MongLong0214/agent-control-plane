@@ -1,10 +1,10 @@
-import { spawnSync } from "node:child_process";
 import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { acpScratchDir } from "../../src/core/scratch-root.ts";
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 
 /**
  * `scripts/verify-release-version.mjs` is enforced from here rather than from the CI workflow.
@@ -38,14 +38,14 @@ const runAgainst = (edit: (files: { packageJson: string; changelog: string }) =>
   const edited = edit({ packageJson, changelog });
   writeFileSync(join(dir, "package.json"), edited.packageJson ?? packageJson);
   writeFileSync(join(dir, "CHANGELOG.md"), edited.changelog ?? changelog);
-  return spawnSync(process.execPath, [join(dir, "scripts", "verify-release-version.mjs")], {
+  return boundedSpawnSync(process.execPath, [join(dir, "scripts", "verify-release-version.mjs")], {
     encoding: "utf8",
   });
 };
 
 describe("the repository states one version, in one place, that agrees with itself (#516)", () => {
   it("passes on the tree as committed", () => {
-    const result = spawnSync(process.execPath, [script], { cwd: repoRoot, encoding: "utf8" });
+    const result = boundedSpawnSync(process.execPath, [script], { cwd: repoRoot, encoding: "utf8" });
     expect(result.status, result.stdout + result.stderr).toBe(0);
   });
 
