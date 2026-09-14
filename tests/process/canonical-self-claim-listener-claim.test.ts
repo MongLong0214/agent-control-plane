@@ -1,4 +1,4 @@
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   copyFileSync,
@@ -32,6 +32,7 @@ import { allow, type Decision } from "../../src/core/errors.ts";
 import { sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { makeDefaultTranscriptReader } from "../../src/registry/canonical-self-claim.ts";
+import { boundedExecFileSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeStartedOperator, TEST_OPERATOR_TOKEN, type Harness, type StartedOperator } from "../helpers/harness.ts";
 import { createConnection } from "node:net";
@@ -129,11 +130,11 @@ const IMAGE_FIXTURE_ROOT = join(
  */
 const copyToStaging = (staging: string): void => {
   try {
-    execFileSync("cp", ["-c", process.execPath, staging], { stdio: "ignore" });
+    boundedExecFileSync("cp", ["-c", process.execPath, staging], { stdio: "ignore" });
     return;
   } catch { /* not APFS */ }
   try {
-    execFileSync("cp", ["--reflink=auto", process.execPath, staging], { stdio: "ignore" });
+    boundedExecFileSync("cp", ["--reflink=auto", process.execPath, staging], { stdio: "ignore" });
     return;
   } catch { /* no reflink */ }
   copyFileSync(process.execPath, staging);
