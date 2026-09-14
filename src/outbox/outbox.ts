@@ -431,7 +431,7 @@ export class Outbox {
             -- never judged retryable, so it is not picked up.
             AND (o.attempts = 0 OR o.retry_eligible = 1)
             AND ${liveDeliveryTarget("o")}
-          ORDER BY o.created_at
+          ORDER BY o.created_at, o.rowid
           LIMIT ?`,
         [now, now, limit],
       );
@@ -534,13 +534,24 @@ export class Outbox {
       // composite ties again. Not reachable from `src/`, where every writer mints through
       // `newMessageId()`, but a raw-SQL writer is in this repository's threat model.
       //
-      // And a tiebreaker here is not free. Two were tried — `message_id`, and `idempotency_key`
-      // for the property above — and both changed *which row* this `LIMIT` returns:
+      // `o.rowid`, and the reason is which orders a tiebreaker preserves. Two minted ids were
+      // tried and both changed *which row* this `LIMIT` returns —
       // `outbox-owner-message-holder.test.ts` expected the message it had queued and got another,
-      // each time. That is what the comparison shows and all it shows. It is not evidence that
-      // the untied order is rowid, nor that rowid is this queue's arrival order; no query plan was
-      // taken. So the tie stays open here rather than closed by a column that makes the census
-      // quiet, and what "arrival" should be measured against is itself an open question (#858).
+      // under `message_id` and again under `idempotency_key`. `rowid` does not:
+      //
+      //     inserted c, a, b        ORDER BY created_at              -> c
+      //                             ORDER BY created_at, message_id  -> a   (a different row)
+      //                             ORDER BY created_at, rowid       -> c   (the same row)
+      //
+      // A minted id sorts arbitrarily; rowid is assigned in insertion order, which for a queue is
+      // the order the rows arrived. So this pair is total *and* keeps the answer the untied query
+      // already gave, which is the part a census cannot check and a consumer can.
+      //
+      // What it is not: a declared contract. `rowid` is SQLite's, not this schema's — a `VACUUM`
+      // or a table rebuild renumbers it, and a delete lets a value be reused, because this table
+      // is not `AUTOINCREMENT`. Both only reorder rows that are already tied on `created_at`, and
+      // nothing here reads the number itself. Making arrival order a column the schema states is a
+      // migration and remains #858's, not this query's.
       //
       // `created_at` is millisecond ISO text, and 400 consecutive `systemClock.nowIso()` calls
       // were measured returning one distinct timestamp. This query is `LIMIT 1`: it decides which
@@ -560,7 +571,7 @@ export class Outbox {
             AND o.status = 'PENDING'
             AND o.role_key = ? AND o.binding_generation = ? AND o.target_session_id = ?
             AND ${exactHolderTarget("o")}
-          ORDER BY o.created_at
+          ORDER BY o.created_at, o.rowid
           LIMIT 1`,
         tuple,
       );
