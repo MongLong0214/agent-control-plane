@@ -1,0 +1,32 @@
+Limit: the bound is 55s from the shared helper, which is under the 60s global testTimeout but above what any child in these three files costs; none of them is a long-running closure copy the way rollback-pair-wal's is
+Warn: the new-inode census moves sites from "resolved" to "not decided" as files convert, because a path behind a wrapper is followed only as far as a non-argv[0] position — the count is unread, not cleared, and it went 74 -> 74 here only because these files' creations already sat there
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited c34b743cc159b4f0e4c867ecde62b074cc72f48a
+
+Limit: `canonical-self-claim-identity.test.ts` keeps `spawn` and `type ChildProcess` from `node:child_process` | only the two synchronous APIs move, and the async one is already non-blocking
+Ruled-out: converting the e2e file with tsc and eslint as the only evidence | a green typecheck is not evidence that an env-gated file still passes, and the environment it gates on is the operator's real one
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited 5deaf10de72733687b273c4d298eadb82165e1e5
+
+Limit: `argv`/options being forwarded is not equivalence | the wrapper changes exactly two things, and both were checked at every converted site rather than argued: a call with no `timeout` now has one, and an `ETIMEDOUT` becomes a throw instead of `result.error`. Across all thirteen converted files there are 4 reads of `.error` (one inside a generated script string, one asserting undefined on a path with no timeout, two in a site that already supplied `timeout: 30_000`), 20 reads of `.signal` and 0 of `.killed`, 0 `maxBuffer`, and `stdio`/`encoding`/`shell`/`cwd`/`env` are spread through untouched
+Warn: the one site whose behaviour really changes is `runExtractedBackup` in `the-database-backup-step-fails-closed.test.ts`, which surfaces `proc.error` as `spawnError` and is asserted undefined nine times — on a timeout those assertions used to fail, and now the helper throws first. The file has no `catch`, so the throw propagates: no path that failed before passes now, which is the property that had to hold
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited dcdbc5048e89f3ac026c15009cca1d0da9bda3c5
+
+Limit: the 55s default applies | none of these files declares a per-case timeout, so the global `testTimeout: 60_000` governs and the bound sits under it — the condition that made `the-database-backup-step-fails-closed.test.ts` need an explicit 10s does not hold here
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited 58092fd525d032835febaa8ac3ce84b29e5b6994
+
+Limit: the 55s default applies — neither file declares a per-case timeout, so the global `testTimeout: 60_000` governs | the condition that made `the-database-backup-step-fails-closed` need an explicit 10s does not hold here
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited a530dd998db3506237133f0b048f47fa7fc33223
