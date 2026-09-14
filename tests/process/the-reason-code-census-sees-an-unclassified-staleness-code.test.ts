@@ -1,8 +1,8 @@
 import { describe, expect, it, afterAll } from "vitest";
-import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -40,12 +40,12 @@ const scratchRepo = (catalogueSource: string): string => {
 
 const censusOn = (catalogueSource: string): { status: number | null; stdout: string; stderr: string } => {
   const repo = scratchRepo(catalogueSource);
-  const done = spawnSync("node", [SCRIPT], { cwd: repo, encoding: "utf8" });
+  const done = boundedSpawnSync("node", [SCRIPT], { cwd: repo, encoding: "utf8" });
   return { status: done.status, stdout: done.stdout, stderr: done.stderr };
 };
 
 const runRealEntrypoint = (): { status: number | null; stdout: string; stderr: string } => {
-  const done = spawnSync("node", [SCRIPT], { cwd: ROOT, encoding: "utf8" });
+  const done = boundedSpawnSync("node", [SCRIPT], { cwd: ROOT, encoding: "utf8" });
   return { status: done.status, stdout: done.stdout, stderr: done.stderr };
 };
 
