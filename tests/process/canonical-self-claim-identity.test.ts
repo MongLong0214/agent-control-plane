@@ -46,6 +46,13 @@ const resolvedImage = (pid: number): ExecutingImageEvidence | null => {
 };
 
 /** Synthetic — never a value that names a real deployment's version. */
+/**
+ * The cases below declare `20_000`, so the helper's 55s default could never be the bound that
+ * fires — vitest would time the case out first and report it against whatever the worker held.
+ * `readlink` returns a symlink target; 10s is already far past anything it can legitimately cost.
+ */
+const QUICK_CHILD_BUDGET_MS = 10_000;
+
 const TEST_REQUIRED_EXECUTOR_VERSION = "9.0.0-test";
 /**
  * The two versions the symlink/image-divergence test below exercises. Both carry a `-symlink-*`
@@ -476,7 +483,10 @@ describe("real executing-image resolution — symlink and image can diverge", ()
       // Contrast case, spelled out: a naive implementation reading "the symlink's current
       // target" instead of "the image this pid actually loaded" would report the decoy version
       // here — wrong, and exactly what `defaultExecutingImageInspector` above does not report.
-      const naiveSymlinkRead = boundedExecFileSync("readlink", [launchPath], { encoding: "utf8" }).trim();
+      const naiveSymlinkRead = boundedExecFileSync("readlink", [launchPath], {
+        encoding: "utf8",
+        timeout: QUICK_CHILD_BUDGET_MS,
+      }).trim();
       expect(naiveSymlinkRead).toContain(SYMLINK_TEST_VERSION_DECOY);
     },
     20_000,

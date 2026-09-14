@@ -14,10 +14,10 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { rm } from "node:fs/promises";
-import { execFileSync } from "node:child_process";
 
 import { describe, it, expect, afterEach } from "vitest";
 
+import { boundedExecFileSync } from "../helpers/bounded-sync-child.ts";
 import { ManualClock } from "../../src/core/clock.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { parseRepoFactoryResult } from "../../src/bootstrap/repo-factory-result.ts";
@@ -163,7 +163,7 @@ describe("repo factory producer (#246)", () => {
     // The ownership marker is deliberately never committed, so it would show as untracked
     // to a plain `git status` if it were not excluded via `.git/info/exclude` (CEO review
     // round 3, defect 2). This is the real, external command — not the producer's own judge.
-    const status = execFileSync("git", ["-C", checkoutPath, "status", "--porcelain"], { encoding: "utf8" });
+    const status = boundedExecFileSync("git", ["-C", checkoutPath, "status", "--porcelain"], { encoding: "utf8" });
     expect(status).toBe("");
     expect(existsSync(join(checkoutPath, ".repo-factory-operation.json"))).toBe(true);
   });

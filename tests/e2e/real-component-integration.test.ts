@@ -13,6 +13,7 @@ import { PROJECT_MANIFEST_SCHEMA_ID, type ProjectManifest } from "../../src/cont
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import { ExecutionMode, RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import { validateDocumentInput, applyDocumentInput, measureDocumentCapacity } from "../helpers/document-only-integration.ts";
+import { boundedExecFileSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import { bindWorkerForTask } from "../helpers/harness.ts";
 
@@ -187,14 +188,14 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
 
       // A real, pre-existing project. Cloned so the owner's working tree is untouched;
       // the code, history and verification command are the real ones.
-      execFileSync("git", ["clone", "--local", "--quiet", REAL_PROJECT, checkout]);
+      boundedExecFileSync("git", ["clone", "--local", "--quiet", REAL_PROJECT, checkout]);
       // A local clone points `origin` at the source directory. The repository's identity is
       // its real remote, and the registry now refuses a declared identity that contradicts
       // what the checkout says — so the clone is pointed at the same remote the source has.
-      const sourceRemote = execFileSync("git", ["-C", REAL_PROJECT, "remote", "get-url", "origin"], {
+      const sourceRemote = boundedExecFileSync("git", ["-C", REAL_PROJECT, "remote", "get-url", "origin"], {
         encoding: "utf8",
       }).trim();
-      execFileSync("git", ["-C", checkout, "remote", "set-url", "origin", sourceRemote]);
+      boundedExecFileSync("git", ["-C", checkout, "remote", "set-url", "origin", sourceRemote]);
       // Local-only exclude: the symlink is a convenience for this checkout and must never
       // enter a candidate. Committing a machine-specific absolute symlink is exactly the
       // scope violation an independent reviewer should refuse.
@@ -310,17 +311,17 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
       let secondRepositoryId: string | null = null;
       if (TWO_REPOSITORIES) {
         const secondCheckout = join(root, "project-2");
-        execFileSync("git", ["clone", "--local", "--quiet", resolve(SECOND_PROJECT!), secondCheckout]);
+        boundedExecFileSync("git", ["clone", "--local", "--quiet", resolve(SECOND_PROJECT!), secondCheckout]);
         // Same reason as the primary above, and it was missed here when the second repository was
         // added: a `--local` clone points `origin` at the source *directory*, so the checkout says
         // its remote is a filesystem path while the declared identity says `github:owner/repo`.
         // The registry compares the two and refuses. Point the clone at the remote its source has.
-        const secondRemote = execFileSync(
+        const secondRemote = boundedExecFileSync(
           "git",
           ["-C", resolve(SECOND_PROJECT!), "remote", "get-url", "origin"],
           { encoding: "utf8" },
         ).trim();
-        execFileSync("git", ["-C", secondCheckout, "remote", "set-url", "origin", secondRemote]);
+        boundedExecFileSync("git", ["-C", secondCheckout, "remote", "set-url", "origin", secondRemote]);
         const second = await cp.repositories.register({
           checkoutPath: secondCheckout,
           projectId,

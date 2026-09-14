@@ -1,4 +1,3 @@
-import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -15,6 +14,7 @@ import { join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
+import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -206,7 +206,7 @@ const runItem6 = (
   fixture: Fixture,
   values: { pairId: string; indexDigest: string },
 ): { status: number | null; stdout: string; trace: string } => {
-  const result = spawnSync("bash", ["-x", "-c", extractItem6Script()], {
+  const result = boundedSpawnSync("bash", ["-x", "-c", extractItem6Script()], {
     encoding: "utf8",
     env: {
       ...process.env,
@@ -307,6 +307,6 @@ describe("item 6 is the sealed-pair rollback and touches nothing when it refuses
     writeFileSync(script, `${extractItem6Script()}\n`, { mode: 0o700 });
     // `bash -n` parses without running. Without this, a block that stopped parsing would exit
     // non-zero for the wrong reason and every refusal row above would pass on a broken document.
-    execFileSync("bash", ["-n", script]);
+    boundedExecFileSync("bash", ["-n", script]);
   });
 });
