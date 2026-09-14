@@ -32,7 +32,174 @@ import { cleanupTempDirs, commitAll, makeRepo, tempDir } from "../helpers/fixtur
 import { bindWorkerForTask, fixtureManifest, reviewerPass } from "../helpers/harness.ts";
 import { testReviewerEgressEvidence } from "../helpers/production-adapter.ts";
 
+import { afterEach } from "vitest";
+import { ApprovedRunFinalizer } from "../../src/daemon/finalizer.ts";
+import { makeHarness } from "../helpers/harness.ts";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import ts from "typescript";
+import type { ProviderCapacity } from "../../src/capacity/capacity-monitor.ts";
+
 afterAll(cleanupTempDirs);
+
+// The B document driver regression suite stays in the same rollback test unit.
+describe("approved document restoration", () => {
+const driver = () => readFileSync(new URL("../e2e/real-component-integration.test.ts", import.meta.url), "utf8");
+const roots: string[] = [];
+afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+const git = (root: string, ...args: string[]) => execFileSync("git", ["-C", root, ...args], { encoding: "utf8", timeout: 10_000 }).trim();
+function fixture() {
+  const root = mkdtempSync(join(tmpdir(), "docs-only-component-"));
+  roots.push(root);
+  git(root, "init", "-q");
+  git(root, "config", "user.name", "Component Test");
+  git(root, "config", "user.email", "component@example.invalid");
+  git(root, "remote", "add", "origin", "https://github.com/MongLong0214/agent-control-plane.git");
+  mkdirSync(join(root, "docs"));
+  writeFileSync(join(root, "docs", "dogfood.md"), "Before\n");
+  git(root, "add", "docs/dogfood.md");
+  git(root, "commit", "-qm", "docs: initial");
+  const baseHead = git(root, "rev-parse", "HEAD");
+  writeFileSync(join(root, "docs", "dogfood.md"), "After\n");
+  const patch = execFileSync("git", ["-C", root, "diff", "--", "docs/dogfood.md"], { encoding: "utf8", timeout: 10_000 });
+  writeFileSync(join(root, "docs", "dogfood.md"), "Before\n");
+  return { root, input: { evidenceKind: "disposable-component", repositoryIdentity: "github:MongLong0214/agent-control-plane", baseHead, patch,
+    contract: { goal: "Update the approved dogfood document", why: "Exercise the document-only terminal path", scope: ["docs/dogfood.md"], nonGoals: ["source changes"], acceptance: ["Only the approved document diff changes"], priority: "NORMAL", humanGate: [], references: ["#512"] } } };
+}
+
+describe("document-only component input", () => {
+  it("executes the existing single-repository finalization caller exactly once", async () => {
+    const source = driver();
+    // Execute the actual caller and Daemon lock guard. Only downstream merge effects
+    // are stubbed; this is disposable admission evidence, not live merge evidence.
+    const start = source.lastIndexOf("      if (secondRepositoryId) {");
+    const end = source.indexOf('      evidence["doctor"]', start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const body = ts.transpile(source.slice(start, end), { target: ts.ScriptTarget.ES2022 });
+    const h = makeHarness();
+    const instances: Daemon[] = [];
+    class ComponentDaemon extends Daemon {
+      constructor(...args: ConstructorParameters<typeof Daemon>) { super(...args); instances.push(this); }
+    }
+    const merge = vi.spyOn(ApprovedRunFinalizer.prototype, "finalizeApprovedRun").mockResolvedValue(
+      allow(ReasonCode.OK, {} as never),
+    );
+    const stop = vi.spyOn(Daemon.prototype, "stop");
+    vi.spyOn(h.cp.runs, "repositoriesOf").mockReturnValue([
+      { identity: "component-only", mergeOrder: 0, mergeState: "MERGED" } as never,
+    ]);
+    const evidence: Record<string, unknown> = {};
+    const execute = new Function("cp", "Daemon", "tempDir", "expect", "evidence", "runId", "secondRepositoryId", "SECOND_IDENTITY", `return (async () => {${body}})()`);
+    const invoke = () => execute(h.cp, ComponentDaemon, tempDir, expect, evidence, "component-run", null, null);
+    try {
+      await invoke();
+      expect(merge).toHaveBeenCalledExactlyOnceWith("component-run");
+      expect(stop).toHaveBeenCalledTimes(1);
+      expect(instances[0]!.lock.held()).toBe(false);
+      expect(evidence["mergeSequence"]).toEqual([{ identity: "component-only", mergeOrder: 0, mergeState: "MERGED" }]);
+      expect(await instances[0]!.finalizeApprovedRun("component-run")).toMatchObject({ allowed: false, reasonCode: ReasonCode.DAEMON_LOCK_LOST });
+      expect(merge).toHaveBeenCalledTimes(1);
+      merge.mockRejectedValueOnce(new Error("component-finalizer-failure"));
+      await expect(invoke()).rejects.toThrow("component-finalizer-failure");
+      expect(stop).toHaveBeenCalledTimes(2);
+      expect(instances[1]!.lock.held()).toBe(false);
+    } finally {
+      for (const daemon of instances) await daemon.stop();
+      vi.restoreAllMocks();
+      h.cp.db.close();
+      cleanupTempDirs();
+    }
+  });
+  it("supplies the explicit GitHub App file at the actual constructor boundary", () => {
+    const source = driver();
+    const start = source.indexOf("      const cp = new ControlPlane({");
+    const end = source.indexOf("      // Existing collectors", start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const body = ts.transpile(source.slice(start, end), { target: ts.ScriptTarget.ES2022 });
+    const construct = new Function("ControlPlane", "join", "root", "systemClock", "ACCEPTANCE_REVIEWER_EGRESS", "ownerIdentities", "REVIEWER_MODEL", "process", `${body}; return cp;`);
+    class CaptureConfig { constructor(readonly config: Record<string, unknown>) {} }
+    const invoke = (env: Record<string, string>) => construct(CaptureConfig, join, "/disposable", {}, () => ({}), [], "test-model", { env }).config;
+    expect(invoke({ ACP_GITHUB_APP_ENV_FILE: "/trusted/app.env" }).githubAppEnvFile).toBe("/trusted/app.env");
+    expect(invoke({}).githubAppEnvFile).toBeUndefined();
+  });
+  it("keeps reviewer credential scope out of the shared Claude override", () => {
+    const source = driver();
+    const start = source.indexOf("      const cp = new ControlPlane({");
+    const end = source.indexOf("      // Existing collectors", start);
+    const body = ts.transpile(source.slice(start, end), { target: ts.ScriptTarget.ES2022 });
+    const construct = new Function("ControlPlane", "join", "root", "systemClock", "ACCEPTANCE_REVIEWER_EGRESS", "ownerIdentities", "REVIEWER_MODEL", "process", `${body}; return cp;`);
+    class CaptureConfig { constructor(readonly config: { adapterOptions: Record<string, { providerCredentialDir?: string; reviewerEgress: { profilePath: string } }> }) {} }
+    const config = construct(CaptureConfig, join, "/disposable", {}, () => ({ profilePath: "/confined/reviewer.sb" }), [], "test-model", { env: { HOME: "/operator" } }).config;
+    expect(config.adapterOptions.claude).not.toHaveProperty("providerCredentialDir");
+    expect(config.adapterOptions.claude.reviewerEgress.profilePath).toBe("/confined/reviewer.sb");
+    expect(config.adapterOptions.gpt.providerCredentialDir).toBe("/operator/.acp-reviewer/codex");
+  });
+  it("unknown measured capacity fails closed; a measured reading is not rewritten", async () => {
+    const { assertMeasuredCapacity } = await import("../helpers/document-only-integration.ts");
+    const readings: ProviderCapacity[] = ["claude", "gpt"].map((provider) => ({
+      provider, sensorHealth: "HEALTHY", runtimeHealth: "HEALTHY", observedAt: new Date().toISOString(),
+      source: "component-test-only", allocationAdmission: "OPEN", advisoryState: "HEALTHY", ageMs: 0,
+      unknownBuckets: [], buckets: [{ id: "measured", remainingPercent: 38, resetAt: null, capabilities: ["cto", "blind-review"] }],
+    }));
+    expect(assertMeasuredCapacity(readings)).toBe(readings);
+    expect(() => assertMeasuredCapacity([])).toThrow("CAPACITY_UNKNOWN_NOT_ROUTABLE");
+    for (const bad of [
+      { sensorHealth: "ERROR" }, { runtimeHealth: "UNKNOWN" }, { allocationAdmission: "SUSPENDED" },
+      { buckets: [] }, { buckets: [{ ...readings[0]!.buckets[0], remainingPercent: null }] },
+      { operatorObservation: { actor: "not-a-measurement" } },
+    ]) expect(() => assertMeasuredCapacity([{ ...readings[0], ...bad }, readings[1]] as ProviderCapacity[])).toThrow("CAPACITY_UNKNOWN_NOT_ROUTABLE");
+  });
+  it("the existing caller consumes the document input before constructing provider state", () => {
+    const source = driver();
+    expect(source).toContain('ACP_COMPONENT_INTEGRATION_DOCUMENT_INPUT');
+    expect(source.indexOf('validateDocumentInput(REAL_PROJECT')).toBeLessThan(source.indexOf('new ControlPlane('));
+    expect(source).toContain('applyDocumentInput(checkout, documentInput)');
+    expect(source).not.toContain('export const reasonCodeCount');
+    expect(source).not.toContain('cp.capacity.observe(');
+    expect(source).toContain('await measureDocumentCapacity(cp.capacity, cp.providers)');
+    expect(source.match(/cp\.tasks\.startExecution\(/g)).toHaveLength(2);
+    expect(source.match(/bindWorkerForTask\(/g)).toHaveLength(2);
+    expect(source).not.toContain('startWorkerExecution(');
+    expect(source).not.toContain('remainingPercent: 75');
+  });
+  it.each(["identity", "remote", "head", "scope", "source", "canonical", "dirty", "symlink"])("refuses %s contamination before applying anything", async (kind) => {
+    const { validateDocumentInput } = await import("../helpers/document-only-integration.ts");
+    const { root, input } = fixture();
+    if (kind === "identity") input.repositoryIdentity = "github:other/project";
+    if (kind === "remote") git(root, "remote", "set-url", "origin", "https://github.com/other/project.git");
+    if (kind === "head") input.baseHead = "0".repeat(40);
+    if (kind === "scope") input.contract.scope = ["docs/other.md"];
+    if (kind === "source") { input.contract.scope = ["src/core/reason-codes.ts"]; }
+    if (kind === "canonical") input.evidenceKind = "canonical-live";
+    if (kind === "dirty") writeFileSync(join(root, "unapproved.txt"), "extra");
+    if (kind === "symlink") {
+      git(root, "config", "core.symlinks", "true");
+      rmSync(join(root, "docs/dogfood.md"));
+      const { symlinkSync } = await import("node:fs");
+      symlinkSync("../outside.md", join(root, "docs/dogfood.md"));
+      git(root, "add", "docs/dogfood.md");
+      git(root, "commit", "-qm", "docs: link");
+      input.baseHead = git(root, "rev-parse", "HEAD");
+    }
+    const before = git(root, "status", "--porcelain");
+    expect(() => validateDocumentInput(root, input)).toThrow();
+    expect(git(root, "status", "--porcelain")).toBe(before);
+  });
+  it("consumes the exact approved contract and applies only its document diff", async () => {
+    const { validateDocumentInput, applyDocumentInput } = await import("../helpers/document-only-integration.ts");
+    const { root, input } = fixture();
+    const approved = validateDocumentInput(root, input);
+    expect(approved.contract).toEqual(input.contract);
+    expect(git(root, "status", "--porcelain")).toBe("");
+    applyDocumentInput(root, approved);
+    expect(readFileSync(join(root, "docs/dogfood.md"), "utf8")).toBe("After\n");
+    expect(git(root, "diff", "--cached", "--name-only")).toBe("docs/dogfood.md");
+  });
+});
+});
 
 class ProductionTestAdapter implements ProviderAdapter {
   readonly #scripted: ScriptedAdapter;
@@ -107,6 +274,168 @@ const makePlane = () => {
   });
   return { cp, clock, gpt, claude, root };
 };
+
+describe("exact-role mandatory coverage", () => {
+  it("enumerates every active critical actor and RUNNING worker without borrowing another role's quota", async () => {
+    const plane = makePlane();
+    const { cp, clock, gpt, claude } = plane;
+    try {
+      bindCeo(plane);
+      const projectId = "scoped-roster";
+      const manifest = fixtureManifest(projectId);
+      const registered = cp.projects.register({ projectId, name: projectId, manifest,
+        authorization: cp.manifestAuthorizationForTests(manifest) });
+      if (!registered.allowed) throw new Error(registered.message);
+      const run = cp.runs.create({ projectId, executionMode: ExecutionMode.SIMPLE,
+        contract: { goal: "roster", why: "coverage", scope: [], nonGoals: [], acceptance: ["done"],
+          priority: "NORMAL", humanGate: [], references: [] } });
+      if (!run.allowed) throw new Error(run.message);
+      gpt.setCapacity(healthy("gpt", clock));
+      claude.setCapacity(healthy("claude", clock));
+      const dispatched = await cp.runs.dispatch(run.value.runId);
+      if (!dispatched.allowed) throw new Error(dispatched.message);
+      const expected = ["CEO", roleKeyFor(Role.PRIMARY_CTO, { projectId })];
+      for (const role of [Role.BOOTSTRAP_CTO, Role.BLIND_REVIEWER]) {
+        const session = cp.sessions.create({ provider: "claude", model: "test" });
+        cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "test");
+        const bound = cp.bindings.bind({ role, projectId, runId: run.value.runId,
+          sessionId: session.sessionId });
+        if (!bound.allowed) throw new Error(bound.message);
+        expected.push(bound.value.roleKey);
+      }
+      const submitted = cp.tasks.submit(run.value.runId, ["one", "two", "idle"].map((key) => ({ key, title: key, category: "mechanical" })));
+      if (!submitted.allowed) throw new Error(submitted.message);
+      const tasks = cp.tasks.ready(run.value.runId);
+      expect(tasks).toHaveLength(3);
+      const fanout = vi.spyOn(cp.capacity, "refreshForWorkerFanout");
+      for (const task of tasks) {
+        const workerSessionId = bindWorkerForTask(cp, task.taskId);
+        if (task.title === "idle") continue;
+        const execution = cp.tasks.startExecution({ runId: run.value.runId, taskId: task.taskId, workerSessionId,
+          ownerBindingGeneration: 1, provider: "gpt", model: "worker" });
+        if (!execution.allowed) throw new Error(execution.message);
+        expected.push(roleKeyFor(Role.WORKER, { taskId: task.taskId }));
+      }
+      const worker = new ProductionTestAdapter(clock, "claude");
+      worker.setCapacity({ ...healthy("claude", clock), runtimeHealth: "UNKNOWN", buckets: [] });
+      claude.setCapacity(healthy("claude", clock));
+      gpt.setCapacity({ ...healthy("gpt", clock), runtimeHealth: "UNAVAILABLE" });
+      for (const role of Object.values(Role)) cp.providers.registerForRole(role === Role.WORKER ? worker : claude, role);
+      const plan = await cp.continuity.evaluate("complete live roster");
+      expect(plan.requiredRoles.map((role) => role.roleKey).sort()).toEqual(expected.sort());
+      expect(plan.requiredRoles.filter((role) => role.role === Role.WORKER)).toHaveLength(2);
+      expect(plan.uncovered.sort()).toEqual(expected.filter((key) => key.startsWith("WORKER:")).sort());
+      expect(plan.outcome).toBe("PARTIAL_COVERAGE");
+      expect(fanout).not.toHaveBeenCalled();
+      worker.setCapacity(healthy("claude", clock));
+      expect((await cp.continuity.evaluate("worker measured independently")).outcome).toBe("FULL_COVERAGE");
+    } finally { vi.restoreAllMocks(); cp.db.close(); }
+  });
+  it("measures the restored document driver against exact critical role bindings", async () => {
+    const { measureDocumentCapacity } = await import("../helpers/document-only-integration.ts");
+    const { cp, clock, gpt, claude } = makePlane();
+    try {
+      gpt.setCapacity(healthy("gpt", clock));
+      const producer = new ProductionTestAdapter(clock, "claude");
+      producer.setCapacity(healthy("claude", clock));
+      claude.setCapacity(healthy("claude", clock));
+      for (const role of [Role.CEO, Role.BOOTSTRAP_CTO, Role.PRIMARY_CTO, Role.WORKER]) {
+        cp.providers.registerForRole(producer, role);
+      }
+      cp.providers.registerForRole(claude, Role.BLIND_REVIEWER);
+      const measured = await measureDocumentCapacity(cp.capacity, cp.providers);
+      expect(measured).toHaveLength(6);
+      expect(measured.filter((entry) => entry.provider === "claude").map((entry) => "binding" in entry ? entry.binding.role : null))
+        .toEqual([Role.CEO, Role.BOOTSTRAP_CTO, Role.PRIMARY_CTO, Role.WORKER, Role.BLIND_REVIEWER]);
+      expect(cp.capacity.current("claude")?.runtimeHealth).toBe("UNKNOWN");
+      claude.setCapacity({ ...healthy("claude", clock), sensorHealth: "ERROR", buckets: [] });
+      await expect(measureDocumentCapacity(cp.capacity, cp.providers)).rejects.toThrow("CAPACITY_UNKNOWN_NOT_ROUTABLE");
+      expect(cp.capacity.currentForRole("claude", Role.PRIMARY_CTO)?.allocationAdmission).toBe("OPEN");
+    } finally { cp.db.close(); }
+  });
+  it("composes the original six Claude roles without sharing reviewer identity", async () => {
+    const root = tempDir("acp-role-composition-");
+    const clock = new ManualClock("2026-08-12T00:00:00.000Z");
+    const cp = new ControlPlane({ databasePath: join(root, "state.sqlite"), worktreeRoot: join(root, "worktrees"),
+      capacityDir: join(root, "capacity"), secretsDir: join(root, "secrets"), clock });
+    try {
+      const producerRoles = [Role.CEO, Role.BOOTSTRAP_CTO, Role.PRIMARY_CTO, Role.WORKER];
+      const reviewerRoles = [Role.BLIND_REVIEWER, Role.OPTIONAL_ADVERSARIAL_REVIEWER];
+      for (const role of [...producerRoles, ...reviewerRoles]) {
+        expect(cp.providers.capacityBindingForRole("claude", role)?.role).toBe(role);
+      }
+      const producer = cp.providers.capacityBindingForRole("claude", Role.CEO)!.adapter;
+      const reviewer = cp.providers.capacityBindingForRole("claude", Role.BLIND_REVIEWER)!.adapter;
+      expect(producer).not.toBe(reviewer);
+      for (const role of producerRoles) expect(cp.providers.capacityBindingForRole("claude", role)!.adapter).toBe(producer);
+      for (const role of reviewerRoles) expect(cp.providers.capacityBindingForRole("claude", role)!.adapter).toBe(reviewer);
+      vi.spyOn(producer, "probeCapacity").mockResolvedValue(healthy("claude", clock));
+      vi.spyOn(reviewer, "probeCapacity").mockResolvedValue(healthy("claude", clock));
+      vi.spyOn(cp.capacity, "refresh").mockResolvedValue([]); // no external collectors in this unit
+      const plan = await cp.continuity.evaluate("default scoped composition");
+      expect(plan.requiredRoles.map((role) => role.roleKey)).toEqual(["CEO"]);
+      expect(plan.outcome).toBe("FULL_COVERAGE");
+      expect(plan.assignments[0]?.provider).toBe("claude");
+      expect(cp.capacity.current("claude")?.runtimeHealth).toBe("UNKNOWN");
+    } finally { vi.restoreAllMocks(); cp.db.close(); }
+  });
+  it("covers a bound role-only provider absent from the shared production inventory", async () => {
+    const { cp, clock, gpt, claude } = makePlane();
+    try {
+      gpt.setCapacity({ ...healthy("gpt", clock), runtimeHealth: "UNAVAILABLE" });
+      claude.setCapacity({ ...healthy("claude", clock), runtimeHealth: "UNAVAILABLE" });
+      const scoped = new ProductionTestAdapter(clock, "scoped-provider");
+      scoped.setCapacity(healthy("scoped-provider", clock));
+      cp.providers.registerForRole(scoped, Role.CEO);
+      const session = cp.sessions.create({ provider: scoped.provider, model: "ceo" });
+      cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "test");
+      expect(cp.bindings.bind({ role: Role.CEO, sessionId: session.sessionId }).allowed).toBe(true);
+      expect(cp.providers.production().map((adapter) => adapter.provider)).not.toContain(scoped.provider);
+      const plan = await cp.continuity.evaluate("bound scoped-only provider");
+      expect(plan.outcome).toBe("FULL_COVERAGE");
+      expect(plan.assignments[0]?.provider).toBe(scoped.provider);
+    } finally { cp.db.close(); }
+  });
+  it("includes active bootstrap bindings even before their run is dispatched", async () => {
+    const { cp, clock, gpt, claude } = makePlane();
+    try {
+      gpt.setCapacity(healthy("gpt", clock));
+      claude.setCapacity(healthy("claude", clock));
+      const run = cp.runs.create({ executionMode: ExecutionMode.SIMPLE,
+        contract: { goal: "bootstrap", why: "coverage", scope: [], nonGoals: [], acceptance: ["done"],
+          priority: "NORMAL", humanGate: [], references: [] } });
+      if (!run.allowed) throw new Error(run.message);
+      const session = cp.sessions.create({ provider: "claude", model: "cto" });
+      cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "test");
+      const binding = cp.bindings.bind({ role: Role.BOOTSTRAP_CTO, runId: run.value.runId, sessionId: session.sessionId });
+      if (!binding.allowed) throw new Error(binding.message);
+      const plan = await cp.continuity.evaluate("active bootstrap");
+      expect(plan.requiredRoles.map((role) => role.roleKey).sort()).toEqual([binding.value.roleKey, "CEO"].sort());
+      expect(plan.requiredRoles.find((role) => role.role === Role.BOOTSTRAP_CTO)?.inFlight).toBe(true);
+    } finally { cp.db.close(); }
+  });
+  it("evaluates the exact role binding without promoting provider-global UNKNOWN", async () => {
+    const { cp, clock, gpt, claude } = makePlane();
+    try {
+      gpt.setCapacity(healthy("gpt", clock));
+      claude.setCapacity({ ...healthy("claude", clock), runtimeHealth: "UNAVAILABLE" });
+      cp.providers.registerForRole(gpt, Role.CEO);
+      cp.providers.registerForRole(claude, Role.CEO);
+      const plan = await cp.continuity.evaluate("scoped CEO coverage");
+      expect(plan.requiredRoles.map((role) => role.roleKey)).toEqual(["CEO"]);
+      expect(plan.outcome).toBe("FULL_COVERAGE");
+      expect(plan.assignments).toEqual([{ roleKey: "CEO", provider: "gpt", reason: "preferred" }]);
+      expect(plan.mode).toBe(ContinuityMode.DEGRADED);
+      expect(cp.capacity.current("gpt")?.runtimeHealth).toBe("UNKNOWN");
+      expect(cp.capacity.currentForRole("gpt", Role.CEO)?.binding.generation).toBe(
+        cp.providers.capacityBindingForRole("gpt", Role.CEO)?.generation,
+      );
+      cp.providers.invalidateCapacityForRole("gpt", Role.CEO);
+      expect(cp.continuity.computeCoveragePlan().outcome).toBe("NO_VALID_COVERAGE");
+      expect((await cp.continuity.evaluate("fresh generation")).outcome).toBe("FULL_COVERAGE");
+    } finally { cp.db.close(); }
+  });
+});
 
 const attachRoutablePorts = (cp: ControlPlane) => {
   cp.continuity.attach({

@@ -205,6 +205,21 @@ export const controlPlaneStateDenyReadPaths = (
  * the cycles are closed here with narrow `attach` ports rather than by merging the
  * services into one object with unclear authority.
  */
+/**
+ * An adapter and, when it has one, the roles it serves. No `roles` means one identity for every
+ * caller, which is what a provider with no role-specific credential scope has.
+ */
+interface RegisteredAdapter {
+  adapter: ProviderAdapter;
+  roles?: readonly Role[];
+}
+
+/** Roles that act as the deployment itself, under the ambient OAuth subscription identity. */
+const CTO_ROLES: readonly Role[] = [Role.CEO, Role.BOOTSTRAP_CTO, Role.PRIMARY_CTO, Role.WORKER];
+
+/** Roles that must not read the producer's transcript store, and carry their own scope. */
+const REVIEWER_ROLES: readonly Role[] = [Role.BLIND_REVIEWER, Role.OPTIONAL_ADVERSARIAL_REVIEWER];
+
 export class ControlPlane {
   readonly db: Db;
   readonly clock: Clock;
@@ -429,12 +444,19 @@ export class ControlPlane {
       this.claims = new ClaimRegistry(this.db, this.clock, this.audit, this.bindings);
 
       this.providers = new ProviderRegistry();
-      for (const adapter of config.adapters ?? this.defaultAdapters()) {
-        if (adapter.isProduction) this.providers.register(adapter);
-        else if (config.allowNonProductionAdapters) this.providers.registerTestAdapter(adapter);
-        else {
-          throw new Error(`adapter '${adapter.provider}' fabricates responses; it is test-only`);
+      const registrations: RegisteredAdapter[] = config.adapters
+        ? config.adapters.map((adapter) => ({ adapter }))
+        : this.defaultAdapters();
+      for (const { adapter, roles } of registrations) {
+        if (!adapter.isProduction) {
+          if (!config.allowNonProductionAdapters) {
+            throw new Error(`adapter '${adapter.provider}' fabricates responses; it is test-only`);
+          }
+          this.providers.registerTestAdapter(adapter);
+          continue;
         }
+        if (roles) for (const role of roles) this.providers.registerForRole(adapter, role);
+        else this.providers.register(adapter);
       }
 
       this.worktrees = new WorktreeManager(config.worktreeRoot);
@@ -661,7 +683,7 @@ export class ControlPlane {
     }
   }
 
-  private defaultAdapters(): ProviderAdapter[] {
+  private defaultAdapters(): RegisteredAdapter[] {
     const credentialDenyPaths = this.credentials.sensitivePaths();
     const managedWriteBroker = new GuardedInvocationWriteBroker(this.guard);
     // Spread after the defaults so an override wins for the keys it names and only those. The
@@ -675,18 +697,49 @@ export class ControlPlane {
     // spread, so a configured override still wins, and left `undefined` when the variable is
     // unset — which the adapter already reads as "search PATH", the behaviour without a pin.
     return [
-      new ClaudeCliAdapter({
-        clock: this.clock,
-        capacityFile: join(this.config.capacityDir, "claude.json"),
-        environmentAllowlist: [],
-        denyReadPaths: [this.config.databasePath, this.config.secretsDir, this.config.capacityDir, ...credentialDenyPaths],
-        managedWriteBroker,
-        providerCredentialDir: process.env["ACP_CLAUDE_REVIEWER_CONFIG_DIR"],
-        reviewerEgress: this.config.reviewerEgress,
-        binary: process.env["ACP_CLAUDE_BINARY"],
-              ...overrides.claude,
-      }),
-      new CodexCliAdapter({
+      // Claude is built twice, and the difference is the credential scope (#512).
+      //
+      // `ACP_CLAUDE_REVIEWER_CONFIG_DIR` is the blind reviewer's, and it exists so a review runs
+      // under an identity that cannot read `~/.claude` — the producer's transcript store. One
+      // instance carrying it served every role, so the probe asking whether the *CTO* session was
+      // alive authenticated as the reviewer: measured, the CLI exits 1 with `duration_api_ms: 0`,
+      // no API call at all, and the dispatch reading that refused with `SESSION_NOT_READY` —
+      // naming the session for a failure about identity.
+      //
+      // The CTO instance carries **no** `providerCredentialDir`. That is not a fallback and not an
+      // absent setting: this deployment authenticates providers through OAuth subscription
+      // accounts, never an API key, and that identity lives in the keychain `HOME` reaches. Naming
+      // a directory here would be choosing some other identity for the CTO, which is the fault
+      // being removed. An override may still name one, for a deployment that has a CTO-scoped
+      // directory; the default is the ambient OAuth identity because that is the only one there is.
+      {
+        adapter: new ClaudeCliAdapter({
+          clock: this.clock,
+          capacityFile: join(this.config.capacityDir, "claude.json"),
+          environmentAllowlist: [],
+          denyReadPaths: [this.config.databasePath, this.config.secretsDir, this.config.capacityDir, ...credentialDenyPaths],
+          managedWriteBroker,
+          reviewerEgress: this.config.reviewerEgress,
+          binary: process.env["ACP_CLAUDE_BINARY"],
+                ...overrides.claude,
+        }),
+        roles: CTO_ROLES,
+      },
+      {
+        adapter: new ClaudeCliAdapter({
+          clock: this.clock,
+          capacityFile: join(this.config.capacityDir, "claude.json"),
+          environmentAllowlist: [],
+          denyReadPaths: [this.config.databasePath, this.config.secretsDir, this.config.capacityDir, ...credentialDenyPaths],
+          managedWriteBroker,
+          providerCredentialDir: process.env["ACP_CLAUDE_REVIEWER_CONFIG_DIR"],
+          reviewerEgress: this.config.reviewerEgress,
+          binary: process.env["ACP_CLAUDE_BINARY"],
+                ...overrides.claude,
+        }),
+        roles: REVIEWER_ROLES,
+      },
+      { adapter: new CodexCliAdapter({
         clock: this.clock,
         capacityFile: join(this.config.capacityDir, "gpt.json"),
         environmentAllowlist: [],
@@ -699,8 +752,8 @@ export class ControlPlane {
         reviewerEgress: this.config.reviewerEgress,
         binary: process.env["ACP_CODEX_BINARY"],
               ...overrides.gpt,
-      }),
-      new GrokCliAdapter({
+      }) },
+      { adapter: new GrokCliAdapter({
         clock: this.clock,
         capacityFile: join(this.config.capacityDir, "grok.json"),
         environmentAllowlist: [],
@@ -708,7 +761,7 @@ export class ControlPlane {
         providerCredentialDir: process.env["ACP_GROK_CREDENTIAL_DIR"],
         binary: process.env["ACP_GROK_BINARY"],
               ...overrides.grok,
-      }),
+      }) },
     ];
   }
 
