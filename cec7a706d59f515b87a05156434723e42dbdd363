@@ -1,0 +1,29 @@
+Limit: the 55s default applies — neither file declares a per-case timeout | `git init` and a `command -v` are fast, so the bound is far above their cost and remains a wedge threshold
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited a288fb165759a670a07582087a5c85c1d45777e4
+
+Limit: the 55s default applies — neither file declares a per-case timeout, so the global 60s governs | both children are a census over the repository's own source, which is seconds
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited 1839b9177272fb5ad1795739c78428f83cdc2102
+
+Limit: the bound on the racing migrator is the caller's 60s, not the helper's 55s | it is the only converted site whose child is expected to be slow, and the case's own deadline is above it
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited fcc5253ac7de83000b5c3bb0d8f0159b63e701d7
+
+Limit: the 55s default applies — none of the four declares a per-case timeout | each child is a scan of `src/` or `scripts/`, seconds at most, so the bound stays a wedge threshold
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited fb31126905aa868fe8cce89ddfc146af4e5d6b4e
+
+Limit: `spawnSync` still blocks the worker while a whole scenario runs in the child | the bound makes "forever" into a named failure; it does not make these cheap, and each remains seconds of a worker's wall clock
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited ba7f108ebc220b2e138f97bb8d4baab273f543c4
