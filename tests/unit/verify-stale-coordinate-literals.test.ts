@@ -1,10 +1,11 @@
-import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { afterEach, expect, it } from "vitest";
+
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
 const script = join(repositoryRoot, "scripts", "verify-stale-coordinate-literals.mjs");
@@ -27,7 +28,7 @@ const write = (root: string, path: string, text: string): void => {
 };
 
 const run = (root: string) =>
-  spawnSync(process.execPath, [script, `--root=${root}`, "--json"], {
+  boundedSpawnSync(process.execPath, [script, `--root=${root}`, "--json"], {
     cwd: repositoryRoot,
     encoding: "utf8",
   });
