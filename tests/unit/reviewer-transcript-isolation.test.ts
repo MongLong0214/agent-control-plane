@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import { createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -8,6 +7,7 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { __testing } from "../../src/runtime/cli-adapters.ts";
 import { disposableWorkspaceLocation } from "../../src/core/disposable-workspace-root.ts";
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -66,7 +66,7 @@ const buildProfile = (home: string, packetRoot: string): string => {
 
 /** Reads the target inside the sandbox. Exit 0 means the read succeeded. */
 const readUnderSandbox = (profile: string, target: string, home: string) =>
-  spawnSync(
+  boundedSpawnSync(
     "/usr/bin/sandbox-exec",
     [
       "-p",
@@ -88,7 +88,7 @@ describe("a reviewer cannot read producer transcripts (CP-HI-04, #360)", () => {
   it("is a real test: the same read succeeds without the sandbox", () => {
     // Without this, a profile that denied everything — or a target that never existed —
     // would make the refusal below meaningless.
-    const plain = spawnSync(
+    const plain = boundedSpawnSync(
       process.execPath,
       ["-e", `require("node:fs").readFileSync(${JSON.stringify(transcript)}, "utf8")`],
       { encoding: "utf8" },
@@ -135,7 +135,7 @@ describe("the rest of the withheld list is enforced, not just declared (#360)", 
   it("refuses to execute a shell under the no-tools profile", () => {
     // `tools: "none"` is `(deny process-exec*)` plus an allowlist of the provider binary and
     // node. A reviewer that can spawn /bin/sh is an ordinary local agent wearing the label.
-    const result = spawnSync(
+    const result = boundedSpawnSync(
       "/usr/bin/sandbox-exec",
       [
         "-p",
@@ -162,7 +162,7 @@ describe("the rest of the withheld list is enforced, not just declared (#360)", 
     });
     try {
       const profile = buildProfileWithEgress(home, packetRoot, port + 1);
-      const result = spawnSync(
+      const result = boundedSpawnSync(
         "/usr/bin/sandbox-exec",
         [
           "-p",
@@ -198,7 +198,7 @@ describe("the reviewer may write to the per-user temp directory and nowhere new 
   const packetRoot = tempDir("reviewer-packet-3");
 
   const writeUnderSandbox = (target: string) =>
-    spawnSync(
+    boundedSpawnSync(
       "/usr/bin/sandbox-exec",
       [
         "-p",

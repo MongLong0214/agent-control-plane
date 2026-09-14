@@ -1,10 +1,10 @@
 import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { acpScratchDir } from "../../src/core/scratch-root.ts";
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 
 /**
  * `scripts/verify-peercred-is-unreachable.mjs` enforces #539's central acceptance: nothing in
@@ -38,14 +38,14 @@ const scratchTree = (): string => {
   return dir;
 };
 
-const runGate = (dir: string) => spawnSync(process.execPath, [join(dir, "scripts", "verify-peercred-is-unreachable.mjs")], {
+const runGate = (dir: string) => boundedSpawnSync(process.execPath, [join(dir, "scripts", "verify-peercred-is-unreachable.mjs")], {
   cwd: dir,
   encoding: "utf8",
 });
 
 describe("the peercred primitive stays unreachable from every live surface (#539)", () => {
   it("passes against the tree as committed", () => {
-    const result = spawnSync(process.execPath, [script], { cwd: repoRoot, encoding: "utf8" });
+    const result = boundedSpawnSync(process.execPath, [script], { cwd: repoRoot, encoding: "utf8" });
     expect(result.status, result.stdout + result.stderr).toBe(0);
   });
 

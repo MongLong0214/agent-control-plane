@@ -1,4 +1,3 @@
-import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
   closeSync,
@@ -20,6 +19,7 @@ import Database from "better-sqlite3";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { FdVfsControl, RollbackFilesystem, parseExactIdentity } from "../../src/db/fd-vfs.ts";
+import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -73,7 +73,7 @@ const buildTestingArtifact = (): string => {
     "deps",
     "sqlite3",
   );
-  const result = spawnSync(
+  const result = boundedSpawnSync(
     process.env["CC"] ?? "cc",
     [
       "-O1",
@@ -362,7 +362,7 @@ describe("U6-UNIT1 the fd-vfs binds a connection to a verified descriptor", () =
       ].join("\n"),
       { mode: 0o600 },
     );
-    const result = spawnSync(process.execPath, ["--import", "tsx", script], { encoding: "utf8" });
+    const result = boundedSpawnSync(process.execPath, ["--import", "tsx", script], { encoding: "utf8" });
     expect(result.status, `probe child failed: ${result.stderr}`).toBe(0);
     return JSON.parse(result.stdout) as string[];
   };
@@ -439,7 +439,7 @@ describe("U6-UNIT1 the fd-vfs binds a connection to a verified descriptor", () =
       ].join("\n"),
       { mode: 0o600 },
     );
-    const result = spawnSync(process.execPath, ["--import", "tsx", script], { encoding: "utf8" });
+    const result = boundedSpawnSync(process.execPath, ["--import", "tsx", script], { encoding: "utf8" });
     expect(result.status, `absence child failed: ${result.stderr}`).toBe(0);
     const report = JSON.parse(result.stdout) as Record<string, string | boolean>;
     for (const call of names) {
@@ -519,7 +519,7 @@ describe("U6-UNIT1 the fd-vfs binds a connection to a verified descriptor", () =
       { mode: 0o600 },
     );
 
-    const result = spawnSync(process.execPath, ["--import", "tsx", script], { encoding: "utf8" });
+    const result = boundedSpawnSync(process.execPath, ["--import", "tsx", script], { encoding: "utf8" });
     expect(
       result.status,
       `child exited ${result.status} signal ${result.signal}: ${result.stderr}`,
@@ -594,7 +594,7 @@ describe("U6-UNIT1 the fd-vfs binds a connection to a verified descriptor", () =
     let signal: string | null = null;
     let childStderr = "";
     try {
-      execFileSync(process.execPath, ["--import", "tsx", child], { stdio: "pipe" });
+      boundedExecFileSync(process.execPath, ["--import", "tsx", child], { stdio: "pipe" });
     } catch (error) {
       const failure = error as { signal?: string; stderr?: Buffer };
       signal = failure.signal ?? null;
@@ -666,7 +666,7 @@ describe("U6-UNIT1 the fd-vfs binds a connection to a verified descriptor", () =
     );
 
     for (const variable of ["CFLAGS", "CPPFLAGS"]) {
-      const build = spawnSync(
+      const build = boundedSpawnSync(
         process.execPath,
         [join(buildRoot, "scripts", "build-native-fd-vfs.mjs")],
         {
@@ -710,7 +710,7 @@ describe("U6-UNIT1 the fd-vfs binds a connection to a verified descriptor", () =
       ].join("\n"),
       { mode: 0o600 },
     );
-    const loaded = spawnSync(process.execPath, ["--import", "tsx", script], { encoding: "utf8" });
+    const loaded = boundedSpawnSync(process.execPath, ["--import", "tsx", script], { encoding: "utf8" });
     expect(loaded.status, `load check failed: ${loaded.stderr}`).toBe(0);
     const report = JSON.parse(loaded.stdout) as Record<string, string | boolean>;
     for (const call of Object.keys(report).filter((key) => key !== "registered")) {
@@ -727,7 +727,7 @@ describe("U6-UNIT1 the fd-vfs binds a connection to a verified descriptor", () =
       "deps",
       "sqlite3",
     );
-    const both = spawnSync(
+    const both = boundedSpawnSync(
       process.env["CC"] ?? "cc",
       [
         "-O1",

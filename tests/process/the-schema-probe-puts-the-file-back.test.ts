@@ -1,8 +1,8 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { execFileSync, spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -30,8 +30,8 @@ const MANIFEST = "src/db/migration-checksums.json";
 /** A throwaway clone, with the working tree and node_modules the script needs. */
 const scratchRepo = (): string => {
   const dir = join(tempDir("acp-schema-probe-"), "repo");
-  execFileSync("git", ["clone", "--quiet", "--no-hardlinks", "--depth", "1", ROOT, dir]);
-  execFileSync("ln", ["-sfn", join(ROOT, "node_modules"), join(dir, "node_modules")]);
+  boundedExecFileSync("git", ["clone", "--quiet", "--no-hardlinks", "--depth", "1", ROOT, dir]);
+  boundedExecFileSync("ln", ["-sfn", join(ROOT, "node_modules"), join(dir, "node_modules")]);
   // The clone carries the committed script; this test is about the one in the working tree. Its
   // first version measured the old script and passed on the wrong evidence — the repair it was
   // asserting on had not been written into what it ran.
@@ -55,7 +55,7 @@ describe("the migration gate puts schema.sql back", () => {
     copyFileSync(schema, parked);
     writeFileSync(schema, `${original}\n-- an abandoned probe left this behind\n`);
 
-    const done = spawnSync("node", [SCRIPT], { cwd: repo, encoding: "utf8" });
+    const done = boundedSpawnSync("node", [SCRIPT], { cwd: repo, encoding: "utf8" });
 
     expect(done.stdout).toContain("died mid-probe");
     expect(readFileSync(schema, "utf8")).toBe(original);
@@ -69,7 +69,7 @@ describe("the migration gate puts schema.sql back", () => {
     const schema = join(repo, "src/db/schema.sql");
     const original = readFileSync(schema, "utf8");
 
-    const done = spawnSync("node", [SCRIPT], { cwd: repo, encoding: "utf8" });
+    const done = boundedSpawnSync("node", [SCRIPT], { cwd: repo, encoding: "utf8" });
 
     expect(done.status).toBe(0);
     expect(readFileSync(schema, "utf8")).toBe(original);
@@ -86,12 +86,12 @@ describe("the migration gate puts schema.sql back", () => {
     copyFileSync(schema, join(repo, ".git/schema-probe-in-flight"));
     writeFileSync(schema, `${original}\n-- leftover\n`);
 
-    spawnSync("node", [SCRIPT, "--update"], { cwd: repo, encoding: "utf8" });
+    boundedSpawnSync("node", [SCRIPT, "--update"], { cwd: repo, encoding: "utf8" });
     const frozen = readFileSync(join(repo, "src/db/migration-checksums.json"), "utf8");
 
     rmSync(join(repo, ".git/schema-probe-in-flight"), { force: true });
     writeFileSync(schema, original);
-    const after = spawnSync("node", [SCRIPT], { cwd: repo, encoding: "utf8" });
+    const after = boundedSpawnSync("node", [SCRIPT], { cwd: repo, encoding: "utf8" });
 
     // The freeze it wrote has to agree with the unaltered schema, which it only does if the repair
     // happened first.
