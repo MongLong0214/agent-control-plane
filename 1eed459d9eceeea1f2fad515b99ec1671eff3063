@@ -1,0 +1,6 @@
+Limit: this says nothing about the within-poll ordering of the advance and the admitting commit | measured above to be unobservable from outside the process, so there is no failure to witness there today — a change that acknowledged inside the same poll would make it observable again and would need its own case
+Warn: the reading happens only when the listener actually asks for an offset past the update, so the case asserts it saw at least one such request; without that guard a listener that never acknowledged would pass by measuring nothing
+Blast: local
+Undo: easy
+Certainty: firm
+Provenance: inherited 624f73ff03b582be12c17fe76b02fbe7deb2d6d1
