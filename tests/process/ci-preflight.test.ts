@@ -1,8 +1,8 @@
-import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -11,7 +11,7 @@ const REPO_ROOT = process.cwd();
 const SCRIPT = join(REPO_ROOT, "scripts", "verify-ci-preflight.mjs");
 
 const run = (repoRoot: string) =>
-  spawnSync(process.execPath, [SCRIPT, `--repo-root=${repoRoot}`], {
+  boundedSpawnSync(process.execPath, [SCRIPT, `--repo-root=${repoRoot}`], {
     cwd: REPO_ROOT,
     encoding: "utf8",
   });
