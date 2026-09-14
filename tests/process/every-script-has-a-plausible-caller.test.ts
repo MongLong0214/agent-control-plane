@@ -411,6 +411,84 @@ describe("the every-script-has-a-plausible-caller census", () => {
     });
   });
 
+  it("counts a bounded wrapper spawn as a plausible invocation site", () => {
+    const dir = scratchRepo();
+    const name = "wrapper-spawn-probe.mjs";
+    addMarkerScript(dir, name);
+    const testFile = "tests/process/wrapper-spawn-probe.test.ts";
+    writeFileSync(
+      join(dir, testFile),
+      `import { expect, it } from "vitest";\n` +
+        `import { join } from "node:path";\n` +
+        `\n` +
+        `import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";\n` +
+        `\n` +
+        `it("enters the script", () => {\n` +
+        `  const script = join(process.cwd(), "scripts", "${name}");\n` +
+        `  expect(boundedSpawnSync(process.execPath, [script], { encoding: "utf8" }).status).toBe(0);\n` +
+        `});\n`,
+    );
+
+    // #872 rewrote test children onto these wrappers. The census read argv[1] through
+    // `spawnSync` and `execFileSync` only, so every converted caller stopped counting and two
+    // untouched scripts were reported as reachable from nowhere.
+    const census = runJson(dir);
+    const entry = census.withPlausibleSites.find((item) => item.name === name);
+    expect(entry?.plausibleSites).toContainEqual({
+      type: "test",
+      file: testFile,
+      plausibleCiRoute: true,
+      execution: "unproven",
+    });
+  });
+
+  it("counts a bounded execFile wrapper the same way, and still refuses a mention that runs nothing", () => {
+    const dir = scratchRepo();
+    const name = "wrapper-execfile-probe.mjs";
+    addMarkerScript(dir, name);
+    const bound = "tests/process/wrapper-execfile-probe.test.ts";
+    writeFileSync(
+      join(dir, bound),
+      `import { expect, it } from "vitest";\n` +
+        `import { join } from "node:path";\n` +
+        `\n` +
+        `import { boundedExecFileSync } from "../helpers/bounded-sync-child.ts";\n` +
+        `\n` +
+        `it("enters the script", () => {\n` +
+        `  const script = join(process.cwd(), "scripts", "${name}");\n` +
+        `  expect(boundedExecFileSync(process.execPath, [script], { encoding: "utf8" })).toBe("");\n` +
+        `});\n`,
+    );
+
+    const census = runJson(dir);
+    expect(census.withPlausibleSites.find((item) => item.name === name)?.plausibleSites).toContainEqual({
+      type: "test",
+      file: bound,
+      plausibleCiRoute: true,
+      execution: "unproven",
+    });
+
+    // The widened list must not widen what counts as a *call*. A second script named only in a
+    // string handed to the same wrapper is still reachable from nowhere.
+    const mentioned = "wrapper-mention-only.mjs";
+    addMarkerScript(dir, mentioned);
+    writeFileSync(
+      join(dir, "tests/process/wrapper-mention-only.test.ts"),
+      `import { expect, it } from "vitest";\n` +
+        `\n` +
+        `import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";\n` +
+        `\n` +
+        `it("says the name without running it", () => {\n` +
+        `  expect(boundedSpawnSync("echo", ["scripts/${mentioned}"]).status).toBe(0);\n` +
+        `});\n`,
+    );
+
+    const done = run(dir);
+    expect(done.stderr).toContain(`scripts/${mentioned}`);
+    expect(done.stderr).toContain("no statically plausible invocation site");
+    expect(done.status).toBe(1);
+  });
+
   it("does not propagate a plausible CI route from callee back to an unused package site", () => {
     const dir = scratchRepo();
     const name = "reverse-graph-probe.sh";
