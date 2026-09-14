@@ -1,5 +1,4 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
 import { chmodSync, linkSync, mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -29,9 +28,17 @@ import {
   type UsageTerminal,
   nonInteractiveEnvironment,
 } from "../../src/capacity/usage-collectors.ts";
+import { boundedExecFileSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
+
+/**
+ * The enclosing case declares `20_000`, so the helper's 55s default would never be the bound that
+ * fires — vitest would time the case out first and report it against whatever the worker held.
+ * `mkfifo` creates one node and returns; 10s is already far past anything it can legitimately cost.
+ */
+const QUICK_CHILD_BUDGET_MS = 10_000;
 
 const clock = () => new ManualClock("2026-08-13T00:00:00.000Z");
 
@@ -681,7 +688,7 @@ describe("capacity review findings (#582)", () => {
     expect(grokBearer(root)).toBeNull();
     expect(grokBearer("/dev/null")).toBeNull();
     const fifo = join(root, "fifo.json");
-    execFileSync("mkfifo", [fifo]);
+    boundedExecFileSync("mkfifo", [fifo], { timeout: QUICK_CHILD_BUDGET_MS });
     const started = Date.now();
     expect(grokBearer(fifo)).toBeNull();
     expect(Date.now() - started).toBeLessThan(1_000);
