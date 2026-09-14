@@ -1282,8 +1282,16 @@ export class BlindReviewGate {
    */
   private async admitReviewer(provider: string): Promise<Decision<void>> {
     if (!this.#capacity) return allow(ReasonCode.OK, undefined);
+    let scoped: boolean;
+    try {
+      scoped = this.providers.hasRoleScoped(provider);
+      if (typeof scoped !== "boolean") throw new Error("unknown provider scope");
+    } catch {
+      return deny(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE, "provider role scope is unavailable", { provider });
+    }
     return this.#capacity.refreshForBlindReview({
       provider,
+      ...(scoped ? { role: Role.BLIND_REVIEWER } : {}),
       capabilities: ["blind-review"],
       priority: "critical",
     });

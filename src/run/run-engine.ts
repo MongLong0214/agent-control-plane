@@ -126,6 +126,11 @@ export interface CapacityGate {
   refreshForDispatch(target?: DispatchCapacityTarget): Promise<Decision<void>>;
 }
 
+/** Read-only view of the same registry used by the capacity monitor and runtime. */
+export interface AdmissionProviderScope {
+  hasRoleScoped(provider: string): boolean;
+}
+
 /**
  * The capability a primary CTO consumes. Named the same way the continuity kernel names
  * it, because the two must agree about what a CTO needs to be routable for (§15.1).
@@ -170,6 +175,9 @@ export class RunEngine {
     private readonly tasks: TaskGraph,
     private readonly claims: ClaimRegistry,
     private readonly telemetry: Telemetry,
+    // Omission supports legacy standalone engines only. A scoped monitor still rejects
+    // their provider-only targets; the production composition root always supplies this.
+    private readonly providerScope?: AdmissionProviderScope,
   ) {
     this.#stateTransitions = db.claimRunStateTransitionAuthority();
     this.#baseline = new BaselineRecorder(db, clock, audit);
@@ -354,8 +362,10 @@ export class RunEngine {
     // Local identity validation comes first because it neither allocates nor routes, and a
     // capacity check cannot be meaningful until there is a concrete owner/provider target.
     if (this.#capacity) {
+      const target = this.dispatchCapacityTarget(run, binding);
+      if (!target.allowed) return target as Decision<RunRow>;
       const capacity = await this.#capacity.refreshForDispatch(
-        this.dispatchCapacityTarget(run) ?? undefined,
+        target.value ?? undefined,
       );
       if (!capacity.allowed) return capacity as Decision<RunRow>;
     }
@@ -523,14 +533,27 @@ export class RunEngine {
    * before this method is reached, so a missing owner is reported as an authority failure
    * rather than as a targetless capacity probe.
    */
-  private dispatchCapacityTarget(run: RunRow): DispatchCapacityTarget | null {
+  private dispatchCapacityTarget(run: RunRow, binding: RoleBinding | null): Decision<DispatchCapacityTarget | null> {
     const provider = run.projectId
       ? (this.#cto?.plannedProvider(run.projectId) ?? null)
       : this.providerOfPinnedOwner(run.ownerSessionId);
-    if (!provider) return null;
+    if (!provider) return allow(ReasonCode.OK, null);
+    let scoped = false;
+    if (this.providerScope) {
+      try {
+        const observed = this.providerScope.hasRoleScoped(provider);
+        if (typeof observed !== "boolean") throw new Error("unknown provider scope");
+        scoped = observed;
+      } catch {
+        return deny(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE, "provider role scope is unavailable", { provider });
+      }
+    }
     // A primary CTO is a critical role, so it is never charged against the dynamic reserve
     // that exists to protect it (§14.5).
-    return { provider, capabilities: [CTO_CAPABILITY], priority: "critical" };
+    return allow(ReasonCode.OK, {
+      provider, capabilities: [CTO_CAPABILITY], priority: "critical",
+      ...(scoped ? { role: run.projectId ? Role.PRIMARY_CTO : binding!.role } : {}),
+    });
   }
 
   /** A projectless run's owner is already pinned, so its provider is a stored fact. */
@@ -561,13 +584,20 @@ export class RunEngine {
       session_incarnation: string;
       binding_generation: number;
       role_key: string;
+      role: Role;
+      project_id: string | null;
+      run_id: string | null;
     }>(
-      `SELECT session_id, session_incarnation, binding_generation, role_key
+      `SELECT session_id, session_incarnation, binding_generation, role_key, role, project_id, run_id
          FROM assignments WHERE role_key = ? AND status = 'ACTIVE'`,
       [run.ownerRoleKey],
     );
     if (
       !active ||
+      active.role !== (run.kind === RunKind.PROJECT_BOOTSTRAP ? Role.BOOTSTRAP_CTO : Role.PRIMARY_CTO) ||
+      (active.role === Role.BOOTSTRAP_CTO
+        ? active.run_id !== run.runId || active.role_key !== roleKeyFor(Role.BOOTSTRAP_CTO, { runId: run.runId })
+        : !active.project_id || active.role_key !== roleKeyFor(Role.PRIMARY_CTO, { projectId: active.project_id })) ||
       active.session_id !== run.ownerSessionId ||
       active.session_incarnation !== run.ownerSessionIncarnation ||
       active.binding_generation !== run.ownerBindingGeneration
@@ -584,9 +614,9 @@ export class RunEngine {
       // synthesises the binding the run named, not whatever is live now.
       boundSessionId: run.ownerSessionId ?? active.session_id,
       boundSessionIncarnation: run.ownerSessionIncarnation ?? active.session_incarnation,
-      role: run.kind === RunKind.PROJECT_BOOTSTRAP ? Role.BOOTSTRAP_CTO : Role.PRIMARY_CTO,
-      projectId: null,
-      runId: run.kind === RunKind.PROJECT_BOOTSTRAP ? run.runId : null,
+      role: active.role,
+      projectId: active.project_id,
+      runId: active.run_id,
       taskId: null,
       sessionId: active.session_id,
       sessionIncarnation: active.session_incarnation,

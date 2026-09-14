@@ -458,6 +458,7 @@ export class ControlPlane {
       this.runs = new RunEngine(
         this.db, this.clock, this.audit, this.artifacts, this.outbox,
         this.projects, this.repositories, this.tasks, this.claims, this.telemetry,
+        { hasRoleScoped: (provider) => this.providers.hasRoleScoped(provider) },
       );
       this.#completionAuthorities = this.runs.issueCompletionAuthorities();
       this.verification = new VerificationEngine(
