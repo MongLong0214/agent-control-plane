@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -20,6 +20,9 @@ import { isAcpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Db, SCHEMA_VERSION, openDb } from "../../src/db/database.ts";
 import { approveMigration, migrationApprovalPath } from "../../src/db/migration-approval.ts";
+import type { SpawnSyncReturns } from "node:child_process";
+
+import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 
 /**
  * An approval is a capability over one database, and the three ways it was not (#747).
@@ -60,7 +63,7 @@ afterAll(() => {
     // A test deliberately makes a file unrenameable; leaving the flag set would make the
     // cleanup below fail and take the next run's temp space with it.
     try {
-      execFileSync("chflags", ["-R", "nouchg", home]);
+      boundedExecFileSync("chflags", ["-R", "nouchg", home]);
     } catch {
       /* nothing was flagged */
     }
@@ -225,14 +228,14 @@ describe("a migration whose chain another process already ran", () => {
     // process that arrives *after* the holder released — which is exactly the window the seam
     // below opens.
     let raced = false;
-    let migrator: ReturnType<typeof spawnSync> | null = null;
+    let migrator: SpawnSyncReturns<string> | null = null;
     expect(
       () =>
         new Db(databasePath, {
           beforeMigrationExclusivity: () => {
             if (raced) return;
             raced = true;
-            migrator = spawnSync(
+            migrator = boundedSpawnSync(
               process.execPath,
               ["--import", "tsx", MIGRATE_ONE, databasePath],
               { cwd: repositoryRoot, encoding: "utf8", timeout: 60_000 },
@@ -329,7 +332,7 @@ describe("a spent approval that could not be filed away", () => {
     // `chflags uchg` makes the file unrenameable while leaving it readable, which is exactly
     // the shape of the failure: the approval can be validated and the migration can run, and
     // then the bookkeeping that describes it cannot be written.
-    execFileSync("chflags", ["uchg", migrationApprovalPath(databasePath)]);
+    boundedExecFileSync("chflags", ["uchg", migrationApprovalPath(databasePath)]);
 
     // The migration committed. Reporting that as a failed start is what left an upgraded
     // database behind a refusal report, with nothing on either side saying which happened.
@@ -340,7 +343,7 @@ describe("a spent approval that could not be filed away", () => {
     // fromVersion this database no longer has.
     expect(existsSync(migrationApprovalPath(databasePath))).toBe(true);
 
-    execFileSync("chflags", ["nouchg", migrationApprovalPath(databasePath)]);
+    boundedExecFileSync("chflags", ["nouchg", migrationApprovalPath(databasePath)]);
 
     // And it resolves itself: the next open at the build's version files it away.
     openDb(databasePath).close();
