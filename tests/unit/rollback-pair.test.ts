@@ -334,6 +334,47 @@ describe("the exact rollback pair", () => {
     }
   });
 
+  it("expresses a pnpm virtual store directory, and still refuses those characters anywhere else", async () => {
+    // Measured against this deployment's own closure: 24,164 of 32,854 files sat under 343 store
+    // directories the grammar could not spell, so `seal` refused every one of them. The names are
+    // real ones taken from that tree.
+    const { fixture, pair } = await sealFixture();
+    const indexPath = join(pair.root, ROLLBACK_PAIR_INDEX_FILE);
+    const original = readFileSync(indexPath, "utf8");
+
+    const accepted = [
+      "runtime/node_modules/.pnpm/@esbuild+darwin-arm64@0.28.2/node_modules/@esbuild/darwin-arm64/README.md",
+      "runtime/node_modules/.pnpm/@eslint+config-array@0.21.2_supports-color@7.2.0/node_modules/x/i.js",
+      "runtime/node_modules/.pnpm/rollup@4.62.4/node_modules/rollup/dist/rollup.js",
+    ];
+    for (const member of accepted) {
+      const index = `${original}${"0".repeat(64)}  ${member}\n`;
+      writeFileSync(indexPath, index, { mode: 0o600 });
+      // The path is expressible, so the refusal it earns is the missing/!hashing member -- never
+      // the spelling. Anchored on the negative: no "plain relative path" verdict.
+      expect(() => validateRollbackPair(pair.root, expectationFor(fixture, pair, {
+        indexDigest: `sha256:${sha256(index)}`,
+      })), member).not.toThrow(/plain relative path/);
+    }
+
+    // The widening is exactly as narrow as the scope exception it mirrors. Each of these carries
+    // the same characters one position away from `node_modules/.pnpm` and must stay refused.
+    const refused = [
+      "runtime/node_modules/.pnpm/@scope+pkg@1.0.0/../LICENSE",
+      "runtime/.pnpm/@scope+pkg@1.0.0/LICENSE",
+      "runtime/node_modules/@scope+pkg@1.0.0/LICENSE",
+      "runtime/node_modules/.pnpm/@scope+pkg@1.0.0/node_modules/a+b@1/LICENSE",
+      "runtime/node_modules/.pnpm/bad name@1.0.0/LICENSE",
+    ];
+    for (const member of refused) {
+      const index = `${original}${"0".repeat(64)}  ${member}\n`;
+      writeFileSync(indexPath, index, { mode: 0o600 });
+      expect(() => validateRollbackPair(pair.root, expectationFor(fixture, pair, {
+        indexDigest: `sha256:${sha256(index)}`,
+      })), member).toThrow(/plain relative path|index.*line/);
+    }
+  });
+
   it("seals a pair that validates with the retained digest and what the deployment is", async () => {
     const { fixture, pair } = await sealFixture();
 

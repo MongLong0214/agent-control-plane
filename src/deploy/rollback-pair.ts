@@ -106,12 +106,34 @@ const INDEX_LINE = /^([a-f0-9]{64}) {2}(\S+)$/;
 const MEMBER_SEGMENT = /^[A-Za-z0-9._-]+$/;
 const NPM_SCOPE_SEGMENT = /^@[a-z0-9][a-z0-9._-]*$/;
 const NPM_PACKAGE_SEGMENT = /^[a-z0-9][a-z0-9._-]*$/;
+/**
+ * A pnpm virtual store directory, which spells a whole dependency identity in one segment:
+ * `@esbuild+darwin-arm64@0.28.2`, `@eslint+config-array@0.21.2_supports-color@7.2.0`. The scope
+ * separator is `+` and the version separator is `@`, so such a name carries both characters and
+ * matches neither rule above.
+ *
+ * This is the same mistake the comment above records, one layer down. That rule was widened once
+ * because a real dependency tree turned up `.npmignore` and `.bin/` the moment anyone sealed one;
+ * this one was never exercised against a pnpm tree at all. Measured on this deployment's own
+ * closure: 24,164 of 32,854 files -- 73% -- sat under 343 distinct store directories that no
+ * spelling of the two rules above can express, so the seal could not be taken at all.
+ *
+ * Kept as narrow as the scope exception it mirrors: the extra characters are admitted only
+ * directly below `node_modules/.pnpm`, never in an arbitrary member name. The property this
+ * grammar exists for is unchanged -- `.` and `..` are still refused by name, whitespace still
+ * cannot appear (the index is `sha256  path`, so a space would break the line itself), and
+ * nothing here lets a member climb out of the pair.
+ */
+const PNPM_STORE_SEGMENT = /^[A-Za-z0-9._+@-]+$/;
 const isMemberPath = (value: string): boolean => {
   if (value.length === 0) return false;
   const segments = value.split("/");
   return segments.every((segment, index) => {
     if (segment === "." || segment === "..") return false;
     if (MEMBER_SEGMENT.test(segment)) return true;
+    // Only a pnpm store directory gains `+` and an embedded `@`, and only directly below `.pnpm`.
+    if (PNPM_STORE_SEGMENT.test(segment) && segments[index - 1] === ".pnpm" &&
+      segments[index - 2] === "node_modules") return true;
     // Only a scope directory in node_modules gains a leading @, never arbitrary member names.
     return NPM_SCOPE_SEGMENT.test(segment) && segments[index - 1] === "node_modules" &&
       index + 2 < segments.length && NPM_PACKAGE_SEGMENT.test(segments[index + 1]!);
