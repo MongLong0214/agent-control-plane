@@ -19,7 +19,6 @@
  * run; a listing guard with no readable-repository case would certify a `listWorktrees` that
  * refuses everything.
  */
-import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -28,6 +27,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { listWorktrees } from "../../src/git/git.ts";
 import { canonical } from "../../src/guard/workspace-probe.ts";
 import { WorktreeManager } from "../../src/verify/worktree.ts";
+import { boundedExecFileSync } from "../helpers/bounded-sync-child.ts";
 
 const made: string[] = [];
 const temp = (prefix: string): string => {
@@ -41,7 +41,7 @@ const temp = (prefix: string): string => {
 };
 
 const git = (cwd: string, args: readonly string[]): string =>
-  execFileSync("git", [...args], {
+  boundedExecFileSync("git", [...args], {
     cwd,
     encoding: "utf8",
     env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
