@@ -16,17 +16,18 @@
  * The workflow is read as the file CI runs, not as a fixture: a fixture would be a second
  * description of the shard set, free to stop resembling the one that matters.
  */
-import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 
 const REPO_ROOT = process.cwd();
 const HARNESS = join(REPO_ROOT, "scripts", "verify-guards-are-falsifiable.mjs");
 const WORKFLOW = join(REPO_ROOT, ".github", "workflows", "ci.yml");
 
 const harness = (...args: string[]) =>
-  spawnSync(process.execPath, [HARNESS, ...args], {
+  boundedSpawnSync(process.execPath, [HARNESS, ...args], {
     cwd: REPO_ROOT,
     encoding: "utf8",
     maxBuffer: 32 * 1024 * 1024,
