@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { chmodSync, writeFileSync } from "node:fs";
+import { chmodSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -273,6 +273,177 @@ const gateWithReviewerPreferences = (
     fallbacks: [{ provider: fallback.provider, model: "opus", effort: null }],
   },
 );
+
+const roleReviewRequest = (setup: Awaited<ReturnType<typeof prepareReviewedInputs>>) => ({
+  runId: setup.run.runId,
+  projectId: setup.projectId,
+  executionMode: setup.run.executionMode,
+  snapshot: setup.snapshot,
+  contract: CONTRACT,
+  contractDigest: setup.run.contractDigest,
+  verification: setup.verification,
+});
+
+describe("review role caller selection", () => {
+  it.each(["unscoped", "scoped", "mixed"])("constitutes only the %s reviewer identity", async (mode) => {
+    const setup = await prepareReviewedInputs();
+    const { cp, clock } = setup.harness;
+    let workdir: string | undefined;
+    try {
+      const selected = new TestProductionAdapter(clock, "gpt");
+      const wrong = new TestProductionAdapter(clock, "gpt");
+      if (mode === "unscoped") cp.providers.register(selected);
+      else {
+        cp.providers.registerForRole(selected, Role.BLIND_REVIEWER);
+        cp.providers.registerForRole(wrong, Role.PRIMARY_CTO);
+        if (mode === "mixed") cp.providers.register(wrong);
+      }
+      const start = vi.spyOn(selected, "startSession");
+      const wrongStart = vi.spyOn(wrong, "startSession");
+      const gate = gateWithReviewerPreferences(setup, selected, new TestProductionAdapter(clock, "claude"));
+      const result = await gate["constituteReviewer"](roleReviewRequest(setup));
+      if (result.allowed) workdir = result.value.workdir;
+      expect(result.allowed).toBe(true);
+      expect(start).toHaveBeenCalledOnce();
+      expect(wrongStart).not.toHaveBeenCalled();
+    } finally {
+      if (workdir) rmSync(workdir, { recursive: true, force: true });
+      cp.close();
+    }
+  });
+
+  it("keeps scoped unavailability fallback on the reviewer identity", async () => {
+    const setup = await prepareReviewedInputs();
+    const { cp, clock } = setup.harness;
+    let workdir: string | undefined;
+    try {
+      const preferred = new TestProductionAdapter(clock, "gpt");
+      preferred.setRuntimeHealth("UNAVAILABLE");
+      const fallback = new TestProductionAdapter(clock, "claude");
+      const wrong = new TestProductionAdapter(clock, "claude");
+      cp.providers.registerForRole(preferred, Role.BLIND_REVIEWER);
+      cp.providers.registerForRole(fallback, Role.BLIND_REVIEWER);
+      cp.providers.registerForRole(wrong, Role.PRIMARY_CTO);
+      const start = vi.spyOn(fallback, "startSession");
+      const wrongStart = vi.spyOn(wrong, "startSession");
+      const result = await gateWithReviewerPreferences(setup, preferred, fallback)["constituteReviewer"](roleReviewRequest(setup));
+      if (result.allowed) workdir = result.value.workdir;
+      expect(result.allowed && result.value.preference.provider).toBe("claude");
+      expect(start).toHaveBeenCalledOnce();
+      expect(wrongStart).not.toHaveBeenCalled();
+      expect(cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toEqual([
+        expect.objectContaining({ evidence: expect.objectContaining({ reason: "runtime unavailable" }) }),
+      ]);
+    } finally {
+      if (workdir) rmSync(workdir, { recursive: true, force: true });
+      cp.close();
+    }
+  });
+
+  it("preserves absent preferred denial and absent fallback bookkeeping", async () => {
+    const setup = await prepareReviewedInputs();
+    const { cp, clock } = setup.harness;
+    try {
+      const preferred = new TestProductionAdapter(clock, "gpt");
+      const fallback = new TestProductionAdapter(clock, "claude");
+      const gate = gateWithReviewerPreferences(setup, preferred, fallback);
+      expect(await gate["constituteReviewer"](roleReviewRequest(setup))).toMatchObject({
+        allowed: false, reasonCode: ReasonCode.ISOLATION_LOST,
+        message: "preferred reviewer adapter is not registered",
+      });
+      preferred.setRuntimeHealth("UNAVAILABLE");
+      cp.providers.registerForRole(preferred, Role.BLIND_REVIEWER);
+      expect(await gate["constituteReviewer"](roleReviewRequest(setup))).toMatchObject({
+        allowed: false, reasonCode: ReasonCode.ISOLATION_LOST,
+        evidence: { attempts: [
+          expect.objectContaining({ reason: "runtime unavailable" }),
+          expect.objectContaining({ reason: "no adapter registered" }),
+        ] },
+      });
+    } finally { cp.close(); }
+  });
+
+  it("refuses a CTO-only provider rather than treating it as an outage", async () => {
+    const setup = await prepareReviewedInputs();
+    const { cp, clock } = setup.harness;
+    try {
+      const wrong = new TestProductionAdapter(clock, "gpt");
+      const fallback = new TestProductionAdapter(clock, "claude");
+      cp.providers.registerForRole(wrong, Role.PRIMARY_CTO);
+      cp.providers.register(fallback);
+      const wrongStart = vi.spyOn(wrong, "startSession");
+      const fallbackStart = vi.spyOn(fallback, "startSession");
+      await expect(gateWithReviewerPreferences(setup, wrong, fallback)["constituteReviewer"](roleReviewRequest(setup)))
+        .rejects.toThrow("no adapter registered");
+      expect(wrongStart).not.toHaveBeenCalled();
+      expect(fallbackStart).not.toHaveBeenCalled();
+      expect(cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toHaveLength(0);
+    } finally { cp.close(); }
+  });
+});
+
+describe("review role caller invocation", () => {
+  it.each([false, true])("keeps single/chunk/final invocations on the reviewer identity (chunked=%s)", async (chunked) => {
+    const setup = chunked ? await prepareLargeReviewedInputs() : await prepareReviewedInputs();
+    const { cp, clock } = setup.harness;
+    try {
+      const selected = new TestProductionAdapter(clock, "gpt");
+      const wrong = new TestProductionAdapter(clock, "gpt");
+      selected.script(
+        { match: /Candidate review/, text: reviewerPass([`${setup.identity}:src/app.js`]) },
+        { match: /Review chunk/, text: reviewerPass([`${setup.identity}:src/app.js`]), once: false },
+        { match: /Final review/, text: reviewerPass([]) },
+      );
+      cp.providers.register(wrong);
+      cp.providers.registerForRole(wrong, Role.PRIMARY_CTO);
+      cp.providers.registerForRole(selected, Role.BLIND_REVIEWER);
+      const wrongInvoke = vi.spyOn(wrong, "invoke");
+      const result = await invokeGate(gateWithReviewerPreferences(setup, selected, new TestProductionAdapter(clock, "claude")), setup);
+      expect(result.allowed).toBe(true);
+      if (!result.allowed) throw new Error(result.message);
+      expect(result.value).toMatchObject({ provider: "gpt", verdict: "PASS", chunked });
+      expect(wrongInvoke).not.toHaveBeenCalled();
+      if (chunked) {
+        expect(selected.invocations.filter((call) => /Review chunk/.test(call.prompt)).length).toBeGreaterThan(1);
+        expect(selected.invocations.filter((call) => /Final review/.test(call.prompt))).toHaveLength(1);
+      } else expect(selected.invocations).toHaveLength(1);
+    } finally { cp.close(); }
+  });
+
+  it("uses reviewer capabilities rather than CTO capabilities for effort attestation", async () => {
+    const setup = await prepareReviewedInputs();
+    const { cp, clock } = setup.harness;
+    let workdir: string | undefined;
+    try {
+      class EffortReviewer extends TestProductionAdapter {
+        readonly supportsReviewerEffortAttestation = true;
+      }
+      const selected = new EffortReviewer(clock, "gpt");
+      const wrong = new TestProductionAdapter(clock, "gpt");
+      cp.providers.register(wrong);
+      cp.providers.registerForRole(wrong, Role.PRIMARY_CTO);
+      cp.providers.registerForRole(selected, Role.BLIND_REVIEWER);
+      const gate = gateWithReviewerPreferences(setup, selected, new TestProductionAdapter(clock, "claude"));
+      const constituted = await gate["constituteReviewer"](roleReviewRequest(setup));
+      if (!constituted.allowed) throw new Error(constituted.message);
+      workdir = constituted.value.workdir;
+      const result: InvocationResult = {
+        ok: true, text: "", json: null, provider: "gpt", model: "test", durationMs: 0, exitCode: 0,
+        error: null, providerSessionId: constituted.value.externalSessionId, isolationAttested: true,
+        egressEvidence: testReviewerEgressEvidence("gpt"),
+      };
+      expect(gate["assertIsolationAttested"](setup.run.runId, constituted.value, result)).toMatchObject({
+        allowed: false, reasonCode: ReasonCode.ISOLATION_LOST,
+        message: "reviewer adapter did not attest the configured effort",
+      });
+      expect(gate["assertIsolationAttested"](setup.run.runId, constituted.value, { ...result, effortAttested: true }))
+        .toMatchObject({ allowed: true });
+    } finally {
+      if (workdir) rmSync(workdir, { recursive: true, force: true });
+      cp.close();
+    }
+  });
+});
 
 describe("round-2 blind-review regressions", () => {
   it("#125 rejects a caller-fabricated PASS verification report", async () => {

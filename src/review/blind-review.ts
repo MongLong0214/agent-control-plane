@@ -420,7 +420,9 @@ export class BlindReviewGate {
 
     for (const preference of [this.preferences.preferred, ...this.preferences.fallbacks]) {
       const isPreferred = preference === this.preferences.preferred;
-      const adapter = this.providers.get(preference.provider);
+      const adapter = this.providers.hasRoleScoped(preference.provider)
+        ? this.providers.requireForRole(preference.provider, Role.BLIND_REVIEWER)
+        : this.providers.get(preference.provider);
       if (!adapter) {
         attempts.push({ preference, reason: "no adapter registered" });
         // An omitted GPT adapter is a deployment/configuration defect, not measured
@@ -721,7 +723,7 @@ export class BlindReviewGate {
     // simply omits the field — is an unprovable isolation claim, which §18.3 treats as a
     // lost boundary rather than a benign default.
     if (result.isolationAttested === true && result.isolationReasonCode === undefined) {
-      const adapter = this.providers.require(reviewer.preference.provider);
+      const adapter = this.providers.requireForRole(reviewer.preference.provider, Role.BLIND_REVIEWER);
       if (
         adapter.supportsReviewerEffortAttestation === true &&
         reviewer.preference.effort !== null &&
@@ -781,7 +783,7 @@ export class BlindReviewGate {
     diffs: Array<{ identity: string; diff: string; files: string[] }>,
     reviewer: ReviewerBinding,
   ): Promise<Decision<ReviewOutcome>> {
-    const adapter = this.providers.require(reviewer.preference.provider);
+    const adapter = this.providers.requireForRole(reviewer.preference.provider, Role.BLIND_REVIEWER);
     const capacity = await this.admitReviewer(reviewer.preference.provider);
     if (!capacity.allowed) return capacity as Decision<ReviewOutcome>;
     const result = await adapter.invoke(this.reviewInvocation(
@@ -877,7 +879,7 @@ export class BlindReviewGate {
 
       const capacity = await this.admitReviewer(reviewer.preference.provider);
       if (!capacity.allowed) return capacity as Decision<ReviewOutcome>;
-      const adapter = this.providers.require(reviewer.preference.provider);
+      const adapter = this.providers.requireForRole(reviewer.preference.provider, Role.BLIND_REVIEWER);
       const result = await adapter.invoke(this.reviewInvocation(
         request,
         reviewer,
@@ -951,7 +953,7 @@ export class BlindReviewGate {
     if (!finalCapacity.allowed) {
       return finalCapacity as Decision<ReviewOutcome>;
     }
-    const finalResult = await this.providers.require(finalReviewer.value.preference.provider).invoke(
+    const finalResult = await this.providers.requireForRole(finalReviewer.value.preference.provider, Role.BLIND_REVIEWER).invoke(
       this.reviewInvocation(
         request,
         finalReviewer.value,

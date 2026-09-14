@@ -593,7 +593,7 @@ export class ContinuityKernel {
     provider: string,
     purpose: string,
   ): Promise<Decision<{ sessionId: string }>> {
-    const adapter = this.providers.require(provider);
+    const adapter = this.providers.requireForRole(provider, role);
     if (!adapter.isProduction) {
       return deny(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE, "non-production adapter cannot provide continuity", {
         provider,
