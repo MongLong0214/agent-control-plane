@@ -1,0 +1,45 @@
+Unverified: worker 4-table 확장은 범위 밖 미완료 유지. 정상 인증 이후 원래 STANDARD→review→CONFIRM→finalizer→merge/post-merge 실결과가 있어야 activation/완료 판정 가능합니다.
+Record-Id: r-7d0aaf8bfbc1
+Provenance: inherited 632c641b547a3a5de79297d5a455e7c539a11928
+
+Warn: Component planning must request PRIMARY_CTO explicitly; do not weaken the registry's provider-only fail-closed boundary.
+Record-Id: r-1c5a3f979adc
+Provenance: inherited 0dc3d7087a1dae98dcb0ed01a7667a426661848f
+
+Warn: Measured OPEN/CONSERVE acceptance is only a measurement precheck; preserve mandatory-review capability/critical priority and worker dynamic reserve admission.
+Unverified: The one full affected-file run had 58 passes and one new fixture failure; after correcting role invalidation, five focused checks passed, but the full file was not rerun.
+Record-Id: r-360cdb3f98f9
+Provenance: inherited f2c433e68aa8652141afecbe290b27914bbaec5e
+
+Warn: This repairs census metadata, not the partial timestamp ordering itself; a passing census is not proof of unique total ordering.
+Record-Id: r-bafc0dbac9f8
+Evidence: scripts/lib/partial-timestamp-orderings.mjs
+Provenance: inherited 508ae6f502eb1af1a60f58b33abe873dad570c62
+
+Warn: Do not release a private reviewer home claim on bootstrap failure or stop; session bookkeeping does not prove every native descendant has exited.
+Unverified: Authenticated native exec/resume remains unverified. The full affected run remains FAIL with the same 38 exact-base failures; scoped acceptance is not full-suite green.
+Record-Id: r-bfb9345de951
+Evidence: src/runtime/reviewer-codex-home.ts
+Evidence: tests/unit/reviewer-isolation-probes.test.ts
+Provenance: inherited 25adc82fd46efe473021a7eea98c921228764f1e
+
+Limit: the denial probe needs a path that exists, and with an empty deny list its only candidates are the ambient ~/.claude and ~/.codex
+Limit: `list()` hands out a role-scoped adapter as a provider's representative | no current consumer dispatches through it, but one that did would act in whichever role registered first
+Limit: eighteen operands are recorded as unanswered, not tested | each states the measurement and the counterexample that would make it decisive, and none of them has a witness today
+Ruled-out: adding an unscoped `register()` for the role-scoped adapters | `register` refuses a duplicate provider, so one of the two Claude adapters would win and a role-less `require` would silently get it
+Ruled-out: relaxing the role-less refusal in `require`/`get` | the callers that hit it were asking provider-level questions, so the fix belongs at the call site
+Warn: do not give a reviewer-isolation case an empty denyReadPaths: the attestation then depends on the developer's home directory and the case turns red on any clean host
+Blast: module
+Undo: easy
+Certainty: firm
+Record-Id: r-1655b6b483f0
+Evidence: tests/unit/reviewer-isolation-probes.test.ts
+Provenance: inherited dedc1e1ded79d27001a2555ab54940d6eb4bea64
+
+Limit: main already carries part of this stack from the CEO's lane, squash-merged, so the same work has different SHAs and different patch-ids and shows up as a conflict
+Warn: do not copy either side's run-engine timestamp coordinate: main says :1045 and the branch says :1075, and only the merged tree's own gate run gives the number that is actually correct there
+Blast: module
+Certainty: firm
+Record-Id: r-45c304ec75f7
+Evidence: scripts/lib/partial-timestamp-orderings.mjs
+Provenance: inherited 1218f3819909a829e0ca9a41dbab1fab42824964
