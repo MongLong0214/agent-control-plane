@@ -675,6 +675,139 @@ export const REALM_EVIDENCE_CLAIM =
   "reconstitution, duplicate freedom, the target fence and receipt, and activation were not " +
   "exercised.";
 
+/**
+ * Condition 3 of #655's safety list: the probe child's tool surface, measured rather than assumed.
+ *
+ * The condition is phrased as a precondition on *starting* — "if mutating and external tools are
+ * not **measured** as off, the run does not start" — and the number behind it is that a trivial
+ * prompt once produced 65 tool calls. So the shape that matters is not "are the dangerous tools
+ * off" but "did anyone look": a run that never took the census and a run whose census came back
+ * clean are the same thing to every check that only reads a boolean.
+ *
+ * `measuredAt === null` is therefore a refusal and not a pass, which is the whole point of taking
+ * a census object rather than a flag. The same applies per tool: a tool this census does not
+ * mention is `undefined`, and `undefined` is not `false`.
+ */
+export interface ProbeToolCensus {
+  /** When the census was taken against the probe child's own configuration. `null` means never. */
+  readonly measuredAt: string | null;
+  /** What the census was taken against, so a reader can tell which child it describes. */
+  readonly targetRoot: string;
+  /** Every tool the census could name, with whether the child may call it. */
+  readonly tools: Readonly<Record<string, boolean>>;
+}
+
+/**
+ * The tools whose side effects leave the realm. A probe that can call one of these can change the
+ * world outside the disposable workspace, which is the thing conditions 1, 2 and 7 all exist to
+ * prevent from a different direction — so this list is deliberately about *reach*, not about risk
+ * in the abstract.
+ *
+ * Named here rather than derived from the child's config: a list read out of the thing being
+ * judged is not an allowlist, it is a restatement.
+ */
+export const PROBE_FORBIDDEN_TOOLS = [
+  "bash",
+  "shell",
+  "write",
+  "edit",
+  "apply_patch",
+  "web_fetch",
+  "web_search",
+  "browser",
+  "mcp",
+] as const;
+
+/**
+ * Refuses unless the census exists and every forbidden tool is measured off.
+ *
+ * Three distinct refusals rather than one, because the operator's next action differs: an absent
+ * census means go and take one, an unmeasured tool means the census is incomplete for this list,
+ * and an enabled tool means the child's configuration has to change.
+ */
+export const assertProbeToolsMeasuredOff = (census: ProbeToolCensus): Decision<ProbeToolCensus> => {
+  if (census.measuredAt === null) {
+    return deny(
+      ReasonCode.ACCEPTANCE_PROBE_INCONCLUSIVE,
+      "the probe child's tool surface was never measured, so the run does not start",
+      { targetRoot: census.targetRoot },
+    );
+  }
+  const unmeasured = PROBE_FORBIDDEN_TOOLS.filter((tool) => census.tools[tool] === undefined);
+  if (unmeasured.length > 0) {
+    return deny(
+      ReasonCode.ACCEPTANCE_PROBE_INCONCLUSIVE,
+      "the tool census does not name every forbidden tool, so it cannot say they are off",
+      { targetRoot: census.targetRoot, unmeasured },
+    );
+  }
+  const enabled = PROBE_FORBIDDEN_TOOLS.filter((tool) => census.tools[tool] === true);
+  if (enabled.length > 0) {
+    return deny(
+      ReasonCode.ACCEPTANCE_PROBE_INCONCLUSIVE,
+      "the probe child may call tools whose side effects leave the realm",
+      { targetRoot: census.targetRoot, enabled },
+    );
+  }
+  return allow(ReasonCode.OK, census);
+};
+
+/**
+ * Condition 6 of #655's safety list: contention on the shared Hermes `state.db` is the result.
+ *
+ * The condition has two halves and they pull in opposite directions. `hermes acp` is **not**
+ * killed — the run has no authority over a process it did not start, which `mayTerminate` already
+ * enforces — and yet the run must not proceed through contention either, because a probe sharing
+ * that database with the live gateway is no longer isolated in the sense conditions 1 and 7 mean.
+ *
+ * So contention resolves to a stop whose *report is the observation*, not to a retry and not to a
+ * failure of the probe. The issue says it outright: "that observation is itself the result and the
+ * run stops."
+ *
+ * `observed === null` is a refusal for the same reason the tool census is: not having looked and
+ * having looked and found nothing are different facts, and only one of them licenses a start.
+ */
+export interface HermesSharedStateObservation {
+  /** When the shared database was inspected. `null` means it was not. */
+  readonly observedAt: string | null;
+  /** The shared database the live gateway and any probe would both hold. */
+  readonly databasePath: string;
+  /**
+   * Whether a second holder was observed — a lock, a `-wal` a foreign writer left, a busy answer.
+   * `null` means the inspection could not decide, which is not the same as "no".
+   */
+  readonly contended: boolean | null;
+  /** What the inspection saw, carried so the report can be the observation. */
+  readonly detail: string;
+}
+
+export type HermesContentionDisposition = "PROCEED" | "STOP_AND_REPORT" | "INCONCLUSIVE";
+
+/**
+ * Maps the observation to what the run does about it. Deliberately total and deliberately without
+ * a retry: a retried contention check is a loop that ends when the answer happens to be the
+ * convenient one, and this condition exists to stop rather than to wait.
+ */
+export const classifyHermesContention = (
+  observation: HermesSharedStateObservation,
+): HermesContentionDisposition => {
+  if (observation.observedAt === null) return "INCONCLUSIVE";
+  if (observation.contended === null) return "INCONCLUSIVE";
+  return observation.contended ? "STOP_AND_REPORT" : "PROCEED";
+};
+
+/**
+ * The sentence a contention stop is allowed to claim, built from the observation it rests on.
+ *
+ * A value rather than prose for the same reason `REALM_EVIDENCE_CLAIM` is: the gap between what
+ * was seen and what gets claimed is where an acceptance run stops being evidence. This one says
+ * the run stopped *and why*, and says nothing about the probe's subject.
+ */
+export const hermesContentionReport = (observation: HermesSharedStateObservation): string =>
+  `The run stopped before the probe because the shared Hermes database at ${observation.databasePath} ` +
+  `was observed contended at ${observation.observedAt ?? "an unrecorded time"}: ${observation.detail}. ` +
+  "No process this run did not start was signalled, and nothing about the probe's subject was exercised.";
+
 /** Whether the production database can be read without being opened for writing. */
 export const productionIsReadable = (home = homedir()): boolean => {
   const database = join(productionRoot(home), "state.sqlite");

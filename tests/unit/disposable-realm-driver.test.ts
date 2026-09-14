@@ -166,6 +166,19 @@ describe("the disposable realm driver", () => {
           condition: "The evidence claim is bounded in the code, not in the write-up",
           status: "CHECKED_BY_RUN",
         },
+        // The last two are not written here; they are whatever the decisions in
+        // `derivedSafetyConditions` return for what synthetic mode can honestly observe, which is
+        // nothing. That is why both read ASSERTED_ONLY rather than being absent from the list.
+        {
+          condition:
+            "Tool side effects are restricted to a closed allowlist, measured rather than assumed",
+          status: "ASSERTED_ONLY",
+        },
+        {
+          condition:
+            "Contention on the shared Hermes state.db is itself the result, and the run stops",
+          status: "ASSERTED_ONLY",
+        },
       ]);
   });
 
