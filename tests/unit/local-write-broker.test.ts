@@ -1,6 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 
 import { isoPlus } from "../../src/core/clock.ts";
@@ -13,6 +12,7 @@ import {
   type ManagedInvocationWrite,
   type ManagedInvocationWriteBroker,
 } from "../../src/runtime/provider.ts";
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, gitSync, makeCore, makeRepo, seedActor, seedRun, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -20,7 +20,7 @@ afterAll(cleanupTempDirs);
 const seatbeltCanApply = (): boolean =>
   process.platform === "darwin" &&
   existsSync("/usr/bin/sandbox-exec") &&
-  spawnSync("/usr/bin/sandbox-exec", ["-p", "(version 1)\n(allow default)", "/usr/bin/true"]).status === 0;
+  boundedSpawnSync("/usr/bin/sandbox-exec", ["-p", "(version 1)\n(allow default)", "/usr/bin/true"]).status === 0;
 
 /** A provider stand-in which writes both inside and outside the authorised directory. */
 const writeScopeProbe = (repository: string): string => {
