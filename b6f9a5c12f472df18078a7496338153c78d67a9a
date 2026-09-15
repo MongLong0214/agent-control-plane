@@ -1,0 +1,22 @@
+Limit: a PASS from this script does not satisfy the roadmap when the producer runs it: the requirement is a verifier who is not the producer, and no program can establish that about itself
+Limit: non-mutation is enforced as a postcondition over the live paths this run reads, which is narrower than a promise about the whole machine
+Ruled-out: preferring the deployed generation's rollback-pair.js | the deployed build predates #929, so it refuses pnpm store member paths that are legal on main and produced a false FAIL against a sound pair
+Ruled-out: a fixed LaunchAgent plist path with no override | a test on a runner without that file would fail for the file's absence rather than for the reason it names, which is vacuous exactly where it must bite
+Ruled-out: keeping the procedure as a prose brief | the brief said mutate nothing in eleven places and could not defend against a command whose shape lies about its direction
+Warn: plutil -extract KEY FMT FILE without -o overwrites FILE rather than printing; this file reads property lists only through plutil -convert json -o -, and a second spelling is how the wrong one returns
+Warn: compare realpath on both sides when detecting direct invocation: import.meta.url is already resolved and process.argv[1] is not, so on macOS a symlinked path made an earlier draft do nothing and exit 0
+Blast: module
+Undo: easy
+Certainty: firm
+Record-Id: r-54ba5523e76a
+Provenance: inherited 01b8617c2c52681d8d540bc20bdd539917d1a405
+
+Limit: the known-bad probe shows the validator refuses one wrong pair id; it does not establish that every wrong expectation is refused
+Ruled-out: asserting the entrypoint is inside the checkout it verifies from | checkoutRoot is derived from import.meta.url, so the branch cannot fire and a guard nothing can kill reports coverage it does not have
+Ruled-out: a source-text assertion for the known-bad probe | a mutant that kept the function name and returned true survived it, which is measuring the shape expected instead of the behaviour
+Warn: the realpath comparison in the invocation guard is what defends the silently-did-nothing class; weakening it back to resolve() fails two cases, and that is the witness the removed tautology pretended to be
+Blast: module
+Undo: easy
+Certainty: firm
+Record-Id: r-4846234f4bfb
+Provenance: inherited 7ba4a57d9753335e6ab81a6294c6e051a776a612
