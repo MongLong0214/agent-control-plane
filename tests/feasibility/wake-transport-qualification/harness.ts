@@ -180,6 +180,16 @@ export interface QualificationReceipt {
     readonly versionOutput: string;
     readonly imagePath: string;
     readonly imageSha256: string;
+    /**
+     * Which client this reading was taken from. `daemon-binary` and `pinned-launcher` speak for
+     * the build this deployment executes; `path` speaks only for whatever the installer last
+     * pointed at, which is a different file and moves on its own.
+     *
+     * Optional because the receipt is written by the operator script and only read back by the
+     * suite (`bd2dc5e5`), so every receipt produced before this field existed lacks it. Absent
+     * means "not recorded" -- a third answer, not a quiet `path`.
+     */
+    readonly qualificationSource?: "daemon-binary" | "pinned-launcher" | "path" | null;
   };
   readonly host: { readonly platform: string; readonly arch: string; readonly release: string };
   readonly frame: {
@@ -231,15 +241,65 @@ const onPath = (name: string): string | null => {
 };
 
 /**
- * Resolves the installed client to the file that actually executes, and digests it.
+ * The launcher this deployment actually starts its canonical session through.
  *
- * `realpathSync` on purpose: the entry on PATH is a symlink into a versioned directory, and a
- * receipt that recorded the symlink would name a pointer that moves on the next update while
- * claiming to identify a build. `--version` is probed from a scratch cwd with a scratch `HOME`
- * so the probe cannot read or write the operator's real configuration (#795).
+ * `~/.agent-control-plane/claude-pinned/claude` is the deployment's own pointer at the qualified
+ * build: the canonical session's argv[0] is that path, and `canonical-self-claim.ts` compares a
+ * claimant's executing image against a pinned realpath rather than against whatever PATH resolves.
+ * PATH is not part of that contract and moves on its own -- the installer re-points it on every
+ * release.
+ */
+const deploymentLauncher = (): string | null => {
+  // `ACP_CLAUDE_BINARY` first, because that is what the daemon hands a client it spawns, and
+  // `r-wakepin266` records a host where it named a build the pin refused. Measured here on
+  // 2026-09-15 the two agree -- the daemon carries
+  // `~/.local/share/claude/versions/2.1.268` and `claude-pinned/claude` resolves to the same file
+  // -- but agreeing today is not the same fact as being one pointer, and reading only the symlink
+  // would answer about the operator-launched session while saying nothing about a daemon-spawned
+  // one.
+  const configured = process.env["ACP_CLAUDE_BINARY"];
+  if (configured !== undefined && configured.length > 0 && existsSync(configured)) return configured;
+  const home = process.env["HOME"];
+  if (home === undefined || home.length === 0) return null;
+  const launcher = join(home, ".agent-control-plane", "claude-pinned", "claude");
+  return existsSync(launcher) ? launcher : null;
+};
+
+/**
+ * Which of the two this harness read. A receipt that does not say cannot be told apart from one
+ * taken against a deployment that was not there.
+ */
+export const qualificationSource = (): "daemon-binary" | "pinned-launcher" | "path" | null => {
+  const configured = process.env["ACP_CLAUDE_BINARY"];
+  if (configured !== undefined && configured.length > 0 && existsSync(configured)) return "daemon-binary";
+  const home = process.env["HOME"];
+  if (home !== undefined && home.length > 0
+    && existsSync(join(home, ".agent-control-plane", "claude-pinned", "claude"))) {
+    return "pinned-launcher";
+  }
+  return onPath("claude") === null ? null : "path";
+};
+
+/**
+ * Resolves the client this harness measures, and digests it.
+ *
+ * The deployment's pinned launcher first, PATH second. Until 2026-09-15 this read PATH alone, and
+ * that is a different build from the one the deployment runs: the canonical session starts through
+ * `claude-pinned/claude`, while PATH is re-pointed by the installer on every release. On this host
+ * the two had drifted three versions apart, so the qualification evidence was measured against a
+ * build **nothing in this deployment executes**. The test asserting the two agree was right to
+ * fail, and relaxing that assertion would have left the harness pointed at the wrong file.
+ *
+ * PATH stays as the fallback so a checkout with no deployment beside it can still qualify
+ * something.
+ *
+ * `realpathSync` on purpose: both entries are symlinks into a versioned directory, and a receipt
+ * that recorded the symlink would name a pointer that moves on the next update while claiming to
+ * identify a build. `--version` is probed from a scratch cwd with a scratch `HOME` so the probe
+ * cannot read or write the operator's real configuration (#795).
  */
 export const resolveClaudeImage = (): ClaudeImage | null => {
-  const entry = onPath("claude");
+  const entry = deploymentLauncher() ?? onPath("claude");
   if (entry === null) return null;
   let path: string;
   try {
@@ -629,6 +689,10 @@ export const buildReceipt = (input: {
       versionOutput: input.image.versionOutput,
       imagePath: redactHome(input.image.path),
       imageSha256: input.image.sha256,
+      // Which of the two the harness read. A receipt that does not say cannot be told apart from
+      // one taken where no deployment was present, and the two claim different things: only
+      // only `daemon-binary` and `pinned-launcher` are evidence about the build it executes.
+      qualificationSource: qualificationSource(),
     },
     host: { platform: platform(), arch: arch(), release: release() },
     frame: {
