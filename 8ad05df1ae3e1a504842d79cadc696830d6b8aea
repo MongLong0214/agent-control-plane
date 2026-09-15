@@ -1,0 +1,4 @@
+Limit: both cases pass today and are written to keep passing | a test that pinned the coordinator's strictness as right would make #858's open decision by being green, so this measures the disagreement rather than resolving it
+Warn: the two ledgers hold different turns, not different counts | ingress says the conversation is running m2 while canonical says m1 is unresolved, so the four adjudication surfaces read a turn production has already moved on from
+Record-Id: r-b43d83324402
+Provenance: inherited ebb2a08cd1cd583bdcbe40d43e89ae58126ace25
