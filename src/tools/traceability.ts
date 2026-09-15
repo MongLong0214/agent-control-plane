@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
@@ -251,10 +251,36 @@ export const collectExecutableTestDeclarations = (root: string = repoRoot): Exec
 
 const normalizeTitle = (title: string): string => title.replace(/\s+/g, " ").trim();
 
-const resultKey = (file: string, fullName: string, root: string): string => {
-  const resolvedFile = isAbsolute(file) ? resolve(file) : resolve(root, file);
-  return `${resolvedFile}\u0000${normalizeTitle(fullName)}`;
+/**
+ * The repository-relative spelling of a path that may have been written by a different machine.
+ *
+ * This used to resolve both sides to absolute paths against the *current* root, which is only
+ * correct while the result set and this process were produced on the same filesystem layout. They
+ * are not: the JSON comes from the macOS matrix leg as an artifact, so its `name` fields read
+ * `/Users/runner/work/...`, and the job consuming them reads `/home/runner/work/...`. Every key
+ * then differed and nothing matched — measured as `requirementsWithGaps: 22`, which is every
+ * requirement in the PRD, from a suite that had passed.
+ *
+ * A same-platform version of this job hid it completely. The failure needs two machines to appear
+ * and says nothing about the code under test when it does.
+ *
+ * Matched against the declarations this run found rather than by cutting at a fixed marker: the
+ * declarations are the authoritative list of files that can participate, and an absolute path from
+ * anywhere either ends with one of them or is not a file this report is about. A path that matches
+ * nothing is left alone, so an unmatched entry stays unmatched instead of being folded onto some
+ * other file's key.
+ */
+const repositoryRelative = (file: string, known: ReadonlySet<string>): string => {
+  const normalized = file.split(sep).join("/");
+  if (known.has(normalized)) return normalized;
+  for (const candidate of known) {
+    if (normalized.endsWith(`/${candidate}`)) return candidate;
+  }
+  return normalized;
 };
+
+const resultKey = (file: string, fullName: string, known: ReadonlySet<string>): string =>
+  `${repositoryRelative(file, known)}\u0000${normalizeTitle(fullName)}`;
 
 /**
  * Returns only the declared scenario tests whose exact Vitest assertion result was `passed`.
@@ -264,12 +290,14 @@ const resultKey = (file: string, fullName: string, root: string): string => {
 export const passedScenarioReferences = (
   declarations: readonly ExecutableTestDeclaration[],
   result: VitestJsonReport,
-  root: string = repoRoot,
 ): Map<string, TestReference[]> => {
+  // The files this run actually found, which is what an absolute path from another machine is
+  // matched back onto. Built before the result set is read, because it is the reference.
+  const known = new Set(declarations.map((declaration) => declaration.file.split(sep).join("/")));
   const statuses = new Map<string, Set<string>>();
   for (const testFile of result.testResults) {
     for (const assertion of testFile.assertionResults) {
-      const key = resultKey(testFile.name, assertion.fullName, root);
+      const key = resultKey(testFile.name, assertion.fullName, known);
       const values = statuses.get(key) ?? new Set<string>();
       values.add(assertion.status);
       statuses.set(key, values);
@@ -278,7 +306,7 @@ export const passedScenarioReferences = (
 
   const references = new Map<string, TestReference[]>();
   for (const declaration of declarations) {
-    const status = statuses.get(resultKey(declaration.file, declaration.fullName, root));
+    const status = statuses.get(resultKey(declaration.file, declaration.fullName, known));
     if (!status?.has("passed")) continue;
     for (const id of declaration.scenarioIds) {
       const rows = references.get(id) ?? [];
@@ -460,31 +488,26 @@ const runVitestJson = (root: string): VitestJsonReport => {
     return parseVitestJsonReport(readFileSync(suppliedPath, "utf8"));
   }
 
-  // Say so. CI supplies ACP_VITEST_RESULTS precisely to avoid this second full run; a bare
-  // `pnpm trace` re-runs a suite that starts real sandboxed children, which is slow and was
-  // where the worker crash surfaced before `pool: "forks"`.
-  console.warn(
-    "pnpm trace: no ACP_VITEST_RESULTS supplied — running the whole suite a second time to obtain a JSON reporter pass",
+  // Refused rather than substituted. `a9c8c56a` already ruled on the shape this fallback has:
+  // *"it was a duplicate execution, and the fix is to not run it twice"* — and the record beside
+  // it says what a trace is for, *"traceability now describes the run the gate judged, so a
+  // supplied result set must come from the same commit"*. A suite this tool starts for itself is
+  // by definition not the run any gate judged, so the report it produced was a claim about an
+  // execution nobody looked at, dressed as coverage.
+  //
+  // It also pinned this tool to Darwin. The fallback starts the whole suite, and that suite reads
+  // `lsof`, launchd and peer credentials through a Darwin-only addon (#539), so a job running
+  // `pnpm trace` had to be on `macos-15` for a path CI arranges never to take. The CI workflow
+  // recorded that cost and the condition for lifting it in as many words: the move "waits until
+  // the fallback is removed or explicitly refused, as its own change." This is that change.
+  //
+  // The refusal names the command, because a refusal a reader cannot act on is just a failure.
+  throw new Error(
+    "pnpm trace needs a result set and will not produce one by starting a second suite run: a run " +
+      "this tool starts is not the run any gate judged. Supply ACP_VITEST_RESULTS, e.g.\n" +
+      "  pnpm vitest run --reporter=json --outputFile=evidence/local/ci-vitest-results.json\n" +
+      "  ACP_VITEST_RESULTS=evidence/local/ci-vitest-results.json pnpm trace",
   );
-  const evidenceDir = join(root, "evidence", "local");
-  const outputPath = join(evidenceDir, `traceability-vitest-${process.pid}.json`);
-  const vitestEntrypoint = join(root, "node_modules", "vitest", "vitest.mjs");
-  if (!existsSync(vitestEntrypoint)) {
-    throw new Error("Vitest is not installed; run pnpm install before pnpm trace");
-  }
-
-  mkdirSync(evidenceDir, { recursive: true });
-  const result = spawnSync(
-    process.execPath,
-    [vitestEntrypoint, "run", "--reporter=json", `--outputFile=${outputPath}`],
-    { cwd: root, encoding: "utf8" },
-  );
-  if (result.error) throw result.error;
-  if (!existsSync(outputPath)) {
-    const details = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
-    throw new Error(`Vitest JSON reporter did not produce a result set${details ? `: ${details}` : ""}`);
-  }
-  return parseVitestJsonReport(readFileSync(outputPath, "utf8"));
 };
 
 const markdownReport = (report: TraceabilityReport): string => [
@@ -556,7 +579,7 @@ export const main = (options: TraceabilityMainOptions = {}): TraceabilityMainRes
   const scenarios = parseScenarioCatalogue(acpPrd, "CP");
   const rfScenarios = parseScenarioCatalogue(rfPrd, "RF");
   const vitest = options.vitest ?? runVitestJson(root);
-  const tests = passedScenarioReferences(collectExecutableTestDeclarations(root), vitest, root);
+  const tests = passedScenarioReferences(collectExecutableTestDeclarations(root), vitest);
   const report = buildTraceabilityReport(requirements.values(), scenarios, rfScenarios, tests, vitest);
 
   if (options.writeEvidence ?? true) {

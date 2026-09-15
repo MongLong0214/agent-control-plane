@@ -33,14 +33,14 @@ const deliberate = {
     "timeout here kills the process mid-write, and the pair exists precisely because the " +
     "database must end up whole — a partial restore is the state rollback is meant to escape. " +
     "It is bounded by the operator watching it, not by a number.",
-  trace:
-    "deliberately unbounded: this is the full Vitest run behind `pnpm trace`, whose duration is " +
-    "the suite's own and grows with it. Any bound is a guess that turns a slow suite into a " +
-    "missing traceability report, and the caller is a developer or a CI job that already has a " +
-    "timeout of its own.",
 };
 
+// `src/tools/traceability.ts:477` was here too, for the full Vitest run behind `pnpm trace`. That
+// call is gone: the tool now refuses when it has no result set instead of producing one by
+// starting a second suite, because a run it starts for itself is not the run any gate judged.
+// The exclusion went with the call. The `STALE EXCLUSION` line this guard prints is what caught
+// it — an exemption outlasting its subject reads as a decision, and the next person deletes the
+// bound rather than the entry.
 export const UNBOUNDED_SUBPROCESS_EXCLUSIONS = new Map([
   ["src/deploy/rollback-pair.ts:1813", deliberate.restore],
-  ["src/tools/traceability.ts:477", deliberate.trace],
 ]);
