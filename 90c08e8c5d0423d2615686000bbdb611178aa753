@@ -1,0 +1,9 @@
+Limit: CHILD_IDENTITY_DRIFT is still a ProbeSignal nothing constructs | it needs a probe child, and synthetic mode starts none, so condition 5 now has four of its five modes producible rather than two
+Limit: the deadline bounds one message, not the run | two messages can still take twice PROBE_MESSAGE_DEADLINE_MS, and nothing here bounds the supervised window as a whole
+Limit: the successful run still reports condition 5 as ASSERTED_ONLY | that is honest -- a run that saw no failure did not exercise one -- so the negative matrix is where the coverage lives, and reading a green artifact as covering condition 5 remains the error the wording exists to prevent
+Ruled-out: classifying a busy session store from the error message text | SQLite's wording is a runtime string from someone else's library, so a classifier keyed on it measures the wording rather than the condition
+Ruled-out: deciding an ambiguous send from a duck-typed failure.kind | that is the one signal whose whole meaning is that the transport could not say, and any object carrying the field would then be read as the transport's own verdict
+Ruled-out: leaving the message loop unbounded because every error path was already terminal | a hang is not an error path: it holds the Hermes gateway paused for a supervised window with no end, which is the one cost condition 6 exists to bound
+Warn: the deadline's timer is cleared in a finally, including on the rejecting path | an un-cleared timer keeps the event loop alive and turns a clean refusal into a process that will not exit, which is the same hang one step further on
+Record-Id: r-97b8599b62c0
+Provenance: inherited c8ec453d30bf7d16299c137b95ba08a4dde6d45a
