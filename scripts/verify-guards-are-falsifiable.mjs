@@ -981,6 +981,26 @@ const GUARDS = [
     ],
   },
   {
+    // #655 condition 5 names five failure modes. Three of them — TIMEOUT, SESSION_STORAGE_BUSY
+    // and CHILD_IDENTITY_DRIFT — existed only as members of `ProbeSignal`: nothing in `src/`
+    // constructed them, and the driver's catch collapsed every non-ambiguous error to
+    // SOCKET_CLOSED. The five-signal test passed the whole time, because it measured that the
+    // classifier maps them, not that a run can reach them. This row is on the half that was
+    // missing: producing the signal, not classifying it.
+    //
+    // The mutation returns the value the old collapse returned, so it is the previous behaviour
+    // rather than a nonsense one — and the disposition is INCONCLUSIVE either way, so nothing
+    // about control flow changes. What it kills is the artifact's ability to say which failure
+    // happened, which for an acceptance-evidence issue is the whole product.
+    what: "a busy session store is named as itself rather than collapsed into a closed socket",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  if (typeof code === \"string\" && code.startsWith(\"SQLITE_BUSY\")) return \"SESSION_STORAGE_BUSY\";",
+    replace: "  if (typeof code === \"string\" && code.startsWith(\"SQLITE_BUSY\")) return \"SOCKET_CLOSED\";",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::names a busy session store as SESSION_STORAGE_BUSY and stops",
+    ],
+  },
+  {
     what: "an acceptance realm path that resolves inside production is refused",
     file: "src/acceptance/disposable-realm.ts",
     find: "    if (within(production, resolved)) {",

@@ -4,6 +4,10 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+// The real class, not a shape check. An ambiguous send is the one signal whose whole meaning is
+// "the transport could not say", and deciding that from a duck-typed `failure.kind` would let any
+// object claiming that field be read as the transport's own verdict.
+import { TelegramDeliveryError } from "../ingress/telegram-polling.ts";
 
 /**
  * A one-shot ACP instance that exists to produce acceptance evidence and then be gone.
@@ -177,6 +181,32 @@ export type ProbeDisposition = "CONTINUE" | "INCONCLUSIVE";
 
 export const classifyProbeSignal = (signal: ProbeSignal): ProbeDisposition =>
   signal === "REPLY_OBSERVED" ? "CONTINUE" : "INCONCLUSIVE";
+
+/**
+ * Which of condition 5's named failures a thrown error actually is.
+ *
+ * `classifyProbeSignal` was a total function over a set whose members nothing constructed:
+ * `SESSION_STORAGE_BUSY` and `CHILD_IDENTITY_DRIFT` appeared in this file's type and nowhere else
+ * in `src/`, and the driver's own `catch` collapsed every non-ambiguous error to `SOCKET_CLOSED`.
+ * Five signals were tested and two could occur, so the tests measured that the mapping is right
+ * rather than that the run notices.
+ *
+ * The disposition is `INCONCLUSIVE` either way, so this changes no control flow -- it changes what
+ * the evidence artifact is able to say happened, which for this issue is the deliverable.
+ *
+ * `code` and not the message: SQLite's text is a runtime string, and a classifier keyed on it
+ * would be measuring the wording of someone else's library.
+ */
+export const probeSignalForError = (error: unknown): ProbeSignal => {
+  if (error instanceof TelegramDeliveryError && error.failure.kind === "UNKNOWN") {
+    return "TELEGRAM_SEND_AMBIGUOUS";
+  }
+  const code = typeof error === "object" && error !== null && "code" in error
+    ? (error as { code?: unknown }).code
+    : undefined;
+  if (typeof code === "string" && code.startsWith("SQLITE_BUSY")) return "SESSION_STORAGE_BUSY";
+  return "SOCKET_CLOSED";
+};
 
 /**
  * A process this run started, identified by more than its number.

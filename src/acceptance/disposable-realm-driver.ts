@@ -32,6 +32,7 @@ import {
   censusProduction,
   classifyHermesContention,
   classifyProbeSignal,
+  probeSignalForError,
   hermesContentionReport,
   mayTerminate,
   planDisposableRealm,
@@ -49,6 +50,8 @@ const PROMPTS = ["synthetic probe 1", "synthetic probe 2"] as const;
 
 export type SyntheticProbeFault =
   | "AMBIGUOUS_FIRST_SEND"
+  | "FIRST_POLL_NEVER_ANSWERS"
+  | "SESSION_STORAGE_BUSY_ON_FIRST_POLL"
   | "BEFORE_CENSUS_UNOBSERVABLE"
   | "FABRICATED_REPLY"
   | "ONE_MESSAGE_ONLY"
@@ -64,7 +67,47 @@ export interface SyntheticDisposableRealmOptions {
   readonly evidenceClaim?: string;
   /** Deterministic fault injection for the negative matrix; every path stays in synthetic state. */
   readonly fault?: SyntheticProbeFault;
+  /**
+   * How long one message may take before the run reports `TIMEOUT` and stops.
+   *
+   * Exposed so the negative matrix can exercise the deadline in under a second rather than by
+   * waiting out the real one. It is a bound, never a retry interval: there is nothing after a
+   * `TIMEOUT` except the refusal.
+   */
+  readonly messageDeadlineMs?: number;
 }
+
+/** A message that took longer than this run is willing to wait. Not an error from the work. */
+export class ProbeDeadlineExceeded extends Error {
+  constructor(readonly deadlineMs: number) {
+    super(`a probe message did not settle within ${String(deadlineMs)}ms`);
+    this.name = "ProbeDeadlineExceeded";
+  }
+}
+
+/** The default bound: generous for a local synthetic realm, finite for a supervised window. */
+export const PROBE_MESSAGE_DEADLINE_MS = 120_000;
+
+/**
+ * Races a step against the deadline.
+ *
+ * The timer is cleared on every exit, including the rejecting one -- an un-cleared timer keeps the
+ * event loop alive and turns a clean refusal into a process that will not exit, which is the same
+ * hang in a different place.
+ */
+const withProbeDeadline = async <T>(work: Promise<T>, deadlineMs: number): Promise<T> => {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new ProbeDeadlineExceeded(deadlineMs)), deadlineMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+};
 
 export interface SyntheticProbeOutcome {
   readonly updateId: number;
@@ -565,6 +608,18 @@ class SyntheticTelegramTransport implements TelegramBotTransport {
         `synthetic transport expected offset ${String(expectedOffset)}, received ${String(options.offset)}`,
       );
     }
+    if (this.fault === "SESSION_STORAGE_BUSY_ON_FIRST_POLL" && this.polls === 1) {
+      // Shaped like better-sqlite3's, because that is what the driver will actually catch: the
+      // classifier reads `code`, not the message, so a test that threw a plain Error would be
+      // measuring the message text rather than the path production takes.
+      throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+    }
+    if (this.fault === "FIRST_POLL_NEVER_ANSWERS" && this.polls === 1) {
+      // Never settles. The point is that nothing else here would stop either: before this change
+      // the loop awaited `pollOnce` with no bound at all, so condition 5's first-named failure
+      // mode produced a hang rather than an INCONCLUSIVE.
+      await new Promise<never>(() => {});
+    }
     if (this.fault === "ONE_MESSAGE_ONLY" && this.#next === 1) return [];
     if (this.#next >= UPDATE_IDS.length) return [];
     const next = update(this.#next);
@@ -789,6 +844,10 @@ export const runSyntheticDisposableRealmProbe = async (
 ): Promise<Decision<SyntheticDisposableRealmEvidence>> => {
   const claim = assertEvidenceClaim(options.evidenceClaim ?? REALM_EVIDENCE_CLAIM);
   if (!claim.allowed) return claim;
+  // Below the claim check, not between it and its refusal: a falsifiability row anchors on those
+  // two lines as one block, and splitting them left the row matching nothing while the guard it
+  // names carried on working. The harness caught it; a reader would not have.
+  const messageDeadlineMs = options.messageDeadlineMs ?? PROBE_MESSAGE_DEADLINE_MS;
   const executedEvidenceSteps = new Set<string>();
 
   // The caller cannot name this path. The driver derives it from a fixed OS path and the effective
@@ -999,18 +1058,21 @@ export const runSyntheticDisposableRealmProbe = async (
     const pollCycles: SyntheticPollCycleObservation[] = [];
     for (let index = 0; index < UPDATE_IDS.length; index += 1) {
       try {
-        const cycle = await listener.service.pollOnce();
-        await listener.service.pendingTurnsSettled();
-        const settled = await cycle.settled();
+        // Bounded, because condition 5 names `timeout` first and nothing here could produce it:
+        // the loop awaited `pollOnce` with no limit, so the failure mode the safety list asks to
+        // end in INCONCLUSIVE ended in a process that never returned. A hang is the worst shape
+        // for this run in particular -- it holds the Hermes gateway paused for a supervised
+        // window that has no end, which is the one cost condition 6 is written to bound.
+        const cycle = await withProbeDeadline(listener.service.pollOnce(), messageDeadlineMs);
+        await withProbeDeadline(listener.service.pendingTurnsSettled(), messageDeadlineMs);
+        const settled = await withProbeDeadline(cycle.settled(), messageDeadlineMs);
         outcomes.push(...settled.outcomes);
         pollCycles.push({
           routeStatuses: cycle.routes.map((route) => route.status),
           settledNextOffset: settled.nextOffset,
         });
       } catch (error) {
-        const signal = error instanceof TelegramDeliveryError && error.failure.kind === "UNKNOWN"
-          ? "TELEGRAM_SEND_AMBIGUOUS"
-          : "SOCKET_CLOSED";
+        const signal = error instanceof ProbeDeadlineExceeded ? "TIMEOUT" : probeSignalForError(error);
         if (classifyProbeSignal(signal) === "INCONCLUSIVE") {
           return deny(
             ReasonCode.ACCEPTANCE_PROBE_INCONCLUSIVE,
