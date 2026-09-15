@@ -1,0 +1,6 @@
+# inherited from 29654b95, dropped by the squash merge (commitlore#1029)
+Limit: this reads a settings file, not a running child | a child started with a command-line flag that overrides its settings is outside what this census can see, and condition 3 is only as strong as the launch path staying the one the settings describe
+Limit: the two permissive modes are named rather than the two readable ones allow-listed | a mode this repository has not met falls into the same refusal as bypassPermissions, which is the safe direction and also means a future readable mode reads as unmeasured until someone adds it
+Warn: the forbidden list stays in this file on purpose | deriving it from the child's own configuration would make the census agree with whatever the child declares, which is the restatement the list's own comment warns about -- the list is ours and only the answer is the child's
+Record-Id: r-19f7e1e7312a
+Provenance: drafted
