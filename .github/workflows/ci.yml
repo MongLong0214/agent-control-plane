@@ -35,6 +35,29 @@ on:
   # leaves the same mechanism in place for the next one, with no check that would notice — which
   # is how this filter came to name a prefix used once (#857).
   pull_request:
+
+# A force-push does not cancel the run it supersedes, and that run keeps its eight macOS jobs until
+# it finishes -- on a head nobody will merge. Measured 2026-09-15, right after #943 was rebased
+# past two merges:
+#
+#     34973735898  64dd3a35  in_progress   <- the head the pull request now points at
+#     34966057871  53806331  in_progress   <- the pre-rebase head, still holding slots
+#
+# Nothing in this repository cancelled the second one; a person did. #885 measures what that costs:
+# eight macOS jobs per pull request against a supply observed between three and five concurrent,
+# and a rebase is how a conflicting pull request is *made* mergeable, so this is ordinary traffic
+# rather than an accident.
+#
+# `cancel-in-progress` is false for `push` deliberately, and that is the whole care in this block.
+# Grouping by `github.ref` puts every `main` push in one group, so a blanket `true` would cancel the
+# run a merge started as soon as the next merge landed -- and `main` runs are what the daily
+# schedule sweeps and what post-merge `traceability` reads. A cancelled run reports `cancelled`,
+# which the gate jobs below already treat as not-success, so the cost of getting this wrong is a
+# red `main` for a tree that was never tested rather than a slow queue.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # This job's id used to be `verify`, which is also the literal string branch protection
   # requires (contexts: ["verify"]). Adding the matrix below made every check GitHub reports for
