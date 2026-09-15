@@ -1,0 +1,24 @@
+Limit: pnpm install --frozen-lockfile has never run on ubuntu in this repository | the only other ubuntu job that touches the tree runs a node script straight after checkout with no install, so the Linux install path is unproven and this job is where a platform-specific resolution would surface first
+Limit: the happy trace path was not exercised locally | the machine's one failing test (#895's PATH drift, now 2.1.271) means no passing result set can be produced here, so what was measured is that the supplied file is read and parsed and that a failing set is refused
+Ruled-out: keeping the second suite run as a convenience for a bare pnpm trace | a run this tool starts is not the run any gate judged, so its report was a claim about an execution nobody looked at, and the prepush manifest already records that reasoning as the reason trace is not a pre-push gate
+Ruled-out: moving the job while leaving the fallback in place because CI arranges never to take it | should-not-run is the wrong footing for a platform where the suite it would start cannot pass, which is the condition the workflow comment itself set
+Warn: pnpm trace rewrites evidence/traceability.json and .md as a side effect of being run | running it locally against a failing suite left regenerated artifacts staged, and committing those would have put a coverage claim derived from a red run into the repository; they were restored, and a reader who runs trace locally must check git status before committing
+Record-Id: r-a94c1602c76d
+Provenance: inherited ac00efcb9f1b850128a4974f5c6d57ff85a28ca7
+
+Limit: one exclusion remains and this census still does not mean a bounded codebase | the guard says so itself in its own PASS line, and the remaining entry is the rollback database restore, which is bounded by the operator watching it
+Warn: deleting a subprocess call leaves its exclusion entry naming nothing | the guard prints STALE EXCLUSION and fails, which is the right direction -- an exemption that outlasts its subject reads as a decision, and the next person removes the bound rather than the entry
+Record-Id: r-6ec5aa7b1874
+Provenance: inherited e2cff3c41a9bd0e1967b06fe29c29271c80825e0
+
+Limit: removing the pin changes where a developer's store lives and the first install after this pays for it once | measured as Already up to date here because node_modules survived, but a clean checkout re-downloads
+Limit: the ubuntu install itself is still unmeasured locally | this machine is macOS, so what was checked is that the default location works here and that nothing referenced the removed value; the Linux half is answered by CI and by the consumer repository that clones this one
+Warn: a setting only unreachable code paths read is not a correct setting | every job that installs in this repository is macOS, so a macOS-only store path passed for as long as nothing installed anywhere else; the first job to install on ubuntu died before reaching a step of its own
+Record-Id: r-743f72ec6360
+Provenance: inherited 33b669e5fb1b1a9d1350060a4199e74270d6729f
+
+Limit: the suffix match is against the declarations this run found, so a result file the run does not declare stays unmatched | that is the closed direction, and it means a renamed test file reads as missing coverage rather than as a wrong match
+Warn: this failure needs two machines to appear | a same-platform job hid it completely, and when it does appear it says nothing about the code under test -- requirementsWithGaps went to 22, every requirement in the PRD, from a suite that had passed
+Warn: my first version of the negative case used a different file name, so a comparison as loose as ends-with-the-basename passed it | the case that kills that mutant needs the same basename in a different directory, which is the shape a wrong implementation has rather than the shape I expected
+Record-Id: r-447b818309cd
+Provenance: inherited 75d86855abc2310fa2d46a6f87c177f5db0d411c
