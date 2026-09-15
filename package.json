@@ -46,6 +46,7 @@
     "native:fd-vfs:build": "node scripts/build-native-fd-vfs.mjs",
     "hooks:check": "node scripts/verify-hooks-are-installed.mjs",
     "hooks:install": "node scripts/install-hooks.mjs",
+    "notes:fetch": "node scripts/fetch-commitlore-notes.mjs",
     "trailers": "node scripts/verify-trailers-are-parsable.mjs",
     "merge-records": "node scripts/verify-merge-preserved-records.mjs",
     "merge": "node scripts/merge-pr.mjs",

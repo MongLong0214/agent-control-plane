@@ -146,4 +146,33 @@ export const RECURRING_DEFECTS: readonly RecurringDefect[] = [
     // through its message or through the notes mirror, since the sanctioned path puts them there.
     guard: "merge-records",
   },
+  {
+    id: "a-record-a-note-carries-reported-as-lost",
+    what:
+      "A gate that asks whether a record survived reads only the commit message, while the " +
+      "repair this repository sanctions for a squash merge attaches the record to the commit as " +
+      "a note. The gate then reports a preserved record as lost, and the refusal cannot be acted " +
+      "on: the message is pushed history.",
+    occurrences: [
+      {
+        at: "2026-09-12",
+        where: ".github/workflows/ci.yml",
+        evidence:
+          "573f7eab (the #867 squash) carries eleven record-trailer lines, of which git parses " +
+          "three; commitlore-preserve had attached the rest as notes. It turned two green pull " +
+          "requests red at once, for a commit neither of them authored. Answered by narrowing " +
+          "ACP_TRAILERS_RANGE to base.sha..head.sha, which moved the range and left the question.",
+      },
+      {
+        at: "2026-09-15",
+        where: "scripts/verify-trailers-are-parsable.mjs",
+        evidence:
+          "8b38c9d6 on main lost four record lines to the squash, and `git notes --ref=commitlore " +
+          "show 8b38c9d6` returns all four. `pnpm trailers HEAD~1..HEAD` failed on both matrix " +
+          "legs. The range is already the narrowest one there is, so the answer used in #867 does " +
+          "not exist here.",
+      },
+    ],
+    guard: "trailers",
+  },
 ];

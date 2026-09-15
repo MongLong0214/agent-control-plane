@@ -130,6 +130,13 @@ jobs:
       # notes -- so the only thing the failure established was that the range was wrong.
       #
       # `base.sha..head.sha` is the pull request's own commits and nothing else.
+      #
+      # And the notes ref below, because `pnpm trailers` reads both places a record can be stored. A
+      # squash merge strands the branch's earlier records mid-message and `commitlore-preserve`
+      # attaches them to the merge commit as a note; a checkout that never fetched that ref cannot
+      # tell a preserved record from a lost one, and the gate refuses rather than guess. `checkout`
+      # does not bring notes refs down, `fetch-depth: 0` or not.
+      - run: pnpm notes:fetch
       - run: pnpm gates
         env:
           ACP_TRAILERS_RANGE: ${{ github.event.pull_request.base.sha && format('{0}..{1}', github.event.pull_request.base.sha, github.event.pull_request.head.sha) || 'HEAD~1..HEAD' }}
