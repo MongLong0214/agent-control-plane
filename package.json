@@ -57,6 +57,7 @@
     "guards:operands": "node scripts/verify-refusal-operands-are-watched.mjs",
     "guards:recurrence": "node scripts/verify-recurrence-is-guarded.mjs",
     "guards:subprocess-bounds": "node scripts/verify-subprocess-calls-are-bounded.mjs",
+    "guards:union-members": "node scripts/verify-union-members-are-constructed.mjs",
     "guards:child-budgets": "node scripts/verify-child-budgets-fit-their-cases.mjs",
     "guards:timestamp-orderings": "node scripts/verify-timestamp-orderings-are-total.mjs",
     "guards:new-inode-exec": "node scripts/verify-tests-do-not-exec-new-inodes.mjs",

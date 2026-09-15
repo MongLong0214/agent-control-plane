@@ -475,6 +475,15 @@ const GUARDS = [
     //
     // The mutation is exactly the old behaviour, not a nonsense value, because the old behaviour
     // is what was wrong — and it produced a digest that looked entirely plausible in every row.
+    //
+    // #858 briefly moved this source to `canonicalTurnTarget` and moved the row with it. CI
+    // refused: `a-turn-claim-outlives-the-process-that-made-it` pins the fence against the CEO
+    // generation the binding registry held, which is what #639 named, and reading it off whichever
+    // actor will answer is a different fact wearing the same digest. The source is back and so is
+    // this row. Measured on the live database, `bindings.active("CEO")` is null there — its one
+    // assignment was revoked at generation 1 — so the fence is still the constant this option was
+    // made required to stop being. That gap is real, and substituting another actor's generation
+    // would hide it rather than close it.
     what: "the claim's binding digest names the CEO generation that asked the turn",
     file: "src/ingress/telegram-polling.ts",
     find: "    bindingGeneration: () => cp.bindings.active(roleKeyFor(Role.CEO))?.bindingGeneration ?? null,",
@@ -1022,6 +1031,24 @@ const GUARDS = [
     replace: "  return independentOccurrences(defect) >= 3 ? \"RECURRED_UNGUARDED\" : \"OBSERVED_ONCE\";",
     killedBy: [
       "tests/unit/a-defect-that-recurs-earns-a-gate.test.ts::two occurrences on different surfaces make a guard mandatory",
+    ],
+  },
+  {
+    // #655 condition 3 refuses to start a run whose probe child's tool surface was never measured,
+    // and until now nothing could measure it — `assertProbeToolsMeasuredOff` had no producer, so
+    // the condition was reachable only as `ASSERTED_ONLY`.
+    //
+    // The census reads the child's own settings, and `permissions.defaultMode` is the whole of why
+    // it is not a restatement of the forbidden list. Claude Code's `bypassPermissions` grants
+    // without consulting `deny`, so a census that trusted the list under that mode would report
+    // "bash: off" about a child that can call it — the safe-sounding answer, and wrong. The
+    // mutation is exactly that: believe the list whatever the mode.
+    what: "a permission mode that grants without consulting the lists yields no tool census at all",
+    file: "src/acceptance/disposable-realm.ts",
+    find: '  if (mode !== "default" && mode !== "plan") {',
+    replace: "  if (false) {",
+    killedBy: [
+      "tests/unit/disposable-realm.test.ts::names nothing at all under a mode that grants without consulting the lists",
     ],
   },
   {

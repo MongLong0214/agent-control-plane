@@ -233,6 +233,24 @@ export class TelegramIngress {
     });
   }
 
+  /**
+   * The exact payload this ingress admits an update under -- and therefore the only payload a
+   * later claim of that (channel, nonce) can present.
+   *
+   * Public because the canonical bridge (#858) has to name it. `claim()` compares a source's
+   * payload digest against the one `INGRESS_ADMITTED` recorded, and the raw `TelegramUpdate` is
+   * not that payload: admission digests `messagePayload(update)`, which carries only the text and
+   * the message id. A bridge that passed the update itself was refused with
+   * `CONVERSATION_TURN_SOURCE_PAYLOAD_MISMATCH` on every message, in every deployment, and no
+   * test saw it because the bridge's refusal is deliberately invisible to the reply path.
+   *
+   * Read from here rather than rebuilt at the call site: a second spelling of "what was admitted"
+   * is how the two come to disagree, and the disagreement is silent by construction.
+   */
+  admittedPayloadFor(update: TelegramUpdate): Record<string, unknown> {
+    return this.messagePayload(update);
+  }
+
   private messagePayload(update: TelegramUpdate): Record<string, unknown> {
     const message = update.message;
     return {

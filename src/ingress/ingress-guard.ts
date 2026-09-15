@@ -237,15 +237,20 @@ export class IngressGuard {
    * claim remains safely UNKNOWN rather than being retrofitted to an ambiguous target later.
    */
   readonly #receiptIdentityForClaim: ((identity: TurnIdentity) => ReceiptLookupQuery | null) | null;
+  readonly #canonicalTargetForClaim: ((identity: TurnIdentity) => ReceiptLookupQuery | null) | null;
 
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
     private readonly audit: AuditLog,
     private readonly policies: Readonly<Record<string, IngressPolicy>>,
-    options: { receiptIdentityForClaim?: (identity: TurnIdentity) => ReceiptLookupQuery | null } = {},
+    options: {
+      receiptIdentityForClaim?: (identity: TurnIdentity) => ReceiptLookupQuery | null;
+      canonicalTargetForClaim?: (identity: TurnIdentity) => ReceiptLookupQuery | null;
+    } = {},
   ) {
     this.#receiptIdentityForClaim = options.receiptIdentityForClaim ?? null;
+    this.#canonicalTargetForClaim = options.canonicalTargetForClaim ?? null;
     const nonceTtlMsByChannel: Record<string, number> = {};
     for (const [channel, policy] of Object.entries(policies)) {
       if (policy.allowedActors.length === 0) {
@@ -539,6 +544,26 @@ export class IngressGuard {
   }
 
   /**
+   * Reads back the canonical-ledger target this claim was admitted against. Re-validated against
+   * the claim's own identity rather than trusted as stored: a row rewritten by hand, or written by
+   * a build whose resolver named a different generation, must read as absent rather than as a
+   * target. Absent is the honest answer and the one the bridge fails closed on.
+   */
+  canonicalTargetForClaim(channel: string, nonce: string): ReceiptLookupQuery | null {
+    const row = this.db.get<{ turn_claim_json: string | null }>(
+      `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+      [channel, nonce],
+    );
+    if (!row?.turn_claim_json) return null;
+    try {
+      const claim = JSON.parse(row.turn_claim_json) as TurnClaim;
+      return isBoundCanonicalTarget(claim.canonicalTarget ?? null, claim) ? claim.canonicalTarget! : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Atomically writes the only no-reply completion an authenticated terminal receipt can support
    * today. The coordinator owns receipt lookup and calls this only after its sealed port matched
    * every field. This guard still re-reads the persisted identity: a receipt for a different
@@ -698,10 +723,23 @@ export class IngressGuard {
         // dispatch and restart, and a receipt from the replacement runtime is not evidence about
         // this turn. Invalid/absent input is intentionally omitted, leaving the claim UNKNOWN.
         const receiptIdentity = this.#receiptIdentityForClaim?.(identity) ?? null;
+        // The canonical ledger's target, decided here for the same reason the receipt identity is:
+        // a later reader must not re-ask a live binding that can fail over in between. It is a
+        // second field rather than a widening of `receiptIdentity`, because the two answer
+        // different questions -- `receiptIdentity` names a Hermes target whose signed receipt can
+        // settle this turn, and this names whichever actor `claim()` would admit, whatever its
+        // executor kind or attestation protocol. Folding them together would let the reconcile
+        // path ask a `claude-cli` target for a `hermes.target-bind/v1` receipt it can never have.
+        //
+        // And a separate validator, for the same reason one step further in: sharing
+        // `isBoundReceiptIdentity` would have tied this target's generation to `bindingDigest`,
+        // which is a different fact about a different actor. See `isBoundCanonicalTarget`.
+        const canonicalTarget = this.#canonicalTargetForClaim?.(identity) ?? null;
         const claim: TurnClaim = {
           deliveryStatus: TURN_CLAIMED,
           ...identity,
           ...(isBoundReceiptIdentity(receiptIdentity, identity) ? { receiptIdentity } : {}),
+          ...(isBoundCanonicalTarget(canonicalTarget, identity) ? { canonicalTarget } : {}),
         };
         const updated = this.db.run(
           `UPDATE inbound_messages SET turn_claim_json = ?
@@ -1503,6 +1541,13 @@ export interface TurnClaim extends TurnIdentity {
    * Absent rows predate an authenticated target and fail closed during reconciliation.
    */
   receiptIdentity?: ReceiptLookupQuery;
+  /**
+   * The actor the canonical ledger names for this turn, decided at the same durable write. Shares
+   * `ReceiptLookupQuery`'s shape because it carries the same tuple, and is a separate field
+   * because it answers a different question -- see `claimTurn`. Absent rows predate the canonical
+   * bridge and leave it with nothing to name, which is the closed direction.
+   */
+  canonicalTarget?: ReceiptLookupQuery;
   repliedAt?: string;
   noReplyAt?: string;
   settledAt?: string;
@@ -1602,6 +1647,43 @@ const isBoundReceiptIdentity = (
     && typeof query.targetAttestationId === "string" && query.targetAttestationId.trim().length > 0
     && typeof query.executorSessionId === "string" && query.executorSessionId.trim().length > 0
     && typeof query.executorSessionIncarnation === "string" && query.executorSessionIncarnation.trim().length > 0;
+};
+
+/**
+ * The canonical target's own check, which is `isBoundReceiptIdentity` minus one condition.
+ *
+ * That one condition is the whole reason this exists. `isBoundReceiptIdentity` requires
+ * `identity.bindingDigest === digestOf({ bindingGeneration: query.bindingGeneration })`, which is
+ * right for a Hermes receipt identity -- it and the fence both speak for the CEO generation that
+ * asked the turn. The canonical target does not: it names whichever actor `claim()` would admit,
+ * and that actor's generation is its own fact. Tying the two together does not validate the
+ * target; it silently redefines `bindingDigest`, which is #639's fence, as something else.
+ *
+ * Found in CI rather than by reading: `a-turn-claim-outlives-the-process-that-made-it` pins the
+ * fence against the CEO generation the binding registry held, and it failed the moment the two
+ * were coupled. The test was right.
+ *
+ * Everything else is kept. The tuple still has to belong to *this* turn, and every field still has
+ * to be a non-empty string, because a stored row is read back by a later process that cannot ask
+ * where it came from.
+ */
+const isBoundCanonicalTarget = (
+  value: unknown,
+  identity: TurnIdentity,
+): value is ReceiptLookupQuery => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const query = value as Partial<ReceiptLookupQuery>;
+  return query.turnRequestId === identity.turnRequestId
+    && query.promptDigest === identity.promptDigest
+    && typeof query.targetActorId === "string" && query.targetActorId.trim().length > 0
+    && typeof query.bindingGeneration === "number"
+    && Number.isSafeInteger(query.bindingGeneration)
+    && query.bindingGeneration > 0
+    && typeof query.targetBindingId === "string" && query.targetBindingId.trim().length > 0
+    && typeof query.targetAttestationId === "string" && query.targetAttestationId.trim().length > 0
+    && typeof query.executorSessionId === "string" && query.executorSessionId.trim().length > 0
+    && typeof query.executorSessionIncarnation === "string"
+    && query.executorSessionIncarnation.trim().length > 0;
 };
 
 /** Neither a stored row nor its caller may substitute one authenticated target tuple for another. */
