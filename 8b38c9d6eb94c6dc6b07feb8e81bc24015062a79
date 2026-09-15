@@ -1,0 +1,6 @@
+# inherited from ed5f941b, dropped by the squash merge (commitlore#1029)
+Limit: a name resolving is not a guard working | this asks whether anything stands where a note used to, and the falsifiability sweep is what asks whether the thing that stands can fail; an entry can name a real script that refuses nothing
+Limit: independence is judged by the `where` string an entry writes | two genuinely different surfaces spelled the same read as one occurrence, and the check cannot tell a careless spelling from a real repeat
+Warn: the pre-push receipt is per-checkout and lives in the git directory | a fresh clone starts with none, which reads as not-run and costs a re-run rather than a wrong pass, and a receipt for a commit that is no longer HEAD is removed rather than left to be read as a skip
+Record-Id: r-f87bfdc00cec
+Provenance: drafted
