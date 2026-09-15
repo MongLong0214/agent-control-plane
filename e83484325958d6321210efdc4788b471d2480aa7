@@ -1,0 +1,16 @@
+# inherited from 60d03ff3, dropped by the squash merge (commitlore#1029)
+Limit: the agnostic resolver refuses when two actors are admissible rather than taking the newest | nothing in this deployment produces two, so only the fixture reaches that refusal and production has never exercised it
+Limit: the bridge's refusal stays invisible to the owner and to any log | that is deliberate, and it is also why both defects survived review: the only thing that can see this bridge fail is a test that asserts the row
+Ruled-out: folding the canonical target into the Hermes receipt identity | it would let the reconcile path ask a claude-cli target for a hermes.target-bind/v1 receipt it can never have
+Ruled-out: resolving the canonical target when the turn is materialized rather than when it is claimed | a later reader must not re-ask a live binding that can fail over in between
+Warn: bindingGeneration and canonicalTargetForClaim must resolve from one query | isBoundReceiptIdentity only stores a target whose generation reproduces the identity's bindingDigest, so if the two ever name different generations the canonical target is dropped as an absent optional field with no error anywhere
+Record-Id: r-4ba08498831e
+Provenance: drafted
+# inherited from de9b6fb0, dropped by the squash merge (commitlore#1029)
+Limit: 이 브리지는 verified target 이 있을 때만 canonical 행을 만든다 — 픽스처는 Hermes CEO 를 바인딩하지 않으므로 테스트는 라우터가 넘기는 것까지만 측정하고 행의 존재는 측정하지 않는다
+Warn: 라우터의 응답 경로를 이 결과로 분기시키지 마라 — 실패는 오늘과 같은 상태이고, 분기시키면 소유자가 조치할 수 없는 원장을 말하게 되어 가산적 변경이 해를 끼칠 수 있는 변경이 된다
+Blast: module
+Certainty: firm
+Record-Id: r-067839cd8295
+Evidence: src/ingress/telegram-router.ts
+Provenance: drafted
