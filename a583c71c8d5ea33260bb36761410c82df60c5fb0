@@ -1,0 +1,11 @@
+Limit: cancel-in-progress must stay false for push: grouping by github.ref puts every main push in one group, and a cancelled run reads as not-success to both gate jobs, so a blanket true costs a red main over a tree nothing tested
+Limit: one observation, not a rate: how often a rebase happens per merged pull request is unmeasured, so what this returns to the queue is 8 jobs per superseded run and not a percentage
+Ruled-out: cancel-in-progress: true without a condition | it cancels the main run a merge started as soon as the next merge lands
+Ruled-out: grouping by github.workflow alone | every open pull request shares one slot and the newest push cancels whichever other one was running
+Ruled-out: parsing the workflow as YAML in the test | this repository ships no YAML parser, and adding a dependency to assert three lines is the worse trade
+Warn: the dangerous edit here is not deleting the block but changing its condition; the three cases distinguish specific wrong values rather than the key's presence
+Blast: system
+Undo: easy
+Certainty: firm
+Record-Id: r-63fb7686e9ac
+Provenance: inherited 9f925c15ff0038fa9c6cb5bab22b140fd28555e9
