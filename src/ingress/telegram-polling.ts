@@ -1255,6 +1255,32 @@ export const startTelegramLongPollListener = async (
   const router = new TelegramHermesRouter({
     ingress,
     hermes,
+    // #858's missing writer. `canonical_turns` has one writer -- `claim()` -- and no production
+    // caller, so the ledger stayed empty while `inbound_messages.turn_claim_json` held the turn.
+    // Assembled here because this is the only place that sees both the router's narrow port and
+    // the control plane; the router never receives the ControlPlane, and that seal is kept.
+    //
+    // The target identity is not derived again: the guard stored it beside the claim, so reading
+    // it back is reading what was already decided rather than asking the live binding a second
+    // time -- a binding that can fail over between the claim and this call.
+    materializeTurn: ({ channel, nonce, prompt, payload }) => {
+      const query = guard.receiptIdentityForClaim(channel, nonce);
+      if (!query) {
+        return deny(
+          ReasonCode.CONVERSATION_TARGET_UNVERIFIED,
+          "the claim carries no receipt identity, so no canonical turn can name a target",
+          { channel, nonce },
+        );
+      }
+      const claimed = cp.conversation.claim({
+        targetActorId: query.targetActorId,
+        prompt,
+        sources: [{ channel, nonce, attempt: 1, payload }],
+      });
+      return claimed.allowed
+        ? allow(ReasonCode.OK, undefined)
+        : deny(claimed.reasonCode, claimed.message, claimed.evidence);
+    },
     // Contract 1's fourth field, read from the live binding at claim time rather than captured
     // once here: a generation that advances while this listener is up (a handoff, a rebind) has
     // to reach the next turn's claim, and a value closed over at construction never would.
