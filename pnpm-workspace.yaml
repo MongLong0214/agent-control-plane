@@ -1,4 +1,18 @@
 allowBuilds:
   better-sqlite3: true
   esbuild: true
-storeDir: /private/tmp/acp-717-pnpm-store/v11
+# No `storeDir`. It carried `/private/tmp/acp-717-pnpm-store/v11` -- one developer's scratch path,
+# committed. Nothing referenced it, `#717` is a Telegram ingress issue with no bearing on package
+# storage, and the name is the worktree that happened to be checked out when the line was written.
+#
+# Two things were wrong with it. `/private/tmp` is recreated at boot on macOS, so the store was
+# discarded on every restart and the next install paid for a full re-download. And `/private`
+# cannot be created on Linux without root: every job that runs `pnpm install` in this repository
+# is macOS today, so the line was unreachable rather than correct, and the first job to install on
+# ubuntu dies with `EACCES: permission denied, mkdir '/private'` before it reaches a step of its own.
+#
+# That first job is the one this branch moves. It also breaks any consumer that clones this
+# repository and installs -- `MongLong0214/repo-factory` does exactly that, pinned to a commit, and
+# its CI failed in 21 seconds on this line.
+#
+# The default store location is per-platform and correct on all of them.
