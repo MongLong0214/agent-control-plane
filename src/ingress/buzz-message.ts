@@ -742,14 +742,38 @@ export const deliverBuzzMessage = async (
 ): Promise<Decision<BuzzMessageAnswer>> => {
   const admission = admitBuzzMessage(ingress, port, input);
   if (!admission.allowed) return admission as Decision<BuzzMessageAnswer>;
-  // Returning here is also where the canonical bridge below stops, and that is a decision rather
-  // than an oversight. `canonical_turns` carries `UNIQUE INDEX … ON (target_actor_id) WHERE
-  // lifecycle_state = 'IN_DOUBT'` -- one unresolved turn per target -- and `canonicalTurnTarget`
-  // resolves one actor for the whole deployment. A role-addressed message bridged the same way
-  // would take that single slot and block the CEO's next turn, for a message that was never the
-  // canonical conversation's. It is a different thing too: this route writes a durable outbox row
-  // for whoever holds the role and waits on nothing. Whoever adds the next ingress route decides
-  // again rather than inheriting this.
+  // Returning here is also where the canonical bridge below stops. That is a decision, it was
+  // reviewed on #858 on 2026-09-16, and the reason it carried when it was first written was the
+  // weaker half of the real one -- so the real one is here, because the next person to read this
+  // will be someone deciding whether to bridge this route.
+  //
+  // The two branches differ in what they promise the sender, and their return values say it:
+  //
+  //     CEO    deliverToCeo, waits, the answer comes back down the same connection.
+  //            `ReasonCode.OK` on this surface means "the addressed peer answered".
+  //     ROLE   enqueueOwnerMessage -> wakeRole -> returns now, with
+  //            `UNTRUSTED_CONTENT_IS_DATA`, `answeredByCeo: false`, and "stored for the role".
+  //
+  // The role route's reply is discharged at enqueue. Nobody is waiting on it, and the holder's
+  // later work is not a reply to the sender. A canonical turn is a conversation the target is
+  // *running*: `prompt_digest` is frozen at claim so a receipt can be matched against the exact
+  // thing the target was asked, and `TurnPermit.issuance` signs over that. An outbox row has no
+  // such correspondence -- it is a work item, claimed and completed by whoever holds a role then.
+  //
+  // And the constraint would collide rather than constrain. `canonical_turns` carries
+  // `UNIQUE INDEX ... ON (target_actor_id) WHERE lifecycle_state = 'IN_DOUBT'`, and
+  // `canonicalTurnTarget` resolves one actor for the whole deployment, so bridging here would
+  // serialise **work items against conversation turns**: one queued CTO message would hold the
+  // conversation's only slot until an operator ran CONVERSATION_RESOLVE. Two unrelated lifecycles
+  // in one row, which this repository has paid for before.
+  //
+  // Ruled out on the way here, both worse: settling a completed hand-over through
+  // `resolveInDoubt`'s abort-shaped record (a ledger that files completions as aborts is worse
+  // than one with no row), and minting a new outcome kind for "handed over and completed" (honest,
+  // and a contract widened on the strength of one deployment's traffic shape).
+  //
+  // Whoever adds the next ingress route decides again rather than inheriting this. The question to
+  // ask is the one above: does the sender wait for what the target produces?
   if (admission.value.kind === "ROLE") return queuedForRole(port, admission.value);
 
   const admitted = admission.value.admitted;
