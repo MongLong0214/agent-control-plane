@@ -112,4 +112,38 @@ export const RECURRING_DEFECTS: readonly RecurringDefect[] = [
     ],
     guard: ".githooks/pre-push",
   },
+  {
+    id: "merged-without-preserving-the-branchs-records",
+    what:
+      "A pull request is squash-merged with a tool that does not call `commitlore squash-preserve`, " +
+      "and git stores only the last paragraph -- so every earlier commit's records are dropped by " +
+      "the merge itself, on a `main` that must not be rewritten. The merge commit is composed on " +
+      "GitHub's servers, where no hook in this repository runs.",
+    occurrences: [
+      {
+        at: "2026-08-22",
+        where: "scripts/merge-pr.mjs",
+        evidence:
+          "That script's own header records three merges measured at the time: 8ab3342 kept 3 of " +
+          "19 record lines, 108ab1a 0 of 30, 74c37fa 0 of 83. `commitlore squash-preserve` " +
+          "existed and was not called.",
+      },
+      {
+        at: "2026-09-15",
+        where: "scripts/verify-merge-preserved-records.mjs",
+        evidence:
+          "Twelve merges went through `gh pr merge --squash`. The three multi-commit branches lost " +
+          "4, 4 and 9 record lines (#937, #935, #932), and the `CommitLore squash inheritance` " +
+          "action reported success with records=0 on each -- its 'already carried' test searches " +
+          "the message text while git will not store the line (MongLong0214/commitlore#1029). " +
+          "`pnpm trailers` went red only because the dropped lines happened to remain in the text.",
+      },
+    ],
+    // Not `pnpm merge`: `merge-pr.mjs` already records that nothing forces a merge through it and
+    // `gh pr merge` still works (0da07459). A guard naming a path an author can simply not take is
+    // the shape this file's header refuses. What refuses the *outcome* is the check below, which
+    // asks whether every record line the branch carried is reachable from the merge commit --
+    // through its message or through the notes mirror, since the sanctioned path puts them there.
+    guard: "merge-records",
+  },
 ];
