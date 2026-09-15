@@ -1,0 +1,11 @@
+Limit: COMPLETED stays inert: reconcileUnresolved's fact 2 refuses every COMPLETED receipt because nothing wired to canonical_turns can discharge the reply obligation atomically, so this makes ABORTED settlements real and nothing else
+Limit: the bridge was on the one channel that has never delivered anything, so the fix is per-route and the next ingress route added will need its own
+Ruled-out: rebuilding the admitted payload at the bridge | claim() compares a source's digest against what INGRESS_ADMITTED recorded, and the Telegram bridge was refused on every message for passing the raw envelope instead
+Ruled-out: branching on the bridge's result | a refusal leaves exactly today's state, so failing can only fail to improve, and surfacing it would name a ledger the owner cannot act on
+Ruled-out: retargeting the CEO binding's assignment in the fixture | BINDING_IDENTITY_IMMUTABLE refuses the UPDATE, and production's one admissible attestation is not on the CEO role anyway
+Warn: IngressGuard stores a claim's canonical target only when constructed with a resolver; a composition that adds the bridge without it is a writer that cannot write, and its refusal is invisible to the reply path
+Blast: system
+Undo: easy
+Certainty: firm
+Record-Id: r-6aa7309297b9
+Provenance: inherited 955d2579e95bf686ed219f7edd7d566bef199418
