@@ -76,6 +76,11 @@ export const GATES = [
   // probe existed twice, one copy bounded at 5s and one not, under a comment declaring them
   // equivalent. This gate is what makes the next unbounded copy arrive loudly.
   { script: "guards:subprocess-bounds" },
+  // A member of a watched string-literal union that nothing in `src/` constructs. Measured
+  // three times in one file on 2026-09-15: the type compiled, the switch was exhaustive, the
+  // test walked every member, and three of them named states no run could enter. `tsc` cannot
+  // see it, because constructing a member is not required to satisfy a type.
+  { script: "guards:union-members" },
   // #872 — a bounded child's budget fires before the case containing it times out. The sibling gate
   // above proves a `timeout` is stated; it deliberately never reads the value. That leaves the
   // shape this one catches: the helper's 55s default sitting inside a case that declares 20s, where
