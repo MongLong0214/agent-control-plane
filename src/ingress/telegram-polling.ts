@@ -92,6 +92,17 @@ export type TelegramDeliveryFailure =
     retryAfterSeconds: null;
   }
   | {
+    /**
+     * This bot already has another consumer. Not a transport fault and not this request's fault:
+     * a second long-poll listener or a webhook is holding the same update stream.
+     */
+    kind: "EXCLUSIVITY_LOST";
+    statusCode: number;
+    description: string;
+    migrateToChatId: null;
+    retryAfterSeconds: null;
+  }
+  | {
     kind: "RETRYABLE";
     statusCode: number;
     description: string | null;
@@ -125,6 +136,7 @@ type TelegramDeliveryPolicy = {
  */
 const TELEGRAM_DELIVERY_POLICY = {
   PERMANENT_REJECTION: { reply: "SETTLE", batch: "ADVANCE" },
+  EXCLUSIVITY_LOST: { reply: "RELEASE", batch: "STOP" },
   RETRYABLE: { reply: "RELEASE", batch: "HOLD_OFFSET" },
   GLOBAL_REJECTION: { reply: "RELEASE", batch: "HOLD_OFFSET" },
   UNKNOWN: { reply: "SETTLE", batch: "STOP" },
@@ -219,6 +231,28 @@ const rejectedDeliveryFailure = (
     };
   }
 
+  // Telegram answers `getUpdates` with 409 `Conflict: ...` when this bot already has another
+  // consumer -- a second long-poll listener, or an active webhook. There is no partial version of
+  // that condition: two consumers split one update stream between them and each silently misses
+  // whatever the other took. Retrying is the wrong answer twice over. Waiting never makes the bot
+  // exclusive, and every win of the race takes an update away from the other session, which is
+  // the sharing this deployment forbids rather than an outage it is riding out.
+  //
+  // Keyed on the description as well as the status, for the same reason the branch below is: this
+  // module's rule is that status alone cannot establish scope, and 409 is a generic conflict code.
+  // Telegram's two conflict descriptions both begin with `Conflict: `; an unrecognised 409 keeps
+  // its old retrying classification rather than stopping the daemon on a guess.
+  const conflictDescription = telegramDescription(payload);
+  if (statusCode === 409 && conflictDescription !== null && conflictDescription.startsWith("Conflict: ")) {
+    return {
+      kind: "EXCLUSIVITY_LOST",
+      statusCode,
+      description: conflictDescription,
+      migrateToChatId: null,
+      retryAfterSeconds: null,
+    };
+  }
+
   // Status alone cannot establish scope: the self-hosted Bot API uses 421 for a token-range
   // configuration fault. Terminalize only descriptions that identify this request or destination.
   if (statusCode >= 400 && statusCode < 500 && isTelegramRequestLocalRejection(payload)) {
@@ -262,7 +296,7 @@ export type TelegramLongPollRuntimeStatus =
   | { running: true; stopReason: null; recoveryNonce: null }
   | {
     running: false;
-    stopReason: "NOT_STARTED" | "UNKNOWN_DELIVERY" | "CLOSED";
+    stopReason: "NOT_STARTED" | "UNKNOWN_DELIVERY" | "BOT_NOT_EXCLUSIVE" | "CLOSED";
     recoveryNonce: string | null;
   };
 
@@ -756,6 +790,30 @@ export class TelegramLongPollService {
     }, persisted.evidence);
   }
 
+  /**
+   * The only place exclusivity can be observed. Telegram reports the second consumer to whoever
+   * calls `getUpdates`, so this wrapper is where a shared bot stops being a repeating error in the
+   * log and becomes a refusal: the listener stops and cannot be resumed by acknowledgement, since
+   * no nonce is recorded and `resumeAfterAcknowledgement` matches on one. Getting the daemon back
+   * means removing the other consumer, which is an operator act, not a retry.
+   */
+  private async receiveUpdates(options: TelegramGetUpdatesOptions): Promise<readonly TelegramUpdate[]> {
+    try {
+      return await this.transport.getUpdates(options);
+    } catch (error) {
+      if (error instanceof TelegramDeliveryError && error.failure.kind === "EXCLUSIVITY_LOST") {
+        this.#terminalDeliveryError = error;
+        this.#running = false;
+        this.options.onRuntimeStatus?.({
+          running: false,
+          stopReason: "BOT_NOT_EXCLUSIVE",
+          recoveryNonce: null,
+        });
+      }
+      throw error;
+    }
+  }
+
   async pollOnce(): Promise<TelegramPollCycle> {
     if (this.#terminalDeliveryError) throw this.#terminalDeliveryError;
 
@@ -764,7 +822,7 @@ export class TelegramLongPollService {
     // undeliverable prompt — a denied `sendOwnerPromptIfNeeded`, a Telegram 5xx — threw past
     // `getUpdates` and stopped every inbound command, including the reply that would have
     // resolved the run whose prompt could not be sent.
-    const updates = await this.transport.getUpdates({
+    const updates = await this.receiveUpdates({
       ...(this.#offset === undefined ? {} : { offset: this.#offset }),
       timeoutSeconds: this.options.pollTimeoutSeconds ?? 50,
       signal: this.#controller?.signal,
