@@ -2056,6 +2056,53 @@ describe("#858 the Buzz route writes the canonical ledger too", () => {
     }
   });
 
+  it("does not open a canonical turn for a role-addressed message", async () => {
+    // #858, decided 2026-09-16: `canonical_turns` is the ledger of conversation turns, and a role
+    // message is not one. The sender is answered at enqueue -- `UNTRUSTED_CONTENT_IS_DATA`,
+    // `answeredByCeo: false`, "stored for the role" -- so nobody waits on what the holder later
+    // does, and there is no frozen `prompt_digest` for a receipt to be matched against.
+    //
+    // The comment beside `queuedForRole` carries the reasoning. This is what makes it a decision
+    // rather than a preference: bridging that route would serialise work items against
+    // conversation turns through `(target_actor_id) WHERE lifecycle_state = 'IN_DOUBT'`, one queued
+    // CTO message holding the conversation's only slot until an operator ran CONVERSATION_RESOLVE.
+    //
+    // A canonical target exists here on purpose. Without one the row would pass for the boring
+    // reason that no turn could be claimed on any route.
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    bindCeo(harness);
+    canonicalTargetFor(harness);
+    const holder = readyBoundSession(harness, "cto-holder", CTO_MENTION, [projectId]);
+    const roleConversation = roleConversationFor(harness);
+    roleConversation.attach(fakeRolePeer(), stillHeldBy(holder));
+    const conversation = new CeoConversationPort();
+    const { server } = fakeCeoPeer("답");
+    conversation.attach(server, stillCeo());
+    const listener = await startMessageListener(harness, conversation, roleConversation);
+
+    try {
+      const delivered = await exchangeSocketLines(
+        listener.socketPath,
+        [envelope({ eventId: "evt-role-canonical", text: "역할 앞 메시지", addressedTo: "CTO", mention: CTO_MENTION })],
+        hasReasonCode,
+      );
+      expect(JSON.parse(delivered.trim())).toMatchObject({
+        reasonCode: ReasonCode.UNTRUSTED_CONTENT_IS_DATA,
+        answeredByCeo: false,
+      });
+      // It really went down the role branch, so the absence below is about that branch.
+      expect(queuedOwnerMessages(harness)).toHaveLength(1);
+
+      const turns = harness.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM canonical_turns`);
+      expect(turns?.n, "a role-addressed message opened a canonical turn").toBe(0);
+      const sources = harness.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM canonical_turn_sources`);
+      expect(sources?.n).toBe(0);
+    } finally {
+      await listener.close();
+    }
+  });
+
   it("hands over the payload admission digested, not the envelope", async () => {
     // The defect this exists to catch has already happened once on the Telegram bridge: it passed
     // the raw update, `claim()` compared the digest against what `INGRESS_ADMITTED` recorded, and
