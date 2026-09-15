@@ -1,0 +1,7 @@
+Limit: pnpm 가상 스토어는 .pnpm/@scope+name@version 형태라 기존 두 규칙 어느 쪽으로도 표현할 수 없었고, 이 배포 클로저의 73%가 거기 해당했다
+Warn: 이 문법을 다시 좁힐 때는 실제 의존성 트리에 대고 seal 을 돌려서 확인하라 — 같은 실수가 이번이 두 번째이고, 합성 픽스처는 두 번 다 통과시켰다
+Blast: module
+Certainty: firm
+Record-Id: r-9ca73ac64f60
+Evidence: src/deploy/rollback-pair.ts
+Provenance: inherited b48f7d3fde71b2a4d85fc6a79037f8bead197be4
