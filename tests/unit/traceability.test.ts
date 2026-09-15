@@ -53,6 +53,80 @@ const vitestResult = (status: string): VitestJsonReport => ({
   ],
 });
 
+describe("a result set written by another machine still matches", () => {
+  // The failure this pins needs two machines to appear, which is why a same-platform job hid it
+  // completely. CI produces the Vitest JSON on the macOS matrix leg and hands it to a job that
+  // consumes it; once that job moved to ubuntu the artifact's `/Users/runner/work/...` names were
+  // resolved against `/home/runner/work/...` and every key differed. Measured in CI as
+  // `requirementsWithGaps: 22` — every requirement in the PRD, from a suite that had passed.
+  const producedUnder = (root: string): VitestJsonReport => ({
+    success: true,
+    numTotalTests: 1,
+    numPassedTests: 1,
+    numFailedTests: 0,
+    numPendingTests: 0,
+    testResults: [
+      {
+        name: `${root}/${declaration.file}`,
+        assertionResults: [{ fullName: declaration.fullName, status: "passed" }],
+      },
+    ],
+  });
+
+  it("matches a macOS-runner result set from a Linux-runner process", () => {
+    const covered = passedScenarioReferences(
+      [declaration],
+      producedUnder("/Users/runner/work/agent-control-plane/agent-control-plane"),
+    );
+
+    expect(covered.get(fixtureScenarioId)).toHaveLength(1);
+  });
+
+  it("matches the same result set from any other root, including this one", () => {
+    for (const root of ["/home/runner/work/agent-control-plane/agent-control-plane", "/tmp/x/y", repoRoot]) {
+      const covered = passedScenarioReferences([declaration], producedUnder(root));
+      expect(covered.get(fixtureScenarioId), `root ${root}`).toHaveLength(1);
+    }
+  });
+
+  it("leaves a path that matches no declaration unmatched rather than folding it onto one", () => {
+    // The other direction. Relaxing the comparison must not make one file's result count for
+    // another's declaration — an unmatched entry has to stay unmatched.
+    const foreign: VitestJsonReport = {
+      ...producedUnder("/Users/runner/work/agent-control-plane/agent-control-plane"),
+      testResults: [
+        {
+          name: "/Users/runner/work/other-repo/other-repo/tests/scenarios/different.test.ts",
+          assertionResults: [{ fullName: declaration.fullName, status: "passed" }],
+        },
+      ],
+    };
+
+    expect(passedScenarioReferences([declaration], foreign).get(fixtureScenarioId)).toBeUndefined();
+  });
+
+  it("requires the whole relative path to match, not just the basename", () => {
+    // Written after a mutation survived the case above. That one uses a different *file name*, so
+    // a comparison as loose as "ends with the basename" passed it while being wrong — the shape I
+    // expected rather than the shape a wrong implementation has. `tests/scenarios/example.test.ts`
+    // and `tests/other/example.test.ts` are different files with one name between them, and the
+    // suffix has to carry the directory to tell them apart.
+    const sameNameElsewhere: VitestJsonReport = {
+      ...producedUnder("/Users/runner/work/agent-control-plane/agent-control-plane"),
+      testResults: [
+        {
+          name: "/Users/runner/work/agent-control-plane/agent-control-plane/tests/other/example.test.ts",
+          assertionResults: [{ fullName: declaration.fullName, status: "passed" }],
+        },
+      ],
+    };
+
+    expect(
+      passedScenarioReferences([declaration], sameNameElsewhere).get(fixtureScenarioId),
+    ).toBeUndefined();
+  });
+});
+
 describe("traceability executed-test coverage", () => {
   it("counts a scenario only when its named Vitest assertion passed", () => {
     const passed = passedScenarioReferences([declaration], vitestResult("passed"));
