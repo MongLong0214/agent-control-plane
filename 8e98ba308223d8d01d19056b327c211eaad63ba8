@@ -1,0 +1,3 @@
+Limit: this refuses a shared bot, it does not prove an exclusive one | a bot nobody else is polling right now produces no 409 and no evidence, so only a live round trip through this listener can close #510; the measurement this adds is one-sided on purpose
+Warn: the stop is silent to the owner | onRuntimeStatus reports BOT_NOT_EXCLUSIVE to whoever wired a handler and agentcpd's handler is the only reader, so a deployment that ignores it sees a daemon that answers nothing and says nothing, the same shape as no daemon at all
+Provenance: inherited cb334c8d99dc8d86830f9c6c64b93fbf3528782e
