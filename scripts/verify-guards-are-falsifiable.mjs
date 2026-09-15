@@ -475,6 +475,15 @@ const GUARDS = [
     //
     // The mutation is exactly the old behaviour, not a nonsense value, because the old behaviour
     // is what was wrong — and it produced a digest that looked entirely plausible in every row.
+    //
+    // #858 briefly moved this source to `canonicalTurnTarget` and moved the row with it. CI
+    // refused: `a-turn-claim-outlives-the-process-that-made-it` pins the fence against the CEO
+    // generation the binding registry held, which is what #639 named, and reading it off whichever
+    // actor will answer is a different fact wearing the same digest. The source is back and so is
+    // this row. Measured on the live database, `bindings.active("CEO")` is null there — its one
+    // assignment was revoked at generation 1 — so the fence is still the constant this option was
+    // made required to stop being. That gap is real, and substituting another actor's generation
+    // would hide it rather than close it.
     what: "the claim's binding digest names the CEO generation that asked the turn",
     file: "src/ingress/telegram-polling.ts",
     find: "    bindingGeneration: () => cp.bindings.active(roleKeyFor(Role.CEO))?.bindingGeneration ?? null,",

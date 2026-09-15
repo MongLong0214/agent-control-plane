@@ -237,6 +237,26 @@ export interface TelegramRouterOptions {
   ) => Decision<void> | Promise<Decision<void>>;
   /** A deployment may choose one project for the shorthand `/managed <request>` form. */
   defaultProjectId?: string | null;
+  /**
+   * Materialises the canonical turn for a message this router has just claimed (#858).
+   *
+   * Narrow on the same principle as `directHandler` below: the router hands over what it claimed
+   * and learns only whether the ledger took it. It never receives the coordinator, and the
+   * identity is not re-derived here -- `IngressGuard` already stored it with the claim.
+   *
+   * Strictly additive. `canonical_turns` has had no production writer, so every operator surface
+   * over it -- contradictions, unresolved-across-actors, resolve-in-doubt, adjudicate -- has been
+   * passing over an empty row set while the ingress ledger held the real turn. If this callback
+   * succeeds the canonical ledger gains the row it should always have had; if it refuses, the
+   * state is exactly what it is today. It cannot make the router's own outcome worse, which is
+   * why the reply path does not branch on it.
+   */
+  materializeTurn?: (input: {
+    channel: string;
+    nonce: string;
+    prompt: string;
+    payload: unknown;
+  }) => Decision<void>;
   /** DIRECT is deliberately a narrow callback, not a mutation capability. */
   directHandler?: (
     input: TelegramDirectInput,
@@ -410,6 +430,7 @@ export class TelegramHermesRouter {
   private readonly resolveOwnerPrompt: NonNullable<TelegramRouterOptions["resolveOwnerPrompt"]>;
   private readonly recordOwnerPrompt: NonNullable<TelegramRouterOptions["recordOwnerPrompt"]>;
   private readonly ownerDecision: TelegramRouterOptions["ownerDecision"];
+  private readonly materializeTurn: TelegramRouterOptions["materializeTurn"];
   private readonly defaultProjectId: string | null;
   private readonly directHandler: NonNullable<TelegramRouterOptions["directHandler"]>;
   private readonly getStoredResponse: NonNullable<TelegramRouterOptions["getStoredResponse"]>;
@@ -426,6 +447,7 @@ export class TelegramHermesRouter {
       "Telegram owner prompt persistence is not configured",
     ));
     this.ownerDecision = options.ownerDecision;
+    this.materializeTurn = options.materializeTurn;
     this.defaultProjectId = options.defaultProjectId ?? null;
     this.directHandler = options.directHandler ?? defaultDirectHandler;
     this.bindingGeneration = options.bindingGeneration;
@@ -686,6 +708,23 @@ export class TelegramHermesRouter {
             claimed.reasonCode,
           ));
         }
+        // The claim above is the ingress ledger's. The canonical ledger has had no production
+        // writer at all (#858), so `canonical_turns` stayed empty while this row was the real
+        // turn -- which is how four adjudication surfaces and a 60s reconcile sweep all passed
+        // over nothing. This is the bridge, and it is deliberately after the claim: the claim
+        // runs inside `db.tx`, and the coordinator opens its own transaction.
+        //
+        // Not branched on. A refusal leaves exactly today's state -- ingress claimed, canonical
+        // empty -- so failing here can only fail to improve, never make the turn worse. Turning
+        // that into a reply would tell the owner about a ledger they cannot act on.
+        this.materializeTurn?.({
+          channel: "telegram",
+          nonce: this.ingress.nonceFor(update),
+          prompt: classified.value.text,
+          // Not `update`. `claim()` compares this against the digest `INGRESS_ADMITTED` recorded,
+          // and admission digests the message payload, not the raw update envelope.
+          payload: this.ingress.admittedPayloadFor(update),
+        });
         return {
           status: "CEO_TURN_PENDING",
           outcome: this.completeDirectRoute(update, classified.value),
