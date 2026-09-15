@@ -171,3 +171,160 @@ describe("the merge path asks before the commit exists", () => {
     expect(out.stdout).toContain("--body-file");
   });
 });
+
+/**
+ * The other place a record is stored, and the two occasions this check called one lost.
+ *
+ * A squash strands the branch's earlier records mid-message, which git will not parse — and
+ * `commitlore squash-preserve` and the `commitlore-preserve` workflow answer exactly that by
+ * attaching them to the merge commit as a note on `refs/notes/commitlore`. 0da07459 chose that
+ * over rewriting pushed history, so a note is this repository's repair, not a workaround.
+ *
+ * The check read only the message, so it reported a repaired commit as a loss:
+ *
+ *     573f7eab  (#867)  eleven record lines, three parsed, records attached as notes
+ *                       -> turned two green pull requests red; answered by narrowing the range
+ *     8b38c9d6  (#937)  four record lines lost to the squash, all four in the commit's note
+ *                       -> the range is already HEAD~1..HEAD; main stayed red over nothing
+ *
+ * These run the real script against a fixture repository through `GIT_DIR`, because the commit
+ * path is the half that reads git and the message path cannot reach it.
+ */
+const fixtureGit = (dir: string) => (...args: string[]): string => {
+  const done = boundedSpawnSync("git", args, { cwd: dir, encoding: "utf8" });
+  expect(done.status, `git ${args.join(" ")}: ${done.stderr ?? ""}`).toBe(0);
+  return (done.stdout ?? "").trim();
+};
+
+const fixtureRepo = (): string => {
+  const dir = tempDir("acp-trailer-notes-");
+  const git = fixtureGit(dir);
+  git("init", "-q", "-b", "main", ".");
+  git("config", "user.email", "fixture@example.invalid");
+  git("config", "user.name", "fixture");
+  return dir;
+};
+
+/** A message shaped the way a squash shapes one: two trailer blocks, of which git keeps the last. */
+const strandedMessage = [
+  "merge subject",
+  "",
+  "what the branch did.",
+  "",
+  "Limit: the record the squash stranded.",
+  "",
+  "second commit subject",
+  "",
+  "more body.",
+  "",
+  "Limit: the record in the last paragraph.",
+  "",
+].join("\n");
+
+let commitCounter = 0;
+
+const commitInto = (dir: string, message: string): string => {
+  const git = fixtureGit(dir);
+  commitCounter += 1;
+  writeFileSync(join(dir, `f${String(commitCounter)}.txt`), "content\n");
+  const messageFile = join(dir, "MESSAGE");
+  writeFileSync(messageFile, message);
+  git("add", "-A");
+  git("commit", "-q", "-F", messageFile);
+  return git("rev-parse", "HEAD");
+};
+
+const note = (dir: string, sha: string, body: string): void => {
+  fixtureGit(dir)("notes", "--ref=commitlore", "add", "-m", body, sha);
+};
+
+/** The real script, reading the fixture repository rather than this one. */
+const verifyCommit = (dir: string, range: string): { status: number; stdout: string } => {
+  const out = boundedSpawnSync(
+    process.execPath,
+    [join(ROOT, "scripts/verify-trailers-are-parsable.mjs"), range],
+    {
+      cwd: ROOT,
+      encoding: "utf8",
+      env: { ...process.env, GIT_DIR: join(dir, ".git"), GIT_WORK_TREE: dir },
+    },
+  );
+  return { status: out.status ?? -1, stdout: out.stdout ?? "" };
+};
+
+describe("a record a note carries is stored, and one nothing carries is lost", () => {
+  it("refuses a stranded record when no note carries it", () => {
+    const dir = fixtureRepo();
+    const sha = commitInto(dir, strandedMessage);
+    const { status, stdout } = verifyCommit(dir, sha);
+    expect(status).toBe(1);
+    expect(stdout).toContain("the record the squash stranded");
+    expect(stdout).not.toContain("the record in the last paragraph");
+  });
+
+  it("accepts a stranded record the commit's own note carries", () => {
+    const dir = fixtureRepo();
+    const sha = commitInto(dir, strandedMessage);
+    note(dir, sha, "Limit: the record the squash stranded.");
+    expect(verifyCommit(dir, sha).status).toBe(0);
+  });
+
+  it("names only the stranded lines no note carries", () => {
+    // A note that preserved half of a merge's records is the case a pass/fail on the note's mere
+    // existence would wave through, and the author would never learn which record went missing.
+    const dir = fixtureRepo();
+    const sha = commitInto(
+      dir,
+      [
+        "merge subject",
+        "",
+        "body.",
+        "",
+        "Limit: the first stranded record.",
+        "Warn: the second stranded record.",
+        "",
+        "second subject",
+        "",
+        "more body.",
+        "",
+        "Limit: the record in the last paragraph.",
+        "",
+      ].join("\n"),
+    );
+    note(dir, sha, "Limit: the first stranded record.");
+    const { status, stdout } = verifyCommit(dir, sha);
+    expect(status).toBe(1);
+    expect(stdout).toContain("the second stranded record");
+    expect(stdout).not.toContain("the first stranded record");
+  });
+
+  it("refuses without the fetch advice when the notes ref is present and this commit has no note", () => {
+    // The advice is for a checkout that could not look. Printing it where the check *did* look and
+    // found nothing would send the reader to fetch a ref they already have, and would suggest the
+    // record might be fine when this run established that it is not.
+    const dir = fixtureRepo();
+    const other = commitInto(dir, "unrelated subject\n\nbody.\n");
+    note(dir, other, "Limit: a note on some other commit.");
+    const sha = commitInto(dir, strandedMessage);
+    const { status, stdout } = verifyCommit(dir, sha);
+    expect(status).toBe(1);
+    expect(stdout).toContain("the record the squash stranded");
+    expect(stdout).not.toContain("refs/notes/commitlore is not in this checkout");
+  });
+
+  it("says what it could not read when the notes ref is absent entirely", () => {
+    const dir = fixtureRepo();
+    const sha = commitInto(dir, strandedMessage);
+    const { status, stdout } = verifyCommit(dir, sha);
+    expect(status).toBe(1);
+    expect(stdout).toContain("refs/notes/commitlore is not in this checkout");
+    expect(stdout).toContain("refs/notes/commitlore:refs/notes/commitlore");
+  });
+
+  it("does not let a note excuse a message that has not been merged yet", () => {
+    // `--message-file` runs before the merge, from `scripts/merge-pr.mjs`. There is no commit to
+    // hang a note on, so the message itself must carry every record — the note is a repair for
+    // history that already exists, never a licence to compose a message that loses one.
+    expect(verify(strandedMessage).status).toBe(1);
+  });
+});

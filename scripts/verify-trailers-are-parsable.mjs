@@ -24,6 +24,20 @@
  * also refuses. One rule now has one implementation, and the hook, CI, and the merge path are
  * three callers of it.
  *
+ * A third gap took longer to see, because it looks like the check working. A squash merge strands
+ * the branch's earlier records mid-message, and `commitlore squash-preserve` / the
+ * `commitlore-preserve` workflow answer that by attaching them to the merge commit as a note on
+ * `refs/notes/commitlore` — the repository's sanctioned repair, chosen in 0da07459 over rewriting
+ * pushed history. This file read only the message, so it reported those records lost while a note
+ * was carrying them. Twice: `573f7eab` (#867), which ci.yml records turned two green pull requests
+ * red, answered then by narrowing the range; and `8b38c9d6` (#937), where the range is already
+ * `HEAD~1..HEAD` and there is nothing left to narrow. A record is stored when git can read it back,
+ * and a note is one of the two places git reads it back from — so this asks both.
+ *
+ * It asks them in that order and never the other way: a note is a repair for a commit that already
+ * exists, so `--message-file`, which runs *before* the merge, has no note to consult and must still
+ * require the message itself to carry every record.
+ *
  * Usage:
  *   verify-trailers-are-parsable.mjs [<range>]          (default: origin/main..HEAD)
  *   verify-trailers-are-parsable.mjs --message-file <p> (a message that is not a commit yet; `-` = stdin)
@@ -48,7 +62,7 @@ const KEYS = RECORD_TRAILER_KEY_PATTERN;
  * is not "run the code that decides" can drift from the answer, and the first version of the
  * `commit-msg` hook drifted exactly that way.
  */
-const unparsed = (message) => {
+const unparsed = (message, carried = []) => {
   // Comments are stripped the way git strips them, so a commented-out example is not counted.
   const body = message
     .split("\n")
@@ -64,12 +78,35 @@ const unparsed = (message) => {
   // so this is normally all of them — naming each is what tells the author which record was lost,
   // rather than that a count disagreed.
   const remaining = [...parsed];
-  return written.filter((line) => {
+  const missing = written.filter((line) => {
     const at = remaining.findIndex((p) => p.trim() === line.trim());
     if (at === -1) return true;
     remaining.splice(at, 1);
     return false;
   });
+  // A line the message no longer carries is only lost if nothing else carries it. `carried` is the
+  // commit's note, and it is empty on every path where no commit exists yet.
+  const elsewhere = carried.map((line) => line.trim());
+  return missing.filter((line) => !elsewhere.includes(line.trim()));
+};
+
+/** Whether this checkout has the notes ref at all — absent is "not fetched", never "empty". */
+const notesRefPresent = () => {
+  try {
+    git(["rev-parse", "--verify", "--quiet", "refs/notes/commitlore"]);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** The lines of a commit's CommitLore note, or none when that commit has no note. */
+const noteLines = (sha) => {
+  try {
+    return git(["notes", "--ref=commitlore", "show", sha]).split("\n");
+  } catch {
+    return [];
+  }
 };
 
 const report = (lost, subject) => {
@@ -110,16 +147,29 @@ try {
   process.exit(2);
 }
 
+const notesFetched = notesRefPresent();
+
 let broken = 0;
 for (const sha of shas) {
-  const lost = unparsed(git(["log", "-1", "--format=%B", sha]));
+  const lost = unparsed(git(["log", "-1", "--format=%B", sha]), notesFetched ? noteLines(sha) : []);
   if (lost.length === 0) continue;
   broken += 1;
   report(lost, sha.slice(0, 7));
 }
 
 if (broken > 0) {
-  process.stdout.write(`${EXPLANATION}RESULT: FAIL — ${broken} commit(s) in ${range} carry a trailer git will not store.\n`);
+  process.stdout.write(EXPLANATION);
+  if (!notesFetched) {
+    // Saying "lost" from a checkout that cannot see the notes ref would be an answer given without
+    // having looked at the other half of the storage. The refusal stands — nothing here can show
+    // the record survived — but it names what this checkout could not read.
+    process.stdout.write(
+      "\nrefs/notes/commitlore is not in this checkout, so a record a note carries could not be\n" +
+        "seen. Fetch it and run this again:\n" +
+        "  git fetch --no-tags origin '+refs/notes/commitlore:refs/notes/commitlore'\n",
+    );
+  }
+  process.stdout.write(`RESULT: FAIL — ${broken} commit(s) in ${range} carry a trailer git will not store.\n`);
   process.exit(1);
 }
 

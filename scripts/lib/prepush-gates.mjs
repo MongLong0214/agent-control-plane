@@ -171,6 +171,10 @@ export const CI_SETUP_COMMANDS = new Map([
   ["pnpm native:peercred:build", "ADR-0010: prebuilds the Darwin peercred addon before anything loads it"],
   ["pnpm native:fd-vfs:build", "ADR-0010 convention, new load mechanism: prebuilds the fd-vfs SQLite extension; unlike peercred it is built on every platform"],
   ["pnpm ci:preflight", "runs pre-install as a seconds-long fast fail; also runs inside the runner"],
+  [
+    "pnpm notes:fetch",
+    "brings refs/notes/commitlore into the checkout; `pnpm trailers` reads both the message and the note, and `actions/checkout` fetches no notes ref",
+  ],
 ]);
 
 /**
