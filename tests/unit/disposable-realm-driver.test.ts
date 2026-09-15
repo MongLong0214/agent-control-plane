@@ -258,6 +258,37 @@ describe("the disposable realm driver", () => {
     expect(result.evidence).toMatchObject({ polls: 1, sends: 1, driverHandledTurns: 1 });
   });
 
+  it("reports TIMEOUT rather than hanging when a message never settles", async () => {
+    // Condition 5 names `timeout` first, and nothing could produce it: the message loop awaited
+    // `pollOnce` with no bound, so this fault used to make the run never return at all. A hang is
+    // the worst outcome available here -- it holds the Hermes gateway paused for a supervised
+    // window with no end -- and it is invisible to a suite that only asserts on results.
+    const result = await runSyntheticDisposableRealmProbe({
+      fault: "FIRST_POLL_NEVER_ANSWERS",
+      messageDeadlineMs: 250,
+    });
+
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.ACCEPTANCE_PROBE_INCONCLUSIVE);
+    // The signal, not just the refusal: the artifact records which of condition 5's failures
+    // happened, and a TIMEOUT recorded as SOCKET_CLOSED is evidence that says the wrong thing.
+    expect(result.evidence).toMatchObject({ signal: "TIMEOUT", polls: 1, sends: 0 });
+  });
+
+  it("names a busy session store as SESSION_STORAGE_BUSY and stops", async () => {
+    // `SESSION_STORAGE_BUSY` was a member of `ProbeSignal` that nothing in `src/` constructed:
+    // the driver's catch collapsed every non-ambiguous error to `SOCKET_CLOSED`. The disposition
+    // was already right, so no behaviour changes here -- what changes is that the evidence can
+    // name the failure condition 5 actually lists.
+    const result = await runSyntheticDisposableRealmProbe({
+      fault: "SESSION_STORAGE_BUSY_ON_FIRST_POLL",
+    });
+
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.ACCEPTANCE_PROBE_INCONCLUSIVE);
+    expect(result.evidence).toMatchObject({ signal: "SESSION_STORAGE_BUSY", polls: 1, sends: 0 });
+  });
+
   it("refuses when the before census cannot be observed", async () => {
     const result = await runSyntheticDisposableRealmProbe({ fault: "BEFORE_CENSUS_UNOBSERVABLE" });
 
