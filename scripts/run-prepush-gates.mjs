@@ -27,8 +27,9 @@
  *   node scripts/run-prepush-gates.mjs            (run every gate, stop at the first failure)
  *   node scripts/run-prepush-gates.mjs --list     (print the manifest, run nothing)
  */
-import { spawnSync } from "node:child_process";
-import { appendFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { appendFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { GATES } from "./lib/prepush-gates.mjs";
@@ -157,6 +158,25 @@ if (onGitHub) {
       process.stdout.write(`gates: could not write the step summary: ${error.message}\n`);
     }
   }
+}
+
+// The receipt `.githooks/pre-push` reads. A green run records the exact commit it judged; any
+// other outcome removes the receipt rather than leaving a stale one, because a receipt for a
+// commit that is no longer HEAD is the "skipped check that reads as a pass" shape this repository
+// keeps meeting. It lives in the git directory, so it is per-checkout, never committed, and a
+// fresh clone starts with no receipt rather than with someone else's.
+try {
+  const gitDir = execFileSync("git", ["rev-parse", "--absolute-git-dir"], { encoding: "utf8" }).trim();
+  const receipt = join(gitDir, "acp-gates-green");
+  if (failure) rmSync(receipt, { force: true });
+  else {
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    writeFileSync(receipt, `${head}\n`);
+  }
+} catch {
+  // A receipt that cannot be written must not fail a run that passed. The hook treats an absent
+  // receipt as "not run", which is the closed direction, so losing it costs a re-run and not a
+  // wrong pass.
 }
 
 process.exit(failure ? failure.status : 0);
