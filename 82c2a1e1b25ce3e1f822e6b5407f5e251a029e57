@@ -1,0 +1,11 @@
+Limit: this wires nothing about the sweep: the full 665-row sweep still runs on every pull request and on main, and the CEO's refusal of the changed-file-only proposal stands on its own ground
+Limit: a FULL verdict skips the reverse computation entirely, so the window's width is what decides whether this check compares anything; 60 sets yields 32 comparisons where 12 yielded two identical ones
+Ruled-out: leaving the exemption and only fixing the header | a check nothing runs can let its agreement lapse silently, which is the state that let the header go stale
+Ruled-out: asserting the DEFAULT_COMMITS constant in the test | the constant is not what the run uses if argument parsing is wrong, so the test reads the set count the run reports about itself
+Ruled-out: a window wider than 60 | 60 already yields 32 comparisons spanning 6 to 547 of 665 rows, and more costs seconds for evidence that is already varied
+Warn: the header used to say this script exits 1 and should; it exits 0 in two seconds, and a comment asserting a falsehood about its own file is why the passing state went unnoticed
+Blast: module
+Undo: easy
+Certainty: firm
+Record-Id: r-b6f6fbc2d817
+Provenance: inherited 2dd61bb2812de976e56da62d6523d0545d0580f8
