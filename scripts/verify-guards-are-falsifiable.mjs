@@ -475,9 +475,16 @@ const GUARDS = [
     //
     // The mutation is exactly the old behaviour, not a nonsense value, because the old behaviour
     // is what was wrong — and it produced a digest that looked entirely plausible in every row.
-    what: "the claim's binding digest names the CEO generation that asked the turn",
+    //
+    // #858: the source moved from `Role.CEO` to `canonicalTurnTarget`, and this row moved with it.
+    // Supplying the option was necessary and not sufficient — measured on the live database,
+    // `bindings.active("CEO")` is null there (its one assignment was revoked at generation 1), so
+    // the now-required option still produced `digestOf({ bindingGeneration: null })`: the same
+    // constant, reached by a different route. The mutation is unchanged because the failure it
+    // reproduces is unchanged.
+    what: "the claim's binding digest names the generation of the actor that will answer the turn",
     file: "src/ingress/telegram-polling.ts",
-    find: "    bindingGeneration: () => cp.bindings.active(roleKeyFor(Role.CEO))?.bindingGeneration ?? null,",
+    find: "    bindingGeneration: () => canonicalTurnTarget(cp)?.bindingGeneration ?? null,",
     replace: "    bindingGeneration: () => null,",
     killedBy: [
       "tests/process/a-turn-claim-outlives-the-process-that-made-it.test.ts::carries the same four values to a reader that opens the file after the writer is gone",

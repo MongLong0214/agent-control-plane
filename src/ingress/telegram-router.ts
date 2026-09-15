@@ -721,7 +721,9 @@ export class TelegramHermesRouter {
           channel: "telegram",
           nonce: this.ingress.nonceFor(update),
           prompt: classified.value.text,
-          payload: update,
+          // Not `update`. `claim()` compares this against the digest `INGRESS_ADMITTED` recorded,
+          // and admission digests the message payload, not the raw update envelope.
+          payload: this.ingress.admittedPayloadFor(update),
         });
         return {
           status: "CEO_TURN_PENDING",
