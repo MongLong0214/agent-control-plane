@@ -8,10 +8,13 @@ import {
   type DatabaseFile,
   type OwnedProcess,
   type ProbeSignal,
+  type ProbeToolCensus,
   type ProductionCensus,
   type RealmPaths,
+  PROBE_FORBIDDEN_TOOLS,
   REALM_EVIDENCE_CLAIM,
   assertDisposableWorkspaceRoot,
+  assertProbeToolsMeasuredOff,
   assertProductionUnchanged,
   censusDatabaseFamily,
   censusProduction,
@@ -19,8 +22,10 @@ import {
   classifyProbeSignal,
   mayTerminate,
   planDisposableRealm,
+  writeProbeChildSettings,
   productionRoot,
   realmLayout,
+  takeProbeToolCensus,
   verifyRealmResidue,
 } from "../../src/acceptance/disposable-realm.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -561,6 +566,124 @@ describe("an unanswerable question is never followed by another message", () => 
     // unanswerable outcome into a duplicate, so its absence is a property worth pinning.
     const dispositions = new Set([...inconclusive, "REPLY_OBSERVED" as const].map(classifyProbeSignal));
     expect([...dispositions].sort()).toEqual(["CONTINUE", "INCONCLUSIVE"]);
+  });
+});
+
+describe("the probe tool census answers from the child's own configuration", () => {
+  const settings = (value: unknown): string => {
+    const dir = tempDir("acp-probe-settings-");
+    const path = join(dir, "settings.json");
+    writeFileSync(path, JSON.stringify(value));
+    return path;
+  };
+  // Narrowed here rather than at each call site. `takeProbeToolCensus` never refuses -- an
+  // unreadable file is still a census, the one that says `measuredAt: null` -- so a test that had
+  // to re-establish that at every assertion would be restating the contract instead of using it.
+  const census = (value: unknown): ProbeToolCensus => {
+    const taken = takeProbeToolCensus(settings(value), "2026-09-15T00:00:00.000Z");
+    if (!taken.allowed) throw new Error(`census refused: ${taken.reasonCode}`);
+    return taken.value;
+  };
+
+  it("records a denied tool as off and an allowed one as on", () => {
+    const taken = census({ permissions: { defaultMode: "default", deny: ["Bash(git status)"], allow: ["Write"] } });
+
+    expect(taken.tools["bash"]).toBe(false);
+    // Narrowed to one argument and still on: condition 3 is about reach, and a `Bash` restricted
+    // to `git status` still runs a process outside the realm.
+    expect(taken.tools["write"]).toBe(true);
+  });
+
+  it("names nothing at all under a mode that grants without consulting the lists", () => {
+    // The case that makes this census worth having. `bypassPermissions` grants regardless of
+    // `deny`, so a census that read the list and reported "bash: off" would be measuring a
+    // sentence rather than the child -- and it would say the safe thing while being wrong.
+    const taken = census({ permissions: { defaultMode: "bypassPermissions", deny: ["Bash"] } });
+
+    expect(taken.tools).toEqual({});
+    expect(assertProbeToolsMeasuredOff(taken).allowed).toBe(false);
+  });
+
+  it("treats a mode it has never met as one of those, not as default", () => {
+    const taken = census({ permissions: { defaultMode: "someFutureMode", deny: ["Bash"] } });
+
+    expect(taken.tools).toEqual({});
+  });
+
+  it("leaves a tool named in neither list out rather than guessing", () => {
+    const taken = census({ permissions: { defaultMode: "default", deny: ["Bash"], allow: [] } });
+
+    expect(taken.tools["bash"]).toBe(false);
+    expect(taken.tools["web_fetch"]).toBeUndefined();
+    // Absent is not off: the gate has to refuse, or an unmeasured tool rides in on a census that
+    // mentioned some others.
+    expect(assertProbeToolsMeasuredOff(taken).allowed).toBe(false);
+  });
+
+  it("reports an unreadable settings file as never measured", () => {
+    const taken = takeProbeToolCensus(join(tempDir("acp-probe-missing-"), "settings.json"), "2026-09-15T00:00:00.000Z");
+    if (!taken.allowed) throw new Error("census refused");
+
+    expect(taken.value.measuredAt).toBeNull();
+    expect(assertProbeToolsMeasuredOff(taken.value).allowed).toBe(false);
+  });
+
+  it("passes the gate only when every forbidden tool is measured off", () => {
+    const off = census({
+      permissions: { defaultMode: "default", deny: [...PROBE_FORBIDDEN_TOOLS], allow: [] },
+    });
+
+    expect(off.tools).toEqual(Object.fromEntries(PROBE_FORBIDDEN_TOOLS.map((tool) => [tool, false])));
+    expect(assertProbeToolsMeasuredOff(off).allowed).toBe(true);
+  });
+});
+
+describe("the realm writes the settings the census judges it by", () => {
+  const realm = (): RealmPaths => {
+    const stateDir = tempDir("acp-probe-realm-");
+    return {
+      stateDir,
+      databasePath: join(stateDir, "state.sqlite"),
+      runtimeRoot: join(stateDir, "runtime"),
+      socketDir: join(stateDir, "sockets"),
+      lockPath: join(stateDir, "agentcpd.lock"),
+    };
+  };
+
+  it("writes settings the census then reads as every forbidden tool off", () => {
+    // The two halves meet here and nowhere else: this test would pass on a writer that lied only
+    // if the census agreed with it, and the census reads the file rather than the writer.
+    const paths = realm();
+    const written = writeProbeChildSettings(paths);
+    if (!written.allowed) throw new Error(`write refused: ${written.reasonCode}`);
+
+    const taken = takeProbeToolCensus(written.value, "2026-09-15T00:00:00.000Z");
+    if (!taken.allowed) throw new Error("census refused");
+
+    expect(taken.value.measuredAt).not.toBeNull();
+    expect(assertProbeToolsMeasuredOff(taken.value).allowed).toBe(true);
+  });
+
+  it("writes it inside the realm, so the residue check already covers it", () => {
+    const paths = realm();
+    const written = writeProbeChildSettings(paths);
+    if (!written.allowed) throw new Error("write refused");
+
+    // Not a new rule: `verifyRealmResidue` walks the state directory entry by entry, so a realm
+    // that forgets to remove the child's settings fails the check that already exists.
+    expect(written.value.startsWith(paths.stateDir)).toBe(true);
+    expect(verifyRealmResidue(paths).allowed).toBe(false);
+  });
+
+  it("refuses rather than reporting a census it could not have taken", () => {
+    const paths = realm();
+    rmSync(paths.stateDir, { recursive: true, force: true });
+    writeFileSync(paths.stateDir, "not a directory");
+
+    const written = writeProbeChildSettings(paths);
+
+    expect(written.allowed).toBe(false);
+    expect(written.reasonCode).toBe(ReasonCode.ACCEPTANCE_PROBE_INCONCLUSIVE);
   });
 });
 

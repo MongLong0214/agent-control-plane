@@ -1010,6 +1010,24 @@ const GUARDS = [
     ],
   },
   {
+    // #655 condition 3 refuses to start a run whose probe child's tool surface was never measured,
+    // and until now nothing could measure it — `assertProbeToolsMeasuredOff` had no producer, so
+    // the condition was reachable only as `ASSERTED_ONLY`.
+    //
+    // The census reads the child's own settings, and `permissions.defaultMode` is the whole of why
+    // it is not a restatement of the forbidden list. Claude Code's `bypassPermissions` grants
+    // without consulting `deny`, so a census that trusted the list under that mode would report
+    // "bash: off" about a child that can call it — the safe-sounding answer, and wrong. The
+    // mutation is exactly that: believe the list whatever the mode.
+    what: "a permission mode that grants without consulting the lists yields no tool census at all",
+    file: "src/acceptance/disposable-realm.ts",
+    find: '  if (mode !== "default" && mode !== "plan") {',
+    replace: "  if (false) {",
+    killedBy: [
+      "tests/unit/disposable-realm.test.ts::names nothing at all under a mode that grants without consulting the lists",
+    ],
+  },
+  {
     what: "an acceptance realm path that resolves inside production is refused",
     file: "src/acceptance/disposable-realm.ts",
     find: "    if (within(production, resolved)) {",
