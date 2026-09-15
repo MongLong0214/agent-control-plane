@@ -1023,6 +1023,33 @@ const GUARDS = [
     ],
   },
   {
+    // The notes mirror is where the sanctioned merge puts the records git will not store, so a
+    // check that ignores it reports every correctly-preserved merge as a loss -- and a check that
+    // trusts only the message answers a question the repository already decided against. Removing
+    // the notes read is the mutation that turns this guard from "are the records reachable" into
+    // "did this one message happen to keep them".
+    what: "a record reachable only through the notes mirror still counts as preserved",
+    file: "scripts/verify-merge-preserved-records.mjs",
+    find: "  const note = git(\"notes\", \"--ref=commitlore\", \"show\", sha);",
+    replace: "  const note = null;",
+    killedBy: [
+      "tests/unit/a-merge-that-drops-records-is-refused.test.ts::a record carried only by the notes mirror is preserved",
+    ],
+  },
+  {
+    // Counting `Record-Id` alone is the shape this check was written against: the three losses
+    // `merge-pr.mjs` measured predate that key being emitted at all, so a guard keyed on it read
+    // "0 record(s) on the branch" against 83 lines that were gone. Measured before the key list
+    // existed, on 74c37fa.
+    what: "a record line without a Record-Id is still a record",
+    file: "scripts/verify-merge-preserved-records.mjs",
+    find: "const isRecordLine = (line) => RECORD_KEYS.some((key) => line.startsWith(`${key}:`));",
+    replace: "const isRecordLine = (line) => line.startsWith(\"Record-Id:\");",
+    killedBy: [
+      "tests/unit/a-merge-that-drops-records-is-refused.test.ts::a branch whose records carry no Record-Id is still measured",
+    ],
+  },
+  {
     // The transition the registry exists for. Raising the threshold makes a class that has
     // recurred read as seen-once, which is exactly the state a note produces and a gate does not.
     what: "the second independent occurrence is what makes a guard mandatory",

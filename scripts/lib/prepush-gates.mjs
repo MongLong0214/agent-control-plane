@@ -135,6 +135,13 @@ export const GATES = [
   // described already existed. The local commit-msg hook refuses it up front; this is the half
   // that holds for a clone that never installed the hooks, and for a message a server composes.
   { script: "trailers", argumentFrom: "ACP_TRAILERS_RANGE" },
+  // The other half of the same question, and the half `trailers` cannot answer. `trailers` asks
+  // whether the lines in this message parse; this asks whether every line the *branch* carried is
+  // reachable from the merge at all. A squash whose body is written by hand drops the records
+  // entirely and leaves nothing unparseable behind, which is the case `trailers` passes. Shares
+  // `ACP_TRAILERS_RANGE` deliberately: the two are about one commit range and a second variable
+  // would be a second authority over what that range is.
+  { script: "merge-records", argumentFrom: "ACP_TRAILERS_RANGE" },
   { script: "build" },
   // One suite run, and its JSON belongs to the gate that judged this exact run: `pnpm trace`
   // consumes that artifact rather than running the suite a second time, because a second run is a
