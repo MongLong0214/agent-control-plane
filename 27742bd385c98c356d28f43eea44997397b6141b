@@ -1,0 +1,9 @@
+Limit: this decides what canonical_turns records, not when it fills: the number still moves only on a CEO-addressed socket message or Telegram, so #858's zero stays downstream of #510
+Ruled-out: settling a completed hand-over through resolveInDoubt's abort-shaped record | a ledger that files completions as aborts is worse than one with no row
+Ruled-out: minting a new outcome kind for handed-over-and-completed | honest, and it widens a contract on the strength of one deployment's traffic shape
+Warn: the question to ask before bridging any future ingress route is whether the sender waits for what the target produces; the role route answers at enqueue and nobody waits
+Blast: module
+Undo: easy
+Certainty: firm
+Record-Id: r-2443fd960171
+Provenance: inherited b8146d733a71adf7d451f3db63e51e508e67b260
