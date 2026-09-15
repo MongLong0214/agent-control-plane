@@ -1,0 +1,10 @@
+Limit: a checkout without refs/notes/commitlore can see only one of the two places a record is stored, so the gate still refuses there and names what it could not read rather than guessing
+Limit: --message-file is untouched: it runs before the merge from scripts/merge-pr.mjs, where there is no commit to hang a note on, so the message must still carry every record itself
+Ruled-out: teaching the check to accept the multi-paragraph shape | 0da07459 already dropped it: the check's job is to say what git will store, and git stores one block
+Ruled-out: rewriting the merge message so the records parse | it is pushed history, and the same record chose a note instead as the repair that rewrites nothing
+Warn: the notes fetch is a declared setup command, not a step: gates:ci-parity refuses any bare command in the gate job, because a gate CI holds and pnpm gates does not is the drift it exists to stop
+Blast: module
+Undo: easy
+Certainty: firm
+Record-Id: r-184a4465c557
+Provenance: inherited 64dd3a35736d9b39c0de9e4bdcd725ce02e11da9
