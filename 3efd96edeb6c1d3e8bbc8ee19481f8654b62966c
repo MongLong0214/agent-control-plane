@@ -1,0 +1,7 @@
+Limit: 머지와 다음 일일 실행 사이 몇 시간 동안 main 쪽 sweep 이 없다 — 단 그 구간의 트리는 PR 이 이미 green 으로 훑은 트리다
+Warn: falsifiability 는 필수 체크가 아니다 — 필수는 verify 하나뿐이므로, 이 조건을 다시 건드릴 때 branch protection 이 막아줄 것이라고 기대하지 마라
+Blast: module
+Certainty: firm
+Record-Id: r-f2f22b1ef46a
+Evidence: .github/workflows/ci.yml
+Provenance: inherited 94a8baab4b957bb47b6743782b456d3348c9154a
