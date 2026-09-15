@@ -26,6 +26,28 @@
 # `pnpm gates` on the exact commit being pushed. A work-in-progress branch with no pull request
 # still costs only the anchors pass, which is what keeps this hook installed.
 set -e
+
+# Read what git is actually pushing before deciding anything. `pre-push` receives one line per ref
+# on stdin -- `<local ref> <local sha> <remote ref> <remote sha>` -- and this hook used to ignore
+# it, asking `HEAD` instead. Two things followed, both met on 2026-09-15:
+#
+#   * a notes-only push (`git push origin refs/notes/commitlore`) carries no commit and cannot
+#     change what CI judges, and it was refused for want of a gate receipt. The records this
+#     repository exists to keep could not be published because of the gate that guards its code;
+#   * the sha checked was `HEAD`, not the commit being pushed, so pushing a ref that is not the
+#     current branch asked about the wrong commit.
+#
+# A push with nothing under `refs/heads/` is not this hook's subject. Deletions are excluded by
+# their all-zero local sha: they carry no tree for a row to name and no commit for CI to judge.
+pushed=""
+while read -r local_ref local_sha remote_ref remote_sha; do
+  case "$remote_ref" in refs/heads/*) ;; *) continue ;; esac
+  case "$local_sha" in *[!0]*) pushed="$pushed $local_ref:$local_sha" ;; esac
+done
+if [ -z "$pushed" ]; then
+  exit 0
+fi
+
 if ! node scripts/verify-guards-are-falsifiable.mjs --anchors-only; then
   echo "pre-push: a falsifiability row no longer names a line that exists." >&2
   echo "CI runs this before the build; it will fail there in seconds. Fix the row first." >&2
@@ -36,10 +58,15 @@ fi
 # receipt is not required. Deliberately fail-open on the *question* and fail-closed on the
 # *answer* -- an unavailable lookup must not block work, but once a pull request is known to
 # exist an absent receipt refuses.
-review_branch() {
+#
+# `--json state` and not `--json number`: `gh pr view` answers for a MERGED pull request exactly as
+# it does for an open one, so a branch whose pull request has already landed kept demanding a
+# receipt for every later push -- forever, on a branch nobody will review again. Only an OPEN pull
+# request means someone will read this.
+open_pull_request() {
   command -v gh >/dev/null 2>&1 || return 1
-  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || return 1
-  gh pr view "$branch" --json number >/dev/null 2>&1
+  [ -n "${1:-}" ] || return 1
+  [ "$(gh pr view "$1" --json state --jq .state 2>/dev/null)" = "OPEN" ]
 }
 
 # What is required is that the manifest was **run** against this commit, not that it was green.
@@ -52,12 +79,17 @@ review_branch() {
 # Running it is what was actually missed, four times in one session. A recorded run puts the
 # failures in front of the author before the push; judging them stays with the author, and CI
 # still has the last word.
-if review_branch; then
-  receipt="$(git rev-parse --absolute-git-dir)/acp-gates-receipt"
-  head="$(git rev-parse HEAD)"
-  if [ ! -f "$receipt" ] || ! grep -q "\"$head\"" "$receipt"; then
-    echo "pre-push: this branch has an open pull request, so CI will judge it." >&2
-    echo "  \`pnpm gates\` has not been run against $head." >&2
+receipt="$(git rev-parse --absolute-git-dir)/acp-gates-receipt"
+for entry in $pushed; do
+  branch="${entry%%:*}"
+  branch="${branch#refs/heads/}"
+  sha="${entry##*:}"
+  open_pull_request "$branch" || continue
+  # The commit being pushed, not `HEAD`. They are the same for the ordinary push and
+  # different for every other one, and the receipt names a commit.
+  if [ ! -f "$receipt" ] || ! grep -q "\"$sha\"" "$receipt"; then
+    echo "pre-push: $branch has an open pull request, so CI will judge it." >&2
+    echo "  \`pnpm gates\` has not been run against $sha." >&2
     echo "" >&2
     echo "  Run it -- same manifest, same order, same executor CI uses:" >&2
     echo "    pnpm build && pnpm gates" >&2
@@ -70,7 +102,7 @@ if review_branch; then
   fi
   failed="$(sed -n 's/.*"failed":"\([^"]*\)".*/\1/p' "$receipt")"
   if [ -n "$failed" ]; then
-    echo "pre-push: \`pnpm gates\` was run against this commit and stopped at \`$failed\`." >&2
+    echo "pre-push: \`pnpm gates\` was run against $sha and stopped at \`$failed\`." >&2
     echo "  Pushing anyway. CI will reach the same gate -- this is here so it is not a surprise." >&2
   fi
-fi
+done

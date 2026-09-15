@@ -150,6 +150,60 @@ const WRAPPED = "subject\n\nbody\n\nLimit: this wraps across\ntwo lines.\n";
 /** The hook's own sentence about the message. It must not be said about the interpreter. */
 const TRAILER_REFUSAL = "writes a record git will not store";
 
+/**
+ * `pre-push` receives what git is pushing on stdin and used to ignore it, asking `HEAD` instead.
+ *
+ * Measured 2026-09-15: pushing `refs/notes/commitlore` -- the mirror this repository's whole
+ * record-keeping depends on -- was refused for want of a `pnpm gates` receipt. A notes push
+ * carries no commit and cannot change what CI judges, so nothing it could have run would have
+ * answered the question the receipt exists for. The records could not be published because of the
+ * gate that guards the code.
+ *
+ * The cases below assert the hook returns *without running the anchors pass*, because "exits 0"
+ * alone would also be true of a hook that ran the whole check and happened to pass. The anchors
+ * pass prints a line on every run; its absence is what distinguishes the two.
+ */
+const runPrePush = (stdin: string): { status: number; out: string } => {
+  const r = boundedSpawnSync(hook("pre-push"), ["origin", "git@github.com:MongLong0214/agent-control-plane.git"], {
+    cwd: ROOT,
+    encoding: "utf8",
+    input: stdin,
+  });
+  return { status: r.status ?? -1, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
+};
+
+const ZERO = "0".repeat(40);
+
+describe("pre-push asks about what is being pushed, not about HEAD", () => {
+  it("returns without checking anything when the push carries no branch", () => {
+    // A notes-only push. This is the one measured on 2026-09-15.
+    const notes = runPrePush(`refs/notes/commitlore ${"a".repeat(40)} refs/notes/commitlore ${"b".repeat(40)}\n`);
+    expect(notes.status).toBe(0);
+    expect(notes.out).not.toContain("anchor(s) still match");
+  });
+
+  it("returns without checking anything when the push is a branch deletion", () => {
+    // git sends an all-zero local sha for a delete: no tree for a row to name, no commit to judge.
+    const deleted = runPrePush(`refs/heads/gone ${ZERO} refs/heads/gone ${"c".repeat(40)}\n`);
+    expect(deleted.status).toBe(0);
+    expect(deleted.out).not.toContain("anchor(s) still match");
+  });
+
+  it("returns without checking anything when git sends no refs at all", () => {
+    const nothing = runPrePush("");
+    expect(nothing.status).toBe(0);
+    expect(nothing.out).not.toContain("anchor(s) still match");
+  });
+
+  it("does check when a branch is actually being pushed", () => {
+    // The other direction, so the three cases above cannot be satisfied by a hook that checks
+    // nothing at all. This one reaches the anchors pass; whether it then wants a receipt depends
+    // on whether that branch has an open pull request, which is not what this case is about.
+    const branch = runPrePush(`refs/heads/some-branch ${"d".repeat(40)} refs/heads/some-branch ${ZERO}\n`);
+    expect(branch.out).toContain("anchor(s) still match");
+  });
+});
+
 describe("commit-msg refuses a trailer git will not parse", () => {
   it("refuses a Limit that wraps onto a second line", () => {
     // The exact shape that reached six commits on 2026-08-22. `git interpret-trailers` reads the
