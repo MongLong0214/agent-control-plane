@@ -22,6 +22,7 @@ import {
   classifyProbeSignal,
   mayTerminate,
   planDisposableRealm,
+  writeProbeChildSettings,
   productionRoot,
   realmLayout,
   takeProbeToolCensus,
@@ -634,6 +635,55 @@ describe("the probe tool census answers from the child's own configuration", () 
 
     expect(off.tools).toEqual(Object.fromEntries(PROBE_FORBIDDEN_TOOLS.map((tool) => [tool, false])));
     expect(assertProbeToolsMeasuredOff(off).allowed).toBe(true);
+  });
+});
+
+describe("the realm writes the settings the census judges it by", () => {
+  const realm = (): RealmPaths => {
+    const stateDir = tempDir("acp-probe-realm-");
+    return {
+      stateDir,
+      databasePath: join(stateDir, "state.sqlite"),
+      runtimeRoot: join(stateDir, "runtime"),
+      socketDir: join(stateDir, "sockets"),
+      lockPath: join(stateDir, "agentcpd.lock"),
+    };
+  };
+
+  it("writes settings the census then reads as every forbidden tool off", () => {
+    // The two halves meet here and nowhere else: this test would pass on a writer that lied only
+    // if the census agreed with it, and the census reads the file rather than the writer.
+    const paths = realm();
+    const written = writeProbeChildSettings(paths);
+    if (!written.allowed) throw new Error(`write refused: ${written.reasonCode}`);
+
+    const taken = takeProbeToolCensus(written.value, "2026-09-15T00:00:00.000Z");
+    if (!taken.allowed) throw new Error("census refused");
+
+    expect(taken.value.measuredAt).not.toBeNull();
+    expect(assertProbeToolsMeasuredOff(taken.value).allowed).toBe(true);
+  });
+
+  it("writes it inside the realm, so the residue check already covers it", () => {
+    const paths = realm();
+    const written = writeProbeChildSettings(paths);
+    if (!written.allowed) throw new Error("write refused");
+
+    // Not a new rule: `verifyRealmResidue` walks the state directory entry by entry, so a realm
+    // that forgets to remove the child's settings fails the check that already exists.
+    expect(written.value.startsWith(paths.stateDir)).toBe(true);
+    expect(verifyRealmResidue(paths).allowed).toBe(false);
+  });
+
+  it("refuses rather than reporting a census it could not have taken", () => {
+    const paths = realm();
+    rmSync(paths.stateDir, { recursive: true, force: true });
+    writeFileSync(paths.stateDir, "not a directory");
+
+    const written = writeProbeChildSettings(paths);
+
+    expect(written.allowed).toBe(false);
+    expect(written.reasonCode).toBe(ReasonCode.ACCEPTANCE_PROBE_INCONCLUSIVE);
   });
 });
 

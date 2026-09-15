@@ -1,4 +1,13 @@
-import { lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
+import {
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -747,6 +756,56 @@ export const PROBE_FORBIDDEN_TOOLS = [
   "browser",
   "mcp",
 ] as const;
+
+/**
+ * Writes the settings the probe child starts under, inside the realm, so the census has something
+ * to read and cleanup has one more thing to remove.
+ *
+ * This is the half that makes condition 3 checkable rather than merely enforced. The gate refuses
+ * an unmeasured census; the census reads a file; and until something wrote that file the only
+ * reachable answer was "never measured". The run writes it into its own disposable state
+ * directory, which `verifyRealmResidue` already walks entry by entry, so a realm that leaves it
+ * behind fails the residue check with no new rule.
+ *
+ * Writing and reading stay separate functions on purpose. If this wrote the wrong thing -- a
+ * permissive `defaultMode`, a tool left out -- `takeProbeToolCensus` reads the file back and the
+ * gate refuses. A single function that both configured the child and declared it configured would
+ * be the subject deciding the claim about itself.
+ *
+ * `defaultMode: "default"` is part of the content, not an assumption about it: under
+ * `bypassPermissions` the `deny` list below would grant anyway, and the census would correctly
+ * report nothing measured. The mode and the list have to agree for this to mean anything, and
+ * writing both here is what makes them agree.
+ */
+export const writeProbeChildSettings = (paths: RealmPaths): Decision<string> => {
+  const settingsPath = join(paths.stateDir, "probe-child", "settings.json");
+  try {
+    mkdirSync(dirname(settingsPath), { recursive: true });
+    writeFileSync(
+      settingsPath,
+      `${JSON.stringify(
+        {
+          permissions: {
+            defaultMode: "default",
+            deny: [...PROBE_FORBIDDEN_TOOLS],
+            allow: [],
+            ask: [],
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      { mode: 0o600 },
+    );
+  } catch (error) {
+    return deny(
+      ReasonCode.ACCEPTANCE_PROBE_INCONCLUSIVE,
+      "the probe child's settings could not be written, so its tool surface cannot be measured",
+      { settingsPath, error: error instanceof Error ? error.message : String(error) },
+    );
+  }
+  return allow(ReasonCode.OK, settingsPath);
+};
 
 /**
  * Takes the census `assertProbeToolsMeasuredOff` refuses without, by reading the settings file the
