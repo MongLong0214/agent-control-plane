@@ -1378,14 +1378,23 @@ export const startTelegramLongPollListener = async (
     // was the same constant whether a CEO was bound at generation 1 or none was bound at all,
     // which is the one distinction it exists to draw. The option is now required, so the next
     // composition root cannot repeat this silently.
-    // Read from the same resolution the claim's canonical target uses, not from `Role.CEO`.
-    // The two have to agree: `isBoundReceiptIdentity` only stores a target whose generation
-    // reproduces the identity's `bindingDigest`, so a digest built from a CEO generation would
-    // have discarded every canonical target this deployment can produce -- silently, as an absent
-    // optional field. Measured on the live database, `bindings.active("CEO")` is null there (the
-    // one CEO assignment was revoked at generation 1), so that digest was `digestOf({
-    // bindingGeneration: null })`: the same constant this option was made required to stop being.
-    bindingGeneration: () => canonicalTurnTarget(cp)?.bindingGeneration ?? null,
+    // Still `Role.CEO`, and deliberately so. `bindingDigest` is #639's fence -- *which CEO
+    // generation asked this turn* -- and an earlier revision of this change quietly redefined it
+    // as the generation of whichever actor would answer, because `canonicalTarget` was being
+    // validated with `isBoundReceiptIdentity`, which requires the stored generation to reproduce
+    // this digest. `a-turn-claim-outlives-the-process-that-made-it` caught that in CI: it pins the
+    // fence against the CEO generation the binding registry held, which is the property #639
+    // named, and the redefinition broke it.
+    //
+    // The two questions stay apart instead. The canonical target carries its own generation and is
+    // checked by `isBoundCanonicalTarget`, which does not tie it to this digest.
+    //
+    // That leaves the fence reading `digestOf({ bindingGeneration: null })` in this deployment,
+    // because the live `CEO` assignment was revoked at generation 1 and never rebound -- the
+    // deployment's own doctor reports `CEO_ROLE_UNBOUND`. That is a real gap and it is not this
+    // change's to close: papering over it by substituting a different actor's generation would
+    // make the fence read plausible while measuring something else.
+    bindingGeneration: () => cp.bindings.active(roleKeyFor(Role.CEO))?.bindingGeneration ?? null,
     currentCandidateSnapshotDigest: (runId) => cp.runs.currentCandidate(runId),
     resolveOwnerPrompt: (input) => storedOwnerPrompt(cp, input.chatId, input.messageId, input.runId),
     recordOwnerPrompt: (record) => recordOwnerPrompt(cp, record),

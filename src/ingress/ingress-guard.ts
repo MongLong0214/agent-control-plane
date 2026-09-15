@@ -557,7 +557,7 @@ export class IngressGuard {
     if (!row?.turn_claim_json) return null;
     try {
       const claim = JSON.parse(row.turn_claim_json) as TurnClaim;
-      return isBoundReceiptIdentity(claim.canonicalTarget ?? null, claim) ? claim.canonicalTarget! : null;
+      return isBoundCanonicalTarget(claim.canonicalTarget ?? null, claim) ? claim.canonicalTarget! : null;
     } catch {
       return null;
     }
@@ -730,12 +730,16 @@ export class IngressGuard {
         // settle this turn, and this names whichever actor `claim()` would admit, whatever its
         // executor kind or attestation protocol. Folding them together would let the reconcile
         // path ask a `claude-cli` target for a `hermes.target-bind/v1` receipt it can never have.
+        //
+        // And a separate validator, for the same reason one step further in: sharing
+        // `isBoundReceiptIdentity` would have tied this target's generation to `bindingDigest`,
+        // which is a different fact about a different actor. See `isBoundCanonicalTarget`.
         const canonicalTarget = this.#canonicalTargetForClaim?.(identity) ?? null;
         const claim: TurnClaim = {
           deliveryStatus: TURN_CLAIMED,
           ...identity,
           ...(isBoundReceiptIdentity(receiptIdentity, identity) ? { receiptIdentity } : {}),
-          ...(isBoundReceiptIdentity(canonicalTarget, identity) ? { canonicalTarget } : {}),
+          ...(isBoundCanonicalTarget(canonicalTarget, identity) ? { canonicalTarget } : {}),
         };
         const updated = this.db.run(
           `UPDATE inbound_messages SET turn_claim_json = ?
@@ -1643,6 +1647,43 @@ const isBoundReceiptIdentity = (
     && typeof query.targetAttestationId === "string" && query.targetAttestationId.trim().length > 0
     && typeof query.executorSessionId === "string" && query.executorSessionId.trim().length > 0
     && typeof query.executorSessionIncarnation === "string" && query.executorSessionIncarnation.trim().length > 0;
+};
+
+/**
+ * The canonical target's own check, which is `isBoundReceiptIdentity` minus one condition.
+ *
+ * That one condition is the whole reason this exists. `isBoundReceiptIdentity` requires
+ * `identity.bindingDigest === digestOf({ bindingGeneration: query.bindingGeneration })`, which is
+ * right for a Hermes receipt identity -- it and the fence both speak for the CEO generation that
+ * asked the turn. The canonical target does not: it names whichever actor `claim()` would admit,
+ * and that actor's generation is its own fact. Tying the two together does not validate the
+ * target; it silently redefines `bindingDigest`, which is #639's fence, as something else.
+ *
+ * Found in CI rather than by reading: `a-turn-claim-outlives-the-process-that-made-it` pins the
+ * fence against the CEO generation the binding registry held, and it failed the moment the two
+ * were coupled. The test was right.
+ *
+ * Everything else is kept. The tuple still has to belong to *this* turn, and every field still has
+ * to be a non-empty string, because a stored row is read back by a later process that cannot ask
+ * where it came from.
+ */
+const isBoundCanonicalTarget = (
+  value: unknown,
+  identity: TurnIdentity,
+): value is ReceiptLookupQuery => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const query = value as Partial<ReceiptLookupQuery>;
+  return query.turnRequestId === identity.turnRequestId
+    && query.promptDigest === identity.promptDigest
+    && typeof query.targetActorId === "string" && query.targetActorId.trim().length > 0
+    && typeof query.bindingGeneration === "number"
+    && Number.isSafeInteger(query.bindingGeneration)
+    && query.bindingGeneration > 0
+    && typeof query.targetBindingId === "string" && query.targetBindingId.trim().length > 0
+    && typeof query.targetAttestationId === "string" && query.targetAttestationId.trim().length > 0
+    && typeof query.executorSessionId === "string" && query.executorSessionId.trim().length > 0
+    && typeof query.executorSessionIncarnation === "string"
+    && query.executorSessionIncarnation.trim().length > 0;
 };
 
 /** Neither a stored row nor its caller may substitute one authenticated target tuple for another. */
