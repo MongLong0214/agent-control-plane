@@ -32,6 +32,7 @@ import {
   type BuzzSubscriberScheduler,
 } from "../buzz/buzz-mention-subscriber.ts";
 import type { OwnerIdentity } from "../ceo/owner-authority.ts";
+import { canonicalTurnTarget } from "../conversation/canonical-turn-target.ts";
 import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { recordMigrationRefusal } from "../db/migration-approval.ts";
@@ -746,7 +747,20 @@ export const startBuzzMessageIngressListener = async (
     throw new Error("Buzz message ingress requires a non-empty signing secret");
   }
 
-  const guard = new IngressGuard(cp.db, cp.clock, cp.audit, { buzz: policy });
+  // The second argument is #858's other half. `IngressGuard` stores a claim's canonical target
+  // only when it is given a resolver, and this composition never was -- so the live Buzz claim
+  // (`msg_b4177e7ec603...`, 2026-09-13) carries `deliveryStatus`, three digests and no
+  // `canonicalTarget`, and `canonicalTargetForClaim("buzz", nonce)` can only answer null for it.
+  // Without this line the bridge below is a call that always refuses, which is the shape
+  // `telegram-polling.ts` already met once and named: a writer that cannot write.
+  const guard = new IngressGuard(cp.db, cp.clock, cp.audit, { buzz: policy }, {
+    canonicalTargetForClaim: (identity) => {
+      const target = canonicalTurnTarget(cp);
+      return target
+        ? { turnRequestId: identity.turnRequestId, promptDigest: identity.promptDigest, ...target }
+        : null;
+    },
+  });
   // `policy.allowedActors` is the relay credential's list and admits every ACTIVE Buzz channel
   // identity; `ownerActors` is who may speak to the CEO as the owner. Passing the first for the
   // second is the defect this argument exists to make impossible to write by accident.
@@ -803,6 +817,28 @@ export const startBuzzMessageIngressListener = async (
         );
       }
       return allow(enqueued.reasonCode, { messageId: enqueued.value.messageId });
+    },
+    // #858. The ingress claim is the ledger `IngressGuard` writes; this is the one it does not.
+    // The target is read back from the claim rather than resolved a second time -- the guard
+    // stored what was decided, and a binding that fails over between the claim and this call must
+    // not silently retarget the turn.
+    materializeTurn: ({ channel, nonce, prompt, payload }) => {
+      const query = guard.canonicalTargetForClaim(channel, nonce);
+      if (!query) {
+        return deny(
+          ReasonCode.CONVERSATION_TARGET_UNVERIFIED,
+          "the claim names no canonical target, so no canonical turn can name one either",
+          { channel, nonce },
+        );
+      }
+      const claimed = cp.conversation.claim({
+        targetActorId: query.targetActorId,
+        prompt,
+        sources: [{ channel, nonce, attempt: 1, payload }],
+      });
+      return claimed.allowed
+        ? allow(ReasonCode.OK, undefined)
+        : deny(claimed.reasonCode, claimed.message, claimed.evidence);
     },
     wakeRole: async (roleKey) =>
       roleConversation
