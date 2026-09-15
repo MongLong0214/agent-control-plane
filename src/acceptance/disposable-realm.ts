@@ -1,4 +1,4 @@
-import { lstatSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
+import { lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -747,6 +747,76 @@ export const PROBE_FORBIDDEN_TOOLS = [
   "browser",
   "mcp",
 ] as const;
+
+/**
+ * Takes the census `assertProbeToolsMeasuredOff` refuses without, by reading the settings file the
+ * probe child will actually start under.
+ *
+ * The forbidden list stays where it is. This answers a different question — *does this child's own
+ * configuration let it call that tool* — so the list is ours and the answer is the child's, which
+ * is what keeps this from being the restatement the list's own comment warns about.
+ *
+ * Three rules, and the first is the one that matters:
+ *
+ * 1. `permissions.defaultMode` decides whether the other two mean anything. Claude Code's
+ *    `bypassPermissions` and `acceptEdits` grant without consulting the lists, so under either of
+ *    them a `deny` entry proves nothing and this census records **no tool at all**. An empty census
+ *    is refused by the gate as unmeasured, which is the honest outcome: the file was read and it
+ *    does not establish that anything is off.
+ * 2. Under `default` or `plan`, a tool named in `deny` is off and a tool named in `allow` is on.
+ * 3. A tool in neither list is left out of the census entirely rather than guessed at. The gate
+ *    reads an absent key as unmeasured and refuses, so silence costs a refusal instead of buying
+ *    a pass.
+ *
+ * Entries are `Tool` or `Tool(argument)`; only the head is matched, case-insensitively, because
+ * this repository's list is lowercase and Claude Code's entries are capitalised. An entry that
+ * narrows a tool to particular arguments (`Bash(git status)`) still counts as that tool being
+ * reachable — condition 3 is about reach, and a narrowed `Bash` still leaves the realm.
+ */
+export const takeProbeToolCensus = (
+  settingsPath: string,
+  now: string,
+  read: (path: string) => string = (path) => readFileSync(path, "utf8"),
+): Decision<ProbeToolCensus> => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(read(settingsPath));
+  } catch (error) {
+    // Unreadable and absent are the same answer to the only question asked here, and it is not
+    // "off": a census that could not be taken must not be returned as one that found nothing
+    // enabled. `measuredAt: null` is what the gate refuses on.
+    return allow(ReasonCode.OK, {
+      measuredAt: null,
+      targetRoot: dirname(settingsPath),
+      tools: {},
+      ...(error instanceof Error ? {} : {}),
+    });
+  }
+  const permissions = (parsed as { permissions?: unknown }).permissions;
+  const section = (name: string): readonly string[] => {
+    const value = (permissions as Record<string, unknown> | undefined)?.[name];
+    return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+  };
+  const mode = typeof (permissions as { defaultMode?: unknown } | undefined)?.defaultMode === "string"
+    ? ((permissions as { defaultMode: string }).defaultMode)
+    : "default";
+
+  // Read, and deliberately answering nothing. Naming the two modes rather than allow-listing the
+  // other two: a mode this repository has not met is unknown, and unknown must not read as safe.
+  if (mode !== "default" && mode !== "plan") {
+    return allow(ReasonCode.OK, { measuredAt: now, targetRoot: dirname(settingsPath), tools: {} });
+  }
+
+  const head = (entry: string): string => (entry.split("(")[0] ?? "").trim().toLowerCase();
+  const denied = new Set(section("deny").map(head));
+  const allowed = new Set(section("allow").map(head));
+  const tools: Record<string, boolean> = {};
+  for (const tool of PROBE_FORBIDDEN_TOOLS) {
+    if (denied.has(tool)) tools[tool] = false;
+    else if (allowed.has(tool)) tools[tool] = true;
+  }
+  return allow(ReasonCode.OK, { measuredAt: now, targetRoot: dirname(settingsPath), tools });
+};
 
 /**
  * Refuses unless the census exists and every forbidden tool is measured off.
