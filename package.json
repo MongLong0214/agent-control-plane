@@ -47,6 +47,7 @@
     "hooks:check": "node scripts/verify-hooks-are-installed.mjs",
     "hooks:install": "node scripts/install-hooks.mjs",
     "notes:fetch": "node scripts/fetch-commitlore-notes.mjs",
+    "closure:affected": "node scripts/verify-affected-closure-misses-nothing.mjs",
     "trailers": "node scripts/verify-trailers-are-parsable.mjs",
     "merge-records": "node scripts/verify-merge-preserved-records.mjs",
     "merge": "node scripts/merge-pr.mjs",

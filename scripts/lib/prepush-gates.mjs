@@ -79,6 +79,12 @@ export const GATES = [
   // lives in `src/quality/recurring-defects.ts`; this fails on the one state it exists to make
   // loud — recurred, and nothing guards it — and on an entry naming a guard that does not
   // resolve, because a guard nobody can run is the same silence wearing a name.
+  // #885 unit 2: the affected closure and reverse reachability agree over 60 real changed-file
+  // sets. It was exempt from having a caller at all while it could not pass; it passes in two
+  // seconds now, and the exemption's own comment said to remove it when that happened. Wiring it
+  // narrows nothing -- the full sweep still runs everywhere -- it only stops the agreement from
+  // silently lapsing.
+  { script: "closure:affected" },
   { script: "guards:recurrence" },
   { script: "guards:subprocess-bounds" },
   // A member of a watched string-literal union that nothing in `src/` constructs. Measured
