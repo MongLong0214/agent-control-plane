@@ -23,10 +23,30 @@
  * is the only failure mode that matters here, because a missed row is a guard nothing checked while
  * a green sweep said the selection was complete.
  *
- * **Not in the gate set, deliberately.** It exits 1 today, and it should: the thing it must prove
- * is not yet provable. Wiring a check that cannot pass would either turn CI red for a property
- * nobody has claimed, or invite someone to relax it into passing. It runs on demand and its
- * refusal is the record of what unit 3 is waiting for.
+ * **In the gate set as of 2026-09-16, because it passes.** The paragraph here used to say it exits
+ * 1 and should, which stopped being true without anyone noticing -- a comment asserting a
+ * falsehood about its own file is the class this repository keeps paying for. Measured:
+ *
+ *     $ node scripts/verify-affected-closure-misses-nothing.mjs ; echo $?
+ *     RESULT: PASS ... 0            2 seconds
+ *
+ * The old default of 12 commits was measuring almost nothing, and that is why passing went
+ * unnoticed. A change to `ci.yml`, `package.json` or `verify-guards-are-falsifiable.mjs` forces
+ * FULL, which skips the reverse computation entirely, and a week of infrastructure work fills the
+ * window with exactly those:
+ *
+ *     12 sets   7 FULL   5 SELECTED, 3 of them selecting 0 rows   -> 2 real comparisons, identical
+ *     60 sets  21 FULL  39 SELECTED, 7 of them selecting 0 rows   -> 32 real comparisons,
+ *                                                                    spanning 6..547 of 665 rows
+ *
+ * So the default is 60. Two identical answers is not evidence that a selection misses no row; the
+ * number here is what decides whether this file measures anything at all, and it is the first thing
+ * to re-measure if the verdict ever looks too easy.
+ *
+ * Still wiring nothing. The full sweep runs on every pull request and on `main`, unchanged. What a
+ * standing green here establishes is only that the closure and reverse reachability agree -- and
+ * the CEO's refusal of the changed-file-only proposal stands on its own ground, that deferring
+ * cross-file regression to `main`'s sweep is a quality reduction. This check does not answer that.
  *
  * Limit: this proves the *selection* agrees with reachability. It does not prove reachability is
  * the right relation — a row can stop being killed for a reason no import edge expresses, and
@@ -51,7 +71,12 @@ if (unknown.length > 0) {
   process.exit(2);
 }
 const commitsArgument = process.argv.slice(2).find((argument) => argument.startsWith("--commits="));
-const COMMITS = commitsArgument === undefined ? 12 : Number(commitsArgument.slice("--commits=".length));
+// 60, not 12: see this file's header. At 12 the window fills with FULL verdicts and the
+// comparison this file exists to make happens twice, on one answer.
+const DEFAULT_COMMITS = 60;
+const COMMITS = commitsArgument === undefined
+  ? DEFAULT_COMMITS
+  : Number(commitsArgument.slice("--commits=".length));
 if (!Number.isInteger(COMMITS) || COMMITS < 1) {
   process.stderr.write(`verify-affected-closure-misses-nothing: --commits=${COMMITS} is not a count of 1 or more.\n`);
   process.exit(2);

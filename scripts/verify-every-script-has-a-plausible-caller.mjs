@@ -48,9 +48,6 @@ const EXEMPT = {
   // Keyed by bare filename: `scriptFiles` is a `readdirSync` of `scripts/`, while the failure
   // message prints the path form. The display form is not the key form, and writing the
   // printed string here leaves the exemption silently unmatched.
-  "verify-affected-closure-misses-nothing.mjs":
-    "deliberately manual: it exits 1 until #885's remaining evidence exists, so a caller would " +
-    "make every build red for a property nobody has claimed",
 };
 
 const PACKAGE_MANAGERS = new Set(["pnpm", "npm", "yarn"]);
