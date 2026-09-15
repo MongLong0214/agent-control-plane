@@ -1956,3 +1956,149 @@ describe("the daemon's answering room and its subscriber's rooms are cross-check
     );
   });
 });
+
+/**
+ * #858's other half: the Buzz route writes the canonical ledger, not only the ingress one.
+ *
+ * `canonical_turns` has one writer — `ConversationTurnCoordinator.claim()` — and the only bridge
+ * to it was the Telegram router's. Measured on the live database 2026-09-15, that bridge had never
+ * fired, because Telegram had delivered nothing: `buzz 1, cli 3, mcp 2, telegram 0`. The one
+ * conversational message this deployment has ever carried came in here, and this route had no
+ * bridge at all, so four adjudication surfaces and a 60s reconcile sweep passed over an empty set.
+ *
+ * The rows below drive the whole composition — `startBuzzMessageIngressListener`, a signed
+ * envelope over the real socket — because the two halves that can be wrong are both in it: the
+ * guard has to be given a target resolver before it stores a canonical target, and the bridge has
+ * to hand over the payload admission digested. Either one missing leaves `canonical_turns` empty
+ * while every observable the owner sees is unchanged, which is how this went unnoticed once.
+ */
+const canonicalTargetFor = (harness: ReturnType<typeof makeHarness>): string => {
+  const at = "2026-09-15T00:00:00.000Z";
+  const suffix = "858-buzz";
+  const actorId = `actor:${suffix}`;
+  const bindingId = `tb:${suffix}`;
+  const sessionId = `ses:${suffix}`;
+  const assignmentId = `asg:${suffix}`;
+  // Its own actor, session and assignment rather than the CEO binding's. `bind()`'s assignment
+  // cannot be retargeted -- `BINDING_IDENTITY_IMMUTABLE` refuses the UPDATE -- and it should not
+  // be: the live deployment's one admissible attestation belongs to a `PRIMARY_CTO` bound to
+  // `claude-cli`, not to the CEO role, so an attestation on its own actor is the shape production
+  // actually has. `canonicalTurnTarget` reads no role at all.
+  harness.cp.db.run(
+    `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
+     VALUES (?, ?, 'claude', 'opus', 'READY', ?, ?)`,
+    [sessionId, `${sessionId}#${at}`, at, at],
+  );
+  harness.cp.db.run(
+    `INSERT INTO conversational_actors (actor_id, kind, created_at, current_session_id, current_session_incarnation)
+     VALUES (?, 'CEO', ?, ?, ?)`,
+    [actorId, at, sessionId, `${sessionId}#${at}`],
+  );
+  harness.cp.db.run(
+    `INSERT INTO assignments
+       (assignment_id, role_key, role, actor_id, session_id, session_incarnation,
+        binding_generation, mode, status, created_at)
+     VALUES (?, ?, 'CEO', ?, ?, ?, 1, 'PREFERRED', 'ACTIVE', ?)`,
+    [assignmentId, `CEO:${suffix}`, actorId, sessionId, `${sessionId}#${at}`, at],
+  );
+  harness.cp.db.run(
+    `INSERT INTO actor_target_bindings
+       (target_binding_id, target_actor_id, executor_kind, target_locator, target_locator_digest, bound_at)
+     VALUES (?, ?, 'claude-cli', ?, ?, ?)`,
+    [bindingId, actorId, "conversation-under-test", "sha256:conversation-under-test", at],
+  );
+  harness.cp.db.run(
+    `INSERT INTO actor_target_attestations
+       (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
+        executor_session_id, executor_session_incarnation, binding_generation, assignment_id, attested_at)
+     VALUES (?, ?, 'acp.canonical-self-claim/v1', ?, ?, ?, 1, ?, ?)`,
+    [`ta:${suffix}`, bindingId, `sha256:att-${suffix}`, sessionId, `${sessionId}#${at}`, assignmentId, at],
+  );
+  return actorId;
+};
+
+describe("#858 the Buzz route writes the canonical ledger too", () => {
+  it("records the delivered turn in canonical_turns, naming the buzz nonce as its source", async () => {
+    const harness = makeHarness();
+    bindCeo(harness);
+    const actorId = canonicalTargetFor(harness);
+
+    const conversation = new CeoConversationPort();
+    const { server } = fakeCeoPeer("기록됨");
+    conversation.attach(server, stillCeo());
+    const listener = await startMessageListener(harness, conversation);
+
+    try {
+      const received = await exchangeSocketLines(
+        listener.socketPath,
+        [envelope({ eventId: "evt-canonical", text: "이 턴은 canonical 원장에 남아야 한다" })],
+        hasReasonCode,
+      );
+      expect(JSON.parse(received.trim())).toMatchObject({ ok: true, reasonCode: ReasonCode.OK });
+
+      const turn = harness.cp.db.get<{ turn_request_id: string; target_actor_id: string }>(
+        `SELECT turn_request_id, target_actor_id FROM canonical_turns`,
+      );
+      expect(turn, "the Buzz route delivered a turn and canonical_turns is still empty").toBeTruthy();
+      expect(turn?.target_actor_id).toBe(actorId);
+
+      // The source, not only the turn. A turn with no source names no message, and the coalescing
+      // storage #631 needs is `canonical_turn_sources` — a bridge that wrote the turn alone would
+      // look identical here without this.
+      const source = harness.cp.db.get<{ source_channel: string; source_nonce: string }>(
+        `SELECT source_channel, source_nonce FROM canonical_turn_sources WHERE turn_request_id = ?`,
+        [turn!.turn_request_id],
+      );
+      expect(source?.source_channel).toBe("buzz");
+      expect(source?.source_nonce).toBe(buzzMessageNonce("evt-canonical"));
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("hands over the payload admission digested, not the envelope", async () => {
+    // The defect this exists to catch has already happened once on the Telegram bridge: it passed
+    // the raw update, `claim()` compared the digest against what `INGRESS_ADMITTED` recorded, and
+    // every message in every deployment was refused with CONVERSATION_TURN_SOURCE_PAYLOAD_MISMATCH
+    // — invisibly, because the bridge's refusal never reaches the reply.
+    const harness = makeHarness();
+    bindCeo(harness);
+    canonicalTargetFor(harness);
+
+    const conversation = new CeoConversationPort();
+    const { server } = fakeCeoPeer("답");
+    conversation.attach(server, stillCeo());
+    const listener = await startMessageListener(harness, conversation);
+
+    try {
+      await exchangeSocketLines(
+        listener.socketPath,
+        [envelope({ eventId: "evt-digest", text: "페이로드 대조" })],
+        hasReasonCode,
+      );
+
+      const nonce = buzzMessageNonce("evt-digest");
+      const admitted = harness.cp.db.get<{ payload_digest: string | null }>(
+        `SELECT json_extract(evidence_json, '$.payloadDigest') AS payload_digest
+           FROM audit_events
+          WHERE kind = 'INGRESS_ADMITTED'
+            AND json_extract(evidence_json, '$.channel') = 'buzz'
+            AND json_extract(evidence_json, '$.nonce') = ?
+          ORDER BY event_id DESC LIMIT 1`,
+        [nonce],
+      );
+      expect(admitted?.payload_digest, "admission recorded no payload digest to compare against").toBeTruthy();
+
+      const stored = harness.cp.db.get<{ source_digest: string }>(
+        `SELECT source_digest FROM canonical_turn_sources WHERE source_nonce = ?`,
+        [nonce],
+      );
+      expect(
+        stored?.source_digest,
+        "the bridge handed a payload whose digest is not the one admission recorded",
+      ).toBe(admitted?.payload_digest);
+    } finally {
+      await listener.close();
+    }
+  });
+});

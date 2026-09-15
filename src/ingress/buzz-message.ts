@@ -497,6 +497,25 @@ export interface BuzzMessageTurnPort {
    * next, which is why no polling path is needed.
    */
   wakeRole(roleKey: string): Promise<Decision<void>>;
+  /**
+   * Records the claimed turn in `canonical_turns`, the ledger `IngressGuard` does not write.
+   *
+   * Optional, and its result is deliberately not branched on. The Telegram path added this bridge
+   * first (`telegram-router.ts`) and the reasoning is the same one word for word: a refusal here
+   * leaves exactly today's state — ingress claimed, canonical empty — so failing can only fail to
+   * improve, never make the turn worse. Turning it into an answer would tell the owner about a
+   * ledger they cannot act on.
+   *
+   * Buzz needed its own because the bridge is per-route, and #858's zero outlived the Telegram one:
+   * measured on the live database 2026-09-15, `telegram` had delivered nothing and `buzz` had
+   * delivered the only conversational message there was.
+   */
+  materializeTurn?(input: {
+    channel: string;
+    nonce: string;
+    prompt: string;
+    payload: Record<string, unknown>;
+  }): Decision<void>;
 }
 
 /** What the relay gets back when a message became a turn. */
@@ -723,6 +742,14 @@ export const deliverBuzzMessage = async (
 ): Promise<Decision<BuzzMessageAnswer>> => {
   const admission = admitBuzzMessage(ingress, port, input);
   if (!admission.allowed) return admission as Decision<BuzzMessageAnswer>;
+  // Returning here is also where the canonical bridge below stops, and that is a decision rather
+  // than an oversight. `canonical_turns` carries `UNIQUE INDEX … ON (target_actor_id) WHERE
+  // lifecycle_state = 'IN_DOUBT'` -- one unresolved turn per target -- and `canonicalTurnTarget`
+  // resolves one actor for the whole deployment. A role-addressed message bridged the same way
+  // would take that single slot and block the CEO's next turn, for a message that was never the
+  // canonical conversation's. It is a different thing too: this route writes a durable outbox row
+  // for whoever holds the role and waits on nothing. Whoever adds the next ingress route decides
+  // again rather than inheriting this.
   if (admission.value.kind === "ROLE") return queuedForRole(port, admission.value);
 
   const admitted = admission.value.admitted;
@@ -733,6 +760,23 @@ export const deliverBuzzMessage = async (
   );
   const claimed = ingress.claimTurn(admitted.nonce, identity);
   if (!claimed.allowed) return claimed as Decision<BuzzMessageAnswer>;
+
+  // After the claim and before the delivery, matching the Telegram bridge: the claim runs inside
+  // `atomically`, and the coordinator opens its own transaction.
+  //
+  // `buzzMessagePayload(input)`, never a payload rebuilt here. `claim()` compares a source's
+  // digest against the one `INGRESS_ADMITTED` recorded, and admission digests exactly this value
+  // (`ingress.admit` -> `buzzMessagePayload(input)`), signature and `p` tag included. The Telegram
+  // bridge was refused with `CONVERSATION_TURN_SOURCE_PAYLOAD_MISMATCH` on every message in every
+  // deployment for passing the envelope instead of the admitted payload, and no test saw it
+  // because this call's refusal is invisible to the reply path by design. One spelling, read from
+  // the function admission itself calls.
+  port.materializeTurn?.({
+    channel: "buzz",
+    nonce: admitted.nonce,
+    prompt: admitted.text,
+    payload: buzzMessagePayload(input),
+  });
 
   const delivered = await port.deliverToCeo(admitted.text);
 
