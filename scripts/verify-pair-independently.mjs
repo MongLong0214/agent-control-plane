@@ -164,6 +164,38 @@ export const inspectDatabase = (path) => ({
   tables: Number(sqlite(path, "SELECT count(*) FROM sqlite_master WHERE type='table';")),
 });
 
+/**
+ * Proves the validator refuses a known-bad expectation, before any PASS is believed.
+ *
+ * A verifier that has only ever reported PASS on a good input has not shown it can fail. The second
+ * session's run established this by hand -- it re-ran `validate` with a value it knew to be wrong
+ * and got a non-zero exit with the expected/found difference printed -- and a property established
+ * by an operator remembering to establish it is not established. So it runs every time, with a
+ * deliberately wrong pair id: a `validate` that accepts that is a broken instrument whatever it
+ * says about the real one.
+ */
+const provesItCanFail = (validatorPath, pairRoot, receipt, measured, schemaVersion) => {
+  const argv = [
+    validatorPath, "validate",
+    "--pair-root", pairRoot,
+    "--pair-id", "00000000-0000-0000-0000-000000000000",
+    "--expected-index-digest", receipt.indexDigest,
+    "--expect-database", measured.databasePath,
+    "--expect-service-label", measured.label,
+    "--expect-working-directory", measured.workingDirectory,
+    "--expect-runtime-root", measured.runtimeRoot,
+    "--expect-schema-version", String(schemaVersion),
+    "--expect-service-generation", receipt.serviceGeneration ?? "",
+    "--expect-node-version", measured.nodeVersion,
+  ];
+  try {
+    execFileSync(process.execPath, argv, { encoding: "utf8", timeout: 600_000 });
+    return false;
+  } catch {
+    return true;
+  }
+};
+
 const main = (argv) => {
   const pairRoot = argumentValue(argv, "--pair-root");
   const receiptPath = argumentValue(argv, "--receipt");
@@ -207,6 +239,12 @@ const main = (argv) => {
     return 2;
   }
 
+  // Ruled out here, and the reason is worth keeping: a check that this file sits inside the
+  // checkout it verifies from. It reads like the structural close for the direct-invocation defect,
+  // and it is a tautology -- `checkoutRoot` is derived from `import.meta.url`, so `self` is inside
+  // it by construction and no mutation can make the branch fire. A guard nothing can kill reports
+  // coverage it does not have. What actually defends that class is the realpath comparison in the
+  // invocation guard at the bottom, and a case above dies when it is weakened back to `resolve()`.
   const measured = measureDeployment(plistPath);
   if (measured.verdict === "BLOCKED") {
     process.stdout.write(`BLOCKED — ${measured.why}\n  ${JSON.stringify(measured.detail)}\n`);
@@ -266,6 +304,14 @@ const main = (argv) => {
     }
     findings.push(["validate", validateStatus === 0 ? "PASS" : `FAIL exit ${String(validateStatus)}`, validateOut.trim()]);
     if (validateStatus !== 0) failed = true;
+
+    const canFail = provesItCanFail(validatorPath, pairRoot, receipt, measured, live.userVersion);
+    findings.push([
+      "CAN_FAIL",
+      canFail ? "PASS" : "FAIL",
+      canFail ? "a deliberately wrong pair id was refused" : "a deliberately wrong pair id was ACCEPTED",
+    ]);
+    if (!canFail) failed = true;
 
     findings.push(["integrity_check", live.integrity === "ok" ? "PASS" : "FAIL", live.integrity]);
     if (live.integrity !== "ok") failed = true;

@@ -146,3 +146,32 @@ describe("the independent pair check refuses what it cannot answer honestly", ()
     expect(out.stdout ?? "", "the deployed validator was used").not.toContain("STUB-DEPLOYED-VALIDATOR");
   });
 });
+
+describe("the independent pair check proves its instrument before trusting its answer", () => {
+  it("reports that the validator accepted a known-bad expectation, instead of only its own PASS", () => {
+    // A verifier that has only ever reported PASS on a good input has not shown it can fail. The
+    // second session established that by hand, once; a property an operator has to remember is not
+    // a property. Here the validator is a stub that succeeds on anything, so a run that does not
+    // probe it would report an unqualified PASS — and this asserts the probe happened and said so.
+    const elsewhere = tempDir("acp-pair-stubval-");
+    mkdirSync(join(elsewhere, "scripts"), { recursive: true });
+    mkdirSync(join(elsewhere, "dist/deploy"), { recursive: true });
+    writeFileSync(join(elsewhere, "dist/deploy/rollback-pair.js"), "process.stdout.write(\"ALWAYS-OK\\n\");\n");
+    const copied = join(elsewhere, "scripts/verify-pair-independently.mjs");
+    copyFileSync(SCRIPT, copied);
+    const { plist } = fixtureDeployment();
+    const pair = tempDir("acp-pair-stub-root-");
+    const receipt = join(tempDir("acp-pair-stub-receipt-"), "receipt.txt");
+    writeFileSync(receipt, "ACP_PAIR_ID=x\nACP_PAIR_INDEX_DIGEST=sha256:y\nservice_generation=g\n");
+
+    const out = boundedSpawnSync(
+      process.execPath,
+      [copied, "--pair-root", pair, "--receipt", receipt, "--plist", plist],
+      { cwd: elsewhere, encoding: "utf8" },
+    );
+    const stdout = out.stdout ?? "";
+    expect(stdout, "the run never reported on whether its validator can fail").toContain("CAN_FAIL");
+    expect(stdout, "a validator that accepts a bogus pair id was not called out").toContain("ACCEPTED");
+    expect(out.status, "a validator that cannot fail was reported as a pass").not.toBe(0);
+  });
+});
