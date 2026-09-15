@@ -460,31 +460,26 @@ const runVitestJson = (root: string): VitestJsonReport => {
     return parseVitestJsonReport(readFileSync(suppliedPath, "utf8"));
   }
 
-  // Say so. CI supplies ACP_VITEST_RESULTS precisely to avoid this second full run; a bare
-  // `pnpm trace` re-runs a suite that starts real sandboxed children, which is slow and was
-  // where the worker crash surfaced before `pool: "forks"`.
-  console.warn(
-    "pnpm trace: no ACP_VITEST_RESULTS supplied — running the whole suite a second time to obtain a JSON reporter pass",
+  // Refused rather than substituted. `a9c8c56a` already ruled on the shape this fallback has:
+  // *"it was a duplicate execution, and the fix is to not run it twice"* — and the record beside
+  // it says what a trace is for, *"traceability now describes the run the gate judged, so a
+  // supplied result set must come from the same commit"*. A suite this tool starts for itself is
+  // by definition not the run any gate judged, so the report it produced was a claim about an
+  // execution nobody looked at, dressed as coverage.
+  //
+  // It also pinned this tool to Darwin. The fallback starts the whole suite, and that suite reads
+  // `lsof`, launchd and peer credentials through a Darwin-only addon (#539), so a job running
+  // `pnpm trace` had to be on `macos-15` for a path CI arranges never to take. The CI workflow
+  // recorded that cost and the condition for lifting it in as many words: the move "waits until
+  // the fallback is removed or explicitly refused, as its own change." This is that change.
+  //
+  // The refusal names the command, because a refusal a reader cannot act on is just a failure.
+  throw new Error(
+    "pnpm trace needs a result set and will not produce one by starting a second suite run: a run " +
+      "this tool starts is not the run any gate judged. Supply ACP_VITEST_RESULTS, e.g.\n" +
+      "  pnpm vitest run --reporter=json --outputFile=evidence/local/ci-vitest-results.json\n" +
+      "  ACP_VITEST_RESULTS=evidence/local/ci-vitest-results.json pnpm trace",
   );
-  const evidenceDir = join(root, "evidence", "local");
-  const outputPath = join(evidenceDir, `traceability-vitest-${process.pid}.json`);
-  const vitestEntrypoint = join(root, "node_modules", "vitest", "vitest.mjs");
-  if (!existsSync(vitestEntrypoint)) {
-    throw new Error("Vitest is not installed; run pnpm install before pnpm trace");
-  }
-
-  mkdirSync(evidenceDir, { recursive: true });
-  const result = spawnSync(
-    process.execPath,
-    [vitestEntrypoint, "run", "--reporter=json", `--outputFile=${outputPath}`],
-    { cwd: root, encoding: "utf8" },
-  );
-  if (result.error) throw result.error;
-  if (!existsSync(outputPath)) {
-    const details = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
-    throw new Error(`Vitest JSON reporter did not produce a result set${details ? `: ${details}` : ""}`);
-  }
-  return parseVitestJsonReport(readFileSync(outputPath, "utf8"));
 };
 
 const markdownReport = (report: TraceabilityReport): string => [

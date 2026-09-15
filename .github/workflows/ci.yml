@@ -239,7 +239,21 @@ jobs:
     name: traceability
     needs: verify-matrix
     if: always()
-    runs-on: macos-15
+    # Moved off macOS (#885). The condition the `ssot` job below recorded for this move —
+    # "that move waits until the fallback is removed or explicitly refused, as its own change" —
+    # is met: `src/tools/traceability.ts` no longer starts a suite when it has no result set, it
+    # refuses and names the command that produces one. With that path gone, nothing here is
+    # Darwin-shaped: the tool imports four node builtins and `typescript`, and its only external
+    # command is `git rev-parse`/`git status`. It reads a result set the macOS matrix produced;
+    # reading that JSON needs no addon and no runner that can execute the suite.
+    #
+    # The three build steps went with it. `pnpm native:peercred:build` is Darwin-only by
+    # construction (#539) and would fail here; `native:fd-vfs` and the `better-sqlite3` rebuild
+    # served the suite this job no longer starts.
+    #
+    # This leaves five macOS jobs per pull request where there were six: `verify` (x2) and
+    # `guard falsifiability` (x4) are the ones that actually execute tests, and they stay.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
@@ -250,9 +264,6 @@ jobs:
           node-version: "22.18.0"
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm rebuild better-sqlite3
-      - run: pnpm native:peercred:build
-      - run: pnpm native:fd-vfs:build
       # The result set comes from the matrix leg the gate judged, on this same commit. Without it
       # `pnpm trace` runs the suite again, and a second execution is a different run — whatever it
       # reports is a claim about something no gate looked at. `if-no-files-found: error` above and
@@ -275,14 +286,11 @@ jobs:
     # are four node builtins and whose only external command is `gh`. Nothing in it is Darwin-shaped,
     # and it was on `macos-15` because every job here was.
     #
-    # Ruled out at the same time: moving `traceability` with it. `src/tools/traceability.ts` imports
-    # no native addon either, but it can spawn vitest directly (`traceability.ts:477`) when it has no
-    # result set to read. CI feeds it the artifact and `test -s` fails the job without one, so that
-    # path should not run — "should not" is the wrong footing for moving a job to a platform where
-    # the suite it would start cannot pass. That move waits until the fallback is removed or
-    # explicitly refused, as its own change.
+    # `traceability` has since followed it, once the condition this comment set was met: its
+    # vitest fallback is now an explicit refusal rather than a path that "should not" run, so the
+    # job no longer needs a platform where the suite could pass. See that job's own comment.
     #
-    # The four macOS legs that stay are the ones that run the suite: `verify` (×2) and
+    # The macOS legs that stay are the ones that run the suite: `verify` (×2) and
     # `guard falsifiability` (×4). Both build `native:peercred` and `native:fd-vfs` and then execute
     # tests that read `lsof`, launchd and peer credentials.
     runs-on: ubuntu-latest
