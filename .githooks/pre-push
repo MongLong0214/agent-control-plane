@@ -15,9 +15,62 @@
 # you expect to be reviewed: it is the same manifest and the same executor CI uses, so a green
 # `pnpm gates` is the answer CI would give, and #736's `pnpm lint` failure arrives in five seconds
 # instead of after a push and a wait.
+#
+# 2026-09-15: that last paragraph was advice, and advice is not a gate. The same class was met
+# four times in one session -- tests/process, a stale subprocess exclusion, an unnarrowed
+# Decision, an unused parameter -- each time by a gate the author would not have picked, and each
+# time about a *removal*, which is the shape a diff shows least. The advice had been read.
+#
+# So the three minutes are now charged where they buy something and nowhere else: a push to a
+# branch with an open pull request is a push someone will review, and it requires a green
+# `pnpm gates` on the exact commit being pushed. A work-in-progress branch with no pull request
+# still costs only the anchors pass, which is what keeps this hook installed.
 set -e
 if ! node scripts/verify-guards-are-falsifiable.mjs --anchors-only; then
   echo "pre-push: a falsifiability row no longer names a line that exists." >&2
   echo "CI runs this before the build; it will fail there in seconds. Fix the row first." >&2
   exit 1
+fi
+
+# `gh` absent, or no pull request, or the lookup failing: this is a work-in-progress push and the
+# receipt is not required. Deliberately fail-open on the *question* and fail-closed on the
+# *answer* -- an unavailable lookup must not block work, but once a pull request is known to
+# exist an absent receipt refuses.
+review_branch() {
+  command -v gh >/dev/null 2>&1 || return 1
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || return 1
+  gh pr view "$branch" --json number >/dev/null 2>&1
+}
+
+# What is required is that the manifest was **run** against this commit, not that it was green.
+# Green is not available everywhere: #895 pins the qualified executor at 2.1.268 while this
+# machine's PATH `claude` has moved on, so `wake-transport-qualification` fails locally forever
+# and CI skips that file. A hook demanding green would refuse every reviewed push permanently,
+# which is how a hook becomes a `--no-verify` habit -- the warning light that never turns off,
+# which this file's own comment already argues against.
+#
+# Running it is what was actually missed, four times in one session. A recorded run puts the
+# failures in front of the author before the push; judging them stays with the author, and CI
+# still has the last word.
+if review_branch; then
+  receipt="$(git rev-parse --absolute-git-dir)/acp-gates-receipt"
+  head="$(git rev-parse HEAD)"
+  if [ ! -f "$receipt" ] || ! grep -q "\"$head\"" "$receipt"; then
+    echo "pre-push: this branch has an open pull request, so CI will judge it." >&2
+    echo "  \`pnpm gates\` has not been run against $head." >&2
+    echo "" >&2
+    echo "  Run it -- same manifest, same order, same executor CI uses:" >&2
+    echo "    pnpm build && pnpm gates" >&2
+    echo "" >&2
+    echo "  Four failures in one session were in gates nobody would have picked: tests/process," >&2
+    echo "  guards:subprocess-bounds, tsc over vitest, and lint. All four were about a removal," >&2
+    echo "  which is the shape a diff shows least." >&2
+    echo "  Registered as \`pushed-without-the-gate-manifest\` in src/quality/recurring-defects.ts." >&2
+    exit 1
+  fi
+  failed="$(sed -n 's/.*"failed":"\([^"]*\)".*/\1/p' "$receipt")"
+  if [ -n "$failed" ]; then
+    echo "pre-push: \`pnpm gates\` was run against this commit and stopped at \`$failed\`." >&2
+    echo "  Pushing anyway. CI will reach the same gate -- this is here so it is not a surprise." >&2
+  fi
 fi

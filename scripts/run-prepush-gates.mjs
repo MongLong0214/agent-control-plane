@@ -27,8 +27,9 @@
  *   node scripts/run-prepush-gates.mjs            (run every gate, stop at the first failure)
  *   node scripts/run-prepush-gates.mjs --list     (print the manifest, run nothing)
  */
-import { spawnSync } from "node:child_process";
-import { appendFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { appendFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { GATES } from "./lib/prepush-gates.mjs";
@@ -157,6 +158,36 @@ if (onGitHub) {
       process.stdout.write(`gates: could not write the step summary: ${error.message}\n`);
     }
   }
+}
+
+// The receipt `.githooks/pre-push` reads: which commit this manifest was run against, and what
+// it found. It records the run, not a verdict — and that distinction is the difference between a
+// hook that survives and one that gets `--no-verify`d.
+//
+// The first version wrote a receipt only on green. On this machine `pnpm gates` cannot be green:
+// #895's qualified executor is pinned at 2.1.268 and the PATH `claude` has moved to 2.1.271, so
+// `wake-transport-qualification` fails locally forever while CI skips that file entirely. A hook
+// demanding green would refuse every push to every reviewed branch, permanently — which is the
+// warning light that never turns off, the exact failure `.githooks/pre-push` already argues
+// against in its own comment, arrived at from the other side.
+//
+// What was actually being missed was running it at all. Four times in one session the manifest
+// was skipped in favour of a hand-picked subset, and each time the gate that caught the defect
+// was one nobody would have chosen. A recorded run puts the failures in front of the author
+// before the push; judging them stays with the author, where CI's verdict already lives.
+//
+// It lives in the git directory, so it is per-checkout, never committed, and a fresh clone starts
+// with no receipt rather than with someone else's.
+try {
+  const gitDir = execFileSync("git", ["rev-parse", "--absolute-git-dir"], { encoding: "utf8" }).trim();
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  writeFileSync(
+    join(gitDir, "acp-gates-receipt"),
+    `${JSON.stringify({ head, ranAt: new Date().toISOString(), failed: failure ? failure.printed : null })}\n`,
+  );
+} catch {
+  // A receipt that cannot be written must not fail a run. The hook treats an absent receipt as
+  // "not run", which is the closed direction, so losing it costs a re-run and not a wrong pass.
 }
 
 process.exit(failure ? failure.status : 0);

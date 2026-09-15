@@ -1010,6 +1010,30 @@ const GUARDS = [
     ],
   },
   {
+    // `guard` is a string an entry writes about itself, and the whole registry turns on not
+    // trusting it. Dropping the emptiness half lets `guard: "   "` read as guarded -- a class met
+    // twice, reported as handled, with whitespace standing where the gate should be. The
+    // null-check half is the same claim for the same reason.
+    what: "a blank guard is not a guard",
+    file: "src/quality/recurring-defects.ts",
+    find: "  if (defect.guard !== null && defect.guard.trim().length > 0) return \"GUARDED\";",
+    replace: "  if (defect.guard !== null) return \"GUARDED\";",
+    killedBy: [
+      "tests/unit/a-defect-that-recurs-earns-a-gate.test.ts::whitespace is not a guard",
+    ],
+  },
+  {
+    // The transition the registry exists for. Raising the threshold makes a class that has
+    // recurred read as seen-once, which is exactly the state a note produces and a gate does not.
+    what: "the second independent occurrence is what makes a guard mandatory",
+    file: "src/quality/recurring-defects.ts",
+    find: "  return independentOccurrences(defect) >= 2 ? \"RECURRED_UNGUARDED\" : \"OBSERVED_ONCE\";",
+    replace: "  return independentOccurrences(defect) >= 3 ? \"RECURRED_UNGUARDED\" : \"OBSERVED_ONCE\";",
+    killedBy: [
+      "tests/unit/a-defect-that-recurs-earns-a-gate.test.ts::two occurrences on different surfaces make a guard mandatory",
+    ],
+  },
+  {
     // #655 condition 3 refuses to start a run whose probe child's tool surface was never measured,
     // and until now nothing could measure it — `assertProbeToolsMeasuredOff` had no producer, so
     // the condition was reachable only as `ASSERTED_ONLY`.

@@ -75,6 +75,11 @@ export const GATES = [
   // unconditionally. Bounding them one at a time does not close the class: the same `ps -o lstart=`
   // probe existed twice, one copy bounded at 5s and one not, under a comment declaring them
   // equivalent. This gate is what makes the next unbounded copy arrive loudly.
+  // A class this repository has met twice must be refused by something that runs. The registry
+  // lives in `src/quality/recurring-defects.ts`; this fails on the one state it exists to make
+  // loud — recurred, and nothing guards it — and on an entry naming a guard that does not
+  // resolve, because a guard nobody can run is the same silence wearing a name.
+  { script: "guards:recurrence" },
   { script: "guards:subprocess-bounds" },
   // A member of a watched string-literal union that nothing in `src/` constructs. Measured
   // three times in one file on 2026-09-15: the type compiled, the switch was exhaustive, the
