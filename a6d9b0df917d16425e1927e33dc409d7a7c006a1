@@ -1,0 +1,10 @@
+Limit: the two readers that need this are synchronous and still do not measure; the plan telling them the truth is what lets them report honestly, not a fix to how they read
+Limit: since #950 the doctor measures before it scores, so it cannot itself reach the unmeasured state; the reachable consumers are CONTINUITY_STATUS and continuityStatus()
+Ruled-out: testing this through the doctor on a cold process | since #950 the doctor measures before it scores, so the test would assert against a branch it no longer takes
+Ruled-out: making the two synchronous readers measure | that is a public surface change, and the plan carrying the distinction is what #951 actually needs
+Warn: ROLE_COVERAGE_NOT_MEASURED must stay non-blocking — canParkForBootstrap admits any ROLE_COVERAGE_ finding, and parking uninstalls the only thing that takes the measurement
+Warn: do not let this become never-block-on-coverage: a measured deployment with nothing routable must still raise the blocking CRITICAL, which the second test pins
+Blast: module
+Record-Id: r-coveragesayswhatitcouldnotmeasure
+Evidence: tests/unit/the-doctor-measures-the-role-before-it-scores-it.test.ts
+Provenance: inherited f71f56b6be2bc56a566db930ca2ae597fa836f82
