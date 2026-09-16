@@ -8,6 +8,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon, type ContinuityReconcileReport } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { CapacityReading } from "../../src/runtime/provider.ts";
+import { RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
 import { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { fixtureManifest } from "../helpers/harness.ts";
@@ -65,7 +66,7 @@ const makeIncumbent = (providers: "claude" | "claude-and-gpt" | "none" = "claude
     rawOutputDigest: `sha256:${createHash("sha256").update("").digest("hex")}`,
   };
   claude.setCapacity(unread);
-  return { cp, claude, daemon, unread, roleKey, incumbent: bound.value };
+  return { cp, claude, daemon, unread, roleKey, clock, incumbent: bound.value };
 };
 
 describe("daemon incumbent capacity reconciliation", () => {
@@ -289,6 +290,80 @@ describe("daemon incumbent capacity reconciliation", () => {
     expect(cp.capacity.isRoutableFor(cp.capacity.current("claude")!, "cto")).toBe(false);
     expect(cp.bindings.active(roleKey), "an unanswered probe is not evidence against the incumbent").toEqual(incumbent);
     expect(report?.unresolved).toContainEqual({ roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
+  });
+
+  /**
+   * #956: the incumbent check holds a role and was asking a provider-global question.
+   *
+   * Since #917 that row is not written again for a provider with role-scoped adapters, so the two
+   * readings of one provider can disagree at the same instant — `computeCoveragePlan` reads
+   * `currentForRole` and says covered while this check reads a row nothing has touched. The
+   * disagreement is what this pins: with a routable role reading and an unroutable provider-global
+   * one, the incumbent is covered and the pass records nothing against it.
+   */
+  it("#956: the incumbent is judged by its role's capacity, not the provider-global row", async () => {
+    const { cp, claude, daemon, unread, roleKey, clock, incumbent } = makeIncumbent("claude-and-gpt");
+    const routable = {
+      ...unread,
+      sensorHealth: "HEALTHY" as const,
+      buckets: [{ id: "rolling", remainingPercent: 95, resetAt: null, capabilities: ["cto"] }],
+      error: undefined,
+    };
+    // A provider-global row written while the provider was unscoped, then left to age out — which
+    // is how the live row got into that state.
+    claude.setCapacity(routable);
+    await cp.capacity.refresh(RefreshTrigger.CONTINUITY_EVALUATION);
+    cp.providers.registerForRole(claude, Role.PRIMARY_CTO);
+    clock.advance(60 * 60 * 1000);
+    claude.setCapacity({ ...routable, observedAt: clock.nowIso() });
+    await cp.capacity.refreshForRole("claude", Role.PRIMARY_CTO);
+
+    expect(cp.capacity.isRoutableFor(cp.capacity.currentForRole("claude", Role.PRIMARY_CTO)!, "cto")).toBe(true);
+
+    const report = await daemon.reconcileContinuity("the role reading is the one that counts");
+
+    expect(cp.bindings.active(roleKey)).toEqual(incumbent);
+    expect(report?.unresolved).toEqual([]);
+    expect(report?.reassigned).toEqual([]);
+  });
+
+  /**
+   * #956: the measurement that decides coverage left no trace of any kind — not a snapshot row, not
+   * a mirror file, not an audit event. Measured on the live deployment 2026-09-16: zero audit events
+   * mentioning `claude` in the three hours after the generation carrying #917 started, against 140
+   * `CAPACITY_PROBE` rows for `gpt`, while the coverage plan consulted `claude`'s role reading every
+   * four minutes and moved the deployment into SURVIVAL.
+   */
+  it("#956: a role measurement leaves a record", async () => {
+    const { cp, claude, daemon, unread, clock } = makeIncumbent("claude-and-gpt");
+    claude.setCapacity({
+      ...unread,
+      sensorHealth: "HEALTHY" as const,
+      buckets: [{ id: "rolling", remainingPercent: 95, resetAt: null, capabilities: ["cto"] }],
+      error: undefined,
+      observedAt: clock.nowIso(),
+    });
+    cp.providers.registerForRole(claude, Role.PRIMARY_CTO);
+
+    await daemon.reconcileContinuity("a pass that measures a role");
+
+    const recorded = cp.db.all<{ evidence_json: string }>(
+      `SELECT evidence_json FROM audit_events WHERE kind = 'CAPACITY_ROLE_PROBE' ORDER BY event_id`,
+    ).map((row) => JSON.parse(row.evidence_json) as Record<string, unknown>);
+
+    const measured = recorded.find((entry) => entry["provider"] === "claude" && entry["role"] === Role.PRIMARY_CTO);
+    expect(measured, "a role probe that answered must leave a record naming what it saw").toBeDefined();
+    expect(measured).toMatchObject({
+      provider: "claude",
+      role: Role.PRIMARY_CTO,
+      sensorHealth: "HEALTHY",
+      allocationAdmission: "OPEN",
+    });
+    // The buckets travel with it: a reader asking "why did coverage change" needs the number, not
+    // just the verdict derived from it.
+    expect(measured?.["buckets"]).toEqual([
+      { id: "rolling", remainingPercent: 95, resetAt: null },
+    ]);
   });
 
   it("#811: an unread provider is still refused for a new allocation", async () => {

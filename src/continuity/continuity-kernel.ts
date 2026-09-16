@@ -160,7 +160,39 @@ export class ContinuityKernel {
     for (const provider of this.coverageProviders(required)) {
       if (!this.providers.hasRoleScoped(provider)) continue;
       for (const role of new Set(required.map((entry) => entry.role))) {
-        taken.push(await this.capacity.refreshForRole(provider, role));
+        const measured = await this.capacity.refreshForRole(provider, role);
+        taken.push(measured);
+        // Recorded here rather than inside `refreshForRole`, which is deliberately pure with respect
+        // to db, audit and telemetry — `role-bound-capacity.test.ts` hands that slice a proxy that
+        // throws on any of the three, so role facts cannot reach provider-global storage. This is
+        // the caller that decides coverage from the reading, so this is where the reading becomes
+        // explainable.
+        //
+        // It had been explainable nowhere. `refresh` audits every provider probe; this path audited
+        // nothing and writes to a volatile map rather than `capacity_snapshots`, so a role reading
+        // existed only inside the process that took it. Measured on the live deployment 2026-09-16:
+        // the generation carrying #917 started at 02:05:09Z and three hours later there were zero
+        // audit events mentioning `claude` — 140 `CAPACITY_PROBE` rows, all `gpt` — while this loop
+        // had been consulting `claude`'s role reading every four minutes and had moved the
+        // deployment into SURVIVAL at 03:25:33.928Z. Nothing on disk could say why.
+        this.audit.record({
+          kind: "CAPACITY_ROLE_PROBE",
+          reasonCode: measured.sensorHealth === "ERROR" ? ReasonCode.PROBE_FAILED : ReasonCode.OK,
+          evidence: {
+            provider,
+            role,
+            bindingGeneration: measured.binding.generation,
+            sensorHealth: measured.sensorHealth,
+            runtimeHealth: measured.runtimeHealth,
+            allocationAdmission: measured.allocationAdmission,
+            advisoryState: measured.advisoryState,
+            buckets: measured.buckets.map((bucket) => ({
+              id: bucket.id,
+              remainingPercent: bucket.remainingPercent,
+              resetAt: bucket.resetAt,
+            })),
+          },
+        });
       }
     }
     // Returned rather than discarded, because these are the only readings anything takes for such

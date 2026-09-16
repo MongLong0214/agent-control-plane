@@ -1591,7 +1591,17 @@ export class Daemon {
 
         const assignment = plan.assignments.find((candidate) => candidate.roleKey === required.roleKey);
         const session = this.cp.sessions.get(current.sessionId);
-        const currentCapacity = session ? this.cp.capacity.current(session.provider) : null;
+        // The role's question, not the provider's. This check holds `required.role` and was asking
+        // `current(provider)` anyway — and since #917 that row is not written again for a provider
+        // with role-scoped adapters, so the two readings of one provider can disagree at the same
+        // instant: `computeCoveragePlan` reads `currentForRole` and can say FULL_COVERAGE while this
+        // line reads a row nothing has touched. `continuity-kernel.ts` already composes them this
+        // way; the fallback keeps every provider without role-scoped adapters answering exactly as
+        // before.
+        const currentCapacity = session
+          ? this.cp.capacity.currentForRole(session.provider, required.role) ??
+            this.cp.capacity.current(session.provider)
+          : null;
         // Capacity constrains the providers it manages. It has nothing to say about one it does
         // not, and "nothing to say" is not "not covered" — reading it that way evicted the only
         // authority the once-ever bootstrap can create. The generation-1 CEO runs as
