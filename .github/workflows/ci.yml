@@ -270,9 +270,29 @@ jobs:
       - name: require every falsifiability shard to have actually succeeded
         run: |
           shards="${{ needs.guard-falsifiability.result }}"
-          # Print the input before deciding on it, the same readback verify-gate prints: a gate
+          event="${{ github.event_name }}"
+          # Print the inputs before deciding on them, the same readback verify-gate prints: a gate
           # that only announces its verdict cannot be told apart from one reading the wrong field.
-          echo "needs.guard-falsifiability.result=${shards}"
+          echo "needs.guard-falsifiability.result=${shards} github.event_name=${event}"
+          # `skipped` is a third answer and it is not a failure. The shard job opts out of `push`
+          # (see its own `if:` above), so on a push the expected result *is* `skipped` — and
+          # reading that as "did not succeed" turned every merge to `main` red while every pull
+          # request stayed green. Measured: sixteen consecutive failing `push` runs from
+          # 2026-09-15T10:18, against a `schedule` run on the same tree that passed.
+          #
+          # The two conditions are one decision and must move together: if the job's `if:` stops
+          # excluding an event, this must stop excusing it. They are restated rather than shared
+          # because Actions cannot reference another job's `if:` expression.
+          #
+          # This does not excuse a skip that was not the opt-out. A `push` whose `verify-matrix`
+          # failed also skips the shards, and `verify-gate` — which runs `if: always()` and
+          # requires that matrix to have succeeded — fails the run on its own. The hole this
+          # branch could otherwise open is closed one job over, not here.
+          if [ "$shards" = "skipped" ] && [ "$event" = "push" ]; then
+            echo "the shard job does not run on push, so nothing that was meant to run was skipped"
+            echo "this run proves what the pull request's own sweep proved, and no more"
+            exit 0
+          fi
           if [ "$shards" != "success" ]; then
             echo "at least one falsifiability shard did not succeed — the sweep did not pass"
             exit 1
