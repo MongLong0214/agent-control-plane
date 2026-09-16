@@ -1,0 +1,10 @@
+Limit: the deployment's move into SURVIVAL is deduced, not measured — the reading that caused it was recorded nowhere, which is what this change fixes going forward and cannot fix backwards
+Limit: role readings are still not persisted; an audit event is an explanation, not a source of truth a later reader allocates from
+Ruled-out: putting the audit call inside refreshForRole | role-bound-capacity.test.ts hands that slice a proxy that throws on db, audit and telemetry, and 23 tests went red — the slice is deliberately pure
+Ruled-out: changing that test to admit the audit log | respecting a boundary someone wrote a proxy to defend is cheaper than arguing with it, and the caller is the better place anyway
+Warn: the record must carry the buckets, not only the admission state — the state is derived from the numbers and cannot be run backwards by a reader asking why coverage changed
+Warn: do not publish role facts into provider-global storage; that is the boundary the proxy in role-bound-capacity.test.ts defends
+Blast: module
+Record-Id: r-arolemeasurementleavesarecord
+Evidence: tests/unit/daemon-sensor-failure-binding.test.ts
+Provenance: inherited 34aa2ee585608aad26b92abdff599c0009b17837
