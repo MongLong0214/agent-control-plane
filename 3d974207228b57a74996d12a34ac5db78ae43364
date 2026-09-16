@@ -1,0 +1,11 @@
+Limit: revocation is one-way: restorationNeeded requires an active FALLBACK binding, and a revoked role has none, so coverage returning does not put the binding back
+Limit: measured in the live audit — 3000 claude probe failures, 236 of them reporting UNAVAILABLE, and four binding revocations on this cause
+Ruled-out: widening ProviderAdapter.probeRuntime's union for every caller | cto-lifecycle, blind-review and the daemon session probe would each need a decision about UNKNOWN and none of them is what revoked the binding
+Ruled-out: making revocation restorable | that is the other half of this failure and a larger change, filed rather than folded in here
+Warn: UNKNOWN must not become routable — isRoutableFor refuses it exactly as it refuses UNAVAILABLE, and that is what keeps this from allocating onto a provider that did not answer
+Warn: probeSession collapses timedOut the same way and restoration after a revoke still has no path; both are untouched here
+Blast: module
+Record-Id: r-atimedoutprobeisnotadeadruntime
+Evidence: tests/unit/a-timed-out-probe-is-not-a-dead-runtime.test.ts
+Evidence: tests/unit/daemon-sensor-failure-binding.test.ts
+Provenance: inherited cd93fd13e4fda1c9eb893090522ea0abd56015cd
