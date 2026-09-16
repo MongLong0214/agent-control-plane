@@ -34,8 +34,8 @@ export const PARTIAL_TIMESTAMP_ORDERINGS = new Map([
   // consequence of the tie is a person sent to the wrong nonce — real, and still not a reason to
   // edit a frozen input without the authority that froze it.
   ["src/db/migrations.ts:2293", "ORDER BY received_at ASC"],
-  ["src/conversation/turn-coordinator.ts:1169", "ORDER BY claimed_at ASC"],
-  ["src/conversation/turn-coordinator.ts:1757", "ORDER BY claimed_at ASC"],
+  ["src/conversation/turn-coordinator.ts:1177", "ORDER BY claimed_at ASC"],
+  ["src/conversation/turn-coordinator.ts:1763", "ORDER BY claimed_at ASC"],
   ["src/cto/cto-lifecycle.ts:783", "ORDER BY created_at DESC"],
   ["src/daemon/agentcpd.ts:1865", "ORDER BY created_at"],
   ["src/github/github-kernel.ts:3419", "ORDER BY created_at DESC"],

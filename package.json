@@ -59,6 +59,7 @@
     "schema:registry": "node scripts/verify-every-trigger-is-required.mjs",
     "guards:operands": "node scripts/verify-refusal-operands-are-watched.mjs",
     "guards:recurrence": "node scripts/verify-recurrence-is-guarded.mjs",
+    "guards:caller-claims": "node scripts/verify-caller-claims-are-current.mjs",
     "guards:subprocess-bounds": "node scripts/verify-subprocess-calls-are-bounded.mjs",
     "guards:union-members": "node scripts/verify-union-members-are-constructed.mjs",
     "guards:child-budgets": "node scripts/verify-child-budgets-fit-their-cases.mjs",
