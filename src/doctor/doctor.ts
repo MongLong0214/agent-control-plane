@@ -57,6 +57,28 @@ export type Severity = "INFO" | "WARN" | "ERROR" | "CRITICAL";
  */
 export const REPOSITORY_SWEEP_BUDGET_MS = 20_000;
 
+/**
+ * How long the capacity sweep may take, across every provider and every role.
+ *
+ * The term `OPERATOR_METHOD_BUDGET_MS`'s derivation was missing. `REPOSITORY_SWEEP_BUDGET_MS` above
+ * exists because a repository probe inherits `git()`'s 120s and N of them grow with the registry;
+ * capacity has the identical shape and had no deadline at all. A single probe is bounded at its own
+ * layer — `COLLECTOR_TIMEOUT_MS` is 45s and the `--version` fallback 15s — but the *pass* is not: it
+ * is one probe per provider plus one per role for each role-scoped provider, and that count grows
+ * with the deployment exactly the way the repository sweep's did.
+ *
+ * 45s is one collector's own timeout, not a measurement of the sweep: a healthy `/usage` answers in
+ * a second or two, so this is headroom for one provider having gone slow rather than a time the
+ * pass is expected to use. What the deadline does not reach is reported — an unswept provider is a
+ * finding, and an absent finding reads as a provider that is fine, which is the shape this file
+ * spent today's other two changes on.
+ *
+ * Abandoning a sweep is safe only because a coverage plan can now say it was *not measured* rather
+ * than *not covered*: without that, a spent budget would produce the blocking CRITICAL that parks a
+ * daemon behind the very coordinator that would clear it.
+ */
+export const CAPACITY_SWEEP_BUDGET_MS = 45_000;
+
 export interface Finding {
   code: string;
   severity: Severity;
@@ -600,15 +622,56 @@ export class Doctor {
     return findings;
   }
 
+  /**
+   * Run the sweep, or give up on it and say so.
+   *
+   * `Promise.race` does not cancel what it loses to — the probe keeps running and its result lands
+   * in the monitor for the next reader. That is the same bargain `Daemon.refreshCapacitySensors`
+   * already makes, and it is the right one: the point is that *this report* returns inside its
+   * budget, not that a slow provider is punished for being slow.
+   */
+  private async withinCapacityBudget<T>(sweep: () => Promise<T>): Promise<T | "BUDGET_SPENT"> {
+    let timer: NodeJS.Timeout | null = null;
+    const budget = new Promise<"BUDGET_SPENT">((resolve) => {
+      timer = setTimeout(() => resolve("BUDGET_SPENT"), CAPACITY_SWEEP_BUDGET_MS);
+      timer.unref();
+    });
+    try {
+      return await Promise.race([sweep(), budget]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   private async checkCapacity(): Promise<Finding[]> {
     const findings: Finding[] = [];
-    const readings = await this.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT);
-    // The coverage score below reads role capacity, which the refresh above does not produce:
-    // a provider with role-scoped adapters is skipped there on purpose, because a
-    // provider-global row cannot carry role provenance (#917). Taking the measurement here is
-    // what makes this method's own two halves agree — otherwise it refreshes one set of
-    // readings and then scores a different one, and on a cold process that second set is empty.
-    const roleReadings = await this.continuity.refreshRoleScopedCapacity();
+    // Both refreshes under one deadline, because a budget has to cover the pass rather than one of
+    // its halves. The coverage score below reads role capacity, which the provider refresh does not
+    // produce: a provider with role-scoped adapters is skipped there on purpose, because a
+    // provider-global row cannot carry role provenance (#917). Taking that measurement here is what
+    // makes this method's own two halves agree — otherwise it refreshes one set of readings and
+    // then scores a different one, and on a cold process that second set is empty.
+    const swept = await this.withinCapacityBudget(async () => ({
+      providers: await this.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT),
+      roles: await this.continuity.refreshRoleScopedCapacity(),
+    }));
+    if (swept === "BUDGET_SPENT") {
+      findings.push({
+        code: "CAPACITY_SWEEP_NOT_REACHED",
+        severity: "WARN",
+        scope: "capacity",
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: { sweepBudgetMs: CAPACITY_SWEEP_BUDGET_MS },
+        recommendedAction:
+          "the capacity sweep ran out of its budget, so the readings below are whatever was already " +
+          "known rather than a fresh measurement; a provider slow to answer is the first place to look",
+      });
+    }
+    // Whatever is already persisted, rather than nothing: an abandoned sweep is a reason to distrust
+    // the freshness of these numbers, not a reason to report the providers as absent.
+    const readings = swept === "BUDGET_SPENT" ? this.capacity.all() : swept.providers;
+    const roleReadings = swept === "BUDGET_SPENT" ? [] : swept.roles;
     // A role-scoped provider is absent from `readings` and its provider-global row is never
     // written again, so without this it has no representation in the report at all. Measured
     // 2026-09-16: this deployment's `CAPACITY_LOW` findings went from two to one when `claude`
