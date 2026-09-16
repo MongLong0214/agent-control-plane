@@ -603,6 +603,12 @@ export class Doctor {
   private async checkCapacity(): Promise<Finding[]> {
     const findings: Finding[] = [];
     const readings = await this.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT);
+    // The coverage score below reads role capacity, which the refresh above does not produce:
+    // a provider with role-scoped adapters is skipped there on purpose, because a
+    // provider-global row cannot carry role provenance (#917). Taking the measurement here is
+    // what makes this method's own two halves agree — otherwise it refreshes one set of
+    // readings and then scores a different one, and on a cold process that second set is empty.
+    await this.continuity.refreshRoleScopedCapacity();
     for (const reading of readings) {
       // A preserved operator observation keeps the provider *routable* through a collector
       // that cannot read quota — but the collector still failed, and CP-HI-08 does not allow

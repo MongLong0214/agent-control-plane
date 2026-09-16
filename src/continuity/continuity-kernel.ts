@@ -127,6 +127,33 @@ export class ContinuityKernel {
     return Math.max(0, new Date(this.clock.nowIso()).getTime() - at);
   }
 
+  /**
+   * Measure every required role against the providers that answer per role, so that a later
+   * `computeCoveragePlan` scores what was measured rather than what nothing measured yet.
+   *
+   * This is separate from `capacity.refresh` and cannot be folded into it. A provider with
+   * role-scoped adapters is deliberately skipped there — a provider-global row cannot carry role
+   * provenance (#917) — and the role readings it would need live in a volatile snapshot keyed by
+   * the registration itself, which no restart inherits. So *every* caller that is about to read a
+   * coverage plan has to take this measurement first, and until this method existed only
+   * `evaluate` did.
+   *
+   * The caller that did not was the doctor, which is the one that runs first: a cold daemon's
+   * startup doctor scored coverage off an empty snapshot, found every role uncovered, and parked
+   * on a CRITICAL finding — after which the park uninstalls the continuity coordinator, so the
+   * only thing that would have taken the measurement no longer runs. Measured 2026-09-16: the
+   * daemon parked at 00:52:48Z and two further doctor passes reported the same thing.
+   */
+  async refreshRoleScopedCapacity(): Promise<void> {
+    const required = this.requiredRoles();
+    for (const provider of this.coverageProviders(required)) {
+      if (!this.providers.hasRoleScoped(provider)) continue;
+      for (const role of new Set(required.map((entry) => entry.role))) {
+        await this.capacity.refreshForRole(provider, role);
+      }
+    }
+  }
+
   /** §15.3 — computed before any failover, never after. */
   computeCoveragePlan(): RoleCoveragePlan {
     const requiredRoles = this.requiredRoles();
@@ -254,12 +281,7 @@ export class ContinuityKernel {
    */
   async evaluate(reason: string): Promise<RoleCoveragePlan> {
     await this.capacity.refresh(RefreshTrigger.CONTINUITY_EVALUATION);
-    for (const provider of this.coverageProviders(this.requiredRoles())) {
-      if (!this.providers.hasRoleScoped(provider)) continue;
-      for (const role of new Set(this.requiredRoles().map((required) => required.role))) {
-        await this.capacity.refreshForRole(provider, role);
-      }
-    }
+    await this.refreshRoleScopedCapacity();
     const plan = this.computeCoveragePlan();
     let previous: ContinuityMode = ContinuityMode.NORMAL;
     let transitioned = false;
