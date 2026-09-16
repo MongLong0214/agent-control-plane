@@ -1,0 +1,9 @@
+Limit: 45s is one collector's own timeout, not a measurement of the sweep — headroom for one slow provider rather than a time the pass is expected to use
+Limit: the probe that loses the race keeps running, so a pathological provider can hold a handle past the report that abandoned it; cancelling it is the adapter's seam
+Ruled-out: bounding each refresh separately | the budget the doctor must fit is one number, and two deadlines that each fit it can still miss it together
+Warn: abandoning the sweep is safe only because the coverage plan can say unmeasured; without that a spent budget raises the blocking CRITICAL that parks a daemon behind the coordinator that clears it
+Warn: on expiry fall back to what is persisted, never to nothing — an abandoned sweep distrusts freshness, it does not make providers absent
+Blast: module
+Record-Id: r-thecapacitysweephasabudget
+Evidence: tests/unit/the-doctor-measures-the-role-before-it-scores-it.test.ts
+Provenance: inherited baf1c0cae8c05b96ee93d9d332ea1d2aa53aa840
