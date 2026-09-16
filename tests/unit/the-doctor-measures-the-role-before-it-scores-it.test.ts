@@ -113,6 +113,39 @@ describe("the doctor measures the role before it scores it", () => {
   });
 
   /**
+   * The operator half of the same seam. `capacity.refresh` skips a provider with role-scoped
+   * adapters, and nothing writes its provider-global row afterwards, so the provider disappeared
+   * from the report entirely — not as a warning, as an absence.
+   *
+   * Measured on the live deployment 2026-09-16: `CAPACITY_LOW` findings per `DOCTOR_REPORT` were
+   * consistently 2 from 00:46 through 02:00 and consistently 1 from 02:05 — the generation
+   * carrying #917 — onward. The finding that vanished was `claude`'s, at 4% of its weekly window,
+   * while `capacity_snapshots` last held a `claude` row at 02:04:05.872Z and `gpt` refreshed every
+   * minute for the hour after.
+   *
+   * The scope carries the role because two roles on one provider are two quotas, and reporting
+   * them under one `provider:claude` scope would collapse them into a single finding.
+   */
+  it("reports a role-scoped provider that is running out of quota", async () => {
+    const { cp, clock, gpt, claude } = coldPlane();
+    try {
+      gpt.setCapacity(healthy("gpt", clock));
+      claude.setCapacity({
+        ...healthy("claude", clock),
+        buckets: [{ id: "current-week-all-models", remainingPercent: 4, resetAt: null, capabilities: CAPABILITIES }],
+      });
+      cp.providers.registerForRole(claude, Role.CEO);
+
+      const report = await cp.doctor.run("system");
+      const low = report.findings.filter((finding) => finding.code === "CAPACITY_LOW");
+
+      expect(low.map((finding) => finding.scope)).toContain("provider:claude:CEO");
+    } finally {
+      cp.db.close();
+    }
+  });
+
+  /**
    * The other direction, so the fix cannot be "stop asking". A doctor that measured the role and
    * found nothing routable must still block: this is the case the CRITICAL finding is *for*, and
    * a repair that satisfied the first case by never reporting coverage would pass it while
