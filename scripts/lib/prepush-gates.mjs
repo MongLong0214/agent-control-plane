@@ -86,6 +86,12 @@ export const GATES = [
   // silently lapsing.
   { script: "closure:affected" },
   { script: "guards:recurrence" },
+  // Prose that names who calls a symbol is a claim about another file, so the change that
+  // falsifies it touches neither the sentence nor anything a reviewer of the sentence opens.
+  // Measured 2026-09-16: `claim()` gained two production callers and five comments across four
+  // files went on saying it had none, one of them carrying an obligation conditioned on that
+  // state. The searches those comments make are declared now, and this re-runs them.
+  { script: "guards:caller-claims" },
   { script: "guards:subprocess-bounds" },
   // A member of a watched string-literal union that nothing in `src/` constructs. Measured
   // three times in one file on 2026-09-15: the type compiled, the switch was exhaustive, the
