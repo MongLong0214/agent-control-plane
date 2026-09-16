@@ -1,0 +1,10 @@
+Limit: codex and grok were both SUSPENDED, so a role-scoped claude was the only candidate left for every required role
+Limit: the role capacity snapshot is not persisted, so no restart inherits it and the first reader after a start sees it empty
+Ruled-out: persisting the role capacity snapshots | the monitor refuses it: a provider-global row cannot represent role provenance
+Ruled-out: relaxing canParkForBootstrap so ROLE_COVERAGE_ no longer parks | the finding is real when the measurement is real, so that removes the signal instead of the defect
+Warn: capacity.refresh does not produce role readings; any caller about to read computeCoveragePlan must take refreshRoleScopedCapacity first
+Warn: a doctor that measured the role and found nothing routable must still report NO_VALID_COVERAGE - do not satisfy the cold-start case by scoring coverage less often
+Blast: module
+Record-Id: r-doctorscoresthemeasuredrole
+Evidence: tests/unit/the-doctor-measures-the-role-before-it-scores-it.test.ts
+Provenance: inherited e54b3d979cc01abc463e6807d2bfdb471fe0a567
