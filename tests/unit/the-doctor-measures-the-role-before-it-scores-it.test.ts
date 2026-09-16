@@ -146,6 +146,61 @@ describe("the doctor measures the role before it scores it", () => {
   });
 
   /**
+   * The same distinction one layer up, for the readers that cannot measure.
+   *
+   * `computeCoveragePlan` has four callers. Two of them — `OPERATOR_METHOD.CONTINUITY_STATUS`
+   * (`daemon.ts`) and `continuityStatus()` (`mcp/hermes-server.ts`) — are synchronous status
+   * surfaces that take no measurement, so on a `ControlPlane` where nothing has refreshed
+   * capacity they read an empty snapshot and report `NO_VALID_COVERAGE`. That is a statement
+   * about the reader, not about the deployment, and it is the same word an operator acts on.
+   *
+   * The plan says which it is now. `unmeasured` is the subset of `uncovered` where no candidate
+   * provider had any reading at all — nothing read it, as against read it and refused it.
+   */
+  it("separates uncovered-because-nothing-read-it from uncovered-because-nothing-is-routable", async () => {
+    const { cp, clock, claude, gpt } = coldPlane();
+    try {
+      claude.setCapacity(healthy("claude", clock));
+      gpt.setCapacity(healthy("gpt", clock));
+      cp.providers.registerForRole(claude, Role.CEO);
+
+      // Nothing has refreshed: both adapters can answer, and no reader has asked.
+      const cold = cp.continuity.computeCoveragePlan();
+      expect(cold.outcome).toBe("NO_VALID_COVERAGE");
+      expect(cold.unmeasured).toEqual(cold.uncovered);
+
+      // After a measurement the same plan is covered, and `unmeasured` is empty — so the field
+      // tracks the reading rather than the shape of the deployment.
+      const measured = await cp.continuity.evaluate("a reader that measures first");
+      expect(measured.outcome).toBe("FULL_COVERAGE");
+      expect(measured.unmeasured).toEqual([]);
+    } finally {
+      cp.db.close();
+    }
+  });
+
+  /**
+   * And the direction that keeps the separation from becoming "never block on coverage": a
+   * deployment that *was* measured and has nothing routable still reports the blocking CRITICAL.
+   */
+  it("still blocks when every candidate was measured and none is routable", async () => {
+    const { cp, clock, claude, gpt } = coldPlane();
+    try {
+      claude.setCapacity({ ...healthy("claude", clock), runtimeHealth: "UNAVAILABLE" });
+      gpt.setCapacity({ ...healthy("gpt", clock), runtimeHealth: "UNAVAILABLE" });
+      cp.providers.registerForRole(claude, Role.CEO);
+
+      const report = await cp.doctor.run("system");
+      const coverage = report.findings.find((finding) => finding.code.startsWith("ROLE_COVERAGE_"));
+
+      expect(coverage?.code).toBe("ROLE_COVERAGE_NO_VALID_COVERAGE");
+      expect(coverage?.blocking).toBe(true);
+    } finally {
+      cp.db.close();
+    }
+  });
+
+  /**
    * The other direction, so the fix cannot be "stop asking". A doctor that measured the role and
    * found nothing routable must still block: this is the case the CRITICAL finding is *for*, and
    * a repair that satisfied the first case by never reporting coverage would pass it while

@@ -51,6 +51,15 @@ export interface RoleCoveragePlan {
   requiredRoles: RequiredRole[];
   assignments: Array<{ roleKey: string; provider: string | null; reason: string }>;
   uncovered: string[];
+  /**
+   * The subset of `uncovered` where no candidate provider had a reading at all.
+   *
+   * Separate from `uncovered` because they are opposite claims wearing one word. "No provider can
+   * staff this" is a fact about the deployment; "nothing has measured any candidate" is a fact
+   * about the reader, and reporting the second as the first is how a cold process talks itself
+   * into a verdict. A consumer that blocks on missing coverage must check this first.
+   */
+  unmeasured: string[];
   providers: Array<{
     provider: string;
     optional: boolean;
@@ -180,17 +189,31 @@ export class ContinuityKernel {
       }
     }
 
-    const usable = (provider: string, required: RequiredRole): ProviderCapacity | null => {
+    /** `"UNMEASURED"` is "nothing read this", `null` is "read it and it is not routable". */
+    const usable = (provider: string, required: RequiredRole): ProviderCapacity | "UNMEASURED" | null => {
       const capacity = this.providers.hasRoleScoped(provider)
         ? this.capacity.currentForRole(provider, required.role)
         : byProvider.get(provider);
-      if (!capacity) return null;
+      // Absent is not refused. `null` here means nothing has measured this provider for this role
+      // at all — no reading, not an unroutable one — and the two produce the same `uncovered`
+      // entry while meaning opposite things. The caller separates them; see `unmeasured`.
+      if (!capacity) return "UNMEASURED";
       // currentForRole checks the current registration identity, not another role's quota.
       return this.capacity.isRoutableFor(capacity, required.capability) ? capacity : null;
     };
 
     const assignments: RoleCoveragePlan["assignments"] = [];
     const uncovered: string[] = [];
+    /**
+     * Roles no candidate provider had any reading for.
+     *
+     * `uncovered` answers "can this role be staffed", and on a process where nothing has measured
+     * yet the honest answer is not "no" — it is "ask again after something measures". Those were
+     * the same value, so a cold reader reported `NO_VALID_COVERAGE` as a fact about the deployment
+     * when it was a fact about itself. Measured 2026-09-16: a startup doctor did exactly that and
+     * parked the daemon on a CRITICAL finding no reachable command could clear.
+     */
+    const unmeasured: string[] = [];
     // Isolation groups must land on different providers where possible, so a single
     // provider outage cannot take a producer and its reviewer at once.
     const usedByGroup = new Map<string, Set<string>>();
@@ -213,13 +236,21 @@ export class ContinuityKernel {
       const preferred = candidatesFor(role.capability);
       const taken = usedByGroup.get(role.isolationGroup) ?? new Set<string>();
 
+      const routable = (provider: string): boolean => {
+        const answer = usable(provider, role);
+        return answer !== null && answer !== "UNMEASURED";
+      };
       const candidate =
-        preferred.find((p) => usable(p, role) !== null && !taken.has(p)) ??
-        preferred.find((p) => usable(p, role) !== null) ??
+        preferred.find((p) => routable(p) && !taken.has(p)) ??
+        preferred.find((p) => routable(p)) ??
         null;
 
       if (!candidate) {
         uncovered.push(role.roleKey);
+        // Every candidate came back `UNMEASURED`, so nothing was read and nothing was refused.
+        if (preferred.length > 0 && preferred.every((p) => usable(p, role) === "UNMEASURED")) {
+          unmeasured.push(role.roleKey);
+        }
         assignments.push({ roleKey: role.roleKey, provider: null, reason: "no provider with capability and admission" });
         continue;
       }
@@ -272,6 +303,7 @@ export class ContinuityKernel {
       requiredRoles,
       assignments,
       uncovered,
+      unmeasured,
       providers: [...byProvider.values()].map((c) => ({
         provider: c.provider,
         optional: OPTIONAL_PROVIDERS.has(c.provider),
