@@ -264,6 +264,33 @@ describe("daemon incumbent capacity reconciliation", () => {
     expect(report?.unresolved).toContainEqual({ roleKey, reasonCode: ReasonCode.COVERAGE_NONE });
   });
 
+  /**
+   * The production shape of the revocation this guard exists to prevent, now that the adapter can
+   * express it. `/usage` timing out sets `sensorHealth: "ERROR"`, and the `--version` fallback
+   * timing out used to set `runtimeHealth: "UNAVAILABLE"` — the one value this guard excludes — so
+   * the incumbent was revoked by two timeouts rather than by any evidence. The adapter now reports
+   * `"UNKNOWN"` for a probe that did not answer, and this pins what that buys: the binding
+   * survives, and the reading is still refused for new work.
+   *
+   * This closes a gap #811 recorded against itself: *"Preserving on runtimeHealth: 'UNKNOWN' is
+   * the intended reading for an established READY incumbent, and no test exercises it."*
+   *
+   * Measured on the live deployment 2026-09-16 — revoked 01:33:32.566Z, `FULL_COVERAGE` again at
+   * 01:36:01.278Z, nothing restored, because `restorationNeeded` requires an active FALLBACK
+   * binding and a revoked role has none.
+   */
+  it("#811: a runtime that did not answer preserves the READY incumbent", async () => {
+    const { cp, claude, daemon, unread, roleKey, incumbent } = makeIncumbent();
+    claude.setCapacity({ ...unread, runtimeHealth: "UNKNOWN" });
+
+    const report = await daemon.reconcileContinuity("runtime probe did not answer");
+
+    expect(cp.capacity.current("claude")?.runtimeHealth).toBe("UNKNOWN");
+    expect(cp.capacity.isRoutableFor(cp.capacity.current("claude")!, "cto")).toBe(false);
+    expect(cp.bindings.active(roleKey), "an unanswered probe is not evidence against the incumbent").toEqual(incumbent);
+    expect(report?.unresolved).toContainEqual({ roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
+  });
+
   it("#811: an unread provider is still refused for a new allocation", async () => {
     const { cp, daemon, roleKey, incumbent } = makeIncumbent();
     await daemon.reconcileContinuity("keep the incumbent while quota is unreadable");

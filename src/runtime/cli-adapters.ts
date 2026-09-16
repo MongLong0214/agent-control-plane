@@ -1620,14 +1620,19 @@ export class ClaudeCliAdapter implements ProviderAdapter {
   }
 
   async probeRuntime(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
-    const result = await runCli(this.#binary, ["--version"], {
-      cwd: undefined,
-      timeoutMs: 15_000,
-      environmentAllowlist: this.#environmentAllowlist,
-      denyReadPaths: this.#denyReadPaths,
-      providerCredentialDir: this.#providerCredentialDir,
-    });
-    return result.exitCode === 0 && !result.timedOut ? "HEALTHY" : "UNAVAILABLE";
+    return collapseUnmeasuredRuntime(await this.measureRuntime());
+  }
+
+  private async measureRuntime(): Promise<CapacityReading["runtimeHealth"]> {
+    return measuredRuntimeHealth(
+      await runCli(this.#binary, ["--version"], {
+        cwd: undefined,
+        timeoutMs: RUNTIME_PROBE_TIMEOUT_MS,
+        environmentAllowlist: this.#environmentAllowlist,
+        denyReadPaths: this.#denyReadPaths,
+        providerCredentialDir: this.#providerCredentialDir,
+      }),
+    );
   }
 
   async probeSession(handle: SessionHandle): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
@@ -1650,7 +1655,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
   async probeCapacity(): Promise<CapacityReading> {
     return resolveRuntimeHealth(
       await this.#usageCollector.collect(),
-      () => this.probeRuntime(),
+      () => this.measureRuntime(),
     );
   }
 }
@@ -1660,9 +1665,61 @@ export class ClaudeCliAdapter implements ProviderAdapter {
  * state runtime health, the CLI is probed — otherwise a fresh quota file would mask an
  * unavailable provider.
  */
+/**
+ * How long a `--version` runtime probe may take before it has told us nothing.
+ *
+ * Named rather than repeated at three call sites, because the number is load-bearing: this host
+ * runs the full test suite, and the thing the probe answers under that load is not "is the CLI
+ * installed" but "did it get scheduled in time".
+ */
+const RUNTIME_PROBE_TIMEOUT_MS = 15_000;
+
+/**
+ * What a `--version` probe established, keeping *it did not answer* apart from *it answered and
+ * failed*.
+ *
+ * A timeout is the absence of evidence, never evidence of absence, and the two were the same
+ * value here: `result.exitCode === 0 && !result.timedOut ? "HEALTHY" : "UNAVAILABLE"` reported a
+ * CLI that was merely slow as a CLI that is gone. `CapacityReading["runtimeHealth"]` has carried
+ * `"UNKNOWN"` for exactly this all along; only the probe could not say it.
+ *
+ * The distinction is load-bearing in one place, and it is the one that costs the most. The #811
+ * guard in `daemon.ts` keeps a READY incumbent bound when the sensor failed but the runtime did
+ * not, and it tests for `"UNAVAILABLE"` — so a slow `--version` walked straight past the guard
+ * written to protect exactly this case. Measured on this deployment 2026-09-16: `/usage` timed
+ * out at 01:32:55.504Z with the runtime probe reporting `UNAVAILABLE`, coverage went
+ * `DEGRADED → SURVIVAL`, the canonical `PRIMARY_CTO` binding was revoked at 01:33:32.566Z, and
+ * coverage was `FULL_COVERAGE` again at 01:36:01.278Z — 2m29s later, with nothing restored,
+ * because `restorationNeeded` requires an active FALLBACK binding and a revoked role has none.
+ * The audit carries four such revocations (generations 2, 3, 4 and 6) and 236 claude probe
+ * failures that reported `UNAVAILABLE`.
+ *
+ * `"UNKNOWN"` does not make the provider routable — `isRoutableFor` refuses it exactly as it
+ * refuses `"UNAVAILABLE"`, and `allocationAdmission` is still `SUSPENDED` — so nothing new is
+ * allocated onto a provider that did not answer. It only stops an unanswered probe from being
+ * read as a dead one.
+ */
+const measuredRuntimeHealth = (result: {
+  exitCode: number | null;
+  timedOut: boolean;
+}): CapacityReading["runtimeHealth"] =>
+  result.timedOut ? "UNKNOWN" : result.exitCode === 0 ? "HEALTHY" : "UNAVAILABLE";
+
+/**
+ * The three-value answer `ProviderAdapter.probeRuntime` promises its other callers.
+ *
+ * `"UNKNOWN"` collapses to `"UNAVAILABLE"` here rather than widening `cto-lifecycle`,
+ * `blind-review` and `Daemon`'s session probe: for those callers *could not tell* and *not there*
+ * have always produced the same refusal, and preserving that is what keeps this change to the one
+ * path where the difference decides whether a binding survives.
+ */
+const collapseUnmeasuredRuntime = (
+  measured: CapacityReading["runtimeHealth"],
+): "HEALTHY" | "DEGRADED" | "UNAVAILABLE" => (measured === "UNKNOWN" ? "UNAVAILABLE" : measured);
+
 const resolveRuntimeHealth = async (
   reading: CapacityReading,
-  probe: () => Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE">,
+  probe: () => Promise<CapacityReading["runtimeHealth"]>,
 ): Promise<CapacityReading> => {
   if (reading.sensorHealth === "ERROR" || reading.runtimeHealth === "UNKNOWN") {
     return { ...reading, runtimeHealth: await probe() };
@@ -1921,14 +1978,19 @@ export class CodexCliAdapter implements ProviderAdapter {
   }
 
   async probeRuntime(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
-    const result = await runCli(this.#binary, ["--version"], {
-      cwd: undefined,
-      timeoutMs: 15_000,
-      environmentAllowlist: this.#environmentAllowlist,
-      denyReadPaths: this.#denyReadPaths,
-      providerCredentialDir: this.#providerCredentialDir,
-    });
-    return result.exitCode === 0 && !result.timedOut ? "HEALTHY" : "UNAVAILABLE";
+    return collapseUnmeasuredRuntime(await this.measureRuntime());
+  }
+
+  private async measureRuntime(): Promise<CapacityReading["runtimeHealth"]> {
+    return measuredRuntimeHealth(
+      await runCli(this.#binary, ["--version"], {
+        cwd: undefined,
+        timeoutMs: RUNTIME_PROBE_TIMEOUT_MS,
+        environmentAllowlist: this.#environmentAllowlist,
+        denyReadPaths: this.#denyReadPaths,
+        providerCredentialDir: this.#providerCredentialDir,
+      }),
+    );
   }
 
   async probeSession(handle: SessionHandle): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
@@ -1942,7 +2004,7 @@ export class CodexCliAdapter implements ProviderAdapter {
   async probeCapacity(): Promise<CapacityReading> {
     return resolveRuntimeHealth(
       await this.#usageCollector.collect(),
-      () => this.probeRuntime(),
+      () => this.measureRuntime(),
     );
   }
 
@@ -2155,13 +2217,18 @@ export class GrokCliAdapter implements ProviderAdapter {
   }
 
   async probeRuntime(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
-    const result = await runCli(this.#binary, ["--version"], {
-      cwd: process.cwd(),
-      timeoutMs: 15_000,
-      denyReadPaths: this.#denyReadPaths,
-      providerCredentialDir: this.#providerCredentialDir,
-    });
-    return result.exitCode === 0 && !result.timedOut ? "HEALTHY" : "UNAVAILABLE";
+    return collapseUnmeasuredRuntime(await this.measureRuntime());
+  }
+
+  private async measureRuntime(): Promise<CapacityReading["runtimeHealth"]> {
+    return measuredRuntimeHealth(
+      await runCli(this.#binary, ["--version"], {
+        cwd: process.cwd(),
+        timeoutMs: RUNTIME_PROBE_TIMEOUT_MS,
+        denyReadPaths: this.#denyReadPaths,
+        providerCredentialDir: this.#providerCredentialDir,
+      }),
+    );
   }
 
   async probeSession(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
@@ -2169,7 +2236,7 @@ export class GrokCliAdapter implements ProviderAdapter {
   }
 
   async probeCapacity(): Promise<CapacityReading> {
-    return resolveRuntimeHealth(await this.#usageCollector.collect(), () => this.probeRuntime());
+    return resolveRuntimeHealth(await this.#usageCollector.collect(), () => this.measureRuntime());
   }
 }
 
