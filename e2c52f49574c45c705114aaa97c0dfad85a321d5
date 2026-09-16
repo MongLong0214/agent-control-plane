@@ -1,0 +1,10 @@
+Limit: this is a stderr line and inherits r-roleunheld811's limits: greppable in launchd's capture, not queryable, and doctor still has no subscriber check
+Limit: it names which branch refused; it does not explain why the live process takes a branch the same code takes differently against a copy of the same database
+Ruled-out: a doctor finding instead of a stderr line | that is the durable fix and a larger change; r-roleunheld811 already records why stderr is the weak form
+Ruled-out: printing the looked-up pubkey in the diagnostic | the reason is a fixed string and the details are counts, so the line stays a statement about the deployment's shape rather than an echo of its input
+Warn: the counts are the load-bearing part: bound-to-nothing and bound-to-a-session-that-is-not-READY were the same silence, as were zero mentionable roles and two, and those are opposite repairs
+Blast: module
+Undo: easy
+Certainty: firm
+Record-Id: r-6225d293205d
+Provenance: inherited 4a6e5cf8141016562d4ce4a6c370533845e83eaf
