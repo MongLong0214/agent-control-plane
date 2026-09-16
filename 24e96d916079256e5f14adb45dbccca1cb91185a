@@ -1,0 +1,9 @@
+Limit: migrations.ts:2186 stays stale — it is a FROZEN_BLOB whose pin was transcribed from a CEO-supplied digest, so correcting a comment there breaks the seal and re-pinning is not this change's to do
+Limit: the guard does not check that the prose around the search says what the search found; a file can satisfy its entry and still describe the result badly
+Ruled-out: correcting the five stale comments and stopping | a manual sweep fixes the five and not the sixth, which is the same shape that let these rot together
+Warn: ingress admits /again while ConversationTurnCoordinator.claim() has no matching override; that disagreement is no longer unreachable, only unreached — the first turn either door admits makes it live
+Warn: editing a docstring in a file with file:line-keyed exclusions shifts them — guards:timestamp-orderings caught it twice here, once in each direction
+Blast: module
+Record-Id: r-callerclaimsgostalesilently
+Evidence: scripts/verify-caller-claims-are-current.mjs
+Provenance: inherited 7d6fb3b00ac94f633f57ea564d6d590b7698e031
