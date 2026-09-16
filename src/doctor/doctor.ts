@@ -608,8 +608,21 @@ export class Doctor {
     // provider-global row cannot carry role provenance (#917). Taking the measurement here is
     // what makes this method's own two halves agree — otherwise it refreshes one set of
     // readings and then scores a different one, and on a cold process that second set is empty.
-    await this.continuity.refreshRoleScopedCapacity();
-    for (const reading of readings) {
+    const roleReadings = await this.continuity.refreshRoleScopedCapacity();
+    // A role-scoped provider is absent from `readings` and its provider-global row is never
+    // written again, so without this it has no representation in the report at all. Measured
+    // 2026-09-16: this deployment's `CAPACITY_LOW` findings went from two to one when `claude`
+    // became role-scoped, and the one that vanished was the provider at 4% of its weekly window.
+    // The scope carries the role, because two roles on one provider are two different quotas and
+    // a shared `provider:claude` scope would report them as one.
+    const scoped = roleReadings.map((reading) => ({
+      reading,
+      scope: `provider:${reading.provider}:${reading.binding.role}`,
+    }));
+    for (const { reading, scope } of [
+      ...readings.map((reading) => ({ reading, scope: `provider:${reading.provider}` })),
+      ...scoped,
+    ]) {
       // A preserved operator observation keeps the provider *routable* through a collector
       // that cannot read quota — but the collector still failed, and CP-HI-08 does not allow
       // a probe failure to be displayed as a pass. So the sensor finding is raised for the
@@ -619,7 +632,7 @@ export class Doctor {
         findings.push({
           code: "CAPACITY_SENSOR_FAILED",
           severity: "ERROR",
-          scope: `provider:${reading.provider}`,
+          scope,
           blocking: false,
           confidence: "HIGH",
           observedEvidence: {
@@ -646,7 +659,7 @@ export class Doctor {
         findings.push({
           code: "CAPACITY_LOW",
           severity: reading.advisoryState === "EXHAUSTED" ? "ERROR" : "WARN",
-          scope: `provider:${reading.provider}`,
+          scope,
           blocking: false,
           confidence: "HIGH",
           observedEvidence: {

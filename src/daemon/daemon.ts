@@ -1872,8 +1872,9 @@ export class Daemon {
     // #639 contract 6's active half: ask, on a schedule, rather than wait to be told. Before #638
     // this always asks a port that answers `found: false` — a real sweep that genuinely runs, not
     // the absence of one. Two independent facts still limit it, both stated in full in
-    // `reconcileUnresolved`'s docstring: (1) `canonical_turns` has no production writer yet
-    // (`ConversationTurnCoordinator.claim()` has none — #683/#639's other half), so
+    // `reconcileUnresolved`'s docstring: (1) `canonical_turns` holds no rows in the running
+    // deployment — `ConversationTurnCoordinator.claim()` now has two production callers, the
+    // Telegram router's and the Buzz mention path's, but both sit behind doors that are shut — so
     // `unresolvedIdentities()` returns empty here regardless of what the port would say; and (2)
     // even once it does not, a `COMPLETED` receipt is refused unconditionally today, because no
     // reply-outbox mechanism is wired to this ledger. (1) resolving does not resolve (2).

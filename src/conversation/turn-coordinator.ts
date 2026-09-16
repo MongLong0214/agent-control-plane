@@ -319,18 +319,23 @@ export type TurnOutcome =
  * somebody follows.
  *
  * **What this covers today, stated plainly rather than left to be inferred from the test suite.**
- * `src/app/control-plane.ts` constructs one instance, but nothing in `src/` outside this file
- * calls `claim()`, `dispatch()`, or any of the `ports.*` settlement entry points — `grep -rn
- * "\.claim(\|conversation\.ports"` outside `tests/` finds nothing. The production Telegram path
- * (`telegram-router.ts`) claims a turn through `IngressGuard.claimTurn()` and its own
- * `inbound_messages.turn_claim_json`, a different lifecycle entirely; it never reaches this
- * ledger. What *is* wired to production is the read/write half a daemon operator can already
- * reach — `contradictions()`, `unresolvedAcrossActors()`, `resolveInDoubt()`, `adjudicate()` — and
- * those operate correctly on whatever rows this class holds, but nothing in production creates
- * one. So this suite is a real, exercised contract with no production caller yet: every property
- * above is true of the code and false of the running system until something calls `claim()`.
- * Wiring a production entry point is a separate, larger change (tracked alongside #639's turn
- * reconciliation work) and is deliberately not attempted here.
+ * Two production paths now call `claim()`: the Telegram router's `materializeTurn`
+ * (`telegram-polling.ts`) and the Buzz mention path's (`agentcpd.ts`). That is a correction — this
+ * paragraph said for months that `grep -rn "\.claim(" ` outside `tests/` finds nothing, and it kept
+ * saying it after the callers landed. A statement about what calls a function is exactly the kind
+ * that goes stale silently, because the thing that makes it false is a change somewhere else.
+ *
+ * What has *not* changed is the row count: `canonical_turns` holds zero rows in the running
+ * deployment, and now for a different reason than "nothing calls this". Both writers sit behind
+ * doors that are shut — ACP has no Telegram registration, so its long-poll listener has never
+ * started, and the Buzz mention subscriber refuses while the canonical role is unbound. So the
+ * distinction this paragraph exists to keep is still live and has moved one step: the contract is
+ * reachable in code and unreached in production, rather than unreachable in code. Whoever reads a
+ * green suite here should still not conclude the running system exercises it.
+ *
+ * The read/write half a daemon operator can already reach — `contradictions()`,
+ * `unresolvedAcrossActors()`, `resolveInDoubt()`, `adjudicate()` — operates correctly on whatever
+ * rows this class holds, and holds none yet.
  *
  * The currency check this file leans on hardest — the exact `assignments` row an attestation was
  * made under, that row's own generation, its own actor, and a live `READY` session whose own
@@ -554,15 +559,17 @@ export class ConversationTurnCoordinator {
    * which is the stall the design exists to remove; ordering belongs where the message is
    * durable, not in a caller's stack frame.
    *
-   * **Nothing in production calls this method.** The live Telegram path claims its turn through
-   * `IngressGuard.claimTurn()`, which writes `inbound_messages.turn_claim_json` — a different
-   * table this class never reads or writes. `canonical_turns`, the table this method and
-   * `reconcileUnresolved()` both work against, has no production writer today: every row in it
-   * this build will ever see comes from a test calling `claim()` directly. A review (#691) named
-   * this precisely, and it is a correct description of the current system rather than a defect in
-   * this one — wiring a production caller here is #683/#639's other half, deliberately not done in
-   * this change. See `reconcileUnresolved`'s docstring, fact 1 of 2, for what that means for the
-   * sweep — and fact 2, which is independent of this one and does not resolve when this does.
+   * **Two production paths call this method, and it has still never run in production.** The
+   * Telegram router's `materializeTurn` and the Buzz mention path's both reach it; `IngressGuard`
+   * remains a separate lifecycle writing `inbound_messages.turn_claim_json`, which this class
+   * never reads or writes. `canonical_turns` holds zero rows in the running deployment because
+   * both callers sit behind doors that are shut, not because nothing calls them — ACP has no
+   * Telegram registration, and the Buzz mention subscriber refuses while the canonical role is
+   * unbound. A review (#691) named the older state precisely; this paragraph said it for months
+   * after it stopped being true, which is what a statement about callers does when the thing that
+   * falsifies it lives in another file. See `reconcileUnresolved`'s docstring, fact 1 of 2, for
+   * what that means for the sweep — and fact 2, which is independent and does not resolve when
+   * this does.
    *
    * A later message that arrives once this method has already produced an `IN_DOUBT` turn is
    * refused twice over, and both refusals are the intended answer, not a gap (#693). It is not a
@@ -594,9 +601,10 @@ export class ConversationTurnCoordinator {
    * `/again` deliberately lets the owner start an independent second turn while an earlier one on
    * the same conversation is still unresolved (`telegram-router.ts`, `overridesUnresolved`), and
    * `IngressGuard.claimTurn()` admits it. `ConversationTurnCoordinator.claim()` has no matching
-   * override today, so the two paths disagree on this one point — deliberately left unresolved
-   * here rather than guessed at, because `claim()` has no production caller (#638/#639) to be
-   * wrong in front of yet. Whoever wires this method to production has to decide then whether the
+   * override today, so the two paths disagree on this one point. That disagreement used to be
+   * unreachable and is now merely unreached: `claim()` has production callers, and the first turn
+   * either door admits makes the divergence live. It is still left unresolved here rather than
+   * guessed at. Whoever opens one of those doors has to decide then whether the
    * one-unresolved-turn hold gains an `/again`-equivalent override or whether the coordinator
    * stays stricter than ingress on purpose; either is a real decision and neither is this comment's
    * to make. What is already true regardless of that decision: a later message is never a source of
@@ -1305,14 +1313,12 @@ export class ConversationTurnCoordinator {
    * than one, because a third review (#691) found the first draft's disclosure let the second one
    * read as a footnote of the first. They are independent, and resolving #1 does not resolve #2:**
    *
-   * 1. **Nothing to sweep.** This method observes `canonical_turns`, which nothing in production
-   *    currently populates — `ConversationTurnCoordinator.claim()` has no caller in `src/` today;
-   *    the live Telegram path claims through `IngressGuard` into a different table,
-   *    `inbound_messages.turn_claim_json` (see `claim()`'s docstring). So today this sweep runs, and
-   *    asks, over an empty set. The design is kept rather than pointed at the ledger production
-   *    does write, because that is a different table with a different shape and its own review;
-   *    silently retargeting this sweep at it would change what this change *is* without saying so.
-   *    Wiring a production writer for `canonical_turns` is #683/#639's other half.
+   * 1. **Nothing to sweep yet.** This method observes `canonical_turns`, which holds zero rows in
+   *    the running deployment. `claim()` does now have production callers — the Telegram router's
+   *    and the Buzz mention path's `materializeTurn` — so the reason has changed and this sentence
+   *    with it: the table is empty because both writers sit behind doors that are shut, not because
+   *    nothing calls them. Until one opens, this sweep runs and asks over an empty set, which is
+   *    the same operational fact it always was and no longer the same claim about the code.
    * 2. **Even with something to sweep, `COMPLETED` cannot be acted on — unconditionally, not only
    *    while #1 holds.** Contract 6 requires a matched receipt to move `TURN_COMPLETED` and insert
    *    one reply-outbox item atomically, in the same transaction. Nothing wired to `canonical_turns`

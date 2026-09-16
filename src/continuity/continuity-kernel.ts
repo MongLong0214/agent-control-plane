@@ -8,6 +8,7 @@ import { isWithin } from "../guard/workspace-probe.ts";
 import {
   type DispatchCapacityTarget,
   type ProviderCapacity,
+  type RoleProviderCapacity,
   type CapacityMonitor,
   RefreshTrigger,
 } from "../capacity/capacity-monitor.ts";
@@ -153,14 +154,21 @@ export class ContinuityKernel {
    * only thing that would have taken the measurement no longer runs. Measured 2026-09-16: the
    * daemon parked at 00:52:48Z and two further doctor passes reported the same thing.
    */
-  async refreshRoleScopedCapacity(): Promise<void> {
+  async refreshRoleScopedCapacity(): Promise<RoleProviderCapacity[]> {
     const required = this.requiredRoles();
+    const taken: RoleProviderCapacity[] = [];
     for (const provider of this.coverageProviders(required)) {
       if (!this.providers.hasRoleScoped(provider)) continue;
       for (const role of new Set(required.map((entry) => entry.role))) {
-        await this.capacity.refreshForRole(provider, role);
+        taken.push(await this.capacity.refreshForRole(provider, role));
       }
     }
+    // Returned rather than discarded, because these are the only readings anything takes for such
+    // a provider: `capacity.refresh` skips it and nothing writes its provider-global row, so a
+    // caller that reports on capacity has no other way to see it. Measured 2026-09-16 — the
+    // doctor's `CAPACITY_LOW` findings went from two to one the moment this deployment's `claude`
+    // became role-scoped, and the one that disappeared was the provider actually running out.
+    return taken;
   }
 
   /** §15.3 — computed before any failover, never after. */
