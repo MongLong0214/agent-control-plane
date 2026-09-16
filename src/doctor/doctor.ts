@@ -659,15 +659,30 @@ export class Doctor {
     }
 
     const plan = this.continuity.computeCoveragePlan();
+    // Nothing read any candidate for any uncovered role. That is a statement about this process,
+    // not about the deployment, and it must not be reported with the word the operator acts on.
+    // Blocking on it is how a cold daemon talks itself into a park: the CRITICAL it raises is
+    // admitted by `canParkForBootstrap`, and parking then uninstalls the continuity coordinator,
+    // which is the only thing that would have taken the measurement. Measured 2026-09-16 — parked
+    // at 00:52:48Z, still parked after two further passes, and nothing reachable could clear it.
+    const nothingMeasured =
+      plan.uncovered.length > 0 && plan.unmeasured.length === plan.uncovered.length;
     if (plan.outcome !== "FULL_COVERAGE") {
       findings.push({
-        code: `ROLE_COVERAGE_${plan.outcome}`,
-        severity: plan.outcome === "NO_VALID_COVERAGE" ? "CRITICAL" : "WARN",
+        code: nothingMeasured ? "ROLE_COVERAGE_NOT_MEASURED" : `ROLE_COVERAGE_${plan.outcome}`,
+        severity: nothingMeasured ? "WARN" : plan.outcome === "NO_VALID_COVERAGE" ? "CRITICAL" : "WARN",
         scope: "continuity",
-        blocking: plan.outcome === "NO_VALID_COVERAGE",
+        blocking: !nothingMeasured && plan.outcome === "NO_VALID_COVERAGE",
         confidence: "HIGH",
-        observedEvidence: { uncovered: plan.uncovered, action: plan.action, mode: plan.mode },
-        recommendedAction: plan.action,
+        observedEvidence: {
+          uncovered: plan.uncovered,
+          unmeasured: plan.unmeasured,
+          action: plan.action,
+          mode: plan.mode,
+        },
+        recommendedAction: nothingMeasured
+          ? "no candidate provider has been measured for these roles; take a capacity reading before reading this as an outage"
+          : plan.action,
       });
     }
     return findings;
