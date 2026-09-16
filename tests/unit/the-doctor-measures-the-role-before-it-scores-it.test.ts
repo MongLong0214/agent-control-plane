@@ -1,7 +1,8 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { join } from "node:path";
 
 import { ControlPlane } from "../../src/app/control-plane.ts";
+import { CAPACITY_SWEEP_BUDGET_MS } from "../../src/doctor/doctor.ts";
 import { ManualClock } from "../../src/core/clock.ts";
 import { Role } from "../../src/domain/types.ts";
 import type {
@@ -196,6 +197,43 @@ describe("the doctor measures the role before it scores it", () => {
       expect(coverage?.code).toBe("ROLE_COVERAGE_NO_VALID_COVERAGE");
       expect(coverage?.blocking).toBe(true);
     } finally {
+      cp.db.close();
+    }
+  });
+
+  /**
+   * The sweep has a deadline, and what it does not reach is a finding rather than an absence.
+   *
+   * `REPOSITORY_SWEEP_BUDGET_MS` exists because N repository probes grow with the registry inside a
+   * `doctor.run` budget of 165s. Capacity has the identical shape — one probe per provider plus one
+   * per role for each role-scoped provider — and had no deadline at all. A single probe is bounded
+   * at its own layer (`COLLECTOR_TIMEOUT_MS` 45s, the `--version` fallback 15s); the pass was not.
+   *
+   * Abandoning the sweep is only safe because the plan can now say `unmeasured`: otherwise a spent
+   * budget produces the blocking CRITICAL that parks a daemon behind the coordinator that would
+   * clear it. The two changes are one design and this case is where they meet.
+   */
+  it("reports the sweep it could not finish, and does not block on it", async () => {
+    const { cp, clock, claude, gpt } = coldPlane();
+    try {
+      claude.setCapacity(healthy("claude", clock));
+      gpt.setCapacity(healthy("gpt", clock));
+      cp.providers.registerForRole(claude, Role.CEO);
+
+      // A provider that never answers. The budget is what has to end the pass.
+      vi.spyOn(gpt, "probeCapacity").mockImplementation(() => new Promise(() => {}));
+      vi.useFakeTimers();
+      const running = cp.doctor.run("system");
+      await vi.advanceTimersByTimeAsync(CAPACITY_SWEEP_BUDGET_MS + 1_000);
+      const report = await running;
+      vi.useRealTimers();
+
+      const sweep = report.findings.find((finding) => finding.code === "CAPACITY_SWEEP_NOT_REACHED");
+      expect(sweep?.severity).toBe("WARN");
+      expect(sweep?.blocking).toBe(false);
+      expect(sweep?.observedEvidence).toMatchObject({ sweepBudgetMs: CAPACITY_SWEEP_BUDGET_MS });
+    } finally {
+      vi.restoreAllMocks();
       cp.db.close();
     }
   });
