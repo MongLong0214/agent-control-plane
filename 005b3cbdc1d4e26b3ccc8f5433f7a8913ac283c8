@@ -1,0 +1,9 @@
+Limit: the shard job's `if:` and this gate's check are one decision in two places; Actions cannot reference another job's `if:`, so only the comment holds them together
+Limit: the excuse relies on verify-gate failing a push whose matrix failed — the hole is closed one job over, not here
+Ruled-out: making the gate itself skip on push | the gate is what branch protection names, and a check that disappears on some events is a check whose absence has to be interpreted
+Warn: if the shard job's `if:` stops excluding an event, this gate must stop excusing it — they move together or main goes red again
+Warn: the test must read the gate's script out of ci.yml, never restate it; a copy passes while the workflow says something else, which is how this hid for a day and a half
+Blast: module
+Record-Id: r-askippedshardisnotafailedone
+Evidence: tests/unit/a-skipped-shard-is-not-a-failed-one.test.ts
+Provenance: inherited 7c8f5d03e2acc05c8886da844dfaa094c3731d4d
