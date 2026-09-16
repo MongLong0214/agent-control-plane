@@ -2591,3 +2591,101 @@ describe("the buzz mention subscriber counts what it receives", () => {
     expect(handle.counters().rejections["frame-not-json"]).toBe(2);
   });
 });
+
+/**
+ * A refusal that does not say what it refused costs a day.
+ *
+ * 2026-09-16: the live daemon refused at every start with "identities[0] does not currently hold a
+ * live PRIMARY_CTO binding", while the same question answered *yes* everywhere it could be asked
+ * from outside — the database's own rows, this code against a copy of them, the deployed
+ * generation's build of it, and a `ControlPlane` over that copy. Five hypotheses were eliminated by
+ * measurement (identity mismatch, key derivation, startup ordering, database preconditions,
+ * deployed-versus-current build) and the refusal still could not be attributed, because
+ * `primaryCtoBindingFor` had four ways to answer `null` and no way to say which one it took.
+ *
+ * These drive each branch and require it to name itself. The success case requires silence: a
+ * diagnostic that prints on the path that works is a log nobody reads by the second day.
+ */
+const capturedStderr = (body: () => void): string => {
+  const original = process.stderr.write.bind(process.stderr);
+  let captured = "";
+  (process.stderr as unknown as { write: (chunk: string) => boolean }).write = (chunk: string) => {
+    captured += String(chunk);
+    return true;
+  };
+  try {
+    body();
+  } finally {
+    (process.stderr as unknown as { write: typeof original }).write = original;
+  }
+  return captured;
+};
+
+describe("the mention binding lookup names what it refused", () => {
+  it("says so when the channel identity is empty", () => {
+    const harness = makeHarness();
+    const registry = buzzMentionSubscriberRegistry(harness.cp);
+    const said = capturedStderr(() => {
+      expect(registry.primaryCtoBindingFor("   ")).toBeNull();
+    });
+    expect(said).toContain("the channel identity is empty");
+  });
+
+  it("says so, with a count, when no live session carries the identity", () => {
+    // The count separates "this actor is bound to nothing" from "it is bound to a session that is
+    // not READY" — two different repairs that used to produce the same silence.
+    const harness = makeHarness();
+    const registry = buzzMentionSubscriberRegistry(harness.cp);
+    const said = capturedStderr(() => {
+      expect(registry.primaryCtoBindingFor(getPublicKey(generateSecretKey()))).toBeNull();
+    });
+    expect(said).toContain("no READY or DRAINING session carries this channel identity");
+    expect(said).toContain("sessionsWithThisActor");
+  });
+
+  it("says how many mentionable roles the session held when it was not exactly one", () => {
+    // The branch that cost the day: a session that exists, is READY and carries the actor, and
+    // still answers null because `held.length !== 1`. Without the count a reader cannot tell
+    // whether it was zero or two, and those are opposite problems.
+    const harness = makeHarness();
+    const secretKey = generateSecretKey();
+    const pubkey = getPublicKey(secretKey);
+    const session = harness.cp.sessions.create({ provider: "scripted", model: "scripted-cto" });
+    expect(harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "test").allowed).toBe(true);
+    expect(harness.cp.sessions.bindBuzzActor({
+      sessionId: session.sessionId, sessionSecret: session.sessionSecret!, buzzActorId: pubkey,
+    }, { isAllowedActor: () => true }).allowed).toBe(true);
+
+    const registry = buzzMentionSubscriberRegistry(harness.cp);
+    const said = capturedStderr(() => {
+      expect(registry.primaryCtoBindingFor(pubkey)).toBeNull();
+    });
+    expect(said).toContain("that session holds no single mentionable role");
+    expect(said).toContain("heldForSession");
+  });
+
+  it("says nothing at all when the lookup succeeds", async () => {
+    const harness = makeHarness();
+    const projectId = "mention-refusal-names-project";
+    harness.cp.db.run(`INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)`, [
+      projectId, "mention refusal names what it saw", harness.cp.clock.nowIso(),
+    ]);
+    const secretKey = generateSecretKey();
+    const pubkey = getPublicKey(secretKey);
+    const session = harness.cp.sessions.create({ provider: "scripted", model: "scripted-cto" });
+    expect(harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "test").allowed).toBe(true);
+    expect(harness.cp.sessions.bindBuzzActor({
+      sessionId: session.sessionId, sessionSecret: session.sessionSecret!, buzzActorId: pubkey,
+    }, { isAllowedActor: () => true }).allowed).toBe(true);
+    expect(harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId: session.sessionId, projectId }).allowed)
+      .toBe(true);
+
+    const registry = buzzMentionSubscriberRegistry(harness.cp);
+    let bound: unknown;
+    const said = capturedStderr(() => {
+      bound = registry.primaryCtoBindingFor(pubkey);
+    });
+    expect(bound, "the fixture did not produce a binding, so silence proves nothing").toBeTruthy();
+    expect(said, "the success path printed a diagnostic").toBe("");
+  });
+});

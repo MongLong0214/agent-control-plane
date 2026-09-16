@@ -254,8 +254,12 @@ const groups = [
     operands: [
       ["!session",1],
       ["session.buzz_actor_id === null",1],
-      ["!only",1],
-      ["only.role !== Role.PRIMARY_CTO",1],
+      // `!only` and `only.role !== Role.PRIMARY_CTO` used to be one `||` here and are two `if`s
+      // now, so neither is an operand this census can see any more. They were split so each
+      // refusal could name itself: a lookup that answered `null` four ways without saying which
+      // cost a day of narrowing the live daemon from outside. The conditions still decide, and
+      // `tests/unit/buzz-mention-subscriber.test.ts` drives each branch and requires it to print
+      // its own reason, which is a stronger witness than the entry these two stood in for.
     ],
   },
   {

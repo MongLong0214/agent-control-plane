@@ -37,7 +37,7 @@ export const PARTIAL_TIMESTAMP_ORDERINGS = new Map([
   ["src/conversation/turn-coordinator.ts:1169", "ORDER BY claimed_at ASC"],
   ["src/conversation/turn-coordinator.ts:1757", "ORDER BY claimed_at ASC"],
   ["src/cto/cto-lifecycle.ts:783", "ORDER BY created_at DESC"],
-  ["src/daemon/agentcpd.ts:1828", "ORDER BY created_at"],
+  ["src/daemon/agentcpd.ts:1865", "ORDER BY created_at"],
   ["src/github/github-kernel.ts:3419", "ORDER BY created_at DESC"],
   ["src/github/github-kernel.ts:3845", "ORDER BY created_at"],
   ["src/run/run-engine.ts:1075", "ORDER BY created_at"],

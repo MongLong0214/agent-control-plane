@@ -914,20 +914,57 @@ export const startDaemonBuzzMessageIngress = (
  * else is `null`, and `null` at startup is a subscriber that does not open.
  */
 export const buzzMentionSubscriberRegistry = (cp: ControlPlane): BuzzMentionRegistry => ({
+  // Four ways to answer `null`, and until 2026-09-16 they were one silent `null` between them.
+  //
+  // Measured that day: the subscriber refused at every start with "identities[0] does not currently
+  // hold a live PRIMARY_CTO binding", while the same question answered *yes* everywhere it could be
+  // asked from outside — the live database's rows, this exact code against a copy of them, the
+  // deployed generation's own build of it, and a `ControlPlane` built over the copy. Five
+  // hypotheses were eliminated by measurement (identity mismatch, key derivation, startup
+  // ordering, database preconditions, deployed-versus-current build) and the refusal still could
+  // not be attributed, because the one thing nobody could see was which of these four lines the
+  // live process took.
+  //
+  // A refusal that does not say what it refused costs a day of narrowing from the outside. So each
+  // return says which condition failed and what it saw. `reason` is a fixed string, never a value
+  // read from the request, and the numbers are counts — a pubkey is public but this stays a
+  // diagnostic about the deployment's own shape rather than an echo of its input.
   primaryCtoBindingFor: (pubkey) => {
     const channelIdentity = pubkey.trim();
-    if (channelIdentity.length === 0) return null;
+    const refuse = (reason: string, detail: Record<string, unknown> = {}): null => {
+      process.stderr.write(
+        `Buzz mention binding lookup refused: ${reason} ${JSON.stringify(detail)}\n`,
+      );
+      return null;
+    };
+    if (channelIdentity.length === 0) return refuse("the channel identity is empty");
     const session = cp.db.get<{ session_id: string; buzz_actor_id: string | null }>(
       `SELECT session_id, buzz_actor_id FROM sessions
         WHERE buzz_actor_id = ? AND lifecycle IN ('READY','DRAINING')`,
       [channelIdentity],
     );
-    if (!session || session.buzz_actor_id === null) return null;
+    if (!session || session.buzz_actor_id === null) {
+      return refuse("no READY or DRAINING session carries this channel identity", {
+        sessionsWithThisActor: cp.db.all<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM sessions WHERE buzz_actor_id = ?`,
+          [channelIdentity],
+        )[0]?.n ?? 0,
+      });
+    }
     const held = currentBindingsForRoles(cp, MENTIONABLE_ROLES).filter(
       (binding) => binding.sessionId === session.session_id,
     );
     const only = held.length === 1 ? held[0] : undefined;
-    if (!only || only.role !== Role.PRIMARY_CTO) return null;
+    if (!only) {
+      return refuse("that session holds no single mentionable role", {
+        heldForSession: held.length,
+        roles: held.map((binding) => binding.role),
+        projects: cp.projects.list().length,
+      });
+    }
+    if (only.role !== Role.PRIMARY_CTO) {
+      return refuse("the one role that session holds is not PRIMARY_CTO", { role: only.role });
+    }
     // The stored column travels back with the answer rather than being assumed equal to the
     // lookup key. `WHERE buzz_actor_id = ?` is SQLite's comparison, and the subscriber re-runs
     // it in constant time before it will speak for the role.
