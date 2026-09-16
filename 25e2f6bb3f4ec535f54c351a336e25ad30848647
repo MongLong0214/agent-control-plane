@@ -1,0 +1,10 @@
+Limit: capacity.refresh(trigger, [provider]) with an explicit role-scoped id persists an unknownCapacity row, and continuity.failover passes one — so the provider-global row is overwritten with an explicit unknown, not merely frozen
+Limit: the binding-loss consequence I first published was refuted by the test built to settle it; the incumbent stays bound in production's shape, and #956 carries the retraction
+Ruled-out: persisting role readings into the provider-global row | that is exactly what #917 refused, and it puts role provenance in a row that cannot hold it
+Ruled-out: changing daemon.ts:1594 to ask the role's question in this change | still the right shape, but after the retraction it cannot be justified by a failure I could not demonstrate
+Warn: the finding scope must carry the role — two roles on one provider are two quotas, and a shared provider:<name> scope collapses them into one finding
+Warn: a provider that is skipped by the refresh disappears from the report as an absence rather than a warning; that is what made this invisible for an hour
+Blast: module
+Record-Id: r-arolescopedprovidervanishedfromthereport
+Evidence: tests/unit/the-doctor-measures-the-role-before-it-scores-it.test.ts
+Provenance: inherited 0ee566fc528357fdb61df9ff2626659772bd3203
