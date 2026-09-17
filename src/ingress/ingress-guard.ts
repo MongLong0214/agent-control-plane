@@ -258,7 +258,7 @@ export class IngressGuard {
   ) {
     this.#receiptIdentityForClaim = options.receiptIdentityForClaim ?? null;
     this.#canonicalTargetForClaim = options.canonicalTargetForClaim ?? null;
-    this.#processIncarnation = options.claimProcessIncarnation ?? processIncarnation();
+    this.#processIncarnation = options.claimProcessIncarnation ?? processIncarnationForClaims();
     const nonceTtlMsByChannel: Record<string, number> = {};
     for (const [channel, policy] of Object.entries(policies)) {
       if (policy.allowedActors.length === 0) {
@@ -1574,8 +1574,34 @@ export interface TurnIdentity {
  * field existed has no incarnation at all and reads as the former — the closed direction, because
  * the wrong direction here would report a lost message as live.
  */
-const processIncarnation = (): string =>
-  `${process.pid}#${new Date(Date.now() - Math.round(process.uptime() * 1000)).toISOString()}`;
+const PROCESS_INCARNATION = `${process.pid}#${
+  new Date(Date.now() - Math.round(process.uptime() * 1000)).toISOString()
+}`;
+
+/**
+ * Measured, because the first version of this was a function and two calls in one process
+ * disagreed.
+ *
+ * `Date.now() - process.uptime() * 1000` reconstructs the start instant from two clocks that
+ * drift against each other by fractions of a millisecond, so consecutive calls land on either
+ * side of a millisecond boundary: 2,000 calls in one process produced **two** distinct values.
+ * Two `IngressGuard` instances in one daemon — the Telegram listener's and the Buzz ingress's —
+ * then hold different incarnations, and each reads the other's claims as taken by a process that
+ * is gone. That is the fail-open direction this field exists to refuse: a live turn reported as
+ * one whose claimer can never answer.
+ *
+ * Computed once at module load, so every guard in a process shares one value and it changes only
+ * when the process does.
+ */
+/**
+ * This process's incarnation, as every claim it writes records it.
+ *
+ * Exported so a test can measure the property the docstring above claims — that reading it
+ * repeatedly yields one value. The function it replaced satisfied a same-millisecond check and
+ * failed across a whole test file, so the witness has to probe the boundary rather than take two
+ * readings and hope.
+ */
+export const processIncarnationForClaims = (): string => PROCESS_INCARNATION;
 
 /**
  * Whether a stored claim was taken by a process that is not this one.

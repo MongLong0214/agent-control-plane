@@ -1,6 +1,10 @@
 import { afterAll, describe, expect, it } from "vitest";
 
-import { IngressGuard, type TurnIdentity } from "../../src/ingress/ingress-guard.ts";
+import {
+  IngressGuard,
+  processIncarnationForClaims,
+  type TurnIdentity,
+} from "../../src/ingress/ingress-guard.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
 
@@ -19,6 +23,16 @@ afterAll(cleanupTempDirs);
  * outcome can arrive for it on its own. A claim naming *this* process proves nothing either way:
  * the handler may be running, or may have thrown already, and both leave an identical row.
  */
+/** The production constructor — no injected incarnation, so it takes the process's own. */
+const productionGuardFor = (harness: ReturnType<typeof makeHarness>) =>
+  new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, {
+    telegram: {
+      allowedActors: ["owner"],
+      allowedConversations: ["chat"],
+      recoverInFlight: true,
+    },
+  });
+
 const guardFor = (harness: ReturnType<typeof makeHarness>, incarnation: string) =>
   new IngressGuard(
     harness.cp.db,
@@ -78,6 +92,41 @@ describe("an unresolved turn says whether its claimer is gone", () => {
     const unresolved = live.unresolvedTurns("telegram", "session-digest");
     expect(unresolved).toHaveLength(1);
     expect(unresolved[0]?.claimerProcessGone).toBe(false);
+  });
+
+  it("gives every guard in one process the same incarnation", () => {
+    // Measured: the first version computed this per construction, from
+    // `Date.now() - process.uptime() * 1000`. Those are two clocks with sub-millisecond drift, so
+    // the reconstructed start instant lands on either side of a millisecond boundary — 5,000 reads
+    // in one process produced **two** distinct values, five times out of five. A daemon builds
+    // more than one guard (the Telegram listener's and the Buzz ingress's), so each read the
+    // other's claims as taken by a process that is gone: the fail-open direction, a live turn
+    // reported as one whose claimer can never answer.
+    //
+    // Probed rather than sampled twice, deliberately. Two back-to-back constructions land in the
+    // same millisecond and the broken version passes that check every time — measured, six runs
+    // out of six. What separates the two implementations is stability *across* the boundary.
+    const readings = new Set<string>();
+    for (let i = 0; i < 5_000; i += 1) readings.add(processIncarnationForClaims());
+    expect(
+      readings.size,
+      "the incarnation a claim records must not depend on when it is read",
+    ).toBe(1);
+
+    // And the consequence that motivates it, through the product: two guards, one process, one
+    // answer about whose claim it is.
+    const harness = makeHarness();
+    const first = productionGuardFor(harness);
+    const second = productionGuardFor(harness);
+    expect(admit(first, "update:4").allowed).toBe(true);
+    expect(first.claimTurn("telegram", "update:4", identity()).allowed).toBe(true);
+
+    const throughSecond = second.unresolvedTurns("telegram", "session-digest");
+    expect(throughSecond).toHaveLength(1);
+    expect(
+      throughSecond[0]?.claimerProcessGone,
+      "a second guard in the same process must not read the first's claim as abandoned",
+    ).toBe(false);
   });
 
   it("treats a claim written before the field existed as unknown, not as a dead claimer", () => {
