@@ -175,4 +175,60 @@ export const RECURRING_DEFECTS: readonly RecurringDefect[] = [
     ],
     guard: "trailers",
   },
+  {
+    id: "the-index-routes-a-reader-to-a-closed-issue",
+    what:
+      "The production-readiness index keeps a hand-written list of what is open. It is a copy of " +
+      "the tracker with nothing reconciling it, so it drifts on the tracker's schedule rather " +
+      "than on anyone's attention, and a reader who opens a listed issue finds it green and " +
+      "concludes the area is finished.",
+    // The surface is a URL rather than a repository path, because that is where this class lives:
+    // the list is in the tracker, not in the tree. `where` is required to be nameable — a slash or
+    // a dot, so that two occurrences can be compared at all — and a stable link to the exact
+    // section satisfies that for the reason the requirement exists, not by accident of punctuation.
+    //
+    // Four dated drifts, all in one document, because the class is a property of that document.
+    // `independentOccurrences` counts distinct surfaces and therefore reads this as one, which
+    // understates it: the guard below is added on the strength of the four measurements rather
+    // than on the count this module derives. The first three are the index's own record of
+    // correcting itself, which is the clearest evidence a correction is not a fix.
+    occurrences: [
+      {
+        at: "2026-09-12",
+        where: "github.com/MongLong0214/agent-control-plane/issues/306#what-is-actually-open",
+        evidence:
+          "The section said \"all 16\" and named seven issues that were already closed: #778, " +
+          "#780, #779, #756, #757, #575, #245 — plus #241/#418, cited as the owner-gated action, " +
+          "closed 2026-08-31.",
+      },
+      {
+        at: "2026-09-13",
+        where: "github.com/MongLong0214/agent-control-plane/issues/306#what-is-actually-open",
+        evidence:
+          "It happened again on the corrected list: #674, #777, #859 and #784 were all named and " +
+          "all closed, and #778/#864 were cited as live references when both were finished. " +
+          "Fourteen became twelve.",
+      },
+      {
+        at: "2026-09-15",
+        where: "github.com/MongLong0214/agent-control-plane/issues/306#what-is-actually-open",
+        evidence:
+          "The heading read \"11 at 2026-09-15\" while the section carried nine live bullets, so " +
+          "the count and the list it counted disagreed with each other as well as with the tracker.",
+      },
+      {
+        at: "2026-09-18",
+        where: "github.com/MongLong0214/agent-control-plane/issues/306#what-is-actually-open",
+        evidence:
+          "Six of nine live bullets named closed issues (#510, #655, #858, #833, #872, #885) and " +
+          "three open issues had no bullet at all (#954, #758, #246) — #954 absent while the " +
+          "deployment was waiting on the decision it carries.",
+      },
+    ],
+    // A daily scheduled check, not a merge gate, for `tracker-loci.yml`'s reason: this is a fact
+    // about the tracker rather than about any diff, so it is already red on an unedited `main`
+    // whenever the tracker moves, and a required check in that state blocks every merge on
+    // something no diff touched. `pnpm index:open-list` is the same script an operator runs.
+    guard: "index:open-list",
+  },
 ];
