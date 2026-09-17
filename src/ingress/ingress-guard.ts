@@ -238,6 +238,7 @@ export class IngressGuard {
    */
   readonly #receiptIdentityForClaim: ((identity: TurnIdentity) => ReceiptLookupQuery | null) | null;
   readonly #canonicalTargetForClaim: ((identity: TurnIdentity) => ReceiptLookupQuery | null) | null;
+  readonly #processIncarnation: string;
 
   constructor(
     private readonly db: Db,
@@ -247,10 +248,17 @@ export class IngressGuard {
     options: {
       receiptIdentityForClaim?: (identity: TurnIdentity) => ReceiptLookupQuery | null;
       canonicalTargetForClaim?: (identity: TurnIdentity) => ReceiptLookupQuery | null;
+      /**
+       * This process's incarnation, injectable so a test can hold a claim written by a *different*
+       * process — the case that must read as "claimer is gone" and cannot be produced by forking a
+       * second daemon inside a unit test.
+       */
+      claimProcessIncarnation?: string;
     } = {},
   ) {
     this.#receiptIdentityForClaim = options.receiptIdentityForClaim ?? null;
     this.#canonicalTargetForClaim = options.canonicalTargetForClaim ?? null;
+    this.#processIncarnation = options.claimProcessIncarnation ?? processIncarnation();
     const nonceTtlMsByChannel: Record<string, number> = {};
     for (const [channel, policy] of Object.entries(policies)) {
       if (policy.allowedActors.length === 0) {
@@ -740,6 +748,9 @@ export class IngressGuard {
           ...identity,
           ...(isBoundReceiptIdentity(receiptIdentity, identity) ? { receiptIdentity } : {}),
           ...(isBoundCanonicalTarget(canonicalTarget, identity) ? { canonicalTarget } : {}),
+          // In this same statement for the reason the identity is: a row that is claimed but says
+          // nothing about who claimed it is a state nothing can interpret afterwards.
+          claimedByProcess: this.#processIncarnation,
         };
         const updated = this.db.run(
           `UPDATE inbound_messages SET turn_claim_json = ?
@@ -944,6 +955,15 @@ export class IngressGuard {
     );
     return rows.map((row) => ({
       nonce: row.nonce,
+      // Derived here, never stored, and only in the direction that can be proven. See
+      // `UnresolvedTurn.claimerProcessGone`: a *different* recorded incarnation is decisive, while
+      // this process's own is not — a handler that threw in this process leaves exactly the same
+      // row as one still running, and the resend scenario in `telegram-ingress.test.ts` produces
+      // that inside a single process.
+      claimerProcessGone: claimerProcessIsGone(
+        JSON.parse(row.turn_claim_json) as StoredTurnClaim,
+        this.#processIncarnation,
+      ),
       // `received_at`, and named for it. It was called `claimedAt`, which is a different moment:
       // a message admitted, lost to a crash, redelivered and only then claimed has a gap between
       // the two. The surface this feeds is a person deciding what to do about an outstanding
@@ -1533,6 +1553,41 @@ export interface TurnIdentity {
   overriddenUnresolvedNonces?: readonly string[];
 }
 
+/**
+ * Which process took a claim, as a value that cannot survive that process.
+ *
+ * `unresolvedTurns` answers "no outcome was ever recorded", and that is two facts wearing one
+ * word: a turn running right now has no outcome yet, and so does a turn whose process died
+ * mid-flight. The Telegram park reply then tells the owner ACP "does not know whether any of
+ * those reached the CEO" about a turn this very process is still awaiting, and offers `/again` —
+ * which starts a second turn alongside the live one.
+ *
+ * The pid alone cannot separate them: pids are reused, so a claim from a dead daemon can carry
+ * the pid of the live one. Pairing it with this process's own start instant makes the value
+ * unique to one run of one process — the same shape `session_incarnation` uses for the same
+ * reason.
+ *
+ * Read, never trusted as liveness on its own: a claim carrying *another* incarnation says only
+ * that whoever took it is not this process, which in a deployment holding one `agentcpd.lock` at
+ * a time means that process is gone. A claim carrying *this* one says this process took it and
+ * has recorded no outcome. Neither promises an answer is coming, and a row written before this
+ * field existed has no incarnation at all and reads as the former — the closed direction, because
+ * the wrong direction here would report a lost message as live.
+ */
+const processIncarnation = (): string =>
+  `${process.pid}#${new Date(Date.now() - Math.round(process.uptime() * 1000)).toISOString()}`;
+
+/**
+ * Whether a stored claim was taken by a process that is not this one.
+ *
+ * Both guards are load-bearing. An absent `claimedByProcess` is a row from a build older than the
+ * field, which proves nothing about its claimer — not that the claimer is gone. And equality
+ * proves only that this process took it, which is compatible with the handler having already
+ * thrown. So the answer is `true` for exactly one shape: a recorded incarnation that is not ours.
+ */
+const claimerProcessIsGone = (claim: { claimedByProcess?: string }, thisProcess: string): boolean =>
+  typeof claim.claimedByProcess === "string" && claim.claimedByProcess !== thisProcess;
+
 export interface TurnClaim extends TurnIdentity {
   deliveryStatus: typeof TURN_CLAIMED;
   /**
@@ -1548,6 +1603,15 @@ export interface TurnClaim extends TurnIdentity {
    * bridge and leave it with nothing to name, which is the closed direction.
    */
   canonicalTarget?: ReceiptLookupQuery;
+  /**
+   * The incarnation of the process that took this claim — see `processIncarnation`.
+   *
+   * Written by the same UPDATE that writes the claim, so there is no window where a row is
+   * claimed and says nothing about who claimed it, and never updated afterwards: this is a fact
+   * about the moment of claiming, not a lifecycle. Optional because rows claimed before the field
+   * existed do not have it, and those read as *not* this process.
+   */
+  claimedByProcess?: string;
   repliedAt?: string;
   noReplyAt?: string;
   settledAt?: string;
@@ -1584,6 +1648,23 @@ const normalizeStoredTurnClaim = (claim: StoredTurnClaim): TurnClaim => {
 /** A claimed turn with the row context a reader needs to say which message it was. */
 export interface UnresolvedTurn extends TurnClaim {
   nonce: string;
+  /**
+   * Whether the process that claimed this turn is provably gone.
+   *
+   * `unresolvedTurns` answers "no outcome was ever recorded", and that is two facts wearing one
+   * word: a turn still running has no outcome yet, and neither does one whose process died
+   * mid-flight. Only one of the two can be established from a row, and this is it — a claim
+   * naming a *different* incarnation was taken by a process that no longer exists, because this
+   * deployment holds one `agentcpd.lock` at a time. No outcome can arrive for it on its own.
+   *
+   * `false` is deliberately *not* the converse. A claim naming this process may be in flight or
+   * may be a handler that already threw, which leaves an identical row — the resend scenario in
+   * `telegram-ingress.test.ts` produces that inside one process — and a row claimed before this
+   * field existed carries no incarnation at all. Both are unknown, and unknown keeps the wording
+   * it already had. Reporting a lost message as live is the failure this asymmetry exists to
+   * refuse; the positive half needs an in-flight registry a stored claim cannot supply.
+   */
+  claimerProcessGone: boolean;
   /**
    * When the source message was admitted — not when its turn was claimed.
    *
