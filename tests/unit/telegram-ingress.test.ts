@@ -1337,6 +1337,106 @@ describe("Telegram production ingress", () => {
     }
   });
 
+  it("says a turn is in flight here while this process is still awaiting it, and stops saying it once the handler has thrown", async () => {
+    // #631. Slice 1 refused to claim the positive half, because a stored claim cannot tell a
+    // running handler from one that threw — both leave a claim with no `repliedAt`, `noReplyAt`
+    // or `settledAt`. The code that *awaits* the turn can: its tracking removes the turn in a
+    // `finally`, so a thrown handler drops out and a slow one does not. These two halves are one
+    // test on purpose — the second is what makes the first safe to say.
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const turns: string[] = [];
+    const hangingTurn = async (input: { text: string }): Promise<string> => {
+      turns.push(input.text);
+      await held;
+      return "답";
+    };
+
+    const transport = new FakeTelegramTransport();
+    // One batch, two messages: the second is routed while the first's handler is still awaiting,
+    // which is the ordinary case — a measured CEO turn runs minutes, and the owner types again.
+    transport.updates = [update("배포 언제 끝나?", {}, 730), update("아직이야?", {}, 731)];
+    const listener = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport,
+      start: false,
+      onDirect: hangingTurn,
+    });
+    try {
+      const cycle = await listener.service.pollOnce();
+
+      // The first message's turn is claimed and awaited; the second is parked against it.
+      expect(listener.service.inFlightTurnNonces().has("update:730")).toBe(true);
+      const parked = cycle.routes.find((route) => route.status === "COMPLETED");
+      const parkedText = parked?.status === "COMPLETED" ? parked.outcome.reply?.text ?? "" : "";
+      expect(parkedText).toContain("in flight here");
+      expect(parkedText).toContain("ACP is still awaiting it in this process");
+      // The wording that would be wrong here: this turn has not lost its claimer, and telling the
+      // owner ACP does not know whether it reached the CEO is what slice 1 deliberately kept for
+      // the cases where that is true.
+      expect(parkedText).not.toContain("claimer gone");
+      expect(parkedText).not.toContain("does not know whether any of those reached the CEO");
+      expect(turns).toEqual(["배포 언제 끝나?"]);
+
+      release();
+      await listener.service.pendingTurnsSettled();
+
+      // Settled, so nothing is in flight — the set is emptied by the same `finally` that a throw
+      // would have run.
+      expect(listener.service.inFlightTurnNonces().size).toBe(0);
+    } finally {
+      release();
+      await listener.close();
+    }
+  });
+
+  it("does not report a turn as in flight after its handler threw", async () => {
+    // The other direction, and the one that makes the claim above safe. `crashingTurn` throws
+    // inside the process that claimed the turn — the row it leaves is byte-identical to a running
+    // one, so only the `finally` in the poller's tracking can tell them apart. If it ever stops
+    // running, this row goes red and the park reply starts telling an owner to wait for an answer
+    // that will never arrive.
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const crashingTurn = async (input: { text: string }): Promise<string> => {
+      void input;
+      throw new TelegramInterruption("after-dispatch");
+    };
+
+    const firstTransport = new FakeTelegramTransport();
+    firstTransport.updates = [update("빌드 깨졌어?", {}, 740)];
+    const first = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport: firstTransport,
+      start: false,
+      onDirect: crashingTurn,
+    });
+    try {
+      await expect(observedTurnFault(first.service)).rejects.toBeInstanceOf(TelegramInterruption);
+      expect(first.service.inFlightTurnNonces().size, "a thrown handler must leave the in-flight set").toBe(0);
+    } finally {
+      await first.close();
+    }
+
+    const resendTransport = new FakeTelegramTransport();
+    resendTransport.updates = [update("빌드 깨졌어?", {}, 741)];
+    const resendListener = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport: resendTransport,
+      start: false,
+      onDirect: crashingTurn,
+    });
+    try {
+      const outcome = await settledPoll(resendListener.service);
+      const text = outcome.outcomes[0]?.reply?.text ?? "";
+      expect(text).not.toContain("in flight here");
+      expect(text).toContain("does not know whether any of those reached the CEO");
+    } finally {
+      await resendListener.close();
+    }
+  });
+
   it("does not park a DIRECT message from an unrelated conversation", async () => {
     // The lookup is scoped by sessionDigest = digestOf({ channel, conversation }). An unresolved
     // turn in one chat must never hold up a different chat that happens to share nothing but a

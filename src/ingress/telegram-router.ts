@@ -210,7 +210,20 @@ export interface TelegramRouteOutcome {
  */
 export type TelegramRouteProgress =
   | { status: "COMPLETED"; outcome: TelegramRouteOutcome }
-  | { status: "CEO_TURN_PENDING"; outcome: Promise<TelegramRouteOutcome> };
+  | {
+    status: "CEO_TURN_PENDING";
+    outcome: Promise<TelegramRouteOutcome>;
+    /**
+     * The nonce of the message whose turn is now pending, stated by the side that derives it.
+     *
+     * The caller awaiting this promise is the only place that can know the turn is still running
+     * — its `finally` fires on a thrown handler as well as a returned one — but it cannot name the
+     * turn without either being handed the nonce or deriving it a second time. `nonceFor` is the
+     * one authority for that string, and a second derivation beside it is the defect this field
+     * exists to avoid.
+     */
+    nonce: string;
+  };
 
 const completedRoute = (outcome: TelegramRouteOutcome): TelegramRouteProgress => ({
   status: "COMPLETED",
@@ -218,6 +231,21 @@ const completedRoute = (outcome: TelegramRouteOutcome): TelegramRouteProgress =>
 });
 
 export interface TelegramRouterOptions {
+  /**
+   * The nonces whose turns this process is still awaiting, read at the moment the question is
+   * asked rather than captured once.
+   *
+   * Supplied by the poller, because the poller is what awaits the turn: its tracking removes a
+   * turn in a `finally`, so a handler that threw drops out of the set and a handler that is merely
+   * slow does not. The guard cannot answer this — a claim written by a crashed in-process handler
+   * is byte-identical to one still running, which is why `claimerProcessGone` states only the
+   * negative half.
+   *
+   * Absent by default: a router with no poller behind it (a test, the disposable realm's driver)
+   * knows nothing about in-flight work, and an empty set is the honest answer there — it reports
+   * "outcome unknown", the wording that was already correct.
+   */
+  inFlightTurnNonces?: () => ReadonlySet<string>;
   ingress: TelegramIngress;
   /** The sealed Hermes surface; the router never receives the ControlPlane. */
   hermes: HermesMcpPort;
@@ -433,6 +461,7 @@ export class TelegramHermesRouter {
   private readonly materializeTurn: TelegramRouterOptions["materializeTurn"];
   private readonly defaultProjectId: string | null;
   private readonly directHandler: NonNullable<TelegramRouterOptions["directHandler"]>;
+  private readonly inFlightTurnNonces: NonNullable<TelegramRouterOptions["inFlightTurnNonces"]>;
   private readonly getStoredResponse: NonNullable<TelegramRouterOptions["getStoredResponse"]>;
   private readonly getStoredState: NonNullable<TelegramRouterOptions["getStoredState"]>;
   private readonly onInterrupt: TelegramRouterOptions["onInterrupt"];
@@ -450,6 +479,10 @@ export class TelegramHermesRouter {
     this.materializeTurn = options.materializeTurn;
     this.defaultProjectId = options.defaultProjectId ?? null;
     this.directHandler = options.directHandler ?? defaultDirectHandler;
+    // An empty set, not a thrown error and not a guess: a router with nothing awaiting turns
+    // behind it has no in-flight knowledge, and the wording for "no knowledge" is the one the
+    // park reply already used.
+    this.inFlightTurnNonces = options.inFlightTurnNonces ?? (() => new Set<string>());
     this.bindingGeneration = options.bindingGeneration;
     this.getStoredResponse = options.getStoredResponse ?? (() => null);
     this.getStoredState = options.getStoredState ?? ((nonce) => {
@@ -660,6 +693,10 @@ export class TelegramHermesRouter {
         // the message instead of claiming or dropping it, and tells the owner exactly how to get
         // unstuck, unless they already made that choice via `/again`.
         const unresolved = this.ingress.unresolvedTurns(identity.sessionDigest);
+        // Read once, here, and passed down. Two reads of a set that changes as turns settle could
+        // disagree between the enumeration and the advice built from it, and the reply would then
+        // name a state that never existed.
+        const inFlight = this.inFlightTurnNonces();
         if (unresolved.length > 0 && !classified.value.overridesUnresolved) {
           // #695: every unresolved row is counted, and up to MAX_NAMED_UNRESOLVED_TURNS are
           // named individually, not only the oldest. A second one accumulates whenever an
@@ -678,8 +715,8 @@ export class TelegramHermesRouter {
             this.replyFor(
               update,
               [
-                unresolvedTurnsParkText(unresolved),
-                ...unresolvedTurnsRemedyText(unresolved),
+                unresolvedTurnsParkText(unresolved, inFlight),
+                ...unresolvedTurnsRemedyText(unresolved, inFlight),
               ].join("\n"),
             ),
             ReasonCode.INGRESS_TURN_UNRESOLVED_CONVERSATION,
@@ -727,6 +764,7 @@ export class TelegramHermesRouter {
         return {
           status: "CEO_TURN_PENDING",
           outcome: this.completeDirectRoute(update, classified.value),
+          nonce: this.ingress.nonceFor(update),
         };
       }
       return completedRoute(await this.routeManaged(update, admitted.value, classified.value));
@@ -1471,26 +1509,42 @@ const unresolvedTurnExcerpt = (turn: UnresolvedTurn): string => {
 };
 
 /**
- * Which of the two things "unresolved" means, for one row — where it can be told.
+ * Which of the three things "unresolved" means, for one row.
  *
- * `unresolvedTurns` returns every claim with no recorded outcome, and that folds two facts into
- * one word. One of them is provable from the row and the other is not, so this says the provable
- * one and says "unknown" otherwise rather than guessing the shape the owner would act on. See
- * `UnresolvedTurn.claimerProcessGone`.
+ * `unresolvedTurns` returns every claim with no recorded outcome, and that folded three states
+ * into one word. Two of them can now be named from evidence and the third stays unknown, which is
+ * the only honest answer for it:
+ *
+ * - **in flight here** — this process is still awaiting the turn. Only the awaiting code knows
+ *   this; a stored claim cannot, because a handler that threw leaves an identical row.
+ * - **claimer gone** — the claim names another incarnation, so no outcome can arrive on its own.
+ * - **outcome unknown** — claimed by this process and no longer awaited, or claimed before the
+ *   incarnation was recorded. Nothing here can tell those apart from a turn that was answered
+ *   and lost its record, and the wording says so.
+ *
+ * The order matters: `inFlight` is checked first because it is the only positive evidence, and a
+ * row cannot be both awaited here and claimed elsewhere.
  */
-const unresolvedTurnState = (turn: UnresolvedTurn): string =>
-  turn.claimerProcessGone ? "claimer gone" : "outcome unknown";
+const unresolvedTurnState = (turn: UnresolvedTurn, inFlight: ReadonlySet<string>): string =>
+  inFlight.has(turn.nonce)
+    ? "in flight here"
+    : turn.claimerProcessGone
+      ? "claimer gone"
+      : "outcome unknown";
 
 /** The park reply's summary of what is unresolved — every row is counted, only some are named. */
-const unresolvedTurnsParkText = (unresolved: readonly UnresolvedTurn[]): string => {
+const unresolvedTurnsParkText = (
+  unresolved: readonly UnresolvedTurn[],
+  inFlight: ReadonlySet<string>,
+): string => {
   if (unresolved.length === 1) {
     const only = unresolved[0]!;
-    return `DIRECT parked: an earlier message in this conversation is still unresolved (received ${only.receivedAt}, ${unresolvedTurnState(only)}): ${unresolvedTurnExcerpt(only)}.`;
+    return `DIRECT parked: an earlier message in this conversation is still unresolved (received ${only.receivedAt}, ${unresolvedTurnState(only, inFlight)}): ${unresolvedTurnExcerpt(only)}.`;
   }
   const shown = unresolved.slice(0, MAX_NAMED_UNRESOLVED_TURNS);
   const remaining = unresolved.length - shown.length;
   const named = shown
-    .map((turn) => `${turn.receivedAt} ${unresolvedTurnExcerpt(turn)} [${unresolvedTurnState(turn)}]`)
+    .map((turn) => `${turn.receivedAt} ${unresolvedTurnExcerpt(turn)} [${unresolvedTurnState(turn, inFlight)}]`)
     .join("; ");
   const tail = remaining > 0 ? `; and ${remaining} more` : "";
   return `DIRECT parked: ${unresolved.length} earlier messages in this conversation are still unresolved (${named}${tail}).`;
@@ -1505,22 +1559,42 @@ const unresolvedTurnsParkText = (unresolved: readonly UnresolvedTurn[]): string 
  * no way to tell that from a turn that may still answer, which is the difference between waiting
  * and sending `/again`.
  */
-const unresolvedTurnsRemedyText = (unresolved: readonly UnresolvedTurn[]): readonly string[] => {
-  const gone = unresolved.filter((turn) => turn.claimerProcessGone).length;
+const unresolvedTurnsRemedyText = (
+  unresolved: readonly UnresolvedTurn[],
+  inFlight: ReadonlySet<string>,
+): readonly string[] => {
+  const live = unresolved.filter((turn) => inFlight.has(turn.nonce)).length;
+  const gone = unresolved.filter((turn) => !inFlight.has(turn.nonce) && turn.claimerProcessGone).length;
   const plural = unresolved.length === 1 ? "it" : "them";
   const unknownSentence =
     "ACP does not know whether any of those reached the CEO, so this one was not run — nothing was appended twice.";
   const again =
     "Reply with /again <your message> to run this one anyway, knowing the earlier turn(s) may still land too.";
-  if (gone === 0) return [unknownSentence, again];
-  if (gone === unresolved.length) {
+  // Every row awaited here. This is the only case where waiting is the better advice, and it is
+  // the case the owner used to be told nothing about.
+  if (live === unresolved.length) {
+    return [
+      `ACP is still awaiting ${plural} in this process, so this one was not run — nothing was appended twice.`,
+      `Its answer is still coming; ${plural === "it" ? "it" : "they"} can also be run alongside with /again <your message>, which would send the CEO both.`,
+    ];
+  }
+  if (live === 0 && gone === 0) return [unknownSentence, again];
+  if (live === 0 && gone === unresolved.length) {
     return [
       `The process that claimed ${plural} is gone, so no outcome can arrive for ${plural} on its own; ACP still does not know whether ${plural} reached the CEO, and this one was not run — nothing was appended twice.`,
       again,
     ];
   }
+  // Mixed. Counting all three is what keeps this honest: a reply naming only the live ones would
+  // invite waiting for turns that can never answer, and naming only the dead ones would hide that
+  // an answer is on its way.
+  const parts = [`${unresolved.length} earlier turns are unresolved`];
+  if (live > 0) parts.push(`${live} still awaited in this process`);
+  if (gone > 0) parts.push(`${gone} claimed by a process that is gone and unable to resolve on their own`);
+  const unknown = unresolved.length - live - gone;
+  if (unknown > 0) parts.push(`${unknown} with no recorded outcome either way`);
   return [
-    `${gone} of those were claimed by a process that is gone and can never resolve on their own; the rest have no recorded outcome either way. ACP does not know whether any of them reached the CEO, so this one was not run — nothing was appended twice.`,
+    `${parts.join(", ")}. This one was not run — nothing was appended twice.`,
     again,
   ];
 };

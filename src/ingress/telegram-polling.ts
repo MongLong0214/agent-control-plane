@@ -343,6 +343,14 @@ type TelegramTrackedTurnResult =
 interface TelegramTrackedTurn {
   settled: Promise<void>;
   result: TelegramTrackedTurnResult | null;
+  /**
+   * Which message's turn this is, so the set of tracked turns can answer "is that one still
+   * running" and not merely "how many are".
+   *
+   * Handed over by the router rather than derived here — `TelegramIngress.nonceFor` is the one
+   * authority for the string, and a second derivation would be free to drift from it.
+   */
+  nonce: string;
 }
 
 type TelegramLongPollRouteProgress =
@@ -351,6 +359,7 @@ type TelegramLongPollRouteProgress =
     status: "CEO_TURN_PENDING";
     outcome: Promise<TelegramRouteOutcome>;
     deliveryStarted: Promise<void>;
+    nonce: string;
   };
 
 type TelegramUpdateState =
@@ -876,7 +885,7 @@ export class TelegramLongPollService {
           },
         );
         routes.push({ status: "CEO_TURN_PENDING", outcome: route });
-        const turn = this.trackTurn(route);
+        const turn = this.trackTurn(route, progress.nonce);
         // A CEO call that is still pending may detach, but once it reaches Telegram the ordered
         // batch waits for that external result. A slow terminal rejection must stop the batch
         // before the next update can be parked and consumed by the unresolved-turn policy.
@@ -980,8 +989,8 @@ export class TelegramLongPollService {
     }
   }
 
-  private trackTurn(route: Promise<TelegramRouteOutcome>): TelegramTrackedTurn {
-    const turn: TelegramTrackedTurn = { settled: Promise.resolve(), result: null };
+  private trackTurn(route: Promise<TelegramRouteOutcome>, nonce: string): TelegramTrackedTurn {
+    const turn: TelegramTrackedTurn = { settled: Promise.resolve(), result: null, nonce };
     turn.settled = route.then(
       (outcome) => {
         turn.result = { ok: true, outcome };
@@ -1008,6 +1017,22 @@ export class TelegramLongPollService {
     return turn;
   }
 
+  /**
+   * The nonces whose turns this service is still awaiting.
+   *
+   * Derived from the same set `pendingTurnsSettled` waits on, so there is one answer to "what is
+   * this process still running" rather than two that can disagree. `trackTurn` removes a turn in a
+   * `finally`, which is what makes the set honest in the direction that matters: a handler that
+   * threw leaves it, a handler that is merely slow does not.
+   *
+   * A fresh set each call rather than a live view of `#pendingTurns`: a caller that held the
+   * internal set would see it change under a decision already made from it, and the park reply is
+   * exactly such a decision.
+   */
+  inFlightTurnNonces(): ReadonlySet<string> {
+    return new Set([...this.#pendingTurns].map((turn) => turn.nonce));
+  }
+
   private async routeUpdate(update: TelegramUpdate): Promise<TelegramLongPollRouteProgress> {
     const progress = await this.router.routeUntilCeoTurn(update, this.webhookSecret);
     if (progress.status === "COMPLETED") {
@@ -1019,6 +1044,7 @@ export class TelegramLongPollService {
     return {
       status: "CEO_TURN_PENDING",
       deliveryStarted,
+      nonce: progress.nonce,
       outcome: progress.outcome.then((outcome) => {
         markDeliveryStarted();
         return this.reconcileIngressClaim(outcome).then((reconciled) => this.deliverRouteOutcome(update, reconciled));
@@ -1316,7 +1342,13 @@ export const startTelegramLongPollListener = async (
   });
   const ingress = new TelegramIngress(guard, { webhookSecret: config.webhookSecret });
   const hermes = createHermesMcpPort(cp, { onCeoApproved: options.onCeoApproved });
+  // Assigned immediately below, and read only inside a callback the router invokes while routing —
+  // which cannot happen before the service exists, because the service is what drives routing.
+  // The alternative shapes are worse: a setter on the router makes it mutable after construction,
+  // and constructing the service first is impossible since it takes the router.
+  let service: TelegramLongPollService | null = null;
   const router = new TelegramHermesRouter({
+    inFlightTurnNonces: () => service?.inFlightTurnNonces() ?? new Set<string>(),
     ingress,
     hermes,
     // #858's missing writer. `canonical_turns` has one writer -- `claim()` -- and no production
@@ -1389,7 +1421,7 @@ export const startTelegramLongPollListener = async (
     getStoredResponse: (nonce) => storedResponse(cp, nonce),
     ...(options.onInterrupt ? { onInterrupt: options.onInterrupt } : {}),
   });
-  const service = new TelegramLongPollService(transport, router, config.webhookSecret, {
+  service = new TelegramLongPollService(transport, router, config.webhookSecret, {
     pollTimeoutSeconds: config.pollTimeoutSeconds,
     retryDelayMs: config.retryDelayMs,
     allowedChatIds: config.allowedChatIds,
