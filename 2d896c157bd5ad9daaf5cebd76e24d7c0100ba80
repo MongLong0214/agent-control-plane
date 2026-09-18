@@ -1,0 +1,19 @@
+Limit: only the code that awaits a turn can say it is live — the poller's finally is the signal, and a stored claim cannot supply it because a thrown handler leaves an identical row
+Limit: a router with no poller behind it (a test, the disposable realm driver) gets an empty set and reports outcome unknown, which is the wording that was already correct there
+Ruled-out: deriving the nonce inside the poller | TelegramIngress.nonceFor is the one authority for that string and a second derivation beside it is free to drift
+Ruled-out: a setter on the router for the in-flight source | it would make the router mutable after construction; the composition root closes over a let assigned on the next line instead
+Warn: read the in-flight set once per park decision and pass it down — two reads of a set that changes as turns settle can disagree between the enumeration and the advice built from it
+Blast: module
+Record-Id: r-631inflighthere
+Follows: r-631claimerprocessgone
+Evidence: tests/unit/telegram-ingress.test.ts
+Provenance: inherited 3e2ffa32620055876eed9ac4c8c9809c69dbc717
+
+Limit: the presence row cannot discriminate alone — measured with the state's condition forced true so every unresolved row was labelled live: the presence row passed and only the absence row failed, so the two rows are one witness and must not be separated
+Ruled-out: making the presence row self-sufficient by parking a third message after the hung turn settles | a completed turn has an outcome, so nothing is unresolved, nothing parks, and there is no park text to read — the only way to produce unresolved-and-not-in-flight is a crash, which the second row already does
+Warn: a router with no poller behind it is a test that constructs it directly, not the disposable realm's driver — that driver goes through startTelegramLongPollListener and is wired like any other poller deployment
+Blast: module
+Record-Id: r-963inflightpairiswitness
+Follows: r-631inflighthere
+Evidence: tests/unit/telegram-ingress.test.ts
+Provenance: inherited fdf5f1381db7d7747a628ebba242db81ef2af921
