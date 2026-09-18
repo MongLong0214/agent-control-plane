@@ -1,3 +1,9 @@
+import { execFile } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+
 import { afterAll, describe, expect, it } from "vitest";
 
 import {
@@ -117,6 +123,56 @@ describe("the index cannot name a closed issue as open", () => {
     expect(reconcile([issue(306, "[index]", indexBody(section)), issue(627, "open one")])).toEqual([]);
   });
 
+  it("reads every form Markdown renders as a bullet, not only the one the list happens to use", () => {
+    // The reviewer of #965 broke the first version by construction: each of these renders as a list
+    // entry and was silently skipped, which is this module's worst outcome — a closed issue
+    // presented as open, reported as reconciled. It is also the one hole rule 3 cannot cover, since
+    // a closed number is not in the open set for rule 3 to find missing.
+    const section = [
+      "## What is actually open — 8 listed below",
+      "- **#1** hyphen and bold",
+      "* **#2** asterisk marker",
+      "+ **#3** plus marker",
+      "-  **#4** two spaces after the marker",
+      "-\t**#5** a tab after the marker",
+      "- [ ] **#6** a task-list checkbox",
+      "- **[#7](https://example.test)** the number inside a link",
+      "- #8 no bold at all",
+      "- ~~**#9**~~ struck through",
+      "* ~~**#10**~~ struck through under another marker",
+      "> - **#11** inside a blockquote, which is prose about the list",
+    ].join("\n");
+
+    const bullets = bulletsOf(openSectionOf(indexBody(section))!);
+    expect(bullets.live).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(bullets.struck).toEqual([9, 10]);
+    // The blockquote stays out: `> Measured …` notes cite closed issues deliberately, as the record
+    // of previous drifts, and reading them as entries would teach a maintainer to delete them.
+    expect(bullets.live).not.toContain(11);
+    expect(bullets.struck).not.toContain(11);
+  });
+
+  it("refuses a heading that states no number, rather than skipping the rule it cannot apply", () => {
+    // `— all 16` is the wording of the first measured drift, quoted in this module's own header,
+    // and the first version returned null for it and skipped rule 2 entirely. The heading that
+    // started this could have said anything and escaped the rule meant to hold it.
+    const section = "## What is actually open — all of them\n\n- **#627** open.\n";
+    const findings = reconcile([issue(306, "[index]", indexBody(section)), issue(627, "open one")]);
+
+    expect(findings.map((finding) => finding.rule)).toEqual(["heading-states-no-count"]);
+  });
+
+  it("calls an unreadable payload a look-failure, not a disagreement", () => {
+    // Three shapes that parse and are not a list of issues. The middle one is the `gh api --slurp`
+    // shape — an array *of pages* — which a plain `typeof === "object"` test admits, and which then
+    // reads `body` off an array and reports a missing index: a disagreement about a tracker nobody
+    // read.
+    for (const payload of [{}, [[{ number: 1 }]], [{ notAnIssue: true }]]) {
+      expect(reconcile(payload as never).map((finding) => finding.rule), JSON.stringify(payload))
+        .toEqual(["issues-unreadable"]);
+    }
+  });
+
   it("says nothing was found rather than passing when the index or its section is absent", () => {
     // Absence is the failure this whole module is about, so it must not be the quiet answer.
     // An index that has lost its marker, or a body that has lost the section, produces a finding —
@@ -125,5 +181,56 @@ describe("the index cannot name a closed issue as open", () => {
     expect(
       reconcile([issue(306, "[index]", `${INDEX_MARKER}\nno such section here`)]).map((f) => f.rule),
     ).toEqual(["section-missing"]);
+  });
+});
+
+const execFileAsync = promisify(execFile);
+const CLI = join(process.cwd(), "scripts", "verify-index-lists-what-is-open.mjs");
+
+/** Runs the real command, because exit codes are the only thing CI reads. */
+const runCli = async (payload: unknown): Promise<number> => {
+  const dir = mkdtempSync(join(tmpdir(), "acp-index-list-"));
+  const file = join(dir, "issues.json");
+  writeFileSync(file, typeof payload === "string" ? payload : JSON.stringify(payload));
+  try {
+    await execFileAsync("node", [CLI, `--issues-file=${file}`]);
+    return 0;
+  } catch (error) {
+    return (error as { code?: number }).code ?? -1;
+  }
+};
+
+describe("the command's exit codes, which are the only thing CI reads", () => {
+  const reconciling = () => [
+    {
+      number: 306,
+      title: "[index]",
+      body: `${INDEX_MARKER}\n\n## What is actually open — 1 listed below\n\n- **#627** open.\n`,
+    },
+    { number: 627, title: "open one", body: "" },
+  ];
+
+  it("exits 0 when the list reconciles", async () => {
+    expect(await runCli(reconciling())).toBe(0);
+  });
+
+  it("exits 1 when the list disagrees with the tracker", async () => {
+    const drifted = reconciling();
+    drifted[0]!.body = drifted[0]!.body.replace("- **#627** open.", "- **#858** closed, listed live.");
+    expect(await runCli(drifted)).toBe(1);
+  });
+
+  it("exits 2 when nobody could look, and never 1", async () => {
+    // The distinction this repository's other tracker checks draw for the same reason: "nobody
+    // could look" must not read as "the list disagrees", which sends a reader hunting a mismatch
+    // that was never measured. A truncated file, a wrong shape and the un-flattened page array all
+    // leave by this door, and so does a file that is not there.
+    for (const payload of ["{", {}, [[{ number: 1 }]]]) {
+      expect(await runCli(payload), JSON.stringify(payload)).toBe(2);
+    }
+    const missing = await execFileAsync("node", [CLI, "--issues-file=/nonexistent/issues.json"])
+      .then(() => 0)
+      .catch((error: { code?: number }) => error.code ?? -1);
+    expect(missing).toBe(2);
   });
 });

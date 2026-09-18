@@ -101,6 +101,17 @@ const main = () => {
   }
 
   const findings = reconcile(issues);
+  // `issues-unreadable` is the one finding that means *nobody could look*, not *the list is wrong*,
+  // so it leaves by the same door as an unreachable GitHub. Exit 1 would tell a reader the list
+  // disagrees with the tracker when the tracker was never read (#965 review, NIT 4).
+  if (findings.some((finding) => finding.rule === "issues-unreadable")) {
+    console.error(
+      "verify-index-lists-what-is-open UNDETERMINED: the issue payload is not a list of issues, so " +
+        "the tracker was never read. With --issues-file, check the file's shape; the gh path returns " +
+        "an array of pages and is flattened before it reaches here.",
+    );
+    return 2;
+  }
   if (findings.length === 0) {
     console.log(
       `index reconciles: every live bullet names an open issue, the heading's count matches, and all ` +

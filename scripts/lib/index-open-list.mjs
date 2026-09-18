@@ -89,26 +89,64 @@ export const openSectionOf = (body) => {
  * Deliberately two lists rather than a set of "mentioned" numbers: the whole judgment this check
  * makes is about which of the two a number is in.
  */
+/**
+ * A list bullet, in every form Markdown will render as one.
+ *
+ * The first version matched exactly `- **#N**` and `- ~~**#N**~~`, and the reviewer of #965 broke it
+ * by construction rather than by argument. Each of these renders as a list entry and was silently
+ * skipped, which is the worst outcome this module has — a closed issue presented as open, reported
+ * as reconciled:
+ *
+ * ```
+ * * **#858**          an asterisk marker
+ * + **#858**          a plus marker
+ * -  **#858**         two spaces after the marker
+ * -<TAB>**#858**      a tab after the marker
+ * - [ ] **#858**      a task-list checkbox
+ * - **[#858](url)**   the number inside a link
+ * - #858              no bold at all
+ * ```
+ *
+ * And it is the one hole rule 3 cannot cover: rule 3 finds an *open* issue with no bullet, and a
+ * skipped bullet naming a *closed* issue leaves nothing for it to miss — the number is not in the
+ * open set, so no rule has a subject.
+ *
+ * Marker, optional checkbox, optional strikethrough, optional bold, optional link, then `#N`.
+ * Anything Markdown renders as a bullet naming an issue is treated as a bullet naming an issue.
+ */
+const BULLET = /^([-*+])[ \t]+(?:\[[ xX]\][ \t]+)?(~~)?(?:\*\*)?\[?#(\d+)/;
+
 export const bulletsOf = (section) => {
   const live = [];
   const struck = [];
   for (const raw of section.split("\n")) {
     const line = raw.trim();
-    const strikethrough = /^- ~~\*\*#(\d+)\*\*~~/.exec(line);
-    if (strikethrough) {
-      struck.push(Number(strikethrough[1]));
-      continue;
-    }
-    const plain = /^- \*\*#(\d+)\*\*/.exec(line);
-    if (plain) live.push(Number(plain[1]));
+    // A blockquote is prose *about* the list, not the list. `> - **#674**` inside a `> Measured …`
+    // note is the record of a previous drift, and reading it as an entry would teach a maintainer
+    // to delete the history this module depends on.
+    if (line.startsWith(">")) continue;
+    const bullet = BULLET.exec(line);
+    if (!bullet) continue;
+    const [, , strikethrough, number] = bullet;
+    if (strikethrough) struck.push(Number(number));
+    else live.push(Number(number));
   }
   return { live, struck };
 };
 
-/** The count the heading claims, or `null` when it states none. */
+/**
+ * The count the heading claims, or `null` when it states no *numeric* one.
+ *
+ * `null` is a finding rather than a skip, and the reviewer of #965 is why. The first version
+ * skipped rule 2 whenever this returned `null`, and `— all 16` returns `null` — which is the exact
+ * wording the first measured drift used, quoted in this module's own header. So the heading that
+ * started this could have said anything and escaped the rule meant to hold it.
+ *
+ * Numeric only, on purpose: a count is compared, and "all" cannot be compared to a length.
+ */
 export const headingCountOf = (section) => {
   const heading = section.split("\n")[0] ?? "";
-  const stated = /—\s*(\d+)\b/.exec(heading);
+  const stated = /(\d+)/.exec(heading);
   return stated ? Number(stated[1]) : null;
 };
 
@@ -119,6 +157,26 @@ export const headingCountOf = (section) => {
  * returns findings rather than printing them so a caller can count them.
  */
 export const reconcile = (issues) => {
+  // A payload that parsed but is not a list of issues is a look-failure, not a disagreement: the
+  // caller turns this into exit 2. The reviewer of #965 found that `--issues-file` holding `{}`
+  // reached `issues.find` and threw, exiting 1 — loud, but under the code that means "the list
+  // disagrees with the tracker", which sends a reader hunting a mismatch that was never measured.
+  const isIssue = (value) =>
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    typeof value.number === "number";
+  if (!Array.isArray(issues) || !issues.every(isIssue)) {
+    // `!Array.isArray(value)` and the `number` check both earn their place: the `gh api --slurp`
+    // shape is an array *of pages*, so a caller that forgot to flatten it passes a plain
+    // `typeof === "object"` test and then reads `body` off an array — reported as a missing index,
+    // which is a disagreement, when nothing was read at all.
+    return [{
+      rule: "issues-unreadable",
+      detail: "the issue payload is not a flat list of issue objects with numeric `number` fields",
+    }];
+  }
+
   const index = issues.find((issue) => (issue.body ?? "").includes(INDEX_MARKER));
   if (!index) return [{ rule: "index-missing", detail: `no open issue carries ${INDEX_MARKER}` }];
 
@@ -145,10 +203,18 @@ export const reconcile = (issues) => {
   }
 
   // Rule 2. The heading's number is a second statement of the list's length, so it is exactly the
-  // kind of copy that drifts. Requiring the two to agree is what keeps the cheap one honest.
+  // kind of copy that drifts. Requiring the two to agree is what keeps the cheap one honest — and
+  // requiring one to exist is what stops the rule being escaped by not stating a number at all.
   const stated = headingCountOf(section);
   const liveOpen = live.filter((number) => openNumbers.has(number)).length;
-  if (stated !== null && stated !== liveOpen) {
+  if (stated === null) {
+    findings.push({
+      rule: "heading-states-no-count",
+      detail:
+        `the heading states no number, so nothing holds it to the list: ` +
+        `"${(section.split("\n")[0] ?? "").trim()}"`,
+    });
+  } else if (stated !== liveOpen) {
     findings.push({
       rule: "heading-count-disagrees",
       detail: `the heading says ${stated} and the section has ${liveOpen} live bullet(s) naming open issues`,
