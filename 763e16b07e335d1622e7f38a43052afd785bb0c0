@@ -1,0 +1,28 @@
+Limit: the positive half is not provable from a stored claim — a handler that threw inside the claiming process leaves a byte-identical row, so claimerProcessGone false means unknown and must never be read as live
+Limit: rows claimed before claimedByProcess existed carry no incarnation, and prune deliberately never removes an unresolved claim, so those rows do not age out and a build that has the field will read them
+Ruled-out: reporting a same-incarnation claim as in flight here | a handler that threw inside the claiming process leaves a byte-identical row, so the reply would tell the owner to wait for an answer that can never come
+Warn: do not add the converse by widening this field — the in-flight half needs a registry removed in a finally at the await, not a comparison against a stored value
+Blast: module
+Record-Id: r-631claimerprocessgone
+Evidence: src/ingress/ingress-guard.ts
+Evidence: tests/unit/a-turn-whose-claimer-is-gone-says-so.test.ts
+Provenance: inherited c8a380b504d1a7d62e444b40b922e2c38d8ac160
+
+Limit: the incarnation is reconstructed from two clocks that drift against each other, so it must be computed once per process — 5,000 reads of the per-call version produced two distinct values, five runs out of five
+Ruled-out: computing the incarnation per guard construction | a daemon builds more than one guard, and each then read the other's claims as taken by a process that is gone, which is the fail-open direction the asymmetry exists to refuse
+Warn: a witness for this must probe the millisecond boundary — two back-to-back readings land in the same millisecond and the broken version passed that check six runs out of six
+Blast: module
+Record-Id: r-631incarnationonceperprocess
+Follows: r-631claimerprocessgone
+Evidence: tests/unit/a-turn-whose-claimer-is-gone-says-so.test.ts
+Provenance: inherited 4956223faaf663f0ed0fb704eae5b1372e708d65
+
+Limit: claimedByProcess is never updated by any writer, and the identity trigger does not freeze it — never-updated is a property of the writers here, not of the schema
+Limit: the new park assertions are a probabilistic witness: against the broken per-construction incarnation they fail 3 runs in 8, and the deterministic witness is the 5,000-reading probe
+Ruled-out: extending inbound_messages_turn_claim_identity_immutable to cover the new key | the trigger's body is reproduced by a migration step pinned at schema version 36 in a frozen blob whose digest comes from outside this repository, so extending it for a live database needs a migration whose pin is not mine to re-mint
+Warn: the reviewer lane status in the tracker was stale — grok answered at exit 0 while #306 said 402 and the capacity table said SUSPENDED from 2026-09-07; test the lane rather than reading either
+Blast: module
+Record-Id: r-962reviewnits
+Follows: r-631incarnationonceperprocess
+Evidence: tests/unit/telegram-ingress.test.ts
+Provenance: inherited ad6408f4d928c738d6ec78d9ab34b0db487a9bbe
