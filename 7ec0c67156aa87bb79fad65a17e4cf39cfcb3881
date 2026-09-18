@@ -1,0 +1,9 @@
+Limit: the daemon's own refusals are not covered here — a non-owner connection, a generation that does not match, a spent nonce are the daemon's to make and are covered where it makes them
+Limit: a malformed argument throws rather than returning a code, which is agentctl's established contract: the entry point turns a throw into exit 1 with the message on stderr
+Ruled-out: offering a role argument | the daemon fixes the role to PRIMARY_CTO and refuses any other, so it would only invite a refused request and restate a fact the daemon already owns
+Ruled-out: an --approved=false spelling | a rejection is expressed by not running the command, which is the reason binding recover-dead gives in place
+Warn: parse the generation as an integer with a minimum of 1 rather than forwarding the argv token — the daemon reads it with requiredOperatorInteger and refuses a string, producing a refusal the owner cannot diagnose from their side
+Blast: module
+Record-Id: r-anownerapprovalwithnocommand
+Evidence: tests/unit/an-owner-approval-with-no-command.test.ts
+Provenance: inherited a753670ec59abac9f4df3948d15dc204ae998d0f
