@@ -32,6 +32,13 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
                                            lifecycle has reached a terminal state
   agentctl outbox retry                   reset delivery attempts on pending messages
   agentctl owner approve <runId> <item>   record an owner decision for a human gate
+  agentctl owner approve-canonical-cto <projectId> <sessionUuid> <generation> <nonce>
+                                           mint the owner approval a canonical PRIMARY_CTO
+                                           self-claim consumes. The claiming session cannot make
+                                           this call: the daemon requires an allowlisted owner on
+                                           this connection, and mint and claim are two connections
+                                           for that reason. <generation> is the generation the
+                                           claim will create, one past the last revoked one
   agentctl github merge ...             refused: agentcpd owns CEO-approved finalization
   agentctl github post-merge ...        refused: agentcpd owns exact post-merge verification
   agentctl repair list                    show the repair operation allowlist
@@ -411,6 +418,28 @@ export const dispatch = async (
   }
 
   if (command === "owner") {
+    // The method this spells has existed and been reachable over the operator socket since the
+    // canonical self-claim landed, and nothing in this CLI spelled it — so the one approval that
+    // can rebind a revoked canonical PRIMARY_CTO was unavailable to the only person permitted to
+    // grant it. Measured on this deployment: revoked at generation 6, the role unbound since, and
+    // every code path downstream ready and waiting on a call no command could make.
+    if (args[0] === "approve-canonical-cto") {
+      const [, projectId, claimedSessionUuid, generation, nonce] = args;
+      return call("owner.approveClaimCanonicalCto", {
+        projectId: required(projectId, "projectId"),
+        claimedSessionUuid: required(claimedSessionUuid, "claimedSessionUuid"),
+        // No `role` argument, for `binding recover-dead`'s reason: this door serves the canonical
+        // CTO role and the daemon refuses any other, so offering one would only invite a refused
+        // request. The daemon fixes it itself, and sending it would be a second statement of the
+        // same fact.
+        expectedBindingGeneration: requiredInteger(generation, "expectedBindingGeneration", 1),
+        nonce: required(nonce, "nonce"),
+        // Reaching this command *is* the owner's approval, and the daemon verifies an allowlisted
+        // owner behind this connection before it acts. No `--approved=false` spelling, for the
+        // reason `binding recover-dead` gives: a rejection is expressed by not running the command.
+        approved: true,
+      });
+    }
     if (args[0] !== "approve") return fail(`unknown owner subcommand: ${args[0] ?? ""}`);
     return call("owner.approve", {
       runId: required(args[1], "runId"),
