@@ -679,8 +679,7 @@ export class TelegramHermesRouter {
               update,
               [
                 unresolvedTurnsParkText(unresolved),
-                "ACP does not know whether any of those reached the CEO, so this one was not run — nothing was appended twice.",
-                "Reply with /again <your message> to run this one anyway, knowing the earlier turn(s) may still land too.",
+                ...unresolvedTurnsRemedyText(unresolved),
               ].join("\n"),
             ),
             ReasonCode.INGRESS_TURN_UNRESOLVED_CONVERSATION,
@@ -1471,19 +1470,59 @@ const unresolvedTurnExcerpt = (turn: UnresolvedTurn): string => {
   return `"${excerpt}"`;
 };
 
+/**
+ * Which of the two things "unresolved" means, for one row — where it can be told.
+ *
+ * `unresolvedTurns` returns every claim with no recorded outcome, and that folds two facts into
+ * one word. One of them is provable from the row and the other is not, so this says the provable
+ * one and says "unknown" otherwise rather than guessing the shape the owner would act on. See
+ * `UnresolvedTurn.claimerProcessGone`.
+ */
+const unresolvedTurnState = (turn: UnresolvedTurn): string =>
+  turn.claimerProcessGone ? "claimer gone" : "outcome unknown";
+
 /** The park reply's summary of what is unresolved — every row is counted, only some are named. */
 const unresolvedTurnsParkText = (unresolved: readonly UnresolvedTurn[]): string => {
   if (unresolved.length === 1) {
     const only = unresolved[0]!;
-    return `DIRECT parked: an earlier message in this conversation is still unresolved (received ${only.receivedAt}): ${unresolvedTurnExcerpt(only)}.`;
+    return `DIRECT parked: an earlier message in this conversation is still unresolved (received ${only.receivedAt}, ${unresolvedTurnState(only)}): ${unresolvedTurnExcerpt(only)}.`;
   }
   const shown = unresolved.slice(0, MAX_NAMED_UNRESOLVED_TURNS);
   const remaining = unresolved.length - shown.length;
   const named = shown
-    .map((turn) => `${turn.receivedAt} ${unresolvedTurnExcerpt(turn)}`)
+    .map((turn) => `${turn.receivedAt} ${unresolvedTurnExcerpt(turn)} [${unresolvedTurnState(turn)}]`)
     .join("; ");
   const tail = remaining > 0 ? `; and ${remaining} more` : "";
   return `DIRECT parked: ${unresolved.length} earlier messages in this conversation are still unresolved (${named}${tail}).`;
+};
+
+/**
+ * What ACP can actually say about those turns, and what `/again` costs given that.
+ *
+ * The unknown case keeps the sentence it already had, word for word: nothing measured here
+ * changed what is known about it. What is new is the case that *is* settled — a claim whose
+ * process is gone can never resolve itself, and an owner who is told only "ACP does not know" has
+ * no way to tell that from a turn that may still answer, which is the difference between waiting
+ * and sending `/again`.
+ */
+const unresolvedTurnsRemedyText = (unresolved: readonly UnresolvedTurn[]): readonly string[] => {
+  const gone = unresolved.filter((turn) => turn.claimerProcessGone).length;
+  const plural = unresolved.length === 1 ? "it" : "them";
+  const unknownSentence =
+    "ACP does not know whether any of those reached the CEO, so this one was not run — nothing was appended twice.";
+  const again =
+    "Reply with /again <your message> to run this one anyway, knowing the earlier turn(s) may still land too.";
+  if (gone === 0) return [unknownSentence, again];
+  if (gone === unresolved.length) {
+    return [
+      `The process that claimed ${plural} is gone, so no outcome can arrive for ${plural} on its own; ACP still does not know whether ${plural} reached the CEO, and this one was not run — nothing was appended twice.`,
+      again,
+    ];
+  }
+  return [
+    `${gone} of those were claimed by a process that is gone and can never resolve on their own; the rest have no recorded outcome either way. ACP does not know whether any of them reached the CEO, so this one was not run — nothing was appended twice.`,
+    again,
+  ];
 };
 
 const replyToMessageIdFor = (update: TelegramUpdate): number | null => {

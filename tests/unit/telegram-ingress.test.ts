@@ -1246,6 +1246,16 @@ describe("Telegram production ingress", () => {
       expect(outcome.outcomes[0]?.admitted).toBe(true);
       expect(outcome.outcomes[0]?.reply?.text).toContain("/again");
 
+      // The wording for *this* case, added because the reviewer of #962 noticed its absence: both
+      // listeners are the same process, so the crashed turn's claimer is this process and the only
+      // honest answer is that the outcome is unknown. Asserting it here is what would have caught
+      // the incarnation defect that shipped in this PR's first commit — a per-construction value
+      // that jittered across a millisecond boundary made two guards in one process read each
+      // other's claims as abandoned, and this reply would have said "claimer gone" about a live
+      // claimer two runs in eight.
+      expect(outcome.outcomes[0]?.reply?.text).toContain("outcome unknown");
+      expect(outcome.outcomes[0]?.reply?.text).not.toContain("claimer gone");
+
       // Parked, not silently swallowed: the row exists and was never claimed, so it remains
       // reachable — the owner's words were not dropped.
       const parkedRow = harness.cp.db.get<{ turn_claim_json: string | null }>(
@@ -1253,6 +1263,75 @@ describe("Telegram production ingress", () => {
         ["update:711"],
       );
       expect(parkedRow?.turn_claim_json).toBeNull();
+    } finally {
+      await resendListener.close();
+    }
+  });
+
+  it("tells the owner when the process that claimed the earlier turn is gone, not only that ACP does not know", async () => {
+    // #631. The park reply above is right for the case it was written against — a turn lost
+    // inside the process that is still running, where ACP genuinely cannot tell whether the CEO
+    // saw it. It said the same sentence for a case it *can* settle: a claim taken by a daemon
+    // that no longer exists can never resolve itself, because this deployment holds one
+    // `agentcpd.lock` at a time. An owner told only "ACP does not know" has no way to tell
+    // "wait, it may still answer" from "nothing will ever come of this".
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const turns: string[] = [];
+    const crashingTurn = async (input: { text: string }): Promise<string> => {
+      turns.push(input.text);
+      throw new TelegramInterruption("after-dispatch");
+    };
+
+    const firstTransport = new FakeTelegramTransport();
+    const lost = update("릴리스 언제야?", {}, 720);
+    firstTransport.updates = [lost];
+    const first = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport: firstTransport,
+      start: false,
+      onDirect: crashingTurn,
+    });
+    try {
+      await expect(observedTurnFault(first.service)).rejects.toBeInstanceOf(TelegramInterruption);
+    } finally {
+      await first.close();
+    }
+    expect(turns).toEqual(["릴리스 언제야?"]);
+
+    // The restart, as the next daemon's row reader sees it. Rewriting the recorded incarnation is
+    // the one thing a single-process test cannot get by closing a listener: the claim is
+    // unchanged in every other respect, and this is exactly the row a second daemon would read.
+    // `turn_claim_json` is the field that carries claim lifecycle; `payload_json` is the
+    // write-once one, and it is untouched.
+    const rewritten = harness.cp.db.run(
+      `UPDATE inbound_messages
+          SET turn_claim_json = json_set(turn_claim_json, '$.claimedByProcess', ?)
+        WHERE channel = 'telegram' AND nonce = ?`,
+      ["1234#2026-09-17T20:00:00.000Z", "update:720"],
+    );
+    expect(rewritten.changes, "the crashed turn's claim row must exist to be aged").toBe(1);
+
+    const resendTransport = new FakeTelegramTransport();
+    resendTransport.updates = [update("릴리스 언제야?", {}, 721)];
+    const resendListener = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport: resendTransport,
+      start: false,
+      onDirect: crashingTurn,
+    });
+    try {
+      const outcome = await settledPoll(resendListener.service);
+
+      // Still parked, still one handler run — the change is what the owner is told, not what runs.
+      expect(turns).toEqual(["릴리스 언제야?"]);
+      expect(outcome.outcomes[0]?.reasonCode).toBe(ReasonCode.INGRESS_TURN_UNRESOLVED_CONVERSATION);
+      const text = outcome.outcomes[0]?.reply?.text ?? "";
+      expect(text).toContain("claimer gone");
+      expect(text).toContain("The process that claimed it is gone");
+      // The unknown half is not overwritten by the new sentence: ACP still does not know whether
+      // the lost turn reached the CEO, and `/again` is still the door.
+      expect(text).toContain("does not know whether it reached the CEO");
+      expect(text).toContain("/again");
     } finally {
       await resendListener.close();
     }
