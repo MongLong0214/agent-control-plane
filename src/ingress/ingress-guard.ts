@@ -1570,9 +1570,14 @@ export interface TurnIdentity {
  * Read, never trusted as liveness on its own: a claim carrying *another* incarnation says only
  * that whoever took it is not this process, which in a deployment holding one `agentcpd.lock` at
  * a time means that process is gone. A claim carrying *this* one says this process took it and
- * has recorded no outcome. Neither promises an answer is coming, and a row written before this
- * field existed has no incarnation at all and reads as the former — the closed direction, because
- * the wrong direction here would report a lost message as live.
+ * has recorded no outcome. Neither promises an answer is coming.
+ *
+ * A row written before this field existed has no incarnation at all, and it reads as **unknown**,
+ * not as gone — `claimerProcessIsGone` requires a recorded value, so an absent one is false. An
+ * earlier draft of this sentence said the opposite ("reads as the former"), which is the direction
+ * that would report a possibly-answered message as unanswerable; a reviewer caught the comment
+ * contradicting the code it describes, and a later cleanup trusting the comment would have
+ * introduced the defect the code does not have.
  */
 const PROCESS_INCARNATION = `${process.pid}#${
   new Date(Date.now() - Math.round(process.uptime() * 1000)).toISOString()
@@ -1630,12 +1635,27 @@ export interface TurnClaim extends TurnIdentity {
    */
   canonicalTarget?: ReceiptLookupQuery;
   /**
-   * The incarnation of the process that took this claim — see `processIncarnation`.
+   * The incarnation of the process that took this claim — see `PROCESS_INCARNATION`.
    *
    * Written by the same UPDATE that writes the claim, so there is no window where a row is
    * claimed and says nothing about who claimed it, and never updated afterwards: this is a fact
    * about the moment of claiming, not a lifecycle. Optional because rows claimed before the field
-   * existed do not have it, and those read as *not* this process.
+   * existed do not have it, and those read as unknown rather than as abandoned.
+   *
+   * **Never-updated is a property of the writers here, not yet of the schema, and a reviewer of
+   * #962 was right to name the difference.** `inbound_messages_turn_claim_identity_immutable`
+   * freezes `turnRequestId`, `sessionDigest`, `promptDigest`, `bindingDigest` and
+   * `receiptIdentity`, and does not mention this key — so an UPDATE could create or change it,
+   * which is the shape `payload_json`'s own comment warns about ("a third lifecycle reachable by
+   * UPDATE would be the same defect a third time").
+   *
+   * Measured today, and the reason it is a limit rather than a fix: the trigger's body is
+   * reproduced by a migration step pinned at schema version 36 inside `src/db/migrations.ts`,
+   * which is a frozen blob whose digest comes from an authority produced outside this repository.
+   * Extending the trigger for a live database needs a migration, and that pin is not mine to
+   * re-mint. What holds today is that no writer touches it: the three terminal `json_set` paths
+   * write only `noReplyAt`, `repliedAt` and `settledAt`/`settlement`, and nothing else updates
+   * `turn_claim_json` at all.
    */
   claimedByProcess?: string;
   repliedAt?: string;

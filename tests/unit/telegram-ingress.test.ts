@@ -1246,6 +1246,16 @@ describe("Telegram production ingress", () => {
       expect(outcome.outcomes[0]?.admitted).toBe(true);
       expect(outcome.outcomes[0]?.reply?.text).toContain("/again");
 
+      // The wording for *this* case, added because the reviewer of #962 noticed its absence: both
+      // listeners are the same process, so the crashed turn's claimer is this process and the only
+      // honest answer is that the outcome is unknown. Asserting it here is what would have caught
+      // the incarnation defect that shipped in this PR's first commit — a per-construction value
+      // that jittered across a millisecond boundary made two guards in one process read each
+      // other's claims as abandoned, and this reply would have said "claimer gone" about a live
+      // claimer two runs in eight.
+      expect(outcome.outcomes[0]?.reply?.text).toContain("outcome unknown");
+      expect(outcome.outcomes[0]?.reply?.text).not.toContain("claimer gone");
+
       // Parked, not silently swallowed: the row exists and was never claimed, so it remains
       // reachable — the owner's words were not dropped.
       const parkedRow = harness.cp.db.get<{ turn_claim_json: string | null }>(
