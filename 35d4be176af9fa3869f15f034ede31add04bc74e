@@ -1,0 +1,21 @@
+Limit: the check reads only bullets of the form the list already uses; prose elsewhere in the section, including its own record of previous drifts, is deliberately outside the subject
+Limit: it runs on a daily schedule and not as a merge gate, so a drift is refused within a day rather than at the moment it is introduced
+Ruled-out: taking every #N in the section as a list entry | it failed on the section's own history, and a check that calls those citations defects would teach the maintainer to delete the record of the drift it exists to stop
+Ruled-out: making it a required merge check | a fact about the tracker is already red on an unedited main whenever the tracker moves, so it would block every merge on something no diff touched
+Warn: strike a finished issue through rather than deleting its bullet — the strikethrough form is the accepted state, and deleting the entry leaves a reader wondering why an area vanished
+Blast: module
+Record-Id: r-indexcannotnameaclosedissue
+Evidence: tests/unit/the-index-cannot-name-a-closed-issue-as-open.test.ts
+Evidence: src/quality/recurring-defects.ts
+Provenance: inherited 5a0a6ad20cff82b6df43cc7074a09c6f6dfd4ed4
+
+Limit: a skipped bullet is the one hole rule 3 cannot cover — rule 3 finds an open issue with no bullet, and a skipped bullet naming a closed issue leaves no subject for any rule
+Limit: the widening stops at what Markdown renders as a bullet; a bare number anywhere in the section is still outside the subject
+Ruled-out: accepting a bare #N anywhere in the section | that is the subject the first draft had and it failed on the section's own history, which cites closed issues deliberately
+Warn: a heading with no numeric count is a finding, not a skip — absence must not be the quiet answer in the one module whose subject is absence
+Warn: an unreadable issue payload exits 2 and never 1: exit 1 means the list disagrees with the tracker, which sends a reader hunting a mismatch against a tracker nobody read
+Blast: module
+Record-Id: r-indexlistbulletforms
+Follows: r-indexcannotnameaclosedissue
+Evidence: tests/unit/the-index-cannot-name-a-closed-issue-as-open.test.ts
+Provenance: inherited 34c8995d8d4b81416c93d6c35836e59de6bccd03
