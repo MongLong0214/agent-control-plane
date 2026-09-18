@@ -1341,8 +1341,17 @@ describe("Telegram production ingress", () => {
     // #631. Slice 1 refused to claim the positive half, because a stored claim cannot tell a
     // running handler from one that threw — both leave a claim with no `repliedAt`, `noReplyAt`
     // or `settledAt`. The code that *awaits* the turn can: its tracking removes the turn in a
-    // `finally`, so a thrown handler drops out and a slow one does not. These two halves are one
-    // test on purpose — the second is what makes the first safe to say.
+    // `finally`, so a thrown handler drops out and a slow one does not.
+    //
+    // **This row measures presence and cannot discriminate on its own**, which a reviewer of #963
+    // established rather than argued: an implementation that said "in flight here" about any
+    // unresolved row satisfies every line below. The row after it is the half that kills that
+    // implementation, so the two are one witness and must not be separated — deleting the second
+    // leaves the first passing against a reply that is always wrong.
+    //
+    // A third message after this turn settles would not help: a turn that *completed* has an
+    // outcome, so there is nothing unresolved to park against and no park text to read. The only
+    // way to produce unresolved-and-not-in-flight is to crash, which is the next row.
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
     });
@@ -1386,6 +1395,7 @@ describe("Telegram production ingress", () => {
       // Settled, so nothing is in flight — the set is emptied by the same `finally` that a throw
       // would have run.
       expect(listener.service.inFlightTurnNonces().size).toBe(0);
+
     } finally {
       release();
       await listener.close();
@@ -1393,10 +1403,11 @@ describe("Telegram production ingress", () => {
   });
 
   it("does not report a turn as in flight after its handler threw", async () => {
-    // The other direction, and the one that makes the claim above safe. `crashingTurn` throws
+    // The other direction, and **the discriminating half of the pair**. `crashingTurn` throws
     // inside the process that claimed the turn — the row it leaves is byte-identical to a running
-    // one, so only the `finally` in the poller's tracking can tell them apart. If it ever stops
-    // running, this row goes red and the park reply starts telling an owner to wait for an answer
+    // one, so only the `finally` in the poller's tracking can tell them apart. An implementation
+    // that always said "in flight here" passes the row above and fails here; if the `finally` ever
+    // stops running, this goes red and the park reply starts telling an owner to wait for an answer
     // that will never arrive.
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],

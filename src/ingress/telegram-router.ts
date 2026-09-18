@@ -241,9 +241,13 @@ export interface TelegramRouterOptions {
    * is byte-identical to one still running, which is why `claimerProcessGone` states only the
    * negative half.
    *
-   * Absent by default: a router with no poller behind it (a test, the disposable realm's driver)
-   * knows nothing about in-flight work, and an empty set is the honest answer there — it reports
-   * "outcome unknown", the wording that was already correct.
+   * Absent by default, and the default's readers are tests that construct this router directly —
+   * `ingress-no-reply-turn-resolution.test.ts` is one. An earlier draft of this sentence also named
+   * the disposable realm's driver, and a reviewer measured that wrong: the driver goes through
+   * `startTelegramLongPollListener`, which wires this option, so it is a poller deployment like any
+   * other. A router with genuinely nothing awaiting turns behind it knows nothing about in-flight
+   * work, and an empty set is the honest answer there — it reports "outcome unknown", the wording
+   * that was already correct.
    */
   inFlightTurnNonces?: () => ReadonlySet<string>;
   ingress: TelegramIngress;
