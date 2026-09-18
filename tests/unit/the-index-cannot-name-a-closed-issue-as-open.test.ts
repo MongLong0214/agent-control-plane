@@ -1,0 +1,236 @@
+import { execFile } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+
+import { afterAll, describe, expect, it } from "vitest";
+
+import {
+  INDEX_MARKER,
+  bulletsOf,
+  headingCountOf,
+  openSectionOf,
+  reconcile,
+} from "../../scripts/lib/index-open-list.mjs";
+import { cleanupTempDirs } from "../helpers/fixtures.ts";
+
+afterAll(cleanupTempDirs);
+
+/**
+ * The index's open list drifted four times, and each correction was itself a copy.
+ *
+ * Its own body records the first three; the fourth was measured on 2026-09-18, when six of nine
+ * live bullets named closed issues and three open issues had no bullet at all. What the body also
+ * records is why: *"the correction keeps not sticking because the list is a copy"*. These rows are
+ * about the reconciler that refuses the copy once it has stopped being true.
+ *
+ * The rules are pinned here rather than the wording of the findings: a message is prose, and a
+ * reader who changes it should not have to change a test. What must not change is which states are
+ * refused.
+ */
+const indexBody = (section: string): string => `${INDEX_MARKER}
+Some preamble the reconciler must not read as a list.
+
+## Where things stand
+
+A paragraph naming #999 in prose, which is not a bullet and is not the list.
+
+${section}
+
+## Suggested order of work
+
+- **#998** — a bullet in a later section, which is a different list.
+`;
+
+const issue = (number: number, title: string, body = ""): Record<string, unknown> => ({
+  number,
+  title,
+  body,
+});
+
+describe("the index cannot name a closed issue as open", () => {
+  it("reads only the bullets of the open section, not prose or later sections", () => {
+    const section = `## What is actually open — 2 listed below
+
+> **Measured 2026-09-13.** This section named #674 and #784, both since closed. That note is the
+> record of a previous drift and must not be read as a list entry.
+
+- **#627** — still open.
+- ~~**#674**~~ — **closed 2026-09-13.**
+- **#631** — still open.
+`;
+    const extracted = openSectionOf(indexBody(section));
+    expect(extracted).not.toBeNull();
+    // The prose citation of #674 inside the blockquote, the #999 in an earlier section and the
+    // #998 bullet in a later one are all outside this list. A first draft took every `#N` in the
+    // section and failed on the section's own history, which would have taught a maintainer to
+    // delete the record of the drift this check exists to stop.
+    expect(bulletsOf(extracted!)).toEqual({ live: [627, 631], struck: [674] });
+    expect(headingCountOf(extracted!)).toBe(2);
+  });
+
+  it("refuses a live bullet whose issue is closed, and accepts the same issue struck through", () => {
+    const listed = `## What is actually open — 1 listed below
+
+- **#627** — open.
+- **#858** — closed, and presented as open.
+`;
+    const closedListed = reconcile([
+      issue(306, "[index]", indexBody(listed)),
+      issue(627, "open one"),
+    ]);
+    expect(closedListed.map((finding) => finding.rule)).toContain("closed-issue-listed-as-open");
+    expect(closedListed.some((finding) => finding.detail.includes("#858"))).toBe(true);
+
+    const struck = `## What is actually open — 1 listed below
+
+- **#627** — open.
+- ~~**#858**~~ — **closed 2026-09-16.**
+`;
+    // Strikethrough is the section's own marker for "named here, and finished". Keeping the entry
+    // that way is how a reader learns the area is done rather than wondering why it vanished, so
+    // it must be an accepted state and not merely an unreported one.
+    expect(reconcile([issue(306, "[index]", indexBody(struck)), issue(627, "open one")])).toEqual([]);
+  });
+
+  it("refuses a heading count that disagrees with its own list", () => {
+    const section = `## What is actually open — 11 listed below
+
+- **#627** — open.
+`;
+    const findings = reconcile([issue(306, "[index]", indexBody(section)), issue(627, "open one")]);
+    expect(findings.map((finding) => finding.rule)).toEqual(["heading-count-disagrees"]);
+    expect(findings[0]?.detail).toContain("says 11");
+  });
+
+  it("refuses an open issue that has no bullet, and exempts the index itself", () => {
+    const section = `## What is actually open — 1 listed below
+
+- **#627** — open.
+`;
+    const findings = reconcile([
+      issue(306, "[index]", indexBody(section)),
+      issue(627, "open one"),
+      issue(954, "a revoked binding has no way back"),
+    ]);
+    // The other half of the same defect: a reader who does not find an issue here concludes it
+    // does not exist. #954 was absent from the list while the deployment waited on its decision.
+    expect(findings.map((finding) => finding.rule)).toEqual(["open-issue-absent"]);
+    expect(findings[0]?.detail).toContain("#954");
+
+    // And the index is not required to route to itself, which is the one exemption.
+    expect(reconcile([issue(306, "[index]", indexBody(section)), issue(627, "open one")])).toEqual([]);
+  });
+
+  it("reads every form Markdown renders as a bullet, not only the one the list happens to use", () => {
+    // The reviewer of #965 broke the first version by construction: each of these renders as a list
+    // entry and was silently skipped, which is this module's worst outcome — a closed issue
+    // presented as open, reported as reconciled. It is also the one hole rule 3 cannot cover, since
+    // a closed number is not in the open set for rule 3 to find missing.
+    const section = [
+      "## What is actually open — 8 listed below",
+      "- **#1** hyphen and bold",
+      "* **#2** asterisk marker",
+      "+ **#3** plus marker",
+      "-  **#4** two spaces after the marker",
+      "-\t**#5** a tab after the marker",
+      "- [ ] **#6** a task-list checkbox",
+      "- **[#7](https://example.test)** the number inside a link",
+      "- #8 no bold at all",
+      "- ~~**#9**~~ struck through",
+      "* ~~**#10**~~ struck through under another marker",
+      "> - **#11** inside a blockquote, which is prose about the list",
+    ].join("\n");
+
+    const bullets = bulletsOf(openSectionOf(indexBody(section))!);
+    expect(bullets.live).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(bullets.struck).toEqual([9, 10]);
+    // The blockquote stays out: `> Measured …` notes cite closed issues deliberately, as the record
+    // of previous drifts, and reading them as entries would teach a maintainer to delete them.
+    expect(bullets.live).not.toContain(11);
+    expect(bullets.struck).not.toContain(11);
+  });
+
+  it("refuses a heading that states no number, rather than skipping the rule it cannot apply", () => {
+    // `— all 16` is the wording of the first measured drift, quoted in this module's own header,
+    // and the first version returned null for it and skipped rule 2 entirely. The heading that
+    // started this could have said anything and escaped the rule meant to hold it.
+    const section = "## What is actually open — all of them\n\n- **#627** open.\n";
+    const findings = reconcile([issue(306, "[index]", indexBody(section)), issue(627, "open one")]);
+
+    expect(findings.map((finding) => finding.rule)).toEqual(["heading-states-no-count"]);
+  });
+
+  it("calls an unreadable payload a look-failure, not a disagreement", () => {
+    // Three shapes that parse and are not a list of issues. The middle one is the `gh api --slurp`
+    // shape — an array *of pages* — which a plain `typeof === "object"` test admits, and which then
+    // reads `body` off an array and reports a missing index: a disagreement about a tracker nobody
+    // read.
+    for (const payload of [{}, [[{ number: 1 }]], [{ notAnIssue: true }]]) {
+      expect(reconcile(payload as never).map((finding) => finding.rule), JSON.stringify(payload))
+        .toEqual(["issues-unreadable"]);
+    }
+  });
+
+  it("says nothing was found rather than passing when the index or its section is absent", () => {
+    // Absence is the failure this whole module is about, so it must not be the quiet answer.
+    // An index that has lost its marker, or a body that has lost the section, produces a finding —
+    // an empty findings list must mean "reconciled", never "nothing was looked at".
+    expect(reconcile([issue(627, "no index among these")]).map((f) => f.rule)).toEqual(["index-missing"]);
+    expect(
+      reconcile([issue(306, "[index]", `${INDEX_MARKER}\nno such section here`)]).map((f) => f.rule),
+    ).toEqual(["section-missing"]);
+  });
+});
+
+const execFileAsync = promisify(execFile);
+const CLI = join(process.cwd(), "scripts", "verify-index-lists-what-is-open.mjs");
+
+/** Runs the real command, because exit codes are the only thing CI reads. */
+const runCli = async (payload: unknown): Promise<number> => {
+  const dir = mkdtempSync(join(tmpdir(), "acp-index-list-"));
+  const file = join(dir, "issues.json");
+  writeFileSync(file, typeof payload === "string" ? payload : JSON.stringify(payload));
+  try {
+    await execFileAsync("node", [CLI, `--issues-file=${file}`]);
+    return 0;
+  } catch (error) {
+    return (error as { code?: number }).code ?? -1;
+  }
+};
+
+describe("the command's exit codes, which are the only thing CI reads", () => {
+  const reconciling = () => [
+    {
+      number: 306,
+      title: "[index]",
+      body: `${INDEX_MARKER}\n\n## What is actually open — 1 listed below\n\n- **#627** open.\n`,
+    },
+    { number: 627, title: "open one", body: "" },
+  ];
+
+  it("exits 0 when the list reconciles", async () => {
+    expect(await runCli(reconciling())).toBe(0);
+  });
+
+  it("exits 1 when the list disagrees with the tracker", async () => {
+    const drifted = reconciling();
+    drifted[0]!.body = drifted[0]!.body.replace("- **#627** open.", "- **#858** closed, listed live.");
+    expect(await runCli(drifted)).toBe(1);
+  });
+
+  it("exits 2 when nobody could look, and never 1", async () => {
+    // The distinction this repository's other tracker checks draw for the same reason: "nobody
+    // could look" must not read as "the list disagrees", which sends a reader hunting a mismatch
+    // that was never measured. A truncated file, a wrong shape and the un-flattened page array all
+    // leave by this door, and so does a file that is not there.
+    for (const payload of ["{", {}, [[{ number: 1 }]]]) {
+      expect(await runCli(payload), JSON.stringify(payload)).toBe(2);
+    }
+    const missing = await execFileAsync("node", [CLI, "--issues-file=/nonexistent/issues.json"])
+      .then(() => 0)
+      .catch((error: { code?: number }) => error.code ?? -1);
+    expect(missing).toBe(2);
+  });
+});

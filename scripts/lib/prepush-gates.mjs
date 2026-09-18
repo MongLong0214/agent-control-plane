@@ -292,4 +292,8 @@ export const VERIFICATION_OUTSIDE_THE_RUNNER = new Map([
     "loci:node scripts/verify-tracker-loci-resolve.mjs",
     "#597 citation staleness, on a schedule in tracker-loci.yml. It is red today on an unedited main because an open issue cites a moved line; requiring it anywhere near a merge is how a check gets silenced instead of fixed.",
   ],
+  [
+    "loci:node scripts/verify-index-lists-what-is-open.mjs",
+    "whether the index's open list still describes the tracker, on the same schedule and for the same reason as the line above: closing an issue makes it red without any diff, so as a required check it would block every merge on something nobody's change touched.",
+  ],
 ]);

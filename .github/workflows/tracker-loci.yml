@@ -1,6 +1,10 @@
 name: tracker-loci
 on:
-  # This is the *only* place `verify-tracker-loci-resolve.mjs` runs, deliberately.
+  # This is the *only* place `verify-tracker-loci-resolve.mjs` runs, deliberately, and the same
+  # argument put `verify-index-lists-what-is-open.mjs` here beside it rather than in `project-ci`:
+  # both are facts about the open issue tracker rather than about any one pull request's diff, so
+  # both are already red on an unedited `main` whenever the tracker has moved, and a required check
+  # in that state blocks every merge on something no diff touched.
   #
   # It was briefly also a `project-ci` step, on the theory that it should also catch drift a PR's
   # own commit introduces. An independent review found the coupling that creates: the check is a
@@ -47,5 +51,13 @@ jobs:
       # remove it when that entrypoint has no bare package imports.
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: node scripts/verify-tracker-loci-resolve.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # `if: always()` so the two checks cannot hide each other. They ask different questions of
+        # the same tracker — whether a citation still describes the tree, and whether the index's
+        # list still describes the tracker — and a reader who fixes the first should not have to
+        # run the job again to discover the second.
+      - run: node scripts/verify-index-lists-what-is-open.mjs
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
