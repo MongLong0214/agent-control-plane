@@ -838,6 +838,48 @@ const probeNoTools = async (
  * it must return 403 for a real public host outside the generated provider allowlist. Direct Node sockets
  * explicitly remove/override HTTPS_PROXY and must still receive the seatbelt errno.
  */
+/**
+ * What the two direct-socket probes prove, as three outcomes rather than two.
+ *
+ * Every non-proving outcome still fails closed — a boundary that was not proved is not a
+ * boundary — but the reason has to name what was observed. One sentence used to cover all of
+ * them and it said "remained reachable" about a socket that never opened, which is how a loaded
+ * CI runner became a report of leaking isolation (#972). It is the same shape #967 and #969
+ * removed one layer up: the unknown taking the name of the nearest definite negative.
+ *
+ * The asymmetry that makes the third state real: the sandbox refuses a denied socket
+ * *immediately* with EPERM/EACCES, so a 3s timeout or an unresolved name is never the boundary
+ * answering. It is the host failing to answer, and that is not evidence either way.
+ */
+const directSocketVerdict = (
+  probes: ReadonlyArray<ReviewerEgressProbe | null>,
+  providerHost: string,
+): { ok: true } | { ok: false; reason: string } => {
+  if (probes.some((probe) => probe?.connected === true)) {
+    return {
+      ok: false,
+      reason: "direct-socket probe remained reachable after unsetting or overriding HTTPS_PROXY",
+    };
+  }
+  if (probes.some((probe) => !probe)) {
+    return { ok: false, reason: "direct-socket probe produced no readable observation" };
+  }
+  const indeterminate = probes.filter((probe) => probe?.indeterminate === true);
+  if (indeterminate.length > 0) {
+    const detail = indeterminate
+      .map((probe) => `${probe?.proxyMode ?? "direct"}:${probe?.errorCode ?? "timeout"}`)
+      .join(", ");
+    return {
+      ok: false,
+      reason:
+        `direct-socket probe could not determine whether ${providerHost} was denied (${detail}); ` +
+        "the sandbox refuses immediately, so this is the host failing to answer rather than a proved boundary",
+    };
+  }
+  // Everything left is a refusal the sandbox issued.
+  return { ok: true };
+};
+
 const probeProviderOnlyNetwork = async (
   profile: string,
   cwd: string,
@@ -909,11 +951,18 @@ const probeProviderOnlyNetwork = async (
     const observation = parseProbe(result.stdout);
     if (!observation || result.exitCode !== 0 || result.timedOut) return null;
     const errorCode = typeof observation["errorCode"] === "string" ? observation["errorCode"] : null;
+    const connected = observation["connected"] === true;
+    const blocked = !connected && (errorCode === "EPERM" || errorCode === "EACCES");
     return {
       host: target,
       proxyMode,
-      connected: observation["connected"] === true,
-      blocked: observation["connected"] !== true && (errorCode === "EPERM" || errorCode === "EACCES"),
+      connected,
+      blocked,
+      // Neither opened nor refused: a 3s timeout with no error code, or a name that never
+      // resolved. The sandbox denies a socket immediately, so this state is the host failing to
+      // answer rather than the boundary holding or leaking — and it is the one that used to be
+      // folded into `blocked: false` and reported as "remained reachable".
+      indeterminate: !connected && !blocked,
       errorCode,
     };
   };
@@ -944,12 +993,9 @@ const probeProviderOnlyNetwork = async (
     directProbe("unset", providerHost),
     directProbe("override", providerHost),
   ]);
-  if (directSocket.some((probe) => !probe || probe.blocked !== true || probe.connected === true)) {
-    return {
-      enforced: false,
-      reason: "direct-socket probe remained reachable after unsetting or overriding HTTPS_PROXY",
-    };
-  }
+  const directVerdict = directSocketVerdict(directSocket, providerHost);
+  if (!directVerdict.ok) return { enforced: false, reason: directVerdict.reason };
+
   return {
     enforced: true,
     egressProbes: {
@@ -2283,6 +2329,7 @@ export const __testing = Object.freeze({
   // probeNoTools and probeDeniedTranscriptPaths are: the boundary is only worth what a test
   // can show it refusing.
   probeProviderOnlyNetwork,
+  directSocketVerdict,
   reviewerSandboxArgs,
   composeReviewerProfile,
   probeNoTools,
