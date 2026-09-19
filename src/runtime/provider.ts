@@ -152,6 +152,12 @@ export interface ReviewerEgressProbe {
   connected?: boolean;
   denied?: boolean;
   blocked?: boolean;
+  /**
+   * The socket neither connected nor was refused by the sandbox — it timed out, or the name
+   * never resolved. Distinct from `blocked: false`, which used to carry this case and made a
+   * probe that could not tell indistinguishable from one that watched the socket open.
+   */
+  indeterminate?: boolean;
   statusCode?: number | null;
   errorCode?: string | null;
 }

@@ -494,3 +494,71 @@ while True:
     // into evidence, so this refusal is deliberately before record construction.
   });
 });
+
+/**
+ * #972 — the direct-socket verdict had two outcomes for three observations.
+ *
+ * Measured on PR #971: `verify (22)` reported *"direct-socket probe remained reachable after
+ * unsetting or overriding HTTPS_PROXY"* and a re-run of the identical commit passed, while
+ * `verify (22.18.0)` and a local Node 22.23.2 run passed the same case throughout. The socket had
+ * not remained reachable — it never answered, and a probe that could not tell was folded into the
+ * one definite negative beside it, which is the shape #967 and #969 removed one layer up.
+ *
+ * The asymmetry that makes the third state real is the sandbox's own behaviour: a denied socket
+ * fails *immediately* with EPERM, so a timeout is never the boundary answering.
+ *
+ * These rows pin which observation produces which verdict. Nothing here relaxes enforcement:
+ * every non-proving outcome still fails closed, and the first row is the one that proves it.
+ */
+describe("what the direct-socket probes prove", () => {
+  const denied = (proxyMode: "unset" | "override") => ({
+    host: "api.openai.com", proxyMode, connected: false, blocked: true,
+    indeterminate: false, errorCode: "EPERM",
+  });
+
+  it("proves the boundary only when both probes were refused by the sandbox", () => {
+    expect(__testing.directSocketVerdict([denied("unset"), denied("override")], "api.openai.com"))
+      .toEqual({ ok: true });
+  });
+
+  it("still fails closed, and says so, when a socket actually opened", () => {
+    // The original sentence, now reachable only from the observation that supports it.
+    const verdict = __testing.directSocketVerdict(
+      [denied("unset"), { host: "api.openai.com", proxyMode: "override", connected: true }],
+      "api.openai.com",
+    );
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reason).toContain("remained reachable");
+  });
+
+  it("does not call a socket that never answered one that remained reachable", () => {
+    // The #972 observation: no connection, no refusal, no error code — a 3s timeout.
+    const verdict = __testing.directSocketVerdict(
+      [denied("unset"),
+       { host: "api.openai.com", proxyMode: "override", connected: false, blocked: false, indeterminate: true }],
+      "api.openai.com",
+    );
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reason).not.toContain("remained reachable");
+    expect(verdict.ok === false && verdict.reason).toContain("could not determine");
+    // The operator needs which probe and why, or the next reader repeats the half hour this cost.
+    expect(verdict.ok === false && verdict.reason).toContain("override:timeout");
+  });
+
+  it("names a DNS failure by its code rather than as a timeout", () => {
+    const verdict = __testing.directSocketVerdict(
+      [{ host: "api.openai.com", proxyMode: "unset", connected: false, blocked: false,
+         indeterminate: true, errorCode: "EAI_AGAIN" }, denied("override")],
+      "api.openai.com",
+    );
+    expect(verdict.ok === false && verdict.reason).toContain("unset:EAI_AGAIN");
+  });
+
+  it("separates a probe that did not run from one that ran and could not tell", () => {
+    // A null probe is the command failing, not the socket answering. Reporting it as an
+    // indeterminate socket would send a reader to the network for a process that never started.
+    const verdict = __testing.directSocketVerdict([denied("unset"), null], "api.openai.com");
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reason).toContain("no readable observation");
+  });
+});
