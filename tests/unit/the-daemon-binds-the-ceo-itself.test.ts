@@ -24,6 +24,7 @@ const complete = (overrides: Record<string, string> = {}): Record<string, string
   ACP_HERMES_PROFILE: "default",
   ACP_HERMES_HOME: "/home/isaac/.hermes",
   ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY: "hermes-runtime@1",
+  ACP_HERMES_LINEAGE_ROOT_DIGEST: `sha256:${"c".repeat(64)}`,
   ACP_HERMES_RUNTIME_COMMAND: "/usr/local/bin/hermes\tacp\tserve",
   ...overrides,
 });
@@ -53,6 +54,16 @@ describe("the daemon binds the CEO itself", () => {
       expect(resolved.allowed, `omitting ${omitted} was accepted`).toBe(false);
       expect(!resolved.allowed && JSON.stringify(resolved.evidence)).toContain(omitted);
     }
+  });
+
+  it("refuses a declared lineage digest that is not a digest, before any bind is attempted", () => {
+    // `runHermesTargetBind` rejects a non-digest expectation before it spawns anything, so a
+    // malformed value would otherwise surface as PROTOCOL_INVALID with nothing naming the field.
+    const resolved = resolveCeoSelfBootstrapDescriptor(
+      complete({ ACP_HERMES_LINEAGE_ROOT_DIGEST: "c".repeat(64) }),
+    );
+    expect(resolved.allowed).toBe(false);
+    expect(!resolved.allowed && resolved.message).toContain("not a digest");
   });
 
   it("reads the runtime command as argv, so a path may hold spaces", () => {

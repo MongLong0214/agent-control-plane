@@ -22,16 +22,26 @@ import { ReasonCode } from "../core/reason-codes.ts";
  * and handed it straight back would be letting the subject decide the claim about itself, which is
  * the defect class this repository keeps removing.
  *
- * So the pin is trust-on-first-use and durable: the first automatic bootstrap records what the
- * receipt carried, and every later one sends the recorded value as its expectation. Nobody types
- * it, and a Hermes lineage that *changes* is still refused. What is given up is a human reading
- * the digest once — which is exactly the step the owner ruled out.
+ * Measured 2026-09-20, after this was first written the other way round: there is **no first-use
+ * mode to reach**. `hermes-bootstrap.ts:411-413` compares the receipt's identity and lineage
+ * digest to the request by strict equality, and `hermes-target-bind.ts:44` refuses a non-digest
+ * expectation before Hermes is spawned at all. Probing for the value does not work either — a
+ * request naming the wrong digest and a request naming none both come back
+ * `target_bind_preflight_invalid`, so Hermes deliberately tells a guesser nothing.
+ *
+ * So the expectation is declared once, and the pin is what makes a *later* change visible: the
+ * first successful bootstrap records what the receipt carried, and every boot after that asserts
+ * the recorded value rather than the declared one. An edited variable cannot silently re-point
+ * the CEO at a different Hermes lineage. The digest is stated once by the side that owns it,
+ * which is a fact the CEO supplies to this deployment's configuration — not a command anyone
+ * types at a terminal.
  */
 export interface CeoSelfBootstrapDescriptor {
   readonly targetBindExecutable: string;
   readonly hermesProfile: string;
   readonly hermesHome: string;
   readonly executorRuntimeIdentity: string;
+  readonly lineageRootDigest: string;
   readonly command: readonly string[];
 }
 
@@ -47,6 +57,7 @@ export const CEO_SELF_BOOTSTRAP_VARS = [
   "ACP_HERMES_PROFILE",
   "ACP_HERMES_HOME",
   "ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY",
+  "ACP_HERMES_LINEAGE_ROOT_DIGEST",
   "ACP_HERMES_RUNTIME_COMMAND",
 ] as const;
 
@@ -78,17 +89,24 @@ export const resolveCeoSelfBootstrapDescriptor = (
       },
     );
   }
-  const [targetBindExecutable, hermesProfile, hermesHome, executorRuntimeIdentity, rawCommand] =
-    values as [string, string, string, string, string];
+  const [targetBindExecutable, hermesProfile, hermesHome, executorRuntimeIdentity, lineageRootDigest, rawCommand] =
+    values as [string, string, string, string, string, string];
   const command = parseRuntimeCommand(rawCommand);
   if (command.length === 0) {
     return deny(ReasonCode.INVALID_ARGUMENT, "ACP_HERMES_RUNTIME_COMMAND named no command", {});
+  }
+  // Refused here rather than at the bind. `runHermesTargetBind` rejects a non-digest expectation
+  // before it spawns anything, so a malformed value would surface as PROTOCOL_INVALID with
+  // nothing naming which field was wrong.
+  if (!isDigest(lineageRootDigest)) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "ACP_HERMES_LINEAGE_ROOT_DIGEST is not a digest", {});
   }
   return allow(ReasonCode.OK, {
     targetBindExecutable,
     hermesProfile,
     hermesHome,
     executorRuntimeIdentity,
+    lineageRootDigest,
     command,
   });
 };
