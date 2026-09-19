@@ -423,6 +423,36 @@ export class Doctor {
         });
         continue;
       }
+      // Only `suspended` qualifies this. `activity` cannot: `ProjectRegistry` derives it as
+      // `(bound PRIMARY_CTO count) > 0 ? "ACTIVE" : "INACTIVE"`, so `!binding` and
+      // `activity === "INACTIVE"` are the same fact under two names, and adding it as a
+      // condition makes this branch unreachable. The first draft of this check had exactly that
+      // and would have reported nothing — the defect it exists to fix, inside the fix.
+      if (!binding && !project.suspended) {
+        // The same absence, without the open runs that used to be its only witness.
+        //
+        // `runs.create()`'s one production caller is the CEO MCP port, so a project with no bound
+        // role cannot acquire an open run — which made the condition above unreachable from
+        // exactly the state that needs reporting. Measured on this deployment 2026-09-20:
+        // `ACTIVE assignments = 0`, `runs = 0`, and `health.json` reading `mode NORMAL` with
+        // `blockingFindings []` for two days. Nothing could be dispatched and nothing said so.
+        //
+        // Non-blocking on purpose, and the distinction is the whole point: blocking here parks
+        // the daemon behind the coordinator that would bind the role (#950, #958), which is how
+        // an honest report turns into a deadlock. A deployment with an unbound role can still do
+        // everything that is not a run.
+        findings.push({
+          code: "CTO_MISSING_WITH_NO_RUNS",
+          severity: "ERROR",
+          scope: `project:${project.projectId}`,
+          blocking: false,
+          confidence: "HIGH",
+          observedEvidence: { openRuns: [], suspended: false },
+          recommendedAction:
+            "bind a primary CTO for this project, or suspend it — until then it can accept no work",
+        });
+        continue;
+      }
       if (!binding) continue;
 
       const session = this.sessions.get(binding.sessionId);
