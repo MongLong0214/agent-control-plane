@@ -1,0 +1,15 @@
+Limit: this changes what is reported and not what is refused — the review still denies and the mandatory GPT gate is unchanged, which the test pins by asserting no fallback invocation and no BLIND_REVIEW_FALLBACK row
+Limit: ACP_REVIEWER_CODEX_HOME is set nowhere — not in run-once.py, not in the launcher — so the first #512 run failed for want of a pointer rather than a credential; whether to make that permanent is not settled here
+Ruled-out: widening ProviderSessionProvisionError's reasonCode to ReasonCode | any code could then arrive there and the caller would have nothing to branch on, so the type stays a union of exactly the two outcomes a caller can act on
+Warn: check the order in startPacketReviewerSession before reading a failure there — isolation and egress evidence are verified first, so anything after that point is not evidence about the boundary
+Blast: module
+Record-Id: r-handshaketimeoutisnotlostisolation
+Evidence: tests/unit/review-r2.test.ts
+Provenance: inherited 40b94d4e018902c21ce35984ae4f46a7543afbe0
+
+Limit: the reason chosen at that throw is reachable only through the real adapter — a fake that raises ProviderSessionProvisionError supplies the code instead of deciding it, so no row built that way can measure the branch
+Ruled-out: also splitting the sibling throw that folds a missing provider thread id into ISOLATION_LOST | an existing row pins that site to ISOLATION_LOST today, so moving it is a contract change rather than a drive-by, and it is filed separately
+Warn: keep both rows together — one alone cannot tell a split from a rename, and each kills only its own direction of the mutation
+Record-Id: r-967handshakewitness
+Evidence: tests/unit/codex-reviewer-session.test.ts
+Provenance: inherited 7780f87f6e4c0b4cdd4028ff8bf4ed842d033ce1
