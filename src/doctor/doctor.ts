@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { totalmem } from "node:os";
 
@@ -309,6 +309,7 @@ export class Doctor {
       findings.push(...(await this.checkCapacity()));
     }
     if (scope === "system") {
+      findings.push(...this.checkPacketReviewerScope());
       findings.push(...this.checkStatePaths());
       findings.push(...(await this.checkHostResources()));
       findings.push(...this.checkClaims());
@@ -765,6 +766,91 @@ export class Doctor {
   }
 
   /** The daemon owns these files, so their timestamp is independently checkable evidence. */
+  /**
+   * Whether the packet reviewer has a private credential scope it could actually use.
+   *
+   * The blind-review gate needs one the moment a candidate reaches review, and until then nothing
+   * says whether it exists. Measured on #512: `ACP_REVIEWER_CODEX_HOME` was set in neither the
+   * launcher nor the run harness while the capsules sat on disk with nothing pointing at one, so
+   * the deployment read healthy right up to the review that needed it.
+   *
+   * That ordering is expensive, not merely late. `claimReviewerCodexHome` writes a `claimed`
+   * marker with no auto-release — deliberately, since "a lack of session bookkeeping is not proof
+   * that every native descendant has exited" — so a run that fails *after* claiming still consumes
+   * the capsule. Discovering the problem at review time costs one capsule per discovery.
+   *
+   * Reads presence and directory state only, never a credential's contents: `auth.json` is checked
+   * for existence and nothing in it is opened. A missing file here is a fact about configuration,
+   * which is what this reports.
+   *
+   * Non-blocking on purpose. A deployment with no reviewer scope can still run everything that is
+   * not a review, and a blocking finding for a missing thing is how a daemon ends up parked behind
+   * the very coordinator that would fix it (#950, #958).
+   */
+  private checkPacketReviewerScope(): Finding[] {
+    const findings: Finding[] = [];
+    const action =
+      "provision a private reviewer CODEX_HOME, authenticate it, and point " +
+      "ACP_REVIEWER_CODEX_HOME at its `home` directory";
+    const configured = process.env["ACP_REVIEWER_CODEX_HOME"];
+
+    if (!configured) {
+      findings.push({
+        code: ReasonCode.PACKET_REVIEWER_SCOPE_UNAVAILABLE,
+        severity: "ERROR",
+        scope: "reviewer:packet",
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: { state: "UNCONFIGURED", variable: "ACP_REVIEWER_CODEX_HOME" },
+        recommendedAction: action,
+      });
+      return findings;
+    }
+
+    const capsule = dirname(configured);
+    if (!existsSync(join(capsule, "identity.json"))) {
+      findings.push({
+        code: ReasonCode.PACKET_REVIEWER_SCOPE_UNAVAILABLE,
+        severity: "ERROR",
+        scope: "reviewer:packet",
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: { state: "NO_IDENTITY_RECEIPT", root: configured },
+        recommendedAction: action,
+      });
+      return findings;
+    }
+
+    // The claim marker is the capsule's one-way door: a claimed capsule is spent, not reusable.
+    if (existsSync(join(capsule, "claimed"))) {
+      findings.push({
+        code: ReasonCode.PACKET_REVIEWER_SCOPE_UNAVAILABLE,
+        severity: "ERROR",
+        scope: "reviewer:packet",
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: { state: "ALREADY_CLAIMED", root: configured },
+        recommendedAction: action,
+      });
+      return findings;
+    }
+
+    // Presence only. Whether the credential inside is current is a question this check does not
+    // open a credential file to answer.
+    if (!existsSync(join(configured, "auth.json"))) {
+      findings.push({
+        code: ReasonCode.PACKET_REVIEWER_SCOPE_UNAVAILABLE,
+        severity: "ERROR",
+        scope: "reviewer:packet",
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: { state: "NOT_AUTHENTICATED", root: configured },
+        recommendedAction: action,
+      });
+    }
+    return findings;
+  }
+
   private checkCapacitySensorFiles(): Finding[] {
     const findings: Finding[] = [];
     const now = Date.parse(this.clock.nowIso());

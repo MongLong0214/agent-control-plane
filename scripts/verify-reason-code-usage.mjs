@@ -549,6 +549,12 @@ recordReturnedCollection(
   "checkCapacitySensorFiles returned finding",
 );
 recordReturnedCollection(
+  "src/doctor/doctor.ts",
+  /private\s+checkPacketReviewerScope\(\):\s*Finding\[\]\s*\{/,
+  "findings",
+  "checkPacketReviewerScope returned finding",
+);
+recordReturnedCollection(
   "src/continuity/continuity-kernel.ts",
   /async\s+restore\(\):\s*Promise<\{[\s\S]*?\}>\s*\{/,
   "deferred",

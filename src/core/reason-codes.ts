@@ -95,6 +95,15 @@ export const ReasonCode = {
   COVERAGE_INCOMPLETE: "COVERAGE_INCOMPLETE",
   PROBE_FAILED: "PROBE_FAILED",
   ISOLATION_LOST: "ISOLATION_LOST",
+  /**
+   * The packet reviewer has no private credential scope it could actually use.
+   *
+   * Reported by the doctor so the state is visible before a review needs it. Measured on #512:
+   * `ACP_REVIEWER_CODEX_HOME` was set in neither the launcher nor the run harness, the capsules
+   * existed with nothing pointing at one, and the deployment looked healthy until a review asked
+   * for a reviewer — at which point a claim is permanent whether or not the run succeeds.
+   */
+  PACKET_REVIEWER_SCOPE_UNAVAILABLE: "PACKET_REVIEWER_SCOPE_UNAVAILABLE",
   VERIFICATION_GAP: "VERIFICATION_GAP",
 
   // --- run lifecycle -------------------------------------------------------
