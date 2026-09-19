@@ -61,7 +61,11 @@ it.each(["success", "cancel", "auth-error", "keychain-error", "wrong-scope", "de
   });
 it("production native executable builds without launching it", () => {
   execFileSync("/usr/bin/xcrun", ["swiftc", "-parse-as-library", "native/owner-auth/OwnerAuth.swift", "-o", join(nativeRoot, "owner-auth")], { timeout: 120000 });
-  expect(execFileSync("/usr/bin/file", [join(nativeRoot, "owner-auth")], { encoding: "utf8" })).toContain("Mach-O");
+  // Bounded like every other exec in this file. `file` on a local binary is fast, but an
+  // unbounded child is what wedges a suite when the host is not — `guards:subprocess-bounds`
+  // refuses it, and raising the budget instead would remove the only thing enforcing that.
+  expect(execFileSync("/usr/bin/file", [join(nativeRoot, "owner-auth")], { encoding: "utf8", timeout: 5000 }))
+    .toContain("Mach-O");
 }, 130000);
 
 it.each(["success", "append-fault", "wrong-token", "non-owner", "lost-lock", "wrong-role", "wrong-actor", "expired", "extra-field"])(

@@ -301,14 +301,15 @@ const groups = [
   {
     file: "src/daemon/agentcpd.ts",
     // operatorRequestParams
+    // The three `params` operands left this list on 2026-09-20: the adopted row
+    // `delegation-operator-object-params-are-admissible` names the range that contains them, and a
+    // debt that survives its row is reported as stale — correctly, since it would then claim an
+    // answer is owed for something already answered.
     reason: "This private operator-parameter parser overlaps object and prototype checks. JSON transport cannot supply a custom prototype; independent in-process and wire witnesses have not been isolated.",
     operands: [
       ["!value",2],
       ["typeof value !== \"object\"",2],
       ["Array.isArray(value)",2],
-      ["!params",1],
-      ["typeof params !== \"object\"",1],
-      ["Array.isArray(params)",1],
       ["prototype === Object.prototype",1],
       ["prototype === null",1],
     ],
