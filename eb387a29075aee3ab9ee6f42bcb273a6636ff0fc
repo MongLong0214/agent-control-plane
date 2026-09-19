@@ -1,0 +1,6 @@
+Limit: the reason-code census does not see a code passed as a constructor argument inside `throw new ...` — of the three this error class carries, only the one sitting in a ternary was counted, and the plain form is the natural one
+Ruled-out: rewriting the throw into a shape the census already accepts | contorting production code to satisfy a checker leaves the checker wrong and the code worse; the recognizer verifies the concrete path instead
+Warn: REVIEWER_SESSION_FAILURE_MESSAGES is total on purpose — never give it a default or an index signature, because a default is exactly where an unnamed reason goes to be misreported
+Record-Id: r-969unreadableanswer
+Evidence: tests/unit/codex-reviewer-session.test.ts
+Provenance: inherited 96acba745a4f5ec41724b6981c0f7e533d291af2
