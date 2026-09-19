@@ -1,6 +1,6 @@
 // Composite-decision witness: the unique range names its contained operands.
 // This is not a claim of independent mutation sensitivity for each operand.
-export default {
+const legacyScopeRemainsAdmissible = {
   "id": "legacy-scope-remains-admissible",
   "what": "scope refinement must admit a legacy owner grant",
   "file": "src/ceo/cto-binding-delegation.ts",
@@ -10,3 +10,5 @@ export default {
     "tests/unit/cto-binding-delegation.test.ts::requires an admitted explicit owner decision"
   ]
 };
+
+export default legacyScopeRemainsAdmissible;

@@ -1,6 +1,6 @@
 // Composite-decision witness: the unique range names its contained operands.
 // This is not a claim of independent mutation sensitivity for each operand.
-export default {
+const delegationRevokeExactReceipt = {
   "id": "delegation-revoke-exact-receipt",
   "what": "an exact admitted revocation receipt revokes the grant",
   "file": "src/ceo/cto-binding-delegation.ts",
@@ -10,3 +10,5 @@ export default {
     "tests/unit/cto-binding-delegation.test.ts::owner revocation invalidates cached retries"
   ]
 };
+
+export default delegationRevokeExactReceipt;

@@ -1,6 +1,6 @@
 // Composite-decision witness: the unique range names its contained operands.
 // This is not a claim of independent mutation sensitivity for each operand.
-export default {
+const nativeDelegationValidScopeIsAdmissible = {
   "id": "native-delegation-valid-scope-is-admissible",
   "what": "the valid native delegation scope reaches owner admission",
   "file": "src/daemon/agentcpd.ts",
@@ -10,3 +10,5 @@ export default {
     "tests/unit/native-owner-auth.test.ts::native"
   ]
 };
+
+export default nativeDelegationValidScopeIsAdmissible;

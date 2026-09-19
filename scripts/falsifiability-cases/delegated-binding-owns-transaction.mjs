@@ -1,6 +1,6 @@
 // Composite-decision witness: the unique range names its contained operands.
 // This is not a claim of independent mutation sensitivity for each operand.
-export default {
+const delegatedBindingOwnsTransaction = {
   "id": "delegated-binding-owns-transaction",
   "what": "an unnested delegated binding can own its transaction",
   "file": "src/ceo/cto-binding-delegation.ts",
@@ -10,3 +10,5 @@ export default {
     "tests/unit/cto-binding-runtime.test.ts::Claude target pins.*success"
   ]
 };
+
+export default delegatedBindingOwnsTransaction;

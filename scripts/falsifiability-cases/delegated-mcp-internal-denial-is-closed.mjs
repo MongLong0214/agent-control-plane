@@ -1,6 +1,6 @@
 // Composite-decision witness: the unique range names its contained operands.
 // This is not a claim of independent mutation sensitivity for each operand.
-export default {
+const delegatedMcpInternalDenialIsClosed = {
   "id": "delegated-mcp-internal-denial-is-closed",
   "what": "an internal returned denial is sanitized at MCP publication",
   "file": "src/daemon/agentcpd.ts",
@@ -10,3 +10,5 @@ export default {
     "tests/unit/cto-binding-runtime.test.ts::nested target denial stays closed"
   ]
 };
+
+export default delegatedMcpInternalDenialIsClosed;

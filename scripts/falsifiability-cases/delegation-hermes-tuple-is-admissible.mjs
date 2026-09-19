@@ -1,6 +1,6 @@
 // Composite-decision witness: the unique range names its contained operands.
 // This is not a claim of independent mutation sensitivity for each operand.
-export default {
+const delegationHermesTupleIsAdmissible = {
   "id": "delegation-hermes-tuple-is-admissible",
   "what": "the matching Hermes tuple reaches the child target-bind producer",
   "file": "src/daemon/cto-binding-runtime.ts",
@@ -10,3 +10,5 @@ export default {
     "tests/unit/cto-binding-runtime.test.ts::owner-admitted grant reaches CEO MCP.*success"
   ]
 };
+
+export default delegationHermesTupleIsAdmissible;

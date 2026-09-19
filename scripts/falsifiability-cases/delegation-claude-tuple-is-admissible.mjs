@@ -1,6 +1,6 @@
 // Composite-decision witness: the unique range names its contained operands.
 // This is not a claim of independent mutation sensitivity for each operand.
-export default {
+const delegationClaudeTupleIsAdmissible = {
   "id": "delegation-claude-tuple-is-admissible",
   "what": "the matching Claude session tuple reaches the canonical verifier",
   "file": "src/daemon/cto-binding-runtime.ts",
@@ -10,3 +10,5 @@ export default {
     "tests/unit/cto-binding-runtime.test.ts::Claude target pins.*success"
   ]
 };
+
+export default delegationClaudeTupleIsAdmissible;

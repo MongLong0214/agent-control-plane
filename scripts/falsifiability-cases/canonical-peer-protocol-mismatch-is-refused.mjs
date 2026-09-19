@@ -8,7 +8,7 @@
 // exercises exactly this mismatch.
 // Composite-decision witness: the unique range names its contained operands.
 // This is not a claim of independent mutation sensitivity for each operand.
-export default {
+const canonicalPeerProtocolMismatchIsRefused = {
   "id": "canonical-peer-protocol-mismatch-is-refused",
   "what": "a connected peer protocol mismatch is refused",
   "file": "src/registry/canonical-self-claim.ts",
@@ -18,3 +18,5 @@ export default {
     "tests/unit/canonical-self-claim.test.ts::clause 2 — peer protocol version must match the deployment's expectation"
   ]
 };
+
+export default canonicalPeerProtocolMismatchIsRefused;

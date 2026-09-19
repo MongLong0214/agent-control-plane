@@ -1,6 +1,6 @@
 // Composite-decision witness: the unique range names its contained operands.
 // This is not a claim of independent mutation sensitivity for each operand.
-export default {
+const durableGrantRemainsReadable = {
   "id": "durable-grant-remains-readable",
   "what": "a receipt-bound grant remains reconstructible",
   "file": "src/ceo/cto-binding-delegation.ts",
@@ -10,3 +10,5 @@ export default {
     "tests/unit/cto-binding-delegation-durable.test.ts::reconstructs only an explicitly durable"
   ]
 };
+
+export default durableGrantRemainsReadable;

@@ -1,6 +1,6 @@
 // Composite-decision witness: the unique range names its contained operands.
 // This is not a claim of independent mutation sensitivity for each operand.
-export default {
+const delegationTargetConfigIsAdmissible = {
   "id": "delegation-target-config-is-admissible",
   "what": "valid unique target pins construct the runtime",
   "file": "src/daemon/cto-binding-runtime.ts",
@@ -10,3 +10,5 @@ export default {
     "tests/unit/cto-binding-runtime.test.ts::Claude target pins.*success"
   ]
 };
+
+export default delegationTargetConfigIsAdmissible;

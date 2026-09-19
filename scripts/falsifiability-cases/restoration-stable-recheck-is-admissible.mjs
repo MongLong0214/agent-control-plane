@@ -1,6 +1,6 @@
 // Composite-decision witness: the unique range names its contained operands.
 // This is not a claim of independent mutation sensitivity for each operand.
-export default {
+const restorationStableRecheckIsAdmissible = {
   "id": "restoration-stable-recheck-is-admissible",
   "what": "restoration with stable generation and target survives the final recheck",
   "file": "src/session/binding-registry.ts",
@@ -10,3 +10,5 @@ export default {
     "tests/unit/ceo-same-actor-restore.test.ts::attaches the first authenticated target"
   ]
 };
+
+export default restorationStableRecheckIsAdmissible;

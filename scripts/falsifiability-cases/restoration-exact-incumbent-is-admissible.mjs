@@ -1,6 +1,6 @@
 // Composite-decision witness: the unique range names its contained operands.
 // This is not a claim of independent mutation sensitivity for each operand.
-export default {
+const restorationExactIncumbentIsAdmissible = {
   "id": "restoration-exact-incumbent-is-admissible",
   "what": "the exact revoked incumbent actor tuple can be restored",
   "file": "src/session/binding-registry.ts",
@@ -10,3 +10,5 @@ export default {
     "tests/unit/ceo-same-actor-restore.test.ts::attaches the first authenticated target"
   ]
 };
+
+export default restorationExactIncumbentIsAdmissible;

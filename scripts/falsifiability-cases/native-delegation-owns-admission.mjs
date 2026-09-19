@@ -1,6 +1,6 @@
 // Composite-decision witness: the unique range names its contained operands.
 // This is not a claim of independent mutation sensitivity for each operand.
-export default {
+const nativeDelegationOwnsAdmission = {
   "id": "native-delegation-owns-admission",
   "what": "native delegation admits within its own transaction",
   "file": "src/ceo/cto-binding-delegation.ts",
@@ -10,3 +10,5 @@ export default {
     "tests/unit/native-owner-auth.test.ts::native"
   ]
 };
+
+export default nativeDelegationOwnsAdmission;

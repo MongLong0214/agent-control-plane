@@ -1,6 +1,6 @@
 // Composite-decision witness: the unique range names its contained operands.
 // This is not a claim of independent mutation sensitivity for each operand.
-export default {
+const durableDenialSettlesFence = {
   "id": "durable-denial-settles-fence",
   "what": "a denied expired operation settles its revocation and fence",
   "file": "src/ceo/cto-binding-delegation.ts",
@@ -10,3 +10,5 @@ export default {
     "tests/unit/cto-binding-runtime.test.ts::durable expiry survives a denied production binding"
   ]
 };
+
+export default durableDenialSettlesFence;

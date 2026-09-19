@@ -8,7 +8,7 @@
 // exercises exactly this mismatch.
 // Composite-decision witness: the unique range names its contained operands.
 // This is not a claim of independent mutation sensitivity for each operand.
-export default {
+const restorationOperatorRequiresOwner = {
   "id": "restoration-operator-requires-owner",
   "what": "a non-owner operator cannot restore existing CEO authority",
   "file": "src/daemon/agentcpd.ts",
@@ -18,3 +18,5 @@ export default {
     "tests/scenarios/hermes-bootstrap-owner-boundary.test.ts::non-owner bob is checked before caller-selected executables run"
   ]
 };
+
+export default restorationOperatorRequiresOwner;

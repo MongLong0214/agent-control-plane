@@ -1,6 +1,6 @@
 // Composite-decision witness: the unique range names its contained operands.
 // This is not a claim of independent mutation sensitivity for each operand.
-export default {
+const delegationCurrentCeoIsAdmissible = {
   "id": "delegation-current-ceo-is-admissible",
   "what": "an unexpired grant for the current CEO permits authorization",
   "file": "src/ceo/cto-binding-delegation.ts",
@@ -10,3 +10,5 @@ export default {
     "tests/unit/cto-binding-delegation.test.ts::authenticates the CEO session"
   ]
 };
+
+export default delegationCurrentCeoIsAdmissible;
