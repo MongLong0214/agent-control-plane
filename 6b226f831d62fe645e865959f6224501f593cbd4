@@ -1,0 +1,6 @@
+Limit: the CEO's ruling is a transport batch, not a content merge — items stay whole and an unrelated instruction in the same conversation is a separate item, never fused
+Ruled-out: editing the poll loop in this change | that loop carries hard-won ordering behaviour around offsets, held turns and terminal delivery errors, so the rule goes where a test reaches it directly
+Warn: unconsumedIds must be reported even when empty — otherwise a batch that took some is indistinguishable from one that took all, and the next execution cannot tell what is still owed
+Record-Id: r-631ownertransportbatch
+Evidence: tests/unit/three-messages-do-not-become-three-turns.test.ts
+Provenance: inherited 4980fe56b65e9fe0fe70082428e430985b92519a
