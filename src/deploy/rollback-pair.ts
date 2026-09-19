@@ -2044,6 +2044,12 @@ const main = async (argv: readonly string[]): Promise<number> => {
         `ACP_PAIR_ID=${sealed.pairId}`,
         `ACP_PAIR_ROOT=${sealed.root}`,
         `ACP_PAIR_INDEX_DIGEST=${sealed.indexDigest}`,
+        // `validate` requires the generation, and the independent verifier reads it from this
+        // receipt rather than from the pair — a pair that misnamed its own generation would
+        // otherwise vouch for that name itself. It was never printed, so the verifier's own
+        // `validate` step ran with an empty value and could not reach PASS for any pair
+        // (measured 2026-09-20 against 80581c97…: `validate FAIL exit 2`, every other row PASS).
+        `ACP_PAIR_SERVICE_GENERATION=${sealed.manifest.identity.service.generation}`,
         "",
       ].join("\n"),
     );
