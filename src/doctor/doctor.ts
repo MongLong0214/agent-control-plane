@@ -23,6 +23,7 @@ import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { TaskGraph } from "../run/task-graph.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
+import { inspectReviewerCodexHome } from "../runtime/reviewer-codex-home.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 
@@ -309,6 +310,7 @@ export class Doctor {
       findings.push(...(await this.checkCapacity()));
     }
     if (scope === "system") {
+      findings.push(...this.checkPacketReviewerScope());
       findings.push(...this.checkStatePaths());
       findings.push(...(await this.checkHostResources()));
       findings.push(...this.checkClaims());
@@ -759,6 +761,64 @@ export class Doctor {
         recommendedAction: nothingMeasured
           ? "no candidate provider has been measured for these roles; take a capacity reading before reading this as an outage"
           : plan.action,
+      });
+    }
+    return findings;
+  }
+
+  /**
+   * Whether the packet reviewer has a private credential scope it could actually use.
+   *
+   * The blind-review gate needs one the moment a candidate reaches review, and until then nothing
+   * says whether it exists. Measured on #512: `ACP_REVIEWER_CODEX_HOME` was set in neither the
+   * launcher nor the run harness while the capsules sat on disk with nothing pointing at one, so
+   * the deployment read healthy right up to the review that needed it.
+   *
+   * That ordering is expensive, not merely late. `claimReviewerCodexHome` writes a `claimed`
+   * marker with no auto-release — deliberately, since "a lack of session bookkeeping is not proof
+   * that every native descendant has exited" — so a run that fails *after* claiming still consumes
+   * the capsule. Discovering the problem at review time costs one capsule per discovery.
+   *
+   * Reads presence and directory state only, never a credential's contents: `auth.json` is checked
+   * for existence and nothing in it is opened. A missing file here is a fact about configuration,
+   * which is what this reports.
+   *
+   * Non-blocking on purpose. A deployment with no reviewer scope can still run everything that is
+   * not a review, and a blocking finding for a missing thing is how a daemon ends up parked behind
+   * the very coordinator that would fix it (#950, #958).
+   */
+  private checkPacketReviewerScope(): Finding[] {
+    const findings: Finding[] = [];
+    const action =
+      "provision a private reviewer CODEX_HOME, authenticate it, and point " +
+      "ACP_REVIEWER_CODEX_HOME at its `home` directory";
+    const configured = process.env["ACP_REVIEWER_CODEX_HOME"];
+
+    if (!configured) {
+      findings.push({
+        code: ReasonCode.PACKET_REVIEWER_SCOPE_UNAVAILABLE,
+        severity: "ERROR",
+        scope: "reviewer:packet",
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: { state: "UNCONFIGURED", variable: "ACP_REVIEWER_CODEX_HOME" },
+        recommendedAction: action,
+      });
+      return findings;
+    }
+
+    const inspected = inspectReviewerCodexHome(configured);
+    // READY is the claim's own answer, not this method's opinion of it, and the credential's
+    // freshness is not part of either: nothing here opens `auth.json`.
+    if (inspected.state !== "READY" || !existsSync(join(configured, "auth.json"))) {
+      findings.push({
+        code: ReasonCode.PACKET_REVIEWER_SCOPE_UNAVAILABLE,
+        severity: "ERROR",
+        scope: "reviewer:packet",
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: { state: inspected.state === "READY" ? "NOT_AUTHENTICATED" : inspected.state, root: configured },
+        recommendedAction: action,
       });
     }
     return findings;

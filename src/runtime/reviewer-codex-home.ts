@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -59,20 +59,65 @@ export const provisionReviewerCodexHome = (): string => {
   return root;
 };
 
+/**
+ * Everything the claim requires, short of claiming — so nothing has to restate it.
+ *
+ * A reader that wants to know whether this capsule is usable had one way to find out, and it was
+ * to claim it. That is a one-way door: `claimReviewerCodexHome` writes a marker with no
+ * auto-release, so asking the question consumed the answer. A second implementation of the
+ * contract is the other way it goes wrong — a checker built from `existsSync` calls agrees with
+ * the claim right up to the case it does not model (a capsule outside the private namespace, a
+ * receipt with the wrong mode, a symlinked ancestor), and then reports healthy for a capsule the
+ * claim refuses.
+ *
+ * `UNUSABLE_CAPSULE` is deliberately one state and not a taxonomy of shapes: the remedy for all of
+ * them is the same — provision a fresh capsule — and naming the specific violation would describe
+ * a path this function was handed, which is not something to write into a report.
+ */
+export type ReviewerCodexHomeState =
+  | { readonly state: "READY"; readonly identity: ReviewerCodexHome }
+  | { readonly state: "ALREADY_CLAIMED" }
+  | { readonly state: "NO_IDENTITY_RECEIPT" }
+  | { readonly state: "UNUSABLE_CAPSULE" };
+
+export const inspectReviewerCodexHome = (root: string): ReviewerCodexHomeState => {
+  let identity: ReviewerCodexHome;
+  try {
+    identity = verifiedIdentity(root);
+  } catch {
+    // Absence of the receipt is a different action from a capsule that cannot be used: one is a
+    // login that has not happened, the other is a path that is not a capsule. Everything else,
+    // including a receipt that exists and does not verify, is the second.
+    let present = false;
+    try { present = existsSync(join(dirname(root), "identity.json")); } catch { present = false; }
+    return { state: present ? "UNUSABLE_CAPSULE" : "NO_IDENTITY_RECEIPT" };
+  }
+  // Advisory only. The claim is still the `mkdirSync` below and nothing else: a capsule claimed
+  // between this read and that call fails there, which is where atomicity has to live.
+  if (existsSync(join(dirname(root), "claimed"))) return { state: "ALREADY_CLAIMED" };
+  return { state: "READY", identity };
+};
+
+/** The claim's preconditions, with no side effect. Throws through `fail`, as the claim did. */
+const verifiedIdentity = (root: string): ReviewerCodexHome => {
+  validatePath(root);
+  const receipt = join(dirname(root), "identity.json");
+  const stat = lstatSync(receipt);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.uid !== process.getuid?.() ||
+      (stat.mode & 0o7777) !== 0o600 || stat.size > 2048) fail();
+  const identity = JSON.parse(readFileSync(receipt, "utf8")) as ReviewerCodexHome;
+  if (Object.keys(identity).sort().join(",") !== "capsuleDev,capsuleIno,dev,ino,root" || identity.root !== root) fail();
+  const home = privateDirectory(root);
+  const capsule = privateDirectory(dirname(root));
+  if (identity.dev !== home.dev || identity.ino !== home.ino ||
+      identity.capsuleDev !== capsule.dev || identity.capsuleIno !== capsule.ino) fail();
+  return identity;
+};
+
 /** Irrevocable per-session claim. Crash/failed bootstrap leaves a tombstone, never reuse. */
 export const claimReviewerCodexHome = (root: string): ReviewerCodexHome => {
   try {
-    validatePath(root);
-    const receipt = join(dirname(root), "identity.json");
-    const stat = lstatSync(receipt);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.uid !== process.getuid?.() ||
-        (stat.mode & 0o7777) !== 0o600 || stat.size > 2048) fail();
-    const identity = JSON.parse(readFileSync(receipt, "utf8")) as ReviewerCodexHome;
-    if (Object.keys(identity).sort().join(",") !== "capsuleDev,capsuleIno,dev,ino,root" || identity.root !== root) fail();
-    const home = privateDirectory(root);
-    const capsule = privateDirectory(dirname(root));
-    if (identity.dev !== home.dev || identity.ino !== home.ino ||
-        identity.capsuleDev !== capsule.dev || identity.capsuleIno !== capsule.ino) fail();
+    const identity = verifiedIdentity(root);
     // Atomic across adapters/processes. No auto-release, even on failure or stopSession:
     // a lack of session bookkeeping is not proof that every native descendant has exited.
     mkdirSync(join(dirname(root), "claimed"), { mode: 0o700 });
