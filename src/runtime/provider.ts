@@ -306,14 +306,18 @@ export class ProviderSessionProvisionError extends Error {
      * Narrow on purpose: provisioning may fail for exactly two reasons a caller can act on.
      *
      * `ISOLATION_LOST` is the boundary itself — no isolation proof, no egress evidence, or a
-     * non-zero exit before either could be established. `REVIEWER_SESSION_HANDSHAKE_TIMEOUT` is
-     * the reviewer answering nothing *after* that boundary was proved, which sends an operator to
-     * a different place: the credential and the provider, not the sandbox. Widening this to
-     * `ReasonCode` would let any code arrive here and leave the caller nothing to branch on.
+     * non-zero exit before either could be established. The other two are failures *after* that
+     * boundary was proved, and they send an operator somewhere else than the sandbox:
+     * `REVIEWER_SESSION_HANDSHAKE_TIMEOUT` is the reviewer answering nothing, which points at the
+     * credential and the provider; `REVIEWER_SESSION_UNREADABLE_ANSWER` is the reviewer answering
+     * in a shape with no resumable session id in it, which points at the provider's output
+     * contract. Widening this to `ReasonCode` would let any code arrive here and leave the caller
+     * nothing to branch on.
      */
     readonly reasonCode:
       | typeof ReasonCode.ISOLATION_LOST
-      | typeof ReasonCode.REVIEWER_SESSION_HANDSHAKE_TIMEOUT,
+      | typeof ReasonCode.REVIEWER_SESSION_HANDSHAKE_TIMEOUT
+      | typeof ReasonCode.REVIEWER_SESSION_UNREADABLE_ANSWER,
     message: string,
   ) {
     super(message);

@@ -436,6 +436,40 @@ if (credentialHelper) {
   }
 }
 
+// A reviewer-session failure leaves its adapter as a thrown `ProviderSessionProvisionError` and
+// reaches a caller as that error's `reasonCode`. The direct-syntax rules do not see it: a code
+// passed as a constructor argument inside `throw new ...` is neither a directly thrown value nor a
+// ternary in the thrown position, so of the three codes this class carries only the one that
+// happens to sit in a ternary was counted. Count all of them, and only when both halves of the
+// path are present — the throw that supplies the member, and a `deny` that returns the caught
+// error's `reasonCode`.
+const provisionErrorRel = "src/runtime/cli-adapters.ts";
+const provisionConsumerRel = "src/review/blind-review.ts";
+const provisionConsumerText = productionFileSet.has(provisionConsumerRel)
+  ? codeSource(read(provisionConsumerRel), true)
+  : "";
+// The catch arm that turns the thrown error back into a decision. Without it the throw reaches
+// nobody and the code has not left the module.
+const provisionDenied =
+  /\binstanceof\s+ProviderSessionProvisionError\b/.test(provisionConsumerText) &&
+  /\bdeny\(\s*\n?\s*error\.reasonCode\s*,/.test(provisionConsumerText);
+if (provisionDenied && productionFileSet.has(provisionErrorRel)) {
+  const provisionText = codeSource(read(provisionErrorRel), true);
+  for (const call of provisionText.matchAll(/throw\s+new\s+ProviderSessionProvisionError\s*\(/g)) {
+    const open = call.index + call[0].lastIndexOf("(");
+    const close = matchingClose(provisionText, open, "(", ")");
+    if (close === -1) continue;
+    const args = splitTopLevelArguments(provisionText.slice(open + 1, close));
+    // The first argument is the reason; a ternary there supplies one member per arm.
+    for (const member of (args[0] ?? "").matchAll(/ReasonCode\.([A-Z0-9_]+)/g)) {
+      recordIndirect(member[1], "thrown ProviderSessionProvisionError denied by its catcher", [
+        `${provisionErrorRel}:${lineAt(provisionText, call.index)}`,
+        provisionConsumerRel,
+      ]);
+    }
+  }
+}
+
 // SQLite trigger strings and unique-index violations originate outside TypeScript. Count a mapped
 // code only when the DDL producer, the mapping entry, and translate's acpError path all exist.
 const triggerSources = [
