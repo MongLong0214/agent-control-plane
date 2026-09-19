@@ -17,8 +17,8 @@ const aProbeThatCouldNotRunIsNotAMismatch = {
   id: "a-probe-that-could-not-run-is-not-a-mismatch",
   what: "a working directory no probe read refuses as a failed probe, never as a directory that did not match",
   file: "src/registry/canonical-self-claim.ts",
-  find: "    if (identity.cwd === null) {\n",
-  replace: "    if (false) {\n",
+  find: "  if (identity.cwd === null) {\n",
+  replace: "  if (false) {\n",
   killedBy: [
     "tests/unit/canonical-self-claim.test.ts::clause 2 — a working directory the probe never read refuses as a failed probe, not as a mismatch",
   ],

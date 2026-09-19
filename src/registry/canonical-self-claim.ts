@@ -902,6 +902,209 @@ export interface CanonicalSelfClaimDeps {
   processSignal?: (pid: number) => void;
 }
 
+/** Read-only evidence only: no owner authority, session creation or binding writes.
+ * callerPid must come from authenticated transport or a deployment-owned session pin,
+ * never a delegated request. Native UUID and executor evidence are independently read.
+ */
+export type ClaudeIdentityConfig = Omit<CanonicalSelfClaimConfig, "canonicalBuzzChannelId" | "expectedPeerProtocolVersion" | "expectedPeerIdentity">;
+export type ClaudeIdentityRequest = Pick<CanonicalSelfClaimRequest,
+  "callerPid" | "claimedPid" | "claimedSessionUuid">;
+export interface VerifiedClaudeIdentity {
+  identity: DerivedClaimantIdentity;
+  image: ExecutingImageEvidence;
+  transcript: TranscriptEvidence;
+}
+export function verifyClaudeIdentity(
+  config: ClaudeIdentityConfig, request: ClaudeIdentityRequest, deps: CanonicalSelfClaimDeps = {},
+  // Canonical claims retain their transport checks at the original ordering points.
+  // A daemon-local delegated check has no target peer connection to attest.
+  peer?: { protocolVersion: string; identity: string; expectedProtocolVersion: string; expectedIdentity: string },
+): Decision<VerifiedClaudeIdentity> {
+  const processInspector = deps.processInspector ?? defaultProcessAncestryInspector;
+  const imageInspector = deps.imageInspector ?? defaultExecutingImageInspector;
+  const transcriptReader = deps.transcriptReader ?? defaultTranscriptReader;
+  // Clause 1 — derive independently before anything the caller said is ever consulted.
+  const derived = deriveClaimantIdentity(request.callerPid, processInspector, deps.maxAncestryHops ?? MAX_ANCESTRY_HOPS);
+  if (!derived.allowed) return derived as Decision<VerifiedClaudeIdentity>;
+  const identity = derived.value;
+
+  // Clause 1 — a caller-supplied UUID/PID is checked against the derived value, never substituted.
+  if (identity.sessionUuid !== request.claimedSessionUuid.toLowerCase()) {
+    return deny(
+      ReasonCode.CONFLICT,
+      "claimed session UUID does not match the independently derived identity",
+      { claimed: request.claimedSessionUuid, derived: identity.sessionUuid },
+    );
+  }
+  if (request.claimedPid !== undefined && request.claimedPid !== identity.pid) {
+    return deny(
+      ReasonCode.CONFLICT,
+      "claimed pid does not match the derived claude ancestor process",
+      { claimed: request.claimedPid, derived: identity.pid },
+    );
+  }
+
+  // Clause 4 — same-session restore only, checked immediately after the derived identity is
+  // confirmed to match what the caller claimed, and before any of clause 2's environment checks
+  // below. Ordering matters: the transcript check a few lines down is real filesystem I/O
+  // against whatever session was actually derived, and a caller connected from a real,
+  // otherwise-legitimate claude process that simply isn't the canonical session must not reach
+  // that I/O and fail with NOT_FOUND ("no transcript exists") — a true but wrong-shaped refusal
+  // for what this block exists to name. No fallback bootstraps a new session or actor here
+  // regardless of when this runs; checking this first means a non-canonical session always fails
+  // for the reason this check names, not for whichever unrelated check happens to run first
+  // against a session this primitive was never going to adopt anyway.
+  if (identity.sessionUuid !== config.canonicalSessionUuid) {
+    return deny(
+      ReasonCode.CONFLICT,
+      "only the canonical session may be adopted by this primitive",
+      { observed: identity.sessionUuid, canonical: config.canonicalSessionUuid },
+    );
+  }
+
+  // Clause 2 — pid and process start time as a pair; a pid alone is reused (CP-HI-04).
+  if (identity.startedAt === null) {
+    return deny(
+      ReasonCode.CONFLICT,
+      "the claude ancestor's process start time could not be established",
+      { pid: identity.pid },
+    );
+  }
+  // Clause 2 — the process is an interactive CLI.
+  if (!isInteractiveClaudeInvocation(identity.argv)) {
+    return deny(
+      ReasonCode.CONFLICT,
+      "the claude ancestor is not an interactive CLI invocation",
+      { pid: identity.pid },
+    );
+  }
+  // Clause 2 — cwd. A probe that could not run is not a value that did not match (#834).
+  //
+  // These two refusals deny identically — nothing is admitted here that was refused before, and
+  // nothing that was admitted is now refused. What changes is which fact the operator is told,
+  // and that is the whole repair: the daemon's claim socket puts only the `reasonCode` on the
+  // wire (`publicClaimResponse`, src/daemon/canonical-self-claim-listener.ts), so a probe
+  // failure arriving as `CONFLICT` is indistinguishable from a genuinely wrong workdir, and it
+  // sends the operator to check a directory that was already correct. It cost most of a day.
+  //
+  // `null` here covers both shapes of "not observed": the scan could not run (`cwdProbeFailure`
+  // is non-null and names the timeout or the OS error), or it ran and reported no `cwd`
+  // descriptor (`cwdProbeFailure` is null). Neither is an observation of a different directory,
+  // so neither may be reported as one — the same distinction `CONTRACT_UNVERIFIED` draws for a
+  // pinned contract that could not be produced to compare (#448).
+  if (identity.cwd === null) {
+    return deny(
+      ReasonCode.PROBE_FAILED,
+      "the claude ancestor's working directory could not be read, so this says nothing about whether it is the canonical workdir",
+      { pid: identity.pid, probe: "lsof", probeFailure: identity.cwdProbeFailure },
+    );
+  }
+  if (identity.cwd !== config.expectedCwd) {
+    return deny(
+      ReasonCode.CONFLICT,
+      "the claude ancestor's working directory does not match the expected canonical workdir",
+      { observed: identity.cwd, expected: config.expectedCwd },
+    );
+  }
+  // Clause 2 — peer protocol.
+  if (peer && peer.protocolVersion !== peer.expectedProtocolVersion) {
+    return deny(
+      ReasonCode.CONFLICT,
+      "peer protocol version does not match the deployment's expected protocol",
+      { observed: peer.protocolVersion, expected: peer.expectedProtocolVersion },
+    );
+  }
+  // Clause 2 — target version exactly the configured required executor version, from the
+  // executing image.
+  const image = imageInspector.resolve(identity.pid);
+  // The second consumer of the same scan, and the same distinction (#834). On Darwin the
+  // executing image is reached only through `lsof`, so an lsof that times out or is missing
+  // from the daemon's PATH resolves every image to nothing — which used to refuse a genuine
+  // claim as `CONFLICT`, the exact wrong-direction diagnosis the PATH row in
+  // `scripts/falsifiability-cases/` already names as this deployment's recurring shape.
+  if (isExecutingImageProbeFailure(image)) {
+    return deny(
+      ReasonCode.PROBE_FAILED,
+      "the claude ancestor's executing image could not be scanned, so this says nothing about which image it is",
+      { pid: identity.pid, probe: "lsof", probeFailure: image.probeFailure },
+    );
+  }
+  if (!image) {
+    return deny(
+      ReasonCode.CONFLICT,
+      "the claude ancestor's executing image could not be resolved",
+      { pid: identity.pid },
+    );
+  }
+  if (image.version !== config.requiredExecutorVersion) {
+    return deny(
+      ReasonCode.CONFLICT,
+      "the claude ancestor's executing image is not the required version",
+      {
+        observedVersion: image.version,
+        requiredVersion: config.requiredExecutorVersion,
+        imagePath: image.imagePath,
+      },
+    );
+  }
+  // Clause 2 — the executing image is the exact expected artifact, not merely a file that
+  // reports the expected version. A version string (and even the resolved path alone) can be
+  // spoofed by a renamed binary with a forged adjacent manifest placed at the expected
+  // location; comparing both the realpath and a hash of the actual bytes closes that gap.
+  if (image.imagePath !== config.expectedExecutorRealpath) {
+    return deny(
+      ReasonCode.CONFLICT,
+      "the claude ancestor's executing image is not at the expected realpath",
+      { observed: image.imagePath, expected: config.expectedExecutorRealpath },
+    );
+  }
+  if (image.sha256 !== config.expectedExecutorSha256) {
+    return deny(
+      ReasonCode.CONFLICT,
+      "the claude ancestor's executing image does not hash to the expected sha256",
+      { observed: image.sha256, expected: config.expectedExecutorSha256, imagePath: image.imagePath },
+    );
+  }
+  // Clause 2 — pid/startedAt re-verified immediately after the image check. Both the ancestry
+  // walk and this image resolution did real, non-instantaneous I/O; a pid reused in between
+  // must be caught here, before the transcript check or the async Buzz boundary below run
+  // anything else against `identity.pid` as though it still names the verified process.
+  const stillLiveAfterImage = assertClaudeIdentityStillLive(identity, processInspector);
+  if (!stillLiveAfterImage.allowed) return stillLiveAfterImage as Decision<VerifiedClaudeIdentity>;
+  // Clause 2 — the transcript.
+  const transcript = transcriptReader.locate(identity.sessionUuid);
+  if (!transcript) {
+    return deny(
+      ReasonCode.NOT_FOUND,
+      "no transcript exists on disk for the derived conversational actor",
+      { sessionUuid: identity.sessionUuid },
+    );
+  }
+  // Clause 2 — the connected peer identity.
+  if (peer && peer.identity !== peer.expectedIdentity) {
+    return deny(
+      ReasonCode.CONFLICT,
+      "connected peer identity does not match the deployment's expected peer",
+      { observed: peer.identity, expected: peer.expectedIdentity },
+    );
+  }
+  return allow(ReasonCode.OK, { identity, image, transcript });
+}
+
+export function assertClaudeIdentityStillLive(
+  identity: DerivedClaimantIdentity, inspector: ProcessAncestryInspector = defaultProcessAncestryInspector,
+): Decision<true> {
+  const observed = inspector.snapshot(identity.pid)?.startedAt ?? null;
+  if (observed !== identity.startedAt) {
+    return deny(
+      ReasonCode.CONFLICT,
+      "the claimant process's start time no longer matches the identity verified earlier in this claim — its pid may have been reused",
+      { pid: identity.pid, verifiedStartedAt: identity.startedAt, observedStartedAt: observed },
+    );
+  }
+  return allow(ReasonCode.OK, true);
+}
+
 /**
  * The claim primitive (#760). Composes `SessionRegistry.create` and `BindingRegistry.bind` —
  * it mints no writer of its own for any of the five tables the mutation touches (sessions,
@@ -921,8 +1124,6 @@ export class CanonicalSelfClaim {
   readonly #imageInspector: ExecutingImageInspector;
   readonly #transcriptReader: TranscriptReader;
   readonly #maxAncestryHops: number;
-  readonly #canonicalSessionUuid: string;
-  readonly #requiredExecutorVersion: string;
   readonly #canonicalBuzzChannelId: string;
 
   constructor(
@@ -968,8 +1169,6 @@ export class CanonicalSelfClaim {
     this.#imageInspector = deps.imageInspector ?? defaultExecutingImageInspector;
     this.#transcriptReader = deps.transcriptReader ?? defaultTranscriptReader;
     this.#maxAncestryHops = deps.maxAncestryHops ?? MAX_ANCESTRY_HOPS;
-    this.#canonicalSessionUuid = config.canonicalSessionUuid;
-    this.#requiredExecutorVersion = config.requiredExecutorVersion;
     this.#canonicalBuzzChannelId = config.canonicalBuzzChannelId;
   }
 
@@ -1039,171 +1238,13 @@ export class CanonicalSelfClaim {
     const admitted = this.ownerAuthority.assertApproval(request.ownerApproval);
     if (!admitted.allowed) return admitted as Decision<CanonicalSelfClaimReceipt>;
 
-    // Clause 1 — derive independently before anything the caller said is ever consulted.
-    const derived = deriveClaimantIdentity(request.callerPid, this.#processInspector, this.#maxAncestryHops);
-    if (!derived.allowed) return derived as Decision<CanonicalSelfClaimReceipt>;
-    const identity = derived.value;
-
-    // Clause 1 — a caller-supplied UUID/PID is checked against the derived value, never substituted.
-    if (identity.sessionUuid !== request.claimedSessionUuid.toLowerCase()) {
-      return deny(
-        ReasonCode.CONFLICT,
-        "claimed session UUID does not match the independently derived identity",
-        { claimed: request.claimedSessionUuid, derived: identity.sessionUuid },
-      );
-    }
-    if (request.claimedPid !== undefined && request.claimedPid !== identity.pid) {
-      return deny(
-        ReasonCode.CONFLICT,
-        "claimed pid does not match the derived claude ancestor process",
-        { claimed: request.claimedPid, derived: identity.pid },
-      );
-    }
-
-    // Clause 4 — same-session restore only, checked immediately after the derived identity is
-    // confirmed to match what the caller claimed, and before any of clause 2's environment checks
-    // below. Ordering matters: the transcript check a few lines down is real filesystem I/O
-    // against whatever session was actually derived, and a caller connected from a real,
-    // otherwise-legitimate claude process that simply isn't the canonical session must not reach
-    // that I/O and fail with NOT_FOUND ("no transcript exists") — a true but wrong-shaped refusal
-    // for what this block exists to name. No fallback bootstraps a new session or actor here
-    // regardless of when this runs; checking this first means a non-canonical session always fails
-    // for the reason this check names, not for whichever unrelated check happens to run first
-    // against a session this primitive was never going to adopt anyway.
-    if (identity.sessionUuid !== this.#canonicalSessionUuid) {
-      return deny(
-        ReasonCode.CONFLICT,
-        "only the canonical session may be adopted by this primitive",
-        { observed: identity.sessionUuid, canonical: this.#canonicalSessionUuid },
-      );
-    }
-
-    // Clause 2 — pid and process start time as a pair; a pid alone is reused (CP-HI-04).
-    if (identity.startedAt === null) {
-      return deny(
-        ReasonCode.CONFLICT,
-        "the claude ancestor's process start time could not be established",
-        { pid: identity.pid },
-      );
-    }
-    // Clause 2 — the process is an interactive CLI.
-    if (!isInteractiveClaudeInvocation(identity.argv)) {
-      return deny(
-        ReasonCode.CONFLICT,
-        "the claude ancestor is not an interactive CLI invocation",
-        { pid: identity.pid },
-      );
-    }
-    // Clause 2 — cwd. A probe that could not run is not a value that did not match (#834).
-    //
-    // These two refusals deny identically — nothing is admitted here that was refused before, and
-    // nothing that was admitted is now refused. What changes is which fact the operator is told,
-    // and that is the whole repair: the daemon's claim socket puts only the `reasonCode` on the
-    // wire (`publicClaimResponse`, src/daemon/canonical-self-claim-listener.ts), so a probe
-    // failure arriving as `CONFLICT` is indistinguishable from a genuinely wrong workdir, and it
-    // sends the operator to check a directory that was already correct. It cost most of a day.
-    //
-    // `null` here covers both shapes of "not observed": the scan could not run (`cwdProbeFailure`
-    // is non-null and names the timeout or the OS error), or it ran and reported no `cwd`
-    // descriptor (`cwdProbeFailure` is null). Neither is an observation of a different directory,
-    // so neither may be reported as one — the same distinction `CONTRACT_UNVERIFIED` draws for a
-    // pinned contract that could not be produced to compare (#448).
-    if (identity.cwd === null) {
-      return deny(
-        ReasonCode.PROBE_FAILED,
-        "the claude ancestor's working directory could not be read, so this says nothing about whether it is the canonical workdir",
-        { pid: identity.pid, probe: "lsof", probeFailure: identity.cwdProbeFailure },
-      );
-    }
-    if (identity.cwd !== this.config.expectedCwd) {
-      return deny(
-        ReasonCode.CONFLICT,
-        "the claude ancestor's working directory does not match the expected canonical workdir",
-        { observed: identity.cwd, expected: this.config.expectedCwd },
-      );
-    }
-    // Clause 2 — peer protocol.
-    if (request.peerProtocolVersion !== this.config.expectedPeerProtocolVersion) {
-      return deny(
-        ReasonCode.CONFLICT,
-        "peer protocol version does not match the deployment's expected protocol",
-        { observed: request.peerProtocolVersion, expected: this.config.expectedPeerProtocolVersion },
-      );
-    }
-    // Clause 2 — target version exactly the configured required executor version, from the
-    // executing image.
-    const image = this.#imageInspector.resolve(identity.pid);
-    // The second consumer of the same scan, and the same distinction (#834). On Darwin the
-    // executing image is reached only through `lsof`, so an lsof that times out or is missing
-    // from the daemon's PATH resolves every image to nothing — which used to refuse a genuine
-    // claim as `CONFLICT`, the exact wrong-direction diagnosis the PATH row in
-    // `scripts/falsifiability-cases/` already names as this deployment's recurring shape.
-    if (isExecutingImageProbeFailure(image)) {
-      return deny(
-        ReasonCode.PROBE_FAILED,
-        "the claude ancestor's executing image could not be scanned, so this says nothing about which image it is",
-        { pid: identity.pid, probe: "lsof", probeFailure: image.probeFailure },
-      );
-    }
-    if (!image) {
-      return deny(
-        ReasonCode.CONFLICT,
-        "the claude ancestor's executing image could not be resolved",
-        { pid: identity.pid },
-      );
-    }
-    if (image.version !== this.#requiredExecutorVersion) {
-      return deny(
-        ReasonCode.CONFLICT,
-        "the claude ancestor's executing image is not the required version",
-        {
-          observedVersion: image.version,
-          requiredVersion: this.#requiredExecutorVersion,
-          imagePath: image.imagePath,
-        },
-      );
-    }
-    // Clause 2 — the executing image is the exact expected artifact, not merely a file that
-    // reports the expected version. A version string (and even the resolved path alone) can be
-    // spoofed by a renamed binary with a forged adjacent manifest placed at the expected
-    // location; comparing both the realpath and a hash of the actual bytes closes that gap.
-    if (image.imagePath !== this.config.expectedExecutorRealpath) {
-      return deny(
-        ReasonCode.CONFLICT,
-        "the claude ancestor's executing image is not at the expected realpath",
-        { observed: image.imagePath, expected: this.config.expectedExecutorRealpath },
-      );
-    }
-    if (image.sha256 !== this.config.expectedExecutorSha256) {
-      return deny(
-        ReasonCode.CONFLICT,
-        "the claude ancestor's executing image does not hash to the expected sha256",
-        { observed: image.sha256, expected: this.config.expectedExecutorSha256, imagePath: image.imagePath },
-      );
-    }
-    // Clause 2 — pid/startedAt re-verified immediately after the image check. Both the ancestry
-    // walk and this image resolution did real, non-instantaneous I/O; a pid reused in between
-    // must be caught here, before the transcript check or the async Buzz boundary below run
-    // anything else against `identity.pid` as though it still names the verified process.
-    const stillLiveAfterImage = this.#assertClaimantStillLive(identity);
-    if (!stillLiveAfterImage.allowed) return stillLiveAfterImage as Decision<CanonicalSelfClaimReceipt>;
-    // Clause 2 — the transcript.
-    const transcript = this.#transcriptReader.locate(identity.sessionUuid);
-    if (!transcript) {
-      return deny(
-        ReasonCode.NOT_FOUND,
-        "no transcript exists on disk for the derived conversational actor",
-        { sessionUuid: identity.sessionUuid },
-      );
-    }
-    // Clause 2 — the connected peer identity.
-    if (request.peerIdentity !== this.config.expectedPeerIdentity) {
-      return deny(
-        ReasonCode.CONFLICT,
-        "connected peer identity does not match the deployment's expected peer",
-        { observed: request.peerIdentity, expected: this.config.expectedPeerIdentity },
-      );
-    }
+    const verified = verifyClaudeIdentity(this.config, request, {
+      processInspector: this.#processInspector, imageInspector: this.#imageInspector,
+      transcriptReader: this.#transcriptReader, maxAncestryHops: this.#maxAncestryHops,
+    }, { protocolVersion: request.peerProtocolVersion, identity: request.peerIdentity,
+      expectedProtocolVersion: this.config.expectedPeerProtocolVersion, expectedIdentity: this.config.expectedPeerIdentity });
+    if (!verified.allowed) return verified;
+    const { identity, image, transcript } = verified.value;
     // A real comparison against the one channel this deployment names, never a decorative
     // pass-through.
     if (request.buzzChannelId !== this.#canonicalBuzzChannelId) {
@@ -1243,15 +1284,7 @@ export class CanonicalSelfClaim {
    * not against a real kernel lookup for a pid that was never real to begin with.
    */
   #assertClaimantStillLive(identity: DerivedClaimantIdentity): Decision<true> {
-    const observed = this.#processInspector.snapshot(identity.pid)?.startedAt ?? null;
-    if (observed !== identity.startedAt) {
-      return deny(
-        ReasonCode.CONFLICT,
-        "the claimant process's start time no longer matches the identity verified earlier in this claim — its pid may have been reused",
-        { pid: identity.pid, verifiedStartedAt: identity.startedAt, observedStartedAt: observed },
-      );
-    }
-    return allow(ReasonCode.OK, true);
+    return assertClaudeIdentityStillLive(identity, this.#processInspector);
   }
 
   /**
