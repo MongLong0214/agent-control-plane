@@ -46,7 +46,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { collapseTrailerParagraphs } from "./lib/collapse-trailer-paragraphs.mjs";
 import { RECORD_TRAILER_KEY_PATTERN } from "./lib/record-trailer-keys.mjs";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -100,17 +99,20 @@ try {
   fail("could not inherit the branch's records onto the merge message.");
 }
 
-// The tool that inherits the records writes them as one paragraph per source commit, which git
-// stores only the last of. Collapsed here, before the check below is asked whether git will keep
-// what results.
-writeFileSync(draft, collapseTrailerParagraphs(readFileSync(draft, "utf8")));
+// CommitLore 1.5.0 owns the record boundaries. Joining its paragraphs corrupts
+// singleton cardinality even though Git's final-paragraph parser accepts it.
+// Freeze the official bytes before validation and body extraction.
+const expected = `${draft}.official`;
+writeFileSync(expected, readFileSync(draft));
 
-// 3. What results, against git's own parser, before it becomes a commit nobody may rewrite.
+// 3. Semantic validity and byte preservation are separate from Git trailer parsing.
 try {
-  process.stdout.write(run("node", ["scripts/verify-trailers-are-parsable.mjs", "--message-file", draft]));
+  run("commitlore", ["validate", "--message-file", draft]);
+  process.stdout.write(run("node", ["scripts/verify-trailers-are-parsable.mjs", "--message-file", draft,
+    "--expected-message-file", expected]));
 } catch (error) {
   process.stdout.write(String(error.stdout ?? ""));
-  fail("the merge message carries a trailer git will not store. Fix it here; after the merge it is history.");
+  fail("the merge message violates record semantics or preservation. Refusing before it becomes history.");
 }
 
 const composed = readFileSync(draft, "utf8");
