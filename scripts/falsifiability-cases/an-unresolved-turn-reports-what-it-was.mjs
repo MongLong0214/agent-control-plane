@@ -14,8 +14,12 @@ const anUnresolvedTurnReportsWhatItWas = {
   id: "an-unresolved-turn-reports-what-it-was",
   what: "unresolvedTurns carries each outstanding turn's admitted payload, so what was lost can be named rather than only counted",
   file: "src/ingress/ingress-guard.ts",
-  find: "      payload: admittedPayload(row.payload_json),\n",
-  replace: "      payload: null,\n",
+  // Anchored with the line below it, because `pendingOwnerMessages` (#631) reads the same
+  // column through the same helper and the bare line now matches in two places. A row that
+  // matches twice is not about one guard, and `guards:anchors` refuses it rather than letting
+  // the mutation land wherever the search happened to stop.
+  find: "      payload: admittedPayload(row.payload_json),\n      ...normalizeStoredTurnClaim(",
+  replace: "      payload: null,\n      ...normalizeStoredTurnClaim(",
   killedBy: [
     "tests/process/an-owner-message-outlives-the-process-that-lost-its-turn.test.ts::holds Telegram's copy when restart finds an unresolved governed turn",
   ],

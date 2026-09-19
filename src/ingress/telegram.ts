@@ -11,6 +11,7 @@ import {
   type TurnClaim,
   type TurnIdentity,
   type UnresolvedTurn,
+  type ParkedOwnerMessage,
   type OwnerApprovalIngress,
 } from "./ingress-guard.ts";
 
@@ -352,6 +353,22 @@ export class TelegramIngress {
    */
   unresolvedTurns(sessionDigest: string): readonly UnresolvedTurn[] {
     return this.guard.unresolvedTurns("telegram", sessionDigest);
+  }
+
+  /**
+   * Notes that a message was parked rather than run, so the next claim on this chat can take it.
+   *
+   * Keyed by the turn identity's `sessionDigest`, which the caller has already computed for the
+   * unresolved-turn lookup on the same route -- the conversation identity this repository already
+   * has, rather than a second one. See `IngressGuard.parkForBatch`.
+   */
+  parkForBatch(update: TelegramUpdate, sessionDigest: string): void {
+    this.guard.parkForBatch(this.nonceFor(update), sessionDigest);
+  }
+
+  /** Every message parked for this conversation and not yet claimed, oldest first. */
+  pendingOwnerMessages(sessionDigest: string): readonly ParkedOwnerMessage[] {
+    return this.guard.pendingOwnerMessages(sessionDigest);
   }
 
   /** The no-reply counterpart: a claimed turn whose handler decided not to reply (#672). */
