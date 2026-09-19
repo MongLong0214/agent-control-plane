@@ -63,6 +63,11 @@ import {
 } from "../ingress/telegram-polling.ts";
 import type { TelegramDirectAnswer } from "../ingress/telegram-router.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
+import {
+  CEO_SELF_BOOTSTRAP_VARS,
+  readCeoLineagePin,
+  resolveCeoSelfBootstrapDescriptor,
+} from "../bootstrap/ceo-self-bootstrap.ts";
 import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
 import { createCtoMcpPort, createCtoServer } from "../mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../mcp/hermes-server.ts";
@@ -2719,6 +2724,59 @@ export interface AgentcpdMainContext {
  * Intended to run under a process supervisor (`launchd` on macOS). The daemon owns the
  * single-instance lock, restart reconciliation, the watchdog timer and Buzz delivery.
  */
+/**
+ * Fills the CEO role when it stands empty, using the authority this process already holds.
+ *
+ * `bootstrap.hermes` is the only door that fills it, and this process constructs that authority
+ * and then hands it to the operator socket without ever calling it — so the human in that loop was
+ * carrying values, not making a decision. Measured 2026-09-20: `ACTIVE assignments` 0 rows for two
+ * days while the Buzz project room, #246, #512 and repo-factory#19 all waited on that one binding.
+ *
+ * Every refusal reports and returns. A deployment with no CEO must stay up, because staying up is
+ * how it gets one — parking behind the coordinator that would bind the role is the shape #950,
+ * #958 and #974 removed.
+ *
+ * The lineage digest is pinned on first use and asserted afterwards, never taken from whatever
+ * answers this time: an expectation the subject supplies is not an expectation.
+ */
+const bindCeoIfRoleStandsEmpty = async (
+  cp: ControlPlane,
+  stateDir: string,
+  bootstrap: HermesBootstrapAuthority | null,
+  authorityHeld: () => boolean,
+): Promise<void> => {
+  const say = (line: string): void => void process.stdout.write(`ceo self-bootstrap: ${line}\n`);
+  if (!bootstrap) return say("bootstrap authority is not constructed; skipping");
+  if (!authorityHeld()) return say("this process does not hold the daemon lock; skipping");
+  if (cp.bindings.active(roleKeyFor(Role.CEO))) return say("a CEO is already bound; nothing to do");
+
+  const descriptor = resolveCeoSelfBootstrapDescriptor(process.env);
+  if (!descriptor.allowed) return say(`refused: ${descriptor.message}`);
+  if (!descriptor.value) {
+    // Named variables only. No value, secret or otherwise, is ever in this line.
+    return say(`disabled: none of ${CEO_SELF_BOOTSTRAP_VARS.join(", ")} is set`);
+  }
+
+  const pin = readCeoLineagePin(stateDir);
+  if (!pin.allowed) return say(`refused: ${pin.message}`);
+  const expectedLineageRootDigest = pin.value?.lineageRootDigest ?? "";
+
+  const result = await bootstrap.bootstrap({
+    command: [...descriptor.value.command],
+    targetBindExecutable: descriptor.value.targetBindExecutable,
+    hermesProfile: descriptor.value.hermesProfile,
+    hermesHome: descriptor.value.hermesHome,
+    requestedSessionId: `ceo-${randomUUID()}`,
+    expectedLineageRootDigest,
+    executorRuntimeIdentity:
+      pin.value?.executorRuntimeIdentity ?? descriptor.value.executorRuntimeIdentity,
+  });
+  if (!result.allowed) return say(`did not bind: ${result.reasonCode} ${result.message}`);
+
+  const bound = result.value as { bindingGeneration?: number };
+  say(`bound the CEO at generation ${String(bound.bindingGeneration ?? "?")}`);
+};
+
 export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => {
   // Classify the complete environment-only group before reading config or acquiring resources.
   // Blank values are absent; nonblank values are retained exactly for the claim boundary.
@@ -2931,6 +2989,18 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         bootstrapHermes: (params) => hermesBootstrap!.bootstrap(params),
       },
     );
+    // The CEO role standing empty is not a state a human has to carry values through.
+    //
+    // `bootstrap.hermes` is the only door that fills it, and this process already holds the
+    // authority behind that door — it constructs `hermesBootstrap` above and then hands it to the
+    // operator socket without ever calling it. Measured on this deployment 2026-09-20: `ACTIVE
+    // assignments` 0 rows for two days while every downstream blocker waited on that one binding.
+    //
+    // Failure here never parks the daemon. A deployment with no CEO can still do everything that
+    // is not a run, and parking behind the coordinator that would bind the role is the shape
+    // #950, #958 and #974 removed. It reports and keeps running.
+    await bindCeoIfRoleStandsEmpty(cp, stateDir, hermesBootstrap, () => daemon.lock.held());
+
     if (canonicalActivationPresentCount === 0) {
       // Disabled: no partial credential surface is exposed, no socket is bound, and normal
       // startup continues exactly as it would for a deployment that has never heard of this
