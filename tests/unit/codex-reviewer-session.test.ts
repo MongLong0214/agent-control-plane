@@ -140,7 +140,12 @@ describe("Codex provider-issued reviewer sessions", () => {
     const adapter = makeAdapter(credentialDir);
 
     const rejectedSession = rejectedAdapter.startSession(spec);
-    await expect(rejectedSession).rejects.toMatchObject({ reasonCode: ReasonCode.ISOLATION_LOST });
+    // Not `ISOLATION_LOST`: this reviewer was isolated, exited 0 and did not time out — it
+    // answered, and the answer carried a local/session_id field instead of a `thread.started`
+    // event, so there is nothing to resume. #969.
+    await expect(rejectedSession).rejects.toMatchObject({
+      reasonCode: ReasonCode.REVIEWER_SESSION_UNREADABLE_ANSWER,
+    });
     await expect(rejectedSession).rejects.toThrow("provider thread id");
     expect(providerCalls).toHaveLength(1);
 
@@ -234,6 +239,21 @@ describe("a reviewer that was isolated and then did not answer", () => {
       reasonCode: ReasonCode.REVIEWER_SESSION_HANDSHAKE_TIMEOUT,
     });
     await expect(started).rejects.toThrow("timed out");
+  });
+
+  it("is an unreadable answer when the reviewer replies with no resumable session id", async () => {
+    // The third state at the same throw. Everything above it passed — isolation proved, exit 0,
+    // no timeout — so the reviewer answered; the answer simply had no `thread.started` carrying a
+    // `thread_id`. That is the provider's output contract, not the sandbox.
+    const started = startWith({
+      ...timedOutHandshake(),
+      timedOut: false,
+      stdout: '{"type":"thread.completed","session_id":"local-only-id"}',
+    });
+    await expect(started).rejects.toMatchObject({
+      reasonCode: ReasonCode.REVIEWER_SESSION_UNREADABLE_ANSWER,
+    });
+    await expect(started).rejects.toThrow("provider thread id");
   });
 
   it("still calls a non-zero exit lost isolation, so the split is a split and not a rename", async () => {

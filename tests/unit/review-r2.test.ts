@@ -274,6 +274,24 @@ class HandshakeTimeoutGptAdapter extends TestProductionAdapter {
   }
 }
 
+/**
+ * A GPT reviewer that answered its identity handshake in a shape with no resumable session id.
+ *
+ * The third of the three ways `startPacketReviewerSession` can fail after proving isolation, and
+ * the last one that was reported as lost isolation. #969.
+ */
+class UnreadableAnswerGptAdapter extends TestProductionAdapter {
+  readonly supportsReviewerIsolation = true;
+  readonly requiresReviewerProviderSessionProof = true;
+
+  override async startSession(_spec: SessionSpec): Promise<never> {
+    throw new ProviderSessionProvisionError(
+      ReasonCode.REVIEWER_SESSION_UNREADABLE_ANSWER,
+      "Codex did not report a provider thread id for the packet reviewer session",
+    );
+  }
+}
+
 const gateWithReviewerPreferences = (
   setup: Awaited<ReturnType<typeof prepareReviewedInputs>>,
   preferred: TestProductionAdapter,
@@ -878,6 +896,31 @@ describe("round-2 blind-review regressions", () => {
     expect(result.message).not.toContain("isolation could not be proved");
     // The P0-07 property, unchanged: a reviewer that could not run does not become a successful
     // review by another provider, and no fallback is recorded.
+    expect(fallback.invocations).toHaveLength(0);
+    expect(setup.harness.cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toHaveLength(0);
+  });
+
+  it("names an unreadable answer as one, and still refuses to fall back", async () => {
+    // The same two properties the timeout row pins, for the reason that was still wearing
+    // `ISOLATION_LOST`: the report must send an operator to the provider's output contract rather
+    // than to the sandbox, and the mandatory GPT gate must stay exactly as mandatory.
+    const setup = await prepareReviewedInputs();
+    const preferred = new UnreadableAnswerGptAdapter(setup.harness.clock, "gpt");
+    const fallback = new TestProductionAdapter(setup.harness.clock, "claude");
+    fallback.script({
+      match: /Candidate review/,
+      text: reviewerPass([`${setup.identity}:src/app.js`]),
+    });
+    setup.harness.cp.providers.register(preferred);
+    setup.harness.cp.providers.register(fallback);
+
+    const result = await invokeGate(gateWithReviewerPreferences(setup, preferred, fallback), setup);
+
+    expect(result.allowed).toBe(false);
+    if (result.allowed) throw new Error("expected the gate to deny a reviewer with no session id");
+    expect(result.reasonCode).toBe(ReasonCode.REVIEWER_SESSION_UNREADABLE_ANSWER);
+    expect(result.message).toContain("without a resumable session id");
+    expect(result.message).not.toContain("isolation could not be proved");
     expect(fallback.invocations).toHaveLength(0);
     expect(setup.harness.cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toHaveLength(0);
   });

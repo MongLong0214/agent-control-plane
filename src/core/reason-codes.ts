@@ -114,6 +114,16 @@ export const ReasonCode = {
    * for a reviewer — at which point a claim is permanent whether or not the run succeeds.
    */
   PACKET_REVIEWER_SCOPE_UNAVAILABLE: "PACKET_REVIEWER_SCOPE_UNAVAILABLE",
+  /**
+   * The reviewer answered its identity handshake in a shape this adapter cannot read.
+   *
+   * The third state at one throw, and the last one still wearing `ISOLATION_LOST`. Reaching it
+   * means isolation was proved, the process exited 0 and did not time out — so the reviewer
+   * *answered*; what failed is that no `thread.started` event carrying a `thread_id` was in the
+   * output, and without one the session cannot be resumed. Calling that lost isolation sends an
+   * operator to the sandbox for what is a provider whose output shape moved.
+   */
+  REVIEWER_SESSION_UNREADABLE_ANSWER: "REVIEWER_SESSION_UNREADABLE_ANSWER",
   VERIFICATION_GAP: "VERIFICATION_GAP",
 
   // --- run lifecycle -------------------------------------------------------

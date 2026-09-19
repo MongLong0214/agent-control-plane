@@ -2066,8 +2066,14 @@ export class CodexCliAdapter implements ProviderAdapter {
     }
     const providerSessionId = codexThreadId(result.stdout);
     if (!providerSessionId) {
+      // The third state at this handshake, and the last one that was wearing `ISOLATION_LOST`.
+      // Everything above has already passed: isolation proved, egress evidence present, exit 0,
+      // no timeout. So the reviewer answered — the answer simply carried no `thread.started`
+      // event with a `thread_id`, and without one there is nothing to resume. That is the
+      // provider's output contract, not the sandbox, and #967 measured what the wrong name
+      // costs: an operator auditing a seatbelt profile while the real fault sits elsewhere.
       throw new ProviderSessionProvisionError(
-        ReasonCode.ISOLATION_LOST,
+        ReasonCode.REVIEWER_SESSION_UNREADABLE_ANSWER,
         "Codex did not report a provider thread id for the packet reviewer session",
       );
     }

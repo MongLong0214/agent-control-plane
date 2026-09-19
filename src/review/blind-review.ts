@@ -170,6 +170,22 @@ const reviewPacketDigest = (request: BlindReviewRequest): string =>
  * There is no operation on any agent-facing surface that requests, skips or overrides
  * it: `manualInvocation` exists solely to return the denial (§18.2).
  */
+/**
+ * One sentence per way provisioning a reviewer session can fail, keyed by the error's own union.
+ *
+ * Total by construction: `Record<ProviderSessionProvisionError["reasonCode"], string>` cannot be
+ * satisfied while a member has no sentence, so the next reason to arrive here is a compile error
+ * rather than a run that silently reports the wrong one. That is what replaced the ternary chain
+ * — the chain had a default, and a default is where an unnamed reason goes to be misreported.
+ */
+const REVIEWER_SESSION_FAILURE_MESSAGES: Record<ProviderSessionProvisionError["reasonCode"], string> = {
+  [ReasonCode.ISOLATION_LOST]: "preferred reviewer isolation could not be proved",
+  [ReasonCode.REVIEWER_SESSION_HANDSHAKE_TIMEOUT]:
+    "preferred reviewer was isolated and did not answer its identity handshake",
+  [ReasonCode.REVIEWER_SESSION_UNREADABLE_ANSWER]:
+    "preferred reviewer answered its identity handshake without a resumable session id",
+};
+
 export class BlindReviewGate {
   readonly #pipelineCapability = Symbol("blind-review-control-plane");
   #capacity: BlindReviewCapacityGate | null = null;
@@ -491,17 +507,16 @@ export class BlindReviewGate {
         // back to Claude here would hide a broken mandatory GPT gate behind a successful
         // alternate review, which is exactly the P0-07 failure mode.
         if (error instanceof ProviderSessionProvisionError) {
-          // The message follows the reason rather than assuming it. Every
-          // `ProviderSessionProvisionError` used to be reported as unproven isolation, including a
-          // handshake that timed out *after* the adapter had already verified `isolationEnforced`
-          // and the egress evidence — see `startPacketReviewerSession`. An operator reading
-          // "isolation could not be proved" about a reviewer that simply did not answer audits the
-          // sandbox and never looks at the credential, which is exactly what #512 produced.
+          // The message follows the reason rather than assuming it, through a total map rather
+          // than a chain of ternaries: every `ProviderSessionProvisionError` used to be reported
+          // as unproven isolation, and each time a reason is added the chain's default silently
+          // reclaims it. A `Record` keyed by the error's own union has no default to fall into —
+          // adding a member without its sentence is a type error, which is the property that
+          // matters here. An operator reading "isolation could not be proved" about a reviewer
+          // that answered audits the sandbox and never looks at the provider (#512, #967).
           return deny(
             error.reasonCode,
-            error.reasonCode === ReasonCode.REVIEWER_SESSION_HANDSHAKE_TIMEOUT
-              ? "preferred reviewer was isolated and did not answer its identity handshake"
-              : "preferred reviewer isolation could not be proved",
+            REVIEWER_SESSION_FAILURE_MESSAGES[error.reasonCode],
             {
               runId,
               provider: preference.provider,
