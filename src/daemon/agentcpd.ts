@@ -80,6 +80,8 @@ import type { AuthenticatedOperatorPeer, Daemon } from "./daemon.ts";
 import { executeCanonicalSelfClaimOperator } from "./canonical-self-claim-operator.ts";
 import { startCanonicalSelfClaimListener, type CanonicalSelfClaimListener } from "./canonical-self-claim-listener.ts";
 import { readOneJsonLineRequest } from "./local-socket-framing.ts";
+import { daemonCtoBindingRuntime, type CtoBindingRuntime } from "./cto-binding-runtime.ts";
+import { CtoBindingDelegation } from "../ceo/cto-binding-delegation.ts";
 
 /**
  * The bound on one message: the bytes of a single line, terminator excluded, measured after the
@@ -286,6 +288,8 @@ export interface LocalOperatorCredential {
 }
 
 export interface LocalOperatorSocketOptions {
+  ctoBinding?: CtoBindingRuntime;
+  approveCtoDelegate?: (params: Record<string, unknown>) => Decision<unknown>;
   handshakeTimeoutMs?: number;
   /** Execution budget for an authenticated method, distinct from the handshake budget. */
   requestTimeoutMs?: number;
@@ -430,6 +434,7 @@ export const startLocalMcpListeners = async (
   // transport still needs `cp` to authenticate a socket, but a tool cannot turn that into
   // raw database access or evidence-write authority (#352).
   const hermesPort = createHermesMcpPort(cp, { onCeoApproved: options.onCeoApproved });
+  const ctoBinding = daemonCtoBindingRuntime(cp);
   const ctoPort = createCtoMcpPort(cp);
   const ceoConversation = options.ceoConversation ?? new CeoConversationPort();
   /*
@@ -464,8 +469,25 @@ export const startLocalMcpListeners = async (
     cp,
     [Role.CEO],
     handshakeTimeoutMs,
-    (auth) => {
+    (auth, _opening, credential) => {
       const server = createHermesServer(hermesPort, auth);
+      server.registerTool("cto_binding_bind", {
+        description: "Bind or replace a proven-dead CTO under an existing owner delegation. Restart revokes grants; stale retries are refused.",
+        inputSchema: { request: z.record(z.unknown()) },
+      }, async ({ request }) => {
+        try {
+          const peer = auth();
+          const decision = peer.allowed ? ctoBinding.bind(credential, request) : peer;
+          // Internal composition may return an exception as a denial instead of throwing.
+          return respond(!decision.allowed && decision.reasonCode === ReasonCode.INTERNAL_ERROR
+            ? deny(ReasonCode.INTERNAL_ERROR, "CTO binding request failed", {})
+            : decision);
+        } catch {
+          // Do not inspect/log the exception: even its message, code or getters may
+          // contain private deployment data. Cover authentication and serialization too.
+          return respond(deny(ReasonCode.INTERNAL_ERROR, "CTO binding request failed", {}));
+        }
+      });
       // The authenticator travels with the connection, not just the server. Reaching this line
       // proves the peer held the CEO binding at handshake; `ask` re-runs `auth` so a socket
       // that outlives its binding cannot keep receiving the owner.
@@ -1119,6 +1141,57 @@ export const assertBuzzChannelMatchesSubscriberRooms = (
  * incarnation before the daemon applies the per-method lock/authority checks. The MCP token
  * is never accepted here: it is shared deployment authentication, not operator identity.
  */
+export const startDaemonOperatorSocket = (
+  cp: ControlPlane,
+  daemon: Pick<Daemon, "handleOperatorRequest" | "lock">,
+  stateDir: string,
+  credential: LocalOperatorCredential,
+  options: Omit<LocalOperatorSocketOptions, "ctoBinding"> = {},
+): Promise<LocalOperatorListener> => {
+  // Possession of the deployment operator bearer is not owner authority. Restoring
+  // an existing CEO actor transfers its identity and issues a new session secret,
+  // so admit only the server-configured CLI owner before the bootstrap authority
+  // derives a restoration target or launches either caller-selected executable.
+  // Never take channel/actor/owner claims from the request body or peerId text.
+  const operatorActor = credential.actor.trim();
+  const bootstrap = options.bootstrapHermes;
+  const nativeDelegation = new CtoBindingDelegation(cp.sessions, cp.bindings, cp.ownerAuthority, cp.audit, cp.clock, cp.db);
+  return startOperatorSocket(daemon, stateDir, credential, {
+    ...options,
+    ...(bootstrap ? { bootstrapHermes: (params: Record<string, unknown>) => {
+      if (cp.bindings.history(Role.CEO).length > 0 &&
+          !cp.ownerAuthority.isAllowedActor("cli", operatorActor)) {
+        return Promise.resolve(deny(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED,
+          "restoring CEO authority requires an allowlisted CLI owner", {}));
+      }
+      return bootstrap(params);
+    } } : {}),
+    ctoBinding: daemonCtoBindingRuntime(cp),
+    approveCtoDelegate: (params) => {
+      if (!cp.ownerAuthority.isAllowedActor("cli", operatorActor)) return deny(
+        ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED, "CTO delegation requires an allowlisted CLI owner", {});
+      const text = z.string().min(1).max(256).regex(/^[\x21-\x7e]+$/);
+      const parsed = z.object({ requestId: z.string().uuid(), scope: z.object({
+        projectId: text, role: z.literal("PRIMARY_CTO"), action: z.literal("bind-or-rebind"),
+        ceoActorId: text, ceoSessionId: text, ceoIncarnation: text,
+        expiresAt: z.string().datetime(), revokePolicy: z.literal("owner-or-ceo-loss"),
+      }).strict() }).strict().safeParse(params);
+      if (!parsed.success || Date.parse(parsed.data.scope.expiresAt) <= cp.clock.now().getTime()) return deny(
+        ReasonCode.INVALID_ARGUMENT, "invalid native CTO delegation scope", {});
+      const { scope, requestId } = parsed.data;
+      const approval = { operation: "ctoBinding.delegate", parameters: scope, runId: null,
+        candidateSnapshotDigest: null, idempotencyKey: requestId, approved: true };
+      // The delegation authority owns admission + consumption, not an external tx.
+      return nativeDelegation.grantWithAdmission(scope, () => {
+        const guard = new IngressGuard(cp.db, cp.clock, cp.audit, { cli: { allowedActors: [operatorActor] } });
+        return guard.admitOwnerApproval({ channel: "cli", actor: operatorActor,
+          nonce: requestId, payload: { type: "OWNER_APPROVAL", runId: null, candidateSnapshotDigest: null,
+            operation: approval.operation, parameterDigest: digestOf(scope), idempotencyKey: requestId, approved: true } }, approval);
+      });
+    },
+  });
+};
+
 export const startOperatorSocket = async (
   daemon: Pick<Daemon, "handleOperatorRequest" | "lock">,
   stateDir: string,
@@ -1354,6 +1427,24 @@ const serveOperatorRequest = (
       // Leaving the handshake timer armed made every method slower than five seconds report that
       // the operator had not authenticated, which they had.
       beginRequest(method ?? "<none>");
+      if (method === "ctoBinding.approveAndDelegate") {
+        if (!daemon.lock.held()) return finish(deny(ReasonCode.DAEMON_LOCK_LOST, "daemon lock is not held", {}));
+        const params = operatorRequestParams(value);
+        if (!params || !options.approveCtoDelegate) return finish(deny(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED, "native delegation unavailable", {}));
+        try { return finish(options.approveCtoDelegate(params)); }
+        catch { return finish(deny(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, "delegation refused", {})); }
+      }
+      if (method === "ctoBinding.delegate" || method === "ctoBinding.revoke") {
+        if (!options.ctoBinding) return finish(deny(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED, "CTO delegation is unavailable", {}));
+        if (!daemon.lock.held()) return finish(deny(ReasonCode.DAEMON_LOCK_LOST, "daemon lock is not held", {}));
+        const params = operatorRequestParams(value);
+        if (!params) return finish(deny(ReasonCode.INVALID_ARGUMENT, "invalid delegation parameters", {}));
+        try {
+          return finish(method === "ctoBinding.delegate"
+            ? options.ctoBinding.grant(params.scope, params.receipt)
+            : options.ctoBinding.revoke(typeof params.delegationId === "string" ? params.delegationId : "", params.receipt));
+        } catch { return finish(deny(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, "delegation refused", {})); }
+      }
       if (method === "bootstrap.hermes") {
         if (!options.bootstrapHermes) {
           return finish(deny(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED, "Hermes bootstrap is not enabled on this socket", {}));
@@ -2918,7 +3009,8 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     });
     // The operator socket is opened first so the uninitialized-only bootstrap door can be
     // reached without exposing a normal Hermes listener that has no bound peer yet.
-    operator = await startOperatorSocket(
+    operator = await startDaemonOperatorSocket(
+      cp,
       daemon,
       stateDir,
       {

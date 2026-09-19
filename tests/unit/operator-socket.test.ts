@@ -752,7 +752,8 @@ describe("authenticated operator socket (#393/#405)", () => {
     // Capability issuance remains a daemon composition concern; the client only serializes
     // plain operator requests and can never obtain the private completion/evidence tokens.
     expect(source).not.toMatch(/issueCompletionAuthorities|issueEvidenceWriters|daemonFinalizationAuthorities/);
-    expect(daemonSource).toMatch(/operator = await startOperatorSocket\(/);
+    // Production must use the owner-gated composition, not the lower-level socket.
+    expect(daemonSource).toMatch(/operator = await startDaemonOperatorSocket\(/);
     expect(daemonSource).toMatch(/ACP_OPERATOR_TOKEN is required/);
     expect(daemonSource).not.toMatch(/ACP_OPERATOR_TOKEN[^\n]*\|\|\s*mcpToken/);
     expect(daemonSource).toMatch(/await operator\?\.close\(\)/);

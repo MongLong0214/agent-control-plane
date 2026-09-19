@@ -4,6 +4,7 @@ import { canonicalJson, digestOf, isDigest } from "../core/digest.ts";
 import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { newAssignmentId } from "../core/ids.ts";
 import { processStartedAt } from "../core/process-identity.ts";
+import { probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
@@ -116,6 +117,8 @@ export interface BindInput {
   verifiedTarget?: VerifiedTargetBinding;
   /** Authenticated successor to `verifiedTarget`; legacy callers remain compatible. */
   authenticatedTarget?: AuthenticatedTargetBinding;
+  /** Owner-bootstrap-only restoration of an existing, revoked CEO; never a new actor. */
+  restoreCeo?: { actorId: string; generation: number; sessionId: string; incarnation: string };
 }
 
 const LIVE_RUN_STATES = [
@@ -253,7 +256,9 @@ export class BindingRegistry {
       const generation = this.nextGeneration(roleKey);
       const assignmentId = newAssignmentId();
       const claimedTarget = input.authenticatedTarget?.claimed ?? input.verifiedTarget;
-      const reused = this.actorOwning(claimedTarget);
+      const reused = input.restoreCeo
+        ? this.restoredCeoActor(input)
+        : this.actorOwning(claimedTarget);
       if (!reused.allowed) return reused as Decision<RoleBinding>;
       // Plan a new id before verification so target authentication is the last pre-write step.
       const freshCandidate = `actor:${newAssignmentId()}`;
@@ -291,6 +296,15 @@ export class BindingRegistry {
         );
         if (!validatedReceipt.allowed) return validatedReceipt as Decision<RoleBinding>;
         hermesReceipt = validatedReceipt.value;
+      }
+      if (input.restoreCeo) {
+        const rechecked = this.restoredCeoActor(input);
+        const current = this.sessions.get(input.sessionId);
+        if (!rechecked.allowed) return rechecked as Decision<RoleBinding>;
+        if (rechecked.value !== provisionalActorId || this.nextGeneration(roleKey) !== generation ||
+            this.active(roleKey) || current?.incarnation !== session.incarnation) {
+          return deny(ReasonCode.CONFLICT, "CEO restoration changed during target verification", {});
+        }
       }
       // Reuse when the target says which actor owns it; mint otherwise.
       //
@@ -1345,6 +1359,53 @@ export class BindingRegistry {
       lineage_root_digest: receipt.lineage_root_digest,
     };
     return receipt.receipt_digest === digestOf(publicFields) ? receipt : null;
+  }
+
+  private restoredCeoActor(input: BindInput): Decision<string | null> {
+    const restore = input.restoreCeo!;
+    const target = input.authenticatedTarget;
+    if (input.role !== Role.CEO || input.projectId || input.runId || input.taskId ||
+        target?.protocolVersion !== HERMES_TARGET_BIND_PROTOCOL || target.claimed.executorKind !== "hermes") {
+      return deny(ReasonCode.CONFLICT, "CEO restoration requires authenticated Hermes target proof", {});
+    }
+    const previous = this.db.get<{
+      actor_id: string; binding_generation: number; session_id: string;
+      session_incarnation: string; status: string;
+    }>(`SELECT actor_id, binding_generation, session_id, session_incarnation, status
+          FROM assignments WHERE role_key = 'CEO' ORDER BY binding_generation DESC LIMIT 1`);
+    const actor = this.db.get<{
+      kind: string; current_session_id: string; current_session_incarnation: string; retired_at: string | null;
+    }>(`SELECT kind, current_session_id, current_session_incarnation, retired_at
+          FROM conversational_actors WHERE actor_id = ?`, [restore.actorId]);
+    if (!previous || previous.status !== "REVOKED" || previous.actor_id !== restore.actorId ||
+        previous.binding_generation !== restore.generation || previous.session_id !== restore.sessionId ||
+        previous.session_incarnation !== restore.incarnation || !actor || actor.kind !== Role.CEO ||
+        actor.retired_at !== null || actor.current_session_id !== restore.sessionId ||
+        actor.current_session_incarnation !== restore.incarnation) {
+      return deny(ReasonCode.CONFLICT, "CEO restoration incumbent tuple changed", {});
+    }
+    const incumbent = this.sessions.get(restore.sessionId);
+    const replacement = this.sessions.get(input.sessionId);
+    if (!incumbent || incumbent.incarnation !== restore.incarnation ||
+        !replacement || replacement.provider !== "hermes" || replacement.lifecycle !== SessionLifecycle.READY ||
+        probeSessionLiveness(incumbent.osPid, incumbent.osProcessStartedAt) !== "DEAD" ||
+        probeSessionLiveness(replacement.osPid, replacement.osProcessStartedAt) !== "ALIVE") {
+      return deny(ReasonCode.CONFLICT, "CEO restoration requires a dead incumbent and live replacement", {});
+    }
+    const owner = this.actorOwning(target.claimed);
+    if (!owner.allowed) return owner;
+    if (owner.value !== null && owner.value !== restore.actorId) {
+      return deny(ReasonCode.CONFLICT, "CEO restoration target belongs to another actor", {});
+    }
+    const existing = this.db.get<{ executor_kind: string; target_locator_digest: string }>(
+      `SELECT executor_kind, target_locator_digest FROM actor_target_bindings WHERE target_actor_id = ?`,
+      [restore.actorId],
+    );
+    if (existing && (existing.executor_kind !== target.claimed.executorKind ||
+        existing.target_locator_digest !== target.claimed.targetLocatorDigest)) {
+      return deny(ReasonCode.CONFLICT, "CEO restoration cannot change the actor lineage", {});
+    }
+    return allow(ReasonCode.OK, restore.actorId);
   }
 
   /** Finds the exact existing target-binding id or records a new one for this actor. */
