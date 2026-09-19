@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { totalmem } from "node:os";
 
@@ -23,6 +23,7 @@ import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { TaskGraph } from "../run/task-graph.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
+import { inspectReviewerCodexHome } from "../runtime/reviewer-codex-home.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 
@@ -765,7 +766,6 @@ export class Doctor {
     return findings;
   }
 
-  /** The daemon owns these files, so their timestamp is independently checkable evidence. */
   /**
    * Whether the packet reviewer has a private credential scope it could actually use.
    *
@@ -807,50 +807,24 @@ export class Doctor {
       return findings;
     }
 
-    const capsule = dirname(configured);
-    if (!existsSync(join(capsule, "identity.json"))) {
+    const inspected = inspectReviewerCodexHome(configured);
+    // READY is the claim's own answer, not this method's opinion of it, and the credential's
+    // freshness is not part of either: nothing here opens `auth.json`.
+    if (inspected.state !== "READY" || !existsSync(join(configured, "auth.json"))) {
       findings.push({
         code: ReasonCode.PACKET_REVIEWER_SCOPE_UNAVAILABLE,
         severity: "ERROR",
         scope: "reviewer:packet",
         blocking: false,
         confidence: "HIGH",
-        observedEvidence: { state: "NO_IDENTITY_RECEIPT", root: configured },
-        recommendedAction: action,
-      });
-      return findings;
-    }
-
-    // The claim marker is the capsule's one-way door: a claimed capsule is spent, not reusable.
-    if (existsSync(join(capsule, "claimed"))) {
-      findings.push({
-        code: ReasonCode.PACKET_REVIEWER_SCOPE_UNAVAILABLE,
-        severity: "ERROR",
-        scope: "reviewer:packet",
-        blocking: false,
-        confidence: "HIGH",
-        observedEvidence: { state: "ALREADY_CLAIMED", root: configured },
-        recommendedAction: action,
-      });
-      return findings;
-    }
-
-    // Presence only. Whether the credential inside is current is a question this check does not
-    // open a credential file to answer.
-    if (!existsSync(join(configured, "auth.json"))) {
-      findings.push({
-        code: ReasonCode.PACKET_REVIEWER_SCOPE_UNAVAILABLE,
-        severity: "ERROR",
-        scope: "reviewer:packet",
-        blocking: false,
-        confidence: "HIGH",
-        observedEvidence: { state: "NOT_AUTHENTICATED", root: configured },
+        observedEvidence: { state: inspected.state === "READY" ? "NOT_AUTHENTICATED" : inspected.state, root: configured },
         recommendedAction: action,
       });
     }
     return findings;
   }
 
+  /** The daemon owns these files, so their timestamp is independently checkable evidence. */
   private checkCapacitySensorFiles(): Finding[] {
     const findings: Finding[] = [];
     const now = Date.parse(this.clock.nowIso());

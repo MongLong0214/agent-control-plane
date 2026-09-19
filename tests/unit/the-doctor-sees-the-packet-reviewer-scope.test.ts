@@ -1,10 +1,11 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { provisionReviewerCodexHome } from "../../src/runtime/reviewer-codex-home.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
 
@@ -24,21 +25,31 @@ afterAll(cleanupTempDirs);
  * Discovering this at review time costs one capsule per discovery, and it cost the last free one
  * on 2026-09-19.
  *
- * These rows are about what the doctor reports, and about the two things it must not do: open a
- * credential, or block.
+ * These rows are about what the doctor reports, about the two things it must not do — open a
+ * credential, or block — and about the trap this check was one revision away from becoming: a
+ * second implementation of the capsule contract that reports healthy for a capsule the claim
+ * refuses.
  */
 const scopeFindings = async (harness: ReturnType<typeof makeHarness>) =>
   (await harness.cp.doctor.run("system")).findings.filter(
     (finding) => finding.code === ReasonCode.PACKET_REVIEWER_SCOPE_UNAVAILABLE,
   );
 
-/** A capsule in the shape `claimReviewerCodexHome` expects, built piece by piece. */
-const capsuleWith = (parts: { identity?: boolean; claimed?: boolean; auth?: boolean }): string => {
-  const capsule = mkdtempSync(join(tmpdir(), "acp-reviewer-capsule-"));
-  const root = join(capsule, "home");
-  mkdirSync(root, { mode: 0o700 });
-  if (parts.identity) writeFileSync(join(capsule, "identity.json"), JSON.stringify({ root }), { mode: 0o600 });
-  if (parts.claimed) mkdirSync(join(capsule, "claimed"), { mode: 0o700 });
+const capsules: string[] = [];
+afterAll(() => { for (const root of capsules) rmSync(dirname(root), { recursive: true, force: true }); });
+
+/**
+ * A real capsule, made the only way one is ever made.
+ *
+ * Built by hand from `mkdtemp` at first, which is what let the first version of this check pass a
+ * directory `claimReviewerCodexHome` refuses outright — the private namespace, the UUID capsule
+ * name and the 0700 ancestors are all part of the contract, and a fixture that skips them tests a
+ * capsule production never sees.
+ */
+const capsule = (parts: { claimed?: boolean; auth?: boolean }): string => {
+  const root = provisionReviewerCodexHome();
+  capsules.push(root);
+  if (parts.claimed) mkdirSync(join(dirname(root), "claimed"), { mode: 0o700 });
   if (parts.auth) writeFileSync(join(root, "auth.json"), "{}", { mode: 0o600 });
   return root;
 };
@@ -68,21 +79,40 @@ describe("the doctor sees the packet reviewer's scope", () => {
     // Two different owner actions: a claimed capsule needs a new one provisioned, an
     // unauthenticated one needs a login into the capsule that already exists. One finding code for
     // both would leave the operator to guess which.
-    process.env["ACP_REVIEWER_CODEX_HOME"] = capsuleWith({ identity: true, claimed: true, auth: true });
+    process.env["ACP_REVIEWER_CODEX_HOME"] = capsule({ claimed: true, auth: true });
     expect((await scopeFindings(makeHarness()))[0]?.observedEvidence)
       .toMatchObject({ state: "ALREADY_CLAIMED" });
 
-    process.env["ACP_REVIEWER_CODEX_HOME"] = capsuleWith({ identity: true });
+    process.env["ACP_REVIEWER_CODEX_HOME"] = capsule({});
     expect((await scopeFindings(makeHarness()))[0]?.observedEvidence)
       .toMatchObject({ state: "NOT_AUTHENTICATED" });
+  });
 
-    process.env["ACP_REVIEWER_CODEX_HOME"] = capsuleWith({ auth: true });
+  it("does not call a capsule the claim would refuse a healthy one", async () => {
+    // The failure this check exists to prevent, aimed at the check itself. Both of these are
+    // shaped like a capsule and are refused by `claimReviewerCodexHome`, so a doctor that answered
+    // from `existsSync` alone would report each as usable and the deployment would learn otherwise
+    // at the review — which is #512 again, from inside the thing that was supposed to catch it.
+    const outside = mkdtempSync(join(tmpdir(), "acp-reviewer-lookalike-"));
+    const root = join(outside, "home");
+    mkdirSync(root, { mode: 0o700 });
+    writeFileSync(join(outside, "identity.json"), JSON.stringify({ root }), { mode: 0o600 });
+    writeFileSync(join(root, "auth.json"), "{}", { mode: 0o600 });
+    process.env["ACP_REVIEWER_CODEX_HOME"] = root;
     expect((await scopeFindings(makeHarness()))[0]?.observedEvidence)
-      .toMatchObject({ state: "NO_IDENTITY_RECEIPT" });
+      .toMatchObject({ state: "UNUSABLE_CAPSULE" });
+
+    // A real capsule whose receipt was replaced with one that does not verify. The receipt is
+    // present, so this is not "no login yet" — it is a capsule that cannot be used.
+    const tampered = capsule({ auth: true });
+    writeFileSync(join(dirname(tampered), "identity.json"), JSON.stringify({ root: tampered }), { mode: 0o600 });
+    process.env["ACP_REVIEWER_CODEX_HOME"] = tampered;
+    expect((await scopeFindings(makeHarness()))[0]?.observedEvidence)
+      .toMatchObject({ state: "UNUSABLE_CAPSULE" });
   });
 
   it("says nothing when the scope is usable", async () => {
-    process.env["ACP_REVIEWER_CODEX_HOME"] = capsuleWith({ identity: true, auth: true });
+    process.env["ACP_REVIEWER_CODEX_HOME"] = capsule({ auth: true });
 
     expect(await scopeFindings(makeHarness())).toEqual([]);
   });
@@ -91,7 +121,7 @@ describe("the doctor sees the packet reviewer's scope", () => {
     // Blocking on a missing thing is how a daemon ends up parked behind the very coordinator that
     // would fix it (#950, #958). And the check answers from directory state alone: an `auth.json`
     // whose bytes are not JSON still counts as present, which is the proof that nothing parsed it.
-    const root = capsuleWith({ identity: true });
+    const root = capsule({});
     writeFileSync(join(root, "auth.json"), "not json at all — if this is parsed, the check throws", { mode: 0o600 });
     process.env["ACP_REVIEWER_CODEX_HOME"] = root;
 
