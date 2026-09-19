@@ -1,0 +1,6 @@
+Limit: a project with no bound role cannot acquire a run, so the open-runs condition could never become true from the state it was meant to describe
+Ruled-out: guarding the branch with project.activity !== "INACTIVE" | ProjectRegistry derives activity from whether a PRIMARY_CTO is bound, so it is the same fact under another name and the guard makes the branch unreachable
+Warn: keep this finding non-blocking — blocking parks the daemon behind the coordinator that would bind the role (#950, #958)
+Record-Id: r-974unboundwithnoruns
+Evidence: tests/unit/an-unbound-role-with-no-runs-is-still-unbound.test.ts
+Provenance: inherited 010698e3cfe77869be01ad009c73a268da1fd03a
