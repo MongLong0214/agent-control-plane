@@ -1,0 +1,6 @@
+Limit: the verifier read a receipt key no producer has ever written, so its validate step always ran with an empty generation and no pair could reach PASS
+Ruled-out: reading the generation from the pair's own pair.json instead of the receipt | a pair that misnamed its own generation would then be the thing vouching for that name, which is the self-attestation the index digest is kept outside to avoid
+Warn: a verifier whose every measured row passes can still be structurally unable to pass — read the verdict row that failed, not the rows that did not
+Record-Id: r-verifierreadsakeynobodywrites
+Evidence: scripts/verify-pair-independently.mjs
+Provenance: inherited ad3d1369522593bae45bc022703226e2ef8f3851
