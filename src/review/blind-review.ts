@@ -491,14 +491,26 @@ export class BlindReviewGate {
         // back to Claude here would hide a broken mandatory GPT gate behind a successful
         // alternate review, which is exactly the P0-07 failure mode.
         if (error instanceof ProviderSessionProvisionError) {
-          return deny(error.reasonCode, "preferred reviewer isolation could not be proved", {
-            runId,
-            provider: preference.provider,
-            model: preference.model,
-            effort: preference.effort,
-            reason: message,
-            attempts,
-          });
+          // The message follows the reason rather than assuming it. Every
+          // `ProviderSessionProvisionError` used to be reported as unproven isolation, including a
+          // handshake that timed out *after* the adapter had already verified `isolationEnforced`
+          // and the egress evidence — see `startPacketReviewerSession`. An operator reading
+          // "isolation could not be proved" about a reviewer that simply did not answer audits the
+          // sandbox and never looks at the credential, which is exactly what #512 produced.
+          return deny(
+            error.reasonCode,
+            error.reasonCode === ReasonCode.REVIEWER_SESSION_HANDSHAKE_TIMEOUT
+              ? "preferred reviewer was isolated and did not answer its identity handshake"
+              : "preferred reviewer isolation could not be proved",
+            {
+              runId,
+              provider: preference.provider,
+              model: preference.model,
+              effort: preference.effort,
+              reason: message,
+              attempts,
+            },
+          );
         }
         return deny(ReasonCode.ISOLATION_LOST, "reviewer session creation failed without an availability proof", {
           runId,

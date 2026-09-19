@@ -189,3 +189,59 @@ describe("Codex provider-issued reviewer sessions", () => {
     // refusing the bootstrap that only reported a local/session_id field.
   });
 });
+
+/**
+ * #512 — the line that decides *which* reason a failed handshake carries had no witness.
+ *
+ * `review-r2.test.ts` covers what the gate reports, but its fake adapter throws the reason code
+ * itself, so reverting `startPacketReviewerSession` to an unconditional `ISOLATION_LOST` left all
+ * 52 of those rows green (measured 2026-09-19). The decision lives here, one branch above the
+ * throw, and the only way to reach it is the real adapter with a timed-out `runCli` result.
+ */
+describe("a reviewer that was isolated and then did not answer", () => {
+  /** Exactly the shape #512 produced: the boundary proved, the one-word reply never arriving. */
+  const timedOutHandshake = () => ({
+    stdout: "",
+    stderr: "",
+    exitCode: 0,
+    timedOut: true,
+    isolationEnforced: true,
+    egressEvidence: testReviewerEgressEvidence("gpt"),
+  });
+
+  const startWith = async (result: ReturnType<typeof timedOutHandshake> | Record<string, unknown>) => {
+    const packetRoot = tempDir("acp-codex-handshake-");
+    __testing.setRunCli(async () => result as never);
+    const adapter = new CodexCliAdapter({
+      clock: new ManualClock("2026-08-13T00:00:00.000Z"),
+      capacityFile: join(packetRoot, "gpt.json"),
+      reviewerCodexHome: freshHome(),
+    });
+    return adapter.startSession({
+      model: "gpt-5.6-sol", workdir: packetRoot, purpose: "blind-review",
+      isolation: { packetRoot, denyReadPaths: [], emptyEnvironment: true,
+        network: "provider-only", tools: "none" },
+    });
+  };
+
+  it("is a handshake timeout, not lost isolation", async () => {
+    // The boundary was proved before this point — `isolationEnforced` true, egress evidence
+    // non-empty — so a timeout is never evidence about the sandbox. Reporting it as
+    // `ISOLATION_LOST` is what had the operator auditing a seatbelt profile while the reviewer
+    // capsule's credential sat five days stale.
+    const started = startWith(timedOutHandshake());
+    await expect(started).rejects.toMatchObject({
+      reasonCode: ReasonCode.REVIEWER_SESSION_HANDSHAKE_TIMEOUT,
+    });
+    await expect(started).rejects.toThrow("timed out");
+  });
+
+  it("still calls a non-zero exit lost isolation, so the split is a split and not a rename", async () => {
+    // The other arm of the same branch. Without this row the change reads identically to one that
+    // renamed the code for every failure here, which would move the misdirection rather than
+    // remove it: a reviewer that exited non-zero reported as one that merely did not answer.
+    const started = startWith({ ...timedOutHandshake(), timedOut: false, exitCode: 3, stderr: "codex: boom" });
+    await expect(started).rejects.toMatchObject({ reasonCode: ReasonCode.ISOLATION_LOST });
+    await expect(started).rejects.toThrow("boom");
+  });
+});

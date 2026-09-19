@@ -302,7 +302,18 @@ export interface SessionHandle {
  */
 export class ProviderSessionProvisionError extends Error {
   constructor(
-    readonly reasonCode: typeof ReasonCode.ISOLATION_LOST,
+    /**
+     * Narrow on purpose: provisioning may fail for exactly two reasons a caller can act on.
+     *
+     * `ISOLATION_LOST` is the boundary itself — no isolation proof, no egress evidence, or a
+     * non-zero exit before either could be established. `REVIEWER_SESSION_HANDSHAKE_TIMEOUT` is
+     * the reviewer answering nothing *after* that boundary was proved, which sends an operator to
+     * a different place: the credential and the provider, not the sandbox. Widening this to
+     * `ReasonCode` would let any code arrive here and leave the caller nothing to branch on.
+     */
+    readonly reasonCode:
+      | typeof ReasonCode.ISOLATION_LOST
+      | typeof ReasonCode.REVIEWER_SESSION_HANDSHAKE_TIMEOUT,
     message: string,
   ) {
     super(message);

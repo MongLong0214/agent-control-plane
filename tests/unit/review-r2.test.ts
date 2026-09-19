@@ -253,6 +253,27 @@ class ProviderIdentityFailureGptAdapter extends TestProductionAdapter {
   }
 }
 
+/**
+ * A GPT reviewer that *was* isolated and then did not answer its identity handshake.
+ *
+ * The distinction is the adapter's own order: `startPacketReviewerSession` verifies
+ * `isolationEnforced` and the egress evidence *before* the handshake can time out, so a timeout is
+ * never evidence about the boundary. Measured on #512 — the reviewer capsule's credential had not
+ * refreshed in five days, the one-word handshake spent its whole 60s budget, and the run was
+ * reported as "preferred reviewer isolation could not be proved".
+ */
+class HandshakeTimeoutGptAdapter extends TestProductionAdapter {
+  readonly supportsReviewerIsolation = true;
+  readonly requiresReviewerProviderSessionProof = true;
+
+  override async startSession(_spec: SessionSpec): Promise<never> {
+    throw new ProviderSessionProvisionError(
+      ReasonCode.REVIEWER_SESSION_HANDSHAKE_TIMEOUT,
+      "Codex reviewer session identity handshake timed out",
+    );
+  }
+}
+
 const gateWithReviewerPreferences = (
   setup: Awaited<ReturnType<typeof prepareReviewedInputs>>,
   preferred: TestProductionAdapter,
@@ -825,6 +846,38 @@ describe("round-2 blind-review regressions", () => {
 
     expect(result.allowed).toBe(false);
     expect(result.reasonCode).toBe(ReasonCode.ISOLATION_LOST);
+    expect(fallback.invocations).toHaveLength(0);
+    expect(setup.harness.cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toHaveLength(0);
+  });
+
+  it("names a handshake timeout as one, and still refuses to fall back", async () => {
+    // Two properties, and the second is what makes the first safe to ship. The report must stop
+    // calling a timeout "isolation could not be proved" — an operator reading that audits the
+    // sandbox and never looks at the credential, which is what #512 produced. And the mandatory
+    // GPT gate must be exactly as mandatory as before: nothing branches on `ISOLATION_LOST` as a
+    // value, so this changes what is reported and not what is refused.
+    const setup = await prepareReviewedInputs();
+    const preferred = new HandshakeTimeoutGptAdapter(setup.harness.clock, "gpt");
+    const fallback = new TestProductionAdapter(setup.harness.clock, "claude");
+    fallback.script({
+      match: /Candidate review/,
+      text: reviewerPass([`${setup.identity}:src/app.js`]),
+    });
+    setup.harness.cp.providers.register(preferred);
+    setup.harness.cp.providers.register(fallback);
+
+    const result = await invokeGate(gateWithReviewerPreferences(setup, preferred, fallback), setup);
+
+    expect(result.allowed).toBe(false);
+    // `Decision` carries `message` only on its denied arm, so the narrowing is explicit rather
+    // than implied by the assertion above — a `.message` read on the allowed arm is a type error,
+    // not a runtime surprise.
+    if (result.allowed) throw new Error("expected the gate to deny a reviewer that never answered");
+    expect(result.reasonCode).toBe(ReasonCode.REVIEWER_SESSION_HANDSHAKE_TIMEOUT);
+    expect(result.message).toContain("did not answer its identity handshake");
+    expect(result.message).not.toContain("isolation could not be proved");
+    // The P0-07 property, unchanged: a reviewer that could not run does not become a successful
+    // review by another provider, and no fallback is recorded.
     expect(fallback.invocations).toHaveLength(0);
     expect(setup.harness.cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toHaveLength(0);
   });
