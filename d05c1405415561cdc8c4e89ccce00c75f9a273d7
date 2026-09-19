@@ -1,0 +1,6 @@
+Limit: the sandbox refuses a denied socket immediately with EPERM, so a timeout or an unresolved name is never the boundary answering — that asymmetry is what makes the indeterminate state real rather than a shade of blocked
+Ruled-out: pointing the direct probe at an endpoint the test owns | the attestation's value is that a *real* provider host is unreachable directly, and a local target would pass on a host where the boundary leaks
+Warn: keep the verdict a pure function — inline it can only be reached through a seatbelt fixture whose socket times out, which cannot be arranged deterministically, so the branch would have no witness
+Record-Id: r-972threestateprobe
+Evidence: tests/unit/reviewer-egress.test.ts
+Provenance: inherited 258f5c78ae27360073d7835067e9d0b51a740881
