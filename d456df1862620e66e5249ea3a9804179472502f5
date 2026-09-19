@@ -1,0 +1,4 @@
+Limit: Official multi-record separate paragraphs and raw-object roundtrips must be preserved; validation must not be weakened or replaced with custom semantics.
+Warn: Require both shape and reference checks exactly once with status ok; an empty or incomplete checks array is not validation success.
+Record-Id: r-cbbff5efeeed
+Provenance: inherited e204413c13ec7183060e7d030c8dfc3fd00a1f4f
