@@ -62,7 +62,38 @@ const KEYS = RECORD_TRAILER_KEY_PATTERN;
  * is not "run the code that decides" can drift from the answer, and the first version of the
  * `commit-msg` hook drifted exactly that way.
  */
-const unparsed = (message, carried = []) => {
+const unparsed = (message, carried = [], source = []) => {
+  // SPEC §2.4 recovers separate identified record paragraphs. Git's all-message
+  // trailer parser sees only the last one; it is not the multi-record authority.
+  if ((message.match(/^Record-Id\s*:/gim) ?? []).length > 1) {
+    try {
+      const cli = (args) => execFileSync("commitlore", args, { cwd: ROOT, encoding: "utf8", input: message });
+      const validation = JSON.parse(cli(["validate", ...source, "--json"]));
+      const checks = validation.checks;
+      if (!Array.isArray(checks) || checks.length !== 2 ||
+          !["shape", "reference"].every((required) =>
+            checks.filter((check) => check?.class === required && check.status === "ok").length === 1)) {
+        return ["multi-record semantic validation was incomplete"];
+      }
+      const { blocks } = JSON.parse(cli(["parse", "--json"]));
+      if (!Array.isArray(blocks) || blocks.length < 2 || blocks.some((block) => block.identityCollision)) {
+        return ["invalid multi-record region"];
+      }
+      const region = blocks.map((block) => block.trailers.map(({ key, value }) => `${key}: ${value}`).join("\n")).join("\n\n");
+      const start = message.indexOf(region);
+      // Exact canonical paragraphs, ending the message: no prose, hidden record,
+      // malformed continuation or second title may be skipped by the parser.
+      if (start < 2 || message.slice(start - 2, start) !== "\n\n" ||
+          message.slice(start).replace(/\n+$/, "") !== region ||
+          message.slice(0, start).split("\n").some((line) => KEYS.test(line))) {
+        return ["records must form one final, intact structured region"];
+      }
+      return [];
+    } catch {
+      // A note never excuses a malformed multi-record message or an unavailable validator.
+      return ["multi-record semantic validation failed or could not run"];
+    }
+  }
   // Comments are stripped the way git strips them, so a commented-out example is not counted.
   const body = message
     .split("\n")
@@ -124,8 +155,14 @@ if (messageFileAt !== -1) {
     process.stdout.write("  --message-file needs a path (`-` for stdin).\n\nRESULT: FAIL — nothing was examined.\n");
     process.exit(2);
   }
-  const message = readFileSync(path === "-" ? 0 : path, "utf8");
-  const lost = unparsed(message);
+  const bytes = readFileSync(path === "-" ? 0 : path);
+  const expectedAt = process.argv.indexOf("--expected-message-file");
+  if (expectedAt !== -1 && !bytes.equals(readFileSync(process.argv[expectedAt + 1]))) {
+    process.stdout.write("RESULT: FAIL — the official message bytes changed.\n");
+    process.exit(1);
+  }
+  const message = bytes.toString("utf8");
+  const lost = unparsed(message, [], path === "-" ? [] : ["--message-file", path]);
   if (lost.length > 0) {
     report(lost, "the message");
     process.stdout.write(`${EXPLANATION}RESULT: FAIL — ${lost.length} trailer line(s) git will not store.\n`);
@@ -151,7 +188,7 @@ const notesFetched = notesRefPresent();
 
 let broken = 0;
 for (const sha of shas) {
-  const lost = unparsed(git(["log", "-1", "--format=%B", sha]), notesFetched ? noteLines(sha) : []);
+  const lost = unparsed(git(["log", "-1", "--format=%B", sha]), notesFetched ? noteLines(sha) : [], ["--commit", sha]);
   if (lost.length === 0) continue;
   broken += 1;
   report(lost, sha.slice(0, 7));
