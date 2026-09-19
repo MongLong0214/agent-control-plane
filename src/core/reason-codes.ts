@@ -95,6 +95,16 @@ export const ReasonCode = {
   COVERAGE_INCOMPLETE: "COVERAGE_INCOMPLETE",
   PROBE_FAILED: "PROBE_FAILED",
   ISOLATION_LOST: "ISOLATION_LOST",
+  /**
+   * The reviewer's isolation was enforced and its identity handshake then did not answer.
+   *
+   * Separate from `ISOLATION_LOST` because the adapter checks isolation *first*: by the time a
+   * handshake can time out, `isolationEnforced` and the egress evidence have already been
+   * verified. Reporting that run as "isolation could not be proved" sends an operator hunting a
+   * sandbox or profile fault for what is a reviewer that did not reply — measured on #512, where
+   * the credential in the reviewer capsule had not refreshed in five days.
+   */
+  REVIEWER_SESSION_HANDSHAKE_TIMEOUT: "REVIEWER_SESSION_HANDSHAKE_TIMEOUT",
   VERIFICATION_GAP: "VERIFICATION_GAP",
 
   // --- run lifecycle -------------------------------------------------------

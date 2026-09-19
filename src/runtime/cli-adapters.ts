@@ -2047,8 +2047,20 @@ export class CodexCliAdapter implements ProviderAdapter {
       );
     }
     if (result.exitCode !== 0 || result.timedOut) {
+      // A timeout here is **not** lost isolation, and saying so sends an operator to the wrong
+      // place. Isolation is checked immediately above: reaching this line means
+      // `isolationEnforced` was true and the egress evidence was non-empty, so whatever went
+      // wrong happened *after* the boundary was proved. Measured on #512, where the reviewer
+      // capsule's credential had not refreshed in five days and the handshake — one word,
+      // `READY` — spent its whole 60s budget; the report read "preferred reviewer isolation
+      // could not be proved", which is the sentence that would have had me auditing the sandbox.
+      //
+      // The same shape this repository has now corrected four times: an absent answer folded
+      // into the nearest definite negative (#950, #953, #957, #961). Nothing branches on
+      // `ISOLATION_LOST` as a value, so this changes what is reported and not what is refused —
+      // the review still denies and the pipeline still stops.
       throw new ProviderSessionProvisionError(
-        ReasonCode.ISOLATION_LOST,
+        result.timedOut ? ReasonCode.REVIEWER_SESSION_HANDSHAKE_TIMEOUT : ReasonCode.ISOLATION_LOST,
         result.timedOut ? "Codex reviewer session identity handshake timed out" : result.stderr || "Codex reviewer session identity handshake failed",
       );
     }
