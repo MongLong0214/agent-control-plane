@@ -92,7 +92,12 @@ export const readReceipt = (text) => {
   return {
     pairId: field("ACP_PAIR_ID"),
     indexDigest: field("ACP_PAIR_INDEX_DIGEST"),
-    serviceGeneration: field("service_generation"),
+    // `ACP_PAIR_SERVICE_GENERATION`, to match the two keys above. This read `service_generation`
+    // — a spelling no producer has ever written — so the field was always null, `validate` was
+    // always called with an empty `--expect-service-generation`, and this verifier could not
+    // reach PASS for any pair. The receipt carries it rather than the pair, because a pair that
+    // misnamed its own generation would otherwise be the thing vouching for that name.
+    serviceGeneration: field("ACP_PAIR_SERVICE_GENERATION"),
   };
 };
 
