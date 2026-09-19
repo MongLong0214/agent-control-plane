@@ -1,0 +1,15 @@
+Limit: it reads directory state only and never opens a credential, so it cannot say whether the credential inside is current — only whether one is present
+Limit: a claim has no auto-release, so a run that fails after claiming still spends the capsule; discovering this at review time costs one capsule per discovery
+Ruled-out: building the findings through a local helper | the reason-code census recognises a returned collection only by an explicitly registered method with literal findings.push objects, and it verifies the concrete path rather than taking a name for it
+Warn: a new doctor check that declares a new reason code must also register its recogniser in verify-reason-code-usage.mjs, the way checkCapacitySensorFiles is — the census refuses the code otherwise
+Blast: module
+Record-Id: r-doctorseesthepacketreviewerscope
+Evidence: tests/unit/the-doctor-sees-the-packet-reviewer-scope.test.ts
+Provenance: inherited f7fc933bed15d5fd17b4aead80e18bf9aa564734
+
+Limit: the capsule contract is not a directory listing — the private namespace, the UUID capsule name, 0700 non-symlink ancestors and the receipt's mode, link count, key set and dev/ino are all part of what the claim requires
+Ruled-out: leaving the doctor with its own existsSync checks and widening them | restating the contract in a second place is what produced the defect, and a wider restatement agrees with the claim only until the next case it does not model
+Warn: inspectReviewerCodexHome is advisory about ALREADY_CLAIMED — the claim is still the mkdirSync and nothing else, so never move the claim decision into the inspection
+Record-Id: r-968singleauthorityforthecapsule
+Evidence: tests/unit/the-doctor-sees-the-packet-reviewer-scope.test.ts
+Provenance: inherited 2ffdc159914ba2969913fe86562d7dcd7b7b9bd6
