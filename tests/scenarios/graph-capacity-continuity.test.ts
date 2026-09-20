@@ -313,7 +313,7 @@ describe("provider capacity (CP-S16, CP-S17, CP-S18)", () => {
       reading("gpt", harness.clock, {
         buckets: [
           { id: "rolling-5h", remainingPercent: 62, resetAt: "2026-08-12T05:00:00.000Z", capabilities: ["ceo", "blind-review"] },
-          { id: "weekly", remainingPercent: 18, resetAt: "2026-08-18T00:00:00.000Z", capabilities: ["luna-worker"] },
+          { id: "weekly", remainingPercent: 4, resetAt: "2026-08-18T00:00:00.000Z", capabilities: ["luna-worker"] },
         ],
       }),
     );
@@ -321,7 +321,7 @@ describe("provider capacity (CP-S16, CP-S17, CP-S18)", () => {
 
     const current = harness.cp.capacity.current("gpt")!;
     expect(current.buckets.map((b) => b.id).sort()).toEqual(["rolling-5h", "weekly"]);
-    // The lowest bucket drives admission: 18% is inside the conserve band.
+    // The lowest bucket drives admission: the weekly window's 4% is inside the conserve band.
     expect(current.allocationAdmission).toBe("CONSERVE");
     expect(current.advisoryState).toBe("CONSERVE");
   });
