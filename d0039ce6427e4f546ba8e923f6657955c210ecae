@@ -1,0 +1,25 @@
+Limit: the ladder's ordering is pinned by its own case, but the three figures themselves are a policy choice with no test that can say they are right - only that they are ordered
+Limit: CONSERVE refusal applies only where priority is worker, so this changes how much capacity is reserved for critical roles and nothing about whether a critical role can be staffed
+Ruled-out: amending or force-pushing the earlier head | ruled out because the same rollback unit re-projects cleanly onto current main, and rewriting that history would carry the authoring-tool metadata forward rather than removing it
+Warn: the earlier head's message reported 97/97 for the capacity contract files; the four files this change touches measure 88/88 on this tree and no set of four capacity files reproduced 97, so treat that figure as naming a file set it never stated
+Record-Id: r-04aaf924b661
+Provenance: inherited 65ff44267e787cfc2895ac0d1bac3c5d1fc0f67f
+
+Warn: Inside the conserve band, which is where a measured reserve is still allowed to refuse.
+Warn: Above it the ladder holds the window open no matter how high the critical demand climbs.
+Record-Id: r-reservebandladder920
+Provenance: inherited 65ff44267e787cfc2895ac0d1bac3c5d1fc0f67f
+
+Warn: Above the band the ladder holds it open regardless.
+Warn: fixture has to sit inside it for the reserve to have anything left to refuse.
+Record-Id: r-dispatchadmissionband920
+Follows: r-reservebandladder920
+Provenance: inherited 65ff44267e787cfc2895ac0d1bac3c5d1fc0f67f
+
+Limit: The correction is confined to capacity-monitor and one existing test; schema, migrations, and #631 paths remain untouched.
+Warn: Finite raw demand can overflow weighted/share arithmetic; non-finite derived values must stay unmeasured with reserve 1 so TaskGraph worker admission fails closed.
+Warn: Preserve 20% admission, measured 5%/1% refusals, and null/malformed/unmeasured fail-closed ordering.
+Record-Id: r-capacityoverflow982
+Evidence: src/capacity/capacity-monitor.ts
+Evidence: tests/unit/continuity-r2.test.ts
+Provenance: inherited 775edf26bf192f1ca1624bd7cdedf422778abbb4
