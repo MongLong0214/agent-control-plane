@@ -2,7 +2,12 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import { accessSync, chmodSync, constants, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
-import { CAPACITY_DEFAULTS, RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
+import {
+  CAPACITY_DEFAULTS,
+  type DynamicReserveDemand,
+  type ProviderCapacity,
+  RefreshTrigger,
+} from "../../src/capacity/capacity-monitor.ts";
 import { ControlPlane } from "../../src/app/control-plane.ts";
 import { ManualClock } from "../../src/core/clock.ts";
 import { allow, type Evidence } from "../../src/core/errors.ts";
@@ -39,7 +44,6 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import ts from "typescript";
-import type { ProviderCapacity } from "../../src/capacity/capacity-monitor.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -765,6 +769,8 @@ const startWorkerWithMeasuredReserve = async (input: {
   extraInFlightRun?: boolean;
   /** Adds a live CEO binding without adding a run that needs review. */
   extraCeoDemand?: boolean;
+  /** Injects trusted allocator output while retaining the real TaskGraph admission path. */
+  reserveDemandOverride?: DynamicReserveDemand;
 }) => {
   const plane = makePlane();
   const { cp, clock, gpt, claude } = plane;
@@ -849,15 +855,23 @@ const startWorkerWithMeasuredReserve = async (input: {
 
   const task = cp.tasks.ready(created.value.runId)[0]!;
   const workerSessionId = bindWorkerForTask(cp, task.taskId);
-  const demand = cp.capacity.workerReserveDemand("gpt");
-  const started = await cp.tasks.startWorkerExecution({
-    runId: created.value.runId,
-    taskId: task.taskId,
-    ownerBindingGeneration: dispatched.value.ownerBindingGeneration!,
-    workerSessionId,
-    provider: "gpt",
-    model: "worker",
-  });
+  const demand = input.reserveDemandOverride ?? cp.capacity.workerReserveDemand("gpt");
+  const demandOverride = input.reserveDemandOverride
+    ? vi.spyOn(cp.capacity, "workerReserveDemand").mockReturnValue(input.reserveDemandOverride)
+    : null;
+  let started: Awaited<ReturnType<typeof cp.tasks.startWorkerExecution>>;
+  try {
+    started = await cp.tasks.startWorkerExecution({
+      runId: created.value.runId,
+      taskId: task.taskId,
+      ownerBindingGeneration: dispatched.value.ownerBindingGeneration!,
+      workerSessionId,
+      provider: "gpt",
+      model: "worker",
+    });
+  } finally {
+    demandOverride?.mockRestore();
+  }
   return { plane, demand, started };
 };
 
@@ -1775,6 +1789,43 @@ describe("round-2 capacity and runtime regressions", () => {
       .toBeGreaterThan(refusedReserve(baselineRoles.started.evidence, bucketId));
     baselineRoles.plane.cp.close();
     ceoCoverage.plane.cp.close();
+  });
+
+  it("#982 fails closed when finite reserve inputs overflow derived arithmetic", async () => {
+    const demand: DynamicReserveDemand = {
+      criticalRoleInvocations: Number.MAX_VALUE,
+      expectedReviews: 0,
+      inFlightRuns: 0,
+      burnRatePercentPerHour: 0,
+      roleDemand: { ceo: Number.MAX_VALUE, cto: 0, reviewer: 0 },
+      burnRatePercentPerHourByBucket: { "worker-window": 0 },
+    };
+    expect([
+      demand.criticalRoleInvocations,
+      demand.expectedReviews,
+      demand.inFlightRuns,
+      demand.burnRatePercentPerHour,
+      demand.roleDemand.ceo,
+      demand.roleDemand.cto,
+      demand.roleDemand.reviewer,
+    ].every(Number.isFinite)).toBe(true);
+    expect(demand.criticalRoleInvocations * 2 + demand.roleDemand.ceo * 5).toBe(Number.POSITIVE_INFINITY);
+
+    const overflow = await startWorkerWithMeasuredReserve({
+      remainingPercent: CAPACITY_DEFAULTS.conservePercent,
+      previousRemainingPercent: CAPACITY_DEFAULTS.conservePercent,
+      resetAfterObservationHours: 1,
+      reserveDemandOverride: demand,
+    });
+    try {
+      expect(overflow.started.allowed).toBe(false);
+      expect(overflow.started.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+      expect(overflow.started.evidence).toMatchObject({
+        reserves: [{ bucketId: "worker-window", reserve: 1, measured: false }],
+      });
+    } finally {
+      overflow.plane.cp.close();
+    }
   });
 
   it("#56 rejects a future-dated capacity file instead of keeping it fresh indefinitely", () => {

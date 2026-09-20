@@ -1028,8 +1028,9 @@ export class CapacityMonitor {
   ): Array<{ bucketId: string; reserve: number; measured: boolean }> {
     // Types protect product callers, but evidence crossing a process boundary can still be
     // malformed at runtime. An absent role-demand object is unknown demand, never zero.
+    const unmeasured = (bucketId: string) => ({ bucketId, reserve: 1, measured: false });
     const roleDemand = demand.roleDemand;
-    if (!roleDemand) return capacity.buckets.map((bucket) => ({ bucketId: bucket.id, reserve: 1, measured: false }));
+    if (!roleDemand) return capacity.buckets.map((bucket) => unmeasured(bucket.id));
     const inputs = [
       demand.criticalRoleInvocations,
       demand.expectedReviews,
@@ -1042,7 +1043,7 @@ export class CapacityMonitor {
     if (inputs.some((input) => !Number.isFinite(input) || input < 0)) {
       // A malformed demand observation is not zero demand. Preserve every window until
       // the caller can provide the measured facts §14.5 requires.
-      return capacity.buckets.map((bucket) => ({ bucketId: bucket.id, reserve: 1, measured: false }));
+      return capacity.buckets.map((bucket) => unmeasured(bucket.id));
     }
     const weighted =
       demand.criticalRoleInvocations * 2 +
@@ -1051,27 +1052,36 @@ export class CapacityMonitor {
       roleDemand.ceo * 5 +
       roleDemand.cto * 4 +
       roleDemand.reviewer * 3;
+    if (!Number.isFinite(weighted)) return capacity.buckets.map((bucket) => unmeasured(bucket.id));
     const nowMs = new Date(this.clock.nowIso()).getTime();
     return capacity.buckets.map((bucket) => {
       // Unknown quota is never imagined as headroom. Lower-priority work must preserve
       // the whole window until a usable observation exists.
-      if (bucket.remainingPercent === null) return { bucketId: bucket.id, reserve: 1, measured: false };
+      if (
+        bucket.remainingPercent === null ||
+        !Number.isFinite(bucket.remainingPercent) ||
+        bucket.remainingPercent < 0
+      ) return unmeasured(bucket.id);
       const resetMs = bucket.resetAt ? new Date(bucket.resetAt).getTime() : Number.NaN;
       // A lower-priority router cannot manufacture a reset horizon. A missing, malformed,
       // or already elapsed reset must therefore protect the whole bucket until it is
       // observed again with a usable horizon.
-      if (!Number.isFinite(resetMs) || resetMs <= nowMs) return { bucketId: bucket.id, reserve: 1, measured: false };
+      if (!Number.isFinite(resetMs) || resetMs <= nowMs) return unmeasured(bucket.id);
       const horizonHours = (resetMs - nowMs) / (60 * 60 * 1000);
+      if (!Number.isFinite(horizonHours) || horizonHours <= 0) return unmeasured(bucket.id);
       const burn = demand.burnRatePercentPerHourByBucket
         ? (demand.burnRatePercentPerHourByBucket[bucket.id] ?? Number.NaN)
         : demand.burnRatePercentPerHour;
       // A known aggregate cannot certify a different, unmeasured quota window. Preserve
       // that bucket until it has its own burn observation.
-      if (!Number.isFinite(burn) || burn < 0) return { bucketId: bucket.id, reserve: 1, measured: false };
+      if (!Number.isFinite(burn) || burn < 0) return unmeasured(bucket.id);
       const expectedBurn = burn * horizonHours;
+      if (!Number.isFinite(expectedBurn)) return unmeasured(bucket.id);
       const demandShare = weighted / (weighted + Math.max(1, bucket.remainingPercent));
       const burnShare = expectedBurn / Math.max(1, bucket.remainingPercent + expectedBurn);
-      return { bucketId: bucket.id, reserve: Math.min(1, demandShare + burnShare), measured: true };
+      const reserve = demandShare + burnShare;
+      if (![demandShare, burnShare, reserve].every(Number.isFinite)) return unmeasured(bucket.id);
+      return { bucketId: bucket.id, reserve: Math.min(1, reserve), measured: true };
     });
   }
 
