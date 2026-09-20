@@ -262,12 +262,12 @@ describe("a parked message is owed to its own conversation", () => {
         bindingDigest: digestOf({ bindingGeneration: null }),
       },
       ["update:721"],
-      [],
+      ["update:720"],
     );
     expect(exact.allowed).toBe(true);
     if (!exact.allowed) return;
     expect(exact.value.batchConsumedNonces).toEqual(["update:721"]);
-    expect(exact.value.batchUnconsumedNonces).toEqual([]);
+    expect(exact.value.batchUnconsumedNonces).toEqual(["update:720"]);
     expect(guard.pendingOwnerMessages().map((item) => item.nonce)).toContain("update:720");
 
     const guessed = guard.claimOwnerBatch(
@@ -286,6 +286,93 @@ describe("a parked message is owed to its own conversation", () => {
     expect(harness.cp.db.get<{ turn_claim_json: string | null }>(
       `SELECT turn_claim_json FROM inbound_messages
         WHERE channel = 'telegram' AND nonce = 'update:720'`,
+    )?.turn_claim_json).toBeNull();
+  });
+
+  it("validates the exact pending snapshot before claiming any owner-batch member", () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const guard = readerFor(harness);
+    const scopeA = canonicalConversationOf(CHAT_A);
+    const scopeB = canonicalConversationOf(CHAT_B);
+    expect(guard.admit({
+      channel: "telegram",
+      actor: OWNER_ID,
+      conversation: CHAT_A,
+      nonce: "update:730",
+      payload: { text: "update:730", messageId: 730 },
+    }).allowed).toBe(true);
+    guard.parkForBatch("update:730", scopeA);
+    harness.cp.db.run(
+      `INSERT INTO inbound_messages
+        (channel, nonce, actor, received_at, payload_json, result_json)
+       VALUES ('telegram', 'update:731', ?, ?, '{', ?)`,
+      [OWNER_ID, harness.clock.nowIso(), JSON.stringify({
+        kind: "TELEGRAM_WORKFLOW",
+        phase: "ADMITTED",
+        parked: { sessionDigest: scopeB, parkedAt: harness.clock.nowIso() },
+      })],
+    );
+    expect(guard.admit({
+      channel: "telegram",
+      actor: OWNER_ID,
+      conversation: CHAT_A,
+      nonce: "update:732",
+      payload: { text: "current", messageId: 732 },
+    }).allowed).toBe(true);
+    const identity = {
+      turnRequestId: "turn-732",
+      sessionDigest: scopeA,
+      promptDigest: digestOf("update:730\ncurrent"),
+      bindingDigest: digestOf({ bindingGeneration: null }),
+    };
+
+    const omitted = guard.claimOwnerBatch(
+      "telegram",
+      "update:732",
+      identity,
+      ["update:730", "update:732"],
+      [],
+    );
+    expect(omitted.allowed).toBe(false);
+    expect(harness.cp.db.all<{ nonce: string }>(
+      `SELECT nonce FROM inbound_messages
+        WHERE channel = 'telegram' AND turn_claim_json IS NOT NULL ORDER BY nonce`,
+    )).toEqual([]);
+
+    const reordered = guard.claimOwnerBatch(
+      "telegram",
+      "update:732",
+      identity,
+      ["update:732", "update:730"],
+      ["update:731"],
+    );
+    expect(reordered.allowed).toBe(false);
+
+    const exact = guard.claimOwnerBatch(
+      "telegram",
+      "update:732",
+      identity,
+      ["update:730", "update:732"],
+      ["update:731"],
+    );
+    expect(exact.allowed).toBe(true);
+    const claims = harness.cp.db.all<{ turn_claim_json: string }>(
+      `SELECT turn_claim_json FROM inbound_messages
+        WHERE channel = 'telegram' AND nonce IN ('update:730', 'update:732') ORDER BY nonce`,
+    ).map((row) => JSON.parse(row.turn_claim_json) as {
+      batchConsumedNonces: string[];
+      batchUnconsumedNonces: string[];
+    });
+    expect(claims).toHaveLength(2);
+    expect(claims.every((claim) =>
+      JSON.stringify(claim.batchConsumedNonces) === JSON.stringify(["update:730", "update:732"])
+      && JSON.stringify(claim.batchUnconsumedNonces) === JSON.stringify(["update:731"]))
+    ).toBe(true);
+    expect(harness.cp.db.get<{ turn_claim_json: string | null }>(
+      `SELECT turn_claim_json FROM inbound_messages
+        WHERE channel = 'telegram' AND nonce = 'update:731'`,
     )?.turn_claim_json).toBeNull();
   });
 

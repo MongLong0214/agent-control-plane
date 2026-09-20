@@ -246,6 +246,42 @@ describe("a reply moving through its lifecycle does not take the turn's with it"
     expect(guard.unresolvedTurns("telegram", "session-digest").map((t) => t.nonce)).toEqual(["n1"]);
   });
 
+  it("rolls back an earlier accepted member when a later batch member refuses reply settlement", () => {
+    const harness = makeHarness();
+    const guard = guardFor(harness);
+    admitOne(guard, "n1");
+    guard.parkForBatch("n1", "session-digest");
+    admitOne(guard, "n2");
+    expect(guard.claimOwnerBatch(
+      "telegram",
+      "n2",
+      identity(),
+      ["n1", "n2"],
+      [],
+    ).allowed).toBe(true);
+    expect(reserve(guard, "n1").allowed).toBe(true);
+    expect(reserve(guard, "n2").allowed).toBe(true);
+
+    const refused = guard.completeReplyAndResolveTurn("telegram", "n1", {
+      kind: "TELEGRAM_WORKFLOW",
+      phase: "REPLIED",
+      reply: "답",
+      sent: true,
+      deliveryStatus: "APPLIED",
+    }, "ANSWERED");
+
+    expect(refused.allowed).toBe(false);
+    const first = harness.cp.db.get<{ result_json: string }>(
+      "SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'n1'",
+    );
+    expect((JSON.parse(first?.result_json ?? "{}") as { deliveryStatus?: string }).deliveryStatus).toBe(
+      "PENDING",
+    );
+    expect(
+      (JSON.parse(storedClaim(harness, "n1") ?? "{}") as { repliedAt?: string }).repliedAt,
+    ).toBeUndefined();
+  });
+
   it("is a no-op for a message that never claimed a turn", () => {
     // The ordinary non-CEO path: a handler that only formats a reply. Nothing to resolve, and a
     // refusal here would make every such message fail.

@@ -62,6 +62,32 @@ export interface IngressPolicy {
   transportRetentionMs?: number | null;
 }
 
+export interface OwnerBatchCanonicalClaim {
+  readonly target: ReceiptLookupQuery;
+  readonly sources: readonly {
+    channel: string;
+    nonce: string;
+    attempt: number;
+    payload: unknown;
+  }[];
+}
+
+type OwnerBatchMaterializer = (claim: OwnerBatchCanonicalClaim) => Decision<void>;
+const OWNER_BATCH_MATERIALIZER = Symbol("owner-batch-materializer");
+
+export const withOwnerBatchMaterializer = (
+  identity: TurnIdentity,
+  materialize: OwnerBatchMaterializer,
+): TurnIdentity => {
+  Object.defineProperty(identity, OWNER_BATCH_MATERIALIZER, { value: materialize });
+  return identity;
+};
+
+const ownerBatchMaterializer = (identity: TurnIdentity): OwnerBatchMaterializer | undefined =>
+  (identity as TurnIdentity & { [OWNER_BATCH_MATERIALIZER]?: OwnerBatchMaterializer })[
+    OWNER_BATCH_MATERIALIZER
+  ];
+
 export interface OwnerApprovalIngress {
   runId: string | null;
   /** Candidate current when this owner approval was minted; null only for non-run operations. */
@@ -866,6 +892,9 @@ export class IngressGuard {
    * then receives the same immutable claim identity plus the complete consumed/unconsumed sets.
    * Parked delivery receipts are reset to the fresh admitted phase because the selected rows now
    * participate in one new reply lifecycle; their parking marker remains attached for audit.
+   * A verified canonical target is materialized in the same transaction when available, but that
+   * ledger is additive: its ordinary denial neither rolls this claim back nor blocks its owner.
+   * Thrown materializer or database failures still escape and roll the transaction back.
    */
   claimOwnerBatch(
     channel: string,
@@ -875,6 +904,7 @@ export class IngressGuard {
     unconsumedNonces: readonly string[],
   ): Decision<TurnClaim> {
     return this.db.txDecision(() => {
+      const materializeTurn = ownerBatchMaterializer(identity);
       const consumed = [...consumedNonces];
       const unconsumed = [...unconsumedNonces];
       const consumedSet = new Set(consumed);
@@ -892,10 +922,38 @@ export class IngressGuard {
         });
       }
 
+      const pending = this.pendingOwnerMessages();
+      const expectedConsumed = [
+        ...pending
+          .filter((message) => message.sessionDigest === identity.sessionDigest)
+          .map((message) => message.nonce),
+        currentNonce,
+      ];
+      const expectedUnconsumed = pending
+        .filter((message) => message.sessionDigest !== identity.sessionDigest)
+        .map((message) => message.nonce);
+      if (
+        consumed.length !== expectedConsumed.length
+        || consumed.some((nonce, index) => nonce !== expectedConsumed[index])
+        || unconsumed.length !== expectedUnconsumed.length
+        || unconsumed.some((nonce, index) => nonce !== expectedUnconsumed[index])
+      ) {
+        return deny(
+          ReasonCode.RESOURCE_COLLISION,
+          "owner batch does not match the exact pending snapshot",
+          { channel, nonce: currentNonce },
+        );
+      }
+
       const rows = consumed.map((nonce) => ({
         nonce,
-        row: this.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
-          `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+        row: this.db.get<{
+          result_json: string | null;
+          turn_claim_json: string | null;
+          payload_json: string | null;
+        }>(
+          `SELECT result_json, turn_claim_json, payload_json
+             FROM inbound_messages WHERE channel = ? AND nonce = ?`,
           [channel, nonce],
         ),
       }));
@@ -960,6 +1018,17 @@ export class IngressGuard {
             nonce,
           });
         }
+      }
+      if (materializeTurn && isBoundCanonicalTarget(canonicalTarget, identity)) {
+        materializeTurn({
+          target: canonicalTarget!,
+          sources: rows.map(({ nonce, row }) => ({
+            channel,
+            nonce,
+            attempt: 1,
+            payload: admittedPayload(row!.payload_json),
+          })),
+        });
       }
       return allow(ReasonCode.OK, claim);
     });
@@ -1393,7 +1462,7 @@ export class IngressGuard {
     result: unknown,
     turnOutcome: "ANSWERED" | "UNANSWERED",
   ): Decision<void> {
-    return this.db.tx(() => {
+    return this.db.txDecision(() => {
       const batchNonces = this.#batchNonces(channel, nonce);
       for (const memberNonce of batchNonces) {
         const completed = this.#recordResultHere(

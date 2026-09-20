@@ -14,7 +14,11 @@ import type {
   TelegramIngress,
   TelegramUpdate,
 } from "./telegram.ts";
-import type { UnresolvedTurn } from "./ingress-guard.ts";
+import {
+  withOwnerBatchMaterializer,
+  type OwnerBatchCanonicalClaim,
+  type UnresolvedTurn,
+} from "./ingress-guard.ts";
 import { composeOwnerBatch, renderOwnerBatch, type OwnerMessage } from "./owner-batch.ts";
 
 export interface TelegramDirectInput {
@@ -271,24 +275,19 @@ export interface TelegramRouterOptions {
   /** A deployment may choose one project for the shorthand `/managed <request>` form. */
   defaultProjectId?: string | null;
   /**
-   * Materialises the canonical turn for a message this router has just claimed (#858).
+   * Materialises the canonical turn for the complete owner batch this router is claiming (#858).
    *
    * Narrow on the same principle as `directHandler` below: the router hands over what it claimed
    * and learns only whether the ledger took it. It never receives the coordinator, and the
    * identity is not re-derived here -- `IngressGuard` already stored it with the claim.
    *
-   * Strictly additive. `canonical_turns` has had no production writer, so every operator surface
-   * over it -- contradictions, unresolved-across-actors, resolve-in-doubt, adjudicate -- has been
-   * passing over an empty row set while the ingress ledger held the real turn. If this callback
-   * succeeds the canonical ledger gains the row it should always have had; if it refuses, the
-   * state is exactly what it is today. It cannot make the router's own outcome worse, which is
-   * why the reply path does not branch on it.
+   * It runs inside the ingress claim's outer transaction, so a successful canonical write commits
+   * with the ingress claim before external dispatch. The bridge is strictly additive: an ordinary
+   * returned denial does not undo the ingress claim or stop owner dispatch, while a thrown/database
+   * failure still unwinds the transaction.
    */
-  materializeTurn?: (input: {
-    channel: string;
-    nonce: string;
+  materializeTurn?: (input: OwnerBatchCanonicalClaim & {
     prompt: string;
-    payload: unknown;
   }) => Decision<void>;
   /** DIRECT is deliberately a narrow callback, not a mutation capability. */
   directHandler?: (
@@ -810,9 +809,15 @@ export class TelegramHermesRouter {
           promptDigest: digestOf(input.text),
           ...(overriddenUnresolvedNonces ? { overriddenUnresolvedNonces } : {}),
         };
+        const claimIdentity = this.materializeTurn
+          ? withOwnerBatchMaterializer(
+            identity,
+            (canonicalClaim) => this.materializeTurn!({ ...canonicalClaim, prompt: input.text }),
+          )
+          : identity;
         const claimed = this.ingress.claimOwnerBatch(
           currentNonce,
-          identity,
+          claimIdentity,
           batch.consumedIds,
           batch.unconsumedIds,
         );
@@ -826,23 +831,6 @@ export class TelegramHermesRouter {
             claimed.reasonCode,
           ));
         }
-        // The claim above is the ingress ledger's. The canonical ledger has had no production
-        // writer at all (#858), so `canonical_turns` stayed empty while this row was the real
-        // turn -- which is how four adjudication surfaces and a 60s reconcile sweep all passed
-        // over nothing. This is the bridge, and it is deliberately after the claim: the claim
-        // runs inside `db.tx`, and the coordinator opens its own transaction.
-        //
-        // Not branched on. A refusal leaves exactly today's state -- ingress claimed, canonical
-        // empty -- so failing here can only fail to improve, never make the turn worse. Turning
-        // that into a reply would tell the owner about a ledger they cannot act on.
-        this.materializeTurn?.({
-          channel: "telegram",
-          nonce: currentNonce,
-          prompt: input.text,
-          // Not `update`. `claim()` compares this against the digest `INGRESS_ADMITTED` recorded,
-          // and admission digests the message payload, not the raw update envelope.
-          payload: this.ingress.admittedPayloadFor(update),
-        });
         return {
           status: "CEO_TURN_PENDING",
           outcome: this.completeDirectRoute(update, input),
