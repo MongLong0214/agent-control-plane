@@ -691,6 +691,7 @@ export class TelegramHermesRouter {
           update,
           classified.value.text,
           this.bindingGeneration(),
+          this.defaultProjectId,
         );
 
         // The claim above stops the *same* message from starting a second CEO turn. It cannot
@@ -701,7 +702,21 @@ export class TelegramHermesRouter {
         // never resolve (#672 has no operator door for that yet) — so an unresolved turn parks
         // the message instead of claiming or dropping it, and tells the owner exactly how to get
         // unstuck, unless they already made that choice via `/again`.
-        const unresolved = this.ingress.unresolvedTurns(scopeIdentity.sessionDigest);
+        const canonicalUnresolved = this.ingress.unresolvedTurns(scopeIdentity.sessionDigest);
+        // Pre-S2 claims know only their chat. They remain visible as unresolved, but this digest is
+        // never used to park or select a batch member: its missing project/thread/root scope cannot
+        // be guessed safely. Once those legacy claims settle, only the canonical read remains.
+        const legacyChatDigest = digestOf({
+          channel: "telegram",
+          conversation: classified.value.chatId,
+        });
+        const unresolved = legacyChatDigest === scopeIdentity.sessionDigest
+          ? canonicalUnresolved
+          : [
+              ...canonicalUnresolved,
+              ...this.ingress.unresolvedTurns(legacyChatDigest).filter((legacy) =>
+                canonicalUnresolved.every((canonical) => canonical.nonce !== legacy.nonce)),
+            ];
         // Read once, here, and passed down. Two reads of a set that changes as turns settle could
         // disagree between the enumeration and the advice built from it, and the reply would then
         // name a state that never existed.
@@ -749,21 +764,27 @@ export class TelegramHermesRouter {
         // rest, the same defect this issue closes in a new place.
         const overriddenUnresolvedNonces = unresolved.length > 0 ? unresolved.map((turn) => turn.nonce) : undefined;
         const pending = this.ingress.pendingOwnerMessages();
+        const telegramItemIdentities = new Map<string, { updateId: string; messageId: number }>();
         const ownerMessages: OwnerMessage[] = pending.flatMap((message, sequence) => {
           const payload = message.payload && typeof message.payload === "object" && !Array.isArray(message.payload)
             ? message.payload as Record<string, unknown>
             : null;
-          return typeof payload?.text === "string"
-            ? [{
-                id: message.nonce,
-                sequence,
-                projectId: null,
-                conversation: message.sessionDigest,
-                text: payload.text,
-              }]
-            : [];
+          const updateId = /^update:(\d+)$/.exec(message.nonce)?.[1];
+          if (typeof payload?.text !== "string" || typeof payload.messageId !== "number" || !updateId) return [];
+          telegramItemIdentities.set(message.nonce, { updateId, messageId: payload.messageId });
+          return [{
+            id: message.nonce,
+            sequence,
+            projectId: null,
+            conversation: message.sessionDigest,
+            text: payload.text,
+          }];
         });
         const currentNonce = this.ingress.nonceFor(update);
+        telegramItemIdentities.set(currentNonce, {
+          updateId: String(classified.value.updateId),
+          messageId: classified.value.messageId,
+        });
         ownerMessages.push({
           id: currentNonce,
           sequence: pending.length,
@@ -775,7 +796,12 @@ export class TelegramHermesRouter {
           projectId: null,
           conversation: scopeIdentity.sessionDigest,
         });
-        const renderedBatch = renderOwnerBatch(batch);
+        const renderedBatch = batch.items.every((message) => telegramItemIdentities.has(message.id))
+          ? batch.items.map((message, index) => {
+              const itemIdentity = telegramItemIdentities.get(message.id)!;
+              return `[${index + 1}/${batch.items.length} update_id=${itemIdentity.updateId} message_id=${itemIdentity.messageId}]\n${message.text}`;
+            }).join("\n\n")
+          : renderOwnerBatch(batch);
         const input = batch.items.length > 1
           ? { ...classified.value, text: renderedBatch }
           : classified.value;

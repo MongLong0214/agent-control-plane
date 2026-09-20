@@ -96,6 +96,7 @@ export interface BatchCrashReport {
   consumedIds: readonly string[];
   unconsumedIds: readonly string[];
   claimedRows: number;
+  renderedBatch: string;
 }
 
 export interface BatchRetryReport {
@@ -120,7 +121,9 @@ export interface BatchReceiptReport {
 
 const BATCH_RUNNING_UPDATE_ID = 4251;
 const BATCH_PARKED_UPDATE_IDS = [4252, 4253] as const;
+const BATCH_PARKED_MESSAGE_IDS = [52, 53] as const;
 const BATCH_CURRENT_UPDATE_ID = 4254;
+const BATCH_CURRENT_MESSAGE_ID = 54;
 
 const installHermesTarget = (harness: ReturnType<typeof makeHarness>): void => {
   const binding = harness.cp.db.get<{
@@ -320,15 +323,19 @@ const batchRows = (db: Db): Array<{ nonce: string; turn_claim_json: string }> =>
 
 const batchCrash = async (): Promise<BatchCrashReport> => {
   const transport = telegramQueue([
-    updateFrom(BATCH_RUNNING_UPDATE_ID, BATCH_RUNNING_UPDATE_ID, "batch-running"),
-    ...BATCH_PARKED_UPDATE_IDS.map((updateId) =>
-      updateFrom(updateId, updateId, `batch-parked-${updateId}`)),
+    updateFrom(BATCH_RUNNING_UPDATE_ID, 51, "batch-running"),
+    ...BATCH_PARKED_UPDATE_IDS.map((updateId, index) =>
+      updateFrom(updateId, BATCH_PARKED_MESSAGE_IDS[index]!, `batch-parked-${updateId}`)),
   ], []);
+  let renderedBatch = "";
   const current = await listenerOver(
     undefined,
     transport,
     {
-      onDirect: () => { throw new TelegramInterruption("after-dispatch"); },
+      onDirect: (input) => {
+        renderedBatch = input.text;
+        throw new TelegramInterruption("after-dispatch");
+      },
       installHermesTarget: true,
     },
   );
@@ -346,7 +353,7 @@ const batchCrash = async (): Promise<BatchCrashReport> => {
     if (!resolved.allowed) throw new Error(`${resolved.reasonCode}: ${resolved.message}`);
 
     transport.enqueue(
-      updateFrom(BATCH_CURRENT_UPDATE_ID, BATCH_CURRENT_UPDATE_ID, "batch-current"),
+      updateFrom(BATCH_CURRENT_UPDATE_ID, BATCH_CURRENT_MESSAGE_ID, "batch-current"),
     );
     await pollOnceAndSettle(current.listener);
   } finally {
@@ -366,6 +373,7 @@ const batchCrash = async (): Promise<BatchCrashReport> => {
     consumedIds: claim.batchConsumedNonces ?? [],
     unconsumedIds: claim.batchUnconsumedNonces ?? [],
     claimedRows: rows.length,
+    renderedBatch,
   };
 };
 
@@ -374,7 +382,7 @@ const batchRetry = async (root: string): Promise<BatchRetryReport> => {
   const listener = await listenerOver(
     root,
     telegramQueue([
-      updateFrom(BATCH_CURRENT_UPDATE_ID, BATCH_CURRENT_UPDATE_ID, "batch-current"),
+      updateFrom(BATCH_CURRENT_UPDATE_ID, BATCH_CURRENT_MESSAGE_ID, "batch-current"),
     ], []),
     {
       bind: false,
@@ -494,7 +502,12 @@ const recover = (databasePath: string, sessionDigest: string): RecoverReport => 
 
 /** The session digest the claim stores, derived here rather than read back from the row. */
 export const expectedSessionDigest = (): string =>
-  digestOf({ channel: CHANNEL, conversation: CHAT_ID });
+  digestOf({
+    projectId: null,
+    chatId: CHAT_ID,
+    message_thread_id: null,
+    replyRootMessageId: null,
+  });
 
 const SCRIPT = fileURLToPath(import.meta.url);
 

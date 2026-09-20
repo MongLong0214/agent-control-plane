@@ -875,9 +875,18 @@ export class IngressGuard {
     unconsumedNonces: readonly string[],
   ): Decision<TurnClaim> {
     return this.db.txDecision(() => {
-      const consumed = [...new Set(consumedNonces)];
-      if (consumed.length === 0 || !consumed.includes(currentNonce)) {
-        return deny(ReasonCode.INVALID_ARGUMENT, "owner batch must include the current admitted message", {
+      const consumed = [...consumedNonces];
+      const unconsumed = [...unconsumedNonces];
+      const consumedSet = new Set(consumed);
+      const unconsumedSet = new Set(unconsumed);
+      if (
+        consumed.length === 0
+        || !consumedSet.has(currentNonce)
+        || consumedSet.size !== consumed.length
+        || unconsumedSet.size !== unconsumed.length
+        || unconsumed.some((nonce) => consumedSet.has(nonce))
+      ) {
+        return deny(ReasonCode.INVALID_ARGUMENT, "owner batch IDs must be unique, disjoint, and include the current admitted message", {
           channel,
           nonce: currentNonce,
         });
@@ -921,12 +930,6 @@ export class IngressGuard {
         }
       }
 
-      const consumedSet = new Set(consumed);
-      const observedUnconsumed = this.pendingOwnerMessages()
-        .map((message) => message.nonce)
-        .filter((nonce) => !consumedSet.has(nonce));
-      const unconsumed = [...new Set([...unconsumedNonces, ...observedUnconsumed])]
-        .filter((nonce) => !consumedSet.has(nonce));
       const receiptIdentity = this.#receiptIdentityForClaim?.(identity) ?? null;
       const canonicalTarget = this.#canonicalTargetForClaim?.(identity) ?? null;
       const claim: TurnClaim = {
@@ -1271,12 +1274,16 @@ export class IngressGuard {
   pendingOwnerMessages(sessionDigest?: string): readonly ParkedOwnerMessage[] {
     const rows = this.db.all<{
       nonce: string;
+      arrival_sequence: number;
+      received_at: string;
       parked_at: string;
       payload_json: string | null;
       session_digest: string;
     }>(
       `WITH pending AS (
          SELECT admitted.nonce AS nonce,
+                admitted.rowid AS arrival_sequence,
+                admitted.received_at AS received_at,
                 json_extract(admitted.result_json, '$.parked.parkedAt') AS parked_at,
                 admitted.payload_json AS payload_json,
                 json_extract(admitted.result_json, '$.parked.sessionDigest') AS session_digest
@@ -1289,6 +1296,8 @@ export class IngressGuard {
             AND json_type(admitted.result_json, '$.parked.parkedAt') = 'text'
          UNION ALL
          SELECT admitted.nonce AS nonce,
+                admitted.rowid AS arrival_sequence,
+                admitted.received_at AS received_at,
                 legacy.received_at AS parked_at,
                 admitted.payload_json AS payload_json,
                 legacy.actor AS session_digest
@@ -1306,15 +1315,16 @@ export class IngressGuard {
               AND json_type(admitted.result_json, '$.parked.parkedAt') = 'text'
             ), 0)
        )
-       SELECT nonce, parked_at, payload_json, session_digest
+       SELECT nonce, arrival_sequence, received_at, parked_at, payload_json, session_digest
          FROM pending
         WHERE ? IS NULL OR session_digest IS ?
-        ORDER BY parked_at ASC, nonce ASC`,
+        ORDER BY received_at ASC, arrival_sequence ASC`,
       [LEGACY_PARKED_BATCH_CHANNEL, sessionDigest ?? null, sessionDigest ?? null],
     );
     return rows.map((row) => ({
       nonce: row.nonce,
       sessionDigest: row.session_digest,
+      arrivalSequence: row.arrival_sequence,
       receivedAt: row.parked_at,
       payload: admittedPayload(row.payload_json),
     }));
@@ -2087,6 +2097,8 @@ export interface ParkedOwnerMessage {
   readonly nonce: string;
   /** The turn identity's conversation digest, which is this repository's one name for "same chat". */
   readonly sessionDigest: string;
+  /** SQLite insertion order for the admitted row; the stable tie-break for equal timestamps. */
+  readonly arrivalSequence: number;
   readonly receivedAt: string;
   readonly payload: unknown;
 }

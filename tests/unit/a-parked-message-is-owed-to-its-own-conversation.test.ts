@@ -2,13 +2,13 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { startDaemonTelegramListener } from "../../src/daemon/agentcpd.ts";
 import { TelegramInterruption } from "../../src/ingress/telegram-router.ts";
-import { IngressGuard } from "../../src/ingress/ingress-guard.ts";
+import { IngressGuard, type TurnIdentity } from "../../src/ingress/ingress-guard.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import type {
   TelegramBotTransport,
   TelegramLongPollConfig,
 } from "../../src/ingress/telegram-polling.ts";
-import type { TelegramUpdate } from "../../src/ingress/telegram.ts";
+import { TelegramIngress, type TelegramUpdate } from "../../src/ingress/telegram.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeHarness, TEST_OWNER } from "../helpers/harness.ts";
 
@@ -42,6 +42,14 @@ const CHAT_B = "-100222";
 // keep passing against a digest nothing in production computes any more.
 const conversationOf = (chatId: string): string =>
   digestOf({ channel: "telegram", conversation: chatId });
+
+const canonicalConversationOf = (chatId: string): string =>
+  digestOf({
+    projectId: null,
+    chatId,
+    message_thread_id: null,
+    replyRootMessageId: null,
+  });
 
 const telegramConfig: TelegramLongPollConfig = {
   botToken: "telegram-test-token",
@@ -89,6 +97,198 @@ const readerFor = (harness: ReturnType<typeof makeHarness>) =>
   });
 
 describe("a parked message is owed to its own conversation", () => {
+  it("uses project, chat, thread, and reply root as the canonical batch scope", () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const ingress = new TelegramIngress(readerFor(harness), { webhookSecret: SECRET });
+    const identityFor = ingress.turnIdentityFor.bind(ingress) as unknown as (
+      update: TelegramUpdate,
+      text: string,
+      bindingGeneration: number | null,
+      projectId: string | null,
+    ) => TurnIdentity;
+    const scopedUpdate = (threadId: number, replyRootMessageId: number): TelegramUpdate => {
+      const value = update("same owner text", 700, CHAT_A) as TelegramUpdate & {
+        message: NonNullable<TelegramUpdate["message"]> & { message_thread_id: number };
+      };
+      value.message.message_thread_id = threadId;
+      value.message.reply_to_message = { message_id: replyRootMessageId };
+      return value;
+    };
+
+    const base = identityFor(scopedUpdate(11, 21), "same owner text", null, "project-a");
+    const otherProject = identityFor(scopedUpdate(11, 21), "same owner text", null, "project-b");
+    const otherThread = identityFor(scopedUpdate(12, 21), "same owner text", null, "project-a");
+    const otherRoot = identityFor(scopedUpdate(11, 22), "same owner text", null, "project-a");
+
+    expect(base.sessionDigest).toBe(digestOf({
+      projectId: "project-a",
+      chatId: CHAT_A,
+      message_thread_id: 11,
+      replyRootMessageId: 21,
+    }));
+    expect(new Set([
+      base.sessionDigest,
+      otherProject.sessionDigest,
+      otherThread.sessionDigest,
+      otherRoot.sessionDigest,
+    ]).size).toBe(4);
+  });
+
+  it("keeps a legacy chat-only unresolved turn visible without assigning it the new scope", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const guard = readerFor(harness);
+    expect(guard.admit({
+      channel: "telegram",
+      actor: OWNER_ID,
+      conversation: CHAT_A,
+      nonce: "update:710",
+      payload: { text: "legacy unresolved", messageId: 710 },
+    }).allowed).toBe(true);
+    expect(guard.claimTurn("telegram", "update:710", {
+      turnRequestId: "legacy-turn-710",
+      sessionDigest: conversationOf(CHAT_A),
+      promptDigest: digestOf("legacy unresolved"),
+      bindingDigest: digestOf({ bindingGeneration: null }),
+    }).allowed).toBe(true);
+
+    const next = update("new scoped message", 711, CHAT_A);
+    next.message!.message_thread_id = 31;
+    next.message!.reply_to_message = { message_id: 41 };
+    const transport = new OneShotTransport();
+    transport.updates = [next];
+    let executions = 0;
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      { ...telegramConfig, defaultProjectId: "project-a" },
+      { handleOperator: async () => ({ ok: true }) } as never,
+      {
+        transport,
+        start: false,
+        onDirect: async () => {
+          executions += 1;
+          return "must remain parked";
+        },
+      },
+    );
+    try {
+      const cycle = await listener.service.pollOnce();
+      await listener.service.pendingTurnsSettled();
+      await cycle.settled();
+    } finally {
+      await listener.close();
+    }
+
+    const canonicalScope = digestOf({
+      projectId: "project-a",
+      chatId: CHAT_A,
+      message_thread_id: 31,
+      replyRootMessageId: 41,
+    });
+    expect(executions, "the legacy unresolved turn became invisible to the canonical reader").toBe(0);
+    expect(guard.pendingOwnerMessages(canonicalScope).map((item) => item.nonce)).toEqual([
+      "update:711",
+    ]);
+    expect(guard.unresolvedTurns("telegram", conversationOf(CHAT_A))).toHaveLength(1);
+  });
+
+  it("uses SQLite arrival sequence to keep same-millisecond updates in arrival order", () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const guard = readerFor(harness);
+    const scope = "canonical-same-millisecond-scope";
+    for (const [nonce, messageId] of [["update:9", 109], ["update:10", 110]] as const) {
+      expect(guard.admit({
+        channel: "telegram",
+        actor: OWNER_ID,
+        conversation: CHAT_A,
+        nonce,
+        payload: { text: nonce, messageId },
+      }).allowed).toBe(true);
+      guard.parkForBatch(nonce, scope);
+    }
+
+    const pending = guard.pendingOwnerMessages(scope) as unknown as ReadonlyArray<{
+      nonce: string;
+      arrivalSequence?: number;
+    }>;
+    expect(pending.map((item) => item.nonce)).toEqual(["update:9", "update:10"]);
+    expect(pending.map((item) => item.arrivalSequence)).toEqual([
+      expect.any(Number),
+      expect.any(Number),
+    ]);
+    expect(pending[0]!.arrivalSequence!).toBeLessThan(pending[1]!.arrivalSequence!);
+  });
+
+  it("preserves exact empty batch bookkeeping and never consumes an unknown-scope legacy park", () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const guard = readerFor(harness);
+    expect(guard.admit({
+      channel: "telegram",
+      actor: OWNER_ID,
+      conversation: CHAT_A,
+      nonce: "update:720",
+      payload: { text: "legacy unknown scope", messageId: 1720 },
+    }).allowed).toBe(true);
+    harness.cp.db.run(
+      `INSERT INTO inbound_messages (channel, nonce, actor, received_at)
+        VALUES ('telegram-owner-parked', 'update:720', ?, ?)`,
+      [conversationOf(CHAT_A), harness.clock.nowIso()],
+    );
+
+    const canonicalScope = "canonical-project-chat-thread-root";
+    for (const nonce of ["update:721", "update:722"] as const) {
+      expect(guard.admit({
+        channel: "telegram",
+        actor: OWNER_ID,
+        conversation: CHAT_A,
+        nonce,
+        payload: { text: nonce, messageId: Number(nonce.split(":")[1]) },
+      }).allowed).toBe(true);
+    }
+    const exact = guard.claimOwnerBatch(
+      "telegram",
+      "update:721",
+      {
+        turnRequestId: "turn-721",
+        sessionDigest: canonicalScope,
+        promptDigest: digestOf("update:721"),
+        bindingDigest: digestOf({ bindingGeneration: null }),
+      },
+      ["update:721"],
+      [],
+    );
+    expect(exact.allowed).toBe(true);
+    if (!exact.allowed) return;
+    expect(exact.value.batchConsumedNonces).toEqual(["update:721"]);
+    expect(exact.value.batchUnconsumedNonces).toEqual([]);
+    expect(guard.pendingOwnerMessages().map((item) => item.nonce)).toContain("update:720");
+
+    const guessed = guard.claimOwnerBatch(
+      "telegram",
+      "update:722",
+      {
+        turnRequestId: "turn-722",
+        sessionDigest: canonicalScope,
+        promptDigest: digestOf("legacy unknown scope\nupdate:722"),
+        bindingDigest: digestOf({ bindingGeneration: null }),
+      },
+      ["update:720", "update:722"],
+      [],
+    );
+    expect(guessed.allowed).toBe(false);
+    expect(harness.cp.db.get<{ turn_claim_json: string | null }>(
+      `SELECT turn_claim_json FROM inbound_messages
+        WHERE channel = 'telegram' AND nonce = 'update:720'`,
+    )?.turn_claim_json).toBeNull();
+  });
+
   it("keeps two chats' parked messages apart, in arrival order, and drops one once its turn is claimed", async () => {
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
@@ -136,8 +336,8 @@ describe("a parked message is owed to its own conversation", () => {
 
     const reader = readerFor(harness);
 
-    const a = reader.pendingOwnerMessages(conversationOf(CHAT_A));
-    const b = reader.pendingOwnerMessages(conversationOf(CHAT_B));
+    const a = reader.pendingOwnerMessages(canonicalConversationOf(CHAT_A));
+    const b = reader.pendingOwnerMessages(canonicalConversationOf(CHAT_B));
 
     // The boundary the CEO's ruling names. Asserted as the whole list rather than "contains", so
     // a reader that returned every parked message regardless of chat fails here instead of
@@ -154,7 +354,7 @@ describe("a parked message is owed to its own conversation", () => {
 
     // Every returned message names the conversation it is owed to, so a caller composing a batch
     // cannot lose the scope on the way.
-    expect(new Set(a.map((m) => m.sessionDigest))).toEqual(new Set([conversationOf(CHAT_A)]));
+    expect(new Set(a.map((m) => m.sessionDigest))).toEqual(new Set([canonicalConversationOf(CHAT_A)]));
   });
 
   it("claims three same-conversation messages as one ordered execution and fans out success", async () => {
@@ -207,18 +407,18 @@ describe("a parked message is owed to its own conversation", () => {
 
     expect(executions).toEqual([
       [
-        "[1/3 id=update:802]",
+        "[1/3 update_id=802 message_id=802]",
         "a-parked-1",
         "",
-        "[2/3 id=update:803]",
+        "[2/3 update_id=803 message_id=803]",
         "a-parked-2",
         "",
-        "[3/3 id=update:806]",
+        "[3/3 update_id=806 message_id=806]",
         "a-current",
       ].join("\n"),
     ]);
-    expect(guard.pendingOwnerMessages(conversationOf(CHAT_A))).toEqual([]);
-    expect(guard.pendingOwnerMessages(conversationOf(CHAT_B)).map((item) => item.nonce)).toEqual([
+    expect(guard.pendingOwnerMessages(canonicalConversationOf(CHAT_A))).toEqual([]);
+    expect(guard.pendingOwnerMessages(canonicalConversationOf(CHAT_B)).map((item) => item.nonce)).toEqual([
       "update:805",
     ]);
 

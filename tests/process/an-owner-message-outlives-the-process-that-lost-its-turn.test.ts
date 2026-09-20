@@ -77,6 +77,16 @@ describe("an owner message outlives the process that lost its turn", () => {
       expect(crashed.consumedIds).toEqual(["update:4252", "update:4253", "update:4254"]);
       expect(crashed.unconsumedIds).toEqual([]);
       expect(crashed.claimedRows).toBe(3);
+      expect(crashed.renderedBatch).toBe([
+        "[1/3 update_id=4252 message_id=52]",
+        "batch-parked-4252",
+        "",
+        "[2/3 update_id=4253 message_id=53]",
+        "batch-parked-4253",
+        "",
+        "[3/3 update_id=4254 message_id=54]",
+        "batch-current",
+      ].join("\n"));
 
       const retried = runInItsOwnProcess<BatchRetryReport>("batch-retry", crashed.root);
       expect(retried.pid).not.toBe(crashed.pid);
