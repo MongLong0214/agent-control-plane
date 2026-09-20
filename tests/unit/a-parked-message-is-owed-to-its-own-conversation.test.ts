@@ -1,0 +1,221 @@
+import { afterAll, describe, expect, it } from "vitest";
+
+import { startDaemonTelegramListener } from "../../src/daemon/agentcpd.ts";
+import { TelegramInterruption } from "../../src/ingress/telegram-router.ts";
+import { IngressGuard } from "../../src/ingress/ingress-guard.ts";
+import { digestOf } from "../../src/core/digest.ts";
+import type {
+  TelegramBotTransport,
+  TelegramLongPollConfig,
+} from "../../src/ingress/telegram-polling.ts";
+import type { TelegramUpdate } from "../../src/ingress/telegram.ts";
+import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { makeHarness, TEST_OWNER } from "../helpers/harness.ts";
+
+afterAll(cleanupTempDirs);
+
+/**
+ * What a parked message is owed, and to whom (#631).
+ *
+ * A message that arrives while this conversation has an unresolved turn is parked: admitted,
+ * kept, and answered with an advisory rather than run. Until now nothing recorded *which*
+ * conversation it was parked for, because the admitted row does not carry one -- `admit` is
+ * handed `conversation` and writes it only to the audit trail. Its `actor` column is the sender,
+ * which is one person across every chat they are allowlisted in, so it cannot separate two chats.
+ *
+ * That is the whole reason the batch could not be built. The CEO's ruling on #628/#631 is
+ * explicit that a batch never spans a conversation, and a reader with only `actor` to go on would
+ * merge two chats on its first run.
+ *
+ * These cases enter where production enters -- real updates through the long-poll listener -- and
+ * read back through the same reader the next claim will use. A test that called `parkForBatch`
+ * directly would pass against a router that never calls it, which is the defect this slice is
+ * one half of.
+ */
+const SECRET = "telegram-configured-secret";
+const OWNER_ID = "424242";
+const CHAT_A = "-100111";
+const CHAT_B = "-100222";
+
+// The conversation identity the product uses, spelled the way `TelegramIngress.turnIdentityFor`
+// spells it. Restated here on purpose: if that formula changes, these cases must fail rather than
+// keep passing against a digest nothing in production computes any more.
+const conversationOf = (chatId: string): string =>
+  digestOf({ channel: "telegram", conversation: chatId });
+
+const telegramConfig: TelegramLongPollConfig = {
+  botToken: "telegram-test-token",
+  webhookSecret: SECRET,
+  allowedChatIds: [CHAT_A, CHAT_B],
+  allowedOwnerIds: [OWNER_ID],
+};
+
+const update = (text: string, updateId: number, chatId: string): TelegramUpdate => ({
+  update_id: updateId,
+  message: {
+    message_id: updateId,
+    date: 1_700_000_000,
+    text,
+    from: { id: Number(OWNER_ID), username: "owner" },
+    chat: { id: Number(chatId) },
+  },
+});
+
+/** The minimum a listener needs: hand it the queued updates once, and accept every reply. */
+class OneShotTransport implements TelegramBotTransport {
+  readonly redeliveryRetentionMs = 24 * 60 * 60 * 1000;
+  updates: TelegramUpdate[] = [];
+  #handed = false;
+
+  async getUpdates(): Promise<readonly TelegramUpdate[]> {
+    if (this.#handed) return [];
+    this.#handed = true;
+    return this.updates;
+  }
+
+  async sendMessage(): Promise<void> {
+    // The reply is not what these cases measure, and a transport that refused it would stop the
+    // route before it parked.
+  }
+}
+
+const readerFor = (harness: ReturnType<typeof makeHarness>) =>
+  new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, {
+    telegram: {
+      allowedActors: [OWNER_ID],
+      allowedConversations: [CHAT_A, CHAT_B],
+      recoverInFlight: true,
+    },
+  });
+
+describe("a parked message is owed to its own conversation", () => {
+  it("keeps two chats' parked messages apart, in arrival order, and drops one once its turn is claimed", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+
+    // Every turn crashes after dispatch. That is what leaves an unresolved turn behind, which is
+    // the precondition for parking -- not a detail of this test, but the state the product parks
+    // in.
+    const crash = async (): Promise<string> => {
+      throw new TelegramInterruption("after-dispatch");
+    };
+
+    // Chat A: one turn that goes unresolved, then two messages that park behind it. Chat B: the
+    // same shape, so the two chats are symmetric and a reader that merged them would be caught by
+    // count alone rather than by which text it returned.
+    const sequence: Array<{ text: string; id: number; chat: string }> = [
+      { text: "a-first", id: 801, chat: CHAT_A },
+      { text: "a-parked-1", id: 802, chat: CHAT_A },
+      { text: "a-parked-2", id: 803, chat: CHAT_A },
+      { text: "b-first", id: 804, chat: CHAT_B },
+      { text: "b-parked-1", id: 805, chat: CHAT_B },
+    ];
+
+    for (const step of sequence) {
+      const transport = new OneShotTransport();
+      transport.updates = [update(step.text, step.id, step.chat)];
+      const listener = await startDaemonTelegramListener(
+        harness.cp,
+        telegramConfig,
+        { handleOperator: async () => ({ ok: true }) } as never,
+        { transport, start: false, onDirect: crash },
+      );
+      try {
+        // The whole cycle, not just the poll: the turn detaches (#630), so its crash surfaces
+        // through `pendingTurnsSettled`/`settled` rather than the poll promise. Swallowed here
+        // because the crash is this test's setup -- an unresolved turn is what makes the next
+        // message park -- and not the behaviour under measurement.
+        const cycle = await listener.service.pollOnce();
+        await listener.service.pendingTurnsSettled().catch(() => undefined);
+        await cycle.settled().catch(() => undefined);
+      } finally {
+        await listener.close();
+      }
+    }
+
+    const reader = readerFor(harness);
+
+    const a = reader.pendingOwnerMessages(conversationOf(CHAT_A));
+    const b = reader.pendingOwnerMessages(conversationOf(CHAT_B));
+
+    // The boundary the CEO's ruling names. Asserted as the whole list rather than "contains", so
+    // a reader that returned every parked message regardless of chat fails here instead of
+    // passing a membership check.
+    expect(a.map((m) => (m.payload as { text?: string } | null)?.text)).toEqual([
+      "a-parked-1",
+      "a-parked-2",
+    ]);
+    expect(b.map((m) => (m.payload as { text?: string } | null)?.text)).toEqual(["b-parked-1"]);
+
+    // Arrival order, and it is the index's order rather than the reader's sort of whatever came
+    // back: 803 was parked after 802 and must stay behind it.
+    expect(a.map((m) => m.nonce)).toEqual(["update:802", "update:803"]);
+
+    // Every returned message names the conversation it is owed to, so a caller composing a batch
+    // cannot lose the scope on the way.
+    expect(new Set(a.map((m) => m.sessionDigest))).toEqual(new Set([conversationOf(CHAT_A)]));
+  });
+
+  it("a message whose turn was claimed is no longer owed", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const guard = readerFor(harness);
+
+    // Admitted, then parked, then claimed -- the `/again` path, which claims a parked message
+    // directly. Returning it afterwards would put the same message in a batch a second time,
+    // which is the duplication this whole issue exists to prevent.
+    guard.admit({
+      channel: "telegram",
+      actor: OWNER_ID,
+      conversation: CHAT_A,
+      nonce: "update:900",
+      payload: { text: "claimed-later", messageId: 900 },
+    });
+    guard.parkForBatch("update:900", conversationOf(CHAT_A));
+    expect(guard.pendingOwnerMessages(conversationOf(CHAT_A)).map((m) => m.nonce)).toEqual(["update:900"]);
+
+    const claimed = guard.claimTurn("telegram", "update:900", {
+      turnRequestId: "turn-900",
+      sessionDigest: "session-digest",
+      promptDigest: "prompt-digest",
+      bindingDigest: "binding-digest",
+    });
+    expect(claimed.allowed).toBe(true);
+
+    expect(guard.pendingOwnerMessages(conversationOf(CHAT_A))).toEqual([]);
+  });
+
+  it("parking the same message twice keeps its first place in the queue", () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const guard = readerFor(harness);
+
+    for (const [nonce, text] of [
+      ["update:910", "first"],
+      ["update:911", "second"],
+    ] as const) {
+      guard.admit({
+        channel: "telegram",
+        actor: OWNER_ID,
+        conversation: CHAT_A,
+        nonce,
+        payload: { text, messageId: Number(nonce.split(":")[1]) },
+      });
+      guard.parkForBatch(nonce, conversationOf(CHAT_A));
+    }
+
+    // Telegram redelivers any update this listener has not acknowledged, so the router reaches
+    // parking again for a message already parked. Re-parking must not move it: an `INSERT OR
+    // REPLACE` here would rewrite `received_at` and send the older message to the back of its own
+    // batch, reordering the owner's words.
+    guard.parkForBatch("update:910", conversationOf(CHAT_A));
+
+    expect(guard.pendingOwnerMessages(conversationOf(CHAT_A)).map((m) => m.nonce)).toEqual([
+      "update:910",
+      "update:911",
+    ]);
+  });
+});

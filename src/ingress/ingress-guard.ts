@@ -116,6 +116,40 @@ export const buzzActorBindingSigningRequest = (
 });
 
 const DEFAULT_NONCE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The namespace the parked-message index lives in (#631).
+ *
+ * `inbound_messages` is already keyed by `(channel, nonce)` across several namespaces -- `mcp`,
+ * `telegram`, and `telegram-owner-prompt` -- so an index needs no schema change, and a schema
+ * change is not available here: `src/db/migrations.ts` is byte-pinned in
+ * `tests/helpers/frozen-authority.ts` and an append moves the digest as surely as an edit.
+ *
+ * Why an index at all: batching must never span a conversation, and the admitted row cannot say
+ * which conversation it belongs to. `admit` is handed `conversation` and writes it only to the
+ * audit trail, so by the time a message is parked the durable row has a channel, a nonce, an
+ * actor -- the *sender*, which is one person across every chat they are allowlisted in -- and the
+ * payload. None of those separates two chats.
+ *
+ * What it is keyed by is the turn identity's `sessionDigest`, not the chat id, and that is not a
+ * detail. A record on `86a10fd` ruled out storing the conversation in its own column: it is a
+ * second definition of a fact the claim already carries, and two spellings of "the same
+ * conversation" are how they come to disagree. `sessionDigest` is that existing definition --
+ * `digestOf({ channel, conversation })`, the same value `unresolvedTurns` selects on and the same
+ * value the router has already computed by the time it parks -- so the index reuses the
+ * conversation identity rather than minting a parallel one.
+ *
+ * Ruled out putting the chat id in the admitted payload instead: `claim()` compares a source's
+ * payload digest against the one `INGRESS_ADMITTED` recorded, so changing that shape refuses
+ * every message admitted before the change and redelivered after it. `admittedPayloadFor`'s own
+ * docstring records that exact class going unnoticed "on every message, in every deployment".
+ *
+ * This row carries **only** the conversation and the arrival order. It is deliberately not a
+ * second copy of the message: the text stays in the admitted row's `payload_json`, which remains
+ * the single authority for what the owner said. An index that also carried the content would be
+ * two records of one fact, and the two would drift.
+ */
+const PARKED_BATCH_CHANNEL = "telegram-owner-parked";
 type TelegramReplyTransitionExpectation = "AVAILABLE" | "PENDING" | "UNKNOWN_RETRYABLE";
 
 /**
@@ -976,6 +1010,81 @@ export class IngressGuard {
   }
 
   /**
+   * Notes that an admitted message was parked rather than run, so the next claim can take it.
+   *
+   * Idempotent, and it cannot be made so by a conflict clause. Parking is reached again whenever
+   * Telegram redelivers an update this listener has not acknowledged, so a second park must not
+   * become a second item in the batch -- but `inbound_messages_no_replace` is a BEFORE INSERT
+   * trigger that aborts on any `(channel, nonce)` already present, which fires ahead of `OR
+   * IGNORE` as surely as ahead of `OR REPLACE`. That trigger exists because a replaced row is a
+   * nonce that has never been seen, and its comment names this issue as what found the hole; it
+   * is not something to work around.
+   *
+   * So the existence check and the insert are one transaction. Keeping the first row is the point
+   * rather than a side effect: `received_at` is the arrival order the batch is read in, and a
+   * re-park that rewrote it would send the earlier message to the back of its own batch and
+   * reorder the owner's words.
+   *
+   * Takes `sessionDigest` from the caller because the admitted row does not carry it; see
+   * `PARKED_BATCH_CHANNEL` for why it is that digest and not the chat id.
+   */
+  parkForBatch(nonce: string, sessionDigest: string): void {
+    this.db.tx(() => {
+      const parked = this.db.get<{ one: number }>(
+        `SELECT 1 AS one FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+        [PARKED_BATCH_CHANNEL, nonce],
+      );
+      if (parked) return;
+      this.db.run(
+        `INSERT INTO inbound_messages (channel, nonce, actor, received_at)
+          VALUES (?, ?, ?, ?)`,
+        [PARKED_BATCH_CHANNEL, nonce, sessionDigest, this.clock.nowIso()],
+      );
+    });
+  }
+
+  /**
+   * Every parked message still owed to one conversation, oldest first.
+   *
+   * Joined back to the admitted row rather than read from the index: the index holds the
+   * conversation and the order, and the admitted row holds what the owner actually said. A
+   * parked entry whose admitted row is gone -- pruned after its TTL, or never written -- is
+   * dropped here rather than returned with an empty payload, because a batch item that cannot
+   * say what it carries is worse than one message fewer and would be indistinguishable from a
+   * message with no text.
+   *
+   * A message whose turn has since been claimed is excluded: `/again` claims a parked message
+   * directly, and returning it here afterwards would put it in a batch a second time.
+   *
+   * Ordered by `(received_at, nonce)`. `received_at` alone is not a total order -- a batch of
+   * owner messages is exactly the traffic that shares a millisecond (#858) -- and `nonce` is
+   * `update:<update_id>`, unique per message within the channel.
+   */
+  pendingOwnerMessages(sessionDigest: string): readonly ParkedOwnerMessage[] {
+    const rows = this.db.all<{
+      nonce: string;
+      received_at: string;
+      payload_json: string | null;
+    }>(
+      `SELECT parked.nonce AS nonce, parked.received_at AS received_at, admitted.payload_json AS payload_json
+         FROM inbound_messages AS parked
+         JOIN inbound_messages AS admitted
+           ON admitted.channel = ? AND admitted.nonce = parked.nonce
+        WHERE parked.channel = ?
+          AND parked.actor = ?
+          AND admitted.turn_claim_json IS NULL
+        ORDER BY parked.received_at ASC, parked.nonce ASC`,
+      ["telegram", PARKED_BATCH_CHANNEL, sessionDigest],
+    );
+    return rows.map((row) => ({
+      nonce: row.nonce,
+      sessionDigest,
+      receivedAt: row.received_at,
+      payload: admittedPayload(row.payload_json),
+    }));
+  }
+
+  /**
    * Records that this message's turn produced a reply the transport accepted.
    *
    * The middle transition of `AVAILABLE → TURN_CLAIMED → (turn outcome) → REPLY_PENDING →
@@ -1692,6 +1801,15 @@ const normalizeStoredTurnClaim = (claim: StoredTurnClaim): TurnClaim => {
 };
 
 /** A claimed turn with the row context a reader needs to say which message it was. */
+/** One message parked for a later batch (#631). The payload is the admitted row's, not the index's. */
+export interface ParkedOwnerMessage {
+  readonly nonce: string;
+  /** The turn identity's conversation digest, which is this repository's one name for "same chat". */
+  readonly sessionDigest: string;
+  readonly receivedAt: string;
+  readonly payload: unknown;
+}
+
 export interface UnresolvedTurn extends TurnClaim {
   nonce: string;
   /**

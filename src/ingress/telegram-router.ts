@@ -711,6 +711,15 @@ export class TelegramHermesRouter {
           // grow without bound, and naming all of them risks the exact opposite failure — a
           // reply so long it cannot be sent, or one truncated in a way that drops the
           // instructions telling the owner `/again` exists at all.
+          // Parked is not dropped, and the owner should not have to resend. The index this
+          // writes is what lets the next claim on this chat take these messages as one batch
+          // (#631) instead of the owner spending an `/again` per message. Written before the
+          // reply so a process that dies between them has already recorded what it parked;
+          // the reply is retried by the transport, the park is not.
+          //
+          // Not branched on: parking already happened, and a failure to index it leaves exactly
+          // today's behaviour, which is a message the owner must resend rather than one lost.
+          this.ingress.parkForBatch(update, identity.sessionDigest);
           return completedRoute(this.outcomeWithReply(
             update,
             true,
