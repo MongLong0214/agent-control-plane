@@ -119,8 +119,8 @@ const DEFAULT_NONCE_TTL_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Rows from PR #979's temporary parked-message index. New parking state lives on the admitted
- * Telegram row itself; this name remains only so each park can remove a bounded number of legacy
- * rows. Keeping it as a reader or writer would leave two authorities for one lifecycle.
+ * Telegram row itself; old databases still need this name to read and promote valid pairs without
+ * making the synthetic row a second content authority.
  */
 const LEGACY_PARKED_BATCH_CHANNEL = "telegram-owner-parked";
 const LEGACY_PARK_CLEANUP_LIMIT = 100;
@@ -1161,22 +1161,14 @@ export class IngressGuard {
    * lifecycle marker carries the already-canonical `sessionDigest` and first arrival time.
    * Re-parking is idempotent and cannot move the message later in its queue.
    *
-   * Every call also removes at most `LEGACY_PARK_CLEANUP_LIMIT` rows from PR #979's synthetic
-   * channel. The bounded sweep means an orphan using a newly reused nonce is never consulted as
-   * authority, while old databases converge without an unbounded write transaction.
+   * Every call first promotes at most `LEGACY_PARK_CLEANUP_LIMIT` valid pairs from PR #979's
+   * synthetic channel. A pair is valid only when its admitted lifetime began no later than the
+   * park; otherwise a reused nonce could inherit an earlier conversation. Only a successful or
+   * already-equivalent promotion permits deleting the legacy row.
    */
   parkForBatch(nonce: string, sessionDigest: string): void {
     this.db.tx(() => {
-      this.db.run(
-        `DELETE FROM inbound_messages
-          WHERE rowid IN (
-            SELECT rowid FROM inbound_messages
-              WHERE channel = ?
-              ORDER BY received_at ASC, nonce ASC
-              LIMIT ?
-          )`,
-        [LEGACY_PARKED_BATCH_CHANNEL, LEGACY_PARK_CLEANUP_LIMIT],
-      );
+      this.#promoteLegacyParks();
 
       const admitted = this.db.get<{
         actor: string;
@@ -1215,6 +1207,62 @@ export class IngressGuard {
     });
   }
 
+  /** Promote only legacy rows whose nonce still names the admitted lifetime they followed. */
+  #promoteLegacyParks(): void {
+    const legacyRows = this.db.all<{
+      nonce: string;
+      session_digest: string;
+      parked_at: string;
+      admitted_at: string;
+      result_json: string | null;
+      turn_claim_json: string | null;
+    }>(
+      `SELECT legacy.nonce AS nonce,
+              legacy.actor AS session_digest,
+              legacy.received_at AS parked_at,
+              admitted.received_at AS admitted_at,
+              admitted.result_json AS result_json,
+              admitted.turn_claim_json AS turn_claim_json
+         FROM inbound_messages AS legacy
+         JOIN inbound_messages AS admitted
+           ON admitted.channel = 'telegram'
+          AND admitted.nonce = legacy.nonce
+          AND admitted.received_at <= legacy.received_at
+        WHERE legacy.channel = ?
+        ORDER BY legacy.received_at ASC, legacy.nonce ASC
+        LIMIT ?`,
+      [LEGACY_PARKED_BATCH_CHANNEL, LEGACY_PARK_CLEANUP_LIMIT],
+    );
+
+    for (const legacy of legacyRows) {
+      if (legacy.turn_claim_json !== null) continue;
+      const state = ingressResultRecord(legacy.result_json);
+      const parked = parkedLifecycle(state);
+      const equivalent = parked?.sessionDigest === legacy.session_digest
+        && parked.parkedAt === legacy.parked_at;
+      if (!equivalent) {
+        if (parked || (state && !isClaimable(legacy.result_json))) continue;
+        const next = {
+          ...(state ?? { kind: "TELEGRAM_WORKFLOW", phase: "ADMITTED" }),
+          parked: { sessionDigest: legacy.session_digest, parkedAt: legacy.parked_at },
+        };
+        const promoted = this.db.run(
+          `UPDATE inbound_messages SET result_json = ?
+            WHERE channel = 'telegram' AND nonce = ?
+              AND received_at = ? AND turn_claim_json IS NULL
+              AND result_json IS ?`,
+          [JSON.stringify(next), legacy.nonce, legacy.admitted_at, legacy.result_json],
+        );
+        if (promoted.changes !== 1) continue;
+      }
+      this.db.run(
+        `DELETE FROM inbound_messages
+          WHERE channel = ? AND nonce = ? AND actor = ? AND received_at = ?`,
+        [LEGACY_PARKED_BATCH_CHANNEL, legacy.nonce, legacy.session_digest, legacy.parked_at],
+      );
+    }
+  }
+
   /**
    * Every admitted message still parked and unclaimed, oldest first. Passing a session digest
    * narrows the reader to one conversation; omitting it lets the batch composer name both what it
@@ -1223,28 +1271,51 @@ export class IngressGuard {
   pendingOwnerMessages(sessionDigest?: string): readonly ParkedOwnerMessage[] {
     const rows = this.db.all<{
       nonce: string;
-      received_at: string;
+      parked_at: string;
       payload_json: string | null;
       session_digest: string;
     }>(
-      `SELECT nonce, received_at, payload_json,
-              json_extract(result_json, '$.parked.sessionDigest') AS session_digest
-         FROM inbound_messages
-        WHERE channel = 'telegram'
-          AND turn_claim_json IS NULL
-          AND json_valid(result_json) = 1
-          AND json_type(result_json, '$.parked') = 'object'
-          AND json_type(result_json, '$.parked.sessionDigest') = 'text'
-          ${sessionDigest === undefined
-            ? ""
-            : "AND json_extract(result_json, '$.parked.sessionDigest') IS ?"}
-        ORDER BY received_at ASC, nonce ASC`,
-      sessionDigest === undefined ? [] : [sessionDigest],
+      `WITH pending AS (
+         SELECT admitted.nonce AS nonce,
+                json_extract(admitted.result_json, '$.parked.parkedAt') AS parked_at,
+                admitted.payload_json AS payload_json,
+                json_extract(admitted.result_json, '$.parked.sessionDigest') AS session_digest
+           FROM inbound_messages AS admitted
+          WHERE admitted.channel = 'telegram'
+            AND admitted.turn_claim_json IS NULL
+            AND json_valid(admitted.result_json) = 1
+            AND json_type(admitted.result_json, '$.parked') = 'object'
+            AND json_type(admitted.result_json, '$.parked.sessionDigest') = 'text'
+            AND json_type(admitted.result_json, '$.parked.parkedAt') = 'text'
+         UNION ALL
+         SELECT admitted.nonce AS nonce,
+                legacy.received_at AS parked_at,
+                admitted.payload_json AS payload_json,
+                legacy.actor AS session_digest
+           FROM inbound_messages AS legacy
+           JOIN inbound_messages AS admitted
+             ON admitted.channel = 'telegram'
+            AND admitted.nonce = legacy.nonce
+            AND admitted.received_at <= legacy.received_at
+          WHERE legacy.channel = ?
+            AND admitted.turn_claim_json IS NULL
+            AND NOT COALESCE((
+              json_valid(admitted.result_json) = 1
+              AND json_type(admitted.result_json, '$.parked') = 'object'
+              AND json_type(admitted.result_json, '$.parked.sessionDigest') = 'text'
+              AND json_type(admitted.result_json, '$.parked.parkedAt') = 'text'
+            ), 0)
+       )
+       SELECT nonce, parked_at, payload_json, session_digest
+         FROM pending
+        WHERE ? IS NULL OR session_digest IS ?
+        ORDER BY parked_at ASC, nonce ASC`,
+      [LEGACY_PARKED_BATCH_CHANNEL, sessionDigest ?? null, sessionDigest ?? null],
     );
     return rows.map((row) => ({
       nonce: row.nonce,
       sessionDigest: row.session_digest,
-      receivedAt: row.received_at,
+      receivedAt: row.parked_at,
       payload: admittedPayload(row.payload_json),
     }));
   }

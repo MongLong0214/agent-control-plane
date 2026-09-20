@@ -340,39 +340,95 @@ describe("a parked message is owed to its own conversation", () => {
     expect(restarted.pendingOwnerMessages(conversation)).toEqual([]);
   });
 
-  it("an expired legacy park cannot suppress a reused nonce and cleanup is bounded", () => {
+  it("reads and promotes valid legacy parks without reviving a reused nonce", () => {
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
     });
     const guard = readerFor(harness);
+    const sessionA = conversationOf(CHAT_A);
+    const sessionB = conversationOf(CHAT_B);
+    const validParkedAt = "2026-09-20T00:00:00.001Z";
+    const equivalentParkedAt = "2026-09-20T00:00:00.003Z";
 
-    // This is the exact stale shape written by PR #979: a second inbound row, no admitted peer,
-    // and a conversation from a prior use of the nonce. A later real message with the same nonce
-    // must not be mistaken for this orphan.
-    for (const nonce of ["update:950", "update:old-orphan"]) {
+    const seedAdmitted = (
+      nonce: string,
+      text: string,
+      receivedAt: string,
+      result: unknown = null,
+    ): void => {
+      harness.cp.db.run(
+        `INSERT INTO inbound_messages
+          (channel, nonce, actor, received_at, result_json, payload_json)
+          VALUES ('telegram', ?, ?, ?, ?, ?)`,
+        [nonce, OWNER_ID, receivedAt, result === null ? null : JSON.stringify(result), JSON.stringify({ text })],
+      );
+    };
+    const seedLegacyPark = (nonce: string, sessionDigest: string, parkedAt: string): void => {
       harness.cp.db.run(
         `INSERT INTO inbound_messages (channel, nonce, actor, received_at)
-          VALUES ('telegram-owner-parked', ?, ?, '2000-01-01T00:00:00.000Z')`,
-        [nonce, conversationOf(CHAT_B)],
+          VALUES ('telegram-owner-parked', ?, ?, ?)`,
+        [nonce, sessionDigest, parkedAt],
       );
-    }
+    };
 
-    expect(guard.admit({
-      channel: "telegram",
-      actor: OWNER_ID,
-      conversation: CHAT_A,
-      nonce: "update:950",
-      payload: { text: "new lifetime", messageId: 950 },
-    }).allowed).toBe(true);
-    guard.parkForBatch("update:950", conversationOf(CHAT_A));
+    // The first pair is the exact pre-#983 shape: the admitted row owns the content and the
+    // synthetic row owns only conversation and park time. The second represents an already
+    // equivalent canonical row whose legacy half still needs cleanup; the reader must not expose
+    // that nonce twice while both rows exist.
+    seedAdmitted("update:950", "legacy only", "2026-09-20T00:00:00.000Z");
+    seedLegacyPark("update:950", sessionA, validParkedAt);
+    seedAdmitted("update:951", "already canonical", "2026-09-20T00:00:00.002Z", {
+      kind: "TELEGRAM_WORKFLOW",
+      phase: "ADMITTED",
+      parked: { sessionDigest: sessionA, parkedAt: equivalentParkedAt },
+    });
+    seedLegacyPark("update:951", sessionA, equivalentParkedAt);
 
-    expect(guard.pendingOwnerMessages(conversationOf(CHAT_A)).map((item) => item.nonce)).toEqual([
-      "update:950",
+    // This nonce was reused after the legacy park was written. Joining only on the nonce would
+    // promote the old conversation onto the new admitted lifetime, so admitted-at <= parked-at is
+    // the compatibility boundary.
+    seedLegacyPark("update:952", sessionB, "2000-01-01T00:00:00.000Z");
+    seedAdmitted("update:952", "new lifetime", "2026-09-20T00:00:00.004Z");
+
+    expect(guard.pendingOwnerMessages(sessionA).map((item) => ({
+      nonce: item.nonce,
+      receivedAt: item.receivedAt,
+      text: (item.payload as { text?: string } | null)?.text,
+    }))).toEqual([
+      { nonce: "update:950", receivedAt: validParkedAt, text: "legacy only" },
+      { nonce: "update:951", receivedAt: equivalentParkedAt, text: "already canonical" },
     ]);
-    expect(harness.cp.db.get<{ count: number }>(
-      `SELECT COUNT(*) AS count FROM inbound_messages WHERE channel = 'telegram-owner-parked'`,
-    )?.count).toBe(0);
-    expect(harness.cp.audit.byKind("INGRESS_OWNER_MESSAGE_PARKED")).toHaveLength(1);
+    expect(guard.pendingOwnerMessages(sessionB)).toEqual([]);
+
+    seedAdmitted("update:953", "sweep trigger", "2026-09-20T00:00:00.005Z");
+    guard.parkForBatch("update:953", sessionA);
+
+    // The next park promotes the valid pair and removes both the successful and already-equivalent
+    // legacy rows. The stale reused nonce remains unpromoted and therefore is not eligible for
+    // deletion; payload_json remains the sole source of returned content.
+    expect(harness.cp.db.all<{ nonce: string }>(
+      `SELECT nonce FROM inbound_messages
+        WHERE channel = 'telegram-owner-parked' ORDER BY nonce`,
+    ).map((row) => row.nonce)).toEqual(["update:952"]);
+    expect(JSON.parse(harness.cp.db.get<{ result_json: string }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'update:950'`,
+    )!.result_json)).toMatchObject({
+      parked: { sessionDigest: sessionA, parkedAt: validParkedAt },
+    });
+    expect(harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'update:952'`,
+    )?.result_json).toBeNull();
+
+    const afterSweep = guard.pendingOwnerMessages(sessionA);
+    expect(afterSweep.filter((item) => item.nonce === "update:950")).toEqual([
+      expect.objectContaining({
+        nonce: "update:950",
+        sessionDigest: sessionA,
+        receivedAt: validParkedAt,
+        payload: { text: "legacy only" },
+      }),
+    ]);
+    expect(guard.pendingOwnerMessages(sessionB)).toEqual([]);
   });
 
   it("a message whose turn was claimed is no longer owed", async () => {
