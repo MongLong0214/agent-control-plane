@@ -1,6 +1,73 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
+import { join } from "node:path";
 
-import { CAPACITY_DEFAULTS } from "../../src/capacity/capacity-monitor.ts";
+import { CAPACITY_DEFAULTS, RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
+import { ControlPlane } from "../../src/app/control-plane.ts";
+import { ManualClock } from "../../src/core/clock.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
+import type { CapacityReading } from "../../src/runtime/provider.ts";
+import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { TestProductionAdapter } from "../helpers/production-adapter.ts";
+
+afterAll(cleanupTempDirs);
+
+/**
+ * The live weekly window and the critical demand that was standing behind it when the
+ * allocation was refused: one bound CTO, one unreviewed run, one running execution.
+ */
+const WEEKLY_BUCKET = "current-week-all-models";
+const LIVE_DEMAND = {
+  criticalRoleInvocations: 1,
+  expectedReviews: 1,
+  inFlightRuns: 1,
+  burnRatePercentPerHour: 0,
+  roleDemand: { ceo: 0, cto: 1, reviewer: 0 },
+  burnRatePercentPerHourByBucket: { [WEEKLY_BUCKET]: 0 },
+};
+
+/**
+ * A worker allocation through `refreshForWorkerFanout`, the gate `TaskGraph.startWorkerExecution`
+ * calls. The reading is persisted by a real refresh first, so the reserve is computed from stored
+ * capacity rather than from the object this test hands over.
+ */
+const admitWorkerAt = async (remainingPercent: number) => {
+  const root = tempDir("acp-ladder-");
+  const clock = new ManualClock("2026-09-20T00:00:00.000Z");
+  const gpt = new TestProductionAdapter(clock, "gpt");
+  const cp = new ControlPlane({
+    databasePath: join(root, "state.sqlite"),
+    worktreeRoot: join(root, "worktrees"),
+    capacityDir: join(root, "capacity"),
+    secretsDir: join(root, "secrets"),
+    clock,
+    adapters: [gpt],
+  });
+  try {
+    const observed: CapacityReading = {
+      provider: "gpt",
+      sensorHealth: "HEALTHY",
+      runtimeHealth: "HEALTHY",
+      observedAt: clock.nowIso(),
+      source: "capacity-ladder-test",
+      buckets: [{
+        id: WEEKLY_BUCKET,
+        remainingPercent,
+        resetAt: new Date(clock.now().getTime() + 24 * 60 * 60 * 1000).toISOString(),
+        capabilities: ["worker"],
+      }],
+    };
+    gpt.setCapacity(observed);
+    await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["gpt"]);
+    return await cp.capacity.refreshForWorkerFanout({
+      provider: "gpt",
+      capabilities: ["worker"],
+      priority: "worker",
+      reserveDemand: LIVE_DEMAND,
+    });
+  } finally {
+    cp.close();
+  }
+};
 
 /**
  * Where the capacity ladder stands, and why the three numbers move together.
@@ -28,11 +95,19 @@ describe("capacity holds only near exhaustion", () => {
     expect(CAPACITY_DEFAULTS.criticalPercent).toBeLessThan(CAPACITY_DEFAULTS.conservePercent);
   });
 
-  it("leaves a live reading that used to conserve open", () => {
-    // The exact figure that was refusing work on this deployment. Written as the measurement it
-    // came from rather than as a round number, so that if the policy is ever raised back above
-    // it, the case says which observation it is contradicting.
-    const liveWeeklyRemainingPercent = 20;
-    expect(liveWeeklyRemainingPercent).toBeGreaterThan(CAPACITY_DEFAULTS.conservePercent);
+  it("admits the live reading that used to conserve, and still holds one inside the band", async () => {
+    // 20% is the figure that was refusing work on this deployment. Comparing it with the
+    // threshold would pass against a gate that never reads the threshold, which is what the
+    // first attempt at this ladder did -- the worker gate refused on the dynamic reserve alone
+    // and never consulted `conservePercent` at all. So the allocation itself is what is measured.
+    const live = await admitWorkerAt(20);
+    expect(live.allowed).toBe(true);
+    expect(live.reasonCode).toBe(ReasonCode.OK);
+
+    // The same demand against a window inside the band: the reserve still governs there, so this
+    // case fails if the ladder is mistaken for permission to admit everything.
+    const nearlyGone = await admitWorkerAt(CAPACITY_DEFAULTS.conservePercent);
+    expect(nearlyGone.allowed).toBe(false);
+    expect(nearlyGone.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
   });
 });
