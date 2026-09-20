@@ -8,8 +8,15 @@ const aTurnTheCeoDidNotAnswerStaysUnresolved = {
   id: "a-turn-the-ceo-did-not-answer-stays-unresolved",
   what: "a reply the CEO did not write is delivered without resolving the turn as answered",
   file: "src/ingress/ingress-guard.ts",
-  find: "      const completed = this.#recordResultHere(channel, nonce, result, \"PENDING\");\n      if (!completed.allowed) return completed;\n      if (turnOutcome === \"UNANSWERED\") return allow(ReasonCode.OK, undefined);\n",
-  replace: "      const completed = this.#recordResultHere(channel, nonce, result, \"PENDING\");\n      if (!completed.allowed) return completed;\n",
+  find:
+    "      }\n" +
+    "      if (turnOutcome === \"UNANSWERED\") return allow(ReasonCode.OK, undefined);\n" +
+    "      for (const memberNonce of batchNonces) {\n" +
+    "        const resolved = this.#resolveTurnHere(channel, memberNonce);",
+  replace:
+    "      }\n" +
+    "      for (const memberNonce of batchNonces) {\n" +
+    "        const resolved = this.#resolveTurnHere(channel, memberNonce);",
   killedBy: [
     "tests/unit/a-timeout-apology-is-not-an-answer.test.ts::leaves the turn unresolved while the reply's own lifecycle records that it was delivered",
   ],

@@ -4946,11 +4946,10 @@ try {
 /**
  * Guard relocations made by #631's full-coalescing successor.
  *
- * Six rows below still live in the legacy in-file table and two already live in CASES_DIR. Keeping
- * the correction at the composition boundary lets this bounded successor move all eight rows with
- * the production guards while changing only this registry path. The cardinality check is part of
- * the correction: a description that disappears or becomes duplicated must fail rather than make
- * an override silently apply to the wrong row.
+ * Six rows below still live in the legacy in-file table. The two rows in CASES_DIR carry their
+ * relocated batch anchors directly. The cardinality check is part of the correction: a description
+ * that disappears or becomes duplicated must fail rather than make an override silently apply to
+ * the wrong row.
  */
 const MOVED_GUARD_ROWS = new Map([
   [
@@ -5053,40 +5052,6 @@ const MOVED_GUARD_ROWS = new Map([
       replace: "      `UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ?`,",
       killedBy: [
         "tests/unit/ingress-no-reply-turn-resolution.test.ts::#682, fourth review: a reservation that lands after the router's snapshot survives the no-reply path",
-      ],
-    },
-  ],
-  [
-    "a reply the CEO did not write is terminalized without settling the turn it never answered",
-    {
-      find:
-        "      }\n" +
-        "      if (turnOutcome === \"UNANSWERED\") return allow(ReasonCode.OK, undefined);\n" +
-        "      for (const memberNonce of batchNonces) {\n" +
-        "        const settled = this.#settleTurnHere(channel, memberNonce, settlement);",
-      replace:
-        "      }\n" +
-        "      for (const memberNonce of batchNonces) {\n" +
-        "        const settled = this.#settleTurnHere(channel, memberNonce, settlement);",
-      killedBy: [
-        "tests/unit/a-timeout-apology-is-not-an-answer.test.ts::terminalizes the reply but not the turn when Telegram refuses the apology",
-      ],
-    },
-  ],
-  [
-    "a reply the CEO did not write is delivered without resolving the turn as answered",
-    {
-      find:
-        "      }\n" +
-        "      if (turnOutcome === \"UNANSWERED\") return allow(ReasonCode.OK, undefined);\n" +
-        "      for (const memberNonce of batchNonces) {\n" +
-        "        const resolved = this.#resolveTurnHere(channel, memberNonce);",
-      replace:
-        "      }\n" +
-        "      for (const memberNonce of batchNonces) {\n" +
-        "        const resolved = this.#resolveTurnHere(channel, memberNonce);",
-      killedBy: [
-        "tests/unit/a-timeout-apology-is-not-an-answer.test.ts::leaves the turn unresolved while the reply's own lifecycle records that it was delivered",
       ],
     },
   ],
