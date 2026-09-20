@@ -2,10 +2,15 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import { accessSync, chmodSync, constants, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
-import { RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
+import {
+  CAPACITY_DEFAULTS,
+  type DynamicReserveDemand,
+  type ProviderCapacity,
+  RefreshTrigger,
+} from "../../src/capacity/capacity-monitor.ts";
 import { ControlPlane } from "../../src/app/control-plane.ts";
 import { ManualClock } from "../../src/core/clock.ts";
-import { allow } from "../../src/core/errors.ts";
+import { allow, type Evidence } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { ArtifactKind, ContinuityMode, ExecutionMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
@@ -39,7 +44,6 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import ts from "typescript";
-import type { ProviderCapacity } from "../../src/capacity/capacity-monitor.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -161,13 +165,17 @@ describe("document-only component input", () => {
       expect(lookup).toHaveBeenCalledExactlyOnceWith("claude", Role.PRIMARY_CTO);
     } finally { vi.restoreAllMocks(); cp.close(); }
   });
-  it("accepts the measured HEALTHY 20 percent CONSERVE counterexample without changing admission policy", async () => {
+  it("accepts a measured HEALTHY CONSERVE counterexample without changing admission policy", async () => {
     const { assertMeasuredCapacity, measureDocumentCapacity } = await import("../helpers/document-only-integration.ts");
     const { cp, clock, gpt, claude } = makePlane();
     try {
       claude.setCapacity(healthy("claude", clock));
       // Offline regression of the failed collector shape, not a live quota observation.
-      gpt.setCapacity(reading("gpt", clock, [{ id: "7d", remainingPercent: 20,
+      // 4, not the 20 this case was first measured at: the conserve rung moved to 5 by owner
+      // decision 2026-09-20, so 20 is now OPEN. What the case measures is unchanged -- a HEALTHY
+      // reading that is nonetheless in CONSERVE stays routable for blind-review -- so the fixture
+      // follows the threshold rather than the assertion being dropped.
+      gpt.setCapacity(reading("gpt", clock, [{ id: "7d", remainingPercent: 4,
         resetAt: "2026-09-19T08:14:51.000Z", capabilities: ["ceo", "blind-review", "worker", "luna-worker"] }]));
       const [measured] = await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["gpt"]);
       expect(measured).toMatchObject({ sensorHealth: "HEALTHY", runtimeHealth: "HEALTHY", allocationAdmission: "CONSERVE" });
@@ -175,7 +183,7 @@ describe("document-only component input", () => {
       const readings = [measured!];
       expect(assertMeasuredCapacity(readings, ["gpt"])).toBe(readings);
       expect((await measureDocumentCapacity(cp.capacity, cp.providers)).find((entry) => entry.provider === "gpt"))
-        .toMatchObject({ allocationAdmission: "CONSERVE", buckets: [{ remainingPercent: 20 }] });
+        .toMatchObject({ allocationAdmission: "CONSERVE", buckets: [{ remainingPercent: 4 }] });
     } finally { cp.close(); }
   });
   it("unknown measured capacity fails closed; a measured reading is not rewritten", async () => {
@@ -416,11 +424,15 @@ describe("exact-role mandatory coverage", () => {
     const { cp, clock, gpt, claude } = makePlane();
     try {
       gpt.setCapacity(healthy("gpt", clock));
-      claude.setCapacity(reading("claude", clock, [{ id: "rolling", remainingPercent: 20, resetAt: null,
+      claude.setCapacity(reading("claude", clock, [{ id: "rolling", remainingPercent: 4, resetAt: null,
         capabilities: kind === "capability" ? ["worker"] : CAPABILITIES }]));
       for (const role of [Role.CEO, Role.BOOTSTRAP_CTO, Role.PRIMARY_CTO, Role.WORKER, Role.BLIND_REVIEWER]) {
         cp.providers.registerForRole(claude, role);
       }
+      // The state this case is named for, read before the invalidation is injected. The fixture
+      // sat at 20% while the ladder conserved below 5, so the refusals below were the injected
+      // invalidation's alone and the name was describing a state the reading never had.
+      expect((await cp.capacity.refreshForRole("claude", Role.PRIMARY_CTO)).allocationAdmission).toBe("CONSERVE");
       const refresh = cp.capacity.refreshForRole.bind(cp.capacity);
       vi.spyOn(cp.capacity, "refreshForRole").mockImplementation(async (provider, role) => {
         const measured = await refresh(provider, role);
@@ -727,6 +739,21 @@ const prepareCapacityReviewedRun = async (plane: ReturnType<typeof makePlane>) =
 };
 
 /**
+ * The reserve the worker gate itself computed, read back from the refusal it returned. A
+ * reserve recomputed in the test would agree with a gate that never consulted one.
+ */
+const refusedReserve = (evidence: Evidence, bucketId: string): number => {
+  const reserves = evidence["reserves"];
+  if (!Array.isArray(reserves)) throw new Error("the worker refusal carried no per-bucket reserves");
+  const entry = reserves
+    .filter((row): row is Record<string, unknown> => typeof row === "object" && row !== null)
+    .find((row) => row["bucketId"] === bucketId);
+  const reserve = entry?.["reserve"];
+  if (typeof reserve !== "number") throw new Error(`no measured reserve evidence for ${bucketId}`);
+  return reserve;
+};
+
+/**
  * Creates a real worker allocation after recording a same-window capacity history. The
  * returned decision is from `TaskGraph.startWorkerExecution`, not from the monitor, so a
  * reserve input only proves itself when it changes this production allocation outcome.
@@ -742,6 +769,8 @@ const startWorkerWithMeasuredReserve = async (input: {
   extraInFlightRun?: boolean;
   /** Adds a live CEO binding without adding a run that needs review. */
   extraCeoDemand?: boolean;
+  /** Injects trusted allocator output while retaining the real TaskGraph admission path. */
+  reserveDemandOverride?: DynamicReserveDemand;
 }) => {
   const plane = makePlane();
   const { cp, clock, gpt, claude } = plane;
@@ -826,15 +855,23 @@ const startWorkerWithMeasuredReserve = async (input: {
 
   const task = cp.tasks.ready(created.value.runId)[0]!;
   const workerSessionId = bindWorkerForTask(cp, task.taskId);
-  const demand = cp.capacity.workerReserveDemand("gpt");
-  const started = await cp.tasks.startWorkerExecution({
-    runId: created.value.runId,
-    taskId: task.taskId,
-    ownerBindingGeneration: dispatched.value.ownerBindingGeneration!,
-    workerSessionId,
-    provider: "gpt",
-    model: "worker",
-  });
+  const demand = input.reserveDemandOverride ?? cp.capacity.workerReserveDemand("gpt");
+  const demandOverride = input.reserveDemandOverride
+    ? vi.spyOn(cp.capacity, "workerReserveDemand").mockReturnValue(input.reserveDemandOverride)
+    : null;
+  let started: Awaited<ReturnType<typeof cp.tasks.startWorkerExecution>>;
+  try {
+    started = await cp.tasks.startWorkerExecution({
+      runId: created.value.runId,
+      taskId: task.taskId,
+      ownerBindingGeneration: dispatched.value.ownerBindingGeneration!,
+      workerSessionId,
+      provider: "gpt",
+      model: "worker",
+    });
+  } finally {
+    demandOverride?.mockRestore();
+  }
   return { plane, demand, started };
 };
 
@@ -1544,8 +1581,10 @@ describe("round-2 capacity and runtime regressions", () => {
     expect(missingDemand.allowed).toBe(false);
     expect(missingDemand.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
 
+    // Inside the conserve band, which is where a measured reserve is still allowed to refuse.
+    // Above it the ladder holds the window open no matter how high the critical demand climbs.
     gpt.setCapacity(reading("gpt", clock, [
-      { id: "constrained", remainingPercent: 10, resetAt: "2026-08-13T00:00:00.000Z", capabilities: ["worker"] },
+      { id: "constrained", remainingPercent: 4, resetAt: "2026-08-13T00:00:00.000Z", capabilities: ["worker"] },
     ]));
     const reserved = await cp.capacity.refreshForDispatch({
       provider: "gpt",
@@ -1574,18 +1613,25 @@ describe("round-2 capacity and runtime regressions", () => {
     expect(unknownHorizon.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
   });
 
-  it("#55/#182 makes every §14.5 reserve input change real worker admission", async () => {
-    // Each pair reaches TaskGraph.startWorkerExecution. The only changed fact in a pair is
-    // the named §14.5 input, and the differing result is therefore evidence that production
-    // allocation consumes that input rather than a monitor-only calculation.
+  it("#55/#182 makes every §14.5 reserve input change what real worker admission computes", async () => {
+    // Each pair reaches TaskGraph.startWorkerExecution, and the only fact that differs inside a
+    // pair is the named §14.5 input. Two kinds of difference are evidence that production
+    // allocation consumes that input: the verdict, where the input can still reach it, and the
+    // reserve the production refusal carried, where the ladder bounds the refusal to the conserve
+    // band. Above that band a measured reserve may not hold a window (owner decision 2026-09-20),
+    // so a demand count there cannot move the verdict however high it climbs -- which is the
+    // policy, not a gap in the fixture.
+    const bucketId = "worker-window";
+
+    // Quota: the same demand against a healthy window and against one inside the band.
     const quotaOpen = await startWorkerWithMeasuredReserve({
-      remainingPercent: 50,
-      previousRemainingPercent: 50,
+      remainingPercent: 20,
+      previousRemainingPercent: 20,
       resetAfterObservationHours: 1,
     });
     const quotaHeld = await startWorkerWithMeasuredReserve({
-      remainingPercent: 20,
-      previousRemainingPercent: 20,
+      remainingPercent: 4,
+      previousRemainingPercent: 4,
       resetAfterObservationHours: 1,
     });
     expect(quotaOpen.started.allowed).toBe(true);
@@ -1595,105 +1641,191 @@ describe("round-2 capacity and runtime regressions", () => {
     quotaOpen.plane.cp.close();
     quotaHeld.plane.cp.close();
 
-    const shortHorizon = await startWorkerWithMeasuredReserve({
-      remainingPercent: 50,
-      previousRemainingPercent: 80,
-      resetAfterObservationHours: 0.5,
-    });
-    const longHorizon = await startWorkerWithMeasuredReserve({
-      remainingPercent: 50,
-      previousRemainingPercent: 80,
+    // The live shape the ladder was moved for: a weekly window at 20% with a bound CTO and a
+    // running execution behind it. The reserve refused exactly this allocation and left the rest
+    // of the week unspent, so the measured demand is asserted here too -- production still reads
+    // it, and it is the ladder rather than an empty demand that admits the worker.
+    const liveWeekly = await startWorkerWithMeasuredReserve({
+      remainingPercent: 20,
+      previousRemainingPercent: 20,
       resetAfterObservationHours: 1,
+      extraExpectedReview: true,
+      extraInFlightRun: true,
     });
-    expect(shortHorizon.started.allowed).toBe(true);
-    expect(shortHorizon.started.reasonCode).toBe(ReasonCode.OK);
-    expect(longHorizon.started.allowed).toBe(false);
-    expect(longHorizon.started.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
-    shortHorizon.plane.cp.close();
-    longHorizon.plane.cp.close();
+    expect(liveWeekly.demand.roleDemand).toEqual({ ceo: 0, cto: 1, reviewer: 0 });
+    expect(liveWeekly.demand.inFlightRuns).toBe(1);
+    expect(liveWeekly.demand.burnRatePercentPerHourByBucket?.[bucketId]).toBe(0);
+    expect(liveWeekly.started.allowed).toBe(true);
+    expect(liveWeekly.started.reasonCode).toBe(ReasonCode.OK);
+    liveWeekly.plane.cp.close();
 
-    const noBurn = await startWorkerWithMeasuredReserve({
-      remainingPercent: 50,
-      previousRemainingPercent: 50,
+    // The band's own boundary is still held. The rung below it is held by routability instead,
+    // which is a different refusal and deliberately not this one.
+    const atBoundary = await startWorkerWithMeasuredReserve({
+      remainingPercent: CAPACITY_DEFAULTS.conservePercent,
+      previousRemainingPercent: CAPACITY_DEFAULTS.conservePercent,
       resetAfterObservationHours: 1,
     });
+    const atExhaustion = await startWorkerWithMeasuredReserve({
+      remainingPercent: CAPACITY_DEFAULTS.exhaustedPercent,
+      previousRemainingPercent: CAPACITY_DEFAULTS.exhaustedPercent,
+      resetAfterObservationHours: 1,
+    });
+    expect(atBoundary.started.allowed).toBe(false);
+    expect(atBoundary.started.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+    expect(atExhaustion.started.allowed).toBe(false);
+    expect(atExhaustion.started.reasonCode).toBe(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE);
+    atBoundary.plane.cp.close();
+    atExhaustion.plane.cp.close();
+
+    // Reset horizon. A horizon that has already elapsed is not a short one, it is no observation
+    // at all, and unmeasured evidence stays fail-closed above the band where a measured reserve
+    // no longer reaches. Its magnitude still reaches the computed reserve below.
+    const usableHorizon = await startWorkerWithMeasuredReserve({
+      remainingPercent: 20,
+      previousRemainingPercent: 20,
+      resetAfterObservationHours: 1,
+    });
+    const elapsedHorizon = await startWorkerWithMeasuredReserve({
+      remainingPercent: 20,
+      previousRemainingPercent: 20,
+      resetAfterObservationHours: -0.5,
+    });
+    const elapsedBucket = elapsedHorizon.plane.cp.capacity.current("gpt")!.buckets[0]!;
+    expect(new Date(elapsedBucket.resetAt!).getTime()).toBeLessThan(elapsedHorizon.plane.clock.now().getTime());
+    expect(usableHorizon.started.allowed).toBe(true);
+    expect(usableHorizon.started.reasonCode).toBe(ReasonCode.OK);
+    expect(elapsedHorizon.started.allowed).toBe(false);
+    expect(elapsedHorizon.started.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+    usableHorizon.plane.cp.close();
+    elapsedHorizon.plane.cp.close();
+
+    // Burn. A window whose quota rose inside one reset is inconsistent evidence rather than a
+    // measured zero, and the same healthy 20% is held on that ground alone.
     const measuredBurn = await startWorkerWithMeasuredReserve({
-      remainingPercent: 50,
-      previousRemainingPercent: 80,
+      remainingPercent: 20,
+      previousRemainingPercent: 20,
       resetAfterObservationHours: 1,
     });
-    expect(noBurn.demand.burnRatePercentPerHourByBucket?.["worker-window"]).toBe(0);
-    expect(measuredBurn.demand.burnRatePercentPerHourByBucket?.["worker-window"]).toBe(30);
-    expect(noBurn.started.allowed).toBe(true);
-    expect(noBurn.started.reasonCode).toBe(ReasonCode.OK);
-    expect(measuredBurn.started.allowed).toBe(false);
-    expect(measuredBurn.started.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
-    noBurn.plane.cp.close();
+    const unmeasurableBurn = await startWorkerWithMeasuredReserve({
+      remainingPercent: 20,
+      previousRemainingPercent: 10,
+      resetAfterObservationHours: 1,
+    });
+    expect(measuredBurn.demand.burnRatePercentPerHourByBucket?.[bucketId]).toBe(0);
+    expect(unmeasurableBurn.demand.burnRatePercentPerHourByBucket?.[bucketId]).toBeNaN();
+    expect(measuredBurn.started.allowed).toBe(true);
+    expect(measuredBurn.started.reasonCode).toBe(ReasonCode.OK);
+    expect(unmeasurableBurn.started.allowed).toBe(false);
+    expect(unmeasurableBurn.started.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
     measuredBurn.plane.cp.close();
+    unmeasurableBurn.plane.cp.close();
 
+    // Expected reviews. Inside the band every reachable demand already exceeds the window's
+    // remaining share, so the verdict cannot separate one review from two; the reserve the
+    // production gate computed and returned as its evidence can, and does.
     const oneReview = await startWorkerWithMeasuredReserve({
-      remainingPercent: 27,
-      previousRemainingPercent: 27,
+      remainingPercent: 4,
+      previousRemainingPercent: 4,
       resetAfterObservationHours: 1,
     });
     const twoReviews = await startWorkerWithMeasuredReserve({
-      remainingPercent: 27,
-      previousRemainingPercent: 27,
+      remainingPercent: 4,
+      previousRemainingPercent: 4,
       resetAfterObservationHours: 1,
       extraExpectedReview: true,
     });
     expect(oneReview.demand.expectedReviews).toBe(1);
     expect(twoReviews.demand.expectedReviews).toBe(2);
-    expect(oneReview.started.allowed).toBe(true);
-    expect(oneReview.started.reasonCode).toBe(ReasonCode.OK);
-    expect(twoReviews.started.allowed).toBe(false);
+    expect(oneReview.started.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
     expect(twoReviews.started.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+    expect(refusedReserve(twoReviews.started.evidence, bucketId))
+      .toBeGreaterThan(refusedReserve(oneReview.started.evidence, bucketId));
     oneReview.plane.cp.close();
     twoReviews.plane.cp.close();
 
+    // In-flight runs, with the unreviewed run held constant on both sides so the execution is
+    // the only fact that moves.
     const noFlight = await startWorkerWithMeasuredReserve({
-      remainingPercent: 30,
-      previousRemainingPercent: 30,
+      remainingPercent: 4,
+      previousRemainingPercent: 4,
       resetAfterObservationHours: 1,
       extraExpectedReview: true,
     });
     const inFlight = await startWorkerWithMeasuredReserve({
-      remainingPercent: 30,
-      previousRemainingPercent: 30,
+      remainingPercent: 4,
+      previousRemainingPercent: 4,
       resetAfterObservationHours: 1,
       extraExpectedReview: true,
       extraInFlightRun: true,
     });
     expect(noFlight.demand.inFlightRuns).toBe(0);
     expect(inFlight.demand.inFlightRuns).toBe(1);
-    expect(noFlight.started.allowed).toBe(true);
-    expect(noFlight.started.reasonCode).toBe(ReasonCode.OK);
-    expect(inFlight.started.allowed).toBe(false);
+    expect(noFlight.started.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
     expect(inFlight.started.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+    expect(refusedReserve(inFlight.started.evidence, bucketId))
+      .toBeGreaterThan(refusedReserve(noFlight.started.evidence, bucketId));
     noFlight.plane.cp.close();
     inFlight.plane.cp.close();
 
-    // At 30%, the CEO's aggregate invocation count alone would still admit; the separate
-    // CEO coverage weight is what crosses the reserve boundary in the second allocation.
+    // CEO coverage demand is weighted separately from the aggregate invocation count, so a live
+    // CEO binding raises the reserve by more than the one invocation it also adds.
     const baselineRoles = await startWorkerWithMeasuredReserve({
-      remainingPercent: 30,
-      previousRemainingPercent: 30,
+      remainingPercent: 4,
+      previousRemainingPercent: 4,
       resetAfterObservationHours: 1,
     });
     const ceoCoverage = await startWorkerWithMeasuredReserve({
-      remainingPercent: 30,
-      previousRemainingPercent: 30,
+      remainingPercent: 4,
+      previousRemainingPercent: 4,
       resetAfterObservationHours: 1,
       extraCeoDemand: true,
     });
     expect(baselineRoles.demand.roleDemand).toEqual({ ceo: 0, cto: 1, reviewer: 0 });
     expect(ceoCoverage.demand.roleDemand).toEqual({ ceo: 1, cto: 1, reviewer: 0 });
-    expect(baselineRoles.started.allowed).toBe(true);
-    expect(baselineRoles.started.reasonCode).toBe(ReasonCode.OK);
-    expect(ceoCoverage.started.allowed).toBe(false);
+    expect(baselineRoles.started.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
     expect(ceoCoverage.started.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+    expect(refusedReserve(ceoCoverage.started.evidence, bucketId))
+      .toBeGreaterThan(refusedReserve(baselineRoles.started.evidence, bucketId));
     baselineRoles.plane.cp.close();
     ceoCoverage.plane.cp.close();
+  });
+
+  it("#982 fails closed when finite reserve inputs overflow derived arithmetic", async () => {
+    const demand: DynamicReserveDemand = {
+      criticalRoleInvocations: Number.MAX_VALUE,
+      expectedReviews: 0,
+      inFlightRuns: 0,
+      burnRatePercentPerHour: 0,
+      roleDemand: { ceo: Number.MAX_VALUE, cto: 0, reviewer: 0 },
+      burnRatePercentPerHourByBucket: { "worker-window": 0 },
+    };
+    expect([
+      demand.criticalRoleInvocations,
+      demand.expectedReviews,
+      demand.inFlightRuns,
+      demand.burnRatePercentPerHour,
+      demand.roleDemand.ceo,
+      demand.roleDemand.cto,
+      demand.roleDemand.reviewer,
+    ].every(Number.isFinite)).toBe(true);
+    expect(demand.criticalRoleInvocations * 2 + demand.roleDemand.ceo * 5).toBe(Number.POSITIVE_INFINITY);
+
+    const overflow = await startWorkerWithMeasuredReserve({
+      remainingPercent: CAPACITY_DEFAULTS.conservePercent,
+      previousRemainingPercent: CAPACITY_DEFAULTS.conservePercent,
+      resetAfterObservationHours: 1,
+      reserveDemandOverride: demand,
+    });
+    try {
+      expect(overflow.started.allowed).toBe(false);
+      expect(overflow.started.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+      expect(overflow.started.evidence).toMatchObject({
+        reserves: [{ bucketId: "worker-window", reserve: 1, measured: false }],
+      });
+    } finally {
+      overflow.plane.cp.close();
+    }
   });
 
   it("#56 rejects a future-dated capacity file instead of keeping it fresh indefinitely", () => {

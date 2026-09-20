@@ -114,8 +114,9 @@ const createQueuedCtoRun = (
 const startWorkerFanoutWith = async (remainingPercent: number) => {
   const harness = makeHarness();
   const { projectId, repositoryId } = await registerFixtureProject(harness, "worker-reserve-project");
-  // After the history sample there is one reset-hour left. One percent of measured burn
-  // alone would admit 25%; it is the durable CTO/review role demand that withholds it.
+  // After the history sample there is one reset-hour left. Inside the conserve band, one
+  // percent of measured burn alone would admit the window; it is the durable CTO/review
+  // role demand that withholds it. Above the band the ladder holds it open regardless.
   const resetAt = new Date(harness.clock.now().getTime() + 2 * 60 * 60 * 1000).toISOString();
   const capacity = (remaining: number) => ({
     provider: "scripted",
@@ -610,7 +611,10 @@ describe("dispatch admission is asked about the allocation it will make", () => 
   it("#55/#182 refuses a worker fan-out that would consume the dynamic critical-role reserve", async () => {
     // The dispatch itself succeeds. Only its later worker allocation is denied, proving the
     // reserve is consumed at the production worker path rather than in a monitor-only test.
-    const { harness, started } = await startWorkerFanoutWith(25);
+    // Inside the conserve band (owner decision 2026-09-20 moved it to 5/2/1): above the band
+    // the ladder holds the window open no matter how high this same demand climbs, so the
+    // fixture has to sit inside it for the reserve to have anything left to refuse.
+    const { harness, started } = await startWorkerFanoutWith(4);
     expect(started.allowed).toBe(false);
     expect(started.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
     expect(harness.cp.tasks.executions(harness.cp.runs.list()[0]!.runId)).toHaveLength(0);
