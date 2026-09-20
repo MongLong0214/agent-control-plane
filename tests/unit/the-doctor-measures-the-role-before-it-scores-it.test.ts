@@ -133,7 +133,7 @@ describe("the doctor measures the role before it scores it", () => {
       gpt.setCapacity(healthy("gpt", clock));
       claude.setCapacity({
         ...healthy("claude", clock),
-        buckets: [{ id: "current-week-all-models", remainingPercent: 4, resetAt: null, capabilities: CAPABILITIES }],
+        buckets: [{ id: "current-week-all-models", remainingPercent: 1.5, resetAt: null, capabilities: CAPABILITIES }],
       });
       cp.providers.registerForRole(claude, Role.CEO);
 

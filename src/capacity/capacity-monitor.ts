@@ -131,12 +131,21 @@ export interface CapacityOptions {
  */
 export const UNATTENDED_PROBE_EXCLUDED_BY_DEFAULT: ReadonlySet<string> = new Set(["grok"]);
 
-const DEFAULTS = {
+export const CAPACITY_DEFAULTS = {
   freshnessMs: 5 * 60 * 1000,
   staleGraceMs: 15 * 60 * 1000,
-  conservePercent: 25,
-  criticalPercent: 10,
-  exhaustedPercent: 2,
+  // Owner decision 2026-09-20: hold work only when a bucket is nearly gone, not at a quarter
+  // remaining. The old ladder (25/10/2) made CONSERVE the ordinary state -- the live weekly
+  // bucket sat at 20% and every worker allocation was refused
+  // `CAPACITY_ADMISSION_CONSERVE` while four fifths of the week's capacity went unused.
+  //
+  // The three move together because the ladder is evaluated top-down: `exhausted` is checked
+  // before `conserve`, so lowering only `conserve` would leave `exhausted` (2) firing first and
+  // suspend earlier than before -- the opposite of what was asked for. Ordering is the invariant,
+  // not the individual numbers: exhausted < critical < conserve.
+  conservePercent: 5,
+  criticalPercent: 2,
+  exhaustedPercent: 1,
   maxClockSkewMs: 60_000,
   // Absent is the safe default (#735): nothing is opted back into the unattended probe
   // unless a deployment names it.
@@ -378,7 +387,7 @@ export class CapacityMonitor {
     private readonly telemetry: Telemetry,
     options: CapacityOptions = {},
   ) {
-    this.#options = { ...DEFAULTS, ...options };
+    this.#options = { ...CAPACITY_DEFAULTS, ...options };
   }
 
   /**
@@ -777,14 +786,28 @@ export class CapacityMonitor {
         );
       }
       const reserves = new Map(
-        this.dynamicReserveByBucket(selected, target.reserveDemand).map((reserve) => [reserve.bucketId, reserve.reserve]),
+        this.dynamicReserveByBucket(selected, target.reserveDemand).map((reserve) => [reserve.bucketId, reserve]),
       );
       const applicable = selected.buckets.filter((bucket) =>
         target.capabilities.some((capability) => bucket.capabilities.includes(capability)),
       );
+      // The ladder bounds where the reserve is allowed to refuse: above the conserve band the
+      // bucket is OPEN and critical-role demand alone must not hold worker work out of it;
+      // inside the band the reserve governs as before. Measured on the live deployment
+      // 2026-09-20, the weekly bucket at 20% remaining was refused here on every allocation.
+      //
+      // `measured` is asked first because a reserve of 1 has two unrelated origins: a window
+      // whose demand share genuinely saturates, and one of the fail-closed branches that
+      // declines to guess. Only the second must survive the ladder, and the value alone
+      // cannot tell them apart -- the computed share is clamped to the same 1.
       const constrained = applicable.filter((bucket) => {
-        const reserve = reserves.get(bucket.id) ?? 1;
-        return bucket.remainingPercent === null || bucket.remainingPercent / 100 <= reserve;
+        const reserve = reserves.get(bucket.id);
+        if (!reserve?.measured) return true;
+        if (bucket.remainingPercent === null) return true;
+        return (
+          bucket.remainingPercent <= this.#options.conservePercent &&
+          bucket.remainingPercent / 100 <= reserve.reserve
+        );
       });
       if (constrained.length > 0) {
         return deny(
@@ -793,7 +816,11 @@ export class CapacityMonitor {
           {
             provider: selected.provider,
             capabilities: target.capabilities,
-            reserves: constrained.map((bucket) => ({ bucketId: bucket.id, reserve: reserves.get(bucket.id) ?? 1 })),
+            reserves: constrained.map((bucket) => ({
+              bucketId: bucket.id,
+              reserve: reserves.get(bucket.id)?.reserve ?? 1,
+              measured: reserves.get(bucket.id)?.measured ?? false,
+            })),
           },
         );
       }
@@ -986,15 +1013,24 @@ export class CapacityMonitor {
     return reserves.length === 0 ? 1 : Math.max(...reserves.map((reserve) => reserve.reserve));
   }
 
-  /** Per-window reserve facts; callers must not erase distinct reset horizons into one minimum. */
+  /**
+   * Per-window reserve facts; callers must not erase distinct reset horizons into one minimum.
+   *
+   * `measured` carries the provenance the number cannot: `false` on every branch that withholds
+   * the whole window because an input was absent or unusable, `true` only where a share was
+   * computed from observed demand and burn. A caller that wants to bound the reserve by the
+   * admission ladder has to know which it is holding, and `reserve === 1` answers a different
+   * question -- a computed share is clamped to 1 as well.
+   */
   dynamicReserveByBucket(
     capacity: ProviderCapacity,
     demand: DynamicReserveDemand,
-  ): Array<{ bucketId: string; reserve: number }> {
+  ): Array<{ bucketId: string; reserve: number; measured: boolean }> {
     // Types protect product callers, but evidence crossing a process boundary can still be
     // malformed at runtime. An absent role-demand object is unknown demand, never zero.
+    const unmeasured = (bucketId: string) => ({ bucketId, reserve: 1, measured: false });
     const roleDemand = demand.roleDemand;
-    if (!roleDemand) return capacity.buckets.map((bucket) => ({ bucketId: bucket.id, reserve: 1 }));
+    if (!roleDemand) return capacity.buckets.map((bucket) => unmeasured(bucket.id));
     const inputs = [
       demand.criticalRoleInvocations,
       demand.expectedReviews,
@@ -1007,7 +1043,7 @@ export class CapacityMonitor {
     if (inputs.some((input) => !Number.isFinite(input) || input < 0)) {
       // A malformed demand observation is not zero demand. Preserve every window until
       // the caller can provide the measured facts §14.5 requires.
-      return capacity.buckets.map((bucket) => ({ bucketId: bucket.id, reserve: 1 }));
+      return capacity.buckets.map((bucket) => unmeasured(bucket.id));
     }
     const weighted =
       demand.criticalRoleInvocations * 2 +
@@ -1016,27 +1052,36 @@ export class CapacityMonitor {
       roleDemand.ceo * 5 +
       roleDemand.cto * 4 +
       roleDemand.reviewer * 3;
+    if (!Number.isFinite(weighted)) return capacity.buckets.map((bucket) => unmeasured(bucket.id));
     const nowMs = new Date(this.clock.nowIso()).getTime();
     return capacity.buckets.map((bucket) => {
       // Unknown quota is never imagined as headroom. Lower-priority work must preserve
       // the whole window until a usable observation exists.
-      if (bucket.remainingPercent === null) return { bucketId: bucket.id, reserve: 1 };
+      if (
+        bucket.remainingPercent === null ||
+        !Number.isFinite(bucket.remainingPercent) ||
+        bucket.remainingPercent < 0
+      ) return unmeasured(bucket.id);
       const resetMs = bucket.resetAt ? new Date(bucket.resetAt).getTime() : Number.NaN;
       // A lower-priority router cannot manufacture a reset horizon. A missing, malformed,
       // or already elapsed reset must therefore protect the whole bucket until it is
       // observed again with a usable horizon.
-      if (!Number.isFinite(resetMs) || resetMs <= nowMs) return { bucketId: bucket.id, reserve: 1 };
+      if (!Number.isFinite(resetMs) || resetMs <= nowMs) return unmeasured(bucket.id);
       const horizonHours = (resetMs - nowMs) / (60 * 60 * 1000);
+      if (!Number.isFinite(horizonHours) || horizonHours <= 0) return unmeasured(bucket.id);
       const burn = demand.burnRatePercentPerHourByBucket
         ? (demand.burnRatePercentPerHourByBucket[bucket.id] ?? Number.NaN)
         : demand.burnRatePercentPerHour;
       // A known aggregate cannot certify a different, unmeasured quota window. Preserve
       // that bucket until it has its own burn observation.
-      if (!Number.isFinite(burn) || burn < 0) return { bucketId: bucket.id, reserve: 1 };
+      if (!Number.isFinite(burn) || burn < 0) return unmeasured(bucket.id);
       const expectedBurn = burn * horizonHours;
+      if (!Number.isFinite(expectedBurn)) return unmeasured(bucket.id);
       const demandShare = weighted / (weighted + Math.max(1, bucket.remainingPercent));
       const burnShare = expectedBurn / Math.max(1, bucket.remainingPercent + expectedBurn);
-      return { bucketId: bucket.id, reserve: Math.min(1, demandShare + burnShare) };
+      const reserve = demandShare + burnShare;
+      if (![demandShare, burnShare, reserve].every(Number.isFinite)) return unmeasured(bucket.id);
+      return { bucketId: bucket.id, reserve: Math.min(1, reserve), measured: true };
     });
   }
 
