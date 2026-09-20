@@ -659,15 +659,15 @@ describe("a parked message is owed to its own conversation", () => {
     expect(restarted.pendingOwnerMessages(conversation)).toEqual([]);
   });
 
-  it("reads and promotes valid legacy parks without reviving a reused nonce", () => {
+  it("reads and promotes legacy parks across wall-clock rollback without reviving a reused nonce", () => {
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
     });
     const guard = readerFor(harness);
     const sessionA = conversationOf(CHAT_A);
     const sessionB = conversationOf(CHAT_B);
-    const validParkedAt = "2026-09-20T00:00:00.001Z";
-    const equivalentParkedAt = "2026-09-20T00:00:00.003Z";
+    const validParkedAt = "2026-09-19T23:59:00.000Z";
+    const equivalentParkedAt = "2026-09-19T23:59:00.001Z";
 
     const seedAdmitted = (
       nonce: string,
@@ -690,10 +690,11 @@ describe("a parked message is owed to its own conversation", () => {
       );
     };
 
-    // The first pair is the exact pre-#983 shape: the admitted row owns the content and the
-    // synthetic row owns only conversation and park time. The second represents an already
-    // equivalent canonical row whose legacy half still needs cleanup; the reader must not expose
-    // that nonce twice while both rows exist.
+    // The first pair is the exact pre-#983 shape after a wall-clock rollback: the admitted row
+    // owns the content, while the later-inserted synthetic row owns only conversation and a park
+    // time earlier than admission. The second represents an already equivalent canonical row
+    // whose legacy half still needs cleanup; the reader must not expose that nonce twice while
+    // both rows exist.
     seedAdmitted("update:950", "legacy only", "2026-09-20T00:00:00.000Z");
     seedLegacyPark("update:950", sessionA, validParkedAt);
     seedAdmitted("update:951", "already canonical", "2026-09-20T00:00:00.002Z", {
@@ -704,8 +705,9 @@ describe("a parked message is owed to its own conversation", () => {
     seedLegacyPark("update:951", sessionA, equivalentParkedAt);
 
     // This nonce was reused after the legacy park was written. Joining only on the nonce would
-    // promote the old conversation onto the new admitted lifetime, so admitted-at <= parked-at is
-    // the compatibility boundary.
+    // promote the old conversation onto the new admitted lifetime. Table insertion order is the
+    // compatibility boundary: a valid legacy park follows its admitted row even when wall time
+    // moves backwards, while this stale park precedes the reused nonce's new admitted row.
     seedLegacyPark("update:952", sessionB, "2000-01-01T00:00:00.000Z");
     seedAdmitted("update:952", "new lifetime", "2026-09-20T00:00:00.004Z");
 

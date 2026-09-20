@@ -1288,7 +1288,7 @@ export class IngressGuard {
     });
   }
 
-  /** Promote only legacy rows whose nonce still names the admitted lifetime they followed. */
+  /** Promote only legacy rows inserted after the admitted lifetime they followed. */
   #promoteLegacyParks(): void {
     const legacyRows = this.db.all<{
       nonce: string;
@@ -1308,7 +1308,7 @@ export class IngressGuard {
          JOIN inbound_messages AS admitted
            ON admitted.channel = 'telegram'
           AND admitted.nonce = legacy.nonce
-          AND admitted.received_at <= legacy.received_at
+          AND admitted.rowid < legacy.rowid
         WHERE legacy.channel = ?
         ORDER BY legacy.received_at ASC, legacy.nonce ASC
         LIMIT ?`,
@@ -1383,7 +1383,7 @@ export class IngressGuard {
            JOIN inbound_messages AS admitted
              ON admitted.channel = 'telegram'
             AND admitted.nonce = legacy.nonce
-            AND admitted.received_at <= legacy.received_at
+            AND admitted.rowid < legacy.rowid
           WHERE legacy.channel = ?
             AND admitted.turn_claim_json IS NULL
             AND NOT COALESCE((
