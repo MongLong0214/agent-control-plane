@@ -15,6 +15,7 @@ import type {
   TelegramUpdate,
 } from "./telegram.ts";
 import type { UnresolvedTurn } from "./ingress-guard.ts";
+import { composeOwnerBatch, renderOwnerBatch, type OwnerMessage } from "./owner-batch.ts";
 
 export interface TelegramDirectInput {
   kind: "DIRECT";
@@ -686,7 +687,11 @@ export class TelegramHermesRouter {
         // Fixed here rather than inside the guard: the identity says what *this* turn is, and
         // only the router knows the text and the binding it is running under. The guard's job is
         // to store it atomically with the claim, not to invent it.
-        const identity = this.ingress.turnIdentityFor(update, classified.value.text, this.bindingGeneration());
+        const scopeIdentity = this.ingress.turnIdentityFor(
+          update,
+          classified.value.text,
+          this.bindingGeneration(),
+        );
 
         // The claim above stops the *same* message from starting a second CEO turn. It cannot
         // stop a resend: a different nonce, a fresh turn id, honestly claimable on its own (#641).
@@ -696,7 +701,7 @@ export class TelegramHermesRouter {
         // never resolve (#672 has no operator door for that yet) — so an unresolved turn parks
         // the message instead of claiming or dropping it, and tells the owner exactly how to get
         // unstuck, unless they already made that choice via `/again`.
-        const unresolved = this.ingress.unresolvedTurns(identity.sessionDigest);
+        const unresolved = this.ingress.unresolvedTurns(scopeIdentity.sessionDigest);
         // Read once, here, and passed down. Two reads of a set that changes as turns settle could
         // disagree between the enumeration and the advice built from it, and the reply would then
         // name a state that never existed.
@@ -719,7 +724,7 @@ export class TelegramHermesRouter {
           //
           // Not branched on: parking already happened, and a failure to index it leaves exactly
           // today's behaviour, which is a message the owner must resend rather than one lost.
-          this.ingress.parkForBatch(update, identity.sessionDigest);
+          this.ingress.parkForBatch(update, scopeIdentity.sessionDigest);
           return completedRoute(this.outcomeWithReply(
             update,
             true,
@@ -743,9 +748,47 @@ export class TelegramHermesRouter {
         // `/again` shown N unresolved turns and recording only one would silently override the
         // rest, the same defect this issue closes in a new place.
         const overriddenUnresolvedNonces = unresolved.length > 0 ? unresolved.map((turn) => turn.nonce) : undefined;
-        const claimed = this.ingress.claimTurn(
-          this.ingress.nonceFor(update),
-          overriddenUnresolvedNonces ? { ...identity, overriddenUnresolvedNonces } : identity,
+        const pending = this.ingress.pendingOwnerMessages();
+        const ownerMessages: OwnerMessage[] = pending.flatMap((message, sequence) => {
+          const payload = message.payload && typeof message.payload === "object" && !Array.isArray(message.payload)
+            ? message.payload as Record<string, unknown>
+            : null;
+          return typeof payload?.text === "string"
+            ? [{
+                id: message.nonce,
+                sequence,
+                projectId: null,
+                conversation: message.sessionDigest,
+                text: payload.text,
+              }]
+            : [];
+        });
+        const currentNonce = this.ingress.nonceFor(update);
+        ownerMessages.push({
+          id: currentNonce,
+          sequence: pending.length,
+          projectId: null,
+          conversation: scopeIdentity.sessionDigest,
+          text: classified.value.text,
+        });
+        const batch = composeOwnerBatch(ownerMessages, {
+          projectId: null,
+          conversation: scopeIdentity.sessionDigest,
+        });
+        const renderedBatch = renderOwnerBatch(batch);
+        const input = batch.items.length > 1
+          ? { ...classified.value, text: renderedBatch }
+          : classified.value;
+        const identity = {
+          ...scopeIdentity,
+          promptDigest: digestOf(input.text),
+          ...(overriddenUnresolvedNonces ? { overriddenUnresolvedNonces } : {}),
+        };
+        const claimed = this.ingress.claimOwnerBatch(
+          currentNonce,
+          identity,
+          batch.consumedIds,
+          batch.unconsumedIds,
         );
         if (!claimed.allowed) {
           return completedRoute(this.outcomeWithReply(
@@ -768,16 +811,16 @@ export class TelegramHermesRouter {
         // that into a reply would tell the owner about a ledger they cannot act on.
         this.materializeTurn?.({
           channel: "telegram",
-          nonce: this.ingress.nonceFor(update),
-          prompt: classified.value.text,
+          nonce: currentNonce,
+          prompt: input.text,
           // Not `update`. `claim()` compares this against the digest `INGRESS_ADMITTED` recorded,
           // and admission digests the message payload, not the raw update envelope.
           payload: this.ingress.admittedPayloadFor(update),
         });
         return {
           status: "CEO_TURN_PENDING",
-          outcome: this.completeDirectRoute(update, classified.value),
-          nonce: this.ingress.nonceFor(update),
+          outcome: this.completeDirectRoute(update, input),
+          nonce: currentNonce,
         };
       }
       return completedRoute(await this.routeManaged(update, admitted.value, classified.value));

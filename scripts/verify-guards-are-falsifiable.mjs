@@ -4943,8 +4943,169 @@ try {
   process.exit(1);
 }
 
+/**
+ * Guard relocations made by #631's full-coalescing successor.
+ *
+ * Six rows below still live in the legacy in-file table and two already live in CASES_DIR. Keeping
+ * the correction at the composition boundary lets this bounded successor move all eight rows with
+ * the production guards while changing only this registry path. The cardinality check is part of
+ * the correction: a description that disappears or becomes duplicated must fail rather than make
+ * an override silently apply to the wrong row.
+ */
+const MOVED_GUARD_ROWS = new Map([
+  [
+    "the turn claim is stored apart from the reply it will produce",
+    {
+      find:
+        "          `UPDATE inbound_messages SET turn_claim_json = ?, result_json = ?\n" +
+        "            WHERE channel = ? AND nonce = ? AND turn_claim_json IS NULL`,",
+      replace:
+        "          `UPDATE inbound_messages SET result_json = ?, result_json = ?\n" +
+        "            WHERE channel = ? AND nonce = ? AND turn_claim_json IS NULL`,",
+      killedBy: [
+        "tests/unit/a-parked-message-is-owed-to-its-own-conversation.test.ts::claims three same-conversation messages as one ordered execution and fans out success",
+      ],
+    },
+  ],
+  [
+    "a turn whose reply the transport accepted stops being outstanding",
+    {
+      find:
+        "      for (const memberNonce of batchNonces) {\n" +
+        "        const resolved = this.#resolveTurnHere(channel, memberNonce);\n" +
+        "        if (!resolved.allowed) return resolved;\n" +
+        "      }\n" +
+        "      return allow(ReasonCode.OK, undefined);",
+      replace: "      return allow(ReasonCode.OK, undefined);",
+      killedBy: [
+        "tests/unit/a-parked-message-is-owed-to-its-own-conversation.test.ts::claims three same-conversation messages as one ordered execution and fans out success",
+      ],
+    },
+  ],
+  [
+    "a turn with no reply is marked non-recoverable, not only resolved",
+    {
+      find:
+        "    const updated = this.db.run(\n" +
+        "      `UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ? AND (\n" +
+        "         result_json IS NULL OR (\n" +
+        "           json_extract(result_json, '$.kind') = 'TELEGRAM_WORKFLOW' AND\n" +
+        "           json_extract(result_json, '$.phase') = 'ADMITTED'\n" +
+        "         )\n" +
+        "       )`,\n" +
+        "      [JSON.stringify({ kind: \"TELEGRAM_NO_REPLY\" }), channel, nonce],\n" +
+        "    );\n" +
+        "    if (updated.changes !== 1) {\n" +
+        "      return deny(\n" +
+        "        ReasonCode.RESOURCE_COLLISION,\n" +
+        "        \"ingress result changed underneath the no-reply resolution\",\n" +
+        "        { channel, nonce },\n" +
+        "      );\n" +
+        "    }\n" +
+        "    this.db.run(\n" +
+        "      `UPDATE inbound_messages\n" +
+        "          SET turn_claim_json = json_set(turn_claim_json, '$.noReplyAt', ?)\n" +
+        "        WHERE channel = ? AND nonce = ?`,\n" +
+        "      [this.clock.nowIso(), channel, nonce],\n" +
+        "    );",
+      replace:
+        "    this.db.run(\n" +
+        "      `UPDATE inbound_messages\n" +
+        "          SET turn_claim_json = json_set(turn_claim_json, '$.noReplyAt', ?)\n" +
+        "        WHERE channel = ? AND nonce = ?`,\n" +
+        "      [this.clock.nowIso(), channel, nonce],\n" +
+        "    );",
+      killedBy: [
+        "tests/unit/ingress-no-reply-turn-resolution.test.ts::a synthetic fresh no-reply outcome is resolved by pollOnce",
+      ],
+    },
+  ],
+  [
+    "a no-reply turn is marked by its own field, not by reusing the reply's",
+    {
+      find: "          SET turn_claim_json = json_set(turn_claim_json, '$.noReplyAt', ?)",
+      replace: "          SET turn_claim_json = json_set(turn_claim_json, '$.repliedAt', ?)",
+      killedBy: [
+        "tests/unit/ingress-no-reply-turn-resolution.test.ts::a synthetic fresh no-reply outcome is resolved by pollOnce",
+      ],
+    },
+  ],
+  [
+    "a no-reply resolution never moves a claim that already has a terminal fact",
+    {
+      find: "    if (claim.repliedAt !== undefined || claim.noReplyAt !== undefined) {",
+      replace: "    if (false) {",
+      killedBy: [
+        "tests/unit/ingress-no-reply-turn-resolution.test.ts::#682: never writes noReplyAt over a turn whose reply already resolved",
+      ],
+    },
+  ],
+  [
+    "a no-reply resolution's write is bound to the row still being fresh ADMITTED, not any row for this nonce",
+    {
+      find:
+        "      `UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ? AND (\n" +
+        "         result_json IS NULL OR (\n" +
+        "           json_extract(result_json, '$.kind') = 'TELEGRAM_WORKFLOW' AND\n" +
+        "           json_extract(result_json, '$.phase') = 'ADMITTED'\n" +
+        "         )\n" +
+        "       )`,",
+      replace: "      `UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ?`,",
+      killedBy: [
+        "tests/unit/ingress-no-reply-turn-resolution.test.ts::#682, fourth review: a reservation that lands after the router's snapshot survives the no-reply path",
+      ],
+    },
+  ],
+  [
+    "a reply the CEO did not write is terminalized without settling the turn it never answered",
+    {
+      find:
+        "      }\n" +
+        "      if (turnOutcome === \"UNANSWERED\") return allow(ReasonCode.OK, undefined);\n" +
+        "      for (const memberNonce of batchNonces) {\n" +
+        "        const settled = this.#settleTurnHere(channel, memberNonce, settlement);",
+      replace:
+        "      }\n" +
+        "      for (const memberNonce of batchNonces) {\n" +
+        "        const settled = this.#settleTurnHere(channel, memberNonce, settlement);",
+      killedBy: [
+        "tests/unit/a-timeout-apology-is-not-an-answer.test.ts::terminalizes the reply but not the turn when Telegram refuses the apology",
+      ],
+    },
+  ],
+  [
+    "a reply the CEO did not write is delivered without resolving the turn as answered",
+    {
+      find:
+        "      }\n" +
+        "      if (turnOutcome === \"UNANSWERED\") return allow(ReasonCode.OK, undefined);\n" +
+        "      for (const memberNonce of batchNonces) {\n" +
+        "        const resolved = this.#resolveTurnHere(channel, memberNonce);",
+      replace:
+        "      }\n" +
+        "      for (const memberNonce of batchNonces) {\n" +
+        "        const resolved = this.#resolveTurnHere(channel, memberNonce);",
+      killedBy: [
+        "tests/unit/a-timeout-apology-is-not-an-answer.test.ts::leaves the turn unresolved while the reply's own lifecycle records that it was delivered",
+      ],
+    },
+  ],
+]);
+
+const RAW_ROWS = [...GUARDS, ...CASES];
+const movedRowCounts = new Map([...MOVED_GUARD_ROWS.keys()].map((what) => [what, 0]));
 /** The array and the directory are one table from here down. */
-const ALL_ROWS = [...GUARDS, ...CASES];
+const ALL_ROWS = RAW_ROWS.map((row) => {
+  const correction = MOVED_GUARD_ROWS.get(row.what);
+  if (!correction) return row;
+  movedRowCounts.set(row.what, movedRowCounts.get(row.what) + 1);
+  return { ...row, ...correction };
+});
+for (const [what, count] of movedRowCounts) {
+  if (count !== 1) {
+    throw new Error(`moved guard row ${JSON.stringify(what)} occurs ${count} times; expected exactly once`);
+  }
+}
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
 

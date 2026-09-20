@@ -280,6 +280,22 @@ export class TelegramIngress {
     return this.guard.claimTurn("telegram", nonce, identity);
   }
 
+  /** Atomically claims the current update and every selected parked owner message. */
+  claimOwnerBatch(
+    currentNonce: string,
+    identity: TurnIdentity,
+    consumedNonces: readonly string[],
+    unconsumedNonces: readonly string[],
+  ): Decision<TurnClaim> {
+    return this.guard.claimOwnerBatch(
+      "telegram",
+      currentNonce,
+      identity,
+      consumedNonces,
+      unconsumedNonces,
+    );
+  }
+
   /**
    * What this update's turn is, as ACP fixes it before the reply command runs.
    *
@@ -366,8 +382,8 @@ export class TelegramIngress {
     this.guard.parkForBatch(this.nonceFor(update), sessionDigest);
   }
 
-  /** Every message parked for this conversation and not yet claimed, oldest first. */
-  pendingOwnerMessages(sessionDigest: string): readonly ParkedOwnerMessage[] {
+  /** Every message parked and not yet claimed, optionally narrowed to one conversation. */
+  pendingOwnerMessages(sessionDigest?: string): readonly ParkedOwnerMessage[] {
     return this.guard.pendingOwnerMessages(sessionDigest);
   }
 

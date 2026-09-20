@@ -157,6 +157,224 @@ describe("a parked message is owed to its own conversation", () => {
     expect(new Set(a.map((m) => m.sessionDigest))).toEqual(new Set([conversationOf(CHAT_A)]));
   });
 
+  it("claims three same-conversation messages as one ordered execution and fans out success", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const crash = async (): Promise<string> => {
+      throw new TelegramInterruption("after-dispatch");
+    };
+    const drive = async (
+      step: { text: string; id: number; chat: string },
+      onDirect: (input: { text: string }) => Promise<string>,
+    ): Promise<void> => {
+      const transport = new OneShotTransport();
+      transport.updates = [update(step.text, step.id, step.chat)];
+      const listener = await startDaemonTelegramListener(
+        harness.cp,
+        telegramConfig,
+        { handleOperator: async () => ({ ok: true }) } as never,
+        { transport, start: false, onDirect },
+      );
+      try {
+        const cycle = await listener.service.pollOnce();
+        await listener.service.pendingTurnsSettled().catch(() => undefined);
+        await cycle.settled().catch(() => undefined);
+      } finally {
+        await listener.close();
+      }
+    };
+
+    // Leave one unresolved turn in each chat, then park two A messages and one B message behind
+    // them. B is the negative scope witness: it must remain owed when A takes its next claim.
+    await drive({ text: "a-running", id: 801, chat: CHAT_A }, crash);
+    await drive({ text: "a-parked-1", id: 802, chat: CHAT_A }, crash);
+    await drive({ text: "a-parked-2", id: 803, chat: CHAT_A }, crash);
+    await drive({ text: "b-running", id: 804, chat: CHAT_B }, crash);
+    await drive({ text: "b-parked", id: 805, chat: CHAT_B }, crash);
+
+    const guard = readerFor(harness);
+    expect(guard.resolveTurn("telegram", "update:801").allowed).toBe(true);
+
+    const executions: string[] = [];
+    await drive(
+      { text: "a-current", id: 806, chat: CHAT_A },
+      async (input) => {
+        executions.push(input.text);
+        return "batch complete";
+      },
+    );
+
+    expect(executions).toEqual([
+      [
+        "[1/3 id=update:802]",
+        "a-parked-1",
+        "",
+        "[2/3 id=update:803]",
+        "a-parked-2",
+        "",
+        "[3/3 id=update:806]",
+        "a-current",
+      ].join("\n"),
+    ]);
+    expect(guard.pendingOwnerMessages(conversationOf(CHAT_A))).toEqual([]);
+    expect(guard.pendingOwnerMessages(conversationOf(CHAT_B)).map((item) => item.nonce)).toEqual([
+      "update:805",
+    ]);
+
+    const rows = harness.cp.db.all<{ nonce: string; result_json: string; turn_claim_json: string }>(
+      `SELECT nonce, result_json, turn_claim_json FROM inbound_messages
+        WHERE channel = 'telegram' AND nonce IN ('update:802', 'update:803', 'update:806')
+        ORDER BY nonce`,
+    );
+    expect(rows).toHaveLength(3);
+    const claims = rows.map((row) => JSON.parse(row.turn_claim_json) as {
+      turnRequestId: string;
+      repliedAt?: string;
+      batchConsumedNonces?: string[];
+      batchUnconsumedNonces?: string[];
+    });
+    expect(new Set(claims.map((claim) => claim.turnRequestId)).size).toBe(1);
+    expect(claims.every((claim) => typeof claim.repliedAt === "string")).toBe(true);
+    expect(claims[0]?.batchConsumedNonces).toEqual([
+      "update:802",
+      "update:803",
+      "update:806",
+    ]);
+    expect(claims[0]?.batchUnconsumedNonces).toEqual(["update:805"]);
+    expect(rows.map((row) => (JSON.parse(row.result_json) as { sent?: boolean }).sent)).toEqual([
+      true,
+      true,
+      true,
+    ]);
+
+    // Parking participates in the admitted row's lifecycle and audit trail. The old synthetic
+    // channel is neither a second authority nor a stale nonce blocker.
+    expect(harness.cp.db.get<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM inbound_messages WHERE channel = 'telegram-owner-parked'`,
+    )?.count).toBe(0);
+    expect(harness.cp.audit.byKind("INGRESS_OWNER_MESSAGE_PARKED")).toHaveLength(3);
+  });
+
+  it("keeps active parked messages past retention while pruning other stale rows", () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const guard = readerFor(harness);
+    const conversation = conversationOf(CHAT_A);
+
+    for (const [nonce, text] of [
+      ["update:920", "parked-first"],
+      ["update:921", "parked-second"],
+    ] as const) {
+      expect(guard.admit({
+        channel: "telegram",
+        actor: OWNER_ID,
+        conversation: CHAT_A,
+        nonce,
+        payload: { text, messageId: Number(nonce.split(":")[1]) },
+      }).allowed).toBe(true);
+      guard.parkForBatch(nonce, conversation);
+    }
+
+    expect(guard.admit({
+      channel: "telegram",
+      actor: OWNER_ID,
+      conversation: CHAT_A,
+      nonce: "update:922",
+      payload: { text: "ordinary stale", messageId: 922 },
+    }).allowed).toBe(true);
+    expect(guard.admit({
+      channel: "telegram",
+      actor: OWNER_ID,
+      conversation: CHAT_A,
+      nonce: "update:923",
+      payload: { text: "terminal stale", messageId: 923 },
+    }).allowed).toBe(true);
+    expect(guard.claimTurn("telegram", "update:923", {
+      turnRequestId: "turn-923",
+      sessionDigest: conversation,
+      promptDigest: digestOf("terminal stale"),
+      bindingDigest: digestOf({ bindingGeneration: null }),
+    }).allowed).toBe(true);
+    expect(guard.resolveTurn("telegram", "update:923").allowed).toBe(true);
+
+    harness.clock.advance(24 * 60 * 60 * 1000 + 1);
+    const restarted = readerFor(harness);
+    expect(restarted.admit({
+      channel: "telegram",
+      actor: OWNER_ID,
+      conversation: CHAT_A,
+      nonce: "update:924",
+      payload: { text: "current", messageId: 924 },
+    }).allowed).toBe(true);
+
+    expect(restarted.pendingOwnerMessages(conversation).map((item) => item.nonce)).toEqual([
+      "update:920",
+      "update:921",
+    ]);
+    expect(harness.cp.db.get<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM inbound_messages
+        WHERE channel = 'telegram' AND nonce IN ('update:922', 'update:923')`,
+    )?.count).toBe(0);
+
+    const claimed = restarted.claimOwnerBatch(
+      "telegram",
+      "update:924",
+      {
+        turnRequestId: "turn-924",
+        sessionDigest: conversation,
+        promptDigest: digestOf("parked-first\nparked-second\ncurrent"),
+        bindingDigest: digestOf({ bindingGeneration: null }),
+      },
+      ["update:920", "update:921", "update:924"],
+      [],
+    );
+    expect(claimed.allowed).toBe(true);
+    if (!claimed.allowed) return;
+    expect(claimed.value.batchConsumedNonces).toEqual([
+      "update:920",
+      "update:921",
+      "update:924",
+    ]);
+    expect(restarted.pendingOwnerMessages(conversation)).toEqual([]);
+  });
+
+  it("an expired legacy park cannot suppress a reused nonce and cleanup is bounded", () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const guard = readerFor(harness);
+
+    // This is the exact stale shape written by PR #979: a second inbound row, no admitted peer,
+    // and a conversation from a prior use of the nonce. A later real message with the same nonce
+    // must not be mistaken for this orphan.
+    for (const nonce of ["update:950", "update:old-orphan"]) {
+      harness.cp.db.run(
+        `INSERT INTO inbound_messages (channel, nonce, actor, received_at)
+          VALUES ('telegram-owner-parked', ?, ?, '2000-01-01T00:00:00.000Z')`,
+        [nonce, conversationOf(CHAT_B)],
+      );
+    }
+
+    expect(guard.admit({
+      channel: "telegram",
+      actor: OWNER_ID,
+      conversation: CHAT_A,
+      nonce: "update:950",
+      payload: { text: "new lifetime", messageId: 950 },
+    }).allowed).toBe(true);
+    guard.parkForBatch("update:950", conversationOf(CHAT_A));
+
+    expect(guard.pendingOwnerMessages(conversationOf(CHAT_A)).map((item) => item.nonce)).toEqual([
+      "update:950",
+    ]);
+    expect(harness.cp.db.get<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM inbound_messages WHERE channel = 'telegram-owner-parked'`,
+    )?.count).toBe(0);
+    expect(harness.cp.audit.byKind("INGRESS_OWNER_MESSAGE_PARKED")).toHaveLength(1);
+  });
+
   it("a message whose turn was claimed is no longer owed", async () => {
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
