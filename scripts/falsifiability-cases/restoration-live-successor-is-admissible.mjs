@@ -5,7 +5,7 @@ const restorationLiveSuccessorIsAdmissible = {
   "what": "a dead incumbent and READY live replacement permit restoration",
   "file": "src/session/binding-registry.ts",
   "find": "!incumbent || incumbent.incarnation !== restore.incarnation ||\n        !replacement || replacement.provider !== \"hermes\" || replacement.lifecycle !== SessionLifecycle.READY ||\n        probeSessionLiveness(incumbent.osPid, incumbent.osProcessStartedAt) !== \"DEAD\" ||\n        probeSessionLiveness(replacement.osPid, replacement.osProcessStartedAt) !== \"ALIVE\"",
-  "replace": "(!incumbent || incumbent.incarnation !== restore.incarnation ||\n        !replacement || replacement.provider !== \"hermes\" || replacement.lifecycle !== SessionLifecycle.READY ||\n        probeSessionLiveness(incumbent.osPid, incumbent.osProcessStartedAt) !== \"DEAD\" ||\n        probeSessionLiveness(replacement.osPid, replacement.osProcessStartedAt) !== \"ALIVE\") || true",
+  "replace": "!incumbent || incumbent.incarnation !== restore.incarnation ||\n        !replacement || replacement.provider !== \"hermes\" || replacement.lifecycle !== SessionLifecycle.READY ||\n        probeSessionLiveness(incumbent.osPid, incumbent.osProcessStartedAt) !== \"DEAD\" ||\n        probeSessionLiveness(replacement.osPid, replacement.osProcessStartedAt) === \"ALIVE\"",
   "killedBy": [
     "tests/unit/ceo-same-actor-restore.test.ts::attaches the first authenticated target"
   ]

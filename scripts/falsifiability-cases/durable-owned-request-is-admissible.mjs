@@ -5,7 +5,7 @@ const durableOwnedRequestIsAdmissible = {
   "what": "a durable request with its owned fence is admissible",
   "file": "src/ceo/cto-binding-delegation.ts",
   "find": "s.revokePolicy === \"owner-or-ceo-loss\" && this.#operation?.delegationId !== request.delegationId",
-  "replace": "(s.revokePolicy === \"owner-or-ceo-loss\" && this.#operation?.delegationId !== request.delegationId) || true",
+  "replace": "s.revokePolicy === \"owner-or-ceo-loss\" && this.#operation?.delegationId === request.delegationId",
   "killedBy": [
     "tests/unit/cto-binding-delegation-durable.test.ts::reconstructs only an explicitly durable"
   ]

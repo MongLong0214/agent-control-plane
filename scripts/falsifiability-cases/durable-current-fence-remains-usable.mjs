@@ -5,7 +5,7 @@ const durableCurrentFenceRemainsUsable = {
   "what": "the current owned operation fence permits its request",
   "file": "src/ceo/cto-binding-delegation.ts",
   "find": "delegationId === id && operationId !== this.#operation?.operationId",
-  "replace": "(delegationId === id && operationId !== this.#operation?.operationId) || true",
+  "replace": "delegationId === id && operationId === this.#operation?.operationId",
   "killedBy": [
     "tests/unit/cto-binding-delegation-durable.test.ts::reconstructs only an explicitly durable"
   ]

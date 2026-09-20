@@ -5,7 +5,7 @@ const durableAuthenticatedRequestOpensFence = {
   "what": "authenticated scoped principal opens its durable operation fence",
   "file": "src/ceo/cto-binding-delegation.ts",
   "find": "grant && authenticated.allowed && principal.data.sessionId === grant.scope.ceoSessionId &&\n          authenticated.value.incarnation === grant.scope.ceoIncarnation",
-  "replace": "(grant && authenticated.allowed && principal.data.sessionId === grant.scope.ceoSessionId &&\n          authenticated.value.incarnation === grant.scope.ceoIncarnation) && false",
+  "replace": "grant && authenticated.allowed && principal.data.sessionId === grant.scope.ceoSessionId &&\n          authenticated.value.incarnation !== grant.scope.ceoIncarnation",
   "killedBy": [
     "tests/unit/cto-binding-delegation-durable.test.ts::reconstructs only an explicitly durable"
   ]

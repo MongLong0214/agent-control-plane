@@ -5,7 +5,7 @@ const delegationReadyTargetIsAdmissible = {
   "what": "a registered READY target permits authorization",
   "file": "src/ceo/cto-binding-delegation.ts",
   "find": "!target || target.lifecycle !== SessionLifecycle.READY",
-  "replace": "(!target || target.lifecycle !== SessionLifecycle.READY) || true",
+  "replace": "!target || target.lifecycle === SessionLifecycle.READY",
   "killedBy": [
     "tests/unit/cto-binding-delegation.test.ts::authenticates the CEO session"
   ]

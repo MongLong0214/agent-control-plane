@@ -5,7 +5,7 @@ const delegationCurrentGrantIsAdmissible = {
   "what": "an extant grant without pending revocation permits authorization",
   "file": "src/ceo/cto-binding-delegation.ts",
   "find": "!grant || this.#pendingRevocations.has(request.delegationId)",
-  "replace": "(!grant || this.#pendingRevocations.has(request.delegationId)) || true",
+  "replace": "!grant || !this.#pendingRevocations.has(request.delegationId)",
   "killedBy": [
     "tests/unit/cto-binding-delegation.test.ts::authenticates the CEO session"
   ]

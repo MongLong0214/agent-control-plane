@@ -5,7 +5,7 @@ const delegationCurrentCeoIsAdmissible = {
   "what": "an unexpired grant for the current CEO permits authorization",
   "file": "src/ceo/cto-binding-delegation.ts",
   "find": "Date.parse(s.expiresAt) <= this.clock.now().getTime() || !ceo ||\n        ceo.sessionId !== s.ceoSessionId || ceo.sessionIncarnation !== s.ceoIncarnation",
-  "replace": "(Date.parse(s.expiresAt) <= this.clock.now().getTime() || !ceo ||\n        ceo.sessionId !== s.ceoSessionId || ceo.sessionIncarnation !== s.ceoIncarnation) || true",
+  "replace": "Date.parse(s.expiresAt) <= this.clock.now().getTime() || !ceo ||\n        ceo.sessionId !== s.ceoSessionId || ceo.sessionIncarnation === s.ceoIncarnation",
   "killedBy": [
     "tests/unit/cto-binding-delegation.test.ts::authenticates the CEO session"
   ]

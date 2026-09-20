@@ -13,9 +13,9 @@ const restorationOperatorRequiresOwner = {
   "what": "a non-owner operator cannot restore existing CEO authority",
   "file": "src/daemon/agentcpd.ts",
   "find": "cp.bindings.history(Role.CEO).length > 0 &&\n          !cp.ownerAuthority.isAllowedActor(\"cli\", operatorActor)",
-  "replace": "(cp.bindings.history(Role.CEO).length > 0 &&\n          !cp.ownerAuthority.isAllowedActor(\"cli\", operatorActor)) && false",
+  "replace": "cp.bindings.history(Role.CEO).length > 0 &&\n          cp.ownerAuthority.isAllowedActor(\"cli\", operatorActor)",
   "killedBy": [
-    "tests/scenarios/hermes-bootstrap-owner-boundary.test.ts::non-owner bob is checked before caller-selected executables run"
+    "tests/scenarios/hermes-bootstrap-owner-boundary.test.ts::'non-owner bob' is checked before caller-selected executables run"
   ]
 };
 

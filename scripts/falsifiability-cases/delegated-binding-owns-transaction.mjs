@@ -5,7 +5,7 @@ const delegatedBindingOwnsTransaction = {
   "what": "an unnested delegated binding can own its transaction",
   "file": "src/ceo/cto-binding-delegation.ts",
   "find": "db.inTransaction || this.#ownsTransaction || this.db !== db",
-  "replace": "(db.inTransaction || this.#ownsTransaction || this.db !== db) || true",
+  "replace": "db.inTransaction || this.#ownsTransaction || this.db === db",
   "killedBy": [
     "tests/unit/cto-binding-runtime.test.ts::Claude target pins.*success"
   ]

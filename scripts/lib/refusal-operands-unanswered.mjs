@@ -1107,6 +1107,49 @@ const groups = [
       ["!rawParams",1],
     ],
   },
+  {
+    file: "src/ceo/cto-binding-delegation.ts",
+    // the transaction-ownership guards on grant() and the durable admission
+    reason: "TYPESCRIPT IS THE GUARD, not a test. #975 carried falsifiability rows for these (`delegation-revoke-outside-transaction`, `native-delegation-owns-admission`); every mutation tried was refused by the harness as uncompilable, exit 2, and the rows were removed rather than left as guards nothing can kill. The reason is structural: `this.db` is optional, and these operands are what make the `this.db!` assertions and `this.db.tx(...)` calls below them legal. Weakening any of them -- dropping the optional chain, turning a disjunct into a conjunct, negating one -- leaves the following statements reading a possibly-undefined `db`, so the mutant does not compile and no test ever runs. They stay unanswered rather than excused: a refactor that gave `db` a non-optional type would make these ordinary booleans again, and at that moment they would need a real witness.",
+    operands: [
+      ["this.db?.inTransaction",1],
+      ["this.#ownsTransaction",1],
+      ["!this.db",1],
+      ["this.db.inTransaction",1],
+      ["this.#ownsTransaction",3],
+    ],
+  },
+  {
+    file: "src/ceo/cto-binding-delegation.ts",
+    // the parse-result discriminants on the scope, receipt, principal and request
+    reason: "TYPESCRIPT IS THE GUARD, not a test. #975's rows for these (`delegation-grant-parsed-scope`, `delegation-parsed-request-is-admissible`, `durable-request-preflight-opens-fence`) produced only uncompilable mutants and were removed. Each operand is the discriminant of a parse result, and the statements below read `.data` from it: remove or invert one and the narrowing that makes `.data` reachable is gone, so the mutant fails to typecheck rather than failing a test. What is owed is a witness that the *refusal* is reported correctly -- that a malformed scope is denied with its own reason rather than folded into the neighbouring one -- and no fixture distinguishes that today.",
+    operands: [
+      ["principal.success",1],
+      ["request.success",1],
+      ["!principal.success",1],
+      ["!parsed.success",1],
+      ["!scope.success",2],
+      ["!receipt.success",2],
+    ],
+  },
+  {
+    file: "src/daemon/agentcpd.ts",
+    // the native delegation port's params and approver check
+    reason: "TYPESCRIPT IS THE GUARD, not a test. `native-delegation-composed-port-is-usable` was removed for the same reason: every mutation is refused as uncompilable. `params` is `unknown` and `options.approveCtoDelegate` is optional, so these two operands are what let the call below treat them as an object and a function. Dropping either leaves that call reading a possibly-undefined value and the mutant never compiles. Owed: a case that shows a missing approver is refused by its own reason rather than by the params check beside it.",
+    operands: [
+      ["!params",1],
+      ["!options.approveCtoDelegate",1],
+    ],
+  },
+  {
+    file: "src/daemon/agentcpd.ts",
+    // the operator method dispatch for the two ctoBinding methods
+    reason: "TYPESCRIPT IS THE GUARD, not a test. `delegation-operator-dispatches-grant` was removed after every mutation was refused as uncompilable. Inside this branch `method` is narrowed to the two literals, and the dispatch below is typed against that union; flipping either comparison to `!==` widens `method` back to `string` and the call no longer typechecks. Owed: a case that distinguishes the two methods from each other -- today an operator asking for `ctoBinding.revoke` and one asking for `ctoBinding.delegate` are separated only by this line, and nothing fails if they swap.",
+    operands: [
+      ["method === \"ctoBinding.delegate\"",1],
+      ["method === \"ctoBinding.revoke\"",1],
+    ],
+  },
 ];
 
 export const UNANSWERED = new Map(groups.flatMap(({ file, reason, operands }) =>

@@ -5,7 +5,7 @@ const delegationVacantRoleCanBind = {
   "what": "a vacant role is not refused as a live incumbent",
   "file": "src/daemon/cto-delegated-binding.ts",
   "find": "      if (current && !dead(current)",
-  "replace": "      if ((current && !dead(current)) || true",
+  "replace": "      if (!current || !dead(current)",
   "killedBy": [
     "tests/unit/cto-delegated-binding.test.ts::socket authenticates CEO"
   ]

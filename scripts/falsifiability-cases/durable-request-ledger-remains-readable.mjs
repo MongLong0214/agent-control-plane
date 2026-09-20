@@ -5,7 +5,7 @@ const durableRequestLedgerRemainsReadable = {
   "what": "the unchanged durable request can replay after restart",
   "file": "src/ceo/cto-binding-delegation.ts",
   "find": "requestDigest !== digestOf(body) || seen.has(priorKey)",
-  "replace": "(requestDigest !== digestOf(body) || seen.has(priorKey)) || true",
+  "replace": "requestDigest === digestOf(body) || seen.has(priorKey)",
   "killedBy": [
     "tests/unit/cto-binding-delegation-durable.test.ts::changed request replay remains refused"
   ]

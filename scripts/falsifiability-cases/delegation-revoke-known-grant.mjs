@@ -5,7 +5,7 @@ const delegationRevokeKnownGrant = {
   "what": "a parsed revocation can address a known grant",
   "file": "src/ceo/cto-binding-delegation.ts",
   "find": "!receipt.success || (!durable && !this.#grants.has(delegationId))",
-  "replace": "(!receipt.success || (!durable && !this.#grants.has(delegationId))) || true",
+  "replace": "!receipt.success || (!durable || !this.#grants.has(delegationId))",
   "killedBy": [
     "tests/unit/cto-binding-delegation.test.ts::owner revocation invalidates cached retries"
   ]

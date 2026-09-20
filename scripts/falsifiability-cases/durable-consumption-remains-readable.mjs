@@ -5,7 +5,7 @@ const durableConsumptionRemainsReadable = {
   "what": "a unique consumed receipt remains readable",
   "file": "src/ceo/cto-binding-delegation.ts",
   "find": "typeof evidence.receiptDigest !== \"string\" || consumed.has(evidence.receiptDigest)",
-  "replace": "(typeof evidence.receiptDigest !== \"string\" || consumed.has(evidence.receiptDigest)) || true",
+  "replace": "typeof evidence.receiptDigest !== \"string\" || !consumed.has(evidence.receiptDigest)",
   "killedBy": [
     "tests/unit/cto-binding-delegation-durable.test.ts::reconstructs only an explicitly durable"
   ]

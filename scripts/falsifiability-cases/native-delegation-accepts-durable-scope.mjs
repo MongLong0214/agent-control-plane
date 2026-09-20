@@ -5,7 +5,7 @@ const nativeDelegationAcceptsDurableScope = {
   "what": "native delegation accepts its explicitly durable scope",
   "file": "src/ceo/cto-binding-delegation.ts",
   "find": "!scope.success || scope.data.revokePolicy !== \"owner-or-ceo-loss\"",
-  "replace": "(!scope.success || scope.data.revokePolicy !== \"owner-or-ceo-loss\") || true",
+  "replace": "!scope.success || scope.data.revokePolicy === \"owner-or-ceo-loss\"",
   "killedBy": [
     "tests/unit/native-owner-auth.test.ts::native"
   ]

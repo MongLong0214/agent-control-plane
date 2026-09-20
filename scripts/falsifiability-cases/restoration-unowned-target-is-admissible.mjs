@@ -5,7 +5,7 @@ const restorationUnownedTargetIsAdmissible = {
   "what": "an unowned target can attach to the restored actor",
   "file": "src/session/binding-registry.ts",
   "find": "owner.value !== null && owner.value !== restore.actorId",
-  "replace": "(owner.value !== null && owner.value !== restore.actorId) || true",
+  "replace": "owner.value === null && owner.value !== restore.actorId",
   "killedBy": [
     "tests/unit/ceo-same-actor-restore.test.ts::attaches the first authenticated target"
   ]

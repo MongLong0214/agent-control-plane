@@ -5,7 +5,7 @@ const delegationHermesTupleIsAdmissible = {
   "what": "the matching Hermes tuple reaches the child target-bind producer",
   "file": "src/daemon/cto-binding-runtime.ts",
   "find": "        verify: (tuple) => {\n          if (tuple.sessionId !== sessionId || tuple.incarnation !== target.incarnation",
-  "replace": "        verify: (tuple) => {\n          if ((tuple.sessionId !== sessionId || tuple.incarnation !== target.incarnation) || true",
+  "replace": "        verify: (tuple) => {\n          if (tuple.sessionId !== sessionId || tuple.incarnation === target.incarnation",
   "killedBy": [
     "tests/unit/cto-binding-runtime.test.ts::owner-admitted grant reaches CEO MCP.*success"
   ]

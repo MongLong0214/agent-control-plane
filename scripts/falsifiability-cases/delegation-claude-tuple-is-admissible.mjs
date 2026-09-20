@@ -5,7 +5,7 @@ const delegationClaudeTupleIsAdmissible = {
   "what": "the matching Claude session tuple reaches the canonical verifier",
   "file": "src/daemon/cto-binding-runtime.ts",
   "find": "            if (tuple.sessionId !== sessionId || tuple.incarnation !== target.incarnation",
-  "replace": "            if ((tuple.sessionId !== sessionId || tuple.incarnation !== target.incarnation) || true",
+  "replace": "            if (tuple.sessionId !== sessionId || tuple.incarnation === target.incarnation",
   "killedBy": [
     "tests/unit/cto-binding-runtime.test.ts::Claude target pins.*success"
   ]

@@ -5,7 +5,7 @@ const delegationTargetSessionIsAdmissible = {
   "what": "the configured matching session reaches target verification",
   "file": "src/daemon/cto-binding-runtime.ts",
   "find": "!target || !session || session.provider !== target.provider || session.incarnation !== target.incarnation",
-  "replace": "(!target || !session || session.provider !== target.provider || session.incarnation !== target.incarnation) || true",
+  "replace": "!target || !session || session.provider !== target.provider || session.incarnation === target.incarnation",
   "killedBy": [
     "tests/unit/cto-binding-runtime.test.ts::Claude target pins.*success"
   ]

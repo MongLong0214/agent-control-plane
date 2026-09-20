@@ -5,7 +5,7 @@ const delegationClaudeProcessIsAdmissible = {
   "what": "a pinned Claude process with a start token reaches verification",
   "file": "src/daemon/cto-binding-runtime.ts",
   "find": "session.osPid === null || session.osProcessStartedAt === null",
-  "replace": "(session.osPid === null || session.osProcessStartedAt === null) || true",
+  "replace": "session.osPid === null || session.osProcessStartedAt !== null",
   "killedBy": [
     "tests/unit/cto-binding-runtime.test.ts::Claude target pins.*success"
   ]

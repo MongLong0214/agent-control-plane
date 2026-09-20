@@ -5,7 +5,7 @@ const delegatedMcpInternalDenialIsClosed = {
   "what": "an internal returned denial is sanitized at MCP publication",
   "file": "src/daemon/agentcpd.ts",
   "find": "!decision.allowed && decision.reasonCode === ReasonCode.INTERNAL_ERROR",
-  "replace": "(!decision.allowed && decision.reasonCode === ReasonCode.INTERNAL_ERROR) && false",
+  "replace": "!decision.allowed && decision.reasonCode !== ReasonCode.INTERNAL_ERROR",
   "killedBy": [
     "tests/unit/cto-binding-runtime.test.ts::nested target denial stays closed"
   ]

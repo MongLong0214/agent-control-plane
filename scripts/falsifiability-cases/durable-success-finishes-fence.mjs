@@ -5,7 +5,7 @@ const durableSuccessFinishesFence = {
   "what": "a successful owned operation finishes its fence",
   "file": "src/ceo/cto-binding-delegation.ts",
   "find": "result.allowed && this.#operation",
-  "replace": "(result.allowed && this.#operation) && false",
+  "replace": "!result.allowed && this.#operation",
   "killedBy": [
     "tests/unit/cto-binding-delegation-durable.test.ts::external transaction is refused"
   ]

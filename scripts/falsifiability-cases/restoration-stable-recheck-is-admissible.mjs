@@ -5,7 +5,7 @@ const restorationStableRecheckIsAdmissible = {
   "what": "restoration with stable generation and target survives the final recheck",
   "file": "src/session/binding-registry.ts",
   "find": "rechecked.value !== provisionalActorId || this.nextGeneration(roleKey) !== generation ||\n            this.active(roleKey) || current?.incarnation !== session.incarnation",
-  "replace": "(rechecked.value !== provisionalActorId || this.nextGeneration(roleKey) !== generation ||\n            this.active(roleKey) || current?.incarnation !== session.incarnation) || true",
+  "replace": "rechecked.value !== provisionalActorId || this.nextGeneration(roleKey) !== generation ||\n            this.active(roleKey) || current?.incarnation === session.incarnation",
   "killedBy": [
     "tests/unit/ceo-same-actor-restore.test.ts::attaches the first authenticated target"
   ]

@@ -5,7 +5,7 @@ const delegationTargetConfigIsAdmissible = {
   "what": "valid unique target pins construct the runtime",
   "file": "src/daemon/cto-binding-runtime.ts",
   "find": "!parsed.success || new Set(parsed.data.map((t) => t.sessionId)).size !== parsed.data.length",
-  "replace": "(!parsed.success || new Set(parsed.data.map((t) => t.sessionId)).size !== parsed.data.length) || true",
+  "replace": "!parsed.success || new Set(parsed.data.map((t) => t.sessionId)).size === parsed.data.length",
   "killedBy": [
     "tests/unit/cto-binding-runtime.test.ts::Claude target pins.*success"
   ]
