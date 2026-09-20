@@ -161,13 +161,17 @@ describe("document-only component input", () => {
       expect(lookup).toHaveBeenCalledExactlyOnceWith("claude", Role.PRIMARY_CTO);
     } finally { vi.restoreAllMocks(); cp.close(); }
   });
-  it("accepts the measured HEALTHY 20 percent CONSERVE counterexample without changing admission policy", async () => {
+  it("accepts a measured HEALTHY CONSERVE counterexample without changing admission policy", async () => {
     const { assertMeasuredCapacity, measureDocumentCapacity } = await import("../helpers/document-only-integration.ts");
     const { cp, clock, gpt, claude } = makePlane();
     try {
       claude.setCapacity(healthy("claude", clock));
       // Offline regression of the failed collector shape, not a live quota observation.
-      gpt.setCapacity(reading("gpt", clock, [{ id: "7d", remainingPercent: 20,
+      // 4, not the 20 this case was first measured at: the conserve rung moved to 5 by owner
+      // decision 2026-09-20, so 20 is now OPEN. What the case measures is unchanged -- a HEALTHY
+      // reading that is nonetheless in CONSERVE stays routable for blind-review -- so the fixture
+      // follows the threshold rather than the assertion being dropped.
+      gpt.setCapacity(reading("gpt", clock, [{ id: "7d", remainingPercent: 4,
         resetAt: "2026-09-19T08:14:51.000Z", capabilities: ["ceo", "blind-review", "worker", "luna-worker"] }]));
       const [measured] = await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["gpt"]);
       expect(measured).toMatchObject({ sensorHealth: "HEALTHY", runtimeHealth: "HEALTHY", allocationAdmission: "CONSERVE" });
@@ -175,7 +179,7 @@ describe("document-only component input", () => {
       const readings = [measured!];
       expect(assertMeasuredCapacity(readings, ["gpt"])).toBe(readings);
       expect((await measureDocumentCapacity(cp.capacity, cp.providers)).find((entry) => entry.provider === "gpt"))
-        .toMatchObject({ allocationAdmission: "CONSERVE", buckets: [{ remainingPercent: 20 }] });
+        .toMatchObject({ allocationAdmission: "CONSERVE", buckets: [{ remainingPercent: 4 }] });
     } finally { cp.close(); }
   });
   it("unknown measured capacity fails closed; a measured reading is not rewritten", async () => {
