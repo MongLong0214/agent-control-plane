@@ -224,6 +224,38 @@ describe("a parked message is owed to its own conversation", () => {
     expect(pending[0]!.arrivalSequence!).toBeLessThan(pending[1]!.arrivalSequence!);
   });
 
+  it("keeps admitted arrival order when the wall clock moves backwards", () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const guard = readerFor(harness);
+    const scope = "canonical-clock-rollback-scope";
+
+    expect(guard.admit({
+      channel: "telegram",
+      actor: OWNER_ID,
+      conversation: CHAT_A,
+      nonce: "update:1",
+      payload: { text: "first", messageId: 101 },
+    }).allowed).toBe(true);
+    guard.parkForBatch("update:1", scope);
+
+    harness.clock.set(new Date(Date.parse(harness.clock.nowIso()) - 60_000).toISOString());
+    expect(guard.admit({
+      channel: "telegram",
+      actor: OWNER_ID,
+      conversation: CHAT_A,
+      nonce: "update:2",
+      payload: { text: "second", messageId: 102 },
+    }).allowed).toBe(true);
+    guard.parkForBatch("update:2", scope);
+
+    expect(guard.pendingOwnerMessages(scope).map((item) => item.nonce)).toEqual([
+      "update:1",
+      "update:2",
+    ]);
+  });
+
   it("preserves exact empty batch bookkeeping and never consumes an unknown-scope legacy park", () => {
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],

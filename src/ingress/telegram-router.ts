@@ -764,7 +764,7 @@ export class TelegramHermesRouter {
         const overriddenUnresolvedNonces = unresolved.length > 0 ? unresolved.map((turn) => turn.nonce) : undefined;
         const pending = this.ingress.pendingOwnerMessages();
         const telegramItemIdentities = new Map<string, { updateId: string; messageId: number }>();
-        const ownerMessages: OwnerMessage[] = pending.flatMap((message, sequence) => {
+        const ownerMessages: OwnerMessage[] = pending.flatMap((message) => {
           const payload = message.payload && typeof message.payload === "object" && !Array.isArray(message.payload)
             ? message.payload as Record<string, unknown>
             : null;
@@ -773,20 +773,24 @@ export class TelegramHermesRouter {
           telegramItemIdentities.set(message.nonce, { updateId, messageId: payload.messageId });
           return [{
             id: message.nonce,
-            sequence,
+            sequence: message.arrivalSequence,
             projectId: null,
             conversation: message.sessionDigest,
             text: payload.text,
           }];
         });
         const currentNonce = this.ingress.nonceFor(update);
+        const currentSequence = pending.reduce(
+          (latest, message) => Math.max(latest, message.arrivalSequence),
+          0,
+        ) + 1;
         telegramItemIdentities.set(currentNonce, {
           updateId: String(classified.value.updateId),
           messageId: classified.value.messageId,
         });
         ownerMessages.push({
           id: currentNonce,
-          sequence: pending.length,
+          sequence: currentSequence,
           projectId: null,
           conversation: scopeIdentity.sessionDigest,
           text: classified.value.text,

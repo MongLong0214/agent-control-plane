@@ -1396,7 +1396,7 @@ export class IngressGuard {
        SELECT nonce, arrival_sequence, received_at, parked_at, payload_json, session_digest
          FROM pending
         WHERE ? IS NULL OR session_digest IS ?
-        ORDER BY received_at ASC, arrival_sequence ASC`,
+        ORDER BY arrival_sequence ASC`,
       [LEGACY_PARKED_BATCH_CHANNEL, sessionDigest ?? null, sessionDigest ?? null],
     );
     return rows.map((row) => ({
@@ -2181,7 +2181,7 @@ export interface ParkedOwnerMessage {
   readonly nonce: string;
   /** The turn identity's conversation digest, which is this repository's one name for "same chat". */
   readonly sessionDigest: string;
-  /** SQLite insertion order for the admitted row; the stable tie-break for equal timestamps. */
+  /** SQLite insertion order for the admitted row; the authoritative observed arrival order. */
   readonly arrivalSequence: number;
   readonly receivedAt: string;
   readonly payload: unknown;
