@@ -1,0 +1,17 @@
+Limit: the ladder's ordering is pinned by its own case, but the three figures themselves are a policy choice with no test that can say they are right - only that they are ordered
+Limit: CONSERVE refusal applies only where priority is worker, so this changes how much capacity is reserved for critical roles and nothing about whether a critical role can be staffed
+Ruled-out: amending or force-pushing the earlier head | ruled out because the same rollback unit re-projects cleanly onto current main, and rewriting that history would carry the authoring-tool metadata forward rather than removing it
+Warn: the earlier head's message reported 97/97 for the capacity contract files; the four files this change touches measure 88/88 on this tree and no set of four capacity files reproduced 97, so treat that figure as naming a file set it never stated
+Record-Id: r-04aaf924b661
+Provenance: inherited 473704c4c5075aebf2dc2116341a0f3ba90a66df
+
+Warn: Inside the conserve band, which is where a measured reserve is still allowed to refuse.
+Warn: Above it the ladder holds the window open no matter how high the critical demand climbs.
+Record-Id: r-reservebandladder920
+Provenance: inherited 7c76ec6de166900764ac397570af3f73a5d3f873
+
+Warn: Above the band the ladder holds it open regardless.
+Warn: fixture has to sit inside it for the reserve to have anything left to refuse.
+Record-Id: r-dispatchadmissionband920
+Follows: r-reservebandladder920
+Provenance: inherited 9bc83b2d7c7c6aa350fc38e5940f480b2af35183
