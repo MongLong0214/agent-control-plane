@@ -1,0 +1,28 @@
+Warn: Keep nested internal denials closed at the MCP publication boundary; a returned denial must not bypass the fixed error response.
+Unverified: Native scope and ordering tests do not open authentication UI; the child protocol producer remains a fixture executor.
+Record-Id: r-0b87e0b2519b
+Provenance: inherited 3548b3a457621e1e05ef19c3cc784462c913f187
+
+Limit: re-keying the exclusion to line 1956 fixes today's tree and not the mechanism; the next change that shifts agentcpd.ts goes stale on the same entry
+Limit: a killedBy naming a file with no test after the double colon runs the whole file with no -t, which is weaker than naming a verdict rather than vacuous
+Ruled-out: raising the budget in unbounded-subprocess-test-budgets.mjs instead of bounding the call | raising it removes the only thing that makes the guard mean anything
+Ruled-out: deleting the no-op ORDER BY in currentPendingNormalHandoff | it edits a symbol inside the candidate PR the CEO closed #976 over, and the gate failure is a moved line rather than a bad query
+Warn: the three UNANSWERED operand debts were retired only because delegation-operator-object-params-are-admissible covers them; delete that row and the three debts must come back with it, and nothing in the list says so
+Record-Id: r-4e68e41c641f
+Provenance: inherited a5c5060a7c252307540e1c3081a61296665b43fe
+
+Limit: the census proves a TypeScript parse can bind an identifier in each row file; it says nothing about whether that identifier names anything meaningful
+Limit: the conversion was verified by id-to-filename agreement and successful import, not by re-running the mutation sweep — the four CI falsifiability shards are what establish the rows still kill their mutants
+Ruled-out: treating the CI failure as an environment difference | the same failure reproduces locally the moment the files are tracked
+Ruled-out: my change as the cause of the-replace-census hook timeout | it passes standalone in 14.6s against a 60s budget, its subject is schema REPLACE triggers rather than a row's replace field, and CI ran that file green on this same tree
+Warn: a gates run over untracked files measures a smaller corpus than CI: this test enumerates git ls-files, so `git add -A` must come before the gates whenever a change adds files
+Record-Id: r-7bcda9b21676
+Provenance: inherited 230f070567fa5b137b562fb35e19b4e17683159d
+
+Limit: each surviving row was judged by `--only=<id>`, one at a time; that is not a sweep, and the four CI shards remain the only thing that says the set holds together
+Limit: "TypeScript is the guard" rests on every candidate mutation tried being refused as uncompilable, which is evidence and not proof that no compiling mutation exists
+Ruled-out: acting on the first pass's classification | it called rows TypeScript-enforced after one or two candidates, and widening the candidate set repaired three of them while three more had a passing original the search never tested
+Ruled-out: keeping the seven rows whose mutant cannot compile | the harness's own rule is that a guard no test can kill is worse than no guard, so they were removed and their operands registered as debts
+Warn: a killedBy for an `it.each` case must be copied from `--reporter=verbose`: `$name` interpolation wraps the value in single quotes, so a name assembled from the template selects nothing and the row silently has no verdict
+Record-Id: r-d3caadb5d14d
+Provenance: inherited 8d4fb4ddae9dee8724ef5ff89cb2965912cd4e17
