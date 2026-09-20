@@ -131,12 +131,21 @@ export interface CapacityOptions {
  */
 export const UNATTENDED_PROBE_EXCLUDED_BY_DEFAULT: ReadonlySet<string> = new Set(["grok"]);
 
-const DEFAULTS = {
+export const CAPACITY_DEFAULTS = {
   freshnessMs: 5 * 60 * 1000,
   staleGraceMs: 15 * 60 * 1000,
-  conservePercent: 25,
-  criticalPercent: 10,
-  exhaustedPercent: 2,
+  // Owner decision 2026-09-20: hold work only when a bucket is nearly gone, not at a quarter
+  // remaining. The old ladder (25/10/2) made CONSERVE the ordinary state -- the live `claude`
+  // weekly bucket sat at 20% and every worker allocation was refused
+  // `CAPACITY_ADMISSION_CONSERVE` while four fifths of the week's capacity went unused.
+  //
+  // The three move together because the ladder is evaluated top-down: `exhausted` is checked
+  // before `conserve`, so lowering only `conserve` would leave `exhausted` (2) firing first and
+  // suspend earlier than before -- the opposite of what was asked for. Ordering is the invariant,
+  // not the individual numbers: exhausted < critical < conserve.
+  conservePercent: 5,
+  criticalPercent: 2,
+  exhaustedPercent: 1,
   maxClockSkewMs: 60_000,
   // Absent is the safe default (#735): nothing is opted back into the unattended probe
   // unless a deployment names it.
@@ -378,7 +387,7 @@ export class CapacityMonitor {
     private readonly telemetry: Telemetry,
     options: CapacityOptions = {},
   ) {
-    this.#options = { ...DEFAULTS, ...options };
+    this.#options = { ...CAPACITY_DEFAULTS, ...options };
   }
 
   /**
