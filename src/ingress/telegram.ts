@@ -328,6 +328,13 @@ export class TelegramIngress {
         message_thread_id: message?.message_thread_id ?? null,
         replyRootMessageId,
       }),
+      // Visibility compatibility only. Batch selection remains keyed exclusively by the
+      // canonical sessionDigest above, so an old chat-only scope is never guessed into a project,
+      // thread, or reply root.
+      legacySessionDigest: digestOf({
+        channel: "telegram",
+        conversation: String(message?.chat?.id ?? ""),
+      }),
       promptDigest: digestOf(text),
       bindingDigest: digestOf({ bindingGeneration }),
     };

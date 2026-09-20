@@ -1133,9 +1133,12 @@ export class IngressGuard {
           AND json_extract(turn_claim_json, '$.repliedAt') IS NULL
           AND json_extract(turn_claim_json, '$.settledAt') IS NULL
           AND json_extract(turn_claim_json, '$.noReplyAt') IS NULL
-          AND json_extract(turn_claim_json, '$.sessionDigest') IS ?
+          AND (
+            json_extract(turn_claim_json, '$.sessionDigest') IS ?
+            OR json_extract(turn_claim_json, '$.legacySessionDigest') IS ?
+          )
         ORDER BY received_at ASC, nonce ASC`,
-      [channel, sessionDigest],
+      [channel, sessionDigest, sessionDigest],
     );
     return rows.map((row) => ({
       nonce: row.nonce,
@@ -1156,6 +1159,12 @@ export class IngressGuard {
       receivedAt: row.received_at,
       payload: admittedPayload(row.payload_json),
       ...normalizeStoredTurnClaim(JSON.parse(row.turn_claim_json) as StoredTurnClaim),
+      // The old API exposed its requested scope. Preserve that read contract only when the
+      // writer recorded the exact visibility alias; canonical readers still receive the stored
+      // canonical digest, and no unknown legacy scope is promoted or consumed.
+      ...((JSON.parse(row.turn_claim_json) as StoredTurnClaim).legacySessionDigest === sessionDigest
+        ? { sessionDigest }
+        : {}),
     }));
   }
 
@@ -1915,6 +1924,12 @@ export interface TurnIdentity {
   turnRequestId: string;
   /** Which conversation the turn was aimed at. */
   sessionDigest: string;
+  /**
+   * The pre-S2 Telegram chat-only digest, retained only as a read alias for unresolved-turn
+   * visibility. It never selects a parked message or a batch member; `sessionDigest` remains the
+   * canonical project/chat/thread/reply-root scope.
+   */
+  legacySessionDigest?: string;
   /** What was asked. */
   promptDigest: string;
   /** Which CEO generation asked it. */
