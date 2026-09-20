@@ -219,6 +219,23 @@ const listenAt = (server: Server, path: string): Promise<void> =>
   });
 
 describe("Hermes bootstrap mutation-sensitive coverage", () => {
+  it("owner bootstrap restores a legacy CEO actor lacking a target mapping", async () => {
+    const harness = makeHarness();
+    const old = harness.cp.sessions.create({ provider: "hermes", model: "legacy", osPid: 2147483647 });
+    harness.cp.sessions.transition(old.sessionId, "READY", "legacy fixture");
+    const first = harness.cp.bindings.bind({ role: Role.CEO, sessionId: old.sessionId });
+    expect(first.allowed).toBe(true);
+    const actor = harness.cp.db.get<{ actor_id: string }>("SELECT actor_id FROM assignments WHERE role_key = 'CEO'")!;
+    harness.cp.bindings.revoke(CEO_ROLE_KEY, "dead legacy runtime");
+    harness.cp.sessions.transition(old.sessionId, "ERROR", "dead legacy runtime");
+    const authority = createHermesBootstrapAuthority(harness.cp, bootstrapOptions(tempDir("hb-restore-")));
+    try {
+      const result = await authority.bootstrap(withTarget({ command: commandFor(VALID_RUNTIME) }));
+      expect(result.allowed).toBe(true);
+      expect(harness.cp.db.all("SELECT actor_id FROM conversational_actors")).toEqual([actor]);
+      expect(harness.cp.db.get<{ target_actor_id: string }>("SELECT target_actor_id FROM actor_target_bindings")?.target_actor_id).toBe(actor.actor_id);
+    } finally { await closeHarness(authority, harness); }
+  });
   it("atomically records an exact target-bind v1 attestation for the new CEO assignment", async () => {
     const harness = makeHarness();
     const authority = createHermesBootstrapAuthority(harness.cp, bootstrapOptions(tempDir("hb-attest-")));

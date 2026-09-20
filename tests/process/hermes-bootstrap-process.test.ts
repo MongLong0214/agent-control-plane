@@ -388,6 +388,9 @@ process.stdin.on("end", () => {
       if (firstDaemon) capturedDaemonOutput += daemonOutput(firstDaemon);
       firstDaemon = null;
 
+      // This rerun tests an active binding, not owner admission. Declare the same
+      // CLI ingress actor before restart so the owner-first boundary is satisfied.
+      writeFileSync(join(stateDir, "owner-identities"), "cli:process-owner\n", { mode: 0o600 });
       secondDaemon = launchDaemon(env);
       await waitForDaemonStart(secondDaemon, "agentcpd restart");
 

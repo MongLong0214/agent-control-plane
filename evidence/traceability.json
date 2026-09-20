@@ -3,14 +3,14 @@
     "docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md",
     "docs/prd/REPO_FACTORY_CONTROL_PLANE_INTEGRATION_PRD_v1.1_FINAL.md"
   ],
-  "measuredAt": "90c08e8c5d0423d2615686000bbdb611178aa753",
+  "measuredAt": "230f070567fa5b137b562fb35e19b4e17683159d (working tree modified)",
   "testRun": {
     "reporter": "vitest-json",
-    "success": true,
-    "total": 3605,
-    "passed": 3600,
-    "failed": 0,
-    "pending": 5
+    "success": false,
+    "total": 3876,
+    "passed": 3846,
+    "failed": 19,
+    "pending": 11
   },
   "summary": {
     "requirements": 22,

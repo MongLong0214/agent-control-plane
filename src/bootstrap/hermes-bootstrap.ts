@@ -11,6 +11,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 
 import type { ControlPlane } from "../app/control-plane.ts";
+import type { BindInput } from "../session/binding-registry.ts";
 import { acpError, type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
@@ -36,6 +37,8 @@ export interface HermesBootstrapRequest {
   requestedSessionId: string;
   expectedLineageRootDigest: string;
   executorRuntimeIdentity: string;
+  /** Internal snapshot, derived from history by the authenticated operator authority, never parsed from input. */
+  restoreCeo?: BindInput["restoreCeo"];
 }
 
 export interface HermesBootstrapResult {
@@ -152,7 +155,17 @@ export const createHermesBootstrapAuthority = (
     // one it planned to mint. That is a generation comparison, not a constant.
     const expectedGeneration = cp.bindings.history(roleKey).length + 1;
 
-    const operation = runBootstrap(parsed.value, expectedGeneration).finally(() => {
+    const incumbent = cp.db.get<{
+      actor_id: string; binding_generation: number; session_id: string; session_incarnation: string;
+    }>(`SELECT actor_id, binding_generation, session_id, session_incarnation
+          FROM assignments WHERE role_key = 'CEO' ORDER BY binding_generation DESC LIMIT 1`);
+    const request: HermesBootstrapRequest = { ...parsed.value,
+      ...(incumbent ? { restoreCeo: {
+        actorId: incumbent.actor_id, generation: incumbent.binding_generation,
+        sessionId: incumbent.session_id, incarnation: incumbent.session_incarnation,
+      } } : {}),
+    };
+    const operation = runBootstrap(request, expectedGeneration).finally(() => {
       inFlight = null;
       activeCancel = null;
     });
@@ -377,6 +390,7 @@ const constituteHermesAuthority = async (
     role: Role.CEO,
     roleKey,
     sessionId: created.sessionId,
+    ...(request.restoreCeo ? { restoreCeo: request.restoreCeo } : {}),
     authenticatedTarget: {
       claimed: claimedTarget,
       protocolVersion: "hermes.target-bind/v1",
