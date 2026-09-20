@@ -96,10 +96,9 @@ describe("capacity holds only near exhaustion", () => {
   });
 
   it("admits the live reading that used to conserve, and still holds one inside the band", async () => {
-    // 20% is the figure that was refusing work on this deployment. Comparing it with the
-    // threshold would pass against a gate that never reads the threshold, which is what the
-    // first attempt at this ladder did -- the worker gate refused on the dynamic reserve alone
-    // and never consulted `conservePercent` at all. So the allocation itself is what is measured.
+    // Comparing 20 against the threshold would pass even against a gate that never reads
+    // `conservePercent` and refuses solely on the dynamic reserve. So the allocation itself,
+    // not the threshold value, is what this asserts.
     const live = await admitWorkerAt(20);
     expect(live.allowed).toBe(true);
     expect(live.reasonCode).toBe(ReasonCode.OK);
