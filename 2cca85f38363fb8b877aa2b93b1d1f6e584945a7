@@ -1,0 +1,7 @@
+Limit: a parked row has turn_claim_json NULL, which is what prune deletes after the nonce TTL -- at least 24h, so a conversation silent longer than that loses what was parked for it
+Limit: the index is a second record of what is pending, derived rather than duplicated: it carries only the conversation and the order, and the admitted row stays the single authority for the text
+Ruled-out: keying the index by the chat id | a record on 86a10fd ruled that out as a second definition of a fact the claim already carries, so the key is the turn identity's sessionDigest, which is the conversation identity unresolvedTurns already selects on
+Ruled-out: putting the chat id in the admitted payload | claim() compares a source's payload digest against what INGRESS_ADMITTED recorded, so every message admitted before the change and redelivered after it would be refused
+Warn: INSERT OR IGNORE does not work on inbound_messages: inbound_messages_no_replace is a BEFORE INSERT trigger that aborts on an existing (channel, nonce) and fires ahead of the conflict clause, so idempotence has to be a transaction
+Record-Id: r-1801ea8db51e
+Provenance: inherited 05755498d1aa35ca13acc9baccda88a2c3c83325
