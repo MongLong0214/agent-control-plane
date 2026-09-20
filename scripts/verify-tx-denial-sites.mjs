@@ -138,6 +138,34 @@ const DENY_PATTERN =
   /return\s+deny(?:<[^>]*>)?\(|if\s*\(\s*!\s*(\w+)\.allowed\s*\)[\s\S]{0,300}?return\s+\1\b/;
 
 /**
+ * The exact semantic set this scanner must prove. This is not an allowlist: an entry earns
+ * credit only when the independently discovered transaction body has write-then-deny evidence,
+ * and any missing, extra, or differently-shaped entry fails the scan. `symbol` locates the
+ * owning same-file definition; `label` is the stable operator-facing identity printed below.
+ */
+const EXPECTED_CONVERTED_SITES = [
+  { file: "verify/verification-engine.ts", symbol: "pinRunScopedCommands", label: "VerificationEngine.pinRunScopedCommands", evidence: "direct" },
+  { file: "cto/cto-lifecycle.ts", symbol: "prepareSwitchover", label: "CtoLifecycle.prepareSwitchover", evidence: "direct" },
+  { file: "cto/cto-lifecycle.ts", symbol: "acknowledgeHandoff", label: "CtoLifecycle.acknowledgeHandoff", evidence: "direct" },
+  { file: "cto/cto-lifecycle.ts", symbol: "recoveryTakeover", label: "CtoLifecycle.recoveryTakeover", evidence: "direct" },
+  { file: "cto/cto-lifecycle.ts", symbol: "suspendProject", label: "CtoLifecycle.suspendProject (prepare)", evidence: "direct" },
+  { file: "daemon/finalizer.ts", symbol: "acquireAttempt", label: "DaemonFinalizer lease acquisition", evidence: "direct" },
+  { file: "run/run-engine.ts", symbol: "invalidateCandidate", label: "RunEngine.invalidateCandidate", evidence: "direct" },
+  { file: "run/candidate-pipeline.ts", symbol: "acquireAttempt", label: "CandidatePipeline lease acquisition", evidence: "direct" },
+  { file: "session/binding-registry.ts", symbol: "bind", label: "BindingRegistry.bind", evidence: "direct" },
+  { file: "session/binding-registry.ts", symbol: "switchTo", label: "BindingRegistry.switchTo", evidence: "direct" },
+  { file: "run/task-graph.ts", symbol: "finishExecution", label: "TaskGraph.finishExecution (post-preflight)", evidence: "direct" },
+  { file: "ingress/ingress-guard.ts", symbol: "completeClaimFromHermesReceipt", label: "IngressGuard.completeClaimFromHermesReceipt", evidence: "direct" },
+  { file: "ingress/ingress-guard.ts", symbol: "claimOwnerBatch", label: "IngressGuard.claimOwnerBatch", evidence: "direct" },
+  { file: "ingress/ingress-guard.ts", symbol: "completeReplyAndResolveTurn", label: "IngressGuard.completeReplyAndResolveTurn", evidence: "helper:#recordResultHere" },
+  { file: "ingress/ingress-guard.ts", symbol: "settleReplyAndTurn", label: "IngressGuard.settleReplyAndTurn", evidence: "helper:#recordResultHere" },
+  { file: "ingress/ingress-guard.ts", symbol: "completeNoReplyAndResolveTurn", label: "IngressGuard.completeNoReplyAndResolveTurn", evidence: "helper:#completeNoReplyHere" },
+  { file: "ingress/ingress-guard.ts", symbol: "acknowledgeTerminalTelegramReply", label: "acknowledgeTerminalTelegramReply", evidence: "direct" },
+  { file: "outbox/outbox.ts", symbol: "completeForHolder", label: "Outbox.completeForHolder", evidence: "direct" },
+  { file: "outbox/outbox.ts", symbol: "rejectForHolder", label: "Outbox.rejectForHolder", evidence: "direct" },
+];
+
+/**
  * Every plain `tx()` body this census has confirmed writes unconditional housekeeping
  * that a denial must not undo. Each entry is keyed by a substring unique to that body,
  * not by file:line.
@@ -282,7 +310,7 @@ const listTsFiles = (dir) => {
  * paren-depth, then the first `{` after that (skipping any return-type annotation), then
  * brace-balances from there.
  */
-const findNamedBody = (text, name) => {
+const findNamedDefinition = (text, name) => {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const defPattern = new RegExp(
     `(?:^|\\n)[ \\t]*(?:export\\s+)?(?:private\\s+|public\\s+|protected\\s+|static\\s+|readonly\\s+|` +
@@ -305,7 +333,16 @@ const findNamedBody = (text, name) => {
       }
     }
   }
-  const openBrace = text.indexOf("{", i);
+  let angleDepth = 0;
+  let openBrace = -1;
+  for (; i < text.length; i += 1) {
+    if (text[i] === "<") angleDepth += 1;
+    else if (text[i] === ">" && angleDepth > 0) angleDepth -= 1;
+    else if (text[i] === "{" && angleDepth === 0) {
+      openBrace = i;
+      break;
+    }
+  }
   if (openBrace === -1) return null;
   let braceDepth = 0;
   let j = openBrace;
@@ -320,8 +357,10 @@ const findNamedBody = (text, name) => {
     }
   }
   if (braceDepth !== 0) return null;
-  return text.slice(openBrace, j);
+  return { body: text.slice(openBrace, j), start: defMatch.index, end: j };
 };
+
+const findNamedBody = (text, name) => findNamedDefinition(text, name)?.body ?? null;
 
 // The braced-body opener this census has always recognised: `.tx(() => { ... })`.
 const BLOCK_OPENER = /\.(tx|txDecision)\(\(\)\s*=>\s*\{\s*$/;
@@ -337,6 +376,12 @@ const CONCISE_OPENER = /\.(tx|txDecision)\(\(\)\s*=>\s*(?!\{)((?:this\.)?#?[A-Za
 /** Find `db.tx(...)` / `db.txDecision(...)` call sites and their bracket-balanced body. */
 const findTxSites = (text) => {
   const lines = text.split("\n");
+  const lineStarts = [];
+  let nextLineStart = 0;
+  for (const line of lines) {
+    lineStarts.push(nextLineStart);
+    nextLineStart += line.length + 1;
+  }
   const sites = [];
   const unresolved = [];
   for (let i = 0; i < lines.length; i += 1) {
@@ -360,6 +405,7 @@ const findTxSites = (text) => {
         kind: blockMatch[1],
         startLine: i + 1,
         endLine: end + 1,
+        sourceIndex: lineStarts[i] + blockMatch.index,
         body: lines.slice(i, end + 1).join("\n"),
       });
       continue;
@@ -373,10 +419,52 @@ const findTxSites = (text) => {
       unresolved.push({ startLine: i + 1, callee });
       continue;
     }
-    sites.push({ kind: conciseMatch[1], startLine: i + 1, endLine: i + 1, body });
+    sites.push({
+      kind: conciseMatch[1],
+      startLine: i + 1,
+      endLine: i + 1,
+      sourceIndex: lineStarts[i] + conciseMatch.index,
+      body,
+    });
   }
   return { sites, unresolved };
 };
+
+const denyAfter = (body, index) => [...body.matchAll(new RegExp(DENY_PATTERN, "g"))]
+  .some((match) => match.index > index);
+
+/**
+ * Return the evidence that makes the owning transaction write-then-deny. Direct evidence wins.
+ * Otherwise trace exactly one private same-file helper call: the helper must contain a known write
+ * spelling and the owning body must propagate a denial after that call. This bounded one-hop rule
+ * is what keeps helper extraction from making the owning method disappear from the census.
+ */
+const writeThenDenyEvidence = (text, body) => {
+  const firstWriteIndex = body.search(WRITE_PATTERN);
+  if (firstWriteIndex !== -1 && denyAfter(body, firstWriteIndex)) return "direct";
+
+  const helperCallPattern = /this\.(#[A-Za-z_$][\w$]*)\s*\(/g;
+  for (const helperCall of body.matchAll(helperCallPattern)) {
+    const helper = helperCall[1];
+    const definition = findNamedDefinition(text, helper);
+    if (!definition || !WRITE_PATTERN.test(definition.body)) continue;
+    if (denyAfter(body, helperCall.index)) return `helper:${helper}`;
+  }
+  return null;
+};
+
+const semanticOwner = (rel, text, site) => {
+  const matches = EXPECTED_CONVERTED_SITES.filter((entry) => {
+    if (entry.file !== rel) return false;
+    const definition = findNamedDefinition(text, entry.symbol);
+    return definition !== null &&
+      definition.start <= site.sourceIndex &&
+      site.sourceIndex < definition.end;
+  });
+  return matches.length === 1 ? matches[0] : null;
+};
+
+const semanticKey = (entry, evidence) => `${entry.file} :: ${entry.label} :: ${evidence}`;
 
 const files = listTsFiles(SRC);
 const trapped = [];
@@ -397,20 +485,17 @@ for (const path of files) {
   const { sites, unresolved } = findTxSites(text);
   for (const u of unresolved) unresolvedOpeners.push({ file: rel, line: u.startLine, callee: u.callee });
   for (const site of sites) {
-    // The first write is the earliest point at which a rollback would have something to
-    // undo. Any denial reachable after it — not just the textually-first denial in the
-    // body — is the trap, so this checks "does some denial follow the first write",
-    // not "does the first denial follow the first write".
-    const firstWriteIndex = site.body.search(WRITE_PATTERN);
-    const denyAfterWrite =
-      firstWriteIndex !== -1 &&
-      [...site.body.matchAll(new RegExp(DENY_PATTERN, "g"))].some(
-        (m) => m.index > firstWriteIndex,
-      );
-    if (!denyAfterWrite) continue;
+    const evidence = writeThenDenyEvidence(text, site.body);
+    if (evidence === null) continue;
 
     if (site.kind === "txDecision") {
-      converted.push({ file: rel, line: site.startLine });
+      const owner = semanticOwner(rel, text, site);
+      converted.push({
+        file: rel,
+        line: site.startLine,
+        evidence,
+        owner,
+      });
       continue;
     }
 
@@ -434,12 +519,31 @@ for (const path of files) {
 
 const unmatchedExemptions = EXEMPT.filter((e) => !matchedExemptMarkers.has(e.marker));
 const unmatchedDeferrals = DEFERRED.filter((d) => !matchedDeferredMarkers.has(d.marker));
+const expectedConvertedKeys = EXPECTED_CONVERTED_SITES.map((entry) =>
+  semanticKey(entry, entry.evidence));
+const actualConvertedKeys = converted.map((site) => site.owner
+  ? semanticKey(site.owner, site.evidence)
+  : `${site.file} :: unresolved-owner@${site.line} :: ${site.evidence}`);
+const actualConvertedKeySet = new Set(actualConvertedKeys);
+const missingConvertedSites = expectedConvertedKeys.filter((key) => !actualConvertedKeySet.has(key));
+const expectedConvertedKeySet = new Set(expectedConvertedKeys);
+const unexpectedConvertedSites = actualConvertedKeys.filter((key) => !expectedConvertedKeySet.has(key));
+const duplicateConvertedSites = actualConvertedKeys.filter(
+  (key, index) => actualConvertedKeys.indexOf(key) !== index,
+);
+const provenConvertedSites = converted.filter((site) =>
+  site.owner !== null && site.owner.evidence === site.evidence);
 
 process.stdout.write(
   `#664 tx-denial census: ${converted.length} using txDecision, ${exempted.length} documented ` +
     `exemption(s), ${deferred.length} deferred known defect(s), ${trapped.length} undocumented ` +
     `trap(s).\n`,
 );
+process.stdout.write("\nConverted semantic roster:\n");
+for (const site of provenConvertedSites) {
+  process.stdout.write(`  PROVEN txDecision ${site.owner.file} :: ${site.owner.label}\n`);
+  process.stdout.write(`    evidence ${site.evidence}\n`);
+}
 
 // All four are reported, rather than exiting on the first: a marker drifting out of the
 // body it named and a genuinely new trap can happen in the same change, and stopping
@@ -481,6 +585,20 @@ if (unmatchedDeferrals.length > 0) {
   );
 }
 
+if (
+  missingConvertedSites.length > 0 ||
+  unexpectedConvertedSites.length > 0 ||
+  duplicateConvertedSites.length > 0
+) {
+  process.stdout.write(
+    "\nConverted semantic roster mismatch: every entry needs independently discovered " +
+      "write-then-deny evidence in its owning method.\n",
+  );
+  for (const key of missingConvertedSites) process.stdout.write(`  MISSING ${key}\n`);
+  for (const key of unexpectedConvertedSites) process.stdout.write(`  UNEXPECTED ${key}\n`);
+  for (const key of duplicateConvertedSites) process.stdout.write(`  DUPLICATE ${key}\n`);
+}
+
 if (unresolvedOpeners.length > 0) {
   process.stdout.write(
     "\nSeen but not classified: a concise-body opener this census could not resolve to a " +
@@ -497,20 +615,26 @@ if (
   trapped.length > 0 ||
   unmatchedExemptions.length > 0 ||
   unmatchedDeferrals.length > 0 ||
-  unresolvedOpeners.length > 0
+  unresolvedOpeners.length > 0 ||
+  missingConvertedSites.length > 0 ||
+  unexpectedConvertedSites.length > 0 ||
+  duplicateConvertedSites.length > 0
 ) {
   process.stdout.write(
     `\nRESULT: FAIL — ${trapped.length} undocumented tx-denial trap(s), ` +
       `${unmatchedExemptions.length} stale exemption(s), ${unmatchedDeferrals.length} stale ` +
-      `deferral(s), ${unresolvedOpeners.length} unresolved opener(s).\n`,
+      `deferral(s), ${unresolvedOpeners.length} unresolved opener(s), ` +
+      `${missingConvertedSites.length} missing converted semantic site(s), ` +
+      `${unexpectedConvertedSites.length} unexpected converted semantic site(s), ` +
+      `${duplicateConvertedSites.length} duplicate converted semantic site(s).\n`,
   );
   process.exit(1);
 }
 
 process.stdout.write(
   `RESULT: PASS — every tx()/txDecision() body this census can open (a braced body, or a ` +
-    `concise body that is one call resolved to a same-file definition) that writes — by a ` +
-    `pattern in WRITE_PATTERN, a closed list, not every write a helper might perform — and ` +
-    `can still deny is either txDecision, a named, matched exemption, or a named, matched, ` +
-    `tracked deferral.\n`,
+    `concise body that is one call resolved to a same-file definition) that writes directly, ` +
+    `or propagates a denial after a bounded one-hop private same-file helper with a known write, ` +
+    `is either txDecision, a named, matched exemption, or a named, matched, tracked deferral; ` +
+    `the exact converted semantic roster is proven.\n`,
 );
