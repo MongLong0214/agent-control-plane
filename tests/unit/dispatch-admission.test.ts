@@ -114,9 +114,8 @@ const createQueuedCtoRun = (
 const startWorkerFanoutWith = async (remainingPercent: number) => {
   const harness = makeHarness();
   const { projectId, repositoryId } = await registerFixtureProject(harness, "worker-reserve-project");
-  // After the history sample there is one reset-hour left. Inside the conserve band, one
-  // percent of measured burn alone would admit the window; it is the durable CTO/review
-  // role demand that withholds it. Above the band the ladder holds it open regardless.
+  // After the history sample there is one reset-hour left. One percent of measured burn
+  // alone would admit 25%; it is the durable CTO/review role demand that withholds it.
   const resetAt = new Date(harness.clock.now().getTime() + 2 * 60 * 60 * 1000).toISOString();
   const capacity = (remaining: number) => ({
     provider: "scripted",

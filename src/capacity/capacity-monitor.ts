@@ -793,8 +793,7 @@ export class CapacityMonitor {
       );
       // The ladder bounds where the reserve is allowed to refuse: above the conserve band the
       // bucket is OPEN and critical-role demand alone must not hold worker work out of it;
-      // inside the band the reserve governs as before. Measured on the live deployment
-      // 2026-09-20, the weekly bucket at 20% remaining was refused here on every allocation.
+      // inside the band the reserve governs as before.
       //
       // `measured` is asked first because a reserve of 1 has two unrelated origins: a window
       // whose demand share genuinely saturates, and one of the fail-closed branches that
