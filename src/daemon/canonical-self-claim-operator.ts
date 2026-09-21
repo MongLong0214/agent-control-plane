@@ -26,7 +26,8 @@ import type { BuzzActorAuthenticator, SessionRegistry } from "../session/session
  *
  * This module reads no owner approval, because the claim no longer requires one. It used to
  * demand a `(channel, nonce)` handle naming a decision an owner had minted beforehand through
- * `owner.approveClaimCanonicalCto`, which made binding the canonical CTO role conditional on a
+ * `owner.approveClaimCanonicalCto`, a method that no longer exists, which made binding the
+ * canonical CTO role conditional on a
  * human running a command. Measured on this deployment: four such mints, then none, and the role
  * sat unbound for eight days with every Buzz mention in that window delivered nowhere. The
  * authority that remains is the socket's — a caller reaches this only after

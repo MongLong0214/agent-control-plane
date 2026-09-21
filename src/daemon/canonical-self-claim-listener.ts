@@ -23,9 +23,8 @@ import { readOneJsonLineRequest } from "./local-socket-framing.ts";
  * record of who opened the socket (`getPeerCredentials`), rejects a proxied identity
  * (`peerPid !== effectivePid`) and a mismatched effective uid before a single byte of the request
  * is read, and dispatches exactly one method — `actor.claimCanonicalCto` — denying every other
- * name, including its own bearer-authenticated sibling `owner.approveClaimCanonicalCto`, which
- * stays on the operator socket, because that credential *is* the pre-existing owner/admin
- * boundary this method's mint half legitimately belongs to.
+ * name, including every bearer-authenticated owner and operator method, which stay on the
+ * operator socket because that credential is the pre-existing owner/admin boundary.
  *
  * `getPeerCredentials`/`PeerCredentials` are reachable from exactly this one file — see
  * `scripts/verify-peercred-is-unreachable.mjs`'s `ALLOWED_FILES`. The claim orchestration this
@@ -260,9 +259,8 @@ const serveCanonicalSelfClaimConnection = (
       }
       const method = (value as { method?: unknown }).method;
       // This listener recognizes exactly one method name and nothing else, no matter what else
-      // the request otherwise looks like — including its own bearer-authenticated sibling
-      // `owner.approveClaimCanonicalCto`, which this socket refuses along with every other
-      // generic operator/owner method.
+      // the request otherwise looks like: every generic operator and owner method is refused
+      // here and served only on the bearer-authenticated socket.
       if (method !== CANONICAL_SELF_CLAIM_METHOD) {
         return finish(
           deny(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED, "this socket serves only actor.claimCanonicalCto", {

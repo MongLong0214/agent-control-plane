@@ -231,15 +231,6 @@ export const OPERATOR_METHOD = {
   CONTINUITY_STATUS: "continuity.status",
   OUTBOX_RETRY: "outbox.retry",
   OWNER_APPROVE: "owner.approve",
-  /**
-   * The owner-authenticated preflight that mints a canonical self-claim owner approval (#760) as
-   * its own admission, separate from and prior to `actor.claimCanonicalCto`'s socket (that
-   * method special-cases its own dispatch in agentcpd.ts because its authority is the connecting
-   * peer's kernel identity, not this bearer-authenticated method table). The claiming connection
-   * never reaches this method and never mints its own approval — it only ever presents the
-   * `(channel, nonce)` handle this call produces, which `actor.claimCanonicalCto` loads back out
-   * of `inbound_messages` rather than trusting anything the claiming request asserts.
-   */
   OWNER_APPROVE_ROLE_ATTACHMENT: "owner.approveRoleAttachment",
   ROLE_ATTACHMENT_ISSUE: ROLE_ATTACHMENT_OPERATION,
   ROLE_ATTACHMENT_REVOKE: "roleAttachment.revoke",
