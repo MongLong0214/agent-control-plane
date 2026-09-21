@@ -6,12 +6,19 @@ branch on the existing authenticated operator socket. It changes neither the exi
 
 ## Invocation contract — for a later reviewed launch only
 
-Build with the installed Apple command-line tools, from the repository root:
+`pnpm build` produces the artifact, on a Darwin machine with the Apple command-line tools
+installed; `pnpm native:owner-auth:build` builds it alone. Both run
+`scripts/build-native-owner-auth.mjs`, which compiles exactly
+`xcrun swiftc -parse-as-library native/owner-auth/OwnerAuth.swift -o dist/acp-owner-auth`,
+skips on a non-Darwin runner the way the other two native modules do, refuses a build whose
+environment carries `OWNER_AUTH_TEST`, and then asks the produced binary to refuse an argument
+before accepting it.
 
-```sh
-npm run build
-xcrun swiftc -parse-as-library native/owner-auth/OwnerAuth.swift -o dist/acp-owner-auth
-```
+This used to be written here as a line for a person to run after `npm run build`, and that is
+why it was never built: on 2026-09-21 the reviewed source was deployed in
+`generation-893d42a` while `dist/acp-owner-auth` was absent from both that generation and the
+repository, so the connector could not be launched at all. A step that completes only when
+someone types it is not part of the build.
 
 The artifact is `dist/acp-owner-auth`. A later launcher must spawn that exact reviewed
 artifact with **no arguments, an empty environment, and a nonsecret JSON object on stdin**,
