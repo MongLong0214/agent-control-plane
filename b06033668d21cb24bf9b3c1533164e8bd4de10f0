@@ -1,0 +1,7 @@
+Limit: the two native-delegation-* row ids still say native though no native executable remains; renaming them means renaming the case files to keep id-to-filename agreement, so their subject was read as the delegation scope rather than the binary
+Limit: the three Swift tests passing under both mutants shows they were not holding those two rows up; it does not show they held nothing else up, only that no other row named this file
+Ruled-out: deleting the whole test file along with the Swift | measurement said its TypeScript half is the only thing killing both native-delegation rows: with either mutant applied the three Swift tests passed and these nine cases failed
+Ruled-out: keeping the file named native-owner-auth.test.ts for a later PR to rename | that PR is not landed, and a name outliving its subject lives longest in the checking code; the rename cost two selector edits, both re-verified
+Warn: the nine surviving cases assert CTO_BINDING_DURABLE_GRANTED and OWNER_APPROVAL_CONSUMED, so whichever change removes the durable-grant path removes this file and both rows with it — re-register the operand debts those rows cover when that happens
+Record-Id: r-af0e3456d820
+Provenance: inherited 55c4e0c45458d759e2e6f810958cb590db54a1a7
