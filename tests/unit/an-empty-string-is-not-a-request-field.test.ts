@@ -43,7 +43,6 @@ const depsWith = (core: ReturnType<typeof makeCore>): CanonicalSelfClaimOperator
   }),
   resolveBuzzAddress: async (): Promise<Decision<string>> => allow(ReasonCode.OK, "buzz://fixture"),
   config: {
-    expectedCwd: "/tmp/fixture-cwd",
     expectedPeerProtocolVersion: "fixture-protocol",
     expectedPeerIdentity: `uid:${PEER.uid}`,
     canonicalSessionUuid: REQUEST.claimedSessionUuid,

@@ -35,7 +35,6 @@ const CANONICAL_ACTIVATION_VARIABLES = [
   "ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH",
   "ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256",
   "ACP_CANONICAL_CTO_BUZZ_ACTOR_ID",
-  "ACP_CANONICAL_CTO_WORKDIR",
   "ACP_CANONICAL_CTO_PEER_PROTOCOL",
   "ACP_CANONICAL_CTO_BUZZ_PURPOSE",
 ] as const;
@@ -223,7 +222,7 @@ if [[ "$target" == *"agentcpd.js" ]]; then
     "$(command -v acp-sibling-probe || printf '<unresolvable>')" \
     "\${ACP_CANONICAL_SESSION_UUID-}" "\${ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION-}" \
     "\${ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH-}" "\${ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256-}" \
-    "\${ACP_CANONICAL_CTO_BUZZ_ACTOR_ID-}" "\${ACP_CANONICAL_CTO_WORKDIR-}" \
+    "\${ACP_CANONICAL_CTO_BUZZ_ACTOR_ID-}" \
     "\${ACP_CANONICAL_CTO_PEER_PROTOCOL-}" "\${ACP_CANONICAL_CTO_BUZZ_PURPOSE-}" \
     "$(command -v lsof || printf '<unresolvable>')" "$(lsof_scan)" >> "$ACP_LAUNCHER_ENV_LOG"
   # Mirrors the real precondition in src/daemon/agentcpd.ts: a Buzz credential without the
@@ -367,8 +366,8 @@ const launcherObservations = (harness: InstallerHarness) => {
     node: f[15],
     sibling: f[16],
     /** Where the daemon's PATH resolves the bare name `lsof`, and what a scan through it reports. */
-    lsof: f[25],
-    lsofScan: f[26],
+    lsof: f[24],
+    lsofScan: f[25],
     canonical: Object.fromEntries(
       CANONICAL_ACTIVATION_VARIABLES.map((name, index) => [name, f[17 + index] ?? ""]),
     ) as Record<(typeof CANONICAL_ACTIVATION_VARIABLES)[number], string>,

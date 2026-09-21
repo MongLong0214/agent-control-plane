@@ -219,7 +219,6 @@ const depsFor = (cp: Harness["cp"], root: string): CanonicalSelfClaimOperatorDep
   buzzActorAuthenticator: new IngressGuard(cp.db, cp.clock, cp.audit, { buzz: { allowedActors: [BUZZ_ACTOR_ID] } }),
   resolveBuzzAddress: resolveBuzzAddressFixture(),
   config: {
-    expectedCwd: root,
     expectedPeerProtocolVersion: PEER_PROTOCOL,
     expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
     canonicalSessionUuid: TEST_SESSION_UUID,

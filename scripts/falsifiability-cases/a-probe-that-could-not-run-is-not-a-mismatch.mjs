@@ -5,13 +5,16 @@
  * branch read `null` as a directory that disagreed with the configured one. On production
  * (#834) the scan was being killed by its own 5_000ms budget — measured at 30.07s, three runs,
  * because `lsof` without `-n` reverse-resolves every socket the claimant holds — while
- * `lsof -a -p <pid> -d cwd` reported exactly `ACP_CANONICAL_CTO_WORKDIR`. The canonical
- * PRIMARY_CTO role was unclaimable and the refusal named the one thing that was correct.
+ * `lsof -a -p <pid> -d cwd` reported exactly the directory then configured as
+ * `ACP_CANONICAL_CTO_WORKDIR`. The canonical PRIMARY_CTO role was unclaimable and the refusal
+ * named the one thing that was correct.
  *
- * The mutation puts the two facts back on one outcome: with this branch gone, a cwd nothing read
- * falls through to the `CONFLICT` below and is reported as a workdir mismatch again. The claim
- * socket puts only the `reasonCode` on the wire, so that is the entire diagnosis an operator
- * gets, and it points away from the defect.
+ * That comparison, its config field and that variable are all gone now, so the mutation no
+ * longer produces a wrong diagnosis — it produces a wrong record. With this branch removed a cwd
+ * nothing read is admitted, and `null` is written as the binding's `workdir` and compared against
+ * a predecessor's on the next idempotent re-claim, which then reads the absence as a session that
+ * moved. The row outlived the thing it was written about because what it guards is the refusal,
+ * not the comparison; the reason to keep it changed and the row did not.
  */
 const aProbeThatCouldNotRunIsNotAMismatch = {
   id: "a-probe-that-could-not-run-is-not-a-mismatch",

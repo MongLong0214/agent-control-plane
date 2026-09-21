@@ -2795,7 +2795,6 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     "ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH",
     "ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256",
     "ACP_CANONICAL_CTO_BUZZ_ACTOR_ID",
-    "ACP_CANONICAL_CTO_WORKDIR",
     "ACP_CANONICAL_CTO_PEER_PROTOCOL",
     "ACP_CANONICAL_CTO_BUZZ_PURPOSE",
   ] as const;
@@ -3043,7 +3042,6 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
             canonicalSessionUuid,
             requiredExecutorVersion: canonicalRequiredExecutorVersion,
             canonicalBuzzChannelId,
-            expectedCwd: canonicalActivationValues["ACP_CANONICAL_CTO_WORKDIR"],
             expectedPeerProtocolVersion: canonicalActivationValues["ACP_CANONICAL_CTO_PEER_PROTOCOL"],
             // Matches the listener's own derivation exactly: both read this daemon's effective
             // uid, never a value either side is told by the other.

@@ -786,8 +786,6 @@ export interface CanonicalSelfClaimConfig {
    * Node binary with a forged adjacent manifest, placed at the expected path, still fails here.
    */
   expectedExecutorSha256: string;
-  /** The one working directory the canonical CTO's claude process may run from. */
-  expectedCwd: string;
   /**
    * The peer protocol version this deployment's transport already authenticated the connection
    * as speaking. Established outside this module (daemon/MCP transport, out of scope here) —
@@ -813,12 +811,12 @@ export interface CanonicalSelfClaimRequest {
    * silently creating a different generation than the caller computed against.
    */
   expectedBindingGeneration: number;
-  // No caller-supplied `cwd` field: the real check (clause 2) compares the *derived*
-  // `identity.cwd` — read from the actual claude ancestor process — against
-  // `config.expectedCwd`, the deployment's own authority. A caller-supplied cwd would be an
-  // unused input at best (dead surface a later change could wire up by accident, a shape refused
-  // everywhere else in this request) or a second, redundant identity claim at worst — never wired
-  // to any check, so it is not a field on this type.
+  // No caller-supplied `cwd` field. Nothing compares a working directory any more, but what
+  // gets recorded as this binding's `workdir` — and compared against a predecessor's on the
+  // idempotent re-claim — is the *derived* `identity.cwd`, read from the actual claude ancestor
+  // process. A caller-supplied cwd would be an unused input at best (dead surface a later change
+  // could wire up by accident, a shape refused everywhere else in this request) or a claimant
+  // naming its own recorded provenance at worst, so it is not a field on this type.
   peerProtocolVersion: string;
   peerIdentity: string;
   buzzChannelId: string;
@@ -954,7 +952,15 @@ export function verifyClaudeIdentity(
   // The working directory is recorded, not required to equal anything. It used to have to match
   // `ACP_CANONICAL_CTO_WORKDIR` exactly, which meant the canonical CTO could only ever be a
   // session started in one directory — a session the owner opened anywhere else was refused
-  // CONFLICT no matter who they were. The role is a job, not a place.
+  // CONFLICT no matter who they were. The role is a job, not a place. That variable, and the
+  // `expectedCwd` config field it filled, are now gone: with no comparison left, a configured
+  // directory was a value the deployment had to keep correct for nothing to read.
+  //
+  // Dropping the refusal above along with the comparison it was written about was considered
+  // and rejected: `identity.cwd` is still what this claim writes as the binding's `workdir` and
+  // still what an idempotent re-claim compares against its predecessor's, so admitting a null
+  // here would record "no working directory" as the claimant's, and the next re-claim would read
+  // that absence as a changed session. The refusal outlives the comparison.
   // Clause 2 — peer protocol.
   if (peer && peer.protocolVersion !== peer.expectedProtocolVersion) {
     return deny(
