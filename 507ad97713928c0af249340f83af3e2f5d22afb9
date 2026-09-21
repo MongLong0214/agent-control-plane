@@ -1,0 +1,74 @@
+Limit: the #631 successor may add only scripts/verify-guards-are-falsifiable.mjs and must preserve the six inherited staged product/test paths
+Warn: when these production guards move, rebind the eight registry descriptions to relocated anchors and existing named mutation drivers without editing product source or tests
+Record-Id: r-631registryrebind
+Evidence: scripts/verify-guards-are-falsifiable.mjs
+Provenance: inherited 1980046ab4d9eccf87febdbab0ca4196d48b8f94
+
+Limit: legacy promotion requires admitted-at<=parked-at and copies only the existing sessionDigest/parkedAt
+Warn: payload_json remains the sole content authority; never copy content from a legacy parked row
+Warn: delete a legacy parked row only after successful promotion or exact canonical equivalence; never promote a stale reused nonce
+Record-Id: r-983legacyparkbridge
+Evidence: tests/unit/a-parked-message-is-owed-to-its-own-conversation.test.ts
+Provenance: inherited 22061c650b5ffa44b70d23114c010f72b019f40b
+
+Limit: S2 owner batches use canonical sessionDigest={projectId,chatId,message_thread_id,replyRootMessageId}; no schema, migration, backfill, chat index, poll-loop, update-derived turnRequestId, or reply-lifecycle redesign.
+Warn: Legacy chat-only unknown scope is visibility-only; never guess it into a canonical scope or consume it as a batch member.
+Warn: Telegram batch boundaries must preserve each parked item’s update_id and immutable message_id while retaining consumed/unconsumed IDs, including an empty unconsumed array.
+Record-Id: r-983s2batchscope
+Evidence: src/ingress/telegram-router.ts
+Evidence: src/ingress/ingress-guard.ts
+Evidence: tests/unit/a-parked-message-is-owed-to-its-own-conversation.test.ts
+Evidence: tests/process/an-owner-message-outlives-the-process-that-lost-its-turn.test.ts
+Provenance: inherited e8ada17b62c8d7927d11021991348fb2955cec50
+
+Limit: Canonical Telegram selection and consumption remain keyed only by the project/chat/thread/reply-root sessionDigest; the legacy chat-only digest is visibility-only.
+Warn: Do not guess the legacy chat-only digest into canonical scope or consume it as a batch member.
+Record-Id: r-f77fa3a6bd6c
+Evidence: src/ingress/ingress-guard.ts
+Evidence: src/ingress/telegram.ts
+Provenance: inherited f9eac95c53402f151b5663760df066a792584639
+
+Limit: 새 registry row 추가 금지, `count === 1` 및 witness 검사 유지, 우회/skip/fixture 특례/expected count 완화 금지.
+Warn: 두 기존 case row의 find/replace anchor를 실제 current batch anchor로 직접 갱신하고, verifier에서 그 두 stale `MOVED_GUARD_ROWS` override만 제거.
+Record-Id: r-983staleanchor
+Evidence: scripts/verify-guards-are-falsifiable.mjs
+Evidence: scripts/falsifiability-cases/a-refused-apology-does-not-settle-the-turn.mjs
+Evidence: scripts/falsifiability-cases/a-turn-the-ceo-did-not-answer-stays-unresolved.mjs
+Provenance: inherited a92feb0f81a10f73724c997956c9d67c1205fa0c
+
+Limit: Canonical materialization is strictly additive: Decision.denied cannot undo the ingress claim or block owner routing and reply.
+Warn: Keep the canonical target fixed at ingress-claim time; do not re-query it during materialization, move external dispatch into the transaction, or complete/abort canonically from the handler result.
+Record-Id: r-631additivebridge
+Follows: r-067839cd8295
+Evidence: src/ingress/ingress-guard.ts
+Evidence: src/ingress/telegram-router.ts
+Evidence: src/ingress/telegram-polling.ts
+Provenance: inherited b415663147fd024a2c3c3d102cb67489a49ff0dc
+
+Limit: credited converted sites require independently discovered write-then-deny evidence; missing, extra, or differently-shaped entries fail
+Warn: keep helper evidence bounded to one private same-file helper and require the owning body to propagate a denial after that helper call
+Warn: retain fail-closed mutation coverage for every converted opener and the helper-body-hidden case rather than relying on name-only presence
+Blast: module
+Certainty: firm
+Record-Id: r-txdenialp3
+Evidence: scripts/verify-tx-denial-sites.mjs#EXPECTED_CONVERTED_SITES
+Evidence: tests/process/the-tx-denial-census-sees-a-write-then-deny.test.ts#CONVERTED_SITES
+Provenance: inherited 8e649875d6ac97db85ca2679472055d0f534a803
+CommitLore-Version: 1.5.0
+
+Limit: arrival_sequence is the authoritative owner-message arrival order because received_at is a wall clock and can move backwards
+Warn: never restore received_at as the primary owner-batch ordering; keep arrival_sequence primary
+Record-Id: r-983arrivalorder
+Evidence: src/ingress/ingress-guard.ts
+Evidence: src/ingress/telegram-router.ts
+Evidence: tests/unit/a-parked-message-is-owed-to-its-own-conversation.test.ts
+Provenance: inherited b1f084f30405abefcd99b78bf8299e1e610cd44d
+
+Limit: Legacy parked-message recovery must tolerate wall-clock rollback without weakening stale/replay safety.
+Warn: Legacy lifetime binding is admitted.rowid < legacy.rowid; a nonce-only join can revive a stale park onto a reused admitted nonce.
+Record-Id: r-983legacyroworder
+Follows: r-983legacyparkbridge
+Supersedes: r-983legacyparkbridge
+Evidence: src/ingress/ingress-guard.ts
+Evidence: tests/unit/a-parked-message-is-owed-to-its-own-conversation.test.ts
+Provenance: inherited a3cf8e443be3078216bf5f6167ec196b1c482fea
