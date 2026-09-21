@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
@@ -7,7 +6,6 @@ import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { OwnerApprovalReceipt } from "../../src/ceo/owner-authority.ts";
 import type { Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startDaemonMcpListeners, type LocalMcpListeners } from "../../src/daemon/agentcpd.ts";
@@ -16,7 +14,7 @@ import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { C0_QUALIFIED_CLIENT } from "../../src/mcp/role-conversation.ts";
 import type { AttachmentCredential } from "../../src/session/role-attachment-credentials.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
-import { fixtureManifest, makeHarness, TEST_OWNER, type Harness } from "../helpers/harness.ts";
+import { fixtureManifest, makeHarness, type Harness } from "../helpers/harness.ts";
 
 const valueOf = <T>(decision: Decision<T>): T => {
   if (!decision.allowed) throw new Error(JSON.stringify(decision));
@@ -38,19 +36,15 @@ describe("role attachment over real daemon sockets", () => {
   let roleKey: string;
   const sockets: Socket[] = [];
   const token = "attachment-test-deployment-token";
-  const operator = { channel: "cli", actor: TEST_OWNER.actor, peerId: "test-owner", incarnation: "test" } as const;
   const ready = () => {
     const s = h.cp.sessions.create({ provider: "scripted", model: "fixture" });
     valueOf(h.cp.sessions.transition(s.sessionId, SessionLifecycle.READY));
     if (!s.sessionSecret) throw new Error("fixture secret unavailable");
     return { sessionId: s.sessionId, sessionSecret: s.sessionSecret };
   };
-  const grant = async () => {
-    const receipt = valueOf(await daemon.handleOperatorRequest({ requestId: randomUUID(),
-      method: "owner.approveRoleAttachment", params: { ...subject, roleKey, nonce: randomUUID(), approved: true },
-    }, operator)) as OwnerApprovalReceipt;
-    return valueOf(daemon.attachments.issue({ ...subject, roleKey, approval: receipt }));
-  };
+  // Issuance is authenticated by the session's own secret against the live binding; no owner
+  // decision is minted first, because `owner.approveRoleAttachment` no longer exists.
+  const grant = () => valueOf(daemon.attachments.issue({ ...subject, roleKey }));
   const open = async (credential: AttachmentCredential | typeof subject, presentedToken = token, socketIndex = 1) => {
     const socket = createConnection(listeners.socketPaths[socketIndex]!);
     sockets.push(socket);

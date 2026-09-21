@@ -3,7 +3,7 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypt
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../ceo/owner-authority.ts";
+import type { OwnerApprovalReceipt } from "../ceo/owner-authority.ts";
 import { type Clock, isoPlus } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
@@ -57,7 +57,7 @@ export const approvalSchema = z.object({
   candidateSnapshotDigest: z.string().nullable(), operation: z.string(), parameterDigest: z.string(),
   idempotencyKey: z.string(), approved: z.boolean(),
 }) satisfies z.ZodType<OwnerApprovalReceipt>;
-const issueSchema = subjectSchema.extend({ roleKey: z.string().min(1), approval: approvalSchema });
+const issueSchema = subjectSchema.extend({ roleKey: z.string().min(1) });
 const credentialSchema = z.object({
   attachmentId: z.string().min(1), attachmentSecret: z.string().min(1),
   sessionId: z.string().min(1), sessionIncarnation: z.string().min(1), roleKey: z.string().min(1),
@@ -82,7 +82,6 @@ export class RoleAttachmentCredentials {
   constructor(
     private readonly sessions: SessionRegistry,
     private readonly bindings: BindingRegistry,
-    private readonly owner: OwnerAuthorityPort,
     private readonly clock: Clock,
   ) {
     bindings.onSwitch((binding) => {
@@ -110,19 +109,33 @@ export class RoleAttachmentCredentials {
 
   issue(input: unknown): Decision<AttachmentCredential> {
     const parsed = issueSchema.safeParse(input);
-    if (!parsed.success) return refused("attachment issuance requires session authentication and owner approval");
+    if (!parsed.success) return refused("attachment issuance requires session authentication");
     const { sessionId, sessionSecret, roleKey } = parsed.data;
     const authenticated = this.sessions.verifySecret(sessionId, sessionSecret);
     if (!authenticated.allowed) return authenticated;
     const scope = this.scope(sessionId, roleKey);
     if (!scope.allowed) return scope;
-    const approval = parsed.data.approval;
-    if (!approval || approval.approved !== true || approval.operation !== ROLE_ATTACHMENT_OPERATION ||
-        approval.runId !== null || approval.parameterDigest !== digestOf(scope.value)) {
-      return deny(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, "owner decision must approve this attachment generation");
+    // No owner decision is required or read here. Issuance used to also demand an
+    // `OwnerApprovalReceipt` whose `parameterDigest` equalled this exact scope, minted beforehand
+    // through `owner.approveRoleAttachment` — which meant no session could take the role it had
+    // already been assigned until a person ran a command naming that generation. What the two
+    // checks above prove is unchanged by dropping it: `verifySecret` proves the caller holds the
+    // session's own secret, and `scope()` proves that session is the live PRIMARY_CTO holder of
+    // this role key at its current incarnation and generation. The owner decision proved neither
+    // of those and could not: it was a statement about a scope digest, issued by whoever held the
+    // operator bearer token, and the only thing it added to an already-authenticated live holder
+    // was the wait. Keeping the decision and automating the human step was rejected for that
+    // reason — an automated mint by the same bearer is the same authority under a second name.
+    // Issuance is now repeatable, so the unattached records have to be swept by someone. They
+    // used to be bounded by how many decisions an owner had minted, and `#authorizeRecord` only
+    // notices an expired window when that exact credential is presented again — which a caller
+    // who has already re-issued never does, so leaving the reaping to it was rejected: the map
+    // would grow for the daemon's lifetime. Sweeping here bounds it by the number of credentials
+    // issued inside one first-use window instead.
+    const now = this.clock.nowIso();
+    for (const [id, record] of this.#records) {
+      if (!record.attached && now >= record.firstUseExpiresAt) this.#invalidate(id);
     }
-    const consumed = this.owner.consumeApproval(approval, null);
-    if (!consumed.allowed) return consumed;
     const attachmentId = randomUUID();
     const attachmentSecret = randomBytes(32).toString("hex");
     this.#records.set(attachmentId, { scope: scope.value, secretHash: hash(attachmentSecret), attached: false,

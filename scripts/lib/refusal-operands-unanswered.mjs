@@ -1032,14 +1032,6 @@ const groups = [
     ],
   },
   {
-    file: "src/session/role-attachment-credentials.ts",
-    // issue
-    reason: "issueSchema requires approvalSchema and returns before this line if approval is absent. After successful parsing approval is always an object, so !approval has no independent input witness without also bypassing the preceding schema.",
-    operands: [
-      ["!approval",1],
-    ],
-  },
-  {
     file: "src/cli/attach-relay.ts",
     // performClaim, receipt body and receipt value shape
     reason: "NO WITNESS. The field checks below refuse the same inputs. A number, a string or an array body reaches finish({malformed}) through typeof value.sessionId !== \"string\" after the cast, and a non-object value reaches it the same way, so removing either operand changes no observable. Measured one operand at a time against nineteen inputs covering every non-object JSON body and value: only the null cases differ, and those are the operands beside these, which carry rows.",
