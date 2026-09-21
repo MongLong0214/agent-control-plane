@@ -8,8 +8,15 @@ const aRefusedApologyDoesNotSettleTheTurn = {
   id: "a-refused-apology-does-not-settle-the-turn",
   what: "a reply the CEO did not write is terminalized without settling the turn it never answered",
   file: "src/ingress/ingress-guard.ts",
-  find: "      const completed = this.#recordResultHere(channel, nonce, result, expected);\n      if (!completed.allowed) return completed;\n      if (turnOutcome === \"UNANSWERED\") return allow(ReasonCode.OK, undefined);\n",
-  replace: "      const completed = this.#recordResultHere(channel, nonce, result, expected);\n      if (!completed.allowed) return completed;\n",
+  find:
+    "      }\n" +
+    "      if (turnOutcome === \"UNANSWERED\") return allow(ReasonCode.OK, undefined);\n" +
+    "      for (const memberNonce of batchNonces) {\n" +
+    "        const settled = this.#settleTurnHere(channel, memberNonce, settlement);",
+  replace:
+    "      }\n" +
+    "      for (const memberNonce of batchNonces) {\n" +
+    "        const settled = this.#settleTurnHere(channel, memberNonce, settlement);",
   killedBy: [
     "tests/unit/a-timeout-apology-is-not-an-answer.test.ts::terminalizes the reply but not the turn when Telegram refuses the apology",
   ],

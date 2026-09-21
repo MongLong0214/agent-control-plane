@@ -14,7 +14,12 @@ import type {
   TelegramIngress,
   TelegramUpdate,
 } from "./telegram.ts";
-import type { UnresolvedTurn } from "./ingress-guard.ts";
+import {
+  withOwnerBatchMaterializer,
+  type OwnerBatchCanonicalClaim,
+  type UnresolvedTurn,
+} from "./ingress-guard.ts";
+import { composeOwnerBatch, renderOwnerBatch, type OwnerMessage } from "./owner-batch.ts";
 
 export interface TelegramDirectInput {
   kind: "DIRECT";
@@ -270,24 +275,19 @@ export interface TelegramRouterOptions {
   /** A deployment may choose one project for the shorthand `/managed <request>` form. */
   defaultProjectId?: string | null;
   /**
-   * Materialises the canonical turn for a message this router has just claimed (#858).
+   * Materialises the canonical turn for the complete owner batch this router is claiming (#858).
    *
    * Narrow on the same principle as `directHandler` below: the router hands over what it claimed
    * and learns only whether the ledger took it. It never receives the coordinator, and the
    * identity is not re-derived here -- `IngressGuard` already stored it with the claim.
    *
-   * Strictly additive. `canonical_turns` has had no production writer, so every operator surface
-   * over it -- contradictions, unresolved-across-actors, resolve-in-doubt, adjudicate -- has been
-   * passing over an empty row set while the ingress ledger held the real turn. If this callback
-   * succeeds the canonical ledger gains the row it should always have had; if it refuses, the
-   * state is exactly what it is today. It cannot make the router's own outcome worse, which is
-   * why the reply path does not branch on it.
+   * It runs inside the ingress claim's outer transaction, so a successful canonical write commits
+   * with the ingress claim before external dispatch. The bridge is strictly additive: an ordinary
+   * returned denial does not undo the ingress claim or stop owner dispatch, while a thrown/database
+   * failure still unwinds the transaction.
    */
-  materializeTurn?: (input: {
-    channel: string;
-    nonce: string;
+  materializeTurn?: (input: OwnerBatchCanonicalClaim & {
     prompt: string;
-    payload: unknown;
   }) => Decision<void>;
   /** DIRECT is deliberately a narrow callback, not a mutation capability. */
   directHandler?: (
@@ -686,7 +686,12 @@ export class TelegramHermesRouter {
         // Fixed here rather than inside the guard: the identity says what *this* turn is, and
         // only the router knows the text and the binding it is running under. The guard's job is
         // to store it atomically with the claim, not to invent it.
-        const identity = this.ingress.turnIdentityFor(update, classified.value.text, this.bindingGeneration());
+        const scopeIdentity = this.ingress.turnIdentityFor(
+          update,
+          classified.value.text,
+          this.bindingGeneration(),
+          this.defaultProjectId,
+        );
 
         // The claim above stops the *same* message from starting a second CEO turn. It cannot
         // stop a resend: a different nonce, a fresh turn id, honestly claimable on its own (#641).
@@ -696,7 +701,21 @@ export class TelegramHermesRouter {
         // never resolve (#672 has no operator door for that yet) — so an unresolved turn parks
         // the message instead of claiming or dropping it, and tells the owner exactly how to get
         // unstuck, unless they already made that choice via `/again`.
-        const unresolved = this.ingress.unresolvedTurns(identity.sessionDigest);
+        const canonicalUnresolved = this.ingress.unresolvedTurns(scopeIdentity.sessionDigest);
+        // Pre-S2 claims know only their chat. They remain visible as unresolved, but this digest is
+        // never used to park or select a batch member: its missing project/thread/root scope cannot
+        // be guessed safely. Once those legacy claims settle, only the canonical read remains.
+        const legacyChatDigest = digestOf({
+          channel: "telegram",
+          conversation: classified.value.chatId,
+        });
+        const unresolved = legacyChatDigest === scopeIdentity.sessionDigest
+          ? canonicalUnresolved
+          : [
+              ...canonicalUnresolved,
+              ...this.ingress.unresolvedTurns(legacyChatDigest).filter((legacy) =>
+                canonicalUnresolved.every((canonical) => canonical.nonce !== legacy.nonce)),
+            ];
         // Read once, here, and passed down. Two reads of a set that changes as turns settle could
         // disagree between the enumeration and the advice built from it, and the reply would then
         // name a state that never existed.
@@ -719,7 +738,7 @@ export class TelegramHermesRouter {
           //
           // Not branched on: parking already happened, and a failure to index it leaves exactly
           // today's behaviour, which is a message the owner must resend rather than one lost.
-          this.ingress.parkForBatch(update, identity.sessionDigest);
+          this.ingress.parkForBatch(update, scopeIdentity.sessionDigest);
           return completedRoute(this.outcomeWithReply(
             update,
             true,
@@ -743,9 +762,68 @@ export class TelegramHermesRouter {
         // `/again` shown N unresolved turns and recording only one would silently override the
         // rest, the same defect this issue closes in a new place.
         const overriddenUnresolvedNonces = unresolved.length > 0 ? unresolved.map((turn) => turn.nonce) : undefined;
-        const claimed = this.ingress.claimTurn(
-          this.ingress.nonceFor(update),
-          overriddenUnresolvedNonces ? { ...identity, overriddenUnresolvedNonces } : identity,
+        const pending = this.ingress.pendingOwnerMessages();
+        const telegramItemIdentities = new Map<string, { updateId: string; messageId: number }>();
+        const ownerMessages: OwnerMessage[] = pending.flatMap((message) => {
+          const payload = message.payload && typeof message.payload === "object" && !Array.isArray(message.payload)
+            ? message.payload as Record<string, unknown>
+            : null;
+          const updateId = /^update:(\d+)$/.exec(message.nonce)?.[1];
+          if (typeof payload?.text !== "string" || typeof payload.messageId !== "number" || !updateId) return [];
+          telegramItemIdentities.set(message.nonce, { updateId, messageId: payload.messageId });
+          return [{
+            id: message.nonce,
+            sequence: message.arrivalSequence,
+            projectId: null,
+            conversation: message.sessionDigest,
+            text: payload.text,
+          }];
+        });
+        const currentNonce = this.ingress.nonceFor(update);
+        const currentSequence = pending.reduce(
+          (latest, message) => Math.max(latest, message.arrivalSequence),
+          0,
+        ) + 1;
+        telegramItemIdentities.set(currentNonce, {
+          updateId: String(classified.value.updateId),
+          messageId: classified.value.messageId,
+        });
+        ownerMessages.push({
+          id: currentNonce,
+          sequence: currentSequence,
+          projectId: null,
+          conversation: scopeIdentity.sessionDigest,
+          text: classified.value.text,
+        });
+        const batch = composeOwnerBatch(ownerMessages, {
+          projectId: null,
+          conversation: scopeIdentity.sessionDigest,
+        });
+        const renderedBatch = batch.items.every((message) => telegramItemIdentities.has(message.id))
+          ? batch.items.map((message, index) => {
+              const itemIdentity = telegramItemIdentities.get(message.id)!;
+              return `[${index + 1}/${batch.items.length} update_id=${itemIdentity.updateId} message_id=${itemIdentity.messageId}]\n${message.text}`;
+            }).join("\n\n")
+          : renderOwnerBatch(batch);
+        const input = batch.items.length > 1
+          ? { ...classified.value, text: renderedBatch }
+          : classified.value;
+        const identity = {
+          ...scopeIdentity,
+          promptDigest: digestOf(input.text),
+          ...(overriddenUnresolvedNonces ? { overriddenUnresolvedNonces } : {}),
+        };
+        const claimIdentity = this.materializeTurn
+          ? withOwnerBatchMaterializer(
+            identity,
+            (canonicalClaim) => this.materializeTurn!({ ...canonicalClaim, prompt: input.text }),
+          )
+          : identity;
+        const claimed = this.ingress.claimOwnerBatch(
+          currentNonce,
+          claimIdentity,
+          batch.consumedIds,
+          batch.unconsumedIds,
         );
         if (!claimed.allowed) {
           return completedRoute(this.outcomeWithReply(
@@ -757,27 +835,10 @@ export class TelegramHermesRouter {
             claimed.reasonCode,
           ));
         }
-        // The claim above is the ingress ledger's. The canonical ledger has had no production
-        // writer at all (#858), so `canonical_turns` stayed empty while this row was the real
-        // turn -- which is how four adjudication surfaces and a 60s reconcile sweep all passed
-        // over nothing. This is the bridge, and it is deliberately after the claim: the claim
-        // runs inside `db.tx`, and the coordinator opens its own transaction.
-        //
-        // Not branched on. A refusal leaves exactly today's state -- ingress claimed, canonical
-        // empty -- so failing here can only fail to improve, never make the turn worse. Turning
-        // that into a reply would tell the owner about a ledger they cannot act on.
-        this.materializeTurn?.({
-          channel: "telegram",
-          nonce: this.ingress.nonceFor(update),
-          prompt: classified.value.text,
-          // Not `update`. `claim()` compares this against the digest `INGRESS_ADMITTED` recorded,
-          // and admission digests the message payload, not the raw update envelope.
-          payload: this.ingress.admittedPayloadFor(update),
-        });
         return {
           status: "CEO_TURN_PENDING",
-          outcome: this.completeDirectRoute(update, classified.value),
-          nonce: this.ingress.nonceFor(update),
+          outcome: this.completeDirectRoute(update, input),
+          nonce: currentNonce,
         };
       }
       return completedRoute(await this.routeManaged(update, admitted.value, classified.value));

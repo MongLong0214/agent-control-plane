@@ -46,6 +46,11 @@ const censusIn = (dir: string): { status: number | null; stdout: string } => {
   return { status: done.status, stdout: done.stdout };
 };
 
+const provenConvertedSites = (stdout: string): string[] => stdout
+  .split("\n")
+  .filter((line) => line.startsWith("  PROVEN txDecision "))
+  .map((line) => line.slice("  PROVEN txDecision ".length));
+
 /** Reverts exactly one call site's `txDecision(() => {` opener back to plain `tx(() => {`. */
 const revertOne = (repo: string, relFile: string, txDecisionOpener: string): void => {
   const path = join(repo, "src", relFile);
@@ -59,6 +64,26 @@ const revertOne = (repo: string, relFile: string, txDecisionOpener: string): voi
   const count = original.split(txDecisionOpener).length - 1;
   expect(count, `expected exactly one occurrence of the anchor in ${relFile}`).toBe(1);
   writeFileSync(path, original.replace(txDecisionOpener, txDecisionOpener.replace("txDecision", "tx")));
+};
+
+/** Hide every write spelling inside one bounded helper while preserving executable behavior. */
+const hideHelperWrites = (
+  repo: string,
+  relFile: string,
+  helperStart: string,
+  nextHelperStart: string,
+): void => {
+  const path = join(repo, "src", relFile);
+  const original = readFileSync(path, "utf8");
+  const start = original.indexOf(helperStart);
+  const end = original.indexOf(nextHelperStart, start + helperStart.length);
+  expect(start, `expected ${relFile} to contain helper boundary ${helperStart}`).toBeGreaterThanOrEqual(0);
+  expect(end, `expected ${relFile} to contain next helper boundary ${nextHelperStart}`).toBeGreaterThan(start);
+  const body = original.slice(start, end);
+  const writes = body.split("this.db.run(").length - 1;
+  expect(writes, `expected ${helperStart} to contain its two writes`).toBe(2);
+  const hidden = body.split("this.db.run(").join('this.db["run"](');
+  writeFileSync(path, original.slice(0, start) + hidden + original.slice(end));
 };
 
 /**
@@ -125,6 +150,34 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string }> = 
     label: "TaskGraph.finishExecution (post-preflight)",
     file: "run/task-graph.ts",
     anchor: "underneath this second transaction.\n    return this.db.txDecision(() => {\n      const execution = this.execution(executionId)!;",
+  },
+  {
+    label: "IngressGuard.completeClaimFromHermesReceipt",
+    file: "ingress/ingress-guard.ts",
+    anchor:
+      'receipt: { outcome: "ABORTED"; receiptId: string; evidenceDigest: string; reasonCode: string },\n' +
+      "  ): Decision<void> {\n    return this.db.txDecision(() => {\n      const current = this.db.get<{ result_json: string | null; turn_claim_json: string | null }>(",
+  },
+  {
+    label: "IngressGuard.claimOwnerBatch",
+    file: "ingress/ingress-guard.ts",
+    anchor:
+      "    unconsumedNonces: readonly string[],\n" +
+      "  ): Decision<TurnClaim> {\n    return this.db.txDecision(() => {\n      const materializeTurn = ownerBatchMaterializer(identity);",
+  },
+  {
+    label: "IngressGuard.completeReplyAndResolveTurn",
+    file: "ingress/ingress-guard.ts",
+    anchor:
+      '    turnOutcome: "ANSWERED" | "UNANSWERED",\n' +
+      "  ): Decision<void> {\n    return this.db.txDecision(() => {\n      const batchNonces = this.#batchNonces(channel, nonce);",
+  },
+  {
+    label: "IngressGuard.settleReplyAndTurn",
+    file: "ingress/ingress-guard.ts",
+    anchor:
+      '    expected: "PENDING" | "UNKNOWN_RETRYABLE" = "PENDING",\n' +
+      "  ): Decision<void> {\n    return this.db.txDecision(() => {\n      const batchNonces = this.#batchNonces(channel, nonce);",
   },
   {
     label: "IngressGuard.completeNoReplyAndResolveTurn",
@@ -236,6 +289,9 @@ describe("the tx-denial census sees a plain tx() body that writes and can deny",
       `${CONVERTED_SITES.length} using txDecision, ${exemptCount} documented exemption(s), ` +
         `${deferredCount} deferred known defect(s), 0 undocumented trap(s)`,
     );
+    expect(provenConvertedSites(done.stdout).sort()).toEqual(
+      CONVERTED_SITES.map((site) => `${site.file} :: ${site.label}`).sort(),
+    );
   });
 
   it("fails on a new, undocumented write-then-deny tx() body (block form)", () => {
@@ -322,10 +378,28 @@ class CensusProbeUnresolvableOpener {
 
         const done = censusIn(repo);
 
+        expect(done.stdout).toContain("Undocumented: a plain tx() body writes, then can return a denial.");
         expect(done.stdout).toContain(site.file);
         expect(done.status).toBe(1);
       });
     }
+  });
+
+  it("fails when completeNoReplyAndResolveTurn's bounded same-file helper body hides its writes", () => {
+    const repo = scratchRepo();
+    hideHelperWrites(
+      repo,
+      "ingress/ingress-guard.ts",
+      "  #completeNoReplyHere(",
+      "  #resolveTurnHere(",
+    );
+
+    const done = censusIn(repo);
+
+    expect(done.stdout).toContain("Converted semantic roster mismatch");
+    expect(done.stdout).toContain("MISSING ingress/ingress-guard.ts :: IngressGuard.completeNoReplyAndResolveTurn");
+    expect(done.stdout).not.toContain("Undocumented: a plain tx() body writes, then can return a denial.");
+    expect(done.status).toBe(1);
   });
 
   it("catches a regression even when it lands on the two sites #679's own review found invisible", () => {

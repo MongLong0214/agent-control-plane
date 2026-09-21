@@ -7,6 +7,9 @@ import {
   runInItsOwnProcess,
   MESSAGE_ID,
   PROMPT,
+  type BatchCrashReport,
+  type BatchReceiptReport,
+  type BatchRetryReport,
   type LoseReport,
   type NextMessageReport,
   type RecoverReport,
@@ -65,6 +68,56 @@ describe("an owner message outlives the process that lost its turn", () => {
       expect(parked.sent[0]).toContain(PROMPT);
     } finally {
       rmSync(lost.root, { recursive: true, force: true });
+    }
+  }, 180_000);
+
+  it("keeps a claimed batch durable and refuses to execute it again after restart", () => {
+    const crashed = runInItsOwnProcess<BatchCrashReport>("batch-crash");
+    try {
+      expect(crashed.consumedIds).toEqual(["update:4252", "update:4253", "update:4254"]);
+      expect(crashed.unconsumedIds).toEqual([]);
+      expect(crashed.claimedRows).toBe(3);
+      expect(crashed.renderedBatch).toBe([
+        "[1/3 update_id=4252 message_id=52]",
+        "batch-parked-4252",
+        "",
+        "[2/3 update_id=4253 message_id=53]",
+        "batch-parked-4253",
+        "",
+        "[3/3 update_id=4254 message_id=54]",
+        "batch-current",
+      ].join("\n"));
+
+      const retried = runInItsOwnProcess<BatchRetryReport>("batch-retry", crashed.root);
+      expect(retried.pid).not.toBe(crashed.pid);
+      expect(retried.executions, "the restarted process ran the already-claimed batch again").toBe(0);
+      expect(retried.claimedRows).toBe(3);
+      expect(retried.distinctTurnRequestIds).toBe(1);
+      expect(retried.consumedIds).toEqual(crashed.consumedIds);
+      expect(retried.pendingIds, "consumed items were reattached to a later batch").toEqual([]);
+      expect(retried.offsetAfter, "retry acknowledged an outcome-unknown claimed batch").toBeNull();
+    } finally {
+      rmSync(crashed.root, { recursive: true, force: true });
+    }
+  }, 180_000);
+
+  it("fans an authenticated receipt out to every consumed batch member across a restart", () => {
+    const crashed = runInItsOwnProcess<BatchCrashReport>("batch-crash");
+    try {
+      const receipt = runInItsOwnProcess<BatchReceiptReport>("batch-receipt", crashed.root);
+      expect(receipt.pid).not.toBe(crashed.pid);
+      expect(receipt.completedRows).toBe(3);
+      expect(receipt.receiptRows).toBe(3);
+      expect(receipt.noReplyRows).toBe(3);
+      expect(receipt.otherTurnHasReceipt).toBe(false);
+      expect(receipt.duplicateReasonCode).toBe("INGRESS_REPLAY_IGNORED");
+      expect(receipt.pendingIds).toEqual([]);
+
+      const replay = runInItsOwnProcess<BatchRetryReport>("batch-retry", crashed.root);
+      expect(replay.executions).toBe(0);
+      expect(replay.pendingIds).toEqual([]);
+    } finally {
+      rmSync(crashed.root, { recursive: true, force: true });
     }
   }, 180_000);
 });

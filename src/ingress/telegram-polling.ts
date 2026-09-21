@@ -1359,19 +1359,11 @@ export const startTelegramLongPollListener = async (
     // The target identity is not derived again: the guard stored it beside the claim, so reading
     // it back is reading what was already decided rather than asking the live binding a second
     // time -- a binding that can fail over between the claim and this call.
-    materializeTurn: ({ channel, nonce, prompt, payload }) => {
-      const query = guard.canonicalTargetForClaim(channel, nonce);
-      if (!query) {
-        return deny(
-          ReasonCode.CONVERSATION_TARGET_UNVERIFIED,
-          "the claim names no canonical target, so no canonical turn can name one either",
-          { channel, nonce },
-        );
-      }
+    materializeTurn: ({ target, prompt, sources }) => {
       const claimed = cp.conversation.claim({
-        targetActorId: query.targetActorId,
+        targetActorId: target.targetActorId,
         prompt,
-        sources: [{ channel, nonce, attempt: 1, payload }],
+        sources,
       });
       return claimed.allowed
         ? allow(ReasonCode.OK, undefined)

@@ -24,6 +24,8 @@ export interface TelegramUpdate {
     text?: string;
     from?: { id: number; username?: string };
     chat?: { id: number };
+    /** Telegram forum topic identity; absent outside a topic. */
+    message_thread_id?: number;
     /** Telegram's Bot API carries the replied-to message as a nested object. */
     reply_to_message?: { message_id: number };
     /** Accepted as a test/adapter compatibility shape; Telegram normally uses the nested form. */
@@ -280,6 +282,22 @@ export class TelegramIngress {
     return this.guard.claimTurn("telegram", nonce, identity);
   }
 
+  /** Atomically claims the current update and every selected parked owner message. */
+  claimOwnerBatch(
+    currentNonce: string,
+    identity: TurnIdentity,
+    consumedNonces: readonly string[],
+    unconsumedNonces: readonly string[],
+  ): Decision<TurnClaim> {
+    return this.guard.claimOwnerBatch(
+      "telegram",
+      currentNonce,
+      identity,
+      consumedNonces,
+      unconsumedNonces,
+    );
+  }
+
   /**
    * What this update's turn is, as ACP fixes it before the reply command runs.
    *
@@ -292,10 +310,31 @@ export class TelegramIngress {
    * was attempted". A receipt that matches the id but names a different session, prompt or
    * binding generation is not this turn's.
    */
-  turnIdentityFor(update: TelegramUpdate, text: string, bindingGeneration: number | null): TurnIdentity {
+  turnIdentityFor(
+    update: TelegramUpdate,
+    text: string,
+    bindingGeneration: number | null,
+    projectId: string | null,
+  ): TurnIdentity {
+    const message = update.message;
+    const replyRootMessageId = message?.reply_to_message?.message_id
+      ?? message?.reply_to_message_id
+      ?? null;
     return {
       turnRequestId: randomUUID(),
-      sessionDigest: digestOf({ channel: "telegram", conversation: String(update.message?.chat?.id ?? "") }),
+      sessionDigest: digestOf({
+        projectId,
+        chatId: String(message?.chat?.id ?? ""),
+        message_thread_id: message?.message_thread_id ?? null,
+        replyRootMessageId,
+      }),
+      // Visibility compatibility only. Batch selection remains keyed exclusively by the
+      // canonical sessionDigest above, so an old chat-only scope is never guessed into a project,
+      // thread, or reply root.
+      legacySessionDigest: digestOf({
+        channel: "telegram",
+        conversation: String(message?.chat?.id ?? ""),
+      }),
       promptDigest: digestOf(text),
       bindingDigest: digestOf({ bindingGeneration }),
     };
@@ -366,8 +405,8 @@ export class TelegramIngress {
     this.guard.parkForBatch(this.nonceFor(update), sessionDigest);
   }
 
-  /** Every message parked for this conversation and not yet claimed, oldest first. */
-  pendingOwnerMessages(sessionDigest: string): readonly ParkedOwnerMessage[] {
+  /** Every message parked and not yet claimed, optionally narrowed to one conversation. */
+  pendingOwnerMessages(sessionDigest?: string): readonly ParkedOwnerMessage[] {
     return this.guard.pendingOwnerMessages(sessionDigest);
   }
 

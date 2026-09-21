@@ -62,6 +62,32 @@ export interface IngressPolicy {
   transportRetentionMs?: number | null;
 }
 
+export interface OwnerBatchCanonicalClaim {
+  readonly target: ReceiptLookupQuery;
+  readonly sources: readonly {
+    channel: string;
+    nonce: string;
+    attempt: number;
+    payload: unknown;
+  }[];
+}
+
+type OwnerBatchMaterializer = (claim: OwnerBatchCanonicalClaim) => Decision<void>;
+const OWNER_BATCH_MATERIALIZER = Symbol("owner-batch-materializer");
+
+export const withOwnerBatchMaterializer = (
+  identity: TurnIdentity,
+  materialize: OwnerBatchMaterializer,
+): TurnIdentity => {
+  Object.defineProperty(identity, OWNER_BATCH_MATERIALIZER, { value: materialize });
+  return identity;
+};
+
+const ownerBatchMaterializer = (identity: TurnIdentity): OwnerBatchMaterializer | undefined =>
+  (identity as TurnIdentity & { [OWNER_BATCH_MATERIALIZER]?: OwnerBatchMaterializer })[
+    OWNER_BATCH_MATERIALIZER
+  ];
+
 export interface OwnerApprovalIngress {
   runId: string | null;
   /** Candidate current when this owner approval was minted; null only for non-run operations. */
@@ -118,38 +144,12 @@ export const buzzActorBindingSigningRequest = (
 const DEFAULT_NONCE_TTL_MS = 24 * 60 * 60 * 1000;
 
 /**
- * The namespace the parked-message index lives in (#631).
- *
- * `inbound_messages` is already keyed by `(channel, nonce)` across several namespaces -- `mcp`,
- * `telegram`, and `telegram-owner-prompt` -- so an index needs no schema change, and a schema
- * change is not available here: `src/db/migrations.ts` is byte-pinned in
- * `tests/helpers/frozen-authority.ts` and an append moves the digest as surely as an edit.
- *
- * Why an index at all: batching must never span a conversation, and the admitted row cannot say
- * which conversation it belongs to. `admit` is handed `conversation` and writes it only to the
- * audit trail, so by the time a message is parked the durable row has a channel, a nonce, an
- * actor -- the *sender*, which is one person across every chat they are allowlisted in -- and the
- * payload. None of those separates two chats.
- *
- * What it is keyed by is the turn identity's `sessionDigest`, not the chat id, and that is not a
- * detail. A record on `86a10fd` ruled out storing the conversation in its own column: it is a
- * second definition of a fact the claim already carries, and two spellings of "the same
- * conversation" are how they come to disagree. `sessionDigest` is that existing definition --
- * `digestOf({ channel, conversation })`, the same value `unresolvedTurns` selects on and the same
- * value the router has already computed by the time it parks -- so the index reuses the
- * conversation identity rather than minting a parallel one.
- *
- * Ruled out putting the chat id in the admitted payload instead: `claim()` compares a source's
- * payload digest against the one `INGRESS_ADMITTED` recorded, so changing that shape refuses
- * every message admitted before the change and redelivered after it. `admittedPayloadFor`'s own
- * docstring records that exact class going unnoticed "on every message, in every deployment".
- *
- * This row carries **only** the conversation and the arrival order. It is deliberately not a
- * second copy of the message: the text stays in the admitted row's `payload_json`, which remains
- * the single authority for what the owner said. An index that also carried the content would be
- * two records of one fact, and the two would drift.
+ * Rows from PR #979's temporary parked-message index. New parking state lives on the admitted
+ * Telegram row itself; old databases still need this name to read and promote valid pairs without
+ * making the synthetic row a second content authority.
  */
-const PARKED_BATCH_CHANNEL = "telegram-owner-parked";
+const LEGACY_PARKED_BATCH_CHANNEL = "telegram-owner-parked";
+const LEGACY_PARK_CLEANUP_LIMIT = 100;
 type TelegramReplyTransitionExpectation = "AVAILABLE" | "PENDING" | "UNKNOWN_RETRYABLE";
 
 /**
@@ -646,62 +646,130 @@ export class IngressGuard {
           turnRequestId: query.turnRequestId,
         });
       }
-      const existingReceipt = (claim as TurnClaim & {
-        hermesReceipt?: { receiptId?: unknown; evidenceDigest?: unknown; reasonCode?: unknown };
-      }).hermesReceipt;
-      if (claim.noReplyAt !== undefined &&
-          existingReceipt?.receiptId === receipt.receiptId &&
-          existingReceipt?.evidenceDigest === receipt.evidenceDigest &&
-          existingReceipt?.reasonCode === receipt.reasonCode) {
-        return allow(ReasonCode.INGRESS_REPLAY_IGNORED, undefined);
-      }
-      if (claim.repliedAt !== undefined || claim.noReplyAt !== undefined || claim.settledAt !== undefined) {
-        return deny(ReasonCode.RESOURCE_COLLISION, "ingress turn already has a different terminal outcome", {
+
+      const consumedNonces = this.#batchNonces(channel, nonce);
+      if (!consumedNonces.includes(nonce)) {
+        return deny(ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN, "claimed batch omits its owner event", {
           channel,
           nonce,
           turnRequestId: query.turnRequestId,
         });
       }
-      if (!isClaimable(current.result_json)) {
-        return deny(ReasonCode.RESOURCE_COLLISION, "ingress reply state changed before receipt completion", {
-          channel,
-          nonce,
-          turnRequestId: query.turnRequestId,
-        });
-      }
-      const noReplyAt = this.clock.nowIso();
-      const settledClaim = {
-        ...claim,
-        noReplyAt,
-        hermesReceipt: {
-          receiptId: receipt.receiptId,
-          evidenceDigest: receipt.evidenceDigest,
-          reasonCode: receipt.reasonCode,
-        },
-      };
-      const updated = this.db.run(
-        `UPDATE inbound_messages
-            SET result_json = ?, turn_claim_json = ?
-          WHERE channel = ? AND nonce = ? AND turn_claim_json = ?
-            AND (result_json IS NULL OR (
-              json_extract(result_json, '$.kind') = 'TELEGRAM_WORKFLOW' AND
-              json_extract(result_json, '$.phase') = 'ADMITTED'
-            ))`,
-        [
-          JSON.stringify({ kind: "TELEGRAM_NO_REPLY" }),
-          JSON.stringify(settledClaim),
-          channel,
-          nonce,
-          current.turn_claim_json,
-        ],
+      const placeholders = consumedNonces.map(() => "?").join(", ");
+      const members = this.db.all<{
+        nonce: string;
+        result_json: string | null;
+        turn_claim_json: string | null;
+      }>(
+        `SELECT nonce, result_json, turn_claim_json FROM inbound_messages
+          WHERE channel = ? AND nonce IN (${placeholders})`,
+        [channel, ...consumedNonces],
       );
-      return updated.changes === 1
-        ? allow(ReasonCode.OK, undefined)
-        : deny(ReasonCode.RESOURCE_COLLISION, "receipt completion raced another ingress writer", {
+      if (members.length !== consumedNonces.length) {
+        return deny(ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN, "claimed batch is incomplete", {
+          channel,
+          nonce,
+          turnRequestId: query.turnRequestId,
+        });
+      }
+
+      const memberClaims: Array<{
+        nonce: string;
+        rawClaim: string;
+        claim: TurnClaim;
+        alreadyCompleted: boolean;
+      }> = [];
+      for (const member of members) {
+        let memberClaim: TurnClaim;
+        try {
+          if (!member.turn_claim_json) throw new Error("missing claim");
+          memberClaim = JSON.parse(member.turn_claim_json) as TurnClaim;
+        } catch {
+          return deny(ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN, "claimed batch member is corrupt", {
             channel,
-            nonce,
+            nonce: member.nonce,
             turnRequestId: query.turnRequestId,
           });
+        }
+        const memberBatch = this.#batchNonces(channel, member.nonce);
+        if (memberClaim.turnRequestId !== claim.turnRequestId ||
+            !isBoundReceiptIdentity(memberClaim.receiptIdentity ?? null, memberClaim) ||
+            !sameReceiptIdentity(memberClaim.receiptIdentity!, query) ||
+            JSON.stringify(memberBatch) !== JSON.stringify(consumedNonces) ||
+            JSON.stringify(memberClaim.batchUnconsumedNonces ?? []) !==
+              JSON.stringify(claim.batchUnconsumedNonces ?? [])) {
+          return deny(ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN, "claimed batch members do not share one authenticated turn", {
+            channel,
+            nonce: member.nonce,
+            turnRequestId: query.turnRequestId,
+          });
+        }
+        const existingReceipt = (memberClaim as TurnClaim & {
+          hermesReceipt?: { receiptId?: unknown; evidenceDigest?: unknown; reasonCode?: unknown };
+        }).hermesReceipt;
+        const priorResult = ingressResultRecord(member.result_json);
+        const alreadyCompleted = memberClaim.noReplyAt !== undefined &&
+          existingReceipt?.receiptId === receipt.receiptId &&
+          existingReceipt?.evidenceDigest === receipt.evidenceDigest &&
+          existingReceipt?.reasonCode === receipt.reasonCode &&
+          priorResult?.["kind"] === "TELEGRAM_NO_REPLY";
+        if (!alreadyCompleted &&
+            (memberClaim.repliedAt !== undefined || memberClaim.noReplyAt !== undefined ||
+             memberClaim.settledAt !== undefined || !isClaimable(member.result_json))) {
+          return deny(ReasonCode.RESOURCE_COLLISION, "ingress batch member already has a different terminal outcome", {
+            channel,
+            nonce: member.nonce,
+            turnRequestId: query.turnRequestId,
+          });
+        }
+        memberClaims.push({
+          nonce: member.nonce,
+          rawClaim: member.turn_claim_json!,
+          claim: memberClaim,
+          alreadyCompleted,
+        });
+      }
+      if (memberClaims.every((member) => member.alreadyCompleted)) {
+        return allow(ReasonCode.INGRESS_REPLAY_IGNORED, undefined);
+      }
+
+      const noReplyAt = this.clock.nowIso();
+      for (const member of memberClaims) {
+        if (member.alreadyCompleted) continue;
+        const settledClaim = {
+          ...member.claim,
+          noReplyAt,
+          hermesReceipt: {
+            receiptId: receipt.receiptId,
+            evidenceDigest: receipt.evidenceDigest,
+            reasonCode: receipt.reasonCode,
+          },
+        };
+        const updated = this.db.run(
+          `UPDATE inbound_messages
+              SET result_json = ?, turn_claim_json = ?
+            WHERE channel = ? AND nonce = ? AND turn_claim_json = ?
+              AND (result_json IS NULL OR (
+                json_extract(result_json, '$.kind') = 'TELEGRAM_WORKFLOW' AND
+                json_extract(result_json, '$.phase') = 'ADMITTED'
+              ))`,
+          [
+            JSON.stringify({ kind: "TELEGRAM_NO_REPLY" }),
+            JSON.stringify(settledClaim),
+            channel,
+            member.nonce,
+            member.rawClaim,
+          ],
+        );
+        if (updated.changes !== 1) {
+          return deny(ReasonCode.RESOURCE_COLLISION, "receipt completion raced another ingress writer", {
+            channel,
+            nonce: member.nonce,
+            turnRequestId: query.turnRequestId,
+          });
+        }
+      }
+      return allow(ReasonCode.OK, undefined);
     });
   }
 
@@ -820,6 +888,153 @@ export class IngressGuard {
   }
 
   /**
+   * Atomically claims one transport batch. Every selected nonce is checked before any write and
+   * then receives the same immutable claim identity plus the complete consumed/unconsumed sets.
+   * Parked delivery receipts are reset to the fresh admitted phase because the selected rows now
+   * participate in one new reply lifecycle; their parking marker remains attached for audit.
+   * A verified canonical target is materialized in the same transaction when available, but that
+   * ledger is additive: its ordinary denial neither rolls this claim back nor blocks its owner.
+   * Thrown materializer or database failures still escape and roll the transaction back.
+   */
+  claimOwnerBatch(
+    channel: string,
+    currentNonce: string,
+    identity: TurnIdentity,
+    consumedNonces: readonly string[],
+    unconsumedNonces: readonly string[],
+  ): Decision<TurnClaim> {
+    return this.db.txDecision(() => {
+      const materializeTurn = ownerBatchMaterializer(identity);
+      const consumed = [...consumedNonces];
+      const unconsumed = [...unconsumedNonces];
+      const consumedSet = new Set(consumed);
+      const unconsumedSet = new Set(unconsumed);
+      if (
+        consumed.length === 0
+        || !consumedSet.has(currentNonce)
+        || consumedSet.size !== consumed.length
+        || unconsumedSet.size !== unconsumed.length
+        || unconsumed.some((nonce) => consumedSet.has(nonce))
+      ) {
+        return deny(ReasonCode.INVALID_ARGUMENT, "owner batch IDs must be unique, disjoint, and include the current admitted message", {
+          channel,
+          nonce: currentNonce,
+        });
+      }
+
+      const pending = this.pendingOwnerMessages();
+      const expectedConsumed = [
+        ...pending
+          .filter((message) => message.sessionDigest === identity.sessionDigest)
+          .map((message) => message.nonce),
+        currentNonce,
+      ];
+      const expectedUnconsumed = pending
+        .filter((message) => message.sessionDigest !== identity.sessionDigest)
+        .map((message) => message.nonce);
+      if (
+        consumed.length !== expectedConsumed.length
+        || consumed.some((nonce, index) => nonce !== expectedConsumed[index])
+        || unconsumed.length !== expectedUnconsumed.length
+        || unconsumed.some((nonce, index) => nonce !== expectedUnconsumed[index])
+      ) {
+        return deny(
+          ReasonCode.RESOURCE_COLLISION,
+          "owner batch does not match the exact pending snapshot",
+          { channel, nonce: currentNonce },
+        );
+      }
+
+      const rows = consumed.map((nonce) => ({
+        nonce,
+        row: this.db.get<{
+          result_json: string | null;
+          turn_claim_json: string | null;
+          payload_json: string | null;
+        }>(
+          `SELECT result_json, turn_claim_json, payload_json
+             FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+          [channel, nonce],
+        ),
+      }));
+      for (const { nonce, row } of rows) {
+        if (!row) {
+          return deny(ReasonCode.NOT_FOUND, "cannot batch a message that was never admitted", {
+            channel,
+            nonce,
+          });
+        }
+        if (row.turn_claim_json !== null) {
+          return deny(
+            ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN,
+            "an owner batch member was already claimed",
+            { channel, nonce, deliveryStatus: TURN_CLAIMED },
+          );
+        }
+        if (nonce === currentNonce) {
+          if (!isClaimable(row.result_json)) {
+            return deny(ReasonCode.RESOURCE_COLLISION, "current owner message is not claimable", {
+              channel,
+              nonce,
+            });
+          }
+          continue;
+        }
+        if (parkedLifecycle(ingressResultRecord(row.result_json))?.sessionDigest !== identity.sessionDigest) {
+          return deny(ReasonCode.RESOURCE_COLLISION, "owner batch member belongs to another conversation", {
+            channel,
+            nonce,
+          });
+        }
+      }
+
+      const receiptIdentity = this.#receiptIdentityForClaim?.(identity) ?? null;
+      const canonicalTarget = this.#canonicalTargetForClaim?.(identity) ?? null;
+      const claim: TurnClaim = {
+        deliveryStatus: TURN_CLAIMED,
+        ...identity,
+        ...(isBoundReceiptIdentity(receiptIdentity, identity) ? { receiptIdentity } : {}),
+        ...(isBoundCanonicalTarget(canonicalTarget, identity) ? { canonicalTarget } : {}),
+        claimedByProcess: this.#processIncarnation,
+        batchConsumedNonces: consumed,
+        batchUnconsumedNonces: unconsumed,
+      };
+
+      for (const { nonce, row } of rows) {
+        const parked = parkedLifecycle(ingressResultRecord(row!.result_json));
+        const admittedResult = {
+          kind: "TELEGRAM_WORKFLOW",
+          phase: "ADMITTED",
+          ...(parked ? { parked } : {}),
+        };
+        const updated = this.db.run(
+          `UPDATE inbound_messages SET turn_claim_json = ?, result_json = ?
+            WHERE channel = ? AND nonce = ? AND turn_claim_json IS NULL`,
+          [JSON.stringify(claim), JSON.stringify(admittedResult), channel, nonce],
+        );
+        if (updated.changes !== 1) {
+          return deny(ReasonCode.RESOURCE_COLLISION, "owner batch claim raced another writer", {
+            channel,
+            nonce,
+          });
+        }
+      }
+      if (materializeTurn && isBoundCanonicalTarget(canonicalTarget, identity)) {
+        materializeTurn({
+          target: canonicalTarget!,
+          sources: rows.map(({ nonce, row }) => ({
+            channel,
+            nonce,
+            attempt: 1,
+            payload: admittedPayload(row!.payload_json),
+          })),
+        });
+      }
+      return allow(ReasonCode.OK, claim);
+    });
+  }
+
+  /**
    * Conditional result transition used by Telegram's durable reply protocol. The database
    * transaction makes two pollers race on the reservation rather than both calling Telegram;
    * completion is only allowed from PENDING, so APPLIED cannot be rewritten.
@@ -893,9 +1108,13 @@ export class IngressGuard {
           { channel, nonce, deliveryStatus },
         );
       }
+      const parked = parkedLifecycle(ingressResultRecord(current.result_json));
+      const persistedResult = parked && result && typeof result === "object" && !Array.isArray(result)
+        ? { ...(result as Record<string, unknown>), parked }
+        : result;
       const updated = this.db.run(
         `UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ?`,
-        [JSON.stringify(result), channel, nonce],
+        [JSON.stringify(persistedResult), channel, nonce],
       );
       return updated.changes === 1
         ? allow(ReasonCode.OK, undefined)
@@ -983,9 +1202,12 @@ export class IngressGuard {
           AND json_extract(turn_claim_json, '$.repliedAt') IS NULL
           AND json_extract(turn_claim_json, '$.settledAt') IS NULL
           AND json_extract(turn_claim_json, '$.noReplyAt') IS NULL
-          AND json_extract(turn_claim_json, '$.sessionDigest') IS ?
+          AND (
+            json_extract(turn_claim_json, '$.sessionDigest') IS ?
+            OR json_extract(turn_claim_json, '$.legacySessionDigest') IS ?
+          )
         ORDER BY received_at ASC, nonce ASC`,
-      [channel, sessionDigest],
+      [channel, sessionDigest, sessionDigest],
     );
     return rows.map((row) => ({
       nonce: row.nonce,
@@ -1006,80 +1228,182 @@ export class IngressGuard {
       receivedAt: row.received_at,
       payload: admittedPayload(row.payload_json),
       ...normalizeStoredTurnClaim(JSON.parse(row.turn_claim_json) as StoredTurnClaim),
+      // The old API exposed its requested scope. Preserve that read contract only when the
+      // writer recorded the exact visibility alias; canonical readers still receive the stored
+      // canonical digest, and no unknown legacy scope is promoted or consumed.
+      ...((JSON.parse(row.turn_claim_json) as StoredTurnClaim).legacySessionDigest === sessionDigest
+        ? { sessionDigest }
+        : {}),
     }));
   }
 
   /**
-   * Notes that an admitted message was parked rather than run, so the next claim can take it.
+   * Marks the admitted Telegram row as parked. The payload remains only in `payload_json`; this
+   * lifecycle marker carries the already-canonical `sessionDigest` and first arrival time.
+   * Re-parking is idempotent and cannot move the message later in its queue.
    *
-   * Idempotent, and it cannot be made so by a conflict clause. Parking is reached again whenever
-   * Telegram redelivers an update this listener has not acknowledged, so a second park must not
-   * become a second item in the batch -- but `inbound_messages_no_replace` is a BEFORE INSERT
-   * trigger that aborts on any `(channel, nonce)` already present, which fires ahead of `OR
-   * IGNORE` as surely as ahead of `OR REPLACE`. That trigger exists because a replaced row is a
-   * nonce that has never been seen, and its comment names this issue as what found the hole; it
-   * is not something to work around.
-   *
-   * So the existence check and the insert are one transaction. Keeping the first row is the point
-   * rather than a side effect: `received_at` is the arrival order the batch is read in, and a
-   * re-park that rewrote it would send the earlier message to the back of its own batch and
-   * reorder the owner's words.
-   *
-   * Takes `sessionDigest` from the caller because the admitted row does not carry it; see
-   * `PARKED_BATCH_CHANNEL` for why it is that digest and not the chat id.
+   * Every call first promotes at most `LEGACY_PARK_CLEANUP_LIMIT` valid pairs from PR #979's
+   * synthetic channel. A pair is valid only when its admitted lifetime began no later than the
+   * park; otherwise a reused nonce could inherit an earlier conversation. Only a successful or
+   * already-equivalent promotion permits deleting the legacy row.
    */
   parkForBatch(nonce: string, sessionDigest: string): void {
     this.db.tx(() => {
-      const parked = this.db.get<{ one: number }>(
-        `SELECT 1 AS one FROM inbound_messages WHERE channel = ? AND nonce = ?`,
-        [PARKED_BATCH_CHANNEL, nonce],
+      this.#promoteLegacyParks();
+
+      const admitted = this.db.get<{
+        actor: string;
+        received_at: string;
+        result_json: string | null;
+        turn_claim_json: string | null;
+      }>(
+        `SELECT actor, received_at, result_json, turn_claim_json
+           FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+        [nonce],
       );
+      if (!admitted || admitted.turn_claim_json !== null) return;
+
+      const state = ingressResultRecord(admitted.result_json);
+      const parked = parkedLifecycle(state);
+      if (parked?.sessionDigest === sessionDigest) return;
       if (parked) return;
-      this.db.run(
-        `INSERT INTO inbound_messages (channel, nonce, actor, received_at)
-          VALUES (?, ?, ?, ?)`,
-        [PARKED_BATCH_CHANNEL, nonce, sessionDigest, this.clock.nowIso()],
+      if (state && !isClaimable(admitted.result_json)) return;
+
+      const next = {
+        ...(state ?? { kind: "TELEGRAM_WORKFLOW", phase: "ADMITTED" }),
+        parked: { sessionDigest, parkedAt: admitted.received_at },
+      };
+      const updated = this.db.run(
+        `UPDATE inbound_messages SET result_json = ?
+          WHERE channel = 'telegram' AND nonce = ? AND turn_claim_json IS NULL
+            AND result_json IS ?`,
+        [JSON.stringify(next), nonce, admitted.result_json],
       );
+      if (updated.changes !== 1) return;
+      this.audit.record({
+        kind: "INGRESS_OWNER_MESSAGE_PARKED",
+        actor: admitted.actor,
+        evidence: { channel: "telegram", nonce, digest: sessionDigest },
+      });
     });
   }
 
+  /** Promote only legacy rows inserted after the admitted lifetime they followed. */
+  #promoteLegacyParks(): void {
+    const legacyRows = this.db.all<{
+      nonce: string;
+      session_digest: string;
+      parked_at: string;
+      admitted_at: string;
+      result_json: string | null;
+      turn_claim_json: string | null;
+    }>(
+      `SELECT legacy.nonce AS nonce,
+              legacy.actor AS session_digest,
+              legacy.received_at AS parked_at,
+              admitted.received_at AS admitted_at,
+              admitted.result_json AS result_json,
+              admitted.turn_claim_json AS turn_claim_json
+         FROM inbound_messages AS legacy
+         JOIN inbound_messages AS admitted
+           ON admitted.channel = 'telegram'
+          AND admitted.nonce = legacy.nonce
+          AND admitted.rowid < legacy.rowid
+        WHERE legacy.channel = ?
+        ORDER BY legacy.received_at ASC, legacy.nonce ASC
+        LIMIT ?`,
+      [LEGACY_PARKED_BATCH_CHANNEL, LEGACY_PARK_CLEANUP_LIMIT],
+    );
+
+    for (const legacy of legacyRows) {
+      if (legacy.turn_claim_json !== null) continue;
+      const state = ingressResultRecord(legacy.result_json);
+      const parked = parkedLifecycle(state);
+      const equivalent = parked?.sessionDigest === legacy.session_digest
+        && parked.parkedAt === legacy.parked_at;
+      if (!equivalent) {
+        if (parked || (state && !isClaimable(legacy.result_json))) continue;
+        const next = {
+          ...(state ?? { kind: "TELEGRAM_WORKFLOW", phase: "ADMITTED" }),
+          parked: { sessionDigest: legacy.session_digest, parkedAt: legacy.parked_at },
+        };
+        const promoted = this.db.run(
+          `UPDATE inbound_messages SET result_json = ?
+            WHERE channel = 'telegram' AND nonce = ?
+              AND received_at = ? AND turn_claim_json IS NULL
+              AND result_json IS ?`,
+          [JSON.stringify(next), legacy.nonce, legacy.admitted_at, legacy.result_json],
+        );
+        if (promoted.changes !== 1) continue;
+      }
+      this.db.run(
+        `DELETE FROM inbound_messages
+          WHERE channel = ? AND nonce = ? AND actor = ? AND received_at = ?`,
+        [LEGACY_PARKED_BATCH_CHANNEL, legacy.nonce, legacy.session_digest, legacy.parked_at],
+      );
+    }
+  }
+
   /**
-   * Every parked message still owed to one conversation, oldest first.
-   *
-   * Joined back to the admitted row rather than read from the index: the index holds the
-   * conversation and the order, and the admitted row holds what the owner actually said. A
-   * parked entry whose admitted row is gone -- pruned after its TTL, or never written -- is
-   * dropped here rather than returned with an empty payload, because a batch item that cannot
-   * say what it carries is worse than one message fewer and would be indistinguishable from a
-   * message with no text.
-   *
-   * A message whose turn has since been claimed is excluded: `/again` claims a parked message
-   * directly, and returning it here afterwards would put it in a batch a second time.
-   *
-   * Ordered by `(received_at, nonce)`. `received_at` alone is not a total order -- a batch of
-   * owner messages is exactly the traffic that shares a millisecond (#858) -- and `nonce` is
-   * `update:<update_id>`, unique per message within the channel.
+   * Every admitted message still parked and unclaimed, oldest first. Passing a session digest
+   * narrows the reader to one conversation; omitting it lets the batch composer name both what it
+   * consumes and what remains pending elsewhere.
    */
-  pendingOwnerMessages(sessionDigest: string): readonly ParkedOwnerMessage[] {
+  pendingOwnerMessages(sessionDigest?: string): readonly ParkedOwnerMessage[] {
     const rows = this.db.all<{
       nonce: string;
+      arrival_sequence: number;
       received_at: string;
+      parked_at: string;
       payload_json: string | null;
+      session_digest: string;
     }>(
-      `SELECT parked.nonce AS nonce, parked.received_at AS received_at, admitted.payload_json AS payload_json
-         FROM inbound_messages AS parked
-         JOIN inbound_messages AS admitted
-           ON admitted.channel = ? AND admitted.nonce = parked.nonce
-        WHERE parked.channel = ?
-          AND parked.actor = ?
-          AND admitted.turn_claim_json IS NULL
-        ORDER BY parked.received_at ASC, parked.nonce ASC`,
-      ["telegram", PARKED_BATCH_CHANNEL, sessionDigest],
+      `WITH pending AS (
+         SELECT admitted.nonce AS nonce,
+                admitted.rowid AS arrival_sequence,
+                admitted.received_at AS received_at,
+                json_extract(admitted.result_json, '$.parked.parkedAt') AS parked_at,
+                admitted.payload_json AS payload_json,
+                json_extract(admitted.result_json, '$.parked.sessionDigest') AS session_digest
+           FROM inbound_messages AS admitted
+          WHERE admitted.channel = 'telegram'
+            AND admitted.turn_claim_json IS NULL
+            AND json_valid(admitted.result_json) = 1
+            AND json_type(admitted.result_json, '$.parked') = 'object'
+            AND json_type(admitted.result_json, '$.parked.sessionDigest') = 'text'
+            AND json_type(admitted.result_json, '$.parked.parkedAt') = 'text'
+         UNION ALL
+         SELECT admitted.nonce AS nonce,
+                admitted.rowid AS arrival_sequence,
+                admitted.received_at AS received_at,
+                legacy.received_at AS parked_at,
+                admitted.payload_json AS payload_json,
+                legacy.actor AS session_digest
+           FROM inbound_messages AS legacy
+           JOIN inbound_messages AS admitted
+             ON admitted.channel = 'telegram'
+            AND admitted.nonce = legacy.nonce
+            AND admitted.rowid < legacy.rowid
+          WHERE legacy.channel = ?
+            AND admitted.turn_claim_json IS NULL
+            AND NOT COALESCE((
+              json_valid(admitted.result_json) = 1
+              AND json_type(admitted.result_json, '$.parked') = 'object'
+              AND json_type(admitted.result_json, '$.parked.sessionDigest') = 'text'
+              AND json_type(admitted.result_json, '$.parked.parkedAt') = 'text'
+            ), 0)
+       )
+       SELECT nonce, arrival_sequence, received_at, parked_at, payload_json, session_digest
+         FROM pending
+        WHERE ? IS NULL OR session_digest IS ?
+        ORDER BY arrival_sequence ASC`,
+      [LEGACY_PARKED_BATCH_CHANNEL, sessionDigest ?? null, sessionDigest ?? null],
     );
     return rows.map((row) => ({
       nonce: row.nonce,
-      sessionDigest,
-      receivedAt: row.received_at,
+      sessionDigest: row.session_digest,
+      arrivalSequence: row.arrival_sequence,
+      receivedAt: row.parked_at,
       payload: admittedPayload(row.payload_json),
     }));
   }
@@ -1138,11 +1462,23 @@ export class IngressGuard {
     result: unknown,
     turnOutcome: "ANSWERED" | "UNANSWERED",
   ): Decision<void> {
-    return this.db.tx(() => {
-      const completed = this.#recordResultHere(channel, nonce, result, "PENDING");
-      if (!completed.allowed) return completed;
+    return this.db.txDecision(() => {
+      const batchNonces = this.#batchNonces(channel, nonce);
+      for (const memberNonce of batchNonces) {
+        const completed = this.#recordResultHere(
+          channel,
+          memberNonce,
+          result,
+          memberNonce === nonce ? "PENDING" : "AVAILABLE",
+        );
+        if (!completed.allowed) return completed;
+      }
       if (turnOutcome === "UNANSWERED") return allow(ReasonCode.OK, undefined);
-      return this.#resolveTurnHere(channel, nonce);
+      for (const memberNonce of batchNonces) {
+        const resolved = this.#resolveTurnHere(channel, memberNonce);
+        if (!resolved.allowed) return resolved;
+      }
+      return allow(ReasonCode.OK, undefined);
     });
   }
 
@@ -1167,10 +1503,22 @@ export class IngressGuard {
     expected: "PENDING" | "UNKNOWN_RETRYABLE" = "PENDING",
   ): Decision<void> {
     return this.db.txDecision(() => {
-      const completed = this.#recordResultHere(channel, nonce, result, expected);
-      if (!completed.allowed) return completed;
+      const batchNonces = this.#batchNonces(channel, nonce);
+      for (const memberNonce of batchNonces) {
+        const completed = this.#recordResultHere(
+          channel,
+          memberNonce,
+          result,
+          memberNonce === nonce ? expected : "AVAILABLE",
+        );
+        if (!completed.allowed) return completed;
+      }
       if (turnOutcome === "UNANSWERED") return allow(ReasonCode.OK, undefined);
-      return this.#settleTurnHere(channel, nonce, settlement);
+      for (const memberNonce of batchNonces) {
+        const settled = this.#settleTurnHere(channel, memberNonce, settlement);
+        if (!settled.allowed) return settled;
+      }
+      return allow(ReasonCode.OK, undefined);
     });
   }
 
@@ -1235,64 +1583,73 @@ export class IngressGuard {
     // relying on "this particular write happens to be harmless when denied" is exactly the
     // reasoning #664 exists to stop trusting by hand.
     return this.db.txDecision(() => {
-      const current = this.db.get<{ turn_claim_json: string | null }>(
-        `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
-        [channel, nonce],
-      );
-      if (!current?.turn_claim_json) {
-        // No claim, nothing to resolve — the ordinary non-CEO path, same as `resolveTurn`.
-        return allow(ReasonCode.OK, undefined);
+      for (const memberNonce of this.#batchNonces(channel, nonce)) {
+        const completed = this.#completeNoReplyHere(channel, memberNonce);
+        if (!completed.allowed) return completed;
       }
-      const claim = JSON.parse(current.turn_claim_json) as {
-        repliedAt?: unknown;
-        noReplyAt?: unknown;
-        settledAt?: unknown;
-      };
-      if (claim.repliedAt !== undefined || claim.noReplyAt !== undefined) {
-        // Already resolved, one way or the other. Idempotent-safe, and the guard that keeps a
-        // real `repliedAt` from ever being overwritten by this path.
-        return allow(ReasonCode.OK, undefined);
-      }
-      if (claim.settledAt !== undefined) {
-        return deny(
-          ReasonCode.RESOURCE_COLLISION,
-          "cannot record no-reply for a turn already settled by a delivery failure",
-          { channel, nonce },
-        );
-      }
-      // No `kind: "TELEGRAM_WORKFLOW"`, deliberately: that shape's `sent` and `phase` describe
-      // the reply lifecycle, and there is no reply to describe. `isRecoverableIngressResult`'s
-      // fallback for any other kind is `sent === false`, which a marker with no `sent` field
-      // satisfies as `false` — recoverable only when a workflow explicitly says it has not sent.
-      const updated = this.db.run(
-        `UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ? AND (
-           result_json IS NULL OR (
-             json_extract(result_json, '$.kind') = 'TELEGRAM_WORKFLOW' AND
-             json_extract(result_json, '$.phase') = 'ADMITTED'
-           )
-         )`,
-        [JSON.stringify({ kind: "TELEGRAM_NO_REPLY" }), channel, nonce],
-      );
-      if (updated.changes !== 1) {
-        // The read above passed but the write's own WHERE clause did not match — belt-and-braces
-        // against the same class of collapse `#recordResultHere`'s row-count check guards (#682,
-        // third review): a mismatch here means `result_json` changed between the read and this
-        // write, and reporting success regardless would be exactly the wrong-answer-with-
-        // confidence this method exists to refuse.
-        return deny(
-          ReasonCode.RESOURCE_COLLISION,
-          "ingress result changed underneath the no-reply resolution",
-          { channel, nonce },
-        );
-      }
-      this.db.run(
-        `UPDATE inbound_messages
-            SET turn_claim_json = json_set(turn_claim_json, '$.noReplyAt', ?)
-          WHERE channel = ? AND nonce = ?`,
-        [this.clock.nowIso(), channel, nonce],
-      );
       return allow(ReasonCode.OK, undefined);
     });
+  }
+
+  #batchNonces(channel: string, nonce: string): readonly string[] {
+    const row = this.db.get<{ turn_claim_json: string | null }>(
+      `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+      [channel, nonce],
+    );
+    if (!row?.turn_claim_json) return [nonce];
+    const claim = JSON.parse(row.turn_claim_json) as { batchConsumedNonces?: unknown };
+    if (!Array.isArray(claim.batchConsumedNonces)
+      || !claim.batchConsumedNonces.every((value): value is string => typeof value === "string")
+      || !claim.batchConsumedNonces.includes(nonce)) {
+      return [nonce];
+    }
+    return [...new Set(claim.batchConsumedNonces)];
+  }
+
+  #completeNoReplyHere(channel: string, nonce: string): Decision<void> {
+    const current = this.db.get<{ turn_claim_json: string | null }>(
+      `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+      [channel, nonce],
+    );
+    if (!current?.turn_claim_json) return allow(ReasonCode.OK, undefined);
+    const claim = JSON.parse(current.turn_claim_json) as {
+      repliedAt?: unknown;
+      noReplyAt?: unknown;
+      settledAt?: unknown;
+    };
+    if (claim.repliedAt !== undefined || claim.noReplyAt !== undefined) {
+      return allow(ReasonCode.OK, undefined);
+    }
+    if (claim.settledAt !== undefined) {
+      return deny(
+        ReasonCode.RESOURCE_COLLISION,
+        "cannot record no-reply for a turn already settled by a delivery failure",
+        { channel, nonce },
+      );
+    }
+    const updated = this.db.run(
+      `UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ? AND (
+         result_json IS NULL OR (
+           json_extract(result_json, '$.kind') = 'TELEGRAM_WORKFLOW' AND
+           json_extract(result_json, '$.phase') = 'ADMITTED'
+         )
+       )`,
+      [JSON.stringify({ kind: "TELEGRAM_NO_REPLY" }), channel, nonce],
+    );
+    if (updated.changes !== 1) {
+      return deny(
+        ReasonCode.RESOURCE_COLLISION,
+        "ingress result changed underneath the no-reply resolution",
+        { channel, nonce },
+      );
+    }
+    this.db.run(
+      `UPDATE inbound_messages
+          SET turn_claim_json = json_set(turn_claim_json, '$.noReplyAt', ?)
+        WHERE channel = ? AND nonce = ?`,
+      [this.clock.nowIso(), channel, nonce],
+    );
+    return allow(ReasonCode.OK, undefined);
   }
 
   #resolveTurnHere(channel: string, nonce: string): Decision<void> {
@@ -1447,6 +1804,14 @@ export class IngressGuard {
             OR json_extract(turn_claim_json, '$.noReplyAt') IS NOT NULL
             OR json_extract(turn_claim_json, '$.settledAt') IS NOT NULL
           )
+          AND NOT COALESCE((
+            turn_claim_json IS NULL
+            AND json_valid(result_json) = 1
+            AND json_extract(result_json, '$.kind') = 'TELEGRAM_WORKFLOW'
+            AND json_extract(result_json, '$.phase') = 'ADMITTED'
+            AND json_type(result_json, '$.parked') = 'object'
+            AND json_type(result_json, '$.parked.sessionDigest') = 'text'
+          ), 0)
           AND NOT COALESCE((
             json_valid(result_json) = 1
             AND json_type(result_json, '$.reply') = 'object'
@@ -1628,6 +1993,12 @@ export interface TurnIdentity {
   turnRequestId: string;
   /** Which conversation the turn was aimed at. */
   sessionDigest: string;
+  /**
+   * The pre-S2 Telegram chat-only digest, retained only as a read alias for unresolved-turn
+   * visibility. It never selects a parked message or a batch member; `sessionDigest` remains the
+   * canonical project/chat/thread/reply-root scope.
+   */
+  legacySessionDigest?: string;
   /** What was asked. */
   promptDigest: string;
   /** Which CEO generation asked it. */
@@ -1767,6 +2138,10 @@ export interface TurnClaim extends TurnIdentity {
    * `turn_claim_json` at all.
    */
   claimedByProcess?: string;
+  /** Every admitted nonce atomically claimed for this one transport batch, in arrival order. */
+  batchConsumedNonces?: readonly string[];
+  /** Parked nonces observed but left for another conversation when the batch was claimed. */
+  batchUnconsumedNonces?: readonly string[];
   repliedAt?: string;
   noReplyAt?: string;
   settledAt?: string;
@@ -1806,6 +2181,8 @@ export interface ParkedOwnerMessage {
   readonly nonce: string;
   /** The turn identity's conversation digest, which is this repository's one name for "same chat". */
   readonly sessionDigest: string;
+  /** SQLite insertion order for the admitted row; the authoritative observed arrival order. */
+  readonly arrivalSequence: number;
   readonly receivedAt: string;
   readonly payload: unknown;
 }
@@ -1850,6 +2227,29 @@ export interface UnresolvedTurn extends TurnClaim {
    */
   payload: unknown;
 }
+
+const ingressResultRecord = (resultJson: string | null): Record<string, unknown> | null => {
+  if (!resultJson) return null;
+  try {
+    const value = JSON.parse(resultJson) as unknown;
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+};
+
+const parkedLifecycle = (
+  value: Record<string, unknown> | null,
+): { readonly sessionDigest: string; readonly parkedAt: string } | null => {
+  const parked = value?.parked;
+  if (!parked || typeof parked !== "object" || Array.isArray(parked)) return null;
+  const candidate = parked as Record<string, unknown>;
+  return typeof candidate.sessionDigest === "string" && typeof candidate.parkedAt === "string"
+    ? { sessionDigest: candidate.sessionDigest, parkedAt: candidate.parkedAt }
+    : null;
+};
 
 /**
  * The states a turn may be claimed from: nothing recorded, or admitted and not yet run.
