@@ -1,0 +1,6 @@
+Limit: the live launcher at ~/.agent-control-plane/agentcpd-launch.sh still exports ACP_CANONICAL_CTO_WORKDIR until the next install; it is now an ignored variable rather than a refused one, and nothing announces the difference
+Ruled-out: removing the identity.cwd === null -> PROBE_FAILED refusal along with the comparison it was written about | identity.cwd is still written as the binding's workdir and compared against a predecessor's on an idempotent re-claim, so admitting a null would record an absence as the claimant's directory
+Warn: the launcher env log is a positional record and the canonical activation group sits in the middle of it: dropping one variable shifted lsof and lsof_scan from f[25]/f[26] to f[24]/f[25], and those two indices are hardcoded while the group's own fields are derived from the list
+Warn: the activation-subset test states its count as a literal (2^7-2 = 126, was 254) and three test titles say the group size in words; neither is derived from the list, so both have to be edited with it
+Record-Id: r-ee2a953c34a2
+Provenance: inherited a31a41761483707fdddc076242b58430f9d5a998
