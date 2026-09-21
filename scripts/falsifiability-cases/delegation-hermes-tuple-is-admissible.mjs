@@ -7,7 +7,7 @@ const delegationHermesTupleIsAdmissible = {
   "find": "        verify: (tuple) => {\n          if (tuple.sessionId !== sessionId || tuple.incarnation !== target.incarnation",
   "replace": "        verify: (tuple) => {\n          if (tuple.sessionId !== sessionId || tuple.incarnation === target.incarnation",
   "killedBy": [
-    "tests/unit/cto-binding-runtime.test.ts::owner-admitted grant reaches CEO MCP.*success"
+    "tests/unit/cto-binding-runtime.test.ts::hermes target bind reaches CEO MCP.*success"
   ]
 };
 

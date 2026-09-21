@@ -96,6 +96,13 @@ const hideHelperWrites = (
  */
 const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string }> = [
   {
+    // The opener is concise, so the anchor is the whole line: reverting it to `tx` leaves a body
+    // that still writes an audit row and still refuses after it, which is the trap shape.
+    label: "CtoBindingDelegation.authorize",
+    file: "ceo/cto-binding-delegation.ts",
+    anchor: "    return this.db.txDecision(() => this.#authorize(rawPrincipal, rawRequest));",
+  },
+  {
     label: "VerificationEngine.pinRunScopedCommands",
     file: "verify/verification-engine.ts",
     anchor: "regardless of the outcome, so a denial must roll the pin attempt back.\n    return this.db.txDecision(() => {",

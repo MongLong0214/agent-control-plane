@@ -81,7 +81,6 @@ import { executeCanonicalSelfClaimOperator } from "./canonical-self-claim-operat
 import { startCanonicalSelfClaimListener, type CanonicalSelfClaimListener } from "./canonical-self-claim-listener.ts";
 import { readOneJsonLineRequest } from "./local-socket-framing.ts";
 import { daemonCtoBindingRuntime, type CtoBindingRuntime } from "./cto-binding-runtime.ts";
-import { CtoBindingDelegation } from "../ceo/cto-binding-delegation.ts";
 
 /**
  * The bound on one message: the bytes of a single line, terminator excluded, measured after the
@@ -1155,7 +1154,6 @@ export const startDaemonOperatorSocket = (
   // Never take channel/actor/owner claims from the request body or peerId text.
   const operatorActor = credential.actor.trim();
   const bootstrap = options.bootstrapHermes;
-  const nativeDelegation = new CtoBindingDelegation(cp.sessions, cp.bindings, cp.ownerAuthority, cp.audit, cp.clock, cp.db);
   return startOperatorSocket(daemon, stateDir, credential, {
     ...options,
     ...(bootstrap ? { bootstrapHermes: (params: Record<string, unknown>) => {
@@ -1167,28 +1165,6 @@ export const startDaemonOperatorSocket = (
       return bootstrap(params);
     } } : {}),
     ctoBinding: daemonCtoBindingRuntime(cp),
-    approveCtoDelegate: (params) => {
-      if (!cp.ownerAuthority.isAllowedActor("cli", operatorActor)) return deny(
-        ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED, "CTO delegation requires an allowlisted CLI owner", {});
-      const text = z.string().min(1).max(256).regex(/^[\x21-\x7e]+$/);
-      const parsed = z.object({ requestId: z.string().uuid(), scope: z.object({
-        projectId: text, role: z.literal("PRIMARY_CTO"), action: z.literal("bind-or-rebind"),
-        ceoActorId: text, ceoSessionId: text, ceoIncarnation: text,
-        expiresAt: z.string().datetime(), revokePolicy: z.literal("owner-or-ceo-loss"),
-      }).strict() }).strict().safeParse(params);
-      if (!parsed.success || Date.parse(parsed.data.scope.expiresAt) <= cp.clock.now().getTime()) return deny(
-        ReasonCode.INVALID_ARGUMENT, "invalid native CTO delegation scope", {});
-      const { scope, requestId } = parsed.data;
-      const approval = { operation: "ctoBinding.delegate", parameters: scope, runId: null,
-        candidateSnapshotDigest: null, idempotencyKey: requestId, approved: true };
-      // The delegation authority owns admission + consumption, not an external tx.
-      return nativeDelegation.grantWithAdmission(scope, () => {
-        const guard = new IngressGuard(cp.db, cp.clock, cp.audit, { cli: { allowedActors: [operatorActor] } });
-        return guard.admitOwnerApproval({ channel: "cli", actor: operatorActor,
-          nonce: requestId, payload: { type: "OWNER_APPROVAL", runId: null, candidateSnapshotDigest: null,
-            operation: approval.operation, parameterDigest: digestOf(scope), idempotencyKey: requestId, approved: true } }, approval);
-      });
-    },
   });
 };
 
@@ -1427,24 +1403,10 @@ const serveOperatorRequest = (
       // Leaving the handshake timer armed made every method slower than five seconds report that
       // the operator had not authenticated, which they had.
       beginRequest(method ?? "<none>");
-      if (method === "ctoBinding.approveAndDelegate") {
-        if (!daemon.lock.held()) return finish(deny(ReasonCode.DAEMON_LOCK_LOST, "daemon lock is not held", {}));
-        const params = operatorRequestParams(value);
-        if (!params || !options.approveCtoDelegate) return finish(deny(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED, "native delegation unavailable", {}));
-        try { return finish(options.approveCtoDelegate(params)); }
-        catch { return finish(deny(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, "delegation refused", {})); }
-      }
-      if (method === "ctoBinding.delegate" || method === "ctoBinding.revoke") {
-        if (!options.ctoBinding) return finish(deny(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED, "CTO delegation is unavailable", {}));
-        if (!daemon.lock.held()) return finish(deny(ReasonCode.DAEMON_LOCK_LOST, "daemon lock is not held", {}));
-        const params = operatorRequestParams(value);
-        if (!params) return finish(deny(ReasonCode.INVALID_ARGUMENT, "invalid delegation parameters", {}));
-        try {
-          return finish(method === "ctoBinding.delegate"
-            ? options.ctoBinding.grant(params.scope, params.receipt)
-            : options.ctoBinding.revoke(typeof params.delegationId === "string" ? params.delegationId : "", params.receipt));
-        } catch { return finish(deny(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, "delegation refused", {})); }
-      }
+      // `ctoBinding.delegate` and `ctoBinding.revoke` used to live here: one minted a grant from
+      // an owner receipt, the other spent a second receipt to take it back. Both are gone with
+      // the grant itself — there is nothing to hand out, so there is nothing to withdraw, and
+      // `ctoBinding.bind` asks the only question left by reading the CEO's live binding.
       if (method === "bootstrap.hermes") {
         if (!options.bootstrapHermes) {
           return finish(deny(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED, "Hermes bootstrap is not enabled on this socket", {}));
