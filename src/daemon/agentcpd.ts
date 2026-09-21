@@ -3056,7 +3056,6 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
           clock: cp.clock,
           sessions: cp.sessions,
           bindings: cp.bindings,
-          ownerAuthority: cp.ownerAuthority,
           // The canonical CTO's own Buzz channel identity is a deployment fact, configured the
           // same way the CLI operator identity is (`ACP_OPERATOR_ACTOR`) — not something a
           // caller asserts and this authenticator merely echoes back.

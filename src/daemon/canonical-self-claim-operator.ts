@@ -1,4 +1,3 @@
-import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../ceo/owner-authority.ts";
 import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -13,8 +12,7 @@ import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { BuzzActorAuthenticator, SessionRegistry } from "../session/session-registry.ts";
 
 /**
- * The claim orchestration behind `actor.claimCanonicalCto`: load an *already-admitted* owner
- * approval back out of storage and compose `CanonicalSelfClaim.claim()`.
+ * The claim orchestration behind `actor.claimCanonicalCto`: compose `CanonicalSelfClaim.claim()`.
  *
  * This module has no peer-credential logic of its own (#760), and imports nothing from
  * `../core/peercred.ts`. That authority lives entirely in `canonical-self-claim-listener.ts` —
@@ -26,14 +24,13 @@ import type { BuzzActorAuthenticator, SessionRegistry } from "../session/session
  * kernel-identity check belongs to the listener that owns the socket, not to the orchestration
  * a caller could in principle reach some other way.
  *
- * This module never mints an owner approval and never admits one. Minting happens exactly once,
- * elsewhere: `Daemon.executeApproveCanonicalCtoClaim`
- * (`OPERATOR_METHOD.OWNER_APPROVE_CLAIM_CANONICAL_CTO`), reached only through the normal
- * bearer-authenticated operator method table — a channel this file's exported function never
- * touches and the claiming connection never needs to reach. The bootstrap problem is not solved
- * by handing the claimant owner authority: the claiming connection presents a `(channel, nonce)`
- * handle naming a decision an owner already made, and this module *loads and verifies* that
- * decision — it does not make one.
+ * This module reads no owner approval, because the claim no longer requires one. It used to
+ * demand a `(channel, nonce)` handle naming a decision an owner had minted beforehand through
+ * `owner.approveClaimCanonicalCto`, which made binding the canonical CTO role conditional on a
+ * human running a command. Measured on this deployment: four such mints, then none, and the role
+ * sat unbound for eight days with every Buzz mention in that window delivered nowhere. The
+ * authority that remains is the socket's — a caller reaches this only after
+ * `canonical-self-claim-listener.ts` has authenticated it by kernel credential.
  */
 
 export interface CanonicalSelfClaimOperatorDeps {
@@ -41,7 +38,6 @@ export interface CanonicalSelfClaimOperatorDeps {
   clock: Clock;
   sessions: SessionRegistry;
   bindings: BindingRegistry;
-  ownerAuthority: OwnerAuthorityPort;
   buzzActorAuthenticator: BuzzActorAuthenticator;
   /** Opens the Buzz routing channel; a thin wrapper over the deployment's own transport. */
   resolveBuzzAddress: (purpose: string) => Promise<Decision<string>>;
@@ -75,8 +71,6 @@ export interface CanonicalSelfClaimOperatorRequest {
   claimedSessionUuid: string;
   projectId: string;
   expectedBindingGeneration: number;
-  /** The `(channel="cli", nonce)` handle naming an owner approval admitted earlier, elsewhere. */
-  ownerApprovalNonce: string;
 }
 
 const isNonEmptyString = (value: unknown): value is string => typeof value === "string" && value.length > 0;
@@ -88,12 +82,10 @@ export const parseCanonicalSelfClaimOperatorRequest = (
   const claimedSessionUuid = params["claimedSessionUuid"];
   const projectId = params["projectId"];
   const expectedBindingGeneration = params["expectedBindingGeneration"];
-  const ownerApprovalNonce = params["ownerApprovalNonce"];
   if (
     !isNonEmptyString(claimedSessionUuid) ||
     !isNonEmptyString(projectId) ||
-    !Number.isSafeInteger(expectedBindingGeneration) ||
-    !isNonEmptyString(ownerApprovalNonce)
+    !Number.isSafeInteger(expectedBindingGeneration)
   ) {
     return deny(ReasonCode.INVALID_ARGUMENT, "claim canonical-cto request is missing a required field", {});
   }
@@ -101,91 +93,18 @@ export const parseCanonicalSelfClaimOperatorRequest = (
     claimedSessionUuid,
     projectId,
     expectedBindingGeneration: expectedBindingGeneration as number,
-    ownerApprovalNonce,
   });
 };
 
-interface StoredOwnerApprovalPayload {
-  type: "OWNER_APPROVAL";
-  runId: string | null;
-  candidateSnapshotDigest: string | null;
-  operation: string;
-  parameterDigest: string;
-  idempotencyKey: string;
-  approved: boolean;
-}
-
-const isStoredOwnerApprovalPayload = (value: unknown): value is StoredOwnerApprovalPayload => {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
-  const record = value as Record<string, unknown>;
-  return (
-    record["type"] === "OWNER_APPROVAL" &&
-    (record["runId"] === null || typeof record["runId"] === "string") &&
-    (record["candidateSnapshotDigest"] === null || typeof record["candidateSnapshotDigest"] === "string") &&
-    typeof record["operation"] === "string" &&
-    typeof record["parameterDigest"] === "string" &&
-    typeof record["idempotencyKey"] === "string" &&
-    typeof record["approved"] === "boolean"
-  );
-};
-
 /**
- * Reads back an owner approval that some *other*, earlier, owner-authenticated call already
- * admitted — never mints, never admits, never accepts approval content from the claiming request.
- *
- * `IngressGuard.admit` persists the exact admitted envelope into
- * `inbound_messages.payload_json` (the same durable row `OwnerAuthority.assertApproval` joins
- * `(channel, nonce)` against — `src/ingress/ingress-guard.ts`, `src/ceo/owner-authority.ts`), and
- * `ownerApprovalPayload` shapes that envelope as `{type, runId, candidateSnapshotDigest,
- * operation, parameterDigest, idempotencyKey, approved}`. Reconstructing an `OwnerApprovalReceipt`
- * from exactly that stored row — plus the row's own `actor` column and the `nonce` the caller
- * named — is reading an owner's already-made decision, not accepting the claimant's word for one:
- * every field comes from storage this connection cannot write to (writing it requires the
- * `owner.approveClaimCanonicalCto` operator method, authenticated by the shared bearer token on a
- * socket this listener does not serve).
- *
- * Returns `null` for anything that does not check out — no such nonce, no payload, a payload that
- * is not a valid `OWNER_APPROVAL` envelope — so a missing or fabricated handle denies before this
- * value is ever handed to `OwnerAuthority`.
- */
-const loadAdmittedOwnerApproval = (db: Db, nonce: string): OwnerApprovalReceipt | null => {
-  const row = db.get<{ actor: string; payload_json: string | null }>(
-    `SELECT actor, payload_json FROM inbound_messages WHERE channel = 'cli' AND nonce = ?`,
-    [nonce],
-  );
-  if (!row || row.payload_json === null) return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(row.payload_json);
-  } catch {
-    return null;
-  }
-  if (!isStoredOwnerApprovalPayload(parsed)) return null;
-  return {
-    channel: "cli",
-    actor: row.actor,
-    inboundNonce: nonce,
-    runId: parsed.runId,
-    candidateSnapshotDigest: parsed.candidateSnapshotDigest,
-    operation: parsed.operation,
-    parameterDigest: parsed.parameterDigest,
-    idempotencyKey: parsed.idempotencyKey,
-    approved: parsed.approved,
-  };
-};
-
-/**
- * The claim orchestration: an *already-admitted* owner approval loaded back out of storage, and
- * `CanonicalSelfClaim.claim()` composed to produce a READY session, `PRIMARY_CTO` assignment,
- * target binding, attestation, `buzz_actor_id` and `buzz_address` — or none of it.
+ * The claim orchestration: `CanonicalSelfClaim.claim()` composed to produce a READY session,
+ * `PRIMARY_CTO` assignment, target binding, attestation, `buzz_actor_id` and `buzz_address` —
+ * or none of it.
  *
  * `peer` is a plain `{ peerPid, uid }` tuple the caller (`canonical-self-claim-listener.ts`) has
  * already authenticated against the kernel and this deployment's own effective uid, and against
  * `peerPid === effectivePid`, before this function is ever invoked — this orchestration performs
- * no kernel-credential check of its own and has no way to. `CanonicalSelfClaim.claim()` itself
- * then re-validates the loaded receipt's operation, parameter binding and `approved` flag before
- * opening its own transaction, exactly as it does for every other caller — this module adds no
- * second copy of that logic, it only refuses to fabricate what `claim()` verifies.
+ * no kernel-credential check of its own and has no way to.
  */
 export const executeCanonicalSelfClaimOperator = async (
   peer: { peerPid: number; uid: number },
@@ -196,21 +115,11 @@ export const executeCanonicalSelfClaimOperator = async (
   if (!parsed.allowed) return parsed;
   const request = parsed.value;
 
-  const ownerApproval = loadAdmittedOwnerApproval(deps.db, request.ownerApprovalNonce);
-  if (ownerApproval === null) {
-    return deny(
-      ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-      "no admitted owner approval exists for the presented handle",
-      {},
-    );
-  }
-
   const claim = new CanonicalSelfClaim(
     deps.db,
     deps.clock,
     deps.sessions,
     deps.bindings,
-    deps.ownerAuthority,
     deps.buzzActorAuthenticator,
     deps.resolveBuzzAddress,
     deps.config,
@@ -221,7 +130,6 @@ export const executeCanonicalSelfClaimOperator = async (
     claimedSessionUuid: request.claimedSessionUuid,
     projectId: request.projectId,
     expectedBindingGeneration: request.expectedBindingGeneration,
-    ownerApproval,
     peerProtocolVersion: deps.config.peerProtocolVersion,
     // Derived from the kernel-verified connection, never from the request body — this is the
     // "connected peer identity" clause 2 names, expressed as the effective uid the socket

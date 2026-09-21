@@ -62,7 +62,6 @@ export interface AttachRelayClaim {
   claimedSessionUuid: string;
   projectId: string;
   expectedBindingGeneration: number;
-  ownerApprovalNonce: string;
 }
 
 export interface AttachRelayOptions {

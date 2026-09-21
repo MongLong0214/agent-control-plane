@@ -250,7 +250,6 @@ describe("the canonical CTO attach relay", () => {
       claimedSessionUuid: randomUUID(),
       projectId: manifest.projectId,
       expectedBindingGeneration: 1,
-      ownerApprovalNonce: randomUUID(),
     };
     endpoint = join(stateDir, "w.sock");
     wake = createServer((socket) => socket.resume());

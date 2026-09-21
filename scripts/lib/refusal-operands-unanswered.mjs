@@ -87,7 +87,6 @@ const groups = [
       ["!isNonEmptyString(claimedSessionUuid)",1],
       ["!isNonEmptyString(projectId)",1],
       ["!Number.isSafeInteger(expectedBindingGeneration)",1],
-      ["!isNonEmptyString(ownerApprovalNonce)",1],
       ["!row",1],
       ["row.payload_json === null",1],
     ],

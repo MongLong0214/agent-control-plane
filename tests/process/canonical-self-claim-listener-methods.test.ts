@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { main as agentctlMain } from "../../src/cli/agentctl.ts";
-import { OPERATOR_METHOD, type Daemon } from "../../src/daemon/daemon.ts";
 import {
   assertDirectPeer,
   authenticateClaimCredentials,
@@ -15,6 +14,7 @@ import {
   type CanonicalSelfClaimListener,
 } from "../../src/daemon/canonical-self-claim-listener.ts";
 import { executeCanonicalSelfClaimOperator, type CanonicalSelfClaimOperatorDeps } from "../../src/daemon/canonical-self-claim-operator.ts";
+import type { Daemon } from "../../src/daemon/daemon.ts";
 import { IngressGuard } from "../../src/ingress/ingress-guard.ts";
 import { allow, deny, type Decision } from "../../src/core/errors.ts";
 import { getPeerCredentials } from "../../src/core/peercred.ts";
@@ -130,31 +130,6 @@ const operatorRequest = (
     });
   });
 
-const claimRequest = (socketPath: string, request: Record<string, unknown>): Promise<Decision<unknown>> =>
-  new Promise((resolve, reject) => {
-    const socket = createConnection(socketPath);
-    let received = "";
-    const timeout = setTimeout(() => {
-      socket.destroy();
-      reject(new Error("canonical self-claim socket test timed out"));
-    }, 20_000);
-    socket.setEncoding("utf8");
-    socket.once("connect", () => {
-      socket.write(`${JSON.stringify(request)}\n`);
-    });
-    socket.on("data", (chunk: string) => {
-      received += chunk;
-      if (!received.includes("\n")) return;
-      clearTimeout(timeout);
-      socket.end();
-      resolve(JSON.parse(received.trim()) as Decision<unknown>);
-    });
-    socket.once("error", (error) => {
-      clearTimeout(timeout);
-      reject(error);
-    });
-  });
-
 /**
  * The exact wire bytes, never `JSON.parse`'d — a shape-only assertion on the parsed object cannot
  * prove a field's raw text is absent from the transport itself (a substring check needs the actual
@@ -232,34 +207,6 @@ const startMintOperator = async (): Promise<StartedOperator> => {
   return started;
 };
 
-const mintOwnerApprovalOverOperatorSocket = (
-  started: StartedOperator,
-  input: {
-    projectId: string;
-    claimedSessionUuid: string;
-    expectedBindingGeneration: number;
-    approved?: boolean | "omit" | "malformed";
-    nonce?: string;
-  },
-): Promise<{ nonce: string; result: Decision<unknown> }> => {
-  const nonce = input.nonce ?? `owner-preflight-${freshNonces++}`;
-  const params: Record<string, unknown> = {
-    projectId: input.projectId,
-    claimedSessionUuid: input.claimedSessionUuid,
-    expectedBindingGeneration: input.expectedBindingGeneration,
-    nonce,
-  };
-  if (input.approved === "malformed") {
-    params["approved"] = "yes";
-  } else if (input.approved !== "omit") {
-    params["approved"] = input.approved ?? true;
-  }
-  return operatorRequest(started.socketPath, TEST_OPERATOR_TOKEN, {
-    method: OPERATOR_METHOD.OWNER_APPROVE_CLAIM_CANONICAL_CTO,
-    params,
-  }).then((result) => ({ nonce, result }));
-};
-
 const resolveBuzzAddressFixture = (
   outcome: Decision<string> = allow(ReasonCode.OK, "buzz://test-canonical-cto"),
 ) => async (): Promise<Decision<string>> => outcome;
@@ -269,7 +216,6 @@ const depsFor = (cp: Harness["cp"], root: string): CanonicalSelfClaimOperatorDep
   clock: cp.clock,
   sessions: cp.sessions,
   bindings: cp.bindings,
-  ownerAuthority: cp.ownerAuthority,
   buzzActorAuthenticator: new IngressGuard(cp.db, cp.clock, cp.audit, { buzz: { allowedActors: [BUZZ_ACTOR_ID] } }),
   resolveBuzzAddress: resolveBuzzAddressFixture(),
   config: {
@@ -304,26 +250,6 @@ const startClaimListener = async (
   return listener;
 };
 
-const insertProject = (cp: Harness["cp"], projectId: string): void => {
-  cp.db.run(`INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)`, [
-    projectId, projectId, cp.clock.nowIso(),
-  ]);
-};
-
-const ROLLBACK_TABLES = [
-  "sessions",
-  "conversational_actors",
-  "assignments",
-  "actor_target_bindings",
-  "actor_target_attestations",
-  "audit_events",
-] as const;
-
-const rowCounts = (cp: Harness["cp"]): Record<(typeof ROLLBACK_TABLES)[number], number> =>
-  Object.fromEntries(
-    ROLLBACK_TABLES.map((table) => [table, cp.db.get<{ c: number }>(`SELECT COUNT(*) AS c FROM ${table}`)?.c ?? -1]),
-  ) as Record<(typeof ROLLBACK_TABLES)[number], number>;
-
 describe("actor.claimCanonicalCto — method-level rejections and the mint method's own validation", () => {
   it("the self-claim listener rejects a generic operator/owner method, including its own bearer-authenticated sibling", async () => {
     const started = await startMintOperator();
@@ -342,64 +268,18 @@ describe("actor.claimCanonicalCto — method-level rejections and the mint metho
     if (!daemonStatus.allowed) expect(daemonStatus.reasonCode).toBe(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED);
     expect(closedWithinBudget, "client socket did not reach 'close' within 2s of the response arriving").toBe(true);
 
-    // Its own bearer-authenticated sibling, sent here without a token (this socket has no field
-    // for one) — still refused as an unrecognized method, not as an authentication failure. This
-    // listener does not almost-serve `owner.approveClaimCanonicalCto`; it does not know the name.
-    const ownerApprove = await claimRequest(listener.socketPath, {
-      method: "owner.approveClaimCanonicalCto",
-      params: { projectId: "x", claimedSessionUuid: TEST_SESSION_UUID, expectedBindingGeneration: 1, nonce: "n", approved: true },
-    });
-    expect(ownerApprove.allowed).toBe(false);
-    if (!ownerApprove.allowed) {
-      expect(ownerApprove.reasonCode).toBe(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED);
-      // The wire carries only the reason class, never the internal message naming the one method
-      // this socket serves — see the metadata-free response boundary tests below for why.
-      expect((ownerApprove as Record<string, unknown>)["message"]).toBeUndefined();
-    }
   }, 30_000);
 
   it("the operator socket refuses actor.claimCanonicalCto as an unrecognized method", async () => {
     const started = await startMintOperator();
     const result = await operatorRequest(started.socketPath, TEST_OPERATOR_TOKEN, {
       method: "actor.claimCanonicalCto",
-      params: { claimedSessionUuid: TEST_SESSION_UUID, projectId: "x", expectedBindingGeneration: 1, ownerApprovalNonce: "n" },
+      params: { claimedSessionUuid: TEST_SESSION_UUID, projectId: "x", expectedBindingGeneration: 1 },
     });
     expect(result.allowed).toBe(false);
     if (!result.allowed) expect(result.reasonCode).toBe(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED);
   });
 
-  it("owner.approveClaimCanonicalCto requires an explicit boolean approved: omitted and malformed both deny before any admission", async () => {
-    const started = await startMintOperator();
-    const { cp } = started.harness;
-    const projectId = "prj_operator_approved_required";
-    insertProject(cp, projectId);
-    const before = rowCounts(cp);
-
-    const omitted = await mintOwnerApprovalOverOperatorSocket(started, {
-      projectId,
-      claimedSessionUuid: TEST_SESSION_UUID,
-      expectedBindingGeneration: 1,
-      approved: "omit",
-    });
-    expect(omitted.result.allowed).toBe(false);
-
-    const malformed = await mintOwnerApprovalOverOperatorSocket(started, {
-      projectId,
-      claimedSessionUuid: TEST_SESSION_UUID,
-      expectedBindingGeneration: 1,
-      approved: "malformed",
-    });
-    expect(malformed.result.allowed).toBe(false);
-
-    // Neither denial admitted anything: no `inbound_messages`/`INGRESS_ADMITTED` row landed for
-    // either nonce, and the audit table (part of `ROLLBACK_TABLES`) is unchanged.
-    expect(rowCounts(cp)).toEqual(before);
-    const admitted = cp.db.get<{ c: number }>(
-      `SELECT COUNT(*) AS c FROM inbound_messages WHERE nonce IN (?, ?)`,
-      [omitted.nonce, malformed.nonce],
-    )?.c ?? -1;
-    expect(admitted).toBe(0);
-  });
 });
 
 describe("listener startup — the AF_UNIX sun_path limit (#760)", () => {
@@ -665,8 +545,6 @@ describe("agentctl claim canonical-cto reaches only the dedicated claim socket, 
           "prj_cli_claim_seam",
           "--expected-binding-generation",
           "1",
-          "--owner-approval-nonce",
-          "cli-claim-seam-nonce",
         ]);
       } finally {
         process.stdout.write = originalWrite;
@@ -693,7 +571,6 @@ describe("agentctl claim canonical-cto reaches only the dedicated claim socket, 
           claimedSessionUuid: TEST_SESSION_UUID,
           projectId: "prj_cli_claim_seam",
           expectedBindingGeneration: 1,
-          ownerApprovalNonce: "cli-claim-seam-nonce",
         },
       });
       // `toEqual` above already fails on any extra field; asserted directly too, since a missing
