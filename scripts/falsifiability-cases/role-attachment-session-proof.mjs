@@ -5,7 +5,7 @@ const roleAttachmentSessionProof = {
   "find": "    if (!authenticated.allowed) return authenticated;\n    const scope =",
   "replace": "    const scope =",
   "killedBy": [
-    "tests/unit/role-attachment-authorization.test.ts::issuance rejects a wrong session secret without spending the approval"
+    "tests/unit/role-attachment-authorization.test.ts::issuance rejects a wrong session secret"
   ]
 };
 
