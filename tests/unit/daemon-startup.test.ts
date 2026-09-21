@@ -35,7 +35,7 @@ const BUZZ_VARIABLES = ["ACP_BUZZ_INGRESS_SECRET", "ACP_BUZZ_ALLOWED_ACTORS", "B
 const BUZZ_SECRET = "startup-test-buzz-secret";
 const BUZZ_ACTOR = "npub-startup-owner";
 /**
- * The exact eight-variable canonical self-claim activation group, separate from the pre-existing
+ * The exact seven-variable canonical self-claim activation group, separate from the pre-existing
  * shared `ACP_BUZZ_CHANNEL` transport setting this group also reads once fully configured.
  * Deleted from the child's environment unless a case asks for them, for the same reason
  * `TELEGRAM_VARIABLES` is: an inherited value from the parent process's own environment would
@@ -49,7 +49,6 @@ const CANONICAL_ACTIVATION_VARIABLES = [
   "ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH",
   "ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256",
   "ACP_CANONICAL_CTO_BUZZ_ACTOR_ID",
-  "ACP_CANONICAL_CTO_WORKDIR",
   "ACP_CANONICAL_CTO_PEER_PROTOCOL",
   "ACP_CANONICAL_CTO_BUZZ_PURPOSE",
 ] as const;
@@ -298,7 +297,6 @@ describe("canonical self-claim activation is an atomic pre-effect daemon contrac
     ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH: "/fake/versions/current/claude",
     ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256: `sha256:${"0".repeat(64)}`,
     ACP_CANONICAL_CTO_BUZZ_ACTOR_ID: "buzz:startup-test-canonical-cto",
-    ACP_CANONICAL_CTO_WORKDIR: "/synthetic/startup-test-canonical-workdir",
     ACP_CANONICAL_CTO_PEER_PROTOCOL: "acp.startup-test/v9",
     ACP_CANONICAL_CTO_BUZZ_PURPOSE: "continuity:STARTUP_TEST_CTO",
     ACP_BUZZ_CHANNEL: "channel:startup-test-canonical",
@@ -336,7 +334,7 @@ describe("canonical self-claim activation is an atomic pre-effect daemon contrac
       },
     }) as Parameters<typeof main>[0];
 
-  it("starts the daemon with canonical self-claim disabled when all eight activation variables are absent", async () => {
+  it("starts the daemon with canonical self-claim disabled when all seven activation variables are absent", async () => {
     // This is the exact regression: a deployment carrying only the pre-existing MCP/operator
     // configuration (no canonical env vars at all) must reach a normal, running daemon — not
     // exit before `ControlPlane`, migration refusal, or the operator door can run.
@@ -372,7 +370,7 @@ describe("canonical self-claim activation is an atomic pre-effect daemon contrac
     }
   };
 
-  it("rejects all 254 nonempty proper activation subsets before reading config", async () => {
+  it("rejects all 126 nonempty proper activation subsets before reading config", async () => {
     let rejectedSubsets = 0;
     for (let mask = 1; mask < (1 << CANONICAL_ACTIVATION_VARIABLES.length) - 1; mask += 1) {
       const subset: NodeJS.ProcessEnv = { ACP_BUZZ_CHANNEL: COMPLETE_CANONICAL_ENV["ACP_BUZZ_CHANNEL"] };
@@ -399,7 +397,7 @@ describe("canonical self-claim activation is an atomic pre-effect daemon contrac
       expect(configReads, `mask ${mask} reached the config getter`).toBe(0);
       rejectedSubsets += 1;
     }
-    expect(rejectedSubsets).toBe(254);
+    expect(rejectedSubsets).toBe(126);
   });
 
   it("treats an entirely blank or whitespace-only activation group as disabled", async () => {
@@ -434,7 +432,7 @@ describe("canonical self-claim activation is an atomic pre-effect daemon contrac
     }
   });
 
-  it("fails closed before config when all eight activation variables are set but ACP_BUZZ_CHANNEL is not", async () => {
+  it("fails closed before config when all seven activation variables are set but ACP_BUZZ_CHANNEL is not", async () => {
     const { ACP_BUZZ_CHANNEL: _omit, ...withoutChannel } = COMPLETE_CANONICAL_ENV;
     for (const channel of [undefined, "", " \t "]) {
       let configReads = 0;
@@ -482,7 +480,7 @@ describe("canonical self-claim activation is an atomic pre-effect daemon contrac
     expectNoResidue(result, diagnostics);
   }, 40_000);
 
-  it("starts the canonical self-claim listener when the full synthetic eight-variable group is configured", async () => {
+  it("starts the canonical self-claim listener when the full synthetic seven-variable group is configured", async () => {
     const result = await runMain({ seedState: true, canonical: COMPLETE_CANONICAL_ENV });
 
     const diagnostics =

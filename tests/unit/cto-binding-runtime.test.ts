@@ -81,7 +81,7 @@ it.each(["success", "external-nesting", "reentrant-target", "after-commit-fault"
   });
   const runtime = createCtoBindingRuntime(cp, JSON.stringify([{ provider: "claude", sessionId: target.sessionId,
     incarnation: target.incarnation, nativeSessionUuid: nativeUuid, requiredExecutorVersion: "0.0.0-fixture",
-    expectedExecutorRealpath: "/fixture/claude", expectedExecutorSha256: "sha256:" + "1".repeat(64), expectedCwd: root }]));
+    expectedExecutorRealpath: "/fixture/claude", expectedExecutorSha256: "sha256:" + "1".repeat(64) }]));
   // Nothing is minted before the bind. The runtime exposes `bind` and nothing else, and the only
   // credential in play is the CEO's own session secret against its own live binding.
   expect(Object.keys(runtime)).toEqual(["bind", "release"]);
@@ -226,7 +226,7 @@ it.each([
   });
   vi.stubEnv("ACP_CTO_BINDING_TARGETS_JSON", JSON.stringify([{ provider: "claude", sessionId: target.sessionId,
     incarnation: target.incarnation, nativeSessionUuid: nativeUuid, requiredExecutorVersion: "0.0.0-fixture",
-    expectedExecutorRealpath: "/fixture/claude", expectedExecutorSha256: "sha256:" + "1".repeat(64), expectedCwd: root }]));
+    expectedExecutorRealpath: "/fixture/claude", expectedExecutorSha256: "sha256:" + "1".repeat(64) }]));
   daemonCtoBindingRuntime(cp);
   const registered = vi.spyOn(McpServer.prototype, "registerTool");
   const listeners = await daemon.startDaemonMcpListeners(cp, root, "isolated-mcp-token", { finalizeApprovedRun: () => {} });

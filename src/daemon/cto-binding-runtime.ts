@@ -19,7 +19,6 @@ const claudeTarget = z.object({
   provider: z.literal("claude"), sessionId: z.string().min(1), incarnation: z.string().min(1),
   nativeSessionUuid: z.string().uuid(), requiredExecutorVersion: z.string().min(1),
   expectedExecutorRealpath: absolute, expectedExecutorSha256: z.string().regex(/^sha256:[a-f0-9]{64}$/),
-  expectedCwd: absolute,
 }).strict();
 const targetsSchema = z.array(z.union([hermesTarget, claudeTarget])).max(128);
 

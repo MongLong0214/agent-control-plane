@@ -347,7 +347,6 @@ const depsFor = (
     }),
     resolveBuzzAddress: resolveBuzzAddressFixture(),
     config: {
-      expectedCwd: realpathSync(root),
       expectedPeerProtocolVersion: PEER_PROTOCOL,
       expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
       canonicalSessionUuid: options.sessionUuid ?? TEST_SESSION_UUID,

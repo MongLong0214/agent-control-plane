@@ -178,7 +178,6 @@ const baseConfig = (overrides: Partial<CanonicalSelfClaimConfig> = {}): Canonica
   canonicalBuzzChannelId: CHANNEL,
   expectedExecutorRealpath: TEST_EXPECTED_EXECUTOR_REALPATH,
   expectedExecutorSha256: TEST_EXPECTED_EXECUTOR_SHA256,
-  expectedCwd: CWD,
   expectedPeerProtocolVersion: PEER_PROTOCOL,
   expectedPeerIdentity: PEER_IDENTITY,
   ...overrides,
@@ -897,11 +896,16 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       // `SUBPROCESS_TIMEOUT_MS` of 5_000. The scan was killed, `lsofEntries` returned `[]`, the
       // cwd resolved to null, and the claim refused with "the claude ancestor's working directory
       // does not match the expected canonical workdir" — while `lsof -a -p <pid> -d cwd` reported
-      // exactly the configured `expectedCwd`. The directory matched; the probe that would have
+      // exactly the directory that was then configured. It matched; the probe that would have
       // read it never ran, and the refusal named the wrong thing.
       //
       // A null cwd is what a probe that produced no answer looks like at this seam. It is not an
       // observation of a different directory, and it must not be reported as one.
+      //
+      // There is no configured directory left to mismatch — the comparison and the config field
+      // that fed it are both gone. This refusal is not: `identity.cwd` is written as the
+      // binding's `workdir` and compared against a predecessor's on an idempotent re-claim, so
+      // admitting a null would record an absence as the claimant's directory.
       const core = makeCore();
       const projectId = "prj_cwd_probe_failed";
       insertProject(core, projectId);

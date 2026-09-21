@@ -92,7 +92,7 @@ describe("role attachment authorization without sockets", () => {
       guard, async () => allow(ReasonCode.OK, "buzz://fixture"), {
         canonicalSessionUuid: uuid, requiredExecutorVersion: "0.0.0-test", canonicalBuzzChannelId: "fixture",
         expectedExecutorRealpath: "/fake/claude", expectedExecutorSha256: `sha256:${"0".repeat(64)}`,
-        expectedCwd: "/fake/work", expectedPeerProtocolVersion: "fixture", expectedPeerIdentity: "fixture",
+        expectedPeerProtocolVersion: "fixture", expectedPeerIdentity: "fixture",
       }, {
         processInspector: { snapshot: (pid) => pid === 10 ? {
           pid: 10, ppid: 1, argv: ["/fake/claude", "--session-id", uuid], command: "fixture",
