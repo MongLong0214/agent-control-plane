@@ -443,7 +443,7 @@ export const dispatch = async (
   }
 
   if (command === "binding") {
-    const [sub, projectId, sessionId, sessionIncarnation, generation, nonce] = args;
+    const [sub, projectId, sessionId, sessionIncarnation, generation] = args;
     if (sub === "recover-dead") {
       return call("binding.recoverDead", {
         projectId: required(projectId, "projectId"),
@@ -454,11 +454,12 @@ export const dispatch = async (
         sessionId: required(sessionId, "sessionId"),
         sessionIncarnation: required(sessionIncarnation, "sessionIncarnation"),
         expectedBindingGeneration: requiredInteger(generation, "expectedBindingGeneration", 1),
-        nonce: required(nonce, "nonce"),
-        // Reaching this command *is* the owner's approval, and the daemon verifies that the actor
-        // behind this connection is an allowlisted owner before it acts. There is deliberately no
-        // `--approved=false` spelling: a rejection is expressed by not running the command.
-        approved: true,
+        // There is no `nonce` and no `approved` here any more. This command used to require both,
+        // with `approved` hard-coded to `true` under a comment saying that reaching the command
+        // *was* the owner's approval — which is the whole argument for deleting them: a field
+        // that can only hold one value, and a nonce whose only job was to make that field's
+        // envelope unique, recorded a decision nobody had made. The generation above is what
+        // keeps a repeat from doing anything, and it did that before these two existed.
       });
     }
     return fail(`unknown binding subcommand: ${sub ?? ""}`);
