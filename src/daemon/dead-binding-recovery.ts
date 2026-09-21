@@ -1,4 +1,3 @@
-import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../ceo/owner-authority.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { processStartedAt } from "../core/process-identity.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -7,13 +6,6 @@ import type { Db } from "../db/database.ts";
 import { Role, roleKeyFor } from "../domain/types.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
-
-/**
- * The owner operation this door authorises. Named once, here, and bound into the approval
- * envelope's `parameterDigest`, so an approval minted for any other operation — a run decision,
- * a repair, a canonical self-claim — cannot be replayed at this door and vice versa.
- */
-export const DEAD_BINDING_RECOVERY_OPERATION = "binding.recover_dead_canonical";
 
 /**
  * What the recovery releases. Deliberately one role and not a parameter with a default: this
@@ -86,9 +78,6 @@ export interface DeadBindingRecoveryRequest {
   sessionId: string;
   sessionIncarnation: string;
   expectedBindingGeneration: number;
-  /** The owner's own nonce for this decision; replay protection lives in `IngressGuard`. */
-  nonce: string;
-  approved: boolean;
 }
 
 const isNonEmptyString = (value: unknown): value is string =>
@@ -97,9 +86,10 @@ const isNonEmptyString = (value: unknown): value is string =>
 /**
  * Parses the request with no defaults anywhere.
  *
- * `approved` in particular has no `?? true`: an omitted or malformed field is not an owner
- * saying yes, and treating it as one would make the cheapest possible request the most
- * powerful one.
+ * Every field here names the target: which project, which session, which incarnation, which
+ * generation. A default on any of them would let a caller who named nothing release whatever
+ * happened to hold the role, which is the opposite of what this door is for — so an omitted or
+ * malformed field is a refusal rather than a wildcard.
  */
 export const parseDeadBindingRecoveryRequest = (
   params: Record<string, unknown>,
@@ -109,17 +99,13 @@ export const parseDeadBindingRecoveryRequest = (
   const sessionId = params["sessionId"];
   const sessionIncarnation = params["sessionIncarnation"];
   const expectedBindingGeneration = params["expectedBindingGeneration"];
-  const nonce = params["nonce"];
-  const approved = params["approved"];
   if (
     !isNonEmptyString(projectId) ||
     !isNonEmptyString(role) ||
     !isNonEmptyString(sessionId) ||
     !isNonEmptyString(sessionIncarnation) ||
     !Number.isSafeInteger(expectedBindingGeneration) ||
-    (expectedBindingGeneration as number) < 1 ||
-    !isNonEmptyString(nonce) ||
-    typeof approved !== "boolean"
+    (expectedBindingGeneration as number) < 1
   ) {
     return deny(
       ReasonCode.INVALID_ARGUMENT,
@@ -133,8 +119,6 @@ export const parseDeadBindingRecoveryRequest = (
     sessionId,
     sessionIncarnation,
     expectedBindingGeneration: expectedBindingGeneration as number,
-    nonce,
-    approved,
   });
 };
 
@@ -143,26 +127,6 @@ export interface DeadBindingRecoveryDeps {
   audit: AuditLog;
   sessions: SessionRegistry;
   bindings: BindingRegistry;
-  ownerAuthority: OwnerAuthorityPort;
-  /**
-   * Mints and admits the owner-approval envelope through this deployment's ingress policy.
-   *
-   * A parameter rather than something built here because the allowlist, the guard and the
-   * replay record all belong to the daemon's composition — this module verifies an approval, it
-   * does not decide who may give one.
-   */
-  admitOwnerApproval: (
-    actor: string,
-    approval: {
-      runId: string | null;
-      candidateSnapshotDigest: string | null;
-      operation: string;
-      parameters: unknown;
-      idempotencyKey: string;
-      approved: boolean;
-    },
-    nonce: string,
-  ) => Decision<OwnerApprovalReceipt>;
   /** Test seam for the liveness probe; production passes nothing and gets the real syscall. */
   liveness?: {
     signal?: (pid: number) => void;
@@ -189,13 +153,28 @@ export interface DeadBindingRecoveryReceipt {
  * the role and stops. Whoever takes the role afterwards does so through the ordinary
  * provisioning paths, once the daemon has passed its doctor and come up.
  *
- * Everything happens in one transaction: the approval's admission and its consumption, the
- * generation/incarnation re-read, the revoke (which fences the outbox inside the same
- * transaction, in `BindingRegistry.revoke`), and the audit record. A denial returned from this
- * body rolls the whole thing back through `txDecision`, so a refused recovery spends no nonce
- * and leaves no half-released role. The re-read inside the transaction is not redundant with the
- * caller's checks: the liveness probe is a syscall taken outside any transaction, and a binding
- * that moved in that window must not be released by a decision made about the old one.
+ * No owner decision is minted, presented or consumed. This door used to require an
+ * `OwnerApprovalReceipt` whose digest covered these exact parameters, admitted through the CLI
+ * owner allowlist against a nonce the caller had to invent — and the CLI that carried it already
+ * hard-coded `approved: true` with the comment "reaching this command *is* the owner's approval",
+ * so the receipt restated the fact that the command had been run rather than adding a fact to it.
+ * What bounds this door is not that ceremony but the liveness proof below: a binding is released
+ * only when this machine can show, by `ESRCH` or by a mismatched process start time, that the
+ * process holding it is gone. Widening that proof to buy back a gate was rejected — the proof is
+ * the authority, and an unproven process stays bound no matter who asks.
+ *
+ * What that withdraws is real and is named here rather than left implied: the caller is now
+ * whoever holds the operator socket's bearer credential, not additionally an actor named in
+ * `ownerIdentities`. The door's range is unchanged — one role, one named generation, one provably
+ * dead process — so what a caller gains is the ability to clear a binding nothing is using.
+ *
+ * Everything still happens in one transaction: the generation/incarnation re-read, the revoke
+ * (which fences the outbox inside the same transaction, in `BindingRegistry.revoke`), and the
+ * audit record. A denial returned from this body rolls the whole thing back through `txDecision`,
+ * so a refused recovery leaves no half-released role and no audit line claiming one. The re-read
+ * inside the transaction is not redundant with the caller's checks: the liveness probe is a
+ * syscall taken outside any transaction, and a binding that moved in that window must not be
+ * released by a decision made about the old one.
  *
  * Generation never moves backwards here because nothing is minted. `expectedBindingGeneration`
  * must equal the generation actually held, so a replayed request naming a superseded generation
@@ -215,34 +194,7 @@ export const recoverDeadCanonicalBinding = (
       { role: request.role, supportedRole: DEAD_BINDING_RECOVERY_ROLE },
     );
   }
-  // An explicit rejection is a decision, and the decision it records is "no". Reaching the
-  // release with `approved: false` would make the field decorative.
-  if (!request.approved) {
-    return deny(
-      ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-      "the owner decision presented for this recovery is a rejection",
-      { projectId: request.projectId, sessionId: request.sessionId },
-    );
-  }
-
   const roleKey = roleKeyFor(DEAD_BINDING_RECOVERY_ROLE, { projectId: request.projectId });
-  const approval = {
-    runId: null,
-    candidateSnapshotDigest: null,
-    operation: DEAD_BINDING_RECOVERY_OPERATION,
-    // Every field the owner is answering for is inside the digest. An approval for one project,
-    // session, incarnation or generation therefore cannot authorise the release of another.
-    parameters: {
-      domain: DEAD_BINDING_RECOVERY_OPERATION,
-      projectId: request.projectId,
-      role: DEAD_BINDING_RECOVERY_ROLE,
-      sessionId: request.sessionId,
-      sessionIncarnation: request.sessionIncarnation,
-      expectedBindingGeneration: request.expectedBindingGeneration,
-    },
-    idempotencyKey: `recover-dead-canonical-binding:${request.nonce}`,
-    approved: request.approved,
-  };
 
   return deps.db.txDecision<DeadBindingRecoveryReceipt>(() => {
     const current = deps.bindings.active(roleKey);
@@ -310,8 +262,14 @@ export const recoverDeadCanonicalBinding = (
       // of evidence. Widening the range to cover it is a separate decision that has not been
       // made, and it is out of scope for this change — anyone who needs that case answered
       // should get it decided on its own terms, not by loosening this check.
+      //
+      // The code is the one the liveness refusal below uses, not the owner-authority code this
+      // used to carry. Nothing about owner authority is being asserted here any more: the
+      // refusal says the process could not be proven gone, which is exactly what the sibling
+      // says, and giving the same answer two codes would make the pair look like two different
+      // findings to anyone reading the audit.
       return deny(
-        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        ReasonCode.RECOVERY_TAKEOVER_REQUIRES_UNREACHABLE_OWNER,
         "the bound session record is absent, so its process cannot be proven dead",
         { projectId: request.projectId, roleKey, sessionId: request.sessionId },
       );
@@ -337,14 +295,6 @@ export const recoverDeadCanonicalBinding = (
       );
     }
 
-    // Only now is owner authority created and spent. Admitting inside the transaction is what
-    // makes a mid-flight failure leave the nonce unspent: an admission that survived a rolled
-    // back release would be an owner decision on record for something that did not happen.
-    const admitted = deps.admitOwnerApproval(actor, approval, request.nonce);
-    if (!admitted.allowed) return admitted as Decision<DeadBindingRecoveryReceipt>;
-    const consumed = deps.ownerAuthority.consumeApproval(admitted.value, null);
-    if (!consumed.allowed) return consumed as Decision<DeadBindingRecoveryReceipt>;
-
     // No `allowBlockedRuns`. `revokePausedBinding` may pass it because it has already paused the
     // work; nothing here has, so a role that still owns live runs is refused and the daemon goes
     // on blocking. Sweeping that state out of sight is the outcome this whole door exists to
@@ -368,7 +318,6 @@ export const recoverDeadCanonicalBinding = (
         sessionIncarnation: session.incarnation,
         osPid: session.osPid,
         liveness,
-        ownerApprovalNonce: request.nonce,
       },
     });
 

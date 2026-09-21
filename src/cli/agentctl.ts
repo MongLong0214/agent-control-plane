@@ -32,6 +32,31 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
                                            lifecycle has reached a terminal state
   agentctl outbox retry                   reset delivery attempts on pending messages
   agentctl owner approve <runId> <item>   record an owner decision for a human gate
+  agentctl github merge ...             refused: agentcpd owns CEO-approved finalization
+  agentctl github post-merge ...        refused: agentcpd owns exact post-merge verification
+  agentctl repair list                    show the repair operation allowlist
+  agentctl repair dry-run <op> [k=v...]   evaluate a repair without changing anything
+  agentctl repair execute <op> [k=v...]   execute a repair (owner-risk ops need --owner)
+  agentctl capacity observe <provider> <json> record a short-lived, authenticated quota observation
+  agentctl capacity show                  current provider capacity and admission
+  agentctl project register <name> <path> register a project and its primary repository
+  agentctl project list                   list projects with derived activity
+  agentctl actor register <id> <generation> <expected-set-generation>
+  agentctl actor list                     list registered conversational actors
+  agentctl actor unregister <id> <generation> <expected-set-generation> <reason>
+  agentctl telegram reply acknowledge <nonce> <reason-code> <evidence-digest>
+                                           record that a terminal reply was reviewed and will not retry
+  agentctl binding recover-dead <projectId> <sessionId> <incarnation> <generation>
+                                           release a PRIMARY_CTO binding whose session's OS process
+                                           this host can prove is gone. Refuses a live session and
+                                           refuses one whose liveness cannot be established. Mints
+                                           no session and no generation; the role is simply left
+                                           unbound. Reachable while agentcpd is parked, which is
+                                           the state this exists for. There is no owner approval
+                                           to present: the liveness proof is the whole bound, and
+                                           <generation> is what stops a repeat.
+  agentctl conversation contradictions     turns whose records disagree, with the ids to cite
+  agentctl conversation adjudicate <actor> <turn> <reason-code> <evidence-digest> <id>...
   agentctl conversation unresolved         turns waiting on a person, with what each already holds
   agentctl conversation resolve <actor> <turn> <reason-code> <evidence-digest> [--fenced]
                                            settle an unobserved turn ABORTED, which permits a retry.
@@ -443,7 +468,7 @@ export const dispatch = async (
   }
 
   if (command === "binding") {
-    const [sub, projectId, sessionId, sessionIncarnation, generation, nonce] = args;
+    const [sub, projectId, sessionId, sessionIncarnation, generation] = args;
     if (sub === "recover-dead") {
       return call("binding.recoverDead", {
         projectId: required(projectId, "projectId"),
@@ -454,11 +479,12 @@ export const dispatch = async (
         sessionId: required(sessionId, "sessionId"),
         sessionIncarnation: required(sessionIncarnation, "sessionIncarnation"),
         expectedBindingGeneration: requiredInteger(generation, "expectedBindingGeneration", 1),
-        nonce: required(nonce, "nonce"),
-        // Reaching this command *is* the owner's approval, and the daemon verifies that the actor
-        // behind this connection is an allowlisted owner before it acts. There is deliberately no
-        // `--approved=false` spelling: a rejection is expressed by not running the command.
-        approved: true,
+        // There is no `nonce` and no `approved` here any more. This command used to require both,
+        // with `approved` hard-coded to `true` under a comment saying that reaching the command
+        // *was* the owner's approval — which is the whole argument for deleting them: a field
+        // that can only hold one value, and a nonce whose only job was to make that field's
+        // envelope unique, recorded a decision nobody had made. The generation above is what
+        // keeps a repeat from doing anything, and it did that before these two existed.
       });
     }
     return fail(`unknown binding subcommand: ${sub ?? ""}`);
