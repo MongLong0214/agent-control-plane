@@ -1,6 +1,6 @@
 import type { Socket } from "node:net";
 import { z } from "zod";
-import type { CtoBindingDelegation } from "../ceo/cto-binding-delegation.ts";
+import type { CtoBindingDelegation, CtoReleaseAuthorization } from "../ceo/cto-binding-delegation.ts";
 import { allow, deny, type Decision } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { Db } from "../db/database.ts";
@@ -10,11 +10,18 @@ import type { SessionRegistry } from "../session/session-registry.ts";
 import { probeSessionLiveness } from "./dead-binding-recovery.ts";
 import { readOneJsonLineRequest } from "./local-socket-framing.ts";
 
-const envelope = z.object({ method: z.literal("ctoBinding.bind"),
-  principal: z.object({ sessionId: z.string().min(1).max(256), sessionSecret: z.string().min(1).max(256) }).strict(),
+const principalSchema = z.object({
+  sessionId: z.string().min(1).max(256), sessionSecret: z.string().min(1).max(256) }).strict();
+const envelope = z.object({ method: z.literal("ctoBinding.bind"), principal: principalSchema,
   request: z.object({ requestId: z.string().min(1).max(256),
     projectId: z.string().min(1).max(256), role: z.literal("PRIMARY_CTO"), action: z.literal("bind-or-rebind"),
     targetSessionId: z.string().min(1).max(256), expectedBindingGeneration: z.number().int().positive().safe(),
+  }).strict(),
+}).strict();
+const releaseEnvelope = z.object({ method: z.literal("ctoBinding.release"), principal: principalSchema,
+  request: z.object({ requestId: z.string().min(1).max(256),
+    projectId: z.string().min(1).max(256), role: z.literal("PRIMARY_CTO"), action: z.literal("release"),
+    expectedBindingGeneration: z.number().int().positive().safe(), reason: z.string().min(1).max(512),
   }).strict(),
 }).strict();
 const refused = (): Decision<never> => deny(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, "delegated binding refused", {});
@@ -34,6 +41,43 @@ export class CtoDelegatedBinding {
     db: Db; sessions: SessionRegistry; bindings: BindingRegistry; authority: CtoBindingDelegation;
     target(sessionId: string): AuthenticatedTargetBinding | null;
   }) {}
+
+  /**
+   * Releasing is the half of "add and remove freely" that had no door. It shares this writer's
+   * latch and capacity because it is the same writer against the same registry, and it shares
+   * the authority because the permission is identical: hold the live CEO binding. What it does
+   * not share is the proven-dead precondition — a replacement needs the incumbent gone because
+   * two live runtimes would both believe they hold the role, and a release leaves nobody there.
+   */
+  release(raw: unknown): Decision<CtoReleaseAuthorization> {
+    if (this.#failed) return refused();
+    try { return this.#release(raw); }
+    catch (error) {
+      this.#failed = true;
+      throw error;
+    }
+  }
+
+  #release(raw: unknown): Decision<CtoReleaseAuthorization> {
+    const parsed = releaseEnvelope.safeParse(raw);
+    if (!parsed.success) return refused();
+    const { principal, request } = parsed.data;
+    const { db, bindings, authority } = this.deps;
+    return authority.bindingTransaction(db, () => {
+      const checked = authority.authorizeRelease(principal, request);
+      if (!checked.allowed) return checked;
+      if (this.#observations >= 1024) return refused();
+      db.afterCommit(() => { this.#observations++; });
+      // No second read at a write seam, unlike the bind path below. That recheck exists there
+      // because the executor's `verify` callback runs process probes between authorization and
+      // the write; nothing runs between these two lines, so re-reading the same row in the same
+      // transaction would be a second authority on one fact rather than defence in depth.
+      const revoked = bindings.revoke(`${Role.PRIMARY_CTO}:${request.projectId}`,
+        `CEO delegated release: ${request.reason}`);
+      if (!revoked.allowed) return revoked;
+      return allow(ReasonCode.OK, checked.value);
+    });
+  }
 
   execute(raw: unknown): Decision<RoleBinding> {
     if (this.#failed) return refused();
@@ -111,8 +155,14 @@ export function serveCtoDelegatedBinding(socket: Socket, service: CtoDelegatedBi
   const reply = (decision: Decision<unknown>) => socket.end(JSON.stringify(decision.allowed
     ? { allowed: true, reasonCode: decision.reasonCode, value: decision.value }
     : { allowed: false, reasonCode: decision.reasonCode }) + "\n");
+  // Route on the declared method without narrowing `raw` by assertion: each door re-parses the
+  // whole envelope itself, so a method that does not match one falls through to a strict parse
+  // that refuses it. This peek chooses which parser runs; it never admits anything on its own.
+  const routed = z.object({ method: z.literal("ctoBinding.release") });
   const reader = readOneJsonLineRequest(socket,
     { tooLarge: "request too large", multipleRequests: "one request only", notJson: "invalid JSON" },
-    (raw) => { try { reply(service.execute(raw)); } catch { reply(refused()); } }, reply, 16384);
+    (raw) => { try {
+      reply(routed.safeParse(raw).success ? service.release(raw) : service.execute(raw));
+    } catch { reply(refused()); } }, reply, 16384);
   socket.once("close", () => reader.dispose());
 }

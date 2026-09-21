@@ -111,6 +111,37 @@ describe("CTO binding delegation, authorized by the live CEO binding", () => {
     expect(audit).not.toContain(f.target.sessionSecret!);
   });
 
+  it("releases the binding it names, and the same CEO role is the whole permission", async () => {
+    const f = fixture();
+    await registerFixtureProject(h!, "project-a");
+    const release = { requestId: "release-1", projectId: "project-a", role: "PRIMARY_CTO",
+      action: "release", expectedBindingGeneration: 1, reason: "the CTO seat is being emptied" };
+    // Nothing to release yet: a release names a binding, and naming one that is not there is
+    // refused rather than treated as "already in the desired state".
+    expect(f.authority.authorizeRelease(f.principal, release).allowed).toBe(false);
+    value(f.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: "project-a", sessionId: f.target.sessionId }));
+    // The incumbent is READY and its process is alive. Rebinding would refuse that; releasing is
+    // exactly the operation that is supposed to work on a live incumbent, so it is asserted here.
+    expect(f.cp.sessions.get(f.target.sessionId)?.lifecycle).toBe(SessionLifecycle.READY);
+    const receipt = value(f.authority.authorizeRelease(f.principal, release));
+    expect(receipt.releasedSessionId).toBe(f.target.sessionId);
+    // Deciding is not writing, the same way it is not for a bind.
+    expect(f.cp.bindings.active(CTO_KEY)?.sessionId).toBe(f.target.sessionId);
+    // A generation other than the live one is refused: a release that meant "whoever is there"
+    // would silently win a race against a rebind it never saw.
+    expect(f.authority.authorizeRelease(f.principal, { ...release, requestId: "release-2",
+      expectedBindingGeneration: 2 }).allowed).toBe(false);
+    // Same requestId, changed request: refused, not re-decided.
+    expect(f.authority.authorizeRelease(f.principal, { ...release, reason: "a different reason" }).allowed).toBe(false);
+    expect(value(f.authority.authorizeRelease(f.principal, release))).toEqual(receipt);
+    // Losing the CEO role loses this door too, and no separate revocation was needed to do it.
+    value(f.cp.bindings.revoke(Role.CEO, "the CEO seat is vacated"));
+    expect(f.authority.authorizeRelease(f.principal, release).allowed).toBe(false);
+    expect(f.authority.authorizeRelease({ ...f.principal, sessionSecret: "wrong" }, release).allowed).toBe(false);
+    expect(f.cp.audit.byKind("CTO_BINDING_RELEASE_AUTHORIZED")).toHaveLength(1);
+    expect(JSON.stringify(f.cp.audit.all())).not.toContain("OWNER_APPROVAL");
+  });
+
   it("refuses a CEO session that is not READY and a target that is not READY", () => {
     const f = fixture();
     value(f.cp.sessions.transition(f.target.sessionId, SessionLifecycle.STOPPED));

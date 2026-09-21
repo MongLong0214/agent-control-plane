@@ -40,8 +40,18 @@ async function fixture() {
     // Trusted executor test seam; target authentication is simulated, never claimed as production attestation.
     target: (sessionId) => {
       const claimed = { executorKind: "claude-cli", targetLocator: sessionId, targetLocatorDigest: digestOf(sessionId) };
-      return { claimed, protocolVersion: "fixture/v1", attestationDigest: digestOf(claimed),
-        verify: (tuple) => { controls.beforeVerify(); return controls.confirmTarget && tuple.sessionId === sessionId ? claimed : null; } };
+      // Both production targets digest the tuple they verified, so the digest differs per
+      // generation. This fixture used a constant one, and `actor_target_attestations_no_replace`
+      // refuses a repeated (target_binding_id, attestation_digest) pair — so any second bind of
+      // the *same* session aborted with ACTOR_TARGET_ATTESTATION_NO_REPLACE. No case had ever
+      // rebound one session before, so the fixture's shortcut read as a control-plane rule.
+      let attestationDigest = digestOf(claimed);
+      return { claimed, protocolVersion: "fixture/v1",
+        get attestationDigest() { return attestationDigest; },
+        verify: (tuple) => { controls.beforeVerify();
+          if (!controls.confirmTarget || tuple.sessionId !== sessionId) return null;
+          attestationDigest = digestOf({ ...tuple, target: claimed });
+          return claimed; } };
     } });
   const path = join(h.root, "binding.sock");
   server = createServer((socket) => serveCtoDelegatedBinding(socket, service));
@@ -56,11 +66,12 @@ async function fixture() {
   const request = (sessionId: string, generation: number) => ({
     requestId: randomUUID(), projectId: "project-a", role: "PRIMARY_CTO", action: "bind-or-rebind",
     targetSessionId: sessionId, expectedBindingGeneration: generation });
-  async function rpc(request: unknown, who: unknown = principal): Promise<Decision<Record<string, unknown>>> {
+  async function rpc(request: unknown, who: unknown = principal,
+    method = "ctoBinding.bind"): Promise<Decision<Record<string, unknown>>> {
     const client = createConnection(path); client.setTimeout(5000, () => client.destroy(new Error("fixture timeout")));
     const done = new Promise<string>((resolve, reject) => { let text = "";
       client.on("data", (chunk) => { text += chunk.toString(); }); client.on("end", () => resolve(text)); client.on("error", reject); });
-    client.end(JSON.stringify({ method: "ctoBinding.bind", principal: who, request }) + "\n");
+    client.end(JSON.stringify({ method, principal: who, request }) + "\n");
     return JSON.parse(await done) as Decision<Record<string, unknown>>;
   }
   return { cp, authority, principal, service, request, rpc, target, controls };
@@ -106,6 +117,30 @@ it("rejects wrong principal/shape/target and two concurrent requests cannot both
   expect(results.filter((r) => r.allowed)).toHaveLength(1);
   expect(f.cp.bindings.history("PRIMARY_CTO:project-a")).toHaveLength(1);
   expect(JSON.stringify(f.cp.audit.all())).not.toContain(f.principal.sessionSecret);
+}, 15000);
+
+// The bind cases above all need a proven-dead incumbent before the role can move. This one does
+// not kill anything: the child stays alive for the whole test, which is the point of a release.
+it("releases a live incumbent over the socket, and a stale generation is refused", async () => {
+  const f = await fixture();
+  const first = await f.target();
+  value(await f.rpc(f.request(first.session.sessionId, 1)));
+  expect(f.cp.bindings.activePrimaryCto("project-a")?.sessionId).toBe(first.session.sessionId);
+  const release = (generation: number, who: unknown = f.principal) => f.rpc({ requestId: randomUUID(),
+    projectId: "project-a", role: "PRIMARY_CTO", action: "release",
+    expectedBindingGeneration: generation, reason: "the owner is done with this session" },
+    who, "ctoBinding.release");
+  expect((await release(2)).allowed).toBe(false);
+  expect((await release(1, { ...f.principal, sessionSecret: "wrong" })).allowed).toBe(false);
+  expect(first.child.exitCode).toBeNull();
+  expect(value(await release(1))).toMatchObject({ releasedSessionId: first.session.sessionId });
+  expect(f.cp.bindings.activePrimaryCto("project-a")).toBeNull();
+  // Releasing ends generation 1; it does not rewind the counter. The next bind is generation 2,
+  // and a session can be bound again after being released, which is the "freely" half.
+  expect((await f.rpc(f.request(first.session.sessionId, 1))).allowed).toBe(false);
+  const rebound = value(await f.rpc(f.request(first.session.sessionId, 2)));
+  expect(rebound).toMatchObject({ sessionId: first.session.sessionId, bindingGeneration: 2 });
+  expect(JSON.stringify(f.cp.audit.all())).not.toContain("OWNER_APPROVAL");
 }, 15000);
 
 it("failed target attestation rolls back dead incumbent revoke, then the identical request can commit", async () => {

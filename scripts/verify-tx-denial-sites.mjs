@@ -159,6 +159,10 @@ const EXPECTED_CONVERTED_SITES = [
   // body nor a semantic owner and never counted it. Removing the owner gate collapsed that helper,
   // and the site became first-class. A generic transaction wrapper is a way to be invisible here.
   { file: "ceo/cto-binding-delegation.ts", symbol: "authorize", label: "CtoBindingDelegation.authorize", evidence: "direct" },
+  // The removing door, which writes CTO_BINDING_RELEASE_AUTHORIZED and can refuse after it for
+  // exactly the same reason the binding door can: the audit write is what makes the refusal
+  // observable, so a `tx` here would keep a row describing an authorization that never happened.
+  { file: "ceo/cto-binding-delegation.ts", symbol: "authorizeRelease", label: "CtoBindingDelegation.authorizeRelease", evidence: "direct" },
   { file: "session/binding-registry.ts", symbol: "bind", label: "BindingRegistry.bind", evidence: "direct" },
   { file: "session/binding-registry.ts", symbol: "switchTo", label: "BindingRegistry.switchTo", evidence: "direct" },
   { file: "run/task-graph.ts", symbol: "finishExecution", label: "TaskGraph.finishExecution (post-preflight)", evidence: "direct" },

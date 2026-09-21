@@ -1114,6 +1114,19 @@ const groups = [
     operands: [
       ["!principal.success",1],
       ["!parsed.success",1],
+      // Occurrence 2 is the release door, which parses the same principal against its own request
+      // schema and reads `.data` from both the same way. The debt is the identical one, so it is
+      // listed under the identical reason rather than given a second wording that could drift.
+      ["!principal.success",2],
+      ["!parsed.success",2],
+    ],
+  },
+  {
+    file: "src/ceo/cto-binding-delegation.ts",
+    // the release's "there is a binding to remove" guard
+    reason: "TYPESCRIPT IS THE GUARD, not a test. `bindings.active(roleKey)` returns `RoleBinding | null`, and the operand beside this one reads `current.bindingGeneration` while the body below reads `current.sessionId`. Removing `!current` leaves those reads on a possibly-null value and the mutant fails to typecheck (measured: four TS18047 errors, at the sibling comparison and at all three later reads), so a row claiming a test proves it would be claiming the wrong thing. The behaviour itself is witnessed — `tests/unit/cto-binding-delegation.test.ts::releases the binding it names` asks for a release before anything is bound and requires a refusal — but that case is killed by the sibling generation comparison too, so it does not isolate this operand.",
+    operands: [
+      ["!current",1],
     ],
   },
 ];
