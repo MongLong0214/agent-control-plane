@@ -1,0 +1,8 @@
+Limit: authorization widened from one project to every project the caller is CEO for; the grant it replaces was cut per-project and refused every other, and a live role binding carries no project scope to inherit
+Limit: CtoDelegatedBinding's #failed latch is irreversible, so any request that authorizes and then throws at bindings.bind refuses every later call on that writer; a per-project refusal case that stopped being a refusal is how the widening first showed itself
+Ruled-out: deleting delegation-operator-object-params-are-admissible with the grant it was written against | that row alone retires three UNANSWERED refusal-operand debts; operatorRequestParams is still reached from the bootstrap.hermes branch, so the row was retargeted there and the debts stayed retired
+Ruled-out: keeping a per-project scope on the authorization by re-deriving it from the request | the scope existed because a minted grant had to name what it was cut for; reading the live CEO binding has no such object, and re-deriving one would be a second authority restating the binding registry
+Warn: a generic transaction wrapper hides its site from the tx-denial census: this txDecision was previously reached through #ownedTransaction, whose own line passed a parameter as the body, so the census could resolve neither a body nor an owner and never counted it
+Warn: the partial-timestamp-orderings exclusion is keyed to a line number, so any edit above it goes stale; it has now moved on three separate changes for that one reason and the mechanism is the key, not any of those changes
+Record-Id: r-4e5b3538b978
+Provenance: inherited 5c5309f6b080e9519fb169bbc47ee4ad5dbffc9c
