@@ -231,7 +231,6 @@ export const OPERATOR_METHOD = {
   CONTINUITY_STATUS: "continuity.status",
   OUTBOX_RETRY: "outbox.retry",
   OWNER_APPROVE: "owner.approve",
-  OWNER_APPROVE_ROLE_ATTACHMENT: "owner.approveRoleAttachment",
   ROLE_ATTACHMENT_ISSUE: ROLE_ATTACHMENT_OPERATION,
   ROLE_ATTACHMENT_REVOKE: "roleAttachment.revoke",
   /**
@@ -267,7 +266,6 @@ export const OPERATOR_MUTATION_METHODS: ReadonlySet<OperatorMethod> = new Set([
   OPERATOR_METHOD.RUN_CANCEL,
   OPERATOR_METHOD.OUTBOX_RETRY,
   OPERATOR_METHOD.OWNER_APPROVE,
-  OPERATOR_METHOD.OWNER_APPROVE_ROLE_ATTACHMENT,
   OPERATOR_METHOD.ROLE_ATTACHMENT_ISSUE,
   OPERATOR_METHOD.ROLE_ATTACHMENT_REVOKE,
   OPERATOR_METHOD.BINDING_RECOVER_DEAD,
@@ -537,7 +535,7 @@ export class Daemon {
     mkdirSync(options.stateDir, { recursive: true });
     chmodSync(options.stateDir, 0o700);
     this.lock = new SingleInstanceLock(join(options.stateDir, "agentcpd.lock"));
-    this.attachments = new RoleAttachmentCredentials(cp.sessions, cp.bindings, cp.ownerAuthority, cp.clock);
+    this.attachments = new RoleAttachmentCredentials(cp.sessions, cp.bindings, cp.clock);
     this.#finalizer = new ApprovedRunFinalizer(cp, undefined, authorities);
     this.#evidenceExporter = new RunEvidenceExporter(cp.db, cp.artifacts, cp.clock, cp.audit);
   }
@@ -733,23 +731,6 @@ export class Daemon {
 
         case OPERATOR_METHOD.OWNER_APPROVE:
           return this.executeOwnerApproval(request, peer);
-
-        case OPERATOR_METHOD.OWNER_APPROVE_ROLE_ATTACHMENT: {
-          const sessionId = requiredOperatorString(request.params, "sessionId");
-          if (!sessionId.allowed) return sessionId;
-          const roleKey = requiredOperatorString(request.params, "roleKey");
-          if (!roleKey.allowed) return roleKey;
-          const nonce = requiredOperatorString(request.params, "nonce");
-          if (!nonce.allowed) return nonce;
-          const approved = request.params["approved"];
-          if (typeof approved !== "boolean") return invalidOperatorParam("approved", approved);
-          const scope = this.attachments.scope(sessionId.value, roleKey.value);
-          if (!scope.allowed) return scope;
-          return this.admitCliOwnerApproval(peer.actor, {
-            runId: null, candidateSnapshotDigest: null, operation: ROLE_ATTACHMENT_OPERATION,
-            parameters: scope.value, idempotencyKey: request.idempotencyKey ?? nonce.value, approved,
-          }, nonce.value);
-        }
 
         case OPERATOR_METHOD.ROLE_ATTACHMENT_ISSUE:
           return this.attachments.issue(request.params);

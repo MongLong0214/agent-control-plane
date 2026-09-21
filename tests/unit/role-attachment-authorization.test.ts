@@ -6,14 +6,13 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import ts from "typescript";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { OwnerApprovalReceipt } from "../../src/ceo/owner-authority.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { type Decision, allow } from "../../src/core/errors.ts";
 import { approvalSchema, type AttachmentCredential } from "../../src/session/role-attachment-credentials.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
-import { ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
-import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
+import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { IngressGuard } from "../../src/ingress/ingress-guard.ts";
 import { CanonicalSelfClaim } from "../../src/registry/canonical-self-claim.ts";
 import { RoleConversationPort } from "../../src/mcp/role-conversation.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -35,21 +34,10 @@ describe("role attachment authorization without sockets", () => {
   const operator = { channel: "cli", actor: TEST_OWNER.actor, peerId: "test-owner", incarnation: "test" } as const;
   const request = (method: string, params: Record<string, unknown>) =>
     daemon.handleOperatorRequest({ requestId: randomUUID(), idempotencyKey: randomUUID(), method, params }, operator);
-  const approval = (overrides: Partial<{ approved: boolean; operation: string; parameters: unknown; runId: string }> = {}) => {
-    const binding = h.cp.bindings.active(roleKey)!;
-    const decision = {
-      runId: null, candidateSnapshotDigest: null, operation: "roleAttachment.issue",
-      parameters: { sessionId: subject.sessionId, sessionIncarnation: binding.sessionIncarnation,
-        roleKey, assignmentId: binding.assignmentId, bindingGeneration: binding.bindingGeneration },
-      idempotencyKey: randomUUID(), approved: true,
-      ...overrides,
-    };
-    const guard = new IngressGuard(h.cp.db, h.clock, h.cp.audit, { cli: { allowedActors: [TEST_OWNER.actor] } });
-    return valueOf(guard.admitOwnerApproval({ channel: "cli", actor: TEST_OWNER.actor,
-      nonce: randomUUID(), payload: ownerApprovalPayload(decision) }, decision));
-  };
-  const issue = (receipt = approval(), overrides = {}) =>
-    daemon.attachments.issue({ ...subject, roleKey, approval: receipt, ...overrides });
+  // Issuance carries no owner decision: `verifySecret` and the live-holder `scope()` are the
+  // whole of what authorizes it, so an override here is an override of the subject or the role.
+  const issue = (overrides: Record<string, unknown> = {}) =>
+    daemon.attachments.issue({ ...subject, roleKey, ...overrides });
   const grant = () => valueOf(issue());
   const server = () => new McpServer({ name: "attachment-test", version: "1" });
   const ready = (incarnation?: string) => {
@@ -87,19 +75,8 @@ describe("role attachment authorization without sockets", () => {
     cleanupTempDirs();
   });
 
-  it("an explicit owner decision is admitted for the ACTIVE registry generation", async () => {
-    const result = await request("owner.approveRoleAttachment", {
-      sessionId: subject.sessionId, roleKey, nonce: randomUUID(), approved: true,
-    });
-    expect(result.allowed, JSON.stringify(result)).toBe(true);
-    const receipt = valueOf(result) as OwnerApprovalReceipt;
-    expect(receipt).toMatchObject({ approved: true, operation: "roleAttachment.issue", runId: null,
-      parameterDigest: digestOf(valueOf(daemon.attachments.scope(subject.sessionId, roleKey))) });
-    expect(h.cp.ownerAuthority.assertApproval(receipt).allowed).toBe(true);
-  });
-
-  it("session authentication and an admitted owner approval issue a separate attachment credential", async () => {
-    const result = await request("roleAttachment.issue", { ...subject, roleKey, approval: approval() });
+  it("session authentication alone issues a separate attachment credential", async () => {
+    const result = await request("roleAttachment.issue", { ...subject, roleKey });
     expect(result.allowed, JSON.stringify(result)).toBe(true);
     const credential = valueOf(result) as { attachmentSecret: string };
     expect(credential.attachmentSecret).toEqual(expect.any(String));
@@ -142,11 +119,10 @@ describe("role attachment authorization without sockets", () => {
     subject = { sessionId: successor.sessionId, sessionSecret: successor.sessionSecret! };
     expect(h.cp.db.get(`SELECT actor_id FROM assignments WHERE assignment_id = ?`, [successor.binding.assignmentId])).toEqual(actor);
     expect(daemon.attachments.authorize(oldCredential).allowed).toBe(false);
-    const receipt = approval();
-    expect(issue(receipt, oldSubject).allowed).toBe(false);
-    expect(issue(receipt, ready()).allowed).toBe(false);
-    expect(issue(receipt, { roleKey: "CEO" }).allowed).toBe(false);
-    const credential = valueOf(issue(receipt));
+    expect(issue(oldSubject).allowed).toBe(false);
+    expect(issue(ready()).allowed).toBe(false);
+    expect(issue({ roleKey: "CEO" }).allowed).toBe(false);
+    const credential = valueOf(issue());
     expect(credential.sessionId).toBe(successor.sessionId);
     expect(credential.bindingGeneration).toBe(3);
     expect(daemon.attachments.authorize(credential).allowed).toBe(true);
@@ -193,6 +169,54 @@ describe("role attachment authorization without sockets", () => {
     expect(port.currentHolderConnected(roleKey)).toBe(true);
   });
 
+  it("a later issuance sweeps unattached credentials whose first-use window has closed", () => {
+    // Issuance is repeatable now that no owner decision bounds it, so the expired records have to
+    // be reaped by something other than a caller re-presenting the exact credential that expired
+    // — which is the one thing a caller who has already re-issued never does. The sweep runs on
+    // the next issuance, so this asserts the *retained* record is gone, not merely that the
+    // credential is refused: `authorize` would refuse an expired record either way.
+    const stale = grant();
+    h.clock.advance(60_001);
+    const fresh = grant();
+    expect(daemon.attachments.authorize(fresh).allowed).toBe(true);
+    // Reviving the clock cannot bring `stale` back, because its record no longer exists.
+    h.clock.advance(-60_001);
+    expect(daemon.attachments.authorize(stale)).toMatchObject({
+      allowed: false, message: "attachment credential is unknown or invalid",
+    });
+  });
+
+  it("a later issuance spares an unattached credential still inside its window", () => {
+    const first = grant();
+    h.clock.advance(59_999);
+    grant();
+    expect(daemon.attachments.authorize(first).allowed).toBe(true);
+  });
+
+  it("an established attachment survives a later issuance's sweep", () => {
+    const attached = grant();
+    valueOf(daemon.attachments.connect(server(), port, attached));
+    h.clock.advance(60_001);
+    grant();
+    expect(daemon.attachments.authorize(attached).allowed).toBe(true);
+    expect(port.currentHolderConnected(roleKey)).toBe(true);
+  });
+
+  it("the owner-approval normal form declares exactly the receipt's fields", () => {
+    // Interfaces are erased at runtime. Derive their keys from the real declaration with the type
+    // checker, including optional/inherited fields, rather than a second field list. The schema
+    // is no longer read by attachment issuance; `src/ceo/cto-binding-delegation.ts` is its only
+    // consumer, and this witness moves with the declaration when that path goes.
+    const path = fileURLToPath(new URL("../../src/ceo/owner-authority.ts", import.meta.url));
+    const program = ts.createProgram([path], { types: [], noEmit: true });
+    const checker = program.getTypeChecker();
+    const module = checker.getSymbolAtLocation(program.getSourceFile(path)!)!;
+    const declaration = checker.getExportsOfModule(module).find((symbol) => symbol.name === "OwnerApprovalReceipt")!;
+    const receiptFields = checker.getPropertiesOfType(checker.getDeclaredTypeOfSymbol(declaration))
+      .map((symbol) => symbol.name).sort();
+    expect(Object.keys(approvalSchema.shape).sort()).toEqual(receiptFields);
+  });
+
   it("attach takes an empty slot and a later detach cannot evict its incumbent", () => {
     const auth = () => allow(ReasonCode.OK, { actor: subject.sessionId, ...subject,
       sessionIncarnation: h.cp.sessions.require(subject.sessionId).incarnation });
@@ -222,17 +246,15 @@ describe("role attachment authorization without sockets", () => {
     expect(port.connected(roleKey)).toBe(false);
   });
 
-  it("issuance rejects a wrong session secret without spending the approval", () => {
-    const receipt = approval();
-    expect(issue(receipt, { sessionSecret: "wrong" }).allowed).toBe(false);
-    expect(issue(receipt).allowed).toBe(true);
+  it("issuance rejects a wrong session secret", () => {
+    expect(issue({ sessionSecret: "wrong" }).allowed).toBe(false);
+    expect(issue().allowed).toBe(true);
   });
 
-  it("another authenticated subject cannot spend the holder approval", () => {
-    const receipt = approval();
+  it("another authenticated subject cannot issue against the holder's role", () => {
     const other = ready();
-    expect(issue(receipt, other).allowed).toBe(false);
-    expect(issue(receipt).allowed).toBe(true);
+    expect(issue(other).allowed).toBe(false);
+    expect(issue().allowed).toBe(true);
   });
 
   it("scope refuses a non-primary binding before any port can filter its role", () => {
@@ -300,123 +322,21 @@ describe("role attachment authorization without sockets", () => {
     }
   });
 
-  it("missing and forged decisions cannot authorize issuance", () => {
-    const receipt = approval();
-    expect(issue(receipt, { approval: undefined }).allowed).toBe(false);
-    expect(issue({ ...receipt, inboundNonce: "unadmitted" }).allowed).toBe(false);
-    expect(issue(receipt).allowed).toBe(true);
-  });
-
-  it("an admitted rejection cannot issue a credential", () => {
-    expect(issue(approval({ approved: false })).allowed).toBe(false);
-  });
-
-  it("approval for another operation cannot issue a credential", () => {
-    expect(issue(approval({ operation: "actor.claimCanonicalCto" })).allowed).toBe(false);
-  });
-
-  it("an otherwise valid run-bound approval cannot issue an attachment", () => {
-    const run = valueOf(h.cp.runs.create({ projectId: "attachment-project", executionMode: ExecutionMode.STANDARD,
-      contract: { goal: "attachment scope", why: "isolate the run-bound refusal", scope: [], nonGoals: [],
-        acceptance: ["run approvals cannot issue attachments"], priority: "NORMAL", humanGate: [], references: [] } }));
-    const receipt = approval({ runId: run.runId });
-    expect(h.cp.ownerAuthority.assertApproval(receipt).allowed).toBe(true);
-    const consume = vi.spyOn(h.cp.ownerAuthority, "consumeApproval");
-    try {
-      expect(issue(receipt)).toMatchObject({ allowed: false,
-        reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-        message: "owner decision must approve this attachment generation" });
-      expect(consume).not.toHaveBeenCalled();
-      expect(h.cp.ownerAuthority.consumeApproval(receipt, null).allowed).toBe(true);
-      expect(issue().allowed).toBe(true);
-    } finally {
-      consume.mockRestore();
-    }
-  });
-
-  it("only an explicitly deciding authenticated owner can mint approval", async () => {
-    const params = { sessionId: subject.sessionId, roleKey, nonce: randomUUID() };
-    expect((await request("owner.approveRoleAttachment", params)).allowed).toBe(false);
-    expect((await daemon.handleOperatorRequest({ requestId: randomUUID(), method: "owner.approveRoleAttachment",
-      params: { ...params, approved: true } }, { ...operator, actor: "not-owner" })).allowed).toBe(false);
-    expect((await daemon.handleOperatorRequest({ requestId: randomUUID(), method: "owner.approveRoleAttachment",
-      params: { ...params, approved: true } })).allowed).toBe(false);
-    expect((await request("owner.approveRoleAttachment", { ...params, approved: true })).allowed).toBe(true);
-  });
-
-  it("one admitted approval issues only one credential", () => {
-    const receipt = approval();
-    expect(issue(receipt).allowed).toBe(true);
-    expect(issue(receipt).allowed).toBe(false);
-  });
-
-  it("unknown approval fields cannot create a second consumption", () => {
-    const receipt = approval();
-    expect(h.cp.ownerAuthority.assertApproval(receipt).allowed).toBe(true);
-    expect(issue(receipt).allowed).toBe(true);
-    const extendedReceipt = { ...receipt, ignored: "x" };
-    const retry = issue(extendedReceipt);
-    expect({ allowed: retry.allowed, consumptions: h.cp.db.all(
-      "SELECT * FROM audit_events WHERE kind = 'OWNER_APPROVAL_CONSUMED'",
-    ).length }).toEqual({ allowed: false, consumptions: 1 });
-  });
-
-  it("approval schema matches declared keys and consumption proves the same normal-form object", () => {
-    // Interfaces are erased at runtime. Derive their keys from the real declaration with
-    // the type checker, including optional/inherited fields, rather than a second field list.
-    const path = fileURLToPath(new URL("../../src/ceo/owner-authority.ts", import.meta.url));
-    const program = ts.createProgram([path], { types: [], noEmit: true });
-    const checker = program.getTypeChecker();
-    const module = checker.getSymbolAtLocation(program.getSourceFile(path)!)!;
-    const declaration = checker.getExportsOfModule(module).find((symbol) => symbol.name === "OwnerApprovalReceipt")!;
-    const receiptFields = checker.getPropertiesOfType(checker.getDeclaredTypeOfSymbol(declaration))
-      .map((symbol) => symbol.name).sort();
-    expect(Object.keys(approvalSchema.shape).sort()).toEqual(receiptFields);
-
-    const receipt = approval();
-    const owner = h.cp.ownerAuthority;
-    // Identity and key equality do not establish which fields the proof depends on.
-    const proof = vi.spyOn(owner, "assertApproval");
-    const consumption = vi.spyOn(owner, "consumeApproval");
-    try {
-      // An extended first presentation must succeed after stripping, not be rejected.
-      const extendedReceipt = { ...receipt, ignored: "caller metadata" };
-      expect(issue(extendedReceipt).allowed).toBe(true);
-      expect(consumption).toHaveBeenCalledExactlyOnceWith(receipt, null);
-      const consumed = consumption.mock.calls[0]![0];
-      expect(consumed).toStrictEqual(receipt);
-      expect(Object.keys(consumed).sort()).toEqual(receiptFields);
-      expect(proof).toHaveBeenCalledExactlyOnceWith(consumed);
-      expect(proof.mock.calls[0]![0]).toBe(consumed);
-      expect(proof.mock.results[0]!.value.allowed).toBe(true);
-      const records = h.cp.db.all<{ evidence_json: string }>(
-        "SELECT evidence_json FROM audit_events WHERE kind = 'OWNER_APPROVAL_CONSUMED'",
-      );
-      expect(records).toHaveLength(1);
-      expect(JSON.parse(records[0]!.evidence_json).receiptDigest).toBe(digestOf(consumed));
-    } finally {
-      proof.mockRestore();
-      consumption.mockRestore();
-    }
-  });
-
   it("operator retries never re-serve a plaintext attachment credential", async () => {
     const input = { requestId: randomUUID(), idempotencyKey: randomUUID(), method: "roleAttachment.issue",
-      params: { ...subject, roleKey, approval: approval() } };
+      params: { ...subject, roleKey } };
     const first = await daemon.handleOperatorRequest(input, operator);
     expect(first.allowed).toBe(true);
     const retry = await daemon.handleOperatorRequest(input, operator);
-    expect(retry.allowed).toBe(false);
+    // The retry is answered by issuing again, never from the operator idempotency cache. That
+    // cache exclusion is the property; the refusal this line used to assert was a side effect of
+    // the owner decision being single-use, and with the decision gone there is nothing left to
+    // refuse a caller who already proved the session secret. What must still hold is that the
+    // first answer's plaintext never appears in the second.
+    expect(retry.allowed, JSON.stringify(retry)).toBe(true);
     expect(JSON.stringify(retry)).not.toContain((valueOf(first) as AttachmentCredential).attachmentSecret);
-  });
-
-  it("approval cannot follow a holder into a new registry generation", () => {
-    const receipt = approval();
-    advance();
-    valueOf(h.cp.bindings.switchTo({ role: Role.PRIMARY_CTO, projectId: "attachment-project",
-      ...subject, conversation: "REPLACED", reason: "return to original subject" }));
-    expect(issue(receipt).allowed).toBe(false);
-    expect(issue().allowed).toBe(true);
+    expect((valueOf(retry) as AttachmentCredential).attachmentId)
+      .not.toBe((valueOf(first) as AttachmentCredential).attachmentId);
   });
 
   it("authorization rejects a wrong attachment secret", () => {
@@ -594,7 +514,8 @@ describe("role attachment authorization without sockets", () => {
     });
     const credentials = keys.map((key) => {
       const scope = valueOf(daemon.attachments.scope(subject.sessionId, key));
-      const credential = valueOf(issue(approval({ parameters: scope }), { roleKey: key }));
+      expect(scope.roleKey).toBe(key);
+      const credential = valueOf(issue({ roleKey: key }));
       valueOf(daemon.attachments.connect(server(), port, credential));
       return credential;
     });
@@ -873,12 +794,11 @@ describe("role attachment authorization without sockets", () => {
     expect(daemon.attachments.authorize(credential).allowed).toBe(false);
   });
 
-  it("daemon object reconstruction on the same ControlPlane forgets credentials and retains approval consumption", () => {
-    const receipt = approval();
-    const credential = valueOf(issue(receipt));
+  it("daemon object reconstruction on the same ControlPlane forgets credentials without leaking secrets", () => {
+    const credential = valueOf(issue());
     const fresh = new Daemon(h.cp, { stateDir: tempDir("at-") });
+    // The in-memory record does not survive the new Daemon; the old credential is unknown to it.
     expect(fresh.attachments.authorize(credential).allowed).toBe(false);
-    expect(fresh.attachments.issue({ ...subject, roleKey, approval: receipt }).allowed).toBe(false);
     const stored = JSON.stringify(h.cp.db.all("SELECT * FROM sessions")) +
       JSON.stringify(h.cp.db.all("SELECT * FROM audit_events")) +
       JSON.stringify(h.cp.db.all("SELECT * FROM inbound_messages"));
