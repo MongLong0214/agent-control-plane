@@ -12,7 +12,7 @@ import { readOneJsonLineRequest } from "./local-socket-framing.ts";
 
 const envelope = z.object({ method: z.literal("ctoBinding.bind"),
   principal: z.object({ sessionId: z.string().min(1).max(256), sessionSecret: z.string().min(1).max(256) }).strict(),
-  request: z.object({ delegationId: z.string().uuid(), requestId: z.string().min(1).max(256),
+  request: z.object({ requestId: z.string().min(1).max(256),
     projectId: z.string().min(1).max(256), role: z.literal("PRIMARY_CTO"), action: z.literal("bind-or-rebind"),
     targetSessionId: z.string().min(1).max(256), expectedBindingGeneration: z.number().int().positive().safe(),
   }).strict(),
@@ -20,11 +20,11 @@ const envelope = z.object({ method: z.literal("ctoBinding.bind"),
 const refused = (): Decision<never> => deny(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, "delegated binding refused", {});
 
 /**
- * Daemon-local writer, composed by cto-binding-runtime behind authenticated MCP. Grant provisioning remains on
- * the existing owner-admitted boundary. This port accepts no owner token, receipt or caller
- * supplied target proof. The trusted executor port must authenticate the planned tuple.
- * No async gap is permitted in the binding transaction. Legacy grants and local replay
- * observations die on restart; explicit durable grants use the validated event ledger.
+ * Daemon-local writer, composed by cto-binding-runtime behind authenticated MCP. There is no grant
+ * to provision any more: the authority this asks is whether the caller holds the live CEO binding,
+ * so nothing here mints, stores or expires a permission. This port accepts no owner token, receipt
+ * or caller-supplied target proof. The trusted executor port must authenticate the planned tuple.
+ * No async gap is permitted in the binding transaction. Local replay observations die on restart.
  * Committed bindings persist. A stale retry is refused, not replayed as authority.
  */
 export class CtoDelegatedBinding {
@@ -53,7 +53,7 @@ export class CtoDelegatedBinding {
     if (!parsed.success) return refused();
     const { principal, request } = parsed.data;
     const { db, sessions, bindings, authority } = this.deps;
-    return authority.bindingTransaction(db, principal, request, () => {
+    return authority.bindingTransaction(db, () => {
       // The foundation's result is an observation, never accepted as an input permit.
       const checked = authority.authorize(principal, request);
       if (!checked.allowed) return checked;
