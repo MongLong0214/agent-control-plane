@@ -104,13 +104,37 @@ jobs:
       - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
         with:
           version: 10
+      # A bootstrap Node, not the leg's. The CommitLore installer `pnpm ci:commitlore` runs refuses
+      # anything below 22.23.2 (`NODE_MAJOR_MIN`/`NODE_MINOR_MIN`/`NODE_PATCH_MIN` in its
+      # `install.sh`, enforced with a hard `die`), and this matrix's lower leg is 22.18.0 — so
+      # installing after the leg's own `setup-node` would fail that leg deterministically, on the
+      # exact version the leg exists to test. Raising `engines.node` to suit a tool is the wrong
+      # direction: 22.18.0 is this repository's declared floor, found empirically (ADR-0010).
+      #
+      # Installing under a Node of its own is safe because the wrapper the installer writes records
+      # that Node's *absolute path*, so changing the runtime underneath it afterwards does not
+      # break it. No `cache: pnpm`: nothing is installed under this Node, and a cache keyed to a
+      # Node no gate runs under is one the leg would have to discard.
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: 22.23.2
+      # Dependency-free and first: the same working-tree check as pre-commit catches a workflow
+      # package-script mismatch or invalid Bash before install and the test matrix spend minutes.
+      - run: pnpm ci:preflight
+      # `pnpm trailers` spawns `commitlore` to judge a message carrying more than one record: SPEC
+      # §2.4 recovers separate identified record paragraphs, and git's trailer parser, which reads
+      # only the last one, is not that authority. A hosted runner has no such program, so the spawn
+      # raises ENOENT and the check reports "multi-record semantic validation failed or could not
+      # run" — the same words a malformed message gets. Measured on `507ad977` with one variable
+      # changed: with the CLI on PATH the range passes; with it absent the failure is byte-identical
+      # to the one this job produced. `commitlore-preserve.yml` installs it and already wrote the
+      # lesson down — "so a resolution failure is reported as one rather than as 'cannot parse the
+      # merge message'" — and nothing propagated it to the job that runs the gate.
+      - run: pnpm ci:commitlore
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
           node-version: ${{ matrix.node-version }}
           cache: pnpm
-      # Dependency-free and first: the same working-tree check as pre-commit catches a workflow
-      # package-script mismatch or invalid Bash before install and the test matrix spend minutes.
-      - run: pnpm ci:preflight
       - run: pnpm install --frozen-lockfile
       - run: pnpm rebuild better-sqlite3
       # ADR-0010: this repository's own binding.gyp + node-addon-api convention for native

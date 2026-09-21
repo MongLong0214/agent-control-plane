@@ -187,6 +187,10 @@ export const CI_SETUP_COMMANDS = new Map([
     "pnpm notes:fetch",
     "brings refs/notes/commitlore into the checkout; `pnpm trailers` reads both the message and the note, and `actions/checkout` fetches no notes ref",
   ],
+  [
+    "pnpm ci:commitlore",
+    "puts the pinned CommitLore CLI on PATH; `pnpm trailers` spawns it to judge a message carrying more than one record, and a hosted runner has none, so 507ad977 was reported as a lost trailer rather than as a missing program",
+  ],
 ]);
 
 /**
