@@ -3,7 +3,6 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypt
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-import type { OwnerApprovalReceipt } from "../ceo/owner-authority.ts";
 import { type Clock, isoPlus } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
@@ -50,13 +49,6 @@ interface AttachmentRecord {
 }
 
 const subjectSchema = z.object({ sessionId: z.string().min(1), sessionSecret: z.string().min(1) });
-// This is strip-normalisation, not rejection: callers may send extra fields, which are discarded.
-// Authorization and single-use consumption receive only this normal form of OwnerApprovalReceipt.
-export const approvalSchema = z.object({
-  channel: z.string(), actor: z.string(), inboundNonce: z.string(), runId: z.string().nullable(),
-  candidateSnapshotDigest: z.string().nullable(), operation: z.string(), parameterDigest: z.string(),
-  idempotencyKey: z.string(), approved: z.boolean(),
-}) satisfies z.ZodType<OwnerApprovalReceipt>;
 const issueSchema = subjectSchema.extend({ roleKey: z.string().min(1) });
 const credentialSchema = z.object({
   attachmentId: z.string().min(1), attachmentSecret: z.string().min(1),
