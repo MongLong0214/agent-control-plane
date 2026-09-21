@@ -1,9 +1,20 @@
 # Roadmap — one authority, one canonical CEO, then the factory
 
-- **Reconciled:** 2026-08-24
-- **Document base:** `686281a897c44937bd40e1759decd95b76d63f49`
+- **Reconciled:** 2026-09-21 (previously 2026-08-24)
+- **Document base:** `831fe785`; the previous base was `686281a897c44937bd40e1759decd95b76d63f49`.
 - **Purpose:** dependency order and terminal acceptance only; live status remains in the issue tracker.
-- **Owner terminal deadline:** `2026-08-27 09:12 KST` (72-hour program war room; acceptance unchanged).
+- **Owner terminal deadline:** `2026-08-27 09:12 KST` — **expired, and the program did not stop at
+  it.** The schedule in §4 is kept as the record of a direction that was given, not as a live plan.
+  Nothing below may be read as on-time or overdue against it.
+
+> **Reconciliation note, 2026-09-21.** This document went twenty-eight days without being read
+> against the tracker. In that window **every issue it names as a blocker closed** — all twenty-six
+> of them — and the terminal acceptance list in §7 names two acceptances the owner has since retired
+> by decision. A roadmap whose blockers are all closed and whose gates name retired acceptances is
+> not a dependency order; it is a historical document being read as a current one. Each section
+> below now carries its measured state inline. **Re-derive before acting:**
+> `gh issue list --state open --limit 40 --json number,title` returns **five** issues, and §3 says
+> which.
 
 ## 1. Authority and state model
 
@@ -39,32 +50,70 @@ parallel only when their writable files, symbols, and transaction ownership are 
 
 ## 3. Reconciliation snapshot
 
-At the reconciliation point:
+**Measured 2026-09-21.** The 2026-08-24 column is kept so the movement is visible.
 
-- repository commit: `686281a897c44937bd40e1759decd95b76d63f49`;
-- repository tree: `6e13bcbda40ebe926bf677eb82a8a79df7470b70`;
-- open pull requests: 0;
-- open issues returned by the tracker query: 38;
-- `node scripts/ssot-report.mjs`: PASS;
-- tree-bound evidence freshness: 0 current, 5 stale.
+| | 2026-08-24 | 2026-09-21 |
+|---|---|---|
+| repository commit | `686281a8` | `831fe785` (`origin/main` = `507ad977`) |
+| open pull requests | 0 | **2** — #986 (frozen), #987 (CI hotfix, in review) |
+| open issues | 38 | **5** — #954, #627, #512, #306 (the index), #246 (a separate deliverable) |
+| `node scripts/ssot-report.mjs` | PASS | **PASS** — *"open review issues: 0"*, *"SSOT reconciled"* |
+| evidence freshness | 0 current, 5 stale | **0 current, 6 stale** |
+| suite | — | 3911 tests / 3900 passed / 0 failed / 11 pending, 790 files |
 
 These are timestamped evidence, not counters to maintain by hand.
 
-### Confirmed blockers
+### Confirmed blockers — **every issue this section named is closed**
 
-- Telegram and Buzz do not currently reach one CEO conversational actor. The Buzz bridge path starts
-  its own `hermes acp` child (#627). That is an actor/runtime fork, not a canonical CEO.
-- Buzz addressed-mention delivery is not a durable agent-independent subscription yet (#674).
-- Stable identity, fencing, ingress, reconciliation, outbox, settlement, and crash behavior remain
-  open in #639, #664, #630, #631, #632, #641, #650, #660, #662, #666, and #672–#673.
-- ACP cannot yet prove a disconnected Hermes turn's terminal commit from a durable receipt (#638;
-  upstream #91434), broad writer closure remains open in #675, and #676 checks only inline-SQL
-  direct calls whose TypeScript property symbol is exactly `Db.run`.
-- Canonical live cutover remains owner-gated in #510 and may not run before the receipt, crash, recovery,
-  wrapper-removal, and rollback prerequisites below pass on one integrated candidate.
-- The current evidence manifests are stale, so none authorizes a live cutover.
+The list below is preserved struck through, because deleting it would hide that this document
+asserted these as current for twenty-eight days after they stopped being true.
+
+- ~~Telegram and Buzz do not currently reach one CEO conversational actor. The Buzz bridge path
+  starts its own `hermes acp` child (#627).~~ **#627 is still open but its subject changed.
+  Measured 2026-09-21: `buzz-acp`, `hermes acp` and `ai.hermes.buzz-bridge` are all absent from the
+  process list and from `launchctl`.** The fork is not running — the bridge is down under the
+  owner's standing freeze (*"제출 경로 완성 전 bridge 재기동 금지"*). #627 is an **open design
+  obligation** (nothing in `hermes acp` would prevent a fork if the bridge came back), not a live
+  violation. Do not restate it as one.
+- ~~Buzz addressed-mention delivery is not a durable agent-independent subscription yet (#674).~~
+  **#674 closed 2026-09-13**, traced end to end on durable evidence.
+- ~~Stable identity, fencing, ingress, reconciliation, outbox, settlement, and crash behavior remain
+  open in #639, #664, #630, #631, #632, #641, #650, #660, #662, #666, and #672–#673.~~
+  **All eleven closed** between 2026-08-29 and 2026-09-21 (#631 last, 2026-09-21).
+- ~~ACP cannot yet prove a disconnected Hermes turn's terminal commit from a durable receipt (#638),
+  broad writer closure remains open in #675, and #676…~~ **#638 and #639 closed 2026-09-06; #675
+  closed 2026-08-29; #676 closed 2026-08-30.**
+- ~~Canonical live cutover remains owner-gated in #510…~~ **#510 closed `COMPLETED` 2026-09-15**, and
+  ~~#655~~ with it. The Telegram round trip's design premise was withdrawn on an owner direction
+  (*"봇 공유등 미러링방식은 절대 쓰면 안돼 / 각 세션은 유일해야돼"*), because `getUpdates` allows one
+  consumer per bot and the plan required sharing one.
+- **Still true:** the evidence manifests are stale, so none authorizes a live cutover.
+  `verify-evidence-freshness` reports **0 current, 6 stale** — `e2e-real-project.json` by **462
+  source commits** (it describes `6ea11e6`). Re-derive from a run; do not edit a file to agree.
+
+### What is blocking, 2026-09-21
+
+Three things, and the first is not owner-gated:
+
+1. **Nothing holds a binding.** `~/.agent-control-plane/state.sqlite` → `assignments`: **7 rows,
+   all REVOKED**. CEO since 2026-08-23 (`PROBE_FAILED`); `PRIMARY_CTO` generation 6 since
+   2026-09-16 (*"coverage plan cannot staff the bound role"*). `continuity_state` reads
+   **DEGRADED / FULL_COVERAGE**, evaluated 2026-09-21T02:52Z — full coverage over a role unbound
+   for five days. #975 merged 2026-09-20 (`893d42a7`) and **is deployed** (the live daemon runs
+   `runtime/generation-893d42a`), making the rebind one action per *grant* rather than per
+   *incident*; it has never been used — `audit_events kind LIKE 'CTO_BINDING_DELEGATION%'` returns
+   **0 rows**. See **#954**.
+2. **The ACP↔CEO caller does not exist** (#627). Both endpoints do: Hermes serves a
+   canonical-surface endpoint on `127.0.0.1:8642`, and ACP's `buzz-message.ingress.sock` is open and
+   answers on the same connection.
+3. **Real GitHub writes and real provider calls** for #512, which are owner-gated and unchanged.
 
 ### Exact-source implementation baseline
+
+> **Superseded 2026-09-21.** This was reconnaissance taken on 2026-08-24 and every gap it names has
+> since been built or closed — most of §4's C1–C4 landed through #630, #632, #638, #639, #664, #675
+> and #676. It is kept as the starting point the work was planned from, **not as a description of
+> the current source.** Read the source, or §3's *What is blocking* above.
 
 Current-source reconnaissance found usable primitives but no end-to-end canonical ingress:
 
@@ -85,6 +134,11 @@ seeded existing session/cache/lease. It must not hard-code or rediscover a live 
 
 ### Safety interlock with #638 and #510
 
+> **Discharged 2026-09-21.** #638 and #639 closed 2026-09-06; #664 and #675 closed 2026-08-29; #510
+> closed 2026-09-15. The receipt contract this interlock guarded now exists, so the interlock no
+> longer gates anything. The paragraph stays because the *rule* it states — a receipt, not a process
+> exit, is terminal truth — is still the contract, and §9 depends on it.
+
 A targetless existing-only ingress can be built and proven in disposable state before receipt support,
 but canonical activation cannot. Hermes must first commit the #638 receipt atomically with the final
 assistant row and provide idempotent re-invocation; ACP must then match that receipt through #639 and
@@ -97,6 +151,28 @@ bounded rollback path all pass on one integrated candidate.
 No later acceptance may be declared early merely because its implementation is easier. C1/C2, C3/C4,
 C5, and C6 may use separate writers on explicitly disjoint responsibility units; shared transaction or
 schema files have one integration owner. C7 and C8 remain ordered terminal gates.
+
+> **Measured 2026-09-21 — where the ladder actually stands.** The gate *contracts* below are
+> unchanged and still binding; what changed is that their tracking issues are closed. Closed
+> tracking issues mean **the code exists**, not that the gate was observed — C7 and C8 are
+> observations and neither has been run.
+>
+> | Gate | Tracking issues | State |
+> |---|---|---|
+> | C0 freeze the fork | #596, #627 | #596 closed 2026-08-29. The fork is **not running** (§3). #627 open as a design obligation |
+> | C1 bound-turn kernel | — | built; `buzz-message.ingress.sock` is open and answers on the same connection |
+> | C2 request-local reply sink | — | built |
+> | C3 receipt authority | #638, #639, #664, #675, #676 | **all closed** 2026-08-29 … 2026-09-06 |
+> | C4 admission/settlement/delivery | #630, #631, #632, #641, #650, #660, #662, #666, #672, #673, #693, #695 | **all closed**, #631 last on 2026-09-21 |
+> | C5 bounded rollback | — | not separately tracked; unverified against this list |
+> | C6 model-free Buzz façade | #674, #627 | #674 closed 2026-09-13. **Item 1 below is met; items 2–8 are #627 and are open** |
+> | C7 isolated zero-new-session gate | #655 | #655 closed 2026-09-15, but **the gate has never been run** |
+> | C8 live cutover | #510 | #510 closed 2026-09-15 with its premise withdrawn on owner direction. **Never run** |
+>
+> The honest summary: **C1–C4 are built, C6 is one component short, and C7/C8 are unobserved.**
+> Ahead of all of it is a prerequisite this ladder never listed — see §3, blocker 1: with every
+> assignment REVOKED there is no CEO to route a turn to and no CTO to hand a run to. **#954 is the
+> first step of C6/C7, not a side issue.**
 
 ### C0 — freeze the fork and disposable authority
 
@@ -269,6 +345,11 @@ authorize a direct or force push, destructive deletion, or activation with a fai
 
 ### 72-hour execution checkpoints
 
+> **Expired 2026-08-27, twenty-five days before this reconciliation.** Checkpoints 1-4 were met in
+> substance (C1-C4 are built, §4); 5, 6 and 7 were not run and remain unrun. The schedule is kept as
+> the record of a direction that was given. **It is not a live plan and no item below is "due".**
+> Anyone restating a date from this list as current is repeating the defect §3 documents.
+
 The owner replaced every September checkpoint with this bounded schedule:
 
 1. exact writer map and candidate selection — `2026-08-24 13:12 KST`;
@@ -301,25 +382,53 @@ CommitLore are outside this program. Its Task 7 lane is coordination continuity 
 
 The transition gate is exactly the conjunction of:
 
-1. installed Buzz adapter/CLI purpose contract and live capture PASS;
+1. installed Buzz adapter/CLI purpose contract and live capture PASS —
+   **`evidence/p0-09-buzz-live-delivery.json` records `result: "PARTIAL"`, captured 2026-08-15.
+   Not a PASS.**
 2. #512 full-lifecycle bring-up through `CEO_APPROVED` and daemon finalization; it does not claim
-   #240 ordered two-repository acceptance or #241 observation;
-3. #245's declared owner identities plus one durable owner-decision receipt through that declaration.
+   #240 ordered two-repository acceptance or #241 observation — **#512 open; see §7 for what
+   happened to #240 and #241**;
+3. #245's declared owner identities plus one durable owner-decision receipt through that
+   declaration — **#245 closed 2026-09-11.**
 
 Distinct CEO/CTO conversational Buzz-key binding is a separate Task 7 identity proof and must be tied to
-current binding artifacts; #245 does not prove it by itself.
+current binding artifacts; #245 does not prove it by itself. **Measured 2026-09-21: there are no
+current binding artifacts to tie it to — every assignment is REVOKED (§3).**
 
 #306, #416, #418, #448, and #461—or any historical report—do not substitute for these proofs.
 
 ## 7. Factory completion after transport/identity
 
-1. declared owner identities plus one durable owner-decision receipt (#245);
-2. Repo Factory producer contract (#246);
-3. generated-repository migrations and service-owned integration;
-4. #512 full-lifecycle bring-up through daemon finalization;
-5. ordered two-repository merge acceptance (#240);
-6. observation window across at least three real projects and thirty lifecycles (#241);
-7. final open-issue disposition and fresh independent closeout review.
+> **The acceptance bar was narrowed by owner decision on 2026-08-31, and this roadmap did not record
+> it.** That is the single most consequential correction in this reconciliation, because it changes
+> what "production-ready" means:
+>
+> - **#240** (ordered two-repository merge acceptance) closed **`NOT_PLANNED`** on an owner direction
+>   — *"이 시스템 어차피 나만 내 로컬에서 쓸 거라서"* — with the CEO verdict recorded on the issue:
+>   the ordered-merge **code and tests are preserved**; the live two-repository acceptance is a PRD
+>   artifact with no user, and **resumes if a real multi-repo run appears**.
+> - **#418** (V1-BR-10 baseline minimum) closed `NOT_PLANNED` the same day, folded into #241.
+> - **#241** (observation window) closed **`COMPLETED`** the same day.
+>
+> Items 5 and 6 below are therefore **retired, not achieved**, and no one should schedule work
+> against them. If the owner reinstates multi-repo use, item 5 reopens with its code intact.
+
+1. declared owner identities plus one durable owner-decision receipt (#245) — **closed 2026-09-11**;
+2. Repo Factory producer contract (#246) — **open**; producer exists and passes the canonical
+   parser, contract pin repaired 2026-09-15, activation waits on the GitHub-writing producer
+   (the same gate as item 4), RF-S **11 of 25** traceable by name;
+3. generated-repository migrations and service-owned integration — **unverified against this list**;
+4. #512 full-lifecycle bring-up through daemon finalization — **open, and the critical path.** Its
+   external half has been finished since 2026-08-16 (both seed repositories public, `ci.yml`
+   present, green, `main` protected with a required `project-ci` check);
+5. ~~ordered two-repository merge acceptance (#240)~~ — **retired by owner decision 2026-08-31**;
+6. ~~observation window across at least three real projects and thirty lifecycles (#241)~~ —
+   **closed `COMPLETED` 2026-08-31**;
+7. final open-issue disposition and fresh independent closeout review — **open.** Five issues remain
+   (§3). Both review lanes are currently unavailable: `production-review.mjs` needs `codex login`
+   and codex is prohibited for this work; grok returned `402 Payment Required` on 2026-09-12. Rounds
+   run under `sol-simplify-review` meanwhile, which the protocol permits — *"a model being
+   unavailable changes who executes the round; it does not change the round."*
 
 Owner/API/interactive boundaries remain explicit. A closed prerequisite or successful command is not a
 live acceptance proof.
@@ -351,8 +460,30 @@ The repository may claim production readiness only after all of the following ar
 1. canonical CEO live gate C8, including current receipt, writer-closure, recovery, and rollback evidence;
 2. Task 7 four-actor continuity and zero-shadow gate;
 3. Buzz three-proof transition gate;
-4. full factory acceptance and observation window;
+4. full factory acceptance **as scoped by §7 after the owner's 2026-08-31 decision** — item 5 there
+   is retired and item 6 is closed, so this reads: #246 and #512, not #240 and #241;
 5. every open issue has an evidence-backed terminal disposition;
 6. a fresh independent closeout review passes.
 
 Until then the repository remains **not production-ready**.
+
+### The shortest honest path from here, 2026-09-21
+
+Not a schedule — a dependency order with nothing between the steps. Each is a prerequisite of the
+next, and only the last two need the owner:
+
+1. **Issue a delegation grant and rebind `PRIMARY_CTO` to generation 7** (#954). Merged, deployed
+   and unexercised; this is the one blocker that is neither code nor an owner action at a terminal.
+   Nothing else can start while every assignment is REVOKED.
+2. **Write the caller onto `buzz-message.ingress.sock`** and observe one Buzz round trip with a
+   zero-new-session census (#627, C6 items 2-8, then C7). Both endpoints already exist.
+3. **Drive one document-only change through `CEO_APPROVED`**, daemon finalization and an exact-SHA
+   readback (#512), then **re-derive `evidence/e2e-real-project.json` from that run** — the
+   committed copy is stale by 462 source commits and five other evidence files are stale too.
+   Needs real GitHub writes: owner-gated.
+4. **The GitHub-writing Repo Factory producer** (#246), which is the same gate as (3) and follows it.
+5. **A closeout review round** on a restored lane, and a terminal disposition for whatever is open.
+
+What that list does *not* contain is as informative as what it does: no receipt work, no ingress
+work, no settlement work, no writer-closure work, and no two-repository acceptance. Those are
+finished, or retired.

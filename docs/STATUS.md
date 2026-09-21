@@ -35,10 +35,20 @@ is delegated, like the counts above:
   going stale is a fact about the tree moving, not a fault to be fixed by editing the file.
 
 **A closed prerequisite is not a live observation.** The issues that opened a path are closed once
-the path exists; whether it has been *exercised* is a separate question with its own issue. The
-Telegram round-trip is the clearest case — its two prerequisite issues are closed, and
-[#510](https://github.com/MongLong0214/agent-control-plane/issues/510) records that the round-trip
-has still never been observed. Read the freshness report before treating any live claim as current.
+the path exists; whether it has been *exercised* is a separate question. ~~The Telegram round-trip
+is the clearest case — #510 records that the round-trip has still never been observed.~~
+**Corrected 2026-09-21: [#510](https://github.com/MongLong0214/agent-control-plane/issues/510)
+closed 2026-09-15**, and citing a closed issue as a live record is the defect this section names,
+committed by the section itself.
+
+The point survives its example, and a live one replaces it. **Measured 2026-09-21 on
+`~/.agent-control-plane/state.sqlite`:** #975 merged and deployed the CTO-binding restoration path —
+the daemon runs `runtime/generation-893d42a`, which is that merge commit — and
+`audit_events kind LIKE 'CTO_BINDING_DELEGATION%'` returns **0 rows**. The path exists; it has never
+been walked, and every `assignments` row is REVOKED. See
+[#954](https://github.com/MongLong0214/agent-control-plane/issues/954).
+Read the freshness report before treating any live claim as current: it reports **0 current, 6
+stale**.
 
 The runtime now has a fail-closed provider-egress path: each isolated reviewer receives a
 daemon-generated provider allowlist, a kernel-enforced loopback proxy route, and fresh
@@ -121,14 +131,32 @@ gate", but not "what would close it", and that second question is the one that g
 | **A2** | Kernel attestation, surface equivalence, ingress uniqueness | #449 `conversational_actor` schema · #450 peercred minimal · #451 destination exactly-once |
 | **A3** | ACP implementation complete | #243 #240 #241 #392 #419 #360 #358 #406 #400 #408 |
 
+> **Measured 2026-09-21: the "open items" column is empty — all twenty-two issues are closed.** This
+> is the recorded `Limit:` on this file coming true rather than a surprise: *"the mapping is
+> maintained by hand; no check reconciles the table against the labels"* (`d0b0f8ea`). A hand-kept
+> column of open items becomes a column of closed ones silently, and a reader takes it as current.
+>
+> The column is left in place because the table's value is its **middle** column — what each gate
+> *means* — which does not go stale. Read the third column as the issues that *were* the gate's open
+> items when it was written, and re-derive today's with
+> `gh issue list --state open --limit 40`, which returns five.
+>
+> Two closed `NOT_PLANNED` rather than completed, and the difference matters: **#450** (peercred
+> minimal, A2) and **#240** (ordered two-repository merge acceptance, A3). #240 was retired by owner
+> decision on 2026-08-31 — *"이 시스템 어차피 나만 내 로컬에서 쓸 거라서"* — with the ordered-merge code
+> and tests preserved and the acceptance resuming if a real multi-repo run appears. **A gate whose
+> item was retired is not a gate that was passed.** See `docs/ROADMAP.md` §7.
+
 A0's phrasing is deliberate and worth keeping: seven lanes merged today, and that is a fact about
 main, not a claim about completeness. The two are separable and were conflated before.
 
-**#397, #402 and #403 are listed under A0 with their disposition unverified on purpose.** They are
-open, and the commit that merged as `c5ec3d3` is titled *"close P1-14, P1-15, P1-06"*. Either the
-queue is stale or the titles overclaim, and this document should not assert which before it has
-been reproduced at HEAD. That ambiguity is #408's subject, and recording it as unresolved is more
-useful than guessing.
+~~**#397, #402 and #403 are listed under A0 with their disposition unverified on purpose.** They are
+open, and the commit that merged as `c5ec3d3` is titled *"close P1-14, P1-15, P1-06"*.~~
+**Resolved — all three are closed as of 2026-09-21.** The ambiguity recorded here (whether the queue
+was stale or the titles overclaimed) was real when written and is no longer live. Keeping the
+paragraph struck rather than deleting it preserves the reason the entry existed: recording an
+unresolved disposition was more useful than guessing, and it stayed unresolved until the issues
+themselves closed.
 
 ## What the automated checks mean
 
