@@ -140,8 +140,6 @@ describe("the attach relay as the process Claude Code spawns", () => {
       manifest.projectId,
       "--expected-binding-generation",
       "1",
-      "--owner-approval-nonce",
-      randomUUID(),
     ];
     const child = spawn(
       process.execPath,
@@ -309,8 +307,6 @@ describe("the attach relay as the process Claude Code spawns", () => {
         "flush-project",
         "--expected-binding-generation",
         "1",
-        "--owner-approval-nonce",
-        randomUUID(),
       ],
       {
         cwd: process.cwd(),

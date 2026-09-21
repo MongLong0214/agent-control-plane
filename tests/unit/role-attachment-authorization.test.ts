@@ -14,7 +14,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
-import { CanonicalSelfClaim, SELF_CLAIM_OPERATION } from "../../src/registry/canonical-self-claim.ts";
+import { CanonicalSelfClaim } from "../../src/registry/canonical-self-claim.ts";
 import { RoleConversationPort } from "../../src/mcp/role-conversation.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { fixtureManifest, makeHarness, TEST_OWNER, type Harness } from "../helpers/harness.ts";
@@ -114,7 +114,7 @@ describe("role attachment authorization without sockets", () => {
       cli: { allowedActors: [TEST_OWNER.actor] }, buzz: { allowedActors: ["buzz:fixture"] },
     });
     const recovery = new CanonicalSelfClaim(h.cp.db, h.clock, h.cp.sessions, h.cp.bindings,
-      h.cp.ownerAuthority, guard, async () => allow(ReasonCode.OK, "buzz://fixture"), {
+      guard, async () => allow(ReasonCode.OK, "buzz://fixture"), {
         canonicalSessionUuid: uuid, requiredExecutorVersion: "0.0.0-test", canonicalBuzzChannelId: "fixture",
         expectedExecutorRealpath: "/fake/claude", expectedExecutorSha256: `sha256:${"0".repeat(64)}`,
         expectedCwd: "/fake/work", expectedPeerProtocolVersion: "fixture", expectedPeerIdentity: "fixture",
@@ -126,16 +126,10 @@ describe("role attachment authorization without sockets", () => {
         imageInspector: { resolve: () => ({ imagePath: "/fake/claude", version: "0.0.0-test", sha256: `sha256:${"0".repeat(64)}` }) },
         transcriptReader: { locate: () => ({ path: "/fake/transcript", sizeBytes: 1 }) },
       });
-    const claim = async (generation: number) => {
-      const decision = { runId: null, candidateSnapshotDigest: null, operation: SELF_CLAIM_OPERATION,
-        parameters: { domain: SELF_CLAIM_OPERATION, projectId, claimedSessionUuid: uuid,
-          role: "PRIMARY_CTO", expectedBindingGeneration: generation }, idempotencyKey: randomUUID(), approved: true };
-      const receipt = valueOf(guard.admitOwnerApproval({ channel: "cli", actor: TEST_OWNER.actor,
-        nonce: randomUUID(), payload: ownerApprovalPayload(decision) }, decision));
-      return valueOf(await recovery.claim({ callerPid: 10, claimedSessionUuid: uuid, projectId,
-        expectedBindingGeneration: generation, ownerApproval: receipt, peerProtocolVersion: "fixture",
+    const claim = async (generation: number) =>
+      valueOf(await recovery.claim({ callerPid: 10, claimedSessionUuid: uuid, projectId,
+        expectedBindingGeneration: generation, peerProtocolVersion: "fixture",
         peerIdentity: "fixture", buzzChannelId: "fixture", buzzActorId: "buzz:fixture", buzzPurpose: "fixture" }));
-    };
     valueOf(h.cp.bindings.revoke(roleKey, "canonical fixture"));
     const first = await claim(2);
     subject = { sessionId: first.sessionId, sessionSecret: first.sessionSecret! };

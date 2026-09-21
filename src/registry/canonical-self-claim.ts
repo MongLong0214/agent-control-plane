@@ -3,7 +3,6 @@ import { closeSync, existsSync, fstatSync, openSync, readFileSync, readdirSync, 
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
 
-import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../ceo/owner-authority.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
@@ -62,34 +61,6 @@ export const SELF_CLAIM_EXECUTOR_KIND = "claude-cli";
 
 /** This primitive's own attestation protocol; deliberately distinct from `hermes.target-bind/v1`. */
 export const SELF_CLAIM_PROTOCOL = "acp.canonical-self-claim/v1";
-
-/**
- * The operation name a claim's `OwnerApprovalReceipt` must carry, and the domain tag of the
- * digest that binds it to one exact project, claimant session, role and generation:
- * `OwnerApprovalReceipt.parameterDigest` is a generic field `OwnerAuthority` never interprets —
- * binding it to *these* parameters is this module's job, not the ledger's.
- */
-export const SELF_CLAIM_OPERATION = "actor.claim_canonical_cto";
-
-/**
- * The exact digest an owner approval for one claim attempt must carry as `parameterDigest`. A
- * mismatch (wrong project, wrong session, wrong role, or a stale `expectedBindingGeneration`)
- * fails `OwnerAuthority.assertApproval`'s completeness check indirectly — `claim()` compares this
- * value itself before ever presenting the receipt for consumption, which is the earlier and more
- * exact refusal point of the two.
- */
-export const canonicalSelfClaimParameterDigest = (input: {
-  projectId: string;
-  claimedSessionUuid: string;
-  expectedBindingGeneration: number;
-}): string =>
-  digestOf({
-    domain: SELF_CLAIM_OPERATION,
-    projectId: input.projectId,
-    claimedSessionUuid: input.claimedSessionUuid,
-    role: "PRIMARY_CTO",
-    expectedBindingGeneration: input.expectedBindingGeneration,
-  });
 
 const MAX_ANCESTRY_HOPS = 64;
 const SUBPROCESS_TIMEOUT_MS = 5_000;
@@ -836,29 +807,10 @@ export interface CanonicalSelfClaimRequest {
   claimedPid?: number;
   projectId: string;
   /**
-   * Real owner authority, not a caller-typed string. This is evidence from an admitted ingress
-   * envelope — `OwnerAuthority.assertApproval`'s own contract — never a tuple this call can
-   * fabricate. `claim()` also requires `operation === SELF_CLAIM_OPERATION` and
-   * `parameterDigest === canonicalSelfClaimParameterDigest({ projectId, claimedSessionUuid,
-   * expectedBindingGeneration })`, so a real approval minted for a *different* claim (wrong
-   * project, session, role or generation) is rejected before it is ever presented for
-   * consumption.
-   *
-   * Consumed exactly once **per commit, not per presentation**: `OwnerAuthority.consumeApproval`
-   * runs inside the same transaction as the mutation it authorises, so a denial anywhere in that
-   * transaction — including one after consumption already ran — rolls the consumption back with
-   * everything else. The same receipt is therefore genuinely reusable after a failed attempt and
-   * remains valid until an attempt actually commits. This is deliberate, not an oversight:
-   * refusing to let a caller retry after an unrelated failure (an unauthenticated Buzz channel
-   * identity, a transient denial) with the *same* owner approval would make every such failure
-   * also cost a fresh owner round-trip.
-   */
-  ownerApproval: OwnerApprovalReceipt;
-  /**
    * The binding generation this claim expects to create. Checked against the actual next
    * generation for `PRIMARY_CTO:<projectId>` inside the transaction; a mismatch means the role's
-   * assignment history moved after the owner approved this exact attempt, and denies rather than
-   * silently approving a different generation than the owner actually saw.
+   * assignment history moved between reading it and claiming it, and denies rather than
+   * silently creating a different generation than the caller computed against.
    */
   expectedBindingGeneration: number;
   // No caller-supplied `cwd` field: the real check (clause 2) compares the *derived*
@@ -999,13 +951,10 @@ export function verifyClaudeIdentity(
       { pid: identity.pid, probe: "lsof", probeFailure: identity.cwdProbeFailure },
     );
   }
-  if (identity.cwd !== config.expectedCwd) {
-    return deny(
-      ReasonCode.CONFLICT,
-      "the claude ancestor's working directory does not match the expected canonical workdir",
-      { observed: identity.cwd, expected: config.expectedCwd },
-    );
-  }
+  // The working directory is recorded, not required to equal anything. It used to have to match
+  // `ACP_CANONICAL_CTO_WORKDIR` exactly, which meant the canonical CTO could only ever be a
+  // session started in one directory — a session the owner opened anywhere else was refused
+  // CONFLICT no matter who they were. The role is a job, not a place.
   // Clause 2 — peer protocol.
   if (peer && peer.protocolVersion !== peer.expectedProtocolVersion) {
     return deny(
@@ -1131,8 +1080,6 @@ export class CanonicalSelfClaim {
     private readonly clock: Clock,
     private readonly sessions: SessionRegistry,
     private readonly bindings: BindingRegistry,
-    /** The canonical owner-authenticated directive/turn mechanism — never a caller-typed string. */
-    private readonly ownerAuthority: OwnerAuthorityPort,
     /** Authenticates `buzzActorId` for `SessionRegistry.bindBuzzActor` (deployment ingress policy). */
     private readonly buzzActorAuthenticator: BuzzActorAuthenticator,
     /**
@@ -1190,54 +1137,15 @@ export class CanonicalSelfClaim {
       return deny(ReasonCode.INVALID_ARGUMENT, "buzzActorId is required", {});
     }
 
-    // An owner directive is real owner authority, bound to the exact operation, project, claimant
-    // session and generation this attempt names — never a caller-typed string. Checked here,
-    // before derivation even runs, so a fabricated or mis-scoped approval is refused for that
-    // reason specifically rather than folded into a later, less exact denial.
-    if (request.ownerApproval.operation !== SELF_CLAIM_OPERATION) {
-      return deny(
-        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-        "owner approval names a different operation",
-        { observed: request.ownerApproval.operation, expected: SELF_CLAIM_OPERATION },
-      );
-    }
-    // `approved` is a real boolean on an authenticated receipt, and `approved: false` is exactly
-    // what an owner mints when they explicitly *refuse* an operation — a rejection is otherwise
-    // structurally indistinguishable from an approval that happens to also bind the right
-    // operation/project/session/generation, so this must be checked explicitly, matching
-    // `src/doctor/repair.ts`'s owner-gated repair path (`receipt.approved !== true`).
-    if (request.ownerApproval.approved !== true) {
-      return deny(
-        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-        "owner approval receipt is not an approval",
-        { approved: request.ownerApproval.approved },
-      );
-    }
-    if (request.ownerApproval.runId !== null || request.ownerApproval.candidateSnapshotDigest !== null) {
-      return deny(
-        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-        "owner approval for a canonical self-claim must not bind a run or candidate",
-        {},
-      );
-    }
-    const expectedParameterDigest = canonicalSelfClaimParameterDigest({
-      projectId: request.projectId,
-      claimedSessionUuid: request.claimedSessionUuid,
-      expectedBindingGeneration: request.expectedBindingGeneration,
-    });
-    if (request.ownerApproval.parameterDigest !== expectedParameterDigest) {
-      return deny(
-        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-        "owner approval does not bind the exact project, claimant session and generation of this attempt",
-        { observed: request.ownerApproval.parameterDigest, expected: expectedParameterDigest },
-      );
-    }
-    // A currently-admitted approval, checked before derivation runs any process/filesystem I/O.
-    // The atomic, consume-exactly-once check happens again inside `#mutate` — this is the fail-fast
-    // half, not a substitute for it: `assertApproval` alone cannot see a concurrent consumption.
-    const admitted = this.ownerAuthority.assertApproval(request.ownerApproval);
-    if (!admitted.allowed) return admitted as Decision<CanonicalSelfClaimReceipt>;
-
+    // No owner approval is required or read here. This claim used to demand a `(channel, nonce)`
+    // handle naming a decision an owner had minted beforehand, which meant the canonical CTO role
+    // could only be (re)bound after a human typed a command — measured on this deployment, four
+    // such mints between 2026-09-08 and 2026-09-13 and then nothing, so the role sat unbound for
+    // eight days and every Buzz mention in that window was delivered nowhere. On a single-owner
+    // local deployment that gate bought no authority it did not already have: the claim still
+    // authenticates by kernel peer credential on its own socket, still derives the claimant's
+    // identity from process ancestry rather than accepting it, and still refuses a generation the
+    // assignment history did not hand it. What it removes is the human in the loop.
     const verified = verifyClaudeIdentity(this.config, request, {
       processInspector: this.#processInspector, imageInspector: this.#imageInspector,
       transcriptReader: this.#transcriptReader, maxAncestryHops: this.#maxAncestryHops,
@@ -1463,12 +1371,6 @@ export class CanonicalSelfClaim {
         predecessorSessionId = predecessor.sessionId;
       }
 
-      // Consumed exactly once, inside this transaction. A denial anywhere below rolls this
-      // consumption back too, so a refused claim leaves the approval reusable; only a committed
-      // one burns it. `OwnerAuthority.consumeApproval` itself denies a replay or a presentation
-      // against a different candidate — both re-checked here for a non-run operation.
-      const consumed = this.ownerAuthority.consumeApproval(request.ownerApproval, null);
-      if (!consumed.allowed) return consumed as Decision<CanonicalSelfClaimReceipt>;
       if (abandonedRuntimeSessionId !== null) {
         const reconciled = this.sessions.transition(abandonedRuntimeSessionId, SessionLifecycle.STOPPED,
           `canonical predecessor runtime is gone; row reconciled before generation ${nextGeneration}`);
@@ -1540,7 +1442,6 @@ export class CanonicalSelfClaim {
         buzzChannelId: request.buzzChannelId,
         buzzActorId: request.buzzActorId,
         buzzAddress,
-        ownerApprovalDigest: digestOf(request.ownerApproval),
         expectedBindingGeneration: request.expectedBindingGeneration,
       });
       const authenticatedTarget: AuthenticatedTargetBinding = {

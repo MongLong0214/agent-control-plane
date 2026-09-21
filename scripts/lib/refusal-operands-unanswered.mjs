@@ -71,25 +71,15 @@ const groups = [
   },
   {
     file: "src/daemon/canonical-self-claim-operator.ts",
-    // isStoredOwnerApprovalPayload's two structural guards, in front of the field checks.
-    reason: "Both are subsumed at runtime by the `record[\"type\"] === \"OWNER_APPROVAL\"` check one line down, and both mutants were run and SURVIVED. Remove `typeof value !== \"object\"` and a string payload reaches `record[\"type\"]`, where indexing a string yields `undefined`, which is not the literal — refused, same code, same message. Remove `Array.isArray(value)` and an array reaches the same read with the same outcome. They are kept because the coincidence is in the *next* check rather than in these: a future envelope whose first field happened to be one an array or a string could carry would make both load-bearing again, and nothing about the type check announces that it is doing this work.",
-    operands: [
-      ["typeof value !== \"object\"",1],
-      ["Array.isArray(value)",1],
-    ],
-  },
-  {
-    file: "src/daemon/canonical-self-claim-operator.ts",
     // The request-field checks TypeScript enforces, and the one a second authority re-checks.
-    reason: "Five of these six cannot carry a row and the harness says so: `isNonEmptyString` is a type predicate, so removing any `!isNonEmptyString(...)` operand — or the `typeof value === \"string\"` inside it, or the `!row` guard that narrows a `| undefined` row — leaves an `unknown` or possibly-undefined value flowing into a `string` field, and the mutant refuses to compile. TypeScript is the enforcement site, not a test. The sixth, `!Number.isSafeInteger(expectedBindingGeneration)`, compiles when removed and SURVIVED: `CanonicalSelfClaim.claim()` re-checks the same property (`canonical-self-claim.ts`, \"expectedBindingGeneration must be a positive safe integer\") and denies with the same `INVALID_ARGUMENT`, so no input distinguishes the two. That is a second authority on one fact rather than defence in depth, and it is worth saying plainly: this operand's only effect today is to refuse earlier and with a different message.",
+    // `value.length > 0` used to sit here through `an-empty-string-nonce-is-not-a-nonce`; the
+    // nonce is gone and the operand is not, so it carries `an-empty-string-is-not-a-request-field`.
+    reason: "Three of these four cannot carry a row and the harness says so: `isNonEmptyString` is a type predicate, so removing any `!isNonEmptyString(...)` operand — or the `typeof value === \"string\"` inside it — leaves an `unknown` value flowing into a `string` field, and the mutant refuses to compile. TypeScript is the enforcement site, not a test. The fourth, `!Number.isSafeInteger(expectedBindingGeneration)`, compiles when removed and SURVIVED: `CanonicalSelfClaim.claim()` re-checks the same property (`canonical-self-claim.ts`, \"expectedBindingGeneration must be a positive safe integer\") and denies with the same `INVALID_ARGUMENT`, so no input distinguishes the two. That is a second authority on one fact rather than defence in depth, and it is worth saying plainly: this operand's only effect today is to refuse earlier and with a different message.",
     operands: [
       ["typeof value === \"string\"",1],
       ["!isNonEmptyString(claimedSessionUuid)",1],
       ["!isNonEmptyString(projectId)",1],
       ["!Number.isSafeInteger(expectedBindingGeneration)",1],
-      ["!isNonEmptyString(ownerApprovalNonce)",1],
-      ["!row",1],
-      ["row.payload_json === null",1],
     ],
   },
   {
@@ -152,8 +142,6 @@ const groups = [
       ["entry.fd === \"cwd\"",1],
       ["entry.type === \"DIR\"",1],
       ["rawValue === \"\"",1],
-      ["request.ownerApproval.runId !== null",1],
-      ["request.ownerApproval.candidateSnapshotDigest !== null",1],
       ["!Number.isSafeInteger(request.expectedBindingGeneration)",1],
       ["candidate.fd === \"txt\"",1],
       ["candidate.type === \"REG\"",1],

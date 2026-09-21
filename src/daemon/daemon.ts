@@ -21,7 +21,6 @@ import {
   type Finding,
 } from "../doctor/doctor.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
-import { SELF_CLAIM_OPERATION } from "../registry/canonical-self-claim.ts";
 import { RunState, SessionLifecycle } from "../domain/types.ts";
 import { buildAcceptanceReport } from "../export/acceptance-report.ts";
 import { RunEvidenceExporter } from "../export/run-evidence.ts";
@@ -232,16 +231,6 @@ export const OPERATOR_METHOD = {
   CONTINUITY_STATUS: "continuity.status",
   OUTBOX_RETRY: "outbox.retry",
   OWNER_APPROVE: "owner.approve",
-  /**
-   * The owner-authenticated preflight that mints a canonical self-claim owner approval (#760) as
-   * its own admission, separate from and prior to `actor.claimCanonicalCto`'s socket (that
-   * method special-cases its own dispatch in agentcpd.ts because its authority is the connecting
-   * peer's kernel identity, not this bearer-authenticated method table). The claiming connection
-   * never reaches this method and never mints its own approval — it only ever presents the
-   * `(channel, nonce)` handle this call produces, which `actor.claimCanonicalCto` loads back out
-   * of `inbound_messages` rather than trusting anything the claiming request asserts.
-   */
-  OWNER_APPROVE_CLAIM_CANONICAL_CTO: "owner.approveClaimCanonicalCto",
   OWNER_APPROVE_ROLE_ATTACHMENT: "owner.approveRoleAttachment",
   ROLE_ATTACHMENT_ISSUE: ROLE_ATTACHMENT_OPERATION,
   ROLE_ATTACHMENT_REVOKE: "roleAttachment.revoke",
@@ -278,7 +267,6 @@ export const OPERATOR_MUTATION_METHODS: ReadonlySet<OperatorMethod> = new Set([
   OPERATOR_METHOD.RUN_CANCEL,
   OPERATOR_METHOD.OUTBOX_RETRY,
   OPERATOR_METHOD.OWNER_APPROVE,
-  OPERATOR_METHOD.OWNER_APPROVE_CLAIM_CANONICAL_CTO,
   OPERATOR_METHOD.OWNER_APPROVE_ROLE_ATTACHMENT,
   OPERATOR_METHOD.ROLE_ATTACHMENT_ISSUE,
   OPERATOR_METHOD.ROLE_ATTACHMENT_REVOKE,
@@ -746,9 +734,6 @@ export class Daemon {
         case OPERATOR_METHOD.OWNER_APPROVE:
           return this.executeOwnerApproval(request, peer);
 
-        case OPERATOR_METHOD.OWNER_APPROVE_CLAIM_CANONICAL_CTO:
-          return this.executeApproveCanonicalCtoClaim(request, peer);
-
         case OPERATOR_METHOD.OWNER_APPROVE_ROLE_ATTACHMENT: {
           const sessionId = requiredOperatorString(request.params, "sessionId");
           if (!sessionId.allowed) return sessionId;
@@ -1023,75 +1008,17 @@ export class Daemon {
   }
 
   /**
-   * The *only* place a canonical self-claim owner approval is ever minted (#760). This runs on
-   * the normal bearer-authenticated operator method table (`peer.actor` is
-   * whoever holds the shared operator token, e.g. the owner's own `agentctl` invocation) — never
-   * on the `actor.claimCanonicalCto` socket, which authenticates by kernel peer credential instead
-   * and never reaches this method at all. `nonce` is caller-chosen deliberately: the human running
-   * this command has to hand that exact value to whatever presents the claim afterward, so it
-   * cannot be derived from anything this call alone knows.
-   */
-  private executeApproveCanonicalCtoClaim(
-    request: OperatorRequest,
-    peer: AuthenticatedOperatorPeer,
-  ): Decision<unknown> {
-    const projectId = requiredOperatorString(request.params, "projectId");
-    if (!projectId.allowed) return projectId;
-    const claimedSessionUuid = requiredOperatorString(request.params, "claimedSessionUuid");
-    if (!claimedSessionUuid.allowed) return claimedSessionUuid;
-    const expectedBindingGeneration = requiredOperatorInteger(request.params, "expectedBindingGeneration", 1);
-    if (!expectedBindingGeneration.allowed) return expectedBindingGeneration;
-    const nonce = requiredOperatorString(request.params, "nonce");
-    if (!nonce.allowed) return nonce;
-    // No default (#760). An owner mints an explicit decision, approval or rejection; there is no
-    // reading of "the caller did not say" that this method may treat as either one.
-    // `request.params["approved"] ?? true` would silently turn every omitted or malformed field
-    // into an approval, which is exactly the shape a caller could exploit by leaving the field out
-    // rather than fabricating it.
-    const approved = request.params["approved"];
-    if (typeof approved !== "boolean") return invalidOperatorParam("approved", approved);
-
-    const approval = {
-      runId: null,
-      candidateSnapshotDigest: null,
-      operation: SELF_CLAIM_OPERATION,
-      parameters: {
-        domain: SELF_CLAIM_OPERATION,
-        projectId: projectId.value,
-        claimedSessionUuid: claimedSessionUuid.value,
-        role: "PRIMARY_CTO",
-        expectedBindingGeneration: expectedBindingGeneration.value,
-      },
-      idempotencyKey:
-        request.idempotencyKey ??
-        `claim-canonical-cto:${digestOf({
-          projectId: projectId.value,
-          claimedSessionUuid: claimedSessionUuid.value,
-          expectedBindingGeneration: expectedBindingGeneration.value,
-          approved,
-          nonce: nonce.value,
-        })}`,
-      approved,
-    };
-    return this.admitCliOwnerApproval(peer.actor, approval, nonce.value);
-  }
-
-  /**
    * Releases a canonical PRIMARY_CTO binding whose session's process is provably gone.
    *
    * This method admits its own owner-approval envelope rather than loading one an earlier call
-   * left behind, and that is a deliberate departure from `actor.claimCanonicalCto`, which reads
-   * a decision `owner.approveClaimCanonicalCto` minted beforehand
-   * (`canonical-self-claim-operator.ts`'s `loadAdmittedOwnerApproval`). The separation works
-   * there because both calls happen while the daemon is up. It cannot work here: the state this
-   * recovers is one in which `start()` has already refused, and `OWNER_APPROVE` and
-   * `OWNER_APPROVE_CLAIM_CANONICAL_CTO` are both outside `BOOTSTRAP_OPERATOR_METHODS`, so no
-   * approval can be minted while parked and in a real outage none was minted before. Requiring a
+   * left behind. It cannot do otherwise: the state this recovers is one in which `start()` has
+   * already refused, and `OWNER_APPROVE` is outside `BOOTSTRAP_OPERATOR_METHODS`, so no approval
+   * can be minted while parked and in a real outage none was minted before. Requiring a
    * pre-existing approval would make the remedy unreachable in exactly the state that needs it —
    * the defect this whole change removes, reintroduced one layer down.
    *
    * Nothing about the verification is weakened to buy that. `admitCliOwnerApproval` is the same
-   * function `owner.approve` and `owner.approveClaimCanonicalCto` call: the same `IngressGuard`,
+   * function `owner.approve` calls: the same `IngressGuard`,
    * the same CLI owner allowlist drawn from `cp.config.ownerIdentities`, the same nonce replay
    * record, and the same `ownerApprovalPayload` envelope digest. The receipt it returns is then
    * put through `OwnerAuthority.consumeApproval`, which re-runs `assertApproval` against the

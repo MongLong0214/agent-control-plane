@@ -16,7 +16,6 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { OPERATOR_METHOD, type Daemon } from "../../src/daemon/daemon.ts";
 import {
   startCanonicalSelfClaimListener,
   CANONICAL_SELF_CLAIM_SOCKET_FILENAME,
@@ -27,6 +26,7 @@ import {
   executeCanonicalSelfClaimOperator,
   type CanonicalSelfClaimOperatorDeps,
 } from "../../src/daemon/canonical-self-claim-operator.ts";
+import type { Daemon } from "../../src/daemon/daemon.ts";
 import { IngressGuard } from "../../src/ingress/ingress-guard.ts";
 import { allow, type Decision } from "../../src/core/errors.ts";
 import { sha256 } from "../../src/core/digest.ts";
@@ -34,8 +34,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { makeDefaultTranscriptReader } from "../../src/registry/canonical-self-claim.ts";
 import { boundedExecFileSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
-import { makeStartedOperator, TEST_OPERATOR_TOKEN, type Harness, type StartedOperator } from "../helpers/harness.ts";
-import { createConnection } from "node:net";
+import { makeStartedOperator, type Harness, type StartedOperator } from "../helpers/harness.ts";
 
 /** Synthetic — never a value that names a real deployment's version. */
 const TEST_REQUIRED_EXECUTOR_VERSION = "9.0.0-test";
@@ -45,7 +44,6 @@ const TEST_REQUIRED_EXECUTOR_VERSION = "9.0.0-test";
  * it cannot approve itself, so the sockets are separate, not merely the credentials.
  *
  * This file drives BOTH real sockets a live deployment now has for this feature end to end: the
- * real, bearer-authenticated operator socket for the mint (`owner.approveClaimCanonicalCto`), and
  * the real, token-less canonical self-claim listener for the claim (`actor.claimCanonicalCto`).
  *
  * Every claim in this file is made by a real, independently spawned "claude"-shaped OS process
@@ -306,7 +304,6 @@ const expectClosedPublicDenial = (result: Decision<unknown>, reasonCode: ReasonC
   expect(result).toEqual({ allowed: false, reasonCode });
 };
 
-let freshNonces = 0;
 
 const BUZZ_ACTOR_ID = "buzz:canonical-cto";
 const BUZZ_CHANNEL_ID = "channel:test-canonical";
@@ -314,66 +311,11 @@ const PEER_PROTOCOL = "acp.operator/v1";
 const BUZZ_PURPOSE = "continuity:PRIMARY_CTO";
 const TEST_SESSION_UUID = "99999999-9999-4999-8999-999999999999";
 
-const operatorRequest = (
-  socketPath: string,
-  token: string,
-  request: Record<string, unknown>,
-): Promise<Decision<unknown>> =>
-  new Promise((resolve, reject) => {
-    const socket = createConnection(socketPath);
-    let received = "";
-    const timeout = setTimeout(() => {
-      socket.destroy();
-      reject(new Error("operator socket test timed out"));
-    }, 20_000);
-    socket.setEncoding("utf8");
-    socket.once("connect", () => {
-      socket.write(`${JSON.stringify({ requestId: `test-req-${freshNonces++}`, token, ...request })}\n`);
-    });
-    socket.on("data", (chunk: string) => {
-      received += chunk;
-      if (!received.includes("\n")) return;
-      clearTimeout(timeout);
-      socket.end();
-      resolve(JSON.parse(received.trim()) as Decision<unknown>);
-    });
-    socket.once("error", (error) => {
-      clearTimeout(timeout);
-      reject(error);
-    });
-  });
-
 const startMintOperator = async (): Promise<StartedOperator> => {
   const started = await makeStartedOperator();
   startedOperators.push(started);
   return started;
 };
-
-const mintOwnerApprovalOverOperatorSocket = (
-  started: StartedOperator,
-  input: {
-    projectId: string;
-    claimedSessionUuid: string;
-    expectedBindingGeneration: number;
-    approved?: boolean;
-    nonce?: string;
-  },
-): Promise<{ nonce: string; result: Decision<unknown> }> => {
-  const nonce = input.nonce ?? `owner-preflight-${freshNonces++}`;
-  const params: Record<string, unknown> = {
-    projectId: input.projectId,
-    claimedSessionUuid: input.claimedSessionUuid,
-    expectedBindingGeneration: input.expectedBindingGeneration,
-    nonce,
-    approved: input.approved ?? true,
-  };
-  return operatorRequest(started.socketPath, TEST_OPERATOR_TOKEN, {
-    method: OPERATOR_METHOD.OWNER_APPROVE_CLAIM_CANONICAL_CTO,
-    params,
-  }).then((result) => ({ nonce, result }));
-};
-
-const freshUnadmittedNonce = (): string => `never-admitted-nonce-${freshNonces++}`;
 
 const resolveBuzzAddressFixture = (
   outcome: Decision<string> = allow(ReasonCode.OK, "buzz://test-canonical-cto"),
@@ -400,7 +342,6 @@ const depsFor = (
     clock: cp.clock,
     sessions: cp.sessions,
     bindings: cp.bindings,
-    ownerAuthority: cp.ownerAuthority,
     buzzActorAuthenticator: new IngressGuard(cp.db, cp.clock, cp.audit, {
       buzz: { allowedActors: [BUZZ_ACTOR_ID] },
     }),
@@ -441,7 +382,7 @@ const startClaimListener = async (
 
 describe("actor.claimCanonicalCto — the real production handler, against real sockets and real processes", () => {
   it(
-    "an owner approval minted over the real, bearer-authenticated operator socket succeeds end to end",
+    "a claim from a real claude process succeeds end to end over the real claim socket",
     async () => {
       const started = await startMintOperator();
       const { cp } = started.harness;
@@ -450,17 +391,11 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
       const root = tempRoot();
       const listener = await startClaimListener(started.daemon, cp, root);
 
-      const { nonce, result: mintResult } = await mintOwnerApprovalOverOperatorSocket(started, {
-        projectId,
-        claimedSessionUuid: TEST_SESSION_UUID,
-        expectedBindingGeneration: 1,
-      });
-      expect(mintResult.allowed, JSON.stringify(mintResult)).toBe(true);
 
       const before = rowCounts(cp);
       const result = await claimAsRealClaudeProcess(root, listener.socketPath, {
         method: "actor.claimCanonicalCto",
-        params: { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce: nonce },
+        params: { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1 },
       });
 
       expect(result.allowed, JSON.stringify(result)).toBe(true);
@@ -473,95 +408,11 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
     45_000,
   );
 
-  it(
-    "a claimant holding no operator token, presenting only a fresh unadmitted nonce, cannot self-authorize",
-    async () => {
-      const started = await startMintOperator();
-      const { cp } = started.harness;
-      const projectId = "prj_operator_self_authorize";
-      insertProject(cp, projectId);
-      const root = tempRoot();
-      const listener = await startClaimListener(started.daemon, cp, root);
 
-      const ownerApprovalNonce = freshUnadmittedNonce();
 
-      const before = rowCounts(cp);
-      const result = await claimAsRealClaudeProcess(root, listener.socketPath, {
-        method: "actor.claimCanonicalCto",
-        params: { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce },
-      });
-
-      expect(result.allowed).toBe(false);
-      if (result.allowed) return;
-      expect(result.reasonCode).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
-      expect(rowCounts(cp)).toEqual(before);
-    },
-    45_000,
-  );
 
   it(
-    "approved:false, minted with an explicit boolean, denies the claim with no new claim state or audit",
-    async () => {
-      const started = await startMintOperator();
-      const { cp } = started.harness;
-      const projectId = "prj_operator_rejected";
-      insertProject(cp, projectId);
-      const root = tempRoot();
-      const listener = await startClaimListener(started.daemon, cp, root);
-
-      const { nonce, result: mintResult } = await mintOwnerApprovalOverOperatorSocket(started, {
-        projectId,
-        claimedSessionUuid: TEST_SESSION_UUID,
-        expectedBindingGeneration: 1,
-        approved: false,
-      });
-      expect(mintResult.allowed, JSON.stringify(mintResult)).toBe(true);
-
-      const before = rowCounts(cp);
-      const result = await claimAsRealClaudeProcess(root, listener.socketPath, {
-        method: "actor.claimCanonicalCto",
-        params: { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce: nonce },
-      });
-
-      expect(result.allowed).toBe(false);
-      if (result.allowed) return;
-      expect(result.reasonCode).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
-      expect(rowCounts(cp)).toEqual(before);
-    },
-    45_000,
-  );
-
-  it(
-    "a wrong-tuple approval (minted for a different project) denies with no new claim state or audit",
-    async () => {
-      const started = await startMintOperator();
-      const { cp } = started.harness;
-      const projectId = "prj_operator_wrong_tuple";
-      insertProject(cp, projectId);
-      const root = tempRoot();
-      const listener = await startClaimListener(started.daemon, cp, root);
-
-      const { nonce, result: mintResult } = await mintOwnerApprovalOverOperatorSocket(started, {
-        projectId: "some-other-project",
-        claimedSessionUuid: TEST_SESSION_UUID,
-        expectedBindingGeneration: 1,
-      });
-      expect(mintResult.allowed, JSON.stringify(mintResult)).toBe(true);
-
-      const before = rowCounts(cp);
-      const result = await claimAsRealClaudeProcess(root, listener.socketPath, {
-        method: "actor.claimCanonicalCto",
-        params: { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce: nonce },
-      });
-
-      expectClosedPublicDenial(result, ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
-      expect(rowCounts(cp)).toEqual(before);
-    },
-    45_000,
-  );
-
-  it(
-    "replaying an already-committed approval's nonce denies with no new claim state or audit",
+    "a second claim at a generation already committed denies with no new claim state or audit",
     async () => {
       const started = await startMintOperator();
       const { cp } = started.harness;
@@ -570,23 +421,17 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
       const root = tempRoot();
       const listener = await startClaimListener(started.daemon, cp, root);
 
-      const { nonce, result: mintResult } = await mintOwnerApprovalOverOperatorSocket(started, {
-        projectId,
-        claimedSessionUuid: TEST_SESSION_UUID,
-        expectedBindingGeneration: 1,
-      });
-      expect(mintResult.allowed, JSON.stringify(mintResult)).toBe(true);
 
       const first = await claimAsRealClaudeProcess(root, listener.socketPath, {
         method: "actor.claimCanonicalCto",
-        params: { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce: nonce },
+        params: { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1 },
       });
       expect(first.allowed, JSON.stringify(first)).toBe(true);
       const afterFirst = rowCounts(cp);
 
       const replay = await claimAsRealClaudeProcess(root, listener.socketPath, {
         method: "actor.claimCanonicalCto",
-        params: { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce: nonce },
+        params: { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1 },
       });
       expect(replay.allowed).toBe(false);
       expect(rowCounts(cp)).toEqual(afterFirst);
@@ -605,17 +450,11 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
 
       const listener = await startClaimListener(started.daemon, cp, root, { maxAncestryHops: 1 });
 
-      const { nonce, result: mintResult } = await mintOwnerApprovalOverOperatorSocket(started, {
-        projectId,
-        claimedSessionUuid: TEST_SESSION_UUID,
-        expectedBindingGeneration: 1,
-      });
-      expect(mintResult.allowed, JSON.stringify(mintResult)).toBe(true);
 
       const before = rowCounts(cp);
       const result = await claimAsRealPlainProcess(root, listener.socketPath, {
         method: "actor.claimCanonicalCto",
-        params: { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1, ownerApprovalNonce: nonce },
+        params: { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1 },
       });
 
       expectClosedPublicDenial(result, ReasonCode.CONFLICT);
