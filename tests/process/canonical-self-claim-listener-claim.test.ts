@@ -201,7 +201,7 @@ const spawnAndSendOneRequest = (
 ): ChildProcess => {
   const script = `
     const net = require("node:net");
-    const socket = net.(${JSON.stringify(socketPath)});
+    const socket = net.createConnection(${JSON.stringify(socketPath)});
     let received = "";
     socket.setEncoding("utf8");
     socket.once("connect", () => { socket.write(${JSON.stringify(`${JSON.stringify(requestBody)}\n`)}); });
