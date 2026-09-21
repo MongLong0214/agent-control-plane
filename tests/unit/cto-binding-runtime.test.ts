@@ -84,7 +84,7 @@ it.each(["success", "external-nesting", "reentrant-target", "after-commit-fault"
     expectedExecutorRealpath: "/fixture/claude", expectedExecutorSha256: "sha256:" + "1".repeat(64), expectedCwd: root }]));
   // Nothing is minted before the bind. The runtime exposes `bind` and nothing else, and the only
   // credential in play is the CEO's own session secret against its own live binding.
-  expect(Object.keys(runtime)).toEqual(["bind"]);
+  expect(Object.keys(runtime)).toEqual(["bind", "release"]);
   const consumed = vi.spyOn(cp.ownerAuthority, "consumeApproval");
   const principal = { sessionId: ceo.sessionId, sessionSecret: ceo.sessionSecret! };
   const request = { requestId: randomUUID(), projectId: "project-a", role: "PRIMARY_CTO",

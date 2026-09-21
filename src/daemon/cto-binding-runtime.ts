@@ -89,6 +89,10 @@ export function createCtoBindingRuntime(cp: ControlPlane, rawTargets: string | u
   return Object.freeze({
     bind: (principal: { sessionId: string; sessionSecret: string }, request: unknown) =>
       service.execute({ method: "ctoBinding.bind", principal, request }),
+    // The removing half. It takes no deployment-owned target pin because it produces no
+    // binding: a release needs to know which binding it ends, not which runtime it trusts.
+    release: (principal: { sessionId: string; sessionSecret: string }, request: unknown) =>
+      service.release({ method: "ctoBinding.release", principal, request }),
   });
 }
 export type CtoBindingRuntime = ReturnType<typeof createCtoBindingRuntime>;
