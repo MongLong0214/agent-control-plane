@@ -1,0 +1,10 @@
+Limit: this door's caller is now anyone holding the operator socket's bearer credential; cp.config.ownerIdentities no longer narrows it, and the liveness proof is the whole bound
+Ruled-out: widening the liveness proof so that a gate could be kept | the proof is what bounds the door, so loosening it to pay for a check would remove the only thing doing the work
+Warn: nonce and approved are gone from the wire but the parser ignores unnamed params, so an older agentctl still sending them is not refused — a caller who believes they are still being checked will be wrong
+Record-Id: r-c54bbd2db8ec
+Provenance: inherited fc754aefe9a8fbb1f94acbd759356cd93839922a
+
+Warn: USAGE lost 25 entries to a merge that was removing one of them. The commands themselves — github, repair, capacity, project, actor, telegram, binding recover-dead and the two conversation entries — were never touched; only their usage text went. If an entry disappears again, read the merge that changed this block rather than the command it describes
+Blast: local
+Record-Id: r-0884e51e9013
+Provenance: inherited 295990097fa4568440bda1ff8a10cfc85422eed0
