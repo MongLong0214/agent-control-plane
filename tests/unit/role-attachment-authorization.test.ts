@@ -1,14 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { fileURLToPath } from "node:url";
 import { queryObjects } from "node:v8";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import ts from "typescript";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { digestOf } from "../../src/core/digest.ts";
 import { type Decision, allow } from "../../src/core/errors.ts";
-import { approvalSchema, type AttachmentCredential } from "../../src/session/role-attachment-credentials.ts";
+import type { AttachmentCredential } from "../../src/session/role-attachment-credentials.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
@@ -200,21 +198,6 @@ describe("role attachment authorization without sockets", () => {
     grant();
     expect(daemon.attachments.authorize(attached).allowed).toBe(true);
     expect(port.currentHolderConnected(roleKey)).toBe(true);
-  });
-
-  it("the owner-approval normal form declares exactly the receipt's fields", () => {
-    // Interfaces are erased at runtime. Derive their keys from the real declaration with the type
-    // checker, including optional/inherited fields, rather than a second field list. The schema
-    // is no longer read by attachment issuance; `src/ceo/cto-binding-delegation.ts` is its only
-    // consumer, and this witness moves with the declaration when that path goes.
-    const path = fileURLToPath(new URL("../../src/ceo/owner-authority.ts", import.meta.url));
-    const program = ts.createProgram([path], { types: [], noEmit: true });
-    const checker = program.getTypeChecker();
-    const module = checker.getSymbolAtLocation(program.getSourceFile(path)!)!;
-    const declaration = checker.getExportsOfModule(module).find((symbol) => symbol.name === "OwnerApprovalReceipt")!;
-    const receiptFields = checker.getPropertiesOfType(checker.getDeclaredTypeOfSymbol(declaration))
-      .map((symbol) => symbol.name).sort();
-    expect(Object.keys(approvalSchema.shape).sort()).toEqual(receiptFields);
   });
 
   it("attach takes an empty slot and a later detach cannot evict its incumbent", () => {
