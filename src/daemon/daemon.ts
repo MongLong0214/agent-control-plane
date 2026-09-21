@@ -320,7 +320,9 @@ export const BOOTSTRAP_OPERATOR_METHODS: ReadonlySet<OperatorMethod> = new Set([
   // parked daemon could clear, and the only door that could clear it was opened after start()
   // had already refused. This method is narrower than the others on this list, not wider — it
   // spawns nothing, mints no generation, and releases exactly one binding whose process this
-  // machine can prove is gone, under an owner approval it verifies before it acts.
+  // machine can prove is gone. The proof is what makes it narrow; it carried an owner approval
+  // too, until that approval turned out to be one this same door minted from the request that
+  // was asking for it.
   OPERATOR_METHOD.BINDING_RECOVER_DEAD,
   OPERATOR_METHOD.DAEMON_STATUS,
 ]);
@@ -1079,30 +1081,19 @@ export class Daemon {
   /**
    * Releases a canonical PRIMARY_CTO binding whose session's process is provably gone.
    *
-   * This method admits its own owner-approval envelope rather than loading one an earlier call
-   * left behind, and that is a deliberate departure from `actor.claimCanonicalCto`, which reads
-   * a decision `owner.approveClaimCanonicalCto` minted beforehand
-   * (`canonical-self-claim-operator.ts`'s `loadAdmittedOwnerApproval`). The separation works
-   * there because both calls happen while the daemon is up. It cannot work here: the state this
-   * recovers is one in which `start()` has already refused, and `OWNER_APPROVE` and
-   * `OWNER_APPROVE_CLAIM_CANONICAL_CTO` are both outside `BOOTSTRAP_OPERATOR_METHODS`, so no
-   * approval can be minted while parked and in a real outage none was minted before. Requiring a
-   * pre-existing approval would make the remedy unreachable in exactly the state that needs it —
-   * the defect this whole change removes, reintroduced one layer down.
+   * No owner-approval envelope is minted, admitted or consumed here. This method used to build
+   * one and put it through `admitCliOwnerApproval`, and the reason it had to build its own rather
+   * than load one minted earlier was itself the tell: the state this recovers is one in which
+   * `start()` has already refused, `OWNER_APPROVE` is outside `BOOTSTRAP_OPERATOR_METHODS`, and
+   * in a real outage nobody had minted anything beforehand. So the door minted the approval for
+   * the caller, from the caller's own request, at the moment the caller asked — a decision that
+   * could only ever say yes, recorded as though someone had been asked.
    *
-   * Nothing about the verification is weakened to buy that. `admitCliOwnerApproval` is the same
-   * function `owner.approve` and `owner.approveClaimCanonicalCto` call: the same `IngressGuard`,
-   * the same CLI owner allowlist drawn from `cp.config.ownerIdentities`, the same nonce replay
-   * record, and the same `ownerApprovalPayload` envelope digest. The receipt it returns is then
-   * put through `OwnerAuthority.consumeApproval`, which re-runs `assertApproval` against the
-   * durable `inbound_messages` row and the `INGRESS_ADMITTED` audit event before spending it
-   * exactly once. What changes is *when* the envelope is admitted, not *what makes it valid*,
-   * and the admission happens inside the recovery's own transaction so a refusal spends nothing.
-   *
-   * The peer is still the socket's authenticated identity, never a request field:
-   * `peer.actor` comes from the bearer credential the listener bound, and an actor this
-   * deployment has not allowlisted as a CLI owner is refused by the guard before any state is
-   * read.
+   * `peer.actor` still travels, and it is still the socket's authenticated identity rather than
+   * a request field, but it is now evidence written into the audit record instead of a name
+   * checked against `cp.config.ownerIdentities`. What the daemon proves before releasing anything
+   * is in `dead-binding-recovery.ts`: the named generation is the one in force and the process
+   * holding it is provably gone.
    */
   private executeDeadBindingRecovery(
     request: OperatorRequest,
@@ -1115,9 +1106,6 @@ export class Daemon {
       audit: this.cp.audit,
       sessions: this.cp.sessions,
       bindings: this.cp.bindings,
-      ownerAuthority: this.cp.ownerAuthority,
-      admitOwnerApproval: (actor, approval, nonce) =>
-        this.admitCliOwnerApproval(actor, approval, nonce),
       // No liveness seam is threaded through here on purpose. The probe's own injection points
       // exist so `probeSessionLiveness` can be exercised for the codes a test cannot provoke
       // (EPERM in particular); the daemon path takes the real syscall, so a test that drives

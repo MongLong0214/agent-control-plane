@@ -13,7 +13,7 @@ import {
   type ReconcileReport,
 } from "../../src/daemon/daemon.ts";
 import {
-  DEAD_BINDING_RECOVERY_OPERATION,
+  DEAD_BINDING_RECOVERY_ROLE,
   probeSessionLiveness,
 } from "../../src/daemon/dead-binding-recovery.ts";
 import {
@@ -276,7 +276,14 @@ const deadCanonicalCto = async (
   };
 };
 
-/** The recovery request the owner's `agentctl` would send, with every field overridable. */
+/**
+ * The recovery request `agentctl binding recover-dead` sends, with every field overridable.
+ *
+ * Five fields, all of them naming the target. There is no `nonce` and no `approved`: the door
+ * no longer mints or reads an owner decision, and `recoverableState.admittedNonces` below is the
+ * witness for that — it stays empty through every case in this file, including the ones that
+ * succeed.
+ */
 const recoveryRequest = (fixture: Fixture, overrides: Record<string, unknown> = {}) => ({
   requestId: "req-recover-dead-binding",
   method: OPERATOR_METHOD.BINDING_RECOVER_DEAD,
@@ -286,8 +293,6 @@ const recoveryRequest = (fixture: Fixture, overrides: Record<string, unknown> = 
     sessionId: fixture.sessionId,
     sessionIncarnation: fixture.sessionIncarnation,
     expectedBindingGeneration: fixture.bindingGeneration,
-    nonce: `owner-recovery-${fixture.projectId}`,
-    approved: true,
     ...overrides,
   },
 });
@@ -367,7 +372,10 @@ describe("a canonical CTO whose process is gone", () => {
       ])?.status,
     ).toBe("REJECTED");
     expect(harness.cp.audit.byKind("DEAD_BINDING_RECOVERED")).toHaveLength(1);
-    expect(harness.cp.audit.byKind("OWNER_APPROVAL_CONSUMED")).toHaveLength(1);
+    // Asserted as zero rather than dropped: the release happening without one is the change, so
+    // an approval reappearing here would be a regression this case has to catch.
+    expect(harness.cp.audit.byKind("OWNER_APPROVAL_CONSUMED")).toHaveLength(0);
+    expect(recoverableState(harness).admittedNonces).toEqual([]);
 
     await daemon.stop();
   });
@@ -386,66 +394,69 @@ describe("a canonical CTO whose process is gone", () => {
   });
 
   /**
-   * Case 2 — unauthorized is refused, at each of the three places authority is established: who
-   * the socket says is calling, whether the owner said yes, and whether the request carries a
-   * decision at all.
+   * Case 2 — the authority this door actually has, stated in both directions.
    *
-   * Each refusal also has to be inert. A door that denies and still spends the nonce, or denies
-   * and still releases the role, is not a door that refused.
+   * It used to be established in three places: who the socket said was calling, whether the
+   * owner had said yes, and whether the request carried a decision at all. Two of those are
+   * gone, and the first case here is what says so out loud rather than leaving their absence to
+   * be inferred from tests that no longer exist. An allowlist check re-added to this door would
+   * fail it.
+   *
+   * The second case is the half that remains: a request that does not name its target is
+   * refused, and a refusal has to be inert — a door that denies and still releases the role is
+   * not a door that refused.
    */
-  it("refuses a peer this deployment has not allowlisted as an owner", async () => {
+  it("admits a peer this deployment has not allowlisted as an owner", async () => {
     const fixture = await deadCanonicalCto();
     const daemon = new Daemon(fixture.harness.cp, { stateDir: tempDir("acp-dsr-stranger-") });
     const door = recordingDoor();
     const starting = daemon.start({ bootstrapDoor: door.open });
     await vi.waitFor(() => expect(door.opened).toHaveLength(1));
-    const before = recoverableState(fixture.harness);
 
-    const refused = await daemon.handleOperatorRequest(recoveryRequest(fixture), STRANGER_PEER);
+    // STRANGER_PEER holds the operator socket's bearer credential and is named nowhere in
+    // `ownerIdentities`. That used to be INGRESS_ACTOR_NOT_ALLOWLISTED. What bounds the door now
+    // is the liveness proof, which this fixture satisfies and which no caller can supply.
+    const recovered = await daemon.handleOperatorRequest(recoveryRequest(fixture), STRANGER_PEER);
 
-    expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED);
-    expect(recoverableState(fixture.harness)).toEqual(before);
-    expect(await modeOf(daemon)).toBe("BOOTSTRAP");
-    await daemon.stop();
+    expect(recovered.allowed, JSON.stringify(recovered)).toBe(true);
+    expect(activeAssignmentIds(fixture.harness)).not.toContain(fixture.assignmentId);
+    // And nothing was minted on the way: no nonce admitted, no owner approval consumed.
+    expect(recoverableState(fixture.harness).admittedNonces).toEqual([]);
+    expect(fixture.harness.cp.audit.byKind("OWNER_APPROVAL_CONSUMED")).toHaveLength(0);
+    // The actor that reached the socket is still recorded, because the audit answers "who did
+    // this" even where nothing was checking the answer.
+    const [recordedEvent] = fixture.harness.cp.audit.byKind("DEAD_BINDING_RECOVERED");
+    expect(recordedEvent?.actor).toBe(STRANGER_PEER.actor);
+
     await starting;
+    await daemon.stop();
   });
 
-  it("refuses an owner decision that is a rejection", async () => {
+  it("refuses a request that does not name its target", async () => {
     const fixture = await deadCanonicalCto();
-    const daemon = new Daemon(fixture.harness.cp, { stateDir: tempDir("acp-dsr-rejected-") });
+    const daemon = new Daemon(fixture.harness.cp, { stateDir: tempDir("acp-dsr-no-target-") });
     const door = recordingDoor();
     const starting = daemon.start({ bootstrapDoor: door.open });
     await vi.waitFor(() => expect(door.opened).toHaveLength(1));
     const before = recoverableState(fixture.harness);
 
-    const refused = await daemon.handleOperatorRequest(
-      recoveryRequest(fixture, { approved: false }),
-      OWNER_PEER,
-    );
-
-    expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
-    expect(recoverableState(fixture.harness)).toEqual(before);
-    await daemon.stop();
-    await starting;
-  });
-
-  it("refuses a request carrying no owner decision at all", async () => {
-    const fixture = await deadCanonicalCto();
-    const daemon = new Daemon(fixture.harness.cp, { stateDir: tempDir("acp-dsr-no-decision-") });
-    const door = recordingDoor();
-    const starting = daemon.start({ bootstrapDoor: door.open });
-    await vi.waitFor(() => expect(door.opened).toHaveLength(1));
-    const before = recoverableState(fixture.harness);
-
-    for (const missing of [{ approved: undefined }, { nonce: undefined }, { approved: "yes" }]) {
+    const malformed: Array<Record<string, unknown>> = [
+      { projectId: undefined },
+      { sessionId: "" },
+      { sessionIncarnation: undefined },
+      { expectedBindingGeneration: "1" },
+      { expectedBindingGeneration: 0 },
+    ];
+    for (const params of malformed) {
       const refused = await daemon.handleOperatorRequest(
-        recoveryRequest(fixture, missing),
+        recoveryRequest(fixture, params),
         OWNER_PEER,
       );
-      expect(refused.allowed).toBe(false);
-      expect(refused.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
+      expect({ params, allowed: refused.allowed, reasonCode: refused.reasonCode }).toEqual({
+        params,
+        allowed: false,
+        reasonCode: ReasonCode.INVALID_ARGUMENT,
+      });
     }
     expect(recoverableState(fixture.harness)).toEqual(before);
     await daemon.stop();
@@ -549,12 +560,19 @@ describe("a canonical CTO whose process is gone", () => {
   /**
    * Case 5 — a failure part-way through leaves nothing behind.
    *
-   * The revoke is made to throw because it is the last write of the sequence: by the time it runs
-   * the approval has been admitted *and* consumed, so if any of it were outside the transaction
-   * this is where it would show. Comparing the whole of `recoverableState` rather than the
-   * binding alone is the point — a rollback that restored the assignment but kept the admitted
-   * nonce would leave an owner decision on record for something that did not happen, and the
-   * nonce could then never be reused.
+   * The *audit* is made to throw, not the revoke, and the difference is what gives this case its
+   * teeth. The revoke is the first write of the sequence now, so a revoke that throws has written
+   * nothing and a run with no transaction at all would look identical — the case would pass
+   * either way and prove nothing. It used to distinguish them only because an owner approval had
+   * been admitted and consumed before the revoke ran; when that went, so did the witness, and the
+   * falsifiability harness said so before this comment was written.
+   *
+   * Failing at the audit instead puts a real write on the wrong side of the boundary:
+   * `BindingRegistry.revoke` has already flipped the assignment to REVOKED *and* fenced the
+   * outbox message. Without the transaction those two stand while the `DEAD_BINDING_RECOVERED`
+   * record that explains them never lands. Comparing the whole of `recoverableState` rather than
+   * the binding alone is the point — a rollback that restored the assignment but left the outbox
+   * fenced is not a rollback, and `recoverableState` is what notices.
    */
   it("leaves no partial change when the release fails mid-flight", async () => {
     const fixture = await deadCanonicalCto();
@@ -564,19 +582,28 @@ describe("a canonical CTO whose process is gone", () => {
     await vi.waitFor(() => expect(door.opened).toHaveLength(1));
     const before = recoverableState(fixture.harness);
 
-    const revoke = vi.spyOn(fixture.harness.cp.bindings, "revoke").mockImplementation(() => {
-      throw new Error("simulated storage failure during revoke");
-    });
+    // Only this door's own record throws. Anything else the request audits on its way through is
+    // left alone, so the failure is the one the case names rather than the first audit call.
+    const record = fixture.harness.cp.audit.record.bind(fixture.harness.cp.audit);
+    const audit = vi
+      .spyOn(fixture.harness.cp.audit, "record")
+      .mockImplementation((event: Parameters<typeof record>[0]) => {
+        if (event.kind === "DEAD_BINDING_RECOVERED") {
+          throw new Error("simulated storage failure while recording the release");
+        }
+        return record(event);
+      });
     const failed = await daemon.handleOperatorRequest(recoveryRequest(fixture), OWNER_PEER);
-    revoke.mockRestore();
+    audit.mockRestore();
 
     expect(failed.allowed).toBe(false);
     expect(recoverableState(fixture.harness)).toEqual(before);
     expect(fixture.harness.cp.audit.byKind("DEAD_BINDING_RECOVERED")).toHaveLength(0);
-    expect(fixture.harness.cp.audit.byKind("OWNER_APPROVAL_CONSUMED")).toHaveLength(0);
+    expect(activeAssignmentIds(fixture.harness)).toContain(fixture.assignmentId);
     expect(await modeOf(daemon)).toBe("BOOTSTRAP");
 
-    // And the nonce is genuinely unspent: the same request succeeds once the failure is gone.
+    // And nothing about the failed attempt bars a second one: the same request succeeds once the
+    // failure is gone. It is the generation, not a spent token, that makes a repeat inert.
     const retried = await daemon.handleOperatorRequest(recoveryRequest(fixture), OWNER_PEER);
     expect(retried.allowed).toBe(true);
 
@@ -692,7 +719,7 @@ describe("proving a session's process is gone", () => {
     ).toBe("UNKNOWN");
   });
 
-  it("names its own operation, so no other owner approval can be replayed at this door", () => {
-    expect(DEAD_BINDING_RECOVERY_OPERATION).toBe("binding.recover_dead_canonical");
+  it("recovers exactly one role, named here and not taken from the request", () => {
+    expect(DEAD_BINDING_RECOVERY_ROLE).toBe(Role.PRIMARY_CTO);
   });
 });
