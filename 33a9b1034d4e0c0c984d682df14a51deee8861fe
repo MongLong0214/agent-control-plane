@@ -1,0 +1,13 @@
+Limit: issuance is now repeatable, so `roleAttachment.issue` is no longer once-per-decision. The operator retry test changed from asserting a refusal to asserting a distinct credential: the refusal it used to make was a side effect of the owner decision being single-use, not a property of the idempotency-cache exclusion it was named after
+Limit: `approvalSchema` and its `OwnerApprovalReceipt` typing stay in this file although nothing here reads them; `src/ceo/cto-binding-delegation.ts` is now their only consumer, and both the declaration and `role-attachment-owner-normal-form-fields` move when that path is removed
+Limit: the stale `!approval` entry in refusal-operands-unanswered.mjs was reported only by `pnpm guards:operands` as a declaration error, after the whole gate run reached it — an entry naming an operand that no longer exists is invisible to typecheck, lint and the test suite
+Ruled-out: keeping the owner decision and only removing the human step | the decision is minted by whoever holds the operator bearer token and says nothing the two surviving checks do not: `verifySecret` proves the caller holds the session's own secret, and `scope()` proves that session is the live PRIMARY_CTO holder at its current incarnation and generation
+Ruled-out: leaving the unattached records to `#authorizeRecord`'s lazy expiry | it only notices a closed window when that exact credential is presented again, which a caller who has already re-issued never does, so with issuance repeatable the map would grow for the daemon's lifetime
+Warn: the sweep runs inside `issue()`, so a deployment that issues once and never again keeps that one expired record until the binding switches. It bounds growth; it is not a timer, and nothing reaps on an idle daemon
+Warn: deleting the six owner rows left `role-attachment-owner-normal-form-fields` pointing at a test title that no longer existed. The `killedBy` string is matched at sweep time, not at deletion time, so a row orphaned this way is only reported by a full falsifiability run
+Record-Id: r-55fd66905d8e
+Provenance: inherited 72f1c18acfc89fe04204cf76753d9940f46fbb9a
+
+Warn: a killedBy selector is matched at sweep time, not at rename time, so renaming a test silently orphans every row naming it; this is the second row in this series broken that way and neither typecheck, lint, the suite nor pnpm gates can see it — only the 40-minute CI falsifiability shard does
+Record-Id: r-61b5f11602bd
+Provenance: inherited 7a1ee4f7352ab61f5049f779faa601f63e7d16e1
