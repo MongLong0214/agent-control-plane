@@ -53,13 +53,15 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl actor unregister <id> <generation> <expected-set-generation> <reason>
   agentctl telegram reply acknowledge <nonce> <reason-code> <evidence-digest>
                                            record that a terminal reply was reviewed and will not retry
-  agentctl binding recover-dead <projectId> <sessionId> <incarnation> <generation> <nonce>
+  agentctl binding recover-dead <projectId> <sessionId> <incarnation> <generation>
                                            release a PRIMARY_CTO binding whose session's OS process
                                            this host can prove is gone. Refuses a live session and
                                            refuses one whose liveness cannot be established. Mints
                                            no session and no generation; the role is simply left
                                            unbound. Reachable while agentcpd is parked, which is
-                                           the state this exists for.
+                                           the state this exists for. There is no owner approval
+                                           to present: the liveness proof is the whole bound, and
+                                           <generation> is what stops a repeat.
   agentctl conversation contradictions     turns whose records disagree, with the ids to cite
   agentctl conversation adjudicate <actor> <turn> <reason-code> <evidence-digest> <id>...
   agentctl conversation unresolved         turns waiting on a person, with what each already holds
