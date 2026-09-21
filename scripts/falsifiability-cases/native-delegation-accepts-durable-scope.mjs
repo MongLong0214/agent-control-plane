@@ -7,7 +7,7 @@ const nativeDelegationAcceptsDurableScope = {
   "find": "!scope.success || scope.data.revokePolicy !== \"owner-or-ceo-loss\"",
   "replace": "!scope.success || scope.data.revokePolicy === \"owner-or-ceo-loss\"",
   "killedBy": [
-    "tests/unit/native-owner-auth.test.ts::native"
+    "tests/unit/cto-binding-durable-admission.test.ts::durable admission on the existing authenticated socket"
   ]
 };
 

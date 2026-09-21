@@ -7,7 +7,7 @@ const nativeDelegationValidScopeIsAdmissible = {
   "find": "!parsed.success || Date.parse(parsed.data.scope.expiresAt) <= cp.clock.now().getTime()",
   "replace": "!parsed.success || Date.parse(parsed.data.scope.expiresAt) > cp.clock.now().getTime()",
   "killedBy": [
-    "tests/unit/native-owner-auth.test.ts::native"
+    "tests/unit/cto-binding-durable-admission.test.ts::durable admission on the existing authenticated socket"
   ]
 };
 
