@@ -1,0 +1,16 @@
+Limit: the CommitLore installer refuses any Node below 22.23.2 while this matrix's lower leg is 22.18.0, so the CLI is installed under a bootstrap Node of its own and never after the leg's setup-node
+Limit: install.sh exits with its coding-agent host-wiring status rather than with whether the CLI is usable, so the step reports that status as information and lets the absolute-wrapper smoke decide
+Warn: the bootstrap directory is normalised with pwd -P before it is used in the entrypoint containment check; without it the check compares spellings, and macOS reporting /private/var where TMPDIR says /var made the step exit 1 with the CLI correctly installed
+Record-Id: r-cibootstrapsthemultirecordvalidator
+Provenance: inherited 1a9a1e77b6cd195cbaf87d221d48bcecb3ae6903
+
+Limit: the version comparison is placed before the realpath calls so a wrong version refuses on its own cause; with realpath first, a wrong-version case died on a missing entrypoint and the version check never ran
+Warn: POSIX sh has no pipefail, so piping runtime-identity into tee returned tee's status and the smoke passed on a CLI that exited 7 with truncated JSON; keep the status of the left-hand command and parse the whole output, never substring-match a stream whose writer may have died mid-write
+Record-Id: r-thesmokereadteesstatusnotthecli
+Follows: r-cibootstrapsthemultirecordvalidator
+Provenance: inherited b75fb9738aa3cf91de9129d93eda20a34c414ef1
+
+Warn: a command substitution inside test discards that command exit status; only a bare assignment propagates it to set -e, measured both ways, so collect the output in its own statement and compare the variable
+Record-Id: r-testdiscardedthewrappersstatus
+Follows: r-thesmokereadteesstatusnotthecli
+Provenance: inherited 831fe785fa94a4f682f736f59762bf215ecbbf94
