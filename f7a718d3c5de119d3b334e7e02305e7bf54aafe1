@@ -1,0 +1,16 @@
+Limit: the claude ancestor's working directory is now recorded and not compared against anything; ACP_CANONICAL_CTO_WORKDIR is still set by the launchd plist and threaded into the claim config, so it survives as a write-only value a later reader may mistake for an enforced pin
+Warn: what was removed is the owner approval, not the peer-credential authority: the claim still authenticates by kernel peer credential on its own socket and still derives the claimant identity from process ancestry, so reintroducing the approval restores the eight-day outage rather than restoring safety
+Blast: system
+Undo: costly
+Certainty: firm
+Unverified: the four CI guard-falsifiability shards have not run against this tree; eight envelope rows whose mutation target no longer exists were deleted rather than re-anchored
+Record-Id: r-c990d8c1a27a
+Provenance: inherited e29a50f67239d34b595bff124c43d4d7843b5e6d
+
+Limit: the row's killedBy names one verdict, `refuses an empty projectId`; the empty-claimedSessionUuid case, the two non-string cases and the control run in the same file but are not what the harness selects, so only the projectId path is proved to kill the mutant
+Limit: deleting a falsifiability case orphans its operand silently — nothing reported the unnamed operand until the whole 29-gate run reached guards:operands, which is long after the deletion that caused it
+Ruled-out: adding `value.length > 0` to the unanswered list | it is killable and was killed on the first attempt, so recording it as a debt would have recorded a debt that does not exist
+Ruled-out: keeping `an-empty-string-nonce-is-not-a-nonce` and retargeting its find string | the case's id, prose and killedBy all named the owner-approval nonce, a field this branch deletes, so the row would have been true about an operand under a name for a thing that no longer exists
+Warn: the sibling `typeof value === "string"` stays unanswered on the reason that TypeScript refuses its mutant. That reason holds only while both parsed fields flow into `string`-typed request fields; a future field typed `unknown` would make the mutant compile and the reason would lapse with nothing announcing it
+Record-Id: r-07f3e2dfdeaa
+Provenance: inherited 3cbd975f955b527b139059df8524a51bcb267a0b
