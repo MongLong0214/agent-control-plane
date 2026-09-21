@@ -103,6 +103,13 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string }> = 
     anchor: "    return this.db.txDecision(() => this.#authorize(rawPrincipal, rawRequest));",
   },
   {
+    // Same shape at the removing door. The two openers differ only in the method they call, so
+    // the anchor has to carry that name to stay unique within the file.
+    label: "CtoBindingDelegation.authorizeRelease",
+    file: "ceo/cto-binding-delegation.ts",
+    anchor: "    return this.db.txDecision(() => this.#authorizeRelease(rawPrincipal, rawRequest));",
+  },
+  {
     label: "VerificationEngine.pinRunScopedCommands",
     file: "verify/verification-engine.ts",
     anchor: "regardless of the outcome, so a denial must roll the pin attempt back.\n    return this.db.txDecision(() => {",

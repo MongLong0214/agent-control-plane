@@ -470,23 +470,37 @@ export const startLocalMcpListeners = async (
     handshakeTimeoutMs,
     (auth, _opening, credential) => {
       const server = createHermesServer(hermesPort, auth);
+      // The description said "under an existing owner delegation. Restart revokes grants" until
+      // the grant was removed; it now names the authority that actually decides. A tool
+      // description is what the caller reads to know what it may ask for, so a stale one is a
+      // wrong answer to that question even though nothing dispatches on it.
+      // Both doors publish through one boundary rather than a copy each. The sanitization below
+      // is the only place a nested internal denial is closed, and a second copy of it would be a
+      // second authority on that one fact — and would leave the guard's anchor matching twice,
+      // so the row watching it would no longer name a unique site.
+      const publishCtoBinding = (ask: (request: unknown) => Decision<unknown>) =>
+        async ({ request }: { request: Record<string, unknown> }) => {
+          try {
+            const peer = auth();
+            const decision = peer.allowed ? ask(request) : peer;
+            // Internal composition may return an exception as a denial instead of throwing.
+            return respond(!decision.allowed && decision.reasonCode === ReasonCode.INTERNAL_ERROR
+              ? deny(ReasonCode.INTERNAL_ERROR, "CTO binding request failed", {})
+              : decision);
+          } catch {
+            // Do not inspect/log the exception: even its message, code or getters may
+            // contain private deployment data. Cover authentication and serialization too.
+            return respond(deny(ReasonCode.INTERNAL_ERROR, "CTO binding request failed", {}));
+          }
+        };
       server.registerTool("cto_binding_bind", {
-        description: "Bind or replace a proven-dead CTO under an existing owner delegation. Restart revokes grants; stale retries are refused.",
+        description: "Bind or replace a proven-dead CTO. The caller must hold the live CEO binding; stale retries are refused.",
         inputSchema: { request: z.record(z.unknown()) },
-      }, async ({ request }) => {
-        try {
-          const peer = auth();
-          const decision = peer.allowed ? ctoBinding.bind(credential, request) : peer;
-          // Internal composition may return an exception as a denial instead of throwing.
-          return respond(!decision.allowed && decision.reasonCode === ReasonCode.INTERNAL_ERROR
-            ? deny(ReasonCode.INTERNAL_ERROR, "CTO binding request failed", {})
-            : decision);
-        } catch {
-          // Do not inspect/log the exception: even its message, code or getters may
-          // contain private deployment data. Cover authentication and serialization too.
-          return respond(deny(ReasonCode.INTERNAL_ERROR, "CTO binding request failed", {}));
-        }
-      });
+      }, publishCtoBinding((request) => ctoBinding.bind(credential, request)));
+      server.registerTool("cto_binding_release", {
+        description: "End the current CTO binding for a project, naming its generation. The caller must hold the live CEO binding; the incumbent need not be dead.",
+        inputSchema: { request: z.record(z.unknown()) },
+      }, publishCtoBinding((request) => ctoBinding.release(credential, request)));
       // The authenticator travels with the connection, not just the server. Reaching this line
       // proves the peer held the CEO binding at handshake; `ask` re-runs `auth` so a socket
       // that outlives its binding cannot keep receiving the owner.
@@ -1915,7 +1929,7 @@ const currentPendingNormalHandoff = (
     `SELECT handoff_id, project_id, from_session_id, from_generation
        FROM handoffs
       WHERE to_session_id = ? AND kind = 'HANDOFF' AND status = 'PENDING'
-      ORDER BY created_at`,
+      ORDER BY created_at, handoff_id`,
     [sessionId],
   );
   if (rows.length !== 1) {
