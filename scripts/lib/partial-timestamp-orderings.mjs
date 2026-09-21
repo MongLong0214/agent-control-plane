@@ -37,7 +37,11 @@ export const PARTIAL_TIMESTAMP_ORDERINGS = new Map([
   ["src/conversation/turn-coordinator.ts:1177", "ORDER BY claimed_at ASC"],
   ["src/conversation/turn-coordinator.ts:1763", "ORDER BY claimed_at ASC"],
   ["src/cto/cto-lifecycle.ts:783", "ORDER BY created_at DESC"],
-  ["src/daemon/agentcpd.ts:1956", "ORDER BY created_at"],
+  // `currentPendingNormalHandoff`. Re-keyed from 1956 when removing the owner-approval delegation
+  // handlers shortened this file; the query itself is untouched. This entry is keyed to a line, so
+  // every edit above it moves it, and it has now gone stale on three separate changes for that one
+  // reason. The mechanism is the key, not any of the changes that tripped it.
+  ["src/daemon/agentcpd.ts:1918", "ORDER BY created_at"],
   ["src/github/github-kernel.ts:3419", "ORDER BY created_at DESC"],
   ["src/github/github-kernel.ts:3845", "ORDER BY created_at"],
   ["src/run/run-engine.ts:1075", "ORDER BY created_at"],

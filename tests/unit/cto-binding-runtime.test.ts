@@ -12,7 +12,6 @@ import { defaultProcessAncestryInspector, defaultExecutingImageInspector, defaul
 import { allow, type Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, SessionLifecycle } from "../../src/domain/types.ts";
-import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeHarness, registerFixtureProject, TEST_OWNER, type Harness } from "../helpers/harness.ts";
 
@@ -57,7 +56,7 @@ async function mcp(path: string, credential: unknown, rawResponse = false) {
 }
 
 it.each(["success", "external-nesting", "reentrant-target", "after-commit-fault", "capacity-boundary", "denied-flood", "non-owner-flood", "wrong-pid", "wrong-native-uuid", "wrong-attestation", "stale-start", "stale-after-transcript"])("Claude target pins use the canonical verifier without canonical owner approval: %s", async (mode) => {
-  h = makeHarness(); const { cp, clock, root } = h; await registerFixtureProject(h, "project-a");
+  h = makeHarness(); const { cp, root } = h; await registerFixtureProject(h, "project-a");
   const ceo = cp.sessions.create({ provider: "scripted", model: "ceo", osPid: process.pid });
   value(cp.sessions.transition(ceo.sessionId, SessionLifecycle.READY));
   value(cp.bindings.bind({ role: Role.CEO, sessionId: ceo.sessionId }));
@@ -83,20 +82,12 @@ it.each(["success", "external-nesting", "reentrant-target", "after-commit-fault"
   const runtime = createCtoBindingRuntime(cp, JSON.stringify([{ provider: "claude", sessionId: target.sessionId,
     incarnation: target.incarnation, nativeSessionUuid: nativeUuid, requiredExecutorVersion: "0.0.0-fixture",
     expectedExecutorRealpath: "/fixture/claude", expectedExecutorSha256: "sha256:" + "1".repeat(64), expectedCwd: root }]));
-  const scope = { projectId: "project-a", role: "PRIMARY_CTO", action: "bind-or-rebind", ceoSessionId: ceo.sessionId,
-    ceoIncarnation: ceo.incarnation, expiresAt: new Date(clock.now().getTime() + 3600000).toISOString(),
-    ...(mode === "after-commit-fault" ? {
-      revokePolicy: "owner-or-ceo-loss",
-      ceoActorId: cp.db.get<{ actor_id: string }>("SELECT actor_id FROM assignments WHERE role_key = 'CEO'")!.actor_id,
-    } : { revokePolicy: "owner-or-ceo-loss-or-restart" }) };
-  const approval = { operation: "ctoBinding.delegate", parameters: scope, runId: null, candidateSnapshotDigest: null,
-    approved: true, idempotencyKey: randomUUID() };
-  const receipt = value(new IngressGuard(cp.db, clock, cp.audit, { cli: { allowedActors: [TEST_OWNER.actor] } }).admitOwnerApproval(
-    { channel: "cli", actor: TEST_OWNER.actor, nonce: randomUUID(), payload: ownerApprovalPayload(approval) }, approval));
-  const grant = value(runtime.grant(scope, receipt));
+  // Nothing is minted before the bind. The runtime exposes `bind` and nothing else, and the only
+  // credential in play is the CEO's own session secret against its own live binding.
+  expect(Object.keys(runtime)).toEqual(["bind"]);
   const consumed = vi.spyOn(cp.ownerAuthority, "consumeApproval");
   const principal = { sessionId: ceo.sessionId, sessionSecret: ceo.sessionSecret! };
-  const request = { delegationId: grant.delegationId, requestId: randomUUID(), projectId: "project-a", role: "PRIMARY_CTO",
+  const request = { requestId: randomUUID(), projectId: "project-a", role: "PRIMARY_CTO",
     action: "bind-or-rebind", targetSessionId: target.sessionId, expectedBindingGeneration: 1 };
   const beforeSessions = cp.db.get<{ n: number }>("SELECT count(*) AS n FROM sessions")!.n;
   if (mode === "external-nesting") cp.db.tx(() => {
@@ -119,9 +110,7 @@ it.each(["success", "external-nesting", "reentrant-target", "after-commit-fault"
     try { expect(() => runtime.bind(principal, request)).toThrow("fixture callback fault"); }
     finally { fault.mockRestore(); }
     expect(cp.bindings.history("PRIMARY_CTO:project-a")).toHaveLength(1);
-    expect(cp.audit.byKind("CTO_BINDING_DURABLE_REQUEST")).toHaveLength(1);
-    expect(cp.audit.byKind("CTO_BINDING_OPERATION_STARTED")).toHaveLength(1);
-    expect(cp.audit.byKind("CTO_BINDING_OPERATION_FINISHED")).toHaveLength(1);
+    expect(cp.audit.byKind("CTO_BINDING_DELEGATION_AUTHORIZED")).toHaveLength(2);
     value(cp.bindings.revoke("PRIMARY_CTO:project-a", "fixture callback boundary"));
     let lastAllowed = false;
     for (let generation = 2; generation <= 1025; generation++) {
@@ -132,7 +121,7 @@ it.each(["success", "external-nesting", "reentrant-target", "after-commit-fault"
     expect(lastAllowed, "generation 1025 must never be admitted after callback failure").toBe(false);
     // Post-commit uncertainty poisons this runtime, not merely the overflowing request.
     expect(cp.bindings.history("PRIMARY_CTO:project-a")).toHaveLength(1);
-    expect(cp.audit.byKind("CTO_BINDING_DURABLE_REQUEST")).toHaveLength(1);
+    expect(cp.audit.byKind("CTO_BINDING_DELEGATION_AUTHORIZED")).toHaveLength(2);
     expect(runtime.bind(principal, { ...request, expectedBindingGeneration: 2 }).allowed).toBe(false);
     return;
   }
@@ -186,53 +175,6 @@ it.each(["success", "external-nesting", "reentrant-target", "after-commit-fault"
   expect(runtime.bind(principal, request).allowed).toBe(false);
 });
 
-it.each(["before-request", "during-verification"])("durable expiry survives a denied production binding and clock rollback: %s", async (phase) => {
-  h = makeHarness(); const { cp, clock, root } = h;
-  await registerFixtureProject(h, "project-a");
-  const ceo = cp.sessions.create({ provider: "scripted", model: "fixture", osPid: process.pid });
-  value(cp.sessions.transition(ceo.sessionId, SessionLifecycle.READY));
-  value(cp.bindings.bind({ role: Role.CEO, sessionId: ceo.sessionId }));
-  const target = cp.sessions.create({ provider: "claude", model: "fixture", osPid: process.pid });
-  value(cp.sessions.transition(target.sessionId, SessionLifecycle.READY));
-  const nativeUuid = "11111111-1111-4111-8111-111111111111";
-  vi.spyOn(defaultProcessAncestryInspector, "snapshot").mockImplementation(() => ({
-    pid: process.pid, ppid: 1, command: "fixture", cwd: root, cwdProbeFailure: null,
-    startedAt: target.osProcessStartedAt, argv: ["/fixture/claude", "--session-id", nativeUuid],
-  }));
-  vi.spyOn(defaultExecutingImageInspector, "resolve").mockReturnValue({ imagePath: "/fixture/claude",
-    version: "0.0.0-fixture", sha256: "sha256:" + "1".repeat(64) });
-  vi.spyOn(defaultTranscriptReader, "locate").mockImplementation(() => {
-    if (phase === "during-verification") clock.advance(3600000);
-    return { path: join(root, "fixture.jsonl"), sizeBytes: 42 };
-  });
-  const pins = JSON.stringify([{ provider: "claude", sessionId: target.sessionId,
-    incarnation: target.incarnation, nativeSessionUuid: nativeUuid, requiredExecutorVersion: "0.0.0-fixture",
-    expectedExecutorRealpath: "/fixture/claude", expectedExecutorSha256: "sha256:" + "1".repeat(64), expectedCwd: root }]);
-  const runtime = createCtoBindingRuntime(cp, pins);
-  const scope = { projectId: "project-a", role: "PRIMARY_CTO", action: "bind-or-rebind",
-    ceoSessionId: ceo.sessionId, ceoIncarnation: ceo.incarnation,
-    ceoActorId: cp.db.get<{ actor_id: string }>("SELECT actor_id FROM assignments WHERE role_key = 'CEO'")!.actor_id,
-    expiresAt: new Date(clock.now().getTime() + 3600000).toISOString(), revokePolicy: "owner-or-ceo-loss" };
-  const approval = { operation: "ctoBinding.delegate", parameters: scope, runId: null,
-    candidateSnapshotDigest: null, approved: true, idempotencyKey: randomUUID() };
-  const receipt = value(new IngressGuard(cp.db, clock, cp.audit, { cli: { allowedActors: [TEST_OWNER.actor] } }).admitOwnerApproval(
-    { channel: "cli", actor: TEST_OWNER.actor, nonce: randomUUID(), payload: ownerApprovalPayload(approval) }, approval));
-  const grant = value(runtime.grant(scope, receipt));
-  const principal = { sessionId: ceo.sessionId, sessionSecret: ceo.sessionSecret! };
-  const request = { delegationId: grant.delegationId, requestId: randomUUID(), projectId: "project-a",
-    role: "PRIMARY_CTO", action: "bind-or-rebind", targetSessionId: target.sessionId, expectedBindingGeneration: 1 };
-  if (phase === "before-request") clock.advance(3600000);
-  expect(runtime.bind(principal, request).allowed).toBe(false);
-  expect(cp.bindings.activePrimaryCto("project-a")).toBeNull();
-  expect(cp.db.get<{ n: number }>("SELECT count(*) AS n FROM actor_target_attestations")!.n).toBe(0);
-  expect(cp.audit.byKind("CTO_BINDING_DURABLE_REQUEST")).toHaveLength(0);
-  expect(cp.audit.byKind("CTO_BINDING_DURABLE_REVOKED")).toHaveLength(1);
-  expect(cp.audit.byKind("CTO_BINDING_OPERATION_STARTED")).toHaveLength(1);
-  expect(cp.audit.byKind("CTO_BINDING_OPERATION_FINISHED")).toHaveLength(1);
-  clock.advance(-3600000);
-  expect(createCtoBindingRuntime(cp, pins).bind(principal, request).allowed).toBe(false);
-});
-
 it.each(["authentication", "binding"])("authenticated MCP callback never serializes a private exception: %s", async (seam) => {
   h = makeHarness(); const { cp, root } = h;
   const ceo = cp.sessions.create({ provider: "scripted", model: "fixture", osPid: process.pid });
@@ -249,7 +191,7 @@ it.each(["authentication", "binding"])("authenticated MCP callback never seriali
     : vi.spyOn(cp.db, "txDecision").mockImplementation(fail);
   let wire: Record<string, unknown> | undefined;
   try {
-    wire = await call({ request: { delegationId: randomUUID(), requestId: "fixture-request",
+    wire = await call({ request: { requestId: "fixture-request",
       projectId: "fixture-project", role: "PRIMARY_CTO", action: "bind-or-rebind",
       targetSessionId: ceo.sessionId, expectedBindingGeneration: 1 } });
     expect(fault).toHaveBeenCalled();
@@ -265,7 +207,7 @@ it.each(["authentication", "binding"])("authenticated MCP callback never seriali
 it.each([
   ["direct", "internal"], ["wire", "internal"], ["direct", "domain"], ["wire", "domain"],
 ])("nested target denial stays closed at the MCP publication boundary: %s/%s", async (surface, failure) => {
-  h = makeHarness(); const { cp, clock, root } = h; await registerFixtureProject(h, "project-a");
+  h = makeHarness(); const { cp, root } = h; await registerFixtureProject(h, "project-a");
   const ceo = cp.sessions.create({ provider: "scripted", model: "fixture", osPid: process.pid });
   value(cp.sessions.transition(ceo.sessionId, SessionLifecycle.READY));
   value(cp.bindings.bind({ role: Role.CEO, sessionId: ceo.sessionId }));
@@ -285,16 +227,7 @@ it.each([
   vi.stubEnv("ACP_CTO_BINDING_TARGETS_JSON", JSON.stringify([{ provider: "claude", sessionId: target.sessionId,
     incarnation: target.incarnation, nativeSessionUuid: nativeUuid, requiredExecutorVersion: "0.0.0-fixture",
     expectedExecutorRealpath: "/fixture/claude", expectedExecutorSha256: "sha256:" + "1".repeat(64), expectedCwd: root }]));
-  const runtime = daemonCtoBindingRuntime(cp);
-  const scope = { projectId: "project-a", role: "PRIMARY_CTO", action: "bind-or-rebind",
-    ceoSessionId: ceo.sessionId, ceoIncarnation: ceo.incarnation,
-    ceoActorId: cp.db.get<{ actor_id: string }>("SELECT actor_id FROM assignments WHERE role_key = 'CEO'")!.actor_id,
-    expiresAt: new Date(clock.now().getTime() + 3600000).toISOString(), revokePolicy: "owner-or-ceo-loss" };
-  const approval = { operation: "ctoBinding.delegate", parameters: scope, runId: null,
-    candidateSnapshotDigest: null, approved: true, idempotencyKey: randomUUID() };
-  const receipt = value(new IngressGuard(cp.db, clock, cp.audit, { cli: { allowedActors: [TEST_OWNER.actor] } }).admitOwnerApproval(
-    { channel: "cli", actor: TEST_OWNER.actor, nonce: randomUUID(), payload: ownerApprovalPayload(approval) }, approval));
-  const grant = value(runtime.grant(scope, receipt));
+  daemonCtoBindingRuntime(cp);
   const registered = vi.spyOn(McpServer.prototype, "registerTool");
   const listeners = await daemon.startDaemonMcpListeners(cp, root, "isolated-mcp-token", { finalizeApprovedRun: () => {} });
   closers.push(() => listeners.close());
@@ -304,12 +237,11 @@ it.each([
   const callback = (registered.mock.calls as unknown as unknown[][]).find(([name]) => name === "cto_binding_bind")?.[2] as
     (args: { request: Record<string, unknown> }) => Promise<unknown>;
   expect(callback).toBeTypeOf("function");
-  const request = { delegationId: grant.delegationId, requestId: randomUUID(), projectId: "project-a",
+  const request = { requestId: randomUUID(), projectId: "project-a",
     role: "PRIMARY_CTO", action: "bind-or-rebind", targetSessionId: target.sessionId, expectedBindingGeneration: 1 };
   const result = surface === "direct" ? await callback({ request }) : await call({ request });
   expect(transcript).toHaveBeenCalledExactlyOnceWith(nativeUuid);
   expect(cp.bindings.activePrimaryCto("project-a")).toBeNull();
-  expect(cp.audit.byKind("CTO_BINDING_DURABLE_REQUEST")).toHaveLength(0);
   expect(cp.db.get<{ n: number }>("SELECT count(*) AS n FROM actor_target_attestations")!.n).toBe(0);
   expect.soft(JSON.stringify(result)).not.toContain("SYNTHETIC_PRIVATE_ERROR");
   expect.soft(JSON.stringify(result)).not.toContain("/private/fixture-secret-path");
@@ -321,12 +253,12 @@ it.each([
   expect(surface === "direct" ? result : (result as Record<string, unknown>).result).toEqual(expected);
 });
 
-it("daemon exposes the existing authenticated operator composition for delegated CTO grants", () => {
+it("daemon exposes the existing authenticated operator composition", () => {
   expect(Reflect.get(daemon, "startDaemonOperatorSocket")).toBeTypeOf("function");
 });
 
-it.each(["success", "wrong-receipt", "missing-target"])("owner-admitted grant reaches CEO MCP with child producer: %s", async (mode) => {
-  h = makeHarness(); const { cp, clock, root } = h; await registerFixtureProject(h, "project-a");
+it.each(["success", "wrong-receipt", "missing-target"])("hermes target bind reaches CEO MCP with child producer: %s", async (mode) => {
+  h = makeHarness(); const { cp, root } = h; await registerFixtureProject(h, "project-a");
   const ceo = cp.sessions.create({ provider: "scripted", model: "ceo", osPid: process.pid });
   value(cp.sessions.transition(ceo.sessionId, SessionLifecycle.READY)); value(cp.bindings.bind({ role: Role.CEO, sessionId: ceo.sessionId }));
   const target = cp.sessions.create({ provider: "hermes", model: "cto", osPid: process.pid });
@@ -343,25 +275,24 @@ process.stdout.write(JSON.stringify({...body,receipt_digest:${JSON.stringify(mod
     hermesExecutable: resolve("tests/fixtures/hermes-target-bind-producer.sh"), hermesProfile: "fixture",
     hermesHome: root, requestedSessionId: "fixture-cto", expectedLineageRootDigest: "sha256:" + "1".repeat(64), executorRuntimeIdentity: "fixture-runtime" }]));
   let held = true;
+  // `ctoBinding.delegate` was this socket's method and is gone with the grant. `bootstrap.hermes`
+  // is now the only operator method that reads object params, so it is what carries the
+  // token/lock/params triple this test has always asserted over the real operator listener.
   const ownerSocket = await daemon.startDaemonOperatorSocket(cp,
     { lock: { held: () => held }, handleOperatorRequest: async () => allow(ReasonCode.OK, {}) } as unknown as Parameters<typeof daemon.startOperatorSocket>[0],
-    root, { token: "isolated-owner-token", peerId: "fixture-owner", actor: TEST_OWNER.actor });
+    root, { token: "isolated-owner-token", peerId: "fixture-owner", actor: TEST_OWNER.actor },
+    { bootstrapHermes: (params) => Promise.resolve(allow(ReasonCode.OK, params)) });
   closers.push(() => ownerSocket.close());
   const listeners = await daemon.startDaemonMcpListeners(cp, root, "isolated-mcp-token", { finalizeApprovedRun: () => {} });
   closers.push(() => listeners.close());
-  const scope = { projectId: "project-a", role: "PRIMARY_CTO", action: "bind-or-rebind", ceoSessionId: ceo.sessionId,
-    ceoIncarnation: ceo.incarnation, expiresAt: new Date(clock.now().getTime() + 3600000).toISOString(), revokePolicy: "owner-or-ceo-loss-or-restart" };
-  const approval = { operation: "ctoBinding.delegate", parameters: scope, runId: null, candidateSnapshotDigest: null, approved: true, idempotencyKey: randomUUID() };
-  const receipt = value(new IngressGuard(cp.db, clock, cp.audit, { cli: { allowedActors: [TEST_OWNER.actor] } }).admitOwnerApproval(
-    { channel: "cli", actor: TEST_OWNER.actor, nonce: randomUUID(), payload: ownerApprovalPayload(approval) }, approval));
-  const params = { scope, receipt };
-  expect((await operator(ownerSocket.socketPath, "wrong", "ctoBinding.delegate", params)).allowed).toBe(false);
+  const params = { profile: "fixture" };
+  expect((await operator(ownerSocket.socketPath, "wrong", "bootstrap.hermes", params)).allowed).toBe(false);
   held = false;
-  expect((await operator(ownerSocket.socketPath, "isolated-owner-token", "ctoBinding.delegate", params)).allowed).toBe(false);
+  expect((await operator(ownerSocket.socketPath, "isolated-owner-token", "bootstrap.hermes", params)).allowed).toBe(false);
   held = true;
-  const grant = value(await operator(ownerSocket.socketPath, "isolated-owner-token", "ctoBinding.delegate", params)) as { delegationId: string };
+  expect(value(await operator(ownerSocket.socketPath, "isolated-owner-token", "bootstrap.hermes", params))).toEqual(params);
   const bind = await mcp(join(root, "hermes.mcp.sock"), { token: "isolated-mcp-token", sessionId: ceo.sessionId, sessionSecret: ceo.sessionSecret });
-  const request = { delegationId: grant.delegationId, requestId: randomUUID(), projectId: "project-a", role: "PRIMARY_CTO", action: "bind-or-rebind", targetSessionId: mode === "missing-target" ? ceo.sessionId : target.sessionId, expectedBindingGeneration: 1 };
+  const request = { requestId: randomUUID(), projectId: "project-a", role: "PRIMARY_CTO", action: "bind-or-rebind", targetSessionId: mode === "missing-target" ? ceo.sessionId : target.sessionId, expectedBindingGeneration: 1 };
   const result = await bind({ request });
   if (!["success", "denied-flood", "non-owner-flood"].includes(mode)) {
     expect(result).toMatchObject({ ok: false });

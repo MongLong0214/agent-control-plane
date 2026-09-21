@@ -24,7 +24,8 @@ const claudeTarget = z.object({
 const targetsSchema = z.array(z.union([hermesTarget, claudeTarget])).max(128);
 
 /** Deployment-owned target pins, never request-supplied executable paths or proof callbacks.
- * Legacy grants expire on restart; explicitly durable owner grants use the existing event ledger.
+ * There are no grants to expire or reconstruct: `bind` is the only door, and the CEO's own
+ * live binding is what opens it.
  */
 export function createCtoBindingRuntime(cp: ControlPlane, rawTargets: string | undefined) {
   let decoded: unknown;
@@ -35,7 +36,7 @@ export function createCtoBindingRuntime(cp: ControlPlane, rawTargets: string | u
     throw new Error("ACP_CTO_BINDING_TARGETS_JSON is invalid");
   }
   const targets = new Map(parsed.data.map((t) => [t.sessionId, t]));
-  const authority = new CtoBindingDelegation(cp.sessions, cp.bindings, cp.ownerAuthority, cp.audit, cp.clock, cp.db);
+  const authority = new CtoBindingDelegation(cp.sessions, cp.bindings, cp.audit, cp.db);
   const service = new CtoDelegatedBinding({ db: cp.db, sessions: cp.sessions, bindings: cp.bindings, authority,
     target: (sessionId) => {
       const target = targets.get(sessionId);
@@ -86,8 +87,6 @@ export function createCtoBindingRuntime(cp: ControlPlane, rawTargets: string | u
     },
   });
   return Object.freeze({
-    grant: (scope: unknown, receipt: unknown) => authority.grant(scope, receipt),
-    revoke: (id: string, receipt: unknown) => authority.revoke(id, receipt),
     bind: (principal: { sessionId: string; sessionSecret: string }, request: unknown) =>
       service.execute({ method: "ctoBinding.bind", principal, request }),
   });

@@ -152,6 +152,13 @@ const EXPECTED_CONVERTED_SITES = [
   { file: "daemon/finalizer.ts", symbol: "acquireAttempt", label: "DaemonFinalizer lease acquisition", evidence: "direct" },
   { file: "run/run-engine.ts", symbol: "invalidateCandidate", label: "RunEngine.invalidateCandidate", evidence: "direct" },
   { file: "run/candidate-pipeline.ts", symbol: "acquireAttempt", label: "CandidatePipeline lease acquisition", evidence: "direct" },
+  // New to this roster, not new to the tree. This site has always been a `txDecision` whose body
+  // writes an audit row and can then refuse, but it reached that opener through a generic
+  // `#ownedTransaction(..., rollbackDenial)` helper whose own line read `rollbackDenial ?
+  // db.txDecision(run) : db.tx(run)` — `run` is a parameter, so the census could resolve neither a
+  // body nor a semantic owner and never counted it. Removing the owner gate collapsed that helper,
+  // and the site became first-class. A generic transaction wrapper is a way to be invisible here.
+  { file: "ceo/cto-binding-delegation.ts", symbol: "authorize", label: "CtoBindingDelegation.authorize", evidence: "direct" },
   { file: "session/binding-registry.ts", symbol: "bind", label: "BindingRegistry.bind", evidence: "direct" },
   { file: "session/binding-registry.ts", symbol: "switchTo", label: "BindingRegistry.switchTo", evidence: "direct" },
   { file: "run/task-graph.ts", symbol: "finishExecution", label: "TaskGraph.finishExecution (post-preflight)", evidence: "direct" },
