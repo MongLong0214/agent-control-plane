@@ -808,7 +808,7 @@ export const startBuzzMessageIngressListener = async (
   const ingress = new BuzzMessageIngress(guard, options.ownerActors, buzzMentionRouter(cp));
   const roleConversation = options.roleConversation ?? null;
   const port: BuzzMessageTurnPort = {
-    deliverToCeo: (text) => deliverAsCeoTurn(options.ceoConversation, text),
+    deliverToCeo: (text, source) => deliverAsCeoTurn(options.ceoConversation, text, source),
     // Read at claim time, from the binding registry rather than from the peer: the fence is
     // "which CEO generation was this turn claimed under", and the peer cannot be its own
     // authority for that. Telegram's production composition still passes none (#639's seam is
@@ -2572,6 +2572,8 @@ export const answerAsCeo = async (
 export const deliverAsCeoTurn = async (
   port: CeoConversationPort,
   text: string,
+  // Provenance reaches this delivery boundary; do not add it to the runtime prompt/transport.
+  _source?: Pick<BuzzMessageIngressInput, "eventId" | "actor" | "conversation">,
 ): Promise<CeoTurnDelivery> => {
   const outcome = await port.attempt(text);
   const reachedCeo = outcome.contact === "REACHED";
