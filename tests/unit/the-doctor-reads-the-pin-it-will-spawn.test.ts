@@ -243,7 +243,12 @@ describe("the doctor reads the pin it will spawn", () => {
         });
 
         expect(findings).toHaveLength(1);
-        expect(findings[0]?.recommendedAction).toContain(variable);
+        // `change <variable> and restart`, not a bare `toContain(variable)`. The fallback clause
+        // for a pin the variable does *not* own also mentions the variable — "it is not the current
+        // value of ACP_CODEX_BINARY" — so a bare containment assertion passes on the message that
+        // names no setting to change at all. Measured: the
+        // `a-pin-repair-names-the-variable-it-is-read-from` mutant survived that assertion.
+        expect(findings[0]?.recommendedAction).toContain(`change ${variable} and restart`);
         expect(findings[0]?.recommendedAction).not.toContain("ACP_GPT_BINARY");
       });
     }
@@ -271,7 +276,7 @@ describe("the doctor reads the pin it will spawn", () => {
       const owned = await pinFindings((each) => {
         each.cp.providers.register(new PinnedAdapter(each.clock, "claude", broken));
       });
-      expect(owned[0]?.recommendedAction).toContain("ACP_CLAUDE_BINARY");
+      expect(owned[0]?.recommendedAction).toContain("change ACP_CLAUDE_BINARY and restart");
     });
 
     await withPins({ ACP_CLAUDE_BINARY: somewhereElse }, async () => {
@@ -365,7 +370,7 @@ describe("the doctor reads the pin it will spawn", () => {
             path: claudePin,
             condition: "ABSENT",
           });
-          expect(findings[0]?.recommendedAction).toContain("ACP_CLAUDE_BINARY");
+          expect(findings[0]?.recommendedAction).toContain("change ACP_CLAUDE_BINARY and restart");
           expect(findings[0]?.blocking).toBe(false);
         } finally {
           cp.close();
