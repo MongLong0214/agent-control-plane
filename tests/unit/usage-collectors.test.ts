@@ -1,6 +1,15 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { chmodSync, linkSync, mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+  chmodSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { isAbsolute, join, relative, resolve } from "node:path";
 
 import { ManualClock } from "../../src/core/clock.ts";
 import { ControlPlane } from "../../src/app/control-plane.ts";
@@ -28,7 +37,7 @@ import {
   type UsageTerminal,
   nonInteractiveEnvironment,
 } from "../../src/capacity/usage-collectors.ts";
-import { boundedExecFileSync } from "../helpers/bounded-sync-child.ts";
+import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -1637,12 +1646,12 @@ setInterval(() => {}, 1_000);
       const cp = controlPlaneAt(root);
       try {
         await probeAll(cp);
-        // `resolveExecutable` realpaths an absolute binary, so the expectation resolves the same
-        // way rather than comparing the raw path.
+        // The pins themselves, not their canonical targets: `resolveExecutable` hands an absolute
+        // answer to the spawn unchanged, so the exec — not this module — resolves any link in it.
         expect(spawned).toEqual([
-          realpathSync(pins["claude"] as string),
-          realpathSync(pins["codex"] as string),
-          realpathSync(pins["grok"] as string),
+          pins["claude"] as string,
+          pins["codex"] as string,
+          pins["grok"] as string,
         ]);
         // Never a bare name: that is the state the pins exist to end.
         for (const file of spawned) expect(file.startsWith("/")).toBe(true);
@@ -1663,12 +1672,10 @@ setInterval(() => {}, 1_000);
       const cp = controlPlaneAt(root, { claude: { binary: configured } });
       try {
         await probeAll(cp);
-        expect(spawned[0], "the environment pin overrode an explicit configuration").toBe(
-          realpathSync(configured),
-        );
+        expect(spawned[0], "the environment pin overrode an explicit configuration").toBe(configured);
         // And only the key it named: the other two still come from the environment.
-        expect(spawned[1]).toBe(realpathSync(pins["codex"] as string));
-        expect(spawned[2]).toBe(realpathSync(pins["grok"] as string));
+        expect(spawned[1]).toBe(pins["codex"] as string);
+        expect(spawned[2]).toBe(pins["grok"] as string);
       } finally {
         cp.close();
       }
@@ -1688,7 +1695,9 @@ setInterval(() => {}, 1_000);
       const path = join(searchable, name);
       writeFileSync(path, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
       chmodSync(path, 0o755);
-      onPath[name] = realpathSync(path);
+      // The candidate the search returns, which is the PATH entry joined with the name. The
+      // search no longer canonicalises what it finds, for the same reason the pin branch does not.
+      onPath[name] = path;
     }
     const emptyPath = join(root, "empty");
     mkdirSync(emptyPath, { recursive: true });
@@ -1715,6 +1724,137 @@ setInterval(() => {}, 1_000);
         try {
           await probeAll(cp);
           expect(spawned).toEqual(["claude", "codex", "grok"]);
+        } finally {
+          cp.close();
+        }
+      });
+    } finally {
+      if (beforePath === undefined) delete process.env["PATH"];
+      else process.env["PATH"] = beforePath;
+    }
+  });
+
+  it("#954 spawns the stable name after the provider's updater has replaced the version behind it", async () => {
+    // The seam the launcher pin alone cannot reach. An adapter resolves its binary once, in its
+    // constructor, and every probe for the life of the daemon spawns that one string. So a
+    // resolution that canonicalises the stable name freezes the version behind it, and the
+    // provider's own updater then repoints the name and prunes that version — measured on the
+    // deployment host, where the daemon started at 01:59:50Z and the version it was holding was
+    // pruned at 02:01Z, with three versions produced on three consecutive days.
+    const root = tempDir("acp-954-provider-updater-");
+    const versions = join(root, "versions");
+    mkdirSync(versions, { recursive: true });
+    const stableDirectory = join(root, "pinned");
+    mkdirSync(stableDirectory, { recursive: true });
+    const accepted = join(versions, "1.0.0");
+    writeFileSync(accepted, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    chmodSync(accepted, 0o755);
+    const stable = join(stableDirectory, "claude");
+    symlinkSync(accepted, stable);
+    // On no PATH anywhere in this process, so the pin is the only way this is reachable.
+    expect(process.env["PATH"] ?? "").not.toContain(stableDirectory);
+
+    await withPinnedEnvironment({ claude: stable }, async (spawned) => {
+      const cp = controlPlaneAt(root);
+      try {
+        // Constructed first, mutated second: this is the ordering the live failure has, and the
+        // only ordering in which a frozen resolution is distinguishable from a live one.
+        const replacement = join(versions, "2.0.0");
+        writeFileSync(replacement, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+        chmodSync(replacement, 0o755);
+        rmSync(stable);
+        symlinkSync(replacement, stable);
+        rmSync(accepted);
+        expect(existsSync(accepted), "the fixture did not delete the accepted version").toBe(false);
+
+        await probeAll(cp);
+        expect(
+          spawned[0],
+          "the adapter spawned something other than the stable name its pin carried",
+        ).toBe(stable);
+        // Stated as its own assertion, because the value that was actually spawned before this
+        // change is the one path on this host that is guaranteed not to exist any more.
+        expect(spawned[0], "the adapter spawned the version the updater deleted").not.toBe(
+          join(realpathSync(versions), "1.0.0"),
+        );
+      } finally {
+        cp.close();
+      }
+    });
+  });
+
+  /**
+   * Anchoring, which is the other half of what `realpathSync` used to do at both returns.
+   *
+   * Removing the canonicalisation removed the absolutising with it, and nothing replaced it. These
+   * two cases hold that half on its own: each supplies a relative spelling, which every other pin
+   * case in this file avoids by construction, so a mutation that drops the anchoring is invisible
+   * to all of them. `runCli` passes a caller-chosen `cwd` to `spawn`, so a pathname anchored to
+   * one directory and executed from another either misses or names a different program — which is
+   * why each case executes the value the adapter handed over, from a directory that is not the
+   * one it was anchored to.
+   */
+  const relativeProgram = (directory: string, name: string): string => {
+    const path = join(directory, name);
+    writeFileSync(path, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    chmodSync(path, 0o755);
+    return path;
+  };
+
+  it("#954 anchors a relative configured binary before the adapter spawns it", async () => {
+    const root = tempDir("acp-954-relative-configured-");
+    const program = relativeProgram(root, "claude-configured");
+    // `CliAdapterOptions.binary` is `binary?: string` and states no absolute constraint, and the
+    // first branch of `resolveExecutable` tests for a slash rather than for an absolute path, so
+    // `tools/claude` and `./bin/claude` reach it. This is that input, spelled against the cwd the
+    // daemon process actually has.
+    const spelling = relative(process.cwd(), program);
+    expect(isAbsolute(spelling), "the fixture did not produce a relative spelling").toBe(false);
+    expect(spelling, "the fixture did not exercise the slash branch").toContain("/");
+    expect(resolve(spelling), "the relative spelling does not name the fixture").toBe(program);
+    const elsewhere = tempDir("acp-954-relative-configured-cwd-");
+
+    await withPinnedEnvironment({}, async (spawned) => {
+      const cp = controlPlaneAt(root, { claude: { binary: spelling } });
+      try {
+        await probeAll(cp);
+        expect(spawned[0], "a relative pathname reached the spawn").toBe(resolve(spelling));
+        // The shape is not the point; surviving the trip is. `runCli` hands `spawn` a cwd of the
+        // caller's choosing, so the only pathname that still names this program there is one
+        // anchored before it left.
+        expect(
+          boundedSpawnSync(spawned[0] as string, [], { cwd: elsewhere, timeout: QUICK_CHILD_BUDGET_MS }).status,
+          "the path the adapter handed over does not run from another working directory",
+        ).toBe(0);
+      } finally {
+        cp.close();
+      }
+    });
+  });
+
+  it("#954 anchors a bare name found through a relative PATH entry", async () => {
+    const root = tempDir("acp-954-relative-path-entry-");
+    const directory = join(root, "searchable");
+    mkdirSync(directory, { recursive: true });
+    relativeProgram(directory, "claude");
+    // A PATH entry may legitimately be relative, and `accessSync` then answers about the process's
+    // own cwd while the spawn happens somewhere else entirely.
+    const spelling = relative(process.cwd(), directory);
+    expect(isAbsolute(spelling), "the fixture did not produce a relative PATH entry").toBe(false);
+    const elsewhere = tempDir("acp-954-relative-path-entry-cwd-");
+
+    const beforePath = process.env["PATH"];
+    try {
+      process.env["PATH"] = spelling;
+      await withPinnedEnvironment({}, async (spawned) => {
+        const cp = controlPlaneAt(root);
+        try {
+          await probeAll(cp);
+          expect(spawned[0], "a relative pathname reached the spawn").toBe(resolve(spelling, "claude"));
+          expect(
+            boundedSpawnSync(spawned[0] as string, [], { cwd: elsewhere, timeout: QUICK_CHILD_BUDGET_MS }).status,
+            "the path the adapter handed over does not run from another working directory",
+          ).toBe(0);
         } finally {
           cp.close();
         }
