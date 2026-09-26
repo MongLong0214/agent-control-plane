@@ -186,6 +186,15 @@ export class ContinuityKernel {
             runtimeHealth: measured.runtimeHealth,
             allocationAdmission: measured.allocationAdmission,
             advisoryState: measured.advisoryState,
+            // The shape of the reading without the reason for it is half an explanation, and the
+            // half that cannot name a broken pin. On the live deployment `claude` is role-scoped,
+            // so `CapacityMonitor.refresh` excludes it even when a caller names it explicitly and
+            // its `CAPACITY_PROBE` sibling — the only other row carrying a collector's sentence —
+            // is never written for it. This event is the whole durable record of a role probe, and
+            // the role snapshot it mirrors dies with the process. `error` is an allowlisted audit
+            // key, matching the provider-global sibling, so a full collector sentence survives
+            // `redact` rather than being refused as an unknown free-form field.
+            error: measured.error ?? null,
             buckets: measured.buckets.map((bucket) => ({
               id: bucket.id,
               remainingPercent: bucket.remainingPercent,

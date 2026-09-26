@@ -137,7 +137,16 @@ export const nonInteractiveEnvironment = (): NodeJS.ProcessEnv => ({
 export class SpawnNonInteractiveUsageProbe implements NonInteractiveUsageProbe {
   constructor(private readonly args: readonly string[]) {}
 
-  async run(input: { binary: string; timeoutMs: number }): Promise<{ stdout: string; stderr: string; code: number | null; timedOut: boolean }> {
+  async run(input: { binary: string; timeoutMs: number }): Promise<{
+    stdout: string;
+    stderr: string;
+    code: number | null;
+    timedOut: boolean;
+    // Declared here as well as on the interface. `implements` does not require it — an optional
+    // member is assignable whether or not the class restates it — so a caller holding the class
+    // type rather than the interface was told the field does not exist (TS2339).
+    spawnError?: { code?: string; message: string };
+  }> {
     return new Promise((resolve) => {
       // Detached, so the whole process group can be killed. A grandchild that inherits the pipe
       // keeps `close` from ever firing, and resolving only on `close` means the capacity refresh
@@ -939,7 +948,7 @@ export class ClaudeUsageCollector extends BaseUsageCollector {
         observedAt,
         source,
         digest,
-        `non-interactive /usage never started: the operating system could not spawn the pinned CLI at ` +
+        `non-interactive /usage never started: the operating system could not spawn the configured CLI at ` +
           `${this.claudeOptions.binary} (${outcome.spawnError.code ?? "no errno"}: ${outcome.spawnError.message})`,
       );
     }
@@ -1219,20 +1228,26 @@ export const parseUsageOutput = (
     // Three different failures used to arrive as this one sentence: a binary that never
     // launched, a trust prompt that went unrecognised, and a real usage screen in an
     // unexpected shape. On 2026-08-17 all three providers reported it at once and the
-    // cause was none of the things the sentence describes — `resolveExecutable` returns the
-    // bare name when PATH does not contain the CLI, so nothing ever started, and the empty
-    // stream reached this line as if it were output. A whole causal chain was built on the
-    // wrong reading of it (#564, #568).
+    // cause was none of the things the sentence then described. Separating the empty stream
+    // from a screen that stated no quota is what #564/#568 needed, and that separation is the
+    // line below.
     //
-    // The distinguishing fact is whether anything was said at all. Line and character
-    // counts only: `docs/capacity-source.md` keeps raw terminal output out of the record and
-    // retains a digest instead, so the shape is reportable and the content is not.
+    // What the sentence must NOT do is name a cause this function did not measure. It used to
+    // assert the PATH hypothesis — "a CLI outside the daemon's PATH resolves to a bare name and
+    // never starts" — which was the true cause in #564 and the wrong one for #954, where an
+    // absolute pin named a version directory the provider's updater had deleted. Nothing here
+    // can tell those apart: this function receives text, not a spawn result. A spawn that never
+    // happened is now reported where it is actually observed, by the collector that spawned.
+    //
+    // The distinguishing fact available here is whether anything was said at all. Line and
+    // character counts only: the capacity-source doc keeps raw terminal output out of the
+    // record and retains a digest instead, so the shape is reportable and the content is not.
     if (lines.length === 0) {
       return {
         ok: false,
         error:
-          "interactive CLI produced no output; the binary may not have launched " +
-          "(a CLI outside the daemon's PATH resolves to a bare name and never starts)",
+          "interactive CLI produced no output at all; this parser sees only text and cannot say " +
+          "why it was silent (the process may never have started, or started and printed nothing)",
       };
     }
     return {

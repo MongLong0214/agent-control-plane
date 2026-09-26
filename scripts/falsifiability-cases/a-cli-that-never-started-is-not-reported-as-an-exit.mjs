@@ -27,7 +27,7 @@ const c = {
     + "        observedAt,\n"
     + "        source,\n"
     + "        digest,\n"
-    + "        `non-interactive /usage never started: the operating system could not spawn the pinned CLI at ` +\n"
+    + "        `non-interactive /usage never started: the operating system could not spawn the configured CLI at ` +\n"
     + "          `${this.claudeOptions.binary} (${outcome.spawnError.code ?? \"no errno\"}: ${outcome.spawnError.message})`,\n"
     + "      );\n"
     + "    }\n",
