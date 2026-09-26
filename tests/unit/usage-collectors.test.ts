@@ -273,6 +273,39 @@ describe("non-interactive account usage (#582)", () => {
     expect(reading.error).toContain("repeated a quota-window label");
   });
 
+  it("#954 names the CLI that never started, instead of reporting it as a process that exited", async () => {
+    // The pin pointed at a version directory the Claude auto-updater had deleted. The spawn
+    // failed with ENOENT, which `SpawnNonInteractiveUsageProbe` resolves rather than throws, so
+    // the collector's try/catch never fired; `code === null` then reached the exit branch and the
+    // daemon recorded "non-interactive /usage exited on a signal" — a sentence describing a
+    // process that started and died — every three minutes for four and a half hours. The path it
+    // had tried was folded into `stderr`, hashed into the digest, and appeared nowhere a reader
+    // could reach it.
+    //
+    // Drives the shipped probe, not an injected one: a fake handing back a hand-built spawn
+    // failure would pass whether or not the probe itself keeps the two events apart.
+    const deletedByTheUpdater = resolve("node_modules/.acp-954-version-the-updater-deleted/bin/claude");
+    expect(existsSync(deletedByTheUpdater)).toBe(false);
+
+    const reading = await new ClaudeUsageCollector({ clock: clock(), binary: deletedByTheUpdater }).collect();
+
+    expect(reading.sensorHealth).toBe("ERROR");
+    expect(reading.buckets).toEqual([]);
+    // Measured, not assumed: the sentence quotes Node's own spawn message at the end, and that
+    // message repeats BOTH the errno and the path. So `toContain(deletedByTheUpdater)` and
+    // `toContain("ENOENT")` are each satisfied by the quoted clause alone and would stay green if
+    // the clause this collector composes dropped them — the "asks about something its subject
+    // merely appears in" shape. Both are therefore asserted against the composed clause, which
+    // holds them in an order the quoted message never produces.
+    expect(reading.error).toContain("never started");
+    expect(reading.error).toContain(`could not spawn the pinned CLI at ${deletedByTheUpdater} (`);
+    expect(reading.error).toContain(`(ENOENT: `);
+    // The sentence this replaces is still the right one for a real exit, so it remains in the
+    // source at the `outcome.code !== 0` branch — this asserts it is not reached here, not that
+    // it is gone.
+    expect(reading.error).not.toContain("exited on a signal");
+  });
+
   it("never reads a quota by handling the subscription credential itself", () => {
     // The command carries no token and sets no credential path: the CLI reads and refreshes its
     // own. `--bare` is the one flag that would break this — it refuses the keychain and returns

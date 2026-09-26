@@ -68,6 +68,13 @@ export interface NonInteractiveUsageProbe {
     stderr: string;
     code: number | null;
     timedOut?: boolean;
+    /**
+     * Set only when no process was ever created. A spawn failure and a child that wrote to
+     * stderr are different events, and folding the first into the second leaves `code === null`
+     * as its only trace — indistinguishable from a signal death, and naming neither the errno
+     * nor the path that was tried.
+     */
+    spawnError?: { code?: string; message: string };
   }>;
 }
 
@@ -147,7 +154,11 @@ export class SpawnNonInteractiveUsageProbe implements NonInteractiveUsageProbe {
       let stdout = "";
       let stderr = "";
       let settled = false;
-      const finish = (outcome: { code: number | null; timedOut: boolean; error?: string }): void => {
+      const finish = (outcome: {
+        code: number | null;
+        timedOut: boolean;
+        spawnError?: { code?: string; message: string };
+      }): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
@@ -156,13 +167,28 @@ export class SpawnNonInteractiveUsageProbe implements NonInteractiveUsageProbe {
         } catch {
           /* the group is already gone */
         }
-        resolve({ stdout, stderr: stderr || outcome.error || "", code: outcome.code, timedOut: outcome.timedOut });
+        // `stderr` carries what the child wrote, and nothing else. A spawn failure travels in its
+        // own field: folded in here, "the child complained" and "there was never a child" become
+        // one string, and no caller can tell which one it is holding.
+        resolve({
+          stdout,
+          stderr,
+          code: outcome.code,
+          timedOut: outcome.timedOut,
+          ...(outcome.spawnError ? { spawnError: outcome.spawnError } : {}),
+        });
       };
       // Resolve on the timer itself rather than waiting for a close that may never come.
       const timer = setTimeout(() => finish({ code: null, timedOut: true }), input.timeoutMs);
       child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
       child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
-      child.once("error", (error) => finish({ code: null, timedOut: false, error: error.message }));
+      child.once("error", (error: NodeJS.ErrnoException) =>
+        finish({
+          code: null,
+          timedOut: false,
+          spawnError: { ...(error.code === undefined ? {} : { code: error.code }), message: error.message },
+        }),
+      );
       // `exit` fires when the process goes, whether or not a descendant still holds the pipe.
       child.once("exit", (code) => finish({ code, timedOut: false }));
     });
@@ -870,7 +896,13 @@ export class ClaudeUsageCollector extends BaseUsageCollector {
     if (this.claudeOptions.terminal) return super.collect();
 
     const observedAt = this.claudeOptions.clock.nowIso();
-    let outcome: { stdout: string; stderr: string; code: number | null; timedOut?: boolean };
+    let outcome: {
+      stdout: string;
+      stderr: string;
+      code: number | null;
+      timedOut?: boolean;
+      spawnError?: { code?: string; message: string };
+    };
     try {
       outcome = await this.probe.run({ binary: this.claudeOptions.binary, timeoutMs: this.probeTimeoutMs });
     } catch (error) {
@@ -894,6 +926,22 @@ export class ClaudeUsageCollector extends BaseUsageCollector {
       envelope = JSON.parse(outcome.stdout) as { is_error?: unknown; result?: unknown };
     } catch {
       envelope = null;
+    }
+    // No process was ever created, which is not an exit, and must be settled before any branch
+    // that reads `code` — `code` is null here for the same reason it is null after a signal. A pin
+    // whose target the provider's updater had deleted was reported as "exited on a signal" every
+    // three minutes for four and a half hours (#954): a sentence about a process that started and
+    // died, for one that never started. The errno and the path that was tried are what an operator
+    // needs in order to reach the pin, so both are stated here rather than hashed into the digest.
+    if (outcome.spawnError) {
+      return failedReading(
+        this.provider,
+        observedAt,
+        source,
+        digest,
+        `non-interactive /usage never started: the operating system could not spawn the pinned CLI at ` +
+          `${this.claudeOptions.binary} (${outcome.spawnError.code ?? "no errno"}: ${outcome.spawnError.message})`,
+      );
     }
     // A read that was killed or exited badly is not a reading, whatever landed in the buffer.
     // A complete envelope can already be buffered when the timer fires, and filing that as
