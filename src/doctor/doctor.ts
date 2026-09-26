@@ -1034,18 +1034,17 @@ export class Doctor {
    *
    * Two things in this message are read rather than derived, and both were wrong the first time.
    *
-   * **Which setting owns the pin.** `PROVIDER_PIN_VARIABLE` says which variable *can* pin a
-   * provider; it does not say that it *did*. `control-plane.ts:753` spreads `...overrides.gpt`
-   * after `binary: process.env["ACP_CODEX_BINARY"]`, so a deployment's `adapterOptions` wins over
-   * the environment, and telling that operator to repoint the variable names a setting whose value
-   * nothing reads. So the variable is named only when its current value is the pin in hand —
+   * **Which setting to change.** `PROVIDER_PIN_VARIABLE` says which variable *can* pin a provider;
+   * it does not say that it *did*. `control-plane.ts:753` spreads `...overrides.gpt` after
+   * `binary: process.env["ACP_CODEX_BINARY"]`, so a deployment's `adapterOptions` wins over the
+   * environment. The variable is named only when its current value equals the pin in hand —
    * compared both verbatim and through `resolve`, because `resolveExecutable` anchors a relative
-   * answer with `resolve` and leaves a bare name alone. The adapter cannot report where its
-   * `binary` came from; `CliAdapterOptions.binary` is one string with no provenance, and plumbing
-   * one through would reach the adapter constructors and the composition root. This reads the
-   * daemon's environment at doctor time instead, which is the same authority the operator would
-   * change, and it is honest in the other direction too: a variable edited since construction is
-   * not the source of this pin, and saying so is correct.
+   * answer with `resolve` and leaves a bare name alone — and the sentence says exactly that
+   * relationship, adding that `adapterOptions`, where a deployment supplies them, are what win.
+   * Equality is not provenance: a deployment whose override carries the same path as the variable
+   * matches here while never reading the variable, and claiming causation would send that operator
+   * to restart into no change. See `variableMatchingPin` for why establishing provenance is not in
+   * this slice.
    *
    * **Whether a restart is needed.** Not always, and the first version asserted it unconditionally.
    * Since #998 the pin is the name an updater maintains rather than the version behind it, so
@@ -1053,23 +1052,40 @@ export class Doctor {
    * resolves the retained pin again each time. What needs a restart is changing *which* path is
    * pinned, because `resolveExecutable` runs once in the constructor. The message says which case
    * each repair is in rather than sending everyone to a restart.
+   *
+   * **Which PATH, and when it was read.** `NOT_ON_PATH` used to say "the daemon's PATH" and "no
+   * invocation of this provider has ever started". Both overclaimed. The set a spawn searches is
+   * `agentPath()` (`cli-adapters.ts:179`) — the node binary's directory plus `/usr/bin`, `/bin`,
+   * `/usr/sbin` and `/sbin` — which excludes `/opt/homebrew/bin` and `/usr/local/bin` that the
+   * launcher's PATH does include, so an operator following "install it on the daemon's PATH" could
+   * satisfy that and still not be reachable. And the condition is inferred from the pin's shape at
+   * construction and never re-measured, so a CLI installed after startup is spawnable while this
+   * finding still reads the same way. The message now states the reading and its time.
    */
   private pinRepairAction(provider: string, path: string, condition: PinCondition): string {
+    const matching = this.variableMatchingPin(provider, path);
     const repoint =
-      this.pinSourceFor(provider, path) ??
-      `whichever setting supplies this pin — it is not the current value of ` +
-        `${PROVIDER_PIN_VARIABLE[provider] ?? "any ACP_*_BINARY variable"}, so this deployment's ` +
-        `adapterOptions may own it`;
+      matching !== undefined
+        ? `${matching}, whose current value is this pin — though if this deployment supplies ` +
+          `adapterOptions for ${provider}, those win over the variable and are what to change`
+        : `whichever setting supplies this pin — it is not the current value of ` +
+          `${PROVIDER_PIN_VARIABLE[provider] ?? "any ACP_*_BINARY variable"}, so this ` +
+          `deployment's adapterOptions may own it`;
     const restart =
-      `to pin a different path, change ${repoint} and restart the daemon, which resolves the pin ` +
-      `once at construction`;
+      `to pin a different path, change ${repoint}, then restart the daemon, which resolves the ` +
+      `pin once at construction`;
     if (condition === "NOT_ON_PATH") {
       return (
-        `the pin is the bare name ${path}, which is what resolution answers when nothing of that ` +
-        `name was on the daemon's PATH as the adapter was built — no invocation of this provider ` +
-        `has ever started. Install the CLI where the daemon's PATH reaches it, or ${restart}. ` +
-        `The name in this finding is not a file to restore: it is relative, and a directory of ` +
-        `that name beside the daemon would satisfy a stat while the spawn still searches PATH`
+        `the pin is the bare name ${path}. That is what resolution answered when it ran once, as ` +
+        `the adapter was built, and found nothing of that name on the daemon's own PATH; it has ` +
+        `not been measured since, so a CLI installed after startup is live at the next spawn ` +
+        `while this finding still reads this way. For the repair, the set that matters is not the ` +
+        `daemon's PATH: a provider is spawned with the node binary's directory plus /usr/bin, ` +
+        `/bin, /usr/sbin and /sbin, so /opt/homebrew/bin and /usr/local/bin are never searched ` +
+        `however the daemon's own PATH is set. Install the CLI where that set reaches it, or ` +
+        `${restart}. The name in this finding is not a file to restore: it is relative, and a ` +
+        `directory of that name beside the daemon would satisfy a stat while a spawn still ` +
+        `searches a PATH`
       );
     }
     return (
@@ -1080,14 +1096,29 @@ export class Doctor {
   }
 
   /**
-   * The environment variable whose current value *is* this pin, or `undefined` when none is.
+   * The environment variable whose current value equals this pin, or `undefined` when none does.
    *
-   * `undefined` is the safe answer and the message degrades to naming no specific setting. Naming
-   * none leaves the operator the path and the reinstall; naming one that does not own the pin
-   * sends them to change a value nothing reads, which is the failure this whole check exists to
-   * report.
+   * Equality, and the name says only that. It is **not** provenance and the message must not read
+   * as if it were: `control-plane.ts:753` applies `...overrides` after `binary:`, so a deployment
+   * whose `adapterOptions` happen to carry the same path as the variable produces this match while
+   * the variable is not read at all — and an operator sent to change it would restart into no
+   * change. The adapter cannot settle this: `CliAdapterOptions.binary` is one string with no
+   * provenance, and plumbing a source through reaches the three adapter constructors and the
+   * composition root. So the check states the relationship it measured and names `adapterOptions`
+   * as what wins where a deployment supplies them.
+   *
+   * `undefined` is the safe answer, and the message degrades to naming no specific setting. Naming
+   * none leaves the operator the path and the reinstall; naming one that is not read sends them to
+   * change a value nothing consumes, which is the failure this whole check exists to report.
+   *
+   * Limit: this under-reports for a pin that `resolveExecutable` found by searching PATH. The
+   * variable then holds a bare name while the pin is `resolve(join(directory, name))`, so neither
+   * comparison matches and a variable that really did supply the pin is reported as not matching.
+   * Not repaired here on purpose — re-running the PATH search inside the doctor is the second
+   * resolution this slice already ruled out, and the failure is in the safe direction: the message
+   * names no setting instead of the wrong one.
    */
-  private pinSourceFor(provider: string, path: string): string | undefined {
+  private variableMatchingPin(provider: string, path: string): string | undefined {
     const variable = PROVIDER_PIN_VARIABLE[provider];
     if (variable === undefined) return undefined;
     const value = process.env[variable];

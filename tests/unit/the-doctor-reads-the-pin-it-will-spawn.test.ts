@@ -243,23 +243,41 @@ describe("the doctor reads the pin it will spawn", () => {
         });
 
         expect(findings).toHaveLength(1);
-        // `change <variable> and restart`, not a bare `toContain(variable)`. The fallback clause
-        // for a pin the variable does *not* own also mentions the variable — "it is not the current
-        // value of ACP_CODEX_BINARY" — so a bare containment assertion passes on the message that
-        // names no setting to change at all. Measured: the
+        // The positive clause, not a bare `toContain(variable)`. The message for a pin the
+        // variable does *not* match also mentions the variable — "it is not the current value of
+        // ACP_CODEX_BINARY" — so a bare containment assertion passes on the message that names no
+        // setting to change at all. Measured: the
         // `a-pin-repair-names-the-variable-it-is-read-from` mutant survived that assertion.
-        expect(findings[0]?.recommendedAction).toContain(`change ${variable} and restart`);
+        expect(findings[0]?.recommendedAction).toContain(
+          `change ${variable}, whose current value is this pin`,
+        );
         expect(findings[0]?.recommendedAction).not.toContain("ACP_GPT_BINARY");
       });
     }
 
-    // And a provider the map does not know names no variable at all. Naming none leaves the
-    // operator the path and the reinstall; naming a guessed one costs them the trip.
+  });
+
+  it("names no variable at all for a provider the map does not know", async () => {
+    // Naming none leaves the operator the path and the reinstall; naming a guessed one costs them
+    // the trip. The fallback inside the message is the place that can re-enter the original defect
+    // — it is the one remaining expression that could be made to derive a name from the provider
+    // id — so this asserts positively what the sentence has to say, and then that no
+    // provider-shaped variable name appears anywhere in it.
+    //
+    // The earlier version of this check was `not.toMatch(/ACP_[A-Z]+_BINARY at one/)`. The phrase
+    // "at one" belonged to the pre-repair message and no longer occurs anywhere, so that assertion
+    // passed for every mutant and for every message: it could not fail for its claim.
     const unmapped = await pinFindings((each) => {
       each.cp.providers.register(new PinnedAdapter(each.clock, "pinned", prunedVersionPin()));
     });
+
     expect(unmapped).toHaveLength(1);
-    expect(unmapped[0]?.recommendedAction).not.toMatch(/ACP_[A-Z]+_BINARY at one/);
+    const action = unmapped[0]?.recommendedAction ?? "";
+    expect(action).toContain("change whichever setting supplies this pin");
+    expect(action).toContain("any ACP_*_BINARY variable");
+    expect(action).not.toContain("whose current value is this pin");
+    // `ACP_*_BINARY` does not match this: `*` is not `[A-Z]`. A derived name would.
+    expect(action).not.toMatch(/ACP_[A-Z]+_BINARY/);
   });
 
   it("names the pin's setting only when that setting's value is the pin in hand", async () => {
@@ -273,10 +291,18 @@ describe("the doctor reads the pin it will spawn", () => {
     const somewhereElse = healthyPin();
 
     await withPins({ ACP_CLAUDE_BINARY: broken }, async () => {
-      const owned = await pinFindings((each) => {
+      const matching = await pinFindings((each) => {
         each.cp.providers.register(new PinnedAdapter(each.clock, "claude", broken));
       });
-      expect(owned[0]?.recommendedAction).toContain("change ACP_CLAUDE_BINARY and restart");
+      const action = matching[0]?.recommendedAction ?? "";
+      // Equality is all this fixture establishes, and all the sentence may claim: the adapter here
+      // is hand-built and never reads the variable, exactly as a deployment supplying
+      // `adapterOptions.claude.binary` with the same path would not. So the message says the
+      // variable's current value *is* this pin, and says `adapterOptions` are what win where they
+      // exist — not that the variable supplied it.
+      expect(action).toContain("change ACP_CLAUDE_BINARY, whose current value is this pin");
+      expect(action).toContain("adapterOptions");
+      expect(action).not.toContain("ACP_CLAUDE_BINARY supplied");
     });
 
     await withPins({ ACP_CLAUDE_BINARY: somewhereElse }, async () => {
@@ -317,8 +343,18 @@ describe("the doctor reads the pin it will spawn", () => {
     expect(findings).toHaveLength(1);
     expect(findings[0]?.observedEvidence).toMatchObject({ path: "claude", condition: "NOT_ON_PATH" });
     expect(findings[0]?.observedEvidence).not.toHaveProperty("error");
-    expect(findings[0]?.recommendedAction).toContain("PATH");
-    expect(findings[0]?.recommendedAction).not.toContain("needs no restart");
+    const action = findings[0]?.recommendedAction ?? "";
+    expect(action).not.toContain("needs no restart");
+    // The set a spawn actually searches is `agentPath()` — the node binary's directory plus
+    // /usr/bin, /bin, /usr/sbin and /sbin — not the daemon's PATH, which on this host includes
+    // /opt/homebrew/bin and /usr/local/bin. "Install it on the daemon's PATH" is a repair an
+    // operator can complete without the CLI becoming reachable.
+    expect(action).toContain("/usr/sbin");
+    expect(action).toContain("/opt/homebrew/bin");
+    // And the condition is a reading taken once at construction, never re-measured, so the message
+    // must not state it as a fact about the daemon's whole life.
+    expect(action).toContain("ran once");
+    expect(action).not.toContain("has ever started");
   });
 
   it("finds the pruned pin on the shipped composition, where claude is registered per role", async () => {
@@ -370,7 +406,9 @@ describe("the doctor reads the pin it will spawn", () => {
             path: claudePin,
             condition: "ABSENT",
           });
-          expect(findings[0]?.recommendedAction).toContain("change ACP_CLAUDE_BINARY and restart");
+          expect(findings[0]?.recommendedAction).toContain(
+            "change ACP_CLAUDE_BINARY, whose current value is this pin",
+          );
           expect(findings[0]?.blocking).toBe(false);
         } finally {
           cp.close();

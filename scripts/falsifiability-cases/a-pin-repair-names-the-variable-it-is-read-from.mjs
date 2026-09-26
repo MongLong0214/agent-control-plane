@@ -12,14 +12,14 @@
  * and two thirds of the evidence on screen agrees with it. This row exists so that simplification
  * dies rather than ships.
  *
- * The mutation now lands in `pinSourceFor`, because that is where the name is looked up since the
+ * The mutation now lands in `variableMatchingPin`, because that is where the name is looked up since the
  * message stopped naming a variable that does not own the pin in hand. The annotation
  * `: string | undefined` is not decoration: without it the `variable === undefined` guard below
  * becomes a comparison TypeScript rejects as impossible, and the harness typechecks every mutant,
  * so the row would report a compile failure instead of a verdict.
  *
  * Under the mutant, gpt's lookup answers `ACP_GPT_BINARY`, `process.env` has no such variable, and
- * `pinSourceFor` therefore names nothing — so the repair for gpt loses `ACP_CODEX_BINARY`. It is
+ * `variableMatchingPin` therefore names nothing — so the repair for gpt loses `ACP_CODEX_BINARY`. It is
  * narrow: the finding is still produced, still non-blocking, still carries the same evidence.
  *
  * The witness must exercise the gpt provider. A test that checked `claude` alone passes under the
