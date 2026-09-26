@@ -582,6 +582,34 @@ describe("the daemon's Buzz message ingress", () => {
     }
   });
 
+  it("passes authenticated event provenance to the daemon CEO delivery interface", async () => {
+    const harness = makeHarness();
+    bindCeo(harness);
+    const conversation = new CeoConversationPort();
+    const { peer, server } = fakeCeoPeer("답");
+    conversation.attach(server, stillCeo());
+    const listener = await startMessageListener(harness, conversation);
+    const original = listener.seam.port.deliverToCeo;
+    const provenance: unknown[] = [];
+    listener.seam.port.deliverToCeo = async (text, source) => {
+      provenance.push(source);
+      return original(text, source);
+    };
+
+    try {
+      const response = await exchangeSocketLines(
+        listener.socketPath,
+        [envelope({ eventId: "evt-provenance", actor: OWNER, conversation: "buzz-ceo-room", text: "진행 상황" })],
+        hasReasonCode,
+      );
+      expect(JSON.parse(response.trim())).toMatchObject({ ok: true, reasonCode: ReasonCode.OK });
+      expect(peer.calls).toEqual(["진행 상황"]);
+      expect(provenance).toEqual([{ eventId: "evt-provenance", actor: OWNER, conversation: "buzz-ceo-room" }]);
+    } finally {
+      await listener.close();
+    }
+  });
+
   it("claims the turn under the CEO generation it was answered by, and refuses the same event twice", async () => {
     const harness = makeHarness();
     bindCeo(harness);

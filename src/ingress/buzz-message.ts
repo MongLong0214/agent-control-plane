@@ -215,6 +215,7 @@ export interface BuzzMentionRouter {
 /** An admitted Buzz message, in the shape the turn machinery needs it. */
 export interface AdmittedBuzzMessage {
   text: string;
+  eventId: string;
   actor: string;
   conversation: string;
   nonce: string;
@@ -326,6 +327,7 @@ export class BuzzMessageIngress {
 
     return allow(ReasonCode.UNTRUSTED_CONTENT_IS_DATA, {
       text: input.text,
+      eventId: input.eventId,
       actor: input.actor,
       conversation: input.conversation,
       nonce: request.nonce,
@@ -452,8 +454,11 @@ export interface ActiveRoleTarget {
 
 /** The daemon-side capabilities this path needs, as functions rather than the ControlPlane. */
 export interface BuzzMessageTurnPort {
-  /** Delivers one turn to whoever currently holds the CEO binding. */
-  deliverToCeo(text: string): Promise<CeoTurnDelivery>;
+  /** Delivers one turn with its authenticated Buzz origin to the existing CEO binding. */
+  deliverToCeo(
+    text: string,
+    source: Pick<AdmittedBuzzMessage, "eventId" | "actor" | "conversation">,
+  ): Promise<CeoTurnDelivery>;
   /** The CEO binding generation this turn is being claimed under, or null if there is none. */
   bindingGeneration(): number | null;
   /**
@@ -802,7 +807,11 @@ export const deliverBuzzMessage = async (
     payload: buzzMessagePayload(input),
   });
 
-  const delivered = await port.deliverToCeo(admitted.text);
+  const delivered = await port.deliverToCeo(admitted.text, {
+    eventId: admitted.eventId,
+    actor: admitted.actor,
+    conversation: admitted.conversation,
+  });
 
   // Which outcomes close the claim, and which leave it outstanding.
   //
