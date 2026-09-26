@@ -3,7 +3,7 @@ import { readProcessStartToken } from "../core/process-argv.ts";
 import { processStartedAt } from "../core/process-identity.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { Role, SessionLifecycle } from "../domain/types.ts";
+import { Role, SessionLifecycle, type RoleBinding } from "../domain/types.ts";
 import { probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
 import { runHermesTargetBind, type HermesTargetBindResponse } from "../runtime/hermes-target-bind.ts";
 
@@ -70,6 +70,29 @@ export const createHermesIncumbentAdoption = (cp: ControlPlane, options: {
         !incumbent || incumbent.incarnation !== previous.session_incarnation ||
         probeSessionLiveness(incumbent.osPid, incumbent.osProcessStartedAt) !== "DEAD") return refuse();
 
+    // Finish the awaited Gateway readback before publishing any CEO binding. A bind followed
+    // by an awaited proof admits runs that cannot safely be revoked on a changed head.
+    let current: GatewayIncumbentProof | null;
+    try { current = await options.gatewayOrigin(); } catch { current = null; }
+    if (!current || current.session_id !== expectedLiveSessionId ||
+        current.lineage_root_digest !== proof.lineage_root_digest ||
+        current.process_pid !== proof.process_pid || current.process_started_at !== proof.process_started_at ||
+        readProcessStartToken(proof.process_pid) !== proof.process_started_at) return refuse();
+    // The awaited readback may have let another caller replace the binding or move the actor.
+    const latest = cp.db.get<typeof previous>(
+      "SELECT actor_id, binding_generation, session_id, session_incarnation, status FROM assignments WHERE role_key = 'CEO' ORDER BY binding_generation DESC LIMIT 1",
+    );
+    const servingActor = cp.db.get<typeof actor>(
+      "SELECT kind, current_session_id, current_session_incarnation, retired_at FROM conversational_actors WHERE actor_id = ?",
+      [previous.actor_id],
+    );
+    if (cp.bindings.active("CEO") || !latest || latest.actor_id !== previous.actor_id ||
+        latest.binding_generation !== previous.binding_generation || latest.session_id !== previous.session_id ||
+        latest.session_incarnation !== previous.session_incarnation || latest.status !== "REVOKED" ||
+        !servingActor || servingActor.kind !== Role.CEO || servingActor.retired_at !== null ||
+        servingActor.current_session_id !== previous.session_id ||
+        servingActor.current_session_incarnation !== previous.session_incarnation) return refuse();
+
     // SessionRegistry's liveness probe compares ps lstart, not the native Gateway token.
     const created = cp.sessions.create({ provider: "hermes", model: "hermes-runtime",
       osPid: proof.process_pid, osStartedAt: startedAt });
@@ -82,7 +105,10 @@ export const createHermesIncumbentAdoption = (cp: ControlPlane, options: {
     const claimed = { executorKind: "hermes", targetLocator: proof.session_id,
       targetLocatorDigest: proof.lineage_root_digest };
     let receipt: HermesTargetBindResponse | null = null;
-    const bound = cp.bindings.bind({ role: Role.CEO, sessionId: created.sessionId,
+    // Bind, inspect the exact assignment, and publish as one synchronous transaction.
+    // A mismatched readback rolls the entire bind back before listeners or runs can see it.
+    const bound: Decision<RoleBinding> = cp.db.txDecision((): Decision<RoleBinding> => {
+      const binding = cp.bindings.bind({ role: Role.CEO, sessionId: created.sessionId,
       restoreCeo: { actorId: previous.actor_id, generation: previous.binding_generation,
         sessionId: previous.session_id, incarnation: previous.session_incarnation },
       authenticatedTarget: {
@@ -103,46 +129,31 @@ export const createHermesIncumbentAdoption = (cp: ControlPlane, options: {
           return claimed;
         },
       },
+      });
+      if (!binding.allowed) return binding;
+      const restored = cp.db.get<{ actor_id: string }>(
+        "SELECT actor_id FROM assignments WHERE assignment_id = ? AND binding_generation = ?",
+        [binding.value.assignmentId, binding.value.bindingGeneration],
+      );
+      const serving = cp.db.get<{ current_session_id: string; current_session_incarnation: string }>(
+        "SELECT current_session_id, current_session_incarnation FROM conversational_actors WHERE actor_id = ?",
+        [previous.actor_id],
+      );
+      const active = cp.bindings.active("CEO");
+      if (restored?.actor_id !== previous.actor_id ||
+          serving?.current_session_id !== created.sessionId ||
+          serving.current_session_incarnation !== created.incarnation ||
+          active?.assignmentId !== binding.value.assignmentId) {
+        return deny(ReasonCode.CONFLICT, "Gateway adoption binding readback failed", {});
+      }
+      return binding;
     });
     if (!bound.allowed) {
       void cp.sessions.transition(created.sessionId, SessionLifecycle.ERROR, "adoption target bind failed");
       return bound;
     }
-    let current: GatewayIncumbentProof | null;
-    try { current = await options.gatewayOrigin(); } catch { current = null; }
-    const changedHead = !current || current.session_id !== expectedLiveSessionId ||
-        current.lineage_root_digest !== proof.lineage_root_digest ||
-        current.process_pid !== proof.process_pid || current.process_started_at !== proof.process_started_at ||
-        readProcessStartToken(proof.process_pid) !== proof.process_started_at;
-    const restored = cp.db.get<{ actor_id: string }>(
-      "SELECT actor_id FROM assignments WHERE assignment_id = ? AND binding_generation = ?",
-      [bound.value.assignmentId, bound.value.bindingGeneration],
-    );
-    const serving = cp.db.get<{ current_session_id: string; current_session_incarnation: string }>(
-      "SELECT current_session_id, current_session_incarnation FROM conversational_actors WHERE actor_id = ?",
-      [previous.actor_id],
-    );
-    const active = cp.bindings.active("CEO");
-    const readbackMismatch = restored?.actor_id !== previous.actor_id ||
-      serving?.current_session_id !== created.sessionId ||
-      serving.current_session_incarnation !== created.incarnation ||
-      active?.assignmentId !== bound.value.assignmentId;
-    if (changedHead || readbackMismatch) {
-      // Revoke only our assignment; a replacement may have bound while the awaited proof was in flight.
-      const ownsActiveBinding = active?.assignmentId === bound.value.assignmentId;
-      const revoked = ownsActiveBinding
-        ? cp.bindings.revoke("CEO", "Gateway adoption post-bind verification failed") : null;
-      const errored = cp.sessions.transition(created.sessionId, SessionLifecycle.ERROR,
-        "Gateway adoption post-bind verification failed");
-      return deny(ReasonCode.CONFLICT, "Gateway adoption post-bind verification failed", {
-        changedHead, readbackMismatch, rollbackRevoked: revoked?.allowed ?? false,
-        rollbackSkippedForeignBinding: !ownsActiveBinding,
-        rollbackFailureCode: revoked && !revoked.allowed ? revoked.reasonCode : null,
-        sessionErrored: errored.allowed,
-      });
-    }
     return allow(ReasonCode.OK, { sessionId: created.sessionId, sessionIncarnation: created.incarnation,
-      actorId: restored.actor_id, bindingGeneration: bound.value.bindingGeneration });
+      actorId: previous.actor_id, bindingGeneration: bound.value.bindingGeneration });
   },
   };
 };
