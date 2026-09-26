@@ -38,6 +38,11 @@ const CANONICAL_ACTIVATION_VARIABLES = [
   "ACP_CANONICAL_CTO_PEER_PROTOCOL",
   "ACP_CANONICAL_CTO_BUZZ_PURPOSE",
 ] as const;
+const HERMES_ADOPTION_VARIABLES = [
+  "ACP_HERMES_EXPECTED_LIVE_SESSION_ID", "ACP_HERMES_TARGET_SESSION_ID",
+  "ACP_HERMES_LINEAGE_ROOT_DIGEST", "ACP_HERMES_EXECUTABLE", "ACP_HERMES_PROFILE",
+  "ACP_HERMES_HOME", "ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY", "ACP_HERMES_GATEWAY_API_KEY",
+] as const;
 
 interface InstallerHarness {
   home: string;
@@ -133,6 +138,13 @@ case "$account" in
     esac
     printf 'keychain-%s\\n' "$account"
     ;;
+  ACP_HERMES_*)
+    case ",\${ACP_HERMES_KEYCHAIN_ACCOUNTS:-}," in
+      *,"$account",*) ;;
+      *) exit 44 ;;
+    esac
+    printf 'keychain-%s\\n' "$account"
+    ;;
   ACP_TELEGRAM_*)
     case ",\${ACP_TELEGRAM_KEYCHAIN_ACCOUNTS:-}," in
       *,"$account",*) ;;
@@ -207,9 +219,10 @@ if [[ "$target" == *"agentcpd.js" ]]; then
   # 8-10 are what the daemon was handed, 11-13 what its own PATH can find, 14 whether the handed
   # path runs, 15 which interpreter its PATH resolves, 16 whether an unrelated executable sitting
   # beside a provider CLI is reachable, 17-24 the atomic canonical activation group, and 25-26
-  # where the bare name lsof resolves and what a real scan through it reports. They are
+  # where the bare name lsof resolves and what a real scan through it reports; 26-33 are
+  # the optional Hermes adoption group. They are
   # separate observations and a launcher can satisfy any of them without the others.
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
     "\${ACP_TELEGRAM_BOT_TOKEN-}" "\${ACP_TELEGRAM_OWNER_ID-}" \
     "\${ACP_TELEGRAM_CHAT_ID-}" "\${ACP_TELEGRAM_WEBHOOK_SECRET-}" \
     "\${BUZZ_PRIVATE_KEY:-<unset>}" "\${ACP_BUZZ_BINARY:-<unset>}" \
@@ -224,7 +237,11 @@ if [[ "$target" == *"agentcpd.js" ]]; then
     "\${ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH-}" "\${ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256-}" \
     "\${ACP_CANONICAL_CTO_BUZZ_ACTOR_ID-}" \
     "\${ACP_CANONICAL_CTO_PEER_PROTOCOL-}" "\${ACP_CANONICAL_CTO_BUZZ_PURPOSE-}" \
-    "$(command -v lsof || printf '<unresolvable>')" "$(lsof_scan)" >> "$ACP_LAUNCHER_ENV_LOG"
+    "$(command -v lsof || printf '<unresolvable>')" "$(lsof_scan)" \
+    "\${ACP_HERMES_EXPECTED_LIVE_SESSION_ID-}" "\${ACP_HERMES_TARGET_SESSION_ID-}" \
+    "\${ACP_HERMES_LINEAGE_ROOT_DIGEST-}" "\${ACP_HERMES_EXECUTABLE-}" \
+    "\${ACP_HERMES_PROFILE-}" "\${ACP_HERMES_HOME-}" \
+    "\${ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY-}" "\${ACP_HERMES_GATEWAY_API_KEY-}" >> "$ACP_LAUNCHER_ENV_LOG"
   # Mirrors the real precondition in src/daemon/agentcpd.ts: a Buzz credential without the
   # ingress pair is a startup error, not a degraded mode. Without this, a launcher that
   # exported the key too eagerly would look fine here and put the real daemon in a launchd
@@ -372,6 +389,9 @@ const launcherObservations = (harness: InstallerHarness) => {
     canonical: Object.fromEntries(
       CANONICAL_ACTIVATION_VARIABLES.map((name, index) => [name, f[17 + index] ?? ""]),
     ) as Record<(typeof CANONICAL_ACTIVATION_VARIABLES)[number], string>,
+    hermes: Object.fromEntries(
+      HERMES_ADOPTION_VARIABLES.map((name, index) => [name, f[26 + index] ?? ""]),
+    ) as Record<(typeof HERMES_ADOPTION_VARIABLES)[number], string>,
   };
 };
 
@@ -799,6 +819,36 @@ describe("launchd deployment artifact", () => {
       expect(lookups).toContain(`find-generic-password -w -s test-service -a ${name}`);
     }
     expect(existsSync(join(harness.home, ".agent-control-plane", "buzz-nostr-subscriber.json"))).toBe(false);
+  });
+
+  it("passes the complete Hermes adoption group from Keychain, never from inherited values", () => {
+    const harness = makeHarness();
+    for (const name of HERMES_ADOPTION_VARIABLES) harness.env[name] = `inherited-${name}`;
+    harness.env["ACP_HERMES_KEYCHAIN_ACCOUNTS"] = HERMES_ADOPTION_VARIABLES.join(",");
+    expect(installWithPins(harness).status).toBe(0);
+
+    let launched = runGeneratedLauncher(harness);
+    expect(launched.status, launched.stderr).toBe(0);
+    expect(launcherObservations(harness).hermes).toEqual(Object.fromEntries(
+      HERMES_ADOPTION_VARIABLES.map((name) => [name, `keychain-${name}`]),
+    ));
+    const lookups = readFileSync(harness.securityLog, "utf8");
+    for (const name of HERMES_ADOPTION_VARIABLES) {
+      expect(lookups).toContain(`find-generic-password -w -s test-service -a ${name}`);
+    }
+
+    // An absent account cannot be filled from the inherited shell; daemon validation owns
+    // rejection of the partial group (tested in operator-socket.test.ts).
+    const missing = HERMES_ADOPTION_VARIABLES[7];
+    harness.env["ACP_HERMES_KEYCHAIN_ACCOUNTS"] = HERMES_ADOPTION_VARIABLES.slice(0, -1).join(",");
+    rmSync(harness.launcherEnvLog);
+    launched = runGeneratedLauncher(harness);
+    expect(launched.status, launched.stderr).toBe(0);
+    const partial = launcherObservations(harness).hermes;
+    expect(partial[missing]).toBe("");
+    for (const name of HERMES_ADOPTION_VARIABLES.slice(0, -1)) {
+      expect(partial[name]).toBe(`keychain-${name}`);
+    }
   });
 
   it("#423 takes BUZZ_PRIVATE_KEY from the desktop store when it has no item of its own", () => {
