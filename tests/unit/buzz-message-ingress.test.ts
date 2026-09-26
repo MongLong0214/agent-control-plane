@@ -24,7 +24,7 @@ import {
   type BuzzSubscriberScheduler,
 } from "../../src/buzz/buzz-mention-subscriber.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { allow } from "../../src/core/errors.ts";
+import { allow, deny } from "../../src/core/errors.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import {
@@ -42,6 +42,8 @@ import {
   type BuzzMentionRouter,
 } from "../../src/ingress/buzz-message.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
+import type { GatewayEventSource } from "../../src/runtime/hermes-gateway-conversation.ts";
+import type { CeoTurnOutcome } from "../../src/mcp/ceo-conversation.ts";
 import {
   C0_QUALIFIED_CLIENT,
   ROLE_WAKE_FRAME,
@@ -175,12 +177,13 @@ const startMessageListener = async (
   harness: ReturnType<typeof makeHarness>,
   ceoConversation: CeoConversationPort,
   roleConversation?: RoleConversationPort,
+  gatewayConversation?: (text: string, source: GatewayEventSource) => Promise<CeoTurnOutcome>,
 ) =>
   startBuzzMessageIngressListener(
     harness.cp,
     tempDir("acp-buzz-message-"),
     { allowedActors: RELAY_ACTORS, secret: SECRET },
-    { ceoConversation, ownerActors: [OWNER], roleConversation },
+    { ceoConversation, ownerActors: [OWNER], roleConversation, gatewayConversation },
   );
 
 /**
@@ -540,6 +543,64 @@ const listeningWakeEndpoint = async (
 };
 
 describe("the daemon's Buzz message ingress", () => {
+  it("uses the configured Gateway sender with signed provenance, not the attached MCP peer", async () => {
+    const harness = makeHarness();
+    bindCeo(harness);
+    const conversation = new CeoConversationPort();
+    const { peer, server } = fakeCeoPeer("MCP must not answer");
+    conversation.attach(server, stillCeo());
+    const calls: { text: string; source: GatewayEventSource }[] = [];
+    const listener = await startMessageListener(harness, conversation, undefined, async (text, source) => {
+      calls.push({ text, source });
+      return { contact: "REACHED", answered: allow(ReasonCode.OK, "Gateway answered") };
+    });
+    try {
+      const received = await exchangeSocketLines(listener.socketPath,
+        [envelope({ eventId: "evt-gateway", text: "진행 상황" })], hasReasonCode);
+      expect(JSON.parse(received.trim())).toMatchObject({
+        ok: true, reasonCode: ReasonCode.OK, answeredByCeo: true, answer: "Gateway answered",
+      });
+      expect(calls).toEqual([{ text: "진행 상황", source: {
+        eventId: "evt-gateway", actor: OWNER, conversation: "buzz-ceo-room",
+      } }]);
+      expect(peer.calls).toEqual([]);
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it.each([
+    ["NEVER_REACHED", ReasonCode.CEO_CONVERSATION_STALE, true],
+    ["REACHED", ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED, false],
+  ] as const)("keeps Gateway %s refusal on its own contact boundary", async (contact, reasonCode, resolved) => {
+    const harness = makeHarness();
+    bindCeo(harness);
+    const conversation = new CeoConversationPort();
+    const { peer, server } = fakeCeoPeer("MCP fallback is forbidden");
+    conversation.attach(server, stillCeo());
+    const eventId = `evt-gateway-${contact}`;
+    const listener = await startMessageListener(harness, conversation, undefined, async () => ({
+      contact, answered: deny(reasonCode, "Gateway refused"),
+    }));
+    try {
+      const received = await exchangeSocketLines(listener.socketPath,
+        [envelope({ eventId, text: "계세요?" })], hasReasonCode);
+      expect(JSON.parse(received.trim())).toMatchObject({
+        ok: true, reasonCode, answeredByCeo: false,
+      });
+      expect(peer.calls).toEqual([]);
+      const claim = harness.cp.db.get<{ turn_claim_json: string | null }>(
+        `SELECT turn_claim_json FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`,
+        [buzzMessageNonce(eventId)],
+      );
+      const stored = JSON.parse(claim!.turn_claim_json!) as Record<string, unknown>;
+      expect(typeof stored["repliedAt"] === "string").toBe(resolved);
+      expect(stored["noReplyAt"]).toBeUndefined();
+    } finally {
+      await listener.close();
+    }
+  });
+
   it("delivers an owner's Buzz message to the holder of the active CEO binding without spawning a session child", async () => {
     const harness = makeHarness();
     const ceoSessionId = bindCeo(harness);
