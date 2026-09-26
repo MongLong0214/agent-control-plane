@@ -321,10 +321,11 @@ const assertProviderUnresolvable = (harness: InstallerHarness, ...names: string[
 const writeProviderCli = (path: string, body: string): string => {
   writeFileSync(path, body, { mode: 0o755 });
   chmodSync(path, 0o755);
-  // The canonical path, because that is what the installer pins: it resolves every answer to the
-  // real file before recording it, so a fixture compared by the name it was created under would
-  // disagree with a correct pin on any host whose temporary directory is itself a link.
-  return realpathSync(path);
+  // The path as written, because that is what the installer pins: it records the answer the
+  // installing shell gave, which is the PATH entry plus the name and carries whatever spelling
+  // that entry had. Returning the canonical path instead would disagree with a correct pin on
+  // every host whose temporary directory is itself a link — which macOS's is.
+  return path;
 };
 
 /** A provider CLI that carries its own interpreter, as a compiled one does. */
@@ -1097,7 +1098,7 @@ describe("launchd deployment artifact", () => {
     expect(seen.started?.split(",")[2]).toBe("started");
   });
 
-  it("#785 pins a symlinked CLI at its canonical target and refuses a relative, non-executable or absent one", () => {
+  it("#785 pins a symlinked CLI at the name it answered with and refuses a relative, non-executable or absent one", () => {
     const harness = makeHarness();
     // Four ways the installing shell can answer for a name, and what each is worth to a daemon
     // that runs from a different working directory and cannot search.
@@ -1106,15 +1107,18 @@ describe("launchd deployment artifact", () => {
     const onPath = join(harness.home, "acp-provider-cli-onpath");
     mkdirSync(onPath, { recursive: true });
 
-    // A symlink is a name for a file, not the file. What is pinned is the target it resolves to.
+    // A symlink is the stable name a provider's updater maintains, and what is pinned is that
+    // name rather than the version it currently resolves to (#954).
     const claudeTarget = writeProviderCli(join(real, "claude-1.0"), SELF_CONTAINED_CLI);
-    symlinkSync(claudeTarget, join(onPath, "claude"));
+    const claudeLink = join(onPath, "claude");
+    symlinkSync(claudeTarget, claudeLink);
     // A file that is present but not executable is not a CLI; the shell does not answer for it.
     writeFileSync(join(onPath, "codex"), SELF_CONTAINED_CLI, { mode: 0o644 });
     chmodSync(join(onPath, "codex"), 0o644);
-    // A relative answer names nothing a daemon in another working directory can reach, and would
-    // reach resolveExecutable's absolute-path branch, which returns it unchanged rather than
-    // searching. `grok` resolves only through a relative PATH entry.
+    // A relative answer names nothing a daemon in another working directory can reach. It would
+    // reach resolveExecutable's slash branch — which tests for a slash, not for an absolute path —
+    // and be anchored to whatever directory the daemon happens to be in rather than searched for.
+    // `grok` resolves only through a relative PATH entry.
     const relative = "acp-provider-cli-relative";
     mkdirSync(join(harness.home, relative), { recursive: true });
     writeProviderCli(join(harness.home, relative, "grok"), SELF_CONTAINED_CLI);
@@ -1141,10 +1145,10 @@ describe("launchd deployment artifact", () => {
     expect(installed.status, installed.stderr).toBe(0);
 
     const launcher = readFileSync(launcherPath(harness), "utf8");
-    // Pinned as the canonical target, never as the link that named it.
-    expect(launcher).toContain(`ACP_RESOLVED_CLAUDE_BINARY=${realpathSync(claudeTarget)}`);
-    expect(launcher, "the launcher pinned the link rather than its target").not.toContain(
-      `ACP_RESOLVED_CLAUDE_BINARY=${join(onPath, "claude")}`,
+    // Pinned as the link the shell answered with, never as the version behind it.
+    expect(launcher).toContain(`ACP_RESOLVED_CLAUDE_BINARY=${claudeLink}`);
+    expect(launcher, "the launcher pinned the target rather than the link that named it").not.toContain(
+      `ACP_RESOLVED_CLAUDE_BINARY=${realpathSync(claudeTarget)}`,
     );
     // Not pinned: neither the unexecutable file nor anything relative.
     expect(launcher, "a non-executable file was pinned").not.toContain("ACP_RESOLVED_CODEX_BINARY=");
@@ -1157,39 +1161,95 @@ describe("launchd deployment artifact", () => {
     const launched = runGeneratedLauncher(harness);
     expect(launched.status, launched.stderr).toBe(0);
     const seen = launcherObservations(harness);
-    expect(seen.handed["claude"]).toBe(realpathSync(claudeTarget));
+    expect(seen.handed["claude"]).toBe(claudeLink);
     expect(seen.started?.split(",")[0]).toBe("started");
     expect(seen.handed["codex"]).toBe("<unset>");
     expect(seen.handed["grok"]).toBe("<unset>");
   });
 
-  it("#785 keeps running the binary it pinned when the symlink that named it is repointed", () => {
+  it("#954 pins the stable name a provider's updater maintains, not the versioned file behind it", () => {
     const harness = makeHarness();
-    // The reason a pin is canonical. A pin that recorded the link would still read as correct
-    // after the link moved, and the daemon would run a provider binary this install never saw.
-    const real = join(harness.home, "acp-provider-cli-real");
-    mkdirSync(real, { recursive: true });
+    // The provider's own updater owns the versioned directory: it writes a new version, repoints
+    // the stable name at it, and deletes the one it replaced. A pin taken at the canonical target
+    // therefore names a file that stops existing within days of the install, and from then on
+    // every capacity probe spawns a path that is not there — reported as no quota, which the
+    // daemon reads as a role it cannot staff.
+    const versions = join(harness.home, "acp-provider-cli-versions");
+    mkdirSync(versions, { recursive: true });
     const onPath = join(harness.home, "acp-provider-cli-onpath");
     mkdirSync(onPath, { recursive: true });
-    const accepted = writeProviderCli(join(real, "claude-1.0"), SELF_CONTAINED_CLI);
-    const substitute = writeProviderCli(join(real, "claude-2.0"), SELF_CONTAINED_CLI);
-    const link = join(onPath, "claude");
-    symlinkSync(accepted, link);
+    const accepted = join(versions, "1.0.0");
+    writeFileSync(accepted, SELF_CONTAINED_CLI, { mode: 0o755 });
+    chmodSync(accepted, 0o755);
+    const stable = join(onPath, "claude");
+    symlinkSync(accepted, stable);
     harness.env["PATH"] = isolatedInstallerPath(harness, onPath);
 
     expect(installWithPins(harness).status).toBe(0);
 
-    // The link now names a different binary. Nothing about the installed deployment changed.
-    rmSync(link);
-    symlinkSync(substitute, link);
+    const launcher = readFileSync(launcherPath(harness), "utf8");
+    expect(
+      launcher,
+      "the launcher pinned something other than the stable path the installing shell answered with",
+    ).toContain(`ACP_RESOLVED_CLAUDE_BINARY=${stable}`);
+    expect(
+      launcher,
+      "the launcher pinned the versioned file, which the provider's updater deletes",
+    ).not.toContain(`ACP_RESOLVED_CLAUDE_BINARY=${realpathSync(accepted)}`);
+
+    // The updater runs: a new version arrives, the stable name moves to it, and the version this
+    // install resolved and accepted is removed.
+    const replacement = join(versions, "2.0.0");
+    writeFileSync(replacement, SELF_CONTAINED_CLI, { mode: 0o755 });
+    chmodSync(replacement, 0o755);
+    rmSync(stable);
+    symlinkSync(replacement, stable);
+    rmSync(accepted);
 
     const launched = runGeneratedLauncher(harness);
     expect(launched.status, launched.stderr).toBe(0);
     const seen = launcherObservations(harness);
-    expect(seen.handed["claude"], "repointing the symlink changed which binary the daemon runs").toBe(
-      realpathSync(accepted),
-    );
-    expect(seen.handed["claude"]).not.toBe(realpathSync(substitute));
+    expect(seen.handed["claude"]).toBe(stable);
+    // The half a text assertion cannot reach: the pinned path is still a CLI that runs. A pin at
+    // the deleted version reports `failed` here, which is the live symptom this row is about.
+    expect(
+      seen.started?.split(",")[0],
+      "the pinned path no longer runs once the provider's updater has replaced the version behind it",
+    ).toBe("started");
+  });
+
+  it("#954 refuses a name that answers for something other than a regular file", () => {
+    const harness = makeHarness();
+    // `-x` is not enough on its own. A FIFO with the executable bit set satisfies it, and
+    // `command -v` answers for it just as it would for a CLI — but a spawn of it blocks on an
+    // open that has no writer, so the daemon's first capacity probe would hang rather than fail.
+    // `-f` is the clause that keeps it out, and without a row it is the kind of clause a later
+    // simplification deletes as redundant.
+    const onPath = join(harness.home, "acp-provider-cli-fifo");
+    mkdirSync(onPath, { recursive: true });
+    const fifo = join(onPath, "claude");
+    boundedExecFileSync("mkfifo", [fifo], { timeout: 10_000 });
+    chmodSync(fifo, 0o755);
+    harness.env["PATH"] = isolatedInstallerPath(harness, onPath);
+
+    // The premise, asserted rather than assumed: the shell does answer with this path. If it did
+    // not, the assertion below would pass for the ordinary reason that nothing was found, and
+    // would say nothing at all about `-f`. A directory would fail here — `command -v` skips those
+    // — which is why this row uses a FIFO.
+    const answer = boundedSpawnSync("bash", ["-c", "command -v claude"], {
+      encoding: "utf8",
+      env: harness.env,
+    });
+    expect(answer.status, "the installing shell did not answer for the FIFO").toBe(0);
+    expect(answer.stdout.trim(), "the shell answered with something other than the FIFO").toBe(fifo);
+    expect(statSync(fifo).isFIFO(), "the fixture is not a FIFO").toBe(true);
+
+    const installed = installWithPins(harness);
+    expect(installed.status, installed.stderr).toBe(0);
+
+    const launcher = readFileSync(launcherPath(harness), "utf8");
+    expect(launcher, "a FIFO was pinned as a provider CLI").not.toContain("ACP_RESOLVED_CLAUDE_BINARY=");
+    expect(installed.stderr).toContain("could not resolve the claude CLI");
   });
 
   /** A valid app root at `where`: the builds and renderer the installer requires. */

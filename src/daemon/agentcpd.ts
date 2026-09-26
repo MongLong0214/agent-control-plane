@@ -19,6 +19,8 @@ import {
   createHermesBootstrapAuthority,
   type HermesBootstrapAuthority,
 } from "../bootstrap/hermes-bootstrap.ts";
+import { createHermesIncumbentAdoption } from "../bootstrap/hermes-incumbent-adoption.ts";
+import { createHermesGatewayIdentityReader } from "../runtime/hermes-gateway-identity.ts";
 import { BuzzAdapter, BuzzCliTransport } from "../buzz/buzz-adapter.ts";
 import {
   BUZZ_MENTION_ADDRESSED_TO,
@@ -72,7 +74,7 @@ import {
   type OwnerMessageHandover,
   type OwnerMessageLedger,
 } from "../mcp/role-conversation.ts";
-import { digestOf } from "../core/digest.ts";
+import { digestOf, isDigest } from "../core/digest.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import type { HolderIdentity } from "../outbox/outbox.ts";
 import { respond, type AuthenticatedMcpPeer, type McpPeerAuthenticator } from "../mcp/shared.ts";
@@ -296,6 +298,10 @@ export interface LocalOperatorSocketOptions {
   mcpToken?: string;
   /** The sole additional operator method: a fresh-install Hermes authority bootstrap. */
   bootstrapHermes?: (params: Record<string, unknown>) => Promise<Decision<unknown>>;
+  /** Binding-only adoption of a separately pinned, live incumbent; never starts a chat. */
+  adoptHermesIncumbent?: () => Promise<Decision<unknown>>;
+  /** Server-configured actor predicate; checked before reading request parameters. */
+  adoptHermesIncumbentOwnerAllowed?: () => boolean;
   // No `claimCanonicalCto` option on this bearer-token-authenticated socket (#760): a process may
   // prove who it is, but it cannot approve itself, so the claiming connection cannot sit on this
   // credential surface at all, not even behind its own kernel-credential check layered on top. It
@@ -1168,6 +1174,7 @@ export const startDaemonOperatorSocket = (
   // Never take channel/actor/owner claims from the request body or peerId text.
   const operatorActor = credential.actor.trim();
   const bootstrap = options.bootstrapHermes;
+  const adopt = options.adoptHermesIncumbent;
   return startOperatorSocket(daemon, stateDir, credential, {
     ...options,
     ...(bootstrap ? { bootstrapHermes: (params: Record<string, unknown>) => {
@@ -1178,8 +1185,71 @@ export const startDaemonOperatorSocket = (
       }
       return bootstrap(params);
     } } : {}),
+    ...(adopt ? { adoptHermesIncumbent: () => {
+      if (!cp.ownerAuthority.isAllowedActor("cli", operatorActor)) {
+        return Promise.resolve(deny(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED,
+          "incumbent adoption requires an allowlisted CLI owner", {}));
+      }
+      return adopt();
+    }, adoptHermesIncumbentOwnerAllowed: () => cp.ownerAuthority.isAllowedActor("cli", operatorActor) } : {}),
     ctoBinding: daemonCtoBindingRuntime(cp),
   });
+};
+
+const HERMES_ADOPTION_VARS = [
+  "ACP_HERMES_EXPECTED_LIVE_SESSION_ID", "ACP_HERMES_TARGET_SESSION_ID",
+  "ACP_HERMES_LINEAGE_ROOT_DIGEST", "ACP_HERMES_EXECUTABLE", "ACP_HERMES_PROFILE",
+  "ACP_HERMES_HOME", "ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY", "ACP_HERMES_GATEWAY_API_KEY",
+] as const;
+
+/** Capture independent daemon configuration before exposing the operator method. */
+export const createConfiguredHermesIncumbentAdoption = (
+  cp: ControlPlane,
+  configuration: Readonly<Record<string, string | undefined>>,
+  ports: {
+    identityReader?: typeof createHermesGatewayIdentityReader;
+    adoptionFactory?: typeof createHermesIncumbentAdoption;
+    authorityHeld?: () => boolean;
+  } = {},
+): (() => Promise<Decision<unknown>>) | undefined => {
+  const values = Object.fromEntries(HERMES_ADOPTION_VARS.map((key) => [key, configuration[key]])) as
+    Record<(typeof HERMES_ADOPTION_VARS)[number], string | undefined>;
+  const validText = (value: string | undefined): value is string =>
+    typeof value === "string" && value.trim() === value && value.length > 0 &&
+    value.length <= 512 && !/[\x00-\x1f\x7f]/.test(value);
+  if (!HERMES_ADOPTION_VARS.every((key) => validText(values[key])) ||
+      !isDigest(values.ACP_HERMES_LINEAGE_ROOT_DIGEST) ||
+      !/^[\x21-\x7e]+$/.test(values.ACP_HERMES_GATEWAY_API_KEY ?? "")) return undefined;
+
+  const readGateway = (ports.identityReader ?? createHermesGatewayIdentityReader)({
+    apiKey: values.ACP_HERMES_GATEWAY_API_KEY!,
+  });
+  const gatewayOrigin = async () => {
+    if (ports.authorityHeld && !ports.authorityHeld()) throw new Error("daemon lock lost");
+    const proof = await readGateway();
+    if (ports.authorityHeld && !ports.authorityHeld()) throw new Error("daemon lock lost");
+    return proof;
+  };
+  const adoption = (ports.adoptionFactory ?? createHermesIncumbentAdoption)(cp, {
+    gatewayOrigin,
+    target: { sessionId: values.ACP_HERMES_TARGET_SESSION_ID!,
+      lineageRootDigest: values.ACP_HERMES_LINEAGE_ROOT_DIGEST! },
+    expectedLiveSessionId: values.ACP_HERMES_EXPECTED_LIVE_SESSION_ID!,
+    hermesExecutable: values.ACP_HERMES_EXECUTABLE!,
+    hermesProfile: values.ACP_HERMES_PROFILE!,
+    hermesHome: values.ACP_HERMES_HOME!,
+    executorRuntimeIdentity: values.ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY!,
+  });
+  return async () => {
+    try {
+      const proof = await gatewayOrigin();
+      return adoption.adopt({ gatewayPid: proof.process_pid, gatewayStartToken: proof.process_started_at });
+    } catch {
+      return ports.authorityHeld && !ports.authorityHeld()
+        ? deny(ReasonCode.DAEMON_LOCK_LOST, "daemon lock was lost during incumbent adoption", {})
+        : deny(ReasonCode.CONFLICT, "authenticated live Gateway incumbent cannot be established", {});
+    }
+  };
 };
 
 export const startOperatorSocket = async (
@@ -1256,7 +1326,7 @@ export const startBootstrapOperatorDoor = (
   daemon: Pick<Daemon, "handleOperatorRequest" | "lock">,
   stateDir: string,
   credential: LocalOperatorCredential,
-  options: Omit<LocalOperatorSocketOptions, "bootstrapHermes"> = {},
+  options: Omit<LocalOperatorSocketOptions, "bootstrapHermes" | "adoptHermesIncumbent" | "adoptHermesIncumbentOwnerAllowed"> = {},
 ): Promise<LocalOperatorListener> => startOperatorSocket(daemon, stateDir, credential, options);
 
 const startMcpSocket = async (
@@ -1434,6 +1504,26 @@ const serveOperatorRequest = (
           finish(deny(ReasonCode.INTERNAL_ERROR, "Hermes bootstrap request failed", {
             error: error instanceof Error ? error.message : String(error),
           }));
+        });
+        return;
+      }
+      if (method === "hermes.adoptIncumbent") {
+        if (!options.adoptHermesIncumbent) {
+          return finish(deny(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED, "Hermes incumbent adoption is not configured", {}));
+        }
+        if (!daemon.lock.held()) {
+          return finish(deny(ReasonCode.DAEMON_LOCK_LOST, "daemon lock is not held for incumbent adoption", {}));
+        }
+        if (options.adoptHermesIncumbentOwnerAllowed?.() === false) {
+          return finish(deny(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED,
+            "incumbent adoption requires an allowlisted CLI owner", {}));
+        }
+        const params = operatorRequestParams(value);
+        if (!params || Object.keys(params).length !== 0) {
+          return finish(deny(ReasonCode.INVALID_ARGUMENT, "incumbent adoption accepts no parameters", {}));
+        }
+        void options.adoptHermesIncumbent().then(finish).catch(() => {
+          finish(deny(ReasonCode.INTERNAL_ERROR, "Hermes incumbent adoption failed", {}));
         });
         return;
       }
@@ -2841,6 +2931,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   if (!operatorActor) {
     throw new Error("ACP_OPERATOR_ACTOR or USER is required to establish the operator peer identity");
   }
+  const hermesAdoptionConfiguration = Object.fromEntries(
+    HERMES_ADOPTION_VARS.map((key) => [key, process.env[key]]),
+  ) as Record<(typeof HERMES_ADOPTION_VARS)[number], string | undefined>;
   const telegramConfig = configuredTelegramLongPollConfig(config.ownerIdentities ?? []);
   const cp = new ControlPlane(config);
 
@@ -2982,6 +3075,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       mcpToken,
       authorityHeld: () => daemon.lock.held(),
     });
+    const adoptHermesIncumbent = createConfiguredHermesIncumbentAdoption(
+      cp, hermesAdoptionConfiguration, { authorityHeld: () => daemon.lock.held() },
+    );
     // The operator socket is opened first so the uninitialized-only bootstrap door can be
     // reached without exposing a normal Hermes listener that has no bound peer yet.
     operator = await startDaemonOperatorSocket(
@@ -2996,6 +3092,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       {
         mcpToken,
         bootstrapHermes: (params) => hermesBootstrap!.bootstrap(params),
+        ...(adoptHermesIncumbent ? { adoptHermesIncumbent } : {}),
       },
     );
     if (canonicalActivationPresentCount === 0) {

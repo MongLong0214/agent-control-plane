@@ -91,10 +91,25 @@ system directory listed in `/etc/paths`, holding none of the names this control 
 authority by. A provider directory is user-writable and carries unrelated siblings, which is why
 one is still never added.
 
-Every executable path is recorded as its canonical target: the `--node` answer and each provider
-CLI are resolved through their symlinks and directory components before being copied, pinned or
-persisted, and must end at an absolute regular executable. Repointing a symlink after an install
-therefore does not change which binary the daemon runs.
+The two kinds of executable path this installer records are not recorded the same way, because
+they have different owners.
+
+The `--node` answer is resolved through its symlinks and directory components and must end at an
+absolute regular executable, and that canonical file is then copied into the runtime closure. A
+sealed generation's guarantee is that its own bytes plus the interpreter it names are the whole
+runtime, so the interpreter it carries has to be the file itself rather than a name for one.
+
+Each provider CLI is pinned at the name the installing shell answered with — the stable name the
+provider's own updater maintains — and is required to be absolute, a regular file and executable,
+but is not canonicalised. The versioned file behind that name belongs to the updater, which writes
+a new version, repoints the name and prunes the version it replaced; a pin recorded at the
+canonical target therefore stops naming anything within days of every install, and a probe that
+spawns a path which is not there reports no quota rather than an error. The daemon follows the name
+rather than freezing it: `resolveExecutable` (`src/runtime/cli-adapters.ts`) hands the pinned name
+itself to each spawn, so the kernel resolves the symlink at every exec and the CLI that runs is
+whichever version the name currently points at. Repointing the name after an install does change
+which binary the daemon runs, and that is the accepted outcome; nothing here notices a pinned name
+whose target has gone.
 
 `install`, `upgrade` and `rollback` canonicalise `--app-root` and then refuse two shapes, before
 any file is written, any service is stopped and the runtime interpreter is copied — so a refused

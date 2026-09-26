@@ -13,6 +13,8 @@ import {
   MAX_OPERATOR_METHOD_BUDGET_MS,
   OPERATOR_METHOD_BUDGET_MS,
   startOperatorSocket,
+  startDaemonOperatorSocket,
+  createConfiguredHermesIncumbentAdoption,
 } from "../../src/daemon/agentcpd.ts";
 import { COLLECTOR_TIMEOUT_MS } from "../../src/capacity/usage-collectors.ts";
 import { DEFAULT_RUNTIME_TIMEOUT_MS } from "../../src/bootstrap/hermes-bootstrap.ts";
@@ -22,6 +24,7 @@ import { allow } from "../../src/core/errors.ts";
 import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import {
   makeStartedOperator,
+  makeHarness,
   TEST_OWNER,
   TEST_MCP_TOKEN,
   TEST_OPERATOR_TOKEN,
@@ -35,6 +38,126 @@ afterAll(cleanupTempDirs);
 const execFile = promisify(execFileCallback);
 const OPERATOR_TOKEN = TEST_OPERATOR_TOKEN;
 const MCP_TOKEN = TEST_MCP_TOKEN;
+
+const adoptionConfig = () => ({
+  ACP_HERMES_EXPECTED_LIVE_SESSION_ID: "live-head",
+  ACP_HERMES_TARGET_SESSION_ID: "original-root",
+  ACP_HERMES_LINEAGE_ROOT_DIGEST: `sha256:${"a".repeat(64)}`,
+  ACP_HERMES_EXECUTABLE: "/opt/test/hermes",
+  ACP_HERMES_PROFILE: "test-profile",
+  ACP_HERMES_HOME: "/opt/test/home",
+  ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY: "hermes-runtime:test",
+  ACP_HERMES_GATEWAY_API_KEY: "fixture-gateway-key",
+});
+
+describe("daemon-owned Hermes incumbent adoption", () => {
+  it("does not expose the method for absent, partial, or invalid daemon configuration", async () => {
+    const harness = makeHarness();
+    try {
+      for (const config of [{}, ...Object.keys(adoptionConfig()).map((key) => {
+        const partial: Record<string, string> = { ...adoptionConfig() };
+        delete partial[key];
+        return partial;
+      }), { ...adoptionConfig(), ACP_HERMES_LINEAGE_ROOT_DIGEST: "not-a-digest" }]) {
+        expect(createConfiguredHermesIncumbentAdoption(harness.cp, config)).toBeUndefined();
+      }
+    } finally { harness.cp.close(); }
+  });
+
+  it("routes only an authenticated allowlisted owner with empty params through the Gateway proof and core, under lock", async () => {
+    const harness = makeHarness();
+    const config = adoptionConfig();
+    let held = true;
+    const read = vi.fn(async () => ({ session_id: "live-head", lineage_root_digest: config.ACP_HERMES_LINEAGE_ROOT_DIGEST,
+      process_pid: 222, process_started_at: "darwin-tv:1.000001" }));
+    const adopt = vi.fn(async () => allow(ReasonCode.OK, { actorId: "actor:ceo", sessionId: "session:bound",
+      bindingGeneration: 2, sessionIncarnation: "incarnation:bound" }));
+    const factory = vi.fn((_cp, options) => {
+      expect(options).toMatchObject({ target: { sessionId: "original-root", lineageRootDigest: config.ACP_HERMES_LINEAGE_ROOT_DIGEST },
+        expectedLiveSessionId: "live-head", hermesExecutable: "/opt/test/hermes",
+        hermesProfile: "test-profile", hermesHome: "/opt/test/home", executorRuntimeIdentity: "hermes-runtime:test" });
+      return { adopt };
+    });
+    const reader = vi.fn((_options) => read);
+    const callback = createConfiguredHermesIncumbentAdoption(harness.cp, config,
+      { identityReader: reader, adoptionFactory: factory });
+    expect(callback).toBeDefined();
+    config.ACP_HERMES_EXPECTED_LIVE_SESSION_ID = "changed";
+    config.ACP_HERMES_GATEWAY_API_KEY = "changed";
+    const handleOperatorRequest = vi.fn(async () => allow(ReasonCode.OK, {}));
+    const daemon = { lock: { held: () => held }, handleOperatorRequest } as never;
+    const owner = await startDaemonOperatorSocket(harness.cp, daemon, tempDir("acp-adopt-owner-"),
+      { token: OPERATOR_TOKEN, peerId: "cli:owner", actor: TEST_OWNER.actor },
+      { mcpToken: MCP_TOKEN, adoptHermesIncumbent: callback });
+    const stranger = await startDaemonOperatorSocket(harness.cp, daemon, tempDir("acp-adopt-stranger-"),
+      { token: OPERATOR_TOKEN, peerId: "cli:stranger", actor: "not-allowed" },
+      { mcpToken: MCP_TOKEN, adoptHermesIncumbent: callback });
+    const request = { method: "hermes.adoptIncumbent", params: {}, idempotencyKey: "same-key" };
+    try {
+      expect(await operatorRequest(stranger.socketPath, OPERATOR_TOKEN, { ...request, params: { actor: TEST_OWNER.actor } }))
+        .toMatchObject({ allowed: false, reasonCode: ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED });
+      expect(await operatorRequest(stranger.socketPath, OPERATOR_TOKEN, request))
+        .toMatchObject({ allowed: false, reasonCode: ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED });
+      expect(await operatorRequest(owner.socketPath, "wrong-token", request))
+        .toMatchObject({ allowed: false, reasonCode: ReasonCode.OPERATOR_UNAUTHENTICATED });
+      for (const params of [{ url: "http://other" }, { bearer: "other" }, { actor: TEST_OWNER.actor },
+        { head: "other" }, [], "invalid"]) {
+        expect(await operatorRequest(owner.socketPath, OPERATOR_TOKEN, { ...request, params }))
+          .toMatchObject({ allowed: false, reasonCode: ReasonCode.INVALID_ARGUMENT });
+      }
+      held = false;
+      expect(await operatorRequest(owner.socketPath, OPERATOR_TOKEN, request))
+        .toMatchObject({ allowed: false, reasonCode: ReasonCode.DAEMON_LOCK_LOST });
+      expect(read).not.toHaveBeenCalled();
+      held = true;
+      expect(await operatorRequest(owner.socketPath, OPERATOR_TOKEN, request))
+        .toMatchObject({ allowed: true, value: { actorId: "actor:ceo", sessionId: "session:bound" } });
+      // This method bypasses daemon's idempotency cache: a fixed CLI key cannot replay success.
+      expect(await operatorRequest(owner.socketPath, OPERATOR_TOKEN, request))
+        .toMatchObject({ allowed: true, value: { actorId: "actor:ceo", sessionId: "session:bound" } });
+      expect(reader).toHaveBeenCalledWith({ apiKey: "fixture-gateway-key" });
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(adopt).toHaveBeenCalledTimes(2);
+      expect(adopt).toHaveBeenCalledWith({ gatewayPid: 222, gatewayStartToken: "darwin-tv:1.000001" });
+      expect(handleOperatorRequest).not.toHaveBeenCalled();
+    } finally { await owner.close(); await stranger.close(); harness.cp.close(); }
+  });
+
+  it("does not expose the unconfigured method through generic daemon dispatch", async () => {
+    const handleOperatorRequest = vi.fn(async () => allow(ReasonCode.OK, {}));
+    const listener = await startOperatorSocket({ lock: { held: () => true }, handleOperatorRequest } as never,
+      tempDir("acp-adopt-absent-"),
+      { token: OPERATOR_TOKEN, peerId: "cli:owner", actor: TEST_OWNER.actor }, { mcpToken: MCP_TOKEN });
+    try {
+      expect(await operatorRequest(listener.socketPath, OPERATOR_TOKEN,
+        { method: "hermes.adoptIncumbent", params: {} }))
+        .toMatchObject({ allowed: false, reasonCode: ReasonCode.OPERATOR_METHOD_NOT_ALLOWED });
+      expect(handleOperatorRequest).not.toHaveBeenCalled();
+    } finally { await listener.close(); }
+  });
+
+  it("does not call the core after losing the lock during the Gateway read", async () => {
+    const harness = makeHarness();
+    let held = true;
+    const adopt = vi.fn(async () => allow(ReasonCode.OK, {
+      sessionId: "session:bound", actorId: "actor:ceo", bindingGeneration: 2,
+      sessionIncarnation: "incarnation:bound",
+    }));
+    try {
+      const callback = createConfiguredHermesIncumbentAdoption(harness.cp, adoptionConfig(), {
+        authorityHeld: () => held,
+        identityReader: () => async () => {
+          held = false;
+          return { session_id: "live-head", lineage_root_digest: adoptionConfig().ACP_HERMES_LINEAGE_ROOT_DIGEST,
+            process_pid: 222, process_started_at: "darwin-tv:1.000001" };
+        },
+        adoptionFactory: () => ({ adopt }),
+      });
+      expect(await callback!()).toMatchObject({ allowed: false, reasonCode: ReasonCode.DAEMON_LOCK_LOST });
+      expect(adopt).not.toHaveBeenCalled();
+    } finally { harness.cp.close(); }
+  });
+});
 
 const CONTRACT: TaskContract = {
   goal: "operator socket regression",
