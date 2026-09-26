@@ -107,19 +107,42 @@ const DENIED_TOOLS = [
   "TodoWrite",
 ];
 
+/**
+ * The path a provider CLI is spawned at: the caller's own answer, or the first PATH entry that
+ * holds an executable of that name. Never canonicalised.
+ *
+ * Both returns used to be `realpathSync` of their answer, and an adapter assigns this once in its
+ * constructor and spawns that one string for the rest of the daemon's life. A provider CLI of this
+ * kind is reached through a stable name its own updater maintains, so canonicalising resolved that
+ * name to the version behind it and froze it there; the updater then repointed the name and pruned
+ * the version. Measured on the deployment host: the daemon started at 01:59:50Z and the version it
+ * was holding was pruned at 02:01Z, and the same updater produced three versions on three
+ * consecutive days. Every probe after the prune spawns a path that is not there, which is reported
+ * as no quota rather than as an error, and a role whose capacity is empty is revoked.
+ *
+ * Returning the name is what makes each spawn resolve it again: the kernel follows the symlink at
+ * exec. Re-resolving inside this module was the other option and buys nothing over that — it would
+ * add a resolution that has to be kept in step with the one `execve` performs anyway.
+ *
+ * Canonicalising bought only the freeze at both sites. The first branch already returned its
+ * argument unchanged when `realpathSync` threw, so it never validated anything; the second has
+ * `accessSync(candidate, X_OK)` ahead of it, which is the check that decides. Nothing was put in
+ * its place here: a check whose failure cannot change the answer reports a coverage it does not
+ * have, and the only answer it could change to — searching PATH for some other file when a stated
+ * absolute path is momentarily unreadable — would spawn a binary the caller did not name.
+ *
+ * The seatbelt profile is unaffected. `reviewerProfile`'s `(allow process-exec (literal ...))` is
+ * built per spawn from `resolvePath(executable)`, and measured here: a profile naming the canonical
+ * target execs successfully through a symlink to it, while one naming the symlink path is refused
+ * with EPERM. So the canonical target is the entry that has to be there, and it still is.
+ */
 const resolveExecutable = (binary: string): string => {
-  if (binary.includes("/")) {
-    try {
-      return realpathSync(binary);
-    } catch {
-      return binary;
-    }
-  }
+  if (binary.includes("/")) return binary;
   for (const directory of (process.env.PATH ?? "").split(":").filter(Boolean)) {
     const candidate = join(directory, binary);
     try {
       accessSync(candidate, constants.X_OK);
-      return realpathSync(candidate);
+      return candidate;
     } catch {
       // Keep searching; an unavailable configured binary is reported by the probe.
     }

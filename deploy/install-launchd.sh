@@ -316,13 +316,19 @@ resolve_cli_binary() {
   # install. From then on each capacity probe spawns a path that is not there, the provider reports
   # no quota rather than an error, and a role whose capacity is empty is revoked. That is the more
   # expensive of the two failures and the one that was measured, so the stable name the updater
-  # maintains is what gets pinned; running a version newer than the one resolved here is accepted.
+  # maintains is what gets pinned. The daemon follows that name at each spawn — `resolveExecutable`
+  # (src/runtime/cli-adapters.ts) hands the name itself to the spawn rather than its canonical
+  # target, so the kernel resolves it every time — and running whichever version the name currently
+  # points at is the accepted outcome.
   #
-  # Absolute and executable is still required. A relative answer reaches resolveExecutable's
-  # absolute-path branch, which returns it unchanged rather than searching, and the daemon runs
-  # from a working directory the installing shell does not share; the execute test is what
-  # `canonical_executable` used to contribute here, and a dangling stable name fails it.
-  [[ -n "$found" && "$found" == /* && -x "$found" ]] || return 0
+  # Absolute, a regular file, and executable is still required. A relative answer reaches
+  # resolveExecutable's absolute-path branch, which returns it unchanged rather than searching, and
+  # the daemon runs from a working directory the installing shell does not share. The other two are
+  # what `canonical_executable` used to contribute at this site and are written out here instead:
+  # `-x` alone is true of a mode-755 FIFO that `command -v` answers for, and of a directory, so
+  # without `-f` a name that is not a program can be pinned. Both follow the link, so a stable name
+  # whose target has already gone fails them.
+  [[ -n "$found" && "$found" == /* && -f "$found" && -x "$found" ]] || return 0
   printf '%s' "$found"
 }
 
