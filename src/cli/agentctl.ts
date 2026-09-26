@@ -62,6 +62,8 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
                                            settle an unobserved turn ABORTED, which permits a retry.
                                            --fenced only when its executor incarnation is still
                                            current: you are stating the execution cannot still write
+  agentctl adopt hermes                   ask the daemon to bind the live Hermes incumbent;
+                                           binding alone does not mean the conversation is ready
   agentctl bootstrap hermes --target-bind-executable <path> --hermes-profile <profile> --hermes-home <path> --requested-session-id <id> --expected-lineage-root-digest <sha256> --executor-runtime-identity <identity> -- <command>
   agentctl claim canonical-cto --claimed-session-id <uuid> --project-id <id> --expected-binding-generation <n>
                                            adopt the existing canonical CTO conversation in place;
@@ -145,7 +147,7 @@ export const main = async (argv: string[]): Promise<number> => {
   }
 
   const owner = rest.includes("--owner");
-  const args = rest.filter((arg) => arg !== "--owner");
+  const args = command === "adopt" ? rest : rest.filter((arg) => arg !== "--owner");
 
   const client = createOperatorClient({
     socketPath:
@@ -309,6 +311,12 @@ export const dispatch = async (
 
   if (command === "doctor") {
     return call("doctor.run", { scope: args[0] ?? "system", target: args[1] ?? null });
+  }
+
+  if (command === "adopt") {
+    if (args[0] !== "hermes") return fail(`unknown adopt subcommand: ${args[0] ?? ""}`);
+    if (args.length !== 1) return fail("adopt hermes accepts no additional arguments");
+    return call("hermes.adoptIncumbent", {});
   }
 
   if (command === "bootstrap") {
