@@ -1,9 +1,10 @@
-import { chmodSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
-import type { Clock } from "../../src/core/clock.ts";
+import { ControlPlane } from "../../src/app/control-plane.ts";
+import { type Clock, ManualClock } from "../../src/core/clock.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import type { Finding } from "../../src/doctor/doctor.ts";
@@ -77,6 +78,35 @@ const healthyPin = (): string => {
   writeFileSync(binary, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
   chmodSync(binary, 0o755);
   return binary;
+};
+
+/**
+ * Sets the `ACP_*_BINARY` pins for the body and puts every one of them back afterwards, including
+ * the ones that were unset. The composed case reads these through `ControlPlane`, and the repair
+ * message reads them again to decide whether a setting owns the pin in hand.
+ */
+const withPins = async (pins: Record<string, string>, body: () => Promise<void>): Promise<void> => {
+  const before: Record<string, string | undefined> = {};
+  for (const [variable, value] of Object.entries(pins)) {
+    before[variable] = process.env[variable];
+    process.env[variable] = value;
+  }
+  try {
+    await body();
+  } finally {
+    for (const [variable, value] of Object.entries(before)) {
+      if (value === undefined) delete process.env[variable];
+      else process.env[variable] = value;
+    }
+  }
+};
+
+const executableAt = (directory: string, name: string): string => {
+  mkdirSync(directory, { recursive: true });
+  const path = join(directory, name);
+  writeFileSync(path, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  chmodSync(path, 0o755);
+  return path;
 };
 
 const pinFindings = async (
@@ -160,7 +190,11 @@ describe("the doctor reads the pin it will spawn", () => {
       new CodexCliAdapter({ clock: harness.clock, capacityFile: join(harness.root, "codex.json"), binary: pin }),
       new GrokCliAdapter({ clock: harness.clock, capacityFile: join(harness.root, "grok.json"), binary: pin }),
     ]) {
-      expect(adapter.executablePath).toBe(realpathSync(pin));
+      // The pin itself, uncanonicalised. This asserted `realpathSync(pin)` until #998 landed, and
+      // the merge turned it red: `resolveExecutable` now returns `resolve(...)` at both sites, so a
+      // symlinked or `/var`-style path is anchored and left alone rather than resolved to its
+      // target. That is the contract this accessor hands out and the reason the doctor may stat it.
+      expect(adapter.executablePath).toBe(pin);
     }
 
     const registry = new ProviderRegistry();
@@ -201,13 +235,17 @@ describe("the doctor reads the pin it will spawn", () => {
     ];
 
     for (const { provider, variable } of expected) {
-      const findings = await pinFindings((each) => {
-        each.cp.providers.register(new PinnedAdapter(each.clock, provider, prunedVersionPin()));
-      });
+      const broken = prunedVersionPin();
+      // The variable has to actually hold this pin, because that is the condition on naming it.
+      await withPins({ [variable]: broken }, async () => {
+        const findings = await pinFindings((each) => {
+          each.cp.providers.register(new PinnedAdapter(each.clock, provider, broken));
+        });
 
-      expect(findings).toHaveLength(1);
-      expect(findings[0]?.recommendedAction).toContain(variable);
-      expect(findings[0]?.recommendedAction).not.toContain("ACP_GPT_BINARY");
+        expect(findings).toHaveLength(1);
+        expect(findings[0]?.recommendedAction).toContain(variable);
+        expect(findings[0]?.recommendedAction).not.toContain("ACP_GPT_BINARY");
+      });
     }
 
     // And a provider the map does not know names no variable at all. Naming none leaves the
@@ -216,7 +254,124 @@ describe("the doctor reads the pin it will spawn", () => {
       each.cp.providers.register(new PinnedAdapter(each.clock, "pinned", prunedVersionPin()));
     });
     expect(unmapped).toHaveLength(1);
-    expect(unmapped[0]?.recommendedAction).not.toMatch(/ACP_[A-Z]+_BINARY/);
+    expect(unmapped[0]?.recommendedAction).not.toMatch(/ACP_[A-Z]+_BINARY at one/);
+  });
+
+  it("names the pin's setting only when that setting's value is the pin in hand", async () => {
+    // `control-plane.ts:753` spreads `...overrides.gpt` *after* `binary: process.env[...]`, so a
+    // deployment's `adapterOptions` wins over the environment. Telling that operator to repoint
+    // `ACP_CODEX_BINARY` names a setting whose value nothing reads — the same
+    // sends-you-to-the-wrong-place defect as `ACP_GPT_BINARY`, one layer out. The adapter cannot
+    // report where its `binary` came from, so the check compares the variable's current value
+    // against the pin instead of assuming the variable produced it.
+    const broken = prunedVersionPin();
+    const somewhereElse = healthyPin();
+
+    await withPins({ ACP_CLAUDE_BINARY: broken }, async () => {
+      const owned = await pinFindings((each) => {
+        each.cp.providers.register(new PinnedAdapter(each.clock, "claude", broken));
+      });
+      expect(owned[0]?.recommendedAction).toContain("ACP_CLAUDE_BINARY");
+    });
+
+    await withPins({ ACP_CLAUDE_BINARY: somewhereElse }, async () => {
+      const configured = await pinFindings((each) => {
+        each.cp.providers.register(new PinnedAdapter(each.clock, "claude", broken));
+      });
+      expect(configured).toHaveLength(1);
+      expect(configured[0]?.recommendedAction).not.toContain("change ACP_CLAUDE_BINARY");
+      expect(configured[0]?.recommendedAction).toContain("adapterOptions");
+    });
+  });
+
+  it("says a restore at the pin needs no restart, and that only a repin does", async () => {
+    // Since #998 the pin is the name an updater maintains, not the version behind it, so the
+    // retained pin is resolved again at every spawn: restoring a file at that path is live without
+    // a restart. Asserting a restart unconditionally told the operator to take a step they did not
+    // need for the repair they were most likely to make.
+    const findings = await pinFindings((each) => {
+      each.cp.providers.register(new PinnedAdapter(each.clock, "pinned", prunedVersionPin()));
+    });
+
+    expect(findings[0]?.recommendedAction).toContain("needs no restart");
+    expect(findings[0]?.recommendedAction).toContain(
+      "restart the daemon, which resolves the pin once at construction",
+    );
+  });
+
+  it("calls a bare-name pin not-on-PATH instead of statting it against the daemon's cwd", async () => {
+    // `resolveExecutable`'s last return is a bare name by contract: nothing of that name was on the
+    // daemon's PATH when the adapter was built. Statting it asks the wrong question — it resolves
+    // against the daemon's working directory, so a directory named like the provider there answers
+    // it while the spawn still searches PATH — and it produced `condition: "ABSENT"` with an action
+    // reading "restore an executable file at claude".
+    const findings = await pinFindings((each) => {
+      each.cp.providers.register(new PinnedAdapter(each.clock, "pinned", "claude"));
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.observedEvidence).toMatchObject({ path: "claude", condition: "NOT_ON_PATH" });
+    expect(findings[0]?.observedEvidence).not.toHaveProperty("error");
+    expect(findings[0]?.recommendedAction).toContain("PATH");
+    expect(findings[0]?.recommendedAction).not.toContain("needs no restart");
+  });
+
+  it("finds the pruned pin on the shipped composition, where claude is registered per role", async () => {
+    // The case this slice exists for, entered where production enters it. `production()` is
+    // `list().filter(a => a.isProduction && !hasRoleScoped(a.provider))`, and both
+    // `ClaudeCliAdapter`s are registered with `registerForRole` (`control-plane.ts:726`, `:740`
+    // carry `roles:`; `:458` routes anything with `roles` there), so a check reading `production()`
+    // cannot see claude — the one provider whose pin died on the host. Every other case in this
+    // file registers unscoped, which is a registry shape the deployment does not have, and that is
+    // how the first version of this check passed a green suite while being silent on the
+    // deployment. This one composes through `ControlPlane` with the default adapters and the
+    // `ACP_*_BINARY` pins.
+    const root = tempDir("acp-pin-composed-");
+    const claudePin = prunedVersionPin();
+    const codexPin = executableAt(join(root, "pinned"), "codex");
+    const grokPin = executableAt(join(root, "pinned"), "grok");
+
+    await withPins(
+      { ACP_CLAUDE_BINARY: claudePin, ACP_CODEX_BINARY: codexPin, ACP_GROK_BINARY: grokPin },
+      async () => {
+        const cp = new ControlPlane({
+          databasePath: join(root, "state.sqlite"),
+          worktreeRoot: join(root, "worktrees"),
+          capacityDir: join(root, "capacity"),
+          secretsDir: join(root, "secrets"),
+          clock: new ManualClock("2026-09-26T02:05:00.000Z"),
+        });
+        try {
+          // The shape, asserted rather than assumed: claude is in the provider set and out of the
+          // shared production inventory.
+          expect(cp.providers.list().map((adapter) => adapter.provider).sort()).toEqual([
+            "claude",
+            "gpt",
+            "grok",
+          ]);
+          expect(cp.providers.production().map((adapter) => adapter.provider)).not.toContain("claude");
+
+          const report = await cp.doctor.run("capacity");
+          const findings = report.findings.filter(
+            (finding) => finding.code === ReasonCode.PROVIDER_EXECUTABLE_UNUSABLE,
+          );
+          // Exactly one, although claude is registered twice: `list()` collapses to one
+          // representative adapter per provider, so two role-scoped instances of one provider are
+          // not two findings. A duplicate per provider would be its own defect.
+          expect(findings).toHaveLength(1);
+          expect(findings[0]?.scope).toBe("provider:claude");
+          expect(findings[0]?.observedEvidence).toMatchObject({
+            provider: "claude",
+            path: claudePin,
+            condition: "ABSENT",
+          });
+          expect(findings[0]?.recommendedAction).toContain("ACP_CLAUDE_BINARY");
+          expect(findings[0]?.blocking).toBe(false);
+        } finally {
+          cp.close();
+        }
+      },
+    );
   });
 
   it("never blocks", async () => {

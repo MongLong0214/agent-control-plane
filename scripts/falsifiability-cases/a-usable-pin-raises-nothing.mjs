@@ -14,8 +14,8 @@ const aUsablePinRaisesNothing = {
   id: "a-usable-pin-raises-nothing",
   what: "a pin that exists, is a regular file and is executable produces no finding at all",
   file: "src/doctor/doctor.ts",
-  find: '          } catch {\n            condition = "NOT_EXECUTABLE";\n          }',
-  replace: '          } catch { /* the mutation moves the verdict out from under the probe */ }\n          condition = "NOT_EXECUTABLE";',
+  find: '    } catch {\n      return { condition: "NOT_EXECUTABLE" };\n    }\n    return null;',
+  replace: '    } catch { /* the mutation moves the verdict out from under the probe */ }\n    return { condition: "NOT_EXECUTABLE" };',
   killedBy: [
     "tests/unit/the-doctor-reads-the-pin-it-will-spawn.test.ts::says nothing about a usable pin, and nothing about an adapter that has none",
   ],

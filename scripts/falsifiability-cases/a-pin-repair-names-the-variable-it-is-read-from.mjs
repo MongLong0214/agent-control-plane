@@ -12,11 +12,15 @@
  * and two thirds of the evidence on screen agrees with it. This row exists so that simplification
  * dies rather than ships.
  *
- * It compiles: `noUnusedLocals` is not set in `tsconfig.json`, so the now-unreferenced `variable`
- * binding and `PROVIDER_PIN_VARIABLE` map do not fail the harness's `tsc --noEmit` pass, and the
- * mutant runs. It is also narrow — the finding is still produced, still non-blocking, still
- * carries the same evidence; only the variable named in the prose changes. Every other row in
- * this directory survives it, which is what isolates this one to the property it claims.
+ * The mutation now lands in `pinSourceFor`, because that is where the name is looked up since the
+ * message stopped naming a variable that does not own the pin in hand. The annotation
+ * `: string | undefined` is not decoration: without it the `variable === undefined` guard below
+ * becomes a comparison TypeScript rejects as impossible, and the harness typechecks every mutant,
+ * so the row would report a compile failure instead of a verdict.
+ *
+ * Under the mutant, gpt's lookup answers `ACP_GPT_BINARY`, `process.env` has no such variable, and
+ * `pinSourceFor` therefore names nothing — so the repair for gpt loses `ACP_CODEX_BINARY`. It is
+ * narrow: the finding is still produced, still non-blocking, still carries the same evidence.
  *
  * The witness must exercise the gpt provider. A test that checked `claude` alone passes under the
  * mutation, and that is exactly how the defect reached a green suite the first time.
@@ -25,8 +29,8 @@ const aPinRepairNamesTheVariableItIsReadFrom = {
   id: "a-pin-repair-names-the-variable-it-is-read-from",
   what: "the repair names the environment variable the pin is actually read from, mapped rather than derived from the provider id",
   file: "src/doctor/doctor.ts",
-  find: '          `${variable ?? "whichever setting pins this provider"} at one — and then restart the ` +',
-  replace: "          `ACP_${adapter.provider.toUpperCase()}_BINARY at one — and then restart the ` +",
+  find: "    const variable = PROVIDER_PIN_VARIABLE[provider];",
+  replace: "    const variable: string | undefined = `ACP_${provider.toUpperCase()}_BINARY`;",
   killedBy: [
     "tests/unit/the-doctor-reads-the-pin-it-will-spawn.test.ts::names the environment variable each provider's pin is actually read from",
   ],

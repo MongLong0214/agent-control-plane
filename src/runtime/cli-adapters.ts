@@ -1575,7 +1575,6 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     });
   }
 
-
   /**
    * The pin this adapter will spawn, as it holds it.
    *
@@ -1979,7 +1978,6 @@ export class CodexCliAdapter implements ProviderAdapter {
     });
   }
 
-
   /**
    * The pin this adapter will spawn, as it holds it.
    *
@@ -2327,7 +2325,6 @@ export class GrokCliAdapter implements ProviderAdapter {
       binary: this.#binary,
     });
   }
-
 
   /**
    * The pin this adapter will spawn, as it holds it.

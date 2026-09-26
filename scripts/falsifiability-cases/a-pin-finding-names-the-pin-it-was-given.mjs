@@ -23,9 +23,8 @@ const aPinFindingNamesThePinItWasGiven = {
   id: "a-pin-finding-names-the-pin-it-was-given",
   what: "the finding's evidence carries the pinned path itself, not some other path the check could have resolved",
   file: "src/doctor/doctor.ts",
-  find: "        observedEvidence: { provider: adapter.provider, path, condition, ...(error ? { error } : {}) },",
-  replace:
-    "        observedEvidence: { provider: adapter.provider, path: process.execPath, condition, ...(error ? { error } : {}) },",
+  find: "          provider: adapter.provider,\n          path,",
+  replace: "          provider: adapter.provider,\n          path: process.execPath,",
   killedBy: [
     "tests/unit/the-doctor-reads-the-pin-it-will-spawn.test.ts::does not canonicalise: the evidence names the pin, not what it resolved to",
   ],
