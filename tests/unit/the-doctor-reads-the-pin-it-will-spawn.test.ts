@@ -169,6 +169,56 @@ describe("the doctor reads the pin it will spawn", () => {
     expect(registry.production().map((adapter) => adapter.executablePath)).toEqual([pin]);
   });
 
+  it("names the environment variable each provider's pin is actually read from", async () => {
+    // `ACP_` + the upper-cased provider id + `_BINARY` is the right answer for two of these three,
+    // which is exactly what makes deriving the name read as correct. `CodexCliAdapter.provider` is
+    // `"gpt"`, and the variable `ControlPlane` reads its pin from is `ACP_CODEX_BINARY`
+    // (`control-plane.ts:753`). `ACP_GPT_BINARY` occurs nowhere in this repository, so a derived
+    // name would send an operator to repoint a setting nothing consumes — the send-someone-to-the-
+    // wrong-place failure this whole check exists to prevent, reintroduced inside it.
+    //
+    // The provider ids come from the shipped adapter classes, not from literals typed here. A test
+    // that spells its own ids agrees with itself when one of them changes, and this defect reached
+    // a green suite because the only provider exercised was the one the transformation gets right.
+    const harness = makeHarness();
+    const pin = healthyPin();
+    const expected = [
+      {
+        provider: new ClaudeCliAdapter({ clock: harness.clock, capacityFile: join(harness.root, "claude.json"), binary: pin })
+          .provider,
+        variable: "ACP_CLAUDE_BINARY",
+      },
+      {
+        provider: new CodexCliAdapter({ clock: harness.clock, capacityFile: join(harness.root, "codex.json"), binary: pin })
+          .provider,
+        variable: "ACP_CODEX_BINARY",
+      },
+      {
+        provider: new GrokCliAdapter({ clock: harness.clock, capacityFile: join(harness.root, "grok.json"), binary: pin })
+          .provider,
+        variable: "ACP_GROK_BINARY",
+      },
+    ];
+
+    for (const { provider, variable } of expected) {
+      const findings = await pinFindings((each) => {
+        each.cp.providers.register(new PinnedAdapter(each.clock, provider, prunedVersionPin()));
+      });
+
+      expect(findings).toHaveLength(1);
+      expect(findings[0]?.recommendedAction).toContain(variable);
+      expect(findings[0]?.recommendedAction).not.toContain("ACP_GPT_BINARY");
+    }
+
+    // And a provider the map does not know names no variable at all. Naming none leaves the
+    // operator the path and the reinstall; naming a guessed one costs them the trip.
+    const unmapped = await pinFindings((each) => {
+      each.cp.providers.register(new PinnedAdapter(each.clock, "pinned", prunedVersionPin()));
+    });
+    expect(unmapped).toHaveLength(1);
+    expect(unmapped[0]?.recommendedAction).not.toMatch(/ACP_[A-Z]+_BINARY/);
+  });
+
   it("never blocks", async () => {
     // A blocking finding for a missing binary parks the daemon behind the operator step that
     // would restore it, and the daemon is where the operator reads the finding from.

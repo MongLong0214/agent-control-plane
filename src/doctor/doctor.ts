@@ -80,6 +80,27 @@ export const REPOSITORY_SWEEP_BUDGET_MS = 20_000;
  */
 export const CAPACITY_SWEEP_BUDGET_MS = 45_000;
 
+/**
+ * The environment variable each provider's pin is actually read from, copied from the site that
+ * reads it — `ControlPlane`'s adapter construction, `control-plane.ts:723`, `:753` and `:762`.
+ *
+ * Written out rather than derived, and the divergence is the whole reason. `ACP_` plus the
+ * upper-cased provider id plus `_BINARY` is the right answer for two of the three, which is what
+ * makes the transformation read as correct. It is wrong for the third: `CodexCliAdapter.provider`
+ * is `"gpt"` (`cli-adapters.ts:1873`) while the variable its pin comes from is `ACP_CODEX_BINARY`.
+ * `ACP_GPT_BINARY` is read nowhere in this repository, so a derived name would tell an operator to
+ * repoint a setting nothing consumes — a message that sends someone to the wrong place, which is
+ * precisely the failure `checkProviderExecutables` exists to prevent, reintroduced inside it.
+ *
+ * A provider absent from this map gets no variable named at all. Naming none is recoverable; the
+ * operator still has the path and the reinstall. Naming a guessed one is not.
+ */
+const PROVIDER_PIN_VARIABLE: Readonly<Record<string, string>> = {
+  claude: "ACP_CLAUDE_BINARY",
+  gpt: "ACP_CODEX_BINARY",
+  grok: "ACP_GROK_BINARY",
+};
+
 export interface Finding {
   code: string;
   severity: Severity;
@@ -929,6 +950,8 @@ export class Doctor {
       }
       if (condition === null) continue;
 
+      // Read from `PROVIDER_PIN_VARIABLE`, never transformed from the provider id. See that map.
+      const variable = PROVIDER_PIN_VARIABLE[adapter.provider];
       findings.push({
         code: ReasonCode.PROVIDER_EXECUTABLE_UNUSABLE,
         severity: "ERROR",
@@ -938,8 +961,9 @@ export class Doctor {
         observedEvidence: { provider: adapter.provider, path, condition, ...(error ? { error } : {}) },
         recommendedAction:
           `restore an executable file at ${path} — reinstall the provider CLI, or repoint ` +
-          `ACP_${adapter.provider.toUpperCase()}_BINARY at one — and then restart the daemon, ` +
-          "which resolves this pin once at construction and will not pick the repair up on its own",
+          `${variable ?? "whichever setting pins this provider"} at one — and then restart the ` +
+          "daemon, which resolves this pin once at construction and will not pick the repair up " +
+          "on its own",
       });
     }
     return findings;
