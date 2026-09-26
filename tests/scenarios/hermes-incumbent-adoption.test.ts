@@ -47,8 +47,8 @@ it("refuses an asynchronously missing Gateway origin before writing a session", 
 it.each([[true, false, false, false, false], [false, false, false, false, false],
   [true, true, false, false, false], [false, true, false, false, false],
   [true, false, true, false, false], [true, true, false, true, false],
-  [true, true, false, false, true]])(
-  "adopts only the pinned live head (prior target: %s, switches during readback: %s, actor drift: %s, competing bind: %s, blocked revoke: %s)", async (priorTarget, switchesDuringReadback, actorDrift, competingBind, blockedRevoke) => {
+  [true, true, false, false, true], [true, false, false, false, false, true]])(
+  "adopts only the pinned live head (prior target: %s, switches during readback: %s, actor drift: %s, competing bind: %s, blocked revoke: %s, PID drift: %s)", async (priorTarget, switchesDuringReadback, actorDrift, competingBind, blockedRevoke, pidDrift = false) => {
   const h = makeHarness();
   const home = tempDir("acp-adopt-target-");
   symlinkSync(process.execPath, join(home, "node"));
@@ -158,8 +158,9 @@ process.stdout.write(JSON.stringify({ ...fields, receipt_digest: 'sha256:' + cre
             "SELECT current_session_id FROM conversational_actors WHERE actor_id = ?", [previous.actor_id],
           )?.current_session_id).toBe(driftSession!.sessionId);
         }
-        return proofReads > 1 && switchesDuringReadback
-          ? { ...validProof, session_id: "new-conversation-same-lineage" } : validProof;
+        if (proofReads > 1 && switchesDuringReadback) return { ...validProof, session_id: "new-conversation-same-lineage" };
+        if (proofReads > 1 && pidDrift) return { ...validProof, process_pid: 2147483647 };
+        return validProof;
       },
       target: pinned,
       expectedLiveSessionId: liveHead,
@@ -168,7 +169,7 @@ process.stdout.write(JSON.stringify({ ...fields, receipt_digest: 'sha256:' + cre
     });
     const result = await adoption.adopt({ gatewayPid: process.pid, gatewayStartToken: token! });
     if (blockedRevoke) expect(sawBindingDuringReadback).toBe(false);
-    if (switchesDuringReadback || actorDrift) {
+    if (switchesDuringReadback || actorDrift || pidDrift) {
       expect(result.allowed).toBe(false);
       expect(result.evidence).toEqual({});
       expect(h.cp.sessions.list().filter((session) => session.sessionId !== competitorSessionId))
@@ -179,6 +180,7 @@ process.stdout.write(JSON.stringify({ ...fields, receipt_digest: 'sha256:' + cre
         [previous.actor_id, previous.binding_generation + 1])).toBeUndefined();
       if (competingBind) expect(h.cp.bindings.active("CEO")?.assignmentId).toBe(competingAssignmentId);
       else expect(h.cp.bindings.active("CEO")).toBeNull();
+      if (pidDrift) expect(proofReads).toBe(2);
       if (blockedRevoke) {
         expect(sawBindingDuringReadback).toBe(false);
         expect(revokeCalls).toBe(0);
