@@ -8,6 +8,7 @@ import { COLLECTOR_TIMEOUT_MS } from "../capacity/usage-collectors.ts";
 import { RECONCILE_SWEEP_BUDGET_MS } from "../conversation/turn-coordinator.ts";
 import type { RequiredRole, RoleCoveragePlan } from "../continuity/continuity-kernel.ts";
 import { digestOf } from "../core/digest.ts";
+import { readProcessStartToken } from "../core/process-argv.ts";
 import { acpError, type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
 import type { BuzzMentionCounters } from "../buzz/buzz-mention-subscriber.ts";
@@ -1528,10 +1529,20 @@ export class Daemon {
         // Otherwise a failed sensor or unknown quota is neither exhaustion nor a dead
         // runtime. Keep the READY binding and surface the
         // unresolved reading, without making this provider eligible for new work.
+        // A failed role probe can also report UNAVAILABLE when its runtime check fails.
+        // That verdict is not proof that the *bound* process died: only the exact native
+        // (pid, start token) pair can establish that this READY incumbent is still here.
+        // Never compare a native token to ps's whole-second lstart string.
+        const nativeIncumbentAlive =
+          currentCapacity?.sensorHealth === "ERROR" &&
+          currentCapacity.runtimeHealth === "UNAVAILABLE" &&
+          session?.lifecycle === SessionLifecycle.READY &&
+          session?.osPid != null && session.osProcessStartedAt != null &&
+          session.osProcessStartedAt === readProcessStartToken(session.osPid);
         if (
           session?.lifecycle === SessionLifecycle.READY &&
           currentCapacity !== null &&
-          currentCapacity.runtimeHealth !== "UNAVAILABLE" &&
+          (currentCapacity.runtimeHealth !== "UNAVAILABLE" || nativeIncumbentAlive) &&
           !this.cp.capacity.hasExhaustedQuotaFor(currentCapacity, required.capability) &&
           (currentCapacity.sensorHealth === "ERROR" ||
             this.cp.capacity.hasUnknownQuotaFor(currentCapacity, required.capability))

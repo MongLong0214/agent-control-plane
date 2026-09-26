@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import { ControlPlane } from "../../src/app/control-plane.ts";
 import { ManualClock } from "../../src/core/clock.ts";
+import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon, type ContinuityReconcileReport } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
@@ -23,7 +24,10 @@ afterEach(() => {
   cleanupTempDirs();
 });
 
-const makeIncumbent = (providers: "claude" | "claude-and-gpt" | "none" = "claude") => {
+const makeIncumbent = (
+  providers: "claude" | "claude-and-gpt" | "none" = "claude",
+  identity?: { pid: number; token: string },
+) => {
   const root = tempDir("acp-sensor-binding-");
   const clock = new ManualClock("2026-09-08T00:00:00.000Z");
   const claude = new ProductionTestAdapter(clock, "claude");
@@ -48,7 +52,10 @@ const makeIncumbent = (providers: "claude" | "claude-and-gpt" | "none" = "claude
     authorization: cp.manifestAuthorizationForTests(manifest),
   });
   if (!project.allowed) throw new Error(project.message);
-  const session = cp.sessions.create({ provider: "claude", model: "opus" });
+  const session = cp.sessions.create({
+    provider: "claude", model: "opus",
+    ...(identity ? { osPid: identity.pid, osStartedAt: identity.token } : {}),
+  });
   const ready = cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "incumbent ready");
   if (!ready.allowed) throw new Error(ready.message);
   const bound = cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId, sessionId: session.sessionId });
@@ -242,7 +249,9 @@ describe("daemon incumbent capacity reconciliation", () => {
   });
 
   it("#811: a non-READY session still loses its binding during a sensor failure", async () => {
-    const { cp, daemon, roleKey, incumbent } = makeIncumbent();
+    const token = readProcessStartToken(process.pid);
+    expect(token).toMatch(/^darwin-tv:\d+\.\d{6}$/);
+    const { cp, daemon, roleKey, incumbent } = makeIncumbent("claude", { pid: process.pid, token: token! });
     const stopped = cp.sessions.transition(incumbent.sessionId, SessionLifecycle.STOPPED, "runtime exited");
     if (!stopped.allowed) throw new Error(stopped.message);
     expect(cp.bindings.active(roleKey)).toEqual(incumbent);
@@ -364,6 +373,94 @@ describe("daemon incumbent capacity reconciliation", () => {
     expect(measured?.["buckets"]).toEqual([
       { id: "rolling", remainingPercent: 95, resetAt: null },
     ]);
+  });
+
+  it("#954: a live native-identified READY CTO keeps its generation and outbox on a failed role sensor", async () => {
+    const token = readProcessStartToken(process.pid);
+    expect(token).toMatch(/^darwin-tv:\d+\.\d{6}$/);
+    const { cp, claude, daemon, unread, roleKey, incumbent } = makeIncumbent("claude", { pid: process.pid, token: token! });
+    cp.providers.registerForRole(claude, Role.PRIMARY_CTO);
+    claude.setCapacity({ ...unread, runtimeHealth: "UNAVAILABLE" });
+    const queued = cp.outbox.enqueue({
+      idempotencyKey: "sensor-954-incumbent", roleKey,
+      bindingGeneration: incumbent.bindingGeneration, targetSessionId: incumbent.sessionId,
+      kind: "RUN_DISPATCH", payload: { projectId: "sensor-binding" },
+    });
+    if (!queued.allowed) throw new Error(queued.message);
+
+    const report = await daemon.reconcileContinuity("failed role-scoped /usage and runtime probe");
+
+    expect(cp.capacity.currentForRole("claude", Role.PRIMARY_CTO)).toMatchObject({
+      sensorHealth: "ERROR", runtimeHealth: "UNAVAILABLE", allocationAdmission: "SUSPENDED", buckets: [],
+    });
+    expect(report?.plan.assignments.find((assignment) => assignment.roleKey === roleKey)?.provider).toBeNull();
+    expect(cp.bindings.active(roleKey)).toEqual(incumbent);
+    expect(cp.outbox.get(queued.value.messageId)).toMatchObject({
+      bindingGeneration: incumbent.bindingGeneration, status: "PENDING",
+    });
+    expect(report?.unresolved).toContainEqual({ roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
+    expect(report?.reassigned).toEqual([]);
+    expect(report?.pausedRuns).toEqual([]);
+    expect(await cp.capacity.refreshForDispatch({ provider: "claude", capabilities: ["cto"], priority: "critical" }))
+      .toMatchObject({ allowed: false, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
+  });
+
+  it("#954: a healthy sensor with unknown CTO quota and unavailable runtime revokes a live native incumbent", async () => {
+    const token = readProcessStartToken(process.pid);
+    expect(token).toMatch(/^darwin-tv:\d+\.\d{6}$/);
+    const { cp, claude, daemon, unread, roleKey, incumbent } = makeIncumbent("claude", {
+      pid: process.pid, token: token!,
+    });
+    cp.providers.registerForRole(claude, Role.PRIMARY_CTO);
+    claude.setCapacity({
+      ...unread, sensorHealth: "HEALTHY", runtimeHealth: "UNAVAILABLE", error: undefined,
+      buckets: [{ id: "weekly", remainingPercent: null, resetAt: null, capabilities: ["cto"] }],
+    });
+
+    const report = await daemon.reconcileContinuity("healthy quota sensor, unavailable runtime");
+
+    expect(cp.sessions.require(incumbent.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+    expect(cp.capacity.currentForRole("claude", Role.PRIMARY_CTO)).toMatchObject({
+      sensorHealth: "HEALTHY", runtimeHealth: "UNAVAILABLE", unknownBuckets: ["weekly"],
+    });
+    expect(cp.bindings.active(roleKey)).toBeNull();
+    expect(report?.unresolved).toContainEqual({ roleKey, reasonCode: ReasonCode.COVERAGE_NONE });
+  });
+
+  it("#954: a reused PID with a different native start token cannot retain a failed-sensor binding", async () => {
+    const liveToken = readProcessStartToken(process.pid);
+    expect(liveToken).toMatch(/^darwin-tv:\d+\.\d{6}$/);
+    const recordedToken = liveToken!.replace(/^darwin-tv:(\d+)/, (_, seconds: string) =>
+      `darwin-tv:${Number(seconds) - 1}`);
+    const { cp, claude, daemon, unread, roleKey } = makeIncumbent("claude", {
+      pid: process.pid, token: recordedToken,
+    });
+    cp.providers.registerForRole(claude, Role.PRIMARY_CTO);
+    claude.setCapacity({ ...unread, runtimeHealth: "UNAVAILABLE" });
+
+    const report = await daemon.reconcileContinuity("old session PID was reused");
+
+    expect(cp.bindings.active(roleKey)).toBeNull();
+    expect(report?.unresolved).toContainEqual({ roleKey, reasonCode: ReasonCode.COVERAGE_NONE });
+  });
+
+  it("#954: fresh applicable numeric exhaustion revokes even with an unavailable runtime reading", async () => {
+    const token = readProcessStartToken(process.pid);
+    expect(token).toMatch(/^darwin-tv:\d+\.\d{6}$/);
+    const { cp, claude, daemon, unread, roleKey } = makeIncumbent("claude", { pid: process.pid, token: token! });
+    cp.providers.registerForRole(claude, Role.PRIMARY_CTO);
+    claude.setCapacity({
+      ...unread, runtimeHealth: "UNAVAILABLE",
+      buckets: [{ id: "rolling", remainingPercent: 0, resetAt: null, capabilities: ["cto"] }],
+    });
+
+    const report = await daemon.reconcileContinuity("role quota measured exhausted");
+
+    expect(cp.capacity.currentForRole("claude", Role.PRIMARY_CTO)?.buckets).toMatchObject([
+      { remainingPercent: 0 },
+    ]);
+    expect(cp.bindings.active(roleKey)).toBeNull();
+    expect(report?.unresolved).toContainEqual({ roleKey, reasonCode: ReasonCode.COVERAGE_NONE });
   });
 
   it("#811: an unread provider is still refused for a new allocation", async () => {
