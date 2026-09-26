@@ -302,8 +302,9 @@ resolve_buzz_binary() {
 # path available to a daemon that cannot search for it.
 #
 # Only an absolute answer is baked. The daemon runs from a working directory the installing shell
-# does not share, and `resolveExecutable` returns an absolute-looking path unchanged rather than
-# searching, so a relative pin turns a PATH miss into a failure to stat one layer further in.
+# does not share, and `resolveExecutable` does not search once an answer contains a slash — it
+# anchors it to whatever directory the daemon is in — so a relative pin turns a PATH miss into a
+# path that names nothing, or something else, wherever the spawn happens to run.
 resolve_cli_binary() {
   local name="$1" found=""
   found="$(command -v "$name" 2>/dev/null || true)"
@@ -321,13 +322,14 @@ resolve_cli_binary() {
   # target, so the kernel resolves it every time — and running whichever version the name currently
   # points at is the accepted outcome.
   #
-  # Absolute, a regular file, and executable is still required. A relative answer reaches
-  # resolveExecutable's absolute-path branch, which returns it unchanged rather than searching, and
-  # the daemon runs from a working directory the installing shell does not share. The other two are
-  # what `canonical_executable` used to contribute at this site and are written out here instead:
-  # `-x` alone is true of a mode-755 FIFO that `command -v` answers for, and of a directory, so
-  # without `-f` a name that is not a program can be pinned. Both follow the link, so a stable name
-  # whose target has already gone fails them.
+  # Absolute, a regular file, and executable is still required. A relative answer reaches the branch
+  # of `resolveExecutable` that a slash selects, which anchors it to the daemon's own working
+  # directory rather than searching, and that is not the directory this shell is in. The other two
+  # are what `canonical_executable` used to contribute at this site and are written out here
+  # instead: `-x` alone is true of a mode-755 FIFO, which `command -v` answers for exactly as it
+  # would for a CLI while a spawn of it blocks on an open with no writer. (`-x` is true of a
+  # directory too, but `command -v` skips those, which is why the row for this clause uses a FIFO.)
+  # Both clauses follow the link, so a stable name whose target has already gone fails them.
   [[ -n "$found" && "$found" == /* && -f "$found" && -x "$found" ]] || return 0
   printf '%s' "$found"
 }

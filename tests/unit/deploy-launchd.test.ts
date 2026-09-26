@@ -1115,9 +1115,10 @@ describe("launchd deployment artifact", () => {
     // A file that is present but not executable is not a CLI; the shell does not answer for it.
     writeFileSync(join(onPath, "codex"), SELF_CONTAINED_CLI, { mode: 0o644 });
     chmodSync(join(onPath, "codex"), 0o644);
-    // A relative answer names nothing a daemon in another working directory can reach, and would
-    // reach resolveExecutable's absolute-path branch, which returns it unchanged rather than
-    // searching. `grok` resolves only through a relative PATH entry.
+    // A relative answer names nothing a daemon in another working directory can reach. It would
+    // reach resolveExecutable's slash branch — which tests for a slash, not for an absolute path —
+    // and be anchored to whatever directory the daemon happens to be in rather than searched for.
+    // `grok` resolves only through a relative PATH entry.
     const relative = "acp-provider-cli-relative";
     mkdirSync(join(harness.home, relative), { recursive: true });
     writeProviderCli(join(harness.home, relative, "grok"), SELF_CONTAINED_CLI);
@@ -1215,6 +1216,40 @@ describe("launchd deployment artifact", () => {
       seen.started?.split(",")[0],
       "the pinned path no longer runs once the provider's updater has replaced the version behind it",
     ).toBe("started");
+  });
+
+  it("#954 refuses a name that answers for something other than a regular file", () => {
+    const harness = makeHarness();
+    // `-x` is not enough on its own. A FIFO with the executable bit set satisfies it, and
+    // `command -v` answers for it just as it would for a CLI — but a spawn of it blocks on an
+    // open that has no writer, so the daemon's first capacity probe would hang rather than fail.
+    // `-f` is the clause that keeps it out, and without a row it is the kind of clause a later
+    // simplification deletes as redundant.
+    const onPath = join(harness.home, "acp-provider-cli-fifo");
+    mkdirSync(onPath, { recursive: true });
+    const fifo = join(onPath, "claude");
+    boundedExecFileSync("mkfifo", [fifo], { timeout: 10_000 });
+    chmodSync(fifo, 0o755);
+    harness.env["PATH"] = isolatedInstallerPath(harness, onPath);
+
+    // The premise, asserted rather than assumed: the shell does answer with this path. If it did
+    // not, the assertion below would pass for the ordinary reason that nothing was found, and
+    // would say nothing at all about `-f`. A directory would fail here — `command -v` skips those
+    // — which is why this row uses a FIFO.
+    const answer = boundedSpawnSync("bash", ["-c", "command -v claude"], {
+      encoding: "utf8",
+      env: harness.env,
+    });
+    expect(answer.status, "the installing shell did not answer for the FIFO").toBe(0);
+    expect(answer.stdout.trim(), "the shell answered with something other than the FIFO").toBe(fifo);
+    expect(statSync(fifo).isFIFO(), "the fixture is not a FIFO").toBe(true);
+
+    const installed = installWithPins(harness);
+    expect(installed.status, installed.stderr).toBe(0);
+
+    const launcher = readFileSync(launcherPath(harness), "utf8");
+    expect(launcher, "a FIFO was pinned as a provider CLI").not.toContain("ACP_RESOLVED_CLAUDE_BINARY=");
+    expect(installed.stderr).toContain("could not resolve the claude CLI");
   });
 
   /** A valid app root at `where`: the builds and renderer the installer requires. */

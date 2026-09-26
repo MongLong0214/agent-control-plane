@@ -9,7 +9,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 
 import { ManualClock } from "../../src/core/clock.ts";
 import { ControlPlane } from "../../src/app/control-plane.ts";
@@ -37,7 +37,7 @@ import {
   type UsageTerminal,
   nonInteractiveEnvironment,
 } from "../../src/capacity/usage-collectors.ts";
-import { boundedExecFileSync } from "../helpers/bounded-sync-child.ts";
+import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -1781,6 +1781,88 @@ setInterval(() => {}, 1_000);
         cp.close();
       }
     });
+  });
+
+  /**
+   * Anchoring, which is the other half of what `realpathSync` used to do at both returns.
+   *
+   * Removing the canonicalisation removed the absolutising with it, and nothing replaced it. These
+   * two cases hold that half on its own: each supplies a relative spelling, which every other pin
+   * case in this file avoids by construction, so a mutation that drops the anchoring is invisible
+   * to all of them. `runCli` passes a caller-chosen `cwd` to `spawn`, so a pathname anchored to
+   * one directory and executed from another either misses or names a different program — which is
+   * why each case executes the value the adapter handed over, from a directory that is not the
+   * one it was anchored to.
+   */
+  const relativeProgram = (directory: string, name: string): string => {
+    const path = join(directory, name);
+    writeFileSync(path, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    chmodSync(path, 0o755);
+    return path;
+  };
+
+  it("#954 anchors a relative configured binary before the adapter spawns it", async () => {
+    const root = tempDir("acp-954-relative-configured-");
+    const program = relativeProgram(root, "claude-configured");
+    // `CliAdapterOptions.binary` is `binary?: string` and states no absolute constraint, and the
+    // first branch of `resolveExecutable` tests for a slash rather than for an absolute path, so
+    // `tools/claude` and `./bin/claude` reach it. This is that input, spelled against the cwd the
+    // daemon process actually has.
+    const spelling = relative(process.cwd(), program);
+    expect(isAbsolute(spelling), "the fixture did not produce a relative spelling").toBe(false);
+    expect(spelling, "the fixture did not exercise the slash branch").toContain("/");
+    expect(resolve(spelling), "the relative spelling does not name the fixture").toBe(program);
+    const elsewhere = tempDir("acp-954-relative-configured-cwd-");
+
+    await withPinnedEnvironment({}, async (spawned) => {
+      const cp = controlPlaneAt(root, { claude: { binary: spelling } });
+      try {
+        await probeAll(cp);
+        expect(spawned[0], "a relative pathname reached the spawn").toBe(resolve(spelling));
+        // The shape is not the point; surviving the trip is. `runCli` hands `spawn` a cwd of the
+        // caller's choosing, so the only pathname that still names this program there is one
+        // anchored before it left.
+        expect(
+          boundedSpawnSync(spawned[0] as string, [], { cwd: elsewhere, timeout: QUICK_CHILD_BUDGET_MS }).status,
+          "the path the adapter handed over does not run from another working directory",
+        ).toBe(0);
+      } finally {
+        cp.close();
+      }
+    });
+  });
+
+  it("#954 anchors a bare name found through a relative PATH entry", async () => {
+    const root = tempDir("acp-954-relative-path-entry-");
+    const directory = join(root, "searchable");
+    mkdirSync(directory, { recursive: true });
+    relativeProgram(directory, "claude");
+    // A PATH entry may legitimately be relative, and `accessSync` then answers about the process's
+    // own cwd while the spawn happens somewhere else entirely.
+    const spelling = relative(process.cwd(), directory);
+    expect(isAbsolute(spelling), "the fixture did not produce a relative PATH entry").toBe(false);
+    const elsewhere = tempDir("acp-954-relative-path-entry-cwd-");
+
+    const beforePath = process.env["PATH"];
+    try {
+      process.env["PATH"] = spelling;
+      await withPinnedEnvironment({}, async (spawned) => {
+        const cp = controlPlaneAt(root);
+        try {
+          await probeAll(cp);
+          expect(spawned[0], "a relative pathname reached the spawn").toBe(resolve(spelling, "claude"));
+          expect(
+            boundedSpawnSync(spawned[0] as string, [], { cwd: elsewhere, timeout: QUICK_CHILD_BUDGET_MS }).status,
+            "the path the adapter handed over does not run from another working directory",
+          ).toBe(0);
+        } finally {
+          cp.close();
+        }
+      });
+    } finally {
+      if (beforePath === undefined) delete process.env["PATH"];
+      else process.env["PATH"] = beforePath;
+    }
   });
 });
 

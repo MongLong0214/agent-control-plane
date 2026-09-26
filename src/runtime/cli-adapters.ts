@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import type { Clock } from "../core/clock.ts";
@@ -109,7 +109,8 @@ const DENIED_TOOLS = [
 
 /**
  * The path a provider CLI is spawned at: the caller's own answer, or the first PATH entry that
- * holds an executable of that name. Never canonicalised.
+ * holds an executable of that name — anchored to this process's working directory, never
+ * canonicalised.
  *
  * Both returns used to be `realpathSync` of their answer, and an adapter assigns this once in its
  * constructor and spawns that one string for the rest of the daemon's life. A provider CLI of this
@@ -124,25 +125,43 @@ const DENIED_TOOLS = [
  * exec. Re-resolving inside this module was the other option and buys nothing over that — it would
  * add a resolution that has to be kept in step with the one `execve` performs anyway.
  *
- * Canonicalising bought only the freeze at both sites. The first branch already returned its
- * argument unchanged when `realpathSync` threw, so it never validated anything; the second has
- * `accessSync(candidate, X_OK)` ahead of it, which is the check that decides. Nothing was put in
- * its place here: a check whose failure cannot change the answer reports a coverage it does not
- * have, and the only answer it could change to — searching PATH for some other file when a stated
- * absolute path is momentarily unreadable — would spawn a binary the caller did not name.
+ * `realpathSync` did two jobs at both sites, and only one of them was unwanted. It canonicalised,
+ * which is the freeze above, and it absolutised, anchoring a relative answer to this process's
+ * working directory. `resolve` is here to keep the second: it anchors exactly as `realpathSync`
+ * did and, unlike it, leaves the final symlink alone. Anchoring is not decoration here, because
+ * the spawn does not happen in the directory this function ran in — `runCli` takes a `cwd` from
+ * its caller, so a relative pathname resolved against one directory names a different file, or
+ * nothing, in the other.
+ *
+ * Relative answers do reach both branches. The first tests `binary.includes("/")`, which is a test
+ * for a slash and not for an absolute path, so `./bin/claude` and `tools/claude` enter it;
+ * `CliAdapterOptions.binary` states no absolute constraint and a deployment's configuration is
+ * applied over the environment pin. A PATH entry may itself be relative, and `join` then hands the
+ * search branch a relative candidate that `accessSync` happily answers for against the current
+ * directory. The last return is the exception and stays a bare name: nothing was found, and a bare
+ * name is what that contract says — anchoring it would manufacture a path that does not exist.
+ *
+ * No validation was put in canonicalisation's place. The first branch already returned its argument
+ * unchanged when `realpathSync` threw, so it never validated anything; the second has
+ * `accessSync(candidate, X_OK)` ahead of it, which is the check that decides. A check whose failure
+ * cannot change the answer reports a coverage it does not have, and the only answer it could change
+ * to — searching PATH for some other file when a stated absolute path is momentarily unreadable —
+ * would spawn a binary the caller did not name.
  *
  * The seatbelt profile is unaffected. `reviewerProfile`'s `(allow process-exec (literal ...))` is
- * built per spawn from `resolvePath(executable)`, and measured here: a profile naming the canonical
- * target execs successfully through a symlink to it, while one naming the symlink path is refused
- * with EPERM. So the canonical target is the entry that has to be there, and it still is.
+ * built per spawn from `resolvePath(executable)`, which canonicalises there and is untouched by
+ * this. That the literal has to be the canonical target was measured with a standalone
+ * `sandbox-exec` probe — a profile naming the realpath execs successfully through a symlink to it,
+ * while one naming the link path is refused with EPERM — but that measurement is not a committed
+ * case, so nothing in this repository would notice if it stopped holding.
  */
 const resolveExecutable = (binary: string): string => {
-  if (binary.includes("/")) return binary;
+  if (binary.includes("/")) return resolve(binary);
   for (const directory of (process.env.PATH ?? "").split(":").filter(Boolean)) {
     const candidate = join(directory, binary);
     try {
       accessSync(candidate, constants.X_OK);
-      return candidate;
+      return resolve(candidate);
     } catch {
       // Keep searching; an unavailable configured binary is reported by the probe.
     }
