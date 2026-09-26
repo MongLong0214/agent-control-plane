@@ -21,6 +21,9 @@ import {
 } from "../bootstrap/hermes-bootstrap.ts";
 import { createHermesIncumbentAdoption } from "../bootstrap/hermes-incumbent-adoption.ts";
 import { createHermesGatewayIdentityReader } from "../runtime/hermes-gateway-identity.ts";
+import { createHermesGatewayConversationSender } from "../runtime/hermes-gateway-conversation.ts";
+import { readProcessStartToken } from "../core/process-argv.ts";
+import { processStartedAt } from "../core/process-identity.ts";
 import { BuzzAdapter, BuzzCliTransport } from "../buzz/buzz-adapter.ts";
 import {
   BUZZ_MENTION_ADDRESSED_TO,
@@ -68,7 +71,8 @@ import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/
 import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
 import { createCtoMcpPort, createCtoServer } from "../mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../mcp/hermes-server.ts";
-import { CeoConversationPort } from "../mcp/ceo-conversation.ts";
+import { CeoConversationPort, type CeoTurnOutcome } from "../mcp/ceo-conversation.ts";
+import type { GatewayEventSource } from "../runtime/hermes-gateway-conversation.ts";
 import {
   RoleConversationPort,
   type OwnerMessageHandover,
@@ -774,6 +778,8 @@ export const startBuzzMessageIngressListener = async (
   options: {
     ceoConversation: CeoConversationPort;
     ownerActors: readonly string[];
+    /** Daemon-owned existing-session sender; when present, never fall back to MCP. */
+    gatewayConversation?: (text: string, source: GatewayEventSource) => Promise<CeoTurnOutcome>;
     /**
      * B2's live-peer port, for events addressed to a role by `p` tag.
      *
@@ -808,7 +814,8 @@ export const startBuzzMessageIngressListener = async (
   const ingress = new BuzzMessageIngress(guard, options.ownerActors, buzzMentionRouter(cp));
   const roleConversation = options.roleConversation ?? null;
   const port: BuzzMessageTurnPort = {
-    deliverToCeo: (text, source) => deliverAsCeoTurn(options.ceoConversation, text, source),
+    deliverToCeo: (text, source) =>
+      deliverAsCeoTurn(options.ceoConversation, text, source, options.gatewayConversation),
     // Read at claim time, from the binding registry rather than from the peer: the fence is
     // "which CEO generation was this turn claimed under", and the peer cannot be its own
     // authority for that. Telegram's production composition still passes none (#639's seam is
@@ -931,10 +938,12 @@ export const startDaemonBuzzMessageIngress = (
   policy: IngressPolicy,
   listeners: Pick<LocalMcpListeners, "ceoConversation" | "ctoConversation">,
   ownerActors: readonly string[],
+  gatewayConversation?: (text: string, source: GatewayEventSource) => Promise<CeoTurnOutcome>,
 ): Promise<LocalBuzzMessageIngress> =>
   startBuzzMessageIngressListener(cp, stateDir, policy, {
     ceoConversation: listeners.ceoConversation,
     ownerActors,
+    gatewayConversation,
     // The other half of #760 B4: a `p` tag that resolves to the CTO has somewhere to go. Without
     // this line resolution still happens and every role delivery refuses with ROLE_PEER_ABSENT,
     // which is the state that had a person carrying messages between the two roles.
@@ -1202,6 +1211,78 @@ const HERMES_ADOPTION_VARS = [
   "ACP_HERMES_HOME", "ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY", "ACP_HERMES_GATEWAY_API_KEY",
 ] as const;
 
+const configuredHermesAdoptionValues = (configuration: Readonly<Record<string, string | undefined>>) => {
+  const values = Object.fromEntries(HERMES_ADOPTION_VARS.map((key) => [key, configuration[key]])) as
+    Record<(typeof HERMES_ADOPTION_VARS)[number], string | undefined>;
+  const validText = (value: string | undefined): value is string =>
+    typeof value === "string" && value.trim() === value && value.length > 0 &&
+    value.length <= 512 && !/[\x00-\x1f\x7f]/.test(value);
+  return HERMES_ADOPTION_VARS.every((key) => validText(values[key])) &&
+    isDigest(values.ACP_HERMES_LINEAGE_ROOT_DIGEST) &&
+    /^[\x21-\x7e]+$/.test(values.ACP_HERMES_GATEWAY_API_KEY ?? "") ? values : null;
+};
+
+/** A configured route must never revert to the independently attached MCP peer. */
+export const createConfiguredHermesGatewayConversation = (
+  cp: ControlPlane,
+  configuration: Readonly<Record<string, string | undefined>>,
+  ports: {
+    senderFactory?: typeof createHermesGatewayConversationSender;
+    processStartToken?: typeof readProcessStartToken;
+    processStartedAt?: typeof processStartedAt;
+    authorityHeld?: () => boolean;
+  } = {},
+): ((text: string, source: GatewayEventSource) => Promise<CeoTurnOutcome>) | undefined => {
+  if (!HERMES_ADOPTION_VARS.some((key) => configuration[key] !== undefined)) return undefined;
+  const values = configuredHermesAdoptionValues(configuration);
+  const refuse = (): CeoTurnOutcome => ({ contact: "NEVER_REACHED",
+    answered: deny(ReasonCode.CEO_CONVERSATION_STALE, "adopted Gateway CEO target unavailable") });
+  const currentAuthority = () => {
+    if (!values || (ports.authorityHeld && !ports.authorityHeld())) return null;
+    const binding = cp.bindings.active("CEO");
+    if (!binding || binding.status !== "ACTIVE") return null;
+    const session = cp.sessions.get(binding.sessionId);
+    const target = cp.db.get<{ executor_kind: string; target_locator: string;
+      target_locator_digest: string }>(
+      `SELECT tb.executor_kind, tb.target_locator, tb.target_locator_digest
+         FROM actor_target_bindings tb
+         JOIN assignments a ON a.actor_id = tb.target_actor_id
+        WHERE a.assignment_id = ? AND a.role_key = 'CEO' AND a.status = 'ACTIVE'
+          AND a.binding_generation = ? AND a.session_id = ? AND a.session_incarnation = ?`,
+      [binding.assignmentId, binding.bindingGeneration, binding.sessionId, binding.sessionIncarnation],
+    );
+    if (!session || session.lifecycle !== SessionLifecycle.READY || session.incarnation !== binding.sessionIncarnation ||
+        session.provider !== "hermes" || !Number.isSafeInteger(session.osPid) || !session.osPid ||
+        session.osPid <= 0 || !session.osProcessStartedAt ||
+        (ports.processStartedAt ?? processStartedAt)(session.osPid) !== session.osProcessStartedAt ||
+        !target || target.executor_kind !== "hermes" ||
+        target.target_locator !== values.ACP_HERMES_EXPECTED_LIVE_SESSION_ID ||
+        target.target_locator_digest !== values.ACP_HERMES_LINEAGE_ROOT_DIGEST) return null;
+    const startToken = (ports.processStartToken ?? readProcessStartToken)(session.osPid);
+    if (!startToken || (ports.authorityHeld && !ports.authorityHeld())) return null;
+    return { assignmentId: binding.assignmentId, bindingGeneration: binding.bindingGeneration,
+      sessionId: binding.sessionId, sessionIncarnation: binding.sessionIncarnation,
+      processPid: session.osPid, startToken };
+  };
+  return async (text, source) => {
+    const pinned = currentAuthority();
+    if (!values || !pinned) return refuse();
+    return (ports.senderFactory ?? createHermesGatewayConversationSender)({
+      apiKey: values["ACP_HERMES_GATEWAY_API_KEY"]!, binding: "acp-canonical-ceo",
+      expected: { session_id: values.ACP_HERMES_EXPECTED_LIVE_SESSION_ID!,
+        lineage_root_digest: values.ACP_HERMES_LINEAGE_ROOT_DIGEST!,
+        process_pid: pinned.processPid, process_started_at: pinned.startToken },
+      preDispatch: () => {
+        const current = currentAuthority();
+        return current !== null && current.assignmentId === pinned.assignmentId &&
+          current.bindingGeneration === pinned.bindingGeneration && current.sessionId === pinned.sessionId &&
+          current.sessionIncarnation === pinned.sessionIncarnation && current.processPid === pinned.processPid &&
+          current.startToken === pinned.startToken;
+      },
+    })(text, source);
+  };
+};
+
 /** Capture independent daemon configuration before exposing the operator method. */
 export const createConfiguredHermesIncumbentAdoption = (
   cp: ControlPlane,
@@ -1212,14 +1293,8 @@ export const createConfiguredHermesIncumbentAdoption = (
     authorityHeld?: () => boolean;
   } = {},
 ): (() => Promise<Decision<unknown>>) | undefined => {
-  const values = Object.fromEntries(HERMES_ADOPTION_VARS.map((key) => [key, configuration[key]])) as
-    Record<(typeof HERMES_ADOPTION_VARS)[number], string | undefined>;
-  const validText = (value: string | undefined): value is string =>
-    typeof value === "string" && value.trim() === value && value.length > 0 &&
-    value.length <= 512 && !/[\x00-\x1f\x7f]/.test(value);
-  if (!HERMES_ADOPTION_VARS.every((key) => validText(values[key])) ||
-      !isDigest(values.ACP_HERMES_LINEAGE_ROOT_DIGEST) ||
-      !/^[\x21-\x7e]+$/.test(values.ACP_HERMES_GATEWAY_API_KEY ?? "")) return undefined;
+  const values = configuredHermesAdoptionValues(configuration);
+  if (!values) return undefined;
 
   const readGateway = (ports.identityReader ?? createHermesGatewayIdentityReader)({
     apiKey: values.ACP_HERMES_GATEWAY_API_KEY!,
@@ -2573,9 +2648,12 @@ export const deliverAsCeoTurn = async (
   port: CeoConversationPort,
   text: string,
   // Provenance reaches this delivery boundary; do not add it to the runtime prompt/transport.
-  _source?: Pick<BuzzMessageIngressInput, "eventId" | "actor" | "conversation">,
+  source: Pick<BuzzMessageIngressInput, "eventId" | "actor" | "conversation">,
+  gatewayConversation?: (text: string, source: GatewayEventSource) => Promise<CeoTurnOutcome>,
 ): Promise<CeoTurnDelivery> => {
-  const outcome = await port.attempt(text);
+  const outcome = gatewayConversation
+    ? await gatewayConversation(text, source)
+    : await port.attempt(text);
   const reachedCeo = outcome.contact === "REACHED";
   if (outcome.answered.allowed) {
     return { answer: outcome.answered.value, reachedCeo, reasonCode: ReasonCode.OK };
@@ -3176,6 +3254,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
           buzzActorIngressPolicy,
           listeners,
           buzzMessageOwnerActors,
+          createConfiguredHermesGatewayConversation(cp, hermesAdoptionConfiguration, {
+            authorityHeld: () => daemon.lock.held(),
+          }),
         );
         process.stdout.write("Buzz message ingress started\n");
         // #760 Part C — the daemon's own front door on the relay, feeding the socket above.
