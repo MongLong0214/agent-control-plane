@@ -28,7 +28,6 @@ const aPinFindingNamesThePinItWasGiven = {
     "        observedEvidence: { provider: adapter.provider, path: process.execPath, condition, ...(error ? { error } : {}) },",
   killedBy: [
     "tests/unit/the-doctor-reads-the-pin-it-will-spawn.test.ts::does not canonicalise: the evidence names the pin, not what it resolved to",
-    "tests/unit/the-doctor-reads-the-pin-it-will-spawn.test.ts::reports a stable name whose versioned target the updater pruned",
   ],
 };
 

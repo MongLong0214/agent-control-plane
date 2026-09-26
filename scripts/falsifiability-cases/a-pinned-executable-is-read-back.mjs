@@ -10,9 +10,12 @@
  * and tested in isolation, and the doctor would still say nothing. `findings.length < 0` is never
  * true, so the call compiles and the private method stays referenced.
  *
- * `is reached by the daemon's own start path` is in the list on purpose. It is the row that says
- * the readback happens at boot rather than only when an operator types `doctor`, and boot is the
- * moment a pin resolved by an installer that ran at some other time is first followed.
+ * The witness is the daemon-start row rather than a doctor-level one, because it is the strictly
+ * stronger observation: it drives `Daemon.start()` -> `reconcile()` -> `runSystemDoctorCheck()`
+ * and then asserts the finding on the report that pass recorded. Boot is the moment a pin
+ * resolved by an installer that ran at some other time is first followed, so a readback that only
+ * happens when an operator types `doctor` is not the readback this defect needs. The harness
+ * takes one test name per row; the doctor-level rows in this directory carry the rest.
  */
 const aPinnedExecutableIsReadBack = {
   id: "a-pinned-executable-is-read-back",
@@ -21,7 +24,6 @@ const aPinnedExecutableIsReadBack = {
   find: "      findings.push(...this.checkProviderExecutables());",
   replace: "      if (findings.length < 0) findings.push(...this.checkProviderExecutables());",
   killedBy: [
-    "tests/unit/the-doctor-reads-the-pin-it-will-spawn.test.ts::reports a stable name whose versioned target the updater pruned",
     "tests/unit/the-doctor-reads-the-pin-it-will-spawn.test.ts::is reached by the daemon's own start path, on the report that start writes",
   ],
 };

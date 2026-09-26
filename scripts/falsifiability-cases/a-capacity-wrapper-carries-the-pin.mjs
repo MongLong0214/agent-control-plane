@@ -18,7 +18,6 @@ const aCapacityWrapperCarriesThePin = {
   replace: "  get executablePath(): string | undefined {\n    return undefined;\n  }",
   killedBy: [
     "tests/unit/the-doctor-reads-the-pin-it-will-spawn.test.ts::is the pin the real CLI adapters resolved, carried through the registry's wrapper",
-    "tests/unit/the-doctor-reads-the-pin-it-will-spawn.test.ts::reports a stable name whose versioned target the updater pruned",
   ],
 };
 

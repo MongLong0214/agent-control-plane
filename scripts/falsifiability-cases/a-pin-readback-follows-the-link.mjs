@@ -10,11 +10,12 @@
  * mutant is a plausible implementation rather than a compile error, which is what makes the kill
  * mean something.
  *
- * Two witnesses, because the wrong rule is wrong in two distinguishable ways. On the pruned pin,
- * `lstat` succeeds and `isFile()` is false, so `ABSENT` becomes `NOT_A_FILE` — a finding still
- * fires, and a row that only counted findings would survive this. On the live symlink whose
- * target has lost its execute bit, the same substitution turns `NOT_EXECUTABLE` into
- * `NOT_A_FILE`, which is the operator being sent to fix the link instead of the file.
+ * The witness is the pruned pin, and what it observes is the condition rather than the count: under
+ * `lstat` the dangling link stats fine and `isFile()` is false, so a finding *still fires* and only
+ * its classification changes from `ABSENT` to `NOT_A_FILE`. A row that asserted "some finding
+ * appeared" would survive this mutation intact. The same substitution also turns the live-symlink
+ * case's `NOT_EXECUTABLE` into `NOT_A_FILE` — the operator sent to fix the link instead of the
+ * file — but the harness takes one test name per row and the pruned pin is the case that happened.
  *
  * What this does not prove is the other half of the same rule: that the pin is not canonicalised
  * before it is read. `realpathSync` is not imported in `src/doctor/doctor.ts`, so no mutation of
@@ -29,7 +30,6 @@ const aPinReadbackFollowsTheLink = {
   replace: 'import { accessSync, constants, existsSync, lstatSync as statSync, readFileSync } from "node:fs";',
   killedBy: [
     "tests/unit/the-doctor-reads-the-pin-it-will-spawn.test.ts::reports a stable name whose versioned target the updater pruned",
-    "tests/unit/the-doctor-reads-the-pin-it-will-spawn.test.ts::does not canonicalise: the evidence names the pin, not what it resolved to",
   ],
 };
 
