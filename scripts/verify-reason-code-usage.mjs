@@ -578,6 +578,12 @@ const recordReturnedCollection = (file, signature, collection, mechanism) => {
 };
 recordReturnedCollection(
   "src/doctor/doctor.ts",
+  /private\s+checkProviderExecutables\(\):\s*Finding\[\]\s*\{/,
+  "findings",
+  "checkProviderExecutables returned finding",
+);
+recordReturnedCollection(
+  "src/doctor/doctor.ts",
   /private\s+checkCapacitySensorFiles\(\):\s*Finding\[\]\s*\{/,
   "findings",
   "checkCapacitySensorFiles returned finding",

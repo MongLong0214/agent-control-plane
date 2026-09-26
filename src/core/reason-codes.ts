@@ -115,6 +115,21 @@ export const ReasonCode = {
    */
   PACKET_REVIEWER_SCOPE_UNAVAILABLE: "PACKET_REVIEWER_SCOPE_UNAVAILABLE",
   /**
+   * A provider adapter's pinned executable is not something that can be spawned.
+   *
+   * A pin is resolved once, by an installer that ran at some other time, and then followed for
+   * the daemon's whole life. #954 is what that costs when it is followed without being read back:
+   * this host's daemon started at 01:59:50Z holding `versions/2.1.278`, the provider's updater
+   * repointed the stable name and pruned that directory a minute later, and every capacity probe
+   * afterwards spawned a path that was gone. What the deployment reported was `sensorHealth:
+   * ERROR`, `runtimeHealth: UNAVAILABLE`, `buckets: []` and a CTO role revoked every ~3 minutes
+   * for eight generations — every one of them a symptom, and none of them the cause.
+   *
+   * The evidence names the pin as pinned, never its realpath: the operator's next step is on the
+   * pin, and on the case that produced this there is no realpath left to name.
+   */
+  PROVIDER_EXECUTABLE_UNUSABLE: "PROVIDER_EXECUTABLE_UNUSABLE",
+  /**
    * The reviewer answered its identity handshake in a shape this adapter cannot read.
    *
    * The third state at one throw, and the last one still wearing `ISOLATION_LOST`. Reaching it

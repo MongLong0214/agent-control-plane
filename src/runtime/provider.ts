@@ -392,6 +392,16 @@ export interface ProviderAdapter {
   readonly supportsReviewerEffortAttestation?: boolean;
   /** Provider may contribute only optional adversarial work, never a required role. */
   readonly optionalAdversarialOnly?: boolean;
+  /**
+   * The path this adapter will hand to `execve` — the pin, exactly as the adapter holds it.
+   *
+   * Optional because most adapters spawn nothing: `ScriptedAdapter` answers from a queued script,
+   * and an absent value means "this adapter has no executable", never "its executable is fine".
+   * A reader that stats this must not canonicalise it first. The pin is what an operator set and
+   * what an operator repairs, and #954's case — a stable name whose versioned target the
+   * provider's own updater pruned — has no realpath left to report.
+   */
+  readonly executablePath?: string;
 
   startSession(spec: SessionSpec): Promise<SessionHandle>;
   stopSession(handle: SessionHandle): Promise<void>;
@@ -466,6 +476,17 @@ class CapacityObservedAdapter implements ProviderAdapter {
 
   get optionalAdversarialOnly(): boolean | undefined {
     return this.inner.optionalAdversarialOnly;
+  }
+
+  /**
+   * Forwarded, and not optional to forward. `list()`/`production()` hand out this wrapper, so
+   * every caller that asks the registry for a provider asks *this* object. A wrapper that did not
+   * carry the pin would answer `undefined` for all three CLI adapters, and `undefined` is read as
+   * "no executable" — the doctor's readback would then be silent on exactly the deployment it
+   * exists for, with nothing failing anywhere to say so.
+   */
+  get executablePath(): string | undefined {
+    return this.inner.executablePath;
   }
 
   async startSession(spec: SessionSpec): Promise<SessionHandle> {
