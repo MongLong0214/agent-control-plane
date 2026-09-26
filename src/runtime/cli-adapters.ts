@@ -1533,6 +1533,22 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     });
   }
 
+
+  /**
+   * The pin this adapter will spawn, as it holds it.
+   *
+   * `resolveExecutable` runs once, in the constructor, so this value is fixed for the adapter's
+   * whole life — which is exactly why it has to be readable. #954: the pin resolved at 01:59:50Z
+   * was pruned by the provider's own updater a minute later, and every probe after that spawned a
+   * path that was not there while the daemon reported only the symptoms.
+   *
+   * Handed out uncanonicalised on purpose. A caller that stats this is asking whether *this* pin
+   * can be spawned, and `execve` resolves symlinks itself at each call.
+   */
+  get executablePath(): string {
+    return this.#binary;
+  }
+
   async startSession(spec: SessionSpec): Promise<SessionHandle> {
     // Claude Code is invoked per turn in headless mode; the session id is what makes
     // successive turns one conversation, and a fresh uuid is what makes a session
@@ -1921,6 +1937,18 @@ export class CodexCliAdapter implements ProviderAdapter {
     });
   }
 
+
+  /**
+   * The pin this adapter will spawn, as it holds it.
+   *
+   * Uncanonicalised on purpose, and fixed for the adapter's life: `resolveExecutable` runs once in
+   * the constructor. See `ClaudeCliAdapter.executablePath` for #954, the failure that made this
+   * readable at all.
+   */
+  get executablePath(): string {
+    return this.#binary;
+  }
+
   async startSession(spec: SessionSpec): Promise<SessionHandle> {
     if (spec.isolation) return this.startPacketReviewerSession(spec);
     return {
@@ -2256,6 +2284,18 @@ export class GrokCliAdapter implements ProviderAdapter {
       clock: this.#clock,
       binary: this.#binary,
     });
+  }
+
+
+  /**
+   * The pin this adapter will spawn, as it holds it.
+   *
+   * Uncanonicalised on purpose, and fixed for the adapter's life: `resolveExecutable` runs once in
+   * the constructor. See `ClaudeCliAdapter.executablePath` for #954, the failure that made this
+   * readable at all.
+   */
+  get executablePath(): string {
+    return this.#binary;
   }
 
   async startSession(spec: SessionSpec): Promise<SessionHandle> {

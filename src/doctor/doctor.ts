@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { totalmem } from "node:os";
@@ -306,6 +306,10 @@ export class Doctor {
       findings.push(...this.checkSessions(target ?? null));
     }
     if (scope === "system" || scope === "capacity") {
+      // Before the sensor files and before the sweep, because a pin that cannot be spawned is the
+      // cause of what both of those report. `--scope capacity` is where an operator looks when the
+      // numbers are wrong, so the cause has to be reachable from there and not only from `system`.
+      findings.push(...this.checkProviderExecutables());
       findings.push(...this.checkCapacitySensorFiles());
       findings.push(...(await this.checkCapacity()));
     }
@@ -849,6 +853,93 @@ export class Doctor {
         confidence: "HIGH",
         observedEvidence: { state: inspected.state === "READY" ? "NOT_AUTHENTICATED" : inspected.state, root: configured },
         recommendedAction: action,
+      });
+    }
+    return findings;
+  }
+
+  /**
+   * #954 — read the pin back, because following one is not the same as having one.
+   *
+   * Each CLI adapter resolves its executable once, in its constructor, from a path an installer
+   * chose at some earlier time. Nothing has ever checked that the path still leads anywhere. On
+   * 2026-09-26 this host's daemon came up at 01:59:50Z holding
+   * `~/.local/share/claude/versions/2.1.278`; the provider's own updater repointed the stable name
+   * at 02:01Z and pruned that directory, and every capacity probe from then on spawned a path that
+   * did not exist. The deployment reported `sensorHealth: ERROR`, `runtimeHealth: UNAVAILABLE`,
+   * `buckets: []`, and continuity revoked the bound CTO role every ~3 minutes for eight
+   * generations. Four surfaces, every one of them a consequence, and not one of them said *the
+   * pinned binary is gone*.
+   *
+   * Three decisions are load-bearing here.
+   *
+   * **`statSync`, not `lstatSync` and not `realpathSync`.** `execve` follows symlinks at the
+   * moment of the call, so the readback has to follow them too: a stable name whose target has
+   * been pruned is the case that broke this host, and `lstat` reports that symlink as present.
+   * Canonicalising is the opposite error — the evidence would then name a versioned file the
+   * provider's updater owns rather than the pin an operator set, and on the pruned case there is
+   * no realpath left to name at all. The path in the evidence is the path as pinned.
+   *
+   * **This is a readback, not a guarantee.** Nothing here can close the window between the stat
+   * and the exec; re-resolving the pin inside the adapter before each spawn was considered and
+   * dropped for the same reason, plus the cost of a second resolution that has to stay in step
+   * with the one `execve` performs anyway. Copying the CLI into the installation generation so a
+   * generation "owns" a verified executable was dropped too: that is a second install the
+   * provider's updater never maintains, it re-freezes the version, and the copy diverges silently
+   * on every provider release.
+   *
+   * **Non-blocking, ERROR, exactly like the two checks either side of it.** This stops every probe
+   * and every invocation for one provider, which is a real ERROR; it does not make the daemon
+   * unsafe, and blocking on a missing thing parks the daemon behind the very operator step that
+   * would restore it (#950, #958). The daemon the operator reads this finding from has to be
+   * running for them to read it.
+   *
+   * An adapter with no `executablePath` is skipped and is not a finding: `ScriptedAdapter` and
+   * every other non-CLI adapter spawn nothing.
+   */
+  private checkProviderExecutables(): Finding[] {
+    const findings: Finding[] = [];
+
+    for (const adapter of this.providers.production()) {
+      const path = adapter.executablePath;
+      if (path === undefined) continue;
+
+      let condition: "ABSENT" | "NOT_A_FILE" | "NOT_EXECUTABLE" | "UNREADABLE" | null = null;
+      let error: string | undefined;
+      try {
+        // Follows the link, the way the kernel will. Not canonicalised: see the docstring.
+        const stats = statSync(path);
+        if (!stats.isFile()) {
+          condition = "NOT_A_FILE";
+        } else {
+          try {
+            accessSync(path, constants.X_OK);
+          } catch {
+            condition = "NOT_EXECUTABLE";
+          }
+        }
+      } catch (err) {
+        // ENOENT and ENOTDIR are the only two that mean *not there*. EACCES on a parent
+        // directory, ELOOP, and anything else are a pin this daemon cannot read, which is a
+        // different sentence and a different repair — folding them into "absent" would send an
+        // operator to reinstall a binary that is sitting right where they put it.
+        const code = (err as NodeJS.ErrnoException).code;
+        condition = code === "ENOENT" || code === "ENOTDIR" ? "ABSENT" : "UNREADABLE";
+        error = safeErrorMessage(err);
+      }
+      if (condition === null) continue;
+
+      findings.push({
+        code: ReasonCode.PROVIDER_EXECUTABLE_UNUSABLE,
+        severity: "ERROR",
+        scope: `provider:${adapter.provider}`,
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: { provider: adapter.provider, path, condition, ...(error ? { error } : {}) },
+        recommendedAction:
+          `restore an executable file at ${path} — reinstall the provider CLI, or repoint ` +
+          `ACP_${adapter.provider.toUpperCase()}_BINARY at one — and then restart the daemon, ` +
+          "which resolves this pin once at construction and will not pick the repair up on its own",
       });
     }
     return findings;
