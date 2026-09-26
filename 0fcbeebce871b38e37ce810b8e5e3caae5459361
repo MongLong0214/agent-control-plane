@@ -1,0 +1,39 @@
+Limit: The versioned directory is not owned by this deployment. A provider's updater writes a new version, repoints the stable name at it, and deletes the version it replaced.
+Limit: any pin taken at the canonical target stops naming anything within days of every install
+Ruled-out: Keeping the realpath pin | it holds the daemon to the exact binary the install accepted, and that binary is the one the updater deletes, so the pin ends up naming nothing at all
+Warn: A pin at the stable name means the daemon can run a version this install never resolved. Nothing in the deployment notices that, and nothing here checks that a pinned path still exists after an update.
+Warn: The falsifiability row restores the canonicalisation as its mutation, so it measures exactly the predicate that was reversed.
+Warn: the test helper writeProviderCli now returns the path as written rather than its realpath; on macOS the temporary directory is itself a link, so that distinction is visible in every row that compares a pin
+Blast: module
+Undo: easy
+Certainty: firm
+Unverified: The full gate set, the complete falsifiability sweep and a live install against a real host are unverified here.
+Record-Id: r-9af0643686fc
+Provenance: inherited 33f0c9cc2f44c15cca958264cc9dad4b37974292
+
+Limit: An adapter assigns that result to a private field once, in its constructor, and hands the same string to the capacity collector and to the runtime probe; the collector spawns that one string on every probe for the rest of the daemon's life.
+Limit: the capacity and runtime probes do not go through an exec allow-list at all: the non-isolated path builds runtimeProfile, which has no (deny process-exec*) line
+Ruled-out: an accessSync(binary, X_OK) on the absolute branch | Its failure cannot change the answer, and a check whose failure cannot change the answer reports a coverage it does not have.
+Ruled-out: re-resolving the pin inside this module on each spawn | it adds a resolution that has to be kept in step with the one execve performs anyway
+Warn: The two rows are a pair and neither is sufficient. Every assertion about the generated launcher stays true while the daemon canonicalises the pin at startup, which is exactly how this shipped broken once.
+Warn: Nothing anywhere notices a pinned name whose target has gone. A check that faults that is a separate unit and is deliberately not part of this change.
+Warn: the seatbelt exec allow-list must keep naming the canonical target: measured with sandbox-exec, a profile whose allow-literal names the symlink path instead is refused with "Operation not permitted"
+Warn: command -v answers for a mode-755 FIFO on PATH, -x is true of it and -f is false, so without -f a name that is not a program could be pinned
+Blast: system
+Undo: easy
+Certainty: firm
+Unverified: no live install and no live daemon restart was performed here; the full gate set and the complete falsifiability sweep were not run
+Record-Id: r-00a4322c5bad
+Provenance: inherited e1580acbcc479450469ebf93fe6fd554c018ac8c
+
+Limit: The two anchoring cases observe the string arriving at the setRunCli seam, not a real execve. The deploy case does execute its exported path through the harness's stand-in launcher, so the two halves are witnessed at different depths.
+Limit: That the seatbelt exec literal has to be the canonical path was measured with a standalone sandbox-exec probe, not with a committed case; nothing in this repository would notice if that stopped holding.
+Ruled-out: a Darwin-only committed case for the seatbelt symlink property | reviewerProfile is a different unit and its tests are outside this change's ceiling, so the docstring states the measurement's provenance instead
+Ruled-out: a directory as the fixture for the -f clause | command -v skips directories, so that fixture stays green with the clause deleted and would witness nothing
+Ruled-out: leaving the last return anchored too | nothing was found there, and a bare name is what that contract says; anchoring it would manufacture a path that does not exist
+Warn: binary.includes("/") tests for a slash, not for an absolute path. Naming that branch the absolute one is what hid the regression: ./bin/claude and tools/claude enter it, and CliAdapterOptions.binary states no absolute constraint.
+Warn: An assertion that supplies an already-absolute fixture cannot measure anchoring. Both earlier pin cases do that, so they die for canonicalisation only; each anchoring row needs a relative spelling of its own.
+Warn: The spawn does not run in the directory the resolution ran in — runCli takes a cwd from its caller — so a pathname checked in one directory and executed in another names a different file, or nothing.
+Certainty: firm
+Record-Id: r-48b8aace89ce
+Provenance: inherited 5e57f9fdbf06a76d0e7679fc829c69e28b0b3e28
