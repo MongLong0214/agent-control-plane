@@ -307,11 +307,22 @@ resolve_buzz_binary() {
 resolve_cli_binary() {
   local name="$1" found=""
   found="$(command -v "$name" 2>/dev/null || true)"
-  [[ -n "$found" && "$found" == /* ]] || return 0
-  # The canonical target, not the name the shell answered with. A pin that records a symlink still
-  # reads as correct after the link is repointed, and the daemon then runs a different binary than
-  # the one this install resolved and accepted.
-  found="$(canonical_executable "$found")" || return 0
+  # The name the shell answered with, not the file behind it. The earlier rule resolved the answer
+  # to its canonical target, reasoning that a pin recording a symlink still reads as correct after
+  # the link is repointed and the daemon then runs a binary this install never accepted. That
+  # weighs one direction only. A provider CLI of this kind keeps its versions in a directory its
+  # own updater owns: the updater writes a new version, repoints the stable name, and deletes the
+  # version it replaced — so a canonical pin names a file that stops existing within days of every
+  # install. From then on each capacity probe spawns a path that is not there, the provider reports
+  # no quota rather than an error, and a role whose capacity is empty is revoked. That is the more
+  # expensive of the two failures and the one that was measured, so the stable name the updater
+  # maintains is what gets pinned; running a version newer than the one resolved here is accepted.
+  #
+  # Absolute and executable is still required. A relative answer reaches resolveExecutable's
+  # absolute-path branch, which returns it unchanged rather than searching, and the daemon runs
+  # from a working directory the installing shell does not share; the execute test is what
+  # `canonical_executable` used to contribute here, and a dangling stable name fails it.
+  [[ -n "$found" && "$found" == /* && -x "$found" ]] || return 0
   printf '%s' "$found"
 }
 
