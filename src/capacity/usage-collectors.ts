@@ -915,13 +915,26 @@ export class ClaudeUsageCollector extends BaseUsageCollector {
     try {
       outcome = await this.probe.run({ binary: this.claudeOptions.binary, timeoutMs: this.probeTimeoutMs });
     } catch (error) {
+      // `spawn` does not always reach the `error` event. It throws synchronously when an argument
+      // is rejected before any syscall — an empty binary gives ERR_INVALID_ARG_VALUE — and when
+      // the spawn attempt itself returns an errno to the caller, which a path whose parent is a
+      // file does with ENOTDIR. Both arrive here with no `spawnError` to read, and Node's own
+      // text names neither the attempt nor the path: `spawn ENOTDIR`, on its own, is the same
+      // sentence without a subject that #954 was about, one layer up from the branch below.
+      //
+      // So this states what was attempted and leaves the thrown message to say the rest. It does
+      // not classify why the throw happened: the only evidence available on this side is that
+      // message, and deciding a cause by matching on it is exactly the inference the spawn-error
+      // field was added to avoid.
       const digest = sha256("");
+      const thrown = error instanceof Error ? error.message : "a non-error value was thrown";
       return failedReading(
         this.provider,
         observedAt,
         `non-interactive-/usage:${this.provider};raw-output-digest:${digest}`,
         digest,
-        error instanceof Error ? error.message : "non-interactive /usage collector threw a non-error value",
+        `non-interactive /usage never started: spawning the configured CLI at ${this.claudeOptions.binary} ` +
+          `threw before any process existed (${thrown})`,
       );
     }
     const raw = `${outcome.stdout}${outcome.stderr ? `\n${outcome.stderr}` : ""}`;

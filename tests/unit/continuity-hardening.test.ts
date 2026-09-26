@@ -331,11 +331,19 @@ describe("capacity sensor honesty (§14.2)", () => {
     // whole evidence and stored TRUSTED_CREDENTIAL_LEAK_BLOCKED with `auditEvidenceRejected`.
     // A credential leak that never happened, in place of the cause.
     const { cp, clock, gpt } = makePlane();
-    // Reaching this branch needs `current()` to be the observation, and two things fight that.
+    // Reaching this branch needs `current()` to be the observation, and one thing fights that.
     // `observe` ends by running the continuity evaluation, which re-probes every provider; under
     // a ManualClock that probe lands on the SAME observed_at, and `persist` deletes by
     // (provider, observed_at) before inserting — so the observation is erased by the evaluation
-    // it just triggered. `current()` then takes the first row of a MAX(observed_at) tie.
+    // it just triggered.
+    //
+    // The replacement is the whole of it; row order is not involved. An earlier draft of this
+    // comment said `current()` picks the first row of a MAX(observed_at) tie, and that is wrong
+    // in a way worth stating: literal ties do occur, but only across the buckets of one reading,
+    // and those rows share the source, timestamp and health metadata `current()` reads. Row order
+    // therefore cannot choose between two conflicting observations — `persist` has already
+    // deleted one of them. Reading that draft sends the next person hunting an ordering bug that
+    // cannot exist, instead of at the delete-then-insert that actually erases the row.
     //
     // Pinning the adapter's reading to an earlier instant keeps that re-probe strictly older, so
     // the observation stays the current row. Without this the test passed against the broken

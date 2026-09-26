@@ -328,6 +328,38 @@ describe("non-interactive account usage (#582)", () => {
     expect(outcome.code).toBeNull();
   });
 
+  it("#954 names the CLI that was attempted when spawn throws instead of emitting", async () => {
+    // `spawn` does not always reach the `error` event the branch above depends on. Given a binary
+    // whose parent component is a regular file, the attempt returns ENOTDIR to the caller and
+    // `spawn` throws synchronously: the probe's promise rejects, the collector's catch handles
+    // it, and there is no `spawnError` to read. Node's message there is the whole of
+    // `spawn ENOTDIR` — no path, no attempt, nothing an operator can reach a misconfigured
+    // binary with. The same defect this unit was opened for, one layer up from it. An empty
+    // configured binary enters the same catch by the other door, with ERR_INVALID_ARG_VALUE.
+    //
+    // Measured before it was asserted on: the throw is synchronous under Node 24.18.0, which is
+    // the version this suite's native sqlite binding is built for, and under the older Node that
+    // sits on PATH. So this exercises the catch and not the error handler on either. The subject
+    // is built in this process's own temp root rather than taken from /etc, whose contents this
+    // suite must not depend on.
+    const notADirectory = join(tempDir("acp-954-sync-throw-"), "regular-file");
+    writeFileSync(notADirectory, "a regular file, and therefore not usable as a path component");
+    const attempted = join(notADirectory, "acp-954-cli");
+
+    const reading = await new ClaudeUsageCollector({ clock: clock(), binary: attempted }).collect();
+
+    expect(reading.sensorHealth).toBe("ERROR");
+    expect(reading.buckets).toEqual([]);
+    // Unlike the ENOENT case above, no assertion here can be satisfied by the quoted clause
+    // standing in for the composed one: Node's thrown text is `spawn ENOTDIR` and contains
+    // neither the path nor any of the words this collector puts around it.
+    expect(reading.error).toContain(`spawning the configured CLI at ${attempted} threw before any process existed`);
+    // The errno still has to survive, and it arrives only inside the quoted message.
+    expect(reading.error).toContain("ENOTDIR");
+    // What shipped before was Node's sentence and nothing else.
+    expect(reading.error).not.toBe("spawn ENOTDIR");
+  });
+
   it("never reads a quota by handling the subscription credential itself", () => {
     // The command carries no token and sets no credential path: the CLI reads and refreshes its
     // own. `--bare` is the one flag that would break this — it refuses the keychain and returns
