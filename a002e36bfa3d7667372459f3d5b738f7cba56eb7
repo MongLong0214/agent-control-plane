@@ -1,0 +1,77 @@
+Limit: Read the path by the same rule the spawn uses. Do not canonicalise. A stable symlink whose target has gone must fail.
+Limit: `lstat` reports a dangling link as present, which is exactly the state that broke this host.
+Limit: Severity ERROR, blocking false: a blocking finding for a missing thing parks the daemon behind the very operator step that would restore it.
+Ruled-out: copying the CLI into the installation generation so the generation owns a verified executable | that is a second install the provider's updater never maintains. It re-freezes the version, which is the defect the open PR just removed, and the copy silently diverges on every provider release.
+Ruled-out: re-resolving the pin inside the adapter before each spawn | it adds a resolution that has to stay in step with the one `execve` performs anyway, and it cannot see the window between the check and the exec.
+Warn: `ProviderRegistry.list()` and `production()` hand out `CapacityObservedAdapter`, never the adapter itself. The wrapper has to forward `executablePath` or the doctor asks the wrong object.
+Warn: `realpathSync` is deliberately not imported in `src/doctor/doctor.ts`. Whoever adds it for any reason has removed that structural refusal and owes the falsifiability directory a row that exercises it directly.
+Blast: module
+Undo: easy
+Certainty: firm
+Unverified: `resolveExecutable` in `src/runtime/cli-adapters.ts` calls `realpathSync` itself, in the constructor, so the adapter's pin is canonicalised at construction regardless of what the installer pinned.
+Record-Id: r-954pinreadback
+Provenance: inherited 2c66db0b531392a36525765d41404b023501d0b8
+
+Limit: `recordReturnedCollection` recognises a code pushed onto a returned `Finding[]` only for methods it names explicitly, so a new doctor check that declares a catalogued reason code needs its own registration.
+Ruled-out: emitting the finding as a bare string literal instead of a catalogued ReasonCode | the census only scans literals bound to `reasonCode`, so a bare string would have turned the gate green by the code ceasing to be something the gate can see.
+Warn: `resolveExecutable` is deliberately not edited on this branch. Two branches writing that function is how one of them gets silently reverted in a merge.
+Blast: local
+Undo: easy
+Certainty: firm
+Unverified: On this base the adapter still canonicalises its pin at construction; the change that stops it is in flight as PR #998 fix/954-cli-pin-stable-path, which replaces both realpathSync returns with resolve(...). This branch does not verify that head.
+Record-Id: r-954censusregistration
+Follows: r-954pinreadback
+Provenance: inherited b26b50ac3ed90f046b57d29bd634a7cf0ceecdfa
+
+Limit: A provider's id is not its pin's environment variable. CodexCliAdapter.provider is "gpt" while ControlPlane reads its pin from ACP_CODEX_BINARY, and ACP_GPT_BINARY occurs nowhere in this repository.
+Limit: Two of the three providers come out right under `ACP_` + upper-cased id + `_BINARY`, which is what makes the transformation read as correct and why a witness that exercises only claude cannot see the defect.
+Ruled-out: deriving the name and special-casing gpt inline | the special case reads as an exception to a rule rather than as the rule, and the next provider whose id and variable diverge gets the transformation's answer silently.
+Ruled-out: naming no variable at all and telling the operator only to reinstall | the environment variable is how this deployment pins the CLI in the first place, so the repair the operator most often needs is the one the message would have dropped.
+Warn: Everything in a recommendedAction must be read from where the thing is actually configured, never derived from something that resembles it. The rest of this message was audited the same way: path, scope and provider are read from the adapter, and the resolves-once-at-construction claim is read from resolveExecutable.
+Warn: Scope the commitlore context query to the gates a change will face, not only to the files it will touch. The verify-reason-code-usage.mjs record already carried the constraint that cost this branch a red gate, and reading only the four files I expected to edit is what hid it.
+Blast: local
+Undo: easy
+Certainty: firm
+Record-Id: r-954pinrepairvariable
+Follows: r-954pinreadback
+Provenance: inherited 5b337b4a42c08e49ab609bd24ed42d1e3cec613f
+
+Limit: A per-provider doctor read must use list(), not production(): production() excludes any provider with a role-scoped registration, and both ClaudeCliAdapters are registered with registerForRole, so the pin readback could not see the one provider whose pin died.
+Limit: list() collapses to one representative adapter per provider, so two role-scoped instances of one provider are one finding, and a second instance holding a different pin is unread. The two shipped claude instances read the same ACP_CLAUDE_BINARY, so nothing is lost today.
+Limit: list() includes non-production adapters, which production() filtered out, so the isProduction filter has to be kept explicitly in the loop.
+Limit: verify-reason-code-usage.mjs recognises a catalogued reason code only as an inline findings.push({...}) inside a method it names, so the finding literal cannot be extracted into a helper without three census rows going red.
+Ruled-out: reading production() and adding role-scoped providers back with a second call | two questions in one loop, and list() is already the documented answer for the provider set.
+Ruled-out: plumbing the pin's source through the adapter so the message could state where the pin came from | CliAdapterOptions.binary is one string with no provenance and the change reaches three adapter constructors and the composition root, outside this slice; reading the variable's current value answers the same question from inside it.
+Warn: A test that registers with register() is testing a registry shape this deployment does not have. Every provider-level check needs at least one case composed through ControlPlane with the default adapters, because the unscoped shape passes while the shipped one is silent.
+Warn: Naming an environment variable as the pin's source is only true when that variable's current value is the pin: control-plane.ts:753 spreads ...overrides after binary, so adapterOptions wins over the environment.
+Warn: A restart is needed only to change which path is pinned. Since #998 restoring a file at the pinned path is live at the next spawn, so an unconditional restart instruction sends the operator to a step the likeliest repair does not need.
+Warn: provider.ts:733's claim that doctor.ts consumes list() was false until this change; the surrounding docstring is otherwise the record that named the right question.
+Blast: module
+Undo: easy
+Certainty: firm
+Record-Id: r-954pinreadbackroles
+Follows: r-954pinrepairvariable
+Provenance: inherited 1fbb5c795399ec1038936e9c1a3b5f308dd9b03a
+
+Limit: A containment assertion on a recommendedAction can be satisfied by the fallback clause: the message that names no owning setting still mentions the variable, in "it is not the current value of ACP_CODEX_BINARY". Assert the positive form, change <variable> and restart.
+Warn: This assertion passed while its mutant survived, so it could not fail for the claim it was written for. A falsifiability row is the only thing that showed it; a green test file said nothing.
+Blast: local
+Undo: easy
+Certainty: firm
+Record-Id: r-954pinvariablewitness
+Follows: r-954pinreadbackroles
+Provenance: inherited 66a8c61194a16576c1f99ff8ec364cadbce95663
+
+Limit: Equality with an environment variable's current value is not provenance: ...overrides is applied after binary:, so a deployment whose adapterOptions carry the same path matches while never reading the variable. The message may claim the equality and must name adapterOptions as what wins.
+Limit: variableMatchingPin under-reports for a pin resolveExecutable found by searching PATH: the pin is resolve(join(directory, name)) while the variable holds a bare name, so neither comparison matches. Left unrepaired; the failure names no setting rather than the wrong one.
+Limit: A provider is spawned with agentPath() - the node binary's directory plus /usr/bin, /bin, /usr/sbin and /sbin - not the daemon's PATH, so /opt/homebrew/bin and /usr/local/bin are never searched however the launcher sets PATH.
+Limit: NOT_ON_PATH is inferred from the pin's shape at construction and never re-measured, so it cannot be stated as a fact about the daemon's whole life; a CLI installed after startup is spawnable while the finding reads the same way.
+Ruled-out: re-running the PATH search inside variableMatchingPin so a searched pin can be matched to its variable | it is the second resolution this slice ruled out in round 1, it has to stay in step with the one execve performs, and the current failure under-claims rather than misdirects.
+Ruled-out: renaming the falsifiability row a-pin-setting-is-named-only-when-it-owns-the-pin to match the weaker claim | the id is referenced by the record already written for it, and the row's what and prose carry the correction without breaking that reference.
+Warn: An assertion that names a phrase from a message the change already rewrote passes for every mutant. not.toMatch(/ACP_[A-Z]+_BINARY at one/) guarded nothing because the repair had deleted 'at one' from every sentence. Assert the positive form, and give each expression that could reintroduce a defect its own row.
+Blast: local
+Undo: easy
+Certainty: firm
+Record-Id: r-954pinmessageclaims
+Follows: r-954pinreadbackroles
+Provenance: inherited e621537c79ed22563c17b993e2f64b990a4aa449
