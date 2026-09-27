@@ -1,0 +1,51 @@
+Limit: Each adopted session needs its own Buzz channel identity because the schema says so: sessions_buzz_actor is UNIQUE over live lifecycles, so two entries sharing one actor id means the second bindBuzzActor is refused by the index and the whole claim rolls back.
+Limit: The Buzz channel is still one deployment-wide scalar read from #canonicalBuzzChannelId, so every adopted CTO speaks on the same channel until that becomes per entry too.
+Ruled-out: keep buzzChannelId and buzzActorId as request fields and compare them against the configured values | they were request fields the orchestration filled from deployment configuration and this method then compared back against that same configuration, so removing the surface beats guarding it
+Ruled-out: give a second running session its CTO binding through the existing spawn path | CtoLifecycle.spawn starts a new provider session rather than adopting the live one, which puts a second writer in a checkout a running session already holds
+Ruled-out: hand verifyClaudeIdentity the whole entries instead of bare UUIDs | its second caller, the daemon's delegated CTO binding, has no project or Buzz identity to entitle
+Ruled-out: re-hardcode the launcher env-log field indices after the activation group shrank | the literals had already moved once and the record of that move warned about only two of the three
+Warn: Membership is tested against identity.sessionUuid, derived from process ancestry, never against request.claimedSessionUuid: resolving the entry from what the caller said would move this authority to the claimant.
+Warn: The per-entry blank check is spelled value.trim() === "" on purpose, because the older scalar row anchors on .trim().length === 0 and the falsifiability harness requires each anchor to match its file exactly once.
+Blast: system
+Undo: costly
+Certainty: firm
+Unverified: The five new falsifiability rows and the one repaired row were not run as a sweep before this commit: the harness refuses to run over a dirty tree, so they are run against this commit instead.
+Record-Id: r-acp1005set
+Provenance: inherited 8ea4be7cf499e26b1da7c4b61459c6f257fbe66f
+
+Limit: killedBy now holds a -t prefix shared by three it.each cases rather than three full titles, so a future test in this file whose name begins with the same prefix joins the row's witness set without anyone choosing that.
+Ruled-out: point each row at a single one of its three it.each cases | the mutation makes the comparison vacuous for every field at once, so naming one field would claim less than the mutant actually reaches
+Blast: local
+Undo: easy
+Certainty: firm
+Record-Id: r-acp1005rows
+Supersedes: r-acp1005set
+Provenance: inherited 082ffb083a46cd192dba9873f1a8d8e82c51f6ba
+
+Limit: the two operands #1005 adds are answered by TypeScript rather than by a test, because assertCanonicalSessionsValid takes `unknown`: the Array.isArray operand is the narrowing that makes `.length`, the bound check and the `for...of` legal, and the per-entry typeof is what makes `value.trim()` legal, so every isolated mutant fails to compile and no falsifiability row can witness either one
+Ruled-out: normalise a padded or upper-case configured value with .trim()/.toLowerCase() | membership is resolved by comparing the configured sessionUuid against the form extracted from the ancestor's argv, so a value this module silently repaired would either admit a session the deployment never configured or refuse the one it did, forever, with CONFLICT
+Ruled-out: keep the set rule in the constructor and restate the shape half of it in the daemon's zod schema | holding half the rule in each place is exactly how an invalid set got a started listener and then a throw on its first claim, so the whole rule moved into one exported function both callers use
+Warn: an entry in scripts/lib/refusal-operands-unanswered.mjs is keyed by operand text and occurrence index, so moving a guard to a new lexical site staleizes its declaration even when the logic is unchanged; nothing in typecheck, lint or the suite sees it, and `pnpm guards:operands` reports it only after the whole gate run reaches that gate
+Blast: module
+Undo: easy
+Certainty: firm
+Record-Id: r-acp1005r2
+Provenance: inherited 8266c8a5051b5cad629ad417b06951d9bf70c124
+
+Limit: the generation-1 await case cannot witness the role-key site and was measured SURVIVED against it: the receipt carries the project the bind argument named, not the one the role key named, and at generation 1 the entitled key and a foreign key both count zero assignments, so the mutant's key agrees by accident
+Ruled-out: one row covering both entitlement sites | the census credits every site inside an anchor while one mutation is tested, and here the two sites have different observable effects — the assignment row's project and the role key the expected generation is counted against — so one row would have reported a witness the other site does not have
+Warn: a site whose effect the receipt carries back is witnessed by asserting the receipt; the role-key site is not one of those, and its only distinguishing effect is which role key MAX(binding_generation) is read for, so any future witness for it needs a fixture where the entitled and the request's project disagree in their assignment count, not merely in their name
+Blast: local
+Undo: easy
+Certainty: firm
+Record-Id: r-acp1005wit
+Provenance: inherited 749d6858ca22ac6cee37e9a7227601adff5730d3
+
+Limit: the blank-field row proves nothing about sessionUuid: an empty sessionUuid is refused with or without this operand by the UUID pattern one line later, so the empty-string cases cover projectId and buzzActorId only and the row's witness set spans two value spellings under one -t prefix
+Ruled-out: remove the later entitlement lookup so the membership row could witness an unconfigured session being adopted | that lookup is deliberate defence in depth against the two sets ceasing to agree, and deleting a live guard to make a mutation observable trades the property for the measurement
+Warn: a whitespace-only fixture for a blank-value guard measures whichever guard also refuses whitespace, not the blank check: with this operand deleted the three original cases still threw, from the padding check two lines below, so the row was killed on a thrown message rather than on the constructor accepting what it should have refused
+Blast: local
+Undo: easy
+Certainty: firm
+Record-Id: r-acp1005nit
+Provenance: inherited 0585e7302aafcbc7cbca0ebd0c552be7f62c5aa6
