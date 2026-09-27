@@ -278,30 +278,38 @@ const MUTATION_TABLES = [
   "actor_target_attestations",
 ] as const;
 
-/**
- * The `audit_events` count leaves out the one row `CanonicalSelfClaim.claim()` records for every
- * decision it hands back, admission or refusal. This oracle used to count it too, and so treated a
- * refusal's own record as a leak; a refused claim leaving nothing that says it was refused was
- * the defect, not the contract. What the count still proves is that the rows the mutation's own
- * writers record (session, lifecycle, Buzz actor, binding) roll back with it. The decision row
- * itself is asserted exactly, read back from the database, in `tests/unit/canonical-self-claim.test.ts`.
- */
-const CLAIM_DECISION_KINDS = ["CANONICAL_SELF_CLAIM_ADMITTED", "CANONICAL_SELF_CLAIM_REFUSED"] as const;
-
 const ROLLBACK_TABLES = [...MUTATION_TABLES, "audit_events"] as const;
 
 const rowCounts = (cp: Harness["cp"]): Record<(typeof ROLLBACK_TABLES)[number], number> =>
   Object.fromEntries(
-    ROLLBACK_TABLES.map((table) => [
-      table,
-      (table === "audit_events"
-        ? cp.db.get<{ c: number }>(
-          `SELECT COUNT(*) AS c FROM audit_events WHERE kind NOT IN (?, ?)`,
-          [...CLAIM_DECISION_KINDS],
-        )
-        : cp.db.get<{ c: number }>(`SELECT COUNT(*) AS c FROM ${table}`))?.c ?? -1,
-    ]),
+    ROLLBACK_TABLES.map((table) => [table, cp.db.get<{ c: number }>(`SELECT COUNT(*) AS c FROM ${table}`)?.c ?? -1]),
   ) as Record<(typeof ROLLBACK_TABLES)[number], number>;
+
+/**
+ * The rollback oracle. The mutation tables hold what they held before, and the *whole* of what
+ * `audit_events` gained since `before` — every row, whatever its kind — is exactly the one row
+ * `CanonicalSelfClaim.claim()` records for the refusal it returned, carrying the reason code that
+ * refusal crossed the socket with.
+ *
+ * It compares the full delta rather than leaving the decision kinds out of the count, which it
+ * used to: then a leak written under either kind — a second refusal row, or an admission row the
+ * rollback should have taken with it — passed. `audit_events` is append-only and ordered by
+ * insertion, so offsetting by the earlier count isolates exactly what was written after it.
+ */
+const expectRolledBack = (
+  cp: Harness["cp"],
+  before: Record<(typeof ROLLBACK_TABLES)[number], number>,
+  refusal: Decision<unknown>,
+): void => {
+  expect(refusal.allowed, JSON.stringify(refusal)).toBe(false);
+  expect(
+    cp.db.all<{ kind: string; reason_code: string | null }>(
+      `SELECT kind, reason_code FROM audit_events ORDER BY event_id LIMIT -1 OFFSET ?`,
+      [before.audit_events],
+    ),
+  ).toEqual([{ kind: "CANONICAL_SELF_CLAIM_REFUSED", reason_code: refusal.reasonCode }]);
+  expect(rowCounts(cp)).toEqual({ ...before, audit_events: before.audit_events + 1 });
+};
 
 const insertProject = (cp: Harness["cp"], projectId: string): void => {
   cp.db.run(`INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)`, [
@@ -456,7 +464,7 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
         params: { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1 },
       });
       expect(replay.allowed).toBe(false);
-      expect(rowCounts(cp)).toEqual(afterFirst);
+      expectRolledBack(cp, afterFirst, replay);
     },
     45_000,
   );
@@ -480,7 +488,7 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
       });
 
       expectClosedPublicDenial(result, ReasonCode.CONFLICT);
-      expect(rowCounts(cp)).toEqual(before);
+      expectRolledBack(cp, before, result);
     },
     45_000,
   );

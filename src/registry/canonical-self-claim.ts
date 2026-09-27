@@ -1198,12 +1198,20 @@ export function assertClaudeIdentityStillLive(
  * The claimed session is recorded only when it has the shape of one. The first refusal in `claim`
  * is exactly the case where it does not, and there it is arbitrary caller text.
  *
+ * A refusal's project is recorded only when it names a row in `projects`, and is otherwise null.
+ * The request's `projectId` is any nonempty string the caller sent, so without that bound a refused
+ * claim could put a private path or a token into a durable log verbatim — the same exposure that
+ * keeps `message` and `evidence` off the row, and `AuditLog.record` redacts only `evidence`. The
+ * registry is the existing authority for what a project id is; this adds no second one, no pattern
+ * and no length cap. A null project loses less than a verbatim secret, and the reason code stays.
+ *
  * An admission names the project from the binding, not from the request: the entitlement is what
  * decided the project, and the request is the caller's object.
  */
 const claimDecisionAuditRecord = (
   asked: { claimedSessionUuid: string; projectId: string },
   decision: Decision<CanonicalSelfClaimReceipt>,
+  isRegisteredProject: (projectId: string) => boolean,
 ): AuditRecord => {
   if (decision.allowed) {
     return {
@@ -1221,7 +1229,7 @@ const claimDecisionAuditRecord = (
   return {
     kind: "CANONICAL_SELF_CLAIM_REFUSED",
     reasonCode: decision.reasonCode,
-    projectId: asked.projectId,
+    projectId: isRegisteredProject(asked.projectId) ? asked.projectId : null,
     evidence: { identity: UUID_PATTERN.test(asked.claimedSessionUuid) ? asked.claimedSessionUuid : null },
   };
 };
@@ -1312,8 +1320,22 @@ export class CanonicalSelfClaim {
   async claim(request: CanonicalSelfClaimRequest): Promise<Decision<CanonicalSelfClaimReceipt>> {
     const asked = { claimedSessionUuid: request.claimedSessionUuid, projectId: request.projectId };
     const decision = await this.#decide(request);
-    this.audit.record(claimDecisionAuditRecord(asked, decision));
+    this.audit.record(claimDecisionAuditRecord(asked, decision, (projectId) => this.#isRegisteredProject(projectId)));
     return decision;
+  }
+
+  /**
+   * Whether `projectId` names a row in `projects`, for the audit record alone. It is read after the
+   * decision is final and decides nothing about it. A lookup that fails answers "not registered":
+   * the record then carries a null project, and neither the decision nor its reason code changes,
+   * nor does the failure escape `claim()`.
+   */
+  #isRegisteredProject(projectId: string): boolean {
+    try {
+      return this.db.get(`SELECT 1 FROM projects WHERE project_id = ?`, [projectId]) !== undefined;
+    } catch {
+      return false;
+    }
   }
 
   async #decide(request: CanonicalSelfClaimRequest): Promise<Decision<CanonicalSelfClaimReceipt>> {

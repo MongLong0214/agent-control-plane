@@ -68,7 +68,7 @@ const FIVE_TABLES = [
 /**
  * The two kinds `claim()` records at its return boundary, one row per decision it hands back.
  * Written after `#mutate` has committed or rolled back, so they are outside its transaction by
- * design, and they are the only audit rows a refusal is meant to leave.
+ * design, and a refusal is meant to leave exactly one of them and nothing else.
  */
 const CLAIM_DECISION_KINDS = ["CANONICAL_SELF_CLAIM_ADMITTED", "CANONICAL_SELF_CLAIM_REFUSED"] as const;
 
@@ -79,27 +79,50 @@ const CLAIM_DECISION_KINDS = ["CANONICAL_SELF_CLAIM_ADMITTED", "CANONICAL_SELF_C
  * `BindingRegistry.bind`), so a refusal whose rollback still let one of those rows land would
  * pass every `FIVE_TABLES`-only assertion and still be a real leak. Counting this table is what
  * makes that shape fail.
- *
- * The count leaves out `CLAIM_DECISION_KINDS`. This oracle used to count them too and treat a
- * refusal row as a leak; that was the defect, not the contract — a refused claim left nothing
- * saying it had been refused. Those rows are asserted exactly, and read back, by the
- * "every decision claim() hands back" block; excluding them here keeps every refusal below
- * proving that the *mutation's* writers left nothing behind.
  */
 const ROLLBACK_TABLES = [...FIVE_TABLES, "audit_events"] as const;
 
 const rowCounts = (core: CoreHarness): Record<(typeof ROLLBACK_TABLES)[number], number> =>
   Object.fromEntries(
-    ROLLBACK_TABLES.map((table) => [
-      table,
-      (table === "audit_events"
-        ? core.db.get<{ c: number }>(
-          `SELECT COUNT(*) AS c FROM audit_events WHERE kind NOT IN (?, ?)`,
-          [...CLAIM_DECISION_KINDS],
-        )
-        : core.db.get<{ c: number }>(`SELECT COUNT(*) AS c FROM ${table}`))?.c ?? -1,
-    ]),
+    ROLLBACK_TABLES.map((table) => [table, core.db.get<{ c: number }>(`SELECT COUNT(*) AS c FROM ${table}`)?.c ?? -1]),
   ) as Record<(typeof ROLLBACK_TABLES)[number], number>;
+
+/**
+ * The audit delta a rollback case is allowed: the one refusal row `claim()` records for the
+ * decision it returned, carrying that decision's reason code — or nothing at all for a claim that
+ * threw, because a throw returns no decision and so records none.
+ */
+const allowedAuditDelta = (refusal: { allowed: boolean; reasonCode: string } | null) => {
+  if (refusal === null) return [];
+  expect(refusal.allowed, JSON.stringify(refusal)).toBe(false);
+  return [{ kind: "CANONICAL_SELF_CLAIM_REFUSED", reason_code: refusal.reasonCode }];
+};
+
+/**
+ * The rollback oracle over counts. The five mutation tables hold what they held before, and the
+ * *whole* of what `audit_events` gained since `before` — every row, whatever its kind — is exactly
+ * the delta `allowedAuditDelta` permits.
+ *
+ * It compares the full delta rather than leaving the decision kinds out of the count, which it
+ * used to: then a leak written under either kind — a second refusal row, or an admission row the
+ * rollback should have taken with it — passed every rollback case in this file. `audit_events`
+ * is append-only and ordered by insertion, so offsetting by the earlier count isolates exactly
+ * what was written after it.
+ */
+const expectRolledBack = (
+  core: CoreHarness,
+  before: Record<(typeof ROLLBACK_TABLES)[number], number>,
+  refusal: { allowed: boolean; reasonCode: string } | null,
+): void => {
+  const allowed = allowedAuditDelta(refusal);
+  expect(
+    core.db.all<{ kind: string; reason_code: string | null }>(
+      `SELECT kind, reason_code FROM audit_events ORDER BY event_id LIMIT -1 OFFSET ?`,
+      [before.audit_events],
+    ),
+  ).toEqual(allowed);
+  expect(rowCounts(core)).toEqual({ ...before, audit_events: before.audit_events + allowed.length });
+};
 
 /**
  * The rows `claim()` recorded for the decisions it handed back, read from the database rather
@@ -316,13 +339,32 @@ const successorFixture = async () => {
 };
 
 // Full durable preimages, not counts: rollback must restore pointer, hash, approval and envelope bytes.
-// `audit_events` leaves out the decision rows `claim()` records at its boundary, for the reason
-// `ROLLBACK_TABLES` gives; every other audit row is compared byte for byte.
-const durableSnapshot = (core: CoreHarness) => core.db.all<{ name: string }>(
-  `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`,
-).map(({ name }) => [name, name === "audit_events"
-  ? core.db.all(`SELECT * FROM audit_events WHERE kind NOT IN (?, ?) ORDER BY event_id`, [...CLAIM_DECISION_KINDS])
-  : core.db.all(`SELECT * FROM "${name.replaceAll('"', '""')}"`)]);
+// `audit_events` is read whole and in insertion order, decision rows included.
+const durableSnapshot = (core: CoreHarness): Record<string, Record<string, unknown>[]> => Object.fromEntries(
+  core.db.all<{ name: string }>(
+    `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`,
+  ).map(({ name }) => [name, name === "audit_events"
+    ? core.db.all<Record<string, unknown>>(`SELECT * FROM audit_events ORDER BY event_id`)
+    : core.db.all<Record<string, unknown>>(`SELECT * FROM "${name.replaceAll('"', '""')}"`)]),
+);
+
+/**
+ * The rollback oracle over full preimages, and the same rule as `expectRolledBack`: every table
+ * byte for byte, and `audit_events` byte for byte up to what it already held, followed by exactly
+ * the delta `allowedAuditDelta` permits and nothing else.
+ */
+const expectDurablyRolledBack = (
+  core: CoreHarness,
+  before: Record<string, Record<string, unknown>[]>,
+  refusal: { allowed: boolean; reasonCode: string } | null,
+): void => {
+  const { audit_events: auditBefore = [], ...tablesBefore } = before;
+  const { audit_events: auditAfter = [], ...tablesAfter } = durableSnapshot(core);
+  expect(tablesAfter).toEqual(tablesBefore);
+  expect(auditAfter.slice(0, auditBefore.length)).toEqual(auditBefore);
+  expect(auditAfter.slice(auditBefore.length).map(({ kind, reason_code }) => ({ kind, reason_code })))
+    .toEqual(allowedAuditDelta(refusal));
+};
 
 describe("same-live successor transaction", () => {
   it("same-live recovery concurrent claims have exactly one winner", async () => {
@@ -378,10 +420,12 @@ describe("same-live successor transaction", () => {
         }),
       ];
       try {
+        // A claim that throws hands back no decision, so the only delta it is allowed is none.
+        let refused: Decision<unknown> | null = null;
         if (stage === "create") await expect(subject.claim(request)).rejects.toThrow("after real create");
-        else expect((await subject.claim(request)).allowed).toBe(false);
+        else { refused = await subject.claim(request); expect(refused.allowed).toBe(false); }
         expect(invoked).toBe(true);
-        expect(durableSnapshot(core)).toEqual(before);
+        expectDurablyRolledBack(core, before, refused);
       } finally { spies.forEach((spy) => spy.mockRestore()); }
       expect((await subject.claim(request)).allowed).toBe(true);
       expect(core.db.all(`SELECT * FROM outbox`)).toEqual(envelopeBefore);
@@ -419,8 +463,9 @@ describe("same-live successor transaction", () => {
         [first.sessionId, core.sessions.require(first.sessionId).incarnation, bound.value.assignmentId]);
       }
       const before = durableSnapshot(core);
-      expect((await subject.claim(request)).allowed).toBe(false);
-      expect(durableSnapshot(core)).toEqual(before);
+      const refused = await subject.claim(request);
+      expect(refused.allowed).toBe(false);
+      expectDurablyRolledBack(core, before, refused);
     },
   );
 
@@ -458,8 +503,9 @@ describe("same-live successor transaction", () => {
         [projectId, first.sessionId, core.sessions.require(first.sessionId).incarnation, roleKey, core.clock.nowIso()],
       );
       const before = durableSnapshot(core);
-      expect((await subject.claim(request)).allowed).toBe(false);
-      expect(durableSnapshot(core)).toEqual(before);
+      const refused = await subject.claim(request);
+      expect(refused.allowed).toBe(false);
+      expectDurablyRolledBack(core, before, refused);
     },
   );
 });
@@ -855,8 +901,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     // once each, inside the same committed transaction — the full footprint the refusal oracle
     // below (`ROLLBACK_TABLES`) proves is absent on any denial — plus the one admission row
     // `claim()` records on its way out. `audit_events` is append-only and ordered by insertion,
-    // and nothing before this claim was a decision row, so skipping `before.audit_events` rows
-    // isolates exactly what `claim()` itself wrote.
+    // so skipping `before.audit_events` rows isolates exactly what `claim()` itself wrote.
     const auditKinds = core.db
       .all<{ kind: string }>(`SELECT kind FROM audit_events ORDER BY event_id LIMIT -1 OFFSET ?`, [
         before.audit_events ?? 0,
@@ -870,7 +915,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       "SESSION_CREATED",
       "SESSION_LIFECYCLE",
     ]);
-    expect(after.audit_events).toBe((before.audit_events ?? 0) + 4);
+    expect(after.audit_events).toBe((before.audit_events ?? 0) + 5);
   });
 
   it("clause 1 — a caller-supplied session UUID is checked against the derived one, never substituted", async () => {
@@ -892,7 +937,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(result.reasonCode).toBe(ReasonCode.CONFLICT);
     expect(result.message).toContain("does not match the independently derived identity");
     expect(result.evidence).toMatchObject({ claimed: OTHER, derived: CANON });
-    expect(rowCounts(core)).toEqual(before);
+    expectRolledBack(core, before, result);
   });
 
   it("clause 1 — a caller-supplied pid is checked against the derived ancestor pid", async () => {
@@ -908,7 +953,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     if (result.allowed) return;
     expect(result.reasonCode).toBe(ReasonCode.CONFLICT);
     expect(result.message).toContain("claimed pid does not match");
-    expect(rowCounts(core)).toEqual(before);
+    expectRolledBack(core, before, result);
   });
 
   it(
@@ -943,7 +988,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       // denial happens at clause 1's derivation — strictly before `#mutate` ever opens a
       // transaction, before the async Buzz-address resolution, and before the owner approval
       // this request carried is ever presented for consumption.
-      expect(rowCounts(core)).toEqual(before);
+      expectRolledBack(core, before, result);
 
       // The very same approval, presented again by the real claimant (a directly executed
       // `claude` binary, this file's default chain), must still succeed. If the attack attempt
@@ -984,7 +1029,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       // clause 1's derivation, strictly before `#mutate` ever opens a transaction, before the
       // async Buzz-address resolution, and before the owner approval this request carried is ever
       // presented for consumption.
-      expect(rowCounts(core)).toEqual(before);
+      expectRolledBack(core, before, result);
 
       // The very same approval, presented again by the real claimant (this file's default,
       // unambiguous chain), must still succeed — the conflicting-selector attempt above consumed
@@ -1018,7 +1063,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       if (result.allowed) return;
       expect(result.reasonCode).toBe(ReasonCode.NOT_FOUND);
       expect(result.message).toContain("names no session id");
-      expect(rowCounts(core)).toEqual(before);
+      expectRolledBack(core, before, result);
 
       const legitimateResult = await makeSubject(core, projectId).claim(baseRequest(core, projectId));
       expect(legitimateResult.allowed, JSON.stringify(legitimateResult)).toBe(true);
@@ -1037,7 +1082,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
     expect(result.message).toContain("process start time could not be established");
-    expect(rowCounts(core)).toEqual(before);
+    expectRolledBack(core, before, result);
   });
 
   it(
@@ -1097,7 +1142,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       // Genuinely re-verified, not a single check reused across all four checkpoints: at least
       // one re-check after the original derivation read actually ran.
       expect(claudePidReads).toBeGreaterThan(1);
-      expect(rowCounts(core)).toEqual(before);
+      expectRolledBack(core, before, result);
     },
   );
 
@@ -1118,7 +1163,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
     expect(result.message).toContain("not an interactive CLI invocation");
-    expect(rowCounts(core)).toEqual(before);
+    expectRolledBack(core, before, result);
   });
 
   it(
@@ -1154,7 +1199,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       expect(result.message).toContain("working directory could not be read");
       expect(result.message).not.toContain("does not match");
       expect(result.evidence).toMatchObject({ pid: 10 });
-      expect(rowCounts(core)).toEqual(before);
+      expectRolledBack(core, before, result);
     },
   );
 
@@ -1236,7 +1281,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       expect(result.reasonCode).toBe(ReasonCode.PROBE_FAILED);
       expect(result.message).toContain("executing image could not be scanned");
       expect(result.evidence).toMatchObject({ pid: 10, probe: "lsof", probeFailure: TIMED_OUT_SCAN });
-      expect(rowCounts(core)).toEqual(before);
+      expectRolledBack(core, before, result);
     },
   );
 
@@ -1252,7 +1297,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
     expect(result.message).toContain("peer protocol version");
-    expect(rowCounts(core)).toEqual(before);
+    expectRolledBack(core, before, result);
   });
 
   it("clause 2 — target version exactly the configured required version, from the executing image, not any other observed version", async () => {
@@ -1272,7 +1317,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       observedVersion,
       requiredVersion: TEST_REQUIRED_EXECUTOR_VERSION,
     });
-    expect(rowCounts(core)).toEqual(before);
+    expectRolledBack(core, before, result);
   });
 
   it(
@@ -1300,7 +1345,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       expect(result.allowed).toBe(false);
       if (result.allowed) return;
       expect(result.message).toContain("not at the expected realpath");
-      expect(rowCounts(core)).toEqual(before);
+      expectRolledBack(core, before, result);
     },
   );
 
@@ -1327,7 +1372,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       expect(result.allowed).toBe(false);
       if (result.allowed) return;
       expect(result.message).toContain("does not hash to the expected sha256");
-      expect(rowCounts(core)).toEqual(before);
+      expectRolledBack(core, before, result);
     },
   );
 
@@ -1343,7 +1388,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
     expect(result.message).toContain("executing image could not be resolved");
-    expect(rowCounts(core)).toEqual(before);
+    expectRolledBack(core, before, result);
   });
 
   it("clause 2 — the transcript must exist on disk", async () => {
@@ -1359,7 +1404,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     if (result.allowed) return;
     expect(result.reasonCode).toBe(ReasonCode.NOT_FOUND);
     expect(result.message).toContain("no transcript exists");
-    expect(rowCounts(core)).toEqual(before);
+    expectRolledBack(core, before, result);
   });
 
   it("clause 2 — the connected peer identity must match the deployment's expectation", async () => {
@@ -1374,7 +1419,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
     expect(result.message).toContain("connected peer identity");
-    expect(rowCounts(core)).toEqual(before);
+    expectRolledBack(core, before, result);
   });
 
   it("the buzz channel is the configured one and is load-bearing in the attestation, not a request field to get wrong", async () => {
@@ -1417,7 +1462,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
     expect(result.message).toContain("only a canonical session may be adopted");
-    expect(rowCounts(core)).toEqual(before);
+    expectRolledBack(core, before, result);
   });
 
   it("clause 4 — the pin is membership, not the first entry: a second configured session is adopted on its own project", async () => {
@@ -1485,7 +1530,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(result.reasonCode).toBe(ReasonCode.CONFLICT);
     expect(result.message).toContain("not the canonical CTO for the requested project");
     expect(result.evidence).toMatchObject({ observed: other, entitled });
-    expect(rowCounts(core)).toEqual(before);
+    expectRolledBack(core, before, result);
 
     // The control: the same subject, same process, same everything but the project, succeeds — so
     // the refusal above is attributable to the entitlement and not to a broken fixture.
@@ -1531,7 +1576,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     // `bindings.bind()` denied. If the outer transaction were `db.tx` instead of `db.txDecision`
     // (see the "atomicity" describe block below for the mutation that proves this), that second
     // session row would have been committed anyway. Reading the return value alone cannot see it.
-    expect(rowCounts(core)).toEqual(afterFirst);
+    expectRolledBack(core, afterFirst, second);
   });
 
   it("same-live recovery replaces the runtime while preserving the live actor", async () => {
@@ -1589,8 +1634,9 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(after.actor_target_bindings).toBe(before.actor_target_bindings);
     expect(after.assignments).toBe(before.assignments + 1);
     expect(after.actor_target_attestations).toBe(before.actor_target_attestations + 1);
-    expect((await subject.claim(request)).allowed).toBe(false);
-    expect(rowCounts(core)).toEqual(after);
+    const replayed = await subject.claim(request);
+    expect(replayed.allowed).toBe(false);
+    expectRolledBack(core, after, replayed);
   });
 
   /**
@@ -1725,7 +1771,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     if (refused.allowed) return;
     expect(refused.reasonCode).toBe(ReasonCode.BINDING_ALREADY_ACTIVE);
     // Including the predecessor's lifecycle: the reconciliation rolls back with the refusal.
-    expect(durableSnapshot(core)).toEqual(before);
+    expectDurablyRolledBack(core, before, refused);
   });
 
   /**
@@ -1775,7 +1821,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     // The same-live branch is what answered; an unreadable token did not route this to the
     // abandoned-runtime path and then refuse for some unrelated reason further down.
     expect(refused.message).toBe("same-live recovery requires the exact idle revoked runtime");
-    expect(durableSnapshot(core)).toEqual(before);
+    expectDurablyRolledBack(core, before, refused);
     expect(core.sessions.require(predecessor.sessionId).lifecycle).toBe(SessionLifecycle.READY);
   });
 
@@ -1852,7 +1898,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(refused.allowed).toBe(false);
     if (refused.allowed) return;
     expect(refused.reasonCode).toBe(ReasonCode.CONFLICT);
-    expect(durableSnapshot(core)).toEqual(before);
+    expectDurablyRolledBack(core, before, refused);
   });
 
   it("clause 4 restore — the same external session, reclaimed after a revoke, reuses the actor and target binding rather than minting a second owner", async () => {
@@ -1938,7 +1984,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
     expect(result.reasonCode).toBe(ReasonCode.PROBE_FAILED);
-    expect(rowCounts(core)).toEqual(before);
+    expectRolledBack(core, before, result);
   });
 
   it("an unauthenticated buzz actor id refuses with zero additional rows, even after the session was created", async () => {
@@ -1953,7 +1999,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
     expect(result.reasonCode).toBe(ReasonCode.SESSION_BUZZ_ACTOR_NOT_AUTHENTICATED);
-    expect(rowCounts(core)).toEqual(before);
+    expectRolledBack(core, before, result);
   });
 
 
@@ -1973,9 +2019,9 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
 
 describe("every decision claim() hands back leaves exactly one audit row", () => {
   // The defect this pins: the primitive that adopts a running session wrote nothing to
-  // `audit_events`, so a claim refused for weeks left no row saying so. Each case below counts the
-  // whole table as well as the decision rows, so a second row, a missing row, or a row the
-  // rolled-back mutation should not have left are all failures.
+  // `audit_events`, so a claim refused for weeks left no row saying so. Each case below reads the
+  // decision rows back exactly, so a second row or a missing one fails; the refusal cases that
+  // count the whole table as well also fail on a row the rolled-back mutation should not have left.
 
   it("a refusal of an unconfigured session leaves exactly one audit row carrying its reason code", async () => {
     const core = makeCore();
@@ -2079,6 +2125,107 @@ describe("every decision claim() hands back leaves exactly one audit row", () =>
       kind: "CANONICAL_SELF_CLAIM_REFUSED", reason_code: ReasonCode.NOT_FOUND, project_id: projectId,
     })]);
     expect(auditTotal(core)).toBe(totalBefore + 1);
+  });
+
+  // The request, the configured entry and the committed binding are three candidate sources for an
+  // admission row's project and role key, and in an ordinary admission all three agree — so a row
+  // built from the request cannot be told apart from one built from the binding. They disagree
+  // only if the request changes under the claim, and `request` is the caller's object. Here the
+  // first read, the one `claim()` snapshots as what was asked, names one registered project; every
+  // read `#decide` makes before the Buzz await names the entitled one, so the claim is admitted on
+  // the entitlement; and every read after that await names a third. The row must name the entitled
+  // project whichever of the other two a regression reaches for, which is why there are two.
+  it("an admission row names the project and role key the binding committed, not any the request carried", async () => {
+    const core = makeCore();
+    const entitled = "prj_audit_entitled";
+    const snapshotted = "prj_audit_snapshotted_from_the_request";
+    const afterAwait = "prj_audit_read_from_the_request_after_the_await";
+    for (const projectId of [entitled, snapshotted, afterAwait]) insertProject(core, projectId);
+    const request = baseRequest(core, entitled);
+    let current = entitled;
+    let reads = 0;
+    Object.defineProperty(request, "projectId", {
+      enumerable: true,
+      get: () => (reads++ === 0 ? snapshotted : current),
+    });
+    const subject = makeSubject(core, entitled, {
+      resolveBuzzAddress: async () => {
+        current = afterAwait;
+        return allow(ReasonCode.OK, BUZZ_ADDRESS);
+      },
+    });
+
+    const result = await subject.claim(request);
+
+    expect(result.allowed, JSON.stringify(result)).toBe(true);
+    if (!result.allowed) return;
+    expect(result.value.binding.projectId).toBe(entitled);
+    // The fixture did what it says: the request did name all three, in that order.
+    expect(reads).toBeGreaterThan(1);
+    expect(request.projectId).toBe(afterAwait);
+    expect(claimDecisionRows(core)).toEqual([{
+      kind: "CANONICAL_SELF_CLAIM_ADMITTED",
+      reason_code: ReasonCode.OK,
+      project_id: entitled,
+      session_id: result.value.sessionId,
+      role_key: roleKeyFor(Role.PRIMARY_CTO, { projectId: entitled }),
+      evidence: { identity: CANON, generation: 1 },
+    }]);
+  });
+
+  // ACP-REVIEW-01. The operator accepts any nonempty string as `projectId`, so before this bound a
+  // refusal copied caller text straight into a durable column `AuditLog.record` does not redact.
+  // The token is assembled here rather than written out, so this file holds the shape of a
+  // credential and nothing a scanner or a reader could take for one.
+  it("a refusal naming a project the registry does not hold records a null project and keeps its reason code", async () => {
+    const core = makeCore();
+    const registered = "prj_audit_registered";
+    insertProject(core, registered);
+    const subject = makeSubject(core, registered);
+    const privatePath = "/private/transcripts/session.txt";
+    const token = ["Bearer", "fixture".padEnd(40, "0")].join(" ");
+    const unregistered = `${privatePath} ${token}`;
+    const totalBefore = auditTotal(core);
+
+    const result = await subject.claim(baseRequest(core, unregistered, { expectedBindingGeneration: 0 }));
+
+    expect(result.allowed).toBe(false);
+    if (result.allowed) return;
+    expect(result.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
+    expect(claimDecisionRows(core)).toEqual([{
+      kind: "CANONICAL_SELF_CLAIM_REFUSED",
+      reason_code: ReasonCode.INVALID_ARGUMENT,
+      project_id: null,
+      session_id: null,
+      role_key: null,
+      evidence: { identity: CANON },
+    }]);
+    expect(auditTotal(core)).toBe(totalBefore + 1);
+    const everyAuditRow = JSON.stringify(core.db.all(`SELECT * FROM audit_events`));
+    expect(everyAuditRow).not.toContain(privatePath);
+    expect(everyAuditRow).not.toContain(token);
+  });
+
+  it("a registry lookup that fails records a null project and changes nothing about the decision", async () => {
+    const core = makeCore();
+    const projectId = "prj_audit_lookup_fails";
+    insertProject(core, projectId);
+    const subject = makeSubject(core, projectId);
+    const get = core.db.get.bind(core.db);
+    const spy = vi.spyOn(core.db, "get").mockImplementation(((sql: string, params?: unknown[]) => {
+      if (sql.includes("FROM projects")) throw new Error("injected projects lookup failure");
+      return get(sql, params);
+    }) as typeof core.db.get);
+
+    let result: Decision<unknown>;
+    try {
+      result = await subject.claim(baseRequest(core, projectId, { expectedBindingGeneration: 0 }));
+    } finally { spy.mockRestore(); }
+
+    expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.INVALID_ARGUMENT });
+    expect(claimDecisionRows(core)).toEqual([expect.objectContaining({
+      kind: "CANONICAL_SELF_CLAIM_REFUSED", reason_code: ReasonCode.INVALID_ARGUMENT, project_id: null,
+    })]);
   });
 });
 
