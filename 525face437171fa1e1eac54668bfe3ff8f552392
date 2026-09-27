@@ -1,0 +1,50 @@
+Limit: A provider's updater deletes the version directory a pin names: any pin taken at the canonical target stops naming anything within days of every install, which is the condition that produced this failure.
+Limit: Node's spawn message, quoted at the end of the new sentence, repeats both the errno and the path, so a naive toContain on either is satisfied without the composed clause.
+Limit: The interactive empty-output sentence at usage-collectors.ts:1174-1187 still names a PATH cause it does not measure; no existing positive test covers that message.
+Ruled-out: inferring the spawn failure from stderr string content | a CLI may legitimately print the word ENOENT to stderr, and a string match would then invent a spawn failure that never happened
+Ruled-out: correcting the interactive empty-output sentence in this unit | correcting it was decided against here because it would need a new fixture
+Warn: Assert the errno and the path against the clause the collector composes, never against the whole sentence: the quoted spawn message repeats both. The assertions were retargeted at the composed clause for that reason.
+Warn: The interactive runner was checked and NOT changed: UsageTerminalResult already carries a distinct error field and the caller branches on result.error at :423 before parsing, so the fold does not happen there.
+Blast: module
+Undo: easy
+Certainty: firm
+Unverified: The interactive empty-output message has no positive test. The only test mentioning that message is expect(trailing.error).not.toContain, a negative assertion about a different scenario.
+Record-Id: r-bcf9cce83d75
+Provenance: inherited f78b2327e933be5704d01f053699d0be1b4d04bd
+
+Limit: CapacityMonitor.refresh routes an explicitly named role-scoped provider to ambiguous and returns unknownCapacity, so the live role-scoped claude never reaches the CAPACITY_PROBE row and CAPACITY_ROLE_PROBE is its only durable record.
+Limit: The telemetry path has no allowlist and no length refusal (redact only), so its collectorError dims key is not subject to the rule that forced the audit rename.
+Limit: capacity.observe ends by running the continuity evaluation, which re-probes every provider; under a ManualClock that probe shares the observation's observed_at and persist deletes by (provider, observed_at), so the observation is erased by the evaluation it just triggered.
+Ruled-out: renaming the telemetry dims key alongside the audit key | the telemetry path calls redact only, with no allowlist and no length refusal, so its collectorError name was deliberately left alone
+Ruled-out: keeping the round-1 claim that the interactive message had no positive test | a test asserts toContain("PATH") on it, and my round-1 grep searched only for other phrases and missed it
+Warn: measured.error is not narrowed on the role path: RoleProviderCapacity extends CapacityReading and enrich spreads ...input, so measured.error is the collector's own sentence and nothing had to be reconstructed at that layer.
+Warn: Assertions on the composed sentence cannot see the stderr fold return. Lane B set spawnError AND stderr together and that left all six sentence assertions passing, so the sentence tests alone could not see the fold being reintroduced.
+Warn: The collector sentence says "configured", not "pinned": with no ACP_CLAUDE_BINARY and the CLI absent from PATH resolveExecutable returns the bare name, and "pinned" would name a pin that does not exist.
+Blast: module
+Undo: easy
+Certainty: firm
+Unverified: The MAX(observed_at) tie-break is unaddressed: current() then takes the first row of a MAX(observed_at) tie, which is SQLite row order, not a rule.
+Record-Id: r-08277cabbc15
+Supersedes: r-bcf9cce83d75
+Provenance: inherited b881615923dc0ebc429a9ef644d7dbea6fdcc75d
+
+Limit: CapacityMonitor.refresh routes an explicitly named role-scoped provider to ambiguous and returns unknownCapacity, so the live role-scoped claude never reaches the CAPACITY_PROBE row and CAPACITY_ROLE_PROBE is its only durable record.
+Limit: The telemetry path has no allowlist and no length refusal (redact only), so its collectorError dims key is not subject to the rule that forced the audit rename.
+Limit: capacity.observe ends by running the continuity evaluation, which re-probes every provider; under a ManualClock that probe shares the observation's observed_at and persist deletes by (provider, observed_at), so the observation is erased by the evaluation it just triggered.
+Limit: The preserved-observation path writes one collector sentence under two names: audit_events.evidence_json.error and telemetry_metrics.dims_json.collectorError. No reader depends on either name and the telemetry path has no allowlist forcing them to agree, so nothing in this repository would notice them diverging further.
+Limit: The catch that handles a synchronous spawn throw does not classify the cause. The errno survives only inside Node's quoted message, so a consumer wanting ENOTDIR as a value rather than as text has to parse it out; there is no spawnError on this path to read it from.
+Ruled-out: renaming the telemetry dims key alongside the audit key | the telemetry path calls redact only, with no allowlist and no length refusal, so its collectorError name was deliberately left alone
+Ruled-out: keeping the round-1 claim that the interactive message had no positive test | a test asserts toContain("PATH") on it, and my round-1 grep searched only for other phrases and missed it
+Ruled-out: the MAX(observed_at) tie-break this record's predecessor called an unaddressed hazard | persist holds the repository's only capacity_snapshots inserts and deletes every row for (provider, observed_at) inside one transaction first, so literal ties span only the buckets of a single reading, whose rows agree on the source, timestamp and health metadata current() reads from rows[0]; row order cannot select between conflicting observations, and the erasure the Limit already names is the whole hazard
+Ruled-out: padding an empty configured binary with a placeholder in the synchronous-throw sentence | the sentence renders it as a gap, and substituting a stand-in would be this layer deciding what an empty value means, which is the same inference the repair refuses to make about the errno
+Warn: spawn reaches its error event only when the attempt gets far enough to have a child to emit on. An argument rejected before any syscall (ERR_INVALID_ARG_VALUE, from an empty binary) and an errno returned to the caller (ENOTDIR, from a path whose parent is a regular file) both throw synchronously - measured on Node 24.18.0 and on v22.23.2 - so a guard written only against the spawnError field misses both.
+Warn: measured.error is not narrowed on the role path: RoleProviderCapacity extends CapacityReading and enrich spreads ...input, so measured.error is the collector's own sentence and nothing had to be reconstructed at that layer.
+Warn: Assertions on the composed sentence cannot see the stderr fold return. Lane B set spawnError AND stderr together and that left all six sentence assertions passing, so the sentence tests alone could not see the fold being reintroduced.
+Warn: The collector sentence says "configured", not "pinned": with no ACP_CLAUDE_BINARY and the CLI absent from PATH resolveExecutable returns the bare name, and "pinned" would name a pin that does not exist.
+Warn: better-sqlite3 in this worktree is built for NODE_MODULE_VERSION 137. Running the suite under the v22.23.2 node that sits on PATH fails 49 tests with an ABI mismatch that is about the toolchain and not about any change; every figure reported for this work is from Node 24.18.0.
+Blast: module
+Undo: easy
+Certainty: firm
+Record-Id: r-a37786d2567f
+Supersedes: r-08277cabbc15
+Provenance: inherited 8ff378eaef4968e26d84f8790db5522399d07da9
