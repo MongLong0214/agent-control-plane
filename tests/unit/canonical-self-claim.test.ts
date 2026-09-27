@@ -564,6 +564,49 @@ describe("deployment identity is required, deployment-private configuration (#76
     expect(result.value.binding.roleKey).not.toContain("may_not_hold");
   });
 
+  /**
+   * The twin of the case above, at generation 2, because the role key the transaction assembles
+   * decides one thing the binding row does not carry back: which role key's MAX(binding_generation)
+   * the expected generation is counted against. At generation 1 the entitled key and a foreign key
+   * both count zero assignments, so a role key naming the wrong project agrees by accident and the
+   * case above cannot see it — its mutant survives. Here the entitled key already holds one revoked
+   * generation and the foreign key holds none, so a request expecting 2 is admitted only if the
+   * count was taken against the entitlement rather than against the request the await let move.
+   */
+  it("counts the expected generation against the entitled project's role key, not the request's", async () => {
+    const core = makeCore();
+    insertProject(core, CONFIG_PROJECT);
+    const first = await makeSubject(core, CONFIG_PROJECT).claim(baseRequest(core, CONFIG_PROJECT));
+    expect(first.allowed, JSON.stringify(first)).toBe(true);
+    if (!first.allowed) return;
+    const predecessor = core.sessions.require(first.value.sessionId);
+    expect(
+      core.bindings.revoke(roleKeyFor(Role.PRIMARY_CTO, { projectId: CONFIG_PROJECT }), "lost attachment").allowed,
+    ).toBe(true);
+
+    const restarted = [
+      standardChain()[0]!,
+      { ...standardChain()[1]!, ppid: 11 },
+      claudeAncestor({ pid: 11, startedAt: "Fri Jan  1 02:00:00 2027" }),
+    ];
+    expect(chainInspector(restarted).snapshot(predecessor.osPid!)).toBeNull();
+
+    const request = baseRequest(core, CONFIG_PROJECT, { expectedBindingGeneration: 2 });
+    const claimed = await makeSubject(core, CONFIG_PROJECT, {
+      chain: restarted,
+      resolveBuzzAddress: async () => {
+        (request as { projectId: string }).projectId = "prj_a_project_this_session_may_not_hold";
+        return allow(ReasonCode.OK, BUZZ_ADDRESS);
+      },
+    }).claim(request);
+
+    expect(claimed.allowed, JSON.stringify(claimed)).toBe(true);
+    if (!claimed.allowed) return;
+    expect(claimed.value.binding.bindingGeneration).toBe(2);
+    expect(claimed.value.binding.roleKey).toContain(CONFIG_PROJECT);
+    expect(claimed.value.binding.roleKey).not.toContain("may_not_hold");
+  });
+
   it("never falls back to a hardcoded real value — no exported real-ID constant exists to fall back to", () => {
     // No exported real-ID constant exists for this module to fall back to (#760): every value the
     // primitive uses must come from the config this test constructs, never from a module-level

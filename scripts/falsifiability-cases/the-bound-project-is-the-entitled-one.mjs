@@ -14,7 +14,11 @@ const c = {
   find: "      const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId: entry.projectId });",
   replace: "      const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId: request.projectId });",
   killedBy: [
-    "tests/unit/canonical-self-claim.test.ts::binds the entitled project even when the request's projectId is mutated during the buzz await",
+    // Not the generation-1 await case: this site's only effect the receipt does not carry back is
+    // which role key the expected generation is counted against, and at generation 1 the entitled
+    // and the foreign key both count zero, so that case's mutant survives (measured). The witness
+    // has to be the one where the two keys disagree.
+    "tests/unit/canonical-self-claim.test.ts::counts the expected generation against the entitled project",
   ],
 };
 export default c;
