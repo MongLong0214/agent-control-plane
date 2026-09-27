@@ -318,6 +318,100 @@ describe("capacity sensor honesty (§14.2)", () => {
     expect(current.operatorObservation).toBeUndefined();
     expect(cp.capacity.isRoutableFor(current, "cto")).toBe(false);
   });
+
+  it("#954: a preserved observation records the collector's sentence at the length a real pin gives it", async () => {
+    // The sibling branch to the one above: inside the stale grace the operator's observation is
+    // kept, and the failed collector reading is recorded rather than persisted. That row is the
+    // only place the reason survives on this path, and it is reached exactly when an operator ran
+    // `agentctl capacity observe` because the sensor was broken.
+    //
+    // The evidence key used to be `collectorError`, which is NOT in `AUDIT_EVIDENCE_KEYS`. An
+    // unknown key's value is admitted only if it is at most 200 characters, and the #954 sentence
+    // naming an absolute versioned pin is longer than that — so `AuditLog.record` refused the
+    // whole evidence and stored TRUSTED_CREDENTIAL_LEAK_BLOCKED with `auditEvidenceRejected`.
+    // A credential leak that never happened, in place of the cause.
+    const { cp, clock, gpt } = makePlane();
+    // Reaching this branch needs `current()` to be the observation, and one thing fights that.
+    // `observe` ends by running the continuity evaluation, which re-probes every provider; under
+    // a ManualClock that probe lands on the SAME observed_at, and `persist` deletes by
+    // (provider, observed_at) before inserting — so the observation is erased by the evaluation
+    // it just triggered.
+    //
+    // The replacement is the whole of it; row order is not involved. An earlier draft of this
+    // comment said `current()` picks the first row of a MAX(observed_at) tie, and that is wrong
+    // in a way worth stating: literal ties do occur, but only across the buckets of one reading,
+    // and those rows share the source, timestamp and health metadata `current()` reads. Row order
+    // therefore cannot choose between two conflicting observations — `persist` has already
+    // deleted one of them. Reading that draft sends the next person hunting an ordering bug that
+    // cannot exist, instead of at the delete-then-insert that actually erases the row.
+    //
+    // Pinning the adapter's reading to an earlier instant keeps that re-probe strictly older, so
+    // the observation stays the current row. Without this the test passed against the broken
+    // code, its sentence assertion satisfied by the ordinary `CAPACITY_PROBE` row instead.
+    gpt.setCapacity({
+      provider: "gpt",
+      sensorHealth: "HEALTHY",
+      runtimeHealth: "HEALTHY",
+      observedAt: clock.nowIso(),
+      source: "scripted-before-the-observation",
+      buckets: [{ id: "scripted-bucket", remainingPercent: 100, resetAt: null, capabilities: FULL }],
+    });
+    clock.advance(1_000);
+    const observed = await cp.capacity.observe({
+      provider: "gpt",
+      observedAt: clock.nowIso(),
+      runtimeHealth: "HEALTHY",
+      actor: "fixture-operator",
+      source: AGENTCTL_CAPACITY_OBSERVATION_SOURCE,
+      buckets: [{ id: "fixture-window", remainingPercent: FIXTURE_OBSERVED_REMAINING_PERCENT, resetAt: null, capabilities: FULL }],
+    });
+    expect(observed).toMatchObject({ allowed: true });
+
+    // A real versioned pin, which is what the updater deletes and what #954 actually carried.
+    const pin = "/Users/acp/.local/share/claude/versions/2.1.233-20260921T044118/cli.js";
+    const sentence =
+      "non-interactive /usage never started: the operating system could not spawn the configured CLI at "
+      + `${pin} (ENOENT: spawn ${pin} ENOENT)`;
+    // The boundary this test exists for. If a later edit shortens the sentence below 200 the
+    // refusal stops being reachable and this test would pass without exercising anything.
+    expect(sentence.length).toBeGreaterThan(200);
+
+    // Well inside staleGraceMs (15 min), so the observation is preserved and this is the branch.
+    clock.advance(60 * 1000);
+    gpt.setCapacity({
+      provider: "gpt",
+      sensorHealth: "ERROR",
+      runtimeHealth: "HEALTHY",
+      observedAt: clock.nowIso(),
+      source: "fixture-collector-error",
+      error: sentence,
+      buckets: [],
+    });
+    await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["gpt"]);
+
+    // Read back from the stored row. An assertion on the object handed to `AuditLog.record`
+    // cannot see a refusal that happens inside it — that is the whole defect.
+    const rows = cp.db.all<{ reason_code: string; evidence_json: string }>(
+      `SELECT reason_code, evidence_json FROM audit_events WHERE kind = 'CAPACITY_PROBE' ORDER BY event_id`,
+    ).map((row) => ({
+      reasonCode: row.reason_code,
+      evidence: JSON.parse(row.evidence_json) as Record<string, unknown>,
+    }));
+    // No row may be a refusal. In the defect that is the whole stored result: every key is
+    // dropped and replaced by `auditEvidenceRejected`, so the discriminating `outcome` key below
+    // is gone too and cannot be used to find the row first.
+    expect(rows.filter((row) => row.evidence["auditEvidenceRejected"] === true)).toEqual([]);
+    // Identified by the marker only this branch writes. Without it the ordinary probe row — which
+    // already used the allowlisted `error` key — satisfies the sentence assertion on its own.
+    const preservedRow = rows.find(
+      (row) => row.evidence["outcome"] === "collector error did not replace a current operator observation",
+    );
+    expect(preservedRow, "the preserved-observation branch must leave a row of its own").toBeDefined();
+    expect(preservedRow?.reasonCode).toBe(ReasonCode.PROBE_FAILED);
+    expect(preservedRow?.evidence["error"]).toBe(sentence);
+    // The observation really was preserved, so this test is standing in the branch it names.
+    expect(cp.capacity.current("gpt")?.operatorObservation).toBeDefined();
+  });
 });
 
 describe("completion requires a current continuity mode (§15.6)", () => {

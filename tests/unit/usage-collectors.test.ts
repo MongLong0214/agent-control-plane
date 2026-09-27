@@ -22,6 +22,7 @@ import {
 import {
   CLAUDE_NON_INTERACTIVE_ARGS,
   ClaudeUsageCollector,
+  SpawnNonInteractiveUsageProbe,
   parseNonInteractiveUsage,
   parseResetWallClock,
   CodexUsageCollector,
@@ -271,6 +272,92 @@ describe("non-interactive account usage (#582)", () => {
     // that made the terminal parser wrong fifteen times.
     expect(reading.sensorHealth).toBe("ERROR");
     expect(reading.error).toContain("repeated a quota-window label");
+  });
+
+  it("#954 names the CLI that never started, instead of reporting it as a process that exited", async () => {
+    // The pin pointed at a version directory the Claude auto-updater had deleted. The spawn
+    // failed with ENOENT, which `SpawnNonInteractiveUsageProbe` resolves rather than throws, so
+    // the collector's try/catch never fired; `code === null` then reached the exit branch and the
+    // daemon recorded "non-interactive /usage exited on a signal" — a sentence describing a
+    // process that started and died — every three minutes for four and a half hours. The path it
+    // had tried was folded into `stderr`, hashed into the digest, and appeared nowhere a reader
+    // could reach it.
+    //
+    // Drives the shipped probe, not an injected one: a fake handing back a hand-built spawn
+    // failure would pass whether or not the probe itself keeps the two events apart.
+    const deletedByTheUpdater = resolve("node_modules/.acp-954-version-the-updater-deleted/bin/claude");
+    expect(existsSync(deletedByTheUpdater)).toBe(false);
+
+    const reading = await new ClaudeUsageCollector({ clock: clock(), binary: deletedByTheUpdater }).collect();
+
+    expect(reading.sensorHealth).toBe("ERROR");
+    expect(reading.buckets).toEqual([]);
+    // Measured, not assumed: the sentence quotes Node's own spawn message at the end, and that
+    // message repeats BOTH the errno and the path. So `toContain(deletedByTheUpdater)` and
+    // `toContain("ENOENT")` are each satisfied by the quoted clause alone and would stay green if
+    // the clause this collector composes dropped them — the "asks about something its subject
+    // merely appears in" shape. Both are therefore asserted against the composed clause, which
+    // holds them in an order the quoted message never produces.
+    expect(reading.error).toContain("never started");
+    expect(reading.error).toContain(`could not spawn the configured CLI at ${deletedByTheUpdater} (`);
+    expect(reading.error).toContain(`(ENOENT: `);
+    // The sentence this replaces is still the right one for a real exit, so it remains in the
+    // source at the `outcome.code !== 0` branch — this asserts it is not reached here, not that
+    // it is gone.
+    expect(reading.error).not.toContain("exited on a signal");
+  });
+
+  it("#954 leaves stderr empty when the spawn failed, which is the other half of distinguishable", async () => {
+    // The collector-level test above cannot see this. A probe that set `spawnError` AND ALSO
+    // returned the spawn message as `stderr` passes every assertion on the composed sentence,
+    // while putting the failure back into `raw` and therefore into the raw-output digest — the
+    // exact fold this unit removed, reintroduced beside the fix rather than instead of it.
+    //
+    // So this drives the probe directly and asserts both halves: the failure is present in its
+    // own field, and absent from the field that means "the child said something".
+    const deletedByTheUpdater = resolve("node_modules/.acp-954-version-the-updater-deleted/bin/claude");
+    expect(existsSync(deletedByTheUpdater)).toBe(false);
+
+    const outcome = await new SpawnNonInteractiveUsageProbe(CLAUDE_NON_INTERACTIVE_ARGS)
+      .run({ binary: deletedByTheUpdater, timeoutMs: 5_000 });
+
+    expect(outcome.spawnError?.code).toBe("ENOENT");
+    expect(outcome.spawnError?.message).toContain(deletedByTheUpdater);
+    expect(outcome.stderr).toBe("");
+    expect(outcome.stdout).toBe("");
+    expect(outcome.code).toBeNull();
+  });
+
+  it("#954 names the CLI that was attempted when spawn throws instead of emitting", async () => {
+    // `spawn` does not always reach the `error` event the branch above depends on. Given a binary
+    // whose parent component is a regular file, the attempt returns ENOTDIR to the caller and
+    // `spawn` throws synchronously: the probe's promise rejects, the collector's catch handles
+    // it, and there is no `spawnError` to read. Node's message there is the whole of
+    // `spawn ENOTDIR` — no path, no attempt, nothing an operator can reach a misconfigured
+    // binary with. The same defect this unit was opened for, one layer up from it. An empty
+    // configured binary enters the same catch by the other door, with ERR_INVALID_ARG_VALUE.
+    //
+    // Measured before it was asserted on: the throw is synchronous under Node 24.18.0, which is
+    // the version this suite's native sqlite binding is built for, and under the older Node that
+    // sits on PATH. So this exercises the catch and not the error handler on either. The subject
+    // is built in this process's own temp root rather than taken from /etc, whose contents this
+    // suite must not depend on.
+    const notADirectory = join(tempDir("acp-954-sync-throw-"), "regular-file");
+    writeFileSync(notADirectory, "a regular file, and therefore not usable as a path component");
+    const attempted = join(notADirectory, "acp-954-cli");
+
+    const reading = await new ClaudeUsageCollector({ clock: clock(), binary: attempted }).collect();
+
+    expect(reading.sensorHealth).toBe("ERROR");
+    expect(reading.buckets).toEqual([]);
+    // Unlike the ENOENT case above, no assertion here can be satisfied by the quoted clause
+    // standing in for the composed one: Node's thrown text is `spawn ENOTDIR` and contains
+    // neither the path nor any of the words this collector puts around it.
+    expect(reading.error).toContain(`spawning the configured CLI at ${attempted} threw before any process existed`);
+    // The errno still has to survive, and it arrives only inside the quoted message.
+    expect(reading.error).toContain("ENOTDIR");
+    // What shipped before was Node's sentence and nothing else.
+    expect(reading.error).not.toBe("spawn ENOTDIR");
   });
 
   it("never reads a quota by handling the subscription credential itself", () => {
@@ -842,13 +929,25 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
 
   it("tells a CLI that never launched apart from one that showed the wrong screen", () => {
     // The distinction #564 needed and did not have: three causes arrived as one sentence,
-    // and the one that was actually happening — a binary outside the daemon's PATH, so
-    // nothing started — reads nothing like "output contains no percentage".
+    // and "said nothing at all" reads nothing like "output contains no percentage". That
+    // distinction is what this test is named for, and it still holds.
+    //
+    // What changed in #954: the sentence used to go on and name the #564 cause as though it had
+    // been measured — a CLI outside the daemon's PATH resolving to a bare name. That was the
+    // wrong cause for #954, where an absolute pin named a version directory the provider's
+    // updater had deleted, and this function cannot tell them apart because it receives text,
+    // not a spawn result. A spawn that never happened is now reported by the collector that
+    // spawned. No fixture is needed to reach this branch: the function is exported and defaults
+    // its own digest.
     const silent = parseUsageOutput("claude", "", clock().nowIso());
     expect(silent.ok).toBe(false);
     if (silent.ok) return;
-    expect(silent.error).toContain("produced no output");
-    expect(silent.error).toContain("PATH");
+    expect(silent.error).toContain("produced no output at all");
+    expect(silent.error).toContain("cannot say why it was silent");
+    // The retired hypothesis, in both of its clauses. Checked by grep against the post-change
+    // source rather than trusted from a green negative.
+    expect(silent.error).not.toContain("PATH");
+    expect(silent.error).not.toContain("bare name");
 
     const wrongScreen = parseUsageOutput("claude", "Welcome back\nToken activity: 40%", clock().nowIso());
     expect(wrongScreen.ok).toBe(false);

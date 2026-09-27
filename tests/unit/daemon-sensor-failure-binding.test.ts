@@ -375,6 +375,44 @@ describe("daemon incumbent capacity reconciliation", () => {
     ]);
   });
 
+  /**
+   * #954: that record carried the shape of the reading and not the reason for it.
+   *
+   * On this deployment `claude` is role-scoped, and `CapacityMonitor.refresh` excludes a
+   * role-scoped provider even when a caller names it explicitly — an explicit id goes to
+   * `ambiguous` and returns `unknownCapacity`. So the `CAPACITY_PROBE` row, the one place the
+   * allowlisted `error` key carries a collector's sentence, is never written for `claude`. This
+   * event is its only durable record, and the role snapshot it mirrors dies with the process.
+   *
+   * The sentence is used at the length a real versioned pin gives it, because `error` being
+   * allowlisted is what lets it through `redact` instead of the 200-character refusal an unknown
+   * key would face.
+   */
+  it("#954: a failed role probe records the collector's sentence, not only the shape of the reading", async () => {
+    const { cp, claude, daemon, unread, clock } = makeIncumbent("claude-and-gpt");
+    const pin = "/Users/acp/.local/share/claude/versions/2.1.233-20260921T044118/cli.js";
+    const sentence =
+      "non-interactive /usage never started: the operating system could not spawn the configured CLI at "
+      + `${pin} (ENOENT: spawn ${pin} ENOENT)`;
+    expect(sentence.length).toBeGreaterThan(200);
+    claude.setCapacity({ ...unread, error: sentence, observedAt: clock.nowIso() });
+    cp.providers.registerForRole(claude, Role.PRIMARY_CTO);
+
+    await daemon.reconcileContinuity("a role probe whose CLI never started");
+
+    // Read back from the stored row, never from the object handed to `AuditLog.record`: a refusal
+    // happens inside `record`, so an input-side assertion cannot see one.
+    const recorded = cp.db.all<{ evidence_json: string }>(
+      `SELECT evidence_json FROM audit_events WHERE kind = 'CAPACITY_ROLE_PROBE' ORDER BY event_id`,
+    ).map((row) => JSON.parse(row.evidence_json) as Record<string, unknown>);
+
+    const measured = recorded.find((entry) => entry["provider"] === "claude" && entry["role"] === Role.PRIMARY_CTO);
+    expect(measured, "a role probe that failed must leave a record naming why").toBeDefined();
+    expect(measured?.["sensorHealth"]).toBe("ERROR");
+    expect(measured?.["error"]).toBe(sentence);
+    expect(measured?.["auditEvidenceRejected"]).toBeUndefined();
+  });
+
   it("#954: a live native-identified READY CTO keeps its generation and outbox on a failed role sensor", async () => {
     const token = readProcessStartToken(process.pid);
     expect(token).toMatch(/^darwin-tv:\d+\.\d{6}$/);

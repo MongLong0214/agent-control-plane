@@ -68,6 +68,13 @@ export interface NonInteractiveUsageProbe {
     stderr: string;
     code: number | null;
     timedOut?: boolean;
+    /**
+     * Set only when no process was ever created. A spawn failure and a child that wrote to
+     * stderr are different events, and folding the first into the second leaves `code === null`
+     * as its only trace — indistinguishable from a signal death, and naming neither the errno
+     * nor the path that was tried.
+     */
+    spawnError?: { code?: string; message: string };
   }>;
 }
 
@@ -130,7 +137,16 @@ export const nonInteractiveEnvironment = (): NodeJS.ProcessEnv => ({
 export class SpawnNonInteractiveUsageProbe implements NonInteractiveUsageProbe {
   constructor(private readonly args: readonly string[]) {}
 
-  async run(input: { binary: string; timeoutMs: number }): Promise<{ stdout: string; stderr: string; code: number | null; timedOut: boolean }> {
+  async run(input: { binary: string; timeoutMs: number }): Promise<{
+    stdout: string;
+    stderr: string;
+    code: number | null;
+    timedOut: boolean;
+    // Declared here as well as on the interface. `implements` does not require it — an optional
+    // member is assignable whether or not the class restates it — so a caller holding the class
+    // type rather than the interface was told the field does not exist (TS2339).
+    spawnError?: { code?: string; message: string };
+  }> {
     return new Promise((resolve) => {
       // Detached, so the whole process group can be killed. A grandchild that inherits the pipe
       // keeps `close` from ever firing, and resolving only on `close` means the capacity refresh
@@ -147,7 +163,11 @@ export class SpawnNonInteractiveUsageProbe implements NonInteractiveUsageProbe {
       let stdout = "";
       let stderr = "";
       let settled = false;
-      const finish = (outcome: { code: number | null; timedOut: boolean; error?: string }): void => {
+      const finish = (outcome: {
+        code: number | null;
+        timedOut: boolean;
+        spawnError?: { code?: string; message: string };
+      }): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
@@ -156,13 +176,28 @@ export class SpawnNonInteractiveUsageProbe implements NonInteractiveUsageProbe {
         } catch {
           /* the group is already gone */
         }
-        resolve({ stdout, stderr: stderr || outcome.error || "", code: outcome.code, timedOut: outcome.timedOut });
+        // `stderr` carries what the child wrote, and nothing else. A spawn failure travels in its
+        // own field: folded in here, "the child complained" and "there was never a child" become
+        // one string, and no caller can tell which one it is holding.
+        resolve({
+          stdout,
+          stderr,
+          code: outcome.code,
+          timedOut: outcome.timedOut,
+          ...(outcome.spawnError ? { spawnError: outcome.spawnError } : {}),
+        });
       };
       // Resolve on the timer itself rather than waiting for a close that may never come.
       const timer = setTimeout(() => finish({ code: null, timedOut: true }), input.timeoutMs);
       child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
       child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
-      child.once("error", (error) => finish({ code: null, timedOut: false, error: error.message }));
+      child.once("error", (error: NodeJS.ErrnoException) =>
+        finish({
+          code: null,
+          timedOut: false,
+          spawnError: { ...(error.code === undefined ? {} : { code: error.code }), message: error.message },
+        }),
+      );
       // `exit` fires when the process goes, whether or not a descendant still holds the pipe.
       child.once("exit", (code) => finish({ code, timedOut: false }));
     });
@@ -870,17 +905,36 @@ export class ClaudeUsageCollector extends BaseUsageCollector {
     if (this.claudeOptions.terminal) return super.collect();
 
     const observedAt = this.claudeOptions.clock.nowIso();
-    let outcome: { stdout: string; stderr: string; code: number | null; timedOut?: boolean };
+    let outcome: {
+      stdout: string;
+      stderr: string;
+      code: number | null;
+      timedOut?: boolean;
+      spawnError?: { code?: string; message: string };
+    };
     try {
       outcome = await this.probe.run({ binary: this.claudeOptions.binary, timeoutMs: this.probeTimeoutMs });
     } catch (error) {
+      // `spawn` does not always reach the `error` event. It throws synchronously when an argument
+      // is rejected before any syscall — an empty binary gives ERR_INVALID_ARG_VALUE — and when
+      // the spawn attempt itself returns an errno to the caller, which a path whose parent is a
+      // file does with ENOTDIR. Both arrive here with no `spawnError` to read, and Node's own
+      // text names neither the attempt nor the path: `spawn ENOTDIR`, on its own, is the same
+      // sentence without a subject that #954 was about, one layer up from the branch below.
+      //
+      // So this states what was attempted and leaves the thrown message to say the rest. It does
+      // not classify why the throw happened: the only evidence available on this side is that
+      // message, and deciding a cause by matching on it is exactly the inference the spawn-error
+      // field was added to avoid.
       const digest = sha256("");
+      const thrown = error instanceof Error ? error.message : "a non-error value was thrown";
       return failedReading(
         this.provider,
         observedAt,
         `non-interactive-/usage:${this.provider};raw-output-digest:${digest}`,
         digest,
-        error instanceof Error ? error.message : "non-interactive /usage collector threw a non-error value",
+        `non-interactive /usage never started: spawning the configured CLI at ${this.claudeOptions.binary} ` +
+          `threw before any process existed (${thrown})`,
       );
     }
     const raw = `${outcome.stdout}${outcome.stderr ? `\n${outcome.stderr}` : ""}`;
@@ -894,6 +948,22 @@ export class ClaudeUsageCollector extends BaseUsageCollector {
       envelope = JSON.parse(outcome.stdout) as { is_error?: unknown; result?: unknown };
     } catch {
       envelope = null;
+    }
+    // No process was ever created, which is not an exit, and must be settled before any branch
+    // that reads `code` — `code` is null here for the same reason it is null after a signal. A pin
+    // whose target the provider's updater had deleted was reported as "exited on a signal" every
+    // three minutes for four and a half hours (#954): a sentence about a process that started and
+    // died, for one that never started. The errno and the path that was tried are what an operator
+    // needs in order to reach the pin, so both are stated here rather than hashed into the digest.
+    if (outcome.spawnError) {
+      return failedReading(
+        this.provider,
+        observedAt,
+        source,
+        digest,
+        `non-interactive /usage never started: the operating system could not spawn the configured CLI at ` +
+          `${this.claudeOptions.binary} (${outcome.spawnError.code ?? "no errno"}: ${outcome.spawnError.message})`,
+      );
     }
     // A read that was killed or exited badly is not a reading, whatever landed in the buffer.
     // A complete envelope can already be buffered when the timer fires, and filing that as
@@ -1171,20 +1241,26 @@ export const parseUsageOutput = (
     // Three different failures used to arrive as this one sentence: a binary that never
     // launched, a trust prompt that went unrecognised, and a real usage screen in an
     // unexpected shape. On 2026-08-17 all three providers reported it at once and the
-    // cause was none of the things the sentence describes — `resolveExecutable` returns the
-    // bare name when PATH does not contain the CLI, so nothing ever started, and the empty
-    // stream reached this line as if it were output. A whole causal chain was built on the
-    // wrong reading of it (#564, #568).
+    // cause was none of the things the sentence then described. Separating the empty stream
+    // from a screen that stated no quota is what #564/#568 needed, and that separation is the
+    // line below.
     //
-    // The distinguishing fact is whether anything was said at all. Line and character
-    // counts only: `docs/capacity-source.md` keeps raw terminal output out of the record and
-    // retains a digest instead, so the shape is reportable and the content is not.
+    // What the sentence must NOT do is name a cause this function did not measure. It used to
+    // assert the PATH hypothesis — "a CLI outside the daemon's PATH resolves to a bare name and
+    // never starts" — which was the true cause in #564 and the wrong one for #954, where an
+    // absolute pin named a version directory the provider's updater had deleted. Nothing here
+    // can tell those apart: this function receives text, not a spawn result. A spawn that never
+    // happened is now reported where it is actually observed, by the collector that spawned.
+    //
+    // The distinguishing fact available here is whether anything was said at all. Line and
+    // character counts only: the capacity-source doc keeps raw terminal output out of the
+    // record and retains a digest instead, so the shape is reportable and the content is not.
     if (lines.length === 0) {
       return {
         ok: false,
         error:
-          "interactive CLI produced no output; the binary may not have launched " +
-          "(a CLI outside the daemon's PATH resolves to a bare name and never starts)",
+          "interactive CLI produced no output at all; this parser sees only text and cannot say " +
+          "why it was silent (the process may never have started, or started and printed nothing)",
       };
     }
     return {

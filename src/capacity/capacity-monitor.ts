@@ -466,7 +466,16 @@ export class CapacityMonitor {
             evidence: {
               provider: reading.provider,
               outcome: "collector error did not replace a current operator observation",
-              collectorError: reading.error ?? null,
+              // `error`, not `collectorError`: only the former is in `AUDIT_EVIDENCE_KEYS`. An
+              // unknown key's value is admitted solely if it is identifier-shaped and at most
+              // `MAX_UNKNOWN_AUDIT_STRING` (200) characters, so a collector sentence naming an
+              // absolute pin exceeded it and `AuditLog.record` refused the WHOLE evidence,
+              // storing `reason_code=TRUSTED_CREDENTIAL_LEAK_BLOCKED` and
+              // `{"auditEvidenceRejected":true}` — a credential leak that never happened, in
+              // place of the cause. Allowlisted keys go through `redact` with a 2000-character
+              // budget instead. The telemetry `dims` above keeps its own name deliberately: that
+              // path calls `redact` only and has no allowlist or length refusal.
+              error: reading.error ?? null,
               observationAgeMs: preserved.ageMs,
               staleGraceMs: this.#options.staleGraceMs,
             },
