@@ -1160,6 +1160,7 @@ const groups = [
       ["lineage.executor_kind !== \"hermes\"",1],
       ["lineage.target_locator_digest !== proof.lineage_root_digest",1],
       ["lineage.target_locator !== options.target.sessionId",1],
+      ["lineage.target_locator !== proof.session_id",1],
       ["!incumbent",1],
       ["incumbent.incarnation !== previous.session_incarnation",1],
       ["probeSessionLiveness(incumbent.osPid, incumbent.osProcessStartedAt) !== \"DEAD\"",1],
