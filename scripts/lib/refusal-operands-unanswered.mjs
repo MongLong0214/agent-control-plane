@@ -112,25 +112,25 @@ const groups = [
   {
     file: "src/registry/canonical-self-claim.ts",
     // NO WITNESS — the operand's own effect is subsumed, so no input can distinguish it.
-    reason: "Three operands whose removal changes nothing observable, each measured rather than argued. `firstElement !== undefined` (looksLikeClaudeInvocation): the mutant needs a non-null assertion to compile, and `/(^|\\/)claude$/.test(undefined!)` coerces to the string \"undefined\", which does not match — SURVIVED. `typeof value !== \"string\"` (requireDeploymentValue): every caller reaches it through a `CanonicalSelfClaimConfig` field typed `string`, so a non-string cannot arrive without bypassing the type; removing the operand leaves `value.trim()`, which would throw rather than refuse if one ever did — SURVIVED, and TypeScript is what stands between that throw and a caller. `stat.dev !== reportedDevice` (openVerifiedDarwinImageFd): its sibling inode check catches every fixture, and distinguishing it needs a decoy on a *different device* — a cross-device fixture this suite has no way to build on one volume. `!Array.isArray(config.canonicalSessions)` (#1005): `canonicalSessions` is typed `readonly CanonicalAdoptableSession[]`, so a non-array cannot arrive without bypassing the type; removing the operand leaves the emptiness half, which an array satisfies, and every case passes — SURVIVED, measured. The second occurrence of `typeof value !== \"string\"` is the per-entry field check #1005 added, and it has the same answer for the same reason: the field is typed `string` on `CanonicalAdoptableSession`, and the `value: unknown` read above it is a deliberate widening so this guard has something to narrow rather than evidence that an untyped value can reach it. All five are kept because each is the half that would matter first if the other changed, and because both #1005 operands guard a value whose one production source is a JSON-parsed environment variable: the zod schema in `agentcpd.ts` is what makes the type true today, and this is what refuses if a second composition root ever skips it.",
+    reason: "Three operands whose removal changes nothing observable, each measured rather than argued. `firstElement !== undefined` (looksLikeClaudeInvocation): the mutant needs a non-null assertion to compile, and `/(^|\\/)claude$/.test(undefined!)` coerces to the string \"undefined\", which does not match — SURVIVED. `typeof value !== \"string\"` (requireDeploymentValue): every caller reaches it through a `CanonicalSelfClaimConfig` field typed `string`, so a non-string cannot arrive without bypassing the type; removing the operand leaves `value.trim()`, which would throw rather than refuse if one ever did — SURVIVED, and TypeScript is what stands between that throw and a caller. `stat.dev !== reportedDevice` (openVerifiedDarwinImageFd): its sibling inode check catches every fixture, and distinguishing it needs a decoy on a *different device* — a cross-device fixture this suite has no way to build on one volume. All three are kept because each is the half that would matter first if the other changed.",
     operands: [
       ["firstElement !== undefined",1],
       ["typeof value !== \"string\"",1],
-      ["typeof value !== \"string\"",2],
       ["stat.dev !== reportedDevice",1],
-      ["!Array.isArray(config.canonicalSessions)",1],
     ],
   },
   {
     file: "src/registry/canonical-self-claim.ts",
     // TYPESCRIPT IS THE ENFORCEMENT SITE — the mutant does not compile, so no test can kill it.
-    reason: "Five operands the harness refused as uncompilable mutants, which is the answer rather than a gap. `ppidRaw === null` and `command === null` narrow two `string | null` reads before `Number.parseInt` and the argv split; removing either leaves `null` flowing into a `string` parameter. `rawValue === undefined` narrows before `rawValue.toLowerCase()`. `entry.device === null` and `entry.inode === null` narrow before `BigInt(...)`. In each case the guard is what makes the next line type-check, so the property is enforced at compile time and a row claiming a test proves it would be claiming the wrong thing.",
+    reason: "Seven operands the harness refused as uncompilable mutants, which is the answer rather than a gap. `ppidRaw === null` and `command === null` narrow two `string | null` reads before `Number.parseInt` and the argv split; removing either leaves `null` flowing into a `string` parameter. `rawValue === undefined` narrows before `rawValue.toLowerCase()`. `entry.device === null` and `entry.inode === null` narrow before `BigInt(...)`. The two #1005 operands joined this group when the set validator moved out of the constructor into the exported `assertCanonicalSessionsValid`, whose parameter is `unknown` rather than a typed config field: `!Array.isArray(canonicalSessions)` is the narrowing that makes `.length`, the bound check and the `for...of` legal (measured: three TS18046 at 802, 807 and 812), and the per-entry `typeof value !== \"string\"` is the narrowing that makes `value.trim()` legal on the deliberately widened `const value: unknown` (measured: two TS18046 at 819 and 825). Until that move both were declared here as SURVIVED on the strength of the config field's declared type; at the new site the compiler, not a type declaration upstream, is what refuses the mutant, and the earlier answer would have credited the wrong enforcement site. In each case the guard is what makes the next line type-check, so the property is enforced at compile time and a row claiming a test proves it would be claiming the wrong thing.",
     operands: [
       ["ppidRaw === null",1],
       ["command === null",1],
       ["rawValue === undefined",1],
       ["entry.device === null",1],
       ["entry.inode === null",1],
+      ["!Array.isArray(canonicalSessions)",1],
+      ["typeof value !== \"string\"",2],
     ],
   },
   {

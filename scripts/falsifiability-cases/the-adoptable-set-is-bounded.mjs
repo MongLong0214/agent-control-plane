@@ -13,8 +13,8 @@ const c = {
   id: "the-adoptable-set-is-bounded",
   what: "a configured set larger than MAX_CANONICAL_ADOPTABLE_SESSIONS constructs nothing",
   file: "src/registry/canonical-self-claim.ts",
-  find: "    if (config.canonicalSessions.length > MAX_CANONICAL_ADOPTABLE_SESSIONS) {",
-  replace: "    if (config.canonicalSessions.length > MAX_CANONICAL_ADOPTABLE_SESSIONS && false) {",
+  find: "  if (canonicalSessions.length > MAX_CANONICAL_ADOPTABLE_SESSIONS) {",
+  replace: "  if (canonicalSessions.length > MAX_CANONICAL_ADOPTABLE_SESSIONS && false) {",
   killedBy: [
     "tests/unit/canonical-self-claim.test.ts::fails closed above the adoptable-set bound",
   ],

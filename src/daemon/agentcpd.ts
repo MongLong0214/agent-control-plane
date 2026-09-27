@@ -23,7 +23,7 @@ import { createHermesIncumbentAdoption } from "../bootstrap/hermes-incumbent-ado
 import { createHermesGatewayIdentityReader } from "../runtime/hermes-gateway-identity.ts";
 import { createHermesGatewayConversationSender } from "../runtime/hermes-gateway-conversation.ts";
 import {
-  MAX_CANONICAL_ADOPTABLE_SESSIONS,
+  assertCanonicalSessionsValid,
   type CanonicalAdoptableSession,
 } from "../registry/canonical-self-claim.ts";
 import { readProcessStartToken } from "../core/process-argv.ts";
@@ -2954,18 +2954,20 @@ export interface AgentcpdMainContext {
   ceoConversation: CeoConversationPort | null;
 }
 
-const canonicalSessionsSchema = z
-  .array(
-    z
-      .object({
-        sessionUuid: z.string().uuid(),
-        projectId: z.string().min(1),
-        buzzActorId: z.string().min(1),
-      })
-      .strict(),
-  )
-  .min(1)
-  .max(MAX_CANONICAL_ADOPTABLE_SESSIONS);
+// Shape only — that this is an array of objects carrying exactly these three string keys, so an
+// unrecognised key in the deployment's JSON is refused rather than ignored. Emptiness, the size
+// bound, blank and padded fields, UUID form and uniqueness are `assertCanonicalSessionsValid`'s,
+// which the claim's constructor calls too. Restating any of them here would put the same rule in
+// two places, and the half kept here is the half that runs at startup.
+const canonicalSessionsSchema = z.array(
+  z
+    .object({
+      sessionUuid: z.string(),
+      projectId: z.string(),
+      buzzActorId: z.string(),
+    })
+    .strict(),
+);
 
 /**
  * Which running sessions this deployment may adopt, and what each one is entitled to.
@@ -2990,7 +2992,16 @@ export const configuredCanonicalSessions = (raw: string): readonly CanonicalAdop
   }
   const parsed = canonicalSessionsSchema.safeParse(decoded);
   if (!parsed.success) throw new Error("ACP_CANONICAL_SESSIONS_JSON is invalid");
-  return parsed.data;
+  // The semantic rule, at startup, through the same function the claim's constructor uses. Without
+  // this call the shape check passed a set with two entries sharing a uuid, the listener started
+  // and reported itself up, and every claim then failed with INTERNAL_ERROR from the constructor —
+  // while `deploy/README.md` said an invalid array refuses startup. The message names the variable
+  // and never its contents, like every other refusal on this path.
+  try {
+    return assertCanonicalSessionsValid(parsed.data);
+  } catch {
+    throw new Error("ACP_CANONICAL_SESSIONS_JSON is invalid");
+  }
 };
 
 /**

@@ -214,14 +214,19 @@ if [[ "$target" == *"agentcpd.js" ]]; then
     printf '%s' "$out" | grep -q '^ftxt$' && printf 'txt-reported' || printf 'no-txt'
   }
   # Fields are appended, never inserted: field position is the contract between this stub and its
-  # readers, and every reader written before these destructures from the front (indices 0-7).
-  # 8-10 are what the daemon was handed, 11-13 what its own PATH can find, 14 whether the handed
-  # path runs, 15 which interpreter its PATH resolves, 16 whether an unrelated executable sitting
-  # beside a provider CLI is reachable, 17-24 the atomic canonical activation group, and 25-26
-  # where the bare name lsof resolves and what a real scan through it reports; 26-33 are
-  # the optional Hermes adoption group. They are
-  # separate observations and a launcher can satisfy any of them without the others.
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
+  # readers. The order is: the eight leading observations (0-7), what the daemon was handed, what
+  # its own PATH can find, whether the handed path runs, which interpreter its PATH resolves,
+  # whether an unrelated executable sitting beside a provider CLI is reachable, then the atomic
+  # canonical activation group, then where the bare name lsof resolves and what a real scan through
+  # it reports, then the optional Hermes adoption group. These are separate observations and a
+  # launcher can satisfy any of them without the others.
+  #
+  # The positions of the last three are deliberately NOT written here. They are derived in
+  # launcherObservations from the activation groups own lengths, and the numbers this comment used
+  # to carry had already gone stale twice: it said the canonical group ran 17-24 when it runs 17-22,
+  # put lsof at 25-26 when it is 23-24, and gave Hermes an overlapping 26-33. A comment restating a
+  # derived position is the second authority the derivation was introduced to remove.
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
     "\${ACP_TELEGRAM_BOT_TOKEN-}" "\${ACP_TELEGRAM_OWNER_ID-}" \
     "\${ACP_TELEGRAM_CHAT_ID-}" "\${ACP_TELEGRAM_WEBHOOK_SECRET-}" \
     "\${BUZZ_PRIVATE_KEY:-<unset>}" "\${ACP_BUZZ_BINARY:-<unset>}" \

@@ -14,7 +14,7 @@
  */
 const c = {
   id: "an-entry-field-is-not-blank",
-  what: "a blank sessionUuid, projectId or buzzActorId in a configured entry constructs nothing",
+  what: "a blank projectId or buzzActorId in a configured entry constructs nothing; a blank sessionUuid is also caught by the UUID check one line later",
   file: "src/registry/canonical-self-claim.ts",
   find: " || value.trim() === \"\"",
   replace: "",

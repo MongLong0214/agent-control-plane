@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
-import { main } from "../../src/daemon/agentcpd.ts";
+import { configuredCanonicalSessions, main } from "../../src/daemon/agentcpd.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -499,6 +499,52 @@ describe("canonical self-claim activation is an atomic pre-effect daemon contrac
     expect(result.stdout, diagnostics).not.toContain("canonical self-claim disabled");
     expectNoResidue(result, diagnostics);
   }, 40_000);
+});
+
+describe("#1005: an invalid adoptable set refuses startup, not the first claim", () => {
+  // Review #1006/sol ACP1006-R1-03. `configuredCanonicalSessions` had no test at all, and it held
+  // only half the rule: shape and size. Blanks, padding, UUID form and uniqueness lived in the
+  // claim's constructor, which the operator builds *per request*. So a set with two entries sharing
+  // a uuid started the listener, reported the daemon up, and then answered every claim with
+  // INTERNAL_ERROR — while deploy/README.md says an invalid array refuses startup. These cases
+  // assert the refusal happens in the parser, at the variable, before anything is bound.
+  const entry = (overrides: Record<string, string> = {}) => ({
+    sessionUuid: "11111111-1111-4111-8111-111111111111",
+    projectId: "prj_startup",
+    buzzActorId: "buzz:startup-cto",
+    ...overrides,
+  });
+
+  it.each([
+    ["two entries sharing a sessionUuid", [entry(), entry({ projectId: "prj_other", buzzActorId: "buzz:other" })]],
+    ["two entries sharing a projectId", [entry(), entry({ sessionUuid: "22222222-2222-4222-8222-222222222222", buzzActorId: "buzz:other" })]],
+    ["two entries sharing a buzzActorId", [entry(), entry({ sessionUuid: "22222222-2222-4222-8222-222222222222", projectId: "prj_other" })]],
+    ["a whitespace-only projectId", [entry({ projectId: "   " })]],
+    ["a padded buzzActorId", [entry({ buzzActorId: " buzz:startup-cto " })]],
+    ["an upper-case sessionUuid", [entry({ sessionUuid: "AAAAAAAA-1111-4111-8111-111111111111" })]],
+    ["an empty array", []],
+  ])("refuses %s", (_label, sessions) => {
+    expect(() => configuredCanonicalSessions(JSON.stringify(sessions))).toThrow(
+      /ACP_CANONICAL_SESSIONS_JSON is invalid/,
+    );
+  });
+
+  it("names the variable and never a configured value in the refusal", () => {
+    const secretish = "prj_a_value_that_must_not_be_echoed";
+    let message = "";
+    try {
+      configuredCanonicalSessions(JSON.stringify([entry({ projectId: ` ${secretish} ` })]));
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain("ACP_CANONICAL_SESSIONS_JSON");
+    expect(message).not.toContain(secretish);
+  });
+
+  it("accepts a set that is valid, so the refusals above are not vacuous", () => {
+    const sessions = [entry(), entry({ sessionUuid: "22222222-2222-4222-8222-222222222222", projectId: "prj_other", buzzActorId: "buzz:other" })];
+    expect(configuredCanonicalSessions(JSON.stringify(sessions))).toHaveLength(2);
+  });
 });
 
 describe("#627: an owner's Buzz message reaches the CEO without a session child", () => {

@@ -14,7 +14,7 @@ const c = {
   id: "the-adoptable-set-is-not-empty",
   what: "an empty configured adoptable set constructs nothing",
   file: "src/registry/canonical-self-claim.ts",
-  find: " || config.canonicalSessions.length === 0",
+  find: " || canonicalSessions.length === 0",
   replace: "",
   killedBy: [
     "tests/unit/canonical-self-claim.test.ts::fails closed on an empty adoptable set, which is an unsupplied configuration and not a choice",

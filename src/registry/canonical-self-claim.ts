@@ -777,6 +777,83 @@ export interface CanonicalAdoptableSession {
 /** A deployment adopting more entries than this has stopped being a local deployment. */
 export const MAX_CANONICAL_ADOPTABLE_SESSIONS = 32;
 
+/**
+ * The one authority over what a configured adoptable set may be. Both the composition root's
+ * `ACP_CANONICAL_SESSIONS_JSON` parser and this class's constructor call it, because they used to
+ * hold different halves of the rule: the parser checked shape and size, the constructor checked
+ * blanks and uniqueness, and the constructor runs per claim rather than at startup. A deployment
+ * with two entries sharing a UUID therefore started a listener that reported itself up and then
+ * answered every claim with INTERNAL_ERROR, while `deploy/README.md` promised startup would refuse
+ * it.
+ *
+ * Fields must already be in canonical form; this never normalizes them. Normalizing here would
+ * make this a second authority over the value the rest of the system compares. Uniqueness below
+ * runs on the configured strings, `SessionRegistry.bindBuzzActor` trims the actor id before it
+ * reaches the `sessions_buzz_actor` unique index, and the session UUID derived from process
+ * ancestry is lowercased — so `"a"` and `" a "` are two entries here and one row there, and an
+ * upper-case configured UUID is an entry no live session can ever match.
+ */
+export const assertCanonicalSessionsValid = (
+  canonicalSessions: unknown,
+): readonly CanonicalAdoptableSession[] => {
+  // An empty set is not a deployment that adopts nothing by choice — it is a composition root that
+  // failed to supply its configuration, and admitting it would leave a listener bound that can
+  // never say yes.
+  if (!Array.isArray(canonicalSessions) || canonicalSessions.length === 0) {
+    throw new Error(
+      "CanonicalSelfClaim: config.canonicalSessions is required deployment configuration and was missing or empty",
+    );
+  }
+  if (canonicalSessions.length > MAX_CANONICAL_ADOPTABLE_SESSIONS) {
+    throw new Error(
+      `CanonicalSelfClaim: config.canonicalSessions holds more than ${MAX_CANONICAL_ADOPTABLE_SESSIONS} entries`,
+    );
+  }
+  for (const entry of canonicalSessions) {
+    for (const field of ["sessionUuid", "projectId", "buzzActorId"] as const) {
+      const value: unknown = entry?.[field];
+      // Spelled `.trim() === ""` rather than `.trim().length === 0` on purpose: the falsifiability
+      // row `a-deployment-value-is-not-blank` anchors on that exact substring and the harness
+      // requires its `find` to match this file exactly once. A second spelling of the same
+      // predicate would leave that row with no unique anchor and silently no verdict.
+      if (typeof value !== "string" || value.trim() === "") {
+        throw new Error(
+          `CanonicalSelfClaim: config.canonicalSessions[].${field} is required deployment configuration and was missing or empty`,
+        );
+      }
+      // Refused rather than trimmed: see this function's contract above.
+      if (value !== value.trim()) {
+        throw new Error(
+          `CanonicalSelfClaim: config.canonicalSessions[].${field} must not be surrounded by whitespace`,
+        );
+      }
+    }
+    const configuredUuid = (entry as CanonicalAdoptableSession).sessionUuid;
+    if (!UUID_PATTERN.test(configuredUuid)) {
+      throw new Error("CanonicalSelfClaim: config.canonicalSessions[].sessionUuid must be a UUID");
+    }
+    // `UUID_PATTERN` admits `A-F`, and the UUID this primitive resolves membership against is
+    // lowercased where it is extracted from the ancestor's argv. An upper-case entry would parse,
+    // start, and then refuse its own session with CONFLICT forever.
+    if (configuredUuid !== configuredUuid.toLowerCase()) {
+      throw new Error("CanonicalSelfClaim: config.canonicalSessions[].sessionUuid must be lower-case");
+    }
+  }
+  // Duplicates are refused rather than resolved by first-match. A repeated `sessionUuid` would make
+  // one of the two entries dead configuration that reads as live; a repeated `buzzActorId` would
+  // construct fine and then be refused at `bindBuzzActor` by the `sessions_buzz_actor` unique index
+  // the moment both sessions are live, which is a startup error surfacing as a runtime claim
+  // failure; and a repeated `projectId` would give one role key two entitled sessions, which is the
+  // one-CTO-per-project property every reader downstream assumes.
+  for (const field of ["sessionUuid", "projectId", "buzzActorId"] as const) {
+    const values = (canonicalSessions as readonly CanonicalAdoptableSession[]).map((entry) => entry[field]);
+    if (new Set(values).size !== values.length) {
+      throw new Error(`CanonicalSelfClaim: config.canonicalSessions[].${field} must be unique across entries`);
+    }
+  }
+  return canonicalSessions as readonly CanonicalAdoptableSession[];
+};
+
 export interface CanonicalSelfClaimConfig {
   /**
    * The sessions this deployment may adopt, each with the one project it may hold. Required —
@@ -1162,48 +1239,10 @@ export class CanonicalSelfClaim {
         );
       }
     }
-    // The set gets the same no-fallback rule, per entry and per field. An empty set is not a
-    // deployment that adopts nothing by choice — it is a composition root that failed to supply
-    // its configuration, and admitting it would leave a listener bound that can never say yes.
-    if (!Array.isArray(config.canonicalSessions) || config.canonicalSessions.length === 0) {
-      throw new Error(
-        "CanonicalSelfClaim: config.canonicalSessions is required deployment configuration and was missing or empty",
-      );
-    }
-    if (config.canonicalSessions.length > MAX_CANONICAL_ADOPTABLE_SESSIONS) {
-      throw new Error(
-        `CanonicalSelfClaim: config.canonicalSessions holds more than ${MAX_CANONICAL_ADOPTABLE_SESSIONS} entries`,
-      );
-    }
-    for (const entry of config.canonicalSessions) {
-      for (const field of ["sessionUuid", "projectId", "buzzActorId"] as const) {
-        const value: unknown = entry?.[field];
-        // Spelled `.trim() === ""` rather than `.trim().length === 0` on purpose: the
-        // falsifiability row `a-deployment-value-is-not-blank` anchors on that exact substring and
-        // the harness requires its `find` to match this file exactly once. A second spelling of the
-        // same predicate would leave that row with no unique anchor and silently no verdict.
-        if (typeof value !== "string" || value.trim() === "") {
-          throw new Error(
-            `CanonicalSelfClaim: config.canonicalSessions[].${field} is required deployment configuration and was missing or empty`,
-          );
-        }
-      }
-      if (!UUID_PATTERN.test(entry.sessionUuid)) {
-        throw new Error("CanonicalSelfClaim: config.canonicalSessions[].sessionUuid must be a UUID");
-      }
-    }
-    // Duplicates are refused rather than resolved by first-match. A repeated `sessionUuid` would
-    // make one of the two entries dead configuration that reads as live; a repeated `buzzActorId`
-    // would construct fine and then be refused at `bindBuzzActor` by the `sessions_buzz_actor`
-    // unique index the moment both sessions are live, which is a startup error surfacing as a
-    // runtime claim failure; and a repeated `projectId` would give one role key two entitled
-    // sessions, which is the one-CTO-per-project property every reader downstream assumes.
-    for (const field of ["sessionUuid", "projectId", "buzzActorId"] as const) {
-      const values = config.canonicalSessions.map((entry) => entry[field]);
-      if (new Set(values).size !== values.length) {
-        throw new Error(`CanonicalSelfClaim: config.canonicalSessions[].${field} must be unique across entries`);
-      }
-    }
+    // Shape, emptiness, the bound, blank and padded fields, UUID form and uniqueness all live in
+    // `assertCanonicalSessionsValid`, which the composition root also calls at startup. Holding
+    // half the rule here was how an invalid set got a started listener and a per-claim throw.
+    const validatedSessions = assertCanonicalSessionsValid(config.canonicalSessions);
 
     this.#processInspector = deps.processInspector ?? defaultProcessAncestryInspector;
     this.#processSignal = deps.processSignal ?? ((pid) => process.kill(pid, 0));
@@ -1213,7 +1252,7 @@ export class CanonicalSelfClaim {
     this.#canonicalBuzzChannelId = config.canonicalBuzzChannelId;
     // Frozen at construction, like every other deployment fact here: a later mutation of the array
     // the composition root passed must not change which sessions this instance will adopt.
-    this.#canonicalSessions = config.canonicalSessions.map((entry) => Object.freeze({ ...entry }));
+    this.#canonicalSessions = validatedSessions.map((entry) => Object.freeze({ ...entry }));
   }
 
   async claim(request: CanonicalSelfClaimRequest): Promise<Decision<CanonicalSelfClaimReceipt>> {
@@ -1387,7 +1426,11 @@ export class CanonicalSelfClaim {
       // The owner approved this exact next generation for this exact role key. Checked before any
       // write — including before the owner approval is consumed — so a stale expectation denies
       // with nothing to roll back yet.
-      const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId: request.projectId });
+      // `entry.projectId`, never `request.projectId`. They were compared before the Buzz-address
+      // await, and `request` is the caller's object: a caller holding a reference could change
+      // `projectId` during that await and this key would name the project the entitlement never
+      // authorized. The entitlement is the authority, so it is what assembles the role key.
+      const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId: entry.projectId });
       const currentMax = this.db.get<{ maximum: number | null }>(
         `SELECT MAX(binding_generation) AS maximum FROM assignments WHERE role_key = ?`,
         [roleKey],
@@ -1576,7 +1619,8 @@ export class CanonicalSelfClaim {
 
       const bound = this.bindings.bind({
         role: Role.PRIMARY_CTO,
-        projectId: request.projectId,
+        // Same authority as the role key above, for the same reason.
+        projectId: entry.projectId,
         sessionId: created.sessionId,
         mode: "PREFERRED",
         authenticatedTarget,

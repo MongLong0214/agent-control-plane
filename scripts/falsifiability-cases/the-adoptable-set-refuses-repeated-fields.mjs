@@ -16,8 +16,8 @@ const c = {
   id: "the-adoptable-set-refuses-repeated-fields",
   what: "a configured set that repeats a sessionUuid, projectId or buzzActorId constructs nothing",
   file: "src/registry/canonical-self-claim.ts",
-  find: "      if (new Set(values).size !== values.length) {",
-  replace: "      if (new Set(values).size !== new Set(values).size) {",
+  find: "    if (new Set(values).size !== values.length) {",
+  replace: "    if (new Set(values).size !== new Set(values).size) {",
   // One `-t` pattern, deliberately the shared prefix of the three `it.each` cases rather than one
   // of them: the mutation makes the comparison vacuous for every field at once, so the row's claim
   // is about all three, and `vitestArgsFor` accepts exactly one pattern.

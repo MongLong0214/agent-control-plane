@@ -504,6 +504,66 @@ describe("deployment identity is required, deployment-private configuration (#76
     ).toThrow(/UUID/);
   });
 
+  // Review #1006/sol ACP1006-R1-01. Uniqueness runs on the configured strings while
+  // `SessionRegistry.bindBuzzActor` trims the actor id before the `sessions_buzz_actor` unique
+  // index sees it, so `"a"` and `" a "` were two entitlements here and one Buzz identity there:
+  // the second session bound the *first* entry's actor. Padding is refused rather than trimmed,
+  // because trimming here would make this a second authority over the compared value.
+  it.each(["sessionUuid", "projectId", "buzzActorId"] as const)(
+    "fails closed on a %s padded with whitespace, which uniqueness would not have caught",
+    (field) => {
+      const core = makeCore();
+      const entry = { sessionUuid: CANON, projectId: CONFIG_PROJECT, buzzActorId: CANONICAL_ACTOR };
+      expect(() =>
+        makeSubject(core, CONFIG_PROJECT, {
+          configOverrides: { canonicalSessions: [{ ...entry, [field]: ` ${entry[field]} ` }] },
+        }),
+      ).toThrow(/whitespace/);
+    },
+  );
+
+  // Review #1006/sol ACP1006-R1-01, second half. `UUID_PATTERN` admits `A-F`, but the uuid this
+  // primitive resolves membership against is lowercased where it is read out of the ancestor's
+  // argv. An upper-case entry parsed, started, and then refused its own session forever.
+  it("fails closed on an upper-case configured sessionUuid, which can never match a derived one", () => {
+    const core = makeCore();
+    expect(() =>
+      makeSubject(core, CONFIG_PROJECT, {
+        configOverrides: {
+          canonicalSessions: [
+            // CANON is all digits, so `.toUpperCase()` on it is a no-op and would have made this
+            // assertion vacuous. The case difference has to be in a hex letter to exist at all.
+            { sessionUuid: "AAAAAAAA-1111-4111-8111-111111111111", projectId: CONFIG_PROJECT, buzzActorId: CANONICAL_ACTOR },
+          ],
+        },
+      }),
+    ).toThrow(/lower-case/);
+  });
+
+  // Review #1006/sol ACP1006-R1-02. The entitlement is compared before the Buzz-address await and
+  // the transaction used to re-read `request.projectId` afterwards. A caller holding a reference to
+  // its own request could therefore be entitled to one project and bound to another.
+  it("binds the entitled project even when the request's projectId is mutated during the buzz await", async () => {
+    const core = makeCore();
+    insertProject(core, CONFIG_PROJECT);
+    const request = baseRequest(core, CONFIG_PROJECT);
+    const subject = makeSubject(core, CONFIG_PROJECT, {
+      resolveBuzzAddress: async () => {
+        // The window the await opens: control has left this primitive entirely.
+        (request as { projectId: string }).projectId = "prj_a_project_this_session_may_not_hold";
+        return allow(ReasonCode.OK, BUZZ_ADDRESS);
+      },
+    });
+
+    const result = await subject.claim(request);
+
+    expect(result.allowed).toBe(true);
+    if (!result.allowed) return;
+    expect(result.value.binding.projectId).toBe(CONFIG_PROJECT);
+    expect(result.value.binding.roleKey).toContain(CONFIG_PROJECT);
+    expect(result.value.binding.roleKey).not.toContain("may_not_hold");
+  });
+
   it("never falls back to a hardcoded real value — no exported real-ID constant exists to fall back to", () => {
     // No exported real-ID constant exists for this module to fall back to (#760): every value the
     // primitive uses must come from the config this test constructs, never from a module-level
