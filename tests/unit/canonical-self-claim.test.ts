@@ -66,14 +66,25 @@ const FIVE_TABLES = [
 ] as const;
 
 /**
+ * The two kinds `claim()` records at its return boundary, one row per decision it hands back.
+ * Written after `#mutate` has committed or rolled back, so they are outside its transaction by
+ * design, and they are the only audit rows a refusal is meant to leave.
+ */
+const CLAIM_DECISION_KINDS = ["CANONICAL_SELF_CLAIM_ADMITTED", "CANONICAL_SELF_CLAIM_REFUSED"] as const;
+
+/**
  * `FIVE_TABLES` alone proves state rollback and says nothing about audit rollback, which the
  * contract names explicitly. `audit_events` is append-only and every writer
- * `#mutate` touches records to it (`OwnerAuthority.consumeApproval`, `SessionRegistry.create`,
- * `.transition`, `.bindBuzzActor`, `BindingRegistry.bind`), so a refusal that still lets a
- * "the claim was attempted" row land — including a *deliberately added* refusal-audit record
- * written after `#mutate` returns its denial, outside the transaction that rolled back — would
+ * `#mutate` touches records to it (`SessionRegistry.create`, `.transition`, `.bindBuzzActor`,
+ * `BindingRegistry.bind`), so a refusal whose rollback still let one of those rows land would
  * pass every `FIVE_TABLES`-only assertion and still be a real leak. Counting this table is what
  * makes that shape fail.
+ *
+ * The count leaves out `CLAIM_DECISION_KINDS`. This oracle used to count them too and treat a
+ * refusal row as a leak; that was the defect, not the contract — a refused claim left nothing
+ * saying it had been refused. Those rows are asserted exactly, and read back, by the
+ * "every decision claim() hands back" block; excluding them here keeps every refusal below
+ * proving that the *mutation's* writers left nothing behind.
  */
 const ROLLBACK_TABLES = [...FIVE_TABLES, "audit_events"] as const;
 
@@ -81,9 +92,33 @@ const rowCounts = (core: CoreHarness): Record<(typeof ROLLBACK_TABLES)[number], 
   Object.fromEntries(
     ROLLBACK_TABLES.map((table) => [
       table,
-      core.db.get<{ c: number }>(`SELECT COUNT(*) AS c FROM ${table}`)?.c ?? -1,
+      (table === "audit_events"
+        ? core.db.get<{ c: number }>(
+          `SELECT COUNT(*) AS c FROM audit_events WHERE kind NOT IN (?, ?)`,
+          [...CLAIM_DECISION_KINDS],
+        )
+        : core.db.get<{ c: number }>(`SELECT COUNT(*) AS c FROM ${table}`))?.c ?? -1,
     ]),
   ) as Record<(typeof ROLLBACK_TABLES)[number], number>;
+
+/**
+ * The rows `claim()` recorded for the decisions it handed back, read from the database rather
+ * than observed through a spy: the claim of this suite is that the row is durable, not that a
+ * method was called.
+ */
+
+const claimDecisionRows = (core: CoreHarness) =>
+  core.db.all<{
+    kind: string; reason_code: string | null; project_id: string | null; session_id: string | null;
+    role_key: string | null; evidence_json: string;
+  }>(
+    `SELECT kind, reason_code, project_id, session_id, role_key, evidence_json FROM audit_events
+      WHERE kind IN (?, ?) ORDER BY event_id`,
+    [...CLAIM_DECISION_KINDS],
+  ).map(({ evidence_json, ...row }) => ({ ...row, evidence: JSON.parse(evidence_json) as unknown }));
+
+const auditTotal = (core: CoreHarness): number =>
+  core.db.get<{ c: number }>(`SELECT COUNT(*) AS c FROM audit_events`)?.c ?? -1;
 
 const insertProject = (core: CoreHarness, projectId: string): void => {
   core.db.run(`INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)`, [
@@ -233,6 +268,7 @@ const makeSubject = (
   new CanonicalSelfClaim(
     core.db,
     core.clock,
+    core.audit,
     core.sessions,
     core.bindings,
     options.buzzActorAuthenticator ?? fakeBuzzActorAuthenticator(),
@@ -280,9 +316,13 @@ const successorFixture = async () => {
 };
 
 // Full durable preimages, not counts: rollback must restore pointer, hash, approval and envelope bytes.
+// `audit_events` leaves out the decision rows `claim()` records at its boundary, for the reason
+// `ROLLBACK_TABLES` gives; every other audit row is compared byte for byte.
 const durableSnapshot = (core: CoreHarness) => core.db.all<{ name: string }>(
   `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`,
-).map(({ name }) => [name, core.db.all(`SELECT * FROM "${name.replaceAll('"', '""')}"`)]);
+).map(({ name }) => [name, name === "audit_events"
+  ? core.db.all(`SELECT * FROM audit_events WHERE kind NOT IN (?, ?) ORDER BY event_id`, [...CLAIM_DECISION_KINDS])
+  : core.db.all(`SELECT * FROM "${name.replaceAll('"', '""')}"`)]);
 
 describe("same-live successor transaction", () => {
   it("same-live recovery concurrent claims have exactly one winner", async () => {
@@ -813,9 +853,10 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
 
     // Positive evidence that every writer `#mutate` composes recorded its own audit row, exactly
     // once each, inside the same committed transaction — the full footprint the refusal oracle
-    // below (`ROLLBACK_TABLES`) proves is absent on any denial. `audit_events` is append-only and
-    // ordered by insertion, so skipping `before.audit_events` rows isolates exactly what
-    // `claim()` itself wrote.
+    // below (`ROLLBACK_TABLES`) proves is absent on any denial — plus the one admission row
+    // `claim()` records on its way out. `audit_events` is append-only and ordered by insertion,
+    // and nothing before this claim was a decision row, so skipping `before.audit_events` rows
+    // isolates exactly what `claim()` itself wrote.
     const auditKinds = core.db
       .all<{ kind: string }>(`SELECT kind FROM audit_events ORDER BY event_id LIMIT -1 OFFSET ?`, [
         before.audit_events ?? 0,
@@ -824,6 +865,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       .sort();
     expect(auditKinds).toEqual([
       "BINDING_CREATED",
+      "CANONICAL_SELF_CLAIM_ADMITTED",
       "SESSION_BUZZ_ACTOR_BOUND",
       "SESSION_CREATED",
       "SESSION_LIFECYCLE",
@@ -1031,6 +1073,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       const subject = new CanonicalSelfClaim(
         core.db,
         core.clock,
+        core.audit,
         core.sessions,
         core.bindings,
         fakeBuzzActorAuthenticator(),
@@ -1925,6 +1968,117 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
     expect(result.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
+  });
+});
+
+describe("every decision claim() hands back leaves exactly one audit row", () => {
+  // The defect this pins: the primitive that adopts a running session wrote nothing to
+  // `audit_events`, so a claim refused for weeks left no row saying so. Each case below counts the
+  // whole table as well as the decision rows, so a second row, a missing row, or a row the
+  // rolled-back mutation should not have left are all failures.
+
+  it("a refusal of an unconfigured session leaves exactly one audit row carrying its reason code", async () => {
+    const core = makeCore();
+    const projectId = "prj_audit_unconfigured";
+    insertProject(core, projectId);
+    const subject = makeSubject(core, projectId, { chain: standardChain({}, OTHER) });
+    const totalBefore = auditTotal(core);
+
+    const result = await subject.claim(baseRequest(core, projectId, { claimedSessionUuid: OTHER }));
+
+    expect(result.allowed).toBe(false);
+    if (result.allowed) return;
+    expect(result.reasonCode).toBe(ReasonCode.CONFLICT);
+    expect(claimDecisionRows(core)).toEqual([{
+      kind: "CANONICAL_SELF_CLAIM_REFUSED",
+      reason_code: ReasonCode.CONFLICT,
+      project_id: projectId,
+      session_id: null,
+      role_key: null,
+      evidence: { identity: OTHER },
+    }]);
+    expect(auditTotal(core)).toBe(totalBefore + 1);
+  });
+
+  it("a successful adoption leaves exactly one audit row naming the admitted session and its role key", async () => {
+    const core = makeCore();
+    const projectId = "prj_audit_admitted";
+    insertProject(core, projectId);
+    const subject = makeSubject(core, projectId);
+
+    const result = await subject.claim(baseRequest(core, projectId));
+
+    expect(result.allowed, JSON.stringify(result)).toBe(true);
+    if (!result.allowed) return;
+    expect(claimDecisionRows(core)).toEqual([{
+      kind: "CANONICAL_SELF_CLAIM_ADMITTED",
+      reason_code: ReasonCode.OK,
+      project_id: projectId,
+      session_id: result.value.sessionId,
+      role_key: roleKeyFor(Role.PRIMARY_CTO, { projectId }),
+      evidence: { identity: CANON, generation: 1 },
+    }]);
+    // The receipt carries the session secret back to the claimant; the durable record must not.
+    const secret = result.value.sessionSecret;
+    if (secret !== null) {
+      expect(JSON.stringify(core.db.all(`SELECT * FROM audit_events`))).not.toContain(secret);
+    }
+  });
+
+  it("a refusal from inside the rolled-back transaction still leaves its one row, and none of the mutation's own", async () => {
+    const core = makeCore();
+    const projectId = "prj_audit_generation";
+    insertProject(core, projectId);
+    const subject = makeSubject(core, projectId);
+    const totalBefore = auditTotal(core);
+
+    const result = await subject.claim(baseRequest(core, projectId, { expectedBindingGeneration: 2 }));
+
+    expect(result.allowed).toBe(false);
+    if (result.allowed) return;
+    expect(result.message).toContain("expected binding generation does not match");
+    expect(claimDecisionRows(core)).toEqual([expect.objectContaining({
+      kind: "CANONICAL_SELF_CLAIM_REFUSED", reason_code: ReasonCode.CONFLICT, project_id: projectId,
+    })]);
+    expect(auditTotal(core)).toBe(totalBefore + 1);
+  });
+
+  it("a claimed session that is not a UUID is recorded by its reason code without storing the caller's text", async () => {
+    const core = makeCore();
+    const projectId = "prj_audit_not_a_uuid";
+    insertProject(core, projectId);
+    const subject = makeSubject(core, projectId);
+    const callerText = "not-a-uuid: arbitrary caller text that must not become a durable record";
+
+    const result = await subject.claim(baseRequest(core, projectId, { claimedSessionUuid: callerText }));
+
+    expect(result.allowed).toBe(false);
+    if (result.allowed) return;
+    expect(result.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
+    expect(claimDecisionRows(core)).toEqual([expect.objectContaining({
+      kind: "CANONICAL_SELF_CLAIM_REFUSED", reason_code: ReasonCode.INVALID_ARGUMENT, evidence: { identity: null },
+    })]);
+    expect(JSON.stringify(core.db.all(`SELECT * FROM audit_events`))).not.toContain("arbitrary caller text");
+  });
+
+  it("a refusal handed back from the Buzz resolver is recorded with that resolver's reason code", async () => {
+    const core = makeCore();
+    const projectId = "prj_audit_buzz";
+    insertProject(core, projectId);
+    const subject = makeSubject(core, projectId, {
+      resolveBuzzAddress: fakeResolveBuzzAddress(deny(ReasonCode.NOT_FOUND, "no such channel", {})),
+    });
+    const totalBefore = auditTotal(core);
+
+    const result = await subject.claim(baseRequest(core, projectId));
+
+    expect(result.allowed).toBe(false);
+    if (result.allowed) return;
+    expect(result.reasonCode).toBe(ReasonCode.NOT_FOUND);
+    expect(claimDecisionRows(core)).toEqual([expect.objectContaining({
+      kind: "CANONICAL_SELF_CLAIM_REFUSED", reason_code: ReasonCode.NOT_FOUND, project_id: projectId,
+    })]);
+    expect(auditTotal(core)).toBe(totalBefore + 1);
   });
 });
 

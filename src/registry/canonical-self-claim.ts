@@ -9,6 +9,7 @@ import { type Decision, allow, deny } from "../core/errors.ts";
 import { readProcessArgv, readProcessStartToken } from "../core/process-argv.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
+import type { AuditLog, AuditRecord } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
 import type { AuthenticatedTargetBinding, BindingRegistry, VerifiedTargetBinding } from "../session/binding-registry.ts";
@@ -1187,6 +1188,45 @@ export function assertClaudeIdentityStillLive(
 }
 
 /**
+ * The audit row for one decision `CanonicalSelfClaim.claim()` returns.
+ *
+ * Only the reason code and identifiers cross into the record. The decision's `message` and
+ * `evidence` do not: between them they can carry an executor image path, a transcript path, or a
+ * Buzz transport's own error text, none of which is the claimant's to put in a durable log. The
+ * receipt's `sessionSecret` is never read.
+ *
+ * The claimed session is recorded only when it has the shape of one. The first refusal in `claim`
+ * is exactly the case where it does not, and there it is arbitrary caller text.
+ *
+ * An admission names the project from the binding, not from the request: the entitlement is what
+ * decided the project, and the request is the caller's object.
+ */
+const claimDecisionAuditRecord = (
+  asked: { claimedSessionUuid: string; projectId: string },
+  decision: Decision<CanonicalSelfClaimReceipt>,
+): AuditRecord => {
+  if (decision.allowed) {
+    return {
+      kind: "CANONICAL_SELF_CLAIM_ADMITTED",
+      reasonCode: decision.reasonCode,
+      projectId: decision.value.binding.projectId,
+      sessionId: decision.value.sessionId,
+      roleKey: decision.value.binding.roleKey,
+      evidence: {
+        identity: decision.value.derivedSessionUuid,
+        generation: decision.value.binding.bindingGeneration,
+      },
+    };
+  }
+  return {
+    kind: "CANONICAL_SELF_CLAIM_REFUSED",
+    reasonCode: decision.reasonCode,
+    projectId: asked.projectId,
+    evidence: { identity: UUID_PATTERN.test(asked.claimedSessionUuid) ? asked.claimedSessionUuid : null },
+  };
+};
+
+/**
  * The claim primitive (#760). Composes `SessionRegistry.create` and `BindingRegistry.bind` —
  * it mints no writer of its own for any of the five tables the mutation touches (sessions,
  * conversational_actors, assignments, actor_target_bindings, actor_target_attestations).
@@ -1211,6 +1251,8 @@ export class CanonicalSelfClaim {
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
+    /** Where `claim()` records every decision it returns; see `claimDecisionAuditRecord`. */
+    private readonly audit: AuditLog,
     private readonly sessions: SessionRegistry,
     private readonly bindings: BindingRegistry,
     /** Authenticates `buzzActorId` for `SessionRegistry.bindBuzzActor` (deployment ingress policy). */
@@ -1255,7 +1297,26 @@ export class CanonicalSelfClaim {
     this.#canonicalSessions = validatedSessions.map((entry) => Object.freeze({ ...entry }));
   }
 
+  /**
+   * Every decision this hands back — each refusal and the admission — is recorded here, once, on
+   * its way out. Recorded at this one boundary rather than beside each `deny`: this file alone has
+   * over thirty, more arrive from what it composes, and a record written per site means the next
+   * refusal someone adds has no row. That absence is what hid a weeks-long adoption outage.
+   *
+   * What was asked is read before the first `await`. `request` is the caller's object and the
+   * Buzz-address resolution hands control away, so reading it afterwards would record whatever the
+   * caller changed it to rather than what it claimed.
+   *
+   * A claim that *throws* is not a returned decision and is not recorded here.
+   */
   async claim(request: CanonicalSelfClaimRequest): Promise<Decision<CanonicalSelfClaimReceipt>> {
+    const asked = { claimedSessionUuid: request.claimedSessionUuid, projectId: request.projectId };
+    const decision = await this.#decide(request);
+    this.audit.record(claimDecisionAuditRecord(asked, decision));
+    return decision;
+  }
+
+  async #decide(request: CanonicalSelfClaimRequest): Promise<Decision<CanonicalSelfClaimReceipt>> {
     if (!UUID_PATTERN.test(request.claimedSessionUuid)) {
       return deny(ReasonCode.INVALID_ARGUMENT, "claimedSessionUuid must be a UUID", {});
     }

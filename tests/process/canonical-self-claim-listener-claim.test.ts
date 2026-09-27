@@ -278,11 +278,29 @@ const MUTATION_TABLES = [
   "actor_target_attestations",
 ] as const;
 
+/**
+ * The `audit_events` count leaves out the one row `CanonicalSelfClaim.claim()` records for every
+ * decision it hands back, admission or refusal. This oracle used to count it too, and so treated a
+ * refusal's own record as a leak; a refused claim leaving nothing that says it was refused was
+ * the defect, not the contract. What the count still proves is that the rows the mutation's own
+ * writers record (session, lifecycle, Buzz actor, binding) roll back with it. The decision row
+ * itself is asserted exactly, read back from the database, in `tests/unit/canonical-self-claim.test.ts`.
+ */
+const CLAIM_DECISION_KINDS = ["CANONICAL_SELF_CLAIM_ADMITTED", "CANONICAL_SELF_CLAIM_REFUSED"] as const;
+
 const ROLLBACK_TABLES = [...MUTATION_TABLES, "audit_events"] as const;
 
 const rowCounts = (cp: Harness["cp"]): Record<(typeof ROLLBACK_TABLES)[number], number> =>
   Object.fromEntries(
-    ROLLBACK_TABLES.map((table) => [table, cp.db.get<{ c: number }>(`SELECT COUNT(*) AS c FROM ${table}`)?.c ?? -1]),
+    ROLLBACK_TABLES.map((table) => [
+      table,
+      (table === "audit_events"
+        ? cp.db.get<{ c: number }>(
+          `SELECT COUNT(*) AS c FROM audit_events WHERE kind NOT IN (?, ?)`,
+          [...CLAIM_DECISION_KINDS],
+        )
+        : cp.db.get<{ c: number }>(`SELECT COUNT(*) AS c FROM ${table}`))?.c ?? -1,
+    ]),
   ) as Record<(typeof ROLLBACK_TABLES)[number], number>;
 
 const insertProject = (cp: Harness["cp"], projectId: string): void => {
@@ -342,6 +360,7 @@ const depsFor = (
   return {
     db: cp.db,
     clock: cp.clock,
+    audit: cp.audit,
     sessions: cp.sessions,
     bindings: cp.bindings,
     buzzActorAuthenticator: new IngressGuard(cp.db, cp.clock, cp.audit, {
@@ -415,7 +434,7 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
 
 
   it(
-    "a second claim at a generation already committed denies with no new claim state or audit",
+    "a second claim at a generation already committed denies with no new claim state and no audit row beyond its own decision",
     async () => {
       const started = await startMintOperator();
       const { cp } = started.harness;
