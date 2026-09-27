@@ -3013,11 +3013,14 @@ export const configuredCanonicalSessions = (raw: string): readonly CanonicalAdop
 export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => {
   // Classify the complete environment-only group before reading config or acquiring resources.
   // Blank values are absent; nonblank values are retained exactly for the claim boundary.
+  //
+  // Three, not six. `ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION`, `…_EXPECTED_EXECUTOR_REALPATH` and
+  // `…_EXPECTED_EXECUTOR_SHA256` used to belong to the group; the claim no longer compares the
+  // executing image against anything, so nothing reads them. They are not refused either: a
+  // deployment that still provisions them starts exactly as one that does not, and they count
+  // neither toward the group being present nor toward it being partial.
   const CANONICAL_ACTIVATION_VARS = [
     "ACP_CANONICAL_SESSIONS_JSON",
-    "ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION",
-    "ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH",
-    "ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256",
     "ACP_CANONICAL_CTO_PEER_PROTOCOL",
     "ACP_CANONICAL_CTO_BUZZ_PURPOSE",
   ] as const;
@@ -3238,16 +3241,10 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       );
     } else {
       const canonicalSessions = configuredCanonicalSessions(canonicalActivationValues["ACP_CANONICAL_SESSIONS_JSON"]);
-      const canonicalRequiredExecutorVersion = canonicalActivationValues["ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION"];
-      // Handed to the daemon so the system report can compare it against the build the wake
-      // transport was qualified on (#886). Inside the activation block on purpose: a deployment
-      // that never activated canonical self-claim has no pin, and a null there is the absence of
-      // a claim rather than a disagreement. The check above already refuses a *partial* group;
-      // this covers the group that is complete and contradicts itself one step later.
-      daemon.setCanonicalExecutorVersion(canonicalRequiredExecutorVersion);
-      const canonicalExpectedExecutorRealpath =
-        canonicalActivationValues["ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH"];
-      const canonicalExpectedExecutorSha256 = canonicalActivationValues["ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256"];
+      // No `daemon.setCanonicalExecutorVersion` call any more. It handed the deployment's required
+      // executor version to the system report so #886 could compare it against the build the wake
+      // transport was qualified on. With no version pin on the claim there was nothing to hand it,
+      // and the setter and that finding were removed from `daemon.ts` with it.
       // Its own dedicated, token-less listener (#760): a process may prove who it is, but it
       // cannot approve itself, so the claiming connection never holds, reads, or is checked
       // against `ACP_OPERATOR_TOKEN`; its only authority is the kernel's own record of who opened
@@ -3271,7 +3268,6 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
           resolveBuzzAddress: resolveCanonicalSelfClaimBuzzAddress,
           config: {
             canonicalSessions,
-            requiredExecutorVersion: canonicalRequiredExecutorVersion,
             canonicalBuzzChannelId,
             expectedPeerProtocolVersion: canonicalActivationValues["ACP_CANONICAL_CTO_PEER_PROTOCOL"],
             // Matches the listener's own derivation exactly: both read this daemon's effective
@@ -3279,8 +3275,6 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
             expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
             peerProtocolVersion: canonicalActivationValues["ACP_CANONICAL_CTO_PEER_PROTOCOL"],
             buzzPurpose: canonicalActivationValues["ACP_CANONICAL_CTO_BUZZ_PURPOSE"],
-            expectedExecutorRealpath: canonicalExpectedExecutorRealpath,
-            expectedExecutorSha256: canonicalExpectedExecutorSha256,
           },
         });
       });

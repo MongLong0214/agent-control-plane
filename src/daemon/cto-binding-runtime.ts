@@ -15,11 +15,26 @@ const hermesTarget = z.object({
   requestedSessionId: z.string().min(1), expectedLineageRootDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
   executorRuntimeIdentity: z.string().min(1),
 }).strict();
+/**
+ * The three pins a Claude target used to carry: a version, a realpath and a sha256 the verifier
+ * compared the target's executing image against. That comparison was withdrawn with the canonical
+ * claim's (2026-09-27) — `verifyClaudeIdentity` observes the image and compares it to nothing — so
+ * no value here means anything. They are still accepted, with any value, and dropped at parse so
+ * nothing downstream can read them. Refusing them is what `.strict()` would do if they were simply
+ * deleted, and that would stop a deployment that still provisions them from starting: the failure
+ * the removal was for, pointed the other way. The superseded canonical variables are ignored rather
+ * than refused for the same reason.
+ */
+const WITHDRAWN_CLAUDE_TARGET_PINS = {
+  requiredExecutorVersion: z.unknown().optional(),
+  expectedExecutorRealpath: z.unknown().optional(),
+  expectedExecutorSha256: z.unknown().optional(),
+};
 const claudeTarget = z.object({
   provider: z.literal("claude"), sessionId: z.string().min(1), incarnation: z.string().min(1),
-  nativeSessionUuid: z.string().uuid(), requiredExecutorVersion: z.string().min(1),
-  expectedExecutorRealpath: absolute, expectedExecutorSha256: z.string().regex(/^sha256:[a-f0-9]{64}$/),
-}).strict();
+  nativeSessionUuid: z.string().uuid(), ...WITHDRAWN_CLAUDE_TARGET_PINS,
+}).strict().transform(({ requiredExecutorVersion: _version, expectedExecutorRealpath: _realpath,
+  expectedExecutorSha256: _sha256, ...target }) => target);
 const targetsSchema = z.array(z.union([hermesTarget, claudeTarget])).max(128);
 
 /** Deployment-owned target pins, never request-supplied executable paths or proof callbacks.

@@ -22,9 +22,9 @@ import type { BuzzActorAuthenticator, SessionRegistry } from "../session/session
  * is exactly what must not happen for the canonical PRIMARY_CTO conversational actor, because the
  * canonical conversation already exists and must be adopted in place. This module is the claim
  * primitive that composition does: it derives who is asking independently of what it is told,
- * verifies eight independently fatal facts about the claimant, and only then performs one atomic
- * mutation that either creates the session/actor/assignment/target-binding/attestation tuple or
- * writes nothing at all.
+ * verifies a set of independently fatal facts about the claimant, and only then performs one
+ * atomic mutation that either creates the session/actor/assignment/target-binding/attestation
+ * tuple or writes nothing at all.
  *
  * What this module deliberately does not do:
  *  - It never accepts an argument as identity. A caller-supplied session UUID or PID is checked
@@ -40,14 +40,15 @@ import type { BuzzActorAuthenticator, SessionRegistry } from "../session/session
  */
 
 // ---------------------------------------------------------------------------
-// Deployment identity (#760). The one session UUID, the required executor version, and
-// the canonical Buzz channel are deployment-private facts, not source constants. They are
-// required fields on `CanonicalSelfClaimConfig` (below), sourced by the composition root
-// (`src/daemon/agentcpd.ts`) from required environment variables with no fallback to a real
-// value; a missing one fails construction closed, before any effect. The executing image's
-// version must still be read from the actual resolved artifact at check time, never from a
-// symlink or a fresh `claude --version` invocation resolved through PATH — see
-// `resolveExecutingImagePath`/`versionFromImagePath` below.
+// Deployment identity (#760). The adoptable sessions and the canonical Buzz channel are
+// deployment-private facts, not source constants. They are required fields on
+// `CanonicalSelfClaimConfig` (below), sourced by the composition root (`src/daemon/agentcpd.ts`)
+// from required environment variables with no fallback to a real value; a missing one fails
+// construction closed, before any effect. The claimant's executing image is not one of them: it is
+// observed and recorded, and compared against no configured value (clause 2 in
+// `verifyClaudeIdentity`). What gets recorded is still read from the image the kernel actually
+// loaded, never from a symlink or a fresh `claude --version` invocation resolved through PATH —
+// see `defaultExecutingImageInspector`/`versionFromImagePath` below.
 // ---------------------------------------------------------------------------
 
 /**
@@ -339,17 +340,18 @@ export const defaultProcessAncestryInspector: ProcessAncestryInspector = {
  * the name a caller's `execvp` search resolved), never a `ps`-rendered approximation of it.
  *
  * Deliberately does **not** also match a second element whose basename is `claude` — an
- * interpreter-launched script, `node /path/to/claude ...`. Matching that shape breaks clause 2 in
- * both directions at once: the executing-image inspector below always authenticates the
- * kernel-loaded image, which for `node script` is `node` itself, never the script. A deployment
- * that pins the real Node binary's realpath/hash would admit *any* attacker-controlled script
- * merely named `claude` and launched through that same, legitimate interpreter — the
- * interpreter's own identity would be doing all the authenticating, and the script's identity
- * none of it. A deployment that instead pinned the script's own path could never be satisfied by
- * real interpreter execution, since the kernel-loaded image is still `node`. Requiring the first
- * element to itself be `claude` closes this: only a process whose own exec'd image is the
- * `claude` binary can ever be the claimant, so the image check that follows authenticates the
- * same file this check named.
+ * interpreter-launched script, `node /path/to/claude ...`. For that shape the kernel-loaded image
+ * is the interpreter, never the script, so matching it would let any script merely named `claude`
+ * stand as the claimant on the strength of whichever legitimate interpreter launched it.
+ *
+ * This is now the only process-shape check between a same-uid process and the claim, and it is a
+ * check on a name. It used to be the first half of a pair: the executing image was then compared
+ * against a deployment-configured version, realpath and sha256, which is what tied the name read
+ * here to the bytes actually running. That comparison is withdrawn (clause 2 in
+ * `verifyClaudeIdentity`), so a binary renamed or copied to a path ending in `claude` passes here
+ * and nothing downstream examines what it is. What still bounds the claim is the kernel peer
+ * credential on the claim socket, the configured session UUID derived from this process's own
+ * argv, and the project that UUID's entry names.
  */
 export const looksLikeClaudeInvocation = (argv: readonly string[]): boolean => {
   const [firstElement] = argv;
@@ -528,21 +530,31 @@ export const deriveClaimantIdentity = (
 };
 
 // ---------------------------------------------------------------------------
-// Executing image — the specific file the OS loaded, not a symlink read at check time.
+// Executing image — the specific file the OS loaded, not a symlink read at check time. Observed and
+// recorded; no claim is refused on what it says, or on its absence.
 // ---------------------------------------------------------------------------
 
 export interface ExecutingImageEvidence {
   imagePath: string;
   version: string;
-  /** `sha256:<hex>` of the resolved image's actual bytes — this module's own `sha256` helper. */
+  /**
+   * `sha256:<hex>` of the resolved image's actual bytes — this module's own `sha256` helper. Its
+   * one reader is the delegated CTO binding's attestation digest (`cto-binding-runtime.ts`), which
+   * digests the whole verified identity. The canonical claim's attestation and receipt take the
+   * path and version only. Measured 2026-09-27 by counting reads of this field: none on a
+   * canonical claim, one on a delegated bind. Computing it reads the whole image on both paths.
+   */
   sha256: string;
 }
 
 /**
  * The scan that would have named the executing image could not run. Distinguished from `null` for
- * the same reason `cwd` is (#834): `null` means the image was looked at and is not one this
- * deployment can accept, and this means nobody looked. The one-key shape is the discriminator —
- * `ExecutingImageEvidence` never carries `probeFailure`.
+ * the same reason `cwd` is (#834): `null` means the scan ran and produced no usable image — the
+ * file it names is gone from disk, was replaced after exec, or carries no `/versions/` segment —
+ * and this means nobody looked. Neither refuses a claim, and the claim records both as no image;
+ * the distinction survives for a caller that must not read a scan that never ran as an
+ * observation of nothing. The one-key shape is the discriminator — `ExecutingImageEvidence` never
+ * carries `probeFailure`.
  */
 export interface ExecutingImageProbeFailure {
   probeFailure: LsofProbeFailure;
@@ -563,20 +575,17 @@ export interface ExecutingImageInspector {
 
 /**
  * Reads the version out of the resolved image's own path rather than executing it or trusting a
- * file placed beside it. Invoking the resolved path with `--version` is deliberately avoided: a
- * self-reported string from a binary this check exists to not trust the caller's word about is
- * the same shape of evidence, one hop removed.
+ * file placed beside it. The version is an observation — the claim records it in its attestation
+ * and receipt and compares it against nothing — so the one requirement on it is that it describe
+ * the image the kernel actually loaded. Invoking the resolved path with `--version` would record
+ * whatever that binary chose to say about itself instead.
  *
- * An adjacent `package.json` is not used as version authority: it is a second file, independently
- * writable from the binary it sits beside, so it can be forged without touching the realpath or
- * the bytes clause 2 already authenticates — a version read that way proves nothing the other two
- * checks do not already have to hold for separately. The one thing that cannot be forged without
- * also changing the resolved path itself is the path's own `/versions/<version>` executable-file
- * layout, or the legacy `/versions/<version>/<binary>` layout — so that version segment, taken
- * verbatim, is the only version authority. It is compared for exact equality against
- * `CanonicalSelfClaimConfig.requiredExecutorVersion` afterward; nothing here re-validates its
- * shape, so a deployment's real version and a test's synthetic prerelease segment (e.g.
- * `9.0.0-test`) are read identically.
+ * An adjacent `package.json` is not read either: it is a second file, independently writable from
+ * the binary it sits beside, so it can say anything while the running image stays the same. The
+ * path's own `/versions/<version>` executable-file layout, or the legacy
+ * `/versions/<version>/<binary>` layout, is where the running image was resolved, so that segment,
+ * taken verbatim, is the version recorded. Nothing here validates its shape, so a deployment's real
+ * version and a test's synthetic prerelease segment (e.g. `9.0.0-test`) are read identically.
  */
 const IMAGE_VERSION_FILE_PATTERN = /\/versions\/([^/]+)$/;
 const IMAGE_VERSION_DIRECTORY_PATTERN = /\/versions\/([^/]+)\/[^/]+$/;
@@ -587,15 +596,12 @@ export const versionFromImagePath = (imagePath: string): string | null =>
   ?? null;
 
 /**
- * Hashes the bytes reached through an already-open file descriptor, then closes it. A version
- * string and a realpath both describe the file; neither is the file, and neither is the FD. A
- * renamed Node binary placed at a forged, expected-looking path with a forged adjacent manifest
- * would satisfy a realpath check and a version check alike — hashing bytes read through the exact
- * FD `openLinuxImageFd`/`openVerifiedDarwinImageFd` bound is the one comparison that requires the
- * actual invocation artifact to actually be the expected one, not merely labeled or path-matched
- * as it. Resolving a path and hashing a *later, separate* open of that same path string is not
- * this: a file swapped into place after the path resolves and before that second open runs would
- * authenticate bytes that were never the running image.
+ * Hashes the bytes reached through an already-open file descriptor, then closes it. The hash is
+ * part of the observed `ExecutingImageEvidence`; no claim compares it against a configured value.
+ * It is still read through the exact FD `openLinuxImageFd`/`openVerifiedDarwinImageFd` bound
+ * rather than through a *later, separate* open of the same path string, so that what it reports is
+ * the running image's bytes: a file swapped into place after the path resolves and before a second
+ * open runs would otherwise be hashed in the running image's name.
  */
 const hashImageFd = (fd: number): string | null => {
   try {
@@ -869,32 +875,14 @@ export interface CanonicalSelfClaimConfig {
    */
   canonicalSessions: readonly CanonicalAdoptableSession[];
   /**
-   * The exact executor version this deployment currently requires. Required — deployment-private
-   * configuration only, same no-fallback rule as `canonicalSessions`.
-   */
-  requiredExecutorVersion: string;
-  /**
    * This deployment's one canonical project Buzz channel. Required — deployment-private
    * configuration only, same no-fallback rule as `canonicalSessions`.
    */
   canonicalBuzzChannelId: string;
-  /**
-   * The daemon-owned expected realpath of the executor image, compared against the actual
-   * resolved invocation artifact (`ExecutingImageEvidence.imagePath`, itself never a symlink —
-   * see `resolveExecutingImagePath`). Required — a version string read from an adjacent,
-   * spoofable `package.json` is not sufficient on its own: a renamed binary plus a forged
-   * manifest would still read as the required version. Comparing the actual resolved path closes
-   * that gap. No fallback to a real value.
-   */
-  expectedExecutorRealpath: string;
-  /**
-   * The daemon-owned expected sha256 of the executor image's actual bytes (`sha256:<hex>`, this
-   * module's own `sha256` helper), compared against a hash computed from the resolved image at
-   * check time. Required, same no-fallback rule. Realpath alone would still trust whatever bytes
-   * happen to live at that path; hashing the bytes closes that second half of the gap — a renamed
-   * Node binary with a forged adjacent manifest, placed at the expected path, still fails here.
-   */
-  expectedExecutorSha256: string;
+  // No executor version, realpath or sha256. Those three were deployment-wide values the claimant's
+  // executing image had to equal, which admitted exactly one CLI build per host while every project
+  // runs its own session on whichever build it started with. The image is recorded now, not
+  // required — see clause 2 in `verifyClaudeIdentity` for what that withdraws.
   /**
    * The peer protocol version this deployment's transport already authenticated the connection
    * as speaking. Established outside this module (daemon/MCP transport, out of scope here) —
@@ -943,8 +931,13 @@ export interface CanonicalSelfClaimReceipt {
   sessionSecret: string | null;
   binding: RoleBinding;
   derivedSessionUuid: string;
-  executorImageVersion: string;
-  executorImagePath: string;
+  /**
+   * What the claimant's executing image was observed to be — recorded, never required. `null` when
+   * the scan could not run or found no usable image (a binary the updater has already deleted from
+   * disk resolves to nothing); the claim is admitted either way.
+   */
+  executorImageVersion: string | null;
+  executorImagePath: string | null;
   buzzAddress: string;
 }
 
@@ -966,24 +959,29 @@ export interface CanonicalSelfClaimDeps {
 
 /** Read-only evidence only: no owner authority, session creation or binding writes.
  * callerPid must come from authenticated transport or a deployment-owned session pin,
- * never a delegated request. Native UUID and executor evidence are independently read.
+ * never a delegated request. The native UUID is independently read and compared; the executing
+ * image is independently read and recorded, never compared.
  */
 /**
- * What identity verification needs, which is the executor pins plus the set of session UUIDs this
- * caller considers admissible. It is a set of bare UUIDs rather than `CanonicalAdoptableSession`
- * entries because the second caller of this function — the daemon's delegated CTO binding — checks
- * one already-provisioned session and has no project or Buzz identity to entitle; the entitlement
- * half is enforced by `CanonicalSelfClaim` against the entry it resolves, not here.
+ * What identity verification needs: the set of session UUIDs this caller considers admissible, and
+ * nothing else. It used to carry the executor pins as well — a version, a realpath and a sha256 the
+ * executing image had to equal — and clause 2 below no longer compares any of them. The daemon's
+ * delegated CTO binding still parses and passes those three per target
+ * (`src/daemon/cto-binding-runtime.ts`), and nothing here reads them.
+ *
+ * It is a set of bare UUIDs rather than `CanonicalAdoptableSession` entries because that second
+ * caller checks one already-provisioned session and has no project or Buzz identity to entitle;
+ * the entitlement half is enforced by `CanonicalSelfClaim` against the entry it resolves, not here.
  */
-export type ClaudeIdentityConfig = Omit<CanonicalSelfClaimConfig,
-  "canonicalSessions" | "canonicalBuzzChannelId" | "expectedPeerProtocolVersion" | "expectedPeerIdentity"> & {
+export interface ClaudeIdentityConfig {
   canonicalSessionUuids: readonly string[];
-};
+}
 export type ClaudeIdentityRequest = Pick<CanonicalSelfClaimRequest,
   "callerPid" | "claimedPid" | "claimedSessionUuid">;
 export interface VerifiedClaudeIdentity {
   identity: DerivedClaimantIdentity;
-  image: ExecutingImageEvidence;
+  /** Observed, not verified: clause 2 resolves it and refuses on nothing it says. */
+  image: ExecutingImageEvidence | ExecutingImageProbeFailure | null;
   transcript: TranscriptEvidence;
 }
 export function verifyClaudeIdentity(
@@ -1095,58 +1093,30 @@ export function verifyClaudeIdentity(
       { observed: peer.protocolVersion, expected: peer.expectedProtocolVersion },
     );
   }
-  // Clause 2 — target version exactly the configured required executor version, from the
-  // executing image.
+  // Clause 2 — the executing image, observed and never required. It is resolved here and carried
+  // to the attestation as what the claimant was running; no claim is refused on what it says or on
+  // its absence.
+  //
+  // It used to have to equal a deployment-wide triple (`ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION`,
+  // `ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH`, `ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256`) while the
+  // deployment runs one session per project, each on whichever build it was started with. On
+  // 2026-09-27, with three such sessions live, one matched the triple, one ran the previous patch
+  // release and was refused CONFLICT, and one ran a build the updater had already deleted from
+  // disk — which no realpath or sha256 comparison can ever be satisfied by. At most one project
+  // could hold the role. The owner withdrew the comparison rather than restart live sessions, and
+  // with it went the two refusals that existed only to feed it: an image whose scan could not run
+  // (`ExecutingImageProbeFailure`, refused PROBE_FAILED) and one the scan resolved to nothing
+  // (`null`, refused CONFLICT). With nothing to compare against, neither says anything about
+  // whether this claimant is entitled.
+  //
+  // What that gives up, stated rather than implied: the realpath+sha256 pair is what refused a
+  // renamed binary with a forged adjacent manifest placed at the expected location — a process
+  // whose argv[0] reads `claude` while its bytes are something else. `looksLikeClaudeInvocation`
+  // checks only the name, so that process is no longer refused here. What remains is the kernel
+  // peer credential on the claim socket, the configured session UUID derived from the claimant's
+  // own argv, and the project that UUID's entry names.
   const image = imageInspector.resolve(identity.pid);
-  // The second consumer of the same scan, and the same distinction (#834). On Darwin the
-  // executing image is reached only through `lsof`, so an lsof that times out or is missing
-  // from the daemon's PATH resolves every image to nothing — which used to refuse a genuine
-  // claim as `CONFLICT`, the exact wrong-direction diagnosis the PATH row in
-  // `scripts/falsifiability-cases/` already names as this deployment's recurring shape.
-  if (isExecutingImageProbeFailure(image)) {
-    return deny(
-      ReasonCode.PROBE_FAILED,
-      "the claude ancestor's executing image could not be scanned, so this says nothing about which image it is",
-      { pid: identity.pid, probe: "lsof", probeFailure: image.probeFailure },
-    );
-  }
-  if (!image) {
-    return deny(
-      ReasonCode.CONFLICT,
-      "the claude ancestor's executing image could not be resolved",
-      { pid: identity.pid },
-    );
-  }
-  if (image.version !== config.requiredExecutorVersion) {
-    return deny(
-      ReasonCode.CONFLICT,
-      "the claude ancestor's executing image is not the required version",
-      {
-        observedVersion: image.version,
-        requiredVersion: config.requiredExecutorVersion,
-        imagePath: image.imagePath,
-      },
-    );
-  }
-  // Clause 2 — the executing image is the exact expected artifact, not merely a file that
-  // reports the expected version. A version string (and even the resolved path alone) can be
-  // spoofed by a renamed binary with a forged adjacent manifest placed at the expected
-  // location; comparing both the realpath and a hash of the actual bytes closes that gap.
-  if (image.imagePath !== config.expectedExecutorRealpath) {
-    return deny(
-      ReasonCode.CONFLICT,
-      "the claude ancestor's executing image is not at the expected realpath",
-      { observed: image.imagePath, expected: config.expectedExecutorRealpath },
-    );
-  }
-  if (image.sha256 !== config.expectedExecutorSha256) {
-    return deny(
-      ReasonCode.CONFLICT,
-      "the claude ancestor's executing image does not hash to the expected sha256",
-      { observed: image.sha256, expected: config.expectedExecutorSha256, imagePath: image.imagePath },
-    );
-  }
-  // Clause 2 — pid/startedAt re-verified immediately after the image check. Both the ancestry
+  // Clause 2 — pid/startedAt re-verified immediately after the image resolution. Both the ancestry
   // walk and this image resolution did real, non-instantaneous I/O; a pid reused in between
   // must be caught here, before the transcript check or the async Buzz boundary below run
   // anything else against `identity.pid` as though it still names the verified process.
@@ -1224,14 +1194,12 @@ export class CanonicalSelfClaim {
     private readonly config: CanonicalSelfClaimConfig,
     deps: CanonicalSelfClaimDeps = {},
   ) {
-    // Fail closed before any effect: these three are deployment-private configuration with no
+    // Fail closed before any effect: the channel is deployment-private configuration with no
     // fallback to a real value. A blank string (an absent env var coerced by a caller, or a typo
     // in the composition root) must construct nothing, never silently adopt a hardcoded default.
+    // One row since the three executor pins that shared this table were withdrawn.
     for (const [field, value] of [
-      ["requiredExecutorVersion", config.requiredExecutorVersion],
       ["canonicalBuzzChannelId", config.canonicalBuzzChannelId],
-      ["expectedExecutorRealpath", config.expectedExecutorRealpath],
-      ["expectedExecutorSha256", config.expectedExecutorSha256],
     ] as const) {
       if (typeof value !== "string" || value.trim().length === 0) {
         throw new Error(
@@ -1406,7 +1374,7 @@ export class CanonicalSelfClaim {
   #mutate(
     request: CanonicalSelfClaimRequest,
     identity: DerivedClaimantIdentity,
-    image: ExecutingImageEvidence,
+    image: VerifiedClaudeIdentity["image"],
     transcript: TranscriptEvidence,
     buzzAddress: string,
     /**
@@ -1417,6 +1385,10 @@ export class CanonicalSelfClaim {
      */
     entry: CanonicalAdoptableSession,
   ): Decision<CanonicalSelfClaimReceipt> {
+    // An observation, never an authority (clause 2): a scan that could not run and a scan that
+    // found no usable image are both recorded as no image, and neither refused anything upstream.
+    // The second is already `null`; the type guard folds the first into it.
+    const observedImage = isExecutingImageProbeFailure(image) ? null : image;
     // `db.txDecision` — not `db.tx` — is load-bearing here. `tx()` treats a denied `Decision` as
     // an ordinary return value and commits it; a nested `bindings.bind()` denial (BindingRegistry
     // uses `txDecision` itself, which at depth > 0 just hands the Decision back as data rather
@@ -1595,8 +1567,8 @@ export class CanonicalSelfClaim {
         pid: identity.pid,
         startedAt: identity.startedAt,
         cwd: identity.cwd,
-        executorImagePath: image.imagePath,
-        executorVersion: image.version,
+        executorImagePath: observedImage?.imagePath ?? null,
+        executorVersion: observedImage?.version ?? null,
         transcriptPath: transcript.path,
         transcriptSizeBytes: transcript.sizeBytes,
         peerProtocolVersion: request.peerProtocolVersion,
@@ -1632,8 +1604,8 @@ export class CanonicalSelfClaim {
         sessionSecret: created.sessionSecret,
         binding: bound.value,
         derivedSessionUuid: identity.sessionUuid,
-        executorImageVersion: image.version,
-        executorImagePath: image.imagePath,
+        executorImageVersion: observedImage?.version ?? null,
+        executorImagePath: observedImage?.imagePath ?? null,
         buzzAddress,
       });
     });

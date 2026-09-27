@@ -30,13 +30,10 @@ Optional Buzz configuration uses the same Keychain service and these account nam
 Buzz ingress settings must also be installed because the daemon rejects an unauthenticated
 actor-binding setup.
 
-Canonical self-claim is an optional, atomic activation group. Provision all six accounts under
+Canonical self-claim is an optional, atomic activation group. Provision all three accounts under
 that same Keychain service to enable it:
 
 - `ACP_CANONICAL_SESSIONS_JSON`
-- `ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION`
-- `ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH`
-- `ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256`
 - `ACP_CANONICAL_CTO_PEER_PROTOCOL`
 - `ACP_CANONICAL_CTO_BUZZ_PURPOSE`
 
@@ -53,7 +50,7 @@ An invalid or empty array refuses startup, and the refusal names the variable, n
 
 With none present, self-claim is disabled. Empty and whitespace-only values count as absent.
 Any nonempty proper subset refuses startup before config access, database opening, migration,
-or listener creation; diagnostics name missing variables, never their values. With all six
+or listener creation; diagnostics name missing variables, never their values. With all three
 present, `ACP_BUZZ_CHANNEL` is also required. Channel-only transport configuration remains valid.
 The session list, protocol and purpose have no defaults: the configured values are retained from
 daemon entry and passed unchanged to the claim boundary.
@@ -68,6 +65,18 @@ They held one session's uuid and one session's Buzz identity, so a second canoni
 be expressed and the project a claimant asked for was compared against nothing (#1005).
 `ACP_CANONICAL_SESSIONS_JSON` replaces both, and a deployment that still provisions either of the
 old two is not refused — they are simply ignored.
+
+`ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION`, `ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH` and
+`ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256` used to be three of the six. They pinned one CLI build —
+its version, its resolved path and the sha256 of its bytes — that every claimant's executing image
+had to equal, while each project's session runs whichever build it was started with; a session on
+an earlier build was refused, and one whose build the updater had since deleted from disk could
+never be admitted at all. The claim now records the executing image and requires nothing of it.
+That also withdraws what the realpath and sha256 comparison defended against: a same-user process
+exec'd from a binary renamed `claude` is no longer told apart by its bytes, and what bounds a claim
+is the kernel peer credential on the claim socket, the session UUID in the claimant's own argv and
+the project that UUID's entry names. A deployment that still provisions any of the three is not
+refused — they are simply ignored.
 
 The generated launcher clears all six inherited variables together before its first Keychain
 lookup, then reads each through the existing optional-account loop. These values are not written
@@ -97,11 +106,12 @@ that a CLI whose shebang resolves its interpreter by name receives the one this 
 carries.
 
 `/usr/sbin` is last, and is required for `lsof`, which ships only from there. A canonical
-self-claim resolves the claiming process's executing image by spawning `lsof` under its bare name
-and consulting no environment, so this `PATH` is the only channel that reaches the call: an
-absolute path baked into a variable has no reader. Without the directory every scan returns empty,
-the executing image resolves to null, and a genuine claim is refused as `CONFLICT` with evidence
-that carries a pid and names neither the missing tool nor the cause. It is admitted on the same
+self-claim reads the claiming process's working directory, and observes its executing image, by
+spawning `lsof` under its bare name and consulting no environment, so this `PATH` is the only
+channel that reaches the call: an absolute path baked into a variable has no reader. Without the
+directory the scan cannot run, the working directory cannot be read, and a genuine claim is
+refused as `PROBE_FAILED`. The executing image goes unobserved in the same case, which on its own
+refuses nothing: it is recorded, not required. The directory is admitted on the same
 footing as `/usr/bin` and `/bin`: a root-owned, mode `755`, SIP-`restricted`, non-user-writable
 system directory listed in `/etc/paths`, holding none of the names this control plane grants
 authority by. A provider directory is user-writable and carries unrelated siblings, which is why

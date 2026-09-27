@@ -104,9 +104,6 @@ it("completes daemon startup with a revoked PRIMARY_CTO binding and keeps the cl
         buzzActorId: pubkey,
       },
     ]),
-    ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION: "0.0.0-startup-test",
-    ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH: join(root, "executor"),
-    ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256: `sha256:${"0".repeat(64)}`,
     ACP_CANONICAL_CTO_PEER_PROTOCOL: "acp.startup-test/v9",
     ACP_CANONICAL_CTO_BUZZ_PURPOSE: "continuity:STARTUP_TEST_CTO",
   })) vi.stubEnv(key, value);

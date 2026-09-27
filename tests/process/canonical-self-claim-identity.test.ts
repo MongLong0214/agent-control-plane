@@ -53,7 +53,7 @@ const resolvedImage = (pid: number): ExecutingImageEvidence | null => {
  */
 const QUICK_CHILD_BUDGET_MS = 10_000;
 
-const TEST_REQUIRED_EXECUTOR_VERSION = "9.0.0-test";
+const TEST_EXECUTOR_VERSION = "9.0.0-test";
 /**
  * The two versions the symlink/image-divergence test below exercises. Both carry a `-symlink-*`
  * suffix so neither can be mistaken for a real deployment version; only their
@@ -257,7 +257,7 @@ describe("the reusable executable image is reused, not recreated", () => {
 describe("real process ancestry — ps-backed, not a fake", () => {
   it("reports the exact command line, a resolvable start time, and the real cwd of a live process", async () => {
     const root = tempRoot();
-    const claude = writeVersionedClaude(TEST_REQUIRED_EXECUTOR_VERSION);
+    const claude = writeVersionedClaude(TEST_EXECUTOR_VERSION);
     const sessionUuid = "33333333-3333-4333-8333-333333333333";
     const child = spawnHeld(claude, ["--session-id", sessionUuid], root);
     await waitUntil(() => child.pid !== undefined, "child pid to be assigned");
@@ -291,7 +291,7 @@ describe("real process ancestry — ps-backed, not a fake", () => {
     "the real OS argv reader keeps one positional argument containing spaces and selector-looking text as exactly one argv element",
     async () => {
       const root = tempRoot();
-      const claude = writeVersionedClaude(TEST_REQUIRED_EXECUTOR_VERSION);
+      const claude = writeVersionedClaude(TEST_EXECUTOR_VERSION);
       const sessionUuid = "55555555-5555-4555-8555-555555555555";
       // `spawn` with an argument array never goes through a shell, so this one array element
       // reaches the kernel as exactly one argv entry — the shape a real attacker-controlled or
@@ -378,7 +378,7 @@ describe("real process ancestry — ps-backed, not a fake", () => {
 
   it("walks a real two-hop ancestry (grandchild -> claude parent) to the claude process", async () => {
     const root = tempRoot();
-    const claude = writeVersionedClaude(TEST_REQUIRED_EXECUTOR_VERSION);
+    const claude = writeVersionedClaude(TEST_EXECUTOR_VERSION);
     const sessionUuid = "44444444-4444-4444-8444-444444444444";
     const resultPath = join(root, "grandchild-pid.txt");
     // The "claude" process spawns a plain, non-claude grandchild and writes its pid to disk —
@@ -493,7 +493,7 @@ describe("real executing-image resolution — symlink and image can diverge", ()
   );
 
   it(
-    "refuses rather than hashes a decoy when the resolved image path is replaced after the running process opened it",
+    "resolves no image rather than hashing a decoy when the resolved image path is replaced after the running process opened it",
     async () => {
       const root = tempRoot();
       const claude = writeVersionedClaude("1.0.0-fd-swap-test");
@@ -531,9 +531,10 @@ describe("real executing-image resolution — symlink and image can diverge", ()
         expect(after, "the executing image could not be resolved after the swap").not.toBeNull();
         expect(after!.sha256).toBe(before!.sha256);
       } else {
-        // Darwin has no magic-symlink equivalent: refused, not the decoy's hash. The bytes this
+        // Darwin has no magic-symlink equivalent: no image, not the decoy's hash. The bytes this
         // reads are bound to the fd `fstat` verified against the kernel's own record of what the
-        // process has open, not re-resolved from the path a second time.
+        // process has open, not re-resolved from the path a second time. The claim records that
+        // as no image and admits or refuses on its other clauses — nothing is compared to it.
         expect(after).toBeNull();
       }
     },
@@ -541,12 +542,13 @@ describe("real executing-image resolution — symlink and image can diverge", ()
   );
 
   it("a forged adjacent manifest cannot change the version of the kernel-resolved image", async () => {
-    // The version authority is the resolved image's own `/versions/<version>/` path segment, not
-    // any file living beside it. This writes a real, correctly-versioned image, then overwrites
-    // its adjacent `package.json` with a different, forged version string — the exact shape a
-    // deployment's own manifest write, or an attacker with write access to that one file but not
-    // the version-directory layout, could produce — and asserts the resolved version is still the
-    // real one, unmoved by the forgery.
+    // The version the claim records is read from the resolved image's own `/versions/<version>/`
+    // path segment, not from any file living beside it. It is an observation now — no configured
+    // version is compared to it and no claim is refused on it — so what this protects is the
+    // record, not an admission: a receipt should name the build the process actually loaded. This
+    // writes a real, correctly-versioned image, then overwrites its adjacent `package.json` with a
+    // different, forged version string — the shape a deployment's own manifest write could produce
+    // — and asserts the resolved version is still the real one, unmoved by the forgery.
     const root = tempRoot();
     const claude = writeVersionedClaude(SYMLINK_TEST_VERSION_REAL);
     writeFileSync(
@@ -567,9 +569,9 @@ describe("real executing-image resolution — symlink and image can diverge", ()
     expect(image!.version).not.toBe("0.0.1-forged-manifest-version");
   });
 
-  it("resolves the exact required version end to end", async () => {
+  it("resolves the version the executable is laid out as, end to end", async () => {
     const root = tempRoot();
-    const claude = writeVersionedClaude(TEST_REQUIRED_EXECUTOR_VERSION);
+    const claude = writeVersionedClaude(TEST_EXECUTOR_VERSION);
     const child = spawnHeld(claude, [], root);
     await waitUntil(() => child.pid !== undefined, "child pid to be assigned");
 
@@ -579,7 +581,7 @@ describe("real executing-image resolution — symlink and image can diverge", ()
       image = resolvedImage(child.pid!);
     }
     expect(image).not.toBeNull();
-    expect(image!.version).toBe(TEST_REQUIRED_EXECUTOR_VERSION);
+    expect(image!.version).toBe(TEST_EXECUTOR_VERSION);
   });
 });
 

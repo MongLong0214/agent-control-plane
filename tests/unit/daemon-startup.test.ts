@@ -35,7 +35,7 @@ const BUZZ_VARIABLES = ["ACP_BUZZ_INGRESS_SECRET", "ACP_BUZZ_ALLOWED_ACTORS", "B
 const BUZZ_SECRET = "startup-test-buzz-secret";
 const BUZZ_ACTOR = "npub-startup-owner";
 /**
- * The exact six-variable canonical self-claim activation group, separate from the pre-existing
+ * The exact three-variable canonical self-claim activation group, separate from the pre-existing
  * shared `ACP_BUZZ_CHANNEL` transport setting this group also reads once fully configured.
  * Deleted from the child's environment unless a case asks for them, for the same reason
  * `TELEGRAM_VARIABLES` is: an inherited value from the parent process's own environment would
@@ -45,14 +45,23 @@ const BUZZ_ACTOR = "npub-startup-owner";
  */
 const CANONICAL_ACTIVATION_VARIABLES = [
   "ACP_CANONICAL_SESSIONS_JSON",
-  "ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION",
-  "ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH",
-  "ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256",
   "ACP_CANONICAL_CTO_PEER_PROTOCOL",
   "ACP_CANONICAL_CTO_BUZZ_PURPOSE",
 ] as const;
+/**
+ * The three executor-image pins that used to make the group six. The claim no longer compares the
+ * executing image to anything, so the daemon reads none of them: a deployment still provisioning
+ * them is neither activated nor refused by them. They are scrubbed from every child's environment
+ * like the rest, so the cases that set them are the only ones that do.
+ */
+const WITHDRAWN_EXECUTOR_VARIABLES = [
+  "ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION",
+  "ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH",
+  "ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256",
+] as const;
 const CANONICAL_ENVIRONMENT_VARIABLES = [
   ...CANONICAL_ACTIVATION_VARIABLES,
+  ...WITHDRAWN_EXECUTOR_VARIABLES,
   "ACP_BUZZ_CHANNEL",
 ] as const;
 
@@ -298,9 +307,6 @@ describe("canonical self-claim activation is an atomic pre-effect daemon contrac
         buzzActorId: "buzz:startup-test-canonical-cto",
       },
     ]),
-    ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION: "0.0.0-startup-test",
-    ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH: "/fake/versions/current/claude",
-    ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256: `sha256:${"0".repeat(64)}`,
     ACP_CANONICAL_CTO_PEER_PROTOCOL: "acp.startup-test/v9",
     ACP_CANONICAL_CTO_BUZZ_PURPOSE: "continuity:STARTUP_TEST_CTO",
     ACP_BUZZ_CHANNEL: "channel:startup-test-canonical",
@@ -308,6 +314,12 @@ describe("canonical self-claim activation is an atomic pre-effect daemon contrac
   const COMPLETE_CANONICAL_GROUP = Object.fromEntries(
     CANONICAL_ACTIVATION_VARIABLES.map((name) => [name, COMPLETE_CANONICAL_ENV[name]!]),
   ) as Record<(typeof CANONICAL_ACTIVATION_VARIABLES)[number], string>;
+  /** What a deployment provisioned for the six-variable group still carries. Synthetic. */
+  const WITHDRAWN_EXECUTOR_ENV: NodeJS.ProcessEnv = {
+    ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION: "0.0.0-startup-test",
+    ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH: "/fake/versions/current/claude",
+    ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256: `sha256:${"0".repeat(64)}`,
+  };
 
   const withCanonicalProcessEnvironment = async (
     values: NodeJS.ProcessEnv,
@@ -338,7 +350,7 @@ describe("canonical self-claim activation is an atomic pre-effect daemon contrac
       },
     }) as Parameters<typeof main>[0];
 
-  it("starts the daemon with canonical self-claim disabled when all six activation variables are absent", async () => {
+  it("starts the daemon with canonical self-claim disabled when all three activation variables are absent", async () => {
     // This is the exact regression: a deployment carrying only the pre-existing MCP/operator
     // configuration (no canonical env vars at all) must reach a normal, running daemon — not
     // exit before `ControlPlane`, migration refusal, or the operator door can run.
@@ -404,7 +416,7 @@ describe("canonical self-claim activation is an atomic pre-effect daemon contrac
     // The group's size is pinned once, deliberately; the sweep's coverage is derived from it. The
     // number used to be written out here as well (`126`, for a seven-variable group), which made
     // one contract change a two-site edit and the second site the one that goes stale.
-    expect(CANONICAL_ACTIVATION_VARIABLES.length).toBe(6);
+    expect(CANONICAL_ACTIVATION_VARIABLES.length).toBe(3);
     expect(rejectedSubsets).toBe((1 << CANONICAL_ACTIVATION_VARIABLES.length) - 2);
   });
 
@@ -440,7 +452,7 @@ describe("canonical self-claim activation is an atomic pre-effect daemon contrac
     }
   });
 
-  it("fails closed before config when all six activation variables are set but ACP_BUZZ_CHANNEL is not", async () => {
+  it("fails closed before config when all three activation variables are set but ACP_BUZZ_CHANNEL is not", async () => {
     const { ACP_BUZZ_CHANNEL: _omit, ...withoutChannel } = COMPLETE_CANONICAL_ENV;
     for (const channel of [undefined, "", " \t "]) {
       let configReads = 0;
@@ -488,7 +500,7 @@ describe("canonical self-claim activation is an atomic pre-effect daemon contrac
     expectNoResidue(result, diagnostics);
   }, 40_000);
 
-  it("starts the canonical self-claim listener when the full synthetic six-variable group is configured", async () => {
+  it("starts the canonical self-claim listener when the full synthetic three-variable group is configured", async () => {
     const result = await runMain({ seedState: true, canonical: COMPLETE_CANONICAL_ENV });
 
     const diagnostics =
@@ -499,6 +511,39 @@ describe("canonical self-claim activation is an atomic pre-effect daemon contrac
     expect(result.stdout, diagnostics).not.toContain("canonical self-claim disabled");
     expectNoResidue(result, diagnostics);
   }, 40_000);
+
+  it("ignores the withdrawn executor variables: alone they are no partial group, and beside a complete one they refuse nothing", async () => {
+    // A partial group throws before config is read; a disabled or complete one reads it. The
+    // poison getter is how the two are told apart without starting anything. Each withdrawn
+    // variable alone, and all three together, must read as "nothing is set" — counting any of them
+    // toward the group would turn a deployment that never activated into a refused one.
+    for (const values of [
+      ...WITHDRAWN_EXECUTOR_VARIABLES.map((name) => ({ [name]: WITHDRAWN_EXECUTOR_ENV[name] })),
+      WITHDRAWN_EXECUTOR_ENV,
+      { ...COMPLETE_CANONICAL_ENV, ...WITHDRAWN_EXECUTOR_ENV },
+    ]) {
+      let configReads = 0;
+      await withCanonicalProcessEnvironment(values, async () => {
+        await expect(main(poisonConfigOptions(() => (configReads += 1))), JSON.stringify(Object.keys(values)))
+          .rejects.toThrow("poison config getter was read");
+      });
+      expect(configReads, `${JSON.stringify(Object.keys(values))} never reached the config getter`).toBe(1);
+    }
+  });
+
+  it("starts the listener for a complete group still carrying the withdrawn executor variables, and stays disabled for those variables alone", async () => {
+    const carried = await runMain({ seedState: true, canonical: { ...COMPLETE_CANONICAL_ENV, ...WITHDRAWN_EXECUTOR_ENV } });
+    const carriedDiagnostics = `status=${carried.status}\nstdout:\n${carried.stdout}\nstderr:\n${carried.stderr}`;
+    expect(carried.status, carriedDiagnostics).toBe(0);
+    expect(carried.stdout, carriedDiagnostics).toContain("canonical self-claim listener started");
+    expectNoResidue(carried, carriedDiagnostics);
+
+    const alone = await runMain({ seedState: true, canonical: WITHDRAWN_EXECUTOR_ENV });
+    const aloneDiagnostics = `status=${alone.status}\nstdout:\n${alone.stdout}\nstderr:\n${alone.stderr}`;
+    expect(alone.status, aloneDiagnostics).toBe(0);
+    expect(alone.stdout, aloneDiagnostics).toContain("canonical self-claim disabled");
+    expect(alone.stdout, aloneDiagnostics).not.toContain("canonical self-claim listener started");
+  }, 55_000);
 });
 
 describe("#1005: an invalid adoptable set refuses startup, not the first claim", () => {
