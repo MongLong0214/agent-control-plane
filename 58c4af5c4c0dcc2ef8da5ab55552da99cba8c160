@@ -1,0 +1,22 @@
+Limit: a claim that throws is not a returned decision and leaves no row; the operator's own parse refusals and the listener's peer-credential refusals never reach `claim()`, so they leave none either
+Limit: the refusal row's project_id is the request's raw caller text, unbounded and unredacted. Bounding it would need a project-id pattern that exists nowhere in src/, and inventing one here would make this file a second authority for what a project id is; the socket admits only a kernel-verified same-uid peer, which could write the database file directly
+Limit: the admission row is written after the mutation commits, so a crash between them leaves a binding with no row, and a database error inside record() would throw out of a claim whose binding is already committed
+Ruled-out: recording the audit row beside each `deny` in this file | a per-site record means the next refusal someone adds silently has no row, and that absence is what hid a weeks-long adoption outage, so the write sits at the single boundary where claim() returns instead
+Warn: the rollback oracle in both the unit and the process suite now excludes the two decision kinds from its audit_events count, so a leak into audit_events under those two kinds would not be caught there — the five new unit cases, three of which assert the whole table grows by exactly one, are what cover it
+Record-Id: r-5586d6cc13d9
+Provenance: inherited c005625b9c5530853110626f530b5e323d33286c
+
+Limit: a refusal row names its project only when `projects` already holds it and null otherwise, so the row cannot tell an unregistered id from a lookup that failed; the lookup runs after the decision is final and outside the mutation's transaction
+Ruled-out: leaving the two decision kinds out of the rollback oracles' count | an exclusion that wide passes a genuine leak written under either kind, so each rollback case now asserts its whole audit delta and allows exactly the one row its own refusal produced
+Warn: the rollback oracles read the audit delta with `ORDER BY event_id LIMIT -1 OFFSET <count>`, which is only sound while audit_events stays append-only — a delete or a reordering would make them read the wrong rows
+Warn: the predecessor commit's record says the refusal row's project_id is the request's raw caller text and that the oracles exclude the two decision kinds; both were true when written and neither is true after this commit
+Record-Id: r-48936b149b38
+Provenance: inherited c5710afbfbd87b1463d42b49ddf8275a5d310bcc
+
+Limit: a refusal whose own audit insert fails returns its reason code and leaves no row, and nothing records that the row was lost: the refusal, its reason code and the fact a claim was attempted are then absent from audit_events, and the class has no logger to say so either
+Limit: the injected failure is a spy on Db.run that throws a plain Error; SQLite's own abort on a full disk or an I/O error, where it ends the transaction before tx() issues its ROLLBACK, is not exercised, and tx() swallowing a failed ROLLBACK was checked by reading only
+Ruled-out: allowing the audit throw to escape claim() | a refusal must reach its caller with its own reason code rather than as a throw the listener turns into INTERNAL_ERROR, and on the admission path that answer contradicted a binding the database had already committed
+Warn: AUDIT_WRITE_FAILED is a new reason code on the external contract; a caller that switches exhaustively on this listener's refusals sees a code it has never seen before
+Warn: two predecessor records are now false: c005625b's Limit that the admission row is written after the mutation commits, and c5710afb's Limit that the registry lookup runs after the decision and outside the transaction, which now holds for refusals alone because only they make the lookup
+Record-Id: r-c3512988253d
+Provenance: inherited 2723a1660078b9aaa945dbd8ca38239cbf834f21
