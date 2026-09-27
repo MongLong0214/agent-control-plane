@@ -45,14 +45,16 @@ const depsWith = (core: ReturnType<typeof makeCore>): CanonicalSelfClaimOperator
   config: {
     expectedPeerProtocolVersion: "fixture-protocol",
     expectedPeerIdentity: `uid:${PEER.uid}`,
-    canonicalSessionUuid: REQUEST.claimedSessionUuid,
+    canonicalSessions: [{
+      sessionUuid: REQUEST.claimedSessionUuid,
+      projectId: REQUEST.projectId,
+      buzzActorId: "fixture-actor",
+    }],
     requiredExecutorVersion: "0.0.0",
     canonicalBuzzChannelId: "fixture-channel",
     expectedExecutorRealpath: "/tmp/fixture-claude",
     expectedExecutorSha256: `sha256:${"b".repeat(64)}`,
     peerProtocolVersion: "fixture-protocol",
-    buzzChannelId: "fixture-channel",
-    buzzActorId: "fixture-actor",
     buzzPurpose: "fixture-purpose",
   },
 });

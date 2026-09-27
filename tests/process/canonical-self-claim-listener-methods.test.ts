@@ -94,6 +94,8 @@ const tempRoot = (): string => {
 
 let freshNonces = 0;
 const TEST_SESSION_UUID = "99999999-9999-4999-8999-999999999999";
+/** The one project the configured entry entitles `TEST_SESSION_UUID` to hold. */
+const TEST_PROJECT_ID = "prj_canonical_fixture";
 const BUZZ_ACTOR_ID = "buzz:canonical-cto";
 const BUZZ_CHANNEL_ID = "channel:test-canonical";
 const PEER_PROTOCOL = "acp.operator/v1";
@@ -221,7 +223,7 @@ const depsFor = (cp: Harness["cp"], root: string): CanonicalSelfClaimOperatorDep
   config: {
     expectedPeerProtocolVersion: PEER_PROTOCOL,
     expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
-    canonicalSessionUuid: TEST_SESSION_UUID,
+    canonicalSessions: [{ sessionUuid: TEST_SESSION_UUID, projectId: TEST_PROJECT_ID, buzzActorId: BUZZ_ACTOR_ID }],
     // Synthetic — no test in this file spawns a real claimant far enough to reach the image
     // check; every path here denies earlier, at the method/mint-validation layer these tests
     // actually exercise (see this file's own docstring).
@@ -230,8 +232,6 @@ const depsFor = (cp: Harness["cp"], root: string): CanonicalSelfClaimOperatorDep
     expectedExecutorRealpath: "/fake/versions/current/claude",
     expectedExecutorSha256: `sha256:${"0".repeat(64)}`,
     peerProtocolVersion: PEER_PROTOCOL,
-    buzzChannelId: BUZZ_CHANNEL_ID,
-    buzzActorId: BUZZ_ACTOR_ID,
     buzzPurpose: BUZZ_PURPOSE,
   },
   claimDeps: { transcriptReader: makeDefaultTranscriptReader(join(root, "transcripts")) },

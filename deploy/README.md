@@ -30,30 +30,46 @@ Optional Buzz configuration uses the same Keychain service and these account nam
 Buzz ingress settings must also be installed because the daemon rejects an unauthenticated
 actor-binding setup.
 
-Canonical self-claim is an optional, atomic activation group. Provision all seven accounts under
+Canonical self-claim is an optional, atomic activation group. Provision all six accounts under
 that same Keychain service to enable it:
 
-- `ACP_CANONICAL_SESSION_UUID`
+- `ACP_CANONICAL_SESSIONS_JSON`
 - `ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION`
 - `ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH`
 - `ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256`
-- `ACP_CANONICAL_CTO_BUZZ_ACTOR_ID`
 - `ACP_CANONICAL_CTO_PEER_PROTOCOL`
 - `ACP_CANONICAL_CTO_BUZZ_PURPOSE`
 
+`ACP_CANONICAL_SESSIONS_JSON` is a JSON array of at most 32 entries, each naming one running
+session and the whole of what it is entitled to:
+
+```json
+[{"sessionUuid":"<uuid>","projectId":"<project>","buzzActorId":"<actor>"}]
+```
+
+A session may be adopted only as `PRIMARY_CTO` of the `projectId` its own entry names, and it
+speaks on Buzz as that entry's `buzzActorId`. No two entries may share any of the three values.
+An invalid or empty array refuses startup, and the refusal names the variable, never its contents.
+
 With none present, self-claim is disabled. Empty and whitespace-only values count as absent.
 Any nonempty proper subset refuses startup before config access, database opening, migration,
-or listener creation; diagnostics name missing variables, never their values. With all seven
+or listener creation; diagnostics name missing variables, never their values. With all six
 present, `ACP_BUZZ_CHANNEL` is also required. Channel-only transport configuration remains valid.
-The actor, protocol and purpose have no defaults: the configured values are retained from daemon
-entry and passed unchanged to the claim boundary.
+The session list, protocol and purpose have no defaults: the configured values are retained from
+daemon entry and passed unchanged to the claim boundary.
 
 `ACP_CANONICAL_CTO_WORKDIR` used to be the eighth. It pinned the one directory the canonical
 CTO's process could run from; nothing compares a working directory any more, so the group no
 longer carries a value that had to be kept correct for no reader. A deployment that still
 provisions it is not refused — the variable is simply ignored.
 
-The generated launcher clears all seven inherited variables together before its first Keychain
+`ACP_CANONICAL_SESSION_UUID` and `ACP_CANONICAL_CTO_BUZZ_ACTOR_ID` used to be two of the seven.
+They held one session's uuid and one session's Buzz identity, so a second canonical CTO could not
+be expressed and the project a claimant asked for was compared against nothing (#1005).
+`ACP_CANONICAL_SESSIONS_JSON` replaces both, and a deployment that still provisions either of the
+old two is not refused — they are simply ignored.
+
+The generated launcher clears all six inherited variables together before its first Keychain
 lookup, then reads each through the existing optional-account loop. These values are not written
 to the plist. Installation does not create `buzz-nostr-subscriber.json`; that separately provisioned
 subscriber config retains its existing authentication contract. Without it, an otherwise configured

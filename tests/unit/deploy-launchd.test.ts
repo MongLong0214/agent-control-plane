@@ -30,11 +30,10 @@ const installer = join(deploy, "install-launchd.sh");
 const template = join(deploy, "com.agentcontrolplane.agentcpd.plist.template");
 const label = "com.agentcontrolplane.agentcpd";
 const CANONICAL_ACTIVATION_VARIABLES = [
-  "ACP_CANONICAL_SESSION_UUID",
+  "ACP_CANONICAL_SESSIONS_JSON",
   "ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION",
   "ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH",
   "ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256",
-  "ACP_CANONICAL_CTO_BUZZ_ACTOR_ID",
   "ACP_CANONICAL_CTO_PEER_PROTOCOL",
   "ACP_CANONICAL_CTO_BUZZ_PURPOSE",
 ] as const;
@@ -233,9 +232,8 @@ if [[ "$target" == *"agentcpd.js" ]]; then
     "$(started_of "\${ACP_CLAUDE_BINARY:-}"),$(started_of "\${ACP_CODEX_BINARY:-}"),$(started_of "\${ACP_GROK_BINARY:-}")" \
     "$(command -v node || printf '<unresolvable>')" \
     "$(command -v acp-sibling-probe || printf '<unresolvable>')" \
-    "\${ACP_CANONICAL_SESSION_UUID-}" "\${ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION-}" \
+    "\${ACP_CANONICAL_SESSIONS_JSON-}" "\${ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION-}" \
     "\${ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH-}" "\${ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256-}" \
-    "\${ACP_CANONICAL_CTO_BUZZ_ACTOR_ID-}" \
     "\${ACP_CANONICAL_CTO_PEER_PROTOCOL-}" "\${ACP_CANONICAL_CTO_BUZZ_PURPOSE-}" \
     "$(command -v lsof || printf '<unresolvable>')" "$(lsof_scan)" \
     "\${ACP_HERMES_EXPECTED_LIVE_SESSION_ID-}" "\${ACP_HERMES_TARGET_SESSION_ID-}" \
@@ -372,6 +370,19 @@ const runGeneratedLauncher = (harness: InstallerHarness): CommandResult => {
   return { status: launched.status, stdout: launched.stdout, stderr: launched.stderr };
 };
 
+/**
+ * Field positions after the canonical activation group are derived from its length rather than
+ * written down. They were literals — `lsof: f[24]`, `lsofScan: f[25]`, hermes at `f[26 + index]` —
+ * and every change to the group's size silently moved all three onto their neighbours while the
+ * group's own fields, being derived, stayed right. That has already happened once (an eight-variable
+ * group becoming seven shifted lsof and lsofScan from 25/26 to 24/25) and the record of it warned
+ * about exactly these two indices while the hermes base, added later, was the third instance of the
+ * same mistake. Deriving them is what stops the next change from being the fourth.
+ */
+const CANONICAL_BASE_FIELD = 17;
+const LSOF_FIELD = CANONICAL_BASE_FIELD + CANONICAL_ACTIVATION_VARIABLES.length;
+const HERMES_BASE_FIELD = LSOF_FIELD + 2;
+
 /** What the daemon saw, by field. Positions are the contract; see the stub in `makeHarness`. */
 const launcherObservations = (harness: InstallerHarness) => {
   const f = readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
@@ -384,13 +395,13 @@ const launcherObservations = (harness: InstallerHarness) => {
     node: f[15],
     sibling: f[16],
     /** Where the daemon's PATH resolves the bare name `lsof`, and what a scan through it reports. */
-    lsof: f[24],
-    lsofScan: f[25],
+    lsof: f[LSOF_FIELD],
+    lsofScan: f[LSOF_FIELD + 1],
     canonical: Object.fromEntries(
-      CANONICAL_ACTIVATION_VARIABLES.map((name, index) => [name, f[17 + index] ?? ""]),
+      CANONICAL_ACTIVATION_VARIABLES.map((name, index) => [name, f[CANONICAL_BASE_FIELD + index] ?? ""]),
     ) as Record<(typeof CANONICAL_ACTIVATION_VARIABLES)[number], string>,
     hermes: Object.fromEntries(
-      HERMES_ADOPTION_VARIABLES.map((name, index) => [name, f[26 + index] ?? ""]),
+      HERMES_ADOPTION_VARIABLES.map((name, index) => [name, f[HERMES_BASE_FIELD + index] ?? ""]),
     ) as Record<(typeof HERMES_ADOPTION_VARIABLES)[number], string>,
   };
 };

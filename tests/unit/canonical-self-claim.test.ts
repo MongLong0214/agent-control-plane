@@ -30,6 +30,7 @@ import {
   looksLikeClaudeInvocation,
   lsofScanArgv,
   probeFailureKind,
+  MAX_CANONICAL_ADOPTABLE_SESSIONS,
   type CanonicalSelfClaimConfig,
   type CanonicalSelfClaimRequest,
   type ExecutingImageInspector,
@@ -48,6 +49,7 @@ const CWD = "/work/repo-factory";
 const PEER_PROTOCOL = "mcp/2025-06-18";
 const PEER_IDENTITY = "claude-code-mcp-client";
 const CHANNEL = "channel:test-canonical";
+const CANONICAL_ACTOR = "buzz:canonical-cto";
 const BUZZ_ADDRESS = "buzz://test-canonical-cto";
 /** Synthetic — never a value that names a real deployment's version. */
 const TEST_REQUIRED_EXECUTOR_VERSION = "0.0.0-test";
@@ -172,8 +174,17 @@ const fakeTranscriptReader = (present = true): TranscriptReader => ({
   locate: (sessionUuid) => (present ? { path: `/fake/transcripts/${sessionUuid}.jsonl`, sizeBytes: 42 } : null),
 });
 
-const baseConfig = (overrides: Partial<CanonicalSelfClaimConfig> = {}): CanonicalSelfClaimConfig => ({
-  canonicalSessionUuid: CANON,
+/**
+ * The adoptable set this deployment is configured with, for a harness whose subject is entitled to
+ * exactly one project. `projectId` is a parameter rather than a constant because it is now half of
+ * what the subject is configured for: a harness that built the subject without naming the project
+ * would be free to claim a different one, which is the defect this set exists to close.
+ */
+const baseConfig = (
+  projectId: string,
+  overrides: Partial<CanonicalSelfClaimConfig> = {},
+): CanonicalSelfClaimConfig => ({
+  canonicalSessions: [{ sessionUuid: CANON, projectId, buzzActorId: CANONICAL_ACTOR }],
   requiredExecutorVersion: TEST_REQUIRED_EXECUTOR_VERSION,
   canonicalBuzzChannelId: CHANNEL,
   expectedExecutorRealpath: TEST_EXPECTED_EXECUTOR_REALPATH,
@@ -202,14 +213,13 @@ const baseRequest = (
   expectedBindingGeneration: 1,
   peerProtocolVersion: PEER_PROTOCOL,
   peerIdentity: PEER_IDENTITY,
-  buzzChannelId: CHANNEL,
-  buzzActorId: "buzz:canonical-cto",
   buzzPurpose: "continuity:PRIMARY_CTO",
   ...overrides,
 });
 
 const makeSubject = (
   core: CoreHarness,
+  projectId: string,
   options: {
     configOverrides?: Partial<CanonicalSelfClaimConfig>;
     chain?: readonly ProcessSnapshot[];
@@ -227,7 +237,7 @@ const makeSubject = (
     core.bindings,
     options.buzzActorAuthenticator ?? fakeBuzzActorAuthenticator(),
     options.resolveBuzzAddress ?? fakeResolveBuzzAddress(),
-    baseConfig(options.configOverrides),
+    baseConfig(projectId, options.configOverrides),
     {
       processInspector: chainInspector(options.chain ?? standardChain()),
       imageInspector: options.imageInspector ?? fakeImageInspector(),
@@ -240,7 +250,7 @@ const successorFixture = async () => {
   const core = makeCore();
   const projectId = "prj_successor";
   insertProject(core, projectId);
-  const subject = makeSubject(core);
+  const subject = makeSubject(core, projectId);
   const first = await subject.claim(baseRequest(core, projectId));
   if (!first.allowed) throw new Error(JSON.stringify(first));
   const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
@@ -387,8 +397,18 @@ describe("same-live successor transaction", () => {
   it.each(["buzz", "draining", "active", "work"] as const)(
     "same-live recovery refuses %s mismatch without effects", async (condition) => {
       const { core, first, request, roleKey, projectId } = await successorFixture();
-      const subject = makeSubject(core);
-      if (condition === "buzz") request.buzzActorId = "buzz:other";
+      // The "buzz" condition used to mutate `request.buzzActorId`, which no longer exists: the
+      // identity comes from the configured entry now, so the only way the predecessor's stored
+      // actor can disagree is for the deployment's own entry to name a different one. That is a
+      // stricter version of the same case — it proves the comparison reads the configured value
+      // rather than anything the claimant can restate.
+      const subject = makeSubject(core, projectId, condition === "buzz"
+        ? {
+          configOverrides: {
+            canonicalSessions: [{ sessionUuid: CANON, projectId, buzzActorId: "buzz:other" }],
+          },
+        }
+        : {});
       if (condition === "draining") expect(core.sessions.transition(first.sessionId, SessionLifecycle.DRAINING).allowed).toBe(true);
       if (condition === "active") expect(core.bindings.bind({ role: Role.CEO, sessionId: first.sessionId }).allowed).toBe(true);
       if (condition === "work") core.db.run(
@@ -405,28 +425,83 @@ describe("same-live successor transaction", () => {
 });
 
 describe("deployment identity is required, deployment-private configuration (#760)", () => {
+  const CONFIG_PROJECT = "prj_config_fixture";
+
   it("fails closed, before any effect, when a required deployment value is missing or blank", () => {
     const core = makeCore();
-    expect(() => makeSubject(core, { configOverrides: { canonicalSessionUuid: "" } })).toThrow(
-      /canonicalSessionUuid/,
-    );
-    expect(() => makeSubject(core, { configOverrides: { requiredExecutorVersion: "" } })).toThrow(
+    expect(() => makeSubject(core, CONFIG_PROJECT, { configOverrides: { requiredExecutorVersion: "" } })).toThrow(
       /requiredExecutorVersion/,
     );
-    expect(() => makeSubject(core, { configOverrides: { canonicalBuzzChannelId: "   " } })).toThrow(
+    expect(() => makeSubject(core, CONFIG_PROJECT, { configOverrides: { canonicalBuzzChannelId: "   " } })).toThrow(
       /canonicalBuzzChannelId/,
     );
-    expect(() => makeSubject(core, { configOverrides: { expectedExecutorRealpath: "" } })).toThrow(
+    expect(() => makeSubject(core, CONFIG_PROJECT, { configOverrides: { expectedExecutorRealpath: "" } })).toThrow(
       /expectedExecutorRealpath/,
     );
-    expect(() => makeSubject(core, { configOverrides: { expectedExecutorSha256: "" } })).toThrow(
+    expect(() => makeSubject(core, CONFIG_PROJECT, { configOverrides: { expectedExecutorSha256: "" } })).toThrow(
       /expectedExecutorSha256/,
     );
   });
 
-  it("fails closed when the configured canonical session UUID is not a UUID", () => {
+  it("fails closed on an empty adoptable set, which is an unsupplied configuration and not a choice", () => {
     const core = makeCore();
-    expect(() => makeSubject(core, { configOverrides: { canonicalSessionUuid: "not-a-uuid" } })).toThrow(/UUID/);
+    expect(() => makeSubject(core, CONFIG_PROJECT, { configOverrides: { canonicalSessions: [] } })).toThrow(
+      /canonicalSessions is required deployment configuration/,
+    );
+  });
+
+  it("fails closed above the adoptable-set bound", () => {
+    const core = makeCore();
+    const oversized = Array.from({ length: MAX_CANONICAL_ADOPTABLE_SESSIONS + 1 }, (_unused, index) => ({
+      sessionUuid: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+      projectId: `prj_${index}`,
+      buzzActorId: `buzz:actor-${index}`,
+    }));
+    expect(() => makeSubject(core, CONFIG_PROJECT, { configOverrides: { canonicalSessions: oversized } })).toThrow(
+      new RegExp(`more than ${MAX_CANONICAL_ADOPTABLE_SESSIONS} entries`),
+    );
+    // The bound itself, not merely "some large number is refused": one entry fewer constructs.
+    expect(
+      makeSubject(core, CONFIG_PROJECT, { configOverrides: { canonicalSessions: oversized.slice(1) } }),
+    ).toBeInstanceOf(CanonicalSelfClaim);
+  });
+
+  it.each(["sessionUuid", "projectId", "buzzActorId"] as const)(
+    "fails closed on a blank %s in an entry", (field) => {
+      const core = makeCore();
+      const entry = { sessionUuid: CANON, projectId: CONFIG_PROJECT, buzzActorId: CANONICAL_ACTOR };
+      expect(() =>
+        makeSubject(core, CONFIG_PROJECT, {
+          configOverrides: { canonicalSessions: [{ ...entry, [field]: "  " }] },
+        }),
+      ).toThrow(new RegExp(`canonicalSessions\\[\\].${field} is required deployment configuration`));
+    },
+  );
+
+  it.each(["sessionUuid", "projectId", "buzzActorId"] as const)(
+    "refuses a set that repeats a %s rather than resolving it by first match", (field) => {
+      const core = makeCore();
+      // Every field distinct except the one under test, so the refusal is attributable to that
+      // field and not to whichever duplicate check happens to run first.
+      const first = { sessionUuid: CANON, projectId: "prj_first", buzzActorId: "buzz:first" };
+      const second = { sessionUuid: OTHER, projectId: "prj_second", buzzActorId: "buzz:second" };
+      expect(() =>
+        makeSubject(core, CONFIG_PROJECT, {
+          configOverrides: { canonicalSessions: [first, { ...second, [field]: first[field] }] },
+        }),
+      ).toThrow(new RegExp(`canonicalSessions\\[\\].${field} must be unique across entries`));
+    },
+  );
+
+  it("fails closed when a configured canonical session UUID is not a UUID", () => {
+    const core = makeCore();
+    expect(() =>
+      makeSubject(core, CONFIG_PROJECT, {
+        configOverrides: {
+          canonicalSessions: [{ sessionUuid: "not-a-uuid", projectId: CONFIG_PROJECT, buzzActorId: CANONICAL_ACTOR }],
+        },
+      }),
+    ).toThrow(/UUID/);
   });
 
   it("never falls back to a hardcoded real value — no exported real-ID constant exists to fall back to", () => {
@@ -434,7 +509,7 @@ describe("deployment identity is required, deployment-private configuration (#76
     // primitive uses must come from the config this test constructs, never from a module-level
     // default.
     const core = makeCore();
-    const subject = makeSubject(core);
+    const subject = makeSubject(core, CONFIG_PROJECT);
     expect(subject).toBeInstanceOf(CanonicalSelfClaim);
   });
 });
@@ -589,7 +664,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_canonical";
     insertProject(core, projectId);
-    const subject = makeSubject(core);
+    const subject = makeSubject(core, projectId);
 
     const request = baseRequest(core, projectId);
     const before = rowCounts(core);
@@ -644,7 +719,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_uuid_mismatch";
     insertProject(core, projectId);
-    const subject = makeSubject(core);
+    const subject = makeSubject(core, projectId);
     // The owner approval must itself bind `OTHER` too — otherwise the owner-approval
     // parameterDigest check fires first (a real, earlier, and correct refusal, but not the one
     // this test targets), and the derivation mismatch this test names never gets reached.
@@ -666,7 +741,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_pid_mismatch";
     insertProject(core, projectId);
-    const subject = makeSubject(core);
+    const subject = makeSubject(core, projectId);
     const request = baseRequest(core, projectId, { claimedPid: 999 });
     const before = rowCounts(core);
     const result = await subject.claim(request);
@@ -691,7 +766,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       // climbing past it, finds nothing above it (`ppid: 1`), and denies at clause 1, before this
       // request's owner approval is ever presented for consumption, before any transaction opens,
       // and before Buzz resolution runs.
-      const subject = makeSubject(core, {
+      const subject = makeSubject(core, projectId, {
         chain: standardChain({
           argv: ["/usr/bin/node", "/attacker-controlled/claude", "--session-id", CANON],
           command: `/usr/bin/node /attacker-controlled/claude --session-id ${CANON}`,
@@ -716,7 +791,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       // `claude` binary, this file's default chain), must still succeed. If the attack attempt
       // had consumed it, this second, otherwise-identical claim would be refused as a replay
       // instead.
-      const legitimateResult = await makeSubject(core).claim(baseRequest(core, projectId));
+      const legitimateResult = await makeSubject(core, projectId).claim(baseRequest(core, projectId));
       expect(legitimateResult.allowed, JSON.stringify(legitimateResult)).toBe(true);
     },
   );
@@ -732,7 +807,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       // trusting whichever selector is checked first would silently treat CANON as this process's
       // one real session, when the same argv just as validly names OTHER via `--resume`. Exactness
       // means the ambiguity itself is the refusal, never a tiebreak between the two candidates.
-      const subject = makeSubject(core, {
+      const subject = makeSubject(core, projectId, {
         chain: standardChain({
           argv: ["/opt/claude/claude", "--resume", OTHER, "--session-id", CANON],
           command: `/opt/claude/claude --resume ${OTHER} --session-id ${CANON}`,
@@ -756,7 +831,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       // The very same approval, presented again by the real claimant (this file's default,
       // unambiguous chain), must still succeed — the conflicting-selector attempt above consumed
       // nothing.
-      const legitimateResult = await makeSubject(core).claim(baseRequest(core, projectId));
+      const legitimateResult = await makeSubject(core, projectId).claim(baseRequest(core, projectId));
       expect(legitimateResult.allowed, JSON.stringify(legitimateResult)).toBe(true);
     },
   );
@@ -770,7 +845,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       // `--session-id=` (an attached selector with no value) still counts as one occurrence; with
       // `--resume CANON` also present, two occurrences means refusal, not a fallback to whichever
       // selector has a value.
-      const subject = makeSubject(core, {
+      const subject = makeSubject(core, projectId, {
         chain: standardChain({
           argv: ["/opt/claude/claude", "--session-id=", "--resume", CANON],
           command: `/opt/claude/claude --session-id= --resume ${CANON}`,
@@ -787,7 +862,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       expect(result.message).toContain("names no session id");
       expect(rowCounts(core)).toEqual(before);
 
-      const legitimateResult = await makeSubject(core).claim(baseRequest(core, projectId));
+      const legitimateResult = await makeSubject(core, projectId).claim(baseRequest(core, projectId));
       expect(legitimateResult.allowed, JSON.stringify(legitimateResult)).toBe(true);
     },
   );
@@ -796,7 +871,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_no_start_time";
     insertProject(core, projectId);
-    const subject = makeSubject(core, { chain: standardChain({ startedAt: null }) });
+    const subject = makeSubject(core, projectId, { chain: standardChain({ startedAt: null }) });
     const request = baseRequest(core, projectId);
     const before = rowCounts(core);
     const result = await subject.claim(request);
@@ -844,7 +919,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
         core.bindings,
         fakeBuzzActorAuthenticator(),
         fakeResolveBuzzAddress(),
-        baseConfig(),
+        baseConfig(projectId),
         {
           processInspector: reusablePidInspector,
           imageInspector: fakeImageInspector(),
@@ -871,7 +946,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_headless";
     insertProject(core, projectId);
-    const subject = makeSubject(core, {
+    const subject = makeSubject(core, projectId, {
       chain: standardChain({
         argv: ["/usr/local/bin/claude", "-p", "--session-id", CANON],
         command: `/usr/local/bin/claude -p --session-id ${CANON}`,
@@ -909,7 +984,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       const core = makeCore();
       const projectId = "prj_cwd_probe_failed";
       insertProject(core, projectId);
-      const subject = makeSubject(core, { chain: standardChain({ cwd: null }) });
+      const subject = makeSubject(core, projectId, { chain: standardChain({ cwd: null }) });
       const request = baseRequest(core, projectId);
       const before = rowCounts(core);
       const result = await subject.claim(request);
@@ -992,7 +1067,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       const core = makeCore();
       const projectId = "prj_image_probe_failed";
       insertProject(core, projectId);
-      const subject = makeSubject(core, { imageInspector: unscannableImageInspector() });
+      const subject = makeSubject(core, projectId, { imageInspector: unscannableImageInspector() });
       const request = baseRequest(core, projectId);
       const before = rowCounts(core);
       const result = await subject.claim(request);
@@ -1010,7 +1085,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_peer_protocol";
     insertProject(core, projectId);
-    const subject = makeSubject(core);
+    const subject = makeSubject(core, projectId);
     const request = baseRequest(core, projectId, { peerProtocolVersion: "mcp/2024-01-01" });
     const before = rowCounts(core);
     const result = await subject.claim(request);
@@ -1026,7 +1101,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const projectId = "prj_version";
     insertProject(core, projectId);
     const observedVersion = "1.2.3-wrong";
-    const subject = makeSubject(core, { imageInspector: fakeImageInspector(observedVersion) });
+    const subject = makeSubject(core, projectId, { imageInspector: fakeImageInspector(observedVersion) });
     const request = baseRequest(core, projectId);
     const before = rowCounts(core);
     const result = await subject.claim(request);
@@ -1052,7 +1127,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       const core = makeCore();
       const projectId = "prj_forged_realpath";
       insertProject(core, projectId);
-      const subject = makeSubject(core, {
+      const subject = makeSubject(core, projectId, {
         imageInspector: fakeImageInspector(
           TEST_REQUIRED_EXECUTOR_VERSION,
           "/tmp/attacker-controlled/renamed-node-binary",
@@ -1079,7 +1154,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       const core = makeCore();
       const projectId = "prj_forged_hash";
       insertProject(core, projectId);
-      const subject = makeSubject(core, {
+      const subject = makeSubject(core, projectId, {
         imageInspector: fakeImageInspector(
           TEST_REQUIRED_EXECUTOR_VERSION,
           TEST_EXPECTED_EXECUTOR_REALPATH,
@@ -1101,7 +1176,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_no_image";
     insertProject(core, projectId);
-    const subject = makeSubject(core, { imageInspector: { resolve: () => null } });
+    const subject = makeSubject(core, projectId, { imageInspector: { resolve: () => null } });
     const request = baseRequest(core, projectId);
     const before = rowCounts(core);
     const result = await subject.claim(request);
@@ -1116,7 +1191,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_no_transcript";
     insertProject(core, projectId);
-    const subject = makeSubject(core, { transcriptReader: fakeTranscriptReader(false) });
+    const subject = makeSubject(core, projectId, { transcriptReader: fakeTranscriptReader(false) });
     const request = baseRequest(core, projectId);
     const before = rowCounts(core);
     const result = await subject.claim(request);
@@ -1132,7 +1207,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_peer_identity";
     insertProject(core, projectId);
-    const subject = makeSubject(core);
+    const subject = makeSubject(core, projectId);
     const request = baseRequest(core, projectId, { peerIdentity: "someone-else" });
     const before = rowCounts(core);
     const result = await subject.claim(request);
@@ -1143,26 +1218,37 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(rowCounts(core)).toEqual(before);
   });
 
-  it("the buzz channel check is real, not decorative: the wrong channel refuses exactly like the live PROBE_FAILED case", async () => {
-    const core = makeCore();
-    const projectId = "prj_channel";
-    insertProject(core, projectId);
-    const subject = makeSubject(core);
-    const request = baseRequest(core, projectId, { buzzChannelId: "DM" });
-    const before = rowCounts(core);
-    const result = await subject.claim(request);
+  it("the buzz channel is the configured one and is load-bearing in the attestation, not a request field to get wrong", async () => {
+    // This replaces a case that sent `buzzChannelId: "DM"` in the request and expected "not the
+    // canonical project channel". The request cannot carry a channel any more — the deployment's
+    // channel is the only one there is — so the guard that comparison provided has become the
+    // absence of the field. What is left to check is that the configured value is still what the
+    // claim is attested over: two deployments differing only in their channel must not produce the
+    // same attestation, or the channel would be recorded without being covered.
+    const digestFor = async (canonicalBuzzChannelId: string): Promise<string> => {
+      const core = makeCore();
+      const projectId = "prj_channel";
+      insertProject(core, projectId);
+      const subject = makeSubject(core, projectId, { configOverrides: { canonicalBuzzChannelId } });
+      const result = await subject.claim(baseRequest(core, projectId));
+      expect(result.allowed, JSON.stringify(result)).toBe(true);
+      if (!result.allowed) throw new Error("unreachable");
+      // From the durable row, not the return value: the point is what was recorded.
+      const rows = core.db.all<{ attestation_digest: string }>(
+        `SELECT attestation_digest FROM actor_target_attestations`,
+      );
+      expect(rows).toHaveLength(1);
+      return rows[0]!.attestation_digest;
+    };
 
-    expect(result.allowed).toBe(false);
-    if (result.allowed) return;
-    expect(result.message).toContain("not the canonical project channel");
-    expect(rowCounts(core)).toEqual(before);
+    expect(await digestFor(CHANNEL)).not.toBe(await digestFor("channel:some-other-room"));
   });
 
-  it("clause 4 — only the exact canonical session may be adopted; a different, otherwise-valid session is refused, not bootstrapped", async () => {
+  it("clause 4 — only a configured canonical session may be adopted; a different, otherwise-valid session is refused, not bootstrapped", async () => {
     const core = makeCore();
     const projectId = "prj_other_session";
     insertProject(core, projectId);
-    const subject = makeSubject(core, { chain: standardChain({}, OTHER) });
+    const subject = makeSubject(core, projectId, { chain: standardChain({}, OTHER) });
     const request = baseRequest(core, projectId, {
       claimedSessionUuid: OTHER,
     });
@@ -1171,11 +1257,82 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
 
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
-    expect(result.message).toContain("only the canonical session may be adopted");
+    expect(result.message).toContain("only a canonical session may be adopted");
     expect(rowCounts(core)).toEqual(before);
   });
 
+  it("clause 4 — the pin is membership, not the first entry: a second configured session is adopted on its own project", async () => {
+    // The whole point of the set. Before #1005 the pin was `identity.sessionUuid !== config
+    // .canonicalSessionUuid`, so this claim could not exist: a deployment could name exactly one
+    // adoptable session, and `cto_start` — which spawns a new provider process — was the only
+    // other way to give a second running session a CTO binding.
+    const core = makeCore();
+    const firstProject = "prj_first_cto";
+    const secondProject = "prj_second_cto";
+    insertProject(core, firstProject);
+    insertProject(core, secondProject);
+    const canonicalSessions = [
+      { sessionUuid: CANON, projectId: firstProject, buzzActorId: CANONICAL_ACTOR },
+      { sessionUuid: OTHER, projectId: secondProject, buzzActorId: "buzz:second-cto" },
+    ];
 
+    const first = await makeSubject(core, firstProject, { configOverrides: { canonicalSessions } })
+      .claim(baseRequest(core, firstProject));
+    expect(first.allowed, JSON.stringify(first)).toBe(true);
+    if (!first.allowed) return;
+
+    // A whole second ancestry, not the first one with a field swapped: two live CTOs are two
+    // processes, so every pid in the chain differs as well as the session uuid.
+    // `sessions_buzz_actor` is why the two entries must also carry different actor ids.
+    const secondChain: ProcessSnapshot[] = [
+      { pid: 200, ppid: 150, argv: ["/usr/bin/node", "/opt/acp/mcp-server.js"],
+        command: "/usr/bin/node /opt/acp/mcp-server.js", cwd: CWD, cwdProbeFailure: null, startedAt: "t1" },
+      { pid: 150, ppid: 11, argv: ["/bin/zsh", "-c", "foo"], command: "/bin/zsh -c foo", cwd: CWD,
+        cwdProbeFailure: null, startedAt: "t2" },
+      claudeAncestor({ pid: 11 }, OTHER),
+    ];
+    const second = await makeSubject(core, secondProject, {
+      configOverrides: { canonicalSessions },
+      chain: secondChain,
+    }).claim(baseRequest(core, secondProject, { callerPid: 200, claimedSessionUuid: OTHER }));
+    expect(second.allowed, JSON.stringify(second)).toBe(true);
+    if (!second.allowed) return;
+
+    expect(second.value.sessionId).not.toBe(first.value.sessionId);
+    expect(first.value.binding.projectId).toBe(firstProject);
+    expect(second.value.binding.projectId).toBe(secondProject);
+    // Each speaks as its own configured identity — not one shared actor, and not a value either
+    // claimant supplied.
+    expect(core.sessions.require(first.value.sessionId).buzzActorId).toBe(CANONICAL_ACTOR);
+    expect(core.sessions.require(second.value.sessionId).buzzActorId).toBe("buzz:second-cto");
+  });
+
+  it("clause 4 — an entitled session claiming another project is refused, on the derived UUID and before any row", async () => {
+    // The defect the set closes on its own: the old pin established *that* the claimant was the
+    // canonical session and nothing compared `request.projectId` to anything, so the one entitled
+    // session could assemble `PRIMARY_CTO:<any registered project>` by naming it in the request.
+    const core = makeCore();
+    const entitled = "prj_entitled";
+    const other = "prj_not_entitled";
+    insertProject(core, entitled);
+    insertProject(core, other);
+    const subject = makeSubject(core, entitled);
+
+    const before = rowCounts(core);
+    const result = await subject.claim(baseRequest(core, other));
+
+    expect(result.allowed).toBe(false);
+    if (result.allowed) return;
+    expect(result.reasonCode).toBe(ReasonCode.CONFLICT);
+    expect(result.message).toContain("not the canonical CTO for the requested project");
+    expect(result.evidence).toMatchObject({ observed: other, entitled });
+    expect(rowCounts(core)).toEqual(before);
+
+    // The control: the same subject, same process, same everything but the project, succeeds — so
+    // the refusal above is attributable to the entitlement and not to a broken fixture.
+    const allowed = await subject.claim(baseRequest(core, entitled));
+    expect(allowed.allowed, JSON.stringify(allowed)).toBe(true);
+  });
 
 
 
@@ -1183,24 +1340,30 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_duplicate";
     insertProject(core, projectId);
-    const subject = makeSubject(core);
+    const subject = makeSubject(core, projectId);
 
     const first = await subject.claim(baseRequest(core, projectId));
     expect(first.allowed).toBe(true);
 
     // Built — and its owner approval minted — before `afterFirst` is captured, so the second
     // mint's own `INGRESS_ADMITTED` audit write does not show up as unexplained drift against it.
-    const secondRequest = baseRequest(core, projectId, {
-      expectedBindingGeneration: 2,
-      // A different Buzz identity than the first claim's, deliberately: the first session is
-      // still live and holding "buzz:canonical-cto" (`sessions_buzz_actor`'s partial unique
-      // index refuses a second live session the same identity), which would otherwise deny this
-      // attempt at `bindBuzzActor` — a real, earlier guard, but not the one this test targets.
-      buzzActorId: "buzz:canonical-cto-second-attempt",
+    const secondRequest = baseRequest(core, projectId, { expectedBindingGeneration: 2 });
+    // A second subject carrying a different Buzz identity in its entry, deliberately: the first
+    // session is still live and holding "buzz:canonical-cto" (`sessions_buzz_actor`'s partial
+    // unique index refuses a second live session the same identity), which would otherwise deny
+    // this attempt at `bindBuzzActor` — a real, earlier guard, but not the one this test targets.
+    // The identity used to be a request field the second attempt could vary on its own; it is
+    // configuration now, so isolating this guard means configuring it.
+    const secondSubject = makeSubject(core, projectId, {
+      configOverrides: {
+        canonicalSessions: [
+          { sessionUuid: CANON, projectId, buzzActorId: "buzz:canonical-cto-second-attempt" },
+        ],
+      },
     });
     const afterFirst = rowCounts(core);
 
-    const second = await subject.claim(secondRequest);
+    const second = await secondSubject.claim(secondRequest);
     expect(second.allowed).toBe(false);
     if (second.allowed) return;
     expect(second.reasonCode).toBe(ReasonCode.BINDING_ALREADY_ACTIVE);
@@ -1216,7 +1379,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_same_live";
     insertProject(core, projectId);
-    const subject = makeSubject(core);
+    const subject = makeSubject(core, projectId);
     const first = await subject.claim(baseRequest(core, projectId));
     expect(first.allowed).toBe(true);
     if (!first.allowed) return;
@@ -1282,7 +1445,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_dead_predecessor";
     insertProject(core, projectId);
-    const first = await makeSubject(core).claim(baseRequest(core, projectId));
+    const first = await makeSubject(core, projectId).claim(baseRequest(core, projectId));
     expect(first.allowed, JSON.stringify(first)).toBe(true);
     if (!first.allowed) return;
     const predecessor = core.sessions.require(first.value.sessionId);
@@ -1298,7 +1461,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     ];
     expect(chainInspector(restarted).snapshot(predecessor.osPid!)).toBeNull();
 
-    const claimed = await makeSubject(core, { chain: restarted }).claim(baseRequest(core, projectId, {
+    const claimed = await makeSubject(core, projectId, { chain: restarted }).claim(baseRequest(core, projectId, {
       expectedBindingGeneration: 2,
     }));
     expect(claimed.allowed, JSON.stringify(claimed)).toBe(true);
@@ -1335,7 +1498,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_probe_failed_not_dead";
     insertProject(core, projectId);
-    const first = await makeSubject(core).claim(baseRequest(core, projectId));
+    const first = await makeSubject(core, projectId).claim(baseRequest(core, projectId));
     expect(first.allowed, JSON.stringify(first)).toBe(true);
     if (!first.allowed) return;
     const predecessor = core.sessions.require(first.value.sessionId);
@@ -1350,7 +1513,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     ];
     expect(chainInspector(restarted).snapshot(predecessor.osPid!)).toBeNull();
 
-    const claimed = await makeSubject(core, {
+    const claimed = await makeSubject(core, projectId, {
       chain: restarted,
       // The one difference. The pid is not in the chain, so the default probe would raise ESRCH
       // and the claim would succeed; EPERM says the process is there.
@@ -1383,7 +1546,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_dead_but_held";
     insertProject(core, projectId);
-    const first = await makeSubject(core).claim(baseRequest(core, projectId));
+    const first = await makeSubject(core, projectId).claim(baseRequest(core, projectId));
     expect(first.allowed, JSON.stringify(first)).toBe(true);
     if (!first.allowed) return;
     // Deliberately no revoke: the binding stays ACTIVE while the runtime behind it dies.
@@ -1398,7 +1561,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       expectedBindingGeneration: 2,
     });
     const before = durableSnapshot(core);
-    const refused = await makeSubject(core, { chain: restarted }).claim(request);
+    const refused = await makeSubject(core, projectId, { chain: restarted }).claim(request);
     expect(refused.allowed).toBe(false);
     if (refused.allowed) return;
     expect(refused.reasonCode).toBe(ReasonCode.BINDING_ALREADY_ACTIVE);
@@ -1423,7 +1586,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_unreadable_token";
     insertProject(core, projectId);
-    const first = await makeSubject(core).claim(baseRequest(core, projectId));
+    const first = await makeSubject(core, projectId).claim(baseRequest(core, projectId));
     expect(first.allowed, JSON.stringify(first)).toBe(true);
     if (!first.allowed) return;
     const predecessor = core.sessions.require(first.value.sessionId);
@@ -1446,7 +1609,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       expectedBindingGeneration: 2,
     });
     const before = durableSnapshot(core);
-    const refused = await makeSubject(core, { chain: unreadable }).claim(request);
+    const refused = await makeSubject(core, projectId, { chain: unreadable }).claim(request);
     expect(refused.allowed).toBe(false);
     if (refused.allowed) return;
     expect(refused.reasonCode).toBe(ReasonCode.CONFLICT);
@@ -1468,7 +1631,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_recycled_pid";
     insertProject(core, projectId);
-    const first = await makeSubject(core).claim(baseRequest(core, projectId));
+    const first = await makeSubject(core, projectId).claim(baseRequest(core, projectId));
     expect(first.allowed, JSON.stringify(first)).toBe(true);
     if (!first.allowed) return;
     const predecessor = core.sessions.require(first.value.sessionId);
@@ -1478,7 +1641,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const recycled = standardChain({ startedAt: "different lifetime" });
     expect(chainInspector(recycled).snapshot(predecessor.osPid!)?.startedAt).not.toBe(predecessor.osProcessStartedAt);
 
-    const claimed = await makeSubject(core, { chain: recycled }).claim(baseRequest(core, projectId, {
+    const claimed = await makeSubject(core, projectId, { chain: recycled }).claim(baseRequest(core, projectId, {
       expectedBindingGeneration: 2,
     }));
     expect(claimed.allowed, JSON.stringify(claimed)).toBe(true);
@@ -1504,7 +1667,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_foreign_live";
     insertProject(core, projectId);
-    const first = await makeSubject(core).claim(baseRequest(core, projectId));
+    const first = await makeSubject(core, projectId).claim(baseRequest(core, projectId));
     expect(first.allowed, JSON.stringify(first)).toBe(true);
     if (!first.allowed) return;
     const predecessor = core.sessions.require(first.value.sessionId);
@@ -1526,7 +1689,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       expectedBindingGeneration: 2,
     });
     const before = durableSnapshot(core);
-    const refused = await makeSubject(core, { chain: foreign }).claim(request);
+    const refused = await makeSubject(core, projectId, { chain: foreign }).claim(request);
     expect(refused.allowed).toBe(false);
     if (refused.allowed) return;
     expect(refused.reasonCode).toBe(ReasonCode.CONFLICT);
@@ -1537,7 +1700,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_restore";
     insertProject(core, projectId);
-    const subject = makeSubject(core);
+    const subject = makeSubject(core, projectId);
 
     const first = await subject.claim(baseRequest(core, projectId));
     expect(first.allowed).toBe(true);
@@ -1559,7 +1722,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const stopped = core.sessions.transition(first.value.sessionId, SessionLifecycle.STOPPED, "restart");
     expect(stopped.allowed).toBe(true);
 
-    const restoreSubject = makeSubject(core, {
+    const restoreSubject = makeSubject(core, projectId, {
       chain: standardChain({ startedAt: "Fri Jan  1 01:00:00 2027" }),
     });
     const before = rowCounts(core);
@@ -1589,7 +1752,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_no_hermes";
     insertProject(core, projectId);
-    const subject = makeSubject(core);
+    const subject = makeSubject(core, projectId);
 
     const result = await subject.claim(baseRequest(core, projectId));
     expect(result.allowed).toBe(true);
@@ -1606,7 +1769,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_no_buzz_address";
     insertProject(core, projectId);
-    const subject = makeSubject(core, {
+    const subject = makeSubject(core, projectId, {
       resolveBuzzAddress: fakeResolveBuzzAddress(deny(ReasonCode.PROBE_FAILED, "buzz transport is not available", {})),
     });
     const request = baseRequest(core, projectId);
@@ -1623,7 +1786,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_bad_buzz_actor";
     insertProject(core, projectId);
-    const subject = makeSubject(core, { buzzActorAuthenticator: fakeBuzzActorAuthenticator(false) });
+    const subject = makeSubject(core, projectId, { buzzActorAuthenticator: fakeBuzzActorAuthenticator(false) });
     const request = baseRequest(core, projectId);
     const before = rowCounts(core);
     const result = await subject.claim(request);
@@ -1639,7 +1802,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const core = makeCore();
     const projectId = "prj_bad_generation";
     insertProject(core, projectId);
-    const subject = makeSubject(core);
+    const subject = makeSubject(core, projectId);
 
     const result = await subject.claim(baseRequest(core, projectId, { expectedBindingGeneration: 0 }));
 

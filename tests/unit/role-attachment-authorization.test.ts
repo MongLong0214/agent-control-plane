@@ -90,7 +90,8 @@ describe("role attachment authorization without sockets", () => {
     });
     const recovery = new CanonicalSelfClaim(h.cp.db, h.clock, h.cp.sessions, h.cp.bindings,
       guard, async () => allow(ReasonCode.OK, "buzz://fixture"), {
-        canonicalSessionUuid: uuid, requiredExecutorVersion: "0.0.0-test", canonicalBuzzChannelId: "fixture",
+        canonicalSessions: [{ sessionUuid: uuid, projectId, buzzActorId: "buzz:fixture" }],
+        requiredExecutorVersion: "0.0.0-test", canonicalBuzzChannelId: "fixture",
         expectedExecutorRealpath: "/fake/claude", expectedExecutorSha256: `sha256:${"0".repeat(64)}`,
         expectedPeerProtocolVersion: "fixture", expectedPeerIdentity: "fixture",
       }, {
@@ -104,7 +105,7 @@ describe("role attachment authorization without sockets", () => {
     const claim = async (generation: number) =>
       valueOf(await recovery.claim({ callerPid: 10, claimedSessionUuid: uuid, projectId,
         expectedBindingGeneration: generation, peerProtocolVersion: "fixture",
-        peerIdentity: "fixture", buzzChannelId: "fixture", buzzActorId: "buzz:fixture", buzzPurpose: "fixture" }));
+        peerIdentity: "fixture", buzzPurpose: "fixture" }));
     valueOf(h.cp.bindings.revoke(roleKey, "canonical fixture"));
     const first = await claim(2);
     subject = { sessionId: first.sessionId, sessionSecret: first.sessionSecret! };
