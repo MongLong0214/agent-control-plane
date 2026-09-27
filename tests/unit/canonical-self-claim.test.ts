@@ -66,9 +66,10 @@ const FIVE_TABLES = [
 ] as const;
 
 /**
- * The two kinds `claim()` records at its return boundary, one row per decision it hands back.
- * Written after `#mutate` has committed or rolled back, so they are outside its transaction by
- * design, and a refusal is meant to leave exactly one of them and nothing else.
+ * The two kinds a claim records, one row per decision it hands back. The admission's row is written
+ * last inside `#mutate`'s own transaction, so it commits or rolls back with the admission. A
+ * refusal's row is written by `claim()` after `#mutate` has rolled back, so it is outside that
+ * transaction by design, and a refusal is meant to leave exactly one of them and nothing else.
  */
 const CLAIM_DECISION_KINDS = ["CANONICAL_SELF_CLAIM_ADMITTED", "CANONICAL_SELF_CLAIM_REFUSED"] as const;
 
@@ -149,6 +150,29 @@ const insertProject = (core: CoreHarness, projectId: string): void => {
     projectId,
     core.clock.nowIso(),
   ]);
+};
+
+/**
+ * Makes `audit_events` inserts fail at the database boundary — `Db.run`, the call `AuditLog`'s
+ * insert makes — for each kind `fails` accepts, and keeps the kinds it refused, in order. Nothing
+ * above the database is replaced: `claim()`, `#mutate`, `AuditLog.record` and the transaction all
+ * run as they do in production and meet a throw where `better-sqlite3` would raise one.
+ *
+ * The kind is the insert's second parameter. `refused` is what proves the fixture reached the
+ * insert it names: were that position to move, the list would stay empty and the case would fail
+ * on it rather than pass without having injected anything.
+ */
+const failAuditInserts = (core: CoreHarness, fails: (kind: unknown) => boolean) => {
+  const run = core.db.run.bind(core.db);
+  const refused: unknown[] = [];
+  const spy = vi.spyOn(core.db, "run").mockImplementation(((sql: string, params: unknown[] = []) => {
+    if (/^\s*INSERT INTO audit_events\b/.test(sql) && fails(params[1])) {
+      refused.push(params[1]);
+      throw new Error("injected audit insert failure: database or disk is full");
+    }
+    return run(sql, params);
+  }) as typeof core.db.run);
+  return { refused, restore: () => spy.mockRestore() };
 };
 
 /** A `ppid`-linked chain of fake processes; `snapshot` looks a pid up by identity. */
@@ -480,7 +504,7 @@ describe("same-live successor transaction", () => {
    * runtime" below.
    */
   it.each(["buzz", "draining", "active", "work"] as const)(
-    "same-live recovery refuses %s mismatch without effects", async (condition) => {
+    "same-live recovery refuses %s mismatch leaving only its own refusal row", async (condition) => {
       const { core, first, request, roleKey, projectId } = await successorFixture();
       // The "buzz" condition used to mutate `request.buzzActorId`, which no longer exists: the
       // identity comes from the configured entry now, so the only way the predecessor's stored
@@ -899,9 +923,9 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
 
     // Positive evidence that every writer `#mutate` composes recorded its own audit row, exactly
     // once each, inside the same committed transaction — the full footprint the refusal oracle
-    // below (`ROLLBACK_TABLES`) proves is absent on any denial — plus the one admission row
-    // `claim()` records on its way out. `audit_events` is append-only and ordered by insertion,
-    // so skipping `before.audit_events` rows isolates exactly what `claim()` itself wrote.
+    // below (`ROLLBACK_TABLES`) proves is absent on any denial — plus the one admission row, which
+    // `#mutate` writes last in that same transaction. `audit_events` is append-only and ordered by
+    // insertion, so skipping `before.audit_events` rows isolates exactly what `claim()` wrote.
     const auditKinds = core.db
       .all<{ kind: string }>(`SELECT kind FROM audit_events ORDER BY event_id LIMIT -1 OFFSET ?`, [
         before.audit_events ?? 0,
@@ -984,10 +1008,11 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       if (result.allowed) return;
       expect(result.reasonCode).toBe(ReasonCode.NOT_FOUND);
       expect(result.message).toContain("no claude ancestor exists");
-      // No effect anywhere: zero new rows across every mutation table and audit_events. This
-      // denial happens at clause 1's derivation — strictly before `#mutate` ever opens a
-      // transaction, before the async Buzz-address resolution, and before the owner approval
-      // this request carried is ever presented for consumption.
+      // No effect but the refusal's own row: zero new rows across every mutation table, and in
+      // audit_events exactly the one refusal row `claim()` writes. This denial happens at clause
+      // 1's derivation — strictly before `#mutate` ever opens a transaction, before the async
+      // Buzz-address resolution, and before the owner approval this request carried is ever
+      // presented for consumption.
       expectRolledBack(core, before, result);
 
       // The very same approval, presented again by the real claimant (a directly executed
@@ -1025,10 +1050,10 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       if (result.allowed) return;
       expect(result.reasonCode).toBe(ReasonCode.NOT_FOUND);
       expect(result.message).toContain("names no session id");
-      // No effect anywhere, for the same reason the row above checks it: this denial happens at
-      // clause 1's derivation, strictly before `#mutate` ever opens a transaction, before the
-      // async Buzz-address resolution, and before the owner approval this request carried is ever
-      // presented for consumption.
+      // No effect but the refusal's own row, for the same reason the row above checks it: this
+      // denial happens at clause 1's derivation, strictly before `#mutate` ever opens a
+      // transaction, before the async Buzz-address resolution, and before the owner approval this
+      // request carried is ever presented for consumption.
       expectRolledBack(core, before, result);
 
       // The very same approval, presented again by the real claimant (this file's default,
@@ -1540,7 +1565,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
 
 
 
-  it("clause 3 — a duplicate live actor is refused with zero additional rows, even though the session insert already ran inside the transaction", async () => {
+  it("clause 3 — a duplicate live actor is refused leaving only its own refusal row, even though the session insert already ran inside the transaction", async () => {
     const core = makeCore();
     const projectId = "prj_duplicate";
     insertProject(core, projectId);
@@ -1987,7 +2012,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expectRolledBack(core, before, result);
   });
 
-  it("an unauthenticated buzz actor id refuses with zero additional rows, even after the session was created", async () => {
+  it("an unauthenticated buzz actor id refuses leaving only its own refusal row, even after the session was created", async () => {
     const core = makeCore();
     const projectId = "prj_bad_buzz_actor";
     insertProject(core, projectId);
@@ -2227,6 +2252,99 @@ describe("every decision claim() hands back leaves exactly one audit row", () =>
       kind: "CANONICAL_SELF_CLAIM_REFUSED", reason_code: ReasonCode.INVALID_ARGUMENT, project_id: null,
     })]);
   });
+});
+
+describe("an audit row that cannot be written never splits a claim's answer from its state", () => {
+  // ACP-REVIEW-01. The admission's row used to be written by `claim()` after `#mutate` committed. An
+  // insert that threw there escaped `claim()` with the session, the binding and the generation bump
+  // already durable, and the listener answered INTERNAL_ERROR: the caller was told the claim had
+  // failed while the database said it had succeeded. The row now commits with the admission, so
+  // each case here reads both answers — what the caller got and what the database holds — and
+  // requires them to agree.
+
+  it("an admission whose audit row cannot be written is rolled back and refused, not committed and reported as an internal error", async () => {
+    const core = makeCore();
+    const projectId = "prj_audit_disk_full";
+    insertProject(core, projectId);
+    const subject = makeSubject(core, projectId);
+    const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+    const before = durableSnapshot(core);
+    // The disk fills at the admission's own insert and stays full, so the refusal that follows
+    // cannot write its row either.
+    let full = false;
+    const injected = failAuditInserts(core, (kind) => (full ||= kind === "CANONICAL_SELF_CLAIM_ADMITTED"));
+
+    let result: Decision<unknown>;
+    try {
+      result = await subject.claim(baseRequest(core, projectId));
+    } finally { injected.restore(); }
+
+    expect(injected.refused).toEqual(["CANONICAL_SELF_CLAIM_ADMITTED", "CANONICAL_SELF_CLAIM_REFUSED"]);
+    expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.AUDIT_WRITE_FAILED });
+    // No session, no binding, no generation bump and no audit row: every table, byte for byte.
+    expect(core.db.get(`SELECT MAX(binding_generation) AS g FROM assignments WHERE role_key = ?`, [roleKey]))
+      .toEqual({ g: null });
+    expect(core.db.all(`SELECT session_id FROM sessions WHERE buzz_actor_id = ?`, [CANONICAL_ACTOR])).toEqual([]);
+    expect(durableSnapshot(core)).toEqual(before);
+
+    // The refusal was the truth: a retry at the generation the caller still expects is admitted.
+    const retry = await subject.claim(baseRequest(core, projectId));
+    expect(retry.allowed, JSON.stringify(retry)).toBe(true);
+    expect(claimDecisionRows(core)).toEqual([expect.objectContaining({
+      kind: "CANONICAL_SELF_CLAIM_ADMITTED", reason_code: ReasonCode.OK, role_key: roleKey,
+    })]);
+  });
+
+  it("an admission whose own row alone cannot be written leaves the refusal's row and none of its own", async () => {
+    const core = makeCore();
+    const projectId = "prj_audit_admission_row_refused";
+    insertProject(core, projectId);
+    const subject = makeSubject(core, projectId);
+    const before = durableSnapshot(core);
+    const injected = failAuditInserts(core, (kind) => kind === "CANONICAL_SELF_CLAIM_ADMITTED");
+
+    let result: Decision<unknown>;
+    try {
+      result = await subject.claim(baseRequest(core, projectId));
+    } finally { injected.restore(); }
+
+    expect(injected.refused).toEqual(["CANONICAL_SELF_CLAIM_ADMITTED"]);
+    expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.AUDIT_WRITE_FAILED });
+    // Every table as it was, and `audit_events` grown by exactly the returned refusal's one row:
+    // not the admission's, and none of the session and binding rows the rollback took with it.
+    expectDurablyRolledBack(core, before, result);
+    expect(claimDecisionRows(core)).toEqual([expect.objectContaining({
+      kind: "CANONICAL_SELF_CLAIM_REFUSED", reason_code: ReasonCode.AUDIT_WRITE_FAILED, project_id: projectId,
+    })]);
+  });
+
+  it.each([
+    ["before the transaction opens", ReasonCode.NOT_FOUND],
+    ["inside the rolled-back transaction", ReasonCode.CONFLICT],
+  ] as const)(
+    "a refusal whose audit row cannot be written still returns its own reason code, refused %s",
+    async (where, reasonCode) => {
+      const core = makeCore();
+      const projectId = "prj_audit_refusal_row_refused";
+      insertProject(core, projectId);
+      const subject = makeSubject(core, projectId, where === "before the transaction opens"
+        ? { resolveBuzzAddress: fakeResolveBuzzAddress(deny(ReasonCode.NOT_FOUND, "no such channel", {})) }
+        : {});
+      const request = baseRequest(core, projectId, where === "before the transaction opens" ? {} : { expectedBindingGeneration: 2 });
+      const before = durableSnapshot(core);
+      const injected = failAuditInserts(core, (kind) => kind === "CANONICAL_SELF_CLAIM_REFUSED");
+
+      let result: Decision<unknown>;
+      try {
+        result = await subject.claim(request);
+      } finally { injected.restore(); }
+
+      expect(injected.refused).toEqual(["CANONICAL_SELF_CLAIM_REFUSED"]);
+      expect(result).toMatchObject({ allowed: false, reasonCode });
+      // The row is lost, and nothing else is: the refusal committed nothing to begin with.
+      expect(durableSnapshot(core)).toEqual(before);
+    },
+  );
 });
 
 describe("adversarial mutations — each must kill its guard, not merely delete the string it greps for", () => {
