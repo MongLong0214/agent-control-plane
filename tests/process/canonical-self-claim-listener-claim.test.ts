@@ -310,6 +310,8 @@ const BUZZ_CHANNEL_ID = "channel:test-canonical";
 const PEER_PROTOCOL = "acp.operator/v1";
 const BUZZ_PURPOSE = "continuity:PRIMARY_CTO";
 const TEST_SESSION_UUID = "99999999-9999-4999-8999-999999999999";
+/** The one project the configured entry entitles `TEST_SESSION_UUID` to hold. */
+const TEST_PROJECT_ID = "prj_canonical_fixture";
 
 const startMintOperator = async (): Promise<StartedOperator> => {
   const started = await makeStartedOperator();
@@ -324,7 +326,7 @@ const resolveBuzzAddressFixture = (
 const depsFor = (
   cp: Harness["cp"],
   root: string,
-  options: { sessionUuid?: string; maxAncestryHops?: number } = {},
+  options: { sessionUuid?: string; projectId?: string; maxAncestryHops?: number } = {},
 ): CanonicalSelfClaimOperatorDeps => {
   // This runs inside the request handler closure, so it executes on every request — after
   // `claimAsRealClaudeProcess` has already asked for this exact fixture and spawned the claiming
@@ -349,14 +351,16 @@ const depsFor = (
     config: {
       expectedPeerProtocolVersion: PEER_PROTOCOL,
       expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
-      canonicalSessionUuid: options.sessionUuid ?? TEST_SESSION_UUID,
+      canonicalSessions: [{
+        sessionUuid: options.sessionUuid ?? TEST_SESSION_UUID,
+        projectId: options.projectId ?? TEST_PROJECT_ID,
+        buzzActorId: BUZZ_ACTOR_ID,
+      }],
       requiredExecutorVersion: TEST_REQUIRED_EXECUTOR_VERSION,
       canonicalBuzzChannelId: BUZZ_CHANNEL_ID,
       expectedExecutorRealpath,
       expectedExecutorSha256,
       peerProtocolVersion: PEER_PROTOCOL,
-      buzzChannelId: BUZZ_CHANNEL_ID,
-      buzzActorId: BUZZ_ACTOR_ID,
       buzzPurpose: BUZZ_PURPOSE,
     },
     claimDeps: {
@@ -370,7 +374,7 @@ const startClaimListener = async (
   daemon: Pick<Daemon, "lock">,
   cp: Harness["cp"],
   root: string,
-  options: { sessionUuid?: string; maxAncestryHops?: number } = {},
+  options: { sessionUuid?: string; projectId?: string; maxAncestryHops?: number } = {},
 ): Promise<CanonicalSelfClaimListener> => {
   const listener = await startCanonicalSelfClaimListener(daemon, tempRoot(), (peer, params) =>
     executeCanonicalSelfClaimOperator(peer, params, depsFor(cp, root, options)),
@@ -388,7 +392,7 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
       const projectId = "prj_operator_success";
       insertProject(cp, projectId);
       const root = tempRoot();
-      const listener = await startClaimListener(started.daemon, cp, root);
+      const listener = await startClaimListener(started.daemon, cp, root, { projectId });
 
 
       const before = rowCounts(cp);
@@ -418,7 +422,7 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
       const projectId = "prj_operator_replay";
       insertProject(cp, projectId);
       const root = tempRoot();
-      const listener = await startClaimListener(started.daemon, cp, root);
+      const listener = await startClaimListener(started.daemon, cp, root, { projectId });
 
 
       const first = await claimAsRealClaudeProcess(root, listener.socketPath, {
@@ -447,7 +451,7 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
       insertProject(cp, projectId);
       const root = tempRoot();
 
-      const listener = await startClaimListener(started.daemon, cp, root, { maxAncestryHops: 1 });
+      const listener = await startClaimListener(started.daemon, cp, root, { projectId, maxAncestryHops: 1 });
 
 
       const before = rowCounts(cp);

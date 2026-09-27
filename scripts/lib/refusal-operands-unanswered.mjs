@@ -122,13 +122,15 @@ const groups = [
   {
     file: "src/registry/canonical-self-claim.ts",
     // TYPESCRIPT IS THE ENFORCEMENT SITE — the mutant does not compile, so no test can kill it.
-    reason: "Five operands the harness refused as uncompilable mutants, which is the answer rather than a gap. `ppidRaw === null` and `command === null` narrow two `string | null` reads before `Number.parseInt` and the argv split; removing either leaves `null` flowing into a `string` parameter. `rawValue === undefined` narrows before `rawValue.toLowerCase()`. `entry.device === null` and `entry.inode === null` narrow before `BigInt(...)`. In each case the guard is what makes the next line type-check, so the property is enforced at compile time and a row claiming a test proves it would be claiming the wrong thing.",
+    reason: "Seven operands the harness refused as uncompilable mutants, which is the answer rather than a gap. `ppidRaw === null` and `command === null` narrow two `string | null` reads before `Number.parseInt` and the argv split; removing either leaves `null` flowing into a `string` parameter. `rawValue === undefined` narrows before `rawValue.toLowerCase()`. `entry.device === null` and `entry.inode === null` narrow before `BigInt(...)`. The two #1005 operands joined this group when the set validator moved out of the constructor into the exported `assertCanonicalSessionsValid`, whose parameter is `unknown` rather than a typed config field: `!Array.isArray(canonicalSessions)` is the narrowing that makes `.length`, the bound check and the `for...of` legal (measured: three TS18046 at 802, 807 and 812), and the per-entry `typeof value !== \"string\"` is the narrowing that makes `value.trim()` legal on the deliberately widened `const value: unknown` (measured: two TS18046 at 819 and 825). Until that move both were declared here as SURVIVED on the strength of the config field's declared type; at the new site the compiler, not a type declaration upstream, is what refuses the mutant, and the earlier answer would have credited the wrong enforcement site. In each case the guard is what makes the next line type-check, so the property is enforced at compile time and a row claiming a test proves it would be claiming the wrong thing.",
     operands: [
       ["ppidRaw === null",1],
       ["command === null",1],
       ["rawValue === undefined",1],
       ["entry.device === null",1],
       ["entry.inode === null",1],
+      ["!Array.isArray(canonicalSessions)",1],
+      ["typeof value !== \"string\"",2],
     ],
   },
   {

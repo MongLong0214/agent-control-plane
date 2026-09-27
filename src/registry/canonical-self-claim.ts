@@ -752,21 +752,130 @@ export const defaultTranscriptReader: TranscriptReader = makeDefaultTranscriptRe
 // The claim primitive.
 // ---------------------------------------------------------------------------
 
+/**
+ * One session this deployment may adopt, and the single project it may hold the CTO role for.
+ *
+ * The project is part of the entry rather than something the claim takes on the caller's word.
+ * Before this existed the pin named a session and nothing else, so the one adoptable session could
+ * claim `PRIMARY_CTO` for whichever `projectId` its request happened to carry — the role key was
+ * assembled from that value (`roleKeyFor`) with no check that this session was the deployment's
+ * answer for that project. Entitlement and identity are one fact here.
+ *
+ * `buzzActorId` is per entry because it has to be: `sessions_buzz_actor` is UNIQUE over
+ * live lifecycles, so two adopted sessions sharing one actor id means the second `bindBuzzActor`
+ * is refused by the index and the whole claim rolls back.
+ */
+export interface CanonicalAdoptableSession {
+  /** The claude session UUID, matched against the independently derived ancestry, never a claim. */
+  sessionUuid: string;
+  /** The only project this session may hold `PRIMARY_CTO` for. */
+  projectId: string;
+  /** The Buzz channel identity this session authenticates as; unique across live sessions. */
+  buzzActorId: string;
+}
+
+/** A deployment adopting more entries than this has stopped being a local deployment. */
+export const MAX_CANONICAL_ADOPTABLE_SESSIONS = 32;
+
+/**
+ * The one authority over what a configured adoptable set may be. Both the composition root's
+ * `ACP_CANONICAL_SESSIONS_JSON` parser and this class's constructor call it, because they used to
+ * hold different halves of the rule: the parser checked shape and size, the constructor checked
+ * blanks and uniqueness, and the constructor runs per claim rather than at startup. A deployment
+ * with two entries sharing a UUID therefore started a listener that reported itself up and then
+ * answered every claim with INTERNAL_ERROR, while `deploy/README.md` promised startup would refuse
+ * it.
+ *
+ * Fields must already be in canonical form; this never normalizes them. Normalizing here would
+ * make this a second authority over the value the rest of the system compares. Uniqueness below
+ * runs on the configured strings, `SessionRegistry.bindBuzzActor` trims the actor id before it
+ * reaches the `sessions_buzz_actor` unique index, and the session UUID derived from process
+ * ancestry is lowercased — so `"a"` and `" a "` are two entries here and one row there, and an
+ * upper-case configured UUID is an entry no live session can ever match.
+ */
+export const assertCanonicalSessionsValid = (
+  canonicalSessions: unknown,
+): readonly CanonicalAdoptableSession[] => {
+  // An empty set is not a deployment that adopts nothing by choice — it is a composition root that
+  // failed to supply its configuration, and admitting it would leave a listener bound that can
+  // never say yes.
+  if (!Array.isArray(canonicalSessions) || canonicalSessions.length === 0) {
+    throw new Error(
+      "CanonicalSelfClaim: config.canonicalSessions is required deployment configuration and was missing or empty",
+    );
+  }
+  if (canonicalSessions.length > MAX_CANONICAL_ADOPTABLE_SESSIONS) {
+    throw new Error(
+      `CanonicalSelfClaim: config.canonicalSessions holds more than ${MAX_CANONICAL_ADOPTABLE_SESSIONS} entries`,
+    );
+  }
+  for (const entry of canonicalSessions) {
+    for (const field of ["sessionUuid", "projectId", "buzzActorId"] as const) {
+      const value: unknown = entry?.[field];
+      // Spelled `.trim() === ""` rather than `.trim().length === 0` on purpose: the falsifiability
+      // row `a-deployment-value-is-not-blank` anchors on that exact substring and the harness
+      // requires its `find` to match this file exactly once. A second spelling of the same
+      // predicate would leave that row with no unique anchor and silently no verdict.
+      if (typeof value !== "string" || value.trim() === "") {
+        throw new Error(
+          `CanonicalSelfClaim: config.canonicalSessions[].${field} is required deployment configuration and was missing or empty`,
+        );
+      }
+      // Refused rather than trimmed: see this function's contract above.
+      if (value !== value.trim()) {
+        throw new Error(
+          `CanonicalSelfClaim: config.canonicalSessions[].${field} must not be surrounded by whitespace`,
+        );
+      }
+    }
+    const configuredUuid = (entry as CanonicalAdoptableSession).sessionUuid;
+    if (!UUID_PATTERN.test(configuredUuid)) {
+      throw new Error("CanonicalSelfClaim: config.canonicalSessions[].sessionUuid must be a UUID");
+    }
+    // `UUID_PATTERN` admits `A-F`, and the UUID this primitive resolves membership against is
+    // lowercased where it is extracted from the ancestor's argv. An upper-case entry would parse,
+    // start, and then refuse its own session with CONFLICT forever.
+    if (configuredUuid !== configuredUuid.toLowerCase()) {
+      throw new Error("CanonicalSelfClaim: config.canonicalSessions[].sessionUuid must be lower-case");
+    }
+  }
+  // Duplicates are refused rather than resolved by first-match. A repeated `sessionUuid` would make
+  // one of the two entries dead configuration that reads as live; a repeated `buzzActorId` would
+  // construct fine and then be refused at `bindBuzzActor` by the `sessions_buzz_actor` unique index
+  // the moment both sessions are live, which is a startup error surfacing as a runtime claim
+  // failure; and a repeated `projectId` would give one role key two entitled sessions, which is the
+  // one-CTO-per-project property every reader downstream assumes.
+  for (const field of ["sessionUuid", "projectId", "buzzActorId"] as const) {
+    const values = (canonicalSessions as readonly CanonicalAdoptableSession[]).map((entry) => entry[field]);
+    if (new Set(values).size !== values.length) {
+      throw new Error(`CanonicalSelfClaim: config.canonicalSessions[].${field} must be unique across entries`);
+    }
+  }
+  return canonicalSessions as readonly CanonicalAdoptableSession[];
+};
+
 export interface CanonicalSelfClaimConfig {
   /**
-   * The one session this deployment may adopt. Required — deployment-private configuration only,
-   * sourced from the composition root's own environment. There is no default and no fallback: a
-   * missing value is a construction-time failure, never a silent substitution for a real ID.
+   * The sessions this deployment may adopt, each with the one project it may hold. Required —
+   * deployment-private configuration only, sourced from the composition root's own environment.
+   * There is no default and no fallback: an empty set constructs nothing, never a silent
+   * substitution for a real ID.
+   *
+   * This is a set rather than a scalar because the deployment runs one session per project and
+   * every one of them needs the role. A single pin made the capability this primitive exists for
+   * available to exactly one session out of however many the host is running, and the alternative
+   * — `CtoLifecycle.spawn` — starts a *new* provider session rather than adopting the live one,
+   * which puts a second writer in a checkout a running session already holds.
    */
-  canonicalSessionUuid: string;
+  canonicalSessions: readonly CanonicalAdoptableSession[];
   /**
    * The exact executor version this deployment currently requires. Required — deployment-private
-   * configuration only, same no-fallback rule as `canonicalSessionUuid`.
+   * configuration only, same no-fallback rule as `canonicalSessions`.
    */
   requiredExecutorVersion: string;
   /**
    * This deployment's one canonical project Buzz channel. Required — deployment-private
-   * configuration only, same no-fallback rule as `canonicalSessionUuid`.
+   * configuration only, same no-fallback rule as `canonicalSessions`.
    */
   canonicalBuzzChannelId: string;
   /**
@@ -819,9 +928,12 @@ export interface CanonicalSelfClaimRequest {
   // naming its own recorded provenance at worst, so it is not a field on this type.
   peerProtocolVersion: string;
   peerIdentity: string;
-  buzzChannelId: string;
-  /** The Buzz channel identity this session will authenticate as, bound via `bindBuzzActor`. */
-  buzzActorId: string;
+  // No `buzzChannelId` and no `buzzActorId` field. They used to be request fields that the
+  // orchestration filled from deployment configuration and this method then compared back against
+  // that same configuration — a real comparison, but of a value the caller had no say in. Now that
+  // the actor is per entry it is read from the entry this claim resolves, and the channel from
+  // `#canonicalBuzzChannelId`, so there is no caller-supplied field left to check. That is the
+  // same reasoning the removed comparison itself carried: removing the surface beats guarding it.
   /** Passed to `resolveBuzzAddress` to open the routing channel before the transaction opens. */
   buzzPurpose: string;
 }
@@ -856,7 +968,17 @@ export interface CanonicalSelfClaimDeps {
  * callerPid must come from authenticated transport or a deployment-owned session pin,
  * never a delegated request. Native UUID and executor evidence are independently read.
  */
-export type ClaudeIdentityConfig = Omit<CanonicalSelfClaimConfig, "canonicalBuzzChannelId" | "expectedPeerProtocolVersion" | "expectedPeerIdentity">;
+/**
+ * What identity verification needs, which is the executor pins plus the set of session UUIDs this
+ * caller considers admissible. It is a set of bare UUIDs rather than `CanonicalAdoptableSession`
+ * entries because the second caller of this function — the daemon's delegated CTO binding — checks
+ * one already-provisioned session and has no project or Buzz identity to entitle; the entitlement
+ * half is enforced by `CanonicalSelfClaim` against the entry it resolves, not here.
+ */
+export type ClaudeIdentityConfig = Omit<CanonicalSelfClaimConfig,
+  "canonicalSessions" | "canonicalBuzzChannelId" | "expectedPeerProtocolVersion" | "expectedPeerIdentity"> & {
+  canonicalSessionUuids: readonly string[];
+};
 export type ClaudeIdentityRequest = Pick<CanonicalSelfClaimRequest,
   "callerPid" | "claimedPid" | "claimedSessionUuid">;
 export interface VerifiedClaudeIdentity {
@@ -904,11 +1026,15 @@ export function verifyClaudeIdentity(
   // regardless of when this runs; checking this first means a non-canonical session always fails
   // for the reason this check names, not for whichever unrelated check happens to run first
   // against a session this primitive was never going to adopt anyway.
-  if (identity.sessionUuid !== config.canonicalSessionUuid) {
+  // Membership is tested against `identity.sessionUuid`, which clause 1 derived from process
+  // ancestry — never against `request.claimedSessionUuid`. Resolving the admissible entry from
+  // what the caller said would move this authority from the deployment's configuration to the
+  // claimant, and the comparison a few lines above would then be comparing a value to itself.
+  if (!config.canonicalSessionUuids.includes(identity.sessionUuid)) {
     return deny(
       ReasonCode.CONFLICT,
-      "only the canonical session may be adopted by this primitive",
-      { observed: identity.sessionUuid, canonical: config.canonicalSessionUuid },
+      "only a canonical session may be adopted by this primitive",
+      { observed: identity.sessionUuid, canonicalCount: config.canonicalSessionUuids.length },
     );
   }
 
@@ -1080,6 +1206,7 @@ export class CanonicalSelfClaim {
   readonly #transcriptReader: TranscriptReader;
   readonly #maxAncestryHops: number;
   readonly #canonicalBuzzChannelId: string;
+  readonly #canonicalSessions: readonly CanonicalAdoptableSession[];
 
   constructor(
     private readonly db: Db,
@@ -1101,7 +1228,6 @@ export class CanonicalSelfClaim {
     // fallback to a real value. A blank string (an absent env var coerced by a caller, or a typo
     // in the composition root) must construct nothing, never silently adopt a hardcoded default.
     for (const [field, value] of [
-      ["canonicalSessionUuid", config.canonicalSessionUuid],
       ["requiredExecutorVersion", config.requiredExecutorVersion],
       ["canonicalBuzzChannelId", config.canonicalBuzzChannelId],
       ["expectedExecutorRealpath", config.expectedExecutorRealpath],
@@ -1113,9 +1239,10 @@ export class CanonicalSelfClaim {
         );
       }
     }
-    if (!UUID_PATTERN.test(config.canonicalSessionUuid)) {
-      throw new Error("CanonicalSelfClaim: config.canonicalSessionUuid must be a UUID");
-    }
+    // Shape, emptiness, the bound, blank and padded fields, UUID form and uniqueness all live in
+    // `assertCanonicalSessionsValid`, which the composition root also calls at startup. Holding
+    // half the rule here was how an invalid set got a started listener and a per-claim throw.
+    const validatedSessions = assertCanonicalSessionsValid(config.canonicalSessions);
 
     this.#processInspector = deps.processInspector ?? defaultProcessAncestryInspector;
     this.#processSignal = deps.processSignal ?? ((pid) => process.kill(pid, 0));
@@ -1123,6 +1250,9 @@ export class CanonicalSelfClaim {
     this.#transcriptReader = deps.transcriptReader ?? defaultTranscriptReader;
     this.#maxAncestryHops = deps.maxAncestryHops ?? MAX_ANCESTRY_HOPS;
     this.#canonicalBuzzChannelId = config.canonicalBuzzChannelId;
+    // Frozen at construction, like every other deployment fact here: a later mutation of the array
+    // the composition root passed must not change which sessions this instance will adopt.
+    this.#canonicalSessions = validatedSessions.map((entry) => Object.freeze({ ...entry }));
   }
 
   async claim(request: CanonicalSelfClaimRequest): Promise<Decision<CanonicalSelfClaimReceipt>> {
@@ -1139,9 +1269,6 @@ export class CanonicalSelfClaim {
         { expectedBindingGeneration: request.expectedBindingGeneration },
       );
     }
-    if (request.buzzActorId.trim().length === 0) {
-      return deny(ReasonCode.INVALID_ARGUMENT, "buzzActorId is required", {});
-    }
 
     // No owner approval is required or read here. This claim used to demand a `(channel, nonce)`
     // handle naming a decision an owner had minted beforehand, which meant the canonical CTO role
@@ -1152,20 +1279,38 @@ export class CanonicalSelfClaim {
     // authenticates by kernel peer credential on its own socket, still derives the claimant's
     // identity from process ancestry rather than accepting it, and still refuses a generation the
     // assignment history did not hand it. What it removes is the human in the loop.
-    const verified = verifyClaudeIdentity(this.config, request, {
+    const verified = verifyClaudeIdentity({
+      ...this.config,
+      canonicalSessionUuids: this.#canonicalSessions.map((entry) => entry.sessionUuid),
+    }, request, {
       processInspector: this.#processInspector, imageInspector: this.#imageInspector,
       transcriptReader: this.#transcriptReader, maxAncestryHops: this.#maxAncestryHops,
     }, { protocolVersion: request.peerProtocolVersion, identity: request.peerIdentity,
       expectedProtocolVersion: this.config.expectedPeerProtocolVersion, expectedIdentity: this.config.expectedPeerIdentity });
     if (!verified.allowed) return verified;
     const { identity, image, transcript } = verified.value;
-    // A real comparison against the one channel this deployment names, never a decorative
-    // pass-through.
-    if (request.buzzChannelId !== this.#canonicalBuzzChannelId) {
+    // Entitlement. `verifyClaudeIdentity` has established that the derived session is one this
+    // deployment may adopt; this establishes that the project it is asking to hold is the one that
+    // session is configured for. The two used to be a single fact by accident of there being one
+    // entry: a session that passed the pin could name whichever `projectId` its request carried,
+    // and `roleKeyFor` below would assemble `PRIMARY_CTO:<that project>` from it. Resolved on the
+    // derived UUID, never on `request.claimedSessionUuid`.
+    const entry = this.#canonicalSessions.find((candidate) => candidate.sessionUuid === identity.sessionUuid);
+    if (!entry) {
+      // Unreachable while this instance hands `verifyClaudeIdentity` the UUIDs of these same
+      // entries, and refused rather than asserted because "unreachable" is a property of today's
+      // composition and this is the seam where the two sets could stop agreeing.
       return deny(
         ReasonCode.CONFLICT,
-        "buzz channel is not the canonical project channel",
-        { observed: request.buzzChannelId, expected: this.#canonicalBuzzChannelId },
+        "the adopted session has no configured entry",
+        { observed: identity.sessionUuid },
+      );
+    }
+    if (entry.projectId !== request.projectId) {
+      return deny(
+        ReasonCode.CONFLICT,
+        "this session is not the canonical CTO for the requested project",
+        { observed: request.projectId, entitled: entry.projectId },
       );
     }
     // The Buzz routing address is resolved here, before the synchronous transaction opens, never
@@ -1183,7 +1328,7 @@ export class CanonicalSelfClaim {
 
     // Clause 3 — one atomic mutation, or none. Every identity and authority check above is over;
     // nothing past this point may refuse for a reason this transaction cannot also undo.
-    return this.#mutate(request, identity, image, transcript, buzzAddress.value);
+    return this.#mutate(request, identity, image, transcript, buzzAddress.value, entry);
   }
 
   /**
@@ -1264,6 +1409,13 @@ export class CanonicalSelfClaim {
     image: ExecutingImageEvidence,
     transcript: TranscriptEvidence,
     buzzAddress: string,
+    /**
+     * The configured entitlement `claim` resolved on the derived UUID and already checked against
+     * `request.projectId`. Passed in rather than looked up again here: a second lookup would be a
+     * second authority over the same fact, and this transaction would be free to write a Buzz
+     * actor id belonging to a different entry than the one the entitlement check passed.
+     */
+    entry: CanonicalAdoptableSession,
   ): Decision<CanonicalSelfClaimReceipt> {
     // `db.txDecision` — not `db.tx` — is load-bearing here. `tx()` treats a denied `Decision` as
     // an ordinary return value and commits it; a nested `bindings.bind()` denial (BindingRegistry
@@ -1274,7 +1426,11 @@ export class CanonicalSelfClaim {
       // The owner approved this exact next generation for this exact role key. Checked before any
       // write — including before the owner approval is consumed — so a stale expectation denies
       // with nothing to roll back yet.
-      const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId: request.projectId });
+      // `entry.projectId`, never `request.projectId`. They were compared before the Buzz-address
+      // await, and `request` is the caller's object: a caller holding a reference could change
+      // `projectId` during that await and this key would name the project the entitlement never
+      // authorized. The entitlement is the authority, so it is what assembles the role key.
+      const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId: entry.projectId });
       const currentMax = this.db.get<{ maximum: number | null }>(
         `SELECT MAX(binding_generation) AS maximum FROM assignments WHERE role_key = ?`,
         [roleKey],
@@ -1369,7 +1525,7 @@ export class CanonicalSelfClaim {
         if (!revoked || work || outstanding || predecessor.lifecycle !== SessionLifecycle.READY ||
             incumbent.current_session_incarnation !== predecessor.incarnation ||
             predecessor.osPid !== identity.pid || predecessor.osProcessStartedAt !== identity.startedAt ||
-            predecessor.workdir !== identity.cwd || predecessor.buzzActorId !== request.buzzActorId ||
+            predecessor.workdir !== identity.cwd || predecessor.buzzActorId !== entry.buzzActorId ||
             predecessor.buzzAddress !== buzzAddress || predecessor.provider !== "claude" ||
             predecessor.model !== "claude-cli") {
           return deny(ReasonCode.CONFLICT, "same-live recovery requires the exact idle revoked runtime", {});
@@ -1420,7 +1576,7 @@ export class CanonicalSelfClaim {
         );
       }
       const boundBuzzActor = this.sessions.bindBuzzActor(
-        { sessionId: created.sessionId, sessionSecret: created.sessionSecret, buzzActorId: request.buzzActorId },
+        { sessionId: created.sessionId, sessionSecret: created.sessionSecret, buzzActorId: entry.buzzActorId },
         this.buzzActorAuthenticator,
       );
       if (!boundBuzzActor.allowed) return boundBuzzActor as Decision<CanonicalSelfClaimReceipt>;
@@ -1445,8 +1601,8 @@ export class CanonicalSelfClaim {
         transcriptSizeBytes: transcript.sizeBytes,
         peerProtocolVersion: request.peerProtocolVersion,
         peerIdentity: request.peerIdentity,
-        buzzChannelId: request.buzzChannelId,
-        buzzActorId: request.buzzActorId,
+        buzzChannelId: this.#canonicalBuzzChannelId,
+        buzzActorId: entry.buzzActorId,
         buzzAddress,
         expectedBindingGeneration: request.expectedBindingGeneration,
       });
@@ -1463,7 +1619,8 @@ export class CanonicalSelfClaim {
 
       const bound = this.bindings.bind({
         role: Role.PRIMARY_CTO,
-        projectId: request.projectId,
+        // Same authority as the role key above, for the same reason.
+        projectId: entry.projectId,
         sessionId: created.sessionId,
         mode: "PREFERRED",
         authenticatedTarget,

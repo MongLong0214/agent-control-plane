@@ -54,7 +54,7 @@ export function createCtoBindingRuntime(cp: ControlPlane, rawTargets: string | u
             if (tuple.sessionId !== sessionId || tuple.incarnation !== target.incarnation) return null;
             // This is a daemon-local check of an already provisioned session, not a new
             // claimant socket. Never pretend the authenticated CEO is the target's peer.
-            const checked = verifyClaudeIdentity({ ...target, canonicalSessionUuid: target.nativeSessionUuid },
+            const checked = verifyClaudeIdentity({ ...target, canonicalSessionUuids: [target.nativeSessionUuid] },
               { callerPid: pid, claimedPid: pid, claimedSessionUuid: target.nativeSessionUuid });
             if (!checked.allowed || checked.value.identity.startedAt !== session.osProcessStartedAt ||
                 !assertClaudeIdentityStillLive(checked.value.identity).allowed) return null;

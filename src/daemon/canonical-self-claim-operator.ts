@@ -44,16 +44,15 @@ export interface CanonicalSelfClaimOperatorDeps {
   resolveBuzzAddress: (purpose: string) => Promise<Decision<string>>;
   /**
    * Deployment facts, fixed at composition time, never read from the claiming request (#760): the
-   * peer protocol version this socket speaks, the canonical Buzz channel, the Buzz channel
-   * identity this session will authenticate as, and the routing purpose passed to
-   * `resolveBuzzAddress`. None of these are caller-supplied input reaching a resolver with no
+   * peer protocol version this socket speaks and the routing purpose passed to
+   * `resolveBuzzAddress`. Neither is caller-supplied input reaching a resolver with no
    * expected-purpose check; fixing them here removes that surface entirely rather than adding a
-   * check for it.
+   * check for it. Two more used to be fixed here: the Buzz channel and the claiming session's Buzz
+   * channel identity. The identity is now a property of the adoptable-session entry the claim
+   * resolves, and the channel is read from `canonicalBuzzChannelId` inside it.
    */
   config: CanonicalSelfClaimConfig & {
     peerProtocolVersion: string;
-    buzzChannelId: string;
-    buzzActorId: string;
     buzzPurpose: string;
   };
   /**
@@ -136,8 +135,10 @@ export const executeCanonicalSelfClaimOperator = async (
     // "connected peer identity" clause 2 names, expressed as the effective uid the socket
     // actually belongs to rather than a string the caller could type.
     peerIdentity: `uid:${peer.uid}`,
-    buzzChannelId: deps.config.buzzChannelId,
-    buzzActorId: deps.config.buzzActorId,
+    // No `buzzChannelId` or `buzzActorId` here. The actor is per adoptable session now, so only
+    // the claim — which resolves the entry from the identity it derives — can know which one this
+    // is. Filling it here would mean this orchestration choosing an identity for a session it has
+    // not yet identified.
     buzzPurpose: deps.config.buzzPurpose,
   });
 };

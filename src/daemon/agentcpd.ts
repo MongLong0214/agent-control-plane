@@ -22,6 +22,10 @@ import {
 import { createHermesIncumbentAdoption } from "../bootstrap/hermes-incumbent-adoption.ts";
 import { createHermesGatewayIdentityReader } from "../runtime/hermes-gateway-identity.ts";
 import { createHermesGatewayConversationSender } from "../runtime/hermes-gateway-conversation.ts";
+import {
+  assertCanonicalSessionsValid,
+  type CanonicalAdoptableSession,
+} from "../registry/canonical-self-claim.ts";
 import { readProcessStartToken } from "../core/process-argv.ts";
 import { processStartedAt } from "../core/process-identity.ts";
 import { BuzzAdapter, BuzzCliTransport } from "../buzz/buzz-adapter.ts";
@@ -2950,6 +2954,56 @@ export interface AgentcpdMainContext {
   ceoConversation: CeoConversationPort | null;
 }
 
+// Shape only — that this is an array of objects carrying exactly these three string keys, so an
+// unrecognised key in the deployment's JSON is refused rather than ignored. Emptiness, the size
+// bound, blank and padded fields, UUID form and uniqueness are `assertCanonicalSessionsValid`'s,
+// which the claim's constructor calls too. Restating any of them here would put the same rule in
+// two places, and the half kept here is the half that runs at startup.
+const canonicalSessionsSchema = z.array(
+  z
+    .object({
+      sessionUuid: z.string(),
+      projectId: z.string(),
+      buzzActorId: z.string(),
+    })
+    .strict(),
+);
+
+/**
+ * Which running sessions this deployment may adopt, and what each one is entitled to.
+ *
+ * One variable holding a list rather than a pair of scalars holding one session's uuid and one
+ * session's Buzz channel identity, because the scalars made the cardinality a property of the
+ * config *shape*: a second CTO could not be expressed at all, and the project a claimant asked
+ * for was never compared against anything, so the single entitled session could hold
+ * `PRIMARY_CTO` for every registered project (#1005). An entry is the whole entitlement — the
+ * session, the one project it may hold, and the channel identity it speaks as — so neither half
+ * can be configured without the other.
+ *
+ * Deliberately the same shape as `ACP_CTO_BINDING_TARGETS_JSON`: a bounded JSON array parsed once
+ * at startup, whose refusal names the variable and never its contents.
+ */
+export const configuredCanonicalSessions = (raw: string): readonly CanonicalAdoptableSession[] => {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(raw);
+  } catch {
+    throw new Error("ACP_CANONICAL_SESSIONS_JSON is invalid");
+  }
+  const parsed = canonicalSessionsSchema.safeParse(decoded);
+  if (!parsed.success) throw new Error("ACP_CANONICAL_SESSIONS_JSON is invalid");
+  // The semantic rule, at startup, through the same function the claim's constructor uses. Without
+  // this call the shape check passed a set with two entries sharing a uuid, the listener started
+  // and reported itself up, and every claim then failed with INTERNAL_ERROR from the constructor —
+  // while `deploy/README.md` said an invalid array refuses startup. The message names the variable
+  // and never its contents, like every other refusal on this path.
+  try {
+    return assertCanonicalSessionsValid(parsed.data);
+  } catch {
+    throw new Error("ACP_CANONICAL_SESSIONS_JSON is invalid");
+  }
+};
+
 /**
  * `agentcpd` — the single local runtime authority (PRD §33.1).
  *
@@ -2960,11 +3014,10 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   // Classify the complete environment-only group before reading config or acquiring resources.
   // Blank values are absent; nonblank values are retained exactly for the claim boundary.
   const CANONICAL_ACTIVATION_VARS = [
-    "ACP_CANONICAL_SESSION_UUID",
+    "ACP_CANONICAL_SESSIONS_JSON",
     "ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION",
     "ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH",
     "ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256",
-    "ACP_CANONICAL_CTO_BUZZ_ACTOR_ID",
     "ACP_CANONICAL_CTO_PEER_PROTOCOL",
     "ACP_CANONICAL_CTO_BUZZ_PURPOSE",
   ] as const;
@@ -3184,7 +3237,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         `canonical self-claim disabled: none of ${CANONICAL_ACTIVATION_VARS.join(", ")} is set\n`,
       );
     } else {
-      const canonicalSessionUuid = canonicalActivationValues["ACP_CANONICAL_SESSION_UUID"];
+      const canonicalSessions = configuredCanonicalSessions(canonicalActivationValues["ACP_CANONICAL_SESSIONS_JSON"]);
       const canonicalRequiredExecutorVersion = canonicalActivationValues["ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION"];
       // Handed to the daemon so the system report can compare it against the build the wake
       // transport was qualified on (#886). Inside the activation block on purpose: a deployment
@@ -3200,7 +3253,6 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       // against `ACP_OPERATOR_TOKEN`; its only authority is the kernel's own record of who opened
       // this socket, checked by `startCanonicalSelfClaimListener` itself before this handler is
       // ever called.
-      const canonicalCtoBuzzActorId = canonicalActivationValues["ACP_CANONICAL_CTO_BUZZ_ACTOR_ID"];
       canonicalSelfClaim = await startCanonicalSelfClaimListener(daemon, stateDir, (peer, params) => {
         // Deployment facts are the entry-time snapshot, never request or callback-time values.
         return executeCanonicalSelfClaimOperator(peer, params, {
@@ -3208,15 +3260,17 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
           clock: cp.clock,
           sessions: cp.sessions,
           bindings: cp.bindings,
-          // The canonical CTO's own Buzz channel identity is a deployment fact, configured the
+          // Each canonical CTO's own Buzz channel identity is a deployment fact, configured the
           // same way the CLI operator identity is (`ACP_OPERATOR_ACTOR`) — not something a
-          // caller asserts and this authenticator merely echoes back.
+          // caller asserts and this authenticator merely echoes back. Every entry's identity is
+          // admissible here and the claim then uses the one belonging to the session the kernel
+          // says is calling, so this guard bounds the set without choosing from it.
           buzzActorAuthenticator: new IngressGuard(cp.db, cp.clock, cp.audit, {
-            buzz: { allowedActors: [canonicalCtoBuzzActorId] },
+            buzz: { allowedActors: canonicalSessions.map((entry) => entry.buzzActorId) },
           }),
           resolveBuzzAddress: resolveCanonicalSelfClaimBuzzAddress,
           config: {
-            canonicalSessionUuid,
+            canonicalSessions,
             requiredExecutorVersion: canonicalRequiredExecutorVersion,
             canonicalBuzzChannelId,
             expectedPeerProtocolVersion: canonicalActivationValues["ACP_CANONICAL_CTO_PEER_PROTOCOL"],
@@ -3224,8 +3278,6 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
             // uid, never a value either side is told by the other.
             expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
             peerProtocolVersion: canonicalActivationValues["ACP_CANONICAL_CTO_PEER_PROTOCOL"],
-            buzzChannelId: canonicalBuzzChannelId,
-            buzzActorId: canonicalCtoBuzzActorId,
             buzzPurpose: canonicalActivationValues["ACP_CANONICAL_CTO_BUZZ_PURPOSE"],
             expectedExecutorRealpath: canonicalExpectedExecutorRealpath,
             expectedExecutorSha256: canonicalExpectedExecutorSha256,
