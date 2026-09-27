@@ -8,6 +8,9 @@ import {
   linkSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
+  readFileSync,
+  readSync,
   readdirSync,
   realpathSync,
   renameSync,
@@ -19,7 +22,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { boundedExecFileSync } from "../helpers/bounded-sync-child.ts";
 
 import {
@@ -33,6 +36,13 @@ import {
   makeDefaultTranscriptReader,
   type ExecutingImageEvidence,
 } from "../../src/registry/canonical-self-claim.ts";
+
+// Every `node:fs` export is a spy that keeps its real implementation (`{ spy: true }`), in this file
+// and in the inspector module it imports. Nothing here overrides one; `imageAccessesDuring` only
+// reads what they recorded, so the one case that asks whether the canonical inspector reads the
+// image can count the opens and reads rather than infer them from what came back. Module scope, so
+// vitest's hoisting runs it before the imports it has to intercept.
+vi.mock("node:fs", { spy: true });
 
 /**
  * The real inspector reports three outcomes; every test below is about the two that describe the
@@ -603,18 +613,98 @@ describe("real executing-image resolution — symlink and image can diverge", ()
     }
   };
 
+  /**
+   * Whether an inspector reads the image is a fact about what it calls, not about what it returns:
+   * one that read and hashed every byte and then dropped the hash would return exactly the path and
+   * version. So the read is counted where it would happen, at `node:fs` (spied on for this whole
+   * file, see `vi.mock` at the top). This lists every `openSync` that landed on the image's inode —
+   * by its reported path or, on Linux, `/proc/<pid>/exe`, which a stat follows to the same inode —
+   * and every `readFileSync` or `readSync` of the image's path or of a descriptor one of those opens
+   * returned, made while `body` ran. `body` is synchronous, so nothing else in this process can
+   * reach `node:fs` inside that window.
+   *
+   * What it cannot see: bytes read by another process (a spawned `shasum`), or by an asynchronous
+   * `node:fs` call started in the window. The inspector reaches a file's bytes only through the
+   * synchronous calls counted here.
+   *
+   * The spies are cleared before and after: `readFileSync` records its result, and for the hashing
+   * inspector that is the whole image, which would otherwise stay referenced for the rest of the file.
+   */
+  const imageAccessesDuring = <T>(imagePath: string, body: () => T): { result: T; accesses: string[] } => {
+    const image = statSync(imagePath, { bigint: true });
+    const namesImage = (target: unknown): boolean => {
+      if (typeof target !== "string") return false;
+      try {
+        const stat = statSync(target, { bigint: true });
+        return stat.dev === image.dev && stat.ino === image.ino;
+      } catch {
+        return false;
+      }
+    };
+    const spies = [vi.mocked(openSync), vi.mocked(readFileSync), vi.mocked(readSync)];
+    for (const spy of spies) spy.mockClear();
+    try {
+      const result = body();
+      const accesses: string[] = [];
+      const imageFds = new Set<number>();
+      const opens = vi.mocked(openSync).mock;
+      opens.calls.forEach(([path], index) => {
+        if (!namesImage(path)) return;
+        accesses.push(`openSync(${String(path)})`);
+        const outcome = opens.results[index];
+        if (outcome?.type === "return") imageFds.add(outcome.value);
+      });
+      for (const [target] of vi.mocked(readFileSync).mock.calls) {
+        if (namesImage(target) || (typeof target === "number" && imageFds.has(target))) {
+          accesses.push(`readFileSync(${String(target)})`);
+        }
+      }
+      for (const [fd] of vi.mocked(readSync).mock.calls) {
+        if (imageFds.has(fd)) accesses.push(`readSync(${fd})`);
+      }
+      return { result, accesses };
+    } finally {
+      for (const spy of spies) spy.mockClear();
+    }
+  };
+
   it(
-    "the canonical inspector observes an image by path and version without reading it, so an unreadable image is still observed",
+    "the canonical inspector opens and reads no byte of the image it observes by path and version",
     async () => {
       const { executable, pid } = await spawnUnreadableImageHolder();
       const expected = { imagePath: realpathSync(executable), version: UNREADABLE_IMAGE_TEST_VERSION };
 
-      // Readable: path and version and nothing else. No `sha256` key at all — the canonical
-      // attestation and receipt read the path and version only, so this inspector reads no bytes.
+      // The count reaches the inspector's own calls: through the hashing inspector it sees the
+      // image opened and read. Without this, an empty count below could mean only that the spy
+      // never reached the module that does the reading.
+      const hashing = imageAccessesDuring(expected.imagePath, () => hashedImage(pid));
+      expect(hashing.result?.sha256).toMatch(/^sha256:[0-9a-f]{64}$/);
+      expect(hashing.accesses.some((access) => access.startsWith("openSync("))).toBe(true);
+      expect(hashing.accesses.some((access) => !access.startsWith("openSync("))).toBe(true);
+
+      // The canonical inspector: path and version, no `sha256` key, and no open or read of the
+      // image at all. The shape alone does not show the last part — a read whose hash is dropped
+      // returns this same shape — which is why the count is taken rather than inferred.
+      const canonical = imageAccessesDuring(expected.imagePath, () => resolvedImage(pid));
+      expect(canonical.result).toEqual(expected);
+      expect(canonical.accesses).toEqual([]);
+    },
+    20_000,
+  );
+
+  it(
+    "an image this uid cannot read is still observed by path and version on the canonical path",
+    async () => {
+      const { executable, pid } = await spawnUnreadableImageHolder();
+      const expected = { imagePath: realpathSync(executable), version: UNREADABLE_IMAGE_TEST_VERSION };
       expect(resolvedImage(pid)).toEqual(expected);
 
       // Unreadable: the same observation. It used to hash here, and the failed read of a field
       // the canonical claim never consumes turned the whole observation into `null`.
+      //
+      // This case does not show that nothing is read. An inspector that tried to read, failed, and
+      // dropped only the hash — which is what the hashing inspector does here — gives this same
+      // answer. The case above is the one that counts reads.
       withoutReadPermission(executable, () => {
         expect(resolvedImage(pid)).toEqual(expected);
       });

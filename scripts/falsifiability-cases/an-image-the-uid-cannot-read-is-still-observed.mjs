@@ -12,6 +12,12 @@
  * and requires the canonical inspector to report the same path and version it reported while the
  * image was readable; with the open in place the open fails with EACCES and the observation is
  * `null`. The mutant also leaks the FD it opens, which is irrelevant to a test process.
+ *
+ * Which row witnesses which fact: this one, that an unreadable image is still observed. It does
+ * not witness that the canonical inspector reads no bytes: an inspector that tries the read, fails
+ * on the unreadable image and drops only the hash gives this test the same answer (measured
+ * against `the-canonical-image-observation-reads-no-bytes`'s mutant, which passes here). That
+ * row's test counts the opens and reads at `node:fs`, and it is the one that witnesses the read.
  */
 const c = {
   id: "an-image-the-uid-cannot-read-is-still-observed",
@@ -20,7 +26,7 @@ const c = {
   find: "isReportedImageFile(statSync(imagePath, { bigint: true }), reported)",
   replace: 'isReportedImageFile(fstatSync(openSync(imagePath, "r"), { bigint: true }), reported)',
   killedBy: [
-    "tests/process/canonical-self-claim-identity.test.ts::the canonical inspector observes an image by path and version without reading it",
+    "tests/process/canonical-self-claim-identity.test.ts::an image this uid cannot read is still observed by path and version on the canonical path",
   ],
 };
 export default c;

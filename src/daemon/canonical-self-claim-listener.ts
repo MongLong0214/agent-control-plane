@@ -158,7 +158,7 @@ export const authenticateClaimCredentials = (
 /**
  * The wire shape a caller may ever see. For a denial, only the stable `reasonCode` classifying
  * why — never the internal `message` prose or `evidence` object, either of which can carry a
- * session UUID, an absolute path, an image hash, a peer identity, a transcript fact, or a raw
+ * session UUID, an absolute path, a peer identity, a transcript fact, or a raw
  * exception message: exactly what `authenticateClaimPeer`, the request parser, the method/lock
  * checks, the handler's own denial, the request-timeout, and the handler-exception catch would
  * otherwise put on this socket unfiltered. For an allow, the caller's own receipt `value` passes
