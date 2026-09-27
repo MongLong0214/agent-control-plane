@@ -109,9 +109,12 @@ export const assertDirectPeer = (credentials: PeerCredentials): Decision<PeerCre
 
 /**
  * The one identity check this listener performs itself, before a byte of the request is even
- * read — "before any other effect". Everything past this point (the exact executable, version,
- * conversation transcript and working directory) is `CanonicalSelfClaim.claim()`'s job,
- * unchanged; this only answers "is this a trustworthy direct local peer at all".
+ * read — "before any other effect". Everything past this point is `CanonicalSelfClaim.claim()`'s
+ * job, unchanged: the claude ancestor the walk finds by `argv[0]`'s basename, the session UUID in
+ * its argv and the project that UUID's entry entitles, a working directory it can read, the
+ * conversation transcript, and the pid/start-time recheck. It checks no executable or version —
+ * the executing image is recorded there, never compared. This only answers "is this a
+ * trustworthy direct local peer at all".
  */
 const authenticateClaimPeer = (socket: Socket): Decision<AuthenticatedClaimPeer> =>
   authenticateClaimCredentials(derivePeerCredentialsFromSocket(socket), process.geteuid?.());

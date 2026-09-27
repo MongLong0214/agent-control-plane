@@ -112,11 +112,11 @@ const groups = [
   {
     file: "src/registry/canonical-self-claim.ts",
     // NO WITNESS — the operand's own effect is subsumed, so no input can distinguish it.
-    reason: "Three operands whose removal changes nothing observable, each measured rather than argued. `firstElement !== undefined` (looksLikeClaudeInvocation): the mutant needs a non-null assertion to compile, and `/(^|\\/)claude$/.test(undefined!)` coerces to the string \"undefined\", which does not match — SURVIVED. `typeof value !== \"string\"` (requireDeploymentValue): every caller reaches it through a `CanonicalSelfClaimConfig` field typed `string`, so a non-string cannot arrive without bypassing the type; removing the operand leaves `value.trim()`, which would throw rather than refuse if one ever did — SURVIVED, and TypeScript is what stands between that throw and a caller. `stat.dev !== reportedDevice` (openVerifiedDarwinImageFd): its sibling inode check catches every fixture, and distinguishing it needs a decoy on a *different device* — a cross-device fixture this suite has no way to build on one volume. All three are kept because each is the half that would matter first if the other changed.",
+    reason: "Three operands whose removal changes nothing observable, each measured rather than argued. `firstElement !== undefined` (looksLikeClaudeInvocation): the mutant needs a non-null assertion to compile, and `/(^|\\/)claude$/.test(undefined!)` coerces to the string \"undefined\", which does not match — SURVIVED. `typeof value !== \"string\"` (requireDeploymentValue): every caller reaches it through a `CanonicalSelfClaimConfig` field typed `string`, so a non-string cannot arrive without bypassing the type; removing the operand leaves `value.trim()`, which would throw rather than refuse if one ever did — SURVIVED, and TypeScript is what stands between that throw and a caller. `stat.dev === reported.device` (isReportedImageFile, which both the canonical path `stat` and the hashing inspector's FD `fstat` call since #1008 round 2 — it was `stat.dev !== reportedDevice` in openVerifiedDarwinImageFd before): its sibling inode check catches every fixture, and distinguishing it needs a decoy on a *different device* — a cross-device fixture this suite has no way to build on one volume. Re-measured at the new site: removing it leaves the decoy-swap case passing. All three are kept because each is the half that would matter first if the other changed.",
     operands: [
       ["firstElement !== undefined",1],
       ["typeof value !== \"string\"",1],
-      ["stat.dev !== reportedDevice",1],
+      ["stat.dev === reported.device",1],
     ],
   },
   {

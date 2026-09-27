@@ -4,7 +4,8 @@ import type { ControlPlane } from "../app/control-plane.ts";
 import { CtoBindingDelegation } from "../ceo/cto-binding-delegation.ts";
 import { runHermesTargetBind, type HermesTargetBindResponse } from "../runtime/hermes-target-bind.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
-import { verifyClaudeIdentity, assertClaudeIdentityStillLive, SELF_CLAIM_PROTOCOL, SELF_CLAIM_EXECUTOR_KIND } from "../registry/canonical-self-claim.ts";
+import { verifyClaudeIdentity, assertClaudeIdentityStillLive, hashingExecutingImageInspector, isExecutingImageProbeFailure,
+  SELF_CLAIM_PROTOCOL, SELF_CLAIM_EXECUTOR_KIND } from "../registry/canonical-self-claim.ts";
 import { CtoDelegatedBinding } from "./cto-delegated-binding.ts";
 
 const absolute = z.string().min(1).refine(isAbsolute);
@@ -69,10 +70,20 @@ export function createCtoBindingRuntime(cp: ControlPlane, rawTargets: string | u
             if (tuple.sessionId !== sessionId || tuple.incarnation !== target.incarnation) return null;
             // This is a daemon-local check of an already provisioned session, not a new
             // claimant socket. Never pretend the authenticated CEO is the target's peer.
+            // The hashing inspector, because the digest below is the one reader of the image's
+            // sha256; the canonical claim observes the same image without reading its bytes.
             const checked = verifyClaudeIdentity({ ...target, canonicalSessionUuids: [target.nativeSessionUuid] },
-              { callerPid: pid, claimedPid: pid, claimedSessionUuid: target.nativeSessionUuid });
+              { callerPid: pid, claimedPid: pid, claimedSessionUuid: target.nativeSessionUuid },
+              { imageInspector: hashingExecutingImageInspector });
             if (!checked.allowed || checked.value.identity.startedAt !== session.osProcessStartedAt ||
                 !assertClaudeIdentityStillLive(checked.value.identity).allowed) return null;
+            // An image the scan resolved but whose bytes could not be read arrives without its
+            // sha256. Attesting it would put a composition in this digest it has never had — an
+            // observed image with no hash — so it is refused; it used to be folded into `null` and
+            // attested as no image at all. No image (`null`) and a scan that never ran are still
+            // attested as they are: neither is a hash that failed.
+            const { image } = checked.value;
+            if (image !== null && !isExecutingImageProbeFailure(image) && image.sha256 === undefined) return null;
             attestationDigest = digestOf({ domain: "acp.cto-delegated-binding", ...tuple,
               ...checked.value, target: claimed });
             return claimed;

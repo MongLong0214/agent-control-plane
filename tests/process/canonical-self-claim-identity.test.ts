@@ -1,6 +1,9 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
+  accessSync,
+  chmodSync,
+  constants as fsConstants,
   copyFileSync,
   linkSync,
   mkdirSync,
@@ -24,6 +27,7 @@ import {
   defaultProcessAncestryInspector,
   deriveClaimantIdentity,
   extractSessionUuidFromArgv,
+  hashingExecutingImageInspector,
   isExecutingImageProbeFailure,
   looksLikeClaudeInvocation,
   makeDefaultTranscriptReader,
@@ -39,6 +43,15 @@ import {
  */
 const resolvedImage = (pid: number): ExecutingImageEvidence | null => {
   const resolution = defaultExecutingImageInspector.resolve(pid);
+  if (isExecutingImageProbeFailure(resolution)) {
+    throw new Error(`the lsof scan for pid ${pid} could not run: ${JSON.stringify(resolution.probeFailure)}`);
+  }
+  return resolution;
+};
+
+/** The same, through the inspector that also reads the image's bytes (the delegated binding's). */
+const hashedImage = (pid: number): ExecutingImageEvidence | null => {
+  const resolution = hashingExecutingImageInspector.resolve(pid);
   if (isExecutingImageProbeFailure(resolution)) {
     throw new Error(`the lsof scan for pid ${pid} could not run: ${JSON.stringify(resolution.probeFailure)}`);
   }
@@ -64,6 +77,12 @@ const SYMLINK_TEST_VERSION_REAL = "1.0.0-symlink-test-real";
 const SYMLINK_TEST_VERSION_DECOY = "9.0.0-symlink-test-decoy";
 /** Synthetic version for the executable-file layout used by current Claude installations. */
 const VERSION_FILE_LAYOUT_TEST_VERSION = "2.0.0-version-file-test";
+/**
+ * The image the unreadable-bytes cases below take read permission away from while it runs. Its own
+ * version, and so its own path, because the mode change is visible to every process on the host:
+ * `9.0.0-test` is shared with a concurrently running sibling file that must be able to run it.
+ */
+const UNREADABLE_IMAGE_TEST_VERSION = "1.0.0-unreadable-image-test";
 
 /**
  * Exercises the *real*, OS-backed implementations this module ships as defaults — never the
@@ -507,6 +526,8 @@ describe("real executing-image resolution — symlink and image can diverge", ()
         before = resolvedImage(pid);
       }
       expect(before, "the executing image could not be resolved before the swap").not.toBeNull();
+      // Linux compares hashes across the swap, and only the hashing inspector reads any.
+      const hashedBefore = process.platform === "linux" ? hashedImage(pid) : null;
 
       // An atomic rename over the exact same path, while the process keeps running: the running
       // process's own open image descriptor stays bound to the original inode (Unix keeps a
@@ -529,14 +550,95 @@ describe("real executing-image resolution — symlink and image can diverge", ()
         // `open()` time — it never re-reads the swapped path at all, so resolution on this
         // platform stays correct through the swap rather than needing to detect and refuse it.
         expect(after, "the executing image could not be resolved after the swap").not.toBeNull();
-        expect(after!.sha256).toBe(before!.sha256);
+        const hashedAfter = hashedImage(pid);
+        expect(hashedAfter?.sha256).toBeDefined();
+        expect(hashedAfter!.sha256).toBe(hashedBefore!.sha256);
       } else {
-        // Darwin has no magic-symlink equivalent: no image, not the decoy's hash. The bytes this
-        // reads are bound to the fd `fstat` verified against the kernel's own record of what the
-        // process has open, not re-resolved from the path a second time. The claim records that
-        // as no image and admits or refuses on its other clauses — nothing is compared to it.
+        // Darwin has no magic-symlink equivalent: no image, not the decoy's path or its hash. The
+        // path is checked against the (device, inode) lsof reported, and the bytes the hashing
+        // inspector reads are bound to the fd `fstat` verified against the same report — neither
+        // is re-resolved from the path on trust. The claim records that as no image and admits or
+        // refuses on its other clauses — nothing is compared to it.
         expect(after).toBeNull();
+        expect(hashedImage(pid)).toBeNull();
       }
+    },
+    20_000,
+  );
+
+  /**
+   * A process can run an image its uid cannot read: `execve` needs the execute bit, and `open` for
+   * reading needs the read bit. Taking the read bit away from a running image is how these cases
+   * get an image whose bytes cannot be read without a seam — the kernel has already mapped it, so
+   * the process keeps running, `lsof` keeps reporting it, and `stat` keeps answering.
+   *
+   * The mode is restored before the spawn as well as after the case, because a run that died
+   * between the two would leave the reused image unreadable for the next one.
+   */
+  const spawnUnreadableImageHolder = async (): Promise<{ executable: string; pid: number }> => {
+    const root = tempRoot();
+    const executable = writeVersionedClaude(UNREADABLE_IMAGE_TEST_VERSION);
+    chmodSync(executable, 0o755);
+    const child = spawnHeld(executable, [], root);
+    await waitUntil(() => child.pid !== undefined, "child pid to be assigned");
+    const pid = child.pid!;
+    let image = resolvedImage(pid);
+    for (let attempt = 0; !image && attempt < 40; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      image = resolvedImage(pid);
+    }
+    expect(image, "the executing image could not be resolved while readable").not.toBeNull();
+    return { executable, pid };
+  };
+
+  const withoutReadPermission = <T>(executable: string, body: () => T): T => {
+    chmodSync(executable, 0o111);
+    try {
+      // The premise, measured rather than assumed: a uid that bypasses permission bits (root)
+      // would read the file anyway and these cases would stop measuring anything.
+      expect(() => accessSync(executable, fsConstants.R_OK), "this uid can still read the image").toThrow();
+      return body();
+    } finally {
+      chmodSync(executable, 0o755);
+    }
+  };
+
+  it(
+    "the canonical inspector observes an image by path and version without reading it, so an unreadable image is still observed",
+    async () => {
+      const { executable, pid } = await spawnUnreadableImageHolder();
+      const expected = { imagePath: realpathSync(executable), version: UNREADABLE_IMAGE_TEST_VERSION };
+
+      // Readable: path and version and nothing else. No `sha256` key at all — the canonical
+      // attestation and receipt read the path and version only, so this inspector reads no bytes.
+      expect(resolvedImage(pid)).toEqual(expected);
+
+      // Unreadable: the same observation. It used to hash here, and the failed read of a field
+      // the canonical claim never consumes turned the whole observation into `null`.
+      withoutReadPermission(executable, () => {
+        expect(resolvedImage(pid)).toEqual(expected);
+      });
+    },
+    20_000,
+  );
+
+  it(
+    "the hashing inspector reports an image it could not read without a hash, never as no image, and hashes it once readable",
+    async () => {
+      const { executable, pid } = await spawnUnreadableImageHolder();
+      const expected = { imagePath: realpathSync(executable), version: UNREADABLE_IMAGE_TEST_VERSION };
+
+      // Unreadable: the scan resolved the image, so the answer still names it; the missing
+      // `sha256` is the report that its bytes were not read. `null` here would tell the delegated
+      // binding there was no image, and it would attest that.
+      withoutReadPermission(executable, () => {
+        expect(hashedImage(pid)).toEqual(expected);
+      });
+
+      // Readable again: the same image, now with the hash of its bytes.
+      const hashed = hashedImage(pid);
+      expect(hashed).toMatchObject(expected);
+      expect(hashed!.sha256).toMatch(/^sha256:[0-9a-f]{64}$/);
     },
     20_000,
   );

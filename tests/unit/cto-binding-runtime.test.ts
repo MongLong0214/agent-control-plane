@@ -8,7 +8,8 @@ import * as daemon from "../../src/daemon/agentcpd.ts";
 import { createCtoBindingRuntime, daemonCtoBindingRuntime } from "../../src/daemon/cto-binding-runtime.ts";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { sha256 } from "../../src/core/digest.ts";
-import { defaultProcessAncestryInspector, defaultExecutingImageInspector, defaultTranscriptReader } from "../../src/registry/canonical-self-claim.ts";
+import { defaultProcessAncestryInspector, defaultExecutingImageInspector, defaultTranscriptReader,
+  hashingExecutingImageInspector } from "../../src/registry/canonical-self-claim.ts";
 import { allow, type Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, SessionLifecycle } from "../../src/domain/types.ts";
@@ -55,7 +56,7 @@ async function mcp(path: string, credential: unknown, rawResponse = false) {
   };
 }
 
-it.each(["success", "external-nesting", "reentrant-target", "after-commit-fault", "capacity-boundary", "denied-flood", "non-owner-flood", "wrong-pid", "wrong-native-uuid", "stale-start", "stale-after-transcript", "withdrawn-executor-pins"])("Claude target pins use the canonical verifier without canonical owner approval: %s", async (mode) => {
+it.each(["success", "external-nesting", "reentrant-target", "after-commit-fault", "capacity-boundary", "denied-flood", "non-owner-flood", "wrong-pid", "wrong-native-uuid", "stale-start", "stale-after-transcript", "withdrawn-executor-pins", "unreadable-image"])("Claude target pins use the canonical verifier without canonical owner approval: %s", async (mode) => {
   h = makeHarness(); const { cp, root } = h; await registerFixtureProject(h, "project-a");
   const ceo = cp.sessions.create({ provider: "scripted", model: "ceo", osPid: process.pid });
   value(cp.sessions.transition(ceo.sessionId, SessionLifecycle.READY));
@@ -71,8 +72,14 @@ it.each(["success", "external-nesting", "reentrant-target", "after-commit-fault"
   if (mode === "wrong-native-uuid") snapshot.argv[2] = "22222222-2222-4222-8222-222222222222";
   if (mode === "stale-start") snapshot.startedAt = "stale";
   vi.spyOn(defaultProcessAncestryInspector, "snapshot").mockImplementation(() => ({ ...snapshot }));
-  vi.spyOn(defaultExecutingImageInspector, "resolve").mockReturnValue({ imagePath: "/fixture/claude",
-    version: "0.0.0-fixture", sha256: "sha256:" + "1".repeat(64) });
+  // The delegated bind is the one reader of the image's sha256, so it resolves the image through the
+  // hashing inspector; the canonical claim's inspector, which reads no bytes, must not be its source.
+  // `unreadable-image` is what that inspector answers for an image it resolved but could not read:
+  // the path and version, and no hash.
+  const hashedImage = vi.spyOn(hashingExecutingImageInspector, "resolve").mockReturnValue(mode === "unreadable-image"
+    ? { imagePath: "/fixture/claude", version: "0.0.0-fixture" }
+    : { imagePath: "/fixture/claude", version: "0.0.0-fixture", sha256: "sha256:" + "1".repeat(64) });
+  const unhashedImage = vi.spyOn(defaultExecutingImageInspector, "resolve");
   let reenter: (() => void) | undefined;
   vi.spyOn(defaultTranscriptReader, "locate").mockImplementation(() => {
     reenter?.();
@@ -169,6 +176,8 @@ it.each(["success", "external-nesting", "reentrant-target", "after-commit-fault"
   const result = runtime.bind(principal, request);
   expect(consumed).not.toHaveBeenCalled();
   expect(cp.db.get<{ n: number }>("SELECT count(*) AS n FROM sessions")!.n).toBe(beforeSessions);
+  if (!["wrong-pid", "wrong-native-uuid"].includes(mode)) expect(hashedImage).toHaveBeenCalled();
+  expect(unhashedImage).not.toHaveBeenCalled();
   if (!["success", "external-nesting", "reentrant-target", "denied-flood", "non-owner-flood", "withdrawn-executor-pins"].includes(mode)) {
     expect(result.allowed).toBe(false);
     expect(cp.bindings.activePrimaryCto("project-a")).toBeNull();
@@ -226,7 +235,7 @@ it.each([
     pid: process.pid, ppid: 1, command: "fixture", cwd: root, cwdProbeFailure: null,
     startedAt: target.osProcessStartedAt, argv: ["/fixture/claude", "--session-id", nativeUuid],
   }));
-  vi.spyOn(defaultExecutingImageInspector, "resolve").mockReturnValue({ imagePath: "/fixture/claude",
+  vi.spyOn(hashingExecutingImageInspector, "resolve").mockReturnValue({ imagePath: "/fixture/claude",
     version: "0.0.0-fixture", sha256: "sha256:" + "1".repeat(64) });
   const transcript = vi.spyOn(defaultTranscriptReader, "locate").mockImplementation(() => {
     if (failure === "internal") throw new Error("SYNTHETIC_PRIVATE_ERROR /private/fixture-secret-path");
