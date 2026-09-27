@@ -36,6 +36,7 @@ const REQUEST = {
 const depsWith = (core: ReturnType<typeof makeCore>): CanonicalSelfClaimOperatorDeps => ({
   db: core.db,
   clock: core.clock,
+  audit: core.audit,
   sessions: core.sessions,
   bindings: core.bindings,
   buzzActorAuthenticator: new IngressGuard(core.db, core.clock, core.audit, {

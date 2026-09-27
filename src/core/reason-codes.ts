@@ -94,6 +94,13 @@ export const ReasonCode = {
   EVIDENCE_MISSING: "EVIDENCE_MISSING",
   COVERAGE_INCOMPLETE: "COVERAGE_INCOMPLETE",
   PROBE_FAILED: "PROBE_FAILED",
+  /**
+   * A decision whose audit row is written inside its own transaction was not committed, because
+   * that row could not be written. Distinct from `INTERNAL_ERROR` because the state is known: the
+   * transaction rolled back, so nothing the decision would have committed is present, and a retry
+   * at the same expected generation meets the state it expected.
+   */
+  AUDIT_WRITE_FAILED: "AUDIT_WRITE_FAILED",
   ISOLATION_LOST: "ISOLATION_LOST",
   /**
    * The reviewer's isolation was enforced and its identity handshake then did not answer.

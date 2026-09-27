@@ -17,7 +17,7 @@ const c = {
   find: "work || ",
   replace: "",
   killedBy: [
-    "tests/unit/canonical-self-claim.test.ts::same-live recovery refuses work mismatch without effects",
+    "tests/unit/canonical-self-claim.test.ts::same-live recovery refuses work mismatch leaving only its own refusal row",
   ],
 };
 export default c;

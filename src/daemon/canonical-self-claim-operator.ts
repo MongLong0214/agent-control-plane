@@ -1,6 +1,7 @@
 import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import {
   CanonicalSelfClaim,
@@ -37,6 +38,8 @@ import type { BuzzActorAuthenticator, SessionRegistry } from "../session/session
 export interface CanonicalSelfClaimOperatorDeps {
   db: Db;
   clock: Clock;
+  /** Receives the one row `CanonicalSelfClaim.claim()` records for every decision it returns. */
+  audit: AuditLog;
   sessions: SessionRegistry;
   bindings: BindingRegistry;
   buzzActorAuthenticator: BuzzActorAuthenticator;
@@ -118,6 +121,7 @@ export const executeCanonicalSelfClaimOperator = async (
   const claim = new CanonicalSelfClaim(
     deps.db,
     deps.clock,
+    deps.audit,
     deps.sessions,
     deps.bindings,
     deps.buzzActorAuthenticator,
