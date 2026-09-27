@@ -18,10 +18,11 @@ const c = {
   file: "src/registry/canonical-self-claim.ts",
   find: "      if (new Set(values).size !== values.length) {",
   replace: "      if (new Set(values).size !== new Set(values).size) {",
+  // One `-t` pattern, deliberately the shared prefix of the three `it.each` cases rather than one
+  // of them: the mutation makes the comparison vacuous for every field at once, so the row's claim
+  // is about all three, and `vitestArgsFor` accepts exactly one pattern.
   killedBy: [
-    "tests/unit/canonical-self-claim.test.ts::refuses a set that repeats a sessionUuid rather than resolving it by first match",
-    "tests/unit/canonical-self-claim.test.ts::refuses a set that repeats a projectId rather than resolving it by first match",
-    "tests/unit/canonical-self-claim.test.ts::refuses a set that repeats a buzzActorId rather than resolving it by first match",
+    "tests/unit/canonical-self-claim.test.ts::refuses a set that repeats a",
   ],
 };
 export default c;

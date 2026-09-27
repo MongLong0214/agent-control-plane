@@ -18,10 +18,11 @@ const c = {
   file: "src/registry/canonical-self-claim.ts",
   find: " || value.trim() === \"\"",
   replace: "",
+  // One `-t` pattern covering the three `it.each` cases, for the same reason as
+  // `the-adoptable-set-refuses-repeated-fields`: the mutation reaches every field, so the row's
+  // witness is all three cases and not whichever one happens to be listed first.
   killedBy: [
-    "tests/unit/canonical-self-claim.test.ts::fails closed on a blank sessionUuid in an entry",
-    "tests/unit/canonical-self-claim.test.ts::fails closed on a blank projectId in an entry",
-    "tests/unit/canonical-self-claim.test.ts::fails closed on a blank buzzActorId in an entry",
+    "tests/unit/canonical-self-claim.test.ts::fails closed on a blank",
   ],
 };
 export default c;
