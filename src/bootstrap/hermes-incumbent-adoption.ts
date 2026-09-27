@@ -62,11 +62,14 @@ export const createHermesIncumbentAdoption = (cp: ControlPlane, options: {
       [previous.actor_id],
     );
     const incumbent = cp.sessions.get(previous.session_id);
+    // A prior live-head binding can be restored only onto that same authenticated head.
+    // A changed head needs Gateway ancestry proof; a matching root digest alone is insufficient.
     if (!actor || actor.kind !== Role.CEO || actor.retired_at !== null || actor.current_session_id !== previous.session_id ||
         actor.current_session_incarnation !== previous.session_incarnation ||
         (lineage && (lineage.executor_kind !== "hermes" ||
           lineage.target_locator_digest !== proof.lineage_root_digest ||
-          lineage.target_locator !== options.target.sessionId)) ||
+          (lineage.target_locator !== options.target.sessionId &&
+            lineage.target_locator !== proof.session_id))) ||
         !incumbent || incumbent.incarnation !== previous.session_incarnation ||
         probeSessionLiveness(incumbent.osPid, incumbent.osProcessStartedAt) !== "DEAD") return refuse();
 
