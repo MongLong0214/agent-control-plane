@@ -466,13 +466,26 @@ describe("deployment identity is required, deployment-private configuration (#76
     ).toBeInstanceOf(CanonicalSelfClaim);
   });
 
-  it.each(["sessionUuid", "projectId", "buzzActorId"] as const)(
-    "fails closed on a blank %s in an entry", (field) => {
+  // Review #1006/sol: whitespace-only ("  ") is also refused by the padding check two lines
+  // below, so those three cases alone kill `an-entry-field-is-not-blank` on wording (a different
+  // thrown message), never on the constructor succeeding. A true empty string does not trip
+  // padding (`"" === "".trim()`), so it isolates the operand — for projectId and buzzActorId,
+  // which have no later check of their own. sessionUuid is left out of the empty-string cases:
+  // an empty sessionUuid still throws after this operand is removed, from `UUID_PATTERN.test("")`
+  // a few lines later, so it would not isolate this check either.
+  it.each([
+    ["sessionUuid", "whitespace-only", "  "],
+    ["projectId", "whitespace-only", "  "],
+    ["buzzActorId", "whitespace-only", "  "],
+    ["projectId", "empty", ""],
+    ["buzzActorId", "empty", ""],
+  ] as const)(
+    "fails closed on a blank %s in an entry (%s)", (field, _shape, value) => {
       const core = makeCore();
       const entry = { sessionUuid: CANON, projectId: CONFIG_PROJECT, buzzActorId: CANONICAL_ACTOR };
       expect(() =>
         makeSubject(core, CONFIG_PROJECT, {
-          configOverrides: { canonicalSessions: [{ ...entry, [field]: "  " }] },
+          configOverrides: { canonicalSessions: [{ ...entry, [field]: value }] },
         }),
       ).toThrow(new RegExp(`canonicalSessions\\[\\].${field} is required deployment configuration`));
     },
