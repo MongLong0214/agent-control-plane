@@ -534,8 +534,12 @@ const strip = (raw: string): string => raw.replace(ANSI, "").replace(/\r/g, "\n"
  * with the screen model they were fixtures for, so the reading above is checkable at 972b4736 and
  * nowhere later. A concatenation has no read boundary left to split, so the only mangled glyph
  * possible is one the client had not finished writing.
+ *
+ * Exported for one row that feeds it a glyph split across two reads. Nothing else may import it:
+ * what it returns is not evidence about anything, and a caller that measured off it would be
+ * measuring the terminal again.
  */
-const terminalOutput = (): { readonly push: (chunk: Buffer) => void; readonly text: () => string } => {
+export const terminalOutput = (): { readonly push: (chunk: Buffer) => void; readonly text: () => string } => {
   const chunks: Buffer[] = [];
   return {
     push: (chunk) => {

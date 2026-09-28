@@ -37,6 +37,7 @@ import {
   pinClaudeImage,
   probeArgv,
   spawnPlanFor,
+  terminalOutput,
   qualificationDisagreements,
   readReadings,
   runQualificationProbe,
@@ -311,6 +312,48 @@ describe("U6: the interactive arm keeps the shape the claim requires, and observ
     expect(baselineTurnObserved(captured("/v1/messages"), BASELINE_PROMPT)).toBe(true);
     expect(baselineTurnObserved(captured("/v1/messages?beta=true"), BASELINE_PROMPT)).toBe(true);
     expect(modelRequestsIn(`${countTokens}${captured("/v1/messages?beta=true")}`)).toHaveLength(1);
+  });
+});
+
+/**
+ * The session log a failed arm prints, and the file every run copies out beside its capture.
+ *
+ * Diagnosis-only output, and the row is narrow on purpose: nothing in the harness measures
+ * anything off this text and nothing may. What it owes is to be readable, and a glyph cut in half
+ * by a pipe read is the one way this loses that. The row that used to say so was deleted with the
+ * screen model, while the guarantee it was about stayed.
+ */
+describe("U6: the session log is decoded as a stream, not per read", () => {
+  it("a glyph split across two reads survives, which decoding each read on its own does not", () => {
+    // A pipe read ends wherever the pipe was drained, not on a character boundary. `❯` is three
+    // bytes and is the client's own prompt glyph, so this is the split that actually happened.
+    const glyph = Buffer.from("❯", "utf8");
+    expect(glyph).toHaveLength(3);
+
+    for (const at of [1, 2]) {
+      const output = terminalOutput();
+      output.push(glyph.subarray(0, at));
+      output.push(glyph.subarray(at));
+      expect(output.text(), `split after ${at} byte(s)`).toBe("❯");
+    }
+
+    // The control, so this is a row about the boundary and not one any implementation passes:
+    // decoding each read on its own is what turned each half into a replacement character.
+    // Three replacement characters, not two: the first byte is one, and the two trailing bytes are
+    // one each, which is what the reviewer who found this row missing measured.
+    expect(glyph.subarray(0, 1).toString("utf8") + glyph.subarray(1).toString("utf8")).toBe("\uFFFD".repeat(3));
+
+    // Byte by byte, and with the surrounding text a real read carries.
+    const line = Buffer.from("│ ❯ ping │", "utf8");
+    const byByte = terminalOutput();
+    for (const byte of line) byByte.push(Buffer.from([byte]));
+    expect(byByte.text()).toBe("│ ❯ ping │");
+
+    // What is still possible, stated rather than papered over: a glyph the client had not finished
+    // writing when the arm read its last chunk has no second half to join, and shows as U+FFFD.
+    const truncated = terminalOutput();
+    truncated.push(glyph.subarray(0, 2));
+    expect(truncated.text()).toBe("\uFFFD");
   });
 });
 
