@@ -175,10 +175,11 @@ describe("U6: the interactive arm keeps the shape the claim requires, and observ
     expect(isInteractiveClaudeInvocation(headless)).toBe(false);
   });
 
-  it("the baseline turn is a captured model request, and nothing short of one counts as having seen it", () => {
-    const captured = (url: string, body = '{"model":"claude-sonnet-4-5"}'): string =>
-      `${JSON.stringify({ at: "2026-09-28T00:00:00.000Z", method: "POST", url, headers: {}, body })}\n`;
+  /** One line of the capture the fake provider appends: the request target as it arrived. */
+  const captured = (url: string, body = '{"model":"claude-sonnet-4-5"}'): string =>
+    `${JSON.stringify({ at: "2026-09-28T00:00:00.000Z", method: "POST", url, headers: {}, body })}\n`;
 
+  it("the baseline turn is a captured model request, and nothing short of one counts as having seen it", () => {
     // Passing the prompt is not evidence it was accepted. An arm that had seen nothing, or had seen
     // only traffic to some other endpoint, has not observed a turn -- and the harness fails rather
     // than proceeding, because a baseline it assumed is a baseline the wake's follow-up is measured
@@ -197,6 +198,24 @@ describe("U6: the interactive arm keeps the shape the claim requires, and observ
     expect(kept).toHaveLength(1);
     // The body is carried through, because it is what the wake count is read from.
     expect(kept[0]).toMatchObject({ url: "/v1/messages?beta=true", body: '{"prompt":"ping"}' });
+  });
+
+  it("a count-tokens request is a request about a turn, and is not one", () => {
+    // `/v1/messages/count_tokens` is beneath the endpoint, not the endpoint. A substring test says
+    // yes to it, and a client can send one before it has asked for any inference -- so it would
+    // stand in for the only evidence this harness has that its prompt was accepted, and the arm
+    // would go on to measure the wake's follow-up against a baseline that never happened.
+    const countTokens = captured("/v1/messages/count_tokens");
+    expect(modelRequestsIn(countTokens)).toEqual([]);
+    expect(baselineTurnObserved(countTokens)).toBe(false);
+    expect(baselineTurnObserved(`${countTokens}${captured("/v1/messages/count_tokens?beta=true")}`)).toBe(false);
+
+    // The control, so this is a row about the endpoint and not a row that refuses everything: the
+    // endpoint itself counts, with a query string and without, and a count-tokens request beside a
+    // real one does not inflate the count the follow-up is compared against.
+    expect(baselineTurnObserved(captured("/v1/messages"))).toBe(true);
+    expect(baselineTurnObserved(captured("/v1/messages?beta=true"))).toBe(true);
+    expect(modelRequestsIn(`${countTokens}${captured("/v1/messages?beta=true")}`)).toHaveLength(1);
   });
 });
 

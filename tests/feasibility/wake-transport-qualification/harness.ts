@@ -673,6 +673,17 @@ export const probeArgv = (
     : ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", ...shared];
 };
 
+/** The one endpoint a request has to have been sent to for this harness to call it a turn. */
+const MESSAGES_ENDPOINT = "/v1/messages";
+
+/**
+ * The endpoint a captured request was sent to: its target without the query string.
+ *
+ * The capture stores the request target as it arrived, and every build measured here sends
+ * `/v1/messages?beta=true`, so the endpoint is what precedes the first `?` or `#`.
+ */
+const requestEndpoint = (url: string): string => url.split(/[?#]/)[0] ?? url;
+
 /**
  * The captured requests that were sent to be inferred on.
  *
@@ -680,13 +691,23 @@ export const probeArgv = (
  * "a turn began" means the same thing everywhere in this file. The capture is the loopback fake
  * provider's append-only JSONL (`../native-session-inbox/fake-anthropic.ts`): every request it
  * received, whatever its path, one JSON object per line.
+ *
+ * The endpoint is *compared*, not searched for. The earlier form was
+ * `url.includes("/v1/messages")`, which also matches `/v1/messages/count_tokens` -- a request
+ * *about* a turn rather than a turn, and one a client can send before it has asked for any
+ * inference at all. Since the baseline turn is this harness's only evidence that the prompt it
+ * started the client with was accepted, a count-tokens request standing in for that evidence would
+ * let an arm proceed and then measure the wake's follow-up against a baseline that never happened.
+ * No capture taken on this host holds one -- checked across the four arms of each committed
+ * reading -- so this changes no number that exists; it stops the filter from meaning something
+ * other than its name on the first build that sends one.
  */
 export const modelRequestsIn = (capture: string): readonly { readonly url: string; readonly body: string }[] =>
   capture
     .split("\n")
     .filter((line) => line.trim().length > 0)
     .map((line) => JSON.parse(line) as { url: string; body: string })
-    .filter((request) => request.url.includes("/v1/messages"));
+    .filter((request) => requestEndpoint(request.url) === MESSAGES_ENDPOINT);
 
 /**
  * Whether the baseline turn has been *observed*: one request the client sent to be inferred on.
