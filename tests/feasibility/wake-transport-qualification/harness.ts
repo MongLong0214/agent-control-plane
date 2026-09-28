@@ -53,7 +53,6 @@ import {
 import { connect } from "node:net";
 import { arch, homedir, platform, release } from "node:os";
 import { basename, delimiter, join, relative } from "node:path";
-import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 
 import { startFakeAnthropic, type FakeAnthropic } from "../native-session-inbox/fake-anthropic.ts";
@@ -142,21 +141,14 @@ const CHILD_EXIT_GRACE_MS = 10_000;
 /**
  * Escape sequences, deleted to store a readable log and to show a terminal tail when a run fails.
  *
- * Deleted, not applied, so this text is not the screen: a renderer that repaints by difference
- * leaves words in it that were never drawn (see `interactiveReadiness`), which is why readiness
- * does not read it. Nothing is *measured* off this text either -- the measurement is the provider
- * capture. A terminal rendering is a picture of a screen, and a session that printed the wake and
- * did nothing with it would look identical to one that acted on it.
+ * Deleted, not applied, so this text is not the screen: it is a picture with the moves left out, and
+ * a client that repaints by difference leaves words in it that were never drawn -- 2.1.283's status
+ * line reads `shortuts` here and `shortcuts` on a terminal. That is acceptable because nothing in
+ * this file decides anything on it. It is the diagnostic a failed arm prints; the measurement is the
+ * provider capture, and a session that printed the wake and did nothing with it would look identical
+ * to one that acted on it.
  */
 const ANSI = /\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)|\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b[@-Z\\-_]/g;
-
-/**
- * The pty's size. `pty-session.py` fixes it with `TIOCSWINSZ`, and the screen model below has to
- * be the same size: the client addresses the screen with absolute cursor moves, and a model of
- * another size puts them on other cells. A test reads both.
- */
-export const PTY_ROWS = 40;
-export const PTY_COLS = 120;
 
 export type ProbeShape = "interactive" | "headless";
 
@@ -525,794 +517,26 @@ export const interactiveBlocker = (): string | null => {
 export const strip = (raw: string): string => raw.replace(ANSI, "").replace(/\r/g, "\n");
 
 /**
- * The client's stdout as text, decoded as one stream rather than read by read.
+ * The client's stdout, kept as the bytes that arrived and decoded only when something reads it.
  *
- * A read ends wherever the pipe happened to be drained, not on a character boundary: of eleven
- * first screens captured on 2026-09-28, three split a three-byte glyph (`─`, `←`) across two reads.
- * `chunk.toString()` turns each half into U+FFFD -- two or three cells where the terminal drew
- * one -- and a split on the input row would move the modelled caret off the cell the client parks
- * its cursor on, so readiness would never fire. `StringDecoder` holds an incomplete sequence back
- * until the rest of it arrives.
+ * **For diagnosis, not for deciding.** It fills the session log a failed arm prints and the file
+ * every run copies out beside its capture. Nothing in this file measures anything off it, and
+ * nothing may: the measurement is the provider capture.
+ *
+ * Bytes rather than text per read, because a read ends wherever the pipe was drained and not on a
+ * character boundary -- of eleven client starts captured on 2026-09-28, three split a three-byte
+ * glyph (`─`, `←`) across two reads, and `chunk.toString()` turns each half into U+FFFD. A
+ * concatenation has no read boundary left to split, so the only mangled glyph possible is one the
+ * client had not finished writing.
  */
-export const terminalTranscript = (): { readonly push: (chunk: Buffer) => void; readonly text: () => string } => {
-  const decoder = new StringDecoder("utf8");
-  let text = "";
+const terminalOutput = (): { readonly push: (chunk: Buffer) => void; readonly text: () => string } => {
+  const chunks: Buffer[] = [];
   return {
     push: (chunk) => {
-      text += decoder.write(chunk);
+      chunks.push(chunk);
     },
-    text: () => text,
+    text: () => Buffer.concat(chunks).toString("utf8"),
   };
-};
-
-interface Cell {
-  glyph: string;
-  readonly inverse: boolean;
-}
-
-const blankCell = (): Cell => ({ glyph: " ", inverse: false });
-const blankRow = (): Cell[] => Array.from({ length: PTY_COLS }, blankCell);
-const blankGrid = (): Cell[][] => Array.from({ length: PTY_ROWS }, blankRow);
-
-/**
- * How many cells a code point takes. Approximate on purpose: the common wide ranges (CJK, Hangul,
- * full-width forms, the two main emoji blocks) and the zero-width marks, not a Unicode table.
- * Every glyph the measured builds draw on their input row is narrow, and a width this gets wrong
- * only shifts cells written after it on the same row by relative moves -- on the input row that
- * fails closed, because the park is absolute and would miss the caret.
- */
-const cellWidth = (codePoint: number): 0 | 1 | 2 => {
-  if ((codePoint >= 0x0300 && codePoint <= 0x036f) || (codePoint >= 0x200b && codePoint <= 0x200f)
-    || (codePoint >= 0xfe00 && codePoint <= 0xfe0f) || (codePoint >= 0x20d0 && codePoint <= 0x20ff)) {
-    return 0;
-  }
-  if ((codePoint >= 0x1100 && codePoint <= 0x115f) || (codePoint >= 0x2e80 && codePoint <= 0xa4cf && codePoint !== 0x303f)
-    || (codePoint >= 0xac00 && codePoint <= 0xd7a3) || (codePoint >= 0xf900 && codePoint <= 0xfaff)
-    || (codePoint >= 0xfe30 && codePoint <= 0xfe4f) || (codePoint >= 0xff00 && codePoint <= 0xff60)
-    || (codePoint >= 0xffe0 && codePoint <= 0xffe6) || (codePoint >= 0x1f300 && codePoint <= 0x1f64f)
-    || (codePoint >= 0x1f900 && codePoint <= 0x1f9ff) || (codePoint >= 0x20000 && codePoint <= 0x3fffd)) {
-    return 2;
-  }
-  return 1;
-};
-
-interface RenderedScreen {
-  readonly grid: readonly (readonly Cell[])[];
-  readonly row: number;
-  readonly col: number;
-  readonly fullScreen: boolean;
-  readonly cursorHidden: boolean;
-  /**
-   * Every sequence in the stream this model did not apply, named as it appeared, in the order first
-   * seen, including any a later repaint has since overwritten.
-   */
-  readonly unmodelled: readonly string[];
-  /**
-   * The part of `unmodelled` the final screen is still in doubt after, in the same order. The grid
-   * is claimed to be the terminal's only while this is empty.
-   */
-  readonly untrusted: readonly string[];
-}
-
-/**
- * A sequence as a reader can find it in the session log: ESC spelled out, every other control as
- * `\xNN`, and a long string cut, since an image or a clipboard payload can run to kilobytes.
- */
-const nameSequence = (raw: string): string => {
-  const shown = raw.replace(/[\u0000-\u001f\u007f-\u009f]/g, (control) =>
-    control === "\u001b" ? "ESC" : `\\x${control.charCodeAt(0).toString(16).padStart(2, "0")}`);
-  return shown.length > 40 ? `${shown.slice(0, 39)}…` : shown;
-};
-
-/**
- * DEC private modes whose setting changes neither what a cell holds nor where the cursor is: what
- * the keys and the mouse send (1, 9, 66, 1000-1007, 1015, 1016), focus reports (1004), bracketed
- * paste (2004), cursor blink (12), synchronized output (2026, which defers painting and leaves the
- * grid as it would be) and palette notifications (2031). 25, 47, 1047, 1048, 1049 and 7 are
- * applied rather than listed. A mode that is not here and not applied is unmodelled.
- */
-const INERT_PRIVATE_MODES: ReadonlySet<number> = new Set([
-  1, 9, 12, 66, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1015, 1016, 2004, 2026, 2031,
-]);
-
-/**
- * CSI sequences that ask or tell the terminal something without drawing, keyed by marker,
- * intermediates and final: device attributes (`c`, `>c`, `=c`), status reports (`n`, `?n`), the
- * version query (`>q`), key-modifier and keyboard-protocol negotiation (`>m`, `>n`, `>u`, `<u`,
- * `=u`, `?u`), pointer and title modes (`>p`, `>t`, `>T`), cursor shape (` q`) and mode queries
- * (`$p`, `?$p`).
- */
-const INERT_CSI: ReadonlySet<string> = new Set([
-  "c", ">c", "=c", "n", "?n", ">q", ">m", ">n", ">u", "<u", "=u", "?u", ">p", ">t", ">T", " q", "$p", "?$p",
-]);
-
-/**
- * Window operations (`CSI Ps t`) that only report or push and pop the title. The rest move, resize
- * or refresh the window, and resizing is a different grid.
- */
-const INERT_WINDOW_OPERATIONS: ReadonlySet<number> = new Set([11, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23]);
-
-/**
- * Operating-system commands that change no cell: titles (0-2), the palette and dynamic colours
- * (4, 10-19, 104, 105, 110-119), the working directory (7), hyperlinks (8), notifications (9, 777),
- * the pointer shape (22), the clipboard (52) and shell-integration marks (133, 633). Anything else,
- * inline images among them, is unmodelled.
- */
-const INERT_OSC: ReadonlySet<number> = new Set([
-  0, 1, 2, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 22, 52, 104, 105, 110, 111, 112, 113, 114, 115,
-  116, 117, 118, 119, 133, 633, 777,
-]);
-
-/**
- * iTerm2's `OSC 1337` commands that change no cell, move no cursor and change how no later byte
- * lands, judged one command at a time because the number says nothing: the same `1337` carries a
- * navigation mark and an inline image. Each is decided from iTerm2's own definition of it
- * (iterm2.com/documentation-escape-codes.html, read 2026-09-28):
- *
- *   - `SetMark` records a location to jump back to later, the same as the cmd-shift-M bookmark.
- *   - `StealFocus` brings the window to the front.
- *   - `CurrentDir`, `RemoteHost` and `ShellIntegrationVersion` report state to the terminal, as
- *     OSC 7 does.
- *   - `SetUserVar` sets a key in the session's variable dictionary.
- *   - `CursorShape` sets the cursor's look, as `CSI Ps SP q` does.
- *   - `SetColors` changes the palette, as OSC 4, 10 and 11 do.
- *   - `Copy` puts the base64 payload carried inside the sequence itself on the pasteboard, as
- *     OSC 52 does.
- *   - `ReportCellSize` and `ReportVariable` are queries, answered on the input side.
- *   - `SetKeyLabel`, `PushKeyLabels` and `PopKeyLabels` label the touch bar.
- *   - `ClearScrollback` erases the history above the screen and not the screen, as ED 3 does.
- *
- * Known not to belong here, and unmodelled for the rest of the stream like any command not listed:
- * `UnicodeVersion` changes the width table every later glyph is measured with; `CopyToClipboard`
- * places all text received after it in the pasteboard until `EndCopy`, so where that text lands is
- * not something the model knows; `SetProfile` and `SetProfileProperty` replace session settings,
- * the font among them, and the model cannot say which of those move cells; `UpdateBlock` collapses
- * a block into one line and expands it back, which moves every line below it. A command nobody has
- * classified is not assumed to be inert: iTerm2 keeps adding them, and `UpdateBlock`, one of the
- * newest (3.6.9), moves lines.
- */
-const INERT_ITERM2_COMMANDS: ReadonlySet<string> = new Set([
-  "SetMark", "StealFocus", "CurrentDir", "RemoteHost", "ShellIntegrationVersion", "SetUserVar", "CursorShape",
-  "SetColors", "Copy", "ReportCellSize", "ReportVariable", "SetKeyLabel", "PushKeyLabels", "PopKeyLabels",
-  "ClearScrollback",
-]);
-
-/**
- * iTerm2's `OSC 1337` commands that are unmodelled but confined to the screen: an inline image,
- * sent whole (`File`) or in parts (`MultipartFile`, `FilePart`, `FileEnd`), per
- * iterm2.com/documentation-images.html. It is drawn into the cells from the cursor on, at a width
- * and height given in cells, pixels, a percentage or `auto`, and leaves the cursor past it -- a
- * number of cells that depends on the image's pixels and the terminal's font, neither of which the
- * model has, so it cannot be applied. What it can change
- * is which cells hold what and where the cursor is -- not a mode, a margin, a width, a saved cursor
- * or the other buffer -- and a repaint overwrites both, which is what `renderScreen` lets end its
- * doubt. `File` without `inline=1` is a download that draws nothing; it is kept here rather than
- * parsed, which only ever refuses more.
- */
-const SCREEN_CONFINED_ITERM2_COMMANDS: ReadonlySet<string> = new Set(["File", "MultipartFile", "FilePart", "FileEnd"]);
-
-/**
- * How long a sequence the model did not apply keeps the screen in doubt: for the rest of the
- * stream, or -- for one whose definition confines it to cells and the cursor -- until a repaint has
- * overwritten both. `renderScreen` says why those are the only two.
- */
-type Doubt = "stream" | "screen";
-
-type ScreenBuffer = "main" | "alternate";
-
-/** What DECSC keeps and DECRC puts back, as far as this model reads it. */
-interface SavedCursor {
-  readonly row: number;
-  readonly col: number;
-  readonly inverse: boolean;
-  /** The screen-confined sequences the cursor's position was in doubt after when it was saved. */
-  readonly doubt: readonly string[];
-}
-
-/** A slot nothing was saved to. DECRC from it goes to the home cell with no attributes. */
-const NEVER_SAVED: SavedCursor = { row: 0, col: 0, inverse: false, doubt: [] };
-
-/** `into` with every name of `names` it did not already hold, in order. */
-const withNames = (into: readonly string[], names: readonly string[]): readonly string[] => {
-  const added = names.filter((name, index) => !into.includes(name) && names.indexOf(name) === index);
-  return added.length === 0 ? into : [...into, ...added];
-};
-
-/** Controls that are applied (BS, HT, LF, VT, FF, CR) or that a terminal ignores (NUL, BEL, DEL). */
-const KNOWN_CONTROLS: ReadonlySet<number> = new Set([0x00, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x7f]);
-
-/**
- * Applies a terminal stream to a `PTY_ROWS` x `PTY_COLS` grid, and names every part of it that it
- * did not apply.
- *
- * Closed, not best-effort. Each sequence falls in exactly one of three sets:
- *
- *   - **Applied.** Printing and autowrap; absolute and relative cursor moves, with CUU, CUD, CNL
- *     and CPL stopping at a scroll margin as a terminal's do; saving and restoring the cursor with
- *     the inverse attribute it carries, one saved cursor per buffer (DECSC/DECRC, `CSI s`/`CSI u`,
- *     mode 1048); the alternate screen (47, 1047, 1049); erasing (ED, EL, ECH); the scroll region
- *     (DECSTBM) and everything that moves lines within it -- a line feed in any of its forms (LF,
- *     VT, FF, IND, NEL) and a reverse index (RI) at a margin, insert and delete line (IL, DL),
- *     scroll up and down (SU, SD); insert and delete character (ICH, DCH); and inverse video
- *     (SGR 7, 27, 0), the one attribute readiness reads.
- *   - **Inert.** Sequences that by definition change no cell and do not move the cursor: queries
- *     and reports, input and keyboard modes, synchronized output, cursor visibility and shape,
- *     titles, colours, hyperlinks, the clipboard, and character-set designations, which change a
- *     glyph and never its width. Each is named in one of the lists above, with its reason.
- *   - **Unmodelled.** Everything else, including every sequence this file has never heard of. It is
- *     recorded by name in `unmodelled`, and while it is in `untrusted` the grid is not claimed to
- *     be the terminal's and readiness refuses.
- *
- * The third set is what makes the first two worth trusting. Until 2026-09-28 an unknown final fell
- * through a `default: break`: an insert-line was dropped, the model kept a caret on a row the
- * terminal had moved, and readiness fired on a screen that was wrong without saying so. An
- * allow-list and not a deny-list, because a deny-list fires only on the sequences its author
- * thought of, which is the same defect with a smaller surface.
- *
- * How long an unmodelled sequence stays in `untrusted`. A sequence can leave three kinds of thing
- * wrong: which cells hold what, where the cursor is, and state that decides how later bytes land --
- * a mode (insert, origin, autowrap), a margin, a tab stop, a width table, a saved cursor, the other
- * buffer. A repaint overwrites the first two and none of the third: after `CSI 4h` every glyph of
- * the most careful redraw still pushes its line right. So there are two lifetimes, and a sequence
- * gets the short one only by being named for it:
- *
- *   - **For the rest of the stream**, the default. A sequence the model does not know is one it
- *     cannot say is confined to cells and the cursor, and forgiving it at a repaint is the defect
- *     this set exists to stop -- a screen the terminal moved, read as the one the model drew.
- *   - **Until a repaint**, for a sequence whose definition confines it to cells and the cursor
- *     (`SCREEN_CONFINED_ITERM2_COMMANDS`, inline images). It puts in doubt the cursor's position and
- *     the cells of the buffer it arrived on, and nothing else. Those cells are known again when that
- *     buffer is blanked whole: ED 2, or 1049 clearing the alternate on the way in. The cursor is
- *     known again when it is placed by both coordinates (CUP, HVP) or restored from a slot saved
- *     while it was known. Until then, anything written at the cursor -- a glyph, an erase, an insert
- *     or delete, a line feed that may scroll -- puts the cells back in doubt, since where it landed
- *     is not known. The screen is trusted again when neither its cursor nor the shown buffer's
- *     cells are in doubt.
- *
- * The risk this accepts sits entirely in the short list. A sequence placed there that can in fact
- * change a mode, a margin or a width is forgiven by the next repaint, and from then on the model is
- * wrong without saying so. That is why the list is one family long, why the entry carries the
- * definition it was decided from, and why an unknown command in the same `OSC 1337` namespace takes
- * the long lifetime. The cost on the other side is also accepted: a harmless sequence nobody has
- * classified still refuses every later frame, and the remedy is a classification that
- * `describeReadiness` names, not a timeout.
- *
- * An escape sequence still incomplete at the end of the stream is left unapplied until the rest of
- * it arrives. At that instant a terminal has not applied it either.
- */
-const renderScreen = (stream: string): RenderedScreen => {
-  const main = blankGrid();
-  const alternate = blankGrid();
-  let grid = main;
-  let fullScreen = false;
-  let cursorHidden = false;
-  let row = 0;
-  let col = 0;
-  // A glyph written into the last column leaves the cursor there, and only the next glyph wraps.
-  // Without this, a full-width rule followed by `CR` + one-row-down lands a row too low.
-  let wrapPending = false;
-  let inverse = false;
-  // The scroll region, 0-based and inclusive: the whole screen until DECSTBM says otherwise.
-  let top = 0;
-  let bottom = PTY_ROWS - 1;
-  // One saved cursor per buffer, as xterm keeps them (cursor.c: `screen->sc[screen->whichBuf]` in
-  // both CursorSave and CursorRestore): a DECSC on the alternate screen does not replace the cursor
-  // that leaving it with 1049 puts back.
-  const saved: Record<ScreenBuffer, SavedCursor> = { main: NEVER_SAVED, alternate: NEVER_SAVED };
-  const unmodelled: string[] = [];
-  // Every unmodelled sequence whose doubt lasts for the rest of the stream.
-  const standing = new Set<string>();
-  // The screen-confined sequences the cursor's position is in doubt after, and each buffer's cells.
-  let cursorDoubt: readonly string[] = [];
-  const cellDoubt: Record<ScreenBuffer, readonly string[]> = { main: [], alternate: [] };
-  const shown = (): ScreenBuffer => (fullScreen ? "alternate" : "main");
-
-  const refuse = (raw: string, doubt: Doubt = "stream"): void => {
-    const name = nameSequence(raw);
-    if (!unmodelled.includes(name)) unmodelled.push(name);
-    if (doubt === "stream") {
-      standing.add(name);
-      return;
-    }
-    cursorDoubt = withNames(cursorDoubt, [name]);
-    cellDoubt[shown()] = withNames(cellDoubt[shown()], [name]);
-  };
-  // Something is about to be written at the cursor, or moved from where it is. If the cursor's
-  // position is in doubt, so is which cells that touched.
-  const written = (): void => {
-    cellDoubt[shown()] = withNames(cellDoubt[shown()], cursorDoubt);
-  };
-
-  const moveTo = (toRow: number, toCol: number): void => {
-    row = Math.min(PTY_ROWS - 1, Math.max(0, toRow));
-    col = Math.min(PTY_COLS - 1, Math.max(0, toCol));
-    wrapPending = false;
-  };
-  // A vertical move that starts inside the region stops at its margin; one that starts outside
-  // stops at the edge of the screen.
-  const up = (count: number): void => moveTo(Math.max(row >= top ? top : 0, row - count), col);
-  const down = (count: number): void => moveTo(Math.min(row <= bottom ? bottom : PTY_ROWS - 1, row + count), col);
-
-  const blankRows = (count: number): Cell[][] => Array.from({ length: count }, blankRow);
-  // The region's lines move up: the top ones leave it and blank ones enter at the bottom margin.
-  const scrollUp = (count: number): void => {
-    const span = Math.min(count, bottom - top + 1);
-    grid.splice(top, span);
-    grid.splice(bottom - span + 1, 0, ...blankRows(span));
-  };
-  const scrollDown = (count: number): void => {
-    const span = Math.min(count, bottom - top + 1);
-    grid.splice(bottom - span + 1, span);
-    grid.splice(top, 0, ...blankRows(span));
-  };
-  // IL and DL act only on a cursor inside the region, move the lines from the cursor down to the
-  // bottom margin, and leave the cursor in the first column.
-  const insertLines = (count: number): void => {
-    written();
-    if (row < top || row > bottom) return;
-    const span = Math.min(count, bottom - row + 1);
-    grid.splice(bottom - span + 1, span);
-    grid.splice(row, 0, ...blankRows(span));
-    moveTo(row, 0);
-  };
-  const deleteLines = (count: number): void => {
-    written();
-    if (row < top || row > bottom) return;
-    const span = Math.min(count, bottom - row + 1);
-    grid.splice(row, span);
-    grid.splice(bottom - span + 1, 0, ...blankRows(span));
-    moveTo(row, 0);
-  };
-  // ICH and DCH move the rest of the cursor's line right or left; the cursor stays where it is.
-  const insertCells = (count: number): void => {
-    written();
-    const line = grid[row];
-    if (line === undefined) return;
-    const span = Math.min(count, PTY_COLS - col);
-    line.splice(PTY_COLS - span, span);
-    line.splice(col, 0, ...Array.from({ length: span }, blankCell));
-    wrapPending = false;
-  };
-  const deleteCells = (count: number): void => {
-    written();
-    const line = grid[row];
-    if (line === undefined) return;
-    const span = Math.min(count, PTY_COLS - col);
-    line.splice(col, span);
-    line.push(...Array.from({ length: span }, blankCell));
-    wrapPending = false;
-  };
-  const lineFeed = (): void => {
-    written();
-    if (row === bottom) scrollUp(1);
-    else if (row < PTY_ROWS - 1) row += 1;
-  };
-  const reverseIndex = (): void => {
-    written();
-    if (row === top) scrollDown(1);
-    else if (row > 0) row -= 1;
-  };
-  const erase = (onRow: number, from: number, to: number): void => {
-    written();
-    const line = grid[onRow];
-    if (line === undefined) return;
-    for (let at = Math.max(0, from); at < Math.min(PTY_COLS, to); at += 1) line[at] = blankCell();
-  };
-  // The attribute goes with the position: a restore that kept the current inverse would paint
-  // the next blank as a caret the client never drew.
-  const saveCursor = (): void => {
-    saved[shown()] = { row, col, inverse, doubt: cursorDoubt };
-  };
-  const restoreCursor = (): void => {
-    const slot = saved[shown()];
-    moveTo(slot.row, slot.col);
-    inverse = slot.inverse;
-    cursorDoubt = slot.doubt;
-  };
-  // xterm's ClearScreen on the alternate buffer: every cell blank, which ends any doubt about them,
-  // and no wrap pending. The cursor stays where it is.
-  const clearAlternate = (): void => {
-    alternate.splice(0, alternate.length, ...blankGrid());
-    cellDoubt.alternate = [];
-    wrapPending = false;
-  };
-  // xterm, charproc.c (srm_OPT_ALTBUF_CURSOR, srm_OPT_ALTBUF, srm_ALTBUF). 1049 is save, switch,
-  // clear on the way in and switch, restore on the way out, each step whether or not the buffer
-  // changes, and each save or restore on the slot of the buffer shown at that moment: the save made
-  // on the way in is on the main slot and so is the restore on the way out. 1047 clears the
-  // alternate on the way out if it is shown, and 47 only switches. None of them moves the cursor.
-  const useScreen = (wanted: boolean, mode: number): void => {
-    if (mode === 1049 && wanted) saveCursor();
-    if (mode === 1047 && !wanted && fullScreen) clearAlternate();
-    if (wanted !== fullScreen) {
-      grid = wanted ? alternate : main;
-      fullScreen = wanted;
-    }
-    if (mode === 1049 && wanted) clearAlternate();
-    if (mode === 1049 && !wanted) restoreCursor();
-  };
-  const put = (glyph: string, width: 0 | 1 | 2): void => {
-    written();
-    if (width === 0) {
-      const previous = grid[row]?.[wrapPending ? col : Math.max(0, col - 1)];
-      if (previous !== undefined) previous.glyph += glyph;
-      return;
-    }
-    if (wrapPending || (width === 2 && col === PTY_COLS - 1)) {
-      col = 0;
-      lineFeed();
-      wrapPending = false;
-    }
-    const line = grid[row];
-    if (line === undefined) return;
-    line[col] = { glyph, inverse };
-    if (width === 2 && col + 1 < PTY_COLS) line[col + 1] = { glyph: "", inverse };
-    if (col + width >= PTY_COLS) {
-      col = PTY_COLS - 1;
-      wrapPending = true;
-    } else {
-      col += width;
-    }
-  };
-
-  const sgr = (tokens: readonly string[]): void => {
-    if (tokens.length === 0) inverse = false;
-    for (let index = 0; index < tokens.length; index += 1) {
-      const token = tokens[index] ?? "";
-      // `38:5:174` carries its own arguments; only the `;` form spends the tokens after it.
-      if (token.includes(":")) continue;
-      const code = token === "" ? 0 : Number(token);
-      if (code === 0 || code === 27) inverse = false;
-      else if (code === 7) inverse = true;
-      else if (code === 38 || code === 48 || code === 58) {
-        const kind = tokens[index + 1];
-        index += kind === "5" ? 2 : kind === "2" ? 4 : 0;
-      }
-    }
-  };
-
-  // One `OSC 1337` command, judged by its name -- `SetMark`, `File`, `CurrentDir` -- and not by the
-  // number every one of them shares.
-  const iterm2 = (raw: string, content: string): void => {
-    const command = /^1337;([A-Za-z]+)(?:[=;:]|$)/.exec(content)?.[1] ?? "";
-    if (INERT_ITERM2_COMMANDS.has(command)) return;
-    refuse(raw, SCREEN_CONFINED_ITERM2_COMMANDS.has(command) ? "screen" : "stream");
-  };
-
-  const csi = (raw: string, body: string, final: string): void => {
-    // Marker, parameters, intermediates, in that order and nothing else. A body of any other shape
-    // is one a terminal would read in some way this model cannot know.
-    const shape = /^([<=>?]?)([0-9:;]*)([ -/]*)$/.exec(body);
-    if (shape === null) {
-      refuse(raw);
-      return;
-    }
-    const marker = shape[1] ?? "";
-    const parameters = shape[2] ?? "";
-    const intermediates = shape[3] ?? "";
-    const tokens = parameters.length === 0 ? [] : parameters.split(";");
-    if (marker === "" && intermediates === "" && final === "m") {
-      sgr(tokens);
-      return;
-    }
-    // Colon sub-parameters mean something to SGR alone.
-    if (tokens.some((token) => !/^\d*$/.test(token))) {
-      refuse(raw);
-      return;
-    }
-    const count = (index: number): number => {
-      const value = Number.parseInt(tokens[index] ?? "", 10);
-      return Number.isNaN(value) || value < 1 ? 1 : value;
-    };
-    const mode = Number.parseInt(tokens[0] ?? "", 10) || 0;
-
-    if (marker === "?" && intermediates === "" && (final === "h" || final === "l")) {
-      const set = final === "h";
-      for (const token of tokens) {
-        const privateMode = Number(token);
-        if (privateMode === 25) cursorHidden = !set;
-        else if (privateMode === 47 || privateMode === 1047 || privateMode === 1049) useScreen(set, privateMode);
-        else if (privateMode === 1048) {
-          if (set) saveCursor();
-          else restoreCursor();
-        } else if (privateMode === 7 && set) {
-          // Autowrap on is the power-on state and what `put` does. Only turning it off is a change
-          // this model would miss, and that is unmodelled below.
-        } else if (!INERT_PRIVATE_MODES.has(privateMode)) {
-          refuse(`\u001b[?${token}${final}`);
-        }
-      }
-      return;
-    }
-    if (INERT_CSI.has(`${marker}${intermediates}${final}`)) return;
-    if (marker !== "" || intermediates !== "") {
-      refuse(raw);
-      return;
-    }
-
-    switch (final) {
-      case "A": up(count(0)); break;
-      case "B": case "e": down(count(0)); break;
-      case "C": case "a": moveTo(row, col + count(0)); break;
-      case "D": moveTo(row, col - count(0)); break;
-      case "E": down(count(0)); col = 0; break;
-      case "F": up(count(0)); col = 0; break;
-      case "G": case "`": moveTo(row, count(0) - 1); break;
-      case "d": moveTo(count(0) - 1, col); break;
-      // The one move that names both coordinates, and so the one that ends doubt about the cursor.
-      case "H": case "f": moveTo(count(0) - 1, count(1) - 1); cursorDoubt = []; break;
-      case "J":
-        if (mode === 0) {
-          erase(row, col, PTY_COLS);
-          for (let below = row + 1; below < PTY_ROWS; below += 1) erase(below, 0, PTY_COLS);
-        } else if (mode === 1) {
-          for (let above = 0; above < row; above += 1) erase(above, 0, PTY_COLS);
-          erase(row, 0, col + 1);
-        } else if (mode === 2) {
-          for (let every = 0; every < PTY_ROWS; every += 1) erase(every, 0, PTY_COLS);
-          // Every cell of the shown buffer is blank whatever was there, so their doubt ends here.
-          cellDoubt[shown()] = [];
-        } else if (mode !== 3) {
-          // 3 erases the scrollback, which is not on the screen.
-          refuse(raw);
-        }
-        break;
-      case "K":
-        if (mode === 0) erase(row, col, PTY_COLS);
-        else if (mode === 1) erase(row, 0, col + 1);
-        else if (mode === 2) erase(row, 0, PTY_COLS);
-        else refuse(raw);
-        break;
-      case "X": erase(row, col, col + count(0)); break;
-      case "@": insertCells(count(0)); break;
-      case "P": deleteCells(count(0)); break;
-      case "L": insertLines(count(0)); break;
-      case "M": deleteLines(count(0)); break;
-      case "S": scrollUp(count(0)); break;
-      // With five parameters this final is mouse highlight tracking, not a scroll.
-      case "T": if (tokens.length <= 1) scrollDown(count(0)); else refuse(raw); break;
-      case "r": {
-        if (tokens.length > 2) {
-          refuse(raw);
-          break;
-        }
-        const first = Number.parseInt(tokens[0] ?? "", 10);
-        const last = Number.parseInt(tokens[1] ?? "", 10);
-        const newTop = (Number.isNaN(first) || first < 1 ? 1 : first) - 1;
-        const newBottom = Math.min(PTY_ROWS, Number.isNaN(last) || last < 1 ? PTY_ROWS : last) - 1;
-        // A region under two lines is ignored by the terminal, cursor and all, and so here.
-        if (newTop < newBottom) {
-          top = newTop;
-          bottom = newBottom;
-          moveTo(0, 0);
-        }
-        break;
-      }
-      // With parameters these are left and right margins, which this model does not keep.
-      case "s": if (tokens.length === 0) saveCursor(); else refuse(raw); break;
-      case "u": if (tokens.length === 0) restoreCursor(); else refuse(raw); break;
-      case "t": if (!INERT_WINDOW_OPERATIONS.has(mode)) refuse(raw); break;
-      default: refuse(raw); break;
-    }
-  };
-
-  for (let at = 0; at < stream.length;) {
-    const char = stream.charAt(at);
-    if (char === "\u001b") {
-      const next = stream.charAt(at + 1);
-      if (next === "") break;
-      if (next === "[") {
-        let end = at + 2;
-        while (end < stream.length && !/[@-~]/.test(stream.charAt(end))) end += 1;
-        if (end >= stream.length) break;
-        csi(stream.slice(at, end + 1), stream.slice(at + 2, end), stream.charAt(end));
-        at = end + 1;
-        continue;
-      }
-      if ("]P_^X".includes(next)) {
-        let end = at + 2;
-        while (end < stream.length && stream.charAt(end) !== "\u0007"
-          && !(stream.charAt(end) === "\u001b" && stream.charAt(end + 1) === "\\")) end += 1;
-        if (end >= stream.length) break;
-        const after = stream.charAt(end) === "\u0007" ? end + 1 : end + 2;
-        const content = stream.slice(at + 2, end);
-        const raw = stream.slice(at, after);
-        if (next === "]") {
-          const command = /^(\d+)(?:;|$)/.exec(content)?.[1];
-          if (command === "1337") iterm2(raw, content);
-          else if (command === undefined || !INERT_OSC.has(Number(command))) refuse(raw);
-        } else if (next === "P") {
-          // Only the two queries: every other device-control string -- sixel above all -- draws.
-          if (!content.startsWith("$q") && !content.startsWith("+q")) refuse(raw);
-        } else if (next === "_") {
-          // Application program commands carry the kitty graphics protocol, which places images.
-          refuse(raw);
-        }
-        // Privacy messages and start-of-string are read and discarded by the terminal.
-        at = after;
-        continue;
-      }
-      // ESC, any intermediates (0x20-0x2F), one final (0x30-0x7E).
-      let end = at + 1;
-      while (end < stream.length && /[ -/]/.test(stream.charAt(end))) end += 1;
-      if (end >= stream.length) break;
-      const raw = stream.slice(at, end + 1);
-      const intermediates = stream.slice(at + 1, end);
-      const final = stream.charAt(end);
-      if (!/[0-~]/.test(final)) {
-        // Not an escape sequence at all. The byte after it is left for the loop to read again.
-        refuse(stream.slice(at, end));
-        at = end;
-        continue;
-      }
-      if (intermediates === "") {
-        if (final === "7") saveCursor();
-        else if (final === "8") restoreCursor();
-        else if (final === "D") {
-          lineFeed();
-          wrapPending = false;
-        } else if (final === "E") {
-          lineFeed();
-          col = 0;
-          wrapPending = false;
-        } else if (final === "M") {
-          reverseIndex();
-          wrapPending = false;
-        } else if (final !== "=" && final !== ">" && final !== "\\") {
-          // `=` and `>` are keypad modes, and `\` is a string terminator with no string open.
-          refuse(raw);
-        }
-      } else if (intermediates.length !== 1 || !"()*+-./".includes(intermediates)) {
-        // One intermediate from that set designates a character set, which changes a glyph and
-        // never its width. Everything else here -- DECALN's `ESC # 8`, line sizes, `ESC % G` -- is
-        // not modelled.
-        refuse(raw);
-      }
-      at = end + 1;
-      continue;
-    }
-    if (char === "\r") {
-      col = 0;
-      wrapPending = false;
-    } else if (char === "\n" || char === "\u000b" || char === "\u000c") {
-      lineFeed();
-      wrapPending = false;
-    } else if (char === "\b") {
-      moveTo(row, col - 1);
-    } else if (char === "\t") {
-      moveTo(row, (Math.floor(col / 8) + 1) * 8);
-    }
-    const codePoint = stream.codePointAt(at) ?? 0;
-    const glyph = String.fromCodePoint(codePoint);
-    at += glyph.length;
-    if (codePoint < 0x20 || (codePoint >= 0x7f && codePoint < 0xa0)) {
-      // A C1 control is one a UTF-8 terminal may act on: U+009B is CSI.
-      if (!KNOWN_CONTROLS.has(codePoint)) refuse(glyph);
-      continue;
-    }
-    put(glyph, cellWidth(codePoint));
-  }
-
-  // In doubt at the end: whatever lasts the stream, and whatever the cursor or the shown buffer's
-  // cells are still in doubt after.
-  const untrusted = unmodelled.filter((name) =>
-    standing.has(name) || cursorDoubt.includes(name) || cellDoubt[shown()].includes(name));
-  return { grid, row, col, fullScreen, cursorHidden, unmodelled, untrusted };
-};
-
-export interface InteractiveReadiness {
-  /** The decision: `cursorOnCaret`, on a screen no sequence the model did not apply leaves in doubt. */
-  readonly ready: boolean;
-  readonly cursorOnCaret: boolean;
-  /** Every sequence the screen model did not apply, named as it appeared, including any since overwritten. */
-  readonly unmodelled: readonly string[];
-  /**
-   * The unmodelled sequences the final screen is still in doubt after. Non-empty means the rendered
-   * screen may not be the terminal's, and readiness refuses whatever the cursor is over.
-   */
-  readonly untrusted: readonly string[];
-  /** 1-based, as the terminal's own cursor moves number them, so a report reads against the log. */
-  readonly cursor: { readonly row: number; readonly column: number };
-  readonly underCursor: string;
-  /** Every inverse-video blank on screen. None, or one away from the cursor, is a diagnosis. */
-  readonly carets: readonly { readonly row: number; readonly column: number }[];
-  /** Context for a report, and deliberately not decision inputs. */
-  readonly fullScreen: boolean;
-  readonly terminalCursorHidden: boolean;
-  /** The rendered rows, trailing blanks trimmed. */
-  readonly screen: readonly string[];
-}
-
-/**
- * Whether the interactive client is at an empty prompt that will take typing, read off the
- * *rendered* screen by one structural fact: the cursor has come to rest on a caret the client drew.
- *
- * Why that fact. The client does not use the terminal's cursor for its input. It hides it
- * (`CSI ?25l`), paints the cell where the next keystroke will land in inverse video, and ends every
- * frame by moving the real cursor back onto that cell. Measured on 2.1.268, 2.1.281, 2.1.282 and
- * 2.1.283 (`first-screens/`): the input row is `❯ ` then an inverse blank, and every frame closes
- * with `CSI 40;1H CSI 38;3H`, which is that blank. The caret is drawn by a focused, editable input
- * -- on these screens by nothing else -- and the park is the renderer's last write of a complete
- * frame, so "the cursor rests on an inverse blank" says that a frame finished and that in it an
- * empty input owns the keyboard. That is the precondition of the next thing the probe does, which
- * is to type into it.
- *
- * Why not the prose. This was `/for shortcuts/` over `strip()` output, and 2.1.283 never satisfied
- * it -- not because the hint changed, but because the renderer repaints by difference. Going from
- * "(shift+tab to cycle)" to "? for shortcuts" it skips the `c` already on screen with `CSI 34G`,
- * and deleting escapes instead of applying them reads `shortuts`. The screen said `shortcuts` the
- * whole time. A phrase match over `strip()` is at the mercy of which cells the previous frame
- * happened to share, and the wording is one more way to lose it.
- *
- * Why not the prompt glyph. `❯` is also the pointer of the client's menus: the workspace-trust
- * dialog draws `❯ No, exit` and parks the cursor on it
- * (`first-screens/claude-code@2.1.283.workspace-trust.json`). Typing there answers a dialog, which
- * pre-provisioning the config exists to avoid. The pointer is drawn in colour, not inverse, so it
- * is not a caret.
- *
- * Why the whole screen has to have been applied. The cell under the cursor is only the terminal's
- * cell if every sequence before it was applied as a terminal would apply it. An insert-line the
- * model dropped leaves an inverse blank on a row the terminal has moved, and a park on that row
- * then reads as ready while the terminal's cursor rests on something else. So a stream carrying
- * any sequence `renderScreen` does not apply is not ready, whatever the cursor is over, and
- * `describeReadiness` names the sequence -- for the rest of the stream, unless the sequence is one
- * whose every possible effect a repaint overwrites and the client has since repainted
- * (`renderScreen` gives the rule and the risk it accepts).
- *
- * What would make this stale: the client showing the terminal's cursor instead of drawing one,
- * drawing its caret in something other than inverse video, ending a frame with the cursor anywhere
- * but the caret, or drawing its screen with a sequence the model does not apply. Each fails closed
- * -- readiness never fires -- and `describeReadiness` says which of the facts below were seen. There
- * is no prose fallback, on purpose: a fallback fires on exactly the build where this stopped
- * describing the client, and hides that it did.
- */
-export const interactiveReadiness = (stream: string): InteractiveReadiness => {
-  const rendered = renderScreen(stream);
-  const under = rendered.grid[rendered.row]?.[rendered.col];
-  const cursorOnCaret = under !== undefined && under.inverse && under.glyph === " ";
-  const ready = cursorOnCaret && rendered.untrusted.length === 0;
-  const carets: { row: number; column: number }[] = [];
-  rendered.grid.forEach((line, rowIndex) => {
-    line.forEach((cell, colIndex) => {
-      if (cell.inverse && cell.glyph === " ") carets.push({ row: rowIndex + 1, column: colIndex + 1 });
-    });
-  });
-  return {
-    ready,
-    cursorOnCaret,
-    unmodelled: rendered.unmodelled,
-    untrusted: rendered.untrusted,
-    cursor: { row: rendered.row + 1, column: rendered.col + 1 },
-    underCursor: under?.glyph ?? "",
-    carets,
-    fullScreen: rendered.fullScreen,
-    terminalCursorHidden: rendered.cursorHidden,
-    screen: rendered.grid.map((line) => line.map((cell) => cell.glyph).join("").trimEnd()),
-  };
-};
-
-/** What a wait that never saw a prompt reports: the signal looked for, and each part of it as seen. */
-export const describeReadiness = (reading: InteractiveReadiness): string => {
-  const at = (cell: { readonly row: number; readonly column: number }): string => `row ${cell.row}, column ${cell.column}`;
-  const drawn = reading.screen
-    .map((line, index) => ({ line, row: index + 1 }))
-    .filter(({ line }) => line.trim().length > 0)
-    .map(({ line, row }) => `${String(row).padStart(2)}| ${line}`);
-  return [
-    "looked for: the cursor at rest on a caret the client drew (an inverse-video blank cell), on a screen no sequence the model did not apply leaves in doubt",
-    `  cursor on a caret: ${reading.cursorOnCaret ? "yes" : "no"}`,
-    `  every sequence applied: ${reading.unmodelled.length === 0 ? "yes" : `no -- not modelled: ${reading.unmodelled.join(", ")}`}`,
-    `  screen in doubt: ${reading.untrusted.length === 0
-      ? reading.unmodelled.length === 0 ? "no" : "no -- each sequence not applied was confined to the screen and repainted over since"
-      : `yes -- after: ${reading.untrusted.join(", ")}`}`,
-    `  cursor: ${at(reading.cursor)}, over ${JSON.stringify(reading.underCursor)}`,
-    `  carets drawn: ${reading.carets.length === 0 ? "none" : reading.carets.map(at).join("; ")}`,
-    "seen, as context rather than as inputs to the decision:",
-    `  full-screen buffer entered: ${reading.fullScreen ? "yes" : "no"}`,
-    `  terminal cursor hidden: ${reading.terminalCursorHidden ? "yes" : "no"}`,
-    "--- rendered screen, non-blank rows ---",
-    ...(drawn.length === 0 ? ["(blank)"] : drawn),
-  ].join("\n");
 };
 
 /**
@@ -1394,6 +618,82 @@ const removeTempRoot = (root: string): void => {
     }
   }
 };
+
+/**
+ * The prompt the interactive arm is started with, and the one the headless arm sends.
+ *
+ * The run needs one ordinary turn before the wake frame, so that the frame's effect is a difference
+ * against something. The interactive arm gets that turn as a *positional argument* -- `claude
+ * [options] [prompt]`, the CLI's own usage -- which is why nothing in this harness types, and why
+ * nothing in it has to decide when a client is ready to be typed into. Deciding that meant
+ * rendering the client's terminal output, and a renderer is a terminal emulator held to a terminal
+ * emulator's accuracy: six false-ready or false-refuse defects were reproduced against it in three
+ * review rounds, and being wrong one way types into a client that is not listening while being
+ * wrong the other way makes every future build unqualifiable.
+ *
+ * A word that is none of the CLI's subcommands, so it is parsed as the prompt operand rather than
+ * dispatched as a command.
+ */
+export const BASELINE_PROMPT = "ping";
+
+/**
+ * The argv each arm starts the client with, after the executable.
+ *
+ * Extracted from the probe so that the interactivity claim can be *checked* rather than read off
+ * this comment. It is load-bearing: `isInteractiveClaudeInvocation`
+ * (src/registry/canonical-self-claim.ts) refuses `-p`, `--print`, `--output-format` and
+ * `--input-format`, so the process that is allowed to hold the canonical claim has exactly the
+ * interactive shape, and a qualification of any other shape qualifies a process that could not be
+ * the holder. A test calls that predicate on what this returns, for both shapes.
+ *
+ * The prompt is a positional argument, which that predicate is indifferent to -- it refuses flags,
+ * and an operand is not a flag. The headless shape keeps all four refused flags, so it doubles as
+ * the control showing the predicate can still say no.
+ */
+export const probeArgv = (
+  shape: ProbeShape,
+  paths: { readonly settingsPath: string; readonly socketPath: string },
+): readonly string[] => {
+  const shared = [
+    "--settings",
+    paths.settingsPath,
+    // Per-invocation settings and no other source: not the operator's, not a project's.
+    "--setting-sources",
+    "",
+    "--messaging-socket-path",
+    paths.socketPath,
+    "--model",
+    "claude-sonnet-4-5",
+  ];
+  return shape === "interactive"
+    ? [...shared, BASELINE_PROMPT]
+    : ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", ...shared];
+};
+
+/**
+ * The captured requests that were sent to be inferred on.
+ *
+ * One definition, used for the baseline, for the follow-up and for the wake count alike, so that
+ * "a turn began" means the same thing everywhere in this file. The capture is the loopback fake
+ * provider's append-only JSONL (`../native-session-inbox/fake-anthropic.ts`): every request it
+ * received, whatever its path, one JSON object per line.
+ */
+export const modelRequestsIn = (capture: string): readonly { readonly url: string; readonly body: string }[] =>
+  capture
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as { url: string; body: string })
+    .filter((request) => request.url.includes("/v1/messages"));
+
+/**
+ * Whether the baseline turn has been *observed*: one request the client sent to be inferred on.
+ *
+ * This is the harness's only evidence that the prompt it started the client with was accepted, and
+ * it is deliberately the same kind of evidence the wake itself is judged by -- a request body the
+ * CLI sent, never a screen, a sleep, or the fact that the argument was passed. An empty capture, or
+ * a capture holding only requests to some other endpoint, is not a turn.
+ */
+export const baselineTurnObserved = (capture: string): boolean => modelRequestsIn(capture).length > 0;
 
 export interface ProbeOptions {
   readonly shape: ProbeShape;
@@ -1480,7 +780,7 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
 
   let fake: FakeAnthropic | undefined;
   let child: ChildProcessWithoutNullStreams | undefined;
-  const terminal = terminalTranscript();
+  const terminal = terminalOutput();
   let stderr = "";
   let failure: unknown;
   let run: ProbeRun | undefined;
@@ -1513,23 +813,9 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
     };
 
-    const shared = [
-      "--settings",
-      settingsPath,
-      // Per-invocation settings and no other source: not the operator's, not a project's.
-      "--setting-sources",
-      "",
-      "--messaging-socket-path",
-      socketPath,
-      "--model",
-      "claude-sonnet-4-5",
-    ];
-    // The interactive argv carries none of `-p`, `--print`, `--output-format`, `--input-format`,
-    // which is exactly the predicate `isInteractiveClaudeInvocation` applies.
-    const args =
-      options.shape === "interactive"
-        ? shared
-        : ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", ...shared];
+    // Both shapes' argv, and the interactive one's positional prompt, are `probeArgv`'s -- the
+    // same value a test hands to `isInteractiveClaudeInvocation`.
+    const args = probeArgv(options.shape, { settingsPath, socketPath });
     const command = [image.executable, ...args];
 
     if (options.shape === "interactive") {
@@ -1553,34 +839,28 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
     const bound = await waitFor(() => existsSync(socketPath), 60_000);
     if (!bound) throw new Error(`the session inbox never appeared\n${stderr}`);
 
-    const captured = () =>
-      readFileSync(capturePath, "utf8")
-        .split("\n")
-        .filter((line) => line.trim().length > 0)
-        .map((line) => JSON.parse(line) as { url: string; body: string });
-    const modelRequests = () => captured().filter((request) => request.url.includes("/v1/messages"));
+    const modelRequests = () => modelRequestsIn(readFileSync(capturePath, "utf8"));
 
     // One ordinary turn first, so the run has a baseline that predates the frame. The interactive
-    // arm types it; the headless arm writes a stream-json frame and holds stdin open, which is
-    // what keeps that session alive after the turn completes.
-    if (options.shape === "interactive") {
-      const ready = await waitFor(() => interactiveReadiness(terminal.text()).ready, 60_000);
-      if (!ready) {
-        throw new Error(
-          `the interactive client never reached its prompt\n${describeReadiness(interactiveReadiness(terminal.text()))}\n` +
-            `--- terminal tail, escapes deleted rather than applied ---\n${strip(terminal.text()).slice(-2000)}`,
-        );
-      }
-      await sleep(1_500);
-      child.stdin.write("ping");
-      await sleep(600);
-      child.stdin.write(String.fromCharCode(13));
-    } else {
-      child.stdin.write(`${JSON.stringify({ type: "user", message: { role: "user", content: "ping" } })}\n`);
+    // arm was *started* with it as its positional prompt (`probeArgv`), so there is nothing to type
+    // here and no screen to model; the headless arm writes a stream-json frame and holds stdin
+    // open, which is what keeps that session alive after the turn completes.
+    if (options.shape === "headless") {
+      child.stdin.write(`${JSON.stringify({ type: "user", message: { role: "user", content: BASELINE_PROMPT } })}\n`);
     }
 
-    const baselineSeen = await waitFor(() => modelRequests().length > 0, 120_000);
-    if (!baselineSeen) throw new Error(`no baseline model request reached the fake endpoint\n${stderr}`);
+    // Observed, never assumed. Passing the prompt is not evidence the client accepted it; the
+    // evidence is the request it sent to be inferred on, which is the same evidence the wake is
+    // judged by. No such request inside the bound fails the arm, and with it the run, so no reading
+    // is written. There is deliberately no second way to start this turn: a fallback to typing would
+    // fire on exactly the build where the argument stopped being accepted, and hide that it had.
+    const baselineSeen = await waitFor(() => baselineTurnObserved(readFileSync(capturePath, "utf8")), 120_000);
+    if (!baselineSeen) {
+      throw new Error(
+        `the client sent no baseline model request for the prompt it was started with\n${stderr}\n` +
+          `--- terminal tail, escapes deleted rather than applied; diagnosis only ---\n${strip(terminal.text()).slice(-2000)}`,
+      );
+    }
     const baselineModelRequests = modelRequests().length;
 
     if (options.inject) {
@@ -1841,6 +1121,7 @@ const LIMITS: readonly string[] = [
   "The runtime does not hand the token to the model bare: it renders it inside a peer-message preamble of its own before it reaches model input. What is qualified is that the token arrives and starts a turn, not that it arrives unadorned. The preserved capture shows the surrounding text.",
   "The endpoint-directory policy is untouched by this slice, so registration through registerEndpoint is still refused for a socket outside the daemon state directory. See the finding of that name.",
   "Interactive start required pre-provisioned answers to the onboarding, workspace-trust and custom-API-key prompts in a throwaway config. A session whose operator answered them differently is outside this reading.",
+  "The interactive arm's baseline turn is started by a positional prompt in its argv, not typed at the client's prompt. What is read here is that the wake frame reaches the model input of an interactively-invoked session and starts a turn; nothing here observes the client's terminal, so this says nothing about whether that session would have accepted a keystroke at the moment the frame arrived.",
   "settleCeilingMs is a ceiling on the post-injection wait, not a duration either arm was observed for. The control spends the whole ceiling; the injection arm returns on its first follow-up request. Two arms sharing a ceiling were watched for at most the same time, not for the same time, and the actual spans are not recorded here.",
   "Every arm executed one hard link, in a directory private to the run, to the inode digested as imageSha256 -- the command's first element names that link, which is removed with the run, and imagePath names where the inode was found. Each arm re-read the link's identity, size, modification time and digest after its measurement and would have failed the run on a difference. A rewrite of that inode in place, undone before the re-read, would not have been seen.",
   "This file does not identify the instrument that produced it. headSha is git rev-parse HEAD at receipt-build time, which can name a tree that contains no harness -- the harness may be uncommitted while the reading is taken. Unless a sourceBinding block below says otherwise, the source of this reading is UNKNOWN, and a digest computed after the fact would attest preservation since, not what executed.",

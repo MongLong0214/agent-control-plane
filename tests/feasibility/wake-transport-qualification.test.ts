@@ -25,19 +25,24 @@
 import { afterAll, describe, expect, it } from "vitest";
 
 import {
+  BASELINE_PROMPT,
   MEASURED_CLIENT_NAME,
   QUALIFICATION_ID,
   RECEIPT_DIR,
   SUITE_CAPTURE_DIR,
   armPassed,
+  baselineTurnObserved,
   interactiveBlocker,
+  modelRequestsIn,
   pinClaudeImage,
+  probeArgv,
   qualificationDisagreements,
   readReadings,
   runQualificationProbe,
   type PinnedClaudeImage,
   type ProbeRun,
 } from "./wake-transport-qualification/harness.ts";
+import { isInteractiveClaudeInvocation } from "../../src/registry/canonical-self-claim.ts";
 import {
   ROLE_WAKE_FRAME,
   ROLE_WAKE_TOKEN,
@@ -135,6 +140,66 @@ describe("U6: the wake transport admits only builds a committed reading qualifie
   });
 });
 
+/**
+ * How the baseline turn is started, and what counts as evidence that it happened.
+ *
+ * The harness used to type the prompt, which meant it had to know when the client would accept
+ * typing, which meant rendering the client's terminal output. Six false-ready or false-refuse
+ * defects were reproduced against that renderer in three review rounds; it is gone. The prompt is
+ * now a positional argument -- `claude [options] [prompt]` -- and the two things that have to stay
+ * true are the two rows below. Neither starts a client: the first is a predicate over an argv, the
+ * second a predicate over a capture.
+ */
+describe("U6: the interactive arm keeps the shape the claim requires, and observes its baseline turn", () => {
+  it("the interactive argv is an invocation the canonical-claim predicate accepts, positional prompt and all", () => {
+    // The predicate production applies, called on the value the harness starts the client with --
+    // not read and reasoned about. `isInteractiveClaudeInvocation` is what decides whether a
+    // process may hold the canonical claim, so an arm it would refuse measures a process that
+    // could not be the holder, whatever else the arm proves.
+    const paths = { settingsPath: "/private/tmp/fixture/settings.json", socketPath: "/private/tmp/fixture/s/i.sock" };
+    const interactive = ["/private/tmp/fixture/claude", ...probeArgv("interactive", paths)];
+    expect(isInteractiveClaudeInvocation(interactive)).toBe(true);
+
+    // The prompt is carried as an operand, which is exactly why the shape survives: the predicate
+    // refuses flags, and this is not one. It is also the last element, so a reading's `command`
+    // shows it.
+    expect(interactive.at(-1)).toBe(BASELINE_PROMPT);
+    expect(interactive.filter((argument) => argument === BASELINE_PROMPT)).toHaveLength(1);
+    for (const flag of ["-p", "--print", "--output-format", "--input-format"]) {
+      expect(interactive).not.toContain(flag);
+    }
+
+    // The control, so this row is not a predicate that says yes to everything: the headless arm
+    // carries the four flags the predicate refuses, and it is refused.
+    const headless = ["/private/tmp/fixture/claude", ...probeArgv("headless", paths)];
+    expect(isInteractiveClaudeInvocation(headless)).toBe(false);
+  });
+
+  it("the baseline turn is a captured model request, and nothing short of one counts as having seen it", () => {
+    const captured = (url: string, body = '{"model":"claude-sonnet-4-5"}'): string =>
+      `${JSON.stringify({ at: "2026-09-28T00:00:00.000Z", method: "POST", url, headers: {}, body })}\n`;
+
+    // Passing the prompt is not evidence it was accepted. An arm that had seen nothing, or had seen
+    // only traffic to some other endpoint, has not observed a turn -- and the harness fails rather
+    // than proceeding, because a baseline it assumed is a baseline the wake's follow-up is measured
+    // against for nothing.
+    expect(baselineTurnObserved("")).toBe(false);
+    expect(baselineTurnObserved("\n   \n")).toBe(false);
+    expect(baselineTurnObserved(captured("/v1/models"))).toBe(false);
+    expect(modelRequestsIn(captured("/v1/models"))).toEqual([]);
+
+    // And what does count: a request the client sent to be inferred on, the same evidence the wake
+    // itself is judged by. The path is the one the measured builds use.
+    expect(baselineTurnObserved(captured("/v1/messages?beta=true"))).toBe(true);
+
+    const mixed = `${captured("/v1/models")}${captured("/v1/messages?beta=true", '{"prompt":"ping"}')}`;
+    const kept = modelRequestsIn(mixed);
+    expect(kept).toHaveLength(1);
+    // The body is carried through, because it is what the wake count is read from.
+    expect(kept[0]).toMatchObject({ url: "/v1/messages?beta=true", body: '{"prompt":"ping"}' });
+  });
+});
+
 describe.skipIf(blocker !== null)("U6: the reading, re-taken", () => {
   // Held once for both arms and every row, as `qualify()` holds it: an arm that resolved the client
   // for itself could run a build other than the one the rows below ask about.
@@ -184,6 +249,23 @@ describe.skipIf(blocker !== null)("U6: the reading, re-taken", () => {
       expect(injected.settleCeilingMs).toBe(run.settleCeilingMs);
       expect(injected.baselineModelRequests).toBe(run.baselineModelRequests);
       expect(injected.followUpAfterInjection).not.toBe(run.followUpAfterInjection);
+    },
+    PROBE_TIMEOUT_MS,
+  );
+
+  it(
+    "the arm that ran was the interactive shape, and its baseline turn was one it was started with",
+    async () => {
+      const run = await probe(true);
+
+      // The argv of a client that really started, redacted but argv-shaped, through the same
+      // predicate. The row above checks what `probeArgv` returns; this checks what ran.
+      expect(isInteractiveClaudeInvocation(run.command)).toBe(true);
+      expect(run.command.at(-1)).toBe(BASELINE_PROMPT);
+
+      // The positional prompt produced a turn, and it produced it before the frame was written:
+      // the arm cannot reach this point otherwise, and the number says so rather than implying it.
+      expect(run.baselineModelRequests).toBeGreaterThan(0);
     },
     PROBE_TIMEOUT_MS,
   );
