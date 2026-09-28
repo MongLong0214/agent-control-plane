@@ -44,6 +44,10 @@ import {
   parseDeadBindingRecoveryRequest,
   type DeadBindingRecoveryReceipt,
 } from "./dead-binding-recovery.ts";
+import {
+  type UnwakeableHolder,
+  wakeTransportQualifiedLabels,
+} from "../mcp/role-conversation.ts";
 import { SingleInstanceLock } from "./single-instance.ts";
 
 /**
@@ -490,6 +494,13 @@ export class Daemon {
    * a live one (#841).
    */
   #buzzMentionReceipt: { startedAtMs: number; configuredIdentities: number; counters(): BuzzMentionCounters } | null = null;
+  /**
+   * The CTO wake port's live peers, as the composition root handed them over. Null until
+   * `startDaemonMcpListeners` installs it, and a daemon with no listeners has no peer to report on.
+   * A handle rather than a snapshot, for the reason `#buzzMentionReceipt` gives: peers connect and
+   * leave while the daemon runs.
+   */
+  #wakeTransportPeers: { unwakeableHolders(): readonly UnwakeableHolder[] } | null = null;
   #telegramIngressController: TelegramIngressController | null = null;
   #continuityCoordinatorInstalled = false;
   #continuityReconciling = false;
@@ -1944,6 +1955,78 @@ export class Daemon {
   }
 
   /**
+   * Installs the CTO wake port so the report can name every binding that cannot receive a wake.
+   *
+   * A setter rather than a constructor argument: `run()`'s `supplementalFindings` is the seam a
+   * system finding belongs on, and it is the route the mention counters took through
+   * `setBuzzMentionReceipt`. `startDaemonMcpListeners` calls it with the port it just built, which
+   * is the one seam a test can drive with a real daemon and real listeners, so the wiring is
+   * exercised rather than asserted.
+   */
+  setWakeTransportPeers(peers: { unwakeableHolders(): readonly UnwakeableHolder[] }): void {
+    this.#wakeTransportPeers = peers;
+  }
+
+  /**
+   * A binding that is active and whose holder can never receive a wake.
+   *
+   * `registerEndpoint` refuses a peer whose declared build is outside the qualified set, and a
+   * binding with no registered endpoint gets no wakes: `wake` refuses, and the Buzz ingress stores
+   * the message and waits for a registration that will never come. Every piece of that is correct
+   * on its own terms and none of it is loud, so the only symptom was that wakes silently did not
+   * arrive -- the #674 shape again, a binding reading ACTIVE while nothing can reach it, with a
+   * different cause. On 2026-09-27 that was every live client on the host: three builds, none of
+   * them a member.
+   *
+   * One finding per binding, because the repair is per build and an operator has to know which
+   * holder runs which. The evidence names the role key, the build the connection declared, and the
+   * qualified set, and never a path: the port answers in `name/version` labels for the reason its
+   * `EndpointCheck` gives.
+   *
+   * Reported rather than refused. The binding is legitimately held: the claim that admitted its
+   * holder observes the executing image and compares it to no build, so nothing about the build
+   * made the hold wrong. What the holder lacks is a qualified transport, and there is no refusal
+   * that supplies one. Revoking the binding would lose the conversation it exists to keep and
+   * still deliver no wake, because a successor on the same build is refused the endpoint the same
+   * way. The repair is a reading of that build or a restart on a member, both of them operator
+   * acts, so what this finding owes is to make a condition whose every piece is quiet loud.
+   */
+  private unwakeableBindingFindings(): Finding[] {
+    const holders = this.#wakeTransportPeers?.unwakeableHolders() ?? [];
+    return holders.map((holder): Finding => {
+      // A holder that declared no build is refused the endpoint exactly as one outside the set is,
+      // so the consequence is the same sentence. Only the cause and the repair differ: there is no
+      // build to qualify, and no name to put in the text.
+      const cause = holder.presented === null
+        ? "its holder's connection has declared no client build"
+        : `its holder runs ${holder.presented}, which is not a build this wake transport was qualified on`;
+      const repair = holder.presented === null
+        ? "Restart the holder on a qualified build. A holder still completing `initialize` has not " +
+          "declared its build yet, and a report taken after it has names that build instead"
+        : "Qualify that build with `pnpm qualify:wake-transport` pointed at it and add it to the " +
+          "qualified set, or restart the holder on a qualified build";
+      return {
+        code: "ROLE_BINDING_CANNOT_RECEIVE_WAKES",
+        severity: "ERROR",
+        scope: "system",
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: {
+          roleKey: holder.roleKey,
+          role: holder.role,
+          presentedClient: holder.presented,
+          wakeTransportQualifiedClients: wakeTransportQualifiedLabels(),
+          wakeTransportPinSource: "src/mcp/role-conversation.ts WAKE_TRANSPORT_QUALIFIED_CLIENTS",
+        },
+        recommendedAction:
+          `binding ${holder.roleKey} is active and ${cause}, so it cannot register a wake endpoint and ` +
+          "cannot receive wakes: a message addressed to it is stored and waits for a registration that " +
+          `will not come. ${repair}`,
+      };
+    });
+  }
+
+  /**
    * Whether anything has actually arrived on the Buzz mention path.
    *
    * The only operator-visible number here used to be the count of *configured identities*, which
@@ -1968,13 +2051,14 @@ export class Daemon {
   // one side refused whichever build the other accepted. The claim no longer pins a build — it
   // observes the executing image and compares it to nothing — so there is no second pin to
   // disagree with, and the composition root stopped handing the report a version. Only
-  // `registerEndpoint`'s qualified client still pins one. A finding kept past that point could
+  // `registerEndpoint`'s qualified set still names builds. A finding kept past that point could
   // only ever be raised by a caller that set the value by hand, and its text would describe a
   // refusal the claim no longer makes.
   private supplementalSystemFindings(): Finding[] {
     return [
       ...this.telegramIngressFindings(),
       ...this.buzzMentionSubscriberFindings(),
+      ...this.unwakeableBindingFindings(),
     ];
   }
 

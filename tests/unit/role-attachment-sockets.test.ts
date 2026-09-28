@@ -11,7 +11,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startDaemonMcpListeners, type LocalMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
-import { C0_QUALIFIED_CLIENT } from "../../src/mcp/role-conversation.ts";
+import { WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
 import type { AttachmentCredential } from "../../src/session/role-attachment-credentials.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { fixtureManifest, makeHarness, type Harness } from "../helpers/harness.ts";
@@ -90,7 +90,7 @@ describe("role attachment over real daemon sockets", () => {
       socket.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
     });
     socket.write(`${JSON.stringify({ token: presentedToken, ...credential })}\n`);
-    await request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: C0_QUALIFIED_CLIENT });
+    await request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: WAKE_TRANSPORT_QUALIFIED_CLIENTS[0] });
     socket.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
     return {
       socket,

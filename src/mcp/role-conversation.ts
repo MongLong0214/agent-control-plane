@@ -190,37 +190,100 @@ type EndpointCheck =
   | "owner-unknown-on-this-platform";
 
 /**
- * The client build this transport was qualified on.
+ * The client builds this transport was qualified on — a **set**, and every member of it exact.
  *
  * This route is a **version-pinned local runtime contract**, not a supported public interface and
  * not an external-events API. Nothing outside this deployment may rely on it, and it is expected
  * to need re-qualification when the local runtime moves: the endpoint is created by the client
  * process itself, and what a given build does with a unix socket it was asked to bind is a fact
- * about that build, established by measurement rather than by a published guarantee. So the pin is
- * exact rather than a floor — a newer client is *unqualified*, not *newer than qualified*, until
- * somebody measures it and moves this constant.
+ * about that build, established by measurement rather than by a published guarantee. So each
+ * member is exact rather than a floor — a newer client is *unqualified*, not *newer than
+ * qualified*, until somebody measures it and adds it here. Membership is equality on
+ * `{name, version}` and nothing looser: no range, no prefix, no semver ordering, and no
+ * environment variable that admits a build nobody measured.
  *
- * "Somebody measures it" now names a file. `evidence/u6-wake-transport-qualification.json` records
- * the reading this value rests on — the command, the resolved image and its digest, the host, the
+ * A set rather than one build because a deployment runs several builds at once. Measured on
+ * 2026-09-27: four live clients on three builds, one of whose images the updater had already
+ * deleted from disk, and none of them the single build this constant then named. One entitlement
+ * could express at most one of them, so every other binding could hold its role and never register
+ * a wake endpoint — its messages stored, waiting for a registration that could not come. The set
+ * changes how many builds may be qualified, not what qualifies one.
+ *
+ * "Somebody measures it" names a file per member. `evidence/u6-wake-transport-qualification/`
+ * holds one reading per build — the command, the resolved image and its digest, the host, the
  * exact `ROLE_WAKE_FRAME` bytes, and both arms of both invocation shapes — and
- * `tests/feasibility/wake-transport-qualification.test.ts` refuses to let the two disagree. The
- * C0 pin had no such file: its harness deleted its temp root on exit, so the constant carried a
- * conclusion whose reading no longer existed, and a conclusion nobody can re-read is indistinguishable
- * from one nobody took.
+ * `tests/feasibility/wake-transport-qualification.test.ts` refuses to let this list and that
+ * directory disagree: every member needs a reading, every reading must be a member, and a member
+ * whose reading's verdict is not `qualified` fails rather than warns. The C0 pin had no such file:
+ * its harness deleted its temp root on exit, so the constant carried a conclusion whose reading no
+ * longer existed, and a conclusion nobody can re-read is indistinguishable from one nobody took.
  *
  * Raw captures and logs use fixed, overwriteable local paths, and the three previously recorded
- * historical losses remain unrecoverable. Each re-qualification writes over the previous run's
- * captures in place, so only the newest reading's raw files exist: the ones behind the receipt
- * produced at 2026-09-08T23:01:02.003Z were overwritten by the 2026-09-09T14:48:17.913Z run, and
- * those in turn by the 2026-09-11T08:55:21.640Z run this value now rests on. No superseded capture
- * is recoverable.
+ * historical losses remain unrecoverable. The 2.1.268 reading's captures sit at the unscoped
+ * paths its receipt names, where each earlier re-qualification wrote over the last: the ones
+ * behind the receipt produced at 2026-09-08T23:01:02.003Z were overwritten by the
+ * 2026-09-09T14:48:17.913Z run, and those in turn by the 2026-09-11T08:55:21.640Z run that reading
+ * now rests on. No superseded capture is recoverable. A qualification now writes under a
+ * directory named for the build it measured, so qualifying one member no longer overwrites the
+ * captures another member's reading points at; re-qualifying the same build still does.
  *
- * The reading behind this value covers an **interactive** start, which the C0 one did not. That
+ * The readings behind these values cover an **interactive** start, which the C0 one did not. That
  * matters because `isInteractiveClaudeInvocation` (src/registry/canonical-self-claim.ts) refuses
  * `-p`, `--print`, `--output-format` and `--input-format`: the process that may hold the canonical
  * claim is exactly the shape a headless-only qualification never observed.
  */
-export const C0_QUALIFIED_CLIENT = { name: "claude-code", version: "2.1.268" } as const;
+export const WAKE_TRANSPORT_QUALIFIED_CLIENTS = [
+  { name: "claude-code", version: "2.1.268" },
+] as const;
+
+/** One `{name, version}` pair, as an MCP client declares itself and as a reading records it. */
+export interface WakeTransportClient {
+  readonly name: string;
+  readonly version: string;
+}
+
+/**
+ * Whether `client` is a member of the qualified set — exact equality on both fields, and nothing
+ * else.
+ *
+ * The one membership test. Registration refuses on it and the daemon's unwakeable-binding finding
+ * reports on it, so the two cannot come to disagree about which builds may receive a wake: a
+ * finding computed from a second copy of this rule would describe a refusal the port does not make.
+ *
+ * `members` is a parameter so the exactness can be exercised against a set of several builds
+ * without editing this module's; every production caller takes the default.
+ */
+export const isWakeTransportQualified = (
+  client: WakeTransportClient | undefined,
+  members: readonly WakeTransportClient[] = WAKE_TRANSPORT_QUALIFIED_CLIENTS,
+): boolean =>
+  client !== undefined && members.some((member) => member.name === client.name && member.version === client.version);
+
+/**
+ * The qualified set as it is reported: `name/version` strings and nothing more.
+ *
+ * Refusal evidence and the daemon's finding both carry this. Neither carries a reading's image
+ * path — see `EndpointCheck` for why a persisted `Decision` or a report must not name a local
+ * path — and the member list is the answer an operator needs anyway: which builds would have been
+ * admitted.
+ */
+export const wakeTransportQualifiedLabels = (): string[] =>
+  WAKE_TRANSPORT_QUALIFIED_CLIENTS.map(({ name, version }) => `${name}/${version}`);
+
+/**
+ * A binding that is active, whose holder is connected, and whose connection declared no build in
+ * the qualified set — so it can never register a wake endpoint and never receive a wake.
+ */
+export interface UnwakeableHolder {
+  readonly roleKey: string;
+  readonly role: Role;
+  /**
+   * `name/version` exactly as the connection declared it, or `null` when it declared none. Never a
+   * path. `null` is the value `registerEndpoint`'s refusal evidence gives the same peer, so the
+   * report and the refusal describe it the same way.
+   */
+  readonly presented: string | null;
+}
 
 /**
  * Owner-only, in the POSIX sense the 0700 state directory already means: no group bits, no other
@@ -369,6 +432,40 @@ export class RoleConversationPort {
   endpointFor(roleKey: string): string | null {
     if (!this.currentHolderConnected(roleKey)) return null;
     return this.#live.get(roleKey)?.endpoint ?? null;
+  }
+
+  /**
+   * Every binding whose connected holder declared no build in the qualified set: one outside it,
+   * or none at all.
+   *
+   * These are the bindings that read ACTIVE, have a live peer, and still cannot receive a wake:
+   * `registerEndpoint` refuses that peer on the same `isWakeTransportQualified` this asks, so no
+   * endpoint is ever registered, `wake` refuses for want of one, and an addressed message is stored
+   * and waits for a registration that will not come. Nothing about that is loud on its own — the
+   * symptom is only that wakes never arrive — so the daemon reports what this returns.
+   *
+   * Asked of the live connection at the moment of the question rather than recorded when a
+   * registration was refused: a peer that never tries to register is just as unwakeable, and a
+   * refusal remembered past the connection that earned it would outlive the fact it describes.
+   *
+   * A connection that has declared no build is reported, with `presented: null`, not skipped.
+   * `registerEndpoint` asks the same predicate, which is false for no build, so that holder is
+   * refused exactly as one outside the set is. Skipping it made the one case in which the report
+   * has no build name to go on the one case it said nothing about. The SDK records the build only
+   * when an `initialize` carrying `clientInfo` parses, and its schema requires `clientInfo`, so
+   * "declared none" and "has not completed `initialize`" are one state here. A report taken in
+   * the moment between a peer attaching and its `initialize` names that peer too. For that moment
+   * the report is true: the peer could not have registered.
+   */
+  unwakeableHolders(): UnwakeableHolder[] {
+    const holders: UnwakeableHolder[] = [];
+    for (const [roleKey, peer] of this.#live) {
+      if (!this.currentHolderConnected(roleKey)) continue;
+      const client = peer.server.server.getClientVersion();
+      if (isWakeTransportQualified(client)) continue;
+      holders.push({ roleKey, role: this.#role, presented: client ? `${client.name}/${client.version}` : null });
+    }
+    return holders;
   }
 
   /**
@@ -522,8 +619,9 @@ export class RoleConversationPort {
    * ever register an endpoint for roles it is already the current holder of, and there is no
    * argument in which to name somebody else's.
    *
-   * The client build is pinned here because the endpoint is the client's own artefact: see
-   * `C0_QUALIFIED_CLIENT`.
+   * The client build is checked here because the endpoint is the client's own artefact: see
+   * `WAKE_TRANSPORT_QUALIFIED_CLIENTS`. Membership is exact, and a build outside the set is
+   * refused however close its version is to a member's.
    */
   async registerEndpoint(server: McpServer, endpoint: string): Promise<Decision<readonly string[]>> {
     const owned = [...this.#live.entries()].filter(([, peer]) => peer.server === server);
@@ -541,14 +639,16 @@ export class RoleConversationPort {
       }
     }
     const client = server.server.getClientVersion();
-    if (client?.name !== C0_QUALIFIED_CLIENT.name || client.version !== C0_QUALIFIED_CLIENT.version) {
+    if (!isWakeTransportQualified(client)) {
       return deny(
         ReasonCode.ROLE_PEER_UNSUPPORTED,
-        "this client build is not the one this version-pinned local wake transport was qualified on",
+        "this client build is not one this version-pinned local wake transport was qualified on",
         {
           role: this.#role,
           presented: client ? `${client.name}/${client.version}` : null,
-          qualified: `${C0_QUALIFIED_CLIENT.name}/${C0_QUALIFIED_CLIENT.version}`,
+          // The whole set, as `name/version` labels: which builds would have been admitted. No
+          // reading's image path, for the reason `EndpointCheck` gives.
+          qualified: wakeTransportQualifiedLabels(),
         },
       );
     }

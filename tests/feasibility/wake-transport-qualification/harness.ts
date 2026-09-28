@@ -21,7 +21,7 @@
  *  3. **It preserves the raw capture.** C0 removed its temp root on exit, so the run left no
  *     artefact and the pinned version rested on a memory of a measurement. Every run here
  *     copies the provider capture and the session log out of the temp root before that root is
- *     removed, into `evidence/local/` under this repository, and `writeReceipt` ties them to
+ *     removed, into `evidence/local/` under this repository, and `recordReading` ties them to
  *     the exact command, binary digest, CLI version and host that produced them.
  *
  * What the isolation buys is unchanged and still bounded. `ANTHROPIC_BASE_URL` points model
@@ -35,14 +35,31 @@
  */
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { connect } from "node:net";
 import { arch, homedir, platform, release } from "node:os";
 import { delimiter, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { startFakeAnthropic, type FakeAnthropic } from "../native-session-inbox/fake-anthropic.ts";
-import { ROLE_WAKE_FRAME, ROLE_WAKE_TOKEN } from "../../../src/mcp/role-conversation.ts";
+import {
+  ROLE_WAKE_FRAME,
+  ROLE_WAKE_TOKEN,
+  type WakeTransportClient,
+  isWakeTransportQualified,
+} from "../../../src/mcp/role-conversation.ts";
 
 /** The repository this harness writes its durable artefacts under. Never anywhere else. */
 export const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
@@ -56,6 +73,13 @@ export const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
  * anyone ran the suite: a reader following one got a capture from a different run, with nothing
  * saying so (#837). The receipt's own summary numbers were never affected — they are values in
  * committed JSON — but a pointer that claims more durability than it has is worse than no pointer.
+ *
+ * `qualify()` writes beneath a subdirectory named for the build it measured, the same name its
+ * reading gets (`readingFileName` without the extension). With one reading that made no
+ * difference; with several, an unscoped directory would let qualifying one build overwrite the
+ * captures another build's committed reading points at — #837's stale pointer again, arriving
+ * through the qualification rather than the suite. The 2.1.268 reading predates this and names the
+ * unscoped paths, which nothing writes to any more.
  */
 export const RAW_CAPTURE_DIR = "evidence/local/u6-wake-transport-qualification";
 
@@ -68,8 +92,32 @@ export const RAW_CAPTURE_DIR = "evidence/local/u6-wake-transport-qualification";
  */
 export const SUITE_CAPTURE_DIR = "evidence/local/u6-wake-transport-probe";
 
-/** The committed receipt this qualification produces, and the one the pin row reads back. */
-export const RECEIPT_PATH = "evidence/u6-wake-transport-qualification.json";
+/**
+ * The committed readings, one file per measured build, each named `<name>@<version>.json`.
+ *
+ * A directory of files rather than one file holding an array, because the question that decides
+ * the shape is what qualifying a *second* build may do to the first, and the answer has to be
+ * "nothing":
+ *
+ *   - Qualifying a build opens exactly one path. The other readings are never read, parsed and
+ *     rewritten on the way, so a crash mid-write, a malformed neighbour, or two operators each
+ *     qualifying a different build cannot lose or reformat a reading nobody meant to touch. In one
+ *     array file, "leave the other readings alone" would be a property of a read-modify-write that
+ *     has to be correct every time; here it is a property of which file gets written.
+ *   - Two branches that each add a build add two files, which merge cleanly. Two appends to one
+ *     array meet at the same closing bracket and conflict.
+ *   - The 2.1.268 reading moved in as a rename of identical bytes, so the migration restates
+ *     nothing about a measurement it did not take.
+ *
+ * The file name is derived from the reading's own `client` and never chosen, and
+ * `qualificationDisagreements` refuses a file whose name disagrees with its content. That is what
+ * makes "one reading per build" a fact about the directory rather than a convention: names are
+ * unique within it, and a name is a function of the build.
+ */
+export const RECEIPT_DIR = "evidence/u6-wake-transport-qualification";
+
+/** The client every reading here measures. The instrument resolves a `claude` binary and nothing else. */
+export const MEASURED_CLIENT_NAME = "claude-code";
 
 /** This harness's own name in the receipt, so a reader knows which instrument took the reading. */
 export const QUALIFICATION_ID = "acp.role-wake-transport/u6";
@@ -684,7 +732,7 @@ export const buildReceipt = (input: {
     producedAt: new Date().toISOString(),
     headSha: input.headSha,
     client: {
-      name: "claude-code",
+      name: MEASURED_CLIENT_NAME,
       version: input.image.version,
       versionOutput: input.image.versionOutput,
       imagePath: redactHome(input.image.path),
@@ -710,17 +758,123 @@ export const buildReceipt = (input: {
   };
 };
 
-export const writeReceipt = (receipt: QualificationReceipt, repoRelativePath: string): string => {
-  const path = join(REPO_ROOT, repoRelativePath);
-  mkdirSync(join(path, ".."), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(receipt, null, 2)}\n`);
+/**
+ * What a name or a version may be for it to become part of a file name.
+ *
+ * No path separator, no `@` (the separator between the two), and no leading `.` or `-`, so neither
+ * part can walk out of `RECEIPT_DIR` or be read as a flag. The version comes from a client's own
+ * `--version` output, which is not this harness's to trust with a path.
+ */
+const FILE_NAME_PART = /^[A-Za-z0-9][A-Za-z0-9._+-]*$/;
+
+/** The one file a build's reading lives in. Refuses a part that cannot be named safely. */
+export const readingFileName = (client: WakeTransportClient): string => {
+  for (const part of [client.name, client.version]) {
+    if (typeof part !== "string" || !FILE_NAME_PART.test(part)) {
+      throw new Error(`a reading cannot be named after ${JSON.stringify(part)}`);
+    }
+  }
+  return `${client.name}@${client.version}.json`;
+};
+
+/** One committed reading and the file it was read from. */
+export interface RecordedReading {
+  readonly file: string;
+  readonly reading: QualificationReceipt;
+}
+
+/**
+ * Adds this build's reading, or replaces the one it already had, and touches no other file.
+ *
+ * Written beside its final name and renamed into place, so an interrupted write leaves the build's
+ * previous reading (or none) rather than half a file. The temporary name does not end in `.json`,
+ * so `readReadings` never mistakes one for a reading.
+ */
+export const recordReading = (
+  reading: QualificationReceipt,
+  directory: string = join(REPO_ROOT, RECEIPT_DIR),
+): string => {
+  const path = join(directory, readingFileName(reading.client));
+  mkdirSync(directory, { recursive: true });
+  const pending = `${path}.${process.pid}.pending`;
+  writeFileSync(pending, `${JSON.stringify(reading, null, 2)}\n`);
+  renameSync(pending, path);
   return path;
 };
 
-export const readReceipt = (repoRelativePath: string): QualificationReceipt | null => {
-  const path = join(REPO_ROOT, repoRelativePath);
-  if (!existsSync(path)) return null;
-  return JSON.parse(readFileSync(path, "utf8")) as QualificationReceipt;
+/** Every committed reading, in file-name order. An absent directory is no readings, not an error. */
+export const readReadings = (directory: string = join(REPO_ROOT, RECEIPT_DIR)): RecordedReading[] => {
+  if (!existsSync(directory)) return [];
+  return readdirSync(directory)
+    .filter((entry) => entry.endsWith(".json"))
+    .sort()
+    .map((file) => ({
+      file,
+      reading: JSON.parse(readFileSync(join(directory, file), "utf8")) as QualificationReceipt,
+    }));
+};
+
+/**
+ * Every way the qualified set and the committed readings disagree, one sentence each; empty when
+ * they agree.
+ *
+ * Each rule is a failure, never a warning, because each is a build the wake transport would admit
+ * or refuse on the strength of something other than a measurement:
+ *
+ *   - **Every member has a reading.** A member with none is a build admitted on no reading at all —
+ *     the C0 state this whole file exists to end, and the one this slice most has to prevent now
+ *     that adding a member is a one-line edit.
+ *   - **No member rests on a reading whose verdict is not `qualified`.** A measurement that failed
+ *     is still a measurement, and it is the one thing that must not make its build a member.
+ *   - **Every reading is of a member.** A reading outside the set is a build that was measured and
+ *     never admitted, or a member removed with its reading left behind; either way the set and the
+ *     evidence have stopped describing the same deployment. Together with the rule above, this
+ *     means a reading whose verdict is not `qualified` cannot be committed at all — the same
+ *     property the single receipt had when its verdict was required to be `qualified`.
+ *   - **A file holds the reading its name says**, and a member is listed once. Those two are what
+ *     make "one reading per build" true rather than conventional.
+ *
+ * Membership is `isWakeTransportQualified` — the equality registration refuses on — so this cannot
+ * pass on a looser notion of "the same build" than the one production applies.
+ */
+export const qualificationDisagreements = (
+  members: readonly WakeTransportClient[],
+  readings: readonly RecordedReading[],
+): string[] => {
+  const label = (client: WakeTransportClient): string => `${client.name}/${client.version}`;
+  const problems: string[] = [];
+  for (const { file, reading } of readings) {
+    let expected: string;
+    try {
+      expected = readingFileName(reading.client);
+    } catch (error) {
+      problems.push(`${file}: ${(error as Error).message}`);
+      continue;
+    }
+    if (file !== expected) {
+      problems.push(`${file} holds the reading of ${label(reading.client)}, whose file is ${expected}`);
+    }
+  }
+  members.forEach((member, index) => {
+    if (members.findIndex((other) => isWakeTransportQualified(other, [member])) !== index) {
+      problems.push(`${label(member)} is listed in the qualified set more than once`);
+    }
+    const own = readings.filter(({ reading }) => isWakeTransportQualified(reading.client, [member]));
+    if (own.length === 0) {
+      problems.push(`${label(member)} is a qualified member with no reading`);
+    }
+    for (const { file, reading } of own) {
+      if (reading.verdict !== "qualified") {
+        problems.push(`${label(member)} is a qualified member resting on ${file}, whose verdict is ${JSON.stringify(reading.verdict)}`);
+      }
+    }
+  });
+  for (const { file, reading } of readings) {
+    if (!isWakeTransportQualified(reading.client, members)) {
+      problems.push(`${file} is a reading of ${label(reading.client)}, which is not a qualified member`);
+    }
+  }
+  return problems;
 };
 
 /**
@@ -767,7 +921,12 @@ const FINDINGS: QualificationReceipt["findings"] = [
 ];
 
 /**
- * Takes the whole reading and writes the receipt: both shapes, both arms, one artefact.
+ * Takes the whole reading of one build and records it: both shapes, both arms, one file.
+ *
+ * One build per call — whichever `resolveClaudeImage` resolves, so an operator points it at a
+ * specific build through `ACP_CLAUDE_BINARY`. Its reading is added, or replaces that build's
+ * earlier one; every other build's reading is left exactly as it was. Moving the build into
+ * `WAKE_TRANSPORT_QUALIFIED_CLIENTS` stays a separate, deliberate edit.
  *
  * Lives here rather than in the script that invokes it so that it is inside the typechecked and
  * linted tree; `scripts/` is outside both, and an unchecked producer of the file the pin is
@@ -778,6 +937,10 @@ export const qualify = async (): Promise<{ readonly receipt: QualificationReceip
   if (image === null) throw new Error("no `claude` image on PATH to qualify");
   const blocker = interactiveBlocker();
   if (blocker !== null) throw new Error(`cannot take the interactive reading: ${blocker}`);
+  // Named before any arm runs: a version that cannot become a file name is refused here, not after
+  // four real client starts, and the same name scopes this build's raw captures.
+  const readingName = readingFileName({ name: MEASURED_CLIENT_NAME, version: image.version });
+  const captureDir = join(RAW_CAPTURE_DIR, readingName.slice(0, -".json".length));
 
   const headSha = execFileSync("git", ["rev-parse", "HEAD"], {
     cwd: REPO_ROOT,
@@ -791,10 +954,10 @@ export const qualify = async (): Promise<{ readonly receipt: QualificationReceip
   const runs: ProbeRun[] = [];
   for (const shape of ["interactive", "headless"] as const) {
     for (const inject of [true, false]) {
-      runs.push(await runQualificationProbe({ shape, inject, captureDir: RAW_CAPTURE_DIR }));
+      runs.push(await runQualificationProbe({ shape, inject, captureDir }));
     }
   }
 
   const receipt = buildReceipt({ image, headSha, runs, limits: LIMITS, findings: FINDINGS });
-  return { receipt, path: writeReceipt(receipt, RECEIPT_PATH) };
+  return { receipt, path: recordReading(receipt) };
 };

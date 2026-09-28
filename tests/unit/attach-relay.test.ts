@@ -13,7 +13,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startDaemonMcpListeners, type LocalMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
-import { C0_QUALIFIED_CLIENT } from "../../src/mcp/role-conversation.ts";
+import { WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { fixtureManifest, makeHarness, type Harness } from "../helpers/harness.ts";
 
@@ -201,7 +201,7 @@ describe("the canonical CTO attach relay", () => {
   };
 
   const attach = async (
-    clientInfo: { name: string; version: string } = C0_QUALIFIED_CLIENT,
+    clientInfo: { name: string; version: string } = WAKE_TRANSPORT_QUALIFIED_CLIENTS[0],
     mcpSocketPath?: string,
   ): Promise<Relay & { init: Wire }> => {
     const relay = drive(mcpSocketPath ?? mcpPath);
@@ -335,7 +335,7 @@ describe("the canonical CTO attach relay", () => {
         jsonrpc: "2.0",
         id: 1,
         method: "initialize",
-        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: C0_QUALIFIED_CLIENT },
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: WAKE_TRANSPORT_QUALIFIED_CLIENTS[0] },
       })}\n`,
     );
     expect(await settles(relay.exit)).toBe(ATTACH_EXIT.HANDSHAKE_REFUSED);
@@ -364,7 +364,7 @@ describe("the canonical CTO attach relay", () => {
       }),
       proxyPath,
     );
-    const relay = await attach(C0_QUALIFIED_CLIENT, proxyPath);
+    const relay = await attach(WAKE_TRANSPORT_QUALIFIED_CLIENTS[0], proxyPath);
     expect((await register(relay))["ok"]).toBe(true);
     expect(listeners.ctoConversation.endpointFor(roleKey)).toBe(endpoint);
 

@@ -45,9 +45,9 @@ import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
 import type { GatewayEventSource } from "../../src/runtime/hermes-gateway-conversation.ts";
 import type { CeoTurnOutcome } from "../../src/mcp/ceo-conversation.ts";
 import {
-  C0_QUALIFIED_CLIENT,
   ROLE_WAKE_FRAME,
   RoleConversationPort,
+  WAKE_TRANSPORT_QUALIFIED_CLIENTS,
 } from "../../src/mcp/role-conversation.ts";
 import type { McpPeerAuthenticator } from "../../src/mcp/shared.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -342,11 +342,12 @@ const connectRolePeer = async (
   /**
    * The client build this connection announces.
    *
-   * Defaulted, because only one row needs a specific one: `role_wake_endpoint_register` is pinned
-   * to one qualified runtime build, so the row that registers an endpoint has to arrive as that
-   * build — named by `C0_QUALIFIED_CLIENT` rather than spelled out, so a re-qualification that
-   * moves the pin does not leave a stale literal behind that still passes. Every other row is unaffected by what it says here, and passing the pin unconditionally
-   * would have made those rows quietly depend on a version they never exercise.
+   * Defaulted, because only one row needs a specific one: `role_wake_endpoint_register` admits
+   * only the qualified runtime builds, so the row that registers an endpoint has to arrive as one
+   * of them — a member of `WAKE_TRANSPORT_QUALIFIED_CLIENTS` rather than a version spelled out, so
+   * a re-qualification that changes the set does not leave a stale literal behind that still
+   * passes. Every other row is unaffected by what it says here, and passing a member
+   * unconditionally would have made those rows quietly depend on a version they never exercise.
    */
   clientInfo: { name: string; version: string } = { name: "buzz-role-peer", version: "1" },
 ): Promise<{
@@ -428,7 +429,7 @@ const connectRolePeer = async (
 const fakeRolePeer = () =>
   ({
     server: {
-      getClientVersion: () => C0_QUALIFIED_CLIENT,
+      getClientVersion: () => WAKE_TRANSPORT_QUALIFIED_CLIENTS[0],
     },
   }) as never;
 
@@ -1508,7 +1509,7 @@ describe("the daemon's Buzz message ingress", () => {
     const peer = await connectRolePeer(
       ctoSocket,
       { token: MCP_TOKEN, sessionId: session.sessionId, sessionSecret: session.sessionSecret },
-      C0_QUALIFIED_CLIENT,
+      WAKE_TRANSPORT_QUALIFIED_CLIENTS[0],
     );
 
     // One directory for both, the way `main` has one `stateDir`: the ingress socket and the
