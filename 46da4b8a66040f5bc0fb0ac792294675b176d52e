@@ -1,0 +1,64 @@
+Limit: the executing image is still hashed on every canonical claim, reading the whole binary, although the canonical claim never reads the result; the one reader is the delegated bind's attestation digest
+Limit: no test drives the real inspector into an lsof failure; the cases that admit a claim with no observed image supply a synthetic null, and the deleted-binary shape was confirmed read-only against a live session rather than in the suite
+Ruled-out: restarting the jev-gate session onto the pinned build, or giving each adoptable entry its own executor triple | the session's running image is deleted from disk, so no per-entry pin could admit it either, and a restart would lose the conversation the adoption exists to keep
+Warn: the realpath and sha256 pair that refused a binary renamed to `claude` with a forged adjacent manifest is withdrawn; argv[0]'s basename is now the only process-shape check, and the peer the socket admits is same-uid, which can write state.sqlite directly
+Warn: a delegated bind's attestation digest no longer contains the three pins, so digests written before and after this change are not comparable; nothing recomputes a stored digest — binding-registry.ts compares the stored receipt's own digest against the stored column
+Record-Id: r-d9a56b133455
+Provenance: inherited 8e033d0ca747771100161ca8df785dda30c49040
+
+Limit: the hashing inspector is now the only reader of the image's bytes, and its one caller is the delegated bind; nothing checks that a third caller does not appear and take the canonical inspector for a hashing one, because the two differ only by a boolean argument at one call site
+Ruled-out: folding an unreadable image into null | it reported an image the scan had already resolved as no image at all, so a failed read of a field the canonical path never reads destroyed the path and version it does read
+Warn: the parent commit's record says the executing image is still hashed on every canonical claim; that was true when written and is false after this commit, so a reader trusting it will look for a read the canonical path no longer performs
+Warn: the delegated bind now refuses an image it resolved but could not hash; a deployment whose image loses read permission while the session runs loses its delegated binding rather than attesting an image with no hash, and no refusal reason is recorded at that return
+Record-Id: r-d4d71cb53003
+Provenance: inherited a9aff166d8b85cd0eabe937fe61970c8b7a91bfa
+
+Limit: the read count is taken at node:fs inside this process, so what the count cannot see is a read by another process such as a spawned shasum, or an asynchronous node:fs call
+Ruled-out: narrowing the row's claim to the shape its test could already see | an inspector that reads the image, hashes it and drops the result returns this same shape, which is why the count is taken rather than inferred
+Warn: the sibling row an-image-the-uid-cannot-read-is-still-observed does not witness the read: a read that fails and drops only the hash gets the same answer, so it witnesses the observation surviving an unreadable image and nothing about whether bytes were read
+Record-Id: r-377078f4d380
+Provenance: inherited c080f56438e2e7d9e270617490ee2c51152f9d78
+
+Limit: the set holds one build, claude-code/2.1.268, and a deployment runs several at once, so every live session on another build still cannot register a wake endpoint until its build is measured and its reading committed; this change makes that expressible and visible, it does not qualify anything
+Ruled-out: making the qualified version a floor a newer client clears | each member is exact rather than a floor because what a build does with a unix socket it was asked to bind is a fact about that build established by measurement, so a newer client is unqualified rather than newer than qualified
+Warn: a holder that has attached but not finished initialize is indistinguishable from one that declared no clientInfo, so the unwakeable report names a peer during that short gap; it is reported with a null build rather than skipped, which reverses the previous behaviour
+Record-Id: r-94b0f0375033
+Provenance: inherited 81dbe53deeaeb9308ab099a80de8300f232eec09
+
+Limit: a rewrite of the held inode in place, undone before the next re-read, would not be seen
+Limit: the CTO and Hermes MCP doctor_run tools still answer without these findings, so an agent asking the door agents actually use can be told HEALTHY while a binding it holds is unwakeable. Filed as issue 1010 rather than left to a comment
+Ruled-out: apply only the sequences the captured fixtures happen to contain | that is the same defect with a smaller surface, so a sequence the model does not apply now fails closed instead of rendering a wrong screen that readiness is then read off
+Ruled-out: copy the image instead of hard-linking it | a copy is a new inode, so its digest would stop being a statement about the installed build
+Warn: every status the daemon persists now carries the supplemental findings, which widens more than the new finding: the Telegram ingress and Buzz mention findings previously reached only the operator door. All three are non-blocking, so a status can become DEGRADED but never BLOCKED
+Record-Id: r-acp1009r2
+Provenance: inherited 55065b61276e4efd0387d0474b11ac4590e4f498
+
+Limit: a harmless sequence nobody has classified still refuses every later frame, and the remedy is to classify it rather than to widen what a repaint forgives
+Limit: OSC 9 is still judged by its number, so ConEmu's 9;x subcommands carry the same problem OSC 1337 had
+Ruled-out: forgive an unclassified sequence at the next repaint | a repaint overwrites cells and the cursor but no mode, margin or width, so insert mode or origin mode would be forgiven and readiness would again be read off a wrongly rendered screen
+Warn: the earlier record said every status the daemon persists carries the supplemental findings. That holds for a newly completed doctor evaluation, not for every health-file write: setTelegramIngressStatus and setBuzzMentionReceipt write health.json reusing the previous doctor result, so a stopped ingress can produce a write still carrying an older HEALTHY until the next evaluation
+Record-Id: r-acp1009r3
+Supersedes: r-acp1009r2
+Provenance: inherited 972b4736a8097ffe3b63e31ba2501d5a347a731b
+
+Limit: the rule that requires each arm to name the image it executed lands one commit earlier than these files, so that commit on its own is red: run against the readings it was committed beside, the consistency row reports twelve disagreements, one per arm of all three readings. Only this commit makes it green. Bisecting into that commit finds a failure that is an ordering artefact, not a defect.
+Warn: a reading describes how this instrument started a client, so changing the invocation silently makes every committed reading a description of a run shape that no longer happens. These three were re-taken because the harness stopped typing into a modelled screen and now passes the baseline prompt as a positional argument -- visible here as the ping appended to each interactive arm's command. Whoever changes probeArgv again must re-take all of them, or the set rests on readings of an instrument that is gone.
+Record-Id: r-acp1009readings
+Provenance: inherited 2ea54a5c8a1b01138aae02470f1913c550ebd7bf
+
+Limit: the acceptance rule recomputes a committed reading's verdict from that reading's own runs, which closes a stored verdict authorizing its own file but does not establish that a live ceremony produced the file. Every fact it compares -- the four arms, the counts, each arm's argv, each arm's image digest -- is a statement inside the artifact being judged. A fabricated but internally consistent reading is admitted, and nothing here can tell it from a measured one.
+Ruled-out: giving the wake-carrying count the same body test as the baseline | the wake token arrives inside client-composed prose rather than as a message equal to the token, so an exact user-text match would count zero on a working wake; the whole-body search is also the stricter test for the control arm's claim of no wake-carrying turn, since it sees the token wherever it appears
+Warn: two falsifiability rows here kill at a predicate rather than at the branch that acts, because the acting branch -- the arm's spawn and its refusal to proceed without a baseline -- runs only inside a live arm, which skips where no client is installed. Their stated claims were narrowed to what their tests observe. Read the narrow claim as the whole guarantee, not as shorthand for the wider one, and do not widen a row's wording without moving its anchor to a site CI reaches.
+Record-Id: r-acp1009r4
+Provenance: inherited 42405e63101e0eb8b1bad0c6e7089898eeb65925
+
+Limit: a reader of this repository can recompute each arm's four counts over the texts kept verbatim, and can see that no other text was dropped rather than accounted for, but cannot recompute over a withheld text's contents. That needs the raw capture, which is not committed and which each arm names by digest. The record shows what its counts are read from; it does not prove the zero the control arm claims.
+Ruled-out: keeping every model-input text verbatim so the control arm's zero is recomputable by any reader | the texts that make the zero recomputable are the client's system prompt, and publishing them in a public repository is the thing that cannot be traded for it
+Warn: the first version of this record published every text the model read, and this repository is public, so each reading carried roughly 220 KB of the client's own system prompt. That is vendor product content and it is exactly what a public artifact here may not carry. The shape that ships keeps verbatim only the two texts a count is read from -- the arm's own prompt, and the prose the client composed around the wake token -- and accounts for every other text by its length and digest. Anyone widening what is kept verbatim is widening what this repository publishes; check the repository's visibility before doing it.
+Record-Id: r-acp1009obs
+Provenance: inherited 62d5f576d876ed47da0a39c9c54902420971fc7f
+
+Ruled-out: reconstructing the boundary from the requests themselves, by taking the position of the first request that carries the prompt | that asks where the prompt sits in the sequence rather than what existed when the frame was written, and the two answers differ on exactly the build the ceremony exists to refuse
+Warn: an arm's injection boundary is recorded because it cannot be recovered afterwards. Deriving the counts from committed observations removed a stored verdict as an authority but also removed the one thing only the live run knew -- when the frame was written. The first derivation reconstructed it from the position of the first prompt-bearing request, and a session that sent a token-bearing turn before the frame and then ignored the frame entirely was admitted on all four arms. Anything that recomputes an arm's counts must split them at the recorded boundary, never at a request's contents.
+Record-Id: r-acp1009bound
+Provenance: inherited 112d252923c3d142ec01b83109ab8d03deb97047
