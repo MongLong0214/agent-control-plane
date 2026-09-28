@@ -1073,6 +1073,29 @@ export interface ProbeOptions {
    * build from the one the reading names (`pinClaudeImage`).
    */
   readonly image: HeldImage;
+  /**
+   * Ceiling on the wait for the arm's own prompt to become a turn. The live default is generous
+   * because a cold client start is slow; a row that is measuring the refusal passes a short one.
+   */
+  readonly baselineCeilingMs?: number;
+  /**
+   * How the arm's process is started. `spawn`, unless a row is driving this probe where no client
+   * is installed.
+   *
+   * The one boundary that has to be injectable for the probe's own decisions to be observable
+   * offline: what it starts, and what it refuses to proceed without. Everything else stays real
+   * when a row supplies this -- the temp root, the fake provider, the socket, the frame, the
+   * teardown -- so what a row measures is this function's behaviour and not a model of it.
+   *
+   * `qualify()` never passes it, so nothing a committed reading rests on comes through here. A
+   * receipt produced with an injected starter would be a receipt of a process nobody spawned, and
+   * the way that is prevented is that the one producer does not offer it.
+   */
+  readonly startProcess?: (
+    executable: string,
+    argv: readonly string[],
+    options: { readonly env: NodeJS.ProcessEnv; readonly cwd: string; readonly stdio: readonly ["pipe", "pipe", "pipe"] },
+  ) => ChildProcessWithoutNullStreams;
 }
 
 /**
@@ -1177,7 +1200,10 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
     );
     const command = plan.command;
 
-    child = spawn(plan.executable, plan.argv, {
+    // `plan.executable` and `plan.argv`, unchanged and unaccompanied: the plan is the one decision
+    // about what runs, and anything added here would be an invocation the reading does not record.
+    const startProcess = options.startProcess ?? spawn;
+    child = startProcess(plan.executable, plan.argv, {
       env,
       cwd: workDir,
       stdio: ["pipe", "pipe", "pipe"],
@@ -1213,7 +1239,7 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
     // that it had.
     const baselineSeen = await waitFor(
       () => baselineTurnObserved(readFileSync(capturePath, "utf8"), BASELINE_PROMPT),
-      120_000,
+      options.baselineCeilingMs ?? 120_000,
     );
     if (!baselineSeen) {
       throw new Error(

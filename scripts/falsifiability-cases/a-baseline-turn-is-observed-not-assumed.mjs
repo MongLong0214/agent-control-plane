@@ -13,10 +13,12 @@
  * feeds an empty capture, a whitespace-only one, and one holding only a request to another endpoint,
  * and requires each to be "no turn seen".
  *
- * **What this row does not reach**: the predicate, not the refusal. The arm's `if (!baselineSeen)`
- * branch -- the line that actually throws and fails the run -- is executed only when a real client
- * has been started, so no row that must die where no client is installed can be anchored there. The
- * claim is narrowed to the predicate accordingly.
+ * This row is the predicate; the branch that acts on it is `an-unobserved-baseline-stops-the-arm`,
+ * anchored at the `if (!baselineSeen)` refusal itself. That branch was previously called unreachable
+ * where no client is installed and this claim was narrowed on that ground; a reviewer refuted it by
+ * bypassing the refusal through injected boundaries with every selected offline body still passing.
+ * So the refusal is anchored rather than argued about, and between the two rows the predicate and the
+ * act each have a row that dies without them.
  */
 const aBaselineTurnIsObservedNotAssumed = {
   id: "a-baseline-turn-is-observed-not-assumed",

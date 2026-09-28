@@ -22,7 +22,11 @@
  * and fixture readings in `wake-transport-readings.test.ts`. Whenever this row passes, the committed
  * set and its readings agree, so a rule this row never trips here is still shown to trip there.
  */
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { afterAll, describe, expect, it } from "vitest";
 
@@ -35,7 +39,9 @@ import {
   armPassed,
   baselineTurnObserved,
   interactiveBlocker,
+  REPO_ROOT,
   countsFrom,
+  holdImage,
   modelInputTexts,
   modelRequestsIn,
   observationsFrom,
@@ -47,6 +53,7 @@ import {
   readReadings,
   runQualificationProbe,
   wakeCarryingTurnsIn,
+  type HeldImage,
   type PinnedClaudeImage,
   type ProbeRun,
 } from "./wake-transport-qualification/harness.ts";
@@ -504,6 +511,113 @@ describe("U6: the session log is decoded as a stream, not per read", () => {
     truncated.push(glyph.subarray(0, 2));
     expect(truncated.text()).toBe("\uFFFD");
   });
+});
+
+/**
+ * The probe's own two decisions, driven where no client is installed.
+ *
+ * These rows exist because a reviewer refuted the reason the previous ones were narrowed. The
+ * claim was that the `spawn` call and the `if (!baselineSeen)` refusal run only inside a live arm,
+ * so no row that must die where no client is installed could be anchored at either; the reviewer
+ * drove both through injected boundaries and showed a mutation at either site left all 24 selected
+ * offline test bodies green. The branches are reachable, so the rows are anchored at them.
+ *
+ * One boundary is injected and no more: the function that starts the process. The temp root, the
+ * fake provider, the unix socket, the production wake frame, the capture and the teardown are all
+ * the real ones, so what these rows measure is the probe rather than a model of it. What stands in
+ * for the client is `./wake-transport-qualification/fake-client.ts`, which is not evidence about any
+ * client and is not used by `qualify()` -- it binds where its argv tells it to and answers with one
+ * turn, which is exactly enough for the probe's decisions to be observable.
+ */
+describe("U6: what the probe starts, and what it refuses to proceed without", () => {
+  const CAPTURE_DIR = "evidence/local/u6-wake-transport-offline";
+  const FAKE_CLIENT = fileURLToPath(new URL("./wake-transport-qualification/fake-client.ts", import.meta.url));
+
+  let image: HeldImage | undefined;
+  /** A held image of a file that is not a client: nothing executes it, and `confirmHeld` re-reads it. */
+  const stand = (): HeldImage => {
+    if (image) return image;
+    const scratch = mkdtempSync("/private/tmp/acp-u6q-stand-");
+    const file = join(scratch, "claude");
+    writeFileSync(file, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    return (image = holdImage(file));
+  };
+  afterAll(() => {
+    image?.release();
+    rmSync(join(REPO_ROOT, CAPTURE_DIR), { recursive: true, force: true });
+  });
+
+  /** Records what the probe asked to start, then starts the stand-in with exactly that argv. */
+  const starter = (
+    started: { executable: string; argv: readonly string[] }[],
+    firstTurn?: string,
+  ) => (
+    executable: string,
+    argv: readonly string[],
+    options: { readonly env: NodeJS.ProcessEnv; readonly cwd: string },
+  ): ChildProcessWithoutNullStreams => {
+    started.push({ executable, argv: [...argv] });
+    return spawn(process.execPath, [FAKE_CLIENT, ...argv], {
+      env: firstTurn === undefined ? options.env : { ...options.env, ACP_FAKE_CLIENT_TURN: firstTurn },
+      cwd: options.cwd,
+      stdio: ["pipe", "pipe", "pipe"],
+    }) as ChildProcessWithoutNullStreams;
+  };
+
+  it("starts the invocation its reading records, and nothing beside it", async () => {
+    const started: { executable: string; argv: readonly string[] }[] = [];
+    const run = await runQualificationProbe({
+      shape: "headless",
+      inject: true,
+      captureDir: CAPTURE_DIR,
+      image: stand(),
+      settleCeilingMs: 3_000,
+      baselineCeilingMs: 30_000,
+      startProcess: starter(started),
+    });
+
+    // One start, of the held link, with the plan's argv -- and the reading's `command` is that same
+    // invocation. A flag added at the spawn and not to the plan is the divergence a reader of the
+    // reading could never detect, and it is what this equality refuses.
+    expect(started).toHaveLength(1);
+    expect(started[0]?.executable).toBe(stand().executable);
+    expect([started[0]?.executable, ...(started[0]?.argv ?? [])]).toEqual(run.command);
+    // Path-independent and exact about the part that decides the shape: the flags the process was
+    // started with are the flags `probeArgv` builds for this shape, in that order.
+    const flagsOf = (argv: readonly string[]): readonly string[] => argv.filter((word) => word.startsWith("-"));
+    expect(flagsOf(started[0]?.argv ?? [])).toEqual(
+      flagsOf(probeArgv("headless", { settingsPath: "/s/settings.json", socketPath: "/s/i.sock" })),
+    );
+    expect(isInteractiveClaudeInvocation(run.command)).toBe(false);
+
+    // And the arm really ran through the probe's own path: the production frame reached the model
+    // input of the process it started, and the counts came out of the capture.
+    expect(run.wakeCarryingModelRequests).toBe(1);
+    expect(run.followUpAfterInjection).toBe(true);
+    expect(armPassed(run)).toBe(true);
+    expect(run.observations?.requests).toHaveLength(2);
+  }, 90_000);
+
+  it("refuses an arm whose prompt never became a turn, rather than measuring against nothing", async () => {
+    // The refusal, at the branch that acts. The stand-in takes its start, binds its socket and
+    // takes a turn -- just not this arm's prompt -- so everything except the one observation this
+    // arm needs is present. Proceeding would leave `followUpAfterInjection` comparing the wake
+    // against a count that never included the prompt, and the arm would report a pass for a session
+    // that never accepted it.
+    const started: { executable: string; argv: readonly string[] }[] = [];
+    await expect(
+      runQualificationProbe({
+        shape: "headless",
+        inject: true,
+        captureDir: CAPTURE_DIR,
+        image: stand(),
+        settleCeilingMs: 1_000,
+        baselineCeilingMs: 5_000,
+        startProcess: starter(started, "some other turn entirely"),
+      }),
+    ).rejects.toThrow(/sent no model request carrying "ping", the prompt it was started with/);
+    expect(started).toHaveLength(1);
+  }, 90_000);
 });
 
 describe.skipIf(blocker !== null)("U6: the reading, re-taken", () => {

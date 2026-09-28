@@ -14,11 +14,13 @@
  * interactive one must be accepted, the headless one refused, so the row cannot pass by saying yes
  * to everything.
  *
- * **What this row does not reach**, narrowed deliberately after a review found it claimed more: it
- * is about `probeArgv`'s output and nothing else. What an arm actually starts is
- * `the-arm-executes-the-invocation-it-records`'s subject, and the `spawn()` call that consumes the
- * plan is exercised only by the live arms, which do not run where no client is installed. An honest
- * narrow claim beats a wide one nothing checks.
+ * This row is about `probeArgv`'s output. That the shape survives into the process is two further
+ * rows: `the-arm-executes-the-invocation-it-records` for the plan, and
+ * `the-arm-starts-the-plan-and-nothing-beside-it` for the call that consumes it -- the latter driving
+ * the real probe through an injected process boundary, which is how a flag appended at the spawn and
+ * not to the plan dies. That call was previously called unreachable where no client is installed and
+ * this claim was narrowed on that ground; a reviewer refuted it by executing the branch, so the three
+ * rows between them now cover argv, plan and start.
  */
 const theInteractiveArmIsTheShapeTheClaimAccepts = {
   id: "the-interactive-arm-is-the-shape-the-claim-accepts",

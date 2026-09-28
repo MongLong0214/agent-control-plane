@@ -6,12 +6,12 @@
  * through all three moves; the resolved path does not survive any of them. The killing row makes
  * the three moves and reads the held name after each.
  *
- * **What this row does not reach**, narrowed after a review found it claimed the arm's execution:
- * it is about what the hold *names*, measured by a test that reads that name. What an arm starts is
- * now structurally narrowed instead of asserted -- `spawnPlanFor` takes only `{ executable }`, so
- * the resolved launcher path is not a field the spawn decision can reach -- and the plan's own row
- * is `the-arm-executes-the-invocation-it-records`. The `spawn()` call itself runs only in a live
- * arm.
+ * This row is about what the hold *names*, measured by a test that reads that name. That the name is
+ * what an arm starts is carried the rest of the way by two things: `spawnPlanFor` takes only
+ * `{ executable }`, so the resolved launcher path is not a field the spawn decision can reach, and
+ * `the-arm-starts-the-plan-and-nothing-beside-it` drives the real probe through an injected process
+ * boundary and requires that the executable started is the held link the plan named. That call was
+ * previously called live-only here; a reviewer refuted it by executing the branch offline.
  */
 const everyArmExecutesTheHeldLink = {
   id: "every-arm-executes-the-held-link",
