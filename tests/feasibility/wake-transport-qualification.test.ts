@@ -534,12 +534,19 @@ describe("U6: what the probe starts, and what it refuses to proceed without", ()
   const FAKE_CLIENT = fileURLToPath(new URL("./wake-transport-qualification/fake-client.ts", import.meta.url));
 
   let image: HeldImage | undefined;
-  /** A held image of a file that is not a client: nothing executes it, and `confirmHeld` re-reads it. */
+  /**
+   * A held image of a file that is not a client and carries no exec bit.
+   *
+   * `holdImage` links and digests; it does not require the file to be executable, and the row
+   * injects the function that starts a process, so nothing here ever execs this inode. Writing it
+   * without the exec bit is the honest form of that -- an exec bit would say an exec is intended --
+   * and `confirmHeld` still re-reads the same bytes at the end of the run.
+   */
   const stand = (): HeldImage => {
     if (image) return image;
     const scratch = mkdtempSync("/private/tmp/acp-u6q-stand-");
     const file = join(scratch, "claude");
-    writeFileSync(file, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    writeFileSync(file, "not a client: never executed, only linked and digested\n");
     return (image = holdImage(file));
   };
   afterAll(() => {
