@@ -223,17 +223,32 @@ export interface LocalMcpListeners {
   close(): Promise<void>;
 }
 
-/** Main's live listener composition: CEO CONFIRM is handed to the lock-held daemon. */
-export const startDaemonMcpListeners = (
+/**
+ * Main's live listener composition: CEO CONFIRM is handed to the lock-held daemon, and the CTO wake
+ * port is handed to its report.
+ *
+ * The second hand-over is what makes a binding that cannot receive wakes visible. It lives here
+ * rather than in `main` so a test holding a real `Daemon` and these real listeners exercises the
+ * same line production runs; `setWakeTransportPeers` is optional in this parameter only because
+ * several callers pass a bare `finalizeApprovedRun` object, and a real daemon always has it.
+ */
+export const startDaemonMcpListeners = async (
   cp: ControlPlane,
   stateDir: string,
   token: string,
-  daemon: { finalizeApprovedRun(runId: string): void | Promise<unknown>; attachments?: RoleAttachmentCredentials },
-): Promise<LocalMcpListeners> =>
-  startLocalMcpListeners(cp, stateDir, token, {
+  daemon: {
+    finalizeApprovedRun(runId: string): void | Promise<unknown>;
+    attachments?: RoleAttachmentCredentials;
+    setWakeTransportPeers?(peers: RoleConversationPort): void;
+  },
+): Promise<LocalMcpListeners> => {
+  const listeners = await startLocalMcpListeners(cp, stateDir, token, {
     onCeoApproved: (runId) => daemon.finalizeApprovedRun(runId),
     ...(daemon.attachments ? { attachments: daemon.attachments } : {}),
   });
+  daemon.setWakeTransportPeers?.(listeners.ctoConversation);
+  return listeners;
+};
 
 /** Tests shorten the deadline without weakening the daemon's production default. */
 export interface LocalMcpListenerOptions {

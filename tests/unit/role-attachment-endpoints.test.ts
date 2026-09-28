@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, type RoleBinding } from "../../src/domain/types.ts";
-import { C0_QUALIFIED_CLIENT, RoleConversationPort } from "../../src/mcp/role-conversation.ts";
+import { RoleConversationPort, WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
 
 // Filesystem qualification and wake delivery have socket tests. This fixture supplies a
 // qualified path so these assertions isolate slot ownership and endpoint collisions.
@@ -38,7 +38,7 @@ const fixture = async () => {
   vi.spyOn(port, "wake").mockResolvedValue(allow(ReasonCode.OK, undefined));
   const attach = (holder: RoleBinding) => {
     const server = new McpServer({ name: holder.sessionId, version: "1" });
-    vi.spyOn(server.server, "getClientVersion").mockReturnValue(C0_QUALIFIED_CLIENT);
+    vi.spyOn(server.server, "getClientVersion").mockReturnValue(WAKE_TRANSPORT_QUALIFIED_CLIENTS[0]);
     port.attach(server, () => denied.has(holder.roleKey)
       ? deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "peer authentication denied")
       : allow(ReasonCode.OK, { actor: holder.sessionId,

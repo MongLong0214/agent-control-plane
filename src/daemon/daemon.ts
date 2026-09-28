@@ -44,6 +44,10 @@ import {
   parseDeadBindingRecoveryRequest,
   type DeadBindingRecoveryReceipt,
 } from "./dead-binding-recovery.ts";
+import {
+  type UnwakeableHolder,
+  wakeTransportQualifiedLabels,
+} from "../mcp/role-conversation.ts";
 import { SingleInstanceLock } from "./single-instance.ts";
 
 /**
@@ -490,6 +494,13 @@ export class Daemon {
    * a live one (#841).
    */
   #buzzMentionReceipt: { startedAtMs: number; configuredIdentities: number; counters(): BuzzMentionCounters } | null = null;
+  /**
+   * The CTO wake port's live peers, as the composition root handed them over. Null until
+   * `startDaemonMcpListeners` installs it, and a daemon with no listeners has no peer to report on.
+   * A handle rather than a snapshot, for the reason `#buzzMentionReceipt` gives: peers connect and
+   * leave while the daemon runs.
+   */
+  #wakeTransportPeers: { unwakeableHolders(): readonly UnwakeableHolder[] } | null = null;
   #telegramIngressController: TelegramIngressController | null = null;
   #continuityCoordinatorInstalled = false;
   #continuityReconciling = false;
@@ -648,7 +659,7 @@ export class Daemon {
           // is the on-demand escape hatch. A targeted or non-system call is diagnostic only,
           // exactly as before, and does not touch the persisted snapshot.
           if (scope === "system" && target === undefined) {
-            return allow(ReasonCode.OK, await this.runSystemDoctorCheck(this.supplementalSystemFindings()));
+            return allow(ReasonCode.OK, await this.runSystemDoctorCheck());
           }
           return allow(ReasonCode.OK, await this.cp.doctor.run(
             scope,
@@ -1322,8 +1333,31 @@ export class Daemon {
    * refusal would be a condition that can never fire — a guard that reads as coverage and
    * enforces nothing. What was missing was never a fence; it was an ordering the reader could
    * compare. That ordering is `generation`, and it is enforced where the comparison happens.
+   *
+   * The supplemental findings are read here and not passed in, for the same reason the persist is
+   * here: a guarantee a caller has to remember is one some caller forgets. They were a parameter
+   * defaulting to `[]`, and only the operator door passed them, so `reconcile()` and the
+   * periodic/reactive refresh evaluated without them. A connected holder outside the qualified set
+   * then made an on-demand report `DEGRADED` while the next automatic evaluation, clean in every
+   * other respect, wrote `HEALTHY` to `health.json` with that holder still unwakeable -- the silence
+   * this finding exists to end, back one layer up. Every caller of this method -- `reconcile()`,
+   * the periodic and reactive `doctor_refresh`, and the operator's `DOCTOR_RUN` -- produces the
+   * status `health.json` serves, and a status that omits a finding it could have read is a status
+   * that says something false.
+   *
+   * The other `doctor.run("system")` callers, and what each does with them:
+   *   - the bootstrap park's doctor-only pass passes them too. It reads only whether the status is
+   *     `BLOCKED`/`ERROR`, which these non-blocking findings cannot change, but its report is
+   *     audited as `DOCTOR_REPORT` like any other and should not say less than one taken here.
+   *   - `Watchdog.tick` does not, and cannot change a status by it: it runs the system scope only
+   *     with a blocking `WATCHDOG_STALL` of its own, so its status is `BLOCKED` or worse with or
+   *     without non-blocking findings, and it lives in the control plane, which has no daemon.
+   *   - the CTO and Hermes MCP `doctor_run` tools do not: their ports are composed from the control
+   *     plane alone, so an agent peer asking there can still read `HEALTHY` while a holder is
+   *     unwakeable. Carrying them there would change what an agent peer's report contains, which
+   *     this does not decide; `health.json` and `DAEMON_STATUS` are the surfaces that cannot omit it.
    */
-  private async runSystemDoctorCheck(supplementalFindings: readonly Finding[] = []): Promise<DoctorReport> {
+  private async runSystemDoctorCheck(): Promise<DoctorReport> {
     const startedAt = this.cp.clock.nowIso();
     let report: DoctorReport;
     // The `try` covers the evaluation and nothing else. It used to wrap the success path's
@@ -1336,7 +1370,7 @@ export class Daemon {
     // success. The generation mechanism was doing exactly what it should with a fact that was
     // not true. Persistence is not evaluation, and only the evaluation belongs in here.
     try {
-      report = await this.cp.doctor.run("system", undefined, supplementalFindings);
+      report = await this.cp.doctor.run("system", undefined, this.supplementalSystemFindings());
     } catch (err) {
       const generation = ++this.#doctorCompletions;
       this.#lastDoctorAttempt = {
@@ -1944,6 +1978,135 @@ export class Daemon {
   }
 
   /**
+   * Installs the CTO wake port so the report can name every binding that cannot receive a wake.
+   *
+   * A setter rather than a constructor argument: `run()`'s `supplementalFindings` is the seam a
+   * system finding belongs on, and it is the route the mention counters took through
+   * `setBuzzMentionReceipt`. `startDaemonMcpListeners` calls it with the port it just built, which
+   * is the one seam a test can drive with a real daemon and real listeners, so the wiring is
+   * exercised rather than asserted.
+   */
+  setWakeTransportPeers(peers: { unwakeableHolders(): readonly UnwakeableHolder[] }): void {
+    this.#wakeTransportPeers = peers;
+  }
+
+  /**
+   * A binding that is active and whose holder cannot receive a wake.
+   *
+   * `registerEndpoint` refuses a peer whose declared build is outside the qualified set, and a
+   * binding with no registered endpoint gets no wakes: `wake` refuses, and the Buzz ingress stores
+   * the message and waits for a registration that will never come. Every piece of that is correct
+   * on its own terms and none of it is loud, so the only symptom was that wakes silently did not
+   * arrive -- the #674 shape again, a binding reading ACTIVE while nothing can reach it, with a
+   * different cause. On 2026-09-27 that was every live client on the host: three builds, none of
+   * them a member.
+   *
+   * The build is one of five causes and not the definition. A holder on a qualified build that has
+   * registered no endpoint, or whose registered endpoint no longer validates, is exactly as
+   * unreachable -- and until 2026-09-28 the scan returned early on a qualified build, so that was
+   * the one state nothing reported. Each cause gets its own sentence and its own repair, because
+   * they are different operator acts: a restart on a member, a `clientInfo` in the handshake, a
+   * `--messaging-socket-path` the daemon will accept, a state directory whose ownership and mode
+   * have been put back, or a restart after a listener died behind a socket file that outlived it.
+   *
+   * One finding per binding, because the repair is per holder and an operator has to know which is
+   * which. The evidence names the role key, the build the connection declared, the cause, and the
+   * qualified set, and never a path: the port answers in `name/version` labels and cause names for
+   * the reason its `EndpointCheck` gives.
+   *
+   * Reported rather than refused. The binding is legitimately held: the claim that admitted its
+   * holder observes the executing image and compares it to no build, so nothing about the build
+   * made the hold wrong. What the holder lacks is a qualified transport, and there is no refusal
+   * that supplies one. Revoking the binding would lose the conversation it exists to keep and
+   * still deliver no wake, because a successor on the same build is refused the endpoint the same
+   * way. The repairs are operator acts, so what this finding owes is to make a condition whose
+   * every piece is quiet loud -- and to name only a repair that is open. A restart on a member is
+   * open to every holder on a build. Qualifying the holder's own build is open only while a file of
+   * that build can still be started, and the updater deletes old versions under running sessions
+   * (measured 2026-09-28: a live session on 2.1.278, its version file gone), so the text offers it
+   * conditionally. A holder that has declared no build is either mid-`initialize`, which ends on
+   * its own, or omitting `clientInfo`, which a restart that sends the same request does not fix.
+   */
+  private unwakeableBindingFindings(): Finding[] {
+    const holders = this.#wakeTransportPeers?.unwakeableHolders() ?? [];
+    return holders.map((holder): Finding => {
+      // The consequence is one sentence for all four -- the binding is active and no wake reaches
+      // it -- so only the cause and the repair branch. A holder that declared no build is refused
+      // the endpoint exactly as one outside the set is; what differs is that there is no build to
+      // qualify and no name to put in the text.
+      const { cause, repair } = ((): { cause: string; repair: string } => {
+        switch (holder.cause) {
+          case "no-declared-build":
+            return {
+              cause: "its holder's connection has declared no client build",
+              repair:
+                "A holder still completing `initialize` needs nothing: once it declares a qualified build it " +
+                "can register, and a later report names that build. One that keeps declaring none has to send " +
+                "`clientInfo` in its `initialize` request; restarting it on the same request changes nothing",
+            };
+          case "build-outside-the-qualified-set":
+            return {
+              cause: `its holder runs ${holder.presented}, which is not a build this wake transport was qualified on`,
+              repair:
+                "Restart the holder on a qualified build. Qualifying this build instead (`pnpm " +
+                "qualify:wake-transport` pointed at it, then adding it to the set) needs a file of the build " +
+                "that can still be started, and the updater may already have deleted the one the holder runs",
+            };
+          case "no-registered-endpoint":
+            return {
+              cause: `its holder runs ${holder.presented}, a qualified build, and has registered no wake endpoint on this connection`,
+              repair:
+                "Start the holder with `--messaging-socket-path` naming a socket directly inside this " +
+                "deployment's owner-only state directory, which is the only place a registration is accepted " +
+                "from; a client started without it binds its inbox elsewhere and is refused. A holder that has " +
+                "only just attached registers on its own a moment later, and a later report says so",
+            };
+          case "registered-endpoint-not-usable":
+            return {
+              cause:
+                `its holder runs ${holder.presented}, a qualified build, and the wake endpoint it registered no ` +
+                "longer passes the checks made before a wake is sent",
+              repair:
+                "Its socket has gone, or the state directory it sits in is no longer a directory this uid owns " +
+                "with owner-only permissions. Put the directory back, then have the holder register again -- a " +
+                "restart does that, and nothing re-registers on its own",
+            };
+          case "registered-endpoint-refused-the-wake":
+            return {
+              cause:
+                `its holder runs ${holder.presented}, a qualified build whose registered wake endpoint still ` +
+                "passes every check made before a wake is sent, and the last wake sent under the registration it " +
+                "holds now was refused",
+              repair:
+                "The socket file outlived whatever was listening on it, which is what a client that exited " +
+                "without cleaning up leaves behind. Restart the holder so it binds and registers again; nothing " +
+                "re-registers on its own, and this says a wake failed rather than that the next one must",
+            };
+        }
+      })();
+      return {
+        code: "ROLE_BINDING_CANNOT_RECEIVE_WAKES",
+        severity: "ERROR",
+        scope: "system",
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: {
+          roleKey: holder.roleKey,
+          role: holder.role,
+          presentedClient: holder.presented,
+          cause: holder.cause,
+          wakeTransportQualifiedClients: wakeTransportQualifiedLabels(),
+          wakeTransportPinSource: "src/mcp/role-conversation.ts WAKE_TRANSPORT_QUALIFIED_CLIENTS",
+        },
+        recommendedAction:
+          `binding ${holder.roleKey} is active and ${cause}, so it cannot receive wakes: a message addressed ` +
+          "to it is stored, not delivered, until a holder on a qualified build has a wake endpoint that takes " +
+          `a wake. ${repair}`,
+      };
+    });
+  }
+
+  /**
    * Whether anything has actually arrived on the Buzz mention path.
    *
    * The only operator-visible number here used to be the count of *configured identities*, which
@@ -1968,13 +2131,14 @@ export class Daemon {
   // one side refused whichever build the other accepted. The claim no longer pins a build — it
   // observes the executing image and compares it to nothing — so there is no second pin to
   // disagree with, and the composition root stopped handing the report a version. Only
-  // `registerEndpoint`'s qualified client still pins one. A finding kept past that point could
+  // `registerEndpoint`'s qualified set still names builds. A finding kept past that point could
   // only ever be raised by a caller that set the value by hand, and its text would describe a
   // refusal the claim no longer makes.
   private supplementalSystemFindings(): Finding[] {
     return [
       ...this.telegramIngressFindings(),
       ...this.buzzMentionSubscriberFindings(),
+      ...this.unwakeableBindingFindings(),
     ];
   }
 
@@ -2299,7 +2463,7 @@ export class Daemon {
         // on every operator observation destroys state a started daemon would have kept, and
         // the park has neither the delivery timer nor the continuity coordinator that make
         // those sweeps safe to act on.
-        const doctorReport = await this.cp.doctor.run("system");
+        const doctorReport = await this.cp.doctor.run("system", undefined, this.supplementalSystemFindings());
         if (this.#bootstrapAbandoned) return null;
         let blockingFindings = blockingFindingsOf(doctorReport);
 

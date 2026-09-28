@@ -21,8 +21,8 @@ import type { Readable, Writable } from "node:stream";
  *     Claude Code's `initialize` the presented credential, and the socket is refused
  *     `MCP_PEER_UNAUTHENTICATED`. `io.stdin` is therefore paused until the handshake is written.
  *   - **`clientInfo` is the client's own.** There is no JSON-RPC code path here at all, so the
- *     value `registerEndpoint` pins (`src/mcp/role-conversation.ts`, `C0_QUALIFIED_CLIENT`) is
- *     the real process's, not one this relay could compose.
+ *     value `registerEndpoint` checks for membership (`src/mcp/role-conversation.ts`,
+ *     `WAKE_TRANSPORT_QUALIFIED_CLIENTS`) is the real process's, not one this relay could compose.
  *   - **No retry, no reconnect, no backoff.** The credential is the session's own secret, whose
  *     hash is durable, so the daemon cannot tell a pre-restart plaintext from a post-restart one.
  *     "A credential taken before the ACP restart may not be reused" is enforced *here*: the

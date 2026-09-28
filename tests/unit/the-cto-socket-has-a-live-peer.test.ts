@@ -5,7 +5,7 @@ import { basename, join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { startLocalMcpListeners } from "../../src/daemon/agentcpd.ts";
-import { C0_QUALIFIED_CLIENT, ROLE_WAKE_FRAME, ROLE_WAKE_TOKEN } from "../../src/mcp/role-conversation.ts";
+import { ROLE_WAKE_FRAME, ROLE_WAKE_TOKEN, WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -116,8 +116,8 @@ const connectPeer = async (
   /**
    * What this peer says it is at `initialize`.
    *
-   * A parameter rather than a constant because the wake transport is pinned to one qualified
-   * client build, and a row that could not present an unqualified one could not tell a pin from
+   * A parameter rather than a constant because the wake transport is pinned to a set of qualified
+   * client builds, and a row that could not present an unqualified one could not tell a pin from
    * an unconditional accept.
    */
   clientInfo: { name: string; version: string } = { name: "cto-peer", version: "1" },
@@ -858,7 +858,7 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
     // may name stateDir; no other path is disclosed, in any field, whole or by basename.
     const privatePaths = [good.path, outside.path, notASocket, stateDir, elsewhere];
 
-    const qualified = await connectPeer(ctoSocket, { token: TOKEN, ...session }, C0_QUALIFIED_CLIENT);
+    const qualified = await connectPeer(ctoSocket, { token: TOKEN, ...session }, WAKE_TRANSPORT_QUALIFIED_CLIENTS[0]);
     let unqualified: PeerHandle | null = null;
     let wrongBuild: PeerHandle | null = null;
     try {
@@ -916,17 +916,18 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       expectNoPathLeak(unpinned, privatePaths);
       expect(listeners.ctoConversation.endpointFor(roleKey)).toBeNull();
 
-      // The **vendor is right and the build is wrong**, which is the half of the pin the peer
-      // above cannot reach: it declares a different name too, so `name !== ...` alone refuses it
-      // and the version comparison is never the reason. Measured, not reasoned about — deleting
-      // `client.version !== C0_QUALIFIED_CLIENT.version` from the condition left every row in this
-      // file green. The pin's whole claim is that a *newer build of the same client* is
-      // unqualified rather than newer-than-qualified, and this is the only row that says so.
+      // The **vendor is right and the build is wrong**, which is the half of membership the peer
+      // above cannot reach: it declares a different name too, so a name comparison alone refuses
+      // it and the version comparison is never the reason. Measured, not reasoned about — deleting
+      // the version comparison from the pin's condition left every row in this file green. The
+      // set's whole claim is that a *newer build of the same client* is unqualified rather than
+      // newer-than-qualified, and this is the only row that says so. The presented version
+      // *extends* a member's, so a prefix or floor comparison would admit it too.
       await unqualified.close();
       await until(() => !listeners.ctoConversation.connected(roleKey), "the unqualified peer to detach");
       wrongBuild = await connectPeer(ctoSocket, { token: TOKEN, ...session }, {
-        name: C0_QUALIFIED_CLIENT.name,
-        version: `${C0_QUALIFIED_CLIENT.version}.9999-not-the-qualified-build`,
+        name: WAKE_TRANSPORT_QUALIFIED_CLIENTS[0].name,
+        version: `${WAKE_TRANSPORT_QUALIFIED_CLIENTS[0].version}.9999-not-the-qualified-build`,
       });
       await until(() => wrongBuild?.initialized() === true, "the wrong-build peer's attach");
       const unqualifiedBuild = await wrongBuild.callTool("role_wake_endpoint_register", {
@@ -934,14 +935,14 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       });
       expect(unqualifiedBuild.ok).toBe(false);
       expect(unqualifiedBuild.reasonCode).toBe(ReasonCode.ROLE_PEER_UNSUPPORTED);
-      // `presented`/`qualified` are emitted by the pin branch and by nothing else here, so this
-      // pair is what attributes the refusal to the version comparison rather than to any of the
-      // path checks that share the reason code.
+      // `presented`/`qualified` are emitted by the membership branch and by nothing else here, so
+      // this pair is what attributes the refusal to the version comparison rather than to any of
+      // the path checks that share the reason code. `qualified` is the whole set, as labels.
       expect(unqualifiedBuild.evidence?.presented).toBe(
-        `${C0_QUALIFIED_CLIENT.name}/${C0_QUALIFIED_CLIENT.version}.9999-not-the-qualified-build`,
+        `${WAKE_TRANSPORT_QUALIFIED_CLIENTS[0].name}/${WAKE_TRANSPORT_QUALIFIED_CLIENTS[0].version}.9999-not-the-qualified-build`,
       );
-      expect(unqualifiedBuild.evidence?.qualified).toBe(
-        `${C0_QUALIFIED_CLIENT.name}/${C0_QUALIFIED_CLIENT.version}`,
+      expect(unqualifiedBuild.evidence?.qualified).toEqual(
+        WAKE_TRANSPORT_QUALIFIED_CLIENTS.map(({ name, version }) => `${name}/${version}`),
       );
       expectNoPathLeak(unqualifiedBuild, privatePaths);
       expect(listeners.ctoConversation.endpointFor(roleKey)).toBeNull();
@@ -986,7 +987,7 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
     if (!ctoSocket) throw new Error("the CTO MCP listener was not started");
     const endpoint = await listeningSocket(join(stateDir, "cto.wake.sock"));
 
-    const peer = await connectPeer(ctoSocket, { token: TOKEN, ...session }, C0_QUALIFIED_CLIENT);
+    const peer = await connectPeer(ctoSocket, { token: TOKEN, ...session }, WAKE_TRANSPORT_QUALIFIED_CLIENTS[0]);
     let successor: PeerHandle | null = null;
     try {
       await until(() => peer.initialized(), "the peer's attach");
@@ -1043,7 +1044,7 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       // every measure the registry has — and it did not register this endpoint. If availability
       // were keyed by role anywhere that outlives a connection, the successor would inherit it and
       // this wake would land on a socket the successor does not own.
-      successor = await connectPeer(ctoSocket, { token: TOKEN, ...session }, C0_QUALIFIED_CLIENT);
+      successor = await connectPeer(ctoSocket, { token: TOKEN, ...session }, WAKE_TRANSPORT_QUALIFIED_CLIENTS[0]);
       await until(() => successor?.initialized() === true, "the successor's attach");
       await until(() => listeners.ctoConversation.connected(roleKey), "the successor to hold the slot");
       expect(listeners.ctoConversation.endpointFor(roleKey)).toBeNull();
