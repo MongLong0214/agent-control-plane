@@ -34,6 +34,8 @@ const arm = (injected: boolean, metCriterion: boolean): ProbeRun => {
     shape: "interactive",
     injected,
     command: ["~/fixture/claude", "--messaging-socket-path", "/private/tmp/fixture/s/inbox.sock"],
+    // The digest of the fixture image below: every arm here ran the image its reading names.
+    imageSha256: "0".repeat(64),
     baselineModelRequests: 1,
     modelRequests: woke ? 2 : 1,
     wakeCarryingModelRequests: woke ? 1 : 0,

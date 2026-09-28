@@ -1,7 +1,7 @@
 /**
  * The system report includes the unwakeable-binding finding.
  *
- * `supplementalSystemFindings` is the one list every system-scope doctor run draws on. A finding
+ * `supplementalSystemFindings` is the one list the daemon's system-scope evaluations draw on. A finding
  * method nobody calls is correct code that reports nothing: the port would still answer, and no
  * operator would ever read the answer. The killing row runs the daemon's real `doctor.run` with a
  * holder outside the qualified set on the real CTO socket.

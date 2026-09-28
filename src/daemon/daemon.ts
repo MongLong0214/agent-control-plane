@@ -659,7 +659,7 @@ export class Daemon {
           // is the on-demand escape hatch. A targeted or non-system call is diagnostic only,
           // exactly as before, and does not touch the persisted snapshot.
           if (scope === "system" && target === undefined) {
-            return allow(ReasonCode.OK, await this.runSystemDoctorCheck(this.supplementalSystemFindings()));
+            return allow(ReasonCode.OK, await this.runSystemDoctorCheck());
           }
           return allow(ReasonCode.OK, await this.cp.doctor.run(
             scope,
@@ -1333,8 +1333,31 @@ export class Daemon {
    * refusal would be a condition that can never fire — a guard that reads as coverage and
    * enforces nothing. What was missing was never a fence; it was an ordering the reader could
    * compare. That ordering is `generation`, and it is enforced where the comparison happens.
+   *
+   * The supplemental findings are read here and not passed in, for the same reason the persist is
+   * here: a guarantee a caller has to remember is one some caller forgets. They were a parameter
+   * defaulting to `[]`, and only the operator door passed them, so `reconcile()` and the
+   * periodic/reactive refresh evaluated without them. A connected holder outside the qualified set
+   * then made an on-demand report `DEGRADED` while the next automatic evaluation, clean in every
+   * other respect, wrote `HEALTHY` to `health.json` with that holder still unwakeable -- the silence
+   * this finding exists to end, back one layer up. Every caller of this method -- `reconcile()`,
+   * the periodic and reactive `doctor_refresh`, and the operator's `DOCTOR_RUN` -- produces the
+   * status `health.json` serves, and a status that omits a finding it could have read is a status
+   * that says something false.
+   *
+   * The other `doctor.run("system")` callers, and what each does with them:
+   *   - the bootstrap park's doctor-only pass passes them too. It reads only whether the status is
+   *     `BLOCKED`/`ERROR`, which these non-blocking findings cannot change, but its report is
+   *     audited as `DOCTOR_REPORT` like any other and should not say less than one taken here.
+   *   - `Watchdog.tick` does not, and cannot change a status by it: it runs the system scope only
+   *     with a blocking `WATCHDOG_STALL` of its own, so its status is `BLOCKED` or worse with or
+   *     without non-blocking findings, and it lives in the control plane, which has no daemon.
+   *   - the CTO and Hermes MCP `doctor_run` tools do not: their ports are composed from the control
+   *     plane alone, so an agent peer asking there can still read `HEALTHY` while a holder is
+   *     unwakeable. Carrying them there would change what an agent peer's report contains, which
+   *     this does not decide; `health.json` and `DAEMON_STATUS` are the surfaces that cannot omit it.
    */
-  private async runSystemDoctorCheck(supplementalFindings: readonly Finding[] = []): Promise<DoctorReport> {
+  private async runSystemDoctorCheck(): Promise<DoctorReport> {
     const startedAt = this.cp.clock.nowIso();
     let report: DoctorReport;
     // The `try` covers the evaluation and nothing else. It used to wrap the success path's
@@ -1347,7 +1370,7 @@ export class Daemon {
     // success. The generation mechanism was doing exactly what it should with a fact that was
     // not true. Persistence is not evaluation, and only the evaluation belongs in here.
     try {
-      report = await this.cp.doctor.run("system", undefined, supplementalFindings);
+      report = await this.cp.doctor.run("system", undefined, this.supplementalSystemFindings());
     } catch (err) {
       const generation = ++this.#doctorCompletions;
       this.#lastDoctorAttempt = {
@@ -1988,8 +2011,13 @@ export class Daemon {
    * made the hold wrong. What the holder lacks is a qualified transport, and there is no refusal
    * that supplies one. Revoking the binding would lose the conversation it exists to keep and
    * still deliver no wake, because a successor on the same build is refused the endpoint the same
-   * way. The repair is a reading of that build or a restart on a member, both of them operator
-   * acts, so what this finding owes is to make a condition whose every piece is quiet loud.
+   * way. The repairs are operator acts, so what this finding owes is to make a condition whose
+   * every piece is quiet loud -- and to name only a repair that is open. A restart on a member is
+   * open to every holder on a build. Qualifying the holder's own build is open only while a file of
+   * that build can still be started, and the updater deletes old versions under running sessions
+   * (measured 2026-09-28: a live session on 2.1.278, its version file gone), so the text offers it
+   * conditionally. A holder that has declared no build is either mid-`initialize`, which ends on
+   * its own, or omitting `clientInfo`, which a restart that sends the same request does not fix.
    */
   private unwakeableBindingFindings(): Finding[] {
     const holders = this.#wakeTransportPeers?.unwakeableHolders() ?? [];
@@ -2001,10 +2029,12 @@ export class Daemon {
         ? "its holder's connection has declared no client build"
         : `its holder runs ${holder.presented}, which is not a build this wake transport was qualified on`;
       const repair = holder.presented === null
-        ? "Restart the holder on a qualified build. A holder still completing `initialize` has not " +
-          "declared its build yet, and a report taken after it has names that build instead"
-        : "Qualify that build with `pnpm qualify:wake-transport` pointed at it and add it to the " +
-          "qualified set, or restart the holder on a qualified build";
+        ? "A holder still completing `initialize` needs nothing: once it declares a qualified build it " +
+          "can register, and a later report names that build. One that keeps declaring none has to send " +
+          "`clientInfo` in its `initialize` request; restarting it on the same request changes nothing"
+        : "Restart the holder on a qualified build. Qualifying this build instead (`pnpm " +
+          "qualify:wake-transport` pointed at it, then adding it to the set) needs a file of the build " +
+          "that can still be started, and the updater may already have deleted the one the holder runs";
       return {
         code: "ROLE_BINDING_CANNOT_RECEIVE_WAKES",
         severity: "ERROR",
@@ -2020,8 +2050,8 @@ export class Daemon {
         },
         recommendedAction:
           `binding ${holder.roleKey} is active and ${cause}, so it cannot register a wake endpoint and ` +
-          "cannot receive wakes: a message addressed to it is stored and waits for a registration that " +
-          `will not come. ${repair}`,
+          "cannot receive wakes: a message addressed to it is stored, not delivered, until a holder on a " +
+          `qualified build registers. ${repair}`,
       };
     });
   }
@@ -2383,7 +2413,7 @@ export class Daemon {
         // on every operator observation destroys state a started daemon would have kept, and
         // the park has neither the delivery timer nor the continuity coordinator that make
         // those sweeps safe to act on.
-        const doctorReport = await this.cp.doctor.run("system");
+        const doctorReport = await this.cp.doctor.run("system", undefined, this.supplementalSystemFindings());
         if (this.#bootstrapAbandoned) return null;
         let blockingFindings = blockingFindingsOf(doctorReport);
 

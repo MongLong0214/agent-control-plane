@@ -13,7 +13,7 @@ const interactiveReadinessIsNotProse = {
   id: "interactive-readiness-is-not-prose",
   what: "the harness recognises the interactive prompt by the drawn caret, not by the prose hint in the stripped stream",
   file: "tests/feasibility/wake-transport-qualification/harness.ts",
-  find: "  const ready = cursorOnCaret;\n",
+  find: "  const ready = cursorOnCaret && rendered.unmodelled.length === 0;\n",
   replace: "  const ready = /for shortcuts/.test(strip(stream));\n",
   killedBy: [
     "tests/feasibility/wake-transport-readiness.test.ts::the prompt is recognised on the first screen of claude-code@2.1.283",

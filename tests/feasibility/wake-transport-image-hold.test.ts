@@ -1,0 +1,163 @@
+/**
+ * A reading names the image its arms executed, and a run whose arms could have executed another one
+ * does not produce a reading.
+ *
+ * Membership in the qualified set rests on one claim: the build is there because *its own reading*
+ * says it qualified. Before 2026-09-28 the receipt resolved and digested the launcher once, and each
+ * of the four arms resolved it again for itself. The launcher is a symlink the updater re-points, and
+ * the file behind it is one the updater renames over and deletes, so a reading could name image A
+ * while the arms that produced its verdict ran B -- a reading that cannot be falsified, because
+ * nothing in it says which file ran.
+ *
+ * The repair has three parts and each has a row here: the image is held once, as a hard link no
+ * updater can reach (`holdImage`); every arm executes that link and re-reads it after its
+ * measurement (`confirmHeld`); and a receipt refuses an arm whose digest is not the one it names
+ * (`buildReceipt`).
+ *
+ * Nothing here starts a client. The held files are data written by this test and never executed,
+ * except in the last row, which holds a hard link to this process's own interpreter -- an inode
+ * that has already run, so nothing new is assessed by the host (#817).
+ */
+import { createHash } from "node:crypto";
+import {
+  existsSync,
+  linkSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
+import { join } from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import { buildReceipt, confirmHeld, holdImage, pinClaudeImage, type ProbeRun } from "./wake-transport-qualification/harness.ts";
+import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+
+afterEach(cleanupTempDirs);
+
+const sha256 = (bytes: string | Buffer): string => createHash("sha256").update(bytes).digest("hex");
+
+/** A launcher symlink onto a versioned file, laid out the way the installer lays out the real one. */
+const installed = (bytes: string) => {
+  const root = tempDir("acp-u6q-hold-");
+  const versions = join(root, "versions");
+  mkdirSync(versions);
+  const version = join(versions, "2.1.283");
+  writeFileSync(version, bytes);
+  const launcher = join(root, "claude");
+  symlinkSync(version, launcher);
+  return { root, versions, version, launcher };
+};
+
+describe("a qualification run holds one image for its whole length", () => {
+  it("the held image outlives the updater re-pointing the launcher, renaming a new file over it, and deleting it", () => {
+    const original = "the bytes every arm was started on\n";
+    const { root, versions, version, launcher } = installed(original);
+
+    const held = holdImage(launcher, root);
+    try {
+      expect(held.path).toBe(realpathSync(version));
+      expect(held.executable).not.toBe(held.path);
+      expect(held.sha256).toBe(sha256(original));
+
+      // The updater's three moves, in the order it makes them. After each, the name the arms execute
+      // still holds the bytes the reading will name.
+      writeFileSync(join(versions, "2.1.284"), "the next build\n");
+      rmSync(launcher);
+      symlinkSync(join(versions, "2.1.284"), launcher);
+      expect(confirmHeld(held)).toBe(sha256(original));
+
+      const staged = join(versions, ".2.1.283.partial");
+      writeFileSync(staged, "the same version number over other bytes\n");
+      renameSync(staged, version);
+      expect(confirmHeld(held)).toBe(sha256(original));
+
+      rmSync(version);
+      expect(confirmHeld(held)).toBe(sha256(original));
+      expect(readFileSync(held.executable, "utf8")).toBe(original);
+    } finally {
+      held.release();
+    }
+    expect(existsSync(held.executable)).toBe(false);
+  });
+
+  it("a rewrite of the held inode in place fails the run, even one that keeps its size and modification time", () => {
+    const { root, version, launcher } = installed("AAAAAAAAAAAAAAAA\n");
+    // A whole-second modification time, so the rewrite below can put back exactly the value that was
+    // held and only the bytes differ.
+    utimesSync(version, 1_700_000_000, 1_700_000_000);
+
+    const held = holdImage(launcher, root);
+    try {
+      // `writeFileSync` truncates and writes the existing inode, so this reaches the link too: the one
+      // change the hold cannot keep out, and the one `confirmHeld` is there for.
+      writeFileSync(version, "BBBBBBBBBBBBBBBB\n");
+      utimesSync(version, 1_700_000_000, 1_700_000_000);
+
+      expect(() => confirmHeld(held)).toThrow(/digests to [0-9a-f]{64}, not the [0-9a-f]{64} it was held at/);
+    } finally {
+      held.release();
+    }
+  });
+
+  it("a reading cannot name an image one of its arms did not execute", () => {
+    const named = "a".repeat(64);
+    const arm = (injected: boolean, imageSha256: string | undefined): ProbeRun => ({
+      shape: "interactive",
+      injected,
+      command: ["/private/tmp/acp-u6q-img-fixture/2.1.283", "--messaging-socket-path", "/private/tmp/fixture/s/i.sock"],
+      ...(imageSha256 === undefined ? {} : { imageSha256 }),
+      baselineModelRequests: 1,
+      modelRequests: injected ? 2 : 1,
+      wakeCarryingModelRequests: injected ? 1 : 0,
+      followUpAfterInjection: injected,
+      settleCeilingMs: 20_000,
+      rawCapturePath: "evidence/local/fixture/capture.jsonl",
+      rawSessionLogPath: "evidence/local/fixture/session.log",
+      tempRootRemoved: true,
+    });
+    const receiptOf = (runs: readonly ProbeRun[]) =>
+      buildReceipt({
+        image: { path: "/fixture/versions/2.1.283", sha256: named, versionOutput: "2.1.283 (Claude Code)", version: "2.1.283" },
+        headSha: "0".repeat(40),
+        runs,
+        limits: [],
+        findings: [],
+      });
+
+    // The control: both arms ran the named image, and the arms met the criterion, so it qualifies.
+    expect(receiptOf([arm(true, named), arm(false, named)]).verdict).toBe("qualified");
+
+    // The control arm ran another image. Every number in it is still a pass, which is exactly why
+    // the verdict cannot be the place this is caught.
+    expect(() => receiptOf([arm(true, named), arm(false, "b".repeat(64))])).toThrow(
+      `arm 2 (interactive, control) executed an image whose digest is ${"b".repeat(64)}, not the ${named} this reading would name`,
+    );
+    // An arm that cannot say what it ran is refused the same way.
+    expect(() => receiptOf([arm(true, undefined), arm(false, named)])).toThrow(
+      `arm 1 (interactive, injection) executed an image whose digest is not recorded, not the ${named} this reading would name`,
+    );
+  });
+
+  it("the version is asked of the held link, so the version, the digest and every exec are of one inode", () => {
+    const root = tempDir("acp-u6q-pin-");
+    const launcher = join(root, "interpreter");
+    linkSync(process.execPath, launcher);
+
+    const image = pinClaudeImage(launcher, root);
+    try {
+      expect(image.version).toBe(process.version);
+      expect(image.sha256).toBe(sha256(readFileSync(process.execPath)));
+      expect(image.executable.startsWith(root)).toBe(true);
+      expect(confirmHeld(image)).toBe(image.sha256);
+    } finally {
+      image.release();
+    }
+    expect(existsSync(image.executable)).toBe(false);
+  });
+});

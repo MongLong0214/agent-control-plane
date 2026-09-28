@@ -22,7 +22,7 @@
  * and fixture readings in `wake-transport-readings.test.ts`. Whenever this row passes, the committed
  * set and its readings agree, so a rule this row never trips here is still shown to trip there.
  */
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 
 import {
   MEASURED_CLIENT_NAME,
@@ -31,10 +31,11 @@ import {
   SUITE_CAPTURE_DIR,
   armPassed,
   interactiveBlocker,
+  pinClaudeImage,
   qualificationDisagreements,
   readReadings,
-  resolveClaudeImage,
   runQualificationProbe,
+  type PinnedClaudeImage,
   type ProbeRun,
 } from "./wake-transport-qualification/harness.ts";
 import {
@@ -135,6 +136,12 @@ describe("U6: the wake transport admits only builds a committed reading qualifie
 });
 
 describe.skipIf(blocker !== null)("U6: the reading, re-taken", () => {
+  // Held once for both arms and every row, as `qualify()` holds it: an arm that resolved the client
+  // for itself could run a build other than the one the rows below ask about.
+  let held: PinnedClaudeImage | undefined;
+  const image = (): PinnedClaudeImage => (held ??= pinClaudeImage());
+  afterAll(() => held?.release());
+
   const measured = new Map<string, Promise<ProbeRun>>();
   const probe = (inject: boolean): Promise<ProbeRun> => {
     const key = inject ? "injection" : "control";
@@ -145,7 +152,7 @@ describe.skipIf(blocker !== null)("U6: the reading, re-taken", () => {
     // SUITE_CAPTURE_DIR, never RAW_CAPTURE_DIR: this run is a check, not a qualification, and the
     // receipt's `rawCapturePath` rows must keep pointing at the run that produced the receipt
     // (#837). The parameter is required precisely so this line has to say which one it is.
-    const started = runQualificationProbe({ shape: "interactive", inject, captureDir: SUITE_CAPTURE_DIR });
+    const started = runQualificationProbe({ shape: "interactive", inject, captureDir: SUITE_CAPTURE_DIR, image: image() });
     measured.set(key, started);
     return started;
   };
@@ -184,11 +191,11 @@ describe.skipIf(blocker !== null)("U6: the reading, re-taken", () => {
   it(
     "the build it measured is a member of the qualified set",
     async () => {
-      await probe(true);
-      const image = resolveClaudeImage();
-      expect(image).not.toBeNull();
-      if (image === null) return;
-      expect(isWakeTransportQualified({ name: MEASURED_CLIENT_NAME, version: image.version })).toBe(true);
+      // The build the arm ran, not the one the launcher names now: the arm's own digest, read after
+      // its measurement, is the held image's, and the version asked of is the one that image printed.
+      const run = await probe(true);
+      expect(run.imageSha256).toBe(image().sha256);
+      expect(isWakeTransportQualified({ name: MEASURED_CLIENT_NAME, version: image().version })).toBe(true);
     },
     PROBE_TIMEOUT_MS,
   );

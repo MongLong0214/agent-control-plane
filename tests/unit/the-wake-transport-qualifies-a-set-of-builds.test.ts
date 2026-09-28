@@ -1,4 +1,6 @@
+import { readFileSync } from "node:fs";
 import { createConnection, type Socket } from "node:net";
+import { join } from "node:path";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -6,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { allow, type Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startDaemonMcpListeners } from "../../src/daemon/agentcpd.ts";
+import { aggregate, type DoctorReport } from "../../src/doctor/doctor.ts";
 import { Daemon, OPERATOR_METHOD, type AuthenticatedOperatorPeer } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../../src/domain/types.ts";
 import {
@@ -142,7 +145,7 @@ describe("the daemon reports a binding that cannot receive wakes", () => {
   };
 
   /** Starts a real daemon with the production listener composition, and one CTO holder on it. */
-  const holderOn = async (label: string, client: { name: string; version: string } | undefined) => {
+  const startHolder = async (label: string, client: { name: string; version: string } | undefined) => {
     const harness = makeHarness();
     harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
     const manifest = fixtureManifest(`wake-set-${label}`);
@@ -166,14 +169,22 @@ describe("the daemon reports a binding that cannot receive wakes", () => {
     const socket = await initializedPeer(listeners.socketPaths[1]!, {
       token: TOKEN, sessionId: session.sessionId, sessionSecret: session.sessionSecret,
     }, client);
+    const close = async (): Promise<void> => {
+      socket.destroy();
+      await listeners.close();
+      await daemon.stop();
+    };
+    return { harness, daemon, roleKey, stateDir, close };
+  };
 
+  /** The on-demand door: `OPERATOR_METHOD.DOCTOR_RUN`, the one an operator asks through. */
+  const holderOn = async (label: string, client: { name: string; version: string } | undefined) => {
+    const { daemon, roleKey, stateDir, close } = await startHolder(label, client);
     const response = await daemon.handleOperatorRequest(
       { requestId: `doctor-${label}`, method: OPERATOR_METHOD.DOCTOR_RUN, params: { scope: "system" } },
       PEER,
     );
-    socket.destroy();
-    await listeners.close();
-    await daemon.stop();
+    await close();
     expect(response.allowed).toBe(true);
     const findings = (response as { value: { findings: Array<{ code: string; observedEvidence?: Record<string, unknown>; recommendedAction?: string }> } })
       .value.findings;
@@ -195,6 +206,10 @@ describe("the daemon reports a binding that cannot receive wakes", () => {
     });
     expect(finding?.recommendedAction).toContain(presented);
     expect(finding?.recommendedAction).toContain("cannot receive wakes");
+    // The repair open to every such holder comes first; qualifying its build is offered only with
+    // the condition that closes it -- the updater may have deleted the file the holder runs.
+    expect(finding?.recommendedAction).toContain("Restart the holder on a qualified build");
+    expect(finding?.recommendedAction).toContain("may already have deleted");
 
     // Not the state directory, not the socket beside it, and no absolute path of any kind.
     const text = JSON.stringify(finding);
@@ -218,6 +233,10 @@ describe("the daemon reports a binding that cannot receive wakes", () => {
     expect(finding?.recommendedAction).toContain("declared no client build");
     expect(finding?.recommendedAction).toContain("cannot receive wakes");
     expect(finding?.recommendedAction).not.toContain("null");
+    // Not a restart: mid-initialize ends on its own, and a missing `clientInfo` survives a restart
+    // that sends the same request.
+    expect(finding?.recommendedAction).toContain("`clientInfo`");
+    expect(finding?.recommendedAction).not.toMatch(/restart the holder on/i);
 
     const text = JSON.stringify(finding);
     expect(text).not.toContain(stateDir);
@@ -229,6 +248,56 @@ describe("the daemon reports a binding that cannot receive wakes", () => {
     const { findings } = await holderOn("member", { ...WAKE_TRANSPORT_QUALIFIED_CLIENTS[0] });
 
     expect(findings).not.toContainEqual(expect.objectContaining({ code: CODE }));
+  });
+
+  /**
+   * The automatic door: a continuity reconciliation, which the periodic capacity-sensor tick and
+   * the reactive provider-failure callback both route through, and which re-evaluates the doctor
+   * and writes the status to `health.json` -- the file `DAEMON_STATUS` serves and a supervisor reads.
+   *
+   * This is the path the on-demand rows above never reach. When only the operator door carried the
+   * supplemental findings, an operator asking got `DEGRADED` and the next automatic evaluation,
+   * clean in every other respect, wrote `HEALTHY` over it while the holder was still unwakeable.
+   *
+   * "Clean in every other respect" is made literal: the doctor's own checks are replaced by none, so
+   * the status is `aggregate` -- production's -- over exactly what the daemon hands `run`. This
+   * fixture's own checks already report three non-blocking findings of their own (no Buzz for the
+   * CTO, no CEO binding, no packet-reviewer scope), so without that the status is `DEGRADED` for a
+   * member too, and `DEGRADED` for a non-member would prove nothing. The control below is what shows
+   * the substitution leaves `HEALTHY` reachable.
+   */
+  const refreshedAutomatically = async (label: string, client: { name: string; version: string } | undefined) => {
+    const { harness, daemon, stateDir, close } = await startHolder(label, client);
+    try {
+      vi.spyOn(harness.cp.doctor, "run").mockImplementation(
+        async (scope = "system", target, supplemental = []): Promise<DoctorReport> => ({
+          scope,
+          target: target ?? null,
+          status: aggregate(supplemental),
+          findings: [...supplemental],
+          ranAt: harness.clock.nowIso(),
+        }),
+      );
+      harness.clock.advance(10_000);
+      await daemon.reconcileContinuity(`wake-set test: an automatic refresh with a ${label} holder connected`);
+      const health = JSON.parse(readFileSync(join(stateDir, "health.json"), "utf8")) as {
+        doctor?: { status: string; checkedAt: string | null };
+      };
+      // The refresh ran: the snapshot is the evaluation just taken, not the one from startup.
+      expect(health.doctor?.checkedAt).toBe(harness.clock.nowIso());
+      return health.doctor?.status;
+    } finally {
+      await close();
+    }
+  };
+
+  it("the automatic refresh does not persist HEALTHY while a connected holder is outside the set", async () => {
+    expect(await refreshedAutomatically("outside", NOT_A_MEMBER)).toBe("DEGRADED");
+    expect(await refreshedAutomatically("no-build", undefined)).toBe("DEGRADED");
+  });
+
+  it("the automatic refresh persists HEALTHY when the holder runs a qualified build — the control", async () => {
+    expect(await refreshedAutomatically("member", { ...WAKE_TRANSPORT_QUALIFIED_CLIENTS[0] })).toBe("HEALTHY");
   });
 });
 

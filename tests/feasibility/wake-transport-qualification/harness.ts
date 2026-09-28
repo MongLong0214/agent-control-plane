@@ -39,6 +39,8 @@ import {
   chmodSync,
   copyFileSync,
   existsSync,
+  linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -50,7 +52,7 @@ import {
 } from "node:fs";
 import { connect } from "node:net";
 import { arch, homedir, platform, release } from "node:os";
-import { delimiter, join, relative } from "node:path";
+import { basename, delimiter, join, relative } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 
@@ -158,8 +160,13 @@ export const PTY_COLS = 120;
 
 export type ProbeShape = "interactive" | "headless";
 
+/** The build a reading names: what `buildReceipt` writes into `client`. */
 export interface ClaudeImage {
-  /** The real file behind whatever `claude` on PATH points at -- never the symlink. */
+  /**
+   * The real file behind the launcher when the image was held -- never the symlink. Orientation,
+   * not identity: the updater re-points the launcher and deletes old versions, so this path can name
+   * another file, or none, by the time anyone reads it. `sha256` is the identity.
+   */
   readonly path: string;
   readonly sha256: string;
   /** Exactly what `--version` printed, unparsed. */
@@ -168,12 +175,56 @@ export interface ClaudeImage {
   readonly version: string;
 }
 
+/**
+ * One file, held so that the bytes a run digests are the bytes it executes for as long as it runs.
+ *
+ * The hold is a hard link, made in a directory of the run's own (0700), to the inode the path named
+ * at the moment it was taken. A hard link rather than the path itself, because the updater owns the
+ * path: it re-points the launcher, renames a new file over a version, and deletes old ones while
+ * sessions still run them (measured 2026-09-28: a live session on 2.1.278, its version file gone).
+ * None of those reaches a link in a directory nothing else writes -- the inode stays, under a name
+ * only this run uses. A hard link rather than a copy, because a copy is a new inode and macOS
+ * assesses every new inode from scratch (#817); a link is the inode that has already run.
+ *
+ * What the hold does not stop is a write into that inode in place, which reaches every name it has.
+ * `confirmHeld` is what catches that, and it is why the inode's size and modification time are
+ * kept here beside the digest.
+ */
+export interface HeldImage {
+  /** Where the file was found, realpath'd. See `ClaudeImage.path`. */
+  readonly path: string;
+  /** The hard link. The only name the file is read or executed by once it has been held. */
+  readonly executable: string;
+  /** The digest of the held inode, read through `executable`. */
+  readonly sha256: string;
+  readonly inode: { readonly dev: number; readonly ino: number; readonly size: number; readonly mtimeMs: number };
+  /** Removes the link and its directory. The file it was found at is never touched. */
+  readonly release: () => void;
+}
+
+/** A held client image and the version it printed through the same link. */
+export interface PinnedClaudeImage extends ClaudeImage, HeldImage {}
+
 export interface ProbeRun {
   readonly shape: ProbeShape;
   /** Whether this run wrote `ROLE_WAKE_FRAME` to the session's inbox. False is the control. */
   readonly injected: boolean;
-  /** The exact argv, home-redacted, that the client was started with. */
+  /**
+   * The exact argv, home-redacted, that the client was started with. Its first element is the held
+   * link this arm executed (`HeldImage.executable`), not the path the image was found at, which the
+   * receipt keeps as `client.imagePath`. The link is removed with the run.
+   */
   readonly command: readonly string[];
+  /**
+   * The digest of the file this arm executed, read after its measurement through the name it was
+   * started by, by `confirmHeld` -- which throws, failing the arm, if that name no longer holds the
+   * inode and bytes that were digested before it ran. `buildReceipt` refuses an arm whose digest is
+   * not the one the receipt names.
+   *
+   * Optional only because the readings committed before this field existed do not carry it; every
+   * run `runQualificationProbe` returns does.
+   */
+  readonly imageSha256?: string;
   /** Model requests seen before the injection point, in both arms. */
   readonly baselineModelRequests: number;
   readonly modelRequests: number;
@@ -338,44 +389,119 @@ export const qualificationSource = (): "daemon-binary" | "pinned-launcher" | "pa
 };
 
 /**
- * Resolves the client this harness measures, and digests it.
+ * The launcher this harness measures through: the deployment's pinned launcher first, PATH second.
  *
- * The deployment's pinned launcher first, PATH second. Until 2026-09-15 this read PATH alone, and
- * that is a different build from the one the deployment runs: the canonical session starts through
- * `claude-pinned/claude`, while PATH is re-pointed by the installer on every release. On this host
- * the two had drifted three versions apart, so the qualification evidence was measured against a
- * build **nothing in this deployment executes**. The test asserting the two agree was right to
- * fail, and relaxing that assertion would have left the harness pointed at the wrong file.
+ * Until 2026-09-15 this read PATH alone, and that is a different build from the one the deployment
+ * runs: the canonical session starts through `claude-pinned/claude`, while PATH is re-pointed by the
+ * installer on every release. On this host the two had drifted three versions apart, so the
+ * qualification evidence was measured against a build **nothing in this deployment executes**. The
+ * test asserting the two agree was right to fail, and relaxing that assertion would have left the
+ * harness pointed at the wrong file.
  *
- * PATH stays as the fallback so a checkout with no deployment beside it can still qualify
- * something.
- *
- * `realpathSync` on purpose: both entries are symlinks into a versioned directory, and a receipt
- * that recorded the symlink would name a pointer that moves on the next update while claiming to
- * identify a build. `--version` is probed from a scratch cwd with a scratch `HOME` so the probe
- * cannot read or write the operator's real configuration (#795).
+ * PATH stays as the fallback so a checkout with no deployment beside it can still qualify something.
+ * This names an entry and nothing more; `pinClaudeImage` is what turns it into an image.
  */
-export const resolveClaudeImage = (): ClaudeImage | null => {
-  const entry = deploymentLauncher() ?? onPath("claude");
-  if (entry === null) return null;
-  let path: string;
+export const claudeEntry = (): string | null => deploymentLauncher() ?? onPath("claude");
+
+/** Size, modification time and identity of a held inode, read without following a link. */
+const inodeOf = (path: string): HeldImage["inode"] => {
+  const stat = lstatSync(path);
+  if (!stat.isFile()) throw new Error(`${path} is not a regular file`);
+  return { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs };
+};
+
+const sameInode = (left: HeldImage["inode"], right: HeldImage["inode"]): boolean =>
+  left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeMs === right.mtimeMs;
+
+/**
+ * Holds the file `entry` resolves to, and digests it through the hold. See `HeldImage`.
+ *
+ * The digest is bracketed by two reads of the inode, and a change between them is a refusal: a
+ * digest of a file that was being written is a digest of nothing in particular. `parent` is where
+ * the hold's directory is made, and a hard link cannot cross a filesystem, so it has to be on the
+ * same one as the image -- a refusal otherwise, never a fallback to the path or to a copy.
+ */
+export const holdImage = (entry: string, parent = "/private/tmp"): HeldImage => {
+  const path = realpathSync(entry);
+  const directory = mkdtempSync(join(parent, "acp-u6q-img-"));
+  const release = (): void => rmSync(directory, { recursive: true, force: true });
   try {
-    path = realpathSync(entry);
-  } catch {
-    return null;
+    chmodSync(directory, 0o700);
+    const held = join(directory, basename(path));
+    linkSync(path, held);
+    const inode = inodeOf(held);
+    const sha256 = sha256File(held);
+    if (!sameInode(inode, inodeOf(held))) throw new Error(`${path} changed while it was being digested`);
+    return {
+      path,
+      // The link and never `path`: every later read and every arm's exec goes through this name.
+      executable: held,
+      sha256,
+      inode,
+      release,
+    };
+  } catch (error) {
+    release();
+    throw error;
   }
-  const scratch = mkdtempSync("/private/tmp/acp-u6q-ver-");
+};
+
+/**
+ * The digest of a held image, read again through the name the arms execute; a throw, naming what
+ * changed, when that name no longer holds the inode and bytes that were digested.
+ *
+ * This is where "the arms executed what the reading names" is established. The hold rules out
+ * everything the updater does to the path; what is left is a write into the held inode itself, and
+ * this reads the inode's identity, size and modification time and then its bytes. Each arm calls it
+ * after its measurement, and a throw there fails the arm, so no reading is written.
+ *
+ * What it cannot see: a rewrite in place that is undone, bytes and modification time both, between
+ * an arm's exec and this read. Nothing that updates this client does that; something that set out
+ * to would have to be running as this user, where it could as easily edit the harness.
+ */
+export const confirmHeld = (image: HeldImage): string => {
+  const now = inodeOf(image.executable);
+  if (now.dev !== image.inode.dev || now.ino !== image.inode.ino) {
+    throw new Error(`${image.executable} no longer names the inode that was held`);
+  }
+  if (now.size !== image.inode.size || now.mtimeMs !== image.inode.mtimeMs) {
+    throw new Error(`the held image ${image.executable} was rewritten in place after it was digested`);
+  }
+  const sha256 = sha256File(image.executable);
+  if (sha256 !== image.sha256) {
+    throw new Error(`the held image ${image.executable} digests to ${sha256}, not the ${image.sha256} it was held at`);
+  }
+  return sha256;
+};
+
+/**
+ * Holds the client this harness measures, and asks it its version through the hold.
+ *
+ * One call per run, and every arm is handed the result: a second resolution is a second chance for
+ * the updater to have moved the launcher, and before 2026-09-28 each of the four arms resolved it
+ * again, so a reading could name the image of the first resolution while its arms ran another.
+ * `--version` is read through the same link and the digest confirmed after it, so the version, the
+ * digest and every arm's exec are all of one inode.
+ *
+ * `--version` is probed from a scratch cwd with a scratch `HOME` so the probe cannot read or write
+ * the operator's real configuration (#795).
+ */
+export const pinClaudeImage = (entry: string | null = claudeEntry(), parent = "/private/tmp"): PinnedClaudeImage => {
+  if (entry === null) throw new Error("no `claude` image to qualify: no deployment launcher and none on PATH");
+  const held = holdImage(entry, parent);
+  const scratch = mkdtempSync(join(parent, "acp-u6q-ver-"));
   try {
-    const versionOutput = execFileSync(path, ["--version"], {
+    const versionOutput = execFileSync(held.executable, ["--version"], {
       cwd: scratch,
       encoding: "utf8",
       timeout: 30_000,
       env: { PATH: process.env.PATH, HOME: scratch, TMPDIR: scratch, CLAUDE_CONFIG_DIR: join(scratch, "cfg") },
     }).trim();
-    const version = versionOutput.split(/\s+/)[0] ?? "";
-    return { path, sha256: sha256File(path), versionOutput, version };
-  } catch {
-    return null;
+    confirmHeld(held);
+    return { ...held, versionOutput, version: versionOutput.split(/\s+/)[0] ?? "" };
+  } catch (error) {
+    held.release();
+    throw error;
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
@@ -391,7 +517,7 @@ export const resolvePtyAllocator = (): { readonly python: string; readonly scrip
 
 /** Why the interactive measurement cannot be taken here, or null when it can. */
 export const interactiveBlocker = (): string | null => {
-  if (resolveClaudeImage() === null) return "no `claude` on PATH to measure";
+  if (claudeEntry() === null) return "no `claude` on PATH to measure";
   if (resolvePtyAllocator() === null) return "no python3 to allocate a pty for an interactive start";
   return null;
 };
@@ -456,16 +582,100 @@ interface RenderedScreen {
   readonly col: number;
   readonly fullScreen: boolean;
   readonly cursorHidden: boolean;
+  /**
+   * Every sequence in the stream this model did not apply, named as it appeared, in the order first
+   * seen. The grid is claimed to be the terminal's only while this is empty.
+   */
+  readonly unmodelled: readonly string[];
 }
 
 /**
- * Applies a terminal stream to a `PTY_ROWS` x `PTY_COLS` grid: printing, cursor moves, erases,
- * the alternate screen, and inverse video -- the one attribute readiness reads. Not an emulator:
- * no scroll margins, no insert/delete, no colour, and an escape sequence still incomplete at the
- * end of the stream is left unapplied until the rest of it arrives.
+ * A sequence as a reader can find it in the session log: ESC spelled out, every other control as
+ * `\xNN`, and a long string cut, since an image or a clipboard payload can run to kilobytes.
+ */
+const nameSequence = (raw: string): string => {
+  const shown = raw.replace(/[\u0000-\u001f\u007f-\u009f]/g, (control) =>
+    control === "\u001b" ? "ESC" : `\\x${control.charCodeAt(0).toString(16).padStart(2, "0")}`);
+  return shown.length > 40 ? `${shown.slice(0, 39)}…` : shown;
+};
+
+/**
+ * DEC private modes whose setting changes neither what a cell holds nor where the cursor is: what
+ * the keys and the mouse send (1, 9, 66, 1000-1007, 1015, 1016), focus reports (1004), bracketed
+ * paste (2004), cursor blink (12), synchronized output (2026, which defers painting and leaves the
+ * grid as it would be) and palette notifications (2031). 25, 47, 1047, 1048, 1049 and 7 are
+ * applied rather than listed. A mode that is not here and not applied is unmodelled.
+ */
+const INERT_PRIVATE_MODES: ReadonlySet<number> = new Set([
+  1, 9, 12, 66, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1015, 1016, 2004, 2026, 2031,
+]);
+
+/**
+ * CSI sequences that ask or tell the terminal something without drawing, keyed by marker,
+ * intermediates and final: device attributes (`c`, `>c`, `=c`), status reports (`n`, `?n`), the
+ * version query (`>q`), key-modifier and keyboard-protocol negotiation (`>m`, `>n`, `>u`, `<u`,
+ * `=u`, `?u`), pointer and title modes (`>p`, `>t`, `>T`), cursor shape (` q`) and mode queries
+ * (`$p`, `?$p`).
+ */
+const INERT_CSI: ReadonlySet<string> = new Set([
+  "c", ">c", "=c", "n", "?n", ">q", ">m", ">n", ">u", "<u", "=u", "?u", ">p", ">t", ">T", " q", "$p", "?$p",
+]);
+
+/**
+ * Window operations (`CSI Ps t`) that only report or push and pop the title. The rest move, resize
+ * or refresh the window, and resizing is a different grid.
+ */
+const INERT_WINDOW_OPERATIONS: ReadonlySet<number> = new Set([11, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23]);
+
+/**
+ * Operating-system commands that change no cell: titles (0-2), the palette and dynamic colours
+ * (4, 10-19, 104, 105, 110-119), the working directory (7), hyperlinks (8), notifications (9, 777),
+ * the pointer shape (22), the clipboard (52) and shell-integration marks (133, 633). Anything else,
+ * inline images among them, is unmodelled.
+ */
+const INERT_OSC: ReadonlySet<number> = new Set([
+  0, 1, 2, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 22, 52, 104, 105, 110, 111, 112, 113, 114, 115,
+  116, 117, 118, 119, 133, 633, 777,
+]);
+
+/** Controls that are applied (BS, HT, LF, VT, FF, CR) or that a terminal ignores (NUL, BEL, DEL). */
+const KNOWN_CONTROLS: ReadonlySet<number> = new Set([0x00, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x7f]);
+
+/**
+ * Applies a terminal stream to a `PTY_ROWS` x `PTY_COLS` grid, and names every part of it that it
+ * did not apply.
+ *
+ * Closed, not best-effort. Each sequence falls in exactly one of three sets:
+ *
+ *   - **Applied.** Printing and autowrap; absolute and relative cursor moves, with CUU, CUD, CNL
+ *     and CPL stopping at a scroll margin as a terminal's do; saving and restoring the cursor with
+ *     the inverse attribute it carries (DECSC/DECRC, `CSI s`/`CSI u`, mode 1048); the alternate
+ *     screen (47, 1047, 1049); erasing (ED, EL, ECH); the scroll region (DECSTBM) and everything
+ *     that moves lines within it -- a line feed in any of its forms (LF, VT, FF, IND, NEL) and a
+ *     reverse index (RI) at a margin, insert and delete line (IL, DL), scroll up and down (SU, SD);
+ *     insert and delete character (ICH, DCH); and inverse video (SGR 7, 27, 0), the one attribute
+ *     readiness reads.
+ *   - **Inert.** Sequences that by definition change no cell and do not move the cursor: queries
+ *     and reports, input and keyboard modes, synchronized output, cursor visibility and shape,
+ *     titles, colours, hyperlinks, the clipboard, and character-set designations, which change a
+ *     glyph and never its width. Each is named in one of the lists above, with its reason.
+ *   - **Unmodelled.** Everything else, including every sequence this file has never heard of. It is
+ *     recorded by name in `unmodelled`, and from then on the grid is not claimed to be the
+ *     terminal's: readiness refuses for the rest of the stream, because a sequence that moved cells
+ *     leaves them moved and nothing later says which.
+ *
+ * The third set is what makes the first two worth trusting. Until 2026-09-28 an unknown final fell
+ * through a `default: break`: an insert-line was dropped, the model kept a caret on a row the
+ * terminal had moved, and readiness fired on a screen that was wrong without saying so. An
+ * allow-list and not a deny-list, because a deny-list fires only on the sequences its author
+ * thought of, which is the same defect with a smaller surface.
+ *
+ * An escape sequence still incomplete at the end of the stream is left unapplied until the rest of
+ * it arrives. At that instant a terminal has not applied it either.
  */
 const renderScreen = (stream: string): RenderedScreen => {
   const main = blankGrid();
+  let alternate = blankGrid();
   let grid = main;
   let fullScreen = false;
   let cursorHidden = false;
@@ -475,25 +685,110 @@ const renderScreen = (stream: string): RenderedScreen => {
   // Without this, a full-width rule followed by `CR` + one-row-down lands a row too low.
   let wrapPending = false;
   let inverse = false;
-  let saved = { row: 0, col: 0 };
+  // The scroll region, 0-based and inclusive: the whole screen until DECSTBM says otherwise.
+  let top = 0;
+  let bottom = PTY_ROWS - 1;
+  let saved = { row: 0, col: 0, inverse: false };
+  const unmodelled: string[] = [];
+
+  const refuse = (raw: string): void => {
+    const name = nameSequence(raw);
+    if (!unmodelled.includes(name)) unmodelled.push(name);
+  };
 
   const moveTo = (toRow: number, toCol: number): void => {
     row = Math.min(PTY_ROWS - 1, Math.max(0, toRow));
     col = Math.min(PTY_COLS - 1, Math.max(0, toCol));
     wrapPending = false;
   };
+  // A vertical move that starts inside the region stops at its margin; one that starts outside
+  // stops at the edge of the screen.
+  const up = (count: number): void => moveTo(Math.max(row >= top ? top : 0, row - count), col);
+  const down = (count: number): void => moveTo(Math.min(row <= bottom ? bottom : PTY_ROWS - 1, row + count), col);
+
+  const blankRows = (count: number): Cell[][] => Array.from({ length: count }, blankRow);
+  // The region's lines move up: the top ones leave it and blank ones enter at the bottom margin.
+  const scrollUp = (count: number): void => {
+    const span = Math.min(count, bottom - top + 1);
+    grid.splice(top, span);
+    grid.splice(bottom - span + 1, 0, ...blankRows(span));
+  };
+  const scrollDown = (count: number): void => {
+    const span = Math.min(count, bottom - top + 1);
+    grid.splice(bottom - span + 1, span);
+    grid.splice(top, 0, ...blankRows(span));
+  };
+  // IL and DL act only on a cursor inside the region, move the lines from the cursor down to the
+  // bottom margin, and leave the cursor in the first column.
+  const insertLines = (count: number): void => {
+    if (row < top || row > bottom) return;
+    const span = Math.min(count, bottom - row + 1);
+    grid.splice(bottom - span + 1, span);
+    grid.splice(row, 0, ...blankRows(span));
+    moveTo(row, 0);
+  };
+  const deleteLines = (count: number): void => {
+    if (row < top || row > bottom) return;
+    const span = Math.min(count, bottom - row + 1);
+    grid.splice(row, span);
+    grid.splice(bottom - span + 1, 0, ...blankRows(span));
+    moveTo(row, 0);
+  };
+  // ICH and DCH move the rest of the cursor's line right or left; the cursor stays where it is.
+  const insertCells = (count: number): void => {
+    const line = grid[row];
+    if (line === undefined) return;
+    const span = Math.min(count, PTY_COLS - col);
+    line.splice(PTY_COLS - span, span);
+    line.splice(col, 0, ...Array.from({ length: span }, blankCell));
+    wrapPending = false;
+  };
+  const deleteCells = (count: number): void => {
+    const line = grid[row];
+    if (line === undefined) return;
+    const span = Math.min(count, PTY_COLS - col);
+    line.splice(col, span);
+    line.push(...Array.from({ length: span }, blankCell));
+    wrapPending = false;
+  };
   const lineFeed = (): void => {
-    if (row < PTY_ROWS - 1) {
-      row += 1;
-      return;
-    }
-    grid.shift();
-    grid.push(blankRow());
+    if (row === bottom) scrollUp(1);
+    else if (row < PTY_ROWS - 1) row += 1;
+  };
+  const reverseIndex = (): void => {
+    if (row === top) scrollDown(1);
+    else if (row > 0) row -= 1;
   };
   const erase = (onRow: number, from: number, to: number): void => {
     const line = grid[onRow];
     if (line === undefined) return;
     for (let at = Math.max(0, from); at < Math.min(PTY_COLS, to); at += 1) line[at] = blankCell();
+  };
+  // The attribute goes with the position: a restore that kept the current inverse would paint
+  // the next blank as a caret the client never drew.
+  const saveCursor = (): void => {
+    saved = { row, col, inverse };
+  };
+  const restoreCursor = (): void => {
+    moveTo(saved.row, saved.col);
+    inverse = saved.inverse;
+  };
+  // 1049 saves the cursor and clears the alternate screen on the way in and restores the cursor
+  // on the way out; 1047 clears it on the way out; 47 does neither.
+  const useScreen = (wanted: boolean, mode: number): void => {
+    if (wanted === fullScreen) return;
+    if (wanted) {
+      if (mode === 1049) {
+        saveCursor();
+        alternate = blankGrid();
+      }
+      grid = alternate;
+    } else {
+      if (mode === 1047) alternate = blankGrid();
+      grid = main;
+      if (mode === 1049) restoreCursor();
+    }
+    fullScreen = wanted;
   };
   const put = (glyph: string, width: 0 | 1 | 2): void => {
     if (width === 0) {
@@ -534,43 +829,64 @@ const renderScreen = (stream: string): RenderedScreen => {
     }
   };
 
-  const csi = (body: string, final: string): void => {
-    const marker = /^[<=>?]/.test(body) ? body.charAt(0) : "";
-    const rest = marker === "" ? body : body.slice(1);
-    // Intermediate bytes: nothing modelled here uses them, and guessing would move the cursor.
-    if (/[ -/]/.test(rest)) return;
-    const tokens = rest.length === 0 ? [] : rest.split(";");
+  const csi = (raw: string, body: string, final: string): void => {
+    // Marker, parameters, intermediates, in that order and nothing else. A body of any other shape
+    // is one a terminal would read in some way this model cannot know.
+    const shape = /^([<=>?]?)([0-9:;]*)([ -/]*)$/.exec(body);
+    if (shape === null) {
+      refuse(raw);
+      return;
+    }
+    const marker = shape[1] ?? "";
+    const parameters = shape[2] ?? "";
+    const intermediates = shape[3] ?? "";
+    const tokens = parameters.length === 0 ? [] : parameters.split(";");
+    if (marker === "" && intermediates === "" && final === "m") {
+      sgr(tokens);
+      return;
+    }
+    // Colon sub-parameters mean something to SGR alone.
+    if (tokens.some((token) => !/^\d*$/.test(token))) {
+      refuse(raw);
+      return;
+    }
     const count = (index: number): number => {
       const value = Number.parseInt(tokens[index] ?? "", 10);
       return Number.isNaN(value) || value < 1 ? 1 : value;
     };
     const mode = Number.parseInt(tokens[0] ?? "", 10) || 0;
 
-    if (marker === "?") {
-      if (final !== "h" && final !== "l") return;
+    if (marker === "?" && intermediates === "" && (final === "h" || final === "l")) {
       const set = final === "h";
       for (const token of tokens) {
         const privateMode = Number(token);
         if (privateMode === 25) cursorHidden = !set;
-        if ((privateMode === 1049 || privateMode === 1047 || privateMode === 47) && set !== fullScreen) {
-          if (set && privateMode === 1049) saved = { row, col };
-          grid = set ? blankGrid() : main;
-          fullScreen = set;
-          if (!set && privateMode === 1049) moveTo(saved.row, saved.col);
+        else if (privateMode === 47 || privateMode === 1047 || privateMode === 1049) useScreen(set, privateMode);
+        else if (privateMode === 1048) {
+          if (set) saveCursor();
+          else restoreCursor();
+        } else if (privateMode === 7 && set) {
+          // Autowrap on is the power-on state and what `put` does. Only turning it off is a change
+          // this model would miss, and that is unmodelled below.
+        } else if (!INERT_PRIVATE_MODES.has(privateMode)) {
+          refuse(`\u001b[?${token}${final}`);
         }
       }
       return;
     }
-    // `>`, `<` and `=` are queries and keyboard-protocol negotiation: nothing is drawn.
-    if (marker !== "") return;
+    if (INERT_CSI.has(`${marker}${intermediates}${final}`)) return;
+    if (marker !== "" || intermediates !== "") {
+      refuse(raw);
+      return;
+    }
 
     switch (final) {
-      case "A": moveTo(row - count(0), col); break;
-      case "B": case "e": moveTo(row + count(0), col); break;
+      case "A": up(count(0)); break;
+      case "B": case "e": down(count(0)); break;
       case "C": case "a": moveTo(row, col + count(0)); break;
       case "D": moveTo(row, col - count(0)); break;
-      case "E": moveTo(row + count(0), 0); break;
-      case "F": moveTo(row - count(0), 0); break;
+      case "E": down(count(0)); col = 0; break;
+      case "F": up(count(0)); col = 0; break;
       case "G": case "`": moveTo(row, count(0) - 1); break;
       case "d": moveTo(count(0) - 1, col); break;
       case "H": case "f": moveTo(count(0) - 1, count(1) - 1); break;
@@ -581,20 +897,49 @@ const renderScreen = (stream: string): RenderedScreen => {
         } else if (mode === 1) {
           for (let above = 0; above < row; above += 1) erase(above, 0, PTY_COLS);
           erase(row, 0, col + 1);
-        } else {
+        } else if (mode === 2) {
           for (let every = 0; every < PTY_ROWS; every += 1) erase(every, 0, PTY_COLS);
+        } else if (mode !== 3) {
+          // 3 erases the scrollback, which is not on the screen.
+          refuse(raw);
         }
         break;
       case "K":
         if (mode === 0) erase(row, col, PTY_COLS);
         else if (mode === 1) erase(row, 0, col + 1);
-        else erase(row, 0, PTY_COLS);
+        else if (mode === 2) erase(row, 0, PTY_COLS);
+        else refuse(raw);
         break;
       case "X": erase(row, col, col + count(0)); break;
-      case "m": sgr(tokens); break;
-      case "s": if (tokens.length === 0) saved = { row, col }; break;
-      case "u": if (tokens.length === 0) moveTo(saved.row, saved.col); break;
-      default: break;
+      case "@": insertCells(count(0)); break;
+      case "P": deleteCells(count(0)); break;
+      case "L": insertLines(count(0)); break;
+      case "M": deleteLines(count(0)); break;
+      case "S": scrollUp(count(0)); break;
+      // With five parameters this final is mouse highlight tracking, not a scroll.
+      case "T": if (tokens.length <= 1) scrollDown(count(0)); else refuse(raw); break;
+      case "r": {
+        if (tokens.length > 2) {
+          refuse(raw);
+          break;
+        }
+        const first = Number.parseInt(tokens[0] ?? "", 10);
+        const last = Number.parseInt(tokens[1] ?? "", 10);
+        const newTop = (Number.isNaN(first) || first < 1 ? 1 : first) - 1;
+        const newBottom = Math.min(PTY_ROWS, Number.isNaN(last) || last < 1 ? PTY_ROWS : last) - 1;
+        // A region under two lines is ignored by the terminal, cursor and all, and so here.
+        if (newTop < newBottom) {
+          top = newTop;
+          bottom = newBottom;
+          moveTo(0, 0);
+        }
+        break;
+      }
+      // With parameters these are left and right margins, which this model does not keep.
+      case "s": if (tokens.length === 0) saveCursor(); else refuse(raw); break;
+      case "u": if (tokens.length === 0) restoreCursor(); else refuse(raw); break;
+      case "t": if (!INERT_WINDOW_OPERATIONS.has(mode)) refuse(raw); break;
+      default: refuse(raw); break;
     }
   };
 
@@ -607,7 +952,7 @@ const renderScreen = (stream: string): RenderedScreen => {
         let end = at + 2;
         while (end < stream.length && !/[@-~]/.test(stream.charAt(end))) end += 1;
         if (end >= stream.length) break;
-        csi(stream.slice(at + 2, end), stream.charAt(end));
+        csi(stream.slice(at, end + 1), stream.slice(at + 2, end), stream.charAt(end));
         at = end + 1;
         continue;
       }
@@ -616,12 +961,60 @@ const renderScreen = (stream: string): RenderedScreen => {
         while (end < stream.length && stream.charAt(end) !== "\u0007"
           && !(stream.charAt(end) === "\u001b" && stream.charAt(end + 1) === "\\")) end += 1;
         if (end >= stream.length) break;
-        at = stream.charAt(end) === "\u0007" ? end + 1 : end + 2;
+        const after = stream.charAt(end) === "\u0007" ? end + 1 : end + 2;
+        const content = stream.slice(at + 2, end);
+        const raw = stream.slice(at, after);
+        if (next === "]") {
+          const command = /^(\d+)(?:;|$)/.exec(content)?.[1];
+          if (command === undefined || !INERT_OSC.has(Number(command))) refuse(raw);
+        } else if (next === "P") {
+          // Only the two queries: every other device-control string -- sixel above all -- draws.
+          if (!content.startsWith("$q") && !content.startsWith("+q")) refuse(raw);
+        } else if (next === "_") {
+          // Application program commands carry the kitty graphics protocol, which places images.
+          refuse(raw);
+        }
+        // Privacy messages and start-of-string are read and discarded by the terminal.
+        at = after;
         continue;
       }
-      if (next === "7") saved = { row, col };
-      else if (next === "8") moveTo(saved.row, saved.col);
-      at += "()*+-./#".includes(next) ? 3 : 2;
+      // ESC, any intermediates (0x20-0x2F), one final (0x30-0x7E).
+      let end = at + 1;
+      while (end < stream.length && /[ -/]/.test(stream.charAt(end))) end += 1;
+      if (end >= stream.length) break;
+      const raw = stream.slice(at, end + 1);
+      const intermediates = stream.slice(at + 1, end);
+      const final = stream.charAt(end);
+      if (!/[0-~]/.test(final)) {
+        // Not an escape sequence at all. The byte after it is left for the loop to read again.
+        refuse(stream.slice(at, end));
+        at = end;
+        continue;
+      }
+      if (intermediates === "") {
+        if (final === "7") saveCursor();
+        else if (final === "8") restoreCursor();
+        else if (final === "D") {
+          lineFeed();
+          wrapPending = false;
+        } else if (final === "E") {
+          lineFeed();
+          col = 0;
+          wrapPending = false;
+        } else if (final === "M") {
+          reverseIndex();
+          wrapPending = false;
+        } else if (final !== "=" && final !== ">" && final !== "\\") {
+          // `=` and `>` are keypad modes, and `\` is a string terminator with no string open.
+          refuse(raw);
+        }
+      } else if (intermediates.length !== 1 || !"()*+-./".includes(intermediates)) {
+        // One intermediate from that set designates a character set, which changes a glyph and
+        // never its width. Everything else here -- DECALN's `ESC # 8`, line sizes, `ESC % G` -- is
+        // not modelled.
+        refuse(raw);
+      }
+      at = end + 1;
       continue;
     }
     if (char === "\r") {
@@ -638,17 +1031,26 @@ const renderScreen = (stream: string): RenderedScreen => {
     const codePoint = stream.codePointAt(at) ?? 0;
     const glyph = String.fromCodePoint(codePoint);
     at += glyph.length;
-    if (codePoint < 0x20 || (codePoint >= 0x7f && codePoint < 0xa0)) continue;
+    if (codePoint < 0x20 || (codePoint >= 0x7f && codePoint < 0xa0)) {
+      // A C1 control is one a UTF-8 terminal may act on: U+009B is CSI.
+      if (!KNOWN_CONTROLS.has(codePoint)) refuse(glyph);
+      continue;
+    }
     put(glyph, cellWidth(codePoint));
   }
 
-  return { grid, row, col, fullScreen, cursorHidden };
+  return { grid, row, col, fullScreen, cursorHidden, unmodelled };
 };
 
 export interface InteractiveReadiness {
-  /** The decision, and it is `cursorOnCaret` and nothing else. */
+  /** The decision: `cursorOnCaret`, on a screen the model applied every sequence of. */
   readonly ready: boolean;
   readonly cursorOnCaret: boolean;
+  /**
+   * Every sequence the screen model did not apply, named as it appeared. Non-empty means the
+   * rendered screen may not be the terminal's, and readiness refuses whatever the cursor is over.
+   */
+  readonly unmodelled: readonly string[];
   /** 1-based, as the terminal's own cursor moves number them, so a report reads against the log. */
   readonly cursor: { readonly row: number; readonly column: number };
   readonly underCursor: string;
@@ -688,17 +1090,25 @@ export interface InteractiveReadiness {
  * pre-provisioning the config exists to avoid. The pointer is drawn in colour, not inverse, so it
  * is not a caret.
  *
+ * Why the whole screen has to have been applied. The cell under the cursor is only the terminal's
+ * cell if every sequence before it was applied as a terminal would apply it. An insert-line the
+ * model dropped leaves an inverse blank on a row the terminal has moved, and a park on that row
+ * then reads as ready while the terminal's cursor rests on something else. So a stream carrying
+ * any sequence `renderScreen` does not apply is not ready, whatever the cursor is over, and
+ * `describeReadiness` names the sequence.
+ *
  * What would make this stale: the client showing the terminal's cursor instead of drawing one,
- * drawing its caret in something other than inverse video, or ending a frame with the cursor
- * anywhere but the caret. Each fails closed -- readiness never fires -- and `describeReadiness`
- * says which of the facts below were seen. There is no prose fallback, on purpose: a fallback
- * fires on exactly the build where this stopped describing the client, and hides that it did.
+ * drawing its caret in something other than inverse video, ending a frame with the cursor anywhere
+ * but the caret, or drawing its screen with a sequence the model does not apply. Each fails closed
+ * -- readiness never fires -- and `describeReadiness` says which of the facts below were seen. There
+ * is no prose fallback, on purpose: a fallback fires on exactly the build where this stopped
+ * describing the client, and hides that it did.
  */
 export const interactiveReadiness = (stream: string): InteractiveReadiness => {
   const rendered = renderScreen(stream);
   const under = rendered.grid[rendered.row]?.[rendered.col];
   const cursorOnCaret = under !== undefined && under.inverse && under.glyph === " ";
-  const ready = cursorOnCaret;
+  const ready = cursorOnCaret && rendered.unmodelled.length === 0;
   const carets: { row: number; column: number }[] = [];
   rendered.grid.forEach((line, rowIndex) => {
     line.forEach((cell, colIndex) => {
@@ -708,6 +1118,7 @@ export const interactiveReadiness = (stream: string): InteractiveReadiness => {
   return {
     ready,
     cursorOnCaret,
+    unmodelled: rendered.unmodelled,
     cursor: { row: rendered.row + 1, column: rendered.col + 1 },
     underCursor: under?.glyph ?? "",
     carets,
@@ -725,8 +1136,9 @@ export const describeReadiness = (reading: InteractiveReadiness): string => {
     .filter(({ line }) => line.trim().length > 0)
     .map(({ line, row }) => `${String(row).padStart(2)}| ${line}`);
   return [
-    "looked for: the cursor at rest on a caret the client drew (an inverse-video blank cell)",
+    "looked for: the cursor at rest on a caret the client drew (an inverse-video blank cell), on a screen the model applied in full",
     `  cursor on a caret: ${reading.cursorOnCaret ? "yes" : "no"}`,
+    `  every sequence applied: ${reading.unmodelled.length === 0 ? "yes" : `no -- not modelled: ${reading.unmodelled.join(", ")}`}`,
     `  cursor: ${at(reading.cursor)}, over ${JSON.stringify(reading.underCursor)}`,
     `  carets drawn: ${reading.carets.length === 0 ? "none" : reading.carets.map(at).join("; ")}`,
     "seen, as context rather than as inputs to the decision:",
@@ -837,6 +1249,12 @@ export interface ProbeOptions {
    * Making it a decision at each call site is the guard (#837).
    */
   readonly captureDir: string;
+  /**
+   * The image this arm executes, held once by the caller for every arm it runs. Required, and the
+   * probe resolves nothing itself: an arm that looked the client up again could start a different
+   * build from the one the reading names (`pinClaudeImage`).
+   */
+  readonly image: HeldImage;
 }
 
 /**
@@ -847,8 +1265,7 @@ export interface ProbeOptions {
  */
 export const runQualificationProbe = async (options: ProbeOptions): Promise<ProbeRun> => {
   const settleCeilingMs = options.settleCeilingMs ?? 20_000;
-  const image = resolveClaudeImage();
-  if (image === null) throw new Error("no `claude` image on PATH to qualify");
+  const { image } = options;
 
   // Short root on purpose: a unix socket path is capped near 104 bytes, and a deep path fails
   // to bind rather than erroring anywhere legible.
@@ -947,7 +1364,7 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
       options.shape === "interactive"
         ? shared
         : ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", ...shared];
-    const command = [image.path, ...args];
+    const command = [image.executable, ...args];
 
     if (options.shape === "interactive") {
       const pty = resolvePtyAllocator();
@@ -958,7 +1375,7 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
         stdio: ["pipe", "pipe", "pipe"],
       }) as ChildProcessWithoutNullStreams;
     } else {
-      child = spawn(image.path, args, { env, cwd: workDir, stdio: ["pipe", "pipe", "pipe"] }) as ChildProcessWithoutNullStreams;
+      child = spawn(image.executable, args, { env, cwd: workDir, stdio: ["pipe", "pipe", "pipe"] }) as ChildProcessWithoutNullStreams;
     }
     child.stdout.on("data", (chunk: Buffer) => {
       terminal.push(chunk);
@@ -1015,6 +1432,9 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
     }
 
     const final = modelRequests();
+    // Read after the measurement, through the name this arm was started by. A throw here fails the
+    // arm, and with it the run, before anything is recorded (see `confirmHeld`).
+    const imageSha256 = confirmHeld(image);
     mkdirSync(durableDir, { recursive: true });
     copyFileSync(capturePath, durableCapture);
     writeFileSync(sessionLogPath, `${strip(terminal.text())}\n--- stderr ---\n${stderr}`);
@@ -1024,6 +1444,7 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
       shape: options.shape,
       injected: options.inject,
       command: command.map(redactHome),
+      imageSha256,
       baselineModelRequests,
       modelRequests: final.length,
       wakeCarryingModelRequests: final.filter((request) => request.body.includes(ROLE_WAKE_TOKEN)).length,
@@ -1073,6 +1494,18 @@ export const buildReceipt = (input: {
   readonly limits: readonly string[];
   readonly findings: QualificationReceipt["findings"];
 }): QualificationReceipt => {
+  // The one claim a reading rests on is that its arms ran the image it names. An arm that ran
+  // anything else -- or that cannot say what it ran -- has no place in it, and the refusal is a
+  // throw rather than a `not-qualified` verdict, because a reading of the wrong image is not a
+  // reading of this one at all.
+  input.runs.forEach((run, index) => {
+    if (run.imageSha256 !== input.image.sha256) {
+      throw new Error(
+        `arm ${index + 1} (${run.shape}, ${run.injected ? "injection" : "control"}) executed an image whose digest is ` +
+          `${run.imageSha256 ?? "not recorded"}, not the ${input.image.sha256} this reading would name`,
+      );
+    }
+  });
   const frameBytes = Buffer.from(ROLE_WAKE_FRAME, "utf8");
   const interactive = input.runs.filter((run) => run.shape === "interactive");
   const qualified =
@@ -1243,6 +1676,7 @@ const LIMITS: readonly string[] = [
   "The endpoint-directory policy is untouched by this slice, so registration through registerEndpoint is still refused for a socket outside the daemon state directory. See the finding of that name.",
   "Interactive start required pre-provisioned answers to the onboarding, workspace-trust and custom-API-key prompts in a throwaway config. A session whose operator answered them differently is outside this reading.",
   "settleCeilingMs is a ceiling on the post-injection wait, not a duration either arm was observed for. The control spends the whole ceiling; the injection arm returns on its first follow-up request. Two arms sharing a ceiling were watched for at most the same time, not for the same time, and the actual spans are not recorded here.",
+  "Every arm executed one hard link, in a directory private to the run, to the inode digested as imageSha256 -- the command's first element names that link, which is removed with the run, and imagePath names where the inode was found. Each arm re-read the link's identity, size, modification time and digest after its measurement and would have failed the run on a difference. A rewrite of that inode in place, undone before the re-read, would not have been seen.",
   "This file does not identify the instrument that produced it. headSha is git rev-parse HEAD at receipt-build time, which can name a tree that contains no harness -- the harness may be uncommitted while the reading is taken. Unless a sourceBinding block below says otherwise, the source of this reading is UNKNOWN, and a digest computed after the fact would attest preservation since, not what executed.",
 ];
 
@@ -1276,7 +1710,7 @@ const FINDINGS: QualificationReceipt["findings"] = [
 /**
  * Takes the whole reading of one build and records it: both shapes, both arms, one file.
  *
- * One build per call — whichever `resolveClaudeImage` resolves, so an operator points it at a
+ * One build per call — whichever `pinClaudeImage` holds, so an operator points it at a
  * specific build through `ACP_CLAUDE_BINARY`. Its reading is added, or replaces that build's
  * earlier one; every other build's reading is left exactly as it was. Moving the build into
  * `WAKE_TRANSPORT_QUALIFIED_CLIENTS` stays a separate, deliberate edit.
@@ -1286,31 +1720,37 @@ const FINDINGS: QualificationReceipt["findings"] = [
  * verified against would be the weakest link in the chain.
  */
 export const qualify = async (): Promise<{ readonly receipt: QualificationReceipt; readonly path: string }> => {
-  const image = resolveClaudeImage();
-  if (image === null) throw new Error("no `claude` image on PATH to qualify");
   const blocker = interactiveBlocker();
   if (blocker !== null) throw new Error(`cannot take the interactive reading: ${blocker}`);
-  // Named before any arm runs: a version that cannot become a file name is refused here, not after
-  // four real client starts, and the same name scopes this build's raw captures.
-  const readingName = readingFileName({ name: MEASURED_CLIENT_NAME, version: image.version });
-  const captureDir = join(RAW_CAPTURE_DIR, readingName.slice(0, -".json".length));
+  // Held once, here, and handed to every arm; released only after the reading is written, so the
+  // one inode is what the version, the digest and all four execs are of.
+  const image = pinClaudeImage();
+  try {
+    // Named before any arm runs: a version that cannot become a file name is refused here, not
+    // after four real client starts, and the same name scopes this build's raw captures.
+    const readingName = readingFileName({ name: MEASURED_CLIENT_NAME, version: image.version });
+    const captureDir = join(RAW_CAPTURE_DIR, readingName.slice(0, -".json".length));
 
-  const headSha = execFileSync("git", ["rev-parse", "HEAD"], {
-    cwd: REPO_ROOT,
-    encoding: "utf8",
-    timeout: 30_000,
-  }).trim();
+    const headSha = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      timeout: 30_000,
+    }).trim();
 
-  // Serial, not concurrent. Each arm starts a real client that binds a socket and talks to a
-  // loopback server; two of them at once would be measuring a machine under a load the deployment
-  // never puts it under, and the settle ceilings would no longer bound comparable windows.
-  const runs: ProbeRun[] = [];
-  for (const shape of ["interactive", "headless"] as const) {
-    for (const inject of [true, false]) {
-      runs.push(await runQualificationProbe({ shape, inject, captureDir }));
+    // Serial, not concurrent. Each arm starts a real client that binds a socket and talks to a
+    // loopback server; two of them at once would be measuring a machine under a load the
+    // deployment never puts it under, and the settle ceilings would no longer bound comparable
+    // windows.
+    const runs: ProbeRun[] = [];
+    for (const shape of ["interactive", "headless"] as const) {
+      for (const inject of [true, false]) {
+        runs.push(await runQualificationProbe({ shape, inject, captureDir, image }));
+      }
     }
-  }
 
-  const receipt = buildReceipt({ image, headSha, runs, limits: LIMITS, findings: FINDINGS });
-  return { receipt, path: recordReading(receipt) };
+    const receipt = buildReceipt({ image, headSha, runs, limits: LIMITS, findings: FINDINGS });
+    return { receipt, path: recordReading(receipt) };
+  } finally {
+    image.release();
+  }
 };

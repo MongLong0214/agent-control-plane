@@ -184,3 +184,106 @@ describe("U6: the interactive client is at its prompt when its cursor rests on t
     expect(describeReadiness(interactiveReadiness(""))).toContain("(blank)");
   });
 });
+
+/**
+ * The cell under the cursor is only the terminal's cell if the model applied every sequence before
+ * it the way a terminal would. Until 2026-09-28 an unknown sequence fell through a `default: break`:
+ * an insert-line was dropped, the model kept a caret on the row the terminal had moved it off, and
+ * a park on that row read as ready. None of the real first screens contains one, so no committed
+ * reading fired early; what those rows could not show is a screen that did.
+ *
+ * So each sequence is applied, known to change no cell, or unmodelled -- and an unmodelled one
+ * refuses the screen, by name. The cases below that refuse are chosen from outside what the model
+ * names, because a check that fires only on the sequences its author listed is the same defect with
+ * a smaller surface.
+ */
+describe("U6: the screen model applies a sequence that moves cells, or refuses the screen and names it", () => {
+  /** An inverse blank at row 38, column 3, after `❯ `: 2.1.283's input row, drawn the way it draws it. */
+  const caretAt38 = "\u001b[?1049h\u001b[?25l\u001b[38;1H❯ \u001b[7m \u001b[27m";
+
+  it("an inserted line moves the caret down with it: a park on its old row is not ready, and on its new row is", () => {
+    const inserted = `${caretAt38}\u001b[38;1H\u001b[L`;
+
+    const onOldRow = interactiveReadiness(`${inserted}\u001b[38;3H`);
+    expect(onOldRow.ready, describeReadiness(onOldRow)).toBe(false);
+    expect(onOldRow.carets).toEqual([{ row: 39, column: 3 }]);
+
+    const onNewRow = interactiveReadiness(`${inserted}\u001b[39;3H`);
+    expect(onNewRow.ready, describeReadiness(onNewRow)).toBe(true);
+    expect(onNewRow.unmodelled).toEqual([]);
+  });
+
+  it("an insert-line over a real first screen moves 2.1.283's caret off the row the client parks on", () => {
+    const text = transcriptOf(loadFirstScreen("claude-code@2.1.283.json").reads);
+    expect(interactiveReadiness(text).cursor).toEqual({ row: 38, column: 3 });
+
+    expect(interactiveReadiness(`${text}\u001b[38;1H\u001b[L\u001b[38;3H`).ready).toBe(false);
+    expect(interactiveReadiness(`${text}\u001b[38;1H\u001b[L\u001b[39;3H`).ready).toBe(true);
+  });
+
+  it("delete-line, scrolling and reverse index move the lines inside the scroll region and nothing outside it", () => {
+    const readyAt = (stream: string, park: string): boolean => interactiveReadiness(`${stream}\u001b[${park}H`).ready;
+
+    // Delete-line at row 37 pulls row 38 up to it.
+    expect(readyAt(`${caretAt38}\u001b[37;1H\u001b[M`, "38;3")).toBe(false);
+    expect(readyAt(`${caretAt38}\u001b[37;1H\u001b[M`, "37;3")).toBe(true);
+
+    // Scroll up and down, and a reverse index at the top margin, move every line of the region.
+    expect(readyAt(`${caretAt38}\u001b[S`, "37;3")).toBe(true);
+    expect(readyAt(`${caretAt38}\u001b[T`, "39;3")).toBe(true);
+    expect(readyAt(`${caretAt38}\u001b[H\u001bM`, "39;3")).toBe(true);
+
+    // A region ending at row 37 leaves row 38 where it is, whatever is inserted above it, and an
+    // insert-line on a row outside the region does nothing at all.
+    expect(readyAt(`${caretAt38}\u001b[1;37r\u001b[30;1H\u001b[3L`, "38;3")).toBe(true);
+    expect(readyAt(`${caretAt38}\u001b[1;37r\u001b[38;1H\u001b[L`, "38;3")).toBe(true);
+    // Inside the region, a line feed on its bottom margin scrolls only the region.
+    expect(readyAt(`${caretAt38}\u001b[1;37r\u001b[37;1H\n`, "38;3")).toBe(true);
+  });
+
+  it("every sequence on every real first screen is one the model applies or knows changes no cell", () => {
+    for (const name of [...BUILDS.map((version) => `claude-code@${version}.json`), "claude-code@2.1.283.workspace-trust.json"]) {
+      const reading = interactiveReadiness(transcriptOf(loadFirstScreen(name).reads));
+      expect(reading.unmodelled, name).toEqual([]);
+    }
+  });
+
+  it("a sequence that would move cells and is not modelled refuses the screen and is named", () => {
+    const text = transcriptOf(loadFirstScreen("claude-code@2.1.283.json").reads);
+    // The control: the same screen, the cursor sent elsewhere and parked back on the caret, with
+    // sequences the model knows to be inert on the way. Ready -- so what refuses below is the sequence.
+    const control = interactiveReadiness(
+      `${text}\u001b[1;1H\u001b[?2026h\u001b]0;title\u0007\u001b[>1u\u001b[2 q\u001b[?2026l\u001b[38;3H`,
+    );
+    expect(control.ready, describeReadiness(control)).toBe(true);
+    expect(control.unmodelled).toEqual([]);
+
+    const cellMoving: readonly { readonly sequence: string; readonly name: string }[] = [
+      // Insert mode: every glyph printed after it pushes the rest of its line right.
+      { sequence: "\u001b[4h", name: "ESC[4h" },
+      // Scroll left (ECMA-48 SL): every column of the screen moves.
+      { sequence: "\u001b[2 @", name: "ESC[2 @" },
+      // Character position backward (ECMA-48 HPB): a cursor move, and a final the model never names.
+      { sequence: "\u001b[3j", name: "ESC[3j" },
+      // Repeat the preceding glyph.
+      { sequence: "x\u001b[3b", name: "ESC[3b" },
+      // Copy a rectangle of cells to another place on the screen.
+      { sequence: "\u001b[1;1;5;5;1;30;1$v", name: "ESC[1;1;5;5;1;30;1$v" },
+      // Origin mode: every later absolute move is relative to the scroll region.
+      { sequence: "\u001b[?6h", name: "ESC[?6h" },
+      // Screen alignment: every cell becomes an E.
+      { sequence: "\u001b#8", name: "ESC#8" },
+      // An inline image and a kitty graphics placement: both draw, and both move the cursor.
+      { sequence: "\u001b]1337;File=inline=1:AAAA\u0007", name: "ESC]1337;File=inline=1:AAAA\\x07" },
+      { sequence: "\u001b_Ga=T;AAAA\u001b\\", name: "ESC_Ga=T;AAAAESC\\" },
+      // A C1 control, which a UTF-8 terminal may read as CSI.
+      { sequence: "\u009b", name: "\\x9b" },
+    ];
+    for (const { sequence, name } of cellMoving) {
+      const reading = interactiveReadiness(`${text}\u001b[1;1H${sequence}\u001b[38;3H`);
+      expect(reading.ready, name).toBe(false);
+      expect(reading.unmodelled, name).toEqual([name]);
+      expect(describeReadiness(reading), name).toContain(`every sequence applied: no -- not modelled: ${name}`);
+    }
+  });
+});
