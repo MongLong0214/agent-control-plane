@@ -79,8 +79,9 @@ export const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
  * reading gets (`readingFileName` without the extension). With one reading that made no
  * difference; with several, an unscoped directory would let qualifying one build overwrite the
  * captures another build's committed reading points at — #837's stale pointer again, arriving
- * through the qualification rather than the suite. The 2.1.268 reading predates this and names the
- * unscoped paths, which nothing writes to any more.
+ * through the qualification rather than the suite. Every committed reading names the scoped paths:
+ * the 2.1.268 reading, which predated this and named the unscoped ones, was re-taken on 2026-09-28,
+ * and nothing writes to the unscoped paths any more.
  */
 export const RAW_CAPTURE_DIR = "evidence/local/u6-wake-transport-qualification";
 

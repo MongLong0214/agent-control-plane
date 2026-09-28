@@ -116,8 +116,8 @@ const connectPeer = async (
   /**
    * What this peer says it is at `initialize`.
    *
-   * A parameter rather than a constant because the wake transport is pinned to one qualified
-   * client build, and a row that could not present an unqualified one could not tell a pin from
+   * A parameter rather than a constant because the wake transport is pinned to a set of qualified
+   * client builds, and a row that could not present an unqualified one could not tell a pin from
    * an unconditional accept.
    */
   clientInfo: { name: string; version: string } = { name: "cto-peer", version: "1" },

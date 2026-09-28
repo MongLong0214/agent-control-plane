@@ -218,14 +218,34 @@ type EndpointCheck =
  * its harness deleted its temp root on exit, so the constant carried a conclusion whose reading no
  * longer existed, and a conclusion nobody can re-read is indistinguishable from one nobody took.
  *
- * Raw captures and logs use fixed, overwriteable local paths, and the three previously recorded
- * historical losses remain unrecoverable. The 2.1.268 reading's captures sit at the unscoped
- * paths its receipt names, where each earlier re-qualification wrote over the last: the ones
- * behind the receipt produced at 2026-09-08T23:01:02.003Z were overwritten by the
- * 2026-09-09T14:48:17.913Z run, and those in turn by the 2026-09-11T08:55:21.640Z run that reading
- * now rests on. No superseded capture is recoverable. A qualification now writes under a
- * directory named for the build it measured, so qualifying one member no longer overwrites the
- * captures another member's reading points at; re-qualifying the same build still does.
+ * Three members, three readings, each taken on 2026-09-28 by `pnpm qualify:wake-transport` against
+ * a different image: 2.1.268 through the deployment's pinned launcher, 2.1.282 and 2.1.283 through
+ * `ACP_CLAUDE_BINARY` pointed at the versioned image. Each reading names its own image digest, the
+ * head it was taken at and which of those two sources it read, so no member stands on another's
+ * measurement: a build is here because its own reading says `qualified`. Being installed on the
+ * same host is not a reading, and an installed build without one is refused like any other.
+ *
+ * Some sessions the set can never admit, because no reading of what they run can be taken. The
+ * updater removes superseded images from `~/.local/share/claude/versions/`, and it has removed one
+ * a process was still executing: that process keeps running on its open inode, `lsof` still names
+ * the path, and nothing can spawn the file again. Measured on 2026-09-28: a live session on
+ * 2.1.278, whose image that directory no longer holds. A binding held by such a session is reported
+ * like any other holder outside the set and stays unwakeable for as long as the session runs; of
+ * the two repairs the daemon's finding offers, only restarting it onto a member is open. A fresh
+ * download of the same version is not a way round that: membership is equality on
+ * `{name, version}`, so qualifying the download would admit the running session on a reading of a
+ * different file, one nobody can show is the image that session executes.
+ *
+ * Raw captures and logs sit under the git-ignored `evidence/local/`, in a directory named for the
+ * build each qualification measured, so qualifying one member does not overwrite the captures
+ * another member's reading points at; re-qualifying the same build still does, and the paths
+ * resolve only in the checkout that took the reading. All three readings name those scoped paths:
+ * the 2.1.268 reading was re-taken rather than carried forward, and no longer rests on its
+ * 2026-09-11T08:55:21.640Z run. The three previously recorded historical losses remain
+ * unrecoverable. The captures behind the receipt produced at 2026-09-08T23:01:02.003Z were
+ * overwritten by the 2026-09-09T14:48:17.913Z run, those in turn by the 2026-09-11T08:55:21.640Z
+ * run, and that run's own captures sat at unscoped paths that no reading names any more. No
+ * superseded capture is recoverable.
  *
  * The readings behind these values cover an **interactive** start, which the C0 one did not. That
  * matters because `isInteractiveClaudeInvocation` (src/registry/canonical-self-claim.ts) refuses
@@ -234,6 +254,8 @@ type EndpointCheck =
  */
 export const WAKE_TRANSPORT_QUALIFIED_CLIENTS = [
   { name: "claude-code", version: "2.1.268" },
+  { name: "claude-code", version: "2.1.282" },
+  { name: "claude-code", version: "2.1.283" },
 ] as const;
 
 /** One `{name, version}` pair, as an MCP client declares itself and as a reading records it. */

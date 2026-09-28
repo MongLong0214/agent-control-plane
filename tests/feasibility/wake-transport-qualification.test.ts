@@ -19,8 +19,8 @@
  *     can only close it on a machine that has the client.
  *
  * The agreement rules themselves are `qualificationDisagreements`, exercised against fixture sets
- * and fixture readings in `wake-transport-readings.test.ts`. The committed set has one member, so a
- * rule this row never trips here is still shown to trip there.
+ * and fixture readings in `wake-transport-readings.test.ts`. Whenever this row passes, the committed
+ * set and its readings agree, so a rule this row never trips here is still shown to trip there.
  */
 import { describe, expect, it } from "vitest";
 

@@ -1,14 +1,14 @@
 {
   "qualification": "acp.role-wake-transport/u6",
-  "producedAt": "2026-09-28T01:34:04.908Z",
-  "headSha": "81dbe53deeaeb9308ab099a80de8300f232eec09",
+  "producedAt": "2026-09-28T02:56:56.809Z",
+  "headSha": "a5884791264c668595e79e18faac43dc0d7d0510",
   "client": {
     "name": "claude-code",
-    "version": "2.1.268",
-    "versionOutput": "2.1.268 (Claude Code)",
-    "imagePath": "~/.hermes/bridge/qualified-artifacts/claude-2.1.268/06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a/claude",
-    "imageSha256": "06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a",
-    "qualificationSource": "pinned-launcher"
+    "version": "2.1.282",
+    "versionOutput": "2.1.282 (Claude Code)",
+    "imagePath": "~/.local/share/claude/versions/2.1.282",
+    "imageSha256": "fcfd837103965c64de34a6b9b94370d77a347ea71819715a27d5f0ef01775ea4",
+    "qualificationSource": "daemon-binary"
   },
   "host": {
     "platform": "darwin",
@@ -28,13 +28,13 @@
       "shape": "interactive",
       "injected": true,
       "command": [
-        "~/.hermes/bridge/qualified-artifacts/claude-2.1.268/06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a/claude",
+        "~/.local/share/claude/versions/2.1.282",
         "--settings",
-        "/private/tmp/acp-u6q-3TY8eG/settings.json",
+        "/private/tmp/acp-u6q-UPKG7G/settings.json",
         "--setting-sources",
         "",
         "--messaging-socket-path",
-        "/private/tmp/acp-u6q-3TY8eG/s/i.sock",
+        "/private/tmp/acp-u6q-UPKG7G/s/i.sock",
         "--model",
         "claude-sonnet-4-5"
       ],
@@ -43,21 +43,21 @@
       "wakeCarryingModelRequests": 1,
       "followUpAfterInjection": true,
       "settleCeilingMs": 20000,
-      "rawCapturePath": "evidence/local/u6-wake-transport-qualification/claude-code@2.1.268/interactive-injection/capture.jsonl",
-      "rawSessionLogPath": "evidence/local/u6-wake-transport-qualification/claude-code@2.1.268/interactive-injection/session.log",
+      "rawCapturePath": "evidence/local/u6-wake-transport-qualification/claude-code@2.1.282/interactive-injection/capture.jsonl",
+      "rawSessionLogPath": "evidence/local/u6-wake-transport-qualification/claude-code@2.1.282/interactive-injection/session.log",
       "tempRootRemoved": true
     },
     {
       "shape": "interactive",
       "injected": false,
       "command": [
-        "~/.hermes/bridge/qualified-artifacts/claude-2.1.268/06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a/claude",
+        "~/.local/share/claude/versions/2.1.282",
         "--settings",
-        "/private/tmp/acp-u6q-xkjDSO/settings.json",
+        "/private/tmp/acp-u6q-Iallna/settings.json",
         "--setting-sources",
         "",
         "--messaging-socket-path",
-        "/private/tmp/acp-u6q-xkjDSO/s/i.sock",
+        "/private/tmp/acp-u6q-Iallna/s/i.sock",
         "--model",
         "claude-sonnet-4-5"
       ],
@@ -66,15 +66,15 @@
       "wakeCarryingModelRequests": 0,
       "followUpAfterInjection": false,
       "settleCeilingMs": 20000,
-      "rawCapturePath": "evidence/local/u6-wake-transport-qualification/claude-code@2.1.268/interactive-control/capture.jsonl",
-      "rawSessionLogPath": "evidence/local/u6-wake-transport-qualification/claude-code@2.1.268/interactive-control/session.log",
+      "rawCapturePath": "evidence/local/u6-wake-transport-qualification/claude-code@2.1.282/interactive-control/capture.jsonl",
+      "rawSessionLogPath": "evidence/local/u6-wake-transport-qualification/claude-code@2.1.282/interactive-control/session.log",
       "tempRootRemoved": true
     },
     {
       "shape": "headless",
       "injected": true,
       "command": [
-        "~/.hermes/bridge/qualified-artifacts/claude-2.1.268/06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a/claude",
+        "~/.local/share/claude/versions/2.1.282",
         "-p",
         "--input-format",
         "stream-json",
@@ -82,11 +82,11 @@
         "stream-json",
         "--verbose",
         "--settings",
-        "/private/tmp/acp-u6q-MWMp6U/settings.json",
+        "/private/tmp/acp-u6q-j2bO0U/settings.json",
         "--setting-sources",
         "",
         "--messaging-socket-path",
-        "/private/tmp/acp-u6q-MWMp6U/s/i.sock",
+        "/private/tmp/acp-u6q-j2bO0U/s/i.sock",
         "--model",
         "claude-sonnet-4-5"
       ],
@@ -95,15 +95,15 @@
       "wakeCarryingModelRequests": 1,
       "followUpAfterInjection": true,
       "settleCeilingMs": 20000,
-      "rawCapturePath": "evidence/local/u6-wake-transport-qualification/claude-code@2.1.268/headless-injection/capture.jsonl",
-      "rawSessionLogPath": "evidence/local/u6-wake-transport-qualification/claude-code@2.1.268/headless-injection/session.log",
+      "rawCapturePath": "evidence/local/u6-wake-transport-qualification/claude-code@2.1.282/headless-injection/capture.jsonl",
+      "rawSessionLogPath": "evidence/local/u6-wake-transport-qualification/claude-code@2.1.282/headless-injection/session.log",
       "tempRootRemoved": true
     },
     {
       "shape": "headless",
       "injected": false,
       "command": [
-        "~/.hermes/bridge/qualified-artifacts/claude-2.1.268/06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a/claude",
+        "~/.local/share/claude/versions/2.1.282",
         "-p",
         "--input-format",
         "stream-json",
@@ -111,11 +111,11 @@
         "stream-json",
         "--verbose",
         "--settings",
-        "/private/tmp/acp-u6q-T29l03/settings.json",
+        "/private/tmp/acp-u6q-dToZwQ/settings.json",
         "--setting-sources",
         "",
         "--messaging-socket-path",
-        "/private/tmp/acp-u6q-T29l03/s/i.sock",
+        "/private/tmp/acp-u6q-dToZwQ/s/i.sock",
         "--model",
         "claude-sonnet-4-5"
       ],
@@ -124,8 +124,8 @@
       "wakeCarryingModelRequests": 0,
       "followUpAfterInjection": false,
       "settleCeilingMs": 20000,
-      "rawCapturePath": "evidence/local/u6-wake-transport-qualification/claude-code@2.1.268/headless-control/capture.jsonl",
-      "rawSessionLogPath": "evidence/local/u6-wake-transport-qualification/claude-code@2.1.268/headless-control/session.log",
+      "rawCapturePath": "evidence/local/u6-wake-transport-qualification/claude-code@2.1.282/headless-control/capture.jsonl",
+      "rawSessionLogPath": "evidence/local/u6-wake-transport-qualification/claude-code@2.1.282/headless-control/session.log",
       "tempRootRemoved": true
     }
   ],
