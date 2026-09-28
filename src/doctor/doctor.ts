@@ -335,6 +335,42 @@ export type DoctorScope =
  * same overall status.
  */
 export class Doctor {
+  /**
+   * The findings a report must carry that this class cannot read for itself, registered once.
+   *
+   * Some of what "is the system healthy" means is only visible to the process that owns the
+   * listeners: whether the Telegram ingress is running, whether anything has arrived on the Buzz
+   * mention path, and which active bindings have a holder no wake can reach. None of that is in the
+   * database, so the doctor cannot read it, and it used to travel as `run()`'s third argument.
+   *
+   * A third argument is a guarantee every door has to remember, and two doors did not: the CTO and
+   * Hermes MCP `doctor_run` tools call `run(scope, target)` — the door an agent actually asks — so an
+   * agent could be told `HEALTHY` while a binding it holds was unwakeable and the wake it was
+   * waiting for was being stored rather than delivered (#1010). A supplier registered on the doctor
+   * itself is the same set for every door, including doors written after this one, because there is
+   * nothing left for a door to forget.
+   *
+   * The supplier receives the scope and decides for itself what that scope carries. The rule lives
+   * there and only there: it used to be spelled inline at one call site as
+   * `scope === "system" ? … : []`, and a rule spelled in two places is a rule two readers can
+   * disagree about.
+   *
+   * Registering twice replaces, and never appends. A second supplier is a second composition root
+   * over one control plane — what a test that constructs a replacement daemon on the same control
+   * plane does — and the newest one is the live one. Appending would double every finding the
+   * previous supplier still reads, which is the one way this seam could make a report say something
+   * false about *how many* holders are unwakeable.
+   *
+   * With nothing registered a report carries no supplemental findings, and says so by omission
+   * rather than by a finding of its own. That is not an unmeasured state reported as clean: a
+   * control plane with no daemon has started no listeners, so there is no ingress that could be
+   * stopped and no connection that could be holding an unwakeable binding. That deployment is real
+   * and not hypothetical — every unit test that opens a control plane is one, and
+   * `scripts/probe-daemon-startup.ts` takes a system pass before it creates its daemon — and a
+   * finding for "no supplier" would fire on all of them while describing nothing.
+   */
+  #supplementalFindings: ((scope: DoctorScope) => readonly Finding[]) | null = null;
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
@@ -365,12 +401,32 @@ export class Doctor {
     },
   ) {}
 
+  /**
+   * Registers the one supplier every door's report draws its supplemental findings from.
+   *
+   * Called by the composition root that owns the listeners, before anything can serve a door. See
+   * `#supplementalFindings` for why this is a registration rather than an argument, what a second
+   * registration does, and what a report carries before there has been one.
+   */
+  setSupplementalFindings(supplier: (scope: DoctorScope) => readonly Finding[]): void {
+    this.#supplementalFindings = supplier;
+  }
+
   async run(
     scope: DoctorScope = "system",
     target?: string,
     supplementalFindings: readonly Finding[] = [],
   ): Promise<DoctorReport> {
-    const findings: Finding[] = [...supplementalFindings];
+    // The registered set first, then the caller's own. `supplementalFindings` stays a parameter for
+    // findings that belong to *this* call and to no other — `Watchdog.tick` passes the
+    // `WATCHDOG_STALL` findings for the deadline that triggered the pass, which no later report
+    // should repeat — while the registered supplier carries what is true of the deployment whoever
+    // is asking. A caller that passes no third argument at all now gets the registered set, and
+    // that is the whole of #1010: both MCP doors are exactly such callers.
+    const findings: Finding[] = [
+      ...(this.#supplementalFindings?.(scope) ?? []),
+      ...supplementalFindings,
+    ];
 
     if (scope === "system" || scope === "cto" || scope === "project") {
       findings.push(...this.checkBindings(target ?? null));
