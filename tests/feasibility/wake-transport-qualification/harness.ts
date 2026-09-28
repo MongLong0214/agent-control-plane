@@ -970,13 +970,27 @@ export type ObservedText = KeptText | WithheldText;
 /**
  * Whether a model-input text is one this arm's counts are read from.
  *
- * The two questions a reading answers are "did the prompt become a turn" (equality, trimmed) and
- * "did the wake reach the model" (containment, because the runtime composes prose around the
- * token). A text that answers neither contributes to no count, which is exactly why withholding it
- * costs the measurement nothing -- and why withholding one that answers either would gut it.
+ * Three conditions, and the request is one of them. The counts are derived only from turns --
+ * POSTs to the messages endpoint itself (`isModelRequest`) -- so a text in any other request
+ * contributes to no count whatever it contains. Of a turn's model input, the wake count reads any
+ * text containing the token, wherever the runtime put it, and the baseline reads a *user* text
+ * whose trimmed value is the prompt. A text that answers none of those contributes to no count,
+ * which is exactly why withholding it costs the measurement nothing -- and why withholding one that
+ * answers any of them would gut it.
+ *
+ * The request used to be missing from this, and both reviewers reproduced the same defect through
+ * it: a `/v1/messages/count_tokens` request, or a GET, carrying the wake token -- or a system
+ * prompt with the token quoted inside it -- had its text kept **verbatim** in every arm while no
+ * count read a word of it. This repository is public and the text is the client's, so that is the
+ * same safety defect the withholding rule was written to prevent, one layer up.
  */
-export const isArmEvidence = (text: string, prompt: string = BASELINE_PROMPT): boolean =>
-  text.includes(ROLE_WAKE_TOKEN) || text.trim() === prompt;
+export const isArmEvidence = (
+  request: { readonly method: string; readonly url: string },
+  entry: ModelInputText,
+  prompt: string = BASELINE_PROMPT,
+): boolean =>
+  isModelRequest(request) &&
+  (entry.text.includes(ROLE_WAKE_TOKEN) || (entry.from === "user" && entry.text.trim() === prompt));
 
 /**
  * One withheld text's record -- and a **refusal** to withhold what the counts are read from.
@@ -988,24 +1002,35 @@ export const isArmEvidence = (text: string, prompt: string = BASELINE_PROMPT): b
  * failure of the run rather than a silent skip. The production path never asks it to -- the
  * classification below routes evidence to `KeptText` -- which is the point: a later change to that
  * classification stops the arm instead of quietly shrinking what the reading shows.
+ *
+ * It takes the request for the same reason `isArmEvidence` does: "is this text evidence" has no
+ * answer without knowing which request put it in front of the model.
  */
-export const withholdText = (from: string, text: string, prompt: string = BASELINE_PROMPT): WithheldText => {
-  if (isArmEvidence(text, prompt)) {
+export const withholdText = (
+  request: { readonly method: string; readonly url: string },
+  entry: ModelInputText,
+  prompt: string = BASELINE_PROMPT,
+): WithheldText => {
+  if (isArmEvidence(request, entry, prompt)) {
     throw new Error(
       "a model-input text carrying the wake token, or equal to the arm's prompt, cannot be withheld: it is what the counts are read from",
     );
   }
   return {
-    from,
+    from: entry.from,
     withheld: "not this arm's evidence",
-    length: Buffer.byteLength(text, "utf8"),
-    sha256: createHash("sha256").update(Buffer.from(text, "utf8")).digest("hex"),
+    length: Buffer.byteLength(entry.text, "utf8"),
+    sha256: createHash("sha256").update(Buffer.from(entry.text, "utf8")).digest("hex"),
   };
 };
 
-/** One text, classified: kept if the rule reads it, accounted for by length and digest if not. */
-const observedText = (from: string, text: string, prompt: string): ObservedText =>
-  isArmEvidence(text, prompt) ? { from, text } : withholdText(from, text, prompt);
+/** One text, classified: kept if a count of this request is read from it, accounted for if not. */
+const observedText = (
+  request: { readonly method: string; readonly url: string },
+  entry: ModelInputText,
+  prompt: string,
+): ObservedText =>
+  isArmEvidence(request, entry, prompt) ? { from: entry.from, text: entry.text } : withholdText(request, entry, prompt);
 
 /** One request as a committed reading records it: what was asked, and what the model was given. */
 export interface ObservedRequest {
@@ -1099,12 +1124,15 @@ export interface ArmObservations {
  * The prompt is this harness's own constant, the same default `countsFrom` derives against, because
  * an arm that was started with some other prompt is not one these rules admit.
  */
-const isPublishedWithoutBeingRead = (entry: ObservedText): boolean =>
+const isPublishedWithoutBeingRead = (request: ObservedRequest, entry: ObservedText): boolean =>
   entry !== null &&
   typeof entry === "object" &&
   "text" in entry &&
   typeof entry.text === "string" &&
-  !isArmEvidence(entry.text);
+  !isArmEvidence(
+    { method: `${request?.method}`, url: `${request?.url}` },
+    { from: `${entry.from}`, text: entry.text },
+  );
 
 /**
  * Whether an observed text is neither shown nor accounted for -- content a record dropped.
@@ -1174,12 +1202,19 @@ export const observationsFrom = (
     }
     return redacted;
   };
-  const requests = capturedRequests(capture).map((request) => ({
-    at: clean(request.at ?? ""),
-    method: clean(request.method),
-    url: clean(request.url),
-    texts: modelInputTexts(request.body).map(({ from, text }) => observedText(clean(from), clean(text), prompt)),
-  }));
+  const requests = capturedRequests(capture).map((request) => {
+    // Classified against the request it arrived in, redacted as it will be recorded: a text is
+    // evidence only when a count of *this* request is read from it, and a text in a request no
+    // count is derived from is withheld whatever it contains.
+    const at = { method: clean(request.method), url: clean(request.url) };
+    return {
+      at: clean(request.at ?? ""),
+      ...at,
+      texts: modelInputTexts(request.body).map(({ from, text }) =>
+        observedText(at, { from: clean(from), text: clean(text) }, prompt),
+      ),
+    };
+  });
   if (!Number.isInteger(boundary.requestsBefore) || boundary.requestsBefore < 0 || boundary.requestsBefore > requests.length) {
     throw new Error(
       `the injection boundary is at request ${boundary.requestsBefore} of a capture holding ${requests.length}: ` +
@@ -1637,10 +1672,13 @@ const armLabel = (arm: { readonly shape: ProbeShape; readonly injected: boolean 
  *   whose boundary contradicts whether the arm says it injected, or that shows no turn carrying its
  *   own prompt before that point.
  * - **Every observed text shown or accounted for.** A committed observation carries verbatim only
- *   the texts the counts are read from -- the arm's prompt and anything carrying the wake token --
- *   because this repository is public and the rest of what a request puts in front of the model is
- *   the client's own system prompt. Every other text travels as its length and its SHA-256, and a
- *   text that is neither shown nor accounted for that way is a shortfall. So what a reader of the
+ *   the texts the counts are read from -- of a *turn*, the arm's prompt as a user message and
+ *   anything carrying the wake token -- because this repository is public and the rest of what a
+ *   request puts in front of the model is the client's own system prompt. A text in a request no
+ *   count is derived from is withheld whatever it contains: judging it on content alone published
+ *   the client's text out of a count-tokens request and a GET. Every other text travels as its
+ *   length and its SHA-256, and a text that is neither shown nor accounted for that way is a
+ *   shortfall. So what a reader of the
  *   repository can do is exactly this: recompute the four counts over the kept texts, see that
  *   nothing else was dropped rather than withheld, and see that nothing was published that no count
  *   is read from. Recomputing over a withheld text's *contents*
@@ -1768,7 +1806,10 @@ export const qualificationShortfalls = (runs: readonly ProbeRun[]): readonly str
       // rule a property of the artefact rather than of the code that happened to write it.
       const published = observations.requests.reduce(
         (total, request) =>
-          total + (Array.isArray(request?.texts) ? request.texts : []).filter(isPublishedWithoutBeingRead).length,
+          total +
+          (Array.isArray(request?.texts) ? request.texts : []).filter((entry: ObservedText) =>
+            isPublishedWithoutBeingRead(request, entry),
+          ).length,
         0,
       );
       if (published > 0) {
@@ -2052,7 +2093,7 @@ const LIMITS: readonly string[] = [
   "Every arm executed one hard link, in a directory private to the run, to the inode digested as imageSha256 -- the command's first element names that link, which is removed with the run, and imagePath names where the inode was found. Each arm re-read the link's identity, size, modification time and digest after its measurement and would have failed the run on a difference. A rewrite of that inode in place, undone before the re-read, would not have been seen.",
   "The verdict in this file is recomputed from the runs in it, by the one calculation the instrument writes it with, and a reader that admits this reading recomputes it again rather than reading the field. That establishes internal consistency and nothing more: every fact it checks is a statement inside this file. A file written from nothing, with all its fields made to agree, satisfies it. Whether the arms it describes ever ran is a question the raw captures and session logs it points at answer, and this check does not ask them.",
   "Each arm carries the observations its counts are derived from -- every captured request's time, method and URL, and the point in that sequence at which the frame was written -- and both the instrument and the reader derive the four counts from them rather than reading integers. The boundary is recorded by the arm that wrote the frame, not inferred from which request carries the prompt: inferring it counted a wake-carrying turn that preceded the frame as the follow-up the frame caused. What that removes is a count that stood on nothing; what it does not do is attest that a live client produced the observations, or that the recorded boundary is where the frame really went. An observation list written by hand derives exactly as well as a measured one, and this file cannot tell them apart.",
-  "Of each request's model input, this file carries verbatim only what the counts are read from: the arm's prompt, and any text containing the wake token. Every other text -- most of it the client's own system prompt, which is not ours to publish -- is recorded as its kind, its length in UTF-8 bytes and its SHA-256. So a reader of the repository can recompute the four counts over the texts that are here and see that every other text is accounted for by a digest; a reader cannot see what a withheld text said. Recomputing the counts over their contents needs the raw capture named by rawCaptureSha256, which is not committed. The instrument refuses to withhold a text carrying the token or equal to the prompt, so the kept texts are the evidence and not a selection from it -- but that is a property of the code that wrote this file, not a fact this file establishes. What is checked of the file itself is the other direction: a reading carrying a verbatim text that none of its counts are read from is refused rather than admitted.",
+  "Of each request's model input, this file carries verbatim only what the counts are read from, and only out of the requests those counts are derived from -- the turns. In a turn: the arm's prompt as a user message, and any text containing the wake token. A text in any other request is withheld whatever it contains, because no count of this arm reads it. Every other text -- most of it the client's own system prompt, which is not ours to publish -- is recorded as its kind, its length in UTF-8 bytes and its SHA-256. So a reader of the repository can recompute the four counts over the texts that are here and see that every other text is accounted for by a digest; a reader cannot see what a withheld text said. Recomputing the counts over their contents needs the raw capture named by rawCaptureSha256, which is not committed. The instrument refuses to withhold a text a count of its own request is read from, so the kept texts are the evidence and not a selection from it -- but that is a property of the code that wrote this file, not a fact this file establishes. What is checked of the file itself is the other direction: a reading carrying a verbatim text that none of its counts are read from is refused rather than admitted.",
   "The observations are bound to each arm's raw capture by that capture's SHA-256. The capture itself is under evidence/local/, which is not committed, so a reader without that file cannot check the digest, and a reader with it learns only that the copy in hand is the one these observations were read from.",
   "This file does not identify the instrument that produced it. headSha is git rev-parse HEAD at receipt-build time, which can name a tree that contains no harness -- the harness may be uncommitted while the reading is taken. Unless a sourceBinding block below says otherwise, the source of this reading is UNKNOWN, and a digest computed after the fact would attest preservation since, not what executed.",
 ];

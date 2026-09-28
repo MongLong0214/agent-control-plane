@@ -19,7 +19,7 @@ const withholdingTheMeasurementIsAFailure = {
   what: "the observation writer refuses to withhold a model-input text carrying the wake token or equal to the arm's prompt",
   file: "tests/feasibility/wake-transport-qualification/harness.ts",
   find:
-    "  if (isArmEvidence(text, prompt)) {\n" +
+    "  if (isArmEvidence(request, entry, prompt)) {\n" +
     "    throw new Error(\n" +
     '      "a model-input text carrying the wake token, or equal to the arm\'s prompt, cannot be withheld: it is what the counts are read from",\n' +
     "    );\n" +

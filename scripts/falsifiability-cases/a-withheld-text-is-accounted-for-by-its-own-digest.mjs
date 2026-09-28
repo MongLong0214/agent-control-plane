@@ -16,8 +16,8 @@ const aWithheldTextIsAccountedForByItsOwnDigest = {
   id: "a-withheld-text-is-accounted-for-by-its-own-digest",
   what: "a withheld model-input text records the digest of that text, over the same bytes its length counts",
   file: "tests/feasibility/wake-transport-qualification/harness.ts",
-  find: '    sha256: createHash("sha256").update(Buffer.from(text, "utf8")).digest("hex"),\n',
-  replace: '    sha256: createHash("sha256").update(Buffer.from(from, "utf8")).digest("hex"),\n',
+  find: '    sha256: createHash("sha256").update(Buffer.from(entry.text, "utf8")).digest("hex"),\n',
+  replace: '    sha256: createHash("sha256").update(Buffer.from(entry.from, "utf8")).digest("hex"),\n',
   killedBy: [
     "tests/feasibility/wake-transport-qualification.test.ts::keeps the texts its counts are read from, and withholds every other by kind, length and digest",
   ],

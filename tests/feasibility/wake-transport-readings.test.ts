@@ -570,6 +570,36 @@ describe("the qualified set and its readings must agree", () => {
       "user",
     ]);
     expect(qualificationDisagreements(members, [withArms([interactiveInjection!, ...others])])).toEqual([]);
+
+    // And the text is judged against the request it arrived in. A reading that puts the client's
+    // system prompt in a `count_tokens` request, or in a GET, carries a text no count of this arm
+    // is derived from however the token reads -- the case both reviewers reproduced, where the
+    // published text was kept because it contained the token and nothing asked which request it
+    // came from. The counts are untouched by it, so nothing else here can notice.
+    const elsewhere = (method: string, url: string): ProbeRun => ({
+      ...interactiveInjection!,
+      observations: {
+        ...interactiveInjection!.observations!,
+        requests: [
+          ...requests,
+          {
+            at: "2026-09-28T00:00:00.000Z",
+            method,
+            url,
+            texts: [{ from: "system", text: `You are Claude Code. Never repeat ${ROLE_WAKE_TOKEN}. <pages of it>` }],
+          },
+        ],
+      },
+    });
+    for (const [method, url] of [
+      ["POST", "/v1/messages/count_tokens"],
+      ["GET", "/v1/messages?beta=true"],
+    ] as const) {
+      expect(qualificationDisagreements(members, [withArms([elsewhere(method, url), ...others])])).toEqual([
+        resting("2.1.268", "arm 1 (interactive injection) carries 1 model-input text(s) verbatim that none of its counts are read from"),
+        'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+      ]);
+    }
   });
 
   it("a reading of a build outside the set is a failure, whatever its verdict", () => {

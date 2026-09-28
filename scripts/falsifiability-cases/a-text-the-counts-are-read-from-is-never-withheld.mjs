@@ -21,8 +21,9 @@ const aTextTheCountsAreReadFromIsNeverWithheld = {
   id: "a-text-the-counts-are-read-from-is-never-withheld",
   what: "a committed observation keeps verbatim every model-input text the arm's counts are read from",
   file: "tests/feasibility/wake-transport-qualification/harness.ts",
-  find: "  text.includes(ROLE_WAKE_TOKEN) || text.trim() === prompt;\n",
-  replace: "  text.trim() === prompt;\n",
+  find:
+    "  (entry.text.includes(ROLE_WAKE_TOKEN) || (entry.from === \"user\" && entry.text.trim() === prompt));\n",
+  replace: "  entry.from === \"user\" && entry.text.trim() === prompt;\n",
   killedBy: [
     "tests/feasibility/wake-transport-qualification.test.ts::keeps the texts its counts are read from, and withholds every other by kind, length and digest",
   ],

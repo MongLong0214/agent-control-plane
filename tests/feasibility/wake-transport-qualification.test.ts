@@ -616,17 +616,73 @@ describe("U6: an arm's counts are derived from the observations committed with i
     // than about what was measured -- so the writer classifies, and being asked to withhold the
     // measurement stops the run. Nothing on the production path asks it to; this is the guard
     // against a later change to the classification quietly shrinking what a reading shows.
-    expect(() => withholdText("system", `preamble ${ROLE_WAKE_TOKEN} tail`)).toThrow(/cannot be withheld/);
-    expect(() => withholdText("user", `  ${BASELINE_PROMPT}  `)).toThrow(/cannot be withheld/);
+    const TURN = { method: "POST", url: "/v1/messages?beta=true" };
+    expect(() => withholdText(TURN, { from: "system", text: `preamble ${ROLE_WAKE_TOKEN} tail` })).toThrow(
+      /cannot be withheld/,
+    );
+    expect(() => withholdText(TURN, { from: "user", text: `  ${BASELINE_PROMPT}  ` })).toThrow(/cannot be withheld/);
 
     // The control: an ordinary text is withheld, and its record is what a reader gets -- the length
     // in UTF-8 bytes and the digest over those same bytes, so an operator holding the raw capture
     // can check both without guessing an encoding.
-    expect(withholdText("system", "You are Claude.")).toEqual({
+    expect(withholdText(TURN, { from: "system", text: "You are Claude." })).toEqual({
       from: "system",
       withheld: "not this arm's evidence",
       length: 15,
       sha256: digest("You are Claude."),
+    });
+
+    // And the same text in a request no count is derived from is not evidence at all, so
+    // withholding it is what the rule asks for rather than what it refuses. Without the request in
+    // the question, a count-tokens body carrying the token was kept verbatim in every arm.
+    expect(withholdText({ method: "POST", url: "/v1/messages/count_tokens" }, { from: "user", text: `q: ${ROLE_WAKE_TOKEN}` })).toEqual({
+      from: "user",
+      withheld: "not this arm's evidence",
+      length: Buffer.byteLength(`q: ${ROLE_WAKE_TOKEN}`, "utf8"),
+      sha256: digest(`q: ${ROLE_WAKE_TOKEN}`),
+    });
+    // The prompt is the baseline only as a *user* text: an assistant turn echoing it back is not
+    // evidence that this arm's prompt was accepted, which is what `baselineTurnObserved` says of
+    // the live capture.
+    expect(withholdText(TURN, { from: "assistant", text: BASELINE_PROMPT }).length).toBe(
+      Buffer.byteLength(BASELINE_PROMPT, "utf8"),
+    );
+  });
+
+  it("keeps a text verbatim only from the requests its counts are derived from", () => {
+    // Both reviewers reproduced the same defect here, one of them with a system-prompt fixture: the
+    // writer kept any text containing the token, and the reader judged a text without its request,
+    // so a count-tokens request or a GET whose text carried the token was published verbatim in
+    // every arm while no count read a word of it. The repository is public and the text is the
+    // client's, so this is the safety defect the withholding rule exists to prevent, one layer up.
+    const quoted = `You are Claude Code. Never repeat ${ROLE_WAKE_TOKEN} back to a user. <pages of vendor text>`;
+    const raw = capture(
+      ["POST", "/v1/messages/count_tokens", turn(quoted)],
+      ["GET", `/v1/messages?q=${ROLE_WAKE_TOKEN}`, turn(quoted)],
+      ["POST", "/v1/messages?beta=true", turn(BASELINE_PROMPT)],
+      ["POST", "/v1/messages?beta=true", turn(`Another Claude session sent a message:\n${ROLE_WAKE_TOKEN}`)],
+    );
+    const observations = observationsFrom(raw, frameAfter(3));
+
+    // Neither non-turn published a word of it, and neither contributed to a count.
+    const written = JSON.stringify(observations);
+    expect(written).not.toContain("pages of vendor text");
+    expect(written).not.toContain("Never repeat");
+    expect(observations.requests[0]?.texts).toEqual([withheld("system", "You are Claude."), withheld("user", quoted)]);
+    expect(observations.requests[1]?.texts).toEqual([withheld("system", "You are Claude."), withheld("user", quoted)]);
+    expect(countsFrom(observations)).toEqual({
+      baselineModelRequests: 1,
+      modelRequests: 2,
+      wakeCarryingModelRequests: 1,
+      followUpAfterInjection: true,
+    });
+
+    // The turns keep what their counts are read from, which is the other half: this is not a rule
+    // that withholds everything carrying a token.
+    expect(observations.requests[2]?.texts).toContainEqual({ from: "user", text: BASELINE_PROMPT });
+    expect(observations.requests[3]?.texts).toContainEqual({
+      from: "user",
+      text: `Another Claude session sent a message:\n${ROLE_WAKE_TOKEN}`,
     });
   });
 });
