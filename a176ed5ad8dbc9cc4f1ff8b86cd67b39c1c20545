@@ -1,0 +1,20 @@
+Limit: the executing image is still hashed on every canonical claim, reading the whole binary, although the canonical claim never reads the result; the one reader is the delegated bind's attestation digest
+Limit: no test drives the real inspector into an lsof failure; the cases that admit a claim with no observed image supply a synthetic null, and the deleted-binary shape was confirmed read-only against a live session rather than in the suite
+Ruled-out: restarting the jev-gate session onto the pinned build, or giving each adoptable entry its own executor triple | the session's running image is deleted from disk, so no per-entry pin could admit it either, and a restart would lose the conversation the adoption exists to keep
+Warn: the realpath and sha256 pair that refused a binary renamed to `claude` with a forged adjacent manifest is withdrawn; argv[0]'s basename is now the only process-shape check, and the peer the socket admits is same-uid, which can write state.sqlite directly
+Warn: a delegated bind's attestation digest no longer contains the three pins, so digests written before and after this change are not comparable; nothing recomputes a stored digest — binding-registry.ts compares the stored receipt's own digest against the stored column
+Record-Id: r-d9a56b133455
+Provenance: inherited 8e033d0ca747771100161ca8df785dda30c49040
+
+Limit: the hashing inspector is now the only reader of the image's bytes, and its one caller is the delegated bind; nothing checks that a third caller does not appear and take the canonical inspector for a hashing one, because the two differ only by a boolean argument at one call site
+Ruled-out: folding an unreadable image into null | it reported an image the scan had already resolved as no image at all, so a failed read of a field the canonical path never reads destroyed the path and version it does read
+Warn: the parent commit's record says the executing image is still hashed on every canonical claim; that was true when written and is false after this commit, so a reader trusting it will look for a read the canonical path no longer performs
+Warn: the delegated bind now refuses an image it resolved but could not hash; a deployment whose image loses read permission while the session runs loses its delegated binding rather than attesting an image with no hash, and no refusal reason is recorded at that return
+Record-Id: r-d4d71cb53003
+Provenance: inherited a9aff166d8b85cd0eabe937fe61970c8b7a91bfa
+
+Limit: the read count is taken at node:fs inside this process, so what the count cannot see is a read by another process such as a spawned shasum, or an asynchronous node:fs call
+Ruled-out: narrowing the row's claim to the shape its test could already see | an inspector that reads the image, hashes it and drops the result returns this same shape, which is why the count is taken rather than inferred
+Warn: the sibling row an-image-the-uid-cannot-read-is-still-observed does not witness the read: a read that fails and drops only the hash gets the same answer, so it witnesses the observation surviving an unreadable image and nothing about whether bytes were read
+Record-Id: r-377078f4d380
+Provenance: inherited c080f56438e2e7d9e270617490ee2c51152f9d78
