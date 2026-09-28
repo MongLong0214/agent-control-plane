@@ -18,7 +18,7 @@ const observationsAreDigestedFromTheCaptureTheyRead = {
   find: '  return { rawCaptureSha256: createHash("sha256").update(Buffer.from(capture, "utf8")).digest("hex"), requests };\n',
   replace: '  return { rawCaptureSha256: createHash("sha256").update("").digest("hex"), requests };\n',
   killedBy: [
-    "tests/feasibility/wake-transport-qualification.test.ts::keeps each request's time, method, URL and model input, and digests the capture they came from",
+    "tests/feasibility/wake-transport-qualification.test.ts::keeps each request's time, method and URL, and digests the capture they came from",
   ],
 };
 
