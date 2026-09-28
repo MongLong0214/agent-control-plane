@@ -35,7 +35,7 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { buildReceipt, confirmHeld, holdImage, pinClaudeImage, type ProbeRun } from "./wake-transport-qualification/harness.ts";
+import { buildReceipt, confirmHeld, holdImage, pinClaudeImage, type ProbeRun, type ProbeShape } from "./wake-transport-qualification/harness.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterEach(cleanupTempDirs);
@@ -107,10 +107,15 @@ describe("a qualification run holds one image for its whole length", () => {
 
   it("a reading cannot name an image one of its arms did not execute", () => {
     const named = "a".repeat(64);
-    const arm = (injected: boolean, imageSha256: string | undefined): ProbeRun => ({
-      shape: "interactive",
+    // Both shapes, because a reading qualifies a build only when it holds all four arms and each
+    // one's argv is the shape it claims (`qualificationShortfalls`). The headless argv carries the
+    // flags the canonical-claim predicate refuses, as `probeArgv` builds it.
+    const arm = (shape: ProbeShape, injected: boolean, imageSha256: string | undefined): ProbeRun => ({
+      shape,
       injected,
-      command: ["/private/tmp/acp-u6q-img-fixture/2.1.283", "--messaging-socket-path", "/private/tmp/fixture/s/i.sock"],
+      command: shape === "interactive"
+        ? ["/private/tmp/acp-u6q-img-fixture/2.1.283", "--messaging-socket-path", "/private/tmp/fixture/s/i.sock", "ping"]
+        : ["/private/tmp/acp-u6q-img-fixture/2.1.283", "-p", "--input-format", "stream-json", "--output-format", "stream-json"],
       ...(imageSha256 === undefined ? {} : { imageSha256 }),
       baselineModelRequests: 1,
       modelRequests: injected ? 2 : 1,
@@ -130,16 +135,23 @@ describe("a qualification run holds one image for its whole length", () => {
         findings: [],
       });
 
-    // The control: both arms ran the named image, and the arms met the criterion, so it qualifies.
-    expect(receiptOf([arm(true, named), arm(false, named)]).verdict).toBe("qualified");
+    const armsOn = (digests: readonly (string | undefined)[]): readonly ProbeRun[] => [
+      arm("interactive", true, digests[0]),
+      arm("interactive", false, digests[1]),
+      arm("headless", true, digests[2]),
+      arm("headless", false, digests[3]),
+    ];
 
-    // The control arm ran another image. Every number in it is still a pass, which is exactly why
-    // the verdict cannot be the place this is caught.
-    expect(() => receiptOf([arm(true, named), arm(false, "b".repeat(64))])).toThrow(
+    // The control: every arm ran the named image and met its own criterion, so it qualifies.
+    expect(receiptOf(armsOn([named, named, named, named])).verdict).toBe("qualified");
+
+    // One arm ran another image. Every number in it is still a pass, which is exactly why the
+    // verdict cannot be the place this is caught.
+    expect(() => receiptOf(armsOn([named, "b".repeat(64), named, named]))).toThrow(
       `arm 2 (interactive, control) executed an image whose digest is ${"b".repeat(64)}, not the ${named} this reading would name`,
     );
     // An arm that cannot say what it ran is refused the same way.
-    expect(() => receiptOf([arm(true, undefined), arm(false, named)])).toThrow(
+    expect(() => receiptOf(armsOn([undefined, named, named, named]))).toThrow(
       `arm 1 (interactive, injection) executed an image whose digest is not recorded, not the ${named} this reading would name`,
     );
   });
