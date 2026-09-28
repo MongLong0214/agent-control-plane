@@ -85,13 +85,18 @@ interface LivePeer {
    * wake arrives. The daemon already learns that the moment a wake fails, and this is where that
    * fact is kept so the report can use it.
    *
-   * **Scoped to the registration that earned it**, which is what `registration` names: the field
-   * carries the identity of the registration whose delivery failed, `registerEndpoint` clears it,
-   * and a delivery that succeeds under the same registration clears it. So a refusal cannot outlive
-   * the fact it describes -- the same rule the scan's own docstring states about refusals in
-   * general -- and a delivery that outlived its own registration cannot write here at all.
+   * **Scoped to the registration in force**, and held that way by the two writes rather than by
+   * anything stored here: `registerEndpoint` clears it, and a delivery writes it only while the
+   * registration it began under is still the current one (`registration`). So a non-null value here
+   * always describes the registration the holder is on -- a refusal cannot outlive the fact it
+   * describes, which is the rule the scan's own docstring states about refusals in general.
+   *
+   * The identity is deliberately not repeated in this record. It was, and then the reader compared
+   * it as well; with the writes already scoped, that comparison could not be false, and a check
+   * nothing can falsify answers "is this guarded?" with a yes it has not earned. Two rows that
+   * should have died against it survived, which is how it was found.
    */
-  wakeFailure: { readonly registration: number; readonly shape: WakeFailure["shape"] } | null;
+  wakeFailure: { readonly shape: WakeFailure["shape"] } | null;
 }
 
 /**
@@ -588,10 +593,10 @@ export class RoleConversationPort {
    * actually landed. Each answer is the first thing a wake would stop at, so the cause names the
    * step that would refuse rather than the last one that could.
    *
-   * The remembered failure is compared against the registration currently in force, not merely
-   * consulted: a memory that outlived the registration it was taken on would describe a wake to a
-   * socket this holder no longer names. Comparing the endpoint it failed against was not enough --
-   * a holder that rebinds the same pathname registers again under the same string.
+   * The remembered failure is read, not filtered: what is kept there is already the current
+   * registration's, because `registerEndpoint` clears it and `wake` writes it only while the
+   * registration its delivery began under is still in force. Filtering here as well was a second
+   * copy of that rule which no input could make false.
    */
   #unwakeableCause(client: WakeTransportClient | undefined, peer: LivePeer): UnwakeableCause | null {
     if (!isWakeTransportQualified(client)) {
@@ -600,7 +605,7 @@ export class RoleConversationPort {
     const endpoint = peer.endpoint;
     if (endpoint === null) return "no-registered-endpoint";
     if (!this.#validateEndpointPath(endpoint).allowed) return "registered-endpoint-not-usable";
-    return peer.wakeFailure?.registration === peer.registration ? "registered-endpoint-refused-the-wake" : null;
+    return peer.wakeFailure !== null ? "registered-endpoint-refused-the-wake" : null;
   }
 
   /**
@@ -1019,7 +1024,7 @@ export class RoleConversationPort {
       // writing it here would report a working registration as refused. The decision below is
       // returned either way: the wake this caller sent did fail, whatever has happened since.
       if (peer.registration === registration) {
-        peer.wakeFailure = { registration, shape: (failure as WakeFailure).shape };
+        peer.wakeFailure = { shape: (failure as WakeFailure).shape };
       }
       return deny(ReasonCode.ROLE_PEER_FAILED, "the peer's wake endpoint did not accept the wake", {
         role: this.#role,

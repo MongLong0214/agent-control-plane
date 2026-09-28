@@ -18,9 +18,9 @@ const aLateFailureDoesNotPoisonANewerRegistration = {
   file: "src/mcp/role-conversation.ts",
   find:
     "      if (peer.registration === registration) {\n" +
-    "        peer.wakeFailure = { registration, shape: (failure as WakeFailure).shape };\n" +
+    "        peer.wakeFailure = { shape: (failure as WakeFailure).shape };\n" +
     "      }\n",
-  replace: "      peer.wakeFailure = { registration, shape: (failure as WakeFailure).shape };\n",
+  replace: "      peer.wakeFailure = { shape: (failure as WakeFailure).shape };\n",
   killedBy: [
     "tests/unit/a-late-wake-belongs-to-the-registration-it-began-under.test.ts::a failure completing after a later registration of the same path does not poison it",
   ],
