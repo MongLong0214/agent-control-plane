@@ -21,6 +21,7 @@ import {
   readingFileName,
   recordReading,
   type ProbeRun,
+  type ProbeShape,
   type QualificationReceipt,
   type RecordedReading,
 } from "./wake-transport-qualification/harness.ts";
@@ -28,12 +29,34 @@ import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterEach(cleanupTempDirs);
 
-const arm = (injected: boolean, metCriterion: boolean): ProbeRun => {
+/**
+ * The argv each shape is started with, as `probeArgv` builds it.
+ *
+ * Fixture-real rather than decorative: the interactive one is an invocation
+ * `isInteractiveClaudeInvocation` accepts, positional prompt and all, and the headless one carries
+ * the flags it refuses. The rule that an arm's argv must be the shape it claims is checked against
+ * these, so a fixture that got them the wrong way round would fail here rather than pass quietly.
+ */
+const COMMAND: Record<ProbeShape, readonly string[]> = {
+  interactive: ["~/fixture/claude", "--messaging-socket-path", "/private/tmp/fixture/s/inbox.sock", "ping"],
+  headless: [
+    "~/fixture/claude",
+    "-p",
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--messaging-socket-path",
+    "/private/tmp/fixture/s/inbox.sock",
+  ],
+};
+
+const arm = (shape: ProbeShape, injected: boolean, metCriterion = true): ProbeRun => {
   const woke = injected === metCriterion;
   return {
-    shape: "interactive",
+    shape,
     injected,
-    command: ["~/fixture/claude", "--messaging-socket-path", "/private/tmp/fixture/s/inbox.sock"],
+    command: COMMAND[shape],
     // The digest of the fixture image below: every arm here ran the image its reading names.
     imageSha256: "0".repeat(64),
     baselineModelRequests: 1,
@@ -47,6 +70,19 @@ const arm = (injected: boolean, metCriterion: boolean): ProbeRun => {
   };
 };
 
+/**
+ * The four arms one reading is made of, in the order `qualify()` runs them.
+ *
+ * Four rather than two because that is what qualifies a build: injection against control, in both
+ * shapes. A fixture of two would be a fixture of something the instrument will not accept.
+ */
+const arms = (measurement: "met" | "missed" = "met"): ProbeRun[] => [
+  arm("interactive", true, measurement === "met"),
+  arm("interactive", false),
+  arm("headless", true),
+  arm("headless", false),
+];
+
 /** A reading of one fixture build, its verdict computed by the instrument from the arms it ran. */
 const reading = (version: string, measurement: "met" | "missed" = "met"): QualificationReceipt =>
   buildReceipt({
@@ -57,7 +93,7 @@ const reading = (version: string, measurement: "met" | "missed" = "met"): Qualif
       version,
     },
     headSha: "0".repeat(40),
-    runs: [arm(true, measurement === "met"), arm(false, true)],
+    runs: arms(measurement),
     limits: [],
     findings: [],
   });
@@ -67,12 +103,27 @@ const filed = (value: QualificationReceipt, file = readingFileName(value.client)
   reading: value,
 });
 
+/** A reading the instrument produced, with its runs replaced -- the shape a hand-edited file has. */
+const withArms = (runs: readonly ProbeRun[], version = "2.1.268"): RecordedReading =>
+  filed({ ...reading(version), runs });
+
 const build = (version: string) => ({ name: "claude-code", version });
+
+const resting = (version: string, shortfall: string): string =>
+  `claude-code/${version} is a qualified member resting on claude-code@${version}.json, whose own runs do not qualify it: ${shortfall}`;
 
 describe("the qualified set and its readings must agree", () => {
   it("the fixtures mean what they say", () => {
     expect(reading("2.1.268").verdict).toBe("qualified");
     expect(reading("2.1.268", "missed").verdict).toBe("not-qualified");
+    // Four arms, one of each, because that is what the instrument requires of a reading. A fixture
+    // that did not have them would make every row below a test of the wrong thing.
+    expect(reading("2.1.268").runs.map((run) => `${run.shape} ${run.injected ? "injection" : "control"}`)).toEqual([
+      "interactive injection",
+      "interactive control",
+      "headless injection",
+      "headless control",
+    ]);
   });
 
   it("agrees when every member has a qualified reading and every reading is a member — the control", () => {
@@ -92,14 +143,157 @@ describe("the qualified set and its readings must agree", () => {
     ]);
   });
 
-  it("a member resting on a reading whose verdict is not qualified is a failure", () => {
+  it("a member resting on a reading whose own runs do not qualify it is a failure", () => {
     // The reading exists and names the member exactly, so every other rule is satisfied: only the
-    // verdict says this build was measured and failed.
+    // measurement says this build was measured and failed. The report names the arm, because the
+    // verdict is recomputed from the runs and the runs are where the answer is.
     const members = [build("2.1.268"), build("2.1.282")];
     const readings = [filed(reading("2.1.268")), filed(reading("2.1.282", "missed"))];
 
     expect(qualificationDisagreements(members, readings)).toEqual([
-      'claude-code/2.1.282 is a qualified member resting on claude-code@2.1.282.json, whose verdict is "not-qualified"',
+      resting("2.1.282", "arm 1 (interactive injection) did not meet the criterion for its own arm"),
+    ]);
+  });
+
+  it("the stored verdict is an output that is checked, never the reason a reading is admitted", () => {
+    // The defect this row exists for: the reader used to ask the file what its verdict was, so a
+    // file whose runs said one thing and whose verdict said another was admitted on the verdict.
+    // Both directions are reported, because a file that concluded the opposite of its own
+    // observations is wrong whichever way it leans.
+    const members = [build("2.1.268")];
+    const failing = arms("missed");
+
+    expect(qualificationDisagreements(members, [filed({ ...reading("2.1.268"), runs: failing })])).toEqual([
+      resting("2.1.268", "arm 1 (interactive injection) did not meet the criterion for its own arm"),
+      'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+    ]);
+
+    expect(
+      qualificationDisagreements(members, [filed({ ...reading("2.1.268"), verdict: "not-qualified" })]),
+    ).toEqual([
+      'claude-code@2.1.268.json states the verdict "not-qualified", and its own runs recompute to qualified',
+    ]);
+  });
+
+  it("a qualification is four arms: injection against control, in both shapes", () => {
+    // Reproduced on copies of all three committed readings before this rule existed: delete both
+    // headless arms and every offline check still passed, because the file's verdict still said
+    // qualified and nothing recomputed it. The ceremony's claim is a comparison; two of one shape
+    // is not that comparison.
+    const members = [build("2.1.268")];
+    const [interactiveInjection, interactiveControl, headlessInjection, headlessControl] = arms();
+
+    expect(qualificationDisagreements(members, [withArms([interactiveInjection!, interactiveControl!])])).toEqual([
+      resting("2.1.268", "the reading holds 2 arms, and a qualification is made of exactly 4"),
+      resting("2.1.268", "the reading holds 0 headless injection arms, not the one a qualification is made of"),
+      resting("2.1.268", "the reading holds 0 headless control arms, not the one a qualification is made of"),
+      'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+    ]);
+
+    // Four arms, but the same one twice: a count alone would have admitted this.
+    expect(
+      qualificationDisagreements(members, [
+        withArms([interactiveInjection!, interactiveControl!, headlessInjection!, headlessInjection!]),
+      ]),
+    ).toEqual([
+      resting("2.1.268", "the reading holds 2 headless injection arms, not the one a qualification is made of"),
+      resting("2.1.268", "the reading holds 0 headless control arms, not the one a qualification is made of"),
+      'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+    ]);
+
+    // The control: the four the instrument produces are accepted.
+    expect(
+      qualificationDisagreements(members, [
+        withArms([interactiveInjection!, interactiveControl!, headlessInjection!, headlessControl!]),
+      ]),
+    ).toEqual([]);
+  });
+
+  it("an arm is the shape it claims, judged by the predicate production judges by", () => {
+    // `--output-format=json` on a purported interactive arm passed every check before this rule,
+    // although `isInteractiveClaudeInvocation` refuses that argv -- so the reading qualified a
+    // process that could never have held the canonical claim. The headless direction matters too:
+    // an arm recorded as the headless control while carrying an argv the predicate accepts is not
+    // the control the comparison needs.
+    const members = [build("2.1.268")];
+    const [interactiveInjection, interactiveControl, headlessInjection, headlessControl] = arms();
+
+    expect(
+      qualificationDisagreements(members, [
+        withArms([
+          { ...interactiveInjection!, command: [...COMMAND.interactive, "--output-format=json"] },
+          interactiveControl!,
+          headlessInjection!,
+          headlessControl!,
+        ]),
+      ]),
+    ).toEqual([
+      resting(
+        "2.1.268",
+        "arm 1 (interactive injection) was started with an argv the canonical-claim predicate refuses, " +
+          "so it did not measure a session that could hold the claim",
+      ),
+      'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+    ]);
+
+    expect(
+      qualificationDisagreements(members, [
+        withArms([
+          interactiveInjection!,
+          interactiveControl!,
+          headlessInjection!,
+          { ...headlessControl!, command: COMMAND.interactive },
+        ]),
+      ]),
+    ).toEqual([
+      resting(
+        "2.1.268",
+        "arm 4 (headless control) was started with an argv the canonical-claim predicate accepts, " +
+          "so it is not the headless arm it is recorded as",
+      ),
+      'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+    ]);
+  });
+
+  it("an arm's counts have to agree with each other and with a turn having happened", () => {
+    const members = [build("2.1.268")];
+    const [interactiveInjection, interactiveControl, headlessInjection, headlessControl] = arms();
+    const others = [interactiveControl!, headlessInjection!, headlessControl!];
+
+    // Zeroed baselines with the totals made consistent passed every check before this rule: the
+    // wake's follow-up was then a comparison against a turn nobody observed.
+    expect(
+      qualificationDisagreements(members, [
+        withArms([{ ...interactiveInjection!, baselineModelRequests: 0, modelRequests: 1 }, ...others]),
+      ]),
+    ).toEqual([
+      resting(
+        "2.1.268",
+        "arm 1 (interactive injection) recorded no baseline turn, so its follow-up was measured against a turn that never happened",
+      ),
+      'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+    ]);
+
+    // A summary that disagrees with the numbers beneath it: `armPassed` reads the summary, so
+    // without this the summary is the whole measurement.
+    expect(
+      qualificationDisagreements(members, [
+        withArms([{ ...interactiveInjection!, modelRequests: 1, wakeCarryingModelRequests: 1 }, ...others]),
+      ]),
+    ).toEqual([
+      resting(
+        "2.1.268",
+        "arm 1 (interactive injection) says a follow-up arrived, which its own counts (1 before, 1 in all) do not say",
+      ),
+      'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+    ]);
+
+    // A count that is absent is not a count that passed. A comparison against a missing field is
+    // false, so every rule beneath it would have been satisfied by its absence.
+    const { baselineModelRequests: _dropped, ...countless } = interactiveInjection!;
+    expect(qualificationDisagreements(members, [withArms([countless as ProbeRun, ...others])])).toEqual([
+      resting("2.1.268", "arm 1 (interactive injection) does not record baselineModelRequests as a count"),
+      'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
     ]);
   });
 
@@ -132,23 +326,32 @@ describe("the qualified set and its readings must agree", () => {
     // point: these rules read committed files, and a file can arrive hand-edited, from an older
     // instrument, or with its runs replaced, while every number in it still looks like a pass.
     const named = "0".repeat(64);
-    const withArms = (runs: readonly ProbeRun[]): RecordedReading => filed({ ...reading("2.1.268"), runs });
     const members = [build("2.1.268")];
+    const [interactiveInjection, interactiveControl, headlessInjection, headlessControl] = arms();
 
     // The control first: the reading the instrument produced, whose arms all ran the image it names.
     expect(qualificationDisagreements(members, [withArms(reading("2.1.268").runs)])).toEqual([]);
 
     const elsewhere = "b".repeat(64);
     expect(
-      qualificationDisagreements(members, [withArms([arm(true, true), { ...arm(false, true), imageSha256: elsewhere }])]),
+      qualificationDisagreements(members, [
+        withArms([
+          interactiveInjection!,
+          { ...interactiveControl!, imageSha256: elsewhere },
+          headlessInjection!,
+          headlessControl!,
+        ]),
+      ]),
     ).toEqual([
       `claude-code@2.1.268.json: arm 2 (interactive, control) executed ${elsewhere}, not the ${named} this reading names`,
     ]);
 
     // The state the committed readings were actually in until 2026-09-28: no per-arm digest at all,
     // and every other rule satisfied. This is the one that used to pass.
-    const { imageSha256: _dropped, ...silent } = arm(true, true);
-    expect(qualificationDisagreements(members, [withArms([silent, arm(false, true)])])).toEqual([
+    const { imageSha256: _dropped, ...silent } = interactiveInjection!;
+    expect(
+      qualificationDisagreements(members, [withArms([silent, interactiveControl!, headlessInjection!, headlessControl!])]),
+    ).toEqual([
       `claude-code@2.1.268.json: arm 1 (interactive, injection) does not say which image it executed, ` +
         `so nothing ties it to the ${named} this reading names`,
     ]);

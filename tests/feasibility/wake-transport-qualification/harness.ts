@@ -56,6 +56,7 @@ import { basename, delimiter, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { startFakeAnthropic, type FakeAnthropic } from "../native-session-inbox/fake-anthropic.ts";
+import { isInteractiveClaudeInvocation } from "../../../src/registry/canonical-self-claim.ts";
 import {
   ROLE_WAKE_FRAME,
   ROLE_WAKE_TOKEN,
@@ -1043,6 +1044,115 @@ export const armPassed = (run: ProbeRun): boolean =>
     ? run.wakeCarryingModelRequests > 0 && run.followUpAfterInjection
     : run.wakeCarryingModelRequests === 0 && !run.followUpAfterInjection;
 
+/** The four arms one qualification is made of. Exactly one of each, and nothing else. */
+const REQUIRED_ARMS: readonly { readonly shape: ProbeShape; readonly injected: boolean }[] = [
+  { shape: "interactive", injected: true },
+  { shape: "interactive", injected: false },
+  { shape: "headless", injected: true },
+  { shape: "headless", injected: false },
+];
+
+/** How an arm is named in a sentence about it. */
+const armLabel = (arm: { readonly shape: ProbeShape; readonly injected: boolean }): string =>
+  `${arm.shape} ${arm.injected ? "injection" : "control"}`;
+
+/**
+ * Every reason a set of observations does not qualify the build that produced it. Empty is the
+ * verdict "qualified", and there is no other way to reach it.
+ *
+ * **One calculation, used by the producer and by the reader.** `buildReceipt` computes a receipt's
+ * verdict with it; `qualificationDisagreements` recomputes it from a committed reading's own runs
+ * instead of reading the `verdict` the file carries. That the two used to be different code was the
+ * defect, not an inefficiency: reproduced on in-memory copies of all three committed readings, a
+ * reading with both headless arms deleted, with its headless injection arm failing, with every
+ * baseline count zeroed, or with `--output-format=json` added to a purported *interactive* command,
+ * passed every offline check -- because the reader asked the file what its verdict was. The file
+ * was the authority on whether the file was admissible.
+ *
+ * What it requires, and why each one is more than bookkeeping:
+ *
+ * - **Exactly one of each of the four arms.** The ceremony's claim is a comparison -- injection
+ *   against control, in both shapes. Two of one and none of another is not that comparison, and a
+ *   receipt built from it would state a verdict no arm supports.
+ * - **Each arm meeting its own criterion** (`armPassed`): the wake arrives and starts a turn in the
+ *   injection arms, and neither happens in the controls.
+ * - **A positive baseline in every arm.** A zero baseline means nothing was observed to have
+ *   started before the frame, so `followUpAfterInjection` compared the wake against a turn that
+ *   never happened.
+ * - **Counts that are consistent with each other.** Totals no smaller than the baseline, a wake
+ *   count no larger than the total, and `followUpAfterInjection` saying exactly what the two counts
+ *   say. A file whose summary disagrees with its own numbers is being read for its summary.
+ * - **Each arm's argv being the shape it claims**, judged by the production predicate
+ *   (`isInteractiveClaudeInvocation`): accepted for an interactive arm, refused for a headless one.
+ *   A qualification of an argv the predicate refuses qualifies a process that could never hold the
+ *   canonical claim, and that is the whole reason the interactive shape is measured at all.
+ *
+ * What this does **not** establish, and no amount of it can: every fact above is a statement inside
+ * the file being judged. Agreement among a file's own fields is internal consistency, not evidence
+ * that a live ceremony ran. A reading written from nothing, with all its fields made to agree, is
+ * admitted here. What the arms' raw captures and session logs say, and whether they exist at all,
+ * is a separate question this calculation does not ask.
+ */
+export const qualificationShortfalls = (runs: readonly ProbeRun[]): readonly string[] => {
+  const shortfalls: string[] = [];
+  if (runs.length !== REQUIRED_ARMS.length) {
+    shortfalls.push(`the reading holds ${runs.length} arms, and a qualification is made of exactly ${REQUIRED_ARMS.length}`);
+  }
+  for (const required of REQUIRED_ARMS) {
+    const found = runs.filter((run) => run.shape === required.shape && run.injected === required.injected).length;
+    if (found !== 1) {
+      shortfalls.push(`the reading holds ${found} ${armLabel(required)} arms, not the one a qualification is made of`);
+    }
+  }
+  runs.forEach((run, index) => {
+    const where = `arm ${index + 1} (${armLabel(run)})`;
+    // Read from parsed JSON, so a field can be absent or not a number however the type reads here.
+    // A comparison against `undefined` is false, which would let a missing count pass every rule
+    // below it; the counts are established as counts first, and the rules run only on what is one.
+    const counts: readonly (readonly [string, number])[] = [
+      ["baselineModelRequests", run.baselineModelRequests],
+      ["modelRequests", run.modelRequests],
+      ["wakeCarryingModelRequests", run.wakeCarryingModelRequests],
+    ];
+    const missing = counts.filter(([, value]) => !Number.isInteger(value) || value < 0);
+    for (const [field] of missing) shortfalls.push(`${where} does not record ${field} as a count`);
+    if (typeof run.followUpAfterInjection !== "boolean" || typeof run.injected !== "boolean") {
+      shortfalls.push(`${where} does not say whether it was injected and whether a follow-up arrived`);
+    } else if (missing.length === 0) {
+      if (!armPassed(run)) shortfalls.push(`${where} did not meet the criterion for its own arm`);
+      if (run.baselineModelRequests < 1) {
+        shortfalls.push(`${where} recorded no baseline turn, so its follow-up was measured against a turn that never happened`);
+      }
+      if (run.modelRequests < run.baselineModelRequests) {
+        shortfalls.push(`${where} recorded ${run.modelRequests} turns in all and ${run.baselineModelRequests} before the injection point`);
+      }
+      if (run.wakeCarryingModelRequests > run.modelRequests) {
+        shortfalls.push(`${where} recorded ${run.wakeCarryingModelRequests} wake-carrying turns out of ${run.modelRequests} turns`);
+      }
+      if (run.followUpAfterInjection !== run.modelRequests > run.baselineModelRequests) {
+        shortfalls.push(
+          `${where} says a follow-up ${run.followUpAfterInjection ? "arrived" : "did not arrive"}, which its own counts ` +
+            `(${run.baselineModelRequests} before, ${run.modelRequests} in all) do not say`,
+        );
+      }
+    }
+    if (!Array.isArray(run.command) || run.command.some((argument) => typeof argument !== "string")) {
+      shortfalls.push(`${where} does not record the argv it was started with`);
+    } else if (isInteractiveClaudeInvocation(run.command) !== (run.shape === "interactive")) {
+      shortfalls.push(
+        run.shape === "interactive"
+          ? `${where} was started with an argv the canonical-claim predicate refuses, so it did not measure a session that could hold the claim`
+          : `${where} was started with an argv the canonical-claim predicate accepts, so it is not the headless arm it is recorded as`,
+      );
+    }
+  });
+  return shortfalls;
+};
+
+/** The verdict those observations support. There is no input that can make it say otherwise. */
+export const verdictFor = (runs: readonly ProbeRun[]): QualificationReceipt["verdict"] =>
+  qualificationShortfalls(runs).length === 0 ? "qualified" : "not-qualified";
+
 /**
  * Ties every run to the one command, image, build and host that produced it, and writes it where
  * a later reader can check the pin against something other than a memory.
@@ -1071,12 +1181,6 @@ export const buildReceipt = (input: {
     }
   });
   const frameBytes = Buffer.from(ROLE_WAKE_FRAME, "utf8");
-  const interactive = input.runs.filter((run) => run.shape === "interactive");
-  const qualified =
-    input.runs.length > 0 &&
-    interactive.some((run) => run.injected) &&
-    interactive.some((run) => !run.injected) &&
-    input.runs.every(armPassed);
   return {
     qualification: QUALIFICATION_ID,
     producedAt: new Date().toISOString(),
@@ -1102,7 +1206,10 @@ export const buildReceipt = (input: {
       sha256: createHash("sha256").update(frameBytes).digest("hex"),
     },
     runs: input.runs,
-    verdict: qualified ? "qualified" : "not-qualified",
+    // The one calculation, the same one `qualificationDisagreements` recomputes from this file
+    // later. Nothing a caller passes reaches it: the verdict is a reading of the runs or it is
+    // nothing.
+    verdict: verdictFor(input.runs),
     limits: input.limits,
     findings: input.findings,
   };
@@ -1235,11 +1342,26 @@ export const qualificationDisagreements = (
       problems.push(`${label(member)} is a qualified member with no reading`);
     }
     for (const { file, reading } of own) {
-      if (reading.verdict !== "qualified") {
-        problems.push(`${label(member)} is a qualified member resting on ${file}, whose verdict is ${JSON.stringify(reading.verdict)}`);
+      // Recomputed from the runs, never read from the file. `reading.verdict` used to be the
+      // authority here, which made the artefact the judge of its own admissibility: a reading with
+      // its headless arms deleted, or with an arm that failed, or with an interactive command the
+      // production predicate refuses, was admitted because the field still said "qualified".
+      for (const shortfall of qualificationShortfalls(reading.runs)) {
+        problems.push(`${label(member)} is a qualified member resting on ${file}, whose own runs do not qualify it: ${shortfall}`);
       }
     }
   });
+  for (const { file, reading } of readings) {
+    // The stored verdict is an output that is checked, not an input that decides. It stays in the
+    // file because a reader opening one should see what it concluded, but a file whose conclusion
+    // and whose observations disagree is reported rather than believed -- in either direction.
+    const recomputed = verdictFor(reading.runs);
+    if (reading.verdict !== recomputed) {
+      problems.push(
+        `${file} states the verdict ${JSON.stringify(reading.verdict)}, and its own runs recompute to ${recomputed}`,
+      );
+    }
+  }
   for (const { file, reading } of readings) {
     if (!isWakeTransportQualified(reading.client, members)) {
       problems.push(`${file} is a reading of ${label(reading.client)}, which is not a qualified member`);
@@ -1264,6 +1386,7 @@ const LIMITS: readonly string[] = [
   "Each arm's baseline is a model request carrying the prompt as a user message whose text, trimmed, equals it. That is what every capture on this host shows, and a build that sent the same prompt in another shape would fail the arm rather than qualify on an unchecked turn. What is established is that this prompt started a turn, not that the client would have started one from any other input.",
   "settleCeilingMs is a ceiling on the post-injection wait, not a duration either arm was observed for. The control spends the whole ceiling; the injection arm returns on its first follow-up request. Two arms sharing a ceiling were watched for at most the same time, not for the same time, and the actual spans are not recorded here.",
   "Every arm executed one hard link, in a directory private to the run, to the inode digested as imageSha256 -- the command's first element names that link, which is removed with the run, and imagePath names where the inode was found. Each arm re-read the link's identity, size, modification time and digest after its measurement and would have failed the run on a difference. A rewrite of that inode in place, undone before the re-read, would not have been seen.",
+  "The verdict in this file is recomputed from the runs in it, by the one calculation the instrument writes it with, and a reader that admits this reading recomputes it again rather than reading the field. That establishes internal consistency and nothing more: every fact it checks is a statement inside this file. A file written from nothing, with all its fields made to agree, satisfies it. Whether the arms it describes ever ran is a question the raw captures and session logs it points at answer, and this check does not ask them.",
   "This file does not identify the instrument that produced it. headSha is git rev-parse HEAD at receipt-build time, which can name a tree that contains no harness -- the harness may be uncommitted while the reading is taken. Unless a sourceBinding block below says otherwise, the source of this reading is UNKNOWN, and a digest computed after the fact would attest preservation since, not what executed.",
 ];
 
