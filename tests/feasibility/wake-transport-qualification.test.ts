@@ -36,6 +36,7 @@ import {
   modelRequestsIn,
   pinClaudeImage,
   probeArgv,
+  spawnPlanFor,
   qualificationDisagreements,
   readReadings,
   runQualificationProbe,
@@ -173,6 +174,43 @@ describe("U6: the interactive arm keeps the shape the claim requires, and observ
     // carries the four flags the predicate refuses, and it is refused.
     const headless = ["/private/tmp/fixture/claude", ...probeArgv("headless", paths)];
     expect(isInteractiveClaudeInvocation(headless)).toBe(false);
+  });
+
+  it("what an arm executes is the invocation its reading records, for both shapes", () => {
+    // The row the last review asked for: the previous one stopped at `probeArgv`, a helper, while
+    // the spawn a few lines down built its own second expression -- appending a flag there, or
+    // starting the resolved launcher path instead of the held link, left every named test green.
+    // The two are now one value, and this asks that value what it would start.
+    const paths = { settingsPath: "/private/tmp/fixture/settings.json", socketPath: "/private/tmp/fixture/s/i.sock" };
+    const image = { executable: "/private/tmp/fixture/held/claude" };
+    const pty = { python: "/usr/bin/python3", script: "/private/tmp/fixture/pty-session.py" };
+
+    // The headless arm starts the client itself, so what is spawned *is* the recorded command.
+    const headless = spawnPlanFor("headless", image, paths, null);
+    expect(headless.command).toEqual([image.executable, ...probeArgv("headless", paths)]);
+    expect([headless.executable, ...headless.argv]).toEqual([...headless.command]);
+
+    // The interactive arm starts the pty allocator, and the recorded command is the tail of its
+    // argv -- so a reading describes a slice of what was executed rather than a parallel value.
+    const interactive = spawnPlanFor("interactive", image, paths, pty);
+    expect(interactive.command).toEqual([image.executable, ...probeArgv("interactive", paths)]);
+    expect(interactive.executable).toBe(pty.python);
+    expect(interactive.argv).toEqual([pty.script, ...interactive.command]);
+
+    // The shape each plan would actually start is the shape it claims, judged by the production
+    // predicate, and the executed argv carries nothing the recorded one does not.
+    expect(isInteractiveClaudeInvocation([...interactive.command])).toBe(true);
+    expect(isInteractiveClaudeInvocation([...interactive.argv])).toBe(true);
+    expect(isInteractiveClaudeInvocation([...headless.command])).toBe(false);
+
+    // Every arm executes the held hard link. The launcher path an updater re-points is not a field
+    // this decision can reach.
+    expect(interactive.command[0]).toBe(image.executable);
+    expect(headless.executable).toBe(image.executable);
+
+    // No terminal, no interactive arm: it fails rather than falling back to a shape the predicate
+    // refuses, which is the same rule the baseline turn follows.
+    expect(() => spawnPlanFor("interactive", image, paths, null)).toThrow(/pty/);
   });
 
   /**

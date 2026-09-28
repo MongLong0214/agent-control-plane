@@ -676,6 +676,50 @@ export const probeArgv = (
     : ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", ...shared];
 };
 
+/**
+ * What one arm executes, as one value: the process that is started, the argv it is started with,
+ * and the client invocation the reading records.
+ *
+ * One value because the two used to be two expressions -- `spawn(image.executable, args)` beside
+ * `const command = [image.executable, ...args]` -- and two expressions can disagree. A reading's
+ * `command` is the only description of what ran that anybody reads afterwards, so a change that
+ * moved one and not the other would produce a reading describing an invocation that never
+ * happened, with every number in it still looking like a pass.
+ *
+ * `executable` and `argv` are what `spawn` is given; `command` is the client invocation. For the
+ * headless shape they are the same thing split in two. For the interactive shape the process that
+ * is started is the pty allocator, and `command` is the tail of its argv -- so the recorded
+ * invocation is literally a slice of what was executed, which is what a test can check.
+ */
+export interface SpawnPlan {
+  readonly executable: string;
+  readonly argv: readonly string[];
+  readonly command: readonly string[];
+}
+
+/**
+ * How one arm is started, decided in one place a test can call.
+ *
+ * The interactive shape needs a pty: the client's interactive mode wants a terminal on stdout, and
+ * the allocator is a small python script that gives it one. The allocator is passed in rather than
+ * resolved here so a row can ask for both shapes' plans without a python3 on the host.
+ *
+ * `image` is narrowed to the one field an arm may execute -- the held hard link. The path the
+ * launcher resolved to is deliberately not in scope here: it is the thing an arm must not run
+ * (`HeldImage`), and the narrowest way to say that is to make it unreachable.
+ */
+export const spawnPlanFor = (
+  shape: ProbeShape,
+  image: { readonly executable: string },
+  paths: { readonly settingsPath: string; readonly socketPath: string },
+  pty: { readonly python: string; readonly script: string } | null,
+): SpawnPlan => {
+  const command: readonly [string, ...string[]] = [image.executable, ...probeArgv(shape, paths)];
+  if (shape !== "interactive") return { executable: command[0], argv: command.slice(1), command };
+  if (pty === null) throw new Error("no python3 to allocate a pty for an interactive start");
+  return { executable: pty.python, argv: [pty.script, ...command], command };
+};
+
 /** The one endpoint a request has to have been sent to for this harness to call it a turn. */
 const MESSAGES_ENDPOINT = "/v1/messages";
 
@@ -914,22 +958,23 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
     };
 
-    // Both shapes' argv, and the interactive one's positional prompt, are `probeArgv`'s -- the
-    // same value a test hands to `isInteractiveClaudeInvocation`.
-    const args = probeArgv(options.shape, { settingsPath, socketPath });
-    const command = [image.executable, ...args];
+    // One decision, one value: what is spawned and what the reading records come from the same
+    // `spawnPlanFor` call, so the recorded `command` cannot describe an invocation other than the
+    // one below. Both shapes' argv, and the interactive one's positional prompt, are `probeArgv`'s
+    // -- the same value a test hands to `isInteractiveClaudeInvocation`.
+    const plan = spawnPlanFor(
+      options.shape,
+      image,
+      { settingsPath, socketPath },
+      options.shape === "interactive" ? resolvePtyAllocator() : null,
+    );
+    const command = plan.command;
 
-    if (options.shape === "interactive") {
-      const pty = resolvePtyAllocator();
-      if (pty === null) throw new Error("no python3 to allocate a pty for an interactive start");
-      child = spawn(pty.python, [pty.script, ...command], {
-        env,
-        cwd: workDir,
-        stdio: ["pipe", "pipe", "pipe"],
-      }) as ChildProcessWithoutNullStreams;
-    } else {
-      child = spawn(image.executable, args, { env, cwd: workDir, stdio: ["pipe", "pipe", "pipe"] }) as ChildProcessWithoutNullStreams;
-    }
+    child = spawn(plan.executable, plan.argv, {
+      env,
+      cwd: workDir,
+      stdio: ["pipe", "pipe", "pipe"],
+    }) as ChildProcessWithoutNullStreams;
     child.stdout.on("data", (chunk: Buffer) => {
       terminal.push(chunk);
     });

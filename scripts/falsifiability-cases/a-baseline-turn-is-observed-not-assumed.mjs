@@ -12,10 +12,15 @@
  * The mutation is the assumption written down: acceptance without an observation. The killing row
  * feeds an empty capture, a whitespace-only one, and one holding only a request to another endpoint,
  * and requires each to be "no turn seen".
+ *
+ * **What this row does not reach**: the predicate, not the refusal. The arm's `if (!baselineSeen)`
+ * branch -- the line that actually throws and fails the run -- is executed only when a real client
+ * has been started, so no row that must die where no client is installed can be anchored there. The
+ * claim is narrowed to the predicate accordingly.
  */
 const aBaselineTurnIsObservedNotAssumed = {
   id: "a-baseline-turn-is-observed-not-assumed",
-  what: "the harness requires a captured model request before it accepts that the baseline turn happened",
+  what: "the harness's baseline predicate requires a captured model request before it says the baseline turn happened",
   file: "tests/feasibility/wake-transport-qualification/harness.ts",
   find:
     "export const baselineTurnObserved = (capture: string, prompt: string): boolean =>\n" +
