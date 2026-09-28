@@ -126,6 +126,34 @@ describe("the qualified set and its readings must agree", () => {
     ]);
   });
 
+  it("an arm that executed another image, or will not say which it executed, is a failure", () => {
+    // `buildReceipt` cannot produce either of these -- it throws on an arm whose digest is not the
+    // receipt's -- so both are built by replacing the runs of a reading it did produce. That is the
+    // point: these rules read committed files, and a file can arrive hand-edited, from an older
+    // instrument, or with its runs replaced, while every number in it still looks like a pass.
+    const named = "0".repeat(64);
+    const withArms = (runs: readonly ProbeRun[]): RecordedReading => filed({ ...reading("2.1.268"), runs });
+    const members = [build("2.1.268")];
+
+    // The control first: the reading the instrument produced, whose arms all ran the image it names.
+    expect(qualificationDisagreements(members, [withArms(reading("2.1.268").runs)])).toEqual([]);
+
+    const elsewhere = "b".repeat(64);
+    expect(
+      qualificationDisagreements(members, [withArms([arm(true, true), { ...arm(false, true), imageSha256: elsewhere }])]),
+    ).toEqual([
+      `claude-code@2.1.268.json: arm 2 (interactive, control) executed ${elsewhere}, not the ${named} this reading names`,
+    ]);
+
+    // The state the committed readings were actually in until 2026-09-28: no per-arm digest at all,
+    // and every other rule satisfied. This is the one that used to pass.
+    const { imageSha256: _dropped, ...silent } = arm(true, true);
+    expect(qualificationDisagreements(members, [withArms([silent, arm(false, true)])])).toEqual([
+      `claude-code@2.1.268.json: arm 1 (interactive, injection) does not say which image it executed, ` +
+        `so nothing ties it to the ${named} this reading names`,
+    ]);
+  });
+
   it("a file holds the reading its name says, and a member is listed once", () => {
     expect(
       qualificationDisagreements([build("2.1.268")], [filed(reading("2.1.268"), "claude-code@2.1.282.json")]),

@@ -213,8 +213,10 @@ export interface ProbeRun {
    * inode and bytes that were digested before it ran. `buildReceipt` refuses an arm whose digest is
    * not the one the receipt names.
    *
-   * Optional only because the readings committed before this field existed do not carry it; every
-   * run `runQualificationProbe` returns does.
+   * Optional in the *type* because a committed reading is parsed JSON and the readings written
+   * before this field existed carried no such key. It is not optional in a committed reading:
+   * `qualificationDisagreements` refuses one whose arm does not carry it, so absence is a failure
+   * rather than a third answer. Every run `runQualificationProbe` returns carries it.
    */
   readonly imageSha256?: string;
   /** Model requests seen before the injection point, in both arms. */
@@ -1089,6 +1091,12 @@ export const readReadings = (directory: string = join(REPO_ROOT, RECEIPT_DIR)): 
  *     property the single receipt had when its verdict was required to be `qualified`.
  *   - **A file holds the reading its name says**, and a member is listed once. Those two are what
  *     make "one reading per build" true rather than conventional.
+ *   - **Every arm of every reading executed the image that reading names.** `buildReceipt` refuses
+ *     an arm on another digest while a reading is being *produced*, which says nothing about a
+ *     reading that reaches the repository some other way. Measured on 2026-09-28: the committed
+ *     readings carried no per-arm digest at all and this check passed on them, so a reading whose
+ *     arms ran on another build was indistinguishable from one whose arms ran on the build it
+ *     names -- the exact substitution the hold and the per-arm digest exist to catch.
  *
  * Membership is `isWakeTransportQualified` — the equality registration refuses on — so this cannot
  * pass on a looser notion of "the same build" than the one production applies.
@@ -1110,6 +1118,21 @@ export const qualificationDisagreements = (
     if (file !== expected) {
       problems.push(`${file} holds the reading of ${label(reading.client)}, whose file is ${expected}`);
     }
+  }
+  for (const { file, reading } of readings) {
+    // One comparison for both failures, because an arm that does not say which image it executed is
+    // not an arm that said the right one. Absence is the case that was slipping through -- the
+    // readings on disk had no per-arm digest and nothing failed -- so it is refused here rather
+    // than skipped, and the two are told apart only in what the sentence says.
+    reading.runs.forEach((run, index) => {
+      if (run.imageSha256 === reading.client.imageSha256) return;
+      const arm = `arm ${index + 1} (${run.shape}, ${run.injected ? "injection" : "control"})`;
+      problems.push(
+        run.imageSha256 === undefined
+          ? `${file}: ${arm} does not say which image it executed, so nothing ties it to the ${reading.client.imageSha256} this reading names`
+          : `${file}: ${arm} executed ${run.imageSha256}, not the ${reading.client.imageSha256} this reading names`,
+      );
+    });
   }
   members.forEach((member, index) => {
     if (members.findIndex((other) => isWakeTransportQualified(other, [member])) !== index) {
