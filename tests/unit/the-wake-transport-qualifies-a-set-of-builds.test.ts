@@ -1,4 +1,5 @@
-import { chmodSync, readFileSync, rmSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { chmodSync, existsSync, lstatSync, readFileSync, rmSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 
@@ -12,6 +13,7 @@ import { aggregate, type DoctorReport } from "../../src/doctor/doctor.ts";
 import { Daemon, OPERATOR_METHOD, type AuthenticatedOperatorPeer } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../../src/domain/types.ts";
 import {
+  ROLE_WAKE_FRAME,
   RoleConversationPort,
   WAKE_TRANSPORT_QUALIFIED_CLIENTS,
   isWakeTransportQualified,
@@ -205,6 +207,57 @@ describe("the CTO port names every holder that cannot be woken", () => {
     // The same state the scan now reports is the one a wake refuses, asked of the same port.
     expect(await port.wake(onMember.roleKey)).toMatchObject({ allowed: false });
   });
+
+  it("reports a holder whose registration still validates and whose wake was refused", async () => {
+    // Both reviewers' reproduction: every check made before a wake is sent passes -- the path is
+    // there, it is a socket, this uid owns it, its directory is owner-only -- and the connect is
+    // refused, because the process that bound it is gone. A socket path outlives its listener, so
+    // no filesystem answer can see this, and the scan called the holder wakeable while `wake`
+    // answered ROLE_PEER_FAILED.
+    const stateDir = tempDir("acp-wq-port-refused-");
+    chmodSync(stateDir, 0o700);
+    const onMember = binding("on-member");
+    const { port, attach } = portOver([onMember], stateDir);
+    const server = attach(onMember, { ...WAKE_TRANSPORT_QUALIFIED_CLIENTS[0] });
+    const presented = `${WAKE_TRANSPORT_QUALIFIED_CLIENTS[0].name}/${WAKE_TRANSPORT_QUALIFIED_CLIENTS[0].version}`;
+    const path = join(stateDir, "cto.wake.sock");
+    await abandonSocket(path);
+
+    // The validation still says yes, which is the whole difficulty: registration is accepted.
+    expect((await port.registerEndpoint(server, path)).allowed).toBe(true);
+    expect(port.endpointFor(onMember.roleKey)).toBe(path);
+    // Registration sends one wake of its own, and that is the delivery that fails here. Nothing
+    // dialled this socket to find out: the daemon was sending a wake anyway.
+    expect(await port.wake(onMember.roleKey)).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.ROLE_PEER_FAILED,
+    });
+    expect(port.unwakeableHolders()).toEqual([
+      {
+        roleKey: onMember.roleKey, role: Role.PRIMARY_CTO, presented,
+        cause: "registered-endpoint-refused-the-wake",
+      },
+    ]);
+
+    // What it establishes is a delivery that failed, not one that would fail. A listener bound
+    // behind the same path does not reach into the daemon to say so, and the report stays until a
+    // wake contradicts it -- which errs towards reporting, and is the direction to err in.
+    rmSync(path, { force: true });
+    const endpoint = await listeningSocket(path);
+    try {
+      expect(port.unwakeableHolders()).toHaveLength(1);
+      expect((await port.wake(onMember.roleKey)).allowed).toBe(true);
+      // The listener sees the frame on a later tick than the wake resolves on: `end` returns when
+      // the bytes are flushed, not when the peer has read them.
+      for (let attempt = 0; attempt < 50 && endpoint.received.length === 0; attempt += 1) {
+        await new Promise((tick) => setTimeout(tick, 20));
+      }
+      expect(endpoint.received).toEqual([ROLE_WAKE_FRAME]);
+      // The wake that landed is the contradiction, and the memory goes with it.
+      expect(port.unwakeableHolders()).toEqual([]);
+    } finally {
+      await endpoint.close();
+    }
+  });
 });
 
 describe("the daemon reports a binding that cannot receive wakes", () => {
@@ -227,7 +280,11 @@ describe("the daemon reports a binding that cannot receive wakes", () => {
    * this would be a holder on a member build that still cannot be woken -- which is the very state
    * these rows exist to report, so it would agree with the defect instead of ruling it out.
    */
-  const startHolder = async (label: string, client: { name: string; version: string } | undefined, register = false) => {
+  const startHolder = async (
+    label: string,
+    client: { name: string; version: string } | undefined,
+    register: boolean | "abandoned" = false,
+  ) => {
     const harness = makeHarness();
     harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
     const manifest = fixtureManifest(`wake-set-${label}`);
@@ -254,9 +311,14 @@ describe("the daemon reports a binding that cannot receive wakes", () => {
     const socket = await initializedPeer(listeners.socketPaths[1]!, {
       token: TOKEN, sessionId: session.sessionId, sessionSecret: session.sessionSecret,
     }, client);
-    const endpoint = register ? await listeningSocket(join(stateDir, `cto-${label}.wake.sock`)) : null;
-    if (endpoint) {
-      const registered = await callTool(socket, "role_wake_endpoint_register", { endpoint: endpoint.path });
+    const endpointPath = join(stateDir, `cto-${label}.wake.sock`);
+    // "abandoned" is a socket file whose listener is gone: every check the daemon makes before it
+    // connects passes, and the connect is refused. Registration succeeds either way -- it is
+    // decided by those checks -- and what differs is whether the wake it sends lands.
+    if (register === "abandoned") await abandonSocket(endpointPath);
+    const endpoint = register === true ? await listeningSocket(endpointPath) : null;
+    if (register !== false) {
+      const registered = await callTool(socket, "role_wake_endpoint_register", { endpoint: endpointPath });
       expect(registered.ok, `the fixture holder's registration: ${JSON.stringify(registered)}`).toBe(true);
     }
     const close = async (): Promise<void> => {
@@ -269,7 +331,11 @@ describe("the daemon reports a binding that cannot receive wakes", () => {
   };
 
   /** The on-demand door: `OPERATOR_METHOD.DOCTOR_RUN`, the one an operator asks through. */
-  const holderOn = async (label: string, client: { name: string; version: string } | undefined, register = false) => {
+  const holderOn = async (
+    label: string,
+    client: { name: string; version: string } | undefined,
+    register: boolean | "abandoned" = false,
+  ) => {
     const { daemon, roleKey, stateDir, close } = await startHolder(label, client, register);
     const response = await daemon.handleOperatorRequest(
       { requestId: `doctor-${label}`, method: OPERATOR_METHOD.DOCTOR_RUN, params: { scope: "system" } },
@@ -367,6 +433,37 @@ describe("the daemon reports a binding that cannot receive wakes", () => {
     expect(text).not.toMatch(/"\/|\s\/[A-Za-z]/);
   });
 
+  it("reports a holder whose registered endpoint refused the wake it was sent", async () => {
+    // Through the production door, with the production registration tool: the holder registers a
+    // socket the daemon accepts, the wake registration itself sends is refused, and the report says
+    // so with its own cause and its own repair. The repair is a restart of the holder -- there is
+    // no directory to put back and no build to change.
+    const { findings, roleKey, stateDir } = await holderOn("refused", MEMBER, "abandoned");
+    const presented = `${MEMBER.name}/${MEMBER.version}`;
+
+    const finding = findings.find((candidate) => candidate.code === CODE);
+    expect(finding, "no finding for a holder whose registered endpoint refused the wake").toBeDefined();
+    expect(finding?.observedEvidence).toEqual({
+      roleKey,
+      role: Role.PRIMARY_CTO,
+      presentedClient: presented,
+      cause: "registered-endpoint-refused-the-wake",
+      wakeTransportQualifiedClients: WAKE_TRANSPORT_QUALIFIED_CLIENTS.map(({ name, version }) => `${name}/${version}`),
+      wakeTransportPinSource: "src/mcp/role-conversation.ts WAKE_TRANSPORT_QUALIFIED_CLIENTS",
+    });
+    expect(finding?.recommendedAction).toContain("cannot receive wakes");
+    expect(finding?.recommendedAction).toContain("the last wake sent to it was refused");
+    // It says a wake failed, not that the next one must, and the repair is the holder's own restart.
+    expect(finding?.recommendedAction).toContain("Restart the holder so it binds and registers again");
+    expect(finding?.recommendedAction).not.toContain("Restart the holder on a qualified build");
+    expect(finding?.recommendedAction).not.toContain("--messaging-socket-path");
+
+    const text = JSON.stringify(finding);
+    expect(text).not.toContain(stateDir);
+    expect(text).not.toContain(".sock");
+    expect(text).not.toMatch(/"\/|\s\/[A-Za-z]/);
+  });
+
   it("stays quiet when the holder runs a qualified build and has registered a usable endpoint — the control", async () => {
     // A control the defect could not have satisfied: this holder is wakeable, through the real
     // registration tool, against a real socket in the daemon's own state directory.
@@ -391,7 +488,11 @@ describe("the daemon reports a binding that cannot receive wakes", () => {
    * member too, and `DEGRADED` for a non-member would prove nothing. The control below is what shows
    * the substitution leaves `HEALTHY` reachable.
    */
-  const refreshedAutomatically = async (label: string, client: { name: string; version: string } | undefined, register = false) => {
+  const refreshedAutomatically = async (
+    label: string,
+    client: { name: string; version: string } | undefined,
+    register: boolean | "abandoned" = false,
+  ) => {
     const { harness, daemon, stateDir, close } = await startHolder(label, client, register);
     try {
       vi.spyOn(harness.cp.doctor, "run").mockImplementation(
@@ -421,6 +522,8 @@ describe("the daemon reports a binding that cannot receive wakes", () => {
     expect(await refreshedAutomatically("no-build", undefined)).toBe("DEGRADED");
     // The state the scan used to skip: a member build with no registration reaches this door too.
     expect(await refreshedAutomatically("member-unregistered", MEMBER)).toBe("DEGRADED");
+    // And the one no filesystem check can see: a registration that validates and takes no wake.
+    expect(await refreshedAutomatically("refused", MEMBER, "abandoned")).toBe("DEGRADED");
   });
 
   it("the automatic refresh persists HEALTHY when the holder is on a qualified build and wakeable — the control", async () => {
@@ -497,6 +600,49 @@ const listeningSocket = async (path: string): Promise<{ path: string; received: 
     received,
     close: () => new Promise<void>((resolveClose) => server.close(() => resolveClose())),
   };
+};
+
+/**
+ * Leaves a socket file behind with nothing listening on it, the way a client that exited without
+ * cleaning up does.
+ *
+ * A separate process binds it and is killed uncatchably, because a unix socket file outlives the
+ * process that bound it and is removed only by an unlink somebody runs. Nothing else here can
+ * produce the state: `server.close()` unlinks the path, so a closed listener leaves no file, and a
+ * file made any other way is not a socket and would be refused for that instead. The point of the
+ * state is that every check the daemon makes before it connects passes and the connect does not.
+ *
+ * The child is this test's own, started and killed here; nothing is signalled that this row did
+ * not spawn.
+ */
+const abandonSocket = async (path: string): Promise<void> => {
+  const child = spawn(
+    process.execPath,
+    ["-e", "require('net').createServer().listen(process.argv[1], () => console.log('bound'))", path],
+    { stdio: ["ignore", "pipe", "pipe"] },
+  );
+  let stderr = "";
+  child.stderr.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString();
+  });
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`the fixture listener never bound\n${stderr}`)), 10_000);
+    const stop = (settle: () => void): void => {
+      clearTimeout(timer);
+      settle();
+    };
+    child.stdout.on("data", () => stop(resolve));
+    child.once("error", (error) => stop(() => reject(error)));
+    // A bind that fails exits, and the reason is on stderr -- most often a path over the ~104-byte
+    // cap a unix socket has, which is silent in every other way.
+    child.once("exit", (code) => stop(() => reject(new Error(`the fixture listener exited ${code}: ${stderr}`))));
+  });
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  child.kill("SIGKILL");
+  await exited;
+  // Stat'd rather than assumed: the row is worthless unless the path is still a socket this uid
+  // owns, which is what makes the registration pass and the connect fail.
+  expect(existsSync(path) && lstatSync(path).isSocket()).toBe(true);
 };
 
 /**

@@ -2001,13 +2001,13 @@ export class Daemon {
    * different cause. On 2026-09-27 that was every live client on the host: three builds, none of
    * them a member.
    *
-   * The build is one of four causes and not the definition. A holder on a qualified build that has
+   * The build is one of five causes and not the definition. A holder on a qualified build that has
    * registered no endpoint, or whose registered endpoint no longer validates, is exactly as
    * unreachable -- and until 2026-09-28 the scan returned early on a qualified build, so that was
    * the one state nothing reported. Each cause gets its own sentence and its own repair, because
    * they are different operator acts: a restart on a member, a `clientInfo` in the handshake, a
-   * `--messaging-socket-path` the daemon will accept, or a state directory whose ownership and mode
-   * have been put back.
+   * `--messaging-socket-path` the daemon will accept, a state directory whose ownership and mode
+   * have been put back, or a restart after a listener died behind a socket file that outlived it.
    *
    * One finding per binding, because the repair is per holder and an operator has to know which is
    * which. The evidence names the role key, the build the connection declared, the cause, and the
@@ -2071,6 +2071,16 @@ export class Daemon {
                 "with owner-only permissions. Put the directory back, then have the holder register again -- a " +
                 "restart does that, and nothing re-registers on its own",
             };
+          case "registered-endpoint-refused-the-wake":
+            return {
+              cause:
+                `its holder runs ${holder.presented}, a qualified build whose registered wake endpoint still ` +
+                "passes every check made before a wake is sent, and the last wake sent to it was refused",
+              repair:
+                "The socket file outlived whatever was listening on it, which is what a client that exited " +
+                "without cleaning up leaves behind. Restart the holder so it binds and registers again; nothing " +
+                "re-registers on its own, and this says a wake failed rather than that the next one must",
+            };
         }
       })();
       return {
@@ -2088,9 +2098,9 @@ export class Daemon {
           wakeTransportPinSource: "src/mcp/role-conversation.ts WAKE_TRANSPORT_QUALIFIED_CLIENTS",
         },
         recommendedAction:
-          `binding ${holder.roleKey} is active and ${cause}, so it cannot register a wake endpoint and ` +
-          "cannot receive wakes: a message addressed to it is stored, not delivered, until a holder on a " +
-          `qualified build registers. ${repair}`,
+          `binding ${holder.roleKey} is active and ${cause}, so it cannot receive wakes: a message addressed ` +
+          "to it is stored, not delivered, until a holder on a qualified build has a wake endpoint that takes " +
+          `a wake. ${repair}`,
       };
     });
   }

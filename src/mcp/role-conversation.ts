@@ -62,6 +62,20 @@ interface LivePeer {
    * `attach`'s detach by construction, rather than by a cleanup somebody has to remember to run.
    */
   endpoint: string | null;
+  /**
+   * The wake `endpoint` refused, or `null` while nothing has contradicted it.
+   *
+   * A socket path stays a socket after its listener is gone, so every check `wake` makes before it
+   * connects can pass while the connect itself is refused: the holder is reported wakeable and no
+   * wake arrives. The daemon already learns that the moment a wake fails, and this is where that
+   * fact is kept so the report can use it.
+   *
+   * **Scoped to the registration that earned it**, which is why the endpoint it failed against is
+   * stored beside the shape rather than a bare flag. `registerEndpoint` clears it, and a delivery
+   * that succeeds clears it, so a refusal cannot outlive the fact it describes -- the same rule the
+   * scan's own docstring states about refusals in general.
+   */
+  wakeFailure: { readonly endpoint: string; readonly shape: WakeFailure["shape"] } | null;
 }
 
 /**
@@ -300,12 +314,20 @@ export const wakeTransportQualifiedLabels = (): string[] =>
  * first holder has never given the daemon anywhere to knock, and the second gave one that no longer
  * passes the checks `wake` makes before it connects — a socket that has gone, or a state directory
  * whose ownership or mode has changed under it.
+ *
+ * `registered-endpoint-refused-the-wake` is the state those checks cannot see: the path is still
+ * there and still a socket this uid owns, and the connect is refused anyway because the process
+ * that bound it is gone. Reproduced by both reviewers, who found `wake` answering ROLE_PEER_FAILED
+ * for a holder this scan called wakeable. It is a report of a delivery that **failed**, never of a
+ * delivery that would fail: nothing here dials a socket to find out, so a registration that has not
+ * been used since it was made is reported usable because nothing has contradicted it yet.
  */
 export type UnwakeableCause =
   | "build-outside-the-qualified-set"
   | "no-declared-build"
   | "no-registered-endpoint"
-  | "registered-endpoint-not-usable";
+  | "registered-endpoint-not-usable"
+  | "registered-endpoint-refused-the-wake";
 
 /**
  * A binding that is active, whose holder is connected, and which still cannot receive a wake.
@@ -440,7 +462,7 @@ export class RoleConversationPort {
       if (scopeRoleKey !== undefined && binding.roleKey !== scopeRoleKey) continue;
       this.#clearStalePeer(binding.roleKey);
       if (scopeRoleKey !== undefined && this.#live.has(binding.roleKey)) continue;
-      this.#live.set(binding.roleKey, { server, authenticate, binding, endpoint: null });
+      this.#live.set(binding.roleKey, { server, authenticate, binding, endpoint: null, wakeFailure: null });
       owned.push(binding.roleKey);
     }
     return () => {
@@ -490,7 +512,7 @@ export class RoleConversationPort {
    * on the one case it said nothing about" — is the same argument, and the code now follows it in
    * both places.
    *
-   * The four causes are distinguished because the repairs are different, and a report that only
+   * The five causes are distinguished because the repairs are different, and a report that only
    * said "cannot be woken" would have to offer every repair to every holder.
    *
    * The endpoint is **revalidated here**, by the same `#validateEndpointPath` `wake` calls before
@@ -502,6 +524,17 @@ export class RoleConversationPort {
    * Asked of the live connection at the moment of the question rather than recorded when a
    * registration was refused: a peer that never tries to register is just as unwakeable, and a
    * refusal remembered past the connection that earned it would outlive the fact it describes.
+   *
+   * One thing *is* remembered, and it is bounded by that same rule: a wake this registration was
+   * sent and that the endpoint refused (`LivePeer.wakeFailure`). Every check above is a filesystem
+   * answer, and a socket path outlives the process that bound it, so a holder whose listener has
+   * gone passes all of them and takes no wake — both reviewers reproduced exactly that, with `wake`
+   * answering ROLE_PEER_FAILED while this scan called the holder wakeable. The alternative was for
+   * this scan to dial every holder's socket, which would put a side-effecting probe of a peer's
+   * messaging socket on a path that runs on every doctor refresh; the daemon already learns the
+   * fact when a wake it was sending fails, so nothing new is probed. What that buys is narrower
+   * than what a probe would claim, and the difference is the honest part: this reports a delivery
+   * that **failed**, not one that would fail. A registration nothing has tried is reported usable.
    *
    * A connection that has declared no build is reported, with `presented: null`, not skipped.
    * `registerEndpoint` asks the same predicate, which is false for no build, so that holder is
@@ -517,23 +550,33 @@ export class RoleConversationPort {
       if (!this.currentHolderConnected(roleKey)) continue;
       const client = peer.server.server.getClientVersion();
       const presented = client ? `${client.name}/${client.version}` : null;
-      const cause = this.#unwakeableCause(client, peer.endpoint);
+      const cause = this.#unwakeableCause(client, peer);
       if (cause === null) continue;
       holders.push({ roleKey, role: this.#role, presented, cause });
     }
     return holders;
   }
 
-  /** Why this connection cannot be woken, or `null` for one that can. */
-  #unwakeableCause(
-    client: WakeTransportClient | undefined,
-    endpoint: string | null,
-  ): UnwakeableCause | null {
+  /**
+   * Why this connection cannot be woken, or `null` for one that can.
+   *
+   * Ordered as `wake` itself fails: the build, then an endpoint at all, then whether that endpoint
+   * still passes the filesystem checks, then whether the last wake this registration was sent
+   * actually landed. Each answer is the first thing a wake would stop at, so the cause names the
+   * step that would refuse rather than the last one that could.
+   *
+   * The remembered failure is compared against the endpoint currently registered, not merely
+   * consulted: a memory that outlived the registration it was taken on would describe a wake to a
+   * socket this holder no longer names.
+   */
+  #unwakeableCause(client: WakeTransportClient | undefined, peer: LivePeer): UnwakeableCause | null {
     if (!isWakeTransportQualified(client)) {
       return client ? "build-outside-the-qualified-set" : "no-declared-build";
     }
+    const endpoint = peer.endpoint;
     if (endpoint === null) return "no-registered-endpoint";
-    return this.#validateEndpointPath(endpoint).allowed ? null : "registered-endpoint-not-usable";
+    if (!this.#validateEndpointPath(endpoint).allowed) return "registered-endpoint-not-usable";
+    return peer.wakeFailure?.endpoint === endpoint ? "registered-endpoint-refused-the-wake" : null;
   }
 
   /**
@@ -737,7 +780,13 @@ export class RoleConversationPort {
         );
       }
     }
-    for (const [, peer] of owned) peer.endpoint = validated.value;
+    for (const [, peer] of owned) {
+      peer.endpoint = validated.value;
+      // A registration is a new fact about where to knock, so whatever the previous one failed to
+      // deliver says nothing about this one. Cleared before the wake below, which is what decides
+      // whether this registration has a failure of its own.
+      peer.wakeFailure = null;
+    }
     const registered = owned.map(([roleKey]) => roleKey);
 
     // §3 — one constant wake per registered slot, unconditionally, and this is what makes the
@@ -915,12 +964,19 @@ export class RoleConversationPort {
         });
       });
     } catch (failure) {
+      // Remembered against the endpoint it was tried on, so the scan can report a holder whose
+      // registration is valid on the filesystem and still takes no wake -- the one unwakeable state
+      // no check made before connecting can see. Not a probe: this is a delivery that was going to
+      // happen anyway, and what is kept is its outcome.
+      peer.wakeFailure = { endpoint: revalidated.value, shape: (failure as WakeFailure).shape };
       return deny(ReasonCode.ROLE_PEER_FAILED, "the peer's wake endpoint did not accept the wake", {
         role: this.#role,
         roleKey,
         shape: (failure as WakeFailure).shape,
       });
     }
+    // A wake that landed is the contradiction of an earlier one that did not, so the memory goes.
+    peer.wakeFailure = null;
     return allow(ReasonCode.OK, undefined);
   }
 

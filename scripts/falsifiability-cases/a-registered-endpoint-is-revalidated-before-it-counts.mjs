@@ -16,8 +16,8 @@ const aRegisteredEndpointIsRevalidatedBeforeItCounts = {
   id: "a-registered-endpoint-is-revalidated-before-it-counts",
   what: "the CTO port reports a holder whose registered wake endpoint no longer passes the checks a wake makes",
   file: "src/mcp/role-conversation.ts",
-  find: '    return this.#validateEndpointPath(endpoint).allowed ? null : "registered-endpoint-not-usable";\n',
-  replace: "    return null;\n",
+  find: '    if (!this.#validateEndpointPath(endpoint).allowed) return "registered-endpoint-not-usable";\n',
+  replace: "",
   killedBy: [
     "tests/unit/the-wake-transport-qualifies-a-set-of-builds.test.ts::reports a registered endpoint that has stopped being usable, which is the state a wake would refuse",
   ],
