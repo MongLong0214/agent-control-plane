@@ -584,9 +584,14 @@ interface RenderedScreen {
   readonly cursorHidden: boolean;
   /**
    * Every sequence in the stream this model did not apply, named as it appeared, in the order first
-   * seen. The grid is claimed to be the terminal's only while this is empty.
+   * seen, including any a later repaint has since overwritten.
    */
   readonly unmodelled: readonly string[];
+  /**
+   * The part of `unmodelled` the final screen is still in doubt after, in the same order. The grid
+   * is claimed to be the terminal's only while this is empty.
+   */
+  readonly untrusted: readonly string[];
 }
 
 /**
@@ -638,6 +643,81 @@ const INERT_OSC: ReadonlySet<number> = new Set([
   116, 117, 118, 119, 133, 633, 777,
 ]);
 
+/**
+ * iTerm2's `OSC 1337` commands that change no cell, move no cursor and change how no later byte
+ * lands, judged one command at a time because the number says nothing: the same `1337` carries a
+ * navigation mark and an inline image. Each is decided from iTerm2's own definition of it
+ * (iterm2.com/documentation-escape-codes.html, read 2026-09-28):
+ *
+ *   - `SetMark` records a location to jump back to later, the same as the cmd-shift-M bookmark.
+ *   - `StealFocus` brings the window to the front.
+ *   - `CurrentDir`, `RemoteHost` and `ShellIntegrationVersion` report state to the terminal, as
+ *     OSC 7 does.
+ *   - `SetUserVar` sets a key in the session's variable dictionary.
+ *   - `CursorShape` sets the cursor's look, as `CSI Ps SP q` does.
+ *   - `SetColors` changes the palette, as OSC 4, 10 and 11 do.
+ *   - `Copy` puts the base64 payload carried inside the sequence itself on the pasteboard, as
+ *     OSC 52 does.
+ *   - `ReportCellSize` and `ReportVariable` are queries, answered on the input side.
+ *   - `SetKeyLabel`, `PushKeyLabels` and `PopKeyLabels` label the touch bar.
+ *   - `ClearScrollback` erases the history above the screen and not the screen, as ED 3 does.
+ *
+ * Known not to belong here, and unmodelled for the rest of the stream like any command not listed:
+ * `UnicodeVersion` changes the width table every later glyph is measured with; `CopyToClipboard`
+ * places all text received after it in the pasteboard until `EndCopy`, so where that text lands is
+ * not something the model knows; `SetProfile` and `SetProfileProperty` replace session settings,
+ * the font among them, and the model cannot say which of those move cells; `UpdateBlock` collapses
+ * a block into one line and expands it back, which moves every line below it. A command nobody has
+ * classified is not assumed to be inert: iTerm2 keeps adding them, and `UpdateBlock`, one of the
+ * newest (3.6.9), moves lines.
+ */
+const INERT_ITERM2_COMMANDS: ReadonlySet<string> = new Set([
+  "SetMark", "StealFocus", "CurrentDir", "RemoteHost", "ShellIntegrationVersion", "SetUserVar", "CursorShape",
+  "SetColors", "Copy", "ReportCellSize", "ReportVariable", "SetKeyLabel", "PushKeyLabels", "PopKeyLabels",
+  "ClearScrollback",
+]);
+
+/**
+ * iTerm2's `OSC 1337` commands that are unmodelled but confined to the screen: an inline image,
+ * sent whole (`File`) or in parts (`MultipartFile`, `FilePart`, `FileEnd`), per
+ * iterm2.com/documentation-images.html. It is drawn into the cells from the cursor on, at a width
+ * and height given in cells, pixels, a percentage or `auto`, and leaves the cursor past it -- a
+ * number of cells that depends on the image's pixels and the terminal's font, neither of which the
+ * model has, so it cannot be applied. What it can change
+ * is which cells hold what and where the cursor is -- not a mode, a margin, a width, a saved cursor
+ * or the other buffer -- and a repaint overwrites both, which is what `renderScreen` lets end its
+ * doubt. `File` without `inline=1` is a download that draws nothing; it is kept here rather than
+ * parsed, which only ever refuses more.
+ */
+const SCREEN_CONFINED_ITERM2_COMMANDS: ReadonlySet<string> = new Set(["File", "MultipartFile", "FilePart", "FileEnd"]);
+
+/**
+ * How long a sequence the model did not apply keeps the screen in doubt: for the rest of the
+ * stream, or -- for one whose definition confines it to cells and the cursor -- until a repaint has
+ * overwritten both. `renderScreen` says why those are the only two.
+ */
+type Doubt = "stream" | "screen";
+
+type ScreenBuffer = "main" | "alternate";
+
+/** What DECSC keeps and DECRC puts back, as far as this model reads it. */
+interface SavedCursor {
+  readonly row: number;
+  readonly col: number;
+  readonly inverse: boolean;
+  /** The screen-confined sequences the cursor's position was in doubt after when it was saved. */
+  readonly doubt: readonly string[];
+}
+
+/** A slot nothing was saved to. DECRC from it goes to the home cell with no attributes. */
+const NEVER_SAVED: SavedCursor = { row: 0, col: 0, inverse: false, doubt: [] };
+
+/** `into` with every name of `names` it did not already hold, in order. */
+const withNames = (into: readonly string[], names: readonly string[]): readonly string[] => {
+  const added = names.filter((name, index) => !into.includes(name) && names.indexOf(name) === index);
+  return added.length === 0 ? into : [...into, ...added];
+};
+
 /** Controls that are applied (BS, HT, LF, VT, FF, CR) or that a terminal ignores (NUL, BEL, DEL). */
 const KNOWN_CONTROLS: ReadonlySet<number> = new Set([0x00, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x7f]);
 
@@ -649,20 +729,19 @@ const KNOWN_CONTROLS: ReadonlySet<number> = new Set([0x00, 0x07, 0x08, 0x09, 0x0
  *
  *   - **Applied.** Printing and autowrap; absolute and relative cursor moves, with CUU, CUD, CNL
  *     and CPL stopping at a scroll margin as a terminal's do; saving and restoring the cursor with
- *     the inverse attribute it carries (DECSC/DECRC, `CSI s`/`CSI u`, mode 1048); the alternate
- *     screen (47, 1047, 1049); erasing (ED, EL, ECH); the scroll region (DECSTBM) and everything
- *     that moves lines within it -- a line feed in any of its forms (LF, VT, FF, IND, NEL) and a
- *     reverse index (RI) at a margin, insert and delete line (IL, DL), scroll up and down (SU, SD);
- *     insert and delete character (ICH, DCH); and inverse video (SGR 7, 27, 0), the one attribute
- *     readiness reads.
+ *     the inverse attribute it carries, one saved cursor per buffer (DECSC/DECRC, `CSI s`/`CSI u`,
+ *     mode 1048); the alternate screen (47, 1047, 1049); erasing (ED, EL, ECH); the scroll region
+ *     (DECSTBM) and everything that moves lines within it -- a line feed in any of its forms (LF,
+ *     VT, FF, IND, NEL) and a reverse index (RI) at a margin, insert and delete line (IL, DL),
+ *     scroll up and down (SU, SD); insert and delete character (ICH, DCH); and inverse video
+ *     (SGR 7, 27, 0), the one attribute readiness reads.
  *   - **Inert.** Sequences that by definition change no cell and do not move the cursor: queries
  *     and reports, input and keyboard modes, synchronized output, cursor visibility and shape,
  *     titles, colours, hyperlinks, the clipboard, and character-set designations, which change a
  *     glyph and never its width. Each is named in one of the lists above, with its reason.
  *   - **Unmodelled.** Everything else, including every sequence this file has never heard of. It is
- *     recorded by name in `unmodelled`, and from then on the grid is not claimed to be the
- *     terminal's: readiness refuses for the rest of the stream, because a sequence that moved cells
- *     leaves them moved and nothing later says which.
+ *     recorded by name in `unmodelled`, and while it is in `untrusted` the grid is not claimed to
+ *     be the terminal's and readiness refuses.
  *
  * The third set is what makes the first two worth trusting. Until 2026-09-28 an unknown final fell
  * through a `default: break`: an insert-line was dropped, the model kept a caret on a row the
@@ -670,12 +749,40 @@ const KNOWN_CONTROLS: ReadonlySet<number> = new Set([0x00, 0x07, 0x08, 0x09, 0x0
  * allow-list and not a deny-list, because a deny-list fires only on the sequences its author
  * thought of, which is the same defect with a smaller surface.
  *
+ * How long an unmodelled sequence stays in `untrusted`. A sequence can leave three kinds of thing
+ * wrong: which cells hold what, where the cursor is, and state that decides how later bytes land --
+ * a mode (insert, origin, autowrap), a margin, a tab stop, a width table, a saved cursor, the other
+ * buffer. A repaint overwrites the first two and none of the third: after `CSI 4h` every glyph of
+ * the most careful redraw still pushes its line right. So there are two lifetimes, and a sequence
+ * gets the short one only by being named for it:
+ *
+ *   - **For the rest of the stream**, the default. A sequence the model does not know is one it
+ *     cannot say is confined to cells and the cursor, and forgiving it at a repaint is the defect
+ *     this set exists to stop -- a screen the terminal moved, read as the one the model drew.
+ *   - **Until a repaint**, for a sequence whose definition confines it to cells and the cursor
+ *     (`SCREEN_CONFINED_ITERM2_COMMANDS`, inline images). It puts in doubt the cursor's position and
+ *     the cells of the buffer it arrived on, and nothing else. Those cells are known again when that
+ *     buffer is blanked whole: ED 2, or 1049 clearing the alternate on the way in. The cursor is
+ *     known again when it is placed by both coordinates (CUP, HVP) or restored from a slot saved
+ *     while it was known. Until then, anything written at the cursor -- a glyph, an erase, an insert
+ *     or delete, a line feed that may scroll -- puts the cells back in doubt, since where it landed
+ *     is not known. The screen is trusted again when neither its cursor nor the shown buffer's
+ *     cells are in doubt.
+ *
+ * The risk this accepts sits entirely in the short list. A sequence placed there that can in fact
+ * change a mode, a margin or a width is forgiven by the next repaint, and from then on the model is
+ * wrong without saying so. That is why the list is one family long, why the entry carries the
+ * definition it was decided from, and why an unknown command in the same `OSC 1337` namespace takes
+ * the long lifetime. The cost on the other side is also accepted: a harmless sequence nobody has
+ * classified still refuses every later frame, and the remedy is a classification that
+ * `describeReadiness` names, not a timeout.
+ *
  * An escape sequence still incomplete at the end of the stream is left unapplied until the rest of
  * it arrives. At that instant a terminal has not applied it either.
  */
 const renderScreen = (stream: string): RenderedScreen => {
   const main = blankGrid();
-  let alternate = blankGrid();
+  const alternate = blankGrid();
   let grid = main;
   let fullScreen = false;
   let cursorHidden = false;
@@ -688,12 +795,32 @@ const renderScreen = (stream: string): RenderedScreen => {
   // The scroll region, 0-based and inclusive: the whole screen until DECSTBM says otherwise.
   let top = 0;
   let bottom = PTY_ROWS - 1;
-  let saved = { row: 0, col: 0, inverse: false };
+  // One saved cursor per buffer, as xterm keeps them (cursor.c: `screen->sc[screen->whichBuf]` in
+  // both CursorSave and CursorRestore): a DECSC on the alternate screen does not replace the cursor
+  // that leaving it with 1049 puts back.
+  const saved: Record<ScreenBuffer, SavedCursor> = { main: NEVER_SAVED, alternate: NEVER_SAVED };
   const unmodelled: string[] = [];
+  // Every unmodelled sequence whose doubt lasts for the rest of the stream.
+  const standing = new Set<string>();
+  // The screen-confined sequences the cursor's position is in doubt after, and each buffer's cells.
+  let cursorDoubt: readonly string[] = [];
+  const cellDoubt: Record<ScreenBuffer, readonly string[]> = { main: [], alternate: [] };
+  const shown = (): ScreenBuffer => (fullScreen ? "alternate" : "main");
 
-  const refuse = (raw: string): void => {
+  const refuse = (raw: string, doubt: Doubt = "stream"): void => {
     const name = nameSequence(raw);
     if (!unmodelled.includes(name)) unmodelled.push(name);
+    if (doubt === "stream") {
+      standing.add(name);
+      return;
+    }
+    cursorDoubt = withNames(cursorDoubt, [name]);
+    cellDoubt[shown()] = withNames(cellDoubt[shown()], [name]);
+  };
+  // Something is about to be written at the cursor, or moved from where it is. If the cursor's
+  // position is in doubt, so is which cells that touched.
+  const written = (): void => {
+    cellDoubt[shown()] = withNames(cellDoubt[shown()], cursorDoubt);
   };
 
   const moveTo = (toRow: number, toCol: number): void => {
@@ -721,6 +848,7 @@ const renderScreen = (stream: string): RenderedScreen => {
   // IL and DL act only on a cursor inside the region, move the lines from the cursor down to the
   // bottom margin, and leave the cursor in the first column.
   const insertLines = (count: number): void => {
+    written();
     if (row < top || row > bottom) return;
     const span = Math.min(count, bottom - row + 1);
     grid.splice(bottom - span + 1, span);
@@ -728,6 +856,7 @@ const renderScreen = (stream: string): RenderedScreen => {
     moveTo(row, 0);
   };
   const deleteLines = (count: number): void => {
+    written();
     if (row < top || row > bottom) return;
     const span = Math.min(count, bottom - row + 1);
     grid.splice(row, span);
@@ -736,6 +865,7 @@ const renderScreen = (stream: string): RenderedScreen => {
   };
   // ICH and DCH move the rest of the cursor's line right or left; the cursor stays where it is.
   const insertCells = (count: number): void => {
+    written();
     const line = grid[row];
     if (line === undefined) return;
     const span = Math.min(count, PTY_COLS - col);
@@ -744,6 +874,7 @@ const renderScreen = (stream: string): RenderedScreen => {
     wrapPending = false;
   };
   const deleteCells = (count: number): void => {
+    written();
     const line = grid[row];
     if (line === undefined) return;
     const span = Math.min(count, PTY_COLS - col);
@@ -752,14 +883,17 @@ const renderScreen = (stream: string): RenderedScreen => {
     wrapPending = false;
   };
   const lineFeed = (): void => {
+    written();
     if (row === bottom) scrollUp(1);
     else if (row < PTY_ROWS - 1) row += 1;
   };
   const reverseIndex = (): void => {
+    written();
     if (row === top) scrollDown(1);
     else if (row > 0) row -= 1;
   };
   const erase = (onRow: number, from: number, to: number): void => {
+    written();
     const line = grid[onRow];
     if (line === undefined) return;
     for (let at = Math.max(0, from); at < Math.min(PTY_COLS, to); at += 1) line[at] = blankCell();
@@ -767,30 +901,38 @@ const renderScreen = (stream: string): RenderedScreen => {
   // The attribute goes with the position: a restore that kept the current inverse would paint
   // the next blank as a caret the client never drew.
   const saveCursor = (): void => {
-    saved = { row, col, inverse };
+    saved[shown()] = { row, col, inverse, doubt: cursorDoubt };
   };
   const restoreCursor = (): void => {
-    moveTo(saved.row, saved.col);
-    inverse = saved.inverse;
+    const slot = saved[shown()];
+    moveTo(slot.row, slot.col);
+    inverse = slot.inverse;
+    cursorDoubt = slot.doubt;
   };
-  // 1049 saves the cursor and clears the alternate screen on the way in and restores the cursor
-  // on the way out; 1047 clears it on the way out; 47 does neither.
+  // xterm's ClearScreen on the alternate buffer: every cell blank, which ends any doubt about them,
+  // and no wrap pending. The cursor stays where it is.
+  const clearAlternate = (): void => {
+    alternate.splice(0, alternate.length, ...blankGrid());
+    cellDoubt.alternate = [];
+    wrapPending = false;
+  };
+  // xterm, charproc.c (srm_OPT_ALTBUF_CURSOR, srm_OPT_ALTBUF, srm_ALTBUF). 1049 is save, switch,
+  // clear on the way in and switch, restore on the way out, each step whether or not the buffer
+  // changes, and each save or restore on the slot of the buffer shown at that moment: the save made
+  // on the way in is on the main slot and so is the restore on the way out. 1047 clears the
+  // alternate on the way out if it is shown, and 47 only switches. None of them moves the cursor.
   const useScreen = (wanted: boolean, mode: number): void => {
-    if (wanted === fullScreen) return;
-    if (wanted) {
-      if (mode === 1049) {
-        saveCursor();
-        alternate = blankGrid();
-      }
-      grid = alternate;
-    } else {
-      if (mode === 1047) alternate = blankGrid();
-      grid = main;
-      if (mode === 1049) restoreCursor();
+    if (mode === 1049 && wanted) saveCursor();
+    if (mode === 1047 && !wanted && fullScreen) clearAlternate();
+    if (wanted !== fullScreen) {
+      grid = wanted ? alternate : main;
+      fullScreen = wanted;
     }
-    fullScreen = wanted;
+    if (mode === 1049 && wanted) clearAlternate();
+    if (mode === 1049 && !wanted) restoreCursor();
   };
   const put = (glyph: string, width: 0 | 1 | 2): void => {
+    written();
     if (width === 0) {
       const previous = grid[row]?.[wrapPending ? col : Math.max(0, col - 1)];
       if (previous !== undefined) previous.glyph += glyph;
@@ -827,6 +969,14 @@ const renderScreen = (stream: string): RenderedScreen => {
         index += kind === "5" ? 2 : kind === "2" ? 4 : 0;
       }
     }
+  };
+
+  // One `OSC 1337` command, judged by its name -- `SetMark`, `File`, `CurrentDir` -- and not by the
+  // number every one of them shares.
+  const iterm2 = (raw: string, content: string): void => {
+    const command = /^1337;([A-Za-z]+)(?:[=;:]|$)/.exec(content)?.[1] ?? "";
+    if (INERT_ITERM2_COMMANDS.has(command)) return;
+    refuse(raw, SCREEN_CONFINED_ITERM2_COMMANDS.has(command) ? "screen" : "stream");
   };
 
   const csi = (raw: string, body: string, final: string): void => {
@@ -889,7 +1039,8 @@ const renderScreen = (stream: string): RenderedScreen => {
       case "F": up(count(0)); col = 0; break;
       case "G": case "`": moveTo(row, count(0) - 1); break;
       case "d": moveTo(count(0) - 1, col); break;
-      case "H": case "f": moveTo(count(0) - 1, count(1) - 1); break;
+      // The one move that names both coordinates, and so the one that ends doubt about the cursor.
+      case "H": case "f": moveTo(count(0) - 1, count(1) - 1); cursorDoubt = []; break;
       case "J":
         if (mode === 0) {
           erase(row, col, PTY_COLS);
@@ -899,6 +1050,8 @@ const renderScreen = (stream: string): RenderedScreen => {
           erase(row, 0, col + 1);
         } else if (mode === 2) {
           for (let every = 0; every < PTY_ROWS; every += 1) erase(every, 0, PTY_COLS);
+          // Every cell of the shown buffer is blank whatever was there, so their doubt ends here.
+          cellDoubt[shown()] = [];
         } else if (mode !== 3) {
           // 3 erases the scrollback, which is not on the screen.
           refuse(raw);
@@ -966,7 +1119,8 @@ const renderScreen = (stream: string): RenderedScreen => {
         const raw = stream.slice(at, after);
         if (next === "]") {
           const command = /^(\d+)(?:;|$)/.exec(content)?.[1];
-          if (command === undefined || !INERT_OSC.has(Number(command))) refuse(raw);
+          if (command === "1337") iterm2(raw, content);
+          else if (command === undefined || !INERT_OSC.has(Number(command))) refuse(raw);
         } else if (next === "P") {
           // Only the two queries: every other device-control string -- sixel above all -- draws.
           if (!content.startsWith("$q") && !content.startsWith("+q")) refuse(raw);
@@ -1039,18 +1193,24 @@ const renderScreen = (stream: string): RenderedScreen => {
     put(glyph, cellWidth(codePoint));
   }
 
-  return { grid, row, col, fullScreen, cursorHidden, unmodelled };
+  // In doubt at the end: whatever lasts the stream, and whatever the cursor or the shown buffer's
+  // cells are still in doubt after.
+  const untrusted = unmodelled.filter((name) =>
+    standing.has(name) || cursorDoubt.includes(name) || cellDoubt[shown()].includes(name));
+  return { grid, row, col, fullScreen, cursorHidden, unmodelled, untrusted };
 };
 
 export interface InteractiveReadiness {
-  /** The decision: `cursorOnCaret`, on a screen the model applied every sequence of. */
+  /** The decision: `cursorOnCaret`, on a screen no sequence the model did not apply leaves in doubt. */
   readonly ready: boolean;
   readonly cursorOnCaret: boolean;
-  /**
-   * Every sequence the screen model did not apply, named as it appeared. Non-empty means the
-   * rendered screen may not be the terminal's, and readiness refuses whatever the cursor is over.
-   */
+  /** Every sequence the screen model did not apply, named as it appeared, including any since overwritten. */
   readonly unmodelled: readonly string[];
+  /**
+   * The unmodelled sequences the final screen is still in doubt after. Non-empty means the rendered
+   * screen may not be the terminal's, and readiness refuses whatever the cursor is over.
+   */
+  readonly untrusted: readonly string[];
   /** 1-based, as the terminal's own cursor moves number them, so a report reads against the log. */
   readonly cursor: { readonly row: number; readonly column: number };
   readonly underCursor: string;
@@ -1095,7 +1255,9 @@ export interface InteractiveReadiness {
  * model dropped leaves an inverse blank on a row the terminal has moved, and a park on that row
  * then reads as ready while the terminal's cursor rests on something else. So a stream carrying
  * any sequence `renderScreen` does not apply is not ready, whatever the cursor is over, and
- * `describeReadiness` names the sequence.
+ * `describeReadiness` names the sequence -- for the rest of the stream, unless the sequence is one
+ * whose every possible effect a repaint overwrites and the client has since repainted
+ * (`renderScreen` gives the rule and the risk it accepts).
  *
  * What would make this stale: the client showing the terminal's cursor instead of drawing one,
  * drawing its caret in something other than inverse video, ending a frame with the cursor anywhere
@@ -1108,7 +1270,7 @@ export const interactiveReadiness = (stream: string): InteractiveReadiness => {
   const rendered = renderScreen(stream);
   const under = rendered.grid[rendered.row]?.[rendered.col];
   const cursorOnCaret = under !== undefined && under.inverse && under.glyph === " ";
-  const ready = cursorOnCaret && rendered.unmodelled.length === 0;
+  const ready = cursorOnCaret && rendered.untrusted.length === 0;
   const carets: { row: number; column: number }[] = [];
   rendered.grid.forEach((line, rowIndex) => {
     line.forEach((cell, colIndex) => {
@@ -1119,6 +1281,7 @@ export const interactiveReadiness = (stream: string): InteractiveReadiness => {
     ready,
     cursorOnCaret,
     unmodelled: rendered.unmodelled,
+    untrusted: rendered.untrusted,
     cursor: { row: rendered.row + 1, column: rendered.col + 1 },
     underCursor: under?.glyph ?? "",
     carets,
@@ -1136,9 +1299,12 @@ export const describeReadiness = (reading: InteractiveReadiness): string => {
     .filter(({ line }) => line.trim().length > 0)
     .map(({ line, row }) => `${String(row).padStart(2)}| ${line}`);
   return [
-    "looked for: the cursor at rest on a caret the client drew (an inverse-video blank cell), on a screen the model applied in full",
+    "looked for: the cursor at rest on a caret the client drew (an inverse-video blank cell), on a screen no sequence the model did not apply leaves in doubt",
     `  cursor on a caret: ${reading.cursorOnCaret ? "yes" : "no"}`,
     `  every sequence applied: ${reading.unmodelled.length === 0 ? "yes" : `no -- not modelled: ${reading.unmodelled.join(", ")}`}`,
+    `  screen in doubt: ${reading.untrusted.length === 0
+      ? reading.unmodelled.length === 0 ? "no" : "no -- each sequence not applied was confined to the screen and repainted over since"
+      : `yes -- after: ${reading.untrusted.join(", ")}`}`,
     `  cursor: ${at(reading.cursor)}, over ${JSON.stringify(reading.underCursor)}`,
     `  carets drawn: ${reading.carets.length === 0 ? "none" : reading.carets.map(at).join("; ")}`,
     "seen, as context rather than as inputs to the decision:",

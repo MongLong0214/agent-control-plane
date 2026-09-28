@@ -287,3 +287,180 @@ describe("U6: the screen model applies a sequence that moves cells, or refuses t
     }
   });
 });
+
+/** 2.1.283's input row: `❯ ` and an inverse blank at row 38, column 3. The cursor is left after it. */
+const inputRow = "\u001b[38;1H❯ \u001b[7m \u001b[27m";
+
+/**
+ * DEC save and restore are per buffer: xterm keeps one saved cursor for the main screen and one for
+ * the alternate (`cursor.c`, `sc[whichBuf]`), and `CSI ?1049h/l` is save, switch, clear on the way
+ * in and switch, restore on the way out. With one saved cursor shared between them, a save made on
+ * the alternate screen replaced the one that leaving it restores, and a stream review built read
+ * `ready: true` with the terminal's cursor on row 1.
+ */
+describe("U6: a saved cursor belongs to the buffer it was saved on", () => {
+  const onMain = `\u001b[?25l${inputRow}`;
+
+  it("a cursor saved on the alternate screen is not the one leaving it with 1049 restores", () => {
+    // Review's stream: parked at row 1 on the main screen, the alternate entered, a save made there
+    // on the caret's row, and the alternate left. The terminal puts back row 1.
+    const reviewed = interactiveReadiness(`${onMain}\u001b[1;1H\u001b[?1049h\u001b[38;3H\u001b7\u001b[?1049l`);
+    expect(reviewed.cursor).toEqual({ row: 1, column: 1 });
+    expect(reviewed.ready, describeReadiness(reviewed)).toBe(false);
+    expect(reviewed.unmodelled).toEqual([]);
+
+    // The other way round: parked on the caret when the alternate is entered, and a save made on
+    // row 1 there. Leaving puts the cursor back on the caret.
+    const returned = interactiveReadiness(`${onMain}\u001b[38;3H\u001b[?1049h\u001b[1;1H\u001b7\u001b[?1049l`);
+    expect(returned.cursor).toEqual({ row: 38, column: 3 });
+    expect(returned.ready, describeReadiness(returned)).toBe(true);
+  });
+
+  it("a save and a restore on one screen still return to the saved cell, on either screen and by every form", () => {
+    const forms = [["\u001b7", "\u001b8"], ["\u001b[s", "\u001b[u"], ["\u001b[?1048h", "\u001b[?1048l"]] as const;
+    for (const enter of ["", "\u001b[?1049h"]) {
+      for (const [save, restore] of forms) {
+        const reading = interactiveReadiness(`${enter}${onMain}\u001b[38;3H${save}\u001b[1;1H${restore}`);
+        expect(reading.ready, `${JSON.stringify(enter)} ${JSON.stringify(save)}\n${describeReadiness(reading)}`).toBe(true);
+      }
+    }
+  });
+});
+
+/**
+ * An unmodelled sequence used to refuse every later frame: the record was never cleared, so one
+ * harmless sequence before the prompt failed the readiness wait, and no repaint could recover it.
+ * Two repairs, which pull against each other.
+ *
+ * `OSC 1337` is judged by its command, because the number carries a navigation mark and an inline
+ * image alike. And a sequence's doubt lasts as long as its effect can: a repaint overwrites cells
+ * and the cursor, so it ends the doubt of a sequence confined to those, and it overwrites no mode,
+ * so the doubt of a sequence the model cannot confine lasts the stream. Forgive that one at a
+ * repaint and a screen the terminal moved reads as the one the model drew again.
+ */
+describe("U6: an unmodelled sequence keeps the screen in doubt for as long as its effect can last", () => {
+  const image = "\u001b]1337;File=inline=1:AAAA\u0007";
+  const imageName = "ESC]1337;File=inline=1:AAAA\\x07";
+  // The same repaint for every case below: home, the whole screen erased, the input row drawn, and
+  // the cursor parked on its caret.
+  const repaint = `\u001b[H\u001b[2J${inputRow}\u001b[38;3H`;
+
+  it("an OSC 1337 command is judged by what it does: a mark on the caret is ready, and an image or a command nobody classified is not", () => {
+    const text = transcriptOf(loadFirstScreen("claude-code@2.1.283.json").reads);
+    const parkedAfter = (sequence: string) => interactiveReadiness(`${text}\u001b[1;1H${sequence}\u001b[38;3H`);
+
+    const inert = [
+      "\u001b]1337;SetMark\u001b\\",
+      "\u001b]1337;SetMark\u0007",
+      "\u001b]1337;CurrentDir=/tmp\u0007",
+      "\u001b]1337;SetUserVar=phase=cmVhZHk=\u0007",
+      "\u001b]1337;RemoteHost=user@host\u0007",
+      "\u001b]1337;ShellIntegrationVersion=17;zsh\u0007",
+      "\u001b]1337;CursorShape=1\u0007",
+    ];
+    for (const sequence of inert) {
+      const reading = parkedAfter(sequence);
+      expect(reading.ready, `${JSON.stringify(sequence)}\n${describeReadiness(reading)}`).toBe(true);
+      expect(reading.unmodelled, JSON.stringify(sequence)).toEqual([]);
+    }
+
+    // Review's second run: the mark, then the screen cleared and redrawn. It stayed refused.
+    const redrawn = interactiveReadiness(
+      `\u001b[?1049h\u001b[?25l${inputRow}\u001b]1337;SetMark\u001b\\\u001b[2J\u001b[H${inputRow}\u001b[38;3H`,
+    );
+    expect(redrawn.ready, describeReadiness(redrawn)).toBe(true);
+
+    const refused = [
+      // Draws at the cursor and moves it by a size the model cannot know.
+      { sequence: image, name: imageName },
+      // Changes how wide every later glyph is.
+      { sequence: "\u001b]1337;UnicodeVersion=8\u0007", name: "ESC]1337;UnicodeVersion=8\\x07" },
+      // Everything received after it goes to the pasteboard until EndCopy.
+      { sequence: "\u001b]1337;CopyToClipboard=\u0007", name: "ESC]1337;CopyToClipboard=\\x07" },
+      // Nobody has classified it, so nobody may assume it is inert.
+      { sequence: "\u001b]1337;NotYetDefined=1\u0007", name: "ESC]1337;NotYetDefined=1\\x07" },
+      { sequence: "\u001b]1337\u0007", name: "ESC]1337\\x07" },
+    ];
+    for (const { sequence, name } of refused) {
+      const reading = parkedAfter(sequence);
+      expect(reading.ready, name).toBe(false);
+      expect(reading.untrusted, name).toEqual([name]);
+    }
+  });
+
+  it("a repaint ends the doubt an inline image leaves, and not the doubt of a sequence that changes how later bytes land", () => {
+    const text = transcriptOf(loadFirstScreen("claude-code@2.1.283.json").reads);
+
+    // The image, and the cursor sent straight back to the caret: its cells are in doubt.
+    const drawnOver = interactiveReadiness(`${text}\u001b[1;1H${image}\u001b[38;3H`);
+    expect(drawnOver.ready, describeReadiness(drawnOver)).toBe(false);
+    expect(drawnOver.untrusted).toEqual([imageName]);
+
+    // The image, then the repaint: ready, with the image still on record.
+    const repainted = interactiveReadiness(`${text}\u001b[1;1H${image}${repaint}`);
+    expect(repainted.ready, describeReadiness(repainted)).toBe(true);
+    expect(repainted.unmodelled).toEqual([imageName]);
+    expect(repainted.untrusted).toEqual([]);
+    expect(describeReadiness(repainted)).toContain(
+      "screen in doubt: no -- each sequence not applied was confined to the screen and repainted over since",
+    );
+    const parts = "\u001b]1337;MultipartFile=inline=1\u0007\u001b]1337;FilePart=AAAA\u0007\u001b]1337;FileEnd\u0007";
+    expect(interactiveReadiness(`${text}\u001b[1;1H${parts}${repaint}`).ready).toBe(true);
+
+    // The other direction, across that same repaint.
+    const lasting = [
+      // Insert mode: every glyph of the redraw pushes the rest of its line right.
+      { sequence: "\u001b[4h", name: "ESC[4h" },
+      // Origin mode: the redraw's absolute moves land relative to the scroll region.
+      { sequence: "\u001b[?6h", name: "ESC[?6h" },
+      // A final the model never names, so nothing says what it left behind.
+      { sequence: "\u001b[3j", name: "ESC[3j" },
+      { sequence: "\u001b]1337;UnicodeVersion=8\u0007", name: "ESC]1337;UnicodeVersion=8\\x07" },
+      { sequence: "\u001b]1337;NotYetDefined=1\u0007", name: "ESC]1337;NotYetDefined=1\\x07" },
+    ];
+    for (const { sequence, name } of lasting) {
+      const reading = interactiveReadiness(`${text}\u001b[1;1H${sequence}${repaint}`);
+      expect(reading.ready, name).toBe(false);
+      expect(reading.untrusted, name).toEqual([name]);
+      expect(describeReadiness(reading), name).toContain(`screen in doubt: yes -- after: ${name}`);
+      // With the image before it, the repaint ends the image's doubt and not this one's.
+      const both = interactiveReadiness(`${text}\u001b[1;1H${image}${sequence}${repaint}`);
+      expect(both.unmodelled, name).toEqual([imageName, name]);
+      expect(both.untrusted, name).toEqual([name]);
+    }
+
+    // Leaving the buffer the image was drawn on is the other boundary: 1049 restores the cursor
+    // saved on the way in, and the main screen's cells were never in doubt. Entering again by 1049
+    // clears the alternate, so a caret drawn there and parked on is ready.
+    expect(interactiveReadiness(`${text}\u001b[1;1H${image}\u001b[?1049l`).untrusted).toEqual([]);
+    const reentered = interactiveReadiness(`${text}\u001b[1;1H${image}\u001b[?1049l\u001b[?1049h${inputRow}\u001b[38;3H`);
+    expect(reentered.ready, describeReadiness(reentered)).toBe(true);
+  });
+
+  it("a repaint that has not placed the cursor, or writes before placing it, leaves the screen in doubt", () => {
+    // The caret on the main screen with the cursor on it; the alternate entered by 1047, which does
+    // not clear it; an image drawn there; the alternate left by 1047, which does not restore the
+    // cursor. The main screen's cells were never in doubt. Where the image left the cursor is.
+    const onMain = `\u001b[?25l${inputRow}\u001b[38;3H`;
+    const unplaced = interactiveReadiness(`${onMain}\u001b[?1047h${image}\u001b[?1047l`);
+    expect(unplaced.cursorOnCaret).toBe(true);
+    expect(unplaced.ready, describeReadiness(unplaced)).toBe(false);
+    expect(unplaced.untrusted).toEqual([imageName]);
+    const placed = interactiveReadiness(`${onMain}\u001b[?1047h${image}\u001b[?1047l\u001b[38;3H`);
+    expect(placed.ready, describeReadiness(placed)).toBe(true);
+
+    // The image drawn on row 37, the screen erased, and the input row written by a line feed and
+    // text from wherever the cursor then was. The model has that as row 38 and the park lands on
+    // its caret, but the terminal's cursor had moved past the image, so which row was written is
+    // not known -- and a park by both coordinates afterwards does not make it known.
+    const text = transcriptOf(loadFirstScreen("claude-code@2.1.283.json").reads);
+    const writtenBlind = interactiveReadiness(`${text}\u001b[37;1H${image}\u001b[2J\n❯ \u001b[7m \u001b[27m\u001b[38;3H`);
+    expect(writtenBlind.cursorOnCaret).toBe(true);
+    expect(writtenBlind.ready, describeReadiness(writtenBlind)).toBe(false);
+    expect(writtenBlind.untrusted).toEqual([imageName]);
+    const thenRepainted = interactiveReadiness(
+      `${text}\u001b[37;1H${image}\u001b[2J\n❯ \u001b[7m \u001b[27m\u001b[38;3H${repaint}`,
+    );
+    expect(thenRepainted.ready, describeReadiness(thenRepainted)).toBe(true);
+  });
+});
