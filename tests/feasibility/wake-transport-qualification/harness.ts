@@ -783,42 +783,77 @@ export const modelRequestsIn = (capture: string): readonly CapturedRequest[] =>
     (request) => request.method === "POST" && requestEndpoint(request.url) === MESSAGES_ENDPOINT,
   );
 
+/** One piece of text a request asked the model to read, and where in the request it came from. */
+export interface ModelInputText {
+  /** `system` for the request's system blocks; otherwise the role of the message it arrived in. */
+  readonly from: string;
+  readonly text: string;
+}
+
 /**
- * The text of every user message in a request body, flattened; empty for a body that is not one.
+ * Every piece of text a request put in front of the model: its system blocks and its messages'
+ * text, each labelled with where it came from. Empty for a body that is not a request of that
+ * shape.
  *
- * The measured builds send `messages: [{ role: "user", content: [{ type: "text", text }, ...] }]`,
- * with the prompt as a block of its own beside the system reminders. A string `content` is
- * accepted too, since that is the shape of the frame the headless arm writes on stdin and a build
- * is free to forward it unchanged. Anything else -- an unparseable body, no `messages`, a
- * non-user role, a block that is not text -- contributes nothing rather than throwing: this reads
- * a foreign process's output, and a shape it does not recognise is a baseline it has not seen, not
- * a crash.
+ * This is the whole of what "the model was asked this" means here, and it is deliberately not the
+ * whole request. A request body also carries fields the model never reads -- `metadata.user_id`,
+ * `model`, sampling parameters -- and a token sitting in one of those was put there by the client
+ * for the provider's benefit, not handed to the model. The two are different facts and this
+ * harness exists to establish the second.
+ *
+ * The measured builds send `system` as a list of text blocks and
+ * `messages: [{ role: "user", content: [{ type: "text", text }, ...] }]`. A string `system` and a
+ * string `content` are accepted too, since the first is the documented alternative and the second
+ * is the shape of the frame the headless arm writes on stdin, which a build is free to forward
+ * unchanged. Anything else -- an unparseable body, no `messages`, a block that is not text --
+ * contributes nothing rather than throwing: this reads a foreign process's output, and a shape it
+ * does not recognise is a text it has not seen, not a crash.
+ *
+ * Parsed, never searched as a string. Serialized JSON escapes what it likes -- a client may write
+ * `\u0041` for `A` or split nothing at all -- so a substring test over the raw body answers a
+ * question about one encoding of the text rather than about the text.
  */
-const userMessageTexts = (body: string): readonly string[] => {
+export const modelInputTexts = (body: string): readonly ModelInputText[] => {
   let parsed: unknown;
   try {
     parsed = JSON.parse(body);
   } catch {
     return [];
   }
-  const messages = (parsed as { messages?: unknown } | null)?.messages;
-  if (!Array.isArray(messages)) return [];
-  const texts: string[] = [];
-  for (const message of messages) {
-    const { role, content } = (message ?? {}) as { role?: unknown; content?: unknown };
-    if (role !== "user") continue;
+  const request = (parsed ?? {}) as { system?: unknown; messages?: unknown };
+  const texts: ModelInputText[] = [];
+  const collect = (from: string, content: unknown): void => {
     if (typeof content === "string") {
-      texts.push(content);
-      continue;
+      texts.push({ from, text: content });
+      return;
     }
-    if (!Array.isArray(content)) continue;
+    if (!Array.isArray(content)) return;
     for (const block of content) {
       const { type, text } = (block ?? {}) as { type?: unknown; text?: unknown };
-      if (type === "text" && typeof text === "string") texts.push(text);
+      if (type === "text" && typeof text === "string") texts.push({ from, text });
+    }
+  };
+  collect("system", request.system);
+  if (Array.isArray(request.messages)) {
+    for (const message of request.messages) {
+      const { role, content } = (message ?? {}) as { role?: unknown; content?: unknown };
+      collect(typeof role === "string" ? role : "", content);
     }
   }
   return texts;
 };
+
+/**
+ * The text of every user message in a request body, flattened; empty for a body that is not one.
+ *
+ * The user's own messages and nothing else: the prompt an arm was started with arrives as a user
+ * text block beside the system reminders, and the model's own words echoed back in an assistant
+ * turn are not evidence that this arm's prompt was accepted.
+ */
+const userMessageTexts = (body: string): readonly string[] =>
+  modelInputTexts(body)
+    .filter(({ from }) => from === "user")
+    .map(({ text }) => text);
 
 /**
  * Whether the arm's *own prompt* was turned into a turn: a model request carrying it as a user
@@ -843,6 +878,38 @@ const userMessageTexts = (body: string): readonly string[] => {
  */
 export const baselineTurnObserved = (capture: string, prompt: string): boolean =>
   modelRequestsIn(capture).some((request) => userMessageTexts(request.body).some((text) => text.trim() === prompt));
+
+/**
+ * The turns that carried the wake into the model's input: a model request whose *model input*
+ * holds `ROLE_WAKE_TOKEN`.
+ *
+ * Three decisions, and each one was a defect first.
+ *
+ * - **Containment, not equality**, and this is the one place the two counts differ deliberately.
+ *   The baseline asks whether a prompt this harness chose and passed became a turn, and it arrives
+ *   as a text block of its own, so equality is available and is the strongest test. The wake asks
+ *   whether the frame's text reached the model at all, and the runtime composes where it goes:
+ *   every capture here shows the token embedded in prose the client wrote around it ("Another
+ *   Claude session sent a message:\nACP-ROLE-WAKE ..."), so equality would report a delivery that
+ *   happened as one that did not.
+ * - **Model input, not the whole request.** The previous form searched the serialized body, which
+ *   is wrong in both directions and was reproduced in both: a follow-up whose only messages say
+ *   `ping`, with the token in `metadata.user_id`, was counted as a delivery -- the client put it
+ *   there and the model never saw it -- while a token JSON-escaped inside real model input was
+ *   missed, because the escape is in the encoding and not in the text.
+ * - **The same places in both arms**, which is what makes the control's claim mean anything. The
+ *   control arm's criterion is that this count is *zero*, so every place searched here is a place
+ *   the control asserts the token was not: the request's system blocks and every message's text.
+ *   A token outside them is not a delivery, in either arm -- not because it is harmless, but
+ *   because this harness measures what reached the model input, and no part of the request outside
+ *   those places is model input. What lands elsewhere is visible in the preserved raw capture, and
+ *   a build that put the wake somewhere the model never reads would fail its injection arm here
+ *   rather than qualify.
+ */
+export const wakeCarryingTurnsIn = (capture: string): readonly CapturedRequest[] =>
+  modelRequestsIn(capture).filter((request) =>
+    modelInputTexts(request.body).some(({ text }) => text.includes(ROLE_WAKE_TOKEN)),
+  );
 
 export interface ProbeOptions {
   readonly shape: ProbeShape;
@@ -1034,7 +1101,12 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
       await sleep(settleCeilingMs);
     }
 
-    const final = modelRequests();
+    // One read of the capture, and every count this arm records is derived from it. Two reads can
+    // straddle a request that arrived between them, and the counts would then be counts of two
+    // different captures -- a difference small enough to be invisible and large enough to make a
+    // reading's own numbers disagree with each other.
+    const finalCapture = readFileSync(capturePath, "utf8");
+    const final = modelRequestsIn(finalCapture);
     // Read after the measurement, through the name this arm was started by. A throw here fails the
     // arm, and with it the run, before anything is recorded (see `confirmHeld`).
     const imageSha256 = confirmHeld(image);
@@ -1050,18 +1122,10 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
       imageSha256,
       baselineModelRequests,
       modelRequests: final.length,
-      // A substring over the whole body, deliberately *not* the user-message equality
-      // `baselineTurnObserved` uses, and the difference is a decision rather than an oversight.
-      // The two ask different questions. The baseline asks whether a prompt this harness chose and
-      // passed became a turn, and it arrives as a text block of its own, so equality is available
-      // and is the strongest test. The wake asks whether the frame's text reached the provider at
-      // all; the client composes where it goes, and every capture here shows the token *embedded*
-      // in prose the client wrote around it ("Another Claude session sent a message:\nACP-ROLE-WAKE
-      // ..."), so equality would report a delivery that happened as one that did not. The broad
-      // test is also the stricter requirement on the arm that matters most: the control's claim is
-      // that this count is zero, and a test that matches the token anywhere in the body is harder
-      // to satisfy that claim against than one that only looks in one place.
-      wakeCarryingModelRequests: final.filter((request) => request.body.includes(ROLE_WAKE_TOKEN)).length,
+      // Containment within the model's input, never a substring of the serialized body: see
+      // `wakeCarryingTurnsIn` for why each half of that is load-bearing. Read from the same
+      // snapshot as `final`, so the two counts are counts of one capture.
+      wakeCarryingModelRequests: wakeCarryingTurnsIn(finalCapture).length,
       followUpAfterInjection: final.length > baselineModelRequests,
       settleCeilingMs,
       rawCapturePath: relative(REPO_ROOT, durableCapture),
@@ -1429,6 +1493,7 @@ const LIMITS: readonly string[] = [
   "One host and one arch. The receipt records which; it says nothing about any other.",
   "Provider isolation is an ANTHROPIC_BASE_URL override plus a dummy credential, not a network namespace. It bounds where inference went, not everything the process could do.",
   "The runtime does not hand the token to the model bare: it renders it inside a peer-message preamble of its own before it reaches model input. What is qualified is that the token arrives and starts a turn, not that it arrives unadorned. The preserved capture shows the surrounding text.",
+  "A wake-carrying turn is one whose model input -- the request's system blocks and its messages' text -- contains the token. A token elsewhere in the request, such as a metadata field the client fills in for the provider, is not counted in either arm: it is not what the model was asked. So the control's zero and the injection arm's positive count are the same question asked of the same places.",
   "The endpoint-directory policy is untouched by this slice, so registration through registerEndpoint is still refused for a socket outside the daemon state directory. See the finding of that name.",
   "Interactive start required pre-provisioned answers to the onboarding, workspace-trust and custom-API-key prompts in a throwaway config. A session whose operator answered them differently is outside this reading.",
   "The interactive arm's baseline turn is started by a positional prompt in its argv, not typed at the client's prompt. What is read here is that the wake frame reaches the model input of an interactively-invoked session and starts a turn; nothing here observes the client's terminal, so this says nothing about whether that session would have accepted a keystroke at the moment the frame arrived.",

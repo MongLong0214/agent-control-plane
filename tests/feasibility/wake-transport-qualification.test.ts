@@ -33,6 +33,7 @@ import {
   armPassed,
   baselineTurnObserved,
   interactiveBlocker,
+  modelInputTexts,
   modelRequestsIn,
   pinClaudeImage,
   probeArgv,
@@ -41,6 +42,7 @@ import {
   qualificationDisagreements,
   readReadings,
   runQualificationProbe,
+  wakeCarryingTurnsIn,
   type PinnedClaudeImage,
   type ProbeRun,
 } from "./wake-transport-qualification/harness.ts";
@@ -312,6 +314,57 @@ describe("U6: the interactive arm keeps the shape the claim requires, and observ
     expect(baselineTurnObserved(captured("/v1/messages"), BASELINE_PROMPT)).toBe(true);
     expect(baselineTurnObserved(captured("/v1/messages?beta=true"), BASELINE_PROMPT)).toBe(true);
     expect(modelRequestsIn(`${countTokens}${captured("/v1/messages?beta=true")}`)).toHaveLength(1);
+  });
+
+  it("a wake is counted where the model reads, so metadata is not a delivery and an escape is", () => {
+    // The live shape first, and it is the control for everything below: the runtime does not hand
+    // the token to the model bare, it composes a peer-message preamble around it. So the test is
+    // containment within model input -- an equality test would count zero on a working wake.
+    const prose = `Another Claude session sent a message:\n${ROLE_WAKE_TOKEN}\nRead your inbox.`;
+    expect(wakeCarryingTurnsIn(captured("/v1/messages?beta=true", promptBody(prose)))).toHaveLength(1);
+
+    // The defect, reproduced by both reviewers: the request's messages say only `ping`, and the
+    // token is in a field the client fills in for the provider. The model was never asked it. A
+    // substring test over the serialized body counted this as a delivery -- and it is the count
+    // that decides whether a build joins the set, with the control arm claiming it is zero.
+    const inMetadata = JSON.stringify({
+      model: "claude-sonnet-4-5",
+      metadata: { user_id: `session_${ROLE_WAKE_TOKEN}_1` },
+      messages: [{ role: "user", content: [{ type: "text", text: BASELINE_PROMPT }] }],
+    });
+    expect(inMetadata).toContain(ROLE_WAKE_TOKEN);
+    expect(wakeCarryingTurnsIn(captured("/v1/messages?beta=true", inMetadata))).toEqual([]);
+
+    // Same again for a header-shaped field: a request carries plenty the model never reads, and
+    // every one of them was a way to satisfy the injection arm without the wake reaching the model.
+    const inHeaderField = JSON.stringify({
+      model: "claude-sonnet-4-5",
+      headers: { "x-session-note": ROLE_WAKE_TOKEN },
+      messages: [{ role: "user", content: [{ type: "text", text: BASELINE_PROMPT }] }],
+    });
+    expect(wakeCarryingTurnsIn(captured("/v1/messages?beta=true", inHeaderField))).toEqual([]);
+
+    // The mirror defect, the second reviewer's: the token *is* in model input, and JSON escaped a
+    // character of it on the way out. The text the model reads is the token; the bytes on the wire
+    // are not, so a substring test over the body reported a delivery that happened as one that did
+    // not. Parsing is what makes the question be about the text.
+    const escaped = `{"messages":[{"role":"user","content":[{"type":"text","text":"ACP-ROLE-WAK\\u0045 arrived"}]}]}`;
+    expect(escaped).not.toContain(ROLE_WAKE_TOKEN);
+    expect(modelInputTexts(escaped)[0]?.text).toContain(ROLE_WAKE_TOKEN);
+    expect(wakeCarryingTurnsIn(captured("/v1/messages?beta=true", escaped))).toHaveLength(1);
+
+    // The system blocks are model input too, and the control arm's zero is a claim about them as
+    // much as about the messages -- so they are searched, in a request whose messages are innocent.
+    const inSystem = JSON.stringify({
+      system: [{ type: "text", text: `You are Claude.\n${ROLE_WAKE_TOKEN}` }],
+      messages: [{ role: "user", content: BASELINE_PROMPT }],
+    });
+    expect(wakeCarryingTurnsIn(captured("/v1/messages?beta=true", inSystem))).toHaveLength(1);
+
+    // And it stays a count of *turns*: a count-tokens request or a body nothing can parse is not a
+    // delivery however the token reached it, because neither is a turn the model took.
+    expect(wakeCarryingTurnsIn(captured("/v1/messages/count_tokens", promptBody(prose)))).toEqual([]);
+    expect(wakeCarryingTurnsIn(captured("/v1/messages?beta=true", `<html>${ROLE_WAKE_TOKEN}</html>`))).toEqual([]);
   });
 });
 
