@@ -7,6 +7,10 @@
  * is what `followUpAfterInjection` reads, so a stray non-POST after the frame would also read as
  * the wake's follow-up.
  *
+ * One definition, two consumers: the live filter over a capture (`modelRequestsIn`) and the
+ * derivation a committed reading's counts are checked against (`countsFrom`). Mutating it moves
+ * both, which is the point of there being one.
+ *
  * The mutation drops the method comparison and keeps the endpoint one. The killing row asks
  * `modelRequestsIn` for a GET carrying a perfectly good prompt body and requires it to be empty,
  * so the row cannot be satisfied by the body test standing in for the method test.
@@ -15,8 +19,8 @@ const aTurnIsARequestThatAskedForInference = {
   id: "a-turn-is-a-request-that-asked-for-inference",
   what: "the harness counts a captured request as a turn only when it was a POST, not merely when it reached the messages endpoint",
   file: "tests/feasibility/wake-transport-qualification/harness.ts",
-  find: '    (request) => request.method === "POST" && requestEndpoint(request.url) === MESSAGES_ENDPOINT,\n',
-  replace: "    (request) => requestEndpoint(request.url) === MESSAGES_ENDPOINT,\n",
+  find: '  request.method === "POST" && requestEndpoint(request.url) === MESSAGES_ENDPOINT;\n',
+  replace: "  requestEndpoint(request.url) === MESSAGES_ENDPOINT;\n",
   killedBy: [
     "tests/feasibility/wake-transport-qualification.test.ts::a request to that endpoint that is not this prompt's turn is not the baseline",
   ],

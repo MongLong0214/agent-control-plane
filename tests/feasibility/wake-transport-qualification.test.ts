@@ -22,6 +22,8 @@
  * and fixture readings in `wake-transport-readings.test.ts`. Whenever this row passes, the committed
  * set and its readings agree, so a rule this row never trips here is still shown to trip there.
  */
+import { createHash } from "node:crypto";
+
 import { afterAll, describe, expect, it } from "vitest";
 
 import {
@@ -33,8 +35,10 @@ import {
   armPassed,
   baselineTurnObserved,
   interactiveBlocker,
+  countsFrom,
   modelInputTexts,
   modelRequestsIn,
+  observationsFrom,
   pinClaudeImage,
   probeArgv,
   spawnPlanFor,
@@ -365,6 +369,98 @@ describe("U6: the interactive arm keeps the shape the claim requires, and observ
     // delivery however the token reached it, because neither is a turn the model took.
     expect(wakeCarryingTurnsIn(captured("/v1/messages/count_tokens", promptBody(prose)))).toEqual([]);
     expect(wakeCarryingTurnsIn(captured("/v1/messages?beta=true", `<html>${ROLE_WAKE_TOKEN}</html>`))).toEqual([]);
+  });
+});
+
+/**
+ * What a reading commits beside its counts, so that the counts stop being claims about nothing.
+ *
+ * The captures these are read from live under `evidence/local/`, which is gitignored, so before
+ * this a reader of the repository had a file stating how many turns it saw and no way to check it.
+ * These rows are about the record that closes that: it is derived by the instrument, it carries
+ * what the acceptance rule reads, and it refuses to carry an account's home directory.
+ *
+ * What it cannot establish is that a live client produced any of it -- an observation list written
+ * by hand derives exactly as well as a measured one. That is #1012, not this.
+ */
+describe("U6: an arm's counts are derived from the observations committed with it", () => {
+  const capture = (...bodies: readonly (readonly [string, string, string])[]): string =>
+    bodies
+      .map(([method, url, body]) =>
+        `${JSON.stringify({ at: "2026-09-28T00:00:00.000Z", method, url, headers: { "x-api-key": "irrelevant" }, body })}\n`,
+      )
+      .join("");
+
+  const turn = (text: string, role = "user"): string =>
+    JSON.stringify({ model: "claude-sonnet-4-5", system: [{ type: "text", text: "You are Claude." }], messages: [{ role, content: [{ type: "text", text }] }] });
+
+  it("keeps each request's time, method, URL and model input, and digests the capture they came from", () => {
+    const raw = capture(
+      ["POST", "/v1/messages?beta=true", turn(BASELINE_PROMPT)],
+      ["POST", "/v1/messages?beta=true", turn(`Another Claude session sent a message:\n${ROLE_WAKE_TOKEN}`)],
+    );
+    const observations = observationsFrom(raw);
+
+    expect(observations.requests).toHaveLength(2);
+    expect(observations.requests[0]).toMatchObject({ at: "2026-09-28T00:00:00.000Z", method: "POST", url: "/v1/messages?beta=true" });
+    // The model input, labelled by where it came from -- which is what lets one record answer both
+    // questions: the baseline is a *user* text, and the wake is any model input at all.
+    expect(observations.requests[0]?.texts).toEqual([
+      { from: "system", text: "You are Claude." },
+      { from: "user", text: BASELINE_PROMPT },
+    ]);
+    // The headers are not in it. The capture keeps them; this is the part the model was asked, and
+    // a committed file has no business carrying a request's credentials-shaped fields.
+    expect(JSON.stringify(observations)).not.toContain("x-api-key");
+    // Bound to the bytes it was read from, which are the bytes the run writes to its raw capture.
+    expect(observations.rawCaptureSha256).toBe(createHash("sha256").update(Buffer.from(raw, "utf8")).digest("hex"));
+
+    // And the four counts a reading states come out of it, by the calculation the reader repeats.
+    expect(countsFrom(observations)).toEqual({
+      baselineModelRequests: 1,
+      modelRequests: 2,
+      wakeCarryingModelRequests: 1,
+      followUpAfterInjection: true,
+    });
+  });
+
+  it("counts turns the way the rest of this file does, and finds the baseline by the prompt", () => {
+    // Everything that is not a turn is kept in the record and counted in none of the numbers: the
+    // derivation applies the same POST-and-endpoint rule the live arm applies.
+    const noisy = observationsFrom(
+      capture(
+        ["POST", "/v1/messages/count_tokens", turn(BASELINE_PROMPT)],
+        ["GET", "/v1/messages?beta=true", ""],
+        ["POST", "/v1/messages?beta=true", turn("summarise this session")],
+        ["POST", "/v1/messages?beta=true", turn(BASELINE_PROMPT)],
+      ),
+    );
+    expect(noisy.requests).toHaveLength(4);
+    expect(countsFrom(noisy)).toEqual({
+      // Two turns, and the prompt's is the second of them, so one turn preceded the baseline.
+      baselineModelRequests: 2,
+      modelRequests: 2,
+      wakeCarryingModelRequests: 0,
+      followUpAfterInjection: false,
+    });
+
+    // No turn carrying the prompt is a baseline of zero -- the state the arm refuses to proceed
+    // from, and the one the acceptance rule refuses to admit.
+    const noPrompt = observationsFrom(capture(["POST", "/v1/messages?beta=true", turn("summarise this session")]));
+    expect(countsFrom(noPrompt).baselineModelRequests).toBe(0);
+  });
+
+  it("refuses a capture carrying a home-directory path rather than committing one", () => {
+    // The receipt is committed, so a path under an account's home in it publishes a username to
+    // every reader of the repository. `redactHome` replaces a prefix; prose carries one in the
+    // middle, and macOS spells the same directory three ways. A shape this cannot redact stops the
+    // arm -- the run is refused rather than the redaction being assumed complete.
+    const leaked = capture(["POST", "/v1/messages?beta=true", turn("Working directory: /Users/someone-else/projects/acp")]);
+    expect(() => observationsFrom(leaked)).toThrow(/home-directory path/);
+
+    // The control: the same capture without it goes through, so this is not a reader that refuses
+    // everything. Measured across the twelve arms of the three committed readings: none carries one.
+    expect(() => observationsFrom(capture(["POST", "/v1/messages?beta=true", turn("Working directory: /private/tmp/acp-u6q-x/w")]))).not.toThrow();
   });
 });
 

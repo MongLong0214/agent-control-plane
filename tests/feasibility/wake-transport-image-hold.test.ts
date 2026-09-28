@@ -35,7 +35,18 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { buildReceipt, confirmHeld, holdImage, pinClaudeImage, type ProbeRun, type ProbeShape } from "./wake-transport-qualification/harness.ts";
+import {
+  BASELINE_PROMPT,
+  buildReceipt,
+  confirmHeld,
+  countsFrom,
+  holdImage,
+  observationsFrom,
+  pinClaudeImage,
+  type ProbeRun,
+  type ProbeShape,
+} from "./wake-transport-qualification/harness.ts";
+import { ROLE_WAKE_TOKEN } from "../../src/mcp/role-conversation.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterEach(cleanupTempDirs);
@@ -110,22 +121,37 @@ describe("a qualification run holds one image for its whole length", () => {
     // Both shapes, because a reading qualifies a build only when it holds all four arms and each
     // one's argv is the shape it claims (`qualificationShortfalls`). The headless argv carries the
     // flags the canonical-claim predicate refuses, as `probeArgv` builds it.
-    const arm = (shape: ProbeShape, injected: boolean, imageSha256: string | undefined): ProbeRun => ({
-      shape,
-      injected,
-      command: shape === "interactive"
-        ? ["/private/tmp/acp-u6q-img-fixture/2.1.283", "--messaging-socket-path", "/private/tmp/fixture/s/i.sock", "ping"]
-        : ["/private/tmp/acp-u6q-img-fixture/2.1.283", "-p", "--input-format", "stream-json", "--output-format", "stream-json"],
-      ...(imageSha256 === undefined ? {} : { imageSha256 }),
-      baselineModelRequests: 1,
-      modelRequests: injected ? 2 : 1,
-      wakeCarryingModelRequests: injected ? 1 : 0,
-      followUpAfterInjection: injected,
-      settleCeilingMs: 20_000,
-      rawCapturePath: "evidence/local/fixture/capture.jsonl",
-      rawSessionLogPath: "evidence/local/fixture/session.log",
-      tempRootRemoved: true,
-    });
+    // A capture of the shape the fake provider writes, read by the instrument's own reader: an arm
+    // in a receipt has to carry the observations its counts are derived from, and a fixture that
+    // stated counts without them is a fixture of a reading the instrument will not accept.
+    const captureOf = (injected: boolean): string => {
+      const turn = (text: string): string =>
+        `${JSON.stringify({
+          at: "2026-09-28T00:00:00.000Z",
+          method: "POST",
+          url: "/v1/messages?beta=true",
+          headers: {},
+          body: JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text }] }] }),
+        })}\n`;
+      return `${turn(BASELINE_PROMPT)}${injected ? turn(`a peer wrote: ${ROLE_WAKE_TOKEN}`) : ""}`;
+    };
+    const arm = (shape: ProbeShape, injected: boolean, imageSha256: string | undefined): ProbeRun => {
+      const observations = observationsFrom(captureOf(injected));
+      return {
+        shape,
+        injected,
+        command: shape === "interactive"
+          ? ["/private/tmp/acp-u6q-img-fixture/2.1.283", "--messaging-socket-path", "/private/tmp/fixture/s/i.sock", "ping"]
+          : ["/private/tmp/acp-u6q-img-fixture/2.1.283", "-p", "--input-format", "stream-json", "--output-format", "stream-json"],
+        ...(imageSha256 === undefined ? {} : { imageSha256 }),
+        observations,
+        ...countsFrom(observations),
+        settleCeilingMs: 20_000,
+        rawCapturePath: "evidence/local/fixture/capture.jsonl",
+        rawSessionLogPath: "evidence/local/fixture/session.log",
+        tempRootRemoved: true,
+      };
+    };
     const receiptOf = (runs: readonly ProbeRun[]) =>
       buildReceipt({
         image: { path: "/fixture/versions/2.1.283", sha256: named, versionOutput: "2.1.283 (Claude Code)", version: "2.1.283" },

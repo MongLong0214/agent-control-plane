@@ -220,7 +220,20 @@ export interface ProbeRun {
    * rather than a third answer. Every run `runQualificationProbe` returns carries it.
    */
   readonly imageSha256?: string;
-  /** Model requests seen before the injection point, in both arms. */
+  /**
+   * What this arm observed, and what every count below is derived from (`ArmObservations`).
+   *
+   * Optional in the *type* because a committed reading is parsed JSON and the readings written
+   * before this field existed carry no such key. It is not optional in a committed reading:
+   * `qualificationShortfalls` refuses an arm without it, because without it the four counts are
+   * assertions the file makes about itself and there is nothing to check them against.
+   */
+  readonly observations?: ArmObservations;
+  /**
+   * Model requests up to and including the one that carried this arm's prompt -- the turn the
+   * frame was written after. Derived from `observations`, never counted separately; see
+   * `countsFrom` for what that changes and what it costs.
+   */
   readonly baselineModelRequests: number;
   readonly modelRequests: number;
   readonly wakeCarryingModelRequests: number;
@@ -737,6 +750,8 @@ const requestEndpoint = (url: string): string => url.split(/[?#]/)[0] ?? url;
 
 /** One line of the fake provider's capture: a request as it arrived, before anything judged it. */
 interface CapturedRequest {
+  /** When the provider received it, from the provider's own clock. */
+  readonly at: string;
   readonly method: string;
   readonly url: string;
   readonly body: string;
@@ -778,10 +793,11 @@ const capturedRequests = (capture: string): readonly CapturedRequest[] =>
  * four arms of each committed reading -- so this changes no number that exists; it stops the
  * filter from meaning something other than its name on the first build that sends one.
  */
+const isModelRequest = (request: { readonly method: string; readonly url: string }): boolean =>
+  request.method === "POST" && requestEndpoint(request.url) === MESSAGES_ENDPOINT;
+
 export const modelRequestsIn = (capture: string): readonly CapturedRequest[] =>
-  capturedRequests(capture).filter(
-    (request) => request.method === "POST" && requestEndpoint(request.url) === MESSAGES_ENDPOINT,
-  );
+  capturedRequests(capture).filter(isModelRequest);
 
 /** One piece of text a request asked the model to read, and where in the request it came from. */
 export interface ModelInputText {
@@ -910,6 +926,126 @@ export const wakeCarryingTurnsIn = (capture: string): readonly CapturedRequest[]
   modelRequestsIn(capture).filter((request) =>
     modelInputTexts(request.body).some(({ text }) => text.includes(ROLE_WAKE_TOKEN)),
   );
+
+/** One request as a committed reading records it: what was asked, and what the model was given. */
+export interface ObservedRequest {
+  readonly at: string;
+  readonly method: string;
+  readonly url: string;
+  /** Every text this request put in front of the model, labelled -- see `modelInputTexts`. */
+  readonly texts: readonly ModelInputText[];
+}
+
+/**
+ * What one arm observed, committed beside the counts it is summarised by.
+ *
+ * The counts in a reading used to be free-standing integers: the file stated how many turns it saw
+ * and how many carried the wake, and the raw captures they were read from are under
+ * `evidence/local/`, which is gitignored. Nothing a reader of the repository could see tied a
+ * number to an observation, so the acceptance rule recomputed a verdict from integers that were
+ * themselves assertions.
+ *
+ * This is the part of that gap a file can close: the observations the rule actually reads travel
+ * with the reading, and the counts are derived from them rather than believed. What it does **not**
+ * establish is that a live client produced them -- a fabricated observation list is as derivable as
+ * a measured one. That is a different problem, tracked separately, and no sentence here should be
+ * read as claiming otherwise.
+ */
+export interface ArmObservations {
+  /**
+   * The digest of the capture these were read from -- the same bytes `rawCapturePath` names.
+   *
+   * A binding to the local artefact, not a proof of one: the file is outside the repository, so a
+   * reader who does not have it cannot check the digest, and one who does learns only that their
+   * copy is the copy these observations were taken from.
+   */
+  readonly rawCaptureSha256: string;
+  readonly requests: readonly ObservedRequest[];
+}
+
+/** The counts a reading states, as this file derives them from what an arm observed. */
+export interface ArmCounts {
+  readonly baselineModelRequests: number;
+  readonly modelRequests: number;
+  readonly wakeCarryingModelRequests: number;
+  readonly followUpAfterInjection: boolean;
+}
+
+/**
+ * An absolute path under somebody's home directory, in any of the spellings this host produces.
+ *
+ * `redactHome` replaces the prefix of a string that *is* a path; a system prompt is prose that can
+ * carry one in the middle, and macOS spells the same directory `/Users/x`,
+ * `/private/var/.../Users/x` and `/System/Volumes/Data/Users/x`. This matches the segment they all
+ * contain, so the check below is about the account being published rather than about one prefix.
+ */
+const HOME_PATH = /\/(?:Users|home)\/[^/\s"']+/;
+
+/**
+ * Everything the acceptance rule reads from one arm's capture, redacted and bound to that capture.
+ *
+ * Redaction is `redactHome` on every string, and then a **refusal** if a home path survived
+ * anywhere -- not a second redaction pass. A receipt is committed, so a path under an account's
+ * home in one is a username published to every reader of the repository; a shape this does not know
+ * how to redact has to stop the run rather than be committed on the assumption that redaction was
+ * complete. Measured across the twelve arms of the three committed readings: no capture contains
+ * one, so this refuses nothing that exists today.
+ *
+ * The digest is of the bytes passed in, and the caller writes those same bytes to the durable
+ * capture, so the digest names a file rather than a file-like thing that was read twice.
+ */
+export const observationsFrom = (capture: string): ArmObservations => {
+  const clean = (value: string): string => {
+    const redacted = redactHome(value);
+    if (HOME_PATH.test(redacted)) {
+      throw new Error("a captured request carries a home-directory path that redactHome did not reach");
+    }
+    return redacted;
+  };
+  const requests = capturedRequests(capture).map((request) => ({
+    at: clean(request.at ?? ""),
+    method: clean(request.method),
+    url: clean(request.url),
+    texts: modelInputTexts(request.body).map(({ from, text }) => ({ from: clean(from), text: clean(text) })),
+  }));
+  return { rawCaptureSha256: createHash("sha256").update(Buffer.from(capture, "utf8")).digest("hex"), requests };
+};
+
+/**
+ * The four counts a reading states, derived from what the arm observed.
+ *
+ * One calculation for the producer and the reader, in the same sense the verdict is: the probe
+ * records what this returns, and `qualificationShortfalls` derives it again from the committed
+ * observations and reports a difference. So a number in a reading is a claim about an observation
+ * beside it, not a free-standing integer.
+ *
+ * **The baseline is the position of the prompt's own turn**, not a count taken at the moment the
+ * arm stopped waiting. That is what makes it derivable at all: the prompt's turn is identifiable in
+ * the observations, and the moment the probe read the file is not. The two differ if the client
+ * takes a turn of its own between the prompt's turn and the injection point -- then the extra turn
+ * is counted as a follow-up, the control arm's criterion fails, and the run is refused. A refusal
+ * is the direction to be wrong in here, and no capture on this host has ever shown one.
+ */
+export const countsFrom = (observations: ArmObservations, prompt: string = BASELINE_PROMPT): ArmCounts => {
+  const requests = Array.isArray(observations.requests) ? observations.requests : [];
+  const turns = requests.filter(
+    (request) => isModelRequest({ method: `${request?.method}`, url: `${request?.url}` }),
+  );
+  const texts = (request: ObservedRequest): readonly ModelInputText[] =>
+    Array.isArray(request.texts) ? request.texts : [];
+  const promptTurn = turns.findIndex((turn) =>
+    texts(turn).some(({ from, text }) => from === "user" && typeof text === "string" && text.trim() === prompt),
+  );
+  const baselineModelRequests = promptTurn < 0 ? 0 : promptTurn + 1;
+  return {
+    baselineModelRequests,
+    modelRequests: turns.length,
+    wakeCarryingModelRequests: turns.filter((turn) =>
+      texts(turn).some(({ text }) => typeof text === "string" && text.includes(ROLE_WAKE_TOKEN)),
+    ).length,
+    followUpAfterInjection: turns.length > baselineModelRequests,
+  };
+};
 
 export interface ProbeOptions {
   readonly shape: ProbeShape;
@@ -1106,12 +1242,17 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
     // different captures -- a difference small enough to be invisible and large enough to make a
     // reading's own numbers disagree with each other.
     const finalCapture = readFileSync(capturePath, "utf8");
-    const final = modelRequestsIn(finalCapture);
     // Read after the measurement, through the name this arm was started by. A throw here fails the
     // arm, and with it the run, before anything is recorded (see `confirmHeld`).
     const imageSha256 = confirmHeld(image);
+    // Built before anything is written: a capture carrying a path this harness cannot redact fails
+    // the arm here rather than reaching a committed file.
+    const observations = observationsFrom(finalCapture);
+    const counts = countsFrom(observations);
     mkdirSync(durableDir, { recursive: true });
-    copyFileSync(capturePath, durableCapture);
+    // The snapshot, not a second copy of the file: `observations.rawCaptureSha256` is the digest of
+    // these exact bytes, and copying the path again could pick up a request that arrived since.
+    writeFileSync(durableCapture, finalCapture);
     writeFileSync(sessionLogPath, `${strip(terminal.text())}\n--- stderr ---\n${stderr}`);
     copyFileSync(sessionLogPath, durableLog);
 
@@ -1120,13 +1261,11 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
       injected: options.inject,
       command: command.map(redactHome),
       imageSha256,
-      baselineModelRequests,
-      modelRequests: final.length,
-      // Containment within the model's input, never a substring of the serialized body: see
-      // `wakeCarryingTurnsIn` for why each half of that is load-bearing. Read from the same
-      // snapshot as `final`, so the two counts are counts of one capture.
-      wakeCarryingModelRequests: wakeCarryingTurnsIn(finalCapture).length,
-      followUpAfterInjection: final.length > baselineModelRequests,
+      observations,
+      // Derived from the observations committed beside them, by the same calculation the reader
+      // derives them with. `baselineModelRequests` above is what the arm waited for; the number
+      // recorded is the one a reader can check.
+      ...counts,
       settleCeilingMs,
       rawCapturePath: relative(REPO_ROOT, durableCapture),
       rawSessionLogPath: relative(REPO_ROOT, durableLog),
@@ -1199,12 +1338,21 @@ const armLabel = (arm: { readonly shape: ProbeShape; readonly injected: boolean 
  *   (`isInteractiveClaudeInvocation`): accepted for an interactive arm, refused for a headless one.
  *   A qualification of an argv the predicate refuses qualifies a process that could never hold the
  *   canonical claim, and that is the whole reason the interactive shape is measured at all.
+ * - **Counts that come from the observations committed with them.** Every number above used to be
+ *   an integer the file stated about itself, with the captures it was read from under
+ *   `evidence/local/`, which is gitignored -- so nothing a reader could see tied a count to an
+ *   observation. Each arm now carries what it observed (`ArmObservations`), the four counts are
+ *   re-derived from it here by the calculation the probe recorded them with (`countsFrom`), and a
+ *   difference is a shortfall. An arm with no observations is refused: absence is the case that was
+ *   slipping through.
  *
- * What this does **not** establish, and no amount of it can: every fact above is a statement inside
- * the file being judged. Agreement among a file's own fields is internal consistency, not evidence
- * that a live ceremony ran. A reading written from nothing, with all its fields made to agree, is
- * admitted here. What the arms' raw captures and session logs say, and whether they exist at all,
- * is a separate question this calculation does not ask.
+ * What this does **not** establish, and this is the part to read twice: that a live client produced
+ * any of it. Deriving a count from a committed observation removes the count as a free-standing
+ * claim; it does not attest the ceremony. A reading written from nothing, with observations made to
+ * agree with its counts, is admitted here exactly as one taken from four real sessions. The same is
+ * true of every other rule above -- each is a statement inside the file being judged, and agreement
+ * among them is internal consistency. Whether the arms ever ran is a question this calculation
+ * cannot ask, and no rule that lives inside the artefact can.
  */
 export const qualificationShortfalls = (runs: readonly ProbeRun[]): readonly string[] => {
   const shortfalls: string[] = [];
@@ -1247,6 +1395,43 @@ export const qualificationShortfalls = (runs: readonly ProbeRun[]): readonly str
           `${where} says a follow-up ${run.followUpAfterInjection ? "arrived" : "did not arrive"}, which its own counts ` +
             `(${run.baselineModelRequests} before, ${run.modelRequests} in all) do not say`,
         );
+      }
+    }
+    // The counts above are checked against each other; these are checked against something other
+    // than themselves. A reading with no observations is refused rather than admitted on its own
+    // integers -- absence is exactly the case that was slipping through before.
+    const observations = run.observations;
+    if (
+      observations === undefined ||
+      typeof observations.rawCaptureSha256 !== "string" ||
+      !Array.isArray(observations.requests)
+    ) {
+      shortfalls.push(`${where} carries no observations, so its counts are claims this file makes about itself`);
+    } else {
+      if (!/^[0-9a-f]{64}$/.test(observations.rawCaptureSha256)) {
+        shortfalls.push(`${where} does not bind its observations to the digest of a raw capture`);
+      }
+      const stated: ArmCounts = {
+        baselineModelRequests: run.baselineModelRequests,
+        modelRequests: run.modelRequests,
+        wakeCarryingModelRequests: run.wakeCarryingModelRequests,
+        followUpAfterInjection: run.followUpAfterInjection,
+      };
+      // Derived from the observations, never read from the run: a reading whose numbers checked
+      // themselves is the state this rule exists to end.
+      const derived = countsFrom(observations);
+      for (const field of [
+        "baselineModelRequests",
+        "modelRequests",
+        "wakeCarryingModelRequests",
+        "followUpAfterInjection",
+      ] as const) {
+        if (stated[field] !== derived[field]) {
+          shortfalls.push(
+            `${where} states ${field} as ${JSON.stringify(stated[field])}, and its own observations give ` +
+              `${JSON.stringify(derived[field])}`,
+          );
+        }
       }
     }
     if (!Array.isArray(run.command) || run.command.some((argument) => typeof argument !== "string")) {
@@ -1501,6 +1686,8 @@ const LIMITS: readonly string[] = [
   "settleCeilingMs is a ceiling on the post-injection wait, not a duration either arm was observed for. The control spends the whole ceiling; the injection arm returns on its first follow-up request. Two arms sharing a ceiling were watched for at most the same time, not for the same time, and the actual spans are not recorded here.",
   "Every arm executed one hard link, in a directory private to the run, to the inode digested as imageSha256 -- the command's first element names that link, which is removed with the run, and imagePath names where the inode was found. Each arm re-read the link's identity, size, modification time and digest after its measurement and would have failed the run on a difference. A rewrite of that inode in place, undone before the re-read, would not have been seen.",
   "The verdict in this file is recomputed from the runs in it, by the one calculation the instrument writes it with, and a reader that admits this reading recomputes it again rather than reading the field. That establishes internal consistency and nothing more: every fact it checks is a statement inside this file. A file written from nothing, with all its fields made to agree, satisfies it. Whether the arms it describes ever ran is a question the raw captures and session logs it points at answer, and this check does not ask them.",
+  "Each arm carries the observations its counts are derived from -- every captured request's time, method, URL and model-input text -- and both the instrument and the reader derive the four counts from them rather than reading integers. What that removes is a count that stood on nothing; what it does not do is attest that a live client produced the observations. An observation list written by hand derives exactly as well as a measured one, and this file cannot tell them apart.",
+  "The observations are bound to each arm's raw capture by that capture's SHA-256. The capture itself is under evidence/local/, which is not committed, so a reader without that file cannot check the digest, and a reader with it learns only that the copy in hand is the one these observations were read from.",
   "This file does not identify the instrument that produced it. headSha is git rev-parse HEAD at receipt-build time, which can name a tree that contains no harness -- the harness may be uncommitted while the reading is taken. Unless a sourceBinding block below says otherwise, the source of this reading is UNKNOWN, and a digest computed after the fact would attest preservation since, not what executed.",
 ];
 

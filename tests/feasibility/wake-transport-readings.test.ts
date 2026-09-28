@@ -15,7 +15,10 @@ import { readFileSync, readdirSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  BASELINE_PROMPT,
   buildReceipt,
+  countsFrom,
+  observationsFrom,
   qualificationDisagreements,
   readReadings,
   readingFileName,
@@ -25,6 +28,7 @@ import {
   type QualificationReceipt,
   type RecordedReading,
 } from "./wake-transport-qualification/harness.ts";
+import { ROLE_WAKE_TOKEN } from "../../src/mcp/role-conversation.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterEach(cleanupTempDirs);
@@ -51,18 +55,41 @@ const COMMAND: Record<ProbeShape, readonly string[]> = {
   ],
 };
 
+/**
+ * A capture of the shape the fake provider writes: the prompt's turn, and the wake's turn after it
+ * when the wake landed.
+ *
+ * Built and then read by the instrument's own `observationsFrom`, rather than an observation list
+ * typed in here: a fixture whose observations were written by hand could disagree with what the
+ * reader derives from a real one and nobody would find out from this file. The wake text is the
+ * live shape -- the token inside the prose the runtime composes around it.
+ */
+const captureOf = (woke: boolean): string => {
+  const turn = (text: string): string =>
+    `${JSON.stringify({
+      at: "2026-09-28T00:00:00.000Z",
+      method: "POST",
+      url: "/v1/messages?beta=true",
+      headers: {},
+      body: JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text }] }] }),
+    })}\n`;
+  return `${turn(BASELINE_PROMPT)}${woke ? turn(`Another Claude session sent a message:\n${ROLE_WAKE_TOKEN}`) : ""}`;
+};
+
 const arm = (shape: ProbeShape, injected: boolean, metCriterion = true): ProbeRun => {
   const woke = injected === metCriterion;
+  const observations = observationsFrom(captureOf(woke));
   return {
     shape,
     injected,
     command: COMMAND[shape],
     // The digest of the fixture image below: every arm here ran the image its reading names.
     imageSha256: "0".repeat(64),
-    baselineModelRequests: 1,
-    modelRequests: woke ? 2 : 1,
-    wakeCarryingModelRequests: woke ? 1 : 0,
-    followUpAfterInjection: woke,
+    observations,
+    // Derived from the observations, as the probe derives them: a fixture that stated its counts
+    // separately could drift from the observations beside it, which is the defect these rules are
+    // about.
+    ...countsFrom(observations),
     settleCeilingMs: 20_000,
     rawCapturePath: "evidence/local/fixture/capture.jsonl",
     rawSessionLogPath: "evidence/local/fixture/session.log",
@@ -271,6 +298,11 @@ describe("the qualified set and its readings must agree", () => {
         "2.1.268",
         "arm 1 (interactive injection) recorded no baseline turn, so its follow-up was measured against a turn that never happened",
       ),
+      // Caught twice, and the second is the stronger catch: the counts were edited and the
+      // observations they are derived from were not, so the file disagrees with its own evidence
+      // rather than merely with itself.
+      resting("2.1.268", "arm 1 (interactive injection) states baselineModelRequests as 0, and its own observations give 1"),
+      resting("2.1.268", "arm 1 (interactive injection) states modelRequests as 1, and its own observations give 2"),
       'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
     ]);
 
@@ -285,6 +317,7 @@ describe("the qualified set and its readings must agree", () => {
         "2.1.268",
         "arm 1 (interactive injection) says a follow-up arrived, which its own counts (1 before, 1 in all) do not say",
       ),
+      resting("2.1.268", "arm 1 (interactive injection) states modelRequests as 1, and its own observations give 2"),
       'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
     ]);
 
@@ -293,6 +326,54 @@ describe("the qualified set and its readings must agree", () => {
     const { baselineModelRequests: _dropped, ...countless } = interactiveInjection!;
     expect(qualificationDisagreements(members, [withArms([countless as ProbeRun, ...others])])).toEqual([
       resting("2.1.268", "arm 1 (interactive injection) does not record baselineModelRequests as a count"),
+      resting("2.1.268", "arm 1 (interactive injection) states baselineModelRequests as undefined, and its own observations give 1"),
+      'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+    ]);
+  });
+
+  it("an arm's counts have to come from the observations committed with it", () => {
+    // The gap this rule closes: every count above is checked against the other counts in the same
+    // file, and the captures they were read from are under `evidence/local/`, which is gitignored.
+    // So a reading could state any four consistent numbers and nothing a reader of the repository
+    // could see would contradict them.
+    const members = [build("2.1.268")];
+    const [interactiveInjection, interactiveControl, headlessInjection, headlessControl] = arms();
+    const others = [interactiveControl!, headlessInjection!, headlessControl!];
+
+    // Absence is refused, not skipped -- the case that slipped through every previous version of
+    // this rule. A reading written before the observations existed is re-taken, not admitted.
+    const { observations: _dropped, ...unobserved } = interactiveInjection!;
+    expect(qualificationDisagreements(members, [withArms([unobserved as ProbeRun, ...others])])).toEqual([
+      resting("2.1.268", "arm 1 (interactive injection) carries no observations, so its counts are claims this file makes about itself"),
+      'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+    ]);
+
+    // The observations have to name the capture they came from. It is a weak binding -- the file is
+    // not committed, so a reader without it checks nothing -- and a missing one is still a reading
+    // whose observations came from nowhere in particular.
+    expect(
+      qualificationDisagreements(members, [
+        withArms([
+          { ...interactiveInjection!, observations: { ...interactiveInjection!.observations!, rawCaptureSha256: "not-a-digest" } },
+          ...others,
+        ]),
+      ]),
+    ).toEqual([
+      resting("2.1.268", "arm 1 (interactive injection) does not bind its observations to the digest of a raw capture"),
+      'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+    ]);
+
+    // And the numbers have to be the numbers those observations give. Here the injection arm keeps
+    // its counts and carries the control's observations: a wake it says arrived, in a record that
+    // never saw one.
+    expect(
+      qualificationDisagreements(members, [
+        withArms([{ ...interactiveInjection!, observations: interactiveControl!.observations }, ...others]),
+      ]),
+    ).toEqual([
+      resting("2.1.268", "arm 1 (interactive injection) states modelRequests as 2, and its own observations give 1"),
+      resting("2.1.268", "arm 1 (interactive injection) states wakeCarryingModelRequests as 1, and its own observations give 0"),
+      resting("2.1.268", "arm 1 (interactive injection) states followUpAfterInjection as true, and its own observations give false"),
       'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
     ]);
   });
