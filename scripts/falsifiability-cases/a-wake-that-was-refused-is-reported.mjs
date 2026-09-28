@@ -22,7 +22,8 @@ const aWakeThatWasRefusedIsReported = {
   id: "a-wake-that-was-refused-is-reported",
   what: "the CTO port reports a holder whose registered endpoint passes every check and refused the wake it was sent",
   file: "src/mcp/role-conversation.ts",
-  find: '    return peer.wakeFailure?.endpoint === endpoint ? "registered-endpoint-refused-the-wake" : null;\n',
+  find:
+    '    return peer.wakeFailure?.registration === peer.registration ? "registered-endpoint-refused-the-wake" : null;\n',
   replace: "    return null;\n",
   killedBy: [
     "tests/unit/the-wake-transport-qualifies-a-set-of-builds.test.ts::reports a holder whose registration still validates and whose wake was refused",

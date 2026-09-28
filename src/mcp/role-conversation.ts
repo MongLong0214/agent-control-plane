@@ -63,19 +63,35 @@ interface LivePeer {
    */
   endpoint: string | null;
   /**
-   * The wake `endpoint` refused, or `null` while nothing has contradicted it.
+   * Which registration of this connection this peer's endpoint belongs to.
+   *
+   * A counter, and its only job is to tell successive registrations apart. An endpoint string
+   * cannot: a holder that rebinds the same pathname and registers again produces two registrations
+   * that compare equal, and a wake still in flight from the first then writes its outcome into the
+   * second's memory. Both reviewers reproduced that in both directions -- a late success erasing a
+   * newer registration's refusal, and a late failure poisoning a newer registration that worked.
+   *
+   * Bumped wherever `endpoint` is assigned, and read by `wake` before it connects and again when
+   * its delivery completes: a completion whose registration is no longer the current one changes
+   * nothing.
+   */
+  registration: number;
+  /**
+   * The wake this registration was sent and that the endpoint refused, or `null` while nothing has
+   * contradicted it.
    *
    * A socket path stays a socket after its listener is gone, so every check `wake` makes before it
    * connects can pass while the connect itself is refused: the holder is reported wakeable and no
    * wake arrives. The daemon already learns that the moment a wake fails, and this is where that
    * fact is kept so the report can use it.
    *
-   * **Scoped to the registration that earned it**, which is why the endpoint it failed against is
-   * stored beside the shape rather than a bare flag. `registerEndpoint` clears it, and a delivery
-   * that succeeds clears it, so a refusal cannot outlive the fact it describes -- the same rule the
-   * scan's own docstring states about refusals in general.
+   * **Scoped to the registration that earned it**, which is what `registration` names: the field
+   * carries the identity of the registration whose delivery failed, `registerEndpoint` clears it,
+   * and a delivery that succeeds under the same registration clears it. So a refusal cannot outlive
+   * the fact it describes -- the same rule the scan's own docstring states about refusals in
+   * general -- and a delivery that outlived its own registration cannot write here at all.
    */
-  wakeFailure: { readonly endpoint: string; readonly shape: WakeFailure["shape"] } | null;
+  wakeFailure: { readonly registration: number; readonly shape: WakeFailure["shape"] } | null;
 }
 
 /**
@@ -462,7 +478,14 @@ export class RoleConversationPort {
       if (scopeRoleKey !== undefined && binding.roleKey !== scopeRoleKey) continue;
       this.#clearStalePeer(binding.roleKey);
       if (scopeRoleKey !== undefined && this.#live.has(binding.roleKey)) continue;
-      this.#live.set(binding.roleKey, { server, authenticate, binding, endpoint: null, wakeFailure: null });
+      this.#live.set(binding.roleKey, {
+        server,
+        authenticate,
+        binding,
+        endpoint: null,
+        registration: 0,
+        wakeFailure: null,
+      });
       owned.push(binding.roleKey);
     }
     return () => {
@@ -565,9 +588,10 @@ export class RoleConversationPort {
    * actually landed. Each answer is the first thing a wake would stop at, so the cause names the
    * step that would refuse rather than the last one that could.
    *
-   * The remembered failure is compared against the endpoint currently registered, not merely
+   * The remembered failure is compared against the registration currently in force, not merely
    * consulted: a memory that outlived the registration it was taken on would describe a wake to a
-   * socket this holder no longer names.
+   * socket this holder no longer names. Comparing the endpoint it failed against was not enough --
+   * a holder that rebinds the same pathname registers again under the same string.
    */
   #unwakeableCause(client: WakeTransportClient | undefined, peer: LivePeer): UnwakeableCause | null {
     if (!isWakeTransportQualified(client)) {
@@ -576,7 +600,7 @@ export class RoleConversationPort {
     const endpoint = peer.endpoint;
     if (endpoint === null) return "no-registered-endpoint";
     if (!this.#validateEndpointPath(endpoint).allowed) return "registered-endpoint-not-usable";
-    return peer.wakeFailure?.endpoint === endpoint ? "registered-endpoint-refused-the-wake" : null;
+    return peer.wakeFailure?.registration === peer.registration ? "registered-endpoint-refused-the-wake" : null;
   }
 
   /**
@@ -782,6 +806,12 @@ export class RoleConversationPort {
     }
     for (const [, peer] of owned) {
       peer.endpoint = validated.value;
+      // A new registration, and a new identity for it. The endpoint string is not one: a holder
+      // that rebinds the same pathname registers again under a value that compares equal, and a
+      // wake still in flight from the previous registration would then complete into this one's
+      // memory. Every delivery carries the number it began under and writes nothing if it is no
+      // longer this one.
+      peer.registration += 1;
       // A registration is a new fact about where to knock, so whatever the previous one failed to
       // deliver says nothing about this one. A refusal carried across a registration would outlive
       // the fact it describes: a holder that rebound and registered again would be reported
@@ -941,6 +971,11 @@ export class RoleConversationPort {
     const revalidated = this.#validateEndpointPath(peer.endpoint);
     if (!revalidated.allowed) return revalidated as Decision<void>;
 
+    // Read before the connect and compared after it. What this delivery is about is the
+    // registration in force when it began; by the time it completes the holder may have registered
+    // again, and a completion that wrote into the current registration's memory would be reporting
+    // the previous endpoint's delivery as this one's. Both directions of that were reproduced.
+    const registration = peer.registration;
     try {
       await new Promise<void>((resolveWake, rejectWake: (failure: WakeFailure) => void) => {
         const socket = connect(revalidated.value);
@@ -971,19 +1006,29 @@ export class RoleConversationPort {
         });
       });
     } catch (failure) {
-      // Remembered against the endpoint it was tried on, so the scan can report a holder whose
-      // registration is valid on the filesystem and still takes no wake -- the one unwakeable state
-      // no check made before connecting can see. Not a probe: this is a delivery that was going to
-      // happen anyway, and what is kept is its outcome.
-      peer.wakeFailure = { endpoint: revalidated.value, shape: (failure as WakeFailure).shape };
+      // Remembered against the registration it was sent under, so the scan can report a holder
+      // whose registration is valid on the filesystem and still takes no wake -- the one unwakeable
+      // state no check made before connecting can see. Not a probe: this is a delivery that was
+      // going to happen anyway, and what is kept is its outcome.
+      //
+      // Only while that registration is still the one in force. A failure from a registration the
+      // holder has already replaced says nothing about where it now asks to be knocked on, and
+      // writing it here would report a working registration as refused. The decision below is
+      // returned either way: the wake this caller sent did fail, whatever has happened since.
+      if (peer.registration === registration) {
+        peer.wakeFailure = { registration, shape: (failure as WakeFailure).shape };
+      }
       return deny(ReasonCode.ROLE_PEER_FAILED, "the peer's wake endpoint did not accept the wake", {
         role: this.#role,
         roleKey,
         shape: (failure as WakeFailure).shape,
       });
     }
-    // A wake that landed is the contradiction of an earlier one that did not, so the memory goes.
-    peer.wakeFailure = null;
+    // A wake that landed is the contradiction of an earlier one that did not, so the memory goes --
+    // and only the memory of the registration this delivery belonged to. A success completing after
+    // the holder registered again used to clear unconditionally, which erased the newer
+    // registration's own refusal and reported a holder nothing can wake as wakeable.
+    if (peer.registration === registration) peer.wakeFailure = null;
     return allow(ReasonCode.OK, undefined);
   }
 

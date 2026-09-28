@@ -16,8 +16,8 @@ const aWakeThatLandsClearsTheRefusalItContradicts = {
   id: "a-wake-that-lands-clears-the-refusal-it-contradicts",
   what: "a wake the peer accepts clears the refusal remembered against that registration",
   file: "src/mcp/role-conversation.ts",
-  find: "    // A wake that landed is the contradiction of an earlier one that did not, so the memory goes.\n    peer.wakeFailure = null;\n",
-  replace: "    peer.wakeFailure = peer.wakeFailure;\n",
+  find: "    if (peer.registration === registration) peer.wakeFailure = null;\n",
+  replace: "    if (peer.registration !== registration) peer.wakeFailure = null;\n",
   killedBy: [
     "tests/unit/the-wake-transport-qualifies-a-set-of-builds.test.ts::reports a holder whose registration still validates and whose wake was refused",
   ],
