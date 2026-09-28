@@ -1046,6 +1046,26 @@ export interface ArmObservations {
 }
 
 /**
+ * Whether an observed text is published though no count is read from it.
+ *
+ * The other half of the withholding rule, and the half a reader can check: a record shows verbatim
+ * only what the counts are read from, so a text that is neither the prompt nor a carrier of the wake
+ * token has no business being in a committed file. The instrument classifies that way
+ * (`observedText`), which is a property of the code; this is the property of the artefact, and it is
+ * what keeps a reading taken by some other instrument -- or edited afterwards -- from publishing the
+ * client's system prompt into a public repository on the strength of everything else agreeing.
+ *
+ * The prompt is this harness's own constant, the same default `countsFrom` derives against, because
+ * an arm that was started with some other prompt is not one these rules admit.
+ */
+const isPublishedWithoutBeingRead = (entry: ObservedText): boolean =>
+  entry !== null &&
+  typeof entry === "object" &&
+  "text" in entry &&
+  typeof entry.text === "string" &&
+  !isArmEvidence(entry.text);
+
+/**
  * Whether an observed text is neither shown nor accounted for -- content a record dropped.
  *
  * Read from parsed JSON, so neither shape is guaranteed: a kept text needs a string `text`, and a
@@ -1490,8 +1510,9 @@ const armLabel = (arm: { readonly shape: ProbeShape; readonly injected: boolean 
  *   because this repository is public and the rest of what a request puts in front of the model is
  *   the client's own system prompt. Every other text travels as its length and its SHA-256, and a
  *   text that is neither shown nor accounted for that way is a shortfall. So what a reader of the
- *   repository can do is exactly this: recompute the four counts over the kept texts, and see that
- *   nothing else was dropped rather than withheld. Recomputing over a withheld text's *contents*
+ *   repository can do is exactly this: recompute the four counts over the kept texts, see that
+ *   nothing else was dropped rather than withheld, and see that nothing was published that no count
+ *   is read from. Recomputing over a withheld text's *contents*
  *   needs the raw capture, which is under `evidence/local/` and is not committed; `rawCaptureSha256`
  *   names it for the operator who has it. The instrument refuses to withhold evidence
  *   (`withholdText`), which is what keeps the kept set from being the whole of the claim -- but that
@@ -1574,6 +1595,20 @@ export const qualificationShortfalls = (runs: readonly ProbeRun[]): readonly str
       if (unaccounted > 0) {
         shortfalls.push(
           `${where} carries ${unaccounted} model-input text(s) it neither records nor accounts for by a length and digest`,
+        );
+      }
+      // And nothing verbatim that no count is read from. These readings are committed to a public
+      // repository, and most of a request's model input is the client's own system prompt; the
+      // instrument withholds it, and this refuses a reading that does not -- which is what makes the
+      // rule a property of the artefact rather than of the code that happened to write it.
+      const published = observations.requests.reduce(
+        (total, request) =>
+          total + (Array.isArray(request?.texts) ? request.texts : []).filter(isPublishedWithoutBeingRead).length,
+        0,
+      );
+      if (published > 0) {
+        shortfalls.push(
+          `${where} carries ${published} model-input text(s) verbatim that none of its counts are read from`,
         );
       }
       const stated: ArmCounts = {
@@ -1852,7 +1887,7 @@ const LIMITS: readonly string[] = [
   "Every arm executed one hard link, in a directory private to the run, to the inode digested as imageSha256 -- the command's first element names that link, which is removed with the run, and imagePath names where the inode was found. Each arm re-read the link's identity, size, modification time and digest after its measurement and would have failed the run on a difference. A rewrite of that inode in place, undone before the re-read, would not have been seen.",
   "The verdict in this file is recomputed from the runs in it, by the one calculation the instrument writes it with, and a reader that admits this reading recomputes it again rather than reading the field. That establishes internal consistency and nothing more: every fact it checks is a statement inside this file. A file written from nothing, with all its fields made to agree, satisfies it. Whether the arms it describes ever ran is a question the raw captures and session logs it points at answer, and this check does not ask them.",
   "Each arm carries the observations its counts are derived from -- every captured request's time, method and URL -- and both the instrument and the reader derive the four counts from them rather than reading integers. What that removes is a count that stood on nothing; what it does not do is attest that a live client produced the observations. An observation list written by hand derives exactly as well as a measured one, and this file cannot tell them apart.",
-  "Of each request's model input, this file carries verbatim only what the counts are read from: the arm's prompt, and any text containing the wake token. Every other text -- most of it the client's own system prompt, which is not ours to publish -- is recorded as its kind, its length in UTF-8 bytes and its SHA-256. So a reader of the repository can recompute the four counts over the texts that are here and see that every other text is accounted for by a digest; a reader cannot see what a withheld text said. Recomputing the counts over their contents needs the raw capture named by rawCaptureSha256, which is not committed. The instrument refuses to withhold a text carrying the token or equal to the prompt, so the kept texts are the evidence and not a selection from it -- but that is a property of the code that wrote this file, not a fact this file establishes.",
+  "Of each request's model input, this file carries verbatim only what the counts are read from: the arm's prompt, and any text containing the wake token. Every other text -- most of it the client's own system prompt, which is not ours to publish -- is recorded as its kind, its length in UTF-8 bytes and its SHA-256. So a reader of the repository can recompute the four counts over the texts that are here and see that every other text is accounted for by a digest; a reader cannot see what a withheld text said. Recomputing the counts over their contents needs the raw capture named by rawCaptureSha256, which is not committed. The instrument refuses to withhold a text carrying the token or equal to the prompt, so the kept texts are the evidence and not a selection from it -- but that is a property of the code that wrote this file, not a fact this file establishes. What is checked of the file itself is the other direction: a reading carrying a verbatim text that none of its counts are read from is refused rather than admitted.",
   "The observations are bound to each arm's raw capture by that capture's SHA-256. The capture itself is under evidence/local/, which is not committed, so a reader without that file cannot check the digest, and a reader with it learns only that the copy in hand is the one these observations were read from.",
   "This file does not identify the instrument that produced it. headSha is git rev-parse HEAD at receipt-build time, which can name a tree that contains no harness -- the harness may be uncommitted while the reading is taken. Unless a sourceBinding block below says otherwise, the source of this reading is UNKNOWN, and a digest computed after the fact would attest preservation since, not what executed.",
 ];

@@ -434,6 +434,44 @@ describe("the qualified set and its readings must agree", () => {
     expect(qualificationDisagreements(members, [withArms([interactiveInjection!, ...others])])).toEqual([]);
   });
 
+  it("an arm publishing a text none of its counts are read from is refused", () => {
+    // The half of the withholding rule that is a property of the file rather than of the instrument
+    // that wrote it. A reading goes into a public repository, and most of a request's model input is
+    // the client's own system prompt -- vendor product text, and provider and model detail that has
+    // no place in a public artefact. The instrument withholds it; this refuses a reading that does
+    // not, so a record taken by some other instrument, or edited afterwards, cannot publish it on
+    // the strength of every count agreeing.
+    const members = [build("2.1.268")];
+    const [interactiveInjection, interactiveControl, headlessInjection, headlessControl] = arms();
+    const others = [interactiveControl!, headlessInjection!, headlessControl!];
+    const requests = interactiveInjection!.observations!.requests;
+    const published: ProbeRun = {
+      ...interactiveInjection!,
+      observations: {
+        ...interactiveInjection!.observations!,
+        requests: [
+          {
+            ...requests[0]!,
+            texts: [...requests[0]!.texts, { from: "system", text: "You are Claude Code, a CLI. <pages of it>" }],
+          },
+          ...requests.slice(1),
+        ],
+      },
+    };
+    expect(qualificationDisagreements(members, [withArms([published, ...others])])).toEqual([
+      resting("2.1.268", "arm 1 (interactive injection) carries 1 model-input text(s) verbatim that none of its counts are read from"),
+      'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+    ]);
+
+    // The control: the texts the counts *are* read from stay verbatim, and an arm carrying only
+    // those is admitted -- the prompt, and the prose the runtime composes around the token.
+    expect(requests.flatMap((request) => request.texts.filter((entry) => "text" in entry).map((entry) => entry.from))).toEqual([
+      "user",
+      "user",
+    ]);
+    expect(qualificationDisagreements(members, [withArms([interactiveInjection!, ...others])])).toEqual([]);
+  });
+
   it("a reading of a build outside the set is a failure, whatever its verdict", () => {
     const members = [build("2.1.268")];
 
