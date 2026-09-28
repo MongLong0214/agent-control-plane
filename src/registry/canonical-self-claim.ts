@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { closeSync, existsSync, fstatSync, openSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readdirSync, realpathSync, statSync, type BigIntStats } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
 
@@ -23,9 +23,9 @@ import type { BuzzActorAuthenticator, SessionRegistry } from "../session/session
  * is exactly what must not happen for the canonical PRIMARY_CTO conversational actor, because the
  * canonical conversation already exists and must be adopted in place. This module is the claim
  * primitive that composition does: it derives who is asking independently of what it is told,
- * verifies eight independently fatal facts about the claimant, and only then performs one atomic
- * mutation that either creates the session/actor/assignment/target-binding/attestation tuple or
- * writes nothing at all.
+ * verifies a set of independently fatal facts about the claimant, and only then performs one
+ * atomic mutation that either creates the session/actor/assignment/target-binding/attestation
+ * tuple or writes nothing at all.
  *
  * What this module deliberately does not do:
  *  - It never accepts an argument as identity. A caller-supplied session UUID or PID is checked
@@ -42,14 +42,15 @@ import type { BuzzActorAuthenticator, SessionRegistry } from "../session/session
  */
 
 // ---------------------------------------------------------------------------
-// Deployment identity (#760). The one session UUID, the required executor version, and
-// the canonical Buzz channel are deployment-private facts, not source constants. They are
-// required fields on `CanonicalSelfClaimConfig` (below), sourced by the composition root
-// (`src/daemon/agentcpd.ts`) from required environment variables with no fallback to a real
-// value; a missing one fails construction closed, before any effect. The executing image's
-// version must still be read from the actual resolved artifact at check time, never from a
-// symlink or a fresh `claude --version` invocation resolved through PATH — see
-// `resolveExecutingImagePath`/`versionFromImagePath` below.
+// Deployment identity (#760). The adoptable sessions and the canonical Buzz channel are
+// deployment-private facts, not source constants. They are required fields on
+// `CanonicalSelfClaimConfig` (below), sourced by the composition root (`src/daemon/agentcpd.ts`)
+// from required environment variables with no fallback to a real value; a missing one fails
+// construction closed, before any effect. The claimant's executing image is not one of them: it is
+// observed and recorded, and compared against no configured value (clause 2 in
+// `verifyClaudeIdentity`). What gets recorded is still read from the image the kernel actually
+// loaded, never from a symlink or a fresh `claude --version` invocation resolved through PATH —
+// see `defaultExecutingImageInspector`/`versionFromImagePath` below.
 // ---------------------------------------------------------------------------
 
 /**
@@ -336,22 +337,29 @@ export const defaultProcessAncestryInspector: ProcessAncestryInspector = {
 };
 
 /**
- * Matches `argv[0]`'s basename against `claude` — a directly executed compiled binary
- * (`/path/to/claude ...`) only. A real argv vector's first element is exactly the exec'd path (or
- * the name a caller's `execvp` search resolved), never a `ps`-rendered approximation of it.
+ * Tests whether `argv[0]`'s basename is `claude` — the shape of a directly executed compiled binary
+ * (`/path/to/claude ...`) only. The vector is the kernel's copy of the real argv, never a
+ * `ps`-rendered approximation of it, but its first element is still whatever the `execve` caller
+ * chose to pass. By convention that is the path or name it invoked; nothing binds it to the file
+ * the kernel loaded — `exec -a`, or node's `spawn(file, args, { argv0 })`, sets it to any string.
+ * So this is a basename test on a caller-chosen string, not a statement about the image. It is
+ * still worth keeping: the ancestry walk stops at the first ancestor it matches, so it is what
+ * tells the claude process apart from the shells and tools between it and the caller, and a
+ * process that does not even present itself as claude never becomes the claimant.
  *
  * Deliberately does **not** also match a second element whose basename is `claude` — an
- * interpreter-launched script, `node /path/to/claude ...`. Matching that shape breaks clause 2 in
- * both directions at once: the executing-image inspector below always authenticates the
- * kernel-loaded image, which for `node script` is `node` itself, never the script. A deployment
- * that pins the real Node binary's realpath/hash would admit *any* attacker-controlled script
- * merely named `claude` and launched through that same, legitimate interpreter — the
- * interpreter's own identity would be doing all the authenticating, and the script's identity
- * none of it. A deployment that instead pinned the script's own path could never be satisfied by
- * real interpreter execution, since the kernel-loaded image is still `node`. Requiring the first
- * element to itself be `claude` closes this: only a process whose own exec'd image is the
- * `claude` binary can ever be the claimant, so the image check that follows authenticates the
- * same file this check named.
+ * interpreter-launched script, `node /path/to/claude ...`. For that shape the kernel-loaded image
+ * is the interpreter, never the script, so matching it would let any script merely named `claude`
+ * stand as the claimant on the strength of whichever legitimate interpreter launched it.
+ *
+ * This is now the only process-shape check between a same-uid process and the claim, and it is a
+ * check on a name. It used to be the first half of a pair: the executing image was then compared
+ * against a deployment-configured version, realpath and sha256, which is what tied the name read
+ * here to the bytes actually running. That comparison is withdrawn (clause 2 in
+ * `verifyClaudeIdentity`), so any image passes here once its `argv[0]` ends in `claude` — renamed,
+ * copied, or simply exec'd under that name — and nothing downstream examines what it is. What
+ * still bounds the claim is the kernel peer credential on the claim socket, the configured session
+ * UUID derived from this process's own argv, and the project that UUID's entry names.
  */
 export const looksLikeClaudeInvocation = (argv: readonly string[]): boolean => {
   const [firstElement] = argv;
@@ -530,21 +538,40 @@ export const deriveClaimantIdentity = (
 };
 
 // ---------------------------------------------------------------------------
-// Executing image — the specific file the OS loaded, not a symlink read at check time.
+// Executing image — the specific file the OS loaded, not a symlink read at check time. Observed and
+// recorded; no claim is refused on what it says, or on its absence.
 // ---------------------------------------------------------------------------
 
 export interface ExecutingImageEvidence {
   imagePath: string;
   version: string;
-  /** `sha256:<hex>` of the resolved image's actual bytes — this module's own `sha256` helper. */
-  sha256: string;
+  /**
+   * `sha256:<hex>` of the image's bytes, read through the verified FD (see `hashImageFd`) — or
+   * absent, and which one depends on the inspector that produced the evidence.
+   *
+   * Always absent from `defaultExecutingImageInspector`, which is the canonical claim's. That
+   * claim's attestation and receipt take the path and version only, so the inspector reads no byte
+   * of the image. It used to hash the whole binary on every claim for a field nothing there read,
+   * and when that read failed it returned `null` — losing the path and version the claim does read.
+   *
+   * Present from `hashingExecutingImageInspector`, whose one caller is the delegated CTO binding's
+   * attestation digest (`cto-binding-runtime.ts`), except when the bytes could not be read. That
+   * absence is the report: the evidence still names the image the scan resolved instead of
+   * collapsing into `null`, and the delegated binding refuses it rather than attesting an observed
+   * image without its hash. A reader that needs this field must treat its absence as "not read",
+   * never as "nothing to read".
+   */
+  sha256?: string;
 }
 
 /**
  * The scan that would have named the executing image could not run. Distinguished from `null` for
- * the same reason `cwd` is (#834): `null` means the image was looked at and is not one this
- * deployment can accept, and this means nobody looked. The one-key shape is the discriminator —
- * `ExecutingImageEvidence` never carries `probeFailure`.
+ * the same reason `cwd` is (#834): `null` means the scan ran and produced no usable image — the
+ * file it names is gone from disk, was replaced after exec, or carries no `/versions/` segment —
+ * and this means nobody looked. Neither refuses a claim, and the claim records both as no image;
+ * the distinction survives for a caller that must not read a scan that never ran as an
+ * observation of nothing. The one-key shape is the discriminator — `ExecutingImageEvidence` never
+ * carries `probeFailure`.
  */
 export interface ExecutingImageProbeFailure {
   probeFailure: LsofProbeFailure;
@@ -558,27 +585,26 @@ export interface ExecutingImageInspector {
   /**
    * The image, `null` when the scan ran and produced no usable image, or a probe failure when the
    * scan itself could not run. An implementation that cannot fail its probe may keep returning
-   * only the first two — the union is wider than what it produces, not narrower.
+   * only the first two — the union is wider than what it produces, not narrower. Whether the
+   * evidence carries `sha256` is the implementation's to say; `ExecutingImageEvidence` states what
+   * each of the two shipped here does.
    */
   resolve(pid: number): ExecutingImageEvidence | ExecutingImageProbeFailure | null;
 }
 
 /**
  * Reads the version out of the resolved image's own path rather than executing it or trusting a
- * file placed beside it. Invoking the resolved path with `--version` is deliberately avoided: a
- * self-reported string from a binary this check exists to not trust the caller's word about is
- * the same shape of evidence, one hop removed.
+ * file placed beside it. The version is an observation — the claim records it in its attestation
+ * and receipt and compares it against nothing — so the one requirement on it is that it describe
+ * the image the kernel actually loaded. Invoking the resolved path with `--version` would record
+ * whatever that binary chose to say about itself instead.
  *
- * An adjacent `package.json` is not used as version authority: it is a second file, independently
- * writable from the binary it sits beside, so it can be forged without touching the realpath or
- * the bytes clause 2 already authenticates — a version read that way proves nothing the other two
- * checks do not already have to hold for separately. The one thing that cannot be forged without
- * also changing the resolved path itself is the path's own `/versions/<version>` executable-file
- * layout, or the legacy `/versions/<version>/<binary>` layout — so that version segment, taken
- * verbatim, is the only version authority. It is compared for exact equality against
- * `CanonicalSelfClaimConfig.requiredExecutorVersion` afterward; nothing here re-validates its
- * shape, so a deployment's real version and a test's synthetic prerelease segment (e.g.
- * `9.0.0-test`) are read identically.
+ * An adjacent `package.json` is not read either: it is a second file, independently writable from
+ * the binary it sits beside, so it can say anything while the running image stays the same. The
+ * path's own `/versions/<version>` executable-file layout, or the legacy
+ * `/versions/<version>/<binary>` layout, is where the running image was resolved, so that segment,
+ * taken verbatim, is the version recorded. Nothing here validates its shape, so a deployment's real
+ * version and a test's synthetic prerelease segment (e.g. `9.0.0-test`) are read identically.
  */
 const IMAGE_VERSION_FILE_PATTERN = /\/versions\/([^/]+)$/;
 const IMAGE_VERSION_DIRECTORY_PATTERN = /\/versions\/([^/]+)\/[^/]+$/;
@@ -589,15 +615,13 @@ export const versionFromImagePath = (imagePath: string): string | null =>
   ?? null;
 
 /**
- * Hashes the bytes reached through an already-open file descriptor, then closes it. A version
- * string and a realpath both describe the file; neither is the file, and neither is the FD. A
- * renamed Node binary placed at a forged, expected-looking path with a forged adjacent manifest
- * would satisfy a realpath check and a version check alike — hashing bytes read through the exact
- * FD `openLinuxImageFd`/`openVerifiedDarwinImageFd` bound is the one comparison that requires the
- * actual invocation artifact to actually be the expected one, not merely labeled or path-matched
- * as it. Resolving a path and hashing a *later, separate* open of that same path string is not
- * this: a file swapped into place after the path resolves and before that second open runs would
- * authenticate bytes that were never the running image.
+ * Hashes the bytes reached through an already-open file descriptor, then closes it; `null` when
+ * they could not be read. Only `hashingExecutingImageInspector` gets here — the canonical claim's
+ * inspector never opens the image. No claim compares the hash against a configured value. It is
+ * read through the exact FD `openLinuxImageFd`/`openVerifiedDarwinImageFd` bound rather than
+ * through a *later, separate* open of the same path string, so that what it reports is the running
+ * image's bytes: a file swapped into place after the path resolves and before a second open runs
+ * would otherwise be hashed in the running image's name.
  */
 const hashImageFd = (fd: number): string | null => {
   try {
@@ -628,24 +652,61 @@ const openLinuxImageFd = (pid: number): number | null => {
 };
 
 /**
- * Darwin has no magic-symlink equivalent to open directly: `lsof`'s reported `txt` path is still
- * just a path, resolved at scan time. This opens that reported path, then verifies — via `fstat`,
- * in `bigint` mode (a real inode on this filesystem exceeds `Number.MAX_SAFE_INTEGER`; the default,
- * non-bigint stat silently rounds it, which would make two genuinely different inodes compare
- * equal) — that the opened file's device and inode match `lsof`'s own report from the *same* scan.
- * A path swapped in between the scan and the open changes what `fstat` sees without changing what
- * `lsof` already reported, so the mismatch is caught rather than silently hashed.
+ * The (device, inode) `lsof` reported for the image, parsed into what a `bigint` `stat` returns, or
+ * `null` when the scan did not report one. `bigint` because a real inode on this filesystem
+ * exceeds `Number.MAX_SAFE_INTEGER`; the default, non-bigint stat silently rounds it, which would
+ * make two genuinely different inodes compare equal.
  */
-const openVerifiedDarwinImageFd = (imagePath: string, entry: LsofEntry): number | null => {
+interface ReportedImageFile {
+  device: bigint;
+  inode: bigint;
+}
+
+const reportedImageFile = (entry: LsofEntry): ReportedImageFile | null => {
   if (entry.device === null || entry.inode === null) return null;
-  let reportedDevice: bigint;
-  let reportedInode: bigint;
   try {
-    reportedDevice = BigInt(entry.device);
-    reportedInode = BigInt(entry.inode);
+    return { device: BigInt(entry.device), inode: BigInt(entry.inode) };
   } catch {
     return null;
   }
+};
+
+/**
+ * Whether a stat describes the file `lsof` reported the process running. `lsof`'s `txt` path is
+ * only a path, resolved at scan time; a file swapped in at that path afterwards changes what a
+ * later stat sees without changing what `lsof` already reported, so this is what catches it. Both
+ * uses below go through this one comparison: the canonical label (`pathIsReportedImageFile`) and
+ * the FD the hashing inspector reads (`openVerifiedDarwinImageFd`).
+ */
+const isReportedImageFile = (stat: BigIntStats, reported: ReportedImageFile): boolean =>
+  stat.dev === reported.device && stat.ino === reported.inode;
+
+/**
+ * Whether the path `lsof` reported still names the running image — `stat`, not an open, so it
+ * reads no byte of the file and needs no read permission on it. A process can execute an image its
+ * uid cannot read (mode `--x`), and that image's path and version are exactly as observable as any
+ * other's; an open here would lose them to a read nobody on the canonical path consumes.
+ *
+ * What it still refuses to label is a path that no longer names the running file: a build the
+ * updater deleted from disk (the stat fails) or a file renamed over the image after exec (the
+ * stat names another inode). Both resolve to no image, as they did when this was an open.
+ */
+const pathIsReportedImageFile = (imagePath: string, reported: ReportedImageFile): boolean => {
+  try {
+    return isReportedImageFile(statSync(imagePath, { bigint: true }), reported);
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Darwin has no magic-symlink equivalent to open directly, so the hashing inspector opens the
+ * reported path and then verifies — via `fstat` on the opened FD — that it is the file `lsof`
+ * reported in the *same* scan. `pathIsReportedImageFile` already checked the path a moment
+ * earlier, but that check is on the path and this is on the handle whose bytes get hashed: a swap
+ * landing between the two is caught here rather than silently hashed.
+ */
+const openVerifiedDarwinImageFd = (imagePath: string, reported: ReportedImageFile): number | null => {
   let fd: number;
   try {
     fd = openSync(imagePath, "r");
@@ -653,8 +714,7 @@ const openVerifiedDarwinImageFd = (imagePath: string, entry: LsofEntry): number 
     return null;
   }
   try {
-    const stat = fstatSync(fd, { bigint: true });
-    if (stat.dev !== reportedDevice || stat.ino !== reportedInode) {
+    if (!isReportedImageFile(fstatSync(fd, { bigint: true }), reported)) {
       closeSync(fd);
       return null;
     }
@@ -665,43 +725,80 @@ const openVerifiedDarwinImageFd = (imagePath: string, entry: LsofEntry): number 
   return fd;
 };
 
-export const defaultExecutingImageInspector: ExecutingImageInspector = {
-  resolve(pid) {
-    if (platform() === "linux") {
-      let imagePath: string;
-      try {
-        imagePath = realpathSync(`/proc/${pid}/exe`);
-      } catch {
-        return null;
-      }
-      const version = versionFromImagePath(imagePath);
-      if (!version) return null;
-      const fd = openLinuxImageFd(pid);
-      if (fd === null) return null;
-      const hash = hashImageFd(fd);
-      if (!hash) return null;
-      return { imagePath, version, sha256: hash };
+/**
+ * What one scan says the process is running, and how to open exactly that file if a caller needs
+ * its bytes. Producing it reads none of them: `open` runs only for the hashing inspector.
+ */
+interface ObservedImage {
+  evidence: ExecutingImageEvidence;
+  open: () => number | null;
+}
+
+const observeExecutingImage = (pid: number): ObservedImage | ExecutingImageProbeFailure | null => {
+  if (platform() === "linux") {
+    let imagePath: string;
+    try {
+      imagePath = realpathSync(`/proc/${pid}/exe`);
+    } catch {
+      return null;
     }
-    // Darwin (and any other platform lsof can answer for): one lsof scan is the single source for
-    // both the reported path and the device+inode `fstat` verifies the opened FD against — two
-    // separate scans could each see a different reality if a path were swapped in between them.
-    const scan = lsofEntries(pid);
-    // The image resolution has exactly one channel on this platform, and a channel that did not
-    // run says nothing about the image that would have come back through it. This is the same
-    // `lsof` scan the cwd lookup uses and it fails the same two ways — a timeout, or an
-    // unreachable lsof — so it is reported the same way rather than collapsed into `null`.
-    if (!scan.ok) return { probeFailure: scan.failure };
-    const entry = scan.entries.find((candidate) => candidate.fd === "txt" && candidate.type === "REG");
-    if (!entry) return null;
-    const imagePath = entry.name;
     const version = versionFromImagePath(imagePath);
     if (!version) return null;
-    const fd = openVerifiedDarwinImageFd(imagePath, entry);
-    if (fd === null) return null;
-    const hash = hashImageFd(fd);
-    if (!hash) return null;
-    return { imagePath, version, sha256: hash };
-  },
+    return { evidence: { imagePath, version }, open: () => openLinuxImageFd(pid) };
+  }
+  // Darwin (and any other platform lsof can answer for): one lsof scan is the single source for
+  // both the reported path and the device+inode the path and the opened FD are verified against —
+  // two separate scans could each see a different reality if a path were swapped in between them.
+  const scan = lsofEntries(pid);
+  // The image resolution has exactly one channel on this platform, and a channel that did not
+  // run says nothing about the image that would have come back through it. This is the same
+  // `lsof` scan the cwd lookup uses and it fails the same two ways — a timeout, or an
+  // unreachable lsof — so it is reported the same way rather than collapsed into `null`.
+  if (!scan.ok) return { probeFailure: scan.failure };
+  const entry = scan.entries.find((candidate) => candidate.fd === "txt" && candidate.type === "REG");
+  if (!entry) return null;
+  const imagePath = entry.name;
+  const version = versionFromImagePath(imagePath);
+  if (!version) return null;
+  const reported = reportedImageFile(entry);
+  if (!reported) return null;
+  if (!pathIsReportedImageFile(imagePath, reported)) return null;
+  return { evidence: { imagePath, version }, open: () => openVerifiedDarwinImageFd(imagePath, reported) };
+};
+
+const resolveExecutingImage = (
+  pid: number, hash: boolean,
+): ExecutingImageEvidence | ExecutingImageProbeFailure | null => {
+  const observed = observeExecutingImage(pid);
+  if (observed === null) return null;
+  if ("probeFailure" in observed) return observed;
+  if (!hash) return observed.evidence;
+  const fd = observed.open();
+  const imageSha256 = fd === null ? null : hashImageFd(fd);
+  // The scan above already resolved the image, so a read that failed says nothing about whether it
+  // exists. Folding it into `null` is what this used to do, and it reported an image it had
+  // observed as no image at all. The evidence goes back without `sha256` instead, and the caller
+  // that needed the hash decides what an unhashed image means to it.
+  if (imageSha256 === null) return observed.evidence;
+  return { ...observed.evidence, sha256: imageSha256 };
+};
+
+/**
+ * The canonical claim's inspector: the image's path and version, and no byte of the image read.
+ * The canonical attestation and receipt take nothing else, so there is no hash here to compute.
+ */
+export const defaultExecutingImageInspector: ExecutingImageInspector = {
+  resolve: (pid) => resolveExecutingImage(pid, false),
+};
+
+/**
+ * The same observation plus `sha256` of the image, read through the verified FD — for the one
+ * reader of that hash, the delegated CTO binding's attestation digest (`cto-binding-runtime.ts`).
+ * An image it resolved but could not read comes back without `sha256`, never as `null`; that
+ * caller refuses it rather than attest an observed image without its hash.
+ */
+export const hashingExecutingImageInspector: ExecutingImageInspector = {
+  resolve: (pid) => resolveExecutingImage(pid, true),
 };
 
 // ---------------------------------------------------------------------------
@@ -871,32 +968,14 @@ export interface CanonicalSelfClaimConfig {
    */
   canonicalSessions: readonly CanonicalAdoptableSession[];
   /**
-   * The exact executor version this deployment currently requires. Required — deployment-private
-   * configuration only, same no-fallback rule as `canonicalSessions`.
-   */
-  requiredExecutorVersion: string;
-  /**
    * This deployment's one canonical project Buzz channel. Required — deployment-private
    * configuration only, same no-fallback rule as `canonicalSessions`.
    */
   canonicalBuzzChannelId: string;
-  /**
-   * The daemon-owned expected realpath of the executor image, compared against the actual
-   * resolved invocation artifact (`ExecutingImageEvidence.imagePath`, itself never a symlink —
-   * see `resolveExecutingImagePath`). Required — a version string read from an adjacent,
-   * spoofable `package.json` is not sufficient on its own: a renamed binary plus a forged
-   * manifest would still read as the required version. Comparing the actual resolved path closes
-   * that gap. No fallback to a real value.
-   */
-  expectedExecutorRealpath: string;
-  /**
-   * The daemon-owned expected sha256 of the executor image's actual bytes (`sha256:<hex>`, this
-   * module's own `sha256` helper), compared against a hash computed from the resolved image at
-   * check time. Required, same no-fallback rule. Realpath alone would still trust whatever bytes
-   * happen to live at that path; hashing the bytes closes that second half of the gap — a renamed
-   * Node binary with a forged adjacent manifest, placed at the expected path, still fails here.
-   */
-  expectedExecutorSha256: string;
+  // No executor version, realpath or sha256. Those three were deployment-wide values the claimant's
+  // executing image had to equal, which admitted exactly one CLI build per host while every project
+  // runs its own session on whichever build it started with. The image is recorded now, not
+  // required — see clause 2 in `verifyClaudeIdentity` for what that withdraws.
   /**
    * The peer protocol version this deployment's transport already authenticated the connection
    * as speaking. Established outside this module (daemon/MCP transport, out of scope here) —
@@ -945,8 +1024,13 @@ export interface CanonicalSelfClaimReceipt {
   sessionSecret: string | null;
   binding: RoleBinding;
   derivedSessionUuid: string;
-  executorImageVersion: string;
-  executorImagePath: string;
+  /**
+   * What the claimant's executing image was observed to be — recorded, never required. `null` when
+   * the scan could not run or found no usable image (a binary the updater has already deleted from
+   * disk resolves to nothing); the claim is admitted either way.
+   */
+  executorImageVersion: string | null;
+  executorImagePath: string | null;
   buzzAddress: string;
 }
 
@@ -968,24 +1052,33 @@ export interface CanonicalSelfClaimDeps {
 
 /** Read-only evidence only: no owner authority, session creation or binding writes.
  * callerPid must come from authenticated transport or a deployment-owned session pin,
- * never a delegated request. Native UUID and executor evidence are independently read.
+ * never a delegated request. The native UUID is independently read and compared; the executing
+ * image is independently observed and recorded, never compared.
  */
 /**
- * What identity verification needs, which is the executor pins plus the set of session UUIDs this
- * caller considers admissible. It is a set of bare UUIDs rather than `CanonicalAdoptableSession`
- * entries because the second caller of this function — the daemon's delegated CTO binding — checks
- * one already-provisioned session and has no project or Buzz identity to entitle; the entitlement
- * half is enforced by `CanonicalSelfClaim` against the entry it resolves, not here.
+ * What identity verification needs: the set of session UUIDs this caller considers admissible, and
+ * nothing else. It used to carry the executor pins as well — a version, a realpath and a sha256 the
+ * executing image had to equal — and clause 2 below no longer compares any of them. The daemon's
+ * delegated CTO binding still accepts those three in a target's configuration and drops them at
+ * parse (`src/daemon/cto-binding-runtime.ts`), so they never reach this function.
+ *
+ * It is a set of bare UUIDs rather than `CanonicalAdoptableSession` entries because that second
+ * caller checks one already-provisioned session and has no project or Buzz identity to entitle;
+ * the entitlement half is enforced by `CanonicalSelfClaim` against the entry it resolves, not here.
  */
-export type ClaudeIdentityConfig = Omit<CanonicalSelfClaimConfig,
-  "canonicalSessions" | "canonicalBuzzChannelId" | "expectedPeerProtocolVersion" | "expectedPeerIdentity"> & {
+export interface ClaudeIdentityConfig {
   canonicalSessionUuids: readonly string[];
-};
+}
 export type ClaudeIdentityRequest = Pick<CanonicalSelfClaimRequest,
   "callerPid" | "claimedPid" | "claimedSessionUuid">;
 export interface VerifiedClaudeIdentity {
   identity: DerivedClaimantIdentity;
-  image: ExecutingImageEvidence;
+  /**
+   * Observed, not verified: clause 2 resolves it and refuses on nothing it says. It carries
+   * `sha256` only when the caller passed an inspector that hashes (`hashingExecutingImageInspector`);
+   * the canonical claim's default inspector never does.
+   */
+  image: ExecutingImageEvidence | ExecutingImageProbeFailure | null;
   transcript: TranscriptEvidence;
 }
 export function verifyClaudeIdentity(
@@ -1097,58 +1190,32 @@ export function verifyClaudeIdentity(
       { observed: peer.protocolVersion, expected: peer.expectedProtocolVersion },
     );
   }
-  // Clause 2 — target version exactly the configured required executor version, from the
-  // executing image.
+  // Clause 2 — the executing image, observed and never required. It is resolved here and carried
+  // to the attestation as what the claimant was running; no claim is refused on what it says or on
+  // its absence. Which inspector resolves it is the caller's: the canonical claim's reads the path
+  // and version and no byte of the image, and the delegated CTO binding passes the hashing one,
+  // because its attestation digest is the only reader of the image's `sha256`.
+  //
+  // It used to have to equal a deployment-wide triple (`ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION`,
+  // `ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH`, `ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256`) while the
+  // deployment runs one session per project, each on whichever build it was started with. On
+  // 2026-09-27, with three such sessions live, one matched the triple, one ran the previous patch
+  // release and was refused CONFLICT, and one ran a build the updater had already deleted from
+  // disk — which no realpath or sha256 comparison can ever be satisfied by. At most one project
+  // could hold the role. The owner withdrew the comparison rather than restart live sessions, and
+  // with it went the two refusals that existed only to feed it: an image whose scan could not run
+  // (`ExecutingImageProbeFailure`, refused PROBE_FAILED) and one the scan resolved to nothing
+  // (`null`, refused CONFLICT). With nothing to compare against, neither says anything about
+  // whether this claimant is entitled.
+  //
+  // What that gives up, stated rather than implied: the realpath+sha256 pair is what refused a
+  // renamed binary with a forged adjacent manifest placed at the expected location — a process
+  // whose argv[0] reads `claude` while its bytes are something else. `looksLikeClaudeInvocation`
+  // checks only the name, so that process is no longer refused here. What remains is the kernel
+  // peer credential on the claim socket, the configured session UUID derived from the claimant's
+  // own argv, and the project that UUID's entry names.
   const image = imageInspector.resolve(identity.pid);
-  // The second consumer of the same scan, and the same distinction (#834). On Darwin the
-  // executing image is reached only through `lsof`, so an lsof that times out or is missing
-  // from the daemon's PATH resolves every image to nothing — which used to refuse a genuine
-  // claim as `CONFLICT`, the exact wrong-direction diagnosis the PATH row in
-  // `scripts/falsifiability-cases/` already names as this deployment's recurring shape.
-  if (isExecutingImageProbeFailure(image)) {
-    return deny(
-      ReasonCode.PROBE_FAILED,
-      "the claude ancestor's executing image could not be scanned, so this says nothing about which image it is",
-      { pid: identity.pid, probe: "lsof", probeFailure: image.probeFailure },
-    );
-  }
-  if (!image) {
-    return deny(
-      ReasonCode.CONFLICT,
-      "the claude ancestor's executing image could not be resolved",
-      { pid: identity.pid },
-    );
-  }
-  if (image.version !== config.requiredExecutorVersion) {
-    return deny(
-      ReasonCode.CONFLICT,
-      "the claude ancestor's executing image is not the required version",
-      {
-        observedVersion: image.version,
-        requiredVersion: config.requiredExecutorVersion,
-        imagePath: image.imagePath,
-      },
-    );
-  }
-  // Clause 2 — the executing image is the exact expected artifact, not merely a file that
-  // reports the expected version. A version string (and even the resolved path alone) can be
-  // spoofed by a renamed binary with a forged adjacent manifest placed at the expected
-  // location; comparing both the realpath and a hash of the actual bytes closes that gap.
-  if (image.imagePath !== config.expectedExecutorRealpath) {
-    return deny(
-      ReasonCode.CONFLICT,
-      "the claude ancestor's executing image is not at the expected realpath",
-      { observed: image.imagePath, expected: config.expectedExecutorRealpath },
-    );
-  }
-  if (image.sha256 !== config.expectedExecutorSha256) {
-    return deny(
-      ReasonCode.CONFLICT,
-      "the claude ancestor's executing image does not hash to the expected sha256",
-      { observed: image.sha256, expected: config.expectedExecutorSha256, imagePath: image.imagePath },
-    );
-  }
-  // Clause 2 — pid/startedAt re-verified immediately after the image check. Both the ancestry
+  // Clause 2 — pid/startedAt re-verified immediately after the image resolution. Both the ancestry
   // walk and this image resolution did real, non-instantaneous I/O; a pid reused in between
   // must be caught here, before the transcript check or the async Buzz boundary below run
   // anything else against `identity.pid` as though it still names the verified process.
@@ -1281,14 +1348,12 @@ export class CanonicalSelfClaim {
     private readonly config: CanonicalSelfClaimConfig,
     deps: CanonicalSelfClaimDeps = {},
   ) {
-    // Fail closed before any effect: these three are deployment-private configuration with no
+    // Fail closed before any effect: the channel is deployment-private configuration with no
     // fallback to a real value. A blank string (an absent env var coerced by a caller, or a typo
     // in the composition root) must construct nothing, never silently adopt a hardcoded default.
+    // One row since the three executor pins that shared this table were withdrawn.
     for (const [field, value] of [
-      ["requiredExecutorVersion", config.requiredExecutorVersion],
       ["canonicalBuzzChannelId", config.canonicalBuzzChannelId],
-      ["expectedExecutorRealpath", config.expectedExecutorRealpath],
-      ["expectedExecutorSha256", config.expectedExecutorSha256],
     ] as const) {
       if (typeof value !== "string" || value.trim().length === 0) {
         throw new Error(
@@ -1524,7 +1589,7 @@ export class CanonicalSelfClaim {
     /** What `claim()` read from `request` before its first await; the admission's row is built from it. */
     asked: ClaimAsked,
     identity: DerivedClaimantIdentity,
-    image: ExecutingImageEvidence,
+    image: VerifiedClaudeIdentity["image"],
     transcript: TranscriptEvidence,
     buzzAddress: string,
     /**
@@ -1535,6 +1600,10 @@ export class CanonicalSelfClaim {
      */
     entry: CanonicalAdoptableSession,
   ): Decision<CanonicalSelfClaimReceipt> {
+    // An observation, never an authority (clause 2): a scan that could not run and a scan that
+    // found no usable image are both recorded as no image, and neither refused anything upstream.
+    // The second is already `null`; the type guard folds the first into it.
+    const observedImage = isExecutingImageProbeFailure(image) ? null : image;
     // `db.txDecision` — not `db.tx` — is load-bearing here. `tx()` treats a denied `Decision` as
     // an ordinary return value and commits it; a nested `bindings.bind()` denial (BindingRegistry
     // uses `txDecision` itself, which at depth > 0 just hands the Decision back as data rather
@@ -1713,8 +1782,8 @@ export class CanonicalSelfClaim {
         pid: identity.pid,
         startedAt: identity.startedAt,
         cwd: identity.cwd,
-        executorImagePath: image.imagePath,
-        executorVersion: image.version,
+        executorImagePath: observedImage?.imagePath ?? null,
+        executorVersion: observedImage?.version ?? null,
         transcriptPath: transcript.path,
         transcriptSizeBytes: transcript.sizeBytes,
         peerProtocolVersion: request.peerProtocolVersion,
@@ -1750,8 +1819,8 @@ export class CanonicalSelfClaim {
         sessionSecret: created.sessionSecret,
         binding: bound.value,
         derivedSessionUuid: identity.sessionUuid,
-        executorImageVersion: image.version,
-        executorImagePath: image.imagePath,
+        executorImageVersion: observedImage?.version ?? null,
+        executorImagePath: observedImage?.imagePath ?? null,
         buzzAddress,
       });
       // The admission's row, last, inside this transaction: the admission commits only with its

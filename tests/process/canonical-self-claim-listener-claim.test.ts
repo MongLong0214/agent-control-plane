@@ -5,8 +5,6 @@ import {
   linkSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
-  realpathSync,
   rmSync,
   statSync,
   unlinkSync,
@@ -29,15 +27,17 @@ import {
 import type { Daemon } from "../../src/daemon/daemon.ts";
 import { IngressGuard } from "../../src/ingress/ingress-guard.ts";
 import { allow, type Decision } from "../../src/core/errors.ts";
-import { sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { makeDefaultTranscriptReader } from "../../src/registry/canonical-self-claim.ts";
 import { boundedExecFileSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeStartedOperator, type Harness, type StartedOperator } from "../helpers/harness.ts";
 
-/** Synthetic — never a value that names a real deployment's version. */
-const TEST_REQUIRED_EXECUTOR_VERSION = "9.0.0-test";
+/**
+ * Synthetic — never a value that names a real deployment's version. The build the claiming
+ * process is laid out as; the claim records it and compares it against nothing.
+ */
+const TEST_EXECUTOR_VERSION = "9.0.0-test";
 
 /**
  * The mint/claim separation for canonical self-claim (#760): a process may prove who it is, but
@@ -152,8 +152,8 @@ const copyToStaging = (staging: string): void => {
  * machine-wide (#817).
  *
  * A hardlink cannot replace the copy: `lsof` reports an inode's *primary* link, so a second link
- * to the real node binary is reported at the real node binary's own path, where the version this
- * whole file turns on — the `/versions/<version>/` segment — does not appear at all. Measured on
+ * to the real node binary is reported at the real node binary's own path, where the
+ * `/versions/<version>/` segment the claim reads its observed version from does not appear at all. Measured on
  * this machine, not assumed.
  *
  * Published by cloning to a private staging path and `link()`ing that into place, so the
@@ -255,7 +255,7 @@ const claimAsRealClaudeProcess = (
   requestBody: Record<string, unknown>,
   sessionUuid: string = TEST_SESSION_UUID,
 ): Promise<Decision<unknown>> => {
-  const claude = writeVersionedClaude(TEST_REQUIRED_EXECUTOR_VERSION);
+  const claude = writeVersionedClaude(TEST_EXECUTOR_VERSION);
   writeTranscriptFixture(root, sessionUuid);
   const child = spawnAndSendOneRequest(claude, socketPath, ["--session-id", sessionUuid], root, requestBody);
   return waitForClaimResult(child);
@@ -354,17 +354,6 @@ const depsFor = (
   root: string,
   options: { sessionUuid?: string; projectId?: string; maxAncestryHops?: number } = {},
 ): CanonicalSelfClaimOperatorDeps => {
-  // This runs inside the request handler closure, so it executes on every request — after
-  // `claimAsRealClaudeProcess` has already asked for this exact fixture and spawned the claiming
-  // process from it. `writeVersionedClaude` returns the *same file* every time rather than a new
-  // inode, so asking again here cannot replace anything out from under a process already running
-  // that image — the resolved-path-vs-live-image mismatch clause 2's image check exists to
-  // refuse. The call is unconditional precisely because it is now idempotent: the wrong-process
-  // test never spawns a claude process at all, and still needs a real path and real bytes to
-  // configure the expectation against.
-  const claudePath = writeVersionedClaude(TEST_REQUIRED_EXECUTOR_VERSION);
-  const expectedExecutorRealpath = realpathSync(claudePath);
-  const expectedExecutorSha256 = sha256(readFileSync(claudePath));
   return {
     db: cp.db,
     clock: cp.clock,
@@ -383,10 +372,7 @@ const depsFor = (
         projectId: options.projectId ?? TEST_PROJECT_ID,
         buzzActorId: BUZZ_ACTOR_ID,
       }],
-      requiredExecutorVersion: TEST_REQUIRED_EXECUTOR_VERSION,
       canonicalBuzzChannelId: BUZZ_CHANNEL_ID,
-      expectedExecutorRealpath,
-      expectedExecutorSha256,
       peerProtocolVersion: PEER_PROTOCOL,
       buzzPurpose: BUZZ_PURPOSE,
     },

@@ -390,11 +390,13 @@ export HOME="$ACP_HOME"
 # through the environment receives the interpreter this generation carries, rather than whichever
 # one a system directory happens to hold.
 #
-# `/usr/sbin` is last, and is here for `lsof`, which ships only from there. A canonical self-claim
-# resolves the claiming process's executing image by spawning `lsof` under its bare name and
-# consulting no environment, so this PATH is the only channel that reaches that call: without the
-# directory the scan comes back empty, the image resolves to null, and a genuine claim is refused
-# with evidence that names neither the missing tool nor the cause. It is a system directory of the
+# `/usr/sbin` is last, and is here for `lsof`, which ships only from there. On Darwin a canonical
+# self-claim reads the claiming process's working directory, and observes its executing image, by
+# spawning `lsof` under its bare name and consulting no environment, so this PATH is the only
+# channel that reaches that call. Without the directory every scan fails to run (`SCAN_FAILED`,
+# `ENOENT`), the working directory cannot be read, and a genuine claim is refused `PROBE_FAILED`.
+# The image goes unobserved in the same case, which on its own refuses nothing: the claim records
+# the image and compares it against no configured value. It is a system directory of the
 # same standing as `/usr/bin` and `/bin` above — root-owned, mode 755, SIP `restricted`, not
 # user-writable, listed in `/etc/paths` as part of the platform's own default PATH, and holding
 # none of the names this control plane grants authority by. That is what separates it from a
@@ -460,6 +462,13 @@ buzz_key_from_desktop_secrets() {
 }
 
 # Clear the entire activation group before any credential lookup can inherit a partial group.
+#
+# The group is three variables: ACP_CANONICAL_SESSIONS_JSON, ACP_CANONICAL_CTO_PEER_PROTOCOL and
+# ACP_CANONICAL_CTO_BUZZ_PURPOSE. The three ACP_CANONICAL_*_EXECUTOR_* names cleared here and
+# exported in the loop below are the executor pins the claim used to require. The daemon no longer
+# reads them: they neither activate the group nor make it partial, and a Keychain that still holds
+# them is not refused (deploy/README.md). They are left in both lists because passing through a
+# value nothing reads is not a claim about it; removing them is a separate cleanup.
 unset ACP_CANONICAL_SESSIONS_JSON ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256 ACP_CANONICAL_CTO_PEER_PROTOCOL ACP_CANONICAL_CTO_BUZZ_PURPOSE
 
 export ACP_MCP_TOKEN="$(required_keychain_value ACP_MCP_TOKEN)"

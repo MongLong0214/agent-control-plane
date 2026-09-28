@@ -29,6 +29,12 @@ const deploy = join(root, "deploy");
 const installer = join(deploy, "install-launchd.sh");
 const template = join(deploy, "com.agentcontrolplane.agentcpd.plist.template");
 const label = "com.agentcontrolplane.agentcpd";
+/**
+ * What `install-launchd.sh` provisions and the generated launcher forwards and then unsets — the
+ * installer's list, which this suite pins field by field. It is still six. The daemon's own
+ * activation group is three (`agentcpd.ts` `CANONICAL_ACTIVATION_VARS`): the three executor-image
+ * variables here reach the daemon and are read by nothing, which `daemon-startup.test.ts` asserts.
+ */
 const CANONICAL_ACTIVATION_VARIABLES = [
   "ACP_CANONICAL_SESSIONS_JSON",
   "ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION",
@@ -1087,13 +1093,14 @@ describe("launchd deployment artifact", () => {
 
   it("reaches lsof from the daemon's PATH, so a canonical self-claim can resolve an executing image", () => {
     const harness = makeHarness();
-    // On Darwin a canonical self-claim resolves the claiming process's executing image by running
-    // `lsof -p <pid> -FfptDin`, spawned under its bare name by `lsofEntries`
-    // (src/registry/canonical-self-claim.ts). That call consults no environment, so an absolute
-    // path baked into a variable has no reader and the daemon's PATH is the only channel that
-    // reaches it. lsof ships in /usr/sbin; a PATH without that directory turns every scan into an
-    // empty list, the executing image resolves to null, and a genuine claim is refused as CONFLICT
-    // with evidence that carries a pid and names neither the missing tool nor the cause.
+    // On Darwin a canonical self-claim reads the claiming process's working directory, and
+    // observes its executing image, by running `lsof -p <pid> -FfptDin`, spawned under its bare
+    // name by `lsofEntries` (src/registry/canonical-self-claim.ts). That call consults no
+    // environment, so an absolute path baked into a variable has no reader and the daemon's PATH
+    // is the only channel that reaches it. lsof ships in /usr/sbin; a PATH without that directory
+    // makes every scan fail to run (`SCAN_FAILED`, `ENOENT`), the working directory cannot be read,
+    // and a genuine claim is refused `PROBE_FAILED`. The image goes unobserved too, which on its
+    // own refuses nothing — the claim records it and compares it against no configured value.
     harness.env["PATH"] = isolatedInstallerPath(harness);
     expect(installWithPins(harness).status).toBe(0);
     const launched = runGeneratedLauncher(harness);
@@ -1107,8 +1114,9 @@ describe("launchd deployment artifact", () => {
       seen.lsof?.startsWith("/"),
       "lsof resolved to something that is not an absolute path",
     ).toBe(true);
-    // Resolving is not answering. The claim needs a txt record back from a real scan, so the row
-    // runs one rather than stopping at the lookup.
+    // Resolving is not answering. The claim needs a real scan to come back with records, so the row
+    // runs one rather than stopping at the lookup; a txt record is the one an executing image
+    // leaves.
     expect(seen.lsofScan, "lsof resolved but reported no executing image").toBe("txt-reported");
   });
 

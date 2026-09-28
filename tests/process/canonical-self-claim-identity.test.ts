@@ -1,10 +1,16 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
+  accessSync,
+  chmodSync,
+  constants as fsConstants,
   copyFileSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
+  readFileSync,
+  readSync,
   readdirSync,
   realpathSync,
   renameSync,
@@ -16,7 +22,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { boundedExecFileSync } from "../helpers/bounded-sync-child.ts";
 
 import {
@@ -24,11 +30,19 @@ import {
   defaultProcessAncestryInspector,
   deriveClaimantIdentity,
   extractSessionUuidFromArgv,
+  hashingExecutingImageInspector,
   isExecutingImageProbeFailure,
   looksLikeClaudeInvocation,
   makeDefaultTranscriptReader,
   type ExecutingImageEvidence,
 } from "../../src/registry/canonical-self-claim.ts";
+
+// Every `node:fs` export is a spy that keeps its real implementation (`{ spy: true }`), in this file
+// and in the inspector module it imports. Nothing here overrides one; `imageAccessesDuring` only
+// reads what they recorded, so the one case that asks whether the canonical inspector reads the
+// image can count the opens and reads rather than infer them from what came back. Module scope, so
+// vitest's hoisting runs it before the imports it has to intercept.
+vi.mock("node:fs", { spy: true });
 
 /**
  * The real inspector reports three outcomes; every test below is about the two that describe the
@@ -45,6 +59,15 @@ const resolvedImage = (pid: number): ExecutingImageEvidence | null => {
   return resolution;
 };
 
+/** The same, through the inspector that also reads the image's bytes (the delegated binding's). */
+const hashedImage = (pid: number): ExecutingImageEvidence | null => {
+  const resolution = hashingExecutingImageInspector.resolve(pid);
+  if (isExecutingImageProbeFailure(resolution)) {
+    throw new Error(`the lsof scan for pid ${pid} could not run: ${JSON.stringify(resolution.probeFailure)}`);
+  }
+  return resolution;
+};
+
 /** Synthetic — never a value that names a real deployment's version. */
 /**
  * The cases below declare `20_000`, so the helper's 55s default could never be the bound that
@@ -53,7 +76,7 @@ const resolvedImage = (pid: number): ExecutingImageEvidence | null => {
  */
 const QUICK_CHILD_BUDGET_MS = 10_000;
 
-const TEST_REQUIRED_EXECUTOR_VERSION = "9.0.0-test";
+const TEST_EXECUTOR_VERSION = "9.0.0-test";
 /**
  * The two versions the symlink/image-divergence test below exercises. Both carry a `-symlink-*`
  * suffix so neither can be mistaken for a real deployment version; only their
@@ -64,6 +87,12 @@ const SYMLINK_TEST_VERSION_REAL = "1.0.0-symlink-test-real";
 const SYMLINK_TEST_VERSION_DECOY = "9.0.0-symlink-test-decoy";
 /** Synthetic version for the executable-file layout used by current Claude installations. */
 const VERSION_FILE_LAYOUT_TEST_VERSION = "2.0.0-version-file-test";
+/**
+ * The image the unreadable-bytes cases below take read permission away from while it runs. Its own
+ * version, and so its own path, because the mode change is visible to every process on the host:
+ * `9.0.0-test` is shared with a concurrently running sibling file that must be able to run it.
+ */
+const UNREADABLE_IMAGE_TEST_VERSION = "1.0.0-unreadable-image-test";
 
 /**
  * Exercises the *real*, OS-backed implementations this module ships as defaults — never the
@@ -257,7 +286,7 @@ describe("the reusable executable image is reused, not recreated", () => {
 describe("real process ancestry — ps-backed, not a fake", () => {
   it("reports the exact command line, a resolvable start time, and the real cwd of a live process", async () => {
     const root = tempRoot();
-    const claude = writeVersionedClaude(TEST_REQUIRED_EXECUTOR_VERSION);
+    const claude = writeVersionedClaude(TEST_EXECUTOR_VERSION);
     const sessionUuid = "33333333-3333-4333-8333-333333333333";
     const child = spawnHeld(claude, ["--session-id", sessionUuid], root);
     await waitUntil(() => child.pid !== undefined, "child pid to be assigned");
@@ -291,7 +320,7 @@ describe("real process ancestry — ps-backed, not a fake", () => {
     "the real OS argv reader keeps one positional argument containing spaces and selector-looking text as exactly one argv element",
     async () => {
       const root = tempRoot();
-      const claude = writeVersionedClaude(TEST_REQUIRED_EXECUTOR_VERSION);
+      const claude = writeVersionedClaude(TEST_EXECUTOR_VERSION);
       const sessionUuid = "55555555-5555-4555-8555-555555555555";
       // `spawn` with an argument array never goes through a shell, so this one array element
       // reaches the kernel as exactly one argv entry — the shape a real attacker-controlled or
@@ -378,7 +407,7 @@ describe("real process ancestry — ps-backed, not a fake", () => {
 
   it("walks a real two-hop ancestry (grandchild -> claude parent) to the claude process", async () => {
     const root = tempRoot();
-    const claude = writeVersionedClaude(TEST_REQUIRED_EXECUTOR_VERSION);
+    const claude = writeVersionedClaude(TEST_EXECUTOR_VERSION);
     const sessionUuid = "44444444-4444-4444-8444-444444444444";
     const resultPath = join(root, "grandchild-pid.txt");
     // The "claude" process spawns a plain, non-claude grandchild and writes its pid to disk —
@@ -493,7 +522,7 @@ describe("real executing-image resolution — symlink and image can diverge", ()
   );
 
   it(
-    "refuses rather than hashes a decoy when the resolved image path is replaced after the running process opened it",
+    "resolves no image rather than hashing a decoy when the resolved image path is replaced after the running process opened it",
     async () => {
       const root = tempRoot();
       const claude = writeVersionedClaude("1.0.0-fd-swap-test");
@@ -507,6 +536,8 @@ describe("real executing-image resolution — symlink and image can diverge", ()
         before = resolvedImage(pid);
       }
       expect(before, "the executing image could not be resolved before the swap").not.toBeNull();
+      // Linux compares hashes across the swap, and only the hashing inspector reads any.
+      const hashedBefore = process.platform === "linux" ? hashedImage(pid) : null;
 
       // An atomic rename over the exact same path, while the process keeps running: the running
       // process's own open image descriptor stays bound to the original inode (Unix keeps a
@@ -529,24 +560,187 @@ describe("real executing-image resolution — symlink and image can diverge", ()
         // `open()` time — it never re-reads the swapped path at all, so resolution on this
         // platform stays correct through the swap rather than needing to detect and refuse it.
         expect(after, "the executing image could not be resolved after the swap").not.toBeNull();
-        expect(after!.sha256).toBe(before!.sha256);
+        const hashedAfter = hashedImage(pid);
+        expect(hashedAfter?.sha256).toBeDefined();
+        expect(hashedAfter!.sha256).toBe(hashedBefore!.sha256);
       } else {
-        // Darwin has no magic-symlink equivalent: refused, not the decoy's hash. The bytes this
-        // reads are bound to the fd `fstat` verified against the kernel's own record of what the
-        // process has open, not re-resolved from the path a second time.
+        // Darwin has no magic-symlink equivalent: no image, not the decoy's path or its hash. The
+        // path is checked against the (device, inode) lsof reported, and the bytes the hashing
+        // inspector reads are bound to the fd `fstat` verified against the same report — neither
+        // is re-resolved from the path on trust. The claim records that as no image and admits or
+        // refuses on its other clauses — nothing is compared to it.
         expect(after).toBeNull();
+        expect(hashedImage(pid)).toBeNull();
       }
     },
     20_000,
   );
 
+  /**
+   * A process can run an image its uid cannot read: `execve` needs the execute bit, and `open` for
+   * reading needs the read bit. Taking the read bit away from a running image is how these cases
+   * get an image whose bytes cannot be read without a seam — the kernel has already mapped it, so
+   * the process keeps running, `lsof` keeps reporting it, and `stat` keeps answering.
+   *
+   * The mode is restored before the spawn as well as after the case, because a run that died
+   * between the two would leave the reused image unreadable for the next one.
+   */
+  const spawnUnreadableImageHolder = async (): Promise<{ executable: string; pid: number }> => {
+    const root = tempRoot();
+    const executable = writeVersionedClaude(UNREADABLE_IMAGE_TEST_VERSION);
+    chmodSync(executable, 0o755);
+    const child = spawnHeld(executable, [], root);
+    await waitUntil(() => child.pid !== undefined, "child pid to be assigned");
+    const pid = child.pid!;
+    let image = resolvedImage(pid);
+    for (let attempt = 0; !image && attempt < 40; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      image = resolvedImage(pid);
+    }
+    expect(image, "the executing image could not be resolved while readable").not.toBeNull();
+    return { executable, pid };
+  };
+
+  const withoutReadPermission = <T>(executable: string, body: () => T): T => {
+    chmodSync(executable, 0o111);
+    try {
+      // The premise, measured rather than assumed: a uid that bypasses permission bits (root)
+      // would read the file anyway and these cases would stop measuring anything.
+      expect(() => accessSync(executable, fsConstants.R_OK), "this uid can still read the image").toThrow();
+      return body();
+    } finally {
+      chmodSync(executable, 0o755);
+    }
+  };
+
+  /**
+   * Whether an inspector reads the image is a fact about what it calls, not about what it returns:
+   * one that read and hashed every byte and then dropped the hash would return exactly the path and
+   * version. So the read is counted where it would happen, at `node:fs` (spied on for this whole
+   * file, see `vi.mock` at the top). This lists every `openSync` that landed on the image's inode —
+   * by its reported path or, on Linux, `/proc/<pid>/exe`, which a stat follows to the same inode —
+   * and every `readFileSync` or `readSync` of the image's path or of a descriptor one of those opens
+   * returned, made while `body` ran. `body` is synchronous, so nothing else in this process can
+   * reach `node:fs` inside that window.
+   *
+   * What it cannot see: bytes read by another process (a spawned `shasum`), or by an asynchronous
+   * `node:fs` call started in the window. The inspector reaches a file's bytes only through the
+   * synchronous calls counted here.
+   *
+   * The spies are cleared before and after: `readFileSync` records its result, and for the hashing
+   * inspector that is the whole image, which would otherwise stay referenced for the rest of the file.
+   */
+  const imageAccessesDuring = <T>(imagePath: string, body: () => T): { result: T; accesses: string[] } => {
+    const image = statSync(imagePath, { bigint: true });
+    const namesImage = (target: unknown): boolean => {
+      if (typeof target !== "string") return false;
+      try {
+        const stat = statSync(target, { bigint: true });
+        return stat.dev === image.dev && stat.ino === image.ino;
+      } catch {
+        return false;
+      }
+    };
+    const spies = [vi.mocked(openSync), vi.mocked(readFileSync), vi.mocked(readSync)];
+    for (const spy of spies) spy.mockClear();
+    try {
+      const result = body();
+      const accesses: string[] = [];
+      const imageFds = new Set<number>();
+      const opens = vi.mocked(openSync).mock;
+      opens.calls.forEach(([path], index) => {
+        if (!namesImage(path)) return;
+        accesses.push(`openSync(${String(path)})`);
+        const outcome = opens.results[index];
+        if (outcome?.type === "return") imageFds.add(outcome.value);
+      });
+      for (const [target] of vi.mocked(readFileSync).mock.calls) {
+        if (namesImage(target) || (typeof target === "number" && imageFds.has(target))) {
+          accesses.push(`readFileSync(${String(target)})`);
+        }
+      }
+      for (const [fd] of vi.mocked(readSync).mock.calls) {
+        if (imageFds.has(fd)) accesses.push(`readSync(${fd})`);
+      }
+      return { result, accesses };
+    } finally {
+      for (const spy of spies) spy.mockClear();
+    }
+  };
+
+  it(
+    "the canonical inspector opens and reads no byte of the image it observes by path and version",
+    async () => {
+      const { executable, pid } = await spawnUnreadableImageHolder();
+      const expected = { imagePath: realpathSync(executable), version: UNREADABLE_IMAGE_TEST_VERSION };
+
+      // The count reaches the inspector's own calls: through the hashing inspector it sees the
+      // image opened and read. Without this, an empty count below could mean only that the spy
+      // never reached the module that does the reading.
+      const hashing = imageAccessesDuring(expected.imagePath, () => hashedImage(pid));
+      expect(hashing.result?.sha256).toMatch(/^sha256:[0-9a-f]{64}$/);
+      expect(hashing.accesses.some((access) => access.startsWith("openSync("))).toBe(true);
+      expect(hashing.accesses.some((access) => !access.startsWith("openSync("))).toBe(true);
+
+      // The canonical inspector: path and version, no `sha256` key, and no open or read of the
+      // image at all. The shape alone does not show the last part — a read whose hash is dropped
+      // returns this same shape — which is why the count is taken rather than inferred.
+      const canonical = imageAccessesDuring(expected.imagePath, () => resolvedImage(pid));
+      expect(canonical.result).toEqual(expected);
+      expect(canonical.accesses).toEqual([]);
+    },
+    20_000,
+  );
+
+  it(
+    "an image this uid cannot read is still observed by path and version on the canonical path",
+    async () => {
+      const { executable, pid } = await spawnUnreadableImageHolder();
+      const expected = { imagePath: realpathSync(executable), version: UNREADABLE_IMAGE_TEST_VERSION };
+      expect(resolvedImage(pid)).toEqual(expected);
+
+      // Unreadable: the same observation. It used to hash here, and the failed read of a field
+      // the canonical claim never consumes turned the whole observation into `null`.
+      //
+      // This case does not show that nothing is read. An inspector that tried to read, failed, and
+      // dropped only the hash — which is what the hashing inspector does here — gives this same
+      // answer. The case above is the one that counts reads.
+      withoutReadPermission(executable, () => {
+        expect(resolvedImage(pid)).toEqual(expected);
+      });
+    },
+    20_000,
+  );
+
+  it(
+    "the hashing inspector reports an image it could not read without a hash, never as no image, and hashes it once readable",
+    async () => {
+      const { executable, pid } = await spawnUnreadableImageHolder();
+      const expected = { imagePath: realpathSync(executable), version: UNREADABLE_IMAGE_TEST_VERSION };
+
+      // Unreadable: the scan resolved the image, so the answer still names it; the missing
+      // `sha256` is the report that its bytes were not read. `null` here would tell the delegated
+      // binding there was no image, and it would attest that.
+      withoutReadPermission(executable, () => {
+        expect(hashedImage(pid)).toEqual(expected);
+      });
+
+      // Readable again: the same image, now with the hash of its bytes.
+      const hashed = hashedImage(pid);
+      expect(hashed).toMatchObject(expected);
+      expect(hashed!.sha256).toMatch(/^sha256:[0-9a-f]{64}$/);
+    },
+    20_000,
+  );
+
   it("a forged adjacent manifest cannot change the version of the kernel-resolved image", async () => {
-    // The version authority is the resolved image's own `/versions/<version>/` path segment, not
-    // any file living beside it. This writes a real, correctly-versioned image, then overwrites
-    // its adjacent `package.json` with a different, forged version string — the exact shape a
-    // deployment's own manifest write, or an attacker with write access to that one file but not
-    // the version-directory layout, could produce — and asserts the resolved version is still the
-    // real one, unmoved by the forgery.
+    // The version the claim records is read from the resolved image's own `/versions/<version>/`
+    // path segment, not from any file living beside it. It is an observation now — no configured
+    // version is compared to it and no claim is refused on it — so what this protects is the
+    // record, not an admission: a receipt should name the build the process actually loaded. This
+    // writes a real, correctly-versioned image, then overwrites its adjacent `package.json` with a
+    // different, forged version string — the shape a deployment's own manifest write could produce
+    // — and asserts the resolved version is still the real one, unmoved by the forgery.
     const root = tempRoot();
     const claude = writeVersionedClaude(SYMLINK_TEST_VERSION_REAL);
     writeFileSync(
@@ -567,9 +761,9 @@ describe("real executing-image resolution — symlink and image can diverge", ()
     expect(image!.version).not.toBe("0.0.1-forged-manifest-version");
   });
 
-  it("resolves the exact required version end to end", async () => {
+  it("resolves the version the executable is laid out as, end to end", async () => {
     const root = tempRoot();
-    const claude = writeVersionedClaude(TEST_REQUIRED_EXECUTOR_VERSION);
+    const claude = writeVersionedClaude(TEST_EXECUTOR_VERSION);
     const child = spawnHeld(claude, [], root);
     await waitUntil(() => child.pid !== undefined, "child pid to be assigned");
 
@@ -579,7 +773,7 @@ describe("real executing-image resolution — symlink and image can diverge", ()
       image = resolvedImage(child.pid!);
     }
     expect(image).not.toBeNull();
-    expect(image!.version).toBe(TEST_REQUIRED_EXECUTOR_VERSION);
+    expect(image!.version).toBe(TEST_EXECUTOR_VERSION);
   });
 });
 

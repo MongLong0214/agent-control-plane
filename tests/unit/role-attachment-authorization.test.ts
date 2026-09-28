@@ -91,8 +91,7 @@ describe("role attachment authorization without sockets", () => {
     const recovery = new CanonicalSelfClaim(h.cp.db, h.clock, h.cp.audit, h.cp.sessions, h.cp.bindings,
       guard, async () => allow(ReasonCode.OK, "buzz://fixture"), {
         canonicalSessions: [{ sessionUuid: uuid, projectId, buzzActorId: "buzz:fixture" }],
-        requiredExecutorVersion: "0.0.0-test", canonicalBuzzChannelId: "fixture",
-        expectedExecutorRealpath: "/fake/claude", expectedExecutorSha256: `sha256:${"0".repeat(64)}`,
+        canonicalBuzzChannelId: "fixture",
         expectedPeerProtocolVersion: "fixture", expectedPeerIdentity: "fixture",
       }, {
         processInspector: { snapshot: (pid) => pid === 10 ? {

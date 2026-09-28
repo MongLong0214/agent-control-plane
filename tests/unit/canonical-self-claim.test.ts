@@ -32,6 +32,7 @@ import {
   probeFailureKind,
   MAX_CANONICAL_ADOPTABLE_SESSIONS,
   type CanonicalSelfClaimConfig,
+  type CanonicalSelfClaimReceipt,
   type CanonicalSelfClaimRequest,
   type ExecutingImageInspector,
   type LsofProbeFailure,
@@ -51,10 +52,15 @@ const PEER_IDENTITY = "claude-code-mcp-client";
 const CHANNEL = "channel:test-canonical";
 const CANONICAL_ACTOR = "buzz:canonical-cto";
 const BUZZ_ADDRESS = "buzz://test-canonical-cto";
-/** Synthetic — never a value that names a real deployment's version. */
-const TEST_REQUIRED_EXECUTOR_VERSION = "0.0.0-test";
-const TEST_EXPECTED_EXECUTOR_REALPATH = "/fake/versions/current/claude";
-const TEST_EXPECTED_EXECUTOR_SHA256 = `sha256:${"0".repeat(64)}`;
+/**
+ * Synthetic — never a value that names a real deployment's version. What the default fake
+ * inspector reports the claimant to be running. Nothing is configured to equal it: the executing
+ * image is recorded, not required, so these are observations a receipt can be checked against
+ * rather than expectations a claim can fail.
+ */
+const TEST_EXECUTOR_VERSION = "0.0.0-test";
+const TEST_EXECUTOR_IMAGE_PATH = "/fake/versions/current/claude";
+const TEST_EXECUTOR_IMAGE_SHA256 = `sha256:${"0".repeat(64)}`;
 
 /** The five tables clause 3's contract names as the mutation. */
 const FIVE_TABLES = [
@@ -231,9 +237,9 @@ const standardChain = (overrides: Partial<ProcessSnapshot> = {}, sessionUuid = C
 ];
 
 const fakeImageInspector = (
-  version = TEST_REQUIRED_EXECUTOR_VERSION,
-  imagePath = TEST_EXPECTED_EXECUTOR_REALPATH,
-  sha256 = TEST_EXPECTED_EXECUTOR_SHA256,
+  version = TEST_EXECUTOR_VERSION,
+  imagePath = TEST_EXECUTOR_IMAGE_PATH,
+  sha256 = TEST_EXECUTOR_IMAGE_SHA256,
 ): ExecutingImageInspector => ({
   resolve: () => ({ imagePath, version, sha256 }),
 });
@@ -252,6 +258,18 @@ const unscannableImageInspector = (): ExecutingImageInspector => ({
   resolve: () => ({ probeFailure: TIMED_OUT_SCAN }),
 });
 
+/**
+ * An inspector whose scan ran and found no usable image: `null`. This is what
+ * `defaultExecutingImageInspector` answers for a session whose build the updater has deleted from
+ * disk. Measured on 2026-09-27 against such a live session on Darwin: lsof still reports its `txt`
+ * record at `…/versions/<version>`, that path no longer exists, and `resolve(pid)` returned `null`
+ * — not a probe failure, because the scan did run. The control, a live session whose build is
+ * still on disk, resolved to an image with its version in the same call shape.
+ */
+const deletedImageInspector = (): ExecutingImageInspector => ({
+  resolve: () => null,
+});
+
 const fakeTranscriptReader = (present = true): TranscriptReader => ({
   locate: (sessionUuid) => (present ? { path: `/fake/transcripts/${sessionUuid}.jsonl`, sizeBytes: 42 } : null),
 });
@@ -267,10 +285,7 @@ const baseConfig = (
   overrides: Partial<CanonicalSelfClaimConfig> = {},
 ): CanonicalSelfClaimConfig => ({
   canonicalSessions: [{ sessionUuid: CANON, projectId, buzzActorId: CANONICAL_ACTOR }],
-  requiredExecutorVersion: TEST_REQUIRED_EXECUTOR_VERSION,
   canonicalBuzzChannelId: CHANNEL,
-  expectedExecutorRealpath: TEST_EXPECTED_EXECUTOR_REALPATH,
-  expectedExecutorSha256: TEST_EXPECTED_EXECUTOR_SHA256,
   expectedPeerProtocolVersion: PEER_PROTOCOL,
   expectedPeerIdentity: PEER_IDENTITY,
   ...overrides,
@@ -539,17 +554,13 @@ describe("deployment identity is required, deployment-private configuration (#76
 
   it("fails closed, before any effect, when a required deployment value is missing or blank", () => {
     const core = makeCore();
-    expect(() => makeSubject(core, CONFIG_PROJECT, { configOverrides: { requiredExecutorVersion: "" } })).toThrow(
-      /requiredExecutorVersion/,
-    );
+    // The channel is the one scalar left here. The executor version, realpath and sha256 used to be
+    // three more, and they are no longer configuration at all, so there is no blank one to refuse.
     expect(() => makeSubject(core, CONFIG_PROJECT, { configOverrides: { canonicalBuzzChannelId: "   " } })).toThrow(
       /canonicalBuzzChannelId/,
     );
-    expect(() => makeSubject(core, CONFIG_PROJECT, { configOverrides: { expectedExecutorRealpath: "" } })).toThrow(
-      /expectedExecutorRealpath/,
-    );
-    expect(() => makeSubject(core, CONFIG_PROJECT, { configOverrides: { expectedExecutorSha256: "" } })).toThrow(
-      /expectedExecutorSha256/,
+    expect(() => makeSubject(core, CONFIG_PROJECT, { configOverrides: { canonicalBuzzChannelId: "" } })).toThrow(
+      /canonicalBuzzChannelId/,
     );
   });
 
@@ -746,8 +757,9 @@ describe("pure identity-derivation helpers", () => {
     expect(looksLikeClaudeInvocation(["claude", "--resume", "x"])).toBe(true);
     // The exact bypass this file's own claim-seam counterexample proves end to end: naming a
     // script `claude` and launching it through a legitimate interpreter must not match, because
-    // the executing-image check downstream authenticates the interpreter's own binary, never the
-    // script argument sitting after it.
+    // the kernel-loaded image of that process is the interpreter, never the script argument
+    // sitting after it. Nothing downstream compares the image to anything any more, so this name
+    // is the only process-shape check left to refuse it.
     expect(looksLikeClaudeInvocation(["/usr/bin/node", "/opt/claude/claude", "--session-id", "x"])).toBe(false);
     expect(looksLikeClaudeInvocation(["/usr/bin/node", "/attacker-controlled/claude", "--session-id", "x"])).toBe(
       false,
@@ -901,7 +913,9 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(result.value.binding.role).toBe("PRIMARY_CTO");
     expect(result.value.binding.projectId).toBe(projectId);
     expect(result.value.derivedSessionUuid).toBe(CANON);
-    expect(result.value.executorImageVersion).toBe(TEST_REQUIRED_EXECUTOR_VERSION);
+    // Recorded as observed, not compared against anything.
+    expect(result.value.executorImageVersion).toBe(TEST_EXECUTOR_VERSION);
+    expect(result.value.executorImagePath).toBe(TEST_EXECUTOR_IMAGE_PATH);
     expect(result.value.buzzAddress).toBe(BUZZ_ADDRESS);
 
     const after = rowCounts(core);
@@ -1287,26 +1301,30 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
   );
 
   it(
-    "clause 2 — an executing image the scan never reached refuses as a failed probe, not as a conflict",
+    "clause 2 — an executing image the scan could not run on does not refuse a claim its entry entitles",
     async () => {
-      // The second consumer of the same scan. On Darwin `lsof` is the only channel to the
-      // executing image, so a timed-out or unreachable lsof resolves every image to nothing —
-      // and that used to refuse a genuine canonical claim as CONFLICT, telling the operator the
-      // running binary was wrong when nothing had looked at it.
+      // The executing image is observed, not required. A scan that timed out used to refuse this
+      // claim — PROBE_FAILED since #834, CONFLICT before it — because a configured version, realpath
+      // and sha256 were waiting to be compared against whatever it returned. Nothing is configured
+      // now, so an image nobody looked at says nothing about whether this claimant is entitled,
+      // and the claim goes through with no image recorded.
       const core = makeCore();
       const projectId = "prj_image_probe_failed";
       insertProject(core, projectId);
       const subject = makeSubject(core, projectId, { imageInspector: unscannableImageInspector() });
-      const request = baseRequest(core, projectId);
       const before = rowCounts(core);
-      const result = await subject.claim(request);
+      const result = await subject.claim(baseRequest(core, projectId));
 
-      expect(result.allowed).toBe(false);
-      if (result.allowed) return;
-      expect(result.reasonCode).toBe(ReasonCode.PROBE_FAILED);
-      expect(result.message).toContain("executing image could not be scanned");
-      expect(result.evidence).toMatchObject({ pid: 10, probe: "lsof", probeFailure: TIMED_OUT_SCAN });
-      expectRolledBack(core, before, result);
+      expect(result.allowed, JSON.stringify(result)).toBe(true);
+      if (!result.allowed) return;
+      expect(result.value.binding.role).toBe(Role.PRIMARY_CTO);
+      expect(result.value.binding.projectId).toBe(projectId);
+      expect(result.value.executorImageVersion).toBeNull();
+      expect(result.value.executorImagePath).toBeNull();
+      const after = rowCounts(core);
+      for (const table of FIVE_TABLES) {
+        expect(after[table], `table ${table}`).toBe((before[table] ?? 0) + 1);
+      }
     },
   );
 
@@ -1325,96 +1343,32 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expectRolledBack(core, before, result);
   });
 
-  it("clause 2 — target version exactly the configured required version, from the executing image, not any other observed version", async () => {
-    const core = makeCore();
-    const projectId = "prj_version";
-    insertProject(core, projectId);
-    const observedVersion = "1.2.3-wrong";
-    const subject = makeSubject(core, projectId, { imageInspector: fakeImageInspector(observedVersion) });
-    const request = baseRequest(core, projectId);
-    const before = rowCounts(core);
-    const result = await subject.claim(request);
-
-    expect(result.allowed).toBe(false);
-    if (result.allowed) return;
-    expect(result.message).toContain("not the required version");
-    expect(result.evidence).toMatchObject({
-      observedVersion,
-      requiredVersion: TEST_REQUIRED_EXECUTOR_VERSION,
-    });
-    expectRolledBack(core, before, result);
-  });
-
   it(
-    "clause 2 — a renamed binary with a forged adjacent manifest (right version, wrong realpath) is rejected",
+    "clause 2 — an executing image deleted from disk, which the scan resolves to nothing usable, does not refuse a claim its entry entitles",
     async () => {
-      // The exact attack this check closes: a version string alone can be spoofed by placing any
-      // file at any path with a `package.json` claiming the required version next to it. This
-      // fake reports the required version, but at a path that is not the daemon-configured
-      // expected realpath — proving the realpath comparison is what catches it, not the version
-      // check (which this fake, deliberately, would otherwise satisfy).
+      // The shape no image pin could ever admit: the session outlived its own build, so there is
+      // no file left to take a realpath or a sha256 of. It used to refuse CONFLICT ("could not be
+      // resolved"); with no configured image left to compare, it is a session like any other and
+      // its entry is what decides.
       const core = makeCore();
-      const projectId = "prj_forged_realpath";
+      const projectId = "prj_deleted_image";
       insertProject(core, projectId);
-      const subject = makeSubject(core, projectId, {
-        imageInspector: fakeImageInspector(
-          TEST_REQUIRED_EXECUTOR_VERSION,
-          "/tmp/attacker-controlled/renamed-node-binary",
-          TEST_EXPECTED_EXECUTOR_SHA256,
-        ),
-      });
-      const request = baseRequest(core, projectId);
+      const subject = makeSubject(core, projectId, { imageInspector: deletedImageInspector() });
       const before = rowCounts(core);
-      const result = await subject.claim(request);
+      const result = await subject.claim(baseRequest(core, projectId));
 
-      expect(result.allowed).toBe(false);
-      if (result.allowed) return;
-      expect(result.message).toContain("not at the expected realpath");
-      expectRolledBack(core, before, result);
+      expect(result.allowed, JSON.stringify(result)).toBe(true);
+      if (!result.allowed) return;
+      expect(result.value.binding.role).toBe(Role.PRIMARY_CTO);
+      expect(result.value.binding.projectId).toBe(projectId);
+      expect(result.value.executorImageVersion).toBeNull();
+      expect(result.value.executorImagePath).toBeNull();
+      const after = rowCounts(core);
+      for (const table of FIVE_TABLES) {
+        expect(after[table], `table ${table}`).toBe((before[table] ?? 0) + 1);
+      }
     },
   );
-
-  it(
-    "clause 2 — right version and right realpath, wrong bytes (forged hash) is rejected",
-    async () => {
-      // The second half of the same attack: even a file placed at the *expected* path, reporting
-      // the expected version, is rejected if its actual bytes do not hash to the daemon-configured
-      // expected sha256 — the property a version string and a realpath alone cannot prove.
-      const core = makeCore();
-      const projectId = "prj_forged_hash";
-      insertProject(core, projectId);
-      const subject = makeSubject(core, projectId, {
-        imageInspector: fakeImageInspector(
-          TEST_REQUIRED_EXECUTOR_VERSION,
-          TEST_EXPECTED_EXECUTOR_REALPATH,
-          `sha256:${"f".repeat(64)}`,
-        ),
-      });
-      const request = baseRequest(core, projectId);
-      const before = rowCounts(core);
-      const result = await subject.claim(request);
-
-      expect(result.allowed).toBe(false);
-      if (result.allowed) return;
-      expect(result.message).toContain("does not hash to the expected sha256");
-      expectRolledBack(core, before, result);
-    },
-  );
-
-  it("clause 2 — an unresolvable executing image refuses fail-closed", async () => {
-    const core = makeCore();
-    const projectId = "prj_no_image";
-    insertProject(core, projectId);
-    const subject = makeSubject(core, projectId, { imageInspector: { resolve: () => null } });
-    const request = baseRequest(core, projectId);
-    const before = rowCounts(core);
-    const result = await subject.claim(request);
-
-    expect(result.allowed).toBe(false);
-    if (result.allowed) return;
-    expect(result.message).toContain("executing image could not be resolved");
-    expectRolledBack(core, before, result);
-  });
 
   it("clause 2 — the transcript must exist on disk", async () => {
     const core = makeCore();
@@ -1562,6 +1516,116 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     const allowed = await subject.claim(baseRequest(core, entitled));
     expect(allowed.allowed, JSON.stringify(allowed)).toBe(true);
   });
+
+  it("clause 2 — sessions running different executor builds are each admitted as PRIMARY_CTO of their own project", async () => {
+    // The case a deployment-wide executor pin could not express, in the shape it was measured in on
+    // 2026-09-27: three live sessions, one per project, one on the pinned build, one on the build
+    // before it, and one whose build had already been deleted from disk. Under the pin only the
+    // first could ever hold the role. Every version, path and hash here is synthetic.
+    const core = makeCore();
+    const sessions = [
+      { sessionUuid: CANON, projectId: "prj_build_current", buzzActorId: "buzz:cto-build-current",
+        callerPid: 100, shellPid: 50, claudePid: 10,
+        image: fakeImageInspector("1.0.1-build-test", "/fake/versions/1.0.1-build-test", `sha256:${"a".repeat(64)}`),
+        observedVersion: "1.0.1-build-test" },
+      { sessionUuid: OTHER, projectId: "prj_build_previous", buzzActorId: "buzz:cto-build-previous",
+        callerPid: 200, shellPid: 150, claudePid: 11,
+        image: fakeImageInspector("1.0.0-build-test", "/fake/versions/1.0.0-build-test", `sha256:${"b".repeat(64)}`),
+        observedVersion: "1.0.0-build-test" },
+      { sessionUuid: "33333333-3333-4333-8333-333333333333", projectId: "prj_build_deleted",
+        buzzActorId: "buzz:cto-build-deleted", callerPid: 300, shellPid: 250, claudePid: 12,
+        image: deletedImageInspector(), observedVersion: null },
+    ] as const;
+    const canonicalSessions = sessions.map(({ sessionUuid, projectId, buzzActorId }) =>
+      ({ sessionUuid, projectId, buzzActorId }));
+    for (const session of sessions) insertProject(core, session.projectId);
+
+    const receipts: CanonicalSelfClaimReceipt[] = [];
+    for (const session of sessions) {
+      // A whole ancestry per session, not one chain with a field swapped: three live CTOs are three
+      // processes, so every pid differs as well as the session uuid.
+      const chain: ProcessSnapshot[] = [
+        { pid: session.callerPid, ppid: session.shellPid, argv: ["/usr/bin/node", "/opt/acp/mcp-server.js"],
+          command: "/usr/bin/node /opt/acp/mcp-server.js", cwd: CWD, cwdProbeFailure: null, startedAt: "t1" },
+        { pid: session.shellPid, ppid: session.claudePid, argv: ["/bin/zsh", "-c", "foo"], command: "/bin/zsh -c foo",
+          cwd: CWD, cwdProbeFailure: null, startedAt: "t2" },
+        claudeAncestor({ pid: session.claudePid }, session.sessionUuid),
+      ];
+      const result = await makeSubject(core, session.projectId, {
+        configOverrides: { canonicalSessions },
+        chain,
+        imageInspector: session.image,
+      }).claim(baseRequest(core, session.projectId, {
+        callerPid: session.callerPid, claimedSessionUuid: session.sessionUuid,
+      }));
+      expect(result.allowed, `${session.projectId}: ${JSON.stringify(result)}`).toBe(true);
+      if (!result.allowed) return;
+      expect(result.value.binding.projectId).toBe(session.projectId);
+      expect(result.value.executorImageVersion).toBe(session.observedVersion);
+      receipts.push(result.value);
+    }
+
+    // All three hold the role at once, each on its own project and as its own session.
+    expect(new Set(receipts.map((receipt) => receipt.sessionId)).size).toBe(sessions.length);
+    sessions.forEach((session, index) => {
+      expect(core.bindings.activePrimaryCto(session.projectId), session.projectId).toMatchObject({
+        role: Role.PRIMARY_CTO,
+        projectId: session.projectId,
+        sessionId: receipts[index]!.sessionId,
+      });
+    });
+    expect(core.db.all(`SELECT assignment_id FROM assignments WHERE status = 'ACTIVE'`)).toHaveLength(sessions.length);
+  });
+
+  it.each([
+    ["deleted from disk", deletedImageInspector],
+    ["the scan never reached", unscannableImageInspector],
+    ["on a different build", () =>
+      fakeImageInspector("9.9.9-other-build-test", "/fake/versions/9.9.9-other-build-test", `sha256:${"e".repeat(64)}`)],
+  ] as const)(
+    "the withdrawn image check leaves membership and entitlement standing: with an image %s, an unconfigured session and a foreign project are still refused",
+    async (_shape, inspector) => {
+      // Admitting any image must not have become admitting any claimant. These are the two refusals
+      // the withdrawal named as staying — membership and entitlement — re-run against each image
+      // shape that no longer refuses.
+      const core = makeCore();
+      const entitled = "prj_trim_entitled";
+      const foreign = "prj_trim_foreign";
+      insertProject(core, entitled);
+      insertProject(core, foreign);
+      const before = rowCounts(core);
+
+      const unconfigured = await makeSubject(core, entitled, {
+        chain: standardChain({}, OTHER),
+        imageInspector: inspector(),
+      }).claim(baseRequest(core, entitled, { claimedSessionUuid: OTHER }));
+      expect(unconfigured.allowed).toBe(false);
+      if (unconfigured.allowed) return;
+      expect(unconfigured.reasonCode).toBe(ReasonCode.CONFLICT);
+      expect(unconfigured.message).toContain("only a canonical session may be adopted");
+
+      const wrongProject = await makeSubject(core, entitled, { imageInspector: inspector() })
+        .claim(baseRequest(core, foreign));
+      expect(wrongProject.allowed).toBe(false);
+      if (wrongProject.allowed) return;
+      expect(wrongProject.reasonCode).toBe(ReasonCode.CONFLICT);
+      expect(wrongProject.message).toContain("not the canonical CTO for the requested project");
+
+      // Two refusals, so two refusal rows and nothing else: the whole `audit_events` delta is
+      // asserted rather than the five mutation tables alone, for the reason `expectRolledBack`
+      // gives. That helper takes one refusal; this case makes two, so the delta is spelled out.
+      expect(
+        core.db.all<{ kind: string; reason_code: string | null }>(
+          `SELECT kind, reason_code FROM audit_events ORDER BY event_id LIMIT -1 OFFSET ?`,
+          [before.audit_events],
+        ),
+      ).toEqual([
+        { kind: "CANONICAL_SELF_CLAIM_REFUSED", reason_code: unconfigured.reasonCode },
+        { kind: "CANONICAL_SELF_CLAIM_REFUSED", reason_code: wrongProject.reasonCode },
+      ]);
+      expect(rowCounts(core)).toEqual({ ...before, audit_events: before.audit_events + 2 });
+    },
+  );
 
 
 

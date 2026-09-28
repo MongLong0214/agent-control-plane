@@ -225,13 +225,7 @@ const depsFor = (cp: Harness["cp"], root: string): CanonicalSelfClaimOperatorDep
     expectedPeerProtocolVersion: PEER_PROTOCOL,
     expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
     canonicalSessions: [{ sessionUuid: TEST_SESSION_UUID, projectId: TEST_PROJECT_ID, buzzActorId: BUZZ_ACTOR_ID }],
-    // Synthetic — no test in this file spawns a real claimant far enough to reach the image
-    // check; every path here denies earlier, at the method/mint-validation layer these tests
-    // actually exercise (see this file's own docstring).
-    requiredExecutorVersion: "9.0.0-test",
     canonicalBuzzChannelId: BUZZ_CHANNEL_ID,
-    expectedExecutorRealpath: "/fake/versions/current/claude",
-    expectedExecutorSha256: `sha256:${"0".repeat(64)}`,
     peerProtocolVersion: PEER_PROTOCOL,
     buzzPurpose: BUZZ_PURPOSE,
   },
