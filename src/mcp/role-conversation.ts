@@ -783,8 +783,15 @@ export class RoleConversationPort {
     for (const [, peer] of owned) {
       peer.endpoint = validated.value;
       // A registration is a new fact about where to knock, so whatever the previous one failed to
-      // deliver says nothing about this one. Cleared before the wake below, which is what decides
-      // whether this registration has a failure of its own.
+      // deliver says nothing about this one. A refusal carried across a registration would outlive
+      // the fact it describes: a holder that rebound and registered again would be reported
+      // unwakeable on the strength of a delivery to the process before it.
+      //
+      // Cleared before the wake below, which is what decides whether *this* registration has a
+      // failure of its own -- so once this method returns, the memory describes this registration's
+      // own delivery whether or not the earlier one was forgotten, and the clearing is observable
+      // only between the two. A row observes it there, from the listener the wake is delivered to:
+      // `a-registration-forgets-the-refusal-it-inherited`.
       peer.wakeFailure = null;
     }
     const registered = owned.map(([roleKey]) => roleKey);

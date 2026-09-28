@@ -258,6 +258,60 @@ describe("the CTO port names every holder that cannot be woken", () => {
       await endpoint.close();
     }
   });
+
+  it("forgets the refusal an earlier registration earned, before its own wake decides anything", async () => {
+    // The rule the surrounding doc states: a refusal is remembered *for the registration that
+    // earned it*. A registration is a new fact about where to knock, so a refusal carried across
+    // one would outlive the fact it describes -- a holder that rebound and registered again would
+    // be reported unwakeable on the strength of a delivery to the process before it.
+    //
+    // Observing that needs a point inside a registration, because a registration ends by sending
+    // one wake of its own whose outcome sets or clears the same field: after `registerEndpoint`
+    // returns, the memory always describes that registration's own delivery, whether or not the
+    // earlier one was forgotten. So the observation is taken from the listener the wake is being
+    // delivered to. Measured 200/200 on this platform: a unix listener's `connection` event is
+    // emitted before `socket.end(frame, cb)` calls back, which is where the wake resolves -- the
+    // `data` event is the one that lands after, which is why the row above has to poll for it.
+    const stateDir = tempDir("acp-wq-port-forget-");
+    chmodSync(stateDir, 0o700);
+    const onMember = binding("on-member");
+    const { port, attach } = portOver([onMember], stateDir);
+    const server = attach(onMember, { ...WAKE_TRANSPORT_QUALIFIED_CLIENTS[0] });
+    const path = join(stateDir, "cto.wake.sock");
+
+    // One registration that earns a refusal: the socket is there, every check passes, the connect
+    // is refused because the process that bound it is gone.
+    await abandonSocket(path);
+    expect((await port.registerEndpoint(server, path)).allowed).toBe(true);
+    expect(port.unwakeableHolders()).toMatchObject([{ cause: "registered-endpoint-refused-the-wake" }]);
+
+    // Then the holder rebinds the same path and registers again. The listener reports what the port
+    // said about it at the moment that registration's wake arrived -- after the registration, before
+    // the delivery that would decide anything.
+    rmSync(path, { force: true });
+    let insideTheWake: unknown = "the wake never arrived";
+    const listener = createServer((socket) => {
+      if (insideTheWake === "the wake never arrived") insideTheWake = port.unwakeableHolders();
+      // Drained, not read: with nothing consuming the frame the readable side never reaches EOF,
+      // the peer's half-close never completes, and `close()` below waits on an open connection.
+      socket.resume();
+    });
+    await new Promise<void>((bound) => {
+      listener.listen(path, bound);
+    });
+    try {
+      expect((await port.registerEndpoint(server, path)).allowed).toBe(true);
+      // Not a vacuous pass: the snapshot has to have been taken, and it has to be empty.
+      expect(insideTheWake).toEqual([]);
+      // And afterwards, for the same reason, the holder is wakeable -- the new registration's own
+      // wake landed.
+      expect(port.unwakeableHolders()).toEqual([]);
+    } finally {
+      await new Promise<void>((closed) => {
+        listener.close(() => closed());
+      });
+    }
+  });
 });
 
 describe("the daemon reports a binding that cannot receive wakes", () => {
