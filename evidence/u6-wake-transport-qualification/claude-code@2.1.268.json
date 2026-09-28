@@ -1,7 +1,7 @@
 {
   "qualification": "acp.role-wake-transport/u6",
-  "producedAt": "2026-09-28T13:26:41.547Z",
-  "headSha": "0bed91457fd276357c690869263530fce9730b9d",
+  "producedAt": "2026-09-28T15:10:41.550Z",
+  "headSha": "bb386a401ce7ceefe587c6bdbd19466c81194976",
   "client": {
     "name": "claude-code",
     "version": "2.1.268",
@@ -28,23 +28,27 @@
       "shape": "interactive",
       "injected": true,
       "command": [
-        "/private/tmp/acp-u6q-img-9muCvS/2.1.268",
+        "/private/tmp/acp-u6q-img-27R70H/2.1.268",
         "--settings",
-        "/private/tmp/acp-u6q-btiu9y/settings.json",
+        "/private/tmp/acp-u6q-r1Va8N/settings.json",
         "--setting-sources",
         "",
         "--messaging-socket-path",
-        "/private/tmp/acp-u6q-btiu9y/s/i.sock",
+        "/private/tmp/acp-u6q-r1Va8N/s/i.sock",
         "--model",
         "claude-sonnet-4-5",
         "ping"
       ],
       "imageSha256": "06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a",
       "observations": {
-        "rawCaptureSha256": "fc44c89a930321d6a5924009c1b7d1938e810b6a4e73fc6a8e011aa334193c2a",
+        "rawCaptureSha256": "04ab5ef898e662e092b2cb9e9d1af1dc541e75ce0f59355ca9fddd3aadf841f4",
+        "boundary": {
+          "frameWritten": true,
+          "requestsBefore": 1
+        },
         "requests": [
           {
-            "at": "2026-09-28T13:25:59.759Z",
+            "at": "2026-09-28T15:09:59.756Z",
             "method": "POST",
             "url": "/v1/messages?beta=true",
             "texts": [
@@ -64,13 +68,13 @@
                 "from": "system",
                 "withheld": "not this arm's evidence",
                 "length": 27459,
-                "sha256": "3fd05862a2fbce7f4dbdf00f435b947b1d2df007ce2550bbcdb541f02c4da4ec"
+                "sha256": "cfce117b3d1de8c292c5e9671f96d9dec5779d2be112f4ec9379ff163774050a"
               },
               {
                 "from": "user",
                 "withheld": "not this arm's evidence",
                 "length": 260,
-                "sha256": "9e79747c7ce1c4773f334f589f24745bcce6a9e49b1f9ad0606eb68782dd2a51"
+                "sha256": "92bfb36fa33f8707818953f0bafcb733201d1ae9763dcd8679b44577f99a73c3"
               },
               {
                 "from": "user",
@@ -100,7 +104,7 @@
                 "from": "user",
                 "withheld": "not this arm's evidence",
                 "length": 64,
-                "sha256": "dd2961987dae7caf66f139dbfff3bd7eeeed6843b607480597b14a74b95662de"
+                "sha256": "383c55079268d9d6761f28c371650cd0a2116c92fcd43a0d80a702f8f57bd1f9"
               },
               {
                 "from": "user",
@@ -115,7 +119,7 @@
             ]
           },
           {
-            "at": "2026-09-28T13:25:59.824Z",
+            "at": "2026-09-28T15:09:59.817Z",
             "method": "POST",
             "url": "/v1/messages?beta=true",
             "texts": [
@@ -135,13 +139,13 @@
                 "from": "system",
                 "withheld": "not this arm's evidence",
                 "length": 27459,
-                "sha256": "3fd05862a2fbce7f4dbdf00f435b947b1d2df007ce2550bbcdb541f02c4da4ec"
+                "sha256": "cfce117b3d1de8c292c5e9671f96d9dec5779d2be112f4ec9379ff163774050a"
               },
               {
                 "from": "user",
                 "withheld": "not this arm's evidence",
                 "length": 260,
-                "sha256": "9e79747c7ce1c4773f334f589f24745bcce6a9e49b1f9ad0606eb68782dd2a51"
+                "sha256": "92bfb36fa33f8707818953f0bafcb733201d1ae9763dcd8679b44577f99a73c3"
               },
               {
                 "from": "user",
@@ -171,7 +175,7 @@
                 "from": "user",
                 "withheld": "not this arm's evidence",
                 "length": 64,
-                "sha256": "dd2961987dae7caf66f139dbfff3bd7eeeed6843b607480597b14a74b95662de"
+                "sha256": "383c55079268d9d6761f28c371650cd0a2116c92fcd43a0d80a702f8f57bd1f9"
               },
               {
                 "from": "user",
@@ -210,23 +214,27 @@
       "shape": "interactive",
       "injected": false,
       "command": [
-        "/private/tmp/acp-u6q-img-9muCvS/2.1.268",
+        "/private/tmp/acp-u6q-img-27R70H/2.1.268",
         "--settings",
-        "/private/tmp/acp-u6q-eVP7Id/settings.json",
+        "/private/tmp/acp-u6q-VQeuwb/settings.json",
         "--setting-sources",
         "",
         "--messaging-socket-path",
-        "/private/tmp/acp-u6q-eVP7Id/s/i.sock",
+        "/private/tmp/acp-u6q-VQeuwb/s/i.sock",
         "--model",
         "claude-sonnet-4-5",
         "ping"
       ],
       "imageSha256": "06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a",
       "observations": {
-        "rawCaptureSha256": "40ef6e6c810ad706c8ef268d0f36b7070d30f85c0586a89836d246a49e344911",
+        "rawCaptureSha256": "f1a6dc11981ce095419e22ff6c44996291c12f587f5e8444b92ab2a810bdeadb",
+        "boundary": {
+          "frameWritten": false,
+          "requestsBefore": 1
+        },
         "requests": [
           {
-            "at": "2026-09-28T13:26:00.280Z",
+            "at": "2026-09-28T15:10:00.268Z",
             "method": "POST",
             "url": "/v1/messages?beta=true",
             "texts": [
@@ -246,13 +254,13 @@
                 "from": "system",
                 "withheld": "not this arm's evidence",
                 "length": 27459,
-                "sha256": "53318121ee873c65ee37bbf43363789784e0b19206a1612bddc0d57849c0c820"
+                "sha256": "27301ef82100b95b5e3de751993cc599acb2e44e95ead41e09f6f137c7f6b63c"
               },
               {
                 "from": "user",
                 "withheld": "not this arm's evidence",
                 "length": 260,
-                "sha256": "2da749d60523debf344d3bdfe407d5be5981b24c8d18b85341d335b7e06e3331"
+                "sha256": "c80e0ecab53607db5b77c85958799a631fc9b28d1e03b8dc382a66488f8b5dba"
               },
               {
                 "from": "user",
@@ -282,7 +290,7 @@
                 "from": "user",
                 "withheld": "not this arm's evidence",
                 "length": 64,
-                "sha256": "dd2961987dae7caf66f139dbfff3bd7eeeed6843b607480597b14a74b95662de"
+                "sha256": "383c55079268d9d6761f28c371650cd0a2116c92fcd43a0d80a702f8f57bd1f9"
               },
               {
                 "from": "user",
@@ -311,7 +319,7 @@
       "shape": "headless",
       "injected": true,
       "command": [
-        "/private/tmp/acp-u6q-img-9muCvS/2.1.268",
+        "/private/tmp/acp-u6q-img-27R70H/2.1.268",
         "-p",
         "--input-format",
         "stream-json",
@@ -319,20 +327,24 @@
         "stream-json",
         "--verbose",
         "--settings",
-        "/private/tmp/acp-u6q-Ifjf7A/settings.json",
+        "/private/tmp/acp-u6q-5fDCP4/settings.json",
         "--setting-sources",
         "",
         "--messaging-socket-path",
-        "/private/tmp/acp-u6q-Ifjf7A/s/i.sock",
+        "/private/tmp/acp-u6q-5fDCP4/s/i.sock",
         "--model",
         "claude-sonnet-4-5"
       ],
       "imageSha256": "06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a",
       "observations": {
-        "rawCaptureSha256": "0600a2248e6480b19b19a9be0b9fc50b82eb13ca7f46e562ec0a73a2d473d1fa",
+        "rawCaptureSha256": "b6815479bf1716bfa21b18aaa90df2947f3a63b68135be4baf06522599dec6c4",
+        "boundary": {
+          "frameWritten": true,
+          "requestsBefore": 1
+        },
         "requests": [
           {
-            "at": "2026-09-28T13:26:20.703Z",
+            "at": "2026-09-28T15:10:20.692Z",
             "method": "POST",
             "url": "/v1/messages?beta=true",
             "texts": [
@@ -352,13 +364,13 @@
                 "from": "system",
                 "withheld": "not this arm's evidence",
                 "length": 27323,
-                "sha256": "204bef830c1e7d6ed487b47d2c0ab1a3e1ad6f11b4f7b1f1ea8966c4b841e4a0"
+                "sha256": "4f041486b2669745d06883fe14bb729b9fcec095b9909a15d76049860559206a"
               },
               {
                 "from": "user",
                 "withheld": "not this arm's evidence",
                 "length": 260,
-                "sha256": "6a559c7c7b5e5d99f12837919c7d26b453a1e145862c2fbc61abc19826675663"
+                "sha256": "3db1704b699d09bf70565acd61069374544eb2308cdf387935d739ceda3e858d"
               },
               {
                 "from": "user",
@@ -388,7 +400,7 @@
                 "from": "user",
                 "withheld": "not this arm's evidence",
                 "length": 64,
-                "sha256": "dd2961987dae7caf66f139dbfff3bd7eeeed6843b607480597b14a74b95662de"
+                "sha256": "383c55079268d9d6761f28c371650cd0a2116c92fcd43a0d80a702f8f57bd1f9"
               },
               {
                 "from": "user",
@@ -403,7 +415,7 @@
             ]
           },
           {
-            "at": "2026-09-28T13:26:20.843Z",
+            "at": "2026-09-28T15:10:20.831Z",
             "method": "POST",
             "url": "/v1/messages?beta=true",
             "texts": [
@@ -423,13 +435,13 @@
                 "from": "system",
                 "withheld": "not this arm's evidence",
                 "length": 27323,
-                "sha256": "204bef830c1e7d6ed487b47d2c0ab1a3e1ad6f11b4f7b1f1ea8966c4b841e4a0"
+                "sha256": "4f041486b2669745d06883fe14bb729b9fcec095b9909a15d76049860559206a"
               },
               {
                 "from": "user",
                 "withheld": "not this arm's evidence",
                 "length": 260,
-                "sha256": "6a559c7c7b5e5d99f12837919c7d26b453a1e145862c2fbc61abc19826675663"
+                "sha256": "3db1704b699d09bf70565acd61069374544eb2308cdf387935d739ceda3e858d"
               },
               {
                 "from": "user",
@@ -459,7 +471,7 @@
                 "from": "user",
                 "withheld": "not this arm's evidence",
                 "length": 64,
-                "sha256": "dd2961987dae7caf66f139dbfff3bd7eeeed6843b607480597b14a74b95662de"
+                "sha256": "383c55079268d9d6761f28c371650cd0a2116c92fcd43a0d80a702f8f57bd1f9"
               },
               {
                 "from": "user",
@@ -498,7 +510,7 @@
       "shape": "headless",
       "injected": false,
       "command": [
-        "/private/tmp/acp-u6q-img-9muCvS/2.1.268",
+        "/private/tmp/acp-u6q-img-27R70H/2.1.268",
         "-p",
         "--input-format",
         "stream-json",
@@ -506,20 +518,24 @@
         "stream-json",
         "--verbose",
         "--settings",
-        "/private/tmp/acp-u6q-fivhoK/settings.json",
+        "/private/tmp/acp-u6q-c354ya/settings.json",
         "--setting-sources",
         "",
         "--messaging-socket-path",
-        "/private/tmp/acp-u6q-fivhoK/s/i.sock",
+        "/private/tmp/acp-u6q-c354ya/s/i.sock",
         "--model",
         "claude-sonnet-4-5"
       ],
       "imageSha256": "06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a",
       "observations": {
-        "rawCaptureSha256": "9e8c9627f90c1924030b8b3e33a1253b1c36e44e9a0db65dc298392b1835210e",
+        "rawCaptureSha256": "6f65158e8dbbe34152defbe7b83c3421d260e58932b37d0bde0359ec40fa03e9",
+        "boundary": {
+          "frameWritten": false,
+          "requestsBefore": 1
+        },
         "requests": [
           {
-            "at": "2026-09-28T13:26:21.292Z",
+            "at": "2026-09-28T15:10:21.289Z",
             "method": "POST",
             "url": "/v1/messages?beta=true",
             "texts": [
@@ -539,13 +555,13 @@
                 "from": "system",
                 "withheld": "not this arm's evidence",
                 "length": 27323,
-                "sha256": "8a1ae732c79920ef8a7628fedf30f6be8c2586d2305027bfc4358ea7310e0457"
+                "sha256": "cb037bf9102feccca066f0ea5eb25d7f2c3abbb4537b4c62a47d057428fb6c5a"
               },
               {
                 "from": "user",
                 "withheld": "not this arm's evidence",
                 "length": 260,
-                "sha256": "5be7cf2474757984c7464fb23253f2117d48debc9a0eff91732c6951581de0f1"
+                "sha256": "84767f07b0d715bb1f6a6ef2c09ca1a31cb03475a51fbe5d00e0a353fc14ada1"
               },
               {
                 "from": "user",
@@ -575,7 +591,7 @@
                 "from": "user",
                 "withheld": "not this arm's evidence",
                 "length": 64,
-                "sha256": "dd2961987dae7caf66f139dbfff3bd7eeeed6843b607480597b14a74b95662de"
+                "sha256": "383c55079268d9d6761f28c371650cd0a2116c92fcd43a0d80a702f8f57bd1f9"
               },
               {
                 "from": "user",
@@ -610,12 +626,12 @@
     "The endpoint-directory policy is untouched by this slice, so registration through registerEndpoint is still refused for a socket outside the daemon state directory. See the finding of that name.",
     "Interactive start required pre-provisioned answers to the onboarding, workspace-trust and custom-API-key prompts in a throwaway config. A session whose operator answered them differently is outside this reading.",
     "The interactive arm's baseline turn is started by a positional prompt in its argv, not typed at the client's prompt. What is read here is that the wake frame reaches the model input of an interactively-invoked session and starts a turn; nothing here observes the client's terminal, so this says nothing about whether that session would have accepted a keystroke at the moment the frame arrived.",
-    "Each arm's baseline is a model request carrying the prompt as a user message whose text, trimmed, equals it. That is what every capture on this host shows, and a build that sent the same prompt in another shape would fail the arm rather than qualify on an unchecked turn. What is established is that this prompt started a turn, not that the client would have started one from any other input.",
+    "Each arm's baseline is the turns its capture already held at the moment the frame was written, and one of them is required to be a model request carrying the prompt as a user message whose text, trimmed, equals it. That is what every capture on this host shows, and a build that sent the same prompt in another shape would fail the arm rather than qualify on an unchecked turn. What is established is that this prompt started a turn before the frame, not that the client would have started one from any other input, and not that the turns counted beside it were the prompt's.",
     "settleCeilingMs is a ceiling on the post-injection wait, not a duration either arm was observed for. The control spends the whole ceiling; the injection arm returns on its first follow-up request. Two arms sharing a ceiling were watched for at most the same time, not for the same time, and the actual spans are not recorded here.",
     "Every arm executed one hard link, in a directory private to the run, to the inode digested as imageSha256 -- the command's first element names that link, which is removed with the run, and imagePath names where the inode was found. Each arm re-read the link's identity, size, modification time and digest after its measurement and would have failed the run on a difference. A rewrite of that inode in place, undone before the re-read, would not have been seen.",
     "The verdict in this file is recomputed from the runs in it, by the one calculation the instrument writes it with, and a reader that admits this reading recomputes it again rather than reading the field. That establishes internal consistency and nothing more: every fact it checks is a statement inside this file. A file written from nothing, with all its fields made to agree, satisfies it. Whether the arms it describes ever ran is a question the raw captures and session logs it points at answer, and this check does not ask them.",
-    "Each arm carries the observations its counts are derived from -- every captured request's time, method and URL -- and both the instrument and the reader derive the four counts from them rather than reading integers. What that removes is a count that stood on nothing; what it does not do is attest that a live client produced the observations. An observation list written by hand derives exactly as well as a measured one, and this file cannot tell them apart.",
-    "Of each request's model input, this file carries verbatim only what the counts are read from: the arm's prompt, and any text containing the wake token. Every other text -- most of it the client's own system prompt, which is not ours to publish -- is recorded as its kind, its length in UTF-8 bytes and its SHA-256. So a reader of the repository can recompute the four counts over the texts that are here and see that every other text is accounted for by a digest; a reader cannot see what a withheld text said. Recomputing the counts over their contents needs the raw capture named by rawCaptureSha256, which is not committed. The instrument refuses to withhold a text carrying the token or equal to the prompt, so the kept texts are the evidence and not a selection from it -- but that is a property of the code that wrote this file, not a fact this file establishes. What is checked of the file itself is the other direction: a reading carrying a verbatim text that none of its counts are read from is refused rather than admitted.",
+    "Each arm carries the observations its counts are derived from -- every captured request's time, method and URL, and the point in that sequence at which the frame was written -- and both the instrument and the reader derive the four counts from them rather than reading integers. The boundary is recorded by the arm that wrote the frame, not inferred from which request carries the prompt: inferring it counted a wake-carrying turn that preceded the frame as the follow-up the frame caused. What that removes is a count that stood on nothing; what it does not do is attest that a live client produced the observations, or that the recorded boundary is where the frame really went. An observation list written by hand derives exactly as well as a measured one, and this file cannot tell them apart.",
+    "Of each request's model input, this file carries verbatim only what the counts are read from, and only out of the requests those counts are derived from -- the turns. In a turn: the arm's prompt as a user message, and any text containing the wake token. A text in any other request is withheld whatever it contains, because no count of this arm reads it. Every other text -- most of it the client's own system prompt, which is not ours to publish -- is recorded as its kind, its length in UTF-8 bytes and its SHA-256. So a reader of the repository can recompute the four counts over the texts that are here and see that every other text is accounted for by a digest; a reader cannot see what a withheld text said. Recomputing the counts over their contents needs the raw capture named by rawCaptureSha256, which is not committed. The instrument refuses to withhold a text a count of its own request is read from, so the kept texts are the evidence and not a selection from it -- but that is a property of the code that wrote this file, not a fact this file establishes. What is checked of the file itself is the other direction: a reading carrying a verbatim text that none of its counts are read from is refused rather than admitted.",
     "The observations are bound to each arm's raw capture by that capture's SHA-256. The capture itself is under evidence/local/, which is not committed, so a reader without that file cannot check the digest, and a reader with it learns only that the copy in hand is the one these observations were read from.",
     "This file does not identify the instrument that produced it. headSha is git rev-parse HEAD at receipt-build time, which can name a tree that contains no harness -- the harness may be uncommitted while the reading is taken. Unless a sourceBinding block below says otherwise, the source of this reading is UNKNOWN, and a digest computed after the fact would attest preservation since, not what executed."
   ],
