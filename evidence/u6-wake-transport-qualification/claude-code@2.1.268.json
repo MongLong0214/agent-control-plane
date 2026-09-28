@@ -1,14 +1,14 @@
 {
   "qualification": "acp.role-wake-transport/u6",
-  "producedAt": "2026-09-28T01:34:04.908Z",
-  "headSha": "81dbe53deeaeb9308ab099a80de8300f232eec09",
+  "producedAt": "2026-09-28T07:06:29.795Z",
+  "headSha": "bcd371c579c36040b1725d2202ad80f43ab3992f",
   "client": {
     "name": "claude-code",
     "version": "2.1.268",
     "versionOutput": "2.1.268 (Claude Code)",
-    "imagePath": "~/.hermes/bridge/qualified-artifacts/claude-2.1.268/06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a/claude",
+    "imagePath": "~/.local/share/claude/versions/2.1.268",
     "imageSha256": "06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a",
-    "qualificationSource": "pinned-launcher"
+    "qualificationSource": "daemon-binary"
   },
   "host": {
     "platform": "darwin",
@@ -28,16 +28,18 @@
       "shape": "interactive",
       "injected": true,
       "command": [
-        "~/.hermes/bridge/qualified-artifacts/claude-2.1.268/06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a/claude",
+        "/private/tmp/acp-u6q-img-ndGE5z/2.1.268",
         "--settings",
-        "/private/tmp/acp-u6q-3TY8eG/settings.json",
+        "/private/tmp/acp-u6q-UZDasf/settings.json",
         "--setting-sources",
         "",
         "--messaging-socket-path",
-        "/private/tmp/acp-u6q-3TY8eG/s/i.sock",
+        "/private/tmp/acp-u6q-UZDasf/s/i.sock",
         "--model",
-        "claude-sonnet-4-5"
+        "claude-sonnet-4-5",
+        "ping"
       ],
+      "imageSha256": "06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a",
       "baselineModelRequests": 1,
       "modelRequests": 2,
       "wakeCarryingModelRequests": 1,
@@ -51,16 +53,18 @@
       "shape": "interactive",
       "injected": false,
       "command": [
-        "~/.hermes/bridge/qualified-artifacts/claude-2.1.268/06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a/claude",
+        "/private/tmp/acp-u6q-img-ndGE5z/2.1.268",
         "--settings",
-        "/private/tmp/acp-u6q-xkjDSO/settings.json",
+        "/private/tmp/acp-u6q-SBzSff/settings.json",
         "--setting-sources",
         "",
         "--messaging-socket-path",
-        "/private/tmp/acp-u6q-xkjDSO/s/i.sock",
+        "/private/tmp/acp-u6q-SBzSff/s/i.sock",
         "--model",
-        "claude-sonnet-4-5"
+        "claude-sonnet-4-5",
+        "ping"
       ],
+      "imageSha256": "06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a",
       "baselineModelRequests": 1,
       "modelRequests": 1,
       "wakeCarryingModelRequests": 0,
@@ -74,7 +78,7 @@
       "shape": "headless",
       "injected": true,
       "command": [
-        "~/.hermes/bridge/qualified-artifacts/claude-2.1.268/06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a/claude",
+        "/private/tmp/acp-u6q-img-ndGE5z/2.1.268",
         "-p",
         "--input-format",
         "stream-json",
@@ -82,14 +86,15 @@
         "stream-json",
         "--verbose",
         "--settings",
-        "/private/tmp/acp-u6q-MWMp6U/settings.json",
+        "/private/tmp/acp-u6q-IU4Vcv/settings.json",
         "--setting-sources",
         "",
         "--messaging-socket-path",
-        "/private/tmp/acp-u6q-MWMp6U/s/i.sock",
+        "/private/tmp/acp-u6q-IU4Vcv/s/i.sock",
         "--model",
         "claude-sonnet-4-5"
       ],
+      "imageSha256": "06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a",
       "baselineModelRequests": 1,
       "modelRequests": 2,
       "wakeCarryingModelRequests": 1,
@@ -103,7 +108,7 @@
       "shape": "headless",
       "injected": false,
       "command": [
-        "~/.hermes/bridge/qualified-artifacts/claude-2.1.268/06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a/claude",
+        "/private/tmp/acp-u6q-img-ndGE5z/2.1.268",
         "-p",
         "--input-format",
         "stream-json",
@@ -111,14 +116,15 @@
         "stream-json",
         "--verbose",
         "--settings",
-        "/private/tmp/acp-u6q-T29l03/settings.json",
+        "/private/tmp/acp-u6q-hJA9KO/settings.json",
         "--setting-sources",
         "",
         "--messaging-socket-path",
-        "/private/tmp/acp-u6q-T29l03/s/i.sock",
+        "/private/tmp/acp-u6q-hJA9KO/s/i.sock",
         "--model",
         "claude-sonnet-4-5"
       ],
+      "imageSha256": "06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a",
       "baselineModelRequests": 1,
       "modelRequests": 1,
       "wakeCarryingModelRequests": 0,
@@ -136,7 +142,9 @@
     "The runtime does not hand the token to the model bare: it renders it inside a peer-message preamble of its own before it reaches model input. What is qualified is that the token arrives and starts a turn, not that it arrives unadorned. The preserved capture shows the surrounding text.",
     "The endpoint-directory policy is untouched by this slice, so registration through registerEndpoint is still refused for a socket outside the daemon state directory. See the finding of that name.",
     "Interactive start required pre-provisioned answers to the onboarding, workspace-trust and custom-API-key prompts in a throwaway config. A session whose operator answered them differently is outside this reading.",
+    "The interactive arm's baseline turn is started by a positional prompt in its argv, not typed at the client's prompt. What is read here is that the wake frame reaches the model input of an interactively-invoked session and starts a turn; nothing here observes the client's terminal, so this says nothing about whether that session would have accepted a keystroke at the moment the frame arrived.",
     "settleCeilingMs is a ceiling on the post-injection wait, not a duration either arm was observed for. The control spends the whole ceiling; the injection arm returns on its first follow-up request. Two arms sharing a ceiling were watched for at most the same time, not for the same time, and the actual spans are not recorded here.",
+    "Every arm executed one hard link, in a directory private to the run, to the inode digested as imageSha256 -- the command's first element names that link, which is removed with the run, and imagePath names where the inode was found. Each arm re-read the link's identity, size, modification time and digest after its measurement and would have failed the run on a difference. A rewrite of that inode in place, undone before the re-read, would not have been seen.",
     "This file does not identify the instrument that produced it. headSha is git rev-parse HEAD at receipt-build time, which can name a tree that contains no harness -- the harness may be uncommitted while the reading is taken. Unless a sourceBinding block below says otherwise, the source of this reading is UNKNOWN, and a digest computed after the fact would attest preservation since, not what executed."
   ],
   "findings": [
