@@ -293,8 +293,22 @@ export const wakeTransportQualifiedLabels = (): string[] =>
   WAKE_TRANSPORT_QUALIFIED_CLIENTS.map(({ name, version }) => `${name}/${version}`);
 
 /**
- * A binding that is active, whose holder is connected, and whose connection declared no build in
- * the qualified set — so it can never register a wake endpoint and never receive a wake.
+ * Why a connected holder cannot be woken. One value per repair, because the remedies differ and a
+ * report that could not tell them apart would have to offer all of them.
+ *
+ * `no-registered-endpoint` and `registered-endpoint-not-usable` are kept apart for that reason: the
+ * first holder has never given the daemon anywhere to knock, and the second gave one that no longer
+ * passes the checks `wake` makes before it connects — a socket that has gone, or a state directory
+ * whose ownership or mode has changed under it.
+ */
+export type UnwakeableCause =
+  | "build-outside-the-qualified-set"
+  | "no-declared-build"
+  | "no-registered-endpoint"
+  | "registered-endpoint-not-usable";
+
+/**
+ * A binding that is active, whose holder is connected, and which still cannot receive a wake.
  */
 export interface UnwakeableHolder {
   readonly roleKey: string;
@@ -305,6 +319,8 @@ export interface UnwakeableHolder {
    * report and the refusal describe it the same way.
    */
   readonly presented: string | null;
+  /** Which of the four states this holder is in. Never a path, for the same reason. */
+  readonly cause: UnwakeableCause;
 }
 
 /**
@@ -457,14 +473,31 @@ export class RoleConversationPort {
   }
 
   /**
-   * Every binding whose connected holder declared no build in the qualified set: one outside it,
-   * or none at all.
+   * Every binding whose holder is connected and cannot be woken, and why.
    *
-   * These are the bindings that read ACTIVE, have a live peer, and still cannot receive a wake:
-   * `registerEndpoint` refuses that peer on the same `isWakeTransportQualified` this asks, so no
-   * endpoint is ever registered, `wake` refuses for want of one, and an addressed message is stored
-   * and waits for a registration that will not come. Nothing about that is loud on its own — the
-   * symptom is only that wakes never arrive — so the daemon reports what this returns.
+   * These are the bindings that read ACTIVE, have a live peer, and still receive no wake: an
+   * addressed message is stored and waits for a delivery that will not happen. Nothing about that
+   * is loud on its own — the symptom is only that wakes never arrive — so the daemon reports what
+   * this returns.
+   *
+   * **Unwakeable is unwakeable, whatever the reason**, and this scan used to return early on
+   * `isWakeTransportQualified`, which made a qualified build the one state it never reported. A
+   * holder on a qualified build that has registered no endpoint is exactly as unreachable as one
+   * outside the set: `wake` refuses it with ROLE_PEER_UNSUPPORTED for want of an endpoint, and
+   * `endpointFor` answers `null`. That is the case this whole slice exists to make visible, and it
+   * was the one case the report was silent about. The scan's own reasoning about a holder that
+   * declared no build — "skipping it made the one case in which the report has no build name to go
+   * on the one case it said nothing about" — is the same argument, and the code now follows it in
+   * both places.
+   *
+   * The four causes are distinguished because the repairs are different, and a report that only
+   * said "cannot be woken" would have to offer every repair to every holder.
+   *
+   * The endpoint is **revalidated here**, by the same `#validateEndpointPath` `wake` calls before
+   * it connects, so a registration that has since stopped being usable is reported rather than
+   * counted as a wakeable holder. It is a filesystem answer and it is taken now: a holder reported
+   * usable can become unusable a moment later, and the converse. What this says is what was true
+   * when it was asked, which is the same standing every other line of this scan has.
    *
    * Asked of the live connection at the moment of the question rather than recorded when a
    * registration was refused: a peer that never tries to register is just as unwakeable, and a
@@ -472,22 +505,35 @@ export class RoleConversationPort {
    *
    * A connection that has declared no build is reported, with `presented: null`, not skipped.
    * `registerEndpoint` asks the same predicate, which is false for no build, so that holder is
-   * refused exactly as one outside the set is. Skipping it made the one case in which the report
-   * has no build name to go on the one case it said nothing about. The SDK records the build only
-   * when an `initialize` carrying `clientInfo` parses, and its schema requires `clientInfo`, so
-   * "declared none" and "has not completed `initialize`" are one state here. A report taken in
-   * the moment between a peer attaching and its `initialize` names that peer too. For that moment
-   * the report is true: the peer could not have registered.
+   * refused exactly as one outside the set is. The SDK records the build only when an `initialize`
+   * carrying `clientInfo` parses, and its schema requires `clientInfo`, so "declared none" and
+   * "has not completed `initialize`" are one state here. A report taken in the moment between a
+   * peer attaching and its `initialize` names that peer too. For that moment the report is true:
+   * the peer could not have registered.
    */
   unwakeableHolders(): UnwakeableHolder[] {
     const holders: UnwakeableHolder[] = [];
     for (const [roleKey, peer] of this.#live) {
       if (!this.currentHolderConnected(roleKey)) continue;
       const client = peer.server.server.getClientVersion();
-      if (isWakeTransportQualified(client)) continue;
-      holders.push({ roleKey, role: this.#role, presented: client ? `${client.name}/${client.version}` : null });
+      const presented = client ? `${client.name}/${client.version}` : null;
+      const cause = this.#unwakeableCause(client, peer.endpoint);
+      if (cause === null) continue;
+      holders.push({ roleKey, role: this.#role, presented, cause });
     }
     return holders;
+  }
+
+  /** Why this connection cannot be woken, or `null` for one that can. */
+  #unwakeableCause(
+    client: WakeTransportClient | undefined,
+    endpoint: string | null,
+  ): UnwakeableCause | null {
+    if (!isWakeTransportQualified(client)) {
+      return client ? "build-outside-the-qualified-set" : "no-declared-build";
+    }
+    if (endpoint === null) return "no-registered-endpoint";
+    return this.#validateEndpointPath(endpoint).allowed ? null : "registered-endpoint-not-usable";
   }
 
   /**

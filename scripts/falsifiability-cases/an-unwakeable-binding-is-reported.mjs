@@ -15,17 +15,25 @@
  * undefined, so `[client]` alone no longer typechecks as a member list, and the mutant builds the
  * list only from a declared build.
  *
- * The killing row attaches three holders to one port — one on a member build, one outside the set,
- * one that declared no build — and expects the second and the third.
+ * The killing row attaches one holder outside the set and one that declared no build to a port, and
+ * asserts each one's cause. Since the scan stopped returning early on a qualified build, a mutant
+ * here no longer silences the report entirely -- the holder falls through to the endpoint checks and
+ * is reported as having registered none -- so what the row measures is the *cause*: a holder outside
+ * the qualified set has to be reported as outside it, because that is the only cause whose repair
+ * is a different build.
  */
 const anUnwakeableBindingIsReported = {
   id: "an-unwakeable-binding-is-reported",
   what: "the CTO port reports a binding whose connected holder declared a build outside the qualified set",
   file: "src/mcp/role-conversation.ts",
-  find: "      if (isWakeTransportQualified(client)) continue;\n",
-  replace: "      if (isWakeTransportQualified(client, client ? [client] : [])) continue;\n",
+  find:
+    "    if (!isWakeTransportQualified(client)) {\n" +
+    '      return client ? "build-outside-the-qualified-set" : "no-declared-build";\n',
+  replace:
+    "    if (!isWakeTransportQualified(client, client ? [client] : [])) {\n" +
+    '      return client ? "build-outside-the-qualified-set" : "no-declared-build";\n',
   killedBy: [
-    "tests/unit/the-wake-transport-qualifies-a-set-of-builds.test.ts::reports a connected holder on a build outside the set and one that declared no build, and not a member",
+    "tests/unit/the-wake-transport-qualifies-a-set-of-builds.test.ts::reports a holder on a build outside the set and one that declared no build, each with its cause",
   ],
 };
 
