@@ -51,6 +51,7 @@ import {
 import { connect } from "node:net";
 import { arch, homedir, platform, release } from "node:os";
 import { delimiter, join, relative } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 
 import { startFakeAnthropic, type FakeAnthropic } from "../native-session-inbox/fake-anthropic.ts";
@@ -136,16 +137,23 @@ const BLACKHOLE_PROXY = "http://127.0.0.1:9";
 const CHILD_EXIT_GRACE_MS = 10_000;
 
 /**
- * Escape sequences, stripped only to decide when the TUI is ready and to store a readable log.
+ * Escape sequences, deleted to store a readable log and to show a terminal tail when a run fails.
  *
- * Nothing is *measured* off this text -- the measurement is the provider capture. A terminal
- * rendering is a picture of a screen, and a session that printed the wake and did nothing with it
- * would look identical to one that acted on it.
+ * Deleted, not applied, so this text is not the screen: a renderer that repaints by difference
+ * leaves words in it that were never drawn (see `interactiveReadiness`), which is why readiness
+ * does not read it. Nothing is *measured* off this text either -- the measurement is the provider
+ * capture. A terminal rendering is a picture of a screen, and a session that printed the wake and
+ * did nothing with it would look identical to one that acted on it.
  */
 const ANSI = /\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)|\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b[@-Z\\-_]/g;
 
-/** The prompt-line hint the interactive client prints once it is accepting keystrokes. */
-const TUI_READY = /for shortcuts/;
+/**
+ * The pty's size. `pty-session.py` fixes it with `TIOCSWINSZ`, and the screen model below has to
+ * be the same size: the client addresses the screen with absolute cursor moves, and a model of
+ * another size puts them on other cells. A test reads both.
+ */
+export const PTY_ROWS = 40;
+export const PTY_COLS = 120;
 
 export type ProbeShape = "interactive" | "headless";
 
@@ -387,7 +395,346 @@ export const interactiveBlocker = (): string | null => {
   return null;
 };
 
-const strip = (raw: string): string => raw.replace(ANSI, "").replace(/\r/g, "\n");
+export const strip = (raw: string): string => raw.replace(ANSI, "").replace(/\r/g, "\n");
+
+/**
+ * The client's stdout as text, decoded as one stream rather than read by read.
+ *
+ * A read ends wherever the pipe happened to be drained, not on a character boundary: of eleven
+ * first screens captured on 2026-09-28, three split a three-byte glyph (`─`, `←`) across two reads.
+ * `chunk.toString()` turns each half into U+FFFD -- two or three cells where the terminal drew
+ * one -- and a split on the input row would move the modelled caret off the cell the client parks
+ * its cursor on, so readiness would never fire. `StringDecoder` holds an incomplete sequence back
+ * until the rest of it arrives.
+ */
+export const terminalTranscript = (): { readonly push: (chunk: Buffer) => void; readonly text: () => string } => {
+  const decoder = new StringDecoder("utf8");
+  let text = "";
+  return {
+    push: (chunk) => {
+      text += decoder.write(chunk);
+    },
+    text: () => text,
+  };
+};
+
+interface Cell {
+  glyph: string;
+  readonly inverse: boolean;
+}
+
+const blankCell = (): Cell => ({ glyph: " ", inverse: false });
+const blankRow = (): Cell[] => Array.from({ length: PTY_COLS }, blankCell);
+const blankGrid = (): Cell[][] => Array.from({ length: PTY_ROWS }, blankRow);
+
+/**
+ * How many cells a code point takes. Approximate on purpose: the common wide ranges (CJK, Hangul,
+ * full-width forms, the two main emoji blocks) and the zero-width marks, not a Unicode table.
+ * Every glyph the measured builds draw on their input row is narrow, and a width this gets wrong
+ * only shifts cells written after it on the same row by relative moves -- on the input row that
+ * fails closed, because the park is absolute and would miss the caret.
+ */
+const cellWidth = (codePoint: number): 0 | 1 | 2 => {
+  if ((codePoint >= 0x0300 && codePoint <= 0x036f) || (codePoint >= 0x200b && codePoint <= 0x200f)
+    || (codePoint >= 0xfe00 && codePoint <= 0xfe0f) || (codePoint >= 0x20d0 && codePoint <= 0x20ff)) {
+    return 0;
+  }
+  if ((codePoint >= 0x1100 && codePoint <= 0x115f) || (codePoint >= 0x2e80 && codePoint <= 0xa4cf && codePoint !== 0x303f)
+    || (codePoint >= 0xac00 && codePoint <= 0xd7a3) || (codePoint >= 0xf900 && codePoint <= 0xfaff)
+    || (codePoint >= 0xfe30 && codePoint <= 0xfe4f) || (codePoint >= 0xff00 && codePoint <= 0xff60)
+    || (codePoint >= 0xffe0 && codePoint <= 0xffe6) || (codePoint >= 0x1f300 && codePoint <= 0x1f64f)
+    || (codePoint >= 0x1f900 && codePoint <= 0x1f9ff) || (codePoint >= 0x20000 && codePoint <= 0x3fffd)) {
+    return 2;
+  }
+  return 1;
+};
+
+interface RenderedScreen {
+  readonly grid: readonly (readonly Cell[])[];
+  readonly row: number;
+  readonly col: number;
+  readonly fullScreen: boolean;
+  readonly cursorHidden: boolean;
+}
+
+/**
+ * Applies a terminal stream to a `PTY_ROWS` x `PTY_COLS` grid: printing, cursor moves, erases,
+ * the alternate screen, and inverse video -- the one attribute readiness reads. Not an emulator:
+ * no scroll margins, no insert/delete, no colour, and an escape sequence still incomplete at the
+ * end of the stream is left unapplied until the rest of it arrives.
+ */
+const renderScreen = (stream: string): RenderedScreen => {
+  const main = blankGrid();
+  let grid = main;
+  let fullScreen = false;
+  let cursorHidden = false;
+  let row = 0;
+  let col = 0;
+  // A glyph written into the last column leaves the cursor there, and only the next glyph wraps.
+  // Without this, a full-width rule followed by `CR` + one-row-down lands a row too low.
+  let wrapPending = false;
+  let inverse = false;
+  let saved = { row: 0, col: 0 };
+
+  const moveTo = (toRow: number, toCol: number): void => {
+    row = Math.min(PTY_ROWS - 1, Math.max(0, toRow));
+    col = Math.min(PTY_COLS - 1, Math.max(0, toCol));
+    wrapPending = false;
+  };
+  const lineFeed = (): void => {
+    if (row < PTY_ROWS - 1) {
+      row += 1;
+      return;
+    }
+    grid.shift();
+    grid.push(blankRow());
+  };
+  const erase = (onRow: number, from: number, to: number): void => {
+    const line = grid[onRow];
+    if (line === undefined) return;
+    for (let at = Math.max(0, from); at < Math.min(PTY_COLS, to); at += 1) line[at] = blankCell();
+  };
+  const put = (glyph: string, width: 0 | 1 | 2): void => {
+    if (width === 0) {
+      const previous = grid[row]?.[wrapPending ? col : Math.max(0, col - 1)];
+      if (previous !== undefined) previous.glyph += glyph;
+      return;
+    }
+    if (wrapPending || (width === 2 && col === PTY_COLS - 1)) {
+      col = 0;
+      lineFeed();
+      wrapPending = false;
+    }
+    const line = grid[row];
+    if (line === undefined) return;
+    line[col] = { glyph, inverse };
+    if (width === 2 && col + 1 < PTY_COLS) line[col + 1] = { glyph: "", inverse };
+    if (col + width >= PTY_COLS) {
+      col = PTY_COLS - 1;
+      wrapPending = true;
+    } else {
+      col += width;
+    }
+  };
+
+  const sgr = (tokens: readonly string[]): void => {
+    if (tokens.length === 0) inverse = false;
+    for (let index = 0; index < tokens.length; index += 1) {
+      const token = tokens[index] ?? "";
+      // `38:5:174` carries its own arguments; only the `;` form spends the tokens after it.
+      if (token.includes(":")) continue;
+      const code = token === "" ? 0 : Number(token);
+      if (code === 0 || code === 27) inverse = false;
+      else if (code === 7) inverse = true;
+      else if (code === 38 || code === 48 || code === 58) {
+        const kind = tokens[index + 1];
+        index += kind === "5" ? 2 : kind === "2" ? 4 : 0;
+      }
+    }
+  };
+
+  const csi = (body: string, final: string): void => {
+    const marker = /^[<=>?]/.test(body) ? body.charAt(0) : "";
+    const rest = marker === "" ? body : body.slice(1);
+    // Intermediate bytes: nothing modelled here uses them, and guessing would move the cursor.
+    if (/[ -/]/.test(rest)) return;
+    const tokens = rest.length === 0 ? [] : rest.split(";");
+    const count = (index: number): number => {
+      const value = Number.parseInt(tokens[index] ?? "", 10);
+      return Number.isNaN(value) || value < 1 ? 1 : value;
+    };
+    const mode = Number.parseInt(tokens[0] ?? "", 10) || 0;
+
+    if (marker === "?") {
+      if (final !== "h" && final !== "l") return;
+      const set = final === "h";
+      for (const token of tokens) {
+        const privateMode = Number(token);
+        if (privateMode === 25) cursorHidden = !set;
+        if ((privateMode === 1049 || privateMode === 1047 || privateMode === 47) && set !== fullScreen) {
+          if (set && privateMode === 1049) saved = { row, col };
+          grid = set ? blankGrid() : main;
+          fullScreen = set;
+          if (!set && privateMode === 1049) moveTo(saved.row, saved.col);
+        }
+      }
+      return;
+    }
+    // `>`, `<` and `=` are queries and keyboard-protocol negotiation: nothing is drawn.
+    if (marker !== "") return;
+
+    switch (final) {
+      case "A": moveTo(row - count(0), col); break;
+      case "B": case "e": moveTo(row + count(0), col); break;
+      case "C": case "a": moveTo(row, col + count(0)); break;
+      case "D": moveTo(row, col - count(0)); break;
+      case "E": moveTo(row + count(0), 0); break;
+      case "F": moveTo(row - count(0), 0); break;
+      case "G": case "`": moveTo(row, count(0) - 1); break;
+      case "d": moveTo(count(0) - 1, col); break;
+      case "H": case "f": moveTo(count(0) - 1, count(1) - 1); break;
+      case "J":
+        if (mode === 0) {
+          erase(row, col, PTY_COLS);
+          for (let below = row + 1; below < PTY_ROWS; below += 1) erase(below, 0, PTY_COLS);
+        } else if (mode === 1) {
+          for (let above = 0; above < row; above += 1) erase(above, 0, PTY_COLS);
+          erase(row, 0, col + 1);
+        } else {
+          for (let every = 0; every < PTY_ROWS; every += 1) erase(every, 0, PTY_COLS);
+        }
+        break;
+      case "K":
+        if (mode === 0) erase(row, col, PTY_COLS);
+        else if (mode === 1) erase(row, 0, col + 1);
+        else erase(row, 0, PTY_COLS);
+        break;
+      case "X": erase(row, col, col + count(0)); break;
+      case "m": sgr(tokens); break;
+      case "s": if (tokens.length === 0) saved = { row, col }; break;
+      case "u": if (tokens.length === 0) moveTo(saved.row, saved.col); break;
+      default: break;
+    }
+  };
+
+  for (let at = 0; at < stream.length;) {
+    const char = stream.charAt(at);
+    if (char === "\u001b") {
+      const next = stream.charAt(at + 1);
+      if (next === "") break;
+      if (next === "[") {
+        let end = at + 2;
+        while (end < stream.length && !/[@-~]/.test(stream.charAt(end))) end += 1;
+        if (end >= stream.length) break;
+        csi(stream.slice(at + 2, end), stream.charAt(end));
+        at = end + 1;
+        continue;
+      }
+      if ("]P_^X".includes(next)) {
+        let end = at + 2;
+        while (end < stream.length && stream.charAt(end) !== "\u0007"
+          && !(stream.charAt(end) === "\u001b" && stream.charAt(end + 1) === "\\")) end += 1;
+        if (end >= stream.length) break;
+        at = stream.charAt(end) === "\u0007" ? end + 1 : end + 2;
+        continue;
+      }
+      if (next === "7") saved = { row, col };
+      else if (next === "8") moveTo(saved.row, saved.col);
+      at += "()*+-./#".includes(next) ? 3 : 2;
+      continue;
+    }
+    if (char === "\r") {
+      col = 0;
+      wrapPending = false;
+    } else if (char === "\n" || char === "\u000b" || char === "\u000c") {
+      lineFeed();
+      wrapPending = false;
+    } else if (char === "\b") {
+      moveTo(row, col - 1);
+    } else if (char === "\t") {
+      moveTo(row, (Math.floor(col / 8) + 1) * 8);
+    }
+    const codePoint = stream.codePointAt(at) ?? 0;
+    const glyph = String.fromCodePoint(codePoint);
+    at += glyph.length;
+    if (codePoint < 0x20 || (codePoint >= 0x7f && codePoint < 0xa0)) continue;
+    put(glyph, cellWidth(codePoint));
+  }
+
+  return { grid, row, col, fullScreen, cursorHidden };
+};
+
+export interface InteractiveReadiness {
+  /** The decision, and it is `cursorOnCaret` and nothing else. */
+  readonly ready: boolean;
+  readonly cursorOnCaret: boolean;
+  /** 1-based, as the terminal's own cursor moves number them, so a report reads against the log. */
+  readonly cursor: { readonly row: number; readonly column: number };
+  readonly underCursor: string;
+  /** Every inverse-video blank on screen. None, or one away from the cursor, is a diagnosis. */
+  readonly carets: readonly { readonly row: number; readonly column: number }[];
+  /** Context for a report, and deliberately not decision inputs. */
+  readonly fullScreen: boolean;
+  readonly terminalCursorHidden: boolean;
+  /** The rendered rows, trailing blanks trimmed. */
+  readonly screen: readonly string[];
+}
+
+/**
+ * Whether the interactive client is at an empty prompt that will take typing, read off the
+ * *rendered* screen by one structural fact: the cursor has come to rest on a caret the client drew.
+ *
+ * Why that fact. The client does not use the terminal's cursor for its input. It hides it
+ * (`CSI ?25l`), paints the cell where the next keystroke will land in inverse video, and ends every
+ * frame by moving the real cursor back onto that cell. Measured on 2.1.268, 2.1.281, 2.1.282 and
+ * 2.1.283 (`first-screens/`): the input row is `❯ ` then an inverse blank, and every frame closes
+ * with `CSI 40;1H CSI 38;3H`, which is that blank. The caret is drawn by a focused, editable input
+ * -- on these screens by nothing else -- and the park is the renderer's last write of a complete
+ * frame, so "the cursor rests on an inverse blank" says that a frame finished and that in it an
+ * empty input owns the keyboard. That is the precondition of the next thing the probe does, which
+ * is to type into it.
+ *
+ * Why not the prose. This was `/for shortcuts/` over `strip()` output, and 2.1.283 never satisfied
+ * it -- not because the hint changed, but because the renderer repaints by difference. Going from
+ * "(shift+tab to cycle)" to "? for shortcuts" it skips the `c` already on screen with `CSI 34G`,
+ * and deleting escapes instead of applying them reads `shortuts`. The screen said `shortcuts` the
+ * whole time. A phrase match over `strip()` is at the mercy of which cells the previous frame
+ * happened to share, and the wording is one more way to lose it.
+ *
+ * Why not the prompt glyph. `❯` is also the pointer of the client's menus: the workspace-trust
+ * dialog draws `❯ No, exit` and parks the cursor on it
+ * (`first-screens/claude-code@2.1.283.workspace-trust.json`). Typing there answers a dialog, which
+ * pre-provisioning the config exists to avoid. The pointer is drawn in colour, not inverse, so it
+ * is not a caret.
+ *
+ * What would make this stale: the client showing the terminal's cursor instead of drawing one,
+ * drawing its caret in something other than inverse video, or ending a frame with the cursor
+ * anywhere but the caret. Each fails closed -- readiness never fires -- and `describeReadiness`
+ * says which of the facts below were seen. There is no prose fallback, on purpose: a fallback
+ * fires on exactly the build where this stopped describing the client, and hides that it did.
+ */
+export const interactiveReadiness = (stream: string): InteractiveReadiness => {
+  const rendered = renderScreen(stream);
+  const under = rendered.grid[rendered.row]?.[rendered.col];
+  const cursorOnCaret = under !== undefined && under.inverse && under.glyph === " ";
+  const ready = cursorOnCaret;
+  const carets: { row: number; column: number }[] = [];
+  rendered.grid.forEach((line, rowIndex) => {
+    line.forEach((cell, colIndex) => {
+      if (cell.inverse && cell.glyph === " ") carets.push({ row: rowIndex + 1, column: colIndex + 1 });
+    });
+  });
+  return {
+    ready,
+    cursorOnCaret,
+    cursor: { row: rendered.row + 1, column: rendered.col + 1 },
+    underCursor: under?.glyph ?? "",
+    carets,
+    fullScreen: rendered.fullScreen,
+    terminalCursorHidden: rendered.cursorHidden,
+    screen: rendered.grid.map((line) => line.map((cell) => cell.glyph).join("").trimEnd()),
+  };
+};
+
+/** What a wait that never saw a prompt reports: the signal looked for, and each part of it as seen. */
+export const describeReadiness = (reading: InteractiveReadiness): string => {
+  const at = (cell: { readonly row: number; readonly column: number }): string => `row ${cell.row}, column ${cell.column}`;
+  const drawn = reading.screen
+    .map((line, index) => ({ line, row: index + 1 }))
+    .filter(({ line }) => line.trim().length > 0)
+    .map(({ line, row }) => `${String(row).padStart(2)}| ${line}`);
+  return [
+    "looked for: the cursor at rest on a caret the client drew (an inverse-video blank cell)",
+    `  cursor on a caret: ${reading.cursorOnCaret ? "yes" : "no"}`,
+    `  cursor: ${at(reading.cursor)}, over ${JSON.stringify(reading.underCursor)}`,
+    `  carets drawn: ${reading.carets.length === 0 ? "none" : reading.carets.map(at).join("; ")}`,
+    "seen, as context rather than as inputs to the decision:",
+    `  full-screen buffer entered: ${reading.fullScreen ? "yes" : "no"}`,
+    `  terminal cursor hidden: ${reading.terminalCursorHidden ? "yes" : "no"}`,
+    "--- rendered screen, non-blank rows ---",
+    ...(drawn.length === 0 ? ["(blank)"] : drawn),
+  ].join("\n");
+};
 
 /**
  * Writes exactly `ROLE_WAKE_FRAME` to the session inbox and closes.
@@ -549,7 +896,7 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
 
   let fake: FakeAnthropic | undefined;
   let child: ChildProcessWithoutNullStreams | undefined;
-  let terminal = "";
+  const terminal = terminalTranscript();
   let stderr = "";
   let failure: unknown;
   let run: ProbeRun | undefined;
@@ -613,7 +960,7 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
       child = spawn(image.path, args, { env, cwd: workDir, stdio: ["pipe", "pipe", "pipe"] }) as ChildProcessWithoutNullStreams;
     }
     child.stdout.on("data", (chunk: Buffer) => {
-      terminal += chunk.toString("utf8");
+      terminal.push(chunk);
     });
     child.stderr.on("data", (chunk: Buffer) => {
       stderr += chunk.toString("utf8");
@@ -633,8 +980,13 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
     // arm types it; the headless arm writes a stream-json frame and holds stdin open, which is
     // what keeps that session alive after the turn completes.
     if (options.shape === "interactive") {
-      const ready = await waitFor(() => TUI_READY.test(strip(terminal)), 60_000);
-      if (!ready) throw new Error(`the interactive client never reached its prompt\n${strip(terminal).slice(-2000)}`);
+      const ready = await waitFor(() => interactiveReadiness(terminal.text()).ready, 60_000);
+      if (!ready) {
+        throw new Error(
+          `the interactive client never reached its prompt\n${describeReadiness(interactiveReadiness(terminal.text()))}\n` +
+            `--- terminal tail, escapes deleted rather than applied ---\n${strip(terminal.text()).slice(-2000)}`,
+        );
+      }
       await sleep(1_500);
       child.stdin.write("ping");
       await sleep(600);
@@ -664,7 +1016,7 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
     const final = modelRequests();
     mkdirSync(durableDir, { recursive: true });
     copyFileSync(capturePath, durableCapture);
-    writeFileSync(sessionLogPath, `${strip(terminal)}\n--- stderr ---\n${stderr}`);
+    writeFileSync(sessionLogPath, `${strip(terminal.text())}\n--- stderr ---\n${stderr}`);
     copyFileSync(sessionLogPath, durableLog);
 
     return (run = {

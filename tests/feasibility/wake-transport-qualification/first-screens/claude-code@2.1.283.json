@@ -1,0 +1,81 @@
+{
+  "client": {
+    "name": "claude-code",
+    "version": "2.1.283",
+    "versionOutput": "2.1.283 (Claude Code)",
+    "imagePath": "~/.local/share/claude/versions/2.1.283",
+    "imageSha256": "d8cb1e5c79684cc12a8bfc813e3a2073406921b6245744b3009be3ab5651d21e"
+  },
+  "capturedOn": "2026-09-28",
+  "launch": "runQualificationProbe's interactive argv and environment, unchanged",
+  "allocator": "tests/feasibility/wake-transport-qualification/pty-session.py (40 rows, 120 columns)",
+  "stoppedWhen": "3s after the client's first full-screen paint went quiet, then SIGTERM to the relay",
+  "reads": "each chunk exactly as one stdout read delivered it, base64, in order; atMs is from spawn",
+  "streamSha256": "9f8ef6c750ba78f58bc177523369674427374fd8b4ab57a33ee8b1f0f0c0b34d",
+  "chunks": [
+    {
+      "atMs": 138,
+      "base64": "GzcbW3IbOBtbPzI1aA=="
+    },
+    {
+      "atMs": 198,
+      "base64": "G1s/MjAwNGgbWz8yMDMxaBtbPzEwMDRo"
+    },
+    {
+      "atMs": 198,
+      "base64": "G10wO+KcsyBDbGF1ZGUgQ29kZQc="
+    },
+    {
+      "atMs": 209,
+      "base64": "G1s/MTA0OWgbWzJKG1tIG1s/MTAwMGgbWz8xMDAyaBtbPzEwMDNoG1s/MTAwNmgbWz8yNWwbWz8yNWwbW0gNG1sxMUMbWzFCG1sxbUNsYXVkZSBDb2RlG1syNEcbWzIybRtbMzg7NTsyNDZtdjIuMS4yODMNG1sxMUMbWzFCU29ubmV0IDQuNSDCtyBBUEkgVXNhZ2UgQmlsbGluZw0bWzExQxtbMUJ+L3cNG1szM0IbWzM4OzU7MjQ0beKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgA0bWzFCG1szOW3ina/CoBtbN20gDRtbMUIbWzI3bRtbMzg7NTsyNDRt4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSADRtbMkMbWzFCG1szODs1OzIyMG3ij7Xij7UgYXV0byBtb2RlIG9uG1szODs1OzI0Nm0gKHNoaWZ0K3RhYiB0byBjeWNsZSkgwrcg4oaQIGZvciBhZ2VudHMbWzM5bRtbNDA7MUgbWzM4OzNI"
+    },
+    {
+      "atMs": 225,
+      "base64": "G1tIDRtbMkMbWzM5QhtbMzg7NTsyNDZt4o+4IG1hbnVhbCBtb2RlIG9uIMK3ID8gZm9yIHNob3J0G1szNEd1dHMgwrcbWzQwR+KGkBtbNDJHZm9yIGFnZW50cxtbMzltG1tLG1s0MDsxSBtbMzg7M0g="
+    },
+    {
+      "atMs": 225,
+      "base64": "G1s+MHEbWz91G1tj"
+    },
+    {
+      "atMs": 383,
+      "base64": "G1tIDRtbMUIbWzQ4OzU7MTZtG1szODs1OzE3NG3ilpvilogbWzQ5beKWhA0bWzFCG1s0ODs1OzE2beKWiBtbNDlt4paI4paYDRtbMULilp3ilp0gG1szOW0bWzQwOzFIG1szODszSA=="
+    },
+    {
+      "atMs": 508,
+      "base64": "G1tIDRtbMkMbWzFCIA0bWzJDG1sxQhtbMzg7NTsxNzRt4paAG1szOW0bWzQwOzFIG1szODszSA=="
+    },
+    {
+      "atMs": 571,
+      "base64": "G1tIDRtbMUIgIA0bWzFCG1s0ODs1OzE2bRtbMzg7NTsxNzRt4pab4paIG1szOW0bWzQ5bSANG1sxQhtbNDg7NTsxNm0bWzM4OzU7MTc0beKWiBtbNDlt4paI4paAG1szOW0bWzQwOzFIG1szODszSA=="
+    },
+    {
+      "atMs": 635,
+      "base64": "G1tIDRtbMUIbWzQ4OzU7MTZtG1szODs1OzE3NG3ilojilojilojilpvilogbWzQ5beKWhA0bWzFCG1s0ODs1OzE2beKWiBtbM0filojilogbWzQ5beKWiOKWmA0bWzFCICAg4pad4padIBtbMzltG1s0MDsxSBtbMzg7M0g="
+    },
+    {
+      "atMs": 762,
+      "base64": "G1tIDRtbNUMbWzFCIA0bWzVDG1sxQhtbMzg7NTsxNzRt4paAG1szOW0bWzQwOzFIG1szODszSA=="
+    },
+    {
+      "atMs": 825,
+      "base64": "G1tIDRtbMUIgICAgIA0bWzNDG1sxQhtbNDg7NTsxNm0bWzM4OzU7MTc0beKWm+KWiBtbMzltG1s0OW0gDRtbMUIbWzQ4OzU7MTZtG1szODs1OzE3NG3ilojilojilojilogbWzQ5beKWiOKWgBtbMzltG1s0MDsxSBtbMzg7M0g="
+    },
+    {
+      "atMs": 890,
+      "base64": "G1tIDRtbMUIbWzM4OzU7MTc0beKWl+KWnxtbNDg7NTsxNm3ilpvilojilojilojilpvilogbWzQ5beKWhA0bWzFCIOKWnBtbNEcbWzQ4OzU7MTZt4paIG1s2R+KWiOKWiBtbNDlt4paI4paYDRtbMUIg4pad4padICAg4pad4padIBtbMzltG1s0MDsxSBtbMzg7M0g="
+    },
+    {
+      "atMs": 1016,
+      "base64": "G1tIDRtbMUIgICAgICAgICANG1sxQxtbMUIbWzM4OzU7MTc0beKWkBtbNDg7NTsxNm3ilpsbWzdH4pab4paIG1szOW0bWzQ5bSANG1sxQhtbMzg7NTsyNDZtwrcbWzM4OzU7MTc0beKWnBtbNDg7NTsxNm3ilojilojilojilojilogbWzQ5beKWiBtbMzg7NTsyNDZtwrcbWzM5bRtbNDA7MUgbWzM4OzNI"
+    },
+    {
+      "atMs": 1099,
+      "base64": "G1tIDRtbM0IbWzM4OzU7MjQ2bX4bWzlHfhtbMzltG1s0MDsxSBtbMzg7M0g="
+    },
+    {
+      "atMs": 1164,
+      "base64": "G1tIDRtbMUIbWzM4OzU7MTc0bSDilpAbWzQ4OzU7MTZt4pab4paI4paI4paI4pab4paIDRtbMUIbWzQ5beKWneKWnBtbNDg7NTsxNm3ilogbWzdH4paIG1s0OW3ilojiloANG1sxQiDilp3ilp0gICDilp3ilp0gG1szOW0bWzQwOzFIG1szODszSA=="
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "client": {
+    "name": "claude-code",
+    "version": "2.1.268",
+    "versionOutput": "2.1.268 (Claude Code)",
+    "imagePath": "~/.local/share/claude/versions/2.1.268",
+    "imageSha256": "06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a"
+  },
+  "capturedOn": "2026-09-28",
+  "launch": "runQualificationProbe's interactive argv and environment, unchanged",
+  "allocator": "tests/feasibility/wake-transport-qualification/pty-session.py (40 rows, 120 columns)",
+  "stoppedWhen": "3s after the client's first full-screen paint went quiet, then SIGTERM to the relay",
+  "reads": "each chunk exactly as one stdout read delivered it, base64, in order; atMs is from spawn",
+  "streamSha256": "c2c8f54ac3a1109b4cacaea8ad0a1aa7aea33338a0b35e25e0d664053cef6c26",
+  "chunks": [
+    {
+      "atMs": 719,
+      "base64": "GzcbW3IbOBtbPzI1aA=="
+    },
+    {
+      "atMs": 849,
+      "base64": "G1s/MTA0OWgbWzJKG1tIG1s/MTAwMGgbWz8xMDAyaBtbPzEwMDNoG1s/MTAwNmgbWz8yNWw="
+    },
+    {
+      "atMs": 852,
+      "base64": "G1s/MjAwNGgbWz8yMDMxaBtbPzEwMDRo"
+    },
+    {
+      "atMs": 853,
+      "base64": "G10wO+KcsyBDbGF1ZGUgQ29kZQc="
+    },
+    {
+      "atMs": 869,
+      "base64": "G1tIDRtbMUIbWzM4OzU7MTc0bSDilpAbWzQ4OzU7MTZt4pab4paI4paI4paI4pab4paIG1sxMkcbWzM5bRtbNDltG1sxbUNsYXVkZSBDb2RlG1syNEcbWzIybRtbMzg7NTsyNDZtdjIuMS4yNjgNG1sxQhtbMzg7NTsxNzRt4pad4pacG1s0ODs1OzE2beKWiOKWiOKWiOKWiOKWiBtbNDlt4paI4paAG1sxMkcbWzM4OzU7MjQ2bVNvbm5ldCA0LjUgwrcgQVBJIFVzYWdlIEJpbGxpbmcNG1sxQhtbMzg7NTsxNzRtICDilp3ilp0g4pad4padICAbWzEyRxtbMzg7NTsyNDZtfi93DRtbMzNCG1szODs1OzI0NG3ilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIANG1sxQhtbMzlt4p2vwqAbWzdtIA0bWzFCG1syN20bWzM4OzU7MjQ0beKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgA0bWzJDG1sxQhtbMzg7NTsyNDZt4o+4IG1hbnVhbCBtb2RlIG9uIMK3ID8gZm9yIHNob3J0Y3V0cyDCtyDihpAgZm9yIGFnZW50cxtbMzltG1s0MDsxSBtbMzg7M0g="
+    },
+    {
+      "atMs": 883,
+      "base64": "G1s+MHEbW2M="
+    },
+    {
+      "atMs": 978,
+      "base64": "G1tIDRtbMkMbWzFCG1s0ODs1OzE2bRtbMzg7NTsxNzRt4paI4pafG1s3R+KWiOKWnxtbMzltG1s0OW0bWzQwOzFIG1szODszSA=="
+    },
+    {
+      "atMs": 1296,
+      "base64": "G1tIDRtbMkMbWzFCG1s0ODs1OzE2bRtbMzg7NTsxNzRt4paf4paIG1s3R+KWn+KWiBtbMzltG1s0OW0bWzQwOzFIG1szODszSA=="
+    },
+    {
+      "atMs": 1631,
+      "base64": "G1tIDRtbMkMbWzFCG1s0ODs1OzE2bRtbMzg7NTsxNzRt4pabG1s3R+KWmxtbMzltG1s0OW0bWzQwOzFIG1szODszSA=="
+    }
+  ]
+}
