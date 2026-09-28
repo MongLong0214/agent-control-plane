@@ -818,10 +818,13 @@ export class RoleConversationPort {
       // unwakeable on the strength of a delivery to the process before it.
       //
       // Cleared before the wake below, which is what decides whether *this* registration has a
-      // failure of its own -- so once this method returns, the memory describes this registration's
-      // own delivery whether or not the earlier one was forgotten, and the clearing is observable
-      // only between the two. A row observes it there, from the listener the wake is delivered to:
+      // failure of its own, and the clearing is observable only between the two. A row observes it
+      // there, from the listener the wake is delivered to:
       // `a-registration-forgets-the-refusal-it-inherited`.
+      //
+      // What the memory describes once this method returns is the newest registration's delivery,
+      // which is this one unless the holder registered again while this wake was in flight -- a
+      // completion that outlived its own registration writes nothing (`wake`).
       peer.wakeFailure = null;
     }
     const registered = owned.map(([roleKey]) => roleKey);

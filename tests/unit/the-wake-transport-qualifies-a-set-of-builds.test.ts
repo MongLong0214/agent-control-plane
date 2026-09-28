@@ -506,7 +506,7 @@ describe("the daemon reports a binding that cannot receive wakes", () => {
       wakeTransportPinSource: "src/mcp/role-conversation.ts WAKE_TRANSPORT_QUALIFIED_CLIENTS",
     });
     expect(finding?.recommendedAction).toContain("cannot receive wakes");
-    expect(finding?.recommendedAction).toContain("the last wake sent to it was refused");
+    expect(finding?.recommendedAction).toContain("the last wake sent under the registration it holds now was refused");
     // It says a wake failed, not that the next one must, and the repair is the holder's own restart.
     expect(finding?.recommendedAction).toContain("Restart the holder so it binds and registers again");
     expect(finding?.recommendedAction).not.toContain("Restart the holder on a qualified build");

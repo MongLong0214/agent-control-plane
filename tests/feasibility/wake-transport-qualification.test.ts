@@ -742,8 +742,9 @@ describe("U6: the session log is decoded as a stream, not per read", () => {
  * fake provider, the unix socket, the production wake frame, the capture and the teardown are all
  * the real ones, so what these rows measure is the probe rather than a model of it. What stands in
  * for the client is `./wake-transport-qualification/fake-client.ts`, which is not evidence about any
- * client and is not used by `qualify()` -- it binds where its argv tells it to and answers with one
- * turn, which is exactly enough for the probe's decisions to be observable.
+ * client and is not used by `qualify()` -- it binds where its argv tells it to, takes the turns a
+ * row's environment asks it for, and answers or ignores an arriving frame, which is exactly enough
+ * for the probe's decisions to be observable.
  */
 describe("U6: what the probe starts, and what it refuses to proceed without", () => {
   const CAPTURE_DIR = "evidence/local/u6-wake-transport-offline";

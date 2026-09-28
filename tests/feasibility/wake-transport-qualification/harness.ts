@@ -931,10 +931,11 @@ export const wakeCarryingTurnsIn = (capture: string): readonly CapturedRequest[]
 /**
  * A model-input text a committed reading carries **verbatim**, because the rule reads its content.
  *
- * Two kinds of text qualify and no others: one that contains `ROLE_WAKE_TOKEN`, and one whose
- * trimmed value is the prompt the arm was started with. Those are the two things every count here
- * is read from, and the prose the client composes around our token is the thing an injection arm
- * exists to show, so it travels in full.
+ * Two kinds of text qualify and no others, and both only out of a *turn* -- a request the counts
+ * are derived from (`isArmEvidence`): one that contains `ROLE_WAKE_TOKEN`, and one that arrived as
+ * a user message whose trimmed value is the prompt the arm was started with. Those are the two
+ * things every count here is read from, and the prose the client composes around our token is the
+ * thing an injection arm exists to show, so it travels in full.
  */
 export interface KeptText {
   readonly from: string;
@@ -1115,14 +1116,18 @@ export interface ArmObservations {
  * Whether an observed text is published though no count is read from it.
  *
  * The other half of the withholding rule, and the half a reader can check: a record shows verbatim
- * only what the counts are read from, so a text that is neither the prompt nor a carrier of the wake
- * token has no business being in a committed file. The instrument classifies that way
- * (`observedText`), which is a property of the code; this is the property of the artefact, and it is
- * what keeps a reading taken by some other instrument -- or edited afterwards -- from publishing the
- * client's system prompt into a public repository on the strength of everything else agreeing.
+ * only what the counts are read from, so a text no count of *its own request* reads has no business
+ * being in a committed file. The instrument classifies that way (`observedText`), which is a
+ * property of the code; this is the property of the artefact, and it is what keeps a reading taken
+ * by some other instrument -- or edited afterwards -- from publishing the client's system prompt
+ * into a public repository on the strength of everything else agreeing.
  *
- * The prompt is this harness's own constant, the same default `countsFrom` derives against, because
- * an arm that was started with some other prompt is not one these rules admit.
+ * Asked with the request, for the reason `isArmEvidence` gives: a text was judged on content alone
+ * here, and a count-tokens request or a GET carrying the token had its text published verbatim by
+ * the rule written to prevent exactly that.
+ *
+ * The prompt is this harness's own constant, because an arm that was started with some other prompt
+ * is not one these rules admit.
  */
 const isPublishedWithoutBeingRead = (request: ObservedRequest, entry: ObservedText): boolean =>
   entry !== null &&
@@ -2088,7 +2093,7 @@ const LIMITS: readonly string[] = [
   "The endpoint-directory policy is untouched by this slice, so registration through registerEndpoint is still refused for a socket outside the daemon state directory. See the finding of that name.",
   "Interactive start required pre-provisioned answers to the onboarding, workspace-trust and custom-API-key prompts in a throwaway config. A session whose operator answered them differently is outside this reading.",
   "The interactive arm's baseline turn is started by a positional prompt in its argv, not typed at the client's prompt. What is read here is that the wake frame reaches the model input of an interactively-invoked session and starts a turn; nothing here observes the client's terminal, so this says nothing about whether that session would have accepted a keystroke at the moment the frame arrived.",
-  "Each arm's baseline is a model request carrying the prompt as a user message whose text, trimmed, equals it. That is what every capture on this host shows, and a build that sent the same prompt in another shape would fail the arm rather than qualify on an unchecked turn. What is established is that this prompt started a turn, not that the client would have started one from any other input.",
+  "Each arm's baseline is the turns its capture already held at the moment the frame was written, and one of them is required to be a model request carrying the prompt as a user message whose text, trimmed, equals it. That is what every capture on this host shows, and a build that sent the same prompt in another shape would fail the arm rather than qualify on an unchecked turn. What is established is that this prompt started a turn before the frame, not that the client would have started one from any other input, and not that the turns counted beside it were the prompt's.",
   "settleCeilingMs is a ceiling on the post-injection wait, not a duration either arm was observed for. The control spends the whole ceiling; the injection arm returns on its first follow-up request. Two arms sharing a ceiling were watched for at most the same time, not for the same time, and the actual spans are not recorded here.",
   "Every arm executed one hard link, in a directory private to the run, to the inode digested as imageSha256 -- the command's first element names that link, which is removed with the run, and imagePath names where the inode was found. Each arm re-read the link's identity, size, modification time and digest after its measurement and would have failed the run on a difference. A rewrite of that inode in place, undone before the re-read, would not have been seen.",
   "The verdict in this file is recomputed from the runs in it, by the one calculation the instrument writes it with, and a reader that admits this reading recomputes it again rather than reading the field. That establishes internal consistency and nothing more: every fact it checks is a statement inside this file. A file written from nothing, with all its fields made to agree, satisfies it. Whether the arms it describes ever ran is a question the raw captures and session logs it points at answer, and this check does not ask them.",

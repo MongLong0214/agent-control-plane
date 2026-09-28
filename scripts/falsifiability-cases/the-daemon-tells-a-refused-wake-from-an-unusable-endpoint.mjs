@@ -17,7 +17,8 @@ const theDaemonTellsARefusedWakeFromAnUnusableEndpoint = {
   file: "src/daemon/daemon.ts",
   find:
     "                `its holder runs ${holder.presented}, a qualified build whose registered wake endpoint still ` +\n" +
-    '                "passes every check made before a wake is sent, and the last wake sent to it was refused",\n',
+    '                "passes every check made before a wake is sent, and the last wake sent under the registration it " +\n' +
+    '                "holds now was refused",\n',
   replace:
     "                `its holder runs ${holder.presented}, a qualified build, and the wake endpoint it registered no ` +\n" +
     '                "longer passes the checks made before a wake is sent",\n',

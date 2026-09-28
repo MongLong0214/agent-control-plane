@@ -25,9 +25,9 @@ const aRegistrationForgetsTheRefusalItInherited = {
   what: "a registration forgets the wake refusal an earlier registration earned, so no holder is reported unwakeable for a delivery to the process before it",
   file: "src/mcp/role-conversation.ts",
   find:
-    "      // `a-registration-forgets-the-refusal-it-inherited`.\n" +
+    "      // completion that outlived its own registration writes nothing (`wake`).\n" +
     "      peer.wakeFailure = null;\n",
-  replace: "      // `a-registration-forgets-the-refusal-it-inherited`.\n",
+  replace: "      // completion that outlived its own registration writes nothing (`wake`).\n",
   killedBy: [
     "tests/unit/the-wake-transport-qualifies-a-set-of-builds.test.ts::forgets the refusal an earlier registration earned, before its own wake decides anything",
   ],

@@ -2075,7 +2075,8 @@ export class Daemon {
             return {
               cause:
                 `its holder runs ${holder.presented}, a qualified build whose registered wake endpoint still ` +
-                "passes every check made before a wake is sent, and the last wake sent to it was refused",
+                "passes every check made before a wake is sent, and the last wake sent under the registration it " +
+                "holds now was refused",
               repair:
                 "The socket file outlived whatever was listening on it, which is what a client that exited " +
                 "without cleaning up leaves behind. Restart the holder so it binds and registers again; nothing " +
