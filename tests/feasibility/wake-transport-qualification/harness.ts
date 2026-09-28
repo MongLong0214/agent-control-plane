@@ -514,7 +514,8 @@ export const interactiveBlocker = (): string | null => {
   return null;
 };
 
-export const strip = (raw: string): string => raw.replace(ANSI, "").replace(/\r/g, "\n");
+/** The terminal text with the escapes deleted. Diagnosis only; see `ANSI` and `terminalOutput`. */
+const strip = (raw: string): string => raw.replace(ANSI, "").replace(/\r/g, "\n");
 
 /**
  * The client's stdout, kept as the bytes that arrived and decoded only when something reads it.
@@ -525,9 +526,11 @@ export const strip = (raw: string): string => raw.replace(ANSI, "").replace(/\r/
  *
  * Bytes rather than text per read, because a read ends wherever the pipe was drained and not on a
  * character boundary -- of eleven client starts captured on 2026-09-28, three split a three-byte
- * glyph (`─`, `←`) across two reads, and `chunk.toString()` turns each half into U+FFFD. A
- * concatenation has no read boundary left to split, so the only mangled glyph possible is one the
- * client had not finished writing.
+ * glyph (`─`, `←`) across two reads, and `chunk.toString()` turns each half into U+FFFD. Those
+ * eleven captures are not in the tree: five were committed as `first-screens/` and were deleted
+ * with the screen model they were fixtures for, so the reading above is checkable at 972b4736 and
+ * nowhere later. A concatenation has no read boundary left to split, so the only mangled glyph
+ * possible is one the client had not finished writing.
  */
 const terminalOutput = (): { readonly push: (chunk: Buffer) => void; readonly text: () => string } => {
   const chunks: Buffer[] = [];
