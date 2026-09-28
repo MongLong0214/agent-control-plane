@@ -9,6 +9,7 @@ import { type Decision, allow, deny } from "../core/errors.ts";
 import { readProcessArgv, readProcessStartToken } from "../core/process-argv.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
+import type { AuditLog, AuditRecord } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
 import type { AuthenticatedTargetBinding, BindingRegistry, VerifiedTargetBinding } from "../session/binding-registry.ts";
@@ -35,8 +36,9 @@ import type { BuzzActorAuthenticator, SessionRegistry } from "../session/session
  *    runtime that does not yet exist).
  *  - It never touches a Hermes/CEO actor. CEO direction is out of scope; nothing here mints one.
  *  - It never opens a write transaction before every identity check has already passed. Every
- *    refusal above `#mutate` therefore leaves the database exactly as it found it, by construction
- *    rather than by inspecting what `#mutate` decided.
+ *    refusal above `#mutate` therefore leaves every table but `audit_events` exactly as it found
+ *    it, by construction rather than by inspecting what `#mutate` decided; `audit_events` gains the
+ *    one refusal row `claim()` writes on its way out.
  */
 
 // ---------------------------------------------------------------------------
@@ -1253,6 +1255,59 @@ export function assertClaudeIdentityStillLive(
   return allow(ReasonCode.OK, true);
 }
 
+/** What a claim asked for, read from the caller's request before `claim()` first awaits. */
+interface ClaimAsked {
+  claimedSessionUuid: string;
+  projectId: string;
+}
+
+/**
+ * The audit row for one decision `CanonicalSelfClaim.claim()` returns.
+ *
+ * Only the reason code and identifiers cross into the record. The decision's `message` and
+ * `evidence` do not: between them they can carry an executor image path, a transcript path, or a
+ * Buzz transport's own error text, none of which is the claimant's to put in a durable log. The
+ * receipt's `sessionSecret` is never read.
+ *
+ * The claimed session is recorded only when it has the shape of one. The first refusal in `claim`
+ * is exactly the case where it does not, and there it is arbitrary caller text.
+ *
+ * A refusal's project is recorded only when it names a row in `projects`, and is otherwise null.
+ * The request's `projectId` is any nonempty string the caller sent, so without that bound a refused
+ * claim could put a private path or a token into a durable log verbatim — the same exposure that
+ * keeps `message` and `evidence` off the row, and `AuditLog.record` redacts only `evidence`. The
+ * registry is the existing authority for what a project id is; this adds no second one, no pattern
+ * and no length cap. A null project loses less than a verbatim secret, and the reason code stays.
+ *
+ * An admission names the project from the binding, not from the request: the entitlement is what
+ * decided the project, and the request is the caller's object.
+ */
+const claimDecisionAuditRecord = (
+  asked: ClaimAsked,
+  decision: Decision<CanonicalSelfClaimReceipt>,
+  isRegisteredProject: (projectId: string) => boolean,
+): AuditRecord => {
+  if (decision.allowed) {
+    return {
+      kind: "CANONICAL_SELF_CLAIM_ADMITTED",
+      reasonCode: decision.reasonCode,
+      projectId: decision.value.binding.projectId,
+      sessionId: decision.value.sessionId,
+      roleKey: decision.value.binding.roleKey,
+      evidence: {
+        identity: decision.value.derivedSessionUuid,
+        generation: decision.value.binding.bindingGeneration,
+      },
+    };
+  }
+  return {
+    kind: "CANONICAL_SELF_CLAIM_REFUSED",
+    reasonCode: decision.reasonCode,
+    projectId: isRegisteredProject(asked.projectId) ? asked.projectId : null,
+    evidence: { identity: UUID_PATTERN.test(asked.claimedSessionUuid) ? asked.claimedSessionUuid : null },
+  };
+};
+
 /**
  * The claim primitive (#760). Composes `SessionRegistry.create` and `BindingRegistry.bind` —
  * it mints no writer of its own for any of the five tables the mutation touches (sessions,
@@ -1278,6 +1333,8 @@ export class CanonicalSelfClaim {
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
+    /** Where every decision `claim()` returns is recorded; see `claim()` and `claimDecisionAuditRecord`. */
+    private readonly audit: AuditLog,
     private readonly sessions: SessionRegistry,
     private readonly bindings: BindingRegistry,
     /** Authenticates `buzzActorId` for `SessionRegistry.bindBuzzActor` (deployment ingress policy). */
@@ -1320,7 +1377,66 @@ export class CanonicalSelfClaim {
     this.#canonicalSessions = validatedSessions.map((entry) => Object.freeze({ ...entry }));
   }
 
+  /**
+   * Every decision this hands back — each refusal and the admission — leaves one row, and every
+   * refusal's row is written here, once, on its way out. Recorded at this one boundary rather than
+   * beside each `deny`: this file alone has over thirty, more arrive from what it composes, and a
+   * record written per site means the next refusal someone adds has no row. That absence is what
+   * hid a weeks-long adoption outage.
+   *
+   * The admission's row is not written here. It is written in `#mutate`, inside the transaction
+   * that commits the admission, so the two land or roll back together. Written here, after that
+   * commit, a failed insert threw out of a claim whose session, binding and generation bump were
+   * already durable: the listener answered `INTERNAL_ERROR` while the database said the claim had
+   * succeeded. Inside, a failed insert rolls the admission back and the claim refuses with
+   * `AUDIT_WRITE_FAILED`, and that refusal is recorded here like any other.
+   *
+   * A refusal commits nothing, so its row has no transaction to join. An insert that fails here is
+   * swallowed rather than allowed to escape: a refusal must reach its caller with its own reason
+   * code, not as a throw the listener turns into `INTERNAL_ERROR`. That refusal is then left with
+   * no row, and nothing else records that its row was lost.
+   *
+   * What was asked is read before the first `await`. `request` is the caller's object and the
+   * Buzz-address resolution hands control away, so reading it afterwards would record whatever the
+   * caller changed it to rather than what it claimed.
+   *
+   * A claim that *throws* is not a returned decision and is not recorded here.
+   */
   async claim(request: CanonicalSelfClaimRequest): Promise<Decision<CanonicalSelfClaimReceipt>> {
+    const asked = { claimedSessionUuid: request.claimedSessionUuid, projectId: request.projectId };
+    const decision = await this.#decide(request, asked);
+    // Its row was committed with it; writing one here as well would be the admission's second.
+    if (decision.allowed) return decision;
+    try {
+      this.audit.record(claimDecisionAuditRecord(asked, decision, (projectId) => this.#isRegisteredProject(projectId)));
+    } catch {
+      // Deliberately empty: the refusal stands without its row. See the docblock above.
+    }
+    return decision;
+  }
+
+  /**
+   * Whether `projectId` names a row in `projects`, for the audit record alone. It decides nothing
+   * about the decision. A lookup that fails answers "not registered": the record then carries a
+   * null project, and neither the decision nor its reason code changes, nor does the failure
+   * escape `claim()`.
+   *
+   * Which state it reads depends on where the record is built. A refusal's row is built in
+   * `claim()` after `#decide` has returned, when any transaction has already rolled back, so the
+   * lookup reads committed state after the decision is final. The admission's row is built inside
+   * the admission's own transaction, where this lookup would read that transaction's snapshot —
+   * but an admission names its project from the binding, so `claimDecisionAuditRecord` never
+   * consults the lookup for one.
+   */
+  #isRegisteredProject(projectId: string): boolean {
+    try {
+      return this.db.get(`SELECT 1 FROM projects WHERE project_id = ?`, [projectId]) !== undefined;
+    } catch {
+      return false;
+    }
+  }
+
+  async #decide(request: CanonicalSelfClaimRequest, asked: ClaimAsked): Promise<Decision<CanonicalSelfClaimReceipt>> {
     if (!UUID_PATTERN.test(request.claimedSessionUuid)) {
       return deny(ReasonCode.INVALID_ARGUMENT, "claimedSessionUuid must be a UUID", {});
     }
@@ -1393,7 +1509,7 @@ export class CanonicalSelfClaim {
 
     // Clause 3 — one atomic mutation, or none. Every identity and authority check above is over;
     // nothing past this point may refuse for a reason this transaction cannot also undo.
-    return this.#mutate(request, identity, image, transcript, buzzAddress.value, entry);
+    return this.#mutate(request, asked, identity, image, transcript, buzzAddress.value, entry);
   }
 
   /**
@@ -1470,6 +1586,8 @@ export class CanonicalSelfClaim {
 
   #mutate(
     request: CanonicalSelfClaimRequest,
+    /** What `claim()` read from `request` before its first await; the admission's row is built from it. */
+    asked: ClaimAsked,
     identity: DerivedClaimantIdentity,
     image: VerifiedClaudeIdentity["image"],
     transcript: TranscriptEvidence,
@@ -1696,7 +1814,7 @@ export class CanonicalSelfClaim {
       });
       if (!bound.allowed) return bound as Decision<CanonicalSelfClaimReceipt>;
 
-      return allow(ReasonCode.OK, {
+      const admitted = allow(ReasonCode.OK, {
         sessionId: created.sessionId,
         sessionSecret: created.sessionSecret,
         binding: bound.value,
@@ -1705,6 +1823,22 @@ export class CanonicalSelfClaim {
         executorImagePath: observedImage?.imagePath ?? null,
         buzzAddress,
       });
+      // The admission's row, last, inside this transaction: the admission commits only with its
+      // row, and a failed insert takes the session, the binding and the generation bump back with
+      // it. `better-sqlite3` throws on a constraint, a busy database or a full disk; the throw is
+      // caught here and returned as a denial so `txDecision` rolls back and hands a refusal to
+      // `claim()`, never an exception to the listener. Only this insert is caught — a throw from
+      // anything above still propagates as a throw.
+      try {
+        this.audit.record(claimDecisionAuditRecord(asked, admitted, (projectId) => this.#isRegisteredProject(projectId)));
+      } catch (error) {
+        return deny(
+          ReasonCode.AUDIT_WRITE_FAILED,
+          "the admission's audit row could not be written, so the admission was rolled back",
+          { error: error instanceof Error ? error.message : String(error) },
+        );
+      }
+      return admitted;
     });
   }
 }

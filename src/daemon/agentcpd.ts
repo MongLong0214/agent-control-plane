@@ -3255,6 +3255,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         return executeCanonicalSelfClaimOperator(peer, params, {
           db: cp.db,
           clock: cp.clock,
+          audit: cp.audit,
           sessions: cp.sessions,
           bindings: cp.bindings,
           // Each canonical CTO's own Buzz channel identity is a deployment fact, configured the

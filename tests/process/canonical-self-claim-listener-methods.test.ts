@@ -216,6 +216,7 @@ const resolveBuzzAddressFixture = (
 const depsFor = (cp: Harness["cp"], root: string): CanonicalSelfClaimOperatorDeps => ({
   db: cp.db,
   clock: cp.clock,
+  audit: cp.audit,
   sessions: cp.sessions,
   bindings: cp.bindings,
   buzzActorAuthenticator: new IngressGuard(cp.db, cp.clock, cp.audit, { buzz: { allowedActors: [BUZZ_ACTOR_ID] } }),

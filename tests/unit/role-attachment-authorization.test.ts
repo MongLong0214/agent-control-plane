@@ -88,7 +88,7 @@ describe("role attachment authorization without sockets", () => {
     const guard = new IngressGuard(h.cp.db, h.clock, h.cp.audit, {
       cli: { allowedActors: [TEST_OWNER.actor] }, buzz: { allowedActors: ["buzz:fixture"] },
     });
-    const recovery = new CanonicalSelfClaim(h.cp.db, h.clock, h.cp.sessions, h.cp.bindings,
+    const recovery = new CanonicalSelfClaim(h.cp.db, h.clock, h.cp.audit, h.cp.sessions, h.cp.bindings,
       guard, async () => allow(ReasonCode.OK, "buzz://fixture"), {
         canonicalSessions: [{ sessionUuid: uuid, projectId, buzzActorId: "buzz:fixture" }],
         canonicalBuzzChannelId: "fixture",

@@ -16,7 +16,7 @@ const c = {
   find: "predecessor.lifecycle !== SessionLifecycle.READY ||\n",
   replace: "false ||\n",
   killedBy: [
-    "tests/unit/canonical-self-claim.test.ts::same-live recovery refuses draining mismatch without effects",
+    "tests/unit/canonical-self-claim.test.ts::same-live recovery refuses draining mismatch leaving only its own refusal row",
   ],
 };
 export default c;

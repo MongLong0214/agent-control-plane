@@ -285,6 +285,32 @@ const rowCounts = (cp: Harness["cp"]): Record<(typeof ROLLBACK_TABLES)[number], 
     ROLLBACK_TABLES.map((table) => [table, cp.db.get<{ c: number }>(`SELECT COUNT(*) AS c FROM ${table}`)?.c ?? -1]),
   ) as Record<(typeof ROLLBACK_TABLES)[number], number>;
 
+/**
+ * The rollback oracle. The mutation tables hold what they held before, and the *whole* of what
+ * `audit_events` gained since `before` — every row, whatever its kind — is exactly the one row
+ * `CanonicalSelfClaim.claim()` records for the refusal it returned, carrying the reason code that
+ * refusal crossed the socket with.
+ *
+ * It compares the full delta rather than leaving the decision kinds out of the count, which it
+ * used to: then a leak written under either kind — a second refusal row, or an admission row the
+ * rollback should have taken with it — passed. `audit_events` is append-only and ordered by
+ * insertion, so offsetting by the earlier count isolates exactly what was written after it.
+ */
+const expectRolledBack = (
+  cp: Harness["cp"],
+  before: Record<(typeof ROLLBACK_TABLES)[number], number>,
+  refusal: Decision<unknown>,
+): void => {
+  expect(refusal.allowed, JSON.stringify(refusal)).toBe(false);
+  expect(
+    cp.db.all<{ kind: string; reason_code: string | null }>(
+      `SELECT kind, reason_code FROM audit_events ORDER BY event_id LIMIT -1 OFFSET ?`,
+      [before.audit_events],
+    ),
+  ).toEqual([{ kind: "CANONICAL_SELF_CLAIM_REFUSED", reason_code: refusal.reasonCode }]);
+  expect(rowCounts(cp)).toEqual({ ...before, audit_events: before.audit_events + 1 });
+};
+
 const insertProject = (cp: Harness["cp"], projectId: string): void => {
   cp.db.run(`INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)`, [
     projectId, projectId, cp.clock.nowIso(),
@@ -331,6 +357,7 @@ const depsFor = (
   return {
     db: cp.db,
     clock: cp.clock,
+    audit: cp.audit,
     sessions: cp.sessions,
     bindings: cp.bindings,
     buzzActorAuthenticator: new IngressGuard(cp.db, cp.clock, cp.audit, {
@@ -401,7 +428,7 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
 
 
   it(
-    "a second claim at a generation already committed denies with no new claim state or audit",
+    "a second claim at a generation already committed denies with no new claim state and no audit row beyond its own decision",
     async () => {
       const started = await startMintOperator();
       const { cp } = started.harness;
@@ -423,7 +450,7 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
         params: { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1 },
       });
       expect(replay.allowed).toBe(false);
-      expect(rowCounts(cp)).toEqual(afterFirst);
+      expectRolledBack(cp, afterFirst, replay);
     },
     45_000,
   );
@@ -447,7 +474,7 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
       });
 
       expectClosedPublicDenial(result, ReasonCode.CONFLICT);
-      expect(rowCounts(cp)).toEqual(before);
+      expectRolledBack(cp, before, result);
     },
     45_000,
   );

@@ -23,7 +23,7 @@ const c = {
   find: " || predecessor.buzzActorId !== entry.buzzActorId",
   replace: "",
   killedBy: [
-    "tests/unit/canonical-self-claim.test.ts::same-live recovery refuses buzz mismatch without effects",
+    "tests/unit/canonical-self-claim.test.ts::same-live recovery refuses buzz mismatch leaving only its own refusal row",
   ],
 };
 export default c;
