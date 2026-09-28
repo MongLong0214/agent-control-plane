@@ -686,40 +686,114 @@ const MESSAGES_ENDPOINT = "/v1/messages";
  */
 const requestEndpoint = (url: string): string => url.split(/[?#]/)[0] ?? url;
 
+/** One line of the fake provider's capture: a request as it arrived, before anything judged it. */
+interface CapturedRequest {
+  readonly method: string;
+  readonly url: string;
+  readonly body: string;
+}
+
 /**
- * The captured requests that were sent to be inferred on.
+ * Every request the fake provider recorded, whatever it was.
  *
- * One definition, used for the baseline, for the follow-up and for the wake count alike, so that
- * "a turn began" means the same thing everywhere in this file. The capture is the loopback fake
- * provider's append-only JSONL (`../native-session-inbox/fake-anthropic.ts`): every request it
- * received, whatever its path, one JSON object per line.
- *
- * The endpoint is *compared*, not searched for. The earlier form was
- * `url.includes("/v1/messages")`, which also matches `/v1/messages/count_tokens` -- a request
- * *about* a turn rather than a turn, and one a client can send before it has asked for any
- * inference at all. Since the baseline turn is this harness's only evidence that the prompt it
- * started the client with was accepted, a count-tokens request standing in for that evidence would
- * let an arm proceed and then measure the wake's follow-up against a baseline that never happened.
- * No capture taken on this host holds one -- checked across the four arms of each committed
- * reading -- so this changes no number that exists; it stops the filter from meaning something
- * other than its name on the first build that sends one.
+ * The capture is the loopback fake provider's append-only JSONL
+ * (`../native-session-inbox/fake-anthropic.ts`): one JSON object per line, every request it
+ * received, whatever its method and path.
  */
-export const modelRequestsIn = (capture: string): readonly { readonly url: string; readonly body: string }[] =>
+const capturedRequests = (capture: string): readonly CapturedRequest[] =>
   capture
     .split("\n")
     .filter((line) => line.trim().length > 0)
-    .map((line) => JSON.parse(line) as { url: string; body: string })
-    .filter((request) => requestEndpoint(request.url) === MESSAGES_ENDPOINT);
+    .map((line) => JSON.parse(line) as CapturedRequest);
 
 /**
- * Whether the baseline turn has been *observed*: one request the client sent to be inferred on.
+ * The captured requests that asked for inference: a POST, to the messages endpoint itself.
+ *
+ * One definition, used for the baseline, for the follow-up and for the wake count alike, so that
+ * "a turn began" means the same thing everywhere in this file. Both conditions are load-bearing
+ * and neither is incidental:
+ *
+ * - **The endpoint is compared, not searched for.** The earlier form was
+ *   `url.includes("/v1/messages")`, which also matches `/v1/messages/count_tokens` -- a request
+ *   *about* a turn rather than a turn, and one a client can send before it has asked for any
+ *   inference at all.
+ * - **The method must be POST.** This provider answers a GET to the same path with a 404, so a
+ *   non-POST request got no completion and began no turn; counting one would let a request the
+ *   client's turn machinery never made stand in for a turn it never took.
+ *
+ * Neither condition says *which* turn this is -- see `baselineTurnObserved` for that. This is the
+ * count the follow-up is read from (`followUpAfterInjection`), so what it admits sets what an
+ * "extra request after the frame" can be.
+ *
+ * No capture taken on this host holds a count-tokens or a non-POST request -- checked across the
+ * four arms of each committed reading -- so this changes no number that exists; it stops the
+ * filter from meaning something other than its name on the first build that sends one.
+ */
+export const modelRequestsIn = (capture: string): readonly CapturedRequest[] =>
+  capturedRequests(capture).filter(
+    (request) => request.method === "POST" && requestEndpoint(request.url) === MESSAGES_ENDPOINT,
+  );
+
+/**
+ * The text of every user message in a request body, flattened; empty for a body that is not one.
+ *
+ * The measured builds send `messages: [{ role: "user", content: [{ type: "text", text }, ...] }]`,
+ * with the prompt as a block of its own beside the system reminders. A string `content` is
+ * accepted too, since that is the shape of the frame the headless arm writes on stdin and a build
+ * is free to forward it unchanged. Anything else -- an unparseable body, no `messages`, a
+ * non-user role, a block that is not text -- contributes nothing rather than throwing: this reads
+ * a foreign process's output, and a shape it does not recognise is a baseline it has not seen, not
+ * a crash.
+ */
+const userMessageTexts = (body: string): readonly string[] => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return [];
+  }
+  const messages = (parsed as { messages?: unknown } | null)?.messages;
+  if (!Array.isArray(messages)) return [];
+  const texts: string[] = [];
+  for (const message of messages) {
+    const { role, content } = (message ?? {}) as { role?: unknown; content?: unknown };
+    if (role !== "user") continue;
+    if (typeof content === "string") {
+      texts.push(content);
+      continue;
+    }
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      const { type, text } = (block ?? {}) as { type?: unknown; text?: unknown };
+      if (type === "text" && typeof text === "string") texts.push(text);
+    }
+  }
+  return texts;
+};
+
+/**
+ * Whether the arm's *own prompt* was turned into a turn: a model request carrying it as a user
+ * message.
  *
  * This is the harness's only evidence that the prompt it started the client with was accepted, and
  * it is deliberately the same kind of evidence the wake itself is judged by -- a request body the
- * CLI sent, never a screen, a sleep, or the fact that the argument was passed. An empty capture, or
- * a capture holding only requests to some other endpoint, is not a turn.
+ * CLI sent, never a screen, a sleep, or the fact that the argument was passed.
+ *
+ * Being *some* model request is not enough, and that was a real defect here rather than a
+ * hypothetical: any inference the client makes for its own reasons would have satisfied it, and
+ * then the arm proceeds with a baseline that is not the prompt's turn while
+ * `followUpAfterInjection` compares the wake against that wrong number. So the third condition,
+ * beyond POST and the endpoint, is the body: a user message whose text *is* the prompt.
+ *
+ * Equality after trimming, not containment, because that is what every capture taken on this host
+ * shows -- the prompt arrives as a text block of its own, beside the system reminders, in all
+ * twelve arms of the three committed readings. It is the strongest test that holds on the real
+ * data, and a build that stopped sending it that way would fail the arm rather than qualify on a
+ * turn nobody checked. That direction is the right one: a refusal is visible and costs a re-take,
+ * an acceptance that was never checked is a reading that means nothing.
  */
-export const baselineTurnObserved = (capture: string): boolean => modelRequestsIn(capture).length > 0;
+export const baselineTurnObserved = (capture: string, prompt: string): boolean =>
+  modelRequestsIn(capture).some((request) => userMessageTexts(request.body).some((text) => text.trim() === prompt));
 
 export interface ProbeOptions {
   readonly shape: ProbeShape;
@@ -875,15 +949,22 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
       child.stdin.write(`${JSON.stringify({ type: "user", message: { role: "user", content: BASELINE_PROMPT } })}\n`);
     }
 
-    // Observed, never assumed. Passing the prompt is not evidence the client accepted it; the
-    // evidence is the request it sent to be inferred on, which is the same evidence the wake is
-    // judged by. No such request inside the bound fails the arm, and with it the run, so no reading
-    // is written. There is deliberately no second way to start this turn: a fallback to typing would
-    // fire on exactly the build where the argument stopped being accepted, and hide that it had.
-    const baselineSeen = await waitFor(() => baselineTurnObserved(readFileSync(capturePath, "utf8")), 120_000);
+    // Observed, never assumed, and observed as *this prompt's* turn. Passing the prompt is not
+    // evidence the client accepted it; the evidence is a request it sent to be inferred on carrying
+    // that prompt as a user message, which is the same kind of evidence the wake is judged by. Some
+    // other inference the client made for its own reasons is not this arm's baseline, and admitting
+    // one would leave `followUpAfterInjection` comparing the wake against a number that never
+    // counted the prompt. No such request inside the bound fails the arm, and with it the run, so no
+    // reading is written. There is deliberately no second way to start this turn: a fallback to
+    // typing would fire on exactly the build where the argument stopped being accepted, and hide
+    // that it had.
+    const baselineSeen = await waitFor(
+      () => baselineTurnObserved(readFileSync(capturePath, "utf8"), BASELINE_PROMPT),
+      120_000,
+    );
     if (!baselineSeen) {
       throw new Error(
-        `the client sent no baseline model request for the prompt it was started with\n${stderr}\n` +
+        `the client sent no model request carrying ${JSON.stringify(BASELINE_PROMPT)}, the prompt it was started with\n${stderr}\n` +
           `--- terminal tail, escapes deleted rather than applied; diagnosis only ---\n${strip(terminal.text()).slice(-2000)}`,
       );
     }
@@ -919,6 +1000,17 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
       imageSha256,
       baselineModelRequests,
       modelRequests: final.length,
+      // A substring over the whole body, deliberately *not* the user-message equality
+      // `baselineTurnObserved` uses, and the difference is a decision rather than an oversight.
+      // The two ask different questions. The baseline asks whether a prompt this harness chose and
+      // passed became a turn, and it arrives as a text block of its own, so equality is available
+      // and is the strongest test. The wake asks whether the frame's text reached the provider at
+      // all; the client composes where it goes, and every capture here shows the token *embedded*
+      // in prose the client wrote around it ("Another Claude session sent a message:\nACP-ROLE-WAKE
+      // ..."), so equality would report a delivery that happened as one that did not. The broad
+      // test is also the stricter requirement on the arm that matters most: the control's claim is
+      // that this count is zero, and a test that matches the token anywhere in the body is harder
+      // to satisfy that claim against than one that only looks in one place.
       wakeCarryingModelRequests: final.filter((request) => request.body.includes(ROLE_WAKE_TOKEN)).length,
       followUpAfterInjection: final.length > baselineModelRequests,
       settleCeilingMs,
@@ -1169,6 +1261,7 @@ const LIMITS: readonly string[] = [
   "The endpoint-directory policy is untouched by this slice, so registration through registerEndpoint is still refused for a socket outside the daemon state directory. See the finding of that name.",
   "Interactive start required pre-provisioned answers to the onboarding, workspace-trust and custom-API-key prompts in a throwaway config. A session whose operator answered them differently is outside this reading.",
   "The interactive arm's baseline turn is started by a positional prompt in its argv, not typed at the client's prompt. What is read here is that the wake frame reaches the model input of an interactively-invoked session and starts a turn; nothing here observes the client's terminal, so this says nothing about whether that session would have accepted a keystroke at the moment the frame arrived.",
+  "Each arm's baseline is a model request carrying the prompt as a user message whose text, trimmed, equals it. That is what every capture on this host shows, and a build that sent the same prompt in another shape would fail the arm rather than qualify on an unchecked turn. What is established is that this prompt started a turn, not that the client would have started one from any other input.",
   "settleCeilingMs is a ceiling on the post-injection wait, not a duration either arm was observed for. The control spends the whole ceiling; the injection arm returns on its first follow-up request. Two arms sharing a ceiling were watched for at most the same time, not for the same time, and the actual spans are not recorded here.",
   "Every arm executed one hard link, in a directory private to the run, to the inode digested as imageSha256 -- the command's first element names that link, which is removed with the run, and imagePath names where the inode was found. Each arm re-read the link's identity, size, modification time and digest after its measurement and would have failed the run on a difference. A rewrite of that inode in place, undone before the re-read, would not have been seen.",
   "This file does not identify the instrument that produced it. headSha is git rev-parse HEAD at receipt-build time, which can name a tree that contains no harness -- the harness may be uncommitted while the reading is taken. Unless a sourceBinding block below says otherwise, the source of this reading is UNKNOWN, and a digest computed after the fact would attest preservation since, not what executed.",

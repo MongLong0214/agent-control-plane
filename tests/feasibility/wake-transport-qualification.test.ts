@@ -175,29 +175,86 @@ describe("U6: the interactive arm keeps the shape the claim requires, and observ
     expect(isInteractiveClaudeInvocation(headless)).toBe(false);
   });
 
-  /** One line of the capture the fake provider appends: the request target as it arrived. */
-  const captured = (url: string, body = '{"model":"claude-sonnet-4-5"}'): string =>
-    `${JSON.stringify({ at: "2026-09-28T00:00:00.000Z", method: "POST", url, headers: {}, body })}\n`;
+  /**
+   * A request body of the shape the measured builds send: one user message whose content is a list
+   * of text blocks, the prompt a block of its own beside the reminders the client adds.
+   *
+   * Taken from the twelve real captures under `evidence/local/`, not invented -- a fixture that
+   * differs from what the instrument actually reads would let a test agree with a defect, which is
+   * exactly what the earlier one did.
+   */
+  const promptBody = (text: string): string =>
+    JSON.stringify({
+      model: "claude-sonnet-4-5",
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "<system-reminder>\nToday's date is 2026-09-28.\n</system-reminder>" }, { type: "text", text }],
+        },
+      ],
+    });
+
+  /** One line of the capture the fake provider appends: the request as it arrived. */
+  const captured = (url: string, body = promptBody(BASELINE_PROMPT), method = "POST"): string =>
+    `${JSON.stringify({ at: "2026-09-28T00:00:00.000Z", method, url, headers: {}, body })}\n`;
 
   it("the baseline turn is a captured model request, and nothing short of one counts as having seen it", () => {
     // Passing the prompt is not evidence it was accepted. An arm that had seen nothing, or had seen
     // only traffic to some other endpoint, has not observed a turn -- and the harness fails rather
     // than proceeding, because a baseline it assumed is a baseline the wake's follow-up is measured
     // against for nothing.
-    expect(baselineTurnObserved("")).toBe(false);
-    expect(baselineTurnObserved("\n   \n")).toBe(false);
-    expect(baselineTurnObserved(captured("/v1/models"))).toBe(false);
+    expect(baselineTurnObserved("", BASELINE_PROMPT)).toBe(false);
+    expect(baselineTurnObserved("\n   \n", BASELINE_PROMPT)).toBe(false);
+    expect(baselineTurnObserved(captured("/v1/models"), BASELINE_PROMPT)).toBe(false);
     expect(modelRequestsIn(captured("/v1/models"))).toEqual([]);
 
-    // And what does count: a request the client sent to be inferred on, the same evidence the wake
-    // itself is judged by. The path is the one the measured builds use.
-    expect(baselineTurnObserved(captured("/v1/messages?beta=true"))).toBe(true);
+    // And what does count: a request the client sent to be inferred on, carrying the prompt the arm
+    // was started with -- the same kind of evidence the wake itself is judged by. The path is the
+    // one the measured builds use.
+    expect(baselineTurnObserved(captured("/v1/messages?beta=true"), BASELINE_PROMPT)).toBe(true);
 
-    const mixed = `${captured("/v1/models")}${captured("/v1/messages?beta=true", '{"prompt":"ping"}')}`;
+    const mixed = `${captured("/v1/models")}${captured("/v1/messages?beta=true")}`;
     const kept = modelRequestsIn(mixed);
     expect(kept).toHaveLength(1);
     // The body is carried through, because it is what the wake count is read from.
-    expect(kept[0]).toMatchObject({ url: "/v1/messages?beta=true", body: '{"prompt":"ping"}' });
+    expect(kept[0]).toMatchObject({ method: "POST", url: "/v1/messages?beta=true", body: promptBody(BASELINE_PROMPT) });
+  });
+
+  it("a request to that endpoint that is not this prompt's turn is not the baseline", () => {
+    // The defect this row exists for: every case below reached the endpoint, and every one of them
+    // was accepted as the baseline when the only question asked was whether *some* model request
+    // existed. An arm that proceeds on one of these has a baseline that is not the prompt's turn,
+    // and `followUpAfterInjection` then compares the wake against a number that never counted it.
+
+    // An inference the client made for its own reasons, carrying someone else's user message.
+    expect(baselineTurnObserved(captured("/v1/messages?beta=true", promptBody("summarise this session")), BASELINE_PROMPT)).toBe(false);
+
+    // A body with no messages at all -- which the previous fixture in this file asserted was enough.
+    expect(baselineTurnObserved(captured("/v1/messages?beta=true", '{"model":"claude-sonnet-4-5"}'), BASELINE_PROMPT)).toBe(false);
+
+    // A request that asked for no inference: this provider answers a GET to the same path with a
+    // 404, so it began no turn and is not one to count.
+    expect(baselineTurnObserved(captured("/v1/messages?beta=true", "", "GET"), BASELINE_PROMPT)).toBe(false);
+    expect(modelRequestsIn(captured("/v1/messages?beta=true", promptBody(BASELINE_PROMPT), "GET"))).toEqual([]);
+
+    // A body this reader does not recognise contributes nothing rather than throwing: it reads a
+    // foreign process's output, and an unparseable body is a baseline it has not seen, not a crash.
+    expect(baselineTurnObserved(captured("/v1/messages?beta=true", "<html>502</html>"), BASELINE_PROMPT)).toBe(false);
+
+    // The prompt in the assistant's turn rather than the user's is the model's text, not the arm's.
+    const echoed = JSON.stringify({ messages: [{ role: "assistant", content: [{ type: "text", text: BASELINE_PROMPT }] }] });
+    expect(baselineTurnObserved(captured("/v1/messages?beta=true", echoed), BASELINE_PROMPT)).toBe(false);
+
+    // The controls, so this is a row about which request is the baseline and not one that refuses
+    // everything: the real thing counts, a string `content` counts -- the shape of the frame the
+    // headless arm writes on stdin -- and one real turn beside all the refused ones is still seen.
+    const asString = JSON.stringify({ messages: [{ role: "user", content: BASELINE_PROMPT }] });
+    expect(baselineTurnObserved(captured("/v1/messages?beta=true", asString), BASELINE_PROMPT)).toBe(true);
+    const noise = captured("/v1/messages?beta=true", promptBody("summarise this session"));
+    expect(baselineTurnObserved(`${noise}${captured("/v1/messages?beta=true")}`, BASELINE_PROMPT)).toBe(true);
+    // Still two turns for the follow-up to count, though only one of them was the baseline: the
+    // wake count and the baseline ask different questions of the same capture.
+    expect(modelRequestsIn(`${noise}${captured("/v1/messages?beta=true")}`)).toHaveLength(2);
   });
 
   it("a count-tokens request is a request about a turn, and is not one", () => {
@@ -207,14 +264,14 @@ describe("U6: the interactive arm keeps the shape the claim requires, and observ
     // would go on to measure the wake's follow-up against a baseline that never happened.
     const countTokens = captured("/v1/messages/count_tokens");
     expect(modelRequestsIn(countTokens)).toEqual([]);
-    expect(baselineTurnObserved(countTokens)).toBe(false);
-    expect(baselineTurnObserved(`${countTokens}${captured("/v1/messages/count_tokens?beta=true")}`)).toBe(false);
+    expect(baselineTurnObserved(countTokens, BASELINE_PROMPT)).toBe(false);
+    expect(baselineTurnObserved(`${countTokens}${captured("/v1/messages/count_tokens?beta=true")}`, BASELINE_PROMPT)).toBe(false);
 
     // The control, so this is a row about the endpoint and not a row that refuses everything: the
     // endpoint itself counts, with a query string and without, and a count-tokens request beside a
     // real one does not inflate the count the follow-up is compared against.
-    expect(baselineTurnObserved(captured("/v1/messages"))).toBe(true);
-    expect(baselineTurnObserved(captured("/v1/messages?beta=true"))).toBe(true);
+    expect(baselineTurnObserved(captured("/v1/messages"), BASELINE_PROMPT)).toBe(true);
+    expect(baselineTurnObserved(captured("/v1/messages?beta=true"), BASELINE_PROMPT)).toBe(true);
     expect(modelRequestsIn(`${countTokens}${captured("/v1/messages?beta=true")}`)).toHaveLength(1);
   });
 });

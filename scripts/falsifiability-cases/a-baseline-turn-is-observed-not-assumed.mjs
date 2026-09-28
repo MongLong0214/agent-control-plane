@@ -17,8 +17,10 @@ const aBaselineTurnIsObservedNotAssumed = {
   id: "a-baseline-turn-is-observed-not-assumed",
   what: "the harness requires a captured model request before it accepts that the baseline turn happened",
   file: "tests/feasibility/wake-transport-qualification/harness.ts",
-  find: "export const baselineTurnObserved = (capture: string): boolean => modelRequestsIn(capture).length > 0;\n",
-  replace: "export const baselineTurnObserved = (_capture: string): boolean => true;\n",
+  find:
+    "export const baselineTurnObserved = (capture: string, prompt: string): boolean =>\n" +
+    "  modelRequestsIn(capture).some((request) => userMessageTexts(request.body).some((text) => text.trim() === prompt));\n",
+  replace: "export const baselineTurnObserved = (_capture: string, _prompt: string): boolean => true;\n",
   killedBy: [
     "tests/feasibility/wake-transport-qualification.test.ts::the baseline turn is a captured model request, and nothing short of one counts as having seen it",
   ],

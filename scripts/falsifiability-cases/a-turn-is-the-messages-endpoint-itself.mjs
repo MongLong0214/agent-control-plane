@@ -16,8 +16,8 @@ const aTurnIsTheMessagesEndpointItself = {
   id: "a-turn-is-the-messages-endpoint-itself",
   what: "the harness counts a request as a turn only when its endpoint is /v1/messages, not when the path merely contains it",
   file: "tests/feasibility/wake-transport-qualification/harness.ts",
-  find: "    .filter((request) => requestEndpoint(request.url) === MESSAGES_ENDPOINT);\n",
-  replace: "    .filter((request) => request.url.includes(MESSAGES_ENDPOINT));\n",
+  find: '    (request) => request.method === "POST" && requestEndpoint(request.url) === MESSAGES_ENDPOINT,\n',
+  replace: '    (request) => request.method === "POST" && request.url.includes(MESSAGES_ENDPOINT),\n',
   killedBy: [
     "tests/feasibility/wake-transport-qualification.test.ts::a count-tokens request is a request about a turn, and is not one",
   ],
