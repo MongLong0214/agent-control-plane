@@ -23,6 +23,7 @@ import {
   readReadings,
   readingFileName,
   recordReading,
+  type ObservedText,
   type ProbeRun,
   type ProbeShape,
   type QualificationReceipt,
@@ -376,6 +377,61 @@ describe("the qualified set and its readings must agree", () => {
       resting("2.1.268", "arm 1 (interactive injection) states followUpAfterInjection as true, and its own observations give false"),
       'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
     ]);
+  });
+
+  it("an arm carrying a text it neither records nor accounts for is refused", () => {
+    // A committed observation shows verbatim only what the counts are read from: the arm's prompt
+    // and any text carrying the wake token. Everything else -- most of it the client's own system
+    // prompt, which a public repository has no business republishing -- travels as a length and a
+    // digest. That leaves one way to drop content without a reader seeing it: an entry with neither
+    // the text nor the account. This refuses that, so what a reader recomputes the counts over is
+    // the whole of the model input and not the part that survived.
+    const members = [build("2.1.268")];
+    const [interactiveInjection, interactiveControl, headlessInjection, headlessControl] = arms();
+    const others = [interactiveControl!, headlessInjection!, headlessControl!];
+    const requests = interactiveInjection!.observations!.requests;
+    const withTexts = (texts: readonly ObservedText[]): ProbeRun => ({
+      ...interactiveInjection!,
+      observations: {
+        ...interactiveInjection!.observations!,
+        requests: [{ ...requests[0]!, texts }, ...requests.slice(1)],
+      },
+    });
+
+    // A digest that is not a digest accounts for nothing, and neither does a negative length. Both
+    // are shapes a hand-written or edited record takes; the reading is refused rather than read.
+    expect(
+      qualificationDisagreements(members, [
+        withArms([
+          withTexts([
+            ...requests[0]!.texts,
+            { from: "system", withheld: "not this arm's evidence", length: 4096, sha256: "not-a-digest" },
+          ]),
+          ...others,
+        ]),
+      ]),
+    ).toEqual([
+      resting("2.1.268", "arm 1 (interactive injection) carries 1 model-input text(s) it neither records nor accounts for by a length and digest"),
+      'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+    ]);
+    expect(
+      qualificationDisagreements(members, [
+        withArms([
+          withTexts([
+            ...requests[0]!.texts,
+            { from: "system", withheld: "not this arm's evidence", length: -1, sha256: "f".repeat(64) },
+          ]),
+          ...others,
+        ]),
+      ]),
+    ).toEqual([
+      resting("2.1.268", "arm 1 (interactive injection) carries 1 model-input text(s) it neither records nor accounts for by a length and digest"),
+      'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+    ]);
+
+    // The control: the arm as the instrument wrote it, whose texts are all kept or accounted for,
+    // is admitted -- so this is not a rule that refuses every record.
+    expect(qualificationDisagreements(members, [withArms([interactiveInjection!, ...others])])).toEqual([]);
   });
 
   it("a reading of a build outside the set is a failure, whatever its verdict", () => {

@@ -53,6 +53,7 @@ import {
   readReadings,
   runQualificationProbe,
   wakeCarryingTurnsIn,
+  withholdText,
   type HeldImage,
   type PinnedClaudeImage,
   type ProbeRun,
@@ -385,7 +386,9 @@ describe("U6: the interactive arm keeps the shape the claim requires, and observ
  * The captures these are read from live under `evidence/local/`, which is gitignored, so before
  * this a reader of the repository had a file stating how many turns it saw and no way to check it.
  * These rows are about the record that closes that: it is derived by the instrument, it carries
- * what the acceptance rule reads, and it refuses to carry an account's home directory.
+ * what the acceptance rule reads, it refuses to carry an account's home directory, and it withholds
+ * every text the rule does not read -- because this repository is public and most of a request's
+ * model input is the client's own system prompt, which is not ours to republish.
  *
  * What it cannot establish is that a live client produced any of it -- an observation list written
  * by hand derives exactly as well as a measured one. That is #1012, not this.
@@ -398,10 +401,18 @@ describe("U6: an arm's counts are derived from the observations committed with i
       )
       .join("");
 
+  const digest = (text: string): string => createHash("sha256").update(Buffer.from(text, "utf8")).digest("hex");
+  const withheld = (from: string, text: string): Record<string, unknown> => ({
+    from,
+    withheld: "not this arm's evidence",
+    length: Buffer.byteLength(text, "utf8"),
+    sha256: digest(text),
+  });
+
   const turn = (text: string, role = "user"): string =>
     JSON.stringify({ model: "claude-sonnet-4-5", system: [{ type: "text", text: "You are Claude." }], messages: [{ role, content: [{ type: "text", text }] }] });
 
-  it("keeps each request's time, method, URL and model input, and digests the capture they came from", () => {
+  it("keeps each request's time, method and URL, and digests the capture they came from", () => {
     const raw = capture(
       ["POST", "/v1/messages?beta=true", turn(BASELINE_PROMPT)],
       ["POST", "/v1/messages?beta=true", turn(`Another Claude session sent a message:\n${ROLE_WAKE_TOKEN}`)],
@@ -411,9 +422,10 @@ describe("U6: an arm's counts are derived from the observations committed with i
     expect(observations.requests).toHaveLength(2);
     expect(observations.requests[0]).toMatchObject({ at: "2026-09-28T00:00:00.000Z", method: "POST", url: "/v1/messages?beta=true" });
     // The model input, labelled by where it came from -- which is what lets one record answer both
-    // questions: the baseline is a *user* text, and the wake is any model input at all.
+    // questions: the baseline is a *user* text, and the wake is any model input at all. The prompt
+    // is kept because the baseline is read from it; the system block is accounted for instead.
     expect(observations.requests[0]?.texts).toEqual([
-      { from: "system", text: "You are Claude." },
+      withheld("system", "You are Claude."),
       { from: "user", text: BASELINE_PROMPT },
     ]);
     // The headers are not in it. The capture keeps them; this is the part the model was asked, and
@@ -468,6 +480,69 @@ describe("U6: an arm's counts are derived from the observations committed with i
     // The control: the same capture without it goes through, so this is not a reader that refuses
     // everything. Measured across the twelve arms of the three committed readings: none carries one.
     expect(() => observationsFrom(capture(["POST", "/v1/messages?beta=true", turn("Working directory: /private/tmp/acp-u6q-x/w")]))).not.toThrow();
+  });
+
+  it("keeps the texts its counts are read from, and withholds every other by kind, length and digest", () => {
+    // Why: the readings are committed to a public repository, and a request's model input is mostly
+    // the client's own system prompt -- vendor product text, and provider and model detail that has
+    // no place in a public artefact. It is also 96% of the bytes. What the counts read is small and
+    // is ours: the prompt this harness sent, and the prose the runtime composed around our token.
+    const system = "You are Claude Code, a CLI. <the vendor's system prompt continues for pages>";
+    const prose = `Another Claude session sent a message:\n${ROLE_WAKE_TOKEN}\nRead your inbox.`;
+    const aside = "summarise this session";
+    const raw = capture([
+      "POST",
+      "/v1/messages?beta=true",
+      JSON.stringify({
+        system: [{ type: "text", text: system }],
+        messages: [{ role: "user", content: [{ type: "text", text: prose }, { type: "text", text: aside }] }],
+      }),
+    ]);
+    const observations = observationsFrom(raw);
+
+    // The wake-carrying text travels in full -- it is what the injection arm exists to show -- and
+    // everything else is a kind, a length and a digest.
+    expect(observations.requests[0]?.texts).toEqual([
+      withheld("system", system),
+      { from: "user", text: prose },
+      withheld("user", aside),
+    ]);
+    // And the withheld texts are not in the file by any other route.
+    const written = JSON.stringify(observations);
+    expect(written).not.toContain("the vendor's system prompt");
+    expect(written).not.toContain(aside);
+    // The count is the same count: a text that is neither the prompt nor a carrier of the token was
+    // counted nowhere before it was withheld either, so this is a publication decision and not a
+    // measurement one.
+    expect(countsFrom(observations).wakeCarryingModelRequests).toBe(1);
+    expect(wakeCarryingTurnsIn(raw)).toHaveLength(1);
+
+    // Evidence is judged on the text the model reads, so a token that was JSON-escaped on the wire
+    // is kept -- the same question `wakeCarryingTurnsIn` asks, asked by the writer.
+    const escaped = `{"messages":[{"role":"user","content":[{"type":"text","text":"ACP-ROLE-WAK\\u0045 arrived"}]}]}`;
+    expect(observationsFrom(capture(["POST", "/v1/messages?beta=true", escaped])).requests[0]?.texts).toEqual([
+      { from: "user", text: `${ROLE_WAKE_TOKEN} arrived` },
+    ]);
+  });
+
+  it("refuses to withhold a text carrying the token or equal to the prompt, rather than hiding it", () => {
+    // The property that makes the control arm's zero mean anything. If a token-carrying text could
+    // be recorded as "not evidence", that zero would be a statement about what was published rather
+    // than about what was measured -- so the writer classifies, and being asked to withhold the
+    // measurement stops the run. Nothing on the production path asks it to; this is the guard
+    // against a later change to the classification quietly shrinking what a reading shows.
+    expect(() => withholdText("system", `preamble ${ROLE_WAKE_TOKEN} tail`)).toThrow(/cannot be withheld/);
+    expect(() => withholdText("user", `  ${BASELINE_PROMPT}  `)).toThrow(/cannot be withheld/);
+
+    // The control: an ordinary text is withheld, and its record is what a reader gets -- the length
+    // in UTF-8 bytes and the digest over those same bytes, so an operator holding the raw capture
+    // can check both without guessing an encoding.
+    expect(withholdText("system", "You are Claude.")).toEqual({
+      from: "system",
+      withheld: "not this arm's evidence",
+      length: 15,
+      sha256: digest("You are Claude."),
+    });
   });
 });
 
