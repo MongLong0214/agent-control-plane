@@ -15,8 +15,8 @@ const observationsAreDigestedFromTheCaptureTheyRead = {
   id: "observations-are-digested-from-the-capture-they-read",
   what: "an arm's observation record carries the SHA-256 of the capture bytes it was built from",
   file: "tests/feasibility/wake-transport-qualification/harness.ts",
-  find: '  return { rawCaptureSha256: createHash("sha256").update(Buffer.from(capture, "utf8")).digest("hex"), requests };\n',
-  replace: '  return { rawCaptureSha256: createHash("sha256").update("").digest("hex"), requests };\n',
+  find: '    rawCaptureSha256: createHash("sha256").update(Buffer.from(capture, "utf8")).digest("hex"),\n',
+  replace: '    rawCaptureSha256: createHash("sha256").update("").digest("hex"),\n',
   killedBy: [
     "tests/feasibility/wake-transport-qualification.test.ts::keeps each request's time, method and URL, and digests the capture they came from",
   ],

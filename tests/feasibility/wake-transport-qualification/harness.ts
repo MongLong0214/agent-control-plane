@@ -230,14 +230,15 @@ export interface ProbeRun {
    */
   readonly observations?: ArmObservations;
   /**
-   * Model requests up to and including the one that carried this arm's prompt -- the turn the
-   * frame was written after. Derived from `observations`, never counted separately; see
-   * `countsFrom` for what that changes and what it costs.
+   * Model requests the capture already held when this arm's frame was written -- the turns the
+   * follow-up is measured against. Derived from the boundary the arm recorded in `observations`
+   * (`InjectionBoundary`), never from which request carries the prompt: that reconstruction counted
+   * a wake-carrying turn that *preceded* the frame as the follow-up it caused.
    */
   readonly baselineModelRequests: number;
   readonly modelRequests: number;
   readonly wakeCarryingModelRequests: number;
-  /** Whether a model request arrived that the baseline had not already produced. */
+  /** Whether a model request arrived after the recorded boundary -- after the frame, when one was written. */
   readonly followUpAfterInjection: boolean;
   /**
    * The ceiling on the post-injection wait -- not the span either arm was observed for.
@@ -1019,6 +1020,35 @@ export interface ObservedRequest {
 }
 
 /**
+ * Where the frame was written, as the arm observed it rather than as a reader reconstructs it.
+ *
+ * `requestsBefore` is how many requests the capture held at the moment this arm wrote its frame --
+ * an index into `ArmObservations.requests`, which is the same append-only sequence read later: the
+ * fake provider appends a line per request and never rewrites one, so request *n* of the capture
+ * read at the end is request *n* of the capture read here. Everything before that index existed
+ * before the frame; everything from it existed only after.
+ *
+ * This exists because the alternative was measured and is wrong. The counts were briefly derived
+ * by *finding* the baseline -- taking the position of the turn carrying the arm's prompt -- which
+ * answers "where is the prompt in the sequence" and not "what had happened when the frame was
+ * written". A session that sends its prompt, then a turn carrying the wake token, and then ignores
+ * the injected frame entirely was admitted by that derivation in all four arms: the token-carrying
+ * turn sat after the prompt's turn, so it was read as a follow-up caused by a frame it preceded.
+ * A recorded boundary cannot be read that way -- that turn is before it, and the arm fails.
+ *
+ * `frameWritten` is stated rather than implied by the count. The control arm writes no frame, and
+ * its `requestsBefore` is the point at which the injection arm would have written one; without the
+ * flag, "no frame" and "a frame at position 0" would be the same record. It is set only after
+ * `writeWakeFrame` returns, so it says the frame was written and not that one was intended.
+ */
+export interface InjectionBoundary {
+  /** Whether a frame was written at this point at all. The control arm records `false`. */
+  readonly frameWritten: boolean;
+  /** How many requests the capture already held when it was. */
+  readonly requestsBefore: number;
+}
+
+/**
  * What one arm observed, committed beside the counts it is summarised by.
  *
  * The counts in a reading used to be free-standing integers: the file stated how many turns it saw
@@ -1042,6 +1072,17 @@ export interface ArmObservations {
    * copy is the copy these observations were taken from.
    */
   readonly rawCaptureSha256: string;
+  /**
+   * Where in `requests` the frame was written, recorded by the arm that wrote it.
+   *
+   * Optional in the *type* because a committed reading is parsed JSON and the readings written
+   * before this field existed carry no such key. It is not optional in a committed reading:
+   * `qualificationShortfalls` refuses an arm whose observations do not carry it, because without it
+   * "before the frame" and "after the frame" are inferred from the content of the requests rather
+   * than read from an observation -- which is exactly the inference that admitted a build that
+   * ignored the wake.
+   */
+  readonly boundary?: InjectionBoundary;
   readonly requests: readonly ObservedRequest[];
 }
 
@@ -1115,8 +1156,17 @@ const HOME_PATH = /\/(?:Users|home)\/[^/\s"']+/;
  * the token is counted nowhere -- and it is what keeps a public receipt from republishing the
  * client's system prompt. `prompt` is the arm's own prompt, so the classification is made against
  * the same value the counts are.
+ *
+ * `boundary` is required and has no default: it is the one fact here that cannot be read off the
+ * capture (`InjectionBoundary`), and a default would be this function inventing the observation the
+ * counts are split by. A boundary outside the requests observed splits nothing, so it is refused
+ * here rather than silently clamped -- the arm fails and no reading is written.
  */
-export const observationsFrom = (capture: string, prompt: string = BASELINE_PROMPT): ArmObservations => {
+export const observationsFrom = (
+  capture: string,
+  boundary: InjectionBoundary,
+  prompt: string = BASELINE_PROMPT,
+): ArmObservations => {
   const clean = (value: string): string => {
     const redacted = redactHome(value);
     if (HOME_PATH.test(redacted)) {
@@ -1130,7 +1180,80 @@ export const observationsFrom = (capture: string, prompt: string = BASELINE_PROM
     url: clean(request.url),
     texts: modelInputTexts(request.body).map(({ from, text }) => observedText(clean(from), clean(text), prompt)),
   }));
-  return { rawCaptureSha256: createHash("sha256").update(Buffer.from(capture, "utf8")).digest("hex"), requests };
+  if (!Number.isInteger(boundary.requestsBefore) || boundary.requestsBefore < 0 || boundary.requestsBefore > requests.length) {
+    throw new Error(
+      `the injection boundary is at request ${boundary.requestsBefore} of a capture holding ${requests.length}: ` +
+        "a boundary outside the requests observed divides them into nothing a count can be read from",
+    );
+  }
+  return {
+    rawCaptureSha256: createHash("sha256").update(Buffer.from(capture, "utf8")).digest("hex"),
+    // Copied field by field, never spread: what a caller hands in is an argument, and what is
+    // written into a committed reading is these two facts and no others it happened to carry.
+    boundary: { frameWritten: boundary.frameWritten, requestsBefore: boundary.requestsBefore },
+    requests,
+  };
+};
+
+/**
+ * The texts of one observed request a reader can read: the ones kept verbatim.
+ *
+ * Only the kept texts have content, and reading the counts off them is not a narrowing: a withheld
+ * text is one the writer established no count is read from (`withholdText` refuses the rest), so it
+ * was counted nowhere before it was withheld either. Read from parsed JSON, so an entry can be any
+ * shape; one with no string `text` is a withheld entry as far as this is concerned, and
+ * `qualificationShortfalls` is where a record that neither keeps nor accounts for a text is refused.
+ */
+const keptTexts = (request: ObservedRequest): readonly KeptText[] => {
+  const entries = Array.isArray(request?.texts) ? request.texts : [];
+  return entries.flatMap((entry) =>
+    entry !== null && typeof entry === "object" && "text" in entry && typeof entry.text === "string"
+      ? [{ from: `${entry.from}`, text: entry.text }]
+      : [],
+  );
+};
+
+/** Whether one observed request is a turn, by the same rule the live capture is read with. */
+const isObservedTurn = (request: ObservedRequest): boolean =>
+  isModelRequest({ method: `${request?.method}`, url: `${request?.url}` });
+
+/**
+ * How many of an arm's observed requests preceded its recorded boundary.
+ *
+ * Read from parsed JSON, so the boundary can be missing or be something that is not a count. Then
+ * the whole sequence is "before": no follow-up can be claimed out of a record that does not say
+ * where the frame went, which fails an injection arm rather than admitting it.
+ * `qualificationShortfalls` refuses such a record outright -- this is only what the counts say
+ * while it is being refused, and it is deliberately the direction that refuses.
+ */
+const requestsBeforeBoundary = (observations: ArmObservations): number => {
+  const requests = Array.isArray(observations?.requests) ? observations.requests : [];
+  const at = (observations?.boundary ?? {}).requestsBefore;
+  if (typeof at !== "number" || !Number.isInteger(at) || at < 0) return requests.length;
+  return Math.min(at, requests.length);
+};
+
+/**
+ * Whether the arm's own prompt started a turn *before* the frame was written.
+ *
+ * The baseline is a position now rather than a search (`countsFrom`), so nothing in the counts
+ * alone says the turns before the boundary include the one this arm's prompt started. The probe
+ * refuses to write a reading without it (`baselineTurnObserved`); this is the same question asked
+ * of a committed file, where the prompt's user text is one of the two things kept verbatim.
+ *
+ * `from === "user"`, because the model's own words echoed back in an assistant turn are not
+ * evidence that the prompt was accepted -- the same condition `baselineTurnObserved` applies to the
+ * live capture.
+ */
+export const baselineTurnBeforeBoundary = (
+  observations: ArmObservations,
+  prompt: string = BASELINE_PROMPT,
+): boolean => {
+  const requests = Array.isArray(observations?.requests) ? observations.requests : [];
+  return requests
+    .slice(0, requestsBeforeBoundary(observations))
+    .filter(isObservedTurn)
+    .some((turn) => keptTexts(turn).some(({ from, text }) => from === "user" && text.trim() === prompt));
 };
 
 /**
@@ -1141,43 +1264,31 @@ export const observationsFrom = (capture: string, prompt: string = BASELINE_PROM
  * observations and reports a difference. So a number in a reading is a claim about an observation
  * beside it, not a free-standing integer.
  *
- * **The baseline is the position of the prompt's own turn**, not a count taken at the moment the
- * arm stopped waiting. That is what makes it derivable at all: the prompt's turn is identifiable in
- * the observations, and the moment the probe read the file is not. The two differ if the client
- * takes a turn of its own between the prompt's turn and the injection point -- then the extra turn
- * is counted as a follow-up, the control arm's criterion fails, and the run is refused. A refusal
- * is the direction to be wrong in here, and no capture on this host has ever shown one.
+ * **The baseline is the recorded boundary**, not the position of the prompt's turn. The difference
+ * is not a refinement; it is the defect this function had and it admitted a build that ignores the
+ * wake. Taking the prompt's position asks where the prompt is in the sequence, and the question the
+ * counts have to answer is what had already happened when the frame was written. A session that
+ * emits its prompt, then a turn carrying the wake token, and then ignores the injected frame was
+ * admitted in all four arms by the positional reading -- the token-carrying turn came after the
+ * prompt's turn, so it was counted as the follow-up the frame caused, though it preceded the frame.
+ * Against a boundary the arm *recorded*, that turn is before the frame, no follow-up exists, and
+ * the injection arms fail. See `InjectionBoundary`.
+ *
+ * `followUpAfterInjection` is read from the same split rather than from `modelRequests >
+ * baselineModelRequests`: the requests are one append-ordered sequence, so the two agree by
+ * construction, and `qualificationShortfalls` checks that a reading's stated pair agrees too.
  */
-export const countsFrom = (observations: ArmObservations, prompt: string = BASELINE_PROMPT): ArmCounts => {
-  const requests = Array.isArray(observations.requests) ? observations.requests : [];
-  const turns = requests.filter(
-    (request) => isModelRequest({ method: `${request?.method}`, url: `${request?.url}` }),
-  );
-  // Only the kept texts have content to read, and that is not a narrowing of the counts: a
-  // withheld text is one the writer established is neither the prompt nor a carrier of the token
-  // (`withholdText` refuses the rest), so it was counted nowhere before it was withheld either.
-  // Read from parsed JSON, so an entry can be any shape; one with no string `text` is a withheld
-  // entry as far as this is concerned, and `qualificationShortfalls` is where a record that neither
-  // keeps nor accounts for a text is refused.
-  const texts = (request: ObservedRequest): readonly KeptText[] => {
-    const entries = Array.isArray(request.texts) ? request.texts : [];
-    return entries.flatMap((entry) =>
-      entry !== null && typeof entry === "object" && "text" in entry && typeof entry.text === "string"
-        ? [{ from: `${entry.from}`, text: entry.text }]
-        : [],
-    );
-  };
-  const promptTurn = turns.findIndex((turn) =>
-    texts(turn).some(({ from, text }) => from === "user" && typeof text === "string" && text.trim() === prompt),
-  );
-  const baselineModelRequests = promptTurn < 0 ? 0 : promptTurn + 1;
+export const countsFrom = (observations: ArmObservations): ArmCounts => {
+  const requests = Array.isArray(observations?.requests) ? observations.requests : [];
+  const before = requestsBeforeBoundary(observations);
+  const turns = requests.filter(isObservedTurn);
   return {
-    baselineModelRequests,
+    baselineModelRequests: requests.slice(0, before).filter(isObservedTurn).length,
     modelRequests: turns.length,
     wakeCarryingModelRequests: turns.filter((turn) =>
-      texts(turn).some(({ text }) => typeof text === "string" && text.includes(ROLE_WAKE_TOKEN)),
+      keptTexts(turn).some(({ text }) => text.includes(ROLE_WAKE_TOKEN)),
     ).length,
-    followUpAfterInjection: turns.length > baselineModelRequests,
+    followUpAfterInjection: requests.slice(before).some(isObservedTurn),
   };
 };
 
@@ -1381,10 +1492,20 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
           `--- terminal tail, escapes deleted rather than applied; diagnosis only ---\n${strip(terminal.text()).slice(-2000)}`,
       );
     }
-    const baselineModelRequests = modelRequests().length;
+    // One read, and both numbers come out of it. Two reads can straddle a request that arrived
+    // between them, and then the boundary this arm records would not be the boundary its baseline
+    // was counted at. `requestsBefore` counts *every* captured request, not only the turns: it is
+    // an index into the sequence `observationsFrom` records, which is that same sequence.
+    const atBoundary = readFileSync(capturePath, "utf8");
+    const requestsBefore = capturedRequests(atBoundary).length;
+    const baselineModelRequests = modelRequestsIn(atBoundary).length;
+    // Set after `writeWakeFrame` returns, never before, so the record says a frame was written and
+    // not that one was meant to be. A throw from the write fails the arm, and with it the run.
+    let frameWritten = false;
 
     if (options.inject) {
       await writeWakeFrame(socketPath);
+      frameWritten = true;
       // Returns as soon as the follow-up appears, so this arm's observed span is at most the
       // ceiling and in practice less. The ceiling is what the two arms share; the observed span
       // is not, and nothing here records it.
@@ -1407,7 +1528,10 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
     const imageSha256 = confirmHeld(image);
     // Built before anything is written: a capture carrying a path this harness cannot redact fails
     // the arm here rather than reaching a committed file.
-    const observations = observationsFrom(finalCapture);
+    // The boundary travels with the observations because it is the one fact about them that cannot
+    // be read back off the capture: which requests existed before the frame. Derived instead -- by
+    // taking the prompt's position -- it admitted a session that ignored the wake entirely.
+    const observations = observationsFrom(finalCapture, { frameWritten, requestsBefore });
     const counts = countsFrom(observations);
     mkdirSync(durableDir, { recursive: true });
     // The snapshot, not a second copy of the file: `observations.rawCaptureSha256` is the digest of
@@ -1505,6 +1629,13 @@ const armLabel = (arm: { readonly shape: ProbeShape; readonly injected: boolean 
  *   re-derived from it here by the calculation the probe recorded them with (`countsFrom`), and a
  *   difference is a shortfall. An arm with no observations is refused: absence is the case that was
  *   slipping through.
+ * - **A boundary that was observed, not reconstructed.** Each arm records where in its own request
+ *   sequence the frame was written (`InjectionBoundary`), and the baseline and the follow-up are
+ *   read off that split on both sides. Deriving the boundary instead -- from the position of the
+ *   turn carrying the arm's prompt -- admitted a session whose wake-carrying turn preceded the
+ *   frame it then ignored, in all four arms. An arm with no recorded boundary is refused, as is one
+ *   whose boundary contradicts whether the arm says it injected, or that shows no turn carrying its
+ *   own prompt before that point.
  * - **Every observed text shown or accounted for.** A committed observation carries verbatim only
  *   the texts the counts are read from -- the arm's prompt and anything carrying the wake token --
  *   because this repository is public and the rest of what a request puts in front of the model is
@@ -1582,6 +1713,40 @@ export const qualificationShortfalls = (runs: readonly ProbeRun[]): readonly str
     } else {
       if (!/^[0-9a-f]{64}$/.test(observations.rawCaptureSha256)) {
         shortfalls.push(`${where} does not bind its observations to the digest of a raw capture`);
+      }
+      // Where the frame went, read rather than reconstructed. Without this an arm's "before" and
+      // "after" are inferred from which request carries a prompt, and a session whose wake-carrying
+      // turn *precedes* the frame it then ignores is admitted as one the frame woke -- reproduced
+      // against the real probe, in all four arms. So a record that does not say is refused here,
+      // and one that says something its own arm contradicts is refused too.
+      const boundary = observations.boundary;
+      if (
+        boundary === undefined ||
+        typeof boundary.frameWritten !== "boolean" ||
+        !Number.isInteger(boundary.requestsBefore) ||
+        boundary.requestsBefore < 0 ||
+        boundary.requestsBefore > observations.requests.length
+      ) {
+        shortfalls.push(
+          `${where} does not record where in the requests it observed the frame was written, so which of them ` +
+            `preceded it is a guess`,
+        );
+      } else {
+        if (boundary.frameWritten !== run.injected) {
+          shortfalls.push(
+            `${where} is recorded as ${run.injected ? "an injection" : "a control"} arm, and its observations say a ` +
+              `frame ${boundary.frameWritten ? "was" : "was not"} written`,
+          );
+        }
+        // The baseline is a position now, so nothing in the counts says the turns before the
+        // boundary include the one this arm's prompt started. The probe will not proceed without it
+        // (`baselineTurnObserved`); this asks the same question of the committed file.
+        if (!baselineTurnBeforeBoundary(observations)) {
+          shortfalls.push(
+            `${where} shows no turn carrying the prompt it was started with before that point, so its baseline ` +
+              `counts turns that are not the prompt's`,
+          );
+        }
       }
       // Every text is either readable here or accounted for by a length and a digest. Without
       // this, a record could drop content by writing an entry with neither -- the counts would be
@@ -1886,7 +2051,7 @@ const LIMITS: readonly string[] = [
   "settleCeilingMs is a ceiling on the post-injection wait, not a duration either arm was observed for. The control spends the whole ceiling; the injection arm returns on its first follow-up request. Two arms sharing a ceiling were watched for at most the same time, not for the same time, and the actual spans are not recorded here.",
   "Every arm executed one hard link, in a directory private to the run, to the inode digested as imageSha256 -- the command's first element names that link, which is removed with the run, and imagePath names where the inode was found. Each arm re-read the link's identity, size, modification time and digest after its measurement and would have failed the run on a difference. A rewrite of that inode in place, undone before the re-read, would not have been seen.",
   "The verdict in this file is recomputed from the runs in it, by the one calculation the instrument writes it with, and a reader that admits this reading recomputes it again rather than reading the field. That establishes internal consistency and nothing more: every fact it checks is a statement inside this file. A file written from nothing, with all its fields made to agree, satisfies it. Whether the arms it describes ever ran is a question the raw captures and session logs it points at answer, and this check does not ask them.",
-  "Each arm carries the observations its counts are derived from -- every captured request's time, method and URL -- and both the instrument and the reader derive the four counts from them rather than reading integers. What that removes is a count that stood on nothing; what it does not do is attest that a live client produced the observations. An observation list written by hand derives exactly as well as a measured one, and this file cannot tell them apart.",
+  "Each arm carries the observations its counts are derived from -- every captured request's time, method and URL, and the point in that sequence at which the frame was written -- and both the instrument and the reader derive the four counts from them rather than reading integers. The boundary is recorded by the arm that wrote the frame, not inferred from which request carries the prompt: inferring it counted a wake-carrying turn that preceded the frame as the follow-up the frame caused. What that removes is a count that stood on nothing; what it does not do is attest that a live client produced the observations, or that the recorded boundary is where the frame really went. An observation list written by hand derives exactly as well as a measured one, and this file cannot tell them apart.",
   "Of each request's model input, this file carries verbatim only what the counts are read from: the arm's prompt, and any text containing the wake token. Every other text -- most of it the client's own system prompt, which is not ours to publish -- is recorded as its kind, its length in UTF-8 bytes and its SHA-256. So a reader of the repository can recompute the four counts over the texts that are here and see that every other text is accounted for by a digest; a reader cannot see what a withheld text said. Recomputing the counts over their contents needs the raw capture named by rawCaptureSha256, which is not committed. The instrument refuses to withhold a text carrying the token or equal to the prompt, so the kept texts are the evidence and not a selection from it -- but that is a property of the code that wrote this file, not a fact this file establishes. What is checked of the file itself is the other direction: a reading carrying a verbatim text that none of its counts are read from is refused rather than admitted.",
   "The observations are bound to each arm's raw capture by that capture's SHA-256. The capture itself is under evidence/local/, which is not committed, so a reader without that file cannot check the digest, and a reader with it learns only that the copy in hand is the one these observations were read from.",
   "This file does not identify the instrument that produced it. headSha is git rev-parse HEAD at receipt-build time, which can name a tree that contains no harness -- the harness may be uncommitted while the reading is taken. Unless a sourceBinding block below says otherwise, the source of this reading is UNKNOWN, and a digest computed after the fact would attest preservation since, not what executed.",

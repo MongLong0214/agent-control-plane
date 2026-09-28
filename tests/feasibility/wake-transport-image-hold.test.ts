@@ -136,7 +136,7 @@ describe("a qualification run holds one image for its whole length", () => {
       return `${turn(BASELINE_PROMPT)}${injected ? turn(`a peer wrote: ${ROLE_WAKE_TOKEN}`) : ""}`;
     };
     const arm = (shape: ProbeShape, injected: boolean, imageSha256: string | undefined): ProbeRun => {
-      const observations = observationsFrom(captureOf(injected));
+      const observations = observationsFrom(captureOf(injected), { frameWritten: injected, requestsBefore: 1 });
       return {
         shape,
         injected,

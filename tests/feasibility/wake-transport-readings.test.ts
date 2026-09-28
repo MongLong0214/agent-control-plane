@@ -23,6 +23,7 @@ import {
   readReadings,
   readingFileName,
   recordReading,
+  type ArmObservations,
   type ObservedText,
   type ProbeRun,
   type ProbeShape,
@@ -79,7 +80,10 @@ const captureOf = (woke: boolean): string => {
 
 const arm = (shape: ProbeShape, injected: boolean, metCriterion = true): ProbeRun => {
   const woke = injected === metCriterion;
-  const observations = observationsFrom(captureOf(woke));
+  // The boundary this arm recorded: the prompt's turn preceded the frame, and any turn after it
+  // arrived after. The control writes no frame and says so, which is a different record from an
+  // injection arm whose frame happened to land at the same position.
+  const observations = observationsFrom(captureOf(woke), { frameWritten: injected, requestsBefore: 1 });
   return {
     shape,
     injected,
@@ -366,15 +370,111 @@ describe("the qualified set and its readings must agree", () => {
 
     // And the numbers have to be the numbers those observations give. Here the injection arm keeps
     // its counts and carries the control's observations: a wake it says arrived, in a record that
-    // never saw one.
+    // never saw one. The control's record says no frame was written, which an injection arm's
+    // observations cannot say, so the borrowing is named before the counts are even compared.
     expect(
       qualificationDisagreements(members, [
         withArms([{ ...interactiveInjection!, observations: interactiveControl!.observations }, ...others]),
       ]),
     ).toEqual([
+      resting(
+        "2.1.268",
+        "arm 1 (interactive injection) is recorded as an injection arm, and its observations say a frame was not written",
+      ),
       resting("2.1.268", "arm 1 (interactive injection) states modelRequests as 2, and its own observations give 1"),
       resting("2.1.268", "arm 1 (interactive injection) states wakeCarryingModelRequests as 1, and its own observations give 0"),
       resting("2.1.268", "arm 1 (interactive injection) states followUpAfterInjection as true, and its own observations give false"),
+      'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+    ]);
+  });
+
+  it("an arm that does not say where its frame went, or says it went somewhere its own arm did not, is refused", () => {
+    // The boundary is the one fact about a capture that cannot be read back out of it, and the
+    // version of this rule that reconstructed it -- baseline = the position of the prompt's turn --
+    // admitted a session whose wake-carrying turn *preceded* the frame it then ignored. So a record
+    // that does not carry the boundary is refused rather than read positionally.
+    const members = [build("2.1.268")];
+    const [interactiveInjection, interactiveControl, headlessInjection, headlessControl] = arms();
+    const others = [interactiveControl!, headlessInjection!, headlessControl!];
+    const observations = interactiveInjection!.observations!;
+    const withBoundary = (boundary: ArmObservations["boundary"]): ProbeRun => {
+      const moved = { ...observations, boundary };
+      // Restated from the moved record, so the row measures the boundary rather than a
+      // disagreement between the counts and the observations -- which the rule above already names.
+      return { ...interactiveInjection!, observations: moved, ...countsFrom(moved) };
+    };
+    const unsaid = { ...observations };
+    delete (unsaid as { boundary?: unknown }).boundary;
+
+    expect(
+      qualificationDisagreements(members, [
+        withArms([{ ...interactiveInjection!, observations: unsaid, ...countsFrom(unsaid) }, ...others]),
+      ]),
+    ).toEqual([
+      resting(
+        "2.1.268",
+        "arm 1 (interactive injection) did not meet the criterion for its own arm",
+      ),
+      resting(
+        "2.1.268",
+        "arm 1 (interactive injection) does not record where in the requests it observed the frame was written, so which of them preceded it is a guess",
+      ),
+      'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+    ]);
+
+    // A boundary outside the requests observed splits nothing. The instrument refuses to write one
+    // (`observationsFrom`); this is the same refusal applied to a file it did not write.
+    expect(
+      qualificationDisagreements(members, [withArms([withBoundary({ frameWritten: true, requestsBefore: 9 }), ...others])]),
+    ).toEqual([
+      resting(
+        "2.1.268",
+        "arm 1 (interactive injection) did not meet the criterion for its own arm",
+      ),
+      resting(
+        "2.1.268",
+        "arm 1 (interactive injection) does not record where in the requests it observed the frame was written, so which of them preceded it is a guess",
+      ),
+      'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+    ]);
+
+    // The reviewer's session, as a committed record: the same two requests, with the frame written
+    // after both. Every count agrees with the observations -- and the arm still fails, because the
+    // wake-carrying turn is on the wrong side of the boundary and no follow-up exists.
+    const ignoredTheFrame = withBoundary({ frameWritten: true, requestsBefore: 2 });
+    expect(ignoredTheFrame.followUpAfterInjection).toBe(false);
+    expect(ignoredTheFrame.wakeCarryingModelRequests).toBe(1);
+    expect(qualificationDisagreements(members, [withArms([ignoredTheFrame, ...others])])).toEqual([
+      resting("2.1.268", "arm 1 (interactive injection) did not meet the criterion for its own arm"),
+      'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+    ]);
+
+    // The mirror, out of the same bytes: the frame written between the two turns is the session
+    // that answered it, and nothing is reported at all. So this is not a rule that refuses
+    // everything -- it refuses the side of the boundary the turn is on.
+    expect(
+      qualificationDisagreements(members, [
+        withArms([withBoundary({ frameWritten: true, requestsBefore: 1 }), ...others]),
+      ]),
+    ).toEqual([]);
+
+    // And the turns before the boundary have to include the one this arm's prompt started. The
+    // baseline is a position now, so without this an arm could count turns that are not the
+    // prompt's and report a baseline it never observed.
+    const wakeFirst = {
+      ...observations,
+      boundary: { frameWritten: true, requestsBefore: 1 },
+      requests: [observations.requests[1]!, observations.requests[0]!],
+    };
+    expect(
+      qualificationDisagreements(members, [
+        withArms([{ ...interactiveInjection!, observations: wakeFirst, ...countsFrom(wakeFirst) }, ...others]),
+      ]),
+    ).toEqual([
+      resting(
+        "2.1.268",
+        "arm 1 (interactive injection) shows no turn carrying the prompt it was started with before that point, so its baseline counts turns that are not the prompt's",
+      ),
       'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
     ]);
   });

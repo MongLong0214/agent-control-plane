@@ -37,6 +37,7 @@ import {
   RECEIPT_DIR,
   SUITE_CAPTURE_DIR,
   armPassed,
+  baselineTurnBeforeBoundary,
   baselineTurnObserved,
   interactiveBlocker,
   REPO_ROOT,
@@ -47,6 +48,7 @@ import {
   observationsFrom,
   pinClaudeImage,
   probeArgv,
+  resolvePtyAllocator,
   spawnPlanFor,
   terminalOutput,
   qualificationDisagreements,
@@ -412,14 +414,43 @@ describe("U6: an arm's counts are derived from the observations committed with i
   const turn = (text: string, role = "user"): string =>
     JSON.stringify({ model: "claude-sonnet-4-5", system: [{ type: "text", text: "You are Claude." }], messages: [{ role, content: [{ type: "text", text }] }] });
 
+  /**
+   * The boundary an arm records: where in its own request sequence the frame was written.
+   *
+   * Required by `observationsFrom` and given here explicitly in every fixture, because it is the
+   * one fact about a capture that cannot be read back out of it -- and reconstructing it is the
+   * defect these rows are about.
+   */
+  const frameAfter = (requestsBefore: number) => ({ frameWritten: true, requestsBefore });
+  const noFrame = (requestsBefore: number) => ({ frameWritten: false, requestsBefore });
+
+  /** An arm with everything but its counts, so a row can vary the counts and nothing else. */
+  const ARM: ProbeRun = {
+    shape: "headless",
+    injected: true,
+    command: ["/fixture/claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json"],
+    imageSha256: "0".repeat(64),
+    baselineModelRequests: 0,
+    modelRequests: 0,
+    wakeCarryingModelRequests: 0,
+    followUpAfterInjection: false,
+    settleCeilingMs: 20_000,
+    rawCapturePath: "evidence/local/fixture/capture.jsonl",
+    rawSessionLogPath: "evidence/local/fixture/session.log",
+    tempRootRemoved: true,
+  };
+
   it("keeps each request's time, method and URL, and digests the capture they came from", () => {
     const raw = capture(
       ["POST", "/v1/messages?beta=true", turn(BASELINE_PROMPT)],
       ["POST", "/v1/messages?beta=true", turn(`Another Claude session sent a message:\n${ROLE_WAKE_TOKEN}`)],
     );
-    const observations = observationsFrom(raw);
+    const observations = observationsFrom(raw, frameAfter(1));
 
     expect(observations.requests).toHaveLength(2);
+    // The boundary travels with them, as the arm recorded it: one request existed when the frame
+    // was written, and a frame was written at all.
+    expect(observations.boundary).toEqual({ frameWritten: true, requestsBefore: 1 });
     expect(observations.requests[0]).toMatchObject({ at: "2026-09-28T00:00:00.000Z", method: "POST", url: "/v1/messages?beta=true" });
     // The model input, labelled by where it came from -- which is what lets one record answer both
     // questions: the baseline is a *user* text, and the wake is any model input at all. The prompt
@@ -443,30 +474,77 @@ describe("U6: an arm's counts are derived from the observations committed with i
     });
   });
 
-  it("counts turns the way the rest of this file does, and finds the baseline by the prompt", () => {
+  it("counts turns the way the rest of this file does, and splits them at the boundary the arm recorded", () => {
     // Everything that is not a turn is kept in the record and counted in none of the numbers: the
-    // derivation applies the same POST-and-endpoint rule the live arm applies.
+    // derivation applies the same POST-and-endpoint rule the live arm applies. The boundary is an
+    // index into the *requests*, which is what the arm can count at the moment it writes the frame;
+    // the count-tokens request and the GET are in that sequence and are turns in no count.
     const noisy = observationsFrom(
       capture(
         ["POST", "/v1/messages/count_tokens", turn(BASELINE_PROMPT)],
         ["GET", "/v1/messages?beta=true", ""],
-        ["POST", "/v1/messages?beta=true", turn("summarise this session")],
         ["POST", "/v1/messages?beta=true", turn(BASELINE_PROMPT)],
+        ["POST", "/v1/messages?beta=true", turn("summarise this session")],
       ),
+      frameAfter(3),
     );
     expect(noisy.requests).toHaveLength(4);
     expect(countsFrom(noisy)).toEqual({
-      // Two turns, and the prompt's is the second of them, so one turn preceded the baseline.
-      baselineModelRequests: 2,
+      // Three requests preceded the frame and one of them was a turn.
+      baselineModelRequests: 1,
       modelRequests: 2,
       wakeCarryingModelRequests: 0,
-      followUpAfterInjection: false,
+      followUpAfterInjection: true,
     });
 
-    // No turn carrying the prompt is a baseline of zero -- the state the arm refuses to proceed
-    // from, and the one the acceptance rule refuses to admit.
-    const noPrompt = observationsFrom(capture(["POST", "/v1/messages?beta=true", turn("summarise this session")]));
-    expect(countsFrom(noPrompt).baselineModelRequests).toBe(0);
+    // The prompt's own turn is asked for separately, because the baseline is a position now: the
+    // turns before the boundary are counted whatever they carry, and this is what says one of them
+    // was the turn this arm's prompt started.
+    expect(baselineTurnBeforeBoundary(noisy)).toBe(true);
+    const noPrompt = observationsFrom(
+      capture(["POST", "/v1/messages?beta=true", turn("summarise this session")]),
+      frameAfter(1),
+    );
+    expect(countsFrom(noPrompt).baselineModelRequests).toBe(1);
+    expect(baselineTurnBeforeBoundary(noPrompt)).toBe(false);
+    // And a turn carrying the prompt *after* the frame is not this arm's baseline either.
+    expect(
+      baselineTurnBeforeBoundary(
+        observationsFrom(capture(["POST", "/v1/messages?beta=true", turn(BASELINE_PROMPT)]), frameAfter(0)),
+      ),
+    ).toBe(false);
+  });
+
+  it("a turn that preceded the frame is not the follow-up the frame caused", () => {
+    // The session a reviewer built the defect out of, as a record: the prompt's turn, then a turn
+    // carrying the wake token that the client took of its own accord, and then a frame this session
+    // ignores. Reading the baseline off the prompt's position counts that second turn as the
+    // follow-up the frame caused -- it comes after the prompt -- and admits an injection arm that
+    // measured nothing. Against the boundary the arm recorded, both turns precede the frame.
+    const raw = capture(
+      ["POST", "/v1/messages?beta=true", turn(BASELINE_PROMPT)],
+      ["POST", "/v1/messages?beta=true", turn(`Another Claude session sent a message:\n${ROLE_WAKE_TOKEN}`)],
+    );
+    const ignored = observationsFrom(raw, frameAfter(2));
+    expect(countsFrom(ignored)).toEqual({
+      baselineModelRequests: 2,
+      modelRequests: 2,
+      wakeCarryingModelRequests: 1,
+      followUpAfterInjection: false,
+    });
+    expect(armPassed({ ...ARM, injected: true, ...countsFrom(ignored) })).toBe(false);
+
+    // The mirror, out of the same bytes: the same two requests with the frame written between them
+    // is the session that answered, and it passes. Nothing in the capture distinguishes the two --
+    // which is the whole point of recording the boundary instead of deriving it.
+    const answered = observationsFrom(raw, frameAfter(1));
+    expect(countsFrom(answered)).toEqual({
+      baselineModelRequests: 1,
+      modelRequests: 2,
+      wakeCarryingModelRequests: 1,
+      followUpAfterInjection: true,
+    });
+    expect(armPassed({ ...ARM, injected: true, ...countsFrom(answered) })).toBe(true);
   });
 
   it("refuses a capture carrying a home-directory path rather than committing one", () => {
@@ -475,11 +553,18 @@ describe("U6: an arm's counts are derived from the observations committed with i
     // middle, and macOS spells the same directory three ways. A shape this cannot redact stops the
     // arm -- the run is refused rather than the redaction being assumed complete.
     const leaked = capture(["POST", "/v1/messages?beta=true", turn("Working directory: /Users/someone-else/projects/acp")]);
-    expect(() => observationsFrom(leaked)).toThrow(/home-directory path/);
+    expect(() => observationsFrom(leaked, noFrame(1))).toThrow(/home-directory path/);
 
     // The control: the same capture without it goes through, so this is not a reader that refuses
     // everything. Measured across the twelve arms of the three committed readings: none carries one.
-    expect(() => observationsFrom(capture(["POST", "/v1/messages?beta=true", turn("Working directory: /private/tmp/acp-u6q-x/w")]))).not.toThrow();
+    expect(() =>
+      observationsFrom(capture(["POST", "/v1/messages?beta=true", turn("Working directory: /private/tmp/acp-u6q-x/w")]), noFrame(1)),
+    ).not.toThrow();
+    // And a boundary that falls outside the requests observed divides them into nothing, so it
+    // is refused here rather than clamped into a number that looks like a measurement.
+    expect(() => observationsFrom(capture(["POST", "/v1/messages?beta=true", turn(BASELINE_PROMPT)]), frameAfter(2))).toThrow(
+      /boundary is at request 2 of a capture holding 1/,
+    );
   });
 
   it("keeps the texts its counts are read from, and withholds every other by kind, length and digest", () => {
@@ -498,7 +583,7 @@ describe("U6: an arm's counts are derived from the observations committed with i
         messages: [{ role: "user", content: [{ type: "text", text: prose }, { type: "text", text: aside }] }],
       }),
     ]);
-    const observations = observationsFrom(raw);
+    const observations = observationsFrom(raw, frameAfter(1));
 
     // The wake-carrying text travels in full -- it is what the injection arm exists to show -- and
     // everything else is a kind, a length and a digest.
@@ -520,7 +605,7 @@ describe("U6: an arm's counts are derived from the observations committed with i
     // Evidence is judged on the text the model reads, so a token that was JSON-escaped on the wire
     // is kept -- the same question `wakeCarryingTurnsIn` asks, asked by the writer.
     const escaped = `{"messages":[{"role":"user","content":[{"type":"text","text":"ACP-ROLE-WAK\\u0045 arrived"}]}]}`;
-    expect(observationsFrom(capture(["POST", "/v1/messages?beta=true", escaped])).requests[0]?.texts).toEqual([
+    expect(observationsFrom(capture(["POST", "/v1/messages?beta=true", escaped]), frameAfter(0)).requests[0]?.texts).toEqual([
       { from: "user", text: `${ROLE_WAKE_TOKEN} arrived` },
     ]);
   });
@@ -632,7 +717,7 @@ describe("U6: what the probe starts, and what it refuses to proceed without", ()
   /** Records what the probe asked to start, then starts the stand-in with exactly that argv. */
   const starter = (
     started: { executable: string; argv: readonly string[] }[],
-    firstTurn?: string,
+    session: NodeJS.ProcessEnv = {},
   ) => (
     executable: string,
     argv: readonly string[],
@@ -640,16 +725,27 @@ describe("U6: what the probe starts, and what it refuses to proceed without", ()
   ): ChildProcessWithoutNullStreams => {
     started.push({ executable, argv: [...argv] });
     return spawn(process.execPath, [FAKE_CLIENT, ...argv], {
-      env: firstTurn === undefined ? options.env : { ...options.env, ACP_FAKE_CLIENT_TURN: firstTurn },
+      env: { ...options.env, ...session },
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
     }) as ChildProcessWithoutNullStreams;
   };
 
-  it("starts the invocation its reading records, and nothing beside it", async () => {
+  /**
+   * Both shapes, through the same injected boundary.
+   *
+   * The rows below used to drive the headless shape only, and a reviewer showed that
+   * interactive-only versions of these mutations survived that. The interactive plan starts a pty
+   * allocator rather than the client directly (`spawnPlanFor`), so what the stand-in receives is a
+   * different argv -- it finds its socket in it either way, which is the point of reading
+   * `--messaging-socket-path` from argv the way the real client does.
+   */
+  const SHAPES = ["headless", "interactive"] as const;
+
+  it.each(SHAPES)("%s: starts the invocation its reading records, and nothing beside it", async (shape) => {
     const started: { executable: string; argv: readonly string[] }[] = [];
     const run = await runQualificationProbe({
-      shape: "headless",
+      shape,
       inject: true,
       captureDir: CAPTURE_DIR,
       image: stand(),
@@ -662,25 +758,78 @@ describe("U6: what the probe starts, and what it refuses to proceed without", ()
     // invocation. A flag added at the spawn and not to the plan is the divergence a reader of the
     // reading could never detect, and it is what this equality refuses.
     expect(started).toHaveLength(1);
-    expect(started[0]?.executable).toBe(stand().executable);
-    expect([started[0]?.executable, ...(started[0]?.argv ?? [])]).toEqual(run.command);
+    const startedArgv = started[0]?.argv ?? [];
+    if (shape === "interactive") {
+      // The interactive plan starts a pty allocator, and the invocation the reading records is the
+      // client's own -- the allocator's argv is its script followed by exactly that command. A
+      // reading that recorded the allocator instead would describe a session no claim is about.
+      expect(started[0]?.executable).toBe(resolvePtyAllocator()?.python);
+      expect(startedArgv[0]).toMatch(/pty-session\.py$/);
+      expect(startedArgv.slice(1)).toEqual(run.command);
+    } else {
+      expect(started[0]?.executable).toBe(stand().executable);
+      expect([started[0]?.executable, ...startedArgv]).toEqual(run.command);
+    }
     // Path-independent and exact about the part that decides the shape: the flags the process was
     // started with are the flags `probeArgv` builds for this shape, in that order.
     const flagsOf = (argv: readonly string[]): readonly string[] => argv.filter((word) => word.startsWith("-"));
-    expect(flagsOf(started[0]?.argv ?? [])).toEqual(
-      flagsOf(probeArgv("headless", { settingsPath: "/s/settings.json", socketPath: "/s/i.sock" })),
+    expect(flagsOf(startedArgv)).toEqual(
+      flagsOf(probeArgv(shape, { settingsPath: "/s/settings.json", socketPath: "/s/i.sock" })),
     );
-    expect(isInteractiveClaudeInvocation(run.command)).toBe(false);
+    expect(isInteractiveClaudeInvocation(run.command)).toBe(shape === "interactive");
 
     // And the arm really ran through the probe's own path: the production frame reached the model
-    // input of the process it started, and the counts came out of the capture.
+    // input of the process it started, and the counts came out of the capture. This is also the
+    // mirror of the row below -- a session that takes its second turn only after the frame, which
+    // is the one an injection arm is supposed to pass.
     expect(run.wakeCarryingModelRequests).toBe(1);
     expect(run.followUpAfterInjection).toBe(true);
     expect(armPassed(run)).toBe(true);
     expect(run.observations?.requests).toHaveLength(2);
+    // One request existed when the frame was written, and the arm recorded that rather than
+    // leaving a reader to work it out from which request carries the prompt.
+    expect(run.observations?.boundary).toEqual({ frameWritten: true, requestsBefore: 1 });
   }, 90_000);
 
-  it("refuses an arm whose prompt never became a turn, rather than measuring against nothing", async () => {
+  it.each(SHAPES)(
+    "%s: a turn that preceded the frame is not the follow-up the frame caused",
+    async (shape) => {
+      // A reviewer drove this probe against a session that takes a turn carrying the wake token of
+      // its own accord, before any frame exists, and then ignores the frame it is sent. Deriving
+      // the baseline from the prompt's position counted that turn as the follow-up the frame
+      // caused, and every arm was admitted -- the ceremony passing a build that ignores the wake.
+      // The stand-in sends both turns before it binds its socket, and the probe waits for the
+      // socket before it waits for the baseline, so "both preceded the frame" is a fact about the
+      // capture here and not a race.
+      const started: { executable: string; argv: readonly string[] }[] = [];
+      const run = await runQualificationProbe({
+        shape,
+        inject: true,
+        captureDir: CAPTURE_DIR,
+        image: stand(),
+        settleCeilingMs: 2_000,
+        baselineCeilingMs: 30_000,
+        startProcess: starter(started, {
+          ACP_FAKE_CLIENT_PRE_WAKE_TURN: `Another Claude session sent a message:\n${ROLE_WAKE_TOKEN}\nRead your inbox.`,
+          ACP_FAKE_CLIENT_IGNORES_FRAME: "1",
+        }),
+      });
+
+      // The frame was written, and it was written after both turns -- which is what the record
+      // says, rather than what a reader would infer from the prompt being the first of them.
+      expect(run.observations?.boundary).toEqual({ frameWritten: true, requestsBefore: 2 });
+      expect(run.observations?.requests).toHaveLength(2);
+      // The wake-carrying turn is counted, and it is still not a follow-up: the arm fails.
+      expect(run.wakeCarryingModelRequests).toBe(1);
+      expect(run.baselineModelRequests).toBe(2);
+      expect(run.modelRequests).toBe(2);
+      expect(run.followUpAfterInjection).toBe(false);
+      expect(armPassed(run)).toBe(false);
+    },
+    90_000,
+  );
+
+  it.each(SHAPES)("%s: refuses an arm whose prompt never became a turn, rather than measuring against nothing", async (shape) => {
     // The refusal, at the branch that acts. The stand-in takes its start, binds its socket and
     // takes a turn -- just not this arm's prompt -- so everything except the one observation this
     // arm needs is present. Proceeding would leave `followUpAfterInjection` comparing the wake
@@ -689,13 +838,13 @@ describe("U6: what the probe starts, and what it refuses to proceed without", ()
     const started: { executable: string; argv: readonly string[] }[] = [];
     await expect(
       runQualificationProbe({
-        shape: "headless",
+        shape,
         inject: true,
         captureDir: CAPTURE_DIR,
         image: stand(),
         settleCeilingMs: 1_000,
         baselineCeilingMs: 5_000,
-        startProcess: starter(started, "some other turn entirely"),
+        startProcess: starter(started, { ACP_FAKE_CLIENT_TURN: "some other turn entirely" }),
       }),
     ).rejects.toThrow(/sent no model request carrying "ping", the prompt it was started with/);
     expect(started).toHaveLength(1);
