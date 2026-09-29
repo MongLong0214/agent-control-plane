@@ -585,6 +585,29 @@ describe("a rollback installs one whole generation", () => {
     ).rejects.toThrow(/depends on a library outside itself/);
   }, 120_000);
 
+  it("seals a real dylib whose own install name points outside the closure", async () => {
+    const fixture = makeGenerationFixture("acp-rollback-dylib-id-");
+    new Db(fixture.databasePath).close();
+    chmodSync(fixture.databasePath, 0o600);
+    const closure = runtimeClosureFor(fixture.root, "generation-a");
+    const dylib = join(closure, "bin", "libidentity.dylib");
+    const outsideName = join(fixture.root, "build-machine", "libidentity.dylib");
+    const source = join(fixture.root, "identity.c");
+    writeFileSync(source, "int acp_identity(void){return 0;}\n");
+    boundedExecFileSync("/usr/bin/cc", ["-dynamiclib", "-install_name", outsideName, "-o", dylib, source]);
+
+    const commands = boundedExecFileSync("/usr/bin/otool", ["-l", dylib], { encoding: "utf8" });
+    expect(commands).toMatch(new RegExp(`cmd LC_ID_DYLIB\\s+cmdsize \\d+\\s+name ${outsideName} \\(offset`));
+    const loaded = [...commands.matchAll(/cmd (?:LC_LOAD_DYLIB|LC_LOAD_WEAK_DYLIB|LC_REEXPORT_DYLIB|LC_LOAD_UPWARD_DYLIB|LC_LAZY_LOAD_DYLIB)\s+cmdsize \d+\s+name (\S+) \(offset/g)]
+      .map((match) => match[1]);
+    expect(loaded.length).toBeGreaterThan(0);
+    expect(loaded.every((name) => name!.startsWith("/usr/lib/") || name!.startsWith("/System/Library/"))).toBe(true);
+
+    await expect(
+      sealRollbackPair(fixture.pairsRoot, fixture.sourcesFor("generation-a", closure)),
+    ).resolves.toBeDefined();
+  }, 120_000);
+
   it("refuses a pair sealed for another database or service, through the built binary", async () => {
     const fixture = makeGenerationFixture("acp-rollback-cross-target-");
     new Db(fixture.databasePath).close();
