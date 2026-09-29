@@ -9,7 +9,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { allow, type Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startDaemonMcpListeners } from "../../src/daemon/agentcpd.ts";
-import { aggregate, type DoctorReport } from "../../src/doctor/doctor.ts";
 import { Daemon, OPERATOR_METHOD, type AuthenticatedOperatorPeer } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../../src/domain/types.ts";
 import {
@@ -535,12 +534,26 @@ describe("the daemon reports a binding that cannot receive wakes", () => {
    * supplemental findings, an operator asking got `DEGRADED` and the next automatic evaluation,
    * clean in every other respect, wrote `HEALTHY` over it while the holder was still unwakeable.
    *
-   * "Clean in every other respect" is made literal: the doctor's own checks are replaced by none, so
-   * the status is `aggregate` -- production's -- over exactly what the daemon hands `run`. This
-   * fixture's own checks already report three non-blocking findings of their own (no Buzz for the
-   * CTO, no CEO binding, no packet-reviewer scope), so without that the status is `DEGRADED` for a
-   * member too, and `DEGRADED` for a non-member would prove nothing. The control below is what shows
-   * the substitution leaves `HEALTHY` reachable.
+   * Nothing here is mocked, and that is a repair. This fixture used to replace `Doctor.run` with a
+   * double that aggregated *the third argument the daemon passed it*, which measured the argument
+   * and not the report. Once the supplemental findings became a supplier registered on the doctor
+   * (#1010), no caller passes that argument any more: the double received `[]`, aggregated to
+   * `HEALTHY`, and the row asserted something about a seam production had stopped using.
+   *
+   * What replaces it is production's own record of the evaluation the persisted status came from.
+   * `Doctor.run` audits every report as `DOCTOR_REPORT` carrying each finding's code, severity and
+   * blocking flag, and `reconcileContinuity` completes exactly one system evaluation, so the rows
+   * added across the call are that evaluation and nothing else. `health.json` cannot serve this
+   * alone: its `doctor` field is a `DoctorHealthSnapshot`, which has a status and no findings. So
+   * the row asserts both halves -- that the audited report is the one whose status was persisted,
+   * and that it carries the finding.
+   *
+   * The status alone cannot carry the claim without the double. With the doctor's own checks
+   * running, this fixture's deployment reports unrelated non-blocking findings of its own, so the
+   * persisted status is `DEGRADED` for a wakeable holder too and `DEGRADED` for an unwakeable one
+   * would prove nothing. The discriminating assertion is therefore the finding itself, with its
+   * severity: a non-blocking `ERROR` cannot aggregate to `HEALTHY` under §25.5, so an evaluation
+   * carrying one is an evaluation no persisted status can round up.
    */
   const refreshedAutomatically = async (
     label: string,
@@ -549,15 +562,7 @@ describe("the daemon reports a binding that cannot receive wakes", () => {
   ) => {
     const { harness, daemon, stateDir, close } = await startHolder(label, client, register);
     try {
-      vi.spyOn(harness.cp.doctor, "run").mockImplementation(
-        async (scope = "system", target, supplemental = []): Promise<DoctorReport> => ({
-          scope,
-          target: target ?? null,
-          status: aggregate(supplemental),
-          findings: [...supplemental],
-          ranAt: harness.clock.nowIso(),
-        }),
-      );
+      const auditedBefore = harness.cp.audit.byKind("DOCTOR_REPORT").length;
       harness.clock.advance(10_000);
       await daemon.reconcileContinuity(`wake-set test: an automatic refresh with a ${label} holder connected`);
       const health = JSON.parse(readFileSync(join(stateDir, "health.json"), "utf8")) as {
@@ -565,23 +570,58 @@ describe("the daemon reports a binding that cannot receive wakes", () => {
       };
       // The refresh ran: the snapshot is the evaluation just taken, not the one from startup.
       expect(health.doctor?.checkedAt).toBe(harness.clock.nowIso());
-      return health.doctor?.status;
+      // One evaluation, so the report audited across this call *is* the one just persisted. The
+      // status is compared as well, because a row belonging to some other pass could otherwise
+      // stand in for this one and be read as evidence about it.
+      const audited = harness.cp.audit.byKind("DOCTOR_REPORT").slice(auditedBefore);
+      expect(audited).toHaveLength(1);
+      const report = audited[0]?.evidence as {
+        scope?: string;
+        status?: string;
+        findings?: { code: string; severity: string; blocking: boolean }[];
+      };
+      expect(report.scope).toBe("system");
+      expect(report.status).toBe(health.doctor?.status);
+      return {
+        persistedStatus: health.doctor?.status,
+        unwakeable: (report.findings ?? []).filter((finding) => finding.code === CODE),
+      };
     } finally {
       await close();
     }
   };
 
+  /** One unwakeable holder, reported once, in the evaluation whose status reached `health.json`. */
+  const expectTheRefreshReportsOneUnwakeableHolder = async (
+    label: string,
+    client: { name: string; version: string } | undefined,
+    register: boolean | "abandoned" = false,
+  ): Promise<void> => {
+    const { persistedStatus, unwakeable } = await refreshedAutomatically(label, client, register);
+    expect(unwakeable, `${label}: the persisted evaluation carried no unwakeable-binding finding`)
+      .toHaveLength(1);
+    expect(unwakeable[0]).toMatchObject({ severity: "ERROR", blocking: false });
+    expect(persistedStatus).not.toBe("HEALTHY");
+  };
+
   it("the automatic refresh does not persist HEALTHY while a connected holder is outside the set", async () => {
-    expect(await refreshedAutomatically("outside", NOT_A_MEMBER)).toBe("DEGRADED");
-    expect(await refreshedAutomatically("no-build", undefined)).toBe("DEGRADED");
+    await expectTheRefreshReportsOneUnwakeableHolder("outside", NOT_A_MEMBER);
+    await expectTheRefreshReportsOneUnwakeableHolder("no-build", undefined);
     // The state the scan used to skip: a member build with no registration reaches this door too.
-    expect(await refreshedAutomatically("member-unregistered", MEMBER)).toBe("DEGRADED");
+    await expectTheRefreshReportsOneUnwakeableHolder("member-unregistered", MEMBER);
     // And the one no filesystem check can see: a registration that validates and takes no wake.
-    expect(await refreshedAutomatically("refused", MEMBER, "abandoned")).toBe("DEGRADED");
+    await expectTheRefreshReportsOneUnwakeableHolder("refused", MEMBER, "abandoned");
   });
 
-  it("the automatic refresh persists HEALTHY when the holder is on a qualified build and wakeable — the control", async () => {
-    expect(await refreshedAutomatically("member", MEMBER, true)).toBe("HEALTHY");
+  it("the automatic refresh reports no such finding for a holder on a qualified build that is wakeable — the control", async () => {
+    // A control the defect could not have satisfied: this holder is wakeable, through the real
+    // registration tool, against a real socket in the daemon's own state directory. It no longer
+    // asserts a persisted `HEALTHY` -- with the doctor's own checks running, this deployment is
+    // `DEGRADED` for reasons that have nothing to do with wakes -- so what it establishes is that
+    // the assertion above is not one every deployment satisfies.
+    const { unwakeable } = await refreshedAutomatically("member", MEMBER, true);
+
+    expect(unwakeable).toHaveLength(0);
   });
 });
 
