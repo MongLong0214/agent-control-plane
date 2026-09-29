@@ -165,6 +165,13 @@ deploy/install-launchd.sh stop
 deploy/install-launchd.sh start
 ```
 
+`start` and `restart` report success only after this start writes its completed-start record and
+launchd reports the same running pid across a short settle window. They wait up to 180 seconds
+for slow startup, but fail sooner when launchd shows a sustained missing pid: after five polls
+for a successful-exit refusal or 35 polls while allowing one throttled relaunch. If the job stays
+registered without a running daemon, they exit nonzero; inspect `agentctl daemon status` and
+`agentcpd.out.log` for the startup reason.
+
 `upgrade` saves the rendered plist and launcher under
 `~/.agent-control-plane/deploy-backups/`, stops the running job, renders the new release, and
 starts it. On the next open, the database takes a consistent pre-migration backup before any
@@ -188,7 +195,8 @@ A start that would migrate the database refuses instead (#738), because this app
 git checkout and a `pnpm build` run in it for any reason changes which `SCHEMA_VERSION` the next
 restart declares. The refusal exits 0, so `KeepAlive { SuccessfulExit = false }` leaves the job
 stopped rather than retrying every `ThrottleInterval`; it leaves `migration-refusal.json` in the
-state directory and `agentctl daemon status` reports it with no daemon running. `migration-plan`
+state directory and `agentctl daemon status` reports it with no daemon running. The installer
+therefore reports a failed start even though launchd retains the job. `migration-plan`
 reads the database read-only and prints what a start would do; `approve-migration` refuses a live
 lock, takes a validated recovery point, and writes an approval naming that exact chain and the
 database it is for, which is spent when the chain runs. An approval is a capability over one

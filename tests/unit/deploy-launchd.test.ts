@@ -84,6 +84,7 @@ const makeHarness = (): InstallerHarness => {
   const launcherEnvLog = join(home, "launcher-env.log");
   const stateAdminLog = join(home, "state-admin.log");
   const loaded = join(home, "launchd.loaded");
+  const stdoutLog = join(home, ".agent-control-plane", "agentcpd.out.log");
   const lock = join(home, ".agent-control-plane", "agentcpd.lock");
   const launchctl = join(bin, "launchctl");
   const security = join(bin, "security");
@@ -96,18 +97,68 @@ set -euo pipefail
 printf '%s\\n' "$*" >> "$ACP_LAUNCHCTL_LOG"
 case "\${1:-}" in
   print)
-    [[ -e "$ACP_LAUNCHD_LOADED" ]]
+    if [[ -e "$ACP_LAUNCHD_BOOTOUT_PENDING" ]]; then
+      remaining="$(cat "$ACP_LAUNCHD_BOOTOUT_PENDING")"
+      if [[ "$remaining" -eq 0 ]]; then
+        rm -f "$ACP_LAUNCHD_BOOTOUT_PENDING" "$ACP_LAUNCHD_LOADED"
+      else
+        printf '%s\\n' "$((remaining - 1))" > "$ACP_LAUNCHD_BOOTOUT_PENDING"
+      fi
+    fi
+    [[ -e "$ACP_LAUNCHD_LOADED" ]] || exit 1
+    if [[ -n "\${ACP_FAKE_START_AFTER_PRINTS:-}" && -e "$ACP_FAKE_START_PRINTS" ]]; then
+      prints="$(cat "$ACP_FAKE_START_PRINTS")"
+      prints="$((prints + 1))"
+      printf '%s\\n' "$prints" > "$ACP_FAKE_START_PRINTS"
+      if [[ "$prints" -eq "$ACP_FAKE_START_AFTER_PRINTS" ]]; then
+        mkdir -p "$(dirname "$ACP_FAKE_STDOUT_LOG")"
+        printf '  "started": {\\n' >> "$ACP_FAKE_STDOUT_LOG"
+      fi
+    fi
+    if [[ "\${ACP_FAKE_PID_MODE:-running}" == "running" ]]; then
+      printf '    pid = 4242\\n'
+    elif [[ "\${ACP_FAKE_PID_MODE:-running}" == "none" ]]; then
+      printf '    last exit code = 0\\n'
+    elif [[ "\${ACP_FAKE_PID_MODE:-running}" == "recovers" ]]; then
+      prints="$(cat "$ACP_FAKE_RECOVERY_PRINTS")"
+      prints="$((prints + 1))"
+      printf '%s\\n' "$prints" > "$ACP_FAKE_RECOVERY_PRINTS"
+      if [[ "$prints" -ge 60 ]]; then printf '    pid = 4242\\n'; fi
+    elif [[ "\${ACP_FAKE_PID_MODE:-running}" == "disappears" ]]; then
+      remaining="$(cat "$ACP_FAKE_PID_PRINTS_REMAINING")"
+      if [[ "$remaining" -gt 0 ]]; then
+        printf '    pid = 4242\\n'
+        printf '%s\\n' "$((remaining - 1))" > "$ACP_FAKE_PID_PRINTS_REMAINING"
+      fi
+    fi
     ;;
   bootstrap)
     touch "$ACP_LAUNCHD_LOADED"
     ;;
   bootout)
-    rm -f "$ACP_LAUNCHD_LOADED"
+    if [[ -n "\${ACP_BOOTOUT_PRINT_LAG:-}" ]]; then
+      printf '%s\\n' "$ACP_BOOTOUT_PRINT_LAG" > "$ACP_LAUNCHD_BOOTOUT_PENDING"
+    else
+      rm -f "$ACP_LAUNCHD_LOADED"
+    fi
   if [[ -n "\${ACP_STOP_DELAY:-}" && -n "\${ACP_LOCK_PATH:-}" ]]; then
-      (sleep "$ACP_STOP_DELAY"; rm -f "$ACP_LOCK_PATH") >/dev/null 2>&1 &
+      (/bin/sleep "$ACP_STOP_DELAY"; rm -f "$ACP_LOCK_PATH") >/dev/null 2>&1 &
     fi
     ;;
   kickstart)
+    if [[ "\${ACP_KICKSTART_UNLOAD:-0}" == "1" ]]; then rm -f "$ACP_LAUNCHD_LOADED"; fi
+    if [[ "\${ACP_FAKE_PID_MODE:-running}" == "disappears" ]]; then
+      printf '3\\n' > "$ACP_FAKE_PID_PRINTS_REMAINING"
+    elif [[ "\${ACP_FAKE_PID_MODE:-running}" == "recovers" ]]; then
+      printf '0\\n' > "$ACP_FAKE_RECOVERY_PRINTS"
+    fi
+    if [[ "\${ACP_FAKE_START_MARKER:-1}" == "1" ]]; then
+      mkdir -p "$(dirname "$ACP_FAKE_STDOUT_LOG")"
+      printf '  "started": {\\n' >> "$ACP_FAKE_STDOUT_LOG"
+    fi
+    if [[ -n "\${ACP_FAKE_START_AFTER_PRINTS:-}" ]]; then
+      printf '0\\n' > "$ACP_FAKE_START_PRINTS"
+    fi
     ;;
   *)
     exit 64
@@ -115,6 +166,8 @@ case "\${1:-}" in
 esac
 `,
   );
+  // Shorten start_job's one-second polls while leaving the two-second stop-lock fake observable.
+  writeExecutable(join(bin, "sleep"), "#!/bin/bash\n/bin/sleep 0.1\n");
   writeExecutable(
     security,
     `#!/bin/bash
@@ -284,6 +337,11 @@ exit 90
       ACP_LAUNCHER_ENV_LOG: launcherEnvLog,
       ACP_STATE_ADMIN_LOG: stateAdminLog,
       ACP_LAUNCHD_LOADED: loaded,
+      ACP_LAUNCHD_BOOTOUT_PENDING: join(home, "launchd.bootout-pending"),
+      ACP_FAKE_PID_PRINTS_REMAINING: join(home, "launchd.pid-prints-remaining"),
+      ACP_FAKE_RECOVERY_PRINTS: join(home, "launchd.recovery-prints"),
+      ACP_FAKE_START_PRINTS: join(home, "launchd.start-prints"),
+      ACP_FAKE_STDOUT_LOG: stdoutLog,
       ACP_LOCK_PATH: lock,
       ACP_STOP_DELAY: "2",
       ACP_REAL_NODE: process.execPath,
@@ -599,6 +657,126 @@ const treeFiles = (): string[] =>
     .map((entry) => join(root, entry));
 
 describe("launchd deployment artifact", () => {
+  it("restart waits for a delayed bootout before reporting a loaded job", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    harness.env["ACP_BOOTOUT_PRINT_LAG"] = "1";
+    writeFileSync(harness.launchLog, "");
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+    const observed = boundedSpawnSync("launchctl", ["print", `gui/${process.getuid?.() ?? 0}/${label}`], {
+      encoding: "utf8",
+      env: harness.env,
+    });
+
+    expect(restarted.status, restarted.stderr).toBe(0);
+    expect(observed.status, `restart exited ${restarted.status}; launchctl print found no job`).toBe(0);
+    expect(observed.stdout).toContain("pid = 4242");
+    expect(existsSync(harness.loaded)).toBe(true);
+  });
+
+  it("refuses success when kickstart leaves the job unloaded", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    harness.env["ACP_KICKSTART_UNLOAD"] = "1";
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+
+    expect(restarted.status).not.toBe(0);
+    expect(restarted.stderr).toContain(`launchd job ${label} is not loaded after start`);
+    expect(existsSync(harness.loaded)).toBe(false);
+  });
+
+  it("refuses a restart when the job stays registered without a running pid", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    harness.env["ACP_FAKE_PID_MODE"] = "none";
+    const printsBefore = subcommands(harness.launchLog).filter((command) => command === "print").length;
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+    const printsAfter = subcommands(harness.launchLog).filter((command) => command === "print").length;
+
+    expect(restarted.status, restarted.stderr).not.toBe(0);
+    expect(restarted.stderr).toContain(`launchd job ${label} is not running after start`);
+    expect(restarted.stderr).toContain("agentctl daemon status");
+    expect(printsAfter - printsBefore).toBeLessThan(20);
+    expect(existsSync(harness.loaded)).toBe(true);
+  });
+
+  it("accepts a completed start after more than 30 polls with the same pid", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    harness.env["ACP_FAKE_START_MARKER"] = "0";
+    harness.env["ACP_FAKE_START_AFTER_PRINTS"] = "36";
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+
+    expect(Number(readFileSync(harness.env["ACP_FAKE_START_PRINTS"]!, "utf8").trim())).toBeGreaterThan(30);
+    expect(restarted.status, restarted.stderr).toBe(0);
+    expect(existsSync(harness.loaded)).toBe(true);
+  });
+
+  it("allows a throttled relaunch after 30 consecutive polls without a pid", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    harness.env["ACP_FAKE_PID_MODE"] = "recovers";
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+
+    expect(Number(readFileSync(harness.env["ACP_FAKE_RECOVERY_PRINTS"]!, "utf8").trim())).toBeGreaterThan(60);
+    expect(restarted.status, restarted.stderr).toBe(0);
+  });
+
+  it("refuses a restart when its reported pid disappears during settling", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    harness.env["ACP_FAKE_PID_MODE"] = "disappears";
+    const printsBefore = subcommands(harness.launchLog).filter((command) => command === "print").length;
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+    const printsAfter = subcommands(harness.launchLog).filter((command) => command === "print").length;
+
+    expect(restarted.status, restarted.stderr).not.toBe(0);
+    expect(restarted.stderr).toContain(`launchd job ${label} is not running after start`);
+    expect(restarted.stderr).toContain("agentctl daemon status");
+    expect(printsAfter - printsBefore).toBeLessThan(100);
+    expect(existsSync(harness.loaded)).toBe(true);
+  });
+
+  it("refuses a pid that appears before the daemon reports completed startup", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    harness.env["ACP_FAKE_START_MARKER"] = "0";
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+
+    expect(restarted.status, restarted.stderr).not.toBe(0);
+    expect(restarted.stderr).toContain(`launchd job ${label} is not running after start`);
+    expect(existsSync(harness.loaded)).toBe(true);
+  });
+
+  it("refuses when bootout remains registered past the bounded wait", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    writeExecutable(join(harness.bin, "sleep"), "#!/bin/bash\nexit 0\n");
+    harness.env["ACP_BOOTOUT_PRINT_LAG"] = "31";
+    writeFileSync(harness.launchLog, "");
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+
+    expect(restarted.status).not.toBe(0);
+    expect(restarted.stderr).toContain("launchd job remains loaded after bootout");
+    expect(subcommands(harness.launchLog).filter((command) => command === "print")).toHaveLength(32);
+  });
+
   it("renders a loadable plist with absolute paths and no secret or unresolved placeholder", () => {
     const output = join(tempDir("acp-launchd-render-"), "agentcpd.plist");
     boundedExecFileSync(process.execPath, [
@@ -636,7 +814,9 @@ describe("launchd deployment artifact", () => {
     expect(result.status).toBe(0);
     expect(existsSync(plistPath(harness))).toBe(true);
     assertRenderedPlist(harness);
-    expect(subcommands(harness.launchLog)).toEqual(["print", "print", "bootstrap", "kickstart"]);
+    expect(subcommands(harness.launchLog)).toEqual([
+      "print", "print", "bootstrap", "kickstart", "print", "print", "print", "print",
+    ]);
     expect(readFileSync(harness.securityLog, "utf8")).toContain(
       "find-generic-password -w -s test-service -a ACP_MCP_TOKEN",
     );
@@ -1583,6 +1763,7 @@ describe("launchd deployment artifact", () => {
 
     writeFileSync(harness.lock, "old daemon lock\n", { mode: 0o600 });
     harness.env["ACP_RENDER_REQUIRES_STOPPED"] = "1";
+    harness.env["ACP_BOOTOUT_PRINT_LAG"] = "1";
     const upgraded = runInstaller(
       installer,
       ["upgrade", "--app-root", root, "--node", harness.node],
@@ -1598,10 +1779,20 @@ describe("launchd deployment artifact", () => {
       "bootstrap",
       "kickstart",
       "print",
+      "print",
+      "print",
+      "print",
+      "print",
       "bootout",
+      "print",
+      "print",
       "print",
       "bootstrap",
       "kickstart",
+      "print",
+      "print",
+      "print",
+      "print",
     ]);
   });
 
@@ -1809,6 +2000,7 @@ describe("launchd deployment artifact", () => {
 
     writeFileSync(harness.loaded, "loaded\n", { mode: 0o600 });
     writeFileSync(harness.lock, "old daemon lock\n", { mode: 0o600 });
+    harness.env["ACP_BOOTOUT_PRINT_LAG"] = "1";
     writeFileSync(harness.launchLog, "");
     const rolledBack = runInstaller(
       installer,
@@ -1836,8 +2028,14 @@ describe("launchd deployment artifact", () => {
       "print",
       "bootout",
       "print",
+      "print",
+      "print",
       "bootstrap",
       "kickstart",
+      "print",
+      "print",
+      "print",
+      "print",
     ]);
 
     // The generation moved as one: runtime closure, plist and launcher are all the named pair's,
