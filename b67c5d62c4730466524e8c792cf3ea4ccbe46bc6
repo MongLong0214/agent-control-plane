@@ -1,0 +1,13 @@
+Limit: startup checks that each configured entry's project exists, not that it is available: a registered project that is suspended or not HEALTHY passes, because projects.get reads the row with no status filter, and whether that project may take work is left to the runtime code that owns its state
+Ruled-out: dropping an entry whose project is unregistered and starting with the rest | a silently dropped entry is a session that can never prove it may start work, with nothing saying why
+Warn: do not widen the startup check to availability: whether a registered project is suspended or not HEALTHY changes while the daemon runs without the configuration changing, so refusing on it would refuse a merely paused deployment, and the daemon that must come up to unpause it is this one
+Warn: a startup scenario run through tests/helpers/run-agentcpd-main.ts with ACP_CANONICAL_SESSIONS_JSON set must list its entries' projects in ACP_STARTUP_TEST_REGISTER_PROJECTS; deriving that list from the configured value would make the unregistered-project refusal unreachable from every case
+Record-Id: r-acps2projreg
+Provenance: inherited c4b81739be23837a8eb764cc1292d511e2221024
+
+Limit: the configured set is read from the projects registry before daemon.start() takes the single-instance lock, so the read is not ordered against another process writing that registry at the same moment
+Ruled-out: keeping the registry check after daemon.start() returns | start() parks without returning when the startup doctor has a park-eligible finding, and a denied start reports its own error first, so a check placed after it is skipped on both paths
+Warn: the falsifiability row for this check mutates only its condition; what fails if the check moves back behind daemon.start() is the park-fixture case in tests/unit/canonical-session-project-must-be-registered.test.ts, not the row
+Record-Id: r-acps2beforestart
+Follows: r-acps2projreg
+Provenance: inherited 70292682c053ad2daff0da8f0e7e5957d556b079
