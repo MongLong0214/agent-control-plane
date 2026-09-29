@@ -1,0 +1,40 @@
+Limit: this makes the wait visible and does not end it: restore() records CONTINUITY_RESTORE_AWAITS_CLAIM once per revocation and stops, and the role stays unbound until a claim binds it
+Limit: a role is owed only while its newest assignment row carries one of the continuity revocation reasons (two exact strings and the failover-refused prefix); a revocation written with any other text is read as an operator release and owed nothing
+Limit: the doctor finding's sentence has no falsifiability row of its own: the-coverage-finding-names-the-role-awaiting-a-claim mutates only the evidence field, so a revert of recommendedAction to plan.action is caught by the DOCTOR_RUN test but by no committed row
+Ruled-out: restore() creating the binding for a role continuity revoked | the claim path is the only creator of an assignment row, and a binding minted by continuity would carry no session proof
+Ruled-out: a new doctor reason code for a role that waits on a claim | the existing PARTIAL_COVERAGE finding already carries the state, and a new catalogued code would need its own census registration
+Ruled-out: joining the two restoration sources in daemon.ts with || | daemon.ts is a deciding file for verify-refusal-operands-are-watched, where every new operand needs a declared witness
+Warn: once restorationNeedRecorded is true the reconcile loop stops calling restore() for that role until a later BINDING_REVOKED, so anything later added to restore()'s unbound-role branch runs once per revocation, not once per tick
+Record-Id: r-954awaitsclaim
+Provenance: inherited 458cd81d633f593059174148acf4f95ba3ad9c51
+
+Limit: this makes the wait visible and does not end it: CONTINUITY_RESTORE_AWAITS_CLAIM is recorded once per revocation, by restore() or, on a reconcile pass another role left unresolved, by recordClaimNeeds(), and the role stays unbound until a claim binds it
+Limit: a role is owed only while its newest assignment row carries one of the continuity revocation reasons (two exact strings and the failover-refused prefix); a revocation written with any other text is read as an operator release and owed nothing
+Limit: the doctor finding's sentence has no falsifiability row of its own: the-coverage-finding-names-the-role-awaiting-a-claim mutates only the evidence field, so a revert of recommendedAction to plan.action is caught by the DOCTOR_RUN test but by no committed row
+Limit: failover() refuses only a role continuity owes a claim; it still writes an assignment row for a role that was never held or that an operator released, so a claim is the only creator of the row for a role continuity revoked and not for every role
+Ruled-out: restore() creating the binding for a role continuity revoked | the claim path is the only creator of an assignment row, and a binding minted by continuity would carry no session proof
+Ruled-out: a new doctor reason code for a role that waits on a claim | the existing PARTIAL_COVERAGE finding already carries the state, and a new catalogued code would need its own census registration
+Ruled-out: joining the two restoration sources in daemon.ts with a logical-or operator | daemon.ts is a deciding file for verify-refusal-operands-are-watched, where every new operand needs a declared witness
+Ruled-out: refusing failover for every role with no active binding, as review R1015-1 proposed | staffing a role that was never held is specified failover behaviour, CP-S21 covers the CEO, CTO and reviewer from nothing when claude is down, and no claim is owed for a role nobody ever lost
+Ruled-out: running restore() on a reconcile pass another role left unresolved | that pass may move an acting owner and the unresolved gate exists to withhold it; only the record of a claim need is independent of the gate, so only that runs
+Warn: once restorationNeedRecorded is true the reconcile loop stops calling restore() for that role until a later BINDING_REVOKED, so anything later added to restore()'s unbound-role branch runs once per revocation, not once per tick
+Warn: continuity_state.reason_code now follows the coverage outcome on every evaluation while changed_at still moves only with the mode, so reason_code is no longer the reason the mode last changed
+Record-Id: r-954claimguards
+Supersedes: r-954awaitsclaim
+Provenance: inherited d11b2c3cb38218c8e224599ae770abf01b801a02
+
+Limit: recordClaimNeeds() re-derives coverage from the capacity readings already held and runs no refresh: a provider that went down after its last probe, with nothing in the pass probing it again, still reads as able to staff the role
+Limit: this repair has no falsifiability row: the defect needs a plan handed in from outside and the method no longer takes one, so the only mutant that restores it changes the kernel signature and the daemon.ts call together, which a single-file row cannot express; the regression test is its only witness
+Ruled-out: keeping the plan parameter and handing in the reconcile pass's own plan | that plan predates the pass's failovers, and when a failover's probe finds the provider down it still says the role can be staffed
+Ruled-out: refreshing capacity before recording the claim need | the state failover's probe left is the newest reading, and the unresolved path must not add a probe round to a pass that is already failing
+Warn: a need recorded once per revocation cannot be corrected by a later pass, so nothing that records one may read a plan computed before the same pass's failovers
+Record-Id: r-954freshplan
+Follows: r-954claimguards
+Provenance: inherited 8c87086b463f271c847ebe14d5a03379f42d4084
+
+Limit: A claim need is recorded once per revocation, so a need dated from coverage contradicted by restoration provisioning cannot be corrected on a later pass
+Ruled-out: recording owed-role needs from restore()'s initial plan | bound-role provisioning can invalidate that provider reading before the owed role is processed
+Warn: Keep deferred listing every pending owed role while alreadyRecorded suppresses a repeated CONTINUITY_RESTORE audit row
+Record-Id: r-954restorefresh
+Follows: r-954freshplan
+Provenance: inherited 080ee5b3b0a3f2e920ab3741cd2f4a5839324663
