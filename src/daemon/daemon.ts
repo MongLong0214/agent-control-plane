@@ -545,18 +545,26 @@ export class Daemon {
     this.attachments = new RoleAttachmentCredentials(cp.sessions, cp.bindings, cp.clock);
     this.#finalizer = new ApprovedRunFinalizer(cp, undefined, authorities);
     this.#evidenceExporter = new RunEvidenceExporter(cp.db, cp.artifacts, cp.clock, cp.audit);
-    // Registered in the constructor, so it is in place before anything can answer "is the system
-    // healthy" through any door. `start()` is too late and a listener start is far too late: the
-    // bootstrap park's own doctor pass runs inside `start()`, and the MCP listeners are composed
-    // after it, so a supplier installed alongside them would leave every earlier report short.
-    //
-    // This ternary is the *only* place the scope rule lives. It used to be spelled inline at the
-    // operator door, which is why the doors that did not spell it reported a smaller set (#1010).
-    // Non-system scopes carry nothing: every finding in here is about the deployment as a whole,
-    // and a `--scope run` report is answering about one run.
-    cp.doctor.setSupplementalFindings((scope) =>
-      scope === "system" ? this.supplementalSystemFindings() : []);
+    // Nothing is registered with `cp.doctor` here. A constructed daemon is not yet the live one: a
+    // second `Daemon` over the same control plane that `start()` then refuses the lock would, if it
+    // registered here, replace the supplier of the daemon that does hold the lock, and that
+    // daemon's doors would answer from a set with none of its own holders in it. `start()`
+    // registers `#doctorSupplier` once the lock is this daemon's and before its first doctor pass.
   }
+
+  /**
+   * The one supplier this daemon registers with `cp.doctor`, kept as a field so the same function
+   * object is what `start()` registers and what `stop()` and a failed `start()` ask the doctor to
+   * remove — the doctor removes it only while it is still the registered one, so a daemon that is
+   * no longer live cannot take down the supplier of the daemon that replaced it.
+   *
+   * This ternary is the *only* place the scope rule lives. It used to be spelled inline at the
+   * operator door, which is why the doors that did not spell it reported a smaller set (#1010).
+   * Non-system scopes carry nothing: every finding in here is about the deployment as a whole, and
+   * a `--scope run` report is answering about one run.
+   */
+  readonly #doctorSupplier = (scope: DoctorScope): readonly Finding[] =>
+    scope === "system" ? this.supplementalSystemFindings() : [];
 
   /**
    * The authenticated operator socket's only application entry point. Reads and writes use
@@ -1236,6 +1244,14 @@ export class Daemon {
       });
     }
 
+    // The supplier is registered here and nowhere earlier: the lock is this daemon's, both early
+    // refusals have already returned without a doctor pass (the lock held by another instance,
+    // and the crash-loop backoff, which gives the lock back), and every doctor pass `start()`
+    // performs — the reconciliation below and the bootstrap park's re-checks — runs after this
+    // line. Registering before the lock is what let a daemon that was then refused replace the
+    // live daemon's supplier.
+    this.cp.doctor.setSupplementalFindings(this.#doctorSupplier);
+
     try {
       this.installContinuityCoordinator();
       await this.refreshCapacitySensors();
@@ -1253,6 +1269,7 @@ export class Daemon {
           } else {
             this.recordStartupFailure(reasonCode, { reconcile: report });
             this.uninstallContinuityCoordinator();
+            this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
             this.lock.release();
             this.#startedAt = null;
             return deny(reasonCode, "startup doctor did not permit dispatch resume", { reconcile: report });
@@ -1260,6 +1277,7 @@ export class Daemon {
         } else {
           this.recordStartupFailure(reasonCode, { reconcile: report });
           this.uninstallContinuityCoordinator();
+          this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
           this.lock.release();
           this.#startedAt = null;
           return deny(reasonCode, "startup doctor did not permit dispatch resume", { reconcile: report });
@@ -1297,6 +1315,7 @@ export class Daemon {
       const evidence = { error: safeErrorMessage(err) };
       this.recordStartupFailure(ReasonCode.DAEMON_STARTUP_FAILED, evidence);
       this.uninstallContinuityCoordinator();
+      this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
       this.lock.release();
       this.#startedAt = null;
       return deny(ReasonCode.DAEMON_STARTUP_FAILED, "daemon startup failed", evidence);
@@ -1341,7 +1360,7 @@ export class Daemon {
    * enforces nothing. What was missing was never a fence; it was an ordering the reader could
    * compare. That ordering is `generation`, and it is enforced where the comparison happens.
    *
-   * This method no longer passes the supplemental findings, and no longer has to: the constructor
+   * This method no longer passes the supplemental findings, and no longer has to: `start()`
    * registers `supplementalSystemFindings` with `cp.doctor`, so every system-scope report carries
    * them however it was asked for. The history is worth keeping, because it is the same mistake
    * twice. They began as `run()`'s third argument, and only the operator door passed it, so
@@ -1994,7 +2013,7 @@ export class Daemon {
    * A setter rather than a constructor argument: the CTO port is built after the daemon, from
    * listeners the daemon starts, so there is nothing to pass at construction. It is the route the
    * mention counters took through `setBuzzMentionReceipt`, and it feeds the same
-   * `supplementalSystemFindings` the constructor registers with `cp.doctor`.
+   * `supplementalSystemFindings` that `start()` registers with `cp.doctor`.
    * `startDaemonMcpListeners` calls it with the port it just built, which is the one seam a test can
    * drive with a real daemon and real listeners, so the wiring is exercised rather than asserted.
    */
@@ -2136,7 +2155,7 @@ export class Daemon {
    * Two call sites used to pass `telegramIngressFindings()` directly, so a third channel meant
    * editing both and hoping. A reader comparing them could not tell a deliberate difference from
    * an omission. That argument then repeated one layer out, at the callers of this method, and the
-   * constructor's `cp.doctor.setSupplementalFindings` is where it ends: this list has exactly one
+   * `cp.doctor.setSupplementalFindings` in `start()` is where it ends: this list has exactly one
    * caller now, and it is the doctor itself (#1010).
    */
   // No `canonicalExecutorPinFindings` any more (#886, withdrawn 2026-09-27). It compared the
@@ -2577,6 +2596,8 @@ export class Daemon {
     for (const timer of this.#timers) clearInterval(timer);
     this.#timers = [];
     this.uninstallContinuityCoordinator();
+    // Only its own: a successor that registered after this daemon keeps its supplier.
+    this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
     this.cp.audit.record({ kind: "DAEMON_STOPPED", evidence: { pid: process.pid } });
     this.lock.release();
   }

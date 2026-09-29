@@ -355,11 +355,16 @@ export class Doctor {
    * `scope === "system" ? … : []`, and a rule spelled in two places is a rule two readers can
    * disagree about.
    *
-   * Registering twice replaces, and never appends. A second supplier is a second composition root
-   * over one control plane — what a test that constructs a replacement daemon on the same control
-   * plane does — and the newest one is the live one. Appending would double every finding the
-   * previous supplier still reads, which is the one way this seam could make a report say something
-   * false about *how many* holders are unwakeable.
+   * Only the daemon holding the single-instance lock registers: `Daemon.start()` does it after the
+   * lock is its own and after every refusal that gives the lock back, so the registered supplier is
+   * the lock holder's. Constructing a daemon registers nothing — a second daemon over one control
+   * plane that is then refused the lock never becomes the supplier, and so cannot empty the live
+   * daemon's report of the holders only the live daemon can see. Registering twice still replaces
+   * rather than appends, which is what a successor that starts after its predecessor's lock is
+   * released does. Appending would double every finding the previous supplier still reads, which is
+   * the one way this seam could make a report say something false about *how many* holders are
+   * unwakeable. Removal is by identity (`clearSupplementalFindings`), so a predecessor stopping late
+   * leaves its successor's supplier in place.
    *
    * With nothing registered a report carries no supplemental findings, and says so by omission
    * rather than by a finding of its own. That is not an unmeasured state reported as clean: a
@@ -404,12 +409,25 @@ export class Doctor {
   /**
    * Registers the one supplier every door's report draws its supplemental findings from.
    *
-   * Called by the composition root that owns the listeners, before anything can serve a door. See
+   * Called by `Daemon.start()` once it holds the lock, before its first doctor pass and before any
+   * listener it owns can serve a door. See
    * `#supplementalFindings` for why this is a registration rather than an argument, what a second
    * registration does, and what a report carries before there has been one.
    */
   setSupplementalFindings(supplier: (scope: DoctorScope) => readonly Finding[]): void {
     this.#supplementalFindings = supplier;
+  }
+
+  /**
+   * Removes `supplier` only if it is still the registered one, and otherwise does nothing.
+   *
+   * The caller names what it registered rather than asking for "whatever is there", because the
+   * daemon that stops is not always the newest to register: a successor that registered after it
+   * holds the doctor's only supplier, and an unconditional clear from the old daemon's `stop()`
+   * would leave the successor's doors answering from nothing.
+   */
+  clearSupplementalFindings(supplier: (scope: DoctorScope) => readonly Finding[]): void {
+    if (this.#supplementalFindings === supplier) this.#supplementalFindings = null;
   }
 
   async run(

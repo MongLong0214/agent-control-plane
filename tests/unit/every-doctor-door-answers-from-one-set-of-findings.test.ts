@@ -1,5 +1,6 @@
-import { chmodSync } from "node:fs";
+import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { createConnection, type Socket } from "node:net";
+import { join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
@@ -187,13 +188,17 @@ const deploymentWithOneUnwakeableHolder = async (label: string) => {
   const ctoPeer = await initializedPeer(ctoPath, { token: TOKEN, ...cto }, NOT_A_MEMBER);
   const ceoPeer = await initializedPeer(hermesPath, { token: TOKEN, ...ceo }, MEMBER);
 
-  const close = async (): Promise<void> => {
+  /** The peers and the listeners, and not the daemon — what a handover closes before it stops. */
+  const closeDoors = async (): Promise<void> => {
     ctoPeer.destroy();
     ceoPeer.destroy();
     await listeners.close();
+  };
+  const close = async (): Promise<void> => {
+    await closeDoors();
     await daemon.stop();
   };
-  return { harness, daemon, roleKey, stateDir, ctoPeer, ceoPeer, close };
+  return { harness, daemon, roleKey, stateDir, cto, ctoPeer, ceoPeer, closeDoors, close };
 };
 
 describe("every door that answers whether the system is healthy answers from one set of findings", () => {
@@ -286,6 +291,121 @@ describe("every door that answers whether the system is healthy answers from one
       expect(unwakeableIn((response as { value: DoctorReport }).value)).toHaveLength(0);
     } finally {
       await close();
+    }
+  }, 180_000);
+});
+
+/**
+ * One automatic refresh — `reconcileContinuity`, the pass the capacity timer drives — and the report
+ * it audited and persisted.
+ *
+ * `health.json` carries the status and no findings, so the findings are read from the one
+ * `DOCTOR_REPORT` row the pass audited, and that row's status is tied to the persisted one so a row
+ * from some other pass cannot stand in for it. The same reading the wake-transport rows take.
+ */
+const refreshedAutomatically = async (
+  harness: ReturnType<typeof makeHarness>,
+  daemon: Daemon,
+  stateDir: string,
+  label: string,
+): Promise<{ persistedStatus: string | undefined; unwakeable: { code: string; observedEvidence?: unknown }[] }> => {
+  const auditedBefore = harness.cp.audit.byKind("DOCTOR_REPORT").length;
+  harness.clock.advance(10_000);
+  await daemon.reconcileContinuity(`one-set test: an automatic refresh after ${label}`);
+  const health = JSON.parse(readFileSync(join(stateDir, "health.json"), "utf8")) as {
+    doctor?: { status: string; checkedAt: string | null };
+  };
+  expect(health.doctor?.checkedAt).toBe(harness.clock.nowIso());
+  const audited = harness.cp.audit.byKind("DOCTOR_REPORT").slice(auditedBefore);
+  expect(audited).toHaveLength(1);
+  const report = audited[0]?.evidence as {
+    scope?: string;
+    status?: string;
+    findings?: { code: string; observedEvidence?: unknown }[];
+  };
+  expect(report.scope).toBe("system");
+  expect(report.status).toBe(health.doctor?.status);
+  return {
+    persistedStatus: health.doctor?.status,
+    unwakeable: (report.findings ?? []).filter((finding) => finding.code === CODE),
+  };
+};
+
+describe("only the daemon holding the lock supplies the findings every door answers from", () => {
+  it("a second daemon refused the lock leaves the live daemon's doors carrying its holder's finding", async () => {
+    // The registration used to run in the constructor, before `start()` takes the lock, so a
+    // second daemon over the same control plane replaced the live daemon's supplier whether or not
+    // it was then refused. It has no wake peers of its own, so from then on the live daemon's
+    // doors answered from a set with none of its holders in it — `HEALTHY`, with this one
+    // unwakeable.
+    const { harness, daemon, roleKey, stateDir, ctoPeer, close } =
+      await deploymentWithOneUnwakeableHolder("refused-second");
+    try {
+      // A competing instance, the way CP-S59 makes one in a single process: a live pid that is not
+      // this one holds the lock file.
+      writeFileSync(
+        join(stateDir, "agentcpd.lock"),
+        JSON.stringify({ pid: process.ppid, startedAt: harness.clock.nowIso(), path: "x" }),
+      );
+      const second = new Daemon(harness.cp, { stateDir });
+      const refused = await second.start();
+      expect(refused.allowed).toBe(false);
+      expect(refused.reasonCode).toBe(ReasonCode.DAEMON_ALREADY_RUNNING);
+      // What `main`'s shutdown handler does to a daemon whose start was refused: it is installed
+      // before `start()` and calls `stop()` on a signal during the backoff wait. A refused daemon
+      // registered nothing, so its stop must remove nothing either.
+      await second.stop();
+
+      // The door an agent asks, on the live daemon's own listener.
+      const body = await callTool(ctoPeer, "doctor_run", { scope: "system" });
+      expect(body.ok, body.message).toBe(true);
+      const report = body.value as DoctorReport;
+      expect(report.status).not.toBe("HEALTHY");
+      const unwakeable = unwakeableIn(report);
+      expect(unwakeable, "the live daemon's CTO door lost its holder's finding to a refused daemon")
+        .toHaveLength(1);
+      expect(unwakeable[0]?.observedEvidence).toMatchObject({ roleKey, role: Role.PRIMARY_CTO });
+
+      // And the live daemon's automatic refresh, which is what reaches `health.json`.
+      const refreshed = await refreshedAutomatically(harness, daemon, stateDir, "a refused second daemon");
+      expect(refreshed.unwakeable, "the live daemon's persisted evaluation lost its holder's finding")
+        .toHaveLength(1);
+      expect(refreshed.persistedStatus).not.toBe("HEALTHY");
+    } finally {
+      await close();
+    }
+  }, 180_000);
+
+  it("a successor that starts after its predecessor stops is the one the doors answer from", async () => {
+    // A handover within one control plane: the predecessor closes its doors and stops, which
+    // releases the lock and removes its own supplier; the successor then takes the lock and
+    // registers. The predecessor's port has no peers left, so a holder's finding can only come
+    // from the successor's supplier — a successor that never registered, or whose supplier the
+    // predecessor's stop removed, would answer with none.
+    const first = await deploymentWithOneUnwakeableHolder("handover");
+    await first.closeDoors();
+    await first.daemon.stop();
+
+    const successor = new Daemon(first.harness.cp, { stateDir: first.stateDir });
+    expect((await successor.start()).allowed).toBe(true);
+    const listeners = await startDaemonMcpListeners(first.harness.cp, first.stateDir, TOKEN, successor);
+    const [, ctoPath] = listeners.socketPaths;
+    if (!ctoPath) throw new Error("the successor's MCP listeners were not started");
+    const ctoPeer = await initializedPeer(ctoPath, { token: TOKEN, ...first.cto }, NOT_A_MEMBER);
+    try {
+      const body = await callTool(ctoPeer, "doctor_run", { scope: "system" });
+      expect(body.ok, body.message).toBe(true);
+      const unwakeable = unwakeableIn(body.value as DoctorReport);
+      expect(unwakeable, "the successor's CTO door carries no finding for its holder").toHaveLength(1);
+      expect(unwakeable[0]?.observedEvidence).toMatchObject({ roleKey: first.roleKey });
+
+      const refreshed = await refreshedAutomatically(first.harness, successor, first.stateDir, "a handover");
+      expect(refreshed.unwakeable, "the successor's persisted evaluation carries no finding for its holder")
+        .toHaveLength(1);
+    } finally {
+      ctoPeer.destroy();
+      await listeners.close();
+      await successor.stop();
     }
   }, 180_000);
 });

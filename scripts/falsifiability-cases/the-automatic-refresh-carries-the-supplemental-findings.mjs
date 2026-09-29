@@ -6,7 +6,8 @@
  * respect, persisted `HEALTHY` to `health.json`. Reading them inside `runSystemDoctorCheck` fixed
  * every automatic path and left the two MCP `doctor_run` doors -- which do not call it -- still
  * answering from the smaller set, so #1010 moved the set onto the `Doctor` itself: the daemon
- * registers one supplier at construction and every door draws from it.
+ * registers one supplier in `start()`, once it holds the single-instance lock, and every door
+ * draws from it.
  *
  * This row mutates that registration, because it is now the whole of what puts the findings in an
  * automatic evaluation. The replacement keeps a supplier registered and empties it rather than
@@ -19,8 +20,8 @@ const theAutomaticRefreshCarriesTheSupplementalFindings = {
   id: "the-automatic-refresh-carries-the-supplemental-findings",
   what: "the daemon's automatic doctor refresh includes the supplemental findings it persists a status from",
   file: "src/daemon/daemon.ts",
-  find: '    cp.doctor.setSupplementalFindings((scope) =>\n      scope === "system" ? this.supplementalSystemFindings() : []);\n',
-  replace: "    cp.doctor.setSupplementalFindings(() => []);\n",
+  find: "    this.cp.doctor.setSupplementalFindings(this.#doctorSupplier);\n",
+  replace: "    this.cp.doctor.setSupplementalFindings(() => []);\n",
   killedBy: [
     "tests/unit/the-wake-transport-qualifies-a-set-of-builds.test.ts::the automatic refresh does not persist HEALTHY while a connected holder is outside the set",
   ],

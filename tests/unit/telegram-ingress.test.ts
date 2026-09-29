@@ -239,12 +239,18 @@ const startLiveUnknownDaemonIngress = async () => {
     ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
   });
   const stateDir = tempDir("acp-telegram-live-recovery-");
+  // The startup doctor blocks on TRUSTED_GATE_CREDENTIAL_MISSING without this; the Buzz delivery
+  // row below installs it for the same reason.
+  harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
   const daemon = new Daemon(harness.cp, { stateDir });
-  const acquired = daemon.lock.acquire(harness.clock.nowIso());
-  expect(acquired.allowed).toBe(true);
-  // Ensure the health file exists before ingress starts. The daemon factory, not this test,
-  // owns every Telegram status transition written after this point.
-  daemon.writeHealth(null);
+  // Started, not handed a lock: production takes the lock only inside `start()`, and `start()` is
+  // also where the daemon registers the supplemental findings every doctor door draws from, so a
+  // daemon that only acquired its lock would answer these rows' doctor passes without the
+  // Telegram ingress finding they assert on (#1010). `start()` writes the health file too, before
+  // ingress starts; the daemon factory, not this test, owns every Telegram status transition
+  // written after this point.
+  const started = await daemon.start();
+  expect(started.allowed, JSON.stringify(started)).toBe(true);
   const fixture = liveUnknownTelegramBotApiFixture();
   const handled: string[] = [];
   const errors: unknown[] = [];
@@ -2072,7 +2078,7 @@ describe("Telegram production ingress", () => {
       expect(live.fixture.calls.filter((call) => call.method === "sendMessage")).toHaveLength(1);
     } finally {
       await live.listener.close();
-      live.daemon.lock.release();
+      await live.daemon.stop();
     }
   });
 
@@ -2097,7 +2103,7 @@ describe("Telegram production ingress", () => {
       )).toEqual([7_107, 7_117]);
     } finally {
       await live.listener.close();
-      live.daemon.lock.release();
+      await live.daemon.stop();
     }
   });
 
@@ -2136,7 +2142,7 @@ describe("Telegram production ingress", () => {
       expect(health.telegram).toMatchObject({ configured: true, running: true, disabledReason: null });
     } finally {
       await live.listener.close();
-      live.daemon.lock.release();
+      await live.daemon.stop();
     }
   });
 
