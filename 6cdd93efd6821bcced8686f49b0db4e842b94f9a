@@ -1,0 +1,5 @@
+Limit: Rollback tests run built dist, so a mutation requires a build before its test can measure the changed code.
+Ruled-out: positional otool -L parsing | its first entry can be an image identity, and position alone does not identify a load command
+Warn: Synthetic fixtures have hidden this linkage mistake twice; the regression must exercise a real MH_DYLIB with an outside install name.
+Record-Id: r-acp1016dylibid
+Provenance: inherited 7b8f1fca0588b6e1d3c2fc5fc469c608ee9f2699
