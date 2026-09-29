@@ -752,9 +752,12 @@ describe("deployment identity is required, deployment-private configuration (#76
 });
 
 describe("pure identity-derivation helpers", () => {
-  it("matches only a directly executed binary named claude — never an interpreter-launched script", () => {
+  it("matches only a directly executed binary named claude or an exact native versioned Claude path", () => {
     expect(looksLikeClaudeInvocation(["/usr/local/bin/claude", "--resume", "x"])).toBe(true);
     expect(looksLikeClaudeInvocation(["claude", "--resume", "x"])).toBe(true);
+    expect(
+      looksLikeClaudeInvocation(["/opt/claude/versions/2.1.283", "--resume", "x"]),
+    ).toBe(true);
     // The exact bypass this file's own claim-seam counterexample proves end to end: naming a
     // script `claude` and launching it through a legitimate interpreter must not match, because
     // the kernel-loaded image of that process is the interpreter, never the script argument
@@ -766,6 +769,12 @@ describe("pure identity-derivation helpers", () => {
     );
     expect(looksLikeClaudeInvocation(["/usr/bin/node", "/opt/claude/cli.js", "--session-id", "x"])).toBe(false);
     expect(looksLikeClaudeInvocation(["/usr/bin/node", "/opt/acp/mcp-server.js"])).toBe(false);
+    expect(looksLikeClaudeInvocation(["/opt/claude/versions/latest", "--session-id", "x"])).toBe(false);
+    expect(looksLikeClaudeInvocation(["/opt/claude/versions/2.1", "--session-id", "x"])).toBe(false);
+    expect(looksLikeClaudeInvocation(["/opt/claude/versions/02.1.283", "--session-id", "x"])).toBe(false);
+    expect(looksLikeClaudeInvocation(["/opt/claude/versions/2.1.283/extra", "--session-id", "x"])).toBe(false);
+    expect(looksLikeClaudeInvocation(["/opt/not-claude/versions/2.1.283", "--session-id", "x"])).toBe(false);
+    expect(looksLikeClaudeInvocation(["/opt/arbitrary-binary", "--session-id", "x"])).toBe(false);
   });
 
   it("extracts the session id from --session-id, never from a bare token, an embedded fragment, or a quoted value", () => {
@@ -954,6 +963,26 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       "SESSION_LIFECYCLE",
     ]);
     expect(after.audit_events).toBe((before.audit_events ?? 0) + 5);
+  });
+
+  it("production self-claim accepts an exact native versioned Claude argv[0]", async () => {
+    const core = makeCore();
+    const projectId = "prj_native_versioned_claude";
+    insertProject(core, projectId);
+    const nativeVersionedClaude = "/opt/claude/versions/2.1.283";
+    const subject = makeSubject(core, projectId, {
+      chain: standardChain({
+        argv: [nativeVersionedClaude, "--session-id", CANON],
+        command: `${nativeVersionedClaude} --session-id ${CANON}`,
+      }),
+    });
+
+    const result = await subject.claim(baseRequest(core, projectId));
+
+    expect(result.allowed, JSON.stringify(result)).toBe(true);
+    if (!result.allowed) return;
+    expect(result.value.binding.role).toBe(Role.PRIMARY_CTO);
+    expect(result.value.derivedSessionUuid).toBe(CANON);
   });
 
   it("clause 1 — a caller-supplied session UUID is checked against the derived one, never substituted", async () => {

@@ -225,6 +225,10 @@ const writeVersionedClaude = (version: string): string => {
 const writeVersionFileExecutable = (version: string): string =>
   reusableExecutableImage(join("versions", version));
 
+/** The native updater layout uses the version itself as the executable filename. */
+const writeNativeVersionedClaude = (version: string): string =>
+  reusableExecutableImage(join("claude", "versions", version));
+
 const waitUntil = async (predicate: () => boolean, description: string, timeoutMs = 10_000): Promise<void> => {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
@@ -314,6 +318,34 @@ describe("real process ancestry — ps-backed, not a fake", () => {
     // matched could never be told apart from a `cwd` the probe failed to read — which is the
     // whole defect, and it is also what a broken `-n`/`-P` field parse would look like here.
     expect(snapshot!.cwdProbeFailure).toBeNull();
+  });
+
+  it("derives a live native Claude executable stored at claude/versions/x.y.z", async () => {
+    const root = tempRoot();
+    const claude = writeNativeVersionedClaude("2.1.283");
+    const sessionUuid = "66666666-6666-4666-8666-666666666666";
+    const child = spawnHeld(claude, ["--session-id", sessionUuid], root);
+    await waitUntil(() => child.pid !== undefined, "child pid to be assigned");
+
+    let snapshot = defaultProcessAncestryInspector.snapshot(child.pid!);
+    for (let attempt = 0; (!snapshot || snapshot.argv === null) && attempt < 40; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      snapshot = defaultProcessAncestryInspector.snapshot(child.pid!);
+    }
+    expect(snapshot).not.toBeNull();
+    expect(snapshot!.argv).not.toBeNull();
+    expect(snapshot!.argv![0]).toBe(claude);
+    expect(looksLikeClaudeInvocation(snapshot!.argv!)).toBe(true);
+
+    let derived = deriveClaimantIdentity(child.pid!, defaultProcessAncestryInspector);
+    for (let attempt = 0; !derived.allowed && attempt < 40; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      derived = deriveClaimantIdentity(child.pid!, defaultProcessAncestryInspector);
+    }
+    expect(derived.allowed, JSON.stringify(derived)).toBe(true);
+    if (!derived.allowed) return;
+    expect(derived.value.pid).toBe(child.pid);
+    expect(derived.value.sessionUuid).toBe(sessionUuid);
   });
 
   it(
