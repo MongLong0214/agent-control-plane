@@ -476,6 +476,9 @@ export class CapacityMonitor {
               // budget instead. The telemetry `dims` above keeps its own name deliberately: that
               // path calls `redact` only and has no allowlist or length refusal.
               error: reading.error ?? null,
+              runtimeHealth: reading.runtimeHealth,
+              observedAt: reading.observedAt,
+              source: reading.source,
               observationAgeMs: preserved.ageMs,
               staleGraceMs: this.#options.staleGraceMs,
             },
@@ -894,6 +897,36 @@ export class CapacityMonitor {
     );
     if (rows.length === 0) return null;
     const first = rows[0]!;
+    // A failed quota collector can still measure runtime health. Its own snapshot must
+    // remain at its own time, while a live operator quota keeps its original age and rows.
+    if (first.sensor_health === "ERROR" && first.runtime_health !== "UNKNOWN") {
+      const observed = this.db.all<RawCapacity>(
+        `SELECT * FROM capacity_snapshots
+          WHERE provider = ? AND observed_at = (
+            SELECT MAX(observed_at) FROM capacity_snapshots
+             WHERE provider = ? AND observed_at < ? AND sensor_health != 'ERROR')`,
+        [provider, provider, first.observed_at],
+      );
+      const provenance = observed[0] && operatorObservationFromSource(observed[0].source);
+      if (provenance) {
+        const preserved = this.enrich({
+          provider,
+          sensorHealth: observed[0]!.sensor_health,
+          runtimeHealth: first.runtime_health,
+          observedAt: observed[0]!.observed_at,
+          source: provenance.source,
+          buckets: observed.map((row) => ({
+            id: row.bucket_id,
+            remainingPercent: row.remaining_percent,
+            resetAt: row.reset_at,
+            capabilities: JSON.parse(row.capabilities_json) as string[],
+          })),
+        });
+        if (preserved.ageMs <= this.#options.staleGraceMs) {
+          return { ...preserved, operatorObservation: provenance };
+        }
+      }
+    }
     const operatorObservation = operatorObservationFromSource(first.source);
     const enriched = this.enrich({
       provider,
@@ -1239,21 +1272,24 @@ export class CapacityMonitor {
     const current = this.current(reading.provider);
     if (!current?.operatorObservation) return null;
     if (current.ageMs > this.#options.staleGraceMs) return null;
+    // UNKNOWN contributes no runtime evidence. A measured verdict is persisted as the
+    // collector's own empty-quota reading, never as a rewrite of the operator's rows.
+    if (reading.runtimeHealth !== "UNKNOWN" && reading.observedAt > current.observedAt) {
+      this.record({ ...reading, buckets: [] });
+    }
     const preserved = reading.runtimeHealth === "UNKNOWN" || reading.runtimeHealth === current.runtimeHealth
       ? current
-      : {
-          ...this.record({
-            provider: current.provider,
-            sensorHealth: current.sensorHealth,
-            runtimeHealth: reading.runtimeHealth,
-            observedAt: current.observedAt,
-            source: current.source,
-            buckets: current.buckets,
-          }, storedOperatorObservationSource(current.operatorObservation)),
-          operatorObservation: current.operatorObservation,
-        };
+      : this.enrich({
+          provider: current.provider,
+          sensorHealth: current.sensorHealth,
+          runtimeHealth: reading.runtimeHealth,
+          observedAt: current.observedAt,
+          source: current.source,
+          buckets: current.buckets,
+        });
     return {
       ...preserved,
+      operatorObservation: current.operatorObservation,
       supersededCollectorError: { source: reading.source, error: reading.error ?? null },
     };
   }
