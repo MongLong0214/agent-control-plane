@@ -337,15 +337,16 @@ export const defaultProcessAncestryInspector: ProcessAncestryInspector = {
 };
 
 /**
- * Tests whether `argv[0]`'s basename is `claude` — the shape of a directly executed compiled binary
- * (`/path/to/claude ...`) only. The vector is the kernel's copy of the real argv, never a
+ * Tests whether `argv[0]` is one of the two native Claude invocation shapes: a directly executed
+ * binary whose basename is `claude` (`/path/to/claude ...`), or the current native updater layout
+ * `<dir>/claude/versions/<x.y.z>`. The vector is the kernel's copy of the real argv, never a
  * `ps`-rendered approximation of it, but its first element is still whatever the `execve` caller
  * chose to pass. By convention that is the path or name it invoked; nothing binds it to the file
  * the kernel loaded — `exec -a`, or node's `spawn(file, args, { argv0 })`, sets it to any string.
- * So this is a basename test on a caller-chosen string, not a statement about the image. It is
- * still worth keeping: the ancestry walk stops at the first ancestor it matches, so it is what
- * tells the claude process apart from the shells and tools between it and the caller, and a
- * process that does not even present itself as claude never becomes the claimant.
+ * So these are invocation-shape tests on a caller-chosen string, not statements about the image.
+ * They are still worth keeping: the ancestry walk stops at the first ancestor it matches, so they
+ * distinguish the claude process from the shells and tools between it and the caller, and a
+ * process that presents neither permitted shape never becomes the claimant.
  *
  * Deliberately does **not** also match a second element whose basename is `claude` — an
  * interpreter-launched script, `node /path/to/claude ...`. For that shape the kernel-loaded image
@@ -353,17 +354,21 @@ export const defaultProcessAncestryInspector: ProcessAncestryInspector = {
  * stand as the claimant on the strength of whichever legitimate interpreter launched it.
  *
  * This is now the only process-shape check between a same-uid process and the claim, and it is a
- * check on a name. It used to be the first half of a pair: the executing image was then compared
- * against a deployment-configured version, realpath and sha256, which is what tied the name read
- * here to the bytes actually running. That comparison is withdrawn (clause 2 in
- * `verifyClaudeIdentity`), so any image passes here once its `argv[0]` ends in `claude` — renamed,
- * copied, or simply exec'd under that name — and nothing downstream examines what it is. What
- * still bounds the claim is the kernel peer credential on the claim socket, the configured session
- * UUID derived from this process's own argv, and the project that UUID's entry names.
+ * check on a name or exact updater path shape. It used to be the first half of a pair: the
+ * executing image was then compared against a deployment-configured version, realpath and sha256,
+ * which is what tied the name read here to the bytes actually running. That comparison is
+ * withdrawn (clause 2 in `verifyClaudeIdentity`), so neither accepted `argv[0]` form attests the
+ * loaded image. What still bounds the claim is the kernel peer credential on the claim socket, the
+ * configured session UUID derived from this process's own argv, its PID/start-identity rechecks,
+ * and the project that UUID's entry names.
  */
+const NATIVE_VERSIONED_CLAUDE_PATH =
+  /^.+\/claude\/versions\/(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
+
 export const looksLikeClaudeInvocation = (argv: readonly string[]): boolean => {
   const [firstElement] = argv;
-  return firstElement !== undefined && /(^|\/)claude$/.test(firstElement);
+  return firstElement !== undefined &&
+    (/(^|\/)claude$/.test(firstElement) || NATIVE_VERSIONED_CLAUDE_PATH.test(firstElement));
 };
 
 /**
