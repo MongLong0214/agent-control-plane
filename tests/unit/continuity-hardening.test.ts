@@ -347,7 +347,7 @@ describe("capacity sensor honesty (§14.2)", () => {
       error: "synthetic quota timeout with a measured runtime outage",
       buckets: [],
     });
-    const [refreshed] = await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["gpt"]);
+    const refreshed = (await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["gpt"]))[0]!;
     const current = cp.capacity.current("gpt")!;
     for (const capacity of [refreshed, current]) {
       expect(capacity).toMatchObject({
@@ -400,7 +400,7 @@ describe("capacity sensor honesty (§14.2)", () => {
       error: "synthetic quota timeout with a healthy runtime",
       buckets: [],
     });
-    const [refreshed] = await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["gpt"]);
+    const refreshed = (await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["gpt"]))[0]!;
     const current = cp.capacity.current("gpt")!;
     for (const capacity of [refreshed, current]) {
       expect(capacity).toMatchObject({
