@@ -4709,6 +4709,17 @@ const GUARDS = [
     ],
   },
   {
+    // #1016. A dylib's LC_ID_DYLIB can name its build-machine path while every library it loads
+    // is a system library. Counting that identity as a load refuses a self-contained closure.
+    what: "#1016: a dylib's own install name is not a library the sealed closure loads",
+    file: "src/deploy/rollback-pair.ts",
+    find: 'const MACH_O_LOAD_COMMANDS = new Set([\n  "LC_LOAD_DYLIB",\n',
+    replace: 'const MACH_O_LOAD_COMMANDS = new Set([\n  "LC_ID_DYLIB",\n  "LC_LOAD_DYLIB",\n',
+    killedBy: [
+      "tests/process/rollback-pair-wal.test.ts::seals a real dylib whose own install name points outside the closure",
+    ],
+  },
+  {
     // #774 B1/H3. Before B1, `install-launchd.sh` bound the launcher to whatever `command -v node`
     // resolved on the installing host — outside the closure a seal actually copies — so this check
     // always fired against a real installer's own output and no unit anchored it. Neutering it lets

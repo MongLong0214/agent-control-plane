@@ -565,6 +565,13 @@ const assertGenerationBindings = (
 };
 
 const SYSTEM_LIBRARY_PREFIXES = ["/usr/lib/", "/System/Library/", "/System/iOSSupport/"];
+const MACH_O_LOAD_COMMANDS = new Set([
+  "LC_LOAD_DYLIB",
+  "LC_LOAD_WEAK_DYLIB",
+  "LC_REEXPORT_DYLIB",
+  "LC_LOAD_UPWARD_DYLIB",
+  "LC_LAZY_LOAD_DYLIB",
+]);
 /** Mach-O magic numbers: 64/32-bit, both endiannesses, and the fat-binary wrappers. */
 const MACH_O_MAGIC = new Set([0xfeedfacf, 0xcffaedfe, 0xfeedface, 0xcefaedfe, 0xcafebabe, 0xbebafeca]);
 
@@ -584,8 +591,9 @@ const isMachO = (path: string): boolean => {
  *
  * A pair that carries the interpreter but leaves a dylib behind is self-contained only until the
  * machine it was sealed on changes, and the way that failure shows up is a rollback that installs
- * cleanly and then will not start. So every Mach-O in the sealed tree is asked what it links
- * against, recursively, and anything absolute that is neither a macOS system library nor inside
+ * cleanly and then will not start. So every Mach-O in the sealed tree is asked which libraries its
+ * load commands name, recursively; its own LC_ID_DYLIB install name is an identity, not a load.
+ * Anything absolute that is neither a macOS system library nor inside
  * this tree is a refusal at seal time — where it is a message, rather than at start time, where it
  * is an outage.
  *
@@ -603,7 +611,7 @@ const assertClosureIsSelfContained = (runtimeRoot: string): void => {
     try {
       // Bounded: reading a Mach-O's linkage is a local read, and the catch below already turns a
       // failure into a refusal rather than an assumption (#859).
-      linkage = execFileSync("/usr/bin/otool", ["-L", absolute], {
+      linkage = execFileSync("/usr/bin/otool", ["-l", absolute], {
         encoding: "utf8",
         stdio: "pipe",
         timeout: 10_000,
@@ -614,9 +622,16 @@ const assertClosureIsSelfContained = (runtimeRoot: string): void => {
         member,
       });
     }
-    for (const line of linkage.split("\n").slice(1)) {
-      const dependency = line.trim().split(" ")[0];
-      if (!dependency || !dependency.startsWith("/")) continue;
+    for (const block of linkage.split(/^Load command \d+\s*$/m).slice(1)) {
+      const command = /^\s*cmd (LC_[A-Z_]+)\s*$/m.exec(block)?.[1];
+      if (!command || !MACH_O_LOAD_COMMANDS.has(command)) continue;
+      const dependency = /^\s*name (.+?) \(offset \d+\)\s*$/m.exec(block)?.[1];
+      if (!dependency) {
+        throw acpError(ReasonCode.INTERNAL_ERROR, "the dynamic linkage of a sealed binary could not be read", {
+          member,
+        });
+      }
+      if (!dependency.startsWith("/")) continue;
       if (SYSTEM_LIBRARY_PREFIXES.some((prefix) => dependency.startsWith(prefix))) continue;
       if (dependency.startsWith(`${runtimeRoot}/`)) continue;
       external.push({ member, dependency });
