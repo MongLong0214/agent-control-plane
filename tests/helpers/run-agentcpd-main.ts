@@ -1,5 +1,5 @@
 import { main } from "../../src/daemon/agentcpd.ts";
-import { defaultConfig } from "../../src/app/control-plane.ts";
+import { ControlPlane, defaultConfig } from "../../src/app/control-plane.ts";
 import { NotificationKind } from "../../src/ceo/production-gate.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { isAcpError } from "../../src/core/errors.ts";
@@ -194,6 +194,35 @@ if (process.env["ACP_STARTUP_TEST_SEED"] === "1") {
     { mode: 0o600 },
   );
   chmodSync(envFile, 0o600);
+}
+
+/**
+ * Which projects this deployment has registered before the daemon starts, as a comma-separated
+ * list of project ids.
+ *
+ * A canonical entry naming a project the registry does not hold refuses startup, so a scenario
+ * whose subject is activation has to register what its entries name. The list is supplied rather
+ * than derived from `ACP_CANONICAL_SESSIONS_JSON`: deriving it would register whatever the
+ * configured value happened to say, and then no case here — nor any future one — could reach that
+ * refusal, because the fixture would have repaired every deployment before `main` ever read it.
+ *
+ * Registered through `projects.register`, the same call an operator's registration goes through,
+ * on a control plane opened and closed before `main` opens its own.
+ */
+const registerProjectIds = (process.env["ACP_STARTUP_TEST_REGISTER_PROJECTS"] ?? "")
+  .split(",")
+  .map((projectId) => projectId.trim())
+  .filter((projectId) => projectId.length > 0);
+if (registerProjectIds.length > 0) {
+  const seed = new ControlPlane(config);
+  try {
+    for (const projectId of registerProjectIds) {
+      const registered = seed.projects.register({ name: `startup test ${projectId}`, projectId });
+      if (!registered.allowed) throw new Error(`${registered.reasonCode}: ${registered.message}`);
+    }
+  } finally {
+    seed.close();
+  }
 }
 
 if (process.env["ACP_STARTUP_TEST_PARK"] === "1") {

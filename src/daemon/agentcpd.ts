@@ -3120,6 +3120,53 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     throw err;
   }
 
+  // The configured set is parsed and checked here, before `daemon.start()`, not beside the listener
+  // it configures. `start()` does not always return: a startup doctor finding eligible for the
+  // bootstrap park waits in `parkForBootstrap()` for an observation, holding the lock with an
+  // operator door open, and a denied start reports its own error first. A check placed after
+  // `start()` is skipped on both paths, so a deployment with an unregistered project and no usable
+  // capacity parked instead of refusing (review ACP1014-R1-01).
+  //
+  // Every entry's project must already be in the `projects` registry. The parse reads the value's
+  // shape and its internal consistency; neither can see whether the project an entry entitles a
+  // session to hold `PRIMARY_CTO` of was ever registered. Without this, a deployment configured
+  // with an unregistered project started the listener and reported itself up while the entitlement
+  // it held named a project no row exists for.
+  //
+  // Refused, not repaired and not dropped: a silently dropped entry is a session that can never
+  // prove it may start work, with nothing saying why.
+  //
+  // Existence only — deliberately not availability. Whether a registered project is suspended or
+  // not HEALTHY is a runtime condition, decided while the daemon runs by the code that owns it, and
+  // it changes without the configuration changing; refusing startup on it would refuse a deployment
+  // that is merely paused, and the daemon that must come up to unpause it is this one. What is
+  // checked here is the one thing no later event can make true on its own: a project that was
+  // never registered at all. Do not widen this to availability.
+  let canonicalSessions: readonly CanonicalAdoptableSession[] | null = null;
+  if (canonicalActivationPresentCount > 0) {
+    try {
+      canonicalSessions = configuredCanonicalSessions(canonicalActivationValues["ACP_CANONICAL_SESSIONS_JSON"]);
+      const unregisteredEntryIndex = canonicalSessions.findIndex(
+        (entry) => cp.projects.get(entry.projectId) === null,
+      );
+      if (unregisteredEntryIndex !== -1) {
+        // This path's refusal shape: it names the variable and never its contents. The zero-based
+        // index and the entry count are what let an operator find the offending entry in the value
+        // they set, without this line quoting the project, the session or the actor it holds.
+        throw new Error(
+          `ACP_CANONICAL_SESSIONS_JSON is invalid: entry ${unregisteredEntryIndex} of ` +
+            `${canonicalSessions.length} names a project that is not registered`,
+        );
+      }
+    } catch (err) {
+      // Nothing past this point has started yet: the session-launch channel and the control plane
+      // are the two things open, and both are closed before the refusal leaves.
+      await sessionLaunch.close();
+      cp.close();
+      throw err;
+    }
+  }
+
   const buzzTransport = new BuzzCliTransport(
     process.env["ACP_BUZZ_BINARY"] ?? "buzz",
     process.env["ACP_BUZZ_CHANNEL"] ?? null,
@@ -3246,7 +3293,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         ...(adoptHermesIncumbent ? { adoptHermesIncumbent } : {}),
       },
     );
-    if (canonicalActivationPresentCount === 0) {
+    if (canonicalSessions === null) {
       // Disabled: no partial credential surface is exposed, no socket is bound, and normal
       // startup continues exactly as it would for a deployment that has never heard of this
       // feature. The diagnostic names only the variables themselves — no value, secret or
@@ -3255,7 +3302,6 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         `canonical self-claim disabled: none of ${CANONICAL_ACTIVATION_VARS.join(", ")} is set\n`,
       );
     } else {
-      const canonicalSessions = configuredCanonicalSessions(canonicalActivationValues["ACP_CANONICAL_SESSIONS_JSON"]);
       // No `daemon.setCanonicalExecutorVersion` call any more. It handed the deployment's required
       // executor version to the system report so #886 could compare it against the build the wake
       // transport was qualified on. With no version pin on the claim there was nothing to hand it,

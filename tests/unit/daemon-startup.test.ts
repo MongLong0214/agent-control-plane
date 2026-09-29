@@ -115,6 +115,14 @@ const runMain = async (input: {
   expectBuzzMessage?: boolean;
   /** Canonical self-claim activation-group overrides; see `CANONICAL_ACTIVATION_VARIABLES`. */
   canonical?: NodeJS.ProcessEnv;
+  /**
+   * Project ids this deployment has registered before `main` runs. A configured canonical entry
+   * naming a project the registry does not hold refuses startup, so a case that expects the
+   * listener to come up has to say which projects exist — see `tests/helpers/run-agentcpd-main.ts`,
+   * which registers them. Always passed to the child, empty included, so a value inherited from the
+   * developer's own environment cannot register a project no case here asked for.
+   */
+  registerProjects?: readonly string[];
 }): Promise<MainResult> => {
   // macOS sockaddr_un paths are short; the repository's temp worktree path is long enough
   // to make the operator socket exceed that OS limit and would test the wrong failure.
@@ -142,6 +150,7 @@ const runMain = async (input: {
     ACP_OPERATOR_TOKEN: "startup-operator-token",
     ACP_OPERATOR_ACTOR: "startup-owner",
     ACP_STARTUP_TEST_ROOT: root,
+    ACP_STARTUP_TEST_REGISTER_PROJECTS: (input.registerProjects ?? []).join(","),
     ...(input.seedState ? { ACP_STARTUP_TEST_SEED: "1" } : {}),
     ...(input.expectTelegram ? { ACP_STARTUP_TEST_EXPECT_TELEGRAM: "1" } : {}),
     ...(input.expectPromptFlow ? { ACP_STARTUP_TEST_EXPECT_PROMPT_FLOW: "1" } : {}),
@@ -299,11 +308,18 @@ describe("agentcpd main Telegram startup composition", () => {
 describe("canonical self-claim activation is an atomic pre-effect daemon contract", () => {
   // Synthetic throughout — never a value that names a real deployment's session, channel, path,
   // hash, or version.
+  /**
+   * The one project the complete group's single entry names. Written once and referenced by both
+   * the configured value and every `registerProjects` argument below: the daemon refuses startup
+   * when an entry names a project the registry does not hold, so two spellings of this id would
+   * make an activation case fail on the registry check while reading as a feature regression.
+   */
+  const CANONICAL_PROJECT_ID = "startup-test-project";
   const COMPLETE_CANONICAL_ENV: NodeJS.ProcessEnv = {
     ACP_CANONICAL_SESSIONS_JSON: JSON.stringify([
       {
         sessionUuid: "99999999-9999-4999-8999-999999999999",
-        projectId: "startup-test-project",
+        projectId: CANONICAL_PROJECT_ID,
         buzzActorId: "buzz:startup-test-canonical-cto",
       },
     ]),
@@ -491,6 +507,7 @@ describe("canonical self-claim activation is an atomic pre-effect daemon contrac
       buzz: true,
       buzzOwnerIdentity: true,
       canonical: COMPLETE_CANONICAL_ENV,
+      registerProjects: [CANONICAL_PROJECT_ID],
     });
     const diagnostics = `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
     expect(result.status, diagnostics).toBe(0);
@@ -501,7 +518,11 @@ describe("canonical self-claim activation is an atomic pre-effect daemon contrac
   }, 40_000);
 
   it("starts the canonical self-claim listener when the full synthetic three-variable group is configured", async () => {
-    const result = await runMain({ seedState: true, canonical: COMPLETE_CANONICAL_ENV });
+    const result = await runMain({
+      seedState: true,
+      canonical: COMPLETE_CANONICAL_ENV,
+      registerProjects: [CANONICAL_PROJECT_ID],
+    });
 
     const diagnostics =
       `status=${result.status}\nresidue=${JSON.stringify(result.residue)}\n` +
@@ -532,7 +553,11 @@ describe("canonical self-claim activation is an atomic pre-effect daemon contrac
   });
 
   it("starts the listener for a complete group still carrying the withdrawn executor variables, and stays disabled for those variables alone", async () => {
-    const carried = await runMain({ seedState: true, canonical: { ...COMPLETE_CANONICAL_ENV, ...WITHDRAWN_EXECUTOR_ENV } });
+    const carried = await runMain({
+      seedState: true,
+      canonical: { ...COMPLETE_CANONICAL_ENV, ...WITHDRAWN_EXECUTOR_ENV },
+      registerProjects: [CANONICAL_PROJECT_ID],
+    });
     const carriedDiagnostics = `status=${carried.status}\nstdout:\n${carried.stdout}\nstderr:\n${carried.stderr}`;
     expect(carried.status, carriedDiagnostics).toBe(0);
     expect(carried.stdout, carriedDiagnostics).toContain("canonical self-claim listener started");

@@ -53,6 +53,13 @@ it("completes daemon startup with a revoked PRIMARY_CTO binding and keeps the cl
     seed.db.run(`INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)`, [
       "startup-project", "startup revoked binding", systemClock.nowIso(),
     ]);
+    // The project the canonical activation entry below names, which is deliberately not the one
+    // whose PRIMARY_CTO binding this case revokes: startup refuses an entry naming a project the
+    // registry does not hold, so without this row the daemon never reaches the claim door and the
+    // revoked-binding assertions below would be measuring the registry check instead.
+    seed.db.run(`INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)`, [
+      "startup-test-project", "startup canonical entitlement", systemClock.nowIso(),
+    ]);
     const session = seed.sessions.create({ provider: "claude", model: "startup-cto" });
     expect(seed.sessions.transition(session.sessionId, SessionLifecycle.READY, "startup test").allowed).toBe(true);
     expect(seed.sessions.bindBuzzActor({
