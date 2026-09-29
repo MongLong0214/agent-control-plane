@@ -60,6 +60,22 @@ export interface RoleCoveragePlan {
    * into a verdict. A consumer that blocks on missing coverage must check this first.
    */
   unmeasured: string[];
+  /**
+   * Required roles continuity revoked for want of coverage and nobody holds yet (#954).
+   *
+   * A third thing `uncovered` cannot say. "No provider can staff this role" and "a provider can
+   * staff it and the role is empty" are different states, and the second one had no field, no
+   * status and no reader: continuity revoked a binding because the plan could not staff it, the
+   * plan could staff it again 2m29s later, and coverage reported itself whole with the role still
+   * unbound five days on. `outcome` is therefore never `FULL_COVERAGE` while this list is
+   * non-empty — coverage is not whole when one of its roles is empty — and `restore()` reads it to
+   * find what it owes.
+   *
+   * Deliberately not folded into `uncovered`: the doctor blocks a cold daemon on
+   * `NO_VALID_COVERAGE` and scores `unmeasured` against `uncovered`, so a role that *can* be
+   * staffed must not arrive there wearing the word for one that cannot.
+   */
+  restorationPending: string[];
   providers: Array<{
     provider: string;
     optional: boolean;
@@ -72,6 +88,31 @@ export interface RoleCoveragePlan {
 
 /** §14.5 — Grok is an optional adversarial reviewer and never a critical dependency. */
 const OPTIONAL_PROVIDERS: ReadonlySet<string> = new Set(["grok"]);
+
+/**
+ * The revocation reasons continuity writes when it could not put a provider behind a bound role
+ * (`Daemon.reconcileContinuity`, through `revokePausedBinding`).
+ *
+ * Declared here because this module reads them back: `assignments.revoked_reason` is the only
+ * durable thing that tells a revocation continuity performed from an operator release, and the
+ * difference decides whether the role is still owed a binding. The literal text is load-bearing —
+ * every past revocation on a live deployment already carries it in `assignments` and in
+ * `BINDING_REVOKED` — so it is shared between the writer and this reader rather than spelled twice.
+ */
+export const CONTINUITY_COVERAGE_REVOCATION_REASON = "coverage plan cannot staff the bound role";
+
+/** A planned failover that returned without leaving the ready binding it promised. */
+export const CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON =
+  "continuity failover did not leave a ready planned binding";
+
+/** The prefix of the third such reason, whose tail is the refused failover's reason code. */
+export const CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX = "continuity failover refused: ";
+
+/** The exact reasons above, for the reader that has a `revoked_reason` and needs its origin. */
+export const CONTINUITY_REVOCATION_REASONS: readonly string[] = [
+  CONTINUITY_COVERAGE_REVOCATION_REASON,
+  CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON,
+];
 
 /** Preferred normal binding (§15.1) in priority order per capability. */
 const PREFERENCE: Readonly<Record<string, readonly string[]>> = {
@@ -304,12 +345,26 @@ export class ContinuityKernel {
       });
     }
 
-    const outcome: CoverageOutcome =
+    // #954 — the roles this plan can staff that nobody holds. `bindings.active` is the only
+    // authority for who holds a role now; `assignments` is where the revocation stayed visible
+    // after the binding went.
+    const restorationPending = requiredRoles
+      .filter((role) => this.bindings.active(role.roleKey) === null && this.continuityOwesBinding(role.roleKey))
+      .map((role) => role.roleKey);
+
+    const staffable: CoverageOutcome =
       uncovered.length === 0
         ? "FULL_COVERAGE"
         : uncovered.length < requiredRoles.length
           ? "PARTIAL_COVERAGE"
           : "NO_VALID_COVERAGE";
+    // Coverage is not whole while one of its roles is empty, and this is the only place that can
+    // say so: every consumer downstream reads this one word. `staffable` keeps the question this
+    // module was built to answer — can these roles be staffed at all — because callers pin that
+    // meaning; the answer that cannot be wrong in this direction is composed from it here rather
+    // than by widening `uncovered`, which decides the doctor's blocking finding.
+    const outcome: CoverageOutcome =
+      staffable === "FULL_COVERAGE" && restorationPending.length > 0 ? "PARTIAL_COVERAGE" : staffable;
 
     const anyFallback = assignments.some((a) => a.reason === "fallback");
     const requiredProvidersDown = [...byProvider.values()].filter(
@@ -329,13 +384,19 @@ export class ContinuityKernel {
           : ContinuityMode.NORMAL;
 
     const action: CoverageAction =
-      outcome === "NO_VALID_COVERAGE"
+      staffable === "NO_VALID_COVERAGE"
         ? "SURVIVAL"
-        : outcome === "PARTIAL_COVERAGE"
+        : staffable === "PARTIAL_COVERAGE"
           ? this.partialAction(byProvider)
-          : anyFallback
-            ? "FALLBACK_ROLE"
-            : "FALLBACK_ROLE";
+          // Read from `staffable`, not from the composed `outcome`: nothing can be given to a role
+          // nobody holds, and no quota reset will change that, so `partialAction` would have
+          // offered WAIT_FOR_RESET — a wait on the wrong thing — whenever a window happened to
+          // reset within two hours.
+          : restorationPending.length > 0
+            ? "PAUSE_NEW_WORK"
+            : anyFallback
+              ? "FALLBACK_ROLE"
+              : "FALLBACK_ROLE";
 
     return {
       outcome,
@@ -345,6 +406,7 @@ export class ContinuityKernel {
       assignments,
       uncovered,
       unmeasured,
+      restorationPending,
       providers: [...byProvider.values()].map((c) => ({
         provider: c.provider,
         optional: OPTIONAL_PROVIDERS.has(c.provider),
@@ -399,6 +461,7 @@ export class ContinuityKernel {
           outcome: plan.outcome,
           action: plan.action,
           uncovered: plan.uncovered,
+          restorationPending: plan.restorationPending,
         },
       });
       }
@@ -537,11 +600,34 @@ export class ContinuityKernel {
     const plan = await this.evaluate("provider restoration");
     const restored: string[] = [];
     const deferred: Array<{ roleKey: string; reasonCode: string }> = [];
+    /** Pending needs this pass had already recorded; see the audit note at the end of the loop. */
+    let alreadyRecorded = 0;
 
     for (const assignment of plan.assignments) {
-      if (!assignment.provider || assignment.reason !== "preferred") continue;
       const current = this.bindings.active(assignment.roleKey);
-      if (!current || current.mode === "PREFERRED") continue;
+      if (!current) {
+        // #954 — the role is empty because continuity revoked it when no provider could staff it,
+        // and the plan can staff it again now. Restoration records what is owed and stops here.
+        //
+        // It stops because this is not continuity's binding to create. The canonical PRIMARY_CTO
+        // conversation is adopted in place by a claim on the self-claim socket
+        // (`src/registry/canonical-self-claim.ts`, admitted by `startCanonicalSelfClaimListener`),
+        // which derives who is asking from process ancestry and an entitlement this module cannot
+        // check and must not stand in for; the CEO's generation 1 comes only from the once-ever
+        // possession-proven bootstrap. Writing a fresh assignment row here would hand out by
+        // recovery what the design requires a claim for — and `switchTo` would write one: with no
+        // active binding the target attestation cannot match, a surviving switch is downgraded to
+        // REPLACED, and the mint path runs. `Daemon.reconcileContinuity` refuses the same thing at
+        // its own loop for the same reason.
+        //
+        // A role the plan cannot staff is left to `uncovered`, which already says that.
+        if (!assignment.provider || !plan.restorationPending.includes(assignment.roleKey)) continue;
+        deferred.push({ roleKey: assignment.roleKey, reasonCode: ReasonCode.BINDING_REVOKED });
+        if (!this.recordRestorationAwaitsClaim(assignment.roleKey, assignment.provider)) alreadyRecorded += 1;
+        continue;
+      }
+      if (!assignment.provider || assignment.reason !== "preferred") continue;
+      if (current.mode === "PREFERRED") continue;
 
       const session = this.sessions.get(current.sessionId);
       if (session && this.runs.activeRunsOwnedBy(current.sessionId).length > 0) {
@@ -602,14 +688,65 @@ export class ContinuityKernel {
       restored.push(assignment.roleKey);
     }
 
-    this.audit.record({
-      kind: "CONTINUITY_RESTORE",
-      evidence: { restored, deferred, mode: plan.mode },
-    });
+    // The reconcile loop asks for restoration on every tick — once a minute on a live daemon — and
+    // a role waiting on a claim answers the same way every time. A pass whose entire content is a
+    // need already recorded for this revocation therefore writes nothing: the ledger keeps the one
+    // `CONTINUITY_RESTORE_AWAITS_CLAIM` row that says what is owed, and the daemon's own
+    // `CONTINUITY_RECONCILED` row still carries `deferred` on every pass regardless.
+    if (restored.length > 0 || deferred.length > alreadyRecorded) {
+      this.audit.record({
+        kind: "CONTINUITY_RESTORE",
+        evidence: { restored, deferred, mode: plan.mode },
+      });
+    }
     // A recovered provider does not make the system NORMAL until every fallback binding
     // is actually gone (or remains visible as DEGRADED because restoration was deferred).
     await this.evaluate("post-restoration coverage");
     return { restored, deferred };
+  }
+
+  /**
+   * Whether this role's pending need is already on the ledger for the revocation it is waiting on.
+   *
+   * Keyed on `event_id >` the role's newest `BINDING_REVOKED`, which is what makes the answer
+   * survive a restart and what re-arms it: a *later* revocation of the same role has no record yet,
+   * so it is answered afresh.
+   *
+   * Public because the reconcile loop asks the same question before it asks for a restoration pass.
+   * A pending role whose need is recorded has nothing left for `restore()` to do, and reaching that
+   * same stop again costs two coverage evaluations — a full provider probe round each — every tick.
+   * The daemon reconciles once a minute and the measured role waited five days, so re-deriving it is
+   * a standing load, not a rounding error. One reader, two callers: a second query with this
+   * meaning could drift from the record it is supposed to be about.
+   */
+  restorationNeedRecorded(roleKey: string): boolean {
+    return this.db.get<{ one: number }>(
+      `SELECT 1 AS one FROM audit_events
+        WHERE kind = 'CONTINUITY_RESTORE_AWAITS_CLAIM' AND role_key = ?
+          AND event_id > COALESCE(
+                (SELECT MAX(revoked.event_id) FROM audit_events revoked
+                  WHERE revoked.kind = 'BINDING_REVOKED' AND revoked.role_key = ?), 0)
+        LIMIT 1`,
+      [roleKey, roleKey],
+    ) !== undefined;
+  }
+
+  /**
+   * Record, once per revocation, that a role the plan can now staff is waiting on a claim.
+   * Answers whether it wrote the row.
+   */
+  private recordRestorationAwaitsClaim(roleKey: string, provider: string): boolean {
+    if (this.restorationNeedRecorded(roleKey)) return false;
+    this.audit.record({
+      kind: "CONTINUITY_RESTORE_AWAITS_CLAIM",
+      roleKey,
+      reasonCode: ReasonCode.BINDING_REVOKED,
+      evidence: {
+        provider,
+        reason: "the coverage plan can staff this role again; the binding it lost is created by a claim, not by restoration",
+      },
+    });
+    return true;
   }
 
   /** §15.6 — SURVIVAL: state is preserved, diagnostics run, completion is forbidden. */
@@ -744,7 +881,118 @@ export class ContinuityKernel {
         inFlight: true,
       });
     }
+    // #954 — a role continuity revoked for want of coverage stays a requirement until something
+    // binds it again. Two of the roles above have no other witness once the binding is gone:
+    // `ProjectRegistry` derives `activity` as "(bound PRIMARY_CTO count) > 0 ? ACTIVE : INACTIVE",
+    // so revoking the CTO of a project with no open run erases the only evidence that the project
+    // wanted one, and a BOOTSTRAP_CTO reaches this list only through the ACTIVE-assignment sweep
+    // above. Measured: the role left the plan on the same tick that revoked it, after which
+    // coverage reported itself whole over a role it had stopped counting.
+    //
+    // BLIND_REVIEWER and WORKER need nothing from this loop — their requirement comes from the
+    // open-run and RUNNING-execution rosters, which a revocation does not touch — and the CEO is
+    // unconditional at the top. Every entry is still admitted on the same liveness its own loop
+    // uses (`scopeStillOpen`), so a role whose scope closed while it was unbound stays out.
+    for (const owed of this.continuityOwedBindings()) {
+      if (roles.some((required) => required.roleKey === owed.roleKey)) continue;
+      if (!this.scopeStillOpen(owed)) continue;
+      roles.push({
+        roleKey: owed.roleKey,
+        role: owed.role,
+        capability: owed.role === Role.CEO
+          ? "ceo"
+          : owed.role === Role.BLIND_REVIEWER
+            ? "blind-review"
+            : owed.role === Role.WORKER ? "worker" : "cto",
+        projectId: owed.projectId,
+        runId: owed.runId,
+        taskId: owed.taskId,
+        isolationGroup: owed.taskId
+          ? `task:${owed.taskId}`
+          : owed.projectId
+            ? `project:${owed.projectId}`
+            : owed.runId ? `run:${owed.runId}` : "global",
+        inFlight: true,
+      });
+    }
     return [...new Map(roles.map((required) => [required.roleKey, required])).values()];
+  }
+
+  /**
+   * Whether the most recent binding of this role was revoked by continuity for want of coverage.
+   *
+   * The newest generation is the one that answers: a role bound again and later released for some
+   * other reason is owed nothing, and only the latest row distinguishes those two histories. An
+   * ACTIVE binding is always the newest generation, so a role that is held now answers `false`
+   * here without a second lookup.
+   */
+  private continuityOwesBinding(roleKey: string): boolean {
+    const latest = this.db.get<{ status: string; revoked_reason: string | null }>(
+      `SELECT status, revoked_reason FROM assignments
+        WHERE role_key = ? ORDER BY binding_generation DESC LIMIT 1`,
+      [roleKey],
+    );
+    if (!latest || latest.status !== "REVOKED" || latest.revoked_reason === null) return false;
+    return CONTINUITY_REVOCATION_REASONS.includes(latest.revoked_reason) ||
+      latest.revoked_reason.startsWith(CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX);
+  }
+
+  /** The scope each owed role carried, read from the revoked row because no binding holds it. */
+  private continuityOwedBindings(): Array<{
+    roleKey: string;
+    role: Role;
+    projectId: string | null;
+    runId: string | null;
+    taskId: string | null;
+  }> {
+    return this.db
+      .all<{ role_key: string; role: Role; project_id: string | null; run_id: string | null; task_id: string | null }>(
+        `SELECT a.role_key, a.role, a.project_id, a.run_id, a.task_id
+           FROM assignments a
+          WHERE a.status = 'REVOKED'
+            AND a.binding_generation = (
+                  SELECT MAX(b.binding_generation) FROM assignments b WHERE b.role_key = a.role_key)`,
+      )
+      .filter((row) => this.continuityOwesBinding(row.role_key))
+      .map((row) => ({
+        roleKey: row.role_key,
+        role: row.role,
+        projectId: row.project_id,
+        runId: row.run_id,
+        taskId: row.task_id,
+      }));
+  }
+
+  /**
+   * Whether the scope an owed binding named is still open, judged exactly as the loop that would
+   * otherwise have required the role judges it: a RUNNING execution for a task, a run that has not
+   * ended, a project that is not suspended. The CEO carries no scope and is always required.
+   */
+  private scopeStillOpen(owed: {
+    role: Role;
+    projectId: string | null;
+    runId: string | null;
+    taskId: string | null;
+  }): boolean {
+    if (owed.taskId !== null) {
+      return this.db.get<{ one: number }>(
+        `SELECT 1 AS one FROM task_executions WHERE task_id = ? AND status = 'RUNNING'`,
+        [owed.taskId],
+      ) !== undefined;
+    }
+    if (owed.runId !== null) {
+      const run = this.runs.get(owed.runId);
+      if (!run) return false;
+      return run.state !== RunState.COMPLETED &&
+        run.state !== RunState.BLOCKED_POST_MERGE &&
+        run.state !== RunState.FAILED &&
+        run.state !== RunState.CANCELLED;
+    }
+    if (owed.projectId !== null) {
+      const project = this.projects.get(owed.projectId);
+      return project !== null && !project.suspended;
+    }
+    return owed.role === Role.CEO;
   }
 
   /** Constitute a real, routable provider session before it is allowed to own a role. */
