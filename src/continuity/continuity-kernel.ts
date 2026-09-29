@@ -350,6 +350,11 @@ export class ContinuityKernel {
     // after the binding went.
     const restorationPending = requiredRoles
       .filter((role) => this.bindings.active(role.roleKey) === null && this.continuityOwesBinding(role.roleKey))
+      // A role no provider can staff yet is waiting on a provider, not a claim, and `uncovered`
+      // already names it. Kept out of this list so the doctor does not send an operator to a claim
+      // that could not be honoured, and so the reconcile loop does not ask for a restoration pass —
+      // two coverage evaluations — on every tick of an outage that `restore()` can do nothing about.
+      .filter((role) => !uncovered.includes(role.roleKey))
       .map((role) => role.roleKey);
 
     const staffable: CoverageOutcome =
@@ -443,7 +448,14 @@ export class ContinuityKernel {
           [plan.mode, plan.outcome, this.clock.nowIso(), this.clock.nowIso()],
         );
       } else {
-        this.db.run(`UPDATE continuity_state SET evaluated_at = ? WHERE id = 1`, [this.clock.nowIso()]);
+        // The outcome moves without the mode: DEGRADED is both a whole plan with a fallback holder
+        // and a partial one with a role awaiting a claim (#954). `reason_code` is the durable half of
+        // the verdict a restarted reader sees, so it follows the outcome on every evaluation rather
+        // than only on the ones that also change the mode.
+        this.db.run(`UPDATE continuity_state SET reason_code = ?, evaluated_at = ? WHERE id = 1`, [
+          plan.outcome,
+          this.clock.nowIso(),
+        ]);
       }
       if (transitioned) {
       this.audit.record({
@@ -534,6 +546,22 @@ export class ContinuityKernel {
     if (!switchAdmission.allowed) return switchAdmission as Decision<{ provider: string; generation: number }>;
 
     const expected = this.bindings.active(roleKey);
+    // #954 — a role continuity revoked for want of coverage gets its binding back only from a claim
+    // (see `restore()`). With no active binding `switchTo` has no current row to replace, reads the
+    // unmatched attestation as a replacement, and inserts a fresh assignment, so this public method
+    // would hand out by failover what restoration is forbidden to. The daemon's reconcile loop
+    // reaches here only for a bound role; this guards every other caller. It sits on the snapshot the
+    // generation check below compares against, so a revocation that landed while the admission
+    // refresh above was awaited is refused too.
+    //
+    // Scoped to the owed role, not to every unbound one: staffing a role that was never held is
+    // specified failover behaviour (CP-S21 covers the CEO, CTO and reviewer from nothing when
+    // claude is down), and no claim is owed for a role nobody ever lost.
+    if (expected === null && this.continuityOwesBinding(roleKey)) {
+      return deny(ReasonCode.BINDING_REVOKED, "continuity revoked this role; only a claim creates its binding again", {
+        roleKey,
+      });
+    }
     const provisioned = await this.provisionRoutableSession(role, assignment.provider, `continuity:${role}`);
     if (!provisioned.allowed) return provisioned as Decision<{ provider: string; generation: number }>;
 
@@ -729,6 +757,29 @@ export class ContinuityKernel {
         LIMIT 1`,
       [roleKey, roleKey],
     ) !== undefined;
+  }
+
+  /**
+   * Record the claim need of every role `plan` can staff and nobody holds, and do nothing else of
+   * what `restore()` does. Answers the roles whose need this call wrote.
+   *
+   * For a reconcile pass that does not run `restore()`: the daemon withholds that pass while any
+   * other role is unresolved, because moving a fallback holder mid-failure could preempt an owner.
+   * Recording a claim need preempts nobody and depends on no other role, and without this a sensor
+   * failing on an unrelated provider kept the need off the ledger for as long as it stayed failed.
+   */
+  recordClaimNeeds(plan: RoleCoveragePlan): Array<{ roleKey: string; reasonCode: string }> {
+    const recorded: Array<{ roleKey: string; reasonCode: string }> = [];
+    for (const roleKey of plan.restorationPending) {
+      const provider = plan.assignments.find((assignment) => assignment.roleKey === roleKey)?.provider;
+      if (!provider) continue;
+      // The plan was computed before this pass acted; a claim that bound the role since is not a need.
+      if (this.bindings.active(roleKey) !== null) continue;
+      if (this.recordRestorationAwaitsClaim(roleKey, provider)) {
+        recorded.push({ roleKey, reasonCode: ReasonCode.BINDING_REVOKED });
+      }
+    }
+    return recorded;
   }
 
   /**

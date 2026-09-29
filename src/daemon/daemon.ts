@@ -1665,9 +1665,12 @@ export class Daemon {
           .map((assignment) => assignment.roleKey),
       ];
       const restorationNeeded = restorationCandidates.length > 0;
+      // An unresolved role withholds the restoration pass, which may move an acting owner. It does
+      // not withhold the record of a role waiting on a claim: that record moves nobody, and a sensor
+      // failing on another provider says nothing about whether this role can be staffed (#954).
       const restoration = restorationNeeded && unresolved.length === 0
         ? await this.cp.continuity.restore()
-        : { restored: [], deferred: [] };
+        : { restored: [], deferred: this.cp.continuity.recordClaimNeeds(plan) };
 
       this.cp.audit.record({
         kind: "CONTINUITY_RECONCILED",

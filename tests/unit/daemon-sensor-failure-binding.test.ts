@@ -88,7 +88,7 @@ const makeIncumbent = (
     rawOutputDigest: `sha256:${createHash("sha256").update("").digest("hex")}`,
   };
   claude.setCapacity(unread);
-  return { cp, claude, daemon, unread, roleKey, clock, incumbent: bound.value };
+  return { cp, claude, gpt, daemon, unread, roleKey, clock, incumbent: bound.value };
 };
 
 describe("daemon incumbent capacity reconciliation", () => {
@@ -714,6 +714,104 @@ describe("#954: a role continuity revoked is a role continuity owes", () => {
     // And the audit says why, rather than leaving the absence unexplained.
     expect(cp.audit.byKind("CONTINUITY_RESTORE_AWAITS_CLAIM").at(-1)?.evidence.reason)
       .toContain("created by a claim, not by restoration");
+  });
+
+  it("refuses a failover that would create the binding a claim is owed", async () => {
+    const fixture = makeIncumbent();
+    const { cp, claude, unread, roleKey } = fixture;
+    await revokeForWantOfCoverage(fixture);
+    coverageReturns(claude, unread);
+    // Without the ports provisioning fails closed before any write, and the refusal asserted below
+    // would be the harness's rather than the guard's.
+    attachRoutablePorts(cp);
+    const sessionsBefore = cp.sessions.live().length;
+
+    // `failover` is public, and the plan now staffs the role, so nothing but a guard on the method
+    // itself stands between this call and a fresh assignment row (review R1015-1).
+    const decision = await cp.continuity.failover(roleKey, Role.PRIMARY_CTO, { projectId: "sensor-binding" }, "direct failover");
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.BINDING_REVOKED);
+    expect(cp.db.all(`SELECT status, binding_generation FROM assignments WHERE role_key = ?`, [roleKey]))
+      .toEqual([{ status: "REVOKED", binding_generation: 1 }]);
+    expect(cp.bindings.active(roleKey)).toBeNull();
+    expect(cp.sessions.live()).toHaveLength(sessionsBefore);
+  });
+
+  it("records the claim need while another role's reading is unresolved", async () => {
+    const fixture = makeIncumbent("claude-and-gpt");
+    const { cp, claude, daemon, unread, roleKey, gpt } = fixture;
+    // A second bound role on a provider whose sensor failed: the daemon keeps it and reports it
+    // unresolved on every pass for as long as the sensor stays down.
+    gpt.setCapacity({ ...unread, provider: "gpt", source: "gpt-usage" });
+    const ceoSession = cp.sessions.create({ provider: "gpt", model: "ceo" });
+    expect(cp.sessions.transition(ceoSession.sessionId, SessionLifecycle.READY, "ceo ready").allowed).toBe(true);
+    expect(cp.bindings.bind({ roleKey: roleKeyFor(Role.CEO), role: Role.CEO, sessionId: ceoSession.sessionId }).allowed)
+      .toBe(true);
+    await revokeForWantOfCoverage(fixture);
+    coverageReturns(claude, unread);
+
+    const report = await daemon.reconcileContinuity("coverage returned for the revoked role only");
+
+    // The pass is not clean, and that is the precondition: the other role is unresolved.
+    expect(report?.unresolved).toContainEqual({
+      roleKey: roleKeyFor(Role.CEO),
+      reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
+    });
+    expect(report?.plan.restorationPending).toEqual([roleKey]);
+    // And the revoked role's need is on the ledger anyway: a sensor on another provider says
+    // nothing about whether this role waits on a claim (review R1015-2).
+    const awaiting = cp.audit.byKind("CONTINUITY_RESTORE_AWAITS_CLAIM");
+    expect(awaiting).toHaveLength(1);
+    expect(awaiting[0]).toMatchObject({ roleKey, reasonCode: ReasonCode.BINDING_REVOKED });
+    expect(report?.restorationDeferred).toEqual([{ roleKey, reasonCode: ReasonCode.BINDING_REVOKED }]);
+    // Still no assignment row: recording the need is all this path does.
+    expect(cp.bindings.active(roleKey)).toBeNull();
+
+    // Once per revocation here too.
+    const next = await daemon.reconcileContinuity("a minute later");
+    expect(next?.restorationDeferred).toEqual([]);
+    expect(cp.audit.byKind("CONTINUITY_RESTORE_AWAITS_CLAIM")).toHaveLength(1);
+  });
+
+  it("rewrites the durable reason when the outcome changes and the mode does not", async () => {
+    // A fallback holder keeps the mode DEGRADED while coverage is whole: claude's sensor is unread,
+    // so the plan staffs the role from gpt.
+    const { cp, roleKey } = makeIncumbent("claude-and-gpt");
+    const whole = await cp.continuity.evaluate("fallback staffs the role");
+    expect({ outcome: whole.outcome, mode: whole.mode })
+      .toEqual({ outcome: "FULL_COVERAGE", mode: ContinuityMode.DEGRADED });
+    expect(cp.db.get(`SELECT mode, reason_code FROM continuity_state WHERE id = 1`))
+      .toEqual({ mode: ContinuityMode.DEGRADED, reason_code: "FULL_COVERAGE" });
+
+    // The row the daemon's revocation for want of coverage writes; the role is now owed a claim.
+    expect(cp.bindings.revoke(roleKey, CONTINUITY_COVERAGE_REVOCATION_REASON).allowed).toBe(true);
+    const pending = await cp.continuity.evaluate("the role lost its binding");
+
+    expect({ outcome: pending.outcome, mode: pending.mode, restorationPending: pending.restorationPending })
+      .toEqual({ outcome: "PARTIAL_COVERAGE", mode: ContinuityMode.DEGRADED, restorationPending: [roleKey] });
+    // Same mode, different outcome: the one durable row must not go on saying FULL (review R1015-3).
+    expect(cp.db.get(`SELECT mode, reason_code FROM continuity_state WHERE id = 1`))
+      .toEqual({ mode: ContinuityMode.DEGRADED, reason_code: "PARTIAL_COVERAGE" });
+  });
+
+  it("does not send an operator to a claim for a role no provider can staff yet", async () => {
+    const fixture = makeIncumbent();
+    const { cp, daemon, roleKey } = fixture;
+    await revokeForWantOfCoverage(fixture);
+
+    // Coverage has not returned. The role is owed a binding, but what it waits on is a provider.
+    const still = await daemon.reconcileContinuity("the provider is still down");
+    // The unbound CEO is a required role too, so `uncovered` holds more than this role.
+    expect(still?.plan.uncovered).toContain(roleKey);
+    expect(still?.plan.restorationPending).toEqual([]);
+
+    const coverage = (await cp.doctor.run("system")).findings
+      .find((finding) => finding.code.startsWith("ROLE_COVERAGE_"));
+    // The role stays named in the evidence, by the field that says no provider can staff it.
+    expect((coverage?.observedEvidence as { uncovered?: string[] } | undefined)?.uncovered).toContain(roleKey);
+    expect(coverage?.observedEvidence).toMatchObject({ restorationPending: [] });
+    expect(coverage?.recommendedAction).not.toMatch(/waits on a claim/);
   });
 
   it("reads whole again once the role is bound, and stops reporting a need", async () => {
