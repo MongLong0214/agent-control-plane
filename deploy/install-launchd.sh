@@ -564,6 +564,12 @@ running_pid() {
   return 1
 }
 
+successful_exit_without_pid() {
+  # KeepAlive { SuccessfulExit = false } leaves an exit-0 refusal stopped.
+  launchctl print "$job" 2>/dev/null |
+    grep -Eq '^[[:space:]]*last exit code[[:space:]]*=[[:space:]]*0[[:space:]]*$'
+}
+
 stop_job() {
   if job_loaded; then
     launchctl bootout "$job"
@@ -586,10 +592,23 @@ start_job() {
   if [[ -f "$stdout_log" ]]; then stdout_bytes="$(wc -c < "$stdout_log")"; fi
   launchctl kickstart -k "$job"
   job_loaded || fail "launchd job $LABEL is not loaded after start"
-  local attempt pid previous_pid="" settled=0
-  for attempt in $(seq 1 30); do
+  # STARTUP_CAPACITY_REFRESH_BUDGET_MS (15s) covers the sequential provider refresh.
+  # The startup doctor then has CAPACITY_SWEEP_BUDGET_MS (45s) for global and role-scoped
+  # probes (each collector up to COLLECTOR_TIMEOUT_MS, 45s; non-interactive reads use
+  # NON_INTERACTIVE_TIMEOUT_MS, 20s), the swapUsage sysctl timeout (5s), and
+  # REPOSITORY_SWEEP_BUDGET_MS (20s): 15 + 45 + 5 + 20 = 85s. Allow 95s for
+  # process launch, startup listeners, settling, and slow local work. Some startup
+  # awaits have no aggregate deadline; this is an operational cap, not a proof that
+  # every healthy configuration finishes within it.
+  local start_poll_limit=180
+  # The plist's ThrottleInterval is 30s. Allow one failed KeepAlive relaunch plus
+  # five polls for exec, but recognize an exit-0 refusal after five absent-pid polls.
+  local no_pid_retry_limit=35 no_pid_refusal_limit=5
+  local attempt pid previous_pid="" settled=0 no_pid_polls=0
+  for attempt in $(seq 1 "$start_poll_limit"); do
     if pid="$(running_pid)" && [[ -f "$stdout_log" ]] &&
       tail -c "+$((stdout_bytes + 1))" "$stdout_log" | grep -F '"started":' >/dev/null; then
+      no_pid_polls=0
       if [[ "$pid" == "$previous_pid" ]]; then
         settled=$((settled + 1))
       else
@@ -600,6 +619,18 @@ start_job() {
     else
       previous_pid=""
       settled=0
+      if [[ -z "$pid" ]]; then
+        no_pid_polls=$((no_pid_polls + 1))
+        if [[ "$no_pid_polls" -ge "$no_pid_refusal_limit" ]] &&
+          successful_exit_without_pid; then
+          fail "launchd job $LABEL is not running after start; inspect agentctl daemon status and agentcpd.out.log"
+        fi
+        if [[ "$no_pid_polls" -ge "$no_pid_retry_limit" ]]; then
+          fail "launchd job $LABEL is not running after start; inspect agentctl daemon status and agentcpd.out.log"
+        fi
+      else
+        no_pid_polls=0
+      fi
     fi
     sleep 1
   done

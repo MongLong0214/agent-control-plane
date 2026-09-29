@@ -166,8 +166,10 @@ deploy/install-launchd.sh start
 ```
 
 `start` and `restart` report success only after this start writes its completed-start record and
-launchd reports the same running pid across a short settle window. If the job stays registered
-without a running daemon, they exit nonzero; inspect `agentctl daemon status` and
+launchd reports the same running pid across a short settle window. They wait up to 180 seconds
+for slow startup, but fail sooner when launchd shows a sustained missing pid: after five polls
+for a successful-exit refusal or 35 polls while allowing one throttled relaunch. If the job stays
+registered without a running daemon, they exit nonzero; inspect `agentctl daemon status` and
 `agentcpd.out.log` for the startup reason.
 
 `upgrade` saves the rendered plist and launcher under

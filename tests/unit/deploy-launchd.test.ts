@@ -106,8 +106,24 @@ case "\${1:-}" in
       fi
     fi
     [[ -e "$ACP_LAUNCHD_LOADED" ]] || exit 1
+    if [[ -n "\${ACP_FAKE_START_AFTER_PRINTS:-}" && -e "$ACP_FAKE_START_PRINTS" ]]; then
+      prints="$(cat "$ACP_FAKE_START_PRINTS")"
+      prints="$((prints + 1))"
+      printf '%s\\n' "$prints" > "$ACP_FAKE_START_PRINTS"
+      if [[ "$prints" -eq "$ACP_FAKE_START_AFTER_PRINTS" ]]; then
+        mkdir -p "$(dirname "$ACP_FAKE_STDOUT_LOG")"
+        printf '  "started": {\\n' >> "$ACP_FAKE_STDOUT_LOG"
+      fi
+    fi
     if [[ "\${ACP_FAKE_PID_MODE:-running}" == "running" ]]; then
       printf '    pid = 4242\\n'
+    elif [[ "\${ACP_FAKE_PID_MODE:-running}" == "none" ]]; then
+      printf '    last exit code = 0\\n'
+    elif [[ "\${ACP_FAKE_PID_MODE:-running}" == "recovers" ]]; then
+      prints="$(cat "$ACP_FAKE_RECOVERY_PRINTS")"
+      prints="$((prints + 1))"
+      printf '%s\\n' "$prints" > "$ACP_FAKE_RECOVERY_PRINTS"
+      if [[ "$prints" -ge 60 ]]; then printf '    pid = 4242\\n'; fi
     elif [[ "\${ACP_FAKE_PID_MODE:-running}" == "disappears" ]]; then
       remaining="$(cat "$ACP_FAKE_PID_PRINTS_REMAINING")"
       if [[ "$remaining" -gt 0 ]]; then
@@ -133,10 +149,15 @@ case "\${1:-}" in
     if [[ "\${ACP_KICKSTART_UNLOAD:-0}" == "1" ]]; then rm -f "$ACP_LAUNCHD_LOADED"; fi
     if [[ "\${ACP_FAKE_PID_MODE:-running}" == "disappears" ]]; then
       printf '3\\n' > "$ACP_FAKE_PID_PRINTS_REMAINING"
+    elif [[ "\${ACP_FAKE_PID_MODE:-running}" == "recovers" ]]; then
+      printf '0\\n' > "$ACP_FAKE_RECOVERY_PRINTS"
     fi
     if [[ "\${ACP_FAKE_START_MARKER:-1}" == "1" ]]; then
       mkdir -p "$(dirname "$ACP_FAKE_STDOUT_LOG")"
       printf '  "started": {\\n' >> "$ACP_FAKE_STDOUT_LOG"
+    fi
+    if [[ -n "\${ACP_FAKE_START_AFTER_PRINTS:-}" ]]; then
+      printf '0\\n' > "$ACP_FAKE_START_PRINTS"
     fi
     ;;
   *)
@@ -318,6 +339,8 @@ exit 90
       ACP_LAUNCHD_LOADED: loaded,
       ACP_LAUNCHD_BOOTOUT_PENDING: join(home, "launchd.bootout-pending"),
       ACP_FAKE_PID_PRINTS_REMAINING: join(home, "launchd.pid-prints-remaining"),
+      ACP_FAKE_RECOVERY_PRINTS: join(home, "launchd.recovery-prints"),
+      ACP_FAKE_START_PRINTS: join(home, "launchd.start-prints"),
       ACP_FAKE_STDOUT_LOG: stdoutLog,
       ACP_LOCK_PATH: lock,
       ACP_STOP_DELAY: "2",
@@ -671,13 +694,42 @@ describe("launchd deployment artifact", () => {
     const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
     expect(installed.status, installed.stderr).toBe(0);
     harness.env["ACP_FAKE_PID_MODE"] = "none";
+    const printsBefore = subcommands(harness.launchLog).filter((command) => command === "print").length;
 
     const restarted = runInstaller(installer, ["restart"], harness);
+    const printsAfter = subcommands(harness.launchLog).filter((command) => command === "print").length;
 
     expect(restarted.status, restarted.stderr).not.toBe(0);
     expect(restarted.stderr).toContain(`launchd job ${label} is not running after start`);
     expect(restarted.stderr).toContain("agentctl daemon status");
+    expect(printsAfter - printsBefore).toBeLessThan(20);
     expect(existsSync(harness.loaded)).toBe(true);
+  });
+
+  it("accepts a completed start after more than 30 polls with the same pid", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    harness.env["ACP_FAKE_START_MARKER"] = "0";
+    harness.env["ACP_FAKE_START_AFTER_PRINTS"] = "36";
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+
+    expect(Number(readFileSync(harness.env["ACP_FAKE_START_PRINTS"]!, "utf8").trim())).toBeGreaterThan(30);
+    expect(restarted.status, restarted.stderr).toBe(0);
+    expect(existsSync(harness.loaded)).toBe(true);
+  });
+
+  it("allows a throttled relaunch after 30 consecutive polls without a pid", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    harness.env["ACP_FAKE_PID_MODE"] = "recovers";
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+
+    expect(Number(readFileSync(harness.env["ACP_FAKE_RECOVERY_PRINTS"]!, "utf8").trim())).toBeGreaterThan(60);
+    expect(restarted.status, restarted.stderr).toBe(0);
   });
 
   it("refuses a restart when its reported pid disappears during settling", () => {
@@ -685,12 +737,15 @@ describe("launchd deployment artifact", () => {
     const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
     expect(installed.status, installed.stderr).toBe(0);
     harness.env["ACP_FAKE_PID_MODE"] = "disappears";
+    const printsBefore = subcommands(harness.launchLog).filter((command) => command === "print").length;
 
     const restarted = runInstaller(installer, ["restart"], harness);
+    const printsAfter = subcommands(harness.launchLog).filter((command) => command === "print").length;
 
     expect(restarted.status, restarted.stderr).not.toBe(0);
     expect(restarted.stderr).toContain(`launchd job ${label} is not running after start`);
     expect(restarted.stderr).toContain("agentctl daemon status");
+    expect(printsAfter - printsBefore).toBeLessThan(100);
     expect(existsSync(harness.loaded)).toBe(true);
   });
 
