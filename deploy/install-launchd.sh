@@ -553,13 +553,23 @@ job_loaded() {
 }
 
 stop_job() {
-  if job_loaded; then launchctl bootout "$job"; fi
+  if job_loaded; then
+    launchctl bootout "$job"
+    local attempt
+    for attempt in $(seq 1 30); do
+      job_loaded || return 0
+      sleep 1
+    done
+    job_loaded || return 0
+    fail "launchd job remains loaded after bootout"
+  fi
 }
 
 start_job() {
   private_file "$plist_path"
   if ! job_loaded; then launchctl bootstrap "$domain" "$plist_path"; fi
   launchctl kickstart -k "$job"
+  job_loaded || fail "launchd job is not loaded after start"
 }
 
 wait_for_stop() {
