@@ -1,0 +1,14 @@
+Limit: health.json's doctor snapshot carries status, reasonCode, checkedAt, ageMs and freshnessMs and no findings field, so the persisted findings cannot be read back from the file; the automatic-refresh row reads the DOCTOR_REPORT audit row production writes and ties its status to the persisted one instead
+Ruled-out: thread a supplemental-findings supplier through both MCP port factories and every listener start | an argument is a guarantee each door has to remember, which is how these two doors came to answer from a smaller set, and a door added later would face the same choice
+Warn: Watchdog.tick's system pass now receives this set as well. Its own blocking WATCHDOG_STALL findings still travel as run()'s third argument, and a blocking ERROR of its own makes that status BLOCKED with or without these, so the addition changes what its report names and not what it decides
+Record-Id: r-acp1010oneset
+Provenance: inherited ce58de3e51080694f0079be6f3041f88f58023f4
+
+Limit: production composes one daemon per process (agentcpd main creates exactly one), so a live deployment never had two daemons over one control plane; the defect was reachable only where one control plane is given more than one Daemon, as tests such as CP-S59 do
+Limit: a control plane whose daemon has been constructed but not started, or has stopped with no successor started, answers every doctor door without the supplemental findings; a caller that takes the lock directly instead of calling start() gets reports without them, which is why the Telegram live-ingress fixture now calls start()
+Ruled-out: keep the constructor registration and have the supplier return nothing unless this daemon holds the lock | the refused daemon's registration still replaces the live daemon's supplier, and the empty answer is exactly the defect
+Ruled-out: append suppliers instead of replacing | appending doubles every finding the previous supplier still reads, so a report would misstate how many holders are unwakeable
+Ruled-out: clear the supplier unconditionally in stop() | a predecessor stopping after its successor registered would leave the successor's doors answering from nothing, so removal is by identity
+Warn: stop() now removes this daemon's supplier, so doctor reports on that control plane carry no supplemental findings between one daemon stopping and the next one starting; a refused daemon's stop() removes nothing because it registered nothing
+Record-Id: r-acp1010lockholder
+Provenance: inherited 9b87ccd132472cf949f0373f6970f0ecbe056f70
