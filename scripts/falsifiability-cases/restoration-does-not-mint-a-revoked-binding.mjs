@@ -14,8 +14,8 @@ const restorationDoesNotMintARevokedBinding = {
   what: "restoration of a revoked role records the need and writes no assignment row",
   file: "src/continuity/continuity-kernel.ts",
   find:
-    "        deferred.push({ roleKey: assignment.roleKey, reasonCode: ReasonCode.BINDING_REVOKED });\n" +
-    "        if (!this.recordRestorationAwaitsClaim(assignment.roleKey, assignment.provider)) alreadyRecorded += 1;\n",
+    "      deferred.push({ roleKey: assignment.roleKey, reasonCode: ReasonCode.BINDING_REVOKED });\n" +
+    "      if (!this.recordRestorationAwaitsClaim(assignment.roleKey, assignment.provider)) alreadyRecorded += 1;\n",
   replace:
     "        const owed = this.requiredRoles().find((required) => required.roleKey === assignment.roleKey);\n" +
     "        if (owed) {\n" +

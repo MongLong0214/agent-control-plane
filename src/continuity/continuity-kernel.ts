@@ -633,27 +633,7 @@ export class ContinuityKernel {
 
     for (const assignment of plan.assignments) {
       const current = this.bindings.active(assignment.roleKey);
-      if (!current) {
-        // #954 — the role is empty because continuity revoked it when no provider could staff it,
-        // and the plan can staff it again now. Restoration records what is owed and stops here.
-        //
-        // It stops because this is not continuity's binding to create. The canonical PRIMARY_CTO
-        // conversation is adopted in place by a claim on the self-claim socket
-        // (`src/registry/canonical-self-claim.ts`, admitted by `startCanonicalSelfClaimListener`),
-        // which derives who is asking from process ancestry and an entitlement this module cannot
-        // check and must not stand in for; the CEO's generation 1 comes only from the once-ever
-        // possession-proven bootstrap. Writing a fresh assignment row here would hand out by
-        // recovery what the design requires a claim for — and `switchTo` would write one: with no
-        // active binding the target attestation cannot match, a surviving switch is downgraded to
-        // REPLACED, and the mint path runs. `Daemon.reconcileContinuity` refuses the same thing at
-        // its own loop for the same reason.
-        //
-        // A role the plan cannot staff is left to `uncovered`, which already says that.
-        if (!assignment.provider || !plan.restorationPending.includes(assignment.roleKey)) continue;
-        deferred.push({ roleKey: assignment.roleKey, reasonCode: ReasonCode.BINDING_REVOKED });
-        if (!this.recordRestorationAwaitsClaim(assignment.roleKey, assignment.provider)) alreadyRecorded += 1;
-        continue;
-      }
+      if (!current) continue;
       if (!assignment.provider || assignment.reason !== "preferred") continue;
       if (current.mode === "PREFERRED") continue;
 
@@ -716,6 +696,15 @@ export class ContinuityKernel {
       restored.push(assignment.roleKey);
     }
 
+    // #954 — a revoked role that coverage can staff again is owed a claim, not a binding minted
+    // by restoration. The self-claim socket proves the claimant's entitlement; this module cannot.
+    // Read coverage after bound-role provisioning: its probe may have contradicted the first plan.
+    // A role no provider can staff remains in `uncovered` and is not awaiting a claim.
+    for (const assignment of this.claimNeedsFromCurrentCoverage()) {
+      deferred.push({ roleKey: assignment.roleKey, reasonCode: ReasonCode.BINDING_REVOKED });
+      if (!this.recordRestorationAwaitsClaim(assignment.roleKey, assignment.provider)) alreadyRecorded += 1;
+    }
+
     // The reconcile loop asks for restoration on every tick — once a minute on a live daemon — and
     // a role waiting on a claim answers the same way every time. A pass whose entire content is a
     // need already recorded for this revocation therefore writes nothing: the ledger keeps the one
@@ -760,7 +749,7 @@ export class ContinuityKernel {
   }
 
   /**
-   * Record the claim need of every role `plan` can staff and nobody holds, and do nothing else of
+   * Record the claim need of every owed role current coverage can staff, and do nothing else of
    * what `restore()` does. Answers the roles whose need this call wrote.
    *
    * For a reconcile pass that does not run `restore()`: the daemon withholds that pass while any
@@ -772,20 +761,25 @@ export class ContinuityKernel {
    * own plan predates its failovers, and a failover probes the provider it selects: when that probe
    * finds the provider down, a handed-in plan still says the role can be staffed, and the need it
    * records — once per revocation — would misdate the recovery for good (review R1015-5).
-   * `restore()` re-evaluates for the same reason. No refresh here: the state failover's probe left
-   * is the newest reading there is, and this path must not add a probe round to a failing pass.
+   * `restore()` uses this same derivation after its bound-role provisioning loop, whose probes may
+   * also contradict its first plan. No refresh here: the pass's last probe is the newest reading.
    */
   recordClaimNeeds(): Array<{ roleKey: string; reasonCode: string }> {
-    const plan = this.computeCoveragePlan();
     const recorded: Array<{ roleKey: string; reasonCode: string }> = [];
-    for (const roleKey of plan.restorationPending) {
-      const provider = plan.assignments.find((assignment) => assignment.roleKey === roleKey)?.provider;
-      if (!provider) continue;
-      if (this.recordRestorationAwaitsClaim(roleKey, provider)) {
-        recorded.push({ roleKey, reasonCode: ReasonCode.BINDING_REVOKED });
+    for (const assignment of this.claimNeedsFromCurrentCoverage()) {
+      if (this.recordRestorationAwaitsClaim(assignment.roleKey, assignment.provider)) {
+        recorded.push({ roleKey: assignment.roleKey, reasonCode: ReasonCode.BINDING_REVOKED });
       }
     }
     return recorded;
+  }
+
+  private claimNeedsFromCurrentCoverage(): Array<{ roleKey: string; provider: string }> {
+    const plan = this.computeCoveragePlan();
+    return plan.restorationPending.flatMap((roleKey) => {
+      const provider = plan.assignments.find((assignment) => assignment.roleKey === roleKey)?.provider;
+      return provider ? [{ roleKey, provider }] : [];
+    });
   }
 
   /**

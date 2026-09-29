@@ -15,7 +15,7 @@ import {
   type ContinuityReconcileReport,
 } from "../../src/daemon/daemon.ts";
 import type { Finding } from "../../src/doctor/doctor.ts";
-import { ContinuityMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { ContinuityMode, ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { CapacityReading } from "../../src/runtime/provider.ts";
 import { RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
 import { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
@@ -823,6 +823,56 @@ describe("#954: a role continuity revoked is a role continuity owes", () => {
     expect(cp.audit.byKind("CONTINUITY_RESTORE_AWAITS_CLAIM").filter((event) => event.roleKey === roleKey))
       .toHaveLength(1);
     expect(cp.bindings.active(roleKey)).toBeNull();
+  });
+
+  it("restore records a claim need only after its own provisioning reads capacity", async () => {
+    const { cp, claude, gpt, unread, roleKey } = makeIncumbent("claude-and-gpt");
+    const owedProjectId = "second-project";
+    const owedRoleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId: owedProjectId });
+    // One CTO is a fallback holder. Continuity revoked a second project's CTO and owes it a claim.
+    expect(cp.bindings.revoke(roleKey, "test: move CTO to fallback").allowed).toBe(true);
+    const ctoSession = cp.sessions.create({ provider: "gpt", model: "cto" });
+    expect(cp.sessions.transition(ctoSession.sessionId, SessionLifecycle.READY, "fallback ready").allowed).toBe(true);
+    expect(cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: "sensor-binding", sessionId: ctoSession.sessionId, mode: "FALLBACK" }).allowed)
+      .toBe(true);
+    // Keep this project's role in the active-work sweep, ahead of the second project's owed role.
+    expect(cp.runs.create({ projectId: "sensor-binding", executionMode: ExecutionMode.SIMPLE,
+      contract: { goal: "restore CTO", why: "exercise restoration", scope: [], nonGoals: [],
+        acceptance: ["done"], priority: "NORMAL", humanGate: [], references: [] } }).allowed).toBe(true);
+    const owedManifest = fixtureManifest(owedProjectId);
+    expect(cp.projects.register({ projectId: owedProjectId, name: owedProjectId, manifest: owedManifest,
+      authorization: cp.manifestAuthorizationForTests(owedManifest) }).allowed).toBe(true);
+    const owedSession = cp.sessions.create({ provider: "gpt", model: "cto" });
+    expect(cp.sessions.transition(owedSession.sessionId, SessionLifecycle.READY, "second CTO ready").allowed).toBe(true);
+    expect(cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: owedProjectId, sessionId: owedSession.sessionId }).allowed)
+      .toBe(true);
+    expect(cp.bindings.revoke(owedRoleKey, CONTINUITY_COVERAGE_REVOCATION_REASON).allowed).toBe(true);
+    coverageReturns(claude, unread);
+    gpt.setCapacity({ ...unread, provider: "gpt", source: "gpt-usage", sensorHealth: "HEALTHY", runtimeHealth: "UNAVAILABLE", error: undefined,
+      buckets: [{ id: "rolling", remainingPercent: 90, resetAt: null, capabilities: ["cto", "ceo"] }] });
+    attachRoutablePorts(cp);
+
+    // Both assignments initially choose Claude. CTO provisioning fails, and its refresh records
+    // Claude unavailable before restore reaches the unbound second CTO assignment.
+    const start = vi.spyOn(claude, "startSession").mockImplementationOnce(async () => {
+      claude.setCapacity({ ...unread, runtimeHealth: "UNAVAILABLE" });
+      throw new Error("Claude stopped during restoration");
+    });
+    const first = await cp.continuity.restore();
+    expect(start).toHaveBeenCalledOnce();
+    expect(cp.capacity.isRoutableFor(cp.capacity.current("claude")!, "cto")).toBe(false);
+    expect(first.deferred).not.toContainEqual({ roleKey: owedRoleKey, reasonCode: ReasonCode.BINDING_REVOKED });
+    expect(cp.audit.byKind("CONTINUITY_RESTORE_AWAITS_CLAIM").filter((event) => event.roleKey === owedRoleKey))
+      .toHaveLength(0);
+
+    // Once Claude really recovers, a later pass records the second CTO's need once for this revocation.
+    coverageReturns(claude, unread);
+    const recovered = await cp.continuity.restore();
+    expect(recovered.deferred).toContainEqual({ roleKey: owedRoleKey, reasonCode: ReasonCode.BINDING_REVOKED });
+    const waitingAgain = await cp.continuity.restore();
+    expect(waitingAgain.deferred).toContainEqual({ roleKey: owedRoleKey, reasonCode: ReasonCode.BINDING_REVOKED });
+    expect(cp.audit.byKind("CONTINUITY_RESTORE_AWAITS_CLAIM").filter((event) => event.roleKey === owedRoleKey))
+      .toHaveLength(1);
   });
 
   it("rewrites the durable reason when the outcome changes and the mode does not", async () => {
