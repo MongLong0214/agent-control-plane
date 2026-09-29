@@ -50,9 +50,11 @@ Every entry's `projectId` must already be registered: an entry naming a project 
 holds no record of refuses startup rather than being dropped, so a configured session cannot come
 up entitled to a project that does not exist. Registration is all that is required here — whether
 a registered project is suspended or unhealthy is a runtime condition, decided while the daemon
-runs, and it does not hold startup.
-An invalid or empty array refuses startup, and the refusal names the variable, the zero-based
-index of the offending entry and how many entries there are — never its contents.
+runs, and it does not hold startup. The check runs before the daemon starts, so it refuses a
+startup that would otherwise park for missing capacity too.
+An invalid or empty array refuses startup, and the refusal names the variable, never its contents.
+The unregistered-project refusal alone also names the zero-based index of the offending entry and
+how many entries there are.
 
 With none present, self-claim is disabled. Empty and whitespace-only values count as absent.
 Any nonempty proper subset refuses startup before config access, database opening, migration,

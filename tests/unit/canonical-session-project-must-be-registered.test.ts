@@ -1,7 +1,9 @@
+import { spawn } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { Server } from "node:net";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { afterAll, describe, expect, it, vi } from "vitest";
 
@@ -230,4 +232,141 @@ describe("a configured canonical session's project must be registered before the
     expect(outcome.stdout, diagnostics).not.toContain("canonical self-claim listener started");
     expect(outcome.claimDoorOpenAtShutdown, diagnostics).toBe(false);
   }, 40_000);
+});
+
+/**
+ * How a daemon started through the park fixture ended up: it either exited on its own, or it
+ * reached the bootstrap park and had to be stopped.
+ */
+type ParkedStartupOutcome =
+  | { readonly kind: "exited"; readonly status: number | null; readonly stdout: string; readonly stderr: string }
+  | { readonly kind: "parked"; readonly stdout: string; readonly stderr: string };
+
+const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url)).replace(/\/$/u, "");
+const mainRunner = join(repositoryRoot, "tests/helpers/run-agentcpd-main.ts");
+
+/**
+ * Starts the daemon as its own process through `tests/helpers/run-agentcpd-main.ts` with
+ * `ACP_STARTUP_TEST_PARK=1`: every provider reports no routable capacity, so the startup doctor's
+ * only blocking finding is one `start()` parks for rather than returning. That is a real startup
+ * path — a host with no usable quota — and a check placed after `daemon.start()` returns is never
+ * reached on it (review ACP1014-R1-01).
+ *
+ * The outcome is read from the process, not from anything it prints about itself: an exit is the
+ * child's own exit, and a park is `health.json` saying `BOOTSTRAP`. A parked child is stopped with
+ * SIGTERM, the way a supervisor stops it, so the lock it holds is released before `root` is removed.
+ */
+const startThroughParkFixture = async (input: {
+  readonly entries: readonly CanonicalEntry[];
+  readonly registeredProjects: readonly string[];
+}): Promise<ParkedStartupOutcome> => {
+  // Under /tmp for the reason `daemon-startup.test.ts` roots there: the operator socket lives under
+  // this root and macOS refuses an AF_UNIX path over 103 bytes.
+  const root = mkdtempSync(join("/tmp", "acp-canon-park-"));
+  const healthPath = join(root, ".agent-control-plane", "health.json");
+  const environment: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of Object.keys(environment)) {
+    if (key.startsWith("ACP_TELEGRAM_") || key.startsWith("ACP_CANONICAL_") || key.startsWith("ACP_BUZZ_")) {
+      delete environment[key];
+    }
+  }
+  delete environment["BUZZ_PRIVATE_KEY"];
+  Object.assign(environment, {
+    HOME: root,
+    USER: "registry-park-owner",
+    ACP_MCP_TOKEN: "registry-park-mcp-token",
+    ACP_OPERATOR_TOKEN: "registry-park-operator-token",
+    ACP_OPERATOR_ACTOR: "registry-park-owner",
+    ACP_STARTUP_TEST_ROOT: root,
+    // Load-bearing: without the GitHub credential seed TRUSTED_GATE_CREDENTIAL_MISSING is also
+    // blocking, and the daemon takes the exit path instead of parking.
+    ACP_STARTUP_TEST_SEED: "1",
+    ACP_STARTUP_TEST_PARK: "1",
+    // Always passed, empty included, so a value inherited from the developer's own environment
+    // cannot register a project this case did not ask for.
+    ACP_STARTUP_TEST_REGISTER_PROJECTS: input.registeredProjects.join(","),
+    ACP_BUZZ_CHANNEL: "channel:registry-test-canonical",
+    ACP_CANONICAL_SESSIONS_JSON: JSON.stringify(input.entries),
+    ACP_CANONICAL_CTO_PEER_PROTOCOL: "acp.registry-test/v9",
+    ACP_CANONICAL_CTO_BUZZ_PURPOSE: "continuity:REGISTRY_TEST_CTO",
+  });
+
+  const child = spawn(process.execPath, ["--import", "tsx", mainRunner], {
+    cwd: repositoryRoot,
+    env: environment,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => (stdout += chunk));
+  child.stderr.on("data", (chunk: string) => (stderr += chunk));
+  const exited = new Promise<number | null>((resolveExit) => child.once("exit", (code) => resolveExit(code)));
+
+  const parked = (): boolean => {
+    if (!existsSync(healthPath)) return false;
+    try {
+      return (JSON.parse(readFileSync(healthPath, "utf8")) as { mode?: string }).mode === "BOOTSTRAP";
+    } catch {
+      // Read mid-write: not a park yet.
+      return false;
+    }
+  };
+
+  try {
+    const first = await new Promise<"exited" | "parked">((resolveFirst, rejectFirst) => {
+      const poll = setInterval(() => {
+        if (!parked()) return;
+        clearInterval(poll);
+        clearTimeout(timer);
+        resolveFirst("parked");
+      }, 100);
+      const timer = setTimeout(() => {
+        clearInterval(poll);
+        rejectFirst(new Error(`the daemon neither exited nor parked\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+      }, 60_000);
+      void exited.then(() => {
+        clearInterval(poll);
+        clearTimeout(timer);
+        resolveFirst("exited");
+      });
+    });
+    if (first === "exited") return { kind: "exited", status: await exited, stdout, stderr };
+    child.kill("SIGTERM");
+    await exited;
+    return { kind: "parked", stdout, stderr };
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    rmSync(root, { recursive: true, force: true });
+  }
+};
+
+describe("a parked startup still refuses an unregistered project (ACP1014-R1-01)", () => {
+  it("refuses startup instead of parking when the only configured entry names an unregistered project", async () => {
+    const outcome = await startThroughParkFixture({ entries: [FIRST], registeredProjects: [] });
+
+    const diagnostics = `kind=${outcome.kind}\nstdout:\n${outcome.stdout}\nstderr:\n${outcome.stderr}`;
+    // A park here is the defect: the daemon holds the lock and an operator door open, entitled to a
+    // project no row exists for, and never says why.
+    expect(outcome.kind, diagnostics).toBe("exited");
+    if (outcome.kind !== "exited") return;
+    expect(outcome.status, diagnostics).toBe(1);
+    expect(outcome.stderr, diagnostics).toContain(
+      "ACP_CANONICAL_SESSIONS_JSON is invalid: entry 0 of 1 names a project that is not registered",
+    );
+    for (const value of configuredValues([FIRST])) {
+      expect(outcome.stderr, `the refusal disclosed a configured value\n${diagnostics}`).not.toContain(value);
+    }
+  }, 90_000);
+
+  it("parks the same configuration when its project is registered, so the refusal above is not vacuous", async () => {
+    // Without this the case above would also pass against a fixture that no longer parks at all:
+    // a startup that exits before the park for some other reason never meets the defect.
+    const outcome = await startThroughParkFixture({ entries: [FIRST], registeredProjects: [FIRST.projectId] });
+
+    const diagnostics = `kind=${outcome.kind}\nstdout:\n${outcome.stdout}\nstderr:\n${outcome.stderr}`;
+    expect(outcome.kind, diagnostics).toBe("parked");
+    expect(outcome.stderr, diagnostics).not.toContain("names a project that is not registered");
+  }, 90_000);
 });
