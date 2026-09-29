@@ -774,6 +774,57 @@ describe("#954: a role continuity revoked is a role continuity owes", () => {
     expect(cp.audit.byKind("CONTINUITY_RESTORE_AWAITS_CLAIM")).toHaveLength(1);
   });
 
+  it("does not record a claim need from a plan a later probe in the same pass contradicted", async () => {
+    const fixture = makeIncumbent("claude-and-gpt");
+    const { cp, claude, daemon, unread, roleKey, gpt } = fixture;
+    // The same two-role start as the case above: the CEO on gpt, whose sensor failed, so the CTO
+    // has nowhere to fail over to and is revoked.
+    gpt.setCapacity({ ...unread, provider: "gpt", source: "gpt-usage" });
+    const ceoSession = cp.sessions.create({ provider: "gpt", model: "ceo" });
+    expect(cp.sessions.transition(ceoSession.sessionId, SessionLifecycle.READY, "ceo ready").allowed).toBe(true);
+    expect(cp.bindings.bind({ roleKey: roleKeyFor(Role.CEO), role: Role.CEO, sessionId: ceoSession.sessionId }).allowed)
+      .toBe(true);
+    await revokeForWantOfCoverage(fixture);
+    attachRoutablePorts(cp);
+
+    // Claude is back when the pass evaluates, and gpt's runtime is down, so the CEO must fail over
+    // to claude. Claude goes down again between that evaluation and failover's own probe of it.
+    coverageReturns(claude, unread);
+    gpt.setCapacity({ ...unread, provider: "gpt", source: "gpt-usage", sensorHealth: "HEALTHY", runtimeHealth: "UNAVAILABLE" });
+    const failover = cp.continuity.failover.bind(cp.continuity);
+    const failoverSpy = vi.spyOn(cp.continuity, "failover").mockImplementation(async (...args) => {
+      claude.setCapacity({ ...unread, runtimeHealth: "UNAVAILABLE" });
+      return failover(...args);
+    });
+
+    const report = await daemon.reconcileContinuity("claude flaps inside one pass");
+
+    // Preconditions: failover ran and left the CEO unresolved, and the pass's first plan still said
+    // claude could staff the revoked role — the plan the claim-need record must not be taken from.
+    expect(failoverSpy).toHaveBeenCalled();
+    expect(report?.unresolved.map((entry) => entry.roleKey)).toContain(roleKeyFor(Role.CEO));
+    expect(report?.plan.restorationPending).toEqual([roleKey]);
+    expect(cp.capacity.isRoutableFor(cp.capacity.current("claude")!, "cto")).toBe(false);
+    // Claude is down now, so no claim can staff this role: nothing may say the plan can (R1015-5).
+    expect(report?.restorationDeferred).toEqual([]);
+    expect(cp.audit.byKind("CONTINUITY_RESTORE_AWAITS_CLAIM")).toHaveLength(0);
+
+    // The record is once per revocation, so a misdated one would have been the only one. A genuine
+    // recovery must still be able to write it.
+    failoverSpy.mockRestore();
+    coverageReturns(claude, unread);
+    const recovered = await daemon.reconcileContinuity("claude is back for good");
+    // The CEO is owed one too: its failover in the flap pass found no provider, so it was revoked
+    // for want of coverage like the CTO before it.
+    expect(recovered?.restorationDeferred).toEqual([
+      { roleKey: roleKeyFor(Role.CEO), reasonCode: ReasonCode.BINDING_REVOKED },
+      { roleKey, reasonCode: ReasonCode.BINDING_REVOKED },
+    ]);
+    expect(cp.audit.byKind("CONTINUITY_RESTORE_AWAITS_CLAIM").filter((event) => event.roleKey === roleKey))
+      .toHaveLength(1);
+    expect(cp.bindings.active(roleKey)).toBeNull();
+  });
+
   it("rewrites the durable reason when the outcome changes and the mode does not", async () => {
     // A fallback holder keeps the mode DEGRADED while coverage is whole: claude's sensor is unread,
     // so the plan staffs the role from gpt.

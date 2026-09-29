@@ -1700,7 +1700,7 @@ export class Daemon {
       // failing on another provider says nothing about whether this role can be staffed (#954).
       const restoration = restorationNeeded && unresolved.length === 0
         ? await this.cp.continuity.restore()
-        : { restored: [], deferred: this.cp.continuity.recordClaimNeeds(plan) };
+        : { restored: [], deferred: this.cp.continuity.recordClaimNeeds() };
 
       this.cp.audit.record({
         kind: "CONTINUITY_RECONCILED",

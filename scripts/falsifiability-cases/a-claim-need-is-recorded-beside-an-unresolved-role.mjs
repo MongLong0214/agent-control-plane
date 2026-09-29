@@ -12,7 +12,7 @@ const aClaimNeedIsRecordedBesideAnUnresolvedRole = {
   id: "a-claim-need-is-recorded-beside-an-unresolved-role",
   what: "a role awaiting a claim is recorded on a reconcile pass another role left unresolved",
   file: "src/daemon/daemon.ts",
-  find: "        : { restored: [], deferred: this.cp.continuity.recordClaimNeeds(plan) };\n",
+  find: "        : { restored: [], deferred: this.cp.continuity.recordClaimNeeds() };\n",
   replace: "        : { restored: [], deferred: [] };\n",
   killedBy: [
     "tests/unit/daemon-sensor-failure-binding.test.ts::records the claim need while another role's reading is unresolved",

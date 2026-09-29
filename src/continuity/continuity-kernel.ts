@@ -767,14 +767,20 @@ export class ContinuityKernel {
    * other role is unresolved, because moving a fallback holder mid-failure could preempt an owner.
    * Recording a claim need preempts nobody and depends on no other role, and without this a sensor
    * failing on an unrelated provider kept the need off the ledger for as long as it stayed failed.
+   *
+   * The plan is computed here, from the capacity this pass last read, and not handed in. The pass's
+   * own plan predates its failovers, and a failover probes the provider it selects: when that probe
+   * finds the provider down, a handed-in plan still says the role can be staffed, and the need it
+   * records — once per revocation — would misdate the recovery for good (review R1015-5).
+   * `restore()` re-evaluates for the same reason. No refresh here: the state failover's probe left
+   * is the newest reading there is, and this path must not add a probe round to a failing pass.
    */
-  recordClaimNeeds(plan: RoleCoveragePlan): Array<{ roleKey: string; reasonCode: string }> {
+  recordClaimNeeds(): Array<{ roleKey: string; reasonCode: string }> {
+    const plan = this.computeCoveragePlan();
     const recorded: Array<{ roleKey: string; reasonCode: string }> = [];
     for (const roleKey of plan.restorationPending) {
       const provider = plan.assignments.find((assignment) => assignment.roleKey === roleKey)?.provider;
       if (!provider) continue;
-      // The plan was computed before this pass acted; a claim that bound the role since is not a need.
-      if (this.bindings.active(roleKey) !== null) continue;
       if (this.recordRestorationAwaitsClaim(roleKey, provider)) {
         recorded.push({ roleKey, reasonCode: ReasonCode.BINDING_REVOKED });
       }
