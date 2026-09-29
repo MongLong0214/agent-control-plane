@@ -6,7 +6,13 @@ import type { ControlPlane } from "../app/control-plane.ts";
 import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../capacity/capacity-monitor.ts";
 import { COLLECTOR_TIMEOUT_MS } from "../capacity/usage-collectors.ts";
 import { RECONCILE_SWEEP_BUDGET_MS } from "../conversation/turn-coordinator.ts";
-import type { RequiredRole, RoleCoveragePlan } from "../continuity/continuity-kernel.ts";
+import {
+  CONTINUITY_COVERAGE_REVOCATION_REASON,
+  CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX,
+  CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON,
+  type RequiredRole,
+  type RoleCoveragePlan,
+} from "../continuity/continuity-kernel.ts";
 import { digestOf } from "../core/digest.ts";
 import { readProcessStartToken } from "../core/process-argv.ts";
 import { acpError, type Decision, allow, deny } from "../core/errors.ts";
@@ -1613,8 +1619,11 @@ export class Daemon {
             roleKey: required.roleKey,
             reasonCode: plan.outcome === "NO_VALID_COVERAGE" ? ReasonCode.COVERAGE_NONE : ReasonCode.COVERAGE_PARTIAL,
           });
-          pausedRuns.push(...this.pauseAffectedRuns(required, "coverage plan cannot staff the bound role"));
-          this.revokePausedBinding(required, "coverage plan cannot staff the bound role");
+          pausedRuns.push(...this.pauseAffectedRuns(required, CONTINUITY_COVERAGE_REVOCATION_REASON));
+          // The reason is the continuity kernel's, not a literal this site owns: `requiredRoles`
+          // reads it back off the revoked row to tell a revocation it performed from an operator
+          // release, which is what decides whether the role is still owed a binding (#954).
+          this.revokePausedBinding(required, CONTINUITY_COVERAGE_REVOCATION_REASON);
           continue;
         }
 
@@ -1631,7 +1640,7 @@ export class Daemon {
         if (!failedOver.allowed) {
           unresolved.push({ roleKey: required.roleKey, reasonCode: failedOver.reasonCode });
           pausedRuns.push(...this.pauseAffectedRuns(required, `failover refused: ${failedOver.reasonCode}`));
-          this.revokePausedBinding(required, `continuity failover refused: ${failedOver.reasonCode}`);
+          this.revokePausedBinding(required, `${CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX}${failedOver.reasonCode}`);
           continue;
         }
 
@@ -1648,7 +1657,7 @@ export class Daemon {
         ) {
           unresolved.push({ roleKey: required.roleKey, reasonCode: ReasonCode.SESSION_NOT_READY });
           pausedRuns.push(...this.pauseAffectedRuns(required, "failover did not leave a ready planned binding"));
-          this.revokePausedBinding(required, "continuity failover did not leave a ready planned binding");
+          this.revokePausedBinding(required, CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON);
           continue;
         }
         reassigned.push({
@@ -1662,12 +1671,36 @@ export class Daemon {
       // A recovered preferred provider may receive new work again, but must not seize an
       // acting owner. The kernel's restore path has the role-specific no-preemption
       // barriers; invoke it only after the failure pass achieved full durable coverage.
-      const restorationNeeded = plan.assignments.some((assignment) =>
-        assignment.reason === "preferred" && this.cp.bindings.active(assignment.roleKey)?.mode === "FALLBACK",
-      );
+      // #954 — a role the plan can staff that nobody holds needs restoration exactly as much as one
+      // held by a fallback provider, and this predicate could not see it: it asked
+      // `bindings.active(roleKey)?.mode`, and a role this loop revoked has no active binding at all,
+      // so the test below was false for precisely the state that needs restoring. Measured on a
+      // live deployment: revoked at 01:33:32Z for want of coverage, coverage whole again 2m29s
+      // later, `restoration {restored: [], deferred: []}`, and the role still unbound five days on —
+      // the revocation was not waiting on coverage, it was waiting on a human.
+      //
+      // Two sources collected into one list rather than joined with `||`: this file is a deciding
+      // file for `verify-refusal-operands-are-watched`, where every new `&&`/`||` operand needs its
+      // own declared witness or backlog entry, and a second reading of the same fact is neither.
+      const restorationCandidates = [
+        // A pending role drops out of this list the moment its need is on the ledger. The pass it
+        // would trigger re-derives the same stop through two coverage evaluations, and this daemon
+        // reconciles every minute for as long as the role waits — five days, measured. A later
+        // revocation of the same role is not recorded yet, so it is answered by the same reader.
+        ...plan.restorationPending.filter((roleKey) => !this.cp.continuity.restorationNeedRecorded(roleKey)),
+        ...plan.assignments
+          .filter((assignment) =>
+            assignment.reason === "preferred" && this.cp.bindings.active(assignment.roleKey)?.mode === "FALLBACK",
+          )
+          .map((assignment) => assignment.roleKey),
+      ];
+      const restorationNeeded = restorationCandidates.length > 0;
+      // An unresolved role withholds the restoration pass, which may move an acting owner. It does
+      // not withhold the record of a role waiting on a claim: that record moves nobody, and a sensor
+      // failing on another provider says nothing about whether this role can be staffed (#954).
       const restoration = restorationNeeded && unresolved.length === 0
         ? await this.cp.continuity.restore()
-        : { restored: [], deferred: [] };
+        : { restored: [], deferred: this.cp.continuity.recordClaimNeeds() };
 
       this.cp.audit.record({
         kind: "CONTINUITY_RECONCILED",
@@ -1676,7 +1709,11 @@ export class Daemon {
             ? plan.outcome === "NO_VALID_COVERAGE"
               ? ReasonCode.COVERAGE_NONE
               : ReasonCode.COVERAGE_PARTIAL
-            : ReasonCode.OK,
+            // An empty role is not an OK pass. This row is the per-tick record, so it is the one a
+            // reader scans, and it said OK for five days over a role nobody held (#954).
+            : plan.restorationPending.length > 0
+              ? ReasonCode.COVERAGE_PARTIAL
+              : ReasonCode.OK,
         evidence: {
           reason,
           outcome: plan.outcome,
@@ -1686,6 +1723,7 @@ export class Daemon {
           pausedRuns,
           unresolved,
           restoration,
+          restorationPending: plan.restorationPending,
         },
       });
 

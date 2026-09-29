@@ -940,12 +940,23 @@ export class Doctor {
         observedEvidence: {
           uncovered: plan.uncovered,
           unmeasured: plan.unmeasured,
+          // #954 — `uncovered` is empty in the one state that reaches PARTIAL_COVERAGE without an
+          // unstaffable role: a role continuity revoked, can staff again, and nobody holds. Without
+          // this the finding says a deployment is partly covered and names nothing, sending the
+          // reader to the providers when the missing thing is a claim on a role.
+          restorationPending: plan.restorationPending,
           action: plan.action,
           mode: plan.mode,
         },
+        // A role waiting on a claim is named in the sentence too, not only in the evidence: `action`
+        // alone reads PAUSE_NEW_WORK, which points at the providers, and no provider change will
+        // fill a role that continuity revoked. Only a claim creates that binding again.
         recommendedAction: nothingMeasured
           ? "no candidate provider has been measured for these roles; take a capacity reading before reading this as an outage"
-          : plan.action,
+          : plan.restorationPending.length > 0
+            ? `${plan.action}: ${plan.restorationPending.join(", ")} can be staffed again but nothing holds it; ` +
+              "continuity revoked the binding and does not recreate it, so the role waits on a claim, not on a provider"
+            : plan.action,
       });
     }
     return findings;
