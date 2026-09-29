@@ -1,0 +1,15 @@
+Limit: The bootout wait is 30 one-second polls plus a final check, matching the existing stop-lock budget; a fake still registered through 31 checks exited nonzero.
+Ruled-out: a post-start loaded check alone | removing the bootout wait made restart report failure but left the job unregistered.
+Warn: The tests use a fake launchctl and do not establish that a live daemon PID is running.
+Record-Id: r-1e99a5387e7b
+Provenance: inherited 6c2ad3af43f3bb7af43417e8151a9e5a9e1d68e9
+
+Limit: A daemon can exit after the final readiness poll; this command cannot promise continued liveness.
+Ruled-out: pid-only readiness | launchd can report a pid before main() finishes its startup checks.
+Record-Id: r-0c0cb5d3e4ec
+Provenance: inherited 805bcbd1a6b765025d248b2ef4d2cb26ff2feb3b
+
+Limit: The 180-poll cap cannot guarantee every healthy startup because bootstrap parking and later work have no aggregate deadline.
+Ruled-out: 30-poll readiness wait | the live daemon took 30.8 seconds to reach DAEMON_STARTED, before writing started or settling its pid.
+Record-Id: r-415590e0341a
+Provenance: inherited 4b506fdb12590256a80a046e7a8be6b10500b90a
