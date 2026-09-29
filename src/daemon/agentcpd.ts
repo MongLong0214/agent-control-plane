@@ -3256,6 +3256,33 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       );
     } else {
       const canonicalSessions = configuredCanonicalSessions(canonicalActivationValues["ACP_CANONICAL_SESSIONS_JSON"]);
+      // Every entry's project must already be in the `projects` registry. The parse above reads the
+      // value's shape and its internal consistency; neither can see whether the project an entry
+      // entitles a session to hold `PRIMARY_CTO` of was ever registered. Without this, a deployment
+      // configured with an unregistered project started the listener and reported itself up while
+      // the entitlement it held named a project no row exists for.
+      //
+      // Refused, not repaired and not dropped: a silently dropped entry is a session that can never
+      // prove it may start work, with nothing saying why.
+      //
+      // Existence only — deliberately not availability. Whether a registered project is suspended
+      // or not HEALTHY is a runtime condition, decided while the daemon runs by the code that owns
+      // it, and it changes without the configuration changing; refusing startup on it would refuse
+      // a deployment that is merely paused, and the daemon that must come up to unpause it is this
+      // one. What is checked here is the one thing no later event can make true on its own: a
+      // project that was never registered at all. Do not widen this to availability.
+      const unregisteredEntryIndex = canonicalSessions.findIndex(
+        (entry) => cp.projects.get(entry.projectId) === null,
+      );
+      if (unregisteredEntryIndex !== -1) {
+        // This path's refusal shape: it names the variable and never its contents. The zero-based
+        // index and the entry count are what let an operator find the offending entry in the value
+        // they set, without this line quoting the project, the session or the actor it holds.
+        throw new Error(
+          `ACP_CANONICAL_SESSIONS_JSON is invalid: entry ${unregisteredEntryIndex} of ` +
+            `${canonicalSessions.length} names a project that is not registered`,
+        );
+      }
       // No `daemon.setCanonicalExecutorVersion` call any more. It handed the deployment's required
       // executor version to the system report so #886 could compare it against the build the wake
       // transport was qualified on. With no version pin on the claim there was nothing to hand it,

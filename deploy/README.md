@@ -46,7 +46,13 @@ session and the whole of what it is entitled to:
 
 A session may be adopted only as `PRIMARY_CTO` of the `projectId` its own entry names, and it
 speaks on Buzz as that entry's `buzzActorId`. No two entries may share any of the three values.
-An invalid or empty array refuses startup, and the refusal names the variable, never its contents.
+Every entry's `projectId` must already be registered: an entry naming a project this deployment
+holds no record of refuses startup rather than being dropped, so a configured session cannot come
+up entitled to a project that does not exist. Registration is all that is required here — whether
+a registered project is suspended or unhealthy is a runtime condition, decided while the daemon
+runs, and it does not hold startup.
+An invalid or empty array refuses startup, and the refusal names the variable, the zero-based
+index of the offending entry and how many entries there are — never its contents.
 
 With none present, self-claim is disabled. Empty and whitespace-only values count as absent.
 Any nonempty proper subset refuses startup before config access, database opening, migration,
