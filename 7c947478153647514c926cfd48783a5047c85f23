@@ -1,0 +1,13 @@
+Limit: A /usage timeout can report sensorHealth ERROR with runtimeHealth HEALTHY many times a day; the operator observation must survive that case.
+Ruled-out: treating every sensor ERROR as a runtime outage | a healthy-runtime /usage timeout would revoke live bindings
+Warn: UNKNOWN is not a measured runtime verdict; preserve the observation's prior runtime health until a measured value arrives.
+Record-Id: r-e0756d1e482f
+Provenance: inherited a019e7fa1f5bd61d34db182efd378d41458c0aee
+
+Limit: Run exports and verification rebuild capacity rows by observed_at, so earlier operator snapshots must remain unchanged.
+Ruled-out: rewriting the operator snapshot with the measured runtime | it changes completed-run evidence
+Ruled-out: an audit-only runtime verdict | current() needs the measured runtime after a restart
+Warn: Runtime-only readings do not renew operator quota grace; UNKNOWN adds no runtime evidence.
+Record-Id: r-3c7323ce9499
+Evidence: src/capacity/capacity-monitor.ts
+Provenance: inherited 151ac819615e516ff31ab4db24e3618d4aebab75
