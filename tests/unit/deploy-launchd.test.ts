@@ -84,6 +84,7 @@ const makeHarness = (): InstallerHarness => {
   const launcherEnvLog = join(home, "launcher-env.log");
   const stateAdminLog = join(home, "state-admin.log");
   const loaded = join(home, "launchd.loaded");
+  const stdoutLog = join(home, ".agent-control-plane", "agentcpd.out.log");
   const lock = join(home, ".agent-control-plane", "agentcpd.lock");
   const launchctl = join(bin, "launchctl");
   const security = join(bin, "security");
@@ -104,7 +105,16 @@ case "\${1:-}" in
         printf '%s\\n' "$((remaining - 1))" > "$ACP_LAUNCHD_BOOTOUT_PENDING"
       fi
     fi
-    [[ -e "$ACP_LAUNCHD_LOADED" ]]
+    [[ -e "$ACP_LAUNCHD_LOADED" ]] || exit 1
+    if [[ "\${ACP_FAKE_PID_MODE:-running}" == "running" ]]; then
+      printf '    pid = 4242\\n'
+    elif [[ "\${ACP_FAKE_PID_MODE:-running}" == "disappears" ]]; then
+      remaining="$(cat "$ACP_FAKE_PID_PRINTS_REMAINING")"
+      if [[ "$remaining" -gt 0 ]]; then
+        printf '    pid = 4242\\n'
+        printf '%s\\n' "$((remaining - 1))" > "$ACP_FAKE_PID_PRINTS_REMAINING"
+      fi
+    fi
     ;;
   bootstrap)
     touch "$ACP_LAUNCHD_LOADED"
@@ -116,11 +126,18 @@ case "\${1:-}" in
       rm -f "$ACP_LAUNCHD_LOADED"
     fi
   if [[ -n "\${ACP_STOP_DELAY:-}" && -n "\${ACP_LOCK_PATH:-}" ]]; then
-      (sleep "$ACP_STOP_DELAY"; rm -f "$ACP_LOCK_PATH") >/dev/null 2>&1 &
+      (/bin/sleep "$ACP_STOP_DELAY"; rm -f "$ACP_LOCK_PATH") >/dev/null 2>&1 &
     fi
     ;;
   kickstart)
     if [[ "\${ACP_KICKSTART_UNLOAD:-0}" == "1" ]]; then rm -f "$ACP_LAUNCHD_LOADED"; fi
+    if [[ "\${ACP_FAKE_PID_MODE:-running}" == "disappears" ]]; then
+      printf '3\\n' > "$ACP_FAKE_PID_PRINTS_REMAINING"
+    fi
+    if [[ "\${ACP_FAKE_START_MARKER:-1}" == "1" ]]; then
+      mkdir -p "$(dirname "$ACP_FAKE_STDOUT_LOG")"
+      printf '  "started": {\\n' >> "$ACP_FAKE_STDOUT_LOG"
+    fi
     ;;
   *)
     exit 64
@@ -128,6 +145,8 @@ case "\${1:-}" in
 esac
 `,
   );
+  // Shorten start_job's one-second polls while leaving the two-second stop-lock fake observable.
+  writeExecutable(join(bin, "sleep"), "#!/bin/bash\n/bin/sleep 0.1\n");
   writeExecutable(
     security,
     `#!/bin/bash
@@ -298,6 +317,8 @@ exit 90
       ACP_STATE_ADMIN_LOG: stateAdminLog,
       ACP_LAUNCHD_LOADED: loaded,
       ACP_LAUNCHD_BOOTOUT_PENDING: join(home, "launchd.bootout-pending"),
+      ACP_FAKE_PID_PRINTS_REMAINING: join(home, "launchd.pid-prints-remaining"),
+      ACP_FAKE_STDOUT_LOG: stdoutLog,
       ACP_LOCK_PATH: lock,
       ACP_STOP_DELAY: "2",
       ACP_REAL_NODE: process.execPath,
@@ -628,6 +649,7 @@ describe("launchd deployment artifact", () => {
 
     expect(restarted.status, restarted.stderr).toBe(0);
     expect(observed.status, `restart exited ${restarted.status}; launchctl print found no job`).toBe(0);
+    expect(observed.stdout).toContain("pid = 4242");
     expect(existsSync(harness.loaded)).toBe(true);
   });
 
@@ -640,8 +662,49 @@ describe("launchd deployment artifact", () => {
     const restarted = runInstaller(installer, ["restart"], harness);
 
     expect(restarted.status).not.toBe(0);
-    expect(restarted.stderr).toContain("launchd job is not loaded after start");
+    expect(restarted.stderr).toContain(`launchd job ${label} is not loaded after start`);
     expect(existsSync(harness.loaded)).toBe(false);
+  });
+
+  it("refuses a restart when the job stays registered without a running pid", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    harness.env["ACP_FAKE_PID_MODE"] = "none";
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+
+    expect(restarted.status, restarted.stderr).not.toBe(0);
+    expect(restarted.stderr).toContain(`launchd job ${label} is not running after start`);
+    expect(restarted.stderr).toContain("agentctl daemon status");
+    expect(existsSync(harness.loaded)).toBe(true);
+  });
+
+  it("refuses a restart when its reported pid disappears during settling", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    harness.env["ACP_FAKE_PID_MODE"] = "disappears";
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+
+    expect(restarted.status, restarted.stderr).not.toBe(0);
+    expect(restarted.stderr).toContain(`launchd job ${label} is not running after start`);
+    expect(restarted.stderr).toContain("agentctl daemon status");
+    expect(existsSync(harness.loaded)).toBe(true);
+  });
+
+  it("refuses a pid that appears before the daemon reports completed startup", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    harness.env["ACP_FAKE_START_MARKER"] = "0";
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+
+    expect(restarted.status, restarted.stderr).not.toBe(0);
+    expect(restarted.stderr).toContain(`launchd job ${label} is not running after start`);
+    expect(existsSync(harness.loaded)).toBe(true);
   });
 
   it("refuses when bootout remains registered past the bounded wait", () => {
@@ -696,7 +759,9 @@ describe("launchd deployment artifact", () => {
     expect(result.status).toBe(0);
     expect(existsSync(plistPath(harness))).toBe(true);
     assertRenderedPlist(harness);
-    expect(subcommands(harness.launchLog)).toEqual(["print", "print", "bootstrap", "kickstart", "print"]);
+    expect(subcommands(harness.launchLog)).toEqual([
+      "print", "print", "bootstrap", "kickstart", "print", "print", "print", "print",
+    ]);
     expect(readFileSync(harness.securityLog, "utf8")).toContain(
       "find-generic-password -w -s test-service -a ACP_MCP_TOKEN",
     );
@@ -1660,12 +1725,18 @@ describe("launchd deployment artifact", () => {
       "kickstart",
       "print",
       "print",
+      "print",
+      "print",
+      "print",
       "bootout",
       "print",
       "print",
       "print",
       "bootstrap",
       "kickstart",
+      "print",
+      "print",
+      "print",
       "print",
     ]);
   });
@@ -1906,6 +1977,9 @@ describe("launchd deployment artifact", () => {
       "print",
       "bootstrap",
       "kickstart",
+      "print",
+      "print",
+      "print",
       "print",
     ]);
 

@@ -552,6 +552,18 @@ job_loaded() {
   launchctl print "$job" >/dev/null 2>&1
 }
 
+running_pid() {
+  local output line
+  output="$(launchctl print "$job" 2>/dev/null)" || return 1
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]*pid[[:space:]]*=[[:space:]]*([1-9][0-9]*)[[:space:]]*$ ]]; then
+      printf '%s\n' "${BASH_REMATCH[1]}"
+      return 0
+    fi
+  done <<< "$output"
+  return 1
+}
+
 stop_job() {
   if job_loaded; then
     launchctl bootout "$job"
@@ -568,8 +580,35 @@ stop_job() {
 start_job() {
   private_file "$plist_path"
   if ! job_loaded; then launchctl bootstrap "$domain" "$plist_path"; fi
+  # main() writes its started record only after daemon.start() and all startup listeners finish.
+  # Record the current end so an earlier successful start cannot satisfy this kickstart.
+  local stdout_log="$state_dir/agentcpd.out.log" stdout_bytes=0
+  if [[ -f "$stdout_log" ]]; then stdout_bytes="$(wc -c < "$stdout_log")"; fi
   launchctl kickstart -k "$job"
-  job_loaded || fail "launchd job is not loaded after start"
+  job_loaded || fail "launchd job $LABEL is not loaded after start"
+  local attempt pid previous_pid="" settled=0
+  for attempt in $(seq 1 30); do
+    if pid="$(running_pid)" && [[ -f "$stdout_log" ]] &&
+      tail -c "+$((stdout_bytes + 1))" "$stdout_log" | grep -F '"started":' >/dev/null; then
+      if [[ "$pid" == "$previous_pid" ]]; then
+        settled=$((settled + 1))
+      else
+        settled=0
+      fi
+      previous_pid="$pid"
+      if [[ "$settled" -ge 2 ]]; then return 0; fi
+    else
+      previous_pid=""
+      settled=0
+    fi
+    sleep 1
+  done
+  if pid="$(running_pid)" && [[ -f "$stdout_log" ]] &&
+    tail -c "+$((stdout_bytes + 1))" "$stdout_log" | grep -F '"started":' >/dev/null &&
+    [[ "$pid" == "$previous_pid" && "$settled" -ge 1 ]]; then
+    return 0
+  fi
+  fail "launchd job $LABEL is not running after start; inspect agentctl daemon status and agentcpd.out.log"
 }
 
 wait_for_stop() {
@@ -700,8 +739,8 @@ case "$command_name" in
     stop_job
     wait_for_stop
     if ! rollback_report="$("$node_path" "$validator" rollback "${rollback_flags[@]}")"; then
-      if [[ "$service_was_loaded" == "1" ]]; then start_job; fi
       rm -rf "$state_dir/rollback-stage"
+      if [[ "$service_was_loaded" == "1" ]]; then start_job; fi
       fail "rollback failed; the previous generation and the original service state were restored"
     fi
     if [[ "$service_was_loaded" == "1" ]]; then start_job; fi
