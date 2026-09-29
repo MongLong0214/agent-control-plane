@@ -545,7 +545,26 @@ export class Daemon {
     this.attachments = new RoleAttachmentCredentials(cp.sessions, cp.bindings, cp.clock);
     this.#finalizer = new ApprovedRunFinalizer(cp, undefined, authorities);
     this.#evidenceExporter = new RunEvidenceExporter(cp.db, cp.artifacts, cp.clock, cp.audit);
+    // Nothing is registered with `cp.doctor` here. A constructed daemon is not yet the live one: a
+    // second `Daemon` over the same control plane that `start()` then refuses the lock would, if it
+    // registered here, replace the supplier of the daemon that does hold the lock, and that
+    // daemon's doors would answer from a set with none of its own holders in it. `start()`
+    // registers `#doctorSupplier` once the lock is this daemon's and before its first doctor pass.
   }
+
+  /**
+   * The one supplier this daemon registers with `cp.doctor`, kept as a field so the same function
+   * object is what `start()` registers and what `stop()` and a failed `start()` ask the doctor to
+   * remove — the doctor removes it only while it is still the registered one, so a daemon that is
+   * no longer live cannot take down the supplier of the daemon that replaced it.
+   *
+   * This ternary is the *only* place the scope rule lives. It used to be spelled inline at the
+   * operator door, which is why the doors that did not spell it reported a smaller set (#1010).
+   * Non-system scopes carry nothing: every finding in here is about the deployment as a whole, and
+   * a `--scope run` report is answering about one run.
+   */
+  readonly #doctorSupplier = (scope: DoctorScope): readonly Finding[] =>
+    scope === "system" ? this.supplementalSystemFindings() : [];
 
   /**
    * The authenticated operator socket's only application entry point. Reads and writes use
@@ -661,11 +680,7 @@ export class Daemon {
           if (scope === "system" && target === undefined) {
             return allow(ReasonCode.OK, await this.runSystemDoctorCheck());
           }
-          return allow(ReasonCode.OK, await this.cp.doctor.run(
-            scope,
-            target as string | undefined,
-            scope === "system" ? this.supplementalSystemFindings() : [],
-          ));
+          return allow(ReasonCode.OK, await this.cp.doctor.run(scope, target as string | undefined));
         }
 
         case OPERATOR_METHOD.RUN_SHOW: {
@@ -1229,6 +1244,14 @@ export class Daemon {
       });
     }
 
+    // The supplier is registered here and nowhere earlier: the lock is this daemon's, both early
+    // refusals have already returned without a doctor pass (the lock held by another instance,
+    // and the crash-loop backoff, which gives the lock back), and every doctor pass `start()`
+    // performs — the reconciliation below and the bootstrap park's re-checks — runs after this
+    // line. Registering before the lock is what let a daemon that was then refused replace the
+    // live daemon's supplier.
+    this.cp.doctor.setSupplementalFindings(this.#doctorSupplier);
+
     try {
       this.installContinuityCoordinator();
       await this.refreshCapacitySensors();
@@ -1246,6 +1269,7 @@ export class Daemon {
           } else {
             this.recordStartupFailure(reasonCode, { reconcile: report });
             this.uninstallContinuityCoordinator();
+            this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
             this.lock.release();
             this.#startedAt = null;
             return deny(reasonCode, "startup doctor did not permit dispatch resume", { reconcile: report });
@@ -1253,6 +1277,7 @@ export class Daemon {
         } else {
           this.recordStartupFailure(reasonCode, { reconcile: report });
           this.uninstallContinuityCoordinator();
+          this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
           this.lock.release();
           this.#startedAt = null;
           return deny(reasonCode, "startup doctor did not permit dispatch resume", { reconcile: report });
@@ -1290,6 +1315,7 @@ export class Daemon {
       const evidence = { error: safeErrorMessage(err) };
       this.recordStartupFailure(ReasonCode.DAEMON_STARTUP_FAILED, evidence);
       this.uninstallContinuityCoordinator();
+      this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
       this.lock.release();
       this.#startedAt = null;
       return deny(ReasonCode.DAEMON_STARTUP_FAILED, "daemon startup failed", evidence);
@@ -1334,28 +1360,32 @@ export class Daemon {
    * enforces nothing. What was missing was never a fence; it was an ordering the reader could
    * compare. That ordering is `generation`, and it is enforced where the comparison happens.
    *
-   * The supplemental findings are read here and not passed in, for the same reason the persist is
-   * here: a guarantee a caller has to remember is one some caller forgets. They were a parameter
-   * defaulting to `[]`, and only the operator door passed them, so `reconcile()` and the
-   * periodic/reactive refresh evaluated without them. A connected holder outside the qualified set
-   * then made an on-demand report `DEGRADED` while the next automatic evaluation, clean in every
-   * other respect, wrote `HEALTHY` to `health.json` with that holder still unwakeable -- the silence
-   * this finding exists to end, back one layer up. Every caller of this method -- `reconcile()`,
-   * the periodic and reactive `doctor_refresh`, and the operator's `DOCTOR_RUN` -- produces the
-   * status `health.json` serves, and a status that omits a finding it could have read is a status
-   * that says something false.
+   * This method no longer passes the supplemental findings, and no longer has to: `start()`
+   * registers `supplementalSystemFindings` with `cp.doctor`, so every system-scope report carries
+   * them however it was asked for. The history is worth keeping, because it is the same mistake
+   * twice. They began as `run()`'s third argument, and only the operator door passed it, so
+   * `reconcile()` and the periodic/reactive refresh evaluated without them: a connected holder
+   * outside the qualified set made an on-demand report `DEGRADED` while the next automatic
+   * evaluation, clean in every other respect, wrote `HEALTHY` to `health.json` with that holder
+   * still unwakeable. Reading them *here* fixed all four of this method's callers and left the two
+   * doors that do not come through here -- the CTO and Hermes MCP `doctor_run` tools -- still
+   * answering from the smaller set, which is #1010. A guarantee a caller has to remember is one
+   * some caller forgets, and the second time that sentence came due the answer was to stop having
+   * callers remember at all.
    *
-   * The other `doctor.run("system")` callers, and what each does with them:
-   *   - the bootstrap park's doctor-only pass passes them too. It reads only whether the status is
-   *     `BLOCKED`/`ERROR`, which these non-blocking findings cannot change, but its report is
-   *     audited as `DOCTOR_REPORT` like any other and should not say less than one taken here.
-   *   - `Watchdog.tick` does not, and cannot change a status by it: it runs the system scope only
-   *     with a blocking `WATCHDOG_STALL` of its own, so its status is `BLOCKED` or worse with or
-   *     without non-blocking findings, and it lives in the control plane, which has no daemon.
-   *   - the CTO and Hermes MCP `doctor_run` tools do not: their ports are composed from the control
-   *     plane alone, so an agent peer asking there can still read `HEALTHY` while a holder is
-   *     unwakeable. Carrying them there would change what an agent peer's report contains, which
-   *     this does not decide; `health.json` and `DAEMON_STATUS` are the surfaces that cannot omit it.
+   * What each other `doctor.run("system")` caller now gets, all from the same registration:
+   *   - the bootstrap park's doctor-only pass. It reads only whether the status is `BLOCKED`/`ERROR`,
+   *     which these non-blocking findings cannot change, but its report is audited as
+   *     `DOCTOR_REPORT` like any other and should not say less than one taken here.
+   *   - the CTO and Hermes MCP `doctor_run` tools, which is what #1010 changed. Their ports are
+   *     still composed from the control plane alone and still take no daemon; they reach the same
+   *     `Doctor` instance the registration is on, so an agent asking the door agents actually use
+   *     can no longer be told `HEALTHY` while a binding it holds is unwakeable.
+   *   - `Watchdog.tick`, which asks with its own blocking `WATCHDOG_STALL` findings as the third
+   *     argument and now receives these as well for its system scope. It could not change a status
+   *     by them either way -- a blocking `ERROR` of its own makes that status `BLOCKED` or worse
+   *     with or without them -- so what this adds there is a report that names the same conditions
+   *     as every other, and the stall findings it passes are still its own.
    */
   private async runSystemDoctorCheck(): Promise<DoctorReport> {
     const startedAt = this.cp.clock.nowIso();
@@ -1370,7 +1400,7 @@ export class Daemon {
     // success. The generation mechanism was doing exactly what it should with a fact that was
     // not true. Persistence is not evaluation, and only the evaluation belongs in here.
     try {
-      report = await this.cp.doctor.run("system", undefined, this.supplementalSystemFindings());
+      report = await this.cp.doctor.run("system");
     } catch (err) {
       const generation = ++this.#doctorCompletions;
       this.#lastDoctorAttempt = {
@@ -1980,11 +2010,12 @@ export class Daemon {
   /**
    * Installs the CTO wake port so the report can name every binding that cannot receive a wake.
    *
-   * A setter rather than a constructor argument: `run()`'s `supplementalFindings` is the seam a
-   * system finding belongs on, and it is the route the mention counters took through
-   * `setBuzzMentionReceipt`. `startDaemonMcpListeners` calls it with the port it just built, which
-   * is the one seam a test can drive with a real daemon and real listeners, so the wiring is
-   * exercised rather than asserted.
+   * A setter rather than a constructor argument: the CTO port is built after the daemon, from
+   * listeners the daemon starts, so there is nothing to pass at construction. It is the route the
+   * mention counters took through `setBuzzMentionReceipt`, and it feeds the same
+   * `supplementalSystemFindings` that `start()` registers with `cp.doctor`.
+   * `startDaemonMcpListeners` calls it with the port it just built, which is the one seam a test can
+   * drive with a real daemon and real listeners, so the wiring is exercised rather than asserted.
    */
   setWakeTransportPeers(peers: { unwakeableHolders(): readonly UnwakeableHolder[] }): void {
     this.#wakeTransportPeers = peers;
@@ -2123,7 +2154,9 @@ export class Daemon {
    *
    * Two call sites used to pass `telegramIngressFindings()` directly, so a third channel meant
    * editing both and hoping. A reader comparing them could not tell a deliberate difference from
-   * an omission.
+   * an omission. That argument then repeated one layer out, at the callers of this method, and the
+   * `cp.doctor.setSupplementalFindings` in `start()` is where it ends: this list has exactly one
+   * caller now, and it is the doctor itself (#1010).
    */
   // No `canonicalExecutorPinFindings` any more (#886, withdrawn 2026-09-27). It compared the
   // claim's executor pin, ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION, against the build the wake
@@ -2463,7 +2496,7 @@ export class Daemon {
         // on every operator observation destroys state a started daemon would have kept, and
         // the park has neither the delivery timer nor the continuity coordinator that make
         // those sweeps safe to act on.
-        const doctorReport = await this.cp.doctor.run("system", undefined, this.supplementalSystemFindings());
+        const doctorReport = await this.cp.doctor.run("system");
         if (this.#bootstrapAbandoned) return null;
         let blockingFindings = blockingFindingsOf(doctorReport);
 
@@ -2563,6 +2596,8 @@ export class Daemon {
     for (const timer of this.#timers) clearInterval(timer);
     this.#timers = [];
     this.uninstallContinuityCoordinator();
+    // Only its own: a successor that registered after this daemon keeps its supplier.
+    this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
     this.cp.audit.record({ kind: "DAEMON_STOPPED", evidence: { pid: process.pid } });
     this.lock.release();
   }
