@@ -437,9 +437,9 @@ export class CapacityMonitor {
         // it persist over an operator observation that has not yet expired would erase the
         // only reading this deployment can obtain, seconds after it was recorded.
         //
-        // This is not a favourable-reading fallback: a *successful* collector reading always
-        // wins, because a measurement is better evidence than a recollection, and the
-        // observation still expires on the same stale-grace rule with nothing to renew it.
+        // This preserves quota, not an older runtime verdict: a separately measured runtime
+        // health still governs admission. A *successful* collector reading always wins, and
+        // the observation still expires on the same stale-grace rule with nothing to renew it.
         const preserved = this.observationOutlivingError(reading);
         const enriched = preserved ?? this.record(reading);
         readings.push(enriched);
@@ -1231,16 +1231,29 @@ export class CapacityMonitor {
    *
    * Returns null once the observation is past its stale grace: at that point it is no more
    * informative than the ERROR, and the ERROR is the honest record of what the sensor did.
-   * Both suspend, so nothing becomes routable either way — this only decides which reason
-   * the operator is shown.
+   * A measured runtime health replaces the observation's older runtime health while its
+   * quota and observedAt remain in place. An UNKNOWN runtime adds no new runtime evidence.
    */
   private observationOutlivingError(reading: CapacityReading): ProviderCapacity | null {
     if (reading.sensorHealth !== "ERROR") return null;
     const current = this.current(reading.provider);
     if (!current?.operatorObservation) return null;
     if (current.ageMs > this.#options.staleGraceMs) return null;
+    const preserved = reading.runtimeHealth === "UNKNOWN" || reading.runtimeHealth === current.runtimeHealth
+      ? current
+      : {
+          ...this.record({
+            provider: current.provider,
+            sensorHealth: current.sensorHealth,
+            runtimeHealth: reading.runtimeHealth,
+            observedAt: current.observedAt,
+            source: current.source,
+            buckets: current.buckets,
+          }, storedOperatorObservationSource(current.operatorObservation)),
+          operatorObservation: current.operatorObservation,
+        };
     return {
-      ...current,
+      ...preserved,
       supersededCollectorError: { source: reading.source, error: reading.error ?? null },
     };
   }
