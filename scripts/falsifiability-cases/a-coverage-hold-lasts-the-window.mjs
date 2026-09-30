@@ -6,8 +6,8 @@ const aCoverageHoldLastsTheWindow = {
   id: "a-coverage-hold-lasts-the-window",
   what: "a held role keeps its binding on every tick until the grace window has passed",
   file: "src/daemon/daemon.ts",
-  find: "    if (nowMs - held.sinceMs < COVERAGE_REVOCATION_GRACE_MS) return true;\n",
-  replace: "",
+  find: "    return nowMs - Date.parse(heldAt) < COVERAGE_REVOCATION_GRACE_MS;\n",
+  replace: "    return false;\n",
   killedBy: [
     "tests/unit/daemon-sensor-failure-binding.test.ts::records the hold once and keeps holding while the window lasts",
   ],

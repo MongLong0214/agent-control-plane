@@ -16,7 +16,7 @@ import {
   type ContinuityReconcileReport,
 } from "../../src/daemon/daemon.ts";
 import type { Finding } from "../../src/doctor/doctor.ts";
-import { ContinuityMode, ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { ContinuityMode, ExecutionMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { CapacityReading } from "../../src/runtime/provider.ts";
 import { RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
 import { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
@@ -42,7 +42,7 @@ afterEach(() => {
 
 const makeIncumbent = (
   providers: "claude" | "claude-and-gpt" | "none" = "claude",
-  identity?: { pid: number; token: string },
+  identity?: { pid: number; token?: string },
 ) => {
   const root = tempDir("acp-sensor-binding-");
   const clock = new ManualClock("2026-09-08T00:00:00.000Z");
@@ -70,7 +70,9 @@ const makeIncumbent = (
   if (!project.allowed) throw new Error(project.message);
   const session = cp.sessions.create({
     provider: "claude", model: "opus",
-    ...(identity ? { osPid: identity.pid, osStartedAt: identity.token } : {}),
+    // Without a token the registry derives the start the way the CTO launch and continuity
+    // provisioning paths record it: `ps -o lstart=` text.
+    ...(identity ? { osPid: identity.pid, ...(identity.token !== undefined ? { osStartedAt: identity.token } : {}) } : {}),
   });
   const ready = cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "incumbent ready");
   if (!ready.allowed) throw new Error(ready.message);
@@ -1084,6 +1086,60 @@ describe("#954: a live incumbent keeps its binding through a momentary coverage 
         [fixture.roleKey],
       )[0],
     ).toEqual({ revoked_reason: CONTINUITY_COVERAGE_REVOCATION_REASON });
+  });
+
+  it("holds a session recorded the ordinary way, by ps lstart text", async () => {
+    const fixture = makeIncumbent("claude", { pid: process.pid });
+    fixture.cp.providers.registerForRole(fixture.claude, Role.PRIMARY_CTO);
+    expect(fixture.cp.sessions.require(fixture.incumbent.sessionId).osProcessStartedAt).not.toMatch(/^darwin-tv:/);
+    quota(fixture, 1);
+
+    await fixture.daemon.reconcileContinuity("weekly quota measured exhausted");
+
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toEqual(fixture.incumbent);
+    expect(kinds(fixture, "CONTINUITY_REVOCATION_HELD")).toBe(1);
+  });
+
+  it("does not renew the window when the daemon restarts inside it", async () => {
+    const fixture = liveIncumbent();
+    quota(fixture, 1);
+    await fixture.daemon.reconcileContinuity("first tick of the gap");
+
+    fixture.clock.advance(COVERAGE_REVOCATION_GRACE_MS - 60_000);
+    const restarted = new Daemon(fixture.cp, { stateDir: join(tempDir("acp-sensor-binding-restart-"), "daemon") });
+    quota(fixture, 1);
+    await restarted.reconcileContinuity("the restarted daemon's first tick");
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toEqual(fixture.incumbent);
+
+    fixture.clock.advance(60_000);
+    quota(fixture, 1);
+    await restarted.reconcileContinuity("the window has passed");
+
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toBeNull();
+    expect(kinds(fixture, "CONTINUITY_REVOCATION_HELD")).toBe(1);
+  });
+
+  it("leaves active work running through the hold and pauses it with the revocation", async () => {
+    const fixture = liveIncumbent();
+    const created = fixture.cp.runs.create({ projectId: "sensor-binding", executionMode: ExecutionMode.SIMPLE,
+      contract: { goal: "keep working", why: "a momentary gap", scope: [], nonGoals: [],
+        acceptance: ["done"], priority: "NORMAL", humanGate: [], references: [] } });
+    if (!created.allowed) throw new Error(created.message);
+    const runId = created.value.runId;
+    expect(fixture.cp.runs.transition(runId, RunState.ACTIVE, "test: work in progress").allowed).toBe(true);
+    quota(fixture, 1);
+
+    const held = await fixture.daemon.reconcileContinuity("first tick of the gap");
+    expect(held?.pausedRuns).toEqual([]);
+    expect(fixture.cp.runs.get(runId)?.state).toBe(RunState.ACTIVE);
+
+    fixture.clock.advance(COVERAGE_REVOCATION_GRACE_MS);
+    quota(fixture, 1);
+    const expired = await fixture.daemon.reconcileContinuity("the gap is still there");
+
+    expect(expired?.pausedRuns.map((paused) => paused.runId)).toEqual([runId]);
+    expect(fixture.cp.runs.get(runId)?.state).toBe(RunState.BLOCKED);
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toBeNull();
   });
 
   it("revokes at once a reused pid whose start token is not the one it recorded", async () => {

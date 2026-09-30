@@ -7,7 +7,7 @@ const aCoverageHoldEndsWhenCoverageReturns = {
   id: "a-coverage-hold-ends-when-coverage-returns",
   what: "a held role whose incumbent is covered again leaves a withdrawal record and starts any later gap afresh",
   file: "src/daemon/daemon.ts",
-  find: "          this.releaseCoverageHold(required.roleKey, \"the incumbent's provider covers the role again\");\n",
+  find: "          this.releaseCoverageHold(required.roleKey, current.bindingGeneration, \"the incumbent's provider covers the role again\");\n",
   replace: "",
   killedBy: [
     "tests/unit/daemon-sensor-failure-binding.test.ts::keeps the same generation when coverage returns inside the window, with no claim",

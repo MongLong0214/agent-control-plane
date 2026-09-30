@@ -1,0 +1,17 @@
+/**
+ * #954. The CTO launch and continuity provisioning paths record a session's start as `ps -o lstart=`
+ * text, so a hold that could only read native tokens held none of them. The mutant stops reading an
+ * lstart record back, so an ordinary session is revoked on the first tick of a gap.
+ */
+const aCoverageHoldReadsAnLstartRecordAsLstart = {
+  id: "a-coverage-hold-reads-an-lstart-record-as-lstart",
+  what: "a coverage hold reads a session's start again in the ps lstart form it was recorded in",
+  file: "src/daemon/daemon.ts",
+  find: "    : processStartedAt(session.osPid);\n",
+  replace: "    : null;\n",
+  killedBy: [
+    "tests/unit/daemon-sensor-failure-binding.test.ts::holds a session recorded the ordinary way, by ps lstart text",
+  ],
+};
+
+export default aCoverageHoldReadsAnLstartRecordAsLstart;

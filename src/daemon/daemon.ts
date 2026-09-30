@@ -15,6 +15,7 @@ import {
 } from "../continuity/continuity-kernel.ts";
 import { digestOf } from "../core/digest.ts";
 import { readProcessStartToken } from "../core/process-argv.ts";
+import { processStartedAt } from "../core/process-identity.ts";
 import { acpError, type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
 import type { BuzzMentionCounters } from "../buzz/buzz-mention-subscriber.ts";
@@ -96,11 +97,30 @@ const STARTUP_CAPACITY_REFRESH_BUDGET_MS = 15_000;
  *
  * A revocation is durable and only a claim can undo it, while the cause is often momentary: measured
  * on the live deployment, coverage was whole again 2m29s after the revocation it caused. So an
- * incumbent whose exact process is still running (native pid and start token) keeps its binding
- * through this window, with its work paused exactly as before; the binding is revoked only if the
- * role is still unstaffable when the window ends. A dead or unidentified incumbent is revoked at once.
+ * incumbent whose exact process is still running keeps its binding, and its work, through this
+ * window. New work is not dispatched meanwhile, because dispatch reads the target's capacity itself
+ * (`RunEngine.dispatch`). If the role is still unstaffable when the window ends, affected work is
+ * paused and the binding revoked exactly as before. A dead or unidentified incumbent is revoked at
+ * once. The window is dated from the hold's own audit row, so a daemon restart does not renew it.
  */
 export const COVERAGE_REVOCATION_GRACE_MS = 10 * 60_000;
+
+/**
+ * #954 — whether a session's exact process is still the one running under its pid.
+ *
+ * A session records its start in one of two forms: a native token (`darwin-tv:`/`linux-clk:`)
+ * where its caller verified one, or `ps -o lstart=` text, which `SessionRegistry.create` derives
+ * by default for the CTO launch and continuity provisioning paths. Each is read again in its own
+ * form. Comparing an lstart record against a native reading would fail for every ordinary session.
+ */
+const recordedProcessIsRunning = (session: SessionRecord): boolean => {
+  if (session.osPid == null) return false;
+  if (session.osProcessStartedAt == null) return false;
+  const current = /^(?:darwin-tv|linux-clk):/.test(session.osProcessStartedAt)
+    ? readProcessStartToken(session.osPid)
+    : processStartedAt(session.osPid);
+  return current === session.osProcessStartedAt;
+};
 
 /**
  * What a full sweep may take, derived from the work rather than from a healthy day.
@@ -522,9 +542,6 @@ export class Daemon {
   #telegramIngressController: TelegramIngressController | null = null;
   #continuityCoordinatorInstalled = false;
   #continuityReconciling = false;
-  // #954 — roles held through a coverage gap, keyed by role, with the generation and the moment the
-  // gap was first seen. In memory: a restart starts the window again, which only ever holds longer.
-  #coverageHolds = new Map<string, { generation: number; sinceMs: number }>();
   // #734 — the last system evaluation that actually finished, and the outcome of the most
   // recent *attempt*, kept apart on purpose: a failed attempt must be visible even while the
   // last success is still inside its freshness window (criterion 3). `resolveDoctorHealth`
@@ -1601,7 +1618,7 @@ export class Daemon {
         // That is restoration, not failure, and §15.8 keeps the acting owner in place
         // until the explicit non-preemptive restore path can safely move it.
         if (currentStillCovered) {
-          this.releaseCoverageHold(required.roleKey, "the incumbent's provider covers the role again");
+          this.releaseCoverageHold(required.roleKey, current.bindingGeneration, "the incumbent's provider covers the role again");
           continue;
         }
 
@@ -1637,15 +1654,15 @@ export class Daemon {
             roleKey: required.roleKey,
             reasonCode: plan.outcome === "NO_VALID_COVERAGE" ? ReasonCode.COVERAGE_NONE : ReasonCode.COVERAGE_PARTIAL,
           });
-          pausedRuns.push(...this.pauseAffectedRuns(required, CONTINUITY_COVERAGE_REVOCATION_REASON));
           if (this.holdsThroughCoverageGap(required.roleKey, current.bindingGeneration, session, currentCapacity)) continue;
+          pausedRuns.push(...this.pauseAffectedRuns(required, CONTINUITY_COVERAGE_REVOCATION_REASON));
           // The reason is the continuity kernel's, not a literal this site owns: `requiredRoles`
           // reads it back off the revoked row to tell a revocation it performed from an operator
           // release, which is what decides whether the role is still owed a binding (#954).
           this.revokePausedBinding(required, CONTINUITY_COVERAGE_REVOCATION_REASON);
           continue;
         }
-        this.releaseCoverageHold(required.roleKey, "the coverage plan can staff the role again");
+        this.releaseCoverageHold(required.roleKey, current.bindingGeneration, "the coverage plan can staff the role again");
 
         const failedOver = await this.cp.continuity.failover(
           required.roleKey,
@@ -1848,11 +1865,12 @@ export class Daemon {
    * #954 — whether this pass keeps the binding of a role the coverage plan cannot staff.
    *
    * Only an incumbent that is provably still running is held: its session READY and its exact
-   * process, by native pid and start token, alive. Anything else is the dead endpoint the revocation
-   * exists for. A runtime its own reading calls UNAVAILABLE is evidence against the incumbent rather
-   * than a gap in quota or admission, and is revoked at once as before. The hold is per generation
-   * and ends when the role is covered again or when `COVERAGE_REVOCATION_GRACE_MS` has passed since
-   * the gap was first seen, whichever comes first.
+   * process alive, its start read again in the form the session recorded it. Anything else is the
+   * dead endpoint the revocation exists for. A runtime its own reading calls UNAVAILABLE is evidence
+   * against the incumbent rather than a gap in quota or admission, and is revoked at once as before.
+   * The hold is per generation. It ends when the role is covered again or once
+   * `COVERAGE_REVOCATION_GRACE_MS` has passed since its `CONTINUITY_REVOCATION_HELD` row was written,
+   * whichever comes first.
    */
   private holdsThroughCoverageGap(
     roleKey: string,
@@ -1862,13 +1880,10 @@ export class Daemon {
   ): boolean {
     if (capacity?.runtimeHealth === "UNAVAILABLE") return false;
     if (session?.lifecycle !== SessionLifecycle.READY) return false;
-    if (session.osPid == null) return false;
-    if (session.osProcessStartedAt == null) return false;
-    if (session.osProcessStartedAt !== readProcessStartToken(session.osPid)) return false;
+    if (!recordedProcessIsRunning(session)) return false;
     const nowMs = Date.parse(this.cp.clock.nowIso());
-    const held = this.#coverageHolds.get(roleKey);
-    if (held?.generation !== generation) {
-      this.#coverageHolds.set(roleKey, { generation, sinceMs: nowMs });
+    const heldAt = this.openCoverageHoldAt(roleKey, generation);
+    if (heldAt === null) {
       this.cp.audit.record({
         kind: "CONTINUITY_REVOCATION_HELD",
         roleKey,
@@ -1882,20 +1897,35 @@ export class Daemon {
       });
       return true;
     }
-    if (nowMs - held.sinceMs < COVERAGE_REVOCATION_GRACE_MS) return true;
-    this.#coverageHolds.delete(roleKey);
-    return false;
+    return nowMs - Date.parse(heldAt) < COVERAGE_REVOCATION_GRACE_MS;
+  }
+
+  /**
+   * #954 — when the open hold on this role's generation began, or null if there is none. The ledger
+   * is the only record of it, so the answer is the same before and after a daemon restart.
+   */
+  private openCoverageHoldAt(roleKey: string, generation: number): string | null {
+    return this.cp.db.get<{ at: string }>(
+      `SELECT held.at FROM audit_events held
+        WHERE held.kind = 'CONTINUITY_REVOCATION_HELD' AND held.role_key = ?
+          AND json_extract(held.evidence_json, '$.generation') = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM audit_events closed
+             WHERE closed.kind = 'CONTINUITY_REVOCATION_WITHDRAWN' AND closed.role_key = held.role_key
+               AND closed.event_id > held.event_id)
+        ORDER BY held.event_id DESC LIMIT 1`,
+      [roleKey, generation],
+    )?.at ?? null;
   }
 
   /** #954 — a held role whose coverage returned keeps its binding; the ledger says so once. */
-  private releaseCoverageHold(roleKey: string, reason: string): void {
-    const held = this.#coverageHolds.get(roleKey);
-    if (!held) return;
-    this.#coverageHolds.delete(roleKey);
+  private releaseCoverageHold(roleKey: string, generation: number, reason: string): void {
+    const heldAt = this.openCoverageHoldAt(roleKey, generation);
+    if (heldAt === null) return;
     this.cp.audit.record({
       kind: "CONTINUITY_REVOCATION_WITHDRAWN",
       roleKey,
-      evidence: { generation: held.generation, heldMs: Date.parse(this.cp.clock.nowIso()) - held.sinceMs, reason },
+      evidence: { generation, heldMs: Date.parse(this.cp.clock.nowIso()) - Date.parse(heldAt), reason },
     });
   }
 
