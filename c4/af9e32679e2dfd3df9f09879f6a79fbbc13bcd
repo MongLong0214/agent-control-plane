@@ -1,0 +1,4 @@
+Unverified: The bounded maintenance recovery does not establish service availability after its last poll; bootout can unregister later.
+Record-Id: r-82e744dcf356
+Evidence: tests/unit/deploy-launchd.test.ts
+Provenance: inherited f9df570c754e227a6cb6cd3d94033b0cb1f083cd
