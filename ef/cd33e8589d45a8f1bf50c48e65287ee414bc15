@@ -1,0 +1,21 @@
+Limit: an incumbent whose runtime its own reading calls UNAVAILABLE is revoked at once; the hold covers only a quota or admission gap, the gen11 shape (runtime HEALTHY, weekly 1%)
+Limit: the hold lives in daemon memory, so a restart starts the grace window again
+Ruled-out: re-binding a revoked role from continuity when coverage returns (option B) | #1015 settled that continuity never mints a binding and only a claim creates one, so the revocation is delayed instead
+Record-Id: r-43827494eef9
+Provenance: inherited b4d8b4f35f9fd0bc808e90bae8c4d9119533bcc6
+
+Limit: an incumbent whose runtime its own reading calls UNAVAILABLE is revoked at once; the hold covers only a quota or admission gap, the gen11 shape (runtime HEALTHY, weekly 1%)
+Limit: work is not paused during the hold and is paused together with the revocation at expiry, because a paused CEO review (READY_FOR_CEO_REVIEW to AWAITING_HUMAN) has no transition back; new work is still refused by dispatch's own capacity read
+Limit: the window is dated from the hold's CONTINUITY_REVOCATION_HELD audit row, so a daemon restart does not renew it
+Ruled-out: re-binding a revoked role from continuity when coverage returns (option B) | #1015 settled that continuity never mints a binding and only a claim creates one, so the revocation is delayed instead
+Record-Id: r-865c19021162
+Supersedes: r-43827494eef9
+Provenance: inherited 04fd745ac4c999e89e953e3aba1c1941d3edf64b
+
+Limit: an lstart-recorded session is held only where an epoch-bearing native start (darwin-tv) can be read; elsewhere, including linux-clk hosts, such a session is revoked at once as before
+Record-Id: r-d9a8ac530c55
+Provenance: inherited 7721f689d1292ee1494978afd9b43b471611915b
+
+Limit: the process-before-row test runs at millisecond resolution because createdAt is truncated to the millisecond; a replacement started inside the same millisecond as the row, after the original exited, is not distinguished
+Record-Id: r-364403fc103a
+Provenance: inherited 680dbd88dd1c0b62959b21ef52010244bce15a57
