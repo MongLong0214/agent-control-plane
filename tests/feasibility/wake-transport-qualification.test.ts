@@ -56,6 +56,8 @@ import {
   runQualificationProbe,
   wakeCarryingTurnsIn,
   withholdText,
+  witnessCarryingTurns,
+  ARM_WITNESS,
   type HeldImage,
   type PinnedClaudeImage,
   type ProbeRun,
@@ -842,7 +844,12 @@ describe("U6: what the probe starts, and what it refuses to proceed without", ()
     expect(run.wakeCarryingModelRequests).toBe(1);
     expect(run.followUpAfterInjection).toBe(true);
     expect(armPassed(run)).toBe(true);
-    expect(run.observations?.requests).toHaveLength(2);
+    // Three: the prompt's turn, the production frame's, and the witness frame's. An injection arm
+    // writes both frames, and the witness the arm minted comes back in the model input of a turn --
+    // the one thing in the record that no reading written beforehand could have carried.
+    expect(run.observations?.requests).toHaveLength(3);
+    expect(run.observations?.witness).toMatch(ARM_WITNESS);
+    expect(witnessCarryingTurns(run.observations!)).toHaveLength(1);
     // One request existed when the frame was written, and the arm recorded that rather than
     // leaving a reader to work it out from which request carries the prompt.
     expect(run.observations?.boundary).toEqual({ frameWritten: true, requestsBefore: 1 });

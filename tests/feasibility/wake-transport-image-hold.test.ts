@@ -124,7 +124,7 @@ describe("a qualification run holds one image for its whole length", () => {
     // A capture of the shape the fake provider writes, read by the instrument's own reader: an arm
     // in a receipt has to carry the observations its counts are derived from, and a fixture that
     // stated counts without them is a fixture of a reading the instrument will not accept.
-    const captureOf = (injected: boolean): string => {
+    const captureOf = (injected: boolean, witness: string | null): string => {
       const turn = (text: string): string =>
         `${JSON.stringify({
           at: "2026-09-28T00:00:00.000Z",
@@ -133,10 +133,23 @@ describe("a qualification run holds one image for its whole length", () => {
           headers: {},
           body: JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text }] }] }),
         })}\n`;
-      return `${turn(BASELINE_PROMPT)}${injected ? turn(`a peer wrote: ${ROLE_WAKE_TOKEN}`) : ""}`;
+      return `${turn(BASELINE_PROMPT)}${injected ? turn(`a peer wrote: ${ROLE_WAKE_TOKEN}`) : ""}${
+        witness === null ? "" : turn(`a peer wrote: ${witness}`)
+      }`;
     };
-    const arm = (shape: ProbeShape, injected: boolean, imageSha256: string | undefined): ProbeRun => {
-      const observations = observationsFrom(captureOf(injected), { frameWritten: injected, requestsBefore: 1 });
+    // A witness per arm, of the shape `mintArmWitness` produces and distinct across the four, because
+    // an arm is admitted only if the value it recorded is echoed where it says the frame landed. These
+    // rows are about the image an arm executed, so the witness is fixture scaffolding here.
+    const witnessOf = (index: number): string => `u6-witness-${`${index}`.padEnd(32, "0")}`;
+    const arm = (shape: ProbeShape, injected: boolean, imageSha256: string | undefined, index: number): ProbeRun => {
+      const witness = witnessOf(index);
+      const observations = {
+        ...observationsFrom(captureOf(injected, injected ? witness : null), {
+          frameWritten: injected,
+          requestsBefore: 1,
+        }),
+        witness,
+      };
       return {
         shape,
         injected,
@@ -162,10 +175,10 @@ describe("a qualification run holds one image for its whole length", () => {
       });
 
     const armsOn = (digests: readonly (string | undefined)[]): readonly ProbeRun[] => [
-      arm("interactive", true, digests[0]),
-      arm("interactive", false, digests[1]),
-      arm("headless", true, digests[2]),
-      arm("headless", false, digests[3]),
+      arm("interactive", true, digests[0], 1),
+      arm("interactive", false, digests[1], 2),
+      arm("headless", true, digests[2], 3),
+      arm("headless", false, digests[3], 4),
     ];
 
     // The control: every arm ran the named image and met its own criterion, so it qualifies.

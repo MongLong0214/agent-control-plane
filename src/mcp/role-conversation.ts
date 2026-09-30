@@ -253,12 +253,15 @@ type EndpointCheck =
  * its harness deleted its temp root on exit, so the constant carried a conclusion whose reading no
  * longer existed, and a conclusion nobody can re-read is indistinguishable from one nobody took.
  *
- * Three members, three readings, each taken on 2026-09-28 by `pnpm qualify:wake-transport` against
- * a different image: 2.1.268 through the deployment's pinned launcher, 2.1.282 and 2.1.283 through
- * `ACP_CLAUDE_BINARY` pointed at the versioned image. Each reading names its own image digest, the
- * head it was taken at and which of those two sources it read, so no member stands on another's
- * measurement: a build is here because its own reading says `qualified`. Being installed on the
- * same host is not a reading, and an installed build without one is refused like any other.
+ * Two members, two readings, each taken on 2026-10-01 by `pnpm qualify:wake-transport` with
+ * `ACP_CLAUDE_BINARY` pointed at the versioned image, and each carrying the witness its own run
+ * minted for every arm (#1012). Each reading names its own image digest, the head it was taken at
+ * and which source it read, so no member stands on another's measurement: a build is here because
+ * its own reading says `qualified`. Being installed on the same host is not a reading, and an
+ * installed build without one is refused like any other.
+ *
+ * 2.1.282 was a member on a 2026-09-28 reading that carried no witness. That build is no longer
+ * installed here, so its reading could not be taken again and it left the set with the reading.
  *
  * Some sessions the set can never admit, because no reading of what they run can be taken. The
  * updater removes superseded images from `~/.local/share/claude/versions/`, and it has removed one
@@ -289,7 +292,6 @@ type EndpointCheck =
  */
 export const WAKE_TRANSPORT_QUALIFIED_CLIENTS = [
   { name: "claude-code", version: "2.1.268" },
-  { name: "claude-code", version: "2.1.282" },
   { name: "claude-code", version: "2.1.283" },
 ] as const;
 
