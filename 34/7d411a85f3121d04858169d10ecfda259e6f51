@@ -1,0 +1,17 @@
+Limit: only a project the owner suspended has its missing checkout downgraded to a non-blocking WARN; an active project's unreadable repository still refuses daemon startup, and nothing here retires or unregisters a repository
+Warn: suspend-project takes the daemon's state lease before reading the schema version or opening Db, because the bound VFS provides no locking, and it refuses a database with journal sidecars rather than opening SQLite on a refusal
+Record-Id: r-e9e399f47e54
+Provenance: inherited 3e242c553ec9afc2cfa9998c3590f692a069e7c4
+
+Limit: offline suspension is refused while the project has unfinished runs or active bindings; only the running daemon's owner path (CtoLifecycle.suspendProject) can quiesce live work
+Limit: the offline approver must be a cli owner declared in the deployment's owner-identities file; an absent or empty declaration authorises nobody
+Record-Id: r-2226e106f34c
+Provenance: inherited 3849ecf010db669329fb23f1e1b8ef73f839e7c9
+
+Limit: the offline approver is the account the kernel reports for the running uid (os.userInfo), not a typed name or an environment variable; it must also be a declared cli owner, and whoever controls that OS account can still approve
+Record-Id: r-26d2c9597e54
+Provenance: inherited 99549d828ff1b8bcdc0533841b65eb1798945367
+
+Limit: offline suspension cannot quiesce a project with an unfinished run or an active binding; that project's missing checkout keeps blocking startup until the checkout is restored, and a deployment whose ACP_OPERATOR_ACTOR differs from the OS account must also declare cli:<account>
+Record-Id: r-9f1d42e8524f
+Provenance: inherited 1c6444ba1cae5f513057a4779bb328e503f4659b
