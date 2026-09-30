@@ -565,9 +565,18 @@ describe("round-2 ops regressions", () => {
           harness.cp.db, peer.actor, nonce,
         );
       }
-      expect(harness.cp.db.get<{ actor: string }>(
-        `SELECT actor FROM inbound_messages WHERE channel = 'mcp' AND nonce = ?`, [nonce],
-      )?.actor).toBe(peer.actor);
+      const reservedAt = harness.cp.db.get<{ received_at: string }>(
+        `SELECT received_at FROM inbound_messages WHERE channel = 'mcp' AND nonce = ?`, [nonce],
+      )?.received_at;
+      // The current entry point, driven the way a Db holder can: a timestamp an hour ahead makes
+      // the live reservation read stale, the takeover renews it, and the run then throws.
+      const future = new Date(Date.parse(harness.clock.nowIso()) + 60 * 60_000).toISOString();
+      await expect(ingressGuardExports.runMcpReservedMutation(harness.cp.db, peer.actor, nonce, future, () => {
+        throw new Error("taken over and thrown");
+      })).rejects.toThrow("taken over and thrown");
+      expect(harness.cp.db.get<{ actor: string; received_at: string }>(
+        `SELECT actor, received_at FROM inbound_messages WHERE channel = 'mcp' AND nonce = ?`, [nonce],
+      )).toEqual({ actor: peer.actor, received_at: reservedAt });
       const retry = await idempotentMcpMutation(harness.cp, peer, nonce, () => {
         executions += 1;
         return { content: [{ type: "text" as const, text: "duplicate" }] };

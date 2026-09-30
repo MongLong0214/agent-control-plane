@@ -43,7 +43,14 @@ export const isIngressDeleteAuthority = IngressDeleteAuthorityToken.matches;
 
 const MCP_RESERVATION_TTL_MS = 60_000;
 
-/** Run only the mutation that acquired this reservation; no delete capability leaves this module. */
+/**
+ * Run only the mutation that acquired this reservation; no delete capability leaves this module.
+ *
+ * The staleness test reads the caller's own timestamp, so a caller can always call a live
+ * reservation stale. What that buys it is bounded here: a failed run deletes only a row this call
+ * inserted. A reservation it took over by renewal is put back to the time it held before, so a
+ * handler still in flight keeps its row and a retry cannot run the mutation a second time.
+ */
 export const runMcpReservedMutation = async <T>(
   db: Db,
   actor: string,
@@ -56,6 +63,7 @@ export const runMcpReservedMutation = async <T>(
       `SELECT actor, received_at, result_json FROM inbound_messages WHERE channel = 'mcp' AND nonce = ?`,
       [nonce],
     );
+    let renewedFrom: string | null = null;
     if (existing) {
       const reservedAtMs = Date.parse(existing.received_at);
       const nowMs = Date.parse(receivedAt);
@@ -73,6 +81,7 @@ export const runMcpReservedMutation = async <T>(
       if (renewed.changes !== 1) {
         return { kind: "existing" as const, actor: existing.actor, resultJson: existing.result_json };
       }
+      renewedFrom = existing.received_at;
     } else {
       db.run(
         `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES ('mcp', ?, ?, ?)`,
@@ -83,6 +92,15 @@ export const runMcpReservedMutation = async <T>(
     const release = (): void => {
       if (used) return;
       used = true;
+      if (renewedFrom !== null) {
+        db.run(
+          `UPDATE inbound_messages SET received_at = ?
+            WHERE channel = 'mcp' AND nonce = ? AND actor = ? AND received_at = ?
+              AND result_json IS NULL AND turn_claim_json IS NULL`,
+          [renewedFrom, nonce, actor, receivedAt],
+        );
+        return;
+      }
       const authority = new IngressDeleteAuthorityToken(db, "mcp");
       db.withIngressDelete(authority, "mcp", () => db.run(
         `DELETE FROM inbound_messages
