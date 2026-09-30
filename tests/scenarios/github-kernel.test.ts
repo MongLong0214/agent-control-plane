@@ -1147,7 +1147,7 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
 });
 
 describe("release and hotfix (CP-S41, CP-S42)", () => {
-  it("CP-S41: a tag on an unaccepted commit and a conflicting existing tag are both refused", async () => {
+  it("CP-S41 / RF-S12: a tag on an unaccepted commit and a conflicting existing tag are both refused", async () => {
     const fixture = await setupLineageFixture({
       workBranch: "release/1.2.0",
       sourceBranch: "dev",
@@ -1197,7 +1197,7 @@ describe("release and hotfix (CP-S41, CP-S42)", () => {
     expect(fixture.github.tags.size).toBe(1);
   });
 
-  it("CP-S42: a hotfix missing from an active release reports propagation incomplete", async () => {
+  it("CP-S42 / RF-S13: a hotfix missing from an active release reports propagation incomplete", async () => {
     const fixture = await setup();
     fixture.github.setBranch("release/1.1.0", "r".repeat(40));
     const fixSha = "h".repeat(40);
