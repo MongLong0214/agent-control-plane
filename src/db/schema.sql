@@ -2375,7 +2375,9 @@ CREATE TRIGGER IF NOT EXISTS canonical_turns_no_replace
 BEFORE INSERT ON canonical_turns
 WHEN EXISTS (
   SELECT 1 FROM canonical_turns
-   WHERE turn_request_id = NEW.turn_request_id
+   WHERE (turn_request_id = NEW.turn_request_id)
+           OR (target_actor_id = NEW.target_actor_id AND (lifecycle_state = 'IN_DOUBT' AND override_incumbent_turn_request_id IS NULL) AND (NEW.lifecycle_state = 'IN_DOUBT' AND NEW.override_incumbent_turn_request_id IS NULL))
+           OR (override_incumbent_turn_request_id = NEW.override_incumbent_turn_request_id AND (override_incumbent_turn_request_id IS NOT NULL AND lifecycle_state = 'IN_DOUBT') AND (NEW.override_incumbent_turn_request_id IS NOT NULL AND NEW.lifecycle_state = 'IN_DOUBT'))
 )
 BEGIN
   SELECT RAISE(ABORT, 'CANONICAL_TURN_NO_REPLACE');

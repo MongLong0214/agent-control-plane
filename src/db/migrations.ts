@@ -1795,7 +1795,8 @@ export const rebuildCanonicalTurnsIfStale = (raw: Database.Database, schemaVersi
       .replace(/;\s*$/, "")
       .replace(/\s+/g, " ")
       .trim();
-  if (wanted && normalise(stored) === normalise(wanted[0])) return;
+  const current = /CREATE TABLE IF NOT EXISTS canonical_turns \([\s\S]*?\n\);/.exec(schemaDdlAt(SCHEMA_VERSION));
+  if ([wanted?.[0], current?.[0]].some((ddl) => ddl !== undefined && normalise(stored) === normalise(ddl))) return;
 
   raw.exec(
     canonicalTurnsTableOnlyDdl(schemaVersion).replace(

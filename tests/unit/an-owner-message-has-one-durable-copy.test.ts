@@ -10,7 +10,7 @@ import {
   buzzMessagePayload,
   buzzMessageSigningRequest,
 } from "../../src/ingress/buzz-message.ts";
-import { ingressSignature } from "../../src/ingress/ingress-guard.ts";
+import { IngressGuard, ingressSignature } from "../../src/ingress/ingress-guard.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
 import { RoleConversationPort, WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
 import type { McpPeerAuthenticator } from "../../src/mcp/shared.ts";
@@ -602,11 +602,13 @@ describe("an owner's message has exactly one durable copy, and admission produce
       expect(ledger.complete(messageId, holder).allowed).toBe(true);
       expect(harness.cp.outbox.get(messageId)?.status).toBe("ACKED");
 
-      // The 24-hour prune: the claim is resolved, so the inbound row is deleted and its nonce is
-      // free again. The outbox row is not pruned and keeps the idempotency key forever.
-      harness.cp.db.run(`DELETE FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`, [
-        buzzMessageNonce("evt-reused"),
-      ]);
+      // A later admitted message drives the actual 24-hour prune. The outbox keeps its key.
+      harness.clock.advance(24 * 60 * 60 * 1000 + 1);
+      const guard = new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, {
+        buzz: { allowedActors: [OWNER], secret: SECRET },
+      });
+      const later = { channel: "buzz" as const, actor: OWNER, nonce: "prune-after-reuse", payload: null };
+      expect(guard.admit({ ...later, signature: ingressSignature(SECRET, later) }).allowed).toBe(true);
       expect(inboundRow(harness, "evt-reused")).toBeNull();
 
       // The relay sends the same event again. Nothing may be queued, and nothing may look queued.

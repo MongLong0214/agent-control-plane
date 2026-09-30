@@ -41,6 +41,17 @@ class IngressDeleteAuthorityToken {
 export type IngressDeleteAuthority = IngressDeleteAuthorityToken;
 export const isIngressDeleteAuthority = IngressDeleteAuthorityToken.matches;
 
+/** Release only the authenticated MCP peer's unfinished reservation after its handler throws. */
+export const releaseUnfinishedMcpReservation = (db: Db, actor: string, nonce: string): void => {
+  const authority = new IngressDeleteAuthorityToken(db, "mcp");
+  db.withIngressDelete(authority, "mcp", () => db.run(
+    `DELETE FROM inbound_messages
+      WHERE channel = 'mcp' AND nonce = ? AND actor = ?
+        AND result_json IS NULL AND turn_claim_json IS NULL`,
+    [nonce, actor],
+  ));
+};
+
 export interface IngressRequest {
   channel: "telegram" | "buzz" | "mcp" | "cli";
   /** Channel identity: telegram user id, buzz channel pubkey, mcp peer. Not a role. */

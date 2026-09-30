@@ -351,6 +351,23 @@ const batchCrash = async (): Promise<BatchCrashReport> => {
     );
     const resolved = guard.resolveTurn(CHANNEL, `update:${BATCH_RUNNING_UPDATE_ID}`);
     if (!resolved.allowed) throw new Error(`${resolved.reasonCode}: ${resolved.message}`);
+    // The interrupted handler has stopped. Ingress resolution alone does not settle its
+    // canonical turn; an operator must record the fence before the next verified claim.
+    const stopped = current.harness.cp.db.get<{ turn_request_id: string; target_actor_id: string }>(
+      `SELECT t.turn_request_id, t.target_actor_id FROM canonical_turns t
+        JOIN canonical_turn_sources s ON s.turn_request_id = t.turn_request_id
+       WHERE s.source_channel = ? AND s.source_nonce = ?`,
+      [CHANNEL, `update:${BATCH_RUNNING_UPDATE_ID}`],
+    );
+    if (!stopped) throw new Error("running batch has no canonical turn to resolve");
+    const canonicalResolved = current.harness.cp.conversation.resolveInDoubt({
+      targetActorId: stopped.target_actor_id,
+      turnRequestId: stopped.turn_request_id,
+      reasonCode: ReasonCode.HERMES_AGENT_RUN_EXCEPTION,
+      evidenceDigest: digestOf({ stopped: `update:${BATCH_RUNNING_UPDATE_ID}` }),
+      fenceAsserted: true,
+    });
+    if (!canonicalResolved.allowed) throw new Error(`${canonicalResolved.reasonCode}: ${canonicalResolved.message}`);
 
     transport.enqueue(
       updateFrom(BATCH_CURRENT_UPDATE_ID, BATCH_CURRENT_MESSAGE_ID, "batch-current"),

@@ -2,6 +2,7 @@ import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { Db } from "../db/database.ts";
+import { releaseUnfinishedMcpReservation } from "../ingress/ingress-guard.ts";
 
 const MCP_RESERVATION_TTL_MS = 60_000;
 
@@ -183,11 +184,7 @@ export const idempotentMcpMutation = async (
   } catch (error) {
     // A thrown handler has no durable response for a retry to replay. Removing only this
     // peer's unfinished row keeps a separate peer from taking its key while unblocking it.
-    source.db.run(
-      `DELETE FROM inbound_messages
-        WHERE channel = 'mcp' AND nonce = ? AND actor = ? AND result_json IS NULL`,
-      [idempotencyKey, peer.actor],
-    );
+    releaseUnfinishedMcpReservation(source.db, peer.actor, idempotencyKey);
     throw error;
   }
   source.db.run(

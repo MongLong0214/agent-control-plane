@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -1136,15 +1137,21 @@ describe("a verified actor-bound /again override", () => {
     // Recreate the old on-disk shape without a second test fixture or rewriting a historical migration.
     // The seeded turn is real, and the migration must retain it across the ALTER and index swap.
     const legacy = new Database(file);
+    const v37NoReplace = /CREATE TRIGGER IF NOT EXISTS canonical_turns_no_replace[\s\S]*?\nEND;/.exec(
+      readFileSync(new URL("../../src/db/schema-v37.sql", import.meta.url), "utf8"),
+    )?.[0];
+    if (!v37NoReplace) throw new Error("v37 canonical_turns_no_replace is missing");
     legacy.exec(`
       DROP TRIGGER canonical_turns_override_claim_guard;
       DROP TRIGGER canonical_turns_override_identity_immutable;
       DROP TRIGGER canonical_turns_override_write_authority;
       DROP TRIGGER inbound_messages_override_authority_immutable;
       DROP TRIGGER inbound_messages_override_claim_authority;
+      DROP TRIGGER canonical_turns_no_replace;
       DROP INDEX canonical_turns_one_unresolved;
       DROP INDEX canonical_turns_one_unresolved_override;
       ALTER TABLE canonical_turns DROP COLUMN override_incumbent_turn_request_id;
+      ${v37NoReplace}
       CREATE UNIQUE INDEX canonical_turns_one_unresolved
         ON canonical_turns(target_actor_id) WHERE lifecycle_state = 'IN_DOUBT';
       DROP TRIGGER schema_migrations_no_delete;

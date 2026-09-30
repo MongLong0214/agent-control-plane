@@ -1070,6 +1070,7 @@ describe("baseline boundary contracts", () => {
       "v35-keep-the-admitted-payload-with-its-inbound-row",
       "v36-backfill-ingress-receipt-identities-before-freezing-claims",
       "v37-seed-claude-cli-executor-kind",
+      "v38-canonical-verified-target-override",
     ]);
   });
 

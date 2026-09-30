@@ -42,7 +42,7 @@ export const RECEIPT_BYTES_SHA256 =
 export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string }> = [
   {
     path: "src/db/migrations.ts",
-    sha256: "5a8bb118e4e085c7c9bf584b38f7574b8f12845d4d4d93d54fb331c734911627",
+    sha256: "f500150931eee260383782fb5e648816e2519e3ec1661d250b6877cee376bce4",
   },
   {
     path: "src/db/schema-v37.sql",
