@@ -10,7 +10,6 @@ const offlineSuspensionNeedsAQuietProject = {
   replace: "          if (openRuns < 0) {\n",
   killedBy: [
     "tests/unit/an-offline-project-suspension.test.ts::refuses a project with an unfinished run, which only the daemon's owner path can quiesce",
-    "tests/unit/an-offline-project-suspension.test.ts::refuses a project with an active binding, which only the daemon's owner path can quiesce",
   ],
 };
 
