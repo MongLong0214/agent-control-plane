@@ -677,29 +677,45 @@ describe("candidate snapshot (PRD §16)", () => {
 });
 
 describe("verification sandbox (PRD §17.4)", () => {
-  it("CP-S27: a candidate command cannot read authority secrets from the environment", async () => {
+  it("CP-S27 / RF-S23: a candidate command cannot read authority secrets from the environment", async () => {
     const repo = makeRepo();
     writeFileSync(
       join(repo, "probe.js"),
       `const leak = Object.keys(process.env).filter(k => /TOKEN|SECRET|BUZZ|ANTHROPIC/i.test(k));
        console.log(JSON.stringify({ leak, home: process.env.HOME }));`,
     );
+    const secretNames = [
+      "ACP_TRUSTED_GITHUB_TOKEN",
+      "ANTHROPIC_API_KEY",
+      "TELEGRAM_BOT_TOKEN",
+      "BUZZ_PRIVATE_KEY",
+    ];
+    const previousSecrets = new Map(secretNames.map((name) => [name, process.env[name]]));
     process.env["ACP_TRUSTED_GITHUB_TOKEN"] = "ghp_should_not_leak";
+    process.env["ANTHROPIC_API_KEY"] = "sk-ant-provider-should-not-leak";
+    process.env["TELEGRAM_BOT_TOKEN"] = "123456:telegram-should-not-leak";
     process.env["BUZZ_PRIVATE_KEY"] = "nsec1shouldnotleak";
 
-    const outcome = await runSandboxed({
-      command: parseVerificationCommand({
-        id: "probe",
-        argv: ["node", "probe.js"],
-        envAllowlist: ["CI", "ACP_TRUSTED_GITHUB_TOKEN"],
-        timeoutSeconds: 60,
-      }),
-      worktreePath: repo,
-    });
+    const outcome = await (async () => {
+      try {
+        return await runSandboxed({
+          command: parseVerificationCommand({
+            id: "probe",
+            argv: ["node", "probe.js"],
+            envAllowlist: ["CI", ...secretNames],
+            timeoutSeconds: 60,
+          }),
+          worktreePath: repo,
+        });
+      } finally {
+        for (const [name, value] of previousSecrets) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+      }
+    })();
 
-    delete process.env["ACP_TRUSTED_GITHUB_TOKEN"];
-    delete process.env["BUZZ_PRIVATE_KEY"];
-
+    expect(new Map(secretNames.map((name) => [name, process.env[name]]))).toEqual(previousSecrets);
     expect(outcome.status).toBe("PASS");
     const parsed = JSON.parse(outcome.stdout) as { leak: string[]; home: string };
     expect(parsed.leak).toEqual([]);
