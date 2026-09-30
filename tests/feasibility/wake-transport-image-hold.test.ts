@@ -147,7 +147,8 @@ describe("a qualification run holds one image for its whole length", () => {
         ...observationsFrom(captureOf(injected, injected ? witness : null), {
           frameWritten: injected,
           requestsBefore: 1,
-        }),
+          ...(injected ? { requestsBeforeWitness: 2 } : {}),
+        }, BASELINE_PROMPT, witness),
         witness,
       };
       return {

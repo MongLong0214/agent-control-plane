@@ -16,13 +16,8 @@ const aPublishedTextIsJudgedWithItsRequest = {
   id: "a-published-text-is-judged-with-its-request",
   what: "the acceptance rule judges a verbatim text against the request it was recorded in, not on its content alone",
   file: "tests/feasibility/wake-transport-qualification/harness.ts",
-  find:
-    "  !isArmEvidence(\n" +
-    "    { method: `${request?.method}`, url: `${request?.url}` },\n" +
-    "    { from: `${entry.from}`, text: entry.text },\n" +
-    "  );\n",
-  replace:
-    "  !isArmEvidence({ method: \"POST\", url: \"/v1/messages\" }, { from: \"user\", text: entry.text });\n",
+  find: "  return !ownWitness && !isArmEvidence(at, text);\n",
+  replace: "  return !ownWitness && !isArmEvidence({ method: \"POST\", url: \"/v1/messages\" }, { from: \"user\", text: entry.text });\n",
   killedBy: [
     "tests/feasibility/wake-transport-readings.test.ts::an arm publishing a text none of its counts are read from is refused",
   ],

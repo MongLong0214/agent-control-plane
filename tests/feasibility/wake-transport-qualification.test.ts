@@ -651,6 +651,18 @@ describe("U6: an arm's counts are derived from the observations committed with i
     );
   });
 
+  it("does not publish a private system block with another witness-shaped value", () => {
+    const own = `u6-witness-${"1".repeat(32)}`;
+    const other = `u6-witness-${"2".repeat(32)}`;
+    const raw = capture(["POST", "/v1/messages?beta=true", JSON.stringify({
+      system: [{ type: "text", text: `private system block ${other}` }],
+      messages: [{ role: "user", content: [{ type: "text", text: BASELINE_PROMPT }] }],
+    })]);
+    const observations = observationsFrom(raw, noFrame(1), BASELINE_PROMPT, own);
+    expect(observations.requests[0]?.texts[0]).toMatchObject({ from: "system", withheld: "not this arm's evidence" });
+    expect(JSON.stringify(observations)).not.toContain("private system block");
+  });
+
   it("keeps a text verbatim only from the requests its counts are derived from", () => {
     // Both reviewers reproduced the same defect here, one of them with a system-prompt fixture: the
     // writer kept any text containing the token, and the reader judged a text without its request,
@@ -852,7 +864,7 @@ describe("U6: what the probe starts, and what it refuses to proceed without", ()
     expect(witnessCarryingTurns(run.observations!)).toHaveLength(1);
     // One request existed when the frame was written, and the arm recorded that rather than
     // leaving a reader to work it out from which request carries the prompt.
-    expect(run.observations?.boundary).toEqual({ frameWritten: true, requestsBefore: 1 });
+    expect(run.observations?.boundary).toEqual({ frameWritten: true, requestsBefore: 1, requestsBeforeWitness: 2 });
   }, 90_000);
 
   it.each(SHAPES)(
@@ -866,7 +878,7 @@ describe("U6: what the probe starts, and what it refuses to proceed without", ()
       // socket before it waits for the baseline, so "both preceded the frame" is a fact about the
       // capture here and not a race.
       const started: { executable: string; argv: readonly string[] }[] = [];
-      const run = await runQualificationProbe({
+      await expect(runQualificationProbe({
         shape,
         inject: true,
         captureDir: CAPTURE_DIR,
@@ -877,21 +889,22 @@ describe("U6: what the probe starts, and what it refuses to proceed without", ()
           ACP_FAKE_CLIENT_PRE_WAKE_TURN: `Another Claude session sent a message:\n${ROLE_WAKE_TOKEN}\nRead your inbox.`,
           ACP_FAKE_CLIENT_IGNORES_FRAME: "1",
         }),
-      });
-
-      // The frame was written, and it was written after both turns -- which is what the record
-      // says, rather than what a reader would infer from the prompt being the first of them.
-      expect(run.observations?.boundary).toEqual({ frameWritten: true, requestsBefore: 2 });
-      expect(run.observations?.requests).toHaveLength(2);
-      // The wake-carrying turn is counted, and it is still not a follow-up: the arm fails.
-      expect(run.wakeCarryingModelRequests).toBe(1);
-      expect(run.baselineModelRequests).toBe(2);
-      expect(run.modelRequests).toBe(2);
-      expect(run.followUpAfterInjection).toBe(false);
-      expect(armPassed(run)).toBe(false);
+      })).rejects.toThrow(/production wake.*before the witness frame/);
     },
     90_000,
   );
+
+  it.each(SHAPES)("%s: turns released only after the witness frame do not prove the production wake", async (shape) => {
+    await expect(runQualificationProbe({
+      shape,
+      inject: true,
+      captureDir: CAPTURE_DIR,
+      image: stand(),
+      settleCeilingMs: 1_000,
+      baselineCeilingMs: 30_000,
+      startProcess: starter([], { ACP_FAKE_CLIENT_RELEASE_ON_SECOND_FRAME: "1" }),
+    })).rejects.toThrow(/production wake.*before the witness frame/);
+  }, 90_000);
 
   it.each(SHAPES)("%s: refuses an arm whose prompt never became a turn, rather than measuring against nothing", async (shape) => {
     // The refusal, at the branch that acts. The stand-in takes its start, binds its socket and

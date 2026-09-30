@@ -18,8 +18,8 @@
  *     than a constant of its own that merely looks like it. A harness with its own frame
  *     constant can go green while production sends different bytes. An injection arm then writes a
  *     second frame -- the same envelope, parsed from that constant, carrying the witness this arm
- *     minted (`witnessFrameFor`) -- so that its acceptance rests on a value nothing that did not run
- *     the ceremony could have carried. The production bytes still go first and still go unchanged.
+ *     minted (`witnessFrameFor`) -- after a production-token turn has been observed. The production
+ *     bytes still go first and unchanged; the signed reading binds both frame boundaries.
  *
  *  3. **It preserves the raw capture.** C0 removed its temp root on exit, so the run left no
  *     artefact and the pinned version rested on a memory of a measurement. Every run here
@@ -37,7 +37,7 @@
  * runtime dropped them on the floor.
  */
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, randomBytes, sign, verify, type KeyLike } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
@@ -51,6 +51,7 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { connect } from "node:net";
@@ -122,6 +123,32 @@ export const SUITE_CAPTURE_DIR = "evidence/local/u6-wake-transport-probe";
  * unique within it, and a name is a function of the build.
  */
 export const RECEIPT_DIR = "evidence/u6-wake-transport-qualification";
+export const CEREMONY_PUBLIC_KEY_PATH = join(REPO_ROOT, "tests/feasibility/wake-transport-qualification/wake-ceremony-ed25519.pub.pem");
+
+/** The signing key is operator owned and is checked before the first client measurement. */
+export const readCeremonyPrivateKey = (): KeyLike => {
+  const path = process.env.ACP_WAKE_QUALIFICATION_KEY ?? join(homedir(), ".agent-control-plane/qualification/wake-ceremony-ed25519.pem");
+  // node rather than openssl: the LibreSSL macOS ships has no Ed25519. A new key also needs its public
+  // half committed at CEREMONY_PUBLIC_KEY_PATH, or every reading it signs is refused.
+  const create = `node -e 'const c=require("node:crypto"),f=require("node:fs"),k=c.generateKeyPairSync("ed25519");` +
+    `f.writeFileSync(process.argv[1],k.privateKey.export({type:"pkcs8",format:"pem"}),{mode:0o600});` +
+    `process.stdout.write(k.publicKey.export({type:"spki",format:"pem"}))' ${JSON.stringify(path)}`;
+  try {
+    const keyPath = realpathSync(path);
+    if (keyPath.startsWith(REPO_ROOT)) throw new Error("private key is inside the repository");
+    const status = statSync(path);
+    if (!status.isFile()) throw new Error("key is not a regular file");
+    const mode = status.mode & 0o777;
+    if ((mode & ~0o600) !== 0) throw new Error(`mode ${mode.toString(8)} is wider than 0600`);
+    const key = createPrivateKey(readFileSync(path));
+    if (key.asymmetricKeyType !== "ed25519") throw new Error("key is not Ed25519");
+    const expected = createPublicKey(readFileSync(CEREMONY_PUBLIC_KEY_PATH));
+    if (!createPublicKey(key).equals(expected)) throw new Error(`key does not match ${CEREMONY_PUBLIC_KEY_PATH}`);
+    return key;
+  } catch (error) {
+    throw new Error(`wake qualification key ${path} is unavailable or invalid: ${(error as Error).message}. Create it with: ${create}`);
+  }
+};
 
 /** The client every reading here measures. The instrument resolves a `claude` binary and nothing else. */
 export const MEASURED_CLIENT_NAME = "claude-code";
@@ -265,6 +292,8 @@ export interface ProbeRun {
 }
 
 export interface QualificationReceipt {
+  /** Ed25519 signature of every other JSON field, serialized by `canonicalReadingBytes`. */
+  readonly signature?: string;
   readonly qualification: string;
   readonly producedAt: string;
   /**
@@ -325,6 +354,31 @@ export interface QualificationReceipt {
   readonly limits: readonly string[];
   readonly findings: readonly { readonly id: string; readonly statement: string; readonly options: readonly string[] }[];
 }
+
+/** Stable JSON bytes: all object keys sorted, arrays ordered, and the signature field excluded. */
+export const canonicalReadingBytes = (reading: QualificationReceipt): Buffer => {
+  const { signature: _signature, ...payload } = reading;
+  const canonical = JSON.stringify(payload, (_key, value: unknown) =>
+    value !== null && typeof value === "object" && !Array.isArray(value)
+      ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))
+      : value,
+  );
+  return Buffer.from(canonical, "utf8");
+};
+
+export const signReading = (reading: QualificationReceipt, privateKey: KeyLike): QualificationReceipt => ({
+  ...reading,
+  signature: sign(null, canonicalReadingBytes(reading), privateKey).toString("base64"),
+});
+
+export const verifyReadingSignature = (reading: QualificationReceipt, publicKey: KeyLike): boolean => {
+  if (typeof reading?.signature !== "string" || !/^[A-Za-z0-9+/]{86}==$/.test(reading.signature)) return false;
+  try {
+    return verify(null, canonicalReadingBytes(reading), publicKey, Buffer.from(reading.signature, "base64"));
+  } catch {
+    return false;
+  }
+};
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -580,6 +634,9 @@ export const terminalOutput = (): { readonly push: (chunk: Buffer) => void; read
  */
 export const ARM_WITNESS = /^u6-witness-[0-9a-f]{32}$/;
 const WITNESS_IN_TEXT = /u6-witness-[0-9a-f]{32}/;
+const WITNESS_VALUES = /u6-witness-[0-9a-f]{32}/g;
+const carriesOtherWitness = (text: string, witness?: string): boolean =>
+  [...text.matchAll(WITNESS_VALUES)].some(([value]) => value !== witness);
 
 /**
  * A value this run mints for one arm, which nothing that did not run it can predict.
@@ -1002,7 +1059,7 @@ export const wakeCarryingTurnsIn = (capture: string): readonly CapturedRequest[]
 export const witnessCarryingTurnsIn = (capture: string, witness: string): readonly CapturedRequest[] =>
   ARM_WITNESS.test(witness)
     ? modelRequestsIn(capture).filter((request) =>
-        modelInputTexts(request.body).some(({ text }) => text.includes(witness)),
+        modelInputTexts(request.body).some(({ from, text }) => from === "user" && text.includes(witness)),
       )
     : [];
 
@@ -1079,10 +1136,8 @@ export const isArmEvidence = (
  * (`qualificationShortfalls`), not by a count. Kept apart, neither rule's coverage is claimed by the
  * other's.
  *
- * Judged on the *shape* of the mark rather than against one arm's value, which is what lets the
- * writer classify a text without being told which arm it belongs to -- and it is no weaker: what
- * admission then requires is that the arm's own recorded value be in a text kept this way, so a
- * text carrying some other mark of this shape buys a reading nothing.
+ * Only the exact value this arm minted, in a user message of a model request, may be kept as
+ * witness evidence. A different witness-shaped value in a private system block is withheld.
  *
  * `isModelRequest` for the reason `isArmEvidence` gives: the witness rule reads *turns*, so a mark in
  * a count-tokens request or a GET is read by no rule and is withheld like any other text there.
@@ -1090,7 +1145,8 @@ export const isArmEvidence = (
 export const isWitnessEvidence = (
   request: { readonly method: string; readonly url: string },
   entry: ModelInputText,
-): boolean => isModelRequest(request) && WITNESS_IN_TEXT.test(entry.text);
+  witness?: string,
+): boolean => isModelRequest(request) && entry.from === "user" && typeof witness === "string" && ARM_WITNESS.test(witness) && entry.text.includes(witness);
 
 /**
  * One withheld text's record -- and a **refusal** to withhold what the counts are read from.
@@ -1110,11 +1166,12 @@ export const withholdText = (
   request: { readonly method: string; readonly url: string },
   entry: ModelInputText,
   prompt: string = BASELINE_PROMPT,
+  witness?: string,
 ): WithheldText => {
   // The same refusal as below, for the rule beside the counts: a text carrying a witness mark is
   // what an arm's acceptance is read from, so withholding one would make an injection arm's claim
   // and a control arm's zero statements about what was published.
-  if (isWitnessEvidence(request, entry)) {
+  if (isWitnessEvidence(request, entry, witness)) {
     throw new Error(
       "a model-input text carrying a witness mark cannot be withheld: it is what an arm's acceptance is read from",
     );
@@ -1143,10 +1200,18 @@ const observedText = (
   request: { readonly method: string; readonly url: string },
   entry: ModelInputText,
   prompt: string,
-): ObservedText =>
-  isArmEvidence(request, entry, prompt) || isWitnessEvidence(request, entry)
+  witness?: string,
+): ObservedText => {
+  const ownWitness = isWitnessEvidence(request, entry, witness);
+  const countEvidence = isArmEvidence(request, entry, prompt);
+  if ((carriesOtherWitness(entry.text, witness) || (WITNESS_IN_TEXT.test(entry.text) && !ownWitness)) &&
+      (countEvidence || ownWitness)) {
+    throw new Error("an unrelated witness-shaped value appears in count evidence; refusing to publish the text");
+  }
+  return countEvidence || ownWitness
     ? { from: entry.from, text: entry.text }
-    : withholdText(request, entry, prompt);
+    : withholdText(request, entry, prompt, witness);
+};
 
 /** One request as a committed reading records it: what was asked, and what the model was given. */
 export interface ObservedRequest {
@@ -1187,6 +1252,8 @@ export interface InjectionBoundary {
   readonly frameWritten: boolean;
   /** How many requests the capture already held when it was. */
   readonly requestsBefore: number;
+  /** Injection arms record this after observing a production-token turn and before writing the witness frame. */
+  readonly requestsBeforeWitness?: number;
 }
 
 /**
@@ -1257,18 +1324,14 @@ export interface ArmObservations {
  * The prompt is this harness's own constant, because an arm that was started with some other prompt
  * is not one these rules admit.
  */
-const isPublishedWithoutBeingRead = (request: ObservedRequest, entry: ObservedText): boolean =>
-  entry !== null &&
-  typeof entry === "object" &&
-  "text" in entry &&
-  typeof entry.text === "string" &&
-  // The witness rule reads a text carrying a mark of its own shape, in a turn, so such a text is
-  // published because something reads it -- judged with its request for the same reason as below.
-  !isWitnessEvidence({ method: `${request?.method}`, url: `${request?.url}` }, { from: `${entry.from}`, text: entry.text }) &&
-  !isArmEvidence(
-    { method: `${request?.method}`, url: `${request?.url}` },
-    { from: `${entry.from}`, text: entry.text },
-  );
+const isPublishedWithoutBeingRead = (request: ObservedRequest, entry: ObservedText, witness?: string): boolean => {
+  if (entry === null || typeof entry !== "object" || !("text" in entry) || typeof entry.text !== "string") return false;
+  const at = { method: `${request?.method}`, url: `${request?.url}` };
+  const text = { from: `${entry.from}`, text: entry.text };
+  const ownWitness = isWitnessEvidence(at, text, witness);
+  if (WITNESS_IN_TEXT.test(entry.text) && (!ownWitness || carriesOtherWitness(entry.text, witness))) return true;
+  return !ownWitness && !isArmEvidence(at, text);
+};
 
 /**
  * Whether an observed text is neither shown nor accounted for -- content a record dropped.
@@ -1330,6 +1393,7 @@ export const observationsFrom = (
   capture: string,
   boundary: InjectionBoundary,
   prompt: string = BASELINE_PROMPT,
+  witness?: string,
 ): ArmObservations => {
   const clean = (value: string): string => {
     const redacted = redactHome(value);
@@ -1347,7 +1411,7 @@ export const observationsFrom = (
       at: clean(request.at ?? ""),
       ...at,
       texts: modelInputTexts(request.body).map(({ from, text }) =>
-        observedText(at, { from: clean(from), text: clean(text) }, prompt),
+        observedText(at, { from: clean(from), text: clean(text) }, prompt, witness),
       ),
     };
   });
@@ -1361,7 +1425,11 @@ export const observationsFrom = (
     rawCaptureSha256: createHash("sha256").update(Buffer.from(capture, "utf8")).digest("hex"),
     // Copied field by field, never spread: what a caller hands in is an argument, and what is
     // written into a committed reading is these two facts and no others it happened to carry.
-    boundary: { frameWritten: boundary.frameWritten, requestsBefore: boundary.requestsBefore },
+    boundary: {
+      frameWritten: boundary.frameWritten,
+      requestsBefore: boundary.requestsBefore,
+      ...(boundary.requestsBeforeWitness === undefined ? {} : { requestsBeforeWitness: boundary.requestsBeforeWitness }),
+    },
     requests,
   };
 };
@@ -1480,7 +1548,7 @@ export const witnessCarryingTurns = (observations: ArmObservations): readonly Ob
   const witness = observations?.witness;
   if (typeof witness !== "string" || !ARM_WITNESS.test(witness)) return [];
   const requests = Array.isArray(observations?.requests) ? observations.requests : [];
-  return requests.filter(isObservedTurn).filter((turn) => keptTexts(turn).some(({ text }) => text.includes(witness)));
+  return requests.filter(isObservedTurn).filter((turn) => keptTexts(turn).some(({ from, text }) => from === "user" && text.includes(witness)));
 };
 
 export interface ProbeOptions {
@@ -1697,9 +1765,18 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
     // Set after `writeWakeFrame` returns, never before, so the record says a frame was written and
     // not that one was meant to be. A throw from the write fails the arm, and with it the run.
     let frameWritten = false;
+    let requestsBeforeWitness: number | undefined;
 
     if (options.inject) {
       await writeFrame(socketPath, ROLE_WAKE_FRAME);
+      const productionSeen = await waitFor(() => {
+        const soFar = readFileSync(capturePath, "utf8");
+        return capturedRequests(soFar).slice(requestsBefore).some((request) =>
+          isModelRequest(request) && modelInputTexts(request.body).some(({ text }) => text.includes(ROLE_WAKE_TOKEN)),
+        );
+      }, settleCeilingMs);
+      if (!productionSeen) throw new Error("the production wake produced no token turn before the witness frame");
+      requestsBeforeWitness = capturedRequests(readFileSync(capturePath, "utf8")).length;
       // The witness, in the production envelope, on its own connection and after the production
       // frame: the bytes production sends reach this session unchanged, and this arm's acceptance
       // then rests on a value nothing that did not run it could have carried (`witnessFrameFor`).
@@ -1742,7 +1819,7 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
     // The boundary travels with the observations because it is the one fact about them that cannot
     // be read back off the capture: which requests existed before the frame. Derived instead -- by
     // taking the prompt's position -- it admitted a session that ignored the wake entirely.
-    const observations = observationsFrom(finalCapture, { frameWritten, requestsBefore });
+    const observations = observationsFrom(finalCapture, { frameWritten, requestsBefore, requestsBeforeWitness }, BASELINE_PROMPT, witness);
     const counts = countsFrom(observations);
     mkdirSync(durableDir, { recursive: true });
     // The snapshot, not a second copy of the file: `observations.rawCaptureSha256` is the digest of
@@ -1756,10 +1833,8 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
       injected: options.inject,
       command: command.map(redactHome),
       imageSha256,
-      // The witness travels with the observations rather than being passed into the reader: nothing
-      // in the derivation depends on it -- the writer keeps a text carrying a mark of its shape
-      // whichever arm minted it (`isWitnessEvidence`) -- and what admission needs is which of those
-      // marks was this arm's, which only this arm can say.
+      // The writer used this exact mint to decide which user text it could keep; the reader uses
+      // the same value to check the kept text and the post-witness boundary.
       observations: { ...observations, witness },
       // Derived from the observations committed beside them, by the same calculation the reader
       // derives them with. `baselineModelRequests` above is what the arm waited for; the number
@@ -1877,19 +1952,9 @@ const armLabel = (arm: { readonly shape: ProbeShape; readonly injected: boolean 
  *   terms as its zero token count. The four arms' values have to differ, and
  *   `qualificationDisagreements` refuses a reading that reuses a value another reading recorded.
  *
- * What the witness establishes, exactly: an arm's acceptance is tied to the frame *this run wrote*.
- * A capture from some other run -- including a real one, and including this ceremony's other arms --
- * carries another value, so it cannot be presented as this arm's, and a reading cannot be filed twice
- * under two builds' names. A reading written before the run, with a value chosen by hand, is refused
- * because it would have had to name a value it never saw.
- *
- * What it does **not** establish, and this is the part to read twice: that a live client was on the
- * other end. The same process mints the value and writes both halves of the record -- the frame and
- * the observations -- so whoever can run this instrument, or write a file that looks like its output,
- * can make the value and the text carrying it agree. What the witness removes is the *reuse* of a
- * reading and the *prediction* of one; it is not an attestation of the ceremony, and nothing that
- * lives inside the artefact can be one. Every other rule above remains a statement inside the file
- * being judged, and agreement among them is internal consistency.
+ * The witness and capture still come from the same writer. Admission therefore also verifies the
+ * Ed25519 signature over the entire reading against the committed ceremony public key. Only the
+ * operator-held key can attest that the two values were recorded by the ceremony.
  */
 export const qualificationShortfalls = (runs: readonly ProbeRun[]): readonly string[] => {
   const shortfalls: string[] = [];
@@ -1981,6 +2046,25 @@ export const qualificationShortfalls = (runs: readonly ProbeRun[]): readonly str
               `counts turns that are not the prompt's`,
           );
         }
+        const beforeWitness = boundary.requestsBeforeWitness;
+        if (run.injected) {
+          if (!Number.isInteger(beforeWitness) || beforeWitness! <= boundary.requestsBefore || beforeWitness! > observations.requests.length) {
+            shortfalls.push(`${where} does not record a second boundary after a production-token turn and before the witness frame`);
+          } else {
+            const productionTurns = observations.requests.slice(boundary.requestsBefore, beforeWitness).filter(isObservedTurn);
+            if (!productionTurns.some((turn) => keptTexts(turn).some(({ text }) => text.includes(ROLE_WAKE_TOKEN)))) {
+              shortfalls.push(`${where} shows no production-token turn before the witness frame`);
+            }
+            if (typeof observations.witness !== "string" || !ARM_WITNESS.test(observations.witness) ||
+              !observations.requests.slice(beforeWitness).filter(isObservedTurn).some((turn) =>
+                keptTexts(turn).some(({ from, text }) => from === "user" && text.includes(observations.witness!)),
+              )) {
+              shortfalls.push(`${where} shows no witness turn after the witness frame`);
+            }
+          }
+        } else if (beforeWitness !== undefined) {
+          shortfalls.push(`${where} is a control arm but records a witness-frame boundary`);
+        }
       }
       // The one thing in an arm that a run had to have happened to produce. The value is the arm's
       // own mint (`mintArmWitness`), the frame it wrote carried it, and what is checked here is the
@@ -2027,7 +2111,7 @@ export const qualificationShortfalls = (runs: readonly ProbeRun[]): readonly str
         (total, request) =>
           total +
           (Array.isArray(request?.texts) ? request.texts : []).filter((entry: ObservedText) =>
-            isPublishedWithoutBeingRead(request, entry),
+            isPublishedWithoutBeingRead(request, entry, observations.witness),
           ).length,
         0,
       );
@@ -2243,9 +2327,13 @@ export const readReadings = (directory: string = join(REPO_ROOT, RECEIPT_DIR)): 
 export const qualificationDisagreements = (
   members: readonly WakeTransportClient[],
   readings: readonly RecordedReading[],
+  publicKey: KeyLike = readFileSync(CEREMONY_PUBLIC_KEY_PATH),
 ): string[] => {
   const label = (client: WakeTransportClient): string => `${client.name}/${client.version}`;
   const problems: string[] = [];
+  for (const { file, reading } of readings) {
+    if (!verifyReadingSignature(reading, publicKey)) problems.push(`${file} has no valid ceremony signature`);
+  }
   for (const { file, reading } of readings) {
     let expected: string;
     try {
@@ -2397,6 +2485,7 @@ const FINDINGS: QualificationReceipt["findings"] = [
  * verified against would be the weakest link in the chain.
  */
 export const qualify = async (): Promise<{ readonly receipt: QualificationReceipt; readonly path: string }> => {
+  const ceremonyKey = readCeremonyPrivateKey();
   const blocker = interactiveBlocker();
   if (blocker !== null) throw new Error(`cannot take the interactive reading: ${blocker}`);
   // Held once, here, and handed to every arm; released only after the reading is written, so the
@@ -2425,7 +2514,7 @@ export const qualify = async (): Promise<{ readonly receipt: QualificationReceip
       }
     }
 
-    const receipt = buildReceipt({ image, headSha, runs, limits: LIMITS, findings: FINDINGS });
+    const receipt = signReading(buildReceipt({ image, headSha, runs, limits: LIMITS, findings: FINDINGS }), ceremonyKey);
     return { receipt, path: recordReading(receipt) };
   } finally {
     image.release();
