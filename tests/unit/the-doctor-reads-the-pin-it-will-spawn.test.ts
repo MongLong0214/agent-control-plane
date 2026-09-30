@@ -357,6 +357,48 @@ describe("the doctor reads the pin it will spawn", () => {
     expect(action).not.toContain("has ever started");
   });
 
+  it("reports an explicitly empty provider pin as not configured", async () => {
+    // An empty configured value is not a bare executable name and is not a directory pin. Before
+    // this witness, resolveExecutable joined it to the first PATH entry, so the doctor reported
+    // that directory as NOT_A_FILE and sent the operator to repair a path nobody configured.
+    const root = tempDir("acp-empty-provider-pin-");
+    const codexPin = executableAt(join(root, "pinned"), "codex");
+    const grokPin = executableAt(join(root, "pinned"), "grok");
+
+    await withPins(
+      { ACP_CLAUDE_BINARY: "", ACP_CODEX_BINARY: codexPin, ACP_GROK_BINARY: grokPin },
+      async () => {
+        const cp = new ControlPlane({
+          databasePath: join(root, "state.sqlite"),
+          worktreeRoot: join(root, "worktrees"),
+          capacityDir: join(root, "capacity"),
+          secretsDir: join(root, "secrets"),
+          clock: new ManualClock("2026-09-30T02:00:00.000Z"),
+        });
+        try {
+          const findings = (await cp.doctor.run("capacity")).findings.filter(
+            (finding) => finding.code === ReasonCode.PROVIDER_EXECUTABLE_UNUSABLE,
+          );
+
+          expect(findings).toHaveLength(1);
+          expect(findings[0]?.scope).toBe("provider:claude");
+          expect(findings[0]?.observedEvidence).toMatchObject({
+            provider: "claude",
+            path: "",
+            condition: "NOT_CONFIGURED",
+          });
+          expect(findings[0]?.recommendedAction).toContain(
+            "no provider CLI is configured; to pin a different path, change ACP_CLAUDE_BINARY, whose current value is this pin",
+          );
+          expect(findings[0]?.recommendedAction).toContain("adapterOptions");
+          expect(findings[0]?.recommendedAction).not.toContain("not a regular file");
+        } finally {
+          cp.close();
+        }
+      },
+    );
+  });
+
   it("finds the pruned pin on the shipped composition, where claude is registered per role", async () => {
     // The case this slice exists for, entered where production enters it. `production()` is
     // `list().filter(a => a.isProduction && !hasRoleScoped(a.provider))`, and both

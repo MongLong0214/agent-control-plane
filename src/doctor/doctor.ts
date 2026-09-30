@@ -110,9 +110,17 @@ const PROVIDER_PIN_VARIABLE: Readonly<Record<string, string>> = {
  * that is not "not there" — folding those into `ABSENT` would send an operator to reinstall a
  * binary sitting exactly where they put it.
  */
-type PinCondition = "ABSENT" | "NOT_A_FILE" | "NOT_EXECUTABLE" | "UNREADABLE" | "NOT_ON_PATH";
+type PinCondition =
+  | "ABSENT"
+  | "NOT_A_FILE"
+  | "NOT_EXECUTABLE"
+  | "UNREADABLE"
+  | "NOT_ON_PATH"
+  | "NOT_CONFIGURED";
 
-const PIN_CONDITION_PHRASE: Readonly<Record<Exclude<PinCondition, "NOT_ON_PATH">, string>> = {
+const PIN_CONDITION_PHRASE: Readonly<
+  Record<Exclude<PinCondition, "NOT_ON_PATH" | "NOT_CONFIGURED">, string>
+> = {
   ABSENT: "not there",
   NOT_A_FILE: "not a regular file",
   NOT_EXECUTABLE: "not executable",
@@ -133,6 +141,7 @@ const PIN_CONDITION_PHRASE: Readonly<Record<Exclude<PinCondition, "NOT_ON_PATH">
  * `checkProviderExecutables`, which is where that choice is argued.
  */
 const inspectPin = (path: string): { condition: PinCondition; error?: string } | null => {
+  if (path === "") return { condition: "NOT_CONFIGURED" };
   if (!path.includes("/")) return { condition: "NOT_ON_PATH" };
   try {
     // Follows the link, the way the kernel will. Not canonicalised.
@@ -1173,6 +1182,9 @@ export class Doctor {
         `searches a PATH`
       );
     }
+    if (condition === "NOT_CONFIGURED") {
+      return `no provider CLI is configured; ${restart}`;
+    }
     return (
       `the pin is ${path} and it is ${PIN_CONDITION_PHRASE[condition]}. Restoring an executable ` +
       `file at that exact path needs no restart — the daemon retained the pin and the spawn ` +
@@ -1207,7 +1219,8 @@ export class Doctor {
     const variable = PROVIDER_PIN_VARIABLE[provider];
     if (variable === undefined) return undefined;
     const value = process.env[variable];
-    if (value === undefined || value === "") return undefined;
+    if (value === undefined) return undefined;
+    if (value === "") return path === "" ? variable : undefined;
     return value === path || resolve(value) === path ? variable : undefined;
   }
 
