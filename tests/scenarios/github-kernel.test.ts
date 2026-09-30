@@ -290,7 +290,12 @@ const setupLineageFixture = async (input: {
 };
 
 /** Release tags require historical merge and post-merge evidence the feature-to-dev fixture cannot produce. */
-const recordAcceptedReleaseMerge = (fixture: Fixture, commit: string, pullNumber: number): void => {
+const recordAcceptedReleaseMerge = (
+  fixture: Fixture,
+  commit: string,
+  pullNumber: number,
+  targetBranch = "main",
+): void => {
   const idempotencyKey = `merge_execute:${fixture.identity}:${pullNumber}`;
   fixture.harness.cp.db.run(
     `INSERT INTO github_receipts
@@ -314,7 +319,7 @@ const recordAcceptedReleaseMerge = (fixture: Fixture, commit: string, pullNumber
       WHERE idempotency_key = ? AND status = 'PENDING'`,
     [
       sha256(commit),
-      JSON.stringify({ mergeCommitSha: commit, sourceBranch: fixture.workBranch, targetBranch: "main" }),
+      JSON.stringify({ mergeCommitSha: commit, sourceBranch: fixture.workBranch, targetBranch }),
       "2026-08-12T00:00:00.000Z",
       idempotencyKey,
     ],
@@ -1172,6 +1177,19 @@ describe("release and hotfix (CP-S41, CP-S42)", () => {
     );
     expect(badSemver.reasonCode).toBe(ReasonCode.RELEASE_TAG_SEMVER_MISMATCH);
 
+    const wrongTargetCommit = "d".repeat(40);
+    recordAcceptedReleaseMerge(fixture, wrongTargetCommit, 1199, "dev");
+    const wrongTarget = await fixture.harness.cp.github.releaseTag(
+      fixture.runId,
+      fixture.identity,
+      "1.0.0",
+      wrongTargetCommit,
+      fixture.caller,
+    );
+    expect(wrongTarget.allowed).toBe(false);
+    expect(wrongTarget.reasonCode).toBe(ReasonCode.RELEASE_TAG_COMMIT_NOT_ACCEPTED);
+    expect(fixture.github.tags.size).toBe(0);
+
     const releaseCommit = "r".repeat(40);
     recordAcceptedReleaseMerge(fixture, releaseCommit, 1200);
     const tagged = await fixture.harness.cp.github.releaseTag(
@@ -1263,7 +1281,7 @@ describe("issue projection", () => {
     });
   });
 
-  it("RF-S18: post-bootstrap tickets are projected idempotently through the ACP GitHub kernel", async () => {
+  it("projects tickets idempotently through the ACP GitHub kernel", async () => {
     const fixture = await setup();
     const tickets = [{ id: "T001", title: "first", body: "do the thing" }];
 
@@ -2530,8 +2548,14 @@ describe("trusted CI evidence (CP-S29)", () => {
     const snapshot = await frozen(fixture);
     const run = fixture.harness.cp.runs.require(fixture.runId);
 
+    // Keep every field from the pinned command identical and weaken only the executable payload.
+    // A fixture that also changed the id, evidence mode, role, or timeout could still be rejected
+    // after argv stopped participating in the comparison, leaving RF-S22 green for the wrong field.
     const weaker = [
-      parseVerificationCommand({ id: "verify", argv: ["node", "-e", "process.exit(0)"] }),
+      parseVerificationCommand({
+        ...TRUSTED_CI_COMMANDS[0]!,
+        argv: ["node", "-e", "process.exit(0)"],
+      }),
     ];
     const refused = await fixture.harness.cp.verification.verify({
       runId: fixture.runId,

@@ -98,6 +98,31 @@ export class ApprovedRunFinalizer {
 
   readonly #completionAuthority;
 
+  /**
+   * Integration §17.3 — project an already activated project's portable tickets through
+   * the daemon-owned GitHub boundary. The caller supplies intent only; the run's pinned
+   * owner and the non-forgeable finalizer capability are taken from trusted state here.
+   */
+  async projectTickets(
+    runId: string,
+    repositoryIdentity: string,
+    tickets: ReadonlyArray<{ id: string; title: string; body: string; labels?: string[] }>,
+  ): Promise<Decision<{ created: number; updated: number }>> {
+    const run = this.cp.runs.get(runId);
+    if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+    if (!run.ownerSessionId || run.ownerBindingGeneration == null) {
+      return deny(ReasonCode.RUN_OWNER_NOT_PINNED, "run has no pinned owner for issue projection", {
+        runId,
+        repositoryIdentity,
+      });
+    }
+    return this.cp.github.issueProject(runId, repositoryIdentity, tickets, {
+      ownerSessionId: run.ownerSessionId,
+      ownerBindingGeneration: run.ownerBindingGeneration,
+      daemonFinalizerAuthority: this.#ports.daemonFinalizerAuthority,
+    });
+  }
+
   /** Resume every expired lease deterministically; the caller decides when to run the work. */
   reclaimExpiredAttempts(): ReclaimedFinalizationAttempt[] {
     return this.cp.db.tx(() => {

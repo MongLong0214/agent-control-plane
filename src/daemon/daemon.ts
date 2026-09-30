@@ -1762,6 +1762,21 @@ export class Daemon {
     return finalized;
   }
 
+  /** Project portable tickets only through the daemon instance holding the single-writer lock. */
+  async projectTickets(
+    runId: string,
+    repositoryIdentity: string,
+    tickets: ReadonlyArray<{ id: string; title: string; body: string; labels?: string[] }>,
+  ): Promise<Decision<{ created: number; updated: number }>> {
+    if (!this.lock.held()) {
+      return deny(ReasonCode.DAEMON_LOCK_LOST, "issue projection requires the held single-instance lock", {
+        runId,
+        repositoryIdentity,
+      });
+    }
+    return this.#finalizer.projectTickets(runId, repositoryIdentity, tickets);
+  }
+
   private async resumeQueuedRuns(): Promise<string[]> {
     const resumedRuns: string[] = [];
     // The doctor has already passed. Idempotency lives in the outbox key, so a run

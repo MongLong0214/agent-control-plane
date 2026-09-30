@@ -384,6 +384,8 @@ export const driveToReviewedCandidate = async (
     reviewedPaths?: readonly string[];
     /** Explicit GitHub identity for a disposable live repository. */
     repositoryIdentity?: string;
+    /** A project whose repository was registered by the bootstrap activation path. */
+    registeredProject?: { projectId: string; repositoryId: string; identity: string };
     manifestOverrides?: Partial<ProjectManifest>;
   } = {},
 ): Promise<{
@@ -402,13 +404,13 @@ export const driveToReviewedCandidate = async (
   workBranch: string;
 }> => {
   const workBranch = options.workBranch ?? "feature/F1-thing";
-  const { projectId, repositoryId, identity } = await registerFixtureProject(
+  const { projectId, repositoryId, identity } = options.registeredProject ?? await registerFixtureProject(
     harness,
     options.projectId ?? "fixture-project",
     options.manifestOverrides ?? {},
     ...(options.repositoryIdentity ? [{ identity: options.repositoryIdentity }] : []),
   );
-  bindCeo(harness);
+  if (!harness.cp.bindings.active(roleKeyFor(Role.CEO))) bindCeo(harness);
 
   const contract: TaskContract = {
     goal: "make app() return 2",
