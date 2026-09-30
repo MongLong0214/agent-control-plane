@@ -44,12 +44,20 @@ export const isIngressDeleteAuthority = IngressDeleteAuthorityToken.matches;
 const MCP_RESERVATION_TTL_MS = 60_000;
 
 /**
+ * The reservations whose handler is running in this process, per database.
+ *
+ * The staleness test reads the caller's own timestamp, so on its own it lets a caller call a live
+ * reservation stale and run the mutation beside a handler still in flight. A reservation held
+ * here is never taken over, whatever time the caller claims. The TTL takeover remains for the case
+ * it exists for: a handler whose process died, which leaves a row and no entry in this set.
+ */
+const mcpReservationsInFlight = new WeakMap<Db, Set<string>>();
+
+/**
  * Run only the mutation that acquired this reservation; no delete capability leaves this module.
  *
- * The staleness test reads the caller's own timestamp, so a caller can always call a live
- * reservation stale. What that buys it is bounded here: a failed run deletes only a row this call
- * inserted. A reservation it took over by renewal is put back to the time it held before, so a
- * handler still in flight keeps its row and a retry cannot run the mutation a second time.
+ * A failed run deletes only a row this call inserted. A reservation it took over by renewal is put
+ * back to the time it held before.
  */
 export const runMcpReservedMutation = async <T>(
   db: Db,
@@ -64,6 +72,9 @@ export const runMcpReservedMutation = async <T>(
       [nonce],
     );
     let renewedFrom: string | null = null;
+    if (existing && mcpReservationsInFlight.get(db)?.has(nonce)) {
+      return { kind: "existing" as const, actor: existing.actor, resultJson: existing.result_json };
+    }
     if (existing) {
       const reservedAtMs = Date.parse(existing.received_at);
       const nowMs = Date.parse(receivedAt);
@@ -112,11 +123,16 @@ export const runMcpReservedMutation = async <T>(
     return { kind: "acquired" as const, release };
   });
   if (reservation.kind === "existing") return reservation;
+  const inFlight = mcpReservationsInFlight.get(db) ?? new Set<string>();
+  mcpReservationsInFlight.set(db, inFlight);
+  inFlight.add(nonce);
   try {
     return { kind: "executed", result: await execute() };
   } catch (error) {
     reservation.release();
     throw error;
+  } finally {
+    inFlight.delete(nonce);
   }
 };
 
