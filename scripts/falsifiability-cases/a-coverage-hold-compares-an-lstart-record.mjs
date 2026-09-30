@@ -6,7 +6,7 @@ const aCoverageHoldComparesAnLstartRecord = {
   id: "a-coverage-hold-compares-an-lstart-record",
   what: "a coverage hold refuses an lstart record that is not the running process's start",
   file: "src/daemon/daemon.ts",
-  find: "  if (processStartedAt(session.osPid) !== session.osProcessStartedAt) return false;\n",
+  find: "  if (read.lstart(session.osPid) !== session.osProcessStartedAt) return false;\n",
   replace: "",
   killedBy: [
     "tests/unit/daemon-sensor-failure-binding.test.ts::revokes at once an lstart record that is not this process's start",

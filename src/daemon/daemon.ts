@@ -118,15 +118,25 @@ export const COVERAGE_REVOCATION_GRACE_MS = 10 * 60_000;
  * that started before the row and holds its pid is that process: a replacement can start only after
  * the original exited. Where no epoch-bearing native start can be read, the hold is refused.
  */
-const recordedProcessIsRunning = (session: SessionRecord): boolean => {
+export const recordedProcessIsRunning = (
+  session: Pick<SessionRecord, "osPid" | "osProcessStartedAt" | "createdAt">,
+  read: { native(pid: number): string | null; lstart(pid: number): string | null } = {
+    native: readProcessStartToken,
+    lstart: processStartedAt,
+  },
+): boolean => {
   if (session.osPid == null) return false;
   if (session.osProcessStartedAt == null) return false;
-  const native = readProcessStartToken(session.osPid);
+  const native = read.native(session.osPid);
   if (/^(?:darwin-tv|linux-clk):/.test(session.osProcessStartedAt)) return native === session.osProcessStartedAt;
-  if (processStartedAt(session.osPid) !== session.osProcessStartedAt) return false;
+  if (read.lstart(session.osPid) !== session.osProcessStartedAt) return false;
+  // The lstart read and the native reads must describe one process: a pid reused between them
+  // changes the native start, so the two answers could otherwise come from different processes.
+  if (read.native(session.osPid) !== native) return false;
   const started = /^darwin-tv:(\d+)\.(\d{6})$/.exec(native ?? "");
   if (started === null) return false;
-  return Number(started[1]) * 1000 + Number(started[2]) / 1000 <= Date.parse(session.createdAt);
+  // `createdAt` is truncated to the millisecond, so the start is compared at the same resolution.
+  return Number(started[1]) * 1000 + Math.floor(Number(started[2]) / 1000) <= Date.parse(session.createdAt);
 };
 
 /**

@@ -11,6 +11,7 @@ import { CONTINUITY_COVERAGE_REVOCATION_REASON } from "../../src/continuity/cont
 import {
   COVERAGE_REVOCATION_GRACE_MS,
   Daemon,
+  recordedProcessIsRunning,
   OPERATOR_METHOD,
   type AuthenticatedOperatorPeer,
   type ContinuityReconcileReport,
@@ -1213,5 +1214,42 @@ describe("#954: a live incumbent keeps its binding through a momentary coverage 
 
     expect(fixture.cp.bindings.active(fixture.roleKey)).toBeNull();
     expect(kinds(fixture, "CONTINUITY_REVOCATION_HELD")).toBe(0);
+  });
+});
+
+/**
+ * #954 — the exact-process test a coverage hold rests on, with every process read injected.
+ *
+ * An lstart record is whole-second text, so it is trusted only together with a native start that
+ * precedes the session row, and only if both native reads around the lstart read agree: a pid
+ * reused between the reads would otherwise pair the old process's native start with the
+ * replacement's lstart.
+ */
+describe("#954: which running process a coverage hold may treat as the incumbent", () => {
+  const LSTART = "Wed Sep 30 23:50:25 2026";
+  const record = { osPid: 4242, osProcessStartedAt: LSTART, createdAt: "2026-09-30T14:50:30.123Z" };
+  const reads = (natives: Array<string | null>, lstart: string | null = LSTART) => {
+    const queue = [...natives];
+    return { native: () => queue.shift() ?? null, lstart: () => lstart };
+  };
+
+  it("accepts an lstart record whose process began before its row and stayed the same across the reads", () => {
+    const token = "darwin-tv:1790779825.000001";
+    expect(recordedProcessIsRunning(record, reads([token, token]))).toBe(true);
+  });
+
+  it("refuses when the pid is reused between the native and lstart reads", () => {
+    expect(recordedProcessIsRunning(record, reads(["darwin-tv:1790779825.000001", "darwin-tv:1790779831.500000"])))
+      .toBe(false);
+  });
+
+  it("accepts a process that began earlier in the same millisecond its row was written", () => {
+    const token = "darwin-tv:1790779830.123900";
+    expect(recordedProcessIsRunning(record, reads([token, token]))).toBe(true);
+  });
+
+  it("refuses a process that began after its row", () => {
+    const token = "darwin-tv:1790779830.124000";
+    expect(recordedProcessIsRunning(record, reads([token, token]))).toBe(false);
   });
 });
