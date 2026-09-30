@@ -440,6 +440,27 @@ describe("Codex account rate limits (#582)", () => {
     }
   });
 
+  it("#954 says the Codex app-server never started whether spawn emits or throws", async () => {
+    const missing = join(tempDir("acp-954-codex-missing-"), "missing-codex");
+    const regularFile = join(tempDir("acp-954-codex-enotdir-"), "regular-file");
+    writeFileSync(regularFile, "not a directory");
+    const notADirectory = join(regularFile, "codex");
+
+    for (const [attempted, errno] of [[missing, "ENOENT"], [notADirectory, "ENOTDIR"]] as const) {
+      const reading = await new CodexUsageCollector({
+        clock: clock(),
+        binary: attempted,
+        codexHome: tempDir("acp-954-codex-home-"),
+      }).collect();
+
+      expect(reading.sensorHealth).toBe("ERROR");
+      expect(reading.buckets).toEqual([]);
+      expect(reading.error).toContain("codex app-server never started");
+      expect(reading.error).toContain(`configured CLI at ${attempted}`);
+      expect(reading.error).toContain(errno);
+    }
+  });
+
   it("pins CODEX_HOME in the environment it spawns, not merely in what it passes along", async () => {
     // The earlier version of this test injected a fake probe and asserted the *collector*
     // handed the pinned home to it. That says nothing about whether the spawn uses it, and
