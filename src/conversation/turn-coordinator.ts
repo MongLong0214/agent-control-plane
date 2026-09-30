@@ -1271,7 +1271,8 @@ export class ConversationTurnCoordinator {
         `SELECT turn_request_id, target_actor_id, prompt_digest, binding_generation,
                 target_binding_id, target_attestation_id, executor_session_id,
                 executor_session_incarnation, claimed_at
-           FROM canonical_turns WHERE lifecycle_state = 'IN_DOUBT' ORDER BY claimed_at ASC`,
+           FROM canonical_turns WHERE lifecycle_state = 'IN_DOUBT'
+          ORDER BY claimed_at ASC, turn_request_id ASC`,
       )
       .map((row) => ({
         turnRequestId: row.turn_request_id,
@@ -1857,7 +1858,7 @@ export class ConversationTurnCoordinator {
     return this.db
       .all<{ turn_request_id: string; target_actor_id: string; claimed_at: string }>(
         `SELECT turn_request_id, target_actor_id, claimed_at FROM canonical_turns
-          WHERE lifecycle_state = 'IN_DOUBT' ORDER BY claimed_at ASC`,
+          WHERE lifecycle_state = 'IN_DOUBT' ORDER BY claimed_at ASC, turn_request_id ASC`,
       )
       .map((row) => ({
         turnRequestId: row.turn_request_id,
