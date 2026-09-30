@@ -8,7 +8,7 @@ const aCoverageHoldReadsAnLstartRecordAsLstart = {
   what: "a coverage hold reads a session's start again in the ps lstart form it was recorded in",
   file: "src/daemon/daemon.ts",
   find: "  if (processStartedAt(session.osPid) !== session.osProcessStartedAt) return false;\n",
-  replace: "  return false;\n",
+  replace: "  if (processStartedAt(session.osPid) !== null) return false;\n",
   killedBy: [
     "tests/unit/daemon-sensor-failure-binding.test.ts::holds a session recorded the ordinary way, by ps lstart text",
   ],
