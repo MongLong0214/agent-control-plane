@@ -1769,35 +1769,40 @@ export const runQualificationProbe = async (options: ProbeOptions): Promise<Prob
 
     if (options.inject) {
       await writeFrame(socketPath, ROLE_WAKE_FRAME);
+      frameWritten = true;
       const productionSeen = await waitFor(() => {
         const soFar = readFileSync(capturePath, "utf8");
         return capturedRequests(soFar).slice(requestsBefore).some((request) =>
           isModelRequest(request) && modelInputTexts(request.body).some(({ text }) => text.includes(ROLE_WAKE_TOKEN)),
         );
       }, settleCeilingMs);
-      if (!productionSeen) throw new Error("the production wake produced no token turn before the witness frame");
-      requestsBeforeWitness = capturedRequests(readFileSync(capturePath, "utf8")).length;
-      // The witness, in the production envelope, on its own connection and after the production
-      // frame: the bytes production sends reach this session unchanged, and this arm's acceptance
-      // then rests on a value nothing that did not run it could have carried (`witnessFrameFor`).
-      await writeFrame(socketPath, witnessFrameFor(witness));
-      frameWritten = true;
-      // Returns as soon as the follow-up appears, so this arm's observed span is at most the
-      // ceiling and in practice less. The ceiling is what the two arms share; the observed span
-      // is not, and nothing here records it.
-      //
-      // It waits for the witness as well as for the follow-up. Reading the capture the moment the
-      // first new request lands can catch the arm between the two turns, and the record would then
-      // be one whose acceptance rule no live session could satisfy -- a race against the client's
-      // own ordering rather than a measurement of it.
-      await waitFor(() => {
-        const soFar = readFileSync(capturePath, "utf8");
-        return (
-          modelRequestsIn(soFar).length > baselineModelRequests &&
-          wakeCarryingTurnsIn(soFar).length > 0 &&
-          witnessCarryingTurnsIn(soFar, witness).length > 0
-        );
-      }, settleCeilingMs);
+      // A production wake that took no turn is a failed measurement, and a failed measurement is
+      // recorded rather than thrown: the arm keeps no second boundary and sends no witness, the reader
+      // refuses an injected arm without one, and the reading is still signed and written as
+      // `not-qualified` in place of whatever this build's earlier reading said.
+      if (productionSeen) {
+        requestsBeforeWitness = capturedRequests(readFileSync(capturePath, "utf8")).length;
+        // The witness, in the production envelope, on its own connection and after the production
+        // frame: the bytes production sends reach this session unchanged, and this arm's acceptance
+        // then rests on a value nothing that did not run it could have carried (`witnessFrameFor`).
+        await writeFrame(socketPath, witnessFrameFor(witness));
+        // Returns as soon as the follow-up appears, so this arm's observed span is at most the
+        // ceiling and in practice less. The ceiling is what the two arms share; the observed span
+        // is not, and nothing here records it.
+        //
+        // It waits for the witness as well as for the follow-up. Reading the capture the moment the
+        // first new request lands can catch the arm between the two turns, and the record would then
+        // be one whose acceptance rule no live session could satisfy -- a race against the client's
+        // own ordering rather than a measurement of it.
+        await waitFor(() => {
+          const soFar = readFileSync(capturePath, "utf8");
+          return (
+            modelRequestsIn(soFar).length > baselineModelRequests &&
+            wakeCarryingTurnsIn(soFar).length > 0 &&
+            witnessCarryingTurnsIn(soFar, witness).length > 0
+          );
+        }, settleCeilingMs);
+      }
     } else {
       // The control has nothing to stop early for, so it spends the whole ceiling. That makes its
       // window an upper bound on the injection arm's: an absence measured over a window no shorter
@@ -2437,11 +2442,11 @@ const LIMITS: readonly string[] = [
   "Each arm's baseline is the turns its capture already held at the moment the frame was written, and one of them is required to be a model request carrying the prompt as a user message whose text, trimmed, equals it. That is what every capture on this host shows, and a build that sent the same prompt in another shape would fail the arm rather than qualify on an unchecked turn. What is established is that this prompt started a turn before the frame, not that the client would have started one from any other input, and not that the turns counted beside it were the prompt's.",
   "settleCeilingMs is a ceiling on the post-injection wait, not a duration either arm was observed for. The control spends the whole ceiling; the injection arm returns on its first follow-up request. Two arms sharing a ceiling were watched for at most the same time, not for the same time, and the actual spans are not recorded here.",
   "Every arm executed one hard link, in a directory private to the run, to the inode digested as imageSha256 -- the command's first element names that link, which is removed with the run, and imagePath names where the inode was found. Each arm re-read the link's identity, size, modification time and digest after its measurement and would have failed the run on a difference. A rewrite of that inode in place, undone before the re-read, would not have been seen.",
-  "The verdict in this file is recomputed from the runs in it, by the one calculation the instrument writes it with, and a reader that admits this reading recomputes it again rather than reading the field. That establishes internal consistency and nothing more: every fact it checks is a statement inside this file. A file written from nothing, with all its fields made to agree, satisfies it. Whether the arms it describes ever ran is a question the raw captures and session logs it points at answer, and this check does not ask them.",
+  "The verdict in this file is recomputed from the runs in it, by the one calculation the instrument writes it with, and a reader that admits this reading recomputes it again rather than reading the field. That recomputation establishes internal consistency only. What a file written from nothing cannot also carry is the ceremony's signature: this reading is signed over every other field with an Ed25519 key kept outside the repository, and admission refuses it unless that signature verifies under the committed public key. Whether the arms it describes ever ran is still a question the raw captures and session logs it points at answer, and neither check asks them.",
   "Each arm carries the observations its counts are derived from -- every captured request's time, method and URL, and the point in that sequence at which the frame was written -- and both the instrument and the reader derive the four counts from them rather than reading integers. The boundary is recorded by the arm that wrote the frame, not inferred from which request carries the prompt: inferring it counted a wake-carrying turn that preceded the frame as the follow-up the frame caused. What that removes is a count that stood on nothing; what it does not do is attest that a live client produced the observations, or that the recorded boundary is where the frame really went. An observation list written by hand derives exactly as well as a measured one, and this file cannot tell them apart.",
   "Of each request's model input, this file carries verbatim only what the counts are read from, and only out of the requests those counts are derived from -- the turns. In a turn: the arm's prompt as a user message, and any text containing the wake token. A text in any other request is withheld whatever it contains, because no count of this arm reads it. Every other text -- most of it the client's own system prompt, which is not ours to publish -- is recorded as its kind, its length in UTF-8 bytes and its SHA-256. So a reader of the repository can recompute the four counts over the texts that are here and see that every other text is accounted for by a digest; a reader cannot see what a withheld text said. Recomputing the counts over their contents needs the raw capture named by rawCaptureSha256, which is not committed. The instrument refuses to withhold a text a count of its own request is read from, so the kept texts are the evidence and not a selection from it -- but that is a property of the code that wrote this file, not a fact this file establishes. What is checked of the file itself is the other direction: a reading carrying a verbatim text that none of its counts are read from is refused rather than admitted.",
   "The observations are bound to each arm's raw capture by that capture's SHA-256. The capture itself is under evidence/local/, which is not committed, so a reader without that file cannot check the digest, and a reader with it learns only that the copy in hand is the one these observations were read from.",
-  "Each arm minted a witness of its own -- sixteen random bytes from the platform CSPRNG, recorded with its observations -- and wrote it to the same inbox in a second frame, in the production envelope, after the production frame itself. An injection arm is accepted only if a turn's model input carries that arm's value; a control arm, which wrote no frame, only if none does; the four values differ, and a reading reusing a value another reading records is refused. What that establishes is that an arm's acceptance rests on the frames one run wrote, so a capture from another run -- including another arm of this one -- cannot stand in for it, and a value could not have been chosen before the run that minted it. What it does not establish is that a live client was at the other end: one process mints the value and writes both the frame and this record, so whoever runs the instrument, or writes a file of this shape, can make the value and the text carrying it agree.",
+  "Each arm minted a witness of its own -- sixteen random bytes from the platform CSPRNG, recorded with its observations -- and wrote it to the same inbox in a second frame, in the production envelope, after the production frame itself. An injection arm is accepted only if a turn's model input carries that arm's value; a control arm, which wrote no frame, only if none does; the four values differ, and a reading reusing a value another reading records is refused. What that establishes is that an arm's acceptance rests on the frames one run wrote, so a capture from another run -- including another arm of this one -- cannot stand in for it, and a value could not have been chosen before the run that minted it. What it does not establish is that a live client was at the other end: one process mints the value and writes both the frame and this record, so whoever runs the instrument can make the value and the text carrying it agree. A file of this shape written by hand is refused only because it cannot carry the ceremony's signature; whoever holds that key can still sign one.",
   "This file does not identify the instrument that produced it. headSha is git rev-parse HEAD at receipt-build time, which can name a tree that contains no harness -- the harness may be uncommitted while the reading is taken. Unless a sourceBinding block below says otherwise, the source of this reading is UNKNOWN, and a digest computed after the fact would attest preservation since, not what executed.",
 ];
 

@@ -53,6 +53,7 @@ import {
   terminalOutput,
   qualificationDisagreements,
   readReadings,
+  qualificationShortfalls,
   runQualificationProbe,
   wakeCarryingTurnsIn,
   withholdText,
@@ -878,7 +879,7 @@ describe("U6: what the probe starts, and what it refuses to proceed without", ()
       // socket before it waits for the baseline, so "both preceded the frame" is a fact about the
       // capture here and not a race.
       const started: { executable: string; argv: readonly string[] }[] = [];
-      await expect(runQualificationProbe({
+      const run = await runQualificationProbe({
         shape,
         inject: true,
         captureDir: CAPTURE_DIR,
@@ -889,13 +890,17 @@ describe("U6: what the probe starts, and what it refuses to proceed without", ()
           ACP_FAKE_CLIENT_PRE_WAKE_TURN: `Another Claude session sent a message:\n${ROLE_WAKE_TOKEN}\nRead your inbox.`,
           ACP_FAKE_CLIENT_IGNORES_FRAME: "1",
         }),
-      })).rejects.toThrow(/production wake.*before the witness frame/);
+      });
+      // Recorded, not thrown: a failed measurement is still one, and it has to be able to replace a
+      // build's earlier qualified reading.
+      expect(qualificationShortfalls([run]).some((problem) =>
+        problem.includes("does not record a second boundary after a production-token turn and before the witness frame"))).toBe(true);
     },
     90_000,
   );
 
   it.each(SHAPES)("%s: turns released only after the witness frame do not prove the production wake", async (shape) => {
-    await expect(runQualificationProbe({
+    const run = await runQualificationProbe({
       shape,
       inject: true,
       captureDir: CAPTURE_DIR,
@@ -903,7 +908,9 @@ describe("U6: what the probe starts, and what it refuses to proceed without", ()
       settleCeilingMs: 1_000,
       baselineCeilingMs: 30_000,
       startProcess: starter([], { ACP_FAKE_CLIENT_RELEASE_ON_SECOND_FRAME: "1" }),
-    })).rejects.toThrow(/production wake.*before the witness frame/);
+    });
+    expect(qualificationShortfalls([run]).some((problem) =>
+      problem.includes("does not record a second boundary after a production-token turn and before the witness frame"))).toBe(true);
   }, 90_000);
 
   it.each(SHAPES)("%s: refuses an arm whose prompt never became a turn, rather than measuring against nothing", async (shape) => {
