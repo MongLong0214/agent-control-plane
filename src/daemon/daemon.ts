@@ -110,16 +110,23 @@ export const COVERAGE_REVOCATION_GRACE_MS = 10 * 60_000;
  *
  * A session records its start in one of two forms: a native token (`darwin-tv:`/`linux-clk:`)
  * where its caller verified one, or `ps -o lstart=` text, which `SessionRegistry.create` derives
- * by default for the CTO launch and continuity provisioning paths. Each is read again in its own
- * form. Comparing an lstart record against a native reading would fail for every ordinary session.
+ * by default for the CTO launch and continuity provisioning paths. A native record is compared
+ * with a native reading. An lstart record is compared with an lstart reading and, because that
+ * text has whole-second precision and cannot tell apart a replacement started in the same second,
+ * the running process's native start must also precede the session row. The recorded process was
+ * alive when the row was written (the lstart is read from the live pid at write time), so a process
+ * that started before the row and holds its pid is that process: a replacement can start only after
+ * the original exited. Where no epoch-bearing native start can be read, the hold is refused.
  */
 const recordedProcessIsRunning = (session: SessionRecord): boolean => {
   if (session.osPid == null) return false;
   if (session.osProcessStartedAt == null) return false;
-  const current = /^(?:darwin-tv|linux-clk):/.test(session.osProcessStartedAt)
-    ? readProcessStartToken(session.osPid)
-    : processStartedAt(session.osPid);
-  return current === session.osProcessStartedAt;
+  const native = readProcessStartToken(session.osPid);
+  if (/^(?:darwin-tv|linux-clk):/.test(session.osProcessStartedAt)) return native === session.osProcessStartedAt;
+  if (processStartedAt(session.osPid) !== session.osProcessStartedAt) return false;
+  const started = /^darwin-tv:(\d+)\.(\d{6})$/.exec(native ?? "");
+  if (started === null) return false;
+  return Number(started[1]) * 1000 + Number(started[2]) / 1000 <= Date.parse(session.createdAt);
 };
 
 /**

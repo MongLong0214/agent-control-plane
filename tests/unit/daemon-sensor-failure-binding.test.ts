@@ -43,9 +43,10 @@ afterEach(() => {
 const makeIncumbent = (
   providers: "claude" | "claude-and-gpt" | "none" = "claude",
   identity?: { pid: number; token?: string },
+  startAt = "2026-09-08T00:00:00.000Z",
 ) => {
   const root = tempDir("acp-sensor-binding-");
-  const clock = new ManualClock("2026-09-08T00:00:00.000Z");
+  const clock = new ManualClock(startAt);
   const claude = new ProductionTestAdapter(clock, "claude");
   const gpt = new ProductionTestAdapter(clock, "gpt");
   const cp = new ControlPlane({
@@ -1007,9 +1008,9 @@ describe("#954: a role continuity revoked is a role continuity owes", () => {
  *
  * The revocation is durable and only a claim undoes it, so every momentary gap used to become a
  * human action: measured live, coverage was whole again 2m29s after the revocation it caused. An
- * incumbent whose exact process is still running now keeps its binding for
- * `COVERAGE_REVOCATION_GRACE_MS` while its work is paused, and loses it only if the role is still
- * unstaffable when the window ends. The quota reading here is healthy and exhausted, the gen11 shape
+ * incumbent whose exact process is still running now keeps its binding, and its work keeps running,
+ * for `COVERAGE_REVOCATION_GRACE_MS`; the work is paused and the binding lost only if the role is
+ * still unstaffable when the window ends. The quota reading here is healthy and exhausted, the gen11 shape
  * (weekly 1%, runtime HEALTHY), so the only thing wrong is coverage.
  */
 describe("#954: a live incumbent keeps its binding through a momentary coverage gap", () => {
@@ -1089,7 +1090,8 @@ describe("#954: a live incumbent keeps its binding through a momentary coverage 
   });
 
   it("holds a session recorded the ordinary way, by ps lstart text", async () => {
-    const fixture = makeIncumbent("claude", { pid: process.pid });
+    // The row is written now, after this process started, as a launch path writes it.
+    const fixture = makeIncumbent("claude", { pid: process.pid }, new Date().toISOString());
     fixture.cp.providers.registerForRole(fixture.claude, Role.PRIMARY_CTO);
     expect(fixture.cp.sessions.require(fixture.incumbent.sessionId).osProcessStartedAt).not.toMatch(/^darwin-tv:/);
     quota(fixture, 1);
@@ -1098,6 +1100,31 @@ describe("#954: a live incumbent keeps its binding through a momentary coverage 
 
     expect(fixture.cp.bindings.active(fixture.roleKey)).toEqual(fixture.incumbent);
     expect(kinds(fixture, "CONTINUITY_REVOCATION_HELD")).toBe(1);
+  });
+
+  it("revokes at once an lstart record that is not this process's start", async () => {
+    const fixture = makeIncumbent("claude", { pid: process.pid, token: "Thu Jan  1 00:00:00 1970" }, new Date().toISOString());
+    fixture.cp.providers.registerForRole(fixture.claude, Role.PRIMARY_CTO);
+    quota(fixture, 1);
+
+    await fixture.daemon.reconcileContinuity("weekly quota measured exhausted");
+
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toBeNull();
+    expect(kinds(fixture, "CONTINUITY_REVOCATION_HELD")).toBe(0);
+  });
+
+  it("revokes at once an lstart record whose running process started after its row", async () => {
+    // Same pid and same whole-second lstart text, but a process that began after the session row
+    // was written cannot be the one that row recorded: it is the same-second reuse lstart cannot see.
+    const fixture = makeIncumbent("claude", { pid: process.pid });
+    fixture.cp.providers.registerForRole(fixture.claude, Role.PRIMARY_CTO);
+    expect(fixture.cp.sessions.require(fixture.incumbent.sessionId).osProcessStartedAt).not.toMatch(/^darwin-tv:/);
+    quota(fixture, 1);
+
+    await fixture.daemon.reconcileContinuity("weekly quota measured exhausted");
+
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toBeNull();
+    expect(kinds(fixture, "CONTINUITY_REVOCATION_HELD")).toBe(0);
   });
 
   it("does not renew the window when the daemon restarts inside it", async () => {
@@ -1140,6 +1167,26 @@ describe("#954: a live incumbent keeps its binding through a momentary coverage 
     expect(expired?.pausedRuns.map((paused) => paused.runId)).toEqual([runId]);
     expect(fixture.cp.runs.get(runId)?.state).toBe(RunState.BLOCKED);
     expect(fixture.cp.bindings.active(fixture.roleKey)).toBeNull();
+  });
+
+  it("leaves active work running when coverage returns inside the window", async () => {
+    const fixture = liveIncumbent();
+    const created = fixture.cp.runs.create({ projectId: "sensor-binding", executionMode: ExecutionMode.SIMPLE,
+      contract: { goal: "keep working", why: "a gap that closes", scope: [], nonGoals: [],
+        acceptance: ["done"], priority: "NORMAL", humanGate: [], references: [] } });
+    if (!created.allowed) throw new Error(created.message);
+    const runId = created.value.runId;
+    expect(fixture.cp.runs.transition(runId, RunState.ACTIVE, "test: work in progress").allowed).toBe(true);
+    quota(fixture, 1);
+    await fixture.daemon.reconcileContinuity("first tick of the gap");
+
+    fixture.clock.advance(149_000);
+    quota(fixture, 90);
+    const recovered = await fixture.daemon.reconcileContinuity("weekly quota measured again");
+
+    expect(recovered?.pausedRuns).toEqual([]);
+    expect(fixture.cp.runs.get(runId)?.state).toBe(RunState.ACTIVE);
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toEqual(fixture.incumbent);
   });
 
   it("revokes at once a reused pid whose start token is not the one it recorded", async () => {
