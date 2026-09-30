@@ -2525,7 +2525,7 @@ describe("trusted CI evidence (CP-S29)", () => {
     ).toBe(ReasonCode.EVIDENCE_MISSING);
   });
 
-  it("CP-HI-03: a command list that does not match the pinned manifest is refused", async () => {
+  it("CP-HI-03 / RF-S22: a command list that does not match the pinned manifest is refused", async () => {
     const fixture = await setup({ finalization: false });
     const snapshot = await frozen(fixture);
     const run = fixture.harness.cp.runs.require(fixture.runId);
