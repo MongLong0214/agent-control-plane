@@ -1,0 +1,32 @@
+Limit: Object counts and first-owner equality do not establish historical SQL and migration checksum equivalence.
+Limit: Historical migration definitions through version 37 remain bound to the fixed version-37 schema; version 38 uses the current schema explicitly.
+Record-Id: r-8759a84c77fe
+Evidence: tests/unit/database-migration-restore.test.ts
+Provenance: inherited c4f418e5c47434566a0c215ebd97d19c16872f8f
+
+Limit: src/db/migrations.ts is a frozen, digest-pinned input, so its received_at ordering cannot take a tiebreaker here; its exclusion was only re-keyed to line 2311
+Ruled-out: re-keying the two turn-coordinator IN_DOUBT exclusions to their moved lines | a line-keyed exclusion goes stale on the next edit above it, so both orderings got a turn_request_id tiebreaker and their entries were removed
+Record-Id: r-4ecd0cab1114
+Provenance: inherited 8c5e7f72de539b8a87cfdd3886ef179acdbdf5da
+
+Limit: the MCP reservation release deletes only the authenticated peer's own unfinished row (channel mcp, result_json and turn_claim_json NULL) under the ingress delete authority
+Warn: on v38 a verified-target canonical denial blocks owner dispatch (narrowing r-631additivebridge), so a crashed IN_DOUBT turn must be settled by an operator fence or the owner's /again before the next batch; ingress resolution alone does not settle it
+Record-Id: r-dc4d9b3092a4
+Provenance: inherited 716c3fa2934424d552627c39408e00e9ad699a67
+
+Limit: an /again override may name ingress-only claims left by v37 only when the durable inbound row proves each one: same channel and owner, same session scope, TURN_CLAIMED and unsettled, and no canonical source
+Limit: the MCP reservation delete capability exists only inside the run that acquired the reservation and is spent once on its handler's throw; no exported function issues it
+Record-Id: r-abb64573f416
+Provenance: inherited c93a168da52e309b6f85e3399b4b79e82d77bb76
+
+Limit: an /again override may name ingress-only claims left by v37 only when the durable inbound row proves each one: same channel and owner, same session scope, TURN_CLAIMED and unsettled, and no canonical source
+Limit: runMcpReservedMutation is exported and judges staleness by the caller's own timestamp, so a caller can take over a live reservation; a failed run deletes only a row that call inserted and puts a renewed reservation back to its previous time
+Record-Id: r-f52542e6ce89
+Supersedes: r-abb64573f416
+Provenance: inherited de0cd07f0d73bfdeeebf8024a7a033892fb2352a
+
+Limit: an /again override may name ingress-only claims left by v37 only when the durable inbound row proves each one: same channel and owner, same session scope, TURN_CLAIMED and unsettled, and no canonical source
+Limit: a reservation whose handler runs in this process is never taken over; the TTL takeover, judged by the caller's timestamp, applies only to a row whose process died, and in-flight state is per process, so a second process sharing the database is not covered
+Record-Id: r-4d3de510c9be
+Supersedes: r-f52542e6ce89
+Provenance: inherited 9211bee54d25dc0e037ea05d790b1c2a5d9e7f48
