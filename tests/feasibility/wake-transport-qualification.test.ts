@@ -53,9 +53,12 @@ import {
   terminalOutput,
   qualificationDisagreements,
   readReadings,
+  qualificationShortfalls,
   runQualificationProbe,
   wakeCarryingTurnsIn,
   withholdText,
+  witnessCarryingTurns,
+  ARM_WITNESS,
   type HeldImage,
   type PinnedClaudeImage,
   type ProbeRun,
@@ -649,6 +652,18 @@ describe("U6: an arm's counts are derived from the observations committed with i
     );
   });
 
+  it("does not publish a private system block with another witness-shaped value", () => {
+    const own = `u6-witness-${"1".repeat(32)}`;
+    const other = `u6-witness-${"2".repeat(32)}`;
+    const raw = capture(["POST", "/v1/messages?beta=true", JSON.stringify({
+      system: [{ type: "text", text: `private system block ${other}` }],
+      messages: [{ role: "user", content: [{ type: "text", text: BASELINE_PROMPT }] }],
+    })]);
+    const observations = observationsFrom(raw, noFrame(1), BASELINE_PROMPT, own);
+    expect(observations.requests[0]?.texts[0]).toMatchObject({ from: "system", withheld: "not this arm's evidence" });
+    expect(JSON.stringify(observations)).not.toContain("private system block");
+  });
+
   it("keeps a text verbatim only from the requests its counts are derived from", () => {
     // Both reviewers reproduced the same defect here, one of them with a system-prompt fixture: the
     // writer kept any text containing the token, and the reader judged a text without its request,
@@ -842,10 +857,15 @@ describe("U6: what the probe starts, and what it refuses to proceed without", ()
     expect(run.wakeCarryingModelRequests).toBe(1);
     expect(run.followUpAfterInjection).toBe(true);
     expect(armPassed(run)).toBe(true);
-    expect(run.observations?.requests).toHaveLength(2);
+    // Three: the prompt's turn, the production frame's, and the witness frame's. An injection arm
+    // writes both frames, and the witness the arm minted comes back in the model input of a turn --
+    // the one thing in the record that no reading written beforehand could have carried.
+    expect(run.observations?.requests).toHaveLength(3);
+    expect(run.observations?.witness).toMatch(ARM_WITNESS);
+    expect(witnessCarryingTurns(run.observations!)).toHaveLength(1);
     // One request existed when the frame was written, and the arm recorded that rather than
     // leaving a reader to work it out from which request carries the prompt.
-    expect(run.observations?.boundary).toEqual({ frameWritten: true, requestsBefore: 1 });
+    expect(run.observations?.boundary).toEqual({ frameWritten: true, requestsBefore: 1, requestsBeforeWitness: 2 });
   }, 90_000);
 
   it.each(SHAPES)(
@@ -871,20 +891,27 @@ describe("U6: what the probe starts, and what it refuses to proceed without", ()
           ACP_FAKE_CLIENT_IGNORES_FRAME: "1",
         }),
       });
-
-      // The frame was written, and it was written after both turns -- which is what the record
-      // says, rather than what a reader would infer from the prompt being the first of them.
-      expect(run.observations?.boundary).toEqual({ frameWritten: true, requestsBefore: 2 });
-      expect(run.observations?.requests).toHaveLength(2);
-      // The wake-carrying turn is counted, and it is still not a follow-up: the arm fails.
-      expect(run.wakeCarryingModelRequests).toBe(1);
-      expect(run.baselineModelRequests).toBe(2);
-      expect(run.modelRequests).toBe(2);
-      expect(run.followUpAfterInjection).toBe(false);
-      expect(armPassed(run)).toBe(false);
+      // Recorded, not thrown: a failed measurement is still one, and it has to be able to replace a
+      // build's earlier qualified reading.
+      expect(qualificationShortfalls([run]).some((problem) =>
+        problem.includes("does not record a second boundary after a production-token turn and before the witness frame"))).toBe(true);
     },
     90_000,
   );
+
+  it.each(SHAPES)("%s: turns released only after the witness frame do not prove the production wake", async (shape) => {
+    const run = await runQualificationProbe({
+      shape,
+      inject: true,
+      captureDir: CAPTURE_DIR,
+      image: stand(),
+      settleCeilingMs: 1_000,
+      baselineCeilingMs: 30_000,
+      startProcess: starter([], { ACP_FAKE_CLIENT_RELEASE_ON_SECOND_FRAME: "1" }),
+    });
+    expect(qualificationShortfalls([run]).some((problem) =>
+      problem.includes("does not record a second boundary after a production-token turn and before the witness frame"))).toBe(true);
+  }, 90_000);
 
   it.each(SHAPES)("%s: refuses an arm whose prompt never became a turn, rather than measuring against nothing", async (shape) => {
     // The refusal, at the branch that acts. The stand-in takes its start, binds its socket and

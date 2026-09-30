@@ -15,12 +15,8 @@ const theBoundaryIsReadWhereTheFrameIsWritten = {
   id: "the-boundary-is-read-where-the-frame-is-written",
   what: "an arm records its injection boundary as the capture stood when it wrote the frame, not as it stood when the arm ended",
   file: "tests/feasibility/wake-transport-qualification/harness.ts",
-  find: "    const observations = observationsFrom(finalCapture, { frameWritten, requestsBefore });\n",
-  replace:
-    "    const observations = observationsFrom(finalCapture, {\n" +
-    "      frameWritten,\n" +
-    "      requestsBefore: capturedRequests(finalCapture).length,\n" +
-    "    });\n",
+  find: "    const observations = observationsFrom(finalCapture, { frameWritten, requestsBefore, requestsBeforeWitness }, BASELINE_PROMPT, witness);\n",
+  replace: "    const observations = observationsFrom(finalCapture, { frameWritten, requestsBefore: capturedRequests(finalCapture).length, requestsBeforeWitness }, BASELINE_PROMPT, witness);\n",
   killedBy: [
     "tests/feasibility/wake-transport-qualification.test.ts::starts the invocation its reading records, and nothing beside it",
   ],

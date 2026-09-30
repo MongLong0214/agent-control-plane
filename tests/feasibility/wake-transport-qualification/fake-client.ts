@@ -19,6 +19,7 @@
  * wake token of its own accord, before any frame exists, and then ignores the frame it is sent.
  */
 import { createServer } from "node:net";
+import { ROLE_WAKE_TOKEN } from "../../../src/mcp/role-conversation.ts";
 
 const argv = process.argv.slice(2);
 const socketPath = argv[argv.indexOf("--messaging-socket-path") + 1];
@@ -26,6 +27,8 @@ const baseUrl = process.env.ANTHROPIC_BASE_URL ?? "";
 const firstTurn = process.env.ACP_FAKE_CLIENT_TURN ?? "ping";
 const preWakeTurn = process.env.ACP_FAKE_CLIENT_PRE_WAKE_TURN ?? "";
 const ignoresFrame = process.env.ACP_FAKE_CLIENT_IGNORES_FRAME === "1";
+const releaseOnSecondFrame = process.env.ACP_FAKE_CLIENT_RELEASE_ON_SECOND_FRAME === "1";
+let framesSeen = 0;
 
 const turn = async (text: string): Promise<void> => {
   await fetch(`${baseUrl}/v1/messages?beta=true`, {
@@ -56,6 +59,14 @@ const server = createServer((socket) => {
     // the one the boundary exists to refuse. The frame is still consumed, so the probe's write
     // completes either way and the difference is the turn, not the transport.
     if (ignoresFrame) return;
+    if (releaseOnSecondFrame) {
+      framesSeen += 1;
+      if (framesSeen === 2) {
+        void turn(`Another Claude session sent a message:\n${ROLE_WAKE_TOKEN}\nRead your inbox.`);
+        void turn(`Another Claude session sent a message:\n${frame}\nRead your inbox.`);
+      }
+      return;
+    }
     void turn(`Another Claude session sent a message:\n${frame}\nRead your inbox.`);
   });
 });

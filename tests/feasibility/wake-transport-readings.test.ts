@@ -11,6 +11,7 @@
  * fixture runs, so their verdicts are derived the way a real one is rather than typed in.
  */
 import { readFileSync, readdirSync } from "node:fs";
+import { generateKeyPairSync } from "node:crypto";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -19,10 +20,12 @@ import {
   buildReceipt,
   countsFrom,
   observationsFrom,
-  qualificationDisagreements,
+  qualificationDisagreements as admissionDisagreements,
   readReadings,
   readingFileName,
   recordReading,
+  signReading,
+  witnessCarryingTurns,
   type ArmObservations,
   type ObservedText,
   type ProbeRun,
@@ -34,6 +37,12 @@ import { ROLE_WAKE_TOKEN } from "../../src/mcp/role-conversation.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterEach(cleanupTempDirs);
+
+const fixtureKeys = generateKeyPairSync("ed25519");
+const qualificationDisagreements = (
+  members: Parameters<typeof admissionDisagreements>[0],
+  readings: Parameters<typeof admissionDisagreements>[1],
+): string[] => admissionDisagreements(members, readings, fixtureKeys.publicKey);
 
 /**
  * The argv each shape is started with, as `probeArgv` builds it.
@@ -58,15 +67,27 @@ const COMMAND: Record<ProbeShape, readonly string[]> = {
 };
 
 /**
- * A capture of the shape the fake provider writes: the prompt's turn, and the wake's turn after it
- * when the wake landed.
+ * A witness for one arm of one fixture reading, of the shape `mintArmWitness` produces.
+ *
+ * Derived rather than minted, because a row that names a value in an expected sentence needs the
+ * same value on every run. Distinct per arm *and* per build: a reading that records a witness
+ * another reading records is refused, so fixtures sharing them would trip that rule in every row
+ * that files two readings.
+ */
+const witnessOf = (version: string, index: number): string =>
+  `u6-witness-${`${version.replace(/\D/g, "")}${index}`.padEnd(32, "0")}`;
+
+/**
+ * A capture of the shape the fake provider writes: the prompt's turn, the wake's turn after it when
+ * the wake landed, and the witness frame's turn when the arm wrote one.
  *
  * Built and then read by the instrument's own `observationsFrom`, rather than an observation list
  * typed in here: a fixture whose observations were written by hand could disagree with what the
  * reader derives from a real one and nobody would find out from this file. The wake text is the
- * live shape -- the token inside the prose the runtime composes around it.
+ * live shape -- the token inside the prose the runtime composes around it -- and the witness text is
+ * the same shape around the value the arm's second frame carried.
  */
-const captureOf = (woke: boolean): string => {
+const captureOf = (woke: boolean, witness: string | null): string => {
   const turn = (text: string): string =>
     `${JSON.stringify({
       at: "2026-09-28T00:00:00.000Z",
@@ -75,15 +96,29 @@ const captureOf = (woke: boolean): string => {
       headers: {},
       body: JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text }] }] }),
     })}\n`;
-  return `${turn(BASELINE_PROMPT)}${woke ? turn(`Another Claude session sent a message:\n${ROLE_WAKE_TOKEN}`) : ""}`;
+  return (
+    `${turn(BASELINE_PROMPT)}` +
+    `${woke ? turn(`Another Claude session sent a message:\n${ROLE_WAKE_TOKEN}`) : ""}` +
+    `${witness === null ? "" : turn(`Another Claude session sent a message:\n${witness}`)}`
+  );
 };
 
-const arm = (shape: ProbeShape, injected: boolean, metCriterion = true): ProbeRun => {
+const arm = (shape: ProbeShape, injected: boolean, witness: string, metCriterion = true): ProbeRun => {
   const woke = injected === metCriterion;
   // The boundary this arm recorded: the prompt's turn preceded the frame, and any turn after it
   // arrived after. The control writes no frame and says so, which is a different record from an
   // injection arm whose frame happened to land at the same position.
-  const observations = observationsFrom(captureOf(woke), { frameWritten: injected, requestsBefore: 1 });
+  //
+  // The witness is recorded on every arm and echoed only where a frame was written, which is what
+  // the instrument does: the control mints one and sends nothing, so the turn carrying it is absent
+  // from its capture rather than the value being absent from its record.
+  const observations: ArmObservations = {
+    ...observationsFrom(captureOf(woke, injected ? witness : null), {
+      frameWritten: injected, requestsBefore: 1,
+      ...(injected ? { requestsBeforeWitness: woke ? 2 : 1 } : {}),
+    }, BASELINE_PROMPT, witness),
+    witness,
+  };
   return {
     shape,
     injected,
@@ -108,11 +143,11 @@ const arm = (shape: ProbeShape, injected: boolean, metCriterion = true): ProbeRu
  * Four rather than two because that is what qualifies a build: injection against control, in both
  * shapes. A fixture of two would be a fixture of something the instrument will not accept.
  */
-const arms = (measurement: "met" | "missed" = "met"): ProbeRun[] => [
-  arm("interactive", true, measurement === "met"),
-  arm("interactive", false),
-  arm("headless", true),
-  arm("headless", false),
+const arms = (measurement: "met" | "missed" = "met", version = "2.1.268"): ProbeRun[] => [
+  arm("interactive", true, witnessOf(version, 1), measurement === "met"),
+  arm("interactive", false, witnessOf(version, 2)),
+  arm("headless", true, witnessOf(version, 3)),
+  arm("headless", false, witnessOf(version, 4)),
 ];
 
 /** A reading of one fixture build, its verdict computed by the instrument from the arms it ran. */
@@ -125,14 +160,14 @@ const reading = (version: string, measurement: "met" | "missed" = "met"): Qualif
       version,
     },
     headSha: "0".repeat(40),
-    runs: arms(measurement),
+    runs: arms(measurement, version),
     limits: [],
     findings: [],
   });
 
 const filed = (value: QualificationReceipt, file = readingFileName(value.client)): RecordedReading => ({
   file,
-  reading: value,
+  reading: value.signature === undefined ? signReading(value, fixtureKeys.privateKey) : value,
 });
 
 /** A reading the instrument produced, with its runs replaced -- the shape a hand-edited file has. */
@@ -145,6 +180,44 @@ const resting = (version: string, shortfall: string): string =>
   `claude-code/${version} is a qualified member resting on claude-code@${version}.json, whose own runs do not qualify it: ${shortfall}`;
 
 describe("the qualified set and its readings must agree", () => {
+  it("refuses an unsigned reading", () => {
+    expect(qualificationDisagreements([build("2.1.268")], [{ file: "claude-code@2.1.268.json", reading: reading("2.1.268") }]))
+      .toContain("claude-code@2.1.268.json has no valid ceremony signature");
+  });
+
+  it("refuses a replaced control witness even when every captured text stays unchanged", () => {
+    const original = signReading(reading("2.1.268"), fixtureKeys.privateKey);
+    const runs = original.runs.map((run, index) => index === 1
+      ? { ...run, observations: { ...run.observations!, witness: witnessOf("2.1.268", 9) } }
+      : run);
+    expect(qualificationDisagreements([build("2.1.268")], [filed({ ...original, runs })]))
+      .toContain("claude-code@2.1.268.json has no valid ceremony signature");
+  });
+
+  it("refuses a kept text edited after signing even if counts still agree", () => {
+    const original = signReading(reading("2.1.268"), fixtureKeys.privateKey);
+    const runs = original.runs.map((run, index) => index === 0 ? {
+      ...run,
+      observations: { ...run.observations!, requests: run.observations!.requests.map((request, at) => at === 1
+        ? { ...request, texts: request.texts.map((entry) => "text" in entry
+          ? { ...entry, text: `${entry.text} edited` } : entry) }
+        : request) },
+    } : run);
+    expect(qualificationDisagreements([build("2.1.268")], [filed({ ...original, runs })]))
+      .toContain("claude-code@2.1.268.json has no valid ceremony signature");
+  });
+
+  it("refuses a reading with a signature from another key", () => {
+    const wrong = signReading(reading("2.1.268"), generateKeyPairSync("ed25519").privateKey);
+    expect(qualificationDisagreements([build("2.1.268")], [filed(wrong)]))
+      .toContain("claude-code@2.1.268.json has no valid ceremony signature");
+  });
+
+  it("production admission uses the committed key, not the fixture key", () => {
+    expect(admissionDisagreements([build("2.1.268")], [filed(reading("2.1.268"))]))
+      .toContain("claude-code@2.1.268.json has no valid ceremony signature");
+  });
+
   it("the fixtures mean what they say", () => {
     expect(reading("2.1.268").verdict).toBe("qualified");
     expect(reading("2.1.268", "missed").verdict).toBe("not-qualified");
@@ -184,6 +257,7 @@ describe("the qualified set and its readings must agree", () => {
 
     expect(qualificationDisagreements(members, readings)).toEqual([
       resting("2.1.282", "arm 1 (interactive injection) did not meet the criterion for its own arm"),
+      resting("2.1.282", "arm 1 (interactive injection) does not record a second boundary after a production-token turn and before the witness frame"),
     ]);
   });
 
@@ -197,6 +271,7 @@ describe("the qualified set and its readings must agree", () => {
 
     expect(qualificationDisagreements(members, [filed({ ...reading("2.1.268"), runs: failing })])).toEqual([
       resting("2.1.268", "arm 1 (interactive injection) did not meet the criterion for its own arm"),
+      resting("2.1.268", "arm 1 (interactive injection) does not record a second boundary after a production-token turn and before the witness frame"),
       'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
     ]);
 
@@ -230,6 +305,12 @@ describe("the qualified set and its readings must agree", () => {
     ).toEqual([
       resting("2.1.268", "the reading holds 2 headless injection arms, not the one a qualification is made of"),
       resting("2.1.268", "the reading holds 0 headless control arms, not the one a qualification is made of"),
+      // Caught twice, and the second catch is about the arms rather than the count of them: one arm
+      // filed twice records one witness twice, and an arm's witness is minted for that arm alone.
+      resting(
+        "2.1.268",
+        `2 arms record the witness ${witnessOf("2.1.268", 3)}, and an arm's witness is minted for that arm alone`,
+      ),
       'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
     ]);
 
@@ -307,7 +388,7 @@ describe("the qualified set and its readings must agree", () => {
       // observations they are derived from were not, so the file disagrees with its own evidence
       // rather than merely with itself.
       resting("2.1.268", "arm 1 (interactive injection) states baselineModelRequests as 0, and its own observations give 1"),
-      resting("2.1.268", "arm 1 (interactive injection) states modelRequests as 1, and its own observations give 2"),
+      resting("2.1.268", "arm 1 (interactive injection) states modelRequests as 1, and its own observations give 3"),
       'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
     ]);
 
@@ -322,7 +403,7 @@ describe("the qualified set and its readings must agree", () => {
         "2.1.268",
         "arm 1 (interactive injection) says a follow-up arrived, which its own counts (1 before, 1 in all) do not say",
       ),
-      resting("2.1.268", "arm 1 (interactive injection) states modelRequests as 1, and its own observations give 2"),
+      resting("2.1.268", "arm 1 (interactive injection) states modelRequests as 1, and its own observations give 3"),
       'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
     ]);
 
@@ -371,7 +452,9 @@ describe("the qualified set and its readings must agree", () => {
     // And the numbers have to be the numbers those observations give. Here the injection arm keeps
     // its counts and carries the control's observations: a wake it says arrived, in a record that
     // never saw one. The control's record says no frame was written, which an injection arm's
-    // observations cannot say, so the borrowing is named before the counts are even compared.
+    // observations cannot say, so the borrowing is named before the counts are even compared -- and
+    // named twice over, because a borrowed record brings the other arm's witness with it, which is
+    // what makes "one capture, filed as two arms" visible whatever the counts say.
     expect(
       qualificationDisagreements(members, [
         withArms([{ ...interactiveInjection!, observations: interactiveControl!.observations }, ...others]),
@@ -381,9 +464,18 @@ describe("the qualified set and its readings must agree", () => {
         "2.1.268",
         "arm 1 (interactive injection) is recorded as an injection arm, and its observations say a frame was not written",
       ),
-      resting("2.1.268", "arm 1 (interactive injection) states modelRequests as 2, and its own observations give 1"),
+      resting("2.1.268", "arm 1 (interactive injection) does not record a second boundary after a production-token turn and before the witness frame"),
+      resting(
+        "2.1.268",
+        `arm 1 (interactive injection) wrote a frame carrying the witness ${witnessOf("2.1.268", 2)} and shows no turn whose model input carries it`,
+      ),
+      resting("2.1.268", "arm 1 (interactive injection) states modelRequests as 3, and its own observations give 1"),
       resting("2.1.268", "arm 1 (interactive injection) states wakeCarryingModelRequests as 1, and its own observations give 0"),
       resting("2.1.268", "arm 1 (interactive injection) states followUpAfterInjection as true, and its own observations give false"),
+      resting(
+        "2.1.268",
+        `2 arms record the witness ${witnessOf("2.1.268", 2)}, and an arm's witness is minted for that arm alone`,
+      ),
       'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
     ]);
   });
@@ -438,14 +530,15 @@ describe("the qualified set and its readings must agree", () => {
       'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
     ]);
 
-    // The reviewer's session, as a committed record: the same two requests, with the frame written
-    // after both. Every count agrees with the observations -- and the arm still fails, because the
-    // wake-carrying turn is on the wrong side of the boundary and no follow-up exists.
-    const ignoredTheFrame = withBoundary({ frameWritten: true, requestsBefore: 2 });
+    // The reviewer's session, as a committed record: every request this arm observed, with the frame
+    // written after all of them. Every count agrees with the observations -- and the arm still fails,
+    // because the wake-carrying turn is on the wrong side of the boundary and no follow-up exists.
+    const ignoredTheFrame = withBoundary({ frameWritten: true, requestsBefore: observations.requests.length });
     expect(ignoredTheFrame.followUpAfterInjection).toBe(false);
     expect(ignoredTheFrame.wakeCarryingModelRequests).toBe(1);
     expect(qualificationDisagreements(members, [withArms([ignoredTheFrame, ...others])])).toEqual([
       resting("2.1.268", "arm 1 (interactive injection) did not meet the criterion for its own arm"),
+      resting("2.1.268", "arm 1 (interactive injection) does not record a second boundary after a production-token turn and before the witness frame"),
       'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
     ]);
 
@@ -454,7 +547,7 @@ describe("the qualified set and its readings must agree", () => {
     // everything -- it refuses the side of the boundary the turn is on.
     expect(
       qualificationDisagreements(members, [
-        withArms([withBoundary({ frameWritten: true, requestsBefore: 1 }), ...others]),
+        withArms([withBoundary({ frameWritten: true, requestsBefore: 1, requestsBeforeWitness: 2 }), ...others]),
       ]),
     ).toEqual([]);
 
@@ -463,8 +556,10 @@ describe("the qualified set and its readings must agree", () => {
     // prompt's and report a baseline it never observed.
     const wakeFirst = {
       ...observations,
-      boundary: { frameWritten: true, requestsBefore: 1 },
-      requests: [observations.requests[1]!, observations.requests[0]!],
+      boundary: { frameWritten: true, requestsBefore: 1, requestsBeforeWitness: 2 },
+      // The wake's turn and the prompt's, swapped; the witness turn stays where it was, so what this
+      // row varies is which turn precedes the boundary and nothing else.
+      requests: [observations.requests[1]!, observations.requests[0]!, ...observations.requests.slice(2)],
     };
     expect(
       qualificationDisagreements(members, [
@@ -475,8 +570,150 @@ describe("the qualified set and its readings must agree", () => {
         "2.1.268",
         "arm 1 (interactive injection) shows no turn carrying the prompt it was started with before that point, so its baseline counts turns that are not the prompt's",
       ),
+      resting("2.1.268", "arm 1 (interactive injection) shows no production-token turn before the witness frame"),
       'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
     ]);
+  });
+
+  it("refuses wake and witness turns that both arrived after the witness-frame boundary", () => {
+    const [injection, ...others] = arms();
+    const observations = injection!.observations!;
+    const delayed = { ...injection!, observations: {
+      ...observations,
+      boundary: { frameWritten: true, requestsBefore: 1, requestsBeforeWitness: 1 },
+    } };
+    expect(qualificationDisagreements([build("2.1.268")], [withArms([delayed, ...others])]))
+      .toContain(resting("2.1.268", "arm 1 (interactive injection) does not record a second boundary after a production-token turn and before the witness frame"));
+  });
+
+  it("an arm's acceptance rests on the witness its own run minted, and the control shows no echo of it", () => {
+    // Every other rule here is satisfied by text somebody could type: the frame's bytes, the token,
+    // the prose around it, the prompt, the boundary and the four counts are all fixed or derived from
+    // each other, so a reading can carry them all without a ceremony ever having run. The witness is
+    // the one value in an arm that a run had to have produced to put it there -- and what it does not
+    // establish is written where the rule is.
+    const members = [build("2.1.268")];
+    const [interactiveInjection, interactiveControl, headlessInjection, headlessControl] = arms();
+    const others = [interactiveControl!, headlessInjection!, headlessControl!];
+    const witness = witnessOf("2.1.268", 1);
+
+    // The control, in both halves: the arm the instrument produced records the value and shows a turn
+    // whose model input carried it, and the reading is admitted.
+    expect(interactiveInjection!.observations?.witness).toBe(witness);
+    expect(witnessCarryingTurns(interactiveInjection!.observations!)).toHaveLength(1);
+    expect(qualificationDisagreements(members, [withArms([interactiveInjection!, ...others])])).toEqual([]);
+
+    // An arm that claims the frame reached the model input, with the turn that carried its witness
+    // taken out. Every count is restated from what is left, so the record still agrees with itself,
+    // the wake-carrying turn is still there and the boundary still splits it the same way: this is a
+    // reading whose remaining observations any run, or none, could have produced.
+    const withoutTheEcho = (run: ProbeRun): ProbeRun => {
+      const observations = run.observations!;
+      const requests = observations.requests.filter(
+        (request) => !request.texts.some((entry) => "text" in entry && entry.text.includes(observations.witness!)),
+      );
+      const stripped: ArmObservations = { ...observations, requests };
+      return { ...run, observations: stripped, ...countsFrom(stripped) };
+    };
+    expect(qualificationDisagreements(members, [withArms([withoutTheEcho(interactiveInjection!), ...others])])).toEqual([
+      resting("2.1.268", "arm 1 (interactive injection) shows no witness turn after the witness frame"),
+      resting(
+        "2.1.268",
+        `arm 1 (interactive injection) wrote a frame carrying the witness ${witness} and shows no turn whose model input carries it`,
+      ),
+      'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+    ]);
+
+    // The same arm with another run's value against this run's capture -- the shape a reading built
+    // out of an earlier ceremony's observations takes. The texts are all there; none of them is this.
+    const elsewhere = witnessOf("2.1.283", 1);
+    expect(
+      qualificationDisagreements(members, [
+        withArms([
+          { ...interactiveInjection!, observations: { ...interactiveInjection!.observations!, witness: elsewhere } },
+          ...others,
+        ]),
+      ]),
+    ).toEqual([
+      resting("2.1.268", "arm 1 (interactive injection) shows no witness turn after the witness frame"),
+      resting(
+        "2.1.268",
+        `arm 1 (interactive injection) wrote a frame carrying the witness ${elsewhere} and shows no turn whose model input carries it`,
+      ),
+      resting("2.1.268", "arm 1 (interactive injection) carries 1 model-input text(s) verbatim that none of its counts are read from"),
+      'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+    ]);
+
+    // Absence is refused rather than read as a zero -- an arm with no witness records exactly what an
+    // arm nobody ran leaves behind -- and so is a value the mint could not have produced. The empty
+    // string is the one that matters: every text contains it, so a record carrying one would report a
+    // delivery in all four arms and turn both controls' zeroes into positives.
+    const unwitnessed = { ...interactiveInjection!.observations! };
+    delete (unwitnessed as { witness?: unknown }).witness;
+    for (const observations of [
+      unwitnessed,
+      ...["", "ping", witness.slice(0, -1), witness.toUpperCase()].map((value) => ({
+        ...interactiveInjection!.observations!,
+        witness: value,
+      })),
+    ]) {
+      expect(
+        qualificationDisagreements(members, [withArms([{ ...interactiveInjection!, observations }, ...others])]),
+        JSON.stringify(observations.witness),
+      ).toEqual([
+        resting("2.1.268", "arm 1 (interactive injection) shows no witness turn after the witness frame"),
+        resting(
+          "2.1.268",
+          "arm 1 (interactive injection) records no witness minted by a run, so nothing in it had to be written after a ceremony started",
+        ),
+        resting("2.1.268", "arm 1 (interactive injection) carries 1 model-input text(s) verbatim that none of its counts are read from"),
+        'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+      ]);
+    }
+
+    // And the control arm's criterion, in the same terms as its zero token count: it wrote no frame,
+    // so no turn of its own may carry the value it minted. The echo sits before its boundary, so
+    // every other count it states still passes -- what fails is this.
+    const controlWitness = witnessOf("2.1.268", 2);
+    const echoed: ArmObservations = {
+      ...observationsFrom(captureOf(false, controlWitness), { frameWritten: false, requestsBefore: 2 }, BASELINE_PROMPT, controlWitness),
+      witness: controlWitness,
+    };
+    const echoingControl: ProbeRun = { ...interactiveControl!, observations: echoed, ...countsFrom(echoed) };
+    expect(
+      qualificationDisagreements(members, [
+        withArms([interactiveInjection!, echoingControl, headlessInjection!, headlessControl!]),
+      ]),
+    ).toEqual([
+      resting(
+        "2.1.268",
+        `arm 2 (interactive control) wrote no frame, and 1 of the turns it observed carry the witness ${controlWitness} it minted`,
+      ),
+      'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
+    ]);
+  });
+
+  it("a reading recording a witness another reading records is refused", () => {
+    // Every rule inside a reading is satisfied by a copy of a reading that satisfies them, so without
+    // this a second build could be admitted on the first build's measurement filed under its name --
+    // and the copy would be the whole of what qualified it. A value is minted per arm per run, so two
+    // files carrying one are two files describing one run.
+    const members = [build("2.1.268"), build("2.1.282")];
+    const borrowed = reading("2.1.268").runs[0]!.observations!;
+    const reused = {
+      ...reading("2.1.282"),
+      runs: reading("2.1.282").runs.map((run, index) => (index === 0 ? { ...run, observations: borrowed } : run)),
+    };
+
+    // Nothing else in the copy is wrong: the arm's counts agree with the record it borrowed, its
+    // boundary is that record's, its witness is echoed in that record's own texts, and the file is
+    // named for the build it claims. Only the value says the two files rest on one run.
+    expect(qualificationDisagreements(members, [filed(reading("2.1.268")), filed(reused)])).toEqual([
+      `claude-code@2.1.282.json records the witness ${witnessOf("2.1.268", 1)}, which claude-code@2.1.268.json records too`,
+    ]);
+
+    // The control: the two readings as the instrument produced them, each arm on a value of its own.
+    expect(qualificationDisagreements(members, [filed(reading("2.1.268")), filed(reading("2.1.282"))])).toEqual([]);
   });
 
   it("an arm carrying a text it neither records nor accounts for is refused", () => {
@@ -563,9 +800,11 @@ describe("the qualified set and its readings must agree", () => {
       'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
     ]);
 
-    // The control: the texts the counts *are* read from stay verbatim, and an arm carrying only
-    // those is admitted -- the prompt, and the prose the runtime composes around the token.
+    // The control: the texts a rule *is* read from stay verbatim, and an arm carrying only those is
+    // admitted -- the prompt, and the prose the runtime composes around the token and around the
+    // witness.
     expect(requests.flatMap((request) => request.texts.filter((entry) => "text" in entry).map((entry) => entry.from))).toEqual([
+      "user",
       "user",
       "user",
     ]);
@@ -600,6 +839,18 @@ describe("the qualified set and its readings must agree", () => {
         'claude-code@2.1.268.json states the verdict "qualified", and its own runs recompute to not-qualified',
       ]);
     }
+  });
+
+  it("refuses a reading that kept a different witness-shaped value from a private system block", () => {
+    const first = arms()[0]!;
+    const other = witnessOf("2.1.283", 9);
+    const requests = first.observations!.requests.map((request, index) => index === 1 ? {
+      ...request,
+      texts: [{ from: "system", text: `private system block ${other}` }, ...request.texts],
+    } : request);
+    const patched = { ...first, observations: { ...first.observations!, requests } };
+    const problems = qualificationDisagreements([build("2.1.268")], [withArms([patched, ...arms().slice(1)])]);
+    expect(problems).toContain(resting("2.1.268", "arm 1 (interactive injection) carries 1 model-input text(s) verbatim that none of its counts are read from"));
   });
 
   it("a reading of a build outside the set is a failure, whatever its verdict", () => {
