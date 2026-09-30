@@ -5,9 +5,10 @@ import { fileURLToPath } from "node:url";
 /**
  * The blobs #762's evidence rests on, pinned by content (#763).
  *
- * These four files are the whole argument: the production migrations, the deployment's own v25
- * schema, the owner trace derived from running one against the other, and the receipts read out
- * of the preserved backup. Review's finding was not that any value in them is wrong — the CEO
+ * These five files are the whole argument: the production migrations and its separately pinned
+ * historical schema snapshot, the deployment's own v25 schema, the owner trace derived from
+ * running one against the other, and the receipts read out of the preserved backup. Review's
+ * finding was not that any value in them is wrong — the CEO
  * compared the receipts field-for-field against the read-only backup and they match — but that
  * the tests read them as *both* the input and the standard, so a coordinated edit to a production
  * file and its fixture passes.
@@ -31,17 +32,21 @@ export const RECEIPT_BYTES_SHA256 =
   "aa90c6af77754fce9861cb4f57501879c24f66f5616cf46225c5375adfd2a19d";
 
 /**
- * `src/db/migrations.ts` and `tests/fixtures/schema-v25-lineage.sql` are append-only, frozen
- * inputs: pinning their exact bytes here means any edit to either file — including one that also
- * updates its own fixture to match — changes the value a reader compares against, not merely the
- * file being read. These digests are not recomputed from the files they describe: a pin a run
+ * `src/db/migrations.ts`, its historical schema snapshot, and
+ * `tests/fixtures/schema-v25-lineage.sql` are append-only, frozen inputs: pinning their exact
+ * bytes here means a coordinated edit changes the value a reader compares against, not merely
+ * the file being read. These digests are not recomputed from the files they describe: a pin a run
  * derives from its own input agrees with whatever it is handed, which is exactly the defect these
  * pins exist to close.
  */
 export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string }> = [
   {
     path: "src/db/migrations.ts",
-    sha256: "6d67c8f943deb3f133747f4e7417deaebad0df13647e1ef0292dcaa0130ddce7",
+    sha256: "5a8bb118e4e085c7c9bf584b38f7574b8f12845d4d4d93d54fb331c734911627",
+  },
+  {
+    path: "src/db/schema-v37.sql",
+    sha256: "4261e7641a2411bbfde1246a02a6718ead797ca722cd0c7194e92b0ef19b55ef",
   },
   {
     path: "tests/fixtures/schema-v25-lineage.sql",

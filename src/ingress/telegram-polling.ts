@@ -1359,11 +1359,22 @@ export const startTelegramLongPollListener = async (
     // The target identity is not derived again: the guard stored it beside the claim, so reading
     // it back is reading what was already decided rather than asking the live binding a second
     // time -- a binding that can fail over between the claim and this call.
-    materializeTurn: ({ target, prompt, sources }) => {
+    materializeTurn: ({ target, prompt, sources, overriddenUnresolvedNonces }) => {
+      // The router's nonce list is a candidate, not authority. The coordinator verifies the
+      // persisted ingress claim, actor, binding and complete unresolved set in this transaction.
+      const incumbent = overriddenUnresolvedNonces !== undefined
+        ? cp.db.get<{ turn_request_id: string }>(
+          `SELECT t.turn_request_id FROM canonical_turns t
+            WHERE t.target_actor_id = ? AND t.lifecycle_state = 'IN_DOUBT'
+            ORDER BY t.rowid DESC LIMIT 1`,
+          [target.targetActorId],
+        )
+        : null;
       const claimed = cp.conversation.claim({
         targetActorId: target.targetActorId,
         prompt,
         sources,
+        ...(incumbent ? { overrideIncumbentTurnRequestId: incumbent.turn_request_id } : {}),
       });
       return claimed.allowed
         ? allow(ReasonCode.OK, undefined)

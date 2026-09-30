@@ -282,9 +282,9 @@ export interface TelegramRouterOptions {
    * identity is not re-derived here -- `IngressGuard` already stored it with the claim.
    *
    * It runs inside the ingress claim's outer transaction, so a successful canonical write commits
-   * with the ingress claim before external dispatch. The bridge is strictly additive: an ordinary
-   * returned denial does not undo the ingress claim or stop owner dispatch, while a thrown/database
-   * failure still unwinds the transaction.
+   * with the ingress claim before external dispatch. A verified-target denial rolls the batch
+   * back and blocks owner dispatch; targetless legacy claims remain ingress-only.
+   * Thrown/database failures also unwind the transaction.
    */
   materializeTurn?: (input: OwnerBatchCanonicalClaim & {
     prompt: string;
@@ -761,7 +761,10 @@ export class TelegramHermesRouter {
         // made honestly. Every outstanding nonce is captured, not only the oldest (#695): a
         // `/again` shown N unresolved turns and recording only one would silently override the
         // rest, the same defect this issue closes in a new place.
-        const overriddenUnresolvedNonces = unresolved.length > 0 ? unresolved.map((turn) => turn.nonce) : undefined;
+        // An answered ingress can still have an IN_DOUBT canonical turn. Retain the owner's
+        // deliberate /again proof even when the ingress-only unresolved set is empty.
+        const overriddenUnresolvedNonces = classified.value.overridesUnresolved
+          ? unresolved.map((turn) => turn.nonce) : undefined;
         const pending = this.ingress.pendingOwnerMessages();
         const telegramItemIdentities = new Map<string, { updateId: string; messageId: number }>();
         const ownerMessages: OwnerMessage[] = pending.flatMap((message) => {

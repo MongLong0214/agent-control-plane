@@ -1239,16 +1239,6 @@ BEGIN
   SELECT RAISE(ABORT, 'INBOUND_MESSAGE_NO_REPLACE');
 END;
 
--- CP-HI-06 — deleting the durable nonce first must not turn the no-replace rule into a rewrite.
--- Only the ingress guard's bounded retention and legacy-promotion paths hold this connection-local
--- capability; an arbitrary Db holder cannot erase admission evidence and insert a forged claim.
-CREATE TRIGGER IF NOT EXISTS inbound_messages_delete_authority
-BEFORE DELETE ON inbound_messages
-WHEN acp_ingress_delete_authorized(OLD.channel) <> 1
-BEGIN
-  SELECT RAISE(ABORT, 'INGRESS_MESSAGE_DELETE_AUTHORITY_DENIED');
-END;
-
 -- CP-HI-06 — a claimed ingress turn's target tuple is historical evidence. A lifecycle writer
 -- may add its terminal facts, but it must never alter the turn it is closing or the exact Hermes
 -- runtime tuple that a future receipt is compared with. `CASE` keeps malformed raw JSON on the
@@ -1275,85 +1265,6 @@ WHEN OLD.turn_claim_json IS NOT NULL
  END = 1
 BEGIN
   SELECT RAISE(ABORT, 'INBOUND_TURN_CLAIM_IDENTITY_IMMUTABLE');
-END;
-
--- CP-HI-06 — v38 override authority is write-once after claim. This separate trigger leaves the frozen v36
--- identity trigger and its historical backfill intact; schema replay may install it before v38.
-CREATE TRIGGER IF NOT EXISTS inbound_messages_override_authority_immutable
-BEFORE UPDATE OF turn_claim_json ON inbound_messages
-WHEN OLD.turn_claim_json IS NOT NULL
- AND EXISTS (SELECT 1 FROM schema_migrations WHERE version = 38)
- AND CASE
-   WHEN NEW.turn_claim_json IS NULL
-     OR json_valid(OLD.turn_claim_json) <> 1
-     OR json_valid(NEW.turn_claim_json) <> 1 THEN 1
-   WHEN EXISTS (SELECT 1 FROM json_tree(NEW.turn_claim_json)
-     WHERE typeof(key) = 'text' GROUP BY parent, key HAVING COUNT(*) > 1) THEN 1
-   WHEN json_extract(NEW.turn_claim_json, '$.canonicalTarget')
-          IS NOT json_extract(OLD.turn_claim_json, '$.canonicalTarget')
-     OR json_extract(NEW.turn_claim_json, '$.overriddenUnresolvedNonces')
-          IS NOT json_extract(OLD.turn_claim_json, '$.overriddenUnresolvedNonces')
-     OR json_extract(NEW.turn_claim_json, '$.batchConsumedNonces')
-          IS NOT json_extract(OLD.turn_claim_json, '$.batchConsumedNonces')
-     OR json_extract(NEW.turn_claim_json, '$.batchUnconsumedNonces')
-          IS NOT json_extract(OLD.turn_claim_json, '$.batchUnconsumedNonces') THEN 1
-   ELSE 0
- END = 1
-BEGIN
-  SELECT RAISE(ABORT, 'INBOUND_OVERRIDE_AUTHORITY_IMMUTABLE');
-END;
-
--- CP-HI-06 — a first-write target/override proof must come from the admitted ingress row's
--- guard, not an arbitrary Db.run UPDATE. Lifecycle writes cannot mint this connection marker.
-CREATE TABLE IF NOT EXISTS inbound_claim_authority_markers (
-  channel TEXT NOT NULL,
-  nonce TEXT NOT NULL,
-  PRIMARY KEY (channel, nonce)
-);
-
--- CP-HI-06 — direct SQL cannot mint an ingress override marker outside the guard's exact row scope.
-CREATE TRIGGER IF NOT EXISTS inbound_claim_authority_markers_insert_guard
-BEFORE INSERT ON inbound_claim_authority_markers
-WHEN acp_ingress_claim_authorized(NEW.channel, NEW.nonce, NULL) <> 1
-BEGIN
-  SELECT RAISE(ABORT, 'INGRESS_OVERRIDE_CLAIM_AUTHORITY_DENIED');
-END;
-
--- CP-HI-06 — the first bound claim must have a same-transaction guard marker.
-CREATE TRIGGER IF NOT EXISTS inbound_messages_override_claim_authority
-BEFORE UPDATE OF turn_claim_json ON inbound_messages
-WHEN OLD.turn_claim_json IS NULL AND NEW.turn_claim_json IS NOT NULL
- AND EXISTS (SELECT 1 FROM schema_migrations WHERE version = 38)
- AND CASE
-   WHEN json_valid(NEW.turn_claim_json) <> 1 THEN 1
-   WHEN EXISTS (SELECT 1 FROM json_tree(NEW.turn_claim_json)
-     WHERE typeof(key) = 'text' GROUP BY parent, key HAVING COUNT(*) > 1) THEN 1
-   WHEN json_type(NEW.turn_claim_json, '$.canonicalTarget') IS NOT NULL
-     OR json_type(NEW.turn_claim_json, '$.overriddenUnresolvedNonces') IS NOT NULL
-     THEN acp_ingress_claim_authorized(NEW.channel, NEW.nonce, NEW.turn_claim_json) <> 1
-   ELSE 0
- END = 1
-BEGIN
-  SELECT RAISE(ABORT, 'INGRESS_OVERRIDE_CLAIM_AUTHORITY_DENIED');
-END;
-
--- CP-HI-06 — DELETE followed by INSERT is also a first claim. The same exact claim bytes that
--- authorize the ordinary UPDATE path are required when a bound claim arrives on a new row.
-CREATE TRIGGER IF NOT EXISTS inbound_messages_override_insert_authority
-BEFORE INSERT ON inbound_messages
-WHEN NEW.turn_claim_json IS NOT NULL
- AND EXISTS (SELECT 1 FROM schema_migrations WHERE version = 38)
- AND CASE
-   WHEN json_valid(NEW.turn_claim_json) <> 1 THEN 1
-   WHEN EXISTS (SELECT 1 FROM json_tree(NEW.turn_claim_json)
-     WHERE typeof(key) = 'text' GROUP BY parent, key HAVING COUNT(*) > 1) THEN 1
-   WHEN json_type(NEW.turn_claim_json, '$.canonicalTarget') IS NOT NULL
-     OR json_type(NEW.turn_claim_json, '$.overriddenUnresolvedNonces') IS NOT NULL
-     THEN acp_ingress_claim_authorized(NEW.channel, NEW.nonce, NEW.turn_claim_json) <> 1
-   ELSE 0
- END = 1
-BEGIN
-  SELECT RAISE(ABORT, 'INGRESS_OVERRIDE_CLAIM_AUTHORITY_DENIED');
 END;
 
 -- ---------------------------------------------------------------------------
@@ -1827,7 +1738,6 @@ CREATE TABLE IF NOT EXISTS canonical_turns (
   observation_consistency       TEXT NOT NULL DEFAULT 'CONSISTENT'
                                 REFERENCES turn_observation_consistency(observation_consistency),
   replacement_turn_request_id   TEXT REFERENCES canonical_turns(turn_request_id),
-  override_incumbent_turn_request_id TEXT REFERENCES canonical_turns(turn_request_id),
   FOREIGN KEY (target_binding_id, target_actor_id)
     REFERENCES actor_target_bindings(target_binding_id, target_actor_id),
   FOREIGN KEY (target_attestation_id, target_binding_id)
@@ -1852,48 +1762,7 @@ CREATE TABLE IF NOT EXISTS canonical_turns (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS canonical_turns_one_unresolved
-  ON canonical_turns(target_actor_id)
-  WHERE lifecycle_state = 'IN_DOUBT' AND override_incumbent_turn_request_id IS NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS canonical_turns_one_unresolved_override
-  ON canonical_turns(override_incumbent_turn_request_id)
-  WHERE override_incumbent_turn_request_id IS NOT NULL AND lifecycle_state = 'IN_DOUBT';
-
--- CP-HI-06 — a raw SQL writer cannot create a source-less override by copying the parent's tuple.
-CREATE TRIGGER IF NOT EXISTS canonical_turns_override_write_authority
-BEFORE INSERT ON canonical_turns
-WHEN NEW.override_incumbent_turn_request_id IS NOT NULL
- AND acp_turn_materialization_authorized(NEW.turn_request_id) <> 1
-BEGIN
-  SELECT RAISE(ABORT, 'CANONICAL_TURN_OVERRIDE_AUTHORITY_DENIED');
-END;
-
--- CP-HI-06 — only the current, actor-bound unresolved incumbent can authorize a new override.
-CREATE TRIGGER IF NOT EXISTS canonical_turns_override_claim_guard
-BEFORE INSERT ON canonical_turns
-WHEN (NEW.override_incumbent_turn_request_id IS NULL AND EXISTS (
-    SELECT 1 FROM canonical_turns WHERE target_actor_id = NEW.target_actor_id
-      AND lifecycle_state = 'IN_DOUBT'))
-  OR (NEW.override_incumbent_turn_request_id IS NOT NULL AND NOT EXISTS (
-    SELECT 1 FROM canonical_turns parent
-    WHERE parent.turn_request_id = NEW.override_incumbent_turn_request_id
-      AND parent.target_actor_id = NEW.target_actor_id
-      AND parent.target_binding_id = NEW.target_binding_id
-      AND parent.target_attestation_id = NEW.target_attestation_id
-      AND parent.binding_generation = NEW.binding_generation
-      AND parent.lifecycle_state = 'IN_DOUBT'
-      AND parent.rowid = (SELECT MAX(rowid) FROM canonical_turns
-        WHERE target_actor_id = NEW.target_actor_id AND lifecycle_state = 'IN_DOUBT')))
-BEGIN
-  SELECT RAISE(ABORT, 'CANONICAL_TURN_OVERRIDE_INVALID');
-END;
-
--- CP-HI-06 — an override's parent identity cannot change after canonical admission.
-CREATE TRIGGER IF NOT EXISTS canonical_turns_override_identity_immutable
-BEFORE UPDATE OF override_incumbent_turn_request_id ON canonical_turns
-WHEN OLD.override_incumbent_turn_request_id IS NOT NEW.override_incumbent_turn_request_id
-BEGIN
-  SELECT RAISE(ABORT, 'CANONICAL_TURN_OVERRIDE_IMMUTABLE');
-END;
+  ON canonical_turns(target_actor_id) WHERE lifecycle_state = 'IN_DOUBT';
 
 CREATE TABLE IF NOT EXISTS canonical_turn_sources (
   turn_request_id              TEXT NOT NULL REFERENCES canonical_turns(turn_request_id),
@@ -2375,7 +2244,8 @@ CREATE TRIGGER IF NOT EXISTS canonical_turns_no_replace
 BEFORE INSERT ON canonical_turns
 WHEN EXISTS (
   SELECT 1 FROM canonical_turns
-   WHERE turn_request_id = NEW.turn_request_id
+   WHERE (turn_request_id = NEW.turn_request_id)
+           OR (target_actor_id = NEW.target_actor_id AND (lifecycle_state = 'IN_DOUBT') AND (NEW.lifecycle_state = 'IN_DOUBT'))
 )
 BEGIN
   SELECT RAISE(ABORT, 'CANONICAL_TURN_NO_REPLACE');

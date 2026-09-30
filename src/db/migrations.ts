@@ -9,15 +9,21 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 37;
+export const SCHEMA_VERSION = 38;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
+const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
 
 export const schemaSql = (): string => readFileSync(schemaPath, "utf8");
+const historicalSchemaSql = (): string => readFileSync(historicalSchemaPath, "utf8");
+const schemaSqlAt = (version: number): string =>
+  version <= 37 ? historicalSchemaSql() : schemaSql();
 
 /** Connection PRAGMAs are established by Db before any migration transaction begins. */
 export const schemaDdl = (): string =>
   schemaSql().replace(/^\s*PRAGMA\s+(?:journal_mode|foreign_keys|synchronous)\s*=\s*[^;]+;\s*$/gim, "");
+const schemaDdlAt = (version: number): string =>
+  schemaSqlAt(version).replace(/^\s*PRAGMA\s+(?:journal_mode|foreign_keys|synchronous)\s*=\s*[^;]+;\s*$/gim, "");
 
 export interface SchemaMigration {
   id: string;
@@ -34,7 +40,8 @@ export interface SchemaMigration {
 const sha256 = (input: string): string =>
   `sha256:${createHash("sha256").update(input).digest("hex")}`;
 
-const migrationChecksum = (id: string): string => sha256(`${id}\n${schemaSql()}`);
+const migrationChecksum = (id: string, schemaVersion = 37): string =>
+  sha256(`${id}\n${schemaSqlAt(schemaVersion)}`);
 
 /**
  * Migration metadata is intentionally separate from schema.sql. It is bootstrap state for
@@ -111,9 +118,16 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   // Same reason as the trigger above, and the same owner: `INSERT OR REPLACE` is the other half
   // of write-once, and v35 creates both or neither.
   /-- CP-HI-06 — same census, same hole as the rows above[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_no_replace[\s\S]*?\nEND;/,
+  /-- CP-HI-06 — deleting the durable nonce first must not turn the no-replace rule into a rewrite\.[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_delete_authority[\s\S]*?\nEND;/,
   // `turn_claim_json` does not exist before v30. v36 must create this guard only after every
   // legacy claim has been validated and, where exact ledger evidence exists, backfilled.
   /-- CP-HI-06 — a claimed ingress turn's target tuple is historical evidence[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_turn_claim_identity_immutable[\s\S]*?\nEND;/,
+  // v38 alone installs this guard. Older images do not yet have turn_claim_json to UPDATE.
+  /-- CP-HI-06 — v38 override authority is write-once after claim[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_override_authority_immutable[\s\S]*?\nEND;/,
+  /CREATE TABLE IF NOT EXISTS inbound_claim_authority_markers \([\s\S]*?\n\);/,
+  /CREATE TRIGGER IF NOT EXISTS inbound_claim_authority_markers_insert_guard[\s\S]*?\nEND;/,
+  /-- CP-HI-06 — a first-write target\/override proof must come from[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_override_claim_authority[\s\S]*?\nEND;/,
+  /-- CP-HI-06 — DELETE followed by INSERT is also a first claim\.[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_override_insert_authority[\s\S]*?\nEND;/,
 ];
 
 /**
@@ -214,8 +228,8 @@ const dropsFor = (names: readonly string[]): string =>
   `${names.map((name) => `DROP TRIGGER IF EXISTS ${name};`).join("\n")}\n`;
 
 /** The definitions of the named triggers, read out of the live schema so the two cannot drift. */
-const triggerDdlFor = (names: readonly string[]): string => {
-  const ddl = schemaDdl();
+const triggerDdlFor = (names: readonly string[], schemaVersion = 37): string => {
+  const ddl = schemaDdlAt(schemaVersion);
   const found = names.map((name) => {
     const pattern = new RegExp(
       `CREATE TRIGGER IF NOT EXISTS ${name}\\n[\\s\\S]*?\\nEND;`,
@@ -282,12 +296,13 @@ export const ledgerTriggerDdl = (atVersion?: number): string =>
     atVersion === undefined
       ? LEDGER_TRIGGER_NAMES
       : LEDGER_TRIGGER_NAMES.filter((name) => ledgerTriggerIntroducedIn(name) <= atVersion),
+    atVersion ?? SCHEMA_VERSION,
   );
-export const provenanceNoReplaceDdl = (): string => triggerDdlFor(PROVENANCE_NO_REPLACE_TRIGGERS);
+export const provenanceNoReplaceDdl = (): string => triggerDdlFor(PROVENANCE_NO_REPLACE_TRIGGERS, 37);
 
 /** The adjudication tables and their index, taken from the live schema for the same reason. */
-export const adjudicationDdl = (): string => {
-  const ddl = schemaDdl();
+export const adjudicationDdl = (schemaVersion = 37): string => {
+  const ddl = schemaDdlAt(schemaVersion);
   const parts = [
     /CREATE TABLE IF NOT EXISTS canonical_turn_adjudications \([\s\S]*?\n\);/,
     /CREATE TABLE IF NOT EXISTS canonical_turn_adjudication_citations \([\s\S]*?\n\);/,
@@ -303,7 +318,7 @@ export const adjudicationDdl = (): string => {
 };
 
 export const replayDdlWithoutPostV12Columns = (): string =>
-  REPLAY_EXCLUDES_INTRODUCED_AFTER_V12.reduce((ddl, pattern) => ddl.replace(pattern, ""), schemaDdl());
+  REPLAY_EXCLUDES_INTRODUCED_AFTER_V12.reduce((ddl, pattern) => ddl.replace(pattern, ""), schemaDdlAt(37));
 
 const v12: SchemaMigration = {
   id: "v12-migration-ledger-and-invariant-replay",
@@ -1650,8 +1665,8 @@ const v25: SchemaMigration = {
 };
 
 /** One object out of the live schema, by pattern, so a rebuild cannot invent its own definition. */
-const schemaObject = (pattern: RegExp, what: string): string => {
-  const match = pattern.exec(schemaDdl());
+const schemaObject = (pattern: RegExp, what: string, schemaVersion = 37): string => {
+  const match = pattern.exec(schemaDdlAt(schemaVersion));
   if (!match) {
     throw acpError(ReasonCode.INTERNAL_ERROR, `${what} is missing from schema.sql`, {});
   }
@@ -1742,16 +1757,18 @@ export const sharedColumns = (raw: Database.Database, from: string, to: string):
     .map((row) => row.name);
 };
 
-const canonicalTurnsTableOnlyDdl = (): string =>
+const canonicalTurnsTableOnlyDdl = (schemaVersion = 37): string =>
   schemaObject(
     /CREATE TABLE IF NOT EXISTS canonical_turns \([\s\S]*?\n\);/,
     "the canonical turns table",
+    schemaVersion,
   );
 
-const canonicalTurnsIndexDdl = (): string =>
+const canonicalTurnsIndexDdl = (schemaVersion = 37): string =>
   schemaObject(
     /CREATE UNIQUE INDEX IF NOT EXISTS canonical_turns_one_unresolved[\s\S]*?;/,
     "the one-unresolved index",
+    schemaVersion,
   );
 
 /**
@@ -1763,14 +1780,14 @@ const canonicalTurnsIndexDdl = (): string =>
  * settlement the observations accept and the turn refuses, which is a resolution that reports
  * success and leaves the conversation exactly as wedged.
  */
-export const rebuildCanonicalTurnsIfStale = (raw: Database.Database): void => {
+export const rebuildCanonicalTurnsIfStale = (raw: Database.Database, schemaVersion = 37): void => {
   const stored = (
     raw
       .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'canonical_turns'")
       .get() as { sql?: string } | undefined
   )?.sql;
   if (stored === undefined) return;
-  const wanted = /CREATE TABLE IF NOT EXISTS canonical_turns \([\s\S]*?\n\);/.exec(schemaDdl());
+  const wanted = /CREATE TABLE IF NOT EXISTS canonical_turns \([\s\S]*?\n\);/.exec(schemaDdlAt(schemaVersion));
   const normalise = (sql: string): string =>
     sql
       .replace(/CREATE TABLE IF NOT EXISTS /, "CREATE TABLE ")
@@ -1781,7 +1798,7 @@ export const rebuildCanonicalTurnsIfStale = (raw: Database.Database): void => {
   if (wanted && normalise(stored) === normalise(wanted[0])) return;
 
   raw.exec(
-    canonicalTurnsTableOnlyDdl().replace(
+    canonicalTurnsTableOnlyDdl(schemaVersion).replace(
       "CREATE TABLE IF NOT EXISTS canonical_turns",
       "CREATE TABLE canonical_turns_rebuilt",
     ),
@@ -1804,8 +1821,8 @@ export const rebuildCanonicalTurnsIfStale = (raw: Database.Database): void => {
   if (hasSources) raw.exec(`DROP TRIGGER IF EXISTS canonical_turn_sources_admission_matches_claim`);
   raw.exec("DROP TABLE canonical_turns");
   raw.exec("ALTER TABLE canonical_turns_rebuilt RENAME TO canonical_turns");
-  raw.exec(canonicalTurnsIndexDdl());
-  if (hasSources) raw.exec(sourceAdmissionMatchesClaimTriggerDdl());
+  raw.exec(canonicalTurnsIndexDdl(schemaVersion));
+  if (hasSources) raw.exec(sourceAdmissionMatchesClaimTriggerDdl(schemaVersion));
 };
 
 const dispatchesDdl = (): string =>
@@ -1832,10 +1849,11 @@ const actorIncarnationTriggersDdl = (): string =>
     ),
   ].join("\n\n");
 
-const sourceAdmissionMatchesClaimTriggerDdl = (): string =>
+const sourceAdmissionMatchesClaimTriggerDdl = (schemaVersion = 37): string =>
   schemaObject(
     /CREATE TRIGGER IF NOT EXISTS canonical_turn_sources_admission_matches_claim\n[\s\S]*?\nEND;/,
     "the source admission-matches-claim trigger",
+    schemaVersion,
   );
 
 const observationsIndexDdl = (): string =>
@@ -1857,14 +1875,14 @@ const observationsIndexDdl = (): string =>
  * observation is losing the evidence a turn's outcome was computed from, and a migration that
  * quietly discards one is worse than a migration that stops.
  */
-export const rebuildObservationsIfStale = (raw: Database.Database): void => {
+export const rebuildObservationsIfStale = (raw: Database.Database, schemaVersion = 37): void => {
   const stored = (
     raw
       .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'canonical_turn_observations'")
       .get() as { sql?: string } | undefined
   )?.sql;
   if (stored === undefined) return;
-  const wanted = /CREATE TABLE IF NOT EXISTS canonical_turn_observations \([\s\S]*?\n\);/.exec(schemaDdl());
+  const wanted = /CREATE TABLE IF NOT EXISTS canonical_turn_observations \([\s\S]*?\n\);/.exec(schemaDdlAt(schemaVersion));
   // Quote-insensitive, because `ALTER TABLE … RENAME TO` writes the name back quoted. Comparing
   // the raw text would report a table this migration had just rebuilt as still stale.
   const normalise = (sql: string): string =>
@@ -2529,6 +2547,84 @@ const v37: SchemaMigration = {
   checksum: () => migrationChecksum("v37-seed-claude-cli-executor-kind"),
 };
 
+/** v38-only guards: historical ledger repairs cannot install them before the column exists. */
+export const V38_LEDGER_TRIGGER_NAMES: readonly string[] = [
+  "canonical_turns_override_write_authority",
+  "canonical_turns_override_claim_guard",
+  "canonical_turns_override_identity_immutable",
+];
+
+const v38: SchemaMigration = {
+  id: "v38-canonical-verified-target-override",
+  fromVersion: 37,
+  toVersion: 38,
+  apply: (raw) => {
+    // v12/v13 replay today's schema, and v28 can rebuild this table from today's DDL.
+    // Both paths can arrive at v37 with the v38 column already installed. This is NOT a
+    // general "IF NOT EXISTS" migration: a v37 file with a different column/constraint
+    // shape must fail instead of being stamped v38.
+    const columns = raw.pragma("table_xinfo(canonical_turns)") as Array<{ name: string }>;
+    if (columns.some((column) => column.name === "override_incumbent_turn_request_id")) {
+      const actual = (raw.prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'canonical_turns'",
+      ).get() as { sql: string } | undefined)?.sql;
+      const normalise = (sql: string): string => sql
+        .replace(/^CREATE TABLE IF NOT EXISTS /i, "CREATE TABLE ")
+        .replace(/"/g, "").replace(/;\s*$/, "").replace(/\s+/g, " ").trim();
+      if (!actual || normalise(actual) !== normalise(canonicalTurnsTableOnlyDdl(SCHEMA_VERSION))
+          || (raw.prepare("SELECT 1 FROM canonical_turns WHERE override_incumbent_turn_request_id IS NOT NULL LIMIT 1").get())) {
+        throw new Error("v38 pre-existing canonical_turns column does not match the current table/FK constraints or is populated");
+      }
+      // A replayed index is legitimate only if it is the previous version's exact index
+      // or the current schema's exact index. Do not silently replace an unrelated guard.
+      const indexes = raw.prepare(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND name IN ('canonical_turns_one_unresolved', 'canonical_turns_one_unresolved_override')",
+      ).all() as Array<{ name: string; sql: string }>;
+      const oldIndex = "CREATE UNIQUE INDEX canonical_turns_one_unresolved ON canonical_turns(target_actor_id) WHERE lifecycle_state = 'IN_DOUBT'";
+      const newIndex = "CREATE UNIQUE INDEX canonical_turns_one_unresolved ON canonical_turns(target_actor_id) WHERE lifecycle_state = 'IN_DOUBT' AND override_incumbent_turn_request_id IS NULL";
+      const overrideIndex = "CREATE UNIQUE INDEX canonical_turns_one_unresolved_override ON canonical_turns(override_incumbent_turn_request_id) WHERE override_incumbent_turn_request_id IS NOT NULL AND lifecycle_state = 'IN_DOUBT'";
+      const primary = indexes.find((index) => index.name === "canonical_turns_one_unresolved");
+      const override = indexes.find((index) => index.name === "canonical_turns_one_unresolved_override");
+      if (!primary || ![oldIndex, newIndex].some((expected) => normalise(primary.sql) === normalise(expected))
+          || (override && normalise(override.sql) !== normalise(overrideIndex))) {
+        throw new Error("v38 pre-existing canonical_turns indexes do not match the expected schema");
+      }
+    } else {
+      raw.exec(`ALTER TABLE canonical_turns ADD COLUMN override_incumbent_turn_request_id TEXT
+        REFERENCES canonical_turns(turn_request_id)`);
+    }
+    raw.exec(`
+      DROP INDEX canonical_turns_one_unresolved;
+      DROP INDEX IF EXISTS canonical_turns_one_unresolved_override;
+      CREATE UNIQUE INDEX canonical_turns_one_unresolved ON canonical_turns(target_actor_id)
+        WHERE lifecycle_state = 'IN_DOUBT' AND override_incumbent_turn_request_id IS NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS canonical_turns_one_unresolved_override
+        ON canonical_turns(override_incumbent_turn_request_id)
+        WHERE override_incumbent_turn_request_id IS NOT NULL AND lifecycle_state = 'IN_DOUBT';
+      ${dropsFor(V38_LEDGER_TRIGGER_NAMES)}
+      DROP TRIGGER IF EXISTS inbound_messages_override_authority_immutable;
+      DROP TRIGGER IF EXISTS inbound_messages_override_claim_authority;
+      DROP TRIGGER IF EXISTS inbound_messages_override_insert_authority;
+      DROP TRIGGER IF EXISTS inbound_messages_delete_authority;
+      DROP TRIGGER IF EXISTS inbound_claim_authority_markers_insert_guard;
+      DROP TRIGGER canonical_turns_no_replace;
+    `);
+    raw.exec(`CREATE TABLE IF NOT EXISTS inbound_claim_authority_markers (
+      channel TEXT NOT NULL, nonce TEXT NOT NULL, PRIMARY KEY (channel, nonce)
+    )`);
+    raw.exec(triggerDdlFor([
+      ...V38_LEDGER_TRIGGER_NAMES,
+      "inbound_messages_override_authority_immutable",
+      "inbound_messages_override_claim_authority",
+      "inbound_messages_override_insert_authority",
+      "inbound_messages_delete_authority",
+      "inbound_claim_authority_markers_insert_guard",
+      "canonical_turns_no_replace",
+    ], SCHEMA_VERSION));
+  },
+  checksum: () => migrationChecksum("v38-canonical-verified-target-override", SCHEMA_VERSION),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -2556,6 +2652,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v35,
   v36,
   v37,
+  v38,
 ]);
 
 interface RequiredTrigger {
@@ -2627,6 +2724,9 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "audit_events_append_only", sentinel: "AUDIT_APPEND_ONLY" },
   { name: "audit_events_no_delete", sentinel: "AUDIT_APPEND_ONLY" },
   { name: "canonical_turns_identity_immutable", sentinel: "CANONICAL_TURN_IDENTITY_IMMUTABLE", introducedIn: 24 },
+  { name: "canonical_turns_override_claim_guard", sentinel: "CANONICAL_TURN_OVERRIDE_INVALID", introducedIn: 38 },
+  { name: "canonical_turns_override_write_authority", sentinel: "CANONICAL_TURN_OVERRIDE_AUTHORITY_DENIED", introducedIn: 38 },
+  { name: "canonical_turns_override_identity_immutable", sentinel: "CANONICAL_TURN_OVERRIDE_IMMUTABLE", introducedIn: 38 },
   { name: "canonical_turns_lifecycle_monotone", sentinel: "CANONICAL_TURN_LIFECYCLE_NOT_MONOTONE", introducedIn: 24 },
   { name: "canonical_turns_outcome_never_weakens", sentinel: "CANONICAL_TURN_OUTCOME_WEAKENED", introducedIn: 24 },
   { name: "canonical_turns_born_in_doubt", sentinel: "CANONICAL_TURN_NOT_BORN_IN_DOUBT", introducedIn: 24 },
@@ -2665,6 +2765,11 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "inbound_messages_payload_immutable", sentinel: "INBOUND_PAYLOAD_IMMUTABLE", introducedIn: 35 },
   { name: "inbound_messages_no_replace", sentinel: "INBOUND_MESSAGE_NO_REPLACE", introducedIn: 35 },
   { name: "inbound_messages_turn_claim_identity_immutable", sentinel: "INBOUND_TURN_CLAIM_IDENTITY_IMMUTABLE", introducedIn: 36 },
+  { name: "inbound_messages_override_authority_immutable", sentinel: "INBOUND_OVERRIDE_AUTHORITY_IMMUTABLE", introducedIn: 38 },
+  { name: "inbound_messages_override_claim_authority", sentinel: "INGRESS_OVERRIDE_CLAIM_AUTHORITY_DENIED", introducedIn: 38 },
+  { name: "inbound_messages_override_insert_authority", sentinel: "INGRESS_OVERRIDE_CLAIM_AUTHORITY_DENIED", introducedIn: 38 },
+  { name: "inbound_messages_delete_authority", sentinel: "INGRESS_MESSAGE_DELETE_AUTHORITY_DENIED", introducedIn: 38 },
+  { name: "inbound_claim_authority_markers_insert_guard", sentinel: "INGRESS_OVERRIDE_CLAIM_AUTHORITY_DENIED", introducedIn: 38 },
   { name: "canonical_turn_sources_admission_matches_claim", sentinel: "CANONICAL_TURN_SOURCE_NOT_CLAIM_TIME", introducedIn: 32 },
 ];
 

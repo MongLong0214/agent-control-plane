@@ -6,6 +6,8 @@ import {
   type TelegramGetUpdatesOptions,
 } from "../../src/ingress/telegram-polling.ts";
 import type { TelegramUpdate } from "../../src/ingress/telegram.ts";
+import { TelegramIngress } from "../../src/ingress/telegram.ts";
+import { IngressGuard } from "../../src/ingress/ingress-guard.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
 
@@ -142,6 +144,90 @@ describe("#858 the canonical bridge fires for the target this deployment actuall
     // happens to exist: a bridge that cited a stale attestation would record a turn for a
     // generation nothing attested.
     expect(rows[0]?.target_attestation_id).toBe(target.attestationId);
+  });
+
+  it("materializes an authenticated Telegram /again without settling the unresolved incumbent", async () => {
+    const harness = makeHarness();
+    const target = selfClaimedTarget(harness);
+    // A pending first delivery cannot have repliedAt: a successful poll settles ingress even
+    // while canonical remains IN_DOUBT. Seed that real pending claim, then use the production
+    // listener for the second delivery (the wiring this regression must exercise).
+    const firstUpdate = ownerMessage(8593, "첫 요청");
+    const guard = new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, {
+      telegram: { allowedActors: config.allowedOwnerIds, allowedConversations: config.allowedChatIds,
+        recoverInFlight: true },
+    });
+    const ingress = new TelegramIngress(guard, { webhookSecret: SECRET });
+    expect(ingress.admit(firstUpdate, SECRET).allowed).toBe(true);
+    const firstPayload = JSON.parse(harness.cp.db.get<{ payload_json: string }>(
+      `SELECT payload_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'update:8593'`,
+    )!.payload_json) as unknown;
+    const first = harness.cp.conversation.claim({
+      targetActorId: target.actorId,
+      prompt: "첫 요청",
+      sources: [{ channel: "telegram", nonce: "update:8593", attempt: 1, payload: firstPayload }],
+    });
+    expect(first.allowed).toBe(true);
+    expect(guard.claimTurn("telegram", "update:8593", ingress.turnIdentityFor(firstUpdate, "첫 요청", null, null)).allowed)
+      .toBe(true);
+
+    const parkedTransport = new OneUpdateTransport(ownerMessage(8594, "먼저 대기한 X"));
+    const parkedListener = await startTelegramLongPollListener(harness.cp, config, {
+      transport: parkedTransport, start: false,
+    });
+    try {
+      await parkedListener.service.pollOnce();
+    } finally {
+      await parkedListener.close();
+    }
+    expect(parkedTransport.sent).toHaveLength(1);
+    expect(harness.cp.db.get<{ turn_claim_json: string | null }>(
+      `SELECT turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'update:8594'`,
+    )?.turn_claim_json).toBeNull();
+
+    const transport = new OneUpdateTransport(ownerMessage(8595, "/again 두번째 요청"));
+    const listener = await startTelegramLongPollListener(harness.cp, config, { transport, start: false });
+    try {
+      await listener.service.pollOnce();
+    } finally {
+      await listener.close();
+    }
+    const rows = harness.cp.db.all<{
+      turn_request_id: string; target_actor_id: string; lifecycle_state: string;
+      override_incumbent_turn_request_id: string | null;
+    }>(`SELECT turn_request_id, target_actor_id, lifecycle_state, override_incumbent_turn_request_id
+        FROM canonical_turns ORDER BY rowid`, []);
+    expect(rows, "the deliberate second owner turn must have its own canonical record").toHaveLength(2);
+    expect(rows[0]?.target_actor_id).toBe(target.actorId);
+    expect(rows[0]?.lifecycle_state).toBe("IN_DOUBT");
+    expect(rows[1]?.target_actor_id).toBe(target.actorId);
+    expect(rows[1]?.override_incumbent_turn_request_id).toBe(rows[0]?.turn_request_id);
+    expect(harness.cp.db.all<{ source_nonce: string }>(
+      `SELECT source_nonce FROM canonical_turn_sources WHERE turn_request_id = ? ORDER BY batch_ordinal`,
+      [rows[1]!.turn_request_id],
+    ).map((row) => row.source_nonce)).toEqual(["update:8594", "update:8595"]);
+
+    const repeatedTransport = new OneUpdateTransport(ownerMessage(8596, "/again 세 번째 요청"));
+    const repeatedListener = await startTelegramLongPollListener(harness.cp, config, {
+      transport: repeatedTransport, start: false,
+    });
+    try {
+      await repeatedListener.service.pollOnce();
+    } finally {
+      await repeatedListener.close();
+    }
+    const chain = harness.cp.db.all<{
+      turn_request_id: string; lifecycle_state: string; override_incumbent_turn_request_id: string | null;
+    }>(`SELECT turn_request_id, lifecycle_state, override_incumbent_turn_request_id
+          FROM canonical_turns ORDER BY rowid`, []);
+    const repeatIngress = harness.cp.db.get<{ turn_claim_json: string | null; result_json: string | null }>(
+      `SELECT turn_claim_json, result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'update:8596'`,
+    );
+    expect(chain, `a repeated /again must follow the latest unresolved canonical turn: ${JSON.stringify(repeatIngress)}`)
+      .toHaveLength(3);
+    expect(chain[2]?.override_incumbent_turn_request_id).toBe(chain[1]?.turn_request_id);
+    expect(chain.every((turn) => turn.lifecycle_state === "IN_DOUBT")).toBe(true);
+    expect(repeatedTransport.sent).toHaveLength(1);
   });
 
   it("writes nothing when the deployment has no admissible target", async () => {

@@ -618,6 +618,7 @@ export class ConversationTurnCoordinator {
     targetActorId: string;
     prompt: string;
     sources: readonly TurnSource[];
+    overrideIncumbentTurnRequestId?: string;
   }): Decision<TurnPermit> {
     if (input.sources.length === 0) {
       return deny(ReasonCode.INVALID_ARGUMENT, "a turn has to answer at least one message", {
@@ -862,12 +863,104 @@ export class ConversationTurnCoordinator {
       // This is also the "not a legal new turn" half of #693's answer: a later message never
       // joins the incumbent (see this method's docstring) and is refused here rather than queued
       // or coalesced, deliberately, every time this fires.
-      const incumbent = this.db.get<{ turn_request_id: string }>(
-        `SELECT turn_request_id FROM canonical_turns
-          WHERE target_actor_id = ? AND lifecycle_state = 'IN_DOUBT'`,
+      const unresolved = this.db.all<{ turn_request_id: string; target_binding_id: string;
+        target_attestation_id: string; binding_generation: number; source_nonce: string | null }>(
+        `SELECT t.turn_request_id, t.target_binding_id, t.target_attestation_id,
+                t.binding_generation,
+                CASE WHEN i.turn_claim_json IS NOT NULL
+                  AND json_extract(i.turn_claim_json, '$.repliedAt') IS NULL
+                  AND json_extract(i.turn_claim_json, '$.settledAt') IS NULL
+                  AND json_extract(i.turn_claim_json, '$.noReplyAt') IS NULL
+                  THEN s.source_nonce ELSE NULL END AS source_nonce
+           FROM canonical_turns t
+           LEFT JOIN canonical_turn_sources s ON s.turn_request_id = t.turn_request_id
+           LEFT JOIN inbound_messages i ON i.channel = s.source_channel AND i.nonce = s.source_nonce
+          WHERE t.target_actor_id = ? AND t.lifecycle_state = 'IN_DOUBT'
+          ORDER BY t.rowid, s.batch_ordinal`,
         [input.targetActorId],
       );
-      if (incumbent) {
+      const incumbent = unresolved.at(-1);
+      let overrideEvidence: { channel: string; nonce: string; ingressTurnRequestId: string;
+        overriddenUnresolvedNonces: string[] } | null = null;
+      if (incumbent && input.overrideIncumbentTurnRequestId === incumbent.turn_request_id
+          && input.sources.length > 0) {
+        // The last source is the current /again delivery; earlier sources may be owner messages
+        // parked while the incumbent was unresolved. They must share this exact ingress claim.
+        const source = input.sources.at(-1)!;
+        const inbound = this.db.get<{ payload_json: string | null; turn_claim_json: string | null; claim_unambiguous: number }>(
+          `SELECT payload_json, turn_claim_json,
+                  CASE WHEN json_valid(turn_claim_json) = 1 THEN NOT EXISTS (
+                    SELECT 1 FROM json_tree(turn_claim_json) WHERE typeof(key) = 'text'
+                    GROUP BY parent, key HAVING COUNT(*) > 1
+                  ) ELSE 0 END AS claim_unambiguous
+             FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+          [source.channel, source.nonce],
+        );
+        try {
+          const payload: unknown = JSON.parse(inbound?.payload_json ?? "null");
+          const claim: unknown = JSON.parse(inbound?.turn_claim_json ?? "null");
+          if (inbound?.claim_unambiguous === 1 && source.channel === "telegram" && typeof payload === "object" && payload !== null
+              && !Array.isArray(payload) && typeof (payload as { text?: unknown }).text === "string"
+              && /^\/again(?:\s|$)/.test((payload as { text: string }).text)
+              && typeof claim === "object" && claim !== null && !Array.isArray(claim)) {
+            const proof = claim as Record<string, unknown>;
+            const bound = proof.canonicalTarget as Record<string, unknown> | null | undefined;
+            const nonces = proof.overriddenUnresolvedNonces;
+            const durableBatch = proof.batchConsumedNonces ?? [source.nonce];
+            const batchProven = Array.isArray(durableBatch)
+              && durableBatch.length === input.sources.length
+              && durableBatch.every((nonce, ordinal) => nonce === input.sources[ordinal]?.nonce)
+              && input.sources.every((item) => {
+              if (item.channel !== "telegram") return false;
+              const member = this.db.get<{ turn_claim_json: string | null; claim_unambiguous: number }>(
+                `SELECT turn_claim_json,
+                        CASE WHEN json_valid(turn_claim_json) = 1 THEN NOT EXISTS (
+                          SELECT 1 FROM json_tree(turn_claim_json) WHERE typeof(key) = 'text'
+                          GROUP BY parent, key HAVING COUNT(*) > 1
+                        ) ELSE 0 END AS claim_unambiguous
+                   FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+                [item.channel, item.nonce],
+              );
+              const memberClaim: unknown = JSON.parse(member?.turn_claim_json ?? "null");
+              return member?.claim_unambiguous === 1
+                && typeof memberClaim === "object" && memberClaim !== null && !Array.isArray(memberClaim)
+                && (memberClaim as Record<string, unknown>).turnRequestId === proof.turnRequestId
+                && (memberClaim as Record<string, unknown>).sessionDigest === proof.sessionDigest
+                && (memberClaim as Record<string, unknown>).promptDigest === proof.promptDigest
+                && (memberClaim as Record<string, unknown>).deliveryStatus === "TURN_CLAIMED"
+                && JSON.stringify((memberClaim as Record<string, unknown>).batchConsumedNonces) === JSON.stringify(proof.batchConsumedNonces)
+                && JSON.stringify((memberClaim as Record<string, unknown>).batchUnconsumedNonces) === JSON.stringify(proof.batchUnconsumedNonces)
+                && JSON.stringify((memberClaim as Record<string, unknown>).overriddenUnresolvedNonces) === JSON.stringify(nonces)
+                && JSON.stringify((memberClaim as Record<string, unknown>).canonicalTarget) === JSON.stringify(bound);
+            });
+            const expectedNonces = [...new Set(unresolved.map((row) => row.source_nonce)
+              .filter((nonce): nonce is string => nonce !== null))];
+            if (batchProven && proof.deliveryStatus === "TURN_CLAIMED"
+                && typeof proof.turnRequestId === "string" && proof.turnRequestId.length > 0
+                && proof.promptDigest === digestOf(input.prompt)
+                && bound && typeof bound === "object" && !Array.isArray(bound)
+                && bound.turnRequestId === proof.turnRequestId
+                && bound.promptDigest === proof.promptDigest
+                && bound.targetActorId === input.targetActorId
+                && bound.targetBindingId === target.target_binding_id
+                && bound.targetAttestationId === attestation.target_attestation_id
+                && bound.bindingGeneration === attestation.binding_generation
+                && bound.executorSessionId === attestation.executor_session_id
+                && bound.executorSessionIncarnation === attestation.executor_session_incarnation
+                && incumbent.target_binding_id === target.target_binding_id
+                && incumbent.target_attestation_id === attestation.target_attestation_id
+                && incumbent.binding_generation === attestation.binding_generation
+                && Array.isArray(nonces) && nonces.every((nonce) => typeof nonce === "string")
+                && nonces.length === expectedNonces.length
+                && new Set(nonces).size === nonces.length
+                && expectedNonces.every((nonce) => nonces.includes(nonce))) {
+              overrideEvidence = { channel: source.channel, nonce: source.nonce,
+                ingressTurnRequestId: proof.turnRequestId, overriddenUnresolvedNonces: nonces as string[] };
+            }
+          }
+        } catch { /* Corrupt or absent ingress proof is never authority. */ }
+      }
+      if (incumbent && !overrideEvidence) {
         return deny(
           ReasonCode.CONVERSATION_TURN_IN_DOUBT,
           "this conversation already has a turn whose outcome is unknown",
@@ -890,6 +983,8 @@ export class ConversationTurnCoordinator {
         actor: input.targetActorId,
         evidence: {
           turnRequestId,
+          ...(overrideEvidence ? { overrideIncumbentTurnRequestId: incumbent?.turn_request_id,
+            ingressOverride: overrideEvidence } : {}),
           sources: input.sources.map(
             (source) => `${source.channel}:${source.nonce}#${source.attempt}`,
           ),
@@ -900,12 +995,13 @@ export class ConversationTurnCoordinator {
       }
       const claimAuditEventId = audited.value;
 
-      this.db.run(
+      this.db.materializeTurn(this.#materialization, { turnRequestId }, () => this.db.run(
         `INSERT INTO canonical_turns
            (turn_request_id, target_actor_id, target_binding_id, target_attestation_id,
             executor_session_id, executor_session_incarnation, binding_generation,
-            prompt_digest, claimed_at, claim_audit_event_id, lifecycle_state)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'IN_DOUBT')`,
+            prompt_digest, claimed_at, claim_audit_event_id, lifecycle_state,
+            override_incumbent_turn_request_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'IN_DOUBT', ?)`,
         [
           turnRequestId,
           input.targetActorId,
@@ -917,8 +1013,9 @@ export class ConversationTurnCoordinator {
           promptDigest,
           this.clock.nowIso(),
           claimAuditEventId,
+          overrideEvidence ? incumbent!.turn_request_id : null,
         ],
-      );
+      ));
 
       input.sources.forEach((source, ordinal) => {
         this.db.run(

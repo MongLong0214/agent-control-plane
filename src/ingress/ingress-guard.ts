@@ -10,6 +10,37 @@ import type { OwnerApprovalReceipt } from "../ceo/owner-authority.ts";
 import type { ReceiptLookupQuery } from "../conversation/turn-coordinator.ts";
 import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
 
+// Only the validated claim paths below mint this token. A Db holder receives no issuer.
+class IngressClaimAuthorityToken {
+  constructor(
+    readonly db: Db,
+    readonly channel: string,
+    readonly nonce: string,
+    readonly claimJson: string,
+  ) {}
+  readonly #minted = true;
+  static matches(value: unknown, db: Db, channel: string, nonce: string, claimJson: string): boolean {
+    return typeof value === "object" && value !== null && #minted in value
+      && value.db === db && value.channel === channel && value.nonce === nonce
+      && value.claimJson === claimJson;
+  }
+}
+export type IngressClaimAuthority = IngressClaimAuthorityToken;
+export const isIngressClaimAuthority = IngressClaimAuthorityToken.matches;
+
+// Only this module may authorize removal of durable ingress replay evidence. The token is scoped
+// to one channel; callers never receive it or the callback executed under it.
+class IngressDeleteAuthorityToken {
+  constructor(readonly db: Db, readonly channel: string) {}
+  readonly #minted = true;
+  static matches(value: unknown, db: Db, channel: string): boolean {
+    return typeof value === "object" && value !== null && #minted in value
+      && value.db === db && value.channel === channel;
+  }
+}
+export type IngressDeleteAuthority = IngressDeleteAuthorityToken;
+export const isIngressDeleteAuthority = IngressDeleteAuthorityToken.matches;
+
 export interface IngressRequest {
   channel: "telegram" | "buzz" | "mcp" | "cli";
   /** Channel identity: telegram user id, buzz channel pubkey, mcp peer. Not a role. */
@@ -64,6 +95,7 @@ export interface IngressPolicy {
 
 export interface OwnerBatchCanonicalClaim {
   readonly target: ReceiptLookupQuery;
+  readonly overriddenUnresolvedNonces?: readonly string[];
   readonly sources: readonly {
     channel: string;
     nonce: string;
@@ -854,11 +886,13 @@ export class IngressGuard {
           // nothing about who claimed it is a state nothing can interpret afterwards.
           claimedByProcess: this.#processIncarnation,
         };
-        const updated = this.db.run(
+        const claimJson = JSON.stringify(claim);
+        const authority = new IngressClaimAuthorityToken(this.db, channel, nonce, claimJson);
+        const updated = this.db.withIngressClaim(authority, channel, nonce, claimJson, () => this.db.run(
           `UPDATE inbound_messages SET turn_claim_json = ?
             WHERE channel = ? AND nonce = ? AND turn_claim_json IS NULL`,
-          [JSON.stringify(claim), channel, nonce],
-        );
+          [claimJson, channel, nonce],
+        ));
         // What serialises two claimers is the transaction, not this WHERE clause. `db.tx` runs
         // the read and the write as one unit and SQLite serialises write transactions, so a
         // second claimer cannot observe the pre-claim value and act on it.
@@ -892,9 +926,9 @@ export class IngressGuard {
    * then receives the same immutable claim identity plus the complete consumed/unconsumed sets.
    * Parked delivery receipts are reset to the fresh admitted phase because the selected rows now
    * participate in one new reply lifecycle; their parking marker remains attached for audit.
-   * A verified canonical target is materialized in the same transaction when available, but that
-   * ledger is additive: its ordinary denial neither rolls this claim back nor blocks its owner.
-   * Thrown materializer or database failures still escape and roll the transaction back.
+   * For a verified canonical target, materialization is part of admission: its denial rolls
+   * the batch claim back before owner dispatch. Targetless claims remain ingress-only.
+   * Thrown materializer or database failures also roll back the transaction.
    */
   claimOwnerBatch(
     channel: string,
@@ -1007,11 +1041,13 @@ export class IngressGuard {
           phase: "ADMITTED",
           ...(parked ? { parked } : {}),
         };
-        const updated = this.db.run(
+        const claimJson = JSON.stringify(claim);
+        const authority = new IngressClaimAuthorityToken(this.db, channel, nonce, claimJson);
+        const updated = this.db.withIngressClaim(authority, channel, nonce, claimJson, () => this.db.run(
           `UPDATE inbound_messages SET turn_claim_json = ?, result_json = ?
             WHERE channel = ? AND nonce = ? AND turn_claim_json IS NULL`,
-          [JSON.stringify(claim), JSON.stringify(admittedResult), channel, nonce],
-        );
+          [claimJson, JSON.stringify(admittedResult), channel, nonce],
+        ));
         if (updated.changes !== 1) {
           return deny(ReasonCode.RESOURCE_COLLISION, "owner batch claim raced another writer", {
             channel,
@@ -1020,8 +1056,11 @@ export class IngressGuard {
         }
       }
       if (materializeTurn && isBoundCanonicalTarget(canonicalTarget, identity)) {
-        materializeTurn({
-          target: canonicalTarget!,
+        const materialized = materializeTurn({
+          target: canonicalTarget,
+          ...(identity.overriddenUnresolvedNonces
+            ? { overriddenUnresolvedNonces: identity.overriddenUnresolvedNonces }
+            : {}),
           sources: rows.map(({ nonce, row }) => ({
             channel,
             nonce,
@@ -1029,6 +1068,9 @@ export class IngressGuard {
             payload: admittedPayload(row!.payload_json),
           })),
         });
+        if (!materialized.allowed) {
+          return deny(materialized.reasonCode, materialized.message, materialized.evidence);
+        }
       }
       return allow(ReasonCode.OK, claim);
     });
@@ -1336,11 +1378,12 @@ export class IngressGuard {
         );
         if (promoted.changes !== 1) continue;
       }
-      this.db.run(
+      const authority = new IngressDeleteAuthorityToken(this.db, LEGACY_PARKED_BATCH_CHANNEL);
+      this.db.withIngressDelete(authority, LEGACY_PARKED_BATCH_CHANNEL, () => this.db.run(
         `DELETE FROM inbound_messages
           WHERE channel = ? AND nonce = ? AND actor = ? AND received_at = ?`,
         [LEGACY_PARKED_BATCH_CHANNEL, legacy.nonce, legacy.session_digest, legacy.parked_at],
-      );
+      ));
     }
   }
 
@@ -1795,7 +1838,8 @@ export class IngressGuard {
     //
     // Terminal reply failures need a person, not a timer. `agentctl doctor system` reads these
     // exact rows and reports the unanswerable or unknown delivery state.
-    this.db.run(
+    const authority = new IngressDeleteAuthorityToken(this.db, channel);
+    this.db.withIngressDelete(authority, channel, () => this.db.run(
       `DELETE FROM inbound_messages
         WHERE channel = ? AND received_at < ?
           AND (
@@ -1829,7 +1873,7 @@ export class IngressGuard {
             )
           ), 0)`,
       [channel, new Date(new Date(this.clock.nowIso()).getTime() - ttlMs).toISOString()],
-    );
+    ));
   }
 }
 

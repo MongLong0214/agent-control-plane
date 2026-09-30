@@ -2761,8 +2761,8 @@ const GUARDS = [
     // recorded as overriding a turn that was never actually the only one outstanding.
     what: "the override record captures every unresolved nonce, not only the oldest",
     file: "src/ingress/telegram-router.ts",
-    find: "        const overriddenUnresolvedNonces = unresolved.length > 0 ? unresolved.map((turn) => turn.nonce) : undefined;",
-    replace: "        const overriddenUnresolvedNonces = unresolved[0] ? [unresolved[0].nonce] : undefined;",
+    find: "        const overriddenUnresolvedNonces = classified.value.overridesUnresolved\n          ? unresolved.map((turn) => turn.nonce) : undefined;",
+    replace: "        const overriddenUnresolvedNonces = classified.value.overridesUnresolved && unresolved[0]\n          ? [unresolved[0].nonce] : undefined;",
     killedBy: [
       "tests/unit/telegram-ingress.test.ts::#695: names both unresolved turns, not only the oldest, once a second one accumulates",
     ],
@@ -3277,7 +3277,7 @@ const GUARDS = [
     // backup before this binary can begin storing admitted payloads on the inbound row.
     what: "opening a v34 database takes an automatic rollback snapshot before v35 admitted-payload state",
     file: "src/db/migrations.ts",
-    find: "export const SCHEMA_VERSION = 37;",
+    find: "export const SCHEMA_VERSION = 38;",
     replace: "export const SCHEMA_VERSION = 34;",
     killedBy: [
       "tests/unit/database-migration-restore.test.ts::opening a v34 database takes an automatic rollback snapshot before v35 admitted-payload state",
