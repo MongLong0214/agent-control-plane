@@ -598,17 +598,14 @@ stop_job() {
     done
     job_loaded || return 0
     if [[ "${1:-}" == "maintenance" ]]; then
-      # A timed-out bootout can still unregister after the last check. Only restore a
-      # previously loaded service, with its original plist, after observing that transition.
-      for attempt in $(seq 1 5); do
-        sleep 1
-        if ! job_loaded; then
-          printf 'agentcpd launchd installer: bootout timed out; attempting original service recovery\n' >&2
-          start_job
-          fail "bootout timed out; original service recovered; requested operation not completed"
-        fi
-      done
-      fail "launchd job remains loaded after bootout; no recovery observed within bounded wait; bootout may unregister later, leaving service stopped; inspect launchctl and restore the original service if unloaded"
+      # A successful bootout request can unregister after any finite observation window. Keep
+      # the maintenance command attached until that transition occurs; exiting earlier would
+      # leave nobody responsible for restoring the original, previously loaded service.
+      printf 'agentcpd launchd installer: bootout timed out; waiting to recover the original service after unregister\n' >&2
+      while job_loaded; do sleep 1; done
+      printf 'agentcpd launchd installer: bootout completed late; attempting original service recovery\n' >&2
+      start_job
+      fail "bootout timed out; original service recovered; requested operation not completed"
     fi
     fail "launchd job remains loaded after bootout; recovery not attempted"
   fi

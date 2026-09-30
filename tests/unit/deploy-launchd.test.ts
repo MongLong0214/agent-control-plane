@@ -930,7 +930,7 @@ exec /bin/cp "$@"
     expect(existsSync(join(harness.home, ".agent-control-plane", "rollback-stage"))).toBe(false);
   });
 
-  it("reports the residual when maintenance bootout unregisters just after the recovery window", () => {
+  it("recovers a maintenance bootout that unregisters beyond the initial recovery observations", () => {
     const harness = makeHarness();
     expect(runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness).status).toBe(0);
     writeExecutable(join(harness.bin, "sleep"), "#!/bin/bash\nexit 0\n");
@@ -940,19 +940,13 @@ exec /bin/cp "$@"
     const result = runInstaller(installer, ["restart"], harness);
     const actions = subcommands(harness.launchLog);
     expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain("may unregister later, leaving service stopped");
-    expect(result.stderr).not.toContain("original service recovered");
-    expect(actions.filter((action) => action === "print")).toHaveLength(37);
-    expect(actions).not.toContain("bootstrap");
-    expect(actions).not.toContain("kickstart");
-    const observed = boundedSpawnSync("launchctl", ["print", `gui/${process.getuid?.() ?? 0}/${label}`], {
-      encoding: "utf8", env: harness.env,
-    });
-    expect(observed.status).not.toBe(0);
-    expect(existsSync(harness.loaded)).toBe(false);
+    expect(result.stderr).toContain("original service recovered");
+    expect(actions.filter((action) => action === "bootstrap")).toHaveLength(1);
+    expect(actions.filter((action) => action === "kickstart")).toHaveLength(1);
+    expect(existsSync(harness.loaded)).toBe(true);
   });
 
-  it("does not bootstrap while bootout remains registered after the recovery window", () => {
+  it("waits for maintenance bootout to unregister before recovering the original service", () => {
     const harness = makeHarness();
     const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
     expect(installed.status, installed.stderr).toBe(0);
@@ -964,10 +958,10 @@ exec /bin/cp "$@"
     const actions = subcommands(harness.launchLog);
 
     expect(restarted.status).not.toBe(0);
-    expect(restarted.stderr).toContain("launchd job remains loaded after bootout");
-    expect(actions.filter((action) => action === "print")).toHaveLength(37);
-    expect(actions).not.toContain("bootstrap");
-    expect(actions).not.toContain("kickstart");
+    expect(restarted.stderr).toContain("original service recovered");
+    expect(actions.filter((action) => action === "print").length).toBeGreaterThan(1000);
+    expect(actions.filter((action) => action === "bootstrap")).toHaveLength(1);
+    expect(actions.filter((action) => action === "kickstart")).toHaveLength(1);
     expect(existsSync(harness.loaded)).toBe(true);
   });
 

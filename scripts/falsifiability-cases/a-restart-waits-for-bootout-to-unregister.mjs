@@ -9,22 +9,19 @@ const c = {
     + '    done\n'
     + '    job_loaded || return 0\n'
     + '    if [[ "${1:-}" == "maintenance" ]]; then\n'
-    + '      # A timed-out bootout can still unregister after the last check. Only restore a\n'
-    + '      # previously loaded service, with its original plist, after observing that transition.\n'
-    + '      for attempt in $(seq 1 5); do\n'
-    + '        sleep 1\n'
-    + '        if ! job_loaded; then\n'
-    + '          printf \'agentcpd launchd installer: bootout timed out; attempting original service recovery\\n\' >&2\n'
-    + '          start_job\n'
-    + '          fail "bootout timed out; original service recovered; requested operation not completed"\n'
-    + '        fi\n'
-    + '      done\n'
-    + '      fail "launchd job remains loaded after bootout; no recovery observed within bounded wait; bootout may unregister later, leaving service stopped; inspect launchctl and restore the original service if unloaded"\n'
+    + '      # A successful bootout request can unregister after any finite observation window. Keep\n'
+    + '      # the maintenance command attached until that transition occurs; exiting earlier would\n'
+    + '      # leave nobody responsible for restoring the original, previously loaded service.\n'
+    + '      printf \'agentcpd launchd installer: bootout timed out; waiting to recover the original service after unregister\\n\' >&2\n'
+    + '      while job_loaded; do sleep 1; done\n'
+    + '      printf \'agentcpd launchd installer: bootout completed late; attempting original service recovery\\n\' >&2\n'
+    + '      start_job\n'
+    + '      fail "bootout timed out; original service recovered; requested operation not completed"\n'
     + '    fi\n'
     + '    fail "launchd job remains loaded after bootout; recovery not attempted"\n',
   replace: '    return 0\n',
   killedBy: [
-    "tests/unit/deploy-launchd.test.ts::restart waits for a delayed bootout before reporting a loaded job",
+    "tests/unit/deploy-launchd.test.ts::recovers a maintenance bootout that unregisters beyond the initial recovery observations",
   ],
 };
 export default c;
