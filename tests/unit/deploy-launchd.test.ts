@@ -762,7 +762,210 @@ describe("launchd deployment artifact", () => {
     expect(existsSync(harness.loaded)).toBe(true);
   });
 
-  it("refuses when bootout remains registered past the bounded wait", () => {
+  it.each(["restart", "install", "upgrade"])("recovers a late bootout during %s without completing the requested operation", (command) => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    const originalPlist = readFileSync(plistPath(harness), "utf8");
+    const originalLauncher = readFileSync(launcherPath(harness), "utf8");
+    const stateAdminBefore = existsSync(harness.stateAdminLog) ? readFileSync(harness.stateAdminLog, "utf8") : "";
+    writeExecutable(join(harness.bin, "sleep"), "#!/bin/bash\nexit 0\n");
+    harness.env["ACP_BOOTOUT_PRINT_LAG"] = "31";
+    writeFileSync(harness.launchLog, "");
+
+    const result = runInstaller(installer, command === "restart"
+      ? [command]
+      : [command, "--app-root", root, "--node", harness.node], harness);
+    const actions = subcommands(harness.launchLog);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("bootout timed out");
+    expect(result.stderr).toContain("original service recovered");
+    expect(actions.filter((action) => action === "bootout")).toHaveLength(1);
+    expect(actions.filter((action) => action === "bootstrap")).toHaveLength(1);
+    expect(actions.filter((action) => action === "kickstart")).toHaveLength(1);
+    expect(existsSync(harness.loaded)).toBe(true);
+    expect(readFileSync(plistPath(harness), "utf8")).toBe(originalPlist);
+    expect(readFileSync(launcherPath(harness), "utf8")).toBe(originalLauncher);
+    expect(existsSync(harness.stateAdminLog) ? readFileSync(harness.stateAdminLog, "utf8") : "").toBe(stateAdminBefore);
+  });
+
+  it.each(["install", "upgrade"])("preserves a same-root runtime and source Node when %s bootout times out", (command) => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    expect(runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status).toBe(0);
+    const runtimeNode = join(appRoot, "dist", "bin", "node");
+    const originalRuntime = readFileSync(runtimeNode);
+    const originalPlist = readFileSync(plistPath(harness), "utf8");
+    const originalLauncher = readFileSync(launcherPath(harness), "utf8");
+    const nextNode = join(harness.bin, "node-new");
+    writeExecutable(nextNode, `${readFileSync(harness.node, "utf8")}\n# changed interpreter generation\n`);
+    const nextNodeBefore = readFileSync(nextNode);
+    const stateAdminBefore = existsSync(harness.stateAdminLog) ? readFileSync(harness.stateAdminLog, "utf8") : "";
+    writeExecutable(join(harness.bin, "sleep"), "#!/bin/bash\nexit 0\n");
+    harness.env["ACP_BOOTOUT_PRINT_LAG"] = "31";
+    writeFileSync(harness.launchLog, "");
+
+    const result = runInstaller(installer, [command, "--app-root", appRoot, "--node", nextNode], harness);
+    const actions = subcommands(harness.launchLog);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("original service recovered");
+    expect(actions.filter((action) => action === "bootstrap")).toHaveLength(1);
+    expect(actions.filter((action) => action === "kickstart")).toHaveLength(1);
+    expect(existsSync(harness.loaded)).toBe(true);
+    expect(readFileSync(runtimeNode)).toEqual(originalRuntime);
+    expect(readdirSync(join(appRoot, "dist", "bin")).filter((name) => name.startsWith(".node."))).toEqual([]);
+    expect(readFileSync(nextNode)).toEqual(nextNodeBefore);
+    expect(readFileSync(plistPath(harness), "utf8")).toBe(originalPlist);
+    expect(readFileSync(launcherPath(harness), "utf8")).toBe(originalLauncher);
+    expect(existsSync(harness.stateAdminLog) ? readFileSync(harness.stateAdminLog, "utf8") : "").toBe(stateAdminBefore);
+  });
+
+  it("keeps the loaded old generation when staging a replacement Node fails", () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    expect(runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status).toBe(0);
+    const runtimeDir = join(appRoot, "dist", "bin");
+    const originalNode = readFileSync(join(runtimeDir, "node"));
+    const originalPlist = readFileSync(plistPath(harness), "utf8");
+    const originalLauncher = readFileSync(launcherPath(harness), "utf8");
+    const nextNode = join(harness.bin, "node-new");
+    writeExecutable(nextNode, `${readFileSync(harness.node, "utf8")}\n# new generation\n`);
+    writeExecutable(join(harness.bin, "cp"), `#!/bin/bash
+if [[ "\${@: -1}" == *"/.node."* ]]; then
+  printf 'partial' > "\${@: -1}"
+  exit 1
+fi
+exec /bin/cp "$@"
+`);
+    writeFileSync(harness.launchLog, "");
+
+    const result = runInstaller(installer, ["upgrade", "--app-root", appRoot, "--node", nextNode], harness);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("failed to stage the Node interpreter");
+    expect(subcommands(harness.launchLog)).not.toContain("bootout");
+    expect(existsSync(harness.loaded)).toBe(true);
+    expect(readFileSync(join(runtimeDir, "node"))).toEqual(originalNode);
+    expect(readFileSync(plistPath(harness), "utf8")).toBe(originalPlist);
+    expect(readFileSync(launcherPath(harness), "utf8")).toBe(originalLauncher);
+    expect(readdirSync(runtimeDir).filter((name) => name.startsWith(".node."))).toEqual([]);
+  });
+
+  it("tightens a writable runtime bin before staging even when the copy fails", () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    expect(runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status).toBe(0);
+    const runtimeDir = join(appRoot, "dist", "bin");
+    const originalNode = readFileSync(join(runtimeDir, "node"));
+    const nextNode = join(harness.bin, "node-new");
+    writeExecutable(nextNode, `${readFileSync(harness.node, "utf8")}\n# new generation\n`);
+    const modeLog = join(harness.home, "stage-mode.log");
+    writeExecutable(join(harness.bin, "cp"), `#!/bin/bash
+if [[ "\${@: -1}" == *"/.node."* ]]; then
+  stat -f '%Lp' "$(dirname -- "\${@: -1}")" >> "${modeLog}"
+  printf 'partial' > "\${@: -1}"
+  exit 1
+fi
+exec /bin/cp "$@"
+`);
+    chmodSync(runtimeDir, 0o777);
+    writeFileSync(harness.launchLog, "");
+
+    const result = runInstaller(installer, ["upgrade", "--app-root", appRoot, "--node", nextNode], harness);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("failed to stage the Node interpreter");
+    expect(readFileSync(modeLog, "utf8").trim().split("\n")).toEqual(["755", "755"]);
+    expect(statSync(runtimeDir).mode & 0o777).toBe(0o755);
+    expect(readdirSync(runtimeDir).filter((name) => name.startsWith(".node."))).toEqual([]);
+    expect(readFileSync(join(runtimeDir, "node"))).toEqual(originalNode);
+    expect(subcommands(harness.launchLog)).not.toContain("bootout");
+  });
+
+  it("promotes a staged replacement Node after successful upgrade", () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    expect(runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status).toBe(0);
+    const runtimeDir = join(appRoot, "dist", "bin");
+    const previousNode = readFileSync(join(runtimeDir, "node"));
+    const nextNode = join(harness.bin, "node-new");
+    writeExecutable(nextNode, `${readFileSync(harness.node, "utf8")}\n# new generation\n`);
+    const upgraded = runInstaller(installer, ["upgrade", "--app-root", appRoot, "--node", nextNode], harness);
+    expect(upgraded.status, upgraded.stderr).toBe(0);
+    expect(readFileSync(join(runtimeDir, "node"))).not.toEqual(previousNode);
+    expect(readFileSync(join(runtimeDir, "node"))).toEqual(readFileSync(nextNode));
+    expect(readdirSync(runtimeDir).filter((name) => name.startsWith(".node."))).toEqual([]);
+    expect(parseLauncherBinding(readFileSync(launcherPath(harness), "utf8"), "upgrade-node").nodePath).toBe(join(runtimeDir, "node"));
+    expect(existsSync(harness.loaded)).toBe(true);
+  });
+
+  it("recovers the original loaded service when rollback bootout unregisters after its timeout", async () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    expect(runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status).toBe(0);
+    const fixture = await sealPairFor(harness, appRoot);
+    const originalPlist = readFileSync(plistPath(harness), "utf8");
+    const originalLauncher = readFileSync(launcherPath(harness), "utf8");
+    const originalRuntime = readFileSync(join(appRoot, "dist", "bin", "node"));
+    const stateAdminBefore = existsSync(harness.stateAdminLog) ? readFileSync(harness.stateAdminLog, "utf8") : "";
+    writeExecutable(join(harness.bin, "sleep"), "#!/bin/bash\nexit 0\n");
+    harness.env["ACP_BOOTOUT_PRINT_LAG"] = "31";
+    writeFileSync(harness.launchLog, "");
+
+    const result = runInstaller(installer, ["rollback", "--app-root", appRoot, "--node", harness.node,
+      "--pair-id", fixture.pair.pairId, "--expected-index-digest", fixture.pair.indexDigest,
+      ...structuralFlags(fixture)], harness);
+    const actions = subcommands(harness.launchLog);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("bootout timed out");
+    expect(result.stderr).toContain("original service recovered");
+    expect(actions.filter((action) => action === "bootout")).toHaveLength(1);
+    expect(actions.filter((action) => action === "bootstrap")).toHaveLength(1);
+    expect(actions.filter((action) => action === "kickstart")).toHaveLength(1);
+    expect(existsSync(harness.loaded)).toBe(true);
+    expect(readFileSync(plistPath(harness), "utf8")).toBe(originalPlist);
+    expect(readFileSync(launcherPath(harness), "utf8")).toBe(originalLauncher);
+    expect(readFileSync(join(appRoot, "dist", "bin", "node"))).toEqual(originalRuntime);
+    expect(existsSync(harness.stateAdminLog) ? readFileSync(harness.stateAdminLog, "utf8") : "").toBe(stateAdminBefore);
+    expect(existsSync(join(harness.home, ".agent-control-plane", "rollback-stage"))).toBe(false);
+  });
+
+  it("recovers a maintenance bootout that unregisters beyond the initial recovery observations", () => {
+    const harness = makeHarness();
+    expect(runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness).status).toBe(0);
+    writeExecutable(join(harness.bin, "sleep"), "#!/bin/bash\nexit 0\n");
+    harness.env["ACP_BOOTOUT_PRINT_LAG"] = "36";
+    writeFileSync(harness.launchLog, "");
+
+    const result = runInstaller(installer, ["restart"], harness);
+    const actions = subcommands(harness.launchLog);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("original service recovered");
+    expect(actions.filter((action) => action === "bootstrap")).toHaveLength(1);
+    expect(actions.filter((action) => action === "kickstart")).toHaveLength(1);
+    expect(existsSync(harness.loaded)).toBe(true);
+  });
+
+  it("waits for maintenance bootout to unregister before recovering the original service", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    writeExecutable(join(harness.bin, "sleep"), "#!/bin/bash\nexit 0\n");
+    harness.env["ACP_BOOTOUT_PRINT_LAG"] = "1000";
+    writeFileSync(harness.launchLog, "");
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+    const actions = subcommands(harness.launchLog);
+
+    expect(restarted.status).not.toBe(0);
+    expect(restarted.stderr).toContain("original service recovered");
+    expect(actions.filter((action) => action === "print").length).toBeGreaterThan(1000);
+    expect(actions.filter((action) => action === "bootstrap")).toHaveLength(1);
+    expect(actions.filter((action) => action === "kickstart")).toHaveLength(1);
+    expect(existsSync(harness.loaded)).toBe(true);
+  });
+
+  it.each(["stop", "uninstall"])("does not recover a late bootout during intentional %s", (command) => {
     const harness = makeHarness();
     const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
     expect(installed.status, installed.stderr).toBe(0);
@@ -770,11 +973,19 @@ describe("launchd deployment artifact", () => {
     harness.env["ACP_BOOTOUT_PRINT_LAG"] = "31";
     writeFileSync(harness.launchLog, "");
 
-    const restarted = runInstaller(installer, ["restart"], harness);
-
-    expect(restarted.status).not.toBe(0);
-    expect(restarted.stderr).toContain("launchd job remains loaded after bootout");
-    expect(subcommands(harness.launchLog).filter((command) => command === "print")).toHaveLength(32);
+    const result = runInstaller(installer, [command], harness);
+    const actions = subcommands(harness.launchLog);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("launchd job remains loaded after bootout");
+    expect(actions).not.toContain("bootstrap");
+    expect(actions).not.toContain("kickstart");
+    // The fake subsequently unregisters, demonstrating that this was a delayed bootout.
+    const observed = boundedSpawnSync("launchctl", ["print", `gui/${process.getuid?.() ?? 0}/${label}`], {
+      encoding: "utf8", env: harness.env,
+    });
+    expect(observed.status).not.toBe(0);
+    expect(existsSync(harness.loaded)).toBe(false);
+    expect(existsSync(plistPath(harness))).toBe(true);
   });
 
   it("renders a loadable plist with absolute paths and no secret or unresolved placeholder", () => {

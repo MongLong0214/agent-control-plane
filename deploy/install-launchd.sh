@@ -235,14 +235,19 @@ resolve_node() {
 # cloned into the runtime root itself, once per install/upgrade, and every later step — the
 # launcher this script writes and the closure a seal later copies — is bound to that in-tree copy
 # rather than the host's own PATH resolution.
-install_node_into_runtime() {
+staged_node=""
+# The stage is disposable until promotion. In particular, a bootout timeout must not leave a
+# second interpreter in the old generation, even when the service is recovered or still loaded.
+cleanup_staged_node() {
+  if [[ -n "$staged_node" ]]; then rm -f -- "$staged_node"; fi
+}
+
+stage_node_into_runtime() {
   local dest_dir="$app_root/dist/bin"
   local dest="$dest_dir/node"
   mkdir -p "$dest_dir"
-  chmod 755 "$dest_dir"
-  # Idempotent against re-running install/upgrade after this step has already bound `node_path` to
-  # `dest` on a previous run: `cp` onto its own source is undefined at best, so identity is checked
-  # by resolved path rather than assumed from where the flag pointed.
+  chmod 755 "$dest_dir" || fail "failed to secure the Node runtime directory"
+  # Idempotent when --node already names this runtime copy: never copy onto itself.
   if [[ -e "$dest" ]]; then
     local resolved_src resolved_dest
     resolved_src="$(cd -P -- "$(dirname -- "$node_path")" && pwd)/$(basename -- "$node_path")"
@@ -252,12 +257,25 @@ install_node_into_runtime() {
       return 0
     fi
   fi
-  rm -f "$dest"
-  # `-c` asks APFS for a clone (near-zero cost for a multi-hundred-megabyte interpreter); a
-  # filesystem that cannot clone still gets a real copy rather than a failure.
-  cp -c "$node_path" "$dest" 2>/dev/null || cp "$node_path" "$dest"
-  chmod 755 "$dest"
-  [[ -x "$dest" ]] || fail "failed to install the Node interpreter into the runtime closure: $dest"
+  # A same-directory stage makes promotion a same-filesystem rename; neither a failed source
+  # copy nor a late bootout may touch the old interpreter while its launcher is still live.
+  staged_node="$(mktemp "$dest_dir/.node.XXXXXXXX")" || fail "failed to stage the Node interpreter"
+  trap cleanup_staged_node EXIT
+  # `-c` asks APFS for a clone; a filesystem that cannot clone gets a regular copy.
+  if ! cp -c "$node_path" "$staged_node" 2>/dev/null &&
+     ! cp "$node_path" "$staged_node" 2>/dev/null; then
+    fail "failed to stage the Node interpreter"
+  fi
+  chmod 755 "$staged_node" || fail "failed to stage the Node interpreter"
+  [[ -f "$staged_node" && -x "$staged_node" ]] || fail "failed to stage the Node interpreter"
+}
+
+install_node_into_runtime() {
+  local dest="$app_root/dist/bin/node"
+  if [[ -n "$staged_node" ]]; then
+    mv -f -- "$staged_node" "$dest" || fail "failed to promote the Node interpreter"
+    staged_node=""
+  fi
   node_path="$dest"
 }
 
@@ -579,7 +597,17 @@ stop_job() {
       sleep 1
     done
     job_loaded || return 0
-    fail "launchd job remains loaded after bootout"
+    if [[ "${1:-}" == "maintenance" ]]; then
+      # A successful bootout request can unregister after any finite observation window. Keep
+      # the maintenance command attached until that transition occurs; exiting earlier would
+      # leave nobody responsible for restoring the original, previously loaded service.
+      printf 'agentcpd launchd installer: bootout timed out; waiting to recover the original service after unregister\n' >&2
+      while job_loaded; do sleep 1; done
+      printf 'agentcpd launchd installer: bootout completed late; attempting original service recovery\n' >&2
+      start_job
+      fail "bootout timed out; original service recovered; requested operation not completed"
+    fi
+    fail "launchd job remains loaded after bootout; recovery not attempted"
   fi
 }
 
@@ -655,14 +683,16 @@ case "$command_name" in
   install|upgrade)
     resolve_app_root
     resolve_node
-    install_node_into_runtime
     private_directory "$state_dir"
     private_directory "$deploy_backups_dir"
     keychain_required ACP_MCP_TOKEN
     keychain_required ACP_OPERATOR_TOKEN
+    stage_node_into_runtime
     snapshot_current_deployment
-    stop_job
+    stop_job maintenance
     wait_for_stop
+    # Only promote after the old service has unregistered and its lock is gone.
+    install_node_into_runtime
     write_launcher
     render_plist
     if [[ "$no_start" == "0" ]]; then start_job; fi
@@ -675,7 +705,7 @@ case "$command_name" in
     stop_job
     ;;
   restart)
-    stop_job
+    stop_job maintenance
     start_job
     ;;
   status)
@@ -767,7 +797,7 @@ case "$command_name" in
     # nobody asked for, arrived at through a failure path. So the original state is captured here
     # and restored on both the success and the compensation path.
     if job_loaded; then service_was_loaded=1; else service_was_loaded=0; fi
-    stop_job
+    if [[ "$service_was_loaded" == "1" ]]; then stop_job maintenance; else stop_job; fi
     wait_for_stop
     if ! rollback_report="$("$node_path" "$validator" rollback "${rollback_flags[@]}")"; then
       rm -rf "$state_dir/rollback-stage"
