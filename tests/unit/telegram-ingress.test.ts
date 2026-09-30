@@ -22,8 +22,9 @@ import type { TelegramUpdate } from "../../src/ingress/telegram.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { allow } from "../../src/core/errors.ts";
 import { digestOf } from "../../src/core/digest.ts";
-import { ExecutionMode, Role, RunState, roleKeyFor } from "../../src/domain/types.ts";
+import { ExecutionMode, Role, RunKind, RunState, roleKeyFor } from "../../src/domain/types.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
+import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { Daemon, OPERATOR_METHOD } from "../../src/daemon/daemon.ts";
 import {
@@ -40,6 +41,14 @@ const SECRET = "telegram-configured-secret";
 const OWNER_ID = "424242";
 const CHAT_ID = "-100999";
 let nextFakeTelegramMessageId = 1_000;
+
+const mcpTool = (server: object, name: string) => (
+  server as unknown as {
+    _registeredTools: Record<string, {
+      handler: (args: Record<string, unknown>) => Promise<{ structuredContent?: Record<string, unknown> }>;
+    }>;
+  }
+)._registeredTools[name]!.handler;
 
 const update = (text: string, over: Record<string, unknown> = {}, updateId = 100): TelegramUpdate => ({
   update_id: updateId,
@@ -465,7 +474,7 @@ describe("Telegram production ingress", () => {
     }
   });
 
-  it("does not tell the owner Hermes received a message Hermes never saw", async () => {
+  it("RF-S01: discussion stays DIRECT until an explicit creation tool request creates a PROJECT_BOOTSTRAP run", async () => {
     // The reply used to open "DIRECT acknowledged by Hermes". The default directHandler is a
     // pure function that formats a string — nothing is dispatched and Hermes is not involved.
     // Naming an actor that did not receive it is how an owner concludes a request is in
@@ -492,6 +501,47 @@ describe("Telegram production ingress", () => {
       // And it still says what did happen, so the correction does not just remove information.
       expect(reply).toContain("no run created");
       expect(harness.cp.runs.list()).toHaveLength(0);
+
+      // The creation half crosses the registered production MCP tool handler and its
+      // mutation/idempotency boundary. Calling the port directly would only prove that
+      // RunEngine stores a kind its caller already supplied.
+      const server = createHermesServer(
+        createHermesMcpPort(harness.cp),
+        () => allow(ReasonCode.OK, { actor: "hermes-daemon" }),
+      );
+      const created = await mcpTool(server, "run_create")({
+        idempotencyKey: "rf-s01-create-repository",
+        projectId: null,
+        kind: RunKind.PROJECT_BOOTSTRAP,
+        executionMode: ExecutionMode.STANDARD,
+        contract: {
+          goal: "create the requested repository",
+          why: "the user explicitly requested creation after discussion",
+          scope: ["new repository"],
+          nonGoals: [],
+          acceptance: ["a PROJECT_BOOTSTRAP run records the managed creation request"],
+          priority: "NORMAL",
+          humanGate: [],
+          references: [],
+        },
+        repositories: [],
+      });
+
+      expect(created.structuredContent).toMatchObject({
+        ok: true,
+        value: { kind: RunKind.PROJECT_BOOTSTRAP },
+      });
+      expect(harness.cp.runs.list()).toHaveLength(1);
+      const run = harness.cp.runs.list()[0]!;
+      expect(run).toMatchObject({
+        kind: RunKind.PROJECT_BOOTSTRAP,
+        executionMode: ExecutionMode.STANDARD,
+        goal: "create the requested repository",
+      });
+      expect(harness.cp.audit.byKind("RUN_CREATED").at(-1)).toMatchObject({
+        runId: run.runId,
+        evidence: { kind: RunKind.PROJECT_BOOTSTRAP },
+      });
     } finally {
       await listener.close();
     }
