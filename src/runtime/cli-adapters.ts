@@ -156,6 +156,9 @@ const DENIED_TOOLS = [
  * case, so nothing in this repository would notice if it stopped holding.
  */
 const resolveExecutable = (binary: string): string => {
+  // An explicitly empty pin names no CLI. Joining it to a PATH entry turns absence into that
+  // directory, which the doctor then misreports as a configured path that is not a regular file.
+  if (binary === "") return binary;
   if (binary.includes("/")) return resolve(binary);
   for (const directory of (process.env.PATH ?? "").split(":").filter(Boolean)) {
     const candidate = join(directory, binary);
