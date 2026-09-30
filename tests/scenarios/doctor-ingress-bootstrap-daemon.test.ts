@@ -943,6 +943,39 @@ describe("Repo Factory boundary (CP-S52)", () => {
     expect(parsed.reasonCode).toBe(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT);
   });
 
+  it("RF-S09: an unresolved template placeholder blocks bootstrap before activation state exists", async () => {
+    const harness = makeHarness();
+    const created = harness.cp.runs.create({
+      kind: RunKind.PROJECT_BOOTSTRAP,
+      executionMode: ExecutionMode.SIMPLE,
+      contract: CONTRACT,
+    });
+    if (!created.allowed) throw new Error(created.message);
+
+    const gap = "unresolved placeholder: .github/workflows/ci.yml contains {{NODE_VERSION}}";
+    const refused = await harness.cp.bootstrap.activate({
+      runId: created.value.runId,
+      factoryResult: factoryResult(harness, "placeholder-project", {
+        runId: created.value.runId,
+        unresolvedGaps: [gap],
+      }),
+      approvedManifest: fixtureManifest("placeholder-project"),
+      localBindings: [
+        { identity: "github:acme/fixture", checkoutPath: harness.repoPath, repositoryRole: "primary" },
+      ],
+      projectName: "placeholder project",
+      handoff: HANDOFF,
+    });
+
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT);
+    expect(refused.evidence["gaps"]).toEqual([gap]);
+    expect(harness.cp.projects.get("placeholder-project")).toBeNull();
+    expect(harness.cp.artifacts.latest(created.value.runId, "BOOTSTRAP_ACTIVATION_RESULT")).toBeNull();
+    expect(harness.cp.bindings.activePrimaryCto("placeholder-project")).toBeNull();
+    expect(harness.cp.runs.require(created.value.runId).state).toBe(RunState.QUEUED);
+  });
+
   it("a manifest digest that does not match the approved one is contract drift", async () => {
     const harness = makeHarness();
     const created = harness.cp.runs.create({
