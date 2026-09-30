@@ -1,13 +1,18 @@
 #!/usr/bin/env node
-import { existsSync, readFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, readSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { isAcpError } from "../core/errors.ts";
+import { systemClock } from "../core/clock.ts";
 import { SingleInstanceLock } from "../daemon/single-instance.ts";
+import { realWorkspaceProbe } from "../guard/workspace-probe.ts";
+import { ManagedWriteGuard } from "../guard/managed-write-guard.ts";
+import { ProjectRegistry } from "../registry/project-registry.ts";
+import { AuditLog } from "./audit.ts";
 import { backupDatabase, pruneAutomaticBackups, restoreDatabase } from "./backup.ts";
-import { migrateApprovedCopy } from "./database.ts";
+import { Db, migrateApprovedCopy } from "./database.ts";
 import {
   approveMigration,
   migrationApprovalPath,
@@ -18,7 +23,7 @@ import {
 } from "./migration-approval.ts";
 import { SCHEMA_VERSION } from "./migrations.ts";
 import { targetIdentityOf } from "./target-identity.ts";
-import { assertPrivatePath, ensurePrivateDirectory } from "./state-preflight.ts";
+import { assertPrivateDatabaseFiles, assertPrivatePath, databaseSidecarPaths, ensurePrivateDirectory } from "./state-preflight.ts";
 
 const readApprovalForReport = (databasePath: string): unknown => {
   try {
@@ -39,12 +44,13 @@ const readJsonIfPresent = (path: string): unknown => {
 
 const defaultDatabasePath = (): string => join(homedir(), ".agent-control-plane", "state.sqlite");
 
-const USAGE = `agentcpd-state — database backup, restore and migration approval
+const USAGE = `agentcpd-state — database backup, restore, migration approval and project suspension
 
   agentcpd-state backup [--database /absolute/state.sqlite] [--output /absolute/backup.sqlite]
   agentcpd-state restore <backup.sqlite> --confirm-restore [--database /absolute/state.sqlite]
   agentcpd-state migration-plan [--database /absolute/state.sqlite]
   agentcpd-state approve-migration --approved-by <who> --confirm-migration [--database /absolute/state.sqlite]
+  agentcpd-state suspend-project --project-id <id> --approved-by <who> --confirm-suspend [--database /absolute/state.sqlite]
 
 Backup uses SQLite's online backup API and may run while agentcpd is running.
 Restore refuses a live agentcpd lock; stop the launchd job first. It preserves the
@@ -59,6 +65,10 @@ approve-migration is the owner's decision to let that happen. It refuses a live 
 lock, takes the recovery point the approval will rest on, and writes an approval naming
 the exact chain. It approves one migration between two named versions, not migrations in
 general: after the chain runs, the approval no longer matches anything.
+
+suspend-project is an offline owner action for a registered project whose checkout is unavailable.
+It refuses a live daemon and a database at any other schema version, records the owner's name in
+the PROJECT_SUSPENDED audit row, and leaves resuming to the existing owner paths.
 
 migrate-approved-copy runs the approved chain against one disposable copy and exits. It takes
 --database-copy and has no default: the default is the one database it must never touch. It
@@ -76,6 +86,7 @@ const COMMANDS = [
   "restore",
   "migration-plan",
   "approve-migration",
+  "suspend-project",
   "migrate-approved-copy",
 ] as const;
 type Command = (typeof COMMANDS)[number];
@@ -91,6 +102,8 @@ interface Parsed {
   confirmed: boolean;
   approvedBy: string | null;
   confirmedMigration: boolean;
+  projectId: string | null;
+  confirmedSuspend: boolean;
   /** The disposable copy `migrate-approved-copy` names. Never defaulted, and never `--database`. */
   databaseCopy: string | null;
 }
@@ -104,6 +117,8 @@ const parse = (argv: string[]): Parsed => {
   let confirmed = false;
   let approvedBy: string | null = null;
   let confirmedMigration = false;
+  let projectId: string | null = null;
+  let confirmedSuspend = false;
   let databaseCopy: string | null = null;
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
@@ -117,11 +132,16 @@ const parse = (argv: string[]): Parsed => {
     } else if (token === "--approved-by") {
       approvedBy = tokens[index + 1] ?? "";
       index += 1;
+    } else if (token === "--project-id") {
+      projectId = tokens[index + 1] ?? "";
+      index += 1;
     } else if (token === "--database-copy") {
       databaseCopy = tokens[index + 1] ?? "";
       index += 1;
     } else if (token === "--confirm-migration") {
       confirmedMigration = true;
+    } else if (token === "--confirm-suspend") {
+      confirmedSuspend = true;
     } else if (token === "--confirm-restore") {
       confirmed = true;
     } else if (!token.startsWith("--") && command === "restore" && backupPath === null) {
@@ -140,6 +160,25 @@ const parse = (argv: string[]): Parsed => {
     throw new Error(
       `approve-migration requires --approved-by <who> and --confirm-migration\n\n${USAGE}`,
     );
+  }
+  if (command === "suspend-project") {
+    if (!projectId?.trim()) {
+      throw new Error(`suspend-project requires --project-id <id>\n\n${USAGE}`);
+    }
+    if (!approvedBy?.trim() || !confirmedSuspend) {
+      throw new Error(`suspend-project requires --approved-by <who> and --confirm-suspend\n\n${USAGE}`);
+    }
+    const allowed = new Set(["--database", "--project-id", "--approved-by", "--confirm-suspend"]);
+    const seen = new Set<string>();
+    for (const token of tokens) {
+      if (!token.startsWith("--")) continue;
+      if (!allowed.has(token) || seen.has(token)) {
+        throw new Error(`unknown or repeated suspend-project argument: ${token}\n\n${USAGE}`);
+      }
+      seen.add(token);
+    }
+  } else if (projectId !== null || confirmedSuspend) {
+    throw new Error(`--project-id and --confirm-suspend belong to suspend-project\n\n${USAGE}`);
   }
   if (command === "migrate-approved-copy") {
     // A closed grammar for this one command: exactly `--database-copy <path>` once and
@@ -187,6 +226,8 @@ const parse = (argv: string[]): Parsed => {
     confirmed,
     approvedBy,
     confirmedMigration,
+    projectId,
+    confirmedSuspend,
     databaseCopy,
   };
 };
@@ -205,6 +246,27 @@ const daemonIsLive = (databasePath: string): { pid: number; startedAt: string } 
     return { pid: lock.pid, startedAt: lock.startedAt };
   } catch {
     return null;
+  }
+};
+
+/** Read the main-file version without asking SQLite to materialize WAL or SHM on a refusal. */
+const offlineSchemaVersion = (databasePath: string): number => {
+  assertPrivateDatabaseFiles(databasePath);
+  // A version committed only in a WAL is not in the main header. Refuse instead of guessing or
+  // opening SQLite, which can create sidecars even in read-only mode.
+  if (databaseSidecarPaths(databasePath).some((path) => existsSync(path))) {
+    throw new Error("offline suspension requires a checkpointed database without journal sidecars");
+  }
+  const fd = openSync(databasePath, "r");
+  try {
+    const header = Buffer.alloc(100);
+    if (readSync(fd, header, 0, header.length, 0) !== header.length ||
+        !header.subarray(0, 16).equals(Buffer.from("SQLite format 3\0"))) {
+      throw new Error("offline suspension requires a valid SQLite database header");
+    }
+    return header.readUInt32BE(60);
+  } finally {
+    closeSync(fd);
   }
 };
 
@@ -259,6 +321,54 @@ export const main = async (argv: string[]): Promise<number> => {
     process.stdout.write(
       `${JSON.stringify({ approval, approvalPath: migrationApprovalPath(parsed.databasePath) }, null, 2)}\n`,
     );
+    return 0;
+  }
+
+  if (parsed.command === "suspend-project") {
+    const holder = daemonIsLive(parsed.databasePath);
+    if (holder) {
+      throw new Error(
+        `refusing to suspend a project while agentcpd pid ${holder.pid} holds the state lock (started ${holder.startedAt})`,
+      );
+    }
+    // The VFS does not provide locking. Hold the daemon's lease before a version read or Db
+    // open, and keep it until the registry write, audit append and handle close have completed.
+    const lock = new SingleInstanceLock(join(dirname(parsed.databasePath), "agentcpd.lock"));
+    const acquired = lock.acquire(systemClock.nowIso());
+    if (!acquired.allowed) {
+      throw new Error(`refusing to suspend a project while another process holds the state lock: ${acquired.message}`);
+    }
+    try {
+      const version = offlineSchemaVersion(parsed.databasePath);
+      if (version !== SCHEMA_VERSION) {
+        throw new Error(`refusing to suspend a project: database schema version ${version} differs from build ${SCHEMA_VERSION}`);
+      }
+      const db = new Db(parsed.databasePath, { migrationLock: lock });
+      try {
+        const audit = new AuditLog(db, systemClock);
+        const guard = new ManagedWriteGuard(db, realWorkspaceProbe, audit, systemClock);
+        const projects = new ProjectRegistry(db, systemClock, audit, guard);
+        db.tx(() => {
+          if (!projects.get(parsed.projectId!)) {
+            throw new Error(`unknown project id: ${parsed.projectId}`);
+          }
+          const result = projects.setSuspended(parsed.projectId!, true, true, {
+            approvedBy: parsed.approvedBy!.trim(),
+            source: "agentcpd-state",
+          });
+          if (!result.allowed) throw new Error(result.message);
+        });
+      } finally {
+        db.close();
+      }
+    } finally {
+      lock.release();
+    }
+    process.stdout.write(`${JSON.stringify({
+      projectId: parsed.projectId,
+      suspended: true,
+      approvedBy: parsed.approvedBy!.trim(),
+    })}\n`);
     return 0;
   }
 

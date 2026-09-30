@@ -241,7 +241,12 @@ export class ProjectRegistry {
     });
   }
 
-  setSuspended(projectId: string, suspended: boolean, ownerApproved: boolean): Decision<void> {
+  setSuspended(
+    projectId: string,
+    suspended: boolean,
+    ownerApproved: boolean,
+    approval?: { approvedBy: string; source: "agentcpd-state" },
+  ): Decision<void> {
     if (suspended && !ownerApproved) {
       // §10.4 — a capacity-driven project suspend is an owner gate, not a CEO call.
       return deny(
@@ -257,7 +262,7 @@ export class ProjectRegistry {
     this.audit.record({
       kind: suspended ? "PROJECT_SUSPENDED" : "PROJECT_RESUMED",
       projectId,
-      evidence: { ownerApproved },
+      evidence: { ownerApproved, ...approval },
     });
     return allow(ReasonCode.OK, undefined);
   }

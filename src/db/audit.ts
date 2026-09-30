@@ -172,7 +172,7 @@ const MAX_STRING = 2000;
 const AUDIT_EVIDENCE_KEYS: ReadonlySet<string> = new Set([
   "ackGeneration", "action", "activationGrantDigest", "activeManifestDigest", "activeRuns",
   "activeSession", "address", "allowed", "approved", "at", "attempt", "attemptedStatus",
-  "availability", "backoffSeconds", "bindingRemoved", "blocking", "blocksCriticalPath", "branch",
+  "approvedBy", "availability", "backoffSeconds", "bindingRemoved", "blocking", "blocksCriticalPath", "branch",
   "candidateSnapshotDigest", "changes", "channel", "checkRunId", "checkoutPath", "chunked", "clean", "code",
   "claimId", "claimedClassification", "conclusion", "contractDigest", "conversation", "coveredFiles",
   "creator", "creatorIdentity", "currentGeneration", "currentSession", "decision", "deferred",
