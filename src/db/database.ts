@@ -5,6 +5,12 @@ import { dirname, join } from "node:path";
 
 import { acpError, fail, isAcpError, type Decision } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import {
+  isIngressClaimAuthority,
+  isIngressDeleteAuthority,
+  type IngressClaimAuthority,
+  type IngressDeleteAuthority,
+} from "../ingress/ingress-guard.ts";
 import { SingleInstanceLock } from "../daemon/single-instance.ts";
 import {
   DEFAULT_BACKUP_RETENTION,
@@ -264,6 +270,8 @@ export class Db {
    * part of that claim a trigger can check.
    */
   #turnMaterializationMarkers: Array<{ turnRequestId: string }> = [];
+  #ingressClaimMarkers: Array<{ channel: string; nonce: string; claimJson: string }> = [];
+  #ingressDeleteMarkers: Array<{ channel: string }> = [];
 
   /**
    * The file this connection opened. Capability issuance is keyed by it: two `Db` objects
@@ -368,6 +376,14 @@ export class Db {
     this.#raw.function("acp_turn_materialization_authorized", (turnRequestId: unknown) => {
       const marker = this.#turnMaterializationMarkers[this.#turnMaterializationMarkers.length - 1];
       return marker && marker.turnRequestId === turnRequestId ? 1 : 0;
+    });
+    this.#raw.function("acp_ingress_claim_authorized", (channel: unknown, nonce: unknown, claimJson: unknown) => {
+      const marker = this.#ingressClaimMarkers[this.#ingressClaimMarkers.length - 1];
+      return marker && marker.channel === channel && marker.nonce === nonce && marker.claimJson === claimJson ? 1 : 0;
+    });
+    this.#raw.function("acp_ingress_delete_authorized", (channel: unknown) => {
+      const marker = this.#ingressDeleteMarkers[this.#ingressDeleteMarkers.length - 1];
+      return marker?.channel === channel ? 1 : 0;
     });
     this.#raw.function("acp_schema_migration_authorized", () =>
       this.#schemaMigrationMarkerDepth > 0 ? 1 : 0,
@@ -924,6 +940,27 @@ export class Db {
     }
   }
 
+  /** The ingress guard mints a token for one validated row and the exact claim bytes. */
+  withIngressClaim<T>(authority: IngressClaimAuthority, channel: string, nonce: string, claimJson: string, write: () => T): T {
+    if (!isIngressClaimAuthority(authority, this, channel, nonce, claimJson)) {
+      fail(ReasonCode.COMPLETION_AUTHORITY_DENIED, "INGRESS_OVERRIDE_CLAIM_AUTHORITY_DENIED", {});
+    }
+    if (!this.#raw.inTransaction) {
+      fail(ReasonCode.COMPLETION_AUTHORITY_DENIED, "ingress claim marker requires an atomic claim transaction", {});
+    }
+    this.#ingressClaimMarkers.push({ channel, nonce, claimJson });
+    try { return write(); } finally { this.#ingressClaimMarkers.pop(); }
+  }
+
+  /** The ingress guard alone may remove expired or superseded replay evidence. */
+  withIngressDelete<T>(authority: IngressDeleteAuthority, channel: string, write: () => T): T {
+    if (!isIngressDeleteAuthority(authority, this, channel)) {
+      fail(ReasonCode.COMPLETION_AUTHORITY_DENIED, "INGRESS_MESSAGE_DELETE_AUTHORITY_DENIED", {});
+    }
+    this.#ingressDeleteMarkers.push({ channel });
+    try { return write(); } finally { this.#ingressDeleteMarkers.pop(); }
+  }
+
   applyRunStateTransition<T>(
     authority: RunStateTransitionAuthority,
     work: RunStateTransitionWork<T>,
@@ -1151,6 +1188,9 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   // already holds them, not an internal fault.
   INBOUND_PAYLOAD_IMMUTABLE: ReasonCode.CONFLICT,
   INBOUND_MESSAGE_NO_REPLACE: ReasonCode.CONFLICT,
+  INGRESS_MESSAGE_DELETE_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
+  INBOUND_OVERRIDE_AUTHORITY_IMMUTABLE: ReasonCode.CONFLICT,
+  INGRESS_OVERRIDE_CLAIM_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
   INBOUND_TURN_CLAIM_IDENTITY_IMMUTABLE: ReasonCode.CONFLICT,
   // The canonical-turn ledger, which had no entries here at all: every one of its denials came
   // out of `db.tx` as a raw Error rather than as a typed refusal, so a claim whose source insert
@@ -1164,6 +1204,9 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   CANONICAL_TURN_SETTLEMENT_PROVENANCE_IMMUTABLE: ReasonCode.CONFLICT,
   CANONICAL_TURN_NO_DELETE: ReasonCode.CONFLICT,
   CANONICAL_TURN_NO_REPLACE: ReasonCode.CONFLICT,
+  CANONICAL_TURN_OVERRIDE_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
+  CANONICAL_TURN_OVERRIDE_INVALID: ReasonCode.CONFLICT,
+  CANONICAL_TURN_OVERRIDE_IMMUTABLE: ReasonCode.CONFLICT,
   CANONICAL_TURN_MATERIALIZATION_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
   CANONICAL_TURN_OBSERVATION_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
   CANONICAL_TURN_DISPATCH_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,

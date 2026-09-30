@@ -39,6 +39,10 @@ const V11_SCHEMA = readFileSync(
   fileURLToPath(new URL("../fixtures/schema-v11.sql", import.meta.url)),
   "utf8",
 );
+const V37_SCHEMA = readFileSync(
+  fileURLToPath(new URL("../../src/db/schema-v37.sql", import.meta.url)),
+  "utf8",
+);
 
 /** Explicit v13/v14 shape additions used to build a real v14 file without current schema.sql. */
 const V14_FIXTURE_SHAPE = `
@@ -444,6 +448,12 @@ const asV34Fixture = (path: string, options: { unresolvedTurn?: boolean } = {}):
     raw.exec(`
       DROP TRIGGER IF EXISTS inbound_messages_payload_immutable;
       DROP TRIGGER IF EXISTS inbound_messages_no_replace;
+      DROP TRIGGER IF EXISTS inbound_messages_override_authority_immutable;
+      DROP TRIGGER IF EXISTS inbound_messages_override_claim_authority;
+      DROP TRIGGER IF EXISTS inbound_messages_override_insert_authority;
+      DROP TRIGGER IF EXISTS inbound_messages_delete_authority;
+      DROP TRIGGER IF EXISTS inbound_claim_authority_markers_insert_guard;
+      DROP TABLE IF EXISTS inbound_claim_authority_markers;
     `);
     const present = raw
       .prepare("SELECT 1 AS present FROM pragma_table_info('inbound_messages') WHERE name = 'payload_json'")
@@ -603,8 +613,19 @@ const asV35IngressClaimFixture = (
 
   const raw = new Database(path);
   try {
-    // v36 owns this guard. A current-schema file wound back to v35 must not receive it early.
-    raw.exec("DROP TRIGGER IF EXISTS inbound_messages_turn_claim_identity_immutable");
+    // v36/v38 guards are absent from the historical image before its seed is replayed.
+    raw.exec(`
+      DROP TRIGGER IF EXISTS inbound_messages_turn_claim_identity_immutable;
+      DROP TRIGGER IF EXISTS inbound_messages_override_authority_immutable;
+      DROP TRIGGER IF EXISTS inbound_messages_override_claim_authority;
+      DROP TRIGGER IF EXISTS inbound_messages_override_insert_authority;
+      DROP TRIGGER IF EXISTS inbound_messages_delete_authority;
+      DROP TRIGGER IF EXISTS inbound_claim_authority_markers_insert_guard;
+      DROP TRIGGER IF EXISTS canonical_turns_override_write_authority;
+      DROP TRIGGER IF EXISTS canonical_turns_override_claim_guard;
+      DROP TRIGGER IF EXISTS canonical_turns_override_identity_immutable;
+      DROP TABLE IF EXISTS inbound_claim_authority_markers;
+    `);
     raw.function("acp_schema_migration_authorized", () => 1);
     raw.exec("DROP TRIGGER schema_migrations_immutable; DROP TRIGGER schema_migrations_no_delete;");
     raw.exec("DELETE FROM schema_migrations");
@@ -648,12 +669,12 @@ const asV35IngressClaimFixture = (
   } finally {
     raw.close();
     asPrivateStateFile(path);
-    // #747 — a v35 file is a pre-current deployed database, and opening it migrates. The owner
-    // approval that authorises v35→v36 is explicit here for the same reason it is on every
-    // other pre-current fixture: without it these cases would measure the approval gate rather
-    // than the backfill they are about.
-    approveMigration(path, "database-migration-restore fixture");
   }
+  // #747 — a v35 file is a pre-current deployed database, and opening it migrates. The owner
+  // approval that authorises v35→v36 is explicit here for the same reason it is on every
+  // other pre-current fixture: without it these cases would measure the approval gate rather
+  // than the backfill they are about.
+  approveMigration(path, "database-migration-restore fixture");
 };
 
 const fileSha256 = (path: string): string =>
@@ -735,6 +756,7 @@ describe("versioned SQLite migration", () => {
     // translated error surface or a connection-local marker. The legitimate lifecycle write is
     // deliberately the same json_set form production uses.
     const raw = new Database(path);
+    raw.function("acp_ingress_claim_authorized", { varargs: true }, () => 0);
     try {
       expect(() => raw.prepare(
         `UPDATE inbound_messages
@@ -1049,6 +1071,11 @@ describe("versioned SQLite migration", () => {
           .prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'trigger' AND name = 'sessions_workdir_immutable'")
           .get() as { n: number }).n,
       ).toBe(0);
+      expect(before.prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'trigger'
+          AND name IN ('inbound_messages_delete_authority', 'inbound_messages_override_insert_authority')
+          ORDER BY name`,
+      ).all()).toEqual([]);
       expect(
         before.prepare(
           `SELECT name FROM sqlite_master
@@ -1072,6 +1099,14 @@ describe("versioned SQLite migration", () => {
       // passes in both cases, and these do not.
       expect(SCHEMA_VERSION).toBe(Math.max(...MIGRATIONS.map((m) => m.toVersion)));
       expect(MIGRATIONS.map((m) => m.fromVersion)).toEqual(MIGRATIONS.map((m) => m.toVersion - 1));
+      expect(migrated.all<{ name: string }>(
+        `SELECT name FROM sqlite_master WHERE type = 'trigger'
+          AND name IN ('inbound_messages_delete_authority', 'inbound_messages_override_insert_authority')
+          ORDER BY name`,
+      )).toEqual([
+        { name: "inbound_messages_delete_authority" },
+        { name: "inbound_messages_override_insert_authority" },
+      ]);
       assertEmptyActorRegistry(migrated);
       migrated.run(
         `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, workdir, created_at, updated_at)
@@ -1099,6 +1134,59 @@ describe("versioned SQLite migration", () => {
     raw.exec("DROP TRIGGER sessions_workdir_immutable");
     raw.close();
     expect(() => new Db(path)).toThrowError(/missing a load-bearing schema invariant/);
+  });
+
+  it("keeps the v37 historical replay definitions and receipt checksum at the frozen epoch", () => {
+    const path = join(tempDir("acp-v11-v37-history-"), "state.sqlite");
+    asV11Fixture(path);
+    const names = [
+      "canonical_turns",
+      "canonical_turns_no_replace",
+      "canonical_turns_one_unresolved",
+    ];
+    const expected = new Database(":memory:");
+    const trace: Array<{ version: number; checksum: string; objects: Array<{ type: string; name: string; sql: string }> }> = [];
+    const historicalObjects = (raw: Database.Database): Array<{ type: string; name: string; sql: string }> =>
+      (raw.prepare(
+        `SELECT type, name, sql FROM sqlite_master
+          WHERE name IN (${names.map(() => "?").join(", ")}) ORDER BY type, name`,
+      ).all(...names) as Array<{ type: string; name: string; sql: string }>).map((object) => ({
+        ...object,
+        sql: object.sql.replace(/^CREATE TABLE "canonical_turns"/, "CREATE TABLE canonical_turns"),
+      }));
+    try {
+      expected.exec(V37_SCHEMA);
+      const expectedObjects = historicalObjects(expected);
+      const migrated = new Db(path, {
+        afterMigration: (migration) => {
+          if (migration.toVersion < 26 || migration.toVersion > 37) return;
+          const historical = new Database(path, { readonly: true, fileMustExist: true });
+          try {
+            trace.push({
+              version: migration.toVersion,
+              checksum: (historical.prepare(
+                "SELECT checksum FROM schema_migrations WHERE version = ?",
+              ).get(migration.toVersion) as { checksum: string }).checksum,
+              objects: historicalObjects(historical),
+            });
+          } finally {
+            historical.close();
+          }
+        },
+      });
+      try {
+        expect(trace).toHaveLength(12);
+        const v37 = trace.at(-1);
+        expect(v37).toMatchObject({ version: 37, objects: expectedObjects });
+        expect(v37?.checksum).toBe(
+          `sha256:${createHash("sha256").update(`v37-seed-claude-cli-executor-kind\n${V37_SCHEMA}`).digest("hex")}`,
+        );
+      } finally {
+        migrated.close();
+      }
+    } finally {
+      expected.close();
+    }
   });
 
   it("migrates a v11 fixture in order, records its backup receipt, and re-establishes load-bearing guards", async () => {
@@ -1146,7 +1234,8 @@ describe("versioned SQLite migration", () => {
         [34, "v34-persist-hermes-target-bind-receipt-evidence"],
         [35, "v35-keep-the-admitted-payload-with-its-inbound-row"],
         [36, "v36-backfill-ingress-receipt-identities-before-freezing-claims"],
-        [SCHEMA_VERSION, "v37-seed-claude-cli-executor-kind"],
+        [37, "v37-seed-claude-cli-executor-kind"],
+        [SCHEMA_VERSION, "v38-canonical-verified-target-override"],
       ]);
       // Stated as properties rather than one `objectContaining` per version. The list above
       // already pins the exact order and ids; this block only ever said "every receipt carries a

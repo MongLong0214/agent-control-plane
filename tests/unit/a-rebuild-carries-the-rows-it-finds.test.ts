@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -35,7 +36,9 @@ const V27_CANONICAL_TURNS_CHECK =
 
 /** The table as v27 defined it: the same shape, without the authority v28 admits. */
 const previousShape = (): string => {
-  const current = /CREATE TABLE IF NOT EXISTS canonical_turns \([\s\S]*?\n\);/.exec(schemaDdl());
+  const current = /CREATE TABLE IF NOT EXISTS canonical_turns \([\s\S]*?\n\);/.exec(
+    readFileSync(new URL("../../src/db/schema-v37.sql", import.meta.url), "utf8"),
+  );
   if (current === null) throw new Error("canonical_turns is not in schema.sql");
   return current[0].replace(
     V27_CANONICAL_TURNS_CHECK,

@@ -144,7 +144,7 @@ describe("#858 the router hands a claimed turn to the canonical ledger", () => {
     );
   });
 
-  it("keeps the ingress claim and owner outcome when additive canonical materialization refuses", async () => {
+  it("rolls back the owner batch and never dispatches when the verified target has an unresolved canonical turn", async () => {
     const baselineHarness = makeHarness();
     let baselineExecutions = 0;
     const baseline = buildRouter(
@@ -168,9 +168,12 @@ describe("#858 the router hands a claimed turn to the canonical ledger", () => {
     const handedSources: OwnerBatchCanonicalClaim["sources"][] = [];
     const refusing = buildRouter(
       harness,
-      ({ sources }) => {
+      ({ target, sources, prompt }) => {
         handedSources.push(sources);
-        return deny(ReasonCode.CONVERSATION_TARGET_UNVERIFIED, "no verified target", {});
+        const claimed = harness.cp.conversation.claim({ targetActorId: target.targetActorId, prompt, sources });
+        return claimed.allowed
+          ? allow(ReasonCode.OK, undefined)
+          : deny(claimed.reasonCode, claimed.message, claimed.evidence);
       },
       () => {
         executions += 1;
@@ -178,12 +181,26 @@ describe("#858 the router hands a claimed turn to the canonical ledger", () => {
       },
       targetForClaim,
     );
+    const incumbent = update(8581, "incumbent");
+    expect(refusing.ingress.admit(incumbent, SECRET).allowed).toBe(true);
+    const incumbentPayload = JSON.parse(harness.cp.db.get<{ payload_json: string }>(
+      `SELECT payload_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'update:8581'`,
+    )!.payload_json) as unknown;
+    const first = harness.cp.conversation.claim({
+      targetActorId: targetForClaim(refusing.ingress.turnIdentityFor(incumbent, "incumbent", null, null)).targetActorId,
+      prompt: "incumbent",
+      sources: [{ channel: "telegram", nonce: "update:8581", attempt: 1, payload: incumbentPayload }],
+    });
+    expect(first.allowed).toBe(true);
     const refusingParked = update(8582, "first");
     expect(refusing.ingress.admit(refusingParked, SECRET).allowed).toBe(true);
     refusing.guard.parkForBatch(
       refusing.ingress.nonceFor(refusingParked),
       refusing.ingress.turnIdentityFor(refusingParked, "first", null, null).sessionDigest,
     );
+    const parkedBefore = harness.cp.db.get<{ result_json: string }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'update:8582'`,
+    )!.result_json;
 
     const baselineOutcome = await baseline.router.route(update(8583, "second"), SECRET);
     const refusedOutcome = await refusing.router.route(update(8583, "second"), SECRET);
@@ -193,15 +210,101 @@ describe("#858 the router hands a claimed turn to the canonical ledger", () => {
       { nonce: "update:8582", payload: expect.objectContaining({ text: "first", messageId: 8582 }) },
       { nonce: "update:8583", payload: expect.objectContaining({ text: "second", messageId: 8583 }) },
     ]);
-    expect(executions).toBe(1);
     expect(baselineExecutions).toBe(1);
-    expect(refusedOutcome).toEqual(baselineOutcome);
-    expect(harness.cp.db.get<{ count: number }>(
-      `SELECT COUNT(*) AS count FROM inbound_messages WHERE turn_claim_json IS NOT NULL`,
-    )?.count).toBe(2);
+    expect(baselineOutcome.reasonCode).toBe(ReasonCode.OK);
+    expect(executions).toBe(0);
+    expect(refusedOutcome.reasonCode).toBe(ReasonCode.CONVERSATION_TURN_IN_DOUBT);
+    expect(harness.cp.db.all<{ nonce: string }>(
+      `SELECT nonce FROM inbound_messages WHERE turn_claim_json IS NOT NULL`,
+    )).toEqual([]);
+    expect(harness.cp.db.get<{ turn_claim_json: string | null; result_json: string }>(
+      `SELECT turn_claim_json, result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'update:8582'`,
+    )).toEqual({ turn_claim_json: null, result_json: parkedBefore });
+    expect(harness.cp.db.get<{ turn_claim_json: string | null }>(
+      `SELECT turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'update:8583'`,
+    )?.turn_claim_json).toBeNull();
     expect(harness.cp.db.get<{ count: number }>(
       `SELECT COUNT(*) AS count FROM canonical_turns`,
-    )?.count).toBe(0);
+    )?.count).toBe(1);
+  });
+
+  it("claims a second auditable canonical turn for a verified-target /again without replaying the incumbent", async () => {
+    const harness = makeHarness();
+    const targetForClaim = canonicalTarget(harness, "again");
+    let executions = 0;
+    const { guard, ingress, router } = buildRouter(
+      harness,
+      ({ target, prompt, sources, overriddenUnresolvedNonces }) => {
+        const incumbent = overriddenUnresolvedNonces?.length
+          ? harness.cp.db.get<{ turn_request_id: string }>(
+            `SELECT turn_request_id FROM canonical_turn_sources
+             WHERE source_channel = 'telegram' AND source_nonce = ?`,
+            [overriddenUnresolvedNonces[0]],
+          )?.turn_request_id
+          : undefined;
+        const claimed = harness.cp.conversation.claim({
+          targetActorId: target.targetActorId, prompt, sources,
+          ...(incumbent ? { overrideIncumbentTurnRequestId: incumbent } : {}),
+        });
+        return claimed.allowed
+          ? allow(ReasonCode.OK, undefined)
+          : deny(claimed.reasonCode, claimed.message, claimed.evidence);
+      },
+      () => {
+        executions += 1;
+        return "owner handled";
+      },
+      targetForClaim,
+    );
+    const incumbent = update(8585, "first");
+    expect(ingress.admit(incumbent, SECRET).allowed).toBe(true);
+    const identity = ingress.turnIdentityFor(incumbent, "first", null, null);
+    const sourcePayload = JSON.parse(harness.cp.db.get<{ payload_json: string }>(
+      `SELECT payload_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'update:8585'`,
+    )!.payload_json) as unknown;
+    const first = harness.cp.conversation.claim({
+      targetActorId: targetForClaim(identity).targetActorId,
+      prompt: "first",
+      sources: [{ channel: "telegram", nonce: "update:8585", attempt: 1, payload: sourcePayload }],
+    });
+    if (!first.allowed) throw new Error(`incumbent canonical claim failed: ${first.reasonCode}`);
+    expect(guard.claimTurn("telegram", "update:8585", identity).allowed).toBe(true);
+
+    const second = await router.route(update(8586, "/again second"), SECRET);
+    expect(second.reasonCode).toBe(ReasonCode.OK);
+    expect(executions).toBe(1);
+    const turns = harness.cp.db.all<{ turn_request_id: string; lifecycle_state: string; claim_audit_event_id: number }>(
+      `SELECT turn_request_id, lifecycle_state, claim_audit_event_id FROM canonical_turns ORDER BY rowid`,
+    );
+    expect(turns).toHaveLength(2);
+    expect(turns.map((turn) => turn.lifecycle_state)).toEqual(["IN_DOUBT", "IN_DOUBT"]);
+    expect(turns[0]!.turn_request_id).toBe(first.value.turnRequestId);
+    expect(turns[1]!.turn_request_id).not.toBe(turns[0]!.turn_request_id);
+    const sources = harness.cp.db.all<{ turn_request_id: string; source_nonce: string }>(
+      `SELECT turn_request_id, source_nonce FROM canonical_turn_sources ORDER BY rowid`,
+    );
+    expect(sources).toEqual([
+      { turn_request_id: turns[0]!.turn_request_id, source_nonce: "update:8585" },
+      { turn_request_id: turns[1]!.turn_request_id, source_nonce: "update:8586" },
+    ]);
+    const claim = JSON.parse(harness.cp.db.get<{ turn_claim_json: string }>(
+      `SELECT turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'update:8586'`,
+    )!.turn_claim_json) as { overriddenUnresolvedNonces?: string[]; canonicalTarget?: { targetActorId: string } };
+    expect(claim.overriddenUnresolvedNonces).toEqual(["update:8585"]);
+    expect(claim.canonicalTarget?.targetActorId).toBe(targetForClaim(identity).targetActorId);
+    const audit = harness.cp.db.get<{ evidence_json: string }>(
+      `SELECT evidence_json FROM audit_events WHERE event_id = ?`,
+      [turns[1]!.claim_audit_event_id],
+    );
+    expect(JSON.parse(audit!.evidence_json)).toEqual(expect.objectContaining({
+      turnRequestId: turns[1]!.turn_request_id,
+      overrideIncumbentTurnRequestId: turns[0]!.turn_request_id,
+      ingressOverride: expect.objectContaining({
+        channel: "telegram",
+        nonce: "update:8586",
+        overriddenUnresolvedNonces: ["update:8585"],
+      }),
+    }));
   });
 
   it("publishes every consumed nonce to the canonical ledger in arrival order", async () => {
@@ -237,5 +340,39 @@ describe("#858 the router hands a claimed turn to the canonical ledger", () => {
     );
     expect(canonicalSources.map((source) => source.source_nonce)).toEqual(ingressClaim.batchConsumedNonces);
     expect(canonicalSources.map((source) => source.batch_ordinal)).toEqual([0, 1]);
+  });
+
+  it.each(["omitted", "reordered"] as const)("refuses an %s durable override batch", async (shape) => {
+    const harness = makeHarness();
+    const targetForClaim = canonicalTarget(harness, `batch-${shape}`);
+    let captured: (OwnerBatchCanonicalClaim & { prompt: string }) | undefined;
+    const { guard, ingress, router } = buildRouter(harness, (input) => {
+      captured = input;
+      return allow(ReasonCode.OK, undefined);
+    }, undefined, targetForClaim);
+    const incumbent = update(8590, "first");
+    expect(ingress.admit(incumbent, SECRET).allowed).toBe(true);
+    const identity = ingress.turnIdentityFor(incumbent, "first", null, null);
+    expect(guard.claimTurn("telegram", "update:8590", identity).allowed).toBe(true);
+    const first = harness.cp.conversation.claim({
+      targetActorId: targetForClaim(identity).targetActorId, prompt: "first",
+      sources: [{ channel: "telegram", nonce: "update:8590", attempt: 1,
+        payload: ingress.admittedPayloadFor(incumbent) }],
+    });
+    if (!first.allowed) throw new Error(`incumbent refused: ${first.reasonCode}`);
+    const parked = update(8591, "/again parked");
+    expect(ingress.admit(parked, SECRET).allowed).toBe(true);
+    guard.parkForBatch(ingress.nonceFor(parked), ingress.turnIdentityFor(parked, "parked", null, null).sessionDigest);
+    await router.route(update(8592, "/again current"), SECRET);
+    if (!captured) throw new Error("the real router did not claim its batch");
+    expect(captured.sources.map((item) => item.nonce)).toEqual(["update:8591", "update:8592"]);
+    const sources = shape === "omitted" ? [captured.sources[1]!] : [...captured.sources].reverse();
+    const request = { targetActorId: captured.target.targetActorId, prompt: captured.prompt,
+      overrideIncumbentTurnRequestId: first.value.turnRequestId };
+    const forged = harness.cp.conversation.claim({ ...request, sources });
+    expect(forged.allowed).toBe(false);
+    expect(forged.reasonCode).toBe(ReasonCode.CONVERSATION_TURN_IN_DOUBT);
+    expect(harness.cp.db.all(`SELECT turn_request_id FROM canonical_turns`)).toHaveLength(1);
+    expect(harness.cp.conversation.claim({ ...request, sources: captured.sources }).allowed).toBe(true);
   });
 });

@@ -658,9 +658,17 @@ describe("round-2 run and production-gate regressions", () => {
     expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId).satisfied).toBe(true);
     expect(fixture.harness.cp.audit.byKind("OWNER_APPROVAL_CONSUMED")).toHaveLength(1);
 
-    // Exactly what the TTL prune does: drop the replay row for this receipt's nonce. The
-    // durable consumption event stays, because that is the record of what the owner decided.
-    fixture.harness.cp.db.run("DELETE FROM inbound_messages");
+    // A later admission drives the real TTL prune. The durable consumption event stays.
+    fixture.harness.clock.advance(24 * 60 * 60 * 1000 + 1);
+    const guard = new IngressGuard(fixture.harness.cp.db, fixture.harness.cp.clock, fixture.harness.cp.audit, {
+      cli: { allowedActors: [TEST_OWNER.actor] },
+    });
+    expect(guard.admit({ channel: "cli", actor: TEST_OWNER.actor, nonce: "after-approval-window", payload: null }).allowed)
+      .toBe(true);
+    expect(fixture.harness.cp.db.get(
+      "SELECT 1 FROM inbound_messages WHERE channel = ? AND nonce = ?",
+      [receipt.channel, receipt.inboundNonce],
+    )).toBeUndefined();
 
     expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId).satisfied).toBe(true);
     expect(fixture.harness.cp.ceo.currentHumanGateDecisionDigest(fixture.runId).allowed).toBe(true);

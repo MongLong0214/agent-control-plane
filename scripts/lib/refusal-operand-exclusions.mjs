@@ -114,7 +114,6 @@ export const FILE_EXCLUSIONS = new Map([
   ["src/mcp/ceo-conversation.ts", reason],
   ["src/mcp/cto-server.ts", reason],
   ["src/mcp/hermes-server.ts", reason],
-  ["src/mcp/shared.ts", reason],
   ["src/outbox/outbox.ts", reason],
   ["src/registry/project-registry.ts", reason],
   ["src/registry/repository-registry.ts", reason],

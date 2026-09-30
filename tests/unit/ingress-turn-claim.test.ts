@@ -103,6 +103,92 @@ describe("taking the right to run a message's handler", () => {
   });
 });
 
+describe("the private SQLite authorization for a first ingress claim", () => {
+  type ScopeMismatch = "marker" | "channel" | "nonce" | "claimJson";
+
+  /**
+   * The production path owns the marker: the spy only observes the native UDF while
+   * `IngressGuard.claimTurn` has delegated to its original `Db.run` call.  This keeps the
+   * positive case on the actual transaction and trigger rather than manufacturing authority in
+   * the test.
+   */
+  const observeScopedAuthorization = (mismatch: ScopeMismatch): void => {
+    const harness = makeHarness();
+    const guard = guardFor(harness);
+    const nonce = `scope-${mismatch}`;
+    expect(admitOne(guard, nonce).allowed).toBe(true);
+
+    // A caller can invoke the function, but without the private marker it is never authority.
+    expect(harness.cp.db.get<{ allowed: number }>(
+      "SELECT acp_ingress_claim_authorized(?, ?, ?) AS allowed",
+      ["telegram", nonce, "outside-marker-scope"],
+    )?.allowed).toBe(0);
+
+    // The same first-claim SQL is denied by the real trigger before the legitimate claim below.
+    expect(() => harness.cp.db.run(
+      `UPDATE inbound_messages SET turn_claim_json = ?
+        WHERE channel = ? AND nonce = ? AND turn_claim_json IS NULL`,
+      [JSON.stringify({ turnRequestId: "forged", overriddenUnresolvedNonces: ["forged"] }), "telegram", nonce],
+    )).toThrow(/INGRESS_OVERRIDE_CLAIM_AUTHORITY_DENIED/);
+
+    const originalRun = harness.cp.db.run.bind(harness.cp.db);
+    let observed: { exact: number; mismatch: number } | undefined;
+    harness.cp.db.run = (sql: string, params: unknown[] = []) => {
+      if (sql.includes("UPDATE inbound_messages SET turn_claim_json = ?")) {
+        const [claimJson, channel, claimedNonce] = params;
+        if (typeof claimJson !== "string" || typeof channel !== "string" || typeof claimedNonce !== "string") {
+          throw new Error("the production first-claim SQL did not carry its scoped tuple");
+        }
+        const authorization = (candidateChannel: string, candidateNonce: string, candidateClaimJson: string): number =>
+          harness.cp.db.get<{ allowed: number }>(
+            "SELECT acp_ingress_claim_authorized(?, ?, ?) AS allowed",
+            [candidateChannel, candidateNonce, candidateClaimJson],
+          )?.allowed ?? -1;
+        const mismatchTuple =
+          mismatch === "channel" ? ["other-channel", claimedNonce, claimJson] as const
+            : mismatch === "nonce" ? [channel, "other-nonce", claimJson] as const
+              : mismatch === "claimJson" ? [channel, claimedNonce, `${claimJson} `] as const
+                : [channel, claimedNonce, claimJson] as const;
+        observed = {
+          exact: authorization(channel, claimedNonce, claimJson),
+          mismatch: mismatch === "marker" ? 0 : authorization(...mismatchTuple),
+        };
+      }
+      return originalRun(sql, params);
+    };
+    try {
+      expect(guard.claimTurn("telegram", nonce, {
+        ...identity(`turn-${mismatch}`),
+        overriddenUnresolvedNonces: ["unresolved-before-this-claim"],
+      }).allowed).toBe(true);
+    } finally {
+      harness.cp.db.run = originalRun;
+    }
+
+    expect(observed).toEqual({ exact: 1, mismatch: 0 });
+    expect(harness.cp.db.get<{ turn_claim_json: string | null }>(
+      "SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?",
+      ["telegram", nonce],
+    )?.turn_claim_json).toContain(`turn-${mismatch}`);
+  };
+
+  it("requires an active marker before SQLite authorizes a first ingress claim", () => {
+    observeScopedAuthorization("marker");
+  });
+
+  it("binds SQLite first-claim authorization to its channel", () => {
+    observeScopedAuthorization("channel");
+  });
+
+  it("binds SQLite first-claim authorization to its nonce", () => {
+    observeScopedAuthorization("nonce");
+  });
+
+  it("binds SQLite first-claim authorization to its exact claim JSON", () => {
+    observeScopedAuthorization("claimJson");
+  });
+});
+
 describe("what the claim carries", () => {
   /**
    * The identity is written in the same statement as the claim. Nothing reads it yet — the reply

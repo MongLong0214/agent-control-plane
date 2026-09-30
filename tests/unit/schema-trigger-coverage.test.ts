@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { Db } from "../../src/db/database.ts";
-import { LEDGER_TRIGGER_NAMES } from "../../src/db/migrations.ts";
+import { LEDGER_TRIGGER_NAMES, V38_LEDGER_TRIGGER_NAMES } from "../../src/db/migrations.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -50,7 +50,8 @@ describe("every schema trigger is load-bearing and checked", () => {
     const ledgerTriggers = triggersInSchema.filter(
       (name) => name.startsWith("canonical_turn") || name.startsWith("actor_target"),
     );
-    const listed = new Set(LEDGER_TRIGGER_NAMES);
+    // v38 guards reference a column absent from earlier repair migrations.
+    const listed = new Set([...LEDGER_TRIGGER_NAMES, ...V38_LEDGER_TRIGGER_NAMES]);
     const missing = ledgerTriggers.filter((name) => !listed.has(name));
 
     expect(

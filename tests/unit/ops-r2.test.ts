@@ -11,6 +11,7 @@ import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-se
 import { startDaemonMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { idempotentMcpMutation } from "../../src/mcp/shared.ts";
+import * as ingressGuardExports from "../../src/ingress/ingress-guard.ts";
 import { IngressGuard, ingressSignature } from "../../src/ingress/ingress-guard.ts";
 import { TelegramIngress } from "../../src/ingress/telegram.ts";
 import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
@@ -587,6 +588,58 @@ describe("round-2 ops regressions", () => {
       structuredContent: { reasonCode: ReasonCode.OK },
     }));
     expect(recovered.structuredContent?.["reasonCode"]).toBe(ReasonCode.OK);
+  });
+
+  it("keeps an in-flight MCP reservation sealed from raw deletes and exported release issuers", async () => {
+    const harness = makeHarness();
+    const peer = { actor: "authenticated-peer" };
+    const nonce = "mcp-suspended";
+    let executions = 0;
+    let finish!: (result: { content: [{ type: "text"; text: string }] }) => void;
+    const first = idempotentMcpMutation(harness.cp, peer, nonce, () => {
+      executions += 1;
+      return new Promise((resolve) => { finish = resolve; });
+    });
+    try {
+      expect(() => harness.cp.db.run(
+        `DELETE FROM inbound_messages WHERE channel = 'mcp' AND nonce = ?`, [nonce],
+      )).toThrow(/INGRESS_MESSAGE_DELETE_AUTHORITY_DENIED/);
+      const exposedIssuer = (ingressGuardExports as Record<string, unknown>)["releaseUnfinishedMcpReservation"];
+      if (typeof exposedIssuer === "function") {
+        (exposedIssuer as (db: typeof harness.cp.db, actor: string, key: string) => void)(
+          harness.cp.db, peer.actor, nonce,
+        );
+      }
+      const reservedAt = harness.cp.db.get<{ received_at: string }>(
+        `SELECT received_at FROM inbound_messages WHERE channel = 'mcp' AND nonce = ?`, [nonce],
+      )?.received_at;
+      // The current entry point, driven the way a Db holder can: a timestamp an hour ahead makes
+      // the live reservation read stale. A takeover must run nothing while the first handler is in
+      // flight, whether its run would throw or succeed.
+      const future = new Date(Date.parse(harness.clock.nowIso()) + 60 * 60_000).toISOString();
+      const thrown = await ingressGuardExports.runMcpReservedMutation(harness.cp.db, peer.actor, nonce, future, () => {
+        executions += 1;
+        throw new Error("taken over and thrown");
+      });
+      expect(thrown.kind).toBe("existing");
+      const succeeded = await ingressGuardExports.runMcpReservedMutation(harness.cp.db, peer.actor, nonce, future, () => {
+        executions += 1;
+        return "second execution";
+      });
+      expect(succeeded.kind).toBe("existing");
+      expect(harness.cp.db.get<{ actor: string; received_at: string }>(
+        `SELECT actor, received_at FROM inbound_messages WHERE channel = 'mcp' AND nonce = ?`, [nonce],
+      )).toEqual({ actor: peer.actor, received_at: reservedAt });
+      const retry = await idempotentMcpMutation(harness.cp, peer, nonce, () => {
+        executions += 1;
+        return { content: [{ type: "text" as const, text: "duplicate" }] };
+      });
+      expect(retry.structuredContent?.["reasonCode"]).toBe(ReasonCode.INGRESS_REPLAY_IGNORED);
+      expect(executions).toBe(1);
+    } finally {
+      finish({ content: [{ type: "text", text: "finished" }] });
+      await first;
+    }
   });
 
   it("#110: CTO MCP routes a bootstrap handoff ACK to BootstrapActivation", async () => {
