@@ -12,6 +12,8 @@ import {
 import { isAbsolute, join, relative, resolve } from "node:path";
 
 import { ManualClock } from "../../src/core/clock.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { Role } from "../../src/domain/types.ts";
 import { ControlPlane } from "../../src/app/control-plane.ts";
 import {
   ClaudeCliAdapter,
@@ -38,6 +40,7 @@ import {
   type UsageTerminal,
   nonInteractiveEnvironment,
 } from "../../src/capacity/usage-collectors.ts";
+import type { ProviderAdapter } from "../../src/runtime/provider.ts";
 import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
@@ -437,6 +440,27 @@ describe("Codex account rate limits (#582)", () => {
       }).collect();
       expect(reading.sensorHealth, JSON.stringify(payload)).toBe("ERROR");
       expect(reading.buckets).toEqual([]);
+    }
+  });
+
+  it("#954 says the Codex app-server never started whether spawn emits or throws", async () => {
+    const missing = join(tempDir("acp-954-codex-missing-"), "missing-codex");
+    const regularFile = join(tempDir("acp-954-codex-enotdir-"), "regular-file");
+    writeFileSync(regularFile, "not a directory");
+    const notADirectory = join(regularFile, "codex");
+
+    for (const [attempted, errno] of [[missing, "ENOENT"], [notADirectory, "ENOTDIR"]] as const) {
+      const reading = await new CodexUsageCollector({
+        clock: clock(),
+        binary: attempted,
+        codexHome: tempDir("acp-954-codex-home-"),
+      }).collect();
+
+      expect(reading.sensorHealth).toBe("ERROR");
+      expect(reading.buckets).toEqual([]);
+      expect(reading.error).toContain("codex app-server never started");
+      expect(reading.error).toContain(`configured CLI at ${attempted}`);
+      expect(reading.error).toContain(errno);
     }
   });
 
@@ -1663,6 +1687,48 @@ setInterval(() => {}, 1_000);
     }
     // Deleting Grok from the composition root turns this into a two-provider registry;
     // merely defining a collector elsewhere is not enough to satisfy P0-11.
+  });
+
+  it("#954 doctor checks the shared sensor file for a role-scoped production provider", async () => {
+    const root = tempDir("acp-role-scoped-doctor-");
+    const adapter = (provider: string): ProviderAdapter => ({
+      provider,
+      isProduction: true,
+      defaultModels: {},
+      async startSession() { throw new Error("not exercised"); },
+      async stopSession() {},
+      async invoke() { throw new Error("not exercised"); },
+      async probeRuntime() { return "HEALTHY"; },
+      async probeSession() { return "HEALTHY"; },
+      async probeCapacity() {
+        return {
+          provider,
+          sensorHealth: "HEALTHY",
+          runtimeHealth: "HEALTHY",
+          observedAt: clock().nowIso(),
+          buckets: [{ id: "fixture", remainingPercent: 100, resetAt: null, capabilities: ["cto"] }],
+          source: "fixture",
+        };
+      },
+    });
+    const cp = new ControlPlane({
+      databasePath: join(root, "state.sqlite"),
+      worktreeRoot: join(root, "worktrees"),
+      capacityDir: join(root, "capacity"),
+      secretsDir: join(root, "secrets"),
+      clock: clock(),
+      adapters: [adapter("gpt")],
+    });
+    try {
+      cp.providers.registerForRole(adapter("claude"), Role.CEO);
+      const report = await cp.doctor.run("capacity");
+      expect(report.findings).toContainEqual(expect.objectContaining({
+        code: ReasonCode.CAPACITY_SENSOR_FILE_MISSING,
+        scope: "provider:claude",
+      }));
+    } finally {
+      cp.close();
+    }
   });
 
   /**

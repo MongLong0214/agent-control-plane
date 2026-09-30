@@ -492,14 +492,37 @@ export interface CodexRateLimitProbe {
 export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
   async read(input: { binary: string; timeoutMs: number; codexHome: string }): Promise<unknown> {
     return new Promise((resolve, reject) => {
-      const child = spawn(input.binary, ["app-server", "--stdio"], {
-        stdio: ["pipe", "pipe", "pipe"],
-        detached: true,
-        // CODEX_HOME is pinned, never inherited. A daemon can be started under an environment
-        // naming a different Codex home — this machine has two — and reading the wrong one
-        // reports another account's quota while looking entirely healthy.
-        env: { ...nonInteractiveEnvironment(), CODEX_HOME: input.codexHome },
-      });
+      const neverStarted = (error: unknown): Error => {
+        const message = error instanceof Error ? error.message : "a non-error value was thrown";
+        const code = error && typeof error === "object" && "code" in error && typeof error.code === "string"
+          ? error.code
+          : "no errno";
+        return new Error(
+          `codex app-server never started: the operating system could not spawn the configured CLI at ` +
+            `${input.binary} (${code}: ${message})`,
+        );
+      };
+      let child: ReturnType<typeof spawn>;
+      try {
+        child = spawn(input.binary, ["app-server", "--stdio"], {
+          stdio: ["pipe", "pipe", "pipe"],
+          detached: true,
+          // CODEX_HOME is pinned, never inherited. A daemon can be started under an environment
+          // naming a different Codex home — this machine has two — and reading the wrong one
+          // reports another account's quota while looking entirely healthy.
+          env: { ...nonInteractiveEnvironment(), CODEX_HOME: input.codexHome },
+        });
+      } catch (error) {
+        reject(neverStarted(error));
+        return;
+      }
+      const childStdin = child.stdin;
+      const childStdout = child.stdout;
+      if (!childStdin || !childStdout) {
+        child.kill("SIGKILL");
+        reject(new Error("codex app-server started without the required stdio pipes"));
+        return;
+      }
       let buffer = "";
       let settled = false;
       let asked = false;
@@ -516,9 +539,9 @@ export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
         else resolve(outcome.value);
       };
       const timer = setTimeout(() => finish({ error: "codex app-server did not answer in time" }), input.timeoutMs);
-      const send = (message: unknown): void => void child.stdin.write(`${JSON.stringify(message)}\n`);
+      const send = (message: unknown): void => void childStdin.write(`${JSON.stringify(message)}\n`);
 
-      child.stdout.on("data", (chunk: Buffer) => {
+      childStdout.on("data", (chunk: Buffer) => {
         buffer += chunk.toString();
         let newline: number;
         while ((newline = buffer.indexOf("\n")) >= 0) {
@@ -555,7 +578,7 @@ export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
           }
         }
       });
-      child.once("error", (error) => finish({ error: error.message }));
+      child.once("error", (error) => finish({ error: neverStarted(error).message }));
       // Only to notice a process that died before answering. The answer never arrives this way.
       child.once("exit", () => finish({ error: "codex app-server exited before answering" }));
       send({ method: "initialize", id: 0, params: { clientInfo: { name: "agent-control-plane", version: "1.0.0" } } });

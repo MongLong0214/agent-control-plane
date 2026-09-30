@@ -1229,7 +1229,10 @@ export class Doctor {
     const findings: Finding[] = [];
     const now = Date.parse(this.clock.nowIso());
 
-    for (const adapter of this.providers.production()) {
+    // This asks which production providers own sensor files, not which unscoped adapter may act
+    // for a role. `production()` deliberately excludes role-scoped providers; `list()` retains
+    // them once per provider without choosing an identity for dispatch.
+    for (const adapter of this.providers.list().filter((candidate) => candidate.isProduction)) {
       const provider = adapter.provider;
       // A provider excluded from the unattended probe (#735) never gets this file refreshed
       // again by that sweep. Checking its age would resurrect exactly the always-on warning
