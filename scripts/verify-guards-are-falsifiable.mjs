@@ -1803,6 +1803,45 @@ const GUARDS = [
     replace: "  AND 0 = 1 AND acp_turn_materialization_authorized(",
     killedBy: ["tests/unit/canonical-ledger-immutability.test.ts"],
   },
+  // The native UDF is a four-part capability, not one broad "inside ingress" switch.  Each
+  // mutation removes exactly one operand; its named control observes the real first-claim
+  // transaction and trigger, then changes only that one UDF argument.
+  {
+    what: "SQLite ingress-claim authorization requires its active private marker",
+    file: "src/db/database.ts",
+    find: "      return marker && marker.channel === channel && marker.nonce === nonce && marker.claimJson === claimJson ? 1 : 0;",
+    replace: "      return marker ? (marker.channel === channel && marker.nonce === nonce && marker.claimJson === claimJson ? 1 : 0) : 1;",
+    killedBy: [
+      "tests/unit/ingress-turn-claim.test.ts::requires an active marker before SQLite authorizes a first ingress claim",
+    ],
+  },
+  {
+    what: "SQLite ingress-claim authorization binds the marker to its channel",
+    file: "src/db/database.ts",
+    find: "      return marker && marker.channel === channel && marker.nonce === nonce && marker.claimJson === claimJson ? 1 : 0;",
+    replace: "      return marker && marker.nonce === nonce && marker.claimJson === claimJson ? 1 : 0;",
+    killedBy: [
+      "tests/unit/ingress-turn-claim.test.ts::binds SQLite first-claim authorization to its channel",
+    ],
+  },
+  {
+    what: "SQLite ingress-claim authorization binds the marker to its nonce",
+    file: "src/db/database.ts",
+    find: "      return marker && marker.channel === channel && marker.nonce === nonce && marker.claimJson === claimJson ? 1 : 0;",
+    replace: "      return marker && marker.channel === channel && marker.claimJson === claimJson ? 1 : 0;",
+    killedBy: [
+      "tests/unit/ingress-turn-claim.test.ts::binds SQLite first-claim authorization to its nonce",
+    ],
+  },
+  {
+    what: "SQLite ingress-claim authorization binds the marker to its exact claim JSON",
+    file: "src/db/database.ts",
+    find: "      return marker && marker.channel === channel && marker.nonce === nonce && marker.claimJson === claimJson ? 1 : 0;",
+    replace: "      return marker && marker.channel === channel && marker.nonce === nonce ? 1 : 0;",
+    killedBy: [
+      "tests/unit/ingress-turn-claim.test.ts::binds SQLite first-claim authorization to its exact claim JSON",
+    ],
+  },
   {
     // There is no code to delete here: the guard is the *absence* of an expiry path. So the
     // mutation adds the sweeper someone will eventually be tempted to add, and requires a test
