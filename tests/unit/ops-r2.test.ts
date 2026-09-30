@@ -9,6 +9,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
 import { startDaemonMcpListeners } from "../../src/daemon/agentcpd.ts";
+import { Daemon } from "../../src/daemon/daemon.ts";
 import { idempotentMcpMutation } from "../../src/mcp/shared.ts";
 import { IngressGuard, ingressSignature } from "../../src/ingress/ingress-guard.ts";
 import { TelegramIngress } from "../../src/ingress/telegram.ts";
@@ -21,12 +22,14 @@ import {
 import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import {
+  approveReviewedCandidateForFinalization,
   bindCeo,
   driveToReviewedCandidate,
   fixtureManifest,
   makeHarness,
   type Harness,
 } from "../helpers/harness.ts";
+import { FakeGitHub } from "../helpers/fake-github.ts";
 import { testReviewerEgressEvidence } from "../helpers/production-adapter.ts";
 
 afterAll(cleanupTempDirs);
@@ -406,8 +409,10 @@ describe("round-2 ops regressions", () => {
     expect(harness.cp.artifacts.latest(prepared.runId, "BOOTSTRAP_ACTIVATION_RESULT")).toBeNull();
   });
 
-  it("#109 finalizes the activation result only with the matching CEO-confirmed review candidate", async () => {
-    const harness = makeHarness();
+  it("#109 / RF-S18: a confirmed activation projects tickets through ACP without restarting Repo Factory", async () => {
+    const github = new FakeGitHub();
+    const harness = makeHarness({ githubClient: github });
+    harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
     const prepared = await prepareBootstrap(harness, "activation-finalize");
     const input = activationInput(harness, prepared.runId, "activation-finalize", prepared.plan);
     const pending = await harness.cp.bootstrap.activate(input);
@@ -435,6 +440,46 @@ describe("round-2 ops regressions", () => {
       prepared.runId,
       "BOOTSTRAP_ACTIVATION_RESULT",
     )?.content.ceoConfirm?.decision).toBe("CONFIRM");
+
+    const activatedRepository = harness.cp.repositories.byIdentity("github:acme/fixture");
+    if (!activatedRepository) throw new Error("activation did not register its repository");
+    const activationCalls = vi.spyOn(harness.cp.bootstrap, "activate");
+    const projectionRun = await driveToReviewedCandidate(harness, {
+      registeredProject: {
+        projectId: "activation-finalize",
+        repositoryId: activatedRepository.repositoryId,
+        identity: activatedRepository.identity,
+      },
+    });
+    const projectionClaim = harness.cp.claims.acquire({
+      runId: projectionRun.runId,
+      ownerSessionId: projectionRun.ownerSessionId,
+      ownerBindingGeneration: projectionRun.ownerBindingGeneration,
+      ownerRoleKey: harness.cp.runs.require(projectionRun.runId).ownerRoleKey!,
+      repositoryIdentity: projectionRun.identity,
+      branch: projectionRun.workBranch,
+    });
+    if (!projectionClaim.allowed) throw new Error(projectionClaim.message);
+    const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-rf-s18-projection-") });
+    const started = await daemon.start();
+    expect(started.allowed).toBe(true);
+    try {
+      await approveReviewedCandidateForFinalization(harness, projectionRun);
+      const first = await daemon.projectTickets(projectionRun.runId, projectionRun.identity, [
+        { id: "T001", title: "first", body: "do the thing" },
+      ]);
+      if (!first.allowed) throw new Error(`${first.reasonCode}: ${first.message}`);
+      expect(first.allowed && first.value).toEqual({ created: 1, updated: 0 });
+      const second = await daemon.projectTickets(projectionRun.runId, projectionRun.identity, [
+        { id: "T001", title: "first, retitled", body: "do the thing" },
+      ]);
+      expect(second.allowed && second.value).toEqual({ created: 0, updated: 1 });
+      expect(github.issues).toHaveLength(1);
+      expect(github.issues[0]?.title).toBe("first, retitled");
+      expect(activationCalls).not.toHaveBeenCalled();
+    } finally {
+      await daemon.stop();
+    }
   });
 
   it("#105/#202: a valid result from another run is refused before activation writes", async () => {

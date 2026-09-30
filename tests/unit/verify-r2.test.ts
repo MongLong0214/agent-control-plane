@@ -8,7 +8,7 @@ import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { fixtureManifest, makeHarness } from "../helpers/harness.ts";
 import { applyPassingChange } from "../helpers/harness.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
-import { assertPortableManifest } from "../../src/contracts/manifest.ts";
+import { assertPortableManifest, manifestDigest } from "../../src/contracts/manifest.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { allow } from "../../src/core/errors.ts";
@@ -202,6 +202,42 @@ describe("round-2 verification isolation and candidate freshness", () => {
       contractDigest: snapshot.contractDigest,
     });
     expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT });
+  });
+
+  it("RF-S06: changing verification to an unconditional pass does not change the current run's pinned contract", async () => {
+    const pinnedManifest = fixtureManifest("verify-r2-project");
+    const { harness, run, snapshot } = await frozenPinnedCandidate({ manifest: pinnedManifest });
+    const candidateManifest = structuredClone(pinnedManifest);
+    candidateManifest.verificationCommands[0]!.argv = ["node", "-e", "process.exit(0)"];
+
+    expect(manifestDigest(candidateManifest)).not.toBe(manifestDigest(pinnedManifest));
+    expect(run.pinnedManifestDigest).toBe(manifestDigest(pinnedManifest));
+
+    const weakened = await harness.cp.verification.verify({
+      runId: run.runId,
+      snapshot,
+      commands: candidateManifest.verificationCommands,
+      contractDigest: snapshot.contractDigest,
+    });
+    expect(weakened).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
+    });
+
+    const pinned = await harness.cp.verification.verify({
+      runId: run.runId,
+      snapshot,
+      commands: pinnedManifest.verificationCommands,
+      contractDigest: snapshot.contractDigest,
+    });
+    expect(pinned.allowed).toBe(true);
+    if (!pinned.allowed) return;
+    expect(pinned.value).toMatchObject({
+      status: "PASS",
+      expectedInputs: 1,
+      observedInputs: 1,
+      results: [{ commandId: "verify", status: "PASS" }],
+    });
   });
 
   it("#161 rejects a worktree id paired with a different checkout", async () => {
