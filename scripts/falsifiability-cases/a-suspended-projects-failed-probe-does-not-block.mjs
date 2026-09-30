@@ -9,7 +9,7 @@ const aSuspendedProjectsFailedProbeDoesNotBlock = {
   find: "          code: \"REPOSITORY_PROBE_FAILED\",\n          severity: projectSuspended ? \"WARN\" : \"ERROR\",\n          scope: `repository:${repository.identity}`,\n          blocking: !projectSuspended,\n",
   replace: "          code: \"REPOSITORY_PROBE_FAILED\",\n          severity: projectSuspended ? \"WARN\" : \"ERROR\",\n          scope: `repository:${repository.identity}`,\n          blocking: true,\n",
   killedBy: [
-    "tests/unit/a-suspended-projects-missing-checkout-does-not-block-startup.test.ts::reports a %s project's failed repository probe accordingly",
+    "tests/unit/a-suspended-projects-missing-checkout-does-not-block-startup.test.ts::reports a suspended project's failed repository probe accordingly",
   ],
 };
 
