@@ -1,4 +1,5 @@
 import { readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { userInfo } from "node:os";
 import { dirname, join } from "node:path";
 
 import Database from "better-sqlite3";
@@ -13,9 +14,23 @@ import { makeHarness, registerFixtureProject } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
-const setup = async (live: { run?: boolean; binding?: boolean } = {}) => {
+/** The account the kernel says runs this test, which is the only approver the command admits. */
+const ACCOUNT = userInfo().username;
+
+const setup = async (live: { run?: boolean; binding?: boolean; bindingOnFinishedRun?: boolean } = {}) => {
   const harness = makeHarness();
   const { projectId } = await registerFixtureProject(harness);
+  if (live.bindingOnFinishedRun) {
+    const created = harness.cp.runs.create({ projectId, executionMode: ExecutionMode.SIMPLE,
+      contract: { goal: "finished", why: "a run-scoped binding can outlive its run", scope: [], nonGoals: [],
+        acceptance: ["done"], priority: "NORMAL", humanGate: [], references: [] } });
+    if (!created.allowed) throw new Error(created.message);
+    const session = harness.cp.sessions.create({ provider: "claude", model: "opus" });
+    expect(harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "reviewer ready").allowed).toBe(true);
+    const bound = harness.cp.bindings.bind({ role: Role.BOOTSTRAP_CTO, runId: created.value.runId, sessionId: session.sessionId });
+    if (!bound.allowed) throw new Error(bound.message);
+    expect(harness.cp.runs.transition(created.value.runId, RunState.CANCELLED, "test: finished").allowed).toBe(true);
+  }
   if (live.run) {
     const created = harness.cp.runs.create({ projectId, executionMode: ExecutionMode.SIMPLE,
       contract: { goal: "in flight", why: "work the offline door must not strand", scope: [], nonGoals: [],
@@ -32,9 +47,9 @@ const setup = async (live: { run?: boolean; binding?: boolean } = {}) => {
   harness.cp.db.close();
   const databasePath = join(harness.root, "state.sqlite");
   // The deployment's owner declaration, which the command checks the approver against.
-  writeFileSync(join(harness.root, "owner-identities"), "cli:owner\n", { mode: 0o600 });
+  writeFileSync(join(harness.root, "owner-identities"), `cli:${ACCOUNT}\ncli:another-owner\n`, { mode: 0o600 });
   const args = ["suspend-project", "--database", databasePath, "--project-id", projectId,
-    "--approved-by", "owner", "--confirm-suspend"];
+    "--approved-by", ACCOUNT, "--confirm-suspend"];
   return { databasePath, projectId, args, root: harness.root };
 };
 
@@ -69,7 +84,7 @@ describe("#1032: offline project suspension", () => {
   });
 
   it.each([
-    ["approval", ["--approved-by", "owner"]],
+    ["approval", ["--approved-by", ACCOUNT]],
     ["confirmation", ["--confirm-suspend"]],
   ])("refuses without %s", async (_label, omitted) => {
     const { args } = await setup();
@@ -77,10 +92,17 @@ describe("#1032: offline project suspension", () => {
       .rejects.toThrow(/--approved-by.*--confirm-suspend/);
   });
 
-  it("refuses an approver the deployment did not declare as a cli owner", async () => {
+  it("refuses a declared owner's name typed by an account that is not that owner", async () => {
     const { databasePath, projectId, args } = await setup();
-    await expect(stateAdmin(args.map((token) => token === "owner" ? "someone-else" : token)))
-      .rejects.toThrow(/not a declared cli owner identity/);
+    await expect(stateAdmin(args.map((token) => token === ACCOUNT ? "another-owner" : token)))
+      .rejects.toThrow(/not the account running this command/);
+    expect(suspendedAudits(databasePath, projectId)).toEqual({ suspended: 0, audits: 0 });
+  });
+
+  it("refuses the running account when the deployment did not declare it as a cli owner", async () => {
+    const { databasePath, projectId, args, root } = await setup();
+    writeFileSync(join(root, "owner-identities"), "cli:another-owner\n", { mode: 0o600 });
+    await expect(stateAdmin(args)).rejects.toThrow(/not a declared cli owner identity/);
     expect(suspendedAudits(databasePath, projectId)).toEqual({ suspended: 0, audits: 0 });
   });
 
@@ -94,6 +116,7 @@ describe("#1032: offline project suspension", () => {
   it.each([
     ["an unfinished run", { run: true }],
     ["an active binding", { binding: true }],
+    ["a run-scoped binding left active after its run finished", { bindingOnFinishedRun: true }],
   ])("refuses a project with %s, which only the daemon's owner path can quiesce", async (_label, live) => {
     const { databasePath, projectId, args } = await setup(live);
     await expect(stateAdmin(args)).rejects.toThrow(/suspend it through the running daemon/);
@@ -133,7 +156,7 @@ describe("#1032: offline project suspension", () => {
     try {
       expect(await stateAdmin(args)).toBe(0);
       expect(JSON.parse(String(write.mock.calls.at(-1)?.[0]))).toMatchObject({
-        projectId, suspended: true, approvedBy: "owner",
+        projectId, suspended: true, approvedBy: ACCOUNT,
       });
     } finally {
       write.mockRestore();
@@ -147,7 +170,7 @@ describe("#1032: offline project suspension", () => {
         .all(projectId) as { evidence_json: string }[];
       expect(rows).toHaveLength(1);
       expect(JSON.parse(rows[0]!.evidence_json)).toMatchObject({
-        ownerApproved: true, approvedBy: "owner", source: "agentcpd-state",
+        ownerApproved: true, approvedBy: ACCOUNT, source: "agentcpd-state",
       });
     } finally {
       db.close();

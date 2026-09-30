@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { closeSync, existsSync, openSync, readFileSync, readSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -327,10 +327,16 @@ export const main = async (argv: string[]): Promise<number> => {
   }
 
   if (parsed.command === "suspend-project") {
-    // The approval is the owner's only if the name is one the deployment declared out of band, in
-    // the same `owner-identities` file the daemon's owner authority reads. An absent or empty
-    // declaration authorises nobody, as it does for every other owner gate.
+    // The approver is the account the kernel says is running this command (its uid's name, not an
+    // environment variable), the same same-uid authority the daemon's sockets admit. A name the
+    // caller merely types is not an identity. The approval is the owner's only if that account is
+    // also a cli owner declared out of band, in the `owner-identities` file the daemon's owner
+    // authority reads; an absent or empty declaration authorises nobody.
     const approvedBy = parsed.approvedBy!.trim();
+    const account = userInfo().username;
+    if (approvedBy !== account) {
+      throw new Error(`refusing to suspend a project: ${approvedBy} is not the account running this command`);
+    }
     const owners = readOwnerIdentities(join(dirname(parsed.databasePath), "owner-identities"));
     if (!owners.some((owner) => owner.channel === "cli" && owner.actor === approvedBy)) {
       throw new Error(`refusing to suspend a project: ${approvedBy} is not a declared cli owner identity`);
@@ -370,9 +376,16 @@ export const main = async (argv: string[]): Promise<number> => {
             `SELECT COUNT(*) AS n FROM runs WHERE project_id = ? AND state NOT IN (${terminal})`,
             [parsed.projectId!, ...TERMINAL_RUN_STATES],
           )?.n ?? 0;
+          // Matched on the project, not on the role key's text: run- and task-scoped keys end in
+          // their own ids, and a suffix pattern also matches another project's key.
           const activeBindings = db.get<{ n: number }>(
-            `SELECT COUNT(*) AS n FROM assignments WHERE status = 'ACTIVE' AND role_key LIKE ?`,
-            [`%:${parsed.projectId!}`],
+            `SELECT COUNT(*) AS n FROM assignments a
+              WHERE a.status = 'ACTIVE'
+                AND (a.project_id = ?
+                     OR a.run_id IN (SELECT run_id FROM runs WHERE project_id = ?)
+                     OR a.task_id IN (SELECT t.task_id FROM tasks t JOIN runs r ON r.run_id = t.run_id
+                                       WHERE r.project_id = ?))`,
+            [parsed.projectId!, parsed.projectId!, parsed.projectId!],
           )?.n ?? 0;
           if (openRuns > 0 || activeBindings > 0) {
             throw new Error(
