@@ -9,7 +9,7 @@ const offlineSuspensionNeedsADeclaredOwner = {
   find: "    if (!owners.some((owner) => owner.channel === \"cli\" && owner.actor === approvedBy)) {\n",
   replace: "    if (owners.length < 0) {\n",
   killedBy: [
-    "tests/unit/an-offline-project-suspension.test.ts::refuses an approver the deployment did not declare as a cli owner",
+    "tests/unit/an-offline-project-suspension.test.ts::refuses the running account when the deployment did not declare it as a cli owner",
   ],
 };
 
