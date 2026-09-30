@@ -10,7 +10,7 @@ import {
   type TurnReceipt,
   type TurnSource,
 } from "../../src/conversation/turn-coordinator.ts";
-import { isAcpError, type Decision } from "../../src/core/errors.ts";
+import { allow, deny, isAcpError, type Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
@@ -1126,22 +1126,14 @@ describe("a claim takes the hold in the same transaction", () => {
   });
 });
 
-describe("a verified actor-bound /again override", () => {
-  it("upgrades a populated v37-shaped file and keeps its unresolved turn and receipt identity", () => {
-    expect(MIGRATIONS.find((migration) => migration.fromVersion === 37 && migration.toVersion === 38)).toBeDefined();
-    const h = makeHarness();
-    const actorId = target(h, "upgrade");
-    const first = claimOf(h, actorId, [source(h, "upgrade-1")]);
-    const file = join(h.root, "state.sqlite");
-    h.cp.db.close();
-    // Recreate the old on-disk shape without a second test fixture or rewriting a historical migration.
-    // The seeded turn is real, and the migration must retain it across the ALTER and index swap.
-    const legacy = new Database(file);
-    const v37NoReplace = /CREATE TRIGGER IF NOT EXISTS canonical_turns_no_replace[\s\S]*?\nEND;/.exec(
-      readFileSync(new URL("../../src/db/schema-v37.sql", import.meta.url), "utf8"),
-    )?.[0];
-    if (!v37NoReplace) throw new Error("v37 canonical_turns_no_replace is missing");
-    legacy.exec(`
+const restoreV37Shape = (file: string): void => {
+  // Recreate the old on-disk shape without rewriting a historical migration.
+  const legacy = new Database(file);
+  const v37NoReplace = /CREATE TRIGGER IF NOT EXISTS canonical_turns_no_replace[\s\S]*?\nEND;/.exec(
+    readFileSync(new URL("../../src/db/schema-v37.sql", import.meta.url), "utf8"),
+  )?.[0];
+  if (!v37NoReplace) throw new Error("v37 canonical_turns_no_replace is missing");
+  legacy.exec(`
       DROP TRIGGER canonical_turns_override_claim_guard;
       DROP TRIGGER canonical_turns_override_identity_immutable;
       DROP TRIGGER canonical_turns_override_write_authority;
@@ -1160,9 +1152,20 @@ describe("a verified actor-bound /again override", () => {
       INSERT INTO schema_migrations (version, migration_id, checksum, applied_at)
         VALUES (37, 'bootstrap-v37', 'sha256:legacy', '2026-08-21T00:00:00.000Z');
       PRAGMA user_version = 37;
-    `);
-    installMigrationLedger(legacy);
-    legacy.close();
+  `);
+  installMigrationLedger(legacy);
+  legacy.close();
+};
+
+describe("a verified actor-bound /again override", () => {
+  it("upgrades a populated v37-shaped file and keeps its unresolved turn and receipt identity", () => {
+    expect(MIGRATIONS.find((migration) => migration.fromVersion === 37 && migration.toVersion === 38)).toBeDefined();
+    const h = makeHarness();
+    const actorId = target(h, "upgrade");
+    const first = claimOf(h, actorId, [source(h, "upgrade-1")]);
+    const file = join(h.root, "state.sqlite");
+    h.cp.db.close();
+    restoreV37Shape(file);
     approveMigration(file, "v38 unit fixture");
     const migrated = new Db(file);
     try {
@@ -1186,6 +1189,102 @@ describe("a verified actor-bound /again override", () => {
     } finally {
       migrated.close();
     }
+  });
+
+  it("admits and dispatches /again after v37 left an ingress-only sibling beside a canonical turn", async () => {
+    const h = makeHarness();
+    const actorId = target(h, "mixed-upgrade");
+    const secret = "telegram-fixture-secret";
+    const makeGuard = (harness: Harness) => new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, {
+      telegram: { allowedActors: ["424242"], allowedConversations: ["999"] },
+    }, {
+      canonicalTargetForClaim: (identity) => {
+        const bound = canonicalTurnTarget(harness.cp);
+        return bound ? { ...bound, turnRequestId: identity.turnRequestId, promptDigest: identity.promptDigest } : null;
+      },
+    });
+    const update = (id: number, text: string): TelegramUpdate => ({
+      update_id: id,
+      message: { message_id: id, date: 1_700_000_000, text,
+        from: { id: 424242, username: "owner" }, chat: { id: 999 } },
+    });
+    const oldIngress = new TelegramIngress(makeGuard(h), { webhookSecret: secret });
+    const oldRouter = new TelegramHermesRouter({
+      ingress: oldIngress, hermes: createHermesMcpPort(h.cp),
+      currentCandidateSnapshotDigest: () => null, bindingGeneration: () => null,
+    });
+    const firstUpdate = update(9201, "first");
+    expect((await oldRouter.routeUntilCeoTurn(firstUpdate, secret)).status).toBe("CEO_TURN_PENDING");
+    const firstNonce = oldIngress.nonceFor(firstUpdate);
+    const first = claimOf(h, actorId, [{
+      channel: "telegram", nonce: firstNonce, attempt: 1, payload: oldIngress.admittedPayloadFor(firstUpdate),
+    }], "first");
+    const legacyOnlyUpdate = update(9202, "/again legacy only");
+    expect((await oldRouter.routeUntilCeoTurn(legacyOnlyUpdate, secret)).status).toBe("CEO_TURN_PENDING");
+    const legacyOnlyNonce = oldIngress.nonceFor(legacyOnlyUpdate);
+    expect(h.cp.db.get(`SELECT 1 FROM canonical_turn_sources WHERE source_nonce = ?`, [legacyOnlyNonce]))
+      .toBeUndefined();
+
+    const file = join(h.root, "state.sqlite");
+    h.cp.db.close();
+    restoreV37Shape(file);
+    approveMigration(file, "v38 mixed-state fixture");
+    const resumed = makeHarness({ root: h.root, repoPath: h.repoPath, clock: h.clock });
+    const ingress = new TelegramIngress(makeGuard(resumed), { webhookSecret: secret });
+    let dispatches = 0;
+    const router = new TelegramHermesRouter({
+      ingress, hermes: createHermesMcpPort(resumed.cp),
+      currentCandidateSnapshotDigest: () => null, bindingGeneration: () => null,
+      materializeTurn: ({ target: bound, prompt, sources }) => {
+        const claimed = resumed.cp.conversation.claim({
+          targetActorId: bound.targetActorId, prompt, sources,
+          overrideIncumbentTurnRequestId: first.turnRequestId,
+        });
+        return claimed.allowed ? allow(ReasonCode.OK, undefined)
+          : deny(claimed.reasonCode, claimed.message, claimed.evidence);
+      },
+      directHandler: () => { dispatches += 1; return "dispatched"; },
+    });
+    const againUpdate = update(9203, "/again renewed");
+    const routed = await router.routeUntilCeoTurn(againUpdate, secret);
+    expect(routed.status, JSON.stringify(routed)).toBe("CEO_TURN_PENDING");
+    if (routed.status !== "CEO_TURN_PENDING") return;
+    await routed.outcome;
+    expect(dispatches).toBe(1);
+    const againNonce = ingress.nonceFor(againUpdate);
+    const claim = resumed.cp.db.get<{ turn_claim_json: string }>(
+      `SELECT turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`, [againNonce],
+    );
+    expect((JSON.parse(claim!.turn_claim_json) as TurnClaim).overriddenUnresolvedNonces)
+      .toEqual([firstNonce, legacyOnlyNonce]);
+    const newCanonical = resumed.cp.db.get<{ turn_request_id: string; override_incumbent_turn_request_id: string }>(
+      `SELECT t.turn_request_id, t.override_incumbent_turn_request_id FROM canonical_turns t
+        JOIN canonical_turn_sources s ON s.turn_request_id = t.turn_request_id
+        WHERE s.source_nonce = ?`, [againNonce],
+    );
+    expect(newCanonical?.override_incumbent_turn_request_id).toBe(first.turnRequestId);
+    expect(resumed.cp.db.get(`SELECT 1 FROM canonical_turn_sources WHERE source_nonce = ?`, [legacyOnlyNonce]))
+      .toBeUndefined();
+
+    // A nonce that was valid when ingress recorded the choice is no longer authority once settled.
+    const invalidUpdate = update(9204, "/again fourth");
+    const ingressOnlyRouter = new TelegramHermesRouter({
+      ingress, hermes: createHermesMcpPort(resumed.cp),
+      currentCandidateSnapshotDigest: () => null, bindingGeneration: () => null,
+    });
+    expect((await ingressOnlyRouter.routeUntilCeoTurn(invalidUpdate, secret)).status).toBe("CEO_TURN_PENDING");
+    resumed.cp.db.run(
+      `UPDATE inbound_messages SET turn_claim_json = json_set(turn_claim_json, '$.noReplyAt', ?)
+        WHERE channel = 'telegram' AND nonce = ?`, [NOW, legacyOnlyNonce],
+    );
+    const invalid = resumed.cp.conversation.claim({
+      targetActorId: actorId, prompt: "fourth",
+      sources: [{ channel: "telegram", nonce: ingress.nonceFor(invalidUpdate), attempt: 1,
+        payload: ingress.admittedPayloadFor(invalidUpdate) }],
+      overrideIncumbentTurnRequestId: newCanonical!.turn_request_id,
+    });
+    expect(invalid.allowed).toBe(false);
+    expect(invalid.reasonCode).toBe(ReasonCode.CONVERSATION_TURN_IN_DOUBT);
   });
 
   it("rejects a direct SQL first claim that forges canonical override authority", () => {

@@ -887,8 +887,9 @@ export class ConversationTurnCoordinator {
         // The last source is the current /again delivery; earlier sources may be owner messages
         // parked while the incumbent was unresolved. They must share this exact ingress claim.
         const source = input.sources.at(-1)!;
-        const inbound = this.db.get<{ payload_json: string | null; turn_claim_json: string | null; claim_unambiguous: number }>(
-          `SELECT payload_json, turn_claim_json,
+        const inbound = this.db.get<{ actor: string; payload_json: string | null;
+          turn_claim_json: string | null; claim_unambiguous: number }>(
+          `SELECT actor, payload_json, turn_claim_json,
                   CASE WHEN json_valid(turn_claim_json) = 1 THEN NOT EXISTS (
                     SELECT 1 FROM json_tree(turn_claim_json) WHERE typeof(key) = 'text'
                     GROUP BY parent, key HAVING COUNT(*) > 1
@@ -935,6 +936,40 @@ export class ConversationTurnCoordinator {
             });
             const expectedNonces = [...new Set(unresolved.map((row) => row.source_nonce)
               .filter((nonce): nonce is string => nonce !== null))];
+            const canonicalNonces = new Set(expectedNonces);
+            // v37 could leave an admitted /again claim without a canonical source. The router
+            // names it, but its presence in that list is not authority: re-read its unresolved
+            // ingress claim, owner and scope, and prove it has no canonical source of its own.
+            const completeIngressSet = Array.isArray(nonces) && nonces.every((nonce) => {
+              if (typeof nonce !== "string") return false;
+              if (canonicalNonces.has(nonce)) return true;
+              const extra = this.db.get<{ actor: string; turn_claim_json: string | null;
+                claim_unambiguous: number; ingress_only: number }>(
+                `SELECT actor, turn_claim_json,
+                        CASE WHEN json_valid(turn_claim_json) = 1 THEN NOT EXISTS (
+                          SELECT 1 FROM json_tree(turn_claim_json) WHERE typeof(key) = 'text'
+                          GROUP BY parent, key HAVING COUNT(*) > 1
+                        ) ELSE 0 END AS claim_unambiguous,
+                        NOT EXISTS (
+                          SELECT 1 FROM canonical_turn_sources s
+                           WHERE s.source_channel = inbound_messages.channel
+                             AND s.source_nonce = inbound_messages.nonce
+                        ) AS ingress_only
+                   FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+                [source.channel, nonce],
+              );
+              const extraClaim: unknown = JSON.parse(extra?.turn_claim_json ?? "null");
+              if (extra?.actor !== inbound.actor || extra.claim_unambiguous !== 1
+                  || extra.ingress_only !== 1 || typeof extraClaim !== "object"
+                  || extraClaim === null || Array.isArray(extraClaim)) return false;
+              const claimed = extraClaim as Record<string, unknown>;
+              const sameScope = [proof.sessionDigest, proof.legacySessionDigest]
+                .filter((scope): scope is string => typeof scope === "string")
+                .some((scope) => claimed.sessionDigest === scope || claimed.legacySessionDigest === scope);
+              return sameScope && claimed.deliveryStatus === "TURN_CLAIMED"
+                && claimed.repliedAt == null && claimed.noReplyAt == null
+                && claimed.settledAt == null;
+            });
             if (batchProven && proof.deliveryStatus === "TURN_CLAIMED"
                 && typeof proof.turnRequestId === "string" && proof.turnRequestId.length > 0
                 && proof.promptDigest === digestOf(input.prompt)
@@ -951,9 +986,9 @@ export class ConversationTurnCoordinator {
                 && incumbent.target_attestation_id === attestation.target_attestation_id
                 && incumbent.binding_generation === attestation.binding_generation
                 && Array.isArray(nonces) && nonces.every((nonce) => typeof nonce === "string")
-                && nonces.length === expectedNonces.length
                 && new Set(nonces).size === nonces.length
-                && expectedNonces.every((nonce) => nonces.includes(nonce))) {
+                && expectedNonces.every((nonce) => nonces.includes(nonce))
+                && completeIngressSet) {
               overrideEvidence = { channel: source.channel, nonce: source.nonce,
                 ingressTurnRequestId: proof.turnRequestId, overriddenUnresolvedNonces: nonces as string[] };
             }

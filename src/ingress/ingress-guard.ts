@@ -41,15 +41,65 @@ class IngressDeleteAuthorityToken {
 export type IngressDeleteAuthority = IngressDeleteAuthorityToken;
 export const isIngressDeleteAuthority = IngressDeleteAuthorityToken.matches;
 
-/** Release only the authenticated MCP peer's unfinished reservation after its handler throws. */
-export const releaseUnfinishedMcpReservation = (db: Db, actor: string, nonce: string): void => {
-  const authority = new IngressDeleteAuthorityToken(db, "mcp");
-  db.withIngressDelete(authority, "mcp", () => db.run(
-    `DELETE FROM inbound_messages
-      WHERE channel = 'mcp' AND nonce = ? AND actor = ?
-        AND result_json IS NULL AND turn_claim_json IS NULL`,
-    [nonce, actor],
-  ));
+const MCP_RESERVATION_TTL_MS = 60_000;
+
+/** Run only the mutation that acquired this reservation; no delete capability leaves this module. */
+export const runMcpReservedMutation = async <T>(
+  db: Db,
+  actor: string,
+  nonce: string,
+  receivedAt: string,
+  execute: () => Promise<T> | T,
+): Promise<{ kind: "existing"; actor: string; resultJson: string | null } | { kind: "executed"; result: T }> => {
+  const reservation = db.tx(() => {
+    const existing = db.get<{ actor: string; received_at: string; result_json: string | null }>(
+      `SELECT actor, received_at, result_json FROM inbound_messages WHERE channel = 'mcp' AND nonce = ?`,
+      [nonce],
+    );
+    if (existing) {
+      const reservedAtMs = Date.parse(existing.received_at);
+      const nowMs = Date.parse(receivedAt);
+      if (existing.actor !== actor || existing.result_json !== null
+          || !Number.isFinite(reservedAtMs) || !Number.isFinite(nowMs)
+          || nowMs - reservedAtMs < MCP_RESERVATION_TTL_MS) {
+        return { kind: "existing" as const, actor: existing.actor, resultJson: existing.result_json };
+      }
+      const renewed = db.run(
+        `UPDATE inbound_messages SET received_at = ?
+          WHERE channel = 'mcp' AND nonce = ? AND actor = ?
+            AND result_json IS NULL AND turn_claim_json IS NULL`,
+        [receivedAt, nonce, actor],
+      );
+      if (renewed.changes !== 1) {
+        return { kind: "existing" as const, actor: existing.actor, resultJson: existing.result_json };
+      }
+    } else {
+      db.run(
+        `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES ('mcp', ?, ?, ?)`,
+        [nonce, actor, receivedAt],
+      );
+    }
+    let used = false;
+    const release = (): void => {
+      if (used) return;
+      used = true;
+      const authority = new IngressDeleteAuthorityToken(db, "mcp");
+      db.withIngressDelete(authority, "mcp", () => db.run(
+        `DELETE FROM inbound_messages
+          WHERE channel = 'mcp' AND nonce = ? AND actor = ? AND received_at = ?
+            AND result_json IS NULL AND turn_claim_json IS NULL`,
+        [nonce, actor, receivedAt],
+      ));
+    };
+    return { kind: "acquired" as const, release };
+  });
+  if (reservation.kind === "existing") return reservation;
+  try {
+    return { kind: "executed", result: await execute() };
+  } catch (error) {
+    reservation.release();
+    throw error;
+  }
 };
 
 export interface IngressRequest {

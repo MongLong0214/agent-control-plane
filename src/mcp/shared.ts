@@ -2,9 +2,7 @@ import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { Db } from "../db/database.ts";
-import { releaseUnfinishedMcpReservation } from "../ingress/ingress-guard.ts";
-
-const MCP_RESERVATION_TTL_MS = 60_000;
+import { runMcpReservedMutation } from "../ingress/ingress-guard.ts";
 
 /** Shape the MCP SDK expects from a tool callback; the index signature is its contract. */
 export interface ToolResult {
@@ -134,68 +132,27 @@ export const idempotentMcpMutation = async (
     return respond(deny(ReasonCode.INVALID_ARGUMENT, "MCP mutation requires an idempotency key"));
   }
 
-  const receivedAt = source.clock.nowIso();
-  const reservation = source.db.tx(() => {
-    const existing = source.db.get<{ actor: string; received_at: string; result_json: string | null }>(
-      `SELECT actor, received_at, result_json FROM inbound_messages WHERE channel = 'mcp' AND nonce = ?`,
-      [idempotencyKey],
-    );
-    if (existing) {
-      if (
-        existing.actor === peer.actor &&
-        !existing.result_json &&
-        reservationExpired(existing.received_at, receivedAt)
-      ) {
-        source.db.run(
-          `UPDATE inbound_messages SET received_at = ?
-            WHERE channel = 'mcp' AND nonce = ? AND actor = ? AND result_json IS NULL`,
-          [receivedAt, idempotencyKey, peer.actor],
-        );
-        return { existing: null };
-      }
-      return { existing };
-    }
-    source.db.run(
-      `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES ('mcp', ?, ?, ?)`,
-      [idempotencyKey, peer.actor, receivedAt],
-    );
-    return { existing: null };
-  });
-
-  if (reservation.existing) {
-    if (reservation.existing.actor !== peer.actor) {
+  const reservation = await runMcpReservedMutation(
+    source.db, peer.actor, idempotencyKey, source.clock.nowIso(), execute,
+  );
+  if (reservation.kind === "existing") {
+    if (reservation.actor !== peer.actor) {
       return respond(
         deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "MCP idempotency key belongs to another peer", {
           idempotencyKey,
         }),
       );
     }
-    if (!reservation.existing.result_json) {
+    if (!reservation.resultJson) {
       return respond(
         deny(ReasonCode.INGRESS_REPLAY_IGNORED, "MCP mutation is already reserved", { idempotencyKey }),
       );
     }
-    return JSON.parse(reservation.existing.result_json) as ToolResult;
-  }
-
-  let result: ToolResult;
-  try {
-    result = await execute();
-  } catch (error) {
-    // A thrown handler has no durable response for a retry to replay. Removing only this
-    // peer's unfinished row keeps a separate peer from taking its key while unblocking it.
-    releaseUnfinishedMcpReservation(source.db, peer.actor, idempotencyKey);
-    throw error;
+    return JSON.parse(reservation.resultJson) as ToolResult;
   }
   source.db.run(
     `UPDATE inbound_messages SET result_json = ? WHERE channel = 'mcp' AND nonce = ? AND actor = ?`,
-    [JSON.stringify(result), idempotencyKey, peer.actor],
+    [JSON.stringify(reservation.result), idempotencyKey, peer.actor],
   );
-  return result;
-};
-
-const reservationExpired = (receivedAt: string, now: string): boolean => {
-  const reservedAtMs = Date.parse(receivedAt);
-  const nowMs = Date.parse(now);
-  return Number.isFinite(reservedAtMs) && Number.isFinite(nowMs) && nowMs - reservedAtMs >= MCP_RESERVATION_TTL_MS;
+  return reservation.result;
 };
