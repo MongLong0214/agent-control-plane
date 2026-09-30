@@ -30,30 +30,63 @@ Optional Buzz configuration uses the same Keychain service and these account nam
 Buzz ingress settings must also be installed because the daemon rejects an unauthenticated
 actor-binding setup.
 
-Canonical self-claim is an optional, atomic activation group. Provision all seven accounts under
+Canonical self-claim is an optional, atomic activation group. Provision all three accounts under
 that same Keychain service to enable it:
 
-- `ACP_CANONICAL_SESSION_UUID`
-- `ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION`
-- `ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH`
-- `ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256`
-- `ACP_CANONICAL_CTO_BUZZ_ACTOR_ID`
+- `ACP_CANONICAL_SESSIONS_JSON`
 - `ACP_CANONICAL_CTO_PEER_PROTOCOL`
 - `ACP_CANONICAL_CTO_BUZZ_PURPOSE`
 
+`ACP_CANONICAL_SESSIONS_JSON` is a JSON array of at most 32 entries, each naming one running
+session and the whole of what it is entitled to:
+
+```json
+[{"sessionUuid":"<uuid>","projectId":"<project>","buzzActorId":"<actor>"}]
+```
+
+A session may be adopted only as `PRIMARY_CTO` of the `projectId` its own entry names, and it
+speaks on Buzz as that entry's `buzzActorId`. No two entries may share any of the three values.
+Every entry's `projectId` must already be registered: an entry naming a project this deployment
+holds no record of refuses startup rather than being dropped, so a configured session cannot come
+up entitled to a project that does not exist. Registration is all that is required here — whether
+a registered project is suspended or unhealthy is a runtime condition, decided while the daemon
+runs, and it does not hold startup. The check runs before the daemon starts, so it refuses a
+startup that would otherwise park for missing capacity too.
+An invalid or empty array refuses startup, and the refusal names the variable, never its contents.
+The unregistered-project refusal alone also names the zero-based index of the offending entry and
+how many entries there are.
+
 With none present, self-claim is disabled. Empty and whitespace-only values count as absent.
 Any nonempty proper subset refuses startup before config access, database opening, migration,
-or listener creation; diagnostics name missing variables, never their values. With all seven
+or listener creation; diagnostics name missing variables, never their values. With all three
 present, `ACP_BUZZ_CHANNEL` is also required. Channel-only transport configuration remains valid.
-The actor, protocol and purpose have no defaults: the configured values are retained from daemon
-entry and passed unchanged to the claim boundary.
+The session list, protocol and purpose have no defaults: the configured values are retained from
+daemon entry and passed unchanged to the claim boundary.
 
 `ACP_CANONICAL_CTO_WORKDIR` used to be the eighth. It pinned the one directory the canonical
 CTO's process could run from; nothing compares a working directory any more, so the group no
 longer carries a value that had to be kept correct for no reader. A deployment that still
 provisions it is not refused — the variable is simply ignored.
 
-The generated launcher clears all seven inherited variables together before its first Keychain
+`ACP_CANONICAL_SESSION_UUID` and `ACP_CANONICAL_CTO_BUZZ_ACTOR_ID` used to be two of the seven.
+They held one session's uuid and one session's Buzz identity, so a second canonical CTO could not
+be expressed and the project a claimant asked for was compared against nothing (#1005).
+`ACP_CANONICAL_SESSIONS_JSON` replaces both, and a deployment that still provisions either of the
+old two is not refused — they are simply ignored.
+
+`ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION`, `ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH` and
+`ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256` used to be three of the six. They pinned one CLI build —
+its version, its resolved path and the sha256 of its bytes — that every claimant's executing image
+had to equal, while each project's session runs whichever build it was started with; a session on
+an earlier build was refused, and one whose build the updater had since deleted from disk could
+never be admitted at all. The claim now records the executing image and requires nothing of it.
+That also withdraws what the realpath and sha256 comparison defended against: a same-user process
+exec'd from a binary renamed `claude` is no longer told apart by its bytes, and what bounds a claim
+is the kernel peer credential on the claim socket, the session UUID in the claimant's own argv and
+the project that UUID's entry names. A deployment that still provisions any of the three is not
+refused — they are simply ignored.
+
+The generated launcher clears all six inherited variables together before its first Keychain
 lookup, then reads each through the existing optional-account loop. These values are not written
 to the plist. Installation does not create `buzz-nostr-subscriber.json`; that separately provisioned
 subscriber config retains its existing authentication contract. Without it, an otherwise configured
@@ -81,11 +114,12 @@ that a CLI whose shebang resolves its interpreter by name receives the one this 
 carries.
 
 `/usr/sbin` is last, and is required for `lsof`, which ships only from there. A canonical
-self-claim resolves the claiming process's executing image by spawning `lsof` under its bare name
-and consulting no environment, so this `PATH` is the only channel that reaches the call: an
-absolute path baked into a variable has no reader. Without the directory every scan returns empty,
-the executing image resolves to null, and a genuine claim is refused as `CONFLICT` with evidence
-that carries a pid and names neither the missing tool nor the cause. It is admitted on the same
+self-claim reads the claiming process's working directory, and observes its executing image, by
+spawning `lsof` under its bare name and consulting no environment, so this `PATH` is the only
+channel that reaches the call: an absolute path baked into a variable has no reader. Without the
+directory the scan cannot run, the working directory cannot be read, and a genuine claim is
+refused as `PROBE_FAILED`. The executing image goes unobserved in the same case, which on its own
+refuses nothing: it is recorded, not required. The directory is admitted on the same
 footing as `/usr/bin` and `/bin`: a root-owned, mode `755`, SIP-`restricted`, non-user-writable
 system directory listed in `/etc/paths`, holding none of the names this control plane grants
 authority by. A provider directory is user-writable and carries unrelated siblings, which is why
@@ -131,6 +165,13 @@ deploy/install-launchd.sh stop
 deploy/install-launchd.sh start
 ```
 
+`start` and `restart` report success only after this start writes its completed-start record and
+launchd reports the same running pid across a short settle window. They wait up to 180 seconds
+for slow startup, but fail sooner when launchd shows a sustained missing pid: after five polls
+for a successful-exit refusal or 35 polls while allowing one throttled relaunch. If the job stays
+registered without a running daemon, they exit nonzero; inspect `agentctl daemon status` and
+`agentcpd.out.log` for the startup reason.
+
 `upgrade` saves the rendered plist and launcher under
 `~/.agent-control-plane/deploy-backups/`, stops the running job, renders the new release, and
 starts it. On the next open, the database takes a consistent pre-migration backup before any
@@ -154,7 +195,8 @@ A start that would migrate the database refuses instead (#738), because this app
 git checkout and a `pnpm build` run in it for any reason changes which `SCHEMA_VERSION` the next
 restart declares. The refusal exits 0, so `KeepAlive { SuccessfulExit = false }` leaves the job
 stopped rather than retrying every `ThrottleInterval`; it leaves `migration-refusal.json` in the
-state directory and `agentctl daemon status` reports it with no daemon running. `migration-plan`
+state directory and `agentctl daemon status` reports it with no daemon running. The installer
+therefore reports a failed start even though launchd retains the job. `migration-plan`
 reads the database read-only and prints what a start would do; `approve-migration` refuses a live
 lock, takes a validated recovery point, and writes an approval naming that exact chain and the
 database it is for, which is spent when the chain runs. An approval is a capability over one

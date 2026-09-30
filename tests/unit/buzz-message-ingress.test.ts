@@ -24,7 +24,7 @@ import {
   type BuzzSubscriberScheduler,
 } from "../../src/buzz/buzz-mention-subscriber.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { allow } from "../../src/core/errors.ts";
+import { allow, deny } from "../../src/core/errors.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import {
@@ -42,10 +42,12 @@ import {
   type BuzzMentionRouter,
 } from "../../src/ingress/buzz-message.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
+import type { GatewayEventSource } from "../../src/runtime/hermes-gateway-conversation.ts";
+import type { CeoTurnOutcome } from "../../src/mcp/ceo-conversation.ts";
 import {
-  C0_QUALIFIED_CLIENT,
   ROLE_WAKE_FRAME,
   RoleConversationPort,
+  WAKE_TRANSPORT_QUALIFIED_CLIENTS,
 } from "../../src/mcp/role-conversation.ts";
 import type { McpPeerAuthenticator } from "../../src/mcp/shared.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -175,12 +177,13 @@ const startMessageListener = async (
   harness: ReturnType<typeof makeHarness>,
   ceoConversation: CeoConversationPort,
   roleConversation?: RoleConversationPort,
+  gatewayConversation?: (text: string, source: GatewayEventSource) => Promise<CeoTurnOutcome>,
 ) =>
   startBuzzMessageIngressListener(
     harness.cp,
     tempDir("acp-buzz-message-"),
     { allowedActors: RELAY_ACTORS, secret: SECRET },
-    { ceoConversation, ownerActors: [OWNER], roleConversation },
+    { ceoConversation, ownerActors: [OWNER], roleConversation, gatewayConversation },
   );
 
 /**
@@ -339,11 +342,12 @@ const connectRolePeer = async (
   /**
    * The client build this connection announces.
    *
-   * Defaulted, because only one row needs a specific one: `role_wake_endpoint_register` is pinned
-   * to one qualified runtime build, so the row that registers an endpoint has to arrive as that
-   * build — named by `C0_QUALIFIED_CLIENT` rather than spelled out, so a re-qualification that
-   * moves the pin does not leave a stale literal behind that still passes. Every other row is unaffected by what it says here, and passing the pin unconditionally
-   * would have made those rows quietly depend on a version they never exercise.
+   * Defaulted, because only one row needs a specific one: `role_wake_endpoint_register` admits
+   * only the qualified runtime builds, so the row that registers an endpoint has to arrive as one
+   * of them — a member of `WAKE_TRANSPORT_QUALIFIED_CLIENTS` rather than a version spelled out, so
+   * a re-qualification that changes the set does not leave a stale literal behind that still
+   * passes. Every other row is unaffected by what it says here, and passing a member
+   * unconditionally would have made those rows quietly depend on a version they never exercise.
    */
   clientInfo: { name: string; version: string } = { name: "buzz-role-peer", version: "1" },
 ): Promise<{
@@ -425,7 +429,7 @@ const connectRolePeer = async (
 const fakeRolePeer = () =>
   ({
     server: {
-      getClientVersion: () => C0_QUALIFIED_CLIENT,
+      getClientVersion: () => WAKE_TRANSPORT_QUALIFIED_CLIENTS[0],
     },
   }) as never;
 
@@ -540,6 +544,64 @@ const listeningWakeEndpoint = async (
 };
 
 describe("the daemon's Buzz message ingress", () => {
+  it("uses the configured Gateway sender with signed provenance, not the attached MCP peer", async () => {
+    const harness = makeHarness();
+    bindCeo(harness);
+    const conversation = new CeoConversationPort();
+    const { peer, server } = fakeCeoPeer("MCP must not answer");
+    conversation.attach(server, stillCeo());
+    const calls: { text: string; source: GatewayEventSource }[] = [];
+    const listener = await startMessageListener(harness, conversation, undefined, async (text, source) => {
+      calls.push({ text, source });
+      return { contact: "REACHED", answered: allow(ReasonCode.OK, "Gateway answered") };
+    });
+    try {
+      const received = await exchangeSocketLines(listener.socketPath,
+        [envelope({ eventId: "evt-gateway", text: "진행 상황" })], hasReasonCode);
+      expect(JSON.parse(received.trim())).toMatchObject({
+        ok: true, reasonCode: ReasonCode.OK, answeredByCeo: true, answer: "Gateway answered",
+      });
+      expect(calls).toEqual([{ text: "진행 상황", source: {
+        eventId: "evt-gateway", actor: OWNER, conversation: "buzz-ceo-room",
+      } }]);
+      expect(peer.calls).toEqual([]);
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it.each([
+    ["NEVER_REACHED", ReasonCode.CEO_CONVERSATION_STALE, true],
+    ["REACHED", ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED, false],
+  ] as const)("keeps Gateway %s refusal on its own contact boundary", async (contact, reasonCode, resolved) => {
+    const harness = makeHarness();
+    bindCeo(harness);
+    const conversation = new CeoConversationPort();
+    const { peer, server } = fakeCeoPeer("MCP fallback is forbidden");
+    conversation.attach(server, stillCeo());
+    const eventId = `evt-gateway-${contact}`;
+    const listener = await startMessageListener(harness, conversation, undefined, async () => ({
+      contact, answered: deny(reasonCode, "Gateway refused"),
+    }));
+    try {
+      const received = await exchangeSocketLines(listener.socketPath,
+        [envelope({ eventId, text: "계세요?" })], hasReasonCode);
+      expect(JSON.parse(received.trim())).toMatchObject({
+        ok: true, reasonCode, answeredByCeo: false,
+      });
+      expect(peer.calls).toEqual([]);
+      const claim = harness.cp.db.get<{ turn_claim_json: string | null }>(
+        `SELECT turn_claim_json FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`,
+        [buzzMessageNonce(eventId)],
+      );
+      const stored = JSON.parse(claim!.turn_claim_json!) as Record<string, unknown>;
+      expect(typeof stored["repliedAt"] === "string").toBe(resolved);
+      expect(stored["noReplyAt"]).toBeUndefined();
+    } finally {
+      await listener.close();
+    }
+  });
+
   it("delivers an owner's Buzz message to the holder of the active CEO binding without spawning a session child", async () => {
     const harness = makeHarness();
     const ceoSessionId = bindCeo(harness);
@@ -577,6 +639,34 @@ describe("the daemon's Buzz message ingress", () => {
         process.getActiveResourcesInfo().filter((r) => r === "ChildProcess").length,
       ).toBe(childrenBefore);
       expect(harness.cp.bindings.active(roleKeyFor(Role.CEO))?.boundSessionId).toBe(ceoSessionId);
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("passes authenticated event provenance to the daemon CEO delivery interface", async () => {
+    const harness = makeHarness();
+    bindCeo(harness);
+    const conversation = new CeoConversationPort();
+    const { peer, server } = fakeCeoPeer("답");
+    conversation.attach(server, stillCeo());
+    const listener = await startMessageListener(harness, conversation);
+    const original = listener.seam.port.deliverToCeo;
+    const provenance: unknown[] = [];
+    listener.seam.port.deliverToCeo = async (text, source) => {
+      provenance.push(source);
+      return original(text, source);
+    };
+
+    try {
+      const response = await exchangeSocketLines(
+        listener.socketPath,
+        [envelope({ eventId: "evt-provenance", actor: OWNER, conversation: "buzz-ceo-room", text: "진행 상황" })],
+        hasReasonCode,
+      );
+      expect(JSON.parse(response.trim())).toMatchObject({ ok: true, reasonCode: ReasonCode.OK });
+      expect(peer.calls).toEqual(["진행 상황"]);
+      expect(provenance).toEqual([{ eventId: "evt-provenance", actor: OWNER, conversation: "buzz-ceo-room" }]);
     } finally {
       await listener.close();
     }
@@ -1419,7 +1509,7 @@ describe("the daemon's Buzz message ingress", () => {
     const peer = await connectRolePeer(
       ctoSocket,
       { token: MCP_TOKEN, sessionId: session.sessionId, sessionSecret: session.sessionSecret },
-      C0_QUALIFIED_CLIENT,
+      WAKE_TRANSPORT_QUALIFIED_CLIENTS[0],
     );
 
     // One directory for both, the way `main` has one `stateDir`: the ingress socket and the

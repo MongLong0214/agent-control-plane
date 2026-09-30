@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { accessSync, constants, existsSync, readFileSync, statSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { totalmem } from "node:os";
 
@@ -79,6 +79,83 @@ export const REPOSITORY_SWEEP_BUDGET_MS = 20_000;
  * daemon behind the very coordinator that would clear it.
  */
 export const CAPACITY_SWEEP_BUDGET_MS = 45_000;
+
+/**
+ * The environment variable each provider's pin is actually read from, copied from the site that
+ * reads it — `ControlPlane`'s adapter construction, `control-plane.ts:723`, `:753` and `:762`.
+ *
+ * Written out rather than derived, and the divergence is the whole reason. `ACP_` plus the
+ * upper-cased provider id plus `_BINARY` is the right answer for two of the three, which is what
+ * makes the transformation read as correct. It is wrong for the third: `CodexCliAdapter.provider`
+ * is `"gpt"` (`cli-adapters.ts:1873`) while the variable its pin comes from is `ACP_CODEX_BINARY`.
+ * `ACP_GPT_BINARY` is read nowhere in this repository, so a derived name would tell an operator to
+ * repoint a setting nothing consumes — a message that sends someone to the wrong place, which is
+ * precisely the failure `checkProviderExecutables` exists to prevent, reintroduced inside it.
+ *
+ * A provider absent from this map gets no variable named at all. Naming none is recoverable; the
+ * operator still has the path and the reinstall. Naming a guessed one is not.
+ */
+const PROVIDER_PIN_VARIABLE: Readonly<Record<string, string>> = {
+  claude: "ACP_CLAUDE_BINARY",
+  gpt: "ACP_CODEX_BINARY",
+  grok: "ACP_GROK_BINARY",
+};
+
+/**
+ * How a pin is unusable. Each one is a different repair, which is why they are not one "broken".
+ *
+ * `NOT_ON_PATH` is the pin that is a bare name, and it is not a stat result at all: it is
+ * `resolveExecutable`'s documented last return, meaning nothing of that name was on the daemon's
+ * PATH when the adapter was built. `UNREADABLE` covers EACCES on a parent, ELOOP and anything else
+ * that is not "not there" — folding those into `ABSENT` would send an operator to reinstall a
+ * binary sitting exactly where they put it.
+ */
+type PinCondition = "ABSENT" | "NOT_A_FILE" | "NOT_EXECUTABLE" | "UNREADABLE" | "NOT_ON_PATH";
+
+const PIN_CONDITION_PHRASE: Readonly<Record<Exclude<PinCondition, "NOT_ON_PATH">, string>> = {
+  ABSENT: "not there",
+  NOT_A_FILE: "not a regular file",
+  NOT_EXECUTABLE: "not executable",
+  UNREADABLE: "unreadable by this daemon",
+};
+
+/**
+ * Whether this pin can be spawned, as far as reading it can tell, and how it cannot when it cannot.
+ *
+ * A pin with no separator is `resolveExecutable`'s last return, and its contract is that nothing of
+ * that name was on the daemon's PATH when the adapter was built (`cli-adapters.ts`). Statting it
+ * would ask the wrong question twice over: the name is relative, so the stat resolves against the
+ * daemon's working directory rather than anything the spawn will search, and a directory named like
+ * the provider sitting there would answer it. `usage-collectors.ts:1184` already names this state —
+ * "a CLI outside the daemon's PATH resolves to a bare name and never starts".
+ *
+ * `statSync`, and deliberately neither `lstatSync` nor `realpathSync`: see
+ * `checkProviderExecutables`, which is where that choice is argued.
+ */
+const inspectPin = (path: string): { condition: PinCondition; error?: string } | null => {
+  if (!path.includes("/")) return { condition: "NOT_ON_PATH" };
+  try {
+    // Follows the link, the way the kernel will. Not canonicalised.
+    const stats = statSync(path);
+    if (!stats.isFile()) return { condition: "NOT_A_FILE" };
+    try {
+      accessSync(path, constants.X_OK);
+    } catch {
+      return { condition: "NOT_EXECUTABLE" };
+    }
+    return null;
+  } catch (err) {
+    // ENOENT and ENOTDIR are the only two that mean *not there*. EACCES on a parent directory,
+    // ELOOP, and anything else are a pin this daemon cannot read, which is a different sentence
+    // and a different repair — folding them into "absent" would send an operator to reinstall a
+    // binary that is sitting right where they put it.
+    const code = (err as NodeJS.ErrnoException).code;
+    return {
+      condition: code === "ENOENT" || code === "ENOTDIR" ? "ABSENT" : "UNREADABLE",
+      error: safeErrorMessage(err),
+    };
+  }
+};
 
 export interface Finding {
   code: string;
@@ -258,6 +335,47 @@ export type DoctorScope =
  * same overall status.
  */
 export class Doctor {
+  /**
+   * The findings a report must carry that this class cannot read for itself, registered once.
+   *
+   * Some of what "is the system healthy" means is only visible to the process that owns the
+   * listeners: whether the Telegram ingress is running, whether anything has arrived on the Buzz
+   * mention path, and which active bindings have a holder no wake can reach. None of that is in the
+   * database, so the doctor cannot read it, and it used to travel as `run()`'s third argument.
+   *
+   * A third argument is a guarantee every door has to remember, and two doors did not: the CTO and
+   * Hermes MCP `doctor_run` tools call `run(scope, target)` — the door an agent actually asks — so an
+   * agent could be told `HEALTHY` while a binding it holds was unwakeable and the wake it was
+   * waiting for was being stored rather than delivered (#1010). A supplier registered on the doctor
+   * itself is the same set for every door, including doors written after this one, because there is
+   * nothing left for a door to forget.
+   *
+   * The supplier receives the scope and decides for itself what that scope carries. The rule lives
+   * there and only there: it used to be spelled inline at one call site as
+   * `scope === "system" ? … : []`, and a rule spelled in two places is a rule two readers can
+   * disagree about.
+   *
+   * Only the daemon holding the single-instance lock registers: `Daemon.start()` does it after the
+   * lock is its own and after every refusal that gives the lock back, so the registered supplier is
+   * the lock holder's. Constructing a daemon registers nothing — a second daemon over one control
+   * plane that is then refused the lock never becomes the supplier, and so cannot empty the live
+   * daemon's report of the holders only the live daemon can see. Registering twice still replaces
+   * rather than appends, which is what a successor that starts after its predecessor's lock is
+   * released does. Appending would double every finding the previous supplier still reads, which is
+   * the one way this seam could make a report say something false about *how many* holders are
+   * unwakeable. Removal is by identity (`clearSupplementalFindings`), so a predecessor stopping late
+   * leaves its successor's supplier in place.
+   *
+   * With nothing registered a report carries no supplemental findings, and says so by omission
+   * rather than by a finding of its own. That is not an unmeasured state reported as clean: a
+   * control plane with no daemon has started no listeners, so there is no ingress that could be
+   * stopped and no connection that could be holding an unwakeable binding. That deployment is real
+   * and not hypothetical — every unit test that opens a control plane is one, and
+   * `scripts/probe-daemon-startup.ts` takes a system pass before it creates its daemon — and a
+   * finding for "no supplier" would fire on all of them while describing nothing.
+   */
+  #supplementalFindings: ((scope: DoctorScope) => readonly Finding[]) | null = null;
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
@@ -288,12 +406,45 @@ export class Doctor {
     },
   ) {}
 
+  /**
+   * Registers the one supplier every door's report draws its supplemental findings from.
+   *
+   * Called by `Daemon.start()` once it holds the lock, before its first doctor pass and before any
+   * listener it owns can serve a door. See
+   * `#supplementalFindings` for why this is a registration rather than an argument, what a second
+   * registration does, and what a report carries before there has been one.
+   */
+  setSupplementalFindings(supplier: (scope: DoctorScope) => readonly Finding[]): void {
+    this.#supplementalFindings = supplier;
+  }
+
+  /**
+   * Removes `supplier` only if it is still the registered one, and otherwise does nothing.
+   *
+   * The caller names what it registered rather than asking for "whatever is there", because the
+   * daemon that stops is not always the newest to register: a successor that registered after it
+   * holds the doctor's only supplier, and an unconditional clear from the old daemon's `stop()`
+   * would leave the successor's doors answering from nothing.
+   */
+  clearSupplementalFindings(supplier: (scope: DoctorScope) => readonly Finding[]): void {
+    if (this.#supplementalFindings === supplier) this.#supplementalFindings = null;
+  }
+
   async run(
     scope: DoctorScope = "system",
     target?: string,
     supplementalFindings: readonly Finding[] = [],
   ): Promise<DoctorReport> {
-    const findings: Finding[] = [...supplementalFindings];
+    // The registered set first, then the caller's own. `supplementalFindings` stays a parameter for
+    // findings that belong to *this* call and to no other — `Watchdog.tick` passes the
+    // `WATCHDOG_STALL` findings for the deadline that triggered the pass, which no later report
+    // should repeat — while the registered supplier carries what is true of the deployment whoever
+    // is asking. A caller that passes no third argument at all now gets the registered set, and
+    // that is the whole of #1010: both MCP doors are exactly such callers.
+    const findings: Finding[] = [
+      ...(this.#supplementalFindings?.(scope) ?? []),
+      ...supplementalFindings,
+    ];
 
     if (scope === "system" || scope === "cto" || scope === "project") {
       findings.push(...this.checkBindings(target ?? null));
@@ -306,6 +457,10 @@ export class Doctor {
       findings.push(...this.checkSessions(target ?? null));
     }
     if (scope === "system" || scope === "capacity") {
+      // Before the sensor files and before the sweep, because a pin that cannot be spawned is the
+      // cause of what both of those report. `--scope capacity` is where an operator looks when the
+      // numbers are wrong, so the cause has to be reachable from there and not only from `system`.
+      findings.push(...this.checkProviderExecutables());
       findings.push(...this.checkCapacitySensorFiles());
       findings.push(...(await this.checkCapacity()));
     }
@@ -785,12 +940,23 @@ export class Doctor {
         observedEvidence: {
           uncovered: plan.uncovered,
           unmeasured: plan.unmeasured,
+          // #954 — `uncovered` is empty in the one state that reaches PARTIAL_COVERAGE without an
+          // unstaffable role: a role continuity revoked, can staff again, and nobody holds. Without
+          // this the finding says a deployment is partly covered and names nothing, sending the
+          // reader to the providers when the missing thing is a claim on a role.
+          restorationPending: plan.restorationPending,
           action: plan.action,
           mode: plan.mode,
         },
+        // A role waiting on a claim is named in the sentence too, not only in the evidence: `action`
+        // alone reads PAUSE_NEW_WORK, which points at the providers, and no provider change will
+        // fill a role that continuity revoked. Only a claim creates that binding again.
         recommendedAction: nothingMeasured
           ? "no candidate provider has been measured for these roles; take a capacity reading before reading this as an outage"
-          : plan.action,
+          : plan.restorationPending.length > 0
+            ? `${plan.action}: ${plan.restorationPending.join(", ")} can be staffed again but nothing holds it; ` +
+              "continuity revoked the binding and does not recreate it, so the role waits on a claim, not on a provider"
+            : plan.action,
       });
     }
     return findings;
@@ -852,6 +1018,197 @@ export class Doctor {
       });
     }
     return findings;
+  }
+
+  /**
+   * #954 — read the pin back, because following one is not the same as having one.
+   *
+   * Each CLI adapter resolves its executable once, in its constructor, from a path an installer
+   * chose at some earlier time. Nothing has ever checked that the path still leads anywhere. On
+   * 2026-09-26 this host's daemon came up at 01:59:50Z holding
+   * `~/.local/share/claude/versions/2.1.278`; the provider's own updater repointed the stable name
+   * at 02:01Z and pruned that directory, and every capacity probe from then on spawned a path that
+   * did not exist. The deployment reported `sensorHealth: ERROR`, `runtimeHealth: UNAVAILABLE`,
+   * `buckets: []`, and continuity revoked the bound CTO role every ~3 minutes for eight
+   * generations. Four surfaces, every one of them a consequence, and not one of them said *the
+   * pinned binary is gone*.
+   *
+   * Three decisions are load-bearing here.
+   *
+   * **`statSync`, not `lstatSync` and not `realpathSync`.** `execve` follows symlinks at the
+   * moment of the call, so the readback has to follow them too: a stable name whose target has
+   * been pruned is the case that broke this host, and `lstat` reports that symlink as present.
+   * Canonicalising is the opposite error — the evidence would then name a versioned file the
+   * provider's updater owns rather than the pin an operator set, and on the pruned case there is
+   * no realpath left to name at all. The path in the evidence is the path as pinned.
+   *
+   * **This is a readback, not a guarantee.** Nothing here can close the window between the stat
+   * and the exec; re-resolving the pin inside the adapter before each spawn was considered and
+   * dropped for the same reason, plus the cost of a second resolution that has to stay in step
+   * with the one `execve` performs anyway. Copying the CLI into the installation generation so a
+   * generation "owns" a verified executable was dropped too: that is a second install the
+   * provider's updater never maintains, it re-freezes the version, and the copy diverges silently
+   * on every provider release.
+   *
+   * **Non-blocking, ERROR, exactly like the two checks either side of it.** This stops every probe
+   * and every invocation for one provider, which is a real ERROR; it does not make the daemon
+   * unsafe, and blocking on a missing thing parks the daemon behind the very operator step that
+   * would restore it (#950, #958). The daemon the operator reads this finding from has to be
+   * running for them to read it.
+   *
+   * An adapter with no `executablePath` is skipped and is not a finding: `ScriptedAdapter` and
+   * every other non-CLI adapter spawn nothing.
+   */
+  private checkProviderExecutables(): Finding[] {
+    const findings: Finding[] = [];
+
+    // `list()`, deliberately, and this is the blocker the first version shipped with. `production()`
+    // is `list().filter(a => a.isProduction && !hasRoleScoped(a.provider))`, and both
+    // `ClaudeCliAdapter`s are registered with `registerForRole` (`control-plane.ts:726`, `:740`
+    // carry `roles:`, and `:458` routes anything with `roles` there) — so `production()` excludes
+    // claude, and claude is the provider whose pin died. `production()`'s own docstring says which
+    // question this is: `list()` enumerates every provider the deployment has, role-scoped
+    // included, "because providerCount, the sweep budget derived from its length, and doctor's
+    // per-provider reads are facts about the provider set". Measured on the shipped composition
+    // with the three `ACP_*_BINARY` pins set: `list()` gives `['gpt','grok','claude']` and
+    // `production()` gives `['gpt','grok']`.
+    //
+    // `list()` collapses to one representative adapter per provider — `#adapters` first, then the
+    // first `#roleScoped` entry for a provider not already present — so this loop cannot emit two
+    // findings for one provider, which would be its own defect. Measured: two `ClaudeCliAdapter`s
+    // registered for `PRIMARY_CTO` and `BLIND_REVIEWER` with different binaries yield one `list()`
+    // entry carrying the first one's pin. The two shipped claude instances read the same
+    // `ACP_CLAUDE_BINARY`, so nothing is lost today; a deployment that gave them different pins
+    // would have the second one unread here.
+    //
+    // `list()` includes non-production adapters, which `production()` filtered out, so the filter
+    // is kept explicitly. It is not load-bearing for the pin — a fabricating adapter has no
+    // `executablePath` — but the question this check asks is about what the deployment spawns.
+    for (const adapter of this.providers.list()) {
+      if (!adapter.isProduction) continue;
+      const path = adapter.executablePath;
+      if (path === undefined) continue;
+
+      const unusable = inspectPin(path);
+      if (unusable === null) continue;
+
+      // The finding stays an inline literal here on purpose. `verify-reason-code-usage.mjs`
+      // recognises a catalogued code only as `findings.push({ … })` inside a method it names, so
+      // moving this into a helper made three census rows red — the gate stopped being able to see
+      // the code rather than the code stopping being emitted.
+      findings.push({
+        code: ReasonCode.PROVIDER_EXECUTABLE_UNUSABLE,
+        severity: "ERROR",
+        scope: `provider:${adapter.provider}`,
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: {
+          provider: adapter.provider,
+          path,
+          condition: unusable.condition,
+          ...(unusable.error ? { error: unusable.error } : {}),
+        },
+        recommendedAction: this.pinRepairAction(adapter.provider, path, unusable.condition),
+      });
+    }
+    return findings;
+  }
+
+  /**
+   * One finding, and the sentence an operator acts on.
+   *
+   * Two things in this message are read rather than derived, and both were wrong the first time.
+   *
+   * **Which setting to change.** `PROVIDER_PIN_VARIABLE` says which variable *can* pin a provider;
+   * it does not say that it *did*. `control-plane.ts:753` spreads `...overrides.gpt` after
+   * `binary: process.env["ACP_CODEX_BINARY"]`, so a deployment's `adapterOptions` wins over the
+   * environment. The variable is named only when its current value equals the pin in hand —
+   * compared both verbatim and through `resolve`, because `resolveExecutable` anchors a relative
+   * answer with `resolve` and leaves a bare name alone — and the sentence says exactly that
+   * relationship, adding that `adapterOptions`, where a deployment supplies them, are what win.
+   * Equality is not provenance: a deployment whose override carries the same path as the variable
+   * matches here while never reading the variable, and claiming causation would send that operator
+   * to restart into no change. See `variableMatchingPin` for why establishing provenance is not in
+   * this slice.
+   *
+   * **Whether a restart is needed.** Not always, and the first version asserted it unconditionally.
+   * Since #998 the pin is the name an updater maintains rather than the version behind it, so
+   * restoring an executable file *at that exact path* takes effect at the next spawn — `execve`
+   * resolves the retained pin again each time. What needs a restart is changing *which* path is
+   * pinned, because `resolveExecutable` runs once in the constructor. The message says which case
+   * each repair is in rather than sending everyone to a restart.
+   *
+   * **Which PATH, and when it was read.** `NOT_ON_PATH` used to say "the daemon's PATH" and "no
+   * invocation of this provider has ever started". Both overclaimed. The set a spawn searches is
+   * `agentPath()` (`cli-adapters.ts:179`) — the node binary's directory plus `/usr/bin`, `/bin`,
+   * `/usr/sbin` and `/sbin` — which excludes `/opt/homebrew/bin` and `/usr/local/bin` that the
+   * launcher's PATH does include, so an operator following "install it on the daemon's PATH" could
+   * satisfy that and still not be reachable. And the condition is inferred from the pin's shape at
+   * construction and never re-measured, so a CLI installed after startup is spawnable while this
+   * finding still reads the same way. The message now states the reading and its time.
+   */
+  private pinRepairAction(provider: string, path: string, condition: PinCondition): string {
+    const matching = this.variableMatchingPin(provider, path);
+    const repoint =
+      matching !== undefined
+        ? `${matching}, whose current value is this pin — though if this deployment supplies ` +
+          `adapterOptions for ${provider}, those win over the variable and are what to change`
+        : `whichever setting supplies this pin — it is not the current value of ` +
+          `${PROVIDER_PIN_VARIABLE[provider] ?? "any ACP_*_BINARY variable"}, so this ` +
+          `deployment's adapterOptions may own it`;
+    const restart =
+      `to pin a different path, change ${repoint}, then restart the daemon, which resolves the ` +
+      `pin once at construction`;
+    if (condition === "NOT_ON_PATH") {
+      return (
+        `the pin is the bare name ${path}. That is what resolution answered when it ran once, as ` +
+        `the adapter was built, and found nothing of that name on the daemon's own PATH; it has ` +
+        `not been measured since, so a CLI installed after startup is live at the next spawn ` +
+        `while this finding still reads this way. For the repair, the set that matters is not the ` +
+        `daemon's PATH: a provider is spawned with the node binary's directory plus /usr/bin, ` +
+        `/bin, /usr/sbin and /sbin, so /opt/homebrew/bin and /usr/local/bin are never searched ` +
+        `however the daemon's own PATH is set. Install the CLI where that set reaches it, or ` +
+        `${restart}. The name in this finding is not a file to restore: it is relative, and a ` +
+        `directory of that name beside the daemon would satisfy a stat while a spawn still ` +
+        `searches a PATH`
+      );
+    }
+    return (
+      `the pin is ${path} and it is ${PIN_CONDITION_PHRASE[condition]}. Restoring an executable ` +
+      `file at that exact path needs no restart — the daemon retained the pin and the spawn ` +
+      `resolves it again each time — and ${restart}`
+    );
+  }
+
+  /**
+   * The environment variable whose current value equals this pin, or `undefined` when none does.
+   *
+   * Equality, and the name says only that. It is **not** provenance and the message must not read
+   * as if it were: `control-plane.ts:753` applies `...overrides` after `binary:`, so a deployment
+   * whose `adapterOptions` happen to carry the same path as the variable produces this match while
+   * the variable is not read at all — and an operator sent to change it would restart into no
+   * change. The adapter cannot settle this: `CliAdapterOptions.binary` is one string with no
+   * provenance, and plumbing a source through reaches the three adapter constructors and the
+   * composition root. So the check states the relationship it measured and names `adapterOptions`
+   * as what wins where a deployment supplies them.
+   *
+   * `undefined` is the safe answer, and the message degrades to naming no specific setting. Naming
+   * none leaves the operator the path and the reinstall; naming one that is not read sends them to
+   * change a value nothing consumes, which is the failure this whole check exists to report.
+   *
+   * Limit: this under-reports for a pin that `resolveExecutable` found by searching PATH. The
+   * variable then holds a bare name while the pin is `resolve(join(directory, name))`, so neither
+   * comparison matches and a variable that really did supply the pin is reported as not matching.
+   * Not repaired here on purpose — re-running the PATH search inside the doctor is the second
+   * resolution this slice already ruled out, and the failure is in the safe direction: the message
+   * names no setting instead of the wrong one.
+   */
+  private variableMatchingPin(provider: string, path: string): string | undefined {
+    const variable = PROVIDER_PIN_VARIABLE[provider];
+    if (variable === undefined) return undefined;
+    const value = process.env[variable];
+    if (value === undefined || value === "") return undefined;
+    return value === path || resolve(value) === path ? variable : undefined;
   }
 
   /** The daemon owns these files, so their timestamp is independently checkable evidence. */

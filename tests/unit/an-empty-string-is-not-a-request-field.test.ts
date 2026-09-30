@@ -36,6 +36,7 @@ const REQUEST = {
 const depsWith = (core: ReturnType<typeof makeCore>): CanonicalSelfClaimOperatorDeps => ({
   db: core.db,
   clock: core.clock,
+  audit: core.audit,
   sessions: core.sessions,
   bindings: core.bindings,
   buzzActorAuthenticator: new IngressGuard(core.db, core.clock, core.audit, {
@@ -45,14 +46,13 @@ const depsWith = (core: ReturnType<typeof makeCore>): CanonicalSelfClaimOperator
   config: {
     expectedPeerProtocolVersion: "fixture-protocol",
     expectedPeerIdentity: `uid:${PEER.uid}`,
-    canonicalSessionUuid: REQUEST.claimedSessionUuid,
-    requiredExecutorVersion: "0.0.0",
+    canonicalSessions: [{
+      sessionUuid: REQUEST.claimedSessionUuid,
+      projectId: REQUEST.projectId,
+      buzzActorId: "fixture-actor",
+    }],
     canonicalBuzzChannelId: "fixture-channel",
-    expectedExecutorRealpath: "/tmp/fixture-claude",
-    expectedExecutorSha256: `sha256:${"b".repeat(64)}`,
     peerProtocolVersion: "fixture-protocol",
-    buzzChannelId: "fixture-channel",
-    buzzActorId: "fixture-actor",
     buzzPurpose: "fixture-purpose",
   },
 });

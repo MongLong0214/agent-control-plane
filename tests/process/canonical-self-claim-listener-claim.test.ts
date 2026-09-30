@@ -5,8 +5,6 @@ import {
   linkSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
-  realpathSync,
   rmSync,
   statSync,
   unlinkSync,
@@ -29,15 +27,17 @@ import {
 import type { Daemon } from "../../src/daemon/daemon.ts";
 import { IngressGuard } from "../../src/ingress/ingress-guard.ts";
 import { allow, type Decision } from "../../src/core/errors.ts";
-import { sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { makeDefaultTranscriptReader } from "../../src/registry/canonical-self-claim.ts";
 import { boundedExecFileSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeStartedOperator, type Harness, type StartedOperator } from "../helpers/harness.ts";
 
-/** Synthetic — never a value that names a real deployment's version. */
-const TEST_REQUIRED_EXECUTOR_VERSION = "9.0.0-test";
+/**
+ * Synthetic — never a value that names a real deployment's version. The build the claiming
+ * process is laid out as; the claim records it and compares it against nothing.
+ */
+const TEST_EXECUTOR_VERSION = "9.0.0-test";
 
 /**
  * The mint/claim separation for canonical self-claim (#760): a process may prove who it is, but
@@ -152,8 +152,8 @@ const copyToStaging = (staging: string): void => {
  * machine-wide (#817).
  *
  * A hardlink cannot replace the copy: `lsof` reports an inode's *primary* link, so a second link
- * to the real node binary is reported at the real node binary's own path, where the version this
- * whole file turns on — the `/versions/<version>/` segment — does not appear at all. Measured on
+ * to the real node binary is reported at the real node binary's own path, where the
+ * `/versions/<version>/` segment the claim reads its observed version from does not appear at all. Measured on
  * this machine, not assumed.
  *
  * Published by cloning to a private staging path and `link()`ing that into place, so the
@@ -255,7 +255,7 @@ const claimAsRealClaudeProcess = (
   requestBody: Record<string, unknown>,
   sessionUuid: string = TEST_SESSION_UUID,
 ): Promise<Decision<unknown>> => {
-  const claude = writeVersionedClaude(TEST_REQUIRED_EXECUTOR_VERSION);
+  const claude = writeVersionedClaude(TEST_EXECUTOR_VERSION);
   writeTranscriptFixture(root, sessionUuid);
   const child = spawnAndSendOneRequest(claude, socketPath, ["--session-id", sessionUuid], root, requestBody);
   return waitForClaimResult(child);
@@ -285,6 +285,32 @@ const rowCounts = (cp: Harness["cp"]): Record<(typeof ROLLBACK_TABLES)[number], 
     ROLLBACK_TABLES.map((table) => [table, cp.db.get<{ c: number }>(`SELECT COUNT(*) AS c FROM ${table}`)?.c ?? -1]),
   ) as Record<(typeof ROLLBACK_TABLES)[number], number>;
 
+/**
+ * The rollback oracle. The mutation tables hold what they held before, and the *whole* of what
+ * `audit_events` gained since `before` — every row, whatever its kind — is exactly the one row
+ * `CanonicalSelfClaim.claim()` records for the refusal it returned, carrying the reason code that
+ * refusal crossed the socket with.
+ *
+ * It compares the full delta rather than leaving the decision kinds out of the count, which it
+ * used to: then a leak written under either kind — a second refusal row, or an admission row the
+ * rollback should have taken with it — passed. `audit_events` is append-only and ordered by
+ * insertion, so offsetting by the earlier count isolates exactly what was written after it.
+ */
+const expectRolledBack = (
+  cp: Harness["cp"],
+  before: Record<(typeof ROLLBACK_TABLES)[number], number>,
+  refusal: Decision<unknown>,
+): void => {
+  expect(refusal.allowed, JSON.stringify(refusal)).toBe(false);
+  expect(
+    cp.db.all<{ kind: string; reason_code: string | null }>(
+      `SELECT kind, reason_code FROM audit_events ORDER BY event_id LIMIT -1 OFFSET ?`,
+      [before.audit_events],
+    ),
+  ).toEqual([{ kind: "CANONICAL_SELF_CLAIM_REFUSED", reason_code: refusal.reasonCode }]);
+  expect(rowCounts(cp)).toEqual({ ...before, audit_events: before.audit_events + 1 });
+};
+
 const insertProject = (cp: Harness["cp"], projectId: string): void => {
   cp.db.run(`INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)`, [
     projectId, projectId, cp.clock.nowIso(),
@@ -310,6 +336,8 @@ const BUZZ_CHANNEL_ID = "channel:test-canonical";
 const PEER_PROTOCOL = "acp.operator/v1";
 const BUZZ_PURPOSE = "continuity:PRIMARY_CTO";
 const TEST_SESSION_UUID = "99999999-9999-4999-8999-999999999999";
+/** The one project the configured entry entitles `TEST_SESSION_UUID` to hold. */
+const TEST_PROJECT_ID = "prj_canonical_fixture";
 
 const startMintOperator = async (): Promise<StartedOperator> => {
   const started = await makeStartedOperator();
@@ -324,22 +352,12 @@ const resolveBuzzAddressFixture = (
 const depsFor = (
   cp: Harness["cp"],
   root: string,
-  options: { sessionUuid?: string; maxAncestryHops?: number } = {},
+  options: { sessionUuid?: string; projectId?: string; maxAncestryHops?: number } = {},
 ): CanonicalSelfClaimOperatorDeps => {
-  // This runs inside the request handler closure, so it executes on every request — after
-  // `claimAsRealClaudeProcess` has already asked for this exact fixture and spawned the claiming
-  // process from it. `writeVersionedClaude` returns the *same file* every time rather than a new
-  // inode, so asking again here cannot replace anything out from under a process already running
-  // that image — the resolved-path-vs-live-image mismatch clause 2's image check exists to
-  // refuse. The call is unconditional precisely because it is now idempotent: the wrong-process
-  // test never spawns a claude process at all, and still needs a real path and real bytes to
-  // configure the expectation against.
-  const claudePath = writeVersionedClaude(TEST_REQUIRED_EXECUTOR_VERSION);
-  const expectedExecutorRealpath = realpathSync(claudePath);
-  const expectedExecutorSha256 = sha256(readFileSync(claudePath));
   return {
     db: cp.db,
     clock: cp.clock,
+    audit: cp.audit,
     sessions: cp.sessions,
     bindings: cp.bindings,
     buzzActorAuthenticator: new IngressGuard(cp.db, cp.clock, cp.audit, {
@@ -349,14 +367,13 @@ const depsFor = (
     config: {
       expectedPeerProtocolVersion: PEER_PROTOCOL,
       expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
-      canonicalSessionUuid: options.sessionUuid ?? TEST_SESSION_UUID,
-      requiredExecutorVersion: TEST_REQUIRED_EXECUTOR_VERSION,
+      canonicalSessions: [{
+        sessionUuid: options.sessionUuid ?? TEST_SESSION_UUID,
+        projectId: options.projectId ?? TEST_PROJECT_ID,
+        buzzActorId: BUZZ_ACTOR_ID,
+      }],
       canonicalBuzzChannelId: BUZZ_CHANNEL_ID,
-      expectedExecutorRealpath,
-      expectedExecutorSha256,
       peerProtocolVersion: PEER_PROTOCOL,
-      buzzChannelId: BUZZ_CHANNEL_ID,
-      buzzActorId: BUZZ_ACTOR_ID,
       buzzPurpose: BUZZ_PURPOSE,
     },
     claimDeps: {
@@ -370,7 +387,7 @@ const startClaimListener = async (
   daemon: Pick<Daemon, "lock">,
   cp: Harness["cp"],
   root: string,
-  options: { sessionUuid?: string; maxAncestryHops?: number } = {},
+  options: { sessionUuid?: string; projectId?: string; maxAncestryHops?: number } = {},
 ): Promise<CanonicalSelfClaimListener> => {
   const listener = await startCanonicalSelfClaimListener(daemon, tempRoot(), (peer, params) =>
     executeCanonicalSelfClaimOperator(peer, params, depsFor(cp, root, options)),
@@ -388,7 +405,7 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
       const projectId = "prj_operator_success";
       insertProject(cp, projectId);
       const root = tempRoot();
-      const listener = await startClaimListener(started.daemon, cp, root);
+      const listener = await startClaimListener(started.daemon, cp, root, { projectId });
 
 
       const before = rowCounts(cp);
@@ -411,14 +428,14 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
 
 
   it(
-    "a second claim at a generation already committed denies with no new claim state or audit",
+    "a second claim at a generation already committed denies with no new claim state and no audit row beyond its own decision",
     async () => {
       const started = await startMintOperator();
       const { cp } = started.harness;
       const projectId = "prj_operator_replay";
       insertProject(cp, projectId);
       const root = tempRoot();
-      const listener = await startClaimListener(started.daemon, cp, root);
+      const listener = await startClaimListener(started.daemon, cp, root, { projectId });
 
 
       const first = await claimAsRealClaudeProcess(root, listener.socketPath, {
@@ -433,7 +450,7 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
         params: { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1 },
       });
       expect(replay.allowed).toBe(false);
-      expect(rowCounts(cp)).toEqual(afterFirst);
+      expectRolledBack(cp, afterFirst, replay);
     },
     45_000,
   );
@@ -447,7 +464,7 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
       insertProject(cp, projectId);
       const root = tempRoot();
 
-      const listener = await startClaimListener(started.daemon, cp, root, { maxAncestryHops: 1 });
+      const listener = await startClaimListener(started.daemon, cp, root, { projectId, maxAncestryHops: 1 });
 
 
       const before = rowCounts(cp);
@@ -457,7 +474,7 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
       });
 
       expectClosedPublicDenial(result, ReasonCode.CONFLICT);
-      expect(rowCounts(cp)).toEqual(before);
+      expectRolledBack(cp, before, result);
     },
     45_000,
   );

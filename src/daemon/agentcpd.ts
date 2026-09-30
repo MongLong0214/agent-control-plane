@@ -21,6 +21,13 @@ import {
 } from "../bootstrap/hermes-bootstrap.ts";
 import { createHermesIncumbentAdoption } from "../bootstrap/hermes-incumbent-adoption.ts";
 import { createHermesGatewayIdentityReader } from "../runtime/hermes-gateway-identity.ts";
+import { createHermesGatewayConversationSender } from "../runtime/hermes-gateway-conversation.ts";
+import {
+  assertCanonicalSessionsValid,
+  type CanonicalAdoptableSession,
+} from "../registry/canonical-self-claim.ts";
+import { readProcessStartToken } from "../core/process-argv.ts";
+import { processStartedAt } from "../core/process-identity.ts";
 import { BuzzAdapter, BuzzCliTransport } from "../buzz/buzz-adapter.ts";
 import {
   BUZZ_MENTION_ADDRESSED_TO,
@@ -68,7 +75,8 @@ import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/
 import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
 import { createCtoMcpPort, createCtoServer } from "../mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../mcp/hermes-server.ts";
-import { CeoConversationPort } from "../mcp/ceo-conversation.ts";
+import { CeoConversationPort, type CeoTurnOutcome } from "../mcp/ceo-conversation.ts";
+import type { GatewayEventSource } from "../runtime/hermes-gateway-conversation.ts";
 import {
   RoleConversationPort,
   type OwnerMessageHandover,
@@ -215,17 +223,32 @@ export interface LocalMcpListeners {
   close(): Promise<void>;
 }
 
-/** Main's live listener composition: CEO CONFIRM is handed to the lock-held daemon. */
-export const startDaemonMcpListeners = (
+/**
+ * Main's live listener composition: CEO CONFIRM is handed to the lock-held daemon, and the CTO wake
+ * port is handed to its report.
+ *
+ * The second hand-over is what makes a binding that cannot receive wakes visible. It lives here
+ * rather than in `main` so a test holding a real `Daemon` and these real listeners exercises the
+ * same line production runs; `setWakeTransportPeers` is optional in this parameter only because
+ * several callers pass a bare `finalizeApprovedRun` object, and a real daemon always has it.
+ */
+export const startDaemonMcpListeners = async (
   cp: ControlPlane,
   stateDir: string,
   token: string,
-  daemon: { finalizeApprovedRun(runId: string): void | Promise<unknown>; attachments?: RoleAttachmentCredentials },
-): Promise<LocalMcpListeners> =>
-  startLocalMcpListeners(cp, stateDir, token, {
+  daemon: {
+    finalizeApprovedRun(runId: string): void | Promise<unknown>;
+    attachments?: RoleAttachmentCredentials;
+    setWakeTransportPeers?(peers: RoleConversationPort): void;
+  },
+): Promise<LocalMcpListeners> => {
+  const listeners = await startLocalMcpListeners(cp, stateDir, token, {
     onCeoApproved: (runId) => daemon.finalizeApprovedRun(runId),
     ...(daemon.attachments ? { attachments: daemon.attachments } : {}),
   });
+  daemon.setWakeTransportPeers?.(listeners.ctoConversation);
+  return listeners;
+};
 
 /** Tests shorten the deadline without weakening the daemon's production default. */
 export interface LocalMcpListenerOptions {
@@ -774,6 +797,8 @@ export const startBuzzMessageIngressListener = async (
   options: {
     ceoConversation: CeoConversationPort;
     ownerActors: readonly string[];
+    /** Daemon-owned existing-session sender; when present, never fall back to MCP. */
+    gatewayConversation?: (text: string, source: GatewayEventSource) => Promise<CeoTurnOutcome>;
     /**
      * B2's live-peer port, for events addressed to a role by `p` tag.
      *
@@ -808,7 +833,8 @@ export const startBuzzMessageIngressListener = async (
   const ingress = new BuzzMessageIngress(guard, options.ownerActors, buzzMentionRouter(cp));
   const roleConversation = options.roleConversation ?? null;
   const port: BuzzMessageTurnPort = {
-    deliverToCeo: (text) => deliverAsCeoTurn(options.ceoConversation, text),
+    deliverToCeo: (text, source) =>
+      deliverAsCeoTurn(options.ceoConversation, text, source, options.gatewayConversation),
     // Read at claim time, from the binding registry rather than from the peer: the fence is
     // "which CEO generation was this turn claimed under", and the peer cannot be its own
     // authority for that. Telegram's production composition still passes none (#639's seam is
@@ -931,10 +957,12 @@ export const startDaemonBuzzMessageIngress = (
   policy: IngressPolicy,
   listeners: Pick<LocalMcpListeners, "ceoConversation" | "ctoConversation">,
   ownerActors: readonly string[],
+  gatewayConversation?: (text: string, source: GatewayEventSource) => Promise<CeoTurnOutcome>,
 ): Promise<LocalBuzzMessageIngress> =>
   startBuzzMessageIngressListener(cp, stateDir, policy, {
     ceoConversation: listeners.ceoConversation,
     ownerActors,
+    gatewayConversation,
     // The other half of #760 B4: a `p` tag that resolves to the CTO has somewhere to go. Without
     // this line resolution still happens and every role delivery refuses with ROLE_PEER_ABSENT,
     // which is the state that had a person carrying messages between the two roles.
@@ -1202,6 +1230,78 @@ const HERMES_ADOPTION_VARS = [
   "ACP_HERMES_HOME", "ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY", "ACP_HERMES_GATEWAY_API_KEY",
 ] as const;
 
+const configuredHermesAdoptionValues = (configuration: Readonly<Record<string, string | undefined>>) => {
+  const values = Object.fromEntries(HERMES_ADOPTION_VARS.map((key) => [key, configuration[key]])) as
+    Record<(typeof HERMES_ADOPTION_VARS)[number], string | undefined>;
+  const validText = (value: string | undefined): value is string =>
+    typeof value === "string" && value.trim() === value && value.length > 0 &&
+    value.length <= 512 && !/[\x00-\x1f\x7f]/.test(value);
+  return HERMES_ADOPTION_VARS.every((key) => validText(values[key])) &&
+    isDigest(values.ACP_HERMES_LINEAGE_ROOT_DIGEST) &&
+    /^[\x21-\x7e]+$/.test(values.ACP_HERMES_GATEWAY_API_KEY ?? "") ? values : null;
+};
+
+/** A configured route must never revert to the independently attached MCP peer. */
+export const createConfiguredHermesGatewayConversation = (
+  cp: ControlPlane,
+  configuration: Readonly<Record<string, string | undefined>>,
+  ports: {
+    senderFactory?: typeof createHermesGatewayConversationSender;
+    processStartToken?: typeof readProcessStartToken;
+    processStartedAt?: typeof processStartedAt;
+    authorityHeld?: () => boolean;
+  } = {},
+): ((text: string, source: GatewayEventSource) => Promise<CeoTurnOutcome>) | undefined => {
+  if (!HERMES_ADOPTION_VARS.some((key) => configuration[key] !== undefined)) return undefined;
+  const values = configuredHermesAdoptionValues(configuration);
+  const refuse = (): CeoTurnOutcome => ({ contact: "NEVER_REACHED",
+    answered: deny(ReasonCode.CEO_CONVERSATION_STALE, "adopted Gateway CEO target unavailable") });
+  const currentAuthority = () => {
+    if (!values || (ports.authorityHeld && !ports.authorityHeld())) return null;
+    const binding = cp.bindings.active("CEO");
+    if (!binding || binding.status !== "ACTIVE") return null;
+    const session = cp.sessions.get(binding.sessionId);
+    const target = cp.db.get<{ executor_kind: string; target_locator: string;
+      target_locator_digest: string }>(
+      `SELECT tb.executor_kind, tb.target_locator, tb.target_locator_digest
+         FROM actor_target_bindings tb
+         JOIN assignments a ON a.actor_id = tb.target_actor_id
+        WHERE a.assignment_id = ? AND a.role_key = 'CEO' AND a.status = 'ACTIVE'
+          AND a.binding_generation = ? AND a.session_id = ? AND a.session_incarnation = ?`,
+      [binding.assignmentId, binding.bindingGeneration, binding.sessionId, binding.sessionIncarnation],
+    );
+    if (!session || session.lifecycle !== SessionLifecycle.READY || session.incarnation !== binding.sessionIncarnation ||
+        session.provider !== "hermes" || !Number.isSafeInteger(session.osPid) || !session.osPid ||
+        session.osPid <= 0 || !session.osProcessStartedAt ||
+        (ports.processStartedAt ?? processStartedAt)(session.osPid) !== session.osProcessStartedAt ||
+        !target || target.executor_kind !== "hermes" ||
+        target.target_locator !== values.ACP_HERMES_EXPECTED_LIVE_SESSION_ID ||
+        target.target_locator_digest !== values.ACP_HERMES_LINEAGE_ROOT_DIGEST) return null;
+    const startToken = (ports.processStartToken ?? readProcessStartToken)(session.osPid);
+    if (!startToken || (ports.authorityHeld && !ports.authorityHeld())) return null;
+    return { assignmentId: binding.assignmentId, bindingGeneration: binding.bindingGeneration,
+      sessionId: binding.sessionId, sessionIncarnation: binding.sessionIncarnation,
+      processPid: session.osPid, startToken };
+  };
+  return async (text, source) => {
+    const pinned = currentAuthority();
+    if (!values || !pinned) return refuse();
+    return (ports.senderFactory ?? createHermesGatewayConversationSender)({
+      apiKey: values["ACP_HERMES_GATEWAY_API_KEY"]!, binding: "acp-canonical-ceo",
+      expected: { session_id: values.ACP_HERMES_EXPECTED_LIVE_SESSION_ID!,
+        lineage_root_digest: values.ACP_HERMES_LINEAGE_ROOT_DIGEST!,
+        process_pid: pinned.processPid, process_started_at: pinned.startToken },
+      preDispatch: () => {
+        const current = currentAuthority();
+        return current !== null && current.assignmentId === pinned.assignmentId &&
+          current.bindingGeneration === pinned.bindingGeneration && current.sessionId === pinned.sessionId &&
+          current.sessionIncarnation === pinned.sessionIncarnation && current.processPid === pinned.processPid &&
+          current.startToken === pinned.startToken;
+      },
+    })(text, source);
+  };
+};
+
 /** Capture independent daemon configuration before exposing the operator method. */
 export const createConfiguredHermesIncumbentAdoption = (
   cp: ControlPlane,
@@ -1212,14 +1312,8 @@ export const createConfiguredHermesIncumbentAdoption = (
     authorityHeld?: () => boolean;
   } = {},
 ): (() => Promise<Decision<unknown>>) | undefined => {
-  const values = Object.fromEntries(HERMES_ADOPTION_VARS.map((key) => [key, configuration[key]])) as
-    Record<(typeof HERMES_ADOPTION_VARS)[number], string | undefined>;
-  const validText = (value: string | undefined): value is string =>
-    typeof value === "string" && value.trim() === value && value.length > 0 &&
-    value.length <= 512 && !/[\x00-\x1f\x7f]/.test(value);
-  if (!HERMES_ADOPTION_VARS.every((key) => validText(values[key])) ||
-      !isDigest(values.ACP_HERMES_LINEAGE_ROOT_DIGEST) ||
-      !/^[\x21-\x7e]+$/.test(values.ACP_HERMES_GATEWAY_API_KEY ?? "")) return undefined;
+  const values = configuredHermesAdoptionValues(configuration);
+  if (!values) return undefined;
 
   const readGateway = (ports.identityReader ?? createHermesGatewayIdentityReader)({
     apiKey: values.ACP_HERMES_GATEWAY_API_KEY!,
@@ -2572,8 +2666,13 @@ export const answerAsCeo = async (
 export const deliverAsCeoTurn = async (
   port: CeoConversationPort,
   text: string,
+  // Provenance reaches this delivery boundary; do not add it to the runtime prompt/transport.
+  source: Pick<BuzzMessageIngressInput, "eventId" | "actor" | "conversation">,
+  gatewayConversation?: (text: string, source: GatewayEventSource) => Promise<CeoTurnOutcome>,
 ): Promise<CeoTurnDelivery> => {
-  const outcome = await port.attempt(text);
+  const outcome = gatewayConversation
+    ? await gatewayConversation(text, source)
+    : await port.attempt(text);
   const reachedCeo = outcome.contact === "REACHED";
   if (outcome.answered.allowed) {
     return { answer: outcome.answered.value, reachedCeo, reasonCode: ReasonCode.OK };
@@ -2870,6 +2969,56 @@ export interface AgentcpdMainContext {
   ceoConversation: CeoConversationPort | null;
 }
 
+// Shape only — that this is an array of objects carrying exactly these three string keys, so an
+// unrecognised key in the deployment's JSON is refused rather than ignored. Emptiness, the size
+// bound, blank and padded fields, UUID form and uniqueness are `assertCanonicalSessionsValid`'s,
+// which the claim's constructor calls too. Restating any of them here would put the same rule in
+// two places, and the half kept here is the half that runs at startup.
+const canonicalSessionsSchema = z.array(
+  z
+    .object({
+      sessionUuid: z.string(),
+      projectId: z.string(),
+      buzzActorId: z.string(),
+    })
+    .strict(),
+);
+
+/**
+ * Which running sessions this deployment may adopt, and what each one is entitled to.
+ *
+ * One variable holding a list rather than a pair of scalars holding one session's uuid and one
+ * session's Buzz channel identity, because the scalars made the cardinality a property of the
+ * config *shape*: a second CTO could not be expressed at all, and the project a claimant asked
+ * for was never compared against anything, so the single entitled session could hold
+ * `PRIMARY_CTO` for every registered project (#1005). An entry is the whole entitlement — the
+ * session, the one project it may hold, and the channel identity it speaks as — so neither half
+ * can be configured without the other.
+ *
+ * Deliberately the same shape as `ACP_CTO_BINDING_TARGETS_JSON`: a bounded JSON array parsed once
+ * at startup, whose refusal names the variable and never its contents.
+ */
+export const configuredCanonicalSessions = (raw: string): readonly CanonicalAdoptableSession[] => {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(raw);
+  } catch {
+    throw new Error("ACP_CANONICAL_SESSIONS_JSON is invalid");
+  }
+  const parsed = canonicalSessionsSchema.safeParse(decoded);
+  if (!parsed.success) throw new Error("ACP_CANONICAL_SESSIONS_JSON is invalid");
+  // The semantic rule, at startup, through the same function the claim's constructor uses. Without
+  // this call the shape check passed a set with two entries sharing a uuid, the listener started
+  // and reported itself up, and every claim then failed with INTERNAL_ERROR from the constructor —
+  // while `deploy/README.md` said an invalid array refuses startup. The message names the variable
+  // and never its contents, like every other refusal on this path.
+  try {
+    return assertCanonicalSessionsValid(parsed.data);
+  } catch {
+    throw new Error("ACP_CANONICAL_SESSIONS_JSON is invalid");
+  }
+};
+
 /**
  * `agentcpd` — the single local runtime authority (PRD §33.1).
  *
@@ -2879,12 +3028,14 @@ export interface AgentcpdMainContext {
 export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => {
   // Classify the complete environment-only group before reading config or acquiring resources.
   // Blank values are absent; nonblank values are retained exactly for the claim boundary.
+  //
+  // Three, not six. `ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION`, `…_EXPECTED_EXECUTOR_REALPATH` and
+  // `…_EXPECTED_EXECUTOR_SHA256` used to belong to the group; the claim no longer compares the
+  // executing image against anything, so nothing reads them. They are not refused either: a
+  // deployment that still provisions them starts exactly as one that does not, and they count
+  // neither toward the group being present nor toward it being partial.
   const CANONICAL_ACTIVATION_VARS = [
-    "ACP_CANONICAL_SESSION_UUID",
-    "ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION",
-    "ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH",
-    "ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256",
-    "ACP_CANONICAL_CTO_BUZZ_ACTOR_ID",
+    "ACP_CANONICAL_SESSIONS_JSON",
     "ACP_CANONICAL_CTO_PEER_PROTOCOL",
     "ACP_CANONICAL_CTO_BUZZ_PURPOSE",
   ] as const;
@@ -2967,6 +3118,53 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   } catch (err) {
     cp.close();
     throw err;
+  }
+
+  // The configured set is parsed and checked here, before `daemon.start()`, not beside the listener
+  // it configures. `start()` does not always return: a startup doctor finding eligible for the
+  // bootstrap park waits in `parkForBootstrap()` for an observation, holding the lock with an
+  // operator door open, and a denied start reports its own error first. A check placed after
+  // `start()` is skipped on both paths, so a deployment with an unregistered project and no usable
+  // capacity parked instead of refusing (review ACP1014-R1-01).
+  //
+  // Every entry's project must already be in the `projects` registry. The parse reads the value's
+  // shape and its internal consistency; neither can see whether the project an entry entitles a
+  // session to hold `PRIMARY_CTO` of was ever registered. Without this, a deployment configured
+  // with an unregistered project started the listener and reported itself up while the entitlement
+  // it held named a project no row exists for.
+  //
+  // Refused, not repaired and not dropped: a silently dropped entry is a session that can never
+  // prove it may start work, with nothing saying why.
+  //
+  // Existence only — deliberately not availability. Whether a registered project is suspended or
+  // not HEALTHY is a runtime condition, decided while the daemon runs by the code that owns it, and
+  // it changes without the configuration changing; refusing startup on it would refuse a deployment
+  // that is merely paused, and the daemon that must come up to unpause it is this one. What is
+  // checked here is the one thing no later event can make true on its own: a project that was
+  // never registered at all. Do not widen this to availability.
+  let canonicalSessions: readonly CanonicalAdoptableSession[] | null = null;
+  if (canonicalActivationPresentCount > 0) {
+    try {
+      canonicalSessions = configuredCanonicalSessions(canonicalActivationValues["ACP_CANONICAL_SESSIONS_JSON"]);
+      const unregisteredEntryIndex = canonicalSessions.findIndex(
+        (entry) => cp.projects.get(entry.projectId) === null,
+      );
+      if (unregisteredEntryIndex !== -1) {
+        // This path's refusal shape: it names the variable and never its contents. The zero-based
+        // index and the entry count are what let an operator find the offending entry in the value
+        // they set, without this line quoting the project, the session or the actor it holds.
+        throw new Error(
+          `ACP_CANONICAL_SESSIONS_JSON is invalid: entry ${unregisteredEntryIndex} of ` +
+            `${canonicalSessions.length} names a project that is not registered`,
+        );
+      }
+    } catch (err) {
+      // Nothing past this point has started yet: the session-launch channel and the control plane
+      // are the two things open, and both are closed before the refusal leaves.
+      await sessionLaunch.close();
+      cp.close();
+      throw err;
+    }
   }
 
   const buzzTransport = new BuzzCliTransport(
@@ -3095,7 +3293,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         ...(adoptHermesIncumbent ? { adoptHermesIncumbent } : {}),
       },
     );
-    if (canonicalActivationPresentCount === 0) {
+    if (canonicalSessions === null) {
       // Disabled: no partial credential surface is exposed, no socket is bound, and normal
       // startup continues exactly as it would for a deployment that has never heard of this
       // feature. The diagnostic names only the variables themselves — no value, secret or
@@ -3104,51 +3302,41 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         `canonical self-claim disabled: none of ${CANONICAL_ACTIVATION_VARS.join(", ")} is set\n`,
       );
     } else {
-      const canonicalSessionUuid = canonicalActivationValues["ACP_CANONICAL_SESSION_UUID"];
-      const canonicalRequiredExecutorVersion = canonicalActivationValues["ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION"];
-      // Handed to the daemon so the system report can compare it against the build the wake
-      // transport was qualified on (#886). Inside the activation block on purpose: a deployment
-      // that never activated canonical self-claim has no pin, and a null there is the absence of
-      // a claim rather than a disagreement. The check above already refuses a *partial* group;
-      // this covers the group that is complete and contradicts itself one step later.
-      daemon.setCanonicalExecutorVersion(canonicalRequiredExecutorVersion);
-      const canonicalExpectedExecutorRealpath =
-        canonicalActivationValues["ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH"];
-      const canonicalExpectedExecutorSha256 = canonicalActivationValues["ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256"];
+      // No `daemon.setCanonicalExecutorVersion` call any more. It handed the deployment's required
+      // executor version to the system report so #886 could compare it against the build the wake
+      // transport was qualified on. With no version pin on the claim there was nothing to hand it,
+      // and the setter and that finding were removed from `daemon.ts` with it.
       // Its own dedicated, token-less listener (#760): a process may prove who it is, but it
       // cannot approve itself, so the claiming connection never holds, reads, or is checked
       // against `ACP_OPERATOR_TOKEN`; its only authority is the kernel's own record of who opened
       // this socket, checked by `startCanonicalSelfClaimListener` itself before this handler is
       // ever called.
-      const canonicalCtoBuzzActorId = canonicalActivationValues["ACP_CANONICAL_CTO_BUZZ_ACTOR_ID"];
       canonicalSelfClaim = await startCanonicalSelfClaimListener(daemon, stateDir, (peer, params) => {
         // Deployment facts are the entry-time snapshot, never request or callback-time values.
         return executeCanonicalSelfClaimOperator(peer, params, {
           db: cp.db,
           clock: cp.clock,
+          audit: cp.audit,
           sessions: cp.sessions,
           bindings: cp.bindings,
-          // The canonical CTO's own Buzz channel identity is a deployment fact, configured the
+          // Each canonical CTO's own Buzz channel identity is a deployment fact, configured the
           // same way the CLI operator identity is (`ACP_OPERATOR_ACTOR`) — not something a
-          // caller asserts and this authenticator merely echoes back.
+          // caller asserts and this authenticator merely echoes back. Every entry's identity is
+          // admissible here and the claim then uses the one belonging to the session the kernel
+          // says is calling, so this guard bounds the set without choosing from it.
           buzzActorAuthenticator: new IngressGuard(cp.db, cp.clock, cp.audit, {
-            buzz: { allowedActors: [canonicalCtoBuzzActorId] },
+            buzz: { allowedActors: canonicalSessions.map((entry) => entry.buzzActorId) },
           }),
           resolveBuzzAddress: resolveCanonicalSelfClaimBuzzAddress,
           config: {
-            canonicalSessionUuid,
-            requiredExecutorVersion: canonicalRequiredExecutorVersion,
+            canonicalSessions,
             canonicalBuzzChannelId,
             expectedPeerProtocolVersion: canonicalActivationValues["ACP_CANONICAL_CTO_PEER_PROTOCOL"],
             // Matches the listener's own derivation exactly: both read this daemon's effective
             // uid, never a value either side is told by the other.
             expectedPeerIdentity: `uid:${process.geteuid?.() ?? -1}`,
             peerProtocolVersion: canonicalActivationValues["ACP_CANONICAL_CTO_PEER_PROTOCOL"],
-            buzzChannelId: canonicalBuzzChannelId,
-            buzzActorId: canonicalCtoBuzzActorId,
             buzzPurpose: canonicalActivationValues["ACP_CANONICAL_CTO_BUZZ_PURPOSE"],
-            expectedExecutorRealpath: canonicalExpectedExecutorRealpath,
-            expectedExecutorSha256: canonicalExpectedExecutorSha256,
           },
         });
       });
@@ -3174,6 +3362,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
           buzzActorIngressPolicy,
           listeners,
           buzzMessageOwnerActors,
+          createConfiguredHermesGatewayConversation(cp, hermesAdoptionConfiguration, {
+            authorityHeld: () => daemon.lock.held(),
+          }),
         );
         process.stdout.write("Buzz message ingress started\n");
         // #760 Part C — the daemon's own front door on the relay, feeding the socket above.

@@ -62,6 +62,41 @@ interface LivePeer {
    * `attach`'s detach by construction, rather than by a cleanup somebody has to remember to run.
    */
   endpoint: string | null;
+  /**
+   * Which registration of this connection this peer's endpoint belongs to.
+   *
+   * A counter, and its only job is to tell successive registrations apart. An endpoint string
+   * cannot: a holder that rebinds the same pathname and registers again produces two registrations
+   * that compare equal, and a wake still in flight from the first then writes its outcome into the
+   * second's memory. Both reviewers reproduced that in both directions -- a late success erasing a
+   * newer registration's refusal, and a late failure poisoning a newer registration that worked.
+   *
+   * Bumped wherever `endpoint` is assigned, and read by `wake` before it connects and again when
+   * its delivery completes: a completion whose registration is no longer the current one changes
+   * nothing.
+   */
+  registration: number;
+  /**
+   * The wake this registration was sent and that the endpoint refused, or `null` while nothing has
+   * contradicted it.
+   *
+   * A socket path stays a socket after its listener is gone, so every check `wake` makes before it
+   * connects can pass while the connect itself is refused: the holder is reported wakeable and no
+   * wake arrives. The daemon already learns that the moment a wake fails, and this is where that
+   * fact is kept so the report can use it.
+   *
+   * **Scoped to the registration in force**, and held that way by the two writes rather than by
+   * anything stored here: `registerEndpoint` clears it, and a delivery writes it only while the
+   * registration it began under is still the current one (`registration`). So a non-null value here
+   * always describes the registration the holder is on -- a refusal cannot outlive the fact it
+   * describes, which is the rule the scan's own docstring states about refusals in general.
+   *
+   * The identity is deliberately not repeated in this record. It was, and then the reader compared
+   * it as well; with the writes already scoped, that comparison could not be false, and a check
+   * nothing can falsify answers "is this guarded?" with a yes it has not earned. Two rows that
+   * should have died against it survived, which is how it was found.
+   */
+  wakeFailure: { readonly shape: WakeFailure["shape"] } | null;
 }
 
 /**
@@ -190,37 +225,146 @@ type EndpointCheck =
   | "owner-unknown-on-this-platform";
 
 /**
- * The client build this transport was qualified on.
+ * The client builds this transport was qualified on — a **set**, and every member of it exact.
  *
  * This route is a **version-pinned local runtime contract**, not a supported public interface and
  * not an external-events API. Nothing outside this deployment may rely on it, and it is expected
  * to need re-qualification when the local runtime moves: the endpoint is created by the client
  * process itself, and what a given build does with a unix socket it was asked to bind is a fact
- * about that build, established by measurement rather than by a published guarantee. So the pin is
- * exact rather than a floor — a newer client is *unqualified*, not *newer than qualified*, until
- * somebody measures it and moves this constant.
+ * about that build, established by measurement rather than by a published guarantee. So each
+ * member is exact rather than a floor — a newer client is *unqualified*, not *newer than
+ * qualified*, until somebody measures it and adds it here. Membership is equality on
+ * `{name, version}` and nothing looser: no range, no prefix, no semver ordering, and no
+ * environment variable that admits a build nobody measured.
  *
- * "Somebody measures it" now names a file. `evidence/u6-wake-transport-qualification.json` records
- * the reading this value rests on — the command, the resolved image and its digest, the host, the
+ * A set rather than one build because a deployment runs several builds at once. Measured on
+ * 2026-09-27: four live clients on three builds, one of whose images the updater had already
+ * deleted from disk, and none of them the single build this constant then named. One entitlement
+ * could express at most one of them, so every other binding could hold its role and never register
+ * a wake endpoint — its messages stored, waiting for a registration that could not come. The set
+ * changes how many builds may be qualified, not what qualifies one.
+ *
+ * "Somebody measures it" names a file per member. `evidence/u6-wake-transport-qualification/`
+ * holds one reading per build — the command, the resolved image and its digest, the host, the
  * exact `ROLE_WAKE_FRAME` bytes, and both arms of both invocation shapes — and
- * `tests/feasibility/wake-transport-qualification.test.ts` refuses to let the two disagree. The
- * C0 pin had no such file: its harness deleted its temp root on exit, so the constant carried a
- * conclusion whose reading no longer existed, and a conclusion nobody can re-read is indistinguishable
- * from one nobody took.
+ * `tests/feasibility/wake-transport-qualification.test.ts` refuses to let this list and that
+ * directory disagree: every member needs a reading, every reading must be a member, and a member
+ * whose reading's verdict is not `qualified` fails rather than warns. The C0 pin had no such file:
+ * its harness deleted its temp root on exit, so the constant carried a conclusion whose reading no
+ * longer existed, and a conclusion nobody can re-read is indistinguishable from one nobody took.
  *
- * Raw captures and logs use fixed, overwriteable local paths, and the three previously recorded
- * historical losses remain unrecoverable. Each re-qualification writes over the previous run's
- * captures in place, so only the newest reading's raw files exist: the ones behind the receipt
- * produced at 2026-09-08T23:01:02.003Z were overwritten by the 2026-09-09T14:48:17.913Z run, and
- * those in turn by the 2026-09-11T08:55:21.640Z run this value now rests on. No superseded capture
- * is recoverable.
+ * Three members, three readings, each taken on 2026-09-28 by `pnpm qualify:wake-transport` against
+ * a different image: 2.1.268 through the deployment's pinned launcher, 2.1.282 and 2.1.283 through
+ * `ACP_CLAUDE_BINARY` pointed at the versioned image. Each reading names its own image digest, the
+ * head it was taken at and which of those two sources it read, so no member stands on another's
+ * measurement: a build is here because its own reading says `qualified`. Being installed on the
+ * same host is not a reading, and an installed build without one is refused like any other.
  *
- * The reading behind this value covers an **interactive** start, which the C0 one did not. That
+ * Some sessions the set can never admit, because no reading of what they run can be taken. The
+ * updater removes superseded images from `~/.local/share/claude/versions/`, and it has removed one
+ * a process was still executing: that process keeps running on its open inode, `lsof` still names
+ * the path, and nothing can spawn the file again. Measured on 2026-09-28: a live session on
+ * 2.1.278, whose image that directory no longer holds. A binding held by such a session is reported
+ * like any other holder outside the set and stays unwakeable for as long as the session runs; of
+ * the two repairs the daemon's finding offers, only restarting it onto a member is open. A fresh
+ * download of the same version is not a way round that: membership is equality on
+ * `{name, version}`, so qualifying the download would admit the running session on a reading of a
+ * different file, one nobody can show is the image that session executes.
+ *
+ * Raw captures and logs sit under the git-ignored `evidence/local/`, in a directory named for the
+ * build each qualification measured, so qualifying one member does not overwrite the captures
+ * another member's reading points at; re-qualifying the same build still does, and the paths
+ * resolve only in the checkout that took the reading. All three readings name those scoped paths:
+ * the 2.1.268 reading was re-taken rather than carried forward, and no longer rests on its
+ * 2026-09-11T08:55:21.640Z run. The three previously recorded historical losses remain
+ * unrecoverable. The captures behind the receipt produced at 2026-09-08T23:01:02.003Z were
+ * overwritten by the 2026-09-09T14:48:17.913Z run, those in turn by the 2026-09-11T08:55:21.640Z
+ * run, and that run's own captures sat at unscoped paths that no reading names any more. No
+ * superseded capture is recoverable.
+ *
+ * The readings behind these values cover an **interactive** start, which the C0 one did not. That
  * matters because `isInteractiveClaudeInvocation` (src/registry/canonical-self-claim.ts) refuses
  * `-p`, `--print`, `--output-format` and `--input-format`: the process that may hold the canonical
  * claim is exactly the shape a headless-only qualification never observed.
  */
-export const C0_QUALIFIED_CLIENT = { name: "claude-code", version: "2.1.268" } as const;
+export const WAKE_TRANSPORT_QUALIFIED_CLIENTS = [
+  { name: "claude-code", version: "2.1.268" },
+  { name: "claude-code", version: "2.1.282" },
+  { name: "claude-code", version: "2.1.283" },
+] as const;
+
+/** One `{name, version}` pair, as an MCP client declares itself and as a reading records it. */
+export interface WakeTransportClient {
+  readonly name: string;
+  readonly version: string;
+}
+
+/**
+ * Whether `client` is a member of the qualified set — exact equality on both fields, and nothing
+ * else.
+ *
+ * The one membership test. Registration refuses on it and the daemon's unwakeable-binding finding
+ * reports on it, so the two cannot come to disagree about which builds may receive a wake: a
+ * finding computed from a second copy of this rule would describe a refusal the port does not make.
+ *
+ * `members` is a parameter so the exactness can be exercised against a set of several builds
+ * without editing this module's; every production caller takes the default.
+ */
+export const isWakeTransportQualified = (
+  client: WakeTransportClient | undefined,
+  members: readonly WakeTransportClient[] = WAKE_TRANSPORT_QUALIFIED_CLIENTS,
+): boolean =>
+  client !== undefined && members.some((member) => member.name === client.name && member.version === client.version);
+
+/**
+ * The qualified set as it is reported: `name/version` strings and nothing more.
+ *
+ * Refusal evidence and the daemon's finding both carry this. Neither carries a reading's image
+ * path — see `EndpointCheck` for why a persisted `Decision` or a report must not name a local
+ * path — and the member list is the answer an operator needs anyway: which builds would have been
+ * admitted.
+ */
+export const wakeTransportQualifiedLabels = (): string[] =>
+  WAKE_TRANSPORT_QUALIFIED_CLIENTS.map(({ name, version }) => `${name}/${version}`);
+
+/**
+ * Why a connected holder cannot be woken. One value per repair, because the remedies differ and a
+ * report that could not tell them apart would have to offer all of them.
+ *
+ * `no-registered-endpoint` and `registered-endpoint-not-usable` are kept apart for that reason: the
+ * first holder has never given the daemon anywhere to knock, and the second gave one that no longer
+ * passes the checks `wake` makes before it connects — a socket that has gone, or a state directory
+ * whose ownership or mode has changed under it.
+ *
+ * `registered-endpoint-refused-the-wake` is the state those checks cannot see: the path is still
+ * there and still a socket this uid owns, and the connect is refused anyway because the process
+ * that bound it is gone. Reproduced by both reviewers, who found `wake` answering ROLE_PEER_FAILED
+ * for a holder this scan called wakeable. It is a report of a delivery that **failed**, never of a
+ * delivery that would fail: nothing here dials a socket to find out, so a registration that has not
+ * been used since it was made is reported usable because nothing has contradicted it yet.
+ */
+export type UnwakeableCause =
+  | "build-outside-the-qualified-set"
+  | "no-declared-build"
+  | "no-registered-endpoint"
+  | "registered-endpoint-not-usable"
+  | "registered-endpoint-refused-the-wake";
+
+/**
+ * A binding that is active, whose holder is connected, and which still cannot receive a wake.
+ */
+export interface UnwakeableHolder {
+  readonly roleKey: string;
+  readonly role: Role;
+  /**
+   * `name/version` exactly as the connection declared it, or `null` when it declared none. Never a
+   * path. `null` is the value `registerEndpoint`'s refusal evidence gives the same peer, so the
+   * report and the refusal describe it the same way.
+   */
+  readonly presented: string | null;
+  /** Which of the four states this holder is in. Never a path, for the same reason. */
+  readonly cause: UnwakeableCause;
+}
 
 /**
  * Owner-only, in the POSIX sense the 0700 state directory already means: no group bits, no other
@@ -339,7 +483,14 @@ export class RoleConversationPort {
       if (scopeRoleKey !== undefined && binding.roleKey !== scopeRoleKey) continue;
       this.#clearStalePeer(binding.roleKey);
       if (scopeRoleKey !== undefined && this.#live.has(binding.roleKey)) continue;
-      this.#live.set(binding.roleKey, { server, authenticate, binding, endpoint: null });
+      this.#live.set(binding.roleKey, {
+        server,
+        authenticate,
+        binding,
+        endpoint: null,
+        registration: 0,
+        wakeFailure: null,
+      });
       owned.push(binding.roleKey);
     }
     return () => {
@@ -369,6 +520,92 @@ export class RoleConversationPort {
   endpointFor(roleKey: string): string | null {
     if (!this.currentHolderConnected(roleKey)) return null;
     return this.#live.get(roleKey)?.endpoint ?? null;
+  }
+
+  /**
+   * Every binding whose holder is connected and cannot be woken, and why.
+   *
+   * These are the bindings that read ACTIVE, have a live peer, and still receive no wake: an
+   * addressed message is stored and waits for a delivery that will not happen. Nothing about that
+   * is loud on its own — the symptom is only that wakes never arrive — so the daemon reports what
+   * this returns.
+   *
+   * **Unwakeable is unwakeable, whatever the reason**, and this scan used to return early on
+   * `isWakeTransportQualified`, which made a qualified build the one state it never reported. A
+   * holder on a qualified build that has registered no endpoint is exactly as unreachable as one
+   * outside the set: `wake` refuses it with ROLE_PEER_UNSUPPORTED for want of an endpoint, and
+   * `endpointFor` answers `null`. That is the case this whole slice exists to make visible, and it
+   * was the one case the report was silent about. The scan's own reasoning about a holder that
+   * declared no build — "skipping it made the one case in which the report has no build name to go
+   * on the one case it said nothing about" — is the same argument, and the code now follows it in
+   * both places.
+   *
+   * The five causes are distinguished because the repairs are different, and a report that only
+   * said "cannot be woken" would have to offer every repair to every holder.
+   *
+   * The endpoint is **revalidated here**, by the same `#validateEndpointPath` `wake` calls before
+   * it connects, so a registration that has since stopped being usable is reported rather than
+   * counted as a wakeable holder. It is a filesystem answer and it is taken now: a holder reported
+   * usable can become unusable a moment later, and the converse. What this says is what was true
+   * when it was asked, which is the same standing every other line of this scan has.
+   *
+   * Asked of the live connection at the moment of the question rather than recorded when a
+   * registration was refused: a peer that never tries to register is just as unwakeable, and a
+   * refusal remembered past the connection that earned it would outlive the fact it describes.
+   *
+   * One thing *is* remembered, and it is bounded by that same rule: a wake this registration was
+   * sent and that the endpoint refused (`LivePeer.wakeFailure`). Every check above is a filesystem
+   * answer, and a socket path outlives the process that bound it, so a holder whose listener has
+   * gone passes all of them and takes no wake — both reviewers reproduced exactly that, with `wake`
+   * answering ROLE_PEER_FAILED while this scan called the holder wakeable. The alternative was for
+   * this scan to dial every holder's socket, which would put a side-effecting probe of a peer's
+   * messaging socket on a path that runs on every doctor refresh; the daemon already learns the
+   * fact when a wake it was sending fails, so nothing new is probed. What that buys is narrower
+   * than what a probe would claim, and the difference is the honest part: this reports a delivery
+   * that **failed**, not one that would fail. A registration nothing has tried is reported usable.
+   *
+   * A connection that has declared no build is reported, with `presented: null`, not skipped.
+   * `registerEndpoint` asks the same predicate, which is false for no build, so that holder is
+   * refused exactly as one outside the set is. The SDK records the build only when an `initialize`
+   * carrying `clientInfo` parses, and its schema requires `clientInfo`, so "declared none" and
+   * "has not completed `initialize`" are one state here. A report taken in the moment between a
+   * peer attaching and its `initialize` names that peer too. For that moment the report is true:
+   * the peer could not have registered.
+   */
+  unwakeableHolders(): UnwakeableHolder[] {
+    const holders: UnwakeableHolder[] = [];
+    for (const [roleKey, peer] of this.#live) {
+      if (!this.currentHolderConnected(roleKey)) continue;
+      const client = peer.server.server.getClientVersion();
+      const presented = client ? `${client.name}/${client.version}` : null;
+      const cause = this.#unwakeableCause(client, peer);
+      if (cause === null) continue;
+      holders.push({ roleKey, role: this.#role, presented, cause });
+    }
+    return holders;
+  }
+
+  /**
+   * Why this connection cannot be woken, or `null` for one that can.
+   *
+   * Ordered as `wake` itself fails: the build, then an endpoint at all, then whether that endpoint
+   * still passes the filesystem checks, then whether the last wake this registration was sent
+   * actually landed. Each answer is the first thing a wake would stop at, so the cause names the
+   * step that would refuse rather than the last one that could.
+   *
+   * The remembered failure is read, not filtered: what is kept there is already the current
+   * registration's, because `registerEndpoint` clears it and `wake` writes it only while the
+   * registration its delivery began under is still in force. Filtering here as well was a second
+   * copy of that rule which no input could make false.
+   */
+  #unwakeableCause(client: WakeTransportClient | undefined, peer: LivePeer): UnwakeableCause | null {
+    if (!isWakeTransportQualified(client)) {
+      return client ? "build-outside-the-qualified-set" : "no-declared-build";
+    }
+    const endpoint = peer.endpoint;
+    if (endpoint === null) return "no-registered-endpoint";
+    if (!this.#validateEndpointPath(endpoint).allowed) return "registered-endpoint-not-usable";
+    return peer.wakeFailure !== null ? "registered-endpoint-refused-the-wake" : null;
   }
 
   /**
@@ -522,8 +759,9 @@ export class RoleConversationPort {
    * ever register an endpoint for roles it is already the current holder of, and there is no
    * argument in which to name somebody else's.
    *
-   * The client build is pinned here because the endpoint is the client's own artefact: see
-   * `C0_QUALIFIED_CLIENT`.
+   * The client build is checked here because the endpoint is the client's own artefact: see
+   * `WAKE_TRANSPORT_QUALIFIED_CLIENTS`. Membership is exact, and a build outside the set is
+   * refused however close its version is to a member's.
    */
   async registerEndpoint(server: McpServer, endpoint: string): Promise<Decision<readonly string[]>> {
     const owned = [...this.#live.entries()].filter(([, peer]) => peer.server === server);
@@ -541,14 +779,16 @@ export class RoleConversationPort {
       }
     }
     const client = server.server.getClientVersion();
-    if (client?.name !== C0_QUALIFIED_CLIENT.name || client.version !== C0_QUALIFIED_CLIENT.version) {
+    if (!isWakeTransportQualified(client)) {
       return deny(
         ReasonCode.ROLE_PEER_UNSUPPORTED,
-        "this client build is not the one this version-pinned local wake transport was qualified on",
+        "this client build is not one this version-pinned local wake transport was qualified on",
         {
           role: this.#role,
           presented: client ? `${client.name}/${client.version}` : null,
-          qualified: `${C0_QUALIFIED_CLIENT.name}/${C0_QUALIFIED_CLIENT.version}`,
+          // The whole set, as `name/version` labels: which builds would have been admitted. No
+          // reading's image path, for the reason `EndpointCheck` gives.
+          qualified: wakeTransportQualifiedLabels(),
         },
       );
     }
@@ -569,7 +809,29 @@ export class RoleConversationPort {
         );
       }
     }
-    for (const [, peer] of owned) peer.endpoint = validated.value;
+    for (const [, peer] of owned) {
+      peer.endpoint = validated.value;
+      // A new registration, and a new identity for it. The endpoint string is not one: a holder
+      // that rebinds the same pathname registers again under a value that compares equal, and a
+      // wake still in flight from the previous registration would then complete into this one's
+      // memory. Every delivery carries the number it began under and writes nothing if it is no
+      // longer this one.
+      peer.registration += 1;
+      // A registration is a new fact about where to knock, so whatever the previous one failed to
+      // deliver says nothing about this one. A refusal carried across a registration would outlive
+      // the fact it describes: a holder that rebound and registered again would be reported
+      // unwakeable on the strength of a delivery to the process before it.
+      //
+      // Cleared before the wake below, which is what decides whether *this* registration has a
+      // failure of its own, and the clearing is observable only between the two. A row observes it
+      // there, from the listener the wake is delivered to:
+      // `a-registration-forgets-the-refusal-it-inherited`.
+      //
+      // What the memory describes once this method returns is the newest registration's delivery,
+      // which is this one unless the holder registered again while this wake was in flight -- a
+      // completion that outlived its own registration writes nothing (`wake`).
+      peer.wakeFailure = null;
+    }
     const registered = owned.map(([roleKey]) => roleKey);
 
     // §3 — one constant wake per registered slot, unconditionally, and this is what makes the
@@ -717,6 +979,11 @@ export class RoleConversationPort {
     const revalidated = this.#validateEndpointPath(peer.endpoint);
     if (!revalidated.allowed) return revalidated as Decision<void>;
 
+    // Read before the connect and compared after it. What this delivery is about is the
+    // registration in force when it began; by the time it completes the holder may have registered
+    // again, and a completion that wrote into the current registration's memory would be reporting
+    // the previous endpoint's delivery as this one's. Both directions of that were reproduced.
+    const registration = peer.registration;
     try {
       await new Promise<void>((resolveWake, rejectWake: (failure: WakeFailure) => void) => {
         const socket = connect(revalidated.value);
@@ -747,12 +1014,29 @@ export class RoleConversationPort {
         });
       });
     } catch (failure) {
+      // Remembered against the registration it was sent under, so the scan can report a holder
+      // whose registration is valid on the filesystem and still takes no wake -- the one unwakeable
+      // state no check made before connecting can see. Not a probe: this is a delivery that was
+      // going to happen anyway, and what is kept is its outcome.
+      //
+      // Only while that registration is still the one in force. A failure from a registration the
+      // holder has already replaced says nothing about where it now asks to be knocked on, and
+      // writing it here would report a working registration as refused. The decision below is
+      // returned either way: the wake this caller sent did fail, whatever has happened since.
+      if (peer.registration === registration) {
+        peer.wakeFailure = { shape: (failure as WakeFailure).shape };
+      }
       return deny(ReasonCode.ROLE_PEER_FAILED, "the peer's wake endpoint did not accept the wake", {
         role: this.#role,
         roleKey,
         shape: (failure as WakeFailure).shape,
       });
     }
+    // A wake that landed is the contradiction of an earlier one that did not, so the memory goes --
+    // and only the memory of the registration this delivery belonged to. A success completing after
+    // the holder registered again used to clear unconditionally, which erased the newer
+    // registration's own refusal and reported a holder nothing can wake as wakeable.
+    if (peer.registration === registration) peer.wakeFailure = null;
     return allow(ReasonCode.OK, undefined);
   }
 

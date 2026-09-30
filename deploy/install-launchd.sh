@@ -390,11 +390,13 @@ export HOME="$ACP_HOME"
 # through the environment receives the interpreter this generation carries, rather than whichever
 # one a system directory happens to hold.
 #
-# `/usr/sbin` is last, and is here for `lsof`, which ships only from there. A canonical self-claim
-# resolves the claiming process's executing image by spawning `lsof` under its bare name and
-# consulting no environment, so this PATH is the only channel that reaches that call: without the
-# directory the scan comes back empty, the image resolves to null, and a genuine claim is refused
-# with evidence that names neither the missing tool nor the cause. It is a system directory of the
+# `/usr/sbin` is last, and is here for `lsof`, which ships only from there. On Darwin a canonical
+# self-claim reads the claiming process's working directory, and observes its executing image, by
+# spawning `lsof` under its bare name and consulting no environment, so this PATH is the only
+# channel that reaches that call. Without the directory every scan fails to run (`SCAN_FAILED`,
+# `ENOENT`), the working directory cannot be read, and a genuine claim is refused `PROBE_FAILED`.
+# The image goes unobserved in the same case, which on its own refuses nothing: the claim records
+# the image and compares it against no configured value. It is a system directory of the
 # same standing as `/usr/bin` and `/bin` above — root-owned, mode 755, SIP `restricted`, not
 # user-writable, listed in `/etc/paths` as part of the platform's own default PATH, and holding
 # none of the names this control plane grants authority by. That is what separates it from a
@@ -460,7 +462,14 @@ buzz_key_from_desktop_secrets() {
 }
 
 # Clear the entire activation group before any credential lookup can inherit a partial group.
-unset ACP_CANONICAL_SESSION_UUID ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256 ACP_CANONICAL_CTO_BUZZ_ACTOR_ID ACP_CANONICAL_CTO_PEER_PROTOCOL ACP_CANONICAL_CTO_BUZZ_PURPOSE
+#
+# The group is three variables: ACP_CANONICAL_SESSIONS_JSON, ACP_CANONICAL_CTO_PEER_PROTOCOL and
+# ACP_CANONICAL_CTO_BUZZ_PURPOSE. The three ACP_CANONICAL_*_EXECUTOR_* names cleared here and
+# exported in the loop below are the executor pins the claim used to require. The daemon no longer
+# reads them: they neither activate the group nor make it partial, and a Keychain that still holds
+# them is not refused (deploy/README.md). They are left in both lists because passing through a
+# value nothing reads is not a claim about it; removing them is a separate cleanup.
+unset ACP_CANONICAL_SESSIONS_JSON ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256 ACP_CANONICAL_CTO_PEER_PROTOCOL ACP_CANONICAL_CTO_BUZZ_PURPOSE
 
 export ACP_MCP_TOKEN="$(required_keychain_value ACP_MCP_TOKEN)"
 export ACP_OPERATOR_TOKEN="$(required_keychain_value ACP_OPERATOR_TOKEN)"
@@ -469,10 +478,12 @@ for optional in ACP_OPERATOR_ACTOR BUZZ_PRIVATE_KEY ACP_BUZZ_INGRESS_SECRET ACP_
   ACP_TELEGRAM_CHAT_ID ACP_TELEGRAM_ALLOWED_CHAT_IDS ACP_TELEGRAM_WEBHOOK_SECRET \
   ACP_TELEGRAM_POLL_TIMEOUT_SECONDS ACP_TELEGRAM_RETRY_DELAY_MS \
   ACP_TELEGRAM_DEFAULT_PROJECT_ID ACP_TELEGRAM_API_BASE_URL ACP_TELEGRAM_TRANSPORT_RETENTION_MS \
-  ACP_CANONICAL_SESSION_UUID ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION \
+  ACP_CANONICAL_SESSIONS_JSON ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION \
   ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256 \
-  ACP_CANONICAL_CTO_BUZZ_ACTOR_ID \
-  ACP_CANONICAL_CTO_PEER_PROTOCOL ACP_CANONICAL_CTO_BUZZ_PURPOSE; do
+  ACP_CANONICAL_CTO_PEER_PROTOCOL ACP_CANONICAL_CTO_BUZZ_PURPOSE \
+  ACP_HERMES_EXPECTED_LIVE_SESSION_ID ACP_HERMES_TARGET_SESSION_ID \
+  ACP_HERMES_LINEAGE_ROOT_DIGEST ACP_HERMES_EXECUTABLE ACP_HERMES_PROFILE \
+  ACP_HERMES_HOME ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY ACP_HERMES_GATEWAY_API_KEY; do
   optional_keychain_value "$optional"
 done
 buzz_key_from_desktop_secrets
@@ -541,14 +552,94 @@ job_loaded() {
   launchctl print "$job" >/dev/null 2>&1
 }
 
+running_pid() {
+  local output line
+  output="$(launchctl print "$job" 2>/dev/null)" || return 1
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]*pid[[:space:]]*=[[:space:]]*([1-9][0-9]*)[[:space:]]*$ ]]; then
+      printf '%s\n' "${BASH_REMATCH[1]}"
+      return 0
+    fi
+  done <<< "$output"
+  return 1
+}
+
+successful_exit_without_pid() {
+  # KeepAlive { SuccessfulExit = false } leaves an exit-0 refusal stopped.
+  launchctl print "$job" 2>/dev/null |
+    grep -Eq '^[[:space:]]*last exit code[[:space:]]*=[[:space:]]*0[[:space:]]*$'
+}
+
 stop_job() {
-  if job_loaded; then launchctl bootout "$job"; fi
+  if job_loaded; then
+    launchctl bootout "$job"
+    local attempt
+    for attempt in $(seq 1 30); do
+      job_loaded || return 0
+      sleep 1
+    done
+    job_loaded || return 0
+    fail "launchd job remains loaded after bootout"
+  fi
 }
 
 start_job() {
   private_file "$plist_path"
   if ! job_loaded; then launchctl bootstrap "$domain" "$plist_path"; fi
+  # main() writes its started record only after daemon.start() and all startup listeners finish.
+  # Record the current end so an earlier successful start cannot satisfy this kickstart.
+  local stdout_log="$state_dir/agentcpd.out.log" stdout_bytes=0
+  if [[ -f "$stdout_log" ]]; then stdout_bytes="$(wc -c < "$stdout_log")"; fi
   launchctl kickstart -k "$job"
+  job_loaded || fail "launchd job $LABEL is not loaded after start"
+  # STARTUP_CAPACITY_REFRESH_BUDGET_MS (15s) covers the sequential provider refresh.
+  # The startup doctor then has CAPACITY_SWEEP_BUDGET_MS (45s) for global and role-scoped
+  # probes (each collector up to COLLECTOR_TIMEOUT_MS, 45s; non-interactive reads use
+  # NON_INTERACTIVE_TIMEOUT_MS, 20s), the swapUsage sysctl timeout (5s), and
+  # REPOSITORY_SWEEP_BUDGET_MS (20s): 15 + 45 + 5 + 20 = 85s. Allow 95s for
+  # process launch, startup listeners, settling, and slow local work. Some startup
+  # awaits have no aggregate deadline; this is an operational cap, not a proof that
+  # every healthy configuration finishes within it.
+  local start_poll_limit=180
+  # The plist's ThrottleInterval is 30s. Allow one failed KeepAlive relaunch plus
+  # five polls for exec, but recognize an exit-0 refusal after five absent-pid polls.
+  local no_pid_retry_limit=35 no_pid_refusal_limit=5
+  local attempt pid previous_pid="" settled=0 no_pid_polls=0
+  for attempt in $(seq 1 "$start_poll_limit"); do
+    if pid="$(running_pid)" && [[ -f "$stdout_log" ]] &&
+      tail -c "+$((stdout_bytes + 1))" "$stdout_log" | grep -F '"started":' >/dev/null; then
+      no_pid_polls=0
+      if [[ "$pid" == "$previous_pid" ]]; then
+        settled=$((settled + 1))
+      else
+        settled=0
+      fi
+      previous_pid="$pid"
+      if [[ "$settled" -ge 2 ]]; then return 0; fi
+    else
+      previous_pid=""
+      settled=0
+      if [[ -z "$pid" ]]; then
+        no_pid_polls=$((no_pid_polls + 1))
+        if [[ "$no_pid_polls" -ge "$no_pid_refusal_limit" ]] &&
+          successful_exit_without_pid; then
+          fail "launchd job $LABEL is not running after start; inspect agentctl daemon status and agentcpd.out.log"
+        fi
+        if [[ "$no_pid_polls" -ge "$no_pid_retry_limit" ]]; then
+          fail "launchd job $LABEL is not running after start; inspect agentctl daemon status and agentcpd.out.log"
+        fi
+      else
+        no_pid_polls=0
+      fi
+    fi
+    sleep 1
+  done
+  if pid="$(running_pid)" && [[ -f "$stdout_log" ]] &&
+    tail -c "+$((stdout_bytes + 1))" "$stdout_log" | grep -F '"started":' >/dev/null &&
+    [[ "$pid" == "$previous_pid" && "$settled" -ge 1 ]]; then
+    return 0
+  fi
+  fail "launchd job $LABEL is not running after start; inspect agentctl daemon status and agentcpd.out.log"
 }
 
 wait_for_stop() {
@@ -679,8 +770,8 @@ case "$command_name" in
     stop_job
     wait_for_stop
     if ! rollback_report="$("$node_path" "$validator" rollback "${rollback_flags[@]}")"; then
-      if [[ "$service_was_loaded" == "1" ]]; then start_job; fi
       rm -rf "$state_dir/rollback-stage"
+      if [[ "$service_was_loaded" == "1" ]]; then start_job; fi
       fail "rollback failed; the previous generation and the original service state were restored"
     fi
     if [[ "$service_was_loaded" == "1" ]]; then start_job; fi

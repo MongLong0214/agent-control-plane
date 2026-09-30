@@ -7,6 +7,7 @@ import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { allow, deny } from "../../src/core/errors.ts";
 import { ControlPlane } from "../../src/app/control-plane.ts";
+import { Daemon } from "../../src/daemon/daemon.ts";
 import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
 import { ContinuityMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { ContinuityKernel } from "../../src/continuity/continuity-kernel.ts";
@@ -317,6 +318,196 @@ describe("capacity sensor honesty (§14.2)", () => {
     });
     expect(current.operatorObservation).toBeUndefined();
     expect(cp.capacity.isRoutableFor(current, "cto")).toBe(false);
+  });
+
+  it("a measured runtime outage governs a preserved operator quota after refresh", async () => {
+    const { cp, clock, gpt } = makePlane();
+    // observe() evaluates continuity and re-probes. Keep that probe older than the observation.
+    gpt.setCapacity(reading("gpt", clock, [
+      { id: "scripted-bucket", remainingPercent: 100, resetAt: null, capabilities: FULL },
+    ]));
+    clock.advance(1_000);
+    const observed = await cp.capacity.observe({
+      provider: "gpt",
+      observedAt: clock.nowIso(),
+      runtimeHealth: "HEALTHY",
+      actor: "fixture-operator",
+      source: AGENTCTL_CAPACITY_OBSERVATION_SOURCE,
+      buckets: [{ id: "fixture-window", remainingPercent: FIXTURE_OBSERVED_REMAINING_PERCENT, resetAt: null, capabilities: FULL }],
+    });
+    expect(observed.allowed).toBe(true);
+    expect(cp.capacity.current("gpt")?.operatorObservation).toBeDefined();
+
+    clock.advance(60_000);
+    gpt.setCapacity({
+      provider: "gpt",
+      sensorHealth: "ERROR",
+      runtimeHealth: "UNAVAILABLE",
+      observedAt: clock.nowIso(),
+      source: "fixture-collector-error",
+      error: "synthetic quota timeout with a measured runtime outage",
+      buckets: [],
+    });
+    const refreshed = (await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["gpt"]))[0]!;
+    const current = cp.capacity.current("gpt")!;
+    for (const capacity of [refreshed, current]) {
+      expect(capacity).toMatchObject({
+        sensorHealth: "HEALTHY",
+        runtimeHealth: "UNAVAILABLE",
+        allocationAdmission: "SUSPENDED",
+        advisoryState: "HEALTHY",
+        operatorObservation: { actor: "fixture-operator" },
+        buckets: [{ id: "fixture-window", remainingPercent: FIXTURE_OBSERVED_REMAINING_PERCENT }],
+      });
+      expect(cp.capacity.isRoutableFor(capacity, "cto")).toBe(false);
+    }
+    expect(cp.capacity.providersFor("cto").map((capacity) => capacity.provider)).not.toContain("gpt");
+    const plan = cp.continuity.computeCoveragePlan();
+    expect(plan.providers.find((provider) => provider.provider === "gpt")).toMatchObject({
+      admission: "SUSPENDED",
+      runtimeHealth: "UNAVAILABLE",
+      advisoryState: "HEALTHY",
+    });
+    expect(plan.assignments.every((assignment) => assignment.provider !== "gpt")).toBe(true);
+    const failoverAdmission = await cp.capacity.refreshForProviderSwitch({
+      provider: "gpt", capabilities: ["cto"], priority: "critical",
+    });
+    expect(failoverAdmission).toMatchObject({ allowed: false, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
+  });
+
+  it("a healthy runtime keeps an operator quota usable through a collector ERROR", async () => {
+    const { cp, clock, gpt } = makePlane();
+    gpt.setCapacity(reading("gpt", clock, [
+      { id: "scripted-bucket", remainingPercent: 100, resetAt: null, capabilities: FULL },
+    ]));
+    clock.advance(1_000);
+    const observed = await cp.capacity.observe({
+      provider: "gpt",
+      observedAt: clock.nowIso(),
+      runtimeHealth: "HEALTHY",
+      actor: "fixture-operator",
+      source: AGENTCTL_CAPACITY_OBSERVATION_SOURCE,
+      buckets: [{ id: "fixture-window", remainingPercent: FIXTURE_OBSERVED_REMAINING_PERCENT, resetAt: null, capabilities: FULL }],
+    });
+    expect(observed.allowed).toBe(true);
+
+    clock.advance(60_000);
+    gpt.setCapacity({
+      provider: "gpt",
+      sensorHealth: "ERROR",
+      runtimeHealth: "HEALTHY",
+      observedAt: clock.nowIso(),
+      source: "fixture-collector-error",
+      error: "synthetic quota timeout with a healthy runtime",
+      buckets: [],
+    });
+    const refreshed = (await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["gpt"]))[0]!;
+    const current = cp.capacity.current("gpt")!;
+    for (const capacity of [refreshed, current]) {
+      expect(capacity).toMatchObject({
+        sensorHealth: "HEALTHY",
+        runtimeHealth: "HEALTHY",
+        allocationAdmission: "OPEN",
+        operatorObservation: { actor: "fixture-operator" },
+        buckets: [{ id: "fixture-window", remainingPercent: FIXTURE_OBSERVED_REMAINING_PERCENT }],
+      });
+      expect(cp.capacity.isRoutableFor(capacity, "cto")).toBe(true);
+    }
+    expect(cp.capacity.providersFor("cto").map((capacity) => capacity.provider)).toContain("gpt");
+  });
+
+  it("a runtime-only measurement retains its own provenance without renewing operator quota grace", async () => {
+    const { cp, clock, gpt } = makePlane();
+    gpt.setCapacity(reading("gpt", clock, [
+      { id: "scripted-bucket", remainingPercent: 100, resetAt: null, capabilities: FULL },
+    ]));
+    clock.advance(1_000);
+    const observedAt = clock.nowIso();
+    expect((await cp.capacity.observe({
+      provider: "gpt", observedAt, runtimeHealth: "HEALTHY",
+      actor: "fixture-operator", source: AGENTCTL_CAPACITY_OBSERVATION_SOURCE,
+      buckets: [{ id: "fixture-window", remainingPercent: FIXTURE_OBSERVED_REMAINING_PERCENT, resetAt: null, capabilities: FULL }],
+    })).allowed).toBe(true);
+
+    clock.advance(14 * 60 * 1000);
+    const measuredAt = clock.nowIso();
+    gpt.setCapacity({
+      provider: "gpt", sensorHealth: "ERROR", runtimeHealth: "HEALTHY",
+      observedAt: measuredAt, source: "fixture-runtime-probe", error: "quota timed out", buckets: [],
+    });
+    await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["gpt"]);
+    expect(cp.capacity.current("gpt")).toMatchObject({
+      observedAt, ageMs: 14 * 60 * 1000, allocationAdmission: "OPEN",
+      operatorObservation: { actor: "fixture-operator" },
+    });
+    const original = cp.db.get<{ runtime_health: string; source: string }>(
+      `SELECT runtime_health, source FROM capacity_snapshots WHERE provider = 'gpt' AND observed_at = ?`, [observedAt],
+    );
+    expect(original?.runtime_health).toBe("HEALTHY");
+    const measured = cp.db.get<{ observed_at: string; source: string; runtime_health: string }>(
+      `SELECT observed_at, source, runtime_health FROM capacity_snapshots WHERE provider = 'gpt' AND observed_at = ?`, [measuredAt],
+    );
+    expect(measured).toEqual({ observed_at: measuredAt, source: "fixture-runtime-probe", runtime_health: "HEALTHY" });
+    const audit = cp.db.all<{ evidence_json: string }>(
+      `SELECT evidence_json FROM audit_events WHERE kind = 'CAPACITY_PROBE' ORDER BY event_id`,
+    ).map((row) => JSON.parse(row.evidence_json) as Record<string, unknown>);
+    expect(audit).toContainEqual(expect.objectContaining({
+      outcome: "collector error did not replace a current operator observation",
+      runtimeHealth: "HEALTHY", observedAt: measuredAt, source: "fixture-runtime-probe",
+    }));
+
+    clock.advance(1_000);
+    const unknownAt = clock.nowIso();
+    gpt.setCapacity({
+      provider: "gpt", sensorHealth: "ERROR", runtimeHealth: "UNKNOWN",
+      observedAt: unknownAt, source: "fixture-unmeasured-runtime", error: "quota timed out", buckets: [],
+    });
+    await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["gpt"]);
+    expect(cp.capacity.current("gpt")?.runtimeHealth).toBe("HEALTHY");
+    expect(cp.db.get(`SELECT snapshot_id FROM capacity_snapshots WHERE provider = 'gpt' AND observed_at = ?`,
+      [unknownAt])).toBeUndefined();
+
+    clock.advance(60_001);
+    expect(cp.capacity.current("gpt")).toMatchObject({
+      sensorHealth: "ERROR", allocationAdmission: "SUSPENDED", source: "fixture-runtime-probe",
+    });
+    expect(cp.capacity.current("gpt")?.operatorObservation).toBeUndefined();
+  });
+
+  it("daemon reconciliation keeps a live binding through ERROR plus measured HEALTHY", async () => {
+    const plane = makePlane();
+    const { cp, clock, gpt, claude } = plane;
+    gpt.setCapacity(reading("gpt", clock, [
+      { id: "scripted-bucket", remainingPercent: 100, resetAt: null, capabilities: FULL },
+    ]));
+    claude.setCapacity(reading("claude", clock, [
+      { id: "scripted-bucket", remainingPercent: 100, resetAt: null, capabilities: FULL },
+    ]));
+    clock.advance(1_000);
+    expect((await cp.capacity.observe({
+      provider: "gpt", observedAt: clock.nowIso(), runtimeHealth: "HEALTHY",
+      actor: "fixture-operator", source: AGENTCTL_CAPACITY_OBSERVATION_SOURCE,
+      buckets: [{ id: "fixture-window", remainingPercent: FIXTURE_OBSERVED_REMAINING_PERCENT, resetAt: null, capabilities: FULL }],
+    })).allowed).toBe(true);
+    const before = bindCeoSessionWithTarget(plane);
+
+    clock.advance(60_000);
+    const measuredAt = clock.nowIso();
+    gpt.setCapacity({
+      provider: "gpt", sensorHealth: "ERROR", runtimeHealth: "HEALTHY",
+      observedAt: measuredAt, source: "fixture-runtime-probe", error: "usage timed out", buckets: [],
+    });
+    const daemon = new Daemon(cp, { stateDir: tempDir("acp-healthy-error-reconcile-") });
+    await daemon.reconcileContinuity("usage timeout with a healthy runtime");
+
+    expect(cp.bindings.active(roleKeyFor(Role.CEO))).toEqual(before);
+    expect(cp.capacity.current("gpt")).toMatchObject({
+      runtimeHealth: "HEALTHY", allocationAdmission: "OPEN",
+      operatorObservation: { actor: "fixture-operator" },
+    });
+    expect(cp.db.get<{ source: string }>(
+      `SELECT source FROM capacity_snapshots WHERE provider = 'gpt' AND observed_at = ?`, [measuredAt],
+    )?.source).toBe("fixture-runtime-probe");
   });
 
   it("#954: a preserved observation records the collector's sentence at the length a real pin gives it", async () => {

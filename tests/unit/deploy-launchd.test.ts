@@ -29,14 +29,24 @@ const deploy = join(root, "deploy");
 const installer = join(deploy, "install-launchd.sh");
 const template = join(deploy, "com.agentcontrolplane.agentcpd.plist.template");
 const label = "com.agentcontrolplane.agentcpd";
+/**
+ * What `install-launchd.sh` provisions and the generated launcher forwards and then unsets — the
+ * installer's list, which this suite pins field by field. It is still six. The daemon's own
+ * activation group is three (`agentcpd.ts` `CANONICAL_ACTIVATION_VARS`): the three executor-image
+ * variables here reach the daemon and are read by nothing, which `daemon-startup.test.ts` asserts.
+ */
 const CANONICAL_ACTIVATION_VARIABLES = [
-  "ACP_CANONICAL_SESSION_UUID",
+  "ACP_CANONICAL_SESSIONS_JSON",
   "ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION",
   "ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH",
   "ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256",
-  "ACP_CANONICAL_CTO_BUZZ_ACTOR_ID",
   "ACP_CANONICAL_CTO_PEER_PROTOCOL",
   "ACP_CANONICAL_CTO_BUZZ_PURPOSE",
+] as const;
+const HERMES_ADOPTION_VARIABLES = [
+  "ACP_HERMES_EXPECTED_LIVE_SESSION_ID", "ACP_HERMES_TARGET_SESSION_ID",
+  "ACP_HERMES_LINEAGE_ROOT_DIGEST", "ACP_HERMES_EXECUTABLE", "ACP_HERMES_PROFILE",
+  "ACP_HERMES_HOME", "ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY", "ACP_HERMES_GATEWAY_API_KEY",
 ] as const;
 
 interface InstallerHarness {
@@ -74,6 +84,7 @@ const makeHarness = (): InstallerHarness => {
   const launcherEnvLog = join(home, "launcher-env.log");
   const stateAdminLog = join(home, "state-admin.log");
   const loaded = join(home, "launchd.loaded");
+  const stdoutLog = join(home, ".agent-control-plane", "agentcpd.out.log");
   const lock = join(home, ".agent-control-plane", "agentcpd.lock");
   const launchctl = join(bin, "launchctl");
   const security = join(bin, "security");
@@ -86,18 +97,68 @@ set -euo pipefail
 printf '%s\\n' "$*" >> "$ACP_LAUNCHCTL_LOG"
 case "\${1:-}" in
   print)
-    [[ -e "$ACP_LAUNCHD_LOADED" ]]
+    if [[ -e "$ACP_LAUNCHD_BOOTOUT_PENDING" ]]; then
+      remaining="$(cat "$ACP_LAUNCHD_BOOTOUT_PENDING")"
+      if [[ "$remaining" -eq 0 ]]; then
+        rm -f "$ACP_LAUNCHD_BOOTOUT_PENDING" "$ACP_LAUNCHD_LOADED"
+      else
+        printf '%s\\n' "$((remaining - 1))" > "$ACP_LAUNCHD_BOOTOUT_PENDING"
+      fi
+    fi
+    [[ -e "$ACP_LAUNCHD_LOADED" ]] || exit 1
+    if [[ -n "\${ACP_FAKE_START_AFTER_PRINTS:-}" && -e "$ACP_FAKE_START_PRINTS" ]]; then
+      prints="$(cat "$ACP_FAKE_START_PRINTS")"
+      prints="$((prints + 1))"
+      printf '%s\\n' "$prints" > "$ACP_FAKE_START_PRINTS"
+      if [[ "$prints" -eq "$ACP_FAKE_START_AFTER_PRINTS" ]]; then
+        mkdir -p "$(dirname "$ACP_FAKE_STDOUT_LOG")"
+        printf '  "started": {\\n' >> "$ACP_FAKE_STDOUT_LOG"
+      fi
+    fi
+    if [[ "\${ACP_FAKE_PID_MODE:-running}" == "running" ]]; then
+      printf '    pid = 4242\\n'
+    elif [[ "\${ACP_FAKE_PID_MODE:-running}" == "none" ]]; then
+      printf '    last exit code = 0\\n'
+    elif [[ "\${ACP_FAKE_PID_MODE:-running}" == "recovers" ]]; then
+      prints="$(cat "$ACP_FAKE_RECOVERY_PRINTS")"
+      prints="$((prints + 1))"
+      printf '%s\\n' "$prints" > "$ACP_FAKE_RECOVERY_PRINTS"
+      if [[ "$prints" -ge 60 ]]; then printf '    pid = 4242\\n'; fi
+    elif [[ "\${ACP_FAKE_PID_MODE:-running}" == "disappears" ]]; then
+      remaining="$(cat "$ACP_FAKE_PID_PRINTS_REMAINING")"
+      if [[ "$remaining" -gt 0 ]]; then
+        printf '    pid = 4242\\n'
+        printf '%s\\n' "$((remaining - 1))" > "$ACP_FAKE_PID_PRINTS_REMAINING"
+      fi
+    fi
     ;;
   bootstrap)
     touch "$ACP_LAUNCHD_LOADED"
     ;;
   bootout)
-    rm -f "$ACP_LAUNCHD_LOADED"
+    if [[ -n "\${ACP_BOOTOUT_PRINT_LAG:-}" ]]; then
+      printf '%s\\n' "$ACP_BOOTOUT_PRINT_LAG" > "$ACP_LAUNCHD_BOOTOUT_PENDING"
+    else
+      rm -f "$ACP_LAUNCHD_LOADED"
+    fi
   if [[ -n "\${ACP_STOP_DELAY:-}" && -n "\${ACP_LOCK_PATH:-}" ]]; then
-      (sleep "$ACP_STOP_DELAY"; rm -f "$ACP_LOCK_PATH") >/dev/null 2>&1 &
+      (/bin/sleep "$ACP_STOP_DELAY"; rm -f "$ACP_LOCK_PATH") >/dev/null 2>&1 &
     fi
     ;;
   kickstart)
+    if [[ "\${ACP_KICKSTART_UNLOAD:-0}" == "1" ]]; then rm -f "$ACP_LAUNCHD_LOADED"; fi
+    if [[ "\${ACP_FAKE_PID_MODE:-running}" == "disappears" ]]; then
+      printf '3\\n' > "$ACP_FAKE_PID_PRINTS_REMAINING"
+    elif [[ "\${ACP_FAKE_PID_MODE:-running}" == "recovers" ]]; then
+      printf '0\\n' > "$ACP_FAKE_RECOVERY_PRINTS"
+    fi
+    if [[ "\${ACP_FAKE_START_MARKER:-1}" == "1" ]]; then
+      mkdir -p "$(dirname "$ACP_FAKE_STDOUT_LOG")"
+      printf '  "started": {\\n' >> "$ACP_FAKE_STDOUT_LOG"
+    fi
+    if [[ -n "\${ACP_FAKE_START_AFTER_PRINTS:-}" ]]; then
+      printf '0\\n' > "$ACP_FAKE_START_PRINTS"
+    fi
     ;;
   *)
     exit 64
@@ -105,6 +166,8 @@ case "\${1:-}" in
 esac
 `,
   );
+  // Shorten start_job's one-second polls while leaving the two-second stop-lock fake observable.
+  writeExecutable(join(bin, "sleep"), "#!/bin/bash\n/bin/sleep 0.1\n");
   writeExecutable(
     security,
     `#!/bin/bash
@@ -128,6 +191,13 @@ case "$account" in
                    printf 'keychain-provided-buzz\\n' ;;
   ACP_CANONICAL_*)
     case ",\${ACP_CANONICAL_KEYCHAIN_ACCOUNTS:-}," in
+      *,"$account",*) ;;
+      *) exit 44 ;;
+    esac
+    printf 'keychain-%s\\n' "$account"
+    ;;
+  ACP_HERMES_*)
+    case ",\${ACP_HERMES_KEYCHAIN_ACCOUNTS:-}," in
       *,"$account",*) ;;
       *) exit 44 ;;
     esac
@@ -203,13 +273,19 @@ if [[ "$target" == *"agentcpd.js" ]]; then
     printf '%s' "$out" | grep -q '^ftxt$' && printf 'txt-reported' || printf 'no-txt'
   }
   # Fields are appended, never inserted: field position is the contract between this stub and its
-  # readers, and every reader written before these destructures from the front (indices 0-7).
-  # 8-10 are what the daemon was handed, 11-13 what its own PATH can find, 14 whether the handed
-  # path runs, 15 which interpreter its PATH resolves, 16 whether an unrelated executable sitting
-  # beside a provider CLI is reachable, 17-24 the atomic canonical activation group, and 25-26
-  # where the bare name lsof resolves and what a real scan through it reports. They are
-  # separate observations and a launcher can satisfy any of them without the others.
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
+  # readers. The order is: the eight leading observations (0-7), what the daemon was handed, what
+  # its own PATH can find, whether the handed path runs, which interpreter its PATH resolves,
+  # whether an unrelated executable sitting beside a provider CLI is reachable, then the atomic
+  # canonical activation group, then where the bare name lsof resolves and what a real scan through
+  # it reports, then the optional Hermes adoption group. These are separate observations and a
+  # launcher can satisfy any of them without the others.
+  #
+  # The positions of the last three are deliberately NOT written here. They are derived in
+  # launcherObservations from the activation groups own lengths, and the numbers this comment used
+  # to carry had already gone stale twice: it said the canonical group ran 17-24 when it runs 17-22,
+  # put lsof at 25-26 when it is 23-24, and gave Hermes an overlapping 26-33. A comment restating a
+  # derived position is the second authority the derivation was introduced to remove.
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
     "\${ACP_TELEGRAM_BOT_TOKEN-}" "\${ACP_TELEGRAM_OWNER_ID-}" \
     "\${ACP_TELEGRAM_CHAT_ID-}" "\${ACP_TELEGRAM_WEBHOOK_SECRET-}" \
     "\${BUZZ_PRIVATE_KEY:-<unset>}" "\${ACP_BUZZ_BINARY:-<unset>}" \
@@ -220,11 +296,14 @@ if [[ "$target" == *"agentcpd.js" ]]; then
     "$(started_of "\${ACP_CLAUDE_BINARY:-}"),$(started_of "\${ACP_CODEX_BINARY:-}"),$(started_of "\${ACP_GROK_BINARY:-}")" \
     "$(command -v node || printf '<unresolvable>')" \
     "$(command -v acp-sibling-probe || printf '<unresolvable>')" \
-    "\${ACP_CANONICAL_SESSION_UUID-}" "\${ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION-}" \
+    "\${ACP_CANONICAL_SESSIONS_JSON-}" "\${ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION-}" \
     "\${ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH-}" "\${ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256-}" \
-    "\${ACP_CANONICAL_CTO_BUZZ_ACTOR_ID-}" \
     "\${ACP_CANONICAL_CTO_PEER_PROTOCOL-}" "\${ACP_CANONICAL_CTO_BUZZ_PURPOSE-}" \
-    "$(command -v lsof || printf '<unresolvable>')" "$(lsof_scan)" >> "$ACP_LAUNCHER_ENV_LOG"
+    "$(command -v lsof || printf '<unresolvable>')" "$(lsof_scan)" \
+    "\${ACP_HERMES_EXPECTED_LIVE_SESSION_ID-}" "\${ACP_HERMES_TARGET_SESSION_ID-}" \
+    "\${ACP_HERMES_LINEAGE_ROOT_DIGEST-}" "\${ACP_HERMES_EXECUTABLE-}" \
+    "\${ACP_HERMES_PROFILE-}" "\${ACP_HERMES_HOME-}" \
+    "\${ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY-}" "\${ACP_HERMES_GATEWAY_API_KEY-}" >> "$ACP_LAUNCHER_ENV_LOG"
   # Mirrors the real precondition in src/daemon/agentcpd.ts: a Buzz credential without the
   # ingress pair is a startup error, not a degraded mode. Without this, a launcher that
   # exported the key too eagerly would look fine here and put the real daemon in a launchd
@@ -258,6 +337,11 @@ exit 90
       ACP_LAUNCHER_ENV_LOG: launcherEnvLog,
       ACP_STATE_ADMIN_LOG: stateAdminLog,
       ACP_LAUNCHD_LOADED: loaded,
+      ACP_LAUNCHD_BOOTOUT_PENDING: join(home, "launchd.bootout-pending"),
+      ACP_FAKE_PID_PRINTS_REMAINING: join(home, "launchd.pid-prints-remaining"),
+      ACP_FAKE_RECOVERY_PRINTS: join(home, "launchd.recovery-prints"),
+      ACP_FAKE_START_PRINTS: join(home, "launchd.start-prints"),
+      ACP_FAKE_STDOUT_LOG: stdoutLog,
       ACP_LOCK_PATH: lock,
       ACP_STOP_DELAY: "2",
       ACP_REAL_NODE: process.execPath,
@@ -355,6 +439,19 @@ const runGeneratedLauncher = (harness: InstallerHarness): CommandResult => {
   return { status: launched.status, stdout: launched.stdout, stderr: launched.stderr };
 };
 
+/**
+ * Field positions after the canonical activation group are derived from its length rather than
+ * written down. They were literals — `lsof: f[24]`, `lsofScan: f[25]`, hermes at `f[26 + index]` —
+ * and every change to the group's size silently moved all three onto their neighbours while the
+ * group's own fields, being derived, stayed right. That has already happened once (an eight-variable
+ * group becoming seven shifted lsof and lsofScan from 25/26 to 24/25) and the record of it warned
+ * about exactly these two indices while the hermes base, added later, was the third instance of the
+ * same mistake. Deriving them is what stops the next change from being the fourth.
+ */
+const CANONICAL_BASE_FIELD = 17;
+const LSOF_FIELD = CANONICAL_BASE_FIELD + CANONICAL_ACTIVATION_VARIABLES.length;
+const HERMES_BASE_FIELD = LSOF_FIELD + 2;
+
 /** What the daemon saw, by field. Positions are the contract; see the stub in `makeHarness`. */
 const launcherObservations = (harness: InstallerHarness) => {
   const f = readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
@@ -367,11 +464,14 @@ const launcherObservations = (harness: InstallerHarness) => {
     node: f[15],
     sibling: f[16],
     /** Where the daemon's PATH resolves the bare name `lsof`, and what a scan through it reports. */
-    lsof: f[24],
-    lsofScan: f[25],
+    lsof: f[LSOF_FIELD],
+    lsofScan: f[LSOF_FIELD + 1],
     canonical: Object.fromEntries(
-      CANONICAL_ACTIVATION_VARIABLES.map((name, index) => [name, f[17 + index] ?? ""]),
+      CANONICAL_ACTIVATION_VARIABLES.map((name, index) => [name, f[CANONICAL_BASE_FIELD + index] ?? ""]),
     ) as Record<(typeof CANONICAL_ACTIVATION_VARIABLES)[number], string>,
+    hermes: Object.fromEntries(
+      HERMES_ADOPTION_VARIABLES.map((name, index) => [name, f[HERMES_BASE_FIELD + index] ?? ""]),
+    ) as Record<(typeof HERMES_ADOPTION_VARIABLES)[number], string>,
   };
 };
 
@@ -557,6 +657,126 @@ const treeFiles = (): string[] =>
     .map((entry) => join(root, entry));
 
 describe("launchd deployment artifact", () => {
+  it("restart waits for a delayed bootout before reporting a loaded job", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    harness.env["ACP_BOOTOUT_PRINT_LAG"] = "1";
+    writeFileSync(harness.launchLog, "");
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+    const observed = boundedSpawnSync("launchctl", ["print", `gui/${process.getuid?.() ?? 0}/${label}`], {
+      encoding: "utf8",
+      env: harness.env,
+    });
+
+    expect(restarted.status, restarted.stderr).toBe(0);
+    expect(observed.status, `restart exited ${restarted.status}; launchctl print found no job`).toBe(0);
+    expect(observed.stdout).toContain("pid = 4242");
+    expect(existsSync(harness.loaded)).toBe(true);
+  });
+
+  it("refuses success when kickstart leaves the job unloaded", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    harness.env["ACP_KICKSTART_UNLOAD"] = "1";
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+
+    expect(restarted.status).not.toBe(0);
+    expect(restarted.stderr).toContain(`launchd job ${label} is not loaded after start`);
+    expect(existsSync(harness.loaded)).toBe(false);
+  });
+
+  it("refuses a restart when the job stays registered without a running pid", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    harness.env["ACP_FAKE_PID_MODE"] = "none";
+    const printsBefore = subcommands(harness.launchLog).filter((command) => command === "print").length;
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+    const printsAfter = subcommands(harness.launchLog).filter((command) => command === "print").length;
+
+    expect(restarted.status, restarted.stderr).not.toBe(0);
+    expect(restarted.stderr).toContain(`launchd job ${label} is not running after start`);
+    expect(restarted.stderr).toContain("agentctl daemon status");
+    expect(printsAfter - printsBefore).toBeLessThan(20);
+    expect(existsSync(harness.loaded)).toBe(true);
+  });
+
+  it("accepts a completed start after more than 30 polls with the same pid", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    harness.env["ACP_FAKE_START_MARKER"] = "0";
+    harness.env["ACP_FAKE_START_AFTER_PRINTS"] = "36";
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+
+    expect(Number(readFileSync(harness.env["ACP_FAKE_START_PRINTS"]!, "utf8").trim())).toBeGreaterThan(30);
+    expect(restarted.status, restarted.stderr).toBe(0);
+    expect(existsSync(harness.loaded)).toBe(true);
+  });
+
+  it("allows a throttled relaunch after 30 consecutive polls without a pid", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    harness.env["ACP_FAKE_PID_MODE"] = "recovers";
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+
+    expect(Number(readFileSync(harness.env["ACP_FAKE_RECOVERY_PRINTS"]!, "utf8").trim())).toBeGreaterThan(60);
+    expect(restarted.status, restarted.stderr).toBe(0);
+  });
+
+  it("refuses a restart when its reported pid disappears during settling", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    harness.env["ACP_FAKE_PID_MODE"] = "disappears";
+    const printsBefore = subcommands(harness.launchLog).filter((command) => command === "print").length;
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+    const printsAfter = subcommands(harness.launchLog).filter((command) => command === "print").length;
+
+    expect(restarted.status, restarted.stderr).not.toBe(0);
+    expect(restarted.stderr).toContain(`launchd job ${label} is not running after start`);
+    expect(restarted.stderr).toContain("agentctl daemon status");
+    expect(printsAfter - printsBefore).toBeLessThan(100);
+    expect(existsSync(harness.loaded)).toBe(true);
+  });
+
+  it("refuses a pid that appears before the daemon reports completed startup", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    harness.env["ACP_FAKE_START_MARKER"] = "0";
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+
+    expect(restarted.status, restarted.stderr).not.toBe(0);
+    expect(restarted.stderr).toContain(`launchd job ${label} is not running after start`);
+    expect(existsSync(harness.loaded)).toBe(true);
+  });
+
+  it("refuses when bootout remains registered past the bounded wait", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    writeExecutable(join(harness.bin, "sleep"), "#!/bin/bash\nexit 0\n");
+    harness.env["ACP_BOOTOUT_PRINT_LAG"] = "31";
+    writeFileSync(harness.launchLog, "");
+
+    const restarted = runInstaller(installer, ["restart"], harness);
+
+    expect(restarted.status).not.toBe(0);
+    expect(restarted.stderr).toContain("launchd job remains loaded after bootout");
+    expect(subcommands(harness.launchLog).filter((command) => command === "print")).toHaveLength(32);
+  });
+
   it("renders a loadable plist with absolute paths and no secret or unresolved placeholder", () => {
     const output = join(tempDir("acp-launchd-render-"), "agentcpd.plist");
     boundedExecFileSync(process.execPath, [
@@ -594,7 +814,9 @@ describe("launchd deployment artifact", () => {
     expect(result.status).toBe(0);
     expect(existsSync(plistPath(harness))).toBe(true);
     assertRenderedPlist(harness);
-    expect(subcommands(harness.launchLog)).toEqual(["print", "print", "bootstrap", "kickstart"]);
+    expect(subcommands(harness.launchLog)).toEqual([
+      "print", "print", "bootstrap", "kickstart", "print", "print", "print", "print",
+    ]);
     expect(readFileSync(harness.securityLog, "utf8")).toContain(
       "find-generic-password -w -s test-service -a ACP_MCP_TOKEN",
     );
@@ -799,6 +1021,36 @@ describe("launchd deployment artifact", () => {
       expect(lookups).toContain(`find-generic-password -w -s test-service -a ${name}`);
     }
     expect(existsSync(join(harness.home, ".agent-control-plane", "buzz-nostr-subscriber.json"))).toBe(false);
+  });
+
+  it("passes the complete Hermes adoption group from Keychain, never from inherited values", () => {
+    const harness = makeHarness();
+    for (const name of HERMES_ADOPTION_VARIABLES) harness.env[name] = `inherited-${name}`;
+    harness.env["ACP_HERMES_KEYCHAIN_ACCOUNTS"] = HERMES_ADOPTION_VARIABLES.join(",");
+    expect(installWithPins(harness).status).toBe(0);
+
+    let launched = runGeneratedLauncher(harness);
+    expect(launched.status, launched.stderr).toBe(0);
+    expect(launcherObservations(harness).hermes).toEqual(Object.fromEntries(
+      HERMES_ADOPTION_VARIABLES.map((name) => [name, `keychain-${name}`]),
+    ));
+    const lookups = readFileSync(harness.securityLog, "utf8");
+    for (const name of HERMES_ADOPTION_VARIABLES) {
+      expect(lookups).toContain(`find-generic-password -w -s test-service -a ${name}`);
+    }
+
+    // An absent account cannot be filled from the inherited shell; daemon validation owns
+    // rejection of the partial group (tested in operator-socket.test.ts).
+    const missing = HERMES_ADOPTION_VARIABLES[7];
+    harness.env["ACP_HERMES_KEYCHAIN_ACCOUNTS"] = HERMES_ADOPTION_VARIABLES.slice(0, -1).join(",");
+    rmSync(harness.launcherEnvLog);
+    launched = runGeneratedLauncher(harness);
+    expect(launched.status, launched.stderr).toBe(0);
+    const partial = launcherObservations(harness).hermes;
+    expect(partial[missing]).toBe("");
+    for (const name of HERMES_ADOPTION_VARIABLES.slice(0, -1)) {
+      expect(partial[name]).toBe(`keychain-${name}`);
+    }
   });
 
   it("#423 takes BUZZ_PRIVATE_KEY from the desktop store when it has no item of its own", () => {
@@ -1021,13 +1273,14 @@ describe("launchd deployment artifact", () => {
 
   it("reaches lsof from the daemon's PATH, so a canonical self-claim can resolve an executing image", () => {
     const harness = makeHarness();
-    // On Darwin a canonical self-claim resolves the claiming process's executing image by running
-    // `lsof -p <pid> -FfptDin`, spawned under its bare name by `lsofEntries`
-    // (src/registry/canonical-self-claim.ts). That call consults no environment, so an absolute
-    // path baked into a variable has no reader and the daemon's PATH is the only channel that
-    // reaches it. lsof ships in /usr/sbin; a PATH without that directory turns every scan into an
-    // empty list, the executing image resolves to null, and a genuine claim is refused as CONFLICT
-    // with evidence that carries a pid and names neither the missing tool nor the cause.
+    // On Darwin a canonical self-claim reads the claiming process's working directory, and
+    // observes its executing image, by running `lsof -p <pid> -FfptDin`, spawned under its bare
+    // name by `lsofEntries` (src/registry/canonical-self-claim.ts). That call consults no
+    // environment, so an absolute path baked into a variable has no reader and the daemon's PATH
+    // is the only channel that reaches it. lsof ships in /usr/sbin; a PATH without that directory
+    // makes every scan fail to run (`SCAN_FAILED`, `ENOENT`), the working directory cannot be read,
+    // and a genuine claim is refused `PROBE_FAILED`. The image goes unobserved too, which on its
+    // own refuses nothing — the claim records it and compares it against no configured value.
     harness.env["PATH"] = isolatedInstallerPath(harness);
     expect(installWithPins(harness).status).toBe(0);
     const launched = runGeneratedLauncher(harness);
@@ -1041,8 +1294,9 @@ describe("launchd deployment artifact", () => {
       seen.lsof?.startsWith("/"),
       "lsof resolved to something that is not an absolute path",
     ).toBe(true);
-    // Resolving is not answering. The claim needs a txt record back from a real scan, so the row
-    // runs one rather than stopping at the lookup.
+    // Resolving is not answering. The claim needs a real scan to come back with records, so the row
+    // runs one rather than stopping at the lookup; a txt record is the one an executing image
+    // leaves.
     expect(seen.lsofScan, "lsof resolved but reported no executing image").toBe("txt-reported");
   });
 
@@ -1509,6 +1763,7 @@ describe("launchd deployment artifact", () => {
 
     writeFileSync(harness.lock, "old daemon lock\n", { mode: 0o600 });
     harness.env["ACP_RENDER_REQUIRES_STOPPED"] = "1";
+    harness.env["ACP_BOOTOUT_PRINT_LAG"] = "1";
     const upgraded = runInstaller(
       installer,
       ["upgrade", "--app-root", root, "--node", harness.node],
@@ -1524,10 +1779,20 @@ describe("launchd deployment artifact", () => {
       "bootstrap",
       "kickstart",
       "print",
+      "print",
+      "print",
+      "print",
+      "print",
       "bootout",
+      "print",
+      "print",
       "print",
       "bootstrap",
       "kickstart",
+      "print",
+      "print",
+      "print",
+      "print",
     ]);
   });
 
@@ -1735,6 +2000,7 @@ describe("launchd deployment artifact", () => {
 
     writeFileSync(harness.loaded, "loaded\n", { mode: 0o600 });
     writeFileSync(harness.lock, "old daemon lock\n", { mode: 0o600 });
+    harness.env["ACP_BOOTOUT_PRINT_LAG"] = "1";
     writeFileSync(harness.launchLog, "");
     const rolledBack = runInstaller(
       installer,
@@ -1762,8 +2028,14 @@ describe("launchd deployment artifact", () => {
       "print",
       "bootout",
       "print",
+      "print",
+      "print",
       "bootstrap",
       "kickstart",
+      "print",
+      "print",
+      "print",
+      "print",
     ]);
 
     // The generation moved as one: runtime closure, plist and launcher are all the named pair's,

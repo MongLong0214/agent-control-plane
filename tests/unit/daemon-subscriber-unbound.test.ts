@@ -53,6 +53,13 @@ it("completes daemon startup with a revoked PRIMARY_CTO binding and keeps the cl
     seed.db.run(`INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)`, [
       "startup-project", "startup revoked binding", systemClock.nowIso(),
     ]);
+    // The project the canonical activation entry below names, which is deliberately not the one
+    // whose PRIMARY_CTO binding this case revokes: startup refuses an entry naming a project the
+    // registry does not hold, so without this row the daemon never reaches the claim door and the
+    // revoked-binding assertions below would be measuring the registry check instead.
+    seed.db.run(`INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)`, [
+      "startup-test-project", "startup canonical entitlement", systemClock.nowIso(),
+    ]);
     const session = seed.sessions.create({ provider: "claude", model: "startup-cto" });
     expect(seed.sessions.transition(session.sessionId, SessionLifecycle.READY, "startup test").allowed).toBe(true);
     expect(seed.sessions.bindBuzzActor({
@@ -97,11 +104,13 @@ it("completes daemon startup with a revoked PRIMARY_CTO binding and keeps the cl
     ACP_BUZZ_INGRESS_SECRET: "startup-buzz-secret",
     ACP_BUZZ_ALLOWED_ACTORS: "startup-owner",
     ACP_BUZZ_CHANNEL: "startup-room",
-    ACP_CANONICAL_SESSION_UUID: "99999999-9999-4999-8999-999999999999",
-    ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION: "0.0.0-startup-test",
-    ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH: join(root, "executor"),
-    ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256: `sha256:${"0".repeat(64)}`,
-    ACP_CANONICAL_CTO_BUZZ_ACTOR_ID: pubkey,
+    ACP_CANONICAL_SESSIONS_JSON: JSON.stringify([
+      {
+        sessionUuid: "99999999-9999-4999-8999-999999999999",
+        projectId: "startup-test-project",
+        buzzActorId: pubkey,
+      },
+    ]),
     ACP_CANONICAL_CTO_PEER_PROTOCOL: "acp.startup-test/v9",
     ACP_CANONICAL_CTO_BUZZ_PURPOSE: "continuity:STARTUP_TEST_CTO",
   })) vi.stubEnv(key, value);

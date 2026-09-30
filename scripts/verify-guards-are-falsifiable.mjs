@@ -849,9 +849,12 @@ const GUARDS = [
     // #423 was `buzz`, #785 was `claude`/`codex`/`grok`, and this is `lsof`, which ships only from
     // `/usr/sbin`. `lsofEntries` (src/registry/canonical-self-claim.ts) spawns it under its bare
     // name and reads no environment, so an absolute pin has no reader and this PATH is the only
-    // channel. Dropping the directory returns every scan empty, resolves the executing image to
-    // null, and refuses a genuine canonical self-claim as CONFLICT.
-    what: "the daemon's PATH reaches lsof, the only channel the canonical self-claim's executing-image resolution has",
+    // channel. On Darwin that one scan is how the claim reads the claimant's working directory and
+    // observes its executing image. Dropping the directory makes every scan fail to run
+    // (`SCAN_FAILED`, `ENOENT`, measured 2026-09-27), so the working directory cannot be read and a
+    // genuine canonical self-claim is refused `PROBE_FAILED`. The image goes unobserved too, which
+    // on its own refuses nothing: the claim compares it against no configured value.
+    what: "the daemon's PATH reaches lsof, the only channel the canonical self-claim's working-directory read and executing-image observation have",
     file: "deploy/install-launchd.sh",
     find: 'export PATH="${ACP_NODE_PATH%/*}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin"',
     replace: 'export PATH="${ACP_NODE_PATH%/*}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"',
@@ -4703,6 +4706,17 @@ const GUARDS = [
     replace: "    this.#lastDoctorSuccess = { report, generation: generation + 1 };\n",
     killedBy: [
       "tests/unit/daemon-doctor-freshness.test.ts::a re-evaluation that fails yields STALE immediately",
+    ],
+  },
+  {
+    // #1016. A dylib's LC_ID_DYLIB can name its build-machine path while every library it loads
+    // is a system library. Counting that identity as a load refuses a self-contained closure.
+    what: "#1016: a dylib's own install name is not a library the sealed closure loads",
+    file: "src/deploy/rollback-pair.ts",
+    find: 'const MACH_O_LOAD_COMMANDS = new Set([\n  "LC_LOAD_DYLIB",\n',
+    replace: 'const MACH_O_LOAD_COMMANDS = new Set([\n  "LC_ID_DYLIB",\n  "LC_LOAD_DYLIB",\n',
+    killedBy: [
+      "tests/process/rollback-pair-wal.test.ts::seals a real dylib whose own install name points outside the closure",
     ],
   },
   {

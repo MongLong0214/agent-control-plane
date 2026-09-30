@@ -5,7 +5,9 @@ import { createOperatorClient, dispatch as dispatchAgentctl } from "../../src/cl
 import { parseRepoFactoryResult, REPO_FACTORY_RESULT_SCHEMA_ID } from "../../src/bootstrap/repo-factory-result.ts";
 import { canonicalJson, digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { ArtifactKind, ExecutionMode, TaskClass } from "../../src/domain/types.ts";
+import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
+import { ArtifactKind, ExecutionMode, Role, RunKind, TaskClass, roleKeyFor } from "../../src/domain/types.ts";
+import { Daemon } from "../../src/daemon/daemon.ts";
 import {
   BASELINE_EXPORT_SCHEMA_ID,
   BASELINE_RECORD_SCHEMA_ID,
@@ -29,13 +31,14 @@ import { approveMigration } from "../../src/db/migration-approval.ts";
 import { migrationChainFrom, SCHEMA_VERSION } from "../../src/db/migrations.ts";
 import {
   bindWorker,
+  bindCeo,
   finalizeNoRepositoryRun,
   makeHarness,
   makeStartedOperator,
   registerFixtureProject,
   TEST_OPERATOR_TOKEN,
 } from "../helpers/harness.ts";
-import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -78,6 +81,107 @@ const refreshRecordDigest = (
 };
 
 describe("host-anchored redacted run-evidence export", () => {
+  it("a later runtime measurement leaves a completed run export and its verification unchanged", async () => {
+    const harness = makeHarness();
+    const { cp, clock, scripted } = harness;
+    const { projectId } = await registerFixtureProject(harness);
+    bindCeo(harness);
+    cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
+    scripted.setCapacity({
+      provider: "scripted", sensorHealth: "HEALTHY", runtimeHealth: "HEALTHY",
+      observedAt: clock.nowIso(), source: "scripted-before-observation",
+      buckets: [{ id: "scripted-window", remainingPercent: 90, resetAt: null, capabilities: ["worker", "cto"] }],
+    });
+    const created = cp.runs.create({
+      projectId,
+      kind: RunKind.CONTRACT_CHANGE,
+      executionMode: ExecutionMode.STANDARD,
+      contract,
+      baselineHarness: { evidenceSource: "PRODUCTION", acpBinaryVersion: "production-build" },
+    });
+    expect(created.allowed).toBe(true);
+    if (!created.allowed) return;
+    const dispatched = await cp.runs.dispatch(created.value.runId);
+    expect(dispatched.allowed).toBe(true);
+    if (!dispatched.allowed) return;
+    const submitted = cp.tasks.submit(created.value.runId, [
+      { key: "capacity-witness", title: "capacity witness", category: "test" },
+    ]);
+    expect(submitted.allowed).toBe(true);
+    if (!submitted.allowed) return;
+    const taskId = submitted.value[0]!.taskId;
+    const execution = cp.tasks.startExecution({
+      runId: created.value.runId, taskId,
+      ownerBindingGeneration: dispatched.value.ownerBindingGeneration!,
+      workerSessionId: bindWorker(harness, taskId),
+      provider: "scripted", model: "scripted-worker",
+    });
+    expect(execution.allowed).toBe(true);
+    if (!execution.allowed) return;
+
+    clock.advance(1_000);
+    const observedAt = clock.nowIso();
+    const observed = await cp.capacity.observe({
+      provider: "scripted", observedAt, runtimeHealth: "HEALTHY",
+      actor: "fixture-operator", source: AGENTCTL_CAPACITY_OBSERVATION_SOURCE,
+      buckets: [{ id: "operator-window", remainingPercent: 80, resetAt: null, capabilities: ["worker", "cto"] }],
+    });
+    expect(observed.allowed).toBe(true);
+    expect(cp.capacity.current("scripted")?.operatorObservation).toBeDefined();
+
+    clock.advance(1_000);
+    expect(cp.tasks.finishExecution(execution.value.executionId, {
+      status: "SUCCEEDED", resultDigest: digestOf({ taskId }),
+    }).allowed).toBe(true);
+    await cp.continuity.evaluate("completed-run export witness");
+    const packet = await cp.pipeline.submitResult({
+      runId: created.value.runId,
+      ownerSessionId: dispatched.value.ownerSessionId!,
+      ownerBindingGeneration: dispatched.value.ownerBindingGeneration!,
+      resultSummary: "capacity evidence captured", recommendation: "complete administrative run", residualRisk: [],
+    });
+    expect(packet.allowed).toBe(true);
+    if (!packet.allowed) return;
+    const candidateSnapshotDigest = cp.runs.currentCandidate(created.value.runId)!;
+    await cp.continuity.evaluate("completed-run finalization");
+    const ceo = cp.bindings.active(roleKeyFor(Role.CEO))!;
+    const confirmed = cp.ceo.submitCeoDecision({
+      runId: created.value.runId, decision: "CONFIRM", candidateSnapshotDigest,
+      ceoSessionId: ceo.sessionId, rationale: "administrative capacity witness",
+    });
+    expect(confirmed.allowed).toBe(true);
+    if (!confirmed.allowed) return;
+    const daemon = new Daemon(cp, { stateDir: tempDir("acp-capacity-export-") });
+    const started = await daemon.start();
+    expect(started.allowed).toBe(true);
+    if (!started.allowed) return;
+    await daemon.stop();
+    const before = exporterFor(harness).exportRun(created.value.runId);
+    expect(before.allowed).toBe(true);
+    if (!before.allowed) return;
+    expect(before.value.run.state).toBe("COMPLETED");
+    expect((before.value.baseline.capacity["snapshots"] as Array<{ observedAt: string }>)
+      .some((snapshot) => snapshot.observedAt === observedAt)).toBe(true);
+    expect(verifyRunEvidenceExport(before.value, cp.db)).toBe(true);
+
+    clock.advance(60_000);
+    const measuredAt = clock.nowIso();
+    scripted.setCapacity({
+      provider: "scripted", sensorHealth: "ERROR", runtimeHealth: "UNAVAILABLE",
+      observedAt: measuredAt, source: "fixture-collector-error",
+      error: "quota timed out; runtime probe says unavailable", buckets: [],
+    });
+    await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["scripted"]);
+
+    const after = exporterFor(harness).exportRun(created.value.runId);
+    expect(after.allowed).toBe(true);
+    if (!after.allowed) return;
+    const { exportedAt: _afterExportedAt, integrity: _afterIntegrity, ...afterRun } = after.value;
+    const { exportedAt: _beforeExportedAt, integrity: _beforeIntegrity, ...beforeRun } = before.value;
+    expect(afterRun).toEqual(beforeRun);
+    expect(verifyRunEvidenceExport(before.value, cp.db)).toBe(true);
+  });
+
   it("covers each included artifact with both its source digest and the export checksum", () => {
     const harness = makeHarness();
     const created = harness.cp.runs.create({

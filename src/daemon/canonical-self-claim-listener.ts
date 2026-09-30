@@ -109,9 +109,12 @@ export const assertDirectPeer = (credentials: PeerCredentials): Decision<PeerCre
 
 /**
  * The one identity check this listener performs itself, before a byte of the request is even
- * read — "before any other effect". Everything past this point (the exact executable, version,
- * conversation transcript and working directory) is `CanonicalSelfClaim.claim()`'s job,
- * unchanged; this only answers "is this a trustworthy direct local peer at all".
+ * read — "before any other effect". Everything past this point is `CanonicalSelfClaim.claim()`'s
+ * job, unchanged: the claude ancestor the walk finds by `argv[0]`'s basename, the session UUID in
+ * its argv and the project that UUID's entry entitles, a working directory it can read, the
+ * conversation transcript, and the pid/start-time recheck. It checks no executable or version —
+ * the executing image is recorded there, never compared. This only answers "is this a
+ * trustworthy direct local peer at all".
  */
 const authenticateClaimPeer = (socket: Socket): Decision<AuthenticatedClaimPeer> =>
   authenticateClaimCredentials(derivePeerCredentialsFromSocket(socket), process.geteuid?.());
@@ -155,7 +158,7 @@ export const authenticateClaimCredentials = (
 /**
  * The wire shape a caller may ever see. For a denial, only the stable `reasonCode` classifying
  * why — never the internal `message` prose or `evidence` object, either of which can carry a
- * session UUID, an absolute path, an image hash, a peer identity, a transcript fact, or a raw
+ * session UUID, an absolute path, a peer identity, a transcript fact, or a raw
  * exception message: exactly what `authenticateClaimPeer`, the request parser, the method/lock
  * checks, the handler's own denial, the request-timeout, and the handler-exception catch would
  * otherwise put on this socket unfiltered. For an allow, the caller's own receipt `value` passes

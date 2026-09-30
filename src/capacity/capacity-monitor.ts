@@ -437,9 +437,9 @@ export class CapacityMonitor {
         // it persist over an operator observation that has not yet expired would erase the
         // only reading this deployment can obtain, seconds after it was recorded.
         //
-        // This is not a favourable-reading fallback: a *successful* collector reading always
-        // wins, because a measurement is better evidence than a recollection, and the
-        // observation still expires on the same stale-grace rule with nothing to renew it.
+        // This preserves quota, not an older runtime verdict: a separately measured runtime
+        // health still governs admission. A *successful* collector reading always wins, and
+        // the observation still expires on the same stale-grace rule with nothing to renew it.
         const preserved = this.observationOutlivingError(reading);
         const enriched = preserved ?? this.record(reading);
         readings.push(enriched);
@@ -476,6 +476,9 @@ export class CapacityMonitor {
               // budget instead. The telemetry `dims` above keeps its own name deliberately: that
               // path calls `redact` only and has no allowlist or length refusal.
               error: reading.error ?? null,
+              runtimeHealth: reading.runtimeHealth,
+              observedAt: reading.observedAt,
+              source: reading.source,
               observationAgeMs: preserved.ageMs,
               staleGraceMs: this.#options.staleGraceMs,
             },
@@ -894,6 +897,36 @@ export class CapacityMonitor {
     );
     if (rows.length === 0) return null;
     const first = rows[0]!;
+    // A failed quota collector can still measure runtime health. Its own snapshot must
+    // remain at its own time, while a live operator quota keeps its original age and rows.
+    if (first.sensor_health === "ERROR" && first.runtime_health !== "UNKNOWN") {
+      const observed = this.db.all<RawCapacity>(
+        `SELECT * FROM capacity_snapshots
+          WHERE provider = ? AND observed_at = (
+            SELECT MAX(observed_at) FROM capacity_snapshots
+             WHERE provider = ? AND observed_at < ? AND sensor_health != 'ERROR')`,
+        [provider, provider, first.observed_at],
+      );
+      const provenance = observed[0] && operatorObservationFromSource(observed[0].source);
+      if (provenance) {
+        const preserved = this.enrich({
+          provider,
+          sensorHealth: observed[0]!.sensor_health,
+          runtimeHealth: first.runtime_health,
+          observedAt: observed[0]!.observed_at,
+          source: provenance.source,
+          buckets: observed.map((row) => ({
+            id: row.bucket_id,
+            remainingPercent: row.remaining_percent,
+            resetAt: row.reset_at,
+            capabilities: JSON.parse(row.capabilities_json) as string[],
+          })),
+        });
+        if (preserved.ageMs <= this.#options.staleGraceMs) {
+          return { ...preserved, operatorObservation: provenance };
+        }
+      }
+    }
     const operatorObservation = operatorObservationFromSource(first.source);
     const enriched = this.enrich({
       provider,
@@ -1231,16 +1264,32 @@ export class CapacityMonitor {
    *
    * Returns null once the observation is past its stale grace: at that point it is no more
    * informative than the ERROR, and the ERROR is the honest record of what the sensor did.
-   * Both suspend, so nothing becomes routable either way — this only decides which reason
-   * the operator is shown.
+   * A measured runtime health replaces the observation's older runtime health while its
+   * quota and observedAt remain in place. An UNKNOWN runtime adds no new runtime evidence.
    */
   private observationOutlivingError(reading: CapacityReading): ProviderCapacity | null {
     if (reading.sensorHealth !== "ERROR") return null;
     const current = this.current(reading.provider);
     if (!current?.operatorObservation) return null;
     if (current.ageMs > this.#options.staleGraceMs) return null;
+    // UNKNOWN contributes no runtime evidence. A measured verdict is persisted as the
+    // collector's own empty-quota reading, never as a rewrite of the operator's rows.
+    if (reading.runtimeHealth !== "UNKNOWN" && reading.observedAt > current.observedAt) {
+      this.record({ ...reading, buckets: [] });
+    }
+    const preserved = reading.runtimeHealth === "UNKNOWN" || reading.runtimeHealth === current.runtimeHealth
+      ? current
+      : this.enrich({
+          provider: current.provider,
+          sensorHealth: current.sensorHealth,
+          runtimeHealth: reading.runtimeHealth,
+          observedAt: current.observedAt,
+          source: current.source,
+          buckets: current.buckets,
+        });
     return {
-      ...current,
+      ...preserved,
+      operatorObservation: current.operatorObservation,
       supersededCollectorError: { source: reading.source, error: reading.error ?? null },
     };
   }
