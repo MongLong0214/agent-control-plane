@@ -9,6 +9,7 @@ import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { CONTINUITY_COVERAGE_REVOCATION_REASON } from "../../src/continuity/continuity-kernel.ts";
 import {
+  COVERAGE_REVOCATION_GRACE_MS,
   Daemon,
   OPERATOR_METHOD,
   type AuthenticatedOperatorPeer,
@@ -996,5 +997,118 @@ describe("#954: a role continuity revoked is a role continuity owes", () => {
     } finally {
       await daemon.stop();
     }
+  });
+});
+
+/**
+ * #954 (A) — a momentary coverage gap does not revoke a live incumbent.
+ *
+ * The revocation is durable and only a claim undoes it, so every momentary gap used to become a
+ * human action: measured live, coverage was whole again 2m29s after the revocation it caused. An
+ * incumbent whose exact process is still running now keeps its binding for
+ * `COVERAGE_REVOCATION_GRACE_MS` while its work is paused, and loses it only if the role is still
+ * unstaffable when the window ends. The quota reading here is healthy and exhausted, the gen11 shape
+ * (weekly 1%, runtime HEALTHY), so the only thing wrong is coverage.
+ */
+describe("#954: a live incumbent keeps its binding through a momentary coverage gap", () => {
+  const liveIncumbent = () => {
+    const token = readProcessStartToken(process.pid);
+    expect(token).toMatch(/^darwin-tv:\d+\.\d{6}$/);
+    const fixture = makeIncumbent("claude", { pid: process.pid, token: token! });
+    fixture.cp.providers.registerForRole(fixture.claude, Role.PRIMARY_CTO);
+    return fixture;
+  };
+  const quota = (fixture: ReturnType<typeof makeIncumbent>, remainingPercent: number) => {
+    fixture.claude.setCapacity({
+      ...fixture.unread,
+      sensorHealth: "HEALTHY",
+      runtimeHealth: "HEALTHY",
+      error: undefined,
+      observedAt: fixture.clock.nowIso(),
+      buckets: [{ id: "weekly", remainingPercent, resetAt: null, capabilities: ["cto", "ceo"] }],
+    });
+  };
+  const kinds = (fixture: ReturnType<typeof makeIncumbent>, kind: string) =>
+    fixture.cp.db.all<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM audit_events WHERE kind = ? AND role_key = ?`,
+      [kind, fixture.roleKey],
+    )[0]?.n;
+
+  it("keeps the same generation when coverage returns inside the window, with no claim", async () => {
+    const fixture = liveIncumbent();
+    quota(fixture, 1);
+
+    const gap = await fixture.daemon.reconcileContinuity("weekly quota measured exhausted");
+
+    expect(gap?.plan.assignments.find((assignment) => assignment.roleKey === fixture.roleKey)?.provider).toBeNull();
+    expect(gap?.unresolved).toContainEqual({ roleKey: fixture.roleKey, reasonCode: ReasonCode.COVERAGE_NONE });
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toEqual(fixture.incumbent);
+    expect(kinds(fixture, "CONTINUITY_REVOCATION_HELD")).toBe(1);
+
+    fixture.clock.advance(149_000);
+    quota(fixture, 90);
+    await fixture.daemon.reconcileContinuity("weekly quota measured again");
+
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toEqual(fixture.incumbent);
+    expect(kinds(fixture, "BINDING_REVOKED")).toBe(0);
+    expect(kinds(fixture, "CONTINUITY_RESTORE_AWAITS_CLAIM")).toBe(0);
+    expect(kinds(fixture, "CONTINUITY_REVOCATION_WITHDRAWN")).toBe(1);
+  });
+
+  it("records the hold once and keeps holding while the window lasts", async () => {
+    const fixture = liveIncumbent();
+    quota(fixture, 1);
+
+    await fixture.daemon.reconcileContinuity("first tick of the gap");
+    fixture.clock.advance(COVERAGE_REVOCATION_GRACE_MS - 1_000);
+    quota(fixture, 1);
+    await fixture.daemon.reconcileContinuity("last tick inside the window");
+
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toEqual(fixture.incumbent);
+    expect(kinds(fixture, "CONTINUITY_REVOCATION_HELD")).toBe(1);
+  });
+
+  it("revokes for want of coverage once the gap outlasts the window", async () => {
+    const fixture = liveIncumbent();
+    quota(fixture, 1);
+
+    await fixture.daemon.reconcileContinuity("first tick of the gap");
+    fixture.clock.advance(COVERAGE_REVOCATION_GRACE_MS);
+    quota(fixture, 1);
+    await fixture.daemon.reconcileContinuity("the gap is still there");
+
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toBeNull();
+    expect(
+      fixture.cp.db.all<{ revoked_reason: string | null }>(
+        `SELECT revoked_reason FROM assignments WHERE role_key = ? ORDER BY binding_generation DESC`,
+        [fixture.roleKey],
+      )[0],
+    ).toEqual({ revoked_reason: CONTINUITY_COVERAGE_REVOCATION_REASON });
+  });
+
+  it("revokes at once a reused pid whose start token is not the one it recorded", async () => {
+    const liveToken = readProcessStartToken(process.pid);
+    expect(liveToken).toMatch(/^darwin-tv:\d+\.\d{6}$/);
+    const recordedToken = liveToken!.replace(/^darwin-tv:(\d+)/, (_, seconds: string) =>
+      `darwin-tv:${Number(seconds) - 1}`);
+    const fixture = makeIncumbent("claude", { pid: process.pid, token: recordedToken });
+    fixture.cp.providers.registerForRole(fixture.claude, Role.PRIMARY_CTO);
+    quota(fixture, 1);
+
+    await fixture.daemon.reconcileContinuity("weekly quota measured exhausted");
+
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toBeNull();
+    expect(kinds(fixture, "CONTINUITY_REVOCATION_HELD")).toBe(0);
+  });
+
+  it("revokes at once an incumbent whose process it cannot identify", async () => {
+    const fixture = makeIncumbent("claude");
+    fixture.cp.providers.registerForRole(fixture.claude, Role.PRIMARY_CTO);
+    quota(fixture, 1);
+
+    await fixture.daemon.reconcileContinuity("weekly quota measured exhausted");
+
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toBeNull();
+    expect(kinds(fixture, "CONTINUITY_REVOCATION_HELD")).toBe(0);
   });
 });

@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
 import type { ControlPlane } from "../app/control-plane.ts";
-import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../capacity/capacity-monitor.ts";
+import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger, type ProviderCapacity } from "../capacity/capacity-monitor.ts";
 import { COLLECTOR_TIMEOUT_MS } from "../capacity/usage-collectors.ts";
 import { RECONCILE_SWEEP_BUDGET_MS } from "../conversation/turn-coordinator.ts";
 import {
@@ -38,6 +38,7 @@ import {
 } from "../ingress/ingress-guard.ts";
 import type { OwnerApprovalReceipt } from "../ceo/owner-authority.ts";
 import { ROLE_ATTACHMENT_OPERATION, RoleAttachmentCredentials } from "../session/role-attachment-credentials.ts";
+import type { SessionRecord } from "../session/session-registry.ts";
 import type { BuzzAdapter } from "../buzz/buzz-adapter.ts";
 import {
   ApprovedRunFinalizer,
@@ -89,6 +90,17 @@ import { SingleInstanceLock } from "./single-instance.ts";
 const BUZZ_MENTION_SILENCE_GRACE_MS = 600_000;
 
 const STARTUP_CAPACITY_REFRESH_BUDGET_MS = 15_000;
+
+/**
+ * #954 — how long a live incumbent keeps its binding while the coverage plan cannot staff its role.
+ *
+ * A revocation is durable and only a claim can undo it, while the cause is often momentary: measured
+ * on the live deployment, coverage was whole again 2m29s after the revocation it caused. So an
+ * incumbent whose exact process is still running (native pid and start token) keeps its binding
+ * through this window, with its work paused exactly as before; the binding is revoked only if the
+ * role is still unstaffable when the window ends. A dead or unidentified incumbent is revoked at once.
+ */
+export const COVERAGE_REVOCATION_GRACE_MS = 10 * 60_000;
 
 /**
  * What a full sweep may take, derived from the work rather than from a healthy day.
@@ -510,6 +522,9 @@ export class Daemon {
   #telegramIngressController: TelegramIngressController | null = null;
   #continuityCoordinatorInstalled = false;
   #continuityReconciling = false;
+  // #954 — roles held through a coverage gap, keyed by role, with the generation and the moment the
+  // gap was first seen. In memory: a restart starts the window again, which only ever holds longer.
+  #coverageHolds = new Map<string, { generation: number; sinceMs: number }>();
   // #734 — the last system evaluation that actually finished, and the outcome of the most
   // recent *attempt*, kept apart on purpose: a failed attempt must be visible even while the
   // last success is still inside its freshness window (criterion 3). `resolveDoctorHealth`
@@ -1585,7 +1600,10 @@ export class Daemon {
         // A new plan may prefer a recovered provider over an already healthy fallback.
         // That is restoration, not failure, and §15.8 keeps the acting owner in place
         // until the explicit non-preemptive restore path can safely move it.
-        if (currentStillCovered) continue;
+        if (currentStillCovered) {
+          this.releaseCoverageHold(required.roleKey, "the incumbent's provider covers the role again");
+          continue;
+        }
 
         // #811: allocation needs a readable quota; eviction needs evidence against the
         // incumbent. An observed exhausted window dominates an unread window beside it.
@@ -1620,12 +1638,14 @@ export class Daemon {
             reasonCode: plan.outcome === "NO_VALID_COVERAGE" ? ReasonCode.COVERAGE_NONE : ReasonCode.COVERAGE_PARTIAL,
           });
           pausedRuns.push(...this.pauseAffectedRuns(required, CONTINUITY_COVERAGE_REVOCATION_REASON));
+          if (this.holdsThroughCoverageGap(required.roleKey, current.bindingGeneration, session, currentCapacity)) continue;
           // The reason is the continuity kernel's, not a literal this site owns: `requiredRoles`
           // reads it back off the revoked row to tell a revocation it performed from an operator
           // release, which is what decides whether the role is still owed a binding (#954).
           this.revokePausedBinding(required, CONTINUITY_COVERAGE_REVOCATION_REASON);
           continue;
         }
+        this.releaseCoverageHold(required.roleKey, "the coverage plan can staff the role again");
 
         const failedOver = await this.cp.continuity.failover(
           required.roleKey,
@@ -1822,6 +1842,61 @@ export class Daemon {
       }
     }
     return paused;
+  }
+
+  /**
+   * #954 — whether this pass keeps the binding of a role the coverage plan cannot staff.
+   *
+   * Only an incumbent that is provably still running is held: its session READY and its exact
+   * process, by native pid and start token, alive. Anything else is the dead endpoint the revocation
+   * exists for. A runtime its own reading calls UNAVAILABLE is evidence against the incumbent rather
+   * than a gap in quota or admission, and is revoked at once as before. The hold is per generation
+   * and ends when the role is covered again or when `COVERAGE_REVOCATION_GRACE_MS` has passed since
+   * the gap was first seen, whichever comes first.
+   */
+  private holdsThroughCoverageGap(
+    roleKey: string,
+    generation: number,
+    session: SessionRecord | null,
+    capacity: ProviderCapacity | null,
+  ): boolean {
+    if (capacity?.runtimeHealth === "UNAVAILABLE") return false;
+    if (session?.lifecycle !== SessionLifecycle.READY) return false;
+    if (session.osPid == null) return false;
+    if (session.osProcessStartedAt == null) return false;
+    if (session.osProcessStartedAt !== readProcessStartToken(session.osPid)) return false;
+    const nowMs = Date.parse(this.cp.clock.nowIso());
+    const held = this.#coverageHolds.get(roleKey);
+    if (held?.generation !== generation) {
+      this.#coverageHolds.set(roleKey, { generation, sinceMs: nowMs });
+      this.cp.audit.record({
+        kind: "CONTINUITY_REVOCATION_HELD",
+        roleKey,
+        sessionId: session.sessionId,
+        reasonCode: ReasonCode.COVERAGE_INCOMPLETE,
+        evidence: {
+          generation,
+          graceMs: COVERAGE_REVOCATION_GRACE_MS,
+          revokeAfter: new Date(nowMs + COVERAGE_REVOCATION_GRACE_MS).toISOString(),
+        },
+      });
+      return true;
+    }
+    if (nowMs - held.sinceMs < COVERAGE_REVOCATION_GRACE_MS) return true;
+    this.#coverageHolds.delete(roleKey);
+    return false;
+  }
+
+  /** #954 — a held role whose coverage returned keeps its binding; the ledger says so once. */
+  private releaseCoverageHold(roleKey: string, reason: string): void {
+    const held = this.#coverageHolds.get(roleKey);
+    if (!held) return;
+    this.#coverageHolds.delete(roleKey);
+    this.cp.audit.record({
+      kind: "CONTINUITY_REVOCATION_WITHDRAWN",
+      roleKey,
+      evidence: { generation: held.generation, heldMs: Date.parse(this.cp.clock.nowIso()) - held.sinceMs, reason },
+    });
   }
 
   /**
