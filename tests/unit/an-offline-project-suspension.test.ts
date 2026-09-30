@@ -16,6 +16,8 @@ afterAll(cleanupTempDirs);
 
 /** The account the kernel says runs this test, which is the only approver the command admits. */
 const ACCOUNT = userInfo().username;
+/** A second declared owner whose name can never be the running account. */
+const OTHER_OWNER = `${ACCOUNT}-is-not-this-account`;
 
 const setup = async (live: { run?: boolean; binding?: boolean; bindingOnFinishedRun?: boolean } = {}) => {
   const harness = makeHarness();
@@ -47,7 +49,7 @@ const setup = async (live: { run?: boolean; binding?: boolean; bindingOnFinished
   harness.cp.db.close();
   const databasePath = join(harness.root, "state.sqlite");
   // The deployment's owner declaration, which the command checks the approver against.
-  writeFileSync(join(harness.root, "owner-identities"), `cli:${ACCOUNT}\ncli:another-owner\n`, { mode: 0o600 });
+  writeFileSync(join(harness.root, "owner-identities"), `cli:${ACCOUNT}\ncli:${OTHER_OWNER}\n`, { mode: 0o600 });
   const args = ["suspend-project", "--database", databasePath, "--project-id", projectId,
     "--approved-by", ACCOUNT, "--confirm-suspend"];
   return { databasePath, projectId, args, root: harness.root };
@@ -94,14 +96,14 @@ describe("#1032: offline project suspension", () => {
 
   it("refuses a declared owner's name typed by an account that is not that owner", async () => {
     const { databasePath, projectId, args } = await setup();
-    await expect(stateAdmin(args.map((token) => token === ACCOUNT ? "another-owner" : token)))
+    await expect(stateAdmin(args.map((token) => token === ACCOUNT ? OTHER_OWNER : token)))
       .rejects.toThrow(/not the account running this command/);
     expect(suspendedAudits(databasePath, projectId)).toEqual({ suspended: 0, audits: 0 });
   });
 
   it("refuses the running account when the deployment did not declare it as a cli owner", async () => {
     const { databasePath, projectId, args, root } = await setup();
-    writeFileSync(join(root, "owner-identities"), "cli:another-owner\n", { mode: 0o600 });
+    writeFileSync(join(root, "owner-identities"), `cli:${OTHER_OWNER}\n`, { mode: 0o600 });
     await expect(stateAdmin(args)).rejects.toThrow(/not a declared cli owner identity/);
     expect(suspendedAudits(databasePath, projectId)).toEqual({ suspended: 0, audits: 0 });
   });
