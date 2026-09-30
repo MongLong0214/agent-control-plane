@@ -6,7 +6,9 @@ import { pathToFileURL } from "node:url";
 
 import { isAcpError } from "../core/errors.ts";
 import { systemClock } from "../core/clock.ts";
+import { readOwnerIdentities } from "../app/control-plane.ts";
 import { SingleInstanceLock } from "../daemon/single-instance.ts";
+import { TERMINAL_RUN_STATES } from "../domain/run-state.ts";
 import { realWorkspaceProbe } from "../guard/workspace-probe.ts";
 import { ManagedWriteGuard } from "../guard/managed-write-guard.ts";
 import { ProjectRegistry } from "../registry/project-registry.ts";
@@ -325,6 +327,14 @@ export const main = async (argv: string[]): Promise<number> => {
   }
 
   if (parsed.command === "suspend-project") {
+    // The approval is the owner's only if the name is one the deployment declared out of band, in
+    // the same `owner-identities` file the daemon's owner authority reads. An absent or empty
+    // declaration authorises nobody, as it does for every other owner gate.
+    const approvedBy = parsed.approvedBy!.trim();
+    const owners = readOwnerIdentities(join(dirname(parsed.databasePath), "owner-identities"));
+    if (!owners.some((owner) => owner.channel === "cli" && owner.actor === approvedBy)) {
+      throw new Error(`refusing to suspend a project: ${approvedBy} is not a declared cli owner identity`);
+    }
     const holder = daemonIsLive(parsed.databasePath);
     if (holder) {
       throw new Error(
@@ -352,8 +362,26 @@ export const main = async (argv: string[]): Promise<number> => {
           if (!projects.get(parsed.projectId!)) {
             throw new Error(`unknown project id: ${parsed.projectId}`);
           }
+          // Offline, nothing can checkpoint a run or stop a CTO the way CtoLifecycle.suspendProject
+          // does, and suspending under live work would leave that work authorised while the doctor
+          // stops reporting its missing checkout. So this door opens only on a quiet project.
+          const terminal = TERMINAL_RUN_STATES.map(() => "?").join(", ");
+          const openRuns = db.get<{ n: number }>(
+            `SELECT COUNT(*) AS n FROM runs WHERE project_id = ? AND state NOT IN (${terminal})`,
+            [parsed.projectId!, ...TERMINAL_RUN_STATES],
+          )?.n ?? 0;
+          const activeBindings = db.get<{ n: number }>(
+            `SELECT COUNT(*) AS n FROM assignments WHERE status = 'ACTIVE' AND role_key LIKE ?`,
+            [`%:${parsed.projectId!}`],
+          )?.n ?? 0;
+          if (openRuns > 0 || activeBindings > 0) {
+            throw new Error(
+              `refusing to suspend project ${parsed.projectId} offline: ${openRuns} unfinished run(s) and ` +
+              `${activeBindings} active binding(s); suspend it through the running daemon's owner path instead`,
+            );
+          }
           const result = projects.setSuspended(parsed.projectId!, true, true, {
-            approvedBy: parsed.approvedBy!.trim(),
+            approvedBy,
             source: "agentcpd-state",
           });
           if (!result.allowed) throw new Error(result.message);

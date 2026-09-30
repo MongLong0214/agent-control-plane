@@ -1,5 +1,7 @@
 import { rmSync } from "node:fs";
 
+import { gitSync } from "../helpers/fixtures.ts";
+
 import { afterAll, describe, expect, it } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -94,5 +96,21 @@ describe("#1032: a registered checkout disappears", () => {
       expect(finding.blocking).toBe(true);
       expect(finding.observedEvidence).not.toHaveProperty("projectSuspended");
     }
+  });
+
+  it.each([
+    ["suspended", true, { severity: "WARN", blocking: false }],
+    ["active", false, { severity: "ERROR", blocking: true }],
+  ])("reports a %s project's failed repository probe accordingly", async (_label, suspended, expected) => {
+    const harness = makeHarness();
+    const { projectId, identity } = await registerFixtureProject(harness);
+    if (suspended) expect(harness.cp.projects.setSuspended(projectId, true, true).allowed).toBe(true);
+    // `rev-parse` still answers and `git status` refuses: the probe throws on a checkout that exists.
+    gitSync(harness.repoPath, ["config", "core.bare", "true"]);
+    const report = await harness.cp.doctor.run("system");
+    const failed = report.findings.find((finding) =>
+      finding.scope === `repository:${identity}` && finding.code === "REPOSITORY_PROBE_FAILED");
+    expect(failed).toMatchObject(expected);
+    expect(failed?.observedEvidence["projectSuspended"]).toBe(suspended ? true : undefined);
   });
 });

@@ -1668,19 +1668,22 @@ export class Doctor {
             })
           : false;
       } catch (err) {
+        const projectSuspended = this.repositoryProjectSuspended(repository.projectId);
         findings.push({
           code: "REPOSITORY_PROBE_FAILED",
-          severity: "ERROR",
+          severity: projectSuspended ? "WARN" : "ERROR",
           scope: `repository:${repository.identity}`,
-          blocking: true,
+          blocking: !projectSuspended,
           confidence: "HIGH",
           observedEvidence: {
             checkoutPath: repository.checkoutPath,
             error: safeErrorMessage(err),
+            ...(projectSuspended ? { projectSuspended: true } : {}),
           },
-          recommendedAction:
-            "the repository probe did not complete, so this checkout's drift state is unknown; " +
-            "check that the checkout is reachable and that git responds there",
+          recommendedAction: projectSuspended
+            ? "restore the checkout before resuming the project"
+            : "the repository probe did not complete, so this checkout's drift state is unknown; " +
+              "check that the checkout is reachable and that git responds there",
         });
         continue;
       }
