@@ -1263,7 +1263,7 @@ describe("issue projection", () => {
     });
   });
 
-  it("syncs idempotently by marker rather than creating duplicates", async () => {
+  it("RF-S18: post-bootstrap tickets are projected idempotently through the ACP GitHub kernel", async () => {
     const fixture = await setup();
     const tickets = [{ id: "T001", title: "first", body: "do the thing" }];
 
