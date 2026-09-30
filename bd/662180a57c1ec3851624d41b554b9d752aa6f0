@@ -1,0 +1,11 @@
+Limit: claude-code/2.1.282 left the qualified set: it is not installed on this host, so its witness-less 2026-09-28 reading could not be taken again; a session on that build cannot register a wake endpoint until it is measured
+Record-Id: r-8143e5f1ceb5
+Provenance: inherited 5cee12ad27bf4529392e4a49ab2312c39ca6d35e
+
+Limit: a signed reading proves the ceremony code path signed it with the operator-owned Ed25519 key kept outside the repository (~/.agent-control-plane/qualification); whoever holds that key can still sign, and the provider on the other end remains the loopback fake
+Record-Id: r-63ec2b523d2a
+Provenance: inherited 7014a05ca530d199040bf6e516981661553583fd
+
+Warn: a production wake that takes no turn must stay a recorded not-qualified arm, never a throw: a throw skips signing and recording and leaves the build's earlier qualified reading standing
+Record-Id: r-79114a42d67e
+Provenance: inherited 8cd6b5102bf285e849ee2ccf46675c8b1a3842fa
