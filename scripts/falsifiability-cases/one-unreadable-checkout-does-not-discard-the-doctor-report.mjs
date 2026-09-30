@@ -15,8 +15,8 @@ const oneUnreadableCheckoutDoesNotDiscardTheDoctorReport = {
   id: "one-unreadable-checkout-does-not-discard-the-doctor-report",
   what: "a repository probe that refused is reported as a finding, and the rest of the doctor report survives it",
   file: "src/doctor/doctor.ts",
-  find: '      } catch (err) {\n        findings.push({\n          code: "REPOSITORY_PROBE_FAILED",',
-  replace: '      } catch (err) {\n        if (err) throw err;\n        findings.push({\n          code: "REPOSITORY_PROBE_FAILED",',
+  find: '      } catch (err) {\n        const projectSuspended = this.repositoryProjectSuspended(repository.projectId);\n        findings.push({\n          code: "REPOSITORY_PROBE_FAILED",',
+  replace: '      } catch (err) {\n        if (err) throw err;\n        const projectSuspended = this.repositoryProjectSuspended(repository.projectId);\n        findings.push({\n          code: "REPOSITORY_PROBE_FAILED",',
   killedBy: [
     "tests/unit/one-unreadable-checkout-does-not-discard-the-doctor-report.test.ts::is reported, and does not carry the rest of the doctor report away with it",
   ],

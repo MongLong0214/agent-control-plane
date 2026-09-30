@@ -1605,6 +1605,10 @@ export class Doctor {
     ];
   }
 
+  private repositoryProjectSuspended(projectId: string | null): boolean {
+    return projectId !== null && this.projects.get(projectId)?.suspended === true;
+  }
+
   private async checkRepositories(): Promise<Finding[]> {
     const findings: Finding[] = [];
     // **A deadline for the sweep, not a bound per repository.**
@@ -1664,19 +1668,22 @@ export class Doctor {
             })
           : false;
       } catch (err) {
+        const projectSuspended = this.repositoryProjectSuspended(repository.projectId);
         findings.push({
           code: "REPOSITORY_PROBE_FAILED",
-          severity: "ERROR",
+          severity: projectSuspended ? "WARN" : "ERROR",
           scope: `repository:${repository.identity}`,
-          blocking: true,
+          blocking: !projectSuspended,
           confidence: "HIGH",
           observedEvidence: {
             checkoutPath: repository.checkoutPath,
             error: safeErrorMessage(err),
+            ...(projectSuspended ? { projectSuspended: true } : {}),
           },
-          recommendedAction:
-            "the repository probe did not complete, so this checkout's drift state is unknown; " +
-            "check that the checkout is reachable and that git responds there",
+          recommendedAction: projectSuspended
+            ? "restore the checkout before resuming the project"
+            : "the repository probe did not complete, so this checkout's drift state is unknown; " +
+              "check that the checkout is reachable and that git responds there",
         });
         continue;
       }
@@ -1700,14 +1707,20 @@ export class Doctor {
         });
       }
       if (driftState === "UNKNOWN") {
+        const projectSuspended = this.repositoryProjectSuspended(repository.projectId);
         findings.push({
           code: "REPOSITORY_UNREADABLE",
-          severity: "ERROR",
+          severity: projectSuspended ? "WARN" : "ERROR",
           scope: `repository:${repository.identity}`,
-          blocking: true,
+          blocking: !projectSuspended,
           confidence: "HIGH",
-          observedEvidence: { checkoutPath: repository.checkoutPath },
-          recommendedAction: "restore the checkout path or re-register the repository",
+          observedEvidence: {
+            checkoutPath: repository.checkoutPath,
+            ...(projectSuspended ? { projectSuspended: true } : {}),
+          },
+          recommendedAction: projectSuspended
+            ? "restore the checkout before resuming the project"
+            : "restore the checkout path or re-register the repository",
         });
       }
     }
@@ -1730,17 +1743,21 @@ export class Doctor {
       try {
         orphans = await this.worktrees.orphans(repository.checkoutPath, live);
       } catch (err) {
+        const projectSuspended = this.repositoryProjectSuspended(repository.projectId);
         findings.push({
           code: "WORKTREE_PROBE_FAILED",
-          severity: "ERROR",
+          severity: projectSuspended ? "WARN" : "ERROR",
           scope: `repository:${repository.identity}`,
-          blocking: true,
+          blocking: !projectSuspended,
           confidence: "HIGH",
           observedEvidence: {
             checkoutPath: repository.checkoutPath,
             error: safeErrorMessage(err),
+            ...(projectSuspended ? { projectSuspended: true } : {}),
           },
-          recommendedAction: "restore worktree inspection before trusting repository isolation",
+          recommendedAction: projectSuspended
+            ? "restore the checkout before resuming the project"
+            : "restore worktree inspection before trusting repository isolation",
         });
         continue;
       }

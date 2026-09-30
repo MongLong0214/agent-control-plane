@@ -209,6 +209,18 @@ agentcpd-state migration-plan
 agentcpd-state approve-migration --approved-by "$USER" --confirm-migration
 ```
 
+If a registered checkout is gone, stop the daemon and suspend its project offline with
+`agentcpd-state suspend-project --project-id <id> --approved-by "$USER" --confirm-suspend`.
+The command refuses a live state lock or a schema version different from this build, and records
+the owner approval in the `PROJECT_SUSPENDED` audit event. Restore the checkout before resuming
+the project through the existing owner path.
+
+Two limits are deliberate. The approver is the OS account running the command, so a deployment
+whose `ACP_OPERATOR_ACTOR` differs from that account must also declare `cli:<account>` in
+`owner-identities` to use this path. And a project that still has an unfinished run or an active
+binding cannot be suspended offline, because nothing offline can checkpoint that work. Its missing
+checkout keeps blocking startup until the checkout is restored.
+
 To roll back, restore one **sealed rollback pair**: a UUID-named directory under
 `~/.agent-control-plane/rollback-pairs/` holding a WAL-complete database backup, the runtime
 closure that reads it, and the launchd generation and config that starts it, together with an

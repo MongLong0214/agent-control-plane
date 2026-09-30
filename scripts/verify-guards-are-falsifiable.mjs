@@ -96,6 +96,15 @@ const vitestArgsFor = (killedBy) => {
 
 const GUARDS = [
   {
+    what: "#1032: a suspended project's missing checkout does not block daemon startup",
+    file: "src/doctor/doctor.ts",
+    find: "    return projectId !== null && this.projects.get(projectId)?.suspended === true;",
+    replace: "    return false;",
+    killedBy: [
+      "tests/unit/a-suspended-projects-missing-checkout-does-not-block-startup.test.ts::downgrades both findings for a suspended project and permits daemon startup",
+    ],
+  },
+  {
     what: "ci preflight refuses a workflow pnpm command whose package script is missing",
     file: "package.json",
     find: '    "trace": "tsx src/tools/traceability.ts",\n',
