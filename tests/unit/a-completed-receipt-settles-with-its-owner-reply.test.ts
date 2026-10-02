@@ -600,6 +600,30 @@ describe("a COMPLETED receipt on the canonical ledger", () => {
     expect(replyRows(c), "an answer still being sent was owed a second reply").toBe(0);
   });
 
+  it("still owes the answer when what the transport carried for the message was only an apology", async () => {
+    const port = new FakeReceiptPort();
+    const c = withCoordinator(port);
+    const actorId = target(c.db, "apology");
+    const turn = claimTurn(c, actorId, [telegramMessage("m1", "chat-9", 71)]);
+    // A sentence the daemon composed when the CEO could not be asked: delivered, and not the answer.
+    const guard = new IngressGuard(c.db, c.clock, c.audit, {
+      telegram: { allowedActors: ["owner"], allowedConversations: ["chat-9"] },
+    });
+    const apology = { chatId: "chat-9", text: "the CEO could not be reached", replyToMessageId: 71, correlationId: "corr-m1" };
+    expect(guard.recordResultIf("telegram", "m1", {
+      kind: "TELEGRAM_WORKFLOW", phase: "REPLIED", reply: apology, sent: false, deliveryStatus: "PENDING", turnAnswered: false,
+    }, "AVAILABLE").allowed).toBe(true);
+    expect(guard.completeReplyAndResolveTurn("telegram", "m1", {
+      kind: "TELEGRAM_WORKFLOW", phase: "REPLIED", reply: apology, sent: true, deliveryStatus: "APPLIED", turnAnswered: false,
+    }, "UNANSWERED").allowed).toBe(true);
+    port.answer(turn, receiptFor(c, turn, "COMPLETED"));
+
+    await c.coordinator.reconcileUnresolved();
+
+    expect(stateOf(c, turn)).toEqual({ lifecycle_state: "SETTLED", outcome_kind: "COMPLETED" });
+    expect(replyRows(c), "an apology was taken for the answer the receipt proves exists").toBe(1);
+  });
+
   it("R1041-02 owes one reply when a canonical batch settles before an ingress claim on one of its messages", async () => {
     const port = new FakeReceiptPort();
     const c = withCoordinator(port);
