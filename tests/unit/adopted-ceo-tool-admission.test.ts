@@ -177,6 +177,47 @@ describe("adopted CEO tool admission — refusals write nothing", () => {
     await expectRefusedWithoutWrites(later, () => later.admit(), ReasonCode.CONFLICT);
   });
 
+  it("pins nothing for a legacy row whose admission is refused after the lineage decided it (PR1046-R4)", async () => {
+    const fixture = adoptedFixture({ legacy: { lstart: "Tue Aug 11 09:00:00 2026" } });
+    // The lineage would decide this row and hand back a token to pin; the Gateway's readback then
+    // names another start, so the admission is refused — and must leave nothing behind.
+    await expectRefusedWithoutWrites(
+      fixture,
+      () => fixture.admit(RELAY, {
+        gatewayOrigin: async () => ({ ...fixture.proof, process_started_at: "darwin-tv:1790000000.000777" }),
+      }),
+      ReasonCode.CONFLICT,
+    );
+    expect(fixture.h.cp.sessions.pinnedNativeStart(fixture.gatewaySessionId)).toBeNull();
+  });
+
+  it("refuses a legacy lstart that names two instants where clocks fall back (PR1046-R1, round 2)", async () => {
+    const zone = process.env["TZ"];
+    process.env["TZ"] = "America/New_York";
+    try {
+      // The original started at 01:30 EDT (05:30Z) and was recorded at 01:31 EDT; its successor at
+      // the same pid started at 01:30 EST (06:30Z). Both render `Sun Nov  1 01:30:00 2026`.
+      const fixture = adoptedFixture({
+        legacy: { lstart: "Sun Nov  1 01:30:00 2026", writtenAt: "2026-11-01T05:31:00.000Z" },
+      });
+      fixture.tokens.set(GATEWAY, "darwin-tv:1793511000.000001");
+      await expectRefusedWithoutWrites(
+        fixture,
+        () => fixture.admit(RELAY, {
+          gatewayOrigin: async () => ({ ...fixture.proof, process_started_at: "darwin-tv:1793511000.000001" }),
+        }),
+        ReasonCode.CONFLICT,
+      );
+      expect(fixture.h.cp.sessions.pinnedNativeStart(fixture.gatewaySessionId)).toBeNull();
+      // The original itself cannot be told from it either, so it is refused too: fail-closed.
+      fixture.tokens.set(GATEWAY, TOKEN);
+      await expectRefusedWithoutWrites(fixture, () => fixture.admit(), ReasonCode.CONFLICT);
+    } finally {
+      if (zone === undefined) delete process.env["TZ"];
+      else process.env["TZ"] = zone;
+    }
+  });
+
   it("refuses another chat's session, another lineage, and a binding to another head", async () => {
     const fixture = adoptedFixture();
     for (const proof of [

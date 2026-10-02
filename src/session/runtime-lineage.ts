@@ -85,6 +85,14 @@ export interface RuntimeLineage {
   startToken: string;
   /** The admitted row, for a consumer that acts as it. */
   runtime: AdmittedRuntime;
+  /**
+   * The native token to pin for a legacy row this admission decided, or null. Not written here:
+   * the caller pins it with `pinNativeStart` once every check of its own admission has passed, so
+   * an admission refused after this point leaves nothing behind (review PR1046-R4). Writing it
+   * here, as this function first did, was rejected rather than kept: a refusal that came later
+   * left a pin row for a process the admission never accepted.
+   */
+  pinToRecord: string | null;
 }
 
 /**
@@ -101,26 +109,66 @@ const refuse = (message: string): Decision<RuntimeLineage> => deny(ReasonCode.CO
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const LSTART = /^[A-Z][a-z]{2} ([A-Z][a-z]{2}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/;
 
+interface LocalSecond {
+  year: number;
+  month: number;
+  day: number;
+  hours: number;
+  minutes: number;
+  seconds: number;
+}
+
+const rendersAs = (instant: number, local: LocalSecond): boolean => {
+  const at = new Date(instant);
+  if (at.getFullYear() !== local.year) return false;
+  if (at.getMonth() !== local.month) return false;
+  if (at.getDate() !== local.day) return false;
+  if (at.getHours() !== local.hours) return false;
+  if (at.getMinutes() !== local.minutes) return false;
+  return at.getSeconds() === local.seconds;
+};
+
+/** Every DST shift in use is a multiple of 15 minutes and at most two hours; four hours is margin. */
+const OFFSET_STEP_MS = 15 * 60_000;
+const OFFSET_STEPS = 16;
+
 /**
- * The first millisecond after the second `ps -o lstart=` rendered, or null for anything else.
+ * The one UTC instant at which the second `ps -o lstart=` rendered began, or null.
  *
  * `ps` renders in its own local time and the daemon spawns it with its own environment, so the
- * daemon's local time is the zone the text is in.
+ * daemon's local time is the zone the text is in. A local time is not always one instant: where
+ * clocks fall back it names two (review PR1046-R1, round 2: `Sun Nov  1 01:30:00 2026` in
+ * America/New_York is both 05:30Z and 06:30Z), and where they spring forward it names none. Every
+ * instant within four hours of the naive reading is tried, and only a reading with exactly one
+ * instant is an answer; the rest are null, which every caller refuses.
  */
-const afterLstartSecond = (lstart: string): number | null => {
+const lstartInstant = (lstart: string): number | null => {
   const parts = LSTART.exec(lstart);
   if (parts === null) return null;
   const month = MONTHS.indexOf(parts[1]!);
   if (month === -1) return null;
-  const started = new Date(
-    Number(parts[6]), month, Number(parts[2]), Number(parts[3]), Number(parts[4]), Number(parts[5]),
-  ).getTime();
-  return Number.isFinite(started) ? started + 1000 : null;
+  const local: LocalSecond = {
+    year: Number(parts[6]),
+    month,
+    day: Number(parts[2]),
+    hours: Number(parts[3]),
+    minutes: Number(parts[4]),
+    seconds: Number(parts[5]),
+  };
+  const naive = new Date(local.year, local.month, local.day, local.hours, local.minutes, local.seconds).getTime();
+  if (!Number.isFinite(naive)) return null;
+  const instants: number[] = [];
+  for (let step = -OFFSET_STEPS; step <= OFFSET_STEPS; step += 1) {
+    const candidate = naive + step * OFFSET_STEP_MS;
+    if (rendersAs(candidate, local)) instants.push(candidate);
+  }
+  return instants.length === 1 ? instants[0]! : null;
 };
 
 /**
  * Is the live process at the row's pid the one the row recorded? Returns the native token to pin
- * when the answer was decided from a legacy record, or null when nothing needs pinning.
+ * when the answer was decided from a legacy record, or null when nothing needs pinning. It writes
+ * nothing: the caller pins only once its whole admission holds (review PR1046-R4).
  *
  * Three cases, exact wherever exact is possible:
  *
@@ -131,14 +179,17 @@ const afterLstartSecond = (lstart: string): number | null => {
  *     lstart is decisive only when the row was written after that second ended: the recorded
  *     process was alive then, so any process that replaced it started later, in a later second,
  *     and renders a different lstart. Then the live token is pinned and compared exactly from then
- *     on. A row written inside its own process's start second is ambiguous and is refused.
+ *     on. A row written inside its own process's start second is ambiguous and is refused, and so is
+ *     an lstart whose local time is not exactly one instant (`lstartInstant`).
+ *
+ * Exported for the Gateway delivery authority, which asks the same question of the same row.
  */
-const recordedProcessIsLive = (
+export const recordedStartIsLive = (
   runtime: { sessionId: string; osProcessStartedAt: string; createdAt: string },
   pid: number,
   startToken: string,
-  processes: ProcessLineageReader,
-  pins: NativeStartPins,
+  processes: Pick<ProcessLineageReader, "startedAt">,
+  pins: Pick<NativeStartPins, "pinnedNativeStart">,
 ): Decision<string | null> => {
   const notThis = (): Decision<string | null> =>
     deny(ReasonCode.CONFLICT, "the runtime's pid now belongs to another process", {});
@@ -146,9 +197,15 @@ const recordedProcessIsLive = (
   const pinned = pins.pinnedNativeStart(runtime.sessionId);
   if (pinned !== null) return pinned === startToken ? allow(ReasonCode.OK, null) : notThis();
   if (runtime.osProcessStartedAt !== processes.startedAt(pid)) return notThis();
-  const decisiveFrom = afterLstartSecond(runtime.osProcessStartedAt);
-  if (decisiveFrom === null) return notThis();
-  if (Date.parse(runtime.createdAt) < decisiveFrom) {
+  const started = lstartInstant(runtime.osProcessStartedAt);
+  if (started === null) {
+    return deny(
+      ReasonCode.CONFLICT,
+      "the runtime row's lstart is not exactly one instant in this zone, so it cannot identify a process",
+      {},
+    );
+  }
+  if (Date.parse(runtime.createdAt) < started + 1000) {
     return deny(
       ReasonCode.CONFLICT,
       "the runtime row was written inside its process's start second, so its lstart cannot tell that process from a successor",
@@ -162,9 +219,10 @@ const recordedProcessIsLive = (
  * Admits `peerPid` only when the runtime's recorded process is alive as recorded and is a proper
  * ancestor of the peer. The peer itself is never its own proof.
  *
- * "Alive as recorded" is `recordedProcessIsLive`: an exact native-token comparison, against the row
+ * "Alive as recorded" is `recordedStartIsLive`: an exact native-token comparison, against the row
  * or against the token pinned for it, and for a legacy lstart-only row the one case where lstart is
- * decisive, after which the token is pinned (`pins`) so the next admission is exact too.
+ * decisive — reported back as `pinToRecord` for the caller to pin, so the next admission is exact.
+ * Nothing here writes.
  */
 export const admitRuntimeLineage = (
   peerPid: number,
@@ -176,7 +234,7 @@ export const admitRuntimeLineage = (
     createdAt: string;
   },
   processes: ProcessLineageReader,
-  pins: NativeStartPins,
+  pins: Pick<NativeStartPins, "pinnedNativeStart">,
 ): Decision<RuntimeLineage> => {
   const pid = runtime.osPid;
   const recorded = runtime.osProcessStartedAt;
@@ -184,7 +242,7 @@ export const admitRuntimeLineage = (
   if (recorded === null) return refuse("the runtime recorded no process start");
   const startToken = processes.startToken(pid);
   if (startToken === null) return refuse("the runtime's process is not running");
-  const live = recordedProcessIsLive(
+  const live = recordedStartIsLive(
     { sessionId: runtime.sessionId, osProcessStartedAt: recorded, createdAt: runtime.createdAt },
     pid,
     startToken,
@@ -198,14 +256,12 @@ export const admitRuntimeLineage = (
   for (let hop = 0; hop < MAX_ANCESTRY_HOPS; hop += 1) {
     if (current === null) break;
     if (current === pid) {
-      // Pinned only once the whole admission holds: a peer that is not a descendant pins nothing.
-      if (live.value !== null) pins.pinNativeStart(runtime.sessionId, live.value);
       const admitted: AdmittedRuntime = Object.freeze({
         sessionId: runtime.sessionId,
         sessionIncarnation: runtime.incarnation,
       });
       ADMITTED_RUNTIMES.add(admitted);
-      return allow(ReasonCode.OK, { pid, startToken, runtime: admitted });
+      return allow(ReasonCode.OK, { pid, startToken, runtime: admitted, pinToRecord: live.value });
     }
     if (current <= 1) break;
     if (visited.has(current)) break;

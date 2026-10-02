@@ -103,6 +103,7 @@ import {
   type CanonicalSelfClaimListener,
 } from "./canonical-self-claim-listener.ts";
 import { createCanonicalCtoReattach, type CanonicalCtoReattach } from "../registry/canonical-cto-reattach.ts";
+import { recordedStartIsLive } from "../session/runtime-lineage.ts";
 import { readOneJsonLineRequest } from "./local-socket-framing.ts";
 import { daemonCtoBindingRuntime, type CtoBindingRuntime } from "./cto-binding-runtime.ts";
 
@@ -1485,10 +1486,20 @@ export const createConfiguredHermesGatewayConversation = (
         target.target_locator_digest !== values.ACP_HERMES_LINEAGE_ROOT_DIGEST) return null;
     const startToken = (ports.processStartToken ?? readProcessStartToken)(session.osPid);
     if (!startToken || (ports.authorityHeld && !ports.authorityHeld())) return null;
-    // #1037 R1 sibling: the lstart compare above has one-second grain; a pinned native start
-    // (adoption pins one since #1037) is compared exactly.
-    const pinnedStart = cp.sessions.pinnedNativeStart(session.sessionId) ?? startToken;
-    if (pinnedStart !== startToken) return null;
+    // #1037 R1: the lstart compare above has one-second grain. The tool admission's own rule
+    // decides whether the live process is the recorded one: exact against a pinned native start,
+    // and for an unpinned legacy row only where its lstart is one instant and the row was written
+    // after that second — anything else is refused rather than delivered to (review PR1046-R1,
+    // round 2). Falling back to the live token when no pin exists was dropped rather than kept:
+    // it compared the live process with itself.
+    const recordedStart = recordedStartIsLive(
+      { sessionId: session.sessionId, osProcessStartedAt: session.osProcessStartedAt, createdAt: session.createdAt },
+      session.osPid,
+      startToken,
+      { startedAt: ports.processStartedAt ?? processStartedAt },
+      cp.sessions,
+    );
+    if (!recordedStart.allowed) return null;
     return { assignmentId: binding.assignmentId, bindingGeneration: binding.bindingGeneration,
       sessionId: binding.sessionId, sessionIncarnation: binding.sessionIncarnation,
       processPid: session.osPid, startToken };

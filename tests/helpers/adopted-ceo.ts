@@ -10,6 +10,7 @@ import type { GatewayIncumbentProof } from "../../src/bootstrap/hermes-incumbent
 import { digestOf } from "../../src/core/digest.ts";
 import type { Decision } from "../../src/core/errors.ts";
 import type { ReasonCode } from "../../src/core/reason-codes.ts";
+import { ManualClock } from "../../src/core/clock.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { HermesTargetBindResponse } from "../../src/runtime/hermes-target-bind.ts";
 import type { ProcessLineageReader } from "../../src/session/runtime-lineage.ts";
@@ -105,10 +106,11 @@ export const adoptedFixture = (
      * pinned. `lstart` then names the recorded second; the harness clock (2026-08-12T00:00:00Z) is
      * when the row was written.
      */
-    legacy?: { lstart: string };
+    legacy?: { lstart: string; writtenAt?: string };
   } = {},
 ): AdoptedCeoFixture => {
-  const h = makeHarness();
+  const writtenAt = bound.legacy?.writtenAt;
+  const h = writtenAt === undefined ? makeHarness() : makeHarness({ clock: new ManualClock(writtenAt) });
   const recordedStart = bound.legacy?.lstart ?? LSTART;
   const parents = new Map<number, number>([
     [RELAY, SHELL],
