@@ -8,9 +8,8 @@ const aCompletedReceiptOwesItsOwnerAReply = {
   what: "a completed receipt settles the canonical turn only together with its owner reply",
   file: "src/conversation/turn-coordinator.ts",
   find: "      if (before.outcome === \"COMPLETED\" || observed.value.outcome !== \"COMPLETED\") return observed;",
-  replace: "      return observed;",
+  replace: "      if (observed.allowed) return observed;",
   killedBy: [
-    "tests/unit/a-completed-receipt-settles-with-its-owner-reply.test.ts::settles the turn and stores one owner reply addressed to the Telegram message it answers",
     "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::completes a turn whose every identity field matches, and stores its owner reply in the same pass",
   ],
 };
