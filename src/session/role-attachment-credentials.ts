@@ -185,7 +185,8 @@ export class RoleAttachmentCredentials {
       description: "Register this connection's wake endpoint.", inputSchema: { endpoint: z.string().min(1) },
     }, async ({ endpoint }) => respond(await port.registerEndpoint(server, endpoint)));
     server.registerTool("role_owner_message_claim", {
-      description: "Take an owner message for this connection's role.", inputSchema: { roleKey: z.string().min(1) },
+      description: "Take a message for this connection's role; `principal` peer carries no owner authority.",
+      inputSchema: { roleKey: z.string().min(1) },
     }, async ({ roleKey }) => respond(port.claimOwnerMessage(server, roleKey)));
     server.registerTool("role_owner_message_complete", {
       description: "Complete a message held by this connection.",

@@ -135,8 +135,20 @@ export interface OwnerMessageHandover {
     text: string;
     sourceNonce: string;
     createdAt: string;
+    /**
+     * Who the message is from (#1038). `peer` is the CEO's Buzz mention: the holder may act on its
+     * questions and work instructions, and it carries no owner authority — no owner gate, no
+     * approval, and its completion settles its own turn and nothing the owner is owed.
+     */
+    principal: "owner" | "peer";
   } | null;
   unresolved: readonly UnresolvedOwnerMessage[];
+  /**
+   * Queued messages this holder is addressed by and is not handed, because their admission proof
+   * is no longer current (#1044) — a peer message from a CEO generation that has since rotated.
+   * Metadata only. Nothing was written for them; `reject` by id is what retires one.
+   */
+  withheld: readonly UnresolvedOwnerMessage[];
   hasMore: boolean;
 }
 
