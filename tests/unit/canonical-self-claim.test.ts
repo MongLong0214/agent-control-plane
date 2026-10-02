@@ -39,6 +39,7 @@ import {
   type ProcessAncestryInspector,
   type ProcessSnapshot,
   type TranscriptReader,
+  type HostSessionRegistryReader,
 } from "../../src/registry/canonical-self-claim.ts";
 import { cleanupTempDirs, makeCore, type CoreHarness } from "../helpers/fixtures.ts";
 
@@ -274,6 +275,13 @@ const fakeTranscriptReader = (present = true): TranscriptReader => ({
   locate: (sessionUuid) => (present ? { path: `/fake/transcripts/${sessionUuid}.jsonl`, sizeBytes: 42 } : null),
 });
 
+const fakeHostSessionRegistryReader: HostSessionRegistryReader = {
+  read: (pid) => deny(ReasonCode.NOT_FOUND, `/fake/claude/sessions/${pid}.json is absent`),
+};
+
+const deriveSyntheticIdentity = (pid: number, inspector: ProcessAncestryInspector) =>
+  deriveClaimantIdentity(pid, inspector, 64, fakeHostSessionRegistryReader);
+
 /**
  * The adoptable set this deployment is configured with, for a harness whose subject is entitled to
  * exactly one project. `projectId` is a parameter rather than a constant because it is now half of
@@ -322,6 +330,7 @@ const makeSubject = (
     chain?: readonly ProcessSnapshot[];
     imageInspector?: ExecutingImageInspector;
     transcriptReader?: TranscriptReader;
+    hostSessionRegistryReader?: HostSessionRegistryReader;
     buzzActorAuthenticator?: BuzzActorAuthenticator;
     resolveBuzzAddress?: (purpose: string) => Promise<Decision<string>>;
     processSignal?: (pid: number) => void;
@@ -340,6 +349,7 @@ const makeSubject = (
       processInspector: chainInspector(options.chain ?? standardChain()),
       imageInspector: options.imageInspector ?? fakeImageInspector(),
       transcriptReader: options.transcriptReader ?? fakeTranscriptReader(),
+      hostSessionRegistryReader: options.hostSessionRegistryReader ?? fakeHostSessionRegistryReader,
       processSignal: options.processSignal ?? signalFromChain(options.chain ?? standardChain()),
     },
   );
@@ -840,10 +850,10 @@ describe("pure identity-derivation helpers", () => {
   });
 
   it("walks a multi-hop ancestry to the claude process and derives its session id, refusing distinctly when no claude ancestor exists, no session id is named, or the ancestry cycles", () => {
-    const found = deriveClaimantIdentity(100, chainInspector(standardChain()));
+    const found = deriveSyntheticIdentity(100, chainInspector(standardChain()));
     expect(found).toMatchObject({ allowed: true, value: { pid: 10, sessionUuid: CANON } });
 
-    const withoutClaude = deriveClaimantIdentity(
+    const withoutClaude = deriveSyntheticIdentity(
       100,
       chainInspector([
         {
@@ -863,7 +873,7 @@ describe("pure identity-derivation helpers", () => {
     if (withoutClaude.allowed) throw new Error("unreachable");
     expect(withoutClaude.message).toContain("no claude ancestor exists");
 
-    const noSessionId = deriveClaimantIdentity(
+    const noSessionId = deriveSyntheticIdentity(
       100,
       chainInspector([
         {
@@ -881,7 +891,7 @@ describe("pure identity-derivation helpers", () => {
     if (noSessionId.allowed) throw new Error("unreachable");
     expect(noSessionId.message).toContain("names no session id");
 
-    const cyclic = deriveClaimantIdentity(
+    const cyclic = deriveSyntheticIdentity(
       100,
       chainInspector([
         { pid: 100, ppid: 100, argv: ["/usr/bin/node", "x.js"], command: "/usr/bin/node x.js", cwd: CWD,
@@ -894,7 +904,7 @@ describe("pure identity-derivation helpers", () => {
   });
 
   it("a hop whose argv is unavailable refuses immediately, rather than being silently treated as 'not claude' and climbed past", () => {
-    const unavailable = deriveClaimantIdentity(
+    const unavailable = deriveSyntheticIdentity(
       100,
       chainInspector([{ pid: 100, ppid: 1, argv: null, command: "/opt/claude/claude --session-id " + CANON,
         cwd: CWD, cwdProbeFailure: null, startedAt: "t1" }]),
@@ -1196,6 +1206,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
           processInspector: reusablePidInspector,
           imageInspector: fakeImageInspector(),
           transcriptReader: fakeTranscriptReader(),
+          hostSessionRegistryReader: fakeHostSessionRegistryReader,
         },
       );
       const request = baseRequest(core, projectId);
@@ -2187,6 +2198,25 @@ describe("every decision claim() hands back leaves exactly one audit row", () =>
     if (secret !== null) {
       expect(JSON.stringify(core.db.all(`SELECT * FROM audit_events`))).not.toContain(secret);
     }
+  });
+
+  it("an admitted --continue claim records host-session-registry as its session source", async () => {
+    const core = makeCore();
+    const projectId = "prj_registry_source";
+    insertProject(core, projectId);
+    const subject = makeSubject(core, projectId, {
+      chain: standardChain({ argv: ["/opt/claude/claude", "--continue"] }),
+      hostSessionRegistryReader: { read: () => allow(ReasonCode.OK, { sessionUuid: CANON }) },
+    });
+
+    const result = await subject.claim(baseRequest(core, projectId));
+    expect(result.allowed, JSON.stringify(result)).toBe(true);
+    if (!result.allowed) return;
+    expect(result.value.sessionSource).toBe("host-session-registry");
+    expect(claimDecisionRows(core)).toEqual([expect.objectContaining({
+      kind: "CANONICAL_SELF_CLAIM_ADMITTED",
+      evidence: { identity: CANON, generation: 1, sessionSource: "host-session-registry" },
+    })]);
   });
 
   it("a refusal from inside the rolled-back transaction still leaves its one row, and none of the mutation's own", async () => {

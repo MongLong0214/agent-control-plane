@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
-import { closeSync, existsSync, fstatSync, openSync, readFileSync, readdirSync, realpathSync, statSync, type BigIntStats } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync, type BigIntStats, type Stats } from "node:fs";
 import { homedir, platform } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import type { Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
@@ -124,6 +124,8 @@ export interface ProcessSnapshot {
 
 export interface ProcessAncestryInspector {
   snapshot(pid: number): ProcessSnapshot | null;
+  /** Re-read only the kernel start token after a host registry read. Synthetic inspectors may omit this and use snapshot. */
+  readStartToken?(pid: number): string | null;
 }
 
 interface LsofEntry {
@@ -317,6 +319,7 @@ const resolveProcessCwd = (pid: number): { cwd: string | null; probeFailure: Lso
 };
 
 export const defaultProcessAncestryInspector: ProcessAncestryInspector = {
+  readStartToken: readProcessStartToken,
   snapshot(pid) {
     const ppidRaw = psField(pid, "ppid");
     const command = psField(pid, "command");
@@ -359,8 +362,8 @@ export const defaultProcessAncestryInspector: ProcessAncestryInspector = {
  * which is what tied the name read here to the bytes actually running. That comparison is
  * withdrawn (clause 2 in `verifyClaudeIdentity`), so neither accepted `argv[0]` form attests the
  * loaded image. What still bounds the claim is the kernel peer credential on the claim socket, the
- * configured session UUID derived from this process's own argv, its PID/start-identity rechecks,
- * and the project that UUID's entry names.
+ * configured session UUID derived from this process's argv or supplementary host registry, its
+ * PID/start-identity rechecks, and the project that UUID's entry names.
  */
 const NATIVE_VERSIONED_CLAUDE_PATH =
   /^.+\/claude\/versions\/(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
@@ -404,7 +407,7 @@ const argvBeforeOptionsBoundary = (argv: readonly string[]): readonly string[] =
  * value (attached after `=`, or the immediately following argv element for the bare form) must
  * equal a UUID exactly.
  */
-export const extractSessionUuidFromArgv = (argv: readonly string[]): string | null => {
+const sessionSelectorOccurrences = (argv: readonly string[]): Array<{ index: number; attachedValue: string | null }> => {
   const scanRange = argvBeforeOptionsBoundary(argv);
   const occurrences: Array<{ index: number; attachedValue: string | null }> = [];
   for (let i = 0; i < scanRange.length; i += 1) {
@@ -420,6 +423,12 @@ export const extractSessionUuidFromArgv = (argv: readonly string[]): string | nu
       }
     }
   }
+  return occurrences;
+};
+
+export const extractSessionUuidFromArgv = (argv: readonly string[]): string | null => {
+  const scanRange = argvBeforeOptionsBoundary(argv);
+  const occurrences = sessionSelectorOccurrences(argv);
   // Zero occurrences, or more than one — whether the same flag twice, `--session-id` and
   // `--resume` disagreeing, or one empty/malformed selector alongside one otherwise-valid one —
   // are all refused rather than resolved by a tiebreak: only exactly one occurrence unambiguously
@@ -460,13 +469,15 @@ export interface DerivedClaimantIdentity {
   cwdProbeFailure: LsofProbeFailure | null;
   argv: readonly string[];
   sessionUuid: string;
+  sessionSource: "argv" | "host-session-registry";
 }
 
 /**
  * Clause 1 — identity is derived, never accepted. Walks the process ancestry from `callerPid` to
- * the nearest `claude` ancestor and reads the session UUID out of *that* ancestor's real argv
- * vector. A caller-supplied UUID or PID is never consulted here; `CanonicalSelfClaim.claim` checks
- * one against the value this returns, afterward, and refuses on any mismatch.
+ * the nearest `claude` ancestor and reads its argv selector first. Without a selector, the host
+ * session registry must match that ancestor's pid and kernel start time; a valid registry entry
+ * that disagrees with an argv selector is refused. A caller-supplied UUID or PID is never used as
+ * the derived identity.
  *
  * Every hop's argv must be available for this walk to say anything about it: a hop whose argv
  * cannot be established is not silently treated as "not claude" and skipped — this deployment
@@ -477,6 +488,7 @@ export const deriveClaimantIdentity = (
   callerPid: number,
   inspector: ProcessAncestryInspector,
   maxHops = MAX_ANCESTRY_HOPS,
+  registryReader: HostSessionRegistryReader = makeDefaultHostSessionRegistryReader(),
 ): Decision<DerivedClaimantIdentity> => {
   if (!Number.isSafeInteger(callerPid) || callerPid <= 0) {
     return deny(ReasonCode.INVALID_ARGUMENT, "callerPid must be a positive integer", { callerPid });
@@ -508,13 +520,50 @@ export const deriveClaimantIdentity = (
       );
     }
     if (looksLikeClaudeInvocation(snapshot.argv)) {
-      const sessionUuid = extractSessionUuidFromArgv(snapshot.argv);
-      if (!sessionUuid) {
+      const argvSessionUuid = extractSessionUuidFromArgv(snapshot.argv);
+      const selectorCount = sessionSelectorOccurrences(snapshot.argv).length;
+      if (selectorCount > 0 && !argvSessionUuid) {
         return deny(
           ReasonCode.NOT_FOUND,
           "the claude ancestor's argv names no session id",
           { pid: snapshot.pid },
         );
+      }
+      const registry = registryReader.read(snapshot.pid, snapshot.startedAt);
+      if (registry.allowed) {
+        // A registry entry belongs to the process observed before the file read only if the
+        // kernel still reports that exact native-resolution start token afterward.
+        const afterRead = inspector.readStartToken !== undefined
+          ? inspector.readStartToken(snapshot.pid)
+          : inspector.snapshot(snapshot.pid)?.startedAt ?? null;
+        if (snapshot.startedAt === null || afterRead !== snapshot.startedAt) {
+          return deny(ReasonCode.CONFLICT, "claude ancestor start token changed during host session registry read", {
+            pid: snapshot.pid, beforeRead: snapshot.startedAt, afterRead,
+          });
+        }
+      }
+      let sessionUuid: string;
+      let sessionSource: DerivedClaimantIdentity["sessionSource"];
+      if (argvSessionUuid) {
+        if (registry.allowed && registry.value.sessionUuid !== argvSessionUuid) {
+          return deny(
+            ReasonCode.CONFLICT,
+            "the claude ancestor's argv and host session registry disagree on the session id",
+            { pid: snapshot.pid },
+          );
+        }
+        sessionUuid = argvSessionUuid;
+        sessionSource = "argv";
+      } else {
+        if (!registry.allowed) {
+          return deny(
+            registry.reasonCode,
+            `the claude ancestor's argv names no session id, and the host session registry does not identify it: ${registry.message}`,
+            { pid: snapshot.pid },
+          );
+        }
+        sessionUuid = registry.value.sessionUuid;
+        sessionSource = "host-session-registry";
       }
       return allow(ReasonCode.OK, {
         pid: snapshot.pid,
@@ -524,6 +573,7 @@ export const deriveClaimantIdentity = (
         cwdProbeFailure: snapshot.cwdProbeFailure,
         argv: snapshot.argv,
         sessionUuid,
+        sessionSource,
       });
     }
     if (snapshot.ppid <= 1 || snapshot.ppid === current) {
@@ -821,6 +871,165 @@ export interface TranscriptReader {
 
 export const defaultTranscriptRoot = (): string => join(homedir(), ".claude", "projects");
 
+export interface HostSessionRegistryReader {
+  read(pid: number, startToken: string | null): Decision<{ sessionUuid: string }>;
+}
+
+/** Injectable descriptor operations keep path swaps and fstat failures deterministic in tests. */
+export interface HostSessionRegistryFileOps {
+  open(path: string, flags: number): number;
+  fstat(fd: number): Stats;
+  read(fd: number, buffer: Buffer, offset: number, length: number, position: number): number;
+  close(fd: number): void;
+}
+
+const defaultHostSessionRegistryFileOps: HostSessionRegistryFileOps = {
+  open: openSync, fstat: fstatSync, read: readSync, close: closeSync,
+};
+
+const HOST_SESSION_REGISTRY_MAX_BYTES = 64 * 1024;
+/**
+ * O_NOFOLLOW refuses a symlink at the final path component when the descriptor is created, so
+ * everything checked afterward is checked on the fd rather than on the path. O_NONBLOCK keeps a
+ * FIFO planted at the path from blocking this synchronous open; it changes nothing for the
+ * regular file the fstat below then requires.
+ */
+export const HOST_SESSION_REGISTRY_OPEN_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+const registrySizeWithinBound = (size: number): boolean =>
+  Number.isSafeInteger(size) && size >= 0 && size <= HOST_SESSION_REGISTRY_MAX_BYTES;
+
+/** Claude records UTC ctime at whole-second precision, while the process snapshot keeps its native start token. */
+const registryProcStartFromToken = (token: string | null): string | null => {
+  let seconds: number;
+  const darwin = /^darwin-tv:(\d+)\.(\d{6})$/.exec(token ?? "");
+  if (darwin) {
+    seconds = Number(darwin[1]);
+  } else {
+    const linux = /^linux-clk:(\d+)$/.exec(token ?? "");
+    if (!linux) return null;
+    try {
+      const boot = /^btime (\d+)$/m.exec(readFileSync("/proc/stat", "utf8"));
+      const ticksPerSecond = Number(execFileSync("getconf", ["CLK_TCK"], { encoding: "utf8", timeout: 2_000 }).trim());
+      const ticks = Number(linux[1]);
+      if (!boot || !Number.isSafeInteger(ticks) || !Number.isSafeInteger(ticksPerSecond) || ticksPerSecond <= 0) {
+        return null;
+      }
+      seconds = Number(boot[1]) + Math.floor(ticks / ticksPerSecond);
+    } catch {
+      return null;
+    }
+  }
+  if (!Number.isSafeInteger(seconds) || seconds < 0) return null;
+  const date = new Date(seconds * 1_000);
+  if (!Number.isFinite(date.getTime())) return null;
+  const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const two = (value: number): string => String(value).padStart(2, "0");
+  return `${days[date.getUTCDay()]} ${months[date.getUTCMonth()]} ${String(date.getUTCDate()).padStart(2, " ")} ` +
+    `${two(date.getUTCHours())}:${two(date.getUTCMinutes())}:${two(date.getUTCSeconds())} ${date.getUTCFullYear()}`;
+};
+
+/**
+ * The session directory is the sibling of the one transcript root this module already uses.
+ * The reader owns all host-file checks so synthetic ancestry tests can inject a reader without
+ * consulting the actual Claude home.
+ */
+export const makeDefaultHostSessionRegistryReader = (
+  root: string = join(dirname(defaultTranscriptRoot()), "sessions"),
+  fileOps: HostSessionRegistryFileOps = defaultHostSessionRegistryFileOps,
+): HostSessionRegistryReader => ({
+  read(pid, startToken) {
+    const path = join(root, `${pid}.json`);
+    const uid = process.getuid?.();
+    let fd: number;
+    try {
+      fd = fileOps.open(path, HOST_SESSION_REGISTRY_OPEN_FLAGS);
+    } catch (error) {
+      if (error instanceof Error && "code" in error) {
+        if (error.code === "ENOENT" || error.code === "ENOTDIR") {
+          return deny(ReasonCode.NOT_FOUND, `host session registry file is absent: ${path}`);
+        }
+        if (error.code === "ELOOP") {
+          return deny(ReasonCode.INVALID_ARGUMENT, `host session registry file is a symlink: ${path}`);
+        }
+      }
+      return deny(ReasonCode.PROBE_FAILED, `host session registry file could not be opened safely: ${path}`);
+    }
+    let raw: string;
+    let opened: Stats;
+    try {
+      opened = fileOps.fstat(fd);
+      if (!opened.isFile()) return deny(ReasonCode.INVALID_ARGUMENT, `host session registry file is not regular: ${path}`);
+      if (uid === undefined || opened.uid !== uid) {
+        return deny(ReasonCode.INVALID_ARGUMENT, `host session registry file is not owned by the daemon uid: ${path}`);
+      }
+      if (!registrySizeWithinBound(opened.size)) {
+        return deny(ReasonCode.INVALID_ARGUMENT, `host session registry file exceeds the size limit: ${path}`);
+      }
+      const bytes = Buffer.alloc(HOST_SESSION_REGISTRY_MAX_BYTES + 1);
+      let count = 0;
+      while (count < bytes.length) {
+        const n = fileOps.read(fd, bytes, count, bytes.length - count, count);
+        if (n === 0) break;
+        count += n;
+      }
+      if (!registrySizeWithinBound(count)) return deny(ReasonCode.INVALID_ARGUMENT, `host session registry file exceeds the size limit: ${path}`);
+      if (count !== opened.size) return deny(ReasonCode.PROBE_FAILED, `host session registry file changed during read: ${path}`);
+      raw = bytes.subarray(0, count).toString("utf8");
+    } catch {
+      return deny(ReasonCode.PROBE_FAILED, `host session registry file could not be read: ${path}`);
+    } finally {
+      fileOps.close(fd);
+    }
+    // Reopen safely after the read. The bytes came from the first fd; a replacement of its path
+    // during that read must not be accepted as the current registry entry.
+    let currentFd: number;
+    try {
+      currentFd = fileOps.open(path, HOST_SESSION_REGISTRY_OPEN_FLAGS);
+    } catch {
+      return deny(ReasonCode.PROBE_FAILED, `host session registry file changed during read: ${path}`);
+    }
+    try {
+      const current = fileOps.fstat(currentFd);
+      if (!current.isFile() || current.uid !== uid || current.size !== opened.size ||
+          current.dev !== opened.dev || current.ino !== opened.ino) {
+        return deny(ReasonCode.PROBE_FAILED, `host session registry file changed during read: ${path}`);
+      }
+    } catch {
+      return deny(ReasonCode.PROBE_FAILED, `host session registry file could not be rechecked: ${path}`);
+    } finally {
+      fileOps.close(currentFd);
+    }
+    let entry: unknown;
+    try {
+      entry = JSON.parse(raw) as unknown;
+    } catch {
+      return deny(ReasonCode.INVALID_ARGUMENT, `host session registry JSON is malformed: ${path}`);
+    }
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      return deny(ReasonCode.INVALID_ARGUMENT, `host session registry JSON is not an object: ${path}`);
+    }
+    const fields = entry as Record<string, unknown>;
+    if (typeof fields.pid !== "number" || fields.pid !== pid) {
+      return deny(ReasonCode.CONFLICT, `host session registry pid does not match the claude ancestor: ${path}`);
+    }
+    const expectedProcStart = registryProcStartFromToken(startToken);
+    if (expectedProcStart === null) {
+      return deny(ReasonCode.PROBE_FAILED, `claude ancestor start token cannot verify host session registry: ${path}`);
+    }
+    if (typeof fields.procStart !== "string" || fields.procStart !== expectedProcStart) {
+      return deny(ReasonCode.CONFLICT, `host session registry procStart does not match the kernel start time: ${path}`);
+    }
+    if (typeof fields.sessionId !== "string" || !UUID_PATTERN.test(fields.sessionId)) {
+      return deny(ReasonCode.INVALID_ARGUMENT, `host session registry sessionId is not an exact UUID: ${path}`);
+    }
+    if (fields.kind !== "interactive") {
+      return deny(ReasonCode.INVALID_ARGUMENT, `host session registry kind is not interactive: ${path}`);
+    }
+    return allow(ReasonCode.OK, { sessionUuid: fields.sessionId.toLowerCase() });
+  },
+});
+
 /**
  * Searches every project directory under the transcript root for `<sessionUuid>.jsonl`. The root
  * is a constructor parameter everywhere this is used precisely so a test never has to write into
@@ -1029,6 +1238,7 @@ export interface CanonicalSelfClaimReceipt {
   sessionSecret: string | null;
   binding: RoleBinding;
   derivedSessionUuid: string;
+  sessionSource: DerivedClaimantIdentity["sessionSource"];
   /**
    * What the claimant's executing image was observed to be — recorded, never required. `null` when
    * the scan could not run or found no usable image (a binary the updater has already deleted from
@@ -1043,6 +1253,7 @@ export interface CanonicalSelfClaimDeps {
   processInspector?: ProcessAncestryInspector;
   imageInspector?: ExecutingImageInspector;
   transcriptReader?: TranscriptReader;
+  hostSessionRegistryReader?: HostSessionRegistryReader;
   maxAncestryHops?: number;
   /**
    * The existence probe `#predecessorProcessIsGone` uses, defaulting to `kill(pid, 0)`.
@@ -1096,7 +1307,10 @@ export function verifyClaudeIdentity(
   const imageInspector = deps.imageInspector ?? defaultExecutingImageInspector;
   const transcriptReader = deps.transcriptReader ?? defaultTranscriptReader;
   // Clause 1 — derive independently before anything the caller said is ever consulted.
-  const derived = deriveClaimantIdentity(request.callerPid, processInspector, deps.maxAncestryHops ?? MAX_ANCESTRY_HOPS);
+  const derived = deriveClaimantIdentity(
+    request.callerPid, processInspector, deps.maxAncestryHops ?? MAX_ANCESTRY_HOPS,
+    deps.hostSessionRegistryReader ?? makeDefaultHostSessionRegistryReader(),
+  );
   if (!derived.allowed) return derived as Decision<VerifiedClaudeIdentity>;
   const identity = derived.value;
 
@@ -1302,6 +1516,9 @@ const claimDecisionAuditRecord = (
       evidence: {
         identity: decision.value.derivedSessionUuid,
         generation: decision.value.binding.bindingGeneration,
+        // Only the registry source is named: an admission row without the key is an argv-derived
+        // identity, which is what every row written before the registry fallback existed means.
+        ...(decision.value.sessionSource === "host-session-registry" ? { sessionSource: decision.value.sessionSource } : {}),
       },
     };
   }
@@ -1331,6 +1548,7 @@ export class CanonicalSelfClaim {
   readonly #processSignal: (pid: number) => void;
   readonly #imageInspector: ExecutingImageInspector;
   readonly #transcriptReader: TranscriptReader;
+  readonly #hostSessionRegistryReader: HostSessionRegistryReader;
   readonly #maxAncestryHops: number;
   readonly #canonicalBuzzChannelId: string;
   readonly #canonicalSessions: readonly CanonicalAdoptableSession[];
@@ -1375,6 +1593,7 @@ export class CanonicalSelfClaim {
     this.#processSignal = deps.processSignal ?? ((pid) => process.kill(pid, 0));
     this.#imageInspector = deps.imageInspector ?? defaultExecutingImageInspector;
     this.#transcriptReader = deps.transcriptReader ?? defaultTranscriptReader;
+    this.#hostSessionRegistryReader = deps.hostSessionRegistryReader ?? makeDefaultHostSessionRegistryReader();
     this.#maxAncestryHops = deps.maxAncestryHops ?? MAX_ANCESTRY_HOPS;
     this.#canonicalBuzzChannelId = config.canonicalBuzzChannelId;
     // Frozen at construction, like every other deployment fact here: a later mutation of the array
@@ -1470,7 +1689,8 @@ export class CanonicalSelfClaim {
       canonicalSessionUuids: this.#canonicalSessions.map((entry) => entry.sessionUuid),
     }, request, {
       processInspector: this.#processInspector, imageInspector: this.#imageInspector,
-      transcriptReader: this.#transcriptReader, maxAncestryHops: this.#maxAncestryHops,
+      transcriptReader: this.#transcriptReader, hostSessionRegistryReader: this.#hostSessionRegistryReader,
+      maxAncestryHops: this.#maxAncestryHops,
     }, { protocolVersion: request.peerProtocolVersion, identity: request.peerIdentity,
       expectedProtocolVersion: this.config.expectedPeerProtocolVersion, expectedIdentity: this.config.expectedPeerIdentity });
     if (!verified.allowed) return verified;
@@ -1824,6 +2044,7 @@ export class CanonicalSelfClaim {
         sessionSecret: created.sessionSecret,
         binding: bound.value,
         derivedSessionUuid: identity.sessionUuid,
+        sessionSource: identity.sessionSource,
         executorImageVersion: observedImage?.version ?? null,
         executorImagePath: observedImage?.imagePath ?? null,
         buzzAddress,
