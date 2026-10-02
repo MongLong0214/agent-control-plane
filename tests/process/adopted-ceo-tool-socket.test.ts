@@ -7,6 +7,12 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { ATTACH_EXIT, runAdoptedCeoAttachRelay } from "../../src/cli/attach-relay.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
+  BuzzActorIngress,
+  buzzActorBindingSigningRequest,
+  IngressGuard,
+  ingressSignature,
+} from "../../src/ingress/ingress-guard.ts";
+import {
   startAdoptedCeoToolSocket,
   startLocalMcpListeners,
   type LocalMcpListeners,
@@ -169,7 +175,10 @@ const runCreate = (key: string, meta?: Record<string, unknown>): Record<string, 
   ...(meta ? { _meta: meta } : {}),
 });
 
-const started = async (descendsFromGateway: boolean) => {
+const BUZZ_SECRET = "fixture-buzz-ingress-secret";
+const CEO_KEY = "c".repeat(64);
+
+const started = async (descendsFromGateway: boolean, buzz = false) => {
   const fixture = adoptedFixture();
   fixtures.push(fixture);
   // The kernel will report this process as the peer: state where it sits.
@@ -179,7 +188,16 @@ const started = async (descendsFromGateway: boolean) => {
   const ceoConversation = new CeoConversationPort();
   const listeners: LocalMcpListeners = await startLocalMcpListeners(fixture.h.cp, dir, "fixture-mcp-token", { ceoConversation });
   closers.push(() => listeners.close());
-  const tools: CanonicalSelfClaimListener = await startAdoptedCeoToolSocket(fixture.h.cp, lock, dir, fixture.admission());
+  const tools: CanonicalSelfClaimListener = await startAdoptedCeoToolSocket(fixture.h.cp, lock, dir, fixture.admission(), buzz
+    ? {
+        buzzActorIngress: new BuzzActorIngress(
+          new IngressGuard(fixture.h.cp.db, fixture.h.cp.clock, fixture.h.cp.audit, {
+            buzz: { secret: BUZZ_SECRET, allowedActors: [CEO_KEY] },
+          }),
+          fixture.h.cp.sessions,
+        ),
+      }
+    : {});
   closers.push(() => tools.close());
   return { fixture, ceoConversation, tools };
 };
@@ -248,6 +266,44 @@ describe("the adopted CEO tool socket, through the relay", () => {
     }
     expect(generation()).toEqual(before);
     expect(count(h, "SELECT COUNT(*) AS n FROM sessions")).toBe(1);
+  });
+
+  it("binds the CEO's own Buzz channel identity over the channel, idempotently, and not once the binding moves", async () => {
+    const { fixture, tools } = await started(true, true);
+    const { h } = fixture;
+    const bind = (r: Relay, nonce: string) =>
+      r.request("tools/call", {
+        name: "buzz_actor_bind",
+        arguments: {
+          actor: CEO_KEY,
+          nonce,
+          signature: ingressSignature(
+            BUZZ_SECRET,
+            buzzActorBindingSigningRequest({ actor: CEO_KEY, sessionId: fixture.gatewaySessionId, nonce }),
+          ),
+        },
+        _meta: OWNER_TURN,
+      }) as Promise<Wire>;
+    const r = await initialized(tools.socketPath);
+    expect((await bind(r, "bind-1")).result?.structuredContent).toMatchObject({
+      ok: true,
+      value: { sessionId: fixture.gatewaySessionId, buzzActorId: CEO_KEY },
+    });
+    expect(h.cp.sessions.get(fixture.gatewaySessionId)?.buzzActorId).toBe(CEO_KEY);
+    const bound = snapshot(h);
+    expect((await bind(r, "bind-2")).result?.structuredContent).toMatchObject({ ok: true });
+    expect(snapshot(h)).toEqual(bound);
+
+    // The operator re-adopts: this channel's runtime no longer holds the CEO binding.
+    expect(h.cp.bindings.revoke(CEO, "operator re-adoption").allowed).toBe(true);
+    const revoked = snapshot(h);
+    expect((await bind(r, "bind-3")).result?.structuredContent).toMatchObject({
+      ok: false,
+      reasonCode: ReasonCode.BINDING_GENERATION_STALE,
+    });
+    expect(snapshot(h)).toEqual(revoked);
+    r.stdin.end();
+    expect(await settles(r.exit)).toBe(ATTACH_EXIT.OK);
   });
 
   it("refuses a peer outside the Gateway's ancestry with its reason code only, and writes nothing", async () => {

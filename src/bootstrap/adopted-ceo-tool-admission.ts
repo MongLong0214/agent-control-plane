@@ -7,6 +7,7 @@ import type { AuthenticatedMcpPeer } from "../mcp/shared.ts";
 import {
   admitRuntimeLineage,
   defaultProcessLineageReader,
+  type AdmittedRuntime,
   type ProcessLineageReader,
 } from "../session/runtime-lineage.ts";
 import type { GatewayIncumbentProof } from "./hermes-incumbent-adoption.ts";
@@ -64,6 +65,8 @@ export interface AdoptedCeoAdmission {
   actorId: string;
   /** The bound Hermes session and lineage a mutation's caller provenance must name. */
   provenance: HermesProvenanceAnchor;
+  /** The admitted runtime row, for a writer that takes the admission in place of a secret. */
+  runtime: AdmittedRuntime;
 }
 
 /** The kernel-authenticated peer the listener hands over; never a caller's word. */
@@ -136,6 +139,7 @@ export const createAdoptedCeoToolAdmission = (cp: ControlPlane, options: Adopted
         liveHermesSessionId: target.target_locator,
         lineageRootDigest: target.target_locator_digest,
       },
+      runtime: lineage.value.runtime,
     });
   };
 

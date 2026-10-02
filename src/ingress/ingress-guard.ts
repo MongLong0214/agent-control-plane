@@ -13,6 +13,8 @@ import {
   type ReceiptLookupQuery,
   redeemIngressReceiptSettlement,
 } from "../conversation/turn-coordinator.ts";
+import { SessionLifecycle } from "../domain/types.ts";
+import { isAdmittedRuntime, type AdmittedRuntime } from "../session/runtime-lineage.ts";
 import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
 
 // Only the validated claim paths below mint this token. A Db holder receives no issuer.
@@ -230,6 +232,17 @@ export interface OwnerApprovalIngress {
   approved: boolean;
 }
 
+/**
+ * The same request from a runtime that holds no session secret (#1037): its lineage admission is
+ * the possession proof, and it names the session the signed envelope is bound to.
+ */
+export interface AdmittedBuzzActorBindingIngress {
+  actor: string;
+  admitted: AdmittedRuntime;
+  nonce: string;
+  signature?: string | null;
+}
+
 /** A Buzz relay asks to associate its authenticated actor with one local session. */
 export interface BuzzActorBindingIngress {
   actor: string;
@@ -353,6 +366,13 @@ export const ingressSigningInput = (request: {
     nonce: request.nonce,
     payload: digestOf(request.payload),
   });
+
+/** The guard's one comparison of a presented signature against the bytes it derives itself. */
+const signatureMatches = (secret: string, request: IngressRequest, provided: string): boolean => {
+  const expected = ingressSignature(secret, request);
+  return expected.length === provided.length &&
+    timingSafeEqual(Buffer.from(expected), Buffer.from(provided));
+};
 
 export const ingressSignature = (
   secret: string,
@@ -505,6 +525,44 @@ export class IngressGuard {
     return (this.policies[channel]?.secret?.trim().length ?? 0) > 0;
   }
 
+  /**
+   * `admit`'s refusals that need no write, answered without one (#1037): the channel policy, the
+   * actor and conversation allowlists, the signature, and whether the nonce was already spent.
+   *
+   * Not a second authority — `admit` still decides, and still records the nonce. This is for a
+   * caller whose refusals must leave the database exactly as it was, so it can ask first and only
+   * reach `admit` with an envelope `admit` will take. The answers are `admit`'s reason codes.
+   */
+  check(request: IngressRequest): Decision<void> {
+    const policy = this.policies[request.channel];
+    if (!policy) return deny(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED, "channel has no policy", {});
+    if (!policy.allowedActors.includes(request.actor)) {
+      return deny(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED, "channel identity is not on the allowlist", {});
+    }
+    if (policy.allowedConversations && policy.allowedConversations.length > 0) {
+      if (!request.conversation || !policy.allowedConversations.includes(request.conversation)) {
+        return deny(ReasonCode.INGRESS_CHAT_NOT_ALLOWLISTED, "conversation is not on the allowlist", {});
+      }
+    }
+    if (policy.secret) {
+      if (!request.signature) return deny(ReasonCode.INGRESS_SIGNATURE_INVALID, "missing signature", {});
+      if (!signatureMatches(policy.secret, request, request.signature)) {
+        return deny(ReasonCode.INGRESS_SIGNATURE_INVALID, "signature mismatch", {});
+      }
+    }
+    const seen = this.db.get<{ received_at: string }>(
+      "SELECT received_at FROM inbound_messages WHERE channel = ? AND nonce = ?",
+      [request.channel, request.nonce],
+    );
+    if (seen) {
+      return deny(ReasonCode.INGRESS_REPLAY_IGNORED, "message already processed", {
+        channel: request.channel,
+        nonce: request.nonce,
+      });
+    }
+    return allow(ReasonCode.OK, undefined);
+  }
+
   admit(request: IngressRequest): Decision<{ payload: unknown; untrusted: true }> {
     const policy = this.policies[request.channel];
     if (!policy) {
@@ -536,12 +594,7 @@ export class IngressGuard {
       // The guard derives the signed bytes itself, so actor, conversation, nonce and
       // payload are all covered: a captured signature cannot be reused for a new payload
       // or a fresh nonce.
-      const expected = ingressSignature(policy.secret, request);
-      const provided = request.signature;
-      const ok =
-        expected.length === provided.length &&
-        timingSafeEqual(Buffer.from(expected), Buffer.from(provided));
-      if (!ok) {
+      if (!signatureMatches(policy.secret, request, request.signature)) {
         return this.refuse(request, ReasonCode.INGRESS_SIGNATURE_INVALID, "signature mismatch");
       }
     }
@@ -2623,13 +2676,14 @@ export class BuzzActorIngress {
     private readonly sessions: SessionRegistry,
   ) {}
 
-  bindActor(input: BuzzActorBindingIngress): Decision<SessionRecord> {
+  bindActor(input: BuzzActorBindingIngress | AdmittedBuzzActorBindingIngress): Decision<SessionRecord> {
     if (!this.guard.requiresSignature("buzz")) {
       return deny(
         ReasonCode.INGRESS_SIGNATURE_INVALID,
         "buzz channel identity binding requires a signed ingress policy",
       );
     }
+    if ("admitted" in input) return this.#bindAdmittedActor(input);
     if (
       input.actor.trim().length === 0 ||
       input.sessionId.trim().length === 0 ||
@@ -2654,6 +2708,61 @@ export class BuzzActorIngress {
       },
       this.guard,
     );
+  }
+
+  /**
+   * The admitted form (#1037). The envelope is the same signed envelope — the relay's signature over
+   * this actor, this session and this nonce — so the identity bound is exactly the one the envelope
+   * was signed for: an envelope signed for one actor presented with another fails the signature.
+   *
+   * Every refusal this path can know before it writes, it gives before it writes: the guard's own
+   * gates and the replay (`IngressGuard.check`), an identity another live session already speaks
+   * as, and a session already speaking as a different one. Only an envelope that will bind reaches
+   * `admit`, which records its nonce, and then the one writer. Re-presenting the identity the
+   * session already holds is answered as bound without spending anything.
+   */
+  #bindAdmittedActor(input: AdmittedBuzzActorBindingIngress): Decision<SessionRecord> {
+    // The writer refuses a proof no admission minted; asking first is what keeps that refusal from
+    // spending the nonce on the way there.
+    if (!isAdmittedRuntime(input.admitted)) {
+      return deny(ReasonCode.CONFLICT, "the session proof was not issued by a lineage admission");
+    }
+    const sessionId = input.admitted.sessionId;
+    if (input.actor.trim().length === 0) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "buzz channel identity binding requires an actor and nonce");
+    }
+    if (input.nonce.trim().length === 0) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "buzz channel identity binding requires an actor and nonce");
+    }
+    const request = {
+      ...buzzActorBindingSigningRequest({ actor: input.actor, sessionId, nonce: input.nonce }),
+      signature: input.signature ?? null,
+    };
+    const checked = this.guard.check(request);
+    if (!checked.allowed) return checked as Decision<SessionRecord>;
+    const session = this.sessions.get(sessionId);
+    if (session === null) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId });
+    if (session.lifecycle === SessionLifecycle.STOPPED) {
+      return deny(ReasonCode.SESSION_NOT_READY, "a terminal session cannot acquire an actor identity", { sessionId });
+    }
+    if (session.lifecycle === SessionLifecycle.ERROR) {
+      return deny(ReasonCode.SESSION_NOT_READY, "a terminal session cannot acquire an actor identity", { sessionId });
+    }
+    if (session.buzzActorId === input.actor) return allow(ReasonCode.OK, session);
+    if (session.buzzActorId !== null) {
+      return deny(ReasonCode.SESSION_BUZZ_ACTOR_IMMUTABLE, "session already speaks as a different buzz channel identity", {
+        sessionId,
+      });
+    }
+    const holder = this.sessions.liveSessionSpeakingAs(input.actor);
+    if (holder !== null) {
+      return deny(ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND, "another live session already speaks as this identity", {
+        sessionId,
+      });
+    }
+    const admitted = this.guard.admit(request);
+    if (!admitted.allowed) return admitted as Decision<SessionRecord>;
+    return this.sessions.bindBuzzActor({ admitted: input.admitted, buzzActorId: input.actor }, this.guard);
   }
 }
 

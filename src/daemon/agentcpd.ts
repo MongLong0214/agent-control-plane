@@ -1521,13 +1521,22 @@ export const createConfiguredAdoptedCeoToolAdmission = (
  *
  * Only the Hermes server's own tools are served. `cto_binding_bind`/`cto_binding_release` take the
  * runtime's session secret as their principal, which this runtime does not hold.
+ *
+ * One tool is added when Buzz channel identity binding is configured: `buzz_actor_bind`, the adopted CEO
+ * binding its own Buzz channel identity. It reaches the one writer of `sessions.buzz_actor_id`
+ * (`BuzzActorIngress.bindActor`) with this connection's admitted runtime as the session proof, and
+ * the relay-signed envelope still has to verify; it is a mutation, so caller provenance applies.
  */
 export const startAdoptedCeoToolSocket = (
   cp: ControlPlane,
   daemon: { lock: { held(): boolean } },
   stateDir: string,
   admission: AdoptedCeoToolAdmission,
-  options: { onCeoApproved?: (runId: string) => void | Promise<unknown>; admissionTimeoutMs?: number } = {},
+  options: {
+    onCeoApproved?: (runId: string) => void | Promise<unknown>;
+    admissionTimeoutMs?: number;
+    buzzActorIngress?: BuzzActorIngress;
+  } = {},
 ): Promise<CanonicalSelfClaimListener> => {
   const port = createHermesMcpPort(cp, { onCeoApproved: options.onCeoApproved });
   return startAdoptedCeoToolListener(
@@ -1538,6 +1547,31 @@ export const startAdoptedCeoToolSocket = (
       const server = createHermesServer(port, () => admission.authenticate(admitted), {
         provenance: admitted.provenance,
       });
+      const buzzActorIngress = options.buzzActorIngress;
+      if (buzzActorIngress !== undefined) {
+        server.registerTool(
+          "buzz_actor_bind",
+          {
+            description:
+              "Bind this CEO runtime's own Buzz channel identity from a relay-signed binding envelope " +
+              "(the actor, a fresh nonce, and the relay's signature over them and this session).",
+            inputSchema: { actor: z.string().min(1), nonce: z.string().min(1), signature: z.string().min(1) },
+          },
+          async (args: { actor: string; nonce: string; signature: string }) => {
+            const peer = admission.authenticate(admitted);
+            if (!peer.allowed) return respond(peer);
+            const bound = buzzActorIngress.bindActor({
+              actor: args.actor,
+              nonce: args.nonce,
+              signature: args.signature,
+              admitted: admitted.runtime,
+            });
+            return respond(bound.allowed
+              ? allow(bound.reasonCode, { sessionId: bound.value.sessionId, buzzActorId: bound.value.buzzActorId })
+              : bound);
+          },
+        );
+      }
       void server.connect(new SocketTransport(socket, Buffer.alloc(0))).catch((err: unknown) => {
         socket.destroy(err instanceof Error ? err : new Error(String(err)));
       });
@@ -3596,6 +3630,13 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     if (adoptedCeoAdmission) {
       adoptedCeoTools = await startAdoptedCeoToolSocket(cp, daemon, stateDir, adoptedCeoAdmission, {
         onCeoApproved: (runId) => daemon.finalizeApprovedRun(runId),
+        // The same guard policy the relay's binding socket uses: one allowlist, one signing secret.
+        ...(buzzActorIngressPolicy === null ? {} : {
+          buzzActorIngress: new BuzzActorIngress(
+            new IngressGuard(cp.db, cp.clock, cp.audit, { buzz: buzzActorIngressPolicy }),
+            cp.sessions,
+          ),
+        }),
       });
       process.stdout.write("adopted CEO tool socket started\n");
     }

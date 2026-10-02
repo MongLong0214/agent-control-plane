@@ -9,6 +9,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { SessionLifecycle } from "../domain/types.ts";
 import { HOLDER_CLAIMED_KIND_SQL } from "../outbox/outbox.ts";
+import { isAdmittedRuntime, type AdmittedRuntime } from "./runtime-lineage.ts";
 
 export interface SessionRecord {
   sessionId: string;
@@ -54,6 +55,16 @@ export interface BindBuzzActorInput {
   sessionId: string;
   /** Proof the caller is this session; a session id alone is public and proves nothing. */
   sessionSecret: string;
+  buzzActorId: string;
+}
+
+/**
+ * The same binding, with the caller's proof being a kernel-peer lineage admission rather than the
+ * secret (#1037). The admission names the session; there is no separate session id to disagree
+ * with it.
+ */
+export interface AdmittedBindBuzzActorInput {
+  admitted: AdmittedRuntime;
   buzzActorId: string;
 }
 
@@ -285,11 +296,18 @@ export class SessionRegistry {
    * actor id onto any session and inherit the role that session holds. The binding is
    * write-once (schema trigger) and unique among live sessions (partial unique index), so a
    * later caller cannot re-point an authenticated identity at a different session.
+   *
+   * #1037 — the first proof has a second form. A runtime that holds no secret (an adopted Gateway
+   * keeps none) proves it is this session by a lineage admission instead: the kernel peer descends
+   * from the process the row recorded. That proof is accepted here as issued and not re-derived,
+   * and everything after it — the allowlist, the lifecycle, the one UPDATE below — is the same code
+   * for both forms. There is one writer of this column, with two ways in.
    */
   bindBuzzActor(
-    input: BindBuzzActorInput,
+    input: BindBuzzActorInput | AdmittedBindBuzzActorInput,
     authenticator: BuzzActorAuthenticator,
   ): Decision<SessionRecord> {
+    if ("admitted" in input) return this.#bindAdmittedBuzzActor(input, authenticator);
     const authenticated = this.verifySecret(input.sessionId, input.sessionSecret);
     if (!authenticated.allowed) return authenticated;
 
@@ -301,6 +319,55 @@ export class SessionRegistry {
         { sessionId: input.sessionId, buzzActorId: actorId },
       );
     }
+    return this.#writeBuzzActor(input.sessionId, authenticated, actorId);
+  }
+
+  /** The admitted form's proof and allowlist, then the same write. */
+  #bindAdmittedBuzzActor(
+    input: AdmittedBindBuzzActorInput,
+    authenticator: BuzzActorAuthenticator,
+  ): Decision<SessionRecord> {
+    const sessionId = input.admitted.sessionId;
+    const authenticated = this.#admittedSession(input.admitted);
+    if (!authenticated.allowed) return authenticated;
+    const actorId = input.buzzActorId.trim();
+    const unauthenticated = (): Decision<SessionRecord> =>
+      deny(
+        ReasonCode.SESSION_BUZZ_ACTOR_NOT_AUTHENTICATED,
+        "buzz channel identity is not authenticated by the deployment's ingress policy",
+        { sessionId, buzzActorId: actorId },
+      );
+    if (actorId.length === 0) return unauthenticated();
+    if (!authenticator.isAllowedActor("buzz", actorId)) return unauthenticated();
+    return this.#writeBuzzActor(sessionId, authenticated, actorId);
+  }
+
+  /**
+   * An admission this registry did not see happen is accepted only as the value its issuer minted
+   * (`isAdmittedRuntime`), and only while the row is still the incarnation it was admitted as.
+   */
+  #admittedSession(admitted: AdmittedRuntime): Decision<SessionRecord> {
+    if (!isAdmittedRuntime(admitted)) {
+      return deny(ReasonCode.CONFLICT, "the session proof was not issued by a lineage admission", {});
+    }
+    const session = this.get(admitted.sessionId);
+    if (session === null) {
+      return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId: admitted.sessionId });
+    }
+    if (session.incarnation !== admitted.sessionIncarnation) {
+      return deny(ReasonCode.ACTOR_SESSION_INCARNATION_MISMATCH, "the admitted runtime was respawned", {
+        sessionId: admitted.sessionId,
+      });
+    }
+    return allow(ReasonCode.OK, session);
+  }
+
+  /** The one write of `sessions.buzz_actor_id`, after either form of proof. */
+  #writeBuzzActor(
+    sessionId: string,
+    authenticated: { value: SessionRecord },
+    actorId: string,
+  ): Decision<SessionRecord> {
     if (
       authenticated.value.lifecycle === SessionLifecycle.STOPPED ||
       authenticated.value.lifecycle === SessionLifecycle.ERROR
@@ -308,7 +375,7 @@ export class SessionRegistry {
       return deny(
         ReasonCode.SESSION_NOT_READY,
         "a terminal session cannot acquire an actor identity",
-        { sessionId: input.sessionId, lifecycle: authenticated.value.lifecycle },
+        { sessionId, lifecycle: authenticated.value.lifecycle },
       );
     }
 
@@ -318,19 +385,19 @@ export class SessionRegistry {
       const changes = this.db.run(
         `UPDATE sessions SET buzz_actor_id = ?, updated_at = ?
           WHERE session_id = ? AND (buzz_actor_id IS NULL OR buzz_actor_id = ?)`,
-        [actorId, this.clock.nowIso(), input.sessionId, actorId],
+        [actorId, this.clock.nowIso(), sessionId, actorId],
       ).changes;
       if (changes !== 1) {
         return deny(
           ReasonCode.SESSION_BUZZ_ACTOR_IMMUTABLE,
           "session already speaks as a different buzz channel identity identity",
-          { sessionId: input.sessionId, buzzActorId: actorId },
+          { sessionId, buzzActorId: actorId },
         );
       }
     } catch (err) {
       if (isAcpError(err) && err.reasonCode === ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND) {
         return deny(err.reasonCode, err.message, {
-          sessionId: input.sessionId,
+          sessionId,
           buzzActorId: actorId,
         });
       }
@@ -339,13 +406,23 @@ export class SessionRegistry {
 
     this.audit.record({
       kind: "SESSION_BUZZ_ACTOR_BOUND",
-      sessionId: input.sessionId,
+      sessionId,
       // The identity itself belongs in the actor column, which is where every other
       // channel-scoped actor is recorded; evidence stays a decision summary.
       actor: `buzz:${actorId}`,
       evidence: { channel: "buzz" },
     });
-    return allow(ReasonCode.OK, this.require(input.sessionId));
+    return allow(ReasonCode.OK, this.require(sessionId));
+  }
+
+  /** The live session speaking as this Buzz channel identity, if any; a read for refusing early. */
+  liveSessionSpeakingAs(buzzActorId: string): string | null {
+    const row = this.db.get<{ session_id: string }>(
+      `SELECT session_id FROM sessions
+        WHERE buzz_actor_id = ? AND lifecycle IN ('STARTING','READY','DRAINING')`,
+      [buzzActorId],
+    );
+    return row?.session_id ?? null;
   }
 
   setBuzzAddress(sessionId: string, address: string | null): void {

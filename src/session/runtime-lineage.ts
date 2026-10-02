@@ -57,11 +57,34 @@ export const defaultProcessLineageReader: ProcessLineageReader = {
   startedAt: processStartedAt,
 };
 
+/**
+ * The runtime row a lineage admission settled on, as a value only this module mints (#1037).
+ *
+ * A consumer that writes on a runtime's behalf — the one writer of `sessions.buzz_actor_id` — takes
+ * this in place of the session secret: it was issued by `admitRuntimeLineage` and nothing else, so
+ * holding one means the admission happened, and the consumer re-derives nothing. A structurally
+ * identical object built anywhere else is not one (`isAdmittedRuntime`).
+ */
+export interface AdmittedRuntime {
+  readonly sessionId: string;
+  readonly sessionIncarnation: string;
+}
+
+const ADMITTED_RUNTIMES = new WeakSet<object>();
+
+export const isAdmittedRuntime = (value: unknown): value is AdmittedRuntime => {
+  if (typeof value !== "object") return false;
+  if (value === null) return false;
+  return ADMITTED_RUNTIMES.has(value);
+};
+
 /** The runtime row's process, as the check found it running. */
 export interface RuntimeLineage {
   pid: number;
   /** The live native start token, for a caller that compares it against another report. */
   startToken: string;
+  /** The admitted row, for a consumer that acts as it. */
+  runtime: AdmittedRuntime;
 }
 
 const refuse = (message: string): Decision<RuntimeLineage> => deny(ReasonCode.CONFLICT, message, {});
@@ -78,7 +101,7 @@ const refuse = (message: string): Decision<RuntimeLineage> => deny(ReasonCode.CO
  */
 export const admitRuntimeLineage = (
   peerPid: number,
-  runtime: { osPid: number | null; osProcessStartedAt: string | null },
+  runtime: { sessionId: string; incarnation: string; osPid: number | null; osProcessStartedAt: string | null },
   processes: ProcessLineageReader,
 ): Decision<RuntimeLineage> => {
   const pid = runtime.osPid;
@@ -94,7 +117,14 @@ export const admitRuntimeLineage = (
   let current = processes.parentOf(peerPid);
   for (let hop = 0; hop < MAX_ANCESTRY_HOPS; hop += 1) {
     if (current === null) break;
-    if (current === pid) return allow(ReasonCode.OK, { pid, startToken });
+    if (current === pid) {
+      const admitted: AdmittedRuntime = Object.freeze({
+        sessionId: runtime.sessionId,
+        sessionIncarnation: runtime.incarnation,
+      });
+      ADMITTED_RUNTIMES.add(admitted);
+      return allow(ReasonCode.OK, { pid, startToken, runtime: admitted });
+    }
     if (current <= 1) break;
     if (visited.has(current)) break;
     visited.add(current);
