@@ -1,0 +1,15 @@
+Limit: the host session registry is supplementary evidence a same-uid process can write, not an additional authentication mechanism; it is used only when argv names no session selector, and adoption requires the opened fd to be a regular file owned by the daemon uid within the size bound, its pid to equal the derived claude ancestor, its procStart to equal that pid's kernel start token, and the token to be unchanged after the read
+Warn: an argv selector and a valid registry entry that name different sessions are refused rather than resolved, because an in-process /resume can leave argv stale
+Record-Id: r-f10682ad6296
+Provenance: inherited 25bd174f9db8be4f6a0d82b02672e19ccac8cc02
+
+Limit: the host session registry is read on every claim; only an explicitly absent file (hostSessionRegistryAbsent) lets an argv selector stand alone, and any other registry refusal refuses even a valid argv selector, which supersedes the earlier record that the registry is used only when argv names no selector
+Limit: a registry file whose creation time (st_birthtime, Linux ctime fallback, otherwise refused) precedes the claude ancestor's native start token is refused, which binds the entry to the process instance below second precision; a wall clock stepped backward between a dead process writing its file and a same-second pid reuse can still admit it
+Warn: the claimant session is re-derived from argv and registry after image resolution, after the Buzz await and at the commit checkpoint, and a changed session is refused rather than substituted
+Record-Id: r-e09b9cf62fc6
+Provenance: inherited b4878b3e510d1c6e240a87a7cb8b1c0a153c08c0
+
+Limit: host session registry evidence is Darwin only: it needs a native darwin-tv start token and the fd's st_birthtime, so any other platform refuses it as unverifiable and the Linux start-time estimate and ctime fallback are gone
+Limit: a registry file created after the current wall clock is refused as a backward clock step; the remaining case is a backward step smaller than the gap between a stale file's creation and the claim, combined with same-second pid reuse, by a same-uid process that could already write the registry
+Record-Id: r-abb61d965da6
+Provenance: inherited 9dfe2303b02b3f0dc98f2d2c3c82331f6ad59932
