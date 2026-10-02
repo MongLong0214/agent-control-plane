@@ -1,0 +1,24 @@
+Limit: the canonical self-claim releases a still-ACTIVE PRIMARY_CTO binding only when its holder is the same conversational actor the derived session UUID resolves to and probeSessionLiveness proves the predecessor process DEAD; a binding held by any other actor is left for bind to refuse BINDING_ALREADY_ACTIVE
+Limit: a dead predecessor whose binding still owns live runs is not released, because recoverDeadCanonicalBinding revokes without allowBlockedRuns; that self-claim still refuses (REVOCATION_BLOCKED_ACTIVE_RUNS) and needs a takeover
+Ruled-out: keeping the self-claim refusal and leaving the release to the operator door binding recover-dead | a restarted canonical session must recover its own role without owner authority, and the proof bounding the release is the one recover-dead applies, called rather than copied
+Warn: ALIVE, EPERM, UNKNOWN and a predecessor row missing its pid or start token must keep refusing with nothing written; only DEAD may release, and the counter-example table in tests/unit/canonical-self-claim.test.ts pins each shape
+Warn: falsifiability anchors in scripts/falsifiability-cases match canonical-self-claim.ts by substring, so the release call uses a destructured projectId and a one-line liveness seam and #predecessorProcessIsGone stays byte-identical; writing the seam or projectId the way bind and #predecessorProcessIsGone do makes guards:anchors fail with a row matching 2 places
+Unverified: measured only against checkout-local fixtures with a synthetic inspector and signal; the live daemon, the attach relay and the production database were not touched, so the PRIMARY_CTO state that raised this was not re-claimed
+Unverified: only guards:anchors ran, not the full guards:falsifiable sweep; no falsifiability row mutates the new release, and dropping its refusal return survived the new tests in a local mutation run
+Record-Id: r-b631a449536c
+Follows: r-unknownisnotgone831
+Provenance: inherited 3b934b2b3fc23301594e4fbcd8bb7db4a820c67c
+
+Limit: docs/TERMINOLOGY.md session-identity-continuity: a session is the runtime failover replaces, so what a canonical restart keeps is named the conversational actor and the claimed conversation UUID, never the same session
+Warn: verify-terminology only matches same, identical, unchanged, persistent or long-lived immediately before session, so a phrase such as the same canonical session passes the check while saying what the rule forbids; the test title here was reworded by hand
+Record-Id: r-2f50c1668476
+Follows: r-b631a449536c
+Provenance: inherited 58f6e3f1e55f928bf1dcafbe4444dc0530d31d43
+
+Ruled-out: keeping the claimant check before the predecessor probes and repeating it after them | one check after the last process read in the transaction covers the same window, so it was moved rather than repeated
+Ruled-out: a further claimant check just before bind | nothing between the moved check and the commit leaves the process, so it would re-read the same facts without closing a window
+Warn: the commit-boundary claimant check in #mutate must stay after the last process read the transaction makes; a predecessor or liveness probe added below it reopens ACP1039-R1-01, where a claimant that changed during the release committed under its old identity
+Unverified: the claimant change is injected through the processSignal seam during the release's own probe; real process races, native start-token reads and Linux were not exercised
+Record-Id: r-b73e01a274f3
+Follows: r-b631a449536c
+Provenance: inherited e07468e9f4faad97f3859662ddbdd579fbc6056b
