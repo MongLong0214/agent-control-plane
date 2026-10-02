@@ -27,7 +27,7 @@
   <integer>30</integer>
 
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Standard</string>
 
   <key>StandardOutPath</key>
   <string>__ACP_STDOUT_PATH__</string>
