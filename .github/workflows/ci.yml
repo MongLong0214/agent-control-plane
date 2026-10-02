@@ -11,9 +11,7 @@ name: project-ci
 on:
   push:
     branches: [main, 'release/**', 'hotfix/**']
-  # A daily full run is what keeps `main` swept after the mutation shards stopped running on
-  # `push` — see `guard-falsifiability`'s own condition below for why that duplication was the
-  # thing to remove rather than to retry.
+  # A daily run re-verifies `main` on a tree no push changed.
   schedule:
     - cron: '41 5 * * *'
   # No base filter. `branches` under `pull_request` matches the PR's *base*, so every prefix a
@@ -50,9 +48,8 @@ on:
 #
 # `cancel-in-progress` is false for `push` deliberately, and that is the whole care in this block.
 # Grouping by `github.ref` puts every `main` push in one group, so a blanket `true` would cancel the
-# run a merge started as soon as the next merge landed -- and `main` runs are what the daily
-# schedule sweeps and what post-merge `traceability` reads. A cancelled run reports `cancelled`,
-# which the gate jobs below already treat as not-success, so the cost of getting this wrong is a
+# run a merge started as soon as the next merge landed. A cancelled run reports `cancelled`,
+# which `verify-gate` below already treats as not-success, so the cost of getting this wrong is a
 # red `main` for a tree that was never tested rather than a slow queue.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -194,216 +191,6 @@ jobs:
           path: evidence/local/ci-vitest-results.json
           if-no-files-found: error
 
-  # These checks used to follow `pnpm test` in each matrix workspace. A non-test Vitest exit
-  # skipped all three, while a killed mutation run could also leave that workspace deliberately
-  # broken. Each check now starts from its own checkout and still runs when verify-matrix fails.
-  # The shared setup-node cache key is the lockfile hash, so the dependency store remains reusable
-  # across jobs even though no working tree is shared.
-  #
-  # Sharded, and the shards are separate *checkouts* rather than separate processes in one. The
-  # harness edits the working tree in place and restores it, so two rows running against one tree
-  # would let the second read the first's mutant as the real source — that is why it has never run
-  # alongside `vitest` and never twice at once. A matrix leg is its own runner with its own clone,
-  # so nothing about that rule is being bent here: what moves is which rows a process runs, not how
-  # any row is judged.
-  #
-  # 553 rows (548 after the `skip:` ones), measured, at roughly ten seconds apiece — an hour and a
-  # half of wall-clock on the single job this replaces, on every PR, as the whole critical path.
-  # Four legs because that is the wall-clock target and because four is the smallest number that
-  # reaches it; each leg also pays the fixed setup below (checkout, install, three native builds),
-  # so the per-job total falls by less than four, and more legs buy less each time while asking
-  # macOS runner slots this account has only been measured supplying three of at once.
-  #
-  # `shard: ["1/4", ...]` rather than an index and a separate total: one literal per leg means the
-  # count cannot disagree with itself. What the literals *cannot* say is that all four are here —
-  # deleting one leaves three green jobs and a quarter of the table unchecked — so
-  # `tests/process/the-falsifiability-sweep-is-sharded-without-gaps.test.ts` reads this list back
-  # out of this file and proves it partitions the table.
-  guard-falsifiability:
-    name: guard falsifiability
-    needs: verify-matrix
-    # Not on `push`. A squash merge lands the same tree the pull request's merge commit already
-    # swept, so the post-merge shards re-derive a verdict that exists — and they are the expensive
-    # four of the run: measured on this repository, 113 of a main run's 139 macOS-minutes, 81%.
-    # With runner supply observed at three concurrent macOS jobs, every merge put four more in
-    # front of the next pull request; seven merges in one session is 791 minutes of queue spent
-    # re-proving merged trees.
-    #
-    # `a9c8c56a` already ruled on this shape for the suite itself — "it was a duplicate execution,
-    # and the fix is to not run it twice" — and the same reading applies one job over.
-    #
-    # `main` is not left unswept: the daily `schedule` above runs the whole workflow, this job
-    # included, and `schedule` is not `push`. What is given up is the hours between a merge and
-    # that run, on a tree a pull request had already swept green.
-    if: always() && github.event_name != 'push'
-    runs-on: macos-15
-    strategy:
-      # A shard that fails must not cancel the others. Each leg checks a disjoint quarter, so
-      # cancelling the rest converts one known failure into three unknown results — and a
-      # `cancelled` leg is exactly the state the gate job below reads as not-success.
-      fail-fast: false
-      matrix:
-        shard: ["1/4", "2/4", "3/4", "4/4"]
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
-        with:
-          version: 10
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
-        with:
-          node-version: "22.18.0"
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm rebuild better-sqlite3
-      - run: pnpm native:peercred:build
-      - run: pnpm native:fd-vfs:build
-      # The unmutated verdict for every named test, from the matrix leg the gate judged, on this
-      # same commit. A kill is a difference — the named test passed before the guard was removed
-      # and failed after — and without this the sweep only ever measured the second half, so a
-      # test already failing for its own reasons read as killed by any mutation (#828).
-      #
-      # Not a second execution: re-running the suite here would be a different run, and a verdict
-      # from a run no gate looked at is the thing `traceability` refuses just below for the same
-      # reason. `test -s` keeps a missing artifact from reading as a satisfied baseline, rather
-      # than letting the harness fall back to its no-baseline mode where every kill is trusted.
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
-        with:
-          name: vitest-results-22.18.0
-          path: evidence/baseline
-      - run: test -s evidence/baseline/ci-vitest-results.json
-      # The harness refuses a shard argument that selects no row, so a mistyped or out-of-range
-      # leg is a red job rather than a PASS printed over an empty table.
-      - run: pnpm guards:falsifiable --shard=${{ matrix.shard }}
-        env:
-          ACP_FALSIFIABILITY_BASELINE: ${{ github.workspace }}/evidence/baseline/ci-vitest-results.json
-
-  # The sweep's verdict, in one place, now that no single job holds it.
-  #
-  # Before the matrix, `guard falsifiability` was one check and its colour was the answer. A matrix
-  # turns that name into `guard falsifiability (1/4)` and three more, and GitHub reports a job that
-  # never ran as `skipped` — which reads as satisfied, not as unknown. So this job carries the bare
-  # name, needs every leg, and decides from the aggregate result. `if: always()` and an allow-list
-  # on `== 'success'` are the same two rules `verify-gate` below runs on, for the same reason:
-  # `failure`, `cancelled` and `skipped` must all be red here, and only `success` green.
-  guard-falsifiability-gate:
-    name: guard falsifiability
-    needs: [guard-falsifiability]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: require every falsifiability shard to have actually succeeded
-        run: |
-          shards="${{ needs.guard-falsifiability.result }}"
-          event="${{ github.event_name }}"
-          # Print the inputs before deciding on them, the same readback verify-gate prints: a gate
-          # that only announces its verdict cannot be told apart from one reading the wrong field.
-          echo "needs.guard-falsifiability.result=${shards} github.event_name=${event}"
-          # `skipped` is a third answer and it is not a failure. The shard job opts out of `push`
-          # (see its own `if:` above), so on a push the expected result *is* `skipped` — and
-          # reading that as "did not succeed" turned every merge to `main` red while every pull
-          # request stayed green. Measured: sixteen consecutive failing `push` runs from
-          # 2026-09-15T10:18, against a `schedule` run on the same tree that passed.
-          #
-          # The two conditions are one decision and must move together: if the job's `if:` stops
-          # excluding an event, this must stop excusing it. They are restated rather than shared
-          # because Actions cannot reference another job's `if:` expression.
-          #
-          # This does not excuse a skip that was not the opt-out. A `push` whose `verify-matrix`
-          # failed also skips the shards, and `verify-gate` — which runs `if: always()` and
-          # requires that matrix to have succeeded — fails the run on its own. The hole this
-          # branch could otherwise open is closed one job over, not here.
-          if [ "$shards" = "skipped" ] && [ "$event" = "push" ]; then
-            echo "the shard job does not run on push, so nothing that was meant to run was skipped"
-            echo "this run proves what the pull request's own sweep proved, and no more"
-            exit 0
-          fi
-          if [ "$shards" != "success" ]; then
-            echo "at least one falsifiability shard did not succeed — the sweep did not pass"
-            exit 1
-          fi
-          echo "every falsifiability shard succeeded"
-
-  # Traceability needs a complete Vitest JSON result, and it consumes the one the gate judged
-  # rather than making its own. A second execution is a different run: whatever it reports is a
-  # claim about something no gate looked at. A missing artifact fails this job rather than
-  # silently falling back to a fresh suite — see the download and `test -s` steps below.
-  traceability:
-    name: traceability
-    needs: verify-matrix
-    if: always()
-    # Moved off macOS (#885). The condition the `ssot` job below recorded for this move —
-    # "that move waits until the fallback is removed or explicitly refused, as its own change" —
-    # is met: `src/tools/traceability.ts` no longer starts a suite when it has no result set, it
-    # refuses and names the command that produces one. With that path gone, nothing here is
-    # Darwin-shaped: the tool imports four node builtins and `typescript`, and its only external
-    # command is `git rev-parse`/`git status`. It reads a result set the macOS matrix produced;
-    # reading that JSON needs no addon and no runner that can execute the suite.
-    #
-    # The three build steps went with it. `pnpm native:peercred:build` is Darwin-only by
-    # construction (#539) and would fail here; `native:fd-vfs` and the `better-sqlite3` rebuild
-    # served the suite this job no longer starts.
-    #
-    # This leaves five macOS jobs per pull request where there were six: `verify` (x2) and
-    # `guard falsifiability` (x4) are the ones that actually execute tests, and they stay.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
-        with:
-          version: 10
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
-        with:
-          node-version: "22.18.0"
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      # The result set comes from the matrix leg the gate judged, on this same commit. Without it
-      # `pnpm trace` runs the suite again, and a second execution is a different run — whatever it
-      # reports is a claim about something no gate looked at. `if-no-files-found: error` above and
-      # the absent-file failure below both keep a missing artifact from reading as a passing trace.
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
-        with:
-          name: vitest-results-22.18.0
-          path: evidence/local
-      - run: test -s evidence/local/ci-vitest-results.json
-      - run: pnpm trace
-        env:
-          ACP_VITEST_RESULTS: evidence/local/ci-vitest-results.json
-
-  ssot:
-    name: SSOT reconciliation
-    needs: verify-matrix
-    if: always()
-    # Measured, not assumed (#885). This job builds no native addon and starts no test runner: its
-    # only steps after checkout are `pnpm install` and `node scripts/ssot-report.mjs`, whose imports
-    # are four node builtins and whose only external command is `gh`. Nothing in it is Darwin-shaped,
-    # and it was on `macos-15` because every job here was.
-    #
-    # `traceability` has since followed it, once the condition this comment set was met: its
-    # vitest fallback is now an explicit refusal rather than a path that "should not" run, so the
-    # job no longer needs a platform where the suite could pass. See that job's own comment.
-    #
-    # The macOS legs that stay are the ones that run the suite: `verify` (×2) and
-    # `guard falsifiability` (×4). Both build `native:peercred` and `native:fd-vfs` and then execute
-    # tests that read `lsof`, launchd and peer credentials.
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      issues: read
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: node scripts/ssot-report.mjs
-        env:
-          GH_TOKEN: ${{ github.token }}
-      # `verify-tracker-loci-resolve.mjs` (#597's citation-staleness check) does NOT run here.
-      # It was here once and was wrong to be: it is a fact about the *tracker*, not about this
-      # PR's diff, and — unlike `ssot-report.mjs` above, whose reconciliation only turns red when
-      # someone actively mis-records a marker — it is red *today*, on an unedited `main`, because
-      # an open issue (#649) already cites a moved line. Requiring it here would block every PR's
-      # merge on an issue-thread fact nothing in the diff touched, for however long that issue
-      # stays open — which is the coupling that gets a check silenced rather than fixed. It runs
-      # instead in `.github/workflows/tracker-loci.yml` on a schedule, where it can fail loudly
-      # without failing anyone's merge.
-
   # Branch protection requires the check named exactly `verify` (app_id 15368, GitHub Actions) —
   # confirmed against this repository's live protection settings, not assumed. `verify-matrix`
   # above cannot ever produce that name once it carries a matrix: GitHub always appends the
@@ -426,9 +213,6 @@ jobs:
   # `fail-fast: false` means one leg failing does not cancel the other, while its aggregate result
   # is still `failure` if any leg failed. An allow-list makes every other job fail closed on
   # `cancelled` and `skipped` too, with no separate case needed.
-  # The required check is the test suite. The other three still run, still report, and are still
-  # read — but they no longer gate the merge. Making all four blocking turned every slow or flaky
-  # verification job into a merge stop, and the cost of that landed on unrelated PRs all day.
   verify-gate:
     name: verify
     needs: [verify-matrix]

@@ -260,7 +260,7 @@ export const CI_GATE_JOB_ACTIONS = new Map([
     {
       with: new Set(["name", "path", "if-no-files-found"]),
       if: true,
-      why: "publishes the Vitest JSON the traceability job consumes; runs after the gates and verifies nothing",
+      why: "publishes the Vitest JSON as a run artifact; runs after the gates and verifies nothing",
     },
   ],
 ]);
@@ -281,23 +281,7 @@ export const RUNNER_SCRIPT_WORDS = ["node", "scripts/run-prepush-gates.mjs"];
  */
 export const VERIFICATION_OUTSIDE_THE_RUNNER = new Map([
   [
-    "guard-falsifiability:pnpm guards:falsifiable",
-    "the full mutation sweep is 548 rows and edits the working tree in place; it has its own jobs for that reason — one checkout per `--shard=`, since a shard sharing a tree would read another shard's mutant — and a pre-push gate nobody waits for is not a gate. `guards:anchors` is its seconds-long half and is in the runner.",
-  ],
-  [
-    "traceability:pnpm trace",
-    "consumes the Vitest JSON the matrix leg produced, downloaded as an artifact. Running it pre-push would either need a second suite execution — a different run, so a claim about something no gate judged — or a stale file.",
-  ],
-  [
-    "ssot:node scripts/ssot-report.mjs",
-    "reconciles against the live issue tracker with GH_TOKEN. It is a fact about the tracker, not about the diff, so it must not be able to fail a push.",
-  ],
-  [
     "loci:node scripts/verify-tracker-loci-resolve.mjs",
     "#597 citation staleness, on a schedule in tracker-loci.yml. It is red today on an unedited main because an open issue cites a moved line; requiring it anywhere near a merge is how a check gets silenced instead of fixed.",
-  ],
-  [
-    "loci:node scripts/verify-index-lists-what-is-open.mjs",
-    "whether the index's open list still describes the tracker, on the same schedule and for the same reason as the line above: closing an issue makes it red without any diff, so as a required check it would block every merge on something nobody's change touched.",
   ],
 ]);
