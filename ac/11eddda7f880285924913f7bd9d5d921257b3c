@@ -1,0 +1,46 @@
+Limit: only a refused or unanswered GitHub call is resumable by retrying; a wrong target or a drifted resource stops the operation for a person
+Ruled-out: rolling back GitHub writes after a partial failure | deleting a repository needs a broader credential (delete_repo) than creating it, a public repository is observable once it exists, and a rollback can itself fail halfway; the ledger keeps exact receipts and a retry resumes instead
+Ruled-out: GitHub calls made directly inside the producer | a refusal is only shown to write nothing if every write passes through one countable port, and this packet may not write to GitHub, so the production path is exercised only through injected seams
+Ruled-out: receipts that restate the plan's values | a receipt carries what GitHub answered in a read after the write; a copied plan value would only show that the plan agrees with itself
+Ruled-out: pushing a new commit when a push is already receipted | the new commit's timestamp differs from the one GitHub holds, so the push step fetches the receipted commit and resets onto it
+Warn: keep the GitHub receipt ledger beside the checkout, never inside it: a failed run removes the checkout, and the ledger is what a retry resumes from
+Unverified: the production gh port has never run against GitHub; it is exercised only through an injected client and git runner
+Record-Id: r-16612dbcfde0
+Provenance: inherited c5aea704a08d907522cbb5b8a0867ec051cf40a5
+
+Ruled-out: mutating a guard as if (false && ...) or ... && false | TypeScript drops its narrowing inside the constant-false operand or branch, the mutant fails tsc --noEmit, and the harness refuses it as an unusable row
+Record-Id: r-8b4e3baced8e
+Provenance: inherited bf08309845904b9a914c6f7c1a554a30bc2ab7e8
+
+Limit: nothing in production calls produceAndActivate yet, and no ingress path mints a receipt for repo_factory_github_write, so every production call is refused at the approval
+Ruled-out: producing after a CEO approval (CEO_APPROVED) | a PROJECT_BOOTSTRAP run never has that state: it completes from READY_FOR_CEO_REVIEW through the CEO confirm, and activate refuses any other state
+Ruled-out: taking the write's authority from the run, the CTO or the plan | only an owner approval receipt minted by admitted ingress is authority, and its parameter digest binds owner, visibility, PLAN digest and operations
+Ruled-out: producing again on the call that follows the handoff acknowledgement | the producer's checkout already exists and a second production is refused as a collision, so the retained result is activated
+Warn: the blind review this path requires precedes the GitHub writes, so it covers the run's candidate rather than the pushed commit; a factory that renders templates needs the review after production
+Record-Id: r-26031d3fb388
+Provenance: inherited 90c025802987d8b3a542ff6afabf52028602ac34
+
+Limit: a pending create with no response that finds a same-named repository without its marker is refused as indeterminate; the marker lives in the public repository description, so an edited description turns an adoptable repository into that refusal
+Ruled-out: executing an executable plan the caller supplies, checked by the PLAN digest and operation identities | those said nothing about desired state, so a weaker protection executed under an unchanged approval; the PLAN artifact's own operations are executed instead
+Ruled-out: adopting a same-named repository after a lost create by its name | indistinguishable from someone else's; adoption needs the node id the create response named or the marker the create recorded, and otherwise it is refused
+Ruled-out: removing a leftover checkout of the same bootstrap operation automatically | a live run of the operation cannot be told from a dead one, so the checkout is named in the refusal and left for a person
+Warn: plan_submit still accepts operation identities only, so a PLAN submitted over MCP is refused as not executable until it carries each operation's desired state
+Warn: the REST half and git must address the same host: every gh api call names github.com and the gh child drops GH_HOST
+Record-Id: r-5dd8ef68ada4
+Provenance: inherited 88b286db1b6458626c8c611cc9bfb98c6ca7381d
+
+Limit: a create whose response was never recorded, with a repository now at the name, is refused as indeterminate and needs a person; the description marker is reported only as advisory evidence
+Ruled-out: adopting a repository after a lost create response by the marker the create put in its description | the marker is public once the repository exists, so a replacement can carry it; without a persisted node id the outcome is refused as indeterminate
+Ruled-out: refusing a leftover checkout of this operation whose ledger is settled | when every planned write is receipted and HEAD is the receipted push, GitHub holds everything the checkout does, so it is removed and rebuilt from the ledger
+Warn: protection readback keeps absent, null, present and countless answers apart; a field GitHub returned no value for is unobserved and never equals a requested value
+Record-Id: r-247746418913
+Follows: r-5dd8ef68ada4
+Provenance: inherited c884196bec28934aeb095fa3672a6801343cbdbe
+
+Limit: a checkout left by a run that died, or one still running, is refused by name until a person removes it; only then does the operation resume from the GitHub ledger
+Ruled-out: reclaiming a leftover checkout of this operation when its ledger is complete and its HEAD is the receipted push | a matching HEAD does not make tracked edits, untracked or ignored files recoverable, and two retries could each delete what the other just claimed; every leftover checkout is refused by name and kept
+Ruled-out: keeping the produced result in a file beside the ledger for the runner to activate on retry | a copy only the producer can vouch for can be forged by anyone who can write the file, and the runner activated it before admitting the approval; the caller's store keeps it inside the producer's cleanup
+Warn: the owner approval is admitted before the runner activates anything, a stored result included, so the call after a handoff acknowledgement must carry the same approval
+Record-Id: r-104e4db8c7dd
+Follows: r-247746418913
+Provenance: inherited da828a2654ee4a7e810afca807a06aab48b220d4
