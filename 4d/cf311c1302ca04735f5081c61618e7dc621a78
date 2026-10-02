@@ -1,0 +1,50 @@
+Limit: no consumer delivers an owner-reply item yet: a completed turn's reply is durably owed and readable through pendingOwnerReplies, and delivery belongs to the U6 surface path once Hermes carries signed canonical replies (hermes-agent#63)
+Limit: a Telegram ingress row keeps no chat id in the clear (payload is {text, messageId}, audit stores conversation as [not-stored]), so a Telegram reply item is addressed by the ingress claim's scope and chat digests and the owner's message id, and a sender must resolve the chat against its allowlist
+Ruled-out: a dedicated owner-reply table behind a schema migration | a foreign key to canonical_turns cannot hold for the ingress lane's turn ids, and a schema bump edits the digest-pinned migrations.ts and needs an approved live migration
+Ruled-out: an owner-reply kind in the governed outbox table | its rows are fenced to a role's session and swept by expiry, fencing and the generic delivery loop, none of which an owner reply may pass through before a consumer exists
+Warn: the canonical sweep queues a reply only in the transaction that moves the turn to COMPLETED; queueing on every accepted COMPLETED receipt would answer a turn that a redelivery or another settlement already completed a second time
+Warn: one reply per owner message is enforced by the anchor check in enqueueOwnerReply, not by the row key, because the canonical and ingress lanes mint different turn ids for the same message
+Warn: an ingress claim settled by a COMPLETED receipt carries settledAt with settlement REPLY_OUTBOX and never repliedAt or noReplyAt; readers that treat settledAt as terminal rely on that
+Record-Id: r-1036ownerreply
+Provenance: inherited 5ae2be0e11a32f0ee5ed0faabe79e17c4b036d36
+
+Warn: the falsifiability harness compiles every mutant, and a row's killedBy may name only one distinct test because vitest -t takes one pattern; a replacement of `if (false)` around a block that reads a narrowed variable fails tsc and is reported as an unusable row, not a kill
+Record-Id: r-1036mutantshape
+Follows: r-1036ownerreply
+Provenance: inherited 34727b2a786d498dc21a286877e969cc55536df2
+
+Limit: Telegram rows admitted before this change carry no chatId in their payload, so a COMPLETED receipt for them is unaddressable and the turn stays IN_DOUBT; an update an older binary admitted and this one claims also fails claim()'s INGRESS_ADMITTED payload digest
+Limit: r-1036ownerreply's Limit that a Telegram reply item is addressed by the claim's scope and chat digests, and its Warn that one reply per owner message rests on an anchor check, were true when written and are false after this commit: the address comes from the admitted payload and coverage spans every source of the turn
+Ruled-out: addressing a Telegram reply from the claim's sessionDigest or legacySessionDigest | legacySessionDigest is not frozen by the identity trigger so a later write moves the reply, freezing it needs a trigger change and a migration, and a digest names a conversation without saying where it is
+Ruled-out: keeping the earlier ruling against putting the Telegram chat id in the admitted payload | it leaves a Telegram reply with no immutable address; the payload-digest cost at an upgrade is accepted instead and is bounded to messages admitted before it and still unclaimed
+Warn: only the turn coordinator holds a database's owner-reply authority (claimed once per database identity, released on close); anything else that needs an owner reply must go through the coordinator
+Warn: reconcileIngressReceipt takes (source, query, settle) and completeClaimFromHermesReceipt accepts only a coordinator-issued, single-use IngressReceiptSettlement; code that handed the guard a receipt it built must route through the coordinator's receipt port
+Warn: one owner message gets at most one reply across both lanes: a message answered through ingress (repliedAt or a reserved CEO answer) or named by another item owes nothing new, and a turn whose messages are only partly covered is refused and stays IN_DOUBT
+Record-Id: r-1041r2settle
+Follows: r-1036ownerreply
+Provenance: inherited bad10797d6c818b0d4459891463f5d19c2e012aa
+
+Warn: a reserved Telegram reply counts as the owner's answer only when it carries turnAnswered: true; an apology the transport delivered leaves the answer the receipt proves still owed, and a check that treats any reservation as answered silently drops it
+Record-Id: r-1041r2apology
+Follows: r-1041r2settle
+Provenance: inherited c1635021808e4e15a612971e3d8cda9c99502440
+
+Limit: enqueueing waits (CONVERSATION_TURN_REPLY_IN_FLIGHT) while a handler in this process holds a source message's claim open, judged by the claim's process incarnation; a handler that threw without resolving its claim keeps the canonical turn IN_DOUBT until the claim settles another way or the process restarts
+Limit: r-1041r2settle's Limit that an update admitted by an older binary fails claim()'s INGRESS_ADMITTED digest was overstated when written: the live batch materializer hands claim() the stored payload; what such a row lacks is a chat, so its COMPLETED receipt stays unaddressable
+Warn: an owner's answer and an owner-reply obligation for one message exclude each other in either order: the guard refuses to reserve, complete or record the CEO's answer (turnAnswered: true, or repliedAt) for a message an owner-reply item names, and enqueueing refuses a message already answered or reserved
+Warn: an ingress settlement redeems only on the Db handle that issued it and only inside the issuer's transaction, which withdraws it on return; the coordinator's read-back compares every batch member's turn id and frozen receipt identity with the verified query, not only the receipt fields
+Record-Id: r-1041r3exclusive
+Follows: r-1041r2settle
+Provenance: inherited 1802c43af8406632661de3b7be798252cab9c68f
+
+Warn: the live-handler row's mutant keeps `inFlight` narrowed (`inFlight?.nonce === ""`); replacing the condition with a constant leaves the refusal's evidence reading a possibly-undefined value and the harness reports an uncompilable mutant, not a kill
+Record-Id: r-1041r3livemutant
+Follows: r-1041r3exclusive
+Provenance: inherited 6cfcad8c0541ea3e145076ecdf4187500e3bb0d2
+
+Limit: r-1041r3exclusive's Limit that enqueueing waits while this process holds a source claim open, judged by the claim's process incarnation, was true when written and is false after this commit: an open claim is equally the mark of a handler still running and of one that finished with an apology or a timeout, and only an in-memory handler registry can tell them apart
+Ruled-out: inferring a running handler from an open claim taken by this process | a finished apology or timeout leaves the claim open by design, so matching COMPLETED receipts were held back indefinitely (R1041-04); a handler registers while it runs and leaves when it finishes or throws instead
+Warn: only a handler whose answer reaches the owner without a durable reservation must register through beginTurnHandler (today the Buzz CEO path); a Telegram answer is reserved through recordResultIf first, and that reservation is refused for a message the owner-reply outbox already owes. A new ingress route that answers inline has to register, or a receipt can queue a second reply beside its answer
+Record-Id: r-1041r4handler
+Follows: r-1041r3exclusive
+Provenance: inherited c22eab119802a78788cc25c4bf2247d19b47cb88
