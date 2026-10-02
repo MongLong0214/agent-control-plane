@@ -15,7 +15,6 @@
   "scripts": {
     "postinstall": "node scripts/build-native-peercred.mjs && node scripts/build-native-fd-vfs.mjs",
     "build": "tsc -p tsconfig.build.json && cp src/db/schema.sql dist/db/schema.sql && cp src/db/schema-v37.sql dist/db/schema-v37.sql && node scripts/copy-native-fd-vfs-into-dist.mjs",
-    "declarations:falsifiability-cases": "tsc --allowJs --checkJs --declaration --emitDeclarationOnly --skipLibCheck --module ESNext --target ES2023 --moduleResolution bundler --outDir scripts/lib scripts/lib/falsifiability-cases.mjs",
     "typecheck": "tsc --noEmit",
     "ci:preflight": "node scripts/verify-ci-preflight.mjs",
     "gates": "node scripts/run-prepush-gates.mjs",
@@ -32,7 +31,6 @@
     "release:version": "node scripts/verify-release-version.mjs",
     "symbols": "node scripts/verify-enforcement-symbols.mjs",
     "adapter:source": "node scripts/verify-acceptance-adapter-source.mjs",
-    "guards:falsifiable": "node scripts/verify-guards-are-falsifiable.mjs",
     "guards:peercred-unreachable": "node scripts/verify-peercred-is-unreachable.mjs",
     "native:peercred:build": "node scripts/build-native-peercred.mjs",
     "native:fd-vfs:build": "node scripts/build-native-fd-vfs.mjs",

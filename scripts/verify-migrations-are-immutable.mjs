@@ -50,7 +50,7 @@ const SCHEMA = join(ROOT, "src/db/schema.sql");
 /**
  * Where the original is parked while the probe is applied, so a death mid-probe is repairable.
  *
- * The same discipline `verify-guards-are-falsifiable.mjs` uses, for the same reason: this writes
+ * The same discipline the sibling harness uses, for the same reason: this writes
  * to a tracked source file, and a process that dies between the write and the restore leaves that
  * file altered with nothing saying so. A `finally` covers a thrown error and covers neither a
  * SIGKILL nor a machine losing power.

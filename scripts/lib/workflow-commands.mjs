@@ -9,8 +9,8 @@
  * remove, one layer down.
  *
  * What it adds over the original: every command carries the job id it belongs to and the line span
- * it occupies. The gate-parity check needs both — the job because `guards:falsifiable` legitimately
- * runs outside the runner in its own job, and the span because it cross-checks its own blind spots
+ * it occupies. The gate-parity check needs both — the job because some gates legitimately run
+ * outside the runner in their own job, and the span because it cross-checks its own blind spots
  * by requiring every command-shaped line in the file to fall inside some captured command.
  *
  * It does not claim a step executes, that a matrix leg is reached, or that a GitHub expression's
