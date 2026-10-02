@@ -30,7 +30,7 @@ import { cleanupTempDirs } from "../helpers/fixtures.ts";
  */
 
 const fixtures: AdoptedCeoFixture[] = [];
-const adoptedFixture = (bound?: { locator?: string; digest?: string }): AdoptedCeoFixture => {
+const adoptedFixture = (bound?: Parameters<typeof makeAdoptedFixture>[0]): AdoptedCeoFixture => {
   const fixture = makeAdoptedFixture(bound);
   fixtures.push(fixture);
   return fixture;
@@ -124,6 +124,57 @@ describe("adopted CEO tool admission — refusals write nothing", () => {
       () => fixture.admit(RELAY, { gatewayOrigin: async () => ({ ...fixture.proof, process_started_at: "darwin-tv:1.000000" }) }),
       ReasonCode.CONFLICT,
     );
+  });
+
+  it("refuses a Gateway restarted inside the recorded lstart second, whose readback follows it (PR1046-R1)", async () => {
+    const fixture = adoptedFixture();
+    // Only the native token moves: the new process renders the same lstart second, and the
+    // Gateway's own readback reports the new process consistently.
+    fixture.tokens.set(GATEWAY, "darwin-tv:1790000000.000999");
+    await expectRefusedWithoutWrites(
+      fixture,
+      () => fixture.admit(RELAY, {
+        gatewayOrigin: async () => ({ ...fixture.proof, process_started_at: "darwin-tv:1790000000.000999" }),
+      }),
+      ReasonCode.CONFLICT,
+    );
+  });
+
+  it("decides a legacy lstart-only row only when it was written after that second, then pins the token", async () => {
+    // Written 2026-08-12T00:00:00Z, recording a process that started the day before.
+    const fixture = adoptedFixture({ legacy: { lstart: "Tue Aug 11 09:00:00 2026" } });
+    const { h } = fixture;
+    expect(h.cp.sessions.pinnedNativeStart(fixture.gatewaySessionId)).toBeNull();
+    expect((await fixture.admit()).allowed).toBe(true);
+    expect(h.cp.sessions.pinnedNativeStart(fixture.gatewaySessionId)).toBe(TOKEN);
+    // Pinned once: the next admission writes nothing, and a new token behind the same lstart and
+    // a readback that follows it is now refused exactly.
+    const pinned = snapshot(h);
+    expect((await fixture.admit()).allowed).toBe(true);
+    expect(snapshot(h)).toEqual(pinned);
+    fixture.tokens.set(GATEWAY, "darwin-tv:1790000000.000999");
+    await expectRefusedWithoutWrites(
+      fixture,
+      () => fixture.admit(RELAY, {
+        gatewayOrigin: async () => ({ ...fixture.proof, process_started_at: "darwin-tv:1790000000.000999" }),
+      }),
+      ReasonCode.CONFLICT,
+    );
+  });
+
+  it("refuses a legacy row written inside its process's own start second, or before it", async () => {
+    // The harness clock's own second, rendered the way `ps -o lstart=` renders it locally.
+    const written = new Date("2026-08-12T00:00:00.000Z");
+    const day = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][written.getDay()];
+    const month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][written.getMonth()];
+    const two = (n: number) => String(n).padStart(2, "0");
+    const sameSecond =
+      `${day} ${month} ${String(written.getDate()).padStart(2, " ")} ` +
+      `${two(written.getHours())}:${two(written.getMinutes())}:${two(written.getSeconds())} ${written.getFullYear()}`;
+    const ambiguous = adoptedFixture({ legacy: { lstart: sameSecond } });
+    await expectRefusedWithoutWrites(ambiguous, () => ambiguous.admit(), ReasonCode.CONFLICT);
+    const later = adoptedFixture({ legacy: { lstart: LSTART } });
+    await expectRefusedWithoutWrites(later, () => later.admit(), ReasonCode.CONFLICT);
   });
 
   it("refuses another chat's session, another lineage, and a binding to another head", async () => {

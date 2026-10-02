@@ -123,7 +123,7 @@ export const createCanonicalCtoReattach = (
     // above already walked, and is kept so the CTO and the adopted CEO are admitted by one
     // predicate. The token comparison ties the process it found to the claude ancestor the
     // conversation was derived from, not another one above or below it.
-    const lineage = admitRuntimeLineage(peer.peerPid, session, processes);
+    const lineage = admitRuntimeLineage(peer.peerPid, session, processes, cp.sessions);
     if (!lineage.allowed) return unbound(lineage.message);
     if (lineage.value.startToken !== identity.value.startedAt) {
       return unbound("the binding's runtime is not the claude process this conversation was derived from");

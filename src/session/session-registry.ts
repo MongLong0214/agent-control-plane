@@ -47,6 +47,8 @@ export interface SessionRecord {
  * rather than trusting the caller's word keeps this registry from becoming a second,
  * weaker source of truth about who an actor is.
  */
+const NATIVE_START_PINNED = "SESSION_NATIVE_START_PINNED";
+
 export interface BuzzActorAuthenticator {
   isAllowedActor(channel: string, actor: string): boolean;
 }
@@ -413,6 +415,39 @@ export class SessionRegistry {
       evidence: { channel: "buzz" },
     });
     return allow(ReasonCode.OK, this.require(sessionId));
+  }
+
+  /**
+   * The native start token a runtime row's process was admitted with (#1037), or null.
+   *
+   * `os_process_started_at` keeps whatever form its writer chose — incumbent adoption records `ps`
+   * lstart, which `probeSessionLiveness` and the Gateway delivery authority compare against — so
+   * the exact token lives beside it rather than replacing it. Rewriting the column to the token
+   * was rejected rather than done: both of those readers would then call the live Gateway dead.
+   * Kept as the first `SESSION_NATIVE_START_PINNED` audit event for the session: append-only and
+   * never rewritten, so the first pin is the pin. A dedicated column would need a migration, and
+   * the migration list is frozen.
+   */
+  pinnedNativeStart(sessionId: string): string | null {
+    const row = this.db.get<{ evidence_json: string }>(
+      `SELECT evidence_json FROM audit_events WHERE kind = ? AND session_id = ? ORDER BY event_id LIMIT 1`,
+      [NATIVE_START_PINNED, sessionId],
+    );
+    if (row === undefined) return null;
+    let evidence: unknown;
+    try {
+      evidence = JSON.parse(row.evidence_json);
+    } catch {
+      return null;
+    }
+    const startedAt = (evidence as { startedAt?: unknown } | null)?.startedAt;
+    return typeof startedAt === "string" ? startedAt : null;
+  }
+
+  /** Pins `startToken` for the session unless a pin already exists; the first pin stands. */
+  pinNativeStart(sessionId: string, startToken: string): void {
+    if (this.pinnedNativeStart(sessionId) !== null) return;
+    this.audit.record({ kind: NATIVE_START_PINNED, sessionId, evidence: { startedAt: startToken } });
   }
 
   /** The live session speaking as this Buzz channel identity, if any; a read for refusing early. */

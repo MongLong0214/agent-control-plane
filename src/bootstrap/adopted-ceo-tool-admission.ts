@@ -123,7 +123,7 @@ export const createAdoptedCeoToolAdmission = (cp: ControlPlane, options: Adopted
     if (target.target_locator !== proof.session_id) return refuse("the CEO is bound to another Hermes session");
     if (target.target_locator_digest !== proof.lineage_root_digest) return refuse("the CEO is bound to another lineage");
 
-    const lineage = admitRuntimeLineage(peer.peerPid, session, processes);
+    const lineage = admitRuntimeLineage(peer.peerPid, session, processes, cp.sessions);
     if (!lineage.allowed) return lineage as Decision<AdoptedCeoAdmission>;
     if (lineage.value.startToken !== proof.process_started_at) {
       return refuse("the Gateway reported a process other than the one running at its pid");

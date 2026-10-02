@@ -96,8 +96,20 @@ export interface AdoptedCeoFixture {
  * the executor's receipt for that tuple. The relay descends from the Gateway through a shell; the
  * suite's own process can be added below the Gateway by a test that connects from it.
  */
-export const adoptedFixture = (bound: { locator?: string; digest?: string } = {}): AdoptedCeoFixture => {
+export const adoptedFixture = (
+  bound: {
+    locator?: string;
+    digest?: string;
+    /**
+     * A row written the way adoption wrote them before #1037: `ps` lstart only, no native start
+     * pinned. `lstart` then names the recorded second; the harness clock (2026-08-12T00:00:00Z) is
+     * when the row was written.
+     */
+    legacy?: { lstart: string };
+  } = {},
+): AdoptedCeoFixture => {
   const h = makeHarness();
+  const recordedStart = bound.legacy?.lstart ?? LSTART;
   const parents = new Map<number, number>([
     [RELAY, SHELL],
     [SHELL, GATEWAY],
@@ -105,7 +117,7 @@ export const adoptedFixture = (bound: { locator?: string; digest?: string } = {}
     [STRANGER, 1],
   ]);
   const tokens = new Map<number, string>([[GATEWAY, TOKEN]]);
-  const starts = new Map<number, string>([[GATEWAY, LSTART]]);
+  const starts = new Map<number, string>([[GATEWAY, recordedStart]]);
   const processes: ProcessLineageReader = {
     parentOf: (pid) => parents.get(pid) ?? null,
     startToken: (pid) => tokens.get(pid) ?? null,
@@ -115,9 +127,11 @@ export const adoptedFixture = (bound: { locator?: string; digest?: string } = {}
     provider: "hermes",
     model: "hermes-runtime",
     osPid: GATEWAY,
-    osStartedAt: LSTART,
+    osStartedAt: recordedStart,
   });
   expect(h.cp.sessions.transition(gateway.sessionId, SessionLifecycle.READY).allowed).toBe(true);
+  // What adoption does since #1037: the exact token beside the lstart the row keeps.
+  if (bound.legacy === undefined) h.cp.sessions.pinNativeStart(gateway.sessionId, TOKEN);
   const claimed = {
     executorKind: "hermes",
     targetLocator: bound.locator ?? LIVE,
