@@ -4388,20 +4388,18 @@ const GUARDS = [
     ],
   },
   {
-    // Issue #246 — a producer forbidden from writing to GitHub still has to answer a plan
-    // that calls for one. Honestly receipting a GitHub operation requires performing it,
-    // which this producer never does, so it refuses the whole plan instead. Neutering the
-    // condition would make the producer fabricate a result — repositories, receipts,
-    // verification — for a GitHub write that never happened.
+    // Issue #246 — a plan that calls for GitHub writes is performed only through an injected
+    // `GitHubWritePort`; a caller that supplies none (the local CLI) gets a refusal. Neutering
+    // the condition sends such a plan down the local-only path, which fabricates a result —
+    // repositories, a receipt, verification — for a plan whose GitHub writes never happened.
     //
-    // Bare-file `killedBy`: the describing `describe` block is `repo factory producer
-    // (#246)`, and `vitest -t` treats `#`/`(`/`)` as regex metacharacters (see this file's
-    // own guidance at the top).
-    what: "the producer refuses a plan that requires a GitHub write rather than fabricating a receipt for one",
+    // Bare-file `killedBy`: the describing `describe` blocks carry `(#246)`, and `vitest -t`
+    // treats `#`/`(`/`)` as regex metacharacters (see this file's own guidance at the top).
+    what: "the producer refuses a plan that requires a GitHub write when no GitHub write port is supplied, rather than fabricating a receipt for one",
     file: "src/bootstrap/repo-factory-producer.ts",
-    find: "  if (plan.githubOperations.length > 0) {\n",
-    replace: "  if (false && plan.githubOperations.length > 0) {\n",
-    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+    find: "  if (plan.githubOperations.length > 0 && input.github === undefined) {\n",
+    replace: "  if (false && plan.githubOperations.length > 0 && input.github === undefined) {\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts", "tests/unit/repo-factory-github-producer.test.ts"],
   },
   {
     // The other honesty refusal this producer builds in: `bootstrapVerification` must carry
