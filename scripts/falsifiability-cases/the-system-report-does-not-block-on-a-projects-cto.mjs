@@ -7,7 +7,7 @@ const theSystemReportDoesNotBlockOnAProjectsCto = {
   id: "the-system-report-does-not-block-on-a-projects-cto",
   what: "a dead canonical binding does not park the daemon at startup",
   file: "src/doctor/doctor.ts",
-  find: "          severity: projectScoped ? \"CRITICAL\" : \"ERROR\",\n          scope: `project:${project.projectId}`,\n          blocking: projectScoped,\n",
+  find: "          severity: systemReport ? \"ERROR\" : \"CRITICAL\",\n          scope: `project:${project.projectId}`,\n          blocking: !systemReport,\n",
   replace: "          severity: \"CRITICAL\",\n          scope: `project:${project.projectId}`,\n          blocking: true,\n",
   killedBy: [
     "tests/unit/a-dead-cto-session-locks-the-daemon-out.test.ts::comes up past a dead canonical binding, and the operator door still releases it",

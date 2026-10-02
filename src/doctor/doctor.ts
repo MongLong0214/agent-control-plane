@@ -456,7 +456,7 @@ export class Doctor {
     ];
 
     if (scope === "system" || scope === "cto" || scope === "project") {
-      findings.push(...this.checkBindings(target ?? null));
+      findings.push(...this.checkBindings(target ?? null, scope));
     }
     if (scope === "system" || scope === "run") {
       findings.push(...this.checkRuns(target ?? null));
@@ -559,17 +559,18 @@ export class Doctor {
       }));
   }
 
-  private checkBindings(projectId: string | null): Finding[] {
+  private checkBindings(projectId: string | null, scope: DoctorScope): Finding[] {
     const findings: Finding[] = [];
     const projects = projectId ? [this.projects.get(projectId)].filter(Boolean) : this.projects.list();
     // A project's CTO is an availability fact about that project, not an authority over the
-    // daemon. A report scoped to one project may block that project. The system report is
-    // the daemon's startup gate, and a blocking finding there parks it or ends it before the
-    // claim socket and cto.mcp.sock open. Those sockets are how a CTO claims the role back,
-    // so in the system report these findings are non-blocking ERRORs: DEGRADED, still named.
-    // Admitting them to `canParkForBootstrap` instead was rejected: a parked daemon serves only
-    // the bootstrap door, so the claim socket and cto.mcp.sock would stay shut all the same.
-    const projectScoped = Boolean(projectId);
+    // daemon. The system report is the daemon's startup gate, and a blocking finding there parks
+    // it or ends it before the claim socket and cto.mcp.sock open. Those sockets are how a CTO
+    // claims the role back, so in the system report these findings are non-blocking ERRORs:
+    // DEGRADED, still named. Admitting them to `canParkForBootstrap` instead was rejected: a
+    // parked daemon serves only the bootstrap door, so those sockets would stay shut all the same.
+    // Decided by the report's scope, not by whether it names a project (ACP1045-R1-02): a
+    // "project" or "cto" report without a target covers every project and still blocks on them.
+    const systemReport = scope === "system";
 
     for (const project of projects) {
       if (!project) continue;
@@ -588,7 +589,7 @@ export class Doctor {
           code: "CTO_MISSING_WITH_OPEN_RUNS",
           severity: "ERROR",
           scope: `project:${project.projectId}`,
-          blocking: projectScoped,
+          blocking: !systemReport,
           confidence: "HIGH",
           observedEvidence: { openRuns: openRuns.map((r) => r.runId) },
           recommendedAction: "provision a primary CTO or suspend the project",
@@ -633,9 +634,9 @@ export class Doctor {
           code: "CTO_BINDING_POINTS_AT_DEAD_SESSION",
           // ERROR rather than CRITICAL where it does not block: §25.5 maps a non-blocking ERROR to
           // DEGRADED and has no rule for a non-blocking CRITICAL, which would read HEALTHY.
-          severity: projectScoped ? "CRITICAL" : "ERROR",
+          severity: systemReport ? "ERROR" : "CRITICAL",
           scope: `project:${project.projectId}`,
-          blocking: projectScoped,
+          blocking: !systemReport,
           confidence: "HIGH",
           observedEvidence: { sessionId: binding.sessionId, lifecycle: session?.lifecycle ?? "missing" },
           recommendedAction: "run a recovery takeover for this project",

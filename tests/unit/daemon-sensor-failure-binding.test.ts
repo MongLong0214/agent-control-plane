@@ -1324,6 +1324,31 @@ describe("a live incumbent is not revoked because its capacity is unknown", () =
     expect(fixture.cp.sessions.live()).toHaveLength(1);
   });
 
+  /**
+   * ACP1045-R1-01. A keep lasts for as long as the provider stays unread, so it rests on the exact
+   * native start token only. An lstart record is whole-second text whose native fallback compares
+   * at a truncated millisecond (r-364403fc103a): good enough for the hold, which ends, and not for
+   * a keep, which does not. Such an incumbent gets the hold and then the revocation, as before.
+   */
+  it("holds, and does not keep, a live incumbent recorded by ps lstart text", async () => {
+    // The row is written now, after this process started, as a launch path writes it.
+    const fixture = makeIncumbent("none", { pid: process.pid }, new Date().toISOString());
+    const session = fixture.cp.sessions.require(fixture.incumbent.sessionId);
+    expect(session.osProcessStartedAt).not.toMatch(/^darwin-tv:/);
+    expect(recordedProcessIsRunning(session)).toBe(true);
+
+    const first = await fixture.daemon.reconcileContinuity("no reading, lstart-recorded incumbent");
+
+    expect(first?.unresolved).toEqual([{ roleKey: fixture.roleKey, reasonCode: ReasonCode.COVERAGE_NONE }]);
+    expect(kinds(fixture, "CONTINUITY_REVOCATION_HELD")).toBe(1);
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toEqual(fixture.incumbent);
+
+    fixture.clock.advance(COVERAGE_REVOCATION_GRACE_MS + 1_000);
+    await fixture.daemon.reconcileContinuity("still no reading, past the hold window");
+
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toBeNull();
+  });
+
   it("still revokes at once an incumbent whose recorded process is gone", async () => {
     const recorded = liveToken().replace(/^darwin-tv:(\d+)/, (_, seconds: string) =>
       `darwin-tv:${Number(seconds) - 1}`);

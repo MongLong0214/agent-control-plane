@@ -7,8 +7,8 @@ const anUnreadCapacityKeepsOnlyAReadyIncumbent = {
   id: "an-unread-capacity-keeps-only-a-ready-incumbent",
   what: "an incumbent whose session is no longer READY is revoked although its provider has no reading",
   file: "src/daemon/daemon.ts",
-  find: "    if (session?.lifecycle !== SessionLifecycle.READY) return false;\n    return recordedProcessIsRunning(session);",
-  replace: "    if (session === null) return false;\n    return recordedProcessIsRunning(session);",
+  find: "    if (session?.lifecycle !== SessionLifecycle.READY) return false;\n    if (session.osPid == null) return false;\n",
+  replace: "    if (session === null) return false;\n    if (session.osPid == null) return false;\n",
   killedBy: [
     "tests/unit/daemon-sensor-failure-binding.test.ts::still revokes an incumbent whose session is no longer READY, though its process runs",
   ],

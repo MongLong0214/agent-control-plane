@@ -1900,11 +1900,19 @@ export class Daemon {
    * Whether a READY incumbent keeps its binding although its provider has no capacity reading.
    *
    * Unknown capacity is neither exhaustion nor a dead runtime, and it says nothing about the
-   * bound process. Liveness is decided by the recorded pid and start token, the same exact-process
-   * test the coverage hold uses. The role stays unresolved (`CAPACITY_UNKNOWN_NOT_ROUTABLE`):
-   * unknown is not turned into routable, and new work is still refused by routing. Only the
-   * binding is kept. A session that is not READY, or whose process cannot be proven running,
-   * returns false and takes the revoke and failover paths exactly as before.
+   * bound process. The role stays unresolved (`CAPACITY_UNKNOWN_NOT_ROUTABLE`): unknown is not
+   * turned into routable, and new work is still refused by routing. Only the binding is kept.
+   *
+   * The keep lasts for as long as the provider stays unread, so it rests on the exact native start
+   * token the session recorded, compared as recorded, rather than on `recordedProcessIsRunning`
+   * (ACP1045-R1-01): that test's lstart branch compares whole-second text and then a native start
+   * truncated to the millisecond of `createdAt`, so a replacement that took the pid later in that
+   * same millisecond passes it. The coverage hold keeps that test rather than this comparison: the
+   * hold ends (r-364403fc103a), and the stricter test there would revoke every lstart-recorded
+   * incumbent at once. A session that is not READY, records no native token (lstart text, or
+   * nothing), or whose token no longer matches returns false and takes the hold, revoke and
+   * failover paths exactly as before. The CTO launch and continuity provisioning paths record
+   * lstart text by default, so their incumbents get the hold and not this keep.
    */
   private keepsIncumbentThroughUnreadCapacity(
     session: SessionRecord | null,
@@ -1912,7 +1920,9 @@ export class Daemon {
   ): boolean {
     if (capacity !== null) return false;
     if (session?.lifecycle !== SessionLifecycle.READY) return false;
-    return recordedProcessIsRunning(session);
+    if (session.osPid == null) return false;
+    if (session.osProcessStartedAt == null) return false;
+    return session.osProcessStartedAt === readProcessStartToken(session.osPid);
   }
 
   private holdsThroughCoverageGap(

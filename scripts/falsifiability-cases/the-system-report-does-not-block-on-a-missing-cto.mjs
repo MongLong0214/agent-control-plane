@@ -7,7 +7,7 @@ const theSystemReportDoesNotBlockOnAMissingCto = {
   id: "the-system-report-does-not-block-on-a-missing-cto",
   what: "a project whose open work has no CTO does not stop the daemon starting",
   file: "src/doctor/doctor.ts",
-  find: "          code: \"CTO_MISSING_WITH_OPEN_RUNS\",\n          severity: \"ERROR\",\n          scope: `project:${project.projectId}`,\n          blocking: projectScoped,\n",
+  find: "          code: \"CTO_MISSING_WITH_OPEN_RUNS\",\n          severity: \"ERROR\",\n          scope: `project:${project.projectId}`,\n          blocking: !systemReport,\n",
   replace: "          code: \"CTO_MISSING_WITH_OPEN_RUNS\",\n          severity: \"ERROR\",\n          scope: `project:${project.projectId}`,\n          blocking: true,\n",
   killedBy: [
     "tests/unit/a-dead-cto-session-locks-the-daemon-out.test.ts::comes up for a project whose open work has no CTO, and still names the gap",

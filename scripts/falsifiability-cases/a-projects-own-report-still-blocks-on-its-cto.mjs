@@ -1,16 +1,18 @@
 /**
  * The other direction: the change moved the CTO findings off the daemon's startup gate, not out
- * of the doctor. A report scoped to the project still blocks on its dead binding, which is what a
- * project activation reads. Answering "not scoped" everywhere would quietly loosen that gate.
+ * of the doctor. Every "project" and "cto" report still blocks on them, targeted or not; only the
+ * system report relaxes. The mutant is the first version of this change (ACP1045-R1-02): deciding
+ * by whether a project was named, which read an untargeted project or CTO report as the system
+ * report and demoted both findings in it.
  */
 const aProjectsOwnReportStillBlocksOnItsCto = {
   id: "a-projects-own-report-still-blocks-on-its-cto",
-  what: "a project-scoped doctor report still blocks on that project's dead CTO binding",
+  what: "an untargeted project or CTO doctor report still blocks on a dead CTO binding",
   file: "src/doctor/doctor.ts",
-  find: "    const projectScoped = Boolean(projectId);\n",
-  replace: "    const projectScoped = false;\n",
+  find: "    const systemReport = scope === \"system\";\n",
+  replace: "    const systemReport = !projectId;\n",
   killedBy: [
-    "tests/unit/a-dead-cto-session-locks-the-daemon-out.test.ts::comes up past a dead canonical binding, and the operator door still releases it",
+    "tests/unit/a-dead-cto-session-locks-the-daemon-out.test.ts::blocks on a dead canonical binding in every project and CTO report, targeted or not",
   ],
 };
 

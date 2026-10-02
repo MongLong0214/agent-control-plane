@@ -732,3 +732,73 @@ describe("proving a session's process is gone", () => {
     expect(DEAD_BINDING_RECOVERY_ROLE).toBe(Role.PRIMARY_CTO);
   });
 });
+
+/**
+ * ACP1045-R1-02 — the startup relaxation belongs to the system report, not to every report that
+ * names no project.
+ *
+ * `doctor.run("project")` and `doctor.run("cto")` take an optional target, and the CLI and both
+ * MCP doors let a caller omit it. Deciding blocking from the target alone read those untargeted
+ * reports as the system report and demoted both CTO findings in them. These pin every project and
+ * CTO report, targeted and untargeted, to blocking, and the system report alone to non-blocking.
+ */
+describe("ACP1045-R1-02: project and CTO reports still block on a project's CTO", () => {
+  const reportsAbout = (projectId: string) =>
+    [
+      ["project", projectId],
+      ["project", undefined],
+      ["cto", projectId],
+      ["cto", undefined],
+    ] as const;
+
+  const findingIn = async (harness: Harness, scope: "system" | "project" | "cto", target: string | undefined, code: string) => {
+    const report = await harness.cp.doctor.run(scope, target);
+    const finding = report.findings.find((candidate) => candidate.code === code);
+    return { scope, target, status: report.status, severity: finding?.severity, blocking: finding?.blocking };
+  };
+
+  it("blocks on a dead canonical binding in every project and CTO report, targeted or not", async () => {
+    const { harness, projectId } = await deadCanonicalCto({ lifecycle: "ERROR" });
+
+    for (const [scope, target] of reportsAbout(projectId)) {
+      expect(await findingIn(harness, scope, target, "CTO_BINDING_POINTS_AT_DEAD_SESSION")).toEqual({
+        scope,
+        target,
+        status: "ERROR",
+        severity: "CRITICAL",
+        blocking: true,
+      });
+    }
+    expect(await findingIn(harness, "system", undefined, "CTO_BINDING_POINTS_AT_DEAD_SESSION")).toMatchObject({
+      severity: "ERROR",
+      blocking: false,
+    });
+  });
+
+  it("blocks on open work with no CTO in every project and CTO report, targeted or not", async () => {
+    const { harness, projectId, repositoryId, roleKey } = await deadCanonicalCto();
+    const created = harness.cp.runs.create({
+      projectId,
+      executionMode: ExecutionMode.STANDARD,
+      contract: CONTRACT,
+      repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+    });
+    if (!created.allowed) throw new Error(created.message);
+    const released = harness.cp.bindings.revoke(roleKey, "test: released, leaving the work without a CTO");
+    expect(released.allowed, JSON.stringify(released)).toBe(true);
+
+    for (const [scope, target] of reportsAbout(projectId)) {
+      expect(await findingIn(harness, scope, target, "CTO_MISSING_WITH_OPEN_RUNS")).toEqual({
+        scope,
+        target,
+        status: "BLOCKED",
+        severity: "ERROR",
+        blocking: true,
+      });
+    }
+    expect(await findingIn(harness, "system", undefined, "CTO_MISSING_WITH_OPEN_RUNS")).toMatchObject({
+      severity: "ERROR",
+      blocking: false,
+    });
+  });
+});
