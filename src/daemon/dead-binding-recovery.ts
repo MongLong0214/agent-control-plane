@@ -127,7 +127,10 @@ export interface DeadBindingRecoveryDeps {
   audit: AuditLog;
   sessions: SessionRegistry;
   bindings: BindingRegistry;
-  /** Test seam for the liveness probe; production passes nothing and gets the real syscall. */
+  /**
+   * Seam for the liveness probe. The operator door passes nothing and gets the real syscall; the
+   * canonical self-claim passes the seam its own recorded start token was read through.
+   */
   liveness?: {
     signal?: (pid: number) => void;
     startedAt?: (pid: number) => string | null;
@@ -175,6 +178,13 @@ export interface DeadBindingRecoveryReceipt {
  * inside the transaction is not redundant with the caller's checks: the liveness probe is a
  * syscall taken outside any transaction, and a binding that moved in that window must not be
  * released by a decision made about the old one.
+ *
+ * There is a second caller, and it is bounded by this same proof: `CanonicalSelfClaim` calls this
+ * from inside its own claim transaction when a restarted canonical runtime finds its *own* binding
+ * (same conversational actor, same claimed conversation UUID) still ACTIVE on a predecessor
+ * session whose process is gone. Nested, the denial comes back as data and the claim's outer
+ * `txDecision` rolls back, so a release made there lands only together with the successor
+ * generation. Changing the proof here changes both doors.
  *
  * Generation never moves backwards here because nothing is minted. `expectedBindingGeneration`
  * must equal the generation actually held, so a replayed request naming a superseded generation
