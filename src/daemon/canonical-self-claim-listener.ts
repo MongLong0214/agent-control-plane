@@ -46,6 +46,9 @@ export const CANONICAL_SELF_CLAIM_SOCKET_FILENAME = "agentcpd.claim-canonical-ct
 /** The adopted CEO's tool socket (#1037), sized against `stateDir` the same way. */
 export const ADOPTED_CEO_TOOL_SOCKET_FILENAME = "agentcpd.adopted-ceo-tools.sock";
 
+/** The canonical CTO's reattach socket (#1037): MCP for a live claimant whose binding is ACTIVE. */
+export const CANONICAL_CTO_TOOL_SOCKET_FILENAME = "agentcpd.canonical-cto-tools.sock";
+
 /**
  * `sizeof(struct sockaddr_un.sun_path)` on Darwin is 104 bytes, and that array holds the path plus
  * its NUL terminator — the terminator is not optional and is not this code's to omit, so 103 is
@@ -343,6 +346,19 @@ const publicToolRefusal = (decision: Decision<unknown>): string =>
   `${JSON.stringify({ ok: false, reasonCode: decision.reasonCode })}\n`;
 
 /**
+ * The closed set of kernel-peer MCP doors. `acknowledge` is the one difference: the canonical CTO's
+ * relay must know it was admitted before it hands over a byte of the client's, because a refusal
+ * there sends it to the claim instead, with the client's `initialize` still unsent. The adopted
+ * CEO's relay has nowhere else to go, so its first line is either a refusal or traffic.
+ */
+interface PeerAdmittedDoor {
+  socketFilename: typeof ADOPTED_CEO_TOOL_SOCKET_FILENAME | typeof CANONICAL_CTO_TOOL_SOCKET_FILENAME;
+  acknowledge: boolean;
+}
+
+const ADMITTED_LINE = `${JSON.stringify({ ok: true, reasonCode: ReasonCode.OK })}\n`;
+
+/**
  * One connection on the adopted CEO tool socket: the kernel peer first, before a byte is read; then
  * the caller's admission, bounded by `admissionTimeoutMs`; then the socket, unread, to `serve`.
  *
@@ -351,12 +367,13 @@ const publicToolRefusal = (decision: Decision<unknown>): string =>
  * one `{ok:false,reasonCode}` line and nothing else — no message, no evidence — for the reason
  * `publicClaimResponse` gives on the claim socket.
  */
-const serveAdoptedCeoToolConnection = <T>(
+const servePeerAdmittedConnection = <T>(
   socket: Socket,
   daemon: { lock: { held(): boolean } },
   admit: AdoptedCeoToolAdmit<T>,
   serve: AdoptedCeoToolServe<T>,
   admissionTimeoutMs: number,
+  door: PeerAdmittedDoor,
 ): void => {
   let settled = false;
   const refuse = (decision: Decision<unknown>): void => {
@@ -389,6 +406,7 @@ const serveAdoptedCeoToolConnection = <T>(
       clearTimeout(timer);
       if (!admitted.allowed) return refuse(admitted);
       if (socket.destroyed) return;
+      if (door.acknowledge) socket.write(ADMITTED_LINE);
       serve(admitted.value, socket);
     });
 };
@@ -397,20 +415,49 @@ const serveAdoptedCeoToolConnection = <T>(
  * Starts the adopted CEO's tool socket (#1037). Token-less like the claim socket: its only
  * authority is the kernel's record of who connected and what `admit` decides about that peer.
  */
-export const startAdoptedCeoToolListener = async <T>(
+export const startAdoptedCeoToolListener = <T>(
   daemon: { lock: { held(): boolean } },
   stateDir: string,
   admit: AdoptedCeoToolAdmit<T>,
   serve: AdoptedCeoToolServe<T>,
   options: { admissionTimeoutMs?: number } = {},
+): Promise<CanonicalSelfClaimListener> =>
+  startPeerAdmittedListener(daemon, stateDir, admit, serve, options, {
+    socketFilename: ADOPTED_CEO_TOOL_SOCKET_FILENAME,
+    acknowledge: false,
+  });
+
+/**
+ * Starts the canonical CTO's reattach socket (#1037): the same door, answering an admitted peer
+ * with one `{ok:true}` line before MCP begins, so the relay knows not to claim.
+ */
+export const startCanonicalCtoToolListener = <T>(
+  daemon: { lock: { held(): boolean } },
+  stateDir: string,
+  admit: AdoptedCeoToolAdmit<T>,
+  serve: AdoptedCeoToolServe<T>,
+  options: { admissionTimeoutMs?: number } = {},
+): Promise<CanonicalSelfClaimListener> =>
+  startPeerAdmittedListener(daemon, stateDir, admit, serve, options, {
+    socketFilename: CANONICAL_CTO_TOOL_SOCKET_FILENAME,
+    acknowledge: true,
+  });
+
+const startPeerAdmittedListener = async <T>(
+  daemon: { lock: { held(): boolean } },
+  stateDir: string,
+  admit: AdoptedCeoToolAdmit<T>,
+  serve: AdoptedCeoToolServe<T>,
+  options: { admissionTimeoutMs?: number },
+  door: PeerAdmittedDoor,
 ): Promise<CanonicalSelfClaimListener> => {
   const admissionTimeoutMs = options.admissionTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   if (!Number.isSafeInteger(admissionTimeoutMs)) {
-    throw new Error("adopted CEO admission timeout must be a positive integer");
+    throw new Error("peer admission timeout must be a positive integer");
   }
-  if (admissionTimeoutMs <= 0) throw new Error("adopted CEO admission timeout must be a positive integer");
-  return listenPeerCredentialSocket(stateDir, ADOPTED_CEO_TOOL_SOCKET_FILENAME, (socket) =>
-    serveAdoptedCeoToolConnection(socket, daemon, admit, serve, admissionTimeoutMs),
+  if (admissionTimeoutMs <= 0) throw new Error("peer admission timeout must be a positive integer");
+  return listenPeerCredentialSocket(stateDir, door.socketFilename, (socket) =>
+    servePeerAdmittedConnection(socket, daemon, admit, serve, admissionTimeoutMs, door),
   );
 };
 

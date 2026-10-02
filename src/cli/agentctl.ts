@@ -308,6 +308,10 @@ const dispatchAttach = (args: string[], config: { databasePath: string }): Promi
     {
       claimSocketPath: claimCanonicalCtoSocketPath(config),
       mcpSocketPath: process.env["ACP_CTO_MCP_SOCKET"] ?? join(config.databasePath, "..", "cto.mcp.sock"),
+      // Asked first (#1037): a live claimant whose binding is ACTIVE reattaches without a claim.
+      reattachSocketPath:
+        process.env["ACP_CANONICAL_CTO_TOOL_SOCKET"] ??
+        join(config.databasePath, "..", "agentcpd.canonical-cto-tools.sock"),
       claim: parsed.selectors,
     },
     { stdin: process.stdin, stdout: process.stdout, stderr: process.stderr },

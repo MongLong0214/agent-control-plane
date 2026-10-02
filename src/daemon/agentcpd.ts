@@ -97,9 +97,11 @@ import type { AuthenticatedOperatorPeer, Daemon } from "./daemon.ts";
 import { executeCanonicalSelfClaimOperator } from "./canonical-self-claim-operator.ts";
 import {
   startAdoptedCeoToolListener,
+  startCanonicalCtoToolListener,
   startCanonicalSelfClaimListener,
   type CanonicalSelfClaimListener,
 } from "./canonical-self-claim-listener.ts";
+import { createCanonicalCtoReattach, type CanonicalCtoReattach } from "../registry/canonical-cto-reattach.ts";
 import { readOneJsonLineRequest } from "./local-socket-framing.ts";
 import { daemonCtoBindingRuntime, type CtoBindingRuntime } from "./cto-binding-runtime.ts";
 
@@ -232,6 +234,12 @@ export interface LocalMcpListeners {
    */
   ctoConversation: RoleConversationPort;
   close(): Promise<void>;
+  /**
+   * Opens the canonical CTO's reattach socket (#1037) beside `cto.mcp.sock`: the same CTO server,
+   * for a connection the process tree admits instead of a session secret. Closed by `close()`.
+   * Resolves to the socket's path.
+   */
+  openCanonicalCtoReattach(reattach: CanonicalCtoReattach, daemon: { lock: { held(): boolean } }): Promise<string>;
 }
 
 /**
@@ -548,6 +556,100 @@ export const startLocalMcpListeners = async (
       return server;
     },
   );
+  /**
+   * One CTO MCP server for one admitted connection, whichever door admitted it: `cto.mcp.sock` by
+   * the session secret, or the canonical CTO's reattach socket by the process tree (#1037). `auth`
+   * is binding-scoped tool authority; `connectionAuth` is the binding-free standing the conversation
+   * port re-asks on delivery. Neither door's server differs from the other's in anything else.
+   */
+  const ctoServer = (
+    auth: McpPeerAuthenticator,
+    opening: BoundSocketPeer,
+    connectionAuth: () => McpPeerAuthenticator,
+  ): ReturnType<typeof createCtoServer> => {
+    // `auth` stays binding-scoped: MCP tool authority *is* authority over the one assignment
+    // this connection was admitted under, and `createCtoServer` must keep getting it.
+    const server = createCtoServer(
+      ctoPort,
+      auth,
+      opening.kind === "PENDING_HANDOFF_ACK" ? { pendingHandoffId: opening.handoffId } : undefined,
+    );
+    // The line the CEO socket has had and this one did not. The binding the connection was
+    // admitted under is what the port keys and verifies on: this socket also admits
+    // BOOTSTRAP_CTO and admits PRIMARY_CTO for any project, and neither may become the peer
+    // for this project's canonical CTO. A handoff-pending peer holds no binding at all, so
+    // there is nothing for it to be the target of.
+    if (opening.kind === "BOUND") {
+      // The credential authenticated a *session*; admission then picked one of its bindings to
+      // admit the connection under. Which one it picked decides nothing here — the port asks
+      // the registry which roles this authenticated runtime currently holds. `opening.binding`
+      // is deliberately not passed: making a sibling slot's eligibility depend on whichever
+      // binding admission happened to choose is how a role becomes unreachable. For the same
+      // reason the port gets a *credential-only* authenticator rather than `auth` — a
+      // binding-scoped re-check at delivery time reintroduces that dependency through the back
+      // door, and moving the admitted project away took the session's other project with it.
+      server.server.onclose = ctoConversation.attach(server, connectionAuth());
+      // Registration is a tool on *this* connection's server, and the handler passes `server`
+      // — the object identity `attach` keyed the slots on — rather than anything from `args`.
+      // That is the whole of "connection-bound": there is no argument here in which a peer
+      // could name a role, a session or a connection other than its own, so the only thing it
+      // can say is which path it is listening on. Everything else the port takes from the
+      // registry and from the filesystem.
+      server.registerTool(
+        "role_wake_endpoint_register",
+        {
+          description:
+            "Register this connection's own wake endpoint socket. Local runtime contract, version-pinned; not a public interface.",
+          inputSchema: { endpoint: z.string().min(1) },
+        },
+        async (args: { endpoint: string }) =>
+          respond(await ctoConversation.registerEndpoint(server, args.endpoint)),
+      );
+      /*
+       * The three owner-message tools, registered in this same composition — not on a second
+       * server, and not against a durable endpoint registry.
+       *
+       * `roleKey` is the only thing a caller may say, and it is a **lookup key**: it selects
+       * which of this connection's slots to act on. There is deliberately no argument here for
+       * a session, an incarnation, an assignment, a generation, a pid, a client version or a
+       * digest — `RoleConversationPort` derives the whole `HolderIdentity` from `server` (the
+       * object identity `attach` keyed the slot on), from this connection's own authenticator,
+       * and from the binding registry, and it does that again on every call rather than
+       * trusting what was true at handshake. So a caller supplying a different holder tuple has
+       * nowhere to put it, which is stronger than validating one it could have supplied.
+       */
+      server.registerTool(
+        "role_owner_message_claim",
+        {
+          description:
+            "Take at most one message addressed to a role this connection currently holds. " +
+            "`principal` says who sent it: `peer` is the CEO, whose message carries no owner authority.",
+          inputSchema: { roleKey: z.string().min(1) },
+        },
+        async (args: { roleKey: string }) =>
+          respond(ctoConversation.claimOwnerMessage(server, args.roleKey)),
+      );
+      server.registerTool(
+        "role_owner_message_complete",
+        {
+          description: "Record that this connection took and finished one owner message.",
+          inputSchema: { roleKey: z.string().min(1), messageId: z.string().min(1) },
+        },
+        async (args: { roleKey: string; messageId: string }) =>
+          respond(ctoConversation.completeOwnerMessage(server, args.roleKey, args.messageId)),
+      );
+      server.registerTool(
+        "role_owner_message_reject",
+        {
+          description: "Terminally refuse one owner message this connection was handed.",
+          inputSchema: { roleKey: z.string().min(1), messageId: z.string().min(1) },
+        },
+        async (args: { roleKey: string; messageId: string }) =>
+          respond(ctoConversation.rejectOwnerMessage(server, args.roleKey, args.messageId)),
+      );
+    }
+    return server;
+  };
   let cto: Server;
   try {
     cto = await startMcpSocket(
@@ -556,93 +658,9 @@ export const startLocalMcpListeners = async (
       cp,
       [Role.PRIMARY_CTO, Role.BOOTSTRAP_CTO],
       handshakeTimeoutMs,
-      (auth, opening, credential) => {
-        // `auth` stays binding-scoped: MCP tool authority *is* authority over the one assignment
-        // this connection was admitted under, and `createCtoServer` must keep getting it.
-        const server = createCtoServer(
-          ctoPort,
-          auth,
-          opening.kind === "PENDING_HANDOFF_ACK" ? { pendingHandoffId: opening.handoffId } : undefined,
-        );
-        // The line the CEO socket has had and this one did not. The binding the connection was
-        // admitted under is what the port keys and verifies on: this socket also admits
-        // BOOTSTRAP_CTO and admits PRIMARY_CTO for any project, and neither may become the peer
-        // for this project's canonical CTO. A handoff-pending peer holds no binding at all, so
-        // there is nothing for it to be the target of.
-        if (opening.kind === "BOUND") {
-          // The credential authenticated a *session*; admission then picked one of its bindings to
-          // admit the connection under. Which one it picked decides nothing here — the port asks
-          // the registry which roles this authenticated runtime currently holds. `opening.binding`
-          // is deliberately not passed: making a sibling slot's eligibility depend on whichever
-          // binding admission happened to choose is how a role becomes unreachable. For the same
-          // reason the port gets a *credential-only* authenticator rather than `auth` — a
-          // binding-scoped re-check at delivery time reintroduces that dependency through the back
-          // door, and moving the admitted project away took the session's other project with it.
-          server.server.onclose = ctoConversation.attach(
-            server,
-            conversationPeerAuthenticator(cp, credential, opening.sessionIncarnation, ctoConversation.role),
-          );
-          // Registration is a tool on *this* connection's server, and the handler passes `server`
-          // — the object identity `attach` keyed the slots on — rather than anything from `args`.
-          // That is the whole of "connection-bound": there is no argument here in which a peer
-          // could name a role, a session or a connection other than its own, so the only thing it
-          // can say is which path it is listening on. Everything else the port takes from the
-          // registry and from the filesystem.
-          server.registerTool(
-            "role_wake_endpoint_register",
-            {
-              description:
-                "Register this connection's own wake endpoint socket. Local runtime contract, version-pinned; not a public interface.",
-              inputSchema: { endpoint: z.string().min(1) },
-            },
-            async (args: { endpoint: string }) =>
-              respond(await ctoConversation.registerEndpoint(server, args.endpoint)),
-          );
-          /*
-           * The three owner-message tools, registered in this same composition — not on a second
-           * server, and not against a durable endpoint registry.
-           *
-           * `roleKey` is the only thing a caller may say, and it is a **lookup key**: it selects
-           * which of this connection's slots to act on. There is deliberately no argument here for
-           * a session, an incarnation, an assignment, a generation, a pid, a client version or a
-           * digest — `RoleConversationPort` derives the whole `HolderIdentity` from `server` (the
-           * object identity `attach` keyed the slot on), from this connection's own authenticator,
-           * and from the binding registry, and it does that again on every call rather than
-           * trusting what was true at handshake. So a caller supplying a different holder tuple has
-           * nowhere to put it, which is stronger than validating one it could have supplied.
-           */
-          server.registerTool(
-            "role_owner_message_claim",
-            {
-              description:
-                "Take at most one message addressed to a role this connection currently holds. " +
-                "`principal` says who sent it: `peer` is the CEO, whose message carries no owner authority.",
-              inputSchema: { roleKey: z.string().min(1) },
-            },
-            async (args: { roleKey: string }) =>
-              respond(ctoConversation.claimOwnerMessage(server, args.roleKey)),
-          );
-          server.registerTool(
-            "role_owner_message_complete",
-            {
-              description: "Record that this connection took and finished one owner message.",
-              inputSchema: { roleKey: z.string().min(1), messageId: z.string().min(1) },
-            },
-            async (args: { roleKey: string; messageId: string }) =>
-              respond(ctoConversation.completeOwnerMessage(server, args.roleKey, args.messageId)),
-          );
-          server.registerTool(
-            "role_owner_message_reject",
-            {
-              description: "Terminally refuse one owner message this connection was handed.",
-              inputSchema: { roleKey: z.string().min(1), messageId: z.string().min(1) },
-            },
-            async (args: { roleKey: string; messageId: string }) =>
-              respond(ctoConversation.rejectOwnerMessage(server, args.roleKey, args.messageId)),
-          );
-        }
-        return server;
-      },
+      (auth, opening, credential) =>
+        ctoServer(auth, opening, () =>
+          conversationPeerAuthenticator(cp, credential, opening.sessionIncarnation, ctoConversation.role)),
       true,
       options.attachments ? { authority: options.attachments, port: ctoConversation } : undefined,
     );
@@ -651,13 +669,46 @@ export const startLocalMcpListeners = async (
     if (existsSync(hermesPath)) unlinkSync(hermesPath);
     throw err;
   }
+  // #1037 — the canonical CTO's reattach door. A live claimant whose binding is still ACTIVE gets
+  // the same server as above, admitted by `CanonicalCtoReattach` rather than by a secret; a
+  // connection it does not admit is refused before MCP begins and its relay claims instead.
+  let reattach: CanonicalSelfClaimListener | null = null;
+  const openCanonicalCtoReattach = async (
+    admission: CanonicalCtoReattach,
+    daemon: { lock: { held(): boolean } },
+  ): Promise<string> => {
+    if (reattach !== null) throw new Error("the canonical CTO reattach socket is already open");
+    reattach = await startCanonicalCtoToolListener(
+      daemon,
+      stateDir,
+      async (peer) => admission.admit(peer),
+      (admitted, socket) => {
+        const binding = cp.bindings.active(admitted.roleKey);
+        if (binding === null) {
+          socket.destroy();
+          return;
+        }
+        const server = ctoServer(
+          () => admission.authenticate(admitted),
+          { kind: "BOUND", binding, sessionIncarnation: admitted.sessionIncarnation },
+          () => () => admission.connection(admitted),
+        );
+        void server.connect(new SocketTransport(socket, Buffer.alloc(0))).catch((err: unknown) => {
+          socket.destroy(err instanceof Error ? err : new Error(String(err)));
+        });
+      },
+    );
+    return reattach.socketPath;
+  };
   const servers = [hermes, cto];
 
   return {
     socketPaths: [hermesPath, ctoPath],
     ceoConversation,
     ctoConversation,
+    openCanonicalCtoReattach,
     close: async () => {
+      await reattach?.close();
       await Promise.all(servers.map(closeSocketServer));
       for (const path of [hermesPath, ctoPath]) {
         try {
@@ -3532,6 +3583,11 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       process.stdout.write("canonical self-claim listener started\n");
     }
     listeners = await startDaemonMcpListeners(cp, stateDir, mcpToken, daemon);
+    // #1037 — only where the canonical claim is configured: reattaching is that claim's sequel.
+    if (canonicalSessions !== null) {
+      await listeners.openCanonicalCtoReattach(createCanonicalCtoReattach(cp), daemon);
+      process.stdout.write("canonical CTO reattach socket started\n");
+    }
     // #1037 — the adopted CEO's tools, on their own kernel-peer socket; only when adoption is
     // configured, since that configuration is what the admission compares the Gateway against.
     const adoptedCeoAdmission = createConfiguredAdoptedCeoToolAdmission(cp, hermesAdoptionConfiguration, {
