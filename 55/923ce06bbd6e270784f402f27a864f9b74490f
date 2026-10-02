@@ -1,0 +1,5 @@
+Limit: Isaac directed removing every unnecessary bottleneck and keeping only what is essential; the falsifiability harness (verify-guards-are-falsifiable.mjs, its 565-file scripts/falsifiability-cases directory, and the lib helpers used only by it) was named for full deletion
+Limit: CI and the gate list already do not run this harness: 39f8de21 removed every gate, script and test whose only subject was this repository's own documents, rules or verification tooling, and no reference to the harness remains in .github/ or scripts/lib/prepush-gates.mjs
+Warn: Counterexample coverage for product guards is unaffected by this deletion; it lives in the ordinary tests/**/*.test.ts files, which were left untouched, and only the harness's own self-test rows inside the deleted scripts/falsifiability-cases directory are gone
+Record-Id: r-90c365c5d0cc
+Provenance: inherited d68878bae2e857cb3f6513b0f291ad825f725ebc
