@@ -465,6 +465,23 @@ const groups = [
   },
   {
     file: "src/daemon/agentcpd.ts",
+    // buzzPeerRegistry.currentCeo (#1044)
+    reason: "EQUIVALENT MUTANT. A NULL channel identity is refused at the actor comparison in BuzzMessageIngress's peer rule before `channelIdentityReused` is read, so whatever the reuse query answers for NULL is never observed; and with NULL bound, `buzz_actor_id = ?` matches no row. The operand only spares a query whose answer cannot matter.",
+    operands: [
+      ["channelIdentity !== null",1],
+    ],
+  },
+  {
+    file: "src/daemon/agentcpd.ts",
+    // buzzMentionSubscriberRegistry.peerReceiptFor (#1044)
+    reason: "TYPESCRIPT IS THE GUARD, not a test. `cp.bindings.active` returns `RoleBinding | null`, and the receipt built when both are present reads `ceo.bindingGeneration`, `ceo.sessionId`, `cto.roleKey`, `cto.bindingGeneration` and `cto.sessionId`. Replacing `ceo` with `true` fails to typecheck (measured: two TS18047 errors) and replacing `cto` with `true` fails likewise (measured: three TS18047 errors).",
+    operands: [
+      ["ceo",1],
+      ["cto",1],
+    ],
+  },
+  {
+    file: "src/daemon/agentcpd.ts",
     // buzzPeerRegistry.primaryCtoFor (#1038)
     reason: "TYPESCRIPT IS THE GUARD, not a test. `only` is `RoleBinding | undefined`, and the operand beside this one reads `only.role` while the return below reads `only.roleKey`, `only.bindingGeneration` and `only.sessionId`. Replacing `!only` with `false` fails to typecheck (measured: four TS18048 errors, at the sibling comparison and at all three later reads). The sibling `only.role !== Role.PRIMARY_CTO` has its own row, a-peer-mention-addresses-only-a-primary-cto.",
     operands: [

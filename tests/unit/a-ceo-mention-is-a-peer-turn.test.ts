@@ -13,9 +13,11 @@ import {
   type BuzzSubscriberScheduler,
 } from "../../src/buzz/buzz-mention-subscriber.ts";
 import { OWNER_REPLY_OUTBOX_CHANNEL } from "../../src/conversation/owner-reply-outbox.ts";
+import { deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
   buzzMentionInputFor,
+  buzzMentionSubscriberRegistry,
   ownerMessageLedger,
   startBuzzMessageIngressListener,
   startDaemonBuzzMentionSubscriber,
@@ -29,6 +31,7 @@ import {
 } from "../../src/ingress/buzz-message.ts";
 import { ingressSignature } from "../../src/ingress/ingress-guard.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
+import type { RoleConversationPort } from "../../src/mcp/role-conversation.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { makeHarness, registerFixtureProject } from "../helpers/harness.ts";
@@ -160,7 +163,18 @@ const scheduler = (): BuzzSubscriberScheduler => ({
  * does (`ACP_BUZZ_ALLOWED_ACTORS` lists every ACTIVE Buzz channel identity). So a refusal here is
  * never the relay credential's; it is the peer rule's.
  */
-const startPeerFixture = async (options: { ceoChannelIdentity?: "bound" | "null" } = {}) => {
+const startPeerFixture = async (
+  options: {
+    ceoChannelIdentity?: "bound" | "null";
+    /** Milliseconds past the whole second at which the CEO binding is created (#1044 boundary). */
+    ceoBoundAtMs?: number;
+    /**
+     * Holds every wake until it settles, so the subscriber's admission of one frame is still
+     * awaiting while the next frame arrives — the real queue, not a simulated one (#1044).
+     */
+    wakeGate?: Promise<void>;
+  } = {},
+) => {
   const owner = newKey();
   const ceo = newKey();
   // The key a rotation onto a fresh identity binds; on the relay allowlist from the start, as every
@@ -182,6 +196,7 @@ const startPeerFixture = async (options: { ceoChannelIdentity?: "bound" | "null"
   bindChannelIdentity(harness, ctoSession, cto.pubkey);
 
   const ceoSession = readySession(harness, "ceo", null);
+  harness.clock.advance(options.ceoBoundAtMs ?? 0);
   const ceoGeneration = bindCeoSession(harness, ceoSession);
   if ((options.ceoChannelIdentity ?? "bound") === "bound") {
     bindChannelIdentity(harness, ceoSession, ceo.pubkey);
@@ -205,9 +220,20 @@ const startPeerFixture = async (options: { ceoChannelIdentity?: "bound" | "null"
     allowedActors: [owner.pubkey, ceo.pubkey, ceoNext.pubkey, stranger.pubkey],
     secret: SECRET,
   };
+  const wakeGate = options.wakeGate;
   const ingress = await startBuzzMessageIngressListener(harness.cp, dir, policy, {
     ceoConversation: new CeoConversationPort(),
     ownerActors: [owner.pubkey],
+    ...(wakeGate
+      ? {
+          roleConversation: {
+            wake: async (roleKey: string) => {
+              await wakeGate;
+              return deny(ReasonCode.ROLE_PEER_ABSENT, "no peer in this fixture", { roleKey });
+            },
+          } as unknown as RoleConversationPort,
+        }
+      : {}),
   });
   const relay = manualRelay();
   const subscriber = startDaemonBuzzMentionSubscriber(harness.cp, dir, policy, ingress, {
@@ -252,6 +278,21 @@ const startPeerFixture = async (options: { ceoChannelIdentity?: "bound" | "null"
       relay.live().handlers.onFrame(JSON.stringify(["EVENT", subId, event]));
       await subscriber.settled();
     },
+    /** One relay frame, handed to the subscriber's queue and not waited for. */
+    relayPushes: (event: BuzzMentionEvent): void => {
+      relay.live().handlers.onFrame(JSON.stringify(["EVENT", subId, event]));
+    },
+    /** The receipt the daemon's registry would give a frame arriving now. */
+    receiptNow: () => buzzMentionSubscriberRegistry(harness.cp).peerReceiptFor!(ctoRoleKey),
+    /** The sink's envelope for `event`, carrying the receipt a frame arriving now would carry. */
+    inputFor: (event: BuzzMentionEvent, room = PROJECT_ROOM) =>
+      buzzMentionInputFor(ingress.seam.ingress, SECRET, {
+        roleKey: ctoRoleKey,
+        identityPubkey: cto.pubkey,
+        conversation: room,
+        event,
+        receipt: buzzMentionSubscriberRegistry(harness.cp).peerReceiptFor!(ctoRoleKey),
+      }),
     /** Rows changed on the control plane's connection since it opened. */
     writes: (): number =>
       harness.cp.db.get<{ n: number }>(`SELECT total_changes() AS n`, [])!.n,
@@ -318,6 +359,45 @@ const rotateCeo = (
   const key = options.sameKey ? fixture.ceo : fixture.ceoNext;
   bindChannelIdentity(harness, next, key.pubkey);
   return { generation, key };
+};
+
+/**
+ * Replaces the CTO's runtime: a takeover (`REPLACED`, a new generation) or a surviving move
+ * (`SURVIVED`, the same generation). The new runtime answers on the same project channel and, when
+ * `takeIdentity` is set, takes over the CTO's channel identity once the old runtime has stopped, so
+ * the subscriber still holds the role.
+ */
+const replaceCto = (
+  fixture: PeerFixture,
+  options: { conversation: "REPLACED" | "SURVIVED"; takeIdentity?: boolean },
+): { sessionId: string; incarnation: string } => {
+  const { harness } = fixture;
+  const next = readySession(harness, "cto-next", PROJECT_ROOM);
+  const switched = harness.cp.bindings.switchTo({
+    role: Role.PRIMARY_CTO,
+    projectId: fixture.projectId,
+    sessionId: next.sessionId,
+    reason: "test runtime replacement",
+    conversation: options.conversation,
+  });
+  if (!switched.allowed) throw new Error(`CTO switch failed: ${switched.message}`);
+  if (options.takeIdentity) {
+    expect(
+      harness.cp.sessions.transition(fixture.ctoSession.sessionId, SessionLifecycle.STOPPED, "replaced")
+        .reasonCode,
+    ).toBe(ReasonCode.OK);
+    bindChannelIdentity(harness, next, fixture.cto.pubkey);
+  }
+  return next;
+};
+
+/** Until `predicate` holds, yielding to the event loop between looks. */
+const until = async (predicate: () => boolean, what: string): Promise<void> => {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    if (predicate()) return;
+    await new Promise((resolveTick) => setImmediate(resolveTick));
+  }
+  throw new Error(`timed out waiting for ${what}`);
 };
 
 /** A seam-level envelope signed the way the relay-facing socket signs one. */
@@ -415,80 +495,174 @@ describe("#1038 a bound CEO's Buzz mention is a peer turn for the bound PRIMARY_
     }
   });
 
-  it("refuses an event bound under the old generation and dispatched after a rotation, with zero writes", async () => {
+  it("refuses an old-generation event after a same-key rotation, whether it carries its own receipt or is rebuilt with a fresh one", async () => {
     const fixture = await startPeerFixture();
     try {
-      // The envelope the sink builds at receipt, under generation 1 ...
+      // The review's reproduction (#1044 ACP-1044-01): signed under generation 1 and dated 60 s
+      // ahead, so the event's own time falls inside generation 2's window ...
       const event = fixture.mention(fixture.ceo, {
-        // Dated after the rotation below, so the event's own time cannot be what refuses it.
         createdAt: fixture.nowSeconds() + 60,
         text: "대기열에 있던 지시",
       });
-      const queued = buzzMentionInputFor(fixture.ingress.seam.ingress, SECRET, {
-        roleKey: fixture.ctoRoleKey,
-        identityPubkey: fixture.cto.pubkey,
-        conversation: PROJECT_ROOM,
-        event,
-      });
+      const queued = fixture.inputFor(event);
       expect((queued.peer as { ceoBindingGeneration: number }).ceoBindingGeneration).toBe(
         fixture.ceoGeneration,
       );
 
-      // ... then the CEO rotates onto a new runtime that reuses the same key ...
-      const rotated = rotateCeo(fixture, { sameKey: true, advanceMs: 30_000 });
+      // ... the CEO rotates 30 s later onto a runtime that reuses the same key ...
+      rotateCeo(fixture, { sameKey: true, advanceMs: 30_000 });
 
-      // ... and only then is it dispatched.
+      // ... and neither its own envelope nor one rebuilt now is admitted. The rebuilt one is the
+      // defect the review measured: it used to be stamped with generation 2 and delivered.
       const before = fixture.writes();
-      const refused = await deliverBuzzMessage(
-        fixture.ingress.seam.ingress,
-        fixture.ingress.seam.port,
-        queued,
-      );
-      expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.BUZZ_PEER_GENERATION_STALE });
+      for (const presented of [queued, fixture.inputFor(event)]) {
+        const refused = await deliverBuzzMessage(
+          fixture.ingress.seam.ingress,
+          fixture.ingress.seam.port,
+          presented,
+        );
+        expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.BUZZ_PEER_ORIGIN_AMBIGUOUS });
+      }
       expect(fixture.writes()).toBe(before);
       expect(fixture.admitted(event.id)).toBeUndefined();
-
-      // Control: the same event, bound now, is admitted under the new generation.
-      const rebound = buzzMentionInputFor(fixture.ingress.seam.ingress, SECRET, {
-        roleKey: fixture.ctoRoleKey,
-        identityPubkey: fixture.cto.pubkey,
-        conversation: PROJECT_ROOM,
-        event,
-      });
-      const admitted = await deliverBuzzMessage(
-        fixture.ingress.seam.ingress,
-        fixture.ingress.seam.port,
-        rebound,
-      );
-      expect(admitted.allowed).toBe(true);
-      expect(
-        (JSON.parse(fixture.admitted(event.id)!.payload_json) as { peer: { ceoBindingGeneration: number } })
-          .peer.ceoBindingGeneration,
-      ).toBe(rotated.generation);
     } finally {
       await fixture.close();
     }
   });
 
-  it("refuses an event signed before a same-key rotation with zero writes, even when it is re-bound at delivery", async () => {
+  it("refuses every event signed with a reused key after a same-key rotation, and admits one from a fresh key", async () => {
     const fixture = await startPeerFixture();
     try {
       // Signed during generation 1, by the key generation 2 will reuse.
       const old = fixture.mention(fixture.ceo, { text: "1세대에서 서명됨" });
       rotateCeo(fixture, { sameKey: true });
 
-      // The relay redelivers it after the rotation. The sink binds it fresh — to generation 2 —
-      // and its signature still verifies, because the key is the same. Its signed time is what
-      // says it was written before generation 2 existed.
+      // The relay redelivers it after the rotation, and the same key signs a new one. Nothing in
+      // either event can say which generation signed it, so both are refused.
+      const fresh = fixture.mention(fixture.ceo, { text: "2세대에서 서명됨" });
       const before = fixture.writes();
       await fixture.relayDelivers(old);
+      await fixture.relayDelivers(fresh);
       expect(fixture.writes()).toBe(before);
       expect(fixture.admitted(old.id)).toBeUndefined();
+      expect(fixture.admitted(fresh.id)).toBeUndefined();
+      expect(fixture.refusedWith(ReasonCode.BUZZ_PEER_ORIGIN_AMBIGUOUS)).toBe(2);
+
+      // Control: a rotation onto a fresh key is the current CEO.
+      const rotated = rotateCeo(fixture, { sameKey: false });
+      await fixture.relayDelivers(fixture.mention(rotated.key, { text: "새 키" }));
+      expect(fixture.peerRows()).toHaveLength(1);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("refuses the CEO's events when its runtime is bound again in a new CEO generation", async () => {
+    const fixture = await startPeerFixture();
+    try {
+      const { harness } = fixture;
+      // The same runtime, and so the same key, serves generation 1 and then generation 2. An event
+      // it signed during generation 1 and one it signs now look the same.
+      expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "test re-bind").reasonCode).toBe(ReasonCode.OK);
+      harness.clock.advance(60_000);
+      const generation = bindCeoSession(harness, fixture.ceoSession);
+      expect(generation).toBe(fixture.ceoGeneration + 1);
+
+      const before = fixture.writes();
+      await fixture.relayDelivers(fixture.mention(fixture.ceo, { text: "같은 런타임, 새 세대" }));
+      expect(fixture.writes()).toBe(before);
+      expect(fixture.refusedWith(ReasonCode.BUZZ_PEER_ORIGIN_AMBIGUOUS)).toBe(1);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("refuses a frame that waited in the subscriber's queue across a same-key CEO rotation, with zero writes", async () => {
+    let releaseWake!: () => void;
+    const fixture = await startPeerFixture({
+      wakeGate: new Promise<void>((resolveGate) => {
+        releaseWake = resolveGate;
+      }),
+    });
+    try {
+      // An owner's message is admitted and its wake is held, so the subscriber's queue is busy.
+      const first = fixture.mention(fixture.owner, { text: "먼저 온 주인의 메시지" });
+      fixture.relayPushes(first);
+      await until(() => fixture.admitted(first.id) !== undefined, "the first frame's admission");
+
+      // The CEO's event arrives behind it, under generation 1, dated ahead ...
+      const queued = fixture.mention(fixture.ceo, { createdAt: fixture.nowSeconds() + 60 });
+      fixture.relayPushes(queued);
+      // ... the CEO rotates onto the same key while it waits ...
+      rotateCeo(fixture, { sameKey: true, advanceMs: 30_000 });
+      const before = fixture.writes();
+      // ... and only then does it reach the sink.
+      releaseWake();
+      await fixture.subscriber.settled();
+
+      expect(fixture.writes()).toBe(before);
+      expect(fixture.admitted(queued.id)).toBeUndefined();
+      expect(fixture.peerRows()).toEqual([]);
+      expect(fixture.refusedWith(ReasonCode.BUZZ_PEER_ORIGIN_AMBIGUOUS)).toBe(1);
+    } finally {
+      releaseWake();
+      await fixture.close();
+    }
+  });
+
+  it("refuses a frame that waited in the subscriber's queue while the CTO was taken over, with zero writes", async () => {
+    let releaseWake!: () => void;
+    const fixture = await startPeerFixture({
+      wakeGate: new Promise<void>((resolveGate) => {
+        releaseWake = resolveGate;
+      }),
+    });
+    try {
+      const first = fixture.mention(fixture.owner, { text: "먼저 온 주인의 메시지" });
+      fixture.relayPushes(first);
+      await until(() => fixture.admitted(first.id) !== undefined, "the first frame's admission");
+
+      // The CEO's event arrives for CTO session 1 ...
+      const queued = fixture.mention(fixture.ceo, { text: "세션 1 에게 보낸 지시" });
+      fixture.relayPushes(queued);
+      // ... a new runtime takes the CTO role over, with the CTO's channel identity, so the
+      // subscriber still speaks for the role when the frame reaches the front ...
+      const next = replaceCto(fixture, { conversation: "REPLACED", takeIdentity: true });
+      const before = fixture.writes();
+      releaseWake();
+      await fixture.subscriber.settled();
+
+      // ... and the event is refused, because it arrived for a CTO session that is not the one
+      // processing it. Rebuilding its proof at processing time would have admitted it for `next`.
+      expect(fixture.writes()).toBe(before);
+      expect(fixture.admitted(queued.id)).toBeUndefined();
+      expect(fixture.refusedWith(ReasonCode.BUZZ_PEER_GENERATION_STALE)).toBe(1);
+
+      // Control: the CEO's next event, arriving after the takeover, is admitted for `next`.
+      await fixture.relayDelivers(fixture.mention(fixture.ceo, { text: "세션 2 에게 보낸 지시" }));
+      const peers = fixture.peerRows();
+      expect(peers).toHaveLength(1);
+      expect(peers[0]!.target_session_id).toBe(next.sessionId);
+    } finally {
+      releaseWake();
+      await fixture.close();
+    }
+  });
+
+  it("refuses an exclusive key's event dated before its generation began, and admits one signed in the second it began", async () => {
+    // The binding starts at .500 of a second; `created_at` has no fraction.
+    const fixture = await startPeerFixture({ ceoBoundAtMs: 500 });
+    try {
+      const startSecond = fixture.nowSeconds();
+      const early = fixture.mention(fixture.ceo, { createdAt: startSecond - 1, text: "세대 이전" });
+      const before = fixture.writes();
+      await fixture.relayDelivers(early);
+      expect(fixture.writes()).toBe(before);
       expect(fixture.refusedWith(ReasonCode.BUZZ_PEER_EVENT_OUTSIDE_GENERATION)).toBe(1);
 
-      // Control: the same key, signing after the rotation, is the current CEO.
-      const fresh = fixture.mention(fixture.ceo, { text: "2세대에서 서명됨" });
-      await fixture.relayDelivers(fresh);
+      const atStart = fixture.mention(fixture.ceo, { createdAt: startSecond, text: "시작한 그 초" });
+      await fixture.relayDelivers(atStart);
+      expect(fixture.admitted(atStart.id)).toBeDefined();
       expect(fixture.peerRows()).toHaveLength(1);
     } finally {
       await fixture.close();
@@ -500,12 +674,7 @@ describe("#1038 a bound CEO's Buzz mention is a peer turn for the bound PRIMARY_
     try {
       const { ingress } = fixture;
       const event = fixture.mention(fixture.ceo, { text: "대상이 틀린 지시" });
-      const valid = buzzMentionInputFor(ingress.seam.ingress, SECRET, {
-        roleKey: fixture.ctoRoleKey,
-        identityPubkey: fixture.cto.pubkey,
-        conversation: PROJECT_ROOM,
-        event,
-      });
+      const valid = fixture.inputFor(event);
       const before = fixture.writes();
       for (const mention of [
         // The CEO's own channel identity: a session holding the CEO role, not the CTO.
@@ -545,12 +714,7 @@ describe("#1038 a bound CEO's Buzz mention is a peer turn for the bound PRIMARY_
 
       // At the seam: a `p` tag that is a list rather than one identity.
       const event = fixture.mention(fixture.ceo, { text: "목록" });
-      const valid = buzzMentionInputFor(fixture.ingress.seam.ingress, SECRET, {
-        roleKey: fixture.ctoRoleKey,
-        identityPubkey: fixture.cto.pubkey,
-        conversation: PROJECT_ROOM,
-        event,
-      });
+      const valid = fixture.inputFor(event);
       const listed = signedEnvelope({ ...valid, mention: [fixture.cto.pubkey, fixture.stranger.pubkey] });
       const refused = await deliverBuzzMessage(
         fixture.ingress.seam.ingress,
@@ -572,12 +736,7 @@ describe("#1038 a bound CEO's Buzz mention is a peer turn for the bound PRIMARY_
     try {
       const { ingress } = fixture;
       const event = fixture.mention(fixture.ceo, { text: "주인처럼 말하기" });
-      const valid = buzzMentionInputFor(ingress.seam.ingress, SECRET, {
-        roleKey: fixture.ctoRoleKey,
-        identityPubkey: fixture.cto.pubkey,
-        conversation: PROJECT_ROOM,
-        event,
-      });
+      const valid = fixture.inputFor(event);
       const before = fixture.writes();
 
       // 1. The owner's own route: a conversation turn with the CEO, which only an owner may open.
@@ -694,17 +853,133 @@ describe("#1038 a bound CEO's Buzz mention is a peer turn for the bound PRIMARY_
   });
 });
 
+describe("#1044 a queued peer message keeps its identity fence until it is handed over", () => {
+  const claimOf = (
+    value: unknown,
+  ): { claimed: { text: string; principal: string; messageId: string } | null; withheld: { messageId: string }[] } =>
+    value as never;
+
+  it("withholds a queued peer message from its CTO after the CEO rotates, writing nothing, and lets the holder reject it", async () => {
+    const fixture = await startPeerFixture();
+    try {
+      const { harness } = fixture;
+      const peerEvent = fixture.mention(fixture.ceo, { text: "1세대 CEO 의 지시" });
+      await fixture.relayDelivers(peerEvent);
+      const [peerRow] = fixture.peerRows();
+      expect(peerRow?.status).toBe("PENDING");
+
+      // Admitted under CEO generation 1; the hand-over is asked for under generation 2.
+      rotateCeo(fixture, { sameKey: false });
+      const ledger = ownerMessageLedger(harness.cp);
+      const before = fixture.writes();
+      const refused = ledger.claim(fixture.holder());
+      expect(refused.allowed).toBe(true);
+      const handover = claimOf(refused.allowed ? refused.value : null);
+      expect(handover.claimed).toBeNull();
+      expect(handover.withheld.map((row) => row.messageId)).toEqual([peerRow!.message_id]);
+      expect(fixture.writes()).toBe(before);
+      expect(fixture.peerRows()[0]!.status).toBe("PENDING");
+
+      // It does not stop the queue: the owner's message behind it is handed over.
+      await fixture.relayDelivers(fixture.mention(fixture.owner, { text: "뒤에 온 주인의 메시지" }));
+      const next = ledger.claim(fixture.holder());
+      expect(claimOf(next.allowed ? next.value : null).claimed).toMatchObject({
+        text: "뒤에 온 주인의 메시지",
+        principal: "owner",
+      });
+
+      // The holder retires it by id; that is the one write that does, and it settles its turn.
+      expect(ledger.reject(peerRow!.message_id, fixture.holder()).reasonCode).toBe(ReasonCode.OK);
+      expect(fixture.peerRows()[0]!.status).toBe("REJECTED");
+      const claim = JSON.parse(fixture.admitted(peerEvent.id)!.turn_claim_json!) as Record<string, unknown>;
+      expect(claim["noReplyAt"]).toEqual(expect.any(String));
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("rejects a queued peer message on a CTO takeover instead of retargeting it to the successor", async () => {
+    const fixture = await startPeerFixture();
+    try {
+      const { harness } = fixture;
+      const peerEvent = fixture.mention(fixture.ceo, { text: "세션 1 에게 보낸 지시" });
+      await fixture.relayDelivers(peerEvent);
+      await fixture.relayDelivers(fixture.mention(fixture.owner, { text: "주인의 메시지" }));
+
+      const next = replaceCto(fixture, { conversation: "REPLACED" });
+
+      // The peer message is closed, with its turn, rather than handed to a session its proof does
+      // not name ...
+      expect(fixture.peerRows().map((row) => row.status)).toEqual(["REJECTED"]);
+      const claim = JSON.parse(fixture.admitted(peerEvent.id)!.turn_claim_json!) as Record<string, unknown>;
+      expect(claim["noReplyAt"]).toEqual(expect.any(String));
+
+      // ... while the owner's message follows the role once, as it always has.
+      const successor = {
+        roleKey: fixture.ctoRoleKey,
+        bindingGeneration: harness.cp.bindings.active(fixture.ctoRoleKey)!.bindingGeneration,
+        targetSessionId: next.sessionId,
+        sessionIncarnation: next.incarnation,
+      };
+      const ledger = ownerMessageLedger(harness.cp);
+      const taken = ledger.claim(successor);
+      expect(claimOf(taken.allowed ? taken.value : null).claimed).toMatchObject({
+        text: "주인의 메시지",
+        principal: "owner",
+      });
+      const again = ledger.claim(successor);
+      expect(claimOf(again.allowed ? again.value : null)).toMatchObject({ claimed: null, withheld: [] });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("rejects a queued peer message when the CTO runtime is replaced within its generation instead of carrying it", async () => {
+    const fixture = await startPeerFixture();
+    try {
+      const { harness } = fixture;
+      const peerEvent = fixture.mention(fixture.ceo, { text: "런타임 1 에게 보낸 지시" });
+      await fixture.relayDelivers(peerEvent);
+      await fixture.relayDelivers(fixture.mention(fixture.owner, { text: "주인의 메시지" }));
+      const generation = harness.cp.bindings.active(fixture.ctoRoleKey)!.bindingGeneration;
+
+      const next = replaceCto(fixture, { conversation: "SURVIVED" });
+      expect(harness.cp.bindings.active(fixture.ctoRoleKey)!.bindingGeneration).toBe(generation);
+
+      expect(fixture.peerRows().map((row) => row.status)).toEqual(["REJECTED"]);
+      const claim = JSON.parse(fixture.admitted(peerEvent.id)!.turn_claim_json!) as Record<string, unknown>;
+      expect(claim["noReplyAt"]).toEqual(expect.any(String));
+
+      const taken = ownerMessageLedger(harness.cp).claim({
+        roleKey: fixture.ctoRoleKey,
+        bindingGeneration: generation,
+        targetSessionId: next.sessionId,
+        sessionIncarnation: next.incarnation,
+      });
+      expect(claimOf(taken.allowed ? taken.value : null).claimed).toMatchObject({
+        text: "주인의 메시지",
+        principal: "owner",
+      });
+    } finally {
+      await fixture.close();
+    }
+  });
+});
+
 describe("#1038 the subscriber's sink presents what the relay signed", () => {
-  it("builds the peer envelope from the verified event: author, room, signed time and the generation it was bound under", async () => {
+  it("presents the receipt the frame arrived with as the peer proof, and never builds one of its own", async () => {
     const fixture = await startPeerFixture();
     try {
       const event = fixture.mention(fixture.ceo);
-      const input = buzzMentionInputFor(fixture.ingress.seam.ingress, SECRET, {
+      const receipt = fixture.receiptNow();
+      const request = {
         roleKey: fixture.ctoRoleKey,
         identityPubkey: fixture.cto.pubkey,
         conversation: PROJECT_ROOM,
         event,
-      });
+        receipt,
+      };
+      const input = buzzMentionInputFor(fixture.ingress.seam.ingress, SECRET, request);
       expect(input).toMatchObject({
         actor: fixture.ceo.pubkey,
         conversation: PROJECT_ROOM,
@@ -713,14 +988,26 @@ describe("#1038 the subscriber's sink presents what the relay signed", () => {
         mention: fixture.cto.pubkey,
         text: event.content,
         createdAt: event.created_at,
+        peer: receipt,
       });
       expect(input.signature).toBe(ingressSignature(SECRET, buzzMessageSigningRequest(input)));
 
-      // An owner's event carries no peer proof: the owner path is unchanged.
+      // A frame that arrived with no receipt is presented with no proof, and is refused for it
+      // rather than given one made at processing time (#1044).
+      const unreceipted = buzzMentionInputFor(fixture.ingress.seam.ingress, SECRET, {
+        ...request,
+        receipt: null,
+      });
+      expect(unreceipted.peer).toBeUndefined();
+      const before = fixture.writes();
+      expect(
+        await deliverBuzzMessage(fixture.ingress.seam.ingress, fixture.ingress.seam.port, unreceipted),
+      ).toMatchObject({ allowed: false, reasonCode: ReasonCode.BUZZ_PEER_GENERATION_STALE });
+      expect(fixture.writes()).toBe(before);
+
+      // An owner's event carries no peer proof, receipt or not: the owner path is unchanged.
       const ownerInput = buzzMentionInputFor(fixture.ingress.seam.ingress, SECRET, {
-        roleKey: fixture.ctoRoleKey,
-        identityPubkey: fixture.cto.pubkey,
-        conversation: PROJECT_ROOM,
+        ...request,
         event: fixture.mention(fixture.owner),
       });
       expect(ownerInput.peer).toBeUndefined();

@@ -143,6 +143,12 @@ export interface OwnerMessageHandover {
     principal: "owner" | "peer";
   } | null;
   unresolved: readonly UnresolvedOwnerMessage[];
+  /**
+   * Queued messages this holder is addressed by and is not handed, because their admission proof
+   * is no longer current (#1044) — a peer message from a CEO generation that has since rotated.
+   * Metadata only. Nothing was written for them; `reject` by id is what retires one.
+   */
+  withheld: readonly UnresolvedOwnerMessage[];
   hasMore: boolean;
 }
 
