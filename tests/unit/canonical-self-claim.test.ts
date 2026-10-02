@@ -2113,6 +2113,74 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       expect(core.sessions.require(predecessor.sessionId).lifecycle).toBe(SessionLifecycle.READY);
       expect(recoveryRows(core)).toEqual([]);
     });
+
+    /**
+     * ACP1039-R1-01. The release probes the predecessor a second time, and that probe is real time
+     * in which the claimant itself can change: a `/resume` keeps its pid and start token and moves
+     * it to another conversation, and a reused pid keeps the number under another start token.
+     * Each row makes that change during the second predecessor probe — the release's own signal —
+     * and the claim must refuse with every table, `assignments`, `sessions` and `audit_events`
+     * included, byte for byte as it was.
+     */
+    const RESTART_START = "Fri Jan  1 02:00:00 2027";
+    it.each([
+      {
+        change: "its argv now names another conversation UUID",
+        claimant: () => claudeAncestor({ pid: 11, startedAt: RESTART_START }),
+        registry: false,
+        switchClaimant: (chain: ProcessSnapshot[]) => {
+          chain[2] = claudeAncestor({ pid: 11, startedAt: RESTART_START }, OTHER);
+        },
+      },
+      {
+        change: "the host session registry now names another conversation UUID under --continue",
+        claimant: () => claudeAncestor({
+          pid: 11, startedAt: RESTART_START,
+          argv: ["/opt/claude/claude", "--continue"], command: "/opt/claude/claude --continue",
+        }),
+        registry: true,
+        switchClaimant: (_chain: ProcessSnapshot[], registry: { named: string }) => { registry.named = OTHER; },
+      },
+      {
+        change: "its pid now carries another start token",
+        claimant: () => claudeAncestor({ pid: 11, startedAt: RESTART_START }),
+        registry: false,
+        switchClaimant: (chain: ProcessSnapshot[]) => {
+          chain[2] = claudeAncestor({ pid: 11, startedAt: "Fri Jan  1 03:00:00 2027" });
+        },
+      },
+    ])("a claimant that changes during the release's own probe is refused with nothing written: $change", async (row) => {
+      const { core, projectId, roleKey, first, predecessor } = await heldByDeadPredecessor("prj_claimant_changed_mid_release");
+      const chain: ProcessSnapshot[] = [standardChain()[0]!, { ...standardChain()[1]!, ppid: 11 }, row.claimant()];
+      const registry = { named: CANON };
+      const registryReader: HostSessionRegistryReader = {
+        read: () => allow(ReasonCode.OK, { sessionUuid: registry.named }),
+      };
+      let predecessorSignals = 0;
+      const request = baseRequest(core, projectId, { expectedBindingGeneration: 2 });
+      const before = durableSnapshot(core);
+
+      const refused = await makeSubject(core, projectId, {
+        chain,
+        hostSessionRegistryReader: row.registry ? registryReader : fakeHostSessionRegistryReader,
+        processSignal: (pid) => {
+          if (pid !== predecessor.osPid) return;
+          predecessorSignals += 1;
+          // The first signal decides the branch; the second is the release's own probe.
+          if (predecessorSignals === 2) row.switchClaimant(chain, registry);
+          throw Object.assign(new Error(`no such process: ${pid}`), { code: "ESRCH" });
+        },
+      }).claim(request);
+
+      expect(predecessorSignals).toBe(2);
+      expect(refused.allowed, JSON.stringify(refused)).toBe(false);
+      if (refused.allowed) return;
+      expect(refused.reasonCode).toBe(ReasonCode.CONFLICT);
+      expectDurablyRolledBack(core, before, refused);
+      expect(core.bindings.active(roleKey)?.assignmentId).toBe(first.binding.assignmentId);
+      expect(core.sessions.require(predecessor.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+      expect(recoveryRows(core)).toEqual([]);
+    });
   });
 
   /**

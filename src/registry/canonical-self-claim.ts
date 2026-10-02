@@ -1971,14 +1971,6 @@ export class CanonicalSelfClaim {
         );
       }
 
-      // Clause 2 — pid/startedAt re-verified one last time, at the commit boundary itself, inside
-      // this transaction. Everything above this point ran outside the transaction (including the
-      // async Buzz-resolution await); a pid reused in the gap between that last check and this
-      // write is still a real, distinct window, and this is the last point it can be caught
-      // before `identity.pid`/`identity.startedAt` are written as though verified.
-      const stillLiveAtCommit = this.#assertClaimantStillLive(identity);
-      if (!stillLiveAtCommit.allowed) return stillLiveAtCommit as Decision<CanonicalSelfClaimReceipt>;
-
       // A live canonical actor may replace only its exact revoked runtime attachment (the same-live
       // branch). Dead-process recovery happens only in the #831 branch, only for this same actor's
       // own binding, and grants no authority over another holder.
@@ -2097,6 +2089,20 @@ export class CanonicalSelfClaim {
         }
         predecessorSessionId = predecessor.sessionId;
       }
+
+      // Clause 2 — pid/startedAt and the derived session re-verified one last time, at the commit
+      // boundary itself, inside this transaction. Everything before the transaction ran outside it
+      // (including the async Buzz-resolution await), and the predecessor probes above — the
+      // release's included — signal and shell out to `ps` inside it: real time in which the
+      // claimant can `/resume` into another conversation or lose its pid to reuse. So this check
+      // was moved here, after the last process read the transaction makes, rather than repeated
+      // (ACP1039-R1-01: it used to sit before the probes, and a claimant that changed during the
+      // release committed under its old identity); a refusal here rolls the release back with
+      // everything else. A further check just before `bind` was rejected: nothing from here to the
+      // commit leaves this process, so it would re-read the same facts without closing a window.
+      // Any process read added to this transaction later belongs above this line.
+      const stillLiveAtCommit = this.#assertClaimantStillLive(identity);
+      if (!stillLiveAtCommit.allowed) return stillLiveAtCommit as Decision<CanonicalSelfClaimReceipt>;
 
       if (abandonedRuntimeSessionId !== null) {
         const reconciled = this.sessions.transition(abandonedRuntimeSessionId, SessionLifecycle.STOPPED,
