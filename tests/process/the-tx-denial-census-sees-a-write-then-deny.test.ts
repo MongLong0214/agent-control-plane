@@ -169,8 +169,8 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string }> = 
     label: "IngressGuard.completeClaimFromHermesReceipt",
     file: "ingress/ingress-guard.ts",
     anchor:
-      'receipt: { outcome: "COMPLETED" | "ABORTED"; receiptId: string; evidenceDigest: string; reasonCode: string },\n' +
-      "  ): Decision<void> {\n    return this.db.txDecision(() => {\n      const current = this.db.get<{ result_json: string | null; turn_claim_json: string | null }>(",
+      "    const { channel, nonce, query, receipt } = issued;\n" +
+      "    return this.db.txDecision(() => {\n      const current = this.db.get<{ result_json: string | null; turn_claim_json: string | null }>(",
   },
   {
     // #1036: the receipt observation and settlement are written through `#observeVerified`, then

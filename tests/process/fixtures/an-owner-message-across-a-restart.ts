@@ -27,6 +27,8 @@ import { startDaemonTelegramListener } from "../../../src/daemon/agentcpd.ts";
 import { TelegramInterruption } from "../../../src/ingress/telegram-router.ts";
 import type { TelegramBotTransport } from "../../../src/ingress/telegram-polling.ts";
 import type { TelegramUpdate } from "../../../src/ingress/telegram.ts";
+import type { HermesAcpResult } from "../../../src/runtime/hermes-acp-client.ts";
+import type { HermesAcpExecute } from "../../../src/runtime/hermes-receipt-port.ts";
 import { boundedSpawnSync } from "../../helpers/bounded-sync-child.ts";
 import { bindCeo, makeHarness, TEST_OWNER } from "../../helpers/harness.ts";
 
@@ -437,10 +439,32 @@ const batchRetry = async (root: string): Promise<BatchRetryReport> => {
   };
 };
 
-const batchReceipt = (root: string): BatchReceiptReport => {
+const BATCH_RECEIPT_ID = "receipt:owner-batch";
+
+const batchReceipt = async (root: string): Promise<BatchReceiptReport> => {
+  // The receipt reaches the guard only through the coordinator's sealed port now (#1041, R1041-03):
+  // the Hermes status call answers ABORTED for exactly the identity it is asked about.
   const harness = makeHarness({
     root,
     ownerIdentities: [TEST_OWNER, { channel: CHANNEL, actor: OWNER_ID }],
+    hermesReceipt: {
+      executable: "fixture-hermes",
+      cwd: "/tmp",
+      home: "/tmp",
+      hermesHome: "/tmp",
+      hermesProfile: "default",
+      timeoutMs: 1_000,
+      maxStdoutBytes: 16_384,
+      maxStderrBytes: 16_384,
+      maxLineBytes: 16_384,
+      execute: (async (input) => ({
+        status: "ABORTED",
+        receiptIdentity: input.receiptIdentity,
+        receiptId: BATCH_RECEIPT_ID,
+        evidenceDigest: digestOf({ identity: input.receiptIdentity, outcome: "ABORTED" }),
+        reasonCode: ReasonCode.HERMES_AGENT_RUN_EXCEPTION,
+      } satisfies HermesAcpResult)) satisfies HermesAcpExecute,
+    },
   });
   const guard = new IngressGuard(
     harness.cp.db,
@@ -451,15 +475,14 @@ const batchReceipt = (root: string): BatchReceiptReport => {
   const currentNonce = `update:${BATCH_CURRENT_UPDATE_ID}`;
   const query = guard.receiptIdentityForClaim(CHANNEL, currentNonce);
   if (!query) throw new Error("claimed batch has no authenticated receipt identity");
-  const receipt = {
-    outcome: "ABORTED" as const,
-    receiptId: "receipt:owner-batch",
-    evidenceDigest: digestOf({ query, outcome: "ABORTED" }),
-    reasonCode: ReasonCode.HERMES_AGENT_RUN_EXCEPTION,
-  };
-  const completed = guard.completeClaimFromHermesReceipt(CHANNEL, currentNonce, query, receipt);
+  const reconcile = () => harness.cp.conversation.reconcileIngressReceipt(
+    { channel: CHANNEL, nonce: currentNonce },
+    query,
+    (settlement) => guard.completeClaimFromHermesReceipt(settlement),
+  );
+  const completed = await reconcile();
   if (!completed.allowed) throw new Error(`${completed.reasonCode}: ${completed.message}`);
-  const duplicate = guard.completeClaimFromHermesReceipt(CHANNEL, currentNonce, query, receipt);
+  const duplicate = await reconcile();
   if (!duplicate.allowed) throw new Error(`${duplicate.reasonCode}: ${duplicate.message}`);
 
   const rows = harness.cp.db.all<{ nonce: string; result_json: string | null; turn_claim_json: string }>(
@@ -485,7 +508,7 @@ const batchReceipt = (root: string): BatchReceiptReport => {
     completedRows: rows.filter((row) =>
       (JSON.parse(row.result_json ?? "null") as { kind?: unknown } | null)?.kind === "TELEGRAM_NO_REPLY").length,
     receiptRows: claims.filter((claim) =>
-      (claim["hermesReceipt"] as { receiptId?: unknown } | undefined)?.receiptId === receipt.receiptId).length,
+      (claim["hermesReceipt"] as { receiptId?: unknown } | undefined)?.receiptId === BATCH_RECEIPT_ID).length,
     noReplyRows: claims.filter((claim) => typeof claim["noReplyAt"] === "string").length,
     otherTurnHasReceipt: otherClaim["hermesReceipt"] !== undefined,
     duplicateReasonCode: duplicate.reasonCode,
@@ -571,7 +594,7 @@ const main = async (): Promise<void> => {
     return;
   }
   if (mode === "batch-receipt") {
-    process.stdout.write(`${JSON.stringify(batchReceipt(rest[0] ?? ""))}\n`);
+    process.stdout.write(`${JSON.stringify(await batchReceipt(rest[0] ?? ""))}\n`);
     return;
   }
   throw new Error(`unknown mode: ${String(mode)}`);

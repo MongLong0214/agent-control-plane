@@ -6,7 +6,12 @@ import { type Decision, acpError, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db, TurnMaterializationAuthority } from "../db/database.ts";
-import { enqueueOwnerReply, ownerReplyFor } from "./owner-reply-outbox.ts";
+import {
+  REPLY_OUTBOX_SETTLEMENT,
+  type OwnerReplyAuthority,
+  claimOwnerReplyAuthority,
+  enqueueOwnerReply,
+} from "./owner-reply-outbox.ts";
 
 /**
  * One inbound message a turn is being asked to answer.
@@ -168,6 +173,40 @@ export interface ReceiptPort {
 export const NEVER_FOUND_RECEIPT_PORT: ReceiptPort = Object.freeze({
   lookup: (_query: ReceiptLookupQuery, _signal: AbortSignal): ReceiptLookupResult => ({ found: false }),
 });
+
+/**
+ * The right to settle one ingress claim from one receipt this coordinator verified (#1041 review,
+ * R1041-03).
+ *
+ * Minted only inside `reconcileIngressReceipt`, after its sealed port answered and every identity
+ * field matched, and bound to the claim it was asked about. The ingress guard accepts nothing else:
+ * a receipt-shaped object a caller built is not one of these, however its fields read, because
+ * the registry below is private to this module and only that method adds to it. It is spent on
+ * first redemption and withdrawn when the reconcile returns, so a captured one settles nothing.
+ */
+export interface IngressReceiptSettlement {
+  readonly channel: string;
+  readonly nonce: string;
+  readonly query: ReceiptLookupQuery;
+  readonly receipt: {
+    readonly outcome: "COMPLETED" | "ABORTED";
+    readonly receiptId: string;
+    readonly evidenceDigest: string;
+    readonly reasonCode: string;
+  };
+}
+
+const ISSUED_INGRESS_SETTLEMENTS = new WeakSet<object>();
+
+/**
+ * The settlement itself when `value` is one a coordinator issued and nobody has redeemed yet;
+ * `null` for anything else. Redeeming spends it.
+ */
+export const redeemIngressReceiptSettlement = (value: unknown): IngressReceiptSettlement | null => {
+  if (typeof value !== "object" || value === null) return null;
+  if (!ISSUED_INGRESS_SETTLEMENTS.delete(value)) return null;
+  return value as IngressReceiptSettlement;
+};
 
 /**
  * How long `reconcileUnresolved()` waits for one `ReceiptPort.lookup()` before treating it as
@@ -374,6 +413,9 @@ export class ConversationTurnCoordinator {
    */
   readonly #receiptPort: ReceiptPort;
 
+  /** The right to create owner-reply obligations, claimed once per database (R1041-03). */
+  readonly #ownerReplies: OwnerReplyAuthority;
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
@@ -381,6 +423,7 @@ export class ConversationTurnCoordinator {
     receiptPort: ReceiptPort = NEVER_FOUND_RECEIPT_PORT,
   ) {
     this.#materialization = db.claimTurnMaterializationAuthority();
+    this.#ownerReplies = claimOwnerReplyAuthority(db);
     this.#receiptPort = receiptPort;
   }
 
@@ -1324,22 +1367,22 @@ export class ConversationTurnCoordinator {
   }
 
   async reconcileIngressReceipt(
+    /** The ingress row whose claim this receipt may settle. The settlement is bound to it. */
+    source: { readonly channel: string; readonly nonce: string },
     query: ReceiptLookupQuery,
     /**
-     * The event-specific completion remains with the ingress ledger. The receipt reaches this
-     * closure only after this coordinator's sealed port looked it up and every immutable field
-     * below matched; callers never receive a receipt-shaped public argument they could forge.
+     * The event-specific completion remains with the ingress ledger. The closure receives an
+     * `IngressReceiptSettlement`, never a plain receipt: it exists only after this coordinator's
+     * sealed port looked the receipt up and every immutable field below matched, and the guard
+     * refuses anything else (R1041-03).
      *
-     * For `COMPLETED` the closure owes contract 6's pair: it settles the ingress claim and
-     * enqueues the owner reply (`owner-reply-outbox.ts`) in one transaction, because only the
-     * ingress ledger knows which messages the turn consumed and where they came from.
+     * For `COMPLETED` the closure settles the claim and this method owes the reply: it enqueues
+     * the owner reply in the same transaction, then checks both halves are durable before it
+     * commits — every batch member settled by exactly this receipt, and the reply owed or already
+     * answered. The closure cannot write the reply, because only this coordinator holds the
+     * owner-reply authority.
      */
-    settle: (receipt: {
-      outcome: "COMPLETED" | "ABORTED";
-      receiptId: string;
-      evidenceDigest: string;
-      reasonCode: string;
-    }) => Decision<void>,
+    settle: (settlement: IngressReceiptSettlement) => Decision<void>,
   ): Promise<Decision<void>> {
     let result: ReceiptLookupResult;
     try {
@@ -1386,33 +1429,103 @@ export class ConversationTurnCoordinator {
         turnRequestId: query.turnRequestId,
       });
     }
-    const receipt = {
+    const receipt = Object.freeze({
       outcome: result.outcome,
       receiptId: result.receiptId,
       evidenceDigest: result.evidenceDigest,
       reasonCode: result.reasonCode,
-    };
-    // `ABORTED` carries no reply obligation and reaches the closure exactly as it always has.
-    if (receipt.outcome === "ABORTED") return settle(receipt);
-    // A completed target receipt has an owner-reply obligation (#1036). The closure performs both
-    // writes; this transaction is what makes them one commit, and the check after it is what
-    // makes "the closure enqueued the reply" a fact this coordinator read rather than one it was
-    // told. A closure that settled the claim without durably owing the reply this receipt names
-    // is rolled back whole — the completion and its reply land together or not at all.
-    return this.db.txDecision(() => {
-      const settled = settle(receipt);
-      if (!settled.allowed) return settled;
-      const reply = ownerReplyFor(this.db, query.turnRequestId);
-      if (reply === null || reply.receipt.receiptId !== receipt.receiptId ||
-          reply.receipt.evidenceDigest !== receipt.evidenceDigest) {
-        return deny(
-          ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN,
-          "the ingress settlement did not leave this receipt's owner reply durable, so neither write stands",
-          { turnRequestId: query.turnRequestId },
-        );
-      }
-      return settled;
     });
+    const settlement: IngressReceiptSettlement = Object.freeze({
+      channel: source.channel,
+      nonce: source.nonce,
+      query: Object.freeze({ ...query }),
+      receipt,
+    });
+    ISSUED_INGRESS_SETTLEMENTS.add(settlement);
+    try {
+      // `ABORTED` carries no reply obligation and settles exactly as it always has.
+      if (receipt.outcome === "ABORTED") return settle(settlement);
+      // A completed target receipt has an owner-reply obligation (#1036): the claim's settlement
+      // and the reply land in this one transaction or neither does.
+      return this.db.txDecision(() => {
+        const settled = settle(settlement);
+        if (!settled.allowed) return settled;
+        const members = this.#ingressBatch(source.channel, source.nonce);
+        const unsettled = members.find((nonce) =>
+          !this.#ingressClaimSettledBy(source.channel, nonce, receipt));
+        if (unsettled !== undefined) {
+          return deny(
+            ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN,
+            "the ingress settlement did not settle every claimed message by this receipt, so neither write stands",
+            { turnRequestId: query.turnRequestId, channel: source.channel, nonce: unsettled },
+          );
+        }
+        const reply = enqueueOwnerReply(this.#ownerReplies, this.db, this.clock, {
+          turnRequestId: query.turnRequestId,
+          ledger: "INGRESS_CLAIM",
+          targetActorId: query.targetActorId,
+          sources: members.map((nonce) => ({ channel: source.channel, nonce })),
+          receipt: {
+            authority: "HERMES_TARGET",
+            receiptId: receipt.receiptId,
+            evidenceDigest: receipt.evidenceDigest,
+            reasonCode: receipt.reasonCode,
+          },
+        });
+        if (!reply.allowed) return deny(reply.reasonCode, reply.message, reply.evidence);
+        return settled;
+      });
+    } finally {
+      ISSUED_INGRESS_SETTLEMENTS.delete(settlement);
+    }
+  }
+
+  /**
+   * The messages one ingress claim consumed, read from the claim's own frozen batch list
+   * (`inbound_messages_override_authority_immutable`). Anything else reads as the message alone.
+   */
+  #ingressBatch(channel: string, nonce: string): readonly string[] {
+    const row = this.db.get<{ turn_claim_json: string | null }>(
+      `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+      [channel, nonce],
+    );
+    let batch: unknown;
+    try {
+      batch = (JSON.parse(row?.turn_claim_json ?? "null") as { batchConsumedNonces?: unknown } | null)
+        ?.batchConsumedNonces;
+    } catch {
+      return [nonce];
+    }
+    if (!Array.isArray(batch) || !batch.every((member): member is string => typeof member === "string") ||
+        !batch.includes(nonce)) {
+      return [nonce];
+    }
+    return [...new Set(batch)];
+  }
+
+  /** Whether this message's claim now records the settlement this exact receipt makes. */
+  #ingressClaimSettledBy(
+    channel: string,
+    nonce: string,
+    receipt: { receiptId: string; evidenceDigest: string },
+  ): boolean {
+    const row = this.db.get<{ turn_claim_json: string | null }>(
+      `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+      [channel, nonce],
+    );
+    try {
+      const claim = JSON.parse(row?.turn_claim_json ?? "null") as {
+        settledAt?: unknown;
+        settlement?: unknown;
+        hermesReceipt?: { outcome?: unknown; receiptId?: unknown; evidenceDigest?: unknown };
+      } | null;
+      return typeof claim?.settledAt === "string" && claim.settlement === REPLY_OUTBOX_SETTLEMENT &&
+        claim.hermesReceipt?.outcome === "COMPLETED" &&
+        claim.hermesReceipt.receiptId === receipt.receiptId &&
+        claim.hermesReceipt.evidenceDigest === receipt.evidenceDigest;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -1714,15 +1827,17 @@ export class ConversationTurnCoordinator {
       // owner one reply, addressed from the turn's own ingress messages. Only that transaction —
       // a redelivered receipt, or a turn some other settlement already completed, finds the turn
       // `COMPLETED` before it starts and owes nothing new, which is what keeps a second sweep
-      // overlapping the first from queueing a second reply. A reply that cannot be written refuses,
-      // and `txDecision` takes the observation and the settlement back with it.
+      // overlapping the first from queueing a second reply. A message ingress already answered, or
+      // another turn's item already owes, needs no new obligation (R1041-02); one the lane cannot
+      // address or account for refuses, and `txDecision` takes the observation and the settlement
+      // back with it.
       if (before.outcome === "COMPLETED" || observed.value.outcome !== "COMPLETED") return observed;
       const sources = this.db.all<{ source_channel: string; source_nonce: string }>(
         `SELECT source_channel, source_nonce FROM canonical_turn_sources
           WHERE turn_request_id = ? ORDER BY batch_ordinal ASC`,
         [turnRequestId],
       );
-      const reply = enqueueOwnerReply(this.db, this.clock, {
+      const reply = enqueueOwnerReply(this.#ownerReplies, this.db, this.clock, {
         turnRequestId,
         ledger: "CANONICAL_TURN",
         targetActorId: attested.targetActorId,

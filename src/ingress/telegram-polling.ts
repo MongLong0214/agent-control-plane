@@ -1443,8 +1443,9 @@ export const startTelegramLongPollListener = async (
         );
       }
       return cp.conversation.reconcileIngressReceipt(
+        { channel: "telegram", nonce },
         query,
-        (receipt) => guard.completeClaimFromHermesReceipt("telegram", nonce, query, receipt),
+        (settlement) => guard.completeClaimFromHermesReceipt(settlement),
       );
     },
     ...(options.onInterrupt ? { onInterrupt: options.onInterrupt } : {}),

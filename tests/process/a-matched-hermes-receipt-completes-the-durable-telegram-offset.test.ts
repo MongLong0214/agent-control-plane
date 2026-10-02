@@ -2,8 +2,6 @@ import { rmSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
-import { digestOf } from "../../src/core/digest.ts";
-
 import {
   CHAT_ID,
   UPDATE_ID,
@@ -69,10 +67,8 @@ describe("a matched Hermes receipt completes the durable Telegram offset", () =>
       expect(completed.settlement, "the completed receipt did not settle the ingress event").toBe("REPLY_OUTBOX");
       expect(completed.noReplyAt, "a completed turn was recorded as having no reply").toBeNull();
       expect(completed.receiptId).toBe("receipt:completed");
-      // Telegram's ingress row keeps the chat only as `digestOf({channel, conversation})`; that digest
-      // and the owner's message id are what address the reply.
-      const chatDigest = digestOf({ channel: "telegram", conversation: CHAT_ID });
-      expect(completed.ownerReplies).toEqual([`telegram ${chatDigest} update:${UPDATE_ID} 7`]);
+      // Addressed from the admitted payload: the chat and the owner's own message.
+      expect(completed.ownerReplies).toEqual([`telegram ${CHAT_ID} update:${UPDATE_ID} 7`]);
       expect(completed.offsetAfter, "the completed receipt did not release the ordered update").toBe(UPDATE_ID + 1);
       expect(completed.offsetsRequested).toEqual([null, UPDATE_ID + 1]);
     } finally {

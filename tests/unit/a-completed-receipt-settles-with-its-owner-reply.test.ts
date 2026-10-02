@@ -4,15 +4,19 @@ import { join } from "node:path";
 
 import { ManualClock } from "../../src/core/clock.ts";
 import { digestOf } from "../../src/core/digest.ts";
+import type { Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
   OWNER_REPLY_OUTBOX_CHANNEL,
+  type OwnerReplyAuthority,
+  claimOwnerReplyAuthority,
   enqueueOwnerReply,
   ownerReplyFor,
   pendingOwnerReplies,
 } from "../../src/conversation/owner-reply-outbox.ts";
 import {
   ConversationTurnCoordinator,
+  type IngressReceiptSettlement,
   type ReceiptLookupQuery,
   type ReceiptLookupResult,
   type ReceiptPort,
@@ -32,8 +36,11 @@ afterEach(() => {
  * #1036 — contract 6's other half. A matched `COMPLETED` receipt moves the turn and inserts one
  * owner-reply item in the same transaction, on both receipt lanes: the canonical ledger's sweep
  * (`reconcileUnresolved`) and the Telegram ingress lane (`reconcileIngressReceipt`). Neither write
- * may land without the other, a redelivered receipt adds nothing, the item is addressed to the
- * conversation the owner asked from, and `ABORTED` is untouched.
+ * may land without the other, a redelivered receipt adds nothing, one owner message gets at most
+ * one reply across both lanes, the item is addressed from the originating row's immutable payload,
+ * only a receipt the coordinator verified can settle anything, and `ABORTED` is untouched.
+ *
+ * The cases named `R1041-…` are the witnesses the #1041 review reproduced against 34727b2a.
  */
 const NOW = "2026-10-02T00:00:00.000Z";
 
@@ -73,34 +80,34 @@ class FakeReceiptPort implements ReceiptPort {
   }
 }
 
-const target = (c: Fixture, name: string): string => {
+const target = (db: Fixture["db"], name: string): string => {
   const actorId = `actor:${name}`;
   const sessionId = `runtime:${name}`;
-  c.db.run(
+  db.run(
     `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
      VALUES (?, 'inc-1', 'claude', 'opus', 'READY', ?, ?)`,
     [sessionId, NOW, NOW],
   );
-  c.db.run(
+  db.run(
     `INSERT INTO conversational_actors
        (actor_id, kind, current_session_id, current_session_incarnation, created_at)
      VALUES (?, 'CEO', ?, 'inc-1', ?)`,
     [actorId, sessionId, NOW],
   );
-  c.db.run(
+  db.run(
     `INSERT INTO actor_target_bindings
        (target_binding_id, target_actor_id, executor_kind, target_locator, target_locator_digest, bound_at)
      VALUES (?, ?, 'hermes', ?, ?, ?)`,
     [`bind:${name}`, actorId, `locator:${name}`, `digest:${name}`, NOW],
   );
-  c.db.run(
+  db.run(
     `INSERT INTO assignments
        (assignment_id, role_key, role, actor_id, session_id, session_incarnation,
         binding_generation, mode, status, created_at)
      VALUES (?, ?, 'CEO', ?, ?, 'inc-1', 1, 'PREFERRED', 'ACTIVE', ?)`,
     [`asg:${name}`, `CEO:${name}`, actorId, sessionId, NOW],
   );
-  c.db.run(
+  db.run(
     `INSERT INTO actor_target_attestations
        (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
         executor_session_id, executor_session_incarnation, binding_generation, assignment_id,
@@ -111,13 +118,25 @@ const target = (c: Fixture, name: string): string => {
   return actorId;
 };
 
+/** The identity the ingress lane binds a claim to, for an actor `target` installed. */
+const ingressQuery = (turnRequestId: string, actorId: string, name: string, prompt: string): ReceiptLookupQuery => ({
+  turnRequestId,
+  targetActorId: actorId,
+  promptDigest: digestOf(prompt),
+  bindingGeneration: 1,
+  targetBindingId: `bind:${name}`,
+  targetAttestationId: `att:${name}`,
+  executorSessionId: `runtime:${name}`,
+  executorSessionIncarnation: "inc-1",
+});
+
 interface Admission {
   channel: "telegram" | "buzz";
   nonce: string;
   conversation: string | undefined;
   payload: Record<string, unknown>;
   /** The ingress claim the router writes before it materializes the turn, when there is one. */
-  claim?: { sessionDigest: string; legacySessionDigest?: string };
+  claim?: { sessionDigest: string; legacySessionDigest?: string } | undefined;
 }
 
 /** The two digests `TelegramIngress.turnIdentityFor` writes for a chat (project and thread elided). */
@@ -126,11 +145,12 @@ const telegramScope = (chat: string) => ({
   legacySessionDigest: digestOf({ channel: "telegram", conversation: chat }),
 });
 
+/** The payload `TelegramIngress` admits a message under: text, message id, chat and thread. */
 const telegramMessage = (nonce: string, chat: string, messageId: number): Admission => ({
   channel: "telegram",
   nonce,
   conversation: chat,
-  payload: { text: `message ${nonce}`, messageId },
+  payload: { text: `message ${nonce}`, messageId, chatId: chat, messageThreadId: null },
   claim: telegramScope(chat),
 });
 
@@ -142,8 +162,8 @@ const buzzMessage = (nonce: string, room: string): Admission => ({
   claim: { sessionDigest: digestOf({ channel: "buzz", conversation: room }) },
 });
 
-/** Admits through the production `IngressGuard.admit`, so the address is what ingress recorded. */
-const admit = (c: Fixture, message: Admission): void => {
+/** Admits through the production `IngressGuard.admit`, so the payload is what ingress recorded. */
+const admit = (c: Pick<Fixture, "db" | "clock" | "audit">, message: Admission): void => {
   // Telegram refuses to run without a chat allowlist; the other channels take the conversation as
   // the relay presents it, including none at all.
   const policy = message.conversation === undefined
@@ -168,11 +188,8 @@ const admit = (c: Fixture, message: Admission): void => {
   if (!claimed.allowed) throw new Error(`fixture could not claim ${message.nonce}: ${claimed.reasonCode}`);
 };
 
-const claimTurn = (c: Fixture, actorId: string, messages: readonly Admission[]): string =>
-  claimWithPermit(c, actorId, messages).turnRequestId;
-
-const claimWithPermit = (c: Fixture, actorId: string, messages: readonly Admission[]): TurnPermit => {
-  for (const message of messages) admit(c, message);
+const claimWithPermit = (c: Fixture, actorId: string, messages: readonly Admission[], admitFirst = true): TurnPermit => {
+  if (admitFirst) for (const message of messages) admit(c, message);
   const decision = c.coordinator.claim({
     targetActorId: actorId,
     prompt: "hello",
@@ -186,6 +203,9 @@ const claimWithPermit = (c: Fixture, actorId: string, messages: readonly Admissi
   if (!decision.allowed) throw new Error(`claim refused: ${decision.reasonCode} ${decision.message}`);
   return decision.value;
 };
+
+const claimTurn = (c: Fixture, actorId: string, messages: readonly Admission[]): string =>
+  claimWithPermit(c, actorId, messages).turnRequestId;
 
 /** The receipt the canonical turn's own row would match, with only the outcome chosen. */
 const receiptFor = (
@@ -219,6 +239,15 @@ const receiptFor = (
   };
 };
 
+const ingressReceipt = (query: ReceiptLookupQuery, outcome: "COMPLETED" | "ABORTED"): ReceiptLookupResult => ({
+  found: true,
+  outcome,
+  receiptId: `hermes:${query.turnRequestId}`,
+  evidenceDigest: `sha256:reply-${query.turnRequestId}`,
+  reasonCode: outcome === "COMPLETED" ? ReasonCode.OK : ReasonCode.HERMES_AGENT_RUN_EXCEPTION,
+  ...query,
+});
+
 const stateOf = (c: Fixture, turnRequestId: string) =>
   c.db.get<{ lifecycle_state: string; outcome_kind: string | null }>(
     `SELECT lifecycle_state, outcome_kind FROM canonical_turns WHERE turn_request_id = ?`,
@@ -231,10 +260,26 @@ const observationsOf = (c: Fixture, turnRequestId: string): number =>
     [turnRequestId],
   )!.n;
 
-const replyRows = (c: Fixture): number =>
+const replyRows = (c: Pick<Fixture, "db">): number =>
   c.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM inbound_messages WHERE channel = ?`, [
     OWNER_REPLY_OUTBOX_CHANNEL,
   ])!.n;
+
+const claimOf = (c: Pick<Fixture, "db">, channel: string, nonce: string): Record<string, unknown> =>
+  JSON.parse(c.db.get<{ turn_claim_json: string }>(
+    `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+    [channel, nonce],
+  )!.turn_claim_json) as Record<string, unknown>;
+
+/** Rewrites only the claim's chat alias, which the identity trigger does not freeze. */
+const rewriteChatAlias = (c: Pick<Fixture, "db">, channel: string, nonce: string, chat: string): void => {
+  const claim = claimOf(c, channel, nonce);
+  c.db.run(`UPDATE inbound_messages SET turn_claim_json = ? WHERE channel = ? AND nonce = ?`, [
+    JSON.stringify({ ...claim, legacySessionDigest: digestOf({ channel: "telegram", conversation: chat }) }),
+    channel,
+    nonce,
+  ]);
+};
 
 /** Makes the owner-reply insert itself fail, as a full disk or a refused write would. */
 const failTheReplyInsert = (c: Fixture): void => {
@@ -247,11 +292,58 @@ const failTheReplyInsert = (c: Fixture): void => {
   });
 };
 
+/**
+ * A Telegram ingress claim bound to a Hermes receipt identity, as the router writes it, plus the
+ * production reconcile wiring (`telegram-polling.ts`): the coordinator's settlement handed to the
+ * guard unchanged.
+ */
+const ingressLane = (c: Fixture, actorId: string, nonce: string, turnRequestId: string, chat = "chat-9") => {
+  const prompt = `prompt ${nonce}`;
+  const query = ingressQuery(turnRequestId, actorId, actorId.replace("actor:", ""), prompt);
+  const guard = new IngressGuard(
+    c.db,
+    c.clock,
+    c.audit,
+    { telegram: { allowedActors: ["owner"], allowedConversations: [chat] } },
+    { receiptIdentityForClaim: (identity) => ({ ...query, turnRequestId: identity.turnRequestId }) },
+  );
+  if (!c.db.get(`SELECT 1 FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`, [nonce])) {
+    const admitted = guard.admit({
+      channel: "telegram",
+      actor: "owner",
+      conversation: chat,
+      nonce,
+      payload: { text: prompt, messageId: 7, chatId: chat, messageThreadId: null },
+    });
+    if (!admitted.allowed) throw new Error(`fixture could not admit: ${admitted.reasonCode}`);
+  }
+  const identity: TurnIdentity = {
+    turnRequestId,
+    ...telegramScope(chat),
+    promptDigest: query.promptDigest,
+    bindingDigest: digestOf({ bindingGeneration: 1 }),
+  };
+  const claimed = guard.claimTurn("telegram", nonce, identity);
+  if (!claimed.allowed) throw new Error(`fixture could not claim: ${claimed.reasonCode}`);
+  const stored = guard.receiptIdentityForClaim("telegram", nonce);
+  if (!stored) throw new Error("fixture claim carries no receipt identity");
+  const reconcile = () => c.coordinator.reconcileIngressReceipt(
+    { channel: "telegram", nonce },
+    stored,
+    (settlement) => guard.completeClaimFromHermesReceipt(settlement),
+  );
+  const result = () => c.db.get<{ result_json: string | null }>(
+    `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+    [nonce],
+  )!.result_json;
+  return { guard, stored, reconcile, claim: () => claimOf(c, "telegram", nonce), result };
+};
+
 describe("a COMPLETED receipt on the canonical ledger", () => {
   it("settles the turn and stores one owner reply addressed to the Telegram message it answers", async () => {
     const port = new FakeReceiptPort();
     const c = withCoordinator(port);
-    const actorId = target(c, "telegram");
+    const actorId = target(c.db, "telegram");
     const turn = claimTurn(c, actorId, [telegramMessage("m1", "chat-9", 71), telegramMessage("m2", "chat-9", 72)]);
     port.answer(turn, receiptFor(c, turn, "COMPLETED"));
 
@@ -263,14 +355,8 @@ describe("a COMPLETED receipt on the canonical ledger", () => {
       turnRequestId: turn,
       ledger: "CANONICAL_TURN",
       targetActorId: actorId,
-      address: {
-        channel: "telegram",
-        sourceNonce: "m2",
-        conversation: null,
-        scopeDigest: telegramScope("chat-9").sessionDigest,
-        chatDigest: telegramScope("chat-9").legacySessionDigest,
-        replyToMessageId: 72,
-      },
+      sources: [{ channel: "telegram", nonce: "m1" }, { channel: "telegram", nonce: "m2" }],
+      address: { channel: "telegram", conversation: "chat-9", threadId: null, sourceNonce: "m2", replyToMessageId: 72 },
       receipt: {
         authority: "HERMES_TARGET",
         receiptId: `hermes:${turn}`,
@@ -283,25 +369,20 @@ describe("a COMPLETED receipt on the canonical ledger", () => {
     expect(pendingOwnerReplies(c.db).map((item) => item.turnRequestId)).toEqual([turn]);
   });
 
-  it("addresses a Buzz turn to the room its ingress row was admitted from", async () => {
+  it("addresses a Buzz turn to the room its signed envelope names", async () => {
     const port = new FakeReceiptPort();
     const c = withCoordinator(port);
-    const actorId = target(c, "buzz");
+    const actorId = target(c.db, "buzz");
     const turn = claimTurn(c, actorId, [buzzMessage("buzz-message:e1", "room-7")]);
     port.answer(turn, receiptFor(c, turn, "COMPLETED"));
 
     await c.coordinator.reconcileUnresolved();
 
-    const stored = c.db.get<{ payload_json: string }>(
-      `SELECT payload_json FROM inbound_messages WHERE channel = 'buzz' AND nonce = 'buzz-message:e1'`,
-    )!;
-    expect((JSON.parse(stored.payload_json) as { conversation: string }).conversation).toBe("room-7");
     expect(ownerReplyFor(c.db, turn)?.address).toEqual({
       channel: "buzz",
-      sourceNonce: "buzz-message:e1",
       conversation: "room-7",
-      scopeDigest: digestOf({ channel: "buzz", conversation: "room-7" }),
-      chatDigest: null,
+      threadId: null,
+      sourceNonce: "buzz-message:e1",
       replyToMessageId: null,
     });
   });
@@ -309,7 +390,7 @@ describe("a COMPLETED receipt on the canonical ledger", () => {
   it("rolls the settlement back when the reply insert fails, and completes once it can be written", async () => {
     const port = new FakeReceiptPort();
     const c = withCoordinator(port);
-    const actorId = target(c, "rollback");
+    const actorId = target(c.db, "rollback");
     const turn = claimTurn(c, actorId, [telegramMessage("m1", "chat-9", 71)]);
     port.answer(turn, receiptFor(c, turn, "COMPLETED"));
 
@@ -330,7 +411,7 @@ describe("a COMPLETED receipt on the canonical ledger", () => {
   it("leaves the turn unsettled when its messages do not name one conversation to answer", async () => {
     const port = new FakeReceiptPort();
     const c = withCoordinator(port);
-    const actorId = target(c, "split");
+    const actorId = target(c.db, "split");
     const split = claimTurn(c, actorId, [telegramMessage("m1", "chat-9", 71), telegramMessage("m2", "chat-10", 72)]);
     port.answer(split, receiptFor(c, split, "COMPLETED"));
 
@@ -342,13 +423,37 @@ describe("a COMPLETED receipt on the canonical ledger", () => {
     expect(replyRows(c)).toBe(0);
   });
 
-  it("leaves the turn unsettled when nothing durable names the conversation its message came from", async () => {
+  /**
+   * R1041-01: a claimed scope is not an address. Each row below carries the turn claim the router
+   * writes, so a reader that accepts the claim's digests in place of a destination settles them.
+   */
+  it.each<[string, Admission]>([
+    ["R1041-01 a Telegram message whose admitted payload names no chat", {
+      channel: "telegram",
+      nonce: "update:81",
+      conversation: "chat-9",
+      payload: { text: "no chat", messageId: 81 },
+      claim: { sessionDigest: telegramScope("chat-9").sessionDigest },
+    }],
+    ["R1041-01 a Buzz message whose envelope names no room", {
+      channel: "buzz",
+      nonce: "buzz-message:e9",
+      conversation: undefined,
+      payload: { type: "BUZZ_MESSAGE", addressedTo: "CEO", mention: null, text: "no room" },
+      claim: { sessionDigest: digestOf({ channel: "buzz", conversation: "room-7" }) },
+    }],
+    ["R1041-01 a Telegram message with no message id to reply to", {
+      channel: "telegram",
+      nonce: "update:82",
+      conversation: "chat-9",
+      payload: { text: "no message id", chatId: "chat-9", messageThreadId: null },
+      claim: telegramScope("chat-9"),
+    }],
+  ])("leaves the turn unsettled for %s", async (_name, message) => {
     const port = new FakeReceiptPort();
     const c = withCoordinator(port);
-    const actorId = target(c, "nowhere");
-    const turn = claimTurn(c, actorId, [
-      { channel: "buzz", nonce: "buzz-message:e9", conversation: undefined, payload: { text: "no room" } },
-    ]);
+    const actorId = target(c.db, "unaddressable");
+    const turn = claimTurn(c, actorId, [message]);
     port.answer(turn, receiptFor(c, turn, "COMPLETED"));
 
     const summary = await c.coordinator.reconcileUnresolved();
@@ -358,10 +463,25 @@ describe("a COMPLETED receipt on the canonical ledger", () => {
     expect(replyRows(c)).toBe(0);
   });
 
+  it("R1041-01 addresses the reply from the admitted payload, not from a rewritten chat alias", async () => {
+    const port = new FakeReceiptPort();
+    const c = withCoordinator(port);
+    const actorId = target(c.db, "alias");
+    const turn = claimTurn(c, actorId, [telegramMessage("m1", "chat-9", 71)]);
+    rewriteChatAlias(c, "telegram", "m1", "chat-10");
+    port.answer(turn, receiptFor(c, turn, "COMPLETED"));
+
+    await c.coordinator.reconcileUnresolved();
+
+    const item = ownerReplyFor(c.db, turn);
+    expect(item?.address).toMatchObject({ channel: "telegram", conversation: "chat-9", replyToMessageId: 71 });
+    expect(JSON.stringify(item)).not.toContain(digestOf({ channel: "telegram", conversation: "chat-10" }));
+  });
+
   it("stores one reply when two overlapping sweeps settle the same receipt", async () => {
     const port = new FakeReceiptPort();
     const c = withCoordinator(port);
-    const actorId = target(c, "overlap");
+    const actorId = target(c.db, "overlap");
     const turn = claimTurn(c, actorId, [telegramMessage("m1", "chat-9", 71)]);
     port.answer(turn, receiptFor(c, turn, "COMPLETED"));
     let release!: () => void;
@@ -382,7 +502,7 @@ describe("a COMPLETED receipt on the canonical ledger", () => {
   it("owes nothing new for a turn another settlement completed while the sweep was asking", async () => {
     const port = new FakeReceiptPort();
     const c = withCoordinator(port);
-    const actorId = target(c, "elsewhere");
+    const actorId = target(c.db, "elsewhere");
     const permit = claimWithPermit(c, actorId, [telegramMessage("m1", "chat-9", 71)]);
     const receipt = receiptFor(c, permit.turnRequestId, "COMPLETED");
     port.answer(permit.turnRequestId, receipt);
@@ -407,10 +527,124 @@ describe("a COMPLETED receipt on the canonical ledger", () => {
     expect(replyRows(c), "a redelivered receipt queued a reply for a turn it did not complete").toBe(0);
   });
 
+  it("R1041-02 completes a turn whose message ingress already answered without queueing a second reply", async () => {
+    const port = new FakeReceiptPort();
+    const c = withCoordinator(port);
+    const actorId = target(c.db, "answered");
+    const turn = claimTurn(c, actorId, [telegramMessage("m1", "chat-9", 71)]);
+    // The router's own reply lifecycle for the message: reserved, then accepted by Telegram, which
+    // writes `sent: true` and the claim's `repliedAt` together.
+    const guard = new IngressGuard(c.db, c.clock, c.audit, {
+      telegram: { allowedActors: ["owner"], allowedConversations: ["chat-9"] },
+    });
+    const reply = { chatId: "chat-9", text: "the CEO's answer", replyToMessageId: 71, correlationId: "corr-m1" };
+    const reserved = guard.recordResultIf("telegram", "m1", {
+      kind: "TELEGRAM_WORKFLOW", phase: "REPLIED", reply, sent: false, deliveryStatus: "PENDING", turnAnswered: true,
+    }, "AVAILABLE");
+    expect(reserved.allowed).toBe(true);
+    const delivered = guard.completeReplyAndResolveTurn("telegram", "m1", {
+      kind: "TELEGRAM_WORKFLOW", phase: "REPLIED", reply, sent: true, deliveryStatus: "APPLIED", turnAnswered: true,
+    }, "ANSWERED");
+    expect(delivered.allowed).toBe(true);
+    expect(claimOf(c, "telegram", "m1")).toHaveProperty("repliedAt");
+    port.answer(turn, receiptFor(c, turn, "COMPLETED"));
+
+    const summary = await c.coordinator.reconcileUnresolved();
+
+    expect(summary).toEqual({ swept: 1, settled: 1, unresolved: 0, failed: 0 });
+    expect(stateOf(c, turn)).toEqual({ lifecycle_state: "SETTLED", outcome_kind: "COMPLETED" });
+    expect(replyRows(c), "an answered message was owed a second reply").toBe(0);
+  });
+
+  it("R1041-02 owes nothing new for a message whose reply the transport already accepted", async () => {
+    const port = new FakeReceiptPort();
+    const c = withCoordinator(port);
+    const actorId = target(c.db, "replied");
+    const turn = claimTurn(c, actorId, [buzzMessage("buzz-message:e3", "room-7")]);
+    // The Buzz path's own record that ACP handed the turn a reply: `repliedAt`, and nothing else.
+    const guard = new IngressGuard(c.db, c.clock, c.audit, { buzz: { allowedActors: ["owner"] } });
+    expect(guard.resolveTurn("buzz", "buzz-message:e3").allowed).toBe(true);
+    port.answer(turn, receiptFor(c, turn, "COMPLETED"));
+
+    const summary = await c.coordinator.reconcileUnresolved();
+
+    expect(summary).toEqual({ swept: 1, settled: 1, unresolved: 0, failed: 0 });
+    expect(replyRows(c), "a message the transport already answered was owed a second reply").toBe(0);
+  });
+
+  it("R1041-02 owes nothing new while a CEO answer for the message is still in the transport's hands", async () => {
+    const port = new FakeReceiptPort();
+    const c = withCoordinator(port);
+    const actorId = target(c.db, "in-flight");
+    const turn = claimTurn(c, actorId, [telegramMessage("m1", "chat-9", 71)]);
+    // Reserved and not yet acknowledged: an ambiguous send is the ingress lifecycle's to finish,
+    // and a second copy queued beside it is how the owner gets the answer twice.
+    const guard = new IngressGuard(c.db, c.clock, c.audit, {
+      telegram: { allowedActors: ["owner"], allowedConversations: ["chat-9"] },
+    });
+    const reserved = guard.recordResultIf("telegram", "m1", {
+      kind: "TELEGRAM_WORKFLOW",
+      phase: "REPLIED",
+      reply: { chatId: "chat-9", text: "the CEO's answer", replyToMessageId: 71, correlationId: "corr-m1" },
+      sent: false,
+      deliveryStatus: "PENDING",
+      turnAnswered: true,
+    }, "AVAILABLE");
+    expect(reserved.allowed).toBe(true);
+    expect(claimOf(c, "telegram", "m1")).not.toHaveProperty("repliedAt");
+    port.answer(turn, receiptFor(c, turn, "COMPLETED"));
+
+    const summary = await c.coordinator.reconcileUnresolved();
+
+    expect(summary).toEqual({ swept: 1, settled: 1, unresolved: 0, failed: 0 });
+    expect(replyRows(c), "an answer still being sent was owed a second reply").toBe(0);
+  });
+
+  it("R1041-02 owes one reply when a canonical batch settles before an ingress claim on one of its messages", async () => {
+    const port = new FakeReceiptPort();
+    const c = withCoordinator(port);
+    const actorId = target(c.db, "overlap-batch");
+    const m1 = telegramMessage("update:91", "chat-9", 91);
+    const m2 = telegramMessage("update:92", "chat-9", 92);
+    for (const message of [m1, m2]) admit(c, { ...message, claim: undefined });
+    const lane = ingressLane(c, actorId, "update:91", "ingress-turn-91");
+    const canonical = claimWithPermit(c, actorId, [m1, m2], false).turnRequestId;
+    port.answer(canonical, receiptFor(c, canonical, "COMPLETED"));
+    port.answer("ingress-turn-91", ingressReceipt(lane.stored, "COMPLETED"));
+
+    await c.coordinator.reconcileUnresolved();
+    const ingress = await lane.reconcile();
+
+    expect(stateOf(c, canonical)).toEqual({ lifecycle_state: "SETTLED", outcome_kind: "COMPLETED" });
+    expect(ingress.allowed, ingress.allowed ? "" : `${ingress.reasonCode}: ${ingress.message}`).toBe(true);
+    expect(lane.claim()).toMatchObject({ settlement: "REPLY_OUTBOX" });
+    expect(pendingOwnerReplies(c.db).map((item) => item.turnRequestId)).toEqual([canonical]);
+  });
+
+  it("R1041-02 refuses a canonical batch that only partly overlaps a message an ingress claim already owes", async () => {
+    const port = new FakeReceiptPort();
+    const c = withCoordinator(port);
+    const actorId = target(c.db, "partial-batch");
+    const m1 = telegramMessage("update:93", "chat-9", 93);
+    const m2 = telegramMessage("update:94", "chat-9", 94);
+    for (const message of [m1, m2]) admit(c, { ...message, claim: undefined });
+    const lane = ingressLane(c, actorId, "update:93", "ingress-turn-93");
+    const canonical = claimWithPermit(c, actorId, [m1, m2], false).turnRequestId;
+    port.answer(canonical, receiptFor(c, canonical, "COMPLETED"));
+    port.answer("ingress-turn-93", ingressReceipt(lane.stored, "COMPLETED"));
+
+    expect((await lane.reconcile()).allowed).toBe(true);
+    const summary = await c.coordinator.reconcileUnresolved();
+
+    expect(summary).toMatchObject({ settled: 0, unresolved: 1 });
+    expect(stateOf(c, canonical)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
+    expect(pendingOwnerReplies(c.db).map((item) => item.turnRequestId)).toEqual(["ingress-turn-93"]);
+  });
+
   it("settles an ABORTED receipt exactly as before, with no reply owed", async () => {
     const port = new FakeReceiptPort();
     const c = withCoordinator(port);
-    const actorId = target(c, "aborted");
+    const actorId = target(c.db, "aborted");
     const turn = claimTurn(c, actorId, [telegramMessage("m1", "chat-9", 71)]);
     port.answer(turn, receiptFor(c, turn, "ABORTED"));
 
@@ -424,73 +658,19 @@ describe("a COMPLETED receipt on the canonical ledger", () => {
 });
 
 describe("a COMPLETED receipt on the Telegram ingress lane", () => {
-  const CHAT = "chat-9";
   const TURN = "ingress-turn-1";
+  const NONCE = "update:7";
 
-  /** A durable ingress claim bound to a Hermes receipt identity, as the Telegram router writes it. */
-  const ingressClaim = (port: FakeReceiptPort) => {
+  const setUp = () => {
+    const port = new FakeReceiptPort();
     const c = withCoordinator(port);
-    const actorId = target(c, "ingress");
-    const query: ReceiptLookupQuery = {
-      turnRequestId: TURN,
-      targetActorId: actorId,
-      promptDigest: digestOf("did Hermes finish?"),
-      bindingGeneration: 1,
-      targetBindingId: "bind:ingress",
-      targetAttestationId: "att:ingress",
-      executorSessionId: "runtime:ingress",
-      executorSessionIncarnation: "inc-1",
-    };
-    const guard = new IngressGuard(
-      c.db,
-      c.clock,
-      c.audit,
-      { telegram: { allowedActors: ["owner"], allowedConversations: [CHAT] } },
-      { receiptIdentityForClaim: (identity) => ({ ...query, turnRequestId: identity.turnRequestId }) },
-    );
-    const admitted = guard.admit({
-      channel: "telegram",
-      actor: "owner",
-      conversation: CHAT,
-      nonce: "update:7",
-      payload: { text: "did Hermes finish?", messageId: 7 },
-    });
-    if (!admitted.allowed) throw new Error(`fixture could not admit: ${admitted.reasonCode}`);
-    const identity: TurnIdentity = {
-      turnRequestId: TURN,
-      ...telegramScope(CHAT),
-      promptDigest: query.promptDigest,
-      bindingDigest: digestOf({ bindingGeneration: 1 }),
-    };
-    const claimed = guard.claimTurn("telegram", "update:7", identity);
-    if (!claimed.allowed) throw new Error(`fixture could not claim: ${claimed.reasonCode}`);
-    const stored = guard.receiptIdentityForClaim("telegram", "update:7");
-    if (!stored) throw new Error("fixture claim carries no receipt identity");
-    const reconcile = () => c.coordinator.reconcileIngressReceipt(
-      stored,
-      (receipt) => guard.completeClaimFromHermesReceipt("telegram", "update:7", stored, receipt),
-    );
-    const claim = () => JSON.parse(c.db.get<{ turn_claim_json: string }>(
-      `SELECT turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'update:7'`,
-    )!.turn_claim_json) as Record<string, unknown>;
-    const result = () => c.db.get<{ result_json: string | null }>(
-      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'update:7'`,
-    )!.result_json;
-    return { c, guard, stored, reconcile, claim, result };
+    const actorId = target(c.db, "ingress");
+    const lane = ingressLane(c, actorId, NONCE, TURN);
+    return { port, c, ...lane };
   };
 
-  const ingressReceipt = (query: ReceiptLookupQuery, outcome: "COMPLETED" | "ABORTED"): ReceiptLookupResult => ({
-    found: true,
-    outcome,
-    receiptId: "hermes:ingress-receipt",
-    evidenceDigest: "sha256:ingress-reply",
-    reasonCode: outcome === "COMPLETED" ? ReasonCode.OK : ReasonCode.HERMES_AGENT_RUN_EXCEPTION,
-    ...query,
-  });
-
   it("settles the ingress claim and stores one owner reply addressed to the owner's message", async () => {
-    const port = new FakeReceiptPort();
-    const { c, stored, reconcile, claim, result } = ingressClaim(port);
+    const { port, c, stored, reconcile, claim, result } = setUp();
     port.answer(TURN, ingressReceipt(stored, "COMPLETED"));
 
     const settled = await reconcile();
@@ -501,8 +681,8 @@ describe("a COMPLETED receipt on the Telegram ingress lane", () => {
       settlement: "REPLY_OUTBOX",
       hermesReceipt: {
         outcome: "COMPLETED",
-        receiptId: "hermes:ingress-receipt",
-        evidenceDigest: "sha256:ingress-reply",
+        receiptId: `hermes:${TURN}`,
+        evidenceDigest: `sha256:reply-${TURN}`,
         reasonCode: ReasonCode.OK,
       },
     });
@@ -512,22 +692,15 @@ describe("a COMPLETED receipt on the Telegram ingress lane", () => {
     expect(ownerReplyFor(c.db, TURN)).toMatchObject({
       ledger: "INGRESS_CLAIM",
       targetActorId: stored.targetActorId,
-      address: {
-        channel: "telegram",
-        sourceNonce: "update:7",
-        conversation: null,
-        scopeDigest: telegramScope(CHAT).sessionDigest,
-        chatDigest: telegramScope(CHAT).legacySessionDigest,
-        replyToMessageId: 7,
-      },
-      receipt: { receiptId: "hermes:ingress-receipt", evidenceDigest: "sha256:ingress-reply" },
+      sources: [{ channel: "telegram", nonce: NONCE }],
+      address: { channel: "telegram", conversation: "chat-9", threadId: null, sourceNonce: NONCE, replyToMessageId: 7 },
+      receipt: { receiptId: `hermes:${TURN}`, evidenceDigest: `sha256:reply-${TURN}` },
       status: "PENDING",
     });
   });
 
   it("adds nothing when the same receipt settles the claim again", async () => {
-    const port = new FakeReceiptPort();
-    const { c, stored, reconcile } = ingressClaim(port);
+    const { port, c, stored, reconcile } = setUp();
     port.answer(TURN, ingressReceipt(stored, "COMPLETED"));
 
     const first = await reconcile();
@@ -539,8 +712,7 @@ describe("a COMPLETED receipt on the Telegram ingress lane", () => {
   });
 
   it("rolls the ingress settlement back when the reply insert fails", async () => {
-    const port = new FakeReceiptPort();
-    const { c, stored, reconcile, claim, result } = ingressClaim(port);
+    const { port, c, stored, reconcile, claim, result } = setUp();
     port.answer(TURN, ingressReceipt(stored, "COMPLETED"));
     const resultBefore = result();
 
@@ -557,60 +729,114 @@ describe("a COMPLETED receipt on the Telegram ingress lane", () => {
     expect(replyRows(c)).toBe(1);
   });
 
-  it("refuses, and rolls back, a settlement that records completion without its reply", async () => {
-    const port = new FakeReceiptPort();
-    const { c, stored, claim } = ingressClaim(port);
+  it("R1041-01 addresses the reply from the admitted payload, not from a rewritten chat alias", async () => {
+    const { port, c, stored, reconcile } = setUp();
+    rewriteChatAlias(c, "telegram", NONCE, "chat-10");
     port.answer(TURN, ingressReceipt(stored, "COMPLETED"));
 
-    const settled = await c.coordinator.reconcileIngressReceipt(stored, () => {
-      c.db.run(
-        `UPDATE inbound_messages SET result_json = ? WHERE channel = 'telegram' AND nonce = 'update:7'`,
-        [JSON.stringify({ kind: "TELEGRAM_REPLY_OUTBOX" })],
-      );
-      return { allowed: true, reasonCode: ReasonCode.OK, evidence: {}, value: undefined };
+    expect((await reconcile()).allowed).toBe(true);
+
+    const item = ownerReplyFor(c.db, TURN);
+    expect(item?.address).toMatchObject({ channel: "telegram", conversation: "chat-9", replyToMessageId: 7 });
+    expect(JSON.stringify(item)).not.toContain(digestOf({ channel: "telegram", conversation: "chat-10" }));
+  });
+
+  it("R1041-03 refuses a caller-built receipt handed straight to the guard", () => {
+    const { c, guard, stored, claim } = setUp();
+    // The pre-review signature, called as a caller holding the guard would: no lookup ran.
+    const settle = guard.completeClaimFromHermesReceipt as unknown as (...args: unknown[]) => Decision<void>;
+    const forged = settle.call(guard, "telegram", NONCE, stored, {
+      outcome: "COMPLETED",
+      receiptId: "forged-receipt",
+      evidenceDigest: "sha256:forged",
+      reasonCode: ReasonCode.OK,
     });
 
-    expect(settled).toMatchObject({ allowed: false });
+    expect(forged.allowed).toBe(false);
     expect(claim()).not.toHaveProperty("settledAt");
-    expect(c.db.get<{ result_json: string | null }>(
-      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'update:7'`,
-    )!.result_json).toBeNull();
+    expect(claim()).not.toHaveProperty("hermesReceipt");
     expect(replyRows(c)).toBe(0);
   });
 
-  it("refuses a settlement whose queued reply names a different receipt than the one matched", async () => {
-    const port = new FakeReceiptPort();
-    const { c, stored, claim } = ingressClaim(port);
-    port.answer(TURN, ingressReceipt(stored, "COMPLETED"));
+  it("R1041-03 refuses a settlement shaped like the coordinator's but built by a caller", () => {
+    const { c, guard, stored, claim } = setUp();
+    const shaped: IngressReceiptSettlement = {
+      channel: "telegram",
+      nonce: NONCE,
+      query: stored,
+      receipt: { outcome: "COMPLETED", receiptId: "shaped", evidenceDigest: "sha256:shaped", reasonCode: ReasonCode.OK },
+    };
 
-    for (const wrong of [{ receiptId: "hermes:another-receipt" }, { evidenceDigest: "sha256:another-reply" }]) {
-      const settled = await c.coordinator.reconcileIngressReceipt(stored, (receipt) => {
-        const queued = enqueueOwnerReply(c.db, c.clock, {
+    expect(guard.completeClaimFromHermesReceipt(shaped).allowed).toBe(false);
+    expect(claim()).not.toHaveProperty("settledAt");
+    expect(replyRows(c)).toBe(0);
+  });
+
+  it("R1041-03 commits nothing when the callback queues a reply without settling the claim", async () => {
+    const { port, c, stored, claim } = setUp();
+    port.answer(TURN, ingressReceipt(stored, "COMPLETED"));
+    // The pre-review enqueue signature, called from inside the callback's transaction.
+    const enqueue = enqueueOwnerReply as unknown as (...args: unknown[]) => unknown;
+
+    const settled = await c.coordinator.reconcileIngressReceipt({ channel: "telegram", nonce: NONCE }, stored, () => {
+      try {
+        enqueue(c.db, c.clock, {
           turnRequestId: TURN,
           ledger: "INGRESS_CLAIM",
           targetActorId: stored.targetActorId,
-          sources: [{ channel: "telegram", nonce: "update:7" }],
-          receipt: {
-            authority: "HERMES_TARGET",
-            receiptId: receipt.receiptId,
-            evidenceDigest: receipt.evidenceDigest,
-            reasonCode: receipt.reasonCode,
-            ...wrong,
-          },
+          sources: [{ channel: "telegram", nonce: NONCE }],
+          receipt: { authority: "HERMES_TARGET", receiptId: `hermes:${TURN}`, evidenceDigest: `sha256:reply-${TURN}`, reasonCode: ReasonCode.OK },
         });
-        if (!queued.allowed) throw new Error(`fixture could not queue: ${queued.reasonCode}`);
-        return { allowed: true, reasonCode: ReasonCode.OK, evidence: {}, value: undefined };
-      });
+      } catch { /* refused: only the coordinator holds the owner-reply authority */ }
+      return { allowed: true, reasonCode: ReasonCode.OK, evidence: {}, value: undefined };
+    });
 
-      expect(settled, JSON.stringify(wrong)).toMatchObject({ allowed: false, reasonCode: ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN });
-      expect(replyRows(c), JSON.stringify(wrong)).toBe(0);
-    }
+    expect(settled.allowed).toBe(false);
     expect(claim()).not.toHaveProperty("settledAt");
+    expect(replyRows(c), "a reply was committed beside an unsettled claim").toBe(0);
+  });
+
+  it("refuses a callback that settles the claim by a different receipt than the one verified", async () => {
+    const { port, c, stored, claim } = setUp();
+    port.answer(TURN, ingressReceipt(stored, "COMPLETED"));
+
+    const settled = await c.coordinator.reconcileIngressReceipt({ channel: "telegram", nonce: NONCE }, stored, () => {
+      c.db.run(`UPDATE inbound_messages SET turn_claim_json = ? WHERE channel = 'telegram' AND nonce = ?`, [
+        JSON.stringify({
+          ...claim(),
+          settledAt: NOW,
+          settlement: "REPLY_OUTBOX",
+          hermesReceipt: { outcome: "COMPLETED", receiptId: "another", evidenceDigest: "sha256:another", reasonCode: ReasonCode.OK },
+        }),
+        NONCE,
+      ]);
+      return { allowed: true, reasonCode: ReasonCode.OK, evidence: {}, value: undefined };
+    });
+
+    expect(settled).toMatchObject({ allowed: false, reasonCode: ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN });
+    expect(claim()).not.toHaveProperty("settledAt");
+    expect(replyRows(c)).toBe(0);
+  });
+
+  it("spends the settlement: one captured from the callback settles nothing afterwards", async () => {
+    const { port, c, guard, stored, claim } = setUp();
+    port.answer(TURN, ingressReceipt(stored, "COMPLETED"));
+    let captured: IngressReceiptSettlement | null = null;
+
+    const refused = await c.coordinator.reconcileIngressReceipt({ channel: "telegram", nonce: NONCE }, stored, (settlement) => {
+      captured = settlement;
+      return { allowed: false, reasonCode: ReasonCode.CONFLICT, evidence: {}, message: "declined" };
+    });
+    expect(refused.allowed).toBe(false);
+    if (captured === null) throw new Error("the callback was never handed a settlement");
+
+    expect(guard.completeClaimFromHermesReceipt(captured).allowed).toBe(false);
+    expect(claim()).not.toHaveProperty("settledAt");
+    expect(replyRows(c)).toBe(0);
   });
 
   it("settles an ABORTED receipt exactly as before, with no reply owed", async () => {
-    const port = new FakeReceiptPort();
-    const { c, stored, reconcile, claim, result } = ingressClaim(port);
+    const { port, c, stored, reconcile, claim, result } = setUp();
     port.answer(TURN, ingressReceipt(stored, "ABORTED"));
 
     const settled = await reconcile();
@@ -619,8 +845,8 @@ describe("a COMPLETED receipt on the Telegram ingress lane", () => {
     expect(claim()).toMatchObject({
       noReplyAt: NOW,
       hermesReceipt: {
-        receiptId: "hermes:ingress-receipt",
-        evidenceDigest: "sha256:ingress-reply",
+        receiptId: `hermes:${TURN}`,
+        evidenceDigest: `sha256:reply-${TURN}`,
         reasonCode: ReasonCode.HERMES_AGENT_RUN_EXCEPTION,
       },
     });
@@ -631,69 +857,99 @@ describe("a COMPLETED receipt on the Telegram ingress lane", () => {
 });
 
 describe("the owner-reply lane", () => {
-  it("refuses a second turn's reply to an ingress message another turn already answers", () => {
-    const c = withCoordinator(new FakeReceiptPort());
-    admit(c, telegramMessage("m1", "chat-9", 71));
-    const receipt = {
-      authority: "HERMES_TARGET" as const,
-      receiptId: "r-1",
-      evidenceDigest: "sha256:r-1",
-      reasonCode: ReasonCode.OK,
-    };
-    const enqueue = (turnRequestId: string) => c.db.tx(() => enqueueOwnerReply(c.db, c.clock, {
-      turnRequestId,
-      ledger: "CANONICAL_TURN",
-      targetActorId: "actor:x",
-      sources: [{ channel: "telegram", nonce: "m1" }],
-      receipt,
-    }));
+  /** A database whose owner-reply authority the test holds, with no coordinator claiming it first. */
+  const withLane = () => {
+    const db = openDb(join(stateDir(), "state.sqlite"));
+    const clock = new ManualClock(NOW);
+    const audit = new AuditLog(db, clock);
+    return { db, clock, audit, authority: claimOwnerReplyAuthority(db) };
+  };
+  const receipt = {
+    authority: "HERMES_TARGET" as const,
+    receiptId: "r-1",
+    evidenceDigest: "sha256:r-1",
+    reasonCode: ReasonCode.OK,
+  };
+  const enqueueAs = (
+    lane: ReturnType<typeof withLane>,
+    authority: OwnerReplyAuthority,
+    turnRequestId: string,
+    nonces: readonly string[],
+    overrides: Partial<typeof receipt> = {},
+  ) => lane.db.tx(() => enqueueOwnerReply(authority, lane.db, lane.clock, {
+    turnRequestId,
+    ledger: "CANONICAL_TURN",
+    targetActorId: "actor:x",
+    sources: nonces.map((nonce) => ({ channel: "telegram", nonce })),
+    receipt: { ...receipt, ...overrides },
+  }));
 
-    expect(enqueue("tr_first").allowed).toBe(true);
-    expect(enqueue("tr_first")).toMatchObject({ allowed: true, value: { replayed: true } });
-    expect(enqueue("tr_second")).toMatchObject({
-      allowed: false,
-      reasonCode: ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT,
-    });
-    expect(c.db.tx(() => enqueueOwnerReply(c.db, c.clock, {
-      turnRequestId: "tr_first",
-      ledger: "CANONICAL_TURN",
-      targetActorId: "actor:x",
-      sources: [{ channel: "telegram", nonce: "m1" }],
-      receipt: { ...receipt, evidenceDigest: "sha256:a-different-reply" },
-    }))).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT });
-    expect(replyRows(c)).toBe(1);
-    expect(ownerReplyFor(c.db, "tr_first")?.receipt.evidenceDigest).toBe("sha256:r-1");
+  it("answers each owner message once: a redelivery is a no-op, a covered message owes nothing new, a partial overlap is refused", () => {
+    const lane = withLane();
+    admit(lane, telegramMessage("m1", "chat-9", 71));
+    admit(lane, telegramMessage("m2", "chat-9", 72));
+
+    expect(enqueueAs(lane, lane.authority, "tr_first", ["m1"])).toMatchObject({ allowed: true, value: { status: "ENQUEUED" } });
+    expect(enqueueAs(lane, lane.authority, "tr_first", ["m1"])).toMatchObject({ allowed: true, value: { status: "REDELIVERED" } });
+    expect(enqueueAs(lane, lane.authority, "tr_first", ["m1"], { evidenceDigest: "sha256:a-different-reply" }))
+      .toMatchObject({ allowed: false, reasonCode: ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT });
+    expect(enqueueAs(lane, lane.authority, "tr_second", ["m1"])).toMatchObject({ allowed: true, value: { status: "ALREADY_ANSWERED" } });
+    expect(enqueueAs(lane, lane.authority, "tr_third", ["m1", "m2"]))
+      .toMatchObject({ allowed: false, reasonCode: ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT });
+    expect(replyRows(lane)).toBe(1);
+    expect(ownerReplyFor(lane.db, "tr_first")?.receipt.evidenceDigest).toBe("sha256:r-1");
   });
 
-  it("refuses a turn whose messages arrived on two channels, even under one claimed scope", () => {
-    const c = withCoordinator(new FakeReceiptPort());
-    const scope = { sessionDigest: "sha256:one-scope" };
-    admit(c, { ...telegramMessage("m1", "chat-9", 71), claim: scope });
-    admit(c, { channel: "buzz", nonce: "buzz-message:e1", conversation: undefined, payload: { text: "e1" }, claim: scope });
+  it("refuses a turn whose messages arrived on two channels", () => {
+    const lane = withLane();
+    admit(lane, telegramMessage("m1", "chat-9", 71));
+    admit(lane, buzzMessage("buzz-message:e1", "chat-9"));
 
-    const enqueued = c.db.tx(() => enqueueOwnerReply(c.db, c.clock, {
+    const enqueued = lane.db.tx(() => enqueueOwnerReply(lane.authority, lane.db, lane.clock, {
       turnRequestId: "tr_two_channels",
       ledger: "CANONICAL_TURN",
       targetActorId: "actor:x",
       sources: [{ channel: "telegram", nonce: "m1" }, { channel: "buzz", nonce: "buzz-message:e1" }],
-      receipt: { authority: "HERMES_TARGET", receiptId: "r", evidenceDigest: "sha256:r", reasonCode: ReasonCode.OK },
+      receipt,
     }));
 
     expect(enqueued).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONVERSATION_TURN_REPLY_UNADDRESSABLE });
-    expect(replyRows(c)).toBe(0);
+    expect(replyRows(lane)).toBe(0);
+  });
+
+  it("refuses a payload that is not the one ingress admitted", () => {
+    const lane = withLane();
+    lane.db.run(
+      `INSERT INTO inbound_messages (channel, nonce, actor, received_at, payload_json) VALUES ('telegram', 'raw', 'owner', ?, ?)`,
+      [NOW, JSON.stringify({ text: "never admitted", messageId: 5, chatId: "chat-elsewhere", messageThreadId: null })],
+    );
+
+    expect(enqueueAs(lane, lane.authority, "tr_raw", ["raw"]))
+      .toMatchObject({ allowed: false, reasonCode: ReasonCode.CONVERSATION_TURN_REPLY_UNADDRESSABLE });
+    expect(replyRows(lane)).toBe(0);
   });
 
   it("refuses to enqueue outside the transaction that settles the turn", () => {
-    const c = withCoordinator(new FakeReceiptPort());
-    admit(c, telegramMessage("m1", "chat-9", 71));
+    const lane = withLane();
+    admit(lane, telegramMessage("m1", "chat-9", 71));
 
-    expect(() => enqueueOwnerReply(c.db, c.clock, {
+    expect(() => enqueueOwnerReply(lane.authority, lane.db, lane.clock, {
       turnRequestId: "tr_outside",
       ledger: "CANONICAL_TURN",
       targetActorId: "actor:x",
       sources: [{ channel: "telegram", nonce: "m1" }],
-      receipt: { authority: "HERMES_TARGET", receiptId: "r", evidenceDigest: "sha256:r", reasonCode: ReasonCode.OK },
+      receipt,
     })).toThrow(/inside the transaction that settles its turn/);
-    expect(replyRows(c)).toBe(0);
+    expect(replyRows(lane)).toBe(0);
+  });
+
+  it("refuses a caller that does not hold this database's owner-reply authority, and issues it once", () => {
+    const lane = withLane();
+    admit(lane, telegramMessage("m1", "chat-9", 71));
+    const imitation = Object.freeze({ ownerReplyAuthorityFor: lane.db.identity });
+
+    expect(() => enqueueAs(lane, imitation, "tr_imitation", ["m1"])).toThrow(/owner-reply authority/);
+    expect(() => claimOwnerReplyAuthority(lane.db)).toThrow(/already issued/);
+    expect(replyRows(lane)).toBe(0);
   });
 });
