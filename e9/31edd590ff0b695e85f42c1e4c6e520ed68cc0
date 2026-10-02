@@ -1,0 +1,41 @@
+Limit: A project's CTO binding and provider capacity are availability, not authority: a blocking finding in the system doctor report parks or ends the daemon before the claim socket and cto.mcp.sock open, so in the system report they are non-blocking ERRORs (DEGRADED) while a project-scoped report still blocks on its own CTO
+Limit: Unknown capacity stays unknown: a READY incumbent whose provider has no reading keeps its binding only while its recorded pid and start token still match; the role stays unresolved as CAPACITY_UNKNOWN_NOT_ROUTABLE and routing still refuses new work, so only binding revocation and failover are withheld
+Ruled-out: admitting the availability findings to canParkForBootstrap | a parked daemon serves only the bootstrap door, so the claim socket and cto.mcp.sock would stay shut all the same
+Ruled-out: keeping CRITICAL severity on the non-blocking variants | PRD 25.5 maps a non-blocking ERROR to DEGRADED and has no rule for a non-blocking CRITICAL, which would read HEALTHY
+Warn: This deliberately reverses the earlier warning that a measured NO_VALID_COVERAGE must raise the blocking CRITICAL, and the dead-CTO test that required CTO_MISSING_WITH_OPEN_RUNS to stop startup; the owner directive is that capacity and another project's CTO are never a precondition for authentication or connection. Integrity findings (STATE_PATH_INSECURE, CANONICAL_TURN_CONTRADICTED, trusted-gate credentials) still block
+Warn: ACP_STARTUP_TEST_PARK now parks on a seeded contradicted canonical turn; no-quota no longer parks, so a test that needs a parked daemon must stand on a real blocker
+Record-Id: r-b80d167e40b2
+Follows: r-coveragesayswhatitcouldnotmeasure
+Follows: r-81a03d8188e0
+Provenance: inherited 14609f8a79fe24579ac3249c8018de3f37d144d3
+
+Limit: A falsifiability row names at most one test in killedBy: the harness runs vitest -t, which takes one pattern, and refuses a row that names two before it runs anything
+Record-Id: r-5a6353cf0ecc
+Follows: r-b80d167e40b2
+Provenance: inherited f37d013bb04b3fb359171bc221a0e0df923bd3e1
+
+Limit: The indefinite keep through an unread provider rests only on the exact native start token the session recorded; an incumbent recorded by ps lstart text, or with no token, takes the coverage hold and is revoked when it ends, and the CTO launch and continuity provisioning paths record lstart text by default
+Limit: The CTO findings relax only in the system report, decided by the report scope: every project and cto report, with or without a target, still blocks on CTO_BINDING_POINTS_AT_DEAD_SESSION and CTO_MISSING_WITH_OPEN_RUNS
+Ruled-out: reusing recordedProcessIsRunning for the keep | its lstart branch compares whole-second text and a native start truncated to the createdAt millisecond, so a replacement that took the pid later in that millisecond passes it
+Ruled-out: applying the exact-token comparison to the coverage hold as well | the hold ends, and the stricter test there would revoke every lstart-recorded incumbent at once
+Record-Id: r-c0b1bb5c3338
+Follows: r-b80d167e40b2
+Follows: r-364403fc103a
+Provenance: inherited eebb2e0817311b3ef201f2c85e1b7047b78f615a
+
+Limit: A legacy row that recorded only ps lstart is kept through an unread provider only when the live native start, truncated to the second, is the recorded lstart second and the row was written after that second ended; a row written inside its process's own start second is ambiguous and takes the coverage hold instead
+Limit: The native start pin is the first SESSION_NATIVE_START_PINNED audit event for the session, because a dedicated column needs a migration and the migration list is frozen; CTO launch and continuity provisioning pin at creation, and the legacy rule pins when it decides, after which every pass compares the pin exactly
+Ruled-out: rewriting sessions.os_process_started_at to the native token at CTO launch and continuity provisioning | probeSessionLiveness, the dead-binding recovery door and the delegated binding's liveness check compare that column as ps lstart and would then call a live CTO dead; the token is pinned beside it instead
+Warn: lstart is parsed in the daemon's local time zone, the zone ps renders it in; a daemon whose TZ differs from the one that wrote a row reads that row's second shifted by the offset and refuses to keep it
+Warn: SessionRegistry.pinnedNativeStart and pinNativeStart repeat #1046's methods with the same audit kind, evidence key and bodies; when #1046 merges, keep one copy (tsc reports the duplicate members)
+Record-Id: r-61dce8af405d
+Follows: r-c0b1bb5c3338
+Provenance: inherited 1ee2363c726416c4eab3ff95264d6901b36e55df
+
+Limit: CTO launch and continuity provisioning pin a native token only from one (native, lstart, native) snapshot: both native reads must agree and the token must fall in the lstart's second, and the row records the lstart read between them; otherwise nothing is pinned and the keep decides the row by the legacy lstart rule
+Limit: The keep compares a pin only for a live process that started in the recorded lstart second, so a pin that contradicts its row is refused however it was written
+Ruled-out: rendering the row's lstart from the native token instead of reading it from ps | probeSessionLiveness and the dead-binding readers compare the column with ps output as a string, so a rendering that differed in any detail would call a live process dead
+Warn: Registration cannot see a runtime that exited and lost its pid before the first read; every read then describes the successor consistently, as create() alone always has
+Record-Id: r-ba65e9633b59
+Follows: r-61dce8af405d
+Provenance: inherited f61d9b279052ec3592418724bddae3b60dfe823b
