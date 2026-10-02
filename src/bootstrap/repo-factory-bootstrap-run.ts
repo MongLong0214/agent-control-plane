@@ -13,9 +13,20 @@ import type { HandoffPackage } from "../cto/cto-lifecycle.ts";
 import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../ceo/owner-authority.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { ACPBootstrapActivationResult, BootstrapActivation } from "./activation.ts";
-import type { GitHubWritePort } from "./github-write-port.ts";
-import { preflightGitHubOperations, type GitHubWriteAuthority } from "./repo-factory-github.ts";
-import { produceRepoFactoryResult, repoFactoryPlanFixtureSchema } from "./repo-factory-producer.ts";
+import { parseGitHubIdentity, type GitHubWritePort } from "./github-write-port.ts";
+import {
+  githubOperationSchema,
+  preflightGitHubOperations,
+  producedResultPath,
+  readProducedResult,
+  type GitHubOperation,
+  type GitHubWriteAuthority,
+} from "./repo-factory-github.ts";
+import {
+  produceRepoFactoryResult,
+  verificationKindRunning,
+  type RepoFactoryPlanFixture,
+} from "./repo-factory-producer.ts";
 import { parseRepoFactoryResult, type RepoFactoryResult } from "./repo-factory-result.ts";
 
 /**
@@ -43,16 +54,32 @@ import { parseRepoFactoryResult, type RepoFactoryResult } from "./repo-factory-r
  * consumption on a retry, so a partial failure can resume without a second approval and the
  * approval cannot be carried to a different candidate.
  *
+ * What is executed. The approved PLAN artifact's own operations, desired state included, rather
+ * than an executable plan a caller supplies, which the reviewed head checked only by its digest
+ * and operation identities while executing whatever desired state it carried. The owner's approval binds that artifact's digest and its
+ * operations in full, so a protection weakened after approval is a different digest and a
+ * different approval, not the same one executing different parameters (PR #1043 review,
+ * RF1043-01). Every other field the producer needs is derived from the artifact and the approved
+ * manifest: the repository role from the manifest's one repository, the default branch from the
+ * push the plan makes, and the verification from the manifest's one command — which must be the
+ * invocation the producer actually runs, because a PASS recorded under a command id is a claim
+ * that command ran (RF1043-03). A manifest the producer cannot honestly evidence — any other
+ * command, or any required CI workflow — is refused before the first write, not found by
+ * activation after it. The CTO's `plan_submit` tool still accepts operation identities only;
+ * until it carries desired state, a PLAN submitted through it is refused here as not executable.
+ *
  * Everything that can be refused is refused before the first GitHub call: run kind and state,
- * the activation preconditions a result cannot change, the executable plan against the approved
- * PLAN artifact, the manifest against both, the approval, and the producer's own pure
- * preflight. A refusal here has made no GitHub read or write.
+ * the activation preconditions a result cannot change, the PLAN artifact, the manifest against
+ * it, the approval, and the producer's own pure preflight. A refusal here has made no GitHub
+ * read or write.
  *
  * A produced result is retained (REPO_FACTORY_RESULT) before activation is attempted. Activation
  * of a fresh bootstrap normally stops once — the incoming CTO has not yet acknowledged its
  * handoff — and the second call must activate the result already produced rather than produce
  * again: the producer's checkout now exists, and a second production would be refused as a
- * collision.
+ * collision. A result produced but never stored — the store failed, or the process died after
+ * the producer returned — is rebuilt from the copy the producer keeps beside its ledger
+ * (RF1043-02), and activation re-validates it like any other.
  *
  * Who calls this is not decided here. No transport invokes it — as none invokes `activate` — and
  * no ingress path mints a receipt for `REPO_FACTORY_GITHUB_WRITE_OPERATION` yet; until both exist,
@@ -70,31 +97,25 @@ export const repoFactoryGitHubWriteParameters = (input: {
   owner: string;
   visibility: "public" | "private";
   planDigest: string;
-  githubOperations: ReadonlyArray<{ operationId: string; resourceType: string; resourceIdentity: string }>;
+  /** The PLAN artifact's operations in full — desired state included, not just their identities. */
+  githubOperations: readonly GitHubOperation[];
 }): Record<string, unknown> => ({
   owner: input.owner,
   visibility: input.visibility,
   planDigest: input.planDigest,
-  githubOperations: input.githubOperations.map((operation) => ({
-    operationId: operation.operationId,
-    resourceType: operation.resourceType,
-    resourceIdentity: operation.resourceIdentity,
-  })),
+  githubOperations: input.githubOperations,
 });
 
-/** The approved PLAN artifact's shape, as `BootstrapActivation` already requires it. */
+/** The approved PLAN artifact's provenance, as `BootstrapActivation` already requires it. */
 const approvedPlanSchema = z.object({
   bootstrapOperationId: z.string().min(1),
   requestDigest: z.string().min(1),
   projectManifestDigest: z.string().min(1),
-  githubOperations: z.array(
-    z.object({
-      operationId: z.string().min(1),
-      resourceType: z.string().min(1),
-      resourceIdentity: z.string().min(1),
-    }),
-  ),
+  githubOperations: z.array(z.unknown()),
 });
+
+/** Its operations as this producer executes them: each with the state it asks for. */
+const executableOperationsSchema = z.array(githubOperationSchema).min(1);
 
 const ownerApprovalReceiptSchema = z
   .object({
@@ -122,8 +143,6 @@ export interface RepoFactoryOwnerApproval {
 
 export interface ProduceAndActivateInput {
   runId: string;
-  /** The executable plan: the approved PLAN artifact's operations, each with its desired state. */
-  plan: unknown;
   ownerApproval: RepoFactoryOwnerApproval | null;
   approvedManifest: ProjectManifest;
   projectName: string;
@@ -191,56 +210,99 @@ export class RepoFactoryBootstrapRunner {
       return this.activate(input, parsed.value);
     }
 
-    const fixture = repoFactoryPlanFixtureSchema.safeParse(input.plan);
-    if (!fixture.success) {
-      return refuse(ReasonCode.INVALID_ARGUMENT, "PLAN_INVALID", "the executable plan failed validation", {
-        issues: fixture.error.issues.map((i) => ({ path: i.path.join("."), message: i.message })),
-      });
-    }
-    const executable = fixture.data;
-
-    // The executable plan is the approved PLAN artifact with each operation's desired state
-    // filled in. Every identity field must be the approved one; the operations themselves are
-    // compared by `preflightGitHubOperations` below against the artifact's own triples.
-    const planMismatch = (field: string, approved: string, planned: string): Decision<ACPBootstrapActivationResult> =>
-      refuse(
-        ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
-        "PLAN_MISMATCH",
-        `the executable plan's ${field} is not the approved PLAN artifact's`,
-        { field, approved, planned },
-      );
-    if (executable.runId !== runId) return planMismatch("runId", runId, executable.runId);
-    if (executable.planDigest !== planArtifact.digest) {
-      return planMismatch("planDigest", planArtifact.digest, executable.planDigest);
-    }
-    if (executable.bootstrapOperationId !== plan.bootstrapOperationId) {
-      return planMismatch("bootstrapOperationId", plan.bootstrapOperationId, executable.bootstrapOperationId);
-    }
-    if (executable.requestDigest !== plan.requestDigest) {
-      return planMismatch("requestDigest", plan.requestDigest, executable.requestDigest);
-    }
-    if (executable.projectManifestDigest !== plan.projectManifestDigest) {
-      return planMismatch("projectManifestDigest", plan.projectManifestDigest, executable.projectManifestDigest);
-    }
-    if (executable.githubOperations.length === 0) {
-      // A local-only result names its repository `local:<role>`, which no portable manifest
-      // remote can equal; producing one here would write a checkout activation must refuse.
+    // What executes is the artifact's own operations (RF1043-01). An artifact that names its
+    // operations without the state each asks for approved nothing that could be executed.
+    const executableOperations = executableOperationsSchema.safeParse(plan.githubOperations);
+    if (!executableOperations.success) {
       return refuse(
         ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
-        "GITHUB_PLAN_REQUIRED",
-        "an activatable bootstrap names a GitHub repository; this plan has no GitHub operation",
+        "PLAN_NOT_EXECUTABLE",
+        "the approved PLAN artifact's GitHub operations do not carry the state each asks for, so there is nothing approved to execute",
+        { issues: executableOperations.error.issues.map((i) => ({ path: i.path.join("."), message: i.message })) },
       );
     }
+    const operations = executableOperations.data;
 
     const manifestMismatch = (message: string, evidence: Evidence): Decision<ACPBootstrapActivationResult> =>
       refuse(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT, "MANIFEST_MISMATCH", message, evidence);
-    const approvedManifestDigest = manifestDigest(input.approvedManifest);
+    const manifest = input.approvedManifest;
+    const approvedManifestDigest = manifestDigest(manifest);
     if (approvedManifestDigest !== plan.projectManifestDigest) {
       return manifestMismatch("the manifest supplied is not the one the PLAN artifact approved", {
         supplied: approvedManifestDigest,
         approved: plan.projectManifestDigest,
       });
     }
+    const declared = manifest.repositories[0];
+    if (manifest.repositories.length !== 1) {
+      return manifestMismatch("this producer creates exactly one repository and the manifest declares a different count", {
+        declared: manifest.repositories.length,
+      });
+    }
+    if (declared === undefined) return manifestMismatch("the manifest declares no repository", {});
+
+    // RF1043-03 — a PASS is recorded under a manifest command id, so it must be the command the
+    // producer runs. Anything else the manifest requires would be missing or misreported, and
+    // activation would find that only after the repository already existed.
+    const unsupported = (message: string, evidence: Evidence): Decision<ACPBootstrapActivationResult> =>
+      refuse(ReasonCode.VERIFICATION_GAP, "UNSUPPORTED_VERIFICATION", message, evidence);
+    if (manifest.ciWorkflows.length > 0) {
+      return unsupported("the manifest requires CI evidence, and this producer produces none", {
+        ciWorkflows: manifest.ciWorkflows.map((workflow) => workflow.checkName),
+      });
+    }
+    const command = manifest.verificationCommands[0];
+    if (manifest.verificationCommands.length !== 1) {
+      return unsupported("this producer runs exactly one verification, and the manifest requires a different count", {
+        commands: manifest.verificationCommands.map((candidate) => candidate.id),
+      });
+    }
+    if (command === undefined) return unsupported("the manifest requires no verification command", {});
+    const verificationKind = verificationKindRunning(command.argv);
+    if (verificationKind === null) {
+      return unsupported(`the manifest's command ${command.id} is not an invocation this producer runs`, {
+        commandId: command.id,
+        argv: command.argv,
+      });
+    }
+    if (command.cwd !== ".") {
+      return unsupported(`the manifest runs ${command.id} outside the repository root, where this producer runs it`, {
+        commandId: command.id,
+        cwd: command.cwd,
+      });
+    }
+    if (command.repositoryRole !== declared.role) {
+      return unsupported(`the manifest runs ${command.id} in another repository`, { commandId: command.id });
+    }
+    if (command.evidenceMode !== "LOCAL_COMMAND") {
+      return unsupported(`the manifest requires ${command.id} as ${command.evidenceMode} evidence, and this producer records a local run`, {
+        commandId: command.id,
+        evidenceMode: command.evidenceMode,
+      });
+    }
+
+    const push = operations.find((operation) => operation.resourceType === "branch");
+    const pushed = push === undefined ? null : parseGitHubIdentity(push.resourceIdentity);
+    const defaultBranch = pushed === null ? null : pushed.ref;
+    if (defaultBranch === null) {
+      return refuse(
+        ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
+        "PLAN_NOT_EXECUTABLE",
+        "the approved PLAN artifact pushes no branch, so a produced repository would have no verified head",
+      );
+    }
+    const executable: RepoFactoryPlanFixture = {
+      runId,
+      bootstrapOperationId: plan.bootstrapOperationId,
+      requestDigest: plan.requestDigest,
+      planDigest: planArtifact.digest,
+      projectManifestDigest: plan.projectManifestDigest,
+      repositoryRole: declared.role,
+      defaultBranch,
+      verificationCommandId: command.id,
+      verificationKind,
+      githubOperations: operations,
+    };
 
     if (input.ownerApproval === null) {
       return refuse(
@@ -254,41 +316,20 @@ export class RepoFactoryBootstrapRunner {
     const authority: GitHubWriteAuthority = {
       owner: input.ownerApproval.owner,
       visibility: input.ownerApproval.visibility,
-      approvedOperations: plan.githubOperations,
+      approvedOperations: operations.map(({ operationId, resourceType, resourceIdentity }) => ({
+        operationId,
+        resourceType,
+        resourceIdentity,
+      })),
     };
     // The producer's own pure preflight, run here so a plan it would refuse never consumes the
     // owner's approval. It runs again inside the producer; that second run is a no-op check.
     const execution = preflightGitHubOperations(executable, authority);
     if (!execution.allowed) return atStage(execution as Decision<ACPBootstrapActivationResult>, "precondition");
-
-    // Activation matches the result to the manifest by role and identity, and requires every
-    // required command's verification. Either mismatch would be found only after the writes.
-    const repositories = input.approvedManifest.repositories;
-    const declared = repositories.find((repository) => repository.role === executable.repositoryRole);
-    if (repositories.length !== 1) {
-      return manifestMismatch("this producer creates exactly one repository and the manifest declares a different count", {
-        declared: repositories.length,
-      });
-    }
-    if (declared === undefined) {
-      return manifestMismatch("the manifest declares no repository for the plan's role", {
-        role: executable.repositoryRole,
-      });
-    }
     if (declared.remote !== execution.value.repositoryIdentity) {
       return manifestMismatch("the manifest's remote is not the repository the plan creates", {
         manifestRemote: declared.remote,
         planned: execution.value.repositoryIdentity,
-      });
-    }
-    const unverifiable = input.approvedManifest.verificationCommands
-      .filter((command) => command.required)
-      .filter((command) => command.id !== executable.verificationCommandId)
-      .map((command) => command.id);
-    if (unverifiable.length > 0) {
-      return manifestMismatch("the manifest requires verification the plan does not produce", {
-        unverifiable,
-        produced: executable.verificationCommandId,
       });
     }
 
@@ -303,18 +344,28 @@ export class RepoFactoryBootstrapRunner {
     if (!PATH_SAFE_RUN_ID.test(runId)) {
       return refuse(ReasonCode.INVALID_ARGUMENT, "RUN_ID_NOT_PATH_SAFE", "the run id cannot name a work directory");
     }
+    const workDir = join(workRoot, runId);
+    const owner = { bootstrapOperationId: plan.bootstrapOperationId, requestDigest: plan.requestDigest };
+
+    // RF1043-02 — produced earlier and lost before it was stored: rebuilt, not produced again.
+    const kept = readProducedResult(producedResultPath(workDir, declared.role), owner);
+    if (!kept.allowed) return atStage(kept as Decision<ACPBootstrapActivationResult>, "production");
+    if (kept.value !== null) {
+      this.deps.artifacts.put(runId, ArtifactKind.REPO_FACTORY_RESULT, kept.value);
+      return this.activate(input, kept.value);
+    }
 
     const approval = this.admitApproval(runId, input.ownerApproval.receipt, {
       owner: authority.owner,
       visibility: authority.visibility,
       planDigest: planArtifact.digest,
-      githubOperations: plan.githubOperations,
+      githubOperations: operations,
     });
     if (!approval.allowed) return atStage(approval as Decision<ACPBootstrapActivationResult>, "approval");
 
     const produced = await produceRepoFactoryResult({
       plan: executable,
-      workDir: join(workRoot, runId),
+      workDir,
       clock: this.deps.clock,
       github: { port: this.deps.githubPort, authority },
     });

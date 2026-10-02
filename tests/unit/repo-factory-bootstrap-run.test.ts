@@ -38,6 +38,9 @@ import { testReviewerEgressEvidence } from "../helpers/production-adapter.ts";
  * every harness test) and GitHub, which is the bare-repository double in
  * `tests/helpers/fake-github-write-port.ts`. Every refusal asserts the double logged no write and
  * no read: a refusal that happened after a GitHub call is the defect this path exists to avoid.
+ *
+ * The operations executed are the approved PLAN artifact's own, desired state included; no caller
+ * supplies an executable plan (PR #1043 review, RF1043-01).
  */
 
 afterAll(cleanupTempDirs);
@@ -74,6 +77,14 @@ const HANDOFF: HandoffPackage = {
 
 const IDENTITY = "github:acme/fixture";
 
+const APPROVED_PROTECTION = {
+  requiredStatusChecks: { strict: true, contexts: ["project-ci"] },
+  enforceAdmins: true,
+  requiredApprovingReviewCount: 1,
+  allowForcePushes: false,
+  allowDeletions: false,
+};
+
 const operations = () => [
   {
     operationId: "create-repository:fixture",
@@ -92,18 +103,34 @@ const operations = () => [
     operationId: "protect-default-branch:fixture",
     resourceType: "branch-protection" as const,
     resourceIdentity: `${IDENTITY}#main`,
-    desiredState: {
-      requiredStatusChecks: ["project-ci"],
-      enforceAdmins: true,
-      requiredApprovingReviewCount: null,
-      allowForcePushes: false,
-      allowDeletions: false,
-    },
+    desiredState: APPROVED_PROTECTION,
   },
 ];
 
-const triples = (ops: ReturnType<typeof operations>) =>
-  ops.map(({ operationId, resourceType, resourceIdentity }) => ({ operationId, resourceType, resourceIdentity }));
+type Operation = ReturnType<typeof operations>[number];
+
+/** The one verification this producer can honestly run, declared as a manifest command. */
+const CLEAN_TREE_COMMAND = {
+  id: "clean-tree",
+  argv: ["git", "status", "--porcelain"],
+  repositoryRole: "primary",
+  cwd: ".",
+  timeoutSeconds: 120,
+  envAllowlist: [],
+  network: "deny" as const,
+  networkAllowlist: [],
+  required: true as const,
+  evidenceMode: "LOCAL_COMMAND" as const,
+  maxOutputBytes: 1_048_576,
+  maxMemoryMb: 2048,
+};
+
+const cleanTreeManifest = (projectId: string, overrides: Parameters<typeof fixtureManifest>[1] = {}) =>
+  fixtureManifest(projectId, {
+    verificationCommands: [CLEAN_TREE_COMMAND],
+    verificationProfiles: { simple: ["clean-tree"], standard: ["clean-tree"], guarded: ["clean-tree"] },
+    ...overrides,
+  });
 
 /** The blind-reviewed candidate a bootstrap run reaches CEO review with (as in ops-r2). */
 const recordBootstrapBlindReview = (harness: Harness, runId: string): string => {
@@ -176,13 +203,23 @@ interface Prepared {
   github: FakeGitHub;
   runner: RepoFactoryBootstrapRunner;
   workRoot: string;
+  ops: Operation[];
   planDigest: string;
   snapshotDigest: string;
   input: ProduceAndActivateInput;
 }
 
+type ArtifactsPort = ConstructorParameters<typeof RepoFactoryBootstrapRunner>[0]["artifacts"];
+
 /** A PROJECT_BOOTSTRAP run at CEO review with an approved PLAN, and a runner wired to a double. */
-const prepare = async (projectId: string): Promise<Prepared> => {
+const prepare = async (
+  projectId: string,
+  options: {
+    ops?: Operation[];
+    manifest?: ReturnType<typeof fixtureManifest>;
+    artifacts?: (real: ArtifactsPort) => ArtifactsPort;
+  } = {},
+): Promise<Prepared> => {
   const harness = makeHarness();
   const created = harness.cp.runs.create({
     kind: RunKind.PROJECT_BOOTSTRAP,
@@ -200,21 +237,21 @@ const prepare = async (projectId: string): Promise<Prepared> => {
   const snapshotDigest = recordBootstrapBlindReview(harness, runId);
   harness.cp.runs.transition(runId, RunState.READY_FOR_CEO_REVIEW, "reviewed");
 
-  const manifest = fixtureManifest(projectId);
-  const approvedPlan = {
+  const manifest = options.manifest ?? cleanTreeManifest(projectId);
+  const ops = options.ops ?? operations();
+  const planArtifact = harness.cp.artifacts.put(runId, "PLAN", {
     bootstrapOperationId: "op-bootstrap",
     requestDigest: digestOf({ request: "bootstrap" }),
     projectManifestDigest: manifestDigest(manifest),
-    githubOperations: triples(operations()),
-  };
-  const planArtifact = harness.cp.artifacts.put(runId, "PLAN", approvedPlan);
+    githubOperations: ops,
+  });
 
   const workRoot = mkdtempSync(join(tmpdir(), "acp-246-run-"));
   roots.push(workRoot);
   const github = new FakeGitHub(workRoot);
   const runner = new RepoFactoryBootstrapRunner({
     runs: harness.cp.runs,
-    artifacts: harness.cp.artifacts,
+    artifacts: options.artifacts ? options.artifacts(harness.cp.artifacts) : harness.cp.artifacts,
     ownerAuthority: harness.cp.ownerAuthority,
     bootstrap: harness.cp.bootstrap,
     githubPort: github,
@@ -223,24 +260,12 @@ const prepare = async (projectId: string): Promise<Prepared> => {
   });
   const input: ProduceAndActivateInput = {
     runId,
-    plan: {
-      runId,
-      bootstrapOperationId: approvedPlan.bootstrapOperationId,
-      requestDigest: approvedPlan.requestDigest,
-      planDigest: planArtifact.digest,
-      projectManifestDigest: approvedPlan.projectManifestDigest,
-      repositoryRole: "primary",
-      defaultBranch: "main",
-      verificationCommandId: "verify",
-      verificationKind: "CLEAN_TREE",
-      githubOperations: operations(),
-    },
     ownerApproval: null,
     approvedManifest: manifest,
     projectName: projectId,
     handoff: HANDOFF,
   };
-  return { harness, runId, github, runner, workRoot, planDigest: planArtifact.digest, snapshotDigest, input };
+  return { harness, runId, github, runner, workRoot, ops, planDigest: planArtifact.digest, snapshotDigest, input };
 };
 
 /**
@@ -248,15 +273,15 @@ const prepare = async (projectId: string): Promise<Prepared> => {
  * for this run's current candidate, over exactly the parameters named.
  */
 const ownerApproval = (
-  prepared: Prepared,
-  overrides: { visibility?: "public" | "private"; approved?: boolean; operations?: ReturnType<typeof triples> } = {},
+  prepared: Pick<Prepared, "harness" | "runId" | "planDigest" | "ops">,
+  overrides: { visibility?: "public" | "private"; approved?: boolean; operations?: Operation[] } = {},
 ): NonNullable<ProduceAndActivateInput["ownerApproval"]> => {
   const { harness, runId } = prepared;
   const parameters = repoFactoryGitHubWriteParameters({
     owner: "acme",
     visibility: overrides.visibility ?? "public",
     planDigest: prepared.planDigest,
-    githubOperations: overrides.operations ?? triples(operations()),
+    githubOperations: overrides.operations ?? prepared.ops,
   });
   const approved = overrides.approved ?? true;
   const guard = new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, {
@@ -285,6 +310,40 @@ const noGitHubCall = (prepared: Prepared): void => {
   expect(prepared.harness.cp.artifacts.latest(prepared.runId, "REPO_FACTORY_RESULT")).toBeNull();
 };
 
+/**
+ * The executable plan the reviewed head (afd93586) took from its caller, in that head's
+ * protection vocabulary. The witnesses below pass it so each one reproduces its finding there;
+ * the corrected runner has no such input and executes the PLAN artifact instead.
+ */
+const reviewedHeadPlan = (
+  prepared: Prepared,
+  overrides: { verificationCommandId?: string; protection?: Record<string, unknown> } = {},
+) => ({
+  runId: prepared.runId,
+  bootstrapOperationId: "op-bootstrap",
+  requestDigest: digestOf({ request: "bootstrap" }),
+  planDigest: prepared.planDigest,
+  projectManifestDigest: manifestDigest(prepared.input.approvedManifest),
+  repositoryRole: "primary",
+  defaultBranch: "main",
+  verificationCommandId: overrides.verificationCommandId ?? "clean-tree",
+  verificationKind: "CLEAN_TREE",
+  githubOperations: prepared.ops.map((operation) =>
+    operation.resourceType === "branch-protection"
+      ? {
+          ...operation,
+          desiredState: overrides.protection ?? {
+            ...APPROVED_PROTECTION,
+            requiredStatusChecks: APPROVED_PROTECTION.requiredStatusChecks.contexts,
+          },
+        }
+      : operation,
+  ),
+});
+
+const withReviewedHeadPlan = (input: ProduceAndActivateInput, plan: object): ProduceAndActivateInput =>
+  ({ ...input, plan }) as ProduceAndActivateInput;
+
 describe("PROJECT_BOOTSTRAP run path: produce, then activate (#246)", () => {
   it("activates the result the producer wrote to GitHub, and a second call activates it again rather than producing again", async () => {
     const prepared = await prepare("produced-activation");
@@ -302,6 +361,8 @@ describe("PROJECT_BOOTSTRAP run path: produce, then activate (#246)", () => {
       "setDefaultBranch",
       "protectBranch",
     ]);
+    // The protection GitHub holds is the one the approved PLAN artifact names.
+    expect(github.repository("acme", "fixture")?.protections.get("main")).toEqual(APPROVED_PROTECTION);
     const retained = harness.cp.artifacts.latest<{ repositories: Array<{ identity: string }> }>(runId, "REPO_FACTORY_RESULT");
     expect(retained?.content.repositories.map((repository) => repository.identity)).toEqual([IDENTITY]);
 
@@ -386,86 +447,73 @@ describe("PROJECT_BOOTSTRAP run path: produce, then activate (#246)", () => {
       noGitHubCall(prepared);
     });
 
-    it("refuses an approval the owner gave for a different set of operations", async () => {
-      const prepared = await prepare("approved-fewer");
+    it("refuses an approval the owner gave for different operation parameters", async () => {
+      const prepared = await prepare("approved-weaker");
+      const weaker = prepared.ops.map((operation) =>
+        operation.resourceType === "branch-protection"
+          ? { ...operation, desiredState: { ...APPROVED_PROTECTION, allowForcePushes: true } }
+          : operation,
+      );
       const refused = await prepared.runner.produceAndActivate({
         ...prepared.input,
-        ownerApproval: ownerApproval(prepared, { operations: triples(operations()).slice(0, 2) }),
+        ownerApproval: ownerApproval(prepared, { operations: weaker }),
       });
       expect(refused.allowed).toBe(false);
       expect(refused.evidence["refusal"]).toBe("APPROVAL_MISMATCH");
       noGitHubCall(prepared);
     });
 
-    it("refuses an executable plan carrying an operation the approved PLAN artifact does not, and leaves the approval unconsumed", async () => {
-      const prepared = await prepare("plan-adds-operation");
+    it("refuses when the PLAN artifact was replaced after the owner approved it — the approval names the digest it saw", async () => {
+      const prepared = await prepare("plan-replaced");
       const approval = ownerApproval(prepared);
-      const plan = prepared.input.plan as { githubOperations: unknown[] };
-      const refused = await prepared.runner.produceAndActivate({
-        ...prepared.input,
-        plan: {
-          ...plan,
-          githubOperations: [
-            ...plan.githubOperations,
-            {
-              operationId: "protect-release-branch:fixture",
-              resourceType: "branch-protection",
-              resourceIdentity: `${IDENTITY}#release`,
-              desiredState: operations()[3]!.desiredState,
-            },
-          ],
-        },
-        ownerApproval: approval,
+      prepared.harness.cp.artifacts.put(prepared.runId, "PLAN", {
+        bootstrapOperationId: "op-bootstrap",
+        requestDigest: digestOf({ request: "bootstrap" }),
+        projectManifestDigest: manifestDigest(prepared.input.approvedManifest),
+        githubOperations: prepared.ops.map((operation) =>
+          operation.resourceType === "branch-protection"
+            ? { ...operation, desiredState: { ...APPROVED_PROTECTION, allowForcePushes: true, allowDeletions: true } }
+            : operation,
+        ),
       });
+      const refused = await prepared.runner.produceAndActivate({ ...prepared.input, ownerApproval: approval });
       expect(refused.allowed).toBe(false);
-      expect(refused.reasonCode).toBe(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT);
-      expect(refused.evidence["refusal"]).toBe("OPERATION_NOT_IN_PLAN");
+      expect(refused.evidence["refusal"]).toBe("APPROVAL_MISMATCH");
       noGitHubCall(prepared);
-      const candidate = prepared.harness.cp.runs.currentCandidate(prepared.runId) ?? "";
-      expect(
-        prepared.harness.cp.ownerAuthority.assertConsumedApproval(
-          approval.receipt as Parameters<typeof prepared.harness.cp.ownerAuthority.assertConsumedApproval>[0],
-          candidate,
-        ).allowed,
-      ).toBe(false);
     });
 
-    it("refuses an executable plan whose plan digest is not the approved PLAN artifact's", async () => {
-      const prepared = await prepare("plan-digest");
-      const refused = await prepared.runner.produceAndActivate({
-        ...prepared.input,
-        plan: { ...(prepared.input.plan as object), planDigest: "sha256:" + "f".repeat(64) },
-        ownerApproval: ownerApproval(prepared),
+    it("refuses a PLAN artifact whose operations carry no desired state — there is nothing approved to execute", async () => {
+      const prepared = await prepare("plan-triples-only", {
+        ops: operations().map(({ operationId, resourceType, resourceIdentity }) => ({
+          operationId,
+          resourceType,
+          resourceIdentity,
+        })) as unknown as Operation[],
       });
+      const refused = await prepared.runner.produceAndActivate({ ...prepared.input, ownerApproval: ownerApproval(prepared) });
       expect(refused.allowed).toBe(false);
-      expect(refused.evidence["refusal"]).toBe("PLAN_MISMATCH");
-      expect(refused.evidence["field"]).toBe("planDigest");
+      expect(refused.evidence["refusal"]).toBe("PLAN_NOT_EXECUTABLE");
+      noGitHubCall(prepared);
+    });
+
+    it("refuses a manifest that wants its one command as CI evidence, which a local run cannot be", async () => {
+      const manifest = cleanTreeManifest("trusted-ci", {
+        verificationCommands: [{ ...CLEAN_TREE_COMMAND, evidenceMode: "TRUSTED_CI" as const }],
+      });
+      const prepared = await prepare("trusted-ci", { manifest });
+      const refused = await prepared.runner.produceAndActivate({ ...prepared.input, ownerApproval: ownerApproval(prepared) });
+      expect(refused.allowed).toBe(false);
+      expect(refused.evidence["refusal"]).toBe("UNSUPPORTED_VERIFICATION");
+      expect(refused.evidence["evidenceMode"]).toBe("TRUSTED_CI");
       noGitHubCall(prepared);
     });
 
     it("refuses a manifest whose remote is not the repository the plan creates", async () => {
-      const prepared = await prepare("manifest-remote");
-      const manifest = fixtureManifest("manifest-remote", {
+      const manifest = cleanTreeManifest("manifest-remote", {
         repositories: [{ role: "primary", remote: "github:acme/other", manifestRoot: "." }],
       });
-      // The PLAN artifact approved this manifest, so only the remote disagrees.
-      prepared.harness.cp.artifacts.put(prepared.runId, "PLAN", {
-        bootstrapOperationId: "op-bootstrap",
-        requestDigest: digestOf({ request: "bootstrap" }),
-        projectManifestDigest: manifestDigest(manifest),
-        githubOperations: triples(operations()),
-      });
-      const planDigest = prepared.harness.cp.artifacts.latest(prepared.runId, "PLAN")?.digest ?? "";
-      const refused = await prepared.runner.produceAndActivate({
-        ...prepared.input,
-        plan: {
-          ...(prepared.input.plan as object),
-          planDigest,
-          projectManifestDigest: manifestDigest(manifest),
-        },
-        approvedManifest: manifest,
-        ownerApproval: ownerApproval({ ...prepared, planDigest }),
-      });
+      const prepared = await prepare("manifest-remote", { manifest });
+      const refused = await prepared.runner.produceAndActivate({ ...prepared.input, ownerApproval: ownerApproval(prepared) });
       expect(refused.allowed).toBe(false);
       expect(refused.evidence["refusal"]).toBe("MANIFEST_MISMATCH");
       noGitHubCall(prepared);
@@ -523,5 +571,83 @@ describe("PROJECT_BOOTSTRAP run path: produce, then activate (#246)", () => {
     expect(refused.reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
     expect(refused.evidence["stage"]).toBe("precondition");
     noGitHubCall(prepared);
+  });
+});
+
+/**
+ * PR #1043 review witnesses. Each reproduces its finding against the reviewed head (afd93586),
+ * where it fails, and is kept as that finding's regression guard.
+ */
+describe("PR #1043 review witnesses — the run path", () => {
+  it("RF1043-01: executes the protection the approved PLAN artifact holds, never a weaker one a caller supplies under the same digest", async () => {
+    const prepared = await prepare("rf1043-01");
+    const weakened = reviewedHeadPlan(prepared, {
+      protection: {
+        requiredStatusChecks: [],
+        enforceAdmins: false,
+        requiredApprovingReviewCount: null,
+        allowForcePushes: true,
+        allowDeletions: true,
+      },
+    });
+    await prepared.runner.produceAndActivate(
+      withReviewedHeadPlan({ ...prepared.input, ownerApproval: ownerApproval(prepared) }, weakened),
+    );
+    expect(prepared.github.repository("acme", "fixture")?.protections.get("main")).toEqual(APPROVED_PROTECTION);
+  });
+
+  it("RF1043-03: refuses, before any GitHub call, a manifest command this producer would not run (`node verify.js`)", async () => {
+    const prepared = await prepare("rf1043-03-command", { manifest: fixtureManifest("rf1043-03-command") });
+    const refused = await prepared.runner.produceAndActivate(
+      withReviewedHeadPlan(
+        { ...prepared.input, ownerApproval: ownerApproval(prepared) },
+        reviewedHeadPlan(prepared, { verificationCommandId: "verify" }),
+      ),
+    );
+    expect(refused.allowed).toBe(false);
+    expect(refused.evidence["refusal"]).toBe("UNSUPPORTED_VERIFICATION");
+    noGitHubCall(prepared);
+  });
+
+  it("RF1043-03: refuses, before any GitHub call, a manifest requiring CI evidence this producer never produces", async () => {
+    const manifest = cleanTreeManifest("rf1043-03-ci", {
+      ciWorkflows: [{
+        path: ".github/workflows/ci.yml",
+        checkName: "project-ci",
+        repositoryRole: "primary",
+        approvedDigest: null,
+        unapprovedFirstActivation: true,
+      }],
+    });
+    const prepared = await prepare("rf1043-03-ci", { manifest });
+    const refused = await prepared.runner.produceAndActivate(
+      withReviewedHeadPlan({ ...prepared.input, ownerApproval: ownerApproval(prepared) }, reviewedHeadPlan(prepared)),
+    );
+    expect(refused.allowed).toBe(false);
+    expect(refused.evidence["refusal"]).toBe("UNSUPPORTED_VERIFICATION");
+    noGitHubCall(prepared);
+  });
+
+  it("RF1043-02: a result produced but not stored is reconstructed on retry, not refused at its own checkout", async () => {
+    let failOnce = true;
+    const prepared = await prepare("rf1043-02-result", {
+      artifacts: (real) => ({
+        latest: (...args: Parameters<ArtifactsPort["latest"]>) => real.latest(...args),
+        put: (...args: Parameters<ArtifactsPort["put"]>) => {
+          if (args[1] === "REPO_FACTORY_RESULT" && failOnce) {
+            failOnce = false;
+            throw new Error("database is locked");
+          }
+          return real.put(...args);
+        },
+      }) as ArtifactsPort,
+    });
+    const input = withReviewedHeadPlan({ ...prepared.input, ownerApproval: ownerApproval(prepared) }, reviewedHeadPlan(prepared));
+    await expect(prepared.runner.produceAndActivate(input)).rejects.toThrow(/database is locked/);
+
+    prepared.github.writes.length = 0;
+    const retry = await prepared.runner.produceAndActivate(input);
+    expect(retry.evidence["stage"]).toBe("activation");
+    expect(prepared.github.writes).toEqual([]);
   });
 });

@@ -47,7 +47,7 @@ afterEach(async () => {
 
 const IDENTITY = "github:acme/fixture";
 const PROTECTION: Protection = {
-  requiredStatusChecks: ["project-ci"],
+  requiredStatusChecks: { strict: true, contexts: ["project-ci"] },
   enforceAdmins: true,
   requiredApprovingReviewCount: null,
   allowForcePushes: false,
@@ -373,8 +373,9 @@ describe("repo factory producer performs planned GitHub operations (#246)", () =
       expect(produced.reasonCode).toBe(ReasonCode.RESOURCE_COLLISION);
       expect(evidenceOf(produced).refusal).toBe("WRONG_TARGET");
       expect(evidenceOf(produced).observedNodeId).toBe(foreign.nodeId);
+      // No write of ours was ever pending, so this is not an indeterminate outcome: it is foreign.
+      expect(evidenceOf(produced).indeterminate).toBeUndefined();
       expect(github.writes).toEqual([]);
-      expect(existsSync(ledgerPath(workDir))).toBe(false);
     });
 
     it("refuses to resume onto a repository whose name was reused after our receipt — node id differs — and writes nothing", async () => {
@@ -454,10 +455,8 @@ describe("repo factory producer performs planned GitHub operations (#246)", () =
 
     it("a readback that disagrees with what was asked is a failure, not a receipt", async () => {
       const { workDir, github } = makeSandbox();
-      const original = github.protectBranch.bind(github);
       // The write call returns, and GitHub keeps something weaker than was requested.
-      github.protectBranch = async (target, branch, desired) =>
-        original(target, branch, { ...desired, enforceAdmins: false });
+      github.keepProtection = (requested) => ({ ...(requested as Protection), enforceAdmins: false });
       const produced = await produce(workDir, github);
       expect(produced.allowed).toBe(false);
       expect(evidenceOf(produced).refusal).toBe("REREAD_MISMATCH");
@@ -527,5 +526,222 @@ describe("repo factory producer performs planned GitHub operations (#246)", () =
     expect(produced.reasonCode).toBe(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT);
     expect(produced.allowed ? "" : produced.message).toMatch(/GitHub write port/);
     expect(existsSync(repositoryCheckoutPath(workDir, "primary"))).toBe(false);
+  });
+});
+
+/**
+ * PR #1043 review witnesses (RF1043-02). A write that reached GitHub and whose answer — or the
+ * read after it, or the ledger line recording it — was lost must not leave the operation unable
+ * to resume, nor make it write again. These use a plan without branch protection so the same
+ * cases run unchanged against the reviewed head (afd93586), where each of them fails.
+ */
+describe("PR #1043 review witnesses — a write GitHub accepted is recoverable after its answer is lost", () => {
+  const threeOperations = () => operations().filter((operation) => operation.resourceType !== "branch-protection");
+  const threeOperationPlan = () => githubPlan(threeOperations());
+  const threeOperationAuthority = () => authority({ approvedOperations: approvedTriples(threeOperations()) });
+  const attempt = (workDir: string, github: FakeGitHub, at: string) =>
+    produce(workDir, github, { plan: threeOperationPlan(), authority: threeOperationAuthority(), at });
+
+  it("a create whose read-back failed is adopted on retry by the node id GitHub returned, not refused as someone else's", async () => {
+    const { workDir, github } = makeSandbox();
+    github.failAfter = { method: "createRepository", mode: "readback" };
+    const first = await attempt(workDir, github, "2026-10-02T00:00:00.000Z");
+    expect(first.allowed).toBe(false);
+    const created = github.repository("acme", "fixture");
+    if (!created) throw new Error("the create did not reach the double");
+
+    github.writes.length = 0;
+    const retry = await attempt(workDir, github, "2026-10-02T00:05:00.000Z");
+    if (!retry.allowed) throw new Error(`${retry.reasonCode}: ${retry.message} ${JSON.stringify(retry.evidence)}`);
+    expect(github.writes.map((write) => write.method)).not.toContain("createRepository");
+    expect(github.repository("acme", "fixture")?.nodeId).toBe(created.nodeId);
+  });
+
+  it("a create whose own response was lost is adopted on retry by the marker it carried, not refused as someone else's", async () => {
+    const { workDir, github } = makeSandbox();
+    github.failAfter = { method: "createRepository", mode: "response" };
+    const first = await attempt(workDir, github, "2026-10-02T00:00:00.000Z");
+    expect(first.allowed).toBe(false);
+    const created = github.repository("acme", "fixture");
+    if (!created) throw new Error("the create did not reach the double");
+
+    github.writes.length = 0;
+    const retry = await attempt(workDir, github, "2026-10-02T00:05:00.000Z");
+    if (!retry.allowed) throw new Error(`${retry.reasonCode}: ${retry.message} ${JSON.stringify(retry.evidence)}`);
+    expect(github.writes.map((write) => write.method)).not.toContain("createRepository");
+    expect(github.repository("acme", "fixture")?.nodeId).toBe(created.nodeId);
+  });
+
+  it("a push whose read-back failed is adopted on retry by the commit it pushed, not refused as an unreceipted branch", async () => {
+    const { workDir, github } = makeSandbox();
+    github.failAfter = { method: "pushBranch", mode: "readback" };
+    const first = await attempt(workDir, github, "2026-10-02T00:00:00.000Z");
+    expect(first.allowed).toBe(false);
+    const remote = github.repository("acme", "fixture");
+    if (!remote) throw new Error("no repository");
+    const pushed = (await git(remote.bare, ["rev-parse", "refs/heads/main"])).stdout.trim();
+
+    github.writes.length = 0;
+    const retry = await attempt(workDir, github, "2026-10-02T00:05:00.000Z");
+    if (!retry.allowed) throw new Error(`${retry.reasonCode}: ${retry.message} ${JSON.stringify(retry.evidence)}`);
+    expect(github.writes.map((write) => write.method)).not.toContain("pushBranch");
+    expect(retry.value.bootstrapVerification[0]?.exactHead).toBe(pushed);
+  });
+
+  it("a setting whose read-back failed is not written again on retry when GitHub already holds it", async () => {
+    const { workDir, github } = makeSandbox();
+    github.failAfter = { method: "setDefaultBranch", mode: "readback" };
+    const first = await attempt(workDir, github, "2026-10-02T00:00:00.000Z");
+    expect(first.allowed).toBe(false);
+
+    github.writes.length = 0;
+    const retry = await attempt(workDir, github, "2026-10-02T00:05:00.000Z");
+    if (!retry.allowed) throw new Error(`${retry.reasonCode}: ${retry.message} ${JSON.stringify(retry.evidence)}`);
+    expect(github.writes.map((write) => write.method)).not.toContain("setDefaultBranch");
+  });
+
+  it("a create whose ledger line could not be written is adopted on retry, not refused as someone else's", async () => {
+    const { workDir, github } = makeSandbox();
+    const scratch = join(workDir, "github-ledger", "primary.json.partial");
+    const create = github.createRepository.bind(github);
+    // The create reaches GitHub; every ledger write after it fails.
+    github.createRepository = async (...args: Parameters<typeof create>) => {
+      const created = await create(...args);
+      mkdirSync(scratch, { recursive: true });
+      return created;
+    };
+    await expect(attempt(workDir, github, "2026-10-02T00:00:00.000Z")).rejects.toMatchObject({ code: "EISDIR" });
+    const created = github.repository("acme", "fixture");
+    if (!created) throw new Error("the create did not reach the double");
+    github.createRepository = create;
+    rmSync(scratch, { recursive: true, force: true });
+
+    github.writes.length = 0;
+    const retry = await attempt(workDir, github, "2026-10-02T00:05:00.000Z");
+    if (!retry.allowed) throw new Error(`${retry.reasonCode}: ${retry.message} ${JSON.stringify(retry.evidence)}`);
+    expect(github.writes.map((write) => write.method)).not.toContain("createRepository");
+    expect(github.repository("acme", "fixture")?.nodeId).toBe(created.nodeId);
+  });
+});
+
+describe("pending writes and readback fidelity (#1043 review follow-through)", () => {
+  it("refuses a protection GitHub kept without `strict`, though every other field matches (RF1043-04)", async () => {
+    const { workDir, github } = makeSandbox();
+    github.keepProtection = (requested) => {
+      const kept = requested as Protection;
+      return { ...kept, requiredStatusChecks: { contexts: kept.requiredStatusChecks?.contexts ?? [], strict: false } };
+    };
+    const produced = await produce(workDir, github);
+    expect(produced.allowed).toBe(false);
+    expect(evidenceOf(produced).refusal).toBe("REREAD_MISMATCH");
+    expect(evidenceOf(produced).failedOperationId).toBe("protect-default-branch:fixture");
+  });
+
+  it("a protection whose read-back failed is not written again on retry when GitHub already holds it", async () => {
+    const { workDir, github } = makeSandbox();
+    github.failAfter = { method: "protectBranch", mode: "readback" };
+    expect((await produce(workDir, github)).allowed).toBe(false);
+    github.writes.length = 0;
+    const retry = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
+    if (!retry.allowed) throw new Error(`${retry.reasonCode}: ${retry.message}`);
+    expect(github.writes).toEqual([]);
+  });
+
+  it("refuses — as indeterminate, with no write — a same-named repository whose description is not the marker its lost create carried", async () => {
+    const { workDir, github } = makeSandbox();
+    github.failAfter = { method: "createRepository", mode: "response" };
+    expect((await produce(workDir, github)).allowed).toBe(false);
+    // The name now holds a repository the lost create's marker does not identify.
+    await github.replace("acme", "fixture");
+    github.writes.length = 0;
+    const retry = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
+    expect(retry.allowed).toBe(false);
+    expect(retry.reasonCode).toBe(ReasonCode.RESOURCE_COLLISION);
+    expect(evidenceOf(retry).refusal).toBe("WRONG_TARGET");
+    expect(evidenceOf(retry).indeterminate).toBe(true);
+    expect(github.writes).toEqual([]);
+  });
+
+  it("refuses a same-named repository whose node id is not the one its create's response named", async () => {
+    const { workDir, github } = makeSandbox();
+    github.failAfter = { method: "createRepository", mode: "readback" };
+    expect((await produce(workDir, github)).allowed).toBe(false);
+    expect(readLedger(workDir).receipts).toEqual([]);
+    await github.replace("acme", "fixture");
+    github.writes.length = 0;
+    const retry = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
+    expect(retry.allowed).toBe(false);
+    expect(evidenceOf(retry).refusal).toBe("WRONG_TARGET");
+    expect(evidenceOf(retry).indeterminate).toBe(false);
+    expect(github.writes).toEqual([]);
+  });
+
+  it("refuses to create again under a name whose create GitHub already answered, once that repository is gone", async () => {
+    const { workDir, github } = makeSandbox();
+    github.failAfter = { method: "createRepository", mode: "readback" };
+    expect((await produce(workDir, github)).allowed).toBe(false);
+    github.remove("acme", "fixture");
+    github.writes.length = 0;
+    const retry = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
+    expect(retry.allowed).toBe(false);
+    expect(evidenceOf(retry).refusal).toBe("RESUMED_RESOURCE_ABSENT");
+    expect(github.writes).toEqual([]);
+  });
+
+  it("creates again, under the same marker, when a create left an intent and GitHub shows no trace of it", async () => {
+    const { workDir, github } = makeSandbox();
+    github.failNext = "createRepository";
+    expect((await produce(workDir, github)).allowed).toBe(false);
+    const marker = readLedger(workDir) as unknown as { pending: Array<{ marker: string | null }> };
+    expect(marker.pending).toHaveLength(1);
+    github.writes.length = 0;
+    const retry = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
+    if (!retry.allowed) throw new Error(`${retry.reasonCode}: ${retry.message}`);
+    expect(github.writes[0]?.method).toBe("createRepository");
+    expect(github.repository("acme", "fixture")?.description).toBe(marker.pending[0]?.marker);
+  });
+
+  it("refuses a branch someone else pushed while this operation's push was pending, and writes nothing", async () => {
+    const { workDir, github } = makeSandbox();
+    github.failNext = "pushBranch";
+    expect((await produce(workDir, github)).allowed).toBe(false);
+    const remote = github.repository("acme", "fixture");
+    if (!remote) throw new Error("no repository");
+    const other = mkdtempSync(join(tmpdir(), "acp-246-other-"));
+    sandboxes.push(other);
+    await git(other, ["init", "-q", "-b", "main"]);
+    writeFileSync(join(other, "theirs.txt"), "someone else\n");
+    await git(other, ["add", "theirs.txt"]);
+    await git(other, ["-c", "user.email=x@example.com", "-c", "user.name=x", "commit", "-q", "-m", "theirs"]);
+    await git(other, ["push", "-q", remote.bare, "HEAD:refs/heads/main"]);
+    github.writes.length = 0;
+    const retry = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
+    expect(retry.allowed).toBe(false);
+    expect(evidenceOf(retry).refusal).toBe("UNRECEIPTED_RESOURCE");
+    expect(github.writes).toEqual([]);
+  });
+
+  it("refuses a branch answer that describes another branch than the one asked about", async () => {
+    const { workDir, github } = makeSandbox();
+    const observe = github.observeBranch.bind(github);
+    github.observeBranch = async (target, branch) => {
+      const observed = await observe(target, branch);
+      return observed === null ? null : { ...observed, name: "release" };
+    };
+    const produced = await produce(workDir, github);
+    expect(produced.allowed).toBe(false);
+    expect(evidenceOf(produced).refusal).toBe("REREAD_MISMATCH");
+    expect(evidenceOf(produced).failedOperationId).toBe("push-default-branch:fixture");
+  });
+
+  it("says plainly when the leftover checkout is this operation's own, and removes nothing", async () => {
+    const { workDir, github } = makeSandbox();
+    const first = await produce(workDir, github);
+    if (!first.allowed) throw new Error(`${first.reasonCode}: ${first.message}`);
+    const checkout = repositoryCheckoutPath(workDir, "primary");
+    const again = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
+    expect(again.allowed).toBe(false);
+    expect(evidenceOf(again).refusal).toBe("INTERRUPTED_RUN_CHECKOUT");
+    expect(existsSync(checkout)).toBe(true);
   });
 });

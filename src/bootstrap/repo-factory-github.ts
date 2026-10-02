@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   closeSync,
   fsyncSync,
@@ -24,9 +25,10 @@ import {
   type GitHubRepositoryTarget,
   type GitHubVisibility,
   type GitHubWritePort,
+  type ObservedBranchProtection,
   type ObservedRepository,
 } from "./github-write-port.ts";
-import type { ExternalWriteReceipt } from "./repo-factory-result.ts";
+import { parseRepoFactoryResult, type ExternalWriteReceipt, type RepoFactoryResult } from "./repo-factory-result.ts";
 
 /**
  * Issue #246 — the repo factory producer's GitHub half: which planned operations may run, in
@@ -55,16 +57,32 @@ import type { ExternalWriteReceipt } from "./repo-factory-result.ts";
  * now. Absent a receipt it is someone else's (`WRONG_TARGET`), and with a receipt whose node
  * id differs the name was reused (`WRONG_TARGET` again) — either way nothing is written.
  *
+ * A write GitHub accepted but whose answer was lost is not a write that never happened (PR #1043
+ * review, RF1043-02). So every write is recorded twice outside the verified receipts: as a
+ * pending intent before the call — carrying what will identify it afterwards — and, where GitHub
+ * answers with an identity, again with that answer. A retry reconciles a pending write against
+ * GitHub before anything else: a create by the node id its response named or, if no response
+ * arrived, by the marker its request put in the repository's description; a push by the commit it
+ * pushed; a setting or protection by whether GitHub already holds the requested state. A pending
+ * write that GitHub shows no trace of is retried; one GitHub shows a *different* resource for is
+ * refused as before, with `indeterminate: true` where the record cannot say which of the two
+ * happened. Nothing here weakens the wrong-target refusal: adoption needs the node id, marker or
+ * commit this operation itself recorded before it wrote.
+ *
  * This file avoids `&&`/`||` on purpose: every refusal is its own branch with its own
  * evidence, so a reader — and `verify-refusal-operands-are-watched.mjs` — sees one decision
  * per condition rather than a chain whose failing link the evidence cannot name.
  */
 
-export const GITHUB_LEDGER_SCHEMA_ID = "acp.repo-factory.github-ledger.v1";
+export const GITHUB_LEDGER_SCHEMA_ID = "acp.repo-factory.github-ledger.v2";
 
 const branchProtectionStateSchema = z
   .object({
-    requiredStatusChecks: z.array(z.string().min(1)),
+    /** `strict` is requested, so it is read back and compared (RF1043-04); `null` is no checks. */
+    requiredStatusChecks: z
+      .object({ strict: z.boolean(), contexts: z.array(z.string().min(1)).min(1) })
+      .strict()
+      .nullable(),
     enforceAdmins: z.boolean(),
     requiredApprovingReviewCount: z.number().int().min(0).max(6).nullable(),
     allowForcePushes: z.boolean(),
@@ -343,6 +361,20 @@ const receiptCommon = {
   rereadAt: z.string().min(1),
 };
 
+/** Protection as GitHub answered it: a flag its answer did not carry is `null`, never a default. */
+const observedProtectionSchema = z
+  .object({
+    requiredStatusChecks: z
+      .object({ strict: z.boolean().nullable(), contexts: z.array(z.string()) })
+      .strict()
+      .nullable(),
+    enforceAdmins: z.boolean().nullable(),
+    requiredApprovingReviewCount: z.number().int().nullable(),
+    allowForcePushes: z.boolean().nullable(),
+    allowDeletions: z.boolean().nullable(),
+  })
+  .strict();
+
 /** A receipt in the ledger: the readback GitHub gave, in full, not a digest of it. */
 export const githubOperationReceiptSchema = z.discriminatedUnion("resourceType", [
   z
@@ -369,11 +401,35 @@ export const githubOperationReceiptSchema = z.discriminatedUnion("resourceType",
     })
     .strict(),
   z
-    .object({ ...receiptCommon, resourceType: z.literal("branch-protection"), observed: branchProtectionStateSchema })
+    .object({ ...receiptCommon, resourceType: z.literal("branch-protection"), observed: observedProtectionSchema })
     .strict(),
 ]);
 
 export type GitHubOperationReceipt = z.infer<typeof githubOperationReceiptSchema>;
+
+/**
+ * A write started and not yet receipted (RF1043-02). Recorded before the call, and again with
+ * GitHub's answer when one arrives, so a retry can tell its own write from someone else's.
+ */
+export const pendingWriteSchema = z
+  .object({
+    operationId: z.string().min(1),
+    resourceType: z.enum(["repository", "branch", "setting", "branch-protection"]),
+    resourceIdentity: z.string().min(1),
+    /** When the write was first attempted — the receipt's `createdAt` if it is adopted. */
+    attemptedAt: z.string().min(1),
+    preexisting: z.boolean(),
+    beforeStateDigest: z.string().nullable(),
+    /** repository: the description its create request carried. */
+    marker: z.string().min(1).nullable(),
+    /** repository: the node id GitHub's create response named, once one arrived. */
+    respondedNodeId: z.string().min(1).nullable(),
+    /** branch: the commit the push sent. */
+    pushedHead: z.string().min(1).nullable(),
+  })
+  .strict();
+
+export type PendingWrite = z.infer<typeof pendingWriteSchema>;
 
 const ledgerSchema = z
   .object({
@@ -381,6 +437,7 @@ const ledgerSchema = z
     bootstrapOperationId: z.string().min(1),
     requestDigest: z.string().min(1),
     receipts: z.array(githubOperationReceiptSchema),
+    pending: z.array(pendingWriteSchema),
   })
   .strict();
 
@@ -391,6 +448,11 @@ export interface LedgerOwner {
   requestDigest: string;
 }
 
+export interface LedgerState {
+  receipts: ReadonlyMap<string, GitHubOperationReceipt>;
+  pending: ReadonlyMap<string, PendingWrite>;
+}
+
 /**
  * Beside the checkout, never inside it. The checkout is disposable — a failed run removes it
  * so the same operation can retry — and the ledger is the one thing a retry must find.
@@ -398,51 +460,63 @@ export interface LedgerOwner {
 export const githubLedgerPath = (workDir: string, repositoryRole: string): string =>
   join(resolve(workDir), "github-ledger", `${repositoryRole}.json`);
 
-const unsafeLedger = (path: string, message: string): Decision<Map<string, GitHubOperationReceipt>> =>
+/** The produced result, kept beside the ledger so a retry can rebuild it (RF1043-02). */
+export const producedResultPath = (workDir: string, repositoryRole: string): string =>
+  join(resolve(workDir), "github-ledger", `${repositoryRole}.result.json`);
+
+const unsafeFile = <T>(path: string, message: string): Decision<T> =>
   refuse(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "LEDGER_UNSAFE", message, { ledgerPath: path });
 
-const corruptLedger = (path: string, message: string, evidence: Evidence = {}): Decision<Map<string, GitHubOperationReceipt>> =>
+const corruptFile = <T>(path: string, message: string, evidence: Evidence = {}): Decision<T> =>
   refuse(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT, "LEDGER_CORRUPT", message, { ledgerPath: path, ...evidence });
 
 /**
- * Reads the receipts a previous attempt left. Absent is empty; anything else that cannot be
- * proven to be this operation's own record is a refusal, because resuming from it would treat
- * someone else's writes — or a forged line — as ours.
+ * Reads one of this operation's own files: absent is `null`; a symlink, a non-file, another
+ * account's file or one writable by others is a refusal, because acting on it would treat
+ * someone else's record — or a forged one — as ours.
+ */
+const readOwnFile = (path: string): Decision<unknown> => {
+  let stat: Stats;
+  try {
+    stat = lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return allow(ReasonCode.OK, null);
+    return corruptFile(path, "a GitHub ledger file could not be inspected", { message: (error as Error).message });
+  }
+  if (stat.isSymbolicLink()) return unsafeFile(path, "a GitHub ledger file is a symlink");
+  if (!stat.isFile()) return unsafeFile(path, "a GitHub ledger file is not a regular file");
+  if (typeof process.getuid !== "function") {
+    return unsafeFile(path, "ownership verification is not supported on this platform");
+  }
+  if (stat.uid !== process.getuid()) return unsafeFile(path, "a GitHub ledger file is owned by another account");
+  if ((stat.mode & 0o022) !== 0) return unsafeFile(path, "a GitHub ledger file is writable by another user or group");
+  try {
+    return allow(ReasonCode.OK, JSON.parse(readFileSync(path, "utf8")));
+  } catch (error) {
+    return corruptFile(path, "a GitHub ledger file is not readable JSON", { message: (error as Error).message });
+  }
+};
+
+/**
+ * Reads the receipts and pending writes a previous attempt left. Anything that cannot be proven
+ * to be this operation's own record is a refusal.
  */
 export const readGitHubLedger = (
   path: string,
   owner: LedgerOwner,
   operations: readonly GitHubOperation[],
-): Decision<Map<string, GitHubOperationReceipt>> => {
-  let stat: Stats;
-  try {
-    stat = lstatSync(path);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return allow(ReasonCode.OK, new Map());
-    return corruptLedger(path, "the GitHub receipt ledger could not be inspected", { message: (error as Error).message });
-  }
-  if (stat.isSymbolicLink()) return unsafeLedger(path, "the GitHub receipt ledger is a symlink");
-  if (!stat.isFile()) return unsafeLedger(path, "the GitHub receipt ledger is not a regular file");
-  if (typeof process.getuid !== "function") {
-    return unsafeLedger(path, "ownership verification is not supported on this platform");
-  }
-  if (stat.uid !== process.getuid()) return unsafeLedger(path, "the GitHub receipt ledger is owned by another account");
-  if ((stat.mode & 0o022) !== 0) return unsafeLedger(path, "the GitHub receipt ledger is writable by another user or group");
-
-  let raw: unknown;
-  try {
-    raw = JSON.parse(readFileSync(path, "utf8"));
-  } catch (error) {
-    return corruptLedger(path, "the GitHub receipt ledger is not readable JSON", { message: (error as Error).message });
-  }
-  const parsed = ledgerSchema.safeParse(raw);
+): Decision<LedgerState> => {
+  const raw = readOwnFile(path);
+  if (!raw.allowed) return raw as Decision<LedgerState>;
+  if (raw.value === null) return allow(ReasonCode.OK, { receipts: new Map(), pending: new Map() });
+  const parsed = ledgerSchema.safeParse(raw.value);
   if (!parsed.success) {
-    return corruptLedger(path, "the GitHub receipt ledger failed validation", {
+    return corruptFile(path, "the GitHub receipt ledger failed validation", {
       issues: parsed.error.issues.map((i) => ({ path: i.path.join("."), message: i.message })),
     });
   }
   const ledger = parsed.data;
-  const foreign = (field: string): Decision<Map<string, GitHubOperationReceipt>> =>
+  const foreign = (field: string): Decision<LedgerState> =>
     refuse(
       ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
       "LEDGER_FOREIGN",
@@ -452,39 +526,62 @@ export const readGitHubLedger = (
   if (ledger.bootstrapOperationId !== owner.bootstrapOperationId) return foreign("bootstrap operation");
   if (ledger.requestDigest !== owner.requestDigest) return foreign("request");
 
-  const receipts = new Map<string, GitHubOperationReceipt>();
-  for (const receipt of ledger.receipts) {
-    if (receipts.has(receipt.operationId)) {
-      return corruptLedger(path, "the GitHub receipt ledger holds two receipts for one operation", {
-        operationId: receipt.operationId,
-      });
-    }
-    const planned = operations.find((operation) => operation.operationId === receipt.operationId);
-    const notInPlan = (): Decision<Map<string, GitHubOperationReceipt>> =>
+  const planned = (entry: { operationId: string; resourceType: string; resourceIdentity: string }): Decision<void> => {
+    const operation = operations.find((candidate) => candidate.operationId === entry.operationId);
+    const notInPlan = (): Decision<void> =>
       refuse(
         ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
         "OPERATION_NOT_IN_PLAN",
-        `the GitHub receipt ledger receipts ${receipt.operationId}, which this plan does not contain as written`,
-        { ledgerPath: path, operationId: receipt.operationId },
+        `the GitHub receipt ledger records ${entry.operationId}, which this plan does not contain as written`,
+        { ledgerPath: path, operationId: entry.operationId },
       );
-    if (planned === undefined) return notInPlan();
-    if (planned.resourceType !== receipt.resourceType) return notInPlan();
-    if (planned.resourceIdentity !== receipt.resourceIdentity) return notInPlan();
+    if (operation === undefined) return notInPlan();
+    if (operation.resourceType !== entry.resourceType) return notInPlan();
+    if (operation.resourceIdentity !== entry.resourceIdentity) return notInPlan();
+    return allow(ReasonCode.OK, undefined);
+  };
+  const receipts = new Map<string, GitHubOperationReceipt>();
+  for (const receipt of ledger.receipts) {
+    if (receipts.has(receipt.operationId)) {
+      return corruptFile(path, "the GitHub receipt ledger holds two receipts for one operation", {
+        operationId: receipt.operationId,
+      });
+    }
+    const inPlan = planned(receipt);
+    if (!inPlan.allowed) return inPlan as Decision<LedgerState>;
     receipts.set(receipt.operationId, receipt);
   }
-  return allow(ReasonCode.OK, receipts);
+  const pending = new Map<string, PendingWrite>();
+  for (const entry of ledger.pending) {
+    // A receipt and its pending write are replaced in one atomic ledger write; both at once is
+    // a ledger this producer did not write.
+    if (receipts.has(entry.operationId)) {
+      return corruptFile(path, "the GitHub receipt ledger holds a receipt and a pending write for one operation", {
+        operationId: entry.operationId,
+      });
+    }
+    if (pending.has(entry.operationId)) {
+      return corruptFile(path, "the GitHub receipt ledger holds two pending writes for one operation", {
+        operationId: entry.operationId,
+      });
+    }
+    const inPlan = planned(entry);
+    if (!inPlan.allowed) return inPlan as Decision<LedgerState>;
+    pending.set(entry.operationId, entry);
+  }
+  return allow(ReasonCode.OK, { receipts, pending });
 };
 
 /**
- * Atomic and durable: write a scratch file, fsync it, rename it over the ledger, fsync the
- * directory. A crash mid-write leaves the previous ledger whole, so the resume point the
+ * Atomic and durable: write a scratch file, fsync it, rename it over the target, fsync the
+ * directory. A crash mid-write leaves the previous version whole, so the resume point the
  * ledger exists to keep is never the thing a crash destroys.
  */
-export const writeGitHubLedger = (path: string, ledger: GitHubLedger): void => {
+const writeOwnFile = (path: string, content: unknown): void => {
   const scratch = `${path}.partial`;
   const descriptor = openSync(scratch, "w", 0o600);
   try {
-    writeSync(descriptor, `${JSON.stringify(ledger, null, 2)}\n`);
+    writeSync(descriptor, `${JSON.stringify(content, null, 2)}\n`);
     fsyncSync(descriptor);
   } finally {
     closeSync(descriptor);
@@ -496,6 +593,48 @@ export const writeGitHubLedger = (path: string, ledger: GitHubLedger): void => {
   } finally {
     closeSync(directory);
   }
+};
+
+export const writeGitHubLedger = (path: string, ledger: GitHubLedger): void => writeOwnFile(path, ledger);
+
+const PRODUCED_RESULT_SCHEMA_ID = "acp.repo-factory.produced-result.v1";
+
+const producedResultSchema = z
+  .object({
+    schema: z.literal(PRODUCED_RESULT_SCHEMA_ID),
+    bootstrapOperationId: z.string().min(1),
+    requestDigest: z.string().min(1),
+    result: z.unknown(),
+  })
+  .strict();
+
+/** Written by the producer after it built a result and before it returns it. */
+export const writeProducedResult = (path: string, owner: LedgerOwner, result: RepoFactoryResult): void =>
+  writeOwnFile(path, { schema: PRODUCED_RESULT_SCHEMA_ID, ...owner, result });
+
+/**
+ * A result this operation already produced, for the caller that lost it before storing it.
+ * Parsed by the same canonical parser activation uses, and refused if another operation wrote it.
+ */
+export const readProducedResult = (path: string, owner: LedgerOwner): Decision<RepoFactoryResult | null> => {
+  const raw = readOwnFile(path);
+  if (!raw.allowed) return raw as Decision<RepoFactoryResult | null>;
+  if (raw.value === null) return allow(ReasonCode.OK, null);
+  const parsed = producedResultSchema.safeParse(raw.value);
+  if (!parsed.success) return corruptFile(path, "the produced result file failed validation");
+  if (parsed.data.bootstrapOperationId !== owner.bootstrapOperationId) {
+    return refuse(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT, "LEDGER_FOREIGN", "the produced result belongs to a different bootstrap operation", {
+      ledgerPath: path,
+    });
+  }
+  if (parsed.data.requestDigest !== owner.requestDigest) {
+    return refuse(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT, "LEDGER_FOREIGN", "the produced result belongs to a different request", {
+      ledgerPath: path,
+    });
+  }
+  const result = parseRepoFactoryResult(parsed.data.result);
+  if (!result.allowed) return result as Decision<RepoFactoryResult | null>;
+  return allow(ReasonCode.OK, result.value);
 };
 
 /** The result contract's view of a ledger receipt: identity fields plus the readback's digest. */
@@ -518,32 +657,41 @@ export interface ApplyGitHubOperationsInput {
   port: GitHubWritePort;
   checkoutPath: string;
   defaultBranch: string;
-  prior: ReadonlyMap<string, GitHubOperationReceipt>;
-  /** Persists the full receipt set; called after every verified write, before the next one. */
-  record: (receipts: readonly GitHubOperationReceipt[]) => void;
+  prior: LedgerState;
+  /** Persists receipts and pending writes together; called before and after every write. */
+  record: (state: { receipts: GitHubOperationReceipt[]; pending: PendingWrite[] }) => void;
   ledgerPath: string;
   clock: Clock;
+  /** Mints the marker a create puts in the repository's description. */
+  newMarker?: () => string;
 }
 
 export interface AppliedGitHubOperations {
-  /** This attempt's receipts, in plan order — written now or resumed from the ledger. */
+  /** This attempt's receipts, in plan order — written now, adopted from a pending write, or resumed. */
   receipts: GitHubOperationReceipt[];
   written: string[];
+  adopted: string[];
   resumed: string[];
 }
 
-type Step = { receipt: GitHubOperationReceipt; wrote: boolean };
+type Step = { receipt: GitHubOperationReceipt; outcome: "written" | "adopted" | "resumed" };
 
-const sortedProtection = (state: BranchProtectionState): BranchProtectionState => ({
-  requiredStatusChecks: [...state.requiredStatusChecks].sort(),
+type ComparableProtection = BranchProtectionState | ObservedBranchProtection;
+
+/** Order-free over contexts, and nothing else: every requested field takes part. */
+const normalizedProtection = (state: ComparableProtection): ObservedBranchProtection => ({
+  requiredStatusChecks:
+    state.requiredStatusChecks === null
+      ? null
+      : { strict: state.requiredStatusChecks.strict, contexts: [...state.requiredStatusChecks.contexts].sort() },
   enforceAdmins: state.enforceAdmins,
   requiredApprovingReviewCount: state.requiredApprovingReviewCount,
   allowForcePushes: state.allowForcePushes,
   allowDeletions: state.allowDeletions,
 });
 
-const sameProtection = (left: BranchProtectionState, right: BranchProtectionState): boolean =>
-  canonicalJson(sortedProtection(left)) === canonicalJson(sortedProtection(right));
+const sameProtection = (observed: ObservedBranchProtection, desired: BranchProtectionState): boolean =>
+  canonicalJson(normalizedProtection(observed)) === canonicalJson(normalizedProtection(desired));
 
 const describeFailure = (error: unknown): Evidence => {
   const message = error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300);
@@ -557,11 +705,21 @@ export const applyGitHubOperations = async (
 ): Promise<Decision<AppliedGitHubOperations>> => {
   const { execution, port, clock } = input;
   const target = execution.target;
-  const ledger = new Map(input.prior);
+  const newMarker = input.newMarker ?? (() => `repo-factory:${randomUUID()}`);
+  const receipts = new Map(input.prior.receipts);
+  const pending = new Map(input.prior.pending);
   const completed: GitHubOperationReceipt[] = [];
   const written: string[] = [];
+  const adopted: string[] = [];
   const resumed: string[] = [];
   let repositoryNodeId: string | null = null;
+
+  const persist = (): void => input.record({ receipts: [...receipts.values()], pending: [...pending.values()] });
+  /** Before a write, and again with GitHub's answer: what a retry reconciles against. */
+  const begin = (entry: PendingWrite): void => {
+    pending.set(entry.operationId, entry);
+    persist();
+  };
 
   /**
    * Every failure stops here, carrying exactly what this attempt completed. `resumable` says
@@ -581,6 +739,7 @@ export const applyGitHubOperations = async (
       failedOperationId,
       completedOperationIds: completed.map((receipt) => receipt.operationId),
       completedReceipts: [...completed],
+      pendingOperationIds: [...pending.keys()],
       ledgerPath: input.ledgerPath,
       rollback: "none",
       resumable,
@@ -672,9 +831,23 @@ export const applyGitHubOperations = async (
       false,
     );
 
+  /** A branch answer must describe the branch asked about; the port never fills the name in. */
+  const sameBranch = (observedName: string, branch: string, operationId: string): Decision<void> =>
+    observedName === branch
+      ? allow(ReasonCode.OK, undefined)
+      : stop(
+          ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
+          "REREAD_MISMATCH",
+          `GitHub answered for branch ${observedName} when asked about ${branch}`,
+          operationId,
+          { observedName, branch },
+          false,
+        );
+
   const repositoryStep = async (operation: Extract<GitHubOperation, { resourceType: "repository" }>): Promise<Decision<Step>> => {
     const id = operation.operationId;
-    const prior = input.prior.get(id);
+    const prior = input.prior.receipts.get(id);
+    const pendingWrite = pending.get(id);
     const observed = await remote(id, () => port.observeRepository(target));
     if (!observed.allowed) return observed as Decision<Step>;
     if (prior !== undefined) {
@@ -703,22 +876,90 @@ export const applyGitHubOperations = async (
       if (!judged.allowed) return judged as Decision<Step>;
       return allow(ReasonCode.OK, {
         receipt: { ...prior, observed: readbackOf(observed.value), rereadAt: clock.nowIso() },
-        wrote: false,
+        outcome: "resumed",
       });
     }
+
     if (observed.value !== null) {
+      // Ours only by what this operation recorded before it wrote: the node id GitHub's create
+      // response named, or — if that response never arrived — the marker the create carried.
+      const recordedNodeId = pendingWrite === undefined ? null : pendingWrite.respondedNodeId;
+      const recordedMarker = pendingWrite === undefined ? null : pendingWrite.marker;
+      const ownsByResponse = recordedNodeId === null ? false : observed.value.nodeId === recordedNodeId;
+      const ownsByMarker = recordedNodeId !== null ? false : recordedMarker !== null ? observed.value.description === recordedMarker : false;
+      if (pendingWrite === undefined) {
+        return stop(
+          ReasonCode.RESOURCE_COLLISION,
+          "WRONG_TARGET",
+          `${target.owner}/${target.name} already exists and carries no receipt from this bootstrap operation; it is not adopted, overwritten or renamed`,
+          id,
+          { observedNodeId: observed.value.nodeId, observed: readbackOf(observed.value) },
+          false,
+        );
+      }
+      if (ownsByResponse === ownsByMarker) {
+        // Neither proves it: GitHub's create named another node, or no response arrived and the
+        // description is not our marker. Either the create never landed and someone else holds
+        // the name, or ours was changed since — refused rather than adopted by name.
+        return stop(
+          ReasonCode.RESOURCE_COLLISION,
+          "WRONG_TARGET",
+          `${target.owner}/${target.name} exists, and nothing this operation recorded before its create identifies it as that create`,
+          id,
+          {
+            indeterminate: recordedNodeId === null,
+            recordedNodeId,
+            observedNodeId: observed.value.nodeId,
+            observed: readbackOf(observed.value),
+          },
+          false,
+        );
+      }
+      const judged = judgeRepository(observed.value, id);
+      if (!judged.allowed) return judged as Decision<Step>;
+      return allow(ReasonCode.OK, {
+        receipt: {
+          operationId: id,
+          resourceType: "repository",
+          resourceIdentity: operation.resourceIdentity,
+          repositoryNodeId: observed.value.nodeId,
+          preexisting: false,
+          beforeStateDigest: null,
+          observed: readbackOf(observed.value),
+          createdAt: pendingWrite.attemptedAt,
+          rereadAt: clock.nowIso(),
+        },
+        outcome: "adopted",
+      });
+    }
+    if (pendingWrite === undefined ? false : pendingWrite.respondedNodeId !== null) {
       return stop(
-        ReasonCode.RESOURCE_COLLISION,
-        "WRONG_TARGET",
-        `${target.owner}/${target.name} already exists and carries no receipt from this bootstrap operation; it is not adopted, overwritten or renamed`,
+        ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
+        "RESUMED_RESOURCE_ABSENT",
+        `GitHub answered this operation's create and ${target.owner}/${target.name} is now absent; it is not created again under a name that was ours`,
         id,
-        { observedNodeId: observed.value.nodeId, observed: readbackOf(observed.value) },
+        { recordedNodeId: pendingWrite?.respondedNodeId ?? null },
         false,
       );
     }
+
     const createdAt = clock.nowIso();
-    const created = await remote(id, () => port.createRepository(target, execution.visibility));
+    const marker = pendingWrite?.marker ?? newMarker();
+    const intent: PendingWrite = {
+      operationId: id,
+      resourceType: "repository",
+      resourceIdentity: operation.resourceIdentity,
+      attemptedAt: createdAt,
+      preexisting: false,
+      beforeStateDigest: null,
+      marker,
+      respondedNodeId: null,
+      pushedHead: null,
+    };
+    begin(intent);
+    const created = await remote(id, () => port.createRepository(target, execution.visibility, marker));
     if (!created.allowed) return created as Decision<Step>;
+    begin({ ...intent, respondedNodeId: created.value.nodeId });
     const createdJudged = judgeRepository(created.value, id);
     if (!createdJudged.allowed) return createdJudged as Decision<Step>;
     const reread = await remote(id, () => port.observeRepository(target));
@@ -757,7 +998,7 @@ export const applyGitHubOperations = async (
         createdAt,
         rereadAt: clock.nowIso(),
       },
-      wrote: true,
+      outcome: "written",
     });
   };
 
@@ -766,11 +1007,26 @@ export const applyGitHubOperations = async (
     const branch = input.defaultBranch;
     const repository = await confirmRepository(id);
     if (!repository.allowed) return repository as Decision<Step>;
-    const prior = input.prior.get(id);
+    const prior = input.prior.receipts.get(id);
+    const pendingWrite = pending.get(id);
     const observed = await remote(id, () => port.observeBranch(target, branch));
     if (!observed.allowed) return observed as Decision<Step>;
     const localFailure = (message: string, evidence: Evidence): Decision<Step> =>
       stop(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT, "LOCAL_CHECKOUT_FAILED", message, id, evidence, true);
+    /** The checkout is fresh on every attempt; the commit GitHub already holds is brought into it. */
+    const checkOut = async (head: string): Promise<Decision<void>> => {
+      const fetched = await remote(id, () => port.fetchBranch(target, branch, input.checkoutPath));
+      if (!fetched.allowed) return fetched as Decision<void>;
+      const reset = await git(input.checkoutPath, ["reset", "-q", "--hard", head], { allowFailure: true });
+      if (reset.exitCode !== 0) {
+        return localFailure("the pushed commit could not be checked out locally", { stderr: reset.stderr }) as Decision<void>;
+      }
+      const local = await tryRevParse(input.checkoutPath, "HEAD");
+      if (local !== head) {
+        return localFailure("the local checkout is not at the pushed commit", { head: local, pushed: head }) as Decision<void>;
+      }
+      return allow(ReasonCode.OK, undefined);
+    };
     if (prior !== undefined) {
       if (prior.resourceType !== "branch") return corruptPrior(id);
       if (observed.value === null) {
@@ -783,6 +1039,8 @@ export const applyGitHubOperations = async (
           false,
         );
       }
+      const named = sameBranch(observed.value.name, branch, id);
+      if (!named.allowed) return named as Decision<Step>;
       if (observed.value.headSha !== prior.observed.headSha) {
         return stop(
           ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
@@ -793,23 +1051,8 @@ export const applyGitHubOperations = async (
           false,
         );
       }
-      // The checkout is fresh on every attempt; the commit GitHub already holds is brought into
-      // it rather than recommitted, so the head this run verifies is the head GitHub has.
-      const fetched = await remote(id, () => port.fetchBranch(target, branch, input.checkoutPath));
-      if (!fetched.allowed) return fetched as Decision<Step>;
-      const reset = await git(input.checkoutPath, ["reset", "-q", "--hard", prior.observed.headSha], {
-        allowFailure: true,
-      });
-      if (reset.exitCode !== 0) {
-        return localFailure("the pushed commit could not be checked out locally", { stderr: reset.stderr });
-      }
-      const head = await tryRevParse(input.checkoutPath, "HEAD");
-      if (head !== prior.observed.headSha) {
-        return localFailure("the local checkout is not at the pushed commit after resume", {
-          head,
-          pushed: prior.observed.headSha,
-        });
-      }
+      const checkedOut = await checkOut(prior.observed.headSha);
+      if (!checkedOut.allowed) return checkedOut as Decision<Step>;
       return allow(ReasonCode.OK, {
         receipt: {
           ...prior,
@@ -817,22 +1060,56 @@ export const applyGitHubOperations = async (
           observed: { name: observed.value.name, headSha: observed.value.headSha },
           rereadAt: clock.nowIso(),
         },
-        wrote: false,
+        outcome: "resumed",
       });
     }
     if (observed.value !== null) {
-      return stop(
-        ReasonCode.RESOURCE_COLLISION,
-        "UNRECEIPTED_RESOURCE",
-        `${branch} already exists on ${target.owner}/${target.name} and carries no receipt from this bootstrap operation`,
-        id,
-        { observedHead: observed.value.headSha },
-        false,
-      );
+      const named = sameBranch(observed.value.name, branch, id);
+      if (!named.allowed) return named as Decision<Step>;
+      const recordedHead = pendingWrite === undefined ? null : pendingWrite.pushedHead;
+      if (recordedHead !== observed.value.headSha) {
+        return stop(
+          ReasonCode.RESOURCE_COLLISION,
+          "UNRECEIPTED_RESOURCE",
+          `${branch} already exists on ${target.owner}/${target.name} at a commit this bootstrap operation did not push`,
+          id,
+          { observedHead: observed.value.headSha, recordedHead },
+          false,
+        );
+      }
+      // The commit this operation recorded before its push is the one GitHub holds: the push
+      // landed and only its answer was lost.
+      const checkedOut = await checkOut(recordedHead);
+      if (!checkedOut.allowed) return checkedOut as Decision<Step>;
+      return allow(ReasonCode.OK, {
+        receipt: {
+          operationId: id,
+          resourceType: "branch",
+          resourceIdentity: operation.resourceIdentity,
+          repositoryNodeId: repository.value.nodeId,
+          preexisting: false,
+          beforeStateDigest: null,
+          observed: { name: observed.value.name, headSha: observed.value.headSha },
+          createdAt: pendingWrite?.attemptedAt ?? clock.nowIso(),
+          rereadAt: clock.nowIso(),
+        },
+        outcome: "adopted",
+      });
     }
     const localHead = await tryRevParse(input.checkoutPath, "HEAD");
     if (localHead === null) return localFailure("the local checkout has no commit to push", {});
     const createdAt = clock.nowIso();
+    begin({
+      operationId: id,
+      resourceType: "branch",
+      resourceIdentity: operation.resourceIdentity,
+      attemptedAt: createdAt,
+      preexisting: false,
+      beforeStateDigest: null,
+      marker: null,
+      respondedNodeId: null,
+      pushedHead: localHead,
+    });
     const pushed = await remote(id, () => port.pushBranch(target, branch, input.checkoutPath, localHead));
     if (!pushed.allowed) return pushed as Decision<Step>;
     const reread = await remote(id, () => port.observeBranch(target, branch));
@@ -847,6 +1124,8 @@ export const applyGitHubOperations = async (
         true,
       );
     }
+    const named = sameBranch(reread.value.name, branch, id);
+    if (!named.allowed) return named as Decision<Step>;
     if (reread.value.headSha !== localHead) {
       return stop(
         ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
@@ -869,7 +1148,7 @@ export const applyGitHubOperations = async (
         createdAt,
         rereadAt: clock.nowIso(),
       },
-      wrote: true,
+      outcome: "written",
     });
   };
 
@@ -878,7 +1157,8 @@ export const applyGitHubOperations = async (
     const desired = operation.desiredState.defaultBranch;
     const repository = await confirmRepository(id);
     if (!repository.allowed) return repository as Decision<Step>;
-    const prior = input.prior.get(id);
+    const prior = input.prior.receipts.get(id);
+    const pendingWrite = pending.get(id);
     if (prior !== undefined) {
       if (prior.resourceType !== "setting") return corruptPrior(id);
       if (repository.value.defaultBranch !== desired) {
@@ -893,11 +1173,42 @@ export const applyGitHubOperations = async (
       }
       return allow(ReasonCode.OK, {
         receipt: { ...prior, observed: { defaultBranch: desired }, rereadAt: clock.nowIso() },
-        wrote: false,
+        outcome: "resumed",
       });
     }
-    const before = { defaultBranch: repository.value.defaultBranch };
-    const createdAt = clock.nowIso();
+    if (pendingWrite !== undefined) {
+      // A setting this operation already sent: if GitHub holds it, the write landed and only the
+      // read after it was lost. On the repository its node id proves ours, that is the receipt.
+      if (repository.value.defaultBranch === desired) {
+        return allow(ReasonCode.OK, {
+          receipt: {
+            operationId: id,
+            resourceType: "setting",
+            resourceIdentity: operation.resourceIdentity,
+            repositoryNodeId: repository.value.nodeId,
+            preexisting: pendingWrite.preexisting,
+            beforeStateDigest: pendingWrite.beforeStateDigest,
+            observed: { defaultBranch: desired },
+            createdAt: pendingWrite.attemptedAt,
+            rereadAt: clock.nowIso(),
+          },
+          outcome: "adopted",
+        });
+      }
+    }
+    const createdAt = pendingWrite?.attemptedAt ?? clock.nowIso();
+    const intent: PendingWrite = pendingWrite ?? {
+      operationId: id,
+      resourceType: "setting",
+      resourceIdentity: operation.resourceIdentity,
+      attemptedAt: createdAt,
+      preexisting: true,
+      beforeStateDigest: digestOf({ defaultBranch: repository.value.defaultBranch }),
+      marker: null,
+      respondedNodeId: null,
+      pushedHead: null,
+    };
+    begin(intent);
     const set = await remote(id, () => port.setDefaultBranch(target, desired));
     if (!set.allowed) return set as Decision<Step>;
     const reread = await confirmRepository(id);
@@ -919,13 +1230,13 @@ export const applyGitHubOperations = async (
         resourceType: "setting",
         resourceIdentity: operation.resourceIdentity,
         repositoryNodeId: reread.value.nodeId,
-        preexisting: true,
-        beforeStateDigest: digestOf(before),
+        preexisting: intent.preexisting,
+        beforeStateDigest: intent.beforeStateDigest,
         observed: { defaultBranch: observedDefault },
         createdAt,
         rereadAt: clock.nowIso(),
       },
-      wrote: true,
+      outcome: "written",
     });
   };
 
@@ -937,7 +1248,8 @@ export const applyGitHubOperations = async (
     const desired = operation.desiredState;
     const repository = await confirmRepository(id);
     if (!repository.allowed) return repository as Decision<Step>;
-    const prior = input.prior.get(id);
+    const prior = input.prior.receipts.get(id);
+    const pendingWrite = pending.get(id);
     const current = await remote(id, () => port.observeBranchProtection(target, branch));
     if (!current.allowed) return current as Decision<Step>;
     if (prior !== undefined) {
@@ -958,17 +1270,46 @@ export const applyGitHubOperations = async (
           "RESUMED_RESOURCE_DRIFTED",
           `${branch}'s protection is no longer the approved one`,
           id,
-          { requested: sortedProtection(desired), observed: sortedProtection(current.value) },
+          { requested: normalizedProtection(desired), observed: normalizedProtection(current.value) },
           false,
         );
       }
       return allow(ReasonCode.OK, {
-        receipt: { ...prior, observed: sortedProtection(current.value), rereadAt: clock.nowIso() },
-        wrote: false,
+        receipt: { ...prior, observed: normalizedProtection(current.value), rereadAt: clock.nowIso() },
+        outcome: "resumed",
       });
     }
+    if (pendingWrite !== undefined) {
+      if (current.value === null ? false : sameProtection(current.value, desired)) {
+        return allow(ReasonCode.OK, {
+          receipt: {
+            operationId: id,
+            resourceType: "branch-protection",
+            resourceIdentity: operation.resourceIdentity,
+            repositoryNodeId: repository.value.nodeId,
+            preexisting: pendingWrite.preexisting,
+            beforeStateDigest: pendingWrite.beforeStateDigest,
+            observed: normalizedProtection(current.value ?? desired),
+            createdAt: pendingWrite.attemptedAt,
+            rereadAt: clock.nowIso(),
+          },
+          outcome: "adopted",
+        });
+      }
+    }
     const before = current.value;
-    const createdAt = clock.nowIso();
+    const intent: PendingWrite = pendingWrite ?? {
+      operationId: id,
+      resourceType: "branch-protection",
+      resourceIdentity: operation.resourceIdentity,
+      attemptedAt: clock.nowIso(),
+      preexisting: before !== null,
+      beforeStateDigest: before === null ? null : digestOf(normalizedProtection(before)),
+      marker: null,
+      respondedNodeId: null,
+      pushedHead: null,
+    };
+    begin(intent);
     const protectedNow = await remote(id, () => port.protectBranch(target, branch, desired));
     if (!protectedNow.allowed) return protectedNow as Decision<Step>;
     const reread = await remote(id, () => port.observeBranchProtection(target, branch));
@@ -989,7 +1330,7 @@ export const applyGitHubOperations = async (
         "REREAD_MISMATCH",
         `GitHub holds a different protection on ${branch} than the one requested`,
         id,
-        { requested: sortedProtection(desired), observed: sortedProtection(reread.value) },
+        { requested: normalizedProtection(desired), observed: normalizedProtection(reread.value) },
         false,
       );
     }
@@ -999,13 +1340,13 @@ export const applyGitHubOperations = async (
         resourceType: "branch-protection",
         resourceIdentity: operation.resourceIdentity,
         repositoryNodeId: repository.value.nodeId,
-        preexisting: before !== null,
-        beforeStateDigest: before === null ? null : digestOf(sortedProtection(before)),
-        observed: sortedProtection(reread.value),
-        createdAt,
+        preexisting: intent.preexisting,
+        beforeStateDigest: intent.beforeStateDigest,
+        observed: normalizedProtection(reread.value),
+        createdAt: intent.attemptedAt,
         rereadAt: clock.nowIso(),
       },
-      wrote: true,
+      outcome: "written",
     });
   };
 
@@ -1019,16 +1360,19 @@ export const applyGitHubOperations = async (
             ? await settingStep(operation)
             : await protectionStep(operation);
     if (!step.allowed) return step as Decision<AppliedGitHubOperations>;
-    const { receipt, wrote } = step.value;
+    const { receipt, outcome } = step.value;
     if (receipt.resourceType === "repository") repositoryNodeId = receipt.observed.nodeId;
     completed.push(receipt);
-    if (wrote) {
-      ledger.set(receipt.operationId, receipt);
-      input.record([...ledger.values()]);
-      written.push(receipt.operationId);
-    } else {
+    if (outcome === "resumed") {
       resumed.push(receipt.operationId);
+      continue;
     }
+    // The receipt replaces its pending write in one atomic ledger write.
+    pending.delete(receipt.operationId);
+    receipts.set(receipt.operationId, receipt);
+    persist();
+    if (outcome === "written") written.push(receipt.operationId);
+    else adopted.push(receipt.operationId);
   }
 
   // The result states a default branch; it is stated only after GitHub says so. With no
@@ -1046,5 +1390,5 @@ export const applyGitHubOperations = async (
       false,
     );
   }
-  return allow(ReasonCode.OK, { receipts: completed, written, resumed });
+  return allow(ReasonCode.OK, { receipts: completed, written, adopted, resumed });
 };

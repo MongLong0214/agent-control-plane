@@ -5,6 +5,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
   GhCliGitHubClient,
   createGitHubApiWritePort,
+  ghChildEnv,
   parseGitHubIdentity,
 } from "../../src/bootstrap/github-write-port.ts";
 import type { GitHubClient } from "../../src/github/github-kernel.ts";
@@ -61,6 +62,7 @@ describe("GitHub write port over the REST API (#246)", () => {
       nodeId: "R_kgDOreal",
       fullName: "Acme/fixture",
       visibility: "public",
+      description: null,
       defaultBranch: "main",
     });
     expect(await port.observeRepository({ owner: "acme", name: "absent" })).toBeNull();
@@ -85,12 +87,18 @@ describe("GitHub write port over the REST API (#246)", () => {
       },
     });
     const port = createGitHubApiWritePort({ client });
-    const created = await port.createRepository(target, "public");
-    expect(created).toEqual({ nodeId: "R_kgDOnew", fullName: "acme/fixture", visibility: "public", defaultBranch: null });
+    const created = await port.createRepository(target, "public", "repo-factory:marker");
+    expect(created).toEqual({
+      nodeId: "R_kgDOnew",
+      fullName: "acme/fixture",
+      visibility: "public",
+      description: null,
+      defaultBranch: null,
+    });
     expect(client.calls.at(-1)).toEqual({
       method: "POST",
       path: "orgs/acme/repos",
-      body: { name: "fixture", private: false, visibility: "public", auto_init: false },
+      body: { name: "fixture", description: "repo-factory:marker", private: false, visibility: "public", auto_init: false },
     });
   });
 
@@ -101,11 +109,11 @@ describe("GitHub write port over the REST API (#246)", () => {
       "POST user/repos": { node_id: "R_kgDOmine", full_name: "acme/fixture", visibility: "private", private: true },
     });
     const port = createGitHubApiWritePort({ client });
-    await port.createRepository(target, "private");
+    await port.createRepository(target, "private", "repo-factory:marker");
     expect(client.calls.at(-1)).toEqual({
       method: "POST",
       path: "user/repos",
-      body: { name: "fixture", private: true, visibility: "private", auto_init: false },
+      body: { name: "fixture", description: "repo-factory:marker", private: true, visibility: "private", auto_init: false },
     });
   });
 
@@ -115,7 +123,7 @@ describe("GitHub write port over the REST API (#246)", () => {
       "GET user": { login: "octocat" },
     });
     const port = createGitHubApiWritePort({ client });
-    await expect(port.createRepository(target, "public")).rejects.toThrow(/octocat/);
+    await expect(port.createRepository(target, "public", "repo-factory:marker")).rejects.toThrow(/octocat/);
     expect(client.calls.filter((call) => call.method !== "GET")).toEqual([]);
   });
 
@@ -139,7 +147,7 @@ describe("GitHub write port over the REST API (#246)", () => {
     expect(client.calls.at(-1)).toEqual({ method: "PATCH", path: "repos/acme/fixture", body: { default_branch: "main" } });
 
     await port.protectBranch(target, "main", {
-      requiredStatusChecks: ["project-ci"],
+      requiredStatusChecks: { strict: true, contexts: ["project-ci"] },
       enforceAdmins: true,
       requiredApprovingReviewCount: 1,
       allowForcePushes: false,
@@ -159,7 +167,7 @@ describe("GitHub write port over the REST API (#246)", () => {
     });
 
     expect(await port.observeBranchProtection(target, "main")).toEqual({
-      requiredStatusChecks: ["project-ci", "z-check"],
+      requiredStatusChecks: { strict: true, contexts: ["project-ci", "z-check"] },
       enforceAdmins: true,
       requiredApprovingReviewCount: null,
       allowForcePushes: false,
@@ -206,8 +214,11 @@ describe("gh CLI transport (#246)", () => {
     expect(await client.request("GET", "repos/acme/fixture")).toEqual({ ok: true });
     await client.request("POST", "orgs/acme/repos", { name: "fixture" });
     expect(seen).toEqual([
-      { args: ["api", "--method", "GET", "repos/acme/fixture"], stdin: null },
-      { args: ["api", "--method", "POST", "orgs/acme/repos", "--input", "-"], stdin: '{"name":"fixture"}' },
+      { args: ["api", "--hostname", "github.com", "--method", "GET", "repos/acme/fixture"], stdin: null },
+      {
+        args: ["api", "--hostname", "github.com", "--method", "POST", "orgs/acme/repos", "--input", "-"],
+        stdin: '{"name":"fixture"}',
+      },
     ]);
   });
 
@@ -227,5 +238,56 @@ describe("gh CLI transport (#246)", () => {
       reasonCode: ReasonCode.INTERNAL_ERROR,
       evidence: { status: null },
     });
+  });
+});
+
+/**
+ * PR #1043 review witnesses. Each case reproduces a finding against the reviewed head
+ * (afd93586) and is kept as its regression guard.
+ */
+describe("PR #1043 review witnesses — the port reports only what GitHub said, from the host it names", () => {
+  it("RF1043-04: protection readback carries `strict` as GitHub returned it, so a non-strict check cannot pass for a strict one", async () => {
+    const client = scriptedClient({
+      "GET repos/acme/fixture/branches/main/protection": {
+        required_status_checks: { strict: false, contexts: ["project-ci"] },
+        enforce_admins: { enabled: true },
+        allow_force_pushes: { enabled: false },
+        allow_deletions: { enabled: false },
+      },
+    });
+    const observed = await createGitHubApiWritePort({ client }).observeBranchProtection(target, "main");
+    expect(observed).toEqual({
+      requiredStatusChecks: { strict: false, contexts: ["project-ci"] },
+      enforceAdmins: true,
+      requiredApprovingReviewCount: null,
+      allowForcePushes: false,
+      allowDeletions: false,
+    });
+  });
+
+  it("RF1043-04: a branch answer that names no branch is not filled in with the branch that was asked for", async () => {
+    const client = scriptedClient({
+      "GET repos/acme/fixture/branches/main": { commit: { sha: "a".repeat(40) } },
+    });
+    await expect(createGitHubApiWritePort({ client }).observeBranch(target, "main")).rejects.toThrow(/names no branch/);
+  });
+
+  it("RF1043-05: every `gh api` call names github.com, the host every github: identity and git URL means", async () => {
+    const seen: Array<readonly string[]> = [];
+    const client = new GhCliGitHubClient(async (args) => {
+      seen.push(args);
+      return { exitCode: 0, stdout: "{}", stderr: "" };
+    });
+    await client.request("GET", "repos/acme/fixture");
+    await client.request("POST", "orgs/acme/repos", { name: "fixture" });
+    for (const args of seen) expect(args.slice(0, 3)).toEqual(["api", "--hostname", "github.com"]);
+  });
+});
+
+describe("gh child environment (#246)", () => {
+  it("drops GH_HOST from the environment a `gh` child inherits, and keeps the rest", () => {
+    const parent = { HOME: "/home/owner", PATH: "/usr/bin", GH_HOST: "ghe.example.com", GH_CONFIG_DIR: "/cfg" };
+    expect(ghChildEnv(parent)).toEqual({ HOME: "/home/owner", PATH: "/usr/bin", GH_CONFIG_DIR: "/cfg" });
+    expect(parent.GH_HOST).toBe("ghe.example.com");
   });
 });

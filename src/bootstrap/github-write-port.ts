@@ -46,6 +46,8 @@ export interface ObservedRepository {
   nodeId: string;
   fullName: string;
   visibility: string;
+  /** Carries the create marker that lets a retry recognise its own create (RF1043-02). */
+  description: string | null;
   defaultBranch: string | null;
 }
 
@@ -55,29 +57,50 @@ export interface ObservedBranch {
 }
 
 /**
- * Branch protection in the port's own vocabulary — the five facts the producer asks for and
- * reads back. Everything else GitHub's protection document carries is neither requested nor
- * judged, and saying so here is the point: a readback compared on fields nobody set fails on
- * defaults, and one compared on fewer fields than were set passes on a weaker protection.
+ * Branch protection in the port's own vocabulary — every fact the producer asks for and reads
+ * back. Everything else GitHub's protection document carries is neither requested nor judged,
+ * and saying so here is the point: a readback compared on fields nobody set fails on defaults,
+ * and one compared on fewer fields than were set passes on a weaker protection — which is what
+ * leaving `strict` out did (PR #1043 review, RF1043-04): it was requested and never read back.
+ * `requiredStatusChecks: null` is "no required checks", GitHub's own representation of that.
  */
 export interface BranchProtectionState {
-  requiredStatusChecks: string[];
+  requiredStatusChecks: { strict: boolean; contexts: string[] } | null;
   enforceAdmins: boolean;
   requiredApprovingReviewCount: number | null;
   allowForcePushes: boolean;
   allowDeletions: boolean;
 }
 
+/**
+ * Protection as GitHub answered it. A flag GitHub's answer did not carry is `null` — unknown —
+ * never the value it was asked for or a default, so it cannot compare equal to a requested one.
+ */
+export interface ObservedBranchProtection {
+  requiredStatusChecks: { strict: boolean | null; contexts: string[] } | null;
+  enforceAdmins: boolean | null;
+  requiredApprovingReviewCount: number | null;
+  allowForcePushes: boolean | null;
+  allowDeletions: boolean | null;
+}
+
 export interface GitHubWritePort {
   observeRepository(target: GitHubRepositoryTarget): Promise<ObservedRepository | null>;
-  /** Returns GitHub's response to the create. The producer still re-reads it separately. */
-  createRepository(target: GitHubRepositoryTarget, visibility: GitHubVisibility): Promise<ObservedRepository>;
+  /**
+   * Returns GitHub's response to the create. The producer still re-reads it separately.
+   * `description` carries the producer's create marker, recorded before the call.
+   */
+  createRepository(
+    target: GitHubRepositoryTarget,
+    visibility: GitHubVisibility,
+    description: string,
+  ): Promise<ObservedRepository>;
   observeBranch(target: GitHubRepositoryTarget, branch: string): Promise<ObservedBranch | null>;
   pushBranch(target: GitHubRepositoryTarget, branch: string, checkoutPath: string, commitSha: string): Promise<void>;
   /** A read: brings an already-pushed commit into a fresh local checkout on resume. */
   fetchBranch(target: GitHubRepositoryTarget, branch: string, checkoutPath: string): Promise<void>;
   setDefaultBranch(target: GitHubRepositoryTarget, branch: string): Promise<void>;
-  observeBranchProtection(target: GitHubRepositoryTarget, branch: string): Promise<BranchProtectionState | null>;
+  observeBranchProtection(target: GitHubRepositoryTarget, branch: string): Promise<ObservedBranchProtection | null>;
   protectBranch(target: GitHubRepositoryTarget, branch: string, desired: BranchProtectionState): Promise<void>;
 }
 
@@ -137,6 +160,7 @@ interface RepositoryDocument {
   full_name?: unknown;
   visibility?: unknown;
   private?: unknown;
+  description?: unknown;
   default_branch?: unknown;
 }
 
@@ -158,26 +182,41 @@ const repositoryFrom = (document: RepositoryDocument, path: string): ObservedRep
         ? document.private ? "private" : "public"
         : "unknown";
   const defaultBranch = typeof document.default_branch === "string" ? document.default_branch : null;
-  return { nodeId, fullName, visibility, defaultBranch };
+  const description = typeof document.description === "string" ? document.description : null;
+  return { nodeId, fullName, visibility, description, defaultBranch };
 };
 
 interface ProtectionDocument {
-  required_status_checks?: { contexts?: unknown } | null;
+  required_status_checks?: { strict?: unknown; contexts?: unknown } | null;
   enforce_admins?: { enabled?: unknown } | null;
   required_pull_request_reviews?: { required_approving_review_count?: unknown } | null;
   allow_force_pushes?: { enabled?: unknown } | null;
   allow_deletions?: { enabled?: unknown } | null;
 }
 
-const enabled = (flag: { enabled?: unknown } | null | undefined): boolean => flag?.enabled === true;
+/** A flag GitHub did not report is unknown (`null`), never "off". */
+const enabled = (flag: { enabled?: unknown } | null | undefined): boolean | null =>
+  typeof flag?.enabled === "boolean" ? flag.enabled : null;
 
-const protectionFrom = (document: ProtectionDocument): BranchProtectionState => {
-  const contexts = document.required_status_checks?.contexts;
+/**
+ * GitHub omits `required_status_checks` and `required_pull_request_reviews` when they are off,
+ * so their absence is an answer; inside them, and for the always-present flags, a missing field
+ * is not, and reads as `null`.
+ */
+const protectionFrom = (document: ProtectionDocument): ObservedBranchProtection => {
+  const checks = document.required_status_checks;
+  const contexts = checks?.contexts;
   const reviews = document.required_pull_request_reviews?.required_approving_review_count;
   return {
-    requiredStatusChecks: Array.isArray(contexts)
-      ? contexts.filter((context): context is string => typeof context === "string").sort()
-      : [],
+    requiredStatusChecks:
+      checks == null
+        ? null
+        : {
+              strict: typeof checks.strict === "boolean" ? checks.strict : null,
+              contexts: Array.isArray(contexts)
+                ? contexts.filter((context): context is string => typeof context === "string").sort()
+                : [],
+            },
     enforceAdmins: enabled(document.enforce_admins),
     requiredApprovingReviewCount: typeof reviews === "number" ? reviews : null,
     allowForcePushes: enabled(document.allow_force_pushes),
@@ -202,7 +241,7 @@ export interface GitHubApiWritePortOptions {
 const GH_CREDENTIAL = ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"] as const;
 
 const remoteUrl = (target: GitHubRepositoryTarget): string =>
-  `https://github.com/${target.owner}/${target.name}.git`;
+  `https://${GITHUB_HOST}/${target.owner}/${target.name}.git`;
 
 const repoPath = (target: GitHubRepositoryTarget): string => `repos/${target.owner}/${target.name}`;
 
@@ -226,7 +265,7 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
         repositoryFrom(await client.request<RepositoryDocument>("GET", repoPath(target)), repoPath(target)),
       ),
 
-    async createRepository(target, visibility) {
+    async createRepository(target, visibility, description) {
       // The endpoint decides the owner, so it is chosen from what GitHub says the owner is —
       // never assumed. `POST user/repos` creates under whoever is authenticated, whatever the
       // plan named; that is the user/organization confusion this refuses rather than risks.
@@ -248,6 +287,7 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
       }
       const created = await client.request<RepositoryDocument>("POST", path, {
         name: target.name,
+        description,
         private: visibility === "private",
         visibility,
         auto_init: false,
@@ -267,7 +307,14 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
             path: branchPath(target, branch),
           });
         }
-        return { name: typeof document.name === "string" ? document.name : branch, headSha: sha };
+        // Not filled in from the request (RF1043-04): an answer that does not say which branch it
+        // describes is not a readback of the branch that was asked about.
+        if (typeof document.name !== "string") {
+          throw acpError(ReasonCode.INTERNAL_ERROR, "GitHub's branch answer names no branch", {
+            path: branchPath(target, branch),
+          });
+        }
+        return { name: document.name, headSha: sha };
       }),
 
     async pushBranch(target, branch, checkoutPath, commitSha) {
@@ -298,9 +345,9 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
     async protectBranch(target, branch, desired) {
       await client.request("PUT", `${branchPath(target, branch)}/protection`, {
         required_status_checks:
-          desired.requiredStatusChecks.length > 0
-            ? { strict: true, contexts: [...desired.requiredStatusChecks] }
-            : null,
+          desired.requiredStatusChecks === null
+            ? null
+            : { strict: desired.requiredStatusChecks.strict, contexts: [...desired.requiredStatusChecks.contexts] },
         enforce_admins: desired.enforceAdmins,
         required_pull_request_reviews:
           desired.requiredApprovingReviewCount === null
@@ -323,16 +370,40 @@ export interface GhRunResult {
 export type GhRunner = (args: readonly string[], stdin: string | null) => Promise<GhRunResult>;
 
 const GH_TIMEOUT_MS = 120_000;
+
+/**
+ * The only host this port addresses. A `github:` identity means github.com, and so does every git
+ * URL `remoteUrl` builds; the REST half has to mean the same host, or a `GH_HOST` in the
+ * environment sends observations, the create and the node-id checks to one server while the
+ * push lands on a same-named repository on another (PR #1043 review, RF1043-05).
+ */
+export const GITHUB_HOST = "github.com";
+
+/**
+ * The environment a `gh` child gets: the parent's, without `GH_HOST`. `--hostname` already
+ * names the host on every call; dropping the variable as well means no `gh` behaviour that
+ * consults it — a pager, an alias, a future subcommand — can route this port elsewhere.
+ */
+export const ghChildEnv = (env: NodeJS.ProcessEnv): NodeJS.ProcessEnv => {
+  const child: NodeJS.ProcessEnv = { ...env };
+  delete child["GH_HOST"];
+  return child;
+};
 const GH_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 
 /**
  * `gh` as a child: argv only, no shell, a time bound, and the body on stdin rather than argv so
- * nothing in it is ever parsed as a flag. The environment is inherited because `gh` reads its
- * own authentication from it; nothing here reads, logs or forwards a credential.
+ * nothing in it is ever parsed as a flag. The environment is inherited — less `GH_HOST`, see
+ * `ghChildEnv` — because `gh` reads its own authentication from it; nothing here reads, logs or
+ * forwards a credential.
  */
 const spawnGh: GhRunner = (args, stdin) =>
   new Promise((resolvePromise, reject) => {
-    const child = spawn("gh", [...args], { stdio: ["pipe", "pipe", "pipe"], timeout: GH_TIMEOUT_MS });
+    const child = spawn("gh", [...args], {
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: GH_TIMEOUT_MS,
+      env: ghChildEnv(process.env),
+    });
     let stdout = "";
     let stderr = "";
     let overflow = false;
@@ -381,7 +452,7 @@ export class GhCliGitHubClient implements GitHubClient {
     path: string,
     body?: unknown,
   ): Promise<T> {
-    const args = ["api", "--method", method, path];
+    const args = ["api", "--hostname", GITHUB_HOST, "--method", method, path];
     let stdin: string | null = null;
     if (body !== undefined) {
       args.push("--input", "-");

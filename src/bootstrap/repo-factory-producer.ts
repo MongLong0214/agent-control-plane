@@ -12,7 +12,7 @@ import { dirname, join, resolve } from "node:path";
 import { z } from "zod";
 
 import { type Clock, systemClock } from "../core/clock.ts";
-import { digestOf } from "../core/digest.ts";
+import { canonicalJson, digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { git, tryRevParse, type GitResult } from "../git/git.ts";
@@ -23,13 +23,15 @@ import {
   githubLedgerPath,
   githubOperationSchema,
   preflightGitHubOperations,
+  producedResultPath,
   readGitHubLedger,
   toExternalWriteReceipt,
   writeGitHubLedger,
+  writeProducedResult,
   type AppliedGitHubOperations,
   type GitHubExecutionPlan,
-  type GitHubOperationReceipt,
   type GitHubWriteAuthority,
+  type LedgerState,
 } from "./repo-factory-github.ts";
 import {
   REPO_FACTORY_RESULT_SCHEMA_ID,
@@ -92,6 +94,19 @@ export const VERIFICATION_KINDS = {
 
 export type VerificationKind = keyof typeof VERIFICATION_KINDS;
 
+/**
+ * The verification kind whose fixed invocation *is* this argv — run as `git <argv...>` in the
+ * checkout root — or null. A result's PASS names a manifest command id; it is honest only when
+ * that command is the invocation the producer actually ran (PR #1043 review, RF1043-03). The
+ * argv is compared, never executed: the executed argv is still only the hardcoded one above.
+ */
+export const verificationKindRunning = (argv: readonly string[]): VerificationKind | null => {
+  for (const [kind, spec] of Object.entries(VERIFICATION_KINDS) as Array<[VerificationKind, { argv: readonly string[] }]>) {
+    if (canonicalJson(["git", ...spec.argv]) === canonicalJson(argv)) return kind;
+  }
+  return null;
+};
+
 export const repoFactoryPlanFixtureSchema = z
   .object({
     runId: z.string().min(1),
@@ -102,7 +117,12 @@ export const repoFactoryPlanFixtureSchema = z
     /** Kebab-case only — this is also the local directory name, so it cannot carry a path. */
     repositoryRole: z.string().min(1).regex(/^[a-z0-9][a-z0-9-]*$/, "repositoryRole must be kebab-case"),
     defaultBranch: z.string().min(1),
-    /** Correlates to a named command in the approved manifest — never itself run as argv. */
+    /**
+     * The approved manifest command the PASS is recorded under — never itself run as argv. The
+     * label is honest only if that command *is* `verificationKind`'s invocation; this producer
+     * cannot see the manifest, so its caller must establish that (`verificationKindRunning`,
+     * as `RepoFactoryBootstrapRunner` does — PR #1043 review, RF1043-03).
+     */
     verificationCommandId: z.string().min(1),
     /** Which of `VERIFICATION_KINDS` this producer actually runs. Closed, not free-form argv. */
     verificationKind: z.enum(["CLEAN_TREE"]),
@@ -141,6 +161,22 @@ const localRepositoryIdentity = (repositoryRole: string): string => `local:${rep
 
 /** Marker this run's own checkout carries so a later failure only ever cleans up its own. */
 const OPERATION_MARKER_NAME = ".repo-factory-operation.json";
+
+/**
+ * The bootstrap operation an existing checkout's marker names, or null. Read only to word a
+ * refusal: nothing is removed or reused on its strength, so a forged marker changes a message.
+ */
+const checkoutMarkerOf = (localRepoPath: string): string | null => {
+  try {
+    if (!lstatSync(localRepoPath).isDirectory()) return null;
+    const marker = JSON.parse(readFileSync(join(localRepoPath, OPERATION_MARKER_NAME), "utf8")) as {
+      bootstrapOperationId?: unknown;
+    };
+    return typeof marker.bootstrapOperationId === "string" ? marker.bootstrapOperationId : null;
+  } catch {
+    return null;
+  }
+};
 
 /**
  * CEO review round 8 — this producer used to also run a realpath-based containment check
@@ -565,6 +601,16 @@ export const produceRepoFactoryResult = async (
   // `existsSync` check has a gap another process's own creation can land in before this one
   // reads it).
   if (existsSync(localRepoPath)) {
+    // Said explicitly when the checkout is this operation's own (PR #1043 review, RF1043-02): a
+    // run that died between its last write and storing its result leaves it. It is named rather
+    // than removed, because a live run of the same operation cannot be told from a dead one.
+    if (checkoutMarkerOf(localRepoPath) === plan.bootstrapOperationId) {
+      return deny(
+        ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
+        "this bootstrap operation's checkout already exists: an earlier run of it was interrupted, or is still running. It is not removed automatically; remove it once no run of this operation is active, and the next run resumes from the GitHub ledger",
+        { refusal: "INTERRUPTED_RUN_CHECKOUT", localRepoPath, resumable: false },
+      );
+    }
     return deny(
       ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
       "local repository checkout path already exists; a same-named resource with unknown provenance is a collision, not a resume (Integration §13.3)",
@@ -625,14 +671,14 @@ export const produceRepoFactoryResult = async (
 
   // Read only once this call holds the checkout leaf, which `createCheckoutLeafOrDeny` grants to
   // exactly one caller per role — so no other producer is writing this ledger while it is read.
-  let priorReceipts: ReadonlyMap<string, GitHubOperationReceipt> = new Map();
+  let prior: LedgerState = { receipts: new Map(), pending: new Map() };
   if (github !== null) {
-    const prior = readGitHubLedger(github.ledgerPath, ledgerOwner, github.execution.operations);
-    if (!prior.allowed) {
+    const ledger = readGitHubLedger(github.ledgerPath, ledgerOwner, github.execution.operations);
+    if (!ledger.allowed) {
       cleanup();
-      return prior as Decision<RepoFactoryResult>;
+      return ledger as Decision<RepoFactoryResult>;
     }
-    priorReceipts = prior.value;
+    prior = ledger.value;
   }
 
   const createdAt = clock.nowIso();
@@ -696,9 +742,14 @@ export const produceRepoFactoryResult = async (
         port: github.port,
         checkoutPath: localRepoPath,
         defaultBranch: plan.defaultBranch,
-        prior: priorReceipts,
-        record: (receipts) =>
-          writeGitHubLedger(ledgerPath, { schema: GITHUB_LEDGER_SCHEMA_ID, ...ledgerOwner, receipts: [...receipts] }),
+        prior,
+        record: (state) =>
+          writeGitHubLedger(ledgerPath, {
+            schema: GITHUB_LEDGER_SCHEMA_ID,
+            ...ledgerOwner,
+            receipts: state.receipts,
+            pending: state.pending,
+          }),
         ledgerPath,
         clock,
       });
@@ -808,5 +859,10 @@ export const produceRepoFactoryResult = async (
     unresolvedGaps: [],
   };
 
+  // Kept beside the ledger before it is returned, so a caller that loses it before storing it
+  // can rebuild it rather than be refused at this checkout on retry (PR #1043 review, RF1043-02).
+  if (github !== null) {
+    writeProducedResult(producedResultPath(input.workDir, plan.repositoryRole), ledgerOwner, result);
+  }
   return allow(ReasonCode.OK, result);
 };
