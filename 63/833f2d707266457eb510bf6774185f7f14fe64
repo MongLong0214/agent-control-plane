@@ -1,0 +1,8 @@
+Limit: a daemon restart reconciles every live session whose pid is gone to ERROR and revokes nothing, so a restarted canonical runtime ordinarily finds its predecessor row already terminal while that predecessor's PRIMARY_CTO generation is still ACTIVE
+Warn: the predecessor row's lifecycle decides only whether #mutate reconciles it to STOPPED; releasing a still-ACTIVE binding still rests on probeSessionLiveness answering DEAD, the holder being this same actor and the generation being the one in force, so a terminal row must never be read as proof that the process is gone
+Warn: a STOPPED or ERROR predecessor is left as written and not transitioned again; the terminal-predecessor tests assert the row is byte for byte unchanged, which is what catches a change that starts reconciling an ERROR row
+Unverified: scripts/lib/refusal-operands-unanswered.mjs still explains the lifecycle operands as surviving because every fixture's predecessor is READY or DRAINING; the new ERROR and STOPPED fixtures make that sentence stale and may kill those mutants, but no mutation run was made against them
+Unverified: the tests/process canonical-self-claim identity and listener files fail 22 cases on this host, the same 22 on base b6e164b7, so they say nothing about this change
+Record-Id: r-terminalpredecessor
+Follows: r-b631a449536c
+Provenance: inherited 32fcfcf30154163808f5a3b926685f074ddab93f
