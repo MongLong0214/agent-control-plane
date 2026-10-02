@@ -6,7 +6,7 @@ const anIngressSettlementIsSpentWithItsReconcile = {
   id: "an-ingress-settlement-is-spent-with-its-reconcile",
   what: "a settlement captured from a callback settles nothing afterwards",
   file: "src/conversation/turn-coordinator.ts",
-  find: "      ISSUED_INGRESS_SETTLEMENTS.delete(settlement);",
+  find: "      withdrawIngressReceiptSettlement(settlement);",
   replace: "      void settlement;",
   killedBy: [
     "tests/unit/a-completed-receipt-settles-with-its-owner-reply.test.ts::spends the settlement: one captured from the callback settles nothing afterwards",

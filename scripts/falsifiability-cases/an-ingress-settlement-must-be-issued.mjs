@@ -6,8 +6,8 @@ const anIngressSettlementMustBeIssued = {
   id: "an-ingress-settlement-must-be-issued",
   what: "a settlement a caller built does not settle an ingress claim",
   file: "src/ingress/ingress-guard.ts",
-  find: "    const issued = redeemIngressReceiptSettlement(settlement);",
-  replace: "    const issued = redeemIngressReceiptSettlement(settlement) ?? settlement;",
+  find: "    const issued = redeemIngressReceiptSettlement(settlement, this.db);",
+  replace: "    const issued = redeemIngressReceiptSettlement(settlement, this.db) ?? settlement;",
   killedBy: [
     "tests/unit/a-completed-receipt-settles-with-its-owner-reply.test.ts::R1041-03 refuses a settlement shaped like the coordinator's but built by a caller",
   ],

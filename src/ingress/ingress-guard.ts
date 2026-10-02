@@ -7,12 +7,14 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import type { OwnerApprovalReceipt } from "../ceo/owner-authority.ts";
-import { REPLY_OUTBOX_RESULT_KIND, REPLY_OUTBOX_SETTLEMENT } from "../conversation/owner-reply-outbox.ts";
 import {
   type IngressReceiptSettlement,
-  type ReceiptLookupQuery,
+  REPLY_OUTBOX_RESULT_KIND,
+  REPLY_OUTBOX_SETTLEMENT,
+  ownerReplyOwing,
   redeemIngressReceiptSettlement,
-} from "../conversation/turn-coordinator.ts";
+} from "../conversation/owner-reply-outbox.ts";
+import type { ReceiptLookupQuery } from "../conversation/turn-coordinator.ts";
 import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
 
 // Only the validated claim paths below mint this token. A Db holder receives no issuer.
@@ -755,7 +757,7 @@ export class IngressGuard {
    * has read this settlement back.
    */
   completeClaimFromHermesReceipt(settlement: IngressReceiptSettlement): Decision<void> {
-    const issued = redeemIngressReceiptSettlement(settlement);
+    const issued = redeemIngressReceiptSettlement(settlement, this.db);
     if (issued === null) {
       return deny(
         ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN,
@@ -1268,6 +1270,21 @@ export class IngressGuard {
             ReasonCode.RESOURCE_COLLISION,
             "cannot transition an ingress result for a turn already resolved as no-reply or settled by a delivery failure",
             { channel, nonce },
+          );
+        }
+      }
+      // An answer and an owner-reply obligation for one message exclude each other in either order
+      // (#1041 review, R1041-02, round 2). The obligation side refuses a message whose answer is
+      // already reserved here; this side refuses to reserve, complete or settle a CEO answer for a
+      // message whose reply a target receipt already queued. A sentence that is not the CEO's
+      // answer (`turnAnswered: false`) discharges nothing and is not refused.
+      if (carriesTheAnswer(result)) {
+        const owedBy = ownerReplyOwing(this.db, { channel, nonce });
+        if (owedBy !== null) {
+          return deny(
+            ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT,
+            "this message's answer is already owed through the owner-reply outbox",
+            { channel, nonce, owedBy },
           );
         }
       }
@@ -1872,6 +1889,17 @@ export class IngressGuard {
           ReasonCode.RESOURCE_COLLISION,
           "cannot record an accepted reply for a turn already settled by a delivery failure",
           { channel, nonce },
+        );
+      }
+      // `repliedAt` is the answer reaching the owner; the owner-reply outbox already owing this
+      // message's answer is the other half of the same exclusion (R1041-02, round 2). Buzz reaches
+      // this directly, without a reservation step to refuse first.
+      const owedBy = ownerReplyOwing(this.db, { channel, nonce });
+      if (owedBy !== null) {
+        return deny(
+          ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT,
+          "this message's answer is already owed through the owner-reply outbox",
+          { channel, nonce, owedBy },
         );
       }
       const updated = this.db.run(
@@ -2518,6 +2546,12 @@ const sameReceiptIdentity = (left: ReceiptLookupQuery, right: ReceiptLookupQuery
   && left.targetAttestationId === right.targetAttestationId
   && left.executorSessionId === right.executorSessionId
   && left.executorSessionIncarnation === right.executorSessionIncarnation;
+
+/** Whether a reply-lifecycle result carries the CEO's answer rather than a composed sentence. */
+const carriesTheAnswer = (result: unknown): boolean => {
+  if (typeof result !== "object" || result === null || Array.isArray(result)) return false;
+  return (result as { turnAnswered?: unknown }).turnAnswered === true;
+};
 
 const nonEmptyReceipt = (receipt: {
   outcome: "COMPLETED" | "ABORTED";

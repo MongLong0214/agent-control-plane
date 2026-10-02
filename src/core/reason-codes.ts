@@ -577,6 +577,13 @@ export const ReasonCode = {
    */
   CONVERSATION_TURN_REPLY_CONFLICT: "CONVERSATION_TURN_REPLY_CONFLICT",
   /**
+   * A reconciled `COMPLETED` receipt names a message whose ingress claim a handler in this process
+   * still holds open. That handler may yet deliver the answer itself, so creating the owner-reply
+   * obligation now could produce a second reply. The settlement waits for the next sweep, by which
+   * time the claim records how it ended (#1041 review, R1041-02).
+   */
+  CONVERSATION_TURN_REPLY_IN_FLIGHT: "CONVERSATION_TURN_REPLY_IN_FLIGHT",
+  /**
    * A reconciled receipt names a different target binding than the one this turn was claimed
    * against. Kept apart from the generation/runtime checks because it is a distinct fact: which
    * Hermes conversation this turn belongs to, not which execution of it.

@@ -102,6 +102,8 @@ export interface EnqueueOwnerReplyInput {
   /** The turn's ingress messages in batch order. The reply answers the last one. */
   readonly sources: readonly OwnerReplySource[];
   readonly receipt: OwnerReplyReceipt;
+  /** This process's claim incarnation; a claim it still holds open may yet be answered live. */
+  readonly answeringProcess: string;
 }
 
 /**
@@ -149,6 +151,87 @@ export const claimOwnerReplyAuthority = (db: Db): OwnerReplyAuthority => {
     }
   });
   return authority;
+};
+
+/**
+ * The right to settle one ingress claim from one receipt the turn coordinator verified (#1041
+ * review, R1041-03).
+ *
+ * Minted only by `issueIngressReceiptSettlement`, which demands the database's owner-reply
+ * authority — so only the coordinator holding it can mint one, and only after its sealed port
+ * matched every identity field of the receipt. The ingress guard accepts nothing else.
+ */
+export interface IngressReceiptSettlement {
+  readonly channel: string;
+  readonly nonce: string;
+  readonly query: {
+    readonly turnRequestId: string;
+    readonly targetActorId: string;
+    readonly promptDigest: string;
+    readonly bindingGeneration: number;
+    readonly targetBindingId: string;
+    readonly targetAttestationId: string;
+    readonly executorSessionId: string;
+    readonly executorSessionIncarnation: string;
+  };
+  readonly receipt: {
+    readonly outcome: "COMPLETED" | "ABORTED";
+    readonly receiptId: string;
+    readonly evidenceDigest: string;
+    readonly reasonCode: string;
+  };
+}
+
+/** Each live settlement, keyed to the exact `Db` handle that issued it. */
+const ISSUED_INGRESS_SETTLEMENTS = new WeakMap<object, Db>();
+
+const assertAuthority = (authority: OwnerReplyAuthority, db: Db, turnRequestId: string): void => {
+  if (ISSUED_OWNER_REPLY_AUTHORITIES.get(db.identity) !== authority) {
+    throw acpError(
+      ReasonCode.COMPLETION_AUTHORITY_DENIED,
+      "only the holder of this database's owner-reply authority may do this",
+      { turnRequestId },
+    );
+  }
+};
+
+export const issueIngressReceiptSettlement = (
+  authority: OwnerReplyAuthority,
+  db: Db,
+  fields: IngressReceiptSettlement,
+): IngressReceiptSettlement => {
+  assertAuthority(authority, db, fields.query.turnRequestId);
+  const settlement: IngressReceiptSettlement = Object.freeze({
+    channel: fields.channel,
+    nonce: fields.nonce,
+    query: Object.freeze({ ...fields.query }),
+    receipt: Object.freeze({ ...fields.receipt }),
+  });
+  ISSUED_INGRESS_SETTLEMENTS.set(settlement, db);
+  return settlement;
+};
+
+/** Withdraws a settlement whether or not it was redeemed. The issuer calls this when it is done. */
+export const withdrawIngressReceiptSettlement = (settlement: IngressReceiptSettlement): void => {
+  ISSUED_INGRESS_SETTLEMENTS.delete(settlement);
+};
+
+/**
+ * The settlement itself when `value` is one issued against this exact `Db` handle and not yet
+ * redeemed; `null` otherwise. Redeeming spends it.
+ *
+ * Bound to the handle rather than to the file: a settlement minted by database A's coordinator and
+ * handed to database B's guard settled B while A rolled its own half back (R1041-03, round 2). The
+ * window is the issuer's own transaction: the coordinator issues it, opens its transaction on that
+ * same handle before running any caller code, hands it to the closure inside, and withdraws it the
+ * moment the transaction returns, so a live settlement can only be redeemed inside that transaction.
+ */
+export const redeemIngressReceiptSettlement = (value: unknown, db: Db): IngressReceiptSettlement | null => {
+  // A WeakMap answers `undefined` for any key that is not a live object, primitives included.
+  const settlement = value as IngressReceiptSettlement;
+  if (ISSUED_INGRESS_SETTLEMENTS.get(settlement) !== db) return null;
+  ISSUED_INGRESS_SETTLEMENTS.delete(settlement);
+  return settlement;
 };
 
 type StoredPayload = Omit<OwnerReplyItem, "status" | "enqueuedAt">;
@@ -285,22 +368,45 @@ const answeredThroughIngress = (db: Db, source: OwnerReplySource): boolean => {
   return reply !== null;
 };
 
-/** The other turn whose reply item already answers this message, if any. */
-const owedByAnotherItem = (db: Db, source: OwnerReplySource, turnRequestId: string): string | null =>
+/**
+ * The turn whose reply item already answers this message, if any, other than `exceptTurn`.
+ *
+ * Exported for the ingress guard, which refuses to record an answer for a message this lane already
+ * owes one for: the two must exclude each other in either order (R1041-02, round 2).
+ */
+export const ownerReplyOwing = (db: Db, source: OwnerReplySource, exceptTurn: string | null = null): string | null =>
   db.get<{ nonce: string }>(
     `SELECT item.nonce FROM inbound_messages AS item, json_each(item.payload_json, '$.sources') AS answered
       WHERE item.channel = ?
-        AND item.nonce <> ?
+        AND item.nonce IS NOT ?
         AND json_extract(answered.value, '$.channel') = ?
         AND json_extract(answered.value, '$.nonce') = ?
       ORDER BY item.received_at ASC, item.nonce ASC LIMIT 1`,
-    [OWNER_REPLY_OUTBOX_CHANNEL, turnRequestId, source.channel, source.nonce],
+    [OWNER_REPLY_OUTBOX_CHANNEL, exceptTurn, source.channel, source.nonce],
   )?.nonce ?? null;
+
+/**
+ * Whether a handler in this process still holds the message's ingress claim open — claimed by
+ * `answeringProcess` and not yet resolved by any terminal fact. That handler may still produce and
+ * deliver the answer, so an obligation created now could be the second reply (R1041-02, round 2).
+ * A claim taken by another incarnation belongs to a process that is gone and can answer nothing.
+ */
+const answerInFlight = (db: Db, source: OwnerReplySource, answeringProcess: string): boolean => {
+  const row = db.get<{ turn_claim_json: string | null }>(
+    `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+    [source.channel, source.nonce],
+  );
+  const claim = recordOf(row?.turn_claim_json ?? null);
+  if (claim?.["claimedByProcess"] !== answeringProcess) return false;
+  if (claim["repliedAt"] !== undefined) return false;
+  if (claim["noReplyAt"] !== undefined) return false;
+  return claim["settledAt"] === undefined;
+};
 
 /** Answered through ingress, or already named by another turn's reply item. */
 const alreadyAnswered = (db: Db, source: OwnerReplySource, turnRequestId: string): boolean => {
   if (answeredThroughIngress(db, source)) return true;
-  return owedByAnotherItem(db, source, turnRequestId) !== null;
+  return ownerReplyOwing(db, source, turnRequestId) !== null;
 };
 
 /** The part of an item that says which obligation it is; the address is derived, not compared. */
@@ -354,13 +460,7 @@ export const enqueueOwnerReply = (
   clock: Clock,
   input: EnqueueOwnerReplyInput,
 ): Decision<OwnerReplyEnqueued> => {
-  if (ISSUED_OWNER_REPLY_AUTHORITIES.get(db.identity) !== authority) {
-    throw acpError(
-      ReasonCode.COMPLETION_AUTHORITY_DENIED,
-      "an owner reply is enqueued only by the holder of this database's owner-reply authority",
-      { turnRequestId: input.turnRequestId },
-    );
-  }
+  assertAuthority(authority, db, input.turnRequestId);
   if (!db.inTransaction) {
     // Outside the settlement transaction the item and the turn are two commits, which is the
     // half-written state this lane exists to make unreachable.
@@ -387,6 +487,15 @@ export const enqueueOwnerReply = (
       );
     }
     return allow(ReasonCode.OK, { status: "REDELIVERED", item: stored });
+  }
+
+  const inFlight = input.sources.find((source) => answerInFlight(db, source, input.answeringProcess));
+  if (inFlight !== undefined) {
+    return deny(
+      ReasonCode.CONVERSATION_TURN_REPLY_IN_FLIGHT,
+      "a handler in this process still holds this message open and may answer it; ask again once it settles",
+      { turnRequestId: input.turnRequestId, channel: inFlight.channel, nonce: inFlight.nonce },
+    );
   }
 
   const covered = input.sources.filter((source) => alreadyAnswered(db, source, input.turnRequestId));
