@@ -80,7 +80,12 @@ describe("repo-factory:produce-local CLI (#246)", () => {
     const plan: RepoFactoryPlanFixture = {
       ...basePlan(),
       githubOperations: [
-        { operationId: "repo-create", resourceType: "repository", resourceIdentity: "github:acme/repo" },
+        {
+          operationId: "repo-create",
+          resourceType: "repository",
+          resourceIdentity: "github:acme/repo",
+          desiredState: { visibility: "public" },
+        },
       ],
     };
     const planPath = writePlan(sandbox, plan);

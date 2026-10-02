@@ -23,8 +23,11 @@ export interface OwnerIdentity {
 export interface OwnerAuthorityPort {
   isAllowedActor(channel: string, actor: string): boolean;
   assertApproval(receipt: OwnerApprovalReceipt): Decision<void>;
-  /** Re-admit a retained decision only when its durable consumption names this candidate. */
-  assertConsumedApproval(receipt: OwnerApprovalReceipt, candidateSnapshotDigest: string): Decision<void>;
+  /**
+   * Re-admit a retained decision only when its durable consumption names this candidate — or,
+   * for a non-candidate owner operation consumed with `null`, names no candidate.
+   */
+  assertConsumedApproval(receipt: OwnerApprovalReceipt, candidateSnapshotDigest: string | null): Decision<void>;
   /**
    * Atomically consume an admitted receipt for the candidate (or null for a non-candidate
    * owner operation). Retained artifacts use assertApproval; only an authorising write calls
@@ -251,7 +254,7 @@ export class OwnerAuthority implements OwnerAuthorityPort {
    */
   assertConsumedApproval(
     receipt: OwnerApprovalReceipt,
-    candidateSnapshotDigest: string,
+    candidateSnapshotDigest: string | null,
   ): Decision<void> {
     const prior = this.consumedReceipt(digestOf(receipt));
     if (!prior) {

@@ -9,6 +9,7 @@ import { canonicalJson, digestOf } from "../../../src/core/digest.ts";
 import { ReasonCode } from "../../../src/core/reason-codes.ts";
 import { Role, roleKeyFor } from "../../../src/domain/types.ts";
 import { startDaemonTelegramListener } from "../../../src/daemon/agentcpd.ts";
+import { pendingOwnerReplies } from "../../../src/conversation/owner-reply-outbox.ts";
 import { TelegramInterruption } from "../../../src/ingress/telegram-router.ts";
 import type { TelegramBotTransport } from "../../../src/ingress/telegram-polling.ts";
 import type { TelegramUpdate } from "../../../src/ingress/telegram.ts";
@@ -22,7 +23,7 @@ export const CHAT_ID = "-100999";
 export const UPDATE_ID = 4242;
 export const PROMPT = "did Hermes finish this exact turn?";
 
-type ReceiptMode = "matching" | "missing" | "wrong-turn" | "wrong-runtime" | "corrupt";
+type ReceiptMode = "matching" | "completed" | "missing" | "wrong-turn" | "wrong-runtime" | "corrupt";
 
 export interface LostReport {
   pid: number;
@@ -39,6 +40,9 @@ export interface RestartReport {
   offsetAfter: number | null;
   noReplyAt: string | null;
   receiptId: string | null;
+  settlement: string | null;
+  /** Every owner reply the restart left queued, as `channel conversation sourceNonce replyTo`. */
+  ownerReplies: string[];
 }
 
 const update: TelegramUpdate = {
@@ -80,6 +84,15 @@ const receiptOptions = (
     executorCalls.value += 1;
     if (mode === "missing") return { status: "NEVER_FOUND" };
     if (mode === "corrupt") return { status: "FAILED", reason: "MALFORMED_TERMINAL_RECEIPT" };
+    if (mode === "completed") {
+      return {
+        status: "COMPLETED",
+        receiptIdentity: input.receiptIdentity,
+        receiptId: "receipt:completed",
+        evidenceDigest: digestOf({ mode, identity: input.receiptIdentity }),
+        content: "the CEO's answer, which Hermes committed before the restart",
+      } satisfies HermesAcpResult;
+    }
     const identity = mode === "wrong-turn"
       ? { ...input.receiptIdentity, turnRequestId: "tr_wrong_turn" }
       : mode === "wrong-runtime"
@@ -239,6 +252,9 @@ const restart = async (root: string, mode: ReceiptMode): Promise<RestartReport> 
     offsetAfter: listener.service.offset ?? null,
     noReplyAt: typeof claim["noReplyAt"] === "string" ? claim["noReplyAt"] : null,
     receiptId: typeof receipt?.receiptId === "string" ? receipt.receiptId : null,
+    settlement: typeof claim["settlement"] === "string" ? claim["settlement"] : null,
+    ownerReplies: pendingOwnerReplies(harness.cp.db).map((item) =>
+      `${item.address.channel} ${item.address.conversation} ${item.address.sourceNonce} ${String(item.address.replyToMessageId)}`),
   };
 };
 

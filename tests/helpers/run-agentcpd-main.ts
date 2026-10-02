@@ -10,12 +10,12 @@ import type { TelegramBotTransport } from "../../src/ingress/telegram-polling.ts
 import type { TelegramUpdate } from "../../src/ingress/telegram.ts";
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { ingressSignature } from "../../src/ingress/ingress-guard.ts";
+import { IngressGuard, ingressSignature } from "../../src/ingress/ingress-guard.ts";
 import { buzzMessageSigningRequest } from "../../src/ingress/buzz-message.ts";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { generateKeyPairSync } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { join } from "node:path";
 
@@ -226,13 +226,114 @@ if (registerProjectIds.length > 0) {
 }
 
 if (process.env["ACP_STARTUP_TEST_PARK"] === "1") {
-  // No routable quota from any provider, which is the host this bootstrap park exists for.
-  // `isRoutableFor` rejects on `runtimeHealth === "UNAVAILABLE"` before it reads buckets, so
-  // that field is what makes every required role uncovered here; the empty buckets would do it
-  // on their own too. The ERROR sensor raises CAPACITY_SENSOR_FAILED, which is deliberately
-  // non-blocking, so ROLE_COVERAGE_NO_VALID_COVERAGE is the only blocking finding and `start()`
-  // parks instead of returning. The GitHub credential seed is load-bearing: without it
-  // TRUSTED_GATE_CREDENTIAL_MISSING is also blocking and the daemon takes the exit path.
+  // A canonical turn two authorities disagree about: an integrity quarantine, still blocking, and
+  // still one `start()` parks for, because the parked door can adjudicate it. This used to be "no
+  // routable quota", but capacity is availability and no longer blocks startup, so a case that
+  // needs a park has to stand on a real blocker. CANONICAL_TURN_CONTRADICTED is the only blocking
+  // finding here, so `start()` parks instead of returning. The GitHub credential seed is
+  // load-bearing: without it TRUSTED_GATE_CREDENTIAL_MISSING is also blocking and the daemon
+  // takes the exit path. The rows are the ones `the-quarantine-has-an-operator-door.test.ts`
+  // builds, written through the same ledger calls.
+  const seed = new ControlPlane(config);
+  try {
+    const at = systemClock.nowIso();
+    seed.db.run(
+      `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
+       VALUES ('runtime:park', 'inc', 'claude', 'opus', 'READY', ?, ?)`,
+      [at, at],
+    );
+    seed.db.run(
+      `INSERT INTO conversational_actors
+         (actor_id, kind, current_session_id, current_session_incarnation, created_at)
+       VALUES ('actor:park', 'CEO', 'runtime:park', 'inc', ?)`,
+      [at],
+    );
+    seed.db.run(
+      `INSERT INTO actor_target_bindings
+         (target_binding_id, target_actor_id, executor_kind, target_locator, target_locator_digest, bound_at)
+       VALUES ('bind:park', 'actor:park', 'hermes', 'locator:park', 'digest:park', ?)`,
+      [at],
+    );
+    seed.db.run(
+      `INSERT INTO assignments
+         (assignment_id, role_key, role, actor_id, session_id, session_incarnation,
+          binding_generation, mode, status, created_at)
+       VALUES ('asg:park', 'CEO:park', 'CEO', 'actor:park', 'runtime:park', 'inc', 1, 'PREFERRED', 'ACTIVE', ?)`,
+      [at],
+    );
+    seed.db.run(
+      `INSERT INTO actor_target_attestations
+         (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
+          executor_session_id, executor_session_incarnation, binding_generation, assignment_id,
+          attested_at)
+       VALUES ('att:park', 'bind:park', 'v1', 'attd:park', 'runtime:park', 'inc', 1, 'asg:park', ?)`,
+      [at],
+    );
+    const admitted = new IngressGuard(seed.db, seed.clock, seed.audit, {
+      telegram: { allowedActors: ["owner"], allowedConversations: ["convo"] },
+    }).admit({ channel: "telegram", actor: "owner", conversation: "convo", nonce: "park-m1", payload: {} });
+    if (!admitted.allowed) throw new Error(`park fixture could not admit its source: ${admitted.reasonCode}`);
+    const claimed = seed.conversation.claim({
+      targetActorId: "actor:park",
+      prompt: "park-m1",
+      sources: [{ channel: "telegram", nonce: "park-m1", attempt: 1, payload: {} }],
+    });
+    if (!claimed.allowed) throw new Error(`park fixture claim refused: ${claimed.reasonCode}`);
+    seed.conversation.ports.target.completed(claimed.value, {
+      receiptId: "target:park-m1",
+      evidenceDigest: "sha256:receipt",
+      reasonCode: ReasonCode.OK,
+    });
+    seed.conversation.ports.preDispatch.neverAdmitted(claimed.value, {
+      receiptId: "pre:park-m1",
+      evidenceDigest: "sha256:pre",
+      reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
+    });
+  } finally {
+    seed.close();
+  }
+}
+
+/**
+ * Projects whose primary CTO is bound to a session that has died, as a comma-separated list. Each
+ * is registered if it is not already, and its binding is left ACTIVE on an ERROR session, which is
+ * what the startup doctor reads as CTO_BINDING_POINTS_AT_DEAD_SESSION.
+ */
+const deadCtoProjectIds = (process.env["ACP_STARTUP_TEST_DEAD_CTO"] ?? "")
+  .split(",")
+  .map((projectId) => projectId.trim())
+  .filter((projectId) => projectId.length > 0);
+if (deadCtoProjectIds.length > 0) {
+  const seed = new ControlPlane(config);
+  try {
+    for (const projectId of deadCtoProjectIds) {
+      if (!seed.projects.get(projectId)) {
+        const registered = seed.projects.register({ name: `startup test ${projectId}`, projectId });
+        if (!registered.allowed) throw new Error(`${registered.reasonCode}: ${registered.message}`);
+      }
+      const session = seed.sessions.create({ provider: "claude", model: "startup-test-dead-cto" });
+      const ready = seed.sessions.transition(session.sessionId, SessionLifecycle.READY, "startup test cto");
+      if (!ready.allowed) throw new Error(ready.message);
+      const bound = seed.bindings.bind({
+        role: Role.PRIMARY_CTO,
+        roleKey: roleKeyFor(Role.PRIMARY_CTO, { projectId }),
+        projectId,
+        sessionId: session.sessionId,
+      });
+      if (!bound.allowed) throw new Error(bound.message);
+      const died = seed.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "startup test: cto died");
+      if (!died.allowed) throw new Error(died.message);
+    }
+  } finally {
+    seed.close();
+  }
+}
+
+if (process.env["ACP_STARTUP_TEST_NO_CAPACITY"] === "1") {
+  // No routable quota from any provider. `isRoutableFor` rejects on `runtimeHealth ===
+  // "UNAVAILABLE"` before it reads buckets, so every required role is uncovered: the startup
+  // doctor reports ROLE_COVERAGE_NO_VALID_COVERAGE beside the non-blocking
+  // CAPACITY_SENSOR_FAILED. Neither blocks startup; both are availability.
   for (const adapter of adapters) {
     adapter.setCapacity({
       provider: adapter.provider,
@@ -497,6 +598,32 @@ try {
           `startup test Buzz message spawned no session child (children ${childrenBefore.length} -> ` +
             `${childrenAfter.length} ${JSON.stringify(childrenAfter)}, sessions ` +
             `${sessionsBefore.length} -> ${sessionsAfter.length})\n`,
+        );
+      }
+      if (process.env["ACP_STARTUP_TEST_REPORT_SOCKETS"] === "1") {
+        // Read from the filesystem while the daemon is still up, not from anything it says about
+        // itself: each name is a socket `main` binds only after `daemon.start()` returned.
+        const stateRoot = join(root, ".agent-control-plane");
+        const sockets = Object.fromEntries(
+          ["agentcpd.claim-canonical-cto.sock", "cto.mcp.sock", "hermes.mcp.sock"].map((name) => {
+            const path = join(stateRoot, name);
+            return [name, existsSync(path) && statSync(path).isSocket()];
+          }),
+        );
+        const mode = (JSON.parse(readFileSync(join(stateRoot, "health.json"), "utf8")) as { mode?: string }).mode;
+        process.stdout.write(`startup test sockets ${JSON.stringify({ mode, sockets })}\n`);
+        // What the startup doctor itself recorded, so a caller can see the findings were there.
+        const startupReport = context.cp.audit
+          .byKind("DOCTOR_REPORT")
+          .map((event) => event.evidence as {
+            scope: string;
+            findings: Array<{ code: string; severity: string; blocking: boolean }>;
+          })
+          .find((evidence) => evidence.scope === "system");
+        process.stdout.write(
+          `startup test doctor findings ${JSON.stringify(
+            (startupReport?.findings ?? []).map((f) => `${f.code}/${f.severity}/${f.blocking ? "blocking" : "nonblocking"}`),
+          )}\n`,
         );
       }
       await shutdown("STARTUP_TEST");

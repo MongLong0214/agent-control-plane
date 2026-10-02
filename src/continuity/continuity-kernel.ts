@@ -1085,7 +1085,9 @@ export class ContinuityKernel {
         error: (err as Error).message,
       });
     }
-    const session = this.sessions.create({
+    // Recorded with its native start pinned beside the lstart, read as one snapshot of one process
+    // (ACP1045-R2-01, R3-01); see `SessionRegistry.createWithPinnedStart`.
+    const session = this.sessions.createWithPinnedStart({
       provider: adapter.provider,
       model,
       effort: role === Role.BLIND_REVIEWER ? "xhigh" : null,

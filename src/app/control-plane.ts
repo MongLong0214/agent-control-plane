@@ -54,6 +54,8 @@ import { Doctor } from "../doctor/doctor.ts";
 import { Watchdog } from "../doctor/watchdog.ts";
 import { RepairService } from "../doctor/repair.ts";
 import { BootstrapActivation } from "../bootstrap/activation.ts";
+import { createGhCliGitHubWritePort, type GitHubWritePort } from "../bootstrap/github-write-port.ts";
+import { RepoFactoryBootstrapRunner } from "../bootstrap/repo-factory-bootstrap-run.ts";
 import { Daemon, type DaemonOptions } from "../daemon/daemon.ts";
 import type { DaemonFinalizationAuthorities } from "../daemon/finalizer.ts";
 
@@ -135,6 +137,12 @@ export interface ControlPlaneConfig {
    */
   githubKernelOptions?: GitHubKernelOptions;
   githubClient?: GitHubClient;
+  /**
+   * Issue #246 — where a PROJECT_BOOTSTRAP run's Repo Factory producer may write its local
+   * checkout and GitHub receipt ledger (`<workRoot>/<runId>`). Absent, the producer refuses
+   * every run before any GitHub call. `githubPort` replaces the production `gh` port in tests.
+   */
+  repoFactory?: { workRoot: string; githubPort?: GitHubWritePort };
 }
 
 export const defaultConfig = (root = join(homedir(), ".agent-control-plane")): ControlPlaneConfig => ({
@@ -262,6 +270,8 @@ export class ControlPlane {
   readonly watchdog: Watchdog;
   readonly repair: RepairService;
   readonly bootstrap: BootstrapActivation;
+  /** Issue #246 — performs a bootstrap plan's GitHub writes, then hands the result to `bootstrap`. */
+  readonly bootstrapProducer: RepoFactoryBootstrapRunner;
 
   /**
    * The evidence writer capabilities, minted here and nowhere else. Kept in a `#private`
@@ -615,6 +625,15 @@ export class ControlPlane {
         },
       });
       this.ownerAuthority = new OwnerAuthority(this.db, config.ownerIdentities ?? [], this.clock);
+      this.bootstrapProducer = new RepoFactoryBootstrapRunner({
+        runs: this.runs,
+        artifacts: this.artifacts,
+        ownerAuthority: this.ownerAuthority,
+        bootstrap: this.bootstrap,
+        githubPort: config.repoFactory?.githubPort ?? createGhCliGitHubWritePort(),
+        workRoot: config.repoFactory?.workRoot ?? null,
+        clock: this.clock,
+      });
       // The GitHub kernel binds the production gate's single human-gate predicate to its
       // payload. It never reinterprets APPROVAL artifacts or ingress receipts itself.
       this.github.attach({

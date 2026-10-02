@@ -403,6 +403,46 @@ export const ReasonCode = {
    * not be resolved, so an unreachable role is visible rather than silent.
    */
   MENTION_TARGET_UNBOUND: "MENTION_TARGET_UNBOUND",
+  /**
+   * #1038 — a CEO-authored Buzz envelope whose generation proof is not the current one.
+   *
+   * The proof is what the daemon's own subscriber bound the event to at receipt: the CEO binding
+   * generation, the CEO runtime, and the receiving PRIMARY_CTO's generation and session. It is
+   * compared against the registry immediately before the admission's first write, and anything
+   * else — a proof from before a rotation, or none at all — is refused there, before the replay
+   * slot is spent. Distinct from `BUZZ_PEER_EVENT_OUTSIDE_GENERATION`, which is about the event's
+   * own signed time rather than what it was bound to.
+   */
+  BUZZ_PEER_GENERATION_STALE: "BUZZ_PEER_GENERATION_STALE",
+  /**
+   * #1038 — the event was signed outside the current CEO generation's window.
+   *
+   * A Buzz channel identity can be reused across generations, and an event the previous
+   * generation signed still verifies under the same key. Its signed `created_at` is the one fact
+   * that places it, so an event dated before the current CEO binding was created — or further in
+   * the future than clock skew explains — is not this generation's.
+   */
+  BUZZ_PEER_EVENT_OUTSIDE_GENERATION: "BUZZ_PEER_EVENT_OUTSIDE_GENERATION",
+  /**
+   * #1044 — the CEO's Buzz channel identity is not this CEO generation's alone.
+   *
+   * Another runtime carries or carried it, or this runtime carried it while serving an earlier CEO
+   * generation. An event signed with it may then be an earlier holder's, the signature cannot say,
+   * and `created_at` is the signer's own claim — so every event signed with that identity is
+   * refused, whatever it says about itself. Distinct from `BUZZ_PEER_GENERATION_STALE`: nothing here is out of date and
+   * re-deriving changes nothing; the remedy is a fresh identity for the generation.
+   */
+  BUZZ_PEER_ORIGIN_AMBIGUOUS: "BUZZ_PEER_ORIGIN_AMBIGUOUS",
+  /**
+   * #1038 — a CEO-authored envelope that does not address exactly one bound PRIMARY_CTO.
+   *
+   * A peer turn has one recipient class. The owner's own CEO conversation, a session holding any
+   * other role or several, and a `p` tag that is not one channel identity are all refused rather
+   * than narrowed, and refused before admission so nothing is written for them.
+   */
+  BUZZ_PEER_TARGET_NOT_BOUND_CTO: "BUZZ_PEER_TARGET_NOT_BOUND_CTO",
+  /** #1038 — a CEO-authored envelope that arrived on a room other than the addressed CTO's project channel. */
+  BUZZ_PEER_CHANNEL_MISMATCH: "BUZZ_PEER_CHANNEL_MISMATCH",
 
   // --- canonical turns -----------------------------------------------------
   /**
@@ -560,20 +600,29 @@ export const ReasonCode = {
    */
   CONVERSATION_TURN_RECEIPT_WRONG_TURN: "CONVERSATION_TURN_RECEIPT_WRONG_TURN",
   /**
-   * A reconciled receipt says `COMPLETED`, and this build has no way to discharge the reply
-   * obligation that transition carries alongside it.
+   * A reconciled receipt says `COMPLETED`, and the reply it obliges has no single place to go.
    *
-   * #639's contract: a matched receipt must move the turn to `TURN_COMPLETED` and insert one
-   * reply-outbox item atomically, in the same transaction — not as two facts that could disagree.
-   * A review found the reconciler only did the first: `canonical_turns` moved, nothing else did,
-   * and `COMPLETED` cannot be walked back through the ordinary API once recorded. There is no
-   * reply-outbox mechanism wired to this ledger to insert into — `src/outbox/outbox.ts` exists,
-   * but its `MessageKind`s are role-to-role task dispatch, not a reply to the owner who asked — so
-   * recording `COMPLETED` today would be exactly the false positive contract 6 exists to prevent.
-   * `ABORTED` carries no such obligation and is unaffected.
+   * #639's contract 6 pairs the settlement with one owner-reply item in the same transaction
+   * (#1036). The item is addressed from the turn's durable ingress record: the channel, the
+   * conversation `INGRESS_ADMITTED` recorded, and the message it answers. A turn with no ingress
+   * row, no admitted conversation, or sources that disagree on channel or conversation cannot be
+   * addressed, so neither write happens and the turn stays where it was.
    */
-  CONVERSATION_TURN_RECEIPT_REPLY_OBLIGATION_UNDISCHARGEABLE:
-    "CONVERSATION_TURN_RECEIPT_REPLY_OBLIGATION_UNDISCHARGEABLE",
+  CONVERSATION_TURN_REPLY_UNADDRESSABLE: "CONVERSATION_TURN_REPLY_UNADDRESSABLE",
+  /**
+   * A reconciled `COMPLETED` receipt would create a second owner reply: this turn already has a
+   * reply item with different content, or another turn already owes a reply to the same ingress
+   * message. Two items would be two answers to one owner message. Refused, and the settlement it
+   * belonged to rolls back with it (#1036).
+   */
+  CONVERSATION_TURN_REPLY_CONFLICT: "CONVERSATION_TURN_REPLY_CONFLICT",
+  /**
+   * A reconciled `COMPLETED` receipt names a message whose ingress claim a handler in this process
+   * still holds open. That handler may yet deliver the answer itself, so creating the owner-reply
+   * obligation now could produce a second reply. The settlement waits for the next sweep, by which
+   * time the claim records how it ended (#1041 review, R1041-02).
+   */
+  CONVERSATION_TURN_REPLY_IN_FLIGHT: "CONVERSATION_TURN_REPLY_IN_FLIGHT",
   /**
    * A reconciled receipt names a different target binding than the one this turn was claimed
    * against. Kept apart from the generation/runtime checks because it is a distinct fact: which
@@ -724,6 +773,7 @@ export const isReasonCode = (value: string): value is ReasonCode => ALL.has(valu
  */
 export const STALENESS_REASON_CODES: ReadonlySet<ReasonCode> = new Set([
   ReasonCode.BINDING_GENERATION_STALE,
+  ReasonCode.BUZZ_PEER_GENERATION_STALE,
   ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE,
   ReasonCode.CAPACITY_SENSOR_FILE_STALE,
   ReasonCode.CEO_CONVERSATION_STALE,

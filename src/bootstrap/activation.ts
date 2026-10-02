@@ -922,33 +922,43 @@ export class BootstrapActivation {
         incomplete: ["localBindings"],
       });
     }
-    const missing = missingHandoffFields(input.handoff);
+    void projectId;
+    return this.readinessForFactoryResult(input.runId, input.handoff);
+  }
+
+  /**
+   * The activation preconditions no factory result can change: a complete handoff, a passing
+   * blind review, and the run at CEO review. Public so a producer that writes to GitHub can be
+   * refused *before* its first write when activation would refuse its output anyway (#246) —
+   * the same checks `preflight` runs, not a second copy of them.
+   */
+  readinessForFactoryResult(runId: string, handoff: HandoffPackage): Decision<void> {
+    const missing = missingHandoffFields(handoff);
     if (missing.length > 0) {
       return deny(ReasonCode.HANDOFF_PACKAGE_INCOMPLETE, "activation handoff is incomplete", {
-        runId: input.runId,
+        runId,
         missing,
       });
     }
 
-    const review = this.artifacts.latest<{ verdict: string }>(input.runId, ArtifactKind.BLIND_REVIEW);
+    const review = this.artifacts.latest<{ verdict: string }>(runId, ArtifactKind.BLIND_REVIEW);
     if (!review || review.content.verdict !== "PASS") {
       return deny(
         ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,
         "activation requires a passing blind review of the bootstrap run",
-        { runId: input.runId, incomplete: ["blindReview"], verdict: review?.content.verdict ?? null },
+        { runId, incomplete: ["blindReview"], verdict: review?.content.verdict ?? null },
       );
     }
 
-    const state = this.runs.get(input.runId)?.state;
+    const state = this.runs.get(runId)?.state;
     if (state !== RunState.READY_FOR_CEO_REVIEW) {
       return deny(
         ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,
         "activation requires the bootstrap run to have reached CEO review",
-        { runId: input.runId, incomplete: ["ceoConfirm"], state: state ?? null },
+        { runId, incomplete: ["ceoConfirm"], state: state ?? null },
       );
     }
 
-    void projectId;
     return allow(ReasonCode.OK, undefined);
   }
 
