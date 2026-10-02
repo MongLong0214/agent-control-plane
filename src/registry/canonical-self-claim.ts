@@ -8,7 +8,7 @@ import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { readProcessArgv, readProcessStartToken } from "../core/process-argv.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
+import { probeSessionLiveness, recoverDeadCanonicalBinding } from "../daemon/dead-binding-recovery.ts";
 import type { AuditLog, AuditRecord } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
@@ -1979,8 +1979,9 @@ export class CanonicalSelfClaim {
       const stillLiveAtCommit = this.#assertClaimantStillLive(identity);
       if (!stillLiveAtCommit.allowed) return stillLiveAtCommit as Decision<CanonicalSelfClaimReceipt>;
 
-      // A live canonical actor may replace only its exact revoked runtime attachment.
-      // This is not dead-process recovery and grants no authority over another holder.
+      // A live canonical actor may replace only its exact revoked runtime attachment (the same-live
+      // branch). Dead-process recovery happens only in the #831 branch, only for this same actor's
+      // own binding, and grants no authority over another holder.
       const incumbent = this.db.get<{
         actor_id: string; current_session_id: string; current_session_incarnation: string;
         target_binding_id: string;
@@ -2014,6 +2015,43 @@ export class CanonicalSelfClaim {
         // restart leaves the old session terminal), so the row is reconciled to the process fact
         // below, inside this transaction, and rolls back with everything else if anything denies.
         abandonedRuntimeSessionId = predecessor.sessionId;
+        // Policy change (2026-10-02): the dead predecessor may still hold the role ACTIVE, because
+        // nothing revokes an assignment when its process dies, and `bind` below then refused the
+        // restarted canonical session BINDING_ALREADY_ACTIVE — locked out of its own role until an
+        // operator ran `binding recover-dead`. Keeping that refusal and leaving the release to the
+        // operator door was rejected: a restarted canonical session must recover its own role
+        // without owner authority, and the proof that bounds it is the one that door applies.
+        // When the holder is this same actor (the UUID derived and verified above), the release is
+        // made here by `recoverDeadCanonicalBinding` itself, not a copy of its rule: the same
+        // DEAD-only proof over this claim's own seam, the same revoke and the same
+        // DEAD_BINDING_RECOVERED record, inside this transaction so it lands only together with
+        // the successor generation. Another actor's binding is not this claim's
+        // to release and is left for `bind` to refuse; ALIVE, EPERM and UNKNOWN never reach here.
+        const held = this.db.get<{ actor_id: string }>(
+          `SELECT actor_id FROM assignments WHERE role_key = ? AND status = 'ACTIVE'`,
+          [roleKey],
+        );
+        if (held?.actor_id === incumbent.actor_id) {
+          // The entitlement's project, never the request's, for the reason the role key is.
+          const { projectId } = entry;
+          // The seam `#predecessorProcessIsGone` reads, so the start token is compared in the
+          // format this claim recorded it and the two reads cannot disagree about one row.
+          const startedAt = (pid: number) => this.#processInspector.snapshot(pid)?.startedAt ?? null;
+          const released = recoverDeadCanonicalBinding(`canonical-self-claim:${incumbent.actor_id}`, {
+            projectId,
+            role: Role.PRIMARY_CTO,
+            sessionId: predecessor.sessionId,
+            sessionIncarnation: predecessor.incarnation,
+            expectedBindingGeneration: currentMax,
+          }, {
+            db: this.db,
+            audit: this.audit,
+            sessions: this.sessions,
+            bindings: this.bindings,
+            liveness: { signal: this.#processSignal, startedAt },
+          });
+          if (!released.allowed) return released as Decision<CanonicalSelfClaimReceipt>;
+        }
       } else if (incumbent && predecessor &&
           predecessor.lifecycle !== SessionLifecycle.STOPPED && predecessor.lifecycle !== SessionLifecycle.ERROR) {
         const active = this.db.get(

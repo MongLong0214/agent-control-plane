@@ -22,6 +22,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { runBoundedChild } from "../helpers/bounded-child.ts";
 
+import { sha256 } from "../../src/core/digest.ts";
 import { type Decision, allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { roleKeyFor, Role, SessionLifecycle } from "../../src/domain/types.ts";
@@ -49,6 +50,7 @@ import {
   type ProcessSnapshot,
   type TranscriptReader,
   type HostSessionRegistryReader,
+  SELF_CLAIM_EXECUTOR_KIND,
 } from "../../src/registry/canonical-self-claim.ts";
 import { cleanupTempDirs, makeCore, tempDir, type CoreHarness } from "../helpers/fixtures.ts";
 
@@ -1880,36 +1882,236 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
   });
 
   /**
-   * The door #831 must not open. A dead process is not a released role: the incumbent's assignment
-   * is still ACTIVE, and reconciling its runtime row says nothing about that. Seizing a held
-   * binding on the strength of a missing process is `binding recover-dead`'s operation, with its
-   * own proof and its own audit record, not a side effect of claiming.
+   * The restart #831 still locked out (2026-10-02). The predecessor's assignment is ACTIVE because
+   * nothing revoked it before its process died, and the claimant is the same canonical session —
+   * the same UUID, re-derived and re-verified — so the binding it finds is its own. When that
+   * session's recorded `(osPid, start token)` is provably gone, the claim releases the binding
+   * through `recoverDeadCanonicalBinding` inside its own transaction: the same proof and the same
+   * audit record as `binding recover-dead`, landing only together with the successor generation.
+   *
+   * Every other shape keeps the refusal it had before, with nothing written; the counter-example
+   * table and the different-UUID case below pin that.
    */
-  it("a dead predecessor whose assignment is still ACTIVE does not hand the role to the restarted claimant", async () => {
-    const core = makeCore();
-    const projectId = "prj_dead_but_held";
-    insertProject(core, projectId);
-    const first = await makeSubject(core, projectId).claim(baseRequest(core, projectId));
-    expect(first.allowed, JSON.stringify(first)).toBe(true);
-    if (!first.allowed) return;
-    // Deliberately no revoke: the binding stays ACTIVE while the runtime behind it dies.
-    expect(core.db.all(`SELECT assignment_id FROM assignments WHERE status = 'ACTIVE'`)).toHaveLength(1);
-
-    const restarted = [
+  describe("a dead predecessor whose assignment is still ACTIVE", () => {
+    /** The predecessor ran as pid 10; the restart is a new process, pid 11, and pid 10 is gone. */
+    const restarted = (): ProcessSnapshot[] => [
       standardChain()[0]!,
       { ...standardChain()[1]!, ppid: 11 },
       claudeAncestor({ pid: 11, startedAt: "Fri Jan  1 02:00:00 2027" }),
     ];
-    const request = baseRequest(core, projectId, {
-      expectedBindingGeneration: 2,
+
+    const heldByDeadPredecessor = async (projectId: string) => {
+      const core = makeCore();
+      insertProject(core, projectId);
+      const first = await makeSubject(core, projectId).claim(baseRequest(core, projectId));
+      if (!first.allowed) throw new Error(JSON.stringify(first));
+      const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+      // Deliberately no revoke: the binding stays ACTIVE while the runtime behind it dies.
+      expect(core.bindings.active(roleKey)?.assignmentId).toBe(first.value.binding.assignmentId);
+      const predecessor = core.sessions.require(first.value.sessionId);
+      expect(predecessor.lifecycle).toBe(SessionLifecycle.READY);
+      expect(predecessor.osPid).toBe(10);
+      return { core, projectId, roleKey, first: first.value, predecessor };
+    };
+
+    const assignmentsOf = (core: CoreHarness, roleKey: string) =>
+      core.db.all<{ binding_generation: number; status: string; actor_id: string; revoked_reason: string | null }>(
+        `SELECT binding_generation, status, actor_id, revoked_reason FROM assignments
+          WHERE role_key = ? ORDER BY binding_generation`,
+        [roleKey],
+      );
+
+    const recoveryRows = (core: CoreHarness) =>
+      core.db.all<{ session_id: string | null; role_key: string | null; actor: string | null; evidence_json: string }>(
+        `SELECT session_id, role_key, actor, evidence_json FROM audit_events WHERE kind = 'DEAD_BINDING_RECOVERED'`,
+      );
+
+    it.each([
+      ["its pid answers ESRCH", restarted],
+      ["its pid was reused under a different start token", () => standardChain({ startedAt: "different lifetime" })],
+    ] as const)("the same canonical session reclaims the role when %s", async (_shape, chain) => {
+      const { core, projectId, roleKey, first, predecessor } = await heldByDeadPredecessor("prj_dead_but_held");
+
+      const claimed = await makeSubject(core, projectId, { chain: chain() }).claim(baseRequest(core, projectId, {
+        expectedBindingGeneration: 2,
+      }));
+
+      expect(claimed.allowed, JSON.stringify(claimed)).toBe(true);
+      if (!claimed.allowed) return;
+      expect(claimed.value.binding.bindingGeneration).toBe(2);
+      const rows = assignmentsOf(core, roleKey);
+      expect(rows.map(({ binding_generation, status }) => ({ binding_generation, status }))).toEqual([
+        { binding_generation: 1, status: "REVOKED" },
+        { binding_generation: 2, status: "ACTIVE" },
+      ]);
+      // The same actor carries the role on; a restart is not a second owner of the transcript.
+      expect(rows[1]!.actor_id).toBe(rows[0]!.actor_id);
+      expect(rows[0]!.revoked_reason).toContain("dead canonical binding recovery");
+      expect(core.bindings.active(roleKey)?.sessionId).toBe(claimed.value.sessionId);
+      expect(core.sessions.require(predecessor.sessionId).lifecycle).toBe(SessionLifecycle.STOPPED);
+      expect(core.db.all(
+        `SELECT session_id FROM sessions WHERE buzz_actor_id = ? AND lifecycle NOT IN ('STOPPED','ERROR')`,
+        [CANONICAL_ACTOR],
+      )).toEqual([{ session_id: claimed.value.sessionId }]);
+      // The release is the recovery door's own record, not a vocabulary invented for the claim.
+      const recovered = recoveryRows(core);
+      expect(recovered).toHaveLength(1);
+      expect(recovered[0]).toMatchObject({
+        session_id: predecessor.sessionId,
+        role_key: roleKey,
+        actor: `canonical-self-claim:${rows[0]!.actor_id}`,
+      });
+      expect(JSON.parse(recovered[0]!.evidence_json)).toEqual({
+        assignmentId: first.binding.assignmentId,
+        releasedGeneration: 1,
+        sessionIncarnation: predecessor.incarnation,
+        osPid: predecessor.osPid,
+        liveness: "DEAD",
+      });
     });
-    const before = durableSnapshot(core);
-    const refused = await makeSubject(core, projectId, { chain: restarted }).claim(request);
-    expect(refused.allowed).toBe(false);
-    if (refused.allowed) return;
-    expect(refused.reasonCode).toBe(ReasonCode.BINDING_ALREADY_ACTIVE);
-    // Including the predecessor's lifecycle: the reconciliation rolls back with the refusal.
-    expectDurablyRolledBack(core, before, refused);
+
+    const eperm = () => Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+    const eio = () => Object.assign(new Error("input/output error"), { code: "EIO" });
+
+    it.each([
+      {
+        shape: "its process is alive under the recorded start token",
+        chain: (): ProcessSnapshot[] => [
+          standardChain()[0]!,
+          { ...standardChain()[1]!, ppid: 11 },
+          claudeAncestor({ pid: 11 }),
+          claudeAncestor({ pid: 10 }),
+        ],
+      },
+      {
+        shape: "signalling its pid answers EPERM",
+        chain: restarted,
+        processSignal: (pid: number) => { if (pid === 10) throw eperm(); },
+      },
+      {
+        shape: "its pid answers but its start token cannot be read (UNKNOWN)",
+        chain: (): ProcessSnapshot[] => [
+          standardChain()[0]!,
+          { ...standardChain()[1]!, ppid: 11 },
+          claudeAncestor({ pid: 11 }),
+          claudeAncestor({ pid: 10, startedAt: null }),
+        ],
+      },
+      {
+        shape: "signalling its pid fails with an unclassified error (UNKNOWN)",
+        chain: restarted,
+        processSignal: (pid: number) => { if (pid === 10) throw eio(); },
+      },
+      { shape: "its row records no start token", chain: restarted, unrecord: "os_process_started_at" },
+      { shape: "its row records no pid", chain: restarted, unrecord: "os_pid" },
+    ] as const)("the role stays with the incumbent and nothing is written when $shape", async (row) => {
+      const { core, projectId, roleKey, first, predecessor } = await heldByDeadPredecessor("prj_held_not_proven_dead");
+      if ("unrecord" in row) {
+        core.db.run(`UPDATE sessions SET ${row.unrecord} = NULL WHERE session_id = ?`, [predecessor.sessionId]);
+      }
+      const request = baseRequest(core, projectId, { expectedBindingGeneration: 2 });
+      const before = durableSnapshot(core);
+
+      const refused = await makeSubject(core, projectId, {
+        chain: row.chain(),
+        ...("processSignal" in row ? { processSignal: row.processSignal } : {}),
+      }).claim(request);
+
+      expect(refused.allowed).toBe(false);
+      if (refused.allowed) return;
+      expect(refused.reasonCode).toBe(ReasonCode.BINDING_ALREADY_ACTIVE);
+      expectDurablyRolledBack(core, before, refused);
+      expect(core.bindings.active(roleKey)?.assignmentId).toBe(first.binding.assignmentId);
+      expect(core.sessions.require(predecessor.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+      expect(recoveryRows(core)).toEqual([]);
+    });
+
+    /**
+     * The release is for the claimant's own binding only. Here the #831 path does engage — the
+     * claimant's own predecessor row is READY and its process is gone — but the role is held by a
+     * different actor, bound to a different session UUID, whose process is gone as well. That
+     * binding is not this claim's to release, so it stays ACTIVE and the claim refuses exactly as
+     * it did before.
+     */
+    it("a dead holder bound to a different session UUID is left bound, and the claim writes nothing", async () => {
+      const core = makeCore();
+      const projectId = "prj_dead_foreign_holder";
+      insertProject(core, projectId);
+      const first = await makeSubject(core, projectId).claim(baseRequest(core, projectId));
+      expect(first.allowed, JSON.stringify(first)).toBe(true);
+      if (!first.allowed) return;
+      const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+      expect(core.bindings.revoke(roleKey, "lost attachment").allowed).toBe(true);
+
+      const foreign = core.sessions.create({
+        provider: "claude", model: "claude-cli", workdir: CWD, osPid: 77, osStartedAt: "Fri Jan  1 03:00:00 2027",
+      });
+      expect(core.sessions.transition(foreign.sessionId, SessionLifecycle.READY, "foreign holder").allowed).toBe(true);
+      const held = core.bindings.bind({
+        role: Role.PRIMARY_CTO,
+        projectId,
+        sessionId: foreign.sessionId,
+        mode: "PREFERRED",
+        verifiedTarget: { executorKind: SELF_CLAIM_EXECUTOR_KIND, targetLocator: OTHER, targetLocatorDigest: sha256(OTHER) },
+      });
+      expect(held.allowed, JSON.stringify(held)).toBe(true);
+      if (!held.allowed) return;
+      const actors = assignmentsOf(core, roleKey).map(({ actor_id }) => actor_id);
+      expect(new Set(actors).size).toBe(2);
+
+      const request = baseRequest(core, projectId, { expectedBindingGeneration: 3 });
+      const before = durableSnapshot(core);
+      const refused = await makeSubject(core, projectId, { chain: restarted() }).claim(request);
+
+      expect(refused.allowed).toBe(false);
+      if (refused.allowed) return;
+      expect(refused.reasonCode).toBe(ReasonCode.BINDING_ALREADY_ACTIVE);
+      expectDurablyRolledBack(core, before, refused);
+      expect(core.bindings.active(roleKey)?.assignmentId).toBe(held.value.assignmentId);
+      expect(core.sessions.require(first.value.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+      expect(recoveryRows(core)).toEqual([]);
+    });
+
+    it("a claim naming the wrong next generation leaves the dead predecessor's generation ACTIVE", async () => {
+      const { core, projectId, roleKey, first, predecessor } = await heldByDeadPredecessor("prj_dead_wrong_generation");
+      const request = baseRequest(core, projectId, { expectedBindingGeneration: 3 });
+      const before = durableSnapshot(core);
+
+      const refused = await makeSubject(core, projectId, { chain: restarted() }).claim(request);
+
+      expect(refused.allowed).toBe(false);
+      if (refused.allowed) return;
+      expect(refused.reasonCode).toBe(ReasonCode.CONFLICT);
+      expectDurablyRolledBack(core, before, refused);
+      expect(core.bindings.active(roleKey)?.assignmentId).toBe(first.binding.assignmentId);
+      expect(core.sessions.require(predecessor.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+      expect(recoveryRows(core)).toEqual([]);
+    });
+
+    /**
+     * The release is not a separate step that survives the claim: a refusal that arrives after the
+     * successor has been bound takes the revoke, its audit rows and the reconciled predecessor row
+     * back with everything else. `injected.refused` naming the admission row is what proves the
+     * claim reached the end of its transaction — past the release and past `bind` — before failing.
+     */
+    it("a refusal after the bind takes the release back with it", async () => {
+      const { core, projectId, roleKey, first, predecessor } = await heldByDeadPredecessor("prj_dead_late_refusal");
+      const request = baseRequest(core, projectId, { expectedBindingGeneration: 2 });
+      const before = durableSnapshot(core);
+      const injected = failAuditInserts(core, (kind) => kind === "CANONICAL_SELF_CLAIM_ADMITTED");
+
+      let refused: Decision<unknown>;
+      try {
+        refused = await makeSubject(core, projectId, { chain: restarted() }).claim(request);
+      } finally { injected.restore(); }
+
+      expect(injected.refused).toEqual(["CANONICAL_SELF_CLAIM_ADMITTED"]);
+      expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.AUDIT_WRITE_FAILED });
+      expectDurablyRolledBack(core, before, refused);
+      expect(core.bindings.active(roleKey)?.assignmentId).toBe(first.binding.assignmentId);
+      expect(core.sessions.require(predecessor.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+      expect(recoveryRows(core)).toEqual([]);
+    });
   });
 
   /**
