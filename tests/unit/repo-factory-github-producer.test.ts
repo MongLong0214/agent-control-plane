@@ -804,20 +804,35 @@ describe("PR #1043 review round 2 witnesses", () => {
     expect(github.writes).toEqual([]);
   });
 
-  it("RF1043-02: a result file that could not be written does not strand its checkout — the retry rebuilds from the ledger with no write", async () => {
+  it("RF1043-02: a result that could not be kept does not strand its checkout — the retry reconciles the ledger against GitHub and rebuilds it, with no write", async () => {
+    // Round 2 kept the result in a file and its write failure stranded the checkout; round 3
+    // removed the file (RF1043-08). The caller's store now runs inside the producer's cleanup.
     const { workDir, github } = makeSandbox();
-    const scratch = join(workDir, "github-ledger", "primary.result.json.partial");
-    mkdirSync(scratch, { recursive: true });
-    await expect(produce(workDir, github)).rejects.toMatchObject({ code: "EISDIR" });
+    const attempt = (at: string, persist: (result: unknown) => void) =>
+      produceRepoFactoryResult({
+        plan: githubPlan(),
+        workDir,
+        clock: new ManualClock(at),
+        github: { port: github, authority: authority() },
+        persist,
+      } as Parameters<typeof produceRepoFactoryResult>[0]);
+    await expect(
+      attempt("2026-10-02T00:00:00.000Z", () => {
+        throw Object.assign(new Error("EISDIR: illegal operation on a directory"), { code: "EISDIR" });
+      }),
+    ).rejects.toMatchObject({ code: "EISDIR" });
     expect(readLedger(workDir).receipts).toHaveLength(4);
-    // The failure cleans up like every other: no checkout is left for the retry to trip on.
     expect(existsSync(repositoryCheckoutPath(workDir, "primary"))).toBe(false);
-    rmSync(scratch, { recursive: true, force: true });
     github.writes.length = 0;
-    const retry = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
+    github.reads.length = 0;
+    let kept: unknown = null;
+    const retry = await attempt("2026-10-02T00:05:00.000Z", (result) => {
+      kept = result;
+    });
     if (!retry.allowed) throw new Error(`${retry.reasonCode}: ${retry.message} ${JSON.stringify(retry.evidence)}`);
     expect(github.writes).toEqual([]);
-    expect(existsSync(join(workDir, "github-ledger", "primary.result.json"))).toBe(true);
+    expect(github.reads.length).toBeGreaterThan(0);
+    expect(kept).toEqual(retry.value);
   });
 
   it("a leftover checkout moved off the head GitHub holds is not settled, so it is named and kept rather than rebuilt", async () => {
@@ -835,16 +850,46 @@ describe("PR #1043 review round 2 witnesses", () => {
     expect(github.writes).toEqual([]);
   });
 
-  it("RF1043-02: a run that died after its last receipt and before keeping its result is rebuilt from its own settled checkout and ledger", async () => {
+  it("a run that died after its last receipt leaves a checkout that is refused by name and kept for a person, not reclaimed", async () => {
+    // Round 2 rebuilt this from a "settled" checkout; round 3 (RF1043-07) showed a matching HEAD
+    // does not make the checkout's other contents recoverable, so it is never reclaimed.
     const { workDir, github } = makeSandbox();
     const first = await produce(workDir, github);
     if (!first.allowed) throw new Error(`${first.reasonCode}: ${first.message}`);
-    // The process died between its last receipt and the result file: checkout and ledger remain.
-    rmSync(join(workDir, "github-ledger", "primary.result.json"), { force: true });
+    const checkout = repositoryCheckoutPath(workDir, "primary");
     github.writes.length = 0;
     const retry = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
-    if (!retry.allowed) throw new Error(`${retry.reasonCode}: ${retry.message} ${JSON.stringify(retry.evidence)}`);
+    expect(retry.allowed).toBe(false);
+    expect(evidenceOf(retry).refusal).toBe("INTERRUPTED_RUN_CHECKOUT");
+    expect(existsSync(checkout)).toBe(true);
     expect(github.writes).toEqual([]);
-    expect(retry.value.bootstrapVerification[0]?.exactHead).toBe(first.value.bootstrapVerification[0]?.exactHead);
+  });
+});
+
+/**
+ * PR #1043 review round 3 witnesses. Each reproduces its finding against the round-2 head
+ * (c884196b), where it fails, and is kept as that finding's regression guard.
+ */
+describe("PR #1043 review round 3 witnesses — a leftover checkout is never reclaimed", () => {
+  it("RF1043-07: tracked edits, untracked and ignored files in a leftover checkout survive a retry, which is refused by name", async () => {
+    const { workDir, github } = makeSandbox();
+    const first = await produce(workDir, github);
+    if (!first.allowed) throw new Error(`${first.reasonCode}: ${first.message}`);
+    // As a run that died before storing its result leaves it (the reviewed head kept a file here).
+    rmSync(join(workDir, "github-ledger", "primary.result.json"), { force: true });
+    const checkout = repositoryCheckoutPath(workDir, "primary");
+    writeFileSync(join(checkout, ".repo-factory-bootstrap.json"), "{ \"edited\": true }\n");
+    writeFileSync(join(checkout, "notes.txt"), "untracked work\n");
+    writeFileSync(join(checkout, ".git", "info", "exclude"), "ignored.log\n", { flag: "a" });
+    writeFileSync(join(checkout, "ignored.log"), "ignored work\n");
+    github.writes.length = 0;
+
+    const retry = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
+    expect(retry.allowed).toBe(false);
+    expect(evidenceOf(retry).refusal).toBe("INTERRUPTED_RUN_CHECKOUT");
+    expect(readFileSync(join(checkout, ".repo-factory-bootstrap.json"), "utf8")).toBe("{ \"edited\": true }\n");
+    expect(readFileSync(join(checkout, "notes.txt"), "utf8")).toBe("untracked work\n");
+    expect(readFileSync(join(checkout, "ignored.log"), "utf8")).toBe("ignored work\n");
+    expect(github.writes).toEqual([]);
   });
 });

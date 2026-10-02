@@ -29,7 +29,7 @@ import {
   type ObservedBranchProtection,
   type ObservedRepository,
 } from "./github-write-port.ts";
-import { parseRepoFactoryResult, type ExternalWriteReceipt, type RepoFactoryResult } from "./repo-factory-result.ts";
+import type { ExternalWriteReceipt } from "./repo-factory-result.ts";
 
 /**
  * Issue #246 — the repo factory producer's GitHub half: which planned operations may run, in
@@ -463,10 +463,6 @@ export interface LedgerState {
 export const githubLedgerPath = (workDir: string, repositoryRole: string): string =>
   join(resolve(workDir), "github-ledger", `${repositoryRole}.json`);
 
-/** The produced result, kept beside the ledger so a retry can rebuild it (RF1043-02). */
-export const producedResultPath = (workDir: string, repositoryRole: string): string =>
-  join(resolve(workDir), "github-ledger", `${repositoryRole}.result.json`);
-
 const unsafeFile = <T>(path: string, message: string): Decision<T> =>
   refuse(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "LEDGER_UNSAFE", message, { ledgerPath: path });
 
@@ -474,9 +470,10 @@ const corruptFile = <T>(path: string, message: string, evidence: Evidence = {}):
   refuse(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT, "LEDGER_CORRUPT", message, { ledgerPath: path, ...evidence });
 
 /**
- * Reads one of this operation's own files: absent is `null`; a symlink, a non-file, another
- * account's file or one writable by others is a refusal, because acting on it would treat
- * someone else's record — or a forged one — as ours.
+ * Reads the ledger file: absent is `null`; a symlink, a non-file, another account's file or one
+ * writable by others is a refusal, because acting on it would treat someone else's record as
+ * ours. Ownership is not provenance: every ledger entry is re-checked against GitHub before it is
+ * acted on, which is why the ledger, unlike a stored result, can be trusted this far.
  */
 const readOwnFile = (path: string): Decision<unknown> => {
   let stat: Stats;
@@ -599,46 +596,6 @@ const writeOwnFile = (path: string, content: unknown): void => {
 };
 
 export const writeGitHubLedger = (path: string, ledger: GitHubLedger): void => writeOwnFile(path, ledger);
-
-const PRODUCED_RESULT_SCHEMA_ID = "acp.repo-factory.produced-result.v1";
-
-const producedResultSchema = z
-  .object({
-    schema: z.literal(PRODUCED_RESULT_SCHEMA_ID),
-    bootstrapOperationId: z.string().min(1),
-    requestDigest: z.string().min(1),
-    result: z.unknown(),
-  })
-  .strict();
-
-/** Written by the producer after it built a result and before it returns it. */
-export const writeProducedResult = (path: string, owner: LedgerOwner, result: RepoFactoryResult): void =>
-  writeOwnFile(path, { schema: PRODUCED_RESULT_SCHEMA_ID, ...owner, result });
-
-/**
- * A result this operation already produced, for the caller that lost it before storing it.
- * Parsed by the same canonical parser activation uses, and refused if another operation wrote it.
- */
-export const readProducedResult = (path: string, owner: LedgerOwner): Decision<RepoFactoryResult | null> => {
-  const raw = readOwnFile(path);
-  if (!raw.allowed) return raw as Decision<RepoFactoryResult | null>;
-  if (raw.value === null) return allow(ReasonCode.OK, null);
-  const parsed = producedResultSchema.safeParse(raw.value);
-  if (!parsed.success) return corruptFile(path, "the produced result file failed validation");
-  if (parsed.data.bootstrapOperationId !== owner.bootstrapOperationId) {
-    return refuse(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT, "LEDGER_FOREIGN", "the produced result belongs to a different bootstrap operation", {
-      ledgerPath: path,
-    });
-  }
-  if (parsed.data.requestDigest !== owner.requestDigest) {
-    return refuse(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT, "LEDGER_FOREIGN", "the produced result belongs to a different request", {
-      ledgerPath: path,
-    });
-  }
-  const result = parseRepoFactoryResult(parsed.data.result);
-  if (!result.allowed) return result as Decision<RepoFactoryResult | null>;
-  return allow(ReasonCode.OK, result.value);
-};
 
 /** The result contract's view of a ledger receipt: identity fields plus the readback's digest. */
 export const toExternalWriteReceipt = (receipt: GitHubOperationReceipt, owner: LedgerOwner): ExternalWriteReceipt => ({

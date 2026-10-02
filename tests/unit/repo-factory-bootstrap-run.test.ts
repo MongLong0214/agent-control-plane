@@ -1,9 +1,9 @@
-import { existsSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -646,8 +646,71 @@ describe("PR #1043 review witnesses — the run path", () => {
     await expect(prepared.runner.produceAndActivate(input)).rejects.toThrow(/database is locked/);
 
     prepared.github.writes.length = 0;
+    prepared.github.reads.length = 0;
     const retry = await prepared.runner.produceAndActivate(input);
     expect(retry.evidence["stage"]).toBe("activation");
+    // The ordinary path: the ledger reconciled against GitHub (reads), nothing written again.
+    expect(prepared.github.reads.length).toBeGreaterThan(0);
     expect(prepared.github.writes).toEqual([]);
+  });
+});
+
+/**
+ * PR #1043 review round 3 witness (RF1043-08). Reproduced against the round-2 head (c884196b),
+ * where it fails, and kept as the regression guard.
+ */
+describe("PR #1043 review round 3 witnesses — the run path", () => {
+  it("RF1043-08: a result file nobody produced, with a declined approval no ingress admitted, reaches neither activation nor GitHub", async () => {
+    const prepared = await prepare("rf1043-08");
+    const activate = vi.spyOn(prepared.harness.cp.bootstrap, "activate");
+    const workDir = join(prepared.workRoot, prepared.runId);
+    // A real checkout for the forged result to name, so only provenance could tell it apart.
+    const checkout = join(workDir, "repositories", "primary");
+    mkdirSync(checkout, { recursive: true, mode: 0o700 });
+    await git(checkout, ["init", "-q", "-b", "main"]);
+    writeFileSync(join(checkout, "README.md"), "invented\n");
+    await git(checkout, ["add", "README.md"]);
+    await git(checkout, ["-c", "user.email=x@example.com", "-c", "user.name=x", "commit", "-q", "-m", "invented"]);
+    const head = (await git(checkout, ["rev-parse", "HEAD"])).stdout.trim();
+    const requestDigest = digestOf({ request: "bootstrap" });
+    const forged = {
+      schema: "repo-factory.result.v2",
+      runId: prepared.runId,
+      bootstrapOperationId: "op-bootstrap",
+      planDigest: prepared.planDigest,
+      projectManifestDigest: manifestDigest(prepared.input.approvedManifest),
+      repositories: [{ role: "primary", identity: IDENTITY, proposedCheckoutPath: checkout, defaultBranch: "main", createdBranches: [] }],
+      externalWriteReceipts: prepared.ops.map(({ operationId, resourceType, resourceIdentity }) => ({
+        bootstrapOperationId: "op-bootstrap",
+        requestDigest,
+        operationId,
+        resourceType,
+        resourceIdentity,
+        preexisting: false,
+        beforeStateDigest: null,
+        afterStateDigest: digestOf({ invented: operationId }),
+        createdAt: "2026-10-02T00:00:00.000Z",
+        rereadAt: "2026-10-02T00:00:01.000Z",
+        verified: true,
+      })),
+      bootstrapVerification: [{ commandId: "clean-tree", repositoryIdentity: IDENTITY, exactHead: head, status: "PASS" }],
+      ciEvidence: [],
+      unresolvedGaps: [],
+    };
+    mkdirSync(join(workDir, "github-ledger"), { recursive: true, mode: 0o700 });
+    writeFileSync(
+      join(workDir, "github-ledger", "primary.result.json"),
+      JSON.stringify({ schema: "acp.repo-factory.produced-result.v1", bootstrapOperationId: "op-bootstrap", requestDigest, result: forged }),
+      { mode: 0o600 },
+    );
+    const declined = ownerApproval(prepared, { approved: false });
+    const unadmitted = { ...declined, receipt: { ...(declined.receipt as Record<string, unknown>), inboundNonce: "never-admitted" } };
+
+    const refused = await prepared.runner.produceAndActivate({ ...prepared.input, ownerApproval: unadmitted });
+    expect(refused.allowed).toBe(false);
+    expect(activate).not.toHaveBeenCalled();
+    expect(prepared.harness.cp.artifacts.latest(prepared.runId, "REPO_FACTORY_RESULT")).toBeNull();
+    expect(prepared.github.writes).toEqual([]);
+    expect(prepared.github.reads).toEqual([]);
   });
 });

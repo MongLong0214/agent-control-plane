@@ -17,8 +17,6 @@ import { parseGitHubIdentity, type GitHubWritePort } from "./github-write-port.t
 import {
   githubOperationSchema,
   preflightGitHubOperations,
-  producedResultPath,
-  readProducedResult,
   type GitHubOperation,
   type GitHubWriteAuthority,
 } from "./repo-factory-github.ts";
@@ -73,13 +71,14 @@ import { parseRepoFactoryResult, type RepoFactoryResult } from "./repo-factory-r
  * it, the approval, and the producer's own pure preflight. A refusal here has made no GitHub
  * read or write.
  *
- * A produced result is retained (REPO_FACTORY_RESULT) before activation is attempted. Activation
- * of a fresh bootstrap normally stops once — the incoming CTO has not yet acknowledged its
- * handoff — and the second call must activate the result already produced rather than produce
- * again: the producer's checkout now exists, and a second production would be refused as a
- * collision. A result produced but never stored — the store failed, or the process died after
- * the producer returned — is rebuilt from the copy the producer keeps beside its ledger
- * (RF1043-02), and activation re-validates it like any other.
+ * A produced result is stored (REPO_FACTORY_RESULT) inside the producer's cleanup, before
+ * activation is attempted. Activation of a fresh bootstrap normally stops once — the incoming CTO
+ * has not yet acknowledged its handoff — and the second call, admitted under the same approval,
+ * activates that stored result rather than producing again: the producer's checkout now exists.
+ * There is no other copy and no shortcut around the approval (PR #1043 review round 3, RF1043-08):
+ * a result that could not be stored leaves no checkout, and its retry takes the ordinary path —
+ * approval, then the ledger reconciled against GitHub, then the result rebuilt. A checkout left by
+ * a run that died is refused by name and kept for a person (RF1043-07).
  *
  * Who calls this is not decided here. No transport invokes it — as none invokes `activate` — and
  * no ingress path mints a receipt for `REPO_FACTORY_GITHUB_WRITE_OPERATION` yet; until both exist,
@@ -202,13 +201,6 @@ export class RepoFactoryBootstrapRunner {
       );
     }
     const plan = approvedPlan.data;
-
-    const retained = this.deps.artifacts.latest<unknown>(runId, ArtifactKind.REPO_FACTORY_RESULT);
-    if (retained !== null) {
-      const parsed = parseRepoFactoryResult(retained.content);
-      if (!parsed.allowed) return atStage(parsed as Decision<ACPBootstrapActivationResult>, "activation");
-      return this.activate(input, parsed.value);
-    }
 
     // What executes is the artifact's own operations (RF1043-01). An artifact that names its
     // operations without the state each asks for approved nothing that could be executed.
@@ -344,17 +336,9 @@ export class RepoFactoryBootstrapRunner {
     if (!PATH_SAFE_RUN_ID.test(runId)) {
       return refuse(ReasonCode.INVALID_ARGUMENT, "RUN_ID_NOT_PATH_SAFE", "the run id cannot name a work directory");
     }
-    const workDir = join(workRoot, runId);
-    const owner = { bootstrapOperationId: plan.bootstrapOperationId, requestDigest: plan.requestDigest };
-
-    // RF1043-02 — produced earlier and lost before it was stored: rebuilt, not produced again.
-    const kept = readProducedResult(producedResultPath(workDir, declared.role), owner);
-    if (!kept.allowed) return atStage(kept as Decision<ACPBootstrapActivationResult>, "production");
-    if (kept.value !== null) {
-      this.deps.artifacts.put(runId, ArtifactKind.REPO_FACTORY_RESULT, kept.value);
-      return this.activate(input, kept.value);
-    }
-
+    // Every call is authorised before anything else it does: the approval is admitted through
+    // ingress and consumed, or re-admitted from that durable consumption on a later call
+    // (PR #1043 review round 3, RF1043-08 — the previous head activated a stored result first).
     const approval = this.admitApproval(runId, input.ownerApproval.receipt, {
       owner: authority.owner,
       visibility: authority.visibility,
@@ -363,14 +347,30 @@ export class RepoFactoryBootstrapRunner {
     });
     if (!approval.allowed) return atStage(approval as Decision<ACPBootstrapActivationResult>, "approval");
 
+    // The result this runner stored after producing it, under this same approval, in the control
+    // plane's own artifact store — nothing a caller or a file supplies. Activation follows it on
+    // the call after a handoff is acknowledged, and re-validates it like any other.
+    const retained = this.deps.artifacts.latest<unknown>(runId, ArtifactKind.REPO_FACTORY_RESULT);
+    if (retained !== null) {
+      const parsed = parseRepoFactoryResult(retained.content);
+      if (!parsed.allowed) return atStage(parsed as Decision<ACPBootstrapActivationResult>, "activation");
+      return this.activate(input, parsed.value);
+    }
+
+    // Otherwise the ordinary path, for a first call and for every retry alike: the producer
+    // reconciles its ledger against GitHub, performs what is left, and rebuilds the result. A
+    // result that cannot be stored leaves no checkout behind (`persist` runs inside the
+    // producer's cleanup), so the retry takes this same path.
     const produced = await produceRepoFactoryResult({
       plan: executable,
-      workDir,
+      workDir: join(workRoot, runId),
       clock: this.deps.clock,
       github: { port: this.deps.githubPort, authority },
+      persist: (result) => {
+        this.deps.artifacts.put(runId, ArtifactKind.REPO_FACTORY_RESULT, result);
+      },
     });
     if (!produced.allowed) return atStage(produced as Decision<ACPBootstrapActivationResult>, "production");
-    this.deps.artifacts.put(runId, ArtifactKind.REPO_FACTORY_RESULT, produced.value);
     return this.activate(input, produced.value);
   }
 
