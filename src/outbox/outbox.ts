@@ -12,6 +12,7 @@ import { IngressGuard } from "../ingress/ingress-guard.ts";
 import {
   type FencedEnvelope,
   HOLDER_CLAIMED_KINDS,
+  IDENTITY_BOUND_KINDS,
   MessageKind,
   RETARGETABLE_KINDS,
   payloadDigestOf,
@@ -89,6 +90,12 @@ export interface HolderClaimResult {
   claimed: OutboxMessage[];
   /** Rows already `SENT` and never acknowledged. Metadata only. */
   unresolved: UnresolvedOwnerMessage[];
+  /**
+   * `PENDING` rows this holder is addressed by and may not be handed, because the caller's
+   * `admits` refused them (#1044). Metadata only, and nothing was written for them: the holder may
+   * reject one, by id, through `rejectForHolder`, which is the one write that retires it.
+   */
+  withheld: UnresolvedOwnerMessage[];
   /**
    * Whether a claimable message remains that this call did not hand over.
    *
@@ -479,8 +486,15 @@ export class Outbox {
    * 4. **The compare-and-set carries the caller's whole identity**, rather than standing next to a
    *    check of it. The candidate read and the write are two statements; binding the write to the
    *    row id alone trusts that nothing changed in between. See the `UPDATE` below.
+   * 5. **`admits` is asked about every candidate before anything is written** (#1044), inside this
+   *    same transaction, and a refused candidate is skipped rather than handed over or burned. Its
+   *    default withholds every `IDENTITY_BOUND_KINDS` row, so a caller that supplies no proof hands
+   *    over no peer message. The caller's predicate must only read.
    */
-  claimForHolder(holder: HolderIdentity): HolderClaimResult {
+  claimForHolder(
+    holder: HolderIdentity,
+    admits: (candidate: OutboxMessage) => boolean = withholdsIdentityBound,
+  ): HolderClaimResult {
     return this.db.tx(() => {
       const now = this.clock.nowIso();
       const tuple = [
@@ -504,26 +518,13 @@ export class Outbox {
         )
         .map(unresolvedOwnerMessage);
 
-      // No `expires_at` here, and none on the candidate read below. A holder-claimed row does not
-      // expire — see `expireOverdue` — and the exclusion has to hold at *every* query that reads
-      // the column, not only at the sweep. Excluding it from the sweep alone produces a subtler
-      // strand than the one it removes: the row keeps `status = 'PENDING'`, so nothing sweeps it
-      // and nothing reports it, while these two conditions mean no holder can ever be handed it.
-      const queued =
-        this.db.get<{ queued: number }>(
-          `SELECT COUNT(*) AS queued FROM outbox o
-            WHERE o.kind IN (${HOLDER_CLAIMED_KIND_SQL})
-              AND o.status = 'PENDING'
-              AND o.role_key = ? AND o.binding_generation = ? AND o.target_session_id = ?
-              AND ${exactHolderTarget("o")}`,
-          tuple,
-        )?.queued ?? 0;
 
-      // The block. An outstanding unknown outcome is exactly the state in which handing out more
-      // work is wrong, so the holder is told what is unsettled and that work is waiting, and is
-      // given neither payload until it settles the first.
-      if (unresolved.length > 0) return { claimed: [], unresolved, hasMore: queued > 0 };
-
+      // No `expires_at` here. A holder-claimed row does not expire — see `expireOverdue` — and the
+      // exclusion has to hold at *every* query that reads the column, not only at the sweep.
+      // Excluding it from the sweep alone produces a subtler strand than the one it removes: the row
+      // keeps `status = 'PENDING'`, so nothing sweeps it and nothing reports it, while a condition
+      // here would mean no holder can ever be handed it.
+      //
       // ORDER BY o.created_at, o.message_id — the tiebreaker is load-bearing here and this is
       // the site where saying so matters most (#858).
       //
@@ -554,8 +555,8 @@ export class Outbox {
       // migration and remains #858's, not this query's.
       //
       // `created_at` is millisecond ISO text, and 400 consecutive `systemClock.nowIso()` calls
-      // were measured returning one distinct timestamp. This query is `LIMIT 1`: it decides which
-      // PENDING message the holder is handed next. With a tie and no second term, that choice was
+      // were measured returning one distinct timestamp. This order decides which PENDING message
+      // the holder is handed next. With a tie and no second term, that choice was
       // the query planner's, so two owner messages queued in the same millisecond had no defined
       // order of answering.
       //
@@ -565,17 +566,33 @@ export class Outbox {
       // arbitrary — but the same arbitrary one on every run and every replica, which is what the
       // planner's choice was not. Making it arrival order needs a monotonic column, which is a
       // schema change and is not this.
-      const candidate = this.db.get<RawOutbox>(
+      //
+      // Every queued row is read, not `LIMIT 1`, because `admits` decides which of them may be
+      // handed over at all (#1044) — and it decides before anything below writes. A withheld row is
+      // skipped, so one stale peer message does not stop the owner's messages queued behind it.
+      const queued = this.db.all<RawOutbox>(
         `SELECT o.* FROM outbox o
           WHERE o.kind IN (${HOLDER_CLAIMED_KIND_SQL})
             AND o.status = 'PENDING'
             AND o.role_key = ? AND o.binding_generation = ? AND o.target_session_id = ?
             AND ${exactHolderTarget("o")}
-          ORDER BY o.created_at, o.rowid
-          LIMIT 1`,
+          ORDER BY o.created_at, o.rowid`,
         tuple,
       );
-      if (!candidate) return { claimed: [], unresolved, hasMore: false };
+      const admitted = queued.filter((row) => admits(hydrate(row)));
+      const withheld = queued
+        .filter((row) => !admitted.includes(row))
+        .map(unresolvedOwnerMessage);
+
+      // The block. An outstanding unknown outcome is exactly the state in which handing out more
+      // work is wrong, so the holder is told what is unsettled and that work is waiting, and is
+      // given neither payload until it settles the first.
+      if (unresolved.length > 0) {
+        return { claimed: [], unresolved, withheld, hasMore: admitted.length > 0 };
+      }
+
+      const candidate = admitted[0];
+      if (!candidate) return { claimed: [], unresolved, withheld, hasMore: false };
 
       // Compare-and-set, asserting the full caller tuple rather than the row id and a status.
       // `role_key`, `binding_generation` and `target_session_id` are the caller's values, not the
@@ -601,7 +618,7 @@ export class Outbox {
           holder.sessionIncarnation,
         ],
       ).changes;
-      if (moved !== 1) return { claimed: [], unresolved, hasMore: queued > 0 };
+      if (moved !== 1) return { claimed: [], unresolved, withheld, hasMore: admitted.length > 0 };
 
       // Re-read rather than patching the candidate: the payload handed over is the one on the row
       // this statement actually moved, and so are the attempts and the hand-over instant.
@@ -611,7 +628,8 @@ export class Outbox {
       return {
         claimed: handed ? [hydrate(handed)] : [],
         unresolved,
-        hasMore: queued > 1,
+        withheld,
+        hasMore: admitted.length > 1,
       };
     });
   }
@@ -1039,7 +1057,13 @@ export class Outbox {
           // unreachable rather than merely unused.
           //
           // No `expires_at` test: these rows do not expire. See `expireOverdue`.
-          row.status === "PENDING" && toGeneration !== fromGeneration
+          //
+          // And never an `IDENTITY_BOUND_KINDS` row (#1044): a peer message was admitted for this
+          // generation's exact session, so a successor is exactly who must not be handed it. It
+          // falls through to the reject below, which settles its ingress claim.
+          row.status === "PENDING" &&
+          toGeneration !== fromGeneration &&
+          !IDENTITY_BOUND_KINDS.has(row.kind as MessageKind)
         : row.status === "PENDING" &&
           RETARGETABLE_KINDS.has(row.kind as MessageKind) &&
           row.expires_at > now;
@@ -1146,8 +1170,11 @@ export class Outbox {
         // Exact compare-and-set on the whole tuple the caller named, not on the row id: the read
         // above and this write are two statements, and a row that stopped being this role's, this
         // generation's or this runtime's in between must move nothing.
+        // Never an `IDENTITY_BOUND_KINDS` row (#1044): the generation is the same, but the receiving
+        // session a peer message was admitted for is the one that just went, so it is rejected
+        // below rather than re-addressed to a runtime its proof does not name.
         const moved =
-          row.status === "PENDING"
+          row.status === "PENDING" && !IDENTITY_BOUND_KINDS.has(row.kind as MessageKind)
             ? this.db.run(
                 `UPDATE outbox SET target_session_id = ?
                   WHERE message_id = ? AND status = 'PENDING'
@@ -1361,6 +1388,13 @@ interface RawOutbox {
  * Projects a raw row onto the no-payload shape. `payload_json` is read off the row and simply
  * never copied — the destination type has no field for it.
  */
+/**
+ * `claimForHolder`'s default: hand over no `IDENTITY_BOUND_KINDS` row (#1044). A peer message is
+ * handed over only to a caller that supplies the predicate proving its proof still current.
+ */
+const withholdsIdentityBound = (candidate: OutboxMessage): boolean =>
+  !IDENTITY_BOUND_KINDS.has(candidate.kind);
+
 const unresolvedOwnerMessage = (row: RawOutbox): UnresolvedOwnerMessage => ({
   messageId: row.message_id,
   roleKey: row.role_key,

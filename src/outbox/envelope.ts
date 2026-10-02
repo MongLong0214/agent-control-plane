@@ -39,10 +39,11 @@ export const MessageKind = {
    * the message's principal, so the principal is the daemon's fact about the row and never a field
    * a payload could carry.
    *
-   * Its generation proof is checked at admission, not at hand-over: the hand-over checks only the
-   * holder fence every holder-claimed row has, so a message admitted before a CEO rotation is still
-   * handed to its CTO after it. Re-checking the CEO generation at hand-over was decided against
-   * here, because a refusal there has to burn the row — a write — where admission refuses with none.
+   * Its authority is the generation proof it was admitted under — the CEO binding generation and the
+   * exact receiving CTO session — and that proof is checked again at hand-over, before the
+   * hand-over's first write (#1044). A row whose proof is no longer current is withheld: not handed
+   * over, not moved, and not written to. It is also never carried or retargeted to another runtime;
+   * see `IDENTITY_BOUND_KINDS`.
    */
   PEER_MESSAGE: "PEER_MESSAGE",
 } as const;
@@ -79,6 +80,22 @@ export const RETARGETABLE_KINDS: ReadonlySet<MessageKind> = new Set<MessageKind>
  */
 export const HOLDER_CLAIMED_KINDS: ReadonlySet<MessageKind> = new Set<MessageKind>([
   MessageKind.OWNER_MESSAGE,
+  MessageKind.PEER_MESSAGE,
+]);
+
+/**
+ * Holder-claimed kinds whose authority belongs to the exact runtime they were admitted for (#1044).
+ *
+ * An owner's message is addressed to a role, so a queued one may follow the role once to a
+ * successor, and to the runtime a surviving conversation moved to. A peer message may not: its
+ * admission bound it to one CEO generation and one receiving CTO session, and carrying it would
+ * hand the CEO's instruction to a session it was never admitted for. So a takeover or a runtime
+ * move rejects it, and `Outbox.claimForHolder` withholds it unless the caller proves, before the
+ * hand-over writes anything, that its proof is still current.
+ *
+ * A subset of `HOLDER_CLAIMED_KINDS`, and disjoint from `RETARGETABLE_KINDS` for the same reason.
+ */
+export const IDENTITY_BOUND_KINDS: ReadonlySet<MessageKind> = new Set<MessageKind>([
   MessageKind.PEER_MESSAGE,
 ]);
 

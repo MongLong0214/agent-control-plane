@@ -12,8 +12,9 @@ const theSubscriberCountsTheFramesItHandles = {
   id: "the-subscriber-counts-the-frames-it-handles",
   what: "every frame that reaches the subscriber is counted, with its refusal reason",
   file: "src/buzz/buzz-mention-subscriber.ts",
-  find: "            this.#tally.record(await this.#handleFrame(raw, generation));\n",
-  replace: "            await this.#handleFrame(raw, generation);\n",
+  // Re-anchored for #1044, which threads the frame's arrival receipt through this call.
+  find: "            this.#tally.record(await this.#handleFrame(raw, generation, receipt));\n",
+  replace: "            await this.#handleFrame(raw, generation, receipt);\n",
   killedBy: [
     "tests/unit/buzz-mention-subscriber.test.ts::counts a frame it refuses, under the reason it refused it",
   ],

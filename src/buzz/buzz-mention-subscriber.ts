@@ -6,6 +6,8 @@ import { decode } from "nostr-tools/nip19";
 import { makeAuthEvent } from "nostr-tools/nip42";
 import { finalizeEvent, getPublicKey, validateEvent, verifyEvent } from "nostr-tools/pure";
 
+import type { BuzzPeerBinding } from "../ingress/buzz-message.ts";
+
 /**
  * The daemon's own front door on the relay (#760, Part C).
  *
@@ -355,6 +357,12 @@ export interface BuzzMentionRoleBinding {
  */
 export interface BuzzMentionRegistry {
   primaryCtoBindingFor(pubkey: string): BuzzMentionRoleBinding | null;
+  /**
+   * The CEO binding and this role's binding as they stand right now — read when a frame *arrives*,
+   * before it waits behind another frame's admission (#1044). Reads only. Absent, or answering
+   * null, gives the frame no receipt, and the seam refuses a peer envelope that has none.
+   */
+  peerReceiptFor?(roleKey: string): BuzzPeerBinding | null;
 }
 
 /**
@@ -417,6 +425,12 @@ export interface BuzzMentionAdmissionRequest {
   /** The Buzz room the event arrived on — its single `h` tag. */
   readonly conversation: string;
   readonly event: BuzzMentionEvent;
+  /**
+   * The CEO generation and receiving CTO session current **when this frame arrived** (#1044), or
+   * null. Taken before the frame was queued, so a frame that waited across a rotation carries the
+   * generation it arrived under rather than the one it was processed under.
+   */
+  readonly receipt: BuzzPeerBinding | null;
 }
 
 /** Where a verified event goes. The daemon's composition is the only production implementation. */
@@ -967,6 +981,10 @@ class BuzzMentionSubscription {
         /* NIP-42 first: nothing is requested until the relay has challenged and accepted us. */
       },
       onFrame: (raw) => {
+        // Before the queue, and that is the point (#1044): the frame may wait behind another
+        // frame's admission, and whatever the registry says when it reaches the front describes
+        // processing, not arrival.
+        const receipt = this.#peerReceipt();
         this.#queue = this.#queue.then(async () => {
           // Checked here, and then again everywhere below. Reaching the front of the queue is the
           // *first* moment "is this still the connection I arrived on" has a truthful answer; it
@@ -981,7 +999,7 @@ class BuzzMentionSubscription {
             // past it"; a merge-gate review measured the opposite — a sink that threw left the
             // `EVENT` frame invisible to all three counters (`framesHandled: 2`). The catch counts
             // it now, which is why that claim is gone from here (#870).
-            this.#tally.record(await this.#handleFrame(raw, generation));
+            this.#tally.record(await this.#handleFrame(raw, generation, receipt));
           } catch {
             // A sink that threw established nothing about the message, so this is the `RETRY`
             // shape and is treated as one: the cursor stays where it is and the socket goes.
@@ -1074,6 +1092,19 @@ class BuzzMentionSubscription {
    * replacement opened, and the tail of the old frame is still holding a reference to a
    * subscriber whose state has entirely moved on.
    */
+  /**
+   * The registry's receipt for this role, or null. A registry that throws gives no receipt rather
+   * than taking the socket's frame handler with it: no receipt is a refusal at the seam, never an
+   * admission (#1044).
+   */
+  #peerReceipt(): BuzzPeerBinding | null {
+    try {
+      return this.#deps.registry.peerReceiptFor?.(this.#roleKey) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   #isCurrent(generation: number): boolean {
     return !this.#stopped && generation !== 0 && generation === this.#generation;
   }
@@ -1118,7 +1149,11 @@ class BuzzMentionSubscription {
     return this.#tally.snapshot();
   }
 
-  async #handleFrame(raw: string, generation: number): Promise<BuzzMentionFrameOutcome> {
+  async #handleFrame(
+    raw: string,
+    generation: number,
+    receipt: BuzzPeerBinding | null,
+  ): Promise<BuzzMentionFrameOutcome> {
     if (Buffer.byteLength(raw, "utf8") > MAX_RELAY_FRAME_BYTES) {
       this.#reconnect(generation);
       return rejected("frame-too-large");
@@ -1140,7 +1175,7 @@ class BuzzMentionSubscription {
       case "OK":
         return this.#onOk(frame, generation);
       case "EVENT":
-        return await this.#onEvent(frame, generation);
+        return await this.#onEvent(frame, generation, receipt);
       case "EOSE":
         return this.#onEose(frame, generation);
       case "CLOSED":
@@ -1256,7 +1291,11 @@ class BuzzMentionSubscription {
     return rejected("unknown-subscription");
   }
 
-  async #onEvent(frame: readonly unknown[], generation: number): Promise<BuzzMentionFrameOutcome> {
+  async #onEvent(
+    frame: readonly unknown[],
+    generation: number,
+    receipt: BuzzPeerBinding | null,
+  ): Promise<BuzzMentionFrameOutcome> {
     // `["EVENT", <subscription id>, <event>]`, exactly. A frame carrying a surplus element is not
     // this grammar, and reading elements 1 and 2 out of it anyway would be answering a message
     // nobody in this protocol sent.
@@ -1331,6 +1370,7 @@ class BuzzMentionSubscription {
       identityPubkey: this.#pubkey,
       conversation,
       event: frozen,
+      receipt,
     });
     const admission = typeof answer === "string" ? answer : answer.admission;
 
