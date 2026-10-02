@@ -12,8 +12,11 @@ const aPeerEnvelopeBoundToAnOldGenerationIsRefused = {
   id: "a-peer-envelope-bound-to-an-old-generation-is-refused",
   what: "a peer envelope bound to a CEO generation that is no longer current is refused before any write",
   file: "src/ingress/buzz-message.ts",
+  // The current binding compared with itself, rather than `if (false)`: the refusal below reads
+  // `current.value`, and inside a literally unreachable block TypeScript drops the narrowing that
+  // makes that read legal, so the bare form is a mutant that does not compile.
   find: "    if (!samePeerBinding(input.peer, current.value)) {\n",
-  replace: "    if (false) {\n",
+  replace: "    if (!samePeerBinding(current.value, current.value)) {\n",
   killedBy: [
     "tests/unit/a-ceo-mention-is-a-peer-turn.test.ts::refuses an event bound under the old generation and dispatched after a rotation, with zero writes",
   ],
