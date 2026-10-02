@@ -1333,19 +1333,8 @@ const groups = [
   },
   {
     file: "src/registry/canonical-self-claim.ts",
-    // registryProcStartFromToken, linux branch
-    reason: "NO WITNESS. Measured by weakening each of `!boot`, `!Number.isSafeInteger(ticks)`, `!Number.isSafeInteger(ticksPerSecond)` and `ticksPerSecond <= 0` to `false` and running the same 149 cases: 149 passed every time. This branch only runs for a `linux-clk:` start token; every fixture in this suite supplies the Darwin-shaped `darwin-tv:` token, so the branch is never reached, let alone with a value that would distinguish these four checks from one another.",
-    operands: [
-      ["!boot",1],
-      ["!Number.isSafeInteger(ticks)",1],
-      ["!Number.isSafeInteger(ticksPerSecond)",1],
-      ["ticksPerSecond <= 0",1],
-    ],
-  },
-  {
-    file: "src/registry/canonical-self-claim.ts",
-    // registryProcStartFromToken, common tail
-    reason: "NO WITNESS. Measured by weakening `!Number.isSafeInteger(seconds)` and `seconds < 0` each to `false` and running the same 149 cases: 149 passed. `seconds` is `Number(darwin[1])` where `darwin[1]` is the token regex's `\\d+` capture, always a safe non-negative integer for any token this suite supplies; neither operand is reachable without a token whose digit run overflows `Number.MAX_SAFE_INTEGER`, which no test constructs.",
+    // registryProcStartFromStartNs
+    reason: "NO WITNESS. Measured by weakening `!Number.isSafeInteger(seconds)` and `seconds < 0` each to `false` and running the same 149 cases: 149 passed. `seconds` is `Number(startedNs / 1_000_000_000n)` where `startedNs` is built from the Darwin token regex's `\\d+` captures, always a safe non-negative integer for any token this suite supplies; neither operand is reachable without a token whose digit run overflows `Number.MAX_SAFE_INTEGER`, which no test constructs.",
     operands: [
       ["!Number.isSafeInteger(seconds)",1],
       ["seconds < 0",1],
@@ -1399,7 +1388,7 @@ const groups = [
   {
     file: "src/registry/canonical-self-claim.ts",
     // deriveClaimantIdentity, start-token-stable guard
-    reason: "NO WITNESS. Measured by weakening `snapshot.startedAt === null` to `false` and running the same 149 cases: 149 passed. Reaching this line requires `registry.allowed` to be true, and every registry reader this suite builds refuses a null start token before allowing, inside `registryProcStartFromToken` — so a registry can never be observed as allowed while `snapshot.startedAt` is null under any reader exercised here. A reader that is allowed without consulting the start token at all would be needed to separate this from its sibling `afterRead !== snapshot.startedAt` (named by `host-session-registry-start-token-stable`).",
+    reason: "NO WITNESS. Measured by weakening `snapshot.startedAt === null` to `false` and running the same 149 cases: 149 passed. Reaching this line requires `registry.allowed` to be true, and every registry reader this suite builds refuses a null start token before allowing, inside `darwinStartEpochNs` — so a registry can never be observed as allowed while `snapshot.startedAt` is null under any reader exercised here. A reader that is allowed without consulting the start token at all would be needed to separate this from its sibling `afterRead !== snapshot.startedAt` (named by `host-session-registry-start-token-stable`).",
     operands: [
       ["snapshot.startedAt === null",1],
     ],
@@ -1410,23 +1399,6 @@ const groups = [
     reason: "TypeScript enforcing. Measured by replacing `!registry.allowed` with `true` and running `tsc --noEmit -p .`: exit 2, TS2339 \"Property 'message' does not exist on type 'Decision<{ sessionUuid: string; }>'\" at the refusal's own `registry.message`. The operand is the narrowing that makes the denied registry's message readable, so no compiling mutation removes it. Its two siblings are named: `argvSessionUuid` by host-session-registry-anomaly-refusal-needs-argv and `!isHostSessionRegistryAbsent(registry)` by host-session-registry-anomaly-refuses-argv.",
     operands: [
       ["!registry.allowed",1],
-    ],
-  },
-  {
-    file: "src/registry/canonical-self-claim.ts",
-    // processStartEpochNs, linux branch (#1035)
-    reason: "NO WITNESS. This branch runs only for a `linux-clk:` start token. Every fixture supplies a `darwin-tv:` token, and the suite and the falsifiability sweep run on macos-15 (ci.yml `verify-matrix`, `guard-falsifiability`), where the default inspector never produces a Linux token. Separating `!uptime` from `ticksPerSecond <= 0n` needs a Linux host whose `/proc/uptime` is unreadable or malformed, or whose `getconf CLK_TCK` answers zero; neither is constructible here.",
-    operands: [
-      ["!uptime",1],
-      ["ticksPerSecond <= 0n",1],
-    ],
-  },
-  {
-    file: "src/registry/canonical-self-claim.ts",
-    // registryCreationNs, Linux ctime fallback (#1035)
-    reason: "NO WITNESS. `process.platform === \"linux\"` is named by host-session-registry-ctime-fallback-is-linux-only, so on the macos-15 host that runs the suite the second operand is never evaluated: Darwin short-circuits before `stats.ctimeNs > 0n`. Removing it changes the answer only on Linux, for a file whose birth time and ctime both read zero, and the one fixture that zeroes both (`refuses a registry file with neither a birth time nor a ctime`) refuses through the platform operand on Darwin first.",
-    operands: [
-      ["stats.ctimeNs > 0n",1],
     ],
   },
 ];

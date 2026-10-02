@@ -2766,6 +2766,32 @@ describe("#1035 — the claimant session is re-derived and a registry anomaly re
     expectRolledBack(core, before, result);
   });
 
+  it.each([
+    ["--continue", continueChain],
+    ["an argv selector naming CANON", () => standardChain()],
+  ])("a registry file under a non-Darwin start token is refused as unverifiable with %s, and nothing is written", async (_label, chain) => {
+    // ACP1034-R2-01: only a native Darwin start token can bind a registry entry to its process
+    // instance. A Linux token is never placed on the wall clock, so the file is refused whatever
+    // it says, and — not being an absent file — it refuses the argv selector with it.
+    const root = tempDir("acp-1035-registry-linux-");
+    writeFileSync(join(root, "10.json"), JSON.stringify({
+      pid: 10, procStart: "Fri Jan  1 00:00:00 2027", sessionId: CANON, kind: "interactive",
+    }));
+    const core = makeCore();
+    const projectId = "prj_registry_non_darwin";
+    insertProject(core, projectId);
+    const linuxChain = chain().map((entry) => entry.pid === 10 ? { ...entry, startedAt: "linux-clk:36770" } : entry);
+    const subject = makeSubject(core, projectId, {
+      chain: linuxChain, hostSessionRegistryReader: makeDefaultHostSessionRegistryReader(root),
+    });
+    const before = rowCounts(core);
+    const result = await subject.claim(baseRequest(core, projectId));
+    expect(result, JSON.stringify(result)).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.PROBE_FAILED, message: expect.stringContaining("not a native Darwin start token"),
+    });
+    expectRolledBack(core, before, result);
+  });
+
   it("the delegated CTO verifier refuses the same detected replacement under a valid argv selector", () => {
     const { reader, state } = replacingRegistryReader();
     const checked = verifyClaudeIdentity(

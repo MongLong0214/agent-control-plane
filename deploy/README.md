@@ -66,14 +66,16 @@ daemon entry and passed unchanged to the claim boundary.
 Self-claim derives the session UUID from the Claude ancestor's argv selector first, and from the
 host session registry beside the transcript root when argv has no selector. The registry is read
 through one `O_NOFOLLOW` descriptor (regular, owned by the daemon's uid, size-bounded) and must have
-its pid and `procStart` match the ancestor and its kernel start time, a file creation time no
-earlier than the ancestor's native start token, that start token unchanged after the read, and
-`kind` `interactive`. Only a missing registry file lets an argv selector stand alone: a file that
+its pid and `procStart` match the ancestor and its kernel start time, a native file birth time no
+earlier than the ancestor's native Darwin start token and no later than the wall clock at the
+check, that start token unchanged after the read, and `kind` `interactive`. A start token that is
+not a native Darwin token, or a birth time that is unavailable or zero, makes the registry
+unverifiable and refuses it; ACP deploys only on Darwin (launchd). Only a missing registry file lets an argv selector stand alone: a file that
 fails any of those checks, or a valid entry that disagrees with the selector, refuses the claim.
 The session is derived again, argv and registry, after the Buzz await and at the commit
 checkpoint, and the claim refuses if it changed; the delegated CTO bind's rechecks do the same.
 The host session registry is supplementary evidence writable by a same-uid process, not an additional authentication mechanism.
-Residual risk: the creation-time check compares two wall-clock readings, so a clock stepped backward between a dead process writing its registry file and a same-second reuse of its pid can still admit that stale file, and on Linux without a reported birth time `ctime` stands in and does not refuse a stale file whose metadata changed after the new process started.
+Residual risk: on Darwin, a backward wall-clock step smaller than the gap between a stale registry file's creation and the claim, combined with a reuse of its pid within the same second, by a same-uid process that could already write the registry, can still admit that stale file.
 
 `ACP_CANONICAL_CTO_WORKDIR` used to be the eighth. It pinned the one directory the canonical
 CTO's process could run from; nothing compares a working directory any more, so the group no

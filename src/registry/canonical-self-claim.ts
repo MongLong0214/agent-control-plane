@@ -3,7 +3,7 @@ import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, re
 import { homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
 
-import type { Clock } from "../core/clock.ts";
+import { systemClock, type Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { readProcessArgv, readProcessStartToken } from "../core/process-argv.ts";
@@ -925,27 +925,26 @@ export const HOST_SESSION_REGISTRY_OPEN_FLAGS = constants.O_RDONLY | constants.O
 const registrySizeWithinBound = (size: number): boolean =>
   Number.isSafeInteger(size) && size >= 0 && size <= HOST_SESSION_REGISTRY_MAX_BYTES;
 
+/**
+ * The registry is bound to a process instance only by Darwin's native start token: the kernel's
+ * own `pbi_start_tvsec`/`tvusec` wall-clock pair, which places the start exactly on the clock a
+ * file's `st_birthtime` is read from. ACP deploys only on Darwin (launchd). Any other token —
+ * Linux's `linux-clk:` ticks since boot among them — has no such instant: placing it on the wall
+ * clock means sampling the boot time, and that estimate moves with probe latency. Such a token is
+ * not converted at all; the reader refuses the registry as unverifiable.
+ */
+const DARWIN_START_TOKEN = /^darwin-tv:(\d+)\.(\d{6})$/;
+
+/** The ancestor's native start as nanoseconds since the Unix epoch, or `null` for a non-Darwin token. */
+const darwinStartEpochNs = (token: string | null): bigint | null => {
+  const darwin = DARWIN_START_TOKEN.exec(token ?? "");
+  if (!darwin) return null;
+  return BigInt(darwin[1]!) * 1_000_000_000n + BigInt(darwin[2]!) * 1_000n;
+};
+
 /** Claude records UTC ctime at whole-second precision, while the process snapshot keeps its native start token. */
-const registryProcStartFromToken = (token: string | null): string | null => {
-  let seconds: number;
-  const darwin = /^darwin-tv:(\d+)\.(\d{6})$/.exec(token ?? "");
-  if (darwin) {
-    seconds = Number(darwin[1]);
-  } else {
-    const linux = /^linux-clk:(\d+)$/.exec(token ?? "");
-    if (!linux) return null;
-    try {
-      const boot = /^btime (\d+)$/m.exec(readFileSync("/proc/stat", "utf8"));
-      const ticksPerSecond = Number(execFileSync("getconf", ["CLK_TCK"], { encoding: "utf8", timeout: 2_000 }).trim());
-      const ticks = Number(linux[1]);
-      if (!boot || !Number.isSafeInteger(ticks) || !Number.isSafeInteger(ticksPerSecond) || ticksPerSecond <= 0) {
-        return null;
-      }
-      seconds = Number(boot[1]) + Math.floor(ticks / ticksPerSecond);
-    } catch {
-      return null;
-    }
-  }
+const registryProcStartFromStartNs = (startedNs: bigint): string | null => {
+  const seconds = Number(startedNs / 1_000_000_000n);
   if (!Number.isSafeInteger(seconds) || seconds < 0) return null;
   const date = new Date(seconds * 1_000);
   if (!Number.isFinite(date.getTime())) return null;
@@ -957,54 +956,22 @@ const registryProcStartFromToken = (token: string | null): string | null => {
 };
 
 /**
- * The ancestor's native start as nanoseconds since the Unix epoch, the instant the registry file's
- * creation time must not precede. `null` when the token cannot be placed on the wall clock.
- *
- * Darwin's token is the kernel's own `pbi_start_tvsec`/`tvusec` wall-clock pair, so it converts
- * exactly. Linux's is clock ticks since boot; the boot instant is taken as the current wall clock
- * minus `/proc/uptime`, which is truncated to 10 ms, and both that truncation and the tick are
- * rounded *up*. The estimate can therefore only be later than the true start, never earlier: a file
- * created just after its process started may be refused, a file created before it is not admitted.
+ * The upper bound of the current wall clock in nanoseconds since the Unix epoch. `Clock` answers
+ * in whole milliseconds, so the end of the current millisecond is taken: a file created earlier in
+ * the same millisecond as the check is not mistaken for one from the future.
  */
-const processStartEpochNs = (token: string | null): bigint | null => {
-  const darwin = /^darwin-tv:(\d+)\.(\d{6})$/.exec(token ?? "");
-  if (darwin) return BigInt(darwin[1]!) * 1_000_000_000n + BigInt(darwin[2]!) * 1_000n;
-  const linux = /^linux-clk:(\d+)$/.exec(token ?? "");
-  if (!linux) return null;
-  try {
-    const uptime = /^(\d+)\.(\d{2})\s/.exec(readFileSync("/proc/uptime", "utf8"));
-    const ticksPerSecond = BigInt(execFileSync("getconf", ["CLK_TCK"], { encoding: "utf8", timeout: 2_000 }).trim());
-    if (!uptime || ticksPerSecond <= 0n) return null;
-    const nowUpperNs = (BigInt(Date.now()) + 1n) * 1_000_000n;
-    const uptimeNs = BigInt(uptime[1]!) * 1_000_000_000n + BigInt(uptime[2]!) * 10_000_000n;
-    const sinceBootUpperNs = ((BigInt(linux[1]!) + 1n) * 1_000_000_000n + ticksPerSecond - 1n) / ticksPerSecond;
-    return nowUpperNs - uptimeNs + sinceBootUpperNs;
-  } catch {
-    return null;
-  }
-};
-
-/**
- * When the kernel says the opened file came into existence, or `null` when it cannot say. Darwin
- * records `st_birthtime` on every local filesystem. Linux reports a birth time only where `statx`
- * and the filesystem carry one; where it reads zero, `ctime` is the strongest remaining fact — it is
- * never earlier than the file's creation, so it still refuses a file untouched since before the
- * process started, but a stale file whose metadata changed after that start is not refused by it.
- */
-const registryCreationNs = (stats: BigIntStats): bigint | null => {
-  if (stats.birthtimeNs > 0n) return stats.birthtimeNs;
-  if (process.platform === "linux" && stats.ctimeNs > 0n) return stats.ctimeNs;
-  return null;
-};
+const wallClockUpperNs = (clock: Clock): bigint => (BigInt(clock.now().getTime()) + 1n) * 1_000_000n;
 
 /**
  * The host registry directory sits beside the one transcript root this module already uses.
  * The reader owns all host-file checks so synthetic ancestry tests can inject a reader without
- * consulting the actual Claude home.
+ * consulting the actual Claude home. `clock` is the wall clock a registry file's creation time
+ * must not be later than; it is injectable so a backward step can be reproduced.
  */
 export const makeDefaultHostSessionRegistryReader = (
   root: string = join(dirname(defaultTranscriptRoot()), "sessions"),
   fileOps: HostSessionRegistryFileOps = defaultHostSessionRegistryFileOps,
+  clock: Clock = systemClock,
 ): HostSessionRegistryReader => ({
   read(pid, startToken) {
     const path = join(root, `${pid}.json`);
@@ -1082,7 +1049,17 @@ export const makeDefaultHostSessionRegistryReader = (
     if (typeof fields.pid !== "number" || fields.pid !== pid) {
       return deny(ReasonCode.CONFLICT, `host session registry pid does not match the claude ancestor: ${path}`);
     }
-    const expectedProcStart = registryProcStartFromToken(startToken);
+    // Only a native Darwin start token and a native file creation time bind this entry to the
+    // process instance below the second. Anything else is refused as unverifiable, never estimated:
+    // the refusal is not an absent file, so it also refuses a valid argv selector.
+    const startedNs = darwinStartEpochNs(startToken);
+    if (startedNs === null) {
+      return deny(
+        ReasonCode.PROBE_FAILED,
+        `claude ancestor start token is not a native Darwin start token, so it cannot verify host session registry: ${path}`,
+      );
+    }
+    const expectedProcStart = registryProcStartFromStartNs(startedNs);
     if (expectedProcStart === null) {
       return deny(ReasonCode.PROBE_FAILED, `claude ancestor start token cannot verify host session registry: ${path}`);
     }
@@ -1091,26 +1068,29 @@ export const makeDefaultHostSessionRegistryReader = (
     }
     // procStart is whole seconds, so a process that reuses this pid within the same second as an
     // earlier one matches a file the earlier one left. The file itself was created by a process
-    // that existed when it was written: a file whose kernel creation time precedes this process's
-    // native start token was written before this process instance existed, and is refused.
+    // that existed when it was written: a file whose kernel birth time precedes this process's
+    // native start token was written before this process instance existed, and is refused. A
+    // birth time later than the wall clock now means the clock stepped backward after the file
+    // was written, so neither instant can be trusted against the other, and that is refused too.
     //
-    // Residual risk: both instants are wall-clock readings. A wall clock stepped backward between
-    // a dead process writing this file and a same-second reuse of its pid can place the stale
-    // file's creation after the new start and admit it; a forward step cannot. A same-uid process
-    // can also set a file's birth time (`setattrlist`), which is inside the threat model this
-    // registry already carries — it is supplementary evidence a same-uid writer controls.
-    const startedNs = processStartEpochNs(startToken);
-    if (startedNs === null) {
-      return deny(ReasonCode.PROBE_FAILED, `claude ancestor start token cannot be placed against the registry file's creation time: ${path}`);
-    }
-    const createdNs = registryCreationNs(opened);
-    if (createdNs === null) {
+    // Residual risk: on Darwin, a backward wall-clock step smaller than the gap between the stale
+    // file's creation and the claim, combined with a reuse of its pid within the same second, by a
+    // same-uid process that could already write the registry, still admits the stale file. A
+    // same-uid process can also set a file's birth time (`setattrlist`), which is inside the same
+    // threat model: the registry is supplementary evidence a same-uid writer controls.
+    if (opened.birthtimeNs <= 0n) {
       return deny(ReasonCode.PROBE_FAILED, `host session registry file creation time cannot be established: ${path}`);
     }
-    if (createdNs < startedNs) {
+    if (opened.birthtimeNs < startedNs) {
       return deny(
         ReasonCode.CONFLICT,
         `host session registry file was created before the claude ancestor started, so it belongs to an earlier process at this pid: ${path}`,
+      );
+    }
+    if (opened.birthtimeNs > wallClockUpperNs(clock)) {
+      return deny(
+        ReasonCode.PROBE_FAILED,
+        `host session registry file was created after the current wall clock, so the clock stepped backward after it was written: ${path}`,
       );
     }
     if (typeof fields.sessionId !== "string" || !UUID_PATTERN.test(fields.sessionId)) {

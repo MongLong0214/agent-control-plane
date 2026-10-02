@@ -375,6 +375,13 @@ describe("real process ancestry — ps-backed, not a fake", () => {
     const registryReader = makeDefaultHostSessionRegistryReader(sessions);
 
     const derived = deriveClaimantIdentity(child.pid!, defaultProcessAncestryInspector, 64, registryReader);
+    if (process.platform !== "darwin") {
+      // Only a native Darwin start token binds a registry entry to its process instance.
+      expect(derived, JSON.stringify(derived)).toMatchObject({
+        allowed: false, reasonCode: "PROBE_FAILED", message: expect.stringContaining("not a native Darwin start token"),
+      });
+      return;
+    }
     expect(derived, JSON.stringify(derived)).toMatchObject({
       allowed: true, value: { pid: child.pid, sessionUuid, sessionSource: "host-session-registry" },
     });

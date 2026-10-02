@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { ManualClock } from "../../src/core/clock.ts";
 import { deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import * as claim from "../../src/registry/canonical-self-claim.ts";
@@ -36,11 +37,8 @@ const fixture = (entry: unknown = { pid: 10, procStart: PROC_START, sessionId: C
 const derive = (argv: string[], reader: claim.HostSessionRegistryReader, startedAt: string | null = START) =>
   claim.deriveClaimantIdentity(10, inspector(argv, startedAt), 8, reader);
 
-/** The timestamp the reader treats as the file's creation: birthtime, or ctime where Linux has none. */
-const registryCreationNs = (path: string): bigint => {
-  const stats = statSync(path, { bigint: true });
-  return stats.birthtimeNs > 0n || process.platform !== "linux" ? stats.birthtimeNs : stats.ctimeNs;
-};
+/** The timestamp the reader treats as the file's creation: its native birth time, nothing else. */
+const registryCreationNs = (path: string): bigint => statSync(path, { bigint: true }).birthtimeNs;
 const darwinToken = (ns: bigint): string =>
   `darwin-tv:${ns / 1_000_000_000n}.${String((ns % 1_000_000_000n) / 1_000n).padStart(6, "0")}`;
 /** The host's whole-second `TZ=UTC` ctime rendering of the second containing `ns`. */
@@ -354,32 +352,18 @@ describe("canonical host session registry derivation", () => {
     expect(derived).not.toMatchObject({ message: expect.stringContaining("argv selector is not accepted") });
   });
 
-  it("refuses a registry file whose birth time the kernel does not report, falling back to ctime only on Linux", () => {
+  it("refuses a registry file whose birth time the kernel does not report, with no ctime fallback", () => {
     const { root } = fixture();
-    // The real ctime is kept: it is after the ancestor's start, so only the platform rule decides.
+    // The real ctime is kept and is after the ancestor's start: only the missing birth time refuses.
     const reader = claim.makeDefaultHostSessionRegistryReader(root, fileOps({
       fstat(fd) {
         return Object.assign(Object.create(statFd(fd)) as BigIntStats, { birthtimeNs: 0n });
       },
     }));
-    const derived = derive(["claude", "--continue"], reader);
-    if (process.platform === "linux") {
-      expect(derived).toMatchObject({ allowed: true, value: { sessionUuid: CANON } });
-      return;
-    }
-    expect(derived).toMatchObject({
+    expect(derive(["claude", "--continue"], reader)).toMatchObject({
       allowed: false, reasonCode: ReasonCode.PROBE_FAILED, message: expect.stringContaining("creation time"),
     });
-  });
-
-  it("refuses a registry file with neither a birth time nor a ctime", () => {
-    const { root } = fixture();
-    const reader = claim.makeDefaultHostSessionRegistryReader(root, fileOps({
-      fstat(fd) {
-        return Object.assign(Object.create(statFd(fd)) as BigIntStats, { birthtimeNs: 0n, ctimeNs: 0n });
-      },
-    }));
-    expect(derive(["claude", "--continue"], reader)).toMatchObject({
+    expect(derive(["claude", "--resume", CANON], reader)).toMatchObject({
       allowed: false, reasonCode: ReasonCode.PROBE_FAILED, message: expect.stringContaining("creation time"),
     });
   });
@@ -433,4 +417,34 @@ describe("canonical host session registry derivation", () => {
     });
   });
 
+  /**
+   * A birth time later than the wall clock at the check means the clock stepped backward after
+   * the file was written; a stale file from before the step could otherwise land after the new
+   * process's start token. The clock is injected so the step is reproduced, not waited for.
+   */
+  const futureFixture = (clockOffsetMs: number) => {
+    const { root, path } = fixture();
+    const createdNs = registryCreationNs(path);
+    const startNs = createdNs - 500_000_000n;
+    writeFileSync(path, JSON.stringify({ pid: 10, procStart: procStartOf(startNs), sessionId: CANON, kind: "interactive" }));
+    expect(registryCreationNs(path)).toBe(createdNs);
+    const clock = new ManualClock(Number(createdNs / 1_000_000n) + clockOffsetMs);
+    return { reader: claim.makeDefaultHostSessionRegistryReader(root, fileOps(), clock), token: darwinToken(startNs) };
+  };
+
+  it("refuses a registry file whose birth time is 0.5 s later than the injected wall clock, even under a matching argv selector", () => {
+    const { reader, token } = futureFixture(-500);
+    for (const argv of [["claude", "--continue"], ["claude", "--resume", CANON]]) {
+      expect(derive(argv, reader, token)).toMatchObject({
+        allowed: false, reasonCode: ReasonCode.PROBE_FAILED, message: expect.stringContaining("after the current wall clock"),
+      });
+    }
+  });
+
+  it("admits a registry file whose birth time is 0.5 s earlier than the injected wall clock", () => {
+    const { reader, token } = futureFixture(500);
+    expect(derive(["claude", "--continue"], reader, token)).toMatchObject({
+      allowed: true, value: { sessionUuid: CANON, sessionSource: "host-session-registry" },
+    });
+  });
 });
