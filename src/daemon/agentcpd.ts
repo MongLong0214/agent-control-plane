@@ -64,6 +64,7 @@ import {
   type BuzzMentionRouter,
   type BuzzMessageIngressInput,
   type BuzzMessageTurnPort,
+  type AdmittedPeerSource,
   type BuzzPeerRegistry,
   type CeoTurnDelivery,
 } from "../ingress/buzz-message.ts";
@@ -800,7 +801,10 @@ export const buzzPeerRegistry = (cp: ControlPlane): BuzzPeerRegistry => ({
     // #1044. Three ways an identity is not this generation's alone, each a read: another session
     // row carries it (a stopped one keeps the column, which is what makes a key's earlier holder
     // visible), this runtime was bound to an earlier CEO generation, or an earlier generation's
-    // conversation was moved onto this runtime before this generation began.
+    // conversation was moved onto this runtime. The last is read from the generation the move
+    // recorded rather than from when it happened: a move and the next binding can share one clock
+    // reading, and comparing times then answered "not reused" for a runtime that served the
+    // generation before. A move record with no readable generation counts as an earlier one.
     const reused =
       channelIdentity !== null &&
       (cp.db.get<{ reused: number }>(
@@ -810,11 +814,11 @@ export const buzzPeerRegistry = (cp: ControlPlane): BuzzPeerRegistry => ({
                      WHERE role_key = ? AND binding_generation < ? AND session_id = ?)
          OR EXISTS (SELECT 1 FROM audit_events
                      WHERE kind = 'BINDING_RUNTIME_MOVED' AND role_key = ? AND session_id = ?
-                       AND at < ?) AS reused`,
+                       AND COALESCE(json_extract(evidence_json, '$.generation'), -1) < ?) AS reused`,
         [
           channelIdentity, ceo.sessionId,
           ceo.roleKey, ceo.bindingGeneration, ceo.sessionId,
-          ceo.roleKey, ceo.sessionId, ceo.createdAt,
+          ceo.roleKey, ceo.sessionId, ceo.bindingGeneration,
         ],
       )?.reused ?? 1) !== 0;
     return {
@@ -2885,16 +2889,17 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
       try {
       return cp.db.tx((): Decision<OwnerMessageHandover> => {
         // #1044. A peer message's proof is checked here, before the hand-over's first write and in
-        // its transaction: the CEO generation it was admitted under must still be the current one,
-        // and the CTO it names must be exactly this holder. A row that fails is withheld rather than
-        // burned — not handed over and not written to — and reported by id so the holder can
-        // reject it.
-        const ceoGeneration = cp.bindings.active(roleKeyFor(Role.CEO))?.bindingGeneration ?? null;
+        // its transaction, against the registry as it stands now: the CEO generation and the CEO
+        // runtime it was admitted under, that runtime's channel identity — still the one that
+        // signed, still not reused — and exactly this holder as the receiving CTO. A row that fails
+        // is withheld rather than burned — not handed over and not written to — and reported by id
+        // so the holder can reject it.
+        const ceo = buzzPeerRegistry(cp).currentCeo();
         const taken = cp.outbox.claimForHolder(
           holder,
           (candidate) =>
             candidate.kind !== MessageKind.PEER_MESSAGE ||
-            peerProofIsCurrent(admittedPeerProof(cp, candidate.payload), ceoGeneration, holder),
+            peerProofIsCurrent(admittedPeerSource(cp, candidate.payload), ceo, holder),
         );
         const unresolved = taken.unresolved;
         const withheld = taken.withheld;
@@ -3011,17 +3016,18 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
 };
 
 /**
- * The generation proof a queued peer message was admitted under, read back through its pointer
- * (#1044) — or `undefined` when the pointer, the stored envelope or its digest does not check out.
+ * What a queued peer message was admitted from, read back through its pointer (#1044): the
+ * generation proof in the admitted payload and the inbound row's author — or `undefined` when the
+ * pointer, the stored envelope or its digest does not check out.
  *
  * Reads only, and the digest is checked here as well as after the claim: the proof a hand-over is
  * decided on must be the one admission digested, not merely whatever the pointer's row now says.
  */
-const admittedPeerProof = (cp: ControlPlane, outboxPayload: unknown): unknown => {
+const admittedPeerSource = (cp: ControlPlane, outboxPayload: unknown): AdmittedPeerSource | undefined => {
   const pointer = ownerMessagePointerOf(outboxPayload);
   if (!pointer) return undefined;
-  const source = cp.db.get<{ payload_json: string | null }>(
-    `SELECT payload_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+  const source = cp.db.get<{ actor: string; payload_json: string | null }>(
+    `SELECT actor, payload_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
     [pointer.sourceChannel, pointer.sourceNonce],
   );
   if (!source?.payload_json) return undefined;
@@ -3032,7 +3038,7 @@ const admittedPeerProof = (cp: ControlPlane, outboxPayload: unknown): unknown =>
     return undefined;
   }
   if (digestOf(payload) !== pointer.sourcePayloadDigest) return undefined;
-  return (payload as { peer?: unknown }).peer;
+  return { proof: (payload as { peer?: unknown }).peer, author: source.actor };
 };
 
 /**

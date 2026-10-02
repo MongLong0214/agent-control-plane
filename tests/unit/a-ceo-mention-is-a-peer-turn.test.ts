@@ -391,6 +391,27 @@ const replaceCto = (
   return next;
 };
 
+/**
+ * Moves the CEO's conversation onto another runtime within its generation (`SURVIVED`): the
+ * binding generation stays, the live runtime changes. No clock advance.
+ */
+const moveCeoRuntime = (fixture: PeerFixture, buzzAddress: string | null = null) => {
+  const { harness } = fixture;
+  const before = harness.cp.bindings.active(roleKeyFor(Role.CEO))!.bindingGeneration;
+  const next = readySession(harness, "ceo-moved", buzzAddress);
+  const moved = harness.cp.bindings.switchTo({
+    roleKey: roleKeyFor(Role.CEO),
+    role: Role.CEO,
+    sessionId: next.sessionId,
+    reason: "test runtime move",
+    conversation: "SURVIVED",
+  });
+  if (!moved.allowed) throw new Error(`CEO runtime move failed: ${moved.message}`);
+  expect(moved.value.bindingGeneration).toBe(before);
+  expect(moved.value.sessionId).toBe(next.sessionId);
+  return next;
+};
+
 /** Until `predicate` holds, yielding to the event loop between looks. */
 const until = async (predicate: () => boolean, what: string): Promise<void> => {
   for (let attempt = 0; attempt < 500; attempt += 1) {
@@ -571,6 +592,36 @@ describe("#1038 a bound CEO's Buzz mention is a peer turn for the bound PRIMARY_
       const before = fixture.writes();
       await fixture.relayDelivers(fixture.mention(fixture.ceo, { text: "같은 런타임, 새 세대" }));
       expect(fixture.writes()).toBe(before);
+      expect(fixture.refusedWith(ReasonCode.BUZZ_PEER_ORIGIN_AMBIGUOUS)).toBe(1);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("refuses an earlier generation's event when its runtime is bound again at the very instant it was moved there", async () => {
+    // Generation 1 starts on a runtime with no Buzz channel identity.
+    const fixture = await startPeerFixture({ ceoChannelIdentity: "null" });
+    try {
+      const { harness } = fixture;
+      const startedAt = harness.clock.nowIso();
+      // Generation 1 is moved onto runtime B, which carries the CEO's key, and B signs an event.
+      const b = moveCeoRuntime(fixture);
+      bindChannelIdentity(harness, b, fixture.ceo.pubkey);
+      const event = fixture.mention(fixture.ceo, { text: "1세대, 런타임 B 에서 서명" });
+
+      // Generation 2 is bound to B with the clock where it was: the move and the new binding share
+      // one timestamp, so no ordering of times can say B served generation 1. The record can.
+      expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "test re-bind").reasonCode).toBe(ReasonCode.OK);
+      expect(bindCeoSession(harness, b)).toBe(fixture.ceoGeneration + 1);
+      expect(harness.clock.nowIso()).toBe(startedAt);
+
+      const before = fixture.writes();
+      expect(
+        await deliverBuzzMessage(fixture.ingress.seam.ingress, fixture.ingress.seam.port, fixture.inputFor(event)),
+      ).toMatchObject({ allowed: false, reasonCode: ReasonCode.BUZZ_PEER_ORIGIN_AMBIGUOUS });
+      await fixture.relayDelivers(event);
+      expect(fixture.writes()).toBe(before);
+      expect(fixture.admitted(event.id)).toBeUndefined();
       expect(fixture.refusedWith(ReasonCode.BUZZ_PEER_ORIGIN_AMBIGUOUS)).toBe(1);
     } finally {
       await fixture.close();
@@ -893,6 +944,55 @@ describe("#1044 a queued peer message keeps its identity fence until it is hande
       expect(fixture.peerRows()[0]!.status).toBe("REJECTED");
       const claim = JSON.parse(fixture.admitted(peerEvent.id)!.turn_claim_json!) as Record<string, unknown>;
       expect(claim["noReplyAt"]).toEqual(expect.any(String));
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("withholds a queued peer message after the CEO's runtime moves within its generation, writing nothing", async () => {
+    const fixture = await startPeerFixture();
+    try {
+      const { harness } = fixture;
+      await fixture.relayDelivers(fixture.mention(fixture.ceo, { text: "떠난 런타임의 지시" }));
+      const [peerRow] = fixture.peerRows();
+
+      // The generation is unchanged; the runtime that signed is gone, and the one now serving the
+      // CEO carries no Buzz channel identity at all.
+      moveCeoRuntime(fixture);
+      const before = fixture.writes();
+      const taken = ownerMessageLedger(harness.cp).claim(fixture.holder());
+      expect(claimOf(taken.allowed ? taken.value : null)).toMatchObject({
+        claimed: null,
+        withheld: [{ messageId: peerRow!.message_id }],
+      });
+      expect(fixture.writes()).toBe(before);
+      expect(fixture.peerRows()[0]!.status).toBe("PENDING");
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("withholds a queued peer message once the CEO's runtime no longer speaks as the identity that signed it, writing nothing", async () => {
+    const fixture = await startPeerFixture();
+    try {
+      const { harness } = fixture;
+      await fixture.relayDelivers(fixture.mention(fixture.ceo, { text: "멈춘 런타임의 지시" }));
+      const [peerRow] = fixture.peerRows();
+
+      // Same generation and the same runtime on the binding, but that runtime has stopped, so it no
+      // longer speaks as any Buzz channel identity.
+      expect(
+        harness.cp.sessions.transition(fixture.ceoSession.sessionId, SessionLifecycle.STOPPED, "gone")
+          .reasonCode,
+      ).toBe(ReasonCode.OK);
+      expect(harness.cp.bindings.active(roleKeyFor(Role.CEO))?.sessionId).toBe(fixture.ceoSession.sessionId);
+      const before = fixture.writes();
+      const taken = ownerMessageLedger(harness.cp).claim(fixture.holder());
+      expect(claimOf(taken.allowed ? taken.value : null)).toMatchObject({
+        claimed: null,
+        withheld: [{ messageId: peerRow!.message_id }],
+      });
+      expect(fixture.writes()).toBe(before);
     } finally {
       await fixture.close();
     }

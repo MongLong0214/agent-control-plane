@@ -109,31 +109,38 @@ export interface BuzzPeerBinding {
   readonly ctoSessionId: string;
 }
 
+/** The ACTIVE CEO binding and its live runtime, as `BuzzPeerRegistry.currentCeo` reads them. */
+export interface BuzzPeerCurrentCeo {
+  readonly bindingGeneration: number;
+  readonly sessionId: string;
+  /**
+   * That runtime's `sessions.buzz_actor_id`, or null when it is not READY/DRAINING or carries
+   * none. Null is the live state on 2026-10-02 and it refuses every CEO mention: nothing here
+   * binds one, and #1037 is what issues the credential that lets `bindActor` do it.
+   */
+  readonly channelIdentity: string | null;
+  /** When this generation's assignment was created. */
+  readonly generationStartedAt: string;
+  /**
+   * Whether that identity is anything but this generation's alone (#1044): another session row —
+   * of any lifecycle — carries it, or this runtime served an earlier CEO generation. Either way
+   * an event signed with it may be an earlier holder's, and nothing in the event can say which,
+   * so every event signed with it is refused. A fresh identity per CEO generation is the remedy.
+   *
+   * "Served an earlier generation" is read from what each generation recorded — the session its
+   * assignment was bound to, and the generation a runtime move onto this session was made in —
+   * never from timestamps, which tie when a move and the next binding share a clock reading.
+   */
+  readonly channelIdentityReused: boolean;
+}
+
 /**
  * The registry facts the peer rule reads. Supplied by the daemon, and reads only: nothing the peer
  * rule asks may write, because every refusal it makes must leave the database untouched.
  */
 export interface BuzzPeerRegistry {
   /** The ACTIVE CEO binding and its live runtime, or null when there is no CEO binding. */
-  currentCeo(): {
-    readonly bindingGeneration: number;
-    readonly sessionId: string;
-    /**
-     * That runtime's `sessions.buzz_actor_id`, or null when it is not READY/DRAINING or carries
-     * none. Null is the live state on 2026-10-02 and it refuses every CEO mention: nothing here
-     * binds one, and #1037 is what issues the credential that lets `bindActor` do it.
-     */
-    readonly channelIdentity: string | null;
-    /** When this generation's assignment was created. */
-    readonly generationStartedAt: string;
-    /**
-     * Whether that identity is anything but this generation's alone (#1044): another session row —
-     * of any lifecycle — carries it, or this runtime served an earlier CEO generation. Either way
-     * an event signed with it may be an earlier holder's, and nothing in the event can say which,
-     * so every event signed with it is refused. A fresh identity per CEO generation is the remedy.
-     */
-    readonly channelIdentityReused: boolean;
-  } | null;
+  currentCeo(): BuzzPeerCurrentCeo | null;
   /**
    * The PRIMARY_CTO binding a `p` tag names, only when it names a live session whose one
    * mentionable role is that PRIMARY_CTO — the same question the subscriber asks before it speaks.
@@ -178,24 +185,40 @@ const samePeerBinding = (presented: unknown, current: BuzzPeerBinding): boolean 
   );
 };
 
+/** What a queued peer message was admitted from: its generation proof and the event's author. */
+export interface AdmittedPeerSource {
+  /** The `peer` field of the admitted, write-once payload. */
+  readonly proof: unknown;
+  /** The inbound row's `actor`: the Buzz channel identity that signed the event. */
+  readonly author: string;
+}
+
 /**
- * Whether a stored peer proof still names the current CEO generation and exactly this holder
- * (#1044) — the hand-over's question, asked before the hand-over writes anything.
+ * Whether a queued peer message may still be handed to this holder (#1044) — the hand-over's
+ * question, asked before the hand-over writes anything.
  *
- * `stored` is the `peer` field of the admitted, write-once payload. The CTO half is compared field
- * by field with the holder rather than trusted from the outbox row: a row's addressing columns are
- * the outbox's, while this proof is what admission signed.
+ * Every identity the admission was decided on is asked again, against the registry as it stands
+ * now: the CEO binding generation **and** its live runtime, that runtime's Buzz channel identity —
+ * still the one that signed, still not reused — and exactly this receiving CTO. A CEO runtime move
+ * keeps the generation, so the generation alone would hand a departed runtime's instruction over.
+ *
+ * The CTO half is compared field by field with the holder rather than trusted from the outbox row:
+ * a row's addressing columns are the outbox's, while the proof is what admission signed.
  */
 export const peerProofIsCurrent = (
-  stored: unknown,
-  ceoBindingGeneration: number | null,
+  source: AdmittedPeerSource | undefined,
+  ceo: BuzzPeerCurrentCeo | null,
   holder: { roleKey: string; bindingGeneration: number; targetSessionId: string },
 ): boolean => {
-  if (ceoBindingGeneration === null) return false;
+  if (!source || !ceo || ceo.channelIdentityReused) return false;
+  const stored = source.proof;
   if (!stored || typeof stored !== "object" || Array.isArray(stored)) return false;
   const proof = stored as Record<string, unknown>;
   return (
-    proof["ceoBindingGeneration"] === ceoBindingGeneration &&
+    proof["ceoBindingGeneration"] === ceo.bindingGeneration &&
+    proof["ceoSessionId"] === ceo.sessionId &&
+    ceo.channelIdentity !== null &&
+    sameChannelIdentity(ceo.channelIdentity, source.author) &&
     proof["ctoRoleKey"] === holder.roleKey &&
     proof["ctoBindingGeneration"] === holder.bindingGeneration &&
     proof["ctoSessionId"] === holder.targetSessionId

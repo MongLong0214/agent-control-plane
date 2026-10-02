@@ -7,8 +7,8 @@ const aStalePeerRowIsWithheldAtHandOver = {
   id: "a-stale-peer-row-is-withheld-at-hand-over",
   what: "a peer message whose admission proof is no longer current is withheld at hand-over",
   file: "src/daemon/agentcpd.ts",
-  find: "            peerProofIsCurrent(admittedPeerProof(cp, candidate.payload), ceoGeneration, holder),\n",
-  replace: "            peerProofIsCurrent(admittedPeerProof(cp, candidate.payload), ceoGeneration, holder) || true,\n",
+  find: "            peerProofIsCurrent(admittedPeerSource(cp, candidate.payload), ceo, holder),\n",
+  replace: "            peerProofIsCurrent(admittedPeerSource(cp, candidate.payload), ceo, holder) || true,\n",
   killedBy: [
     "tests/unit/a-ceo-mention-is-a-peer-turn.test.ts::withholds a queued peer message from its CTO after the CEO rotates, writing nothing, and lets the holder reject it",
   ],
