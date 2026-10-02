@@ -54,6 +54,9 @@ const payloadOf = (harness: ReturnType<typeof makeHarness>, nonce: string): stri
  * were careful too and the reservation still did it. The trigger is the property: the words are
  * not reachable by an UPDATE at all, so no future lifecycle can be handed them by accident.
  */
+/** What `TelegramIngress` admits a message under, including where an answer to it goes (#1041). */
+const ADMITTED = { text: PROMPT, messageId: 7, chatId: CHAT_ID, messageThreadId: null };
+
 describe("the admitted payload is write-once", () => {
   it("survives the whole reply lifecycle running over the same row", () => {
     const harness = makeHarness({ ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }] });
@@ -62,7 +65,7 @@ describe("the admitted payload is write-once", () => {
     expect(admitted.allowed).toBe(true);
     const stored = payloadOf(harness, "update:4242");
     expect(stored).not.toBeNull();
-    expect(JSON.parse(stored!)).toEqual({ text: PROMPT, messageId: 7 });
+    expect(JSON.parse(stored!)).toEqual(ADMITTED);
 
     // Every writer that touches this row in the ordinary course of one message: `admit`'s own
     // ADMITTED marker, then the reply reservation and its completion. Each writes `result_json`
@@ -108,7 +111,7 @@ describe("the admitted payload is write-once", () => {
       ),
     ).toThrow(/INBOUND_PAYLOAD_IMMUTABLE/);
 
-    expect(JSON.parse(payloadOf(harness, "update:4243")!)).toEqual({ text: PROMPT, messageId: 7 });
+    expect(JSON.parse(payloadOf(harness, "update:4243")!)).toEqual(ADMITTED);
   });
 
   it("refuses an INSERT OR REPLACE, which rewrites the row without running an UPDATE trigger", () => {
@@ -129,6 +132,6 @@ describe("the admitted payload is write-once", () => {
       ),
     ).toThrow(/INBOUND_MESSAGE_NO_REPLACE/);
 
-    expect(JSON.parse(payloadOf(harness, "update:4244")!)).toEqual({ text: PROMPT, messageId: 7 });
+    expect(JSON.parse(payloadOf(harness, "update:4244")!)).toEqual(ADMITTED);
   });
 });

@@ -1,4 +1,4 @@
-import { canonicalJson } from "../core/digest.ts";
+import { canonicalJson, digestOf } from "../core/digest.ts";
 import type { Clock } from "../core/clock.ts";
 import { type Decision, acpError, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -10,8 +10,9 @@ import type { Db } from "../db/database.ts";
  *
  * Contract 6 pairs the two writes. A matched `COMPLETED` receipt moves the turn and inserts its
  * reply item in one transaction, so no reader can observe a completed turn whose reply obligation
- * was never written down. `enqueueOwnerReply` is only ever called inside that transaction and
- * refuses to run outside one.
+ * was never written down. `enqueueOwnerReply` runs only inside that transaction and only for the
+ * holder of this database's `OwnerReplyAuthority`, which the turn coordinator claims once at
+ * construction (#1041 review, R1041-03).
  *
  * **Stored in `inbound_messages`, under a channel of its own.** No schema change: the row already
  * has what an outbox item needs, enforced by triggers that exist today — one row per
@@ -44,29 +45,27 @@ export const OWNER_REPLY_OUTBOX_CHANNEL = "owner-reply";
 export type OwnerReplyLedger = "CANONICAL_TURN" | "INGRESS_CLAIM";
 
 /**
- * Where the reply goes, read from the turn's durable ingress row at settlement time and copied
- * into the item, because a terminal ingress row can be pruned after its retention window and the
- * reply must still know where it goes.
+ * Where the reply goes, derived from the originating ingress rows' immutable admitted payload and
+ * copied into the item, because a terminal ingress row can be pruned after its retention window
+ * and the reply must still know where it goes.
  *
- * Each field is what that row actually holds, and nothing is reconstructed:
+ * `payload_json` is the one per-row record nothing can rewrite (`inbound_messages_payload_immutable`),
+ * and it is checked against the digest `INGRESS_ADMITTED` recorded for that row before anything in
+ * it is used. Nothing here reads `turn_claim_json`: its `legacySessionDigest` is not frozen by the
+ * identity trigger, and a reply address that a later write could move is not an address (R1041-01).
+ * Addressing from the claim's digests was dropped rather than frozen, because freezing them needs a
+ * trigger change and so a migration, and a digest names a conversation without saying where it is.
  *
- * - `conversation` — the room the row's own signed payload names (Buzz). `null` for Telegram:
- *   its admitted payload is `{text, messageId}`, and the audit trail stores `conversation` as
- *   `[not-stored]`, so no durable record holds a Telegram chat id in the clear.
- * - `scopeDigest` — the row's turn claim `sessionDigest`, the project/chat/thread/reply-root scope
- *   the batch was composed under.
- * - `chatDigest` — the claim's `legacySessionDigest`, `digestOf({channel, conversation: chatId})`.
- *   For Telegram this is how a sender finds the chat: the configured chat allowlist is finite, and
- *   exactly one entry hashes to it.
- * - `replyToMessageId` — the admitted payload's `messageId` (Telegram), which threads the answer
- *   under the owner's own message.
+ * - Telegram: `conversation` is the payload's `chatId`, `threadId` its `messageThreadId`, and
+ *   `replyToMessageId` its `messageId`. A row without a chat or a message id is unaddressable.
+ * - Buzz: `conversation` is the room the signed envelope names. A row without one is unaddressable.
+ * - Any other channel is unaddressable: no reply route exists for it to be addressed by.
  */
 export interface OwnerReplyAddress {
   readonly channel: string;
+  readonly conversation: string;
+  readonly threadId: number | null;
   readonly sourceNonce: string;
-  readonly conversation: string | null;
-  readonly scopeDigest: string | null;
-  readonly chatDigest: string | null;
   readonly replyToMessageId: number | null;
 }
 
@@ -78,20 +77,22 @@ export interface OwnerReplyReceipt {
   readonly reasonCode: string;
 }
 
+export interface OwnerReplySource {
+  readonly channel: string;
+  readonly nonce: string;
+}
+
 export interface OwnerReplyItem {
   readonly turnRequestId: string;
   readonly ledger: OwnerReplyLedger;
   readonly targetActorId: string;
+  /** Every ingress message the reply answers, in batch order; the address is the last one's. */
+  readonly sources: readonly OwnerReplySource[];
   readonly address: OwnerReplyAddress;
   readonly receipt: OwnerReplyReceipt;
   /** Only `PENDING` exists until a consumer is built; a consumer adds its own terminal states. */
   readonly status: "PENDING";
   readonly enqueuedAt: string;
-}
-
-export interface OwnerReplySource {
-  readonly channel: string;
-  readonly nonce: string;
 }
 
 export interface EnqueueOwnerReplyInput {
@@ -103,11 +104,58 @@ export interface EnqueueOwnerReplyInput {
   readonly receipt: OwnerReplyReceipt;
 }
 
+/**
+ * How an ingress claim records that a target receipt proved its turn `COMPLETED` and the answer is
+ * owed through this lane (#1036): `settledAt` with this settlement, because that is the terminal
+ * fact meaning "the outcome is no longer unknown" without claiming a transport accepted anything.
+ * Named here because both the ingress guard (which writes it) and the coordinator (which checks it
+ * before committing) need the one spelling.
+ */
+export const REPLY_OUTBOX_SETTLEMENT = "REPLY_OUTBOX";
+/** The finished-result marker written beside that settlement; neither claimable nor recoverable. */
+export const REPLY_OUTBOX_RESULT_KIND = "TELEGRAM_REPLY_OUTBOX";
+
+/**
+ * The right to write this lane for one database. Opaque; only `claimOwnerReplyAuthority` makes one.
+ *
+ * Claimed once per database identity, the way `Db.claimTurnMaterializationAuthority` is, and the
+ * turn coordinator claims it at construction — so the only code that can create an obligation is
+ * the code that has just verified a receipt. That closes the route where any caller holding a
+ * transaction could insert an item with no settlement beside it (R1041-03). Like the database's
+ * own authorities, it closes an ordering race rather than an in-process adversary: whoever
+ * constructs first holds it.
+ */
+export interface OwnerReplyAuthority {
+  readonly ownerReplyAuthorityFor: string;
+}
+
+const ISSUED_OWNER_REPLY_AUTHORITIES = new Map<string, OwnerReplyAuthority>();
+
+export const claimOwnerReplyAuthority = (db: Db): OwnerReplyAuthority => {
+  if (ISSUED_OWNER_REPLY_AUTHORITIES.has(db.identity)) {
+    throw acpError(
+      ReasonCode.COMPLETION_AUTHORITY_DENIED,
+      "the owner-reply authority was already issued for this database",
+      {},
+    );
+  }
+  const authority: OwnerReplyAuthority = Object.freeze({ ownerReplyAuthorityFor: db.identity });
+  ISSUED_OWNER_REPLY_AUTHORITIES.set(db.identity, authority);
+  // Handed back when the handle that claimed it closes, as the database's own slots are, so a
+  // process that reopens the same file can construct its coordinator again.
+  db.releaseOnClose(() => {
+    if (ISSUED_OWNER_REPLY_AUTHORITIES.get(db.identity) === authority) {
+      ISSUED_OWNER_REPLY_AUTHORITIES.delete(db.identity);
+    }
+  });
+  return authority;
+};
+
 type StoredPayload = Omit<OwnerReplyItem, "status" | "enqueuedAt">;
 
-const payloadRecord = (payloadJson: string | null): Record<string, unknown> | null => {
+const recordOf = (json: string | null): Record<string, unknown> | null => {
   try {
-    const value: unknown = JSON.parse(payloadJson ?? "null");
+    const value: unknown = JSON.parse(json ?? "null");
     if (value === null) return null;
     if (typeof value !== "object") return null;
     return Array.isArray(value) ? null : value as Record<string, unknown>;
@@ -121,58 +169,71 @@ const textOf = (value: unknown): string | null => {
   return value.trim() === "" ? null : value;
 };
 
-const replyToOf = (payload: Record<string, unknown> | null): number | null => {
-  const messageId = payload?.["messageId"];
-  if (typeof messageId !== "number") return null;
-  if (!Number.isSafeInteger(messageId)) return null;
-  return messageId > 0 ? messageId : null;
+const positiveIdOf = (value: unknown): number | null => {
+  if (typeof value !== "number") return null;
+  if (!Number.isSafeInteger(value)) return null;
+  return value > 0 ? value : null;
 };
 
-type Thread = Pick<OwnerReplyAddress, "conversation" | "scopeDigest" | "chatDigest">;
+const unaddressable = <T>(message: string, source: OwnerReplySource): Decision<T> =>
+  deny(ReasonCode.CONVERSATION_TURN_REPLY_UNADDRESSABLE, message, { channel: source.channel, nonce: source.nonce });
 
-/** What one ingress row durably says about where it came from, or a refusal. */
-const admittedSource = (
-  db: Db,
-  source: OwnerReplySource,
-): Decision<{ thread: Thread; payload: Record<string, unknown> | null }> => {
-  const row = db.get<{ payload_json: string | null; turn_claim_json: string | null }>(
-    `SELECT payload_json, turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+/** One ingress row's own address, from its immutable admitted payload alone, or a refusal. */
+const addressOfSource = (db: Db, source: OwnerReplySource): Decision<OwnerReplyAddress> => {
+  const row = db.get<{ payload_json: string | null }>(
+    `SELECT payload_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
     [source.channel, source.nonce],
   );
-  if (!row) {
-    return deny(
-      ReasonCode.CONVERSATION_TURN_REPLY_UNADDRESSABLE,
-      "an ingress message this turn answers has no durable row",
-      { channel: source.channel, nonce: source.nonce },
-    );
+  if (!row) return unaddressable("an ingress message this turn answers has no durable row", source);
+  const payload = recordOf(row.payload_json);
+  if (payload === null) return unaddressable("an ingress message this turn answers has no admitted payload", source);
+  // The payload column cannot be rewritten after its insert; this is what makes it the payload the
+  // guard admitted rather than one a raw insert placed there first.
+  const admitted = db.get<{ payload_digest: string | null }>(
+    `SELECT json_extract(evidence_json, '$.payloadDigest') AS payload_digest
+       FROM audit_events
+      WHERE kind = 'INGRESS_ADMITTED'
+        AND json_extract(evidence_json, '$.channel') = ?
+        AND json_extract(evidence_json, '$.nonce') = ?
+      ORDER BY event_id DESC LIMIT 1`,
+    [source.channel, source.nonce],
+  );
+  if (admitted?.payload_digest !== digestOf(payload)) {
+    return unaddressable("an ingress message's stored payload is not the one ingress admitted", source);
   }
-  const payload = payloadRecord(row.payload_json);
-  const claim = payloadRecord(row.turn_claim_json);
-  const thread: Thread = {
-    conversation: textOf(payload?.["conversation"]),
-    scopeDigest: textOf(claim?.["sessionDigest"]),
-    chatDigest: textOf(claim?.["legacySessionDigest"]),
-  };
-  // Neither a signed room nor a claimed scope: nothing durable says which conversation this
-  // message belongs to, and a reply addressed by guess is worse than one not sent.
-  if (thread.conversation === null) {
-    if (thread.scopeDigest === null) {
-      return deny(
-        ReasonCode.CONVERSATION_TURN_REPLY_UNADDRESSABLE,
-        "an ingress message this turn answers names no durable conversation",
-        { channel: source.channel, nonce: source.nonce },
-      );
-    }
+  if (source.channel === "telegram") {
+    const chat = textOf(payload["chatId"]);
+    if (chat === null) return unaddressable("a Telegram message this turn answers names no chat", source);
+    const messageId = positiveIdOf(payload["messageId"]);
+    if (messageId === null) return unaddressable("a Telegram message this turn answers has no message id", source);
+    return allow(ReasonCode.OK, {
+      channel: source.channel,
+      conversation: chat,
+      threadId: positiveIdOf(payload["messageThreadId"]),
+      sourceNonce: source.nonce,
+      replyToMessageId: messageId,
+    });
   }
-  return allow(ReasonCode.OK, { thread, payload });
+  if (source.channel === "buzz") {
+    const room = textOf(payload["conversation"]);
+    if (room === null) return unaddressable("a Buzz message this turn answers names no room", source);
+    return allow(ReasonCode.OK, {
+      channel: source.channel,
+      conversation: room,
+      threadId: null,
+      sourceNonce: source.nonce,
+      replyToMessageId: null,
+    });
+  }
+  return unaddressable("no reply route exists for this ingress channel", source);
 };
 
 /**
- * The one conversation every source of the turn arrived on, or a refusal.
+ * The address of the turn's last message, after every source proved its own address and all of
+ * them agreed on channel, conversation and thread.
  *
- * A batch is scoped to one conversation when it is composed, so sources that disagree here mean
- * the ledger holds something that scoping should have prevented. The reply then has no single
- * place to go, and guessing one is how an answer reaches the wrong room.
+ * Each source is read from its own row rather than compared with its neighbours: agreement among
+ * batch members is not provenance, only the admitted payload is (R1041-01).
  */
 export const ownerReplyAddressFor = (
   db: Db,
@@ -182,11 +243,11 @@ export const ownerReplyAddressFor = (
   if (!anchor) {
     return deny(ReasonCode.CONVERSATION_TURN_REPLY_UNADDRESSABLE, "the turn names no ingress message to answer", {});
   }
-  const answered = admittedSource(db, anchor);
+  const answered = addressOfSource(db, anchor);
   if (!answered.allowed) return deny(answered.reasonCode, answered.message, answered.evidence);
   for (const source of sources) {
-    const admitted = admittedSource(db, source);
-    if (!admitted.allowed) return deny(admitted.reasonCode, admitted.message, admitted.evidence);
+    const own = addressOfSource(db, source);
+    if (!own.allowed) return deny(own.reasonCode, own.message, own.evidence);
     if (source.channel !== anchor.channel) {
       return deny(
         ReasonCode.CONVERSATION_TURN_REPLY_UNADDRESSABLE,
@@ -194,57 +255,161 @@ export const ownerReplyAddressFor = (
         { channels: [source.channel, anchor.channel] },
       );
     }
-    if (canonicalJson(admitted.value.thread) !== canonicalJson(answered.value.thread)) {
-      return deny(
-        ReasonCode.CONVERSATION_TURN_REPLY_UNADDRESSABLE,
-        "the turn's ingress messages arrived on different conversations",
-        { channel: source.channel, nonce: source.nonce },
-      );
+    if (own.value.conversation !== answered.value.conversation) {
+      return unaddressable("the turn's ingress messages arrived on different conversations", source);
+    }
+    if (own.value.threadId !== answered.value.threadId) {
+      return unaddressable("the turn's ingress messages arrived on different threads", source);
     }
   }
-  return allow(ReasonCode.OK, {
-    channel: anchor.channel,
-    sourceNonce: anchor.nonce,
-    ...answered.value.thread,
-    replyToMessageId: replyToOf(answered.value.payload),
-  });
+  return answered;
 };
 
 /**
- * Inserts the reply item for one completed turn, inside the caller's settlement transaction.
+ * Whether the owner has already been answered for this message through the ingress reply
+ * lifecycle: the transport accepted the CEO's answer (`repliedAt`), or a CEO answer was reserved
+ * for the transport and that lifecycle — sent, pending, or awaiting a person — owns it.
+ */
+const answeredThroughIngress = (db: Db, source: OwnerReplySource): boolean => {
+  const row = db.get<{ result_json: string | null; turn_claim_json: string | null }>(
+    `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+    [source.channel, source.nonce],
+  );
+  if (!row) return false;
+  const claim = recordOf(row.turn_claim_json);
+  if (claim?.["repliedAt"] !== undefined) return true;
+  const result = recordOf(row.result_json);
+  if (result?.["turnAnswered"] !== true) return false;
+  const reply = result["reply"];
+  if (typeof reply !== "object") return false;
+  return reply !== null;
+};
+
+/** The other turn whose reply item already answers this message, if any. */
+const owedByAnotherItem = (db: Db, source: OwnerReplySource, turnRequestId: string): string | null =>
+  db.get<{ nonce: string }>(
+    `SELECT item.nonce FROM inbound_messages AS item, json_each(item.payload_json, '$.sources') AS answered
+      WHERE item.channel = ?
+        AND item.nonce <> ?
+        AND json_extract(answered.value, '$.channel') = ?
+        AND json_extract(answered.value, '$.nonce') = ?
+      ORDER BY item.received_at ASC, item.nonce ASC LIMIT 1`,
+    [OWNER_REPLY_OUTBOX_CHANNEL, turnRequestId, source.channel, source.nonce],
+  )?.nonce ?? null;
+
+/** Answered through ingress, or already named by another turn's reply item. */
+const alreadyAnswered = (db: Db, source: OwnerReplySource, turnRequestId: string): boolean => {
+  if (answeredThroughIngress(db, source)) return true;
+  return owedByAnotherItem(db, source, turnRequestId) !== null;
+};
+
+/** The part of an item that says which obligation it is; the address is derived, not compared. */
+const obligationOf = (input: {
+  turnRequestId: string;
+  ledger: string;
+  targetActorId: string;
+  sources: readonly OwnerReplySource[];
+  receipt: OwnerReplyReceipt;
+}): string => canonicalJson({
+  turnRequestId: input.turnRequestId,
+  ledger: input.ledger,
+  targetActorId: input.targetActorId,
+  sources: input.sources.map((source) => ({ channel: source.channel, nonce: source.nonce })),
+  receipt: {
+    authority: input.receipt.authority,
+    receiptId: input.receipt.receiptId,
+    evidenceDigest: input.receipt.evidenceDigest,
+    reasonCode: input.receipt.reasonCode,
+  },
+});
+
+/**
+ * What enqueueing decided. `ALREADY_ANSWERED` creates nothing: every message the turn answers was
+ * already answered through ingress or is already owed by another turn's item, so the completion
+ * discharges an obligation that exists rather than creating a second one.
+ */
+export type OwnerReplyEnqueued =
+  | { readonly status: "ENQUEUED" | "REDELIVERED"; readonly item: OwnerReplyItem }
+  | { readonly status: "ALREADY_ANSWERED"; readonly item: null };
+
+/**
+ * Records the reply a completed turn owes, inside the transaction that settles the turn.
  *
- * Idempotent on the exact item: an existing row for this turn with the same payload is a
- * redelivery and changes nothing. A row for this turn with a different payload, or another turn's
- * row already answering the same ingress message, is refused — two items would be two replies to
- * one owner message, and only the first can be right.
+ * One owner message gets at most one reply across both receipt lanes (R1041-02):
  *
- * Returns a denial rather than throwing for every refusal it can name, so the caller's
- * `txDecision` rolls the settlement back with it. A database error still throws, which rolls back
- * the same way.
+ * - The same turn's identical item is a redelivery and changes nothing; a different one is refused.
+ * - A message already answered through ingress (`repliedAt`, or a reserved CEO answer), or already
+ *   named by another turn's item, needs no new obligation. When that is true of every message of
+ *   the turn, nothing is written and the completion stands on the existing answer. When it is true
+ *   of some and not others, the batches disagree about which reply answers what, and that is
+ *   refused rather than resolved by a second reply.
+ * - Otherwise the item is written, addressed from the rows' immutable payloads.
+ *
+ * Every refusal is a denial rather than a throw, so the caller's `txDecision` rolls the settlement
+ * back with it. A database error still throws, which rolls back the same way.
  */
 export const enqueueOwnerReply = (
+  authority: OwnerReplyAuthority,
   db: Db,
   clock: Clock,
   input: EnqueueOwnerReplyInput,
-): Decision<{ item: OwnerReplyItem; replayed: boolean }> => {
+): Decision<OwnerReplyEnqueued> => {
+  if (ISSUED_OWNER_REPLY_AUTHORITIES.get(db.identity) !== authority) {
+    throw acpError(
+      ReasonCode.COMPLETION_AUTHORITY_DENIED,
+      "an owner reply is enqueued only by the holder of this database's owner-reply authority",
+      { turnRequestId: input.turnRequestId },
+    );
+  }
   if (!db.inTransaction) {
-    // Programming error, not a state: outside the settlement transaction the item and the turn
-    // are two commits, which is the half-written state this lane exists to make unreachable.
+    // Outside the settlement transaction the item and the turn are two commits, which is the
+    // half-written state this lane exists to make unreachable.
     throw acpError(
       ReasonCode.INTERNAL_ERROR,
       "an owner reply must be enqueued inside the transaction that settles its turn",
       { turnRequestId: input.turnRequestId },
     );
   }
+
+  const existing = db.get<{ payload_json: string | null; result_json: string | null; received_at: string }>(
+    `SELECT payload_json, result_json, received_at FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+    [OWNER_REPLY_OUTBOX_CHANNEL, input.turnRequestId],
+  );
+  if (existing !== undefined) {
+    // Compared on what the obligation is, not on the address: the address was derived from rows
+    // that may since have been pruned, and re-deriving it would turn a redelivery into a refusal.
+    const stored = itemOf(input.turnRequestId, existing);
+    if (obligationOf(stored) !== obligationOf(input)) {
+      return deny(
+        ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT,
+        "this turn already has an owner reply with different content",
+        { turnRequestId: input.turnRequestId },
+      );
+    }
+    return allow(ReasonCode.OK, { status: "REDELIVERED", item: stored });
+  }
+
+  const covered = input.sources.filter((source) => alreadyAnswered(db, source, input.turnRequestId));
+  if (covered.length > 0) {
+    if (covered.length === input.sources.length) {
+      return allow(ReasonCode.OK, { status: "ALREADY_ANSWERED", item: null });
+    }
+    return deny(
+      ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT,
+      "some of this turn's messages already have a reply and others do not",
+      { turnRequestId: input.turnRequestId, answered: covered.map((source) => `${source.channel}:${source.nonce}`) },
+    );
+  }
+
   const address = ownerReplyAddressFor(db, input.sources);
   if (!address.allowed) {
     return deny(address.reasonCode, address.message, { ...address.evidence, turnRequestId: input.turnRequestId });
   }
-
   const payload: StoredPayload = {
     turnRequestId: input.turnRequestId,
     ledger: input.ledger,
     targetActorId: input.targetActorId,
+    sources: input.sources.map((source) => ({ channel: source.channel, nonce: source.nonce })),
     address: address.value,
     receipt: {
       authority: input.receipt.authority,
@@ -255,56 +420,28 @@ export const enqueueOwnerReply = (
   };
   const payloadJson = canonicalJson(payload);
 
-  const existing = db.get<{ payload_json: string | null; result_json: string | null; received_at: string }>(
-    `SELECT payload_json, result_json, received_at FROM inbound_messages WHERE channel = ? AND nonce = ?`,
-    [OWNER_REPLY_OUTBOX_CHANNEL, input.turnRequestId],
-  );
-  if (existing) {
-    if (existing.payload_json !== payloadJson) {
-      return deny(
-        ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT,
-        "this turn already has an owner reply with different content",
-        { turnRequestId: input.turnRequestId },
-      );
-    }
-    return allow(ReasonCode.OK, { item: itemOf(input.turnRequestId, existing), replayed: true });
-  }
-
-  const sibling = db.get<{ nonce: string }>(
-    `SELECT nonce FROM inbound_messages
-      WHERE channel = ?
-        AND json_extract(payload_json, '$.address.channel') = ?
-        AND json_extract(payload_json, '$.address.sourceNonce') = ?
-      ORDER BY received_at ASC, nonce ASC LIMIT 1`,
-    [OWNER_REPLY_OUTBOX_CHANNEL, address.value.channel, address.value.sourceNonce],
-  );
-  if (sibling) {
-    return deny(
-      ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT,
-      "another turn already owes the owner a reply to this ingress message",
-      { turnRequestId: input.turnRequestId, otherTurnRequestId: sibling.nonce },
-    );
-  }
-
   const enqueuedAt = clock.nowIso();
-  const resultJson = canonicalJson({ status: "PENDING" });
   db.run(
     `INSERT INTO inbound_messages (channel, nonce, actor, received_at, payload_json, result_json)
      VALUES (?, ?, ?, ?, ?, ?)`,
-    [OWNER_REPLY_OUTBOX_CHANNEL, input.turnRequestId, input.targetActorId, enqueuedAt, payloadJson, resultJson],
+    [
+      OWNER_REPLY_OUTBOX_CHANNEL,
+      input.turnRequestId,
+      input.targetActorId,
+      enqueuedAt,
+      payloadJson,
+      canonicalJson({ status: "PENDING" }),
+    ],
   );
-  return allow(ReasonCode.OK, {
-    item: { ...payload, status: "PENDING", enqueuedAt },
-    replayed: false,
-  });
+  return allow(ReasonCode.OK, { status: "ENQUEUED", item: { ...payload, status: "PENDING", enqueuedAt } });
 };
 
 const itemOf = (
   turnRequestId: string,
   row: { payload_json: string | null; result_json: string | null; received_at: string },
 ): OwnerReplyItem => {
-  const payload = payloadRecord(row.payload_json) as StoredPayload | null;
-  const result = payloadRecord(row.result_json);
+  const payload = recordOf(row.payload_json) as StoredPayload | null;
+  const result = recordOf(row.result_json);
   if (payload === null) {
     throw acpError(ReasonCode.INTERNAL_ERROR, "an owner reply item has no readable payload", { turnRequestId });
   }
