@@ -325,19 +325,17 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
     const port = new FakeReceiptPort();
     const c = withCoordinator(port);
     const actorId = target(c, "perfect-match-completed", 1);
-    const held = claim(c, actorId, "m1");
-    // The Telegram router claims the ingress row as well; that claim's scope is what the reply is
-    // addressed by, since a Telegram row keeps no chat id in the clear.
-    const ingress = new IngressGuard(c.db, c.clock, c.audit, {
-      telegram: { allowedActors: ["owner"], allowedConversations: ["convo"] },
+    // The payload `TelegramIngress` admits a message under, which is what the reply is addressed
+    // from: the chat and the message it answers.
+    const payload = { text: "message m1", messageId: 41, chatId: "convo", messageThreadId: null };
+    admitInbound(c, "m1", payload);
+    const claimed = c.coordinator.claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [{ channel: "telegram", nonce: "m1", attempt: 1, payload }],
     });
-    expect(ingress.claimTurn("telegram", "m1", {
-      turnRequestId: "ingress:m1",
-      sessionDigest: "scope:convo",
-      legacySessionDigest: "chat:convo",
-      promptDigest: held.promptDigest,
-      bindingDigest: "binding:1",
-    }).allowed).toBe(true);
+    if (!claimed.allowed) throw new Error(`claim refused: ${claimed.reasonCode}`);
+    const held = claimed.value;
 
     port.answer(
       held.turnRequestId,
@@ -354,7 +352,7 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
     expect(ownerReplyFor(c.db, held.turnRequestId)).toMatchObject({
       turnRequestId: held.turnRequestId,
       ledger: "CANONICAL_TURN",
-      address: { channel: "telegram", sourceNonce: "m1", scopeDigest: "scope:convo", chatDigest: "chat:convo" },
+      address: { channel: "telegram", conversation: "convo", threadId: null, sourceNonce: "m1", replyToMessageId: 41 },
       receipt: { authority: "HERMES_TARGET", receiptId: `hermes:${held.turnRequestId}` },
       status: "PENDING",
     });

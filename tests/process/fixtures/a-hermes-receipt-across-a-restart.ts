@@ -41,7 +41,7 @@ export interface RestartReport {
   noReplyAt: string | null;
   receiptId: string | null;
   settlement: string | null;
-  /** Every owner reply the restart left queued, as `channel chatDigest sourceNonce replyTo`. */
+  /** Every owner reply the restart left queued, as `channel conversation sourceNonce replyTo`. */
   ownerReplies: string[];
 }
 
@@ -254,7 +254,7 @@ const restart = async (root: string, mode: ReceiptMode): Promise<RestartReport> 
     receiptId: typeof receipt?.receiptId === "string" ? receipt.receiptId : null,
     settlement: typeof claim["settlement"] === "string" ? claim["settlement"] : null,
     ownerReplies: pendingOwnerReplies(harness.cp.db).map((item) =>
-      `${item.address.channel} ${String(item.address.chatDigest)} ${item.address.sourceNonce} ${String(item.address.replyToMessageId)}`),
+      `${item.address.channel} ${item.address.conversation} ${item.address.sourceNonce} ${String(item.address.replyToMessageId)}`),
   };
 };
 
