@@ -6,15 +6,16 @@
  * WHY this check exists
  *
  *   `Daemon.start()` fails closed on its single-instance lock, startup doctor, and crash-loop
- *   backoff. Production also supplies a bootstrap door: when capacity is the only missing
- *   prerequisite, startup parks behind that door instead of returning a doctor refusal.
+ *   backoff. Capacity is availability, not a startup prerequisite: when it is the only thing
+ *   missing, startup proceeds and the doctor reads DEGRADED. Startup used to park behind the
+ *   bootstrap door here, which kept the claim socket and cto.mcp.sock shut until a quota read.
  *
  *   The checked scenarios retain the production adapters but inject an unavailable usage
  *   collector. That keeps the result independent of provider login state and proves that a
  *   prewritten daemon mirror cannot create coverage. The GitHub prerequisite enters through the
  *   production App env/private-key files, and the daemon enters through
- *   `ControlPlane.createDaemon()` with a bootstrap door. The probe observes the park and releases
- *   it immediately; it does not claim to exercise `agentcpd.main` socket plumbing.
+ *   `ControlPlane.createDaemon()` with a bootstrap door, so a park would still be observed (and
+ *   released immediately); it does not claim to exercise `agentcpd.main` socket plumbing.
  *
  *   An ordinary operator run adds one clearly labelled live-collector observation. Only that
  *   stage uses the production collectors' normal credential paths and may make the Grok billing
@@ -26,7 +27,7 @@
  *
  * Run: npx tsx scripts/probe-daemon-startup.ts [--json] [--isolated]
  * Exits non-zero if an isolated scenario does not reach its named startup state, if the live
- * observation reaches neither normal startup nor the capacity bootstrap park, or if a scenario
+ * observation reaches neither normal startup nor a bootstrap park, or if a scenario
  * errors. Listening sockets are deliberately unmeasured here.
  */
 import { generateKeyPairSync } from "node:crypto";
@@ -276,22 +277,22 @@ await scenario("isolated bare state directory", {
 await scenario("isolated production App credential", {
   collectorMode: "isolated",
   credential: true,
-  expectedStates: ["BOOTSTRAP_PARKED"],
-  expectedReasonCodes: doctorReasons,
+  expectedStates: ["STARTED"],
+  expectedReasonCodes: [ReasonCode.OK],
 });
 
 await scenario("isolated production App credential with prewritten daemon mirrors", {
   collectorMode: "isolated",
   credential: true,
   mirrors: true,
-  expectedStates: ["BOOTSTRAP_PARKED"],
-  expectedReasonCodes: doctorReasons,
+  expectedStates: ["STARTED"],
+  expectedReasonCodes: [ReasonCode.OK],
 });
 
 /**
  * A refused start writes `crash-loop.json` with a `retryNotBefore`. Rebuild the production
  * composition after provisioning the App files, observe the immediate backoff, then wait until
- * the returned timestamp before asking whether startup reaches its capacity bootstrap park.
+ * the returned timestamp before asking whether startup now proceeds with capacity still unread.
  */
 {
   const root = mkdtempSync(join(tmpdir(), "acp-daemon-probe-"));
@@ -335,7 +336,7 @@ await scenario("isolated production App credential with prewritten daemon mirror
     const retried = await observeStartup(retryDaemon);
     stage["retryAfterBackoff"] = retried.report;
     stage["capacitySources"] = capacitySources(cp);
-    expectStartup("the retry after backoff", retried, ["BOOTSTRAP_PARKED"], doctorReasons);
+    expectStartup("the retry after backoff", retried, ["STARTED"], [ReasonCode.OK]);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     stage["error"] = message;
