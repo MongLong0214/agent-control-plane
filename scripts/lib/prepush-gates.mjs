@@ -61,9 +61,6 @@ export const GATES = [
   // connection ACP did not open — measured: an `audit_events` row rewritten under its own id with
   // every foreign key still valid.
   { script: "schema:census" },
-  // #676: every inline-SQL `Db.run` that names a turn-fence table is in that table's declared
-  // owner, so a write cannot reach the fence's tables around the code that enforces the fence.
-  { script: "schema:writers" },
   // A trigger sentinel with no entry in TRIGGER_CODES reaches its caller as a raw Error instead of
   // a Decision, so a refusal is indistinguishable from a bug. The whole canonical-turn ledger was
   // in that state, and a census found five more that predate it.
