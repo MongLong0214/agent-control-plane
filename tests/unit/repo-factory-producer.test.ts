@@ -190,11 +190,18 @@ describe("repo factory producer (#246)", () => {
     const plan: RepoFactoryPlanFixture = {
       ...basePlan(),
       githubOperations: [
-        { operationId: "repo-create", resourceType: "repository", resourceIdentity: "github:acme/repo" },
+        {
+          operationId: "repo-create",
+          resourceType: "repository",
+          resourceIdentity: "github:acme/repo",
+          desiredState: { visibility: "public" },
+        },
       ],
     };
+    // No `github` port: the refusal is the #246 boundary itself, not a schema rejection.
     const produced = await produceRepoFactoryResult({ plan, workDir });
     expect(produced.allowed).toBe(false);
+    expect(produced.reasonCode).toBe(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT);
     // Refusing before ever touching the filesystem — no local checkout was fabricated either.
     expect(existsSync(repositoryCheckoutPath(workDir, plan.repositoryRole))).toBe(false);
   });

@@ -16,6 +16,21 @@ import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { git, tryRevParse, type GitResult } from "../git/git.ts";
+import type { GitHubWritePort } from "./github-write-port.ts";
+import {
+  GITHUB_LEDGER_SCHEMA_ID,
+  applyGitHubOperations,
+  githubLedgerPath,
+  githubOperationSchema,
+  preflightGitHubOperations,
+  readGitHubLedger,
+  toExternalWriteReceipt,
+  writeGitHubLedger,
+  type AppliedGitHubOperations,
+  type GitHubExecutionPlan,
+  type GitHubOperationReceipt,
+  type GitHubWriteAuthority,
+} from "./repo-factory-github.ts";
 import {
   REPO_FACTORY_RESULT_SCHEMA_ID,
   type ExternalWriteReceipt,
@@ -23,10 +38,12 @@ import {
 } from "./repo-factory-result.ts";
 
 /**
- * Issue #246, first slice — the producing side of the bootstrap contract that
- * `repo-factory-result.ts` already parses and rejects. This producer performs local
- * filesystem and local git writes only. It never touches GitHub: no network call, no
- * repository creation, no activation.
+ * Issue #246 — the producing side of the bootstrap contract that `repo-factory-result.ts`
+ * already parses and rejects. With no GitHub operations in its plan, this producer performs
+ * local filesystem and local git writes only. With GitHub operations, it performs them through
+ * the injected `GitHubWritePort` and receipts what GitHub answered (`repo-factory-github.ts`);
+ * without a port it refuses such a plan rather than receipting a write it did not perform.
+ * It never activates anything.
  *
  * `RepoFactoryPlanFixture` is a deliberately minimal stand-in for the PRD's approved
  * `BootstrapPlanCore` (Integration §8.1/§13.2) — enough of the plan for this slice's
@@ -90,29 +107,30 @@ export const repoFactoryPlanFixtureSchema = z
     /** Which of `VERIFICATION_KINDS` this producer actually runs. Closed, not free-form argv. */
     verificationKind: z.enum(["CLEAN_TREE"]),
     /**
-     * GitHub-side operations the plan calls for. Integration §13.3/§16 define
-     * `ExternalWriteReceipt` around a *GitHub* resource write; this producer makes none, so
-     * a non-empty list here cannot be honestly receipted and is refused outright.
+     * GitHub-side operations the plan calls for, each with the state it asks for. Integration
+     * §13.3/§16 define `ExternalWriteReceipt` around a *GitHub* resource write, so these are
+     * performed only through `RepoFactoryProducerInput.github`, and a resource type this
+     * producer cannot both perform and re-read fails the schema here.
      */
-    githubOperations: z
-      .array(
-        z.object({
-          operationId: z.string().min(1),
-          resourceType: z.string().min(1),
-          resourceIdentity: z.string().min(1),
-        }),
-      )
-      .default([]),
+    githubOperations: z.array(githubOperationSchema).default([]),
   })
   .strict();
 
 export type RepoFactoryPlanFixture = z.infer<typeof repoFactoryPlanFixtureSchema>;
 
+export interface RepoFactoryGitHubInput {
+  port: GitHubWritePort;
+  /** What the owner approved — supplied by the caller, never read from the plan. */
+  authority: GitHubWriteAuthority;
+}
+
 export interface RepoFactoryProducerInput {
   plan: RepoFactoryPlanFixture;
-  /** Directory the producer may write inside. Nothing is written outside it. */
+  /** Directory the producer may write inside. Nothing local is written outside it. */
   workDir: string;
   clock?: Clock;
+  /** Required for a plan with GitHub operations; unused for one without. */
+  github?: RepoFactoryGitHubInput;
 }
 
 /** Single source of truth for where a role's local checkout lives under `workDir`. */
@@ -486,8 +504,9 @@ export const trackedFilesOrDeny = (tracked: GitResult): Decision<string[]> => {
  * Things this deliberately refuses to fabricate rather than fill because the schema demands
  * a value:
  *
- *  - a plan that requires a GitHub write (`githubOperations` non-empty) — honestly
- *    receipting that requires performing it, which this producer never does;
+ *  - a GitHub write it did not perform — a plan with `githubOperations` and no
+ *    `input.github` port is refused, and with a port each receipt is built from GitHub's
+ *    readback after the write, never from the plan (`repo-factory-github.ts`);
  *  - a `bootstrapVerification` PASS when the real local verification command's exit code or
  *    stdout says otherwise, or the tracked-file listing behind the receipt fails — recording
  *    PASS anyway would be a schema-complete lie;
@@ -513,13 +532,27 @@ export const produceRepoFactoryResult = async (
   const plan = parsedPlan.data;
   const clock = input.clock ?? systemClock;
 
-  if (plan.githubOperations.length > 0) {
+  if (plan.githubOperations.length > 0 && input.github === undefined) {
     return deny(
       ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
-      "producer cannot honestly receipt GitHub operations without performing a GitHub write, and this producer never performs one (issue #246 boundary)",
+      "a plan with GitHub operations needs a GitHub write port; without one this producer cannot perform them and will not receipt a write it did not perform (issue #246 boundary)",
       { githubOperations: plan.githubOperations.map((op) => op.operationId) },
     );
   }
+
+  // Every GitHub check that needs no GitHub call — approval coverage, owner, visibility, plan
+  // shape — runs here, before any local write and before the port is touched at all.
+  let github: { execution: GitHubExecutionPlan; port: GitHubWritePort; ledgerPath: string } | null = null;
+  if (plan.githubOperations.length > 0 && input.github !== undefined) {
+    const preflight = preflightGitHubOperations(plan, input.github.authority);
+    if (!preflight.allowed) return preflight as Decision<RepoFactoryResult>;
+    github = {
+      execution: preflight.value,
+      port: input.github.port,
+      ledgerPath: githubLedgerPath(input.workDir, plan.repositoryRole),
+    };
+  }
+  const ledgerOwner = { bootstrapOperationId: plan.bootstrapOperationId, requestDigest: plan.requestDigest };
 
   const workDir = resolve(input.workDir);
   const localRepoPath = repositoryCheckoutPath(workDir, plan.repositoryRole);
@@ -548,7 +581,8 @@ export const produceRepoFactoryResult = async (
   // either creates a fresh, genuine directory or discovers a real, already-existing one;
   // anything else — a symlink raced into place in that exact window — is refused immediately,
   // producing no write inside it, not merely a refusal after the fact.
-  for (const dir of [workDir, repositoriesDir]) {
+  const levels = github === null ? [workDir, repositoriesDir] : [workDir, repositoriesDir, dirname(github.ledgerPath)];
+  for (const dir of levels) {
     const ensured = ensureDirectoryLevel(dir);
     if (!ensured.allowed) return ensured as Decision<RepoFactoryResult>;
   }
@@ -588,6 +622,18 @@ export const produceRepoFactoryResult = async (
       throw err;
     }
   };
+
+  // Read only once this call holds the checkout leaf, which `createCheckoutLeafOrDeny` grants to
+  // exactly one caller per role — so no other producer is writing this ledger while it is read.
+  let priorReceipts: ReadonlyMap<string, GitHubOperationReceipt> = new Map();
+  if (github !== null) {
+    const prior = readGitHubLedger(github.ledgerPath, ledgerOwner, github.execution.operations);
+    if (!prior.allowed) {
+      cleanup();
+      return prior as Decision<RepoFactoryResult>;
+    }
+    priorReceipts = prior.value;
+  }
 
   const createdAt = clock.nowIso();
 
@@ -633,6 +679,40 @@ export const produceRepoFactoryResult = async (
     );
   }
 
+  // GitHub's half, between the commit and the verification: the verified head below must be
+  // the head GitHub holds. On a resumed push the commit just made is not that head — its
+  // timestamp differs from the one GitHub holds — so the push step fetches the receipted
+  // commit and resets onto it rather than pushing a second one. A failure leaves the ledger —
+  // every write that succeeded, with its readback — and removes only the local checkout, which
+  // a retry rebuilds (see `repo-factory-github.ts` for why there is no rollback). A throw cleans
+  // up the same way, for the reason `gitOrCleanup` above gives.
+  let applied: AppliedGitHubOperations | null = null;
+  if (github !== null) {
+    const ledgerPath = github.ledgerPath;
+    let outcome: Decision<AppliedGitHubOperations>;
+    try {
+      outcome = await applyGitHubOperations({
+        execution: github.execution,
+        port: github.port,
+        checkoutPath: localRepoPath,
+        defaultBranch: plan.defaultBranch,
+        prior: priorReceipts,
+        record: (receipts) =>
+          writeGitHubLedger(ledgerPath, { schema: GITHUB_LEDGER_SCHEMA_ID, ...ledgerOwner, receipts: [...receipts] }),
+        ledgerPath,
+        clock,
+      });
+    } catch (thrown) {
+      cleanup();
+      throw thrown;
+    }
+    if (!outcome.allowed) {
+      cleanup();
+      return outcome as Decision<RepoFactoryResult>;
+    }
+    applied = outcome.value;
+  }
+
   const head = await tryRevParse(localRepoPath, "HEAD");
   if (!head) {
     cleanup();
@@ -672,20 +752,30 @@ export const produceRepoFactoryResult = async (
     return tracked as Decision<RepoFactoryResult>;
   }
 
-  const identity = localRepositoryIdentity(plan.repositoryRole);
-  const receipt: ExternalWriteReceipt = {
-    bootstrapOperationId: plan.bootstrapOperationId,
-    requestDigest: plan.requestDigest,
-    operationId: `${plan.bootstrapOperationId}:local-repository-create`,
-    resourceType: "local_git_repository",
-    resourceIdentity: identity,
-    preexisting: false,
-    beforeStateDigest: null,
-    afterStateDigest: digestOf({ head, files: tracked.value }),
-    createdAt,
-    rereadAt,
-    verified: true,
-  };
+  // A GitHub-provisioned repository is named by its GitHub identity — the portable form an
+  // approved manifest's `remote` must take (`assertPortableManifest`) — and receipted only by
+  // its GitHub operations: activation matches every receipt against the approved plan's
+  // `githubOperations`, where a local checkout has no entry. A local-only run keeps its local
+  // identity and its one local receipt, and stays unactivatable by design (#246).
+  const identity = github === null ? localRepositoryIdentity(plan.repositoryRole) : github.execution.repositoryIdentity;
+  const receipts: ExternalWriteReceipt[] =
+    applied === null
+      ? [
+          {
+            bootstrapOperationId: plan.bootstrapOperationId,
+            requestDigest: plan.requestDigest,
+            operationId: `${plan.bootstrapOperationId}:local-repository-create`,
+            resourceType: "local_git_repository",
+            resourceIdentity: identity,
+            preexisting: false,
+            beforeStateDigest: null,
+            afterStateDigest: digestOf({ head, files: tracked.value }),
+            createdAt,
+            rereadAt,
+            verified: true,
+          },
+        ]
+      : applied.receipts.map((receipt) => toExternalWriteReceipt(receipt, ledgerOwner));
 
   const result: RepoFactoryResult = {
     schema: REPO_FACTORY_RESULT_SCHEMA_ID,
@@ -705,7 +795,7 @@ export const produceRepoFactoryResult = async (
         createdBranches: [],
       },
     ],
-    externalWriteReceipts: [receipt],
+    externalWriteReceipts: receipts,
     bootstrapVerification: [
       {
         commandId: plan.verificationCommandId,

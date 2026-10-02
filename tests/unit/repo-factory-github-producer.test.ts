@@ -1,0 +1,690 @@
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import { ManualClock } from "../../src/core/clock.ts";
+import { digestOf } from "../../src/core/digest.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { PROJECT_MANIFEST_SCHEMA_ID, assertPortableManifest } from "../../src/contracts/manifest.ts";
+import { parseRepoFactoryResult } from "../../src/bootstrap/repo-factory-result.ts";
+import {
+  produceRepoFactoryResult,
+  repositoryCheckoutPath,
+  type RepoFactoryPlanFixture,
+} from "../../src/bootstrap/repo-factory-producer.ts";
+import { git } from "../../src/git/git.ts";
+
+/**
+ * Issue #246 — the producer performs the GitHub operations its plan calls for, through an
+ * injected port, and receipts what GitHub answered rather than what the plan said.
+ *
+ * The double below is a GitHub with real git underneath: each repository it "creates" is a bare
+ * repository in the sandbox, so a push moves a real ref and a commit SHA in a receipt is a SHA a
+ * real `git rev-parse` produced. Node ids are minted by the double, never by the plan, which is
+ * what lets these tests tell a receipted value from a copied one.
+ *
+ * Every refusal below asserts the double's write log. A refusal that still wrote is the defect
+ * this producer exists to avoid, and "allowed: false" alone cannot see it.
+ */
+
+type WriteMethod = "createRepository" | "pushBranch" | "setDefaultBranch" | "protectBranch";
+
+interface Target {
+  owner: string;
+  name: string;
+}
+
+interface Protection {
+  requiredStatusChecks: string[];
+  enforceAdmins: boolean;
+  requiredApprovingReviewCount: number | null;
+  allowForcePushes: boolean;
+  allowDeletions: boolean;
+}
+
+interface FakeRepository {
+  nodeId: string;
+  owner: string;
+  name: string;
+  visibility: string;
+  defaultBranch: string | null;
+  bare: string;
+  protections: Map<string, Protection>;
+}
+
+class FakeGitHub {
+  readonly writes: Array<{ method: WriteMethod; target: string }> = [];
+  readonly reads: string[] = [];
+  private readonly repositories = new Map<string, FakeRepository>();
+  private minted = 0;
+  /** Inject one remote failure on the next call of this write method. */
+  failNext: WriteMethod | null = null;
+  /** GitHub's own spelling of an owner, which need not be the plan's. */
+  canonicalOwner: string | null = null;
+  /** Simulates a create that lands somewhere other than where it was asked to. */
+  createUnderOwner: string | null = null;
+  /** Simulates a create whose visibility is not the one requested. */
+  createWithVisibility: string | null = null;
+  /** GitHub makes the first pushed branch the default; `false` simulates it not doing so. */
+  pushSetsDefault = true;
+
+  constructor(private readonly root: string) {}
+
+  private key(owner: string, name: string): string {
+    return `${owner}/${name}`.toLowerCase();
+  }
+
+  private async mint(owner: string, name: string, visibility: string, prefix: string): Promise<FakeRepository> {
+    this.minted += 1;
+    const bare = join(this.root, `${prefix}-${this.minted}.git`);
+    await git(this.root, ["init", "--bare", "-q", bare]);
+    const repository: FakeRepository = {
+      nodeId: `${prefix}_kgDO${this.minted}`,
+      owner,
+      name,
+      visibility,
+      defaultBranch: null,
+      bare,
+      protections: new Map(),
+    };
+    this.repositories.set(this.key(owner, name), repository);
+    return repository;
+  }
+
+  /** A repository someone else made — exists, and no receipt of ours names it. */
+  seedForeign(owner: string, name: string, visibility = "public"): Promise<FakeRepository> {
+    return this.mint(owner, name, visibility, "R_foreign");
+  }
+
+  /** Delete and recreate under the same name: the name is reused, the node id is not. */
+  async replace(owner: string, name: string): Promise<FakeRepository> {
+    this.repositories.delete(this.key(owner, name));
+    return this.mint(owner, name, "public", "R_replacement");
+  }
+
+  repository(owner: string, name: string): FakeRepository | undefined {
+    return this.repositories.get(this.key(owner, name));
+  }
+
+  private failIfInjected(method: WriteMethod): void {
+    if (this.failNext === method) {
+      this.failNext = null;
+      throw new Error(`HTTP 502 injected on ${method}`);
+    }
+  }
+
+  private shape(repository: FakeRepository) {
+    return {
+      nodeId: repository.nodeId,
+      fullName: `${repository.owner}/${repository.name}`,
+      visibility: repository.visibility,
+      defaultBranch: repository.defaultBranch,
+    };
+  }
+
+  async observeRepository(target: Target) {
+    this.reads.push(`repository ${target.owner}/${target.name}`);
+    const repository = this.repository(target.owner, target.name);
+    return repository ? this.shape(repository) : null;
+  }
+
+  async createRepository(target: Target, visibility: string) {
+    this.writes.push({ method: "createRepository", target: `${target.owner}/${target.name}` });
+    this.failIfInjected("createRepository");
+    if (this.repository(target.owner, target.name)) throw new Error("HTTP 422 name already exists on this account");
+    const owner = this.createUnderOwner ?? this.canonicalOwner ?? target.owner;
+    const created = await this.mint(owner, target.name, this.createWithVisibility ?? visibility, "R");
+    return this.shape(created);
+  }
+
+  async observeBranch(target: Target, branch: string) {
+    this.reads.push(`branch ${target.owner}/${target.name}#${branch}`);
+    const repository = this.repository(target.owner, target.name);
+    if (!repository) return null;
+    const head = await git(repository.bare, ["rev-parse", "--verify", `refs/heads/${branch}^{commit}`], {
+      allowFailure: true,
+    });
+    return head.exitCode === 0 ? { name: branch, headSha: head.stdout.trim() } : null;
+  }
+
+  async pushBranch(target: Target, branch: string, checkoutPath: string, commitSha: string) {
+    this.writes.push({ method: "pushBranch", target: `${target.owner}/${target.name}#${branch}` });
+    this.failIfInjected("pushBranch");
+    const repository = this.repository(target.owner, target.name);
+    if (!repository) throw new Error("HTTP 404 repository not found");
+    await git(checkoutPath, ["push", "-q", repository.bare, `${commitSha}:refs/heads/${branch}`]);
+    // GitHub's own behaviour: the first branch pushed to an empty repository becomes its default.
+    if (this.pushSetsDefault && repository.defaultBranch === null) repository.defaultBranch = branch;
+  }
+
+  async fetchBranch(target: Target, branch: string, checkoutPath: string) {
+    this.reads.push(`fetch ${target.owner}/${target.name}#${branch}`);
+    const repository = this.repository(target.owner, target.name);
+    if (!repository) throw new Error("HTTP 404 repository not found");
+    await git(checkoutPath, ["fetch", "-q", repository.bare, `refs/heads/${branch}`]);
+  }
+
+  async setDefaultBranch(target: Target, branch: string) {
+    this.writes.push({ method: "setDefaultBranch", target: `${target.owner}/${target.name}` });
+    this.failIfInjected("setDefaultBranch");
+    const repository = this.repository(target.owner, target.name);
+    if (!repository) throw new Error("HTTP 404 repository not found");
+    repository.defaultBranch = branch;
+  }
+
+  async observeBranchProtection(target: Target, branch: string) {
+    this.reads.push(`protection ${target.owner}/${target.name}#${branch}`);
+    const stored = this.repository(target.owner, target.name)?.protections.get(branch);
+    return stored ? { ...stored, requiredStatusChecks: [...stored.requiredStatusChecks] } : null;
+  }
+
+  async protectBranch(target: Target, branch: string, desired: Protection) {
+    this.writes.push({ method: "protectBranch", target: `${target.owner}/${target.name}#${branch}` });
+    this.failIfInjected("protectBranch");
+    const repository = this.repository(target.owner, target.name);
+    if (!repository) throw new Error("HTTP 404 repository not found");
+    repository.protections.set(branch, { ...desired, requiredStatusChecks: [...desired.requiredStatusChecks] });
+  }
+}
+
+const sandboxes: string[] = [];
+const makeSandbox = (): { workDir: string; github: FakeGitHub } => {
+  const sandbox = mkdtempSync(join(tmpdir(), "acp-246-github-"));
+  sandboxes.push(sandbox);
+  return { workDir: join(sandbox, "workdir"), github: new FakeGitHub(sandbox) };
+};
+
+afterEach(async () => {
+  while (sandboxes.length > 0) {
+    const dir = sandboxes.pop();
+    if (dir) await rm(dir, { recursive: true, force: true });
+  }
+});
+
+const IDENTITY = "github:acme/fixture";
+const PROTECTION: Protection = {
+  requiredStatusChecks: ["project-ci"],
+  enforceAdmins: true,
+  requiredApprovingReviewCount: null,
+  allowForcePushes: false,
+  allowDeletions: false,
+};
+
+const operations = () => [
+  {
+    operationId: "create-repository:fixture",
+    resourceType: "repository" as const,
+    resourceIdentity: IDENTITY,
+    desiredState: { visibility: "public" as const },
+  },
+  {
+    operationId: "push-default-branch:fixture",
+    resourceType: "branch" as const,
+    resourceIdentity: `${IDENTITY}#main`,
+  },
+  {
+    operationId: "set-default-branch:fixture",
+    resourceType: "setting" as const,
+    resourceIdentity: `${IDENTITY}#default-branch`,
+    desiredState: { defaultBranch: "main" },
+  },
+  {
+    operationId: "protect-default-branch:fixture",
+    resourceType: "branch-protection" as const,
+    resourceIdentity: `${IDENTITY}#main`,
+    desiredState: PROTECTION,
+  },
+];
+
+type Operation = ReturnType<typeof operations>[number];
+
+const githubPlan = (ops: Operation[] = operations()) =>
+  ({
+    runId: "run_bootstrap_246",
+    bootstrapOperationId: "bootstrap_246",
+    requestDigest: "sha256:" + "a".repeat(64),
+    planDigest: "sha256:" + "b".repeat(64),
+    projectManifestDigest: "sha256:" + "c".repeat(64),
+    repositoryRole: "primary",
+    defaultBranch: "main",
+    verificationCommandId: "local-clean-tree",
+    verificationKind: "CLEAN_TREE",
+    githubOperations: ops,
+  }) as unknown as RepoFactoryPlanFixture;
+
+/** The triples activation matches receipts against — the approved PLAN artifact's own shape. */
+const approvedTriples = (ops: Operation[]) =>
+  ops.map(({ operationId, resourceType, resourceIdentity }) => ({ operationId, resourceType, resourceIdentity }));
+
+const authority = (overrides: Partial<{ owner: string; visibility: string; approvedOperations: unknown[] }> = {}) => ({
+  owner: "acme",
+  visibility: "public",
+  approvedOperations: approvedTriples(operations()),
+  ...overrides,
+});
+
+const produce = (
+  workDir: string,
+  github: FakeGitHub,
+  options: { plan?: RepoFactoryPlanFixture; authority?: ReturnType<typeof authority>; at?: string } = {},
+) =>
+  produceRepoFactoryResult({
+    plan: options.plan ?? githubPlan(),
+    workDir,
+    clock: new ManualClock(options.at ?? "2026-10-02T00:00:00.000Z"),
+    github: { port: github, authority: options.authority ?? authority() },
+  } as Parameters<typeof produceRepoFactoryResult>[0]);
+
+const ledgerPath = (workDir: string): string => join(workDir, "github-ledger", "primary.json");
+
+interface LedgerReceipt {
+  operationId: string;
+  resourceType: string;
+  resourceIdentity: string;
+  repositoryNodeId: string;
+  preexisting: boolean;
+  beforeStateDigest: string | null;
+  observed: Record<string, unknown>;
+  createdAt: string;
+  rereadAt: string;
+}
+
+const readLedger = (workDir: string): { bootstrapOperationId: string; receipts: LedgerReceipt[] } =>
+  JSON.parse(readFileSync(ledgerPath(workDir), "utf8")) as { bootstrapOperationId: string; receipts: LedgerReceipt[] };
+
+const evidenceOf = (decision: { allowed: boolean; evidence: Record<string, unknown> }) =>
+  decision.evidence as Record<string, unknown>;
+
+describe("repo factory producer performs planned GitHub operations (#246)", () => {
+  it("performs each planned operation through the port and receipts what GitHub answered, not what the plan said", async () => {
+    const { workDir, github } = makeSandbox();
+    // GitHub spells the owner its own way. A receipt that copied the plan would say `acme`.
+    github.canonicalOwner = "Acme";
+
+    const produced = await produce(workDir, github);
+    if (!produced.allowed) throw new Error(`${produced.reasonCode}: ${produced.message} ${JSON.stringify(produced.evidence)}`);
+
+    expect(github.writes.map((write) => write.method)).toEqual([
+      "createRepository",
+      "pushBranch",
+      "setDefaultBranch",
+      "protectBranch",
+    ]);
+
+    const parsed = parseRepoFactoryResult(produced.value);
+    expect(parsed.allowed).toBe(true);
+    const result = produced.value;
+    expect(result.repositories).toEqual([
+      expect.objectContaining({ role: "primary", identity: IDENTITY, defaultBranch: "main" }),
+    ]);
+
+    // Activation matches every receipt against the approved plan's triples and wants none
+    // missing (activation.ts validateFactoryProvenance). No local receipt rides along.
+    const triples = result.externalWriteReceipts.map(({ operationId, resourceType, resourceIdentity }) => ({
+      operationId,
+      resourceType,
+      resourceIdentity,
+    }));
+    expect(triples).toEqual(approvedTriples(operations()));
+    expect(result.externalWriteReceipts.every((receipt) => receipt.verified && receipt.rereadAt)).toBe(true);
+
+    // The durable receipts carry GitHub's answers.
+    const remote = github.repository("acme", "fixture");
+    if (!remote) throw new Error("the double holds no repository");
+    const ledger = readLedger(workDir);
+    const byId = new Map(ledger.receipts.map((receipt) => [receipt.operationId, receipt]));
+    expect(byId.get("create-repository:fixture")?.observed).toEqual({
+      nodeId: remote.nodeId,
+      fullName: "Acme/fixture",
+      visibility: "public",
+    });
+    const remoteHead = (await git(remote.bare, ["rev-parse", "refs/heads/main"])).stdout.trim();
+    expect(byId.get("push-default-branch:fixture")?.observed).toEqual({ name: "main", headSha: remoteHead });
+    expect(byId.get("set-default-branch:fixture")?.observed).toEqual({ defaultBranch: "main" });
+    expect(byId.get("protect-default-branch:fixture")?.observed).toEqual(remote.protections.get("main"));
+    for (const receipt of ledger.receipts) expect(receipt.repositoryNodeId).toBe(remote.nodeId);
+
+    // The contract's digest is the digest of exactly that readback, so the two cannot drift.
+    for (const receipt of result.externalWriteReceipts) {
+      expect(receipt.afterStateDigest).toBe(digestOf(byId.get(receipt.operationId)?.observed));
+    }
+
+    // The verified head is the one GitHub has, and the proposed checkout really is at it.
+    expect(result.bootstrapVerification).toEqual([
+      { commandId: "local-clean-tree", repositoryIdentity: IDENTITY, exactHead: remoteHead, status: "PASS" },
+    ]);
+    const localHead = (await git(repositoryCheckoutPath(workDir, "primary"), ["rev-parse", "HEAD"])).stdout.trim();
+    expect(localHead).toBe(remoteHead);
+  });
+
+  it("the produced identity satisfies the manifest's portable-remote rule, which a local identity still cannot (manifest.ts stays as it is)", async () => {
+    const { workDir, github } = makeSandbox();
+    const produced = await produce(workDir, github);
+    if (!produced.allowed) throw new Error(`${produced.reasonCode}: ${produced.message}`);
+    const manifest = (remote: string) => ({
+      schema: PROJECT_MANIFEST_SCHEMA_ID,
+      projectId: "fixture",
+      repositories: [{ role: "primary", remote, manifestRoot: "." }],
+      branchProfile: {
+        longLived: ["main"],
+        defaultBranch: "main",
+        updateStrategy: "rebase_before_review",
+        mergeStrategy: "merge_commit",
+        releaseTagPolicy: "semver",
+        releaseBranchCleanup: "keep",
+      },
+      verificationProfiles: { simple: [], standard: [], guarded: [] },
+      verificationCommands: [],
+      postMergeCommands: [],
+      ciWorkflows: [],
+      commitlore: { mode: "preferred" },
+    });
+    const identity = produced.value.repositories[0]?.identity ?? "";
+    expect(assertPortableManifest(manifest(identity)).allowed).toBe(true);
+    const local = assertPortableManifest(manifest("local:primary"));
+    expect(local.allowed).toBe(false);
+    expect(local.reasonCode).toBe(ReasonCode.MANIFEST_NOT_PORTABLE);
+  });
+
+  describe("an operation outside the approved plan is refused before any GitHub call", () => {
+    it("refuses a planned operation the approval does not cover", async () => {
+      const { workDir, github } = makeSandbox();
+      const produced = await produce(workDir, github, {
+        authority: authority({ approvedOperations: approvedTriples(operations().slice(0, 3)) }),
+      });
+      expect(produced.allowed).toBe(false);
+      expect(produced.reasonCode).toBe(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT);
+      expect(evidenceOf(produced).refusal).toBe("OPERATION_NOT_IN_PLAN");
+      expect(evidenceOf(produced).operationId).toBe("protect-default-branch:fixture");
+      expect(github.writes).toEqual([]);
+      expect(github.reads).toEqual([]);
+      expect(existsSync(repositoryCheckoutPath(workDir, "primary"))).toBe(false);
+    });
+
+    it("refuses an approved operation whose executable form names a different resource", async () => {
+      const { workDir, github } = makeSandbox();
+      const approved = approvedTriples(operations());
+      approved[3] = { ...approved[3]!, resourceIdentity: `${IDENTITY}#release` };
+      const produced = await produce(workDir, github, { authority: authority({ approvedOperations: approved }) });
+      expect(produced.allowed).toBe(false);
+      expect(evidenceOf(produced).refusal).toBe("OPERATION_NOT_IN_PLAN");
+      expect(github.writes).toEqual([]);
+    });
+
+    it("refuses when the approval covers an operation the plan would never perform", async () => {
+      const { workDir, github } = makeSandbox();
+      const produced = await produce(workDir, github, { plan: githubPlan(operations().slice(0, 3)) });
+      expect(produced.allowed).toBe(false);
+      expect(produced.reasonCode).toBe(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT);
+      expect(evidenceOf(produced).refusal).toBe("APPROVED_OPERATION_NOT_PLANNED");
+      expect(github.writes).toEqual([]);
+    });
+
+    it("refuses a resume ledger that names an operation the plan does not contain", async () => {
+      const { workDir, github } = makeSandbox();
+      github.failNext = "pushBranch";
+      const first = await produce(workDir, github);
+      expect(first.allowed).toBe(false);
+      const ledger = readLedger(workDir);
+      ledger.receipts.push({ ...ledger.receipts[0]!, operationId: "delete-repository:fixture" });
+      writeFileSync(ledgerPath(workDir), JSON.stringify(ledger));
+      github.writes.length = 0;
+
+      const retry = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
+      expect(retry.allowed).toBe(false);
+      expect(retry.reasonCode).toBe(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT);
+      expect(evidenceOf(retry).refusal).toBe("OPERATION_NOT_IN_PLAN");
+      expect(github.writes).toEqual([]);
+    });
+  });
+
+  describe("owner and visibility mismatches", () => {
+    it("refuses a plan that targets an owner the approval does not name, with no GitHub call", async () => {
+      const { workDir, github } = makeSandbox();
+      const produced = await produce(workDir, github, { authority: authority({ owner: "someone-else" }) });
+      expect(produced.allowed).toBe(false);
+      expect(produced.reasonCode).toBe(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT);
+      expect(evidenceOf(produced).refusal).toBe("OWNER_MISMATCH");
+      expect(evidenceOf(produced).operationId).toBe("create-repository:fixture");
+      expect(github.writes).toEqual([]);
+      expect(github.reads).toEqual([]);
+    });
+
+    it("refuses a later operation aimed at another owner, even when the repository's own owner is approved", async () => {
+      const { workDir, github } = makeSandbox();
+      const ops = operations();
+      ops[3] = { ...ops[3]!, resourceIdentity: "github:elsewhere/fixture#main" };
+      const produced = await produce(workDir, github, {
+        plan: githubPlan(ops),
+        authority: authority({ approvedOperations: approvedTriples(ops) }),
+      });
+      expect(produced.allowed).toBe(false);
+      expect(evidenceOf(produced).refusal).toBe("OWNER_MISMATCH");
+      expect(evidenceOf(produced).operationId).toBe("protect-default-branch:fixture");
+      expect(github.writes).toEqual([]);
+      expect(github.reads).toEqual([]);
+    });
+
+    it("refuses a plan whose repository visibility differs from the approved visibility, with no GitHub call", async () => {
+      const { workDir, github } = makeSandbox();
+      const ops = operations();
+      ops[0] = { ...ops[0]!, desiredState: { visibility: "private" } } as unknown as Operation;
+      const produced = await produce(workDir, github, {
+        plan: githubPlan(ops),
+        authority: authority({ approvedOperations: approvedTriples(ops) }),
+      });
+      expect(produced.allowed).toBe(false);
+      expect(produced.reasonCode).toBe(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT);
+      expect(evidenceOf(produced).refusal).toBe("VISIBILITY_MISMATCH");
+      expect(github.writes).toEqual([]);
+      expect(github.reads).toEqual([]);
+    });
+
+    it("stops after a create that GitHub reports under a different owner, and receipts nothing as success", async () => {
+      const { workDir, github } = makeSandbox();
+      github.createUnderOwner = "octocat";
+      const produced = await produce(workDir, github);
+      expect(produced.allowed).toBe(false);
+      expect(produced.reasonCode).toBe(ReasonCode.RESOURCE_COLLISION);
+      expect(evidenceOf(produced).refusal).toBe("WRONG_TARGET");
+      // GitHub's own answer, so an operator can find what was made.
+      expect(evidenceOf(produced).observed).toEqual(expect.objectContaining({ fullName: "octocat/fixture" }));
+      expect(github.writes.map((write) => write.method)).toEqual(["createRepository"]);
+      expect(existsSync(ledgerPath(workDir)) ? readLedger(workDir).receipts : []).toEqual([]);
+    });
+
+    it("stops after a create that GitHub reports with a different visibility", async () => {
+      const { workDir, github } = makeSandbox();
+      github.createWithVisibility = "private";
+      const produced = await produce(workDir, github);
+      expect(produced.allowed).toBe(false);
+      expect(produced.reasonCode).toBe(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT);
+      expect(evidenceOf(produced).refusal).toBe("VISIBILITY_MISMATCH");
+      expect(github.writes.map((write) => write.method)).toEqual(["createRepository"]);
+    });
+
+    it("refuses to resume onto a receipted repository whose visibility has since changed, with no write", async () => {
+      const { workDir, github } = makeSandbox();
+      github.failNext = "pushBranch";
+      expect((await produce(workDir, github)).allowed).toBe(false);
+      const remote = github.repository("acme", "fixture");
+      if (!remote) throw new Error("no repository");
+      remote.visibility = "private";
+      github.writes.length = 0;
+
+      const retry = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
+      expect(retry.allowed).toBe(false);
+      expect(retry.reasonCode).toBe(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT);
+      expect(evidenceOf(retry).refusal).toBe("VISIBILITY_MISMATCH");
+      expect(github.writes).toEqual([]);
+    });
+  });
+
+  describe("wrong target — an existing repository is ours only if a receipt's node id says so", () => {
+    it("refuses a same-named repository that exists with no receipt from this operation, and writes nothing", async () => {
+      const { workDir, github } = makeSandbox();
+      const foreign = await github.seedForeign("acme", "fixture");
+      const produced = await produce(workDir, github);
+      expect(produced.allowed).toBe(false);
+      expect(produced.reasonCode).toBe(ReasonCode.RESOURCE_COLLISION);
+      expect(evidenceOf(produced).refusal).toBe("WRONG_TARGET");
+      expect(evidenceOf(produced).observedNodeId).toBe(foreign.nodeId);
+      expect(github.writes).toEqual([]);
+      expect(existsSync(ledgerPath(workDir))).toBe(false);
+    });
+
+    it("refuses to resume onto a repository whose name was reused after our receipt — node id differs — and writes nothing", async () => {
+      const { workDir, github } = makeSandbox();
+      github.failNext = "pushBranch";
+      expect((await produce(workDir, github)).allowed).toBe(false);
+      const ours = readLedger(workDir).receipts.find((receipt) => receipt.resourceType === "repository");
+      const replacement = await github.replace("acme", "fixture");
+      github.writes.length = 0;
+
+      const retry = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
+      expect(retry.allowed).toBe(false);
+      expect(retry.reasonCode).toBe(ReasonCode.RESOURCE_COLLISION);
+      expect(evidenceOf(retry).refusal).toBe("WRONG_TARGET");
+      expect(evidenceOf(retry).recordedNodeId).toBe(ours?.observed.nodeId);
+      expect(evidenceOf(retry).observedNodeId).toBe(replacement.nodeId);
+      expect(github.writes).toEqual([]);
+    });
+  });
+
+  describe("partial failure leaves exact receipts and a resumable state, never a rollback", () => {
+    it("records what succeeded, stops at the failure, and the retry performs only what is left", async () => {
+      const { workDir, github } = makeSandbox();
+      github.failNext = "protectBranch";
+      const first = await produce(workDir, github);
+      expect(first.allowed).toBe(false);
+      expect(first.reasonCode).toBe(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT);
+      const evidence = evidenceOf(first);
+      expect(evidence.refusal).toBe("REMOTE_REFUSED");
+      expect(evidence.failedOperationId).toBe("protect-default-branch:fixture");
+      expect(evidence.completedOperationIds).toEqual([
+        "create-repository:fixture",
+        "push-default-branch:fixture",
+        "set-default-branch:fixture",
+      ]);
+      expect(evidence.rollback).toBe("none");
+      expect(evidence.resumable).toBe(true);
+      // Exactly the attempted writes, and no compensating one.
+      expect(github.writes.map((write) => write.method)).toEqual([
+        "createRepository",
+        "pushBranch",
+        "setDefaultBranch",
+        "protectBranch",
+      ]);
+      expect(readLedger(workDir).receipts.map((receipt) => receipt.operationId)).toEqual(
+        evidence.completedOperationIds,
+      );
+      const pushed = readLedger(workDir).receipts.find((receipt) => receipt.resourceType === "branch");
+      // The local checkout is disposable; the ledger beside it is the resume state.
+      expect(existsSync(repositoryCheckoutPath(workDir, "primary"))).toBe(false);
+
+      github.writes.length = 0;
+      const retry = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
+      if (!retry.allowed) throw new Error(`${retry.reasonCode}: ${retry.message} ${JSON.stringify(retry.evidence)}`);
+      expect(github.writes.map((write) => write.method)).toEqual(["protectBranch"]);
+      // The resumed checkout is the commit GitHub already has, fetched — not a new commit.
+      expect(retry.value.bootstrapVerification[0]?.exactHead).toBe(pushed?.observed.headSha);
+      expect(parseRepoFactoryResult(retry.value).allowed).toBe(true);
+      expect(retry.value.externalWriteReceipts.map((receipt) => receipt.operationId)).toEqual(
+        operations().map((operation) => operation.operationId),
+      );
+    });
+
+    it("a failure at the push leaves only the repository receipted, and the retry pushes a fresh commit to it", async () => {
+      const { workDir, github } = makeSandbox();
+      github.failNext = "pushBranch";
+      const first = await produce(workDir, github);
+      expect(first.allowed).toBe(false);
+      expect(evidenceOf(first).completedOperationIds).toEqual(["create-repository:fixture"]);
+      expect(readLedger(workDir).receipts.map((receipt) => receipt.resourceType)).toEqual(["repository"]);
+
+      github.writes.length = 0;
+      const retry = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
+      if (!retry.allowed) throw new Error(`${retry.reasonCode}: ${retry.message}`);
+      expect(github.writes.map((write) => write.method)).toEqual(["pushBranch", "setDefaultBranch", "protectBranch"]);
+    });
+
+    it("a readback that disagrees with what was asked is a failure, not a receipt", async () => {
+      const { workDir, github } = makeSandbox();
+      const original = github.protectBranch.bind(github);
+      // The write call returns, and GitHub keeps something weaker than was requested.
+      github.protectBranch = async (target, branch, desired) =>
+        original(target, branch, { ...desired, enforceAdmins: false });
+      const produced = await produce(workDir, github);
+      expect(produced.allowed).toBe(false);
+      expect(evidenceOf(produced).refusal).toBe("REREAD_MISMATCH");
+      expect(evidenceOf(produced).failedOperationId).toBe("protect-default-branch:fixture");
+      expect(readLedger(workDir).receipts.map((receipt) => receipt.operationId)).not.toContain(
+        "protect-default-branch:fixture",
+      );
+    });
+  });
+
+  it("reports a default branch only once GitHub reports it, even when no operation set it", async () => {
+    const { workDir, github } = makeSandbox();
+    github.pushSetsDefault = false;
+    const ops = operations().filter((operation) => operation.resourceType !== "setting");
+    const produced = await produce(workDir, github, {
+      plan: githubPlan(ops),
+      authority: authority({ approvedOperations: approvedTriples(ops) }),
+    });
+    expect(produced.allowed).toBe(false);
+    expect(evidenceOf(produced).refusal).toBe("REREAD_MISMATCH");
+    expect(evidenceOf(produced).observed).toBeNull();
+    expect(evidenceOf(produced).reported).toBe("main");
+  });
+
+  it("a throw inside the GitHub half still removes its own checkout, so the operation stays retryable (#871's rule)", async () => {
+    const { workDir, github } = makeSandbox();
+    // The ledger's scratch file cannot be opened: the first verified write's `record` throws.
+    mkdirSync(join(workDir, "github-ledger", "primary.json.partial"), { recursive: true });
+    await expect(produce(workDir, github)).rejects.toMatchObject({ code: "EISDIR" });
+    expect(existsSync(repositoryCheckoutPath(workDir, "primary"))).toBe(false);
+  });
+
+  describe("retry safety", () => {
+    it("re-running a finished operation after the local checkout is lost writes nothing and receipts the same resources", async () => {
+      const { workDir, github } = makeSandbox();
+      const first = await produce(workDir, github);
+      if (!first.allowed) throw new Error(`${first.reasonCode}: ${first.message}`);
+      rmSync(repositoryCheckoutPath(workDir, "primary"), { recursive: true, force: true });
+      github.writes.length = 0;
+
+      const again = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
+      if (!again.allowed) throw new Error(`${again.reasonCode}: ${again.message}`);
+      expect(github.writes).toEqual([]);
+      expect(again.value.bootstrapVerification[0]?.exactHead).toBe(first.value.bootstrapVerification[0]?.exactHead);
+      expect(again.value.externalWriteReceipts.map((receipt) => receipt.afterStateDigest)).toEqual(
+        first.value.externalWriteReceipts.map((receipt) => receipt.afterStateDigest),
+      );
+    });
+
+    it("refuses a ledger written for a different bootstrap operation rather than resuming someone else's writes", async () => {
+      const { workDir, github } = makeSandbox();
+      github.failNext = "pushBranch";
+      expect((await produce(workDir, github)).allowed).toBe(false);
+      github.writes.length = 0;
+      const other = { ...githubPlan(), bootstrapOperationId: "bootstrap_other" } as RepoFactoryPlanFixture;
+      const produced = await produce(workDir, github, { plan: other, at: "2026-10-02T00:05:00.000Z" });
+      expect(produced.allowed).toBe(false);
+      expect(evidenceOf(produced).refusal).toBe("LEDGER_FOREIGN");
+      expect(github.writes).toEqual([]);
+    });
+  });
+
+  it("still refuses a GitHub plan when no port is supplied — the #246 boundary for callers that cannot write", async () => {
+    const { workDir } = makeSandbox();
+    const produced = await produceRepoFactoryResult({ plan: githubPlan(), workDir });
+    expect(produced.allowed).toBe(false);
+    expect(produced.reasonCode).toBe(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT);
+    expect(produced.allowed ? "" : produced.message).toMatch(/GitHub write port/);
+    expect(existsSync(repositoryCheckoutPath(workDir, "primary"))).toBe(false);
+  });
+});
