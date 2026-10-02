@@ -11,9 +11,10 @@ const anUnreadCapacityKeepsALiveIncumbent = {
   file: "src/daemon/daemon.ts",
   find: "        if (this.keepsIncumbentThroughUnreadCapacity(session, currentCapacity)) {\n",
   replace: "        if (this.keepsIncumbentThroughUnreadCapacity(null, currentCapacity)) {\n",
+  // One test only: the harness runs `vitest -t`, which takes a single name. The failover case in
+  // the same file dies to this mutant too (measured by hand), and is not named here for that reason.
   killedBy: [
     "tests/unit/daemon-sensor-failure-binding.test.ts::keeps a live incumbent whose provider has no reading, past the hold window",
-    "tests/unit/daemon-sensor-failure-binding.test.ts::does not fail a live incumbent over to a routable provider because its own reading is missing",
   ],
 };
 
