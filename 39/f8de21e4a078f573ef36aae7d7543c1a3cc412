@@ -1,0 +1,26 @@
+Limit: removed at Isaac's direction, relayed by the CEO: every gate, script and test whose only subject was this repository's own documents, rules or verification tooling; the gates that stay each stop a product defect or keep the commit record intact, and say which on their entry in scripts/lib/prepush-gates.mjs
+Limit: CI now runs one Node leg, 22.23.2, the deployed runtime; the engines.node floor 22.18.0 is no longer exercised by any CI job
+Limit: merge-pr now judges only the required verify check, by its newest completed run on the exact head, and accepts UNSTABLE; any unfinished verify run still refuses, and other checks on the head no longer block
+Ruled-out: keeping the 22.18.0 and moving 22 matrix legs | each ran every gate and the whole suite again on macOS for a runtime nothing deploys
+Warn: the falsifiability harness does not load after this commit: 14 case modules in scripts/falsifiability-cases name a deleted test in killedBy or a deleted file, and inline rows in scripts/verify-guards-are-falsifiable.mjs name deleted scripts; the harness was outside this change, so its owners have to prune those rows before it can run again
+Warn: src/ was outside this change, so src/quality/recurring-defects.ts (now read by nothing) and comments in src/daemon/daemon.ts and src/cli/attach-relay.ts still name guards this commit deleted
+Warn: tests/process/the-replace-census-sees-every-guard-form.test.ts failed once in the full suite on its afterAll cleanup hitting the 60s hook timeout under heavy machine load, and passed alone in 65s; it is unchanged here and is a load flake to watch
+Record-Id: r-63cf02e35ea2
+Provenance: inherited cc7395941e16c6312a9387a124a8089aac7c1cb5
+
+Limit: removed at Isaac's direction, relayed by the coordinator: the schema:writers gate, its package script, scripts/verify-turn-fence-writer-census.mjs and its only test, a census of which module may call Db.run on a turn-fence table
+Limit: schema:census, schema:registry and their test the-replace-census-sees-every-guard-form stay: the census refuses a schema in which INSERT OR REPLACE can rewrite a guarded row (the sessions secret hash was rewritten that way on ACP's own connection), and the registry check keeps the trigger set assertLoadBearingInvariants checks when a database is opened complete
+Limit: the falsifiability harness is left as it is, still naming the deleted census; it is to be deleted separately after the open pull requests merge
+Record-Id: r-69ea823afe77
+Provenance: inherited 388bfa64f990a817868705e85c83a2003a3d078c
+
+Limit: merge-pr's verdict is the aggregate verify job of the newest project-ci run on the exact head, at that run's latest attempt, read with gh run list and gh run view; an unfinished run, a missing or non-success verify job, a non-SUCCESS verify commit status, or a failed read refuses
+Ruled-out: judging the bare verify checks in the pull request rollup, newest by completedAt | the aggregate check does not exist while the matrix runs and the latest completedAt is the job that finished last, so a previous run's green verify was merged on
+Unverified: the CommitLore integration cases of official-merge-records pin CommitLore 1.5.0 and stop at that version check on a machine with 1.7.2, so the full merge path against the new fixture world was not run here
+Record-Id: r-02037d0737d5
+Provenance: inherited 1a18a338135c523541b1fba4a7ef868572a3ada5
+
+Limit: the one conflict, scripts/lib/refusal-operands-unanswered.mjs (deleted here, modified on main), is resolved by keeping the deletion: the operand entries main added for #1038 and #1044 in src/daemon/agentcpd.ts are dropped with the guards:operands census they fed
+Limit: everything else is main's: src, product tests, the falsifiability harness and its cases match origin/main exactly, and the merge result differs from main only in the files this branch changed
+Record-Id: r-c227ae573f8b
+Provenance: inherited f503548be79f8b3d0a0f4a4c2cf13e4e56d1f8f4
