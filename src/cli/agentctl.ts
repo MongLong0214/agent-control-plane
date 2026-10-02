@@ -32,6 +32,11 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
                                            lifecycle has reached a terminal state
   agentctl outbox retry                   reset delivery attempts on pending messages
   agentctl owner approve <runId> <item>   record an owner decision for a human gate
+  agentctl approve repo-factory-github-write <runId> --github-owner <login> --visibility <public|private>
+          --plan-digest <digest> --manifest <project.json> --project-name <name>
+                                           approve, as the owner, the GitHub writes in a
+                                           PROJECT_BOOTSTRAP run's current PLAN (see run show);
+                                           nothing is written until the CEO confirms the run
   agentctl github merge ...             refused: agentcpd owns CEO-approved finalization
   agentctl github post-merge ...        refused: agentcpd owns exact post-merge verification
   agentctl repair list                    show the repair operation allowlist
@@ -96,6 +101,7 @@ const OPERATOR_MUTATION_METHOD_NAMES = new Set([
   "run.cancel",
   "outbox.retry",
   "owner.approve",
+  "repoFactory.githubWrite.approve",
   "repair.dry-run",
   "repair.execute",
   "capacity.observe",
@@ -105,6 +111,14 @@ const OPERATOR_MUTATION_METHOD_NAMES = new Set([
   "conversation.adjudicate",
   "conversation.resolve",
   "telegram.reply.acknowledge",
+]);
+
+const REPO_FACTORY_APPROVAL_OPTIONS: ReadonlySet<string> = new Set([
+  "--github-owner",
+  "--visibility",
+  "--plan-digest",
+  "--manifest",
+  "--project-name",
 ]);
 
 /** Creates a daemon-only operator client. It never opens SQLite or constructs a service. */
@@ -413,6 +427,40 @@ export const dispatch = async (
   if (command === "outbox") {
     if (args[0] !== "retry") return fail(`unknown outbox subcommand: ${args[0] ?? ""}`);
     return call("outbox.retry");
+  }
+
+  if (command === "approve") {
+    if (args[0] !== "repo-factory-github-write") return fail(`unknown approve subcommand: ${args[0] ?? ""}`);
+    const runId = required(args[1], "runId");
+    const pairs = args.slice(2);
+    if (pairs.length % 2 !== 0) return fail("approve repo-factory-github-write options must be option/value pairs");
+    const options = new Map<string, string>();
+    for (let index = 0; index < pairs.length; index += 2) {
+      const option = pairs[index]!;
+      if (!REPO_FACTORY_APPROVAL_OPTIONS.has(option)) {
+        return fail(`unknown approve repo-factory-github-write option: ${option}`);
+      }
+      if (options.has(option)) return fail(`duplicate approve repo-factory-github-write option: ${option}`);
+      options.set(option, pairs[index + 1]!);
+    }
+    // The manifest is read here, on the owner's machine, and sent whole: the daemon checks it is
+    // the one the PLAN names by digest, so a different file is refused rather than approved.
+    const manifestPath = required(options.get("--manifest"), "--manifest");
+    let manifest: unknown;
+    try {
+      manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as unknown;
+    } catch {
+      return fail("--manifest must name a readable JSON file");
+    }
+    return call("repoFactory.githubWrite.approve", {
+      runId,
+      owner: required(options.get("--github-owner"), "--github-owner"),
+      visibility: required(options.get("--visibility"), "--visibility"),
+      planDigest: required(options.get("--plan-digest"), "--plan-digest"),
+      manifest,
+      projectName: required(options.get("--project-name"), "--project-name"),
+      approved: true,
+    });
   }
 
   if (command === "owner") {

@@ -126,6 +126,15 @@ export const OWNER_DECISION_OPERATION = "owner_decision_submit";
 /** PRD §21 — the owner-only gate list. */
 export { HUMAN_GATE_TRIGGERS } from "./human-gate.ts";
 
+/** A CEO's decision on a run at READY_FOR_CEO_REVIEW, as Hermes submits it. */
+export interface CeoDecisionInput {
+  runId: string;
+  decision: CeoDecision;
+  candidateSnapshotDigest: string;
+  ceoSessionId: string;
+  rationale: string;
+}
+
 export class ProductionGate {
   #continuity: ContinuityGate | null = null;
   #ownerAuthority: OwnerAuthorityPort | null = null;
@@ -496,59 +505,10 @@ export class ProductionGate {
    * §19.2 — the CEO's confirm is bound to the exact candidate. If the candidate moved
    * between packet and confirm, the confirm is void rather than approximately right.
    */
-  submitCeoDecision(input: {
-    runId: string;
-    decision: CeoDecision;
-    candidateSnapshotDigest: string;
-    ceoSessionId: string;
-    rationale: string;
-  }): Decision<{ state: RunState }> {
-    const run = this.runs.get(input.runId);
-    if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: input.runId });
-    if (run.state !== RunState.READY_FOR_CEO_REVIEW) {
-      return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, `run is ${run.state}`, { runId: input.runId });
-    }
-
-    // A bootstrap run has no candidate to ship, so its evidence is the activation result
-    // rather than a production-ready packet (§26.3).
-    const isBootstrap = run.kind === RunKind.PROJECT_BOOTSTRAP;
-    const packet = this.artifacts.latestForSnapshot<ProductionReadyPacket>(
-      input.runId,
-      ArtifactKind.PRODUCTION_READY_PACKET,
-      input.candidateSnapshotDigest,
-    );
-    if (!packet && !isBootstrap) {
-      return deny(ReasonCode.EVIDENCE_STALE, "no production-ready packet for this candidate", {
-        runId: input.runId,
-        candidateSnapshotDigest: input.candidateSnapshotDigest,
-      });
-    }
-
-    if (input.decision === "CONFIRM") {
-      const continuity = this.assertCompletionAllowed(input.runId);
-      if (!continuity.allowed) return continuity as Decision<{ state: RunState }>;
-    }
-
-    // The decision is an exercise of the CEO role, so the session must currently hold it.
-    // Independence alone would let any unknown id decide (CP-HI-07).
-    const holds = this.assertCurrentCeo(input.ceoSessionId);
-    if (!holds.allowed) return holds as Decision<{ state: RunState }>;
-
-    // CP-HI-04 second clause — the deciding CEO session cannot also be this run's CTO
-    // or blind reviewer.
-    const independence = this.bindings.assertFinalCeoIndependence(input.runId, input.ceoSessionId);
-    if (!independence.allowed) return independence as Decision<{ state: RunState }>;
-
-    // The packet records what the owner gate said when it was published, but a later
-    // authenticated rejection is authoritative at confirmation time.
-    const humanGate = this.humanGateStatus(input.runId);
-    if (input.decision === "CONFIRM" && humanGate.required && !humanGate.satisfied) {
-      return deny(
-        ReasonCode.HUMAN_GATE_UNSATISFIED,
-        "candidate requires owner approval that has not been recorded",
-        { runId: input.runId, items: humanGate.items },
-      );
-    }
+  submitCeoDecision(input: CeoDecisionInput): Decision<{ state: RunState }> {
+    const admitted = this.admitCeoDecision(input);
+    if (!admitted.allowed) return admitted as Decision<{ state: RunState }>;
+    const { isBootstrap } = admitted.value;
 
     if (input.decision === "CONFIRM" && !isBootstrap) {
       const freshness = this.revalidateCandidateFreshness(input.runId, input.candidateSnapshotDigest);
@@ -631,6 +591,68 @@ export class ProductionGate {
       if (isAcpError(error)) return deny(error.reasonCode, error.message, error.evidence);
       throw error;
     }
+  }
+
+  /**
+   * The checks a CEO decision passes before it changes anything. Read-only, so a caller with
+   * asynchronous work to do ahead of the decision can ask first: a PROJECT_BOOTSTRAP CONFIRM
+   * runs Repo Factory's GitHub writes before `submitCeoDecision` (issue #246), and a decision
+   * this refuses — a session that is not the CEO, a stale continuity mode — must not set them off.
+   * `submitCeoDecision` asks the same question again, so passing here admits nothing by itself.
+   */
+  assertCeoDecisionAdmissible(input: CeoDecisionInput): Decision<void> {
+    const admitted = this.admitCeoDecision(input);
+    return admitted.allowed ? allow(ReasonCode.OK, undefined) : (admitted as Decision<void>);
+  }
+
+  private admitCeoDecision(input: CeoDecisionInput): Decision<{ isBootstrap: boolean }> {
+    const run = this.runs.get(input.runId);
+    if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: input.runId });
+    if (run.state !== RunState.READY_FOR_CEO_REVIEW) {
+      return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, `run is ${run.state}`, { runId: input.runId });
+    }
+
+    // A bootstrap run has no candidate to ship, so its evidence is the activation result
+    // rather than a production-ready packet (§26.3).
+    const isBootstrap = run.kind === RunKind.PROJECT_BOOTSTRAP;
+    const packet = this.artifacts.latestForSnapshot<ProductionReadyPacket>(
+      input.runId,
+      ArtifactKind.PRODUCTION_READY_PACKET,
+      input.candidateSnapshotDigest,
+    );
+    if (!packet && !isBootstrap) {
+      return deny(ReasonCode.EVIDENCE_STALE, "no production-ready packet for this candidate", {
+        runId: input.runId,
+        candidateSnapshotDigest: input.candidateSnapshotDigest,
+      });
+    }
+
+    if (input.decision === "CONFIRM") {
+      const continuity = this.assertCompletionAllowed(input.runId);
+      if (!continuity.allowed) return continuity as Decision<{ isBootstrap: boolean }>;
+    }
+
+    // The decision is an exercise of the CEO role, so the session must currently hold it.
+    // Independence alone would let any unknown id decide (CP-HI-07).
+    const holds = this.assertCurrentCeo(input.ceoSessionId);
+    if (!holds.allowed) return holds as Decision<{ isBootstrap: boolean }>;
+
+    // CP-HI-04 second clause — the deciding CEO session cannot also be this run's CTO
+    // or blind reviewer.
+    const independence = this.bindings.assertFinalCeoIndependence(input.runId, input.ceoSessionId);
+    if (!independence.allowed) return independence as Decision<{ isBootstrap: boolean }>;
+
+    // The packet records what the owner gate said when it was published, but a later
+    // authenticated rejection is authoritative at confirmation time.
+    const humanGate = this.humanGateStatus(input.runId);
+    if (input.decision === "CONFIRM" && humanGate.required && !humanGate.satisfied) {
+      return deny(
+        ReasonCode.HUMAN_GATE_UNSATISFIED,
+        "candidate requires owner approval that has not been recorded",
+        { runId: input.runId, items: humanGate.items },
+      );
+    }
+    return allow(ReasonCode.OK, { isBootstrap });
   }
 
   /**
