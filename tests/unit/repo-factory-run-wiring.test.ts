@@ -1,10 +1,14 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
+import { defaultConfig } from "../../src/app/control-plane.ts";
+import type { GitHubWritePort } from "../../src/bootstrap/github-write-port.ts";
 import { createOperatorClient, dispatch } from "../../src/cli/agentctl.ts";
 import { allow } from "../../src/core/errors.ts";
 import { digestOf } from "../../src/core/digest.ts";
@@ -25,6 +29,7 @@ import {
   TEST_OPERATOR_TOKEN,
   TEST_OWNER,
   bindCeo,
+  bindWorker,
   fixtureManifest,
   makeHarness,
   makeStartedOperator,
@@ -194,8 +199,29 @@ interface PreparedRun {
   bootstrapCtoSessionId: string;
 }
 
-/** A PROJECT_BOOTSTRAP run at CEO review, holding an executable PLAN artifact. */
-const prepareRun = async (harness: Harness, projectId: string): Promise<PreparedRun> => {
+/** Puts the PLAN on the run and returns its artifact digest. */
+type PlanSubmitter = (
+  harness: Harness,
+  runId: string,
+  manifest: ProjectManifest,
+  cto: { sessionId: string; incarnation: string },
+) => Promise<string>;
+
+/** The PLAN written straight into the artifact store, as the runner's own tests do. */
+const putPlanArtifact: PlanSubmitter = async (harness, runId, manifest) =>
+  harness.cp.artifacts.put(runId, "PLAN", {
+    bootstrapOperationId: "op-bootstrap",
+    requestDigest: digestOf({ request: "bootstrap" }),
+    projectManifestDigest: manifestDigest(manifest),
+    githubOperations: operations(),
+  }).digest;
+
+/** A PROJECT_BOOTSTRAP run at CEO review, holding the PLAN `submitPlan` put on it. */
+const prepareRun = async (
+  harness: Harness,
+  projectId: string,
+  submitPlan: PlanSubmitter = putPlanArtifact,
+): Promise<PreparedRun> => {
   const created = harness.cp.runs.create({
     kind: RunKind.PROJECT_BOOTSTRAP,
     executionMode: ExecutionMode.STANDARD,
@@ -209,16 +235,14 @@ const prepareRun = async (harness: Harness, projectId: string): Promise<Prepared
   if (!bound.allowed) throw new Error(bound.message);
   const dispatched = await harness.cp.runs.dispatch(runId);
   if (!dispatched.allowed) throw new Error(dispatched.message);
+  const manifest = cleanTreeManifest(projectId);
+  const planDigest = await submitPlan(harness, runId, manifest, {
+    sessionId: bootstrapCto.sessionId,
+    incarnation: bootstrapCto.incarnation,
+  });
   const snapshotDigest = recordBootstrapBlindReview(harness, runId);
   harness.cp.runs.transition(runId, RunState.READY_FOR_CEO_REVIEW, "reviewed");
-  const manifest = cleanTreeManifest(projectId);
-  const plan = harness.cp.artifacts.put(runId, "PLAN", {
-    bootstrapOperationId: "op-bootstrap",
-    requestDigest: digestOf({ request: "bootstrap" }),
-    projectManifestDigest: manifestDigest(manifest),
-    githubOperations: operations(),
-  });
-  return { runId, planDigest: plan.digest, snapshotDigest, manifest, bootstrapCtoSessionId: bootstrapCto.sessionId };
+  return { runId, planDigest, snapshotDigest, manifest, bootstrapCtoSessionId: bootstrapCto.sessionId };
 };
 
 interface Wired extends PreparedRun {
@@ -229,18 +253,36 @@ interface Wired extends PreparedRun {
 }
 
 /** A lock-held daemon whose control plane composes the runner over a GitHub double. */
-const wire = async (projectId: string): Promise<Wired> => {
-  const workRoot = mkdtempSync(join(tmpdir(), "acp-246-wiring-"));
-  roots.push(workRoot);
-  const github = new FakeGitHub(workRoot);
-  const harness = makeHarness({ repoFactory: { workRoot, githubPort: github } });
+const wire = async (
+  projectId: string,
+  options: {
+    /** `"default"` composes `defaultConfig(root).repoFactory` — the work root production gets. */
+    workRoot?: "default" | string;
+    submitPlan?: PlanSubmitter;
+  } = {},
+): Promise<Wired> => {
+  const bareRoot = mkdtempSync(join(tmpdir(), "acp-246-wiring-"));
+  roots.push(bareRoot);
+  const github = new FakeGitHub(bareRoot);
+  let harness: Harness;
+  if (options.workRoot === "default") {
+    const root = tempDir("acp-246-default-root-");
+    harness = makeHarness({ root, repoFactory: defaultConfig(root).repoFactory });
+    // `defaultConfig()` composes the production `gh` port beside its work root. This test needs
+    // that work root and must not reach GitHub, so only the port is replaced after composition.
+    const deps = (harness.cp.bootstrapProducer as unknown as { deps: { workRoot: string | null; githubPort: GitHubWritePort } }).deps;
+    expect(deps.workRoot).toBe(join(root, "repo-factory"));
+    deps.githubPort = github;
+  } else {
+    harness = makeHarness({ repoFactory: { workRoot: options.workRoot ?? bareRoot, githubPort: github } });
+  }
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
   const ceoSessionId = bindCeo(harness);
   const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-246-wiring-daemon-") });
   const started = await daemon.start();
   if (!started.allowed) throw new Error(`${started.reasonCode}: ${started.message}`);
   daemons.push(daemon);
-  const prepared = await prepareRun(harness, projectId);
+  const prepared = await prepareRun(harness, projectId, options.submitPlan);
   return { ...prepared, harness, daemon, github, ceoSessionId };
 };
 
@@ -488,6 +530,201 @@ describe("#246 wiring: owner approval, then the CEO confirm runs Repo Factory", 
     expect(wired.github.writes).toEqual([]);
     expect(wired.github.reads).toEqual([]);
     expect(consumedApprovals(wired)).toBe(0);
+  });
+});
+
+/**
+ * A CTO MCP tool call through a real MCP client and server pair, so the tool's input schema is
+ * applied exactly as it is for the bootstrap CTO — the registered handler alone would skip it.
+ */
+const callCtoTool = async (
+  harness: Harness,
+  cto: { sessionId: string; incarnation: string },
+  name: string,
+  args: Record<string, unknown>,
+): Promise<{ isError: boolean; text: string; body: Record<string, unknown> }> => {
+  const server = createCtoServer(createCtoMcpPort(harness.cp), () =>
+    allow(ReasonCode.OK, { actor: `cto:${cto.sessionId}`, sessionId: cto.sessionId, sessionIncarnation: cto.incarnation }),
+  );
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  const client = new Client({ name: "acp-246-cto", version: "1" });
+  await client.connect(clientTransport);
+  try {
+    const result = await client.callTool({ name, arguments: args });
+    const content = result.content as Array<{ type: string; text?: string }>;
+    return {
+      isError: result.isError === true,
+      text: content.map((part) => part.text ?? "").join("\n"),
+      body: (result.structuredContent ?? {}) as Record<string, unknown>,
+    };
+  } finally {
+    await client.close();
+    await server.close();
+  }
+};
+
+/** Every task the PLAN submitted, driven to SUCCEEDED by its own worker, as a CTO would. */
+const completeTasks = (harness: Harness, runId: string): void => {
+  const ownerBindingGeneration = harness.cp.runs.require(runId).ownerBindingGeneration;
+  if (ownerBindingGeneration === null) throw new Error("the bootstrap run has no owner generation");
+  for (const task of harness.cp.tasks.ready(runId)) {
+    const started = harness.cp.tasks.startExecution({
+      runId,
+      taskId: task.taskId,
+      ownerBindingGeneration,
+      workerSessionId: bindWorker(harness, task.taskId),
+      provider: "scripted",
+      model: "scripted-worker",
+    });
+    if (!started.allowed) throw new Error(`${started.reasonCode}: ${started.message}`);
+    const finished = harness.cp.tasks.finishExecution(started.value.executionId, {
+      status: "SUCCEEDED",
+      resultDigest: digestOf({ task: task.taskId }),
+    });
+    if (!finished.allowed) throw new Error(`${finished.reasonCode}: ${finished.message}`);
+  }
+};
+
+/** The PLAN through the bootstrap CTO's `plan_submit`, then its task carried to SUCCEEDED. */
+const submitPlanOverCto = (githubOperations: unknown[]): PlanSubmitter => async (harness, runId, manifest, cto) => {
+  const submitted = await callCtoTool(harness, cto, "plan_submit", {
+    idempotencyKey: `plan-${runId}`,
+    runId,
+    plan: {
+      summary: "create the repository the owner approved",
+      bootstrapOperationId: "op-bootstrap",
+      requestDigest: digestOf({ request: "bootstrap" }),
+      projectManifestDigest: manifestDigest(manifest),
+      githubOperations,
+    },
+    tasks: [{ key: "bootstrap", title: "bootstrap the repository", category: "implementation" }],
+  });
+  if (submitted.isError) throw new Error(`plan_submit refused: ${submitted.text}`);
+  completeTasks(harness, runId);
+  const plan = harness.cp.artifacts.latest(runId, "PLAN");
+  if (plan === null) throw new Error("plan_submit stored no PLAN artifact");
+  return plan.digest;
+};
+
+/** Identities only — the shape `plan_submit` accepted before desired state. */
+const identitiesOnly = (ops: ReturnType<typeof operations>) =>
+  ops.map(({ operationId, resourceType, resourceIdentity }) => ({ operationId, resourceType, resourceIdentity }));
+
+/** Owner approval → first CONFIRM (writes) → handoff ack → second CONFIRM (COMPLETED). */
+const approveAndConfirm = async (wired: Wired, projectId: string): Promise<void> => {
+  const approved = await approve(wired);
+  if (!approved.allowed) throw new Error(`${approved.reasonCode}: ${approved.message}`);
+  const first = await ceoDecision(wired, `${projectId}-confirm-1`);
+  expect(first).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+  expect(wired.github.writes.map((write) => write.method)).toEqual([
+    "createRepository",
+    "pushBranch",
+    "setDefaultBranch",
+    "protectBranch",
+  ]);
+  const primary = wired.harness.cp.bindings.activePrimaryCto(projectId);
+  if (!primary) throw new Error("activation bound no primary CTO");
+  const handoffId = (first["evidence"] as Record<string, unknown>)["pendingHandoffId"] as string;
+  expect(wired.harness.cp.bootstrap.acknowledgeActivationHandoff(handoffId, primary.sessionId).allowed).toBe(true);
+  const second = await ceoDecision(wired, `${projectId}-confirm-2`);
+  expect(second).toMatchObject({ ok: true, value: { state: RunState.COMPLETED } });
+  expect(wired.harness.cp.runs.require(wired.runId).state).toBe(RunState.COMPLETED);
+};
+
+describe("#246 production defaults: the work root and an executable plan_submit", () => {
+  it("with no work root configured, the default under the state root is created 0700 and the run completes there", async () => {
+    const wired = await wire("default-work-root", { workRoot: "default" });
+    const workRoot = (wired.harness.cp.bootstrapProducer as unknown as { deps: { workRoot: string } }).deps.workRoot;
+    expect(existsSync(workRoot)).toBe(false);
+
+    await approveAndConfirm(wired, "default-work-root");
+    expect(statSync(workRoot).mode & 0o777).toBe(0o700);
+    expect(existsSync(join(workRoot, wired.runId))).toBe(true);
+    const binding = wired.harness.cp.repositories.byIdentity(IDENTITY);
+    // The registry keeps the canonical path; the temp root sits behind macOS's /var alias.
+    expect(binding?.checkoutPath.startsWith(realpathSync(join(workRoot, wired.runId)))).toBe(true);
+  });
+
+  it("refuses a work root reached through a symlink, or not exactly 0700, before the approval is consumed or GitHub is called", async () => {
+    const real = mkdtempSync(join(tmpdir(), "acp-246-real-root-"));
+    roots.push(real);
+    const linkParent = mkdtempSync(join(tmpdir(), "acp-246-link-parent-"));
+    roots.push(linkParent);
+    const linked = join(linkParent, "work-root");
+    symlinkSync(real, linked);
+    const permissive = join(mkdtempSync(join(tmpdir(), "acp-246-permissive-")), "work-root");
+    roots.push(join(permissive, ".."));
+    mkdirSync(permissive, { mode: 0o755 });
+    chmodSync(permissive, 0o755);
+
+    for (const [projectId, workRoot] of [["work-root-symlink", linked], ["work-root-permissive", permissive]] as const) {
+      const wired = await wire(projectId, { workRoot });
+      const approved = await approve(wired);
+      if (!approved.allowed) throw new Error(`${approved.reasonCode}: ${approved.message}`);
+      const refused = await ceoDecision(wired, `${projectId}-confirm`);
+      expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.STATE_PATH_INSECURE });
+      expect(refused["evidence"]).toMatchObject({ stage: "precondition", refusal: "WORK_ROOT_INSECURE" });
+      nothingWrittenOrConsumed(wired);
+    }
+    // Refused, not repaired: the permissive root keeps the mode it had.
+    expect(statSync(permissive).mode & 0o777).toBe(0o755);
+    // A directory owned by another account cannot be made here without root; that refusal is
+    // the same `ensurePrivateDirectory` owner check, and this test does not exercise it.
+  });
+
+  it("plan_submit with desired state → owner approval → CEO confirm → GitHub writes (double) → activation → COMPLETED", async () => {
+    const wired = await wire("cto-plan", { submitPlan: submitPlanOverCto(operations()) });
+    const plan = wired.harness.cp.artifacts.latest<{ githubOperations: unknown[] }>(wired.runId, "PLAN");
+    expect(plan?.content.githubOperations).toEqual(operations());
+
+    await approveAndConfirm(wired, "cto-plan");
+    // The protection GitHub holds is the one the CTO's PLAN carried and the owner approved.
+    expect(wired.github.repository("acme", "fixture")?.protections.get("main")).toEqual(APPROVED_PROTECTION);
+    expect(consumedApprovals(wired)).toBe(1);
+  });
+
+  it("a PLAN without desired state is still accepted by plan_submit and refused as PLAN_NOT_EXECUTABLE; malformed desired state is refused by the same schema", async () => {
+    const executable = operations();
+    // Mixed: some operations carry their state, the repository's does not.
+    const mixed = [identitiesOnly(executable)[0], ...executable.slice(1)];
+    for (const [projectId, githubOperations] of [
+      ["plan-identities-only", identitiesOnly(executable)],
+      ["plan-mixed", mixed],
+    ] as const) {
+      const wired = await wire(projectId, { submitPlan: submitPlanOverCto([...githubOperations]) });
+      const refused = await approve(wired);
+      expect(refused.allowed).toBe(false);
+      expect(refused.evidence["refusal"]).toBe("PLAN_NOT_EXECUTABLE");
+      expect(recordedApprovals(wired)).toEqual([]);
+      const confirm = await ceoDecision(wired, `${projectId}-confirm`);
+      expect(confirm["evidence"]).toMatchObject({ stage: "approval", refusal: "APPROVAL_MISSING" });
+      nothingWrittenOrConsumed(wired);
+    }
+
+    // A desired state the runner would refuse never reaches the PLAN: `githubOperationSchema`
+    // rejects it at plan_submit.
+    const malformed = await wire("plan-malformed");
+    const before = malformed.harness.cp.artifacts.list(malformed.runId, "PLAN").length;
+    const cto = malformed.harness.cp.runs.require(malformed.runId);
+    const session = malformed.harness.cp.sessions.get(cto.ownerSessionId!);
+    const rejected = await callCtoTool(
+      malformed.harness,
+      { sessionId: session!.sessionId, incarnation: session!.incarnation },
+      "plan_submit",
+      {
+        idempotencyKey: "plan-malformed",
+        runId: malformed.runId,
+        plan: {
+          summary: "internal visibility",
+          githubOperations: [{ ...executable[0], desiredState: { visibility: "internal" } }],
+        },
+        tasks: [{ key: "bootstrap", title: "bootstrap", category: "implementation" }],
+      },
+    );
+    expect(rejected.isError).toBe(true);
+    expect(rejected.text).toContain("Input validation error");
+    expect(malformed.harness.cp.artifacts.list(malformed.runId, "PLAN")).toHaveLength(before);
   });
 });
 

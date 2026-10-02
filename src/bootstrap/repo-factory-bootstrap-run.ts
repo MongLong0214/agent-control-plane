@@ -4,10 +4,11 @@ import { z } from "zod";
 
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
-import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
+import { type Decision, type Evidence, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { type ProjectManifest, assertPortableManifest, manifestDigest } from "../contracts/manifest.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
+import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { ArtifactKind, RunKind } from "../domain/types.ts";
 import type { HandoffPackage } from "../cto/cto-lifecycle.ts";
 import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../ceo/owner-authority.ts";
@@ -89,10 +90,11 @@ import { parseRepoFactoryResult, type RepoFactoryResult } from "./repo-factory-r
  * first CONFIRM performs the writes and is refused BOOTSTRAP_ACTIVATION_INCOMPLETE until the
  * primary CTO acknowledges its handoff; the CEO then confirms again, under a new idempotency key.
  *
- * Still refused in production: `defaultConfig()` sets no `repoFactory.workRoot`, so a CONFIRM is
- * refused at WORK_ROOT_UNCONFIGURED before the approval is consumed or GitHub is called; and the
- * CTO's `plan_submit` carries operation identities only, so a PLAN submitted over MCP is refused
- * as PLAN_NOT_EXECUTABLE, at the owner's approval as well as here.
+ * What production supplies. `defaultConfig()` sets the work root to `<state root>/repo-factory`,
+ * and the CTO's `plan_submit` takes each operation in `githubOperationSchema` — the shape this
+ * runner executes — so a PLAN submitted over MCP with desired state is executable. A PLAN whose
+ * operations carry identities only is still accepted there and refused as PLAN_NOT_EXECUTABLE,
+ * at the owner's approval as well as here.
  */
 
 export const REPO_FACTORY_GITHUB_WRITE_OPERATION = "repo_factory_github_write";
@@ -530,6 +532,17 @@ export class RepoFactoryBootstrapRunner {
     }
     if (!PATH_SAFE_RUN_ID.test(runId)) {
       return refuse(ReasonCode.INVALID_ARGUMENT, "RUN_ID_NOT_PATH_SAFE", "the run id cannot name a work directory");
+    }
+    // The work root is state — it holds the checkout and the GitHub ledger a retry resumes from —
+    // so the state-path rule applies: created 0700 when absent, refused when it is reached through
+    // a symlink, owned by another account, or not exactly 0700, and never repaired. It is checked
+    // here, before the approval is consumed or GitHub is called, rather than at construction, so an
+    // insecure work root refuses Repo Factory runs and does not stop the daemon.
+    try {
+      ensurePrivateDirectory(workRoot);
+    } catch (error) {
+      if (!isAcpError(error)) throw error;
+      return refuse(error.reasonCode, "WORK_ROOT_INSECURE", error.message, error.evidence);
     }
     // Every call is authorised before anything else it does: the approval is admitted through
     // ingress and consumed, or re-admitted from that durable consumption on a later call

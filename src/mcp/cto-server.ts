@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import type { BootstrapActivation } from "../bootstrap/activation.ts";
+import { githubOperationSchema } from "../bootstrap/repo-factory-github.ts";
 import type { CapacityMonitor } from "../capacity/capacity-monitor.ts";
 import type { ProductionGate } from "../ceo/production-gate.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
@@ -270,11 +271,18 @@ const createCtoServerFromPort = (
           bootstrapOperationId: z.string().min(1).optional(),
           requestDigest: z.string().min(1).optional(),
           projectManifestDigest: z.string().min(1).optional(),
-          githubOperations: z.array(z.object({
-            operationId: z.string().min(1),
-            resourceType: z.string().min(1),
-            resourceIdentity: z.string().min(1),
-          }).strict()).optional(),
+          // Issue #246 — each operation as the Repo Factory runner executes it and the owner
+          // approves it, desired state included: `githubOperationSchema` itself, rather than a
+          // second copy of its rules here. An operation named by identity only is still accepted,
+          // as before; such a PLAN is refused as PLAN_NOT_EXECUTABLE at approval and execution.
+          githubOperations: z.array(z.union([
+            githubOperationSchema,
+            z.object({
+              operationId: z.string().min(1),
+              resourceType: z.string().min(1),
+              resourceIdentity: z.string().min(1),
+            }).strict(),
+          ])).optional(),
         }),
         tasks: z.array(z.object({ key: z.string(), title: z.string(), category: z.enum(["mechanical", "implementation", "investigation", "integration", "test", "review", "docs", "migration", "benchmark", "security"]), dependsOn: z.array(z.string()).default([]), spec: z.record(z.unknown()).default({}) })).min(1),
       },
