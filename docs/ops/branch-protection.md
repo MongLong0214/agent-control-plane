@@ -12,8 +12,8 @@ The CI workflow is `project-ci` (`.github/workflows/ci.yml`), and **the bare `ve
 required status check context** — that is a job check name GitHub reports, not the workflow name.
 Its jobs, and what each contributes to that check:
 
-- `verify-matrix`, displayed as `verify`, runs the main build and test steps on Node 22.18.0 and
-  the current Node 22 release, producing `verify (22.18.0)` and `verify (22)` checks;
+- `verify-matrix`, displayed as `verify`, runs the main build and test steps on Node 22.23.2, the
+  runtime the daemon is deployed on, producing one `verify (22.23.2)` check;
 - `guard-falsifiability`, displayed as `guard falsifiability`, runs the mutation sweep after the
   matrix, split four ways: each leg is its own clean checkout running `--shard=<n>/4`, because the
   harness edits the working tree in place and two shards sharing a tree would read each other's

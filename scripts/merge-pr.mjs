@@ -126,29 +126,39 @@ writeFileSync(bodyOut, composed.split("\n").slice(2).join("\n"));
 //    exactly when you want to know the body is wrong — checking it last means a dry run against a
 //    pending PR reports the merge state and never looks at the message at all.
 if (pr.mergeable !== "MERGEABLE") fail(`#${number} is ${pr.mergeable}.`);
-if (pr.mergeStateStatus !== "CLEAN") fail(`#${number} merge state is ${pr.mergeStateStatus}, not CLEAN.`);
+// UNSTABLE is GitHub's "mergeable, and some check branch protection does not require is not green".
+// On this repository that has been a superseded run's leftovers: a run cancelled by a force-push,
+// or a job since deleted, kept reporting CANCELLED on the head after the required check passed,
+// and the only way through was pushing a new commit to change the head. The required check below
+// is the verdict; BLOCKED, BEHIND, DIRTY and the rest still refuse.
+if (pr.mergeStateStatus !== "CLEAN" && pr.mergeStateStatus !== "UNSTABLE") {
+  fail(`#${number} merge state is ${pr.mergeStateStatus}, not CLEAN or UNSTABLE.`);
+}
 // The rollup comes from the same `gh pr view` above, which is one GraphQL call. The first version
 // asked `gh run list` instead — a second call, against the REST actions endpoint, which returned
 // HTTP 403 rate-limited mid-session and took the script down with an unhandled exception. A check
 // that cannot look must say it could not look; a stack trace says neither that nor "green".
-const checks = pr.statusCheckRollup ?? [];
-if (checks.length === 0) fail(`no check reported on ${head.slice(0, 7)}. A green claim needs a run.`);
-const unfinished = checks.filter((c) => c.status !== undefined && c.status !== "COMPLETED");
+//
+// Only the check branch protection requires, and only its newest result on this exact head. Every
+// other check on the head used to count, so an old run's CANCELLED stayed red forever: a newer run
+// of the same head cannot overwrite a check whose job no longer exists. Any run of it that has not
+// finished still refuses, so "newest" is never an older green read while a newer run is going.
+const REQUIRED_CHECK = "verify";
+const required = (pr.statusCheckRollup ?? []).filter((c) => (c.name ?? c.context) === REQUIRED_CHECK);
+if (required.length === 0) fail(`no \`${REQUIRED_CHECK}\` check reported on ${head.slice(0, 7)}. A green claim needs a run.`);
+const unfinished = required.filter((c) => c.status !== undefined && c.status !== "COMPLETED");
 if (unfinished.length > 0) {
-  for (const c of unfinished) process.stdout.write(`  ${c.name ?? c.context}: ${c.status}\n`);
-  fail(`${unfinished.length} check(s) on ${head.slice(0, 7)} have not finished.`);
+  for (const c of unfinished) process.stdout.write(`  ${REQUIRED_CHECK}: ${c.status}\n`);
+  fail(`${unfinished.length} \`${REQUIRED_CHECK}\` run(s) on ${head.slice(0, 7)} have not finished.`);
 }
-const red = checks.filter((c) => {
-  const verdict = c.conclusion ?? c.state;
-  return verdict !== "SUCCESS" && verdict !== "SKIPPED" && verdict !== "NEUTRAL";
-});
-if (red.length > 0) {
-  for (const c of red) process.stdout.write(`  ${c.name ?? c.context}: ${c.conclusion ?? c.state}\n`);
-  fail(`${red.length} non-green check(s) on ${head.slice(0, 7)}.`);
+const newest = required.reduce((a, b) => (String(b.completedAt ?? "") > String(a.completedAt ?? "") ? b : a));
+const verdict = newest.conclusion ?? newest.state;
+if (verdict !== "SUCCESS") {
+  fail(`the newest \`${REQUIRED_CHECK}\` check on ${head.slice(0, 7)} is ${verdict}${newest.completedAt ? ` (${newest.completedAt})` : ""}.`);
 }
 
 process.stdout.write(
-  `\n  #${number} ${pr.title}\n  head ${head.slice(0, 7)} — ${checks.length} check(s), all green\n`,
+  `\n  #${number} ${pr.title}\n  head ${head.slice(0, 7)} — \`${REQUIRED_CHECK}\` green (newest of ${required.length} run(s))\n`,
 );
 
 if (dryRun) {

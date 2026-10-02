@@ -7,25 +7,21 @@
  * to be right about: the set existed only as a sequence of `run:` steps in `.github/workflows/`,
  * and reading a workflow is not running one.
  *
- * The rejected fix was to parse `ci.yml` at run time and execute the `pnpm` strings it yields
- * (`scripts/lib/ci-workflow-gates.mjs`, written and then deleted; it is preserved in this
- * branch's first commit and imported by nothing).
- * YAML is an execution contract, not a command manifest; partially parsing matrix, condition, env,
- * and working-directory semantics produces another silent omission, and it makes `ci.yml` the
- * source of truth — so a gate the parser misses is missing locally and nobody is told. That is the
- * same defect one layer up.
+ * So the manifest is here, it is data, and CI runs it through the same executor a developer does
+ * (`pnpm gates`, one step in the `verify-matrix` job).
  *
- * So the manifest is here, it is data, and CI runs it through the same executor a developer does.
- * `scripts/verify-ci-runs-the-gate-runner.mjs` is what keeps that true: it refuses a workflow that
- * runs a verification command the runner does not own.
+ * What belongs here: a check that stops a product defect, or one that keeps the commit record
+ * intact. Checks whose only subject was this repository's own documents, rules or verification
+ * tooling were removed at the owner's direction on 2026-10-02; each static check that stays says
+ * on its entry which product defect it stops.
  */
 
 /**
- * Exactly the `verify-matrix` job's verification steps, in its order.
+ * The `verify-matrix` job's verification, in order.
  *
- * Order is not decoration. `typecheck` regenerates a declaration file and diffs it; `trailers`
- * reads a commit range; `build` produces `dist/` that the suite's process-level tests spawn. The
- * cheap structural checks come first because a failure there is a failure in under a second.
+ * Order is not decoration. `trailers` reads a commit range; `build` produces `dist/` that the
+ * suite's process-level tests spawn. The cheap structural checks come first because a failure
+ * there is a failure in under a second.
  *
  * `argumentFrom` names an environment variable whose value, when non-empty, is appended as a
  * single argument. It exists for exactly one thing: the commit range for `trailers` is a property
@@ -34,92 +30,27 @@
  * uses its own default, `origin/main..HEAD`.
  */
 export const GATES = [
-  // The same dependency-free working-tree check the pre-commit hook runs. CI also runs it once
-  // before `pnpm install` (see CI_SETUP_COMMANDS), where a workflow/package-script mismatch or
-  // invalid Bash costs seconds rather than the matrix's minutes.
+  // The same dependency-free working-tree check the pre-commit hook runs: a workflow `pnpm`
+  // command with no package script, or a `run:` that does not parse under Bash. CI also runs it
+  // once before `pnpm install`, where that costs seconds rather than the job's minutes.
   { script: "ci:preflight" },
-  // #739 itself: refuses a workflow that verifies anything this manifest does not own. It is in
-  // the set rather than beside it, so the property is checked by the same run everything else is.
-  { script: "gates:ci-parity" },
   // #736 failed CI in 35 seconds on one `@typescript-eslint/consistent-type-imports` error while
   // four hand-written local lists all omitted this line. It is the reason the manifest exists.
   { script: "lint" },
-  { script: "terminology" },
-  // #705 — this check is correct and was reachable from neither package.json nor CI, so a real
-  // defect it found (a `_STALE` code absent from STALENESS_REASON_CODES) reported into a room
-  // nobody was in. Dependency-free by the same PRD §17.4 contract as `terminology`.
+  // Reason codes are an external contract (PRD §40): callers match on the string. This refuses a
+  // code whose value is not its key and a published code that was removed or renamed.
   { script: "reason-codes" },
-  // Reports, never fails: stale evidence is a fact to see, and a check that fails on a true
-  // statement gets switched off. `--strict` exists for when a release wants a gate.
-  { script: "evidence:freshness" },
   { script: "typecheck" },
-  // #705's static half: every direct script has a plausible invocation site. The command prints
-  // that this cannot establish execution and that dynamic measurement remains #705.
-  { script: "scripts:plausible-callers" },
-  // Mutable repository structure is named by symbols or derived at the point of use. This catches
-  // four copied coordinate forms that already went stale in tests and documentation.
-  { script: "coordinates:stale" },
-  // Seconds, and it answers the question that actually goes stale: does every mutation row still
-  // name a line that exists. Editing a guarded line renames its anchor and the row silently stops
-  // checking anything — three times on one branch, each found only when the full sweep reached it
-  // forty minutes in. This fails first instead.
-  { script: "guards:anchors" },
-  // The question that found three of four findings in one final review: which operand of a refusal
-  // does no falsifiability row name. The harness answers "is this guard tested" for the lines
-  // someone wrote a row for; it cannot answer which lines nobody did.
-  { script: "guards:operands" },
-  // #859 — the question this one answers is which subprocess call has no bound in time. Measured
-  // by making `ps` take 8s and changing nothing else: a sandboxed command needing 50ms against a
-  // 3-second budget came back ERROR / SANDBOX_CHILD_CLEANUP_FAILED after 24,081ms, because
-  // `promisify(execFile)` waits forever without the option and the sandbox awaits those probes
-  // unconditionally. Bounding them one at a time does not close the class: the same `ps -o lstart=`
-  // probe existed twice, one copy bounded at 5s and one not, under a comment declaring them
-  // equivalent. This gate is what makes the next unbounded copy arrive loudly.
-  // A class this repository has met twice must be refused by something that runs. The registry
-  // lives in `src/quality/recurring-defects.ts`; this fails on the one state it exists to make
-  // loud — recurred, and nothing guards it — and on an entry naming a guard that does not
-  // resolve, because a guard nobody can run is the same silence wearing a name.
-  // #885 unit 2: the affected closure and reverse reachability agree over 60 real changed-file
-  // sets. It was exempt from having a caller at all while it could not pass; it passes in two
-  // seconds now, and the exemption's own comment said to remove it when that happened. Wiring it
-  // narrows nothing -- the full sweep still runs everywhere -- it only stops the agreement from
-  // silently lapsing.
-  { script: "closure:affected" },
-  { script: "guards:recurrence" },
-  // Prose that names who calls a symbol is a claim about another file, so the change that
-  // falsifies it touches neither the sentence nor anything a reviewer of the sentence opens.
-  // Measured 2026-09-16: `claim()` gained two production callers and five comments across four
-  // files went on saying it had none, one of them carrying an obligation conditioned on that
-  // state. The searches those comments make are declared now, and this re-runs them.
-  { script: "guards:caller-claims" },
+  // #859 — a subprocess call in `src/` with no time bound. Measured: a sandboxed command needing
+  // 50ms against a 3-second budget came back SANDBOX_CHILD_CLEANUP_FAILED after 24,081ms, because
+  // `promisify(execFile)` waits forever without the option.
   { script: "guards:subprocess-bounds" },
-  // A member of a watched string-literal union that nothing in `src/` constructs. Measured
-  // three times in one file on 2026-09-15: the type compiled, the switch was exhaustive, the
-  // test walked every member, and three of them named states no run could enter. `tsc` cannot
-  // see it, because constructing a member is not required to satisfy a type.
-  { script: "guards:union-members" },
-  // #872 — a bounded child's budget fires before the case containing it times out. The sibling gate
-  // above proves a `timeout` is stated; it deliberately never reads the value. That leaves the
-  // shape this one catches: the helper's 55s default sitting inside a case that declares 20s, where
-  // the case times out first and the bound names nothing — the original defect wearing the fix's
-  // clothes. The helper's own record said nothing enforced the rule, and it was right twice: two
-  // sites that reading every converted file by hand had missed failed this gate's first run.
-  { script: "guards:child-budgets" },
-  // #858 — a timestamp ORDER BY names a tiebreaker, or is named in the backlog. `received_at` is
-  // millisecond ISO text and 400 consecutive clock reads shared one millisecond, so an order over
-  // it alone is partial and SQLite returns ties in whatever the access path yields. Four sites took
-  // the first row as "the oldest" and handed its channel and nonce to a person; which row that was
-  // had been decided by an index choice. They shared one definition of "still outstanding" and a
-  // comment saying so, while the ordering beside it was copied four times.
+  // #858 — a timestamp ORDER BY names a tiebreaker. 400 consecutive clock reads shared one
+  // millisecond, and four sites took the first of the tied rows as "the oldest" and handed its
+  // channel and nonce to a person; which row that was had been decided by an index choice.
   { script: "guards:timestamp-orderings" },
-  // #817 — a fixture that writes a program and execs it wedges macOS Gatekeeper: the assessment
-  // cache is keyed by inode, so a three-line shell script at a fresh inode costs more than a
-  // 100MB signed binary at an existing one. `syspolicyd` wedged this machine twice on 2026-09-09,
-  // the second time for over an hour. Under a second, and its subject is the test suite itself,
-  // which is why it runs before the suite rather than in the mutation job.
-  { script: "guards:new-inode-exec" },
-  // #539 lands src/core/peercred.ts unreachable from every live surface on purpose — a new call
-  // site (or a ControlPlane export) is a RED mutant here, not a deliverable.
+  // #539 — the peercred addon stays unreachable from every live surface. A new call site (or a
+  // ControlPlane export) widens a security boundary; it is a refusal here, not a deliverable.
   { script: "guards:peercred-unreachable" },
   // `migrations:check` freezes what each migration does. v24's DDL was edited in place across two
   // correction rounds; a database created at the earlier one then sat at that version with bodies
@@ -127,19 +58,18 @@ export const GATES = [
   { script: "migrations:check" },
   // Refuses a table guarded on UPDATE or DELETE and open on INSERT. `INSERT OR REPLACE` skips the
   // implicit delete's triggers on a connection with recursive_triggers off, which is any
-  // connection ACP did not open. Adding it found two more tables in that shape within a minute.
+  // connection ACP did not open — measured: an `audit_events` row rewritten under its own id with
+  // every foreign key still valid.
   { script: "schema:census" },
-  // #676: every inline-SQL direct call whose TypeScript property symbol is exactly Db.run and that
-  // names a turn-fence table is in that table's declared application owner.
+  // #676: every inline-SQL `Db.run` that names a turn-fence table is in that table's declared
+  // owner, so a write cannot reach the fence's tables around the code that enforces the fence.
   { script: "schema:writers" },
   // A trigger sentinel with no entry in TRIGGER_CODES reaches its caller as a raw Error instead of
   // a Decision, so a refusal is indistinguishable from a bug. The whole canonical-turn ledger was
   // in that state, and a census found five more that predate it.
   { script: "schema:denials" },
   // A trigger declared and named by no required registry is created on a fresh install and never
-  // checked again — drop it from a live database and nothing notices. The registries are
-  // hand-written lists, and four defects on one branch were a hand-written list that stopped
-  // matching what it enumerates.
+  // checked when a database is opened again — drop it from a live database and nothing notices.
   { script: "schema:registry" },
   // A wrapped CommitLore trailer is not a trailer: git ends the block at the continuation line and
   // the record is stored by nobody. It happened six times on 2026-08-22, and every one was
@@ -160,128 +90,3 @@ export const GATES = [
   // different execution and anything it reports is a claim about a run no gate judged.
   { script: "test" },
 ];
-
-/** The package script that must invoke the runner, and the file it must invoke. */
-export const RUNNER_SCRIPT = "gates";
-export const RUNNER_PATH = "scripts/run-prepush-gates.mjs";
-
-/** The workflow job whose verification steps the runner owns. */
-export const CI_GATE_JOB = "verify-matrix";
-
-/**
- * Commands a workflow may run outside the runner because they build the environment the runner
- * needs, rather than verifying anything about the tree.
- *
- * `ci:preflight` is here *and* in `GATES`. CI runs it once before `pnpm install` — it is
- * dependency-free, and a workflow/package-script mismatch found there costs seconds instead of the
- * matrix's minutes — and once more inside the runner, where it is part of the set a developer
- * gets. A duplicate that is declared and cheap is not drift; an omission is.
- */
-export const CI_SETUP_COMMANDS = new Map([
-  ["pnpm install", "installs the dependencies every later gate needs"],
-  ["pnpm rebuild", "rebuilds better-sqlite3 against the matrix leg's Node ABI"],
-  ["pnpm native:peercred:build", "ADR-0010: prebuilds the Darwin peercred addon before anything loads it"],
-  ["pnpm native:fd-vfs:build", "ADR-0010 convention, new load mechanism: prebuilds the fd-vfs SQLite extension; unlike peercred it is built on every platform"],
-  ["pnpm ci:preflight", "runs pre-install as a seconds-long fast fail; also runs inside the runner"],
-  [
-    "pnpm notes:fetch",
-    "brings refs/notes/commitlore into the checkout; `pnpm trailers` reads both the message and the note, and `actions/checkout` fetches no notes ref",
-  ],
-  [
-    "pnpm ci:commitlore",
-    "puts the pinned CommitLore CLI on PATH; `pnpm trailers` spawns it to judge a message carrying more than one record, and a hosted runner has none, so 507ad977 was reported as a lost trailer rather than as a missing program",
-  ],
-]);
-
-/**
- * The gate job's own shape, declared rather than assumed.
- *
- * The first version of the parity check read `run:` text and nothing else, and an independent
- * review defeated it four ways in minutes: `if: false` on the runner step, a `working-directory:`
- * pointing at another tree, a `uses:` action doing the verification, and a package script that
- * kept the runner's path in a string while running `echo`. None of those touch a `run:` command,
- * and all four left CI running something other than the manifest while the check said the two
- * sides agreed.
- *
- * So the job is enumerated instead of sampled. Every key of the job, every step, every key of
- * every step, and every `with:` input is either named here or refuses the build — and a line the
- * parser cannot place at all refuses it too. The list below will be incomplete again; what has to
- * hold is that being incomplete is red, not green.
- */
-export const CI_GATE_JOB_KEYS = new Map([
-  ["name", "the check-run name branch protection requires (#694)"],
-  ["runs-on", "which runner image; the same image runs every gate"],
-  ["strategy", "the Node matrix, constrained by CI_GATE_JOB_STRATEGY below"],
-  ["permissions", "narrows the job's token; cannot add verification or move it"],
-  ["needs", "ordering between jobs; cannot change what this one runs"],
-  ["timeout-minutes", "a ceiling that fails the job — it cannot turn a failure green"],
-  ["steps", "the steps themselves, enumerated below"],
-]);
-
-/**
- * Keys deliberately absent from the map above, and what each one would do. Named so the refusal
- * can say why rather than only that: `if` decides whether the job runs at all, `env` changes what
- * every command in it means, `defaults` moves every step's working directory, `container` and
- * `services` replace the tree and toolchain being verified, and `continue-on-error` makes a failed
- * gate report success.
- */
-export const CI_GATE_JOB_KEYS_REFUSED = new Map([
-  ["if", "would let the whole gate job be skipped"],
-  ["env", "would change what every gate in the job means"],
-  ["defaults", "would move every step's working directory off the tree under test"],
-  ["container", "would verify a different toolchain than the one declared"],
-  ["services", "would add a runtime the local runner does not have"],
-  ["continue-on-error", "would let a failed gate report success"],
-]);
-
-/** `strategy` may hold the Node matrix and nothing that changes which legs exist. */
-export const CI_GATE_JOB_STRATEGY = {
-  keys: new Set(["fail-fast", "matrix"]),
-  matrixKeys: new Set(["node-version"]),
-};
-
-/**
- * Actions the gate job may use, by name, with the inputs each may take.
- *
- * The ref is required to be a 40-character commit SHA rather than pinned here, so a version bump
- * is not a manifest edit — but an action this list does not name is refused, which is what stops a
- * verification action from being added as a step nothing classifies.
- *
- * The `with:` allow-lists are not decoration. `actions/checkout` takes `repository`, `ref`, and
- * `path`, and any of the three makes CI verify a tree that is not the one this commit is: the same
- * "different tree" defect as `working-directory`, arriving through an action's inputs.
- */
-export const CI_GATE_JOB_ACTIONS = new Map([
-  ["actions/checkout", { with: new Set(["fetch-depth"]), why: "the tree under test, at full depth for the trailer range" }],
-  ["pnpm/action-setup", { with: new Set(["version"]), why: "installs the package manager every gate is invoked through" }],
-  ["actions/setup-node", { with: new Set(["node-version", "cache"]), why: "the matrix leg's Node, and the dependency cache" }],
-  [
-    "actions/upload-artifact",
-    {
-      with: new Set(["name", "path", "if-no-files-found"]),
-      if: true,
-      why: "publishes the Vitest JSON as a run artifact; runs after the gates and verifies nothing",
-    },
-  ],
-]);
-
-/** Step keys the runner's own step may carry. Anything else changes whether or where it runs. */
-export const RUNNER_STEP_KEYS = new Set(["run", "env"]);
-
-/** Environment the workflow may set on the runner step — the commit range, and nothing else. */
-export const RUNNER_STEP_ENV = new Set(["ACP_TRAILERS_RANGE"]);
-
-/** The exact argv the `gates` package script must be. See the parity check for why it is exact. */
-export const RUNNER_SCRIPT_WORDS = ["node", "scripts/run-prepush-gates.mjs"];
-
-/**
- * Verification a workflow runs outside the runner on purpose, with the reason it is not a pre-push
- * gate. Every entry must match something a workflow actually runs — a stale exemption is a hole
- * that reads as a decision, so the parity check fails on one that names nothing.
- */
-export const VERIFICATION_OUTSIDE_THE_RUNNER = new Map([
-  [
-    "loci:node scripts/verify-tracker-loci-resolve.mjs",
-    "#597 citation staleness, on a schedule in tracker-loci.yml. It is red today on an unedited main because an open issue cites a moved line; requiring it anywhere near a merge is how a check gets silenced instead of fixed.",
-  ],
-]);

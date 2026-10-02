@@ -64,7 +64,6 @@ describe("ci preflight", () => {
 
     const hook = readFileSync(join(REPO_ROOT, ".githooks", "pre-commit"), "utf8");
     expect(hook.indexOf("pnpm ci:preflight")).toBeGreaterThan(-1);
-    expect(hook.indexOf("pnpm ci:preflight")).toBeLessThan(hook.indexOf("--anchors-only"));
 
     const workflow = readFileSync(join(REPO_ROOT, ".github", "workflows", "ci.yml"), "utf8");
     expect(workflow.indexOf("run: pnpm ci:preflight")).toBeGreaterThan(-1);

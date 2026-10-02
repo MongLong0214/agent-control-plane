@@ -14,7 +14,7 @@ if (process.env.FIXTURE_CLI_RESPONSES) {
   else process.stdout.write(JSON.stringify({
     state: "OPEN", mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", title: "fixture",
     baseRefOid: process.env.FIXTURE_BASE, headRefOid: process.env.FIXTURE_HEAD,
-    statusCheckRollup: [{ name: "fixture", status: "COMPLETED", conclusion: "SUCCESS" }],
+    statusCheckRollup: [{ name: "verify", status: "COMPLETED", conclusion: "SUCCESS", completedAt: "2026-10-02T00:00:00Z" }],
   }));
 } else if (args[0] === "pr" && args[1] === "merge") {
   const subject = args[args.indexOf("--subject") + 1];
