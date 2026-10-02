@@ -7,6 +7,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import type { OwnerApprovalReceipt } from "../ceo/owner-authority.ts";
+import { enqueueOwnerReply } from "../conversation/owner-reply-outbox.ts";
 import type { ReceiptLookupQuery } from "../conversation/turn-coordinator.ts";
 import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
 
@@ -733,16 +734,25 @@ export class IngressGuard {
   }
 
   /**
-   * Atomically writes the only no-reply completion an authenticated terminal receipt can support
-   * today. The coordinator owns receipt lookup and calls this only after its sealed port matched
-   * every field. This guard still re-reads the persisted identity: a receipt for a different
-   * event, a corrupt row, or a concurrent reply must leave this event unresolved.
+   * Atomically settles a claimed ingress turn from an authenticated terminal receipt. The
+   * coordinator owns receipt lookup and calls this only after its sealed port matched every field.
+   * This guard still re-reads the persisted identity: a receipt for a different event, a corrupt
+   * row, or a concurrent reply must leave this event unresolved.
+   *
+   * `ABORTED` writes the no-reply completion it always has: `noReplyAt` and `TELEGRAM_NO_REPLY`.
+   *
+   * `COMPLETED` (#1036) means the target answered and nothing delivered the answer. It writes
+   * `settledAt` with `settlement: "REPLY_OUTBOX"` — the outcome is no longer unknown, which is what
+   * `settledAt` says — and never `repliedAt` (no transport accepted anything) or `noReplyAt` (there
+   * is a reply). In the same transaction it enqueues the owner reply, addressed from the batch's own
+   * ingress rows, so the claim cannot read as settled while the reply it owes is missing. If either
+   * half cannot be written, neither is.
    */
   completeClaimFromHermesReceipt(
     channel: string,
     nonce: string,
     query: ReceiptLookupQuery,
-    receipt: { outcome: "ABORTED"; receiptId: string; evidenceDigest: string; reasonCode: string },
+    receipt: { outcome: "COMPLETED" | "ABORTED"; receiptId: string; evidenceDigest: string; reasonCode: string },
   ): Decision<void> {
     return this.db.txDecision(() => {
       const current = this.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
@@ -831,15 +841,20 @@ export class IngressGuard {
             turnRequestId: query.turnRequestId,
           });
         }
-        const existingReceipt = (memberClaim as TurnClaim & {
-          hermesReceipt?: { receiptId?: unknown; evidenceDigest?: unknown; reasonCode?: unknown };
-        }).hermesReceipt;
+        const existing = memberClaim as TurnClaim & {
+          hermesReceipt?: { outcome?: unknown; receiptId?: unknown; evidenceDigest?: unknown; reasonCode?: unknown };
+        };
+        const existingReceipt = existing.hermesReceipt;
         const priorResult = ingressResultRecord(member.result_json);
-        const alreadyCompleted = memberClaim.noReplyAt !== undefined &&
-          existingReceipt?.receiptId === receipt.receiptId &&
+        const sameReceipt = existingReceipt?.receiptId === receipt.receiptId &&
           existingReceipt?.evidenceDigest === receipt.evidenceDigest &&
-          existingReceipt?.reasonCode === receipt.reasonCode &&
-          priorResult?.["kind"] === "TELEGRAM_NO_REPLY";
+          existingReceipt?.reasonCode === receipt.reasonCode;
+        const alreadyCompleted = receipt.outcome === "ABORTED"
+          ? memberClaim.noReplyAt !== undefined && sameReceipt &&
+            priorResult?.["kind"] === "TELEGRAM_NO_REPLY"
+          : memberClaim.settledAt !== undefined && existing.settlement === REPLY_OUTBOX_SETTLEMENT &&
+            sameReceipt && existingReceipt?.outcome === "COMPLETED" &&
+            priorResult?.["kind"] === REPLY_OUTBOX_RESULT_KIND;
         if (!alreadyCompleted &&
             (memberClaim.repliedAt !== undefined || memberClaim.noReplyAt !== undefined ||
              memberClaim.settledAt !== undefined || !isClaimable(member.result_json))) {
@@ -856,22 +871,53 @@ export class IngressGuard {
           alreadyCompleted,
         });
       }
-      if (memberClaims.every((member) => member.alreadyCompleted)) {
-        return allow(ReasonCode.INGRESS_REPLAY_IGNORED, undefined);
-      }
-
-      const noReplyAt = this.clock.nowIso();
-      for (const member of memberClaims) {
-        if (member.alreadyCompleted) continue;
-        const settledClaim = {
-          ...member.claim,
-          noReplyAt,
-          hermesReceipt: {
+      // The reply a completed turn owes, enqueued before any member is written and in the same
+      // transaction. A redelivery finds the identical item and adds nothing; a conflicting or
+      // unaddressable one refuses here, before the claim could read as settled.
+      if (receipt.outcome === "COMPLETED") {
+        const reply = enqueueOwnerReply(this.db, this.clock, {
+          turnRequestId: query.turnRequestId,
+          ledger: "INGRESS_CLAIM",
+          targetActorId: query.targetActorId,
+          sources: consumedNonces.map((member) => ({ channel, nonce: member })),
+          receipt: {
+            authority: "HERMES_TARGET",
             receiptId: receipt.receiptId,
             evidenceDigest: receipt.evidenceDigest,
             reasonCode: receipt.reasonCode,
           },
-        };
+        });
+        if (!reply.allowed) return deny(reply.reasonCode, reply.message, { ...reply.evidence, channel, nonce });
+      }
+
+      if (memberClaims.every((member) => member.alreadyCompleted)) {
+        return allow(ReasonCode.INGRESS_REPLAY_IGNORED, undefined);
+      }
+
+      const settledAt = this.clock.nowIso();
+      for (const member of memberClaims) {
+        if (member.alreadyCompleted) continue;
+        const settledClaim = receipt.outcome === "ABORTED"
+          ? {
+            ...member.claim,
+            noReplyAt: settledAt,
+            hermesReceipt: {
+              receiptId: receipt.receiptId,
+              evidenceDigest: receipt.evidenceDigest,
+              reasonCode: receipt.reasonCode,
+            },
+          }
+          : {
+            ...member.claim,
+            settledAt,
+            settlement: REPLY_OUTBOX_SETTLEMENT,
+            hermesReceipt: {
+              outcome: "COMPLETED",
+              receiptId: receipt.receiptId,
+              evidenceDigest: receipt.evidenceDigest,
+              reasonCode: receipt.reasonCode,
+            },
+          };
         const updated = this.db.run(
           `UPDATE inbound_messages
               SET result_json = ?, turn_claim_json = ?
@@ -881,7 +927,7 @@ export class IngressGuard {
                 json_extract(result_json, '$.phase') = 'ADMITTED'
               ))`,
           [
-            JSON.stringify({ kind: "TELEGRAM_NO_REPLY" }),
+            JSON.stringify({ kind: receipt.outcome === "ABORTED" ? "TELEGRAM_NO_REPLY" : REPLY_OUTBOX_RESULT_KIND }),
             JSON.stringify(settledClaim),
             channel,
             member.nonce,
@@ -2284,7 +2330,8 @@ export interface TurnClaim extends TurnIdentity {
   repliedAt?: string;
   noReplyAt?: string;
   settledAt?: string;
-  settlement?: "UNANSWERABLE" | "UNRESOLVED";
+  /** `REPLY_OUTBOX`: a target receipt proved the turn completed and its reply is queued (#1036). */
+  settlement?: "UNANSWERABLE" | "UNRESOLVED" | "REPLY_OUTBOX";
 }
 
 /**
@@ -2481,13 +2528,22 @@ const sameReceiptIdentity = (left: ReceiptLookupQuery, right: ReceiptLookupQuery
   && left.executorSessionId === right.executorSessionId
   && left.executorSessionIncarnation === right.executorSessionIncarnation;
 
+/**
+ * How a claim records that a target receipt proved its turn `COMPLETED` and the answer is owed
+ * through the owner-reply outbox (#1036). `settledAt` carries it, because that is the terminal
+ * fact meaning "the outcome is no longer unknown" without claiming a transport accepted anything.
+ */
+const REPLY_OUTBOX_SETTLEMENT = "REPLY_OUTBOX" satisfies TurnClaim["settlement"];
+/** The finished-result marker for that settlement; neither claimable nor recoverable. */
+const REPLY_OUTBOX_RESULT_KIND = "TELEGRAM_REPLY_OUTBOX";
+
 const nonEmptyReceipt = (receipt: {
-  outcome: "ABORTED";
+  outcome: "COMPLETED" | "ABORTED";
   receiptId: string;
   evidenceDigest: string;
   reasonCode: string;
 }): boolean =>
-  receipt.outcome === "ABORTED"
+  (receipt.outcome === "ABORTED" || receipt.outcome === "COMPLETED")
   && receipt.receiptId.trim().length > 0
   && receipt.evidenceDigest.trim().length > 0
   && receipt.reasonCode.trim().length > 0;
@@ -2520,8 +2576,10 @@ const isRecoverableIngressResult = (resultJson: string | null): boolean => {
  *
  * A claim with `repliedAt` produced a reply the transport accepted; a claim with `noReplyAt` had a
  * handler that decided not to reply; a claim with `settledAt` produced a stored handler result
- * whose reply was terminally unanswerable or externally unresolved. These are three different
- * facts, and each closes the ingress claim without overstating the others.
+ * whose reply was terminally unanswerable or externally unresolved, or (`settlement:
+ * "REPLY_OUTBOX"`, #1036) a target receipt proved the turn completed and its reply is owed through
+ * the owner-reply outbox. These are three different facts, and each closes the ingress claim
+ * without overstating the others.
  */
 /**
  * The admitted payload as stored, or `null` when this row does not have one.

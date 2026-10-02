@@ -560,20 +560,22 @@ export const ReasonCode = {
    */
   CONVERSATION_TURN_RECEIPT_WRONG_TURN: "CONVERSATION_TURN_RECEIPT_WRONG_TURN",
   /**
-   * A reconciled receipt says `COMPLETED`, and this build has no way to discharge the reply
-   * obligation that transition carries alongside it.
+   * A reconciled receipt says `COMPLETED`, and the reply it obliges has no single place to go.
    *
-   * #639's contract: a matched receipt must move the turn to `TURN_COMPLETED` and insert one
-   * reply-outbox item atomically, in the same transaction — not as two facts that could disagree.
-   * A review found the reconciler only did the first: `canonical_turns` moved, nothing else did,
-   * and `COMPLETED` cannot be walked back through the ordinary API once recorded. There is no
-   * reply-outbox mechanism wired to this ledger to insert into — `src/outbox/outbox.ts` exists,
-   * but its `MessageKind`s are role-to-role task dispatch, not a reply to the owner who asked — so
-   * recording `COMPLETED` today would be exactly the false positive contract 6 exists to prevent.
-   * `ABORTED` carries no such obligation and is unaffected.
+   * #639's contract 6 pairs the settlement with one owner-reply item in the same transaction
+   * (#1036). The item is addressed from the turn's durable ingress record: the channel, the
+   * conversation `INGRESS_ADMITTED` recorded, and the message it answers. A turn with no ingress
+   * row, no admitted conversation, or sources that disagree on channel or conversation cannot be
+   * addressed, so neither write happens and the turn stays where it was.
    */
-  CONVERSATION_TURN_RECEIPT_REPLY_OBLIGATION_UNDISCHARGEABLE:
-    "CONVERSATION_TURN_RECEIPT_REPLY_OBLIGATION_UNDISCHARGEABLE",
+  CONVERSATION_TURN_REPLY_UNADDRESSABLE: "CONVERSATION_TURN_REPLY_UNADDRESSABLE",
+  /**
+   * A reconciled `COMPLETED` receipt would create a second owner reply: this turn already has a
+   * reply item with different content, or another turn already owes a reply to the same ingress
+   * message. Two items would be two answers to one owner message. Refused, and the settlement it
+   * belonged to rolls back with it (#1036).
+   */
+  CONVERSATION_TURN_REPLY_CONFLICT: "CONVERSATION_TURN_REPLY_CONFLICT",
   /**
    * A reconciled receipt names a different target binding than the one this turn was claimed
    * against. Kept apart from the generation/runtime checks because it is a distinct fact: which

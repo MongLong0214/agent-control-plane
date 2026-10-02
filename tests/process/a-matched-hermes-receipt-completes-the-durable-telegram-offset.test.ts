@@ -2,7 +2,10 @@ import { rmSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
+import { digestOf } from "../../src/core/digest.ts";
+
 import {
+  CHAT_ID,
   UPDATE_ID,
   type LostReport,
   type RestartReport,
@@ -42,6 +45,7 @@ describe("a matched Hermes receipt completes the durable Telegram offset", () =>
           expect(restarted.receiptId, `${mode} wrote a receipt into the durable claim`).toBeNull();
           expect(restarted.offsetAfter, `${mode} advanced Telegram past an unresolved turn`).toBeNull();
           expect(restarted.offsetsRequested).toEqual([null, null]);
+          expect(restarted.ownerReplies, `${mode} queued a reply for an unverified turn`).toEqual([]);
         } finally {
           rmSync(negativeLost.root, { recursive: true, force: true });
         }
@@ -50,4 +54,29 @@ describe("a matched Hermes receipt completes the durable Telegram offset", () =>
       rmSync(lost.root, { recursive: true, force: true });
     }
   }, 180_000);
+
+  /**
+   * #1036: a receipt that proves the turn COMPLETED used to be refused on this lane, so the update
+   * stayed held forever. It now settles the claim and queues one owner reply in the same
+   * transaction, addressed to the chat and message the owner asked from, and releases the update.
+   */
+  it("settles a COMPLETED receipt with one queued owner reply and releases the update", () => {
+    const lost = runInItsOwnProcess<LostReport>("claim");
+    try {
+      const completed = runInItsOwnProcess<RestartReport>("restart", lost.root, "completed");
+      expect(completed.executorCalls, "the restart did not ask Hermes for the claimed turn").toBe(1);
+      expect(completed.directCalls, "a completed receipt re-executed the owner turn").toBe(0);
+      expect(completed.settlement, "the completed receipt did not settle the ingress event").toBe("REPLY_OUTBOX");
+      expect(completed.noReplyAt, "a completed turn was recorded as having no reply").toBeNull();
+      expect(completed.receiptId).toBe("receipt:completed");
+      // Telegram's ingress row keeps the chat only as `digestOf({channel, conversation})`; that digest
+      // and the owner's message id are what address the reply.
+      const chatDigest = digestOf({ channel: "telegram", conversation: CHAT_ID });
+      expect(completed.ownerReplies).toEqual([`telegram ${chatDigest} update:${UPDATE_ID} 7`]);
+      expect(completed.offsetAfter, "the completed receipt did not release the ordered update").toBe(UPDATE_ID + 1);
+      expect(completed.offsetsRequested).toEqual([null, UPDATE_ID + 1]);
+    } finally {
+      rmSync(lost.root, { recursive: true, force: true });
+    }
+  }, 120_000);
 });

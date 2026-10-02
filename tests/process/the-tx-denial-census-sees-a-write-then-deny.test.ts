@@ -169,8 +169,18 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string }> = 
     label: "IngressGuard.completeClaimFromHermesReceipt",
     file: "ingress/ingress-guard.ts",
     anchor:
-      'receipt: { outcome: "ABORTED"; receiptId: string; evidenceDigest: string; reasonCode: string },\n' +
+      'receipt: { outcome: "COMPLETED" | "ABORTED"; receiptId: string; evidenceDigest: string; reasonCode: string },\n' +
       "  ): Decision<void> {\n    return this.db.txDecision(() => {\n      const current = this.db.get<{ result_json: string | null; turn_claim_json: string | null }>(",
+  },
+  {
+    // #1036: the receipt observation and settlement are written through `#observeVerified`, then
+    // the owner-reply half can refuse — a `tx` here would keep a completion whose reply was never
+    // written.
+    label: "ConversationTurnCoordinator.#settleFromReceipt",
+    file: "conversation/turn-coordinator.ts",
+    anchor:
+      "written, and that refusal has to take the observation with it (#664's discipline).\n" +
+      "    return this.db.txDecision(() => {",
   },
   {
     label: "IngressGuard.claimOwnerBatch",

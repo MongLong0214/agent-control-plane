@@ -17,6 +17,7 @@ import { AuditLog } from "../../src/db/audit.ts";
 import { openDb } from "../../src/db/database.ts";
 import { ManualClock } from "../../src/core/clock.ts";
 import { IngressGuard } from "../../src/ingress/ingress-guard.ts";
+import { ownerReplyFor } from "../../src/conversation/owner-reply-outbox.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -54,13 +55,12 @@ afterAll(cleanupTempDirs);
  *    (`claim()` has no caller in `src/`; the live Telegram path claims through `IngressGuard` into
  *    a different table) — so this sweep runs, and asks, over an empty set, until #683/#639's other
  *    half wires a production writer.
- * 4. Even with something to sweep, `COMPLETED` cannot be acted on: every settlement below only
- *    ever moves `canonical_turns`, and contract 6 also requires a reply-outbox insert in the same
- *    transaction, which nothing wired to this ledger can perform. So `#settleFromReceipt` refuses
- *    `COMPLETED` outright and unconditionally — not only while 3 holds, but independently of it.
- *    `ABORTED` carries no reply obligation and is what most tests below use to exercise the
- *    identity checks without that refusal masking them; the one test about `COMPLETED` itself says
- *    so explicitly.
+ * 4. `COMPLETED` used to be refused outright, because contract 6 pairs it with a reply-outbox
+ *    insert in the same transaction and nothing wired to this ledger could perform one. #1036
+ *    wired the owner-reply lane (`owner-reply-outbox.ts`), so a matched `COMPLETED` now settles
+ *    and stores its reply together; `a-completed-receipt-settles-with-its-owner-reply.test.ts`
+ *    owns that contract. Most tests below still use `ABORTED`, which carries no reply obligation,
+ *    so an identity check is exercised without the reply lane in the way.
  */
 type Coordinator = {
   db: ReturnType<typeof openDb>;
@@ -219,12 +219,11 @@ const rowIdentity = (
  * `executorSessionIncarnation` would make it easy to write a new test that "matches" without ever
  * exercising those fields, the same gap the whole file exists to close.
  *
- * Defaults to `outcome: "ABORTED"`, not `"COMPLETED"` — a third review found that `#settleFromReceipt`
- * now refuses every `COMPLETED` unconditionally (contract 6's atomic reply-outbox insert has
- * nothing to write into yet), so a test using the default to prove an *identity* check would have
- * passed for the wrong reason: the completion refusal fires before any identity is even compared.
- * `ABORTED` carries no reply obligation and reaches those checks unaffected; the one test about
- * `COMPLETED` itself overrides this explicitly.
+ * Defaults to `outcome: "ABORTED"`, not `"COMPLETED"`. When this was written `#settleFromReceipt`
+ * refused every `COMPLETED` before comparing any identity, so a test proving an *identity* check
+ * with a completion would have passed for the wrong reason. #1036 removed that refusal; `ABORTED`
+ * still keeps the reply lane out of tests that are about identity, and the test about `COMPLETED`
+ * itself overrides this explicitly.
  */
 const matchingReceipt = (
   identity: {
@@ -318,16 +317,27 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
   /**
    * A third review (Sol, on #691's own fix) found the atomicity gap contract 6 names explicitly:
    * a matched receipt must move `TURN_COMPLETED` and insert one reply-outbox item in the same
-   * transaction, and nothing wired to `canonical_turns` performs the second half. Every field here
-   * matches perfectly — actor, prompt, generation, turn id — precisely so this refusal cannot be
-   * mistaken for any of the identity checks above; the only thing wrong with this receipt is that
-   * this build cannot yet act on `COMPLETED` at all.
+   * transaction. Until #1036 nothing wired to `canonical_turns` performed the second half, so this
+   * test asserted a refusal. Every field matches — actor, prompt, generation, turn id — so the
+   * completion is the only thing being decided, and both halves have to be there afterwards.
    */
-  it("does not complete a turn even when every identity field matches, because the reply obligation cannot yet be discharged", async () => {
+  it("completes a turn whose every identity field matches, and stores its owner reply in the same pass", async () => {
     const port = new FakeReceiptPort();
     const c = withCoordinator(port);
     const actorId = target(c, "perfect-match-completed", 1);
     const held = claim(c, actorId, "m1");
+    // The Telegram router claims the ingress row as well; that claim's scope is what the reply is
+    // addressed by, since a Telegram row keeps no chat id in the clear.
+    const ingress = new IngressGuard(c.db, c.clock, c.audit, {
+      telegram: { allowedActors: ["owner"], allowedConversations: ["convo"] },
+    });
+    expect(ingress.claimTurn("telegram", "m1", {
+      turnRequestId: "ingress:m1",
+      sessionDigest: "scope:convo",
+      legacySessionDigest: "chat:convo",
+      promptDigest: held.promptDigest,
+      bindingDigest: "binding:1",
+    }).allowed).toBe(true);
 
     port.answer(
       held.turnRequestId,
@@ -339,8 +349,15 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
 
     const summary = await c.coordinator.reconcileUnresolved();
 
-    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1, failed: 0 });
-    expect(stateOf(c, held.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
+    expect(summary).toEqual({ swept: 1, settled: 1, unresolved: 0, failed: 0 });
+    expect(stateOf(c, held.turnRequestId)).toEqual({ lifecycle_state: "SETTLED", outcome_kind: "COMPLETED" });
+    expect(ownerReplyFor(c.db, held.turnRequestId)).toMatchObject({
+      turnRequestId: held.turnRequestId,
+      ledger: "CANONICAL_TURN",
+      address: { channel: "telegram", sourceNonce: "m1", scopeDigest: "scope:convo", chatDigest: "chat:convo" },
+      receipt: { authority: "HERMES_TARGET", receiptId: `hermes:${held.turnRequestId}` },
+      status: "PENDING",
+    });
   });
 
   it("does not complete a turn on a receipt naming a different CEO generation, and keeps sweeping the rest", async () => {
