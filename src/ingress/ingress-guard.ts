@@ -2716,8 +2716,8 @@ export class BuzzActorIngress {
    * was signed for: an envelope signed for one actor presented with another fails the signature.
    *
    * Every refusal this path can know before it writes, it gives before it writes: the guard's own
-   * gates and the replay (`IngressGuard.check`), an identity another live session already speaks
-   * as, and a session already speaking as a different one. Only an envelope that will bind reaches
+   * gates and the replay (`IngressGuard.check`), an identity another session row already carries,
+   * and a session already speaking as a different one. Only an envelope that will bind reaches
    * `admit`, which records its nonce, and then the one writer. Re-presenting the identity the
    * session already holds is answered as bound without spending anything.
    */
@@ -2754,9 +2754,12 @@ export class BuzzActorIngress {
         sessionId,
       });
     }
-    const holder = this.sessions.liveSessionSpeakingAs(input.actor);
+    // Any other row, not only a live one: #1038 reads a key another session row carries — a stopped
+    // one keeps the column — as ambiguous, so binding it here would bind nothing a peer turn admits.
+    // Checking only live holders was rejected rather than kept for that reason.
+    const holder = this.sessions.otherSessionCarrying(input.actor, sessionId);
     if (holder !== null) {
-      return deny(ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND, "another live session already speaks as this identity", {
+      return deny(ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND, "another session row already carries this identity", {
         sessionId,
       });
     }

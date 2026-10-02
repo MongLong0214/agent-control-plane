@@ -450,12 +450,15 @@ export class SessionRegistry {
     this.audit.record({ kind: NATIVE_START_PINNED, sessionId, evidence: { startedAt: startToken } });
   }
 
-  /** The live session speaking as this Buzz channel identity, if any; a read for refusing early. */
-  liveSessionSpeakingAs(buzzActorId: string): string | null {
+  /**
+   * Another session row that carries this Buzz channel identity, live or not; a read for refusing
+   * early. A stopped row keeps the column, and #1038's peer rule reads any other holder of a key as
+   * making that key's events ambiguous, so a binding onto it would bind nothing usable.
+   */
+  otherSessionCarrying(buzzActorId: string, sessionId: string): string | null {
     const row = this.db.get<{ session_id: string }>(
-      `SELECT session_id FROM sessions
-        WHERE buzz_actor_id = ? AND lifecycle IN ('STARTING','READY','DRAINING')`,
-      [buzzActorId],
+      `SELECT session_id FROM sessions WHERE buzz_actor_id = ? AND session_id <> ? ORDER BY session_id LIMIT 1`,
+      [buzzActorId, sessionId],
     );
     return row?.session_id ?? null;
   }

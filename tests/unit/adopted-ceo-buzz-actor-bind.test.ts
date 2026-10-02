@@ -2,6 +2,7 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import type { AdoptedCeoAdmission } from "../../src/bootstrap/adopted-ceo-tool-admission.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { buzzPeerRegistry } from "../../src/daemon/agentcpd.ts";
 import { SessionLifecycle } from "../../src/domain/types.ts";
 import {
   BuzzActorIngress,
@@ -80,6 +81,17 @@ describe("the adopted CEO binds its own Buzz channel identity", () => {
     expect(snapshot(fixture.h)).toEqual(before);
   });
 
+  it("leaves #1038's peer rule an identity it reads as this generation's alone", async () => {
+    const { fixture, bind } = await subject();
+    // A CEO runtime with no identity yet reads as none at all, which #1038 refuses.
+    expect(buzzPeerRegistry(fixture.h.cp).currentCeo()).toMatchObject({ channelIdentity: null });
+    expect(bind(CEO_KEY).allowed).toBe(true);
+    expect(buzzPeerRegistry(fixture.h.cp).currentCeo()).toMatchObject({
+      channelIdentity: CEO_KEY,
+      channelIdentityReused: false,
+    });
+  });
+
   it("refuses an envelope signed for another identity than the one it would bind", async () => {
     const { fixture, bind, envelope, boundActor } = await subject();
     expectNoWrites(fixture, () => bind(CEO_KEY, envelope(OTHER_KEY)), ReasonCode.INGRESS_SIGNATURE_INVALID);
@@ -105,6 +117,10 @@ describe("the adopted CEO binds its own Buzz channel identity", () => {
       { sessionId: other.sessionId, sessionSecret: other.sessionSecret!, buzzActorId: CEO_KEY },
       guard,
     ).allowed).toBe(true);
+    expectNoWrites(fixture, () => bind(CEO_KEY), ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND);
+    expect(boundActor()).toBeNull();
+    // Stopped, the row keeps the identity, and #1038 would read it as ambiguous: still refused.
+    expect(fixture.h.cp.sessions.transition(other.sessionId, SessionLifecycle.STOPPED).allowed).toBe(true);
     expectNoWrites(fixture, () => bind(CEO_KEY), ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND);
     expect(boundActor()).toBeNull();
   });
