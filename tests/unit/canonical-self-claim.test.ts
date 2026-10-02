@@ -1883,11 +1883,12 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
 
   /**
    * The restart #831 still locked out (2026-10-02). The predecessor's assignment is ACTIVE because
-   * nothing revoked it before its process died, and the claimant is the same canonical session —
-   * the same UUID, re-derived and re-verified — so the binding it finds is its own. When that
-   * session's recorded `(osPid, start token)` is provably gone, the claim releases the binding
-   * through `recoverDeadCanonicalBinding` inside its own transaction: the same proof and the same
-   * audit record as `binding recover-dead`, landing only together with the successor generation.
+   * nothing revoked it before its process died, and the claimant is the same conversational actor —
+   * the same claimed conversation UUID, re-derived and re-verified — so the binding it finds is its
+   * own. When the predecessor session's recorded `(osPid, start token)` is provably gone, the claim
+   * releases the binding through `recoverDeadCanonicalBinding` inside its own transaction: the
+   * same proof and the same audit record as `binding recover-dead`, landing only together with the
+   * successor generation.
    *
    * Every other shape keeps the refusal it had before, with nothing written; the counter-example
    * table and the different-UUID case below pin that.
@@ -1929,7 +1930,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     it.each([
       ["its pid answers ESRCH", restarted],
       ["its pid was reused under a different start token", () => standardChain({ startedAt: "different lifetime" })],
-    ] as const)("the same canonical session reclaims the role when %s", async (_shape, chain) => {
+    ] as const)("the same conversational actor reclaims the role when %s", async (_shape, chain) => {
       const { core, projectId, roleKey, first, predecessor } = await heldByDeadPredecessor("prj_dead_but_held");
 
       const claimed = await makeSubject(core, projectId, { chain: chain() }).claim(baseRequest(core, projectId, {

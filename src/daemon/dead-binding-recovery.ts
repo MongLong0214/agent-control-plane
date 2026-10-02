@@ -180,10 +180,11 @@ export interface DeadBindingRecoveryReceipt {
  * released by a decision made about the old one.
  *
  * There is a second caller, and it is bounded by this same proof: `CanonicalSelfClaim` calls this
- * from inside its own claim transaction when a restarted canonical session finds its *own* binding
- * (same actor, same session UUID) still ACTIVE on a predecessor whose process is gone. Nested, the
- * denial comes back as data and the claim's outer `txDecision` rolls back, so a release made there
- * lands only together with the successor generation. Changing the proof here changes both doors.
+ * from inside its own claim transaction when a restarted canonical runtime finds its *own* binding
+ * (same conversational actor, same claimed conversation UUID) still ACTIVE on a predecessor
+ * session whose process is gone. Nested, the denial comes back as data and the claim's outer
+ * `txDecision` rolls back, so a release made there lands only together with the successor
+ * generation. Changing the proof here changes both doors.
  *
  * Generation never moves backwards here because nothing is minted. `expectedBindingGeneration`
  * must equal the generation actually held, so a replayed request naming a superseded generation
