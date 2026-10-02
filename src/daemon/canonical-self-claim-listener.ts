@@ -481,7 +481,21 @@ const listenPeerCredentialSocket = async (
     );
   }
   removeStaleSocket(socketPath);
-  const server = createServer(onConnection);
+  // Every accepted connection, so `close` can end them (review PR1046-R3). `server.close()` only
+  // stops accepting and then waits for each open connection to end on its own, and a tool
+  // connection ends when the Gateway or claude behind it does — so a daemon shutting down with a
+  // live relay attached would wait forever before it reached its lock release.
+  const connections = new Set<Socket>();
+  let closing = false;
+  const server = createServer((socket) => {
+    if (closing) {
+      socket.destroy();
+      return;
+    }
+    connections.add(socket);
+    socket.once("close", () => connections.delete(socket));
+    onConnection(socket);
+  });
   try {
     await new Promise<void>((resolveListen, reject) => {
       server.once("error", reject);
@@ -507,15 +521,26 @@ const listenPeerCredentialSocket = async (
     throw err;
   }
 
+  // One close, however many callers ask: a second `server.close()` rejects as not running.
+  let closed: Promise<void> | null = null;
+  const closeOnce = async (): Promise<void> => {
+    // Admission stops with the connections: an admission still resolving finds its socket
+    // destroyed and serves nothing (`servePeerAdmittedConnection` checks before it serves).
+    closing = true;
+    const stopped = closeSocketServer(server);
+    for (const socket of connections) socket.destroy();
+    await stopped;
+    try {
+      if (existsSync(socketPath)) unlinkSync(socketPath);
+    } catch {
+      /* closing the server already releases its socket; this is only cleanup */
+    }
+  };
   return {
     socketPath,
-    close: async () => {
-      await closeSocketServer(server);
-      try {
-        if (existsSync(socketPath)) unlinkSync(socketPath);
-      } catch {
-        /* closing the server already releases its socket; this is only cleanup */
-      }
+    close: () => {
+      closed ??= closeOnce();
+      return closed;
     },
   };
 };

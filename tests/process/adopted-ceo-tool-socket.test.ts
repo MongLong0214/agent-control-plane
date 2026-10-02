@@ -20,8 +20,11 @@ import {
 import {
   ADOPTED_CEO_TOOL_SOCKET_FILENAME,
   MAX_SUN_PATH_BYTES,
+  startAdoptedCeoToolListener,
   type CanonicalSelfClaimListener,
 } from "../../src/daemon/canonical-self-claim-listener.ts";
+import { allow, type Decision } from "../../src/core/errors.ts";
+import { createConnection } from "node:net";
 import { HERMES_PROVENANCE_META_KEY } from "../../src/mcp/hermes-provenance.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
 import {
@@ -213,6 +216,43 @@ const initialized = async (path: string): Promise<Relay> => {
   r.notify("notifications/initialized");
   return r;
 };
+
+describe("closing a kernel-peer listener does not wait on its connections (PR1046-R3)", () => {
+  it("closes with an admitted relay still attached, and the relay sees its stream end", async () => {
+    const { tools } = await started(true);
+    const r = await initialized(tools.socketPath);
+    // The Gateway is alive and the relay's stdin stays open: nothing on the client side ends this.
+    expect(await settles(tools.close().then(() => 0))).toBe(0);
+    expect(await settles(r.exit)).toBe(ATTACH_EXIT.STREAM_CLOSED);
+  });
+
+  it("closes while an admission is still deciding, and serves nothing once it decides", async () => {
+    const dir = stateDir();
+    let decide: (decision: Decision<string>) => void = () => undefined;
+    const pending = new Promise<Decision<string>>((resolve) => {
+      decide = resolve;
+    });
+    let served = 0;
+    let admissions = 0;
+    const listener = await startAdoptedCeoToolListener(lock, dir, () => {
+      admissions += 1;
+      return pending;
+    }, () => {
+      served += 1;
+    });
+    const client = createConnection(listener.socketPath);
+    client.on("error", () => undefined);
+    const ended = new Promise<void>((resolve) => client.once("close", () => resolve()));
+    await new Promise<void>((resolve) => client.once("connect", () => resolve()));
+    for (let wait = 0; admissions === 0 && wait < 100; wait += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(admissions).toBe(1);
+    expect(await settles(listener.close().then(() => 0))).toBe(0);
+    decide(allow(ReasonCode.OK, "admitted after the close"));
+    await ended;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(served).toBe(0);
+  });
+});
 
 describe("the adopted CEO tool socket, through the relay", () => {
   it("serves the adopted CEO's tools without registering a conversation or writing any identity", async () => {

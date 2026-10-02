@@ -68,7 +68,10 @@ const started = async () => {
   const dir = mkdtempSync("/tmp/acp37c-");
   roots.push(dir);
   expect(Buffer.byteLength(join(dir, CANONICAL_CTO_TOOL_SOCKET_FILENAME))).toBeLessThanOrEqual(MAX_SUN_PATH_BYTES);
-  const listeners = await startLocalMcpListeners(subject.h.cp, dir, TOKEN);
+  const opened = await startLocalMcpListeners(subject.h.cp, dir, TOKEN);
+  // Closed once, by whichever of the test and the teardown gets there first.
+  let closedOnce: Promise<void> | null = null;
+  const listeners = { ...opened, close: () => (closedOnce ??= opened.close()) };
   closers.push(() => listeners.close());
   const reattachPath = await listeners.openCanonicalCtoReattach(subject.reattach(), { lock: { held: () => true } });
   // A claim socket that records every request and refuses it, so a claim the relay should not
@@ -182,6 +185,17 @@ describe("the CLI entry reattaches before it asks for the deployment credential 
       expect(r.err()).toBe("attach: mcp token unavailable\n");
     });
     expect(paths.claims).toEqual([]);
+  });
+});
+
+describe("closing the listeners does not wait on a reattached relay (PR1046-R3)", () => {
+  it("closes with a reattached relay still attached", async () => {
+    const paths = await started();
+    const r = relay(paths);
+    const init = await r.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "claude-code", version: "1" } });
+    expect(init.error).toBeUndefined();
+    expect(await settles(paths.listeners.close().then(() => 0))).toBe(0);
+    expect(await settles(r.exit)).toBe(ATTACH_EXIT.STREAM_CLOSED);
   });
 });
 
