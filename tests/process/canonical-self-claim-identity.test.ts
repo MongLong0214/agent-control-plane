@@ -33,6 +33,7 @@ import {
   hashingExecutingImageInspector,
   isExecutingImageProbeFailure,
   looksLikeClaudeInvocation,
+  makeDefaultHostSessionRegistryReader,
   makeDefaultTranscriptReader,
   type ExecutingImageEvidence,
 } from "../../src/registry/canonical-self-claim.ts";
@@ -337,16 +338,64 @@ describe("real process ancestry — ps-backed, not a fake", () => {
     expect(snapshot!.argv![0]).toBe(claude);
     expect(looksLikeClaudeInvocation(snapshot!.argv!)).toBe(true);
 
-    let derived = deriveClaimantIdentity(child.pid!, defaultProcessAncestryInspector);
+    const registryReader = makeDefaultHostSessionRegistryReader(join(root, "sessions"));
+    let derived = deriveClaimantIdentity(child.pid!, defaultProcessAncestryInspector, 64, registryReader);
     for (let attempt = 0; !derived.allowed && attempt < 40; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 25));
-      derived = deriveClaimantIdentity(child.pid!, defaultProcessAncestryInspector);
+      derived = deriveClaimantIdentity(child.pid!, defaultProcessAncestryInspector, 64, registryReader);
     }
     expect(derived.allowed, JSON.stringify(derived)).toBe(true);
     if (!derived.allowed) return;
     expect(derived.value.pid).toBe(child.pid);
     expect(derived.value.sessionUuid).toBe(sessionUuid);
   });
+
+  it("derives a live --continue Claude from a registry whose procStart is the kernel start that TZ=UTC ps renders, and refuses it one second off", async () => {
+    const root = tempRoot();
+    const claude = writeNativeVersionedClaude("2.1.283");
+    const sessionUuid = "77777777-7777-4777-8777-777777777777";
+    const child = spawnHeld(claude, ["--continue"], root);
+    await waitUntil(() => child.pid !== undefined, "child pid to be assigned");
+    let snapshot = defaultProcessAncestryInspector.snapshot(child.pid!);
+    for (let attempt = 0; (!snapshot || snapshot.argv === null) && attempt < 40; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      snapshot = defaultProcessAncestryInspector.snapshot(child.pid!);
+    }
+    expect(snapshot?.argv).toContain("--continue");
+    expect(extractSessionUuidFromArgv(snapshot!.argv!)).toBeNull();
+
+    // The oracle is ps, not this module's renderer: the host writes procStart in this same form.
+    const procStart = boundedExecFileSync("ps", ["-o", "lstart=", "-p", String(child.pid)], {
+      encoding: "utf8", env: { ...process.env, TZ: "UTC", LC_ALL: "C" }, timeout: QUICK_CHILD_BUDGET_MS,
+    }).trim();
+    const sessions = join(root, "sessions");
+    mkdirSync(sessions);
+    const entry = { pid: child.pid, sessionId: sessionUuid, cwd: root, procStart, kind: "interactive", entrypoint: "cli" };
+    writeFileSync(join(sessions, `${child.pid}.json`), JSON.stringify(entry));
+    const registryReader = makeDefaultHostSessionRegistryReader(sessions);
+
+    const derived = deriveClaimantIdentity(child.pid!, defaultProcessAncestryInspector, 64, registryReader);
+    if (process.platform !== "darwin") {
+      // Only a native Darwin start token binds a registry entry to its process instance.
+      expect(derived, JSON.stringify(derived)).toMatchObject({
+        allowed: false, reasonCode: "PROBE_FAILED", message: expect.stringContaining("not a native Darwin start token"),
+      });
+      return;
+    }
+    expect(derived, JSON.stringify(derived)).toMatchObject({
+      allowed: true, value: { pid: child.pid, sessionUuid, sessionSource: "host-session-registry" },
+    });
+
+    // The same process one second later in the same rendering: a stale file at a reused pid.
+    const later = new Date(Date.parse(`${procStart} UTC`) + 1_000);
+    expect(Number.isFinite(later.getTime())).toBe(true);
+    const [weekday, day, month, year, clock] = later.toUTCString().replace(",", "").split(" ");
+    const stale = `${weekday} ${month} ${day!.replace(/^0/, " ")} ${clock} ${year}`;
+    expect(stale).not.toBe(procStart);
+    writeFileSync(join(sessions, `${child.pid}.json`), JSON.stringify({ ...entry, procStart: stale }));
+    const refused = deriveClaimantIdentity(child.pid!, defaultProcessAncestryInspector, 64, registryReader);
+    expect(refused).toMatchObject({ allowed: false, message: expect.stringContaining("procStart") });
+  }, 20_000);
 
   it(
     "the real OS argv reader keeps one positional argument containing spaces and selector-looking text as exactly one argv element",
@@ -473,10 +522,11 @@ describe("real process ancestry — ps-backed, not a fake", () => {
     );
     expect(Number.isSafeInteger(grandchildPid)).toBe(true);
 
-    let derived = deriveClaimantIdentity(grandchildPid, defaultProcessAncestryInspector);
+    const registryReader = makeDefaultHostSessionRegistryReader(join(root, "sessions"));
+    let derived = deriveClaimantIdentity(grandchildPid, defaultProcessAncestryInspector, 64, registryReader);
     for (let attempt = 0; !derived.allowed && attempt < 40; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 25));
-      derived = deriveClaimantIdentity(grandchildPid, defaultProcessAncestryInspector);
+      derived = deriveClaimantIdentity(grandchildPid, defaultProcessAncestryInspector, 64, registryReader);
     }
     expect(derived.allowed, JSON.stringify(derived)).toBe(true);
     if (!derived.allowed) return;

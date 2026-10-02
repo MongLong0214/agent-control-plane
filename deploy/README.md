@@ -63,6 +63,20 @@ present, `ACP_BUZZ_CHANNEL` is also required. Channel-only transport configurati
 The session list, protocol and purpose have no defaults: the configured values are retained from
 daemon entry and passed unchanged to the claim boundary.
 
+Self-claim derives the session UUID from the Claude ancestor's argv selector first, and from the
+host session registry beside the transcript root when argv has no selector. The registry is read
+through one `O_NOFOLLOW` descriptor (regular, owned by the daemon's uid, size-bounded) and must have
+its pid and `procStart` match the ancestor and its kernel start time, a native file birth time no
+earlier than the ancestor's native Darwin start token and no later than the wall clock at the
+check, that start token unchanged after the read, and `kind` `interactive`. A start token that is
+not a native Darwin token, or a birth time that is unavailable or zero, makes the registry
+unverifiable and refuses it; ACP deploys only on Darwin (launchd). Only a missing registry file lets an argv selector stand alone: a file that
+fails any of those checks, or a valid entry that disagrees with the selector, refuses the claim.
+The session is derived again, argv and registry, after the Buzz await and at the commit
+checkpoint, and the claim refuses if it changed; the delegated CTO bind's rechecks do the same.
+The host session registry is supplementary evidence writable by a same-uid process, not an additional authentication mechanism.
+Residual risk: on Darwin, a backward wall-clock step smaller than the gap between a stale registry file's creation and the claim, combined with a reuse of its pid within the same second, by a same-uid process that could already write the registry, can still admit that stale file.
+
 `ACP_CANONICAL_CTO_WORKDIR` used to be the eighth. It pinned the one directory the canonical
 CTO's process could run from; nothing compares a working directory any more, so the group no
 longer carries a value that had to be kept correct for no reader. A deployment that still
@@ -82,8 +96,8 @@ an earlier build was refused, and one whose build the updater had since deleted 
 never be admitted at all. The claim now records the executing image and requires nothing of it.
 That also withdraws what the realpath and sha256 comparison defended against: a same-user process
 exec'd from a binary renamed `claude` is no longer told apart by its bytes, and what bounds a claim
-is the kernel peer credential on the claim socket, the session UUID in the claimant's own argv and
-the project that UUID's entry names. A deployment that still provisions any of the three is not
+is the kernel peer credential on the claim socket, the session UUID derived from the claimant's
+ancestor, and the project that UUID's entry names. A deployment that still provisions any of the three is not
 refused — they are simply ignored.
 
 The generated launcher clears all six inherited variables together before its first Keychain

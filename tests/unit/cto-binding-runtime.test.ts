@@ -1,13 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { createConnection, type Socket } from "node:net";
-import { readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import * as daemon from "../../src/daemon/agentcpd.ts";
 import { createCtoBindingRuntime, daemonCtoBindingRuntime } from "../../src/daemon/cto-binding-runtime.ts";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { sha256 } from "../../src/core/digest.ts";
+import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { defaultProcessAncestryInspector, defaultExecutingImageInspector, defaultTranscriptReader,
   hashingExecutingImageInspector } from "../../src/registry/canonical-self-claim.ts";
 import { allow, type Decision } from "../../src/core/errors.ts";
@@ -190,6 +192,64 @@ it.each(["success", "external-nesting", "reentrant-target", "after-commit-fault"
   expect(cp.db.get<{ protocol_version: string }>("SELECT protocol_version FROM actor_target_attestations")?.protocol_version).toBe("acp.canonical-self-claim/v1");
   expect(consumed).not.toHaveBeenCalled();
   expect(runtime.bind(principal, request).allowed).toBe(false);
+});
+
+// #1035: the delegated bind shares the canonical verifier, so the host session registry it reads —
+// here the production default reader under a stubbed HOME — must refuse a detected anomaly even
+// beside a valid argv selector, and its post-verification recheck must re-derive the session rather
+// than compare only the start token.
+it.each(["registry-valid", "registry-symlink", "registry-switch-after-transcript"])("delegated Claude bind re-derives the session from the host registry: %s", async (mode) => {
+  h = makeHarness(); const { cp, root } = h; await registerFixtureProject(h, "project-a");
+  const home = join(root, "home");
+  const sessions = join(home, ".claude", "sessions");
+  mkdirSync(sessions, { recursive: true });
+  vi.stubEnv("HOME", home);
+  const ceo = cp.sessions.create({ provider: "scripted", model: "ceo", osPid: process.pid });
+  value(cp.sessions.transition(ceo.sessionId, SessionLifecycle.READY));
+  value(cp.bindings.bind({ role: Role.CEO, sessionId: ceo.sessionId }));
+  // The native start token, as a canonical claim records the pair it verified (#760); the host
+  // registry's procStart can only be checked against a token, never a rendered `ps` string.
+  const startToken = readProcessStartToken(process.pid);
+  expect(startToken).not.toBeNull();
+  const target = cp.sessions.create({ provider: "claude", model: "claude-cli", osPid: process.pid, osStartedAt: startToken });
+  value(cp.sessions.transition(target.sessionId, SessionLifecycle.READY));
+  const nativeUuid = "11111111-1111-4111-8111-111111111111";
+  const otherUuid = "22222222-2222-4222-8222-222222222222";
+  // The host's own rendering of this process's start, as the process suite's oracle reads it.
+  const procStart = execFileSync("ps", ["-o", "lstart=", "-p", String(process.pid)], {
+    encoding: "utf8", env: { ...process.env, TZ: "UTC", LC_ALL: "C" }, timeout: 5_000,
+  }).trim();
+  const entry = (sessionId: string) => JSON.stringify({ pid: process.pid, sessionId, procStart, kind: "interactive" });
+  const registryPath = join(sessions, `${process.pid}.json`);
+  if (mode === "registry-symlink") {
+    writeFileSync(join(home, "elsewhere.json"), entry(nativeUuid));
+    symlinkSync(join(home, "elsewhere.json"), registryPath);
+  } else {
+    writeFileSync(registryPath, entry(nativeUuid));
+  }
+  const snapshot = { pid: process.pid, ppid: 1, command: "diagnostic only", cwd: root,
+    cwdProbeFailure: null, startedAt: target.osProcessStartedAt,
+    argv: ["/fixture/claude", "--session-id", nativeUuid] };
+  vi.spyOn(defaultProcessAncestryInspector, "snapshot").mockImplementation(() => ({ ...snapshot }));
+  vi.spyOn(hashingExecutingImageInspector, "resolve").mockReturnValue(
+    { imagePath: "/fixture/claude", version: "0.0.0-fixture", sha256: "sha256:" + "1".repeat(64) });
+  vi.spyOn(defaultTranscriptReader, "locate").mockImplementation(() => {
+    // The process keeps its pid and start token; only the session it is running changes.
+    if (mode === "registry-switch-after-transcript") writeFileSync(registryPath, entry(otherUuid));
+    return { path: join(root, "fixture.jsonl"), sizeBytes: 42 };
+  });
+  const runtime = createCtoBindingRuntime(cp, JSON.stringify([{ provider: "claude", sessionId: target.sessionId,
+    incarnation: target.incarnation, nativeSessionUuid: nativeUuid }]));
+  const principal = { sessionId: ceo.sessionId, sessionSecret: ceo.sessionSecret! };
+  const result = runtime.bind(principal, { requestId: randomUUID(), projectId: "project-a", role: "PRIMARY_CTO",
+    action: "bind-or-rebind", targetSessionId: target.sessionId, expectedBindingGeneration: 1 });
+  if (mode === "registry-valid") {
+    expect(result, JSON.stringify(result)).toMatchObject({ allowed: true, value: { status: "ACTIVE", sessionId: target.sessionId } });
+    return;
+  }
+  expect(result.allowed, JSON.stringify(result)).toBe(false);
+  expect(cp.bindings.activePrimaryCto("project-a")).toBeNull();
+  expect(cp.db.get<{ n: number }>("SELECT count(*) AS n FROM actor_target_attestations")!.n).toBe(0);
 });
 
 it.each(["authentication", "binding"])("authenticated MCP callback never serializes a private exception: %s", async (seam) => {
