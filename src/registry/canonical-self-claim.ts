@@ -1997,8 +1997,7 @@ export class CanonicalSelfClaim {
       // all, and a rule about a live actor must not answer for an actor that no longer exists.
       const predecessorRuntimeIsGone = predecessor !== null &&
         this.#predecessorProcessIsGone(predecessor.osPid, predecessor.osProcessStartedAt);
-      if (incumbent && predecessor && predecessorRuntimeIsGone &&
-          predecessor.lifecycle !== SessionLifecycle.STOPPED && predecessor.lifecycle !== SessionLifecycle.ERROR) {
+      if (incumbent && predecessor && predecessorRuntimeIsGone) {
         // Falling through alone does not reach the ordinary claim: `sessions_buzz_actor` is a
         // partial unique index over *live* rows, so a dead runtime left at READY keeps the
         // canonical Buzz identity and the ordinary claim below dies at `bindBuzzActor` with
@@ -2006,7 +2005,10 @@ export class CanonicalSelfClaim {
         // code. The restore path this claim then takes states the same precondition (a genuine
         // restart leaves the old session terminal), so the row is reconciled to the process fact
         // below, inside this transaction, and rolls back with everything else if anything denies.
-        abandonedRuntimeSessionId = predecessor.sessionId;
+        // A row that is already STOPPED or ERROR already says so and is left as written.
+        if (predecessor.lifecycle !== SessionLifecycle.STOPPED && predecessor.lifecycle !== SessionLifecycle.ERROR) {
+          abandonedRuntimeSessionId = predecessor.sessionId;
+        }
         // Policy change (2026-10-02): the dead predecessor may still hold the role ACTIVE, because
         // nothing revokes an assignment when its process dies, and `bind` below then refused the
         // restarted canonical session BINDING_ALREADY_ACTIVE — locked out of its own role until an
@@ -2019,6 +2021,11 @@ export class CanonicalSelfClaim {
         // DEAD_BINDING_RECOVERED record, inside this transaction so it lands only together with
         // the successor generation. Another actor's binding is not this claim's
         // to release and is left for `bind` to refuse; ALIVE, EPERM and UNKNOWN never reach here.
+        // Policy change (2026-10-02, later): this used to require a non-terminal row as well, and
+        // a daemon restart is exactly what makes the row terminal — its reconcile moves every
+        // live session whose pid is gone to ERROR and revokes nothing — so the commonest restart
+        // still refused BINDING_ALREADY_ACTIVE. The row's lifecycle decides only whether it is
+        // reconciled; whether the binding is released is still the probe's answer alone.
         const held = this.db.get<{ actor_id: string }>(
           `SELECT actor_id FROM assignments WHERE role_key = ? AND status = 'ACTIVE'`,
           [roleKey],
