@@ -465,6 +465,14 @@ const groups = [
   },
   {
     file: "src/daemon/agentcpd.ts",
+    // identityUsedInAnEarlierCeoGeneration (#1044)
+    reason: "TYPESCRIPT IS THE GUARD, not a test. `serving` is `{ generation, runtime } | null`, and the two operands beside this one read `serving.runtime` and `serving.generation`. Replacing `serving !== null` with `true` fails to typecheck (measured: two TS18047 errors, one at each sibling read). Each sibling has its own row.",
+    operands: [
+      ["serving !== null",1],
+    ],
+  },
+  {
+    file: "src/daemon/agentcpd.ts",
     // buzzPeerRegistry.currentCeo (#1044)
     reason: "EQUIVALENT MUTANT. A NULL channel identity is refused at the actor comparison in BuzzMessageIngress's peer rule before `channelIdentityReused` is read, so whatever the reuse query answers for NULL is never observed; and with NULL bound, `buzz_actor_id = ?` matches no row. The operand only spares a query whose answer cannot matter.",
     operands: [

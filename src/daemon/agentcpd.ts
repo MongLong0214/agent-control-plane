@@ -772,6 +772,64 @@ const buzzMentionRouter = (cp: ControlPlane): BuzzMentionRouter => ({
 });
 
 /**
+ * Whether `runtime` carried `identity` at any moment it was serving a CEO generation earlier than
+ * `generation` (#1044) — the identity's history, not the runtime's.
+ *
+ * `sessions.buzz_actor_id` is written once per session, so a runtime carries an identity from the
+ * moment it took it onward. That moment is the runtime's first `SESSION_BUZZ_ACTOR_BOUND` record
+ * for it, and the CEO generations the runtime served are replayed from the binding records in
+ * `event_id` order — which is total, so two records that share one clock reading are still ordered —
+ * reading each record's own generation. The identity was used by an earlier generation exactly when
+ * this runtime was serving one at or after the moment it took the identity.
+ *
+ * Fails closed: no record of the binding, or a binding record whose generation is not readable,
+ * counts as used, because nothing can then show that no earlier generation saw the identity.
+ */
+const identityUsedInAnEarlierCeoGeneration = (
+  cp: ControlPlane,
+  runtime: string,
+  identity: string,
+  generation: number,
+): boolean => {
+  const tookIdentityAt =
+    cp.db.get<{ first: number | null }>(
+      `SELECT MIN(event_id) AS first FROM audit_events
+        WHERE kind = 'SESSION_BUZZ_ACTOR_BOUND' AND session_id = ? AND actor = ?`,
+      [runtime, `buzz:${identity}`],
+    )?.first ?? null;
+  if (tookIdentityAt === null) return true;
+  const records = cp.db.all<{ event_id: number; kind: string; session_id: string | null; evidence_json: string }>(
+    `SELECT event_id, kind, session_id, evidence_json FROM audit_events
+      WHERE role_key = ?
+        AND kind IN ('BINDING_CREATED','BINDING_SWITCHED','BINDING_RUNTIME_MOVED','BINDING_REVOKED')
+      ORDER BY event_id`,
+    [roleKeyFor(Role.CEO)],
+  );
+  let serving: { generation: number; runtime: string | null } | null = null;
+  const servingAnEarlierGenerationHere = (): boolean =>
+    serving !== null && serving.runtime === runtime && serving.generation < generation;
+  for (const record of records) {
+    // The state in force just before this record covers the moment the identity was taken, or a
+    // moment after it, once this record comes after that moment.
+    if (record.event_id > tookIdentityAt && servingAnEarlierGenerationHere()) return true;
+    if (record.kind === "BINDING_REVOKED") {
+      serving = null;
+      continue;
+    }
+    let evidence: Record<string, unknown>;
+    try {
+      evidence = JSON.parse(record.evidence_json) as Record<string, unknown>;
+    } catch {
+      return true;
+    }
+    const recorded = record.kind === "BINDING_SWITCHED" ? evidence["toGeneration"] : evidence["generation"];
+    if (typeof recorded !== "number") return true;
+    serving = { generation: recorded, runtime: record.session_id };
+  }
+  return servingAnEarlierGenerationHere();
+};
+
+/**
  * The registry facts the Buzz peer rule reads (#1038). Reads only, like `buzzMentionRouter`.
  *
  * `currentCeo` reads the column off the CEO binding's *live* runtime, so a NULL there — the adopted
@@ -798,29 +856,18 @@ export const buzzPeerRegistry = (cp: ControlPlane): BuzzPeerRegistry => ({
       [ceo.sessionId],
     );
     const channelIdentity = runtime?.buzz_actor_id ?? null;
-    // #1044. Three ways an identity is not this generation's alone, each a read: another session
-    // row carries it (a stopped one keeps the column, which is what makes a key's earlier holder
-    // visible), this runtime was bound to an earlier CEO generation, or an earlier generation's
-    // conversation was moved onto this runtime. The last is read from the generation the move
-    // recorded rather than from when it happened: a move and the next binding can share one clock
-    // reading, and comparing times then answered "not reused" for a runtime that served the
-    // generation before. A move record with no readable generation counts as an earlier one.
+    // #1044. Two ways an identity is not this generation's alone, and both are about the identity's
+    // own history rather than the runtime's. Another session row carries it — a stopped one keeps
+    // the column, which is what makes a key's earlier holder visible — or this runtime carried it
+    // while serving an earlier CEO generation. A runtime that served an earlier generation with no
+    // identity, and took this one only later, holds an identity no earlier generation used.
     const reused =
       channelIdentity !== null &&
-      (cp.db.get<{ reused: number }>(
-        `SELECT
-            EXISTS (SELECT 1 FROM sessions WHERE buzz_actor_id = ? AND session_id <> ?)
-         OR EXISTS (SELECT 1 FROM assignments
-                     WHERE role_key = ? AND binding_generation < ? AND session_id = ?)
-         OR EXISTS (SELECT 1 FROM audit_events
-                     WHERE kind = 'BINDING_RUNTIME_MOVED' AND role_key = ? AND session_id = ?
-                       AND COALESCE(json_extract(evidence_json, '$.generation'), -1) < ?) AS reused`,
-        [
-          channelIdentity, ceo.sessionId,
-          ceo.roleKey, ceo.bindingGeneration, ceo.sessionId,
-          ceo.roleKey, ceo.sessionId, ceo.bindingGeneration,
-        ],
-      )?.reused ?? 1) !== 0;
+      (cp.db.get<{ carried: number }>(
+        `SELECT EXISTS (SELECT 1 FROM sessions WHERE buzz_actor_id = ? AND session_id <> ?) AS carried`,
+        [channelIdentity, ceo.sessionId],
+      )?.carried !== 0 ||
+        identityUsedInAnEarlierCeoGeneration(cp, ceo.sessionId, channelIdentity, ceo.bindingGeneration));
     return {
       bindingGeneration: ceo.bindingGeneration,
       sessionId: ceo.sessionId,
@@ -2891,15 +2938,16 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
         // #1044. A peer message's proof is checked here, before the hand-over's first write and in
         // its transaction, against the registry as it stands now: the CEO generation and the CEO
         // runtime it was admitted under, that runtime's channel identity — still the one that
-        // signed, still not reused — and exactly this holder as the receiving CTO. A row that fails
-        // is withheld rather than burned — not handed over and not written to — and reported by id
-        // so the holder can reject it.
+        // signed, still not reused — and exactly this holder as the receiving CTO, on the project
+        // channel the event arrived on. A row that fails is withheld rather than burned — not
+        // handed over and not written to — and reported by id so the holder can reject it.
         const ceo = buzzPeerRegistry(cp).currentCeo();
+        const ctoChannel = cp.sessions.get(holder.targetSessionId)?.buzzAddress ?? null;
         const taken = cp.outbox.claimForHolder(
           holder,
           (candidate) =>
             candidate.kind !== MessageKind.PEER_MESSAGE ||
-            peerProofIsCurrent(admittedPeerSource(cp, candidate.payload), ceo, holder),
+            peerProofIsCurrent(admittedPeerSource(cp, candidate.payload), ceo, holder, ctoChannel),
         );
         const unresolved = taken.unresolved;
         const withheld = taken.withheld;
@@ -3017,8 +3065,8 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
 
 /**
  * What a queued peer message was admitted from, read back through its pointer (#1044): the
- * generation proof in the admitted payload and the inbound row's author — or `undefined` when the
- * pointer, the stored envelope or its digest does not check out.
+ * generation proof and the room in the admitted payload, and the inbound row's author — or
+ * `undefined` when the pointer, the stored envelope or its digest does not check out.
  *
  * Reads only, and the digest is checked here as well as after the claim: the proof a hand-over is
  * decided on must be the one admission digested, not merely whatever the pointer's row now says.
@@ -3038,7 +3086,8 @@ const admittedPeerSource = (cp: ControlPlane, outboxPayload: unknown): AdmittedP
     return undefined;
   }
   if (digestOf(payload) !== pointer.sourcePayloadDigest) return undefined;
-  return { proof: (payload as { peer?: unknown }).peer, author: source.actor };
+  const admitted = payload as { peer?: unknown; conversation?: unknown };
+  return { proof: admitted.peer, author: source.actor, conversation: admitted.conversation };
 };
 
 /**

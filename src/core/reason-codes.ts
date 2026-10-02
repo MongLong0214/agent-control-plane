@@ -426,10 +426,10 @@ export const ReasonCode = {
   /**
    * #1044 — the CEO's Buzz channel identity is not this CEO generation's alone.
    *
-   * Another runtime carries or carried it, or this runtime served an earlier CEO generation. An
-   * event signed with it may then be an earlier holder's, the signature cannot say, and `created_at`
-   * is the signer's own claim — so every event signed with that identity is refused, whatever it
-   * says about itself. Distinct from `BUZZ_PEER_GENERATION_STALE`: nothing here is out of date and
+   * Another runtime carries or carried it, or this runtime carried it while serving an earlier CEO
+   * generation. An event signed with it may then be an earlier holder's, the signature cannot say,
+   * and `created_at` is the signer's own claim — so every event signed with that identity is
+   * refused, whatever it says about itself. Distinct from `BUZZ_PEER_GENERATION_STALE`: nothing here is out of date and
    * re-deriving changes nothing; the remedy is a fresh identity for the generation.
    */
   BUZZ_PEER_ORIGIN_AMBIGUOUS: "BUZZ_PEER_ORIGIN_AMBIGUOUS",

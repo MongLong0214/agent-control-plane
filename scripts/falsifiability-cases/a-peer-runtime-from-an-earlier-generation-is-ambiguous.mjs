@@ -1,14 +1,14 @@
 /**
- * #1044. The same runtime bound again in a new CEO generation keeps its key, so an event it signed
- * during the earlier generation verifies exactly like one it signs now. The mutation disables the
- * clause that sees an earlier CEO assignment on this runtime.
+ * #1044. A runtime bound again in a new CEO generation keeps the key it carried in the earlier one,
+ * and an event it signed then verifies exactly like one it signs now. The mutation stops asking
+ * whether this runtime carried the identity while serving an earlier generation.
  */
 const aPeerRuntimeFromAnEarlierGenerationIsAmbiguous = {
   id: "a-peer-runtime-from-an-earlier-generation-is-ambiguous",
-  what: "a CEO runtime that served an earlier CEO generation has no exclusive identity",
+  what: "a CEO identity its runtime carried in an earlier CEO generation is not this generation's alone",
   file: "src/daemon/agentcpd.ts",
-  find: "                     WHERE role_key = ? AND binding_generation < ? AND session_id = ?)\n",
-  replace: "                     WHERE role_key = ? AND binding_generation < ? AND session_id = ? AND 0)\n",
+  find: "        identityUsedInAnEarlierCeoGeneration(cp, ceo.sessionId, channelIdentity, ceo.bindingGeneration));\n",
+  replace: "        false);\n",
   killedBy: [
     "tests/unit/a-ceo-mention-is-a-peer-turn.test.ts::refuses the CEO's events when its runtime is bound again in a new CEO generation",
   ],

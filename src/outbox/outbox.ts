@@ -92,8 +92,9 @@ export interface HolderClaimResult {
   unresolved: UnresolvedOwnerMessage[];
   /**
    * `PENDING` rows this holder is addressed by and may not be handed, because the caller's
-   * `admits` refused them (#1044). Metadata only, and nothing was written for them: the holder may
-   * reject one, by id, through `rejectForHolder`, which is the one write that retires it.
+   * `admits` refused them or their stored payload is not readable (#1044). Metadata only, and
+   * nothing was written for them: the holder may reject one, by id, through `rejectForHolder`,
+   * which is the one write that retires it.
    */
   withheld: UnresolvedOwnerMessage[];
   /**
@@ -579,10 +580,17 @@ export class Outbox {
           ORDER BY o.created_at, o.rowid`,
         tuple,
       );
-      const admitted = queued.filter((row) => admits(hydrate(row)));
-      const withheld = queued
-        .filter((row) => !admitted.includes(row))
-        .map(unresolvedOwnerMessage);
+      // Each row is read on its own, and a row whose payload cannot be read is withheld on its own
+      // (#1044): an unreadable later row must not cost the holder the readable message ahead of it,
+      // nor the report of an unresolved hand-over. Only reading is caught here — a failure inside
+      // `admits` is the caller's, and still propagates.
+      const admitted: RawOutbox[] = [];
+      const withheld: UnresolvedOwnerMessage[] = [];
+      for (const row of queued) {
+        const message = readableMessage(row);
+        if (message !== null && admits(message)) admitted.push(row);
+        else withheld.push(unresolvedOwnerMessage(row));
+      }
 
       // The block. An outstanding unknown outcome is exactly the state in which handing out more
       // work is wrong, so the holder is told what is unsettled and that work is waiting, and is
@@ -1388,6 +1396,15 @@ interface RawOutbox {
  * Projects a raw row onto the no-payload shape. `payload_json` is read off the row and simply
  * never copied — the destination type has no field for it.
  */
+/** The row as a message, or null when its stored payload is not readable JSON. */
+const readableMessage = (row: RawOutbox): OutboxMessage | null => {
+  try {
+    return hydrate(row);
+  } catch {
+    return null;
+  }
+};
+
 /**
  * `claimForHolder`'s default: hand over no `IDENTITY_BOUND_KINDS` row (#1044). A peer message is
  * handed over only to a caller that supplies the predicate proving its proof still current.

@@ -123,13 +123,16 @@ export interface BuzzPeerCurrentCeo {
   readonly generationStartedAt: string;
   /**
    * Whether that identity is anything but this generation's alone (#1044): another session row —
-   * of any lifecycle — carries it, or this runtime served an earlier CEO generation. Either way
-   * an event signed with it may be an earlier holder's, and nothing in the event can say which,
-   * so every event signed with it is refused. A fresh identity per CEO generation is the remedy.
+   * of any lifecycle — carries it, or this runtime carried it while serving an earlier CEO
+   * generation. Either way an event signed with it may be an earlier holder's, and nothing in the
+   * event can say which, so every event signed with it is refused. A fresh identity per CEO
+   * generation is the remedy.
    *
-   * "Served an earlier generation" is read from what each generation recorded — the session its
-   * assignment was bound to, and the generation a runtime move onto this session was made in —
-   * never from timestamps, which tie when a move and the next binding share a clock reading.
+   * It is the identity's history, not the runtime's: a runtime that served an earlier generation
+   * with no identity and took this one only afterwards holds an identity no earlier generation used.
+   * The order of events is read from the audit record's `event_id` and the generation each binding
+   * record names — never from timestamps, which tie when a move and the next binding share a clock
+   * reading.
    */
   readonly channelIdentityReused: boolean;
 }
@@ -191,6 +194,8 @@ export interface AdmittedPeerSource {
   readonly proof: unknown;
   /** The inbound row's `actor`: the Buzz channel identity that signed the event. */
   readonly author: string;
+  /** The admitted payload's `conversation`: the room (`h` tag) the event arrived on. */
+  readonly conversation: unknown;
 }
 
 /**
@@ -199,8 +204,10 @@ export interface AdmittedPeerSource {
  *
  * Every identity the admission was decided on is asked again, against the registry as it stands
  * now: the CEO binding generation **and** its live runtime, that runtime's Buzz channel identity —
- * still the one that signed, still not reused — and exactly this receiving CTO. A CEO runtime move
- * keeps the generation, so the generation alone would hand a departed runtime's instruction over.
+ * still the one that signed, still not reused — exactly this receiving CTO, and that CTO's project
+ * channel, which must still be the room the event arrived on. A CEO runtime move keeps the
+ * generation, so the generation alone would hand a departed runtime's instruction over; a CTO whose
+ * channel changed is no longer the recipient admission found on that room.
  *
  * The CTO half is compared field by field with the holder rather than trusted from the outbox row:
  * a row's addressing columns are the outbox's, while the proof is what admission signed.
@@ -209,6 +216,8 @@ export const peerProofIsCurrent = (
   source: AdmittedPeerSource | undefined,
   ceo: BuzzPeerCurrentCeo | null,
   holder: { roleKey: string; bindingGeneration: number; targetSessionId: string },
+  /** The receiving CTO session's current `buzz_address`, or null. */
+  ctoChannel: string | null,
 ): boolean => {
   if (!source || !ceo || ceo.channelIdentityReused) return false;
   const stored = source.proof;
@@ -221,7 +230,9 @@ export const peerProofIsCurrent = (
     sameChannelIdentity(ceo.channelIdentity, source.author) &&
     proof["ctoRoleKey"] === holder.roleKey &&
     proof["ctoBindingGeneration"] === holder.bindingGeneration &&
-    proof["ctoSessionId"] === holder.targetSessionId
+    proof["ctoSessionId"] === holder.targetSessionId &&
+    ctoChannel !== null &&
+    source.conversation === ctoChannel
   );
 };
 
