@@ -3,7 +3,8 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny, fail, isAcpError } from "../core/errors.ts";
 import { newSessionId } from "../core/ids.ts";
-import { processStartedAt } from "../core/process-identity.ts";
+import { readProcessStartToken } from "../core/process-argv.ts";
+import { nativeStartIsInLstartSecond, processStartedAt } from "../core/process-identity.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
@@ -47,6 +48,19 @@ export interface SessionRecord {
  * weaker source of truth about who an actor is.
  */
 const NATIVE_START_PINNED = "SESSION_NATIVE_START_PINNED";
+
+/**
+ * The native token of a (native, lstart, native) snapshot when all three describe one process, or
+ * null. Equal native reads around the lstart read mean nothing replaced the process in between;
+ * the token's second matching the lstart's is the same fact checked once more against the text.
+ */
+const oneProcessStartToken = (before: string | null, startedAt: string | null, after: string | null): string | null => {
+  if (before === null) return null;
+  if (before !== after) return null;
+  if (startedAt === null) return null;
+  if (!nativeStartIsInLstartSecond(before, startedAt)) return null;
+  return before;
+};
 
 export interface BuzzActorAuthenticator {
   isAllowedActor(channel: string, actor: string): boolean;
@@ -308,6 +322,35 @@ export class SessionRegistry {
   pinNativeStart(sessionId: string, startToken: string): void {
     if (this.pinnedNativeStart(sessionId) !== null) return;
     this.audit.record({ kind: NATIVE_START_PINNED, sessionId, evidence: { startedAt: startToken } });
+  }
+
+  /**
+   * `create()` for a runtime the daemon has just started, with that runtime's native start pinned
+   * beside the lstart the row records (ACP1045-R2-01, R3-01).
+   *
+   * The two are read as one snapshot of one process: the native token, then the lstart, then the
+   * native token again. The token is pinned only when both native reads agree and the token falls
+   * in the lstart's second; the row records the lstart read between them, so the row and the pin
+   * name the same process. Reading the token after `create()` had recorded its own lstart, as the
+   * first version did, pinned whatever held the pid by then — a successor that took it in between
+   * became the incumbent the keep trusts indefinitely. When the reads disagree nothing is pinned,
+   * the row keeps the lstart that was read, and the keep decides it by the legacy lstart rule.
+   * The lstart is read from `ps` rather than rendered from the token: `probeSessionLiveness` and
+   * the dead-binding readers compare the column with `ps` output as a string, so a rendering that
+   * differed in any detail would have them call a live process dead.
+   *
+   * What this cannot see: a runtime that had already exited and lost its pid before the first read.
+   * Then every read describes the successor, consistently, as `create()` alone always has.
+   */
+  createWithPinnedStart(input: Omit<Parameters<SessionRegistry["create"]>[0], "osStartedAt">): CreatedSession {
+    const pid = input.osPid ?? null;
+    const before = pid === null ? null : readProcessStartToken(pid);
+    const startedAt = processStartedAt(pid);
+    const after = pid === null ? null : readProcessStartToken(pid);
+    const created = this.create({ ...input, osStartedAt: startedAt });
+    const token = oneProcessStartToken(before, startedAt, after);
+    if (token !== null) this.pinNativeStart(created.sessionId, token);
+    return created;
   }
 
   /**

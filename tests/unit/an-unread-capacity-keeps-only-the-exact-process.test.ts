@@ -5,11 +5,13 @@ import { ControlPlane } from "../../src/app/control-plane.ts";
 import type * as ProcessArgv from "../../src/core/process-argv.ts";
 import type * as ProcessIdentity from "../../src/core/process-identity.ts";
 import { ManualClock } from "../../src/core/clock.ts";
+import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { COVERAGE_REVOCATION_GRACE_MS, Daemon, recordedProcessIsRunning } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
-import { fixtureManifest } from "../helpers/harness.ts";
+import { fixtureManifest, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
 
 /**
  * Which process the keep for an unread provider may treat as the incumbent (ACP1045-R1-01, R2-01).
@@ -51,11 +53,20 @@ const ids = vi.hoisted(() => {
       ownStartSecond: 4_194_303,
       decisive: 4_194_304,
       laterSecondReuse: 4_194_305,
+      contradictoryPin: 4_194_306,
+      launchRace: 4_194_307,
+      provisionRace: 4_194_308,
     },
     /** The live native token each faked pid answers with; a test may change one mid-case. */
     native: new Map<number, string | null>(),
     /** The live `ps` lstart each faked pid answers with. */
     lstart: new Map<number, string | null>(),
+    /**
+     * A successor that takes the pid the moment its lstart has been read: the next native read
+     * answers with this token. That is the window ACP1045-R3-01 found, between the lstart a row
+     * records and the token pinned beside it.
+     */
+    successor: new Map<number, string>(),
   };
 });
 
@@ -72,8 +83,16 @@ vi.mock("../../src/core/process-identity.ts", async (importOriginal) => {
   const actual = await importOriginal<typeof ProcessIdentity>();
   return {
     ...actual,
-    processStartedAt: (pid: number | null | undefined) =>
-      typeof pid === "number" && ids.lstart.has(pid) ? ids.lstart.get(pid)! : actual.processStartedAt(pid),
+    processStartedAt: (pid: number | null | undefined) => {
+      if (typeof pid !== "number" || !ids.lstart.has(pid)) return actual.processStartedAt(pid);
+      const lstart = ids.lstart.get(pid)!;
+      const successor = ids.successor.get(pid);
+      if (successor !== undefined) {
+        ids.native.set(pid, successor);
+        ids.successor.delete(pid);
+      }
+      return lstart;
+    },
   };
 });
 
@@ -82,6 +101,7 @@ afterEach(() => {
   for (const cp of planes.splice(0)) cp.close();
   ids.native.clear();
   ids.lstart.clear();
+  ids.successor.clear();
   cleanupTempDirs();
 });
 
@@ -222,6 +242,133 @@ describe("the keep for an unread provider needs a decisive identity for the incu
     expect(fixture.session.osProcessStartedAt).toBeNull();
 
     const report = await fixture.daemon.reconcileContinuity("no reading, and no recorded start");
+
+    expect(report?.unresolved).toEqual(notKept(fixture.roleKey));
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toBeNull();
+  });
+});
+
+describe("ACP1045-R3-01: a pin names the process whose lstart its row records", () => {
+  /** [label, the launched process's token, the second it started in, the successor's token]. */
+  const races = [
+    ["a later second", `darwin-tv:${ids.earlierSecond}.000001`, ids.earlierSecond, `darwin-tv:${ids.rowSecond + 1}.000001`],
+    ["the same second", `darwin-tv:${ids.rowSecond}.050000`, ids.rowSecond, `darwin-tv:${ids.rowSecond}.900000`],
+  ] as const;
+
+  const raceOn = (pid: number, original: string, second: number, successor: string) => {
+    ids.native.set(pid, original);
+    ids.lstart.set(pid, ids.lstartOf(second));
+    ids.successor.set(pid, successor);
+  };
+
+  it.each(races)("does not pin a launched CTO whose pid a successor took in %s", async (_label, original, second, successor) => {
+    const pid = ids.pid.launchRace;
+    raceOn(pid, original, second, successor);
+    const harness = makeHarness();
+    const start = harness.scripted.startSession.bind(harness.scripted);
+    harness.scripted.startSession = async (spec) => ({ ...(await start(spec)), pid });
+    const { projectId } = await registerFixtureProject(harness);
+
+    const bound = await harness.cp.cto.ensurePrimaryCto(projectId, "a successor takes the pid mid-registration");
+    if (!bound.allowed) throw new Error(bound.message);
+
+    const session = harness.cp.sessions.require(bound.value.sessionId);
+    expect(session.osProcessStartedAt).toBe(ids.lstartOf(second));
+    // The premise: the successor holds the pid by the time anything could pin it.
+    expect(ids.native.get(pid)).toBe(successor);
+    expect(harness.cp.sessions.pinnedNativeStart(session.sessionId)).toBeNull();
+  });
+
+  it.each(races)("does not pin a provisioned session whose pid a successor took in %s", async (_label, original, second, successor) => {
+    const pid = ids.pid.provisionRace;
+    raceOn(pid, original, second, successor);
+    const root = tempDir("acp-provision-race-");
+    const clock = new ManualClock(ids.rowWritten);
+    class ProductionTestAdapter extends ScriptedAdapter {
+      override readonly isProduction = true;
+    }
+    const gpt = new ProductionTestAdapter(clock, "gpt");
+    const start = gpt.startSession.bind(gpt);
+    gpt.startSession = async (spec) => ({ ...(await start(spec)), pid });
+    const cp = new ControlPlane({
+      databasePath: join(root, "state.sqlite"),
+      worktreeRoot: join(root, "worktrees"),
+      capacityDir: join(root, "capacity"),
+      secretsDir: join(root, "secrets"),
+      clock,
+      adapters: [gpt],
+      capacity: { exhaustedPercent: 2 },
+      allowTestEvidenceWriters: true,
+    });
+    planes.push(cp);
+    const projectId = "provision-race";
+    const manifest = fixtureManifest(projectId);
+    const project = cp.projects.register({
+      projectId, name: "Provision race", manifest, authorization: cp.manifestAuthorizationForTests(manifest),
+    });
+    if (!project.allowed) throw new Error(project.message);
+    // An incumbent with no recorded process cannot be kept, so the pass fails it over to gpt.
+    const incumbent = cp.sessions.create({ provider: "claude", model: "opus" });
+    expect(cp.sessions.transition(incumbent.sessionId, SessionLifecycle.READY, "incumbent ready").allowed).toBe(true);
+    expect(cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId, sessionId: incumbent.sessionId }).allowed).toBe(true);
+    cp.continuity.attach({
+      readiness: { checkSession: async () => allow(ReasonCode.OK, undefined) },
+      buzz: { connect: async (sessionId) => allow(ReasonCode.OK, `buzz:${sessionId}`) },
+    });
+    const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+
+    const report = await new Daemon(cp, { stateDir: join(root, "daemon") }).reconcileContinuity("provision under a race");
+
+    expect(report?.reassigned).toHaveLength(1);
+    const provisioned = cp.sessions.require(cp.bindings.active(roleKey)!.sessionId);
+    expect(provisioned).toMatchObject({ provider: "gpt", osPid: pid, osProcessStartedAt: ids.lstartOf(second) });
+    expect(ids.native.get(pid)).toBe(successor);
+    expect(cp.sessions.pinnedNativeStart(provisioned.sessionId)).toBeNull();
+  });
+
+  it("pins the launched CTO's token when the process holds its pid through registration", async () => {
+    const pid = ids.pid.launchRace;
+    const token = `darwin-tv:${ids.earlierSecond}.000001`;
+    ids.native.set(pid, token);
+    ids.lstart.set(pid, ids.lstartOf(ids.earlierSecond));
+    const harness = makeHarness();
+    const start = harness.scripted.startSession.bind(harness.scripted);
+    harness.scripted.startSession = async (spec) => ({ ...(await start(spec)), pid });
+    const { projectId } = await registerFixtureProject(harness);
+
+    const bound = await harness.cp.cto.ensurePrimaryCto(projectId, "a stable process");
+    if (!bound.allowed) throw new Error(bound.message);
+
+    expect(harness.cp.sessions.pinnedNativeStart(bound.value.sessionId)).toBe(token);
+  });
+
+  it("does not pin a launched CTO when the lstart it reads names another second than its token", async () => {
+    // Both native reads agree, but the text does not describe that start: an lstart rendered in
+    // another zone reads this way. The row and a pin would then name different seconds.
+    const pid = ids.pid.launchRace;
+    ids.native.set(pid, `darwin-tv:${ids.earlierSecond}.000001`);
+    ids.lstart.set(pid, ids.lstartOf(ids.rowSecond + 1));
+    const harness = makeHarness();
+    const start = harness.scripted.startSession.bind(harness.scripted);
+    harness.scripted.startSession = async (spec) => ({ ...(await start(spec)), pid });
+    const { projectId } = await registerFixtureProject(harness);
+
+    const bound = await harness.cp.cto.ensurePrimaryCto(projectId, "a token outside the lstart's second");
+    if (!bound.allowed) throw new Error(bound.message);
+
+    expect(harness.cp.sessions.pinnedNativeStart(bound.value.sessionId)).toBeNull();
+  });
+
+  it("does not keep an lstart row whose pin contradicts its recorded second", async () => {
+    // A pin for a successor beside the original's lstart: what the first writer could leave.
+    const pid = ids.pid.contradictoryPin;
+    const successor = `darwin-tv:${ids.rowSecond + 1}.000001`;
+    ids.native.set(pid, successor);
+    ids.lstart.set(pid, ids.lstartOf(ids.rowSecond + 1));
+    const fixture = incumbentWithoutReading(pid, ids.lstartOf(ids.earlierSecond));
+    fixture.cp.sessions.pinNativeStart(fixture.session.sessionId, successor);
+
+    const report = await fixture.daemon.reconcileContinuity("no reading, and a pin for another process");
 
     expect(report?.unresolved).toEqual(notKept(fixture.roleKey));
     expect(fixture.cp.bindings.active(fixture.roleKey)).toBeNull();

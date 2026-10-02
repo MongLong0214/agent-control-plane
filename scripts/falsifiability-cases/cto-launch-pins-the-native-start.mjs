@@ -6,8 +6,8 @@ const ctoLaunchPinsTheNativeStart = {
   id: "cto-launch-pins-the-native-start",
   what: "a launched CTO session has its native start token pinned",
   file: "src/cto/cto-lifecycle.ts",
-  find: "    if (startToken !== null) this.sessions.pinNativeStart(session.sessionId, startToken);\n",
-  replace: "    void startToken;\n",
+  find: "    const session = this.sessions.createWithPinnedStart({\n",
+  replace: "    const session = this.sessions.create({\n",
   killedBy: [
     "tests/unit/cto-registry-r2.test.ts::ACP1045-R2-01 pins the launched CTO's native start beside the lstart it records",
   ],

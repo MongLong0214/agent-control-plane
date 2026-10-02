@@ -53,3 +53,18 @@ export const lstartSecondStartMs = (lstart: string): number | null => {
   ).getTime();
   return Number.isFinite(started) ? started : null;
 };
+
+/**
+ * Whether a native start token falls in the second an lstart text names (ACP1045-R3-01).
+ *
+ * Only a `darwin-tv` token carries epoch seconds; a `linux-clk` token counts ticks since boot and
+ * has no second to compare, so it is never in one. The lstart is read in the daemon's local time,
+ * as `lstartSecondStartMs` says.
+ */
+export const nativeStartIsInLstartSecond = (token: string, lstart: string): boolean => {
+  const second = lstartSecondStartMs(lstart);
+  if (second === null) return false;
+  const native = /^darwin-tv:(\d+)\.\d{6}$/.exec(token);
+  if (native === null) return false;
+  return Number(native[1]) * 1000 === second;
+};

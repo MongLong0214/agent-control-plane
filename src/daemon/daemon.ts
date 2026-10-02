@@ -15,7 +15,7 @@ import {
 } from "../continuity/continuity-kernel.ts";
 import { digestOf } from "../core/digest.ts";
 import { readProcessStartToken } from "../core/process-argv.ts";
-import { lstartSecondStartMs, processStartedAt } from "../core/process-identity.ts";
+import { lstartSecondStartMs, nativeStartIsInLstartSecond, processStartedAt } from "../core/process-identity.ts";
 import { acpError, type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
 import type { BuzzMentionCounters } from "../buzz/buzz-mention-subscriber.ts";
@@ -1902,9 +1902,9 @@ export class Daemon {
    * rather than this one, because the hold ends (r-364403fc103a). Decisive here means, in order:
    *
    *   (a) a row that recorded a native token: equal to the live token, or not this process;
-   *   (b) a row whose process has a pinned native token (`SessionRegistry.pinNativeStart`, written
-   *       by the CTO launch and continuity provisioning paths, and by (c) below): equal to it, or
-   *       not this process;
+   *   (b) a row whose process has a pinned native token (written by the CTO launch and continuity
+   *       provisioning paths through `SessionRegistry.createWithPinnedStart`, and by (c) below):
+   *       equal to it and in the recorded lstart second, or not this process;
    *   (c) a legacy row that recorded only `ps` lstart (ACP1045-R2-01): the live native start,
    *       truncated to the second, is the recorded lstart second, and the row was written after
    *       that second ended. The recorded process was alive when the row was written, so a process
@@ -1929,13 +1929,14 @@ export class Daemon {
     if (live === null) return false;
     if (session.osProcessStartedAt === live) return true;
     if (NATIVE_START_TOKEN.test(session.osProcessStartedAt)) return false;
+    // Every remaining branch needs the live process to have started in the recorded lstart second,
+    // a pinned one included: a pin that contradicts the row it sits beside names some other
+    // process, however it came to be written (ACP1045-R3-01).
+    if (!nativeStartIsInLstartSecond(live, session.osProcessStartedAt)) return false;
     const pinned = this.cp.sessions.pinnedNativeStart(session.sessionId);
     if (pinned !== null) return pinned === live;
     const recordedSecond = lstartSecondStartMs(session.osProcessStartedAt);
     if (recordedSecond === null) return false;
-    const liveSecond = /^darwin-tv:(\d+)\.\d{6}$/.exec(live);
-    if (liveSecond === null) return false;
-    if (Number(liveSecond[1]) * 1000 !== recordedSecond) return false;
     if (Date.parse(session.createdAt) < recordedSecond + 1000) return false;
     this.cp.sessions.pinNativeStart(session.sessionId, live);
     return true;
