@@ -123,6 +123,12 @@ const runMain = async (input: {
    * developer's own environment cannot register a project no case here asked for.
    */
   registerProjects?: readonly string[];
+  /** Projects whose primary CTO is bound to a dead session before `main` runs. */
+  deadCto?: readonly string[];
+  /** Every provider reports no routable quota. */
+  noCapacity?: boolean;
+  /** Has the runner print which of the claim and MCP sockets are bound, while the daemon is up. */
+  reportSockets?: boolean;
 }): Promise<MainResult> => {
   // macOS sockaddr_un paths are short; the repository's temp worktree path is long enough
   // to make the operator socket exceed that OS limit and would test the wrong failure.
@@ -151,6 +157,9 @@ const runMain = async (input: {
     ACP_OPERATOR_ACTOR: "startup-owner",
     ACP_STARTUP_TEST_ROOT: root,
     ACP_STARTUP_TEST_REGISTER_PROJECTS: (input.registerProjects ?? []).join(","),
+    ACP_STARTUP_TEST_DEAD_CTO: (input.deadCto ?? []).join(","),
+    ...(input.noCapacity ? { ACP_STARTUP_TEST_NO_CAPACITY: "1" } : {}),
+    ...(input.reportSockets ? { ACP_STARTUP_TEST_REPORT_SOCKETS: "1" } : {}),
     ...(input.seedState ? { ACP_STARTUP_TEST_SEED: "1" } : {}),
     ...(input.expectTelegram ? { ACP_STARTUP_TEST_EXPECT_TELEGRAM: "1" } : {}),
     ...(input.expectPromptFlow ? { ACP_STARTUP_TEST_EXPECT_PROMPT_FLOW: "1" } : {}),
@@ -569,6 +578,45 @@ describe("canonical self-claim activation is an atomic pre-effect daemon contrac
     expect(alone.stdout, aloneDiagnostics).toContain("canonical self-claim disabled");
     expect(alone.stdout, aloneDiagnostics).not.toContain("canonical self-claim listener started");
   }, 55_000);
+
+  /**
+   * Availability is not a precondition for connecting. Another project's CTO bound to a dead
+   * session, and no provider with a readable quota, used to put blocking findings in the startup
+   * report: `start()` parked or returned a denial, and `main` opens the claim socket and
+   * cto.mcp.sock only after `start()` returns, so neither was ever bound. The sockets are read
+   * from the filesystem while the daemon is up, and the start report must still read DEGRADED:
+   * the findings are reported, not turned into HEALTHY.
+   */
+  it("binds the claim socket and cto.mcp.sock while another project's CTO is dead and no quota is readable", async () => {
+    const result = await runMain({
+      seedState: true,
+      canonical: COMPLETE_CANONICAL_ENV,
+      registerProjects: [CANONICAL_PROJECT_ID],
+      deadCto: ["startup-test-other-project"],
+      noCapacity: true,
+      reportSockets: true,
+    });
+
+    const diagnostics = `status=${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
+    expect(result.status, diagnostics).toBe(0);
+    expect(result.stdout, diagnostics).toContain("canonical self-claim listener started");
+    expect(result.stdout, diagnostics).toContain(
+      `startup test sockets ${JSON.stringify({
+        mode: "NORMAL",
+        sockets: {
+          "agentcpd.claim-canonical-cto.sock": true,
+          "cto.mcp.sock": true,
+          "hermes.mcp.sock": true,
+        },
+      })}`,
+    );
+    expect(result.stdout, diagnostics).toContain('"doctorStatus": "DEGRADED"');
+    expect(result.stdout, diagnostics).toContain('"blockingFindings": []');
+    // The premise: both availability findings were in the startup report, neither blocking.
+    expect(result.stdout, diagnostics).toContain("CTO_BINDING_POINTS_AT_DEAD_SESSION/ERROR/nonblocking");
+    expect(result.stdout, diagnostics).toContain("ROLE_COVERAGE_NO_VALID_COVERAGE/ERROR/nonblocking");
+    expectNoResidue(result, diagnostics);
+  }, 40_000);
 });
 
 describe("#1005: an invalid adoptable set refuses startup, not the first claim", () => {

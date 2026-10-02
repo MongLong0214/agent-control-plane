@@ -247,10 +247,11 @@ const mainRunner = join(repositoryRoot, "tests/helpers/run-agentcpd-main.ts");
 
 /**
  * Starts the daemon as its own process through `tests/helpers/run-agentcpd-main.ts` with
- * `ACP_STARTUP_TEST_PARK=1`: every provider reports no routable capacity, so the startup doctor's
- * only blocking finding is one `start()` parks for rather than returning. That is a real startup
- * path — a host with no usable quota — and a check placed after `daemon.start()` returns is never
- * reached on it (review ACP1014-R1-01).
+ * `ACP_STARTUP_TEST_PARK=1`: a contradicted canonical turn is seeded, so the startup doctor's only
+ * blocking finding is one `start()` parks for rather than returning. That is a real startup path —
+ * a conversation in quarantine — and a check placed after `daemon.start()` returns is never
+ * reached on it (review ACP1014-R1-01). It used to be a host with no usable quota; capacity no
+ * longer blocks startup, so it no longer parks.
  *
  * The outcome is read from the process, not from anything it prints about itself: an exit is the
  * child's own exit, and a park is `health.json` saying `BOOTSTRAP`. A parked child is stopped with

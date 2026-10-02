@@ -2,7 +2,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import { join } from "node:path";
 
 import { ControlPlane } from "../../src/app/control-plane.ts";
-import { CAPACITY_SWEEP_BUDGET_MS } from "../../src/doctor/doctor.ts";
+import { aggregate, CAPACITY_SWEEP_BUDGET_MS } from "../../src/doctor/doctor.ts";
 import { ManualClock } from "../../src/core/clock.ts";
 import { Role } from "../../src/domain/types.ts";
 import type {
@@ -181,10 +181,12 @@ describe("the doctor measures the role before it scores it", () => {
   });
 
   /**
-   * And the direction that keeps the separation from becoming "never block on coverage": a
-   * deployment that *was* measured and has nothing routable still reports the blocking CRITICAL.
+   * A deployment that *was* measured and has nothing routable is still reported, by its own name,
+   * and the report still reads degraded. It no longer blocks: coverage is availability, and a
+   * blocking finding in the system report parks the daemon or ends it before its claim socket and
+   * cto.mcp.sock open. Routing refuses new work on the same plan without the doctor's help.
    */
-  it("still blocks when every candidate was measured and none is routable", async () => {
+  it("reports a measured deployment with nothing routable as degraded, without blocking", async () => {
     const { cp, clock, claude, gpt } = coldPlane();
     try {
       claude.setCapacity({ ...healthy("claude", clock), runtimeHealth: "UNAVAILABLE" });
@@ -195,7 +197,17 @@ describe("the doctor measures the role before it scores it", () => {
       const coverage = report.findings.find((finding) => finding.code.startsWith("ROLE_COVERAGE_"));
 
       expect(coverage?.code).toBe("ROLE_COVERAGE_NO_VALID_COVERAGE");
-      expect(coverage?.blocking).toBe(true);
+      expect(coverage).toMatchObject({ severity: "ERROR", blocking: false });
+      // On its own it reads DEGRADED, not HEALTHY. (This fixture has no GitHub credential, so the
+      // whole report is held BLOCKED by TRUSTED_GATE_CREDENTIAL_MISSING, which is not coverage.)
+      expect(aggregate([coverage!])).toBe("DEGRADED");
+      expect(report.findings.filter((finding) => finding.blocking).map((finding) => finding.code))
+        .not.toContain("ROLE_COVERAGE_NO_VALID_COVERAGE");
+      // Unknown is not turned into routable: the plan the router reads still refuses new work.
+      expect(cp.continuity.computeCoveragePlan()).toMatchObject({
+        outcome: "NO_VALID_COVERAGE",
+        action: "SURVIVAL",
+      });
     } finally {
       cp.db.close();
     }
@@ -240,9 +252,9 @@ describe("the doctor measures the role before it scores it", () => {
 
   /**
    * The other direction, so the fix cannot be "stop asking". A doctor that measured the role and
-   * found nothing routable must still block: this is the case the CRITICAL finding is *for*, and
-   * a repair that satisfied the first case by never reporting coverage would pass it while
-   * removing the only automatic signal that a deployment has no provider left.
+   * found nothing routable must still report it: this is the case the finding is *for*, and a
+   * repair that satisfied the first case by never reporting coverage would pass it while removing
+   * the only automatic signal that a deployment has no provider left.
    */
   it("still reports no coverage when the measured role capacity is unroutable", async () => {
     const { cp, clock, gpt, claude } = coldPlane();

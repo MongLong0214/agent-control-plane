@@ -1665,6 +1665,13 @@ export class Daemon {
           unresolved.push({ roleKey: required.roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
           continue;
         }
+        // The same rule when there is no reading at all. The guard above needs a snapshot to
+        // read, so a managed provider with none fell through to the coverage gap and, after its
+        // grace, to revocation or failover of a binding whose process was still running.
+        if (this.keepsIncumbentThroughUnreadCapacity(session, currentCapacity)) {
+          unresolved.push({ roleKey: required.roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
+          continue;
+        }
 
         if (!assignment?.provider) {
           unresolved.push({
@@ -1889,6 +1896,25 @@ export class Daemon {
    * `COVERAGE_REVOCATION_GRACE_MS` has passed since its `CONTINUITY_REVOCATION_HELD` row was written,
    * whichever comes first.
    */
+  /**
+   * Whether a READY incumbent keeps its binding although its provider has no capacity reading.
+   *
+   * Unknown capacity is neither exhaustion nor a dead runtime, and it says nothing about the
+   * bound process. Liveness is decided by the recorded pid and start token, the same exact-process
+   * test the coverage hold uses. The role stays unresolved (`CAPACITY_UNKNOWN_NOT_ROUTABLE`):
+   * unknown is not turned into routable, and new work is still refused by routing. Only the
+   * binding is kept. A session that is not READY, or whose process cannot be proven running,
+   * returns false and takes the revoke and failover paths exactly as before.
+   */
+  private keepsIncumbentThroughUnreadCapacity(
+    session: SessionRecord | null,
+    capacity: ProviderCapacity | null,
+  ): boolean {
+    if (capacity !== null) return false;
+    if (session?.lifecycle !== SessionLifecycle.READY) return false;
+    return recordedProcessIsRunning(session);
+  }
+
   private holdsThroughCoverageGap(
     roleKey: string,
     generation: number,

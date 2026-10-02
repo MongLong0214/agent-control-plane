@@ -42,7 +42,7 @@ afterEach(() => {
 });
 
 const makeIncumbent = (
-  providers: "claude" | "claude-and-gpt" | "none" = "claude",
+  providers: "claude" | "claude-and-gpt" | "gpt" | "none" = "claude",
   identity?: { pid: number; token?: string },
   startAt = "2026-09-08T00:00:00.000Z",
 ) => {
@@ -56,7 +56,9 @@ const makeIncumbent = (
     capacityDir: join(root, "capacity"),
     secretsDir: join(root, "secrets"),
     clock,
-    adapters: providers === "none" ? [] : providers === "claude-and-gpt" ? [claude, gpt] : [claude],
+    adapters: providers === "none"
+      ? []
+      : providers === "claude-and-gpt" ? [claude, gpt] : providers === "gpt" ? [gpt] : [claude],
     capacity: { exhaustedPercent: 2 },
     allowTestEvidenceWriters: true,
   });
@@ -1251,5 +1253,97 @@ describe("#954: which running process a coverage hold may treat as the incumbent
   it("refuses a process that began after its row", () => {
     const token = "darwin-tv:1790779830.124000";
     expect(recordedProcessIsRunning(record, reads([token, token]))).toBe(false);
+  });
+});
+
+/**
+ * Capacity unknown is not evidence against the incumbent, with no reading at all either.
+ *
+ * The #811 guard reads a snapshot, so a provider capacity manages and nothing has read yet
+ * (`current()` null) fell through it: into the coverage hold and, past its grace, revocation, or
+ * straight into failover when another provider could staff the role. Whether the bound process is
+ * still here was already answerable from its recorded pid and start token, and was not asked.
+ * These pin that it is asked, that unknown stays unknown (unresolved, not routable), and that an
+ * incumbent whose process is gone or whose session is no longer READY is handled as before.
+ */
+describe("a live incumbent is not revoked because its capacity is unknown", () => {
+  const liveToken = (): string => {
+    const token = readProcessStartToken(process.pid);
+    expect(token).toMatch(/^darwin-tv:\d+\.\d{6}$/);
+    return token!;
+  };
+  const kinds = (fixture: ReturnType<typeof makeIncumbent>, kind: string) =>
+    fixture.cp.db.all<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM audit_events WHERE kind = ? AND role_key = ?`,
+      [kind, fixture.roleKey],
+    )[0]?.n;
+
+  it("keeps a live incumbent whose provider has no reading, past the hold window", async () => {
+    const fixture = makeIncumbent("none", { pid: process.pid, token: liveToken() });
+    expect(fixture.cp.capacity.manages("claude")).toBe(true);
+    expect(fixture.cp.capacity.current("claude")).toBeNull();
+
+    const first = await fixture.daemon.reconcileContinuity("no reading for the incumbent's provider");
+    fixture.clock.advance(COVERAGE_REVOCATION_GRACE_MS + 1_000);
+    const later = await fixture.daemon.reconcileContinuity("still no reading, past the hold window");
+
+    for (const report of [first, later]) {
+      expect(report?.unresolved).toEqual([
+        { roleKey: fixture.roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE },
+      ]);
+      expect(report?.reassigned).toEqual([]);
+      expect(report?.pausedRuns).toEqual([]);
+    }
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toEqual(fixture.incumbent);
+    expect(kinds(fixture, "BINDING_REVOKED")).toBe(0);
+    expect(kinds(fixture, "CONTINUITY_REVOCATION_HELD")).toBe(0);
+    // Unknown stays unknown: keeping the binding did not invent a reading for the provider.
+    expect(fixture.cp.capacity.current("claude")).toBeNull();
+  });
+
+  it("does not fail a live incumbent over to a routable provider because its own reading is missing", async () => {
+    const fixture = makeIncumbent("gpt", { pid: process.pid, token: liveToken() });
+    // The route continuity staffs a role through, attached so that a failover could succeed and
+    // its absence below is the daemon's decision rather than the harness failing closed.
+    fixture.cp.continuity.attach({
+      readiness: { checkSession: async () => allow(ReasonCode.OK, undefined) },
+      buzz: { connect: async (sessionId) => allow(ReasonCode.OK, `buzz:${sessionId}`) },
+    });
+    expect(fixture.cp.capacity.current("claude")).toBeNull();
+
+    const report = await fixture.daemon.reconcileContinuity("no reading for the incumbent's provider");
+
+    // A target existed, so this is not a refusal for want of one.
+    expect(report?.plan.assignments.find((assignment) => assignment.roleKey === fixture.roleKey)?.provider)
+      .toBe("gpt");
+    expect(report?.reassigned).toEqual([]);
+    expect(report?.unresolved).toEqual([
+      { roleKey: fixture.roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE },
+    ]);
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toEqual(fixture.incumbent);
+    expect(fixture.cp.sessions.live()).toHaveLength(1);
+  });
+
+  it("still revokes at once an incumbent whose recorded process is gone", async () => {
+    const recorded = liveToken().replace(/^darwin-tv:(\d+)/, (_, seconds: string) =>
+      `darwin-tv:${Number(seconds) - 1}`);
+    const fixture = makeIncumbent("none", { pid: process.pid, token: recorded });
+
+    const report = await fixture.daemon.reconcileContinuity("no reading, and not the recorded process");
+
+    expect(report?.unresolved).toEqual([{ roleKey: fixture.roleKey, reasonCode: ReasonCode.COVERAGE_NONE }]);
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toBeNull();
+    expect(kinds(fixture, "CONTINUITY_REVOCATION_HELD")).toBe(0);
+  });
+
+  it("still revokes an incumbent whose session is no longer READY, though its process runs", async () => {
+    const fixture = makeIncumbent("none", { pid: process.pid, token: liveToken() });
+    const stopped = fixture.cp.sessions.transition(fixture.incumbent.sessionId, SessionLifecycle.STOPPED, "runtime exited");
+    if (!stopped.allowed) throw new Error(stopped.message);
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toEqual(fixture.incumbent);
+
+    await fixture.daemon.reconcileContinuity("no reading, session stopped");
+
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toBeNull();
   });
 });
