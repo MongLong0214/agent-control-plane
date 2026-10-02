@@ -126,29 +126,61 @@ writeFileSync(bodyOut, composed.split("\n").slice(2).join("\n"));
 //    exactly when you want to know the body is wrong — checking it last means a dry run against a
 //    pending PR reports the merge state and never looks at the message at all.
 if (pr.mergeable !== "MERGEABLE") fail(`#${number} is ${pr.mergeable}.`);
-if (pr.mergeStateStatus !== "CLEAN") fail(`#${number} merge state is ${pr.mergeStateStatus}, not CLEAN.`);
-// The rollup comes from the same `gh pr view` above, which is one GraphQL call. The first version
-// asked `gh run list` instead — a second call, against the REST actions endpoint, which returned
-// HTTP 403 rate-limited mid-session and took the script down with an unhandled exception. A check
-// that cannot look must say it could not look; a stack trace says neither that nor "green".
-const checks = pr.statusCheckRollup ?? [];
-if (checks.length === 0) fail(`no check reported on ${head.slice(0, 7)}. A green claim needs a run.`);
-const unfinished = checks.filter((c) => c.status !== undefined && c.status !== "COMPLETED");
-if (unfinished.length > 0) {
-  for (const c of unfinished) process.stdout.write(`  ${c.name ?? c.context}: ${c.status}\n`);
-  fail(`${unfinished.length} check(s) on ${head.slice(0, 7)} have not finished.`);
+// UNSTABLE is GitHub's "mergeable, and some check branch protection does not require is not green".
+// On this repository that has been a superseded run's leftovers: a run cancelled by a force-push,
+// or a job since deleted, kept reporting CANCELLED on the head after the required check passed,
+// and the only way through was pushing a new commit to change the head. The required check below
+// is the verdict; BLOCKED, BEHIND, DIRTY and the rest still refuse.
+if (pr.mergeStateStatus !== "CLEAN" && pr.mergeStateStatus !== "UNSTABLE") {
+  fail(`#${number} merge state is ${pr.mergeStateStatus}, not CLEAN or UNSTABLE.`);
 }
-const red = checks.filter((c) => {
-  const verdict = c.conclusion ?? c.state;
-  return verdict !== "SUCCESS" && verdict !== "SKIPPED" && verdict !== "NEUTRAL";
-});
-if (red.length > 0) {
-  for (const c of red) process.stdout.write(`  ${c.name ?? c.context}: ${c.conclusion ?? c.state}\n`);
-  fail(`${red.length} non-green check(s) on ${head.slice(0, 7)}.`);
+// The verdict is the aggregate `verify` job of the newest `project-ci` run on this exact head, at
+// that run's latest attempt — not whichever `verify` check the rollup happens to hold. Read from the
+// rollup, a previous run's green `verify` stood alone while a newer run was still in its matrix
+// (the aggregate job's check does not exist until the matrix finishes), and picking the latest
+// `completedAt` chose the job that finished last, so an older run finishing late outranked a newer
+// failure. Checks from other or superseded runs, including jobs since deleted, are not consulted.
+//
+// These are REST calls. The first version of this gate died on an HTTP 403 rate limit from
+// `gh run list` with an unhandled exception. A read that fails here is a refusal that says it could
+// not look; a stack trace said neither that nor "green".
+const WORKFLOW = "project-ci";
+const REQUIRED_CHECK = "verify";
+const short = head.slice(0, 7);
+const ghJson = (args, what) => {
+  try {
+    return JSON.parse(run("gh", args));
+  } catch (error) {
+    process.stdout.write(String(error.stdout ?? error.stderr ?? error.message ?? ""));
+    return fail(`could not read ${what} for ${short}. A check that cannot look reports that, not a verdict.`);
+  }
+};
+const runs = ghJson(
+  ["run", "list", "--commit", head, "--workflow", WORKFLOW, "--limit", "100", "--json", "databaseId,attempt,status,headSha"],
+  `the ${WORKFLOW} runs`,
+).filter((r) => r.headSha === head);
+if (runs.length === 0) fail(`no ${WORKFLOW} run on ${short}. A green claim needs a run.`);
+const current = runs.reduce((a, b) => (b.databaseId > a.databaseId ? b : a));
+const named = `${WORKFLOW} run ${current.databaseId} attempt ${current.attempt}`;
+if (current.status !== "completed") fail(`the newest ${named} on ${short} is ${current.status}, not completed.`);
+const { jobs } = ghJson(
+  ["run", "view", String(current.databaseId), "--attempt", String(current.attempt), "--json", "jobs"],
+  `the jobs of ${named}`,
+);
+const gate = (jobs ?? []).filter((j) => j.name === REQUIRED_CHECK);
+if (gate.length !== 1) fail(`${named} has ${gate.length} \`${REQUIRED_CHECK}\` job(s); exactly one is the verdict.`);
+if (gate[0].status !== "completed" || gate[0].conclusion !== "success") {
+  fail(`the \`${REQUIRED_CHECK}\` job of ${named} is ${gate[0].status}/${gate[0].conclusion || "none"}, not completed/success.`);
+}
+// A commit status named `verify` is not a job of any run, so the run above cannot speak for it.
+// GitHub keeps one state per status context, so the one in the rollup is current: anything but
+// SUCCESS, pending included, refuses.
+for (const status of (pr.statusCheckRollup ?? []).filter((c) => c.context === REQUIRED_CHECK)) {
+  if (status.state !== "SUCCESS") fail(`the \`${REQUIRED_CHECK}\` commit status on ${short} is ${status.state}.`);
 }
 
 process.stdout.write(
-  `\n  #${number} ${pr.title}\n  head ${head.slice(0, 7)} — ${checks.length} check(s), all green\n`,
+  `\n  #${number} ${pr.title}\n  head ${short} — \`${REQUIRED_CHECK}\` green in ${named}\n`,
 );
 
 if (dryRun) {

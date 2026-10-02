@@ -57,39 +57,31 @@ concurrency:
 
 jobs:
   # This job's id used to be `verify`, which is also the literal string branch protection
-  # requires (contexts: ["verify"]). Adding the matrix below made every check GitHub reports for
-  # this job get the matrix value appended — "verify (22.18.0)", "verify (22)" — and a check
-  # literally named `verify` stopped existing. Branch protection then waits for a check that can
-  # never appear, on every PR in the repository, not just this one. `name: verify` here keeps the
-  # per-leg checks reading the same as before ("verify (22.18.0)", "verify (22)"); `verify-gate`
-  # below is what now produces the bare `verify` check branch protection actually requires.
+  # requires (contexts: ["verify"]). Adding a matrix made every check GitHub reports for this job
+  # get the matrix value appended — "verify (22.23.2)" — and a check literally named `verify`
+  # stopped existing. Branch protection then waits for a check that can never appear, on every PR
+  # in the repository, not just this one. `name: verify` here keeps the per-leg check reading
+  # "verify (<node>)"; `verify-gate` below is what produces the bare `verify` check branch
+  # protection actually requires.
   verify-matrix:
     name: verify
     runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:
-        # `package.json` declares `"node": ">=22.18.0"`. `22` (bare) is a moving alias that
-        # resolves to whatever the newest 22.x is on the day the job runs — it can never fail at
-        # the declared range's actual edge, only at whatever is currently newest. `22.18.0` is
-        # that edge, pinned exactly rather than aliased.
+        # One leg, on the Node the daemon is deployed on. 22.23.2 is the version the peercred
+        # addon's provenance pins (ADR-0010) and the floor CommitLore's installer enforces, so the
+        # gate runs on the runtime that ships and `pnpm ci:commitlore` needs no Node of its own.
         #
-        # It was originally `22.0.0`, matching the range this repository had merely written down.
-        # That entry is what found the real floor: `22.0.0` failed `pnpm migrations:check` with
-        # `ERR_UNKNOWN_FILE_EXTENSION` for `.ts` — `scripts/verify-migrations-are-immutable.mjs`
-        # does `await import(".../src/db/migrations.ts")` directly, under plain `node`, with no
-        # transpiler. Unflagged native TypeScript execution shipped in Node 22.18.0 (2025-07-31);
-        # `22.17.1` still throws that exact error, checked empirically with `nvm`. So `>=22` was
-        # never true for this repository's own tooling — nothing had ever tested the edge before
-        # this entry existed, and it found the gap on its first real use, not the one it went
-        # looking for (ADR-0010).
+        # Ruled out: keeping the `22.18.0` (declared `engines.node` floor, ADR-0010) and `22`
+        # (moving alias) legs. Each ran every gate and the whole suite again on macOS for a runtime
+        # nothing deploys. The engines floor is therefore no longer exercised by CI.
         #
-        # `node-gyp`'s own range (ADR-0010: pinned to `11.5.0`, `^18.17.0 || >=20.5.0`) already
-        # covers `22.18.0` — moving the floor up did not require touching that pin again.
-        node-version: ["22.18.0", "22"]
+        # Still a matrix, of one element: the check names above, and `verify-gate`'s bare
+        # `verify`, stay exactly what branch protection already pins.
+        node-version: ["22.23.2"]
     permissions:
       contents: read
-      issues: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -101,22 +93,12 @@ jobs:
       - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
         with:
           version: 10
-      # A bootstrap Node, not the leg's. The CommitLore installer `pnpm ci:commitlore` runs refuses
-      # anything below 22.23.2 (`NODE_MAJOR_MIN`/`NODE_MINOR_MIN`/`NODE_PATCH_MIN` in its
-      # `install.sh`, enforced with a hard `die`), and this matrix's lower leg is 22.18.0 — so
-      # installing after the leg's own `setup-node` would fail that leg deterministically, on the
-      # exact version the leg exists to test. Raising `engines.node` to suit a tool is the wrong
-      # direction: 22.18.0 is this repository's declared floor, found empirically (ADR-0010).
-      #
-      # Installing under a Node of its own is safe because the wrapper the installer writes records
-      # that Node's *absolute path*, so changing the runtime underneath it afterwards does not
-      # break it. No `cache: pnpm`: nothing is installed under this Node, and a cache keyed to a
-      # Node no gate runs under is one the leg would have to discard.
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
-          node-version: 22.23.2
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
       # Dependency-free and first: the same working-tree check as pre-commit catches a workflow
-      # package-script mismatch or invalid Bash before install and the test matrix spend minutes.
+      # package-script mismatch or invalid Bash before install and the suite spend minutes.
       - run: pnpm ci:preflight
       # `pnpm trailers` spawns `commitlore` to judge a message carrying more than one record: SPEC
       # §2.4 recovers separate identified record paragraphs, and git's trailer parser, which reads
@@ -128,10 +110,6 @@ jobs:
       # lesson down — "so a resolution failure is reported as one rather than as 'cannot parse the
       # merge message'" — and nothing propagated it to the job that runs the gate.
       - run: pnpm ci:commitlore
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
-        with:
-          node-version: ${{ matrix.node-version }}
-          cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm rebuild better-sqlite3
       # ADR-0010: this repository's own binding.gyp + node-addon-api convention for native
@@ -150,10 +128,6 @@ jobs:
       # `::error::` annotation naming the one that failed, and a table of all of them to the run's
       # step summary — which is also the readback that this job ran the runner rather than a step
       # list of its own.
-      #
-      # `pnpm gates:ci-parity` (a gate inside the manifest) refuses any step added to this job that
-      # verifies something the manifest does not hold, in either direction. Adding `- run: pnpm
-      # <check>` below is a red build, not a quiet divergence.
       #
       # ACP_TRAILERS_RANGE is the one workflow-specific value the runner takes: which commits to
       # read is a property of the event GitHub is handling, not of the gate. Unset locally, where
@@ -194,9 +168,9 @@ jobs:
   # Branch protection requires the check named exactly `verify` (app_id 15368, GitHub Actions) —
   # confirmed against this repository's live protection settings, not assumed. `verify-matrix`
   # above cannot ever produce that name once it carries a matrix: GitHub always appends the
-  # matrix values to a matrixed job's check name, so its checks are "verify (22.18.0)" and
-  # "verify (22)", never bare "verify". This job carries no matrix, so its own check name is
-  # exactly its `name:` — `verify` — with nothing appended. It is what makes the required check
+  # matrix values to a matrixed job's check name, so its check is "verify (22.23.2)", never bare
+  # "verify". This job carries no matrix, so its own check name is exactly its `name:` —
+  # `verify` — with nothing appended. It is what makes the required check
   # exist again, without touching the required-check string itself.
   #
   # `if: always()` is load-bearing, not decoration. Without it, this job's default condition is
@@ -209,10 +183,8 @@ jobs:
   # pass or fail — never GitHub's default treatment of an unrun job.
   #
   # The check itself must read `== 'success'` (an allow-list), not `!= 'failure'` (a deny-list):
-  # `needs.<job>.result` can be `success`, `failure`, `cancelled`, or `skipped`. The matrix's own
-  # `fail-fast: false` means one leg failing does not cancel the other, while its aggregate result
-  # is still `failure` if any leg failed. An allow-list makes every other job fail closed on
-  # `cancelled` and `skipped` too, with no separate case needed.
+  # `needs.<job>.result` can be `success`, `failure`, `cancelled`, or `skipped`. An allow-list
+  # fails closed on `cancelled` and `skipped` too, with no separate case needed.
   verify-gate:
     name: verify
     needs: [verify-matrix]

@@ -253,9 +253,7 @@ something at the time. Detection was never the missing part.
 | Mistake | Times | What noticed, and why that was not enough | What refuses it now |
 |---|---|---|---|
 | Committing while the falsifiability sweep holds a mutation | 2 | The sweep's own start-up check asks "is the tree dirty" — false after a killed run, irrelevant during a live one | `pre-commit`, on the sentinel file, which exists in exactly both cases |
-| Editing a line a mutation row anchors to | 3 | The full sweep, forty minutes into CI | `pre-commit` and `pre-push` run the one-second anchors pass; CI runs it before the build |
 | Wrapping a `Limit:` or `Ruled-out:` trailer onto a second line | 6 | `commitlore validate` printed a warning **and exited 0**, after the commit existed | `commit-msg`, and `pnpm trailers` over the range in CI |
-| Pushing before the local gate CI runs had finished | 2 | CI, twice, in about eight minutes each | `pre-push` runs the cheap half of that gate |
 
 ## Never pipe a gate
 

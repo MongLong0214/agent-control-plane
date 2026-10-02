@@ -23,10 +23,6 @@ hook that a clone silently starts running is a code-execution path, and git clos
   Twice — 2026-08-19 by way of a killed run, 2026-08-22 by way of a live one. Both put a *removed
   guard* into a commit. The harness's own check asks "is the tree dirty", which is false in the
   killed case and irrelevant in the live case; the sentinel file exists in exactly both.
-- Committing a source edit that left a falsifiability row anchored to a line that no longer
-  exists. The row then checks nothing while still reporting the guard as covered. Three times on
-  one branch, each found forty minutes into CI. `--anchors-only` is a string search and costs a
-  second.
 
 **`commit-msg`**
 

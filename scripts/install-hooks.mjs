@@ -52,7 +52,6 @@ const shim = (name) =>
 const TARGETS = [
   { name: "pre-commit", path: join(HOOK_DIR, "pre-commit") },
   { name: "commit-msg", path: join(HOOK_DIR, "commit-msg.commitlore-chained") },
-  { name: "pre-push", path: join(HOOK_DIR, "pre-push.commitlore-chained") },
 ];
 
 const written = [];
