@@ -705,6 +705,30 @@ export class IngressGuard {
    * capability: it exposes no receipt and a missing, malformed, or historic claim cannot be
    * upgraded from the live binding on restart.
    */
+  /**
+   * Records that a handler in this process has started answering this message, until the returned
+   * `end` is called — when it finishes, however it finishes, and when it throws.
+   *
+   * Only a handler whose answer leaves without a durable reservation needs this. A Telegram answer
+   * is reserved through `recordResultIf` before it is sent, and that reservation is refused for a
+   * message the owner-reply outbox already owes; a Buzz answer is returned inline to the relay, so
+   * nothing durable stands between it and the owner, and the receipt side has to wait instead.
+   */
+  beginTurnHandler(channel: string, nonce: string): { end(): void } {
+    const key = handlerKey(channel, nonce);
+    const running = RUNNING_TURN_HANDLERS.get(this.db.identity) ?? new Set<string>();
+    RUNNING_TURN_HANDLERS.set(this.db.identity, running);
+    running.add(key);
+    let ended = false;
+    return {
+      end: () => {
+        if (ended) return;
+        ended = true;
+        running.delete(key);
+      },
+    };
+  }
+
   receiptIdentityForClaim(channel: string, nonce: string): ReceiptLookupQuery | null {
     const row = this.db.get<{ turn_claim_json: string | null }>(
       `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
@@ -2291,6 +2315,23 @@ const PROCESS_INCARNATION = `${process.pid}#${
  * readings and hope.
  */
 export const processIncarnationForClaims = (): string => PROCESS_INCARNATION;
+
+/**
+ * The turn handlers running in this process right now, by database file and `channel\u0000nonce`.
+ *
+ * In memory on purpose. The question it answers is "is code in this process about to hand this
+ * message an answer?", and only a live process can be asked it: a durable open claim says the
+ * outcome was never recorded, which is equally true of a handler still running and of one that
+ * finished with an apology or a timeout and left the claim open by design. Reading the second
+ * case as the first held matching receipts back indefinitely (#1041 review, R1041-04).
+ */
+const RUNNING_TURN_HANDLERS = new Map<string, Set<string>>();
+
+const handlerKey = (channel: string, nonce: string): string => `${channel}\u0000${nonce}`;
+
+/** Whether a handler registered through `beginTurnHandler` is running for this message now. */
+export const turnHandlerRunning = (db: Db, channel: string, nonce: string): boolean =>
+  RUNNING_TURN_HANDLERS.get(db.identity)?.has(handlerKey(channel, nonce)) ?? false;
 
 /**
  * Whether a stored claim was taken by a process that is not this one.

@@ -102,8 +102,12 @@ export interface EnqueueOwnerReplyInput {
   /** The turn's ingress messages in batch order. The reply answers the last one. */
   readonly sources: readonly OwnerReplySource[];
   readonly receipt: OwnerReplyReceipt;
-  /** This process's claim incarnation; a claim it still holds open may yet be answered live. */
-  readonly answeringProcess: string;
+  /**
+   * Whether a handler in this process is running for the message right now and may still hand its
+   * answer out. Supplied by the coordinator from the ingress guard's handler registry, which a
+   * handler enters when it starts and leaves when it finishes or throws (R1041-04).
+   */
+  readonly handlerRunning: (source: OwnerReplySource) => boolean;
 }
 
 /**
@@ -385,23 +389,6 @@ export const ownerReplyOwing = (db: Db, source: OwnerReplySource, exceptTurn: st
     [OWNER_REPLY_OUTBOX_CHANNEL, exceptTurn, source.channel, source.nonce],
   )?.nonce ?? null;
 
-/**
- * Whether a handler in this process still holds the message's ingress claim open — claimed by
- * `answeringProcess` and not yet resolved by any terminal fact. That handler may still produce and
- * deliver the answer, so an obligation created now could be the second reply (R1041-02, round 2).
- * A claim taken by another incarnation belongs to a process that is gone and can answer nothing.
- */
-const answerInFlight = (db: Db, source: OwnerReplySource, answeringProcess: string): boolean => {
-  const row = db.get<{ turn_claim_json: string | null }>(
-    `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
-    [source.channel, source.nonce],
-  );
-  const claim = recordOf(row?.turn_claim_json ?? null);
-  if (claim?.["claimedByProcess"] !== answeringProcess) return false;
-  if (claim["repliedAt"] !== undefined) return false;
-  if (claim["noReplyAt"] !== undefined) return false;
-  return claim["settledAt"] === undefined;
-};
 
 /** Answered through ingress, or already named by another turn's reply item. */
 const alreadyAnswered = (db: Db, source: OwnerReplySource, turnRequestId: string): boolean => {
@@ -489,7 +476,12 @@ export const enqueueOwnerReply = (
     return allow(ReasonCode.OK, { status: "REDELIVERED", item: stored });
   }
 
-  const inFlight = input.sources.find((source) => answerInFlight(db, source, input.answeringProcess));
+  // A handler that is running for one of these messages may still hand its own answer out, so an
+  // obligation created now could be the second reply (R1041-02, round 2). This asks the handler
+  // registry rather than inferring a running handler from an open claim, which was ruled out: a
+  // handler that finished with an apology or a timeout leaves its claim open on purpose and must
+  // not hold the receipt back (R1041-04).
+  const inFlight = input.sources.find((source) => input.handlerRunning(source));
   if (inFlight !== undefined) {
     return deny(
       ReasonCode.CONVERSATION_TURN_REPLY_IN_FLIGHT,

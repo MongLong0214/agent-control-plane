@@ -6,7 +6,7 @@ import { type Decision, acpError, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db, TurnMaterializationAuthority } from "../db/database.ts";
-import { processIncarnationForClaims } from "../ingress/ingress-guard.ts";
+import { turnHandlerRunning } from "../ingress/ingress-guard.ts";
 import {
   type IngressReceiptSettlement,
   REPLY_OUTBOX_SETTLEMENT,
@@ -1453,7 +1453,7 @@ export class ConversationTurnCoordinator {
             evidenceDigest: receipt.evidenceDigest,
             reasonCode: receipt.reasonCode,
           },
-          answeringProcess: processIncarnationForClaims(),
+          handlerRunning: (member) => turnHandlerRunning(this.db, member.channel, member.nonce),
         });
         if (!reply.allowed) return deny(reply.reasonCode, reply.message, reply.evidence);
         return settled;
@@ -1858,7 +1858,7 @@ export class ConversationTurnCoordinator {
           evidenceDigest: receipt.evidenceDigest,
           reasonCode: receipt.reasonCode,
         },
-        answeringProcess: processIncarnationForClaims(),
+        handlerRunning: (source) => turnHandlerRunning(this.db, source.channel, source.nonce),
       });
       if (!reply.allowed) return deny(reply.reasonCode, reply.message, reply.evidence);
       return observed;

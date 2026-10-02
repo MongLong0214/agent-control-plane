@@ -24,7 +24,20 @@ import {
 } from "../../src/conversation/turn-coordinator.ts";
 import { AuditLog } from "../../src/db/audit.ts";
 import { openDb } from "../../src/db/database.ts";
-import { IngressGuard, type TurnIdentity, processIncarnationForClaims } from "../../src/ingress/ingress-guard.ts";
+import {
+  IngressGuard,
+  type TurnIdentity,
+  ingressSignature,
+  processIncarnationForClaims,
+} from "../../src/ingress/ingress-guard.ts";
+import {
+  BuzzMessageIngress,
+  type BuzzMessageTurnPort,
+  type CeoTurnDelivery,
+  buzzMessageSigningRequest,
+  deliverBuzzMessage,
+} from "../../src/ingress/buzz-message.ts";
+import { allow, deny } from "../../src/core/errors.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -354,6 +367,63 @@ const ingressLane = (c: Fixture, actorId: string, nonce: string, turnRequestId: 
   return { guard, stored, reconcile, claim: () => claimOf(c, "telegram", nonce), result };
 };
 
+/**
+ * The production Buzz CEO path, `deliverBuzzMessage`, against this fixture's coordinator: a signed
+ * owner envelope is admitted and claimed, the canonical turn is materialized, and `deliverToCeo` is
+ * whatever the case supplies. That is the handler whose answer goes back to the relay inline.
+ */
+const BUZZ_SECRET = "buzz-fixture-secret";
+const BUZZ_OWNER = "buzz-owner-pubkey";
+const buzzHandler = (c: Fixture, actorId: string) => {
+  const guard = new IngressGuard(c.db, c.clock, c.audit, {
+    buzz: { allowedActors: [BUZZ_OWNER], secret: BUZZ_SECRET },
+  });
+  const ingress = new BuzzMessageIngress(guard, [BUZZ_OWNER], {
+    rolesFor: () => [],
+    journalUnbound: () => {
+      throw new Error("a CEO-addressed envelope resolves no mention");
+    },
+  });
+  const deliver = (eventId: string, deliverToCeo: () => Promise<CeoTurnDelivery>) => {
+    const message = {
+      actor: BUZZ_OWNER,
+      conversation: "buzz-ceo-room",
+      eventId,
+      addressedTo: "CEO",
+      mention: null,
+      text: `owner message ${eventId}`,
+    };
+    const port: BuzzMessageTurnPort = {
+      deliverToCeo,
+      bindingGeneration: () => 1,
+      atomically: (body) => c.db.tx(body),
+      activeRoleTarget: () => null,
+      enqueueOwnerMessage: () => deny(ReasonCode.CONFLICT, "no role route in this fixture"),
+      wakeRole: async () => allow(ReasonCode.OK, undefined),
+      materializeTurn: (input) => {
+        const claimed = c.coordinator.claim({
+          targetActorId: actorId,
+          prompt: input.prompt,
+          sources: [{ channel: input.channel, nonce: input.nonce, attempt: 1, payload: input.payload }],
+        });
+        return claimed.allowed ? allow(ReasonCode.OK, undefined) : deny(claimed.reasonCode, claimed.message);
+      },
+    };
+    return deliverBuzzMessage(ingress, port, {
+      ...message,
+      signature: ingressSignature(BUZZ_SECRET, buzzMessageSigningRequest(message)),
+    });
+  };
+  return { guard, deliver };
+};
+
+/** The one canonical turn an actor holds, by actor. */
+const turnOf = (c: Fixture, actorId: string): string =>
+  c.db.get<{ turn_request_id: string }>(
+    `SELECT turn_request_id FROM canonical_turns WHERE target_actor_id = ?`,
+    [actorId],
+  )!.turn_request_id;
+
 describe("a COMPLETED receipt on the canonical ledger", () => {
   it("settles the turn and stores one owner reply addressed to the Telegram message it answers", async () => {
     const port = new FakeReceiptPort();
@@ -670,35 +740,99 @@ describe("a COMPLETED receipt on the canonical ledger", () => {
     expect(replyRows(c)).toBe(1);
   });
 
-  it("R1041-02 waits for a handler this process still holds open instead of queueing beside its answer", async () => {
+  it("R1041-02 waits for a Buzz handler that is still running instead of queueing beside its answer", async () => {
     const port = new FakeReceiptPort();
     const c = withCoordinator(port);
-    const actorId = target(c.db, "live");
-    // Claimed by this process: the router's handler for this message has not finished.
+    const actorId = target(c.db, "buzz-live");
+    const buzz = buzzHandler(c, actorId);
+    let duringHandler: { settled: number; unresolved: number } | null = null;
+
+    const delivered = await buzz.deliver("e-live", async () => {
+      // The receipt arrives while the CEO's answer is still on its way back to the relay.
+      const turn = turnOf(c, actorId);
+      port.answer(turn, receiptFor(c, turn, "COMPLETED"));
+      duringHandler = await c.coordinator.reconcileUnresolved();
+      return { answer: "the CEO's answer", reachedCeo: true, reasonCode: ReasonCode.OK };
+    });
+    expect(delivered).toMatchObject({ allowed: true, value: { answer: "the CEO's answer", answeredByCeo: true } });
+    expect(duringHandler).toMatchObject({ settled: 0, unresolved: 1 });
+
+    const after = await c.coordinator.reconcileUnresolved();
+
+    const turn = turnOf(c, actorId);
+    expect(after).toMatchObject({ settled: 1, unresolved: 0 });
+    expect(stateOf(c, turn)).toEqual({ lifecycle_state: "SETTLED", outcome_kind: "COMPLETED" });
+    expect(claimOf(c, "buzz", "buzz-message:e-live")).toHaveProperty("repliedAt");
+    expect(replyRows(c), "the relay's answer and a queued reply both stand").toBe(0);
+  });
+
+  /**
+   * R1041-04: a handler that has finished is not in flight, however it finished. The cases below
+   * leave the claim open by design and were held back indefinitely when an open claim taken by this
+   * process was read as a running handler.
+   */
+  it("R1041-04 settles a turn whose Telegram handler in this process finished with an apology", async () => {
+    const port = new FakeReceiptPort();
+    const c = withCoordinator(port);
+    const actorId = target(c.db, "apology-here");
     const turn = claimTurn(c, actorId, [{ ...telegramMessage("m1", "chat-9", 71), claimedBy: THIS_PROCESS }]);
-    port.answer(turn, receiptFor(c, turn, "COMPLETED"));
-
-    const first = await c.coordinator.reconcileUnresolved();
-    expect(first).toMatchObject({ settled: 0, unresolved: 1 });
-    expect(stateOf(c, turn)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
-
-    const router = new IngressGuard(c.db, c.clock, c.audit, {
+    const guard = new IngressGuard(c.db, c.clock, c.audit, {
       telegram: { allowedActors: ["owner"], allowedConversations: ["chat-9"] },
     });
-    const reply = { chatId: "chat-9", text: "the CEO's answer", replyToMessageId: 71, correlationId: "corr-m1" };
-    expect(router.recordResultIf("telegram", "m1", {
-      kind: "TELEGRAM_WORKFLOW", phase: "REPLIED", reply, sent: false, deliveryStatus: "PENDING", turnAnswered: true,
+    const apology = { chatId: "chat-9", text: "the CEO could not be reached", replyToMessageId: 71, correlationId: "corr-m1" };
+    expect(guard.recordResultIf("telegram", "m1", {
+      kind: "TELEGRAM_WORKFLOW", phase: "REPLIED", reply: apology, sent: false, deliveryStatus: "PENDING", turnAnswered: false,
     }, "AVAILABLE").allowed).toBe(true);
-    expect(router.completeReplyAndResolveTurn("telegram", "m1", {
-      kind: "TELEGRAM_WORKFLOW", phase: "REPLIED", reply, sent: true, deliveryStatus: "APPLIED", turnAnswered: true,
-    }, "ANSWERED").allowed).toBe(true);
+    expect(guard.completeReplyAndResolveTurn("telegram", "m1", {
+      kind: "TELEGRAM_WORKFLOW", phase: "REPLIED", reply: apology, sent: true, deliveryStatus: "APPLIED", turnAnswered: false,
+    }, "UNANSWERED").allowed).toBe(true);
+    expect(claimOf(c, "telegram", "m1")).toMatchObject({ claimedByProcess: THIS_PROCESS });
+    port.answer(turn, receiptFor(c, turn, "COMPLETED"));
 
-    const second = await c.coordinator.reconcileUnresolved();
+    for (let sweep = 0; sweep < 3; sweep += 1) await c.coordinator.reconcileUnresolved();
 
-    expect(second).toMatchObject({ settled: 1, unresolved: 0 });
     expect(stateOf(c, turn)).toEqual({ lifecycle_state: "SETTLED", outcome_kind: "COMPLETED" });
-    expect(claimOf(c, "telegram", "m1")).toHaveProperty("repliedAt");
-    expect(replyRows(c), "the live answer and a queued reply both stand").toBe(0);
+    expect(replyRows(c), "the receipt's answer was never queued").toBe(1);
+  });
+
+  it("R1041-04 settles a turn whose Buzz handler finished on a timeout", async () => {
+    const port = new FakeReceiptPort();
+    const c = withCoordinator(port);
+    const actorId = target(c.db, "buzz-timeout");
+    const buzz = buzzHandler(c, actorId);
+
+    const delivered = await buzz.deliver("e-timeout", async () => ({
+      answer: "the CEO did not answer in time",
+      reachedCeo: true,
+      reasonCode: ReasonCode.CEO_CONVERSATION_TIMEOUT,
+    }));
+    expect(delivered).toMatchObject({ allowed: true, value: { answeredByCeo: false } });
+    expect(claimOf(c, "buzz", "buzz-message:e-timeout")).not.toHaveProperty("repliedAt");
+    const turn = turnOf(c, actorId);
+    port.answer(turn, receiptFor(c, turn, "COMPLETED"));
+
+    for (let sweep = 0; sweep < 3; sweep += 1) await c.coordinator.reconcileUnresolved();
+
+    expect(stateOf(c, turn)).toEqual({ lifecycle_state: "SETTLED", outcome_kind: "COMPLETED" });
+    expect(replyRows(c), "the receipt's answer was never queued").toBe(1);
+  });
+
+  it("R1041-04 settles a turn whose Buzz handler threw", async () => {
+    const port = new FakeReceiptPort();
+    const c = withCoordinator(port);
+    const actorId = target(c.db, "buzz-threw");
+    const buzz = buzzHandler(c, actorId);
+
+    await expect(buzz.deliver("e-threw", async () => {
+      throw new Error("the peer connection dropped");
+    })).rejects.toThrow(/the peer connection dropped/);
+    const turn = turnOf(c, actorId);
+    port.answer(turn, receiptFor(c, turn, "COMPLETED"));
+
+    for (let sweep = 0; sweep < 3; sweep += 1) await c.coordinator.reconcileUnresolved();
+
+    expect(stateOf(c, turn)).toEqual({ lifecycle_state: "SETTLED", outcome_kind: "COMPLETED" });
+    expect(replyRows(c), "the receipt's answer was never queued").toBe(1);
   });
 
   it("R1041-02 refuses to record a Buzz answer for a message a receipt already queued a reply for", async () => {
@@ -1050,7 +1184,7 @@ describe("the owner-reply lane", () => {
     targetActorId: "actor:x",
     sources: nonces.map((nonce) => ({ channel: "telegram", nonce })),
     receipt: { ...receipt, ...overrides },
-    answeringProcess: THIS_PROCESS,
+    handlerRunning: () => false,
   }));
 
   it("answers each owner message once: a redelivery is a no-op, a covered message owes nothing new, a partial overlap is refused", () => {
@@ -1080,7 +1214,7 @@ describe("the owner-reply lane", () => {
       targetActorId: "actor:x",
       sources: [{ channel: "telegram", nonce: "m1" }, { channel: "buzz", nonce: "buzz-message:e1" }],
       receipt,
-      answeringProcess: THIS_PROCESS,
+      handlerRunning: () => false,
     }));
 
     expect(enqueued).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONVERSATION_TURN_REPLY_UNADDRESSABLE });
@@ -1109,7 +1243,7 @@ describe("the owner-reply lane", () => {
       targetActorId: "actor:x",
       sources: [{ channel: "telegram", nonce: "m1" }],
       receipt,
-      answeringProcess: THIS_PROCESS,
+      handlerRunning: () => false,
     })).toThrow(/inside the transaction that settles its turn/);
     expect(replyRows(lane)).toBe(0);
   });
