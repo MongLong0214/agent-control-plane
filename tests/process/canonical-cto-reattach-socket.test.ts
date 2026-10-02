@@ -5,7 +5,7 @@ import { PassThrough } from "node:stream";
 
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
-import { ATTACH_EXIT, runAttachRelay } from "../../src/cli/attach-relay.ts";
+import { ATTACH_EXIT, runAttachRelay, runAttachRelayCommand } from "../../src/cli/attach-relay.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startLocalMcpListeners } from "../../src/daemon/agentcpd.ts";
 import {
@@ -91,7 +91,7 @@ const started = async () => {
   return { subject, listeners, claims, claimPath, reattachPath, ctoPath: listeners.socketPaths[1]! };
 };
 
-const relay = (paths: { claimPath: string; ctoPath: string; reattachPath: string }) => {
+const relay = (paths: { claimPath: string; ctoPath: string; reattachPath: string }, entry: "relay" | "command" = "relay") => {
   const stdin = new PassThrough();
   const stdout = new PassThrough();
   const stderr = new PassThrough();
@@ -111,16 +111,15 @@ const relay = (paths: { claimPath: string; ctoPath: string; reattachPath: string
   stderr.on("data", (chunk: Buffer) => {
     errText += chunk.toString("utf8");
   });
-  const exit = runAttachRelay(
-    {
-      claimSocketPath: paths.claimPath,
-      mcpSocketPath: paths.ctoPath,
-      reattachSocketPath: paths.reattachPath,
-      mcpToken: TOKEN,
-      claim: { claimedSessionUuid: CONVERSATION, projectId: PROJECT, expectedBindingGeneration: 2 },
-    },
-    { stdin, stdout, stderr },
-  );
+  const common = {
+    claimSocketPath: paths.claimPath,
+    mcpSocketPath: paths.ctoPath,
+    reattachSocketPath: paths.reattachPath,
+    claim: { claimedSessionUuid: CONVERSATION, projectId: PROJECT, expectedBindingGeneration: 2 },
+  };
+  const exit = entry === "command"
+    ? runAttachRelayCommand(common, { stdin, stdout, stderr })
+    : runAttachRelay({ ...common, mcpToken: TOKEN }, { stdin, stdout, stderr });
   let nextId = 1;
   return {
     exit,
@@ -138,6 +137,53 @@ const relay = (paths: { claimPath: string; ctoPath: string; reattachPath: string
       }),
   };
 };
+
+/**
+ * The CLI entry with no deployment credential to be had: no `ACP_MCP_TOKEN`, and no `security`
+ * binary on PATH, so the Keychain read fails before it reaches any Keychain.
+ */
+const withoutCredential = async <T>(run: () => Promise<T>): Promise<T> => {
+  const saved = { token: process.env["ACP_MCP_TOKEN"], path: process.env["PATH"] };
+  process.env["ACP_MCP_TOKEN"] = "";
+  process.env["PATH"] = "/nonexistent-acp-1037";
+  try {
+    return await run();
+  } finally {
+    if (saved.token === undefined) delete process.env["ACP_MCP_TOKEN"];
+    else process.env["ACP_MCP_TOKEN"] = saved.token;
+    process.env["PATH"] = saved.path;
+  }
+};
+
+describe("the CLI entry reattaches before it asks for the deployment credential (PR1046-R2)", () => {
+  it("reattaches a live claimant whose credential cannot be read", async () => {
+    const paths = await started();
+    await withoutCredential(async () => {
+      const r = relay(paths, "command");
+      const init = await r.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "claude-code", version: "1" } });
+      expect(init.error).toBeUndefined();
+      const listed = await r.request("tools/list", {});
+      expect(listed.result?.tools?.map((tool) => tool.name)).toContain("role_owner_message_claim");
+      r.stdin.end();
+      expect(await settles(r.exit)).toBe(ATTACH_EXIT.OK);
+      expect(r.err()).toBe("");
+    });
+    expect(paths.claims).toEqual([]);
+  });
+
+  it("asks for the credential only on the fallback, and claims nothing it could not then attach", async () => {
+    const paths = await started();
+    expect(paths.subject.h.cp.bindings.revoke(CTO, "revoked before the respawn").allowed).toBe(true);
+    await withoutCredential(async () => {
+      const r = relay(paths, "command");
+      const exited = await settles(r.exit);
+      if (exited === "did-not-settle") r.stdin.end();
+      expect(exited).toBe(ATTACH_EXIT.UNAVAILABLE);
+      expect(r.err()).toBe("attach: mcp token unavailable\n");
+    });
+    expect(paths.claims).toEqual([]);
+  });
+});
 
 describe("the canonical CTO relay reattaches before it would claim", () => {
   it("reattaches the live claimant to its own CTO tools without a claim, and again after a respawn", async () => {

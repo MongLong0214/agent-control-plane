@@ -343,16 +343,50 @@ export interface AttachRelayCommandOptions {
  * `runAttachRelay`, which still takes it explicitly so a test can drive the relay with a synthetic
  * one.
  */
-export const runAttachRelayCommand = (
+export const runAttachRelayCommand = async (
   options: AttachRelayCommandOptions,
   io: AttachRelayIo,
 ): Promise<number> => {
+  // The reattach is tokenless, so it is asked before the deployment credential is: a live
+  // claimant whose Keychain is locked or unreadable still reaches its own tools (review
+  // PR1046-R2). Resolving the token first was dropped rather than kept: it made the one door that
+  // needs no credential unreachable without one. The token is acquired only for the fallback,
+  // which presents it on `cto.mcp.sock`.
+  io.stdin.pause();
+  const reattached = await reattachFirst(options.reattachSocketPath, DEFAULT_CLAIM_TIMEOUT_MS, io);
+  if (reattached !== null) return reattached;
   const mcpToken = resolveMcpToken();
   if (mcpToken === null) {
     io.stderr.write("attach: mcp token unavailable\n");
-    return Promise.resolve(ATTACH_EXIT.UNAVAILABLE);
+    return ATTACH_EXIT.UNAVAILABLE;
   }
-  return runAttachRelay({ ...options, mcpToken }, io);
+  return runAttachRelay({ ...options, reattachSocketPath: undefined, mcpToken }, io);
+};
+
+/**
+ * Asks the reattach socket when there is one. Resolves to the relay's exit code when the reattach
+ * decided the attach — admitted and piped, or refused — and to null when the caller should claim:
+ * this process holds no binding, or there is no reattach socket to ask.
+ */
+const reattachFirst = async (
+  reattachSocketPath: string | undefined,
+  timeoutMs: number,
+  io: AttachRelayIo,
+): Promise<number | null> => {
+  if (reattachSocketPath === undefined) return null;
+  const reattached = await attemptReattach(reattachSocketPath, timeoutMs);
+  if (reattached.kind === "admitted") {
+    return pipeStdioToSocket(reattached.socket, io, { handshake: () => undefined });
+  }
+  if (reattached.kind === "refused") {
+    io.stderr.write(`attach: reattach refused ${reattached.reasonCode}\n`);
+    return ATTACH_EXIT.HANDSHAKE_REFUSED;
+  }
+  if (reattached.kind === "malformed") {
+    io.stderr.write("attach: reattach reply malformed\n");
+    return ATTACH_EXIT.PROTOCOL;
+  }
+  return null;
 };
 
 export const runAttachRelay = async (
@@ -362,24 +396,13 @@ export const runAttachRelay = async (
   // Nothing of Claude Code's moves until the handshake newline is on the wire.
   io.stdin.pause();
 
-  if (options.reattachSocketPath !== undefined) {
-    const reattached = await attemptReattach(
-      options.reattachSocketPath,
-      options.claimTimeoutMs ?? DEFAULT_CLAIM_TIMEOUT_MS,
-    );
-    if (reattached.kind === "admitted") {
-      return pipeStdioToSocket(reattached.socket, io, { handshake: () => undefined });
-    }
-    if (reattached.kind === "refused") {
-      io.stderr.write(`attach: reattach refused ${reattached.reasonCode}\n`);
-      return ATTACH_EXIT.HANDSHAKE_REFUSED;
-    }
-    if (reattached.kind === "malformed") {
-      io.stderr.write("attach: reattach reply malformed\n");
-      return ATTACH_EXIT.PROTOCOL;
-    }
-    // Unbound, or no reattach socket to ask: the claim decides, as it always has.
-  }
+  const reattached = await reattachFirst(
+    options.reattachSocketPath,
+    options.claimTimeoutMs ?? DEFAULT_CLAIM_TIMEOUT_MS,
+    io,
+  );
+  // Unbound, or no reattach socket to ask: the claim decides, as it always has.
+  if (reattached !== null) return reattached;
 
   const claimed = await performClaim(
     options.claimSocketPath,
