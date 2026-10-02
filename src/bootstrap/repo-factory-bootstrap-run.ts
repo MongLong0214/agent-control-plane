@@ -49,7 +49,7 @@ import { parseRepoFactoryResult, type RepoFactoryResult } from "./repo-factory-r
  * `REPO_FACTORY_GITHUB_WRITE_OPERATION`, whose parameter digest binds the owner, the visibility,
  * the approved PLAN artifact's digest and its `githubOperations`. A caller can carry the receipt;
  * it cannot mint one, because `assertApproval` re-reads the ingress admission it came from. The
- * receipt is consumed once for the run's current candidate and re-admitted from that durable
+ * receipt is consumed once for the candidate the CEO confirms and re-admitted from that durable
  * consumption on a retry, so a partial failure can resume without a second approval and the
  * approval cannot be carried to a different candidate.
  *
@@ -214,6 +214,11 @@ export interface RepoFactoryOwnerApproval {
 
 export interface ProduceAndActivateInput {
   runId: string;
+  /**
+   * The candidate the CEO's CONFIRM names. Its passing blind review is required before anything
+   * else this call does that matters, and the owner approval is consumed for it (RF1050-01).
+   */
+  candidateSnapshotDigest: string;
   ownerApproval: RepoFactoryOwnerApproval | null;
   approvedManifest: ProjectManifest;
   projectName: string;
@@ -224,7 +229,7 @@ export interface RepoFactoryBootstrapRunnerDeps {
   runs: Pick<RunEngine, "get" | "currentCandidate">;
   artifacts: Pick<ArtifactStore, "latest" | "list" | "put">;
   ownerAuthority: Pick<OwnerAuthorityPort, "assertConsumedApproval" | "consumeApproval">;
-  bootstrap: Pick<BootstrapActivation, "activate" | "readinessForFactoryResult">;
+  bootstrap: Pick<BootstrapActivation, "activate" | "readinessForFactoryResult" | "reviewForConfirmation">;
   /** The production composition passes `createGhCliGitHubWritePort()`; tests pass a double. */
   githubPort: GitHubWritePort;
   /** Each run produces under `<workRoot>/<runId>`. Null means this deployment never configured one. */
@@ -336,8 +341,12 @@ export class RepoFactoryBootstrapRunner {
    * newest recorded approval of this operation, so a later decline supersedes an earlier approval.
    * With none recorded it refuses as a missing approval, before any GitHub call. A recorded
    * receipt is still only a claim here; `admitApproval` re-reads the ingress admission behind it.
+   * `candidateSnapshotDigest` is the CONFIRM's own candidate, carried through unchanged.
    */
-  async produceAndActivateApproved(runId: string): Promise<Decision<ACPBootstrapActivationResult>> {
+  async produceAndActivateApproved(
+    runId: string,
+    candidateSnapshotDigest: string,
+  ): Promise<Decision<ACPBootstrapActivationResult>> {
     const missing = (message: string): Decision<ACPBootstrapActivationResult> =>
       deny(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, message, { stage: "approval", refusal: "APPROVAL_MISSING", runId });
     const newest = this.deps.artifacts
@@ -358,6 +367,7 @@ export class RepoFactoryBootstrapRunner {
     if (!manifest.allowed) return missing("the owner approval recorded for this run carries no usable manifest");
     return this.produceAndActivate({
       runId,
+      candidateSnapshotDigest,
       ownerApproval: { owner: recorded.data.owner, visibility: recorded.data.visibility, receipt: recorded.data.receipt },
       approvedManifest: manifest.value,
       projectName: recorded.data.projectName,
@@ -384,6 +394,11 @@ export class RepoFactoryBootstrapRunner {
     }
     const ready = this.deps.bootstrap.readinessForFactoryResult(runId, input.handoff);
     if (!ready.allowed) return atStage(ready as Decision<ACPBootstrapActivationResult>, "precondition");
+    // RF1050-01 — the candidate the CEO confirms must carry a passing review now, before the
+    // approval is consumed or GitHub is written, not only at finalization, which cannot undo a
+    // write. The check is finalization's own `reviewForConfirmation` rather than a copy of it.
+    const reviewed = this.deps.bootstrap.reviewForConfirmation(runId, input.candidateSnapshotDigest);
+    if (!reviewed.allowed) return atStage(reviewed as Decision<ACPBootstrapActivationResult>, "precondition");
 
     const planArtifact = this.deps.artifacts.latest<unknown>(runId, ArtifactKind.PLAN);
     const approvedPlan = approvedPlanSchema.safeParse(planArtifact?.content);
@@ -547,7 +562,7 @@ export class RepoFactoryBootstrapRunner {
     // Every call is authorised before anything else it does: the approval is admitted through
     // ingress and consumed, or re-admitted from that durable consumption on a later call
     // (PR #1043 review round 3, RF1043-08 — the previous head activated a stored result first).
-    const approval = this.admitApproval(runId, input.ownerApproval.receipt, {
+    const approval = this.admitApproval(runId, input.candidateSnapshotDigest, input.ownerApproval.receipt, {
       owner: authority.owner,
       visibility: authority.visibility,
       planDigest: planArtifact.digest,
@@ -584,12 +599,13 @@ export class RepoFactoryBootstrapRunner {
 
   /**
    * The owner's receipt must name this run, this operation and exactly these parameters, and
-   * approve them. It is consumed once for the run's current candidate; a retry for the same
+   * approve them. It is consumed once for the candidate the CEO confirms; a retry for the same
    * candidate is re-admitted from that durable consumption rather than from the ingress replay
-   * cache, which expires.
+   * cache, which expires, and a CONFIRM naming another candidate is refused.
    */
   private admitApproval(
     runId: string,
+    candidateSnapshotDigest: string,
     presented: unknown,
     parameters: Parameters<typeof repoFactoryGitHubWriteParameters>[0],
   ): Decision<void> {
@@ -618,13 +634,13 @@ export class RepoFactoryBootstrapRunner {
     }
     if (!receipt.approved) return refuse("APPROVAL_DECLINED", "the owner declined this GitHub write");
 
-    // Bound to the run's current candidate when it has one, as every other owner decision is; a
-    // bootstrap run whose candidate was never promoted consumes it as a non-candidate operation.
-    // `assertApproval` (inside `consumeApproval`) already refuses a receipt minted for any other.
-    const candidate = this.deps.runs.currentCandidate(runId);
-    const retained = this.deps.ownerAuthority.assertConsumedApproval(receipt, candidate);
+    // Consumed for the candidate the CEO confirms rather than the run's candidate pointer, which
+    // an unpromoted bootstrap leaves null and which would let one approval serve two confirmations.
+    // `assertApproval` (inside `consumeApproval`) still refuses a receipt minted while the run's
+    // pointer named a different candidate.
+    const retained = this.deps.ownerAuthority.assertConsumedApproval(receipt, candidateSnapshotDigest);
     if (retained.allowed) return retained;
-    return this.deps.ownerAuthority.consumeApproval(receipt, candidate);
+    return this.deps.ownerAuthority.consumeApproval(receipt, candidateSnapshotDigest);
   }
 
   private async activate(

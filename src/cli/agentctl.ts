@@ -34,9 +34,13 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl owner approve <runId> <item>   record an owner decision for a human gate
   agentctl approve repo-factory-github-write <runId> --github-owner <login> --visibility <public|private>
           --plan-digest <digest> --manifest <project.json> --project-name <name>
+          [--decline] [--decision-key <key>]
                                            approve, as the owner, the GitHub writes in a
                                            PROJECT_BOOTSTRAP run's current PLAN (see run show);
-                                           nothing is written until the CEO confirms the run
+                                           nothing is written until the CEO confirms the run.
+                                           --decline records a refusal instead. Each command is
+                                           a new decision under a fresh key, printed on stderr;
+                                           retry a lost answer with --decision-key <that key>
   agentctl github merge ...             refused: agentcpd owns CEO-approved finalization
   agentctl github post-merge ...        refused: agentcpd owns exact post-merge verification
   agentctl repair list                    show the repair operation allowlist
@@ -101,7 +105,6 @@ const OPERATOR_MUTATION_METHOD_NAMES = new Set([
   "run.cancel",
   "outbox.retry",
   "owner.approve",
-  "repoFactory.githubWrite.approve",
   "repair.dry-run",
   "repair.execute",
   "capacity.observe",
@@ -119,6 +122,7 @@ const REPO_FACTORY_APPROVAL_OPTIONS: ReadonlySet<string> = new Set([
   "--plan-digest",
   "--manifest",
   "--project-name",
+  "--decision-key",
 ]);
 
 /** Creates a daemon-only operator client. It never opens SQLite or constructs a service. */
@@ -432,7 +436,8 @@ export const dispatch = async (
   if (command === "approve") {
     if (args[0] !== "repo-factory-github-write") return fail(`unknown approve subcommand: ${args[0] ?? ""}`);
     const runId = required(args[1], "runId");
-    const pairs = args.slice(2);
+    const declined = args.slice(2).includes("--decline");
+    const pairs = args.slice(2).filter((arg) => arg !== "--decline");
     if (pairs.length % 2 !== 0) return fail("approve repo-factory-github-write options must be option/value pairs");
     const options = new Map<string, string>();
     for (let index = 0; index < pairs.length; index += 2) {
@@ -452,15 +457,24 @@ export const dispatch = async (
     } catch {
       return fail("--manifest must name a readable JSON file");
     }
-    return call("repoFactory.githubWrite.approve", {
-      runId,
-      owner: required(options.get("--github-owner"), "--github-owner"),
-      visibility: required(options.get("--visibility"), "--visibility"),
-      planDigest: required(options.get("--plan-digest"), "--plan-digest"),
-      manifest,
-      projectName: required(options.get("--project-name"), "--project-name"),
-      approved: true,
-    });
+    // RF1050-02 — the key names this decision rather than its parameters: a key derived from them made
+    // an approval after a decline a cached replay of the first approval. A new command is a new
+    // decision; only an explicit --decision-key repeats one, which is how a lost answer is retried.
+    const decisionKey = options.get("--decision-key") ?? `repo-factory-github-write:${randomUUID()}`;
+    process.stderr.write(`decision key: ${decisionKey}\n`);
+    return call(
+      "repoFactory.githubWrite.approve",
+      {
+        runId,
+        owner: required(options.get("--github-owner"), "--github-owner"),
+        visibility: required(options.get("--visibility"), "--visibility"),
+        planDigest: required(options.get("--plan-digest"), "--plan-digest"),
+        manifest,
+        projectName: required(options.get("--project-name"), "--project-name"),
+        approved: !declined,
+      },
+      decisionKey,
+    );
   }
 
   if (command === "owner") {

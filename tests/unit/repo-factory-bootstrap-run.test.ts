@@ -260,6 +260,8 @@ const prepare = async (
   });
   const input: ProduceAndActivateInput = {
     runId,
+    // The candidate the CEO confirms: the one the blind review above passed.
+    candidateSnapshotDigest: snapshotDigest,
     ownerApproval: null,
     approvedManifest: manifest,
     projectName: projectId,

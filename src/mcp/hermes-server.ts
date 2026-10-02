@@ -128,7 +128,10 @@ export const createHermesMcpPort = (
       if (input.decision === "CONFIRM" && source.runs.get(input.runId)?.kind === RunKind.PROJECT_BOOTSTRAP) {
         const admissible = source.ceo.assertCeoDecisionAdmissible(input);
         if (!admissible.allowed) return admissible as Decision<{ state: RunState }>;
-        const produced = await source.bootstrapProducer.produceAndActivateApproved(input.runId);
+        const produced = await source.bootstrapProducer.produceAndActivateApproved(
+          input.runId,
+          input.candidateSnapshotDigest,
+        );
         if (!produced.allowed) return produced as Decision<{ state: RunState }>;
       }
       const decision = source.ceo.submitCeoDecision(input);

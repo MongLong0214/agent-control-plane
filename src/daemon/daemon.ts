@@ -1111,6 +1111,12 @@ export class Daemon {
     if (!isPlainRecord(manifest)) return invalidOperatorParam("manifest", manifest);
     const approved = request.params["approved"] ?? true;
     if (typeof approved !== "boolean") return invalidOperatorParam("approved", approved);
+    // The idempotency key names this owner decision (RF1050-02). A retry of the same decision
+    // repeats it and is answered from the operator cache; a new decision with the same
+    // parameters — an approval after a decline — carries a new one. A key derived from the
+    // parameters could not tell the two apart, so none is derived: a request without one is refused.
+    const decisionKey = request.idempotencyKey;
+    if (decisionKey === undefined) return invalidOperatorParam("idempotencyKey", decisionKey);
 
     const binding = this.cp.bootstrapProducer.approvalBinding(runId.value, {
       owner: owner.value,
@@ -1124,15 +1130,7 @@ export class Daemon {
       candidateSnapshotDigest: binding.value.candidateSnapshotDigest,
       operation: REPO_FACTORY_GITHUB_WRITE_OPERATION,
       parameters: binding.value.parameters,
-      idempotencyKey:
-        request.idempotencyKey ??
-        `repo-factory-github-write:${digestOf({
-          runId: runId.value,
-          parameters: binding.value.parameters,
-          approved,
-          peerId: peer.peerId,
-          incarnation: peer.incarnation,
-        })}`,
+      idempotencyKey: decisionKey,
       approved,
     };
     const admitted = this.admitCliOwnerApproval(

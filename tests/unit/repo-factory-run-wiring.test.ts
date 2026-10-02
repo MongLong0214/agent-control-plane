@@ -14,6 +14,7 @@ import { allow } from "../../src/core/errors.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { manifestDigest, type ProjectManifest } from "../../src/contracts/manifest.ts";
+import { startOperatorSocket } from "../../src/daemon/agentcpd.ts";
 import { Daemon, OPERATOR_METHOD, type AuthenticatedOperatorPeer } from "../../src/daemon/daemon.ts";
 import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
@@ -26,6 +27,7 @@ import {
 import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github-write-port.ts";
 import {
+  TEST_MCP_TOKEN,
   TEST_OPERATOR_TOKEN,
   TEST_OWNER,
   bindCeo,
@@ -329,14 +331,14 @@ const hermesServer = (harness: Harness) =>
 const ceoDecision = async (
   wired: Pick<Wired, "harness" | "runId" | "snapshotDigest" | "ceoSessionId">,
   key: string,
-  overrides: { decision?: string; ceoSessionId?: string } = {},
+  overrides: { decision?: string; ceoSessionId?: string; candidateSnapshotDigest?: string } = {},
 ): Promise<Record<string, unknown>> => {
   await wired.harness.cp.continuity.evaluate("bootstrap confirmation");
   const result = await registeredTools(hermesServer(wired.harness))["ceo_decision_submit"]!.handler({
     idempotencyKey: key,
     runId: wired.runId,
     decision: overrides.decision ?? "CONFIRM",
-    candidateSnapshotDigest: wired.snapshotDigest,
+    candidateSnapshotDigest: overrides.candidateSnapshotDigest ?? wired.snapshotDigest,
     ceoSessionId: overrides.ceoSessionId ?? wired.ceoSessionId,
     rationale: "issue #246 wiring",
   });
@@ -725,6 +727,130 @@ describe("#246 production defaults: the work root and an executable plan_submit"
     expect(rejected.isError).toBe(true);
     expect(rejected.text).toContain("Input validation error");
     expect(malformed.harness.cp.artifacts.list(malformed.runId, "PLAN")).toHaveLength(before);
+  });
+});
+
+/**
+ * PR #1050 review witnesses. Each fails against 08e05ade, the reviewed head, and is kept as that
+ * finding's regression guard.
+ */
+describe("PR #1050 review witnesses", () => {
+  const unreviewed = digestOf({ candidate: "never reviewed" });
+
+  it("RF1050-01: a CONFIRM naming a candidate with no passing review consumes nothing and writes nothing (unpromoted run)", async () => {
+    const wired = await wire("rf1050-01-unpromoted");
+    expect(wired.harness.cp.runs.currentCandidate(wired.runId)).toBeNull();
+    const approved = await approve(wired);
+    if (!approved.allowed) throw new Error(`${approved.reasonCode}: ${approved.message}`);
+
+    const refused = await ceoDecision(wired, "rf1050-01-unreviewed", { candidateSnapshotDigest: unreviewed });
+    expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+    expect(refused["evidence"]).toMatchObject({ stage: "precondition", candidateSnapshotDigest: unreviewed });
+    nothingWrittenOrConsumed(wired);
+
+    // The reviewed candidate is still confirmed: the first CONFIRM writes and waits on the handoff.
+    const reviewed = await ceoDecision(wired, "rf1050-01-reviewed");
+    expect(reviewed).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+    expect((reviewed["evidence"] as Record<string, unknown>)["stage"]).toBe("activation");
+    expect(wired.github.writes.map((write) => write.method)).toContain("createRepository");
+    expect(consumedApprovals(wired)).toBe(1);
+  });
+
+  it("RF1050-01: the same holds once the reviewed candidate is promoted", async () => {
+    const wired = await wire("rf1050-01-promoted");
+    wired.harness.cp.runs.promoteCandidate(wired.runId, wired.snapshotDigest);
+    const approved = await approve(wired);
+    if (!approved.allowed) throw new Error(`${approved.reasonCode}: ${approved.message}`);
+
+    const refused = await ceoDecision(wired, "rf1050-01p-unreviewed", { candidateSnapshotDigest: unreviewed });
+    expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+    nothingWrittenOrConsumed(wired);
+
+    const reviewed = await ceoDecision(wired, "rf1050-01p-reviewed");
+    expect((reviewed["evidence"] as Record<string, unknown>)["stage"]).toBe("activation");
+    expect(wired.github.writes.map((write) => write.method)).toContain("createRepository");
+  });
+
+  /** The owner's CLI on the wired daemon's own operator socket, with the owner token. */
+  const ownerCli = async (wired: Wired) => {
+    const listener = await startOperatorSocket(
+      wired.daemon,
+      tempDir("acp-246-owner-sock-"),
+      { token: TEST_OPERATOR_TOKEN, peerId: `cli:${TEST_OWNER.actor}`, actor: TEST_OWNER.actor },
+      { mcpToken: TEST_MCP_TOKEN },
+    );
+    const manifestPath = join(tempDir("acp-246-owner-manifest-"), "project.json");
+    writeFileSync(manifestPath, JSON.stringify(wired.manifest));
+    const client = createOperatorClient({ socketPath: listener.socketPath, token: TEST_OPERATOR_TOKEN });
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    return {
+      run: (...extra: string[]) =>
+        dispatch(client, "approve", [
+          "repo-factory-github-write",
+          wired.runId,
+          "--github-owner",
+          "acme",
+          "--visibility",
+          "public",
+          "--plan-digest",
+          wired.planDigest,
+          "--manifest",
+          manifestPath,
+          "--project-name",
+          "fixture project",
+          ...extra,
+        ], false),
+      close: async () => {
+        stdout.mockRestore();
+        stderr.mockRestore();
+        await listener.close();
+      },
+    };
+  };
+
+  const newestDecision = (wired: Wired): unknown => {
+    const records = recordedApprovals(wired);
+    return (records.at(-1)?.content as { receipt?: { approved?: unknown } } | undefined)?.receipt?.approved;
+  };
+
+  it("RF1050-02: approve → decline → approve with the CLI's own keys leaves the approval newest, and the runner proceeds", async () => {
+    const wired = await wire("rf1050-02-reapprove");
+    const cli = await ownerCli(wired);
+    try {
+      expect(await cli.run()).toBe(0);
+      const declined = await approve(wired, { approved: false });
+      if (!declined.allowed) throw new Error(`${declined.reasonCode}: ${declined.message}`);
+      expect(newestDecision(wired)).toBe(false);
+      expect(await cli.run()).toBe(0);
+    } finally {
+      await cli.close();
+    }
+    expect(recordedApprovals(wired)).toHaveLength(3);
+    expect(newestDecision(wired)).toBe(true);
+
+    const first = await ceoDecision(wired, "rf1050-02-confirm");
+    expect(first).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+    expect((first["evidence"] as Record<string, unknown>)["stage"]).toBe("activation");
+    expect(wired.github.writes.map((write) => write.method)).toContain("createRepository");
+  });
+
+  it("RF1050-02: --decision-key retries one decision idempotently, and --decline records a refusal", async () => {
+    const wired = await wire("rf1050-02-retry");
+    const cli = await ownerCli(wired);
+    try {
+      expect(await cli.run("--decision-key", "owner-decision-1")).toBe(0);
+      expect(await cli.run("--decision-key", "owner-decision-1")).toBe(0);
+      expect(recordedApprovals(wired)).toHaveLength(1);
+      expect(await cli.run("--decline")).toBe(0);
+    } finally {
+      await cli.close();
+    }
+    expect(recordedApprovals(wired)).toHaveLength(2);
+    expect(newestDecision(wired)).toBe(false);
+    const refused = await ceoDecision(wired, "rf1050-02-declined");
+    expect(refused["evidence"]).toMatchObject({ stage: "approval", refusal: "APPROVAL_DECLINED" });
+    nothingWrittenOrConsumed(wired);
   });
 });
 
