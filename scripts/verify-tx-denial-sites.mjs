@@ -174,6 +174,9 @@ const EXPECTED_CONVERTED_SITES = [
   { file: "ingress/ingress-guard.ts", symbol: "acknowledgeTerminalTelegramReply", label: "acknowledgeTerminalTelegramReply", evidence: "direct" },
   { file: "outbox/outbox.ts", symbol: "completeForHolder", label: "Outbox.completeForHolder", evidence: "direct" },
   { file: "outbox/outbox.ts", symbol: "rejectForHolder", label: "Outbox.rejectForHolder", evidence: "direct" },
+  // #1036: the receipt observation and the settlement are written through `#observeVerified`, and
+  // the owner-reply half can refuse after them. The refusal has to take both back.
+  { file: "conversation/turn-coordinator.ts", symbol: "#settleFromReceipt", label: "ConversationTurnCoordinator.#settleFromReceipt", evidence: "helper:#observeVerified" },
 ];
 
 /**

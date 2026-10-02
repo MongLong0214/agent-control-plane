@@ -6,6 +6,18 @@ import { type Decision, acpError, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db, TurnMaterializationAuthority } from "../db/database.ts";
+import { turnHandlerRunning } from "../ingress/ingress-guard.ts";
+import {
+  type IngressReceiptSettlement,
+  REPLY_OUTBOX_SETTLEMENT,
+  type OwnerReplyAuthority,
+  claimOwnerReplyAuthority,
+  enqueueOwnerReply,
+  issueIngressReceiptSettlement,
+  withdrawIngressReceiptSettlement,
+} from "./owner-reply-outbox.ts";
+
+export type { IngressReceiptSettlement } from "./owner-reply-outbox.ts";
 
 /**
  * One inbound message a turn is being asked to answer.
@@ -373,6 +385,9 @@ export class ConversationTurnCoordinator {
    */
   readonly #receiptPort: ReceiptPort;
 
+  /** The right to create owner-reply obligations, claimed once per database (R1041-03). */
+  readonly #ownerReplies: OwnerReplyAuthority;
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
@@ -380,6 +395,7 @@ export class ConversationTurnCoordinator {
     receiptPort: ReceiptPort = NEVER_FOUND_RECEIPT_PORT,
   ) {
     this.#materialization = db.claimTurnMaterializationAuthority();
+    this.#ownerReplies = claimOwnerReplyAuthority(db);
     this.#receiptPort = receiptPort;
   }
 
@@ -1323,18 +1339,22 @@ export class ConversationTurnCoordinator {
   }
 
   async reconcileIngressReceipt(
+    /** The ingress row whose claim this receipt may settle. The settlement is bound to it. */
+    source: { readonly channel: string; readonly nonce: string },
     query: ReceiptLookupQuery,
     /**
-     * The event-specific completion remains with the ingress ledger. The receipt reaches this
-     * closure only after this coordinator's sealed port looked it up and every immutable field
-     * below matched; callers never receive a receipt-shaped public argument they could forge.
+     * The event-specific completion remains with the ingress ledger. The closure receives an
+     * `IngressReceiptSettlement`, never a plain receipt: it exists only after this coordinator's
+     * sealed port looked the receipt up and every immutable field below matched, and the guard
+     * refuses anything else (R1041-03).
+     *
+     * For `COMPLETED` the closure settles the claim and this method owes the reply: it enqueues
+     * the owner reply in the same transaction, then checks both halves are durable before it
+     * commits — every batch member settled by exactly this receipt, and the reply owed or already
+     * answered. The closure cannot write the reply, because only this coordinator holds the
+     * owner-reply authority.
      */
-    settle: (receipt: {
-      outcome: "ABORTED";
-      receiptId: string;
-      evidenceDigest: string;
-      reasonCode: string;
-    }) => Decision<void>,
+    settle: (settlement: IngressReceiptSettlement) => Decision<void>,
   ): Promise<Decision<void>> {
     let result: ReceiptLookupResult;
     try {
@@ -1381,22 +1401,141 @@ export class ConversationTurnCoordinator {
         turnRequestId: query.turnRequestId,
       });
     }
-    // A completed target receipt has an owner-reply obligation. The canonical outbox does not
-    // exist on this ingress lane yet, so only an authenticated ABORTED receipt can terminalize it
-    // without falsely claiming the owner received the target's response.
-    if (result.outcome !== "ABORTED") {
-      return deny(
-        ReasonCode.CONVERSATION_TURN_RECEIPT_REPLY_OBLIGATION_UNDISCHARGEABLE,
-        "a completed target receipt cannot settle ingress before its reply is atomically durable",
-        { turnRequestId: query.turnRequestId },
-      );
-    }
-    return settle({
+    const receipt = {
       outcome: result.outcome,
       receiptId: result.receiptId,
       evidenceDigest: result.evidenceDigest,
       reasonCode: result.reasonCode,
+    };
+    const settlement = issueIngressReceiptSettlement(this.#ownerReplies, this.db, {
+      channel: source.channel,
+      nonce: source.nonce,
+      query,
+      receipt,
     });
+    try {
+      // Both outcomes redeem inside a transaction on this coordinator's own handle, which is what
+      // the guard requires: a settlement handed to another database's guard is refused there.
+      // `ABORTED` carries no reply obligation and writes exactly what it always has.
+      if (receipt.outcome === "ABORTED") {
+        return this.db.txDecision(() => {
+          const settled = settle(settlement);
+          return settled;
+        });
+      }
+      // A completed target receipt has an owner-reply obligation (#1036): the claim's settlement
+      // and the reply land in this one transaction or neither does.
+      return this.db.txDecision(() => {
+        const settled = settle(settlement);
+        if (!settled.allowed) return settled;
+        // Read back, independently of what the closure reports: every member of the claim's frozen
+        // batch is bound to this exact turn — the claim the receipt was asked about, not merely one
+        // carrying matching receipt fields (R1041-03, round 2) — and records this exact receipt.
+        const members = this.#ingressBatch(source.channel, source.nonce);
+        const unsettled = members.find((nonce) =>
+          !this.#ingressClaimBoundTo(source.channel, nonce, query) ||
+          !this.#ingressClaimSettledBy(source.channel, nonce, receipt));
+        if (unsettled !== undefined) {
+          return deny(
+            ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN,
+            "the ingress settlement did not settle every claimed message of this turn by this receipt, so neither write stands",
+            { turnRequestId: query.turnRequestId, channel: source.channel, nonce: unsettled },
+          );
+        }
+        const reply = enqueueOwnerReply(this.#ownerReplies, this.db, this.clock, {
+          turnRequestId: query.turnRequestId,
+          ledger: "INGRESS_CLAIM",
+          targetActorId: query.targetActorId,
+          sources: members.map((nonce) => ({ channel: source.channel, nonce })),
+          receipt: {
+            authority: "HERMES_TARGET",
+            receiptId: receipt.receiptId,
+            evidenceDigest: receipt.evidenceDigest,
+            reasonCode: receipt.reasonCode,
+          },
+          handlerRunning: (member) => turnHandlerRunning(this.db, member.channel, member.nonce),
+        });
+        if (!reply.allowed) return deny(reply.reasonCode, reply.message, reply.evidence);
+        return settled;
+      });
+    } finally {
+      withdrawIngressReceiptSettlement(settlement);
+    }
+  }
+
+  /**
+   * Whether the message's durable claim belongs to exactly this turn: its turn id, and the Hermes
+   * receipt identity frozen into it at claim time, field for field.
+   */
+  #ingressClaimBoundTo(channel: string, nonce: string, query: ReceiptLookupQuery): boolean {
+    const row = this.db.get<{ turn_claim_json: string | null }>(
+      `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+      [channel, nonce],
+    );
+    let claim: { turnRequestId?: unknown; receiptIdentity?: Record<string, unknown> | null } | null;
+    try {
+      claim = JSON.parse(row?.turn_claim_json ?? "null") as typeof claim;
+    } catch {
+      return false;
+    }
+    const bound = claim?.receiptIdentity;
+    if (claim?.turnRequestId !== query.turnRequestId || !bound || typeof bound !== "object") return false;
+    return bound["turnRequestId"] === query.turnRequestId &&
+      bound["targetActorId"] === query.targetActorId &&
+      bound["promptDigest"] === query.promptDigest &&
+      bound["bindingGeneration"] === query.bindingGeneration &&
+      bound["targetBindingId"] === query.targetBindingId &&
+      bound["targetAttestationId"] === query.targetAttestationId &&
+      bound["executorSessionId"] === query.executorSessionId &&
+      bound["executorSessionIncarnation"] === query.executorSessionIncarnation;
+  }
+
+  /**
+   * The messages one ingress claim consumed, read from the claim's own frozen batch list
+   * (`inbound_messages_override_authority_immutable`). Anything else reads as the message alone.
+   */
+  #ingressBatch(channel: string, nonce: string): readonly string[] {
+    const row = this.db.get<{ turn_claim_json: string | null }>(
+      `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+      [channel, nonce],
+    );
+    let batch: unknown;
+    try {
+      batch = (JSON.parse(row?.turn_claim_json ?? "null") as { batchConsumedNonces?: unknown } | null)
+        ?.batchConsumedNonces;
+    } catch {
+      return [nonce];
+    }
+    if (!Array.isArray(batch) || !batch.every((member): member is string => typeof member === "string") ||
+        !batch.includes(nonce)) {
+      return [nonce];
+    }
+    return [...new Set(batch)];
+  }
+
+  /** Whether this message's claim now records the settlement this exact receipt makes. */
+  #ingressClaimSettledBy(
+    channel: string,
+    nonce: string,
+    receipt: { receiptId: string; evidenceDigest: string },
+  ): boolean {
+    const row = this.db.get<{ turn_claim_json: string | null }>(
+      `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+      [channel, nonce],
+    );
+    try {
+      const claim = JSON.parse(row?.turn_claim_json ?? "null") as {
+        settledAt?: unknown;
+        settlement?: unknown;
+        hermesReceipt?: { outcome?: unknown; receiptId?: unknown; evidenceDigest?: unknown };
+      } | null;
+      return typeof claim?.settledAt === "string" && claim.settlement === REPLY_OUTBOX_SETTLEMENT &&
+        claim.hermesReceipt?.outcome === "COMPLETED" &&
+        claim.hermesReceipt.receiptId === receipt.receiptId &&
+        claim.hermesReceipt.evidenceDigest === receipt.evidenceDigest;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -1452,21 +1591,17 @@ export class ConversationTurnCoordinator {
    *    with it: the table is empty because both writers sit behind doors that are shut, not because
    *    nothing calls them. Until one opens, this sweep runs and asks over an empty set, which is
    *    the same operational fact it always was and no longer the same claim about the code.
-   * 2. **Even with something to sweep, `COMPLETED` cannot be acted on — unconditionally, not only
-   *    while #1 holds.** Contract 6 requires a matched receipt to move `TURN_COMPLETED` and insert
-   *    one reply-outbox item atomically, in the same transaction. Nothing wired to `canonical_turns`
-   *    can perform the second half (`src/outbox/outbox.ts` exists, but its message kinds are
-   *    role-to-role task dispatch, not a reply to the owner who asked), so `#settleFromReceipt`
-   *    refuses every `COMPLETED` receipt outright, unconditionally — not "when the reply obligation
-   *    happens to be undischargeable", because there is no path today on which it is dischargeable.
-   *    This was a deliberate choice over a conditional refusal: a conditional check would need a
-   *    reply-outbox interface to test against, and no consumer of one exists yet — inventing that
-   *    seam now is how an API nobody can use gets built. What has to exist first is a reply-outbox
-   *    mechanism actually wired to this ledger; until it does, resolving #1 makes `ABORTED`
-   *    settlements real and leaves `COMPLETED` exactly as inert as it is today. `ABORTED` carries no
-   *    reply obligation and is unaffected by this refusal. A refusal here is recoverable; a
-   *    `COMPLETED` recorded with no way to prove the reply went anywhere is not, since
-   *    `canonical_turns`' settlement is one-way through the ordinary API.
+   * 2. **`COMPLETED` settles with its owner reply, and the reply is not yet delivered.** Contract
+   *    6 requires a matched receipt to move `TURN_COMPLETED` and insert one reply-outbox item in
+   *    the same transaction. Until #1036 nothing wired to `canonical_turns` could perform the
+   *    second half, so `#settleFromReceipt` refused every `COMPLETED` outright. The owner-reply
+   *    lane (`owner-reply-outbox.ts`) is that half now: the settlement and the item addressed to
+   *    the turn's own ingress conversation commit together or not at all, and a turn whose reply
+   *    cannot be addressed stays `IN_DOUBT`. What that lane does not have yet is a consumer — no
+   *    code delivers an item, so a completed turn's reply is durably owed and visible through
+   *    `pendingOwnerReplies`, not sent. Delivery is the U6 surface path's, once Hermes carries
+   *    canonical replies with signer provenance (MongLong0214/hermes-agent#63). `ABORTED` carries
+   *    no reply obligation and settles exactly as it did before.
    */
   async reconcileUnresolved(
     /**
@@ -1604,21 +1739,7 @@ export class ConversationTurnCoordinator {
     },
     receipt: TurnReceipt & { outcome: "COMPLETED" | "ABORTED" },
   ): Decision<TurnMaterialization> {
-    // Contract 6's atomic pair, and the half this build cannot perform: a matched receipt must
-    // move `TURN_COMPLETED` and insert one reply-outbox item in the same transaction, and nothing
-    // wired to `canonical_turns` can do the second half today (see `reconcileUnresolved`'s
-    // docstring). Checked first and unconditionally — no identity or generation match makes this
-    // safe, because the gap is not about which turn the receipt names, it is about what recording
-    // `COMPLETED` here would fail to guarantee for any turn. `ABORTED` carries no reply obligation
-    // and reaches the checks below unaffected.
-    if (receipt.outcome === "COMPLETED") {
-      return deny(
-        ReasonCode.CONVERSATION_TURN_RECEIPT_REPLY_OBLIGATION_UNDISCHARGEABLE,
-        "this receipt reports completion, but no reply-outbox insert can be performed atomically with it yet",
-        { turnRequestId },
-      );
-    }
-    // Checked next, and against no table: a receipt attesting to a different turn than the one
+    // Checked first, and against no table: a receipt attesting to a different turn than the one
     // this sweep asked about is not evidence about this row at all, whatever else it says. A port
     // that confused two turns sharing the same actor, prompt and generation — an earlier completed
     // one and a later one, say — is exactly what this catches; every other field here could agree
@@ -1630,7 +1751,9 @@ export class ConversationTurnCoordinator {
         { turnRequestId, receiptTurnRequestId: attested.turnRequestId },
       );
     }
-    return this.db.tx(() => {
+    // `txDecision`, not `tx`: the owner-reply half below can refuse after the observation was
+    // written, and that refusal has to take the observation with it (#664's discipline).
+    return this.db.txDecision(() => {
       const row = this.db.get<{
         binding_generation: number;
         target_binding_id: string;
@@ -1703,11 +1826,42 @@ export class ConversationTurnCoordinator {
           },
         );
       }
-      return this.#observeVerified(
+      const before = this.materialization(turnRequestId);
+      const observed = this.#observeVerified(
         { turnRequestId, targetActorId: attested.targetActorId, promptDigest: attested.promptDigest },
         { ...receipt, authority: "HERMES_TARGET" },
         "AFTER",
       );
+      if (!observed.allowed) return observed;
+      // Contract 6's pair (#1036): the transaction that makes this turn `COMPLETED` also owes the
+      // owner one reply, addressed from the turn's own ingress messages. Only that transaction —
+      // a redelivered receipt, or a turn some other settlement already completed, finds the turn
+      // `COMPLETED` before it starts and owes nothing new, which is what keeps a second sweep
+      // overlapping the first from queueing a second reply. A message ingress already answered, or
+      // another turn's item already owes, needs no new obligation (R1041-02); one the lane cannot
+      // address or account for refuses, and `txDecision` takes the observation and the settlement
+      // back with it.
+      if (before.outcome === "COMPLETED" || observed.value.outcome !== "COMPLETED") return observed;
+      const sources = this.db.all<{ source_channel: string; source_nonce: string }>(
+        `SELECT source_channel, source_nonce FROM canonical_turn_sources
+          WHERE turn_request_id = ? ORDER BY batch_ordinal ASC`,
+        [turnRequestId],
+      );
+      const reply = enqueueOwnerReply(this.#ownerReplies, this.db, this.clock, {
+        turnRequestId,
+        ledger: "CANONICAL_TURN",
+        targetActorId: attested.targetActorId,
+        sources: sources.map((source) => ({ channel: source.source_channel, nonce: source.source_nonce })),
+        receipt: {
+          authority: "HERMES_TARGET",
+          receiptId: receipt.receiptId,
+          evidenceDigest: receipt.evidenceDigest,
+          reasonCode: receipt.reasonCode,
+        },
+        handlerRunning: (source) => turnHandlerRunning(this.db, source.channel, source.nonce),
+      });
+      if (!reply.allowed) return deny(reply.reasonCode, reply.message, reply.evidence);
+      return observed;
     });
   }
 

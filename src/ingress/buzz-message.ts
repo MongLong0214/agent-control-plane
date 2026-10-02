@@ -428,6 +428,11 @@ export class BuzzMessageIngress {
   resolveTurn(nonce: string): Decision<void> {
     return this.guard.resolveTurn("buzz", nonce);
   }
+
+  /** Marks this message's handler as running until `end`. See `IngressGuard.beginTurnHandler`. */
+  beginTurnHandler(nonce: string): { end(): void } {
+    return this.guard.beginTurnHandler("buzz", nonce);
+  }
 }
 
 /**
@@ -807,11 +812,22 @@ export const deliverBuzzMessage = async (
     payload: buzzMessagePayload(input),
   });
 
-  const delivered = await port.deliverToCeo(admitted.text, {
-    eventId: admitted.eventId,
-    actor: admitted.actor,
-    conversation: admitted.conversation,
-  });
+  // From here until the claim's outcome is recorded, this handler may still hand the CEO's answer
+  // to the relay, and nothing durable stands between that answer and the owner. A receipt that
+  // arrives meanwhile must not queue a second reply, so it waits for `end` -- which runs however
+  // this finishes, including by throwing (#1041 review, R1041-02 and R1041-04).
+  const handling = ingress.beginTurnHandler(admitted.nonce);
+  let delivered: CeoTurnDelivery;
+  try {
+    delivered = await port.deliverToCeo(admitted.text, {
+      eventId: admitted.eventId,
+      actor: admitted.actor,
+      conversation: admitted.conversation,
+    });
+  } catch (error) {
+    handling.end();
+    throw error;
+  }
 
   // Which outcomes close the claim, and which leave it outstanding.
   //
@@ -828,6 +844,7 @@ export const deliverBuzzMessage = async (
   const answered = delivered.reasonCode === ReasonCode.OK;
   const closes = delivered.reachedCeo ? answered : !answered;
   const resolution = closes ? ingress.resolveTurn(admitted.nonce) : null;
+  handling.end();
 
   return allow(
     delivered.reasonCode,

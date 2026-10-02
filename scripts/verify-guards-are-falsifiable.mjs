@@ -2716,20 +2716,6 @@ const GUARDS = [
     ],
   },
   {
-    // Sol's third review of #691: contract 6 requires a matched receipt to move `TURN_COMPLETED`
-    // and insert one reply-outbox item atomically, and nothing wired to `canonical_turns` performs
-    // the second half. Removing this refusal reopens the exact gap: a receipt with perfectly
-    // matching identity would record `COMPLETED` with no way to prove any reply was ever
-    // preserved, and that transition cannot be undone through the ordinary API.
-    what: "a receipt reporting completion is refused, because no reply-outbox insert can accompany it yet",
-    file: "src/conversation/turn-coordinator.ts",
-    find: '    if (receipt.outcome === "COMPLETED") {',
-    replace: "    if (false) {",
-    killedBy: [
-      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::does not complete a turn even when every identity field matches, because the reply obligation cannot yet be discharged",
-    ],
-  },
-  {
     // #649 part A: `bind()` minted a fresh actor unconditionally, so re-bootstrapping against the
     // same Hermes transcript produced a second owner beside the first — two actors that collide on
     // nothing, so the alias was silent. Without this line the reuse path is computed and then
