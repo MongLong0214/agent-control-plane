@@ -1,0 +1,8 @@
+Limit: removed at Isaac's direction, relayed by the CEO: the four guard-falsifiability shards and their gate job, the traceability and SSOT reconciliation jobs, the index open-list step in tracker-loci, and the pre-push gates receipt; the verify matrix and verify-gate are unchanged and remain the only merge gate
+Limit: no falsifiability row runs in CI after this commit; the affected-rows replacement was deferred to a follow-up because the coordinator asked for the deletion first
+Limit: the pre-push hook keeps only its stdin filter and the anchors pass, a string search measured at 0.36 seconds; the open pull request lookup and the gates receipt are gone, and run-prepush-gates no longer writes the receipt
+Warn: closure:affected's transitive closure selected 380 to 781 of 858 rows on most of the last 60 merges, so wiring it into verify unchanged would move the sweep into the required check; a light replacement has to use the direct terms only: mutated file, row definition, witness test
+Warn: src/quality/recurring-defects.ts still names .githooks/pre-push as the guard for pushed-without-the-gate-manifest; guards:recurrence passes because the hook exists, but the hook no longer refuses that class
+Warn: the falsifiability row that deletes the trace package script can no longer be killed: its witness needs a workflow that runs pnpm trace, and none does now
+Record-Id: r-bcc65c765005
+Provenance: inherited a777be72ff584bf8212247a599a88f8b9c4f92bf
