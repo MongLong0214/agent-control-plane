@@ -1,0 +1,76 @@
+Limit: no consumer delivers an owner-reply item yet: a completed turn's reply is durably owed and readable through pendingOwnerReplies, and delivery belongs to the U6 surface path once Hermes carries signed canonical replies (hermes-agent#63)
+Limit: a Telegram ingress row keeps no chat id in the clear (payload is {text, messageId}, audit stores conversation as [not-stored]), so a Telegram reply item is addressed by the ingress claim's scope and chat digests and the owner's message id, and a sender must resolve the chat against its allowlist
+Ruled-out: a dedicated owner-reply table behind a schema migration | a foreign key to canonical_turns cannot hold for the ingress lane's turn ids, and a schema bump edits the digest-pinned migrations.ts and needs an approved live migration
+Ruled-out: an owner-reply kind in the governed outbox table | its rows are fenced to a role's session and swept by expiry, fencing and the generic delivery loop, none of which an owner reply may pass through before a consumer exists
+Warn: the canonical sweep queues a reply only in the transaction that moves the turn to COMPLETED; queueing on every accepted COMPLETED receipt would answer a turn that a redelivery or another settlement already completed a second time
+Warn: one reply per owner message is enforced by the anchor check in enqueueOwnerReply, not by the row key, because the canonical and ingress lanes mint different turn ids for the same message
+Warn: an ingress claim settled by a COMPLETED receipt carries settledAt with settlement REPLY_OUTBOX and never repliedAt or noReplyAt; readers that treat settledAt as terminal rely on that
+Record-Id: r-1036ownerreply
+Provenance: inherited 5ae2be0e11a32f0ee5ed0faabe79e17c4b036d36
+
+Warn: the falsifiability harness compiles every mutant, and a row's killedBy may name only one distinct test because vitest -t takes one pattern; a replacement of `if (false)` around a block that reads a narrowed variable fails tsc and is reported as an unusable row, not a kill
+Record-Id: r-1036mutantshape
+Follows: r-1036ownerreply
+Provenance: inherited 34727b2a786d498dc21a286877e969cc55536df2
+
+Limit: a Buzz channel identity can be reused across CEO generations and a reused key signs an earlier generation's events just as validly, so the CEO generation and the receiving CTO session are bound into the signed payload at receipt and compared with the registry immediately before admission's first write
+Limit: the signed-time window narrows a reused key and does not close it: whoever holds a reused key can still sign an event dated inside the current window, and nothing on the daemon side tells it from the current CEO's
+Limit: a peer message admitted before a CEO rotation is still handed to its CTO after it; the hand-over checks only the holder fence every holder-claimed row has
+Ruled-out: adding the CEO's Buzz channel identity to the owner allowlist | it hands the CEO the owner's authority (owner gates, approvals, the owner's reply), a delegation nobody granted; a peer is instead whoever the registry says the current CEO binding speaks as, toward its bound PRIMARY_CTO only
+Ruled-out: re-checking the CEO generation when the CTO takes a peer message | a refusal at hand-over has to burn the row, which is a write, where admission refuses with none
+Warn: the live CEO runtime's buzz_actor_id is NULL, so every CEO mention is refused (fail-closed) until #1037 issues the credential bindActor needs; do not unblock it with an owner-list entry or a second binding path
+Warn: activation also needs the CEO's key on ACP_BUZZ_ALLOWED_ACTORS and the CTO runtime's buzz_address equal to the room the CEO writes in; this change configures neither
+Warn: health now counts a coded refusal as admission-refused:<reasonCode> and a bare REFUSED as admission-refused, so a reader totalling refusals must sum both
+Record-Id: r-1038peeringress
+Provenance: inherited b24844fc62bfed6a3c36fee5f510c332a0f72713
+
+Warn: a peer-rule mutant that replaces a refusal's condition with `if (false)` does not compile when the refusal reads `current.value`, because TypeScript drops the narrowing inside a literally unreachable block; replace the condition with one that is always false at runtime instead
+Record-Id: r-1038mutantshape
+Follows: r-1038peeringress
+Provenance: inherited 881d0ff23f96cc838e3efc1a5867d2d7e2b863f9
+
+Limit: Telegram rows admitted before this change carry no chatId in their payload, so a COMPLETED receipt for them is unaddressable and the turn stays IN_DOUBT; an update an older binary admitted and this one claims also fails claim()'s INGRESS_ADMITTED payload digest
+Limit: r-1036ownerreply's Limit that a Telegram reply item is addressed by the claim's scope and chat digests, and its Warn that one reply per owner message rests on an anchor check, were true when written and are false after this commit: the address comes from the admitted payload and coverage spans every source of the turn
+Ruled-out: addressing a Telegram reply from the claim's sessionDigest or legacySessionDigest | legacySessionDigest is not frozen by the identity trigger so a later write moves the reply, freezing it needs a trigger change and a migration, and a digest names a conversation without saying where it is
+Ruled-out: keeping the earlier ruling against putting the Telegram chat id in the admitted payload | it leaves a Telegram reply with no immutable address; the payload-digest cost at an upgrade is accepted instead and is bounded to messages admitted before it and still unclaimed
+Warn: only the turn coordinator holds a database's owner-reply authority (claimed once per database identity, released on close); anything else that needs an owner reply must go through the coordinator
+Warn: reconcileIngressReceipt takes (source, query, settle) and completeClaimFromHermesReceipt accepts only a coordinator-issued, single-use IngressReceiptSettlement; code that handed the guard a receipt it built must route through the coordinator's receipt port
+Warn: one owner message gets at most one reply across both lanes: a message answered through ingress (repliedAt or a reserved CEO answer) or named by another item owes nothing new, and a turn whose messages are only partly covered is refused and stays IN_DOUBT
+Record-Id: r-1041r2settle
+Follows: r-1036ownerreply
+Provenance: inherited bad10797d6c818b0d4459891463f5d19c2e012aa
+
+Warn: a reserved Telegram reply counts as the owner's answer only when it carries turnAnswered: true; an apology the transport delivered leaves the answer the receipt proves still owed, and a check that treats any reservation as answered silently drops it
+Record-Id: r-1041r2apology
+Follows: r-1041r2settle
+Provenance: inherited c1635021808e4e15a612971e3d8cda9c99502440
+
+Limit: a CEO channel identity carried by another session row, or a CEO runtime that served an earlier CEO generation, refuses every CEO mention; a fresh identity per CEO generation is the remedy, so if #1037 binds the earlier key or re-binds the same runtime, peer delivery stays refused
+Limit: the reuse check reads three facts: another session row with the key, an earlier CEO assignment on this runtime, and a recorded runtime move onto it before this generation; a key held outside those records is not visible
+Limit: the generation's lower time bound is in whole seconds, so an exclusive identity's event signed in the fraction of the start second before the start is admitted
+Limit: a withheld peer row stays PENDING with its turn open until the holder rejects it by id; nothing sweeps it
+Ruled-out: building the peer generation proof in the sink when a frame is processed | a frame that waited behind another admission across a rotation was stamped with the generation it was processed under; the subscriber's receipt, read when the frame arrives, is presented instead
+Ruled-out: placing a reused key's events in a generation by their created_at | it is the signer's own claim and the review admitted an event signed under generation 1 and dated 60 s ahead; a reused identity is refused outright
+Ruled-out: burning a peer row whose proof is stale when the CTO asks for it | the hand-over must refuse before its first write; the row is withheld, reported by id, and retired by the holder's own reject
+Warn: a peer message is rejected, not carried, on a CTO takeover or runtime move, unlike an owner message; the CEO has to send it again
+Warn: Outbox.claimForHolder withholds every IDENTITY_BOUND_KINDS row by default; a new caller that passes no proof predicate hands over no peer message
+Warn: r-1038peeringress's Limit that a peer message admitted before a CEO rotation is still handed over, and its Ruled-out of re-checking at hand-over, are no longer true
+Record-Id: r-1044peerfence
+Follows: r-1038peeringress
+Provenance: inherited 27838aa1995d50b86125787e0dcc54114b25b79d
+
+Limit: a runtime-move record with no readable generation counts as an earlier generation's, so a malformed record refuses the CEO's peer mentions
+Limit: the hand-over's CEO-runtime comparison has no falsifiability row of its own: no reachable state changes the CEO runtime while keeping the identity that signed, so its removal is masked by the identity and reuse checks
+Ruled-out: deciding whether a CEO runtime served an earlier generation by comparing a runtime move's timestamp with the new binding's | a move and the next binding can share one clock reading, and the comparison then answered not reused; the generation the move recorded is read instead
+Warn: the hand-over re-asks every identity admission decided on, through buzzPeerRegistry.currentCeo; a check added to admission's peer rule has to be added to peerProofIsCurrent too, or a queued message outlives it
+Record-Id: r-1044fenceround2
+Follows: r-1044peerfence
+Provenance: inherited 7b3ef13f9fbfca330bac002c6fb68f7cd680afce
+
+Limit: the key-history replay reads SESSION_BUZZ_ACTOR_BOUND and the CEO binding audit records in event_id order; with no record of when the runtime took the identity, or a binding record whose generation is unreadable, the identity counts as reused and every CEO mention is refused
+Limit: a queued row whose stored payload is not readable JSON is withheld and reported instead of claimed, so it no longer throws the claim, and it stays PENDING until the holder rejects it
+Ruled-out: judging a CEO identity reused because its runtime served an earlier CEO generation | a runtime that served an earlier generation with no identity and took its first key only later had that key refused; whether the runtime carried the key while serving an earlier generation is replayed instead
+Warn: the hand-over also requires the admitted room to equal the receiving CTO session's current buzz_address; changing a CTO's buzz_address withholds every peer message queued for it
+Record-Id: r-1044fenceround3
+Follows: r-1044fenceround2
+Provenance: inherited 57b5452a2725a1622813efd684df7c7a12edd7bb
