@@ -19,7 +19,11 @@ import {
   createHermesBootstrapAuthority,
   type HermesBootstrapAuthority,
 } from "../bootstrap/hermes-bootstrap.ts";
-import { createHermesIncumbentAdoption } from "../bootstrap/hermes-incumbent-adoption.ts";
+import { createHermesIncumbentAdoption, type GatewayIncumbentProof } from "../bootstrap/hermes-incumbent-adoption.ts";
+import {
+  createAdoptedCeoToolAdmission,
+  type AdoptedCeoToolAdmission,
+} from "../bootstrap/adopted-ceo-tool-admission.ts";
 import { createHermesGatewayIdentityReader } from "../runtime/hermes-gateway-identity.ts";
 import { createHermesGatewayConversationSender } from "../runtime/hermes-gateway-conversation.ts";
 import {
@@ -91,7 +95,11 @@ import type { HolderIdentity } from "../outbox/outbox.ts";
 import { respond, type AuthenticatedMcpPeer, type McpPeerAuthenticator } from "../mcp/shared.ts";
 import type { AuthenticatedOperatorPeer, Daemon } from "./daemon.ts";
 import { executeCanonicalSelfClaimOperator } from "./canonical-self-claim-operator.ts";
-import { startCanonicalSelfClaimListener, type CanonicalSelfClaimListener } from "./canonical-self-claim-listener.ts";
+import {
+  startAdoptedCeoToolListener,
+  startCanonicalSelfClaimListener,
+  type CanonicalSelfClaimListener,
+} from "./canonical-self-claim-listener.ts";
 import { readOneJsonLineRequest } from "./local-socket-framing.ts";
 import { daemonCtoBindingRuntime, type CtoBindingRuntime } from "./cto-binding-runtime.ts";
 
@@ -1407,6 +1415,86 @@ export const createConfiguredHermesGatewayConversation = (
   };
 };
 
+/**
+ * The authenticated Gateway readback both adoption and the adopted CEO's tool admission use: one
+ * reader, fenced on the daemon lock on both sides of the await.
+ */
+const lockedGatewayOrigin = (
+  values: NonNullable<ReturnType<typeof configuredHermesAdoptionValues>>,
+  ports: { identityReader?: typeof createHermesGatewayIdentityReader; authorityHeld?: () => boolean },
+): (() => Promise<GatewayIncumbentProof>) => {
+  const readGateway = (ports.identityReader ?? createHermesGatewayIdentityReader)({
+    apiKey: values.ACP_HERMES_GATEWAY_API_KEY!,
+  });
+  return async () => {
+    if (ports.authorityHeld && !ports.authorityHeld()) throw new Error("daemon lock lost");
+    const proof = await readGateway();
+    if (ports.authorityHeld && !ports.authorityHeld()) throw new Error("daemon lock lost");
+    return proof;
+  };
+};
+
+/**
+ * The adopted CEO's tool admission (#1037), from the same configuration adoption reads. Undefined
+ * when that configuration is incomplete, so a deployment that never adopted opens no tool socket.
+ */
+export const createConfiguredAdoptedCeoToolAdmission = (
+  cp: ControlPlane,
+  configuration: Readonly<Record<string, string | undefined>>,
+  ports: {
+    identityReader?: typeof createHermesGatewayIdentityReader;
+    authorityHeld?: () => boolean;
+  } = {},
+): AdoptedCeoToolAdmission | undefined => {
+  const values = configuredHermesAdoptionValues(configuration);
+  if (!values) return undefined;
+  return createAdoptedCeoToolAdmission(cp, {
+    gatewayOrigin: lockedGatewayOrigin(values, ports),
+    expectedLiveSessionId: values.ACP_HERMES_EXPECTED_LIVE_SESSION_ID!,
+    lineageRootDigest: values.ACP_HERMES_LINEAGE_ROOT_DIGEST!,
+  });
+};
+
+/**
+ * Serves the Hermes MCP tools to the adopted CEO (#1037) on its own kernel-peer socket.
+ *
+ * The connection is authenticated once, by `admission.admit` — same uid, a descendant of the bound
+ * CEO runtime's recorded process, and the Gateway's own readback agreeing — and every tool call
+ * then consumes that admission: `admission.authenticate` fences it on the binding, and the
+ * provenance guard compares each mutation's caller against the session and lineage it read. There
+ * is no session secret on this path, so there is none to issue, rotate or lose.
+ *
+ * Deliberately not `ceoConversation.attach`: this channel is how the CEO calls ACP, not how ACP
+ * reaches the CEO. Registering it would let the daemon ask the Gateway for sampling outside the
+ * adopted conversation's lineage — a new conversation by another door.
+ *
+ * Only the Hermes server's own tools are served. `cto_binding_bind`/`cto_binding_release` take the
+ * runtime's session secret as their principal, which this runtime does not hold.
+ */
+export const startAdoptedCeoToolSocket = (
+  cp: ControlPlane,
+  daemon: { lock: { held(): boolean } },
+  stateDir: string,
+  admission: AdoptedCeoToolAdmission,
+  options: { onCeoApproved?: (runId: string) => void | Promise<unknown>; admissionTimeoutMs?: number } = {},
+): Promise<CanonicalSelfClaimListener> => {
+  const port = createHermesMcpPort(cp, { onCeoApproved: options.onCeoApproved });
+  return startAdoptedCeoToolListener(
+    daemon,
+    stateDir,
+    (peer) => admission.admit(peer),
+    (admitted, socket) => {
+      const server = createHermesServer(port, () => admission.authenticate(admitted), {
+        provenance: admitted.provenance,
+      });
+      void server.connect(new SocketTransport(socket, Buffer.alloc(0))).catch((err: unknown) => {
+        socket.destroy(err instanceof Error ? err : new Error(String(err)));
+      });
+    },
+    options.admissionTimeoutMs === undefined ? {} : { admissionTimeoutMs: options.admissionTimeoutMs },
+  );
+};
+
 /** Capture independent daemon configuration before exposing the operator method. */
 export const createConfiguredHermesIncumbentAdoption = (
   cp: ControlPlane,
@@ -1420,15 +1508,7 @@ export const createConfiguredHermesIncumbentAdoption = (
   const values = configuredHermesAdoptionValues(configuration);
   if (!values) return undefined;
 
-  const readGateway = (ports.identityReader ?? createHermesGatewayIdentityReader)({
-    apiKey: values.ACP_HERMES_GATEWAY_API_KEY!,
-  });
-  const gatewayOrigin = async () => {
-    if (ports.authorityHeld && !ports.authorityHeld()) throw new Error("daemon lock lost");
-    const proof = await readGateway();
-    if (ports.authorityHeld && !ports.authorityHeld()) throw new Error("daemon lock lost");
-    return proof;
-  };
+  const gatewayOrigin = lockedGatewayOrigin(values, ports);
   const adoption = (ports.adoptionFactory ?? createHermesIncumbentAdoption)(cp, {
     gatewayOrigin,
     target: { sessionId: values.ACP_HERMES_TARGET_SESSION_ID!,
@@ -3310,6 +3390,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   let buzzMentionSubscriber: BuzzMentionSubscriberHandle | null = null;
   let operator: LocalOperatorListener | null = null;
   let canonicalSelfClaim: CanonicalSelfClaimListener | null = null;
+  let adoptedCeoTools: CanonicalSelfClaimListener | null = null;
   let hermesBootstrap: HermesBootstrapAuthority | null = null;
   let telegram: TelegramLongPollListener | null = null;
   let startCompleted = false;
@@ -3329,6 +3410,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     await buzzActorIngress?.close();
     await operator?.close();
     await canonicalSelfClaim?.close();
+    await adoptedCeoTools?.close();
     await hermesBootstrap?.close();
     await listeners?.close();
     await sessionLaunch.close();
@@ -3450,6 +3532,17 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       process.stdout.write("canonical self-claim listener started\n");
     }
     listeners = await startDaemonMcpListeners(cp, stateDir, mcpToken, daemon);
+    // #1037 — the adopted CEO's tools, on their own kernel-peer socket; only when adoption is
+    // configured, since that configuration is what the admission compares the Gateway against.
+    const adoptedCeoAdmission = createConfiguredAdoptedCeoToolAdmission(cp, hermesAdoptionConfiguration, {
+      authorityHeld: () => daemon.lock.held(),
+    });
+    if (adoptedCeoAdmission) {
+      adoptedCeoTools = await startAdoptedCeoToolSocket(cp, daemon, stateDir, adoptedCeoAdmission, {
+        onCeoApproved: (runId) => daemon.finalizeApprovedRun(runId),
+      });
+      process.stdout.write("adopted CEO tool socket started\n");
+    }
     if (buzzActorIngressPolicy) {
       buzzActorIngress = await startBuzzActorIngressListener(cp, stateDir, buzzActorIngressPolicy);
       // The receiving half of #627. It opens with the binding half because both are the same
@@ -3556,6 +3649,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     await buzzActorIngress?.close();
     await operator?.close();
     await canonicalSelfClaim?.close();
+    await adoptedCeoTools?.close();
     await hermesBootstrap?.close();
     await listeners?.close();
     await sessionLaunch.close();

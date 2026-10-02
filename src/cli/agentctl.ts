@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { defaultConfig } from "../app/control-plane.ts";
-import { runAttachRelayCommand, type AttachRelayClaim } from "./attach-relay.ts";
+import { runAdoptedCeoAttachRelay, runAttachRelayCommand, type AttachRelayClaim } from "./attach-relay.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -75,6 +75,10 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
                                            Spawned by the canonical Claude Code as its stdio MCP
                                            server, never run by hand: it prints no receipt, reaches
                                            no ACP_OPERATOR_TOKEN, and never reconnects
+  agentctl attach adopted-ceo             the adopted Hermes CEO's tool channel: spawned by the
+                                           live Gateway as its stdio MCP server and relayed to the
+                                           adopted CEO tool socket, which admits it by kernel peer
+                                           and Gateway ancestry. Takes no selector and no secret
   agentctl daemon status                  daemon mode and health; falls back to the lock file
 `;
 
@@ -277,7 +281,24 @@ const dispatchCanonicalSelfClaim = (args: string[], config: { databasePath: stri
   );
 };
 
+/**
+ * `attach adopted-ceo` (#1037) takes no selector: the socket it reaches decides who is calling from
+ * the kernel's record and the Gateway's own readback, so there is nothing for an argv to say.
+ */
+const dispatchAdoptedCeoAttach = (args: string[], config: { databasePath: string }): Promise<number> => {
+  if (args.length !== 0) return Promise.resolve(fail("attach adopted-ceo takes no arguments"));
+  return runAdoptedCeoAttachRelay(
+    {
+      toolSocketPath:
+        process.env["ACP_ADOPTED_CEO_TOOL_SOCKET"] ??
+        join(config.databasePath, "..", "agentcpd.adopted-ceo-tools.sock"),
+    },
+    { stdin: process.stdin, stdout: process.stdout, stderr: process.stderr },
+  );
+};
+
 const dispatchAttach = (args: string[], config: { databasePath: string }): Promise<number> => {
+  if (args[0] === "adopted-ceo") return dispatchAdoptedCeoAttach(args.slice(1), config);
   if (args[0] !== "canonical-cto") return Promise.resolve(fail(`unknown attach subcommand: ${args[0] ?? ""}`));
   const parsed = parseCanonicalClaimSelectors(args.slice(1), "attach canonical-cto");
   if (!parsed.ok) return Promise.resolve(fail(parsed.message));

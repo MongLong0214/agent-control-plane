@@ -26,6 +26,11 @@ import { readOneJsonLineRequest } from "./local-socket-framing.ts";
  * name, including every bearer-authenticated owner and operator method, which stay on the
  * operator socket because that credential is the pre-existing owner/admin boundary.
  *
+ * The adopted CEO's tool socket (#1037) is the second door this file opens, with the same
+ * kernel-peer check in front of it. It answers no method: once the peer is admitted, the socket
+ * carries MCP for the adopted CEO, so the admission is the whole of its authentication and there is
+ * no credential to issue, keep or replay.
+ *
  * `getPeerCredentials`/`PeerCredentials` are reachable from exactly this one file — see
  * `scripts/verify-peercred-is-unreachable.mjs`'s `ALLOWED_FILES`. The claim orchestration this
  * listener calls into (`src/daemon/canonical-self-claim-operator.ts`) does not touch peer
@@ -37,6 +42,9 @@ export const CANONICAL_SELF_CLAIM_METHOD = "actor.claimCanonicalCto";
 
 /** The one filename this listener ever binds; exported so a caller can size a `stateDir` against it. */
 export const CANONICAL_SELF_CLAIM_SOCKET_FILENAME = "agentcpd.claim-canonical-cto.sock";
+
+/** The adopted CEO's tool socket (#1037), sized against `stateDir` the same way. */
+export const ADOPTED_CEO_TOOL_SOCKET_FILENAME = "agentcpd.adopted-ceo-tools.sock";
 
 /**
  * `sizeof(struct sockaddr_un.sun_path)` on Darwin is 104 bytes, and that array holds the path plus
@@ -318,7 +326,101 @@ export const startCanonicalSelfClaimListener = async (
   if (!Number.isInteger(requestTimeoutMs) || requestTimeoutMs <= 0) {
     throw new Error("canonical self-claim request timeout must be a positive integer");
   }
-  const socketPath = join(stateDir, CANONICAL_SELF_CLAIM_SOCKET_FILENAME);
+  return listenPeerCredentialSocket(stateDir, CANONICAL_SELF_CLAIM_SOCKET_FILENAME, (socket) =>
+    serveCanonicalSelfClaimConnection(socket, daemon, handler, requestTimeoutMs),
+  );
+};
+
+/**
+ * What the adopted CEO tool socket hands its caller: the kernel's peer, to decide on, and — only
+ * once that decision admitted it — the connection itself, to serve.
+ */
+export type AdoptedCeoToolAdmit<T> = (peer: AuthenticatedClaimPeer) => Promise<Decision<T>>;
+export type AdoptedCeoToolServe<T> = (admitted: T, socket: Socket) => void;
+
+/** Only the reason code reaches the wire, in the `{ok:false}` shape the attach relay reads. */
+const publicToolRefusal = (decision: Decision<unknown>): string =>
+  `${JSON.stringify({ ok: false, reasonCode: decision.reasonCode })}\n`;
+
+/**
+ * One connection on the adopted CEO tool socket: the kernel peer first, before a byte is read; then
+ * the caller's admission, bounded by `admissionTimeoutMs`; then the socket, unread, to `serve`.
+ *
+ * Nothing is read from the peer before it is admitted, so the client's first MCP message waits in
+ * the socket's own buffer and reaches whatever `serve` attaches. A refusal ends the connection with
+ * one `{ok:false,reasonCode}` line and nothing else — no message, no evidence — for the reason
+ * `publicClaimResponse` gives on the claim socket.
+ */
+const serveAdoptedCeoToolConnection = <T>(
+  socket: Socket,
+  daemon: { lock: { held(): boolean } },
+  admit: AdoptedCeoToolAdmit<T>,
+  serve: AdoptedCeoToolServe<T>,
+  admissionTimeoutMs: number,
+): void => {
+  let settled = false;
+  const refuse = (decision: Decision<unknown>): void => {
+    if (socket.destroyed) return;
+    socket.resume();
+    socket.end(publicToolRefusal(decision));
+  };
+  const authenticated = authenticateClaimPeer(socket);
+  if (!authenticated.allowed) return refuse(authenticated);
+  if (!daemon.lock.held()) {
+    return refuse(deny(ReasonCode.DAEMON_LOCK_LOST, "daemon lock is not held for the adopted CEO tool socket", {}));
+  }
+  const timer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    refuse(deny(ReasonCode.OPERATOR_REQUEST_TIMEOUT, "adopted CEO admission did not finish within its budget", {}));
+  }, admissionTimeoutMs);
+  timer.unref();
+  const abandon = (): void => {
+    settled = true;
+    clearTimeout(timer);
+  };
+  socket.once("error", abandon);
+  socket.once("close", abandon);
+  void admit(authenticated.value)
+    .catch(() => deny<T>(ReasonCode.INTERNAL_ERROR, "adopted CEO admission failed", {}))
+    .then((admitted) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (!admitted.allowed) return refuse(admitted);
+      if (socket.destroyed) return;
+      serve(admitted.value, socket);
+    });
+};
+
+/**
+ * Starts the adopted CEO's tool socket (#1037). Token-less like the claim socket: its only
+ * authority is the kernel's record of who connected and what `admit` decides about that peer.
+ */
+export const startAdoptedCeoToolListener = async <T>(
+  daemon: { lock: { held(): boolean } },
+  stateDir: string,
+  admit: AdoptedCeoToolAdmit<T>,
+  serve: AdoptedCeoToolServe<T>,
+  options: { admissionTimeoutMs?: number } = {},
+): Promise<CanonicalSelfClaimListener> => {
+  const admissionTimeoutMs = options.admissionTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  if (!Number.isSafeInteger(admissionTimeoutMs)) {
+    throw new Error("adopted CEO admission timeout must be a positive integer");
+  }
+  if (admissionTimeoutMs <= 0) throw new Error("adopted CEO admission timeout must be a positive integer");
+  return listenPeerCredentialSocket(stateDir, ADOPTED_CEO_TOOL_SOCKET_FILENAME, (socket) =>
+    serveAdoptedCeoToolConnection(socket, daemon, admit, serve, admissionTimeoutMs),
+  );
+};
+
+/** Binds one owner-only socket file in `stateDir` and hands every connection to `onConnection`. */
+const listenPeerCredentialSocket = async (
+  stateDir: string,
+  socketFilename: string,
+  onConnection: (socket: Socket) => void,
+): Promise<CanonicalSelfClaimListener> => {
+  const socketPath = join(stateDir, socketFilename);
   // Byte length, never `.length` (UTF-16 code units): a path can carry characters whose UTF-8
   // encoding is wider than one code unit, and `sun_path` is a byte buffer the kernel copies into,
   // not a character count. Checked before `removeStaleSocket` and before `createServer` — nothing
@@ -332,9 +434,7 @@ export const startCanonicalSelfClaimListener = async (
     );
   }
   removeStaleSocket(socketPath);
-  const server = createServer((socket) =>
-    serveCanonicalSelfClaimConnection(socket, daemon, handler, requestTimeoutMs),
-  );
+  const server = createServer(onConnection);
   try {
     await new Promise<void>((resolveListen, reject) => {
       server.once("error", reject);

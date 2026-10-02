@@ -33,6 +33,9 @@ import type { Readable, Writable } from "node:stream";
  * The secret never reaches argv, the environment, stdout, stderr or any file: `stdout` carries
  * only bytes that came off the socket after the handshake, and the `stderr` vocabulary is closed
  * to `attach: <stage> <reasonCode>` with the code copied from the daemon's own public envelope.
+ *
+ * The adopted CEO's relay (`runAdoptedCeoAttachRelay`, #1037) is the same byte pipe with no claim
+ * and no handshake in front of it, because its socket authenticates the connection itself.
  */
 
 /**
@@ -297,8 +300,54 @@ export const runAttachRelay = async (
     return ATTACH_EXIT.PROTOCOL;
   }
 
-  return new Promise<number>((resolveRelay) => {
-    const socket: Socket = createConnection(options.mcpSocketPath);
+  return pipeStdioToSocket(options.mcpSocketPath, io, {
+    handshake: (socket) => {
+      // One write, one string, one reference. The order is the whole correctness argument: this
+      // newline is what makes the client's first message the *second* line on this socket.
+      socket.write(
+        `${JSON.stringify({
+          token: options.mcpToken,
+          sessionId: claimed.sessionId,
+          sessionSecret: claimed.sessionSecret,
+        })}\n`,
+      );
+    },
+  });
+};
+
+/**
+ * The adopted CEO's relay (#1037): no claim, no token, no handshake.
+ *
+ * The adopted CEO tool socket authenticates the connection itself — the kernel's peer, which is
+ * this process, descending from the adopted Gateway that spawned it — so there is nothing for this
+ * relay to obtain first and nothing for it to present. The first byte on the socket is the
+ * client's own. A refusal is the daemon's one `{ok:false,reasonCode}` line, read here exactly as a
+ * handshake refusal is above.
+ *
+ * It still never reconnects, but for a different reason than the CTO relay: there is no
+ * credential to reuse. A respawn is simply a new connection, admitted or refused on the same facts
+ * as the first one, and Hermes is what respawns it.
+ */
+export const runAdoptedCeoAttachRelay = (
+  options: { toolSocketPath: string },
+  io: AttachRelayIo,
+): Promise<number> => {
+  // The client's bytes wait until the socket is connected, so none is lost to a closed pipe.
+  io.stdin.pause();
+  return pipeStdioToSocket(options.toolSocketPath, io, { handshake: () => undefined });
+};
+
+/**
+ * The byte pipe both relays share: connect, let `handshake` write first, then carry stdin to the
+ * socket and the socket to stdout, inspecting only the daemon's first line for a refusal.
+ */
+const pipeStdioToSocket = (
+  socketPath: string,
+  io: AttachRelayIo,
+  connection: { handshake(socket: Socket): void },
+): Promise<number> =>
+  new Promise<number>((resolveRelay) => {
+    const socket: Socket = createConnection(socketPath);
     let settled = false;
     let resolved = false;
     let connected = false;
@@ -374,15 +423,9 @@ export const runAttachRelay = async (
     });
     socket.once("connect", () => {
       connected = true;
-      // One write, one string, one reference. The order is the whole correctness argument: this
-      // newline is what makes the client's first message the *second* line on this socket.
-      socket.write(
-        `${JSON.stringify({
-          token: options.mcpToken,
-          sessionId: claimed.sessionId,
-          sessionSecret: claimed.sessionSecret,
-        })}\n`,
-      );
+      // Whatever the handshake writes is on the wire before the client's first byte, because
+      // stdin is piped only after it returns.
+      connection.handshake(socket);
       socket.on("data", peek);
       io.stdin.pipe(socket);
     });
@@ -398,4 +441,3 @@ export const runAttachRelay = async (
     // them. There is deliberately no branch here that opens a second connection.
     socket.once("close", () => finish(stdinEnded ? ATTACH_EXIT.OK : ATTACH_EXIT.STREAM_CLOSED));
   });
-};
