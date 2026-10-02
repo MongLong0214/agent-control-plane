@@ -83,10 +83,46 @@ export interface AttachRelayOptions {
   /** Resolved by the caller. Written to the handshake line and nowhere else. */
   mcpToken: string;
   claim: AttachRelayClaim;
-  /** The canonical CTO's reattach socket (#1037); asked before any claim when it is set. */
+  /**
+   * The canonical CTO's reattach socket (#1037). Set, it is asked before any claim, and it is how
+   * the relay comes back after the daemon's side of the connection closes: the relay outlives the
+   * connection and reattaches instead of exiting (`relayWithReattach`).
+   */
   reattachSocketPath?: string;
+  /** False when the caller already asked the reattach socket for this attach. Defaults to true. */
+  initialReattach?: boolean;
+  /** Bounds on waiting for a restarted daemon; see `ReattachPolicy`. */
+  reattach?: Partial<ReattachPolicy>;
   claimTimeoutMs?: number;
 }
+
+/**
+ * How long a relay that lost its daemon waits for it, and how often it asks.
+ *
+ * It waits only while nobody answers on the reattach socket — a daemon that is down or still
+ * starting. Any answer ends the wait: admitted, it carries on; refused, it exits. `maxWaitMs`
+ * bounds the whole wait, and each attempt is bounded by `attemptTimeoutMs`.
+ */
+export interface ReattachPolicy {
+  maxWaitMs: number;
+  initialDelayMs: number;
+  maxDelayMs: number;
+  attemptTimeoutMs: number;
+}
+
+export const DEFAULT_REATTACH_POLICY: ReattachPolicy = {
+  maxWaitMs: 5 * 60_000,
+  initialDelayMs: 250,
+  maxDelayMs: 5_000,
+  attemptTimeoutMs: 35_000,
+};
+
+/**
+ * The JSON-RPC error a client receives for a request the relay could not carry: sent while the
+ * relay was reattaching, or in flight when the daemon's side closed. In the implementation-defined
+ * server-error range; the message says which of the two it was.
+ */
+export const RELAY_REATTACHING_ERROR = -32001;
 
 export const ATTACH_EXIT = {
   OK: 0,
@@ -333,6 +369,7 @@ export interface AttachRelayCommandOptions {
   mcpSocketPath: string;
   claim: AttachRelayClaim;
   reattachSocketPath?: string;
+  reattach?: Partial<ReattachPolicy>;
 }
 
 /**
@@ -353,30 +390,39 @@ export const runAttachRelayCommand = async (
   // needs no credential unreachable without one. The token is acquired only for the fallback,
   // which presents it on `cto.mcp.sock`.
   io.stdin.pause();
-  const reattached = await reattachFirst(options.reattachSocketPath, DEFAULT_CLAIM_TIMEOUT_MS, io);
-  if (reattached !== null) return reattached;
+  const reattached = await reattachFirst(options.reattachSocketPath, DEFAULT_CLAIM_TIMEOUT_MS, options.reattach, io);
+  if (typeof reattached === "number") return reattached;
   const mcpToken = resolveMcpToken();
   if (mcpToken === null) {
     io.stderr.write("attach: mcp token unavailable\n");
     return ATTACH_EXIT.UNAVAILABLE;
   }
-  return runAttachRelay({ ...options, reattachSocketPath: undefined, mcpToken }, io);
+  // A door that did not answer is not one to come back through; one that answered "unbound" is.
+  return runAttachRelay({
+    ...options,
+    reattachSocketPath: reattached === "unbound" ? options.reattachSocketPath : undefined,
+    initialReattach: false,
+    mcpToken,
+  }, io);
 };
 
 /**
  * Asks the reattach socket when there is one. Resolves to the relay's exit code when the reattach
- * decided the attach — admitted and piped, or refused — and to null when the caller should claim:
- * this process holds no binding, or there is no reattach socket to ask.
+ * decided the attach — admitted and relayed, or refused — and otherwise to why the caller should
+ * claim: `unbound` (the door answered that this process holds no binding) or `unavailable` (there
+ * is no door, or it did not answer). Only a door that answered is one the relay may later come back
+ * through: a deployment without one keeps the byte pipe that exits with its connection.
  */
 const reattachFirst = async (
   reattachSocketPath: string | undefined,
   timeoutMs: number,
+  policy: Partial<ReattachPolicy> | undefined,
   io: AttachRelayIo,
-): Promise<number | null> => {
-  if (reattachSocketPath === undefined) return null;
+): Promise<number | "unbound" | "unavailable"> => {
+  if (reattachSocketPath === undefined) return "unavailable";
   const reattached = await attemptReattach(reattachSocketPath, timeoutMs);
   if (reattached.kind === "admitted") {
-    return pipeStdioToSocket(reattached.socket, io, { handshake: () => undefined });
+    return relayWithReattach(reattached.socket, NO_HANDSHAKE, true, reattachSocketPath, policy, io);
   }
   if (reattached.kind === "refused") {
     io.stderr.write(`attach: reattach refused ${reattached.reasonCode}\n`);
@@ -386,7 +432,7 @@ const reattachFirst = async (
     io.stderr.write("attach: reattach reply malformed\n");
     return ATTACH_EXIT.PROTOCOL;
   }
-  return null;
+  return reattached.kind;
 };
 
 export const runAttachRelay = async (
@@ -396,13 +442,18 @@ export const runAttachRelay = async (
   // Nothing of Claude Code's moves until the handshake newline is on the wire.
   io.stdin.pause();
 
-  const reattached = await reattachFirst(
-    options.reattachSocketPath,
-    options.claimTimeoutMs ?? DEFAULT_CLAIM_TIMEOUT_MS,
-    io,
-  );
+  // The caller may have asked the door already; then `reattachSocketPath` is set only if it answered.
+  const reattached = options.initialReattach === false
+    ? (options.reattachSocketPath === undefined ? "unavailable" : "unbound")
+    : await reattachFirst(
+      options.reattachSocketPath,
+      options.claimTimeoutMs ?? DEFAULT_CLAIM_TIMEOUT_MS,
+      options.reattach,
+      io,
+    );
   // Unbound, or no reattach socket to ask: the claim decides, as it always has.
-  if (reattached !== null) return reattached;
+  if (typeof reattached === "number") return reattached;
+  const door = reattached === "unbound" ? options.reattachSocketPath : undefined;
 
   const claimed = await performClaim(
     options.claimSocketPath,
@@ -422,8 +473,8 @@ export const runAttachRelay = async (
     return ATTACH_EXIT.PROTOCOL;
   }
 
-  return pipeStdioToSocket(createConnection(options.mcpSocketPath), io, {
-    handshake: (socket) => {
+  const connection = {
+    handshake: (socket: Socket) => {
       // One write, one string, one reference. The order is the whole correctness argument: this
       // newline is what makes the client's first message the *second* line on this socket.
       socket.write(
@@ -434,7 +485,13 @@ export const runAttachRelay = async (
         })}\n`,
       );
     },
-  });
+  };
+  const first = createConnection(options.mcpSocketPath);
+  // With a reattach socket to come back through, losing this connection is not the end of the
+  // attach; the secret above is presented on this one connection and never again.
+  return door === undefined
+    ? pipeStdioToSocket(first, io, connection)
+    : relayWithReattach(first, connection, false, door, options.reattach, io);
 };
 
 /**
@@ -567,4 +624,329 @@ const pipeStdioToSocket = (
     // EOF and ECONNRESET are the same event to this relay, and a daemon restart produces one of
     // them. There is deliberately no branch here that opens a second connection.
     socket.once("close", () => finish(stdinEnded ? ATTACH_EXIT.OK : ATTACH_EXIT.STREAM_CLOSED));
+  });
+
+const NO_HANDSHAKE = { handshake: (): void => undefined };
+
+/** One JSON-RPC message as the relay needs to see it: whether it is a request, and its id. */
+interface RelayedMessage {
+  id?: unknown;
+  method?: unknown;
+  params?: unknown;
+  result?: unknown;
+  error?: unknown;
+}
+
+const parseRelayed = (line: string): RelayedMessage | null => {
+  let value: unknown;
+  try {
+    value = JSON.parse(line) as unknown;
+  } catch {
+    return null;
+  }
+  if (typeof value !== "object") return null;
+  if (value === null) return null;
+  if (Array.isArray(value)) return null;
+  return value as RelayedMessage;
+};
+
+/** A request's id, or undefined for a notification or a response. */
+const requestIdOf = (message: RelayedMessage): unknown => {
+  if (typeof message.method !== "string") return undefined;
+  return message.id;
+};
+
+/** A response's id, or undefined for anything that is not a response. */
+const responseIdOf = (message: RelayedMessage): unknown => {
+  if (message.method !== undefined) return undefined;
+  return message.id;
+};
+
+const idKey = (id: unknown): string => JSON.stringify(id) ?? "undefined";
+
+/** Splits a byte stream into lines; anything left unterminated past the line bound is refused. */
+const lineSplitter = (onLine: (line: string) => void, onOverflow: () => void): ((chunk: Buffer) => void) => {
+  let held = Buffer.alloc(0);
+  return (chunk) => {
+    held = Buffer.concat([held, chunk]);
+    for (let boundary = held.indexOf(0x0a); boundary !== -1; boundary = held.indexOf(0x0a)) {
+      const line = held.subarray(0, boundary).toString("utf8");
+      held = held.subarray(boundary + 1);
+      onLine(line);
+    }
+    if (held.length > MAX_LINE_BYTES) onOverflow();
+  };
+};
+
+/**
+ * The canonical CTO's relay when it has a reattach socket to come back through (#1037).
+ *
+ * The byte pipe above exits when the daemon's side closes, and that was the whole of a daemon
+ * restart for a canonical CTO: the relay died, Claude Code does not respawn a dead stdio MCP
+ * server, and the binding stayed ACTIVE with no tools and no wake path until someone restarted the
+ * session. This relay outlives the connection instead:
+ *
+ *   - **The client's stdio is never closed for it.** A request that arrives while the relay is
+ *     reattaching is answered at once with `RELAY_REATTACHING_ERROR`, and a request that was in
+ *     flight when the daemon's side closed is answered with the same code and an "outcome unknown"
+ *     message. Holding requests until the daemon returns was rejected rather than bounded: nothing
+ *     is held for later, so nothing is buffered without bound.
+ *   - **It comes back only by reattach.** The secret a claim returned was presented on the first
+ *     connection and is never presented again; the reattach admits on the process tree, so a
+ *     reconnect proves what a first connection does and reuses nothing. It never claims: a refusal
+ *     — this process holds no binding, the binding was revoked, the ancestry does not match — ends
+ *     the relay rather than falling back to a claim, and a new generation stays an operator's or a
+ *     fresh spawn's decision.
+ *   - **It waits only for a daemon that is not answering**, with doubling delays and a bound on
+ *     the whole wait (`ReattachPolicy`), and then exits.
+ *   - **It restores what the connection held.** A daemon serves a new connection from scratch, so
+ *     the relay replays the client's own `initialize` and `notifications/initialized` — the
+ *     client's exact lines, so `clientInfo` is still the client's — and swallows their answers, then
+ *     repeats the last `role_wake_endpoint_register` call the client made, so the wake path comes
+ *     back with the tools.
+ *
+ * Seeing those three messages is the only reason this relay reads JSON-RPC at all; every line is
+ * still forwarded exactly as it arrived.
+ */
+const relayWithReattach = (
+  first: Socket,
+  connection: { handshake(socket: Socket): void },
+  firstAdmitted: boolean,
+  reattachSocketPath: string,
+  policyOverrides: Partial<ReattachPolicy> | undefined,
+  io: AttachRelayIo,
+): Promise<number> =>
+  new Promise<number>((resolveRelay) => {
+    const policy: ReattachPolicy = { ...DEFAULT_REATTACH_POLICY, ...policyOverrides };
+    let daemon: Socket | null = null;
+    let live = false;
+    let done = false;
+    // Whether the daemon has accepted this relay: known at once for a reattach, and after the
+    // first line that is not a refusal for a claim's handshake.
+    let accepted = firstAdmitted;
+    let stdinEnded = false;
+    let stdoutFailed = false;
+    let clientInitialize: { id: unknown; line: string } | null = null;
+    let clientInitialized: string | null = null;
+    let wakeArguments: unknown = undefined;
+    let internalIds = 0;
+    const inFlight = new Map<string, unknown>();
+    const internal = new Map<string, (message: RelayedMessage | null) => void>();
+
+    const toClient = (line: string): void => {
+      if (stdoutFailed) return;
+      io.stdout.write(`${line}\n`);
+    };
+    const undelivered = (id: unknown, message: string): void => {
+      toClient(JSON.stringify({ jsonrpc: "2.0", id, error: { code: RELAY_REATTACHING_ERROR, message } }));
+    };
+
+    let resolved = false;
+    const resolveOnce = (code: number): void => {
+      if (resolved) return;
+      resolved = true;
+      resolveRelay(code);
+    };
+    const end = (code: number): void => {
+      if (done) return;
+      done = true;
+      live = false;
+      daemon?.destroy();
+      io.stdin.removeListener("data", fromClient);
+      io.stdin.pause();
+      // Resolved only once stdout has flushed, for the reason `pipeStdioToSocket` gives.
+      if (stdoutFailed) return resolveOnce(code);
+      if (io.stdout.writableFinished) return resolveOnce(code);
+      io.stdout.once("finish", () => resolveOnce(code));
+      if (!io.stdout.writableEnded) io.stdout.end();
+    };
+    const protocolFailure = (stage: string): void => {
+      io.stderr.write(`attach: ${stage} malformed\n`);
+      end(ATTACH_EXIT.PROTOCOL);
+    };
+
+    /** What a restarted daemon will need replayed, read off the client's own messages. */
+    const remember = (message: RelayedMessage, line: string): void => {
+      if (message.method === "initialize") {
+        if (message.id !== undefined) clientInitialize = { id: message.id, line };
+        return;
+      }
+      if (message.method === "notifications/initialized") {
+        clientInitialized = line;
+        return;
+      }
+      if (message.method !== "tools/call") return;
+      const params = message.params as { name?: unknown; arguments?: unknown } | undefined;
+      if (params?.name === "role_wake_endpoint_register") wakeArguments = params.arguments;
+    };
+
+    const fromClient = lineSplitter((line) => {
+      const message = parseRelayed(line);
+      if (message !== null) remember(message, line);
+      const id = message === null ? undefined : requestIdOf(message);
+      if (live) {
+        if (id !== undefined) inFlight.set(idKey(id), id);
+        daemon?.write(`${line}\n`);
+        return;
+      }
+      if (id !== undefined) undelivered(id, "agent-control-plane is reattaching; this request was not sent");
+    }, () => protocolFailure("client line"));
+
+    const lost = (socket: Socket): void => {
+      if (daemon !== socket) return;
+      daemon = null;
+      live = false;
+      if (done) return;
+      if (stdinEnded) return end(ATTACH_EXIT.OK);
+      if (!accepted) return end(ATTACH_EXIT.STREAM_CLOSED);
+      for (const id of inFlight.values()) {
+        undelivered(id, "the agent-control-plane connection closed before this request was answered; its outcome is unknown");
+      }
+      inFlight.clear();
+      for (const waiter of internal.values()) waiter(null);
+      internal.clear();
+      void reattachLoop();
+    };
+
+    const attachDaemon = (socket: Socket): void => {
+      daemon = socket;
+      socket.on(
+        "data",
+        lineSplitter((line) => {
+          if (!accepted) {
+            // A claim's handshake is answered by a refusal line or by nothing at all.
+            const reply = classifyFirstLine(line);
+            if (reply.kind === "malformed") return protocolFailure("handshake reply");
+            if (reply.kind === "refusal") {
+              io.stderr.write(`attach: handshake refused ${reply.reasonCode}\n`);
+              return end(ATTACH_EXIT.HANDSHAKE_REFUSED);
+            }
+            accepted = true;
+          }
+          const message = parseRelayed(line);
+          const id = message === null ? undefined : responseIdOf(message);
+          if (id !== undefined) {
+            const waiter = internal.get(idKey(id));
+            if (waiter !== undefined) {
+              internal.delete(idKey(id));
+              return waiter(message);
+            }
+            inFlight.delete(idKey(id));
+          }
+          toClient(line);
+        }, () => protocolFailure("daemon line")),
+      );
+      socket.once("error", () => undefined);
+      socket.once("close", () => lost(socket));
+      socket.resume();
+    };
+
+    /** One relay-originated request on `socket`; null when the socket closes or nothing answers. */
+    const ask = (socket: Socket, id: unknown, line: string): Promise<RelayedMessage | null> =>
+      new Promise((resolveAsk) => {
+        const timer = setTimeout(() => {
+          internal.delete(idKey(id));
+          resolveAsk(null);
+        }, policy.attemptTimeoutMs);
+        internal.set(idKey(id), (message) => {
+          clearTimeout(timer);
+          resolveAsk(message);
+        });
+        socket.write(`${line}\n`);
+      });
+
+    /** Restores a fresh connection to where the lost one was; false when it closes meanwhile. */
+    const restore = async (socket: Socket): Promise<boolean> => {
+      attachDaemon(socket);
+      const initialize = clientInitialize;
+      if (initialize !== null) {
+        if ((await ask(socket, initialize.id, initialize.line)) === null) return false;
+        if (clientInitialized !== null) socket.write(`${clientInitialized}\n`);
+      }
+      if (wakeArguments !== undefined) {
+        internalIds += 1;
+        const id = `acp-relay-rewake-${internalIds}`;
+        const answer = await ask(socket, id, JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: { name: "role_wake_endpoint_register", arguments: wakeArguments },
+        }));
+        if (answer === null) return false;
+        const body = (answer.result as { structuredContent?: { ok?: unknown; reasonCode?: unknown } } | undefined)
+          ?.structuredContent;
+        if (body?.ok !== true) {
+          io.stderr.write(`attach: wake re-registration refused ${String(body?.reasonCode ?? "UNKNOWN")}\n`);
+        }
+      }
+      return daemon === socket;
+    };
+
+    const pause = (ms: number): Promise<void> => new Promise((resolvePause) => setTimeout(resolvePause, ms));
+
+    const reattachLoop = async (): Promise<void> => {
+      const started = Date.now();
+      let delay = policy.initialDelayMs;
+      for (;;) {
+        if (done) return;
+        const outcome = await attemptReattach(reattachSocketPath, policy.attemptTimeoutMs);
+        if (done) {
+          if (outcome.kind === "admitted") outcome.socket.destroy();
+          return;
+        }
+        if (outcome.kind === "refused") {
+          io.stderr.write(`attach: reattach refused ${outcome.reasonCode}\n`);
+          return end(ATTACH_EXIT.HANDSHAKE_REFUSED);
+        }
+        if (outcome.kind === "malformed") return protocolFailure("reattach reply");
+        if (outcome.kind === "unbound") {
+          io.stderr.write(`attach: reattach refused ${CTO_REATTACH_UNBOUND}\n`);
+          return end(ATTACH_EXIT.HANDSHAKE_REFUSED);
+        }
+        if (outcome.kind === "admitted") {
+          if (await restore(outcome.socket)) {
+            live = true;
+            return;
+          }
+          if (done) return;
+        }
+        if (Date.now() - started + delay > policy.maxWaitMs) {
+          io.stderr.write("attach: daemon did not return\n");
+          return end(ATTACH_EXIT.UNAVAILABLE);
+        }
+        await pause(delay);
+        delay = Math.min(delay * 2, policy.maxDelayMs);
+      }
+    };
+
+    io.stdin.once("end", () => {
+      stdinEnded = true;
+      if (live) daemon?.end();
+      else if (!accepted) daemon?.end();
+      else end(ATTACH_EXIT.OK);
+    });
+    io.stdin.once("error", () => end(ATTACH_EXIT.STREAM_CLOSED));
+    io.stdout.once("error", () => {
+      stdoutFailed = true;
+      if (done) resolveOnce(ATTACH_EXIT.STREAM_CLOSED);
+      else end(ATTACH_EXIT.STREAM_CLOSED);
+    });
+
+    const begin = (): void => {
+      connection.handshake(first);
+      attachDaemon(first);
+      live = true;
+      io.stdin.on("data", fromClient);
+      io.stdin.resume();
+    };
+    if (first.pending) {
+      first.once("connect", begin);
+      first.once("error", () => {
+        if (daemon !== null) return;
+        io.stderr.write("attach: mcp socket unavailable\n");
+        end(ATTACH_EXIT.UNAVAILABLE);
+      });
+    } else {
+      begin();
+    }
   });
