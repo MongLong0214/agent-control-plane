@@ -6,7 +6,7 @@ const rf246ThePortNeverCreatesUnderAnotherUser = {
   what: "the production port refuses to create a repository under a user account it is not authenticated as",
   file: "src/bootstrap/github-write-port.ts",
   find: "        if (login === null ? true : !sameGitHubName(login, target.owner)) {\n",
-  replace: "        if (false && (login === null ? true : !sameGitHubName(login, target.owner))) {\n",
+  replace: "        if ((login === null ? true : !sameGitHubName(login, target.owner)) && false) {\n",
   killedBy: ["tests/unit/github-write-port.test.ts"],
 };
 
