@@ -4,6 +4,7 @@ import { acpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
   GhCliGitHubClient,
+  UNOBSERVED,
   createGitHubApiWritePort,
   ghChildEnv,
   parseGitHubIdentity,
@@ -289,5 +290,57 @@ describe("gh child environment (#246)", () => {
     const parent = { HOME: "/home/owner", PATH: "/usr/bin", GH_HOST: "ghe.example.com", GH_CONFIG_DIR: "/cfg" };
     expect(ghChildEnv(parent)).toEqual({ HOME: "/home/owner", PATH: "/usr/bin", GH_CONFIG_DIR: "/cfg" });
     expect(parent.GH_HOST).toBe("ghe.example.com");
+  });
+});
+
+/**
+ * PR #1043 review round 2 witness (RF1043-04). Reproduced against the round-1 head (88b286db),
+ * where it fails, and kept as the regression guard.
+ */
+describe("PR #1043 review round 2 witnesses — the port", () => {
+  const protectionAnswer = (reviews: Record<string, unknown>) =>
+    scriptedClient({
+      "GET repos/acme/fixture/branches/main/protection": {
+        required_status_checks: { strict: true, contexts: ["project-ci"] },
+        enforce_admins: { enabled: true },
+        allow_force_pushes: { enabled: false },
+        allow_deletions: { enabled: false },
+        ...reviews,
+      },
+    });
+  const reviewCount = async (reviews: Record<string, unknown>) =>
+    (await createGitHubApiWritePort({ client: protectionAnswer(reviews) }).observeBranchProtection(target, "main"))
+      ?.requiredApprovingReviewCount;
+
+  it("RF1043-04: a present review requirement with no count is unobserved, not \"no reviews required\"", async () => {
+    expect(await reviewCount({ required_pull_request_reviews: {} })).toBe("unobserved");
+    expect(UNOBSERVED).toBe("unobserved");
+  });
+
+  it("keeps absent, null, zero, empty and countless review answers apart", async () => {
+    expect(await reviewCount({})).toBeNull();
+    expect(await reviewCount({ required_pull_request_reviews: null })).toBeNull();
+    expect(await reviewCount({ required_pull_request_reviews: { required_approving_review_count: 0 } })).toBe(0);
+    expect(await reviewCount({ required_pull_request_reviews: { required_approving_review_count: 2 } })).toBe(2);
+    expect(await reviewCount({ required_pull_request_reviews: { required_approving_review_count: null } })).toBe(UNOBSERVED);
+  });
+
+  it("reads status-check contexts it cannot read in full as unobserved, never as a shorter list", async () => {
+    const contexts = async (value: unknown) =>
+      (
+        await createGitHubApiWritePort({
+          client: scriptedClient({
+            "GET repos/acme/fixture/branches/main/protection": {
+              required_status_checks: { strict: true, contexts: value },
+              enforce_admins: { enabled: true },
+              allow_force_pushes: { enabled: false },
+              allow_deletions: { enabled: false },
+            },
+          }),
+        }).observeBranchProtection(target, "main")
+      )?.requiredStatusChecks?.contexts;
+    expect(await contexts(["b", "a"])).toEqual(["a", "b"]);
+    expect(await contexts(undefined)).toBeNull();
+    expect(await contexts(["a", 7])).toBeNull();
   });
 });

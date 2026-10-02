@@ -200,6 +200,38 @@ const checkoutMarkerOf = (localRepoPath: string): string | null => {
  */
 
 /**
+ * Whether a checkout this operation left is settled: the ownership precondition holds for it, its
+ * GitHub ledger receipts every planned operation with nothing pending, and its HEAD is the commit
+ * the push receipt names. Then GitHub holds everything the checkout does, and removing it loses
+ * nothing a rebuild from the ledger does not restore — whether the run that left it is dead or is
+ * finishing its last, local steps.
+ */
+const ownedCheckoutIsSettled = async (
+  workDir: string,
+  localRepoPath: string,
+  github: { execution: GitHubExecutionPlan; ledgerPath: string },
+  owner: { bootstrapOperationId: string; requestDigest: string },
+): Promise<boolean> => {
+  if (!assertParentChainNotAttackerWritable(workDir, localRepoPath).allowed) return false;
+  if (typeof process.getuid !== "function") return false;
+  let leaf: Stats;
+  try {
+    leaf = lstatSync(localRepoPath);
+  } catch {
+    return false;
+  }
+  if (!judgeRealDirectoryEntry(localRepoPath, leaf, process.getuid()).allowed) return false;
+  // Every planned operation receipted leaves nothing pending: the ledger reader refuses a pending
+  // write beside its own receipt, and accepts no pending write for an operation outside the plan.
+  const ledger = readGitHubLedger(github.ledgerPath, owner, github.execution.operations);
+  if (!ledger.allowed) return false;
+  if (github.execution.operations.some((operation) => !ledger.value.receipts.has(operation.operationId))) return false;
+  const push = ledger.value.receipts.get(github.execution.pushOperationId);
+  if (push === undefined || push.resourceType !== "branch") return false;
+  return (await tryRevParse(localRepoPath, "HEAD")) === push.observed.headSha;
+};
+
+/**
  * The ownership/permission decision, factored out so it can be exercised directly with a
  * crafted `{ uid, mode }` — the exact fields `fs.Stats` carries — without needing a real
  * directory owned by a different account, which a test sandbox cannot create without root.
@@ -600,14 +632,25 @@ export const produceRepoFactoryResult = async (
   // system runs multiple same-UID producers concurrently as normal operation, and an
   // `existsSync` check has a gap another process's own creation can land in before this one
   // reads it).
+  // A checkout this operation left behind whose every GitHub write is receipted, at the head
+  // GitHub holds, carries nothing GitHub does not: it is removed and rebuilt from the ledger
+  // below, rather than refused (PR #1043 review round 2, RF1043-02). A run that died after its
+  // last write and before storing its result leaves exactly this.
   if (existsSync(localRepoPath)) {
-    // Said explicitly when the checkout is this operation's own (PR #1043 review, RF1043-02): a
-    // run that died between its last write and storing its result leaves it. It is named rather
-    // than removed, because a live run of the same operation cannot be told from a dead one.
+    if (github !== null && checkoutMarkerOf(localRepoPath) === plan.bootstrapOperationId) {
+      if (await ownedCheckoutIsSettled(workDir, localRepoPath, github, ledgerOwner)) {
+        cleanupOwnedCheckout(workDir, localRepoPath, plan.bootstrapOperationId);
+      }
+    }
+  }
+  if (existsSync(localRepoPath)) {
+    // Said explicitly when the checkout is this operation's own (PR #1043 review, RF1043-02) and
+    // its ledger is not settled: the run that left it stopped mid-write, or is still running.
+    // It is named rather than removed, because a live run cannot be told from a dead one there.
     if (checkoutMarkerOf(localRepoPath) === plan.bootstrapOperationId) {
       return deny(
         ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
-        "this bootstrap operation's checkout already exists: an earlier run of it was interrupted, or is still running. It is not removed automatically; remove it once no run of this operation is active, and the next run resumes from the GitHub ledger",
+        "this bootstrap operation's checkout already exists and its GitHub ledger is not settled: an earlier run of it stopped mid-write, or is still running. It is not removed automatically; remove it once no run of this operation is active, and the next run resumes from the GitHub ledger",
         { refusal: "INTERRUPTED_RUN_CHECKOUT", localRepoPath, resumable: false },
       );
     }
@@ -861,8 +904,15 @@ export const produceRepoFactoryResult = async (
 
   // Kept beside the ledger before it is returned, so a caller that loses it before storing it
   // can rebuild it rather than be refused at this checkout on retry (PR #1043 review, RF1043-02).
+  // A failure to keep it cleans up like every other failure here, so the retry finds no
+  // checkout and rebuilds the result from the ledger (PR #1043 review round 2, RF1043-02).
   if (github !== null) {
-    writeProducedResult(producedResultPath(input.workDir, plan.repositoryRole), ledgerOwner, result);
+    try {
+      writeProducedResult(producedResultPath(input.workDir, plan.repositoryRole), ledgerOwner, result);
+    } catch (thrown) {
+      cleanup();
+      throw thrown;
+    }
   }
   return allow(ReasonCode.OK, result);
 };

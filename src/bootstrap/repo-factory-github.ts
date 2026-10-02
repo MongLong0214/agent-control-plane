@@ -25,6 +25,7 @@ import {
   type GitHubRepositoryTarget,
   type GitHubVisibility,
   type GitHubWritePort,
+  UNOBSERVED,
   type ObservedBranchProtection,
   type ObservedRepository,
 } from "./github-write-port.ts";
@@ -61,13 +62,15 @@ import { parseRepoFactoryResult, type ExternalWriteReceipt, type RepoFactoryResu
  * review, RF1043-02). So every write is recorded twice outside the verified receipts: as a
  * pending intent before the call — carrying what will identify it afterwards — and, where GitHub
  * answers with an identity, again with that answer. A retry reconciles a pending write against
- * GitHub before anything else: a create by the node id its response named or, if no response
- * arrived, by the marker its request put in the repository's description; a push by the commit it
- * pushed; a setting or protection by whether GitHub already holds the requested state. A pending
- * write that GitHub shows no trace of is retried; one GitHub shows a *different* resource for is
- * refused as before, with `indeterminate: true` where the record cannot say which of the two
- * happened. Nothing here weakens the wrong-target refusal: adoption needs the node id, marker or
- * commit this operation itself recorded before it wrote.
+ * GitHub before anything else: a create by the node id its response named; a push by the commit
+ * it pushed; a setting or protection by whether GitHub already holds the requested state. A
+ * pending write that GitHub shows no trace of is retried. One whose outcome the ledger cannot
+ * settle — a create whose response never arrived, with a repository now at the name — is refused
+ * with `indeterminate: true`, rather than adopted by the marker the create put in the repository's
+ * description: that marker is public once the repository exists, so a replacement can carry it
+ * (PR #1043 review round 2, RF1043-06). It is reported as advisory evidence only. Nothing here
+ * weakens the wrong-target refusal: adoption needs a GitHub node id or commit this operation
+ * itself recorded.
  *
  * This file avoids `&&`/`||` on purpose: every refusal is its own branch with its own
  * evidence, so a reader — and `verify-refusal-operands-are-watched.mjs` — sees one decision
@@ -365,11 +368,11 @@ const receiptCommon = {
 const observedProtectionSchema = z
   .object({
     requiredStatusChecks: z
-      .object({ strict: z.boolean().nullable(), contexts: z.array(z.string()) })
+      .object({ strict: z.boolean().nullable(), contexts: z.array(z.string()).nullable() })
       .strict()
       .nullable(),
     enforceAdmins: z.boolean().nullable(),
-    requiredApprovingReviewCount: z.number().int().nullable(),
+    requiredApprovingReviewCount: z.union([z.number().int(), z.null(), z.literal(UNOBSERVED)]),
     allowForcePushes: z.boolean().nullable(),
     allowDeletions: z.boolean().nullable(),
   })
@@ -683,7 +686,10 @@ const normalizedProtection = (state: ComparableProtection): ObservedBranchProtec
   requiredStatusChecks:
     state.requiredStatusChecks === null
       ? null
-      : { strict: state.requiredStatusChecks.strict, contexts: [...state.requiredStatusChecks.contexts].sort() },
+      : {
+          strict: state.requiredStatusChecks.strict,
+          contexts: state.requiredStatusChecks.contexts === null ? null : [...state.requiredStatusChecks.contexts].sort(),
+        },
   enforceAdmins: state.enforceAdmins,
   requiredApprovingReviewCount: state.requiredApprovingReviewCount,
   allowForcePushes: state.allowForcePushes,
@@ -881,12 +887,10 @@ export const applyGitHubOperations = async (
     }
 
     if (observed.value !== null) {
-      // Ours only by what this operation recorded before it wrote: the node id GitHub's create
-      // response named, or — if that response never arrived — the marker the create carried.
-      const recordedNodeId = pendingWrite === undefined ? null : pendingWrite.respondedNodeId;
-      const recordedMarker = pendingWrite === undefined ? null : pendingWrite.marker;
-      const ownsByResponse = recordedNodeId === null ? false : observed.value.nodeId === recordedNodeId;
-      const ownsByMarker = recordedNodeId !== null ? false : recordedMarker !== null ? observed.value.description === recordedMarker : false;
+      // Ours only by a GitHub identity this operation persisted before this read: the node id
+      // GitHub's create response named. The marker cannot stand in for it (PR #1043 review round
+      // 2, RF1043-06): it lives in the repository's public description, so a replacement created
+      // after ours can carry it too.
       if (pendingWrite === undefined) {
         return stop(
           ReasonCode.RESOURCE_COLLISION,
@@ -897,18 +901,33 @@ export const applyGitHubOperations = async (
           false,
         );
       }
-      if (ownsByResponse === ownsByMarker) {
-        // Neither proves it: GitHub's create named another node, or no response arrived and the
-        // description is not our marker. Either the create never landed and someone else holds
-        // the name, or ours was changed since — refused rather than adopted by name.
+      if (pendingWrite.respondedNodeId === null) {
+        // The create was sent and its answer never recorded: it may have landed, and the repository
+        // at this name may be it or a later one. That is reported, not resolved.
         return stop(
           ReasonCode.RESOURCE_COLLISION,
           "WRONG_TARGET",
-          `${target.owner}/${target.name} exists, and nothing this operation recorded before its create identifies it as that create`,
+          `${target.owner}/${target.name} exists, and this operation's create recorded no GitHub identity to tell whether it is that create; it is not adopted on the strength of a public description`,
           id,
           {
-            indeterminate: recordedNodeId === null,
-            recordedNodeId,
+            indeterminate: true,
+            observedNodeId: observed.value.nodeId,
+            observed: readbackOf(observed.value),
+            // Advisory, for whoever resolves this by hand — never authority.
+            markerMatches: observed.value.description === pendingWrite.marker,
+          },
+          false,
+        );
+      }
+      if (observed.value.nodeId !== pendingWrite.respondedNodeId) {
+        return stop(
+          ReasonCode.RESOURCE_COLLISION,
+          "WRONG_TARGET",
+          `${target.owner}/${target.name} is not the repository this operation's create was answered with`,
+          id,
+          {
+            indeterminate: false,
+            recordedNodeId: pendingWrite.respondedNodeId,
             observedNodeId: observed.value.nodeId,
             observed: readbackOf(observed.value),
           },

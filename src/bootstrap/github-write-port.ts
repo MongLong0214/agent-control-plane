@@ -77,12 +77,20 @@ export interface BranchProtectionState {
  * never the value it was asked for or a default, so it cannot compare equal to a requested one.
  */
 export interface ObservedBranchProtection {
-  requiredStatusChecks: { strict: boolean | null; contexts: string[] } | null;
+  requiredStatusChecks: { strict: boolean | null; contexts: string[] | null } | null;
   enforceAdmins: boolean | null;
-  requiredApprovingReviewCount: number | null;
+  /**
+   * `null` here is an answer — GitHub sent no review requirement, or sent it as null — so it
+   * cannot also stand for "GitHub sent a review object without a count". That case is
+   * `UNOBSERVED`, which equals no requested value (PR #1043 review round 2, RF1043-04).
+   */
+  requiredApprovingReviewCount: number | null | typeof UNOBSERVED;
   allowForcePushes: boolean | null;
   allowDeletions: boolean | null;
 }
+
+/** A field GitHub's answer carried no value for, where `null` already means something else. */
+export const UNOBSERVED = "unobserved";
 
 export interface GitHubWritePort {
   observeRepository(target: GitHubRepositoryTarget): Promise<ObservedRepository | null>;
@@ -198,27 +206,35 @@ interface ProtectionDocument {
 const enabled = (flag: { enabled?: unknown } | null | undefined): boolean | null =>
   typeof flag?.enabled === "boolean" ? flag.enabled : null;
 
+/** Every context, as strings, or unobserved — never a filtered subset that reads as the whole. */
+const contextsFrom = (contexts: unknown): string[] | null => {
+  if (!Array.isArray(contexts)) return null;
+  const strings = contexts.filter((context): context is string => typeof context === "string");
+  return strings.length === contexts.length ? strings.sort() : null;
+};
+
 /**
- * GitHub omits `required_status_checks` and `required_pull_request_reviews` when they are off,
- * so their absence is an answer; inside them, and for the always-present flags, a missing field
- * is not, and reads as `null`.
+ * Four answers kept apart, because collapsing any two certifies a fact GitHub did not state:
+ * a requirement object that is absent or null means the requirement is off; one that is present
+ * says what it holds; a present one without the field asked about is unobserved. GitHub omits
+ * `required_status_checks` and `required_pull_request_reviews` when they are off, so their
+ * absence is an answer; a missing field inside them, or a missing always-present flag, is not.
  */
 const protectionFrom = (document: ProtectionDocument): ObservedBranchProtection => {
   const checks = document.required_status_checks;
-  const contexts = checks?.contexts;
-  const reviews = document.required_pull_request_reviews?.required_approving_review_count;
+  const reviews = document.required_pull_request_reviews;
+  const reviewCount = reviews == null ? null : reviews.required_approving_review_count;
   return {
     requiredStatusChecks:
       checks == null
         ? null
         : {
-              strict: typeof checks.strict === "boolean" ? checks.strict : null,
-              contexts: Array.isArray(contexts)
-                ? contexts.filter((context): context is string => typeof context === "string").sort()
-                : [],
-            },
+            strict: typeof checks.strict === "boolean" ? checks.strict : null,
+            contexts: contextsFrom(checks.contexts),
+          },
     enforceAdmins: enabled(document.enforce_admins),
-    requiredApprovingReviewCount: typeof reviews === "number" ? reviews : null,
+    requiredApprovingReviewCount:
+      reviews == null ? null : typeof reviewCount === "number" ? reviewCount : UNOBSERVED,
     allowForcePushes: enabled(document.allow_force_pushes),
     allowDeletions: enabled(document.allow_deletions),
   };

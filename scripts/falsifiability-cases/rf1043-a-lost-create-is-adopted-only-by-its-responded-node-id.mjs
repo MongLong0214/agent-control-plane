@@ -5,8 +5,8 @@ const rf1043ALostCreateIsAdoptedOnlyByItsRespondedNodeId = {
   id: "rf1043-a-lost-create-is-adopted-only-by-its-responded-node-id",
   what: "a create whose read-back was lost is adopted only when the repository has the node id the create's response named",
   file: "src/bootstrap/repo-factory-github.ts",
-  find: "const ownsByResponse = recordedNodeId === null ? false : observed.value.nodeId === recordedNodeId;",
-  replace: "const ownsByResponse = recordedNodeId === null ? false : true;",
+  find: "      if (observed.value.nodeId !== pendingWrite.respondedNodeId) {\n",
+  replace: "      if (observed.value.nodeId !== observed.value.nodeId) {\n",
   killedBy: ["tests/unit/repo-factory-github-producer.test.ts"],
 };
 

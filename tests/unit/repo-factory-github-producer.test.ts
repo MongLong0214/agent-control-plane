@@ -557,19 +557,22 @@ describe("PR #1043 review witnesses — a write GitHub accepted is recoverable a
     expect(github.repository("acme", "fixture")?.nodeId).toBe(created.nodeId);
   });
 
-  it("a create whose own response was lost is adopted on retry by the marker it carried, not refused as someone else's", async () => {
+  it("a create whose own response was lost is reported as indeterminate on retry — explicitly, with no write — not adopted by its public marker", async () => {
+    // Round 1 adopted this by the description marker; round 2 (RF1043-06) showed a replacement
+    // can carry that public marker, so without a recorded node id the outcome stays unresolved.
     const { workDir, github } = makeSandbox();
     github.failAfter = { method: "createRepository", mode: "response" };
     const first = await attempt(workDir, github, "2026-10-02T00:00:00.000Z");
     expect(first.allowed).toBe(false);
-    const created = github.repository("acme", "fixture");
-    if (!created) throw new Error("the create did not reach the double");
+    if (!github.repository("acme", "fixture")) throw new Error("the create did not reach the double");
 
     github.writes.length = 0;
     const retry = await attempt(workDir, github, "2026-10-02T00:05:00.000Z");
-    if (!retry.allowed) throw new Error(`${retry.reasonCode}: ${retry.message} ${JSON.stringify(retry.evidence)}`);
-    expect(github.writes.map((write) => write.method)).not.toContain("createRepository");
-    expect(github.repository("acme", "fixture")?.nodeId).toBe(created.nodeId);
+    expect(retry.allowed).toBe(false);
+    expect(retry.reasonCode).toBe(ReasonCode.RESOURCE_COLLISION);
+    expect(evidenceOf(retry).indeterminate).toBe(true);
+    expect(evidenceOf(retry).markerMatches).toBe(true);
+    expect(github.writes).toEqual([]);
   });
 
   it("a push whose read-back failed is adopted on retry by the commit it pushed, not refused as an unreceipted branch", async () => {
@@ -600,31 +603,58 @@ describe("PR #1043 review witnesses — a write GitHub accepted is recoverable a
     expect(github.writes.map((write) => write.method)).not.toContain("setDefaultBranch");
   });
 
-  it("a create whose ledger line could not be written is adopted on retry, not refused as someone else's", async () => {
+  it("a create whose receipt could not be written is adopted on retry, not refused as someone else's", async () => {
     const { workDir, github } = makeSandbox();
     const scratch = join(workDir, "github-ledger", "primary.json.partial");
+    const observe = github.observeRepository.bind(github);
+    let created = false;
     const create = github.createRepository.bind(github);
-    // The create reaches GitHub; every ledger write after it fails.
     github.createRepository = async (...args: Parameters<typeof create>) => {
-      const created = await create(...args);
-      mkdirSync(scratch, { recursive: true });
-      return created;
+      created = true;
+      return create(...args);
+    };
+    // The create reaches GitHub and is read back; the ledger write that would receipt it fails.
+    github.observeRepository = async (...args: Parameters<typeof observe>) => {
+      const observed = await observe(...args);
+      if (created) mkdirSync(scratch, { recursive: true });
+      return observed;
     };
     await expect(attempt(workDir, github, "2026-10-02T00:00:00.000Z")).rejects.toMatchObject({ code: "EISDIR" });
-    const created = github.repository("acme", "fixture");
-    if (!created) throw new Error("the create did not reach the double");
+    const repository = github.repository("acme", "fixture");
+    if (!repository) throw new Error("the create did not reach the double");
     github.createRepository = create;
+    github.observeRepository = observe;
     rmSync(scratch, { recursive: true, force: true });
 
     github.writes.length = 0;
     const retry = await attempt(workDir, github, "2026-10-02T00:05:00.000Z");
     if (!retry.allowed) throw new Error(`${retry.reasonCode}: ${retry.message} ${JSON.stringify(retry.evidence)}`);
     expect(github.writes.map((write) => write.method)).not.toContain("createRepository");
-    expect(github.repository("acme", "fixture")?.nodeId).toBe(created.nodeId);
+    expect(github.repository("acme", "fixture")?.nodeId).toBe(repository.nodeId);
   });
 });
 
 describe("pending writes and readback fidelity (#1043 review follow-through)", () => {
+  it("a create whose answer could not be recorded at all is reported as indeterminate on retry, with no write", async () => {
+    const { workDir, github } = makeSandbox();
+    const scratch = join(workDir, "github-ledger", "primary.json.partial");
+    const create = github.createRepository.bind(github);
+    // The create reaches GitHub; the ledger write that would record its answer fails.
+    github.createRepository = async (...args: Parameters<typeof create>) => {
+      const created = await create(...args);
+      mkdirSync(scratch, { recursive: true });
+      return created;
+    };
+    await expect(produce(workDir, github)).rejects.toMatchObject({ code: "EISDIR" });
+    github.createRepository = create;
+    rmSync(scratch, { recursive: true, force: true });
+    github.writes.length = 0;
+    const retry = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
+    expect(retry.allowed).toBe(false);
+    expect(evidenceOf(retry).indeterminate).toBe(true);
+    expect(github.writes).toEqual([]);
+  });
+
   it("refuses a protection GitHub kept without `strict`, though every other field matches (RF1043-04)", async () => {
     const { workDir, github } = makeSandbox();
     github.keepProtection = (requested) => {
@@ -659,6 +689,7 @@ describe("pending writes and readback fidelity (#1043 review follow-through)", (
     expect(retry.reasonCode).toBe(ReasonCode.RESOURCE_COLLISION);
     expect(evidenceOf(retry).refusal).toBe("WRONG_TARGET");
     expect(evidenceOf(retry).indeterminate).toBe(true);
+    expect(evidenceOf(retry).markerMatches).toBe(false);
     expect(github.writes).toEqual([]);
   });
 
@@ -734,14 +765,86 @@ describe("pending writes and readback fidelity (#1043 review follow-through)", (
     expect(evidenceOf(produced).failedOperationId).toBe("push-default-branch:fixture");
   });
 
-  it("says plainly when the leftover checkout is this operation's own, and removes nothing", async () => {
+  it("says plainly when the leftover checkout is this operation's own and its ledger is not settled, and removes nothing", async () => {
     const { workDir, github } = makeSandbox();
     const first = await produce(workDir, github);
     if (!first.allowed) throw new Error(`${first.reasonCode}: ${first.message}`);
+    // As a run that stopped before its last receipt would leave it.
+    const ledger = readLedger(workDir);
+    ledger.receipts = ledger.receipts.filter((receipt) => receipt.resourceType !== "branch-protection");
+    writeFileSync(ledgerPath(workDir), JSON.stringify(ledger));
     const checkout = repositoryCheckoutPath(workDir, "primary");
+    github.writes.length = 0;
     const again = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
     expect(again.allowed).toBe(false);
     expect(evidenceOf(again).refusal).toBe("INTERRUPTED_RUN_CHECKOUT");
     expect(existsSync(checkout)).toBe(true);
+    expect(github.writes).toEqual([]);
+  });
+});
+
+/**
+ * PR #1043 review round 2 witnesses. Each reproduces its finding against the round-1 head
+ * (88b286db), where it fails, and is kept as that finding's regression guard.
+ */
+describe("PR #1043 review round 2 witnesses", () => {
+  it("RF1043-06: a replacement repository carrying the lost create's public marker is not adopted, and nothing is written to it", async () => {
+    const { workDir, github } = makeSandbox();
+    github.failAfter = { method: "createRepository", mode: "response" };
+    expect((await produce(workDir, github)).allowed).toBe(false);
+    const ours = github.repository("acme", "fixture");
+    if (!ours) throw new Error("the create did not reach the double");
+    // Deleted and recreated by someone else, who copied the public description.
+    const replacement = await github.replace("acme", "fixture");
+    replacement.description = ours.description;
+    github.writes.length = 0;
+    const retry = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
+    expect(retry.allowed).toBe(false);
+    expect(evidenceOf(retry).refusal).toBe("WRONG_TARGET");
+    expect(github.writes).toEqual([]);
+  });
+
+  it("RF1043-02: a result file that could not be written does not strand its checkout — the retry rebuilds from the ledger with no write", async () => {
+    const { workDir, github } = makeSandbox();
+    const scratch = join(workDir, "github-ledger", "primary.result.json.partial");
+    mkdirSync(scratch, { recursive: true });
+    await expect(produce(workDir, github)).rejects.toMatchObject({ code: "EISDIR" });
+    expect(readLedger(workDir).receipts).toHaveLength(4);
+    // The failure cleans up like every other: no checkout is left for the retry to trip on.
+    expect(existsSync(repositoryCheckoutPath(workDir, "primary"))).toBe(false);
+    rmSync(scratch, { recursive: true, force: true });
+    github.writes.length = 0;
+    const retry = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
+    if (!retry.allowed) throw new Error(`${retry.reasonCode}: ${retry.message} ${JSON.stringify(retry.evidence)}`);
+    expect(github.writes).toEqual([]);
+    expect(existsSync(join(workDir, "github-ledger", "primary.result.json"))).toBe(true);
+  });
+
+  it("a leftover checkout moved off the head GitHub holds is not settled, so it is named and kept rather than rebuilt", async () => {
+    const { workDir, github } = makeSandbox();
+    const first = await produce(workDir, github);
+    if (!first.allowed) throw new Error(`${first.reasonCode}: ${first.message}`);
+    rmSync(join(workDir, "github-ledger", "primary.result.json"), { force: true });
+    const checkout = repositoryCheckoutPath(workDir, "primary");
+    await git(checkout, ["-c", "user.email=x@example.com", "-c", "user.name=x", "commit", "-q", "--allow-empty", "-m", "local only"]);
+    github.writes.length = 0;
+    const again = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
+    expect(again.allowed).toBe(false);
+    expect(evidenceOf(again).refusal).toBe("INTERRUPTED_RUN_CHECKOUT");
+    expect(existsSync(checkout)).toBe(true);
+    expect(github.writes).toEqual([]);
+  });
+
+  it("RF1043-02: a run that died after its last receipt and before keeping its result is rebuilt from its own settled checkout and ledger", async () => {
+    const { workDir, github } = makeSandbox();
+    const first = await produce(workDir, github);
+    if (!first.allowed) throw new Error(`${first.reasonCode}: ${first.message}`);
+    // The process died between its last receipt and the result file: checkout and ledger remain.
+    rmSync(join(workDir, "github-ledger", "primary.result.json"), { force: true });
+    github.writes.length = 0;
+    const retry = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
+    if (!retry.allowed) throw new Error(`${retry.reasonCode}: ${retry.message} ${JSON.stringify(retry.evidence)}`);
+    expect(github.writes).toEqual([]);
+    expect(retry.value.bootstrapVerification[0]?.exactHead).toBe(first.value.bootstrapVerification[0]?.exactHead);
   });
 });
