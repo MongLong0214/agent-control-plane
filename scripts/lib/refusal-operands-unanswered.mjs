@@ -1322,6 +1322,113 @@ const groups = [
       ["typeof (answer as Record<string, unknown>).text !== \"string\"",1],
     ],
   },
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // registrySizeWithinBound
+    reason: "NO WITNESS. Measured by weakening `Number.isSafeInteger(size)` and `size >= 0` each to `true` and running the registry, canonical-self-claim and process-identity suites together (149 cases): 149 passed either way. Every caller passes `opened.size` or a `count` accumulated by the read loop, both always a real non-negative safe integer under the real and the overridden `fstat`/`read` fixtures this suite builds; distinguishing either operand needs a fixture whose fstat or read loop returns a NaN, fractional, or negative size, which no test constructs.",
+    operands: [
+      ["Number.isSafeInteger(size)",1],
+      ["size >= 0",1],
+    ],
+  },
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // registryProcStartFromToken, linux branch
+    reason: "NO WITNESS. Measured by weakening each of `!boot`, `!Number.isSafeInteger(ticks)`, `!Number.isSafeInteger(ticksPerSecond)` and `ticksPerSecond <= 0` to `false` and running the same 149 cases: 149 passed every time. This branch only runs for a `linux-clk:` start token; every fixture in this suite supplies the Darwin-shaped `darwin-tv:` token, so the branch is never reached, let alone with a value that would distinguish these four checks from one another.",
+    operands: [
+      ["!boot",1],
+      ["!Number.isSafeInteger(ticks)",1],
+      ["!Number.isSafeInteger(ticksPerSecond)",1],
+      ["ticksPerSecond <= 0",1],
+    ],
+  },
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // registryProcStartFromToken, common tail
+    reason: "NO WITNESS. Measured by weakening `!Number.isSafeInteger(seconds)` and `seconds < 0` each to `false` and running the same 149 cases: 149 passed. `seconds` is `Number(darwin[1])` where `darwin[1]` is the token regex's `\\d+` capture, always a safe non-negative integer for any token this suite supplies; neither operand is reachable without a token whose digit run overflows `Number.MAX_SAFE_INTEGER`, which no test constructs.",
+    operands: [
+      ["!Number.isSafeInteger(seconds)",1],
+      ["seconds < 0",1],
+    ],
+  },
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // makeDefaultHostSessionRegistryReader, open() catch
+    reason: "NO WITNESS. Measured by weakening `error instanceof Error`, `\"code\" in error` and `error.code === \"ENOTDIR\"` each to a value that removes its own branch, and running the same 149 cases: 149 passed every time. Every open failure this suite produces is a real Node `fs` error, always an `Error` instance carrying a `code` string, so the first two narrow nothing any fixture disagrees with. `ENOTDIR`'s sibling `ENOENT` is exercised by removing the registry file outright (named above); `ENOTDIR` needs a path whose parent directory component is itself a file, which no fixture builds.",
+    operands: [
+      ["error instanceof Error",1],
+      ["\"code\" in error",1],
+      ["error.code === \"ENOTDIR\"",1],
+    ],
+  },
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // makeDefaultHostSessionRegistryReader, re-fstat replacement check
+    reason: "NO WITNESS. Measured by weakening `!current.isFile()`, `current.uid !== uid` and `current.size !== opened.size` each to `false` and running the same 149 cases: 149 passed each time. The one fixture that replaces the registry file between the two opens (`refuses a regular registry path replaced while its opened fd is read`) renames in a same-size, same-owner, regular file with a different sessionId, so only the dev/ino pair named by `host-session-registry-path-replacement` distinguishes it. A fixture swapping in a directory, FIFO, different-uid file, or different-length file at the same device/inode would be needed to separate these three.",
+    operands: [
+      ["!current.isFile()",1],
+      ["current.uid !== uid",1],
+      ["current.size !== opened.size",1],
+    ],
+  },
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // makeDefaultHostSessionRegistryReader, parsed JSON shape
+    reason: "NO WITNESS. Measured by weakening `typeof entry !== \"object\"` and `Array.isArray(entry)` each to `false` and running the same 149 cases: 149 passed. The one malformed-shape fixture (`refuses registry JSON that is not an object`) writes the JSON literal `null`, caught by the sibling `entry === null` check named above; a fixture writing a bare number, string, or a JSON array would be needed to separate these two.",
+    operands: [
+      ["typeof entry !== \"object\"",1],
+      ["Array.isArray(entry)",1],
+    ],
+  },
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // makeDefaultHostSessionRegistryReader, procStart field type
+    reason: "NO WITNESS. Measured by weakening `typeof fields.procStart !== \"string\"` to `false` and running the same 149 cases: 149 passed. Every fixture reaching this line writes `procStart` as a string, correct or one second stale; none writes a non-string value, which its sibling `fields.procStart !== expectedProcStart` (named by `host-session-registry-proc-start-matches-kernel`) cannot distinguish from a wrong string.",
+    operands: [
+      ["typeof fields.procStart !== \"string\"",1],
+    ],
+  },
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // makeDefaultHostSessionRegistryReader, sessionId field type
+    reason: "NO WITNESS. Measured by weakening `typeof fields.sessionId !== \"string\"` to `false` and running the same 149 cases: 149 passed. Every fixture reaching this line writes `sessionId` as a string (valid, padded, or uppercase); the non-UUID-shape fixture (named above) also writes a string, so no fixture distinguishes a missing type from a malformed one.",
+    operands: [
+      ["typeof fields.sessionId !== \"string\"",1],
+    ],
+  },
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // deriveClaimantIdentity, start-token-stable guard
+    reason: "NO WITNESS. Measured by weakening `snapshot.startedAt === null` to `false` and running the same 149 cases: 149 passed. Reaching this line requires `registry.allowed` to be true, and every registry reader this suite builds refuses a null start token before allowing, inside `registryProcStartFromToken` — so a registry can never be observed as allowed while `snapshot.startedAt` is null under any reader exercised here. A reader that is allowed without consulting the start token at all would be needed to separate this from its sibling `afterRead !== snapshot.startedAt` (named by `host-session-registry-start-token-stable`).",
+    operands: [
+      ["snapshot.startedAt === null",1],
+    ],
+  },
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // deriveClaimantIdentity, a registry anomaly refusing a valid argv selector (#1035)
+    reason: "TypeScript enforcing. Measured by replacing `!registry.allowed` with `true` and running `tsc --noEmit -p .`: exit 2, TS2339 \"Property 'message' does not exist on type 'Decision<{ sessionUuid: string; }>'\" at the refusal's own `registry.message`. The operand is the narrowing that makes the denied registry's message readable, so no compiling mutation removes it. Its two siblings are named: `argvSessionUuid` by host-session-registry-anomaly-refusal-needs-argv and `!isHostSessionRegistryAbsent(registry)` by host-session-registry-anomaly-refuses-argv.",
+    operands: [
+      ["!registry.allowed",1],
+    ],
+  },
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // processStartEpochNs, linux branch (#1035)
+    reason: "NO WITNESS. This branch runs only for a `linux-clk:` start token. Every fixture supplies a `darwin-tv:` token, and the suite and the falsifiability sweep run on macos-15 (ci.yml `verify-matrix`, `guard-falsifiability`), where the default inspector never produces a Linux token. Separating `!uptime` from `ticksPerSecond <= 0n` needs a Linux host whose `/proc/uptime` is unreadable or malformed, or whose `getconf CLK_TCK` answers zero; neither is constructible here.",
+    operands: [
+      ["!uptime",1],
+      ["ticksPerSecond <= 0n",1],
+    ],
+  },
+  {
+    file: "src/registry/canonical-self-claim.ts",
+    // registryCreationNs, Linux ctime fallback (#1035)
+    reason: "NO WITNESS. `process.platform === \"linux\"` is named by host-session-registry-ctime-fallback-is-linux-only, so on the macos-15 host that runs the suite the second operand is never evaluated: Darwin short-circuits before `stats.ctimeNs > 0n`. Removing it changes the answer only on Linux, for a file whose birth time and ctime both read zero, and the one fixture that zeroes both (`refuses a registry file with neither a birth time nor a ctime`) refuses through the platform operand on Darwin first.",
+    operands: [
+      ["stats.ctimeNs > 0n",1],
+    ],
+  },
 ];
 
 export const UNANSWERED = new Map(groups.flatMap(({ file, reason, operands }) =>

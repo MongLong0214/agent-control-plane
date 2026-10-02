@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync, type BigIntStats, type Stats } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync, type BigIntStats } from "node:fs";
 import { homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -530,6 +530,17 @@ export const deriveClaimantIdentity = (
         );
       }
       const registry = registryReader.read(snapshot.pid, snapshot.startedAt);
+      // Only a file that is not there leaves argv to stand alone. A file that is there and could
+      // not be verified — replaced during the read, the wrong shape, an earlier process's, or
+      // unverifiable — refuses even a valid argv selector: the selector cannot outvote evidence
+      // that the process may now be running a session it does not name.
+      if (!registry.allowed && argvSessionUuid && !isHostSessionRegistryAbsent(registry)) {
+        return deny(
+          registry.reasonCode,
+          `the claude ancestor's host session registry entry could not be verified, so its argv selector is not accepted: ${registry.message}`,
+          { pid: snapshot.pid },
+        );
+      }
       if (registry.allowed) {
         // A registry entry belongs to the process observed before the file read only if the
         // kernel still reports that exact native-resolution start token afterward.
@@ -875,16 +886,32 @@ export interface HostSessionRegistryReader {
   read(pid: number, startToken: string | null): Decision<{ sessionUuid: string }>;
 }
 
-/** Injectable descriptor operations keep path swaps and fstat failures deterministic in tests. */
+/**
+ * The one registry refusal that is not an anomaly: no file exists at the ancestor's path. Only this
+ * answer lets an argv selector stand on its own. A read that found a file and could not verify it
+ * — replaced during the read, the wrong shape, the wrong process, unverifiable — refuses the claim
+ * whatever argv names, because the file it did find is evidence the selector may be stale.
+ */
+const HOST_SESSION_REGISTRY_ABSENT = "absent";
+export const hostSessionRegistryAbsent = (message: string): Decision<{ sessionUuid: string }> =>
+  deny(ReasonCode.NOT_FOUND, message, { hostSessionRegistry: HOST_SESSION_REGISTRY_ABSENT });
+const isHostSessionRegistryAbsent = (registry: Decision<{ sessionUuid: string }>): boolean =>
+  registry.evidence["hostSessionRegistry"] === HOST_SESSION_REGISTRY_ABSENT;
+
+/**
+ * Injectable descriptor operations keep path swaps and fstat failures deterministic in tests.
+ * `fstat` answers at bigint precision: the file's creation time is compared to the process's start
+ * token at nanosecond resolution, which a number millisecond field cannot carry exactly.
+ */
 export interface HostSessionRegistryFileOps {
   open(path: string, flags: number): number;
-  fstat(fd: number): Stats;
+  fstat(fd: number): BigIntStats;
   read(fd: number, buffer: Buffer, offset: number, length: number, position: number): number;
   close(fd: number): void;
 }
 
 const defaultHostSessionRegistryFileOps: HostSessionRegistryFileOps = {
-  open: openSync, fstat: fstatSync, read: readSync, close: closeSync,
+  open: openSync, fstat: (fd) => fstatSync(fd, { bigint: true }), read: readSync, close: closeSync,
 };
 
 const HOST_SESSION_REGISTRY_MAX_BYTES = 64 * 1024;
@@ -930,7 +957,48 @@ const registryProcStartFromToken = (token: string | null): string | null => {
 };
 
 /**
- * The session directory is the sibling of the one transcript root this module already uses.
+ * The ancestor's native start as nanoseconds since the Unix epoch, the instant the registry file's
+ * creation time must not precede. `null` when the token cannot be placed on the wall clock.
+ *
+ * Darwin's token is the kernel's own `pbi_start_tvsec`/`tvusec` wall-clock pair, so it converts
+ * exactly. Linux's is clock ticks since boot; the boot instant is taken as the current wall clock
+ * minus `/proc/uptime`, which is truncated to 10 ms, and both that truncation and the tick are
+ * rounded *up*. The estimate can therefore only be later than the true start, never earlier: a file
+ * created just after its process started may be refused, a file created before it is not admitted.
+ */
+const processStartEpochNs = (token: string | null): bigint | null => {
+  const darwin = /^darwin-tv:(\d+)\.(\d{6})$/.exec(token ?? "");
+  if (darwin) return BigInt(darwin[1]!) * 1_000_000_000n + BigInt(darwin[2]!) * 1_000n;
+  const linux = /^linux-clk:(\d+)$/.exec(token ?? "");
+  if (!linux) return null;
+  try {
+    const uptime = /^(\d+)\.(\d{2})\s/.exec(readFileSync("/proc/uptime", "utf8"));
+    const ticksPerSecond = BigInt(execFileSync("getconf", ["CLK_TCK"], { encoding: "utf8", timeout: 2_000 }).trim());
+    if (!uptime || ticksPerSecond <= 0n) return null;
+    const nowUpperNs = (BigInt(Date.now()) + 1n) * 1_000_000n;
+    const uptimeNs = BigInt(uptime[1]!) * 1_000_000_000n + BigInt(uptime[2]!) * 10_000_000n;
+    const sinceBootUpperNs = ((BigInt(linux[1]!) + 1n) * 1_000_000_000n + ticksPerSecond - 1n) / ticksPerSecond;
+    return nowUpperNs - uptimeNs + sinceBootUpperNs;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * When the kernel says the opened file came into existence, or `null` when it cannot say. Darwin
+ * records `st_birthtime` on every local filesystem. Linux reports a birth time only where `statx`
+ * and the filesystem carry one; where it reads zero, `ctime` is the strongest remaining fact — it is
+ * never earlier than the file's creation, so it still refuses a file untouched since before the
+ * process started, but a stale file whose metadata changed after that start is not refused by it.
+ */
+const registryCreationNs = (stats: BigIntStats): bigint | null => {
+  if (stats.birthtimeNs > 0n) return stats.birthtimeNs;
+  if (process.platform === "linux" && stats.ctimeNs > 0n) return stats.ctimeNs;
+  return null;
+};
+
+/**
+ * The host registry directory sits beside the one transcript root this module already uses.
  * The reader owns all host-file checks so synthetic ancestry tests can inject a reader without
  * consulting the actual Claude home.
  */
@@ -940,14 +1008,15 @@ export const makeDefaultHostSessionRegistryReader = (
 ): HostSessionRegistryReader => ({
   read(pid, startToken) {
     const path = join(root, `${pid}.json`);
-    const uid = process.getuid?.();
+    const processUid = process.getuid?.();
+    const uid = processUid === undefined ? undefined : BigInt(processUid);
     let fd: number;
     try {
       fd = fileOps.open(path, HOST_SESSION_REGISTRY_OPEN_FLAGS);
     } catch (error) {
       if (error instanceof Error && "code" in error) {
         if (error.code === "ENOENT" || error.code === "ENOTDIR") {
-          return deny(ReasonCode.NOT_FOUND, `host session registry file is absent: ${path}`);
+          return hostSessionRegistryAbsent(`host session registry file is absent: ${path}`);
         }
         if (error.code === "ELOOP") {
           return deny(ReasonCode.INVALID_ARGUMENT, `host session registry file is a symlink: ${path}`);
@@ -956,14 +1025,14 @@ export const makeDefaultHostSessionRegistryReader = (
       return deny(ReasonCode.PROBE_FAILED, `host session registry file could not be opened safely: ${path}`);
     }
     let raw: string;
-    let opened: Stats;
+    let opened: BigIntStats;
     try {
       opened = fileOps.fstat(fd);
       if (!opened.isFile()) return deny(ReasonCode.INVALID_ARGUMENT, `host session registry file is not regular: ${path}`);
       if (uid === undefined || opened.uid !== uid) {
         return deny(ReasonCode.INVALID_ARGUMENT, `host session registry file is not owned by the daemon uid: ${path}`);
       }
-      if (!registrySizeWithinBound(opened.size)) {
+      if (!registrySizeWithinBound(Number(opened.size))) {
         return deny(ReasonCode.INVALID_ARGUMENT, `host session registry file exceeds the size limit: ${path}`);
       }
       const bytes = Buffer.alloc(HOST_SESSION_REGISTRY_MAX_BYTES + 1);
@@ -974,7 +1043,7 @@ export const makeDefaultHostSessionRegistryReader = (
         count += n;
       }
       if (!registrySizeWithinBound(count)) return deny(ReasonCode.INVALID_ARGUMENT, `host session registry file exceeds the size limit: ${path}`);
-      if (count !== opened.size) return deny(ReasonCode.PROBE_FAILED, `host session registry file changed during read: ${path}`);
+      if (BigInt(count) !== opened.size) return deny(ReasonCode.PROBE_FAILED, `host session registry file changed during read: ${path}`);
       raw = bytes.subarray(0, count).toString("utf8");
     } catch {
       return deny(ReasonCode.PROBE_FAILED, `host session registry file could not be read: ${path}`);
@@ -1019,6 +1088,30 @@ export const makeDefaultHostSessionRegistryReader = (
     }
     if (typeof fields.procStart !== "string" || fields.procStart !== expectedProcStart) {
       return deny(ReasonCode.CONFLICT, `host session registry procStart does not match the kernel start time: ${path}`);
+    }
+    // procStart is whole seconds, so a process that reuses this pid within the same second as an
+    // earlier one matches a file the earlier one left. The file itself was created by a process
+    // that existed when it was written: a file whose kernel creation time precedes this process's
+    // native start token was written before this process instance existed, and is refused.
+    //
+    // Residual risk: both instants are wall-clock readings. A wall clock stepped backward between
+    // a dead process writing this file and a same-second reuse of its pid can place the stale
+    // file's creation after the new start and admit it; a forward step cannot. A same-uid process
+    // can also set a file's birth time (`setattrlist`), which is inside the threat model this
+    // registry already carries — it is supplementary evidence a same-uid writer controls.
+    const startedNs = processStartEpochNs(startToken);
+    if (startedNs === null) {
+      return deny(ReasonCode.PROBE_FAILED, `claude ancestor start token cannot be placed against the registry file's creation time: ${path}`);
+    }
+    const createdNs = registryCreationNs(opened);
+    if (createdNs === null) {
+      return deny(ReasonCode.PROBE_FAILED, `host session registry file creation time cannot be established: ${path}`);
+    }
+    if (createdNs < startedNs) {
+      return deny(
+        ReasonCode.CONFLICT,
+        `host session registry file was created before the claude ancestor started, so it belongs to an earlier process at this pid: ${path}`,
+      );
     }
     if (typeof fields.sessionId !== "string" || !UUID_PATTERN.test(fields.sessionId)) {
       return deny(ReasonCode.INVALID_ARGUMENT, `host session registry sessionId is not an exact UUID: ${path}`);
@@ -1306,10 +1399,10 @@ export function verifyClaudeIdentity(
   const processInspector = deps.processInspector ?? defaultProcessAncestryInspector;
   const imageInspector = deps.imageInspector ?? defaultExecutingImageInspector;
   const transcriptReader = deps.transcriptReader ?? defaultTranscriptReader;
+  const registryReader = deps.hostSessionRegistryReader ?? makeDefaultHostSessionRegistryReader();
   // Clause 1 — derive independently before anything the caller said is ever consulted.
   const derived = deriveClaimantIdentity(
-    request.callerPid, processInspector, deps.maxAncestryHops ?? MAX_ANCESTRY_HOPS,
-    deps.hostSessionRegistryReader ?? makeDefaultHostSessionRegistryReader(),
+    request.callerPid, processInspector, deps.maxAncestryHops ?? MAX_ANCESTRY_HOPS, registryReader,
   );
   if (!derived.allowed) return derived as Decision<VerifiedClaudeIdentity>;
   const identity = derived.value;
@@ -1438,7 +1531,7 @@ export function verifyClaudeIdentity(
   // walk and this image resolution did real, non-instantaneous I/O; a pid reused in between
   // must be caught here, before the transcript check or the async Buzz boundary below run
   // anything else against `identity.pid` as though it still names the verified process.
-  const stillLiveAfterImage = assertClaudeIdentityStillLive(identity, processInspector);
+  const stillLiveAfterImage = assertClaudeIdentityStillLive(identity, processInspector, registryReader);
   if (!stillLiveAfterImage.allowed) return stillLiveAfterImage as Decision<VerifiedClaudeIdentity>;
   // Clause 2 — the transcript.
   const transcript = transcriptReader.locate(identity.sessionUuid);
@@ -1460,15 +1553,53 @@ export function verifyClaudeIdentity(
   return allow(ReasonCode.OK, { identity, image, transcript });
 }
 
+/**
+ * Re-verifies an identity `deriveClaimantIdentity` established earlier, at a later checkpoint: the
+ * process at `identity.pid` still has the verified start token, *and* deriving its session again —
+ * argv and host registry, with every check the first derivation ran — still yields the UUID verified earlier.
+ * A process keeps its pid and start token across an in-process `/resume`, so the start token alone
+ * cannot see the session change; the re-derivation can, and it refuses rather than substituting
+ * either the new session or the one the request named.
+ *
+ * The re-derivation starts at `identity.pid` itself and walks no further: the claimant is that
+ * process, and an ancestor it no longer looks like is not one to climb past. It reuses the snapshot
+ * just taken for the start-token check, so each checkpoint scans the process once.
+ */
 export function assertClaudeIdentityStillLive(
-  identity: DerivedClaimantIdentity, inspector: ProcessAncestryInspector = defaultProcessAncestryInspector,
+  identity: DerivedClaimantIdentity,
+  inspector: ProcessAncestryInspector = defaultProcessAncestryInspector,
+  registryReader: HostSessionRegistryReader = makeDefaultHostSessionRegistryReader(),
 ): Decision<true> {
-  const observed = inspector.snapshot(identity.pid)?.startedAt ?? null;
+  const snapshot = inspector.snapshot(identity.pid);
+  const observed = snapshot?.startedAt ?? null;
   if (observed !== identity.startedAt) {
     return deny(
       ReasonCode.CONFLICT,
       "the claimant process's start time no longer matches the identity verified earlier in this claim — its pid may have been reused",
       { pid: identity.pid, verifiedStartedAt: identity.startedAt, observedStartedAt: observed },
+    );
+  }
+  const pinned: ProcessAncestryInspector = {
+    snapshot: (pid) => pid === identity.pid ? snapshot : inspector.snapshot(pid),
+    // The after-read start-token check must reach the kernel again, never the pinned snapshot.
+    readStartToken: (pid) => inspector.readStartToken !== undefined
+      ? inspector.readStartToken(pid)
+      : inspector.snapshot(pid)?.startedAt ?? null,
+  };
+  const rederived = deriveClaimantIdentity(identity.pid, pinned, 1, registryReader);
+  if (!rederived.allowed) {
+    return deny(
+      rederived.reasonCode,
+      `the claimant's session could not be derived again at this checkpoint: ${rederived.message}`,
+      { pid: identity.pid },
+    );
+  }
+  // The pid needs no comparison: a one-hop derivation starting at `identity.pid` answers for it alone.
+  if (rederived.value.sessionUuid !== identity.sessionUuid) {
+    return deny(
+      ReasonCode.CONFLICT,
+      "the claimant process's session changed after its identity was verified in this claim",
+      { pid: identity.pid, verifiedSessionUuid: identity.sessionUuid, observedSessionUuid: rederived.value.sessionUuid },
     );
   }
   return allow(ReasonCode.OK, true);
@@ -1729,6 +1860,8 @@ export class CanonicalSelfClaim {
     // control left this process entirely (a shelled Buzz CLI transport), for however long that
     // took, before returning. A pid reused during that gap must be caught before `#mutate` ever
     // opens its transaction and writes `identity.pid` as though it were still the verified one.
+    // The session is derived again here too: a `/resume` during that await keeps the pid and start
+    // token and changes the session, and the UUID derived before it must not be bound (#1035).
     const stillLiveAfterBuzz = this.#assertClaimantStillLive(identity);
     if (!stillLiveAfterBuzz.allowed) return stillLiveAfterBuzz as Decision<CanonicalSelfClaimReceipt>;
 
@@ -1739,7 +1872,9 @@ export class CanonicalSelfClaim {
 
   /**
    * Re-verifies the immutable `(pid, startedAt)` adoption identity `deriveClaimantIdentity`
-   * established at clause 1, at a point later than that derivation. `identity.startedAt` is
+   * established at clause 1, at a point later than that derivation, and derives the claimant's
+   * session again through the same registry reader (#1035): the session a live process runs can
+   * change under an unchanged pid and start token. `identity.startedAt` is
    * guaranteed non-null here — clause 2's own null check above already denied that case — so this
    * is always a real string-to-string comparison, never a vacuous pass on two nulls.
    *
@@ -1749,7 +1884,7 @@ export class CanonicalSelfClaim {
    * not against a real kernel lookup for a pid that was never real to begin with.
    */
   #assertClaimantStillLive(identity: DerivedClaimantIdentity): Decision<true> {
-    return assertClaudeIdentityStillLive(identity, this.#processInspector);
+    return assertClaudeIdentityStillLive(identity, this.#processInspector, this.#hostSessionRegistryReader);
   }
 
   /**

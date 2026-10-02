@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { closeSync, constants, fstatSync, mkdtempSync, mkdirSync, openSync, readSync, renameSync, rmSync, symlinkSync, writeFileSync, type Stats } from "node:fs";
+import { closeSync, constants, fstatSync, mkdtempSync, mkdirSync, openSync, readSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, type BigIntStats } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -12,6 +12,7 @@ const CANON = "11111111-1111-4111-8111-111111111111";
 const OTHER = "22222222-2222-4222-8222-222222222222";
 const START = "darwin-tv:1790893367.707157";
 const PROC_START = "Thu Oct  1 22:22:47 2026";
+const HEX_LETTER_UUID = "abcdef12-3456-4789-8abc-def012345678";
 const tempDirs: string[] = [];
 
 afterEach(() => {
@@ -35,8 +36,24 @@ const fixture = (entry: unknown = { pid: 10, procStart: PROC_START, sessionId: C
 const derive = (argv: string[], reader: claim.HostSessionRegistryReader, startedAt: string | null = START) =>
   claim.deriveClaimantIdentity(10, inspector(argv, startedAt), 8, reader);
 
+/** The timestamp the reader treats as the file's creation: birthtime, or ctime where Linux has none. */
+const registryCreationNs = (path: string): bigint => {
+  const stats = statSync(path, { bigint: true });
+  return stats.birthtimeNs > 0n || process.platform !== "linux" ? stats.birthtimeNs : stats.ctimeNs;
+};
+const darwinToken = (ns: bigint): string =>
+  `darwin-tv:${ns / 1_000_000_000n}.${String((ns % 1_000_000_000n) / 1_000n).padStart(6, "0")}`;
+/** The host's whole-second `TZ=UTC` ctime rendering of the second containing `ns`. */
+const procStartOf = (ns: bigint): string => {
+  const [weekday, day, month, year, clock] = new Date(Number(ns / 1_000_000_000n) * 1_000)
+    .toUTCString().replace(",", "").split(" ");
+  return `${weekday} ${month} ${day!.replace(/^0/, " ")} ${clock} ${year}`;
+};
+
+const statFd = (fd: number): BigIntStats => fstatSync(fd, { bigint: true });
+
 const fileOps = (overrides: Partial<claim.HostSessionRegistryFileOps> = {}): claim.HostSessionRegistryFileOps => ({
-  open: openSync, fstat: fstatSync, read: readSync, close: closeSync, ...overrides,
+  open: openSync, fstat: statFd, read: readSync, close: closeSync, ...overrides,
 });
 
 describe("canonical host session registry derivation", () => {
@@ -141,10 +158,10 @@ describe("canonical host session registry derivation", () => {
     let firstStat = true;
     const reader = claim.makeDefaultHostSessionRegistryReader(root, fileOps({
       fstat(fd) {
-        const stat = fstatSync(fd);
+        const stat = statFd(fd);
         if (!firstStat) return stat;
         firstStat = false;
-        return Object.assign(Object.create(stat) as Stats, { isFile: () => false });
+        return Object.assign(Object.create(stat) as BigIntStats, { isFile: () => false });
       },
     }));
     expect(derive(["claude"], reader)).toMatchObject({ allowed: false, message: expect.stringContaining("regular") });
@@ -161,7 +178,7 @@ describe("canonical host session registry derivation", () => {
     const { root } = fixture();
     const reader = claim.makeDefaultHostSessionRegistryReader(root, fileOps({
       fstat(fd) {
-        return Object.assign(Object.create(fstatSync(fd)) as Stats, { size: 65537 });
+        return Object.assign(Object.create(statFd(fd)) as BigIntStats, { size: 65537n });
       },
     }));
     expect(derive(["claude"], reader)).toMatchObject({ allowed: false, message: expect.stringContaining("size") });
@@ -199,10 +216,10 @@ describe("canonical host session registry derivation", () => {
     let firstStat = true;
     const reader = claim.makeDefaultHostSessionRegistryReader(root, fileOps({
       fstat(fd) {
-        const stat = fstatSync(fd);
+        const stat = statFd(fd);
         if (!firstStat) return stat;
         firstStat = false;
-        return Object.assign(Object.create(stat) as Stats, { uid: uid + 1 });
+        return Object.assign(Object.create(stat) as BigIntStats, { uid: BigInt(uid + 1) });
       },
     }));
     expect(derive(["claude"], reader)).toMatchObject({ allowed: false, message: expect.stringContaining("daemon uid") });
@@ -281,9 +298,12 @@ describe("canonical host session registry derivation", () => {
   });
 
   it("lowercases only a valid derived registry UUID", () => {
-    const { reader } = fixture({ pid: 10, procStart: PROC_START, sessionId: CANON.toUpperCase(), kind: "interactive" });
+    // Hex letters, so the upper-case spelling differs from the lower-case one; an all-digit UUID
+    // is its own upper case and could not tell a lowercasing reader from one that does nothing.
+    expect(HEX_LETTER_UUID.toUpperCase()).not.toBe(HEX_LETTER_UUID);
+    const { reader } = fixture({ pid: 10, procStart: PROC_START, sessionId: HEX_LETTER_UUID.toUpperCase(), kind: "interactive" });
     expect(derive(["claude"], reader)).toMatchObject({
-      allowed: true, value: { sessionUuid: CANON, sessionSource: "host-session-registry" },
+      allowed: true, value: { sessionUuid: HEX_LETTER_UUID, sessionSource: "host-session-registry" },
     });
   });
 
@@ -315,12 +335,101 @@ describe("canonical host session registry derivation", () => {
     });
   }, 10_000);
 
-  it("does not treat an invalid registry as a disagreement with valid argv", () => {
+  it("refuses a valid argv selector when the registry entry fails verification", () => {
     const reader: claim.HostSessionRegistryReader = {
       read: () => deny(ReasonCode.INVALID_ARGUMENT, "invalid registry entry"),
     };
     expect(derive(["claude", "--resume", CANON], reader)).toMatchObject({
-      allowed: true, value: { sessionUuid: CANON, sessionSource: "argv" },
+      allowed: false, reasonCode: ReasonCode.INVALID_ARGUMENT, message: expect.stringContaining("invalid registry entry"),
+    });
+  });
+
+  it("names the missing selector, not the argv refusal, for an unverifiable registry without a selector", () => {
+    const reader: claim.HostSessionRegistryReader = {
+      read: () => deny(ReasonCode.INVALID_ARGUMENT, "invalid registry entry"),
+    };
+    const derived = derive(["claude", "--continue"], reader);
+    expect(derived).toMatchObject({ allowed: false, reasonCode: ReasonCode.INVALID_ARGUMENT });
+    expect(derived).toMatchObject({ message: expect.stringContaining("names no session id") });
+    expect(derived).not.toMatchObject({ message: expect.stringContaining("argv selector is not accepted") });
+  });
+
+  it("refuses a registry file whose birth time the kernel does not report, falling back to ctime only on Linux", () => {
+    const { root } = fixture();
+    // The real ctime is kept: it is after the ancestor's start, so only the platform rule decides.
+    const reader = claim.makeDefaultHostSessionRegistryReader(root, fileOps({
+      fstat(fd) {
+        return Object.assign(Object.create(statFd(fd)) as BigIntStats, { birthtimeNs: 0n });
+      },
+    }));
+    const derived = derive(["claude", "--continue"], reader);
+    if (process.platform === "linux") {
+      expect(derived).toMatchObject({ allowed: true, value: { sessionUuid: CANON } });
+      return;
+    }
+    expect(derived).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.PROBE_FAILED, message: expect.stringContaining("creation time"),
+    });
+  });
+
+  it("refuses a registry file with neither a birth time nor a ctime", () => {
+    const { root } = fixture();
+    const reader = claim.makeDefaultHostSessionRegistryReader(root, fileOps({
+      fstat(fd) {
+        return Object.assign(Object.create(statFd(fd)) as BigIntStats, { birthtimeNs: 0n, ctimeNs: 0n });
+      },
+    }));
+    expect(derive(["claude", "--continue"], reader)).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.PROBE_FAILED, message: expect.stringContaining("creation time"),
+    });
+  });
+
+  it("refuses a valid argv selector when the registry path is replaced while its opened fd is read", () => {
+    const { root, path } = fixture();
+    const replacement = join(root, "replacement.json");
+    let replaced = false;
+    const reader = claim.makeDefaultHostSessionRegistryReader(root, fileOps({
+      read(fd, buffer, offset, length, position) {
+        if (!replaced) {
+          renameSync(replacement, path);
+          replaced = true;
+        }
+        return readSync(fd, buffer, offset, length, position);
+      },
+    }));
+    // Both argv selector forms name the same session the replacement does, so only the detected
+    // replacement can refuse: a disagreement check has nothing to disagree with.
+    for (const argv of [["claude", "--resume", CANON], ["claude", `--session-id=${CANON}`]]) {
+      replaced = false;
+      writeFileSync(replacement, JSON.stringify({ pid: 10, procStart: PROC_START, sessionId: CANON, kind: "interactive" }));
+      expect(derive(argv, reader)).toMatchObject({
+        allowed: false, reasonCode: ReasonCode.PROBE_FAILED, message: expect.stringContaining("changed"),
+      });
+      expect(replaced).toBe(true);
+    }
+  });
+
+  it("refuses a registry file created before the ancestor's native start token within the same procStart second", () => {
+    const { path, reader } = fixture();
+    const createdNs = registryCreationNs(path);
+    // A stale entry left at a reused pid: its file existed half a second before this process
+    // instance started, and the whole-second procStart cannot tell the two instances apart.
+    const startNs = createdNs + 500_000_000n;
+    writeFileSync(path, JSON.stringify({ pid: 10, procStart: procStartOf(startNs), sessionId: CANON, kind: "interactive" }));
+    expect(registryCreationNs(path)).toBe(createdNs);
+    expect(derive(["claude", "--continue"], reader, darwinToken(startNs))).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.CONFLICT, message: expect.stringContaining("created before"),
+    });
+  });
+
+  it("admits a registry file created after the ancestor's native start token within the same procStart second", () => {
+    const { path, reader } = fixture();
+    const createdNs = registryCreationNs(path);
+    const startNs = createdNs - 500_000_000n;
+    writeFileSync(path, JSON.stringify({ pid: 10, procStart: procStartOf(startNs), sessionId: CANON, kind: "interactive" }));
+    expect(registryCreationNs(path)).toBe(createdNs);
+    expect(derive(["claude", "--continue"], reader, darwinToken(startNs))).toMatchObject({
+      allowed: true, value: { sessionUuid: CANON, sessionSource: "host-session-registry" },
     });
   });
 

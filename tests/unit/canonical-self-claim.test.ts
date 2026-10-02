@@ -1,11 +1,16 @@
 import {
+  closeSync,
   copyFileSync,
   cpSync,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdtempSync,
+  openSync,
   readFileSync,
+  readSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -23,8 +28,12 @@ import { roleKeyFor, Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import type { BuzzActorAuthenticator } from "../../src/session/session-registry.ts";
 import {
+  assertClaudeIdentityStillLive,
   CanonicalSelfClaim,
   deriveClaimantIdentity,
+  hostSessionRegistryAbsent,
+  makeDefaultHostSessionRegistryReader,
+  verifyClaudeIdentity,
   extractSessionUuidFromArgv,
   isInteractiveClaudeInvocation,
   looksLikeClaudeInvocation,
@@ -41,7 +50,7 @@ import {
   type TranscriptReader,
   type HostSessionRegistryReader,
 } from "../../src/registry/canonical-self-claim.ts";
-import { cleanupTempDirs, makeCore, type CoreHarness } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, makeCore, tempDir, type CoreHarness } from "../helpers/fixtures.ts";
 
 afterEach(cleanupTempDirs);
 
@@ -276,7 +285,7 @@ const fakeTranscriptReader = (present = true): TranscriptReader => ({
 });
 
 const fakeHostSessionRegistryReader: HostSessionRegistryReader = {
-  read: (pid) => deny(ReasonCode.NOT_FOUND, `/fake/claude/sessions/${pid}.json is absent`),
+  read: (pid) => hostSessionRegistryAbsent(`/fake/claude/sessions/${pid}.json is absent`),
 };
 
 const deriveSyntheticIdentity = (pid: number, inspector: ProcessAncestryInspector) =>
@@ -2707,4 +2716,160 @@ describe("adversarial mutations — each must kill its guard, not merely delete 
     },
     MUTATION_TEST_TIMEOUT_MS,
   );
+});
+
+/**
+ * #1035 review round 1. The claimant's session is derived from argv and the host registry, and the
+ * registry is not only consulted when argv is silent: a registry read that detected a replacement,
+ * failed verification or could not be verified refuses even a valid argv selector, and the session
+ * is derived again — argv and registry, every check — after each external await and at the commit
+ * checkpoint, so a session that switched mid-claim is refused rather than adopted under its earlier
+ * UUID. Each case asserts the whole rollback oracle: no session, binding or admission row lands.
+ */
+describe("#1035 — the claimant session is re-derived and a registry anomaly refuses argv", () => {
+  const statRegistryFd = (fd: number) => fstatSync(fd, { bigint: true });
+  /** A registry directory whose `10.json` the reader will replace with an identical entry mid-read. */
+  const replacingRegistryReader = () => {
+    const root = tempDir("acp-1035-registry-");
+    const path = join(root, "10.json");
+    const entry = JSON.stringify({ pid: 10, procStart: "Fri Jan  1 00:00:00 2027", sessionId: CANON, kind: "interactive" });
+    writeFileSync(path, entry);
+    writeFileSync(join(root, "replacement.json"), entry);
+    const state = { replaced: false };
+    const reader = makeDefaultHostSessionRegistryReader(root, {
+      open: openSync, fstat: statRegistryFd, close: closeSync,
+      read(fd, buffer, offset, length, position) {
+        if (!state.replaced) {
+          renameSync(join(root, "replacement.json"), path);
+          state.replaced = true;
+        }
+        return readSync(fd, buffer, offset, length, position);
+      },
+    });
+    return { reader, state };
+  };
+  const continueChain = () => standardChain({
+    argv: ["/opt/claude/claude", "--continue"], command: "/opt/claude/claude --continue",
+  });
+
+  it("a valid argv selector does not bypass a registry replacement detected during its read, and nothing is written", async () => {
+    const { reader, state } = replacingRegistryReader();
+    const core = makeCore();
+    const projectId = "prj_registry_replaced";
+    insertProject(core, projectId);
+    // The standard chain names CANON with `--session-id`, a selector that would be admitted alone.
+    const subject = makeSubject(core, projectId, { hostSessionRegistryReader: reader });
+    const before = rowCounts(core);
+    const result = await subject.claim(baseRequest(core, projectId));
+    expect(result, JSON.stringify(result)).toMatchObject({ allowed: false, reasonCode: ReasonCode.PROBE_FAILED });
+    expect(state.replaced).toBe(true);
+    expectRolledBack(core, before, result);
+  });
+
+  it("the delegated CTO verifier refuses the same detected replacement under a valid argv selector", () => {
+    const { reader, state } = replacingRegistryReader();
+    const checked = verifyClaudeIdentity(
+      { canonicalSessionUuids: [CANON] },
+      { callerPid: 10, claimedPid: 10, claimedSessionUuid: CANON },
+      { processInspector: chainInspector(standardChain()), imageInspector: fakeImageInspector(),
+        transcriptReader: fakeTranscriptReader(), hostSessionRegistryReader: reader },
+    );
+    expect(checked, JSON.stringify(checked)).toMatchObject({ allowed: false, reasonCode: ReasonCode.PROBE_FAILED });
+    expect(state.replaced).toBe(true);
+  });
+
+  it.each([
+    ["--continue", continueChain],
+    ["an argv selector naming CANON", () => standardChain()],
+  ])("a registry that switches from CANON to OTHER during Buzz resolution is refused with %s, and nothing is written", async (_label, chain) => {
+    let named = CANON;
+    let reads = 0;
+    const reader: HostSessionRegistryReader = {
+      read: () => { reads += 1; return allow(ReasonCode.OK, { sessionUuid: named }); },
+    };
+    const core = makeCore();
+    const projectId = "prj_registry_switch_buzz";
+    insertProject(core, projectId);
+    const subject = makeSubject(core, projectId, {
+      chain: chain(), hostSessionRegistryReader: reader,
+      // The pid and its start token are untouched: only the session the process is running changes.
+      resolveBuzzAddress: async () => { named = OTHER; return allow(ReasonCode.OK, BUZZ_ADDRESS); },
+    });
+    const before = rowCounts(core);
+    const result = await subject.claim(baseRequest(core, projectId));
+    expect(result, JSON.stringify(result)).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+    expect(named).toBe(OTHER);
+    expect(reads).toBeGreaterThan(2);
+    expectRolledBack(core, before, result);
+  });
+
+  it("a registry that switches after the post-Buzz recheck is refused at the commit checkpoint, and nothing is written", async () => {
+    let reads = 0;
+    // Reads in order: the derivation, the post-image recheck, the post-Buzz recheck, then the
+    // commit checkpoint inside the transaction — the only read that sees OTHER.
+    const reader: HostSessionRegistryReader = {
+      read: () => { reads += 1; return allow(ReasonCode.OK, { sessionUuid: reads <= 3 ? CANON : OTHER }); },
+    };
+    const core = makeCore();
+    const projectId = "prj_registry_switch_commit";
+    insertProject(core, projectId);
+    const subject = makeSubject(core, projectId, { chain: continueChain(), hostSessionRegistryReader: reader });
+    const before = rowCounts(core);
+    const result = await subject.claim(baseRequest(core, projectId));
+    expect(result, JSON.stringify(result)).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+    expect(reads).toBe(4);
+    expectRolledBack(core, before, result);
+  });
+
+  it("a registry that names CANON at every checkpoint is admitted from the registry as the control", async () => {
+    let reads = 0;
+    const reader: HostSessionRegistryReader = {
+      read: () => { reads += 1; return allow(ReasonCode.OK, { sessionUuid: CANON }); },
+    };
+    const core = makeCore();
+    const projectId = "prj_registry_stable";
+    insertProject(core, projectId);
+    const subject = makeSubject(core, projectId, { chain: continueChain(), hostSessionRegistryReader: reader });
+    const result = await subject.claim(baseRequest(core, projectId));
+    expect(result, JSON.stringify(result)).toMatchObject({
+      allowed: true, value: { derivedSessionUuid: CANON, sessionSource: "host-session-registry" },
+    });
+    expect(reads).toBeGreaterThan(0);
+  });
+
+  it("the live recheck reads the start token again after its registry read rather than reusing its snapshot", () => {
+    const reader: HostSessionRegistryReader = { read: () => allow(ReasonCode.OK, { sessionUuid: CANON }) };
+    const chain = continueChain();
+    const verified = chain.find((entry) => entry.pid === 10)!;
+    // The snapshot taken for the checkpoint still shows the verified start; the kernel, asked again
+    // after the registry read, shows another. Only a fresh read can see the pid change hands.
+    const inspector: ProcessAncestryInspector = {
+      snapshot: (pid) => chain.find((entry) => entry.pid === pid) ?? null,
+      readStartToken: (pid) => pid === 10 ? "a different process" : null,
+    };
+    const identity = { pid: 10, ppid: verified.ppid, startedAt: verified.startedAt, cwd: verified.cwd,
+      cwdProbeFailure: null, argv: verified.argv ?? [], sessionUuid: CANON, sessionSource: "host-session-registry" as const };
+    expect(assertClaudeIdentityStillLive(identity, inspector, reader)).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.CONFLICT, message: expect.stringContaining("start token changed"),
+    });
+  });
+
+  it("the delegated CTO verifier's post-image recheck refuses a registry that switched sessions", () => {
+    let named = CANON;
+    const reader: HostSessionRegistryReader = { read: () => allow(ReasonCode.OK, { sessionUuid: named }) };
+    const inspector = chainInspector(continueChain());
+    const checked = verifyClaudeIdentity(
+      { canonicalSessionUuids: [CANON] },
+      { callerPid: 10, claimedPid: 10, claimedSessionUuid: CANON },
+      { processInspector: inspector, imageInspector: fakeImageInspector(),
+        transcriptReader: fakeTranscriptReader(), hostSessionRegistryReader: reader },
+    );
+    expect(checked, JSON.stringify(checked)).toMatchObject({ allowed: true });
+    if (!checked.allowed) return;
+    expect(assertClaudeIdentityStillLive(checked.value.identity, inspector, reader)).toMatchObject({ allowed: true });
+    named = OTHER;
+    expect(assertClaudeIdentityStillLive(checked.value.identity, inspector, reader)).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.CONFLICT,
+    });
+  });
 });

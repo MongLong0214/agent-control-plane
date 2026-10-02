@@ -5,13 +5,13 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { digestOf } from "../../src/core/digest.ts";
-import { type Decision, allow, deny } from "../../src/core/errors.ts";
+import { type Decision, allow } from "../../src/core/errors.ts";
 import type { AttachmentCredential } from "../../src/session/role-attachment-credentials.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { IngressGuard } from "../../src/ingress/ingress-guard.ts";
-import { CanonicalSelfClaim } from "../../src/registry/canonical-self-claim.ts";
+import { CanonicalSelfClaim, hostSessionRegistryAbsent } from "../../src/registry/canonical-self-claim.ts";
 import { RoleConversationPort } from "../../src/mcp/role-conversation.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { fixtureManifest, makeHarness, TEST_OWNER, type Harness } from "../helpers/harness.ts";
@@ -100,7 +100,7 @@ describe("role attachment authorization without sockets", () => {
         } : null },
         imageInspector: { resolve: () => ({ imagePath: "/fake/claude", version: "0.0.0-test", sha256: `sha256:${"0".repeat(64)}` }) },
         transcriptReader: { locate: () => ({ path: "/fake/transcript", sizeBytes: 1 }) },
-        hostSessionRegistryReader: { read: () => deny(ReasonCode.NOT_FOUND, "fixture registry entry absent") },
+        hostSessionRegistryReader: { read: () => hostSessionRegistryAbsent("fixture registry entry absent") },
       });
     const claim = async (generation: number) =>
       valueOf(await recovery.claim({ callerPid: 10, claimedSessionUuid: uuid, projectId,
