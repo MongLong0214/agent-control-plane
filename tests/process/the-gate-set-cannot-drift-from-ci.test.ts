@@ -175,12 +175,16 @@ describe("the CI gate set and the pre-push gate set", () => {
 
   it("refuses a declaration that no longer names anything a workflow runs", () => {
     const repoRoot = copyOfThisRepository();
-    editWorkflow(repoRoot, (text) => text.replace("- run: pnpm guards:falsifiable", "- run: echo nothing"));
+    const tracker = join(repoRoot, ".github", "workflows", "tracker-loci.yml");
+    writeFileSync(
+      tracker,
+      readFileSync(tracker, "utf8").replace("- run: node scripts/verify-tracker-loci-resolve.mjs", "- run: echo nothing"),
+    );
 
     const result = parity(repoRoot);
 
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain('declares "guard-falsifiability:pnpm guards:falsifiable", which no workflow runs');
+    expect(result.stderr).toContain('declares "loci:node scripts/verify-tracker-loci-resolve.mjs", which no workflow runs');
   });
 
   it("refuses a run: form it cannot attribute, rather than reporting a coverage it does not have", () => {
