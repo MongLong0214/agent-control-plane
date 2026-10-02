@@ -1751,6 +1751,7 @@ const startMcpSocket = async (
 ): Promise<Server> => {
   removeStaleSocket(path);
   const server = createServer((socket) => {
+    trackConnection(server, socket);
     void authenticateSocket(socket, token, handshakeTimeoutMs).then(async (accepted) => {
       if (!accepted) return;
       if ("attachmentId" in accepted.credential) {
@@ -1821,9 +1822,25 @@ const removeStaleSocket = (path: string): void => {
   unlinkSync(path);
 };
 
+/**
+ * Every connection an MCP socket accepted (#1037, review PR1046-R3). `server.close()` stops
+ * accepting and then waits for each open connection to end on its own; an attached runtime's
+ * connection ends only when that runtime does, so a shutdown with one attached never reached its
+ * lock release. Closing a tracked server ends its connections as well.
+ */
+const TRACKED_CONNECTIONS = new WeakMap<Server, Set<Socket>>();
+
+const trackConnection = (server: Server, socket: Socket): void => {
+  const open = TRACKED_CONNECTIONS.get(server) ?? new Set<Socket>();
+  TRACKED_CONNECTIONS.set(server, open);
+  open.add(socket);
+  socket.once("close", () => open.delete(socket));
+};
+
 const closeSocketServer = (server: Server): Promise<void> =>
   new Promise((resolveClose, reject) => {
     server.close((err) => (err ? reject(err) : resolveClose()));
+    for (const socket of TRACKED_CONNECTIONS.get(server) ?? []) socket.destroy();
   });
 
 /** A compact wire result for local authenticated ingress; secret-bearing values stay local. */
