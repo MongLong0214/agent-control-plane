@@ -1485,6 +1485,10 @@ export const createConfiguredHermesGatewayConversation = (
         target.target_locator_digest !== values.ACP_HERMES_LINEAGE_ROOT_DIGEST) return null;
     const startToken = (ports.processStartToken ?? readProcessStartToken)(session.osPid);
     if (!startToken || (ports.authorityHeld && !ports.authorityHeld())) return null;
+    // #1037 R1 sibling: the lstart compare above has one-second grain; a pinned native start
+    // (adoption pins one since #1037) is compared exactly.
+    const pinnedStart = cp.sessions.pinnedNativeStart(session.sessionId) ?? startToken;
+    if (pinnedStart !== startToken) return null;
     return { assignmentId: binding.assignmentId, bindingGeneration: binding.bindingGeneration,
       sessionId: binding.sessionId, sessionIncarnation: binding.sessionIncarnation,
       processPid: session.osPid, startToken };

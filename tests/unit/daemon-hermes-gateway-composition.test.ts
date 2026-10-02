@@ -22,6 +22,42 @@ const config = () => ({
 const source = { eventId: "signed-7", actor: "owner", conversation: "room" };
 
 describe("daemon Gateway CEO composition", () => {
+  it("delivers only to the process whose native start is pinned for the CEO runtime (#1037)", async () => {
+    // A successor Gateway inside the recorded lstart second renders the same `ps-start`; only the
+    // pinned native start tells it from the process the binding was adopted onto.
+    const deliver = async (pinned: string): Promise<{ contact: string; dispatched: number }> => {
+      const harness = makeHarness();
+      const { cp } = harness;
+      try {
+        const id = bindCeo(harness);
+        cp.sessions.pinNativeStart(id, pinned);
+        const originalGet = cp.sessions.get.bind(cp.sessions);
+        vi.spyOn(cp.sessions, "get").mockImplementation((sessionId) => {
+          const session = originalGet(sessionId);
+          return sessionId === id && session ? { ...session, provider: "hermes", osPid: 123,
+            osProcessStartedAt: "ps-start" } : session;
+        });
+        const originalDbGet = cp.db.get.bind(cp.db);
+        vi.spyOn(cp.db, "get").mockImplementation((sql, params) =>
+          String(sql).includes("FROM actor_target_bindings")
+            ? { executor_kind: "hermes", target_locator: "live-head", target_locator_digest: digest } as never
+            : originalDbGet(sql, params));
+        let dispatched = 0;
+        const outcome = await createConfiguredHermesGatewayConversation(cp, config(), {
+          processStartToken: () => "native-start",
+          processStartedAt: () => "ps-start",
+          senderFactory: () => {
+            dispatched++;
+            return async () => ({ contact: "REACHED" as const, answered: allow(ReasonCode.OK, "answered") });
+          },
+        })!("status", source);
+        return { contact: outcome.contact, dispatched };
+      } finally { cp.close(); vi.restoreAllMocks(); }
+    };
+    expect(await deliver("native-start")).toEqual({ contact: "REACHED", dispatched: 1 });
+    expect(await deliver("native-start-of-the-adopted-process")).toEqual({ contact: "NEVER_REACHED", dispatched: 0 });
+  });
+
   it("refuses without POST when the CEO binding is revoked during identity GET", async () => {
     const harness = makeHarness();
     const { cp } = harness;
