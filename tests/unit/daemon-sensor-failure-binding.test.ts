@@ -1325,28 +1325,83 @@ describe("a live incumbent is not revoked because its capacity is unknown", () =
   });
 
   /**
-   * ACP1045-R1-01. A keep lasts for as long as the provider stays unread, so it rests on the exact
-   * native start token only. An lstart record is whole-second text whose native fallback compares
-   * at a truncated millisecond (r-364403fc103a): good enough for the hold, which ends, and not for
-   * a keep, which does not. Such an incumbent gets the hold and then the revocation, as before.
+   * ACP1045-R2-01. The CTO launch and continuity provisioning paths record `ps` lstart, so a live
+   * incumbent registered the ordinary way has to be kept too. Its row is decisive when it was
+   * written after the process's start second ended: the recorded process was alive then, so any
+   * process that later took its pid started in a later second. The live token is pinned then.
+   * The row is written two seconds ahead of the real clock so that holds however soon this test
+   * runs after the worker started; a row inside the start second is the ambiguous case, which
+   * `an-unread-capacity-keeps-only-the-exact-process.test.ts` covers with injected reads.
    */
-  it("holds, and does not keep, a live incumbent recorded by ps lstart text", async () => {
-    // The row is written now, after this process started, as a launch path writes it.
-    const fixture = makeIncumbent("none", { pid: process.pid }, new Date().toISOString());
+  const lstartIncumbent = (providers: "none" | "gpt") => {
+    const fixture = makeIncumbent(providers, { pid: process.pid }, new Date(Date.now() + 2_000).toISOString());
     const session = fixture.cp.sessions.require(fixture.incumbent.sessionId);
     expect(session.osProcessStartedAt).not.toMatch(/^darwin-tv:/);
-    expect(recordedProcessIsRunning(session)).toBe(true);
+    // Read from the ledger rather than through `pinnedNativeStart`, so the premise holds on a head
+    // that has no pin at all.
+    expect(fixture.cp.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'SESSION_NATIVE_START_PINNED' AND session_id = ?`,
+      [session.sessionId],
+    )?.n).toBe(0);
+    return fixture;
+  };
+
+  it("keeps a live incumbent recorded by ps lstart text past the hold window, and pins its token", async () => {
+    const fixture = lstartIncumbent("none");
 
     const first = await fixture.daemon.reconcileContinuity("no reading, lstart-recorded incumbent");
-
-    expect(first?.unresolved).toEqual([{ roleKey: fixture.roleKey, reasonCode: ReasonCode.COVERAGE_NONE }]);
-    expect(kinds(fixture, "CONTINUITY_REVOCATION_HELD")).toBe(1);
-    expect(fixture.cp.bindings.active(fixture.roleKey)).toEqual(fixture.incumbent);
-
     fixture.clock.advance(COVERAGE_REVOCATION_GRACE_MS + 1_000);
-    await fixture.daemon.reconcileContinuity("still no reading, past the hold window");
+    const later = await fixture.daemon.reconcileContinuity("still no reading, past the hold window");
 
-    expect(fixture.cp.bindings.active(fixture.roleKey)).toBeNull();
+    for (const report of [first, later]) {
+      expect(report?.unresolved).toEqual([
+        { roleKey: fixture.roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE },
+      ]);
+      expect(report?.reassigned).toEqual([]);
+    }
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toEqual(fixture.incumbent);
+    expect(kinds(fixture, "BINDING_REVOKED")).toBe(0);
+    expect(kinds(fixture, "CONTINUITY_REVOCATION_HELD")).toBe(0);
+    expect(fixture.cp.sessions.pinnedNativeStart(fixture.incumbent.sessionId)).toBe(liveToken());
+  });
+
+  it("does not fail a live lstart-recorded incumbent over to a routable provider", async () => {
+    const fixture = lstartIncumbent("gpt");
+    fixture.cp.continuity.attach({
+      readiness: { checkSession: async () => allow(ReasonCode.OK, undefined) },
+      buzz: { connect: async (sessionId) => allow(ReasonCode.OK, `buzz:${sessionId}`) },
+    });
+
+    const report = await fixture.daemon.reconcileContinuity("no reading, lstart-recorded incumbent, gpt routable");
+
+    expect(report?.plan.assignments.find((assignment) => assignment.roleKey === fixture.roleKey)?.provider)
+      .toBe("gpt");
+    expect(report?.reassigned).toEqual([]);
+    expect(report?.unresolved).toEqual([
+      { roleKey: fixture.roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE },
+    ]);
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toEqual(fixture.incumbent);
+    expect(fixture.cp.sessions.live()).toHaveLength(1);
+  });
+
+  it("pins the native token of a session continuity provisions, beside the lstart it records", async () => {
+    // An incumbent with no recorded process cannot be kept, so the pass fails it over to gpt and
+    // provisions a session whose runtime reports this process's pid.
+    const fixture = makeIncumbent("gpt");
+    fixture.cp.continuity.attach({
+      readiness: { checkSession: async () => allow(ReasonCode.OK, undefined) },
+      buzz: { connect: async (sessionId) => allow(ReasonCode.OK, `buzz:${sessionId}`) },
+    });
+    const start = fixture.gpt.startSession.bind(fixture.gpt);
+    fixture.gpt.startSession = async (spec) => ({ ...(await start(spec)), pid: process.pid });
+
+    const report = await fixture.daemon.reconcileContinuity("incumbent unprovable, gpt can staff the role");
+
+    expect(report?.reassigned).toHaveLength(1);
+    const replacement = fixture.cp.sessions.require(fixture.cp.bindings.active(fixture.roleKey)!.sessionId);
+    expect(replacement).toMatchObject({ provider: "gpt", osPid: process.pid });
+    expect(replacement.osProcessStartedAt).not.toMatch(/^darwin-tv:/);
+    expect(fixture.cp.sessions.pinnedNativeStart(replacement.sessionId)).toBe(liveToken());
   });
 
   it("still revokes at once an incumbent whose recorded process is gone", async () => {

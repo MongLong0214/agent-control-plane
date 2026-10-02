@@ -46,6 +46,8 @@ export interface SessionRecord {
  * rather than trusting the caller's word keeps this registry from becoming a second,
  * weaker source of truth about who an actor is.
  */
+const NATIVE_START_PINNED = "SESSION_NATIVE_START_PINNED";
+
 export interface BuzzActorAuthenticator {
   isAllowedActor(channel: string, actor: string): boolean;
 }
@@ -272,6 +274,40 @@ export class SessionRegistry {
       `UPDATE sessions SET os_pid = ?, os_process_started_at = ?, updated_at = ? WHERE session_id = ?`,
       [pid, processStartedAt(pid), this.clock.nowIso(), sessionId],
     );
+  }
+
+  /**
+   * The exact native start token pinned for a session's process, or null.
+   *
+   * `os_process_started_at` keeps whatever form its writer chose. `create()` without a verified
+   * pair records `ps` lstart, and `probeSessionLiveness`, the dead-binding recovery door and the
+   * delegated binding's liveness check compare it as lstart. So the exact token lives beside it
+   * rather than replacing it: rewriting the column to the token was rejected rather than done,
+   * because those readers would then call a live process dead. Kept as the first
+   * `SESSION_NATIVE_START_PINNED` audit event for the session: append-only and never rewritten,
+   * so the first pin is the pin. A dedicated column would need a migration, and the migration list
+   * is frozen. Same shape as #1046's pin for the adopted Gateway, so the two converge.
+   */
+  pinnedNativeStart(sessionId: string): string | null {
+    const row = this.db.get<{ evidence_json: string }>(
+      `SELECT evidence_json FROM audit_events WHERE kind = ? AND session_id = ? ORDER BY event_id LIMIT 1`,
+      [NATIVE_START_PINNED, sessionId],
+    );
+    if (row === undefined) return null;
+    let evidence: unknown;
+    try {
+      evidence = JSON.parse(row.evidence_json);
+    } catch {
+      return null;
+    }
+    const startedAt = (evidence as { startedAt?: unknown } | null)?.startedAt;
+    return typeof startedAt === "string" ? startedAt : null;
+  }
+
+  /** Pins `startToken` for the session unless a pin already exists; the first pin stands. */
+  pinNativeStart(sessionId: string, startToken: string): void {
+    if (this.pinnedNativeStart(sessionId) !== null) return;
+    this.audit.record({ kind: NATIVE_START_PINNED, sessionId, evidence: { startedAt: startToken } });
   }
 
   /**

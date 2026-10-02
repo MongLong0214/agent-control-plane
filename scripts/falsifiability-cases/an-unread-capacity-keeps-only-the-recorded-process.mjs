@@ -7,8 +7,8 @@ const anUnreadCapacityKeepsOnlyTheRecordedProcess = {
   id: "an-unread-capacity-keeps-only-the-recorded-process",
   what: "an incumbent whose recorded process is gone is revoked although its provider has no reading",
   file: "src/daemon/daemon.ts",
-  find: "    if (session.osProcessStartedAt == null) return false;\n    return session.osProcessStartedAt === readProcessStartToken(session.osPid);\n",
-  replace: "    if (session.osProcessStartedAt == null) return false;\n    return true;\n",
+  find: "    if (session.osProcessStartedAt === live) return true;\n    if (NATIVE_START_TOKEN.test(session.osProcessStartedAt)) return false;\n",
+  replace: "    if (session.osProcessStartedAt !== null) return true;\n    if (NATIVE_START_TOKEN.test(session.osProcessStartedAt)) return false;\n",
   killedBy: [
     "tests/unit/daemon-sensor-failure-binding.test.ts::still revokes at once an incumbent whose recorded process is gone",
   ],

@@ -12,34 +12,59 @@ import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { fixtureManifest } from "../helpers/harness.ts";
 
 /**
- * ACP1045-R1-01 — a reused pid must not satisfy the indefinite keep for an unread provider.
+ * Which process the keep for an unread provider may treat as the incumbent (ACP1045-R1-01, R2-01).
  *
- * The keep holds a binding for as long as the provider stays unread, so it may rest only on an
- * exact identity. The coverage hold's process test is not one: an lstart record is whole-second
- * text, and its native fallback compares at the millisecond `createdAt` is truncated to, so a
- * replacement that took the pid later inside the row's own millisecond passes it
- * (r-364403fc103a). That is an accepted limit for a hold that ends; it is not one for a keep that
- * does not.
+ * The keep holds a binding for as long as the provider stays unread, so it needs a decisive
+ * identity. A native token recorded on the row, or pinned beside it, is compared exactly. A legacy
+ * row that recorded only `ps` lstart is decisive only when the live native start falls in the
+ * recorded lstart second and the row was written after that second ended: the recorded process
+ * was alive then, so anything that later took its pid started in a later second. A row written
+ * inside its process's own start second is ambiguous and is not kept; it gets the coverage hold,
+ * which is unchanged and still accepts it (r-364403fc103a), and is revoked when the hold ends.
  *
- * The process reads are injected because no real process can be placed inside a chosen
- * millisecond. Only the two pids below are answered by the fakes; every other pid reads the host.
+ * The process reads are injected because no real process can be placed inside a chosen second or
+ * millisecond. Only the pids in `ids.native`/`ids.lstart` are answered by the fakes; every other
+ * pid reads the host. The lstart text is rendered in this process's local time, the zone `ps`
+ * renders in and the daemon parses in, so the cases mean the same thing in every zone.
  */
-const ids = vi.hoisted(() => ({
-  reusedPid: 4_194_301,
-  unrecordedPid: 4_194_302,
-  rowWritten: "2026-09-30T14:50:30.123Z",
-  lstart: "Wed Sep 30 23:50:30 2026",
-  // 900 µs into the row's millisecond: later than the process the row was written for, which had
-  // to exit first, and inside the same whole second and the same truncated millisecond.
-  replacement: "darwin-tv:1790779830.123900",
-}));
+const ids = vi.hoisted(() => {
+  const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const pad = (n: number) => String(n).padStart(2, "0");
+  /** `ps -o lstart=` for a process that started in this epoch second, in local time. */
+  const lstartOf = (epochSecond: number): string => {
+    const d = new Date(epochSecond * 1000);
+    return `${days[d.getDay()]} ${months[d.getMonth()]} ${String(d.getDate()).padStart(2, " ")} ` +
+      `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())} ${d.getFullYear()}`;
+  };
+  // 2026-09-30T14:50:30Z and 14:50:25Z.
+  const rowSecond = 1_790_779_830;
+  const earlierSecond = 1_790_779_825;
+  return {
+    lstartOf,
+    rowSecond,
+    earlierSecond,
+    rowWritten: "2026-09-30T14:50:30.123Z",
+    pid: {
+      sameMillisecondReuse: 4_194_301,
+      unrecorded: 4_194_302,
+      ownStartSecond: 4_194_303,
+      decisive: 4_194_304,
+      laterSecondReuse: 4_194_305,
+    },
+    /** The live native token each faked pid answers with; a test may change one mid-case. */
+    native: new Map<number, string | null>(),
+    /** The live `ps` lstart each faked pid answers with. */
+    lstart: new Map<number, string | null>(),
+  };
+});
 
 vi.mock("../../src/core/process-argv.ts", async (importOriginal) => {
   const actual = await importOriginal<typeof ProcessArgv>();
   return {
     ...actual,
     readProcessStartToken: (pid: number) =>
-      pid === ids.reusedPid ? ids.replacement : pid === ids.unrecordedPid ? null : actual.readProcessStartToken(pid),
+      ids.native.has(pid) ? ids.native.get(pid)! : actual.readProcessStartToken(pid),
   };
 });
 
@@ -48,17 +73,22 @@ vi.mock("../../src/core/process-identity.ts", async (importOriginal) => {
   return {
     ...actual,
     processStartedAt: (pid: number | null | undefined) =>
-      pid === ids.reusedPid ? ids.lstart : pid === ids.unrecordedPid ? null : actual.processStartedAt(pid),
+      typeof pid === "number" && ids.lstart.has(pid) ? ids.lstart.get(pid)! : actual.processStartedAt(pid),
   };
 });
 
 const planes: ControlPlane[] = [];
 afterEach(() => {
   for (const cp of planes.splice(0)) cp.close();
+  ids.native.clear();
+  ids.lstart.clear();
   cleanupTempDirs();
 });
 
-/** One project whose primary CTO is bound to a READY session, and no provider with a reading. */
+/**
+ * One project whose primary CTO is bound to a READY session, written at `ids.rowWritten` with the
+ * given recorded start, and no provider with a reading.
+ */
 const incumbentWithoutReading = (osPid: number, osStartedAt: string | null) => {
   const root = tempDir("acp-exact-process-");
   const clock = new ManualClock(ids.rowWritten);
@@ -94,23 +124,32 @@ const incumbentWithoutReading = (osPid: number, osStartedAt: string | null) => {
       `SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'CONTINUITY_REVOCATION_HELD' AND role_key = ?`,
       [roleKey],
     )?.n;
-  return { cp, clock, daemon, roleKey, session: cp.sessions.require(session.sessionId), held };
+  return { cp, clock, daemon, roleKey, incumbent: bound.value, session: cp.sessions.require(session.sessionId), held };
 };
 
-describe("ACP1045-R1-01: the keep for an unread provider needs the exact process", () => {
+const kept = (roleKey: string) => [{ roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE }];
+const notKept = (roleKey: string) => [{ roleKey, reasonCode: ReasonCode.COVERAGE_NONE }];
+
+describe("the keep for an unread provider needs a decisive identity for the incumbent", () => {
   it("does not keep a reused pid whose replacement started later inside the row's millisecond", async () => {
-    const fixture = incumbentWithoutReading(ids.reusedPid, ids.lstart);
-    expect(fixture.session).toMatchObject({ createdAt: ids.rowWritten, osProcessStartedAt: ids.lstart });
+    // ACP1045-R1-01's witness. The row was written inside its process's start second, and a
+    // replacement took the pid 900 µs into the row's own millisecond: same second, same lstart.
+    const pid = ids.pid.sameMillisecondReuse;
+    ids.native.set(pid, `darwin-tv:${ids.rowSecond}.123900`);
+    ids.lstart.set(pid, ids.lstartOf(ids.rowSecond));
+    const fixture = incumbentWithoutReading(pid, ids.lstartOf(ids.rowSecond));
+    expect(fixture.session).toMatchObject({ createdAt: ids.rowWritten, osProcessStartedAt: ids.lstartOf(ids.rowSecond) });
     expect(fixture.cp.capacity.current("claude")).toBeNull();
     // The premise: this is the input the hold's millisecond test cannot tell from the incumbent.
     expect(recordedProcessIsRunning(fixture.session)).toBe(true);
 
     const first = await fixture.daemon.reconcileContinuity("no reading, and a reused pid");
 
-    expect(first?.unresolved).toEqual([{ roleKey: fixture.roleKey, reasonCode: ReasonCode.COVERAGE_NONE }]);
+    expect(first?.unresolved).toEqual(notKept(fixture.roleKey));
     // The finite hold is unchanged: it still accepts this record, and it still ends.
     expect(fixture.held()).toBe(1);
     expect(fixture.cp.bindings.active(fixture.roleKey)).not.toBeNull();
+    expect(fixture.cp.sessions.pinnedNativeStart(fixture.session.sessionId)).toBeNull();
 
     fixture.clock.advance(COVERAGE_REVOCATION_GRACE_MS + 1_000);
     await fixture.daemon.reconcileContinuity("still no reading, past the hold window");
@@ -118,13 +157,73 @@ describe("ACP1045-R1-01: the keep for an unread provider needs the exact process
     expect(fixture.cp.bindings.active(fixture.roleKey)).toBeNull();
   });
 
+  it("does not keep the recorded process itself when its row was written inside its start second", async () => {
+    // The ambiguous case without a successor: the live process is the recorded one, but nothing on
+    // the row can show it, because a successor in the same second would look the same.
+    const pid = ids.pid.ownStartSecond;
+    ids.native.set(pid, `darwin-tv:${ids.rowSecond}.050000`);
+    ids.lstart.set(pid, ids.lstartOf(ids.rowSecond));
+    const fixture = incumbentWithoutReading(pid, ids.lstartOf(ids.rowSecond));
+
+    const report = await fixture.daemon.reconcileContinuity("no reading, row inside the start second");
+
+    expect(report?.unresolved).toEqual(notKept(fixture.roleKey));
+    expect(fixture.held()).toBe(1);
+    expect(fixture.cp.sessions.pinnedNativeStart(fixture.session.sessionId)).toBeNull();
+  });
+
+  it("keeps a legacy lstart row written after its process's start second, pins the token, then compares the pin", async () => {
+    // ACP1045-R2-01's replay: a stable native token in 14:50:25, the row written at 14:50:30.123.
+    const pid = ids.pid.decisive;
+    const token = `darwin-tv:${ids.earlierSecond}.000001`;
+    ids.native.set(pid, token);
+    ids.lstart.set(pid, ids.lstartOf(ids.earlierSecond));
+    const fixture = incumbentWithoutReading(pid, ids.lstartOf(ids.earlierSecond));
+
+    const first = await fixture.daemon.reconcileContinuity("no reading, decisive legacy row");
+    fixture.clock.advance(COVERAGE_REVOCATION_GRACE_MS + 1_000);
+    const later = await fixture.daemon.reconcileContinuity("still no reading, past the hold window");
+
+    expect(first?.unresolved).toEqual(kept(fixture.roleKey));
+    expect(later?.unresolved).toEqual(kept(fixture.roleKey));
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toEqual(fixture.incumbent);
+    expect(fixture.held()).toBe(0);
+    // The lstart column is left as written; the exact token is pinned beside it.
+    expect(fixture.cp.sessions.require(fixture.session.sessionId).osProcessStartedAt).toBe(ids.lstartOf(ids.earlierSecond));
+    expect(fixture.cp.sessions.pinnedNativeStart(fixture.session.sessionId)).toBe(token);
+
+    // A successor inside the same second has the same lstart and would pass the legacy rule. The
+    // pin is what refuses it.
+    ids.native.set(pid, `darwin-tv:${ids.earlierSecond}.000900`);
+    const replaced = await fixture.daemon.reconcileContinuity("same lstart, different process");
+
+    expect(replaced?.unresolved).toEqual(notKept(fixture.roleKey));
+  });
+
+  it("does not keep a reused pid that started in a later second than the recorded one", async () => {
+    const pid = ids.pid.laterSecondReuse;
+    ids.native.set(pid, `darwin-tv:${ids.rowSecond}.200000`);
+    ids.lstart.set(pid, ids.lstartOf(ids.rowSecond));
+    const fixture = incumbentWithoutReading(pid, ids.lstartOf(ids.earlierSecond));
+
+    const report = await fixture.daemon.reconcileContinuity("no reading, a later process on the pid");
+
+    expect(report?.unresolved).toEqual(notKept(fixture.roleKey));
+    // Not the recorded process at all, so not held either: revoked at once, as before.
+    expect(fixture.held()).toBe(0);
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toBeNull();
+  });
+
   it("does not keep an incumbent whose start token was never recorded", async () => {
-    const fixture = incumbentWithoutReading(ids.unrecordedPid, null);
+    const pid = ids.pid.unrecorded;
+    ids.native.set(pid, null);
+    ids.lstart.set(pid, null);
+    const fixture = incumbentWithoutReading(pid, null);
     expect(fixture.session.osProcessStartedAt).toBeNull();
 
     const report = await fixture.daemon.reconcileContinuity("no reading, and no recorded start");
 
-    expect(report?.unresolved).toEqual([{ roleKey: fixture.roleKey, reasonCode: ReasonCode.COVERAGE_NONE }]);
+    expect(report?.unresolved).toEqual(notKept(fixture.roleKey));
     expect(fixture.cp.bindings.active(fixture.roleKey)).toBeNull();
   });
 });

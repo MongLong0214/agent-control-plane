@@ -31,3 +31,25 @@ export const processStartedAt = (pid: number | null | undefined): string | null 
     return null;
   }
 };
+
+const LSTART_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const LSTART = /^[A-Z][a-z]{2} ([A-Z][a-z]{2}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/;
+
+/**
+ * The first millisecond of the second `ps -o lstart=` rendered, or null for anything else.
+ *
+ * `ps` renders in its own local time and is spawned with the daemon's environment, so the
+ * daemon's local time is the zone the text is in. A row written by a process whose zone differed
+ * is misread, and the reader that uses this has to fail closed on it. Same parse as #1046's
+ * legacy lstart rule for the adopted Gateway.
+ */
+export const lstartSecondStartMs = (lstart: string): number | null => {
+  const parts = LSTART.exec(lstart);
+  if (parts === null) return null;
+  const month = LSTART_MONTHS.indexOf(parts[1]!);
+  if (month === -1) return null;
+  const started = new Date(
+    Number(parts[6]), month, Number(parts[2]), Number(parts[3]), Number(parts[4]), Number(parts[5]),
+  ).getTime();
+  return Number.isFinite(started) ? started : null;
+};

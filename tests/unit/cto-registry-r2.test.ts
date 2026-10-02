@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import { type HandoffAcknowledgement, type HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 import { digestOf } from "../../src/core/digest.ts";
+import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, RunState, SessionLifecycle } from "../../src/domain/types.ts";
@@ -127,6 +128,24 @@ describe("round-2 CTO lifecycle regressions", () => {
     const session = harness.cp.sessions.require(bound.value.sessionId);
     expect(session.workdir).toBe(join(harness.root, "runtime", "provider-returned-workdir"));
     expect(session.workdir).not.toBe(process.cwd());
+  });
+
+  it("ACP1045-R2-01 pins the launched CTO's native start beside the lstart it records", async () => {
+    // The row keeps `ps` lstart for the readers that compare it; the exact token is pinned beside
+    // it so the unread-capacity keep can tell this process from one that later takes its pid.
+    const harness = makeHarness();
+    const original = harness.scripted.startSession.bind(harness.scripted);
+    harness.scripted.startSession = async (spec) => ({ ...(await original(spec)), pid: process.pid });
+
+    const { projectId } = await registerFixtureProject(harness);
+    const bound = await harness.cp.cto.ensurePrimaryCto(projectId, "launch pins its token");
+    if (!bound.allowed) throw new Error(bound.message);
+
+    const session = harness.cp.sessions.require(bound.value.sessionId);
+    expect(session.osPid).toBe(process.pid);
+    expect(session.osProcessStartedAt).not.toMatch(/^darwin-tv:/);
+    expect(readProcessStartToken(process.pid)).toMatch(/^darwin-tv:\d+\.\d{6}$/);
+    expect(harness.cp.sessions.pinnedNativeStart(session.sessionId)).toBe(readProcessStartToken(process.pid));
   });
 
   it("P1-06 refuses to persist a workdir the adapter reports outside the managed root", async () => {

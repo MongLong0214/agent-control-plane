@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
+import { readProcessStartToken } from "../core/process-argv.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { isWithin } from "../guard/workspace-probe.ts";
 import {
@@ -1100,6 +1101,12 @@ export class ContinuityKernel {
         ? handle.workdir
         : this.managedRuntimeRoot,
     });
+    // The row keeps `ps` lstart for the readers that compare it (`probeSessionLiveness`, the
+    // dead-binding door), and that grain is one second. The exact native token is pinned beside
+    // it, so the unread-capacity keep can tell this process from one that later takes its pid
+    // (ACP1045-R2-01). A token that cannot be read pins nothing, and that row keeps the legacy rule.
+    const startToken = handle.pid === null ? null : readProcessStartToken(handle.pid);
+    if (startToken !== null) this.sessions.pinNativeStart(session.sessionId, startToken);
     const connected = await buzz.connect(session.sessionId, purpose);
     if (!connected.allowed) {
       this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "buzz connect failed");
