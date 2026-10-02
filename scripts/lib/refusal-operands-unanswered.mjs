@@ -460,7 +460,15 @@ const groups = [
     reason: "Delivery reads the durable outbox row and checks its message kind. The malformed-envelope tests stop before journaling; isolating absent row versus wrong kind needs a separately controlled outbox delivery fixture.",
     operands: [
       ["!row",1],
-      ["row.kind !== MessageKind.OWNER_MESSAGE",1],
+      ["!HOLDER_CLAIMED_KINDS.has(row.kind)",1],
+    ],
+  },
+  {
+    file: "src/daemon/agentcpd.ts",
+    // buzzPeerRegistry.primaryCtoFor (#1038)
+    reason: "TYPESCRIPT IS THE GUARD, not a test. `only` is `RoleBinding | undefined`, and the operand beside this one reads `only.role` while the return below reads `only.roleKey`, `only.bindingGeneration` and `only.sessionId`. Replacing `!only` with `false` fails to typecheck (measured: four TS18048 errors, at the sibling comparison and at all three later reads). The sibling `only.role !== Role.PRIMARY_CTO` has its own row, a-peer-mention-addresses-only-a-primary-cto.",
+    operands: [
+      ["!only",1],
     ],
   },
   {

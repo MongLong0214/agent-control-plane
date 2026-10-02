@@ -31,6 +31,20 @@ export const MessageKind = {
    * conversation, and a conversation does not survive its runtime being replaced.
    */
   OWNER_MESSAGE: "OWNER_MESSAGE",
+  /**
+   * The CEO's Buzz mention of the PRIMARY_CTO, admitted as a peer turn (#1038).
+   *
+   * Consumed exactly as an `OWNER_MESSAGE` is — by its holder, over its own connection — and a kind
+   * of its own so that nothing reads it as the owner's. The kind is what the hand-over reports as
+   * the message's principal, so the principal is the daemon's fact about the row and never a field
+   * a payload could carry.
+   *
+   * Its generation proof is checked at admission, not at hand-over: the hand-over checks only the
+   * holder fence every holder-claimed row has, so a message admitted before a CEO rotation is still
+   * handed to its CTO after it. Re-checking the CEO generation at hand-over was decided against
+   * here, because a refusal there has to burn the row — a write — where admission refuses with none.
+   */
+  PEER_MESSAGE: "PEER_MESSAGE",
 } as const;
 export type MessageKind = (typeof MessageKind)[keyof typeof MessageKind];
 
@@ -65,6 +79,7 @@ export const RETARGETABLE_KINDS: ReadonlySet<MessageKind> = new Set<MessageKind>
  */
 export const HOLDER_CLAIMED_KINDS: ReadonlySet<MessageKind> = new Set<MessageKind>([
   MessageKind.OWNER_MESSAGE,
+  MessageKind.PEER_MESSAGE,
 ]);
 
 export const payloadDigestOf = (payload: unknown): string => digestOf(payload);

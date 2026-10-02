@@ -403,6 +403,36 @@ export const ReasonCode = {
    * not be resolved, so an unreachable role is visible rather than silent.
    */
   MENTION_TARGET_UNBOUND: "MENTION_TARGET_UNBOUND",
+  /**
+   * #1038 — a CEO-authored Buzz envelope whose generation proof is not the current one.
+   *
+   * The proof is what the daemon's own subscriber bound the event to at receipt: the CEO binding
+   * generation, the CEO runtime, and the receiving PRIMARY_CTO's generation and session. It is
+   * compared against the registry immediately before the admission's first write, and anything
+   * else — a proof from before a rotation, or none at all — is refused there, before the replay
+   * slot is spent. Distinct from `BUZZ_PEER_EVENT_OUTSIDE_GENERATION`, which is about the event's
+   * own signed time rather than what it was bound to.
+   */
+  BUZZ_PEER_GENERATION_STALE: "BUZZ_PEER_GENERATION_STALE",
+  /**
+   * #1038 — the event was signed outside the current CEO generation's window.
+   *
+   * A Buzz channel identity can be reused across generations, and an event the previous
+   * generation signed still verifies under the same key. Its signed `created_at` is the one fact
+   * that places it, so an event dated before the current CEO binding was created — or further in
+   * the future than clock skew explains — is not this generation's.
+   */
+  BUZZ_PEER_EVENT_OUTSIDE_GENERATION: "BUZZ_PEER_EVENT_OUTSIDE_GENERATION",
+  /**
+   * #1038 — a CEO-authored envelope that does not address exactly one bound PRIMARY_CTO.
+   *
+   * A peer turn has one recipient class. The owner's own CEO conversation, a session holding any
+   * other role or several, and a `p` tag that is not one channel identity are all refused rather
+   * than narrowed, and refused before admission so nothing is written for them.
+   */
+  BUZZ_PEER_TARGET_NOT_BOUND_CTO: "BUZZ_PEER_TARGET_NOT_BOUND_CTO",
+  /** #1038 — a CEO-authored envelope that arrived on a room other than the addressed CTO's project channel. */
+  BUZZ_PEER_CHANNEL_MISMATCH: "BUZZ_PEER_CHANNEL_MISMATCH",
 
   // --- canonical turns -----------------------------------------------------
   /**
@@ -726,6 +756,7 @@ export const isReasonCode = (value: string): value is ReasonCode => ALL.has(valu
  */
 export const STALENESS_REASON_CODES: ReadonlySet<ReasonCode> = new Set([
   ReasonCode.BINDING_GENERATION_STALE,
+  ReasonCode.BUZZ_PEER_GENERATION_STALE,
   ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE,
   ReasonCode.CAPACITY_SENSOR_FILE_STALE,
   ReasonCode.CEO_CONVERSATION_STALE,

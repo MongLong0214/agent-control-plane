@@ -34,9 +34,11 @@ import {
   BuzzMentionBindingUnavailableError,
   startBuzzMentionSubscriberFromStateDir,
   type BuzzMentionAdmission,
+  type BuzzMentionAdmissionRequest,
   type BuzzMentionRegistry,
   type BuzzMentionSink,
   type BuzzMentionSubscriberHandle,
+  type BuzzMentionVerdict,
   type BuzzRelaySocketFactory,
   type BuzzSubscriberScheduler,
 } from "../buzz/buzz-mention-subscriber.ts";
@@ -61,6 +63,7 @@ import {
   type BuzzMentionRouter,
   type BuzzMessageIngressInput,
   type BuzzMessageTurnPort,
+  type BuzzPeerRegistry,
   type CeoTurnDelivery,
 } from "../ingress/buzz-message.ts";
 import {
@@ -83,7 +86,7 @@ import {
   type OwnerMessageLedger,
 } from "../mcp/role-conversation.ts";
 import { digestOf, isDigest } from "../core/digest.ts";
-import { MessageKind } from "../outbox/envelope.ts";
+import { HOLDER_CLAIMED_KINDS, MessageKind } from "../outbox/envelope.ts";
 import type { HolderIdentity } from "../outbox/outbox.ts";
 import { respond, type AuthenticatedMcpPeer, type McpPeerAuthenticator } from "../mcp/shared.ts";
 import type { AuthenticatedOperatorPeer, Daemon } from "./daemon.ts";
@@ -604,7 +607,8 @@ export const startLocalMcpListeners = async (
             "role_owner_message_claim",
             {
               description:
-                "Take at most one owner message addressed to a role this connection currently holds.",
+                "Take at most one message addressed to a role this connection currently holds. " +
+                "`principal` says who sent it: `peer` is the CEO, whose message carries no owner authority.",
               inputSchema: { roleKey: z.string().min(1) },
             },
             async (args: { roleKey: string }) =>
@@ -766,6 +770,63 @@ const buzzMentionRouter = (cp: ControlPlane): BuzzMentionRouter => ({
 });
 
 /**
+ * The registry facts the Buzz peer rule reads (#1038). Reads only, like `buzzMentionRouter`.
+ *
+ * `currentCeo` reads the column off the CEO binding's *live* runtime, so a NULL there — the adopted
+ * runtime's state on 2026-10-02 — answers with a null identity and every CEO mention is refused.
+ * Nothing here binds one: `BuzzActorIngress.bindActor` is still the only writer, and it needs the
+ * session secret #1037 issues.
+ *
+ * `primaryCtoFor` asks `buzzMentionSubscriberRegistry`'s question — a live session whose one
+ * mentionable role is a PRIMARY_CTO — without its stderr diagnostics, because a refused peer
+ * envelope is an ordinary event here rather than a subscriber that cannot start; and it adds the two
+ * facts the peer rule binds to: the binding's generation and that session's project channel.
+ *
+ * Two deployment facts this change does not configure: the guard every sender meets needs the
+ * CEO's key on `ACP_BUZZ_ALLOWED_ACTORS`, and the peer rule needs the CTO runtime's `buzz_address`
+ * to be the room the CEO writes in.
+ */
+export const buzzPeerRegistry = (cp: ControlPlane): BuzzPeerRegistry => ({
+  currentCeo: () => {
+    const ceo = cp.bindings.active(roleKeyFor(Role.CEO));
+    if (!ceo) return null;
+    const runtime = cp.db.get<{ buzz_actor_id: string | null }>(
+      `SELECT buzz_actor_id FROM sessions
+        WHERE session_id = ? AND lifecycle IN ('READY','DRAINING')`,
+      [ceo.sessionId],
+    );
+    return {
+      bindingGeneration: ceo.bindingGeneration,
+      sessionId: ceo.sessionId,
+      channelIdentity: runtime?.buzz_actor_id ?? null,
+      generationStartedAt: ceo.createdAt,
+    };
+  },
+  primaryCtoFor: (mention) => {
+    const channelIdentity = mention.trim();
+    if (channelIdentity.length === 0) return null;
+    const session = cp.db.get<{ session_id: string; buzz_address: string | null }>(
+      `SELECT session_id, buzz_address FROM sessions
+        WHERE buzz_actor_id = ? AND lifecycle IN ('READY','DRAINING')`,
+      [channelIdentity],
+    );
+    if (!session) return null;
+    const held = currentBindingsForRoles(cp, MENTIONABLE_ROLES).filter(
+      (binding) => binding.sessionId === session.session_id,
+    );
+    const only = held.length === 1 ? held[0] : undefined;
+    if (!only || only.role !== Role.PRIMARY_CTO) return null;
+    return {
+      roleKey: only.roleKey,
+      bindingGeneration: only.bindingGeneration,
+      sessionId: only.sessionId,
+      channel: session.buzz_address,
+    };
+  },
+  nowMs: () => cp.clock.now().getTime(),
+});
+
+/**
  * §6.1 DIRECT for the Buzz surface: an owner's message becomes one turn for the session that
  * currently holds the CEO binding, and the CEO's answer goes back to the relay that sent it.
  *
@@ -830,7 +891,15 @@ export const startBuzzMessageIngressListener = async (
   // `policy.allowedActors` is the relay credential's list and admits every ACTIVE Buzz channel
   // identity; `ownerActors` is who may speak to the CEO as the owner. Passing the first for the
   // second is the defect this argument exists to make impossible to write by accident.
-  const ingress = new BuzzMessageIngress(guard, options.ownerActors, buzzMentionRouter(cp));
+  //
+  // The fourth is the peer rule (#1038), and it is how the CEO reaches the CTO without being on the
+  // owner list: the CEO binding's own Buzz channel identity, toward its bound PRIMARY_CTO only.
+  const ingress = new BuzzMessageIngress(
+    guard,
+    options.ownerActors,
+    buzzMentionRouter(cp),
+    buzzPeerRegistry(cp),
+  );
   const roleConversation = options.roleConversation ?? null;
   const port: BuzzMessageTurnPort = {
     deliverToCeo: (text, source) =>
@@ -856,12 +925,13 @@ export const startBuzzMessageIngressListener = async (
         // fresh key would let one event id enqueue twice if it ever reached here twice, and the
         // outbox's own duplicate suppression is the second line under the ingress replay refusal
         // rather than a different rule.
-        idempotencyKey: `owner-message:${input.nonce}`,
+        idempotencyKey: `${input.principal}-message:${input.nonce}`,
         roleKey: input.roleKey,
         bindingGeneration: input.bindingGeneration,
         targetSessionId: input.targetSessionId,
         runId: null,
-        kind: MessageKind.OWNER_MESSAGE,
+        // #1038: a peer's row is a kind of its own, so its holder is told it is not the owner's.
+        kind: input.principal === "peer" ? MessageKind.PEER_MESSAGE : MessageKind.OWNER_MESSAGE,
         payload: input.pointer,
       });
       if (!enqueued.allowed) return enqueued as Decision<{ messageId: string }>;
@@ -1078,6 +1148,51 @@ export const buzzMentionAdmissionOf = (decision: Decision<unknown>): BuzzMention
 };
 
 /**
+ * `buzzMentionAdmissionOf`, with a refusal's reason code kept for health (#1038).
+ *
+ * The cursor still reads only the four-valued answer. The code is for the operator: on the live
+ * daemon 710 of 721 `admission-refused` frames were the CEO's own mentions, and the bare count
+ * could not say so.
+ */
+export const buzzMentionVerdictOf = (decision: Decision<unknown>): BuzzMentionVerdict => {
+  const admission = buzzMentionAdmissionOf(decision);
+  return admission === "REFUSED" ? { admission, reasonCode: decision.reasonCode } : { admission };
+};
+
+/**
+ * The envelope the daemon's sink presents for one verified relay event (#760 Part C, #1038).
+ *
+ * The event's author is presented as the actor and the seam decides what it is: an owner, the
+ * current CEO binding speaking as a peer, or nobody. For the CEO's event this is also where the
+ * event is bound to its generation — at receipt, through the same rule admission re-runs before
+ * its first write — so an envelope built here and dispatched after a rotation is refused rather
+ * than re-attributed. Exported so that "built at receipt, dispatched later" is a row a test can
+ * write against the exact envelope the sink builds.
+ */
+export const buzzMentionInputFor = (
+  ingress: BuzzMessageIngress,
+  secret: string,
+  request: BuzzMentionAdmissionRequest,
+): BuzzMessageIngressInput => {
+  const input: BuzzMessageIngressInput = {
+    // The event's own author, checked against the declared buzz owners by the seam. A
+    // subscriber cannot widen that: it presents who signed the event and nothing else.
+    actor: request.event.pubkey,
+    conversation: request.conversation,
+    eventId: request.event.id,
+    addressedTo: BUZZ_MENTION_ADDRESSED_TO,
+    // The identity whose `p` tag matched, which is the address the seam resolves to a role.
+    mention: request.identityPubkey,
+    text: request.event.content,
+    // The signed time, which is inside the payload only once a generation proof is attached.
+    createdAt: request.event.created_at,
+  };
+  const observed = ingress.observePeer(input);
+  const bound = observed.allowed ? { ...input, peer: observed.value } : input;
+  return { ...bound, signature: ingressSignature(secret, buzzMessageSigningRequest(bound)) };
+};
+
+/**
  * The daemon's own front door on the relay, feeding the seam a person's CLI feeds (#760 Part C).
  *
  * Two things are worth stating about the signature this composes. The subscriber has already
@@ -1111,22 +1226,12 @@ export const startDaemonBuzzMentionSubscriber = (
   }
   const sink: BuzzMentionSink = {
     admit: async (request) => {
-      const input: BuzzMessageIngressInput = {
-        // The event's own author, checked against the declared buzz owners by the seam. A
-        // subscriber cannot widen that: it presents who signed the event and nothing else.
-        actor: request.event.pubkey,
-        conversation: request.conversation,
-        eventId: request.event.id,
-        addressedTo: BUZZ_MENTION_ADDRESSED_TO,
-        // The identity whose `p` tag matched, which is the address the seam resolves to a role.
-        mention: request.identityPubkey,
-        text: request.event.content,
-      };
-      const delivered = await deliverBuzzMessage(messageIngress.seam.ingress, messageIngress.seam.port, {
-        ...input,
-        signature: ingressSignature(secret, buzzMessageSigningRequest(input)),
-      });
-      return buzzMentionAdmissionOf(delivered);
+      const delivered = await deliverBuzzMessage(
+        messageIngress.seam.ingress,
+        messageIngress.seam.port,
+        buzzMentionInputFor(messageIngress.seam.ingress, secret, request),
+      );
+      return buzzMentionVerdictOf(delivered);
     },
   };
   return startBuzzMentionSubscriberFromStateDir(stateDir, {
@@ -2702,7 +2807,7 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
   /** The pointer on one owner-message row, or a denial naming what is wrong with it. */
   const pointerOn = (messageId: string) => {
     const row = cp.outbox.get(messageId);
-    if (!row || row.kind !== MessageKind.OWNER_MESSAGE) {
+    if (!row || !HOLDER_CLAIMED_KINDS.has(row.kind)) {
       return { pointer: null, refusal: deny(ReasonCode.NOT_FOUND, "no owner message has that id", { messageId }) };
     }
     const pointer = ownerMessagePointerOf(row.payload);
@@ -2807,6 +2912,8 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
             text,
             sourceNonce: pointer.sourceNonce,
             createdAt: message.createdAt,
+            // #1038. From the row's kind — the daemon's own fact — and never from the payload.
+            principal: message.kind === MessageKind.PEER_MESSAGE ? "peer" : "owner",
           },
           unresolved,
           hasMore: taken.hasMore,

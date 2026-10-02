@@ -135,6 +135,12 @@ export interface OwnerMessageHandover {
     text: string;
     sourceNonce: string;
     createdAt: string;
+    /**
+     * Who the message is from (#1038). `peer` is the CEO's Buzz mention: the holder may act on its
+     * questions and work instructions, and it carries no owner authority — no owner gate, no
+     * approval, and its completion settles its own turn and nothing the owner is owed.
+     */
+    principal: "owner" | "peer";
   } | null;
   unresolved: readonly UnresolvedOwnerMessage[];
   hasMore: boolean;

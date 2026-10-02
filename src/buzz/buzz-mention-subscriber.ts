@@ -421,8 +421,24 @@ export interface BuzzMentionAdmissionRequest {
 
 /** Where a verified event goes. The daemon's composition is the only production implementation. */
 export interface BuzzMentionSink {
-  admit(request: BuzzMentionAdmissionRequest): Promise<BuzzMentionAdmission>;
+  admit(request: BuzzMentionAdmissionRequest): Promise<BuzzMentionAdmission | BuzzMentionVerdict>;
 }
+
+/**
+ * An admission answer that also says which refusal it was (#1038).
+ *
+ * A bare `REFUSED` is still accepted, and counts under the bare bucket. The daemon's sink answers
+ * with this so health can tell "a non-owner wrote" from "the CEO wrote on the wrong channel" — 710
+ * of 721 live refusals were one reason, and the count alone could not say which.
+ */
+export interface BuzzMentionVerdict {
+  readonly admission: BuzzMentionAdmission;
+  /** The seam's reason code. Read only when `admission` is `REFUSED`. */
+  readonly reasonCode?: string;
+}
+
+/** A reason code is a fixed catalogue string; anything else stays out of the health key space. */
+const REASON_CODE_SHAPE = /^[A-Z][A-Z0-9_]{0,63}$/;
 
 /** The half of a socket this module drives. */
 export interface BuzzRelaySocket {
@@ -692,7 +708,8 @@ const tagValues = (event: RelayEvent, name: string): string[] =>
 type BuzzMentionRejection =
   /**
    * The sink answered `REFUSED`. Not a frame this subscriber found fault with — it verified,
-   * addressed and resolved a role for it, and the admission seam turned it down.
+   * addressed and resolved a role for it, and the admission seam turned it down. Counted as
+   * `admission-refused:<reasonCode>` when the sink names the reason (`BuzzMentionVerdict`).
    */
   | "admission-refused"
   /**
@@ -757,6 +774,20 @@ type BuzzMentionRejection =
   | "event-conversation-unusable"
   | "role-not-held";
 
+/** A rejection as the tally keys it: one of the fixed reasons, or a refusal with its reason code. */
+type BuzzMentionRejectionKey = BuzzMentionRejection | `admission-refused:${string}`;
+
+/**
+ * Which bucket a `REFUSED` answer is counted in (#1038). A verdict naming a catalogue-shaped
+ * reason code gets its own; a bare answer, or a code of any other shape, keeps the bare bucket.
+ */
+const refusalKey = (answer: BuzzMentionAdmission | BuzzMentionVerdict): BuzzMentionRejectionKey => {
+  const code = typeof answer === "string" ? undefined : answer.reasonCode;
+  return code !== undefined && REASON_CODE_SHAPE.test(code)
+    ? `admission-refused:${code}`
+    : "admission-refused";
+};
+
 /**
  * What this subscriber has actually seen, as opposed to what it was configured to see.
  *
@@ -809,7 +840,7 @@ export interface BuzzMentionCounters {
 class FrameTally {
   #framesHandled = 0;
   #admitted = 0;
-  readonly #rejections = new Map<BuzzMentionRejection, number>();
+  readonly #rejections = new Map<BuzzMentionRejectionKey, number>();
 
   record(outcome: BuzzMentionFrameOutcome): void {
     this.#framesHandled += 1;
@@ -836,7 +867,7 @@ class FrameTally {
 
 /** What one identity's connection did with one frame. */
 interface BuzzMentionFrameOutcome {
-  readonly rejected: BuzzMentionRejection | null;
+  readonly rejected: BuzzMentionRejectionKey | null;
   readonly admission: BuzzMentionAdmission | null;
 }
 
@@ -1295,12 +1326,13 @@ class BuzzMentionSubscription {
     this.#roleNotHeldRun = 0;
 
     const frozen: BuzzMentionEvent = deepFreeze(event);
-    const admission = await this.#deps.sink.admit({
+    const answer = await this.#deps.sink.admit({
       roleKey: bound.roleKey,
       identityPubkey: this.#pubkey,
       conversation,
       event: frozen,
     });
+    const admission = typeof answer === "string" ? answer : answer.admission;
 
     // **The suspension point.** Admission is the one genuinely slow thing this module does — it
     // reaches a database and a live peer — and it is therefore the window in which this
@@ -1332,7 +1364,7 @@ class BuzzMentionSubscription {
     // A refusal moves nothing. It is deterministic, so there is nothing to retry and no reason to
     // drop the connection — and it is reachable by anyone who can sign an event, so it must not be
     // allowed to choose where the window sits. See `BuzzMentionAdmission`.
-    if (admission === "REFUSED") return { rejected: "admission-refused", admission };
+    if (admission === "REFUSED") return { rejected: refusalKey(answer), admission };
 
     // The second guard, and it is independent of the first on purpose. Refusing to trust a
     // *refusal* covers the stranger; it does nothing about an event this daemon accepted as
