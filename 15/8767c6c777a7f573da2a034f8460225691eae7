@@ -1,0 +1,5 @@
+Limit: No decision record existed for placing ProcessType=Background in the template
+Ruled-out: Longer capacity probe timeout or debouncing probe failures | both hide an unknown capacity reading instead of removing the scheduling cause
+Warn: Judge the effect only by reading back the deployed daemon child's PRI and usage after deploy; a clean render or test run does not show it
+Record-Id: r-475be21c8156
+Provenance: inherited 13b09b5ecb1fd289121818b7c1826a0315ec9007
