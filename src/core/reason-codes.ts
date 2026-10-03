@@ -460,6 +460,16 @@ export const ReasonCode = {
   BUZZ_PEER_TARGET_NOT_BOUND_CTO: "BUZZ_PEER_TARGET_NOT_BOUND_CTO",
   /** #1038 — a CEO-authored envelope that arrived on a room other than the addressed CTO's project channel. */
   BUZZ_PEER_CHANNEL_MISMATCH: "BUZZ_PEER_CHANNEL_MISMATCH",
+  /**
+   * A role-addressed Buzz mention, from the owner or the CEO as a peer, signed before the
+   * addressed role's current binding generation was created.
+   *
+   * The relay's history holds every mention ever sent to a channel identity, and a subscriber
+   * opening for the first time — a new identity, a new room — asks for all of it. Such an event
+   * was never addressed to this generation, so it is refused, and the refusal is terminal: asking
+   * again gives the same answer. Not a staleness code, because nothing re-derived would admit it.
+   */
+  BUZZ_MENTION_PRECEDES_BINDING: "BUZZ_MENTION_PRECEDES_BINDING",
 
   // --- canonical turns -----------------------------------------------------
   /**
@@ -761,6 +771,13 @@ export const ReasonCode = {
   SCHEMA_MIGRATION_NOT_APPROVED: "SCHEMA_MIGRATION_NOT_APPROVED",
   FINALIZATION_ATTEMPT_STALE: "FINALIZATION_ATTEMPT_STALE",
   FINALIZATION_COMPENSATION_REQUIRED: "FINALIZATION_COMPENSATION_REQUIRED",
+  /**
+   * A sealed rollback pair whose database image the live database has moved past, or one sealed
+   * before pairs recorded where their image stood (SSOT U5). Applying it would rewind the database
+   * to the seal and discard every write since. Staleness, not a fault in the pair: the answer is a
+   * fresh pair sealed from the stopped current database, never a repair of this one.
+   */
+  ROLLBACK_PAIR_STALE_DATABASE: "ROLLBACK_PAIR_STALE_DATABASE",
 } as const;
 
 export type ReasonCode = (typeof ReasonCode)[keyof typeof ReasonCode];
@@ -803,6 +820,7 @@ export const STALENESS_REASON_CODES: ReadonlySet<ReasonCode> = new Set([
   ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
   ReasonCode.REGISTERED_SET_GENERATION_MISMATCH,
   ReasonCode.ROLE_PEER_STALE,
+  ReasonCode.ROLLBACK_PAIR_STALE_DATABASE,
   ReasonCode.SNAPSHOT_STALE,
   ReasonCode.WRITE_BINDING_GENERATION_STALE,
 ]);

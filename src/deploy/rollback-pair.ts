@@ -69,6 +69,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readFileSync,
   readSync,
@@ -78,8 +79,11 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import Database from "better-sqlite3";
 
 import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -176,11 +180,48 @@ export interface RollbackPairIdentity {
   };
 }
 
+/**
+ * Where the sealed database image stood, so a later rollback can tell whether the live database
+ * has moved past it (SSOT U5).
+ *
+ * A pair is sealed at one moment and applied at another, and restoring its image rewinds the
+ * database to the seal: every write made in between is discarded, silently, by an operation that
+ * reports success. So the seal records the image's identity and a rollback refuses unless the live
+ * database is still at it.
+ *
+ * The identity is the *content*, not the file bytes. The SQLite backup API that takes the image
+ * rewrites header counters as it copies (measured: the image and its stopped source differ at
+ * bytes 24-27 and 92-95 with no write between them), so a database and the image sealed from it
+ * are not byte-identical even when nothing has been written. Nor is a counter enough on its own:
+ * `audit_events` is deliberately not the state SSOT, and an in-place `UPDATE` moves no row count
+ * and no autoincrement. The digest covers the schema, `user_version`, `application_id` and every
+ * row of every table — its hidden rowid included, which `SELECT *` leaves out and the application
+ * reads as order (ACP1058-R2) — so any write is a difference. `userVersion` and `auditEventId` ride
+ * along for the operator reading a refusal; the decision rests on `contentSha256` alone.
+ */
+export interface RollbackPairDatabaseHighWater {
+  /**
+   * Which definition `contentSha256` follows. Two digests are comparable only under the same one,
+   * so a mark under any other — or under none, which is v1, before the definition hashed rowids
+   * and before it was recorded — is refused at use rather than compared.
+   */
+  contentFormat?: string;
+  contentSha256: string;
+  userVersion: number;
+  /** `max(audit_events.event_id)`, or null when the image holds no audit event. */
+  auditEventId: number | null;
+}
+
 export interface RollbackPairManifest {
   format: string;
   pairId: string;
   createdAt: string;
-  database: { member: string; manifestMember: string };
+  /**
+   * `highWater` is absent only from a pair sealed before it existed. Such a pair is not refused as
+   * malformed — it is structurally whole — but no rollback may apply it: whether the live database
+   * has moved on since it was sealed cannot be known.
+   */
+  database: { member: string; manifestMember: string; highWater?: RollbackPairDatabaseHighWater };
   identity: RollbackPairIdentity;
   /**
    * Every directory in the pair with its mode.
@@ -646,6 +687,248 @@ const assertClosureIsSelfContained = (runtimeRoot: string): void => {
 };
 
 /**
+ * The definition the content digest follows, recorded in every mark beside the digest it produced.
+ *
+ * v2 hashes each rowid table's hidden rowid as part of its row (ACP1058-R2). v1 hashed declared
+ * values only, so `UPDATE … SET rowid = …` left it unchanged, and it recorded no label. The label
+ * is hashed too, so the two can never agree by accident; the recorded copy is what lets a rollback
+ * say a mark is from another definition instead of reporting a write nobody made.
+ */
+const DATABASE_CONTENT_FORMAT = "agent-control-plane.database-content/v2";
+
+/**
+ * What `rollback-pair.js guards` declares, so a caller can refuse a coordinator that cannot run the
+ * check before handing it a rollback (ACP1058-R1). A build from before the check answers `guards`
+ * the way it answers any command it does not know: usage, exit 2, and no such line.
+ */
+const DATABASE_HIGH_WATER_GUARD = "ACP_ROLLBACK_DATABASE_HIGH_WATER";
+
+const quoteIdentifier = (name: string): string => `"${name.replaceAll('"', '""')}"`;
+
+/** The names SQLite answers with a rowid table's hidden rowid, each unless a declared column takes it. */
+const ROWID_NAMES = ["rowid", "_rowid_", "oid"] as const;
+
+/**
+ * The name that reaches `table`'s hidden rowid. A declared column of the same name (in any case)
+ * takes the name over, so the first one no column claims is used; when every one is claimed the
+ * rowid is unreachable from SQL, and the digest refuses rather than leave row identity out.
+ */
+const hiddenRowidName = (raw: Database.Database, table: string): string => {
+  const declared = new Set(
+    (raw.prepare("SELECT name FROM pragma_table_xinfo(?)").pluck().all(table) as string[]).map((name) =>
+      name.toLowerCase(),
+    ),
+  );
+  const name = ROWID_NAMES.find((candidate) => !declared.has(candidate));
+  if (name === undefined) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      "a table declares a column under every name SQLite gives its rowid, so no name reaches its hidden rowid and the content digest cannot cover its row identity",
+      { table },
+    );
+  }
+  return name;
+};
+
+/**
+ * One digest over everything a write can change: `user_version`, `application_id`, the schema
+ * without its root pages (layout, not content), and every row of every table in key order. Each
+ * value is tagged with its storage class and length-prefixed, so `'1'`, `1` and `1.0` differ and no
+ * two rows can run together. Integers are read as BigInt; a JavaScript number would merge two
+ * distinct values above 2^53.
+ *
+ * A row's identity is part of the row. `SELECT *` leaves a rowid table's hidden rowid out, and the
+ * application reads it — ingress hands it out as `arrivalSequence`, and outbox, tasks, artifacts
+ * and turn coordination break ties by it — so it is hashed first in every row of a rowid table.
+ * Where an `INTEGER PRIMARY KEY` already aliases it, the value appears twice, which costs nothing.
+ * A `WITHOUT ROWID` table has no hidden identity: its declared primary key is all of it.
+ */
+const digestDatabaseContent = (raw: Database.Database): string => {
+  const hash = createHash("sha256");
+  const length = Buffer.alloc(8);
+  const field = (tag: string, bytes: Uint8Array): void => {
+    length.writeBigUInt64BE(BigInt(bytes.length));
+    hash.update(tag);
+    hash.update(length);
+    hash.update(bytes);
+  };
+  const cell = (value: unknown): void => {
+    if (value === null) hash.update("n");
+    else if (typeof value === "bigint") field("i", Buffer.from(value.toString(), "latin1"));
+    else if (typeof value === "number") {
+      const real = Buffer.alloc(8);
+      real.writeDoubleBE(value);
+      field("r", real);
+    } else if (typeof value === "string") field("s", Buffer.from(value, "utf8"));
+    else if (value instanceof Uint8Array) field("b", value);
+    else {
+      throw acpError(ReasonCode.INTERNAL_ERROR, "a database value has a type the content digest cannot encode", {
+        type: typeof value,
+      });
+    }
+  };
+  const rows = (sql: string): void => {
+    for (const row of raw.prepare(sql).raw(true).safeIntegers(true).iterate() as Iterable<unknown[]>) {
+      hash.update("R");
+      for (const value of row) cell(value);
+    }
+  };
+
+  field("F", Buffer.from(DATABASE_CONTENT_FORMAT, "utf8"));
+  field("V", Buffer.from(String(raw.pragma("user_version", { simple: true })), "utf8"));
+  field("A", Buffer.from(String(raw.pragma("application_id", { simple: true })), "utf8"));
+  rows("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name");
+  // `shadow` tables hold a virtual table's content; the virtual table itself is read through its
+  // module, which this process may not have, and says nothing its shadows do not.
+  const tables = raw
+    .prepare(
+      "SELECT name, wr FROM pragma_table_list WHERE schema = 'main' AND type IN ('table', 'shadow') " +
+        "AND name NOT IN ('sqlite_schema', 'sqlite_master') ORDER BY name",
+    )
+    .all() as Array<{ name: string; wr: number }>;
+  for (const table of tables) {
+    field("T", Buffer.from(table.name, "utf8"));
+    if (table.wr === 0) {
+      const rowid = hiddenRowidName(raw, table.name);
+      rows(`SELECT ${rowid}, * FROM ${quoteIdentifier(table.name)} ORDER BY ${rowid}`);
+      continue;
+    }
+    const key = (
+      raw.prepare("SELECT name FROM pragma_table_info(?) WHERE pk > 0 ORDER BY pk").pluck().all(table.name) as string[]
+    )
+      .map(quoteIdentifier)
+      .join(", ");
+    rows(`SELECT * FROM ${quoteIdentifier(table.name)} ORDER BY ${key}`);
+  }
+  return `sha256:${hash.digest("hex")}`;
+};
+
+/**
+ * The high-water mark of the database at `databasePath`, or null when there is none.
+ *
+ * Measured through a private copy, never in place. A read-only SQLite open of a WAL database with
+ * no sidecars creates `-wal` and `-shm` beside it and leaves them there (measured), so measuring the
+ * live file in place would change the deployment from inside a validation whose refusal must be
+ * free. The copy carries `-wal` and `-journal`, so committed writes still in the log are counted —
+ * the main file alone is older than the last commit until something checkpoints it. A database
+ * that changes while it is being copied has a writer, and is refused rather than measured.
+ */
+const measureDatabaseAt = (databasePath: string): RollbackPairDatabaseHighWater | null => {
+  if (lstatSync(databasePath, { throwIfNoEntry: false }) === undefined) return null;
+  const files = ["", "-wal", "-journal"];
+  for (const suffix of files) {
+    const stat = lstatSync(`${databasePath}${suffix}`, { throwIfNoEntry: false });
+    if (stat !== undefined && !stat.isFile()) {
+      throw acpError(ReasonCode.STATE_PATH_INSECURE, "a database file to be measured is not a regular, non-symlink file", {
+        path: `${databasePath}${suffix}`,
+      });
+    }
+  }
+  const observe = (): string =>
+    files
+      .map((suffix) => {
+        const stat = lstatSync(`${databasePath}${suffix}`, { bigint: true, throwIfNoEntry: false });
+        return stat === undefined ? "-" : `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}`;
+      })
+      .join("|");
+
+  const before = observe();
+  const scratch = mkdtempSync(join(tmpdir(), "acp-rollback-measure-"));
+  try {
+    const copy = join(scratch, basename(databasePath));
+    for (const suffix of files) {
+      if (!existsSync(`${databasePath}${suffix}`)) continue;
+      copyFileSync(`${databasePath}${suffix}`, `${copy}${suffix}`, fsConstants.COPYFILE_FICLONE);
+    }
+    if (observe() !== before) {
+      throw acpError(
+        ReasonCode.ROLLBACK_PAIR_STALE_DATABASE,
+        "the database changed while it was being measured, so something is still writing it; stop the service and try again",
+        { databasePath },
+      );
+    }
+    // Read-write, because this copy is private: recovering its log or its journal changes only the
+    // copy, and a read-only handle cannot roll a hot journal back at all.
+    const raw = new Database(copy, { fileMustExist: true });
+    try {
+      const audited = raw
+        .prepare("SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'audit_events'")
+        .pluck()
+        .get() as number;
+      return {
+        contentFormat: DATABASE_CONTENT_FORMAT,
+        contentSha256: digestDatabaseContent(raw),
+        userVersion: Number(raw.pragma("user_version", { simple: true })),
+        auditEventId:
+          audited === 0 ? null : (raw.prepare("SELECT max(event_id) FROM audit_events").pluck().get() as number | null),
+      };
+    } finally {
+      raw.close();
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+};
+
+/**
+ * Refuses a pair whose sealed database image the live database has moved past (SSOT U5).
+ *
+ * A rollback must preserve current writes. Applying a pair sealed before the live database's last
+ * write rewinds it to the seal and discards everything since, so the only pair that may be applied
+ * is one sealed from the database as it is now. When this refuses, the remedy is the operator's,
+ * and it is the same every time: stop the service, seal a fresh pair from the stopped current
+ * database and the target generation's closure, and roll back with that one.
+ *
+ * A pair sealed before the mark existed is refused too, whatever the live database holds. It is
+ * not malformed, but nothing about it can show the live database has not moved on, and assuming so
+ * is the defect this exists to end. A marked pair with no live database at all is accepted: there is
+ * no write to preserve, and that is the rebuilt-machine case a pair exists for.
+ *
+ * A mark recorded under another content definition — v1's carries no label — is refused the same
+ * way and for the same reason, before the live database is read: its digest and a live one cannot
+ * agree even when nothing has been written, so comparing them would report a write nobody made, and
+ * no comparison under this definition can show the live database is still at the seal (ACP1058-R2).
+ */
+const assertLiveDatabaseAtSeal = (manifest: RollbackPairManifest, root: string): void => {
+  const databasePath = manifest.identity.database.targetPath;
+  const remedy =
+    "stop the service, seal a fresh pair from the stopped current database and the target generation's " +
+    "runtime closure, and roll back with that pair";
+  const sealed = manifest.database.highWater;
+  if (sealed === undefined) {
+    throw acpError(
+      ReasonCode.ROLLBACK_PAIR_STALE_DATABASE,
+      `this pair records no database high-water mark, so whether the live database has moved on since it was sealed cannot be known; ${remedy}`,
+      { root, databasePath, sealedAt: manifest.createdAt },
+    );
+  }
+  if (sealed.contentFormat !== DATABASE_CONTENT_FORMAT) {
+    throw acpError(
+      ReasonCode.ROLLBACK_PAIR_STALE_DATABASE,
+      "this pair's database high-water mark was recorded under a different database content definition " +
+        `than the ${DATABASE_CONTENT_FORMAT} this build measures, so it cannot be compared with the live ` +
+        `database and whether the live database has moved on since it was sealed cannot be known; ${remedy}`,
+      {
+        root,
+        databasePath,
+        sealedAt: manifest.createdAt,
+        sealedContentFormat: sealed.contentFormat ?? "agent-control-plane.database-content/v1 (unlabelled)",
+        measuredContentFormat: DATABASE_CONTENT_FORMAT,
+      },
+    );
+  }
+  const live = measureDatabaseAt(databasePath);
+  if (live === null) return;
+  if (live.contentSha256 !== sealed.contentSha256) {
+    throw acpError(
+      ReasonCode.ROLLBACK_PAIR_STALE_DATABASE,
+      `the live database has changed since this pair was sealed, and restoring the sealed image would discard every write made since; ${remedy}`,
+      { root, databasePath, sealedAt: manifest.createdAt, sealed, live },
+    );
+  }
+};
+
+/**
  * Seals one pair, published atomically.
  *
  * Everything is built inside an owner-only staging directory beside the destination and validated
@@ -737,6 +1020,10 @@ export const sealRollbackPair = async (
         databasePath: sources.databasePath,
       });
     }
+    // Measured from the image, not the source: the image is what a rollback installs, and a source
+    // still being written has already moved past it. Before the inventory is taken, so nothing this
+    // reads can change a member after its digest is recorded.
+    const highWater = measureDatabaseAt(sealedDatabase)!;
     const entrypointMember = `runtime/${sources.entrypoint}`;
     const stateAdminMember = `runtime/${sources.stateAdmin}`;
     const nodeMember = `runtime/${sources.nodeExecutable}`;
@@ -782,7 +1069,7 @@ export const sealRollbackPair = async (
       format: ROLLBACK_PAIR_FORMAT,
       pairId,
       createdAt: new Date().toISOString(),
-      database: { member: databaseMember, manifestMember: backupManifestMember },
+      database: { member: databaseMember, manifestMember: backupManifestMember, highWater },
       identity,
       directories: [...tree.directories]
         .sort()
@@ -808,8 +1095,10 @@ export const sealRollbackPair = async (
     const indexDigest = hashBytes(Buffer.from(index, "utf8"));
 
     // Canonically validated where it was built, under the rules a rollback will apply, so a pair
-    // that could never be used never becomes visible under an approved-looking name.
-    validateRollbackPair(building, {
+    // that could never be used never becomes visible under an approved-looking name. Not against
+    // the live database: a source still being written has moved past the image already, and that
+    // makes the pair stale at use, not malformed at seal.
+    validateSealedPair(building, {
       pairId,
       indexDigest,
       databaseTargetPath: identity.database.targetPath,
@@ -864,6 +1153,22 @@ const parseIndex = (text: string, root: string): IndexEntry[] => {
   });
 };
 
+/** Absent is a legacy pair, refused at use; present and malformed is not a pair at all. */
+const isHighWater = (value: unknown): value is RollbackPairDatabaseHighWater => {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Partial<RollbackPairDatabaseHighWater>;
+  return (
+    // Absent is a v1 mark and a label naming another definition is a mark this build cannot
+    // compare; both are refused at use. A label that is not a label at all is not a mark.
+    (candidate.contentFormat === undefined ||
+      (typeof candidate.contentFormat === "string" && candidate.contentFormat.length > 0)) &&
+    typeof candidate.contentSha256 === "string" &&
+    DIGEST.test(candidate.contentSha256) &&
+    Number.isInteger(candidate.userVersion) &&
+    (candidate.auditEventId === null || Number.isSafeInteger(candidate.auditEventId))
+  );
+};
+
 const readPairManifest = (path: string, root: string): RollbackPairManifest => {
   let parsed: unknown;
   try {
@@ -883,6 +1188,7 @@ const readPairManifest = (path: string, root: string): RollbackPairManifest => {
     typeof candidate.createdAt !== "string" ||
     typeof candidate.database?.member !== "string" ||
     typeof candidate.database?.manifestMember !== "string" ||
+    (candidate.database.highWater !== undefined && !isHighWater(candidate.database.highWater)) ||
     !Number.isInteger(candidate.identity?.schemaVersion) ||
     typeof candidate.identity?.database?.targetPath !== "string" ||
     candidate.identity.database.targetPath.length === 0 ||
@@ -939,8 +1245,12 @@ export interface ValidatedRollbackPair {
  *
  * Mutates nothing, creates nothing, and changes no mode — a refusal has to be free, because the
  * commonest reason to run it is to find out whether a rollback is possible at all.
+ *
+ * This half asks only about the pair. `sealRollbackPair` runs it on the pair it is building, where
+ * the live database is the seal's own source and may legitimately have moved on already;
+ * `validateRollbackPair` is this plus the live database.
  */
-export const validateRollbackPair = (
+const validateSealedPair = (
   pairRoot: string,
   expectation: RollbackPairExpectation,
 ): ValidatedRollbackPair => {
@@ -1373,6 +1683,23 @@ export const validateRollbackPair = (
   };
 };
 
+/**
+ * Everything `validateSealedPair` proves about the pair, and then that applying it now would lose
+ * no write: the live database is still at the image the pair sealed (SSOT U5).
+ *
+ * Last, so every structural refusal keeps the reason it had. The live database is read through a
+ * private copy in the system temporary directory that is removed before this returns; nothing is
+ * created beside the live database, which a read-only open in place would do.
+ */
+export const validateRollbackPair = (
+  pairRoot: string,
+  expectation: RollbackPairExpectation,
+): ValidatedRollbackPair => {
+  const validated = validateSealedPair(pairRoot, expectation);
+  assertLiveDatabaseAtSeal(validated.manifest, validated.root);
+  return validated;
+};
+
 export interface StagedRollbackPair {
   pairId: string;
   stageRoot: string;
@@ -1705,6 +2032,10 @@ export const applyRollbackPair = (
       void what;
     };
     intact("before securing recovery");
+    // Again, immediately before the first mutation. The validation staging ran is not enough on its
+    // own: staging copies the whole closure, and a write that lands in that window is still a write
+    // this rollback would discard. A refusal here has changed nothing.
+    assertLiveDatabaseAtSeal(staged.manifest, staged.stageRoot);
 
     // A sibling of the stage parent, deliberately not nested under `staged.stageRoot`: the stage is
     // exactly what `rollbackToSealedPair`'s own `finally` removes once this call returns *or*
@@ -1953,6 +2284,8 @@ const USAGE = `rollback-pair — seal, validate and roll back one exact sealed p
     --expect-service-generation NAME --expect-node-version vX.Y.Z \\
     [--stage-parent DIR, required by rollback]
 
+  rollback-pair guards
+
 seal states every identity rather than probing for it, so the same command seals the generation
 being left and the one being moved to. It prints the pair id and SHA256(SHA256SUMS); retain both
 OUTSIDE the pair, because a pair cannot prove its own index.
@@ -1962,6 +2295,16 @@ private verified copy of every member, install of the runtime closure, plist, la
 database together, and the post-condition — or puts the previous generation back. There is no way
 to hand out a stage and apply it later: a stage path on a command line is a mutation authority
 anyone who can name it holds.
+
+validate and rollback both refuse with ROLLBACK_PAIR_STALE_DATABASE unless the live database still
+holds exactly what the pair's image holds, because restoring an older image discards every write
+made since. A pair sealed before seals recorded that mark is refused the same way, and so is one whose
+mark was recorded under a different database content definition than this build measures. The remedy
+is always the same: stop the service, seal a fresh pair from the stopped current database and the
+target generation's runtime closure, and roll back with that pair.
+
+guards prints ACP_ROLLBACK_DATABASE_HIGH_WATER=<definition> and changes nothing. A coordinator built
+before the check prints no such line, so a caller holding one can refuse it before any rollback.
 `;
 
 const REQUIRED_SEAL_FLAGS = [
@@ -2027,6 +2370,13 @@ const collect = (argv: readonly string[], flags: readonly string[]): Map<string,
 
 const main = async (argv: readonly string[]): Promise<number> => {
   const command = argv[0];
+
+  if (command === "guards") {
+    // Asked before a rollback is handed to this coordinator, by a caller that may hold an older
+    // one (deploy/install-launchd.sh). Reads nothing and changes nothing.
+    process.stdout.write(`${DATABASE_HIGH_WATER_GUARD}=${DATABASE_CONTENT_FORMAT}\n`);
+    return 0;
+  }
 
   if (command === "seal") {
     const supplied = collect(argv, REQUIRED_SEAL_FLAGS);
