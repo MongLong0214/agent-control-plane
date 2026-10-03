@@ -1,0 +1,9 @@
+Limit: session rows record their process start in two formats: the canonical self-claim writes the native darwin-tv token, every other writer ps lstart text; the live process must be read in the format its row was recorded in
+Warn: a recorded start in neither format is UNKNOWN and refuses; linux-clk tokens are not recognised and refuse rather than guess
+Record-Id: r-livenessfmt
+Provenance: inherited 42aaf1f5a48aae8e7d991dd8e3aea01ca383557d
+
+Warn: probeSessionLiveness checks the recorded format before any comparison, injected reader or not; a live value in a different format from the record is UNKNOWN, so pid-reuse fixtures must use a recognised format of the same kind
+Record-Id: r-livenessfmtr1
+Follows: r-livenessfmt
+Provenance: inherited 8eaad2129e3df90897601e90bb36115f5cb41cd4
