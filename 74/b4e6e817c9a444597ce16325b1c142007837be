@@ -1,0 +1,19 @@
+Limit: a SQLite backup-API image differs from its stopped source in header bytes with no write between them, so the live database is compared with the sealed image by a content digest, never by file bytes
+Limit: audit_events is deliberately not the state SSOT and an in-place UPDATE moves no row count or autoincrement, so max(event_id) and user_version are evidence in a refusal, not the decision
+Ruled-out: comparing the live database file's sha256 with the sealed image digest | the backup API rewrites header counters as it copies, so the two differ even when nothing was written
+Warn: measure the live database only through a private copy that carries -wal and -journal: a read-only open in place leaves -wal and -shm beside it, and the main file alone misses commits still in the log
+Warn: keep the live-database check out of sealRollbackPair and after every structural check in validateRollbackPair: the seal's source may still be written, and existing refusals keep their reasons only while the check runs last
+Warn: deploy/install-launchd.sh rollback runs the rollback-pair.js under --app-root, the target generation, so a rollback into a generation older than this change is not checked by it; run this build's rollback-pair.js validate against the stopped database first
+Unverified: the six rollback-pair-wal rows that exec the sealed interpreter shim, including the restructured CLI and compensation rows, were not run locally because of the host's syspolicyd exec stall; CI runs them
+Record-Id: r-1181b6100741
+Provenance: inherited 5e6c176430d29858293394b97298e8208051e40a
+
+Limit: a deployment's own dist/deploy/rollback-pair.js is the runtime a rollback replaces: a deployment built before the high-water check validates and applies a stale pair without it, and a rollback into an older generation installs that generation's coordinator for the next rollback to find
+Limit: SELECT * leaves a rowid table's hidden rowid out, and the application reads it (ingress hands it out as arrivalSequence; outbox, tasks, artifacts and turn coordination break ties by it), so the high-water digest hashes it as part of every row
+Ruled-out: comparing an unlabelled v1 high-water digest with a v2 live digest | the two cannot agree even when nothing was written, so it would report a write nobody made; such a mark is refused explicitly as ROLLBACK_PAIR_STALE_DATABASE instead
+Warn: keep install-launchd.sh rollback validating and applying through $DEFAULT_APP_ROOT/dist/deploy/rollback-pair.js behind the guards probe, never $app_root/dist; after a rollback into a pre-check generation the installer inside that deployment refuses by design, and the next rollback runs from a checkout built with the check, with --app-root
+Warn: predateHighWaterCheck in tests/unit/deploy-launchd.test.ts anchors on the compiled header of assertLiveDatabaseAtSeal; renaming that function or its parameters needs the anchor updated
+Warn: a table that declares columns named rowid, _rowid_ and oid all at once makes the content digest throw INTERNAL_ERROR, so every seal fails until it is renamed
+Warn: in installer and rollback tests open a WAL database read-write, never read-only: a read-only open with no sidecars creates -wal and -shm and leaves them, which a byte-and-name snapshot reports as a refusal changing something
+Record-Id: r-a9b4d92472b9
+Provenance: inherited fa6630e29116e13c5bc3e42bdcda552319a7feb7
