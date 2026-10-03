@@ -65,6 +65,40 @@ export const SELF_CLAIM_EXECUTOR_KIND = "claude-cli";
 /** This primitive's own attestation protocol; deliberately distinct from `hermes.target-bind/v1`. */
 export const SELF_CLAIM_PROTOCOL = "acp.canonical-self-claim/v1";
 
+/**
+ * Whether a session is an adopted canonical CTO runtime, as one SQL predicate: the session is the
+ * current runtime of an actor whose lifetime target is a `SELF_CLAIM_EXECUTOR_KIND` conversation.
+ * No provider launched such a runtime, so no adapter can deliver to it, and it is reached in band
+ * over its own authenticated connection instead (`Outbox.claimDeliverable`'s exclusion).
+ *
+ * One rule shared by the outbox, the CTO lifecycle and the in-band ack, so they cannot disagree
+ * about which runtime is canonical. `sessionExpr` and `assignmentExpr` are SQL expressions (`?` or
+ * a correlated column); the assignment scope narrows the rule to one binding, which is the form
+ * `CtoLifecycle` asks. The aliases are prefixed so the predicate can sit inside a query that already
+ * uses `a`, `s` or `actor`. The executor kind is a module constant, inlined for the reason
+ * `HOLDER_CLAIMED_KIND_SQL` gives, and quote-guarded the same way.
+ */
+export const adoptedCanonicalRuntimeSql = (sessionExpr: string, assignmentExpr?: string): string => `EXISTS (
+  SELECT 1 FROM assignments canon_a
+    JOIN conversational_actors canon_c ON canon_c.actor_id = canon_a.actor_id
+    JOIN actor_target_bindings canon_tb ON canon_tb.target_actor_id = canon_a.actor_id
+   WHERE canon_tb.executor_kind = '${SELF_CLAIM_EXECUTOR_KIND.replace(/'/g, "''")}'
+     AND canon_c.current_session_id = ${sessionExpr}${
+       assignmentExpr === undefined ? "" : `\n     AND canon_a.assignment_id = ${assignmentExpr}`
+     }
+)`;
+
+/** `adoptedCanonicalRuntimeSql` as a read; with an assignment id, scoped to that binding. */
+export const isAdoptedCanonicalRuntime = (
+  db: Pick<Db, "get">,
+  sessionId: string,
+  assignmentId?: string,
+): boolean =>
+  db.get<{ held: number }>(
+    `SELECT ${adoptedCanonicalRuntimeSql("?", assignmentId === undefined ? undefined : "?")} AS held`,
+    assignmentId === undefined ? [sessionId] : [sessionId, assignmentId],
+  )?.held === 1;
+
 const MAX_ANCESTRY_HOPS = 64;
 const SUBPROCESS_TIMEOUT_MS = 5_000;
 const UUID_PATTERN = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;

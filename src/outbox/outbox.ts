@@ -9,6 +9,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { FailureClass as FailureClassCode, type FailureClass } from "../domain/types.ts";
 import { IngressGuard } from "../ingress/ingress-guard.ts";
+import { adoptedCanonicalRuntimeSql, isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
 import {
   type FencedEnvelope,
   HOLDER_CLAIMED_KINDS,
@@ -142,6 +143,63 @@ export const HOLDER_CLAIMED_KIND_SQL = [...HOLDER_CLAIMED_KINDS]
   .join(", ");
 
 /**
+ * The outward, role-level kinds an adopted canonical CTO receives in band rather than over Buzz.
+ *
+ * A canonical CTO is an interactive runtime no provider launched (`adoptedCanonicalRuntimeSql`). A
+ * Buzz send to its room is signed with the daemon's outbound key, and the room's own sender admits
+ * only the room's registered CEO and CTO — so the send is refused, non-retryably, and the row goes
+ * REJECTED before the CTO can acknowledge it. These kinds are therefore withheld from
+ * `claimDeliverable` when, and only when, the target is such a runtime: the row stays PENDING, the
+ * role is woken, and the CTO reads it with `pendingInBandFor` and settles it with `acknowledge`,
+ * both over its own authenticated connection.
+ *
+ * Every outward kind that can be addressed to a PRIMARY_CTO's bound session is here, so no message
+ * to a canonical CTO depends on that send: `RUN_DISPATCH` (run engine, owner-decision resume),
+ * `REVISION_REQUEST` (candidate pipeline, candidate invalidation), `ESCALATION_REPLY` (the CEO's
+ * resolution), `DRAIN_REQUEST` (replacement) and `CANCEL_REQUEST`. All are settled by `run_ack`,
+ * the only generic acknowledgement there is. Left out: `HANDOFF_PACKAGE`, whose recipient is by
+ * construction not yet the role's holder and is settled by `handoff_ack`; `CEO_NOTIFICATION`,
+ * addressed to the CEO; and `TASK_ASSIGN`, `REVIEW_REQUEST` and `RECOVERY_PACKAGE`, which nothing
+ * enqueues. Disjoint from `HOLDER_CLAIMED_KINDS`, which never reach the sweep at all.
+ */
+export const IN_BAND_KINDS: ReadonlySet<MessageKind> = new Set<MessageKind>([
+  MessageKind.RUN_DISPATCH,
+  MessageKind.CANCEL_REQUEST,
+  MessageKind.REVISION_REQUEST,
+  MessageKind.ESCALATION_REPLY,
+  MessageKind.DRAIN_REQUEST,
+]);
+
+/** The literal list for `IN_BAND_KINDS`, built the way `HOLDER_CLAIMED_KIND_SQL` is. */
+export const IN_BAND_KIND_SQL = [...IN_BAND_KINDS]
+  .map((kind) => `'${kind.replace(/'/g, "''")}'`)
+  .join(", ");
+
+/** A pending in-band row is woken for at most once per this window, per row. */
+export const IN_BAND_REWAKE_MS = 5 * 60 * 1000;
+
+/** Knocks on a role's registered wake endpoint; carries nothing (`RoleConversationPort.wake`). */
+export type InBandWake = (roleKey: string) => Promise<Decision<void>>;
+
+/** What an adopted canonical CTO is shown of a row addressed to it in band. */
+export interface InBandDispatch {
+  messageId: string;
+  kind: MessageKind;
+  runId: string | null;
+  createdAt: string;
+  expiresAt: string;
+  payload: unknown;
+}
+
+/**
+ * An in-band row in the generic sweep's terms: the kind is in band and the target is an adopted
+ * canonical runtime. `claimDeliverable` excludes it, and every in-band read below selects it.
+ */
+const inBandRow = (outboxAlias: "o" | "outbox"): string =>
+  `(${outboxAlias}.kind IN (${IN_BAND_KIND_SQL})
+    AND ${adoptedCanonicalRuntimeSql(`${outboxAlias}.target_session_id`)})`;
+
+/**
  * Which runtime holds a role *right now* — one notion of it, shared by every predicate below.
  *
  * `assignments.session_id` is the runtime the binding was created against, and it does not move.
@@ -259,6 +317,17 @@ export class Outbox {
    * bytes. Nothing on this path hands a reply to any transport.
    */
   private readonly settlement: IngressGuard;
+
+  /** The CTO role's wake port, once the daemon's listeners exist; null wakes nothing. */
+  #inBandWake: InBandWake | null = null;
+  /**
+   * When each pending in-band row was last woken for, by message id (clock milliseconds).
+   *
+   * Memory only, deliberately: it bounds wakes to one per row per `IN_BAND_REWAKE_MS`, which is a
+   * storm guard rather than a delivery record. A restart forgets it and wakes each row once more,
+   * which is harmless — the wake carries nothing, and the row is settled only by its ack.
+   */
+  readonly #inBandWokenAt = new Map<string, number>();
 
   constructor(
     private readonly db: Db,
@@ -391,6 +460,14 @@ export class Outbox {
         message.createdAt,
       ],
     );
+    // An in-band row is never transmitted, so the role is told it has something to read — after
+    // the enclosing transaction commits, so a wake cannot reach the CTO before the row it points
+    // at is visible, and a rollback discards it.
+    if (IN_BAND_KINDS.has(message.kind) && isAdoptedCanonicalRuntime(this.db, message.targetSessionId)) {
+      this.db.afterCommit(() => {
+        void this.#wakeInBand([{ messageId: message.messageId, roleKey: message.roleKey }], "enqueue");
+      });
+    }
     return allow(ReasonCode.OK, message);
   }
 
@@ -430,6 +507,13 @@ export class Outbox {
             -- authenticated the holder — the exact disclosure the separate claim path exists to
             -- prevent. The holder takes these through claimForHolder instead.
             AND o.kind NOT IN (${HOLDER_CLAIMED_KIND_SQL})
+            -- So is an in-band row: a role-level kind addressed to an adopted canonical CTO. A
+            -- Buzz send to it would be signed with the daemon's key, which the room's sender
+            -- refuses — the row would go REJECTED before the CTO could acknowledge it — and the
+            -- CTO already holds an authenticated connection to this daemon. It stays PENDING and
+            -- the CTO reads it in band (pendingInBandFor), for the same reason as the line above:
+            -- nothing here may transmit what only its exact target may read.
+            AND NOT ${inBandRow("o")}
             AND o.expires_at > ?
             -- A deferred retry is not deliverable until its window opens; the deferral is
             -- durable, so a restarted loop honours it instead of retrying immediately.
@@ -450,6 +534,7 @@ export class Outbox {
         const updated = this.db.run(
           `UPDATE outbox SET status = 'IN_FLIGHT', claim_token = ?, claimed_at = ?
             WHERE message_id = ? AND status = 'PENDING'
+              AND NOT ${inBandRow("outbox")}
               AND ${liveDeliveryTarget("outbox")}`,
           [token, now, row.message_id],
         );
@@ -889,17 +974,31 @@ export class Outbox {
    * ACK from a runtime session. An ACK carrying a revoked or superseded generation is
    * audit-only and does not change state (§15.7, §34.4).
    */
-  acknowledge(messageId: string, fromSessionId: string, generation: number): Decision<void> {
-    return this.db.tx(() => this.acknowledgeInTx(messageId, fromSessionId, generation));
+  acknowledge(
+    messageId: string,
+    fromSessionId: string,
+    generation: number,
+    sessionIncarnation?: string,
+  ): Decision<void> {
+    return this.db.tx(() => this.acknowledgeInTx(messageId, fromSessionId, generation, sessionIncarnation));
   }
 
   private acknowledgeInTx(
     messageId: string,
     fromSessionId: string,
     generation: number,
+    sessionIncarnation: string | undefined,
   ): Decision<void> {
     const row = this.db.get<RawOutbox>(`SELECT * FROM outbox WHERE message_id = ?`, [messageId]);
     if (!row) return deny(ReasonCode.NOT_FOUND, "unknown message", { messageId });
+
+    // A pending in-band row has one acknowledgement authority, the one `role_dispatch_ack` uses, so
+    // the run-scoped route and the runless one cannot disagree about who may settle it. `run_ack`
+    // has already fenced the caller to a run it owns; the row's own role generation decides the
+    // rest. A holder-claimed kind is never in band, so the refusal below still covers it.
+    if (row.status === "PENDING" && this.#isInBand(row)) {
+      return this.#acknowledgeInBandInTx(row, fromSessionId, sessionIncarnation ?? null);
+    }
 
     // This route is scoped by a *tuple*, not by a message. The `messageId` is whatever the caller
     // supplied, and everything below checks that the caller holds the row's role generation — so a
@@ -1005,6 +1104,212 @@ export class Outbox {
       messageId,
     ]);
     return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * Acknowledges one in-band row, runless: the authority is the addressed row and the caller's own
+   * authenticated session, never a run (`role_dispatch_ack`). A `DRAIN_REQUEST` carries no run, and
+   * a canonical CTO that owns none still has to be able to settle it.
+   */
+  acknowledgeInBand(messageId: string, sessionId: string, sessionIncarnation: string): Decision<void> {
+    return this.db.tx(() => {
+      const row = this.db.get<RawOutbox>(`SELECT * FROM outbox WHERE message_id = ?`, [messageId]);
+      if (!row) return deny(ReasonCode.NOT_FOUND, "unknown message", { messageId });
+      return this.#acknowledgeInBandInTx(row, sessionId, sessionIncarnation);
+    });
+  }
+
+  /** In-band, in `claimDeliverable`'s terms: an in-band kind addressed to a canonical runtime. */
+  #isInBand(row: RawOutbox): boolean {
+    return IN_BAND_KINDS.has(row.kind as MessageKind) && isAdoptedCanonicalRuntime(this.db, row.target_session_id);
+  }
+
+  /**
+   * The one in-band acknowledgement authority, for `run_ack` and `role_dispatch_ack` alike.
+   *
+   * The caller must be the row's exact target and, through `exactHolderTarget` with the row's own
+   * role key and generation, that generation's ACTIVE holder at the incarnation its connection
+   * presented — the predicate `pendingInBandFor` lists by, so a session can settle exactly what it
+   * can see. A holder-claimed kind, a row that is not in band, and a row that is expired, rejected or
+   * already settled are refused. Only `PENDING -> ACKED` is written, as a compare-and-set.
+   */
+  #acknowledgeInBandInTx(row: RawOutbox, sessionId: string, sessionIncarnation: string | null): Decision<void> {
+    const messageId = row.message_id;
+    const refuse = (reasonCode: ReasonCode, message: string): Decision<void> => {
+      this.audit.record({
+        kind: "OUTBOX_ACK_REJECTED",
+        reasonCode,
+        runId: row.run_id,
+        sessionId,
+        roleKey: row.role_key,
+        evidence: { messageId, kind: row.kind, status: row.status, inBand: true },
+      });
+      return deny(reasonCode, message, { messageId, status: row.status });
+    };
+    if (HOLDER_CLAIMED_KINDS.has(row.kind as MessageKind)) {
+      return refuse(
+        ReasonCode.INVALID_ARGUMENT,
+        "this message is settled over its holder's own connection, not through the generic ack",
+      );
+    }
+    if (!this.#isInBand(row)) {
+      return refuse(ReasonCode.INVALID_ARGUMENT, "this message is not delivered in band; acknowledge it with run_ack");
+    }
+    if (row.status === "EXPIRED" || row.expires_at <= this.clock.nowIso()) {
+      return refuse(ReasonCode.OUTBOX_EXPIRED, `message is ${row.status} and cannot be acknowledged`);
+    }
+    if (row.status !== "PENDING") {
+      return refuse(ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, `message is ${row.status} and cannot be acknowledged`);
+    }
+    const holder =
+      sessionIncarnation !== null &&
+      row.target_session_id === sessionId &&
+      this.db.get<{ held: number }>(
+        `SELECT ${exactHolderTarget("bound")} AS held`,
+        [row.role_key, row.binding_generation, row.target_session_id, sessionIncarnation],
+      )?.held === 1;
+    if (!holder) {
+      return refuse(
+        ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
+        "ack came from a session, generation or incarnation that does not hold this message",
+      );
+    }
+    const now = this.clock.nowIso();
+    const changed = this.db.run(
+      `UPDATE outbox SET status = 'ACKED', acked_at = ? WHERE message_id = ? AND status = 'PENDING'`,
+      [now, messageId],
+    ).changes;
+    if (changed !== 1) {
+      return refuse(ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, "message left PENDING before it could be acknowledged");
+    }
+    this.audit.record({
+      kind: "OUTBOX_ACKED_IN_BAND",
+      reasonCode: ReasonCode.OK,
+      runId: row.run_id,
+      sessionId,
+      roleKey: row.role_key,
+      evidence: { messageId, kind: row.kind, bindingGeneration: row.binding_generation },
+    });
+    this.db.afterCommit(() => this.#inBandWokenAt.delete(messageId));
+    return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * The pending in-band rows addressed to one exact runtime, oldest first: read-only.
+   *
+   * `sessionIncarnation` comes from the caller's authenticated connection, and the row must be
+   * addressed to the current holder of its own role generation down to that incarnation
+   * (`exactHolderTarget`) — so a session sees nothing addressed to another session, to a
+   * generation it no longer holds, or to a runtime it replaced. Expired rows are not listed; they
+   * cannot be acknowledged either.
+   */
+  pendingInBandFor(sessionId: string, sessionIncarnation: string): InBandDispatch[] {
+    const rows = this.db.all<RawOutbox>(
+      `SELECT o.* FROM outbox o
+        WHERE o.status = 'PENDING'
+          AND o.target_session_id = ?
+          AND o.expires_at > ?
+          AND ${inBandRow("o")}
+          AND ${exactHolderTarget("o")}
+        ORDER BY o.created_at, o.rowid`,
+      [sessionId, this.clock.nowIso(), sessionIncarnation],
+    );
+    return rows.map((row) => ({
+      messageId: row.message_id,
+      kind: row.kind as MessageKind,
+      runId: row.run_id,
+      createdAt: row.created_at,
+      expiresAt: row.expires_at,
+      payload: readPayload(row.payload_json),
+    }));
+  }
+
+  /**
+   * Installs the CTO role's wake port. Rows enqueued before this are not woken by it; the next
+   * `wakeInBandPending` finds them, which is why the composition root runs one right after.
+   */
+  attachInBandWake(wake: InBandWake): void {
+    this.#inBandWake = wake;
+  }
+
+  /**
+   * Wakes the role of every pending in-band row not woken for within `IN_BAND_REWAKE_MS`.
+   *
+   * Run on the daemon's delivery tick and once when the wake port is attached at startup. A row
+   * whose target no longer holds its role generation is skipped: the fence sweeps will retire it,
+   * and a wake to a former holder is the mistake `RoleConversationPort.wake` exists to refuse.
+   * Never throws; a wake that fails is audited by `#wakeInBand` and tried again only after the
+   * window, so an unreachable CTO costs one audit row per row per window, not a storm.
+   */
+  async wakeInBandPending(): Promise<void> {
+    if (!this.#inBandWake) return;
+    const now = this.clock.nowIso();
+    const rows = this.db.all<{ message_id: string; role_key: string }>(
+      `SELECT o.message_id, o.role_key FROM outbox o
+        WHERE o.status = 'PENDING'
+          AND o.expires_at > ?
+          AND ${inBandRow("o")}
+          AND ${liveDeliveryTarget("o")}
+        ORDER BY o.created_at, o.rowid`,
+      [now],
+    );
+    // The memory follows the queue: a row that left PENDING is forgotten, so it cannot grow.
+    const pending = new Set(rows.map((row) => row.message_id));
+    for (const messageId of [...this.#inBandWokenAt.keys()]) {
+      if (!pending.has(messageId)) this.#inBandWokenAt.delete(messageId);
+    }
+    const nowMs = Date.parse(now);
+    const due = rows
+      .filter((row) => {
+        const last = this.#inBandWokenAt.get(row.message_id);
+        return last === undefined || nowMs - last >= IN_BAND_REWAKE_MS;
+      })
+      .map((row) => ({ messageId: row.message_id, roleKey: row.role_key }));
+    await this.#wakeInBand(due, "rewake");
+  }
+
+  /**
+   * One wake per role for these rows, fire-and-forget for the caller that does not await it.
+   *
+   * The rows are marked woken before the wake is sent, so a tick that runs while a wake is still in
+   * flight does not send a second. Nothing is marked while no port is attached: no wake was tried.
+   * The returned promise never rejects — a refused or thrown wake becomes one
+   * `OUTBOX_IN_BAND_WAKE_FAILED` audit row carrying the decision's reason code and never the
+   * thrown error's text, which for a socket error names the endpoint's private path.
+   */
+  #wakeInBand(rows: ReadonlyArray<{ messageId: string; roleKey: string }>, trigger: "enqueue" | "rewake"): Promise<void> {
+    const wake = this.#inBandWake;
+    if (!wake || rows.length === 0) return Promise.resolve();
+    const nowMs = Date.parse(this.clock.nowIso());
+    const byRole = new Map<string, string[]>();
+    for (const row of rows) {
+      this.#inBandWokenAt.set(row.messageId, nowMs);
+      byRole.set(row.roleKey, [...(byRole.get(row.roleKey) ?? []), row.messageId]);
+    }
+    return Promise.all(
+      [...byRole].map(async ([roleKey, messageIds]) => {
+        let refused: ReasonCode | null = null;
+        let threw = false;
+        try {
+          const woke = await wake(roleKey);
+          if (!woke.allowed) refused = woke.reasonCode;
+        } catch {
+          refused = ReasonCode.ROLE_PEER_FAILED;
+          threw = true;
+        }
+        if (refused === null) return;
+        try {
+          this.audit.record({
+            kind: "OUTBOX_IN_BAND_WAKE_FAILED",
+            reasonCode: refused,
+            roleKey,
+            evidence: { trigger, messageIds, threw },
+          });
+        } catch {
+          // A closed database cannot take the row; the wake is retried after the window anyway.
+        }
+      }),
+    ).then(() => undefined);
   }
 
   /**
@@ -1423,6 +1728,15 @@ const unresolvedOwnerMessage = (row: RawOutbox): UnresolvedOwnerMessage => ({
   attempts: row.attempts,
   createdAt: row.created_at,
 });
+
+/** A stored payload for an in-band reader; one that is not readable JSON is shown as null. */
+const readPayload = (payloadJson: string): unknown => {
+  try {
+    return JSON.parse(payloadJson) as unknown;
+  } catch {
+    return null;
+  }
+};
 
 const hydrate = (row: RawOutbox): OutboxMessage => ({
   messageId: row.message_id,
