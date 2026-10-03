@@ -1,0 +1,44 @@
+Limit: defaultConfig() sets no repoFactory.workRoot, so a production CONFIRM of a PROJECT_BOOTSTRAP run is refused at WORK_ROOT_UNCONFIGURED before the owner approval is consumed or GitHub is called
+Limit: the CTO's plan_submit carries operation identities only, so a PLAN submitted over MCP is refused as PLAN_NOT_EXECUTABLE at the owner's approval as well as at the CEO confirm
+Ruled-out: running the Repo Factory runner inside ProductionGate.submitCeoDecision's transaction | the runner awaits GitHub and git and the decision is one synchronous transaction, so the Hermes closure runs it ahead of the decision and outside the transaction instead
+Ruled-out: minting the repo_factory_github_write approval through a Hermes or CTO MCP tool | owner authority is the one thing the control plane cannot derive; the operator socket's bearer is the owner's credential and admitCliOwnerApproval admits only an allowlisted CLI owner
+Warn: a fresh bootstrap's first CEO CONFIRM performs the GitHub writes and is refused BOOTSTRAP_ACTIVATION_INCOMPLETE until the primary CTO acknowledges its handoff; the CEO confirms again under a new idempotency key
+Warn: a CEO-decision admission check belongs in ProductionGate.admitCeoDecision, which the bootstrap CONFIRM asks before the runner; a check added only to submitCeoDecision refuses after the GitHub writes have happened
+Unverified: the owner approval and the bootstrap CONFIRM path have run only against the bare-repository GitHub double and an in-process daemon, never GitHub or the live daemon
+Record-Id: r-eb84f1001dfd
+Follows: r-26031d3fb388
+Provenance: inherited ece7b8cfbbae889d46143a170237537956287452
+
+Limit: plan_submit still accepts operations named by identity only, for existing callers; such a PLAN is refused as PLAN_NOT_EXECUTABLE at the owner's approval and at execution
+Ruled-out: running the Repo Factory runner inside ProductionGate.submitCeoDecision's transaction | the runner awaits GitHub and git and the decision is one synchronous transaction, so the Hermes closure runs it ahead of the decision and outside the transaction instead
+Ruled-out: minting the repo_factory_github_write approval through a Hermes or CTO MCP tool | owner authority is the one thing the control plane cannot derive; the operator socket's bearer is the owner's credential and admitCliOwnerApproval admits only an allowlisted CLI owner
+Ruled-out: a constructor fallback for the Repo Factory work root | it would hand every directly constructed control plane, test fixtures included, a work root beside the production gh port; defaultConfig() supplies <state root>/repo-factory instead
+Ruled-out: checking the work root when the control plane is constructed | an insecure work root would then stop the daemon; the runner checks it before the approval is consumed or GitHub is called instead, so it refuses Repo Factory runs only
+Ruled-out: a second copy of the desired-state rules in the plan_submit input schema | plan_submit takes githubOperationSchema itself, the schema the runner executes and the owner approves
+Warn: a work root reached through a symlink, owned by another account, or not exactly 0700 is refused as WORK_ROOT_INSECURE and never repaired; a person fixes the directory
+Warn: a fresh bootstrap's first CEO CONFIRM performs the GitHub writes and is refused BOOTSTRAP_ACTIVATION_INCOMPLETE until the primary CTO acknowledges its handoff; the CEO confirms again under a new idempotency key
+Warn: a CEO-decision admission check belongs in ProductionGate.admitCeoDecision, which the bootstrap CONFIRM asks before the runner; a check added only to submitCeoDecision refuses after the GitHub writes have happened
+Unverified: the owner approval, the bootstrap CONFIRM and plan_submit paths have run only against the bare-repository GitHub double and in-process servers, never GitHub or the live daemon
+Unverified: a work root owned by another account is refused by ensurePrivateDirectory's owner check, which no test here exercises: a test cannot make such a directory without root
+Record-Id: r-e7e0c416ad3c
+Follows: r-5dd8ef68ada4
+Supersedes: r-eb84f1001dfd
+Provenance: inherited 08e05adea00863ea80305e4d1bf1fc5d9a92bcce
+
+Limit: the bootstrap review check runs before the GitHub writes, so a refusal at finalization can no longer be the first refusal of a CONFIRM naming an unreviewed candidate
+Ruled-out: consuming the owner approval against the run's candidate pointer | an unpromoted bootstrap leaves the pointer null, so one approval could serve two confirmations; it is consumed for the candidate the CEO confirms instead
+Ruled-out: a review check written separately for the runner | the runner asks finalization's own reviewForConfirmation instead, so the check before the write and the check inside the CEO transaction cannot drift apart
+Ruled-out: an idempotency key derived from the owner approval's parameters | it made an approval after a decline a cached replay of the first approval; each agentctl command is a new decision under a fresh key instead, and only --decision-key repeats one
+Warn: an owner approval is consumed for the first candidate the CEO confirms; a later CONFIRM naming another candidate is refused, and only a new owner approval can serve it
+Warn: repoFactory.githubWrite.approve refuses a request without an idempotency key; every caller names its decision, and agentctl prints the key it generated on stderr so a lost answer can be retried
+Unverified: the promoted-candidate witness promotes the reviewed snapshot directly with runs.promoteCandidate; no test drives a bootstrap run's promotion through the pipeline
+Record-Id: r-b3da69da8922
+Follows: r-e7e0c416ad3c
+Provenance: inherited 745c6a6f44dd28c523f25cccc70f894d69c8dfec
+
+Limit: OwnerAuthority compares the receipt's candidate only when the caller consumes or re-admits for a candidate; a non-candidate operation such as a repair, consumed with null, is judged only against its own prior consumption
+Ruled-out: rebinding a receipt an earlier head consumed with no candidate to whichever candidate the next CONFIRM names | that record cannot say which candidate it served, so the rebinding would let one approval serve two confirmations; it is refused with the remedy NEW_OWNER_DECISION instead
+Warn: a Repo Factory receipt that the heads before RF1050-01 consumed with no candidate no longer re-admits a retry; the CONFIRM is refused EVIDENCE_STALE with remedy NEW_OWNER_DECISION, and only after a new owner approval does production resume from the GitHub ledger
+Unverified: the RF1050-04 witness replays the earlier head's admission by swapping the runner's owner authority port for one that consumes for the run's candidate pointer; no database written by an earlier build was loaded
+Record-Id: r-e57a81870b07
+Provenance: inherited d1861f58790f4cbdae0384cfe8c29c4011c382a4
