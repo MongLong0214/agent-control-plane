@@ -1,7 +1,7 @@
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { generateSecretKey, getPublicKey, verifyEvent } from "nostr-tools/pure";
+import { finalizeEvent, generateSecretKey, getPublicKey, verifyEvent } from "nostr-tools/pure";
 
 import {
   type BuzzMentionSubscriberHandle,
@@ -18,6 +18,9 @@ import {
   ownerReplyFor,
   pendingOwnerReplies,
 } from "../../src/conversation/owner-reply-outbox.ts";
+// A namespace import for what only this branch's head exports, so this file still loads on the
+// commit before it and each R1056 row fails there on its own assertion rather than at import.
+import * as outbox from "../../src/conversation/owner-reply-outbox.ts";
 import {
   ConversationTurnCoordinator,
   type ReceiptLookupQuery,
@@ -76,6 +79,8 @@ interface FakeRelay {
   readonly factory: BuzzRelaySocketFactory;
   mode: RelayMode;
   refusal: string;
+  /** What an `OK true` for a new event says. The live relay says nothing; a hostile one may say anything. */
+  acceptMessage: string;
   /** Every EVENT frame received, in order, byte for byte. */
   readonly received: { raw: string; event: BuzzSignedEvent }[];
   /** One entry per distinct event id the relay holds, however often it was sent. */
@@ -111,7 +116,7 @@ const fakeRelay = (): FakeRelay => {
           const duplicate = relay.stored.has(event.id);
           if (!duplicate) relay.stored.set(event.id, raw);
           if (relay.mode === "silent") return;
-          answer(["OK", event.id, true, duplicate ? "duplicate: already have this event" : ""]);
+          answer(["OK", event.id, true, duplicate ? "duplicate: already have this event" : relay.acceptMessage]);
         },
         close: () => {
           socket.closed = true;
@@ -120,6 +125,7 @@ const fakeRelay = (): FakeRelay => {
     },
     mode: "accept",
     refusal: "",
+    acceptMessage: "",
     received: [],
     stored: new Map(),
     sockets: [],
@@ -476,6 +482,7 @@ describe("an owner reply on Buzz", () => {
       conversation: ROOM,
       replyToEventId: ownerEvent,
       relayUrl: RELAY,
+      relayAck: "ACCEPTED",
       contentDigest: sha256(REPLY),
     });
     const { evidenceDigest, ...evidence } = delivery!;
@@ -523,8 +530,9 @@ describe("an owner reply on Buzz", () => {
     // The relay took the event and its answer never arrived: the intent is durable, DELIVERED is not.
     expect(relay.received).toHaveLength(1);
     const sent = relay.received[0]!;
-    expect(ownerReplyDeliveryState(before.db, turn)).toMatchObject({
-      status: "PENDING",
+    expect(ownerReplyDeliveryState(before.db, turn)?.status).toBe("PENDING");
+    expect(outbox.ownerReplyIntent(before.db, turn)).toMatchObject({
+      status: "RECORDED",
       intent: { eventId: sent.event.id },
     });
 
@@ -544,7 +552,7 @@ describe("an owner reply on Buzz", () => {
     const item = ownerReplyFor(after.db, turn);
     expect(item?.status).toBe("DELIVERED");
     expect(item?.delivery?.eventId).toBe(sent.event.id);
-    expect(item?.delivery?.relayMessage.startsWith("duplicate:")).toBe(true);
+    expect(item?.delivery?.relayAck).toBe("DUPLICATE");
     expect(auditRows(after, "OWNER_REPLY_DELIVERED", turn)).toHaveLength(1);
   });
 
@@ -561,7 +569,7 @@ describe("an owner reply on Buzz", () => {
       status: "PENDING",
       attempts: 1,
       retryAt: "2026-10-03T00:00:05.000Z",
-      blocked: { reasonCode: ReasonCode.OWNER_REPLY_RELAY_REFUSED, cause: "blocked", transient: true },
+      blocked: { reasonCode: ReasonCode.OWNER_REPLY_RELAY_REFUSED, cause: "REFUSED_OTHER", transient: true },
     });
     expect(auditRows(w, "OWNER_REPLY_UNDELIVERED", turn).map((row) => row.reason_code)).toEqual([
       ReasonCode.OWNER_REPLY_RELAY_REFUSED,
@@ -712,6 +720,271 @@ describe("an owner reply the consumer cannot deliver", () => {
       });
     }
     expect(w.relay.received).toEqual([]);
+  });
+});
+
+/** The marker a hostile relay plants in what it says; nothing it says may be stored (R1056-04). */
+const PRIVATE_MARKER = "private-launch-project";
+
+/** Every place in the database a relay's words could have been kept. */
+const markerRows = (w: World): number =>
+  w.db.get<{ n: number }>(
+    `SELECT (SELECT COUNT(*) FROM inbound_messages
+              WHERE instr(COALESCE(payload_json, '') || COALESCE(result_json, ''), ?) > 0)
+          + (SELECT COUNT(*) FROM audit_events WHERE instr(evidence_json, ?) > 0) AS n`,
+    [PRIVATE_MARKER, PRIVATE_MARKER],
+  )!.n;
+
+/** Steps one due retry whose relay stays silent through to its publish timeout. */
+const timeOutOnce = async (w: World, advanceMs: number): Promise<void> => {
+  w.relay.mode = "silent";
+  w.clock.advance(advanceMs);
+  w.consumerTimers.fireAll();
+  const pass = w.consumer.wake("DUE");
+  await flush();
+  w.subscriberTimers.fireAll();
+  await pass;
+};
+
+/** Steps one due retry the relay refuses. */
+const refuseOnce = async (w: World, advanceMs: number, refusal: string): Promise<void> => {
+  w.relay.mode = "refuse";
+  w.relay.refusal = refusal;
+  w.clock.advance(advanceMs);
+  w.consumerTimers.fireAll();
+  await w.consumer.wake("DUE");
+  await quiesce(w);
+};
+
+describe("the #1056 review's six findings", () => {
+  it("R1056-01 signs and publishes nothing a caller builds, whatever the publisher is handed", async () => {
+    const w = openWorld();
+    await w.relay.connect();
+    const template = { kind: 1, created_at: 1_900_000_000, tags: [["h", OTHER_ROOM]], content: "unverified text" };
+    const strangers = finalizeEvent({ ...template, tags: template.tags.map((tag) => [...tag]) }, generateSecretKey());
+    const claimsToBeOurs = { ...template, pubkey: w.cto.pubkey, id: "0".repeat(64), sig: "0".repeat(128) };
+    const shaped = {
+      turnRequestId: "turn:forged",
+      signer: w.cto.pubkey,
+      room: ROOM,
+      replyToEventId: eventIdFor("owner-event-forged-anchor"),
+      content: "unverified text",
+      createdAt: 1_900_000_000,
+      intent: null,
+    };
+    const inputs: unknown[][] = [
+      [w.cto.pubkey, template],
+      [strangers, 1_000],
+      [claimsToBeOurs, 1_000],
+      [shaped, 1_000],
+      [{ ...shaped, intent: claimsToBeOurs }, 1_000],
+    ];
+    const answers: unknown[] = [];
+    for (const [name, member] of Object.entries(w.subscriber.replies as unknown as Record<string, unknown>)) {
+      if (typeof member !== "function" || ["roomsOf", "ready", "onAuthenticated"].includes(name)) continue;
+      const call = member as (...args: unknown[]) => unknown;
+      for (const args of inputs) answers.push(await call(...args));
+    }
+    await flush();
+
+    expect(answers.length).toBeGreaterThan(0);
+    expect(w.relay.received).toEqual([]);
+    expect(answers.filter((answer) => typeof answer === "object" && answer !== null && "sig" in answer)).toEqual([]);
+  });
+
+  it("R1056-02 resends the one recorded event when the item's mutable state is damaged after an unanswered publish", async () => {
+    const w = openWorld();
+    w.relay.mode = "silent";
+    await w.relay.connect();
+    await w.consumer.start();
+    const turn = await settle(w, admitBuzz(w, { eventId: eventIdFor("owner-event-damaged"), mention: w.cto.pubkey }));
+    await flush();
+    expect(w.relay.received).toHaveLength(1);
+    w.subscriberTimers.fireAll();
+    await Promise.all(w.wakes);
+
+    // The probe the review ran: a writer of the item's mutable column damages what it can reach.
+    w.db.run(
+      `UPDATE inbound_messages SET result_json = json_set(result_json, '$.intent.recordedAt', 5)
+        WHERE channel = ? AND nonce = ?`,
+      [OWNER_REPLY_OUTBOX_CHANNEL, turn],
+    );
+    w.relay.mode = "accept";
+    w.clock.advance(5_000);
+    w.consumerTimers.fireAll();
+    await w.consumer.wake("DUE");
+    await quiesce(w);
+
+    expect(new Set(w.relay.received.map((sent) => sent.event.id)).size).toBe(1);
+    expect(w.relay.stored.size).toBe(1);
+    expect(ownerReplyFor(w.db, turn)?.status).toBe("DELIVERED");
+  });
+
+  it("R1056-02 blocks an item whose recorded intent cannot be read, with one audit row, and never signs another", async () => {
+    const w = openWorld();
+    await w.consumer.start();
+    // Settled while the signer's connection is not authenticated: nothing is signed yet.
+    const turn = await settle(w, admitBuzz(w, { eventId: eventIdFor("owner-event-unreadable"), mention: w.cto.pubkey }));
+    await flush();
+    await Promise.all(w.wakes);
+    w.db.run(
+      `INSERT INTO inbound_messages (channel, nonce, actor, received_at, payload_json, result_json)
+       VALUES ('owner-reply-intent', ?, ?, ?, ?, ?)`,
+      [turn, w.cto.pubkey, NOW, JSON.stringify({ transport: "buzz", event: { id: "damaged" } }), '{"status":"RECORDED"}'],
+    );
+    await w.relay.connect();
+    await quiesce(w);
+    await w.consumer.wake("ALL");
+    await quiesce(w);
+
+    expect(w.relay.received).toEqual([]);
+    expect(ownerReplyFor(w.db, turn)?.status).toBe("PENDING");
+    expect(ownerReplyDeliveryState(w.db, turn)?.blocked).toMatchObject({
+      reasonCode: ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT,
+      cause: "recorded-intent-unreadable",
+      transient: false,
+    });
+    expect(auditRows(w, "OWNER_REPLY_UNDELIVERED", turn).map((row) => row.reason_code)).toEqual([
+      ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT,
+    ]);
+  });
+
+  it("R1056-02 keeps a recorded intent from being rewritten, replaced or removed", async () => {
+    const w = openWorld();
+    w.relay.mode = "silent";
+    await w.relay.connect();
+    await w.consumer.start();
+    const turn = await settle(w, admitBuzz(w, { eventId: eventIdFor("owner-event-protected"), mention: w.cto.pubkey }));
+    await flush();
+    const intentRow = () => w.db.get<{ payload_json: string }>(
+      `SELECT payload_json FROM inbound_messages WHERE channel = 'owner-reply-intent' AND nonce = ?`,
+      [turn],
+    );
+    const recorded = intentRow();
+    expect(recorded).toBeDefined();
+
+    expect(() => w.db.run(
+      `UPDATE inbound_messages SET payload_json = '{}' WHERE channel = 'owner-reply-intent' AND nonce = ?`,
+      [turn],
+    )).toThrow();
+    expect(() => w.db.run(
+      `DELETE FROM inbound_messages WHERE channel = 'owner-reply-intent' AND nonce = ?`,
+      [turn],
+    )).toThrow();
+    expect(() => w.db.run(
+      `INSERT OR REPLACE INTO inbound_messages (channel, nonce, actor, received_at, payload_json)
+       VALUES ('owner-reply-intent', ?, 'someone', ?, '{}')`,
+      [turn, NOW],
+    )).toThrow();
+    expect(intentRow()).toEqual(recorded);
+    expect(outbox.ownerReplyIntent(w.db, turn)).toMatchObject({
+      status: "RECORDED",
+      intent: { eventId: w.relay.received[0]!.event.id },
+    });
+  });
+
+  it("R1056-03 arms no timer for an item waiting on its signer's authentication, and the authentication retries it", async () => {
+    const w = openWorld();
+    w.relay.mode = "refuse";
+    w.relay.refusal = "blocked: not now";
+    await w.relay.connect();
+    await w.consumer.start();
+    const turn = await settle(w, admitBuzz(w, { eventId: eventIdFor("owner-event-waiting"), mention: w.cto.pubkey }));
+    await quiesce(w);
+    expect(w.consumerTimers.pending()).toEqual([5_000]);
+
+    // The relay drops the signer's connection before the retry is due.
+    const dropped = w.relay.sockets.at(-1)!;
+    dropped.closed = true;
+    dropped.handlers.onClose();
+    await flush();
+    w.clock.advance(5_000);
+    w.consumerTimers.fireAll();
+    await w.consumer.wake("DUE");
+    await flush();
+
+    expect(w.consumerTimers.pending()).toEqual([]);
+    expect(ownerReplyDeliveryState(w.db, turn)?.attempts).toBe(1);
+
+    w.relay.mode = "accept";
+    w.subscriberTimers.fireAll();
+    await w.relay.connect();
+    await quiesce(w);
+    expect(ownerReplyFor(w.db, turn)?.status).toBe("DELIVERED");
+  });
+
+  it("R1056-04 keeps only fixed categories of what the relay says, never its words", async () => {
+    const w = openWorld();
+    w.relay.mode = "refuse";
+    w.relay.refusal = `${PRIVATE_MARKER}: refused, and here is a token-0000`;
+    await w.relay.connect();
+    await w.consumer.start();
+    const turn = await settle(w, admitBuzz(w, { eventId: eventIdFor("owner-event-private"), mention: w.cto.pubkey }));
+    await quiesce(w);
+    expect(ownerReplyDeliveryState(w.db, turn)?.blocked).toMatchObject({
+      reasonCode: ReasonCode.OWNER_REPLY_RELAY_REFUSED,
+      cause: "REFUSED_OTHER",
+    });
+
+    w.relay.mode = "accept";
+    w.relay.acceptMessage = `${PRIVATE_MARKER}: stored, with the body attached`;
+    w.clock.advance(5_000);
+    w.consumerTimers.fireAll();
+    await w.consumer.wake("DUE");
+    await quiesce(w);
+
+    expect(ownerReplyFor(w.db, turn)?.delivery?.relayAck).toBe("ACCEPTED");
+    expect(markerRows(w)).toBe(0);
+  });
+
+  it.each([
+    ["CRLF", "line one\r\nline two\r\n"],
+    ["lone CR", "line one\rline two"],
+  ])("R1056-05 delivers a %s reply byte for byte, and resends the same bytes after a restart", async (_, text) => {
+    const relay = fakeRelay();
+    relay.mode = "silent";
+    const before = openWorld({ relay });
+    await relay.connect();
+    await before.consumer.start();
+    const turn = await settle(before, admitBuzz(before, { eventId: eventIdFor(`owner-event-${text}`), mention: before.cto.pubkey }), {
+      content: text,
+    });
+    await flush();
+    expect(relay.received).toHaveLength(1);
+    expect(relay.received[0]!.event.content).toBe(text);
+
+    relay.sockets.at(-1)!.closed = true;
+    before.db.close();
+    relay.mode = "accept";
+    const after = openWorld({ path: before.path, cto: before.cto, relay, clock: new ManualClock("2026-10-03T00:05:00.000Z") });
+    await relay.connect();
+    await after.consumer.start();
+    await quiesce(after);
+
+    expect(relay.received).toHaveLength(2);
+    expect(relay.received[1]!.raw).toBe(relay.received[0]!.raw);
+    expect(ownerReplyFor(after.db, turn)?.status).toBe("DELIVERED");
+    expect(ownerReplyFor(after.db, turn)?.replyText).toBe(text);
+  });
+
+  it("R1056-06 audits each cause once per item, however the causes alternate", async () => {
+    const w = openWorld();
+    w.relay.mode = "refuse";
+    w.relay.refusal = "rate-limited: slow down";
+    await w.relay.connect();
+    await w.consumer.start();
+    const turn = await settle(w, admitBuzz(w, { eventId: eventIdFor("owner-event-alternating"), mention: w.cto.pubkey }));
+    await quiesce(w);
+    for (let round = 0; round < 3; round += 1) {
+      await timeOutOnce(w, 900_000);
+      await refuseOnce(w, 900_000, "rate-limited: slow down");
+    }
+
+    expect(ownerReplyDeliveryState(w.db, turn)).toMatchObject({ status: "PENDING", attempts: 7 });
+    expect(auditRows(w, "OWNER_REPLY_UNDELIVERED", turn).map((row) => row.reason_code)).toEqual([
+      ReasonCode.OWNER_REPLY_RELAY_REFUSED,
+      ReasonCode.OWNER_REPLY_RELAY_TIMEOUT,
+    ]);
   });
 });
 

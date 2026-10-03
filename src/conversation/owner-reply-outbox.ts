@@ -1,9 +1,10 @@
-import { canonicalJson, digestOf } from "../core/digest.ts";
+import { canonicalJson, digestOf, sha256 } from "../core/digest.ts";
 import type { Clock } from "../core/clock.ts";
 import { type Decision, acpError, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
+import { BUZZ_MESSAGE_NONCE_PREFIX } from "../ingress/buzz-message.ts";
 
 /**
  * The owner-reply outbox lane (#1036): one durable item per turn a target receipt proved
@@ -34,8 +35,8 @@ import type { Db } from "../db/database.ts";
  *
  * **Delivery (#1036).** The receipt's `evidenceDigest` names the reply. For a Hermes `COMPLETED`
  * receipt it is the digest of the assistant content. The text itself is carried too, as
- * `replyText`, when the receipt port supplies it. A sender must refuse text that does not hash to
- * that digest. `owner-reply-consumer.ts` is the sender. It records a delivery intent here before
+ * `replyText`, when the receipt port supplies it, stored as its exact UTF-8 bytes (R1056-05). A
+ * sender must refuse text that does not hash to that digest. `owner-reply-consumer.ts` is the sender. It records a delivery intent here before
  * it publishes, and records `DELIVERED` with an `evidenceDigest` of its own once the transport
  * accepts. An item it cannot deliver stays `PENDING`, with one audit row per cause. Items from a
  * build before this one carry no `replyText` and stay `PENDING` for that reason.
@@ -107,6 +108,7 @@ export interface OwnerReplyItem {
    * The reply's text, when the receipt carried it (#1036). Its digest must equal
    * `receipt.evidenceDigest`. The sender checks that, not the writer. Absent on an item from a
    * receipt port that does not carry content, and on every item written before this field existed.
+   * Read back byte for byte, CR and CRLF included (R1056-05).
    */
   readonly replyText?: string;
   /** `PENDING` until a sender records the transport's acceptance; then `DELIVERED`, for good. */
@@ -117,6 +119,9 @@ export interface OwnerReplyItem {
 }
 
 export type OwnerReplyStatus = "PENDING" | "DELIVERED";
+
+/** The acknowledgements a delivery can record. Nothing outside this list is ever stored. */
+export type OwnerReplyRelayAck = "ACCEPTED" | "DUPLICATE";
 
 /**
  * What a sender records when the transport accepted a reply (#1036). `evidenceDigest` is
@@ -129,8 +134,11 @@ export interface OwnerReplyDelivery {
   readonly conversation: string;
   readonly replyToEventId: string;
   readonly relayUrl: string;
-  /** The relay's own `OK` message, cut to 200 characters. A duplicate's says `duplicate:`. */
-  readonly relayMessage: string;
+  /**
+   * What the relay's `OK` said, as a fixed category: `DUPLICATE` when it already held the event.
+   * Never the relay's own text, which the relay chooses and may carry anything (R1056-04).
+   */
+  readonly relayAck: OwnerReplyRelayAck;
   /** The digest of the text published. Equal to the receipt's `evidenceDigest`. */
   readonly contentDigest: string;
   readonly deliveredAt: string;
@@ -282,7 +290,30 @@ export const redeemIngressReceiptSettlement = (value: unknown, db: Db): IngressR
   return settlement;
 };
 
-type StoredPayload = Omit<OwnerReplyItem, "status" | "enqueuedAt">;
+type StoredPayload = Omit<OwnerReplyItem, "status" | "enqueuedAt" | "replyText" | "delivery"> & {
+  /**
+   * The reply text's exact UTF-8 bytes, in base64 (R1056-05). `canonicalJson` rewrites CR and
+   * CRLF to LF in every string it encodes, and the text has to keep the bytes the receipt's digest
+   * was taken over. Base64 carries no CR for it to rewrite. Changing `canonicalJson` was ruled out
+   * rather than taken: its newline rule is what keeps other digests equal across checkouts.
+   */
+  readonly replyTextUtf8Base64?: string;
+};
+
+/** The item a stored payload describes, with its reply text decoded back to the exact string. */
+const itemFrom = (
+  payload: StoredPayload,
+  enqueuedAt: string,
+): Omit<OwnerReplyItem, "status" | "delivery"> => {
+  const { replyTextUtf8Base64, ...rest } = payload;
+  return {
+    ...rest,
+    ...(typeof replyTextUtf8Base64 === "string"
+      ? { replyText: Buffer.from(replyTextUtf8Base64, "base64").toString("utf8") }
+      : {}),
+    enqueuedAt,
+  };
+};
 
 const recordOf = (json: string | null): Record<string, unknown> | null => {
   try {
@@ -572,7 +603,9 @@ export const enqueueOwnerReply = (
     },
     // Into the immutable payload, beside the digest it must match, because a reply that could be
     // rewritten after settlement is not the reply the receipt proved.
-    ...(typeof input.replyText === "string" ? { replyText: input.replyText } : {}),
+    ...(typeof input.replyText === "string"
+      ? { replyTextUtf8Base64: Buffer.from(input.replyText, "utf8").toString("base64") }
+      : {}),
   };
   const payloadJson = canonicalJson(payload);
 
@@ -589,7 +622,7 @@ export const enqueueOwnerReply = (
       canonicalJson({ status: "PENDING" }),
     ],
   );
-  return allow(ReasonCode.OK, { status: "ENQUEUED", item: { ...payload, status: "PENDING", enqueuedAt } });
+  return allow(ReasonCode.OK, { status: "ENQUEUED", item: { ...itemFrom(payload, enqueuedAt), status: "PENDING" } });
 };
 
 const itemOf = (
@@ -601,17 +634,16 @@ const itemOf = (
   if (payload === null) {
     throw acpError(ReasonCode.INTERNAL_ERROR, "an owner reply item has no readable payload", { turnRequestId });
   }
-  if (result?.["status"] === "PENDING") return { ...payload, status: "PENDING", enqueuedAt: row.received_at };
+  if (result?.["status"] === "PENDING") return { ...itemFrom(payload, row.received_at), status: "PENDING" };
   // A build before the consumer reads only `PENDING` and throws on `DELIVERED`, so a rollback past
   // this change meets a delivered item as an unreadable one on its redelivery path.
   const delivery = result?.["status"] === "DELIVERED" ? deliveryOf(result["delivery"]) : null;
-  if (delivery !== null) return { ...payload, status: "DELIVERED", enqueuedAt: row.received_at, delivery };
+  if (delivery !== null) return { ...itemFrom(payload, row.received_at), status: "DELIVERED", delivery };
   throw acpError(ReasonCode.INTERNAL_ERROR, "an owner reply item has a status this build cannot read", { turnRequestId });
 };
 
 const DELIVERY_TEXT_FIELDS = [
-  "eventId", "signer", "conversation", "replyToEventId", "relayUrl", "relayMessage", "contentDigest",
-  "deliveredAt", "evidenceDigest",
+  "eventId", "signer", "conversation", "replyToEventId", "relayUrl", "contentDigest", "deliveredAt", "evidenceDigest",
 ] as const;
 
 /** A stored delivery record with every field present and a string, or `null`. */
@@ -619,6 +651,8 @@ const deliveryOf = (value: unknown): OwnerReplyDelivery | null => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const fields = value as Record<string, unknown>;
   if (fields["transport"] !== "buzz") return null;
+  const relayAck = fields["relayAck"];
+  if (relayAck !== "ACCEPTED" && relayAck !== "DUPLICATE") return null;
   const text: Partial<Record<(typeof DELIVERY_TEXT_FIELDS)[number], string>> = {};
   for (const name of DELIVERY_TEXT_FIELDS) {
     const field = fields[name];
@@ -632,7 +666,7 @@ const deliveryOf = (value: unknown): OwnerReplyDelivery | null => {
     conversation: text.conversation ?? "",
     replyToEventId: text.replyToEventId ?? "",
     relayUrl: text.relayUrl ?? "",
-    relayMessage: text.relayMessage ?? "",
+    relayAck,
     contentDigest: text.contentDigest ?? "",
     deliveredAt: text.deliveredAt ?? "",
     evidenceDigest: text.evidenceDigest ?? "",
@@ -707,6 +741,29 @@ const assertDeliveryAuthority = (authority: OwnerReplyDeliveryAuthority, db: Db,
 };
 
 /**
+ * Where a recorded intent lives: one row per turn, on a channel of its own (R1056-02).
+ *
+ * The item's own protections, from triggers that exist today: `payload_json` cannot be rewritten
+ * (`inbound_messages_payload_immutable`), a second row for the turn cannot be inserted
+ * (`inbound_messages_no_replace`), and no row can be deleted without this channel's ingress delete
+ * authority, which nothing grants. It lives here rather than in the item's mutable `result_json`,
+ * where any writer of that column could replace or drop it, and a dropped intent let the sender
+ * sign a second, different event.
+ */
+export const OWNER_REPLY_INTENT_CHANNEL = "owner-reply-intent";
+
+/** A signed Nostr event, exactly as it goes on the wire. */
+export interface OwnerReplySignedEvent {
+  readonly id: string;
+  readonly pubkey: string;
+  readonly created_at: number;
+  readonly kind: number;
+  readonly tags: readonly (readonly string[])[];
+  readonly content: string;
+  readonly sig: string;
+}
+
+/**
  * The exact signed event a sender is about to publish, committed before the first send.
  *
  * This is what makes delivery exactly once across a crash. A Nostr event's id is the hash of its
@@ -717,11 +774,60 @@ const assertDeliveryAuthority = (authority: OwnerReplyDeliveryAuthority, db: Db,
 export interface OwnerReplyIntent {
   readonly transport: "buzz";
   readonly eventId: string;
-  readonly event: Readonly<Record<string, unknown>>;
+  readonly event: OwnerReplySignedEvent;
   readonly recordedAt: string;
 }
 
-/** Why the last attempt did not deliver. Kept so a repeat of the same cause writes no new audit row. */
+/**
+ * A turn's recorded intent: none yet, one that reads back, or one that does not. `UNREADABLE` is
+ * kept apart from `ABSENT` on purpose. Reading a damaged intent as no intent is what let the sender
+ * sign a second event, so a damaged one blocks the item instead (R1056-02).
+ */
+export type OwnerReplyIntentRecord =
+  | { readonly status: "ABSENT" }
+  | { readonly status: "RECORDED"; readonly intent: OwnerReplyIntent }
+  | { readonly status: "UNREADABLE" };
+
+/** A Schnorr signature as Nostr writes one: 64 bytes, lowercase hex. */
+const SIGNATURE = /^[0-9a-f]{128}$/u;
+
+const signedEventOf = (value: unknown): OwnerReplySignedEvent | null => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const { id, pubkey, created_at: createdAt, kind, tags, content, sig } = value as Record<string, unknown>;
+  if (typeof id !== "string" || !CHANNEL_IDENTITY.test(id)) return null;
+  if (typeof pubkey !== "string" || !CHANNEL_IDENTITY.test(pubkey)) return null;
+  if (typeof sig !== "string" || !SIGNATURE.test(sig)) return null;
+  if (typeof createdAt !== "number" || !Number.isSafeInteger(createdAt)) return null;
+  if (typeof kind !== "number" || typeof content !== "string" || !Array.isArray(tags)) return null;
+  const copied: string[][] = [];
+  for (const tag of tags as unknown[]) {
+    if (!Array.isArray(tag) || !tag.every((part) => typeof part === "string")) return null;
+    copied.push([...(tag as string[])]);
+  }
+  return { id, pubkey, created_at: createdAt, kind, tags: copied, content, sig };
+};
+
+/** The intent recorded for one turn. */
+export const ownerReplyIntent = (db: Db, turnRequestId: string): OwnerReplyIntentRecord => {
+  const row = db.get<{ payload_json: string | null; received_at: string }>(
+    `SELECT payload_json, received_at FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+    [OWNER_REPLY_INTENT_CHANNEL, turnRequestId],
+  );
+  if (!row) return { status: "ABSENT" };
+  const stored = recordOf(row.payload_json);
+  const event = signedEventOf(stored?.["event"]);
+  if (stored?.["transport"] !== "buzz" || event === null) return { status: "UNREADABLE" };
+  return { status: "RECORDED", intent: { transport: "buzz", eventId: event.id, event, recordedAt: row.received_at } };
+};
+
+const unreadableIntent = <T>(turnRequestId: string): Decision<T> =>
+  deny(
+    ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT,
+    "the intent recorded for this reply cannot be read, and a recorded intent is never replaced",
+    { turnRequestId, cause: "recorded-intent-unreadable", transient: false },
+  );
+
+/** Why the last attempt did not deliver. */
 export interface OwnerReplyBlock {
   readonly reasonCode: string;
   readonly cause: string;
@@ -733,26 +839,17 @@ export interface OwnerReplyBlock {
 export interface OwnerReplyDeliveryState {
   readonly turnRequestId: string;
   readonly status: OwnerReplyStatus;
-  readonly intent: OwnerReplyIntent | null;
   readonly attempts: number;
   readonly retryAt: string | null;
   readonly blocked: OwnerReplyBlock | null;
+  /**
+   * Every cause already audited for this item, as `reasonCode:cause` (R1056-06). A cause is audited
+   * once per item, however the failures interleave. The causes come from a fixed vocabulary, so
+   * this list is bounded. It lives in the item's mutable `result_json`, so it bounds this sender's
+   * rows, not those of a writer that rewrites that column.
+   */
+  readonly audited: readonly string[];
 }
-
-const intentOf = (value: unknown): OwnerReplyIntent | null => {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-  const fields = value as Record<string, unknown>;
-  const event = fields["event"];
-  if (fields["transport"] !== "buzz" || typeof fields["eventId"] !== "string") return null;
-  if (typeof fields["recordedAt"] !== "string") return null;
-  if (typeof event !== "object" || event === null || Array.isArray(event)) return null;
-  return {
-    transport: "buzz",
-    eventId: fields["eventId"],
-    event: event as Record<string, unknown>,
-    recordedAt: fields["recordedAt"],
-  };
-};
 
 const blockOf = (value: unknown): OwnerReplyBlock | null => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
@@ -771,13 +868,14 @@ const deliveryStateOf = (turnRequestId: string, resultJson: string | null): Owne
   }
   const attempts = result?.["attempts"];
   const retryAt = result?.["retryAt"];
+  const audited = result?.["audited"];
   return {
     turnRequestId,
     status,
-    intent: intentOf(result?.["intent"]),
     attempts: typeof attempts === "number" && Number.isSafeInteger(attempts) && attempts > 0 ? attempts : 0,
     retryAt: typeof retryAt === "string" ? retryAt : null,
     blocked: blockOf(result?.["blocked"]),
+    audited: Array.isArray(audited) ? audited.filter((key): key is string => typeof key === "string") : [],
   };
 };
 
@@ -792,10 +890,10 @@ export const ownerReplyDeliveryState = (db: Db, turnRequestId: string): OwnerRep
 
 const pendingStateJson = (state: OwnerReplyDeliveryState): string => canonicalJson({
   status: "PENDING",
-  ...(state.intent === null ? {} : { intent: state.intent }),
   ...(state.attempts === 0 ? {} : { attempts: state.attempts }),
   ...(state.retryAt === null ? {} : { retryAt: state.retryAt }),
   ...(state.blocked === null ? {} : { blocked: state.blocked }),
+  ...(state.audited.length === 0 ? {} : { audited: state.audited }),
 });
 
 const writeResult = (db: Db, turnRequestId: string, resultJson: string): void => {
@@ -816,23 +914,49 @@ const notPending = <T>(turnRequestId: string, state: OwnerReplyDeliveryState | n
  * Records the event a sender will publish, unless one is already recorded.
  *
  * Returns the intent that stands, so a sender that lost a race, or that resumed after a crash,
- * publishes the stored event and not the one it just built. The caller compares the two.
+ * publishes the stored event and not the one it just built. A recorded intent that cannot be read
+ * is refused, never replaced.
+ *
+ * Written with `JSON.stringify`, not `canonicalJson`: JSON escapes a CR inside the content, where
+ * `canonicalJson` would rewrite it, and the event id is a hash over the exact content (R1056-05).
  */
 export const recordOwnerReplyIntent = (
   authority: OwnerReplyDeliveryAuthority,
   db: Db,
   clock: Clock,
   turnRequestId: string,
-  intent: Omit<OwnerReplyIntent, "recordedAt">,
+  event: OwnerReplySignedEvent,
 ): Decision<OwnerReplyIntent> => {
   assertDeliveryAuthority(authority, db, turnRequestId);
   return db.txDecision(() => {
     const state = ownerReplyDeliveryState(db, turnRequestId);
     if (state?.status !== "PENDING") return notPending(turnRequestId, state);
-    if (state.intent !== null) return allow(ReasonCode.OK, state.intent);
-    const recorded: OwnerReplyIntent = { ...intent, recordedAt: clock.nowIso() };
-    writeResult(db, turnRequestId, pendingStateJson({ ...state, intent: recorded }));
-    return allow(ReasonCode.OK, recorded);
+    const recorded = ownerReplyIntent(db, turnRequestId);
+    if (recorded.status === "RECORDED") return allow(ReasonCode.OK, recorded.intent);
+    if (recorded.status === "UNREADABLE") return unreadableIntent(turnRequestId);
+    const exact: OwnerReplySignedEvent = {
+      id: event.id,
+      pubkey: event.pubkey,
+      created_at: event.created_at,
+      kind: event.kind,
+      tags: event.tags.map((tag) => [...tag]),
+      content: event.content,
+      sig: event.sig,
+    };
+    const recordedAt = clock.nowIso();
+    db.run(
+      `INSERT INTO inbound_messages (channel, nonce, actor, received_at, payload_json, result_json)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        OWNER_REPLY_INTENT_CHANNEL,
+        turnRequestId,
+        exact.pubkey,
+        recordedAt,
+        JSON.stringify({ transport: "buzz", event: exact }),
+        canonicalJson({ status: "RECORDED" }),
+      ],
+    );
+    return allow(ReasonCode.OK, { transport: "buzz", eventId: exact.id, event: exact, recordedAt });
   });
 };
 
@@ -861,7 +985,8 @@ export const recordOwnerReplyDelivered = (
     if (item?.delivery?.eventId === accepted.eventId) return allow(ReasonCode.OK, item.delivery);
     const state = row ? deliveryStateOf(turnRequestId, row.result_json) : null;
     if (state?.status !== "PENDING") return notPending(turnRequestId, state);
-    if (state.intent?.eventId !== accepted.eventId) {
+    const recorded = ownerReplyIntent(db, turnRequestId);
+    if (recorded.status !== "RECORDED" || recorded.intent.eventId !== accepted.eventId) {
       return deny(
         ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT,
         "the accepted event is not the one this item recorded it would send",
@@ -873,8 +998,8 @@ export const recordOwnerReplyDelivered = (
     writeResult(db, turnRequestId, canonicalJson({
       status: "DELIVERED",
       delivery,
-      intent: state.intent,
       attempts: state.attempts + 1,
+      ...(state.audited.length === 0 ? {} : { audited: state.audited }),
     }));
     audit.record({
       kind: "OWNER_REPLY_DELIVERED",
@@ -886,6 +1011,7 @@ export const recordOwnerReplyDelivered = (
         conversation: delivery.conversation,
         eventId: delivery.eventId,
         replyToEventId: delivery.replyToEventId,
+        relayAck: delivery.relayAck,
         contentDigest: delivery.contentDigest,
         evidenceDigest: delivery.evidenceDigest,
       },
@@ -897,8 +1023,8 @@ export const recordOwnerReplyDelivered = (
 /**
  * Records one attempt that did not deliver, and when the next may run. The item stays `PENDING`.
  *
- * An audit row is written only when the cause differs from the one already recorded, so an item
- * retried a hundred times for the same reason leaves one row, and one more for each new reason.
+ * An audit row is written the first time a cause is seen for this item, and never again for it,
+ * however the causes alternate (R1056-06): a refusal, a timeout and a refusal again leave two rows.
  */
 export const recordOwnerReplyUndelivered = (
   authority: OwnerReplyDeliveryAuthority,
@@ -917,23 +1043,132 @@ export const recordOwnerReplyUndelivered = (
   return db.txDecision(() => {
     const state = ownerReplyDeliveryState(db, turnRequestId);
     if (state?.status !== "PENDING") return notPending(turnRequestId, state);
+    const key = `${blocked.reasonCode}:${blocked.cause}`;
+    const seen = state.audited.includes(key);
     const repeated = state.blocked?.reasonCode === blocked.reasonCode && state.blocked.cause === blocked.cause;
-    const since = repeated && state.blocked ? state.blocked.since : clock.nowIso();
     writeResult(db, turnRequestId, pendingStateJson({
       ...state,
       attempts: state.attempts + 1,
       retryAt: blocked.retryAt,
-      blocked: { reasonCode: blocked.reasonCode, cause: blocked.cause, transient: blocked.transient, since },
+      blocked: {
+        reasonCode: blocked.reasonCode,
+        cause: blocked.cause,
+        transient: blocked.transient,
+        since: repeated && state.blocked ? state.blocked.since : clock.nowIso(),
+      },
+      audited: seen ? state.audited : [...state.audited, key],
     }));
-    if (!repeated) {
+    if (!seen) {
       audit.record({
         kind: "OWNER_REPLY_UNDELIVERED",
         reasonCode: blocked.reasonCode,
         evidence: { turnRequestId, cause: blocked.cause, transient: blocked.transient },
       });
     }
-    return allow(ReasonCode.OK, { audited: !repeated });
+    return allow(ReasonCode.OK, { audited: !seen });
   });
+};
+
+/**
+ * One stored owner reply, authorized for the Buzz publisher (R1056-01).
+ *
+ * The publisher signs and sends nothing else. Only `issueOwnerReplyPublication` makes one, only for
+ * the holder of this database's delivery authority, and only from the item and intent as stored.
+ * Its text is the one the receipt's digest proves, and its room, the event it answers and the
+ * identity it is signed as come from the item's address. Each is spent by the publisher's first
+ * use of it (`redeemOwnerReplyPublication`), so a caller cannot reuse one or build its own.
+ */
+export interface OwnerReplyPublication {
+  readonly turnRequestId: string;
+  readonly signer: string;
+  readonly room: string;
+  readonly replyToEventId: string;
+  readonly content: string;
+  /** The `created_at` a reply with no recorded intent is signed with. */
+  readonly createdAt: number;
+  /** The recorded event, the only event a publication may send; `null` until one is recorded. */
+  readonly intent: OwnerReplySignedEvent | null;
+}
+
+const ISSUED_PUBLICATIONS = new WeakSet<object>();
+
+/**
+ * A publication for one `PENDING` Buzz item, or the refusal that says why there is none. Every
+ * refusal carries its `cause`, and `transient: false`: nothing here changes without a new item, a
+ * new configuration or a restart.
+ */
+export const issueOwnerReplyPublication = (
+  authority: OwnerReplyDeliveryAuthority,
+  db: Db,
+  clock: Clock,
+  turnRequestId: string,
+): Decision<OwnerReplyPublication> => {
+  assertDeliveryAuthority(authority, db, turnRequestId);
+  const item = ownerReplyFor(db, turnRequestId);
+  if (item?.status !== "PENDING") {
+    return deny(ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT, "no owner reply is pending for this turn", { turnRequestId });
+  }
+  const { address } = item;
+  if (address.channel !== "buzz" || address.conversation.trim() === "") {
+    return deny(ReasonCode.CONVERSATION_TURN_REPLY_UNADDRESSABLE, "the reply names no Buzz room", {
+      turnRequestId, cause: "address-names-no-room", transient: false,
+    });
+  }
+  const anchor = item.sources.at(-1);
+  if (anchor === undefined || anchor.nonce !== address.sourceNonce) {
+    return deny(ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT, "the reply's address is not the message the turn answers", {
+      turnRequestId, cause: "address-is-not-the-answered-message", transient: false,
+    });
+  }
+  if (item.sources.some((source) => source.channel !== address.channel)) {
+    return deny(ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT, "the turn's messages span channels", {
+      turnRequestId, cause: "sources-span-channels", transient: false,
+    });
+  }
+  const replyToEventId = address.sourceNonce.startsWith(BUZZ_MESSAGE_NONCE_PREFIX)
+    ? address.sourceNonce.slice(BUZZ_MESSAGE_NONCE_PREFIX.length)
+    : "";
+  if (!CHANNEL_IDENTITY.test(replyToEventId)) {
+    return deny(ReasonCode.CONVERSATION_TURN_REPLY_UNADDRESSABLE, "the reply names no Buzz event to answer", {
+      turnRequestId, cause: "address-names-no-event-to-answer", transient: false,
+    });
+  }
+  const signer = address.replyAs;
+  if (typeof signer !== "string" || !CHANNEL_IDENTITY.test(signer)) {
+    return deny(ReasonCode.OWNER_REPLY_IDENTITY_UNKNOWN, "the reply names no channel identity to sign as", {
+      turnRequestId, cause: "address-names-no-identity", transient: false,
+    });
+  }
+  const text = item.replyText;
+  if (text === undefined || text.trim() === "" || sha256(text) !== item.receipt.evidenceDigest) {
+    return deny(ReasonCode.OWNER_REPLY_BODY_UNAVAILABLE, "the item holds no reply text the receipt proved", {
+      turnRequestId,
+      cause: text === undefined
+        ? "reply-text-absent"
+        : text.trim() === "" ? "reply-text-empty" : "reply-text-digest-mismatch",
+      transient: false,
+    });
+  }
+  const recorded = ownerReplyIntent(db, turnRequestId);
+  if (recorded.status === "UNREADABLE") return unreadableIntent(turnRequestId);
+  const publication: OwnerReplyPublication = Object.freeze({
+    turnRequestId,
+    signer,
+    room: address.conversation,
+    replyToEventId,
+    content: text,
+    createdAt: Math.floor(clock.now().getTime() / 1000),
+    intent: recorded.status === "RECORDED" ? recorded.intent.event : null,
+  });
+  ISSUED_PUBLICATIONS.add(publication);
+  return allow(ReasonCode.OK, publication);
+};
+
+/** The publication itself when `value` is one this module issued and nothing has spent; `null` otherwise. */
+export const redeemOwnerReplyPublication = (value: unknown): OwnerReplyPublication | null => {
+  if (typeof value !== "object" || value === null || !ISSUED_PUBLICATIONS.has(value)) return null;
+  ISSUED_PUBLICATIONS.delete(value);
+  return value as OwnerReplyPublication;
 };
 
 /**

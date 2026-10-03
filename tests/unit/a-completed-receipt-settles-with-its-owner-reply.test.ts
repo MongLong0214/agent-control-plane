@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { ManualClock } from "../../src/core/clock.ts";
-import { digestOf } from "../../src/core/digest.ts";
+import { digestOf, sha256 } from "../../src/core/digest.ts";
 import type { Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
@@ -424,7 +424,34 @@ const turnOf = (c: Fixture, actorId: string): string =>
     [actorId],
   )!.turn_request_id;
 
+/**
+ * R1056-05: the reply the receipt proved, with the line endings it was proved with. A store that
+ * rewrote CR or CRLF to LF would leave text whose digest is no longer the receipt's, and the
+ * sender would refuse it forever.
+ */
+const LINE_ENDING_WITNESSES = [
+  ["CRLF", "line one\r\nline two\r\n"],
+  ["lone CR", "line one\rline two"],
+] as const;
+
+/** A found receipt carrying `text` as its reply, with the digest Hermes takes over those exact bytes. */
+const replying = (receipt: ReceiptLookupResult, text: string): ReceiptLookupResult =>
+  receipt.found ? { ...receipt, evidenceDigest: sha256(text), content: text } : receipt;
+
 describe("a COMPLETED receipt on the canonical ledger", () => {
+  it.each(LINE_ENDING_WITNESSES)("R1056-05 stores a %s reply byte for byte", async (_, text) => {
+    const port = new FakeReceiptPort();
+    const c = withCoordinator(port);
+    const actorId = target(c.db, "telegram");
+    const turn = claimTurn(c, actorId, [telegramMessage("m1", "chat-9", 71)]);
+    port.answer(turn, replying(receiptFor(c, turn, "COMPLETED"), text));
+
+    await c.coordinator.reconcileUnresolved();
+
+    expect(ownerReplyFor(c.db, turn)?.replyText).toBe(text);
+    expect(sha256(ownerReplyFor(c.db, turn)?.replyText ?? "")).toBe(sha256(text));
+  });
+
   it("settles the turn and stores one owner reply addressed to the Telegram message it answers", async () => {
     const port = new FakeReceiptPort();
     const c = withCoordinator(port);
@@ -948,6 +975,16 @@ describe("a COMPLETED receipt on the Telegram ingress lane", () => {
       receipt: { receiptId: `hermes:${TURN}`, evidenceDigest: `sha256:reply-${TURN}` },
       status: "PENDING",
     });
+  });
+
+  it.each(LINE_ENDING_WITNESSES)("R1056-05 stores a %s reply byte for byte", async (_, text) => {
+    const { port, c, stored, reconcile } = setUp();
+    port.answer(TURN, replying(ingressReceipt(stored, "COMPLETED"), text));
+
+    const settled = await reconcile();
+
+    expect(settled.allowed).toBe(true);
+    expect(ownerReplyFor(c.db, TURN)?.replyText).toBe(text);
   });
 
   it("adds nothing when the same receipt settles the claim again", async () => {

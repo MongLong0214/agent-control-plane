@@ -1,23 +1,15 @@
-import { verifyEvent } from "nostr-tools/pure";
-
-import {
-  BUZZ_MENTION_KIND,
-  type BuzzReplyPublisher,
-  type BuzzSignedEvent,
-} from "../buzz/buzz-mention-subscriber.ts";
+import type { BuzzReplyPublisher } from "../buzz/buzz-mention-subscriber.ts";
 import type { Clock } from "../core/clock.ts";
-import { canonicalJson, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { BUZZ_MESSAGE_NONCE_PREFIX } from "../ingress/buzz-message.ts";
 import {
   type OwnerReplyDeliveryAuthority,
   type OwnerReplyDeliveryState,
-  type OwnerReplyIntent,
   type OwnerReplyItem,
   claimOwnerReplyDeliveryAuthority,
+  issueOwnerReplyPublication,
   owedOwnerReplyTurns,
   ownerReplyDeliveryState,
   ownerReplyFor,
@@ -35,7 +27,8 @@ import {
  * `tests/fixtures/buzz-cli/messages-get.json`). It is signed as the daemon's identity the owner
  * mentioned (`address.replyAs`), and sent on that identity's own NIP-42-authenticated subscriber
  * connection (`BuzzReplyPublisher`). The text is the item's `replyText`, sent only if it hashes to
- * the receipt's `evidenceDigest`.
+ * the receipt's `evidenceDigest`. The publisher takes only an `OwnerReplyPublication` the outbox
+ * issued from the stored item (R1056-01), so it cannot be handed anything else to sign or send.
  *
  * **Exactly once.** Before the first send, the whole signed event is committed as the item's
  * intent (`recordOwnerReplyIntent`). Every later attempt, in this process or after a restart,
@@ -58,7 +51,8 @@ import {
  * identity's relay connection authenticates (startup and every reconnect), and once at startup.
  * The one timer it arms is a single backoff timer, for the earliest relay failure due a retry.
  * Address, identity and configuration faults wait for the next wake-up instead, because only a
- * restart or a new settlement can change them.
+ * restart or a new settlement can change them. An item waiting for its signer's connection to
+ * authenticate is not eligible for that timer at all: only the authentication wakes it (R1056-03).
  */
 
 /** How long one publish waits for the relay's `OK` before it counts as a timeout. */
@@ -112,82 +106,6 @@ const parked = (cause: string) => ({ cause, transient: false });
 /** A relay answer that may be different next time. */
 const relayFailure = (cause: string) => ({ cause, transient: true });
 
-const EVENT_ID = /^[0-9a-f]{64}$/u;
-
-/** Where a Buzz reply goes and who signs it, read from the item alone. */
-interface BuzzReplyTarget {
-  readonly room: string;
-  readonly replyToEventId: string;
-  readonly signer: string | null;
-}
-
-const buzzTargetOf = (item: OwnerReplyItem): Decision<BuzzReplyTarget> => {
-  const { address } = item;
-  if (address.conversation.trim() === "") {
-    return deny(ReasonCode.CONVERSATION_TURN_REPLY_UNADDRESSABLE, "the reply names no room", parked("address-names-no-room"));
-  }
-  const anchor = item.sources.at(-1);
-  if (anchor === undefined || anchor.nonce !== address.sourceNonce) {
-    return deny(
-      ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT,
-      "the reply's address is not the message the turn answers",
-      parked("address-is-not-the-answered-message"),
-    );
-  }
-  if (item.sources.some((source) => source.channel !== address.channel)) {
-    return deny(ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT, "the turn's messages span channels", parked("sources-span-channels"));
-  }
-  const replyToEventId = address.sourceNonce.startsWith(BUZZ_MESSAGE_NONCE_PREFIX)
-    ? address.sourceNonce.slice(BUZZ_MESSAGE_NONCE_PREFIX.length)
-    : "";
-  if (!EVENT_ID.test(replyToEventId)) {
-    return deny(
-      ReasonCode.CONVERSATION_TURN_REPLY_UNADDRESSABLE,
-      "the reply names no Buzz event to answer",
-      parked("address-names-no-event-to-answer"),
-    );
-  }
-  const signer = typeof address.replyAs === "string" && EVENT_ID.test(address.replyAs) ? address.replyAs : null;
-  return allow(ReasonCode.OK, { room: address.conversation, replyToEventId, signer });
-};
-
-/** The tags of a reply in `room` to `replyToEventId`, in the shape the live relay writes them. */
-const replyTagsFor = (target: BuzzReplyTarget): string[][] => [
-  ["h", target.room],
-  ["e", target.replyToEventId, "", "reply"],
-];
-
-/**
- * The stored intent's event, when it is a validly signed reply to exactly this item: this signer,
- * this room and event, and text whose digest is the receipt's. Anything else is `null`.
- */
-const storedEventOf = (intent: OwnerReplyIntent, target: BuzzReplyTarget, digest: string): BuzzSignedEvent | null => {
-  const { id, pubkey, created_at: createdAt, kind, tags, content, sig } = intent.event;
-  if (typeof id !== "string" || id !== intent.eventId || typeof pubkey !== "string" || typeof sig !== "string") {
-    return null;
-  }
-  if (typeof createdAt !== "number" || typeof kind !== "number" || typeof content !== "string") return null;
-  if (!Array.isArray(tags) || !tags.every((tag) => Array.isArray(tag) && tag.every((part) => typeof part === "string"))) {
-    return null;
-  }
-  const event: BuzzSignedEvent = {
-    id,
-    pubkey,
-    created_at: createdAt,
-    kind,
-    tags: (tags as string[][]).map((tag) => [...tag]),
-    content,
-    sig,
-  };
-  if (pubkey !== target.signer || kind !== BUZZ_MENTION_KIND || sha256(content) !== digest) return null;
-  if (canonicalJson(event.tags) !== canonicalJson(replyTagsFor(target))) return null;
-  // `verifyEvent` marks the object it is given, so it checks a copy and the stored event stays as read.
-  return verifyEvent({ ...event, tags: event.tags.map((tag) => [...tag]) }) ? event : null;
-};
-
-/** The NIP-01 machine-readable prefix of a relay's refusal, which is all of it an audit row keeps. */
-const refusalPrefixOf = (message: string): string => /^([a-z-]{1,32}):/u.exec(message)?.[1] ?? "unprefixed";
-
 export class OwnerReplyConsumer {
   readonly #db: Db;
   readonly #clock: Clock;
@@ -201,6 +119,12 @@ export class OwnerReplyConsumer {
   #again: OwnerReplySweep | null = null;
   #timer: number | null = null;
   #closed = false;
+  /**
+   * Items whose last attempt found the signer's connection not yet authenticated (R1056-03). Their
+   * retry time has passed, so a timer armed for them would fire at once and find the same thing,
+   * over and over. They are left out of `#arm`, and an authentication wake-up retries them.
+   */
+  readonly #awaitingAuthentication = new Set<string>();
 
   constructor(options: OwnerReplyConsumerOptions) {
     this.#db = options.db;
@@ -263,7 +187,9 @@ export class OwnerReplyConsumer {
         if (state?.status !== "PENDING" || !this.#selected(sweep, state)) continue;
         const item = ownerReplyFor(this.#db, turnRequestId);
         if (item?.status !== "PENDING") continue;
-        const attempt = await this.#attempt(item, state);
+        const attempt = await this.#attempt(item);
+        if (attempt.allowed && attempt.value === "WAITING") this.#awaitingAuthentication.add(turnRequestId);
+        else this.#awaitingAuthentication.delete(turnRequestId);
         if (!attempt.allowed) this.#recordUndelivered(item.turnRequestId, state, attempt);
       } catch (error) {
         this.#onError(error);
@@ -296,6 +222,7 @@ export class OwnerReplyConsumer {
     if (this.#closed) return;
     let earliest: number | null = null;
     for (const turnRequestId of owedOwnerReplyTurns(this.#db)) {
+      if (this.#awaitingAuthentication.has(turnRequestId)) continue;
       const state = ownerReplyDeliveryState(this.#db, turnRequestId);
       if (state?.blocked?.transient !== true || state.retryAt === null) continue;
       const at = Date.parse(state.retryAt);
@@ -308,7 +235,7 @@ export class OwnerReplyConsumer {
     });
   }
 
-  async #attempt(item: OwnerReplyItem, state: OwnerReplyDeliveryState): Promise<Decision<AttemptOutcome>> {
+  async #attempt(item: OwnerReplyItem): Promise<Decision<AttemptOutcome>> {
     if (item.address.channel === "telegram") {
       return deny(
         ReasonCode.OWNER_REPLY_UNDELIVERABLE_NO_TRANSPORT,
@@ -323,9 +250,6 @@ export class OwnerReplyConsumer {
         parked("no-reply-transport-for-channel"),
       );
     }
-    const targeted = buzzTargetOf(item);
-    if (!targeted.allowed) return deny(targeted.reasonCode, targeted.message, targeted.evidence);
-    const target = targeted.value;
     const buzz = this.#buzz;
     if (buzz === null) {
       return deny(
@@ -334,86 +258,83 @@ export class OwnerReplyConsumer {
         parked("buzz-subscriber-not-running"),
       );
     }
-    const rooms = target.signer === null ? null : buzz.roomsOf(target.signer);
-    if (target.signer === null || rooms === null) {
+    const turnRequestId = item.turnRequestId;
+    // Address, identity, text and any recorded intent are checked where the publication is issued,
+    // from the item as stored; a refusal there carries its own cause.
+    let issued = issueOwnerReplyPublication(this.#authority, this.#db, this.#clock, turnRequestId);
+    if (!issued.allowed) return deny(issued.reasonCode, issued.message, issued.evidence);
+    const { signer, room } = issued.value;
+    const rooms = buzz.roomsOf(signer);
+    if (rooms === null) {
       return deny(
         ReasonCode.OWNER_REPLY_IDENTITY_UNKNOWN,
         "the reply names no channel identity this daemon holds",
-        parked(target.signer === null ? "address-names-no-identity" : "identity-not-held-by-this-daemon"),
+        parked("identity-not-held-by-this-daemon"),
       );
     }
-    if (!rooms.includes(target.room)) {
+    if (!rooms.includes(room)) {
       return deny(
         ReasonCode.OWNER_REPLY_WRONG_ROOM,
         "the signing identity is not subscribed to the reply's room",
         parked("identity-not-subscribed-to-room"),
       );
     }
+    if (!buzz.ready(signer)) return allow(ReasonCode.OK, "WAITING");
 
-    const digest = item.receipt.evidenceDigest;
-    let intent = state.intent;
-    if (intent === null) {
-      const text = item.replyText;
-      if (text === undefined || text.trim() === "" || sha256(text) !== digest) {
-        return deny(
-          ReasonCode.OWNER_REPLY_BODY_UNAVAILABLE,
-          "the item holds no reply text the receipt proved",
-          parked(text === undefined
-            ? "reply-text-absent"
-            : text.trim() === "" ? "reply-text-empty" : "reply-text-digest-mismatch"),
-        );
-      }
-      if (!buzz.ready(target.signer)) return allow(ReasonCode.OK, "WAITING");
-      const signed = buzz.sign(target.signer, {
-        kind: BUZZ_MENTION_KIND,
-        created_at: Math.floor(this.#clock.now().getTime() / 1000),
-        tags: replyTagsFor(target),
-        content: text,
-      });
+    if (issued.value.intent === null) {
+      const signed = buzz.signOwnerReply(issued.value);
       if (signed === null) {
         return deny(
-          ReasonCode.OWNER_REPLY_IDENTITY_UNKNOWN,
-          "the reply names no channel identity this daemon holds",
-          parked("identity-not-held-by-this-daemon"),
+          ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT,
+          "the publisher refused to sign this reply",
+          parked("publication-refused-by-publisher"),
         );
       }
-      const recorded = recordOwnerReplyIntent(this.#authority, this.#db, this.#clock, item.turnRequestId, {
-        transport: "buzz",
-        eventId: signed.id,
-        event: { ...signed, tags: signed.tags.map((tag) => [...tag]) },
-      });
-      if (!recorded.allowed) return allow(ReasonCode.OK, "SETTLED_ELSEWHERE");
-      intent = recorded.value;
+      const recorded = recordOwnerReplyIntent(this.#authority, this.#db, this.#clock, turnRequestId, signed);
+      if (!recorded.allowed) {
+        return typeof recorded.evidence["cause"] === "string"
+          ? deny(recorded.reasonCode, recorded.message, recorded.evidence)
+          : allow(ReasonCode.OK, "SETTLED_ELSEWHERE");
+      }
+      // Re-issued from storage, so what is sent is the intent as recorded, never the event in hand.
+      issued = issueOwnerReplyPublication(this.#authority, this.#db, this.#clock, turnRequestId);
+      if (!issued.allowed) return deny(issued.reasonCode, issued.message, issued.evidence);
     }
-    const event = storedEventOf(intent, target, digest);
-    if (event === null) {
+    const sending = issued.value.intent;
+    if (sending === null) {
       return deny(
         ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT,
-        "the event recorded for this reply is not a signed reply to this item",
-        parked("recorded-event-does-not-match-item"),
+        "no intent was recorded for this reply",
+        parked("recorded-intent-missing"),
       );
     }
-    if (!buzz.ready(target.signer)) return allow(ReasonCode.OK, "WAITING");
 
-    const ack = await buzz.publish(event, this.#publishTimeoutMs);
-    if (ack.status === "ACCEPTED" || (ack.status === "REFUSED" && ack.message.startsWith("duplicate:"))) {
-      const delivered = recordOwnerReplyDelivered(this.#authority, this.#db, this.#clock, this.#audit, item.turnRequestId, {
+    const ack = await buzz.publishOwnerReply(issued.value, this.#publishTimeoutMs);
+    if (ack.status === "ACCEPTED" || ack.status === "DUPLICATE") {
+      const delivered = recordOwnerReplyDelivered(this.#authority, this.#db, this.#clock, this.#audit, turnRequestId, {
         transport: "buzz",
-        eventId: event.id,
-        signer: event.pubkey,
-        conversation: target.room,
-        replyToEventId: target.replyToEventId,
+        eventId: sending.id,
+        signer: sending.pubkey,
+        conversation: room,
+        replyToEventId: issued.value.replyToEventId,
         relayUrl: buzz.relayUrl ?? "",
-        relayMessage: ack.message.slice(0, 200),
-        contentDigest: digest,
+        relayAck: ack.status,
+        contentDigest: item.receipt.evidenceDigest,
       });
       return allow(ReasonCode.OK, delivered.allowed ? "DELIVERED" : "SETTLED_ELSEWHERE");
     }
     if (ack.status === "REFUSED") {
-      return deny(ReasonCode.OWNER_REPLY_RELAY_REFUSED, "the relay refused the reply", relayFailure(refusalPrefixOf(ack.message)));
+      return deny(ReasonCode.OWNER_REPLY_RELAY_REFUSED, "the relay refused the reply", relayFailure(ack.category));
     }
     if (ack.status === "TIMEOUT") {
       return deny(ReasonCode.OWNER_REPLY_RELAY_TIMEOUT, "the relay gave no verdict in time", relayFailure("no-verdict-within-bound"));
+    }
+    if (ack.status === "UNAUTHORIZED") {
+      return deny(
+        ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT,
+        "the recorded event is not a signed reply to this item, so it is not sent and not replaced",
+        parked("recorded-event-does-not-match-item"),
+      );
     }
     return deny(
       ReasonCode.OWNER_REPLY_RELAY_UNAVAILABLE,
