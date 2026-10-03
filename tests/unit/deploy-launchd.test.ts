@@ -3,9 +3,11 @@ import {
   chmodSync,
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -381,6 +383,10 @@ const plistPath = (harness: InstallerHarness): string =>
 
 const launcherPath = (harness: InstallerHarness): string =>
   join(harness.home, ".agent-control-plane", "agentcpd-launch.sh");
+
+/** The stable address external consumers (Hermes' mcp_servers, etc.) resolve the CLI through. */
+const currentLinkPath = (harness: InstallerHarness): string =>
+  join(harness.home, ".agent-control-plane", "current");
 
 /**
  * The launcher's PATH, as a single literal.
@@ -2330,6 +2336,260 @@ exit 0
       expect(existsSync(plistPath(harness))).toBe(true);
       expect(subcommands(harness.launchLog)).toEqual(["print", "print", "bootstrap", "kickstart"]);
     }).toThrow();
+  });
+
+  it("points current at the installed app root, then at a new one after upgrade", () => {
+    const harness = makeHarness();
+    const firstRoot = makeDisposableAppRoot();
+    expect(
+      runInstaller(installer, ["install", "--app-root", firstRoot, "--node", harness.node], harness).status,
+    ).toBe(0);
+    const link = currentLinkPath(harness);
+    expect(lstatSync(link).isSymbolicLink(), "current is not a symlink after install").toBe(true);
+    expect(readlinkSync(link)).toBe(firstRoot);
+
+    // A real deploy's upgrade names a new generation directory, not the one just installed.
+    const secondRoot = makeDisposableAppRoot();
+    expect(
+      runInstaller(installer, ["upgrade", "--app-root", secondRoot, "--node", harness.node], harness).status,
+    ).toBe(0);
+    expect(readlinkSync(link), "current was not repointed after upgrade").toBe(secondRoot);
+  });
+
+  it("does not repoint current when upgrade fails before completing, including failure during startup", () => {
+    // ACP1052-R2: the attempted upgrade must name a root distinct from the one already installed.
+    // Reusing the installed root would still satisfy "current still names appRoot" even if a
+    // regression repointed current at that same root before resolve_node or start_job ran — this
+    // is exactly the gap the earlier, single-root version of this test could not see.
+    const harness = makeHarness();
+    const firstRoot = makeDisposableAppRoot();
+    expect(
+      runInstaller(installer, ["install", "--app-root", firstRoot, "--node", harness.node], harness).status,
+    ).toBe(0);
+    const link = currentLinkPath(harness);
+    expect(readlinkSync(link)).toBe(firstRoot);
+
+    // A Node path that cannot resolve fails resolve_node before anything else runs.
+    const secondRoot = makeDisposableAppRoot();
+    const failed = runInstaller(
+      installer,
+      ["upgrade", "--app-root", secondRoot, "--node", join(harness.home, "no-such-node")],
+      harness,
+    );
+    expect(failed.status).not.toBe(0);
+    expect(readlinkSync(link), "current moved on a failed upgrade").toBe(firstRoot);
+
+    // Every mutation (runtime, plist, launcher) succeeds but the service never reports a
+    // completed start; publish must not run over that failure either.
+    const thirdRoot = makeDisposableAppRoot();
+    harness.env["ACP_FAKE_PID_MODE"] = "none";
+    const failedStart = runInstaller(installer, ["upgrade", "--app-root", thirdRoot, "--node", harness.node], harness);
+    expect(failedStart.status).not.toBe(0);
+    expect(readlinkSync(link), "current moved on a startup failure").toBe(firstRoot);
+  });
+
+  it("points current at the generation a rollback restores", async () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    expect(runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status).toBe(
+      0,
+    );
+    const fixture = await sealPairFor(harness, appRoot);
+    const link = currentLinkPath(harness);
+    expect(readlinkSync(link)).toBe(appRoot);
+
+    // Simulate a later generation having moved current elsewhere, so the assertion below is about
+    // the rollback switching it back rather than it having never moved.
+    const decoyRoot = makeDisposableAppRoot();
+    rmSync(link);
+    symlinkSync(decoyRoot, link);
+    writeFileSync(harness.launchLog, "");
+
+    const rolledBack = runInstaller(
+      installer,
+      [
+        "rollback",
+        "--app-root",
+        appRoot,
+        "--node",
+        harness.node,
+        "--pair-id",
+        fixture.pair.pairId,
+        "--expected-index-digest",
+        fixture.pair.indexDigest,
+        ...structuralFlags(fixture),
+      ],
+      harness,
+    );
+
+    expect(rolledBack.status, rolledBack.stderr).toBe(0);
+    expect(readlinkSync(link), "rollback did not repoint current at the restored app root").toBe(appRoot);
+  });
+
+  it("refuses to replace an unsafe existing current rather than overwrite it, before touching anything", () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    const state = join(harness.home, ".agent-control-plane");
+    mkdirSync(state, { recursive: true, mode: 0o700 });
+    chmodSync(state, 0o700);
+    const link = currentLinkPath(harness);
+    // A plain directory at this name, not a symlink this installer ever wrote. The ownership
+    // check this guards is unreachable from this sandbox (no root to own a decoy as a different
+    // uid), but a non-symlinked directory exercises the same refusal: never overwrite a `current`
+    // this run did not create.
+    mkdirSync(link, { mode: 0o700 });
+    writeFileSync(join(link, "marker.txt"), "not an installer artifact\n", { mode: 0o600 });
+    // makeDisposableAppRoot copies this repository's own dist/, which an earlier row in this same
+    // suite run may already have cloned a (fake) interpreter into via --app-root root; snapshot
+    // what the fixture actually starts with rather than assuming absence.
+    const runtimeNodePath = join(appRoot, "dist", "bin", "node");
+    const beforeRuntimeNode = existsSync(runtimeNodePath) ? readFileSync(runtimeNodePath) : null;
+
+    const result = runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness);
+
+    expect(result.status, "install succeeded despite an unsafe existing current").not.toBe(0);
+    expect(result.stderr).toContain("refusing to replace a non-symlink");
+    expect(lstatSync(link).isSymbolicLink(), "the unsafe directory was replaced with a symlink").toBe(false);
+    expect(existsSync(join(link, "marker.txt")), "the pre-existing directory's contents were lost").toBe(true);
+    // ACP1052-R1: the preflight runs before any deployment mutation, so nothing below ran either.
+    if (beforeRuntimeNode === null) {
+      expect(existsSync(runtimeNodePath), "the preflight refusal still installed the runtime").toBe(false);
+    } else {
+      expect(readFileSync(runtimeNodePath), "the preflight refusal still replaced the runtime").toEqual(
+        beforeRuntimeNode,
+      );
+    }
+    expect(existsSync(harness.launchLog), "the preflight refusal still called launchctl").toBe(false);
+  });
+
+  it("ACP1052-R1: preserves deployment bytes and service state when current is unsafe before an upgrade", () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    expect(
+      runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status,
+    ).toBe(0);
+    const link = currentLinkPath(harness);
+    // An unsafe current arrives after the install that set it correctly, e.g. something else
+    // having written over it.
+    rmSync(link, { force: true });
+    mkdirSync(link, { mode: 0o700 });
+    writeFileSync(join(link, "marker.txt"), "untouched\n", { mode: 0o600 });
+
+    const runtimeNode = join(appRoot, "dist", "bin", "node");
+    const originalRuntime = readFileSync(runtimeNode);
+    const originalPlist = readFileSync(plistPath(harness), "utf8");
+    const originalLauncher = readFileSync(launcherPath(harness), "utf8");
+    writeFileSync(harness.launchLog, "");
+    const nextNode = join(harness.bin, "node-new");
+    writeExecutable(nextNode, `${readFileSync(harness.node, "utf8")}\n# new generation\n`);
+
+    const result = runInstaller(installer, ["upgrade", "--app-root", appRoot, "--node", nextNode], harness);
+
+    expect(result.status, "upgrade proceeded despite an unsafe current").not.toBe(0);
+    expect(result.stderr).toContain("refusing to replace a non-symlink");
+    // The point of ACP1052-R1: no launchd call at all, not even a refused one reached mid-way.
+    expect(subcommands(harness.launchLog), "a preflight refusal still touched launchd").toEqual([]);
+    expect(readFileSync(runtimeNode)).toEqual(originalRuntime);
+    expect(readFileSync(plistPath(harness), "utf8")).toBe(originalPlist);
+    expect(readFileSync(launcherPath(harness), "utf8")).toBe(originalLauncher);
+    expect(existsSync(join(link, "marker.txt")), "the pre-existing directory's contents were lost").toBe(true);
+  });
+
+  it("ACP1052-R1: preserves deployment bytes and service state when current is unsafe before a rollback", async () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    expect(
+      runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status,
+    ).toBe(0);
+    const fixture = await sealPairFor(harness, appRoot);
+    const link = currentLinkPath(harness);
+    rmSync(link, { force: true });
+    mkdirSync(link, { mode: 0o700 });
+    writeFileSync(join(link, "marker.txt"), "untouched\n", { mode: 0o600 });
+
+    const originalRuntime = readFileSync(join(appRoot, "dist", "bin", "node"));
+    const originalPlist = readFileSync(plistPath(harness), "utf8");
+    const originalLauncher = readFileSync(launcherPath(harness), "utf8");
+    const stateAdminBefore = existsSync(harness.stateAdminLog) ? readFileSync(harness.stateAdminLog, "utf8") : "";
+    writeFileSync(harness.launchLog, "");
+
+    const result = runInstaller(
+      installer,
+      [
+        "rollback",
+        "--app-root",
+        appRoot,
+        "--node",
+        harness.node,
+        "--pair-id",
+        fixture.pair.pairId,
+        "--expected-index-digest",
+        fixture.pair.indexDigest,
+        ...structuralFlags(fixture),
+      ],
+      harness,
+    );
+
+    expect(result.status, "rollback proceeded despite an unsafe current").not.toBe(0);
+    expect(result.stderr).toContain("refusing to replace a non-symlink");
+    // The prevalidation invariant rollback already keeps for every other check: a refusal here
+    // leaves the filesystem exactly as it found it, with not even a bootout attempted.
+    expect(subcommands(harness.launchLog), "a preflight refusal still touched launchd").toEqual([]);
+    expect(readFileSync(join(appRoot, "dist", "bin", "node"))).toEqual(originalRuntime);
+    expect(readFileSync(plistPath(harness), "utf8")).toBe(originalPlist);
+    expect(readFileSync(launcherPath(harness), "utf8")).toBe(originalLauncher);
+    expect(existsSync(harness.stateAdminLog) ? readFileSync(harness.stateAdminLog, "utf8") : "").toBe(
+      stateAdminBefore,
+    );
+    expect(existsSync(join(harness.home, ".agent-control-plane", "rollback-stage"))).toBe(false);
+    expect(existsSync(join(link, "marker.txt")), "the pre-existing directory's contents were lost").toBe(true);
+  });
+
+  it("ACP1052-R1: does not fail an otherwise successful install when the current link cannot be published", () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    // Nothing else in this script calls `ln`; failing it unconditionally isolates publish's own
+    // rename step without disturbing any other step the installer takes.
+    writeExecutable(join(harness.bin, "ln"), "#!/bin/bash\nexit 1\n");
+
+    const result = runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness);
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toContain("current was not updated");
+    expect(existsSync(currentLinkPath(harness)), "a failed publish left a link behind").toBe(false);
+    expect(existsSync(plistPath(harness)), "an unrelated publish failure blocked the rest of install").toBe(true);
+  });
+
+  it("ACP1052-R1: does not fail an otherwise successful rollback when the current link cannot be published", async () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    expect(
+      runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status,
+    ).toBe(0);
+    const fixture = await sealPairFor(harness, appRoot);
+    writeFileSync(harness.launchLog, "");
+    writeExecutable(join(harness.bin, "ln"), "#!/bin/bash\nexit 1\n");
+
+    const result = runInstaller(
+      installer,
+      [
+        "rollback",
+        "--app-root",
+        appRoot,
+        "--node",
+        harness.node,
+        "--pair-id",
+        fixture.pair.pairId,
+        "--expected-index-digest",
+        fixture.pair.indexDigest,
+        ...structuralFlags(fixture),
+      ],
+      harness,
+    );
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toContain("current was not updated");
+    expect(readFileSync(join(appRoot, "dist", GENERATION_MARKER), "utf8").trim()).toBe("sealed-generation");
   });
 
   it("keeps the template as the only plist artifact in the tree", () => {

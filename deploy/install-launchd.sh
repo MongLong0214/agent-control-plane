@@ -678,11 +678,85 @@ wait_for_stop() {
   fail "agentcpd lock remains after launchctl stop; refusing database restore"
 }
 
+# External consumers (an MCP client config, a launcher script that is not this one) need one
+# address for "the ACP CLI" that outlives any single generation — today they have to name
+# $state_dir/runtime/generation-<sha>/dist/... directly, which breaks on every deploy. That address
+# is $state_dir/current, split into two steps for two different failure rules (ACP1052-R1):
+#
+# `assert_current_link_safe` only looks; it never writes. Every call site below runs it before the
+# first deployment mutation (stop_job, the runtime/database/launcher/plist replacement, start_job),
+# so a refusal here leaves the filesystem and the service exactly as it found them — the same
+# "nothing changes on refusal" rule rollback's own prevalidation already keeps. Checked here as the
+# directive owner (not the resolved target): a non-symlink at that name, or a symlink this user does
+# not own, is something the next step must not overwrite, and that is true whether or not the
+# command upstream of it ultimately succeeds.
+#
+# `publish_current_link` runs only after an install, upgrade or rollback has already fully
+# succeeded — runtime, database, launcher, plist and (unless --no-start) the running service are
+# already the new generation's. At that point `current` is a convenience pointer for an external
+# reader, not this deployment's own correctness boundary: a reader who cannot resolve through it
+# still has the generation path it already had, while reporting *this* deployment as failed over a
+# symlink swap would contradict every byte already on disk. So a publish failure — the safety
+# re-check losing a race with another writer, or the rename itself failing — is a warning on
+# stderr, not a refusal, and this command still exits 0.
+#
+# $state_dir is already required to be owned by this user, unlinked and mode 0700 before either
+# function can be reached — install/upgrade enforce that through `private_directory`, rollback
+# through `assert_existing_private_directory`, both ahead of every call site below — so the
+# directory the link lives in is already trusted.
+assert_current_link_safe() {
+  local current_link="$state_dir/current"
+  if [[ -e "$current_link" || -L "$current_link" ]]; then
+    [[ -L "$current_link" ]] || fail "refusing to replace a non-symlink at $current_link"
+    local owner
+    owner="$(stat -f '%u' "$current_link")"
+    [[ "$owner" == "$(id -u)" ]] ||
+      fail "$current_link is not owned by this user; refusing to replace it"
+  fi
+}
+
+publish_current_link() {
+  local target="$1"
+  local current_link="$state_dir/current"
+  # Re-checked rather than trusted from the preflight: every mutation this command just made ran
+  # in between, and nothing here may turn into a refusal of a deployment that already happened.
+  if [[ -e "$current_link" || -L "$current_link" ]]; then
+    if [[ ! -L "$current_link" ]]; then
+      printf 'agentcpd launchd installer: warning: %s is not a symlink; the deployment succeeded but current was not updated\n' "$current_link" >&2
+      return 0
+    fi
+    local owner
+    owner="$(stat -f '%u' "$current_link")"
+    if [[ "$owner" != "$(id -u)" ]]; then
+      printf 'agentcpd launchd installer: warning: %s is not owned by this user; the deployment succeeded but current was not updated\n' "$current_link" >&2
+      return 0
+    fi
+  fi
+  # Staged under a throwaway name in the same directory, then renamed into place with `-h` so the
+  # rename replaces the symlink itself in one syscall rather than following it into a directory it
+  # points at. `ln -sf` directly onto $current_link would unlink the old target and then create the
+  # new one as two steps, with a window between them in which the name resolves to nothing.
+  local temporary="$state_dir/.current.$$.tmp"
+  rm -f -- "$temporary"
+  if ! ln -s -- "$target" "$temporary"; then
+    printf 'agentcpd launchd installer: warning: failed to stage the current symlink; the deployment succeeded but current was not updated\n' >&2
+    return 0
+  fi
+  if ! mv -hf -- "$temporary" "$current_link"; then
+    printf 'agentcpd launchd installer: warning: failed to update %s; the deployment succeeded but current still names the previous generation\n' "$current_link" >&2
+    rm -f -- "$temporary"
+    return 0
+  fi
+}
+
 case "$command_name" in
   install|upgrade)
     resolve_app_root
     resolve_node
     private_directory "$state_dir"
+    # Preflight, before private_directory "$deploy_backups_dir" or any later mutation: a refusal
+    # here must leave the runtime, database, launcher, plist and service exactly as found (ACP1052-R1).
+    assert_current_link_safe
     private_directory "$deploy_backups_dir"
     keychain_required ACP_MCP_TOKEN
     keychain_required ACP_OPERATOR_TOKEN
@@ -695,6 +769,10 @@ case "$command_name" in
     write_launcher
     render_plist
     if [[ "$no_start" == "0" ]]; then start_job; fi
+    # Published once every step above has happened, --no-start included: the generation's files
+    # are complete on disk at this point regardless of whether the job was started. This never
+    # fails the command — see publish_current_link.
+    publish_current_link "$app_root"
     printf 'installed %s at %s (state: %s)\n' "$LABEL" "$plist_path" "$state_dir"
     ;;
   start)
@@ -746,6 +824,9 @@ case "$command_name" in
     # filesystem exactly as it found it, including not having created the directories it looked in.
     assert_existing_private_directory "$state_dir"
     assert_existing_private_directory "$rollback_pairs_dir"
+    # Still prevalidation: a refusal here must leave the runtime, database, launcher, plist and
+    # service exactly as found, the same as every check above it (ACP1052-R1).
+    assert_current_link_safe
     pair_root="$rollback_pairs_dir/$pair_id"
     [[ -d "$pair_root" && ! -L "$pair_root" ]] || fail "no sealed rollback pair with this id: $pair_root"
     pair_root="$(cd -P -- "$pair_root" && pwd)"
@@ -804,6 +885,11 @@ case "$command_name" in
       fail "rollback failed; the previous generation and the original service state were restored"
     fi
     if [[ "$service_was_loaded" == "1" ]]; then start_job; fi
+    # $app_root is the directory applyRollbackPair just overwrote in place — its runtime root is
+    # resolved from --expect-runtime-root "$app_root/dist" above, and rollback never creates a new
+    # generation directory — so it is exactly what current should name now. Published only here,
+    # after the pair is already fully applied; this never fails the command.
+    publish_current_link "$app_root"
     applied_generation=""
     while IFS='=' read -r report_key report_value; do
       case "$report_key" in
