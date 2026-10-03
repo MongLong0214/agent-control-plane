@@ -1,0 +1,24 @@
+Limit: canonicalTurnTarget refuses whenever more than one actor holds a current attestation, and a live deployment has the Hermes CEO beside several PRIMARY_CTO sessions, so the external lane resolves its target through receiptIdentityForCurrentHermesCeo
+Ruled-out: HermesReceiptPort (hermes acp operation status) as the Telegram turn receipt source | the release line refuses that prompt for every _meta.hermes request, so the port asks the Gateway's loopback receipt API instead
+Ruled-out: IngressGuard.claimTurn for the external lane | it mints a turn id of its own, and the lane's turn has exactly one id, the coordinator's
+Ruled-out: claiming a forwarded Telegram message wrapped as untrusted data | Hermes runs the text it already holds, so the wrapper could not reach the executor; a forward is refused instead
+Warn: one coordinator has one receipt port: a ControlPlaneConfig carrying both hermesReceipt and hermesGatewayReceipt is refused at construction
+Warn: the Gateway receipt port is composed whenever ACP_HERMES_GATEWAY_API_KEY is set, independent of the external lane; without the key the coordinator keeps NEVER_FOUND_RECEIPT_PORT
+Unverified: the live U4 readback against a running Hermes Gateway was not run in this change; the Hermes side (H1 to H3) is not part of this slice
+Record-Id: r-u4tgexternal
+Provenance: inherited 654a4b1674f571b326eb259b3fe01ea7fc5eb2ea
+
+Limit: ConversationTurnCoordinator.dispatch commits its dispatch row in a transaction of its own, so a lane that claimed in one transaction and dispatched in the next left a claimed, undispatched turn and a spent nonce when the dispatch write failed or the process stopped between the two commits (R1062-01)
+Limit: the coordinator claims without turn_claim_json, so IngressGuard.prune's claimed-row exemption could not see an external-lane turn, and the expired ingress row's payload is the only address a COMPLETED receipt's owner reply can be given (R1062-02)
+Ruled-out: a public dispatch step that only writes the row, with the caller sending after its own commit | it is markDispatching public beside dispatch again, rejected because a caller that can pick the order will eventually pick the wrong one; dispatchOnCommit takes the send and Db.afterCommit holds it until the outermost commit
+Ruled-out: a prune exemption scoped to the external lane's guard | ownerReplyAddressFor reads the source payload whichever lane admitted the message, so the exemption is keyed on the canonical ledger for every channel rather than on the external lane alone
+Warn: dispatchOnCommit does not await send; what send throws surfaces from the commit that ran it, after the dispatch row is durable, so a send must report its own delivery failure
+Warn: the external lane recognizes a replay from canonical_turn_sources (telegram, update:<id>, attempt 1), not from the expiring ingress row; the check runs only after admit's secret, owner and chat checks, and its refusal rolls the re-admission back, so a replay past the nonce window is answered without a write
+Warn: IngressGuard.prune never deletes an ingress row on any channel while a canonical turn that consumed it is IN_DOUBT; the row expires only after that turn settles
+Unverified: the crash boundary is witnessed from database files copied in-process at the dispatch write and at the answer, not by killing a process; process, scenario, e2e and CI runs remain outstanding
+Record-Id: r-1062r1repair
+Follows: r-u4tgexternal
+Provenance: inherited fe0ad46c258c57253b727b33f97d1408a2724d99
+
+Provenance: inherited 8a8864e5e1d1c9dbbc6186815d47938fdba9e070
+X-Claude-Session: https://claude.ai/code/session_0125xavK2hjM9n55cHBkK4bB
