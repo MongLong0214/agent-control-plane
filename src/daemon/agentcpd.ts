@@ -1066,7 +1066,11 @@ export const startBuzzMessageIngressListener = async (
     activeRoleTarget: (roleKey) => {
       const binding = cp.bindings.active(roleKey);
       return binding
-        ? { bindingGeneration: binding.bindingGeneration, targetSessionId: binding.sessionId }
+        ? {
+            bindingGeneration: binding.bindingGeneration,
+            targetSessionId: binding.sessionId,
+            createdAt: binding.createdAt,
+          }
         : null;
     },
     enqueueOwnerMessage: (input) => {
@@ -1309,6 +1313,12 @@ export const buzzMentionAdmissionOf = (decision: Decision<unknown>): BuzzMention
   if (decision.allowed) return "DURABLE";
   if (SUBSCRIBER_ALREADY_DURABLE_CODES.includes(decision.reasonCode)) return "ALREADY_DURABLE";
   if (SUBSCRIBER_RETRY_CODES.includes(decision.reasonCode)) return "RETRY";
+  // Terminal, and trusted with the cursor: the event was signed before the addressed role's binding
+  // generation, so it moves the window only to a time before that binding, where nothing this
+  // binding may be handed can be. Only an owner or the current CEO as a peer reaches this refusal —
+  // a stranger is refused before admission — and floors only move forward, because a later
+  // generation is created later.
+  if (decision.reasonCode === ReasonCode.BUZZ_MENTION_PRECEDES_BINDING) return "PRECEDES_BINDING";
   return "REFUSED";
 };
 

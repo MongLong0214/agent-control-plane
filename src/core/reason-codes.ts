@@ -460,6 +460,16 @@ export const ReasonCode = {
   BUZZ_PEER_TARGET_NOT_BOUND_CTO: "BUZZ_PEER_TARGET_NOT_BOUND_CTO",
   /** #1038 — a CEO-authored envelope that arrived on a room other than the addressed CTO's project channel. */
   BUZZ_PEER_CHANNEL_MISMATCH: "BUZZ_PEER_CHANNEL_MISMATCH",
+  /**
+   * A role-addressed Buzz mention, from the owner or the CEO as a peer, signed before the
+   * addressed role's current binding generation was created.
+   *
+   * The relay's history holds every mention ever sent to a channel identity, and a subscriber
+   * opening for the first time — a new identity, a new room — asks for all of it. Such an event
+   * was never addressed to this generation, so it is refused, and the refusal is terminal: asking
+   * again gives the same answer. Not a staleness code, because nothing re-derived would admit it.
+   */
+  BUZZ_MENTION_PRECEDES_BINDING: "BUZZ_MENTION_PRECEDES_BINDING",
 
   // --- canonical turns -----------------------------------------------------
   /**
