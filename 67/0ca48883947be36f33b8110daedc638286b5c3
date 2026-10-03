@@ -1,0 +1,18 @@
+Limit: ACP holds no Telegram transport; Hermes delivers the reply in Telegram, so a Telegram owner-reply can only become DELIVERED from Hermes' own delivery evidence, agreed with the Hermes owner as the closed 6-key delivery {obligation_id, state, content_digest, chat_id, reply_to_message_id, message_ids}
+Warn: a binary from before this change throws when it reads a Telegram DELIVERED record, so a rollback past it has a cost; a group owner chat (negative chat id) is refused because a positive chat id is required
+Record-Id: r-u4a3delivered
+Provenance: inherited df2c67a13fee7a8f7d8e63798a0fb9164116ca9c
+
+Warn: a Telegram chat id is any signed safe integer (group chats are negative), exactly as admission accepts; only reply-to and sent message ids must be positive; the earlier positive-chat warning is superseded
+Warn: later receipt reads go never-read first, then least recently read, so unavailable older receipts cannot starve a younger deliverable reply; the in-doubt loop still has the oldest-first, stop-at-budget pattern
+Record-Id: r-u4a3deliveredr1
+Follows: r-u4a3delivered
+Provenance: inherited f1c52c82ade52ff99a7e5f96c0647087920d3692
+
+Warn: later receipt reads use one order, least recently touched first, where settling without evidence stamps a reply and each later read restamps it; giving never-read replies priority let continuing arrivals starve a previously tried reply (R-A3-03), which supersedes the never-read-first warning
+Record-Id: r-u4a3deliveredr2
+Follows: r-u4a3deliveredr1
+Provenance: inherited 8446d1aa4ed5ad7cd67870c4d102a639aae08532
+
+Provenance: inherited fea0dc359b4e58cc9b3c790d6fe2b93a7308c154
+X-Claude-Session: https://claude.ai/code/session_0125xavK2hjM9n55cHBkK4bB
