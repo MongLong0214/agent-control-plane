@@ -11,12 +11,14 @@ import {
 } from "../session/runtime-lineage.ts";
 import {
   assertCanonicalSessionsValid,
+  assertClaudeIdentityStillLive,
   defaultProcessAncestryInspector,
   deriveClaimantIdentity,
   makeDefaultHostSessionRegistryReader,
   SELF_CLAIM_EXECUTOR_KIND,
   unsubscribedRoomRefusal,
   type CanonicalAdoptableSession,
+  type DerivedClaimantIdentity,
   type HostSessionRegistryReader,
   type ProcessAncestryInspector,
   type SubscribedBuzzRooms,
@@ -117,7 +119,13 @@ export const CANONICAL_CTO_BUZZ_ADDRESS_CORRECTED = "CANONICAL_CTO_BUZZ_ADDRESS_
 
 const MAX_ANCESTRY_HOPS = 64;
 
-const unbound = (message: string): Decision<CanonicalCtoAdmission> =>
+/** An admission and the claude identity it was derived from, which a later checkpoint re-verifies. */
+interface AdmittedHolder {
+  admission: CanonicalCtoAdmission;
+  identity: DerivedClaimantIdentity;
+}
+
+const unbound = (message: string): Decision<AdmittedHolder> =>
   deny(ReasonCode.CTO_REATTACH_UNBOUND, message, {});
 
 /** A draining primary keeps its already-fenced authority, as on `cto.mcp.sock`. */
@@ -144,9 +152,10 @@ export const createCanonicalCtoReattach = (
   // not walk the process tree a second time on every reattach just to find that out.
   const namesARoom = correctable.some((entry) => entry.buzzAddress !== undefined);
 
-  const admit = (peer: { peerPid: number; uid: number }): Decision<CanonicalCtoAdmission> => {
+  /** `admit`, keeping the claude identity it derived so the correction's write can verify it again. */
+  const admitHolder = (peer: { peerPid: number; uid: number }): Decision<AdmittedHolder> => {
     const identity = deriveClaimantIdentity(peer.peerPid, inspector, maxAncestryHops, registryReader);
-    if (!identity.allowed) return identity as Decision<CanonicalCtoAdmission>;
+    if (!identity.allowed) return identity as Decision<AdmittedHolder>;
     const conversation = identity.value.sessionUuid;
     const rows = cp.db.all<{
       assignment_id: string;
@@ -185,15 +194,24 @@ export const createCanonicalCtoReattach = (
       return unbound("the binding's runtime is not the claude process this conversation was derived from");
     }
     return allow(ReasonCode.OK, {
-      roleKey: row.role_key,
-      projectId: row.project_id,
-      assignmentId: row.assignment_id,
-      bindingGeneration: row.binding_generation,
-      sessionId: session.sessionId,
-      sessionIncarnation: session.incarnation,
-      actorId: row.actor_id,
-      conversation,
+      admission: {
+        roleKey: row.role_key,
+        projectId: row.project_id,
+        assignmentId: row.assignment_id,
+        bindingGeneration: row.binding_generation,
+        sessionId: session.sessionId,
+        sessionIncarnation: session.incarnation,
+        actorId: row.actor_id,
+        conversation,
+      },
+      identity: identity.value,
     });
+  };
+
+  const admit = (peer: { peerPid: number; uid: number }): Decision<CanonicalCtoAdmission> => {
+    const admitted = admitHolder(peer);
+    if (!admitted.allowed) return admitted as Decision<CanonicalCtoAdmission>;
+    return allow(admitted.reasonCode, admitted.value.admission);
   };
 
   /**
@@ -209,7 +227,8 @@ export const createCanonicalCtoReattach = (
    * The room is opened through the claim's resolver before the transaction, because opening it
    * shells the Buzz CLI and a transaction body cannot await. That await hands control away, so the
    * holder is admitted again inside the transaction, at the write, and must be the very same
-   * holder — conversation, assignment, generation, session and incarnation — or nothing is written.
+   * holder — conversation, assignment, generation, session and incarnation — or nothing is written;
+   * its claude process is then checked once more, as the claim checks its claimant at commit.
    * The row is read again there too: a concurrent correction that got there first leaves this one
    * `ALREADY_CORRECT`, so the row moves and its audit row is written exactly once.
    */
@@ -243,18 +262,25 @@ export const createCanonicalCtoReattach = (
       return deny(ReasonCode.CONFLICT, "the Buzz transport opened another room than the configured one", {});
     }
     return cp.db.txDecision((): Decision<CanonicalCtoBuzzAddressCorrection> => {
-      const again = admit(peer);
+      const again = admitHolder(peer);
       if (!again.allowed) return again as Decision<CanonicalCtoBuzzAddressCorrection>;
       const changed = (): Decision<CanonicalCtoBuzzAddressCorrection> =>
         deny(ReasonCode.CONFLICT, "the admitted holder changed while its room was opened", {});
-      if (again.value.conversation !== held.conversation) return changed();
-      if (again.value.assignmentId !== held.assignmentId) return changed();
-      if (again.value.bindingGeneration !== held.bindingGeneration) return changed();
-      if (again.value.sessionId !== held.sessionId) return changed();
-      if (again.value.sessionIncarnation !== held.sessionIncarnation) return changed();
+      const now = again.value.admission;
+      if (now.conversation !== held.conversation) return changed();
+      if (now.assignmentId !== held.assignmentId) return changed();
+      if (now.bindingGeneration !== held.bindingGeneration) return changed();
+      if (now.sessionId !== held.sessionId) return changed();
+      if (now.sessionIncarnation !== held.sessionIncarnation) return changed();
       const row = cp.sessions.get(held.sessionId);
       if (row === null) return changed();
       if (row.buzzAddress === room) return allow(ReasonCode.OK, { outcome: "ALREADY_CORRECT", sessionId: held.sessionId });
+      // The claim's commit checkpoint, after the last process read this transaction makes
+      // (PR1060-R1-01). The admission above derived the conversation before its lineage probes, and
+      // the lineage read the native start before walking the relay's parents, so a `/resume` or a
+      // reused pid during that walk was invisible to the tuple compared above. Any process read
+      // added to this transaction later belongs above this line.
+      if (!assertClaudeIdentityStillLive(again.value.identity, inspector, registryReader).allowed) return changed();
       cp.sessions.setBuzzAddress(held.sessionId, room);
       const recorded = cp.audit.record({
         kind: CANONICAL_CTO_BUZZ_ADDRESS_CORRECTED,

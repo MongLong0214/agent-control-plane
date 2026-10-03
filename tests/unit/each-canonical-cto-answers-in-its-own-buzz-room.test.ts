@@ -12,12 +12,18 @@ import {
   createCanonicalCtoReattach,
   type CanonicalCtoBuzzAddressOptions,
 } from "../../src/registry/canonical-cto-reattach.ts";
-import type { CanonicalAdoptableSession, SubscribedBuzzRooms } from "../../src/registry/canonical-self-claim.ts";
+import type {
+  CanonicalAdoptableSession,
+  HostSessionRegistryReader,
+  SubscribedBuzzRooms,
+} from "../../src/registry/canonical-self-claim.ts";
+import type { ProcessLineageReader } from "../../src/session/runtime-lineage.ts";
 import { snapshot } from "../helpers/adopted-ceo.ts";
 import {
   canonicalCtoFixture,
   claudeProcess,
   CLAUDE,
+  CLAUDE_TOKEN,
   CONVERSATION,
   CTO,
   OTHER_CLAUDE,
@@ -207,7 +213,7 @@ describe("nobody but that holder can move the row, and a refusal writes nothing"
   const expectUntouched = async (
     subject: CanonicalCtoFixture,
     attempt: () => Promise<Decision<unknown>>,
-    expected: { allowed: boolean; reasonCode?: string; value?: unknown },
+    expected: { allowed: boolean; reasonCode?: string; message?: string; value?: unknown },
   ): Promise<void> => {
     const before = snapshot(subject.h);
     expect(await attempt()).toMatchObject(expected);
@@ -263,6 +269,81 @@ describe("nobody but that holder can move the row, and a refusal writes nothing"
     await expectUntouched(subject, () => reattach.correctBuzzAddress({ peerPid: RELAY, uid: 501 }), {
       allowed: false, reasonCode: ReasonCode.CTO_REATTACH_UNBOUND,
     });
+  });
+
+  /**
+   * PR1060-R1-01. The write admits the holder again inside its transaction, and that admission
+   * derives the conversation first and probes the lineage after, reading the runtime's native start
+   * before it walks the relay's parents. A change landing during that walk was invisible to the
+   * tuple it returned, so the row moved under a holder that was no longer the one admitted.
+   *
+   * `change` runs inside the transaction's `parentOf(RELAY)`, the first one after the room opened.
+   * The conversation comes from the host registry here, as it does for a `/resume`d claude.
+   */
+  const probedHolder = (change: (registered: { conversation: string }) => void) => {
+    const { subject, options } = misaddressedHolder();
+    subject.processes.set(CLAUDE, { ...claudeProcess(CONVERSATION, CLAUDE_TOKEN), argv: ["/Users/fixture/.local/bin/claude"] });
+    const registered = { conversation: CONVERSATION };
+    const registryReader: HostSessionRegistryReader = {
+      read: () => allow(ReasonCode.OK, { sessionUuid: registered.conversation }),
+    };
+    let opened = false;
+    const processes: ProcessLineageReader = {
+      parentOf: (pid) => {
+        if (opened && pid === RELAY) {
+          opened = false;
+          change(registered);
+        }
+        return subject.processes.get(pid)?.ppid ?? null;
+      },
+      startToken: (pid) => subject.processes.get(pid)?.startedAt ?? null,
+    };
+    const reattach = subject.reattach({
+      ...options({
+        resolveBuzzAddress: async (_purpose, channelId) => {
+          opened = true;
+          return allow(ReasonCode.OK, channelId);
+        },
+      }),
+      processes,
+      registryReader,
+    });
+    return { subject, reattach };
+  };
+
+  it("refuses when the claude process's conversation changes while the write admits it again", async () => {
+    const { subject, reattach } = probedHolder((registered) => {
+      registered.conversation = OTHER_CONVERSATION;
+    });
+    await expectUntouched(subject, () => reattach.correctBuzzAddress({ peerPid: RELAY, uid: 501 }), {
+      allowed: false, reasonCode: ReasonCode.CONFLICT, message: "the admitted holder changed while its room was opened",
+    });
+    // What the write would have stood on: the same pid and start, now running another conversation.
+    expect(reattach.admit({ peerPid: RELAY, uid: 501 })).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.CTO_REATTACH_UNBOUND,
+    });
+  });
+
+  it("refuses when the claude process's native start changes while the write admits it again", async () => {
+    const { subject, reattach } = probedHolder(() => {
+      subject.processes.set(CLAUDE, { ...claudeProcess(CONVERSATION, RESTARTED_TOKEN), argv: ["/Users/fixture/.local/bin/claude"] });
+    });
+    await expectUntouched(subject, () => reattach.correctBuzzAddress({ peerPid: RELAY, uid: 501 }), {
+      allowed: false, reasonCode: ReasonCode.CONFLICT, message: "the admitted holder changed while its room was opened",
+    });
+  });
+
+  it("corrects once when nothing changes while the write admits it again", async () => {
+    let probed = 0;
+    const { subject, reattach } = probedHolder(() => {
+      probed += 1;
+    });
+    expect(await reattach.correctBuzzAddress({ peerPid: RELAY, uid: 501 })).toMatchObject({
+      allowed: true, value: { outcome: "CORRECTED", sessionId: subject.sessionId },
+    });
+    expect(probed).toBe(1);
+    expect(roomOf(subject)).toBe(ROOM);
+    expect(correctionRows(subject)).toHaveLength(1);
   });
 
   it("refuses when the room cannot be opened, or opens as another room", async () => {
