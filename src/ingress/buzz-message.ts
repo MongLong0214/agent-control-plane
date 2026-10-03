@@ -4,8 +4,7 @@ import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { Db } from "../db/database.ts";
-import { MessageKind } from "../outbox/envelope.ts";
-import { isSameActorCanonicalSuccession } from "../registry/canonical-self-claim.ts";
+import { SELF_CLAIM_EXECUTOR_KIND } from "../registry/canonical-self-claim.ts";
 
 import type { IngressGuard, IngressRequest, TurnClaim, TurnIdentity } from "./ingress-guard.ts";
 
@@ -228,6 +227,11 @@ export interface AdmittedPeerSource {
   readonly author: string;
   /** The admitted payload's `conversation`: the room (`h` tag) the event arrived on. */
   readonly conversation: unknown;
+  /**
+   * The admitted payload's `mention`: the Buzz channel identity the event was addressed to. Read
+   * only by `selfClaimCarriedTo`, which requires a carry record to name exactly this identity.
+   */
+  readonly mention?: unknown;
 }
 
 /** The CTO half of a stored peer proof, as `peerProofIsCurrent` read it. */
@@ -255,8 +259,9 @@ const noSuccessor = (): boolean => false;
  *
  * One holder besides the proof's own is accepted (2026-10-03): the same canonical conversation
  * restarted once, which the self-claim's dead-predecessor recovery carried the row to. The proof is
- * not rewritten to name it; `successorOf` establishes it from durable state, one hop only, and
- * every CEO and room clause above is asked of it unchanged.
+ * not rewritten to name it; `successorOf` establishes it from that carry's record alone
+ * (`selfClaimCarriedTo`, ACP-PEER-SUCCESSION-01), one hop only, and every CEO and room clause above
+ * is asked of it unchanged.
  */
 export const peerProofIsCurrent = (
   source: AdmittedPeerSource | undefined,
@@ -266,9 +271,9 @@ export const peerProofIsCurrent = (
   ctoChannel: string | null,
   /**
    * Whether this holder is the one-hop same-actor canonical successor of the CTO session the
-   * proof names, for this row (`carriedToSameActorSuccessor`). Asked only when the proof's CTO
-   * half names generation `holder.bindingGeneration - 1` and another session; the default answers
-   * no, so a caller that supplies nothing accepts the proof's exact holder alone.
+   * proof names, for this row (`selfClaimCarriedTo`). Asked only when the proof's CTO half names
+   * generation `holder.bindingGeneration - 1` and another session; the default answers no, so a
+   * caller that supplies nothing accepts the proof's exact holder alone.
    */
   successorOf: (proofCto: PeerProofCto) => boolean = noSuccessor,
 ): boolean => {
@@ -288,7 +293,7 @@ export const peerProofIsCurrent = (
     source.conversation === ctoChannel &&
     // The CTO the proof names is this holder — or, the one case besides it (2026-10-03), the
     // holder is that CTO's conversation restarted once: generation + 1, another session, and the
-    // durable succession and this row's carry mark say so. The proof itself is never rewritten.
+    // self-claim's carry record for this row says so. The proof itself is never rewritten.
     ((ctoGeneration === holder.bindingGeneration && ctoSession === holder.targetSessionId) ||
       (typeof ctoGeneration === "number" &&
         Number.isSafeInteger(ctoGeneration) &&
@@ -300,41 +305,100 @@ export const peerProofIsCurrent = (
 };
 
 /**
- * The durable succession lookup `peerProofIsCurrent` asks at hand-over, for one queued row and one
- * holder. Yes only when both hold:
+ * The succession lookup `peerProofIsCurrent` asks at hand-over, for one queued row and one holder
+ * (ACP-PEER-SUCCESSION-01). Yes only through the CARRIED record the canonical self-claim wrote for
+ * this exact row when it restarted the same conversation — a record ordinary SQL cannot write
+ * (`peer_message_carries_insert_authority`) — and only when every field of it matches:
  *
- *   - the row is a `PENDING` `PEER_MESSAGE` addressed to exactly this holder's role key, generation
- *     and session, and carries the `OUTBOX_RETARGETED` mark — which, on a peer row, only
- *     `Outbox.carryPeerMessagesToSameActorSuccessor` writes;
- *   - `isSameActorCanonicalSuccession` says the proof's CTO generation and session were released by
- *     the canonical self-claim's dead-predecessor recovery and this holder is the same actor's next
- *     generation, on the same Buzz channel identity.
+ *   - this row's message id and the admitted event its pointer names (channel and nonce);
+ *   - the proof's CTO half as the predecessor (role key, generation, session), and this holder as
+ *     the successor (role key, generation, session, incarnation);
+ *   - the Buzz identity the admitted event was addressed to as the record's signer;
+ *   - and, re-read from the registry, the record's two assignments (the predecessor's REVOKED, the
+ *     successor's ACTIVE, both the record's actor, both at the record's sessions and incarnations),
+ *     the successor's Buzz identity, the actor's conversation UUID, and the recovery's
+ *     `DEAD_BINDING_RECOVERED` row by its id.
  *
- * Only reads, as `claimForHolder`'s predicate must.
+ * The row's `OUTBOX_RETARGETED` mark and any audit row's `actor` text are not asked: both are
+ * ordinary columns. The registry facts can only withhold, never admit, because without the record
+ * the answer is already no. Only reads, as `claimForHolder`'s predicate must.
  */
-export const carriedToSameActorSuccessor = (
+export const selfClaimCarriedTo = (
   db: Pick<Db, "get">,
-  messageId: string,
-  holder: { roleKey: string; bindingGeneration: number; targetSessionId: string },
-) => (proofCto: PeerProofCto): boolean =>
-  db.get<{ carried: number }>(
+  candidate: { messageId: string; payload: unknown },
+  holder: { roleKey: string; bindingGeneration: number; targetSessionId: string; sessionIncarnation: string },
+  source: AdmittedPeerSource | undefined,
+) => (proofCto: PeerProofCto): boolean => {
+  const pointer = ownerMessagePointerOf(candidate.payload);
+  const mention = typeof source?.mention === "string" ? source.mention.trim() : "";
+  if (!pointer || mention.length === 0 || proofCto.roleKey !== holder.roleKey) return false;
+  return db.get<{ carried: number }>(
     `SELECT EXISTS (
-       SELECT 1 FROM outbox
-        WHERE message_id = ? AND kind = ? AND status = 'PENDING' AND reason_code = ?
-          AND role_key = ? AND binding_generation = ? AND target_session_id = ?
+       SELECT 1 FROM peer_message_carries c
+         JOIN assignments prev ON prev.assignment_id = c.from_assignment_id
+         JOIN assignments next ON next.assignment_id = c.to_assignment_id
+         JOIN sessions next_s ON next_s.session_id = c.to_session_id
+         JOIN actor_target_bindings tb ON tb.target_actor_id = c.actor_id
+         JOIN audit_events e ON e.event_id = c.recovery_audit_event_id
+        WHERE c.message_id = ? AND c.outcome = 'CARRIED'
+          AND c.source_channel = ? AND c.source_nonce = ?
+          AND c.role_key = ?
+          AND c.from_binding_generation = ? AND c.from_session_id = ?
+          AND c.to_binding_generation = ? AND c.to_session_id = ? AND c.to_session_incarnation = ?
+          AND c.buzz_actor_id = ?
+          AND prev.role_key = c.role_key AND prev.binding_generation = c.from_binding_generation
+          AND prev.session_id = c.from_session_id AND prev.session_incarnation = c.from_session_incarnation
+          AND prev.actor_id = c.actor_id AND prev.status = 'REVOKED'
+          AND next.role_key = c.role_key AND next.binding_generation = c.to_binding_generation
+          AND next.session_id = c.to_session_id AND next.session_incarnation = c.to_session_incarnation
+          AND next.actor_id = c.actor_id AND next.status = 'ACTIVE'
+          AND next_s.buzz_actor_id = c.buzz_actor_id
+          AND tb.executor_kind = ? AND tb.target_locator = c.conversation_uuid
+          AND e.kind = 'DEAD_BINDING_RECOVERED'
+          AND e.role_key = c.role_key AND e.session_id = c.from_session_id
      ) AS carried`,
     [
-      messageId, MessageKind.PEER_MESSAGE, ReasonCode.OUTBOX_RETARGETED,
-      holder.roleKey, holder.bindingGeneration, holder.targetSessionId,
+      candidate.messageId, pointer.sourceChannel, pointer.sourceNonce,
+      holder.roleKey,
+      proofCto.bindingGeneration, proofCto.sessionId,
+      holder.bindingGeneration, holder.targetSessionId, holder.sessionIncarnation,
+      mention,
+      SELF_CLAIM_EXECUTOR_KIND,
     ],
-  )?.carried === 1 &&
-  isSameActorCanonicalSuccession(db, {
-    roleKey: proofCto.roleKey,
-    fromGeneration: proofCto.bindingGeneration,
-    fromSessionId: proofCto.sessionId,
-    toGeneration: holder.bindingGeneration,
-    toSessionId: holder.targetSessionId,
-  });
+  )?.carried === 1;
+};
+
+/**
+ * A queued peer message the successor's restart refused to carry (ACP-PEER-SUCCESSION-01), as the
+ * successor is told about it so it can tell the CEO in the thread: the daemon cannot sign Buzz in a
+ * canonical room. Metadata only — never the payload.
+ */
+export interface PeerMessageRefusalNotice {
+  readonly messageId: string;
+  /** The Buzz event the CEO sent, when the record names a Buzz nonce. */
+  readonly sourceEventId: string | null;
+  /** `PeerMessageCarryRefusal`: why it was not carried. */
+  readonly reason: string;
+}
+
+/** The REFUSED carry records addressed to exactly this holder, oldest first. Only reads. */
+export const peerMessageRefusalsFor = (
+  db: Pick<Db, "all">,
+  holder: { roleKey: string; bindingGeneration: number; targetSessionId: string; sessionIncarnation: string },
+): PeerMessageRefusalNotice[] =>
+  db.all<{ message_id: string; source_nonce: string | null; refusal: string }>(
+    `SELECT message_id, source_nonce, refusal FROM peer_message_carries
+      WHERE outcome = 'REFUSED' AND role_key = ? AND to_binding_generation = ?
+        AND to_session_id = ? AND to_session_incarnation = ?
+      ORDER BY rowid`,
+    [holder.roleKey, holder.bindingGeneration, holder.targetSessionId, holder.sessionIncarnation],
+  ).map((row) => ({
+    messageId: row.message_id,
+    sourceEventId: row.source_nonce?.startsWith(BUZZ_MESSAGE_NONCE_PREFIX)
+      ? row.source_nonce.slice(BUZZ_MESSAGE_NONCE_PREFIX.length)
+      : null,
+    reason: row.refusal,
+  }));
 
 /** The durable replay key for one Buzz event. */
 export const buzzMessageNonce = (eventId: string): string =>

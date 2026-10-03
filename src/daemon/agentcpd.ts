@@ -84,10 +84,11 @@ import {
   BuzzMessageIngress,
   buzzMessageNonce,
   buzzMessageSigningRequest,
-  carriedToSameActorSuccessor,
   deliverBuzzMessage,
   ownerMessagePointerOf,
+  peerMessageRefusalsFor,
   peerProofIsCurrent,
+  selfClaimCarriedTo,
   type BuzzMentionRouter,
   type BuzzMessageIngressInput,
   type BuzzMessageTurnPort,
@@ -3591,26 +3592,34 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
         const ctoChannel = cp.sessions.get(holder.targetSessionId)?.buzzAddress ?? null;
         const taken = cp.outbox.claimForHolder(
           holder,
-          (candidate) =>
-            candidate.kind !== MessageKind.PEER_MESSAGE ||
-            peerProofIsCurrent(
-              admittedPeerSource(cp, candidate.payload),
+          (candidate) => {
+            if (candidate.kind !== MessageKind.PEER_MESSAGE) return true;
+            const source = admittedPeerSource(cp, candidate.payload);
+            return peerProofIsCurrent(
+              source,
               ceo,
               holder,
               ctoChannel,
               // The one holder besides the proof's own: its conversation restarted once, the row
-              // carried to it by the canonical self-claim's recovery (2026-10-03).
-              carriedToSameActorSuccessor(cp.db, candidate.messageId, holder),
-            ),
+              // carried to it by the canonical self-claim's recovery (2026-10-03) — accepted only
+              // through that carry's record (ACP-PEER-SUCCESSION-01).
+              selfClaimCarriedTo(cp.db, candidate, holder, source),
+            );
+          },
         );
         const unresolved = taken.unresolved;
         const withheld = taken.withheld;
+        // ACP-PEER-SUCCESSION-01: the CEO peer messages this holder's own restart refused to carry,
+        // by id, event and reason and never their text, so the CTO can tell the CEO in the thread.
+        // Present only when there is one, so a handover without any keeps its shape.
+        const refusals = peerMessageRefusalsFor(cp.db, holder);
+        const notices = refusals.length > 0 ? { refusedAtRestart: refusals } : {};
         const message = taken.claimed[0];
         // Nothing new was handed over: either the queue is empty, or an unresolved hand-over is
         // blocking it. Both are reported with metadata only — `UnresolvedOwnerMessage` has no
         // payload field, so "never the payload twice" holds by the shape of what is returned.
         if (!message) {
-          return allow(ReasonCode.OK, { claimed: null, unresolved, withheld, hasMore: taken.hasMore });
+          return allow(ReasonCode.OK, { claimed: null, unresolved, withheld, hasMore: taken.hasMore, ...notices });
         }
         const refuseClaimed = (reasonCode: ReasonCode, why: string): Decision<OwnerMessageHandover> => {
           const burned = cp.outbox.rejectForHolder(message.messageId, holder);
@@ -3679,6 +3688,7 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
           unresolved,
           withheld,
           hasMore: taken.hasMore,
+          ...notices,
         });
       });
       } catch (err) {
@@ -3740,8 +3750,13 @@ const admittedPeerSource = (cp: ControlPlane, outboxPayload: unknown): AdmittedP
     return undefined;
   }
   if (digestOf(payload) !== pointer.sourcePayloadDigest) return undefined;
-  const admitted = payload as { peer?: unknown; conversation?: unknown };
-  return { proof: admitted.peer, author: source.actor, conversation: admitted.conversation };
+  const admitted = payload as { peer?: unknown; conversation?: unknown; mention?: unknown };
+  return {
+    proof: admitted.peer,
+    author: source.actor,
+    conversation: admitted.conversation,
+    mention: admitted.mention,
+  };
 };
 
 /**

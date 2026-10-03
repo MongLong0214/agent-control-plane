@@ -1236,7 +1236,8 @@ describe("versioned SQLite migration", () => {
         [36, "v36-backfill-ingress-receipt-identities-before-freezing-claims"],
         [37, "v37-seed-claude-cli-executor-kind"],
         [38, "v38-canonical-verified-target-override"],
-        [SCHEMA_VERSION, "v39-owner-reply-intent-keeps-its-key"],
+        [39, "v39-owner-reply-intent-keeps-its-key"],
+        [SCHEMA_VERSION, "v40-peer-message-carry-record"],
       ]);
       // Stated as properties rather than one `objectContaining` per version. The list above
       // already pins the exact order and ids; this block only ever said "every receipt carries a

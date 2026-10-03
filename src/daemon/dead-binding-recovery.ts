@@ -185,8 +185,12 @@ export interface DeadBindingRecoveryDeps {
    * generation inside this same transaction and then carries or rejects every held row
    * (`BindingRegistry.carryPeerMessagesToSameActorSuccessor`). The operator door passes nothing:
    * it binds no successor, so a held row would be left addressed to a generation nobody holds.
+   *
+   * `alreadyCarried` is filled by the revoke with the queued peer messages it rejected instead
+   * of holding because an earlier restart already carried them once, so the caller can record
+   * that refusal for its successor to see.
    */
-  holdPeerMessagesForSameActorSuccessor?: boolean;
+  holdPeerMessagesForSameActorSuccessor?: { readonly alreadyCarried: string[] };
 }
 
 export interface DeadBindingRecoveryReceipt {
@@ -196,6 +200,11 @@ export interface DeadBindingRecoveryReceipt {
   sessionId: string;
   releasedGeneration: number;
   liveness: SessionLiveness;
+  /**
+   * The `event_id` of the `DEAD_BINDING_RECOVERED` row this recovery wrote, or null when the audit
+   * log refused its evidence. The self-claim binds it into every peer-message carry record.
+   */
+  recoveryAuditEventId: number | null;
 }
 
 /**
@@ -364,11 +373,13 @@ export const recoverDeadCanonicalBinding = (
     const revoked = deps.bindings.revoke(
       roleKey,
       `dead canonical binding recovery: session ${request.sessionId} process ${session.osPid ?? "unknown"} is gone`,
-      deps.holdPeerMessagesForSameActorSuccessor === true ? { holdPeerMessagesForSameActorSuccessor: true } : {},
+      deps.holdPeerMessagesForSameActorSuccessor === undefined
+        ? {}
+        : { holdPeerMessagesForSameActorSuccessor: deps.holdPeerMessagesForSameActorSuccessor },
     );
     if (!revoked.allowed) return revoked as Decision<DeadBindingRecoveryReceipt>;
 
-    deps.audit.record({
+    const recorded = deps.audit.record({
       kind: "DEAD_BINDING_RECOVERED",
       reasonCode: ReasonCode.OK,
       projectId: request.projectId,
@@ -391,6 +402,7 @@ export const recoverDeadCanonicalBinding = (
       sessionId: request.sessionId,
       releasedGeneration: current.bindingGeneration,
       liveness,
+      recoveryAuditEventId: recorded.allowed ? recorded.value : null,
     });
   });
 };

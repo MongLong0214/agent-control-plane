@@ -13,6 +13,11 @@ import {
 } from "../ingress/ingress-guard.ts";
 import { SingleInstanceLock } from "../daemon/single-instance.ts";
 import {
+  type PeerMessageCarryAuthority,
+  type PeerMessageSuccession,
+  peerMessageCarrySuccessionOf,
+} from "../registry/canonical-self-claim.ts";
+import {
   DEFAULT_BACKUP_RETENTION,
   assertIntegrity,
   backupDatabase,
@@ -272,6 +277,8 @@ export class Db {
   #turnMaterializationMarkers: Array<{ turnRequestId: string }> = [];
   #ingressClaimMarkers: Array<{ channel: string; nonce: string; claimJson: string }> = [];
   #ingressDeleteMarkers: Array<{ channel: string }> = [];
+  /** The one succession a peer-message carry may record, while the self-claim's carry writes. */
+  #peerMessageCarryMarkers: PeerMessageSuccession[] = [];
 
   /**
    * The file this connection opened. Capability issuance is keyed by it: two `Db` objects
@@ -388,6 +395,33 @@ export class Db {
     this.#raw.function("acp_schema_migration_authorized", () =>
       this.#schemaMigrationMarkerDepth > 0 ? 1 : 0,
     );
+    // ACP-PEER-SUCCESSION-01: a carry record is accepted only for the exact succession the marker
+    // names, and a CARRIED one only when that succession was proven continuous.
+    this.#raw.function("acp_peer_message_carry_authorized", (
+      outcome: unknown, roleKey: unknown,
+      fromSessionId: unknown, fromSessionIncarnation: unknown, fromGeneration: unknown, fromAssignmentId: unknown,
+      toSessionId: unknown, toSessionIncarnation: unknown, toGeneration: unknown, toAssignmentId: unknown,
+      actorId: unknown, conversationUuid: unknown, buzzActorId: unknown, recoveryAuditEventId: unknown,
+    ) => {
+      const marker = this.#peerMessageCarryMarkers[this.#peerMessageCarryMarkers.length - 1];
+      return marker &&
+        (outcome === "REFUSED" || (outcome === "CARRIED" && marker.proven)) &&
+        marker.roleKey === roleKey &&
+        marker.fromSessionId === fromSessionId &&
+        marker.fromSessionIncarnation === fromSessionIncarnation &&
+        marker.fromGeneration === fromGeneration &&
+        marker.fromAssignmentId === fromAssignmentId &&
+        marker.toSessionId === toSessionId &&
+        marker.toSessionIncarnation === toSessionIncarnation &&
+        marker.toGeneration === toGeneration &&
+        marker.toAssignmentId === toAssignmentId &&
+        marker.actorId === actorId &&
+        marker.conversationUuid === conversationUuid &&
+        marker.buzzActorId === buzzActorId &&
+        marker.recoveryAuditEventId === recoveryAuditEventId
+        ? 1
+        : 0;
+    });
     this.raw = Object.freeze({
       name: this.#raw.name,
       pragma: (source: string, options?: Database.PragmaOptions): unknown => {
@@ -952,6 +986,27 @@ export class Db {
     try { return write(); } finally { this.#ingressClaimMarkers.pop(); }
   }
 
+  /**
+   * Writes peer-message carry records (ACP-PEER-SUCCESSION-01) under the marker their insert
+   * trigger requires, for the one succession the authority names.
+   *
+   * The authority is minted only by the canonical self-claim, inside its claim transaction, after
+   * its dead-predecessor recovery and the successor's bind; this checks the brand and takes the
+   * succession from the token, never from the caller. So a raw statement cannot write a record, and
+   * a holder of the authority cannot write one for any other succession.
+   */
+  withPeerMessageCarry<T>(authority: PeerMessageCarryAuthority, write: () => T): T {
+    const succession = peerMessageCarrySuccessionOf(authority, this);
+    if (succession === null) {
+      return fail(ReasonCode.COMPLETION_AUTHORITY_DENIED, "PEER_MESSAGE_CARRY_AUTHORITY_DENIED", {});
+    }
+    if (!this.#raw.inTransaction) {
+      return fail(ReasonCode.COMPLETION_AUTHORITY_DENIED, "a peer-message carry requires the self-claim's transaction", {});
+    }
+    this.#peerMessageCarryMarkers.push(succession);
+    try { return write(); } finally { this.#peerMessageCarryMarkers.pop(); }
+  }
+
   /** The ingress guard alone may remove expired or superseded replay evidence. */
   withIngressDelete<T>(authority: IngressDeleteAuthority, channel: string, write: () => T): T {
     if (!isIngressDeleteAuthority(authority, this, channel)) {
@@ -1195,6 +1250,11 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   // #1036 — an owner reply's recorded intent is found by its key, so moving the key is a conflict
   // with the row that holds it, as rewriting its payload is.
   INBOUND_OWNER_REPLY_KEY_IMMUTABLE: ReasonCode.CONFLICT,
+  // ACP-PEER-SUCCESSION-01 — the carry record is evidence only the self-claim may write, and
+  // never rewritten.
+  PEER_MESSAGE_CARRY_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
+  PEER_MESSAGE_CARRY_NO_REPLACE: ReasonCode.CONFLICT,
+  PEER_MESSAGE_CARRY_IMMUTABLE: ReasonCode.CONFLICT,
   // The canonical-turn ledger, which had no entries here at all: every one of its denials came
   // out of `db.tx` as a raw Error rather than as a typed refusal, so a claim whose source insert
   // tripped a guard threw instead of denying. The guards are what this ledger is *for*, and the

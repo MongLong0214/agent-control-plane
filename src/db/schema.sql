@@ -1167,6 +1167,98 @@ CREATE INDEX IF NOT EXISTS outbox_role ON outbox(role_key, binding_generation, s
 CREATE INDEX IF NOT EXISTS outbox_retry_ready ON outbox(next_attempt_at) WHERE status = 'PENDING';
 
 -- ---------------------------------------------------------------------------
+-- peer_message_carries  (schema v40, ACP-PEER-SUCCESSION-01)
+--   Lifecycle: one record per decision the canonical self-claim's dead-predecessor recovery makes
+--   about a queued CEO peer message (#1044) addressed to the released CTO generation: CARRIED once
+--   to the same conversation's next generation, or REFUSED — rejected, with a reason category the
+--   successor is shown so it can tell the CEO. Written in the claim transaction that recovers the
+--   predecessor, binds the successor and moves the outbox row, or not at all.
+--   Integrity: the peer hand-over accepts a holder other than the one the admission proof names
+--   only through a CARRIED record that matches it field for field. The outbox row's
+--   OUTBOX_RETARGETED mark and the recovery audit row's `actor` text are ordinary columns any
+--   statement can write, and are not evidence of anything. A record is inserted only under the
+--   connection-local marker `Db.withPeerMessageCarry` raises for one exact succession, from a
+--   capability only the self-claim mints; it is never updated and never deleted.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS peer_message_carries (
+  message_id               TEXT NOT NULL,
+  outcome                  TEXT NOT NULL CHECK (outcome IN ('CARRIED','REFUSED')),
+  refusal                  TEXT CHECK (refusal IN ('DIFFERENT_ACTOR_OR_SIGNER','DIFFERENT_LINEAGE',
+                                                   'ALREADY_CARRIED','ALREADY_CLAIMED',
+                                                   'SOURCE_UNREADABLE')),
+  -- The admitted event, as the outbox row's pointer names it: the ingress row's key.
+  source_channel           TEXT,
+  source_nonce             TEXT,
+  role_key                 TEXT NOT NULL,
+  from_session_id          TEXT NOT NULL,
+  from_session_incarnation TEXT NOT NULL,
+  from_binding_generation  INTEGER NOT NULL,
+  from_assignment_id       TEXT NOT NULL,
+  to_session_id            TEXT NOT NULL,
+  to_session_incarnation   TEXT NOT NULL,
+  to_binding_generation    INTEGER NOT NULL,
+  to_assignment_id         TEXT NOT NULL,
+  -- The one conversational actor both generations belong to, its claimed conversation UUID and
+  -- the Buzz channel identity both runtimes speak as.
+  actor_id                 TEXT NOT NULL,
+  conversation_uuid        TEXT NOT NULL,
+  buzz_actor_id            TEXT NOT NULL,
+  -- The DEAD_BINDING_RECOVERED audit row the same transaction wrote for the predecessor.
+  recovery_audit_event_id  INTEGER NOT NULL,
+  created_at               TEXT NOT NULL,
+  PRIMARY KEY (message_id, outcome),
+  CHECK ((outcome = 'CARRIED') = (refusal IS NULL)),
+  CHECK (outcome = 'REFUSED' OR (source_channel IS NOT NULL AND source_nonce IS NOT NULL)),
+  -- One hop: a carry names the generation after the released one, and another runtime.
+  CHECK (to_binding_generation = from_binding_generation + 1),
+  CHECK (to_session_id <> from_session_id)
+);
+
+-- CP-HI-06 — the hand-over's only evidence of a same-conversation succession, so ordinary SQL must
+-- not be able to write one. `acp_peer_message_carry_authorized` answers 1 only while the
+-- self-claim's carry holds the marker for this exact succession, and a CARRIED record only when that
+-- succession was proven continuous.
+CREATE TRIGGER IF NOT EXISTS peer_message_carries_insert_authority
+BEFORE INSERT ON peer_message_carries
+WHEN acp_peer_message_carry_authorized(
+  NEW.outcome, NEW.role_key,
+  NEW.from_session_id, NEW.from_session_incarnation, NEW.from_binding_generation, NEW.from_assignment_id,
+  NEW.to_session_id, NEW.to_session_incarnation, NEW.to_binding_generation, NEW.to_assignment_id,
+  NEW.actor_id, NEW.conversation_uuid, NEW.buzz_actor_id, NEW.recovery_audit_event_id
+) <> 1
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_CARRY_AUTHORITY_DENIED');
+END;
+
+-- CP-HI-06 — one carry and one refusal per message, ever; a second of either is refused, not merged.
+CREATE TRIGGER IF NOT EXISTS peer_message_carries_no_replace
+BEFORE INSERT ON peer_message_carries
+WHEN EXISTS (
+  SELECT 1 FROM peer_message_carries
+   WHERE message_id = NEW.message_id AND outcome = NEW.outcome
+)
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_CARRY_NO_REPLACE');
+END;
+
+-- CP-HI-08 — a carry record is evidence: never rewritten.
+CREATE TRIGGER IF NOT EXISTS peer_message_carries_immutable
+BEFORE UPDATE ON peer_message_carries
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_CARRY_IMMUTABLE');
+END;
+
+-- CP-HI-08 — and never removed: a deleted CARRIED record would let a second carry of the same row in.
+CREATE TRIGGER IF NOT EXISTS peer_message_carries_no_delete
+BEFORE DELETE ON peer_message_carries
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_CARRY_IMMUTABLE');
+END;
+
+CREATE INDEX IF NOT EXISTS peer_message_carries_by_successor
+  ON peer_message_carries(to_session_id, to_binding_generation);
+
+-- ---------------------------------------------------------------------------
 -- inbound_messages
 --   Lifecycle: ingress replay defence (§27.1 nonce/idempotency, §27.3 MCP).
 --   Integrity: unique nonce per channel is the whole point.

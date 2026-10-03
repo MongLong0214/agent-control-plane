@@ -7,6 +7,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { Role, RoleBinding } from "../domain/types.ts";
+import type { PeerMessageRefusalNotice } from "../ingress/buzz-message.ts";
 import type { HolderIdentity, UnresolvedOwnerMessage } from "../outbox/outbox.ts";
 import type { AuthenticatedMcpPeer, McpPeerAuthenticator } from "./shared.ts";
 
@@ -150,6 +151,14 @@ export interface OwnerMessageHandover {
    */
   withheld: readonly UnresolvedOwnerMessage[];
   hasMore: boolean;
+  /**
+   * CEO peer messages that were queued for this conversation's previous generation and that this
+   * holder's own restart did not carry to it (ACP-PEER-SUCCESSION-01): rejected, with the reason.
+   * The daemon cannot sign Buzz in a canonical room, so this is how the CEO gets told — the CTO
+   * says so in the thread. Message id, source event id and reason only; never the payload. Absent
+   * when there is none.
+   */
+  refusedAtRestart?: readonly PeerMessageRefusalNotice[];
 }
 
 /**
