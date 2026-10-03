@@ -1,9 +1,20 @@
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import type * as NodeFs from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
 
-import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ATTACH_EXIT,
@@ -62,6 +73,34 @@ const clearMessagingEnv = (): void => {
 };
 clearMessagingEnv();
 beforeEach(clearMessagingEnv);
+
+/**
+ * A socket another user owns cannot be made without root, and a name swapped between two looks
+ * cannot be timed, so `lstatSync` reports them: a path in `foreignOwned` reads as owned by the next
+ * uid, to the relay and to the daemon alike; a path in `swappedEveryLook` reads as another inode at
+ * each look; every other path reads as it is. Both empty unless a case fills them.
+ */
+const forged = vi.hoisted(() => ({ foreignOwned: new Set<string>(), swappedEveryLook: new Set<string>(), looks: 0 }));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof NodeFs>();
+  const lstatSync = ((path: string, options?: never) => {
+    const stats = actual.lstatSync(path, options);
+    if (stats === undefined) return stats;
+    const overrides: PropertyDescriptorMap = {};
+    if (forged.foreignOwned.has(String(path))) overrides["uid"] = { value: stats.uid + 1 };
+    if (forged.swappedEveryLook.has(String(path))) {
+      forged.looks += 1;
+      overrides["ino"] = { value: stats.ino + forged.looks };
+    }
+    if (Object.keys(overrides).length === 0) return stats;
+    return Object.create(stats, overrides) as typeof stats;
+  }) as typeof actual.lstatSync;
+  return { ...actual, lstatSync, default: { ...actual, lstatSync } };
+});
+afterEach(() => {
+  forged.foreignOwned.clear();
+  forged.swappedEveryLook.clear();
+});
 
 interface Wire {
   id?: unknown;
@@ -206,14 +245,17 @@ const relay = (
   let outText = "";
   let pendingText = "";
   let nextId = 1;
-  const pending = new Map<number, (message: Wire) => void>();
+  /** Keyed by the id's JSON, so a string id is told from a number with the same digits. */
+  const pending = new Map<string, (message: Wire) => void>();
+  const received: Wire[] = [];
   stdout.on("data", (chunk: Buffer) => {
     outText += chunk.toString("utf8");
     pendingText += chunk.toString("utf8");
     for (let newline = pendingText.indexOf("\n"); newline >= 0; newline = pendingText.indexOf("\n")) {
       const message = JSON.parse(pendingText.slice(0, newline)) as Wire;
       pendingText = pendingText.slice(newline + 1);
-      if (typeof message.id === "number") pending.get(message.id)?.(message);
+      received.push(message);
+      if (message.id !== undefined) pending.get(JSON.stringify(message.id))?.(message);
     }
   });
   stderr.on("data", (chunk: Buffer) => {
@@ -229,22 +271,28 @@ const relay = (
   const exit = drive.entry === "command"
     ? runAttachRelayCommand(common, { stdin, stdout, stderr })
     : runAttachRelay({ ...common, mcpToken: TOKEN, messaging: drive.messaging }, { stdin, stdout, stderr });
-  const request = (method: string, params: unknown) =>
+  /** A request under an id the caller names: a string id is as valid a JSON-RPC id as a number. */
+  const requestAs = (id: string | number, method: string, params: unknown) =>
     new Promise<Wire>((resolve, reject) => {
-      const id = nextId++;
+      const key = JSON.stringify(id);
       const timer = setTimeout(() => reject(new Error(`timeout awaiting ${method}`)), 10_000);
-      pending.set(id, (message) => {
+      pending.set(key, (message) => {
         clearTimeout(timer);
+        pending.delete(key);
         resolve(message);
       });
       stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
     });
+  const request = (method: string, params: unknown) => requestAs(nextId++, method, params);
   const r = {
     exit,
     stdin,
     err: () => errText,
     out: () => outText,
+    /** Every message the client was sent, in order. */
+    received: () => received,
     request,
+    requestAs,
     /** `initialize` with a qualified build, then `notifications/initialized`, as Claude Code starts. */
     initialized: async () => {
       const init = await request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: qualified });
@@ -363,8 +411,14 @@ describe("the canonical CTO relay wakes its session as the session's own child",
     expect(await until(() => f.session.received.length === 2)).toBe(true);
     expect(f.session.received).toEqual([AUTHENTICATED_WAKE, AUTHENTICATED_WAKE]);
 
-    // A forward that fails is reported on stderr, by shape: no token, and no path.
+    // A forward that fails is reported on stderr, by shape: no token, and no path. The session's
+    // socket is left at its name with nothing listening: it passes the checks made before each
+    // forward (review PR1057-R1), so the failure is the connect's. A second name for the file keeps
+    // it past the close, which removes the name it was opened at.
+    const stale = `${f.session.path}.stale`;
+    linkSync(f.session.path, stale);
     await f.session.close();
+    renameSync(stale, f.session.path);
     expect((await f.daemon.live().ctoConversation.wake(CTO)).allowed).toBe(true);
     expect(await until(() => r.err().includes("attach: wake forward failed "))).toBe(true);
     await r.finish();
@@ -557,6 +611,259 @@ describe("the canonical CTO relay wakes its session as the session's own child",
     const refused = await r.register(session.path);
     expect(refused.result?.structuredContent).toMatchObject({ ok: false, reasonCode: ReasonCode.ROLE_PEER_UNSUPPORTED });
     expect(f.daemon.endpoint()).toBeNull();
+    await r.finish();
+  });
+});
+
+/**
+ * Review PR1057-R1. The daemon validates the endpoint it is given, and with the proxy that is the
+ * proxy, never the session's socket the authenticated forward connects to. So the relay applies the
+ * daemon's own checks to that socket — not a symlink, a socket, owned by this uid, in an owner-only
+ * directory of this uid's — before it opens the proxy and again before each forward, and a target
+ * that fails them is sent nothing: no auth line, no frame.
+ */
+describe("the wake proxy forwards only to a messaging socket the daemon itself would wake (review PR1057-R1)", () => {
+  it("opens no proxy for a messaging socket the daemon would refuse, and hands it no token", async () => {
+    const f = await started();
+    const elsewhere = mkdtempSync("/tmp/acpwx-");
+    roots.push(elsewhere);
+    const decoy = await recordingSocket(join(elsewhere, "decoy.sock"));
+    const linked = join(f.dir, "linked.sock");
+    symlinkSync(decoy.path, linked);
+    const plain = join(f.dir, "plain.sock");
+    writeFileSync(plain, "");
+    const foreign = await recordingSocket(join(f.dir, "foreign.sock"));
+    forged.foreignOwned.add(foreign.path);
+    const cases = [
+      // A name in the right directory that leads to a socket somewhere else.
+      { target: linked, check: "endpoint-is-symlink" },
+      { target: plain, check: "endpoint-not-a-socket" },
+      { target: foreign.path, check: "endpoint-owner-mismatch" },
+    ];
+    for (const { target, check } of cases) {
+      const r = relay(f.paths, { messaging: { socketPath: target, token: MESSAGING_TOKEN } });
+      await r.initialized();
+      await until(() => r.err() !== "" || decoy.received.length + foreign.received.length > 0);
+      expect(decoy.received).toEqual([]);
+      expect(foreign.received).toEqual([]);
+      expect(r.err()).toBe(`attach: wake proxy not opened ${check}\n`);
+      expect(proxiesIn(f.dir)).toEqual([]);
+      // The registration leaves as it arrived, and the daemon refuses it as it always did.
+      const refused = await r.register(target);
+      expect(refused.result?.structuredContent).toMatchObject({ ok: false, reasonCode: ReasonCode.ROLE_PEER_UNSUPPORTED });
+      expect(f.daemon.endpoint()).toBeNull();
+      await r.finish();
+    }
+    await pauseFor(100);
+    expect(decoy.received).toEqual([]);
+    expect(foreign.received).toEqual([]);
+    expect(f.session.received).toEqual([]);
+  });
+
+  it("forwards nothing once the session's socket is replaced by a symlink after registration, and forwards again once it is back", async () => {
+    const f = await started();
+    const elsewhere = mkdtempSync("/tmp/acpwx-");
+    roots.push(elsewhere);
+    const decoy = await recordingSocket(join(elsewhere, "decoy.sock"));
+    const r = relay(f.paths, { messaging: f.messaging });
+    await r.initialized();
+    await proxyRegistered(f);
+
+    // The proxy the daemon validates is unchanged; the name its forward connects to now leads elsewhere.
+    rmSync(f.session.path);
+    symlinkSync(decoy.path, f.session.path);
+    expect((await f.daemon.live().ctoConversation.wake(CTO)).allowed).toBe(true);
+    await until(() => r.err() !== "" || decoy.received.length > 0);
+    expect(decoy.received).toEqual([]);
+    expect(r.err()).toBe("attach: wake forward refused endpoint-is-symlink\n");
+
+    // Refused per forward, not for good: the session's own socket back at its name is woken again.
+    rmSync(f.session.path);
+    const back = await recordingSocket(f.session.path);
+    expect((await f.daemon.live().ctoConversation.wake(CTO)).allowed).toBe(true);
+    expect(await until(() => back.received.length === 1)).toBe(true);
+    expect(back.received).toEqual([AUTHENTICATED_WAKE]);
+    expect(decoy.received).toEqual([]);
+    await r.finish();
+    expect(r.err()).not.toContain(MESSAGING_TOKEN);
+  });
+
+  it("forwards nothing to a session socket another user owns by the time of the wake", async () => {
+    const f = await started();
+    const r = relay(f.paths, { messaging: f.messaging });
+    await r.initialized();
+    await proxyRegistered(f);
+
+    forged.foreignOwned.add(f.session.path);
+    expect((await f.daemon.live().ctoConversation.wake(CTO)).allowed).toBe(true);
+    await until(() => r.err() !== "" || f.session.received.length > 0);
+    expect(f.session.received).toEqual([]);
+    expect(r.err()).toBe("attach: wake forward refused endpoint-owner-mismatch\n");
+
+    forged.foreignOwned.delete(f.session.path);
+    expect((await f.daemon.live().ctoConversation.wake(CTO)).allowed).toBe(true);
+    expect(await until(() => f.session.received.length === 1)).toBe(true);
+    expect(f.session.received).toEqual([AUTHENTICATED_WAKE]);
+    await r.finish();
+  });
+
+  it("writes no token when the name is another file after the connect than it was before it", async () => {
+    const f = await started();
+    const r = relay(f.paths, { messaging: f.messaging });
+    await r.initialized();
+    await proxyRegistered(f);
+
+    // Each look passes every check, and each finds another inode: the look before the connect and
+    // the look after it disagree about which file the connection reached.
+    forged.swappedEveryLook.add(f.session.path);
+    expect((await f.daemon.live().ctoConversation.wake(CTO)).allowed).toBe(true);
+    await until(() => r.err() !== "" || f.session.received.some((bytes) => bytes !== ""));
+    expect(f.session.received.filter((bytes) => bytes !== "")).toEqual([]);
+    expect(r.err()).toBe("attach: wake forward refused endpoint-replaced\n");
+    await r.finish();
+  });
+});
+
+/** A request line as the stand-in daemon below reads it. */
+interface StandInLine {
+  id?: unknown;
+  method?: string;
+  params?: { name?: string; requestId?: unknown; arguments?: { endpoint?: unknown } };
+}
+
+/**
+ * A stand-in daemon behind the reattach door that answers `initialize` at once and holds every other
+ * request until the case answers it, so the case decides the order answers arrive in.
+ */
+const holdingDoor = async (dir: string) => {
+  const path = join(dir, "door.sock");
+  const sockets: Socket[] = [];
+  const held: Array<{ line: StandInLine; socket: Socket }> = [];
+  const notifications: StandInLine[] = [];
+  const server = createServer((socket) => {
+    socket.on("error", () => undefined);
+    sockets.push(socket);
+    socket.write(`${JSON.stringify({ ok: true, reasonCode: ReasonCode.OK, admitted: STAND_IN_TUPLE })}\n`);
+    let text = "";
+    socket.on("data", (chunk: Buffer) => {
+      text += chunk.toString("utf8");
+      for (let newline = text.indexOf("\n"); newline >= 0; newline = text.indexOf("\n")) {
+        const line = JSON.parse(text.slice(0, newline)) as StandInLine;
+        text = text.slice(newline + 1);
+        if (line.method === "initialize") {
+          socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: line.id, result: { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "stand-in", version: "1" } } })}\n`);
+        } else if (line.id === undefined) {
+          notifications.push(line);
+        } else {
+          held.push({ line, socket });
+        }
+      }
+    });
+  });
+  await listen(server, path);
+  closers.push(async () => {
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  const answer = (entry: { line: StandInLine; socket: Socket }, result: unknown): void => {
+    entry.socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: entry.line.id, result })}\n`);
+  };
+  return { path, held, notifications, answer };
+};
+
+const isRegistration = (entry: { line: StandInLine }): boolean =>
+  entry.line.method === "tools/call" && entry.line.params?.name === "role_wake_endpoint_register";
+
+/** The id the relay gave its own registration of the proxy at ca341789: a valid string id for a client too. */
+const OLD_GENERATED_ID = "acp-relay-wake-proxy-1";
+const CLIENT_RESULT = { content: [{ type: "text", text: "the client's own answer" }] };
+const REGISTERED = { structuredContent: { ok: true } };
+
+/** A relay behind `holdingDoor`, with a session socket for its proxy, that has registered the proxy and not been answered. */
+const heldRegistration = async (policy: Partial<ReattachPolicy>) => {
+  const dir = mkdtempSync("/tmp/acpwr-");
+  roots.push(dir);
+  const session = await recordingSocket(join(dir, "client.sock"));
+  const door = await holdingDoor(dir);
+  const r = relay(
+    { claimPath: join(dir, "absent.sock"), ctoPath: join(dir, "absent.sock"), reattachPath: door.path },
+    { messaging: { socketPath: session.path, token: MESSAGING_TOKEN }, policy },
+  );
+  await r.initialized();
+  expect(await until(() => door.held.some(isRegistration))).toBe(true);
+  return { door, r, registration: door.held.find(isRegistration)! };
+};
+
+/**
+ * Review PR1057-R2. The relay's own requests and the client's share one connection to the daemon,
+ * so they must not share one id space: a client id equal to an id the relay generated would have its
+ * answer taken by the relay, and the relay's answer handed to the client as the client's.
+ */
+describe("the relay's own requests cannot take a client's answer (review PR1057-R2)", () => {
+  for (const order of ["the client's answer first", "the registration's answer first"] as const) {
+    it(`answers a client request whose id is the relay's old registration id with its own answer (${order})`, async () => {
+      const { door, r, registration } = await heldRegistration(POLICY);
+      const answered = r.requestAs(OLD_GENERATED_ID, "tools/call", { name: "fixture_tool", arguments: {} });
+      expect(await until(() => door.held.length === 2)).toBe(true);
+      const client = door.held.find((entry) => !isRegistration(entry))!;
+
+      if (order === "the client's answer first") {
+        door.answer(client, CLIENT_RESULT);
+        await pauseFor(50);
+        door.answer(registration, REGISTERED);
+      } else {
+        door.answer(registration, REGISTERED);
+        await pauseFor(50);
+        door.answer(client, CLIENT_RESULT);
+      }
+      expect((await answered).result).toEqual(CLIENT_RESULT);
+      await pauseFor(100);
+      // One answer under that id, the client's own; the registration's answer reached the client under no id.
+      expect(r.received().filter((message) => message.id === OLD_GENERATED_ID)).toEqual([
+        { jsonrpc: "2.0", id: OLD_GENERATED_ID, result: CLIENT_RESULT },
+      ]);
+      expect(r.out()).not.toContain("structuredContent");
+      // The relay took its own answer as its own: no refusal reported.
+      expect(r.err()).toBe("");
+      // And the daemon never had two requests outstanding under one id.
+      expect(new Set(door.held.map((entry) => JSON.stringify(entry.line.id))).size).toBe(door.held.length);
+      await r.finish();
+    });
+  }
+
+  it("does not hand a client the late answer to a registration the relay stopped waiting for", async () => {
+    const { door, r, registration } = await heldRegistration(FAST);
+    const answered = r.requestAs(OLD_GENERATED_ID, "tools/call", { name: "fixture_tool", arguments: {} });
+    expect(await until(() => door.held.length === 2)).toBe(true);
+    const client = door.held.find((entry) => !isRegistration(entry))!;
+    // Past the relay's bound on its own request (FAST.attemptTimeoutMs), then the late answer.
+    await pauseFor(400);
+    door.answer(registration, REGISTERED);
+    await pauseFor(50);
+    door.answer(client, CLIENT_RESULT);
+    expect((await answered).result).toEqual(CLIENT_RESULT);
+    await pauseFor(100);
+    expect(r.received().filter((message) => message.id === OLD_GENERATED_ID)).toHaveLength(1);
+    expect(r.out()).not.toContain("structuredContent");
+    await r.finish();
+  });
+
+  it("cancels a client request upstream under the id it was sent under, and forwards no cancel of a request not in flight", async () => {
+    const { door, r, registration } = await heldRegistration(POLICY);
+    void r.requestAs(OLD_GENERATED_ID, "tools/call", { name: "fixture_tool", arguments: {} }).catch(() => undefined);
+    expect(await until(() => door.held.length === 2)).toBe(true);
+    const client = door.held.find((entry) => !isRegistration(entry))!;
+    const cancel = (requestId: unknown): string =>
+      `${JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId, reason: "fixture" } })}\n`;
+    r.stdin.write(cancel(OLD_GENERATED_ID));
+    r.stdin.write(cancel("never-sent"));
+    await pauseFor(200);
+    const cancels = door.notifications.filter((line) => line.method === "notifications/cancelled");
+    // The client's cancel names its own request as the daemon knows it, never the relay's registration.
+    expect(cancels.map((line) => line.params?.requestId)).toEqual([client.line.id]);
+    expect(JSON.stringify(client.line.id)).not.toBe(JSON.stringify(registration.line.id));
+    door.answer(registration, REGISTERED);
+    door.answer(client, CLIENT_RESULT);
     await r.finish();
   });
 });

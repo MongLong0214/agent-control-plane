@@ -501,28 +501,46 @@ interface WakeProxy {
   close(): void;
 }
 
+/** The session's messaging socket as one look found it: why it may not be woken, or which file it is. */
+type WakeTarget = { refusal: string } | { refusal: null; identity: string };
+
 /**
- * Why the directory of the session's messaging socket cannot hold the proxy, or null when it can.
+ * Whether the wake proxy may forward to the session's messaging socket, and which file that is.
  *
- * The checks the daemon makes of a wake endpoint's directory (`#validateEndpointPath` in
- * `src/mcp/role-conversation.ts`), in its order: an exact normalized path, and a parent that is a
- * real directory, not a symlink, owned by this uid and reachable by no one else. A directory the
- * daemon would refuse gets no proxy, so nothing is opened that only a loosened check would admit.
+ * The checks the daemon makes of a wake endpoint (`#validateEndpointPath` in
+ * `src/mcp/role-conversation.ts`), in its order and by its names, made of the socket the proxy
+ * forwards to (review PR1057-R1): an exact normalized path; a parent that is a real directory, not
+ * a symlink, owned by this uid and reachable by no one else; and the path itself `lstat`ed, never
+ * followed — not a symlink, a socket, owned by this uid. With the proxy registered, the daemon
+ * checks the proxy and never this socket, so these are the only checks the socket the token goes
+ * to gets. The daemon's state-directory check needs no copy: the proxy sits in this socket's
+ * directory, and the daemon accepts the proxy only there.
+ *
+ * Copied rather than imported for the reason `WAKE_FRAME` is. `identity` is the file's device and
+ * inode, which tell one socket from another put at the same name.
  */
-const wakeProxyDirectoryRefusal = (socketPath: string): string | null => {
-  if (socketPath !== resolvePath(socketPath)) return "not-normalized";
+const inspectWakeTarget = (socketPath: string): WakeTarget => {
+  if (socketPath !== resolvePath(socketPath)) return { refusal: "not-normalized" };
   const uid = process.getuid?.();
-  if (uid === undefined) return "owner-unknown-on-this-platform";
+  if (uid === undefined) return { refusal: "owner-unknown-on-this-platform" };
   try {
     const dir = lstatSync(dirname(socketPath));
-    if (dir.isSymbolicLink()) return "directory-is-symlink";
-    if (!dir.isDirectory()) return "directory-not-a-directory";
-    if (dir.uid !== uid) return "directory-owner-mismatch";
-    if ((dir.mode & 0o077) !== 0) return "directory-not-owner-only";
+    if (dir.isSymbolicLink()) return { refusal: "directory-is-symlink" };
+    if (!dir.isDirectory()) return { refusal: "directory-not-a-directory" };
+    if (dir.uid !== uid) return { refusal: "directory-owner-mismatch" };
+    if ((dir.mode & 0o077) !== 0) return { refusal: "directory-not-owner-only" };
   } catch {
-    return "directory-not-inspectable";
+    return { refusal: "directory-not-inspectable" };
   }
-  return null;
+  try {
+    const target = lstatSync(socketPath);
+    if (target.isSymbolicLink()) return { refusal: "endpoint-is-symlink" };
+    if (!target.isSocket()) return { refusal: "endpoint-not-a-socket" };
+    if (target.uid !== uid) return { refusal: "endpoint-owner-mismatch" };
+    return { refusal: null, identity: `${target.dev}:${target.ino}` };
+  } catch {
+    return { refusal: "endpoint-not-inspectable" };
+  }
 };
 
 /** A connect error as the daemon's wake classifies one; a Node error message names the path. */
@@ -554,34 +572,54 @@ const wakeFailureShape = (error: NodeJS.ErrnoException): string => {
  * **The forward goes to the environment's socket**, never to a path a caller named, as the auth
  * line and then the frame on one connection that then ends — the order Claude Code documents.
  *
+ * **Only while that socket passes the daemon's checks** (`inspectWakeTarget`, review PR1057-R1).
+ * The daemon checks the endpoint it is given, and that is the proxy, so the socket the token goes
+ * to is checked here: before the proxy opens, then before each forward connects, and once more
+ * after the connect and before the auth line is written, when it must still be the file it was
+ * before the connect. A socket that fails is sent nothing, reported as `attach: wake forward
+ * refused <check>`, and checked afresh at the next wake. No `lstat` sees what `connect` resolved:
+ * a name moved elsewhere just for the connect and moved back before the second look passes both.
+ * The owner-only directory leaves that move to this uid, which can read this process's environment
+ * anyway.
+ *
  * **It answers the sender nothing**, as the session's own socket answers the daemon nothing: the
  * daemon's wake counts as delivered once its frame is written and reads no reply, so its
  * classification of a wake is what it was. A forward that fails after that shows only here, as
  * `attach: wake forward failed <shape>`, with no path and no token.
  */
 const openWakeProxy = (messaging: SessionMessaging, stderr: Writable): Promise<WakeProxy | null> => {
-  const refusal = wakeProxyDirectoryRefusal(messaging.socketPath);
-  if (refusal !== null) {
-    stderr.write(`attach: wake proxy not opened ${refusal}\n`);
+  const opening = inspectWakeTarget(messaging.socketPath);
+  if (opening.refusal !== null) {
+    stderr.write(`attach: wake proxy not opened ${opening.refusal}\n`);
     return Promise.resolve(null);
   }
   const path = join(dirname(messaging.socketPath), `acp-wake-proxy-${randomBytes(8).toString("hex")}.sock`);
   const connections = new Set<Socket>();
 
   const forward = (): void => {
+    const before = inspectWakeTarget(messaging.socketPath);
+    if (before.refusal !== null) {
+      stderr.write(`attach: wake forward refused ${before.refusal}\n`);
+      return;
+    }
     const out = createConnection(messaging.socketPath);
     let written = false;
     let reported = false;
-    const failed = (shape: string): void => {
+    const report = (line: string): void => {
       out.destroy();
       if (written) return;
       if (reported) return;
       reported = true;
-      stderr.write(`attach: wake forward failed ${shape}\n`);
+      stderr.write(line);
     };
+    const failed = (shape: string): void => report(`attach: wake forward failed ${shape}\n`);
     out.setTimeout(WAKE_PROXY_TIMEOUT_MS, () => failed("timeout"));
     out.once("error", (error: NodeJS.ErrnoException) => failed(wakeFailureShape(error)));
     out.once("connect", () => {
+      // The token is written only to the file that passed before the connect, and passes still.
+      const after = inspectWakeTarget(messaging.socketPath);
+      if (after.refusal !== null) return report(`attach: wake forward refused ${after.refusal}\n`);
+      if (after.identity !== before.identity) return report("attach: wake forward refused endpoint-replaced\n");
       // One write: the auth line is the connection's first line, and the frame is its second.
       out.end(`${JSON.stringify({ type: "auth", token: messaging.token })}\n${WAKE_FRAME}`, () => {
         written = true;
@@ -987,12 +1025,15 @@ interface Link {
   /** Known at once for a reattach; for a claim's handshake, after the first line that is not a refusal. */
   accepted: boolean;
   closed: boolean;
-  /** The client's requests written on this link and not yet answered. */
-  inFlight: Map<string, unknown>;
+  /**
+   * The client's requests written on this link and not yet answered, keyed by the id the relay sent
+   * each under: `client` is the id the client gave it, `upstream` the relay's number for it.
+   */
+  inFlight: Map<string, { client: unknown; upstream: number }>;
   /** The relay's own requests on this link, each answered by this link and by no other. */
   waiters: Map<string, (message: RelayedMessage | null) => void>;
   /** Replayable requests written on this link, remembered only once the daemon answers them with success. */
-  initializes: Map<string, { id: unknown; line: string }>;
+  initializes: Map<string, RelayedMessage>;
   wakeRegistrations: Map<string, unknown>;
   /** Whether the relay has registered its wake proxy on this link of its own accord. */
   proxyOffered: boolean;
@@ -1066,9 +1107,21 @@ const wakeRefusalReason = (message: RelayedMessage): string => {
  *     the proxy itself unless the client registered another endpoint, so a wake reaches a session
  *     whose model never called the tool. The daemon wakes on every registration it accepts, so
  *     that registration is also the first wake through the proxy.
+ *   - **The client's requests leave under ids of the relay's** (review PR1057-R2). The relay's own
+ *     requests — the restore's replays and the proxy's registration, which goes out on a live
+ *     link alongside the client's traffic — share the connection with the client's, and an id the
+ *     client may also use is one whose answer the relay would take, handing the relay's answer to
+ *     the client as the client's. So each client request is sent under the next number the relay
+ *     counts, and its answer goes back under the client's own id; the relay's own requests carry
+ *     strings, which no number equals. A client's `notifications/cancelled` is sent naming the
+ *     number its request went under, and not sent at all when it names no request in flight, since
+ *     the id it names may be one of the relay's. An answer to no request in flight — the late answer
+ *     to a request of the relay's it stopped waiting for — is dropped, never passed to the client.
  *
- * Seeing those messages is the only reason this relay reads JSON-RPC at all; every line is still
- * forwarded exactly as it arrived, but for that one registration.
+ * Seeing those messages, and renaming request ids, is the only reason this relay reads JSON-RPC
+ * at all. A client request leaves with its id renamed, but for that one registration with nothing
+ * else changed, and an answer returns with the client's id restored; every other line is forwarded
+ * exactly as it arrived.
  */
 const relayWithReattach = (
   first: Socket,
@@ -1091,10 +1144,14 @@ const relayWithReattach = (
     let stdoutFailed = false;
     let stdoutBlocked = false;
     let daemonBlocked = false;
-    let clientInitialize: { id: unknown; line: string } | null = null;
+    /** The client's `initialize` a daemon answered with a result, replayed under an id of the relay's own. */
+    let clientInitialize: RelayedMessage | null = null;
     let clientInitialized: string | null = null;
     let wakeArguments: unknown = undefined;
+    /** Counts the relay's own requests, whose ids are strings. */
     let internalIds = 0;
+    /** Counts the client's requests, which leave under these numbers rather than their own ids. */
+    let upstreamIds = 0;
     /** Listening, or null: no messaging in the environment, a directory it may not use, or not yet open. */
     let proxy: WakeProxy | null = null;
     /** Ends the relay's own requests on a live link when the relay ends. */
@@ -1181,9 +1238,9 @@ const relayWithReattach = (
     };
 
     /** Notes a request written on `link` that a restarted daemon would be restored with, if it succeeds. */
-    const noteReplayable = (link: Link, key: string, id: unknown, message: RelayedMessage, line: string): void => {
+    const noteReplayable = (link: Link, key: string, message: RelayedMessage): void => {
       if (message.method === "initialize") {
-        link.initializes.set(key, { id, line });
+        link.initializes.set(key, message);
         return;
       }
       if (message.method !== "tools/call") return;
@@ -1217,7 +1274,7 @@ const relayWithReattach = (
 
     /**
      * The client's registration of the session's own messaging socket, pointed at the proxy; null
-     * for every other message, which leaves as it arrived. Only an `endpoint` exactly equal to the
+     * for every other message, which leaves unchanged but for its id. Only an `endpoint` exactly equal to the
      * environment's socket is rewritten, so the client cannot steer the proxy, and the proxy's
      * forward target is never a path any message names.
      */
@@ -1233,6 +1290,23 @@ const relayWithReattach = (
       return { ...message, params: { ...params, arguments: { ...registration, endpoint: opened.path } } };
     };
 
+    /**
+     * The client's cancel of one of its requests, naming the number that request was sent under; null
+     * when no request of the client's with the id it names is in flight on `link`. Passed on as it
+     * arrived, a cancel names an id in the daemon's space, where it may be one of the relay's own.
+     */
+    const cancelUpstream = (link: Link, message: RelayedMessage): string | null => {
+      const params = message.params as { requestId?: unknown } | null | undefined;
+      if (typeof params !== "object" || params === null) return null;
+      const named = idKey(params.requestId);
+      let upstream: number | undefined;
+      for (const request of link.inFlight.values()) {
+        if (idKey(request.client) === named) upstream = request.upstream;
+      }
+      if (upstream === undefined) return null;
+      return JSON.stringify({ ...message, params: { ...params, requestId: upstream } });
+    };
+
     const fromClient = lineSplitter((line) => {
       const message = parseRelayed(line);
       const id = message === null ? undefined : requestIdOf(message);
@@ -1243,17 +1317,22 @@ const relayWithReattach = (
         return;
       }
       if (id !== undefined) {
-        const key = idKey(id);
-        link.inFlight.set(key, id);
-        const pointed = pointAtProxy(message as RelayedMessage);
-        if (pointed !== null) {
-          const rewritten = JSON.stringify(pointed);
-          noteReplayable(link, key, id, pointed, rewritten);
-          send(link, rewritten);
-          return;
-        }
-        noteReplayable(link, key, id, message as RelayedMessage, line);
-      } else if (message?.method === "notifications/initialized") {
+        // Sent under the relay's next number, never under the client's own id (review PR1057-R2).
+        upstreamIds += 1;
+        const upstream = upstreamIds;
+        const key = idKey(upstream);
+        link.inFlight.set(key, { client: id, upstream });
+        const outbound = pointAtProxy(message as RelayedMessage) ?? (message as RelayedMessage);
+        noteReplayable(link, key, outbound);
+        send(link, JSON.stringify({ ...outbound, id: upstream }));
+        return;
+      }
+      if (message?.method === "notifications/cancelled") {
+        const cancel = cancelUpstream(link, message);
+        if (cancel !== null) send(link, cancel);
+        return;
+      }
+      if (message?.method === "notifications/initialized") {
         clientInitialized = line;
         send(link, line);
         // The client is initialized: the earliest point the daemon accepts a wake registration.
@@ -1288,8 +1367,19 @@ const relayWithReattach = (
         const key = idKey(id);
         const waiter = link.waiters.get(key);
         if (waiter !== undefined) return waiter(message);
-        link.inFlight.delete(key);
-        settleReplayable(link, key, message as RelayedMessage);
+        const request = link.inFlight.get(key);
+        if (request !== undefined) {
+          link.inFlight.delete(key);
+          settleReplayable(link, key, message as RelayedMessage);
+          return toClient(JSON.stringify({ ...message, id: request.client }));
+        }
+        // An answer to no request in flight, such as the late answer to one of the relay's own it
+        // stopped waiting for. The client would take it for the answer to whichever of its requests
+        // carries that id. An error answering no id at all is the daemon's to report, and passes.
+        if (id !== null) {
+          io.stderr.write("attach: dropped an answer to no request in flight\n");
+          return;
+        }
       }
       toClient(line);
     };
@@ -1303,8 +1393,8 @@ const relayWithReattach = (
       if (phase === "done") return;
       const unanswered = [...link.inFlight.values()];
       link.inFlight.clear();
-      for (const id of unanswered) {
-        undelivered(id, "the agent-control-plane connection closed before this request was answered; its outcome is unknown");
+      for (const { client } of unanswered) {
+        undelivered(client, "the agent-control-plane connection closed before this request was answered; its outcome is unknown");
       }
       // A link lost while it was being restored is noticed by that restore, through its waiters,
       // and the wait already running carries on; no second wait starts.
@@ -1438,7 +1528,9 @@ const relayWithReattach = (
     const restore = async (link: Link, deadlineAt: number, signal: AbortSignal): Promise<boolean> => {
       const initialize = clientInitialize;
       if (initialize !== null) {
-        if ((await ask(link, initialize.id, initialize.line, deadlineAt, signal)) === null) return false;
+        internalIds += 1;
+        const id = `acp-relay-reinitialize-${internalIds}`;
+        if ((await ask(link, id, JSON.stringify({ ...initialize, id }), deadlineAt, signal)) === null) return false;
         if (clientInitialized !== null) link.socket.write(`${clientInitialized}\n`);
       }
       if (wakeArguments !== undefined && !supersededByProxy(wakeArguments)) {
