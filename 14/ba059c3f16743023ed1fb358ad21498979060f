@@ -1,0 +1,12 @@
+Limit: `<state root>/current` (#1052) is a symlink to `runtime/generation-<sha8>`, and long-lived callers -- the Claude Code acp-cto entry and the Hermes acp-ceo entry among them -- launch this CLI through that symlink rather than through the generation directory's real path, so argv[1] the entrypoint check sees can be a symlink.
+Warn: Do not restore `import.meta.url === pathToFileURL(process.argv[1]).href` (or agentcpd's `fileURLToPath(import.meta.url) === resolve(process.argv[1])`) at these four entrypoints: import.meta.url is always a realpath and process.argv[1] is whatever path the caller passed, so the comparison silently fails the first time the module is reached through a symlink and the process exits 0 having done nothing.
+Record-Id: r-6f34edf394f0
+Provenance: inherited 42abf7109409718dd876e23d18fed0d0e6df1497
+
+Limit: `src/tools/traceability.ts`'s `isMain` has the identical symlink fix but is not exercised live in the regression test: its `main()` calls `runVitestJson(root)` and writes `evidence/traceability.json`/`.md` as a side effect whenever no `options.vitest` is supplied, so there is no cheap, side-effect-free CLI invocation of it the way there is for the other five fixed entrypoints.
+Warn: Do not restore `import.meta.url === new URL(\`file://${entry}\`).href` in hermes-ceo.ts's or hermes-tool-bridge.ts's invokedDirectly, or `resolve(process.argv[1]) === fileURLToPath(import.meta.url)` in traceability.ts's isMain: import.meta.url is always a realpath and process.argv[1] is whatever path the caller passed, so the comparison silently fails the first time the module is reached through a symlink such as `<state root>/current` (#1052).
+Record-Id: r-bea37d78db60
+Provenance: inherited 8be9788f2592e9bbbf8f8d8a4e2ae7f3f2cfa472
+
+Provenance: inherited 6827ca86b6c6a2557ef41335673ac0163cd0d7af
+X-Claude-Session: https://claude.ai/code/session_0125xavK2hjM9n55cHBkK4bB
