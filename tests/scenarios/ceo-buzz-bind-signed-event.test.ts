@@ -13,7 +13,9 @@ import {
   type BuzzRelaySocketHandlers,
   type BuzzSubscriberScheduler,
 } from "../../src/buzz/buzz-mention-subscriber.ts";
+import { BuzzBindChallenges } from "../../src/buzz/buzz-bind-challenge.ts";
 import { ATTACH_EXIT, runAdoptedCeoAttachRelay } from "../../src/cli/attach-relay.ts";
+import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
   createDaemonBuzzBindChallenges,
@@ -23,7 +25,12 @@ import {
 } from "../../src/daemon/agentcpd.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { buzzMessageNonce } from "../../src/ingress/buzz-message.ts";
-import { BuzzActorIngress, IngressGuard } from "../../src/ingress/ingress-guard.ts";
+import {
+  BuzzActorIngress,
+  buzzActorBindingSigningRequest,
+  IngressGuard,
+  ingressSignature,
+} from "../../src/ingress/ingress-guard.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
 import { HERMES_PROVENANCE_META_KEY } from "../../src/mcp/hermes-provenance.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
@@ -156,7 +163,10 @@ const manualRelay = () => {
   return {
     factory,
     live,
-    authenticateAndSubscribe: async (handle: { settled(): Promise<void> }): Promise<string> => {
+    /** NIP-42 on the live socket, then the subscription's id and the filter its `REQ` asked for. */
+    authenticateAndSubscribe: async (
+      handle: { settled(): Promise<void> },
+    ): Promise<{ subId: string; filter: Record<string, unknown> }> => {
       const socket = live();
       socket.handlers.onFrame(JSON.stringify(["AUTH", "relay-challenge"]));
       await handle.settled();
@@ -164,16 +174,21 @@ const manualRelay = () => {
       socket.handlers.onFrame(JSON.stringify(["OK", auth[1].id, true, ""]));
       await handle.settled();
       const req = socket.sent.map((raw) => JSON.parse(raw) as unknown[]).find((sent) => sent[0] === "REQ")!;
-      return req[1] as string;
+      return { subId: req[1] as string, filter: req[2] as Record<string, unknown> };
     },
   };
 };
 
-const scheduler = (): BuzzSubscriberScheduler => ({
-  setTimer: () => 0,
-  clearTimer: () => undefined,
-  nowSeconds: () => 1_900_000_000,
-});
+/** A fixed clock, and reconnect timers kept for the test to fire rather than run on their own. */
+const scheduler = () => {
+  const timers: Array<() => void> = [];
+  const value: BuzzSubscriberScheduler = {
+    setTimer: (_ms, fire) => timers.push(fire),
+    clearTimer: () => undefined,
+    nowSeconds: () => 1_900_000_000,
+  };
+  return { value, timers };
+};
 
 /**
  * An adopted CEO (no Buzz channel identity yet — the live state), a project whose PRIMARY_CTO answers
@@ -181,7 +196,7 @@ const scheduler = (): BuzzSubscriberScheduler => ({
  * subscriber sharing one challenge store, as `main` wires them. The relay allowlist holds every key,
  * the stranger's included, so no refusal below is the relay credential's.
  */
-const startBindFixture = async () => {
+const startBindFixture = async (options: { challengeStore?: boolean } = {}) => {
   const fixture = adoptedFixture();
   fixtures.push(fixture);
   const { h } = fixture;
@@ -191,6 +206,8 @@ const startBindFixture = async () => {
   const ceo = newKey();
   const cto = newKey();
   const stranger = newKey();
+  /** A second key the relay credential admits, for the relay-signed form to bind first. */
+  const otherCeoKey = newKey();
 
   const { projectId } = await registerFixtureProject(h);
   const ctoRoleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
@@ -202,7 +219,10 @@ const startBindFixture = async () => {
     { isAllowedActor: () => true },
   ).allowed).toBe(true);
 
-  const policy = { allowedActors: [owner.pubkey, ceo.pubkey, stranger.pubkey], secret: SECRET };
+  const policy = {
+    allowedActors: [owner.pubkey, ceo.pubkey, stranger.pubkey, otherCeoKey.pubkey],
+    secret: SECRET,
+  };
   const challenges = createDaemonBuzzBindChallenges(h.cp, policy);
 
   const toolDir = mkdtempSync("/tmp/acpbb-");
@@ -232,13 +252,14 @@ const startBindFixture = async () => {
   });
   closers.push(() => ingress.close());
   const relayOf = manualRelay();
+  const clock = scheduler();
   const subscriber = startDaemonBuzzMentionSubscriber(h.cp, dir, policy, ingress, {
     openSocket: relayOf.factory,
-    scheduler: scheduler(),
-    bindChallenges: challenges,
+    scheduler: clock.value,
+    ...(options.challengeStore === false ? {} : { bindChallenges: challenges }),
   });
   closers.push(() => subscriber.close());
-  const subId = await relayOf.authenticateAndSubscribe(subscriber);
+  const { subId } = await relayOf.authenticateAndSubscribe(subscriber);
 
   const nowSeconds = (): number => Math.floor(h.clock.now().getTime() / 1000);
   const ceoSessionId = fixture.gatewaySessionId;
@@ -268,6 +289,7 @@ const startBindFixture = async () => {
     ceo,
     cto,
     stranger,
+    otherCeoKey,
     ctoRoleKey,
     ceoSessionId,
     tools,
@@ -316,6 +338,23 @@ const startBindFixture = async () => {
     inbound: (eventId: string) =>
       h.cp.db.get(`SELECT nonce FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`, [buzzMessageNonce(eventId)]),
     peerRows: () => h.cp.db.all(`SELECT message_id FROM outbox WHERE kind = ?`, [MessageKind.PEER_MESSAGE]),
+    /** Every row a delivered message leaves, for either principal: its ingress row and its outbox row. */
+    messageRows: () => ({
+      inbound: h.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM inbound_messages`, [])!.n,
+      outbox: h.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM outbox`, [])!.n,
+    }),
+    /**
+     * The relay ends the subscription, the reconnect timer fires, and the new connection subscribes
+     * again: the filter it asks for is the window the subscriber now trusts.
+     */
+    reconnect: async (): Promise<Record<string, unknown>> => {
+      relayOf.live().handlers.onFrame(JSON.stringify(["CLOSED", subId, "test: subscription ended"]));
+      await subscriber.settled();
+      const fire = clock.timers.shift();
+      if (!fire) throw new Error("the subscriber scheduled no reconnect");
+      fire();
+      return (await relayOf.authenticateAndSubscribe(subscriber)).filter;
+    },
     refusedWith: (reasonCode: string): number => subscriber.counters().rejections[`admission-refused:${reasonCode}`] ?? 0,
   };
 };
@@ -553,5 +592,130 @@ describe("the adopted CEO binds its Buzz channel identity with an event its own 
     expect(await f.mint()).toMatch(/^acp-buzz-bind:/);
     expect(f.h.cp.db.all(`SELECT * FROM sessions ORDER BY session_id`)).toEqual(before);
     expect(f.ceoIdentity()).toBeNull();
+  });
+});
+
+/** The relay-signed form, through the adopted CEO tool socket: binds `actor` with no challenge. */
+const bindByRelayEnvelope = async (f: BindFixture, actor: string, nonce: string): Promise<void> => {
+  const wire = await f.callBind({
+    actor,
+    nonce,
+    signature: ingressSignature(SECRET, buzzActorBindingSigningRequest({ actor, sessionId: f.ceoSessionId, nonce })),
+  });
+  expect(wire.result?.structuredContent).toMatchObject({ ok: true, value: { buzzActorId: actor } });
+};
+
+/**
+ * Content carrying the binding marker in a shape that is not exactly one well-formed token. The last
+ * three are the spellings the marker match folds: case, separators and a zero-width character.
+ */
+const MALFORMED_SHAPES: ReadonlyArray<readonly [string, (token: string) => string]> = [
+  ["the same token twice", (token) => `${token} ${token}`],
+  ["a valid token beside a malformed prefix", (token) => `${token} 그리고 acp-buzz-bind:not-a-nonce`],
+  ["a malformed prefix only", () => "acp-buzz-bind:not-a-nonce"],
+  ["an upper-case token", (token) => token.toUpperCase()],
+  ["a token whose prefix is spaced", (token) => token.replace("acp-buzz-bind:", "acp buzz bind : ")],
+  ["a token whose prefix hides a zero-width space", (token) => token.replace("buzz", "bu​zz")],
+];
+
+describe("ACP1055: a binding-shaped message is never delivered, and a refused binding is never durable", () => {
+  for (const [shape, contentOf] of MALFORMED_SHAPES) {
+    it(`ACP1055-01: delivers ${shape} to neither the owner's path nor the peer's`, async () => {
+      const f = await startBindFixture();
+      // The CEO's key bound, so a CEO mention without a binding marker is a peer message.
+      await bindByChallenge(f);
+      const token = await f.mint();
+      const before = f.messageRows();
+      const signedAt = f.nowSeconds();
+      for (const author of [f.owner, f.ceo]) {
+        const event = f.mention(author, `CTO, ${contentOf(token)}`, signedAt + 1);
+        await f.relayDelivers(event);
+        expect(f.inbound(event.id)).toBeUndefined();
+      }
+      expect(f.messageRows()).toEqual(before);
+      expect(f.refusedWith(ReasonCode.INVALID_ARGUMENT)).toBe(2);
+      expect(f.ceoIdentity()).toBe(f.ceo.pubkey);
+
+      // Control: the same two principals' messages without the marker are each delivered.
+      for (const author of [f.owner, f.ceo]) {
+        const plain = f.mention(author, "CTO, 표식 없는 메시지", signedAt + 2);
+        await f.relayDelivers(plain);
+        expect(f.inbound(plain.id)).toBeDefined();
+      }
+      expect(f.messageRows().inbound).toBe(before.inbound + 2);
+    });
+  }
+
+  it("ACP1055-01: delivers no token-carrying message from either principal when no challenge store is wired", async () => {
+    const f = await startBindFixture({ challengeStore: false });
+    await bindByRelayEnvelope(f, f.ceo.pubkey, "acp1055-no-store");
+    const before = f.messageRows();
+    for (const author of [f.owner, f.ceo]) {
+      const event = f.mention(author, `CTO, acp-buzz-bind:${"0".repeat(32)}`);
+      await f.relayDelivers(event);
+      expect(f.inbound(event.id)).toBeUndefined();
+    }
+    expect(f.messageRows()).toEqual(before);
+    expect(f.refusedWith(ReasonCode.INVALID_ARGUMENT)).toBe(2);
+
+    const plain = f.mention(f.ceo, "CTO, 표식 없는 지시", f.nowSeconds() + 1);
+    await f.relayDelivers(plain);
+    expect(f.inbound(plain.id)).toBeDefined();
+  });
+
+  it("ACP1055-02: answers a refused binding's replay with the refusal again, so a reconnect asks for the same window", async () => {
+    const f = await startBindFixture();
+    // A challenge for the CEO's key, then a different key bound through the relay-signed form.
+    const token = await f.mint();
+    await bindByRelayEnvelope(f, f.otherCeoKey.pubkey, "acp1055-other-key");
+    const answer = f.mention(f.ceo, `바인딩: ${token}`);
+    await f.relayDelivers(answer);
+    expect(f.refusedWith(ReasonCode.SESSION_BUZZ_ACTOR_IMMUTABLE)).toBe(1);
+    const sessions = f.sessionsRows();
+
+    await f.relayDelivers(answer);
+    expect(f.refusedWith(ReasonCode.SESSION_BUZZ_ACTOR_IMMUTABLE)).toBe(2);
+    expect(f.subscriber.counters().rejections["admission-already-durable"]).toBeUndefined();
+    expect(f.sessionsRows()).toEqual(sessions);
+    expect(f.ceoIdentity()).toBe(f.otherCeoKey.pubkey);
+
+    // An owner message older than the binding event that the relay has not delivered yet. The
+    // window the new connection asks for must still reach back to it.
+    const older = f.mention(f.owner, "CTO, 아직 전달되지 않은 이전 메시지", answer.created_at - 30);
+    const filter = await f.reconnect();
+    expect(filter["since"]).toBeUndefined();
+    await f.relayDelivers(older);
+    expect(f.inbound(older.id)).toBeDefined();
+  });
+
+  it("ACP1055-02: answers the replay of a binding whose write threw as not bound, and never binds it twice", async () => {
+    const f = await startBindFixture();
+    const admitted = await f.fixture.admit();
+    if (!admitted.allowed) throw new Error(JSON.stringify(admitted));
+    const runtime = admitted.value.runtime;
+    const generation = f.h.cp.bindings.active(CEO)!.bindingGeneration;
+    let writes = 0;
+    const store = new BuzzBindChallenges({
+      nowMs: () => f.h.clock.now().getTime(),
+      currentCeo: () => ({
+        sessionId: runtime.sessionId,
+        sessionIncarnation: runtime.sessionIncarnation,
+        bindingGeneration: generation,
+        live: true,
+      }),
+      bindable: () => allow(ReasonCode.OK, undefined),
+      bind: () => {
+        writes += 1;
+        throw new Error("the writer failed mid-write");
+      },
+      recordRefusal: () => undefined,
+    });
+    const minted = store.mint(runtime, f.ceo.pubkey);
+    if (!minted.allowed) throw new Error(JSON.stringify(minted));
+    const answer = f.mention(f.ceo, `바인딩: ${minted.value.challenge}`);
+
+    expect(() => store.settle(answer)).toThrow("the writer failed mid-write");
+    expect(store.settle(answer)).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+    expect(writes).toBe(1);
   });
 });

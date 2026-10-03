@@ -39,16 +39,41 @@ export const BUZZ_BIND_SIGNED_SKEW_SECONDS = 60;
 
 /** 128 bits, as lowercase hex. */
 const NONCE_BYTES = 16;
-const NONCE_TOKEN = /acp-buzz-bind:([0-9a-f]{32})(?![0-9A-Za-z])/;
+/**
+ * The binding marker in any spelling a reader would take for it: any case, with whitespace, dashes
+ * or underscores (or nothing) between the words, matched after NFKC folding with format characters
+ * removed, so full-width letters and zero-width joiners do not hide it. Loose on purpose: content
+ * this matches is never delivered, and a false match costs a message, never a binding.
+ */
+const BIND_MARKER = /acp[\s\p{Pd}_]*buzz[\s\p{Pd}_]*bind/giu;
+/** The one form that binds: the exact token `mint` issues, standing alone. */
+const WELL_FORMED_TOKEN = /(?<![0-9A-Za-z])acp-buzz-bind:([0-9a-f]{32})(?![0-9A-Za-z])/g;
 const X_ONLY_HEX = /^[0-9a-f]{64}$/;
 
 /**
- * The nonce an event's content carries, when it carries exactly one well-formed token and the token
- * prefix nowhere else. Anything else is not a binding event and goes to admission as it always did.
+ * What an event's content says about binding (ACP1055-01), in three answers:
+ *
+ *   - `NONE`: no binding marker in any spelling — admission's, as it always was;
+ *   - `TOKEN`: exactly one marker, and it is a well-formed token — the binding's;
+ *   - `MALFORMED`: any other content carrying a marker — two tokens, a token beside a mangled
+ *     prefix, a prefix with no usable nonce. Refused: neither delivered nor bound.
+ *
+ * Only `NONE` may reach admission. Reading "not exactly one token" as "not a binding event" is what
+ * once delivered `${token} ${token}` to the CTO as a message.
  */
-export const buzzBindNonceIn = (content: string): string | null => {
-  if (content.split(BUZZ_BIND_TOKEN_PREFIX).length !== 2) return null;
-  return NONCE_TOKEN.exec(content)?.[1] ?? null;
+export type BuzzBindContent =
+  | { readonly kind: "NONE" }
+  | { readonly kind: "TOKEN"; readonly nonce: string }
+  | { readonly kind: "MALFORMED" };
+
+export const buzzBindContentOf = (content: string): BuzzBindContent => {
+  const folded = content.normalize("NFKC").replace(/\p{Cf}/gu, "");
+  const markers = folded.match(BIND_MARKER)?.length ?? 0;
+  if (markers === 0) return { kind: "NONE" };
+  const tokens = [...content.matchAll(WELL_FORMED_TOKEN)];
+  const nonce = tokens.length === 1 ? tokens[0]?.[1] : undefined;
+  if (markers !== 1 || nonce === undefined) return { kind: "MALFORMED" };
+  return { kind: "TOKEN", nonce };
 };
 
 /** A lowercase 64-hex x-only public key from hex in either case or an `npub`, or null. */
@@ -122,8 +147,12 @@ interface Challenge {
   readonly actor: string;
   readonly mintedAtMs: number;
   readonly expiresAtMs: number;
-  /** The event that consumed it, once one did. */
-  consumedBy: string | null;
+  /**
+   * The event that consumed it and the writer's answer to that event, once one did. Consumption and
+   * success are separate facts (ACP1055-02): a consumed nonce never binds again, and only a binding
+   * the writer accepted is answered as already applied when its event comes back.
+   */
+  consumed: { readonly eventId: string; settlement: Decision<unknown> } | null;
   readonly refusalsRecorded: Set<string>;
 }
 
@@ -174,7 +203,7 @@ export class BuzzBindChallenges {
       actor: normalized,
       mintedAtMs: now,
       expiresAtMs,
-      consumedBy: null,
+      consumed: null,
       refusalsRecorded: new Set(),
     });
     this.#pendingBySession.set(runtime.sessionId, nonce);
@@ -185,17 +214,26 @@ export class BuzzBindChallenges {
   }
 
   /**
-   * A verified event's answer to a challenge: null when it carries no single token (admission's, as
-   * before), otherwise the binding's decision. The nonce is consumed before the writer is called, so
-   * no second event can reach the writer on it.
+   * A verified event's answer to a challenge: null only when its content carries no binding marker
+   * at all (admission's, as before), otherwise the binding's decision — a refusal for anything but
+   * one well-formed token. The nonce is consumed before the writer is called, so no second event can
+   * reach the writer on it.
    */
   settle(event: BuzzMentionEvent): Decision<unknown> | null {
-    const nonce = buzzBindNonceIn(event.content);
-    if (nonce === null) return null;
+    const content = buzzBindContentOf(event.content);
+    if (content.kind === "NONE") return null;
     // The subscriber verified this event; the proof is minted only by code that verified it itself.
     if (!verifyEvent(plainCopy(event))) {
       return deny(ReasonCode.INGRESS_SIGNATURE_INVALID, "the binding event's signature does not verify");
     }
+    if (content.kind === "MALFORMED") {
+      // Nothing is looked up or recorded: like an unknown nonce, it names no challenge for certain.
+      return deny(
+        ReasonCode.INVALID_ARGUMENT,
+        "a message carrying the binding marker must carry exactly one well-formed token and nothing else like it",
+      );
+    }
+    const nonce = content.nonce;
     const now = this.#ports.nowMs();
     this.#prune(now);
     const challenge = this.#byNonce.get(nonce);
@@ -208,10 +246,16 @@ export class BuzzBindChallenges {
       this.#recordOnce(challenge, event, reasonCode, cause);
       return deny(reasonCode, message, { channel: "buzz" });
     };
-    if (challenge.consumedBy !== null) {
-      return challenge.consumedBy === event.id
-        ? refuse(ReasonCode.INGRESS_REPLAY_IGNORED, "event-replayed", "this binding event was already applied")
-        : refuse(ReasonCode.SESSION_BUZZ_ACTOR_NOT_AUTHENTICATED, "challenge-consumed", "the binding challenge was already used");
+    const consumed = challenge.consumed;
+    if (consumed !== null) {
+      if (consumed.eventId !== event.id) {
+        return refuse(ReasonCode.SESSION_BUZZ_ACTOR_NOT_AUTHENTICATED, "challenge-consumed", "the binding challenge was already used");
+      }
+      // The same event again. Only a binding the writer accepted is answered as already applied —
+      // the one answer the subscriber trusts with its cursor. A refused or unfinished write is
+      // answered with that refusal again, so a replay cannot turn it into durability.
+      if (!consumed.settlement.allowed) return consumed.settlement;
+      return refuse(ReasonCode.INGRESS_REPLAY_IGNORED, "event-replayed", "this binding event was already applied");
     }
     if (now > challenge.expiresAtMs) {
       return refuse(ReasonCode.SESSION_BUZZ_ACTOR_NOT_AUTHENTICATED, "challenge-expired", "the binding challenge expired");
@@ -244,13 +288,20 @@ export class BuzzBindChallenges {
       );
     }
 
-    challenge.consumedBy = event.id;
+    // Consumed before the writer runs, with a refusal standing in for its answer until it returns:
+    // a writer that throws leaves the nonce spent and its event answered as not bound.
+    const consumedNow = {
+      eventId: event.id,
+      settlement: deny(ReasonCode.CONFLICT, "the binding write for this event did not complete") as Decision<unknown>,
+    };
+    challenge.consumed = consumedNow;
     if (this.#pendingBySession.get(challenge.runtime.sessionId) === nonce) {
       this.#pendingBySession.delete(challenge.runtime.sessionId);
     }
     const possession: BuzzKeyPossession = Object.freeze({ runtime: challenge.runtime, buzzActorId: challenge.actor });
     POSSESSIONS.add(possession);
     const bound = this.#ports.bind(possession);
+    consumedNow.settlement = bound;
     if (!bound.allowed) this.#recordOnce(challenge, event, bound.reasonCode, "write-refused");
     return bound;
   }

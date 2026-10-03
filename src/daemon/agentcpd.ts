@@ -48,7 +48,7 @@ import {
 import { readProcessStartToken } from "../core/process-argv.ts";
 import { processStartedAt } from "../core/process-identity.ts";
 import { BuzzAdapter, BuzzCliTransport } from "../buzz/buzz-adapter.ts";
-import { BuzzBindChallenges } from "../buzz/buzz-bind-challenge.ts";
+import { BuzzBindChallenges, buzzBindContentOf } from "../buzz/buzz-bind-challenge.ts";
 import {
   BUZZ_MENTION_ADDRESSED_TO,
   BuzzMentionBindingUnavailableError,
@@ -1460,10 +1460,15 @@ export const startDaemonBuzzMentionSubscriber = (
   }
   const sink: BuzzMentionSink = {
     admit: async (request) => {
-      // A verified event carrying one binding token is the CEO's answer to its challenge: it goes to
-      // the binding, and never to admission, so it is not delivered as a message to anyone.
-      const bound = options.bindChallenges?.settle(request.event) ?? null;
-      if (bound !== null) return buzzMentionVerdictOf(bound);
+      // A verified event carrying the binding marker in any form goes to the binding, and never to
+      // admission, so it is not delivered as a message to anyone (ACP1055-01). Decided by the
+      // content, not by whether a store is wired: without one, such an event is refused outright.
+      if (buzzBindContentOf(request.event.content).kind !== "NONE") {
+        return buzzMentionVerdictOf(
+          options.bindChallenges?.settle(request.event) ??
+            deny(ReasonCode.INVALID_ARGUMENT, "this daemon serves no Buzz binding challenge"),
+        );
+      }
       const delivered = await deliverBuzzMessage(
         messageIngress.seam.ingress,
         messageIngress.seam.port,
