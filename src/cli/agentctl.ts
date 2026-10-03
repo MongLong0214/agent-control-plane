@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { createConnection } from "node:net";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 import { defaultConfig } from "../app/control-plane.ts";
 import { runAdoptedCeoAttachRelay, runAttachRelayCommand, type AttachRelayClaim } from "./attach-relay.ts";
@@ -868,7 +868,26 @@ const requiredInteger = (value: string | undefined, name: string, minimum: numbe
   return parsed;
 };
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+/**
+ * Whether this module is the process entrypoint, not merely importable from one.
+ *
+ * `import.meta.url` is always the realpath Node resolved the module through, but
+ * `process.argv[1]` is whatever path the caller passed — including a symlink, such as
+ * `<state root>/current` (#1052). Comparing the literal URL against a symlinked `argv[1]` never
+ * matches, so running this CLI through that link silently exits 0 having done nothing. Resolving
+ * both sides to their realpath keeps the check correct across symlinks; a path that cannot be
+ * resolved (missing, unreadable, a dangling link) is treated as "not main" rather than thrown.
+ */
+const isMainModule = (): boolean => {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]);
+  } catch {
+    return false;
+  }
+};
+
+if (isMainModule()) {
   void main(process.argv.slice(2))
     .then((code) => process.exit(code))
     .catch((err: unknown) => {
