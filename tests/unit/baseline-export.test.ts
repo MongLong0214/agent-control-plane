@@ -1071,6 +1071,7 @@ describe("baseline boundary contracts", () => {
       "v36-backfill-ingress-receipt-identities-before-freezing-claims",
       "v37-seed-claude-cli-executor-kind",
       "v38-canonical-verified-target-override",
+      "v39-owner-reply-intent-keeps-its-key",
     ]);
   });
 

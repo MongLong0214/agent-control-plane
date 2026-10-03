@@ -108,6 +108,9 @@ export class HermesReceiptPort implements ReceiptPort {
         receiptId: result.receiptId,
         evidenceDigest: result.evidenceDigest,
         reasonCode: ReasonCode.OK,
+        // The reply the owner is owed (#1036). The client has already refused a receipt whose
+        // content does not hash to `evidenceDigest`; the sender checks that again before it posts.
+        content: result.content,
         ...result.receiptIdentity,
       };
     }

@@ -1140,6 +1140,7 @@ const restoreV37Shape = (file: string): void => {
       DROP TRIGGER inbound_messages_override_authority_immutable;
       DROP TRIGGER inbound_messages_override_claim_authority;
       DROP TRIGGER canonical_turns_no_replace;
+      DROP TRIGGER inbound_messages_owner_reply_key_immutable;
       DROP INDEX canonical_turns_one_unresolved;
       DROP INDEX canonical_turns_one_unresolved_override;
       ALTER TABLE canonical_turns DROP COLUMN override_incumbent_turn_request_id;
@@ -1148,7 +1149,7 @@ const restoreV37Shape = (file: string): void => {
         ON canonical_turns(target_actor_id) WHERE lifecycle_state = 'IN_DOUBT';
       DROP TRIGGER schema_migrations_no_delete;
       DROP TRIGGER schema_migrations_insert_authority;
-      DELETE FROM schema_migrations WHERE version = 38;
+      DELETE FROM schema_migrations WHERE version >= 38;
       INSERT INTO schema_migrations (version, migration_id, checksum, applied_at)
         VALUES (37, 'bootstrap-v37', 'sha256:legacy', '2026-08-21T00:00:00.000Z');
       PRAGMA user_version = 37;
