@@ -3,9 +3,11 @@ import {
   chmodSync,
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -377,6 +379,10 @@ const plistPath = (harness: InstallerHarness): string =>
 
 const launcherPath = (harness: InstallerHarness): string =>
   join(harness.home, ".agent-control-plane", "agentcpd-launch.sh");
+
+/** The stable address external consumers (Hermes' mcp_servers, etc.) resolve the CLI through. */
+const currentLinkPath = (harness: InstallerHarness): string =>
+  join(harness.home, ".agent-control-plane", "current");
 
 /**
  * The launcher's PATH, as a single literal.
@@ -2323,6 +2329,103 @@ exit 0
       expect(existsSync(plistPath(harness))).toBe(true);
       expect(subcommands(harness.launchLog)).toEqual(["print", "print", "bootstrap", "kickstart"]);
     }).toThrow();
+  });
+
+  it("points current at the installed app root, then at a new one after upgrade", () => {
+    const harness = makeHarness();
+    const firstRoot = makeDisposableAppRoot();
+    expect(
+      runInstaller(installer, ["install", "--app-root", firstRoot, "--node", harness.node], harness).status,
+    ).toBe(0);
+    const link = currentLinkPath(harness);
+    expect(lstatSync(link).isSymbolicLink(), "current is not a symlink after install").toBe(true);
+    expect(readlinkSync(link)).toBe(firstRoot);
+
+    // A real deploy's upgrade names a new generation directory, not the one just installed.
+    const secondRoot = makeDisposableAppRoot();
+    expect(
+      runInstaller(installer, ["upgrade", "--app-root", secondRoot, "--node", harness.node], harness).status,
+    ).toBe(0);
+    expect(readlinkSync(link), "current was not repointed after upgrade").toBe(secondRoot);
+  });
+
+  it("does not repoint current when install fails before completing", () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    expect(runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status).toBe(
+      0,
+    );
+    const link = currentLinkPath(harness);
+    expect(readlinkSync(link)).toBe(appRoot);
+
+    // A Node path that cannot resolve fails resolve_node before anything else runs.
+    const failed = runInstaller(
+      installer,
+      ["upgrade", "--app-root", appRoot, "--node", join(harness.home, "no-such-node")],
+      harness,
+    );
+    expect(failed.status).not.toBe(0);
+    expect(readlinkSync(link), "current moved on a failed upgrade").toBe(appRoot);
+  });
+
+  it("points current at the generation a rollback restores", async () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    expect(runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status).toBe(
+      0,
+    );
+    const fixture = await sealPairFor(harness, appRoot);
+    const link = currentLinkPath(harness);
+    expect(readlinkSync(link)).toBe(appRoot);
+
+    // Simulate a later generation having moved current elsewhere, so the assertion below is about
+    // the rollback switching it back rather than it having never moved.
+    const decoyRoot = makeDisposableAppRoot();
+    rmSync(link);
+    symlinkSync(decoyRoot, link);
+    writeFileSync(harness.launchLog, "");
+
+    const rolledBack = runInstaller(
+      installer,
+      [
+        "rollback",
+        "--app-root",
+        appRoot,
+        "--node",
+        harness.node,
+        "--pair-id",
+        fixture.pair.pairId,
+        "--expected-index-digest",
+        fixture.pair.indexDigest,
+        ...structuralFlags(fixture),
+      ],
+      harness,
+    );
+
+    expect(rolledBack.status, rolledBack.stderr).toBe(0);
+    expect(readlinkSync(link), "rollback did not repoint current at the restored app root").toBe(appRoot);
+  });
+
+  it("refuses to replace an unsafe existing current rather than overwrite it", () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    const state = join(harness.home, ".agent-control-plane");
+    mkdirSync(state, { recursive: true, mode: 0o700 });
+    chmodSync(state, 0o700);
+    const link = currentLinkPath(harness);
+    // A plain directory at this name, not a symlink this installer ever wrote. The ownership
+    // check this guards is unreachable from this sandbox (no root to own a decoy as a different
+    // uid), but a non-symlinked directory exercises the same refusal: never overwrite a `current`
+    // this run did not create.
+    mkdirSync(link, { mode: 0o700 });
+    writeFileSync(join(link, "marker.txt"), "not an installer artifact\n", { mode: 0o600 });
+
+    const result = runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness);
+
+    expect(result.status, "install succeeded despite an unsafe existing current").not.toBe(0);
+    expect(result.stderr).toContain("refusing to replace a non-symlink");
+    expect(lstatSync(link).isSymbolicLink(), "the unsafe directory was replaced with a symlink").toBe(false);
+    expect(existsSync(join(link, "marker.txt")), "the pre-existing directory's contents were lost").toBe(true);
   });
 
   it("keeps the template as the only plist artifact in the tree", () => {

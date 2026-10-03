@@ -679,6 +679,40 @@ wait_for_stop() {
   fail "agentcpd lock remains after launchctl stop; refusing database restore"
 }
 
+# External consumers (an MCP client config, a launcher script that is not this one) need one
+# address for "the ACP CLI" that outlives any single generation — today they have to name
+# $state_dir/runtime/generation-<sha>/dist/... directly, which breaks on every deploy. This
+# repoints $state_dir/current at the app root an install, upgrade or rollback just finished with,
+# and is only ever called from a success path: never before the step it names has actually
+# happened, and never on a path this script is about to `fail` from.
+#
+# $state_dir is already required to be owned by this user, unlinked and mode 0700 before this can
+# run — install/upgrade enforce that through `private_directory`, rollback through
+# `assert_existing_private_directory`, both ahead of every call site below — so the directory the
+# link lives in is already trusted. What is not yet known is what this installer never wrote
+# there itself: a `current` left by something else. A non-symlink at that name, or a symlink this
+# user does not own, is refused outright rather than replaced; overwriting either would mean
+# taking over a name a different owner put there.
+update_current_link() {
+  local target="$1"
+  local current_link="$state_dir/current"
+  if [[ -e "$current_link" || -L "$current_link" ]]; then
+    [[ -L "$current_link" ]] || fail "refusing to replace a non-symlink at $current_link"
+    local owner
+    owner="$(stat -f '%u' "$current_link")"
+    [[ "$owner" == "$(id -u)" ]] ||
+      fail "$current_link is not owned by this user; refusing to replace it"
+  fi
+  # Staged under a throwaway name in the same directory, then renamed into place with `-h` so the
+  # rename replaces the symlink itself in one syscall rather than following it into a directory it
+  # points at. `ln -sf` directly onto $current_link would unlink the old target and then create the
+  # new one as two steps, with a window between them in which the name resolves to nothing.
+  local temporary="$state_dir/.current.$$.tmp"
+  rm -f -- "$temporary"
+  ln -s -- "$target" "$temporary" || fail "failed to stage the current symlink"
+  mv -hf -- "$temporary" "$current_link" || fail "failed to update $current_link"
+}
+
 case "$command_name" in
   install|upgrade)
     resolve_app_root
@@ -696,6 +730,10 @@ case "$command_name" in
     write_launcher
     render_plist
     if [[ "$no_start" == "0" ]]; then start_job; fi
+    # Repointed once every step above has happened, --no-start included: the generation's files
+    # are complete on disk at this point regardless of whether the job was started, and a
+    # consumer resolving through this link cares about which bytes are there, not about launchd.
+    update_current_link "$app_root"
     printf 'installed %s at %s (state: %s)\n' "$LABEL" "$plist_path" "$state_dir"
     ;;
   start)
@@ -805,6 +843,10 @@ case "$command_name" in
       fail "rollback failed; the previous generation and the original service state were restored"
     fi
     if [[ "$service_was_loaded" == "1" ]]; then start_job; fi
+    # $app_root is the directory applyRollbackPair just overwrote in place — its runtime root is
+    # resolved from --expect-runtime-root "$app_root/dist" above, and rollback never creates a new
+    # generation directory — so it is exactly what current should name now.
+    update_current_link "$app_root"
     applied_generation=""
     while IFS='=' read -r report_key report_value; do
       case "$report_key" in
