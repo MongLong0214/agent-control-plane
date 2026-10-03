@@ -89,12 +89,20 @@ import {
   type CeoTurnDelivery,
 } from "../ingress/buzz-message.ts";
 import {
+  configuredTelegramExternalConsumerConfig,
   configuredTelegramLongPollConfig,
   startTelegramLongPollListener,
   type TelegramBotTransport,
+  type TelegramExternalConsumerConfig,
   type TelegramLongPollStartOptions,
   type TelegramLongPollListener,
 } from "../ingress/telegram-polling.ts";
+import {
+  TELEGRAM_EXTERNAL_MAX_REQUEST_BYTES,
+  TELEGRAM_EXTERNAL_SOCKET_NAME,
+  TelegramExternalUpdateLane,
+  type TelegramExternalAnswer,
+} from "../ingress/telegram-external.ts";
 import type { TelegramDirectAnswer } from "../ingress/telegram-router.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
 import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
@@ -309,6 +317,13 @@ export interface LocalSessionLaunchChannel {
 /** A daemon-owned local hop from the authenticated Buzz relay to SessionRegistry. */
 export interface LocalBuzzActorIngress {
   socketPath: string;
+  close(): Promise<void>;
+}
+
+/** Hermes' local hop into the Telegram external-consumer lane (U4). */
+export interface LocalTelegramExternalIngress {
+  socketPath: string;
+  lane: TelegramExternalUpdateLane;
   close(): Promise<void>;
 }
 
@@ -769,6 +784,49 @@ export const startBuzzActorIngressListener = async (
 
   return {
     socketPath,
+    close: async () => {
+      await closeSocketServer(server);
+      try {
+        if (existsSync(socketPath)) unlinkSync(socketPath);
+      } catch {
+        /* closing the server already releases its socket; this is only cleanup */
+      }
+    },
+  };
+};
+
+/**
+ * Hermes' door into the Telegram external-consumer lane (U4): `telegram-update.ingress.sock` in the
+ * daemon's owner-only state directory, created and permissioned like the Buzz ingress sockets.
+ *
+ * The socket is authenticated by the shared secret inside each envelope, which
+ * `TelegramIngress.admit` compares; the file mode keeps every other uid off it. One envelope per
+ * connection, bounded in size and time, one answer, then the connection is closed.
+ */
+export const startTelegramExternalIngress = async (
+  cp: ControlPlane,
+  stateDir: string,
+  config: TelegramExternalConsumerConfig,
+  options: { reconcileBudgetMs?: number } = {},
+): Promise<LocalTelegramExternalIngress> => {
+  const lane = new TelegramExternalUpdateLane(cp, config, options);
+  const socketPath = join(stateDir, TELEGRAM_EXTERNAL_SOCKET_NAME);
+  removeStaleSocket(socketPath);
+  const server = createServer((socket) => {
+    trackConnection(server, socket);
+    serveTelegramExternalUpdate(socket, lane);
+  });
+
+  try {
+    await listenSocket(server, socketPath);
+  } catch (err) {
+    if (existsSync(socketPath)) unlinkSync(socketPath);
+    throw err;
+  }
+
+  return {
+    socketPath,
+    lane,
     close: async () => {
       await closeSocketServer(server);
       try {
@@ -1596,6 +1654,24 @@ const configuredHermesAdoptionValues = (configuration: Readonly<Record<string, s
     /^[\x21-\x7e]+$/.test(values.ACP_HERMES_GATEWAY_API_KEY ?? "") ? values : null;
 };
 
+/**
+ * The daemon's receipt port (U4, A2): the Hermes Gateway's own receipt store for Telegram turns,
+ * read with the Gateway key the daemon already holds for the identity readback.
+ *
+ * Only the key decides. Without it the coordinator keeps `NEVER_FOUND_RECEIPT_PORT`, the dark
+ * default, and a configuration that already names a receipt port keeps the one it names. The port
+ * is not asked for anything until a turn is in doubt.
+ */
+export const withConfiguredHermesGatewayReceipt = (
+  config: ControlPlaneConfig,
+  environment: Readonly<Record<string, string | undefined>>,
+): ControlPlaneConfig => {
+  const apiKey = environment["ACP_HERMES_GATEWAY_API_KEY"];
+  if (config.hermesReceipt || config.hermesGatewayReceipt) return config;
+  if (typeof apiKey !== "string" || !/^[\x21-\x7e]+$/.test(apiKey)) return config;
+  return { ...config, hermesGatewayReceipt: { apiKey } };
+};
+
 /** A configured route must never revert to the independently attached MCP peer. */
 export const createConfiguredHermesGatewayConversation = (
   cp: ControlPlane,
@@ -2347,6 +2423,55 @@ const launchExternalSessionId = (value: unknown): string | null => {
   return typeof externalSessionId === "string" && externalSessionId.length > 0
     ? externalSessionId
     : null;
+};
+
+/**
+ * One Telegram update envelope per connection, answered once.
+ *
+ * The answer to a new turn is written by the lane from inside the coordinator's dispatch, after the
+ * turn and its dispatch row are committed; `respond` is idempotent so a late error after that write
+ * cannot add a second line. A peer that sends nothing complete within the handshake budget, more
+ * than the request bound, more than one line or something that is not JSON is refused without
+ * reaching the lane.
+ */
+const serveTelegramExternalUpdate = (socket: Socket, lane: TelegramExternalUpdateLane): void => {
+  let answered = false;
+  let frame: { dispose(): void } | null = null;
+  const respond = (answer: TelegramExternalAnswer): void => {
+    if (answered) return;
+    answered = true;
+    clearTimeout(deadline);
+    frame?.dispose();
+    if (!socket.destroyed) socket.end(`${JSON.stringify(answer)}\n`);
+  };
+  const refuse = (decision: Decision<unknown>): void => {
+    if (!decision.allowed) respond({ allowed: false, reasonCode: decision.reasonCode, message: decision.message });
+  };
+  const deadline = setTimeout(() => {
+    refuse(deny(ReasonCode.INVALID_ARGUMENT, "Telegram update ingress received no complete envelope"));
+  }, DEFAULT_MCP_HANDSHAKE_TIMEOUT_MS);
+  deadline.unref();
+  socket.on("error", () => {
+    answered = true;
+    clearTimeout(deadline);
+    frame?.dispose();
+  });
+  frame = readOneJsonLineRequest(
+    socket,
+    {
+      tooLarge: "Telegram update envelope exceeds the request bound",
+      multipleRequests: "Telegram update ingress accepts one envelope per connection",
+      notJson: "Telegram update envelope is not JSON",
+    },
+    (value) => {
+      clearTimeout(deadline);
+      void lane.handle(value, respond).catch((error: unknown) => {
+        refuse(deny(ReasonCode.INTERNAL_ERROR, error instanceof Error ? error.message : String(error)));
+      });
+    },
+    refuse,
+    TELEGRAM_EXTERNAL_MAX_REQUEST_BYTES,
+  );
 };
 
 const serveBuzzActorBinding = (socket: Socket, ingress: BuzzActorIngress): void => {
@@ -3692,7 +3817,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     throw new Error("ACP_BUZZ_CHANNEL is required once canonical self-claim activation is fully configured");
   }
 
-  const config = options.config ?? defaultConfig();
+  // A2: the Gateway key the daemon holds for identity reads also reads the Gateway's Telegram turn
+  // receipts. Without it the coordinator keeps its dark default.
+  const config = withConfiguredHermesGatewayReceipt(options.config ?? defaultConfig(), process.env);
   const stateDir = dirname(config.databasePath);
   const buzzActorIngressPolicy = configuredBuzzActorIngressPolicy();
   if (process.env["BUZZ_PRIVATE_KEY"] && !buzzActorIngressPolicy) {
@@ -3720,6 +3847,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   const hermesAdoptionConfiguration = Object.fromEntries(
     HERMES_ADOPTION_VARS.map((key) => [key, process.env[key]]),
   ) as Record<(typeof HERMES_ADOPTION_VARS)[number], string | undefined>;
+  // Both parsers refuse `ACP_TELEGRAM_EXTERNAL_CONSUMER=hermes` beside a bot token, here, before the
+  // control plane or any listener exists. In that mode the long-poll parser answers null.
+  const telegramExternalConfig = configuredTelegramExternalConsumerConfig(config.ownerIdentities ?? []);
   const telegramConfig = configuredTelegramLongPollConfig(config.ownerIdentities ?? []);
   const cp = new ControlPlane(config);
 
@@ -3842,6 +3972,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   let hermesAutoAdoptionTimer: NodeJS.Timeout | null = null;
   let hermesBootstrap: HermesBootstrapAuthority | null = null;
   let telegram: TelegramLongPollListener | null = null;
+  let telegramExternal: LocalTelegramExternalIngress | null = null;
   let startCompleted = false;
 
   let shuttingDown: Promise<void> | null = null;
@@ -3855,6 +3986,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     process.stdout.write(`\nshutting down on ${signal}\n`);
     if (hermesAutoAdoptionTimer) clearInterval(hermesAutoAdoptionTimer);
     await telegram?.close();
+    await telegramExternal?.close();
     buzzMentionSubscriber?.close();
     await buzzMessageIngress?.close();
     await buzzActorIngress?.close();
@@ -4092,6 +4224,15 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         );
       }
     }
+    if (telegramExternalConfig) {
+      // U4: Hermes polls Telegram; ACP only admits, claims and dispatches what Hermes hands it.
+      telegramExternal = await startTelegramExternalIngress(cp, stateDir, telegramExternalConfig);
+      process.stdout.write("Telegram external consumer lane started for hermes\n");
+    } else if (process.env["ACP_TELEGRAM_EXTERNAL_CONSUMER"]?.trim()) {
+      process.stdout.write(
+        "Telegram external consumer lane not started: ACP_TELEGRAM_EXTERNAL_SECRET is not configured\n",
+      );
+    }
     if (telegramConfig) {
       const telegramStartOptions = options.telegramStartOptions ?? {};
       const ceoConversation = listeners.ceoConversation;
@@ -4121,6 +4262,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   } catch (err) {
     if (hermesAutoAdoptionTimer) clearInterval(hermesAutoAdoptionTimer);
     await telegram?.close();
+    await telegramExternal?.close();
     // Both Buzz listeners, which this teardown used to walk past: a startup that failed after
     // one of them bound left its socket file behind for the next daemon to find. The relay
     // subscriber joins them for the same reason: it holds outbound sockets, and a startup that

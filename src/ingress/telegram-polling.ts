@@ -408,6 +408,10 @@ export const configuredTelegramLongPollConfig = (
   ownerIdentities: readonly OwnerIdentity[],
   environment: NodeJS.ProcessEnv = process.env,
 ): TelegramLongPollConfig | null => {
+  // Hermes is the only Telegram consumer in this mode, so ACP polls nothing. Checked before the
+  // partial-configuration rule below, which would otherwise read the owner and chat ids the
+  // external lane needs, with no bot token beside them, as a long-poll deployment missing its token.
+  if (externalTelegramConsumerRequested(environment)) return null;
   const botToken = configuredValue(environment, "ACP_TELEGRAM_BOT_TOKEN");
   const ownerRaw = configuredValue(environment, "ACP_TELEGRAM_OWNER_ID", "ACP_TELEGRAM_ALLOWED_OWNER_IDS");
   const chatRaw = configuredValue(environment, "ACP_TELEGRAM_CHAT_ID", "ACP_TELEGRAM_ALLOWED_CHAT_IDS");
@@ -430,37 +434,7 @@ export const configuredTelegramLongPollConfig = (
     );
   }
 
-  const ownerValues = splitConfig(ownerRaw);
-  for (const owner of ownerValues) {
-    if (!isPositiveTelegramId(owner)) fail(
-      ReasonCode.DAEMON_STARTUP_FAILED,
-      `Telegram owner id is not a positive numeric id: ${owner}`,
-      { field: "ACP_TELEGRAM_OWNER_ID", value: owner },
-    );
-  }
-
-  const chatValues = splitConfig(chatRaw);
-  for (const chat of chatValues) {
-    if (!isTelegramId(chat)) fail(
-      ReasonCode.DAEMON_STARTUP_FAILED,
-      `Telegram chat id is not numeric: ${chat}`,
-      { field: "ACP_TELEGRAM_CHAT_ID", value: chat },
-    );
-  }
-
-  const declaredOwners = new Set(
-    ownerIdentities
-      .filter((identity) => identity.channel === "telegram")
-      .map((identity) => identity.actor),
-  );
-  const undeclared = ownerValues.filter((owner) => !declaredOwners.has(owner));
-  if (undeclared.length > 0) {
-    fail(
-      ReasonCode.DAEMON_STARTUP_FAILED,
-      `Telegram owner id(s) are not declared in owner-identities: ${undeclared.join(", ")}`,
-      { undeclared },
-    );
-  }
+  const { ownerValues, chatValues } = validatedTelegramAllowlists(ownerRaw, chatRaw, ownerIdentities);
 
   const pollTimeoutSeconds = parseBoundedInteger(
     environment["ACP_TELEGRAM_POLL_TIMEOUT_SECONDS"],
@@ -497,6 +471,126 @@ export const configuredTelegramLongPollConfig = (
     ...(apiBaseUrl ? { apiBaseUrl } : {}),
     ...(transportRetentionMs !== undefined ? { transportRetentionMs } : {}),
   };
+};
+
+/**
+ * The deployment facts the external-consumer lane (U4, `telegram-external.ts`) runs on.
+ *
+ * Hermes polls the bot and is the only process that does. ACP holds no bot token in this mode and
+ * opens no connection to Telegram; Hermes hands each owner update to ACP's local socket and runs
+ * the turn only once ACP has claimed and dispatched it.
+ */
+export interface TelegramExternalConsumerConfig {
+  consumer: "hermes";
+  /** `ACP_TELEGRAM_OWNER_ID` / `ACP_TELEGRAM_ALLOWED_OWNER_IDS`, each declared in owner-identities. */
+  allowedOwnerIds: readonly string[];
+  /** `ACP_TELEGRAM_CHAT_ID` / `ACP_TELEGRAM_ALLOWED_CHAT_IDS`. */
+  allowedChatIds: readonly string[];
+  /** `ACP_TELEGRAM_EXTERNAL_SECRET`, the value Hermes presents with every update. */
+  sharedSecret: string;
+}
+
+/**
+ * Reads the external-consumer lane's configuration, or null when this deployment has no lane.
+ *
+ * The lane exists only when `ACP_TELEGRAM_EXTERNAL_CONSUMER=hermes` and `ACP_TELEGRAM_EXTERNAL_SECRET`
+ * are both set. The secret is an optional Keychain item, so a deployment that has the flag and not
+ * yet the secret starts without the lane rather than refusing. Once both are present, the owner and
+ * chat allowlists are required and checked exactly as the long-poll path checks them: owners are
+ * positive numeric ids declared as `telegram:<id>` in owner-identities, chats are numeric ids.
+ *
+ * Startup refuses when the flag is set beside `ACP_TELEGRAM_BOT_TOKEN`: one bot has one
+ * `getUpdates` consumer, and in this mode that consumer is Hermes.
+ */
+export const configuredTelegramExternalConsumerConfig = (
+  ownerIdentities: readonly OwnerIdentity[],
+  environment: NodeJS.ProcessEnv = process.env,
+): TelegramExternalConsumerConfig | null => {
+  if (!externalTelegramConsumerRequested(environment)) return null;
+  const sharedSecret = configuredValue(environment, "ACP_TELEGRAM_EXTERNAL_SECRET");
+  if (!sharedSecret) return null;
+  const ownerRaw = configuredValue(environment, "ACP_TELEGRAM_OWNER_ID", "ACP_TELEGRAM_ALLOWED_OWNER_IDS");
+  const chatRaw = configuredValue(environment, "ACP_TELEGRAM_CHAT_ID", "ACP_TELEGRAM_ALLOWED_CHAT_IDS");
+  const missing: string[] = [];
+  if (splitConfig(ownerRaw).length === 0) missing.push("ACP_TELEGRAM_OWNER_ID or ACP_TELEGRAM_ALLOWED_OWNER_IDS");
+  if (splitConfig(chatRaw).length === 0) missing.push("ACP_TELEGRAM_CHAT_ID or ACP_TELEGRAM_ALLOWED_CHAT_IDS");
+  if (missing.length > 0) {
+    fail(
+      ReasonCode.DAEMON_STARTUP_FAILED,
+      `Telegram external consumer configuration is partial; missing ${missing.join(", ")}`,
+      { missing },
+    );
+  }
+  const { ownerValues, chatValues } = validatedTelegramAllowlists(ownerRaw, chatRaw, ownerIdentities);
+  return { consumer: "hermes", allowedOwnerIds: ownerValues, allowedChatIds: chatValues, sharedSecret };
+};
+
+/**
+ * Whether `ACP_TELEGRAM_EXTERNAL_CONSUMER` hands Telegram to Hermes, refusing the two settings that
+ * contradict it. Both parsers ask this first, so neither can start a poller in this mode.
+ *
+ * Neither refusal quotes a value: the flag is not a secret, but the token beside it is, and the
+ * message names variables only, as every other startup refusal here does.
+ */
+const externalTelegramConsumerRequested = (environment: NodeJS.ProcessEnv): boolean => {
+  const consumer = configuredValue(environment, "ACP_TELEGRAM_EXTERNAL_CONSUMER");
+  if (!consumer) return false;
+  if (consumer !== "hermes") {
+    fail(
+      ReasonCode.DAEMON_STARTUP_FAILED,
+      "ACP_TELEGRAM_EXTERNAL_CONSUMER names a consumer this build does not know; the only accepted value is hermes",
+      { field: "ACP_TELEGRAM_EXTERNAL_CONSUMER" },
+    );
+  }
+  if (configuredValue(environment, "ACP_TELEGRAM_BOT_TOKEN")) {
+    fail(
+      ReasonCode.DAEMON_STARTUP_FAILED,
+      "ACP_TELEGRAM_EXTERNAL_CONSUMER=hermes and ACP_TELEGRAM_BOT_TOKEN are both set; Hermes is the only " +
+        "Telegram consumer in this mode, so ACP must hold no bot token",
+      { configuredVariables: ["ACP_TELEGRAM_EXTERNAL_CONSUMER", "ACP_TELEGRAM_BOT_TOKEN"] },
+    );
+  }
+  return true;
+};
+
+/** The owner and chat allowlists, checked the same way for both Telegram modes. */
+const validatedTelegramAllowlists = (
+  ownerRaw: string,
+  chatRaw: string,
+  ownerIdentities: readonly OwnerIdentity[],
+): { ownerValues: string[]; chatValues: string[] } => {
+  const ownerValues = splitConfig(ownerRaw);
+  for (const owner of ownerValues) {
+    if (!isPositiveTelegramId(owner)) fail(
+      ReasonCode.DAEMON_STARTUP_FAILED,
+      `Telegram owner id is not a positive numeric id: ${owner}`,
+      { field: "ACP_TELEGRAM_OWNER_ID", value: owner },
+    );
+  }
+
+  const chatValues = splitConfig(chatRaw);
+  for (const chat of chatValues) {
+    if (!isTelegramId(chat)) fail(
+      ReasonCode.DAEMON_STARTUP_FAILED,
+      `Telegram chat id is not numeric: ${chat}`,
+      { field: "ACP_TELEGRAM_CHAT_ID", value: chat },
+    );
+  }
+
+  const declaredOwners = new Set(
+    ownerIdentities
+      .filter((identity) => identity.channel === "telegram")
+      .map((identity) => identity.actor),
+  );
+  const undeclared = ownerValues.filter((owner) => !declaredOwners.has(owner));
+  if (undeclared.length > 0) {
+    fail(
+      ReasonCode.DAEMON_STARTUP_FAILED,
+      `Telegram owner id(s) are not declared in owner-identities: ${undeclared.join(", ")}`,
+      { undeclared },
+    );
+  }
+  return { ownerValues, chatValues };
 };
 
 /** The endpoint #673's ~24h `getUpdates` retention figure was actually measured against. */
@@ -1237,10 +1331,16 @@ export class TelegramLongPollService {
  * Builds a receipt lookup only from the verified target proof that was live while the claim is
  * admitted. A restart reads the immutable tuple from the claim; this callback never upgrades an
  * old claim to a new target.
+ *
+ * Exported for the external-consumer lane (`telegram-external.ts`, U4). `canonicalTurnTarget`
+ * refuses whenever more than one actor holds a current attestation, and a live deployment has the
+ * Hermes CEO beside several `PRIMARY_CTO` sessions, so that resolver names nothing there. This one
+ * asks only for the CEO role's own Hermes target, which is the one the lane claims for. It reads
+ * only the turn id and prompt digest from `identity`, so that is all it asks for.
  */
-const receiptIdentityForCurrentHermesCeo = (
+export const receiptIdentityForCurrentHermesCeo = (
   cp: ControlPlane,
-  identity: TurnIdentity,
+  identity: Pick<TurnIdentity, "turnRequestId" | "promptDigest">,
 ): ReceiptLookupQuery | null => {
   const roleKey = roleKeyFor(Role.CEO);
   const binding = cp.bindings.active(roleKey);
@@ -1950,6 +2050,8 @@ const TELEGRAM_ENVIRONMENT_VARIABLES = [
   "ACP_TELEGRAM_API_BASE_URL",
   "ACP_TELEGRAM_TRANSPORT_RETENTION_MS",
 ] as const;
+// `ACP_TELEGRAM_EXTERNAL_CONSUMER` and `ACP_TELEGRAM_EXTERNAL_SECRET` are deliberately not in this
+// list. It decides whether a long-poll deployment is partial, and the external lane is not one.
 
 const configuredValue = (
   environment: NodeJS.ProcessEnv,

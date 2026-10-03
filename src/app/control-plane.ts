@@ -42,6 +42,11 @@ import {
   type ReviewerEgressConfig,
 } from "../runtime/provider.ts";
 import { HermesReceiptPort, type HermesReceiptPortOptions } from "../runtime/hermes-receipt-port.ts";
+import {
+  HermesGatewayReceiptPort,
+  telegramTurnSource,
+  type HermesGatewayReceiptPortOptions,
+} from "../runtime/hermes-gateway-receipt-port.ts";
 import { BindingRegistry } from "../session/binding-registry.ts";
 import { SessionRegistry } from "../session/session-registry.ts";
 import { Telemetry } from "../telemetry/telemetry.ts";
@@ -88,6 +93,13 @@ export interface ControlPlaneConfig {
    * keeps returning `found: false` until a deployment names this bounded endpoint.
    */
   hermesReceipt?: HermesReceiptPortOptions;
+  /**
+   * The Hermes Gateway's own receipt store for Telegram turns (U4), read over its loopback API with
+   * the daemon's Gateway key. The daemon sets it when `ACP_HERMES_GATEWAY_API_KEY` is configured
+   * (`withConfiguredHermesGatewayReceipt`). One coordinator has one receipt port, so this and
+   * `hermesReceipt` together are refused.
+   */
+  hermesGatewayReceipt?: HermesGatewayReceiptPortOptions;
   ctoPreference?: CtoPreference;
   reviewer?: { preferred: ReviewerPreference; fallbacks: ReviewerPreference[] };
   capacity?: CapacityOptions;
@@ -410,19 +422,29 @@ export class ControlPlane {
     // hands back exactly what this attempt took.
     try {
       this.audit = new AuditLog(this.db, this.clock);
-      // A production deployment is dark unless it explicitly supplies its bounded Hermes ACP
-      // endpoint. The resolver is a closure because this coordinator must claim its singular
-      // materialization authority before request-facing registries are assembled; it is not called
-      // until a later reconciliation, after `bindings` has been constructed below.
-      const receiptPort = config.hermesReceipt
-        ? new HermesReceiptPort(
-            {
-              historicalHermesTargetBindReceipt: (input) =>
-                this.bindings.historicalHermesTargetBindReceipt(input),
-            },
-            config.hermesReceipt,
+      // A production deployment is dark unless it explicitly supplies a bounded Hermes receipt
+      // endpoint: the Gateway's loopback receipt store (U4) or the `hermes acp` status call. The
+      // resolvers are closures because this coordinator must claim its singular materialization
+      // authority before request-facing registries are assembled; neither is called until a later
+      // reconciliation, after `bindings` has been constructed below.
+      if (config.hermesReceipt && config.hermesGatewayReceipt) {
+        throw new Error("configure one Hermes receipt port: hermesReceipt or hermesGatewayReceipt, not both");
+      }
+      const db = this.db;
+      const receiptPort = config.hermesGatewayReceipt
+        ? new HermesGatewayReceiptPort(
+            (turnRequestId) => telegramTurnSource(db, turnRequestId),
+            config.hermesGatewayReceipt,
           )
-        : NEVER_FOUND_RECEIPT_PORT;
+        : config.hermesReceipt
+          ? new HermesReceiptPort(
+              {
+                historicalHermesTargetBindReceipt: (input) =>
+                  this.bindings.historicalHermesTargetBindReceipt(input),
+              },
+              config.hermesReceipt,
+            )
+          : NEVER_FOUND_RECEIPT_PORT;
       this.conversation = new ConversationTurnCoordinator(
         this.db,
         this.clock,
