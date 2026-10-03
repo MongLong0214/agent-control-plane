@@ -1538,16 +1538,14 @@ export const createConfiguredHermesGatewayConversation = (
     const startToken = (ports.processStartToken ?? readProcessStartToken)(session.osPid);
     if (!startToken || (ports.authorityHeld && !ports.authorityHeld())) return null;
     // #1037 R1: the lstart compare above has one-second grain. The tool admission's own rule
-    // decides whether the live process is the recorded one: exact against a pinned native start,
-    // and for an unpinned legacy row only where its lstart is one instant and the row was written
-    // after that second — anything else is refused rather than delivered to (review PR1046-R1,
-    // round 2). Falling back to the live token when no pin exists was dropped rather than kept:
-    // it compared the live process with itself.
+    // decides whether the live process is the recorded one, exactly: the live token equals the
+    // native start pinned for the row, or nothing is delivered. A row with no pin is refused here
+    // as it is there; the lstart rule that once decided an unpinned row is deleted (see
+    // `recordedStartIsLive`). Falling back to the live token when no pin exists was dropped rather
+    // than kept: it compared the live process with itself.
     const recordedStart = recordedStartIsLive(
-      { sessionId: session.sessionId, osProcessStartedAt: session.osProcessStartedAt, createdAt: session.createdAt },
-      session.osPid,
+      { sessionId: session.sessionId, osProcessStartedAt: session.osProcessStartedAt },
       startToken,
-      { startedAt: ports.processStartedAt ?? processStartedAt },
       cp.sessions,
     );
     if (!recordedStart.allowed) return null;

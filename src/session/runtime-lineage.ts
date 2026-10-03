@@ -2,7 +2,6 @@ import { execFileSync } from "node:child_process";
 
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { readProcessStartToken } from "../core/process-argv.ts";
-import { lstartSecondStartMs, processStartedAt } from "../core/process-identity.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /**
@@ -27,10 +26,8 @@ const MAX_ANCESTRY_HOPS = 64;
 /** What this check reads about processes. Injected so a test can state a process tree. */
 export interface ProcessLineageReader {
   parentOf(pid: number): number | null;
-  /** Native start token (`darwin-tv:sec.usec`): the exact form. */
+  /** Native start token (`darwin-tv:sec.usec`): the exact form, and the only one compared. */
   startToken(pid: number): string | null;
-  /** `ps -o lstart=`: the form `SessionRegistry.create` records when not handed a verified pair. */
-  startedAt(pid: number): string | null;
 }
 
 /**
@@ -54,7 +51,6 @@ const parentPid = (pid: number): number | null => {
 export const defaultProcessLineageReader: ProcessLineageReader = {
   parentOf: parentPid,
   startToken: readProcessStartToken,
-  startedAt: processStartedAt,
 };
 
 /**
@@ -85,75 +81,57 @@ export interface RuntimeLineage {
   startToken: string;
   /** The admitted row, for a consumer that acts as it. */
   runtime: AdmittedRuntime;
-  /**
-   * The native token to pin for a legacy row this admission decided, or null. Not written here:
-   * the caller pins it with `pinNativeStart` once every check of its own admission has passed, so
-   * an admission refused after this point leaves nothing behind (review PR1046-R4). Writing it
-   * here, as this function first did, was rejected rather than kept: a refusal that came later
-   * left a pin row for a process the admission never accepted.
-   */
-  pinToRecord: string | null;
 }
 
 /**
- * A durable, write-once record of the native start a runtime row's process was admitted with
- * (#1037). `SessionRegistry` keeps it; this module only reads it and asks for it to be written.
+ * The durable, write-once native start pinned for a runtime row's process when it was created or
+ * adopted. `SessionRegistry` keeps it; this module only reads it, and no admission writes one.
  */
 export interface NativeStartPins {
   pinnedNativeStart(sessionId: string): string | null;
-  pinNativeStart(sessionId: string, startToken: string): void;
 }
 
 const refuse = (message: string): Decision<RuntimeLineage> => deny(ReasonCode.CONFLICT, message, {});
 
 /**
- * Is the live process at the row's pid the one the row recorded? Returns the native token to pin
- * when the answer was decided from a legacy record, or null when nothing needs pinning. It writes
- * nothing: the caller pins only once its whole admission holds (review PR1046-R4).
- *
- * Three cases, exact wherever exact is possible:
+ * Is the live process at the row's pid the one the row recorded? Exact or refused, in two cases:
  *
  *   - the row recorded the native token (the canonical claim does): equal, or not this process;
- *   - the row's process has a pinned native token: equal to it, or not this process;
- *   - neither — a row that recorded only `ps` lstart, as incumbent adoption did until #1037. Its
- *     one-second grain cannot tell two processes started in the same second apart, so a matching
- *     lstart is decisive only when the row was written after that second ended: the recorded
- *     process was alive then, so any process that replaced it started later, in a later second,
- *     and renders a different lstart. Then the live token is pinned and compared exactly from then
- *     on. A row written inside its own process's start second is ambiguous and is refused, and so is
- *     an lstart whose local time is not exactly one instant (`lstartSecondStartMs`).
+ *   - the row recorded `ps` lstart (incumbent adoption, and every row `create()` writes without a
+ *     verified pair) and the token pinned beside it: equal to the pin, or not this process.
  *
- * Exported for the Gateway delivery authority, which asks the same question of the same row.
+ * A row with neither — lstart and no pin — is refused, whatever its lstart says. The lstart rule
+ * that decided such a row once (written after its start second, then pinned) is deleted rather
+ * than narrowed to the adopted CEO row that relied on it. The decision that reviewed it (efb9dbd0)
+ * allowed keeping it for that one row only, and the row's process ended with the Gateway redeploy
+ * of 2026-10-03, so the stricter option was taken. The risk that rule carried — a pid reused
+ * inside the same second, which no lstart can see — went with it: the path is deleted, not made
+ * safe. A runtime refused for want of a pin is re-adopted, and adoption pins the exact token.
+ *
+ * The pin is compared exactly whoever wrote it. The unread-capacity keep (#1045) still pins an
+ * lstart row by its own lstart rule, and a row it pinned is admitted here on that pin.
+ *
+ * Writes nothing. Exported for the Gateway delivery authority, which asks the same question of
+ * the same row.
  */
 export const recordedStartIsLive = (
-  runtime: { sessionId: string; osProcessStartedAt: string; createdAt: string },
-  pid: number,
+  runtime: { sessionId: string; osProcessStartedAt: string },
   startToken: string,
-  processes: Pick<ProcessLineageReader, "startedAt">,
   pins: Pick<NativeStartPins, "pinnedNativeStart">,
-): Decision<string | null> => {
-  const notThis = (): Decision<string | null> =>
-    deny(ReasonCode.CONFLICT, "the runtime's pid now belongs to another process", {});
+): Decision<null> => {
   if (runtime.osProcessStartedAt === startToken) return allow(ReasonCode.OK, null);
   const pinned = pins.pinnedNativeStart(runtime.sessionId);
-  if (pinned !== null) return pinned === startToken ? allow(ReasonCode.OK, null) : notThis();
-  if (runtime.osProcessStartedAt !== processes.startedAt(pid)) return notThis();
-  const started = lstartSecondStartMs(runtime.osProcessStartedAt);
-  if (started === null) {
+  if (pinned === null) {
     return deny(
       ReasonCode.CONFLICT,
-      "the runtime row's lstart is not exactly one instant in this zone, so it cannot identify a process",
+      "the runtime row has no exact start to compare: it recorded no native start and none is pinned for it",
       {},
     );
   }
-  if (Date.parse(runtime.createdAt) < started + 1000) {
-    return deny(
-      ReasonCode.CONFLICT,
-      "the runtime row was written inside its process's start second, so its lstart cannot tell that process from a successor",
-      {},
-    );
+  if (pinned !== startToken) {
+    return deny(ReasonCode.CONFLICT, "the runtime's pid now belongs to another process", {});
   }
-  return allow(ReasonCode.OK, startToken);
+  return allow(ReasonCode.OK, null);
 };
 
 /**
@@ -161,9 +139,7 @@ export const recordedStartIsLive = (
  * ancestor of the peer. The peer itself is never its own proof.
  *
  * "Alive as recorded" is `recordedStartIsLive`: an exact native-token comparison, against the row
- * or against the token pinned for it, and for a legacy lstart-only row the one case where lstart is
- * decisive — reported back as `pinToRecord` for the caller to pin, so the next admission is exact.
- * Nothing here writes.
+ * or against the token pinned for it, and nothing else. Nothing here writes.
  */
 export const admitRuntimeLineage = (
   peerPid: number,
@@ -172,7 +148,6 @@ export const admitRuntimeLineage = (
     incarnation: string;
     osPid: number | null;
     osProcessStartedAt: string | null;
-    createdAt: string;
   },
   processes: ProcessLineageReader,
   pins: Pick<NativeStartPins, "pinnedNativeStart">,
@@ -183,13 +158,7 @@ export const admitRuntimeLineage = (
   if (recorded === null) return refuse("the runtime recorded no process start");
   const startToken = processes.startToken(pid);
   if (startToken === null) return refuse("the runtime's process is not running");
-  const live = recordedStartIsLive(
-    { sessionId: runtime.sessionId, osProcessStartedAt: recorded, createdAt: runtime.createdAt },
-    pid,
-    startToken,
-    processes,
-    pins,
-  );
+  const live = recordedStartIsLive({ sessionId: runtime.sessionId, osProcessStartedAt: recorded }, startToken, pins);
   if (!live.allowed) return live as Decision<RuntimeLineage>;
 
   const visited = new Set<number>([peerPid]);
@@ -202,7 +171,7 @@ export const admitRuntimeLineage = (
         sessionIncarnation: runtime.incarnation,
       });
       ADMITTED_RUNTIMES.add(admitted);
-      return allow(ReasonCode.OK, { pid, startToken, runtime: admitted, pinToRecord: live.value });
+      return allow(ReasonCode.OK, { pid, startToken, runtime: admitted });
     }
     if (current <= 1) break;
     if (visited.has(current)) break;

@@ -66,6 +66,19 @@ describe("canonical CTO reattach — admitted", () => {
   });
 });
 
+describe("canonical CTO reattach — an lstart row is admitted only on its pin", () => {
+  it("admits a CTO row that recorded lstart, on the native start pinned beside it at launch", () => {
+    const subject = fixture();
+    expect(subject.h.cp.bindings.revoke(CTO, "rebound on a pinned row").allowed).toBe(true);
+    const pinned = subject.bindTo(CLAUDE, "Tue Aug 11 09:00:00 2026");
+    subject.h.cp.sessions.pinNativeStart(pinned, CLAUDE_TOKEN);
+    const before = snapshot(subject.h);
+    const decision = subject.reattach().admit({ peerPid: RELAY, uid: 501 });
+    expect(decision).toMatchObject({ allowed: true, value: { sessionId: pinned, bindingGeneration: 2 } });
+    expect(snapshot(subject.h)).toEqual(before);
+  });
+});
+
 describe("canonical CTO reattach — refusals write nothing", () => {
   it("refuses another claude process running the same conversation", () => {
     const subject = fixture();
@@ -92,6 +105,24 @@ describe("canonical CTO reattach — refusals write nothing", () => {
     const subject = fixture();
     expect(subject.h.cp.bindings.revoke(CTO, "moved to another runtime").allowed).toBe(true);
     subject.bindTo(OTHER_CLAUDE, CLAUDE_TOKEN);
+    expectUnbound(subject);
+  });
+
+  it("refuses a CTO row that recorded only `ps` lstart and has no native start pinned beside it", () => {
+    const subject = fixture();
+    expect(subject.h.cp.bindings.revoke(CTO, "rebound on a legacy row").allowed).toBe(true);
+    // The live claude is the right process at the right pid, and the row was written the day after
+    // the lstart it recorded; the row still cannot say exactly which process it means.
+    const legacy = subject.bindTo(CLAUDE, "Tue Aug 11 09:00:00 2026");
+    expectUnbound(subject);
+    expect(subject.h.cp.sessions.pinnedNativeStart(legacy)).toBeNull();
+  });
+
+  it("refuses a CTO row whose pinned native start is not the live one", () => {
+    const subject = fixture();
+    expect(subject.h.cp.bindings.revoke(CTO, "rebound on a pinned row").allowed).toBe(true);
+    const pinned = subject.bindTo(CLAUDE, "Tue Aug 11 09:00:00 2026");
+    subject.h.cp.sessions.pinNativeStart(pinned, RESTARTED_TOKEN);
     expectUnbound(subject);
   });
 

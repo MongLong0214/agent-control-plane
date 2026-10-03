@@ -35,67 +35,22 @@ export const processStartedAt = (pid: number | null | undefined): string | null 
 const LSTART_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const LSTART = /^[A-Z][a-z]{2} ([A-Z][a-z]{2}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/;
 
-interface LocalSecond {
-  year: number;
-  month: number;
-  day: number;
-  hours: number;
-  minutes: number;
-  seconds: number;
-}
-
-const rendersAs = (instant: number, local: LocalSecond): boolean => {
-  const at = new Date(instant);
-  if (at.getFullYear() !== local.year) return false;
-  if (at.getMonth() !== local.month) return false;
-  if (at.getDate() !== local.day) return false;
-  if (at.getHours() !== local.hours) return false;
-  if (at.getMinutes() !== local.minutes) return false;
-  return at.getSeconds() === local.seconds;
-};
-
-/** Every DST shift in use is a multiple of 15 minutes and at most two hours; four hours is margin. */
-const OFFSET_STEP_MS = 15 * 60_000;
-const OFFSET_STEPS = 16;
-
 /**
- * The first millisecond of the second `ps -o lstart=` rendered, as one UTC instant, or null.
+ * The first millisecond of the second `ps -o lstart=` rendered, or null for anything else.
  *
  * `ps` renders in its own local time and is spawned with the daemon's environment, so the
  * daemon's local time is the zone the text is in. A row written by a process whose zone differed
- * is misread, and the reader that uses this has to fail closed on it. A local time is not always
- * one instant either: where clocks fall back it names two (review PR1046-R1, round 2:
- * `Sun Nov  1 01:30:00 2026` in America/New_York is both 05:30Z and 06:30Z), and where they spring
- * forward it names none. Every instant within four hours of the naive reading is tried, and only a
- * reading with exactly one instant is an answer; the rest are null, which every caller refuses.
- *
- * The one parse for both legacy lstart rules — the unread-capacity keep (#1045) and the adopted
- * Gateway's lineage admission (#1037). Each first had its own. The keep's naive reading was
- * replaced rather than kept beside this one: inside a fall-back hour it settled on one of two
- * instants without saying so. So the keep, and `createWithPinnedStart`'s pin, now refuse such an
- * lstart instead, and that row takes the hold, revoke and failover paths.
+ * is misread, and the reader that uses this has to fail closed on it.
  */
 export const lstartSecondStartMs = (lstart: string): number | null => {
   const parts = LSTART.exec(lstart);
   if (parts === null) return null;
   const month = LSTART_MONTHS.indexOf(parts[1]!);
   if (month === -1) return null;
-  const local: LocalSecond = {
-    year: Number(parts[6]),
-    month,
-    day: Number(parts[2]),
-    hours: Number(parts[3]),
-    minutes: Number(parts[4]),
-    seconds: Number(parts[5]),
-  };
-  const naive = new Date(local.year, local.month, local.day, local.hours, local.minutes, local.seconds).getTime();
-  if (!Number.isFinite(naive)) return null;
-  const instants: number[] = [];
-  for (let step = -OFFSET_STEPS; step <= OFFSET_STEPS; step += 1) {
-    const candidate = naive + step * OFFSET_STEP_MS;
-    if (rendersAs(candidate, local)) instants.push(candidate);
-  }
-  return instants.length === 1 ? instants[0]! : null;
+  const started = new Date(
+    Number(parts[6]), month, Number(parts[2]), Number(parts[3]), Number(parts[4]), Number(parts[5]),
+  ).getTime();
+  return Number.isFinite(started) ? started : null;
 };
 
 /**

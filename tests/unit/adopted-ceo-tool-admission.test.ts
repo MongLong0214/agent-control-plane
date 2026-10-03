@@ -11,7 +11,6 @@ import {
   GATEWAY,
   IMPOSTOR_GATEWAY,
   LIVE,
-  LSTART,
   OTHER_DIGEST,
   RELAY,
   SHELL,
@@ -97,18 +96,11 @@ describe("adopted CEO tool admission — refusals write nothing", () => {
 
   it("refuses when the Gateway's pid now belongs to another process (pid reuse)", async () => {
     const fixture = adoptedFixture();
-    // The process at the pid started at neither recorded moment.
+    // The process at the pid is not the one whose native start was pinned at adoption.
     fixture.tokens.set(GATEWAY, "darwin-tv:1790000999.000002");
-    fixture.starts.set(GATEWAY, "Fri Oct  2 08:00:00 2026");
-    await expectRefusedWithoutWrites(fixture, () => fixture.admit(), ReasonCode.CONFLICT);
-    // The row's recorded start still matches by lstart, but the native token is not the one the
-    // Gateway reported for itself: the one-second grain is not trusted on its own.
-    fixture.starts.set(GATEWAY, LSTART);
     await expectRefusedWithoutWrites(fixture, () => fixture.admit(), ReasonCode.CONFLICT);
     // A Gateway restarted at the same pid: its readback and the live process agree with each
     // other, and only the CEO row still records the process that is gone.
-    fixture.tokens.set(GATEWAY, "darwin-tv:1790000999.000002");
-    fixture.starts.set(GATEWAY, "Fri Oct  2 08:00:00 2026");
     await expectRefusedWithoutWrites(
       fixture,
       () => fixture.admit(RELAY, {
@@ -116,7 +108,6 @@ describe("adopted CEO tool admission — refusals write nothing", () => {
       }),
       ReasonCode.CONFLICT,
     );
-    fixture.starts.set(GATEWAY, LSTART);
     fixture.tokens.set(GATEWAY, TOKEN);
     // The readback reports another start token for the same pid.
     await expectRefusedWithoutWrites(
@@ -126,10 +117,10 @@ describe("adopted CEO tool admission — refusals write nothing", () => {
     );
   });
 
-  it("refuses a Gateway restarted inside the recorded lstart second, whose readback follows it (PR1046-R1)", async () => {
+  it("refuses a Gateway whose native start is not the pinned one, though both render one lstart second (PR1046-R1)", async () => {
     const fixture = adoptedFixture();
     // Only the native token moves: the new process renders the same lstart second, and the
-    // Gateway's own readback reports the new process consistently.
+    // Gateway's own readback reports the new process consistently. The pin decides.
     fixture.tokens.set(GATEWAY, "darwin-tv:1790000000.000999");
     await expectRefusedWithoutWrites(
       fixture,
@@ -140,82 +131,28 @@ describe("adopted CEO tool admission — refusals write nothing", () => {
     );
   });
 
-  it("decides a legacy lstart-only row only when it was written after that second, then pins the token", async () => {
-    // Written 2026-08-12T00:00:00Z, recording a process that started the day before.
-    const fixture = adoptedFixture({ legacy: { lstart: "Tue Aug 11 09:00:00 2026" } });
-    const { h } = fixture;
-    expect(h.cp.sessions.pinnedNativeStart(fixture.gatewaySessionId)).toBeNull();
-    expect((await fixture.admit()).allowed).toBe(true);
-    expect(h.cp.sessions.pinnedNativeStart(fixture.gatewaySessionId)).toBe(TOKEN);
-    // Pinned once: the next admission writes nothing, and a new token behind the same lstart and
-    // a readback that follows it is now refused exactly.
-    const pinned = snapshot(h);
-    expect((await fixture.admit()).allowed).toBe(true);
-    expect(snapshot(h)).toEqual(pinned);
-    fixture.tokens.set(GATEWAY, "darwin-tv:1790000000.000999");
+  it("refuses an unpinned lstart-only row, the shape adoption wrote before #1037, and pins nothing", async () => {
+    // Written 2026-08-12T00:00:00Z, recording a process that started the day before: exactly the
+    // row the deleted lstart rule admitted and pinned. Its age no longer counts for anything.
+    const fixture = adoptedFixture({ unpinned: { lstart: "Tue Aug 11 09:00:00 2026" } });
+    expect(fixture.h.cp.sessions.pinnedNativeStart(fixture.gatewaySessionId)).toBeNull();
+    await expectRefusedWithoutWrites(fixture, () => fixture.admit(), ReasonCode.CONFLICT);
+    // Nor does the Gateway's own readback agreeing with the live process stand in for the pin.
     await expectRefusedWithoutWrites(
       fixture,
-      () => fixture.admit(RELAY, {
-        gatewayOrigin: async () => ({ ...fixture.proof, process_started_at: "darwin-tv:1790000000.000999" }),
-      }),
-      ReasonCode.CONFLICT,
-    );
-  });
-
-  it("refuses a legacy row written inside its process's own start second, or before it", async () => {
-    // The harness clock's own second, rendered the way `ps -o lstart=` renders it locally.
-    const written = new Date("2026-08-12T00:00:00.000Z");
-    const day = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][written.getDay()];
-    const month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][written.getMonth()];
-    const two = (n: number) => String(n).padStart(2, "0");
-    const sameSecond =
-      `${day} ${month} ${String(written.getDate()).padStart(2, " ")} ` +
-      `${two(written.getHours())}:${two(written.getMinutes())}:${two(written.getSeconds())} ${written.getFullYear()}`;
-    const ambiguous = adoptedFixture({ legacy: { lstart: sameSecond } });
-    await expectRefusedWithoutWrites(ambiguous, () => ambiguous.admit(), ReasonCode.CONFLICT);
-    const later = adoptedFixture({ legacy: { lstart: LSTART } });
-    await expectRefusedWithoutWrites(later, () => later.admit(), ReasonCode.CONFLICT);
-  });
-
-  it("pins nothing for a legacy row whose admission is refused after the lineage decided it (PR1046-R4)", async () => {
-    const fixture = adoptedFixture({ legacy: { lstart: "Tue Aug 11 09:00:00 2026" } });
-    // The lineage would decide this row and hand back a token to pin; the Gateway's readback then
-    // names another start, so the admission is refused — and must leave nothing behind.
-    await expectRefusedWithoutWrites(
-      fixture,
-      () => fixture.admit(RELAY, {
-        gatewayOrigin: async () => ({ ...fixture.proof, process_started_at: "darwin-tv:1790000000.000777" }),
-      }),
+      () => fixture.admit(RELAY, { gatewayOrigin: async () => ({ ...fixture.proof, process_started_at: TOKEN }) }),
       ReasonCode.CONFLICT,
     );
     expect(fixture.h.cp.sessions.pinnedNativeStart(fixture.gatewaySessionId)).toBeNull();
   });
 
-  it("refuses a legacy lstart that names two instants where clocks fall back (PR1046-R1, round 2)", async () => {
-    const zone = process.env["TZ"];
-    process.env["TZ"] = "America/New_York";
-    try {
-      // The original started at 01:30 EDT (05:30Z) and was recorded at 01:31 EDT; its successor at
-      // the same pid started at 01:30 EST (06:30Z). Both render `Sun Nov  1 01:30:00 2026`.
-      const fixture = adoptedFixture({
-        legacy: { lstart: "Sun Nov  1 01:30:00 2026", writtenAt: "2026-11-01T05:31:00.000Z" },
-      });
-      fixture.tokens.set(GATEWAY, "darwin-tv:1793511000.000001");
-      await expectRefusedWithoutWrites(
-        fixture,
-        () => fixture.admit(RELAY, {
-          gatewayOrigin: async () => ({ ...fixture.proof, process_started_at: "darwin-tv:1793511000.000001" }),
-        }),
-        ReasonCode.CONFLICT,
-      );
-      expect(fixture.h.cp.sessions.pinnedNativeStart(fixture.gatewaySessionId)).toBeNull();
-      // The original itself cannot be told from it either, so it is refused too: fail-closed.
-      fixture.tokens.set(GATEWAY, TOKEN);
-      await expectRefusedWithoutWrites(fixture, () => fixture.admit(), ReasonCode.CONFLICT);
-    } finally {
-      if (zone === undefined) delete process.env["TZ"];
-      else process.env["TZ"] = zone;
-    }
+  it("admits a Gateway on the native start pinned at adoption, and the admission leaves the pin as it was", async () => {
+    const fixture = adoptedFixture();
+    expect(fixture.h.cp.sessions.pinnedNativeStart(fixture.gatewaySessionId)).toBe(TOKEN);
+    const before = snapshot(fixture.h);
+    expect((await fixture.admit()).allowed).toBe(true);
+    expect(snapshot(fixture.h)).toEqual(before);
+    expect(fixture.h.cp.sessions.pinnedNativeStart(fixture.gatewaySessionId)).toBe(TOKEN);
   });
 
   it("refuses another chat's session, another lineage, and a binding to another head", async () => {
@@ -244,7 +181,6 @@ describe("adopted CEO tool admission — refusals write nothing", () => {
   it("refuses a DEAD Gateway, an unreadable one, a different Gateway, and a binding the operator has not adopted", async () => {
     const dead = adoptedFixture();
     dead.tokens.delete(GATEWAY);
-    dead.starts.delete(GATEWAY);
     await expectRefusedWithoutWrites(dead, () => dead.admit(), ReasonCode.CONFLICT);
 
     const unreadable = adoptedFixture();
@@ -260,7 +196,6 @@ describe("adopted CEO tool admission — refusals write nothing", () => {
     other.parents.set(RELAY, IMPOSTOR_GATEWAY);
     other.parents.set(IMPOSTOR_GATEWAY, 1);
     other.tokens.set(IMPOSTOR_GATEWAY, TOKEN);
-    other.starts.set(IMPOSTOR_GATEWAY, LSTART);
     await expectRefusedWithoutWrites(
       other,
       () => other.admit(RELAY, { gatewayOrigin: async () => ({ ...other.proof, process_pid: IMPOSTOR_GATEWAY }) }),

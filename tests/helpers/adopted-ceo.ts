@@ -10,7 +10,6 @@ import type { GatewayIncumbentProof } from "../../src/bootstrap/hermes-incumbent
 import { digestOf } from "../../src/core/digest.ts";
 import type { Decision } from "../../src/core/errors.ts";
 import type { ReasonCode } from "../../src/core/reason-codes.ts";
-import { ManualClock } from "../../src/core/clock.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { HermesTargetBindResponse } from "../../src/runtime/hermes-target-bind.ts";
 import type { ProcessLineageReader } from "../../src/session/runtime-lineage.ts";
@@ -82,7 +81,6 @@ export interface AdoptedCeoFixture {
   h: Harness;
   parents: Map<number, number>;
   tokens: Map<number, string>;
-  starts: Map<number, string>;
   processes: ProcessLineageReader;
   proof: GatewayIncumbentProof;
   gatewaySessionId: string;
@@ -102,16 +100,13 @@ export const adoptedFixture = (
     locator?: string;
     digest?: string;
     /**
-     * A row written the way adoption wrote them before #1037: `ps` lstart only, no native start
-     * pinned. `lstart` then names the recorded second; the harness clock (2026-08-12T00:00:00Z) is
-     * when the row was written.
+     * A row written the way adoption wrote them before #1037: `ps` lstart only, recording `lstart`,
+     * no native start pinned. Every admission refuses it; re-adoption is what pins it.
      */
-    legacy?: { lstart: string; writtenAt?: string };
+    unpinned?: { lstart: string };
   } = {},
 ): AdoptedCeoFixture => {
-  const writtenAt = bound.legacy?.writtenAt;
-  const h = writtenAt === undefined ? makeHarness() : makeHarness({ clock: new ManualClock(writtenAt) });
-  const recordedStart = bound.legacy?.lstart ?? LSTART;
+  const h = makeHarness();
   const parents = new Map<number, number>([
     [RELAY, SHELL],
     [SHELL, GATEWAY],
@@ -119,21 +114,19 @@ export const adoptedFixture = (
     [STRANGER, 1],
   ]);
   const tokens = new Map<number, string>([[GATEWAY, TOKEN]]);
-  const starts = new Map<number, string>([[GATEWAY, recordedStart]]);
   const processes: ProcessLineageReader = {
     parentOf: (pid) => parents.get(pid) ?? null,
     startToken: (pid) => tokens.get(pid) ?? null,
-    startedAt: (pid) => starts.get(pid) ?? null,
   };
   const gateway = h.cp.sessions.create({
     provider: "hermes",
     model: "hermes-runtime",
     osPid: GATEWAY,
-    osStartedAt: recordedStart,
+    osStartedAt: bound.unpinned?.lstart ?? LSTART,
   });
   expect(h.cp.sessions.transition(gateway.sessionId, SessionLifecycle.READY).allowed).toBe(true);
   // What adoption does since #1037: the exact token beside the lstart the row keeps.
-  if (bound.legacy === undefined) h.cp.sessions.pinNativeStart(gateway.sessionId, TOKEN);
+  if (bound.unpinned === undefined) h.cp.sessions.pinNativeStart(gateway.sessionId, TOKEN);
   const claimed = {
     executorKind: "hermes",
     targetLocator: bound.locator ?? LIVE,
@@ -184,7 +177,6 @@ export const adoptedFixture = (
     h,
     parents,
     tokens,
-    starts,
     processes,
     proof,
     gatewaySessionId: gateway.sessionId,

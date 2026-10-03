@@ -311,9 +311,9 @@ export class SessionRegistry {
    * because those readers would then call a live process dead. Kept as the first
    * `SESSION_NATIVE_START_PINNED` audit event for the session: append-only and never rewritten,
    * so the first pin is the pin. A dedicated column would need a migration, and the migration list
-   * is frozen. One pin serves both writers: a runtime the daemon starts (`createWithPinnedStart`)
-   * and an adopted Gateway pinned at its lineage admission (#1037), whose readers — the lineage
-   * admission and the Gateway delivery authority — compare against it.
+   * is frozen. One pin serves every writer: a runtime the daemon starts (`createWithPinnedStart`),
+   * the unread-capacity keep's legacy row, and a Gateway as incumbent adoption binds it (#1037).
+   * The lineage admission and the Gateway delivery authority compare against it and never write it.
    */
   pinnedNativeStart(sessionId: string): string | null {
     const row = this.db.get<{ evidence_json: string }>(
