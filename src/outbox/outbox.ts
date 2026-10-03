@@ -1,15 +1,24 @@
 import type { Clock } from "../core/clock.ts";
 import { isoPlus } from "../core/clock.ts";
-import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
+import { type Decision, allow, deny, fail, isAcpError } from "../core/errors.ts";
 import { randomUUID } from "node:crypto";
+
+import { digestOf } from "../core/digest.ts";
 
 import { newMessageId } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { FailureClass as FailureClassCode, type FailureClass } from "../domain/types.ts";
+import { ownerMessagePointerOf } from "../ingress/buzz-message.ts";
 import { IngressGuard } from "../ingress/ingress-guard.ts";
-import { adoptedCanonicalRuntimeSql, isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
+import {
+  type PeerMessageCarryAuthority,
+  type PeerMessageSuccession,
+  adoptedCanonicalRuntimeSql,
+  isAdoptedCanonicalRuntime,
+  peerMessageCarrySuccessionOf,
+} from "../registry/canonical-self-claim.ts";
 import {
   type FencedEnvelope,
   HOLDER_CLAIMED_KINDS,
@@ -351,7 +360,7 @@ export class Outbox {
    * nothing open, which is the same thing `completeNoReplyAndResolveTurn` says for a message that
    * claimed no turn.
    */
-  private settleHolderClaim(messageId: string): Decision<void> {
+  private settleHolderClaim(messageId: string, by: "HOLDER" | "FENCE" = "HOLDER"): Decision<void> {
     const claim = this.db.get<{ channel: string; nonce: string }>(
       `SELECT channel, nonce FROM inbound_messages
         WHERE turn_claim_json IS NOT NULL
@@ -360,20 +369,30 @@ export class Outbox {
       [messageId],
     );
     if (!claim) return allow(ReasonCode.OK, undefined);
-    return this.settlement.completeNoReplyAndResolveTurn(claim.channel, claim.nonce);
+    return this.settlement.completeNoReplyAndResolveTurn(claim.channel, claim.nonce, {
+      keepSettled: by === "FENCE",
+    });
   }
 
   /**
    * The same coupling for a sweep, which has no `Decision` to hand a refusal back through.
    *
-   * `fenceUndeliverable` and `retargetOrReject` return counts and id lists, and both run inside a
-   * caller's transaction (a delivery loop, a binding switch). A refused settlement there cannot be
-   * reported as a denial, and committing the outbox half alone is the split state this whole slice
-   * exists to remove — so it throws, and the caller's `db.tx` rolls the whole thing back. Loud and
-   * whole beats quiet and half.
+   * `fenceUndeliverable`, `retargetOrReject`, `carryHolderMessagesToRuntime` and
+   * `carryPeerMessagesToSameActorSuccessor` return counts and id lists, and all run inside a
+   * caller's transaction (a delivery loop, a binding switch, a restart's claim). A refused settlement
+   * there cannot be reported as a denial, and committing the outbox half alone is the split state
+   * this whole slice exists to remove — so it throws, and the caller's `db.tx` rolls the whole thing
+   * back. Loud and whole beats quiet and half.
+   *
+   * A fence is not the holder deciding the turn, though: it only takes the row out of the queue. So
+   * a turn that already has a terminal outcome keeps it (ACP-RESTART-03) — a receipt that settled it
+   * (`settledAt`, e.g. `REPLY_OUTBOX`) stands, exactly as a `repliedAt` or `noReplyAt` already did,
+   * and the row is rejected beside it. Before this, that receipt made the no-reply settlement refuse
+   * with `RESOURCE_COLLISION`, the throw below rolled the whole fence back, and a canonical restart
+   * with one such queued message could never complete.
    */
   private settleHolderClaimOrThrow(messageId: string): void {
-    const settled = this.settleHolderClaim(messageId);
+    const settled = this.settleHolderClaim(messageId, "FENCE");
     if (settled.allowed) return;
     throw new Error(
       `owner-message ${messageId} could not be taken out of the queue: its ingress claim refused ` +
@@ -1322,6 +1341,18 @@ export class Outbox {
     fromGeneration: number,
     toGeneration: number,
     toSessionId: string,
+    options: {
+      /**
+       * Revoke shape only (`fromGeneration === toGeneration`), and only from
+       * `BindingRegistry.revoke`'s `holdPeerMessagesForSameActorSuccessor`: a `PENDING`
+       * `IDENTITY_BOUND_KINDS` row addressed to exactly `sessionId` and never carried before is
+       * left untouched — neither retargeted nor rejected — and listed under `held`, for
+       * `carryPeerMessagesToSameActorSuccessor` to carry or reject in the same transaction. Such a
+       * row that *was* carried before is rejected as it would be without this option, and its id
+       * is added to `alreadyCarried`. Every other row is decided exactly as it is without it.
+       */
+      holdPeerMessagesAddressedTo?: { sessionId: string; alreadyCarried: string[] };
+    } = {},
   ): { retargeted: string[]; rejected: string[] } {
     const now = this.clock.nowIso();
     const pending = this.db.all<RawOutbox>(
@@ -1345,9 +1376,31 @@ export class Outbox {
 
     const retargeted: string[] = [];
     const rejected: string[] = [];
+    const held: string[] = [];
+    const holdFor = toGeneration === fromGeneration ? options.holdPeerMessagesAddressedTo : undefined;
 
     for (const row of pending) {
       const holderClaimed = HOLDER_CLAIMED_KINDS.has(row.kind as MessageKind);
+      // Whether the restart's carry, not this fence, records the CEO's notice for this row.
+      let noticeOwedByCarry = false;
+      // The hold (2026-10-03). Only `PENDING` — a `SENT` peer row's outcome is unknown and it is
+      // rejected below as always — and only a row that has not been carried before. Whether it has
+      // is the carry record's answer (ACP-PEER-SUCCESSION-01), never the row's `OUTBOX_RETARGETED`
+      // mark, which any statement can set or clear: a row that already spent its one carry is
+      // rejected here, not held, and reported in `alreadyCarried` so its refusal is recorded.
+      if (
+        holdFor !== undefined &&
+        IDENTITY_BOUND_KINDS.has(row.kind as MessageKind) &&
+        row.status === "PENDING" &&
+        row.target_session_id === holdFor.sessionId
+      ) {
+        if (!this.#peerMessageCarried(row.message_id)) {
+          held.push(row.message_id);
+          continue;
+        }
+        holdFor.alreadyCarried.push(row.message_id);
+        noticeOwedByCarry = true;
+      }
       const retargetable = holderClaimed
         ? // A holder-claimed row moves only on a *successor takeover*, and only from `PENDING`.
           //
@@ -1373,7 +1426,8 @@ export class Outbox {
           //
           // And never an `IDENTITY_BOUND_KINDS` row (#1044): a peer message was admitted for this
           // generation's exact session, so a successor is exactly who must not be handed it. It
-          // falls through to the reject below, which settles its ingress claim.
+          // falls through to the reject below, which settles its ingress claim. (The one exception,
+          // the same conversation restarted, never reaches this line: the hold above takes it.)
           row.status === "PENDING" &&
           toGeneration !== fromGeneration &&
           !IDENTITY_BOUND_KINDS.has(row.kind as MessageKind)
@@ -1419,6 +1473,17 @@ export class Outbox {
         // A terminal transition out of `PENDING`/`SENT` with no successor to take it: the ingress
         // claim this row was holding open closes here, in this same transaction, or nothing does.
         if (holderClaimed) this.settleHolderClaimOrThrow(row.message_id);
+        // ACP-RESTART-04: a queued CEO peer message rejected here is owed a notice to the CEO,
+        // which the role's next holder is shown until it reports it. A revoke has no successor at
+        // all and a takeover's is a different runtime, so this is never the carry's REFUSED record.
+        if (
+          IDENTITY_BOUND_KINDS.has(row.kind as MessageKind) && row.status === "PENDING" && !noticeOwedByCarry
+        ) {
+          this.#owePeerMessageNotice(
+            row,
+            toGeneration === fromGeneration ? PeerMessageNoticeReason.REVOKED : PeerMessageNoticeReason.REPLACED,
+          );
+        }
         rejected.push(row.message_id);
       }
     }
@@ -1427,10 +1492,369 @@ export class Outbox {
       kind: "OUTBOX_FENCE",
       reasonCode: ReasonCode.OUTBOX_RETARGETED,
       roleKey,
-      evidence: { fromGeneration, toGeneration, toSessionId, retargeted, rejected },
+      evidence: holdFor === undefined
+        ? { fromGeneration, toGeneration, toSessionId, retargeted, rejected }
+        : { fromGeneration, toGeneration, toSessionId, retargeted, rejected, held },
     });
 
     return { retargeted, rejected };
+  }
+
+  /**
+   * The carry for peer messages a same-actor dead-predecessor recovery held (2026-10-03), called
+   * inside the canonical self-claim's transaction once the successor generation is bound, with the
+   * carry authority that claim minted for exactly that succession (ACP-PEER-SUCCESSION-01).
+   *
+   * #1044 rejects a queued `PEER_MESSAGE` on every takeover and runtime move, because it was
+   * admitted for one exact CTO session and a successor is exactly who must not be handed it. A
+   * canonical restart is the one move that does not hand it to anyone else: the conversation, its
+   * actor and its Buzz channel identity are unchanged, and only the process and the generation
+   * moved. So a held row is carried to the successor once, keeping its message id, its admitted
+   * event and its stored proof, when — and only when — every one of these holds:
+   *
+   *   - the succession is proven (`PeerMessageSuccession.proven`): same actor, same conversation
+   *     UUID, same Buzz signer, and this transaction's own `DEAD_BINDING_RECOVERED` row;
+   *   - the row was never carried (no CARRIED record), never handed over, never in flight and never
+   *     attempted, and the turn it opened has no receipt — not replied, not resolved as no-reply,
+   *     not settled — and no canonical turn was dispatched for it;
+   *   - its source is readable, it was admitted for exactly the released CTO generation and session,
+   *     and it was addressed to the Buzz identity this conversation speaks as.
+   *
+   * A carry is a compare-and-set over the whole predecessor tuple plus a CARRIED record, written
+   * under the authority's marker: the record, not the row's `OUTBOX_RETARGETED` mark, is what the
+   * hand-over (`selfClaimCarriedTo`) accepts. The proof is never rewritten.
+   *
+   * Every other held row is rejected and its turn closed — which is what the revoke would have
+   * done to it, keeping a receipt that already settled it (ACP-RESTART-03) — and a REFUSED record
+   * with the reason category is written, with the notice the CEO is owed (ACP-RESTART-04), which
+   * the role's holder is shown until one reports it (`role_owner_message_claim`'s
+   * `refusedAtRestart`). So is each row in `alreadyCarried`, which the revoke itself rejected
+   * because an earlier restart had carried it. A row this call finds already decided by someone
+   * else inside this transaction is left exactly as it is.
+   */
+  carryPeerMessagesToSameActorSuccessor(
+    authority: PeerMessageCarryAuthority,
+    alreadyCarried: readonly string[] = [],
+  ): { retargeted: string[]; rejected: string[] } {
+    const succession = peerMessageCarrySuccessionOf(authority, this.db);
+    if (succession === null) {
+      return fail(ReasonCode.COMPLETION_AUTHORITY_DENIED, "PEER_MESSAGE_CARRY_AUTHORITY_DENIED", {});
+    }
+    const { roleKey, fromGeneration, fromSessionId, toGeneration, toSessionId } = succession;
+    return this.db.tx(() => {
+      const record = (row: RawOutbox, refusal: PeerMessageCarryRefusal | null): void => {
+        const outcome = refusal === null ? "CARRIED" : "REFUSED";
+        // ACP-RESTART-04: every refused row is owed a notice to the CEO, kept until a holder of the
+        // role reports it — the successor or whoever holds the role after it.
+        if (refusal !== null) this.#owePeerMessageNotice(row, refusal);
+        // One refusal per message: a row revived and refused again keeps its first record.
+        if (refusal !== null && this.db.get(
+          `SELECT 1 AS present FROM peer_message_carries WHERE message_id = ? AND outcome = 'REFUSED'`,
+          [row.message_id],
+        )) return;
+        const pointer = ownerMessagePointerOf(readPayload(row.payload_json));
+        // ACP-RESTART-02: the record binds the digest of the admitted row its key names — read
+        // from that row, not from the pointer — and the insert trigger checks it against that row.
+        const sourcePayloadDigest = pointer
+          ? this.#admittedPayloadDigest(pointer.sourceChannel, pointer.sourceNonce)
+          : null;
+        this.db.withPeerMessageCarry(authority, () =>
+          this.db.run(
+            `INSERT INTO peer_message_carries (
+               message_id, outcome, refusal, source_channel, source_nonce, source_payload_digest, role_key,
+               from_session_id, from_session_incarnation, from_binding_generation, from_assignment_id,
+               to_session_id, to_session_incarnation, to_binding_generation, to_assignment_id,
+               actor_id, conversation_uuid, buzz_actor_id, recovery_audit_event_id, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              row.message_id, outcome, refusal, pointer?.sourceChannel ?? null, pointer?.sourceNonce ?? null,
+              sourcePayloadDigest,
+              succession.roleKey,
+              succession.fromSessionId, succession.fromSessionIncarnation, succession.fromGeneration,
+              succession.fromAssignmentId,
+              succession.toSessionId, succession.toSessionIncarnation, succession.toGeneration,
+              succession.toAssignmentId,
+              succession.actorId, succession.conversationUuid, succession.buzzActorId,
+              succession.recoveryAuditEventId, this.clock.nowIso(),
+            ],
+          ));
+      };
+
+      // The revoke's own fence rejected these and settled their turns; only the notice is owed.
+      for (const messageId of alreadyCarried) {
+        const row = this.db.get<RawOutbox>(`SELECT * FROM outbox WHERE message_id = ?`, [messageId]);
+        if (row && IDENTITY_BOUND_KINDS.has(row.kind as MessageKind) && row.status === "REJECTED") {
+          record(row, PeerMessageCarryRefusal.ALREADY_CARRIED);
+        }
+      }
+
+      const rows = this.db.all<RawOutbox>(
+        `SELECT * FROM outbox
+          WHERE role_key = ? AND binding_generation = ?
+            AND kind IN (${HOLDER_CLAIMED_KIND_SQL})
+            AND status IN ('PENDING','IN_FLIGHT','SENT')
+          ORDER BY created_at, rowid`,
+        [roleKey, fromGeneration],
+      ).filter((row) => IDENTITY_BOUND_KINDS.has(row.kind as MessageKind));
+      if (rows.length === 0) return { retargeted: [], rejected: [] };
+
+      const retargeted: string[] = [];
+      const rejected: string[] = [];
+      for (const read of rows) {
+        let row = read;
+        let refusal = this.#peerMessageCarryRefusal(row, succession);
+        // Both writes name the whole tuple the read saw, so a row another writer decided in this
+        // transaction — carried, handed over, rejected — changes nothing here and is left as it is.
+        if (refusal === null) {
+          const moved = this.db.run(
+            `UPDATE outbox SET binding_generation = ?, target_session_id = ?, reason_code = ?
+              WHERE message_id = ? AND status = 'PENDING' AND kind = ?
+                AND role_key = ? AND binding_generation = ? AND target_session_id = ?
+                AND attempts = 0 AND sent_at IS NULL AND claim_token IS NULL`,
+            [
+              toGeneration, toSessionId, ReasonCode.OUTBOX_RETARGETED, row.message_id, row.kind,
+              roleKey, fromGeneration, fromSessionId,
+            ],
+          ).changes;
+          if (moved === 1) {
+            record(row, null);
+            retargeted.push(row.message_id);
+            continue;
+          }
+          // Not moved. Decided by someone else (no longer open at the released generation): left
+          // alone. Still open there but changed since the read: decided again, and at worst
+          // rejected — never left addressed to a generation nobody holds.
+          const now = this.db.get<RawOutbox>(`SELECT * FROM outbox WHERE message_id = ?`, [row.message_id]);
+          if (!now || now.role_key !== roleKey || now.binding_generation !== fromGeneration ||
+              !["PENDING", "IN_FLIGHT", "SENT"].includes(now.status)) {
+            continue;
+          }
+          row = now;
+          refusal = this.#peerMessageCarryRefusal(now, succession) ?? PeerMessageCarryRefusal.ALREADY_CLAIMED;
+        }
+        const closed = this.db.run(
+          `UPDATE outbox SET status = 'REJECTED', reason_code = ?,
+                             claim_token = NULL, claimed_at = NULL,
+                             retry_eligible = 0, next_attempt_at = NULL
+            WHERE message_id = ? AND status = ? AND role_key = ? AND binding_generation = ?
+              AND target_session_id = ?`,
+          [
+            ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, row.message_id, row.status,
+            roleKey, fromGeneration, row.target_session_id,
+          ],
+        ).changes;
+        if (closed !== 1) continue;
+        this.settleHolderClaimOrThrow(row.message_id);
+        record(row, refusal);
+        rejected.push(row.message_id);
+      }
+
+      this.audit.record({
+        kind: "OUTBOX_FENCE",
+        reasonCode: ReasonCode.OUTBOX_RETARGETED,
+        roleKey,
+        evidence: { fromGeneration, toGeneration, fromSessionId, toSessionId, retargeted, rejected },
+      });
+      return { retargeted, rejected };
+    });
+  }
+
+  /** Whether a CARRIED record exists for this message: the once-only rule, and nothing else is. */
+  #peerMessageCarried(messageId: string): boolean {
+    return this.db.get<{ present: number }>(
+      `SELECT 1 AS present FROM peer_message_carries WHERE message_id = ? AND outcome = 'CARRIED'`,
+      [messageId],
+    ) !== undefined;
+  }
+
+  /** The digest of the admitted payload stored at this ingress key, or null when unreadable. */
+  #admittedPayloadDigest(channel: string, nonce: string): string | null {
+    const source = this.db.get<{ payload_json: string | null }>(
+      `SELECT payload_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+      [channel, nonce],
+    );
+    const admitted = source?.payload_json ? readPayload(source.payload_json) : null;
+    return isPlainRecord(admitted) ? digestOf(admitted) : null;
+  }
+
+  /**
+   * Records that the CEO is owed a notice for one queued peer message a fence just rejected
+   * (ACP-RESTART-04): its id, the event and the identity that signed it, why, and the generation
+   * and session it was addressed to — never the payload. Written in the rejecting fence's own
+   * transaction, under a capability minted here for exactly this entry, so ordinary SQL cannot
+   * write one and nothing can delete one. The first entry for a message stands: a row revived and
+   * rejected again is not owed a second notice.
+   */
+  #owePeerMessageNotice(row: RawOutbox, reason: PeerMessageNoticeReason): void {
+    if (this.db.get(
+      `SELECT 1 AS present FROM peer_message_refusal_notices WHERE message_id = ? AND entry = 'OWED'`,
+      [row.message_id],
+    )) return;
+    const pointer = ownerMessagePointerOf(readPayload(row.payload_json));
+    const sender = pointer
+      ? this.db.get<{ actor: string }>(
+        `SELECT actor FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+        [pointer.sourceChannel, pointer.sourceNonce],
+      )?.actor ?? null
+      : null;
+    const entry: PeerMessageNoticeEntry = {
+      messageId: row.message_id,
+      entry: "OWED",
+      roleKey: row.role_key,
+      reason,
+      sender,
+      sourceChannel: pointer?.sourceChannel ?? null,
+      sourceNonce: pointer?.sourceNonce ?? null,
+      bindingGeneration: row.binding_generation,
+      sessionId: row.target_session_id,
+      sessionIncarnation: null,
+    };
+    this.#writePeerMessageNotice(entry);
+  }
+
+  #writePeerMessageNotice(entry: PeerMessageNoticeEntry): void {
+    this.db.withPeerMessageNotice(new PeerMessageNoticeAuthorityToken(this.db, entry), () =>
+      this.db.run(
+        `INSERT INTO peer_message_refusal_notices (
+           message_id, entry, role_key, reason, sender, source_channel, source_nonce,
+           binding_generation, session_id, session_incarnation, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          entry.messageId, entry.entry, entry.roleKey, entry.reason, entry.sender, entry.sourceChannel,
+          entry.sourceNonce, entry.bindingGeneration, entry.sessionId, entry.sessionIncarnation,
+          this.clock.nowIso(),
+        ],
+      ));
+  }
+
+  /**
+   * The notices the CEO is still owed for this role's rejected peer messages (ACP-RESTART-04), as
+   * the role's current holder is shown them — whoever holds the role now, the carry successor or
+   * not. Every OWED entry of the role with no REPORTED one, oldest first, and nothing at all unless
+   * `holder` is the exact current holder (`exactHolderTarget`): a former holder's tuple is shown
+   * nothing. Metadata only. Only reads.
+   */
+  peerMessageRefusalNoticesFor(holder: HolderIdentity): PeerMessageRefusalNoticeRow[] {
+    if (!this.#isExactHolder(holder)) return [];
+    return this.db.all<PeerMessageRefusalNoticeRow>(
+      `SELECT n.message_id, n.reason, n.sender, n.source_channel, n.source_nonce
+         FROM peer_message_refusal_notices n
+        WHERE n.role_key = ? AND n.entry = 'OWED'
+          AND NOT EXISTS (
+            SELECT 1 FROM peer_message_refusal_notices r
+             WHERE r.message_id = n.message_id AND r.entry = 'REPORTED'
+          )
+        ORDER BY n.created_at, n.message_id`,
+      [holder.roleKey],
+    );
+  }
+
+  /**
+   * The role's current holder reports that it told the CEO about one rejected peer message
+   * (ACP-RESTART-04), which retires that notice for every later holder. Exact current holder only,
+   * and only for a notice this role is owed; a repeat by any current holder answers OK and writes
+   * nothing, so a lost acknowledgement can be retried.
+   */
+  reportPeerMessageRefusal(messageId: string, holder: HolderIdentity): Decision<void> {
+    return this.db.txDecision(() => {
+      if (!this.#isExactHolder(holder)) {
+        return deny(ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, "only the role's current holder may report a refusal notice", {
+          messageId,
+        });
+      }
+      const owed = this.db.get<{ present: number }>(
+        `SELECT 1 AS present FROM peer_message_refusal_notices
+          WHERE message_id = ? AND entry = 'OWED' AND role_key = ?`,
+        [messageId, holder.roleKey],
+      );
+      if (!owed) {
+        return deny(ReasonCode.NOT_FOUND, "this role is owed no refusal notice for that message", { messageId });
+      }
+      if (this.db.get(
+        `SELECT 1 AS present FROM peer_message_refusal_notices WHERE message_id = ? AND entry = 'REPORTED'`,
+        [messageId],
+      )) {
+        return allow(ReasonCode.OK, undefined);
+      }
+      this.#writePeerMessageNotice({
+        messageId,
+        entry: "REPORTED",
+        roleKey: holder.roleKey,
+        reason: null,
+        sender: null,
+        sourceChannel: null,
+        sourceNonce: null,
+        bindingGeneration: holder.bindingGeneration,
+        sessionId: holder.targetSessionId,
+        sessionIncarnation: holder.sessionIncarnation,
+      });
+      return allow(ReasonCode.OK, undefined);
+    });
+  }
+
+  /** `exactHolderTarget` for a caller-supplied holder tuple. Only reads. */
+  #isExactHolder(holder: HolderIdentity): boolean {
+    return this.db.get<{ held: number }>(
+      `SELECT ${exactHolderTarget("bound")} AS held`,
+      [holder.roleKey, holder.bindingGeneration, holder.targetSessionId, holder.sessionIncarnation],
+    )?.held === 1;
+  }
+
+  /**
+   * Why one held peer row may not be carried to `succession`'s successor, or null when it may.
+   * Only reads. The order puts what already happened to the row before what it was admitted as,
+   * so the category the successor is shown names the first thing that made a carry impossible.
+   */
+  #peerMessageCarryRefusal(row: RawOutbox, succession: PeerMessageSuccession): PeerMessageCarryRefusal | null {
+    if (this.#peerMessageCarried(row.message_id)) return PeerMessageCarryRefusal.ALREADY_CARRIED;
+    // Unclaimed: never handed over, never in flight, never attempted. UNKNOWN and IN_DOUBT
+    // outcomes are reconciled with what they already have, never moved.
+    if (
+      row.status !== "PENDING" || row.attempts !== 0 || (row.sent_at ?? null) !== null ||
+      (row.claim_token ?? null) !== null
+    ) {
+      return PeerMessageCarryRefusal.ALREADY_CLAIMED;
+    }
+    if (row.target_session_id !== succession.fromSessionId) return PeerMessageCarryRefusal.DIFFERENT_LINEAGE;
+    // A peer row carrying the retarget mark with no carry record was moved by something that is not
+    // a carry (#1044 retargets no identity-bound row). The mark admits nothing; it can still refuse.
+    if (row.reason_code === ReasonCode.OUTBOX_RETARGETED) return PeerMessageCarryRefusal.DIFFERENT_LINEAGE;
+    const pointer = ownerMessagePointerOf(readPayload(row.payload_json));
+    if (!pointer) return PeerMessageCarryRefusal.SOURCE_UNREADABLE;
+    const source = this.db.get<{ payload_json: string | null; turn_claim_json: string | null }>(
+      `SELECT payload_json, turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+      [pointer.sourceChannel, pointer.sourceNonce],
+    );
+    const admitted = source?.payload_json ? readPayload(source.payload_json) : null;
+    if (!isPlainRecord(admitted) || digestOf(admitted) !== pointer.sourcePayloadDigest) {
+      return PeerMessageCarryRefusal.SOURCE_UNREADABLE;
+    }
+    // No receipt: the turn this message opened is still open, and no canonical turn ran for it.
+    if (source?.turn_claim_json != null) {
+      const claim = readPayload(source.turn_claim_json);
+      if (!isPlainRecord(claim)) return PeerMessageCarryRefusal.SOURCE_UNREADABLE;
+      if (claim["repliedAt"] !== undefined || claim["noReplyAt"] !== undefined || claim["settledAt"] !== undefined) {
+        return PeerMessageCarryRefusal.ALREADY_CLAIMED;
+      }
+    }
+    if (this.db.get(`SELECT 1 AS present FROM canonical_turns WHERE turn_request_id = ?`, [row.message_id])) {
+      return PeerMessageCarryRefusal.ALREADY_CLAIMED;
+    }
+    // Lineage: admitted for exactly the released CTO generation and session.
+    const proof = admitted["peer"];
+    if (
+      !isPlainRecord(proof) || proof["ctoRoleKey"] !== succession.roleKey ||
+      proof["ctoBindingGeneration"] !== succession.fromGeneration ||
+      proof["ctoSessionId"] !== succession.fromSessionId
+    ) {
+      return PeerMessageCarryRefusal.DIFFERENT_LINEAGE;
+    }
+    // Signer: addressed to the Buzz channel identity this conversation speaks as.
+    const mention = typeof admitted["mention"] === "string" ? admitted["mention"].trim() : null;
+    if (mention !== succession.buzzActorId) return PeerMessageCarryRefusal.DIFFERENT_ACTOR_OR_SIGNER;
+    // Actor, conversation UUID, signer and the recovery record, as the self-claim read them back.
+    if (!succession.proven) return PeerMessageCarryRefusal.DIFFERENT_ACTOR_OR_SIGNER;
+    return null;
   }
 
   /**
@@ -1508,6 +1932,10 @@ export class Outbox {
           [ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, row.message_id],
         );
         this.settleHolderClaimOrThrow(row.message_id);
+        // ACP-RESTART-04: the queued CEO peer message this move rejected is owed a notice.
+        if (IDENTITY_BOUND_KINDS.has(row.kind as MessageKind) && row.status === "PENDING") {
+          this.#owePeerMessageNotice(row, PeerMessageNoticeReason.RUNTIME_MOVED);
+        }
         rejected.push(row.message_id);
       }
 
@@ -1676,6 +2104,95 @@ export class Outbox {
 
 }
 
+/**
+ * Why a held peer message was not carried to the restarted conversation (ACP-PEER-SUCCESSION-01).
+ * Stored on its REFUSED carry record and shown to the successor; the schema's CHECK lists the same
+ * five.
+ */
+export const PeerMessageCarryRefusal = {
+  /** The actor, conversation UUID, Buzz signer or recovery record is not one continuous restart. */
+  DIFFERENT_ACTOR_OR_SIGNER: "DIFFERENT_ACTOR_OR_SIGNER",
+  /** The row, or its admission proof, names a CTO other than the released generation's session. */
+  DIFFERENT_LINEAGE: "DIFFERENT_LINEAGE",
+  /** An earlier restart carried it once already: one hop only. */
+  ALREADY_CARRIED: "ALREADY_CARRIED",
+  /** It was handed over, in flight or attempted, or its turn already has a receipt. */
+  ALREADY_CLAIMED: "ALREADY_CLAIMED",
+  /** Its pointer, its admitted source or its turn claim cannot be read as admitted. */
+  SOURCE_UNREADABLE: "SOURCE_UNREADABLE",
+} as const;
+export type PeerMessageCarryRefusal = (typeof PeerMessageCarryRefusal)[keyof typeof PeerMessageCarryRefusal];
+
+/**
+ * Why a queued peer message the CEO is owed a notice for was rejected (ACP-RESTART-04): the path
+ * that rejected it, or — when a canonical restart refused to carry it — that refusal's category.
+ * The schema's CHECK lists the same eight.
+ */
+export const PeerMessageNoticeReason = {
+  /** The generation it was addressed to was revoked with no successor: a plain revoke or the operator's dead-binding door. */
+  REVOKED: "REVOKED",
+  /** Another runtime took the role over. */
+  REPLACED: "REPLACED",
+  /** The same generation moved to another runtime. */
+  RUNTIME_MOVED: "RUNTIME_MOVED",
+  ...PeerMessageCarryRefusal,
+} as const;
+export type PeerMessageNoticeReason = (typeof PeerMessageNoticeReason)[keyof typeof PeerMessageNoticeReason];
+
+/** One entry of `peer_message_refusal_notices`, exactly as its insert trigger compares it. */
+export interface PeerMessageNoticeEntry {
+  readonly messageId: string;
+  readonly entry: "OWED" | "REPORTED";
+  readonly roleKey: string;
+  readonly reason: PeerMessageNoticeReason | null;
+  readonly sender: string | null;
+  readonly sourceChannel: string | null;
+  readonly sourceNonce: string | null;
+  readonly bindingGeneration: number;
+  readonly sessionId: string;
+  readonly sessionIncarnation: string | null;
+}
+
+/** An owed notice as `peerMessageRefusalNoticesFor` reads it. */
+export interface PeerMessageRefusalNoticeRow {
+  message_id: string;
+  reason: string;
+  sender: string | null;
+  source_channel: string | null;
+  source_nonce: string | null;
+}
+
+/**
+ * The capability to write one refusal-notice entry (ACP-RESTART-04).
+ *
+ * Minted only inside this module — at the fence that rejects a queued peer message and at the
+ * current holder's report — for exactly the entry it is about to write; the class is not exported,
+ * so no other module can make one, and `Db.withPeerMessageNotice` checks the brand before it raises
+ * the marker the entry's insert trigger requires. The same pattern as the carry authority.
+ */
+class PeerMessageNoticeAuthorityToken {
+  readonly #minted = true;
+  readonly #db: Db;
+  readonly #entry: PeerMessageNoticeEntry;
+
+  constructor(db: Db, entry: PeerMessageNoticeEntry) {
+    this.#db = db;
+    this.#entry = Object.freeze({ ...entry });
+    Object.freeze(this);
+  }
+
+  static entryOf(value: unknown, db: Db): PeerMessageNoticeEntry | null {
+    if (typeof value !== "object" || value === null || !(#minted in value)) return null;
+    return value.#db === db ? value.#entry : null;
+  }
+}
+export type PeerMessageNoticeAuthority = PeerMessageNoticeAuthorityToken;
+/** The entry a notice authority names, or null when `value` is not one issued for `db`. */
+export const peerMessageNoticeEntryOf = PeerMessageNoticeAuthorityToken.entryOf;
+
+const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
 interface RawOutbox {
   message_id: string;
   idempotency_key: string;
@@ -1695,6 +2212,8 @@ interface RawOutbox {
   retry_eligible?: number | null;
   next_attempt_at?: string | null;
   sent_at?: string | null;
+  claim_token?: string | null;
+  reason_code?: string | null;
 }
 
 /**

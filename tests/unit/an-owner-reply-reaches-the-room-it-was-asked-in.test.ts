@@ -1072,7 +1072,7 @@ describe("the #1056 review's six findings", () => {
     try {
       expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
       expect(migrated.get<{ migration_id: string }>(
-        `SELECT migration_id FROM schema_migrations WHERE version = ?`, [SCHEMA_VERSION],
+        `SELECT migration_id FROM schema_migrations WHERE version = ?`, [39],
       )?.migration_id).toBe("v39-owner-reply-intent-keeps-its-key");
       expect(() => migrated.run(
         `UPDATE inbound_messages SET nonce = nonce || ':moved' WHERE channel = 'owner-reply-intent'`,

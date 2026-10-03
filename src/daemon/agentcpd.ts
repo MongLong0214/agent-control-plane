@@ -86,7 +86,9 @@ import {
   buzzMessageSigningRequest,
   deliverBuzzMessage,
   ownerMessagePointerOf,
+  peerMessageRefusalNoticeOf,
   peerProofIsCurrent,
+  selfClaimCarriedTo,
   type BuzzMentionRouter,
   type BuzzMessageIngressInput,
   type BuzzMessageTurnPort,
@@ -652,7 +654,7 @@ export const startLocalMcpListeners = async (
           respond(await ctoConversation.registerEndpoint(server, args.endpoint)),
       );
       /*
-       * The three owner-message tools, registered in this same composition — not on a second
+       * The owner-message tools, registered in this same composition — not on a second
        * server, and not against a durable endpoint registry.
        *
        * `roleKey` is the only thing a caller may say, and it is a **lookup key**: it selects
@@ -692,6 +694,17 @@ export const startLocalMcpListeners = async (
         },
         async (args: { roleKey: string; messageId: string }) =>
           respond(ctoConversation.rejectOwnerMessage(server, args.roleKey, args.messageId)),
+      );
+      server.registerTool(
+        "role_owner_message_report_refusal",
+        {
+          description:
+            "Record that this connection told the CEO about one rejected peer message the claim " +
+            "listed under `refusedAtRestart`, so later holders are no longer shown it.",
+          inputSchema: { roleKey: z.string().min(1), messageId: z.string().min(1) },
+        },
+        async (args: { roleKey: string; messageId: string }) =>
+          respond(ctoConversation.reportPeerMessageRefusal(server, args.roleKey, args.messageId)),
       );
     }
     return server;
@@ -3590,18 +3603,37 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
         const ctoChannel = cp.sessions.get(holder.targetSessionId)?.buzzAddress ?? null;
         const taken = cp.outbox.claimForHolder(
           holder,
-          (candidate) =>
-            candidate.kind !== MessageKind.PEER_MESSAGE ||
-            peerProofIsCurrent(admittedPeerSource(cp, candidate.payload), ceo, holder, ctoChannel),
+          (candidate) => {
+            if (candidate.kind !== MessageKind.PEER_MESSAGE) return true;
+            const source = admittedPeerSource(cp, candidate.payload);
+            return peerProofIsCurrent(
+              source,
+              ceo,
+              holder,
+              ctoChannel,
+              // The one holder besides the proof's own: its conversation restarted once, the row
+              // carried to it by the canonical self-claim's recovery (2026-10-03) — accepted only
+              // through that carry's record (ACP-PEER-SUCCESSION-01).
+              selfClaimCarriedTo(cp.db, candidate, holder, source),
+            );
+          },
         );
         const unresolved = taken.unresolved;
         const withheld = taken.withheld;
+        // ACP-PEER-SUCCESSION-01, ACP-RESTART-04: the CEO peer messages ACP rejected while they
+        // were queued for this role — on a revoke, a takeover, a runtime move or a restart that
+        // refused to carry them — that no holder has reported yet, by id, event, signer and reason
+        // and never their text, so the CTO can tell the CEO in the thread and then report it.
+        // Shown to the role's exact current holder only, whether or not it is the carry successor.
+        // Present only when there is one, so a handover without any keeps its shape.
+        const refusals = cp.outbox.peerMessageRefusalNoticesFor(holder).map(peerMessageRefusalNoticeOf);
+        const notices = refusals.length > 0 ? { refusedAtRestart: refusals } : {};
         const message = taken.claimed[0];
         // Nothing new was handed over: either the queue is empty, or an unresolved hand-over is
         // blocking it. Both are reported with metadata only — `UnresolvedOwnerMessage` has no
         // payload field, so "never the payload twice" holds by the shape of what is returned.
         if (!message) {
-          return allow(ReasonCode.OK, { claimed: null, unresolved, withheld, hasMore: taken.hasMore });
+          return allow(ReasonCode.OK, { claimed: null, unresolved, withheld, hasMore: taken.hasMore, ...notices });
         }
         const refuseClaimed = (reasonCode: ReasonCode, why: string): Decision<OwnerMessageHandover> => {
           const burned = cp.outbox.rejectForHolder(message.messageId, holder);
@@ -3670,6 +3702,7 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
           unresolved,
           withheld,
           hasMore: taken.hasMore,
+          ...notices,
         });
       });
       } catch (err) {
@@ -3705,6 +3738,13 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
         if (refusal) return refusal;
         return cp.outbox.rejectForHolder(messageId, holder);
       }),
+
+    /**
+     * ACP-RESTART-04 — the role's current holder says it told the CEO about one rejected peer
+     * message listed under `refusedAtRestart`, which retires that notice for every later holder.
+     */
+    reportRefusal: (messageId: string, holder: HolderIdentity): Decision<void> =>
+      cp.outbox.reportPeerMessageRefusal(messageId, holder),
   };
 };
 
@@ -3731,8 +3771,13 @@ const admittedPeerSource = (cp: ControlPlane, outboxPayload: unknown): AdmittedP
     return undefined;
   }
   if (digestOf(payload) !== pointer.sourcePayloadDigest) return undefined;
-  const admitted = payload as { peer?: unknown; conversation?: unknown };
-  return { proof: admitted.peer, author: source.actor, conversation: admitted.conversation };
+  const admitted = payload as { peer?: unknown; conversation?: unknown; mention?: unknown };
+  return {
+    proof: admitted.peer,
+    author: source.actor,
+    conversation: admitted.conversation,
+    mention: admitted.mention,
+  };
 };
 
 /**
