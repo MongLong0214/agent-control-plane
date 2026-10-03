@@ -1,0 +1,9 @@
+Limit: the host's buzz command is a Hermes-owned mention-enforce wrapper that lets only each room's registered CEO and CTO sign; the daemon signs as the owner's desktop identity, so any Buzz send it makes into a canonical room is refused, and that guard is not ACP's to bypass
+Warn: run_ack is run-scoped, so a canonical CTO that owns no run cannot acknowledge an in-band DRAIN_REQUEST; it expires after its TTL
+Record-Id: r-inbanddispatch
+Provenance: inherited 0f87b7f8bf340f5dbed8a99515b51dc51b4dc104
+
+Warn: in-band rows are acknowledged through one authority, Outbox.acknowledgeInBand, reached by role_dispatch_ack and by run_ack's in-band branch; a canonical CTO that owns no run settles a DRAIN_REQUEST with role_dispatch_ack, which supersedes the earlier warning that it could not
+Record-Id: r-inbanddispatchr1
+Follows: r-inbanddispatch
+Provenance: inherited 0db2aa4bfa9566c0aaa557d2c49d5b77033bbfa0
