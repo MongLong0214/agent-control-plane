@@ -745,10 +745,12 @@ const assertDeliveryAuthority = (authority: OwnerReplyDeliveryAuthority, db: Db,
  *
  * The item's own protections, from triggers that exist today: `payload_json` cannot be rewritten
  * (`inbound_messages_payload_immutable`), a second row for the turn cannot be inserted
- * (`inbound_messages_no_replace`), and no row can be deleted without this channel's ingress delete
- * authority, which nothing grants. It lives here rather than in the item's mutable `result_json`,
- * where any writer of that column could replace or drop it, and a dropped intent let the sender
- * sign a second, different event.
+ * (`inbound_messages_no_replace`), no row can be deleted without this channel's ingress delete
+ * authority, which nothing grants, and the row's key cannot be moved by UPDATE
+ * (`inbound_messages_owner_reply_key_immutable`, schema v39): a moved nonce would read as no
+ * intent and let a retry sign a second event. It lives here rather than in the item's mutable
+ * `result_json`, where any writer of that column could replace or drop it, and a dropped intent
+ * let the sender sign a second, different event.
  */
 export const OWNER_REPLY_INTENT_CHANNEL = "owner-reply-intent";
 
@@ -791,6 +793,21 @@ export type OwnerReplyIntentRecord =
 /** A Schnorr signature as Nostr writes one: 64 bytes, lowercase hex. */
 const SIGNATURE = /^[0-9a-f]{128}$/u;
 
+/**
+ * A copy of `event` that nothing can change, down to each tag (R1056-01). An event read from
+ * storage is handed out in publications, and a publication's holder could otherwise swap the
+ * event inside it for another one the same identity signed.
+ */
+const frozenEvent = (event: OwnerReplySignedEvent): OwnerReplySignedEvent => Object.freeze({
+  id: event.id,
+  pubkey: event.pubkey,
+  created_at: event.created_at,
+  kind: event.kind,
+  tags: Object.freeze(event.tags.map((tag) => Object.freeze([...tag]))),
+  content: event.content,
+  sig: event.sig,
+});
+
 const signedEventOf = (value: unknown): OwnerReplySignedEvent | null => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const { id, pubkey, created_at: createdAt, kind, tags, content, sig } = value as Record<string, unknown>;
@@ -804,7 +821,7 @@ const signedEventOf = (value: unknown): OwnerReplySignedEvent | null => {
     if (!Array.isArray(tag) || !tag.every((part) => typeof part === "string")) return null;
     copied.push([...(tag as string[])]);
   }
-  return { id, pubkey, created_at: createdAt, kind, tags: copied, content, sig };
+  return frozenEvent({ id, pubkey, created_at: createdAt, kind, tags: copied, content, sig });
 };
 
 /** The intent recorded for one turn. */
@@ -934,15 +951,7 @@ export const recordOwnerReplyIntent = (
     const recorded = ownerReplyIntent(db, turnRequestId);
     if (recorded.status === "RECORDED") return allow(ReasonCode.OK, recorded.intent);
     if (recorded.status === "UNREADABLE") return unreadableIntent(turnRequestId);
-    const exact: OwnerReplySignedEvent = {
-      id: event.id,
-      pubkey: event.pubkey,
-      created_at: event.created_at,
-      kind: event.kind,
-      tags: event.tags.map((tag) => [...tag]),
-      content: event.content,
-      sig: event.sig,
-    };
+    const exact = frozenEvent(event);
     const recordedAt = clock.nowIso();
     db.run(
       `INSERT INTO inbound_messages (channel, nonce, actor, received_at, payload_json, result_json)
@@ -1077,6 +1086,11 @@ export const recordOwnerReplyUndelivered = (
  * Its text is the one the receipt's digest proves, and its room, the event it answers and the
  * identity it is signed as come from the item's address. Each is spent by the publisher's first
  * use of it (`redeemOwnerReplyPublication`), so a caller cannot reuse one or build its own.
+ *
+ * The publication and its event are frozen, tags included, so a holder cannot swap the event for
+ * another one the same identity signed. The publisher does not rely on that alone: spending a
+ * publication reads the turn's intent from storage again, and only an event equal to it, id and
+ * bytes, is sent (R1056-01).
  */
 export interface OwnerReplyPublication {
   readonly turnRequestId: string;
@@ -1090,7 +1104,8 @@ export interface OwnerReplyPublication {
   readonly intent: OwnerReplySignedEvent | null;
 }
 
-const ISSUED_PUBLICATIONS = new WeakSet<object>();
+/** Every unspent publication, with the database that issued it, where its intent is read again. */
+const ISSUED_PUBLICATIONS = new WeakMap<object, Db>();
 
 /**
  * A publication for one `PENDING` Buzz item, or the refusal that says why there is none. Every
@@ -1160,15 +1175,33 @@ export const issueOwnerReplyPublication = (
     createdAt: Math.floor(clock.now().getTime() / 1000),
     intent: recorded.status === "RECORDED" ? recorded.intent.event : null,
   });
-  ISSUED_PUBLICATIONS.add(publication);
+  ISSUED_PUBLICATIONS.set(publication, db);
   return allow(ReasonCode.OK, publication);
 };
 
-/** The publication itself when `value` is one this module issued and nothing has spent; `null` otherwise. */
-export const redeemOwnerReplyPublication = (value: unknown): OwnerReplyPublication | null => {
-  if (typeof value !== "object" || value === null || !ISSUED_PUBLICATIONS.has(value)) return null;
+/** A spent publication, with what storage holds for its turn at the moment it was spent. */
+export interface RedeemedOwnerReplyPublication {
+  readonly publication: OwnerReplyPublication;
+  /**
+   * The event recorded for the publication's turn, read when the publication is spent from the
+   * database that issued it; `null` when none is recorded or it cannot be read. The publisher sends
+   * a publication's event only when it equals this one (R1056-01).
+   */
+  readonly recorded: OwnerReplySignedEvent | null;
+}
+
+/**
+ * Spends `value` when it is a publication this module issued and nothing has spent, and reads the
+ * turn's recorded intent again; `null` for anything else.
+ */
+export const redeemOwnerReplyPublication = (value: unknown): RedeemedOwnerReplyPublication | null => {
+  if (typeof value !== "object" || value === null) return null;
+  const db = ISSUED_PUBLICATIONS.get(value);
+  if (db === undefined) return null;
   ISSUED_PUBLICATIONS.delete(value);
-  return value as OwnerReplyPublication;
+  const publication = value as OwnerReplyPublication;
+  const stored = ownerReplyIntent(db, publication.turnRequestId);
+  return { publication, recorded: stored.status === "RECORDED" ? stored.intent.event : null };
 };
 
 /**

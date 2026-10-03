@@ -6,7 +6,11 @@ import { decode } from "nostr-tools/nip19";
 import { makeAuthEvent } from "nostr-tools/nip42";
 import { finalizeEvent, getPublicKey, validateEvent, verifyEvent } from "nostr-tools/pure";
 
-import { type OwnerReplyPublication, redeemOwnerReplyPublication } from "../conversation/owner-reply-outbox.ts";
+import {
+  type OwnerReplyPublication,
+  type OwnerReplySignedEvent,
+  redeemOwnerReplyPublication,
+} from "../conversation/owner-reply-outbox.ts";
 import type { BuzzPeerBinding } from "../ingress/buzz-message.ts";
 
 /**
@@ -1023,7 +1027,8 @@ class BuzzMentionSubscription {
 
   /**
    * Sends a publication's recorded event on this identity's live connection, once `#isOwnerReply`
-   * holds for it, and waits for the relay's verdict on it.
+   * holds for it against `recorded`, the turn's intent as storage held it when the publication was
+   * spent, and waits for the relay's verdict on it. What goes out is the stored event.
    *
    * A second publish of an id still waiting shares the first one's answer rather than sending
    * again. A connection that is not authenticated sends nothing and answers `UNAVAILABLE`, and so
@@ -1034,14 +1039,24 @@ class BuzzMentionSubscription {
    * running, so a slow admission can turn a verdict into a `TIMEOUT`. The resend that follows is
    * the same event.
    */
-  publishOwnerReply(publication: OwnerReplyPublication, timeoutMs: number): Promise<BuzzPublishAck> {
+  publishOwnerReply(
+    publication: OwnerReplyPublication,
+    recorded: OwnerReplySignedEvent | null,
+    timeoutMs: number,
+  ): Promise<BuzzPublishAck> {
     const event = publication.intent;
-    if (event === null || !this.#isOwnerReply(publication, event)) return Promise.resolve({ status: "UNAUTHORIZED" });
-    return this.#publish(event, timeoutMs);
+    if (event === null || recorded === null || !this.#isOwnerReply(publication, event, recorded)) {
+      return Promise.resolve({ status: "UNAUTHORIZED" });
+    }
+    return this.#publish(recorded, timeoutMs);
   }
 
-  /** The publication's recorded event is this identity's validly signed reply, to its room and anchor, with its text. */
-  #isOwnerReply(publication: OwnerReplyPublication, event: BuzzSignedEvent): boolean {
+  /**
+   * The publication's event is the intent storage holds for its turn now, id and bytes, and is this
+   * identity's validly signed reply, to its room and anchor, with its text (R1056-01).
+   */
+  #isOwnerReply(publication: OwnerReplyPublication, event: BuzzSignedEvent, recorded: BuzzSignedEvent): boolean {
+    if (event.id !== recorded.id || eventFrame(event) !== eventFrame(recorded)) return false;
     if (publication.signer !== this.#pubkey || event.pubkey !== this.#pubkey) return false;
     if (!this.#rooms.includes(publication.room)) return false;
     if (event.kind !== BUZZ_MENTION_KIND || event.content !== publication.content) return false;
@@ -1591,6 +1606,17 @@ const publishAckOf = (accepted: boolean, message: string): BuzzPublishAck => {
   return { status: "REFUSED", category: message.startsWith("rate-limited:") ? "REFUSED_RATE_LIMIT" : "REFUSED_OTHER" };
 };
 
+/** The EVENT frame `event` goes out in, its fields in one fixed order: the bytes the relay receives. */
+const eventFrame = (event: BuzzSignedEvent): string => JSON.stringify(["EVENT", {
+  id: event.id,
+  pubkey: event.pubkey,
+  created_at: event.created_at,
+  kind: event.kind,
+  tags: event.tags,
+  content: event.content,
+  sig: event.sig,
+}]);
+
 /** An owner reply's tags: the room, and the event it answers, in the shape the live relay writes. */
 const ownerReplyTags = (publication: OwnerReplyPublication): string[][] => [
   ["h", publication.room],
@@ -1626,8 +1652,9 @@ export interface BuzzReplyPublisher {
   signOwnerReply(publication: OwnerReplyPublication): BuzzSignedEvent | null;
   /**
    * Sends an issued publication's recorded event on its signer's connection, and resolves with the
-   * relay's verdict or the lack of one. Anything but that exact, validly signed reply is
-   * `UNAUTHORIZED` and is not sent.
+   * relay's verdict or the lack of one. Anything but that exact, validly signed reply, equal in id
+   * and bytes to the intent storage holds for its turn when it is sent, is `UNAUTHORIZED` and is
+   * not sent.
    */
   publishOwnerReply(publication: OwnerReplyPublication, timeoutMs: number): Promise<BuzzPublishAck>;
   /** Called after any identity's connection authenticates: at startup and after every reconnect. */
@@ -1850,15 +1877,16 @@ export const startBuzzMentionSubscriber = (
       roomsOf: (pubkey) => holding(pubkey)?.rooms ?? null,
       ready: (pubkey) => holding(pubkey)?.ready ?? false,
       signOwnerReply: (value) => {
-        const publication = redeemOwnerReplyPublication(value);
-        return publication === null ? null : holding(publication.signer)?.signOwnerReply(publication) ?? null;
+        const redeemed = redeemOwnerReplyPublication(value);
+        return redeemed === null ? null : holding(redeemed.publication.signer)?.signOwnerReply(redeemed.publication) ?? null;
       },
       publishOwnerReply: (value, timeoutMs) => {
-        const publication = redeemOwnerReplyPublication(value);
-        const subscription = publication === null ? null : holding(publication.signer);
-        return publication === null || subscription === null
+        // Spent and checked against storage here, with nothing awaited before the frame is written.
+        const redeemed = redeemOwnerReplyPublication(value);
+        const subscription = redeemed === null ? null : holding(redeemed.publication.signer);
+        return redeemed === null || subscription === null
           ? Promise.resolve({ status: "UNAUTHORIZED" })
-          : subscription.publishOwnerReply(publication, timeoutMs);
+          : subscription.publishOwnerReply(redeemed.publication, redeemed.recorded, timeoutMs);
       },
       onAuthenticated: (listener) => {
         authenticatedListeners.add(listener);

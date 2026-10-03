@@ -1279,10 +1279,13 @@ END;
 
 -- CP-HI-06 — v38 override authority is write-once after claim. This separate trigger leaves the frozen v36
 -- identity trigger and its historical backfill intact; schema replay may install it before v38.
+-- This and the two v38 claim guards below test for a receipt at v38 *or later*. A database
+-- bootstrapped after v38 holds only its own version's receipt, so a test for exactly 38 left all
+-- three inert there; v39 reinstalls them with this body.
 CREATE TRIGGER IF NOT EXISTS inbound_messages_override_authority_immutable
 BEFORE UPDATE OF turn_claim_json ON inbound_messages
 WHEN OLD.turn_claim_json IS NOT NULL
- AND EXISTS (SELECT 1 FROM schema_migrations WHERE version = 38)
+ AND EXISTS (SELECT 1 FROM schema_migrations WHERE version >= 38)
  AND CASE
    WHEN NEW.turn_claim_json IS NULL
      OR json_valid(OLD.turn_claim_json) <> 1
@@ -1323,7 +1326,7 @@ END;
 CREATE TRIGGER IF NOT EXISTS inbound_messages_override_claim_authority
 BEFORE UPDATE OF turn_claim_json ON inbound_messages
 WHEN OLD.turn_claim_json IS NULL AND NEW.turn_claim_json IS NOT NULL
- AND EXISTS (SELECT 1 FROM schema_migrations WHERE version = 38)
+ AND EXISTS (SELECT 1 FROM schema_migrations WHERE version >= 38)
  AND CASE
    WHEN json_valid(NEW.turn_claim_json) <> 1 THEN 1
    WHEN EXISTS (SELECT 1 FROM json_tree(NEW.turn_claim_json)
@@ -1342,7 +1345,7 @@ END;
 CREATE TRIGGER IF NOT EXISTS inbound_messages_override_insert_authority
 BEFORE INSERT ON inbound_messages
 WHEN NEW.turn_claim_json IS NOT NULL
- AND EXISTS (SELECT 1 FROM schema_migrations WHERE version = 38)
+ AND EXISTS (SELECT 1 FROM schema_migrations WHERE version >= 38)
  AND CASE
    WHEN json_valid(NEW.turn_claim_json) <> 1 THEN 1
    WHEN EXISTS (SELECT 1 FROM json_tree(NEW.turn_claim_json)
@@ -1354,6 +1357,19 @@ WHEN NEW.turn_claim_json IS NOT NULL
  END = 1
 BEGIN
   SELECT RAISE(ABORT, 'INGRESS_OVERRIDE_CLAIM_AUTHORITY_DENIED');
+END;
+
+-- CP-HI-06 — an owner reply's recorded intent (#1036, R1056-02) is found by its key alone: channel
+-- 'owner-reply-intent' and the turn's id as nonce. The payload, REPLACE and DELETE guards above keep
+-- the row; they did not keep its key, and an UPDATE that moved the nonce left the reader finding no
+-- intent, so a retry signed and sent a second, different reply. No row may leave this channel,
+-- enter it, or change its nonce in it by UPDATE.
+CREATE TRIGGER IF NOT EXISTS inbound_messages_owner_reply_key_immutable
+BEFORE UPDATE OF channel, nonce ON inbound_messages
+WHEN (OLD.channel = 'owner-reply-intent' OR NEW.channel = 'owner-reply-intent')
+ AND (NEW.channel IS NOT OLD.channel OR NEW.nonce IS NOT OLD.nonce)
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_OWNER_REPLY_KEY_IMMUTABLE');
 END;
 
 -- ---------------------------------------------------------------------------

@@ -1,4 +1,5 @@
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import Database from "better-sqlite3";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { finalizeEvent, generateSecretKey, getPublicKey, verifyEvent } from "nostr-tools/pure";
@@ -7,6 +8,7 @@ import {
   type BuzzMentionSubscriberHandle,
   type BuzzRelaySocketFactory,
   type BuzzRelaySocketHandlers,
+  type BuzzReplyPublisher,
   type BuzzSignedEvent,
   type BuzzSubscriberScheduler,
   startBuzzMentionSubscriber,
@@ -32,7 +34,9 @@ import { canonicalJson, digestOf, sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startDaemonOwnerReplyConsumer } from "../../src/daemon/agentcpd.ts";
 import { AuditLog } from "../../src/db/audit.ts";
-import { openDb } from "../../src/db/database.ts";
+import { SCHEMA_VERSION, openDb } from "../../src/db/database.ts";
+import { approveMigration } from "../../src/db/migration-approval.ts";
+import { installMigrationLedger } from "../../src/db/migrations.ts";
 import { IngressGuard } from "../../src/ingress/ingress-guard.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
@@ -186,6 +190,8 @@ class FakeReceiptPort implements ReceiptPort {
 interface CtoIdentity {
   pubkey: string;
   keyFile: string;
+  /** Kept so a row can sign a second, valid event as this identity, the way the review's probe did. */
+  secretKey: Uint8Array;
 }
 
 const ctoIdentity = (): CtoIdentity => {
@@ -194,7 +200,7 @@ const ctoIdentity = (): CtoIdentity => {
   const keyFile = join(dir, "cto.key");
   writeFileSync(keyFile, `${Buffer.from(secretKey).toString("hex")}\n`, { mode: 0o600 });
   chmodSync(keyFile, 0o600);
-  return { pubkey: getPublicKey(secretKey), keyFile };
+  return { pubkey: getPublicKey(secretKey), keyFile, secretKey };
 };
 
 interface World {
@@ -266,6 +272,8 @@ const openWorld = (options: {
   relay?: FakeRelay;
   rooms?: readonly string[];
   clock?: ManualClock;
+  /** What the consumer is handed in place of the subscriber's publisher: a holder standing between them. */
+  replies?: (real: BuzzReplyPublisher) => BuzzReplyPublisher;
 } = {}): World => {
   const path = options.path ?? statePath();
   const fresh = options.path === undefined;
@@ -294,7 +302,7 @@ const openWorld = (options: {
     db,
     clock,
     audit,
-    buzz: subscriber.replies,
+    buzz: options.replies?.(subscriber.replies) ?? subscriber.replies,
     timers: consumerTimers.scheduler,
   });
   // The two wake-ups `startDaemonOwnerReplyConsumer` wires, kept here so a row can await each one.
@@ -756,6 +764,30 @@ const refuseOnce = async (w: World, advanceMs: number, refusal: string): Promise
   await quiesce(w);
 };
 
+/** The v38 claim guards whose gate v39 widens from a receipt at exactly 38 to one at 38 or later. */
+const V38_GATED = [
+  "inbound_messages_override_authority_immutable",
+  "inbound_messages_override_claim_authority",
+  "inbound_messages_override_insert_authority",
+];
+
+/** `event`'s room, anchor and text signed again as `cto` at `createdAt`: a valid event, as a plain object. */
+const signedAs = (cto: CtoIdentity, event: BuzzSignedEvent, createdAt: number): BuzzSignedEvent => {
+  const signed = finalizeEvent(
+    { kind: event.kind, created_at: createdAt, tags: event.tags.map((tag) => [...tag]), content: event.content },
+    cto.secretKey,
+  );
+  return {
+    id: signed.id,
+    pubkey: signed.pubkey,
+    created_at: signed.created_at,
+    kind: signed.kind,
+    tags: signed.tags.map((tag) => [...tag]),
+    content: signed.content,
+    sig: signed.sig,
+  };
+};
+
 describe("the #1056 review's six findings", () => {
   it("R1056-01 signs and publishes nothing a caller builds, whatever the publisher is handed", async () => {
     const w = openWorld();
@@ -790,6 +822,107 @@ describe("the #1056 review's six findings", () => {
     expect(answers.length).toBeGreaterThan(0);
     expect(w.relay.received).toEqual([]);
     expect(answers.filter((answer) => typeof answer === "object" && answer !== null && "sig" in answer)).toEqual([]);
+  });
+
+  it("R1056-01 publishes only the recorded event when an issued publication's event is replaced with another the signer signed", async () => {
+    // The review's probe: a holder of an issued publication, standing between the outbox and the
+    // publisher, swaps its event for a second event the same identity validly signed.
+    let swap: BuzzSignedEvent | null = null;
+    const attempts: string[] = [];
+    const w = openWorld({
+      replies: (real) => ({
+        ...real,
+        publishOwnerReply: (publication, timeoutMs) => {
+          if (swap !== null && publication.intent !== null) {
+            try {
+              Object.assign(publication.intent, swap);
+              attempts.push("replaced");
+            } catch (error) {
+              attempts.push(error instanceof TypeError ? "refused" : "threw");
+            }
+          }
+          return real.publishOwnerReply(publication, timeoutMs);
+        },
+      }),
+    });
+    w.relay.mode = "silent";
+    await w.relay.connect();
+    await w.consumer.start();
+    const turn = await settle(w, admitBuzz(w, { eventId: eventIdFor("owner-event-swapped"), mention: w.cto.pubkey }));
+    await flush();
+    expect(w.relay.received).toHaveLength(1);
+    const recorded = w.relay.received[0]!.event;
+    w.subscriberTimers.fireAll();
+    await Promise.all(w.wakes);
+
+    swap = signedAs(w.cto, recorded, recorded.created_at + 60);
+    expect(swap.id).not.toBe(recorded.id);
+    expect(verifyEvent({ ...swap, tags: swap.tags.map((tag) => [...tag]) })).toBe(true);
+    w.relay.mode = "accept";
+    w.clock.advance(5_000);
+    w.consumerTimers.fireAll();
+    await w.consumer.wake("DUE");
+    await quiesce(w);
+
+    expect(w.relay.received.map((sent) => sent.event.id)).toEqual([recorded.id, recorded.id]);
+    expect(attempts).toEqual(["refused"]);
+    expect(outbox.ownerReplyIntent(w.db, turn)).toMatchObject({ status: "RECORDED", intent: { eventId: recorded.id } });
+    expect(ownerReplyFor(w.db, turn)?.delivery?.eventId).toBe(recorded.id);
+  });
+
+  it.each([
+    ["another event the signer signed", (cto: CtoIdentity, event: BuzzSignedEvent) => signedAs(cto, event, event.created_at + 60)],
+    ["the same event id under a second signature", (cto: CtoIdentity, event: BuzzSignedEvent) => signedAs(cto, event, event.created_at)],
+  ] as const)("R1056-01 refuses at publication an issued publication whose event is not the recorded intent: %s", async (_, other) => {
+    // The publisher's own check, apart from the token's immutability: the stored intent changes
+    // under a live publication. The triggers forbid that, so this row sets the payload trigger aside.
+    let storeInstead: BuzzSignedEvent | null = null;
+    let path: string | null = null;
+    const w = openWorld({
+      replies: (real) => ({
+        ...real,
+        publishOwnerReply: (publication, timeoutMs) => {
+          if (storeInstead !== null && path !== null) {
+            const side = new Database(path);
+            try {
+              side.exec("DROP TRIGGER IF EXISTS inbound_messages_payload_immutable");
+              side.prepare(
+                `UPDATE inbound_messages SET payload_json = ? WHERE channel = 'owner-reply-intent' AND nonce = ?`,
+              ).run(JSON.stringify({ transport: "buzz", event: storeInstead }), publication.turnRequestId);
+            } finally {
+              side.close();
+            }
+          }
+          return real.publishOwnerReply(publication, timeoutMs);
+        },
+      }),
+    });
+    path = w.path;
+    w.relay.mode = "silent";
+    await w.relay.connect();
+    await w.consumer.start();
+    const turn = await settle(w, admitBuzz(w, { eventId: eventIdFor("owner-event-restored"), mention: w.cto.pubkey }));
+    await flush();
+    expect(w.relay.received).toHaveLength(1);
+    const recorded = w.relay.received[0]!.event;
+    w.subscriberTimers.fireAll();
+    await Promise.all(w.wakes);
+
+    storeInstead = other(w.cto, recorded);
+    expect(JSON.stringify(storeInstead)).not.toBe(JSON.stringify(recorded));
+    w.relay.mode = "accept";
+    w.clock.advance(5_000);
+    w.consumerTimers.fireAll();
+    await w.consumer.wake("DUE");
+    await quiesce(w);
+
+    expect(w.relay.received).toHaveLength(1);
+    expect(ownerReplyFor(w.db, turn)?.status).toBe("PENDING");
+    expect(ownerReplyDeliveryState(w.db, turn)?.blocked).toMatchObject({
+      reasonCode: ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT,
+      cause: "recorded-event-does-not-match-item",
+      transient: false,
+    });
   });
 
   it("R1056-02 resends the one recorded event when the item's mutable state is damaged after an unanswered publish", async () => {
@@ -849,7 +982,7 @@ describe("the #1056 review's six findings", () => {
     ]);
   });
 
-  it("R1056-02 keeps a recorded intent from being rewritten, replaced or removed", async () => {
+  it("R1056-02 keeps a recorded intent from being rewritten, replaced, removed or moved off its key", async () => {
     const w = openWorld();
     w.relay.mode = "silent";
     await w.relay.connect();
@@ -876,11 +1009,97 @@ describe("the #1056 review's six findings", () => {
        VALUES ('owner-reply-intent', ?, 'someone', ?, '{}')`,
       [turn, NOW],
     )).toThrow();
+    // The round-2 probe: the row is found by its key, so moving the key is removing it for the reader.
+    expect(() => w.db.run(
+      `UPDATE inbound_messages SET nonce = nonce || ':moved' WHERE channel = 'owner-reply-intent'`,
+    )).toThrow(/INBOUND_OWNER_REPLY_KEY_IMMUTABLE/u);
+    expect(() => w.db.run(
+      `UPDATE inbound_messages SET channel = 'owner-reply-intent:moved' WHERE channel = 'owner-reply-intent' AND nonce = ?`,
+      [turn],
+    )).toThrow(/INBOUND_OWNER_REPLY_KEY_IMMUTABLE/u);
     expect(intentRow()).toEqual(recorded);
     expect(outbox.ownerReplyIntent(w.db, turn)).toMatchObject({
       status: "RECORDED",
       intent: { eventId: w.relay.received[0]!.event.id },
     });
+
+    // And the retry the probe ran sends the one recorded event, not a second one.
+    w.subscriberTimers.fireAll();
+    await Promise.all(w.wakes);
+    w.relay.mode = "accept";
+    w.clock.advance(5_000);
+    w.consumerTimers.fireAll();
+    await w.consumer.wake("DUE");
+    await quiesce(w);
+    expect(new Set(w.relay.received.map((sent) => sent.event.id)).size).toBe(1);
+    expect(ownerReplyFor(w.db, turn)?.status).toBe("DELIVERED");
+  });
+
+  it("R1056-02 a database written at v38 is migrated to a schema that keeps the key, its owner-reply rows intact", () => {
+    const w = openWorld();
+    const turn = "turn:written-at-v38";
+    w.db.run(
+      `INSERT INTO inbound_messages (channel, nonce, actor, received_at, payload_json, result_json)
+       VALUES ('owner-reply-intent', ?, ?, ?, ?, '{"status":"RECORDED"}')`,
+      [turn, w.cto.pubkey, NOW, JSON.stringify({ transport: "buzz", event: { id: "v38" } })],
+    );
+    w.db.close();
+
+    // The v38 image: the same file without the key guard, with v38's receipt as its newest, and
+    // with the three v38 claim guards as v38 wrote them, live only beside a receipt at exactly 38.
+    const legacy = new Database(w.path);
+    const gated = legacy.prepare(
+      `SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND sql LIKE '%WHERE version >= 38)%' ORDER BY name`,
+    ).all() as { name: string; sql: string }[];
+    expect(gated.map((trigger) => trigger.name)).toEqual(V38_GATED);
+    for (const trigger of gated) {
+      legacy.exec(`DROP TRIGGER ${trigger.name}; ${trigger.sql.replace("WHERE version >= 38)", "WHERE version = 38)")};`);
+    }
+    legacy.exec(`
+      DROP TRIGGER inbound_messages_owner_reply_key_immutable;
+      DROP TRIGGER schema_migrations_no_delete;
+      DROP TRIGGER schema_migrations_insert_authority;
+      DELETE FROM schema_migrations WHERE version > 38;
+      INSERT INTO schema_migrations (version, migration_id, checksum, applied_at)
+        VALUES (38, 'bootstrap-v38', 'sha256:${"0".repeat(64)}', '${NOW}');
+      PRAGMA user_version = 38;
+    `);
+    installMigrationLedger(legacy);
+    legacy.close();
+
+    approveMigration(w.path, "R1056-02 v38 fixture");
+    const migrated = openDb(w.path);
+    try {
+      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
+      expect(migrated.get<{ migration_id: string }>(
+        `SELECT migration_id FROM schema_migrations WHERE version = ?`, [SCHEMA_VERSION],
+      )?.migration_id).toBe("v39-owner-reply-intent-keeps-its-key");
+      expect(() => migrated.run(
+        `UPDATE inbound_messages SET nonce = nonce || ':moved' WHERE channel = 'owner-reply-intent'`,
+      )).toThrow(/INBOUND_OWNER_REPLY_KEY_IMMUTABLE/u);
+      expect(migrated.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM inbound_messages WHERE channel = 'owner-reply-intent' AND nonce = ?`, [turn],
+      )?.n).toBe(1);
+      expect(migrated.all<{ name: string }>(
+        `SELECT name FROM sqlite_master WHERE type = 'trigger' AND sql LIKE '%WHERE version >= 38)%' ORDER BY name`,
+      ).map((trigger) => trigger.name)).toEqual(V38_GATED);
+    } finally {
+      migrated.close();
+    }
+  });
+
+  it("R1056-02 the v38 claim guards stay live on a database bootstrapped after v38", () => {
+    // A fresh database holds only its own version's receipt. Before v39 their gate asked for a
+    // receipt at exactly 38, which such a database never has.
+    const w = openWorld();
+    expect(w.db.get<{ versions: string }>(
+      `SELECT group_concat(version) AS versions FROM schema_migrations`,
+    )?.versions).toBe(String(SCHEMA_VERSION));
+    expect(() => w.db.run(
+      `INSERT INTO inbound_messages (channel, nonce, actor, received_at, turn_claim_json)
+       VALUES ('buzz', 'forged-first-claim', 'owner', ?, ?)`,
+      [NOW, JSON.stringify({ turnRequestId: "forged", canonicalTarget: { targetActorId: w.actorId } })],
+    )).toThrow(/INGRESS_OVERRIDE_CLAIM_AUTHORITY_DENIED/u);
   });
 
   it("R1056-03 arms no timer for an item waiting on its signer's authentication, and the authentication retries it", async () => {
