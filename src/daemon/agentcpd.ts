@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, unlinkSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, realpathSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { Transport, TransportSendOptions } from "@modelcontextprotocol/sdk/shared/transport.js";
@@ -3996,7 +3996,27 @@ export const dispositionForStartupError = (err: unknown, databasePath: string): 
   return { exitCode: 0, body: report, reportPath };
 };
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+/**
+ * Whether this module is the process entrypoint, not merely importable from one.
+ *
+ * `import.meta.url` is always the realpath Node resolved the module through, but
+ * `process.argv[1]` is whatever path the caller passed — including a symlink, such as
+ * `<state root>/current` (#1052). `resolve()` only normalizes a path; it does not follow
+ * symlinks, so comparing it against the realpath never matched through that link and the daemon
+ * silently did nothing. Resolving both sides with `realpathSync` keeps the check correct across
+ * symlinks; a path that cannot be resolved (missing, unreadable, a dangling link) is treated as
+ * "not main" rather than thrown.
+ */
+const isMainModule = (): boolean => {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]);
+  } catch {
+    return false;
+  }
+};
+
+if (isMainModule()) {
   void main().catch((err: unknown) => {
     const disposition = dispositionForStartupError(err, defaultConfig().databasePath);
     process.stderr.write(`${JSON.stringify(disposition.body, null, 2)}\n`);
