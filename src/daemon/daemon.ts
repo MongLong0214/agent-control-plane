@@ -14,7 +14,7 @@ import {
   type RoleCoveragePlan,
 } from "../continuity/continuity-kernel.ts";
 import { digestOf } from "../core/digest.ts";
-import { readProcessStartToken } from "../core/process-argv.ts";
+import { DARWIN_START_TOKEN, readProcessStartToken } from "../core/process-argv.ts";
 import { lstartSecondStartMs, nativeStartIsInLstartSecond, processStartedAt } from "../core/process-identity.ts";
 import { acpError, type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
@@ -137,7 +137,7 @@ export const recordedProcessIsRunning = (
   // The lstart read and the native reads must describe one process: a pid reused between them
   // changes the native start, so the two answers could otherwise come from different processes.
   if (read.native(session.osPid) !== native) return false;
-  const started = /^darwin-tv:(\d+)\.(\d{6})$/.exec(native ?? "");
+  const started = DARWIN_START_TOKEN.exec(native ?? "");
   if (started === null) return false;
   // `createdAt` is truncated to the millisecond, so the start is compared at the same resolution.
   return Number(started[1]) * 1000 + Math.floor(Number(started[2]) / 1000) <= Date.parse(session.createdAt);

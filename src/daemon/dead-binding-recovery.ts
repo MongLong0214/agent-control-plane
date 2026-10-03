@@ -28,17 +28,34 @@ export const DEAD_BINDING_RECOVERY_ROLE = Role.PRIMARY_CTO;
  */
 export type SessionLiveness = "ALIVE" | "DEAD" | "UNKNOWN";
 
+/** One format a session row records its process start in, and the reader that renders it. */
+interface StartFormat {
+  matches(value: string): boolean;
+  read(pid: number): string | null;
+}
+
+const NATIVE_START: StartFormat = {
+  matches: (value) => DARWIN_START_TOKEN.test(value),
+  read: readProcessStartToken,
+};
+
+const LSTART_START: StartFormat = {
+  matches: (value) => lstartSecondStartMs(value) !== null,
+  read: processStartedAt,
+};
+
 /**
- * The reader that renders a live process's start in the format `recorded` was written in, or
- * null when `recorded` is in neither format a session row carries.
+ * The format `recorded` was written in, or null when it is in neither format a session row
+ * carries.
  *
- * A native token is matched by the claim's own pattern and read by the claim's own reader, so
- * this cannot drift from what the claim recorded. Only `darwin-tv:` is recognised: ACP deploys on
- * Darwin, and a `linux-clk:` row is answered `UNKNOWN` rather than guessed at.
+ * A native token is matched by the pattern of the reader that writes it (`DARWIN_START_TOKEN`
+ * beside `readProcessStartToken`), so this cannot drift from what the claim recorded. Only
+ * `darwin-tv:` is recognised: ACP deploys on Darwin, and a `linux-clk:` row is answered
+ * `UNKNOWN` rather than guessed at.
  */
-const liveStartReaderFor = (recorded: string): ((pid: number) => string | null) | null => {
-  if (DARWIN_START_TOKEN.test(recorded)) return readProcessStartToken;
-  if (lstartSecondStartMs(recorded) !== null) return processStartedAt;
+const startFormatOf = (recorded: string): StartFormat | null => {
+  if (NATIVE_START.matches(recorded)) return NATIVE_START;
+  if (LSTART_START.matches(recorded)) return LSTART_START;
   return null;
 };
 
@@ -59,10 +76,12 @@ const liveStartReaderFor = (recorded: string): ((pid: number) => string | null) 
  * The comparison only means anything when both sides are in one format, and a session row
  * records its start in one of two: the canonical self-claim writes the native `darwin-tv:` token
  * its inspector read (`readProcessStartToken`), every other writer `ps -o lstart=` text. So the
- * live process is read in the format its row was recorded in — see `liveStartReaderFor`. A
- * recorded start in neither format cannot be compared with anything, and is `UNKNOWN` rather
- * than a mismatch: reading it as one called a live canonical CTO dead and revoked its binding.
- * An injected `probe.startedAt` is used as given.
+ * live process is read in the format its row was recorded in — see `startFormatOf`. A recorded
+ * start in neither format cannot be compared with anything, and is `UNKNOWN` rather than a
+ * mismatch: reading it as one called a live canonical CTO dead and revoked its binding. The same
+ * holds for the live value: an injected `probe.startedAt` replaces the reader, never the format
+ * check, so a live value in another format than the record is `UNKNOWN` too. Only two values in
+ * one format that differ are `DEAD`.
  */
 export const probeSessionLiveness = (
   osPid: number | null,
@@ -88,10 +107,11 @@ export const probeSessionLiveness = (
   // Something answers on that number. Whether it is *this* session's process is a question the
   // pid alone cannot answer.
   if (recordedStartedAt === null) return "ALIVE";
-  const readStartedAt = probe.startedAt ?? liveStartReaderFor(recordedStartedAt);
-  if (readStartedAt === null) return "UNKNOWN";
-  const current = readStartedAt(osPid);
+  const format = startFormatOf(recordedStartedAt);
+  if (format === null) return "UNKNOWN";
+  const current = (probe.startedAt ?? format.read)(osPid);
   if (current === null) return "UNKNOWN";
+  if (!format.matches(current)) return "UNKNOWN";
   return current === recordedStartedAt ? "ALIVE" : "DEAD";
 };
 

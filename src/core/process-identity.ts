@@ -1,5 +1,7 @@
 import { execFileSync } from "node:child_process";
 
+import { DARWIN_START_TOKEN } from "./process-argv.ts";
+
 /**
  * The start time of a live process, or null if it cannot be established (#505).
  *
@@ -63,7 +65,7 @@ export const lstartSecondStartMs = (lstart: string): number | null => {
 export const nativeStartIsInLstartSecond = (token: string, lstart: string): boolean => {
   const second = lstartSecondStartMs(lstart);
   if (second === null) return false;
-  const native = /^darwin-tv:(\d+)\.\d{6}$/.exec(token);
+  const native = DARWIN_START_TOKEN.exec(token);
   if (native === null) return false;
   return Number(native[1]) * 1000 === second;
 };

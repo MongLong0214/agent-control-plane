@@ -4,7 +4,7 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { DARWIN_START_TOKEN, readProcessStartToken } from "../../src/core/process-argv.ts";
-import { processStartedAt } from "../../src/core/process-identity.ts";
+import { lstartSecondStartMs, processStartedAt } from "../../src/core/process-identity.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
   parseDeadBindingRecoveryRequest,
@@ -134,9 +134,12 @@ describe("a live canonical CTO is not read as dead", () => {
     try {
       const session = h.cp.sessions.create({ provider: "hermes", model: "hermes-runtime", osPid: process.pid });
       const row = h.cp.sessions.require(session.sessionId);
-      expect(row.osProcessStartedAt).toBe(processStartedAt(process.pid));
-      expect(DARWIN_START_TOKEN.test(row.osProcessStartedAt ?? "")).toBe(false);
-      expect(probeSessionLiveness(row.osPid, row.osProcessStartedAt)).toBe("ALIVE");
+      const recorded = row.osProcessStartedAt;
+      if (recorded === null) throw new Error("the session row recorded no start for a live pid");
+      expect(lstartSecondStartMs(recorded)).not.toBeNull();
+      expect(recorded).toBe(processStartedAt(process.pid));
+      expect(DARWIN_START_TOKEN.test(recorded)).toBe(false);
+      expect(probeSessionLiveness(row.osPid, recorded)).toBe("ALIVE");
     } finally {
       h.cp.close();
     }
@@ -170,7 +173,25 @@ describe("a live canonical CTO is not read as dead", () => {
     ["an ISO timestamp", "2026-10-03T17:23:36.000Z"],
   ])("(e) refuses a recorded start in neither format (%s) as UNKNOWN for a live pid, never DEAD", (_shape, recorded) => {
     expect(probeSessionLiveness(process.pid, recorded)).toBe("UNKNOWN");
-    // An injected reader is used as given, whatever the recorded format.
-    expect(probeSessionLiveness(process.pid, recorded, { startedAt: () => recorded })).toBe("ALIVE");
+    // An injected reader replaces the reader, not the format check: even a reader that hands
+    // back the record itself, or a valid native token, cannot make an unrecognised record decide.
+    expect(probeSessionLiveness(process.pid, recorded, { startedAt: () => recorded })).toBe("UNKNOWN");
+    expect(probeSessionLiveness(process.pid, recorded, { startedAt: () => "darwin-tv:1791024432.380000" })).toBe("UNKNOWN");
+  });
+
+  it("(f) a live value in another format than the record is UNKNOWN, never DEAD, even through an injected reader", () => {
+    const answers = () => undefined;
+    const lstart = "Sat Oct  3 17:23:36 2026";
+    const native = "darwin-tv:1791024432.383646";
+    // An lstart record compared through a native reader (the claim's seam), and the reverse.
+    expect(probeSessionLiveness(4242, lstart, { signal: answers, startedAt: () => native })).toBe("UNKNOWN");
+    expect(probeSessionLiveness(4242, native, { signal: answers, startedAt: () => lstart })).toBe("UNKNOWN");
+    // A live value in neither format is no answer either.
+    expect(probeSessionLiveness(4242, native, { signal: answers, startedAt: () => "t2" })).toBe("UNKNOWN");
+    // One format, different values: the pid-reuse case still reads DEAD, and an equal value ALIVE.
+    expect(probeSessionLiveness(4242, native, { signal: answers, startedAt: () => "darwin-tv:1791024433.000001" })).toBe("DEAD");
+    expect(probeSessionLiveness(4242, lstart, { signal: answers, startedAt: () => "Sat Oct  3 17:23:37 2026" })).toBe("DEAD");
+    expect(probeSessionLiveness(4242, native, { signal: answers, startedAt: () => native })).toBe("ALIVE");
+    expect(probeSessionLiveness(4242, lstart, { signal: answers, startedAt: () => lstart })).toBe("ALIVE");
   });
 });
