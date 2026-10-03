@@ -1,7 +1,15 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
@@ -602,5 +610,23 @@ export const main = (options: TraceabilityMainOptions = {}): TraceabilityMainRes
   return { report, exitCode: passes ? 0 : 1 };
 };
 
-const isMain = process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (isMain) process.exitCode = main().exitCode;
+/**
+ * Whether this module is the process entrypoint, not merely importable from one.
+ *
+ * `import.meta.url` is always the realpath Node resolved the module through, but
+ * `process.argv[1]` is whatever path the caller passed — including a symlink, such as
+ * `<state root>/current` (#1052). `resolve()` only normalizes a path; it does not follow
+ * symlinks, so comparing it against the realpath never matched through that link. Resolving both
+ * sides with `realpathSync` keeps the check correct across symlinks; a path that cannot be
+ * resolved (missing, unreadable, a dangling link) is treated as "not main" rather than thrown.
+ */
+const isMain = (): boolean => {
+  const entry = process.argv[1];
+  if (entry === undefined) return false;
+  try {
+    return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+};
+if (isMain()) process.exitCode = main().exitCode;

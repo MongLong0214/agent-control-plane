@@ -21,7 +21,9 @@
  *
  * Usage: hermes-tool-bridge <tool-socket-path>
  */
+import { realpathSync } from "node:fs";
 import { createConnection } from "node:net";
+import { fileURLToPath } from "node:url";
 
 export const main = (argv: readonly string[]): number => {
   const socketPath = argv[0];
@@ -51,10 +53,25 @@ export const main = (argv: readonly string[]): number => {
   return 0;
 };
 
+/**
+ * Whether this module is the process entrypoint, not merely importable from one.
+ *
+ * `import.meta.url` is always the realpath Node resolved the module through, but
+ * `process.argv[1]` is whatever path the caller passed — including a symlink, such as
+ * `<state root>/current` (#1052). Comparing the literal URL against a symlinked `argv[1]` never
+ * matches, so running this bridge through that link silently exits having done nothing.
+ * Resolving both sides to their realpath keeps the check correct across symlinks; a path that
+ * cannot be resolved (missing, unreadable, a dangling link) is treated as "not main" rather than
+ * thrown.
+ */
 const invokedDirectly = (): boolean => {
   const entry = process.argv[1];
   if (!entry) return false;
-  return import.meta.url === new URL(`file://${entry}`).href;
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(entry);
+  } catch {
+    return false;
+  }
 };
 
 if (invokedDirectly()) {

@@ -46,8 +46,9 @@
  */
 import { spawn } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
-import { chmodSync, rmSync } from "node:fs";
+import { chmodSync, realpathSync, rmSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
+import { fileURLToPath } from "node:url";
 
 import {
   CEO_CONVERSATION_BUDGET_MS,
@@ -440,10 +441,25 @@ export const main = async (argv: readonly string[]): Promise<number> => {
   }
 };
 
+/**
+ * Whether this module is the process entrypoint, not merely importable from one.
+ *
+ * `import.meta.url` is always the realpath Node resolved the module through, but
+ * `process.argv[1]` is whatever path the caller passed — including a symlink, such as
+ * `<state root>/current` (#1052). Comparing the literal URL against a symlinked `argv[1]` never
+ * matches, so running this runtime through that link silently exits having done nothing.
+ * Resolving both sides to their realpath keeps the check correct across symlinks; a path that
+ * cannot be resolved (missing, unreadable, a dangling link) is treated as "not main" rather than
+ * thrown.
+ */
 const invokedDirectly = (): boolean => {
   const entry = process.argv[1];
   if (!entry) return false;
-  return import.meta.url === new URL(`file://${entry}`).href;
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(entry);
+  } catch {
+    return false;
+  }
 };
 
 if (invokedDirectly()) {
