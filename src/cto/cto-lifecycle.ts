@@ -15,7 +15,7 @@ import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { Role, type RoleBinding, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
-import { SELF_CLAIM_EXECUTOR_KIND, defaultProcessAncestryInspector } from "../registry/canonical-self-claim.ts";
+import { SELF_CLAIM_EXECUTOR_KIND, defaultProcessAncestryInspector, isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderAdapter, ProviderRegistry, SessionHandle } from "../runtime/provider.ts";
 import type { RunEngine } from "../run/run-engine.ts";
@@ -996,15 +996,10 @@ export class CtoLifecycle {
    * self-claim bound, which no provider adapter launched and so none can answer for or replace.
    * Read from durable state — the holding actor's lifetime `SELF_CLAIM_EXECUTOR_KIND` target and
    * its current runtime being this binding's session — never from a provider or model string.
+   * The rule is the shared one the outbox's in-band delivery reads, scoped to this binding.
    */
   #isAdoptedCanonical(binding: RoleBinding): boolean {
-    return this.db.get<{ held: number }>(
-      `SELECT 1 AS held FROM assignments a
-         JOIN conversational_actors c ON c.actor_id = a.actor_id
-         JOIN actor_target_bindings tb ON tb.target_actor_id = a.actor_id
-        WHERE a.assignment_id = ? AND tb.executor_kind = ? AND c.current_session_id = ?`,
-      [binding.assignmentId, SELF_CLAIM_EXECUTOR_KIND, binding.sessionId],
-    ) !== undefined;
+    return isAdoptedCanonicalRuntime(this.db, binding.sessionId, binding.assignmentId);
   }
 
   /**

@@ -116,6 +116,9 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     },
     acknowledge: (messageId: string, sessionId: string, bindingGeneration: number) =>
       source.outbox.acknowledge(messageId, sessionId, bindingGeneration),
+    // Read-only: the caller's own in-band rows, fenced by the incarnation its connection presented.
+    pendingInBandDispatch: (sessionId: string, sessionIncarnation: string) =>
+      source.outbox.pendingInBandFor(sessionId, sessionIncarnation),
     contractForRun: (runId: string) => {
       const run = source.runs.require(runId);
       const manifest = run.pinnedManifestDigest ? source.projects.manifest(run.pinnedManifestDigest) : null;
@@ -244,6 +247,29 @@ const createCtoServerFromPort = (
     async (args) => write("run_ack", args.idempotencyKey, (peer) => {
       const fenced = owner(peer, args.runId);
       return fenced.allowed ? respond(port.acknowledge(args.messageId, fenced.value.sessionId, fenced.value.bindingGeneration)) : respond(fenced);
+    }),
+  );
+  server.registerTool(
+    "role_dispatch_pending",
+    {
+      description:
+        "The pending control-plane messages (dispatch, revision, escalation reply, drain, cancel) addressed in band to this exact session at its active generation. Acknowledge each with run_ack.",
+      inputSchema: {},
+    },
+    async () => read("role_dispatch_pending", (peer) => {
+      // The session is the authenticated connection's, never an argument: there is no input
+      // through which one session could ask for another's rows. The incarnation is checked here
+      // and again inside the read, which matches rows only to the current holder of their own
+      // role generation down to that incarnation.
+      if (!peer.sessionId || !peer.sessionIncarnation) {
+        return respond(deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "CTO MCP peer is missing a session incarnation"));
+      }
+      if (!port.sessionIsCurrent(peer.sessionId, peer.sessionIncarnation)) {
+        return respond(deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "CTO MCP session incarnation is not current", {
+          sessionId: peer.sessionId,
+        }));
+      }
+      return ok({ messages: port.pendingInBandDispatch(peer.sessionId, peer.sessionIncarnation) });
     }),
   );
   server.registerTool(

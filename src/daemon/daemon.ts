@@ -2200,6 +2200,9 @@ export class Daemon {
     if (this.options.buzz) {
       const delivery = setInterval(() => {
         void this.runPeriodic("buzz_delivery", async () => {
+          // Rows `deliverPending` withholds as in band are woken for instead, at most once per row
+          // per window; this never throws, so it cannot turn a good delivery tick into a failure.
+          await this.cp.outbox.wakeInBandPending();
           const result = await this.options.buzz!.deliverPending();
           if (result.failed.length > 0) {
             throw new Error(`delivery failed for ${result.failed.length} outbox message(s)`);

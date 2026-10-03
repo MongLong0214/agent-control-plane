@@ -299,6 +299,12 @@ export const startDaemonMcpListeners = async (
     ...(daemon.attachments ? { attachments: daemon.attachments } : {}),
   });
   daemon.setWakeTransportPeers?.(listeners.ctoConversation);
+  // In-band delivery to an adopted canonical CTO: a row withheld from Buzz wakes the role through
+  // the same port a role-addressed Buzz message wakes it through. Then one pass for rows that were
+  // queued while no port existed (before a restart, or before these listeners opened); the
+  // daemon's delivery tick repeats it, at most once per row per window.
+  cp.outbox.attachInBandWake((roleKey) => listeners.ctoConversation.wake(roleKey));
+  void cp.outbox.wakeInBandPending();
   return listeners;
 };
 
