@@ -329,6 +329,16 @@ export const ReasonCode = {
    * reads it as "claim instead"; every other refusal ends the attach.
    */
   CTO_REATTACH_UNBOUND: "CTO_REATTACH_UNBOUND",
+  /**
+   * A run's dispatch found its project's PRIMARY_CTO held by an adopted canonical CTO whose
+   * runtime is not running — its recorded process is gone, its session row is already terminal, or
+   * its binding was released and the role's latest assignment is still that canonical actor's.
+   *
+   * No provider launched that runtime, so none is asked about it and none replaces it: the role
+   * is never given a spawned session, and it recovers when its own conversation claims it again.
+   * The run stays QUEUED and nothing but the refusal's audit row is written.
+   */
+  CANONICAL_CTO_AWAITING_RECLAIM: "CANONICAL_CTO_AWAITING_RECLAIM",
   OPERATOR_UNAUTHENTICATED: "OPERATOR_UNAUTHENTICATED",
   OPERATOR_METHOD_NOT_ALLOWED: "OPERATOR_METHOD_NOT_ALLOWED",
   /** An authenticated operator method outlived its execution budget. Not an authentication fact. */
