@@ -1,0 +1,21 @@
+Limit: the adopted Hermes CEO runtime has no signer for the Buzz ingress secret, no new signing platform, secret or external actor may be created, and a plain public pubkey is not authentication, so the CEO proves its Buzz channel identity by posting a one-time challenge token, minted for its admitted tool connection, in a Buzz mention its own Nostr key signs
+Limit: pending challenges live only in daemon memory with no new table: a daemon restart drops them and the CEO asks again; one pending challenge per session, a new one replaces it, and each expires ten minutes after it was minted
+Ruled-out: a Gateway identity field reporting the CEO's pubkey | it is a self-report, the Gateway describing itself, and not proof that the runtime holds the key
+Ruled-out: an operator bind of the CEO's pubkey | a human attestation that would have to be repeated at every CEO generation
+Warn: the key is write-once per session row and otherSessionCarrying refuses a key any other row holds, so after the next CEO re-adoption onto a new session this same key cannot be rebound without a further, separately approved change
+Warn: a verified event addressed to the CTO whose content carries exactly one acp-buzz-bind token goes to the binding and never to admission, whoever signed it, so a message that quotes a live token is delivered to no one
+Warn: a refused binding attempt writes one SESSION_BUZZ_ACTOR_BIND_REFUSED audit row per challenge and cause, and an unknown nonce writes none, so a stranger reposting a public token or a relay re-sending an event adds no audit row; the subscriber's admission-refused counter still counts every refused frame
+Unverified: the challenge store's own verifyEvent re-check is not independently witnessed: removing it fails no test, because the mention subscriber's verifyEvent runs first on every event that reaches the store
+Unverified: not run against a live relay, the Buzz CLI or a live Hermes Gateway; the tests state the process tree and the Gateway readback while the nostr-tools events, the mention subscriber, the adopted CEO tool socket and the registries are real
+Record-Id: r-0b16dd6d3a79
+Provenance: inherited 96d1326a4167c8b06e2b6c09088fe9e7bff6b329
+
+Limit: ACP1055-01: content carrying the binding marker is refused unless it is exactly one well-formed token; the marker matches any case and whitespace, dashes, underscores or nothing between acp, buzz and bind, after NFKC with format characters removed, so a message that merely names the marker is not delivered, and homoglyphs from other scripts are not folded
+Ruled-out: reading content that is not exactly one well-formed token as an ordinary message | the parser's null sent `${token} ${token}` and a token beside a malformed prefix to both the peer and the owner paths (ACP1055-01); marker-carrying content is classified NONE, TOKEN or MALFORMED and only NONE reaches admission
+Ruled-out: answering every replay of a consumed binding event as already applied | a refused write's replay became ALREADY_DURABLE and moved the subscriber's cursor past older undelivered owner messages (ACP1055-02); the writer's answer is kept beside the consuming event and only an accepted binding's replay is INGRESS_REPLAY_IGNORED
+Warn: ACP1055-02: a consumed challenge keeps the writer's answer with its event; a refused write's replay returns that refusal and a write that threw is answered CONFLICT, both REFUSED, which moves no cursor; the nonce still never binds twice
+Warn: the sink decides interception from the content, not from whether a challenge store is wired; with no store a marker-carrying message is refused outright, never delivered
+Warn: r-0b16dd6d3a79's Warn that content carrying exactly one token goes to the binding was narrower than the behaviour after this commit: every marker-carrying message is kept from admission, and one that is not exactly one well-formed token is refused with INVALID_ARGUMENT and no audit row
+Unverified: not run against a live relay, the Buzz CLI or a live Hermes Gateway; the regressions use real nostr-tools events through the real subscriber, sink, tool socket and registries
+Record-Id: r-668447e9ecdd
+Provenance: inherited ff3222717b64544745a0d516e202ae70cfa255f6
