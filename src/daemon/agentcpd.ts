@@ -52,6 +52,7 @@ import { BuzzBindChallenges, buzzBindContentOf } from "../buzz/buzz-bind-challen
 import {
   BUZZ_MENTION_ADDRESSED_TO,
   BuzzMentionBindingUnavailableError,
+  nativeSubscriberScheduler,
   startBuzzMentionSubscriberFromStateDir,
   type BuzzMentionAdmission,
   type BuzzMentionAdmissionRequest,
@@ -62,6 +63,7 @@ import {
   type BuzzRelaySocketFactory,
   type BuzzSubscriberScheduler,
 } from "../buzz/buzz-mention-subscriber.ts";
+import { OwnerReplyConsumer, type OwnerReplyTimers } from "../conversation/owner-reply-consumer.ts";
 import type { OwnerIdentity } from "../ceo/owner-authority.ts";
 import { canonicalTurnTarget } from "../conversation/canonical-turn-target.ts";
 import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
@@ -1483,6 +1485,55 @@ export const startDaemonBuzzMentionSubscriber = (
     ...(options.openSocket ? { openSocket: options.openSocket } : {}),
     ...(options.scheduler ? { scheduler: options.scheduler } : {}),
   });
+};
+
+/** The running owner-reply consumer and the wake-ups wired to it. */
+export interface DaemonOwnerReplyConsumer {
+  readonly consumer: OwnerReplyConsumer;
+  /** The startup sweep, for a caller that wants to wait for it. Main does not. */
+  readonly started: Promise<void>;
+  close(): void;
+}
+
+/**
+ * Main's owner-reply consumer (#1036), beside the mention subscriber whose identities and
+ * connections it publishes through, so it shares that subscriber's relay and configuration.
+ *
+ * Woken three ways and no other: when the coordinator commits a settlement that wrote a new item,
+ * when an identity's relay connection authenticates (first connect and every reconnect), and once
+ * now, at startup. A deployment with no subscriber still runs it, because a Telegram item must
+ * still get its one `OWNER_REPLY_UNDELIVERABLE_NO_TRANSPORT` row, and a Buzz item one saying the
+ * same.
+ */
+export const startDaemonOwnerReplyConsumer = (
+  cp: ControlPlane,
+  subscriber: BuzzMentionSubscriberHandle | null,
+  options: { timers?: OwnerReplyTimers; publishTimeoutMs?: number } = {},
+): DaemonOwnerReplyConsumer => {
+  const replies = subscriber !== null && subscriber.socketCount > 0 ? subscriber.replies : null;
+  const consumer = new OwnerReplyConsumer({
+    db: cp.db,
+    clock: cp.clock,
+    audit: cp.audit,
+    buzz: replies,
+    timers: options.timers ?? nativeSubscriberScheduler(),
+    ...(options.publishTimeoutMs === undefined ? {} : { publishTimeoutMs: options.publishTimeoutMs }),
+    onError: (error) => {
+      process.stderr.write(`owner-reply consumer: ${error instanceof Error ? error.message : String(error)}\n`);
+    },
+  });
+  const stopSettlementWake = cp.conversation.onOwnerReplyEnqueued(() => void consumer.wake("DUE"));
+  const stopRelayWake = replies?.onAuthenticated(() => void consumer.wake("RELAY")) ?? (() => undefined);
+  const started = consumer.start();
+  return {
+    consumer,
+    started,
+    close: () => {
+      stopSettlementWake();
+      stopRelayWake();
+      consumer.close();
+    },
+  };
 };
 
 /** Like Telegram's refusal path: a missing prerequisite disables only this ingress. */
@@ -3836,6 +3887,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   let buzzActorIngress: LocalBuzzActorIngress | null = null;
   let buzzMessageIngress: LocalBuzzMessageIngress | null = null;
   let buzzMentionSubscriber: BuzzMentionSubscriberHandle | null = null;
+  let ownerReplies: DaemonOwnerReplyConsumer | null = null;
   let operator: LocalOperatorListener | null = null;
   let canonicalSelfClaim: CanonicalSelfClaimListener | null = null;
   let adoptedCeoTools: CanonicalSelfClaimListener | null = null;
@@ -3855,6 +3907,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     process.stdout.write(`\nshutting down on ${signal}\n`);
     if (hermesAutoAdoptionTimer) clearInterval(hermesAutoAdoptionTimer);
     await telegram?.close();
+    ownerReplies?.close();
     buzzMentionSubscriber?.close();
     await buzzMessageIngress?.close();
     await buzzActorIngress?.close();
@@ -4092,6 +4145,10 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         );
       }
     }
+    // #1036 — the owner-reply consumer, next to the subscriber it publishes through. Started on
+    // every deployment, subscriber or not: an item it cannot deliver is still recorded as such.
+    ownerReplies = startDaemonOwnerReplyConsumer(cp, buzzMentionSubscriber);
+    process.stdout.write("owner-reply consumer started\n");
     if (telegramConfig) {
       const telegramStartOptions = options.telegramStartOptions ?? {};
       const ceoConversation = listeners.ceoConversation;
@@ -4125,6 +4182,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     // one of them bound left its socket file behind for the next daemon to find. The relay
     // subscriber joins them for the same reason: it holds outbound sockets, and a startup that
     // failed after it opened them would leave a daemon that exited still subscribed.
+    ownerReplies?.close();
     buzzMentionSubscriber?.close();
     await buzzMessageIngress?.close();
     await buzzActorIngress?.close();
