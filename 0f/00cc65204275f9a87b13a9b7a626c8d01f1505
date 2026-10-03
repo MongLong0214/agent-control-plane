@@ -1,0 +1,34 @@
+Limit: Claude Code 2.1.283 holds a cross-session message for the owner's approval when the receiving session bypasses permission prompts and the sender attests no permission mode; the daemon's wake is such a message, so a wake written straight to the session's messaging socket stopped starting a turn, observed on two canonical CTO sessions
+Limit: the daemon accepts a wake endpoint only directly in its state directory, so the proxy sits beside the session's messaging socket and passes the daemon's endpoint checks exactly when that socket would, with none of them loosened
+Limit: the daemon's wake reads no reply and counts as delivered once its frame is written, so a forward to the session that fails after that shows only on the relay's stderr (attach: wake forward failed <shape>), never in the daemon's wake classification
+Limit: a relay killed before it closes leaves its acp-wake-proxy-*.sock file in the state directory; nothing sweeps it
+Ruled-out: attesting a permission mode from the daemon's own wake client | rejected because that attestation is undocumented
+Ruled-out: pressing the held-message dialog on the owner's behalf | rejected because it is forbidden
+Ruled-out: a wake-proxy/ subdirectory of the state root for the proxy socket | the daemon refuses an endpoint whose parent is not exactly its state directory, so the proxy sits beside the session's socket rather than in a directory of its own
+Ruled-out: refusing a role_wake_endpoint_register call for any path other than the session's own messaging socket | the daemon already decides which endpoints it accepts and the proxy forwards only to the environment's socket, so such a call is forwarded as it arrived rather than refused
+Warn: the wake proxy must forward only the constant ROLE_WAKE_FRAME, byte for byte, and only to CLAUDE_CODE_MESSAGING_SOCKET: a message from the session's own child bypasses the hold, so any other byte or target makes the proxy a way to type into the session on the owner's behalf
+Warn: WAKE_FRAME in src/cli/attach-relay.ts is a copy of ROLE_WAKE_FRAME in src/mcp/role-conversation.ts; change both together, and tests/process/relay-wake-proxy.test.ts fails when they drift
+Warn: a test that runs the relay's CLI entry from inside a Claude Code session inherits that session's CLAUDE_CODE_MESSAGING_SOCKET and CLAUDE_CODE_MESSAGING_TOKEN, so the relay would open a proxy beside the real session's socket; clear both variables first
+Unverified: live Claude Code delivering the relay's auth-line wake without holding it was not observed; the tests drive a recording stand-in for the session's messaging socket
+Record-Id: r-wakeproxy1003
+Follows: r-169dbe3e90c9
+Provenance: inherited ca341789ce0e0d878333182d8e9bc5927c8ffd49
+
+Limit: no lstat sees what connect resolved: a messaging-socket name moved elsewhere just for the forward's connect and moved back before the look after it passes both looks; the owner-only directory leaves that move to this uid
+Ruled-out: renaming only the client ids that collide with an outstanding relay id, rather than every client request id | the late answer to a relay request whose wait timed out has no waiter left and would still reach a client request reusing that id
+Ruled-out: pinning the session socket's inode when the proxy opens, rather than checking afresh at each wake | a restart of the session's messaging server recreates the socket under a new inode and would be refused for the rest of the relay's life
+Warn: inspectWakeTarget in src/cli/attach-relay.ts copies the endpoint checks of #validateEndpointPath in src/mcp/role-conversation.ts by name and order; with the proxy registered the daemon checks only the proxy, so a check added on the daemon side must be added to inspectWakeTarget too or the messaging token can go to a socket the daemon would refuse
+Warn: the relay's own requests on a daemon connection must carry string ids: every client request leaves under a relay-counted number and its answer returns under the client's id, and a client message that names a request id (notifications/cancelled) must be renamed the same way
+Unverified: endpoint-owner-mismatch and a name swapped between the two looks are exercised only through a mocked lstatSync in tests/process/relay-wake-proxy.test.ts; no socket owned by another uid and no real rename race was tested
+Record-Id: r-1057r1r2target
+Follows: r-wakeproxy1003
+Provenance: inherited 0c2eff220a73e960bf527b0cdd1045bd13130da9
+
+Limit: the relay sends a request of its own on a live daemon link only while its wake proxy listens, so with no proxy there is no relay id for a client id to collide with, and every line in either direction passes byte for byte as before the proxy existed
+Ruled-out: keying the id renaming on the messaging variables being present, rather than on the wake proxy listening | a complete environment whose socket the proxy may not forward to opens no proxy, and renaming there would change the client's bytes with no proxy to protect
+Warn: r-1057r1r2target's Warn that every client request leaves under a relay-counted number holds only while the wake proxy listens: with no proxy the relay renames nothing, and a request read before the proxy listened keeps the client's own id until it is answered
+Warn: nextUpstreamId and nextInternalId in src/cli/attach-relay.ts skip every id that a request sent under the client's own id before the proxy opened still has in flight; without that skip a relay-counted id can equal such a request's id
+Unverified: the PR1057-R3 witnesses in tests/process/relay-wake-proxy.test.ts drive the relay in-process against a stand-in daemon behind the reattach door; no real Claude Code client and no real agentcpd was run through the relay with the messaging variables absent or partial
+Record-Id: r-1057r3passthru
+Follows: r-1057r1r2target
+Provenance: inherited 92e17c165419f10f1149c5032552f3bbefe8f0eb
