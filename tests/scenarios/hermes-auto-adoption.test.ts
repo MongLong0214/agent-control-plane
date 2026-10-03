@@ -88,6 +88,27 @@ interface Scene {
   auto(): NonNullable<ReturnType<typeof createConfiguredHermesAutoAdoption>>;
 }
 
+/** Binds the CEO to `sessionId` with an authenticated target born at OLD_HEAD in DIGEST. */
+const bindCeo = (h: Harness, sessionId: string) => {
+  const claimed = { executorKind: "hermes", targetLocator: OLD_HEAD, targetLocatorDigest: DIGEST };
+  let receipt: HermesTargetBindResponse | null = null;
+  const bound = h.cp.bindings.bind({ role: Role.CEO, sessionId, authenticatedTarget: {
+    claimed, protocolVersion: "hermes.target-bind/v1", expectedExecutorRuntimeIdentity: RUNTIME,
+    get targetBindReceipt() { return receipt; },
+    get attestationDigest() { return receipt?.receipt_digest ?? ""; },
+    verify: (tuple) => {
+      const fields = { domain: "hermes.target-bind" as const, version: 1 as const, actor_id: tuple.actorId,
+        binding_generation: tuple.generation, executor_runtime_identity: RUNTIME,
+        requested_session_id: OLD_HEAD, lineage_root_digest: DIGEST };
+      receipt = { ...fields, receipt_digest: digestOf(fields) };
+      return claimed;
+    },
+  } });
+  expect(bound.allowed).toBe(true);
+  if (!bound.allowed) throw new Error(bound.message);
+  return bound;
+};
+
 /**
  * CEO gen1 bound to a Hermes runtime with an authenticated target (born at OLD_HEAD), then — unless
  * `revoke` is false — revoked with `revokeReason` (by default a continuity reason). Its process is
@@ -104,22 +125,7 @@ const scene = (options: { revoke?: boolean; revokeReason?: string; incumbentAliv
       osStartedAt: processStartedAt(process.pid)! })
     : h.cp.sessions.create({ provider: "hermes", model: "hermes-runtime", osPid: DEAD_PID });
   expect(h.cp.sessions.transition(incumbent.sessionId, SessionLifecycle.READY).allowed).toBe(true);
-  const claimed = { executorKind: "hermes", targetLocator: OLD_HEAD, targetLocatorDigest: DIGEST };
-  let receipt: HermesTargetBindResponse | null = null;
-  const bound = h.cp.bindings.bind({ role: Role.CEO, sessionId: incumbent.sessionId, authenticatedTarget: {
-    claimed, protocolVersion: "hermes.target-bind/v1", expectedExecutorRuntimeIdentity: RUNTIME,
-    get targetBindReceipt() { return receipt; },
-    get attestationDigest() { return receipt?.receipt_digest ?? ""; },
-    verify: (tuple) => {
-      const fields = { domain: "hermes.target-bind" as const, version: 1 as const, actor_id: tuple.actorId,
-        binding_generation: tuple.generation, executor_runtime_identity: RUNTIME,
-        requested_session_id: OLD_HEAD, lineage_root_digest: DIGEST };
-      receipt = { ...fields, receipt_digest: digestOf(fields) };
-      return claimed;
-    },
-  } });
-  expect(bound.allowed).toBe(true);
-  if (!bound.allowed) throw new Error(bound.message);
+  const bound = bindCeo(h, incumbent.sessionId);
   const actorId = h.cp.db.get<{ actor_id: string }>("SELECT actor_id FROM assignments WHERE role_key = 'CEO'")!.actor_id;
   if (options.revoke !== false) {
     expect(h.cp.bindings.revoke("CEO", options.revokeReason ?? FAILOVER_REFUSED).allowed).toBe(true);
@@ -327,5 +333,52 @@ describe("Hermes CEO auto-adoption — wired to the revocation", () => {
     } finally {
       clearInterval(timer);
     }
+  });
+});
+
+describe("Hermes CEO auto-adoption — PR #1053 review counterexamples", () => {
+  it("ACP1053-01: does not override an operator's revocation made while the Gateway identity was pending", async () => {
+    const s = scene();
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    let held = false;
+    const auto = createConfiguredHermesAutoAdoption(s.h.cp, s.configuration, {
+      identityReader: () => async () => {
+        s.gateway.reads++;
+        if (!held) { held = true; await pending; }
+        return s.gateway.answer();
+      },
+      authorityHeld: () => true,
+      backoff: { baseMs: 1_000, maxMs: 4_000 },
+    })!;
+    // Generation 1 was revoked by continuity, so the pass is eligible and asks the Gateway.
+    const pass = auto.tick("ceo_revoked");
+    expect(s.gateway.reads).toBe(1);
+    // While it waits, generation 2 is bound (its runtime dead too) and an operator stops the CEO.
+    const second = s.h.cp.sessions.create({ provider: "hermes", model: "hermes-runtime", osPid: DEAD_PID });
+    expect(s.h.cp.sessions.transition(second.sessionId, SessionLifecycle.READY).allowed).toBe(true);
+    expect(bindCeo(s.h, second.sessionId).value.bindingGeneration).toBe(s.revokedGeneration + 1);
+    expect(s.h.cp.bindings.revoke("CEO", "operator stopped the CEO").allowed).toBe(true);
+    const before = snapshot(s.h);
+    release();
+    expect(await pass).toMatchObject({ attempted: true, decision: { allowed: false } });
+    // The operator's decision stands: no generation 3, nothing written but one refusal row.
+    expect(s.h.cp.bindings.active("CEO")).toBeNull();
+    expect(auditOnlyDelta(before, snapshot(s.h))).toEqual([HERMES_AUTO_ADOPTION_REFUSED]);
+    expect(s.h.cp.audit.byKind(HERMES_AUTO_ADOPTED)).toEqual([]);
+    expect(await auto.tick("periodic")).toEqual({ attempted: false, skipped: "REVOKED_BY_DECISION" });
+  });
+
+  it("ACP1053-03: refuses a head the audit log would not store exactly, binding nothing", async () => {
+    // A head the shared validator admits but AuditLog redacts as secret-shaped.
+    const s = scene();
+    s.gateway.answer = () => ({ ...s.proof, session_id: `sk-${"Z".repeat(25)}` });
+    expect(await s.auto().tick("periodic")).toMatchObject({ attempted: true, decision: { allowed: false } });
+    expect(s.h.cp.bindings.active("CEO")).toBeNull();
+    expect(s.h.cp.db.all("SELECT binding_generation, status FROM assignments WHERE role_key = 'CEO'"))
+      .toEqual([{ binding_generation: s.revokedGeneration, status: "REVOKED" }]);
+    expect(s.h.cp.audit.byKind(TARGET_HEAD_ADVANCED)).toEqual([]);
+    expect(readHermesTargetHead(s.h.cp.db, s.actorId)?.head).toBe(OLD_HEAD);
+    expect(s.h.cp.audit.byKind(HERMES_AUTO_ADOPTION_REFUSED)).toHaveLength(1);
   });
 });

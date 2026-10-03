@@ -4,6 +4,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { Role, roleKeyFor } from "../domain/types.ts";
 import { isContinuityRevocationReason } from "../continuity/continuity-kernel.ts";
 import { probeSessionLiveness, type SessionLiveness } from "../daemon/dead-binding-recovery.ts";
+import type { AutomaticAdoptionIncumbent } from "./hermes-incumbent-adoption.ts";
 
 /**
  * The daemon re-adopts a restarted Hermes Gateway as the CEO by itself (2026-10-03).
@@ -28,6 +29,10 @@ import { probeSessionLiveness, type SessionLiveness } from "../daemon/dead-bindi
  * reason, or none, is read as such a decision (fail-closed): only the operator's `adopt hermes`
  * binds it again.
  *
+ * The generation found eligible is handed to the core (`AutomaticAdoptionIncumbent`), which restores
+ * that generation or nothing: the Gateway is read between this check and the bind, and a generation
+ * bound and revoked by a decision in that window is not one this pass may restore (ACP1053-01).
+ *
  * A refused attempt is retried on a later pass, no sooner than an exponential backoff allows. Its
  * audit row is written once per distinct refusal of a revoked generation, not once per pass: the
  * newest refusal row is compared first, so a Gateway that stays down for a day leaves one row.
@@ -50,8 +55,11 @@ export type HermesAutoAdoptionOutcome =
   | { attempted: true; decision: Decision<unknown> };
 
 export interface HermesAutoAdoptionOptions {
-  /** The configured adoption core: reads the Gateway itself and takes no caller input. */
-  adopt(): Promise<Decision<unknown>>;
+  /**
+   * The configured adoption core: reads the Gateway itself and takes no caller input beyond the
+   * eligible generation, which it may only restore.
+   */
+  adopt(incumbent: AutomaticAdoptionIncumbent): Promise<Decision<unknown>>;
   authorityHeld?: () => boolean;
   /** Test seam for the incumbent's liveness; production probes the recorded pid and start. */
   liveness?: (osPid: number | null, recordedStartedAt: string | null) => SessionLiveness;
@@ -78,22 +86,22 @@ export const createHermesAutoAdoption = (cp: ControlPlane, options: HermesAutoAd
   let failure: { generation: number; count: number; retryNotBefore: number } | null = null;
 
   /** The four preconditions, read synchronously; nothing here writes or asks the Gateway. */
-  const revokedDeadGeneration = (): { generation: number } | HermesAutoAdoptionSkip => {
+  const revokedDeadGeneration = (): AutomaticAdoptionIncumbent | HermesAutoAdoptionSkip => {
     if (cp.bindings.active(roleKey) !== null) return "CEO_ACTIVE";
-    const latest = cp.db.get<{ binding_generation: number; session_id: string; session_incarnation: string;
-      status: string; revoked_reason: string | null }>(
-      `SELECT binding_generation, session_id, session_incarnation, status, revoked_reason
+    const latest = cp.db.get<{ assignment_id: string; binding_generation: number; session_id: string;
+      session_incarnation: string; status: string; revoked_reason: string | null }>(
+      `SELECT assignment_id, binding_generation, session_id, session_incarnation, status, revoked_reason
          FROM assignments WHERE role_key = ? ORDER BY binding_generation DESC LIMIT 1`,
       [roleKey],
     );
     if (latest === undefined) return "NO_REVOKED_CEO";
     if (latest.status !== "REVOKED") return "NO_REVOKED_CEO";
-    if (!isContinuityRevocationReason(latest.revoked_reason)) return "REVOKED_BY_DECISION";
+    if (latest.revoked_reason === null || !isContinuityRevocationReason(latest.revoked_reason)) return "REVOKED_BY_DECISION";
     const incumbent = cp.sessions.get(latest.session_id);
     if (incumbent === null) return "INCUMBENT_NOT_DEAD";
     if (incumbent.incarnation !== latest.session_incarnation) return "INCUMBENT_NOT_DEAD";
     if (liveness(incumbent.osPid, incumbent.osProcessStartedAt) !== "DEAD") return "INCUMBENT_NOT_DEAD";
-    return { generation: latest.binding_generation };
+    return { assignmentId: latest.assignment_id, generation: latest.binding_generation, revokedReason: latest.revoked_reason };
   };
 
   /** One row per distinct refusal of one revoked generation; a repeat of the newest writes nothing. */
@@ -129,7 +137,7 @@ export const createHermesAutoAdoption = (cp: ControlPlane, options: HermesAutoAd
     inFlight = true;
     let decision: Decision<unknown>;
     try {
-      decision = await options.adopt();
+      decision = await options.adopt(eligible);
     } catch {
       decision = deny(ReasonCode.CONFLICT, "authenticated live Gateway incumbent cannot be established", {});
     } finally {

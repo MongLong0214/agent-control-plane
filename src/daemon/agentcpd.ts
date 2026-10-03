@@ -19,9 +19,22 @@ import {
   createHermesBootstrapAuthority,
   type HermesBootstrapAuthority,
 } from "../bootstrap/hermes-bootstrap.ts";
-import { createHermesIncumbentAdoption, type GatewayIncumbentProof } from "../bootstrap/hermes-incumbent-adoption.ts";
-import { createHermesAutoAdoption, type HermesAutoAdoption } from "../bootstrap/hermes-auto-adoption.ts";
-import { judgeLiveHead, readHermesTargetHead, recordHeadAdvance } from "../session/hermes-target-head.ts";
+import {
+  createHermesIncumbentAdoption,
+  type AutomaticAdoptionIncumbent,
+  type GatewayIncumbentProof,
+} from "../bootstrap/hermes-incumbent-adoption.ts";
+import {
+  createHermesAutoAdoption,
+  type HermesAutoAdoption,
+  type HermesAutoAdoptionOptions,
+} from "../bootstrap/hermes-auto-adoption.ts";
+import {
+  headAdvanceTransaction,
+  judgeLiveHead,
+  readHermesTargetHead,
+  recordHeadAdvance,
+} from "../session/hermes-target-head.ts";
 import {
   createAdoptedCeoToolAdmission,
   type AdoptedCeoToolAdmission,
@@ -1586,11 +1599,11 @@ export const createConfiguredHermesGatewayConversation = (
     const head = judgeLiveHead(current.target, reported);
     if (head.verdict === "REFUSE") return null;
     if (head.verdict === "SAME") return head.head;
-    const advanced = cp.db.txDecision((): Decision<void> => {
+    const advanced = headAdvanceTransaction(cp.db, (): Decision<void> => {
       if (!sameAuthority(currentAuthority(), pinned)) {
         return deny(ReasonCode.CONFLICT, "the CEO authority moved while the Gateway was read", {});
       }
-      return recordHeadAdvance(cp.audit, current.target, head, { path: "gateway_delivery",
+      return recordHeadAdvance(cp.db, cp.audit, current.target, head, { path: "gateway_delivery",
         sessionId: current.sessionId, roleKey: roleKeyFor(Role.CEO),
         bindingGeneration: current.bindingGeneration, gatewayPid: current.processPid });
     });
@@ -1734,7 +1747,7 @@ export const createConfiguredHermesIncumbentAdoption = (
     adoptionFactory?: typeof createHermesIncumbentAdoption;
     authorityHeld?: () => boolean;
   } = {},
-): (() => Promise<Decision<unknown>>) | undefined => {
+): ((automatic?: AutomaticAdoptionIncumbent) => Promise<Decision<unknown>>) | undefined => {
   const values = configuredHermesAdoptionValues(configuration);
   if (!values) return undefined;
 
@@ -1747,10 +1760,12 @@ export const createConfiguredHermesIncumbentAdoption = (
     hermesHome: values.ACP_HERMES_HOME!,
     executorRuntimeIdentity: values.ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY!,
   });
-  return async () => {
+  // `automatic` is the daemon's own pass's eligible generation; the operator method passes none.
+  return async (automatic) => {
     try {
       const proof = await gatewayOrigin();
-      return adoption.adopt({ gatewayPid: proof.process_pid, gatewayStartToken: proof.process_started_at });
+      return adoption.adopt({ gatewayPid: proof.process_pid, gatewayStartToken: proof.process_started_at,
+        ...(automatic ? { automatic } : {}) });
     } catch {
       return ports.authorityHeld && !ports.authorityHeld()
         ? deny(ReasonCode.DAEMON_LOCK_LOST, "daemon lock was lost during incumbent adoption", {})
@@ -1770,7 +1785,7 @@ export const createConfiguredHermesAutoAdoption = (
   cp: ControlPlane,
   configuration: Readonly<Record<string, string | undefined>>,
   ports: Parameters<typeof createConfiguredHermesIncumbentAdoption>[2] & {
-    adopt?: () => Promise<Decision<unknown>>;
+    adopt?: HermesAutoAdoptionOptions["adopt"];
     backoff?: { baseMs: number; maxMs: number };
   } = {},
 ): HermesAutoAdoption | undefined => {
