@@ -48,6 +48,7 @@ import {
 import { readProcessStartToken } from "../core/process-argv.ts";
 import { processStartedAt } from "../core/process-identity.ts";
 import { BuzzAdapter, BuzzCliTransport } from "../buzz/buzz-adapter.ts";
+import { BuzzBindChallenges } from "../buzz/buzz-bind-challenge.ts";
 import {
   BUZZ_MENTION_ADDRESSED_TO,
   BuzzMentionBindingUnavailableError,
@@ -1361,6 +1362,69 @@ export const buzzMentionInputFor = (
 };
 
 /**
+ * The adopted CEO's Buzz binding challenges (`BuzzBindChallenges`), over this daemon's registries:
+ * minted on the adopted CEO tool socket, answered through the mention subscriber, written by the one
+ * writer of `sessions.buzz_actor_id` with the relay credential's allowlist as its authenticator.
+ *
+ * A refused answer leaves one `SESSION_BUZZ_ACTOR_BIND_REFUSED` row per challenge and cause.
+ */
+export const createDaemonBuzzBindChallenges = (cp: ControlPlane, policy: IngressPolicy): BuzzBindChallenges => {
+  const guard = new IngressGuard(cp.db, cp.clock, cp.audit, { buzz: policy });
+  return new BuzzBindChallenges({
+    nowMs: () => cp.clock.now().getTime(),
+    currentCeo: () => {
+      const ceo = cp.bindings.active(roleKeyFor(Role.CEO));
+      if (!ceo) return null;
+      const lifecycle = cp.sessions.get(ceo.sessionId)?.lifecycle;
+      return {
+        sessionId: ceo.sessionId,
+        sessionIncarnation: ceo.sessionIncarnation,
+        bindingGeneration: ceo.bindingGeneration,
+        live: lifecycle === SessionLifecycle.READY || lifecycle === SessionLifecycle.DRAINING,
+      };
+    },
+    // The refusals the writer would give, asked before a challenge exists so the CEO hears them
+    // from the tool call rather than from a message that silently binds nothing.
+    bindable: (sessionId, actor) => {
+      if (!guard.isAllowedActor("buzz", actor)) {
+        return deny(
+          ReasonCode.SESSION_BUZZ_ACTOR_NOT_AUTHENTICATED,
+          "buzz channel identity is not authenticated by the deployment's ingress policy",
+          { sessionId, buzzActorId: actor },
+        );
+      }
+      const held = cp.sessions.get(sessionId)?.buzzActorId ?? null;
+      if (held !== null && held !== actor) {
+        return deny(ReasonCode.SESSION_BUZZ_ACTOR_IMMUTABLE, "session already speaks as a different buzz channel identity", {
+          sessionId,
+        });
+      }
+      if (cp.sessions.otherSessionCarrying(actor, sessionId) !== null) {
+        return deny(ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND, "another session row already carries this identity", {
+          sessionId,
+        });
+      }
+      return allow(ReasonCode.OK, undefined);
+    },
+    bind: (possession) => cp.sessions.bindBuzzActor({ possession }, guard),
+    recordRefusal: (refusal) => {
+      cp.audit.record({
+        kind: "SESSION_BUZZ_ACTOR_BIND_REFUSED",
+        reasonCode: refusal.reasonCode,
+        sessionId: refusal.sessionId,
+        actor: `buzz:${refusal.author}`,
+        evidence: {
+          channel: "buzz",
+          cause: refusal.cause,
+          nonce: buzzMessageNonce(refusal.eventId),
+          generation: refusal.ceoBindingGeneration,
+        },
+      });
+    },
+  });
+};
+
+/**
  * The daemon's own front door on the relay, feeding the seam a person's CLI feeds (#760 Part C).
  *
  * Two things are worth stating about the signature this composes. The subscriber has already
@@ -1386,6 +1450,8 @@ export const startDaemonBuzzMentionSubscriber = (
   options: {
     openSocket?: BuzzRelaySocketFactory;
     scheduler?: BuzzSubscriberScheduler;
+    /** The adopted CEO's pending Buzz binding challenges, shared with its tool socket. */
+    bindChallenges?: BuzzBindChallenges;
   } = {},
 ): BuzzMentionSubscriberHandle => {
   const secret = policy.secret?.trim() ?? "";
@@ -1394,6 +1460,10 @@ export const startDaemonBuzzMentionSubscriber = (
   }
   const sink: BuzzMentionSink = {
     admit: async (request) => {
+      // A verified event carrying one binding token is the CEO's answer to its challenge: it goes to
+      // the binding, and never to admission, so it is not delivered as a message to anyone.
+      const bound = options.bindChallenges?.settle(request.event) ?? null;
+      if (bound !== null) return buzzMentionVerdictOf(bound);
       const delivered = await deliverBuzzMessage(
         messageIngress.seam.ingress,
         messageIngress.seam.port,
@@ -1684,6 +1754,10 @@ export const createConfiguredAdoptedCeoToolAdmission = (
  * binding its own Buzz channel identity. It reaches the one writer of `sessions.buzz_actor_id`
  * (`BuzzActorIngress.bindActor`) with this connection's admitted runtime as the session proof, and
  * the relay-signed envelope still has to verify; it is a mutation, so caller provenance applies.
+ *
+ * Called with the actor alone, it mints a challenge instead (`BuzzBindChallenges`) for this
+ * connection's admitted runtime and writes nothing: the CEO, which has no signer for the relay's
+ * secret, answers it by posting the token in a Buzz mention signed with that actor's key.
  */
 export const startAdoptedCeoToolSocket = (
   cp: ControlPlane,
@@ -1694,6 +1768,7 @@ export const startAdoptedCeoToolSocket = (
     onCeoApproved?: (runId: string) => void | Promise<unknown>;
     admissionTimeoutMs?: number;
     buzzActorIngress?: BuzzActorIngress;
+    buzzBindChallenges?: BuzzBindChallenges;
   } = {},
 ): Promise<CanonicalSelfClaimListener> => {
   const port = createHermesMcpPort(cp, { onCeoApproved: options.onCeoApproved });
@@ -1706,18 +1781,37 @@ export const startAdoptedCeoToolSocket = (
         provenance: admitted.provenance,
       });
       const buzzActorIngress = options.buzzActorIngress;
-      if (buzzActorIngress !== undefined) {
+      const buzzBindChallenges = options.buzzBindChallenges;
+      if (buzzActorIngress !== undefined || buzzBindChallenges !== undefined) {
         server.registerTool(
           "buzz_actor_bind",
           {
             description:
-              "Bind this CEO runtime's own Buzz channel identity from a relay-signed binding envelope " +
-              "(the actor, a fresh nonce, and the relay's signature over them and this session).",
-            inputSchema: { actor: z.string().min(1), nonce: z.string().min(1), signature: z.string().min(1) },
+              "Bind this CEO runtime's own Buzz channel identity. With the actor alone (hex or npub), " +
+              "returns a one-time challenge token valid for 10 minutes: post it in a Buzz mention of the " +
+              "CTO, signed with that actor's key, to bind. With a relay-signed binding envelope (the " +
+              "actor, a fresh nonce, and the relay's signature over them and this session), binds directly.",
+            inputSchema: {
+              actor: z.string().min(1),
+              nonce: z.string().min(1).optional(),
+              signature: z.string().min(1).optional(),
+            },
           },
-          async (args: { actor: string; nonce: string; signature: string }) => {
+          async (args: { actor: string; nonce?: string | undefined; signature?: string | undefined }) => {
             const peer = admission.authenticate(admitted);
             if (!peer.allowed) return respond(peer);
+            if (args.nonce === undefined && args.signature === undefined) {
+              if (buzzBindChallenges === undefined) {
+                return respond(deny(ReasonCode.INVALID_ARGUMENT, "this daemon serves no signed-event binding challenge"));
+              }
+              return respond(buzzBindChallenges.mint(admitted.runtime, args.actor));
+            }
+            if (args.nonce === undefined || args.signature === undefined || buzzActorIngress === undefined) {
+              return respond(deny(
+                ReasonCode.INVALID_ARGUMENT,
+                "a relay-signed binding needs both a nonce and a signature, and a configured relay binding",
+              ));
+            }
             const bound = buzzActorIngress.bindActor({
               actor: args.actor,
               nonce: args.nonce,
@@ -3904,6 +3998,11 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     const adoptedCeoAdmission = createConfiguredAdoptedCeoToolAdmission(cp, hermesAdoptionConfiguration, {
       authorityHeld: () => daemon.lock.held(),
     });
+    // Minted on the adopted CEO tool socket and answered through the mention subscriber, so one
+    // store serves both; in memory only, and a restart drops every pending challenge.
+    const buzzBindChallenges = buzzActorIngressPolicy === null
+      ? undefined
+      : createDaemonBuzzBindChallenges(cp, buzzActorIngressPolicy);
     if (adoptedCeoAdmission) {
       adoptedCeoTools = await startAdoptedCeoToolSocket(cp, daemon, stateDir, adoptedCeoAdmission, {
         onCeoApproved: (runId) => daemon.finalizeApprovedRun(runId),
@@ -3914,6 +4013,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
             cp.sessions,
           ),
         }),
+        ...(buzzBindChallenges === undefined ? {} : { buzzBindChallenges }),
       });
       process.stdout.write("adopted CEO tool socket started\n");
     }
@@ -3953,6 +4053,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
           stateDir,
           buzzActorIngressPolicy,
           buzzMessageIngress,
+          buzzBindChallenges === undefined ? {} : { bindChallenges: buzzBindChallenges },
         );
         process.stdout.write(
           `Buzz mention subscriber configured identities: ${buzzMentionSubscriber?.socketCount ?? 0}\n`,
