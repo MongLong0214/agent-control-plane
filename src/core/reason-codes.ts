@@ -686,6 +686,18 @@ export const ReasonCode = {
   /** The signer's relay connection went away before the relay answered. The item stays `PENDING` and retries. */
   OWNER_REPLY_RELAY_UNAVAILABLE: "OWNER_REPLY_RELAY_UNAVAILABLE",
   /**
+   * A Telegram owner reply's delivery evidence, from the turn's own Hermes Gateway receipt, does not
+   * prove this item delivered (A3): the state is not Hermes' confirmed token, or the content digest,
+   * chat, replied-to message, message ids or obligation id do not match what ACP stored for the turn.
+   * The item stays `PENDING`, parked, with one audit row naming the failed check.
+   */
+  OWNER_REPLY_DELIVERY_EVIDENCE_REJECTED: "OWNER_REPLY_DELIVERY_EVIDENCE_REJECTED",
+  /**
+   * A receipt's Telegram delivery evidence differs from the delivery already recorded for the item
+   * (A3). A recorded delivery is never rewritten; the later evidence is refused and audited.
+   */
+  OWNER_REPLY_DELIVERY_EVIDENCE_CONFLICT: "OWNER_REPLY_DELIVERY_EVIDENCE_CONFLICT",
+  /**
    * A reconciled receipt names a different target binding than the one this turn was claimed
    * against. Kept apart from the generation/runtime checks because it is a distinct fact: which
    * Hermes conversation this turn belongs to, not which execution of it.
