@@ -1,0 +1,47 @@
+Limit: r-1036ownerreply's Limit that no consumer delivers an owner-reply item yet was true when written and is false after this commit: owner-reply-consumer.ts delivers Buzz items and records DELIVERED
+Limit: an item written before this change carries no replyText, so the consumer refuses it with OWNER_REPLY_BODY_UNAVAILABLE and it stays PENDING
+Limit: a Telegram item stays PENDING with one OWNER_REPLY_UNDELIVERABLE_NO_TRANSPORT audit row: this daemon has no Telegram reply transport, and the item is never sent through Buzz
+Limit: a publish verdict is read on the subscriber connection's frame queue behind any running mention admission, so a slow admission can turn it into a TIMEOUT; the retry resends the same event
+Limit: an item whose signer's relay connection has not authenticated is skipped with no attempt and no audit row until a later wake finds the connection authenticated
+Ruled-out: querying the relay for the event id after a restart to reconcile a crash | it needs a second subscription path and still cannot tell not stored from not visible to the query; the stored signed event is resent instead and the relay keeps one copy of an id
+Ruled-out: publishing owner replies through the buzz messages send CLI that BuzzAdapter uses | its invocation takes a channel, content and mentions, and no reply tag
+Ruled-out: re-reading the receipt from Hermes at delivery time to get the reply text | the sender would need the receipt port and the turn's whole identity, where the settlement already holds the port's answer
+Warn: a recorded intent's stored event must be resent as is: re-signing picks a new created_at and so publishes a second event
+Warn: a binary from before this change throws on a DELIVERED item, so a rollback past this change meets delivered items as unreadable on enqueueOwnerReply's redelivery path
+Unverified: the live Buzz relay's acceptance of a kind-9 reply on the subscriber's own connection, and its answer to a resent event id, were exercised only against an in-process fake relay
+Record-Id: r-1036delivery
+Follows: r-1036ownerreply
+Provenance: inherited 00c5d10b2fef988497ac1aec1a9e8b3cf700f630
+
+Limit: R1056-01: the Buzz publisher signs and sends only an OwnerReplyPublication issued from a stored PENDING item and its recorded intent; it exposes no general-purpose sign or publish
+Limit: R1056-02: a recorded intent is its own inbound_messages row on channel owner-reply-intent, protected by the payload, no-replace and delete-authority triggers; an UNREADABLE intent blocks the item and is never replaced
+Limit: R1056-03: an item waiting on its signer's authentication is left out of the backoff timer and is retried by an authentication wake-up
+Limit: R1056-04: a delivery records relayAck ACCEPTED or DUPLICATE and a refusal records REFUSED_RATE_LIMIT or REFUSED_OTHER; no relay text is stored
+Limit: R1056-05: reply text is stored as base64 of its exact UTF-8 bytes and the intent row is written with JSON.stringify, so CR and CRLF survive storage on both settlement lanes
+Limit: R1056-06: an undelivered cause is audited once per item per reasonCode:cause; the audited set lives in the item's mutable result_json, so it bounds this sender's rows, not those of a writer that rewrites that column
+Ruled-out: keeping the recorded intent in the item's mutable result_json | any writer of that column could replace or drop it, and a dropped intent let the sender sign a second, different event
+Ruled-out: storing a truncated copy or the prefix of the relay's OK text | the relay chooses both, so either may carry anything
+Ruled-out: changing canonicalJson to stop rewriting CR and CRLF | its newline rule is what keeps other digests equal across checkouts
+Warn: durable owner-reply text and signed-event content must not pass through canonicalJson, which rewrites CR and CRLF to LF and so breaks the receipt digest and the event id
+Warn: a new caller that signs or sends an owner reply must get an OwnerReplyPublication from issueOwnerReplyPublication under the delivery authority; the publisher refuses anything else
+Record-Id: r-1056review1
+Follows: r-1036delivery
+Provenance: inherited b42ed78be53a704a2ab650b4b8395db9db4fa8de
+
+Limit: R1056-01: the Buzz publisher sends an owner reply only when the publication's event equals, in id and in EVENT-frame bytes, the intent read from storage when the publication is spent, and what it sends is that stored event; a publication and its event are frozen down to each tag
+Limit: R1056-02: from schema v39 an owner-reply-intent row cannot change its channel or nonce by UPDATE, and no row can be moved into that channel (inbound_messages_owner_reply_key_immutable); inserting a new intent row stays as open as it was
+Ruled-out: keeping the v38 claim guards' test for a receipt at exactly version 38 | a database bootstrapped at v39 holds only its own receipt, so all three guards were inert there; they now test for 38 or later and v39 reinstalls them
+Warn: deploying this needs an approved v38 to v39 migration of the live state database: v39 adds a trigger and reinstalls the three v38 claim guards
+Unverified: the FROZEN_BLOBS pin for src/db/migrations.ts in tests/helpers/frozen-authority.ts is not updated here, because that digest comes from the authority that froze the file; its pin test fails until that authority supplies the new digest
+Record-Id: r-1056review2
+Follows: r-1056review1
+Provenance: inherited f958a447c696c373024125386cdf8fa684c43ebe
+
+Limit: the src/db/migrations.ts pin is the digest of that file at f958a447 as the CEO computed it independently from the GitHub original; it matches this checkout's own computation and is valid for those exact bytes only, so any later edit to migrations.ts voids it and needs a new independent digest
+Warn: do not recompute this pin from the file in a later change: a pin derived from its own input agrees with whatever it is handed, so the next digest must again come from the independent authority
+Record-Id: r-1056pinconfirm
+Follows: r-1056review2
+Provenance: inherited 2818e7935778fb614dbd117d3cb550d2096dfc70
+
+Provenance: inherited b9486e5355c56f741fca608999e71277d6729447
+X-Claude-Session: https://claude.ai/code/session_0125xavK2hjM9n55cHBkK4bB
