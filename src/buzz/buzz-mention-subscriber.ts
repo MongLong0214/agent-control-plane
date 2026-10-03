@@ -397,7 +397,7 @@ export interface BuzzMentionEvent {
 }
 
 /**
- * What the admission seam did with one envelope, in the only four answers this subscriber can act
+ * What the admission seam did with one envelope, in the only five answers this subscriber can act
  * on differently.
  *
  * Only the two **durable** answers are cursor-trusted, and the split between `REFUSED` and the
@@ -413,8 +413,19 @@ export interface BuzzMentionEvent {
  * So a refusal is a statement about **one event** and never about where the window should be. It
  * is still deterministic — asking again produces the same refusal — which is why it does not
  * reconnect either; it simply costs nothing and changes nothing.
+ *
+ * `PRECEDES_BINDING` is the one refusal that is cursor-trusted: the event was signed before the
+ * addressed role's current binding generation was created, so it was never this binding's, and
+ * the window it moves to is earlier than anything this binding can be handed. Without the advance,
+ * a subscriber whose window was never set — a new identity, a new room — would ask for the room's
+ * whole history again on every reconnect.
  */
-export type BuzzMentionAdmission = "DURABLE" | "ALREADY_DURABLE" | "REFUSED" | "RETRY";
+export type BuzzMentionAdmission =
+  | "DURABLE"
+  | "ALREADY_DURABLE"
+  | "REFUSED"
+  | "RETRY"
+  | "PRECEDES_BINDING";
 
 /** One verified event, addressed, on its way to the admission seam. */
 export interface BuzzMentionAdmissionRequest {
@@ -776,6 +787,12 @@ type BuzzMentionRejection =
    * bucket needs the seam to pass its code through, which this surface does not receive.
    */
   | "admission-already-durable"
+  /**
+   * The sink answered `PRECEDES_BINDING`: the event was signed before the addressed role's binding
+   * generation was created. The one count for that refusal — nothing writes an audit row per event,
+   * because a first subscription can be handed a room's whole history.
+   */
+  | "admission-precedes-binding"
   | "frame-too-large"
   | "frame-not-json"
   | "frame-not-a-message"
@@ -823,10 +840,11 @@ export interface BuzzMentionCounters {
    * Frames the seam made newly durable — `DURABLE`, and nothing else.
    *
    * Narrowed from "produced an admission attempt", which was true of all four answers and so
-   * could not tell a delivery from a refusal. The other three each carry their own reason below,
+   * could not tell a delivery from a refusal. The other four each carry their own reason below,
    * because every one of them is a frame that arrived and did not newly reach a session, and they
    * call for different repairs: a refusal is about authority, a retry is about the role's peer
-   * being down, and an already-durable is about a reconnect asking for the boundary event again.
+   * being down, an already-durable is about a reconnect asking for the boundary event again, and a
+   * precedes-binding is history from before the role's binding generation.
    */
   readonly admitted: number;
   /**
@@ -858,7 +876,7 @@ class FrameTally {
 
   record(outcome: BuzzMentionFrameOutcome): void {
     this.#framesHandled += 1;
-    // `DURABLE` and nothing else. Three of the four answers are not deliveries, and an earlier
+    // `DURABLE` and nothing else. Four of the five answers are not deliveries, and an earlier
     // version of this line excluded only `REFUSED` — which left `RETRY` reporting a delivery while
     // the role's peer was down, and `ALREADY_DURABLE` incrementing once per reconnect for one
     // message. A merge-gate review measured both. `health.json` is the one place an operator looks
@@ -1418,10 +1436,13 @@ class BuzzMentionSubscription {
     // *up* is what the outer `Math.max` refuses — the mark only ever moves forward.
     const claimed = Math.min(event.created_at, this.#deps.scheduler.nowSeconds());
     this.#since = Math.max(this.#since ?? 0, claimed);
-    // Both remaining answers advance the mark — a replay must not be re-requested forever — and
-    // only what they are *called* differs. `DURABLE` is the delivery; `ALREADY_DURABLE` is the
-    // boundary event arriving again because `since` is inclusive.
+    // Every remaining answer advances the mark — a replay must not be re-requested forever, and an
+    // event signed before the role's binding is refused again on every request — and only what they
+    // are *called* differs. `DURABLE` is the delivery; `ALREADY_DURABLE` is the boundary event
+    // arriving again because `since` is inclusive; `PRECEDES_BINDING` is history from before the
+    // binding, whose refusal is terminal. It keeps the connection, like every deterministic answer.
     if (admission === "ALREADY_DURABLE") return { rejected: "admission-already-durable", admission };
+    if (admission === "PRECEDES_BINDING") return { rejected: "admission-precedes-binding", admission };
     return { rejected: null, admission };
   }
 }
