@@ -1,0 +1,25 @@
+Limit: macOS syspolicyd's provenance table grows by one row per new executable inode exec'd and is SIP-protected, so it cannot be pruned; a fixture that writes a fresh executable per run grows it on every run
+Limit: the group kill runs only after spawnSync returns, and spawnSync returns only once the direct child exits; a direct child that ignores Node's killSignal still wedges the call
+Ruled-out: moving runInstaller to bounded-child.ts runBoundedChild | that helper takes no env and the 77 call sites are synchronous it() bodies; detached spawnSync plus a post-timeout group kill gives the same cleanup at one site
+Ruled-out: publishing the stable shim with rename | rename replaces an existing target, so racing workers on a cold path would each mint an inode; link fails with EEXIST instead
+Warn: test fixtures must not create per-run executables; route shims through tests/helpers/stable-fixture-executable.ts and pass per-run values through env vars, never through the script text
+Record-Id: r-ccb0f2feef79
+Provenance: inherited d29c6cc842e7ff4247fa0b5753016d90eb4304e9
+
+Warn: the SIGKILL case's 2,500ms lower bound relies on the helper's 2s SIGTERM grace running in full; shortening GROUP_SIGTERM_GRACE_MS below about 1.5s makes that case fail, and dropping the bound would let a trap that did not take silently leave the SIGKILL step without a witness
+Warn: a failing case here kills the grandchild it recorded in its finally block; keep that cleanup, or a red run leaves the orphan it is about for the next test
+Record-Id: r-4d13b763956f
+Provenance: inherited 82b0168559b3fd127ce49ccc317143f4c99e504a
+
+Limit: spawnSync returns only once its direct child has exited, so group cleanup that starts after the call never runs for a direct child that ignores the timeout signal; the escalation has to live in a supervising process
+Ruled-out: a blocking poll in the supervisor's escalation | the leader stays a zombie until the supervisor's event loop reaps it and a zombie still answers kill(-pgid, 0), so a group that died on SIGTERM still ran the full grace and settle
+Ruled-out: symlinking fixture executables to the cache | a symlink's realpath is the cache, so rows that pin or search the target's own path would pass for the wrong reason; hard links keep the path and realpath
+Warn: stableFixtureLink shares the cached inode: writing to or chmod'ing a linked path alters the cache entry, which the next reuse refuses; an entry is reused only at mode 0700
+Unverified: the production installer's own copy of --node into dist/bin/node still gets a new inode on every run of the deploy suite; this test-only change does not touch it
+Record-Id: r-dbc44b259ae8
+Provenance: inherited d067ea2346406080abd54831bb2bd10c621152bb
+
+Limit: vitest's fork workers end without running process exit handlers, so cleanup registered there never runs; the supervisor's record directory is per call and removed as soon as it is read
+Record-Id: r-5fe3ff6a5005
+Follows: r-dbc44b259ae8
+Provenance: inherited c201b7a15e30fcc85f80ba8e4c45bbab53271ebc
