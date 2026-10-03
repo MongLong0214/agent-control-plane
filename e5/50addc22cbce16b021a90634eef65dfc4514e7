@@ -1,0 +1,18 @@
+Limit: only mentions the daemon's own subscriber delivers are floored: an envelope with no signed time, which is every one the local socket parses, is not compared with the binding's creation
+Limit: rows admitted before this change are not recognised, because an owner's payload keeps no signed time; the three OWNER_MESSAGE rows admitted live on 2026-10-03 from 2026-08-09 mentions stay PENDING until the Logic Pro MCP PRIMARY_CTO claims each and rejects it with role_owner_message_reject
+Limit: the floor is whole seconds, as created_at is, so an event signed in the fraction of the binding's start second before the binding is admitted
+Warn: BUZZ_MENTION_PRECEDES_BINDING is the one refusal that moves the subscriber's window, and that is safe only because a binding's creation is never later than now and a later generation's is later; a code added to that mapping without both properties lets a refusal choose the window
+Warn: a new binding generation raises the floor, so a mention signed before a takeover is refused even when it was sent while the role was between holders and retried
+Record-Id: r-mentionfloor
+Follows: r-193af16ec4c2
+Provenance: inherited 4aca969f9cd70ad54ab80ba0cdd98a312b12c5cf
+
+Limit: a CEO peer mention whose claim is still open after the CTO's generation moved is not reachable through the daemon's own composition, because a takeover rejects a queued peer row and settles its claim in the same transaction; its regression reopens the claim directly
+Limit: the floor is asked of a spent event id only when the guard answers INGRESS_REPLAY_IGNORED or INGRESS_TURN_OUTCOME_UNKNOWN and the addressed role has an active target; a replay with no signed time, as the local socket's, still commits its replay audit row
+Ruled-out: asking the binding floor ahead of guard.admit | a forged envelope would be refused as history instead of as forged, and no audit row would record the forgery
+Ruled-out: resolving the replay's role through #targetFor | it journals a tag it cannot resolve, and a repeated event must not journal again
+Warn: a redelivery of an event admitted under an earlier binding generation is now counted under admission-precedes-binding rather than admission-already-durable
+Warn: the floor's refusal of a spent event id is thrown and rolls the guard's audit row back, so a code added to SPENT_NONCE_CODES must be one IngressGuard.admit returns only past its allowlist and signature
+Record-Id: r-1061spentfloor
+Follows: r-mentionfloor
+Provenance: inherited f44d32531e2c9a571067d3ae7191358e5340089d
