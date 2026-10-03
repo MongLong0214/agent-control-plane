@@ -47,7 +47,7 @@ const liveToken = (): string => {
 
 /** A pid that answered once and is gone now: a child that ran to completion and was reaped. */
 const exitedPid = (): number => {
-  const child = spawnSync(process.execPath, ["-e", ""], { stdio: "ignore" });
+  const child = spawnSync(process.execPath, ["-e", ""], { stdio: "ignore", timeout: 10_000 });
   if (typeof child.pid !== "number") throw new Error("could not start a child process");
   return child.pid;
 };
