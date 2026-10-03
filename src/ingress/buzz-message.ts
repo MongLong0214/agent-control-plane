@@ -73,8 +73,9 @@ export interface BuzzMessageIngressInput {
    *
    * The daemon's own subscriber always sets it, from an event whose Nostr signature it verified, and
    * a role-addressed admission refuses an event signed before the addressed role's binding generation
-   * was created (`BUZZ_MENTION_PRECEDES_BINDING`). The local socket's envelope carries none, and an
-   * absent value is not compared: there is then no signed time to compare.
+   * was created (`BUZZ_MENTION_PRECEDES_BINDING`) — on its first delivery, and on a redelivery of an
+   * event id already admitted under an earlier generation. The local socket's envelope carries none,
+   * and an absent value is not compared: there is then no signed time to compare.
    */
   createdAt?: number;
   /**
@@ -706,8 +707,7 @@ export class BuzzMessageIngress {
       // an absent tag is not "therefore the CEO", because reading it that way would hand a
       // message meant for some role to the owner's own conversation.
       const presented = input.mention;
-      const mention = typeof presented === "string" ? presented.trim() : "";
-      const candidates = mention.length === 0 ? [] : [...new Set(this.router.rolesFor(mention))];
+      const { mention, candidates } = this.#rolesNamedBy(presented);
       const roleKey = candidates.length === 1 ? candidates[0] : undefined;
       if (roleKey === undefined) {
         const shape: UnboundMentionShape =
@@ -740,6 +740,33 @@ export class BuzzMessageIngress {
       return allow(ReasonCode.OK, { kind: "ROLE", roleKey });
     }
     return allow(ReasonCode.OK, { kind: "CEO" });
+  }
+
+  /** The roles a `p` tag names, by reading the router alone. */
+  #rolesNamedBy(presented: unknown): { mention: string; candidates: string[] } {
+    const mention = typeof presented === "string" ? presented.trim() : "";
+    const candidates = mention.length === 0 ? [] : [...new Set(this.router.rolesFor(mention))];
+    return { mention, candidates };
+  }
+
+  /**
+   * The role an envelope addresses, found by reading alone: the bound PRIMARY_CTO the peer rule
+   * names for the CEO's mention, the one role an owner's `p` tag names, and null otherwise — the
+   * owner's CEO conversation, a tag naming no single role, a non-owner the peer rule refuses.
+   *
+   * For an event id `admit` has already spent (`admitBuzzMessage`): its replay refusal is asked
+   * about the addressed role's binding floor before it commits. Reads the router itself instead of
+   * asking `#targetFor`, which journals a tag it cannot resolve — a repeated event must not journal
+   * again (B4).
+   */
+  addressedRole(input: BuzzMessageIngressInput): string | null {
+    if (!this.#ownerActors.has(input.actor.trim())) {
+      const peer = this.#peerBinding(input);
+      return peer.allowed ? peer.value.ctoRoleKey : null;
+    }
+    if (input.addressedTo === BUZZ_MESSAGE_RECIPIENT_CEO) return null;
+    const { candidates } = this.#rolesNamedBy(input.mention);
+    return candidates.length === 1 ? (candidates[0] ?? null) : null;
   }
 
   /**
@@ -948,6 +975,40 @@ const rolledBackDecision = (err: unknown): Decision<never> | null =>
     : null;
 
 /**
+ * An event signed before this binding generation existed was not addressed to it.
+ *
+ * The relay keeps a channel identity's whole history and a subscriber with no window yet — a new
+ * identity, a new room, the first start — asks for all of it; without this, mentions from weeks
+ * before the binding are queued as new work for whoever holds the role now.
+ *
+ * The floor is the binding's creation, never "now": a message signed after it while no session was
+ * attached is the holder's, and is admitted whenever it arrives. An envelope with no signed time
+ * (the local socket's) has nothing to compare and is not refused here.
+ */
+const precedingBinding = (
+  input: BuzzMessageIngressInput,
+  roleKey: string,
+  active: ActiveRoleTarget,
+): Decision<never> | null =>
+  input.createdAt !== undefined && signedSince(input.createdAt, active.createdAt) === null
+    ? deny(
+        ReasonCode.BUZZ_MENTION_PRECEDES_BINDING,
+        "the mention was signed before the addressed role's binding generation was created",
+        { roleKey, bindingGeneration: active.bindingGeneration },
+      )
+    : null;
+
+/**
+ * `IngressGuard.admit`'s answers for an event id it has already spent — a replay, or a turn whose
+ * outcome was never recorded. Reached only past its allowlist and signature, and each writes one
+ * audit row in the transaction it returns into.
+ */
+const SPENT_NONCE_CODES: readonly string[] = [
+  ReasonCode.INGRESS_REPLAY_IGNORED,
+  ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN,
+];
+
+/**
  * §2 — role admission produces the inbound row, the exact role target and the outbox row together,
  * or produces none of them.
  *
@@ -962,7 +1023,10 @@ const rolledBackDecision = (err: unknown): Decision<never> | null =>
  *                 enqueue, a refused claim. Committing any of that would leave a spent nonce
  *                 addressed to nobody, or a queued message no claim holds open. So it is thrown,
  *                 and the whole admission is rolled back as if the event had never arrived — the
- *                 relay may then send it again.
+ *                 relay may then send it again. A replay of an event id already spent is the one
+ *                 refusal from `admit` that is thrown rather than returned, and only when the event
+ *                 was signed before the addressed role's binding generation: its audit row goes
+ *                 with it, and the spent slot and the first admission's rows stay as they were.
  */
 const admitBuzzMessage = (
   ingress: BuzzMessageIngress,
@@ -972,7 +1036,23 @@ const admitBuzzMessage = (
   try {
     return port.atomically((): Decision<BuzzMessageAdmission> => {
       const admitted = ingress.admit(input);
-      if (!admitted.allowed) return admitted as Decision<BuzzMessageAdmission>;
+      if (!admitted.allowed) {
+        // An event id already spent never reaches the floor below, and its refusal has written an
+        // audit row that a returned denial commits. Admitted under an earlier generation and handed
+        // back after the role's generation moved past its signed time, it is history from before
+        // this binding like any other, and is refused as such: thrown, so the guard's row goes too
+        // and every reconnect that hands the event back writes nothing (R1061-01). Asked after
+        // `admit` rather than ahead of it, because only these two answers come past its allowlist
+        // and signature: ahead of it, a forged envelope would be refused as history instead of as
+        // forged, and no audit row would record the forgery.
+        if (SPENT_NONCE_CODES.includes(admitted.reasonCode)) {
+          const roleKey = ingress.addressedRole(input);
+          const active = roleKey === null ? null : port.activeRoleTarget(roleKey);
+          const floor = roleKey !== null && active ? precedingBinding(input, roleKey, active) : null;
+          if (floor) throw rollingBack(floor);
+        }
+        return admitted as Decision<BuzzMessageAdmission>;
+      }
       const target = admitted.value.target;
       if (target.kind === "CEO") {
         return allow(admitted.reasonCode, { kind: "CEO", admitted: admitted.value });
@@ -1006,28 +1086,11 @@ const admitBuzzMessage = (
           ),
         );
       }
-      // An event signed before this binding generation existed was not addressed to it. The relay
-      // keeps a channel identity's whole history and a subscriber with no window yet — a new
-      // identity, a new room, the first start — asks for all of it; without this, mentions from
-      // weeks before the binding are queued as new work for whoever holds the role now.
-      //
-      // The floor is the binding's creation, never "now": a message signed after it while no
-      // session was attached is the holder's, and is admitted whenever it arrives. Thrown, so the
-      // admission rolls back and the refusal writes nothing — the replay slot, the inbound row and
-      // the admission's audit row all go — and a redelivery is refused the same way. An envelope
-      // with no signed time (the local socket's) has nothing to compare and is not refused here.
-      if (
-        input.createdAt !== undefined &&
-        signedSince(input.createdAt, active.createdAt) === null
-      ) {
-        throw rollingBack(
-          deny(
-            ReasonCode.BUZZ_MENTION_PRECEDES_BINDING,
-            "the mention was signed before the addressed role's binding generation was created",
-            { roleKey: target.roleKey, bindingGeneration: active.bindingGeneration },
-          ),
-        );
-      }
+      // The binding floor (`precedingBinding`). Thrown, so the admission rolls back and the refusal
+      // writes nothing — the replay slot, the inbound row and the admission's audit row all go —
+      // and a redelivery is refused the same way.
+      const floor = precedingBinding(input, target.roleKey, active);
+      if (floor) throw rollingBack(floor);
       const enqueued = port.enqueueOwnerMessage({
         roleKey: target.roleKey,
         bindingGeneration: active.bindingGeneration,

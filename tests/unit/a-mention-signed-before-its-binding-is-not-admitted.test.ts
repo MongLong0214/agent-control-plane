@@ -5,6 +5,7 @@ import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure
 import { afterAll, describe, expect, it } from "vitest";
 
 import {
+  BUZZ_MENTION_ADDRESSED_TO,
   BUZZ_SUBSCRIBER_CONFIG_FILENAME,
   type BuzzMentionEvent,
   type BuzzRelaySocketFactory,
@@ -19,7 +20,13 @@ import {
   startDaemonBuzzMentionSubscriber,
 } from "../../src/daemon/agentcpd.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
-import { buzzMessageNonce } from "../../src/ingress/buzz-message.ts";
+import {
+  type BuzzMessageIngressInput,
+  buzzMessageNonce,
+  buzzMessageSigningRequest,
+  deliverBuzzMessage,
+} from "../../src/ingress/buzz-message.ts";
+import { ingressSignature } from "../../src/ingress/ingress-guard.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
 import type { OwnerMessageHandover } from "../../src/mcp/role-conversation.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
@@ -45,6 +52,7 @@ const SECRET = "buzz-backfill-floor-test-secret";
 const PROJECT_ROOM = "buzz-project-room";
 const HISTORY_SECONDS = Math.floor(Date.parse("2026-08-09T05:00:00.000Z") / 1000);
 const PRECEDES_BINDING = "admission-precedes-binding";
+const ALREADY_DURABLE = "admission-already-durable";
 
 interface Key {
   secret: Uint8Array;
@@ -123,7 +131,7 @@ const start = async (options: { ceoBoundBeforeCtoMs?: number } = {}) => {
   }
 
   h.clock.advance(500);
-  const ctoSession = readySession(h, "cto", PROJECT_ROOM);
+  let ctoSession = readySession(h, "cto", PROJECT_ROOM);
   const ctoBound = h.cp.bindings.bind({
     role: Role.PRIMARY_CTO,
     sessionId: ctoSession.sessionId,
@@ -243,6 +251,78 @@ const start = async (options: { ceoBoundBeforeCtoMs?: number } = {}) => {
         [kind],
       ),
     precedesBinding: (): number => subscriber.counters().rejections[PRECEDES_BINDING] ?? 0,
+    alreadyDurable: (): number => subscriber.counters().rejections[ALREADY_DURABLE] ?? 0,
+    /**
+     * A takeover of the CTO role `afterMs` from now: `REPLACED`, so a new binding generation whose
+     * floor is the takeover's time. The new runtime answers on the same project channel and takes
+     * the CTO's channel identity once the old one has stopped, so the subscriber still holds the
+     * role. Returns the new generation's creation, in whole seconds.
+     */
+    takeOverCto: (afterMs: number): number => {
+      h.clock.advance(afterMs);
+      const next = readySession(h, "cto-next", PROJECT_ROOM);
+      const switched = h.cp.bindings.switchTo({
+        role: Role.PRIMARY_CTO,
+        projectId,
+        sessionId: next.sessionId,
+        reason: "test takeover",
+        conversation: "REPLACED",
+      });
+      if (!switched.allowed) throw new Error(`CTO takeover failed: ${switched.message}`);
+      expect(
+        h.cp.sessions.transition(ctoSession.sessionId, SessionLifecycle.STOPPED, "replaced").reasonCode,
+      ).toBe(ReasonCode.OK);
+      bindChannelIdentity(h, next, cto.pubkey);
+      ctoSession = next;
+      return secondsOf(switched.value.createdAt);
+    },
+    /** The turn claim the admission left on the event's inbound row, as the guard reads it. */
+    claimOf: (eventId: string): "unresolved" | "settled" | null => {
+      const row = h.cp.db.get<{ turn_claim_json: string | null }>(
+        `SELECT turn_claim_json FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`,
+        [buzzMessageNonce(eventId)],
+      );
+      if (!row?.turn_claim_json) return null;
+      const claim = JSON.parse(row.turn_claim_json) as Record<string, unknown>;
+      return claim["repliedAt"] === undefined &&
+        claim["noReplyAt"] === undefined &&
+        claim["settledAt"] === undefined
+        ? "unresolved"
+        : "settled";
+    },
+    /**
+     * Takes the settlement back off the event's claim, leaving its identity as it was.
+     *
+     * Only for the CEO's mention: a takeover rejects a queued peer row and settles its claim in the
+     * same transaction, so this composition cannot reach a peer claim still open after the CTO's
+     * generation moved. The guard's unresolved-claim branch is asked about it all the same.
+     */
+    reopenClaim: (eventId: string): void => {
+      h.cp.db.run(
+        `UPDATE inbound_messages
+            SET turn_claim_json = json_remove(turn_claim_json, '$.repliedAt', '$.noReplyAt', '$.settledAt')
+          WHERE channel = 'buzz' AND nonce = ?`,
+        [buzzMessageNonce(eventId)],
+      );
+    },
+    /**
+     * The owner's envelope as the local socket parses it — no signed time — straight to the seam the
+     * socket and the subscriber share.
+     */
+    socketDelivers: (event: BuzzMentionEvent) => {
+      const input: BuzzMessageIngressInput = {
+        actor: event.pubkey,
+        conversation: PROJECT_ROOM,
+        eventId: event.id,
+        addressedTo: BUZZ_MENTION_ADDRESSED_TO,
+        mention: cto.pubkey,
+        text: event.content,
+      };
+      return deliverBuzzMessage(ingress.seam.ingress, ingress.seam.port, {
+        ...input,
+        signature: ingressSignature(SECRET, buzzMessageSigningRequest(input)),
+      });
+    },
     holder: () => ({
       roleKey: ctoRoleKey,
       bindingGeneration: h.cp.bindings.active(ctoRoleKey)!.bindingGeneration,
@@ -373,6 +453,119 @@ describe("a Buzz mention signed before its role's binding generation", () => {
       await f.relayDelivers(late);
       expect(f.admitted(late.id)?.actor).toBe(f.ceo.pubkey);
       expect(f.rowsOf(MessageKind.PEER_MESSAGE)).toHaveLength(1);
+    } finally {
+      await f.close();
+    }
+  });
+});
+
+/**
+ * R1061-01: a mention admitted under one binding generation and handed back after the role's
+ * generation moved past its signed time.
+ *
+ * Its event id is already spent, so admission never reaches the floor the first delivery was asked
+ * about: the guard answers from the inbound row — a replay, or a turn whose outcome was never
+ * recorded — and writes that answer's audit row. The floor has to be asked on that path too, or
+ * every reconnect of a subscriber whose window sits on the event writes one more row for a mention
+ * the current generation was never addressed. Each row runs the daemon's own subscriber, through a
+ * dropped connection and the reconnect whose inclusive `since` hands the boundary event back.
+ */
+describe("a mention admitted under an earlier binding generation, redelivered after a takeover", () => {
+  const rows = [
+    { author: "owner", claim: "unresolved" },
+    { author: "owner", claim: "settled" },
+    { author: "peer", claim: "settled" },
+    { author: "peer", claim: "unresolved" },
+  ] as const;
+
+  for (const { author, claim } of rows) {
+    const sender = author === "peer" ? "CEO's peer mention" : "owner's mention";
+    it(`refuses the ${sender} whose prior claim is ${claim} as preceding the binding, writing nothing`, async () => {
+      const f = await start(author === "peer" ? { ceoBoundBeforeCtoMs: 120_000 } : {});
+      try {
+        const key = author === "peer" ? f.ceo : f.owner;
+        f.h.clock.advance(5_000);
+        const event = f.mention(key, f.nowSeconds(), "첫 세대에 받은 지시");
+        expect(event.created_at).toBeGreaterThanOrEqual(f.ctoBoundAtSeconds);
+        await f.relayDelivers(event);
+        expect(f.admitted(event.id)?.actor).toBe(key.pubkey);
+        expect(f.subscriber.counters().admitted).toBe(1);
+
+        // Settled for the owner by the first holder taking the message and never acknowledging it,
+        // which the takeover then rejects; for the CEO's, by the takeover rejecting the queued row.
+        // Unresolved for the owner because the takeover carries a queued message to the successor.
+        if (author === "owner" && claim === "settled") {
+          expect(claimedText(ownerMessageLedger(f.h.cp).claim(f.holder()))).toBe("첫 세대에 받은 지시");
+        }
+        const takenOverAt = f.takeOverCto(60_000);
+        expect(event.created_at).toBeLessThan(takenOverAt);
+        if (author === "peer" && claim === "unresolved") f.reopenClaim(event.id);
+        expect(f.claimOf(event.id)).toBe(claim);
+
+        // The relay drops; the reconnect asks from the admitted event on, inclusive, so the relay
+        // hands that event back.
+        f.relayDrops();
+        const filter = await f.reconnect();
+        expect(filter["since"]).toBe(event.created_at);
+
+        const before = f.footprint();
+        const alreadyDurable = f.alreadyDurable();
+        await f.relayDelivers(event);
+
+        expect(f.footprint()).toEqual(before);
+        expect(f.precedesBinding()).toBe(1);
+        expect(f.alreadyDurable()).toBe(alreadyDurable);
+        expect(f.claimOf(event.id)).toBe(claim);
+        // Terminal and cursor-trusted, as on a first delivery: the connection stays, nothing is
+        // retried, and the window stays on the event.
+        expect(f.live().closed).toBe(false);
+        expect(f.timersPending()).toBe(0);
+        expect(f.socketsOpened()).toBe(2);
+        f.relayDrops();
+        expect((await f.reconnect())["since"]).toBe(event.created_at);
+      } finally {
+        await f.close();
+      }
+    });
+  }
+
+  it("is still an ordinary replay, with its audit row, when redelivered inside the generation that admitted it", async () => {
+    const f = await start({ ceoBoundBeforeCtoMs: 120_000 });
+    try {
+      f.h.clock.advance(5_000);
+      const fromOwner = f.mention(f.owner, f.nowSeconds(), "같은 세대의 지시");
+      const fromCeo = f.mention(f.ceo, f.nowSeconds(), "같은 세대의 CEO 지시");
+      await f.relayDelivers(fromOwner);
+      await f.relayDelivers(fromCeo);
+      expect(f.subscriber.counters().admitted).toBe(2);
+
+      const before = f.footprint();
+      await f.relayDelivers(fromOwner);
+      await f.relayDelivers(fromCeo);
+
+      expect(f.footprint()).toEqual({ ...before, audit: before.audit + 2 });
+      expect(f.alreadyDurable()).toBe(2);
+      expect(f.precedesBinding()).toBe(0);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("is still an ordinary replay after a takeover when the envelope carries no signed time, as the local socket's does not", async () => {
+    const f = await start();
+    try {
+      f.h.clock.advance(5_000);
+      const event = f.mention(f.owner, f.nowSeconds(), "첫 세대에 받은 지시");
+      await f.relayDelivers(event);
+      expect(event.created_at).toBeLessThan(f.takeOverCto(60_000));
+      expect(f.claimOf(event.id)).toBe("unresolved");
+
+      const before = f.footprint();
+      const answer = await f.socketDelivers(event);
+
+      expect(answer.allowed).toBe(false);
+      expect(answer.reasonCode).toBe(ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN);
+      expect(f.footprint()).toEqual({ ...before, audit: before.audit + 1 });
     } finally {
       await f.close();
     }
