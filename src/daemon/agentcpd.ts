@@ -3909,12 +3909,25 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   let buzzMessageIngress: LocalBuzzMessageIngress | null = null;
   let buzzMentionSubscriber: BuzzMentionSubscriberHandle | null = null;
   // Read when asked, not captured: the claim and the reattach are composed before the subscriber
-  // starts, and until it does (or where none runs) this answers `null` and checks nothing. Once it
-  // is up, `assertCanonicalRoomsAreSubscribed` applies the same rule to every entry and refuses the
-  // whole start, so a claim or correction that ran before then under a mismatched configuration
-  // leaves a daemon that does not start rather than one that runs deaf.
+  // starts, and until it does (or where none runs) this answers `null` and checks nothing. That
+  // `null` is only an answer once startup has decided whether a subscriber runs, which is what the
+  // latch below is for.
   const subscribedBuzzRooms: SubscribedBuzzRooms = (buzzActorId) =>
     subscribedBuzzRoomsFrom(buzzMentionSubscriber?.identityRooms ?? [])(buzzActorId);
+  // One way, released once: after startup has decided the mention subscriber and, where one
+  // started, `assertCanonicalRoomsAreSubscribed` accepted every entry. The claim and reattach
+  // sockets open before that, and a claim or correction let through then found the lookup above
+  // `null`, opened its room and wrote its row before the start was refused (PR1060-R2-01). Until
+  // the release a claim is refused and a correction waits; a start that throws never releases it,
+  // so neither has written anything.
+  let canonicalRoomsSettled = false;
+  let settleCanonicalRooms: () => void = () => undefined;
+  const canonicalRoomsChecked = new Promise<void>((resolve) => {
+    settleCanonicalRooms = () => {
+      canonicalRoomsSettled = true;
+      resolve();
+    };
+  });
   let operator: LocalOperatorListener | null = null;
   let canonicalSelfClaim: CanonicalSelfClaimListener | null = null;
   let adoptedCeoTools: CanonicalSelfClaimListener | null = null;
@@ -4040,7 +4053,16 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       // against `ACP_OPERATOR_TOKEN`; its only authority is the kernel's own record of who opened
       // this socket, checked by `startCanonicalSelfClaimListener` itself before this handler is
       // ever called.
-      canonicalSelfClaim = await startCanonicalSelfClaimListener(daemon, stateDir, (peer, params) => {
+      canonicalSelfClaim = await startCanonicalSelfClaimListener(daemon, stateDir, async (peer, params) => {
+        // Refused before anything is constructed, so a claim in that window opens no room and
+        // writes no row, not even its refusal's audit row. Claiming again after startup succeeds.
+        if (!canonicalRoomsSettled) {
+          return deny(
+            ReasonCode.CONFLICT,
+            "the daemon is still starting and has not checked each canonical CTO's Buzz room against its mention subscriber",
+            {},
+          );
+        }
         // Deployment facts are the entry-time snapshot, never request or callback-time values.
         return executeCanonicalSelfClaimOperator(peer, params, {
           db: cp.db,
@@ -4085,7 +4107,16 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
           subscribedBuzzRooms,
         },
       });
-      await listeners.openCanonicalCtoReattach(canonicalCtoReattach, daemon);
+      // Admission is untouched and never waits on Buzz. Only the correction waits for the room
+      // check: it is fired after admission and nobody retries it, so refusing it would leave the
+      // CTO in its old room until the next reattach, while refusing the reattach ends the relay.
+      await listeners.openCanonicalCtoReattach({
+        ...canonicalCtoReattach,
+        correctBuzzAddress: async (peer) => {
+          await canonicalRoomsChecked;
+          return canonicalCtoReattach.correctBuzzAddress(peer);
+        },
+      }, daemon);
       process.stdout.write("canonical CTO reattach socket started\n");
     }
     // #1037 — the adopted CEO's tools, on their own kernel-peer socket; only when adoption is
@@ -4187,6 +4218,10 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         }
       }
     }
+    // Every path that did not throw arrives here with the subscriber decided: no relay credential,
+    // no buzz owner, no subscriber file, an unbound role, or a subscriber whose rooms passed both
+    // checks above. Only now may a claim or a correction open a room.
+    settleCanonicalRooms();
     if (telegramConfig) {
       const telegramStartOptions = options.telegramStartOptions ?? {};
       const ceoConversation = listeners.ceoConversation;

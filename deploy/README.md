@@ -66,7 +66,8 @@ When `buzz-nostr-subscriber.json` configures an identity for an entry's `buzzAct
 identity's `rooms` must include the entry's room (its `buzzAddress`, else `ACP_BUZZ_CHANNEL`):
 startup refuses otherwise, naming the project and both rooms, and the claim and the correction
 refuse to write such a room. Set the entry's `buzzAddress`, add the room to that identity's
-`rooms`, then restart the daemon.
+`rooms`, then restart the daemon. Until startup has made that check, a claim is refused (`CONFLICT`;
+claim again once the daemon is up) and a reattach is admitted with its correction held until then.
 Every entry's `projectId` must already be registered: an entry naming a project this deployment
 holds no record of refuses startup rather than being dropped, so a configured session cannot come
 up entitled to a project that does not exist. Registration is all that is required here — whether
