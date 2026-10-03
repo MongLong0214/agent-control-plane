@@ -610,6 +610,64 @@ describe("A3 R-A3-02: later reads rotate, so unavailable older receipts cannot s
   });
 });
 
+describe("A3 R-A3-03: a stream of new arrivals cannot keep an older reply from being read", () => {
+  it("delivers an older reply on the first pass after its receipt becomes available, ahead of later arrivals", async () => {
+    const fixture = daemonFixture();
+    const ingress = await startTelegramExternalIngress(fixture.cp, tempDir("a3-arr-"), fixture.laneConfig);
+    try {
+      const turns = new Map<number, TelegramExternalTurnIdentity>();
+      const reads = new Map<number, number>();
+      const later = (ms: number, body: Record<string, unknown>): GatewayAnswer => ({
+        kind: "deferred",
+        answer: new Promise<GatewayAnswer>((resolve) => {
+          setTimeout(() => resolve({ kind: "json", body }), ms);
+        }),
+      });
+      const older = 400;
+      gateway.answer = (u) => {
+        const turn = turns.get(u);
+        if (!turn) return { kind: "json", body: { status: "NEVER_FOUND" } };
+        const read = (reads.get(u) ?? 0) + 1;
+        reads.set(u, read);
+        // The older reply: settled with no evidence, no evidence on its first retry, then delivered.
+        if (u === older) return { kind: "json", body: gatewayReceipt(u, turn, read <= 2 ? { delivery: null } : {}) };
+        // An arrival: settled after 10 ms with no evidence; every later read takes 30 ms and has none.
+        return later(read === 1 ? 10 : 30, gatewayReceipt(u, turn, { delivery: null }));
+      };
+      const arrive = async (updateId: number, budgetMs: number): Promise<void> => {
+        const answer = await sendOverSocket(ingress.socketPath, envelope(updateId, `질문 ${updateId}`));
+        if (!answer.allowed) throw new Error(`the lane refused update ${updateId}: ${JSON.stringify(answer)}`);
+        turns.set(updateId, answer.turn);
+        await fixture.cp.conversation.reconcileUnresolved(budgetMs);
+        expect(turnState(fixture, answer.turn.turnRequestId)?.outcome_kind, `update ${updateId}`).toBe("COMPLETED");
+      };
+
+      await arrive(older, 5_000);
+      await fixture.cp.conversation.reconcileUnresolved(5_000); // the first retry: still no evidence
+      expect(reads.get(older)).toBe(2);
+      expect(ownerReplyFor(fixture.cp.db, turns.get(older)!.turnRequestId)?.status).toBe("PENDING");
+
+      // Each round, three replies settle — each in a pass whose 3 ms budget the 10 ms settlement
+      // exhausts, so it reads nothing else — and then one 50 ms pass holds about two 30 ms reads:
+      // fewer reads than arrivals, every round.
+      const bound = 1; // nothing was touched before the older reply's last read, so it is first
+      let rounds = 0;
+      let next = older + 1;
+      for (; rounds < 5; rounds += 1) {
+        if (ownerReplyFor(fixture.cp.db, turns.get(older)!.turnRequestId)?.status === "DELIVERED") break;
+        for (let arrival = 0; arrival < 3; arrival += 1) await arrive(next++, 3);
+        await fixture.cp.conversation.reconcileUnresolved(50);
+      }
+      expect(reads.get(older), "lookups of the older reply's receipt").toBeGreaterThan(2);
+      expect(ownerReplyFor(fixture.cp.db, turns.get(older)!.turnRequestId)?.status).toBe("DELIVERED");
+      expect(rounds).toBeLessThanOrEqual(bound);
+    } finally {
+      await ingress.close();
+      fixture.cp.close();
+    }
+  });
+});
+
 /* ---------------------------------------------------------------------------- (e) Buzz control */
 
 const NOW = "2026-10-03T00:00:00.000Z";

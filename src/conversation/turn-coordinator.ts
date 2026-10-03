@@ -415,14 +415,22 @@ export class ConversationTurnCoordinator {
   readonly #ownerReplyListeners = new Set<() => void>();
 
   /**
-   * When each parked Telegram reply was last asked about by a later read (A3), as a sequence number
-   * from `#deliveryReads`; a reply never asked about has none. Later reads go least recently read
-   * first, so a pass that runs out of budget hands the rest of the queue to the next pass instead of
-   * spending every pass on the same oldest replies whose receipts are unavailable (R-A3-02). In
-   * memory only: a restart starts the order over, at the oldest, which costs at most one rotation.
+   * When each parked Telegram reply was last touched (A3), on one counter (`#touches`): its
+   * settlement parked it with no delivery evidence, or a later read asked about it. Later reads go
+   * least recently touched first, queue order breaking ties. That is one order for both cases: a
+   * reply read at T is read again before any reply settled after T, and a reply a pass did not reach
+   * is read before any reply it did, so neither an unavailable backlog (R-A3-02) nor a stream of new
+   * arrivals (R-A3-03) can keep a reply from being read. A reply this process never touched (one
+   * parked before a restart) settled before everything this process touched, and sorts first. In
+   * memory only; nothing here is a schema change.
    */
-  readonly #deliveryReadAt = new Map<string, number>();
-  #deliveryReads = 0;
+  readonly #lastTouched = new Map<string, number>();
+  #touches = 0;
+
+  #touch(turnRequestId: string): void {
+    this.#touches += 1;
+    this.#lastTouched.set(turnRequestId, this.#touches);
+  }
 
   constructor(
     private readonly db: Db,
@@ -1727,6 +1735,7 @@ export class ConversationTurnCoordinator {
     readonly failed: number;
   }> {
     const candidates = this.unresolvedIdentities();
+    const touchedBeforePass = this.#touches;
     // Taken before this pass settles anything, so a reply this pass enqueues is not asked about
     // twice in the one pass: the receipt that settled it was read moments ago.
     let awaitingEvidence: readonly string[] = [];
@@ -1792,30 +1801,30 @@ export class ConversationTurnCoordinator {
     // A3: a completed Telegram turn whose reply is still parked, asked again inside what is left of
     // this pass's budget. Kept out of the counts above, which describe in-doubt turns: a later read
     // that fails leaves its reply parked, as it already was, and the next pass asks again.
-    for (const turnRequestId of this.#leastRecentlyRead(awaitingEvidence)) {
+    for (const turnRequestId of this.#leastRecentlyTouched(awaitingEvidence, touchedBeforePass)) {
       if (Date.now() - startedAt >= budgetMs) break;
-      // Marked before the read, so an overlapping pass sends this reply to the back too.
-      this.#deliveryReads += 1;
-      this.#deliveryReadAt.set(turnRequestId, this.#deliveryReads);
+      // Touched before the read, so an overlapping pass sends this reply to the back too.
+      this.#touch(turnRequestId);
       await this.#readTelegramDeliveryEvidence(turnRequestId);
     }
     return { swept: candidates.length, settled, unresolved: candidates.length - settled, failed };
   }
 
   /**
-   * `awaiting` (queue order, oldest first) reordered never-read first, then least recently read,
-   * queue order breaking ties. Every reply a pass did not reach sorts ahead of every reply it did,
-   * so each one is read within ceil(n / m) passes, m being how many reads one pass's budget holds.
-   * Replies no longer awaiting are forgotten here.
+   * `awaiting` (queue order, oldest first) reordered least recently touched first, queue order
+   * breaking ties. A reply k places from the front is read within ceil((k + 1) / m) passes, m being
+   * how many reads one pass's budget holds: everything behind it, and everything settled or read
+   * from then on, sorts after it. Forgets a reply that no longer awaits evidence and was last
+   * touched before this pass took its list; one touched since may have settled after the list.
    */
-  #leastRecentlyRead(awaiting: readonly string[]): readonly string[] {
+  #leastRecentlyTouched(awaiting: readonly string[], touchedBeforePass: number): readonly string[] {
     const live = new Set(awaiting);
-    for (const turnRequestId of this.#deliveryReadAt.keys()) {
-      if (!live.has(turnRequestId)) this.#deliveryReadAt.delete(turnRequestId);
+    for (const [turnRequestId, touched] of this.#lastTouched) {
+      if (!live.has(turnRequestId) && touched <= touchedBeforePass) this.#lastTouched.delete(turnRequestId);
     }
     return awaiting
-      .map((turnRequestId, queued) => ({ turnRequestId, queued, read: this.#deliveryReadAt.get(turnRequestId) ?? 0 }))
-      .sort((a, b) => a.read - b.read || a.queued - b.queued)
+      .map((turnRequestId, queued) => ({ turnRequestId, queued, touched: this.#lastTouched.get(turnRequestId) ?? 0 }))
+      .sort((a, b) => a.touched - b.touched || a.queued - b.queued)
       .map((entry) => entry.turnRequestId);
   }
 
@@ -1866,11 +1875,13 @@ export class ConversationTurnCoordinator {
       result.executorSessionIncarnation !== query.executorSessionIncarnation
     ) return;
     try {
-      recordTelegramReplyDeliveryEvidence(this.#ownerReplies, this.db, this.clock, this.audit, {
+      const verdict = recordTelegramReplyDeliveryEvidence(this.#ownerReplies, this.db, this.clock, this.audit, {
         turnRequestId,
         receipt: { receiptId: result.receiptId, evidenceDigest: result.evidenceDigest },
         delivery: result.delivery,
       });
+      // Any verdict but "no evidence yet" ends its wait: delivered, refused once, or not owed.
+      if (verdict.status !== "NO_EVIDENCE") this.#lastTouched.delete(turnRequestId);
     } catch {
       // An item this build cannot read stays as it is; one turn's fault does not stop the pass.
     }
@@ -1952,6 +1963,7 @@ export class ConversationTurnCoordinator {
     // `txDecision`, not `tx`: the owner-reply half below can refuse after the observation was
     // written, and that refusal has to take the observation with it (#664's discipline).
     let enqueued = false;
+    let parkedWithoutEvidence = false;
     const decided: Decision<TurnMaterialization> = this.db.txDecision(() => {
       const row = this.db.get<{
         binding_generation: number;
@@ -2066,15 +2078,18 @@ export class ConversationTurnCoordinator {
       // item it obliges is then recorded DELIVERED in this same transaction. Evidence that does
       // not match is audited and leaves the item parked; it never refuses the settlement.
       if (reply.value.item !== null && delivery !== undefined) {
-        recordTelegramReplyDeliveryEvidence(this.#ownerReplies, this.db, this.clock, this.audit, {
+        const verdict = recordTelegramReplyDeliveryEvidence(this.#ownerReplies, this.db, this.clock, this.audit, {
           turnRequestId,
           receipt: { receiptId: receipt.receiptId, evidenceDigest: receipt.evidenceDigest },
           delivery,
         });
+        parkedWithoutEvidence = verdict.status === "NO_EVIDENCE";
       }
       return observed;
     });
     if (decided.allowed && enqueued) this.#announceOwnerReply();
+    // Its settlement is a parked reply's first touch (R-A3-03), stamped only once it has committed.
+    if (decided.allowed && parkedWithoutEvidence) this.#touch(turnRequestId);
     return decided;
   }
 
