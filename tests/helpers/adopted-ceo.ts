@@ -168,7 +168,6 @@ export const adoptedFixture = (
   const admission = (overrides: Partial<AdoptedCeoToolAdmissionOptions> = {}): AdoptedCeoToolAdmission =>
     createAdoptedCeoToolAdmission(h.cp, {
       gatewayOrigin: async () => ({ ...proof }),
-      expectedLiveSessionId: LIVE,
       lineageRootDigest: DIGEST,
       processes,
       ...overrides,

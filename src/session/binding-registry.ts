@@ -18,6 +18,7 @@ import {
 } from "../domain/types.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { TaskGraph } from "../run/task-graph.ts";
+import { servedHermesHeads } from "./hermes-target-head.ts";
 import type { SessionRegistry } from "./session-registry.ts";
 
 /**
@@ -1044,13 +1045,14 @@ export class BindingRegistry {
     const rows = this.db.all<{
       actor_id: string;
       binding_generation: number;
+      target_binding_id: string;
       target_locator: string;
       target_locator_digest: string;
       attestation_digest: string;
       target_bind_receipt_json: string;
       target_bind_executor_runtime_identity: string;
     }>(
-      `SELECT a.actor_id, a.binding_generation, b.target_locator, b.target_locator_digest,
+      `SELECT a.actor_id, a.binding_generation, b.target_binding_id, b.target_locator, b.target_locator_digest,
               t.attestation_digest, t.target_bind_receipt_json, t.target_bind_executor_runtime_identity
          FROM assignments a
          JOIN conversational_actors c
@@ -1091,6 +1093,11 @@ export class BindingRegistry {
       actorId: row.actor_id,
       generation: row.binding_generation,
       requestedSessionId: row.target_locator,
+      // A receipt names the head that was live when it was attested; a recorded head advance
+      // (hermes-target-head.ts) leaves the born locator behind without changing the lineage.
+      servedSessionIds: servedHermesHeads(this.db, { target_binding_id: row.target_binding_id,
+        target_actor_id: row.actor_id, target_locator: row.target_locator,
+        target_locator_digest: row.target_locator_digest }),
       lineageRootDigest: row.target_locator_digest,
       executorRuntimeIdentity: row.target_bind_executor_runtime_identity,
     });
@@ -1173,6 +1180,11 @@ export class BindingRegistry {
       actorId: row.actor_id,
       generation: row.binding_generation,
       requestedSessionId: row.target_locator,
+      // A receipt names the head that was live when it was attested; a recorded head advance
+      // (hermes-target-head.ts) leaves the born locator behind without changing the lineage.
+      servedSessionIds: servedHermesHeads(this.db, { target_binding_id: row.target_binding_id,
+        target_actor_id: row.actor_id, target_locator: row.target_locator,
+        target_locator_digest: row.target_locator_digest }),
       lineageRootDigest: row.target_locator_digest,
       executorRuntimeIdentity: row.target_bind_executor_runtime_identity,
     });
@@ -1313,6 +1325,8 @@ export class BindingRegistry {
       actorId: string;
       generation: number;
       requestedSessionId: string;
+      /** Other heads the binding has served in its lineage; any of them may be the one requested. */
+      servedSessionIds?: ReadonlySet<string>;
       lineageRootDigest: string;
       executorRuntimeIdentity?: string;
     },
@@ -1329,7 +1343,9 @@ export class BindingRegistry {
       record.version !== 1 ||
       record.actor_id !== expected.actorId ||
       record.binding_generation !== expected.generation ||
-      record.requested_session_id !== expected.requestedSessionId ||
+      (record.requested_session_id !== expected.requestedSessionId &&
+        !(typeof record.requested_session_id === "string" &&
+          expected.servedSessionIds?.has(record.requested_session_id) === true)) ||
       record.lineage_root_digest !== expected.lineageRootDigest ||
       (expected.executorRuntimeIdentity !== undefined &&
         record.executor_runtime_identity !== expected.executorRuntimeIdentity) ||

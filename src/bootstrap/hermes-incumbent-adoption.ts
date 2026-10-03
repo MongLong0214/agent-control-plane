@@ -3,13 +3,21 @@ import { readProcessStartToken } from "../core/process-argv.ts";
 import { processStartedAt } from "../core/process-identity.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { Role, SessionLifecycle, type RoleBinding } from "../domain/types.ts";
+import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
+import { isContinuityRevocationReason } from "../continuity/continuity-kernel.ts";
 import { probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
 import { runHermesTargetBind, type HermesTargetBindResponse } from "../runtime/hermes-target-bind.ts";
+import {
+  headAdvanceTransaction,
+  isHermesHead,
+  judgeLiveHead,
+  readHermesTargetHead,
+  recordHeadAdvance,
+} from "../session/hermes-target-head.ts";
 
 /** Supplied only by the daemon's authenticated, read-only canonical Gateway endpoint adapter. */
 export interface GatewayIncumbentProof {
-  /** The live head; it may differ from the pinned session that originally established the actor. */
+  /** The live head; inside the lineage it may differ from the head the target was born with. */
   session_id: string;
   lineage_root_digest: string;
   process_pid: number;
@@ -17,59 +25,81 @@ export interface GatewayIncumbentProof {
   process_started_at: string;
 }
 
+export type HermesIncumbentAdoptionResult = Decision<{
+  sessionId: string; actorId: string; bindingGeneration: number; sessionIncarnation: string;
+}>;
+
+/**
+ * The revoked generation the daemon's own pass found eligible (`hermes-auto-adoption.ts`): revoked
+ * by continuity, its runtime DEAD. An automatic adoption restores that generation or nothing, so a
+ * generation bound and revoked by someone's decision while the Gateway was being read is never
+ * restored by it (PR #1053 review, ACP1053-01). The operator's `agentctl adopt hermes` passes none.
+ */
+export interface AutomaticAdoptionIncumbent {
+  assignmentId: string;
+  generation: number;
+  revokedReason: string;
+}
+
 export const createHermesIncumbentAdoption = (cp: ControlPlane, options: {
   /** This port must be wired by the daemon, not from an operator-supplied request. */
   gatewayOrigin(): Promise<GatewayIncumbentProof | null>;
-  /** Existing configured binding: pins the actor's lineage, not the current head. */
-  target: { sessionId: string; lineageRootDigest: string };
-  /** Daemon-owned exact live head, frozen when this adoption port is constructed. */
-  expectedLiveSessionId: string;
+  /**
+   * The configured lineage. No head is configured: inside this lineage the head is the one the
+   * Gateway reports (`judgeLiveHead`), and the stored target follows it in the bind transaction.
+   */
+  lineageRootDigest: string;
   hermesExecutable: string;
   hermesProfile: string;
   hermesHome: string;
   executorRuntimeIdentity: string;
 }) => {
-  const expectedLiveSessionId = options.expectedLiveSessionId;
   return {
-  async adopt(request: { gatewayPid: number; gatewayStartToken: string }): Promise<Decision<{
-    sessionId: string; actorId: string; bindingGeneration: number; sessionIncarnation: string;
-  }>> {
-    const refuse = (): Decision<{ sessionId: string; actorId: string; bindingGeneration: number;
-      sessionIncarnation: string }> =>
+  async adopt(request: {
+    gatewayPid: number; gatewayStartToken: string; automatic?: AutomaticAdoptionIncumbent;
+  }): Promise<HermesIncumbentAdoptionResult> {
+    const refuse = (): HermesIncumbentAdoptionResult =>
       deny(ReasonCode.CONFLICT, "authenticated live Gateway incumbent cannot be established", {});
+    const automatic = request.automatic;
+    /** For an automatic adoption, the newest CEO generation must still be the eligible one, as it was. */
+    const stillEligible = (row: { assignment_id: string; binding_generation: number; status: string;
+      revoked_reason: string | null }): boolean => {
+      if (automatic === undefined) return true;
+      if (row.assignment_id !== automatic.assignmentId) return false;
+      if (row.binding_generation !== automatic.generation) return false;
+      if (row.status !== "REVOKED") return false;
+      if (row.revoked_reason !== automatic.revokedReason) return false;
+      return isContinuityRevocationReason(row.revoked_reason);
+    };
     let proof: GatewayIncumbentProof | null;
     try { proof = await options.gatewayOrigin(); } catch { return refuse(); }
     // Neither caller-supplied PID nor configured route proves the current process or head.
     if (!proof || !Number.isSafeInteger(proof.process_pid) || proof.process_pid <= 0 ||
-        !expectedLiveSessionId || proof.session_id !== expectedLiveSessionId ||
-        proof.lineage_root_digest !== options.target.lineageRootDigest ||
+        !isHermesHead(proof.session_id) || proof.lineage_root_digest !== options.lineageRootDigest ||
         proof.process_pid !== request.gatewayPid || proof.process_started_at !== request.gatewayStartToken ||
         !proof.process_started_at || readProcessStartToken(proof.process_pid) !== proof.process_started_at) return refuse();
     const startedAt = processStartedAt(proof.process_pid);
     if (!startedAt || readProcessStartToken(proof.process_pid) !== proof.process_started_at) return refuse();
     if (cp.bindings.active("CEO")) return refuse();
-    const previous = cp.db.get<{ actor_id: string; binding_generation: number; session_id: string;
-      session_incarnation: string; status: string }>(
-      "SELECT actor_id, binding_generation, session_id, session_incarnation, status FROM assignments WHERE role_key = 'CEO' ORDER BY binding_generation DESC LIMIT 1",
+    const newestCeo = () => cp.db.get<{ assignment_id: string; actor_id: string; binding_generation: number;
+      session_id: string; session_incarnation: string; status: string; revoked_reason: string | null }>(
+      `SELECT assignment_id, actor_id, binding_generation, session_id, session_incarnation, status, revoked_reason
+         FROM assignments WHERE role_key = 'CEO' ORDER BY binding_generation DESC LIMIT 1`,
     );
-    if (!previous || previous.status !== "REVOKED") return refuse();
+    const previous = newestCeo();
+    if (!previous || previous.status !== "REVOKED" || !stillEligible(previous)) return refuse();
     const actor = cp.db.get<{ kind: string; current_session_id: string; current_session_incarnation: string; retired_at: string | null }>(
       "SELECT kind, current_session_id, current_session_incarnation, retired_at FROM conversational_actors WHERE actor_id = ?",
       [previous.actor_id],
     );
-    const lineage = cp.db.get<{ target_locator: string; target_locator_digest: string; executor_kind: string }>(
-      "SELECT target_locator, target_locator_digest, executor_kind FROM actor_target_bindings WHERE target_actor_id = ?",
-      [previous.actor_id],
-    );
+    const target = readHermesTargetHead(cp.db, previous.actor_id);
     const incumbent = cp.sessions.get(previous.session_id);
-    // A prior live-head binding can be restored only onto that same authenticated head.
-    // A changed head needs Gateway ancestry proof; a matching root digest alone is insufficient.
+    // The actor's lineage is fixed; its head is not. A head the Gateway reports inside the same
+    // lineage is the conversation's head now (a compression rotates it), so only another lineage
+    // or another executor is refused here. The head the target was born with is not compared.
     if (!actor || actor.kind !== Role.CEO || actor.retired_at !== null || actor.current_session_id !== previous.session_id ||
         actor.current_session_incarnation !== previous.session_incarnation ||
-        (lineage && (lineage.executor_kind !== "hermes" ||
-          lineage.target_locator_digest !== proof.lineage_root_digest ||
-          (lineage.target_locator !== options.target.sessionId &&
-            lineage.target_locator !== proof.session_id))) ||
+        (target && judgeLiveHead(target, proof).verdict === "REFUSE") ||
         !incumbent || incumbent.incarnation !== previous.session_incarnation ||
         probeSessionLiveness(incumbent.osPid, incumbent.osProcessStartedAt) !== "DEAD") return refuse();
 
@@ -77,14 +107,13 @@ export const createHermesIncumbentAdoption = (cp: ControlPlane, options: {
     // by an awaited proof admits runs that cannot safely be revoked on a changed head.
     let current: GatewayIncumbentProof | null;
     try { current = await options.gatewayOrigin(); } catch { current = null; }
-    if (!current || current.session_id !== expectedLiveSessionId ||
+    // The head must hold still across the readback: it is the head the bind attests and records.
+    if (!current || current.session_id !== proof.session_id ||
         current.lineage_root_digest !== proof.lineage_root_digest ||
         current.process_pid !== proof.process_pid || current.process_started_at !== proof.process_started_at ||
         readProcessStartToken(proof.process_pid) !== proof.process_started_at) return refuse();
     // The awaited readback may have let another caller replace the binding or move the actor.
-    const latest = cp.db.get<typeof previous>(
-      "SELECT actor_id, binding_generation, session_id, session_incarnation, status FROM assignments WHERE role_key = 'CEO' ORDER BY binding_generation DESC LIMIT 1",
-    );
+    const latest = newestCeo();
     const servingActor = cp.db.get<typeof actor>(
       "SELECT kind, current_session_id, current_session_incarnation, retired_at FROM conversational_actors WHERE actor_id = ?",
       [previous.actor_id],
@@ -92,6 +121,7 @@ export const createHermesIncumbentAdoption = (cp: ControlPlane, options: {
     if (cp.bindings.active("CEO") || !latest || latest.actor_id !== previous.actor_id ||
         latest.binding_generation !== previous.binding_generation || latest.session_id !== previous.session_id ||
         latest.session_incarnation !== previous.session_incarnation || latest.status !== "REVOKED" ||
+        latest.assignment_id !== previous.assignment_id || !stillEligible(latest) ||
         !servingActor || servingActor.kind !== Role.CEO || servingActor.retired_at !== null ||
         servingActor.current_session_id !== previous.session_id ||
         servingActor.current_session_incarnation !== previous.session_incarnation) return refuse();
@@ -114,7 +144,18 @@ export const createHermesIncumbentAdoption = (cp: ControlPlane, options: {
     let receipt: HermesTargetBindResponse | null = null;
     // Bind, inspect the exact assignment, and publish as one synchronous transaction.
     // A mismatched readback rolls the entire bind back before listeners or runs can see it.
-    const bound: Decision<RoleBinding> = cp.db.txDecision((): Decision<RoleBinding> => {
+    const bound: Decision<RoleBinding> = headAdvanceTransaction(cp.db, (): Decision<RoleBinding> => {
+      if (automatic !== undefined) {
+        // Inside the transaction that binds: the eligible generation is still the newest, still
+        // revoked by continuity, and its runtime still DEAD. Otherwise nothing here is written.
+        const newest = newestCeo();
+        const incumbentNow = cp.sessions.get(previous.session_id);
+        if (!newest || !stillEligible(newest) || newest.session_id !== previous.session_id ||
+            !incumbentNow || incumbentNow.incarnation !== previous.session_incarnation ||
+            probeSessionLiveness(incumbentNow.osPid, incumbentNow.osProcessStartedAt) !== "DEAD") {
+          return deny(ReasonCode.CONFLICT, "the revoked CEO generation is no longer the one found eligible", {});
+        }
+      }
       const binding = cp.bindings.bind({ role: Role.CEO, sessionId: created.sessionId,
       restoreCeo: { actorId: previous.actor_id, generation: previous.binding_generation,
         sessionId: previous.session_id, incarnation: previous.session_incarnation },
@@ -152,6 +193,18 @@ export const createHermesIncumbentAdoption = (cp: ControlPlane, options: {
           serving.current_session_incarnation !== created.incarnation ||
           active?.assignmentId !== binding.value.assignmentId) {
         return deny(ReasonCode.CONFLICT, "Gateway adoption binding readback failed", {});
+      }
+      // The target follows the attested head, in this transaction: a head that cannot be
+      // recorded rolls the binding back with it.
+      const served = readHermesTargetHead(cp.db, previous.actor_id);
+      if (!served) return deny(ReasonCode.CONFLICT, "Gateway adoption left the CEO without a target", {});
+      const head = judgeLiveHead(served, proof);
+      if (head.verdict === "REFUSE") return deny(ReasonCode.CONFLICT, "Gateway adoption target readback failed", {});
+      if (head.verdict === "ADVANCE") {
+        const advanced = recordHeadAdvance(cp.db, cp.audit, served, head, { path: "adoption", sessionId: created.sessionId,
+          roleKey: roleKeyFor(Role.CEO), bindingGeneration: binding.value.bindingGeneration,
+          gatewayPid: proof.process_pid });
+        if (!advanced.allowed) return advanced as Decision<RoleBinding>;
       }
       return binding;
     });
