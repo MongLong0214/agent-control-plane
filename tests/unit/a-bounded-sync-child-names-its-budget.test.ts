@@ -1,6 +1,9 @@
 import type * as ChildProcessModule from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { boundedExecFileSync, boundedSpawnSync, CHILD_BUDGET_MS } from "../helpers/bounded-sync-child.ts";
 
@@ -73,5 +76,93 @@ describe("a bounded synchronous child", () => {
     expect(() =>
       boundedExecFileSync("/bin/sh", ["-c", "exit 3"], { encoding: "utf8" }),
     ).toThrowError(/Command failed/);
+  });
+});
+
+/**
+ * `spawnSync`'s own timeout signals only the direct child, so a grandchild is reparented to PPID 1
+ * and outlives the test — orphaned `install-launchd.sh install` and `fake-bin/security` processes
+ * were seen doing so for over an hour. With `detached: true` the helper signals the child's whole
+ * process group on a timeout: SIGTERM, a bounded wait, then SIGKILL.
+ *
+ * The child is an existing `/bin/sh` given its script as an argument, not a file written for the
+ * run, so these cases add no executable inode to syspolicyd's provenance table. It starts a
+ * grandchild, records the grandchild's pid in a file, and waits on it, so the 1s budget always
+ * expires with the grandchild still running.
+ */
+describe("a timed-out detached child takes its process group with it", () => {
+  const scratch: string[] = [];
+  afterEach(() => {
+    for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  const grandchildScript = (ignoreTerm: boolean): string =>
+    `( ${ignoreTerm ? "trap '' TERM; " : ""}exec /bin/sleep 30 ) & echo $! > "$1"; wait`;
+
+  const alive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== "ESRCH";
+    }
+  };
+
+  /** Runs `call` against a fresh pid file and returns the grandchild pid and the elapsed time. */
+  const timeOutWithGrandchild = (
+    ignoreTerm: boolean,
+    call: (argv: readonly string[]) => unknown,
+  ): { grandchild: number; elapsedMs: number } => {
+    const dir = mkdtempSync(join(tmpdir(), "acp-bounded-grandchild-"));
+    scratch.push(dir);
+    const pidFile = join(dir, "grandchild.pid");
+    const started = Date.now();
+    let grandchild = Number.NaN;
+    try {
+      expect(() => call(["-c", grandchildScript(ignoreTerm), "sh", pidFile])).toThrowError(
+        /\/bin\/sh -c .* did not answer within 1000ms/,
+      );
+      const elapsedMs = Date.now() - started;
+      grandchild = Number(readFileSync(pidFile, "utf8").trim());
+      expect(grandchild, "the child recorded no grandchild pid").toBeGreaterThan(1);
+      expect(alive(grandchild), `grandchild ${grandchild} outlived its timed-out parent`).toBe(false);
+      return { grandchild, elapsedMs };
+    } finally {
+      // A failing case must not leave the orphan it is about behind for the next test.
+      if (!Number.isInteger(grandchild) && existsSync(pidFile)) {
+        grandchild = Number(readFileSync(pidFile, "utf8").trim());
+      }
+      if (Number.isInteger(grandchild) && grandchild > 1 && alive(grandchild)) {
+        try {
+          process.kill(grandchild, "SIGKILL");
+        } catch {
+          // Already gone between the probe and the signal.
+        }
+      }
+    }
+  };
+
+  it("reaps a grandchild that outlives its timed-out parent", () => {
+    timeOutWithGrandchild(false, (argv) =>
+      boundedSpawnSync("/bin/sh", argv, { encoding: "utf8", timeout: 1_000, detached: true }),
+    );
+  });
+
+  it("escalates to SIGKILL for a grandchild that ignores SIGTERM", () => {
+    const { elapsedMs } = timeOutWithGrandchild(true, (argv) =>
+      boundedSpawnSync("/bin/sh", argv, { encoding: "utf8", timeout: 1_000, detached: true }),
+    );
+    // A lower bound, so load cannot make it fail: the SIGTERM grace only runs its full length when
+    // the group is still there at the end of it. Without this, a `trap` that did not take would
+    // turn the case into the one above and the SIGKILL step would have no witness.
+    expect(elapsedMs, "the grandchild ended on SIGTERM, so SIGKILL was never needed").toBeGreaterThanOrEqual(
+      2_500,
+    );
+  });
+
+  it("reaps the group for boundedExecFileSync too", () => {
+    timeOutWithGrandchild(false, (argv) =>
+      boundedExecFileSync("/bin/sh", argv, { encoding: "utf8", timeout: 1_000, detached: true }),
+    );
   });
 });
