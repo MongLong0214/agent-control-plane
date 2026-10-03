@@ -45,7 +45,9 @@ import {
  * its next attempt. That covers no transport (every Telegram item on a deployment without ACP
  * Telegram ingress), a missing or conflicting address, no identity to sign as, a room that
  * identity is not subscribed to, a missing or mismatched body, and a relay refusal or timeout. A
- * Telegram item is never sent through Buzz instead.
+ * Telegram item is never sent through Buzz instead. Hermes sends a Telegram reply itself, and the
+ * turn coordinator records the item `DELIVERED` from Hermes' receipt evidence (A3); an item still
+ * here has no such evidence yet, or evidence that was refused.
  *
  * **Woken, not polled.** The consumer runs when the coordinator announces a new item, when an
  * identity's relay connection authenticates (startup and every reconnect), and once at startup.

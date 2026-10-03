@@ -204,6 +204,8 @@ export const externalLaneFixture = (options: {
   configure?: (config: ControlPlaneConfig) => ControlPlaneConfig;
   hermesCeo?: boolean;
   otherCtos?: number;
+  /** The allowlisted owner chat; `CHAT_ID` by default. A group chat's id is negative. */
+  chatId?: number;
 } = {}): ExternalLaneFixture => {
   const root = tempDir("acp-u4-");
   const clock = new ManualClock(NOW);
@@ -216,6 +218,7 @@ export const externalLaneFixture = (options: {
   for (let index = 0; index < (options.otherCtos ?? 0); index += 1) attestedCto(cp, index);
   const laneConfig = configuredTelegramExternalConsumerConfig(baseConfig(root, clock).ownerIdentities ?? [], {
     ...LANE_ENV,
+    ACP_TELEGRAM_CHAT_ID: String(options.chatId ?? CHAT_ID),
   });
   if (!laneConfig) throw new Error("the fixture's lane environment did not configure a lane");
   return { cp, root, clock, ceoActorId, laneConfig, open };
@@ -313,7 +316,9 @@ export interface GatewayRequest {
 export type GatewayAnswer =
   | { kind: "json"; status?: number; body: unknown; contentType?: string }
   | { kind: "raw"; status?: number; body: string; contentType?: string }
-  | { kind: "hang" };
+  | { kind: "hang" }
+  /** Answered once `answer` settles: lets a test order two reads of the same receipt. */
+  | { kind: "deferred"; answer: Promise<GatewayAnswer> };
 
 /** The Gateway's receipt API, answered by the test, on an ephemeral loopback port. */
 export class FakeGateway {
@@ -326,14 +331,20 @@ export class FakeGateway {
     const server = createServer((req: IncomingMessage, res: ServerResponse) => {
       this.requests.push({ path: req.url ?? "", authorization: req.headers.authorization });
       const match = /^\/v1\/canonical-surface\/receipts\/telegram\/(\d+)$/.exec(req.url ?? "");
-      const reply = match ? this.answer(Number(match[1])) : { kind: "json" as const, status: 404, body: {} };
-      if (reply.kind === "hang") {
-        this.#hanging.push(res);
-        return;
-      }
-      const text = reply.kind === "json" ? JSON.stringify(reply.body) : reply.body;
-      res.writeHead(reply.status ?? 200, { "content-type": reply.contentType ?? "application/json" });
-      res.end(text);
+      const send = (reply: GatewayAnswer): void => {
+        if (reply.kind === "deferred") {
+          void reply.answer.then(send);
+          return;
+        }
+        if (reply.kind === "hang") {
+          this.#hanging.push(res);
+          return;
+        }
+        const text = reply.kind === "json" ? JSON.stringify(reply.body) : reply.body;
+        res.writeHead(reply.status ?? 200, { "content-type": reply.contentType ?? "application/json" });
+        res.end(text);
+      };
+      send(match ? this.answer(Number(match[1])) : { kind: "json" as const, status: 404, body: {} });
     });
     this.#server = server;
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -352,6 +363,30 @@ export class FakeGateway {
   }
 }
 
+/** The reply digest `gatewayReceipt` reports for an update: its `evidenceDigest`. */
+export const gatewayReplyDigest = (updateId: number): string => digestOf({ finalText: `answer to ${updateId}` });
+
+/**
+ * The delivery a Gateway's `COMPLETED` receipt reports once Hermes sent the reply, in the agreed
+ * six-key shape: the admitted chat, the owner's message, the sent message ids in send order, and the
+ * receipt's own reply digest. `changes` alters or removes (`undefined`) single keys.
+ */
+export const gatewayDelivery = (
+  updateId: number,
+  changes: Record<string, unknown> = {},
+): Record<string, unknown> => {
+  const delivery: Record<string, unknown> = {
+    obligation_id: `obligation-${updateId}`,
+    state: "delivered",
+    content_digest: gatewayReplyDigest(updateId),
+    chat_id: CHAT_ID,
+    reply_to_message_id: updateId + 100,
+    message_ids: [9_000 + updateId],
+    ...changes,
+  };
+  return Object.fromEntries(Object.entries(delivery).filter(([, value]) => value !== undefined));
+};
+
 /** The Gateway's terminal answer for a turn the lane returned, optionally with one field altered. */
 export const gatewayReceipt = (
   updateId: number,
@@ -362,27 +397,26 @@ export const gatewayReceipt = (
     messageId?: number;
     receiptId?: string;
     reasonCode?: string;
+    /** Defaults to `gatewayDelivery(updateId)` for `COMPLETED` and to `null` otherwise, as Hermes writes it. */
+    delivery?: Record<string, unknown> | null;
     extra?: Record<string, unknown>;
   } = {},
 ): Record<string, unknown> => {
   const identity = { ...turn, ...options.identity };
+  const status = options.status ?? "COMPLETED";
   return {
     schema: "hermes.gateway-turn-receipt/v1",
     update_id: updateId,
     message_id: options.messageId ?? updateId + 100,
-    status: options.status ?? "COMPLETED",
+    status,
     turnRequestId: identity.turnRequestId,
     receiptIdentity: identity,
     receiptId: options.receiptId ?? `hermes-tg:obligation-${updateId}`,
-    evidenceDigest: digestOf({ finalText: `answer to ${updateId}` }),
+    evidenceDigest: gatewayReplyDigest(updateId),
     reasonCode: options.reasonCode ?? "OK",
-    delivery: {
-      chat_id: String(CHAT_ID),
-      reply_to_message_id: updateId + 100,
-      message_ids: [9_000 + updateId],
-      content_digest: digestOf(`answer to ${updateId}`),
-      state: "delivered",
-    },
+    delivery: options.delivery !== undefined
+      ? options.delivery
+      : status === "COMPLETED" ? gatewayDelivery(updateId) : null,
     ...options.extra,
   };
 };
