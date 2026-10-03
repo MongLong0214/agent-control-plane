@@ -20,6 +20,8 @@ import {
   type HermesBootstrapAuthority,
 } from "../bootstrap/hermes-bootstrap.ts";
 import { createHermesIncumbentAdoption, type GatewayIncumbentProof } from "../bootstrap/hermes-incumbent-adoption.ts";
+import { createHermesAutoAdoption, type HermesAutoAdoption } from "../bootstrap/hermes-auto-adoption.ts";
+import { judgeLiveHead, readHermesTargetHead, recordHeadAdvance } from "../session/hermes-target-head.ts";
 import {
   createAdoptedCeoToolAdmission,
   type AdoptedCeoToolAdmission,
@@ -1482,8 +1484,15 @@ export const startDaemonOperatorSocket = (
   });
 };
 
+/**
+ * No head is configured. `ACP_HERMES_EXPECTED_LIVE_SESSION_ID` and `ACP_HERMES_TARGET_SESSION_ID`
+ * pinned the conversation's head by hand, and a compression that rotated it stopped adoption, the
+ * adopted CEO's tools and delivery until both were rewritten and the daemon restarted (2026-10-03).
+ * Inside the configured lineage the head is the one the Gateway reports, kept in the database
+ * (`hermes-target-head.ts`). A Keychain that still holds the two values is not refused; nothing
+ * reads them.
+ */
 const HERMES_ADOPTION_VARS = [
-  "ACP_HERMES_EXPECTED_LIVE_SESSION_ID", "ACP_HERMES_TARGET_SESSION_ID",
   "ACP_HERMES_LINEAGE_ROOT_DIGEST", "ACP_HERMES_EXECUTABLE", "ACP_HERMES_PROFILE",
   "ACP_HERMES_HOME", "ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY", "ACP_HERMES_GATEWAY_API_KEY",
 ] as const;
@@ -1505,6 +1514,7 @@ export const createConfiguredHermesGatewayConversation = (
   configuration: Readonly<Record<string, string | undefined>>,
   ports: {
     senderFactory?: typeof createHermesGatewayConversationSender;
+    identityReader?: typeof createHermesGatewayIdentityReader;
     processStartToken?: typeof readProcessStartToken;
     processStartedAt?: typeof processStartedAt;
     authorityHeld?: () => boolean;
@@ -1512,6 +1522,7 @@ export const createConfiguredHermesGatewayConversation = (
 ): ((text: string, source: GatewayEventSource) => Promise<CeoTurnOutcome>) | undefined => {
   if (!HERMES_ADOPTION_VARS.some((key) => configuration[key] !== undefined)) return undefined;
   const values = configuredHermesAdoptionValues(configuration);
+  const readGateway = values ? lockedGatewayOrigin(values, ports) : null;
   const refuse = (): CeoTurnOutcome => ({ contact: "NEVER_REACHED",
     answered: deny(ReasonCode.CEO_CONVERSATION_STALE, "adopted Gateway CEO target unavailable") });
   const currentAuthority = () => {
@@ -1519,22 +1530,21 @@ export const createConfiguredHermesGatewayConversation = (
     const binding = cp.bindings.active("CEO");
     if (!binding || binding.status !== "ACTIVE") return null;
     const session = cp.sessions.get(binding.sessionId);
-    const target = cp.db.get<{ executor_kind: string; target_locator: string;
-      target_locator_digest: string }>(
-      `SELECT tb.executor_kind, tb.target_locator, tb.target_locator_digest
-         FROM actor_target_bindings tb
-         JOIN assignments a ON a.actor_id = tb.target_actor_id
-        WHERE a.assignment_id = ? AND a.role_key = 'CEO' AND a.status = 'ACTIVE'
-          AND a.binding_generation = ? AND a.session_id = ? AND a.session_incarnation = ?`,
+    const owner = cp.db.get<{ actor_id: string }>(
+      `SELECT actor_id FROM assignments
+        WHERE assignment_id = ? AND role_key = 'CEO' AND status = 'ACTIVE'
+          AND binding_generation = ? AND session_id = ? AND session_incarnation = ?`,
       [binding.assignmentId, binding.bindingGeneration, binding.sessionId, binding.sessionIncarnation],
     );
+    // The stored target, not a configured head: the lineage is configured, the head is whatever
+    // the database last recorded for it (`hermes-target-head.ts`).
+    const target = owner ? readHermesTargetHead(cp.db, owner.actor_id) : null;
     if (!session || session.lifecycle !== SessionLifecycle.READY || session.incarnation !== binding.sessionIncarnation ||
         session.provider !== "hermes" || !Number.isSafeInteger(session.osPid) || !session.osPid ||
         session.osPid <= 0 || !session.osProcessStartedAt ||
         (ports.processStartedAt ?? processStartedAt)(session.osPid) !== session.osProcessStartedAt ||
-        !target || target.executor_kind !== "hermes" ||
-        target.target_locator !== values.ACP_HERMES_EXPECTED_LIVE_SESSION_ID ||
-        target.target_locator_digest !== values.ACP_HERMES_LINEAGE_ROOT_DIGEST) return null;
+        !target || target.executorKind !== "hermes" ||
+        target.lineageRootDigest !== values.ACP_HERMES_LINEAGE_ROOT_DIGEST) return null;
     const startToken = (ports.processStartToken ?? readProcessStartToken)(session.osPid);
     if (!startToken || (ports.authorityHeld && !ports.authorityHeld())) return null;
     // #1037 R1: the lstart compare above has one-second grain. The tool admission's own rule
@@ -1551,23 +1561,53 @@ export const createConfiguredHermesGatewayConversation = (
     if (!recordedStart.allowed) return null;
     return { assignmentId: binding.assignmentId, bindingGeneration: binding.bindingGeneration,
       sessionId: binding.sessionId, sessionIncarnation: binding.sessionIncarnation,
-      processPid: session.osPid, startToken };
+      processPid: session.osPid, startToken, target };
+  };
+  type Authority = NonNullable<ReturnType<typeof currentAuthority>>;
+  const sameAuthority = (current: Authority | null, pinned: Authority): current is Authority =>
+    current !== null && current.assignmentId === pinned.assignmentId &&
+    current.bindingGeneration === pinned.bindingGeneration && current.sessionId === pinned.sessionId &&
+    current.sessionIncarnation === pinned.sessionIncarnation && current.processPid === pinned.processPid &&
+    current.startToken === pinned.startToken && current.target.targetBindingId === pinned.target.targetBindingId &&
+    current.target.head === pinned.target.head;
+  /**
+   * The head this turn is delivered to, by the rule adoption and the tool admission share: the
+   * Gateway's readback must come from the bound process (its pid and the native start pinned for
+   * it) in the bound lineage, and a head that moved inside the lineage is recorded first, in one
+   * transaction fenced on the same authority. Null refuses the turn before any POST.
+   */
+  const trackedHead = async (pinned: Authority): Promise<string | null> => {
+    let reported: GatewayIncumbentProof;
+    try { reported = await readGateway!(); } catch { return null; }
+    const current = currentAuthority();
+    if (!sameAuthority(current, pinned)) return null;
+    if (reported.process_pid !== current.processPid) return null;
+    if (reported.process_started_at !== current.startToken) return null;
+    const head = judgeLiveHead(current.target, reported);
+    if (head.verdict === "REFUSE") return null;
+    if (head.verdict === "SAME") return head.head;
+    const advanced = cp.db.txDecision((): Decision<void> => {
+      if (!sameAuthority(currentAuthority(), pinned)) {
+        return deny(ReasonCode.CONFLICT, "the CEO authority moved while the Gateway was read", {});
+      }
+      return recordHeadAdvance(cp.audit, current.target, head, { path: "gateway_delivery",
+        sessionId: current.sessionId, roleKey: roleKeyFor(Role.CEO),
+        bindingGeneration: current.bindingGeneration, gatewayPid: current.processPid });
+    });
+    return advanced.allowed ? head.head : null;
   };
   return async (text, source) => {
-    const pinned = currentAuthority();
-    if (!values || !pinned) return refuse();
+    const before = currentAuthority();
+    if (!values || !before) return refuse();
+    const head = await trackedHead(before);
+    const pinned = head === null ? null : currentAuthority();
+    if (head === null || pinned === null || pinned.target.head !== head) return refuse();
     return (ports.senderFactory ?? createHermesGatewayConversationSender)({
       apiKey: values["ACP_HERMES_GATEWAY_API_KEY"]!, binding: "acp-canonical-ceo",
-      expected: { session_id: values.ACP_HERMES_EXPECTED_LIVE_SESSION_ID!,
+      expected: { session_id: head,
         lineage_root_digest: values.ACP_HERMES_LINEAGE_ROOT_DIGEST!,
         process_pid: pinned.processPid, process_started_at: pinned.startToken },
-      preDispatch: () => {
-        const current = currentAuthority();
-        return current !== null && current.assignmentId === pinned.assignmentId &&
-          current.bindingGeneration === pinned.bindingGeneration && current.sessionId === pinned.sessionId &&
-          current.sessionIncarnation === pinned.sessionIncarnation && current.processPid === pinned.processPid &&
-          current.startToken === pinned.startToken;
-      },
+      preDispatch: () => sameAuthority(currentAuthority(), pinned),
     })(text, source);
   };
 };
@@ -1607,7 +1647,6 @@ export const createConfiguredAdoptedCeoToolAdmission = (
   if (!values) return undefined;
   return createAdoptedCeoToolAdmission(cp, {
     gatewayOrigin: lockedGatewayOrigin(values, ports),
-    expectedLiveSessionId: values.ACP_HERMES_EXPECTED_LIVE_SESSION_ID!,
     lineageRootDigest: values.ACP_HERMES_LINEAGE_ROOT_DIGEST!,
   });
 };
@@ -1702,9 +1741,7 @@ export const createConfiguredHermesIncumbentAdoption = (
   const gatewayOrigin = lockedGatewayOrigin(values, ports);
   const adoption = (ports.adoptionFactory ?? createHermesIncumbentAdoption)(cp, {
     gatewayOrigin,
-    target: { sessionId: values.ACP_HERMES_TARGET_SESSION_ID!,
-      lineageRootDigest: values.ACP_HERMES_LINEAGE_ROOT_DIGEST! },
-    expectedLiveSessionId: values.ACP_HERMES_EXPECTED_LIVE_SESSION_ID!,
+    lineageRootDigest: values.ACP_HERMES_LINEAGE_ROOT_DIGEST!,
     hermesExecutable: values.ACP_HERMES_EXECUTABLE!,
     hermesProfile: values.ACP_HERMES_PROFILE!,
     hermesHome: values.ACP_HERMES_HOME!,
@@ -1720,6 +1757,53 @@ export const createConfiguredHermesIncumbentAdoption = (
         : deny(ReasonCode.CONFLICT, "authenticated live Gateway incumbent cannot be established", {});
     }
   };
+};
+
+/** How often the daemon asks whether a revoked CEO's restarted Gateway can be adopted. */
+export const HERMES_AUTO_ADOPTION_INTERVAL_MS = 30_000;
+
+/**
+ * The daemon's own adoption pass over the operator method's core (`hermes-auto-adoption.ts`):
+ * same configuration, same Gateway reader, same lock. Undefined when adoption is not configured.
+ */
+export const createConfiguredHermesAutoAdoption = (
+  cp: ControlPlane,
+  configuration: Readonly<Record<string, string | undefined>>,
+  ports: Parameters<typeof createConfiguredHermesIncumbentAdoption>[2] & {
+    adopt?: () => Promise<Decision<unknown>>;
+    backoff?: { baseMs: number; maxMs: number };
+  } = {},
+): HermesAutoAdoption | undefined => {
+  const adopt = ports.adopt ?? createConfiguredHermesIncumbentAdoption(cp, configuration, ports);
+  if (!adopt) return undefined;
+  return createHermesAutoAdoption(cp, {
+    adopt,
+    ...(ports.authorityHeld ? { authorityHeld: ports.authorityHeld } : {}),
+    ...(ports.backoff ? { backoff: ports.backoff } : {}),
+  });
+};
+
+/**
+ * Runs the pass when a CEO binding is revoked and on an interval, so a redeployed Gateway is
+ * re-adopted without a person. Returns the timer for shutdown to clear.
+ */
+export const startHermesAutoAdoption = (
+  cp: ControlPlane,
+  autoAdoption: HermesAutoAdoption,
+  intervalMs = HERMES_AUTO_ADOPTION_INTERVAL_MS,
+): NodeJS.Timeout => {
+  const ceo = roleKeyFor(Role.CEO);
+  // After the revoking transaction commits, and off its call stack: the revoker may be the
+  // continuity pass, which must finish before an adoption starts reading the Gateway.
+  cp.bindings.onSwitch((binding) => {
+    if (binding.roleKey === ceo && binding.status === "REVOKED") {
+      setImmediate(() => void autoAdoption.tick("ceo_revoked"));
+    }
+  });
+  const timer = setInterval(() => void autoAdoption.tick("periodic"), intervalMs);
+  timer.unref();
+  setImmediate(() => void autoAdoption.tick("startup"));
+  return timer;
 };
 
 export const startOperatorSocket = async (
@@ -3641,6 +3725,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   let operator: LocalOperatorListener | null = null;
   let canonicalSelfClaim: CanonicalSelfClaimListener | null = null;
   let adoptedCeoTools: CanonicalSelfClaimListener | null = null;
+  let hermesAutoAdoptionTimer: NodeJS.Timeout | null = null;
   let hermesBootstrap: HermesBootstrapAuthority | null = null;
   let telegram: TelegramLongPollListener | null = null;
   let startCompleted = false;
@@ -3654,6 +3739,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     if (shuttingDown) return shuttingDown;
     shuttingDown = (async () => {
     process.stdout.write(`\nshutting down on ${signal}\n`);
+    if (hermesAutoAdoptionTimer) clearInterval(hermesAutoAdoptionTimer);
     await telegram?.close();
     buzzMentionSubscriber?.close();
     await buzzMessageIngress?.close();
@@ -3715,6 +3801,17 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     const adoptHermesIncumbent = createConfiguredHermesIncumbentAdoption(
       cp, hermesAdoptionConfiguration, { authorityHeld: () => daemon.lock.held() },
     );
+    // The same core, asked by the daemon: a revoked CEO whose Gateway was redeployed is adopted
+    // again without anyone running `agentctl adopt hermes`, which stays as a way to ask sooner.
+    const hermesAutoAdoption = adoptHermesIncumbent
+      ? createConfiguredHermesAutoAdoption(cp, hermesAdoptionConfiguration, {
+        adopt: adoptHermesIncumbent, authorityHeld: () => daemon.lock.held(),
+      })
+      : undefined;
+    if (hermesAutoAdoption) {
+      hermesAutoAdoptionTimer = startHermesAutoAdoption(cp, hermesAutoAdoption);
+      process.stdout.write("Hermes CEO auto-adoption started\n");
+    }
     // The operator socket is opened first so the uninitialized-only bootstrap door can be
     // reached without exposing a normal Hermes listener that has no bound peer yet.
     operator = await startDaemonOperatorSocket(
@@ -3901,6 +3998,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       daemon.setTelegramIngressStatus({ configured: false, running: false, disabledReason: null });
     }
   } catch (err) {
+    if (hermesAutoAdoptionTimer) clearInterval(hermesAutoAdoptionTimer);
     await telegram?.close();
     // Both Buzz listeners, which this teardown used to walk past: a startup that failed after
     // one of them bound left its socket file behind for the next daemon to find. The relay

@@ -39,9 +39,8 @@ const execFile = promisify(execFileCallback);
 const OPERATOR_TOKEN = TEST_OPERATOR_TOKEN;
 const MCP_TOKEN = TEST_MCP_TOKEN;
 
+// No head is configured: the Gateway reports it inside the configured lineage (2026-10-03).
 const adoptionConfig = () => ({
-  ACP_HERMES_EXPECTED_LIVE_SESSION_ID: "live-head",
-  ACP_HERMES_TARGET_SESSION_ID: "original-root",
   ACP_HERMES_LINEAGE_ROOT_DIGEST: `sha256:${"a".repeat(64)}`,
   ACP_HERMES_EXECUTABLE: "/opt/test/hermes",
   ACP_HERMES_PROFILE: "test-profile",
@@ -73,8 +72,8 @@ describe("daemon-owned Hermes incumbent adoption", () => {
     const adopt = vi.fn(async () => allow(ReasonCode.OK, { actorId: "actor:ceo", sessionId: "session:bound",
       bindingGeneration: 2, sessionIncarnation: "incarnation:bound" }));
     const factory = vi.fn((_cp, options) => {
-      expect(options).toMatchObject({ target: { sessionId: "original-root", lineageRootDigest: config.ACP_HERMES_LINEAGE_ROOT_DIGEST },
-        expectedLiveSessionId: "live-head", hermesExecutable: "/opt/test/hermes",
+      expect(options).toMatchObject({ lineageRootDigest: config.ACP_HERMES_LINEAGE_ROOT_DIGEST,
+        hermesExecutable: "/opt/test/hermes",
         hermesProfile: "test-profile", hermesHome: "/opt/test/home", executorRuntimeIdentity: "hermes-runtime:test" });
       return { adopt };
     });
@@ -82,7 +81,7 @@ describe("daemon-owned Hermes incumbent adoption", () => {
     const callback = createConfiguredHermesIncumbentAdoption(harness.cp, config,
       { identityReader: reader, adoptionFactory: factory });
     expect(callback).toBeDefined();
-    config.ACP_HERMES_EXPECTED_LIVE_SESSION_ID = "changed";
+    config.ACP_HERMES_LINEAGE_ROOT_DIGEST = `sha256:${"c".repeat(64)}`;
     config.ACP_HERMES_GATEWAY_API_KEY = "changed";
     const handleOperatorRequest = vi.fn(async () => allow(ReasonCode.OK, {}));
     const daemon = { lock: { held: () => held }, handleOperatorRequest } as never;

@@ -9,10 +9,11 @@ import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
+import { readHermesTargetHead } from "../../src/session/hermes-target-head.ts";
 
 afterAll(cleanupTempDirs);
 
-it("re-adopts the same authenticated live head for the same CEO actor after revocation", async () => {
+it("re-adopts the same CEO actor after revocation, following its head inside the lineage", async () => {
   const h = makeHarness();
   const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
   try {
@@ -49,9 +50,9 @@ process.stdout.write(JSON.stringify({ ...fields, receipt_digest: 'sha256:' + cre
     expect(h.cp.bindings.revoke("CEO", "old process died").allowed).toBe(true);
     expect(h.cp.sessions.transition(old.sessionId, SessionLifecycle.ERROR).allowed).toBe(true);
 
-    const adopt = (proof: GatewayIncumbentProof, expectedLiveSessionId = proof.session_id) =>
+    const adopt = (proof: GatewayIncumbentProof) =>
       createHermesIncumbentAdoption(h.cp, {
-        gatewayOrigin: async () => proof, target, expectedLiveSessionId,
+        gatewayOrigin: async () => proof, lineageRootDigest: target.lineageRootDigest,
         hermesExecutable, hermesProfile: "fixture", hermesHome: home,
         executorRuntimeIdentity: "fixture-runtime",
       }).adopt({ gatewayPid: proof.process_pid, gatewayStartToken: proof.process_started_at });
@@ -73,20 +74,24 @@ process.stdout.write(JSON.stringify({ ...fields, receipt_digest: 'sha256:' + cre
       process_pid: process.pid, process_started_at: token! };
     const beforeSessions = h.cp.sessions.list();
     const beforeAssignments = h.cp.db.all("SELECT assignment_id FROM assignments");
-    // A different head claiming the same lineage digest has no authenticated ancestry proof.
-    const wrongHead = await adopt({ ...nextProof, session_id: "unproven-new-head" });
-    expect(wrongHead.allowed).toBe(false);
+    const beforeAudit = h.cp.db.all("SELECT event_id FROM audit_events");
+    // Another lineage is another conversation, whatever head it names.
     const wrongLineage = await adopt({ ...nextProof, lineage_root_digest: `sha256:${"b".repeat(64)}` });
     expect(wrongLineage.allowed).toBe(false);
     expect(h.cp.sessions.list()).toEqual(beforeSessions);
     expect(h.cp.db.all("SELECT assignment_id FROM assignments")).toEqual(beforeAssignments);
+    expect(h.cp.db.all("SELECT event_id FROM audit_events")).toEqual(beforeAudit);
     expect(h.cp.bindings.active("CEO")).toBeNull();
-    const second = await adopt(nextProof);
+    // A compression rotated the head inside the lineage while the Gateway was down: that head is
+    // adopted and the target follows it, with no configured head to agree with.
+    const rotated = "rotated-live-head";
+    const second = await adopt({ ...nextProof, session_id: rotated });
     expect(second.allowed).toBe(true);
     if (!second.allowed) return;
     expect(second.value.actorId).toBe(first.value.actorId);
     expect(second.value.bindingGeneration).toBe(first.value.bindingGeneration + 1);
     expect(h.cp.bindings.active("CEO")?.sessionId).toBe(second.value.sessionId);
+    expect(readHermesTargetHead(h.cp.db, first.value.actorId)).toMatchObject({ head: rotated, bornLocator: head });
   } finally {
     if (child.exitCode === null) child.kill();
     h.cp.close();

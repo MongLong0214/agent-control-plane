@@ -10,6 +10,7 @@ import {
   type AdmittedRuntime,
   type ProcessLineageReader,
 } from "../session/runtime-lineage.ts";
+import { judgeLiveHead, readHermesTargetHead, recordHeadAdvance } from "../session/hermes-target-head.ts";
 import type { GatewayIncumbentProof } from "./hermes-incumbent-adoption.ts";
 
 /**
@@ -26,12 +27,20 @@ import type { GatewayIncumbentProof } from "./hermes-incumbent-adoption.ts";
  *   - it descends from the process the active CEO binding's runtime row recorded, with that
  *     process's recorded start (`admitRuntimeLineage`) — an ancestor pid alone admits nothing;
  *   - the Gateway's own identity readback (`gatewayOrigin`, the one adoption already uses) names
- *     that same pid and native start token, the configured live Hermes session and the configured
- *     lineage digest, and the binding's target is that session and lineage.
+ *     that same pid and native start token and the configured lineage digest, and the binding's
+ *     target is that lineage.
  *
- * Nothing is written, so admitting the same Gateway's child twice gives the same answer twice: a
- * reconnect or a respawn is just another connection. A Gateway that is not running, a different
- * Gateway, or a binding the operator has not (re-)adopted is refused.
+ * The head inside the lineage is the one the Gateway reports (`judgeLiveHead`, the rule adoption
+ * and Gateway delivery share). When a compression has rotated it since the target last recorded
+ * one, that move — and only it — is recorded, atomically, fenced on this binding; no generation,
+ * session or secret is minted for it. The head becomes the provenance anchor, which still names
+ * exactly one session: tracking the head never widens which turns may mutate. A head that moves
+ * while a connection is open is not followed by that connection; its anchor is the head it was
+ * admitted with, and the next admission records the move.
+ *
+ * Otherwise nothing is written, so admitting the same Gateway's child twice gives the same answer
+ * twice: a reconnect or a respawn is just another connection. A Gateway that is not running, a
+ * different Gateway, or a binding that has not been (re-)adopted is refused.
  *
  * Rotating generation N to N+1 on every attach, with a fresh session and secret for the relay to
  * present, was built first and withdrawn rather than shipped, at the owner's direction: issuing a
@@ -49,8 +58,6 @@ import type { GatewayIncumbentProof } from "./hermes-incumbent-adoption.ts";
 export interface AdoptedCeoToolAdmissionOptions {
   /** The daemon-wired, authenticated Gateway readback adoption already uses. */
   gatewayOrigin(): Promise<GatewayIncumbentProof | null>;
-  /** The configured live Hermes session; the readback must name exactly this one. */
-  expectedLiveSessionId: string;
   /** The configured lineage digest; the readback and the binding must both carry it. */
   lineageRootDigest: string;
   processes?: ProcessLineageReader;
@@ -92,11 +99,10 @@ export const createAdoptedCeoToolAdmission = (cp: ControlPlane, options: Adopted
   const admit = async (peer: AdoptedCeoPeer): Promise<Decision<AdoptedCeoAdmission>> => {
     const proof = await readProof();
     if (proof === null) return refuse("the Gateway's identity cannot be read");
-    if (proof.session_id !== options.expectedLiveSessionId) return refuse("the Gateway's live session is not the configured one");
     if (proof.lineage_root_digest !== options.lineageRootDigest) return refuse("the Gateway's lineage is not the configured one");
 
     const binding = cp.bindings.active(roleKey);
-    if (binding === null) return refuse("no CEO binding is active; a restarted Gateway is adopted by the operator");
+    if (binding === null) return refuse("no CEO binding is active; a restarted Gateway is adopted first");
     const owner = cp.db.get<{ actor_id: string; kind: string; retired_at: string | null }>(
       `SELECT c.actor_id, c.kind, c.retired_at
          FROM assignments a JOIN conversational_actors c ON c.actor_id = a.actor_id
@@ -113,20 +119,30 @@ export const createAdoptedCeoToolAdmission = (cp: ControlPlane, options: Adopted
     if (session.provider !== "hermes") return refuse("the active CEO runtime is not a Hermes runtime");
     if (session.osPid !== proof.process_pid) return refuse("the reporting Gateway is not the bound CEO runtime");
 
-    const targets = cp.db.all<{ executor_kind: string; target_locator: string; target_locator_digest: string }>(
-      "SELECT executor_kind, target_locator, target_locator_digest FROM actor_target_bindings WHERE target_actor_id = ?",
-      [owner.actor_id],
-    );
-    if (targets.length !== 1) return refuse("the CEO actor does not name exactly one target");
-    const target = targets[0]!;
-    if (target.executor_kind !== "hermes") return refuse("the CEO actor's target is not a Hermes conversation");
-    if (target.target_locator !== proof.session_id) return refuse("the CEO is bound to another Hermes session");
-    if (target.target_locator_digest !== proof.lineage_root_digest) return refuse("the CEO is bound to another lineage");
+    const target = readHermesTargetHead(cp.db, owner.actor_id);
+    if (target === null) return refuse("the CEO actor does not name exactly one target");
+    const head = judgeLiveHead(target, proof);
+    if (head.verdict === "REFUSE") return refuse(head.message);
 
     const lineage = admitRuntimeLineage(peer.peerPid, session, processes, cp.sessions);
     if (!lineage.allowed) return lineage as Decision<AdoptedCeoAdmission>;
     if (lineage.value.startToken !== proof.process_started_at) {
       return refuse("the Gateway reported a process other than the one running at its pid");
+    }
+    if (head.verdict === "ADVANCE") {
+      // Everything above was read synchronously after the one await, so this transaction records
+      // the move against exactly the binding and head it judged.
+      const advanced = cp.db.txDecision((): Decision<void> => {
+        const moved = (): Decision<void> =>
+          deny(ReasonCode.CONFLICT, "the CEO binding or its head moved during admission", {});
+        if (cp.bindings.active(roleKey)?.assignmentId !== binding.assignmentId) return moved();
+        const current = readHermesTargetHead(cp.db, owner.actor_id);
+        if (current === null) return moved();
+        if (current.head !== head.previousHead) return moved();
+        return recordHeadAdvance(cp.audit, current, head, { path: "tool_admission", sessionId: binding.sessionId,
+          roleKey, bindingGeneration: binding.bindingGeneration, gatewayPid: proof.process_pid });
+      });
+      if (!advanced.allowed) return refuse(advanced.message);
     }
 
     return allow(ReasonCode.OK, {
@@ -136,8 +152,8 @@ export const createAdoptedCeoToolAdmission = (cp: ControlPlane, options: Adopted
       sessionIncarnation: binding.sessionIncarnation,
       actorId: owner.actor_id,
       provenance: {
-        liveHermesSessionId: target.target_locator,
-        lineageRootDigest: target.target_locator_digest,
+        liveHermesSessionId: head.head,
+        lineageRootDigest: target.lineageRootDigest,
       },
       runtime: lineage.value.runtime,
     });

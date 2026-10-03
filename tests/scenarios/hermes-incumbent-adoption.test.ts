@@ -9,6 +9,7 @@ import { Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { createHermesIncumbentAdoption } from "../../src/bootstrap/hermes-incumbent-adoption.ts";
 import { runHermesTargetBind, type HermesTargetBindResponse } from "../../src/runtime/hermes-target-bind.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { readHermesTargetHead, TARGET_HEAD_ADVANCED } from "../../src/session/hermes-target-head.ts";
 import { makeHarness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
@@ -28,8 +29,7 @@ it("refuses an asynchronously missing Gateway origin before writing a session", 
     expect(token).not.toBeNull();
     const adoption = createHermesIncumbentAdoption(h.cp, {
       gatewayOrigin: async () => null,
-      target: { sessionId: "canonical", lineageRootDigest: `sha256:${"a".repeat(64)}` },
-      expectedLiveSessionId: "live-head",
+      lineageRootDigest: `sha256:${"a".repeat(64)}`,
       hermesExecutable: "unused", hermesProfile: "unused", hermesHome: "unused",
       executorRuntimeIdentity: "unused",
     });
@@ -48,7 +48,7 @@ it.each([[true, false, false, false, false], [false, false, false, false, false]
   [true, true, false, false, false], [false, true, false, false, false],
   [true, false, true, false, false], [true, true, false, true, false],
   [true, true, false, false, true], [true, false, false, false, false, true]])(
-  "adopts only the pinned live head (prior target: %s, switches during readback: %s, actor drift: %s, competing bind: %s, blocked revoke: %s, PID drift: %s)", async (priorTarget, switchesDuringReadback, actorDrift, competingBind, blockedRevoke, pidDrift = false) => {
+  "adopts the Gateway's live head inside the configured lineage (prior target: %s, switches during readback: %s, actor drift: %s, competing bind: %s, blocked revoke: %s, PID drift: %s)", async (priorTarget, switchesDuringReadback, actorDrift, competingBind, blockedRevoke, pidDrift = false) => {
   const h = makeHarness();
   const home = tempDir("acp-adopt-target-");
   symlinkSync(process.execPath, join(home, "node"));
@@ -113,13 +113,12 @@ process.stdout.write(JSON.stringify({ ...fields, receipt_digest: 'sha256:' + cre
       { ...validProof, process_pid: 2147483647 },
       { ...validProof, process_started_at: "darwin-tv:0.000000" },
       { ...validProof, session_id: "" },
-      { ...validProof, session_id: "new-conversation-same-lineage" },
       { ...validProof, lineage_root_digest: `sha256:${"b".repeat(64)}` },
     ]) {
       const beforeSessions = h.cp.sessions.list();
       const beforeAssignments = h.cp.db.all("SELECT assignment_id FROM assignments");
       const rejected = await createHermesIncumbentAdoption(h.cp, {
-        gatewayOrigin: async () => invalid, target: pinned, expectedLiveSessionId: liveHead, hermesExecutable,
+        gatewayOrigin: async () => invalid, lineageRootDigest: pinned.lineageRootDigest, hermesExecutable,
         hermesProfile: "fixture", hermesHome: home, executorRuntimeIdentity: "fixture-runtime",
       }).adopt({ gatewayPid: process.pid, gatewayStartToken: token! });
       expect(rejected.allowed).toBe(false);
@@ -162,8 +161,7 @@ process.stdout.write(JSON.stringify({ ...fields, receipt_digest: 'sha256:' + cre
         if (proofReads > 1 && pidDrift) return { ...validProof, process_pid: 2147483647 };
         return validProof;
       },
-      target: pinned,
-      expectedLiveSessionId: liveHead,
+      lineageRootDigest: pinned.lineageRootDigest,
       hermesExecutable,
       hermesProfile: "fixture", hermesHome: home, executorRuntimeIdentity: "fixture-runtime",
     });
@@ -215,6 +213,18 @@ process.stdout.write(JSON.stringify({ ...fields, receipt_digest: 'sha256:' + cre
       lineage_root_digest: pinned.lineageRootDigest, executor_runtime_identity: "fixture-runtime",
     });
     expect(h.cp.db.all("SELECT actor_id FROM conversational_actors")).toEqual([{ actor_id: previous.actor_id }]);
+    // The target follows the head the Gateway serves; the row it was born with is not rewritten.
+    expect(readHermesTargetHead(h.cp.db, previous.actor_id)).toMatchObject({
+      head: liveHead, bornLocator: priorTarget ? pinned.sessionId : liveHead,
+      lineageRootDigest: pinned.lineageRootDigest,
+    });
+    expect(h.cp.audit.byKind(TARGET_HEAD_ADVANCED).map((row) => row.evidence)).toEqual(priorTarget
+      ? [expect.objectContaining({ previousHead: pinned.sessionId, head: liveHead, path: "adoption",
+        bindingGeneration: result.value.bindingGeneration })]
+      : []);
+    // The new generation's receipt names the moved head and still reads as the CEO's current one.
+    expect(h.cp.bindings.currentHermesTargetBindReceipt({ roleKey: "CEO", sessionId: result.value.sessionId,
+      sessionIncarnation: result.value.sessionIncarnation })).toMatchObject({ requested_session_id: liveHead });
   } finally {
     h.cp.close();
   }

@@ -20,6 +20,7 @@ import {
   type AdoptedCeoFixture,
 } from "../helpers/adopted-ceo.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { readHermesTargetHead, TARGET_HEAD_ADVANCED } from "../../src/session/hermes-target-head.ts";
 
 /**
  * The adopted CEO tool channel's one admission decision (#1037), against the real registries, with
@@ -76,6 +77,64 @@ describe("adopted CEO tool admission — admitted", () => {
     expect(h.cp.db.get("SELECT MAX(binding_generation) AS g FROM assignments WHERE role_key = ?", [CEO])).toEqual({ g: 1 });
     expect(count(h, "SELECT COUNT(*) AS n FROM sessions")).toBe(1);
     expect(count(h, "SELECT COUNT(*) AS n FROM conversational_actors")).toBe(1);
+  });
+});
+
+describe("adopted CEO tool admission — the head moves inside the lineage (2026-10-03)", () => {
+  const OLDER_HEAD = "20260923_000000_older_head";
+
+  it("admits the Gateway's new head over the stored older one and records only that move, once", async () => {
+    // CEO gen3 as it stood live: bound to the 09-23 head, Gateway serving the 10-01 head.
+    const fixture = adoptedFixture({ locator: OLDER_HEAD });
+    const { h } = fixture;
+    expect(readHermesTargetHead(h.cp.db, fixture.actorId)?.head).toBe(OLDER_HEAD);
+    const before = snapshot(h);
+    const admitted = await fixture.admit();
+    expect(admitted.allowed).toBe(true);
+    if (!admitted.allowed) return;
+    // Provenance is anchored on the one head the Gateway serves, not on the lineage.
+    expect(admitted.value.provenance).toEqual({ liveHermesSessionId: LIVE, lineageRootDigest: DIGEST });
+    expect(readHermesTargetHead(h.cp.db, fixture.actorId)).toMatchObject({ head: LIVE, bornLocator: OLDER_HEAD });
+    const after = snapshot(h);
+    // No generation, session, secret, actor or target row: one audit row, the head move.
+    for (const table of Object.keys(before)) {
+      if (table !== "audit_events") expect(after[table]).toEqual(before[table]);
+    }
+    const added = after.audit_events!.filter((row) => !before.audit_events!.includes(row));
+    expect(added).toHaveLength(1);
+    expect(JSON.parse(added[0]!)).toMatchObject({ kind: TARGET_HEAD_ADVANCED, role_key: CEO,
+      session_id: fixture.gatewaySessionId });
+    expect(JSON.parse(JSON.parse(added[0]!).evidence_json)).toMatchObject({ previousHead: OLDER_HEAD, head: LIVE,
+      lineageRootDigest: DIGEST, actorId: fixture.actorId, path: "tool_admission", bindingGeneration: 1 });
+    // The move is made once: the next admission finds the head it reports and writes nothing.
+    const settled = snapshot(h);
+    expect(await fixture.admit()).toEqual(admitted);
+    expect(snapshot(h)).toEqual(settled);
+  });
+
+  it("refuses a head in another lineage over the stored older one, writing nothing", async () => {
+    const fixture = adoptedFixture({ locator: OLDER_HEAD });
+    await expectRefusedWithoutWrites(
+      fixture,
+      () => fixture.admit(RELAY, {
+        lineageRootDigest: OTHER_DIGEST,
+        gatewayOrigin: async () => ({ ...fixture.proof, session_id: "20261002_080000_other_chat",
+          lineage_root_digest: OTHER_DIGEST }),
+      }),
+      ReasonCode.CONFLICT,
+    );
+    expect(readHermesTargetHead(fixture.h.cp.db, fixture.actorId)?.head).toBe(OLDER_HEAD);
+  });
+
+  it("does not move the head for a Gateway that is not the bound process", async () => {
+    const fixture = adoptedFixture({ locator: OLDER_HEAD });
+    // The readback names another start for the bound pid: refused before anything is recorded.
+    await expectRefusedWithoutWrites(
+      fixture,
+      () => fixture.admit(RELAY, { gatewayOrigin: async () => ({ ...fixture.proof, process_started_at: "darwin-tv:1.000000" }) }),
+      ReasonCode.CONFLICT,
+    );
+    expect(readHermesTargetHead(fixture.h.cp.db, fixture.actorId)?.head).toBe(OLDER_HEAD);
   });
 });
 
@@ -155,27 +214,24 @@ describe("adopted CEO tool admission — refusals write nothing", () => {
     expect(fixture.h.cp.sessions.pinnedNativeStart(fixture.gatewaySessionId)).toBe(TOKEN);
   });
 
-  it("refuses another chat's session, another lineage, and a binding to another head", async () => {
+  it("refuses another lineage, reported by the Gateway or bound to the CEO", async () => {
     const fixture = adoptedFixture();
-    for (const proof of [
-      { ...fixture.proof, session_id: "20261002_080000_other_chat" },
-      { ...fixture.proof, lineage_root_digest: OTHER_DIGEST },
-    ]) {
-      await expectRefusedWithoutWrites(fixture, () => fixture.admit(RELAY, { gatewayOrigin: async () => proof }), ReasonCode.CONFLICT);
-    }
+    await expectRefusedWithoutWrites(
+      fixture,
+      () => fixture.admit(RELAY, { gatewayOrigin: async () => ({ ...fixture.proof, lineage_root_digest: OTHER_DIGEST }) }),
+      ReasonCode.CONFLICT,
+    );
     // The readback and the configuration agree with each other, not with what the CEO is bound to.
     await expectRefusedWithoutWrites(
       fixture,
       () => fixture.admit(RELAY, {
-        expectedLiveSessionId: "20261002_080000_other_chat",
-        gatewayOrigin: async () => ({ ...fixture.proof, session_id: "20261002_080000_other_chat" }),
+        lineageRootDigest: OTHER_DIGEST,
+        gatewayOrigin: async () => ({ ...fixture.proof, lineage_root_digest: OTHER_DIGEST }),
       }),
       ReasonCode.CONFLICT,
     );
     const otherLineage = adoptedFixture({ digest: OTHER_DIGEST });
     await expectRefusedWithoutWrites(otherLineage, () => otherLineage.admit(), ReasonCode.CONFLICT);
-    const olderHead = adoptedFixture({ locator: "20261001_000000_older_head" });
-    await expectRefusedWithoutWrites(olderHead, () => olderHead.admit(), ReasonCode.CONFLICT);
   });
 
   it("refuses a DEAD Gateway, an unreadable one, a different Gateway, and a binding the operator has not adopted", async () => {
