@@ -11,9 +11,12 @@ import {
   type IngressReceiptSettlement,
   REPLY_OUTBOX_SETTLEMENT,
   type OwnerReplyAuthority,
+  type TelegramDeliveryReport,
   claimOwnerReplyAuthority,
   enqueueOwnerReply,
   issueIngressReceiptSettlement,
+  recordTelegramReplyDeliveryEvidence,
+  telegramRepliesAwaitingDeliveryEvidence,
   withdrawIngressReceiptSettlement,
 } from "./owner-reply-outbox.ts";
 
@@ -122,6 +125,14 @@ export type ReceiptLookupResult =
        */
       readonly content?: string;
       /**
+       * What a `COMPLETED` receipt says about the reply's Telegram delivery, when the port carries
+       * it (A3): Hermes sends a Telegram reply itself, and its Gateway receipt reports the send.
+       * `null` when the receipt reported none; absent from a port that never reports one. Untrusted
+       * like the rest of the answer: `recordTelegramReplyDeliveryEvidence` checks it against the
+       * item before anything is recorded.
+       */
+      readonly delivery?: TelegramDeliveryReport | null;
+      /**
        * The identity the receipt itself attests to — every field `ReceiptLookupQuery` names, not
        * an echo of the query.
        *
@@ -166,6 +177,12 @@ export type ReceiptLookupResult =
  */
 export interface ReceiptPort {
   lookup(query: ReceiptLookupQuery, signal: AbortSignal): Promise<ReceiptLookupResult> | ReceiptLookupResult;
+  /**
+   * `true` on a port whose `COMPLETED` receipts carry Telegram delivery evidence (A3). Only such a
+   * port is asked again about a completed turn whose Telegram reply is still parked; any other is
+   * never asked about a settled turn, which is what it was before.
+   */
+  readonly reportsTelegramDelivery?: boolean;
 }
 
 /**
@@ -1700,6 +1717,16 @@ export class ConversationTurnCoordinator {
     readonly failed: number;
   }> {
     const candidates = this.unresolvedIdentities();
+    // Taken before this pass settles anything, so a reply this pass enqueues is not asked about
+    // twice in the one pass: the receipt that settled it was read moments ago.
+    let awaitingEvidence: readonly string[] = [];
+    if (this.#receiptPort.reportsTelegramDelivery === true) {
+      try {
+        awaitingEvidence = telegramRepliesAwaitingDeliveryEvidence(this.db);
+      } catch {
+        // A reply row this build cannot read must not stop in-doubt turns from settling below.
+      }
+    }
     const startedAt = Date.now();
     let settled = 0;
     let failed = 0;
@@ -1746,13 +1773,77 @@ export class ConversationTurnCoordinator {
         executorSessionId: result.executorSessionId,
         executorSessionIncarnation: result.executorSessionIncarnation,
       }, { outcome: result.outcome, receiptId: result.receiptId, evidenceDigest: result.evidenceDigest, reasonCode: result.reasonCode },
-      result.content ?? null);
+      result.content ?? null, result.delivery);
       if (decision.allowed) settled += 1;
       // A denial here — wrong generation, mismatched identity, or an already-settled turn a
       // concurrent settlement reached first — leaves the turn exactly as it was. It is not
       // re-thrown: one candidate's refusal must not stop the sweep from asking about the rest.
     }
+    // A3: a completed Telegram turn whose reply is still parked, asked again inside what is left of
+    // this pass's budget. Kept out of the counts above, which describe in-doubt turns: a later read
+    // that fails leaves its reply parked, as it already was, and the next pass asks again.
+    for (const turnRequestId of awaitingEvidence) {
+      if (Date.now() - startedAt >= budgetMs) break;
+      await this.#readTelegramDeliveryEvidence(turnRequestId);
+    }
     return { swept: candidates.length, settled, unresolved: candidates.length - settled, failed };
+  }
+
+  /**
+   * Asks the receipt port again about one completed canonical turn whose Telegram reply is parked,
+   * and hands any delivery evidence to `recordTelegramReplyDeliveryEvidence` (A3), the function the
+   * settlement uses. The answer counts only when it is `COMPLETED` and attests to this turn on all
+   * eight identity fields, exactly as a settling receipt must; anything else changes nothing.
+   */
+  async #readTelegramDeliveryEvidence(turnRequestId: string): Promise<void> {
+    const row = this.db.get<{
+      target_actor_id: string;
+      prompt_digest: string;
+      binding_generation: number;
+      target_binding_id: string;
+      target_attestation_id: string;
+      executor_session_id: string;
+      executor_session_incarnation: string;
+    }>(
+      `SELECT target_actor_id, prompt_digest, binding_generation, target_binding_id, target_attestation_id,
+              executor_session_id, executor_session_incarnation
+         FROM canonical_turns WHERE turn_request_id = ? AND outcome_kind = 'COMPLETED'`,
+      [turnRequestId],
+    );
+    if (!row) return;
+    const query: ReceiptLookupQuery = {
+      turnRequestId,
+      targetActorId: row.target_actor_id,
+      promptDigest: row.prompt_digest,
+      bindingGeneration: row.binding_generation,
+      targetBindingId: row.target_binding_id,
+      targetAttestationId: row.target_attestation_id,
+      executorSessionId: row.executor_session_id,
+      executorSessionIncarnation: row.executor_session_incarnation,
+    };
+    let result: ReceiptLookupResult;
+    try {
+      result = await this.#lookupWithTimeout(query);
+    } catch {
+      return;
+    }
+    if (!result.found || result.outcome !== "COMPLETED" || result.delivery === undefined) return;
+    if (
+      result.turnRequestId !== query.turnRequestId || result.targetActorId !== query.targetActorId ||
+      result.promptDigest !== query.promptDigest || result.bindingGeneration !== query.bindingGeneration ||
+      result.targetBindingId !== query.targetBindingId || result.targetAttestationId !== query.targetAttestationId ||
+      result.executorSessionId !== query.executorSessionId ||
+      result.executorSessionIncarnation !== query.executorSessionIncarnation
+    ) return;
+    try {
+      recordTelegramReplyDeliveryEvidence(this.#ownerReplies, this.db, this.clock, this.audit, {
+        turnRequestId,
+        receipt: { receiptId: result.receiptId, evidenceDigest: result.evidenceDigest },
+        delivery: result.delivery,
+      });
+    } catch {
+      // An item this build cannot read stays as it is; one turn's fault does not stop the pass.
+    }
   }
 
   /**
@@ -1813,6 +1904,8 @@ export class ConversationTurnCoordinator {
     receipt: TurnReceipt & { outcome: "COMPLETED" | "ABORTED" },
     /** The reply text the receipt carried, stored with the item it obliges (#1036). */
     replyText: string | null,
+    /** The receipt's Telegram delivery evidence, when its port reports one (A3). */
+    delivery: TelegramDeliveryReport | null | undefined,
   ): Decision<TurnMaterialization> {
     // Checked first, and against no table: a receipt attesting to a different turn than the one
     // this sweep asked about is not evidence about this row at all, whatever else it says. A port
@@ -1939,6 +2032,16 @@ export class ConversationTurnCoordinator {
       });
       if (!reply.allowed) return deny(reply.reasonCode, reply.message, reply.evidence);
       enqueued = reply.value.status === "ENQUEUED";
+      // A3: Hermes sends a Telegram reply itself, and this receipt may already prove it sent. The
+      // item it obliges is then recorded DELIVERED in this same transaction. Evidence that does
+      // not match is audited and leaves the item parked; it never refuses the settlement.
+      if (reply.value.item !== null && delivery !== undefined) {
+        recordTelegramReplyDeliveryEvidence(this.#ownerReplies, this.db, this.clock, this.audit, {
+          turnRequestId,
+          receipt: { receiptId: receipt.receiptId, evidenceDigest: receipt.evidenceDigest },
+          delivery,
+        });
+      }
       return observed;
     });
     if (decided.allowed && enqueued) this.#announceOwnerReply();
