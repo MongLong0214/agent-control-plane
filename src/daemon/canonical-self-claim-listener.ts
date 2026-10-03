@@ -349,14 +349,37 @@ const publicToolRefusal = (decision: Decision<unknown>): string =>
  * The closed set of kernel-peer MCP doors. `acknowledge` is the one difference: the canonical CTO's
  * relay must know it was admitted before it hands over a byte of the client's, because a refusal
  * there sends it to the claim instead, with the client's `initialize` still unsent. The adopted
- * CEO's relay has nowhere else to go, so its first line is either a refusal or traffic.
+ * CEO's relay has nowhere else to go, so its first line is either a refusal or traffic (`null`).
  */
-interface PeerAdmittedDoor {
+interface PeerAdmittedDoor<T> {
   socketFilename: typeof ADOPTED_CEO_TOOL_SOCKET_FILENAME | typeof CANONICAL_CTO_TOOL_SOCKET_FILENAME;
-  acknowledge: boolean;
+  acknowledge: ((admitted: T) => string) | null;
 }
 
-const ADMITTED_LINE = `${JSON.stringify({ ok: true, reasonCode: ReasonCode.OK })}\n`;
+/**
+ * What the canonical CTO door's acknowledgement names: the binding and the runtime this connection
+ * was admitted under (review PR1051-R1). A relay that comes back after a restart compares it with
+ * what its first admission named and refuses any other, so a reconnect can never adopt a binding or
+ * session that replaced its own while it was away. None of the four is a credential.
+ */
+export interface CanonicalCtoAdmittedTuple {
+  assignmentId: string;
+  bindingGeneration: number;
+  sessionId: string;
+  sessionIncarnation: string;
+}
+
+const admittedLine = (admitted: CanonicalCtoAdmittedTuple): string =>
+  `${JSON.stringify({
+    ok: true,
+    reasonCode: ReasonCode.OK,
+    admitted: {
+      assignmentId: admitted.assignmentId,
+      bindingGeneration: admitted.bindingGeneration,
+      sessionId: admitted.sessionId,
+      sessionIncarnation: admitted.sessionIncarnation,
+    },
+  })}\n`;
 
 /**
  * One connection on the adopted CEO tool socket: the kernel peer first, before a byte is read; then
@@ -373,7 +396,7 @@ const servePeerAdmittedConnection = <T>(
   admit: AdoptedCeoToolAdmit<T>,
   serve: AdoptedCeoToolServe<T>,
   admissionTimeoutMs: number,
-  door: PeerAdmittedDoor,
+  door: PeerAdmittedDoor<T>,
 ): void => {
   let settled = false;
   const refuse = (decision: Decision<unknown>): void => {
@@ -406,7 +429,7 @@ const servePeerAdmittedConnection = <T>(
       clearTimeout(timer);
       if (!admitted.allowed) return refuse(admitted);
       if (socket.destroyed) return;
-      if (door.acknowledge) socket.write(ADMITTED_LINE);
+      if (door.acknowledge !== null) socket.write(door.acknowledge(admitted.value));
       serve(admitted.value, socket);
     });
 };
@@ -424,14 +447,15 @@ export const startAdoptedCeoToolListener = <T>(
 ): Promise<CanonicalSelfClaimListener> =>
   startPeerAdmittedListener(daemon, stateDir, admit, serve, options, {
     socketFilename: ADOPTED_CEO_TOOL_SOCKET_FILENAME,
-    acknowledge: false,
+    acknowledge: null,
   });
 
 /**
  * Starts the canonical CTO's reattach socket (#1037): the same door, answering an admitted peer
- * with one `{ok:true}` line before MCP begins, so the relay knows not to claim.
+ * with one `{ok:true,admitted}` line before MCP begins, so the relay knows not to claim and knows
+ * which binding and runtime it was admitted under.
  */
-export const startCanonicalCtoToolListener = <T>(
+export const startCanonicalCtoToolListener = <T extends CanonicalCtoAdmittedTuple>(
   daemon: { lock: { held(): boolean } },
   stateDir: string,
   admit: AdoptedCeoToolAdmit<T>,
@@ -440,7 +464,7 @@ export const startCanonicalCtoToolListener = <T>(
 ): Promise<CanonicalSelfClaimListener> =>
   startPeerAdmittedListener(daemon, stateDir, admit, serve, options, {
     socketFilename: CANONICAL_CTO_TOOL_SOCKET_FILENAME,
-    acknowledge: true,
+    acknowledge: admittedLine,
   });
 
 const startPeerAdmittedListener = async <T>(
@@ -449,7 +473,7 @@ const startPeerAdmittedListener = async <T>(
   admit: AdoptedCeoToolAdmit<T>,
   serve: AdoptedCeoToolServe<T>,
   options: { admissionTimeoutMs?: number },
-  door: PeerAdmittedDoor,
+  door: PeerAdmittedDoor<T>,
 ): Promise<CanonicalSelfClaimListener> => {
   const admissionTimeoutMs = options.admissionTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   if (!Number.isSafeInteger(admissionTimeoutMs)) {

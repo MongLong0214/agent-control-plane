@@ -119,6 +119,8 @@ const relay = (paths: { claimPath: string; ctoPath: string; reattachPath: string
     mcpSocketPath: paths.ctoPath,
     reattachSocketPath: paths.reattachPath,
     claim: { claimedSessionUuid: CONVERSATION, projectId: PROJECT, expectedBindingGeneration: 2 },
+    // A daemon that never comes back is waited for briefly here, so a closed listener ends a test.
+    reattach: { maxWaitMs: 300, initialDelayMs: 20, maxDelayMs: 100, attemptTimeoutMs: 2_000 },
   };
   const exit = entry === "command"
     ? runAttachRelayCommand(common, { stdin, stdout, stderr })
@@ -195,7 +197,9 @@ describe("closing the listeners does not wait on a reattached relay (PR1046-R3)"
     const init = await r.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "claude-code", version: "1" } });
     expect(init.error).toBeUndefined();
     expect(await settles(paths.listeners.close().then(() => 0))).toBe(0);
-    expect(await settles(r.exit)).toBe(ATTACH_EXIT.STREAM_CLOSED);
+    // The relay outlives the closed connection and waits for the daemon; none comes back, so it
+    // exits once its bounded wait is over.
+    expect(await settles(r.exit)).toBe(ATTACH_EXIT.UNAVAILABLE);
   });
 });
 
