@@ -10,10 +10,12 @@ import {
   type ProcessLineageReader,
 } from "../session/runtime-lineage.ts";
 import {
+  assertCanonicalSessionsValid,
   defaultProcessAncestryInspector,
   deriveClaimantIdentity,
   makeDefaultHostSessionRegistryReader,
   SELF_CLAIM_EXECUTOR_KIND,
+  type CanonicalAdoptableSession,
   type HostSessionRegistryReader,
   type ProcessAncestryInspector,
 } from "./canonical-self-claim.ts";
@@ -45,7 +47,16 @@ import {
  * Anything else — another process, a pid reused by a later start, a binding whose runtime is
  * another session, a REVOKED binding, another conversation — is `CTO_REATTACH_UNBOUND`, and the
  * relay then claims exactly as it always has: a restarted process is a real change of incarnation,
- * and the generation is what fences it. Nothing is written on any path through this module.
+ * and the generation is what fences it. Admission writes nothing on any path.
+ *
+ * The one write in this module is `correctBuzzAddress`, and it is not part of admission. A live
+ * holder bound before its entry named its own Buzz room keeps the room the claim wrote then, and the
+ * peer rule reads that column (`src/ingress/buzz-message.ts`, rule 4). Replacing the row would mean
+ * revoking a live binding and re-claiming, which the claim refuses for a live process whose recorded
+ * address differs from the configured one — the same-live recovery requires the exact runtime — so
+ * the holder would have to restart. Instead the holder this door admits, and only that holder, has
+ * its own row's `buzz_address` set to the room its entry names, once, in one transaction with one
+ * audit row. Nothing else about the session, the binding or the generation moves.
  *
  * Every refusal is its own statement; no condition here is an operand of an `&&`/`||` chain.
  */
@@ -59,6 +70,19 @@ export interface CanonicalCtoAdmission {
   sessionId: string;
   sessionIncarnation: string;
   actorId: string;
+  /** The claude conversation the admission derived from the process tree, never from the peer. */
+  conversation: string;
+}
+
+/**
+ * What `correctBuzzAddress` needs that admission does not: which room each adoptable session
+ * belongs in, and the claim's own way of opening one, so a corrected room is proven to exist
+ * exactly the way a claimed one is.
+ */
+export interface CanonicalCtoBuzzAddressOptions {
+  canonicalSessions: readonly CanonicalAdoptableSession[];
+  resolveBuzzAddress: (purpose: string, channelId: string) => Promise<Decision<string>>;
+  buzzPurpose: string;
 }
 
 export interface CanonicalCtoReattachOptions {
@@ -66,7 +90,22 @@ export interface CanonicalCtoReattachOptions {
   inspector?: ProcessAncestryInspector;
   registryReader?: HostSessionRegistryReader;
   maxAncestryHops?: number;
+  /** Absent, `correctBuzzAddress` corrects nothing and reads nothing. */
+  buzzAddress?: CanonicalCtoBuzzAddressOptions;
 }
+
+/**
+ * `NOT_CONFIGURED`: the admitted holder's entry names no room of its own, so there is nothing to
+ * correct to. `ALREADY_CORRECT`: its row already routes to that room. `CORRECTED`: this call moved
+ * it there and wrote the one audit row.
+ */
+export interface CanonicalCtoBuzzAddressCorrection {
+  outcome: "CORRECTED" | "ALREADY_CORRECT" | "NOT_CONFIGURED";
+  sessionId: string | null;
+}
+
+/** The audit kind of the one row a correction writes. */
+export const CANONICAL_CTO_BUZZ_ADDRESS_CORRECTED = "CANONICAL_CTO_BUZZ_ADDRESS_CORRECTED";
 
 const MAX_ANCESTRY_HOPS = 64;
 
@@ -80,13 +119,22 @@ const lifecycleHoldsSocket = (lifecycle: SessionLifecycle): boolean => {
 };
 
 export const createCanonicalCtoReattach = (
-  cp: Pick<ControlPlane, "db" | "bindings" | "sessions">,
+  cp: Pick<ControlPlane, "db" | "bindings" | "sessions" | "audit">,
   options: CanonicalCtoReattachOptions = {},
 ) => {
   const processes = options.processes ?? defaultProcessLineageReader;
   const inspector = options.inspector ?? defaultProcessAncestryInspector;
   const registryReader = options.registryReader ?? makeDefaultHostSessionRegistryReader();
   const maxAncestryHops = options.maxAncestryHops ?? MAX_ANCESTRY_HOPS;
+  const correction = options.buzzAddress;
+  // Through the one authority over what an adoptable set may be, at construction, so a malformed
+  // room refuses here rather than being written. Copied and frozen like the claim's own set.
+  const correctable = correction === undefined
+    ? []
+    : assertCanonicalSessionsValid(correction.canonicalSessions).map((entry) => Object.freeze({ ...entry }));
+  // A set in which no entry names a room has nothing a correction could move a row to, so it does
+  // not walk the process tree a second time on every reattach just to find that out.
+  const namesARoom = correctable.some((entry) => entry.buzzAddress !== undefined);
 
   const admit = (peer: { peerPid: number; uid: number }): Decision<CanonicalCtoAdmission> => {
     const identity = deriveClaimantIdentity(peer.peerPid, inspector, maxAncestryHops, registryReader);
@@ -136,6 +184,80 @@ export const createCanonicalCtoReattach = (
       sessionId: session.sessionId,
       sessionIncarnation: session.incarnation,
       actorId: row.actor_id,
+      conversation,
+    });
+  };
+
+  /**
+   * Moves the admitted holder's own `buzz_address` to the room its entry names, or does nothing.
+   *
+   * It takes the peer, never an admission, and admits it itself: what may be corrected is decided
+   * by the same process-tree proof that admits a reattach, so a caller cannot hand it a holder it
+   * did not prove. Only the admitted session's row is touched, and only when that holder's entry —
+   * found by the conversation admission derived — names a room and the same project the binding
+   * holds. An entry that names no room is left alone: it asked for the deployment channel, and
+   * nothing rewrites a live row for an entry that did not ask for a room.
+   *
+   * The room is opened through the claim's resolver before the transaction, because opening it
+   * shells the Buzz CLI and a transaction body cannot await. That await hands control away, so the
+   * holder is admitted again inside the transaction, at the write, and must be the very same
+   * holder — conversation, assignment, generation, session and incarnation — or nothing is written.
+   * The row is read again there too: a concurrent correction that got there first leaves this one
+   * `ALREADY_CORRECT`, so the row moves and its audit row is written exactly once.
+   */
+  const correctBuzzAddress = async (
+    peer: { peerPid: number; uid: number },
+  ): Promise<Decision<CanonicalCtoBuzzAddressCorrection>> => {
+    if (correction === undefined) return allow(ReasonCode.OK, { outcome: "NOT_CONFIGURED", sessionId: null });
+    if (!namesARoom) return allow(ReasonCode.OK, { outcome: "NOT_CONFIGURED", sessionId: null });
+    const first = admit(peer);
+    if (!first.allowed) return first as Decision<CanonicalCtoBuzzAddressCorrection>;
+    const held = first.value;
+    const entry = correctable.find((candidate) => candidate.sessionUuid === held.conversation);
+    if (entry === undefined) return allow(ReasonCode.OK, { outcome: "NOT_CONFIGURED", sessionId: held.sessionId });
+    const room = entry.buzzAddress;
+    if (room === undefined) return allow(ReasonCode.OK, { outcome: "NOT_CONFIGURED", sessionId: held.sessionId });
+    if (entry.projectId !== held.projectId) {
+      return deny(ReasonCode.CONFLICT, "this conversation's configured entry names another project than its binding", {});
+    }
+    if (cp.sessions.get(held.sessionId)?.buzzAddress === room) {
+      return allow(ReasonCode.OK, { outcome: "ALREADY_CORRECT", sessionId: held.sessionId });
+    }
+    const opened = await correction.resolveBuzzAddress(correction.buzzPurpose, room);
+    if (!opened.allowed) return opened as Decision<CanonicalCtoBuzzAddressCorrection>;
+    if (opened.value !== room) {
+      return deny(ReasonCode.CONFLICT, "the Buzz transport opened another room than the configured one", {});
+    }
+    return cp.db.txDecision((): Decision<CanonicalCtoBuzzAddressCorrection> => {
+      const again = admit(peer);
+      if (!again.allowed) return again as Decision<CanonicalCtoBuzzAddressCorrection>;
+      const changed = (): Decision<CanonicalCtoBuzzAddressCorrection> =>
+        deny(ReasonCode.CONFLICT, "the admitted holder changed while its room was opened", {});
+      if (again.value.conversation !== held.conversation) return changed();
+      if (again.value.assignmentId !== held.assignmentId) return changed();
+      if (again.value.bindingGeneration !== held.bindingGeneration) return changed();
+      if (again.value.sessionId !== held.sessionId) return changed();
+      if (again.value.sessionIncarnation !== held.sessionIncarnation) return changed();
+      const row = cp.sessions.get(held.sessionId);
+      if (row === null) return changed();
+      if (row.buzzAddress === room) return allow(ReasonCode.OK, { outcome: "ALREADY_CORRECT", sessionId: held.sessionId });
+      cp.sessions.setBuzzAddress(held.sessionId, room);
+      const recorded = cp.audit.record({
+        kind: CANONICAL_CTO_BUZZ_ADDRESS_CORRECTED,
+        reasonCode: ReasonCode.OK,
+        projectId: held.projectId,
+        sessionId: held.sessionId,
+        roleKey: held.roleKey,
+        actor: held.actorId,
+        evidence: {
+          identity: held.conversation,
+          generation: held.bindingGeneration,
+          previousBuzzAddress: row.buzzAddress,
+          buzzAddress: room,
+        },
+      });
+      if (!recorded.allowed) return recorded as Decision<CanonicalCtoBuzzAddressCorrection>;
+      return allow(ReasonCode.OK, { outcome: "CORRECTED", sessionId: held.sessionId });
     });
   };
 
@@ -186,7 +308,7 @@ export const createCanonicalCtoReattach = (
     return standing;
   };
 
-  return { admit, connection, authenticate };
+  return { admit, connection, authenticate, correctBuzzAddress };
 };
 
 export type CanonicalCtoReattach = ReturnType<typeof createCanonicalCtoReattach>;

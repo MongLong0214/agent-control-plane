@@ -1150,6 +1150,14 @@ export const defaultTranscriptReader: TranscriptReader = makeDefaultTranscriptRe
  * `buzzActorId` is per entry because it has to be: `sessions_buzz_actor` is UNIQUE over
  * live lifecycles, so two adopted sessions sharing one actor id means the second `bindBuzzActor`
  * is refused by the index and the whole claim rolls back.
+ *
+ * `buzzAddress` is per entry for the same kind of reason. Each CTO answers in its own project's
+ * CEO room, and the peer rule admits a CEO mention only when it arrived on the addressed CTO's
+ * `sessions.buzz_address` (`src/ingress/buzz-message.ts`, rule 4). With one deployment-wide channel
+ * every adopted CTO was written into the same room, so mentions to all but one of them were refused
+ * or misrouted. It is optional: an entry without it routes to `canonicalBuzzChannelId`, which is
+ * what every entry did before it existed. Unlike the other three fields it need not be unique,
+ * because two projects may share a room.
  */
 export interface CanonicalAdoptableSession {
   /** The claude session UUID, matched against the independently derived ancestry, never a claim. */
@@ -1158,7 +1166,19 @@ export interface CanonicalAdoptableSession {
   projectId: string;
   /** The Buzz channel identity this session authenticates as; unique across live sessions. */
   buzzActorId: string;
+  /** The Buzz room (a lower-case channel UUID) this session's row routes to; see above. */
+  buzzAddress?: string;
 }
+
+/**
+ * The Buzz room an entry routes to: its own `buzzAddress`, or the deployment's channel when it
+ * names none. The claim opens this room and records it in the attestation digest from this one
+ * reading, so the two cannot name different rooms for one entry.
+ */
+export const canonicalBuzzChannelFor = (
+  entry: CanonicalAdoptableSession,
+  canonicalBuzzChannelId: string,
+): string => entry.buzzAddress ?? canonicalBuzzChannelId;
 
 /** A deployment adopting more entries than this has stopped being a local deployment. */
 export const MAX_CANONICAL_ADOPTABLE_SESSIONS = 32;
@@ -1224,6 +1244,21 @@ export const assertCanonicalSessionsValid = (
     if (configuredUuid !== configuredUuid.toLowerCase()) {
       throw new Error("CanonicalSelfClaim: config.canonicalSessions[].sessionUuid must be lower-case");
     }
+    // Absent is the fallback to the deployment channel. Present, it is a channel UUID or the set is
+    // refused: never trimmed, never treated as absent when blank. Lower-case, because the transport
+    // refuses a channel the relay reports under another spelling (`BuzzCliTransport` requires the
+    // answered `channel_id` to equal the one asked for), so an upper-case room would start the
+    // daemon and then fail every claim for that entry.
+    const configuredAddress: unknown = (entry as { buzzAddress?: unknown }).buzzAddress;
+    if (configuredAddress !== undefined) {
+      if (
+        typeof configuredAddress !== "string" ||
+        !UUID_PATTERN.test(configuredAddress) ||
+        configuredAddress !== configuredAddress.toLowerCase()
+      ) {
+        throw new Error("CanonicalSelfClaim: config.canonicalSessions[].buzzAddress must be a lower-case channel UUID");
+      }
+    }
   }
   // Duplicates are refused rather than resolved by first-match. A repeated `sessionUuid` would make
   // one of the two entries dead configuration that reads as live; a repeated `buzzActorId` would
@@ -1255,8 +1290,9 @@ export interface CanonicalSelfClaimConfig {
    */
   canonicalSessions: readonly CanonicalAdoptableSession[];
   /**
-   * This deployment's one canonical project Buzz channel. Required — deployment-private
-   * configuration only, same no-fallback rule as `canonicalSessions`.
+   * This deployment's default canonical project Buzz channel: the room of every entry that names
+   * no `buzzAddress` of its own. Required — deployment-private configuration only, same
+   * no-fallback rule as `canonicalSessions`.
    */
   canonicalBuzzChannelId: string;
   // No executor version, realpath or sha256. Those three were deployment-wide values the claimant's
@@ -1299,9 +1335,10 @@ export interface CanonicalSelfClaimRequest {
   // No `buzzChannelId` and no `buzzActorId` field. They used to be request fields that the
   // orchestration filled from deployment configuration and this method then compared back against
   // that same configuration — a real comparison, but of a value the caller had no say in. Now that
-  // the actor is per entry it is read from the entry this claim resolves, and the channel from
-  // `#canonicalBuzzChannelId`, so there is no caller-supplied field left to check. That is the
-  // same reasoning the removed comparison itself carried: removing the surface beats guarding it.
+  // the actor is per entry it is read from the entry this claim resolves, and the channel from that
+  // entry's `buzzAddress` or else `#canonicalBuzzChannelId`, so there is no caller-supplied field
+  // left to check. That is the same reasoning the removed comparison itself carried: removing the
+  // surface beats guarding it.
   /** Passed to `resolveBuzzAddress` to open the routing channel before the transaction opens. */
   buzzPurpose: string;
 }
@@ -1674,11 +1711,13 @@ export class CanonicalSelfClaim {
     /** Authenticates `buzzActorId` for `SessionRegistry.bindBuzzActor` (deployment ingress policy). */
     private readonly buzzActorAuthenticator: BuzzActorAuthenticator,
     /**
-     * Opens the Buzz routing channel and returns its address. Async and shells a CLI transport
-     * (`BuzzAdapter.connect` → `BuzzTransport.openChannel`), so it must run — and does, in
-     * `claim()` — *before* the synchronous transaction opens; `Db.txDecision`'s body cannot await.
+     * Opens the Buzz routing channel `channelId` names and returns its address. Async and shells a
+     * CLI transport (`BuzzAdapter.connect` → `BuzzTransport.openChannel`), so it must run — and
+     * does, in `claim()` — *before* the synchronous transaction opens; `Db.txDecision`'s body
+     * cannot await. `channelId` is the claiming entry's room (`canonicalBuzzChannelFor`), so a
+     * per-entry room is opened exactly the way the deployment's default one is.
      */
-    private readonly resolveBuzzAddress: (purpose: string) => Promise<Decision<string>>,
+    private readonly resolveBuzzAddress: (purpose: string, channelId: string) => Promise<Decision<string>>,
     private readonly config: CanonicalSelfClaimConfig,
     deps: CanonicalSelfClaimDeps = {},
   ) {
@@ -1833,8 +1872,12 @@ export class CanonicalSelfClaim {
     // The Buzz routing address is resolved here, before the synchronous transaction opens, never
     // awaited inside it. `sessions.create` accepts `buzzAddress` directly, so the resolved value
     // is written in the same transaction as everything else even though resolving it could not
-    // run inside that transaction.
-    const buzzAddress = await this.resolveBuzzAddress(request.buzzPurpose);
+    // run inside that transaction. The room is the entry's, never the request's: the entitlement
+    // resolved above is what names it.
+    const buzzAddress = await this.resolveBuzzAddress(
+      request.buzzPurpose,
+      canonicalBuzzChannelFor(entry, this.#canonicalBuzzChannelId),
+    );
     if (!buzzAddress.allowed) return buzzAddress as Decision<CanonicalSelfClaimReceipt>;
     // Clause 2 — pid/startedAt re-verified again here. This `await` is the real TOCTOU window:
     // control left this process entirely (a shelled Buzz CLI transport), for however long that
@@ -2179,7 +2222,7 @@ export class CanonicalSelfClaim {
         transcriptSizeBytes: transcript.sizeBytes,
         peerProtocolVersion: request.peerProtocolVersion,
         peerIdentity: request.peerIdentity,
-        buzzChannelId: this.#canonicalBuzzChannelId,
+        buzzChannelId: canonicalBuzzChannelFor(entry, this.#canonicalBuzzChannelId),
         buzzActorId: entry.buzzActorId,
         buzzAddress,
         expectedBindingGeneration: request.expectedBindingGeneration,

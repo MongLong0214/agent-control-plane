@@ -343,7 +343,7 @@ const makeSubject = (
     transcriptReader?: TranscriptReader;
     hostSessionRegistryReader?: HostSessionRegistryReader;
     buzzActorAuthenticator?: BuzzActorAuthenticator;
-    resolveBuzzAddress?: (purpose: string) => Promise<Decision<string>>;
+    resolveBuzzAddress?: (purpose: string, channelId: string) => Promise<Decision<string>>;
     processSignal?: (pid: number) => void;
   } = {},
 ): CanonicalSelfClaim =>
@@ -3352,5 +3352,89 @@ describe("#1035 — the claimant session is re-derived and a registry anomaly re
     expect(assertClaudeIdentityStillLive(checked.value.identity, inspector, reader)).toMatchObject({
       allowed: false, reasonCode: ReasonCode.CONFLICT,
     });
+  });
+});
+
+describe("each adopted session is written into its own entry's Buzz room (2026-10-03)", () => {
+  // Measured live: three canonical CTOs for three projects, each project with its own CEO room, and
+  // every claim wrote the one deployment channel, so the peer rule refused or misrouted the CEO's
+  // mentions to all but one of them. An entry may now name its room; one that does not keeps the
+  // deployment channel.
+  const ROOM_PROJECT = "prj_own_room";
+  const ROOM = "6dcb2a67-b130-4c3c-8280-000000000001";
+
+  /** Opens whichever room the claim names, and records which one that was. */
+  const roomResolver = () => {
+    const asked: string[] = [];
+    const resolve = async (_purpose: string, channelId: string): Promise<Decision<string>> => {
+      asked.push(channelId);
+      return allow(ReasonCode.OK, channelId);
+    };
+    return { asked, resolve };
+  };
+
+  const claimWith = async (buzzAddress: string | undefined) => {
+    const core = makeCore();
+    insertProject(core, ROOM_PROJECT);
+    const resolver = roomResolver();
+    const subject = makeSubject(core, ROOM_PROJECT, {
+      configOverrides: {
+        canonicalSessions: [{
+          sessionUuid: CANON, projectId: ROOM_PROJECT, buzzActorId: CANONICAL_ACTOR,
+          ...(buzzAddress === undefined ? {} : { buzzAddress }),
+        }],
+      },
+      resolveBuzzAddress: resolver.resolve,
+    });
+    const result = await subject.claim(baseRequest(core, ROOM_PROJECT));
+    expect(result.allowed, JSON.stringify(result)).toBe(true);
+    if (!result.allowed) throw new Error("unreachable");
+    const rows = core.db.all<{ buzz_address: string | null }>(
+      `SELECT buzz_address FROM sessions WHERE session_id = ?`,
+      [result.value.sessionId],
+    );
+    const attestations = core.db.all<{ attestation_digest: string }>(`SELECT attestation_digest FROM actor_target_attestations`);
+    return { receipt: result.value, rows, asked: resolver.asked, digest: attestations[0]!.attestation_digest };
+  };
+
+  it("opens and writes the entry's own room when it names one", async () => {
+    const claimed = await claimWith(ROOM);
+    expect(claimed.asked).toEqual([ROOM]);
+    expect(claimed.receipt.buzzAddress).toBe(ROOM);
+    expect(claimed.rows).toEqual([{ buzz_address: ROOM }]);
+  });
+
+  it("opens and writes the deployment channel when the entry names no room", async () => {
+    const claimed = await claimWith(undefined);
+    expect(claimed.asked).toEqual([CHANNEL]);
+    expect(claimed.receipt.buzzAddress).toBe(CHANNEL);
+    expect(claimed.rows).toEqual([{ buzz_address: CHANNEL }]);
+    // The room is what the attestation covers, so two entries differing only in it attest apart.
+    expect(claimed.digest).not.toBe((await claimWith(ROOM)).digest);
+  });
+
+  it.each([
+    ["not a UUID", "general"],
+    ["an upper-case UUID", ROOM.toUpperCase()],
+    ["a padded UUID", ` ${ROOM}`],
+    ["an empty string", ""],
+    ["null", null],
+    ["a number", 42],
+  ])("refuses %s as a room before any row is written", (_label, buzzAddress) => {
+    const core = makeCore();
+    insertProject(core, ROOM_PROJECT);
+    const before = rowCounts(core);
+    const resolver = roomResolver();
+    expect(() => makeSubject(core, ROOM_PROJECT, {
+      configOverrides: {
+        canonicalSessions: [{
+          sessionUuid: CANON, projectId: ROOM_PROJECT, buzzActorId: CANONICAL_ACTOR,
+          buzzAddress: buzzAddress as unknown as string,
+        }],
+      },
+      resolveBuzzAddress: resolver.resolve,
+    })).toThrow(/canonicalSessions\[\]\.buzzAddress must be a lower-case channel UUID/);
+    expect(rowCounts(core)).toEqual(before);
+    expect(resolver.asked).toEqual([]);
   });
 });

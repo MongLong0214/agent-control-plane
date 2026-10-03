@@ -700,7 +700,27 @@ export const startLocalMcpListeners = async (
     reattach = await startCanonicalCtoToolListener(
       daemon,
       stateDir,
-      async (peer) => admission.admit(peer),
+      async (peer) => {
+        const admitted = admission.admit(peer);
+        // After admission and never part of it: the correction opens the room through the Buzz
+        // CLI, and a reattach must not wait on, or fail with, the relay. It admits the peer again
+        // itself, so it cannot act for anyone this line did not just admit, and it is a no-op for
+        // a row already in its room. A refusal or a throw leaves the row as it was; the next
+        // reattach asks again. Only the reason code is printed, never a room or a session.
+        if (admitted.allowed) {
+          void admission.correctBuzzAddress(peer).then(
+            (corrected) => {
+              if (!corrected.allowed) {
+                process.stderr.write(`canonical CTO buzz address correction refused: ${corrected.reasonCode}\n`);
+              }
+            },
+            () => {
+              process.stderr.write("canonical CTO buzz address correction failed\n");
+            },
+          );
+        }
+        return admitted;
+      },
       (admitted, socket) => {
         const binding = cp.bindings.active(admitted.roleKey);
         if (binding === null) {
@@ -3604,17 +3624,19 @@ export interface AgentcpdMainContext {
   ceoConversation: CeoConversationPort | null;
 }
 
-// Shape only — that this is an array of objects carrying exactly these three string keys, so an
-// unrecognised key in the deployment's JSON is refused rather than ignored. Emptiness, the size
-// bound, blank and padded fields, UUID form and uniqueness are `assertCanonicalSessionsValid`'s,
-// which the claim's constructor calls too. Restating any of them here would put the same rule in
-// two places, and the half kept here is the half that runs at startup.
+// Shape only — that this is an array of objects carrying these three string keys and optionally a
+// fourth, `buzzAddress`, so an unrecognised key in the deployment's JSON is refused rather than
+// ignored. Emptiness, the size bound, blank and padded fields, UUID form (the room's included) and
+// uniqueness are `assertCanonicalSessionsValid`'s, which the claim's constructor calls too.
+// Restating any of them here would put the same rule in two places, and the half kept here is the
+// half that runs at startup.
 const canonicalSessionsSchema = z.array(
   z
     .object({
       sessionUuid: z.string(),
       projectId: z.string(),
       buzzActorId: z.string(),
+      buzzAddress: z.string().optional(),
     })
     .strict(),
 );
@@ -3628,7 +3650,8 @@ const canonicalSessionsSchema = z.array(
  * for was never compared against anything, so the single entitled session could hold
  * `PRIMARY_CTO` for every registered project (#1005). An entry is the whole entitlement — the
  * session, the one project it may hold, and the channel identity it speaks as — so neither half
- * can be configured without the other.
+ * can be configured without the other. It may also name the Buzz room that project's CEO talks to
+ * its CTO in (`buzzAddress`); an entry that names none is written into `ACP_BUZZ_CHANNEL`.
  *
  * Deliberately the same shape as `ACP_CTO_BINDING_TARGETS_JSON`: a bounded JSON array parsed once
  * at startup, whose refusal names the variable and never its contents.
@@ -3811,12 +3834,21 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   // `sessions.setBuzzAddress(sessionId, ...)` for an *existing* session, and the canonical
   // self-claim primitive resolves its address before the session it belongs to exists
   // (`sessions.create` accepts `buzzAddress` directly, inside the same transaction that mints it).
-  const resolveCanonicalSelfClaimBuzzAddress = async (purpose: string): Promise<Decision<string>> => {
-    if (!(await buzzTransport.available(purpose))) {
+  //
+  // `channelId` is the claiming entry's room: its own `buzzAddress`, or `ACP_BUZZ_CHANNEL` when it
+  // names none. A transport bound to that one room is asked, so a per-entry room goes through the
+  // same `available` and `openChannel` — `buzz channels get`, and the relay's answer required to
+  // name that very channel — as the deployment's default room did through `buzzTransport`.
+  const resolveCanonicalSelfClaimBuzzAddress = async (
+    purpose: string,
+    channelId: string,
+  ): Promise<Decision<string>> => {
+    const roomTransport = new BuzzCliTransport(process.env["ACP_BUZZ_BINARY"] ?? "buzz", channelId);
+    if (!(await roomTransport.available(purpose))) {
       return deny(ReasonCode.PROBE_FAILED, "buzz transport is not available", { purpose });
     }
     try {
-      return allow(ReasonCode.OK, await buzzTransport.openChannel(purpose));
+      return allow(ReasonCode.OK, await roomTransport.openChannel(purpose));
     } catch (err) {
       return deny(ReasonCode.PROBE_FAILED, `buzz connect failed: ${(err as Error).message}`, { purpose });
     }
@@ -3995,7 +4027,16 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     listeners = await startDaemonMcpListeners(cp, stateDir, mcpToken, daemon);
     // #1037 — only where the canonical claim is configured: reattaching is that claim's sequel.
     if (canonicalSessions !== null) {
-      await listeners.openCanonicalCtoReattach(createCanonicalCtoReattach(cp), daemon);
+      // The same set, resolver and purpose the claim is given, so the room a reattach corrects a
+      // live holder's row to is the room a claim would write and is opened the same way.
+      const canonicalCtoReattach = createCanonicalCtoReattach(cp, {
+        buzzAddress: {
+          canonicalSessions,
+          resolveBuzzAddress: resolveCanonicalSelfClaimBuzzAddress,
+          buzzPurpose: canonicalActivationValues["ACP_CANONICAL_CTO_BUZZ_PURPOSE"],
+        },
+      });
+      await listeners.openCanonicalCtoReattach(canonicalCtoReattach, daemon);
       process.stdout.write("canonical CTO reattach socket started\n");
     }
     // #1037 — the adopted CEO's tools, on their own kernel-peer socket; only when adoption is

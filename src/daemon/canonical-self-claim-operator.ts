@@ -43,16 +43,20 @@ export interface CanonicalSelfClaimOperatorDeps {
   sessions: SessionRegistry;
   bindings: BindingRegistry;
   buzzActorAuthenticator: BuzzActorAuthenticator;
-  /** Opens the Buzz routing channel; a thin wrapper over the deployment's own transport. */
-  resolveBuzzAddress: (purpose: string) => Promise<Decision<string>>;
+  /**
+   * Opens the Buzz routing channel `channelId` names; a thin wrapper over the deployment's own
+   * transport. The claim chooses `channelId` from the entry it resolves, never from the request.
+   */
+  resolveBuzzAddress: (purpose: string, channelId: string) => Promise<Decision<string>>;
   /**
    * Deployment facts, fixed at composition time, never read from the claiming request (#760): the
    * peer protocol version this socket speaks and the routing purpose passed to
    * `resolveBuzzAddress`. Neither is caller-supplied input reaching a resolver with no
    * expected-purpose check; fixing them here removes that surface entirely rather than adding a
    * check for it. Two more used to be fixed here: the Buzz channel and the claiming session's Buzz
-   * channel identity. The identity is now a property of the adoptable-session entry the claim
-   * resolves, and the channel is read from `canonicalBuzzChannelId` inside it.
+   * channel identity. Both are now properties of the adoptable-session entry the claim resolves:
+   * the identity always, and the channel when the entry names a `buzzAddress`, falling back to
+   * `canonicalBuzzChannelId` when it does not.
    */
   config: CanonicalSelfClaimConfig & {
     peerProtocolVersion: string;

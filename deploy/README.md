@@ -46,6 +46,22 @@ session and the whole of what it is entitled to:
 
 A session may be adopted only as `PRIMARY_CTO` of the `projectId` its own entry names, and it
 speaks on Buzz as that entry's `buzzActorId`. No two entries may share any of the three values.
+
+An entry may also name its project's CEO room as `buzzAddress`, a lower-case Buzz channel UUID:
+
+```json
+[{"sessionUuid":"<uuid>","projectId":"<project>","buzzActorId":"<actor>","buzzAddress":"<channel-uuid>"}]
+```
+
+The claim opens that room the way it opens `ACP_BUZZ_CHANNEL` and writes it as the session's
+`buzz_address`, which is the room a CEO mention to that CTO must arrive in. An entry without it
+gets `ACP_BUZZ_CHANNEL`, as every entry did before the field existed. Entries may share a room. A
+`buzzAddress` that is not a lower-case channel UUID refuses startup like any other invalid entry.
+A CTO already bound with another room does not have to restart: when its relay next reattaches
+(every daemon restart does this), the daemon proves it is the same live holder, opens the room, and
+moves that one session row's `buzz_address` to it with one `CANONICAL_CTO_BUZZ_ADDRESS_CORRECTED`
+audit row. The binding, its generation and the session are unchanged. Peer messages already queued
+for that CTO under the old room are withheld after the move, as for any change of its room.
 Every entry's `projectId` must already be registered: an entry naming a project this deployment
 holds no record of refuses startup rather than being dropped, so a configured session cannot come
 up entitled to a project that does not exist. Registration is all that is required here — whether
