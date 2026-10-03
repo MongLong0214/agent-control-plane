@@ -30,6 +30,11 @@ state root. Secrets never go in the plist: store ACP_MCP_TOKEN and ACP_OPERATOR_
 optional Buzz variables, and optional Telegram variables as generic-password Keychain items under the
 selected service. Telegram is disabled when none of its variables are present and refuses a partial set.
 
+With ACP_TELEGRAM_EXTERNAL_CONSUMER=hermes, Hermes is the only Telegram consumer: ACP polls nothing
+and startup refuses if ACP_TELEGRAM_BOT_TOKEN is also stored. The lane opens only when
+ACP_TELEGRAM_EXTERNAL_SECRET (the value Hermes presents) is stored too, and then needs
+ACP_TELEGRAM_OWNER_ID and ACP_TELEGRAM_CHAT_ID, the owner declared as telegram:<id> in owner-identities.
+
 BUZZ_PRIVATE_KEY has a second source. When no such item exists under the selected service,
 the launcher falls back to the Buzz desktop app's own store, whose layout is a JSON object
 keyed by identity rather than one item per variable. Point it elsewhere with
@@ -500,6 +505,7 @@ for optional in ACP_OPERATOR_ACTOR BUZZ_PRIVATE_KEY ACP_BUZZ_INGRESS_SECRET ACP_
   ACP_TELEGRAM_CHAT_ID ACP_TELEGRAM_ALLOWED_CHAT_IDS ACP_TELEGRAM_WEBHOOK_SECRET \
   ACP_TELEGRAM_POLL_TIMEOUT_SECONDS ACP_TELEGRAM_RETRY_DELAY_MS \
   ACP_TELEGRAM_DEFAULT_PROJECT_ID ACP_TELEGRAM_API_BASE_URL ACP_TELEGRAM_TRANSPORT_RETENTION_MS \
+  ACP_TELEGRAM_EXTERNAL_CONSUMER ACP_TELEGRAM_EXTERNAL_SECRET \
   ACP_CANONICAL_SESSIONS_JSON ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION \
   ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256 \
   ACP_CANONICAL_CTO_PEER_PROTOCOL ACP_CANONICAL_CTO_BUZZ_PURPOSE \

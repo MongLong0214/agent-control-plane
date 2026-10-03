@@ -481,6 +481,37 @@ export class ConversationTurnCoordinator {
     return allow(ReasonCode.OK, await send());
   }
 
+  /**
+   * `dispatch` for a caller whose claim is still inside its own transaction: the dispatch row joins
+   * that transaction, and `send` runs once it commits.
+   *
+   * `dispatch` commits the row in a transaction of its own, so a caller that claimed in one
+   * transaction and dispatched in the next had two commits with a window between them. A failure
+   * or a crash in that window kept a claimed turn nobody was ever told to run, and the inbound
+   * message it consumed stayed spent (R1062-01). Here the claim and its dispatch commit together or
+   * not at all.
+   *
+   * The order is still not the caller's. The send is handed in, as it is to `dispatch`, and is held
+   * by `Db.afterCommit`: it runs only after the outermost transaction commits, and a rollback
+   * anywhere in that transaction discards it with the row. So the two things the order exists to
+   * prevent stay impossible — a send whose row could still roll back, and a send with no row.
+   * Outside a transaction this is `dispatch` without the `await`: the row commits on its own and
+   * the send follows at once.
+   *
+   * `send` is not awaited, and what it throws surfaces from the commit that ran it, after the row
+   * is durable. A send that must report its own failure to the target does that itself.
+   *
+   * Ruled out: a public step that only writes the row, with the caller sending after its own
+   * commit. It is `markDispatching` public beside `dispatch` again, rejected before because a
+   * caller that can pick the order will eventually pick the wrong one.
+   */
+  dispatchOnCommit(permit: TurnPermit, send: () => void): Decision<void> {
+    const marked = this.#markDispatching(permit);
+    if (!marked.allowed) return deny(marked.reasonCode, marked.message, marked.evidence);
+    this.db.afterCommit(send);
+    return allow(ReasonCode.OK, undefined);
+  }
+
   #markDispatching(permit: TurnPermit): Decision<void> {
     return this.db.tx(() => {
       const permitted = this.assertIssuedHere(permit);

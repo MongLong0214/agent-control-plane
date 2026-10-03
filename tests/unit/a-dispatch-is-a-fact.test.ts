@@ -2,6 +2,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 import { join } from "node:path";
 
+import { deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { admitInbound, makeHarness } from "../helpers/harness.ts";
@@ -298,5 +299,76 @@ describe("a dispatch is recorded once, by the coordinator, and cannot be taken b
     } finally {
       foreign.close();
     }
+  });
+});
+
+describe("a dispatch inside the caller's transaction sends only after that transaction commits", () => {
+  // `dispatchOnCommit` (R1062-01): a caller that claims inside its own transaction dispatches there
+  // too, so the claim and its dispatch row commit together, and the send still belongs to the
+  // coordinator rather than to the caller's ordering.
+  const committedDispatches = (file: string): number => {
+    const reader = new Database(file, { readonly: true, fileMustExist: true });
+    try {
+      return (reader.prepare("SELECT COUNT(*) AS n FROM canonical_turn_dispatches").get() as { n: number }).n;
+    } finally {
+      reader.close();
+    }
+  };
+
+  it("takes the row back and never sends when the caller's transaction is denied after it", () => {
+    const h = makeHarness();
+    const actorId = target(h, "rolled-back");
+    admitInbound(h, { nonce: "m1", payload: {} });
+    const sent: string[] = [];
+    const decision = h.cp.db.txDecision(() => {
+      const claimed = h.cp.conversation.claim({
+        targetActorId: actorId,
+        prompt: "hello",
+        sources: [{ channel: "telegram", nonce: "m1", attempt: 1, payload: {} }],
+      });
+      if (!claimed.allowed) return claimed;
+      expect(h.cp.conversation.dispatchOnCommit(claimed.value, () => sent.push("sent")).allowed).toBe(true);
+      // The transaction is still open: nothing has been sent and nothing is visible outside it.
+      expect(sent).toEqual([]);
+      expect(committedDispatches(h.cp.db.file)).toBe(0);
+      return deny(ReasonCode.CONFLICT, "the caller decided against the turn after dispatching it");
+    });
+    expect(decision.allowed).toBe(false);
+    expect(sent).toEqual([]);
+    expect(h.cp.db.all("SELECT 1 FROM canonical_turns")).toEqual([]);
+    expect(h.cp.db.all("SELECT 1 FROM canonical_turn_dispatches")).toEqual([]);
+  });
+
+  it("sends once the caller's transaction commits, with the row already durable", () => {
+    const h = makeHarness();
+    const actorId = target(h, "committed");
+    admitInbound(h, { nonce: "m1", payload: {} });
+    const seen: Array<{ inTransaction: boolean; committed: number }> = [];
+    const decision = h.cp.db.txDecision(() => {
+      const claimed = h.cp.conversation.claim({
+        targetActorId: actorId,
+        prompt: "hello",
+        sources: [{ channel: "telegram", nonce: "m1", attempt: 1, payload: {} }],
+      });
+      if (!claimed.allowed) return claimed;
+      const dispatched = h.cp.conversation.dispatchOnCommit(claimed.value, () => {
+        seen.push({ inTransaction: h.cp.db.inTransaction, committed: committedDispatches(h.cp.db.file) });
+      });
+      if (!dispatched.allowed) return dispatched;
+      expect(seen).toEqual([]);
+      return claimed;
+    });
+    expect(decision.allowed).toBe(true);
+    expect(seen).toEqual([{ inTransaction: false, committed: 1 }]);
+  });
+
+  it("refuses a second dispatch of the same turn and sends nothing for it", async () => {
+    const h = makeHarness();
+    const permit = claim(h, target(h, "twice"), "m1");
+    expect((await h.cp.conversation.dispatch(permit, () => undefined)).allowed).toBe(true);
+    const sent: string[] = [];
+    const again = h.cp.conversation.dispatchOnCommit(permit, () => sent.push("sent"));
+    expect(again).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONVERSATION_TURN_ALREADY_DISPATCHED });
+    expect(sent).toEqual([]);
   });
 });
