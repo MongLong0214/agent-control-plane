@@ -761,6 +761,13 @@ export const ReasonCode = {
   SCHEMA_MIGRATION_NOT_APPROVED: "SCHEMA_MIGRATION_NOT_APPROVED",
   FINALIZATION_ATTEMPT_STALE: "FINALIZATION_ATTEMPT_STALE",
   FINALIZATION_COMPENSATION_REQUIRED: "FINALIZATION_COMPENSATION_REQUIRED",
+  /**
+   * A sealed rollback pair whose database image the live database has moved past, or one sealed
+   * before pairs recorded where their image stood (SSOT U5). Applying it would rewind the database
+   * to the seal and discard every write since. Staleness, not a fault in the pair: the answer is a
+   * fresh pair sealed from the stopped current database, never a repair of this one.
+   */
+  ROLLBACK_PAIR_STALE_DATABASE: "ROLLBACK_PAIR_STALE_DATABASE",
 } as const;
 
 export type ReasonCode = (typeof ReasonCode)[keyof typeof ReasonCode];
@@ -803,6 +810,7 @@ export const STALENESS_REASON_CODES: ReadonlySet<ReasonCode> = new Set([
   ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
   ReasonCode.REGISTERED_SET_GENERATION_MISMATCH,
   ReasonCode.ROLE_PEER_STALE,
+  ReasonCode.ROLLBACK_PAIR_STALE_DATABASE,
   ReasonCode.SNAPSHOT_STALE,
   ReasonCode.WRITE_BINDING_GENERATION_STALE,
 ]);

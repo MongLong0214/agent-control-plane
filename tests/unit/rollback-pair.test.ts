@@ -16,19 +16,24 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
+import Database from "better-sqlite3";
 import { afterAll, describe, expect, it } from "vitest";
 
+import { isAcpError, type AcpError } from "../../src/core/errors.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Db } from "../../src/db/database.ts";
 import {
   ROLLBACK_PAIR_INDEX_FILE,
   ROLLBACK_PAIR_MANIFEST_FILE,
+  applyRollbackPair,
   rollbackToSealedPair,
   sealRollbackPair,
   stageRollbackPair,
   validateRollbackPair,
   type ApplyOptions,
+  type RollbackPairDatabaseHighWater,
   type RollbackPairExpectation,
   type RollbackPairManifest,
   type RollbackPairMember,
@@ -1025,5 +1030,214 @@ describe("the exact rollback pair", () => {
 
     const survivors = existsSync(stageParent) ? readdirSync(stageParent) : [];
     expect(survivors).toEqual([]);
+  });
+});
+
+/**
+ * A rollback must preserve current writes (SSOT U5). A pair is sealed at one moment and applied at
+ * another, and restoring its image rewinds the database to the seal: on 115916ce applying the
+ * morning's pre-deploy pair would have discarded everything written since, and reported success.
+ *
+ * Every row here is in-process and execs nothing. The refusals are reached before any interpreter
+ * runs, and acceptance is shown by `failAfter: "recovery"`, which fires only after apply's own
+ * re-check of the live database has passed and before anything is installed.
+ */
+const STALE = ReasonCode.ROLLBACK_PAIR_STALE_DATABASE;
+const REMEDY = "seal a fresh pair from the stopped current database";
+
+/** One committed write, the kind the daemon makes every minute it runs. Read-write, so it leaves no sidecar. */
+const writeAuditEvent = (databasePath: string, kind: string): void => {
+  const raw = new Database(databasePath);
+  try {
+    raw
+      .prepare("INSERT INTO audit_events (at, kind, evidence_json) VALUES (?, ?, ?)")
+      .run(new Date().toISOString(), kind, "{}");
+  } finally {
+    raw.close();
+  }
+};
+
+const maxAuditEventId = (databasePath: string): number | null => {
+  const raw = new Database(databasePath);
+  try {
+    return raw.prepare("SELECT max(event_id) FROM audit_events").pluck().get() as number | null;
+  } finally {
+    raw.close();
+  }
+};
+
+/** The structured refusal an attempt ends in. An attempt that is accepted fails the row by saying so. */
+const refusal = (attempt: () => unknown): AcpError => {
+  try {
+    attempt();
+  } catch (error) {
+    if (isAcpError(error)) return error;
+    throw error;
+  }
+  throw new Error("accepted: the attempt was not refused");
+};
+
+/** Every byte and every name a refused rollback could have touched, as one comparable string. */
+const deploymentState = (fixture: Fixture, pair: SealedRollbackPair): string =>
+  JSON.stringify({
+    database: digestOfFile(fixture.databasePath),
+    state: readdirSync(dirname(fixture.databasePath)).sort(),
+    launchAgents: readdirSync(dirname(fixture.plistDestination)).sort(),
+    home: readdirSync(fixture.home).sort(),
+    appRoot: walk(fixture.appRoot),
+    pair: treeFingerprint(pair.root),
+  });
+
+describe("a rollback preserves every write made since its pair was sealed (SSOT U5)", () => {
+  it("records where the sealed image stood, and accepts a pair sealed from the stopped live database", async () => {
+    const fixture = makeFixture();
+    writeAuditEvent(fixture.databasePath, "before-the-seal");
+    const pair = await sealRollbackPair(fixture.pairsRoot, fixture.sources);
+
+    const highWater = pair.manifest.database.highWater;
+    expect(highWater, "the seal recorded no high-water mark for its database").toBeDefined();
+    expect(highWater!.contentSha256).toMatch(/^sha256:[a-f0-9]{64}$/);
+    expect(highWater!.userVersion).toBe(pair.manifest.identity.schemaVersion);
+    expect(highWater!.auditEventId).toBe(maxAuditEventId(fixture.databasePath));
+    // On disk, under the index the retained digest covers — not only in what `seal` returned.
+    expect(readPairManifest(pair.root).database.highWater).toEqual(highWater);
+
+    // Accepted at every point a rollback checks: validation, staging, and apply's re-check just
+    // before its first mutation. Reaching the injected failure is the proof the last one passed.
+    expect(() => validateRollbackPair(pair.root, expectationFor(fixture, pair))).not.toThrow();
+    expect(() =>
+      rollbackToSealedPair(pair.root, expectationFor(fixture, pair), join(fixture.home, "stage"), {
+        failAfter: "recovery",
+      }),
+    ).toThrow(/injected failure after recovery/);
+
+    // No live database at all is nothing to preserve: the rebuilt-machine case a pair exists for.
+    renameSync(fixture.databasePath, join(fixture.home, "moved-away.sqlite"));
+    expect(() => validateRollbackPair(pair.root, expectationFor(fixture, pair))).not.toThrow();
+  });
+
+  it("refuses a pair the live database has moved past, at every entrypoint, changing nothing", async () => {
+    const fixture = makeFixture();
+    writeAuditEvent(fixture.databasePath, "before-the-seal");
+    const pair = await sealRollbackPair(fixture.pairsRoot, fixture.sources);
+    // Staged while the pair was still current, so apply's own re-check is reached on its own below.
+    const staged = stageRollbackPair(pair.root, expectationFor(fixture, pair), join(fixture.home, "stage"));
+
+    writeAuditEvent(fixture.databasePath, "after-the-seal");
+    const written = maxAuditEventId(fixture.databasePath);
+    const before = deploymentState(fixture, pair);
+
+    const attempts: Array<[string, () => unknown]> = [
+      ["validate", () => validateRollbackPair(pair.root, expectationFor(fixture, pair))],
+      ["stage", () => stageRollbackPair(pair.root, expectationFor(fixture, pair), join(fixture.home, "stage-again"))],
+      ["rollback", () => rollbackToSealedPair(pair.root, expectationFor(fixture, pair), join(fixture.home, "stage-rb"))],
+      ["apply", () => applyRollbackPair(staged)],
+    ];
+    for (const [entrypoint, attempt] of attempts) {
+      const refused = refusal(attempt);
+      expect(refused.reasonCode, `${entrypoint}: ${refused.message}`).toBe(STALE);
+      expect(refused.message).toContain(REMEDY);
+      // Database bytes, sidecars, install destinations, the pair, and no stage or recovery copy.
+      expect(deploymentState(fixture, pair), `${entrypoint} changed something while refusing`).toBe(before);
+    }
+
+    // The evidence says how far the live database is past the seal, for the operator reading it.
+    const { sealed, live } = refusal(() => validateRollbackPair(pair.root, expectationFor(fixture, pair)))
+      .evidence as { sealed: RollbackPairDatabaseHighWater; live: RollbackPairDatabaseHighWater };
+    expect(live.auditEventId).toBe(sealed.auditEventId! + 1);
+
+    // The remedy the refusal names works: a pair sealed from the database as it is now is accepted,
+    // and the write the refusals protected is still there.
+    const fresh = await sealRollbackPair(fixture.pairsRoot, fixture.sources);
+    expect(() => validateRollbackPair(fresh.root, expectationFor(fixture, fresh))).not.toThrow();
+    expect(() =>
+      rollbackToSealedPair(fresh.root, expectationFor(fixture, fresh), join(fixture.home, "stage-fresh"), {
+        failAfter: "recovery",
+      }),
+    ).toThrow(/injected failure after recovery/);
+    expect(maxAuditEventId(fixture.databasePath)).toBe(written);
+  });
+
+  it("refuses a write no counter can see: an in-place update", async () => {
+    const fixture = makeFixture();
+    const insert = new Database(fixture.databasePath);
+    insert
+      .prepare(
+        "INSERT INTO capacity_snapshots (snapshot_id, provider, bucket_id, remaining_percent, capabilities_json, " +
+          "sensor_health, runtime_health, allocation_admission, observed_at, source) " +
+          "VALUES ('snapshot-1', 'provider', 'bucket', 80, '{}', 'HEALTHY', 'HEALTHY', 'OPEN', '2026-10-03T00:00:00Z', 'test')",
+      )
+      .run();
+    insert.close();
+    const pair = await sealRollbackPair(fixture.pairsRoot, fixture.sources);
+
+    const update = new Database(fixture.databasePath);
+    update.prepare("UPDATE capacity_snapshots SET remaining_percent = 12.5 WHERE snapshot_id = 'snapshot-1'").run();
+    update.close();
+
+    const refused = refusal(() => validateRollbackPair(pair.root, expectationFor(fixture, pair)));
+    expect(refused.reasonCode).toBe(STALE);
+    // Every counter agrees with the seal. Only the content says the database moved.
+    const { sealed, live } = refused.evidence as { sealed: RollbackPairDatabaseHighWater; live: RollbackPairDatabaseHighWater };
+    expect(live.auditEventId).toBe(sealed.auditEventId);
+    expect(live.userVersion).toBe(sealed.userVersion);
+    expect(live.contentSha256).not.toBe(sealed.contentSha256);
+  });
+
+  it("counts a write still in the write-ahead log, which the main file alone does not have", async () => {
+    const { fixture, pair } = await sealFixture();
+    const mainBefore = digestOfFile(fixture.databasePath);
+    const writer = new Database(fixture.databasePath);
+    try {
+      writer.pragma("wal_autocheckpoint = 0");
+      writer
+        .prepare("INSERT INTO audit_events (at, kind, evidence_json) VALUES (?, ?, ?)")
+        .run(new Date().toISOString(), "in-the-log", "{}");
+      // Committed, and only in the log: a check that read the main file would see no write at all.
+      expect(statSync(`${fixture.databasePath}-wal`).size).toBeGreaterThan(0);
+      expect(digestOfFile(fixture.databasePath)).toBe(mainBefore);
+
+      const refused = refusal(() => validateRollbackPair(pair.root, expectationFor(fixture, pair)));
+      expect(refused.reasonCode).toBe(STALE);
+      expect(digestOfFile(fixture.databasePath), "measuring the live database changed it").toBe(mainBefore);
+    } finally {
+      writer.close();
+    }
+  });
+
+  it("refuses a pair sealed before the mark existed, and one whose mark is malformed", async () => {
+    const { fixture, pair } = await sealFixture();
+    // What the previous seal wrote: this manifest without the mark, under the digest it printed.
+    const manifest = readPairManifest(pair.root);
+    delete manifest.database.highWater;
+    writePairManifest(pair.root, manifest);
+    const legacyDigest = reindex(pair.root);
+    const before = deploymentState(fixture, pair);
+
+    // Refused although nothing has been written since the seal: unknown is not current.
+    for (const attempt of [
+      () => validateRollbackPair(pair.root, expectationFor(fixture, pair, { indexDigest: legacyDigest })),
+      () =>
+        rollbackToSealedPair(
+          pair.root,
+          expectationFor(fixture, pair, { indexDigest: legacyDigest }),
+          join(fixture.home, "stage-legacy"),
+        ),
+    ]) {
+      const refused = refusal(attempt);
+      expect(refused.reasonCode).toBe(STALE);
+      expect(refused.message).toMatch(/records no database high-water mark/);
+      expect(refused.message).toContain(REMEDY);
+      expect(deploymentState(fixture, pair)).toBe(before);
+    }
+
+    // Present but malformed is not a legacy pair; it is not a pair.
+    const forged = readPairManifest(pair.root);
+    forged.database.highWater = { contentSha256: "not-a-digest", userVersion: 1, auditEventId: null };
+    writePairManifest(pair.root, forged);
+    const forgedDigest = reindex(pair.root);
+    expect(() =>
+      validateRollbackPair(pair.root, expectationFor(fixture, pair, { indexDigest: forgedDigest })),
+    ).toThrow(/manifest has an invalid shape/);
   });
 });

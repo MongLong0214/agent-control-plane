@@ -452,10 +452,8 @@ describe("a rollback installs one whole generation", () => {
     // Generation A: the deployment as it was, sealed.
     new Db(fixture.databasePath).close();
     probeDatabase(fixture.databasePath, "generation-a");
-    const sealed = await sealRollbackPair(
-      fixture.pairsRoot,
-      fixture.sourcesFor("generation-a", runtimeClosureFor(fixture.root, "generation-a")),
-    );
+    const closureA = runtimeClosureFor(fixture.root, "generation-a");
+    const sealed = await sealRollbackPair(fixture.pairsRoot, fixture.sourcesFor("generation-a", closureA));
 
     // The sealed image is the database as it was, before anything moved on.
     expect(databaseMarkers(join(sealed.root, sealed.manifest.database.member))).toEqual(["generation-a"]);
@@ -469,15 +467,38 @@ describe("a rollback installs one whole generation", () => {
     expect(installedGeneration(fixture.installRoot)).toBe("generation-b");
     expect(databaseMarkers(fixture.databasePath)).toEqual(["generation-a", "generation-b"]);
 
+    // The pair sealed above predates generation-b's write. Restoring it would rewind the database
+    // and discard that write while reporting success, so the built binary refuses it, before it
+    // has copied or installed anything (SSOT U5).
+    const databaseBefore = readFileSync(fixture.databasePath);
+    const refused = boundedSpawnSync(process.execPath, [VALIDATOR, "rollback", ...cliFlags(fixture, sealed)], {
+      encoding: "utf8",
+    });
+    expect(refused.status, refused.stdout).toBe(1);
+    expect(refused.stderr).toContain("ROLLBACK_PAIR_STALE_DATABASE");
+    expect(refused.stdout).toBe("");
+    expect(readFileSync(fixture.databasePath).equals(databaseBefore), "the refusal changed the database").toBe(true);
+    expect(installedGeneration(fixture.installRoot)).toBe("generation-b");
+    expect(readFileSync(fixture.plistDestination, "utf8")).toContain("generation-b");
+
+    // The remedy the refusal names: generation A's closure sealed again, from the database as it
+    // is now. The live file is not its image byte for byte — the backup API rewrites header
+    // counters — which is what lets the byte assertion below tell an installed image from a
+    // database the restore never touched.
+    const current = await sealRollbackPair(fixture.pairsRoot, fixture.sourcesFor("generation-a", closureA));
+    const image = join(current.root, current.manifest.database.member);
+    expect(readFileSync(fixture.databasePath).equals(readFileSync(image))).toBe(false);
+
     // One invocation. There is no stage to hand back and no second command that could be pointed
     // at one, which is the whole point: a stage path on a command line is a mutation authority.
-    const applied = boundedSpawnSync(process.execPath, [VALIDATOR, "rollback", ...cliFlags(fixture, sealed)], {
+    const applied = boundedSpawnSync(process.execPath, [VALIDATOR, "rollback", ...cliFlags(fixture, current)], {
       encoding: "utf8",
     });
     expect(applied.status, applied.stderr).toBe(0);
 
     // Both halves moved, and they moved together. A database-only rollback would have left
-    // generation-b here — the untested combination this whole mechanism exists to prevent.
+    // generation-b's runtime here — the untested combination this whole mechanism exists to
+    // prevent — and the database is the fresh image, generation-b's write still in it.
     //
     // This row is also the regression for a defect it found: the app root here is reached through
     // macOS's `/var` -> `/private/var` link, and `apply` was handing the sealed state-admin its
@@ -485,7 +506,8 @@ describe("a rollback installs one whole generation", () => {
     // decide whether it is the program being run, so the guard never fired, the process exited 0,
     // and the rollback reported success having restored nothing.
     expect(installedGeneration(fixture.installRoot)).toBe("generation-a");
-    expect(databaseMarkers(fixture.databasePath), applied.stdout).toEqual(["generation-a"]);
+    expect(readFileSync(fixture.databasePath).equals(readFileSync(image)), applied.stdout).toBe(true);
+    expect(databaseMarkers(fixture.databasePath)).toEqual(["generation-a", "generation-b"]);
     expect(readFileSync(fixture.plistDestination, "utf8")).toContain("generation-a");
     expect(readFileSync(fixture.launcherDestination, "utf8")).toContain("generation-a");
     // The runtime that is installed really is a working closure, not a marker file.
@@ -514,13 +536,15 @@ describe("a rollback installs one whole generation", () => {
       "the pair does not carry the acp_fd_vfs extension its runtime loads",
     ).toBe(true);
 
-    // Generation B is live, and the database has moved on.
+    // Generation B is live. Its database has not moved past the seal: a pair it had moved past is
+    // refused before anything here could run (SSOT U5). The live file is still not the sealed
+    // image byte for byte, so the assertion after the apply measures the restore.
     cpSync(runtimeClosureFor(fixture.root, "generation-b"), fixture.installRoot, {
       recursive: true,
       force: true,
     });
-    probeDatabase(fixture.databasePath, "generation-b");
-    expect(databaseMarkers(fixture.databasePath)).toEqual(["generation-a", "generation-b"]);
+    const image = join(sealed.root, sealed.manifest.database.member);
+    expect(readFileSync(fixture.databasePath).equals(readFileSync(image))).toBe(false);
 
     // Everything outside the pair that it could have leaned on is removed before it is used.
     rmSync(closure, { recursive: true, force: true });
@@ -534,6 +558,7 @@ describe("a rollback installs one whole generation", () => {
     applyRollbackPair(staged);
 
     // The database came back through the sealed state-admin under the sealed interpreter.
+    expect(readFileSync(fixture.databasePath).equals(readFileSync(image))).toBe(true);
     expect(databaseMarkers(fixture.databasePath)).toEqual(["generation-a"]);
     expect(installedGeneration(fixture.installRoot)).toBe("<none>");
 
@@ -676,10 +701,13 @@ describe("a rollback installs one whole generation", () => {
       fixture.pairsRoot,
       fixture.sourcesFor("generation-a", runtimeClosureFor(fixture.root, "generation-a")),
     );
-    // The live database moves on after the seal, so the sealed image and the live file differ.
-    // Without this the database assertions below would hold whether or not anything compensated.
-    probeDatabase(fixture.databasePath, "generation-b");
-    expect(databaseMarkers(fixture.databasePath)).toEqual(["generation-a", "generation-b"]);
+    // The live database cannot move on after the seal: a pair it has moved past is refused before
+    // anything is stopped or installed (SSOT U5). What still tells a compensation from a rollback
+    // that never touched the database is bytes. The live file is not the sealed image byte for
+    // byte (the backup API rewrites header counters), the restore installs the image exactly, and
+    // compensation puts back a VACUUM INTO recovery copy that is neither.
+    const image = readFileSync(join(sealed.root, sealed.manifest.database.member));
+    expect(readFileSync(fixture.databasePath).equals(image)).toBe(false);
 
     for (const failAfter of [
       "recovery",
@@ -729,13 +757,17 @@ describe("a rollback installs one whole generation", () => {
       // database back from a rollback that never touched it.
       expect(databaseMarkers(fixture.databasePath), `database rows lost after ${failAfter}`).toEqual([
         "generation-a",
-        "generation-b",
       ]);
       if (failAfter !== "database" && failAfter !== "cleanup") {
         expect(
           readFileSync(fixture.databasePath).equals(databaseBefore),
           `database bytes changed after ${failAfter}`,
         ).toBe(true);
+      } else {
+        expect(
+          readFileSync(fixture.databasePath).equals(image),
+          `the sealed image was left installed after ${failAfter}`,
+        ).toBe(false);
       }
     }
   });
@@ -748,7 +780,6 @@ describe("a rollback installs one whole generation", () => {
       fixture.pairsRoot,
       fixture.sourcesFor("generation-a", runtimeClosureFor(fixture.root, "generation-a")),
     );
-    probeDatabase(fixture.databasePath, "generation-b");
 
     cpSync(runtimeClosureFor(fixture.root, "generation-b"), fixture.installRoot, {
       recursive: true,
@@ -817,7 +848,6 @@ describe("a rollback installs one whole generation", () => {
       fixture.pairsRoot,
       fixture.sourcesFor("generation-a", runtimeClosureFor(fixture.root, "generation-a")),
     );
-    probeDatabase(fixture.databasePath, "generation-b");
 
     cpSync(runtimeClosureFor(fixture.root, "generation-b"), fixture.installRoot, {
       recursive: true,
@@ -862,7 +892,13 @@ describe("a rollback installs one whole generation", () => {
     writeFileSync(join(closure, "db", "state-admin.js"), "process.exit(0);\n");
 
     const sealed = await sealRollbackPair(fixture.pairsRoot, fixture.sourcesFor("generation-a", closure));
-    probeDatabase(fixture.databasePath, "generation-b");
+    // No write after the seal — a pair the live database has moved past is refused before any
+    // restore runs (SSOT U5). The row still measures what it names: the live file is not the
+    // sealed image byte for byte (the backup API rewrites header counters), so a restore that did
+    // nothing leaves bytes the post-condition tells apart from the image.
+    expect(readFileSync(fixture.databasePath).equals(readFileSync(join(sealed.root, sealed.manifest.database.member)))).toBe(
+      false,
+    );
 
     cpSync(runtimeClosureFor(fixture.root, "generation-b"), fixture.installRoot, {
       recursive: true,
