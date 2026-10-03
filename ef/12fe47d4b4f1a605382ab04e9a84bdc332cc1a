@@ -1,0 +1,18 @@
+Limit: no provider adapter launched an adopted canonical CTO, so the adapter probe cannot vouch for it; the recorded (os_pid, start token) is the only liveness evidence, read with the claim inspector's start-token reader because ps lstart text would call every live canonical CTO dead
+Warn: a canonical role is never given a spawned replacement on any path; a refusal leaves the run QUEUED and the session lifecycle untouched, and the role recovers only when its own conversation claims it again
+Unverified: the operator dead-binding door (executeDeadBindingRecovery) compares canonical start tokens with ps lstart text and may read a live canonical CTO as dead; not tested or changed here
+Record-Id: r-canonprobe
+Provenance: inherited c2e38293e2372b0e1de9a995b33ce7f8db23b80a
+
+Warn: canonical lineage must be re-read after every await on the CTO provisioning paths: before startSession and again inside the transaction that binds; a check made before probeRuntime goes stale when a canonical claim lands and is released during the await
+Record-Id: r-canonprober101
+Follows: r-canonprobe
+Provenance: inherited fdf0262f9d266f5e25861192bbb5fb8015f33e60
+
+Warn: every provider stop for a CTO runtime goes through stopProviderSession and handleFor(session); the control plane's ses_cto_ alias is not a provider id, and a stop addressed to it leaves the provider session running while the row says STOPPED
+Record-Id: r-canonprober201
+Follows: r-canonprober101
+Provenance: inherited 192b1313b0a77ee5d79ff863d088890410995205
+
+Provenance: inherited 8b9736e48e5cf98fb70b8d4ffcedbfa2ed9cb625
+X-Claude-Session: https://claude.ai/code/session_0125xavK2hjM9n55cHBkK4bB
