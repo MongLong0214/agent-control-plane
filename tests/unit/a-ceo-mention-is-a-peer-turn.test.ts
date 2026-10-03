@@ -391,6 +391,27 @@ const replaceCto = (
   return next;
 };
 
+/**
+ * Moves the CEO's conversation onto another runtime within its generation (`SURVIVED`): the
+ * binding generation stays, the live runtime changes. No clock advance.
+ */
+const moveCeoRuntime = (fixture: PeerFixture, buzzAddress: string | null = null) => {
+  const { harness } = fixture;
+  const before = harness.cp.bindings.active(roleKeyFor(Role.CEO))!.bindingGeneration;
+  const next = readySession(harness, "ceo-moved", buzzAddress);
+  const moved = harness.cp.bindings.switchTo({
+    roleKey: roleKeyFor(Role.CEO),
+    role: Role.CEO,
+    sessionId: next.sessionId,
+    reason: "test runtime move",
+    conversation: "SURVIVED",
+  });
+  if (!moved.allowed) throw new Error(`CEO runtime move failed: ${moved.message}`);
+  expect(moved.value.bindingGeneration).toBe(before);
+  expect(moved.value.sessionId).toBe(next.sessionId);
+  return next;
+};
+
 /** Until `predicate` holds, yielding to the event loop between looks. */
 const until = async (predicate: () => boolean, what: string): Promise<void> => {
   for (let attempt = 0; attempt < 500; attempt += 1) {
@@ -572,6 +593,86 @@ describe("#1038 a bound CEO's Buzz mention is a peer turn for the bound PRIMARY_
       await fixture.relayDelivers(fixture.mention(fixture.ceo, { text: "같은 런타임, 새 세대" }));
       expect(fixture.writes()).toBe(before);
       expect(fixture.refusedWith(ReasonCode.BUZZ_PEER_ORIGIN_AMBIGUOUS)).toBe(1);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("refuses an earlier generation's event when its runtime is bound again at the very instant it was moved there", async () => {
+    // Generation 1 starts on a runtime with no Buzz channel identity.
+    const fixture = await startPeerFixture({ ceoChannelIdentity: "null" });
+    try {
+      const { harness } = fixture;
+      const startedAt = harness.clock.nowIso();
+      // Generation 1 is moved onto runtime B, which carries the CEO's key, and B signs an event.
+      const b = moveCeoRuntime(fixture);
+      bindChannelIdentity(harness, b, fixture.ceo.pubkey);
+      const event = fixture.mention(fixture.ceo, { text: "1세대, 런타임 B 에서 서명" });
+
+      // Generation 2 is bound to B with the clock where it was: the move and the new binding share
+      // one timestamp, so no ordering of times can say B served generation 1. The record can.
+      expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "test re-bind").reasonCode).toBe(ReasonCode.OK);
+      expect(bindCeoSession(harness, b)).toBe(fixture.ceoGeneration + 1);
+      expect(harness.clock.nowIso()).toBe(startedAt);
+
+      const before = fixture.writes();
+      expect(
+        await deliverBuzzMessage(fixture.ingress.seam.ingress, fixture.ingress.seam.port, fixture.inputFor(event)),
+      ).toMatchObject({ allowed: false, reasonCode: ReasonCode.BUZZ_PEER_ORIGIN_AMBIGUOUS });
+      await fixture.relayDelivers(event);
+      expect(fixture.writes()).toBe(before);
+      expect(fixture.admitted(event.id)).toBeUndefined();
+      expect(fixture.refusedWith(ReasonCode.BUZZ_PEER_ORIGIN_AMBIGUOUS)).toBe(1);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("admits a first-ever key on a runtime that served an earlier generation with no identity, and refuses it once a later generation reuses it", async () => {
+    // Generation 1 on runtime R with no Buzz channel identity at all.
+    const fixture = await startPeerFixture({ ceoChannelIdentity: "null" });
+    try {
+      const { harness } = fixture;
+      // R is bound again as generation 2, and only then takes its first identity: no earlier
+      // generation ever carried this key, so R's own history does not make it ambiguous.
+      expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "test re-bind").reasonCode).toBe(ReasonCode.OK);
+      expect(bindCeoSession(harness, fixture.ceoSession)).toBe(fixture.ceoGeneration + 1);
+      bindChannelIdentity(harness, fixture.ceoSession, fixture.ceo.pubkey);
+      const first = fixture.mention(fixture.ceo, { text: "처음 쓰는 키" });
+      await fixture.relayDelivers(first);
+      expect(fixture.admitted(first.id)).toBeDefined();
+      expect(fixture.peerRows()).toHaveLength(1);
+
+      // Generation 3 on the same runtime: the key generation 2 used is now a reused key.
+      expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "test re-bind").reasonCode).toBe(ReasonCode.OK);
+      expect(bindCeoSession(harness, fixture.ceoSession)).toBe(fixture.ceoGeneration + 2);
+      const later = fixture.mention(fixture.ceo, { text: "재사용된 키" });
+      const before = fixture.writes();
+      await fixture.relayDelivers(later);
+      expect(fixture.writes()).toBe(before);
+      expect(fixture.admitted(later.id)).toBeUndefined();
+      expect(fixture.refusedWith(ReasonCode.BUZZ_PEER_ORIGIN_AMBIGUOUS)).toBe(1);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("admits a fresh key that a new runtime took before it was bound as the CEO", async () => {
+    const fixture = await startPeerFixture();
+    try {
+      const { harness } = fixture;
+      // The new runtime takes its own, never-used key while generation 1 still runs elsewhere, and is
+      // bound as generation 2 only afterwards. No earlier generation ran on it, so the key is its own.
+      const next = readySession(harness, "ceo-next", null);
+      bindChannelIdentity(harness, next, fixture.ceoNext.pubkey);
+      expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "test rotation").reasonCode).toBe(ReasonCode.OK);
+      harness.clock.advance(60_000);
+      expect(bindCeoSession(harness, next)).toBe(fixture.ceoGeneration + 1);
+
+      const event = fixture.mention(fixture.ceoNext, { text: "미리 받은 새 키" });
+      await fixture.relayDelivers(event);
+      expect(fixture.admitted(event.id)).toBeDefined();
+      expect(fixture.peerRows()).toHaveLength(1);
     } finally {
       await fixture.close();
     }
@@ -893,6 +994,133 @@ describe("#1044 a queued peer message keeps its identity fence until it is hande
       expect(fixture.peerRows()[0]!.status).toBe("REJECTED");
       const claim = JSON.parse(fixture.admitted(peerEvent.id)!.turn_claim_json!) as Record<string, unknown>;
       expect(claim["noReplyAt"]).toEqual(expect.any(String));
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("withholds a queued peer message after the CEO's runtime moves within its generation, writing nothing", async () => {
+    const fixture = await startPeerFixture();
+    try {
+      const { harness } = fixture;
+      await fixture.relayDelivers(fixture.mention(fixture.ceo, { text: "떠난 런타임의 지시" }));
+      const [peerRow] = fixture.peerRows();
+
+      // The generation is unchanged; the runtime that signed is gone, and the one now serving the
+      // CEO carries no Buzz channel identity at all.
+      moveCeoRuntime(fixture);
+      const before = fixture.writes();
+      const taken = ownerMessageLedger(harness.cp).claim(fixture.holder());
+      expect(claimOf(taken.allowed ? taken.value : null)).toMatchObject({
+        claimed: null,
+        withheld: [{ messageId: peerRow!.message_id }],
+      });
+      expect(fixture.writes()).toBe(before);
+      expect(fixture.peerRows()[0]!.status).toBe("PENDING");
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("withholds a queued peer message once the CEO's runtime no longer speaks as the identity that signed it, writing nothing", async () => {
+    const fixture = await startPeerFixture();
+    try {
+      const { harness } = fixture;
+      await fixture.relayDelivers(fixture.mention(fixture.ceo, { text: "멈춘 런타임의 지시" }));
+      const [peerRow] = fixture.peerRows();
+
+      // Same generation and the same runtime on the binding, but that runtime has stopped, so it no
+      // longer speaks as any Buzz channel identity.
+      expect(
+        harness.cp.sessions.transition(fixture.ceoSession.sessionId, SessionLifecycle.STOPPED, "gone")
+          .reasonCode,
+      ).toBe(ReasonCode.OK);
+      expect(harness.cp.bindings.active(roleKeyFor(Role.CEO))?.sessionId).toBe(fixture.ceoSession.sessionId);
+      const before = fixture.writes();
+      const taken = ownerMessageLedger(harness.cp).claim(fixture.holder());
+      expect(claimOf(taken.allowed ? taken.value : null)).toMatchObject({
+        claimed: null,
+        withheld: [{ messageId: peerRow!.message_id }],
+      });
+      expect(fixture.writes()).toBe(before);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it.each([
+    ["no channel at all", null],
+    ["another project's room", OTHER_PROJECT_ROOM],
+  ])("withholds a queued peer message once the receiving CTO's channel is %s, writing nothing", async (_what, channel) => {
+    const fixture = await startPeerFixture();
+    try {
+      const { harness } = fixture;
+      await fixture.relayDelivers(fixture.mention(fixture.ceo, { text: "원래 방에서 받은 지시" }));
+      const [peerRow] = fixture.peerRows();
+
+      // The CTO the event was admitted for is still the holder, but it no longer answers on the room
+      // the event arrived on. A fresh event there would be refused as a channel mismatch.
+      harness.cp.sessions.setBuzzAddress(fixture.ctoSession.sessionId, channel);
+      const before = fixture.writes();
+      const taken = ownerMessageLedger(harness.cp).claim(fixture.holder());
+      expect(claimOf(taken.allowed ? taken.value : null)).toMatchObject({
+        claimed: null,
+        withheld: [{ messageId: peerRow!.message_id }],
+      });
+      expect(fixture.writes()).toBe(before);
+      expect(fixture.peerRows()[0]!.status).toBe("PENDING");
+
+      // Control: back on its room, the same CTO is handed the message.
+      harness.cp.sessions.setBuzzAddress(fixture.ctoSession.sessionId, PROJECT_ROOM);
+      const handed = ownerMessageLedger(harness.cp).claim(fixture.holder());
+      expect(claimOf(handed.allowed ? handed.value : null).claimed).toMatchObject({
+        text: "원래 방에서 받은 지시",
+        principal: "peer",
+      });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("hands over a readable message ahead of a queued row whose stored payload is not readable", async () => {
+    const fixture = await startPeerFixture();
+    try {
+      const { harness } = fixture;
+      await fixture.relayDelivers(fixture.mention(fixture.owner, { text: "읽을 수 있는 메시지" }));
+      await fixture.relayDelivers(fixture.mention(fixture.owner, { text: "망가질 메시지" }));
+      const [, broken] = fixture.ownerRows();
+      // A raw writer is inside this repository's threat model, and nothing protects this column.
+      harness.cp.db.run(`UPDATE outbox SET payload_json = '{' WHERE message_id = ?`, [broken!.message_id]);
+
+      const taken = ownerMessageLedger(harness.cp).claim(fixture.holder());
+      const handover = claimOf(taken.allowed ? taken.value : null);
+      expect(handover.claimed).toMatchObject({ text: "읽을 수 있는 메시지", principal: "owner" });
+      expect(handover.withheld.map((row) => row.messageId)).toEqual([broken!.message_id]);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("still reports an unresolved hand-over when a later queued row's stored payload is not readable", async () => {
+    const fixture = await startPeerFixture();
+    try {
+      const { harness } = fixture;
+      await fixture.relayDelivers(fixture.mention(fixture.owner, { text: "건네진 메시지" }));
+      await fixture.relayDelivers(fixture.mention(fixture.owner, { text: "망가질 메시지" }));
+      const [first, broken] = fixture.ownerRows();
+      const ledger = ownerMessageLedger(harness.cp);
+      expect(claimOf((ledger.claim(fixture.holder()) as { value: unknown }).value).claimed).toMatchObject({
+        messageId: first!.message_id,
+      });
+      harness.cp.db.run(`UPDATE outbox SET payload_json = '{' WHERE message_id = ?`, [broken!.message_id]);
+
+      const blocked = ledger.claim(fixture.holder());
+      expect(blocked.allowed).toBe(true);
+      expect(blocked.allowed ? blocked.value : null).toMatchObject({
+        claimed: null,
+        unresolved: [{ messageId: first!.message_id }],
+        withheld: [{ messageId: broken!.message_id }],
+      });
     } finally {
       await fixture.close();
     }

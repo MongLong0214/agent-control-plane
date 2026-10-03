@@ -15,7 +15,7 @@ import {
 } from "../continuity/continuity-kernel.ts";
 import { digestOf } from "../core/digest.ts";
 import { readProcessStartToken } from "../core/process-argv.ts";
-import { processStartedAt } from "../core/process-identity.ts";
+import { lstartSecondStartMs, nativeStartIsInLstartSecond, processStartedAt } from "../core/process-identity.ts";
 import { acpError, type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
 import type { BuzzMentionCounters } from "../buzz/buzz-mention-subscriber.ts";
@@ -104,6 +104,9 @@ const STARTUP_CAPACITY_REFRESH_BUDGET_MS = 15_000;
  * once. The window is dated from the hold's own audit row, so a daemon restart does not renew it.
  */
 export const COVERAGE_REVOCATION_GRACE_MS = 10 * 60_000;
+
+/** A start recorded in the kernel's own form rather than as `ps` lstart text. */
+const NATIVE_START_TOKEN = /^(?:darwin-tv|linux-clk):/;
 
 /**
  * #954 — whether a session's exact process is still the one running under its pid.
@@ -1665,6 +1668,13 @@ export class Daemon {
           unresolved.push({ roleKey: required.roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
           continue;
         }
+        // The same rule when there is no reading at all. The guard above needs a snapshot to
+        // read, so a managed provider with none fell through to the coverage gap and, after its
+        // grace, to revocation or failover of a binding whose process was still running.
+        if (this.keepsIncumbentThroughUnreadCapacity(session, currentCapacity)) {
+          unresolved.push({ roleKey: required.roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
+          continue;
+        }
 
         if (!assignment?.provider) {
           unresolved.push({
@@ -1876,6 +1886,61 @@ export class Daemon {
       }
     }
     return paused;
+  }
+
+  /**
+   * Whether a READY incumbent keeps its binding although its provider has no capacity reading.
+   *
+   * Unknown capacity is neither exhaustion nor a dead runtime, and it says nothing about the
+   * bound process. The role stays unresolved (`CAPACITY_UNKNOWN_NOT_ROUTABLE`): unknown is not
+   * turned into routable, and new work is still refused by routing. Only the binding is kept.
+   *
+   * The keep lasts for as long as the provider stays unread, so it needs a decisive identity, not
+   * `recordedProcessIsRunning` (ACP1045-R1-01): that test's lstart branch compares whole-second
+   * text and then a native start truncated to the millisecond of `createdAt`, so a replacement
+   * that took the pid later in that same millisecond passes it. The coverage hold keeps that test
+   * rather than this one, because the hold ends (r-364403fc103a). Decisive here means, in order:
+   *
+   *   (a) a row that recorded a native token: equal to the live token, or not this process;
+   *   (b) a row whose process has a pinned native token (written by the CTO launch and continuity
+   *       provisioning paths through `SessionRegistry.createWithPinnedStart`, and by (c) below):
+   *       equal to it and in the recorded lstart second, or not this process;
+   *   (c) a legacy row that recorded only `ps` lstart (ACP1045-R2-01): the live native start,
+   *       truncated to the second, is the recorded lstart second, and the row was written after
+   *       that second ended. The recorded process was alive when the row was written, so a process
+   *       that later took its pid started after that, in a later second, and has a different
+   *       lstart. The live token is pinned then, so later passes are exact. A row written inside
+   *       its process's own start second cannot tell that process from a successor, and is not
+   *       kept. The adopted Gateway's lineage admission (#1037) has no such rule: it compares
+   *       the native start exactly, or refuses.
+   *
+   * Anything else — a session that is not READY, no pid, no recorded start, an unreadable live
+   * token, a mismatch, or the ambiguous same-second row — returns false and takes the hold, revoke
+   * and failover paths exactly as before.
+   */
+  private keepsIncumbentThroughUnreadCapacity(
+    session: SessionRecord | null,
+    capacity: ProviderCapacity | null,
+  ): boolean {
+    if (capacity !== null) return false;
+    if (session?.lifecycle !== SessionLifecycle.READY) return false;
+    if (session.osPid == null) return false;
+    if (session.osProcessStartedAt == null) return false;
+    const live = readProcessStartToken(session.osPid);
+    if (live === null) return false;
+    if (session.osProcessStartedAt === live) return true;
+    if (NATIVE_START_TOKEN.test(session.osProcessStartedAt)) return false;
+    // Every remaining branch needs the live process to have started in the recorded lstart second,
+    // a pinned one included: a pin that contradicts the row it sits beside names some other
+    // process, however it came to be written (ACP1045-R3-01).
+    if (!nativeStartIsInLstartSecond(live, session.osProcessStartedAt)) return false;
+    const pinned = this.cp.sessions.pinnedNativeStart(session.sessionId);
+    if (pinned !== null) return pinned === live;
+    const recordedSecond = lstartSecondStartMs(session.osProcessStartedAt);
+    if (recordedSecond === null) return false;
+    if (Date.parse(session.createdAt) < recordedSecond + 1000) return false;
+    this.cp.sessions.pinNativeStart(session.sessionId, live);
+    return true;
   }
 
   /**

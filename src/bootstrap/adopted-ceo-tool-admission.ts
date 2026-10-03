@@ -128,8 +128,6 @@ export const createAdoptedCeoToolAdmission = (cp: ControlPlane, options: Adopted
     if (lineage.value.startToken !== proof.process_started_at) {
       return refuse("the Gateway reported a process other than the one running at its pid");
     }
-    // Every check above has passed; only now may a legacy row's decided token be pinned.
-    if (lineage.value.pinToRecord !== null) cp.sessions.pinNativeStart(session.sessionId, lineage.value.pinToRecord);
 
     return allow(ReasonCode.OK, {
       assignmentId: binding.assignmentId,

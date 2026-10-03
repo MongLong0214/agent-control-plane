@@ -864,7 +864,9 @@ export class CtoLifecycle {
       workdir: this.managedRuntimeRoot,
       purpose,
     });
-    const session = this.sessions.create({
+    // Recorded with its native start pinned beside the lstart, read as one snapshot of one process
+    // (ACP1045-R2-01, R3-01); see `SessionRegistry.createWithPinnedStart`.
+    const session = this.sessions.createWithPinnedStart({
       provider: adapter.provider,
       model: this.preference.model,
       effort: this.preference.effort,

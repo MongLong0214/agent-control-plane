@@ -88,7 +88,6 @@ export const canonicalCtoFixture = (): CanonicalCtoFixture => {
   const lineage: ProcessLineageReader = {
     parentOf: (pid) => processes.get(pid)?.ppid ?? null,
     startToken: (pid) => processes.get(pid)?.startedAt ?? null,
-    startedAt: () => null,
   };
   const bindTo = (osPid: number, startedAt: string): string => {
     const session = h.cp.sessions.create({ provider: "claude", model: "claude-cli", osPid, osStartedAt: startedAt });

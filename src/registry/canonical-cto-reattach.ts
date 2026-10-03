@@ -128,8 +128,6 @@ export const createCanonicalCtoReattach = (
     if (lineage.value.startToken !== identity.value.startedAt) {
       return unbound("the binding's runtime is not the claude process this conversation was derived from");
     }
-    // Every check above has passed; only now may a legacy row's decided token be pinned.
-    if (lineage.value.pinToRecord !== null) cp.sessions.pinNativeStart(session.sessionId, lineage.value.pinToRecord);
     return allow(ReasonCode.OK, {
       roleKey: row.role_key,
       projectId: row.project_id,

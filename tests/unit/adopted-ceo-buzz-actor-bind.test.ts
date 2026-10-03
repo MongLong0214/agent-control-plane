@@ -146,9 +146,8 @@ describe("the adopted CEO binds its own Buzz channel identity", () => {
     const { fixture } = await subject();
     // Another process: not a descendant of the Gateway.
     expect((await fixture.admit(STRANGER)).allowed).toBe(false);
-    // A reused pid: the process at the Gateway's pid started at neither recorded moment.
+    // A reused pid: the process at the Gateway's pid is not the one pinned at adoption.
     fixture.tokens.set(GATEWAY, "darwin-tv:1790000999.000002");
-    fixture.starts.set(GATEWAY, "Fri Oct  2 08:00:00 2026");
     expect((await fixture.admit()).allowed).toBe(false);
   });
 
