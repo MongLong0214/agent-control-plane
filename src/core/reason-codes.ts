@@ -312,6 +312,23 @@ export const ReasonCode = {
   INGRESS_TURN_UNRESOLVED_CONVERSATION: "INGRESS_TURN_UNRESOLVED_CONVERSATION",
   UNTRUSTED_CONTENT_IS_DATA: "UNTRUSTED_CONTENT_IS_DATA",
   MCP_PEER_UNAUTHENTICATED: "MCP_PEER_UNAUTHENTICATED",
+  /**
+   * #1037 — a mutation on the adopted CEO's tool channel whose caller provenance is not the owner's
+   * own turn.
+   *
+   * The channel is authenticated; this is about which turn inside it is calling. Refused when the
+   * request's `params._meta` provenance is absent, names another Hermes session or lineage, a peer
+   * or unknown principal, a scheduled turn, or a subagent — never read from tool arguments.
+   */
+  MCP_TOOL_PROVENANCE_REFUSED: "MCP_TOOL_PROVENANCE_REFUSED",
+  /**
+   * #1037 — the connecting conversation's own process holds no active canonical CTO binding.
+   *
+   * The reattach door's one "not here" answer: no ACTIVE PRIMARY_CTO names this conversation, or
+   * the one that does is bound to another process or to an earlier start of this pid. The relay
+   * reads it as "claim instead"; every other refusal ends the attach.
+   */
+  CTO_REATTACH_UNBOUND: "CTO_REATTACH_UNBOUND",
   OPERATOR_UNAUTHENTICATED: "OPERATOR_UNAUTHENTICATED",
   OPERATOR_METHOD_NOT_ALLOWED: "OPERATOR_METHOD_NOT_ALLOWED",
   /** An authenticated operator method outlived its execution budget. Not an authentication fact. */

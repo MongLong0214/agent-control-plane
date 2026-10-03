@@ -40,8 +40,7 @@ const LSTART = /^[A-Z][a-z]{2} ([A-Z][a-z]{2}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2}
  *
  * `ps` renders in its own local time and is spawned with the daemon's environment, so the
  * daemon's local time is the zone the text is in. A row written by a process whose zone differed
- * is misread, and the reader that uses this has to fail closed on it. Same parse as #1046's
- * legacy lstart rule for the adopted Gateway.
+ * is misread, and the reader that uses this has to fail closed on it.
  */
 export const lstartSecondStartMs = (lstart: string): number | null => {
   const parts = LSTART.exec(lstart);

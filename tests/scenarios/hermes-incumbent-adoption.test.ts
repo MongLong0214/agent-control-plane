@@ -196,6 +196,8 @@ process.stdout.write(JSON.stringify({ ...fields, receipt_digest: 'sha256:' + cre
     expect(h.cp.sessions.get(result.value.sessionId)).toMatchObject({
       osPid: process.pid, osProcessStartedAt: startedAt, lifecycle: SessionLifecycle.READY,
     });
+    // #1037: the exact token is pinned beside the lstart the row keeps.
+    expect(h.cp.sessions.pinnedNativeStart(result.value.sessionId)).toBe(token);
     expect(h.cp.bindings.active("CEO")).toMatchObject({
       sessionId: result.value.sessionId, bindingGeneration: result.value.bindingGeneration,
     });

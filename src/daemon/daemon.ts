@@ -1992,7 +1992,8 @@ export class Daemon {
    *       that later took its pid started after that, in a later second, and has a different
    *       lstart. The live token is pinned then, so later passes are exact. A row written inside
    *       its process's own start second cannot tell that process from a successor, and is not
-   *       kept. Same rule as #1046's legacy lstart rule for the adopted Gateway.
+   *       kept. The adopted Gateway's lineage admission (#1037) has no such rule: it compares
+   *       the native start exactly, or refuses.
    *
    * Anything else — a session that is not READY, no pid, no recorded start, an unreadable live
    * token, a mismatch, or the ambiguous same-second row — returns false and takes the hold, revoke

@@ -105,6 +105,10 @@ export const createHermesIncumbentAdoption = (cp: ControlPlane, options: {
       void cp.sessions.transition(created.sessionId, SessionLifecycle.ERROR, "adoption readiness failed");
       return deny(ReasonCode.CONFLICT, "Gateway adoption could not verify its READY session", {});
     }
+    // The row keeps `ps` lstart for the readers that compare it, and that grain is one second. The
+    // exact token — read back from the Gateway and re-read from the kernel above — is pinned
+    // beside it, so nothing that later admits this runtime has to trust the second (#1037).
+    cp.sessions.pinNativeStart(created.sessionId, proof.process_started_at);
     const claimed = { executorKind: "hermes", targetLocator: proof.session_id,
       targetLocatorDigest: proof.lineage_root_digest };
     let receipt: HermesTargetBindResponse | null = null;

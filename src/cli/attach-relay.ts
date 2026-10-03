@@ -30,9 +30,22 @@ import type { Readable, Writable } from "node:stream";
  *     A reconnect path would be that reuse, which is why its absence is load-bearing rather than
  *     an omission.
  *
+ * What changed with #1037 is what a *respawned* relay does. It no longer has to claim — and the
+ * claim refuses a binding that is still ACTIVE — because it first asks the canonical CTO's reattach
+ * socket, which admits on the process tree rather than on any credential: the connecting relay
+ * descends from the very `claude` process the ACTIVE binding's runtime recorded, with the same
+ * start, running the same conversation. There is nothing there to reuse, so reconnecting proves
+ * exactly what a first connection does, and the reason for the rule above does not reach it. Only
+ * when that socket answers that this process holds no binding does the relay claim, which is where
+ * a restarted `claude` belongs: its start differs, and a new generation is what fences it. The
+ * relay itself still never opens a second connection.
+ *
  * The secret never reaches argv, the environment, stdout, stderr or any file: `stdout` carries
  * only bytes that came off the socket after the handshake, and the `stderr` vocabulary is closed
  * to `attach: <stage> <reasonCode>` with the code copied from the daemon's own public envelope.
+ *
+ * The adopted CEO's relay (`runAdoptedCeoAttachRelay`, #1037) is the same byte pipe with no claim
+ * and no handshake in front of it, because its socket authenticates the connection itself.
  */
 
 /**
@@ -70,6 +83,8 @@ export interface AttachRelayOptions {
   /** Resolved by the caller. Written to the handshake line and nowhere else. */
   mcpToken: string;
   claim: AttachRelayClaim;
+  /** The canonical CTO's reattach socket (#1037); asked before any claim when it is set. */
+  reattachSocketPath?: string;
   claimTimeoutMs?: number;
 }
 
@@ -170,6 +185,73 @@ const performClaim = (
     socket.once("close", () => finish({ kind: "unavailable" }));
   });
 
+type ReattachOutcome =
+  | { kind: "admitted"; socket: Socket }
+  | { kind: "unbound" }
+  | { kind: "unavailable" }
+  | { kind: "refused"; reasonCode: string }
+  | { kind: "malformed" };
+
+/**
+ * The daemon's one "this process holds no binding" answer on the reattach socket
+ * (`ReasonCode.CTO_REATTACH_UNBOUND`). Copied rather than imported for the reason the method names
+ * above are: this is a client.
+ */
+const CTO_REATTACH_UNBOUND = "CTO_REATTACH_UNBOUND";
+
+/**
+ * Asks the reattach socket, and reads its one answer line before a byte of the client's is sent.
+ *
+ * `{ok:true}` hands back the connected socket, paused, for the byte pipe. `CTO_REATTACH_UNBOUND`, a
+ * socket that is not there (an older daemon) or one that never answers sends the caller to the
+ * claim. Any other refusal is the daemon's answer about this process and ends the attach.
+ */
+const attemptReattach = (socketPath: string, timeoutMs: number): Promise<ReattachOutcome> =>
+  new Promise<ReattachOutcome>((resolveReattach) => {
+    const socket = createConnection(socketPath);
+    let received = Buffer.alloc(0);
+    let settled = false;
+    const timer: NodeJS.Timeout = setTimeout(() => finish({ kind: "unavailable" }), timeoutMs);
+    timer.unref();
+    const finish = (outcome: ReattachOutcome): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.removeListener("data", answer);
+      if (outcome.kind === "admitted") socket.pause();
+      else socket.destroy();
+      resolveReattach(outcome);
+    };
+    const answer = (chunk: Buffer): void => {
+      received = Buffer.concat([received, chunk]);
+      const boundary = received.indexOf(0x0a);
+      if (boundary === -1) {
+        if (received.length > MAX_LINE_BYTES) finish({ kind: "malformed" });
+        return;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(received.subarray(0, boundary).toString("utf8")) as unknown;
+      } catch {
+        return finish({ kind: "malformed" });
+      }
+      const reply = (parsed ?? {}) as { ok?: unknown; reasonCode?: unknown };
+      if (reply.ok === true) {
+        // The daemon writes nothing after its acknowledgement until the client speaks; anything
+        // already here belongs to the pipe, not to this reader.
+        const rest = received.subarray(boundary + 1);
+        if (rest.length > 0) socket.unshift(rest);
+        return finish({ kind: "admitted", socket });
+      }
+      if (typeof reply.reasonCode !== "string") return finish({ kind: "malformed" });
+      if (reply.reasonCode === CTO_REATTACH_UNBOUND) return finish({ kind: "unbound" });
+      finish({ kind: "refused", reasonCode: reply.reasonCode });
+    };
+    socket.on("data", answer);
+    socket.once("error", () => finish({ kind: "unavailable" }));
+    socket.once("close", () => finish({ kind: "unavailable" }));
+  });
+
 type HandshakeReply =
   | { kind: "refusal"; reasonCode: string }
   | { kind: "malformed" }
@@ -250,6 +332,7 @@ export interface AttachRelayCommandOptions {
   claimSocketPath: string;
   mcpSocketPath: string;
   claim: AttachRelayClaim;
+  reattachSocketPath?: string;
 }
 
 /**
@@ -260,16 +343,50 @@ export interface AttachRelayCommandOptions {
  * `runAttachRelay`, which still takes it explicitly so a test can drive the relay with a synthetic
  * one.
  */
-export const runAttachRelayCommand = (
+export const runAttachRelayCommand = async (
   options: AttachRelayCommandOptions,
   io: AttachRelayIo,
 ): Promise<number> => {
+  // The reattach is tokenless, so it is asked before the deployment credential is: a live
+  // claimant whose Keychain is locked or unreadable still reaches its own tools (review
+  // PR1046-R2). Resolving the token first was dropped rather than kept: it made the one door that
+  // needs no credential unreachable without one. The token is acquired only for the fallback,
+  // which presents it on `cto.mcp.sock`.
+  io.stdin.pause();
+  const reattached = await reattachFirst(options.reattachSocketPath, DEFAULT_CLAIM_TIMEOUT_MS, io);
+  if (reattached !== null) return reattached;
   const mcpToken = resolveMcpToken();
   if (mcpToken === null) {
     io.stderr.write("attach: mcp token unavailable\n");
-    return Promise.resolve(ATTACH_EXIT.UNAVAILABLE);
+    return ATTACH_EXIT.UNAVAILABLE;
   }
-  return runAttachRelay({ ...options, mcpToken }, io);
+  return runAttachRelay({ ...options, reattachSocketPath: undefined, mcpToken }, io);
+};
+
+/**
+ * Asks the reattach socket when there is one. Resolves to the relay's exit code when the reattach
+ * decided the attach — admitted and piped, or refused — and to null when the caller should claim:
+ * this process holds no binding, or there is no reattach socket to ask.
+ */
+const reattachFirst = async (
+  reattachSocketPath: string | undefined,
+  timeoutMs: number,
+  io: AttachRelayIo,
+): Promise<number | null> => {
+  if (reattachSocketPath === undefined) return null;
+  const reattached = await attemptReattach(reattachSocketPath, timeoutMs);
+  if (reattached.kind === "admitted") {
+    return pipeStdioToSocket(reattached.socket, io, { handshake: () => undefined });
+  }
+  if (reattached.kind === "refused") {
+    io.stderr.write(`attach: reattach refused ${reattached.reasonCode}\n`);
+    return ATTACH_EXIT.HANDSHAKE_REFUSED;
+  }
+  if (reattached.kind === "malformed") {
+    io.stderr.write("attach: reattach reply malformed\n");
+    return ATTACH_EXIT.PROTOCOL;
+  }
+  return null;
 };
 
 export const runAttachRelay = async (
@@ -278,6 +395,14 @@ export const runAttachRelay = async (
 ): Promise<number> => {
   // Nothing of Claude Code's moves until the handshake newline is on the wire.
   io.stdin.pause();
+
+  const reattached = await reattachFirst(
+    options.reattachSocketPath,
+    options.claimTimeoutMs ?? DEFAULT_CLAIM_TIMEOUT_MS,
+    io,
+  );
+  // Unbound, or no reattach socket to ask: the claim decides, as it always has.
+  if (reattached !== null) return reattached;
 
   const claimed = await performClaim(
     options.claimSocketPath,
@@ -297,8 +422,54 @@ export const runAttachRelay = async (
     return ATTACH_EXIT.PROTOCOL;
   }
 
-  return new Promise<number>((resolveRelay) => {
-    const socket: Socket = createConnection(options.mcpSocketPath);
+  return pipeStdioToSocket(createConnection(options.mcpSocketPath), io, {
+    handshake: (socket) => {
+      // One write, one string, one reference. The order is the whole correctness argument: this
+      // newline is what makes the client's first message the *second* line on this socket.
+      socket.write(
+        `${JSON.stringify({
+          token: options.mcpToken,
+          sessionId: claimed.sessionId,
+          sessionSecret: claimed.sessionSecret,
+        })}\n`,
+      );
+    },
+  });
+};
+
+/**
+ * The adopted CEO's relay (#1037): no claim, no token, no handshake.
+ *
+ * The adopted CEO tool socket authenticates the connection itself — the kernel's peer, which is
+ * this process, descending from the adopted Gateway that spawned it — so there is nothing for this
+ * relay to obtain first and nothing for it to present. The first byte on the socket is the
+ * client's own. A refusal is the daemon's one `{ok:false,reasonCode}` line, read here exactly as a
+ * handshake refusal is above.
+ *
+ * It still never reconnects, but for a different reason than the CTO relay: there is no
+ * credential to reuse. A respawn is simply a new connection, admitted or refused on the same facts
+ * as the first one, and Hermes is what respawns it.
+ */
+export const runAdoptedCeoAttachRelay = (
+  options: { toolSocketPath: string },
+  io: AttachRelayIo,
+): Promise<number> => {
+  // The client's bytes wait until the socket is connected, so none is lost to a closed pipe.
+  io.stdin.pause();
+  return pipeStdioToSocket(createConnection(options.toolSocketPath), io, { handshake: () => undefined });
+};
+
+/**
+ * The byte pipe every relay shares: once `socket` is connected — now, or when it connects — let
+ * `handshake` write first, then carry stdin to the socket and the socket to stdout, inspecting only
+ * the daemon's first line for a refusal.
+ */
+const pipeStdioToSocket = (
+  socket: Socket,
+  io: AttachRelayIo,
+  connection: { handshake(socket: Socket): void },
+): Promise<number> =>
+  new Promise<number>((resolveRelay) => {
     let settled = false;
     let resolved = false;
     let connected = false;
@@ -372,20 +543,19 @@ export const runAttachRelay = async (
       if (settled) settle(ATTACH_EXIT.STREAM_CLOSED);
       else finish(ATTACH_EXIT.STREAM_CLOSED);
     });
-    socket.once("connect", () => {
+    const onConnected = (): void => {
       connected = true;
-      // One write, one string, one reference. The order is the whole correctness argument: this
-      // newline is what makes the client's first message the *second* line on this socket.
-      socket.write(
-        `${JSON.stringify({
-          token: options.mcpToken,
-          sessionId: claimed.sessionId,
-          sessionSecret: claimed.sessionSecret,
-        })}\n`,
-      );
+      // Whatever the handshake writes is on the wire before the client's first byte, because
+      // stdin is piped only after it returns.
+      connection.handshake(socket);
       socket.on("data", peek);
+      // A socket the reattach reader paused stays paused under a new `data` listener; one that
+      // was never paused is already flowing and this changes nothing.
+      socket.resume();
       io.stdin.pipe(socket);
-    });
+    };
+    if (socket.pending) socket.once("connect", onConnected);
+    else onConnected();
     socket.once("error", () => {
       if (!connected) {
         io.stderr.write("attach: mcp socket unavailable\n");
@@ -398,4 +568,3 @@ export const runAttachRelay = async (
     // them. There is deliberately no branch here that opens a second connection.
     socket.once("close", () => finish(stdinEnded ? ATTACH_EXIT.OK : ATTACH_EXIT.STREAM_CLOSED));
   });
-};

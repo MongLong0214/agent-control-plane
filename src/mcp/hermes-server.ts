@@ -21,6 +21,11 @@ import type { TaskGraph } from "../run/task-graph.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { ContinuityKernel } from "../continuity/continuity-kernel.ts";
 import {
+  admitHermesProvenance,
+  HERMES_READ_ONLY_TOOLS,
+  type HermesProvenanceAnchor,
+} from "./hermes-provenance.ts";
+import {
   authenticateMcpPeer,
   createMcpMutationPort,
   guarded,
@@ -157,6 +162,60 @@ const assertHermesMcpPort = (port: HermesMcpPort): void => {
   }
 };
 
+/** How one Hermes MCP connection is served; chosen by the transport, never by the peer. */
+export interface HermesServerOptions {
+  /**
+   * The adopted CEO's tool channel (#1037): the bound Hermes session and lineage its admission
+   * read. Every tool outside `HERMES_READ_ONLY_TOOLS` — including any the caller registers on the
+   * returned server afterwards — is admitted only when the call's `params._meta` provenance names
+   * the owner's own top-level, non-scheduled turn in that session and lineage. A refusal happens
+   * before the idempotency reservation, so it writes nothing.
+   */
+  provenance?: HermesProvenanceAnchor;
+}
+
+type ToolCallbackArgs = readonly unknown[];
+
+/**
+ * Wraps every tool registered on `server` from this point on, so the channel's admission is a
+ * property of the server object rather than of each handler remembering to ask. That covers the
+ * tools `agentcpd.ts` adds to the returned server (`cto_binding_bind`/`cto_binding_release`) and
+ * any tool added later, which is guarded until it is named in `HERMES_READ_ONLY_TOOLS`.
+ *
+ * The SDK calls a tool with `(args, extra)` when it has an input schema and `(extra)` when it has
+ * none, so the request context is always the last argument. `extra._meta` is the request's
+ * `params._meta`; `args` is never consulted.
+ */
+const requireToolProvenance = (
+  server: McpServer,
+  admit: (extra: unknown) => ReturnType<typeof admitHermesProvenance>,
+): void => {
+  const register = server.registerTool.bind(server) as (
+    name: string,
+    config: unknown,
+    callback: (...callArgs: ToolCallbackArgs) => unknown,
+  ) => ReturnType<McpServer["registerTool"]>;
+  const guardedRegister = (
+    name: string,
+    config: unknown,
+    callback: (...callArgs: ToolCallbackArgs) => unknown,
+  ): ReturnType<McpServer["registerTool"]> =>
+    register(
+      name,
+      config,
+      HERMES_READ_ONLY_TOOLS.has(name)
+        ? callback
+        : (...callArgs: ToolCallbackArgs) => {
+            const admitted = admit(callArgs[callArgs.length - 1]);
+            return admitted.allowed ? callback(...callArgs) : respond(admitted);
+          },
+    );
+  server.registerTool = guardedRegister as McpServer["registerTool"];
+};
+
+const requestMeta = (extra: unknown): unknown =>
+  typeof extra === "object" && extra !== null ? (extra as { _meta?: unknown })._meta : undefined;
+
 /**
  * This scope deliberately receives only the port. Every registered handler closes over this
  * parameter, so a future Hermes tool cannot recover its construction-time source (#352).
@@ -164,8 +223,19 @@ const assertHermesMcpPort = (port: HermesMcpPort): void => {
 const createHermesServerFromPort = (
   port: HermesMcpPort,
   authenticate: McpPeerAuthenticator,
+  options: HermesServerOptions,
 ): McpServer => {
   const server = new McpServer({ name: "agent-control-plane-hermes", version: "1.3.0" });
+  const anchor = options.provenance;
+  if (anchor !== undefined) {
+    requireToolProvenance(server, (extra) => {
+      // The connection's authority first, so a channel whose binding moved is refused as stale
+      // rather than as a provenance mismatch; then the one call-level question.
+      const peer = authenticateMcpPeer(authenticate);
+      if (!peer.allowed) return peer as ReturnType<typeof admitHermesProvenance>;
+      return admitHermesProvenance(requestMeta(extra), anchor);
+    });
+  }
   const read = (execute: () => Promise<ToolResult> | ToolResult) =>
     guarded(() => {
       const peer = authenticateMcpPeer(authenticate);
@@ -313,7 +383,8 @@ const createHermesServerFromPort = (
 export const createHermesServer = (
   port: HermesMcpPort,
   authenticate: McpPeerAuthenticator,
+  options: HermesServerOptions = {},
 ): McpServer => {
   assertHermesMcpPort(port);
-  return createHermesServerFromPort(port, authenticate);
+  return createHermesServerFromPort(port, authenticate, options);
 };

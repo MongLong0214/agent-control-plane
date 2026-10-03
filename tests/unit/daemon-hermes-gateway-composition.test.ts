@@ -5,6 +5,7 @@ import { createHermesGatewayConversationSender } from "../../src/runtime/hermes-
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { allow } from "../../src/core/errors.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { ManualClock } from "../../src/core/clock.ts";
 import { bindCeo, makeHarness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
@@ -22,6 +23,89 @@ const config = () => ({
 const source = { eventId: "signed-7", actor: "owner", conversation: "room" };
 
 describe("daemon Gateway CEO composition", () => {
+  it("delivers only to the process whose native start is pinned for the CEO runtime (#1037)", async () => {
+    // A successor Gateway inside the recorded lstart second renders the same `ps-start`; only the
+    // pinned native start tells it from the process the binding was adopted onto.
+    const deliver = async (pinned: string): Promise<{ contact: string; dispatched: number }> => {
+      const harness = makeHarness();
+      const { cp } = harness;
+      try {
+        const id = bindCeo(harness);
+        cp.sessions.pinNativeStart(id, pinned);
+        const originalGet = cp.sessions.get.bind(cp.sessions);
+        vi.spyOn(cp.sessions, "get").mockImplementation((sessionId) => {
+          const session = originalGet(sessionId);
+          return sessionId === id && session ? { ...session, provider: "hermes", osPid: 123,
+            osProcessStartedAt: "ps-start" } : session;
+        });
+        const originalDbGet = cp.db.get.bind(cp.db);
+        vi.spyOn(cp.db, "get").mockImplementation((sql, params) =>
+          String(sql).includes("FROM actor_target_bindings")
+            ? { executor_kind: "hermes", target_locator: "live-head", target_locator_digest: digest } as never
+            : originalDbGet(sql, params));
+        let dispatched = 0;
+        const outcome = await createConfiguredHermesGatewayConversation(cp, config(), {
+          processStartToken: () => "native-start",
+          processStartedAt: () => "ps-start",
+          senderFactory: () => {
+            dispatched++;
+            return async () => ({ contact: "REACHED" as const, answered: allow(ReasonCode.OK, "answered") });
+          },
+        })!("status", source);
+        return { contact: outcome.contact, dispatched };
+      } finally { cp.close(); vi.restoreAllMocks(); }
+    };
+    expect(await deliver("native-start")).toEqual({ contact: "REACHED", dispatched: 1 });
+    expect(await deliver("native-start-of-the-adopted-process")).toEqual({ contact: "NEVER_REACHED", dispatched: 0 });
+  });
+
+  /**
+   * An unpinned row (adopted before #1037) is never delivered to. The lstart rule that once
+   * delivered to one written after its start second is deleted, and the absent pin does not fall
+   * back to the live token, which proves nothing (review PR1046-R1, round 2).
+   */
+  const deliverUnpinned = async (input: { writtenAt: string; lstart: string }) => {
+    const harness = makeHarness({ clock: new ManualClock(input.writtenAt) });
+    const { cp } = harness;
+    try {
+      const id = bindCeo(harness);
+      const originalGet = cp.sessions.get.bind(cp.sessions);
+      vi.spyOn(cp.sessions, "get").mockImplementation((sessionId) => {
+        const session = originalGet(sessionId);
+        return sessionId === id && session ? { ...session, provider: "hermes", osPid: 123,
+          osProcessStartedAt: input.lstart } : session;
+      });
+      const originalDbGet = cp.db.get.bind(cp.db);
+      vi.spyOn(cp.db, "get").mockImplementation((sql, params) =>
+        String(sql).includes("FROM actor_target_bindings")
+          ? { executor_kind: "hermes", target_locator: "live-head", target_locator_digest: digest } as never
+          : originalDbGet(sql, params));
+      let dispatched = 0;
+      const outcome = await createConfiguredHermesGatewayConversation(cp, config(), {
+        processStartToken: () => "live-native-start",
+        processStartedAt: () => input.lstart,
+        senderFactory: () => {
+          dispatched++;
+          return async () => ({ contact: "REACHED" as const, answered: allow(ReasonCode.OK, "answered") });
+        },
+      })!("status", source);
+      return { contact: outcome.contact, dispatched, pinned: cp.sessions.pinnedNativeStart(id) };
+    } finally {
+      cp.close();
+      vi.restoreAllMocks();
+    }
+  };
+
+  it("refuses an unpinned row whose recorded start is not an lstart at all", async () => {
+    expect(await deliverUnpinned({ writtenAt: "2026-09-30T23:11:35.000Z", lstart: "ps-start" }))
+      .toEqual({ contact: "NEVER_REACHED", dispatched: 0, pinned: null });
+  });
+
+  it("refuses the CEO gen2 shape too: recorded well after its lstart second, unpinned", async () => {
+    expect(await deliverUnpinned({ writtenAt: "2026-09-30T23:11:35.000Z", lstart: "Thu Oct  1 00:25:43 2026" }))
+      .toEqual({ contact: "NEVER_REACHED", dispatched: 0, pinned: null });
+  });
+
   it("refuses without POST when the CEO binding is revoked during identity GET", async () => {
     const harness = makeHarness();
     const { cp } = harness;
@@ -49,6 +133,8 @@ describe("daemon Gateway CEO composition", () => {
       const address = server.address();
       if (!address || typeof address === "string") throw new Error("expected TCP listener");
       const sessionId = bindCeo(harness);
+      // Adoption pins the native start since #1037; an unpinned row is refused.
+      cp.sessions.pinNativeStart(sessionId, "native-start");
       const originalGet = cp.sessions.get.bind(cp.sessions);
       vi.spyOn(cp.sessions, "get").mockImplementation((id) => {
         const session = originalGet(id);
@@ -87,6 +173,7 @@ describe("daemon Gateway CEO composition", () => {
     const { cp } = harness;
     try {
       const id = bindCeo(harness);
+      cp.sessions.pinNativeStart(id, "native-start");
       const active = cp.bindings.active("CEO")!;
       const originalGet = cp.sessions.get.bind(cp.sessions);
       vi.spyOn(cp.sessions, "get").mockImplementation((sessionId) => {
