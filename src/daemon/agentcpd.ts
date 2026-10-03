@@ -4105,8 +4105,8 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   // latch below is for.
   const subscribedBuzzRooms: SubscribedBuzzRooms = (buzzActorId) =>
     subscribedBuzzRoomsFrom(buzzMentionSubscriber?.identityRooms ?? [])(buzzActorId);
-  // One way, released once: after startup has decided the mention subscriber and, where one
-  // started, `assertCanonicalRoomsAreSubscribed` accepted every entry. The claim and reattach
+  // One way, released once, as startup's last statement: after it has decided the mention subscriber,
+  // `assertCanonicalRoomsAreSubscribed` accepted every entry and no later step refused. The claim and reattach
   // sockets open before that, and a claim or correction let through then found the lookup above
   // `null`, opened its room and wrote its row before the start was refused (PR1060-R2-01). Until
   // the release a claim is refused and a correction waits; a start that throws never releases it,
@@ -4413,10 +4413,6 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         }
       }
     }
-    // Every path that did not throw arrives here with the subscriber decided: no relay credential,
-    // no buzz owner, no subscriber file, an unbound role, or a subscriber whose rooms passed both
-    // checks above. Only now may a claim or a correction open a room.
-    settleCanonicalRooms();
     // #1036 — the owner-reply consumer, next to the subscriber it publishes through. Started on
     // every deployment, subscriber or not: an item it cannot deliver is still recorded as such.
     ownerReplies = startDaemonOwnerReplyConsumer(cp, buzzMentionSubscriber);
@@ -4456,6 +4452,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       process.stderr.write("Telegram ingress not configured; continuing without Telegram ingress\n");
       daemon.setTelegramIngressStatus({ configured: false, running: false, disabledReason: null });
     }
+    // The last statement of startup, after every step that can still refuse it (PR1060-FU-01): the
+    // subscriber is decided, its rooms are checked, and only now may a claim or correction open a room.
+    settleCanonicalRooms();
   } catch (err) {
     if (hermesAutoAdoptionTimer) clearInterval(hermesAutoAdoptionTimer);
     await telegram?.close();

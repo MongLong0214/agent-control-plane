@@ -1,7 +1,7 @@
 import { generateKeyPairSync } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { Server } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
@@ -28,6 +28,7 @@ import {
   type CanonicalSelfClaimDeps,
   type ProcessSnapshot,
 } from "../../src/registry/canonical-self-claim.ts";
+import { TELEGRAM_EXTERNAL_SOCKET_NAME } from "../../src/ingress/telegram-external.ts";
 import { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
@@ -231,7 +232,14 @@ interface DeploymentShape {
   canonical?: boolean;
   /** Called once, when startup reports the reattach socket open: before any subscriber exists. */
   onReattachOpened?: () => void;
+  /**
+   * Telegram's external lane configured for Hermes, with a regular file where its socket goes: that
+   * start refuses on the production path, after the subscriber has been decided.
+   */
+  telegramExternalBlocked?: boolean;
 }
+
+const TELEGRAM_OWNER = "4242";
 
 /** A deployment whose canonical CTO holds its role live, with its subscriber listening in `rooms`. */
 const deployment = (rooms: readonly string[], shape: DeploymentShape = {}) => {
@@ -260,7 +268,10 @@ const deployment = (rooms: readonly string[], shape: DeploymentShape = {}) => {
   ].join("\n"), { mode: 0o600 });
   const config = {
     ...defaultConfig(root),
-    ownerIdentities: shape.buzzOwner === false ? [] : [{ channel: "buzz" as const, actor: "startup-owner" }],
+    ownerIdentities: [
+      ...(shape.buzzOwner === false ? [] : [{ channel: "buzz" as const, actor: "startup-owner" }]),
+      ...(shape.telegramExternalBlocked ? [{ channel: "telegram" as const, actor: TELEGRAM_OWNER }] : []),
+    ],
     adapters: [new StartupAdapter(systemClock, "claude"), new StartupAdapter(systemClock, "gpt")],
     ctoPreference: { provider: "claude", model: "scripted-cto", effort: null },
   };
@@ -353,6 +364,16 @@ const deployment = (rooms: readonly string[], shape: DeploymentShape = {}) => {
   })) vi.stubEnv(key, value);
   const buzzCalls: string[] = [];
   if (shape.canonical) hooks.evidence = canonicalEvidence(buzzCalls);
+  if (shape.telegramExternalBlocked) {
+    for (const [key, value] of Object.entries({
+      ACP_TELEGRAM_EXTERNAL_CONSUMER: "hermes",
+      ACP_TELEGRAM_EXTERNAL_SECRET: "startup-telegram-external-secret",
+      ACP_TELEGRAM_OWNER_ID: TELEGRAM_OWNER,
+      ACP_TELEGRAM_CHAT_ID: TELEGRAM_OWNER,
+    })) vi.stubEnv(key, value);
+    // The daemon's state directory is the database's; a regular file there is no socket to replace.
+    writeFileSync(join(root, TELEGRAM_EXTERNAL_SOCKET_NAME), "");
+  }
   const printed = (): string => stdout.mock.calls.map(([text]) => String(text)).join("");
   return { config, pubkey, printed, buzzCalls };
 };
@@ -515,6 +536,52 @@ describe("a claim or a correction that reaches the daemon before its rooms are c
       correctionAuditRows: 1,
       holderRoom: ITS_ROOM,
     });
+  });
+
+  it("holds the early correction when a startup step after the room check refuses the start", async () => {
+    // PR1060-FU-01. The rooms match, so the room check passes; the Telegram external lane, started
+    // after it, then refuses. A latch released at the room check let the held correction open its
+    // room and move the row before that refusal.
+    const early: { reattach?: Promise<Decision<unknown>>; buzzCallsAtOnce?: number } = {};
+    const { config, pubkey, printed, buzzCalls } = deployment([DEFAULT_ROOM, ITS_ROOM], {
+      canonical: true,
+      telegramExternalBlocked: true,
+      onReattachOpened: () => {
+        early.reattach = reattachHolder();
+        early.buzzCallsAtOnce = buzzCalls.length;
+      },
+    });
+    let reachedShutdown = false;
+    const started = main({
+      config,
+      waitForShutdown: async (shutdown) => {
+        reachedShutdown = true;
+        await shutdown("STARTUP_TEST");
+      },
+    });
+
+    await expect(started).rejects.toThrow(`refusing to replace non-socket MCP path: ${join(dirname(config.databasePath), TELEGRAM_EXTERNAL_SOCKET_NAME)}`);
+    expect(reachedShutdown).toBe(false);
+    // The refusal came after the subscriber started and its rooms were checked.
+    expect(printed()).toContain("Buzz mention subscriber configured identities: 1");
+    expect(printed()).toContain("owner-reply consumer started");
+    // Whatever a released correction would have done has had every turn it needs to do it.
+    for (let turn = 0; turn < 20; turn += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(early.buzzCallsAtOnce).toBe(0);
+    await expect(early.reattach).resolves.toMatchObject({ allowed: true });
+    expect(buzzCalls).toEqual([]);
+    const after = new ControlPlane(config);
+    try {
+      expect(roomState(after, pubkey)).toEqual({
+        sessions: 1,
+        freshSessionRooms: [],
+        claimAuditRows: 0,
+        correctionAuditRows: 0,
+        holderRoom: DEFAULT_ROOM,
+      });
+    } finally {
+      after.close();
+    }
   });
 
   it("claims and corrects as before once startup has finished with matching rooms", async () => {
