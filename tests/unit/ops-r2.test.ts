@@ -257,7 +257,7 @@ describe("round-2 ops regressions", () => {
       },
     });
     const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
-    const confirmed = port.submitCeoDecision({
+    const confirmed = await port.submitCeoDecision({
       runId: driven.runId,
       decision: "CONFIRM",
       candidateSnapshotDigest: driven.candidateSnapshotDigest,

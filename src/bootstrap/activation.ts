@@ -408,6 +408,38 @@ export class BootstrapActivation {
   }
 
   /**
+   * The blind review a bootstrap CONFIRM rests on: a PASS bound to exactly the candidate the CEO
+   * names, by a reviewer independent of this run. Finalization asks this inside the CEO
+   * transaction, and the Repo Factory runner asks it first, before the owner approval is consumed
+   * or GitHub is written (issue #246, RF1050-01): a refusal at finalization cannot undo a write.
+   * It reads the review by the named candidate, never by the run's candidate pointer, so an
+   * unpromoted bootstrap, whose pointer is null, is answered the same way.
+   */
+  reviewForConfirmation(runId: string, candidateSnapshotDigest: string): Decision<{ digest: string }> {
+    const review = this.artifacts.latestForSnapshot<{
+      verdict?: string;
+      candidateSnapshotDigest?: string;
+      reviewerSessionId?: string;
+    }>(runId, ArtifactKind.BLIND_REVIEW, candidateSnapshotDigest);
+    if (
+      !review ||
+      review.content.verdict !== "PASS" ||
+      review.content.candidateSnapshotDigest !== candidateSnapshotDigest
+    ) {
+      return deny(
+        ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,
+        "no passing blind review is bound to the candidate this confirmation names",
+        { runId, candidateSnapshotDigest },
+      );
+    }
+    const reviewer = review.content.reviewerSessionId
+      ? this.bindings.assertReviewerIndependence(runId, review.content.reviewerSessionId)
+      : deny(ReasonCode.REVIEWER_NOT_INDEPENDENT, "blind review has no reviewer session", { runId });
+    if (!reviewer.allowed) return reviewer as Decision<{ digest: string }>;
+    return allow(ReasonCode.OK, { digest: review.digest });
+  }
+
+  /**
    * Phase J's last operation. ProductionGate invokes this while its completion
    * transaction is open, so every fact is re-read before the final artifact and run
    * state become durable together. Calling it outside that transaction is refused.
@@ -432,6 +464,8 @@ export class BootstrapActivation {
       });
     }
 
+    const review = this.reviewForConfirmation(input.runId, input.candidateSnapshotDigest);
+    if (!review.allowed) return review as Decision<ACPBootstrapActivationResult>;
     const factory = this.artifacts.latest<RepoFactoryResult>(input.runId, ArtifactKind.REPO_FACTORY_RESULT);
     const handoffArtifact = this.artifacts.latest<{
       handoffId: string;
@@ -443,20 +477,12 @@ export class BootstrapActivation {
       projectId?: string;
       report?: DoctorReport;
     }>(input.runId, ArtifactKind.DOCTOR_REPORT);
-    const review = this.artifacts.latestForSnapshot<{
-      verdict?: string;
-      candidateSnapshotDigest?: string;
-      reviewerSessionId?: string;
-    }>(input.runId, ArtifactKind.BLIND_REVIEW, input.candidateSnapshotDigest);
     if (
       !factory ||
       !handoffArtifact ||
       !doctorArtifact ||
       doctorArtifact.content.source !== "bootstrap-activation" ||
-      !doctorArtifact.content.report ||
-      !review ||
-      review.content.verdict !== "PASS" ||
-      review.content.candidateSnapshotDigest !== input.candidateSnapshotDigest
+      !doctorArtifact.content.report
     ) {
       return deny(
         ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,
@@ -503,11 +529,6 @@ export class BootstrapActivation {
         projectId,
       });
     }
-    const reviewer = review.content.reviewerSessionId
-      ? this.bindings.assertReviewerIndependence(input.runId, review.content.reviewerSessionId)
-      : deny(ReasonCode.REVIEWER_NOT_INDEPENDENT, "blind review has no reviewer session", { runId: input.runId });
-    if (!reviewer.allowed) return reviewer as Decision<ACPBootstrapActivationResult>;
-
     const activation: ACPBootstrapActivationResult = {
       schema: "agent-control-plane.bootstrap-activation.v1",
       runId: input.runId,
@@ -517,7 +538,7 @@ export class BootstrapActivation {
         activeManifestDigest: project?.activeManifestDigest ?? "",
       },
       localBindings,
-      blindReview: { verdict: "PASS", digest: review.digest },
+      blindReview: { verdict: "PASS", digest: review.value.digest },
       ceoConfirm: { decision: "CONFIRM", at: input.confirmedAt },
       primaryCtoBinding: primary
         ? {
@@ -554,7 +575,7 @@ export class BootstrapActivation {
       sessionId: input.ceoSessionId,
       evidence: {
         candidateSnapshotDigest: input.candidateSnapshotDigest,
-        blindReviewDigest: review.digest,
+        blindReviewDigest: review.value.digest,
         primaryCtoGeneration: primary?.bindingGeneration ?? null,
         doctorStatus: activation.doctor.status,
       },

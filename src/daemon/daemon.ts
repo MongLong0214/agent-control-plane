@@ -28,6 +28,7 @@ import {
   type DoctorScope,
   type Finding,
 } from "../doctor/doctor.ts";
+import { REPO_FACTORY_GITHUB_WRITE_OPERATION } from "../bootstrap/repo-factory-bootstrap-run.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
 import { RunState, SessionLifecycle } from "../domain/types.ts";
 import { buildAcceptanceReport } from "../export/acceptance-report.ts";
@@ -293,6 +294,12 @@ export const OPERATOR_METHOD = {
   CONTINUITY_STATUS: "continuity.status",
   OUTBOX_RETRY: "outbox.retry",
   OWNER_APPROVE: "owner.approve",
+  /**
+   * Issue #246 — the owner's approval of a PROJECT_BOOTSTRAP run's Repo Factory GitHub writes,
+   * minted here and nowhere else: only this socket's bearer reaches it, and only an allowlisted
+   * CLI owner identity is admitted. The CEO confirm consumes it; this method writes nothing to GitHub.
+   */
+  REPO_FACTORY_GITHUB_WRITE_APPROVE: "repoFactory.githubWrite.approve",
   ROLE_ATTACHMENT_ISSUE: ROLE_ATTACHMENT_OPERATION,
   ROLE_ATTACHMENT_REVOKE: "roleAttachment.revoke",
   /**
@@ -328,6 +335,7 @@ export const OPERATOR_MUTATION_METHODS: ReadonlySet<OperatorMethod> = new Set([
   OPERATOR_METHOD.RUN_CANCEL,
   OPERATOR_METHOD.OUTBOX_RETRY,
   OPERATOR_METHOD.OWNER_APPROVE,
+  OPERATOR_METHOD.REPO_FACTORY_GITHUB_WRITE_APPROVE,
   OPERATOR_METHOD.ROLE_ATTACHMENT_ISSUE,
   OPERATOR_METHOD.ROLE_ATTACHMENT_REVOKE,
   OPERATOR_METHOD.BINDING_RECOVER_DEAD,
@@ -812,6 +820,9 @@ export class Daemon {
         case OPERATOR_METHOD.OWNER_APPROVE:
           return this.executeOwnerApproval(request, peer);
 
+        case OPERATOR_METHOD.REPO_FACTORY_GITHUB_WRITE_APPROVE:
+          return this.executeRepoFactoryGitHubWriteApproval(request, peer);
+
         case OPERATOR_METHOD.ROLE_ATTACHMENT_ISSUE:
           return this.attachments.issue(request.params);
 
@@ -1064,6 +1075,76 @@ export class Daemon {
       item: item.value,
       approved,
       note,
+      receipt: admitted.value,
+    });
+  }
+
+  /**
+   * Issue #246 — mints the owner's approval of a PROJECT_BOOTSTRAP run's Repo Factory GitHub
+   * writes and keeps it on the run for the CEO confirm to consume.
+   *
+   * It is minted on the operator socket rather than through a Hermes or CTO MCP tool, because owner
+   * authority is the one thing the control plane cannot derive: the socket's bearer is the owner's
+   * credential, `peer.actor` is the identity bound to it rather than a request field, and
+   * `admitCliOwnerApproval` admits only an allowlisted CLI owner. Hermes MCP refuses owner
+   * decisions outright and the CTO surface has no such tool, so neither the CEO nor the CTO can
+   * mint this.
+   *
+   * What the receipt binds is computed from the run's own PLAN artifact (`approvalBinding`), and
+   * refused before anything is minted when the PLAN is not the one the owner named.
+   */
+  private executeRepoFactoryGitHubWriteApproval(
+    request: OperatorRequest,
+    peer: AuthenticatedOperatorPeer,
+  ): Decision<unknown> {
+    const runId = requiredOperatorString(request.params, "runId");
+    if (!runId.allowed) return runId;
+    const owner = requiredOperatorString(request.params, "owner");
+    if (!owner.allowed) return owner;
+    const visibility = request.params["visibility"];
+    if (visibility !== "public" && visibility !== "private") return invalidOperatorParam("visibility", visibility);
+    const planDigest = requiredOperatorString(request.params, "planDigest");
+    if (!planDigest.allowed) return planDigest;
+    const projectName = requiredOperatorString(request.params, "projectName");
+    if (!projectName.allowed) return projectName;
+    const manifest = request.params["manifest"];
+    if (!isPlainRecord(manifest)) return invalidOperatorParam("manifest", manifest);
+    const approved = request.params["approved"] ?? true;
+    if (typeof approved !== "boolean") return invalidOperatorParam("approved", approved);
+    // The idempotency key names this owner decision (RF1050-02). A retry of the same decision
+    // repeats it and is answered from the operator cache; a new decision with the same
+    // parameters — an approval after a decline — carries a new one. A key derived from the
+    // parameters could not tell the two apart, so none is derived: a request without one is refused.
+    const decisionKey = request.idempotencyKey;
+    if (decisionKey === undefined) return invalidOperatorParam("idempotencyKey", decisionKey);
+
+    const binding = this.cp.bootstrapProducer.approvalBinding(runId.value, {
+      owner: owner.value,
+      visibility,
+      planDigest: planDigest.value,
+      manifest,
+    });
+    if (!binding.allowed) return binding;
+    const approval = {
+      runId: runId.value,
+      candidateSnapshotDigest: binding.value.candidateSnapshotDigest,
+      operation: REPO_FACTORY_GITHUB_WRITE_OPERATION,
+      parameters: binding.value.parameters,
+      idempotencyKey: decisionKey,
+      approved,
+    };
+    const admitted = this.admitCliOwnerApproval(
+      peer.actor,
+      approval,
+      `repo-factory-github-write:${digestOf(approval)}`,
+    );
+    if (!admitted.allowed) return admitted;
+    return this.cp.bootstrapProducer.recordOwnerApproval(runId.value, {
+      owner: owner.value,
+      visibility,
+      planDigest: planDigest.value,
+      approvedManifest: binding.value.approvedManifest,
+      projectName: projectName.value,
       receipt: admitted.value,
     });
   }

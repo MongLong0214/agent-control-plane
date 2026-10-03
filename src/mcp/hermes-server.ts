@@ -2,10 +2,11 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import type { CapacityMonitor } from "../capacity/capacity-monitor.ts";
-import type { ProductionGate } from "../ceo/production-gate.ts";
+import type { RepoFactoryBootstrapRunner } from "../bootstrap/repo-factory-bootstrap-run.ts";
+import type { CeoDecisionInput, ProductionGate } from "../ceo/production-gate.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { Clock } from "../core/clock.ts";
-import { deny } from "../core/errors.ts";
+import { type Decision, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { CtoLifecycle } from "../cto/cto-lifecycle.ts";
 import type { Db } from "../db/database.ts";
@@ -68,6 +69,7 @@ export interface HermesMcpSource extends McpMutationSource {
   readonly runs: RunEngine;
   readonly tasks: TaskGraph;
   readonly bindings: BindingRegistry;
+  readonly bootstrapProducer: Pick<RepoFactoryBootstrapRunner, "produceAndActivateApproved">;
 }
 
 /** Only ports constructed below may be attached to an MCP server. */
@@ -121,7 +123,22 @@ export const createHermesMcpPort = (
       plan: source.continuity.computeCoveragePlan(),
       capacity: source.capacity.all(),
     }),
-    submitCeoDecision: (input: Parameters<ProductionGate["submitCeoDecision"]>[0]) => {
+    submitCeoDecision: async (input: CeoDecisionInput): Promise<Decision<{ state: RunState }>> => {
+      // Issue #246 — a PROJECT_BOOTSTRAP CONFIRM completes only on a result Repo Factory produced
+      // under the owner's approval. The runner runs here, ahead of the decision and outside its
+      // transaction, rather than inside submitCeoDecision: the runner awaits GitHub and git, and the
+      // decision is one synchronous transaction. It runs only for a decision the gate would admit
+      // (a session that does not hold the CEO role sets off no write), and its refusal is the
+      // CEO's answer unchanged.
+      if (input.decision === "CONFIRM" && source.runs.get(input.runId)?.kind === RunKind.PROJECT_BOOTSTRAP) {
+        const admissible = source.ceo.assertCeoDecisionAdmissible(input);
+        if (!admissible.allowed) return admissible as Decision<{ state: RunState }>;
+        const produced = await source.bootstrapProducer.produceAndActivateApproved(
+          input.runId,
+          input.candidateSnapshotDigest,
+        );
+        if (!produced.allowed) return produced as Decision<{ state: RunState }>;
+      }
       const decision = source.ceo.submitCeoDecision(input);
       // Hermes owns the CEO decision, not GitHub finalization. The daemon supplies this
       // internal callback at composition time so a live daemon begins the durable sequence
@@ -326,7 +343,7 @@ const createHermesServerFromPort = (
   server.registerTool(
     "ceo_decision_submit",
     { description: "Submit the CEO's final decision.", inputSchema: { ...mutation, runId: z.string(), decision: z.enum(["CONFIRM", "FINAL_REVISE", "OWNER_DECISION_REQUIRED"]), candidateSnapshotDigest: z.string(), ceoSessionId: z.string(), rationale: z.string() } },
-    async (args) => write(args.idempotencyKey, () => respond(port.submitCeoDecision({ runId: args.runId, decision: args.decision, candidateSnapshotDigest: args.candidateSnapshotDigest, ceoSessionId: args.ceoSessionId, rationale: args.rationale }))),
+    async (args) => write(args.idempotencyKey, async () => respond(await port.submitCeoDecision({ runId: args.runId, decision: args.decision, candidateSnapshotDigest: args.candidateSnapshotDigest, ceoSessionId: args.ceoSessionId, rationale: args.rationale }))),
   );
 
   server.registerTool(

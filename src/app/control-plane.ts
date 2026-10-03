@@ -139,8 +139,9 @@ export interface ControlPlaneConfig {
   githubClient?: GitHubClient;
   /**
    * Issue #246 — where a PROJECT_BOOTSTRAP run's Repo Factory producer may write its local
-   * checkout and GitHub receipt ledger (`<workRoot>/<runId>`). Absent, the producer refuses
-   * every run before any GitHub call. `githubPort` replaces the production `gh` port in tests.
+   * checkout and GitHub receipt ledger (`<workRoot>/<runId>`). `defaultConfig()` supplies one
+   * under the state root; a value given here wins. Absent, the producer refuses every run before
+   * any GitHub call. `githubPort` replaces the production `gh` port in tests.
    */
   repoFactory?: { workRoot: string; githubPort?: GitHubWritePort };
 }
@@ -163,6 +164,11 @@ export const defaultConfig = (root = join(homedir(), ".agent-control-plane")): C
     ? { githubAppPrivateKeyPath: process.env["ACP_GITHUB_APP_PRIVATE_KEY_PATH"] }
     : {}),
   runtimeRoot: join(root, "runtime"),
+  // Issue #246 — the Repo Factory work root, beside the other state directories. It is set here
+  // rather than as a constructor fallback: a fallback would hand every directly constructed
+  // control plane, test fixtures included, a work root beside the production `gh` port. The
+  // runner applies the state-path rule to it before each run (`ensurePrivateDirectory`).
+  repoFactory: { workRoot: join(root, "repo-factory") },
   // §21 — owner identities are declared out of band, one per line as `channel:actor` in
   // `<root>/owner-identities`. An absent or empty file means this deployment has no owner,
   // so no human gate can be satisfied; that is the safe reading, not a permissive one.
