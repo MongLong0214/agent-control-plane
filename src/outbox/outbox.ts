@@ -974,17 +974,31 @@ export class Outbox {
    * ACK from a runtime session. An ACK carrying a revoked or superseded generation is
    * audit-only and does not change state (§15.7, §34.4).
    */
-  acknowledge(messageId: string, fromSessionId: string, generation: number): Decision<void> {
-    return this.db.tx(() => this.acknowledgeInTx(messageId, fromSessionId, generation));
+  acknowledge(
+    messageId: string,
+    fromSessionId: string,
+    generation: number,
+    sessionIncarnation?: string,
+  ): Decision<void> {
+    return this.db.tx(() => this.acknowledgeInTx(messageId, fromSessionId, generation, sessionIncarnation));
   }
 
   private acknowledgeInTx(
     messageId: string,
     fromSessionId: string,
     generation: number,
+    sessionIncarnation: string | undefined,
   ): Decision<void> {
     const row = this.db.get<RawOutbox>(`SELECT * FROM outbox WHERE message_id = ?`, [messageId]);
     if (!row) return deny(ReasonCode.NOT_FOUND, "unknown message", { messageId });
+
+    // A pending in-band row has one acknowledgement authority, the one `role_dispatch_ack` uses, so
+    // the run-scoped route and the runless one cannot disagree about who may settle it. `run_ack`
+    // has already fenced the caller to a run it owns; the row's own role generation decides the
+    // rest. A holder-claimed kind is never in band, so the refusal below still covers it.
+    if (row.status === "PENDING" && this.#isInBand(row)) {
+      return this.#acknowledgeInBandInTx(row, fromSessionId, sessionIncarnation ?? null);
+    }
 
     // This route is scoped by a *tuple*, not by a message. The `messageId` is whatever the caller
     // supplied, and everything below checks that the caller holds the row's role generation — so a
@@ -1085,29 +1099,98 @@ export class Outbox {
       );
     }
 
-    // An in-band row is acknowledged straight from PENDING: it was never claimed or sent, because
-    // its target reads it over its own connection. Every check above still applied — the kind is
-    // not holder-claimed, the caller is the row's exact target at the active generation, and the
-    // row is neither expired nor settled — so this only names the transition, distinctly.
-    const inBand =
-      row.status === "PENDING" &&
-      IN_BAND_KINDS.has(row.kind as MessageKind) &&
-      isAdoptedCanonicalRuntime(this.db, row.target_session_id);
     this.db.run(`UPDATE outbox SET status = 'ACKED', acked_at = ? WHERE message_id = ?`, [
       this.clock.nowIso(),
       messageId,
     ]);
-    if (inBand) {
+    return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * Acknowledges one in-band row, runless: the authority is the addressed row and the caller's own
+   * authenticated session, never a run (`role_dispatch_ack`). A `DRAIN_REQUEST` carries no run, and
+   * a canonical CTO that owns none still has to be able to settle it.
+   */
+  acknowledgeInBand(messageId: string, sessionId: string, sessionIncarnation: string): Decision<void> {
+    return this.db.tx(() => {
+      const row = this.db.get<RawOutbox>(`SELECT * FROM outbox WHERE message_id = ?`, [messageId]);
+      if (!row) return deny(ReasonCode.NOT_FOUND, "unknown message", { messageId });
+      return this.#acknowledgeInBandInTx(row, sessionId, sessionIncarnation);
+    });
+  }
+
+  /** In-band, in `claimDeliverable`'s terms: an in-band kind addressed to a canonical runtime. */
+  #isInBand(row: RawOutbox): boolean {
+    return IN_BAND_KINDS.has(row.kind as MessageKind) && isAdoptedCanonicalRuntime(this.db, row.target_session_id);
+  }
+
+  /**
+   * The one in-band acknowledgement authority, for `run_ack` and `role_dispatch_ack` alike.
+   *
+   * The caller must be the row's exact target and, through `exactHolderTarget` with the row's own
+   * role key and generation, that generation's ACTIVE holder at the incarnation its connection
+   * presented — the predicate `pendingInBandFor` lists by, so a session can settle exactly what it
+   * can see. A holder-claimed kind, a row that is not in band, and a row that is expired, rejected or
+   * already settled are refused. Only `PENDING -> ACKED` is written, as a compare-and-set.
+   */
+  #acknowledgeInBandInTx(row: RawOutbox, sessionId: string, sessionIncarnation: string | null): Decision<void> {
+    const messageId = row.message_id;
+    const refuse = (reasonCode: ReasonCode, message: string): Decision<void> => {
       this.audit.record({
-        kind: "OUTBOX_ACKED_IN_BAND",
-        reasonCode: ReasonCode.OK,
+        kind: "OUTBOX_ACK_REJECTED",
+        reasonCode,
         runId: row.run_id,
-        sessionId: fromSessionId,
+        sessionId,
         roleKey: row.role_key,
-        evidence: { messageId, kind: row.kind, bindingGeneration: generation },
+        evidence: { messageId, kind: row.kind, status: row.status, inBand: true },
       });
-      this.db.afterCommit(() => this.#inBandWokenAt.delete(messageId));
+      return deny(reasonCode, message, { messageId, status: row.status });
+    };
+    if (HOLDER_CLAIMED_KINDS.has(row.kind as MessageKind)) {
+      return refuse(
+        ReasonCode.INVALID_ARGUMENT,
+        "this message is settled over its holder's own connection, not through the generic ack",
+      );
     }
+    if (!this.#isInBand(row)) {
+      return refuse(ReasonCode.INVALID_ARGUMENT, "this message is not delivered in band; acknowledge it with run_ack");
+    }
+    if (row.status === "EXPIRED" || row.expires_at <= this.clock.nowIso()) {
+      return refuse(ReasonCode.OUTBOX_EXPIRED, `message is ${row.status} and cannot be acknowledged`);
+    }
+    if (row.status !== "PENDING") {
+      return refuse(ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, `message is ${row.status} and cannot be acknowledged`);
+    }
+    const holder =
+      sessionIncarnation !== null &&
+      row.target_session_id === sessionId &&
+      this.db.get<{ held: number }>(
+        `SELECT ${exactHolderTarget("bound")} AS held`,
+        [row.role_key, row.binding_generation, row.target_session_id, sessionIncarnation],
+      )?.held === 1;
+    if (!holder) {
+      return refuse(
+        ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
+        "ack came from a session, generation or incarnation that does not hold this message",
+      );
+    }
+    const now = this.clock.nowIso();
+    const changed = this.db.run(
+      `UPDATE outbox SET status = 'ACKED', acked_at = ? WHERE message_id = ? AND status = 'PENDING'`,
+      [now, messageId],
+    ).changes;
+    if (changed !== 1) {
+      return refuse(ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, "message left PENDING before it could be acknowledged");
+    }
+    this.audit.record({
+      kind: "OUTBOX_ACKED_IN_BAND",
+      reasonCode: ReasonCode.OK,
+      runId: row.run_id,
+      sessionId,
+      roleKey: row.role_key,
+      evidence: { messageId, kind: row.kind, bindingGeneration: row.binding_generation },
+    });
+    this.db.afterCommit(() => this.#inBandWokenAt.delete(messageId));
     return allow(ReasonCode.OK, undefined);
   }
 

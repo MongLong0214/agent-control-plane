@@ -8,6 +8,7 @@ import { allow, deny, type Decision } from "../../src/core/errors.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { NotificationKind } from "../../src/ceo/production-gate.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { IN_BAND_REWAKE_MS } from "../../src/outbox/outbox.ts";
@@ -107,9 +108,9 @@ const callCtoTool = async (
 /**
  * A project whose PRIMARY_CTO is bound the way the canonical self-claim binds one (as in
  * `a-run-does-not-replace-its-canonical-cto.test.ts`), whose session has a room and a channel
- * identity as a live canonical CTO's does, and a run dispatched to it with a wake port attached.
+ * identity as a live canonical CTO's does. No run exists yet.
  */
-const dispatchedToCanonical = async (makeWake: (h: Harness) => Wake) => {
+const boundCanonical = async () => {
   const { transport, send } = hostTransport();
   const h = makeHarness({ buzzTransport: transport });
   const { projectId, repositoryId } = await registerFixtureProject(h);
@@ -135,7 +136,12 @@ const dispatchedToCanonical = async (makeWake: (h: Harness) => Wake) => {
     },
   });
   if (!bound.allowed) throw new Error(bound.message);
+  return { h, send, projectId, repositoryId, session, bound: bound.value };
+};
 
+/** `boundCanonical`, and a run dispatched to it with a wake port attached. */
+const dispatchedToCanonical = async (makeWake: (h: Harness) => Wake) => {
+  const { h, send, projectId, repositoryId, session, bound } = await boundCanonical();
   const run = h.cp.runs.create({
     projectId,
     executionMode: ExecutionMode.STANDARD,
@@ -162,7 +168,7 @@ const dispatchedToCanonical = async (makeWake: (h: Harness) => Wake) => {
     runId: run.value.runId,
     sessionId,
     incarnation: h.cp.sessions.require(sessionId).incarnation,
-    generation: bound.value.bindingGeneration,
+    generation: bound.bindingGeneration,
     messageId: dispatchRow(h, run.value.runId).message_id,
   };
 };
@@ -271,9 +277,9 @@ describe("an adopted canonical CTO receives its dispatch in band", () => {
 
       const other = f.h.cp.sessions.create({ provider: "claude", model: "claude-cli" });
       expect(f.h.cp.sessions.transition(other.sessionId, SessionLifecycle.READY, "another runtime").allowed).toBe(true);
-      expect(f.h.cp.outbox.acknowledge(f.messageId, other.sessionId, f.generation))
+      expect(f.h.cp.outbox.acknowledge(f.messageId, other.sessionId, f.generation, f.h.cp.sessions.require(other.sessionId).incarnation))
         .toMatchObject({ allowed: false, reasonCode: ReasonCode.OUTBOX_STALE_GENERATION_REJECTED });
-      expect(f.h.cp.outbox.acknowledge(f.messageId, f.sessionId, f.generation + 1))
+      expect(f.h.cp.outbox.acknowledge(f.messageId, f.sessionId, f.generation, "an-old-incarnation"))
         .toMatchObject({ allowed: false, reasonCode: ReasonCode.OUTBOX_STALE_GENERATION_REJECTED });
       const otherAck = await callCtoTool(
         f.h,
@@ -308,7 +314,7 @@ describe("an adopted canonical CTO receives its dispatch in band", () => {
     try {
       f.h.clock.advance(31 * 60 * 1000);
       expect(f.h.cp.outbox.pendingInBandFor(f.sessionId, f.incarnation)).toEqual([]);
-      expect(f.h.cp.outbox.acknowledge(f.messageId, f.sessionId, f.generation))
+      expect(f.h.cp.outbox.acknowledge(f.messageId, f.sessionId, f.generation, f.incarnation))
         .toMatchObject({ allowed: false, reasonCode: ReasonCode.OUTBOX_EXPIRED });
       expect(outboxRow(f.h, f.messageId)?.status).not.toBe("ACKED");
       expect(f.h.cp.audit.byKind("OUTBOX_ACKED_IN_BAND")).toHaveLength(0);
@@ -386,6 +392,92 @@ describe("an adopted canonical CTO receives its dispatch in band", () => {
       expect(outboxRow(f.h, messageId)?.status).toBe("ACKED");
       expect(f.h.cp.audit.byKind("OUTBOX_ACKED_IN_BAND").map((row) => (row.evidence as { messageId?: string }).messageId))
         .toContain(messageId);
+    } finally {
+      f.h.cp.close();
+    }
+  });
+
+  it("(g) a canonical CTO that owns no run settles a drain request with role_dispatch_ack, and only its own", async () => {
+    const { h, send, projectId, session, bound } = await boundCanonical();
+    try {
+      const sessionId = session.sessionId;
+      const peer = { sessionId, incarnation: h.cp.sessions.require(sessionId).incarnation };
+      expect(h.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM runs`)?.n).toBe(0);
+      const drained = h.cp.cto.requestReplacement(projectId, "operator replacement");
+      if (!drained.allowed) throw new Error(drained.message);
+      const row = h.cp.db.get<{ message_id: string; run_id: string | null }>(
+        `SELECT message_id, run_id FROM outbox WHERE kind = 'DRAIN_REQUEST' AND target_session_id = ?`,
+        [sessionId],
+      );
+      if (!row) throw new Error("the replacement enqueued no DRAIN_REQUEST");
+      const messageId = row.message_id;
+      expect(row.run_id).toBeNull();
+
+      await h.buzzAdapter.deliverPending();
+      expect(send).not.toHaveBeenCalled();
+      const listed = await callCtoTool(h, peer, "role_dispatch_pending", {});
+      expect(listed).toMatchObject({ ok: true, value: { messages: [{ messageId, kind: MessageKind.DRAIN_REQUEST, runId: null }] } });
+
+      // Another live session, the role's generation moved on, and an old incarnation: all refused.
+      const other = h.cp.sessions.create({ provider: "claude", model: "claude-cli" });
+      expect(h.cp.sessions.transition(other.sessionId, SessionLifecycle.READY, "another runtime").allowed).toBe(true);
+      const otherPeer = { sessionId: other.sessionId, incarnation: h.cp.sessions.require(other.sessionId).incarnation };
+      expect(await callCtoTool(h, otherPeer, "role_dispatch_ack", { messageId }))
+        .toMatchObject({ ok: false, reasonCode: ReasonCode.OUTBOX_STALE_GENERATION_REJECTED });
+      h.cp.db.run(`UPDATE outbox SET binding_generation = ? WHERE message_id = ?`, [bound.bindingGeneration + 1, messageId]);
+      expect(await callCtoTool(h, peer, "role_dispatch_ack", { messageId }))
+        .toMatchObject({ ok: false, reasonCode: ReasonCode.OUTBOX_STALE_GENERATION_REJECTED });
+      h.cp.db.run(`UPDATE outbox SET binding_generation = ? WHERE message_id = ?`, [bound.bindingGeneration, messageId]);
+      expect(await callCtoTool(h, { sessionId, incarnation: "an-old-incarnation" }, "role_dispatch_ack", { messageId }))
+        .toMatchObject({ ok: false, reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED });
+      expect(h.cp.outbox.acknowledgeInBand(messageId, sessionId, "an-old-incarnation"))
+        .toMatchObject({ allowed: false, reasonCode: ReasonCode.OUTBOX_STALE_GENERATION_REJECTED });
+      expect(outboxRow(h, messageId)?.status).toBe("PENDING");
+      expect(h.cp.audit.byKind("OUTBOX_ACKED_IN_BAND")).toHaveLength(0);
+
+      expect(await callCtoTool(h, peer, "role_dispatch_ack", { messageId })).toMatchObject({ ok: true, reasonCode: ReasonCode.OK });
+      expect(outboxRow(h, messageId)?.status).toBe("ACKED");
+      const audited = h.cp.audit.byKind("OUTBOX_ACKED_IN_BAND");
+      expect(audited).toHaveLength(1);
+      expect(audited[0]).toMatchObject({ sessionId, runId: null, evidence: { messageId, kind: MessageKind.DRAIN_REQUEST } });
+      // Settled once: a second acknowledgement is refused, and nothing is listed.
+      expect(await callCtoTool(h, peer, "role_dispatch_ack", { messageId }))
+        .toMatchObject({ ok: false, reasonCode: ReasonCode.OUTBOX_STALE_GENERATION_REJECTED });
+      expect(await callCtoTool(h, peer, "role_dispatch_pending", {})).toMatchObject({ ok: true, value: { messages: [] } });
+    } finally {
+      h.cp.close();
+    }
+  });
+
+  it("(g) role_dispatch_ack refuses a holder-claimed row and a row that is not in band", async () => {
+    const f = await dispatchedToCanonical(woken);
+    try {
+      const peer = { sessionId: f.sessionId, incarnation: f.incarnation };
+      const owner = f.h.cp.outbox.enqueue({
+        idempotencyKey: "owner-message:in-band-ack-control",
+        roleKey: f.roleKey,
+        bindingGeneration: f.generation,
+        targetSessionId: f.sessionId,
+        runId: null,
+        kind: MessageKind.OWNER_MESSAGE,
+        payload: { channel: "buzz", nonce: "in-band-ack-control" },
+      });
+      if (!owner.allowed) throw new Error(owner.message);
+      expect(await callCtoTool(f.h, peer, "role_dispatch_ack", { messageId: owner.value.messageId }))
+        .toMatchObject({ ok: false, reasonCode: ReasonCode.INVALID_ARGUMENT });
+      expect(outboxRow(f.h, owner.value.messageId)?.status).toBe("PENDING");
+      // A CEO notification is outward but not in band: it stays Buzz's to deliver.
+      const ceo = bindCeo(f.h);
+      const notified = f.h.cp.ceo.notify(NotificationKind.TRUE_ESCALATION, f.runId, { question: "q" });
+      if (!notified.allowed) throw new Error(notified.message);
+      const notice = f.h.cp.db.get<{ message_id: string }>(
+        `SELECT message_id FROM outbox WHERE kind = 'CEO_NOTIFICATION' AND target_session_id = ?`,
+        [ceo],
+      );
+      if (!notice) throw new Error("no CEO notification was enqueued");
+      expect(await callCtoTool(f.h, peer, "role_dispatch_ack", { messageId: notice.message_id }))
+        .toMatchObject({ ok: false, reasonCode: ReasonCode.INVALID_ARGUMENT });
+      expect(f.h.cp.audit.byKind("OUTBOX_ACKED_IN_BAND")).toHaveLength(0);
     } finally {
       f.h.cp.close();
     }

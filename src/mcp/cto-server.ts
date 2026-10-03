@@ -114,11 +114,14 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       const session = source.sessions.get(sessionId);
       return Boolean(session && session.incarnation === incarnation);
     },
-    acknowledge: (messageId: string, sessionId: string, bindingGeneration: number) =>
-      source.outbox.acknowledge(messageId, sessionId, bindingGeneration),
+    acknowledge: (messageId: string, sessionId: string, bindingGeneration: number, sessionIncarnation: string) =>
+      source.outbox.acknowledge(messageId, sessionId, bindingGeneration, sessionIncarnation),
     // Read-only: the caller's own in-band rows, fenced by the incarnation its connection presented.
     pendingInBandDispatch: (sessionId: string, sessionIncarnation: string) =>
       source.outbox.pendingInBandFor(sessionId, sessionIncarnation),
+    // The same authority `run_ack` reaches for an in-band row, without a run.
+    acknowledgeInBand: (messageId: string, sessionId: string, sessionIncarnation: string) =>
+      source.outbox.acknowledgeInBand(messageId, sessionId, sessionIncarnation),
     contractForRun: (runId: string) => {
       const run = source.runs.require(runId);
       const manifest = run.pinnedManifestDigest ? source.projects.manifest(run.pinnedManifestDigest) : null;
@@ -246,14 +249,18 @@ const createCtoServerFromPort = (
     { description: "Acknowledge a dispatched run and its fenced envelope.", inputSchema: { ...mutation, ...runIdentity, messageId: z.string() } },
     async (args) => write("run_ack", args.idempotencyKey, (peer) => {
       const fenced = owner(peer, args.runId);
-      return fenced.allowed ? respond(port.acknowledge(args.messageId, fenced.value.sessionId, fenced.value.bindingGeneration)) : respond(fenced);
+      // The run fence passed, so the peer carries an incarnation; an in-band row is then settled by
+      // the same authority `role_dispatch_ack` uses (`Outbox.acknowledge` routes it there).
+      return fenced.allowed
+        ? respond(port.acknowledge(args.messageId, fenced.value.sessionId, fenced.value.bindingGeneration, peer.sessionIncarnation ?? ""))
+        : respond(fenced);
     }),
   );
   server.registerTool(
     "role_dispatch_pending",
     {
       description:
-        "The pending control-plane messages (dispatch, revision, escalation reply, drain, cancel) addressed in band to this exact session at its active generation. Acknowledge each with run_ack.",
+        "The pending control-plane messages (dispatch, revision, escalation reply, drain, cancel) addressed in band to this exact session at its active generation. Acknowledge each with role_dispatch_ack (or run_ack, for a row that names a run this session owns).",
       inputSchema: {},
     },
     async () => read("role_dispatch_pending", (peer) => {
@@ -270,6 +277,28 @@ const createCtoServerFromPort = (
         }));
       }
       return ok({ messages: port.pendingInBandDispatch(peer.sessionId, peer.sessionIncarnation) });
+    }),
+  );
+  server.registerTool(
+    "role_dispatch_ack",
+    {
+      description:
+        "Acknowledge one message role_dispatch_pending listed for this session. Needs no run: a drain request carries none.",
+      inputSchema: { messageId: z.string().min(1) },
+    },
+    // Authenticated exactly as role_dispatch_pending is. No idempotency key, like the role_owner_message
+    // tools: the write is a compare-and-set on PENDING, so a retry is answered by the row's own state.
+    async (args) => guarded(() => {
+      const peer = peerFor("role_dispatch_ack");
+      if (!peer.allowed) return respond(peer);
+      const { sessionId, sessionIncarnation } = peer.value;
+      if (!sessionId || !sessionIncarnation) {
+        return respond(deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "CTO MCP peer is missing a session incarnation"));
+      }
+      if (!port.sessionIsCurrent(sessionId, sessionIncarnation)) {
+        return respond(deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "CTO MCP session incarnation is not current", { sessionId }));
+      }
+      return respond(port.acknowledgeInBand(args.messageId, sessionId, sessionIncarnation));
     }),
   );
   server.registerTool(
