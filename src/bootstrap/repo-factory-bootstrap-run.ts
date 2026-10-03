@@ -51,7 +51,11 @@ import { parseRepoFactoryResult, type RepoFactoryResult } from "./repo-factory-r
  * it cannot mint one, because `assertApproval` re-reads the ingress admission it came from. The
  * receipt is consumed once for the candidate the CEO confirms and re-admitted from that durable
  * consumption on a retry, so a partial failure can resume without a second approval and the
- * approval cannot be carried to a different candidate.
+ * approval cannot be carried to a different candidate. A receipt minted while the run's pointer
+ * named a candidate is consumed for that candidate only. One exception to the retry: a receipt
+ * that the heads before PR #1050's RF1050-01 consumed with no candidate authorises none, because
+ * that record cannot say which candidate it served; the CONFIRM is refused with the remedy
+ * NEW_OWNER_DECISION, and under a new owner decision production resumes from the GitHub ledger.
  *
  * What is executed. The approved PLAN artifact's own operations, desired state included, rather
  * than an executable plan a caller supplies, which the reviewed head checked only by its digest
@@ -636,8 +640,10 @@ export class RepoFactoryBootstrapRunner {
 
     // Consumed for the candidate the CEO confirms rather than the run's candidate pointer, which
     // an unpromoted bootstrap leaves null and which would let one approval serve two confirmations.
-    // `assertApproval` (inside `consumeApproval`) still refuses a receipt minted while the run's
-    // pointer named a different candidate.
+    // Whether the receipt may authorise that candidate is the owner authority's judgement alone,
+    // made before anything is consumed: a receipt minted for another candidate is refused
+    // (RF1050-03), and so is one an earlier head consumed with no candidate, whose remedy is a new
+    // owner decision (RF1050-04).
     const retained = this.deps.ownerAuthority.assertConsumedApproval(receipt, candidateSnapshotDigest);
     if (retained.allowed) return retained;
     return this.deps.ownerAuthority.consumeApproval(receipt, candidateSnapshotDigest);

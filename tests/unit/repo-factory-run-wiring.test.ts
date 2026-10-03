@@ -9,6 +9,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { defaultConfig } from "../../src/app/control-plane.ts";
 import type { GitHubWritePort } from "../../src/bootstrap/github-write-port.ts";
+import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../../src/ceo/owner-authority.ts";
 import { createOperatorClient, dispatch } from "../../src/cli/agentctl.ts";
 import { allow } from "../../src/core/errors.ts";
 import { digestOf } from "../../src/core/digest.ts";
@@ -769,6 +770,121 @@ describe("PR #1050 review witnesses", () => {
     const reviewed = await ceoDecision(wired, "rf1050-01p-reviewed");
     expect((reviewed["evidence"] as Record<string, unknown>)["stage"]).toBe("activation");
     expect(wired.github.writes.map((write) => write.method)).toContain("createRepository");
+  });
+
+  /**
+   * A second candidate beside the prepared one: its own snapshot, and a passing review by the
+   * same independent reviewer, so the review check admits a CONFIRM naming either of them.
+   */
+  const recordSecondReviewedCandidate = (wired: Wired): string => {
+    const { harness, runId } = wired;
+    const snapshot = harness.cp.artifacts.latestForSnapshot<CandidateSnapshot>(runId, "CANDIDATE_SNAPSHOT", wired.snapshotDigest);
+    const review = harness.cp.artifacts.latestForSnapshot<Record<string, unknown>>(runId, "BLIND_REVIEW", wired.snapshotDigest);
+    if (!snapshot || !review) throw new Error("the prepared candidate has no snapshot or no review");
+    const second: CandidateSnapshot = {
+      ...snapshot.content,
+      repositories: snapshot.content.repositories.map((repository) => ({
+        ...repository,
+        diffDigest: digestOf({ bootstrapCandidate: runId, second: true }),
+      })),
+    };
+    const digest = candidateSnapshotDigest(second);
+    harness.cp.artifacts.put(runId, "CANDIDATE_SNAPSHOT", second, digest);
+    harness.cp.artifacts.putEvidence(harness.cp.evidenceWritersForTests().BLIND_REVIEW, runId, "BLIND_REVIEW", {
+      ...review.content,
+      candidateSnapshotDigest: digest,
+    }, digest);
+    return digest;
+  };
+
+  const newestReceipt = (wired: Wired): OwnerApprovalReceipt => {
+    const receipt = (recordedApprovals(wired).at(-1)?.content as { receipt?: OwnerApprovalReceipt } | undefined)?.receipt;
+    if (!receipt) throw new Error("no owner receipt is recorded on the run");
+    return receipt;
+  };
+
+  it("RF1050-03: a receipt naming one candidate is not consumed for another reviewed candidate, and still serves its own", async () => {
+    const wired = await wire("rf1050-03-other-candidate");
+    wired.harness.cp.runs.promoteCandidate(wired.runId, wired.snapshotDigest);
+    // Recorded after the promotion, which supersedes reviews of every other candidate.
+    const other = recordSecondReviewedCandidate(wired);
+    const approved = await approve(wired);
+    if (!approved.allowed) throw new Error(`${approved.reasonCode}: ${approved.message}`);
+    expect(newestReceipt(wired).candidateSnapshotDigest).toBe(wired.snapshotDigest);
+    // Both candidates pass the review check, so only the owner admission can tell them apart.
+    expect(wired.harness.cp.bootstrap.reviewForConfirmation(wired.runId, other).allowed).toBe(true);
+
+    const refused = await ceoDecision(wired, "rf1050-03-other", { candidateSnapshotDigest: other });
+    expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.EVIDENCE_STALE });
+    expect(refused["evidence"]).toMatchObject({
+      stage: "approval",
+      approvedCandidateSnapshotDigest: wired.snapshotDigest,
+      presentedCandidateSnapshotDigest: other,
+    });
+    nothingWrittenOrConsumed(wired);
+
+    // The receipt was not spent on the other candidate: the CONFIRM naming its own candidate writes.
+    const own = await ceoDecision(wired, "rf1050-03-own");
+    expect(own).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+    expect((own["evidence"] as Record<string, unknown>)["stage"]).toBe("activation");
+    expect(wired.github.writes.map((write) => write.method)).toContain("createRepository");
+    expect(consumedApprovals(wired)).toBe(1);
+  });
+
+  it("RF1050-04: a receipt an earlier head consumed with no candidate is refused by name, and a new owner decision resumes from the ledger", async () => {
+    const wired = await wire("rf1050-04-legacy");
+    expect(wired.harness.cp.runs.currentCandidate(wired.runId)).toBeNull();
+    const approved = await approve(wired);
+    if (!approved.allowed) throw new Error(`${approved.reasonCode}: ${approved.message}`);
+    const legacy = newestReceipt(wired);
+
+    // The heads before RF1050-01 consumed the approval for the run's candidate pointer, which an
+    // unpromoted bootstrap leaves null. That admission is replayed here around the real owner
+    // authority, and production fails after the repository is created, as the reviewer's did.
+    const deps = (wired.harness.cp.bootstrapProducer as unknown as {
+      deps: { ownerAuthority: Pick<OwnerAuthorityPort, "assertConsumedApproval" | "consumeApproval"> };
+    }).deps;
+    const upgraded = deps.ownerAuthority;
+    const pointer = () => wired.harness.cp.runs.currentCandidate(wired.runId);
+    deps.ownerAuthority = {
+      assertConsumedApproval: (receipt) => upgraded.assertConsumedApproval(receipt, pointer()),
+      consumeApproval: (receipt) => upgraded.consumeApproval(receipt, pointer()),
+    };
+    wired.github.failNext = "pushBranch";
+    const failed = await ceoDecision(wired, "rf1050-04-earlier-head");
+    expect((failed["evidence"] as Record<string, unknown>)["stage"]).toBe("production");
+    expect(wired.github.writes.map((write) => write.method)).toEqual(["createRepository", "pushBranch"]);
+    expect(consumedApprovals(wired)).toBe(1);
+    deps.ownerAuthority = upgraded;
+
+    // After the upgrade that consumption authorises no candidate, and the refusal names its remedy.
+    wired.github.writes.length = 0;
+    const refused = await ceoDecision(wired, "rf1050-04-upgraded");
+    expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.EVIDENCE_STALE });
+    expect(refused["evidence"]).toMatchObject({
+      stage: "approval",
+      approvedCandidateSnapshotDigest: null,
+      presentedCandidateSnapshotDigest: wired.snapshotDigest,
+      remedy: "NEW_OWNER_DECISION",
+    });
+    expect(wired.github.writes).toEqual([]);
+    expect(consumedApprovals(wired)).toBe(1);
+
+    // The recovery: a new owner decision is consumed for the confirmed candidate, and production
+    // resumes from the GitHub ledger without creating the repository again.
+    const reapproved = await approve(wired);
+    if (!reapproved.allowed) throw new Error(`${reapproved.reasonCode}: ${reapproved.message}`);
+    const resumed = await ceoDecision(wired, "rf1050-04-new-decision");
+    expect(resumed).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+    expect((resumed["evidence"] as Record<string, unknown>)["stage"]).toBe("activation");
+    expect(wired.github.writes.map((write) => write.method)).toEqual(["pushBranch", "setDefaultBranch", "protectBranch"]);
+    expect(consumedApprovals(wired)).toBe(2);
+    expect(wired.harness.cp.ownerAuthority.assertConsumedApproval(newestReceipt(wired), wired.snapshotDigest).allowed).toBe(true);
+    // The earlier head's receipt still authorises nothing, the confirmed candidate included.
+    expect(wired.harness.cp.ownerAuthority.assertConsumedApproval(legacy, wired.snapshotDigest)).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.EVIDENCE_STALE,
+    });
   });
 
   /** The owner's CLI on the wired daemon's own operator socket, with the owner token. */
