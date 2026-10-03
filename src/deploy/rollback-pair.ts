@@ -195,10 +195,17 @@ export interface RollbackPairIdentity {
  * are not byte-identical even when nothing has been written. Nor is a counter enough on its own:
  * `audit_events` is deliberately not the state SSOT, and an in-place `UPDATE` moves no row count
  * and no autoincrement. The digest covers the schema, `user_version`, `application_id` and every
- * row of every table, so any write is a difference. `userVersion` and `auditEventId` ride along
- * for the operator reading a refusal; the decision rests on `contentSha256` alone.
+ * row of every table — its hidden rowid included, which `SELECT *` leaves out and the application
+ * reads as order (ACP1058-R2) — so any write is a difference. `userVersion` and `auditEventId` ride
+ * along for the operator reading a refusal; the decision rests on `contentSha256` alone.
  */
 export interface RollbackPairDatabaseHighWater {
+  /**
+   * Which definition `contentSha256` follows. Two digests are comparable only under the same one,
+   * so a mark under any other — or under none, which is v1, before the definition hashed rowids
+   * and before it was recorded — is refused at use rather than compared.
+   */
+  contentFormat?: string;
   contentSha256: string;
   userVersion: number;
   /** `max(audit_events.event_id)`, or null when the image holds no audit event. */
@@ -679,9 +686,49 @@ const assertClosureIsSelfContained = (runtimeRoot: string): void => {
   }
 };
 
-const DATABASE_CONTENT_FORMAT = "agent-control-plane.database-content/v1";
+/**
+ * The definition the content digest follows, recorded in every mark beside the digest it produced.
+ *
+ * v2 hashes each rowid table's hidden rowid as part of its row (ACP1058-R2). v1 hashed declared
+ * values only, so `UPDATE … SET rowid = …` left it unchanged, and it recorded no label. The label
+ * is hashed too, so the two can never agree by accident; the recorded copy is what lets a rollback
+ * say a mark is from another definition instead of reporting a write nobody made.
+ */
+const DATABASE_CONTENT_FORMAT = "agent-control-plane.database-content/v2";
+
+/**
+ * What `rollback-pair.js guards` declares, so a caller can refuse a coordinator that cannot run the
+ * check before handing it a rollback (ACP1058-R1). A build from before the check answers `guards`
+ * the way it answers any command it does not know: usage, exit 2, and no such line.
+ */
+const DATABASE_HIGH_WATER_GUARD = "ACP_ROLLBACK_DATABASE_HIGH_WATER";
 
 const quoteIdentifier = (name: string): string => `"${name.replaceAll('"', '""')}"`;
+
+/** The names SQLite answers with a rowid table's hidden rowid, each unless a declared column takes it. */
+const ROWID_NAMES = ["rowid", "_rowid_", "oid"] as const;
+
+/**
+ * The name that reaches `table`'s hidden rowid. A declared column of the same name (in any case)
+ * takes the name over, so the first one no column claims is used; when every one is claimed the
+ * rowid is unreachable from SQL, and the digest refuses rather than leave row identity out.
+ */
+const hiddenRowidName = (raw: Database.Database, table: string): string => {
+  const declared = new Set(
+    (raw.prepare("SELECT name FROM pragma_table_xinfo(?)").pluck().all(table) as string[]).map((name) =>
+      name.toLowerCase(),
+    ),
+  );
+  const name = ROWID_NAMES.find((candidate) => !declared.has(candidate));
+  if (name === undefined) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      "a table declares a column under every name SQLite gives its rowid, so no name reaches its hidden rowid and the content digest cannot cover its row identity",
+      { table },
+    );
+  }
+  return name;
+};
 
 /**
  * One digest over everything a write can change: `user_version`, `application_id`, the schema
@@ -689,6 +736,12 @@ const quoteIdentifier = (name: string): string => `"${name.replaceAll('"', '""')
  * value is tagged with its storage class and length-prefixed, so `'1'`, `1` and `1.0` differ and no
  * two rows can run together. Integers are read as BigInt; a JavaScript number would merge two
  * distinct values above 2^53.
+ *
+ * A row's identity is part of the row. `SELECT *` leaves a rowid table's hidden rowid out, and the
+ * application reads it — ingress hands it out as `arrivalSequence`, and outbox, tasks, artifacts
+ * and turn coordination break ties by it — so it is hashed first in every row of a rowid table.
+ * Where an `INTEGER PRIMARY KEY` already aliases it, the value appears twice, which costs nothing.
+ * A `WITHOUT ROWID` table has no hidden identity: its declared primary key is all of it.
  */
 const digestDatabaseContent = (raw: Database.Database): string => {
   const hash = createHash("sha256");
@@ -735,13 +788,17 @@ const digestDatabaseContent = (raw: Database.Database): string => {
     .all() as Array<{ name: string; wr: number }>;
   for (const table of tables) {
     field("T", Buffer.from(table.name, "utf8"));
-    const order =
-      table.wr === 0
-        ? "rowid"
-        : (raw.prepare("SELECT name FROM pragma_table_info(?) WHERE pk > 0 ORDER BY pk").pluck().all(table.name) as string[])
-            .map(quoteIdentifier)
-            .join(", ");
-    rows(`SELECT * FROM ${quoteIdentifier(table.name)} ORDER BY ${order}`);
+    if (table.wr === 0) {
+      const rowid = hiddenRowidName(raw, table.name);
+      rows(`SELECT ${rowid}, * FROM ${quoteIdentifier(table.name)} ORDER BY ${rowid}`);
+      continue;
+    }
+    const key = (
+      raw.prepare("SELECT name FROM pragma_table_info(?) WHERE pk > 0 ORDER BY pk").pluck().all(table.name) as string[]
+    )
+      .map(quoteIdentifier)
+      .join(", ");
+    rows(`SELECT * FROM ${quoteIdentifier(table.name)} ORDER BY ${key}`);
   }
   return `sha256:${hash.digest("hex")}`;
 };
@@ -799,6 +856,7 @@ const measureDatabaseAt = (databasePath: string): RollbackPairDatabaseHighWater 
         .pluck()
         .get() as number;
       return {
+        contentFormat: DATABASE_CONTENT_FORMAT,
         contentSha256: digestDatabaseContent(raw),
         userVersion: Number(raw.pragma("user_version", { simple: true })),
         auditEventId:
@@ -825,6 +883,11 @@ const measureDatabaseAt = (databasePath: string): RollbackPairDatabaseHighWater 
  * not malformed, but nothing about it can show the live database has not moved on, and assuming so
  * is the defect this exists to end. A marked pair with no live database at all is accepted: there is
  * no write to preserve, and that is the rebuilt-machine case a pair exists for.
+ *
+ * A mark recorded under another content definition — v1's carries no label — is refused the same
+ * way and for the same reason, before the live database is read: its digest and a live one cannot
+ * agree even when nothing has been written, so comparing them would report a write nobody made, and
+ * no comparison under this definition can show the live database is still at the seal (ACP1058-R2).
  */
 const assertLiveDatabaseAtSeal = (manifest: RollbackPairManifest, root: string): void => {
   const databasePath = manifest.identity.database.targetPath;
@@ -837,6 +900,21 @@ const assertLiveDatabaseAtSeal = (manifest: RollbackPairManifest, root: string):
       ReasonCode.ROLLBACK_PAIR_STALE_DATABASE,
       `this pair records no database high-water mark, so whether the live database has moved on since it was sealed cannot be known; ${remedy}`,
       { root, databasePath, sealedAt: manifest.createdAt },
+    );
+  }
+  if (sealed.contentFormat !== DATABASE_CONTENT_FORMAT) {
+    throw acpError(
+      ReasonCode.ROLLBACK_PAIR_STALE_DATABASE,
+      "this pair's database high-water mark was recorded under a different database content definition " +
+        `than the ${DATABASE_CONTENT_FORMAT} this build measures, so it cannot be compared with the live ` +
+        `database and whether the live database has moved on since it was sealed cannot be known; ${remedy}`,
+      {
+        root,
+        databasePath,
+        sealedAt: manifest.createdAt,
+        sealedContentFormat: sealed.contentFormat ?? "agent-control-plane.database-content/v1 (unlabelled)",
+        measuredContentFormat: DATABASE_CONTENT_FORMAT,
+      },
     );
   }
   const live = measureDatabaseAt(databasePath);
@@ -1080,6 +1158,10 @@ const isHighWater = (value: unknown): value is RollbackPairDatabaseHighWater => 
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as Partial<RollbackPairDatabaseHighWater>;
   return (
+    // Absent is a v1 mark and a label naming another definition is a mark this build cannot
+    // compare; both are refused at use. A label that is not a label at all is not a mark.
+    (candidate.contentFormat === undefined ||
+      (typeof candidate.contentFormat === "string" && candidate.contentFormat.length > 0)) &&
     typeof candidate.contentSha256 === "string" &&
     DIGEST.test(candidate.contentSha256) &&
     Number.isInteger(candidate.userVersion) &&
@@ -2202,6 +2284,8 @@ const USAGE = `rollback-pair — seal, validate and roll back one exact sealed p
     --expect-service-generation NAME --expect-node-version vX.Y.Z \\
     [--stage-parent DIR, required by rollback]
 
+  rollback-pair guards
+
 seal states every identity rather than probing for it, so the same command seals the generation
 being left and the one being moved to. It prints the pair id and SHA256(SHA256SUMS); retain both
 OUTSIDE the pair, because a pair cannot prove its own index.
@@ -2214,9 +2298,13 @@ anyone who can name it holds.
 
 validate and rollback both refuse with ROLLBACK_PAIR_STALE_DATABASE unless the live database still
 holds exactly what the pair's image holds, because restoring an older image discards every write
-made since. A pair sealed before seals recorded that mark is refused the same way. The remedy is always
-the same: stop the service, seal a fresh pair from the stopped current database and the target
-generation's runtime closure, and roll back with that pair.
+made since. A pair sealed before seals recorded that mark is refused the same way, and so is one whose
+mark was recorded under a different database content definition than this build measures. The remedy
+is always the same: stop the service, seal a fresh pair from the stopped current database and the
+target generation's runtime closure, and roll back with that pair.
+
+guards prints ACP_ROLLBACK_DATABASE_HIGH_WATER=<definition> and changes nothing. A coordinator built
+before the check prints no such line, so a caller holding one can refuse it before any rollback.
 `;
 
 const REQUIRED_SEAL_FLAGS = [
@@ -2282,6 +2370,13 @@ const collect = (argv: readonly string[], flags: readonly string[]): Map<string,
 
 const main = async (argv: readonly string[]): Promise<number> => {
   const command = argv[0];
+
+  if (command === "guards") {
+    // Asked before a rollback is handed to this coordinator, by a caller that may hold an older
+    // one (deploy/install-launchd.sh). Reads nothing and changes nothing.
+    process.stdout.write(`${DATABASE_HIGH_WATER_GUARD}=${DATABASE_CONTENT_FORMAT}\n`);
+    return 0;
+  }
 
   if (command === "seal") {
     const supplied = collect(argv, REQUIRED_SEAL_FLAGS);

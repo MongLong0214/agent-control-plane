@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   cpSync,
@@ -17,6 +17,8 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import Database from "better-sqlite3";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { Db } from "../../src/db/database.ts";
@@ -548,6 +550,8 @@ const sealPairFor = async (
   harness: InstallerHarness,
   appRoot: string,
   generation = "sealed-generation",
+  /** Shapes the sealed runtime closure before it is sealed, as a different generation's would be. */
+  prepareRuntime?: (runtimeRoot: string) => void,
 ): Promise<PairFixture> => {
   const state = join(harness.home, ".agent-control-plane");
   mkdirSync(state, { recursive: true, mode: 0o700 });
@@ -565,6 +569,7 @@ const sealPairFor = async (
   const runtimeRoot = join(source, "runtime");
   cpSync(join(root, "dist"), runtimeRoot, { recursive: true });
   writeFileSync(join(runtimeRoot, GENERATION_MARKER), `${generation}\n`, { mode: 0o600 });
+  prepareRuntime?.(runtimeRoot);
   // The interpreter travels inside the closure, so the rollback runs the sealed one rather than
   // whatever `node` this machine happens to have.
   mkdirSync(join(runtimeRoot, "bin"), { recursive: true, mode: 0o700 });
@@ -637,6 +642,87 @@ const structuralFlags = (fixture: PairFixture): string[] => [
   "--expect-node-version",
   fixture.pair.manifest.identity.runtime.nodeVersion,
 ];
+
+const rollbackArgs = (fixture: PairFixture): string[] => [
+  "--pair-id",
+  fixture.pair.pairId,
+  "--expected-index-digest",
+  fixture.pair.indexDigest,
+  ...structuralFlags(fixture),
+];
+
+/**
+ * Turns a copy of this build's runtime closure into one whose rollback coordinator predates the
+ * database high-water check (ACP1058-R1): the check returns at once, and the coordinator no longer
+ * declares it. Everything else is this build's, so it validates and applies the same pair format,
+ * which is what a deployment built before the check does with a pair that records a mark — it
+ * reads past the mark and restores the image. (Also measured outside the suite with an app root
+ * holding a real 115916ce build: the 5e6c1764 installer exited 0 and discarded the write made after
+ * the seal; this installer refused with ROLLBACK_PAIR_STALE_DATABASE and stopped nothing.)
+ *
+ * Anchored on the compiled text, and the anchor is required: a compiled shape this no longer
+ * matches fails here rather than quietly leaving the check in and letting every row below pass.
+ */
+const predateHighWaterCheck = (runtimeRoot: string): void => {
+  const coordinator = join(runtimeRoot, "deploy", "rollback-pair.js");
+  const source = readFileSync(coordinator, "utf8");
+  const anchor = "const assertLiveDatabaseAtSeal = (manifest, root) => {";
+  expect(source.split(anchor).length - 1, "the compiled high-water check moved; update this anchor").toBe(1);
+  writeFileSync(
+    coordinator,
+    source
+      .replace(anchor, `${anchor}\n    return;`)
+      .replaceAll("ACP_ROLLBACK_DATABASE_HIGH_WATER", "ACP_ROLLBACK_PREDATES_THE_CHECK"),
+  );
+};
+
+/** What `rollback-pair.js guards` says the coordinator under `appRoot` enforces. */
+const declaredGuards = (appRoot: string): string =>
+  boundedSpawnSync(process.execPath, [join(appRoot, "dist", "deploy", "rollback-pair.js"), "guards"], {
+    encoding: "utf8",
+  }).stdout;
+
+/** One committed write after a seal, the kind the daemon makes every minute it runs. */
+const writeAfterTheSeal = (databasePath: string): number => {
+  const raw = new Database(databasePath);
+  try {
+    raw
+      .prepare("INSERT INTO audit_events (at, kind, evidence_json) VALUES (?, ?, ?)")
+      .run(new Date().toISOString(), "written-after-the-seal", "{}");
+    return raw.prepare("SELECT max(event_id) FROM audit_events").pluck().get() as number;
+  } finally {
+    raw.close();
+  }
+};
+
+/**
+ * Read-write on purpose: a read-only open of a WAL database with no sidecars creates `-wal` and
+ * `-shm` beside it and leaves them, which the snapshot below would report as the refusal's doing.
+ */
+const maxAuditEventId = (databasePath: string): number | null => {
+  const raw = new Database(databasePath);
+  try {
+    return raw.prepare("SELECT max(event_id) FROM audit_events").pluck().get() as number | null;
+  } finally {
+    raw.close();
+  }
+};
+
+/** Every byte a refused rollback could have replaced, as one comparable value. */
+const deploymentSnapshot = (harness: InstallerHarness, appRoot: string, databasePath: string): string => {
+  const state = join(harness.home, ".agent-control-plane");
+  const digest = (path: string): string =>
+    existsSync(path) ? createHash("sha256").update(readFileSync(path)).digest("hex") : "<absent>";
+  return JSON.stringify({
+    database: digest(databasePath),
+    sidecars: readdirSync(state).filter((name) => name.startsWith("state.sqlite")).sort(),
+    generation: digest(join(appRoot, "dist", GENERATION_MARKER)),
+    coordinator: digest(join(appRoot, "dist", "deploy", "rollback-pair.js")),
+    plist: digest(plistPath(harness)),
+    launcher: digest(launcherPath(harness)),
+    stage: existsSync(join(state, "rollback-stage")) ? readdirSync(join(state, "rollback-stage")) : "<absent>",
+  });
+};
 
 /**
  * The repository tree as git sees it: tracked files plus untracked ones that are not ignored.
@@ -2314,6 +2400,96 @@ exec /bin/cp "$@"
     expect(launchctl, "a stopped service was started by the rollback").not.toContain("bootstrap");
     expect(launchctl).not.toContain("kickstart");
     expect(existsSync(harness.loaded)).toBe(false);
+  });
+
+  it("ACP1058-R1: refuses a stale pair even when the app root's own coordinator predates the check", async () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    // A deployment built before the check. Its coordinator validates and applies the pair below
+    // without asking whether the live database has moved since the seal.
+    predateHighWaterCheck(join(appRoot, "dist"));
+    expect(declaredGuards(appRoot)).not.toContain("ACP_ROLLBACK_DATABASE_HIGH_WATER");
+    expect(runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status).toBe(0);
+    const fixture = await sealPairFor(harness, appRoot);
+    writeFileSync(join(appRoot, "dist", GENERATION_MARKER), "generation-b\n", { mode: 0o600 });
+    const written = writeAfterTheSeal(fixture.databasePath);
+    const untouched = deploymentSnapshot(harness, appRoot, fixture.databasePath);
+    writeFileSync(harness.launchLog, "");
+
+    const result = runInstaller(
+      installer,
+      ["rollback", "--app-root", appRoot, "--node", harness.node, ...rollbackArgs(fixture)],
+      harness,
+    );
+
+    expect(result.status, "the rollback ran through the app root's own coordinator and rewound the database").not.toBe(0);
+    expect(result.stderr).toContain("ROLLBACK_PAIR_STALE_DATABASE");
+    expect(maxAuditEventId(fixture.databasePath), "the write made after the seal was discarded").toBe(written);
+    expect(deploymentSnapshot(harness, appRoot, fixture.databasePath), "a refused rollback changed something").toBe(
+      untouched,
+    );
+    expect(subcommands(harness.launchLog), "a refused rollback stopped the service").not.toContain("bootout");
+  });
+
+  it("ACP1058-R1: still refuses a stale pair on the next rollback, after one installed a closure that predates the check", async () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    const deploymentInstaller = join(appRoot, "deploy", "install-launchd.sh");
+    expect(runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status).toBe(0);
+
+    // The documented invocation — the installer inside the deployment, no --app-root — returning to
+    // a generation built before the check. The database has not moved since that pair was sealed.
+    const older = await sealPairFor(harness, appRoot, "generation-before-the-check", predateHighWaterCheck);
+    const first = runInstaller(deploymentInstaller, ["rollback", "--node", harness.node, ...rollbackArgs(older)], harness);
+    expect(first.status, first.stderr).toBe(0);
+    // The rollback replaced the runtime, its coordinator included: what is installed now is older.
+    expect(readFileSync(join(appRoot, "dist", GENERATION_MARKER), "utf8").trim()).toBe("generation-before-the-check");
+    expect(declaredGuards(appRoot)).not.toContain("ACP_ROLLBACK_DATABASE_HIGH_WATER");
+
+    // A pair sealed now, and then a write the next rollback must not discard.
+    const next = await sealPairFor(harness, appRoot, "generation-next");
+    const written = writeAfterTheSeal(next.databasePath);
+    const untouched = deploymentSnapshot(harness, appRoot, next.databasePath);
+
+    // From this checkout, naming the deployment: the check runs in this checkout's coordinator,
+    // not in the older one the deployment now carries.
+    writeFileSync(harness.launchLog, "");
+    const fromCheckout = runInstaller(
+      installer,
+      ["rollback", "--app-root", appRoot, "--node", harness.node, ...rollbackArgs(next)],
+      harness,
+    );
+    expect(fromCheckout.status, "the second rollback rewound the database through the older coordinator").not.toBe(0);
+    expect(fromCheckout.stderr).toContain("ROLLBACK_PAIR_STALE_DATABASE");
+    expect(maxAuditEventId(next.databasePath)).toBe(written);
+    expect(deploymentSnapshot(harness, appRoot, next.databasePath)).toBe(untouched);
+    expect(subcommands(harness.launchLog)).not.toContain("bootout");
+
+    // From the installer inside the deployment, whose own coordinator is now the older one: it
+    // cannot run the check, so the installer refuses to use it, before anything is stopped.
+    writeFileSync(harness.launchLog, "");
+    const fromDeployment = runInstaller(
+      deploymentInstaller,
+      ["rollback", "--node", harness.node, ...rollbackArgs(next)],
+      harness,
+    );
+    expect(fromDeployment.status, "the second rollback rewound the database through the older coordinator").not.toBe(0);
+    expect(fromDeployment.stderr).toMatch(/does not declare the database high-water check/);
+    expect(maxAuditEventId(next.databasePath)).toBe(written);
+    expect(deploymentSnapshot(harness, appRoot, next.databasePath)).toBe(untouched);
+    expect(subcommands(harness.launchLog)).not.toContain("bootout");
+
+    // The remedy both refusals name works over the older deployment: a pair sealed from the database
+    // as it is now, applied through this checkout, keeps the write.
+    const fresh = await sealPairFor(harness, appRoot, "generation-fresh");
+    const remedied = runInstaller(
+      installer,
+      ["rollback", "--app-root", appRoot, "--node", harness.node, ...rollbackArgs(fresh)],
+      harness,
+    );
+    expect(remedied.status, remedied.stderr).toBe(0);
+    expect(readFileSync(join(appRoot, "dist", GENERATION_MARKER), "utf8").trim()).toBe("generation-fresh");
+    expect(maxAuditEventId(fresh.databasePath)).toBe(written);
   });
 
   it("rejects a substring-only installer stub", () => {
