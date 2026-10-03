@@ -10,6 +10,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { SessionLifecycle } from "../domain/types.ts";
 import { HOLDER_CLAIMED_KIND_SQL } from "../outbox/outbox.ts";
+import { isBuzzKeyPossession, type BuzzKeyPossession } from "../buzz/buzz-bind-challenge.ts";
 import { isAdmittedRuntime, type AdmittedRuntime } from "./runtime-lineage.ts";
 
 export interface SessionRecord {
@@ -82,6 +83,15 @@ export interface BindBuzzActorInput {
 export interface AdmittedBindBuzzActorInput {
   admitted: AdmittedRuntime;
   buzzActorId: string;
+}
+
+/**
+ * The same binding, proven by the identity's own key: the runtime answered a challenge minted for
+ * its lineage admission with an event that key signed (`BuzzBindChallenges`). The proof names both
+ * the runtime and the identity; there is nothing beside it to disagree with either.
+ */
+export interface PossessedBindBuzzActorInput {
+  possession: BuzzKeyPossession;
 }
 
 /** The creation response is the only time a runtime receives its session secret. */
@@ -383,11 +393,17 @@ export class SessionRegistry {
    * from the process the row recorded. That proof is accepted here as issued and not re-derived,
    * and everything after it — the allowlist, the lifecycle, the one UPDATE below — is the same code
    * for both forms. There is one writer of this column, with two ways in.
+   *
+   * A third way in, for the adopted CEO, which holds neither the session secret nor a signer for the
+   * relay's HMAC: a possession proof. It carries the lineage admission and an identity whose key
+   * signed a challenge minted for that admission, and it is accepted only as the value
+   * `BuzzBindChallenges` minted after verifying that event (`isBuzzKeyPossession`).
    */
   bindBuzzActor(
-    input: BindBuzzActorInput | AdmittedBindBuzzActorInput,
+    input: BindBuzzActorInput | AdmittedBindBuzzActorInput | PossessedBindBuzzActorInput,
     authenticator: BuzzActorAuthenticator,
   ): Decision<SessionRecord> {
+    if ("possession" in input) return this.#bindPossessedBuzzActor(input.possession, authenticator);
     if ("admitted" in input) return this.#bindAdmittedBuzzActor(input, authenticator);
     const authenticated = this.verifySecret(input.sessionId, input.sessionSecret);
     if (!authenticated.allowed) return authenticated;
@@ -420,6 +436,50 @@ export class SessionRegistry {
       );
     if (actorId.length === 0) return unauthenticated();
     if (!authenticator.isAllowedActor("buzz", actorId)) return unauthenticated();
+    return this.#writeBuzzActor(sessionId, authenticated, actorId);
+  }
+
+  /**
+   * The possession form's proof and allowlist, then the refusals the admitted ingress gives before it
+   * writes — a terminal runtime, a different identity already held, a key any other row carries —
+   * and the same write. The identity the session already holds is answered as bound, unwritten.
+   */
+  #bindPossessedBuzzActor(
+    possession: BuzzKeyPossession,
+    authenticator: BuzzActorAuthenticator,
+  ): Decision<SessionRecord> {
+    if (!isBuzzKeyPossession(possession)) {
+      return deny(ReasonCode.CONFLICT, "the identity proof was not issued by a verified Buzz binding event", {});
+    }
+    const sessionId = possession.runtime.sessionId;
+    const authenticated = this.#admittedSession(possession.runtime);
+    if (!authenticated.allowed) return authenticated;
+    const actorId = possession.buzzActorId;
+    if (!authenticator.isAllowedActor("buzz", actorId)) {
+      return deny(
+        ReasonCode.SESSION_BUZZ_ACTOR_NOT_AUTHENTICATED,
+        "buzz channel identity is not authenticated by the deployment's ingress policy",
+        { sessionId, buzzActorId: actorId },
+      );
+    }
+    const lifecycle = authenticated.value.lifecycle;
+    if (lifecycle === SessionLifecycle.STOPPED || lifecycle === SessionLifecycle.ERROR) {
+      return deny(ReasonCode.SESSION_NOT_READY, "a terminal session cannot acquire an actor identity", {
+        sessionId,
+        lifecycle,
+      });
+    }
+    if (authenticated.value.buzzActorId === actorId) return authenticated;
+    if (authenticated.value.buzzActorId !== null) {
+      return deny(ReasonCode.SESSION_BUZZ_ACTOR_IMMUTABLE, "session already speaks as a different buzz channel identity", {
+        sessionId,
+      });
+    }
+    if (this.otherSessionCarrying(actorId, sessionId) !== null) {
+      return deny(ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND, "another session row already carries this identity", {
+        sessionId,
+      });
+    }
     return this.#writeBuzzActor(sessionId, authenticated, actorId);
   }
 
