@@ -1180,6 +1180,38 @@ export const canonicalBuzzChannelFor = (
   canonicalBuzzChannelId: string,
 ): string => entry.buzzAddress ?? canonicalBuzzChannelId;
 
+/**
+ * The rooms the daemon's mention subscriber listens in as one Buzz channel identity, or `null` when
+ * it does not listen as that identity at all: no subscriber configured, none started yet, or no
+ * configured identity derives that key. `null` checks nothing, because an identity nobody listens
+ * as has no room to be deaf in.
+ */
+export type SubscribedBuzzRooms = (buzzActorId: string) => readonly string[] | null;
+
+/**
+ * Why routing `entry` to `room` would leave its CTO deaf, or `null` when it would not.
+ *
+ * The claim and the reattach's correction each write one room into an adopted session's
+ * `buzz_address`, and the peer rule then admits that CTO's CEO mentions from that room only. The
+ * subscriber is configured on its own (`buzz-nostr-subscriber.json`) and asks the relay only for
+ * the rooms each identity names (`#h`), so a room written here that the CTO's identity does not
+ * name is a room whose mentions are never delivered: no refusal, no counter, nothing. One rule for
+ * startup, the claim and the correction, so the three cannot disagree. Names the project and both
+ * rooms; never the session, the actor or anything read from a key.
+ */
+export const unsubscribedRoomRefusal = (
+  entry: CanonicalAdoptableSession,
+  room: string,
+  subscribedRooms: SubscribedBuzzRooms,
+): string | null => {
+  const rooms = subscribedRooms(entry.buzzActorId);
+  if (rooms === null || rooms.includes(room)) return null;
+  return (
+    `the canonical CTO for project ${entry.projectId} is routed to Buzz room ${room}, but its mention ` +
+    `subscriber identity listens only in ${rooms.join(", ")}; it would answer in one room and listen in another`
+  );
+};
+
 /** A deployment adopting more entries than this has stopped being a local deployment. */
 export const MAX_CANONICAL_ADOPTABLE_SESSIONS = 32;
 
@@ -1374,6 +1406,12 @@ export interface CanonicalSelfClaimDeps {
    * returning `null`, which a failed `ps` produces just as readily as a dead process.
    */
   processSignal?: (pid: number) => void;
+  /**
+   * The running mention subscriber's rooms per identity. Absent, no room is checked against it,
+   * which is a deployment without a subscriber. Present, a claim whose room the claiming entry's
+   * identity does not listen in is refused before the room is opened (`unsubscribedRoomRefusal`).
+   */
+  subscribedBuzzRooms?: SubscribedBuzzRooms;
 }
 
 /** Read-only evidence only: no owner authority, session creation or binding writes.
@@ -1699,6 +1737,7 @@ export class CanonicalSelfClaim {
   readonly #hostSessionRegistryReader: HostSessionRegistryReader;
   readonly #maxAncestryHops: number;
   readonly #canonicalBuzzChannelId: string;
+  readonly #subscribedBuzzRooms: SubscribedBuzzRooms | null;
   readonly #canonicalSessions: readonly CanonicalAdoptableSession[];
 
   constructor(
@@ -1746,6 +1785,7 @@ export class CanonicalSelfClaim {
     this.#hostSessionRegistryReader = deps.hostSessionRegistryReader ?? makeDefaultHostSessionRegistryReader();
     this.#maxAncestryHops = deps.maxAncestryHops ?? MAX_ANCESTRY_HOPS;
     this.#canonicalBuzzChannelId = config.canonicalBuzzChannelId;
+    this.#subscribedBuzzRooms = deps.subscribedBuzzRooms ?? null;
     // Frozen at construction, like every other deployment fact here: a later mutation of the array
     // the composition root passed must not change which sessions this instance will adopt.
     this.#canonicalSessions = validatedSessions.map((entry) => Object.freeze({ ...entry }));
@@ -1874,10 +1914,14 @@ export class CanonicalSelfClaim {
     // is written in the same transaction as everything else even though resolving it could not
     // run inside that transaction. The room is the entry's, never the request's: the entitlement
     // resolved above is what names it.
-    const buzzAddress = await this.resolveBuzzAddress(
-      request.buzzPurpose,
-      canonicalBuzzChannelFor(entry, this.#canonicalBuzzChannelId),
-    );
+    const room = canonicalBuzzChannelFor(entry, this.#canonicalBuzzChannelId);
+    // Before the room is opened and before anything is written: a row routed to a room this CTO's
+    // subscriber identity does not listen in would take the role and then never hear a mention.
+    if (this.#subscribedBuzzRooms !== null) {
+      const deaf = unsubscribedRoomRefusal(entry, room, this.#subscribedBuzzRooms);
+      if (deaf !== null) return deny(ReasonCode.CONFLICT, deaf, {});
+    }
+    const buzzAddress = await this.resolveBuzzAddress(request.buzzPurpose, room);
     if (!buzzAddress.allowed) return buzzAddress as Decision<CanonicalSelfClaimReceipt>;
     // Clause 2 — pid/startedAt re-verified again here. This `await` is the real TOCTOU window:
     // control left this process entirely (a shelled Buzz CLI transport), for however long that

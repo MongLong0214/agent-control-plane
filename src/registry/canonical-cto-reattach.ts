@@ -15,9 +15,11 @@ import {
   deriveClaimantIdentity,
   makeDefaultHostSessionRegistryReader,
   SELF_CLAIM_EXECUTOR_KIND,
+  unsubscribedRoomRefusal,
   type CanonicalAdoptableSession,
   type HostSessionRegistryReader,
   type ProcessAncestryInspector,
+  type SubscribedBuzzRooms,
 } from "./canonical-self-claim.ts";
 
 /**
@@ -83,6 +85,12 @@ export interface CanonicalCtoBuzzAddressOptions {
   canonicalSessions: readonly CanonicalAdoptableSession[];
   resolveBuzzAddress: (purpose: string, channelId: string) => Promise<Decision<string>>;
   buzzPurpose: string;
+  /**
+   * The running mention subscriber's rooms per identity, the same view the claim is given. A room
+   * the holder's identity does not listen in is refused before the room is opened and before the
+   * row moves. Absent, nothing is checked against it.
+   */
+  subscribedBuzzRooms?: SubscribedBuzzRooms;
 }
 
 export interface CanonicalCtoReattachOptions {
@@ -219,6 +227,12 @@ export const createCanonicalCtoReattach = (
     if (room === undefined) return allow(ReasonCode.OK, { outcome: "NOT_CONFIGURED", sessionId: held.sessionId });
     if (entry.projectId !== held.projectId) {
       return deny(ReasonCode.CONFLICT, "this conversation's configured entry names another project than its binding", {});
+    }
+    // Before the no-op as well as before the write: a row already in a room its subscriber identity
+    // does not listen in is the same deafness, and answering ALREADY_CORRECT would call it fine.
+    if (correction.subscribedBuzzRooms !== undefined) {
+      const deaf = unsubscribedRoomRefusal(entry, room, correction.subscribedBuzzRooms);
+      if (deaf !== null) return deny(ReasonCode.CONFLICT, deaf, {});
     }
     if (cp.sessions.get(held.sessionId)?.buzzAddress === room) {
       return allow(ReasonCode.OK, { outcome: "ALREADY_CORRECT", sessionId: held.sessionId });

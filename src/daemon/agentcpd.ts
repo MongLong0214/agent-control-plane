@@ -43,7 +43,10 @@ import { createHermesGatewayIdentityReader } from "../runtime/hermes-gateway-ide
 import { createHermesGatewayConversationSender } from "../runtime/hermes-gateway-conversation.ts";
 import {
   assertCanonicalSessionsValid,
+  canonicalBuzzChannelFor,
+  unsubscribedRoomRefusal,
   type CanonicalAdoptableSession,
+  type SubscribedBuzzRooms,
 } from "../registry/canonical-self-claim.ts";
 import { readProcessStartToken } from "../core/process-argv.ts";
 import { processStartedAt } from "../core/process-identity.ts";
@@ -60,6 +63,7 @@ import {
   type BuzzMentionSubscriberHandle,
   type BuzzMentionVerdict,
   type BuzzRelaySocketFactory,
+  type BuzzSubscriberIdentityRooms,
   type BuzzSubscriberScheduler,
 } from "../buzz/buzz-mention-subscriber.ts";
 import type { OwnerIdentity } from "../ceo/owner-authority.ts";
@@ -1548,6 +1552,42 @@ export const assertBuzzChannelMatchesSubscriberRooms = (
       `configured rooms (${subscriberRooms.join(", ")}); the daemon would answer in one room and ` +
       "listen in another",
   );
+};
+
+/** The subscriber's per-identity rooms as the lookup `unsubscribedRoomRefusal` asks. */
+export const subscribedBuzzRoomsFrom = (identityRooms: readonly BuzzSubscriberIdentityRooms[]): SubscribedBuzzRooms =>
+  (buzzActorId) => identityRooms.find((identity) => identity.actorId === buzzActorId)?.rooms ?? null;
+
+/**
+ * Every adopted session's room, cross-checked against the rooms its own subscriber identity
+ * listens in.
+ *
+ * `assertBuzzChannelMatchesSubscriberRooms` above compares one room with the union of all of them,
+ * which was the whole question while every canonical CTO was written into `ACP_BUZZ_CHANNEL`. An
+ * entry may now name its own room (`buzzAddress`), and the claim and the reattach's correction write
+ * that room into the CTO's row, where the peer rule admits its CEO's mentions from that room only.
+ * The subscriber asks the relay for each identity's own rooms, so an entry routed to room B whose
+ * identity listens in A alone passes the union check and then never hears a mention in B.
+ *
+ * Per entry, its effective room (its `buzzAddress`, else `ACP_BUZZ_CHANNEL`) must be among the rooms
+ * of the identity that listens as its `buzzActorId`. An entry no identity listens as is not checked,
+ * and neither is anything when no subscriber runs: there is nothing to be deaf in either case. The
+ * refusal names the project and both rooms, never the session, the actor or a key.
+ *
+ * Refused, not repaired: the subscription keeps the rooms its own file declares instead of following
+ * the entry's room, as `ACP_BUZZ_CHANNEL` above is refused rather than added. It reads configuration
+ * only, never a session's `buzz_address`, so a row left in a room no entry names any more is not
+ * found here.
+ */
+export const assertCanonicalRoomsAreSubscribed = (
+  canonicalSessions: readonly CanonicalAdoptableSession[],
+  canonicalBuzzChannelId: string,
+  subscribedRooms: SubscribedBuzzRooms,
+): void => {
+  for (const entry of canonicalSessions) {
+    const deaf = unsubscribedRoomRefusal(entry, canonicalBuzzChannelFor(entry, canonicalBuzzChannelId), subscribedRooms);
+    if (deaf !== null) throw new Error(`ACP_CANONICAL_SESSIONS_JSON does not match the Buzz mention subscriber: ${deaf}`);
+  }
 };
 
 /**
@@ -3868,6 +3908,13 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   let buzzActorIngress: LocalBuzzActorIngress | null = null;
   let buzzMessageIngress: LocalBuzzMessageIngress | null = null;
   let buzzMentionSubscriber: BuzzMentionSubscriberHandle | null = null;
+  // Read when asked, not captured: the claim and the reattach are composed before the subscriber
+  // starts, and until it does (or where none runs) this answers `null` and checks nothing. Once it
+  // is up, `assertCanonicalRoomsAreSubscribed` applies the same rule to every entry and refuses the
+  // whole start, so a claim or correction that ran before then under a mismatched configuration
+  // leaves a daemon that does not start rather than one that runs deaf.
+  const subscribedBuzzRooms: SubscribedBuzzRooms = (buzzActorId) =>
+    subscribedBuzzRoomsFrom(buzzMentionSubscriber?.identityRooms ?? [])(buzzActorId);
   let operator: LocalOperatorListener | null = null;
   let canonicalSelfClaim: CanonicalSelfClaimListener | null = null;
   let adoptedCeoTools: CanonicalSelfClaimListener | null = null;
@@ -4020,6 +4067,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
             peerProtocolVersion: canonicalActivationValues["ACP_CANONICAL_CTO_PEER_PROTOCOL"],
             buzzPurpose: canonicalActivationValues["ACP_CANONICAL_CTO_BUZZ_PURPOSE"],
           },
+          subscribedBuzzRooms,
         });
       });
       process.stdout.write("canonical self-claim listener started\n");
@@ -4034,6 +4082,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
           canonicalSessions,
           resolveBuzzAddress: resolveCanonicalSelfClaimBuzzAddress,
           buzzPurpose: canonicalActivationValues["ACP_CANONICAL_CTO_BUZZ_PURPOSE"],
+          subscribedBuzzRooms,
         },
       });
       await listeners.openCanonicalCtoReattach(canonicalCtoReattach, daemon);
@@ -4131,6 +4180,11 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
           process.env["ACP_BUZZ_CHANNEL"]?.trim(),
           buzzMentionSubscriber?.rooms ?? [],
         );
+        // And per adopted CTO, against its own identity's rooms rather than the union: an entry may
+        // name a room of its own, and the union cannot say which identity hears it.
+        if (canonicalSessions !== null) {
+          assertCanonicalRoomsAreSubscribed(canonicalSessions, canonicalBuzzChannelId, subscribedBuzzRooms);
+        }
       }
     }
     if (telegramConfig) {

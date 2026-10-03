@@ -8,6 +8,7 @@ import {
   type CanonicalSelfClaimConfig,
   type CanonicalSelfClaimDeps,
   type CanonicalSelfClaimReceipt,
+  type SubscribedBuzzRooms,
 } from "../registry/canonical-self-claim.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { BuzzActorAuthenticator, SessionRegistry } from "../session/session-registry.ts";
@@ -72,6 +73,12 @@ export interface CanonicalSelfClaimOperatorDeps {
    * leaving the rest real.
    */
   claimDeps?: CanonicalSelfClaimDeps;
+  /**
+   * The running mention subscriber's rooms per identity, which production does set: a claim whose
+   * room its entry's identity does not listen in is refused before the room is opened. Absent, as
+   * in a deployment with no subscriber, nothing is checked against it.
+   */
+  subscribedBuzzRooms?: SubscribedBuzzRooms;
 }
 
 export interface CanonicalSelfClaimOperatorRequest {
@@ -131,7 +138,10 @@ export const executeCanonicalSelfClaimOperator = async (
     deps.buzzActorAuthenticator,
     deps.resolveBuzzAddress,
     deps.config,
-    deps.claimDeps ?? {},
+    {
+      ...(deps.claimDeps ?? {}),
+      ...(deps.subscribedBuzzRooms === undefined ? {} : { subscribedBuzzRooms: deps.subscribedBuzzRooms }),
+    },
   );
   return claim.claim({
     callerPid: peer.peerPid,

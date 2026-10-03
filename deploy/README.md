@@ -62,6 +62,11 @@ A CTO already bound with another room does not have to restart: when its relay n
 moves that one session row's `buzz_address` to it with one `CANONICAL_CTO_BUZZ_ADDRESS_CORRECTED`
 audit row. The binding, its generation and the session are unchanged. Peer messages already queued
 for that CTO under the old room are withheld after the move, as for any change of its room.
+When `buzz-nostr-subscriber.json` configures an identity for an entry's `buzzActorId`, that
+identity's `rooms` must include the entry's room (its `buzzAddress`, else `ACP_BUZZ_CHANNEL`):
+startup refuses otherwise, naming the project and both rooms, and the claim and the correction
+refuse to write such a room. Set the entry's `buzzAddress`, add the room to that identity's
+`rooms`, then restart the daemon.
 Every entry's `projectId` must already be registered: an entry naming a project this deployment
 holds no record of refuses startup rather than being dropped, so a configured session cannot come
 up entitled to a project that does not exist. Registration is all that is required here — whether

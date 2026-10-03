@@ -2,13 +2,17 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import { type Decision, allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { configuredCanonicalSessions } from "../../src/daemon/agentcpd.ts";
+import {
+  assertCanonicalRoomsAreSubscribed,
+  configuredCanonicalSessions,
+  subscribedBuzzRoomsFrom,
+} from "../../src/daemon/agentcpd.ts";
 import {
   CANONICAL_CTO_BUZZ_ADDRESS_CORRECTED,
   createCanonicalCtoReattach,
   type CanonicalCtoBuzzAddressOptions,
 } from "../../src/registry/canonical-cto-reattach.ts";
-import type { CanonicalAdoptableSession } from "../../src/registry/canonical-self-claim.ts";
+import type { CanonicalAdoptableSession, SubscribedBuzzRooms } from "../../src/registry/canonical-self-claim.ts";
 import { snapshot } from "../helpers/adopted-ceo.ts";
 import {
   canonicalCtoFixture,
@@ -110,6 +114,10 @@ const misaddressedHolder = (sessions: readonly CanonicalAdoptableSession[] = [en
   return { subject, resolver, reattach: subject.reattach(options()), options };
 };
 
+/** The subscriber listening as the fixture's actor in exactly `rooms`, and as nobody else. */
+const listeningIn = (rooms: readonly string[]): SubscribedBuzzRooms =>
+  (buzzActorId) => (buzzActorId === ACTOR ? rooms : null);
+
 const roomOf = (subject: CanonicalCtoFixture): string | null =>
   subject.h.cp.sessions.get(subject.sessionId)?.buzzAddress ?? null;
 
@@ -168,6 +176,18 @@ describe("the same live holder's reattach corrects its own row's room", () => {
     expect(resolver.asked).toEqual([ROOM]);
     expect(correctionRows(subject)).toHaveLength(1);
     expect(snapshot(subject.h)).toEqual(corrected);
+  });
+
+  it("corrects the row when its subscriber identity listens in the entry's room, or does not listen as it at all", async () => {
+    const listeningAsNobody: SubscribedBuzzRooms = () => null;
+    for (const subscribedBuzzRooms of [listeningIn([WRONG_ROOM, ROOM]), listeningAsNobody]) {
+      const { subject, options } = misaddressedHolder();
+      const reattach = subject.reattach(options({ subscribedBuzzRooms }));
+      expect(await reattach.correctBuzzAddress({ peerPid: RELAY, uid: 501 })).toMatchObject({
+        allowed: true, value: { outcome: "CORRECTED" },
+      });
+      expect(roomOf(subject)).toBe(ROOM);
+    }
   });
 
   it("writes once when two reattaches race to correct the same row", async () => {
@@ -259,6 +279,24 @@ describe("nobody but that holder can move the row, and a refusal writes nothing"
     });
   });
 
+  it("refuses to move the row into a room its subscriber identity does not listen in, before opening it", async () => {
+    // PR1060-R2-01. The holder's identity listens in WRONG_ROOM alone, so moving its row to ROOM
+    // would leave it answering CEO mentions only from a room it never hears.
+    const { subject, resolver, options } = misaddressedHolder();
+    const deafened = subject.reattach(options({ subscribedBuzzRooms: listeningIn([WRONG_ROOM]) }));
+    const refused = await deafened.correctBuzzAddress({ peerPid: RELAY, uid: 501 });
+    expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+    if (refused.allowed) return;
+    expect(refused.message).toContain(`project ${PROJECT}`);
+    expect(refused.message).toContain(`Buzz room ${ROOM}`);
+    expect(refused.message).toContain(`listens only in ${WRONG_ROOM}`);
+    expect(refused.message).not.toContain(ACTOR);
+    await expectUntouched(subject, () => deafened.correctBuzzAddress({ peerPid: RELAY, uid: 501 }), {
+      allowed: false, reasonCode: ReasonCode.CONFLICT,
+    });
+    expect(resolver.asked).toEqual([]);
+  });
+
   it("leaves a row alone when its entry names no room, or the conversation has no entry", async () => {
     const withoutRoom = misaddressedHolder([{ sessionUuid: CONVERSATION, projectId: PROJECT, buzzActorId: ACTOR }]);
     await expectUntouched(withoutRoom.subject, () => withoutRoom.reattach.correctBuzzAddress({ peerPid: RELAY, uid: 501 }), {
@@ -294,5 +332,61 @@ describe("nobody but that holder can move the row, and a refusal writes nothing"
         buzzPurpose: "continuity:PRIMARY_CTO",
       },
     })).toThrow(/buzzAddress/);
+  });
+});
+
+describe("startup refuses an adopted CTO routed to a room its own subscriber identity does not listen in", () => {
+  // PR1060-R2-01: the startup cross-check compared ACP_BUZZ_CHANNEL with the union of every
+  // identity's rooms, so an entry routed to ROOM whose identity listens in the default room alone
+  // started cleanly and then never heard a mention in ROOM.
+  const DEFAULT_ROOM = WRONG_ROOM;
+  const OTHER_ACTOR = "buzz:fixture-other-cto";
+  const OTHER_ROOM = "9a1f0c3e-0000-4000-8000-000000000003";
+
+  it("refuses an entry whose own room its identity does not listen in, naming the project and both rooms", () => {
+    const check = () => assertCanonicalRoomsAreSubscribed(
+      [entry()],
+      DEFAULT_ROOM,
+      subscribedBuzzRoomsFrom([{ actorId: ACTOR, rooms: [DEFAULT_ROOM] }]),
+    );
+    expect(check).toThrow(
+      `ACP_CANONICAL_SESSIONS_JSON does not match the Buzz mention subscriber: the canonical CTO for project ${PROJECT} ` +
+        `is routed to Buzz room ${ROOM}, but its mention subscriber identity listens only in ${DEFAULT_ROOM}; ` +
+        "it would answer in one room and listen in another",
+    );
+  });
+
+  it("checks each entry against its own identity, not the union of every identity's rooms", () => {
+    // ROOM is in the union (OTHER_ACTOR listens there), which is what let this start before.
+    expect(() => assertCanonicalRoomsAreSubscribed(
+      [entry(), { sessionUuid: OTHER_CONVERSATION, projectId: "prj_other", buzzActorId: OTHER_ACTOR, buzzAddress: OTHER_ROOM }],
+      DEFAULT_ROOM,
+      subscribedBuzzRoomsFrom([
+        { actorId: ACTOR, rooms: [DEFAULT_ROOM] },
+        { actorId: OTHER_ACTOR, rooms: [OTHER_ROOM, ROOM] },
+      ]),
+    )).toThrow(`project ${PROJECT} is routed to Buzz room ${ROOM}`);
+  });
+
+  it("checks an entry without a room of its own against the deployment's room", () => {
+    const withoutRoom = { sessionUuid: CONVERSATION, projectId: PROJECT, buzzActorId: ACTOR };
+    expect(() => assertCanonicalRoomsAreSubscribed(
+      [withoutRoom], DEFAULT_ROOM, subscribedBuzzRoomsFrom([{ actorId: ACTOR, rooms: [ROOM] }]),
+    )).toThrow(`is routed to Buzz room ${DEFAULT_ROOM}, but its mention subscriber identity listens only in ${ROOM}`);
+    expect(() => assertCanonicalRoomsAreSubscribed(
+      [withoutRoom], DEFAULT_ROOM, subscribedBuzzRoomsFrom([{ actorId: ACTOR, rooms: [DEFAULT_ROOM] }]),
+    )).not.toThrow();
+  });
+
+  it("starts when every subscribed entry's room is its identity's, and checks nothing no identity listens as", () => {
+    expect(() => assertCanonicalRoomsAreSubscribed(
+      [entry()], DEFAULT_ROOM, subscribedBuzzRoomsFrom([{ actorId: ACTOR, rooms: [DEFAULT_ROOM, ROOM] }]),
+    )).not.toThrow();
+    // No subscriber configured: nothing listens, so nothing can be deaf.
+    expect(() => assertCanonicalRoomsAreSubscribed([entry()], DEFAULT_ROOM, subscribedBuzzRoomsFrom([]))).not.toThrow();
+    // A subscriber that listens as someone else entirely.
+    expect(() => assertCanonicalRoomsAreSubscribed(
+      [entry()], DEFAULT_ROOM, subscribedBuzzRoomsFrom([{ actorId: OTHER_ACTOR, rooms: [DEFAULT_ROOM] }]),
+    )).not.toThrow();
   });
 });

@@ -1453,9 +1453,23 @@ export interface BuzzMentionSubscriberHandle {
    * this module reads no environment variable itself, so that check belongs to the caller.
    */
   readonly rooms: readonly string[];
+  /**
+   * Each configured identity's channel identity (the public key its file derives) and the rooms
+   * its own `REQ` is scoped to, in config order. `rooms` above is their union, and a union cannot
+   * say which identity hears which room: a caller that routes one identity's mentions to a room of
+   * its choosing (a canonical CTO's `buzzAddress`) has to find that room in that identity's list.
+   */
+  readonly identityRooms: readonly BuzzSubscriberIdentityRooms[];
   /** Settles once every frame delivered so far has been handled. For tests; production ignores it. */
   settled(): Promise<void>;
   close(): void;
+}
+
+/** One subscribed identity: who it listens as, and the rooms it listens in. */
+export interface BuzzSubscriberIdentityRooms {
+  /** The identity's public key, the value a session's `buzzActorId` is bound to. Not a secret. */
+  readonly actorId: string;
+  readonly rooms: readonly string[];
 }
 
 /** The disabled outcome, stated rather than implied by a null. */
@@ -1465,6 +1479,7 @@ const DISABLED: BuzzMentionSubscriberHandle = {
   relayUrl: null,
   roleKeys: [],
   rooms: [],
+  identityRooms: [],
   settled: () => Promise.resolve(),
   close: () => {
     /* nothing was opened */
@@ -1515,6 +1530,7 @@ export const startBuzzMentionSubscriber = (
   const prepared: BuzzMentionSubscription[] = [];
   const roleKeys: string[] = [];
   const rooms = new Set<string>();
+  const identityRooms: BuzzSubscriberIdentityRooms[] = [];
 
   options.config.identities.forEach((identity, index) => {
     const what = `identities[${index}]`;
@@ -1550,6 +1566,7 @@ export const startBuzzMentionSubscriber = (
 
     roleKeys.push(bound.roleKey);
     for (const room of identity.rooms) rooms.add(room);
+    identityRooms.push(Object.freeze({ actorId: material.pubkey, rooms: Object.freeze([...identity.rooms]) }));
     prepared.push(
       new BuzzMentionSubscription(deps, {
         pubkey: material.pubkey,
@@ -1605,6 +1622,7 @@ export const startBuzzMentionSubscriber = (
     relayUrl: options.config.relayUrl,
     roleKeys,
     rooms: [...rooms],
+    identityRooms,
     settled: async () => {
       for (const subscription of prepared) await subscription.settled();
     },
