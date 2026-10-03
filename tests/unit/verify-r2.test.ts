@@ -1,6 +1,6 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -8,6 +8,7 @@ import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { fixtureManifest, makeHarness } from "../helpers/harness.ts";
 import { applyPassingChange } from "../helpers/harness.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
+import { stableFixtureExecutable } from "../helpers/stable-fixture-executable.ts";
 import { assertPortableManifest, manifestDigest } from "../../src/contracts/manifest.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -463,27 +464,31 @@ time.sleep(30)
 
   sandboxIt("#164 returns the child-cleanup failure when reaping cannot be proved", async () => {
     const repo = makeRepo();
-    const shimDirectory = tempDir("acp-ps-shim-");
-    const shim = join(shimDirectory, "ps");
-    const observed = join(shimDirectory, "group-reap-observed");
-    writeFileSync(
-      shim,
-      `#!/bin/sh
+    // `observed` is a fresh per-run marker *file*, not an executable — fine to live in a fresh
+    // tempDir. The shim script itself must stay byte-constant across runs, so the marker path
+    // travels through an env var the script reads rather than being interpolated into it.
+    const observed = join(tempDir("acp-ps-observed-"), "group-reap-observed");
+    const shimDirectory = dirname(
+      stableFixtureExecutable(
+        "ps",
+        `#!/bin/sh
 if [ "$1" = "-o" ] && [ "$2" = "pid=" ] && [ "$3" = "-g" ]; then
-  : > ${JSON.stringify(observed)}
+  : > "$ACP_PS_SHIM_GROUP_REAP_OBSERVED"
   printf '99999\\n'
   exit 0
 fi
 exec /bin/ps "$@"
 `,
+      ),
     );
-    chmodSync(shim, 0o700);
 
     const previousPath = process.env.PATH;
+    const previousObserved = process.env["ACP_PS_SHIM_GROUP_REAP_OBSERVED"];
     try {
       // The process cap deliberately prevents a real escaped child. This makes only the
       // post-run proof unavailable, so the assertion exercises the fail-closed evidence gate.
       process.env.PATH = `${shimDirectory}:${previousPath ?? ""}`;
+      process.env["ACP_PS_SHIM_GROUP_REAP_OBSERVED"] = observed;
       const outcome = await runSandboxed({
         command: parseVerificationCommand({ id: "unreaped", argv: ["node", "-e", "process.exit(0)"] }),
         worktreePath: repo,
@@ -500,6 +505,8 @@ exec /bin/ps "$@"
     } finally {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
+      if (previousObserved === undefined) delete process.env["ACP_PS_SHIM_GROUP_REAP_OBSERVED"];
+      else process.env["ACP_PS_SHIM_GROUP_REAP_OBSERVED"] = previousObserved;
     }
   });
 

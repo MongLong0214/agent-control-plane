@@ -1,6 +1,6 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -18,6 +18,7 @@ import { WorktreeAction, WriteOperation, type ManagedWriteGuard } from "../../sr
 import type { WorktreeAuthorization } from "../../src/verify/worktree.ts";
 import { fixtureManifest, makeHarness, TEST_OWNER } from "../helpers/harness.ts";
 import { cleanupTempDirs, gitSync, makeRepo, tempDir } from "../helpers/fixtures.ts";
+import { stableFixtureExecutable } from "../helpers/stable-fixture-executable.ts";
 
 afterEach(cleanupTempDirs);
 
@@ -189,10 +190,10 @@ const concurrentProjectCandidates = async () => {
 };
 
 const withPsShim = async <T>(script: string, fn: () => Promise<T>): Promise<T> => {
-  const shimDirectory = tempDir("acp-ps-shim-");
-  const shim = join(shimDirectory, "ps");
-  writeFileSync(shim, script);
-  chmodSync(shim, 0o700);
+  // Stable, content-hashed path rather than a fresh tempDir + fresh inode per run: syspolicyd's
+  // provenance table records one row per new executable inode exec'd and cannot be pruned. See
+  // tests/helpers/stable-fixture-executable.ts.
+  const shimDirectory = dirname(stableFixtureExecutable("ps", script));
 
   const previousPath = process.env.PATH;
   process.env.PATH = `${shimDirectory}:${previousPath ?? ""}`;
@@ -593,31 +594,41 @@ describe("verification hardening findings", () => {
   sandboxIt("#367 treats recorded RSS as sufficient when the leader identity races away", async () => {
     const repository = makeRepo();
     const failLeaderIdentityOnce = join(tempDir("acp-ps-lstart-once-"), "failed");
-    const outcome = await withPsShim(
-      `#!/bin/sh
-if [ "$1" = "-o" ] && [ "$2" = "lstart=" ] && [ ! -e ${JSON.stringify(failLeaderIdentityOnce)} ]; then
-  : > ${JSON.stringify(failLeaderIdentityOnce)}
+    // The sentinel path is a fresh per-run marker *file* (not an executable), so it is fine for
+    // it to live in a fresh tempDir — only the script text must stay constant, which is why the
+    // path travels through an env var rather than being interpolated into the shim script.
+    const previousSentinel = process.env["ACP_PS_SHIM_LSTART_ONCE_SENTINEL"];
+    process.env["ACP_PS_SHIM_LSTART_ONCE_SENTINEL"] = failLeaderIdentityOnce;
+    try {
+      const outcome = await withPsShim(
+        `#!/bin/sh
+if [ "$1" = "-o" ] && [ "$2" = "lstart=" ] && [ ! -e "$ACP_PS_SHIM_LSTART_ONCE_SENTINEL" ]; then
+  : > "$ACP_PS_SHIM_LSTART_ONCE_SENTINEL"
   exit 1
 fi
 exec /bin/ps "$@"
 `,
-      () => runSandboxed({
-        command: parseVerificationCommand({
-          id: "identity-race",
-          // Under a parallel full-suite run, leave enough time for the RSS sampler to
-          // observe the group after the deliberately failed lstart probe.
-          argv: ["node", "-e", "setTimeout(() => process.exit(0), 1500)"],
-          timeoutSeconds: 5,
+        () => runSandboxed({
+          command: parseVerificationCommand({
+            id: "identity-race",
+            // Under a parallel full-suite run, leave enough time for the RSS sampler to
+            // observe the group after the deliberately failed lstart probe.
+            argv: ["node", "-e", "setTimeout(() => process.exit(0), 1500)"],
+            timeoutSeconds: 5,
+          }),
+          worktreePath: repository,
         }),
-        worktreePath: repository,
-      }),
-    );
-    expect(outcome).toMatchObject({
-      status: "PASS",
-      reasonCode: null,
-      enforcement: { memoryLimit: "observed", resourceLimitsEnforced: true, childContainmentEnforced: true },
-    });
-    expect(outcome.peakRssMb).toBeTypeOf("number");
+      );
+      expect(outcome).toMatchObject({
+        status: "PASS",
+        reasonCode: null,
+        enforcement: { memoryLimit: "observed", resourceLimitsEnforced: true, childContainmentEnforced: true },
+      });
+      expect(outcome.peakRssMb).toBeTypeOf("number");
+    } finally {
+      if (previousSentinel === undefined) delete process.env["ACP_PS_SHIM_LSTART_ONCE_SENTINEL"];
+      else process.env["ACP_PS_SHIM_LSTART_ONCE_SENTINEL"] = previousSentinel;
+    }
   });
 
   sandboxIt("#367 refuses a run whose `ps -o lstart=` never answers", async () => {

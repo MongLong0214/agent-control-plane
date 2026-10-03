@@ -15,7 +15,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 
@@ -23,6 +23,7 @@ import { Db } from "../../src/db/database.ts";
 import { parseLauncherBinding, sealRollbackPair, type SealedRollbackPair } from "../../src/deploy/rollback-pair.ts";
 import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { stableFixtureBinDir, stableFixtureExecutable } from "../helpers/stable-fixture-executable.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -75,31 +76,28 @@ interface CommandResult {
   stderr: string;
 }
 
-const writeExecutable = (path: string, content: string): void => {
-  writeFileSync(path, content, { mode: 0o700 });
-  chmodSync(path, 0o700);
+/**
+ * Overrides one PATH-resolved name for a single test by prepending a stable, content-hashed
+ * shim directory ahead of the harness's own (also stable, shared-across-tests) `bin`. `bin`
+ * itself must never be written into after `makeHarness` creates it — it is shared by every test
+ * that calls `makeHarness`, so two tests wanting different content for the same name (e.g. a
+ * `sleep` that exits immediately instead of the default short delay) need their own directory,
+ * not a rewrite of the shared one.
+ */
+const overridePath = (harness: InstallerHarness, name: string, script: string): void => {
+  const shimDirectory = dirname(stableFixtureExecutable(name, script));
+  harness.env["PATH"] = `${shimDirectory}:${harness.env["PATH"]}`;
 };
 
 const makeHarness = (): InstallerHarness => {
   const home = tempDir("acp-launchd-home-");
-  const bin = join(home, "fake-bin");
-  mkdirSync(bin, { recursive: true, mode: 0o700 });
-  chmodSync(bin, 0o700);
-
-  const launchLog = join(home, "launchctl.log");
-  const securityLog = join(home, "security.log");
-  const launcherEnvLog = join(home, "launcher-env.log");
-  const stateAdminLog = join(home, "state-admin.log");
-  const loaded = join(home, "launchd.loaded");
-  const stdoutLog = join(home, ".agent-control-plane", "agentcpd.out.log");
-  const lock = join(home, ".agent-control-plane", "agentcpd.lock");
-  const launchctl = join(bin, "launchctl");
-  const security = join(bin, "security");
-  const node = join(bin, "node-wrapper");
-
-  writeExecutable(
-    launchctl,
-    `#!/bin/bash
+  // `bin` is a stable, content-hashed directory shared across every call to `makeHarness`, not a
+  // fresh `fake-bin` subdirectory of `home`: the scripts below are constant text (every per-run
+  // value they need travels through an env var the harness sets, never through the script
+  // itself), so writing a fresh copy into a fresh tempDir on every test only minted a new
+  // executable inode per test for syspolicyd's provenance table, which cannot be pruned. See
+  // tests/helpers/stable-fixture-executable.ts.
+  const launchctlScript = `#!/bin/bash
 set -euo pipefail
 printf '%s\\n' "$*" >> "$ACP_LAUNCHCTL_LOG"
 case "\${1:-}" in
@@ -171,13 +169,10 @@ case "\${1:-}" in
     exit 64
     ;;
 esac
-`,
-  );
+`;
   // Shorten start_job's one-second polls while leaving the two-second stop-lock fake observable.
-  writeExecutable(join(bin, "sleep"), "#!/bin/bash\n/bin/sleep 0.1\n");
-  writeExecutable(
-    security,
-    `#!/bin/bash
+  const sleepScript = "#!/bin/bash\n/bin/sleep 0.1\n";
+  const securityScript = `#!/bin/bash
 set -euo pipefail
 printf '%s\\n' "$*" >> "$ACP_SECURITY_LOG"
 [[ "\${1:-}" == "find-generic-password" ]] || exit 64
@@ -225,11 +220,8 @@ case "$account" in
     ;;
   *) printf 'fake-keychain-value\\n' ;;
 esac
-`,
-  );
-  writeExecutable(
-    node,
-    `#!/bin/bash
+`;
+  const nodeWrapperScript = `#!/bin/bash
 set -euo pipefail
 target="\${1:-}"
 if [[ "$target" == *"state-admin.js" ]]; then
@@ -292,23 +284,23 @@ if [[ "$target" == *"agentcpd.js" ]]; then
   # to carry had already gone stale twice: it said the canonical group ran 17-24 when it runs 17-22,
   # put lsof at 25-26 when it is 23-24, and gave Hermes an overlapping 26-33. A comment restating a
   # derived position is the second authority the derivation was introduced to remove.
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
-    "\${ACP_TELEGRAM_BOT_TOKEN-}" "\${ACP_TELEGRAM_OWNER_ID-}" \
-    "\${ACP_TELEGRAM_CHAT_ID-}" "\${ACP_TELEGRAM_WEBHOOK_SECRET-}" \
-    "\${BUZZ_PRIVATE_KEY:-<unset>}" "\${ACP_BUZZ_BINARY:-<unset>}" \
-    "\${ACP_CLAUDE_BINARY:-<unset>}" "\${ACP_CODEX_BINARY:-<unset>}" "\${ACP_GROK_BINARY:-<unset>}" \
-    "$(command -v claude || printf '<unresolvable>')" \
-    "$(command -v codex || printf '<unresolvable>')" \
-    "$(command -v grok || printf '<unresolvable>')" \
-    "$(started_of "\${ACP_CLAUDE_BINARY:-}"),$(started_of "\${ACP_CODEX_BINARY:-}"),$(started_of "\${ACP_GROK_BINARY:-}")" \
-    "$(command -v node || printf '<unresolvable>')" \
-    "$(command -v acp-sibling-probe || printf '<unresolvable>')" \
-    "\${ACP_CANONICAL_SESSIONS_JSON-}" "\${ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION-}" \
-    "\${ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH-}" "\${ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256-}" \
-    "\${ACP_CANONICAL_CTO_PEER_PROTOCOL-}" "\${ACP_CANONICAL_CTO_BUZZ_PURPOSE-}" \
-    "$(command -v lsof || printf '<unresolvable>')" "$(lsof_scan)" \
-    "\${ACP_HERMES_LINEAGE_ROOT_DIGEST-}" "\${ACP_HERMES_EXECUTABLE-}" \
-    "\${ACP_HERMES_PROFILE-}" "\${ACP_HERMES_HOME-}" \
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \\
+    "\${ACP_TELEGRAM_BOT_TOKEN-}" "\${ACP_TELEGRAM_OWNER_ID-}" \\
+    "\${ACP_TELEGRAM_CHAT_ID-}" "\${ACP_TELEGRAM_WEBHOOK_SECRET-}" \\
+    "\${BUZZ_PRIVATE_KEY:-<unset>}" "\${ACP_BUZZ_BINARY:-<unset>}" \\
+    "\${ACP_CLAUDE_BINARY:-<unset>}" "\${ACP_CODEX_BINARY:-<unset>}" "\${ACP_GROK_BINARY:-<unset>}" \\
+    "$(command -v claude || printf '<unresolvable>')" \\
+    "$(command -v codex || printf '<unresolvable>')" \\
+    "$(command -v grok || printf '<unresolvable>')" \\
+    "$(started_of "\${ACP_CLAUDE_BINARY:-}"),$(started_of "\${ACP_CODEX_BINARY:-}"),$(started_of "\${ACP_GROK_BINARY:-}")" \\
+    "$(command -v node || printf '<unresolvable>')" \\
+    "$(command -v acp-sibling-probe || printf '<unresolvable>')" \\
+    "\${ACP_CANONICAL_SESSIONS_JSON-}" "\${ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION-}" \\
+    "\${ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH-}" "\${ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256-}" \\
+    "\${ACP_CANONICAL_CTO_PEER_PROTOCOL-}" "\${ACP_CANONICAL_CTO_BUZZ_PURPOSE-}" \\
+    "$(command -v lsof || printf '<unresolvable>')" "$(lsof_scan)" \\
+    "\${ACP_HERMES_LINEAGE_ROOT_DIGEST-}" "\${ACP_HERMES_EXECUTABLE-}" \\
+    "\${ACP_HERMES_PROFILE-}" "\${ACP_HERMES_HOME-}" \\
     "\${ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY-}" "\${ACP_HERMES_GATEWAY_API_KEY-}" >> "$ACP_LAUNCHER_ENV_LOG"
   # Mirrors the real precondition in src/daemon/agentcpd.ts: a Buzz credential without the
   # ingress pair is a startup error, not a degraded mode. Without this, a launcher that
@@ -321,8 +313,22 @@ if [[ "$target" == *"agentcpd.js" ]]; then
   exit 0
 fi
 exit 90
-`,
-  );
+`;
+  const bin = stableFixtureBinDir({
+    launchctl: launchctlScript,
+    security: securityScript,
+    "node-wrapper": nodeWrapperScript,
+    sleep: sleepScript,
+  });
+  const node = join(bin, "node-wrapper");
+
+  const launchLog = join(home, "launchctl.log");
+  const securityLog = join(home, "security.log");
+  const launcherEnvLog = join(home, "launcher-env.log");
+  const stateAdminLog = join(home, "state-admin.log");
+  const loaded = join(home, "launchd.loaded");
+  const stdoutLog = join(home, ".agent-control-plane", "agentcpd.out.log");
+  const lock = join(home, ".agent-control-plane", "agentcpd.lock");
 
   return {
     home,
@@ -364,9 +370,14 @@ const runInstaller = (
   // is relative to, or the shell resolves nothing and the row measures absence instead.
   cwd?: string,
 ): CommandResult => {
+  // `detached: true` so a timeout group-kills this subtree instead of leaving it behind: orphaned
+  // `install-launchd.sh install` and `fake-bin/security` processes with PPID 1 were observed
+  // outliving a timed-out test here by more than an hour. `boundedSpawnSync` does this only when
+  // asked; its `terminateGroup` docstring says why this site stays synchronous.
   const result = boundedSpawnSync("bash", [command, ...args], {
     encoding: "utf8",
     env: harness.env,
+    detached: true,
     ...(cwd ? { cwd } : {}),
   });
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
@@ -779,7 +790,7 @@ describe("launchd deployment artifact", () => {
     const originalPlist = readFileSync(plistPath(harness), "utf8");
     const originalLauncher = readFileSync(launcherPath(harness), "utf8");
     const stateAdminBefore = existsSync(harness.stateAdminLog) ? readFileSync(harness.stateAdminLog, "utf8") : "";
-    writeExecutable(join(harness.bin, "sleep"), "#!/bin/bash\nexit 0\n");
+    overridePath(harness, "sleep", "#!/bin/bash\nexit 0\n");
     harness.env["ACP_BOOTOUT_PRINT_LAG"] = "31";
     writeFileSync(harness.launchLog, "");
 
@@ -808,11 +819,13 @@ describe("launchd deployment artifact", () => {
     const originalRuntime = readFileSync(runtimeNode);
     const originalPlist = readFileSync(plistPath(harness), "utf8");
     const originalLauncher = readFileSync(launcherPath(harness), "utf8");
-    const nextNode = join(harness.bin, "node-new");
-    writeExecutable(nextNode, `${readFileSync(harness.node, "utf8")}\n# changed interpreter generation\n`);
+    const nextNode = stableFixtureExecutable(
+      "node-new",
+      `${readFileSync(harness.node, "utf8")}\n# changed interpreter generation\n`,
+    );
     const nextNodeBefore = readFileSync(nextNode);
     const stateAdminBefore = existsSync(harness.stateAdminLog) ? readFileSync(harness.stateAdminLog, "utf8") : "";
-    writeExecutable(join(harness.bin, "sleep"), "#!/bin/bash\nexit 0\n");
+    overridePath(harness, "sleep", "#!/bin/bash\nexit 0\n");
     harness.env["ACP_BOOTOUT_PRINT_LAG"] = "31";
     writeFileSync(harness.launchLog, "");
 
@@ -839,15 +852,18 @@ describe("launchd deployment artifact", () => {
     const originalNode = readFileSync(join(runtimeDir, "node"));
     const originalPlist = readFileSync(plistPath(harness), "utf8");
     const originalLauncher = readFileSync(launcherPath(harness), "utf8");
-    const nextNode = join(harness.bin, "node-new");
-    writeExecutable(nextNode, `${readFileSync(harness.node, "utf8")}\n# new generation\n`);
-    writeExecutable(join(harness.bin, "cp"), `#!/bin/bash
+    const nextNode = stableFixtureExecutable("node-new", `${readFileSync(harness.node, "utf8")}\n# new generation\n`);
+    overridePath(
+      harness,
+      "cp",
+      `#!/bin/bash
 if [[ "\${@: -1}" == *"/.node."* ]]; then
   printf 'partial' > "\${@: -1}"
   exit 1
 fi
 exec /bin/cp "$@"
-`);
+`,
+    );
     writeFileSync(harness.launchLog, "");
 
     const result = runInstaller(installer, ["upgrade", "--app-root", appRoot, "--node", nextNode], harness);
@@ -867,17 +883,23 @@ exec /bin/cp "$@"
     expect(runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status).toBe(0);
     const runtimeDir = join(appRoot, "dist", "bin");
     const originalNode = readFileSync(join(runtimeDir, "node"));
-    const nextNode = join(harness.bin, "node-new");
-    writeExecutable(nextNode, `${readFileSync(harness.node, "utf8")}\n# new generation\n`);
+    const nextNode = stableFixtureExecutable("node-new", `${readFileSync(harness.node, "utf8")}\n# new generation\n`);
     const modeLog = join(harness.home, "stage-mode.log");
-    writeExecutable(join(harness.bin, "cp"), `#!/bin/bash
+    // `modeLog` is a fresh per-run log path; it travels through an env var so the shim script
+    // text stays constant rather than being interpolated into it per run.
+    harness.env["ACP_CP_SHIM_MODE_LOG"] = modeLog;
+    overridePath(
+      harness,
+      "cp",
+      `#!/bin/bash
 if [[ "\${@: -1}" == *"/.node."* ]]; then
-  stat -f '%Lp' "$(dirname -- "\${@: -1}")" >> "${modeLog}"
+  stat -f '%Lp' "$(dirname -- "\${@: -1}")" >> "$ACP_CP_SHIM_MODE_LOG"
   printf 'partial' > "\${@: -1}"
   exit 1
 fi
 exec /bin/cp "$@"
-`);
+`,
+    );
     chmodSync(runtimeDir, 0o777);
     writeFileSync(harness.launchLog, "");
 
@@ -897,8 +919,7 @@ exec /bin/cp "$@"
     expect(runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status).toBe(0);
     const runtimeDir = join(appRoot, "dist", "bin");
     const previousNode = readFileSync(join(runtimeDir, "node"));
-    const nextNode = join(harness.bin, "node-new");
-    writeExecutable(nextNode, `${readFileSync(harness.node, "utf8")}\n# new generation\n`);
+    const nextNode = stableFixtureExecutable("node-new", `${readFileSync(harness.node, "utf8")}\n# new generation\n`);
     const upgraded = runInstaller(installer, ["upgrade", "--app-root", appRoot, "--node", nextNode], harness);
     expect(upgraded.status, upgraded.stderr).toBe(0);
     expect(readFileSync(join(runtimeDir, "node"))).not.toEqual(previousNode);
@@ -917,7 +938,7 @@ exec /bin/cp "$@"
     const originalLauncher = readFileSync(launcherPath(harness), "utf8");
     const originalRuntime = readFileSync(join(appRoot, "dist", "bin", "node"));
     const stateAdminBefore = existsSync(harness.stateAdminLog) ? readFileSync(harness.stateAdminLog, "utf8") : "";
-    writeExecutable(join(harness.bin, "sleep"), "#!/bin/bash\nexit 0\n");
+    overridePath(harness, "sleep", "#!/bin/bash\nexit 0\n");
     harness.env["ACP_BOOTOUT_PRINT_LAG"] = "31";
     writeFileSync(harness.launchLog, "");
 
@@ -943,7 +964,7 @@ exec /bin/cp "$@"
   it("recovers a maintenance bootout that unregisters beyond the initial recovery observations", () => {
     const harness = makeHarness();
     expect(runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness).status).toBe(0);
-    writeExecutable(join(harness.bin, "sleep"), "#!/bin/bash\nexit 0\n");
+    overridePath(harness, "sleep", "#!/bin/bash\nexit 0\n");
     harness.env["ACP_BOOTOUT_PRINT_LAG"] = "36";
     writeFileSync(harness.launchLog, "");
 
@@ -960,7 +981,7 @@ exec /bin/cp "$@"
     const harness = makeHarness();
     const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
     expect(installed.status, installed.stderr).toBe(0);
-    writeExecutable(join(harness.bin, "sleep"), "#!/bin/bash\nexit 0\n");
+    overridePath(harness, "sleep", "#!/bin/bash\nexit 0\n");
     harness.env["ACP_BOOTOUT_PRINT_LAG"] = "1000";
     writeFileSync(harness.launchLog, "");
 
@@ -979,7 +1000,7 @@ exec /bin/cp "$@"
     const harness = makeHarness();
     const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
     expect(installed.status, installed.stderr).toBe(0);
-    writeExecutable(join(harness.bin, "sleep"), "#!/bin/bash\nexit 0\n");
+    overridePath(harness, "sleep", "#!/bin/bash\nexit 0\n");
     harness.env["ACP_BOOTOUT_PRINT_LAG"] = "31";
     writeFileSync(harness.launchLog, "");
 
@@ -1885,10 +1906,14 @@ exec /bin/cp "$@"
     const link = join(harness.home, `node-${supplied}`);
     symlinkSync(target, link);
     // Emits both paths the way the real utility emits the one it was handed, so the row measures
-    // suppression of the channel rather than of one particular sentence.
-    writeExecutable(
-      join(harness.bin, "readlink"),
-      `#!/bin/bash\nprintf 'readlink: %s: Permission denied (target %s)\\n' "\${2:-}" "${target}" >&2\nexit 1\n`,
+    // suppression of the channel rather than of one particular sentence. `target` travels through
+    // an env var rather than being interpolated into the script so the shim stays byte-constant
+    // across runs.
+    harness.env["ACP_READLINK_SHIM_TARGET"] = target;
+    overridePath(
+      harness,
+      "readlink",
+      `#!/bin/bash\nprintf 'readlink: %s: Permission denied (target %s)\\n' "\${2:-}" "$ACP_READLINK_SHIM_TARGET" >&2\nexit 1\n`,
     );
 
     const refused = runInstaller(
@@ -2317,13 +2342,12 @@ exec /bin/cp "$@"
   });
 
   it("rejects a substring-only installer stub", () => {
-    const stub = join(tempDir("acp-launchd-stub-"), "install-launchd.sh");
     const stubText = `#!/bin/bash
 # Usage: install start restart upgrade rollback --pair-id --expected-index-digest
 # find-generic-password render-launchd-plist.mjs
 exit 0
 `;
-    writeExecutable(stub, stubText);
+    const stub = stableFixtureExecutable("install-launchd.sh", stubText);
     boundedExecFileSync("bash", ["-n", stub]);
     for (const token of ["rollback", "--pair-id", "find-generic-password", "render-launchd-plist.mjs"]) {
       expect(stubText).toContain(token);
@@ -2480,8 +2504,7 @@ exit 0
     const originalPlist = readFileSync(plistPath(harness), "utf8");
     const originalLauncher = readFileSync(launcherPath(harness), "utf8");
     writeFileSync(harness.launchLog, "");
-    const nextNode = join(harness.bin, "node-new");
-    writeExecutable(nextNode, `${readFileSync(harness.node, "utf8")}\n# new generation\n`);
+    const nextNode = stableFixtureExecutable("node-new", `${readFileSync(harness.node, "utf8")}\n# new generation\n`);
 
     const result = runInstaller(installer, ["upgrade", "--app-root", appRoot, "--node", nextNode], harness);
 
@@ -2550,7 +2573,7 @@ exit 0
     const appRoot = makeDisposableAppRoot();
     // Nothing else in this script calls `ln`; failing it unconditionally isolates publish's own
     // rename step without disturbing any other step the installer takes.
-    writeExecutable(join(harness.bin, "ln"), "#!/bin/bash\nexit 1\n");
+    overridePath(harness, "ln", "#!/bin/bash\nexit 1\n");
 
     const result = runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness);
 
@@ -2568,7 +2591,7 @@ exit 0
     ).toBe(0);
     const fixture = await sealPairFor(harness, appRoot);
     writeFileSync(harness.launchLog, "");
-    writeExecutable(join(harness.bin, "ln"), "#!/bin/bash\nexit 1\n");
+    overridePath(harness, "ln", "#!/bin/bash\nexit 1\n");
 
     const result = runInstaller(
       installer,
