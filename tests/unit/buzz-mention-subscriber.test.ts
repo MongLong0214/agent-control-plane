@@ -23,7 +23,11 @@ import {
   type BuzzRelaySocketHandlers,
   type BuzzSubscriberScheduler,
 } from "../../src/buzz/buzz-mention-subscriber.ts";
-import { buzzMentionSubscriberRegistry } from "../../src/daemon/agentcpd.ts";
+import {
+  assertCanonicalRoomsAreSubscribed,
+  buzzMentionSubscriberRegistry,
+  subscribedBuzzRoomsFrom,
+} from "../../src/daemon/agentcpd.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
@@ -2687,5 +2691,85 @@ describe("the mention binding lookup names what it refused", () => {
     });
     expect(bound, "the fixture did not produce a binding, so silence proves nothing").toBeTruthy();
     expect(said, "the success path printed a diagnostic").toBe("");
+  });
+});
+
+describe("a canonical CTO routed to its own room hears it only through its own identity's filter (PR1060-R2-01)", () => {
+  // The deployment's room is DEFAULT_ROOM; the CTO's adoptable entry routes it to ITS_ROOM, so its
+  // row's `buzz_address` is ITS_ROOM and the CEO writes there. The relay pushes a live event to a
+  // subscription only when the event matches its filter, so the filter is modelled here exactly as
+  // the relay applies it: kind, one `p` among `#p`, one `h` among `#h`.
+  const DEFAULT_ROOM = "c37e88d0-0000-4000-8000-000000000001";
+  const ITS_ROOM = "6dcb2a67-0000-4000-8000-000000000002";
+
+  const relayWouldPush = (filter: Record<string, unknown>, event: { kind: number; tags: string[][] }): boolean => {
+    const tagMatches = (name: string): boolean => {
+      const wanted = filter[`#${name}`] as readonly string[] | undefined;
+      return wanted === undefined || event.tags.some(([tag, value]) => tag === name && wanted.includes(value!));
+    };
+    return (filter["kinds"] as readonly number[]).includes(event.kind) && tagMatches("p") && tagMatches("h");
+  };
+
+  const subscribedIn = async (rooms: readonly string[]) => {
+    const stateDir = tempDir("acp-buzz-sub-");
+    const keys = tempDir("acp-buzz-keys-");
+    const identity = hexIdentity(keys, "cto.key");
+    const owner = hexIdentity(keys, "owner.key");
+    writeConfig(stateDir, configFor([{ keyFile: identity.keyFile, encoding: "hex", rooms }]));
+    const sink = recordingSink();
+    const transport = manualTransport();
+    const handle = startBuzzMentionSubscriberFromStateDir(stateDir, {
+      registry: registryHolding({ [identity.pubkey]: { roleKey: ROLE_KEY, buzzActorId: identity.pubkey } }),
+      sink,
+      openSocket: transport.factory,
+      scheduler: virtualClock().scheduler,
+    });
+    const socket = live(transport.sockets);
+    await authenticate(socket, handle);
+    const req = sentFrames(socket)[1] as [string, string, Record<string, unknown>];
+    expect(req[0]).toBe("REQ");
+    const entry = {
+      sessionUuid: "11111111-1111-4111-8111-111111111111",
+      projectId: "proj-1",
+      buzzActorId: identity.pubkey,
+      buzzAddress: ITS_ROOM,
+    };
+    // The CEO's mention, posted where the CTO's row now routes it.
+    const mention = mentionEvent({ author: owner.secretKey, addressedTo: identity.pubkey, room: ITS_ROOM });
+    const postInItsRoom = async (): Promise<void> => {
+      if (relayWouldPush(req[2], mention)) socket.handlers.onFrame(frame(["EVENT", req[1], mention]));
+      await handle.settled();
+    };
+    const startup = (): void =>
+      assertCanonicalRoomsAreSubscribed([entry], DEFAULT_ROOM, subscribedBuzzRoomsFrom(handle.identityRooms));
+    return { handle, sink, identity, mention, postInItsRoom, startup };
+  };
+
+  it("an identity listening in the default room alone is refused at startup, and would never have heard its own room", async () => {
+    const { handle, sink, startup, postInItsRoom } = await subscribedIn([DEFAULT_ROOM]);
+    try {
+      expect(startup).toThrow(
+        `is routed to Buzz room ${ITS_ROOM}, but its mention subscriber identity listens only in ${DEFAULT_ROOM}`,
+      );
+      // What the refusal prevents: the relay never pushes the mention, and nothing says so.
+      await postInItsRoom();
+      expect(sink.admitted).toEqual([]);
+    } finally {
+      handle.close();
+    }
+  });
+
+  it("an identity listening in its entry's room starts, and the mention posted there reaches that CTO", async () => {
+    const { handle, sink, identity, startup, postInItsRoom, mention } = await subscribedIn([ITS_ROOM]);
+    try {
+      expect(handle.identityRooms).toEqual([{ actorId: identity.pubkey, rooms: [ITS_ROOM] }]);
+      expect(startup).not.toThrow();
+      await postInItsRoom();
+      expect(sink.admitted).toEqual([
+        { eventId: mention.id, text: mention.content, conversation: ITS_ROOM, roleKey: ROLE_KEY },
+      ]);
+    } finally {
+      handle.close();
+    }
   });
 });

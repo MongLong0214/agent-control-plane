@@ -23,6 +23,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { runBoundedChild } from "../helpers/bounded-child.ts";
 
 import { sha256 } from "../../src/core/digest.ts";
+import { newSessionId } from "../../src/core/ids.ts";
 import { type Decision, allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { roleKeyFor, Role, SessionLifecycle } from "../../src/domain/types.ts";
@@ -50,6 +51,7 @@ import {
   type ProcessSnapshot,
   type TranscriptReader,
   type HostSessionRegistryReader,
+  type SubscribedBuzzRooms,
   SELF_CLAIM_EXECUTOR_KIND,
 } from "../../src/registry/canonical-self-claim.ts";
 import { cleanupTempDirs, makeCore, tempDir, type CoreHarness } from "../helpers/fixtures.ts";
@@ -343,8 +345,9 @@ const makeSubject = (
     transcriptReader?: TranscriptReader;
     hostSessionRegistryReader?: HostSessionRegistryReader;
     buzzActorAuthenticator?: BuzzActorAuthenticator;
-    resolveBuzzAddress?: (purpose: string) => Promise<Decision<string>>;
+    resolveBuzzAddress?: (purpose: string, channelId: string) => Promise<Decision<string>>;
     processSignal?: (pid: number) => void;
+    subscribedBuzzRooms?: SubscribedBuzzRooms;
   } = {},
 ): CanonicalSelfClaim =>
   new CanonicalSelfClaim(
@@ -362,8 +365,24 @@ const makeSubject = (
       transcriptReader: options.transcriptReader ?? fakeTranscriptReader(),
       hostSessionRegistryReader: options.hostSessionRegistryReader ?? fakeHostSessionRegistryReader,
       processSignal: options.processSignal ?? signalFromChain(options.chain ?? standardChain()),
+      ...(options.subscribedBuzzRooms === undefined ? {} : { subscribedBuzzRooms: options.subscribedBuzzRooms }),
     },
   );
+
+/**
+ * One session id for every claim made in a harness pinned with it.
+ *
+ * A fresh claim mints its session id and the attestation digest covers it, so two claims in two
+ * harnesses attest apart whatever else they share, and a digest comparison between them proves
+ * nothing about the field the case varies. Pinned, every other input the digest covers is already
+ * fixed by the harness (the chain, the transcript, the peer, the generation), so a case can first
+ * show two claims that differ in nothing attest alike and then that the one varied field moves it.
+ */
+const PINNED_SESSION_ID = newSessionId();
+const pinMintedSessionId = (core: CoreHarness): void => {
+  const create = core.sessions.create.bind(core.sessions);
+  vi.spyOn(core.sessions, "create").mockImplementation((input) => create({ ...input, sessionId: PINNED_SESSION_ID }));
+};
 
 const successorFixture = async () => {
   const core = makeCore();
@@ -1461,6 +1480,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     // same attestation, or the channel would be recorded without being covered.
     const digestFor = async (canonicalBuzzChannelId: string): Promise<string> => {
       const core = makeCore();
+      pinMintedSessionId(core);
       const projectId = "prj_channel";
       insertProject(core, projectId);
       const subject = makeSubject(core, projectId, { configOverrides: { canonicalBuzzChannelId } });
@@ -1475,6 +1495,9 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
       return rows[0]!.attestation_digest;
     };
 
+    // The control first: with the session id pinned, two claims on the same channel attest alike,
+    // so the inequality below can only come from the channel.
+    expect(await digestFor(CHANNEL)).toBe(await digestFor(CHANNEL));
     expect(await digestFor(CHANNEL)).not.toBe(await digestFor("channel:some-other-room"));
   });
 
@@ -3352,5 +3375,161 @@ describe("#1035 — the claimant session is re-derived and a registry anomaly re
     expect(assertClaudeIdentityStillLive(checked.value.identity, inspector, reader)).toMatchObject({
       allowed: false, reasonCode: ReasonCode.CONFLICT,
     });
+  });
+});
+
+describe("each adopted session is written into its own entry's Buzz room (2026-10-03)", () => {
+  // Measured live: three canonical CTOs for three projects, each project with its own CEO room, and
+  // every claim wrote the one deployment channel, so the peer rule refused or misrouted the CEO's
+  // mentions to all but one of them. An entry may now name its room; one that does not keeps the
+  // deployment channel.
+  const ROOM_PROJECT = "prj_own_room";
+  const ROOM = "6dcb2a67-b130-4c3c-8280-000000000001";
+
+  /** Opens whichever room the claim names, and records which one that was. */
+  const roomResolver = () => {
+    const asked: string[] = [];
+    const resolve = async (_purpose: string, channelId: string): Promise<Decision<string>> => {
+      asked.push(channelId);
+      return allow(ReasonCode.OK, channelId);
+    };
+    return { asked, resolve };
+  };
+
+  const claimWith = async (buzzAddress: string | undefined) => {
+    const core = makeCore();
+    pinMintedSessionId(core);
+    insertProject(core, ROOM_PROJECT);
+    const resolver = roomResolver();
+    const subject = makeSubject(core, ROOM_PROJECT, {
+      configOverrides: {
+        canonicalSessions: [{
+          sessionUuid: CANON, projectId: ROOM_PROJECT, buzzActorId: CANONICAL_ACTOR,
+          ...(buzzAddress === undefined ? {} : { buzzAddress }),
+        }],
+      },
+      resolveBuzzAddress: resolver.resolve,
+    });
+    const result = await subject.claim(baseRequest(core, ROOM_PROJECT));
+    expect(result.allowed, JSON.stringify(result)).toBe(true);
+    if (!result.allowed) throw new Error("unreachable");
+    const rows = core.db.all<{ buzz_address: string | null }>(
+      `SELECT buzz_address FROM sessions WHERE session_id = ?`,
+      [result.value.sessionId],
+    );
+    const attestations = core.db.all<{ attestation_digest: string }>(`SELECT attestation_digest FROM actor_target_attestations`);
+    return { receipt: result.value, rows, asked: resolver.asked, digest: attestations[0]!.attestation_digest };
+  };
+
+  it("opens and writes the entry's own room when it names one", async () => {
+    const claimed = await claimWith(ROOM);
+    expect(claimed.asked).toEqual([ROOM]);
+    expect(claimed.receipt.buzzAddress).toBe(ROOM);
+    expect(claimed.rows).toEqual([{ buzz_address: ROOM }]);
+  });
+
+  it("opens and writes the deployment channel when the entry names no room", async () => {
+    const claimed = await claimWith(undefined);
+    expect(claimed.asked).toEqual([CHANNEL]);
+    expect(claimed.receipt.buzzAddress).toBe(CHANNEL);
+    expect(claimed.rows).toEqual([{ buzz_address: CHANNEL }]);
+    // The room is what the attestation covers, so two entries differing only in it attest apart.
+    // The control first: the same room twice attests alike, so the inequality is the room's alone.
+    expect((await claimWith(ROOM)).digest).toBe((await claimWith(ROOM)).digest);
+    expect(claimed.digest).not.toBe((await claimWith(ROOM)).digest);
+  });
+
+  /** The subscriber listening as the canonical actor in exactly `rooms`, and as nobody else. */
+  const listeningIn = (rooms: readonly string[]): SubscribedBuzzRooms =>
+    (buzzActorId) => (buzzActorId === CANONICAL_ACTOR ? rooms : null);
+
+  it("refuses a claim into a room its subscriber identity does not listen in, before the room is opened or a row is written", async () => {
+    // PR1060-R2-01. The deployment's room is CHANNEL, the entry names ROOM, and the CTO's subscriber
+    // identity listens in CHANNEL only: the row would move to ROOM and the CEO's mentions there
+    // would never reach it.
+    const core = makeCore();
+    insertProject(core, ROOM_PROJECT);
+    const resolver = roomResolver();
+    const subject = makeSubject(core, ROOM_PROJECT, {
+      configOverrides: {
+        canonicalSessions: [{ sessionUuid: CANON, projectId: ROOM_PROJECT, buzzActorId: CANONICAL_ACTOR, buzzAddress: ROOM }],
+      },
+      resolveBuzzAddress: resolver.resolve,
+      subscribedBuzzRooms: listeningIn([CHANNEL]),
+    });
+    const before = rowCounts(core);
+    const result = await subject.claim(baseRequest(core, ROOM_PROJECT));
+
+    expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+    if (result.allowed) return;
+    expect(result.message).toContain(`project ${ROOM_PROJECT}`);
+    expect(result.message).toContain(`Buzz room ${ROOM}`);
+    expect(result.message).toContain(`listens only in ${CHANNEL}`);
+    expect(result.message).not.toContain(CANONICAL_ACTOR);
+    expect(resolver.asked).toEqual([]);
+    expectRolledBack(core, before, result);
+  });
+
+  it("refuses a default-room entry the same way when its identity does not listen in the deployment's room", async () => {
+    const core = makeCore();
+    insertProject(core, ROOM_PROJECT);
+    const resolver = roomResolver();
+    const subject = makeSubject(core, ROOM_PROJECT, {
+      resolveBuzzAddress: resolver.resolve,
+      subscribedBuzzRooms: listeningIn([ROOM]),
+    });
+    const result = await subject.claim(baseRequest(core, ROOM_PROJECT));
+
+    expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+    if (result.allowed) return;
+    expect(result.message).toContain(`Buzz room ${CHANNEL}`);
+    expect(resolver.asked).toEqual([]);
+  });
+
+  it.each([
+    ["listens in the entry's room", listeningIn([CHANNEL, ROOM])],
+    ["does not listen as this actor at all", (() => null) satisfies SubscribedBuzzRooms],
+  ])("claims into the entry's room when the subscriber %s", async (_label, subscribedBuzzRooms) => {
+    const core = makeCore();
+    insertProject(core, ROOM_PROJECT);
+    const resolver = roomResolver();
+    const subject = makeSubject(core, ROOM_PROJECT, {
+      configOverrides: {
+        canonicalSessions: [{ sessionUuid: CANON, projectId: ROOM_PROJECT, buzzActorId: CANONICAL_ACTOR, buzzAddress: ROOM }],
+      },
+      resolveBuzzAddress: resolver.resolve,
+      subscribedBuzzRooms,
+    });
+    const result = await subject.claim(baseRequest(core, ROOM_PROJECT));
+
+    expect(result.allowed, JSON.stringify(result)).toBe(true);
+    if (!result.allowed) return;
+    expect(resolver.asked).toEqual([ROOM]);
+    expect(core.sessions.get(result.value.sessionId)?.buzzAddress).toBe(ROOM);
+  });
+
+  it.each([
+    ["not a UUID", "general"],
+    ["an upper-case UUID", ROOM.toUpperCase()],
+    ["a padded UUID", ` ${ROOM}`],
+    ["an empty string", ""],
+    ["null", null],
+    ["a number", 42],
+  ])("refuses %s as a room before any row is written", (_label, buzzAddress) => {
+    const core = makeCore();
+    insertProject(core, ROOM_PROJECT);
+    const before = rowCounts(core);
+    const resolver = roomResolver();
+    expect(() => makeSubject(core, ROOM_PROJECT, {
+      configOverrides: {
+        canonicalSessions: [{
+          sessionUuid: CANON, projectId: ROOM_PROJECT, buzzActorId: CANONICAL_ACTOR,
+          buzzAddress: buzzAddress as unknown as string,
+        }],
+      },
+      resolveBuzzAddress: resolver.resolve,
+    })).toThrow(/canonicalSessions\[\]\.buzzAddress must be a lower-case channel UUID/);
+    expect(rowCounts(core)).toEqual(before);
+    expect(resolver.asked).toEqual([]);
   });
 });

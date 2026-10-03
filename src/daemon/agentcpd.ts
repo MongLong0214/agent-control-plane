@@ -43,7 +43,10 @@ import { createHermesGatewayIdentityReader } from "../runtime/hermes-gateway-ide
 import { createHermesGatewayConversationSender } from "../runtime/hermes-gateway-conversation.ts";
 import {
   assertCanonicalSessionsValid,
+  canonicalBuzzChannelFor,
+  unsubscribedRoomRefusal,
   type CanonicalAdoptableSession,
+  type SubscribedBuzzRooms,
 } from "../registry/canonical-self-claim.ts";
 import { readProcessStartToken } from "../core/process-argv.ts";
 import { processStartedAt } from "../core/process-identity.ts";
@@ -61,6 +64,7 @@ import {
   type BuzzMentionSubscriberHandle,
   type BuzzMentionVerdict,
   type BuzzRelaySocketFactory,
+  type BuzzSubscriberIdentityRooms,
   type BuzzSubscriberScheduler,
 } from "../buzz/buzz-mention-subscriber.ts";
 import { OwnerReplyConsumer, type OwnerReplyTimers } from "../conversation/owner-reply-consumer.ts";
@@ -717,7 +721,27 @@ export const startLocalMcpListeners = async (
     reattach = await startCanonicalCtoToolListener(
       daemon,
       stateDir,
-      async (peer) => admission.admit(peer),
+      async (peer) => {
+        const admitted = admission.admit(peer);
+        // After admission and never part of it: the correction opens the room through the Buzz
+        // CLI, and a reattach must not wait on, or fail with, the relay. It admits the peer again
+        // itself, so it cannot act for anyone this line did not just admit, and it is a no-op for
+        // a row already in its room. A refusal or a throw leaves the row as it was; the next
+        // reattach asks again. Only the reason code is printed, never a room or a session.
+        if (admitted.allowed) {
+          void admission.correctBuzzAddress(peer).then(
+            (corrected) => {
+              if (!corrected.allowed) {
+                process.stderr.write(`canonical CTO buzz address correction refused: ${corrected.reasonCode}\n`);
+              }
+            },
+            () => {
+              process.stderr.write("canonical CTO buzz address correction failed\n");
+            },
+          );
+        }
+        return admitted;
+      },
       (admitted, socket) => {
         const binding = cp.bindings.active(admitted.roleKey);
         if (binding === null) {
@@ -1647,6 +1671,42 @@ export const assertBuzzChannelMatchesSubscriberRooms = (
       `configured rooms (${subscriberRooms.join(", ")}); the daemon would answer in one room and ` +
       "listen in another",
   );
+};
+
+/** The subscriber's per-identity rooms as the lookup `unsubscribedRoomRefusal` asks. */
+export const subscribedBuzzRoomsFrom = (identityRooms: readonly BuzzSubscriberIdentityRooms[]): SubscribedBuzzRooms =>
+  (buzzActorId) => identityRooms.find((identity) => identity.actorId === buzzActorId)?.rooms ?? null;
+
+/**
+ * Every adopted session's room, cross-checked against the rooms its own subscriber identity
+ * listens in.
+ *
+ * `assertBuzzChannelMatchesSubscriberRooms` above compares one room with the union of all of them,
+ * which was the whole question while every canonical CTO was written into `ACP_BUZZ_CHANNEL`. An
+ * entry may now name its own room (`buzzAddress`), and the claim and the reattach's correction write
+ * that room into the CTO's row, where the peer rule admits its CEO's mentions from that room only.
+ * The subscriber asks the relay for each identity's own rooms, so an entry routed to room B whose
+ * identity listens in A alone passes the union check and then never hears a mention in B.
+ *
+ * Per entry, its effective room (its `buzzAddress`, else `ACP_BUZZ_CHANNEL`) must be among the rooms
+ * of the identity that listens as its `buzzActorId`. An entry no identity listens as is not checked,
+ * and neither is anything when no subscriber runs: there is nothing to be deaf in either case. The
+ * refusal names the project and both rooms, never the session, the actor or a key.
+ *
+ * Refused, not repaired: the subscription keeps the rooms its own file declares instead of following
+ * the entry's room, as `ACP_BUZZ_CHANNEL` above is refused rather than added. It reads configuration
+ * only, never a session's `buzz_address`, so a row left in a room no entry names any more is not
+ * found here.
+ */
+export const assertCanonicalRoomsAreSubscribed = (
+  canonicalSessions: readonly CanonicalAdoptableSession[],
+  canonicalBuzzChannelId: string,
+  subscribedRooms: SubscribedBuzzRooms,
+): void => {
+  for (const entry of canonicalSessions) {
+    const deaf = unsubscribedRoomRefusal(entry, canonicalBuzzChannelFor(entry, canonicalBuzzChannelId), subscribedRooms);
+    if (deaf !== null) throw new Error(`ACP_CANONICAL_SESSIONS_JSON does not match the Buzz mention subscriber: ${deaf}`);
+  }
 };
 
 /**
@@ -3790,17 +3850,19 @@ export interface AgentcpdMainContext {
   ceoConversation: CeoConversationPort | null;
 }
 
-// Shape only — that this is an array of objects carrying exactly these three string keys, so an
-// unrecognised key in the deployment's JSON is refused rather than ignored. Emptiness, the size
-// bound, blank and padded fields, UUID form and uniqueness are `assertCanonicalSessionsValid`'s,
-// which the claim's constructor calls too. Restating any of them here would put the same rule in
-// two places, and the half kept here is the half that runs at startup.
+// Shape only — that this is an array of objects carrying these three string keys and optionally a
+// fourth, `buzzAddress`, so an unrecognised key in the deployment's JSON is refused rather than
+// ignored. Emptiness, the size bound, blank and padded fields, UUID form (the room's included) and
+// uniqueness are `assertCanonicalSessionsValid`'s, which the claim's constructor calls too.
+// Restating any of them here would put the same rule in two places, and the half kept here is the
+// half that runs at startup.
 const canonicalSessionsSchema = z.array(
   z
     .object({
       sessionUuid: z.string(),
       projectId: z.string(),
       buzzActorId: z.string(),
+      buzzAddress: z.string().optional(),
     })
     .strict(),
 );
@@ -3814,7 +3876,8 @@ const canonicalSessionsSchema = z.array(
  * for was never compared against anything, so the single entitled session could hold
  * `PRIMARY_CTO` for every registered project (#1005). An entry is the whole entitlement — the
  * session, the one project it may hold, and the channel identity it speaks as — so neither half
- * can be configured without the other.
+ * can be configured without the other. It may also name the Buzz room that project's CEO talks to
+ * its CTO in (`buzzAddress`); an entry that names none is written into `ACP_BUZZ_CHANNEL`.
  *
  * Deliberately the same shape as `ACP_CTO_BINDING_TARGETS_JSON`: a bounded JSON array parsed once
  * at startup, whose refusal names the variable and never its contents.
@@ -4002,12 +4065,21 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   // `sessions.setBuzzAddress(sessionId, ...)` for an *existing* session, and the canonical
   // self-claim primitive resolves its address before the session it belongs to exists
   // (`sessions.create` accepts `buzzAddress` directly, inside the same transaction that mints it).
-  const resolveCanonicalSelfClaimBuzzAddress = async (purpose: string): Promise<Decision<string>> => {
-    if (!(await buzzTransport.available(purpose))) {
+  //
+  // `channelId` is the claiming entry's room: its own `buzzAddress`, or `ACP_BUZZ_CHANNEL` when it
+  // names none. A transport bound to that one room is asked, so a per-entry room goes through the
+  // same `available` and `openChannel` — `buzz channels get`, and the relay's answer required to
+  // name that very channel — as the deployment's default room did through `buzzTransport`.
+  const resolveCanonicalSelfClaimBuzzAddress = async (
+    purpose: string,
+    channelId: string,
+  ): Promise<Decision<string>> => {
+    const roomTransport = new BuzzCliTransport(process.env["ACP_BUZZ_BINARY"] ?? "buzz", channelId);
+    if (!(await roomTransport.available(purpose))) {
       return deny(ReasonCode.PROBE_FAILED, "buzz transport is not available", { purpose });
     }
     try {
-      return allow(ReasonCode.OK, await buzzTransport.openChannel(purpose));
+      return allow(ReasonCode.OK, await roomTransport.openChannel(purpose));
     } catch (err) {
       return deny(ReasonCode.PROBE_FAILED, `buzz connect failed: ${(err as Error).message}`, { purpose });
     }
@@ -4027,6 +4099,26 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   let buzzActorIngress: LocalBuzzActorIngress | null = null;
   let buzzMessageIngress: LocalBuzzMessageIngress | null = null;
   let buzzMentionSubscriber: BuzzMentionSubscriberHandle | null = null;
+  // Read when asked, not captured: the claim and the reattach are composed before the subscriber
+  // starts, and until it does (or where none runs) this answers `null` and checks nothing. That
+  // `null` is only an answer once startup has decided whether a subscriber runs, which is what the
+  // latch below is for.
+  const subscribedBuzzRooms: SubscribedBuzzRooms = (buzzActorId) =>
+    subscribedBuzzRoomsFrom(buzzMentionSubscriber?.identityRooms ?? [])(buzzActorId);
+  // One way, released once, as startup's last statement: after it has decided the mention subscriber,
+  // `assertCanonicalRoomsAreSubscribed` accepted every entry and no later step refused. The claim and reattach
+  // sockets open before that, and a claim or correction let through then found the lookup above
+  // `null`, opened its room and wrote its row before the start was refused (PR1060-R2-01). Until
+  // the release a claim is refused and a correction waits; a start that throws never releases it,
+  // so neither has written anything.
+  let canonicalRoomsSettled = false;
+  let settleCanonicalRooms: () => void = () => undefined;
+  const canonicalRoomsChecked = new Promise<void>((resolve) => {
+    settleCanonicalRooms = () => {
+      canonicalRoomsSettled = true;
+      resolve();
+    };
+  });
   let ownerReplies: DaemonOwnerReplyConsumer | null = null;
   let operator: LocalOperatorListener | null = null;
   let canonicalSelfClaim: CanonicalSelfClaimListener | null = null;
@@ -4156,7 +4248,16 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       // against `ACP_OPERATOR_TOKEN`; its only authority is the kernel's own record of who opened
       // this socket, checked by `startCanonicalSelfClaimListener` itself before this handler is
       // ever called.
-      canonicalSelfClaim = await startCanonicalSelfClaimListener(daemon, stateDir, (peer, params) => {
+      canonicalSelfClaim = await startCanonicalSelfClaimListener(daemon, stateDir, async (peer, params) => {
+        // Refused before anything is constructed, so a claim in that window opens no room and
+        // writes no row, not even its refusal's audit row. Claiming again after startup succeeds.
+        if (!canonicalRoomsSettled) {
+          return deny(
+            ReasonCode.CONFLICT,
+            "the daemon is still starting and has not checked each canonical CTO's Buzz room against its mention subscriber",
+            {},
+          );
+        }
         // Deployment facts are the entry-time snapshot, never request or callback-time values.
         return executeCanonicalSelfClaimOperator(peer, params, {
           db: cp.db,
@@ -4183,6 +4284,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
             peerProtocolVersion: canonicalActivationValues["ACP_CANONICAL_CTO_PEER_PROTOCOL"],
             buzzPurpose: canonicalActivationValues["ACP_CANONICAL_CTO_BUZZ_PURPOSE"],
           },
+          subscribedBuzzRooms,
         });
       });
       process.stdout.write("canonical self-claim listener started\n");
@@ -4190,7 +4292,26 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     listeners = await startDaemonMcpListeners(cp, stateDir, mcpToken, daemon);
     // #1037 — only where the canonical claim is configured: reattaching is that claim's sequel.
     if (canonicalSessions !== null) {
-      await listeners.openCanonicalCtoReattach(createCanonicalCtoReattach(cp), daemon);
+      // The same set, resolver and purpose the claim is given, so the room a reattach corrects a
+      // live holder's row to is the room a claim would write and is opened the same way.
+      const canonicalCtoReattach = createCanonicalCtoReattach(cp, {
+        buzzAddress: {
+          canonicalSessions,
+          resolveBuzzAddress: resolveCanonicalSelfClaimBuzzAddress,
+          buzzPurpose: canonicalActivationValues["ACP_CANONICAL_CTO_BUZZ_PURPOSE"],
+          subscribedBuzzRooms,
+        },
+      });
+      // Admission is untouched and never waits on Buzz. Only the correction waits for the room
+      // check: it is fired after admission and nobody retries it, so refusing it would leave the
+      // CTO in its old room until the next reattach, while refusing the reattach ends the relay.
+      await listeners.openCanonicalCtoReattach({
+        ...canonicalCtoReattach,
+        correctBuzzAddress: async (peer) => {
+          await canonicalRoomsChecked;
+          return canonicalCtoReattach.correctBuzzAddress(peer);
+        },
+      }, daemon);
       process.stdout.write("canonical CTO reattach socket started\n");
     }
     // #1037 — the adopted CEO's tools, on their own kernel-peer socket; only when adoption is
@@ -4285,6 +4406,11 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
           process.env["ACP_BUZZ_CHANNEL"]?.trim(),
           buzzMentionSubscriber?.rooms ?? [],
         );
+        // And per adopted CTO, against its own identity's rooms rather than the union: an entry may
+        // name a room of its own, and the union cannot say which identity hears it.
+        if (canonicalSessions !== null) {
+          assertCanonicalRoomsAreSubscribed(canonicalSessions, canonicalBuzzChannelId, subscribedBuzzRooms);
+        }
       }
     }
     // #1036 — the owner-reply consumer, next to the subscriber it publishes through. Started on
@@ -4326,6 +4452,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       process.stderr.write("Telegram ingress not configured; continuing without Telegram ingress\n");
       daemon.setTelegramIngressStatus({ configured: false, running: false, disabledReason: null });
     }
+    // The last statement of startup, after every step that can still refuse it (PR1060-FU-01): the
+    // subscriber is decided, its rooms are checked, and only now may a claim or correction open a room.
+    settleCanonicalRooms();
   } catch (err) {
     if (hermesAutoAdoptionTimer) clearInterval(hermesAutoAdoptionTimer);
     await telegram?.close();
