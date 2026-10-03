@@ -28,16 +28,21 @@ afterAll(cleanupTempDirs);
  * attach relay, the restore, the migration, or the Hermes CEO relay never having run.
  *
  * This runs the *built* `dist/cli/agentctl.js`, `dist/db/state-admin.js`,
- * `dist/runtime/hermes-tool-bridge.js` and `dist/runtime/hermes-ceo.js` (not the source;
- * `pnpm build` must have already run) through a fresh symlink standing in for `current`, and
- * compares that run against the same argv through the real path. The comparison, rather than a
- * hardcoded exit code, is the assertion that must hold: the two runs must agree. Before the fix
- * they did not — the symlinked run went quiet while the direct one failed loudly.
+ * `dist/runtime/hermes-tool-bridge.js`, `dist/runtime/hermes-ceo.js` and
+ * `dist/deploy/rollback-pair.js` (not the source; `pnpm build` must have already run) through a
+ * fresh symlink standing in for `current`, and compares that run against the same argv through
+ * the real path. The comparison, rather than a hardcoded exit code, is the assertion that must
+ * hold: the two runs must agree. Before the fix they did not — the symlinked run went quiet while
+ * the direct one failed loudly.
  *
- * `src/deploy/rollback-pair.ts` and `src/daemon/agentcpd.ts` have the same fix but are not run
- * here directly: `rollback-pair.ts`'s own entrypoint guard is already covered end to end by
- * `rollback-pair-wal.test.ts`'s realpath regression, and spawning `agentcpd.js` for real opens a
- * listening socket and a database.
+ * `src/daemon/agentcpd.ts` has the same fix but is not run here directly: spawning `agentcpd.js`
+ * for real opens a listening socket and a database.
+ *
+ * `src/deploy/rollback-pair.ts` has the same fix and *is* run here, through `--help`:
+ * `rollback-pair-wal.test.ts`'s realpath regression launches `dist/deploy/rollback-pair.js` only
+ * from the checkout path (`REPO_DIST = join(process.cwd(), "dist")`), so nothing there exercises
+ * this entrypoint through a symlink. `--help` is the cheap, side-effect-free argv for it: `main()`
+ * reaches it before any flag is read, so it never touches a pair, a database or the filesystem.
  *
  * `src/tools/traceability.ts`'s `isMain` has the identical fix but is deliberately not run
  * through a symlink here: its `main()` takes no argv to make it fail cheaply, and with no
@@ -51,10 +56,12 @@ const AGENTCTL_REL = join("dist", "cli", "agentctl.js");
 const STATE_ADMIN_REL = join("dist", "db", "state-admin.js");
 const HERMES_TOOL_BRIDGE_REL = join("dist", "runtime", "hermes-tool-bridge.js");
 const HERMES_CEO_REL = join("dist", "runtime", "hermes-ceo.js");
+const ROLLBACK_PAIR_REL = join("dist", "deploy", "rollback-pair.js");
 const AGENTCTL = join(REPO_ROOT, AGENTCTL_REL);
 const STATE_ADMIN = join(REPO_ROOT, STATE_ADMIN_REL);
 const HERMES_TOOL_BRIDGE = join(REPO_ROOT, HERMES_TOOL_BRIDGE_REL);
 const HERMES_CEO = join(REPO_ROOT, HERMES_CEO_REL);
+const ROLLBACK_PAIR = join(REPO_ROOT, ROLLBACK_PAIR_REL);
 
 /**
  * A fresh `<tmp>/current -> REPO_ROOT` symlink, one per call, so two cases in this file never
@@ -165,6 +172,33 @@ describe("a CLI run through the `current` symlink is not silent", () => {
     expect(direct.status, direct.stderr).not.toBe(0);
     expect(direct.stderr).toContain("--reply-command is required");
 
+    expect(viaSymlink.status).toBe(direct.status);
+    expect(viaSymlink.stdout).toBe(direct.stdout);
+    expect(viaSymlink.stderr).toBe(direct.stderr);
+  });
+
+  it("rollback-pair: fails the same way through the symlink as through the real path", () => {
+    expect(existsSync(ROLLBACK_PAIR), `${ROLLBACK_PAIR} is missing — run pnpm build first`).toBe(
+      true,
+    );
+
+    // `--help` reaches the usage branch before any flag is read, so this is the cheap,
+    // side-effect-free path through an entrypoint that otherwise seals, validates or applies a
+    // sealed pair against a real database and runtime closure.
+    const argv = ["--help"];
+    const direct = boundedSpawnSync(process.execPath, [ROLLBACK_PAIR, ...argv], {
+      encoding: "utf8",
+    });
+    const viaSymlink = runThroughCurrentSymlink(ROLLBACK_PAIR_REL, argv);
+
+    // Pinned first, independently of the comparison below: `--help` prints the usage text and
+    // exits 0 on the real path.
+    expect(direct.status, direct.stderr).toBe(0);
+    expect(direct.stdout.length).toBeGreaterThan(0);
+
+    // The regression this guards: before the fix, the symlinked run's own `isMainModule()` check
+    // never matched, so `main()` never ran and the process exited 0 having printed nothing —
+    // indistinguishable from `--help` having "worked", except silently.
     expect(viaSymlink.status).toBe(direct.status);
     expect(viaSymlink.stdout).toBe(direct.stdout);
     expect(viaSymlink.stderr).toBe(direct.stderr);
