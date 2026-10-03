@@ -20,6 +20,10 @@ $HOME/.agent-control-plane/rollback-pairs/. It selects nothing implicitly: the p
 WAL-complete database backup, the runtime closure and the launchd generation together, and
 --expected-index-digest is the SHA256(SHA256SUMS) retained outside the pair, without which a
 pair can vouch for a forgery of itself. Prevalidation runs before anything is stopped.
+The rollback is validated and applied by this installer's own checkout's
+dist/deploy/rollback-pair.js, never the deployment's, and is refused unless that build checks
+the pair against the live database; after rolling back into an older generation, run the next
+rollback from a current checkout with --app-root.
 
 The job always uses $HOME/.agent-control-plane because that is agentcpd's configured
 state root. Secrets never go in the plist: store ACP_MCP_TOKEN and ACP_OPERATOR_TOKEN (both required),
@@ -832,8 +836,25 @@ case "$command_name" in
     pair_root="$(cd -P -- "$pair_root" && pwd)"
     [[ "${pair_root##*/}" == "$pair_id" ]] ||
       fail "the sealed pair directory resolves to a different id: $pair_root"
-    validator="$app_root/dist/deploy/rollback-pair.js"
-    [[ -f "$validator" ]] || fail "rollback pair validator build missing: $validator"
+    # The coordinator is this installer's own checkout's build, never the deployment's (ACP1058-R1).
+    # The deployment's is the runtime this rollback replaces: a deployment built before a check
+    # would validate and apply a pair without it, and a rollback into an older generation installs
+    # that generation's coordinator for the next rollback to find. This is the rule
+    # scripts/verify-pair-independently.mjs already keeps for the same reason. When this installer
+    # runs from inside the deployment the two are the same build, so the coordinator is asked what it
+    # enforces before it is handed anything: one that cannot check whether the live database has
+    # moved past the pair is refused here, before anything is stopped, and the way forward is the
+    # installer of a checkout built with the check, given --app-root.
+    coordinator="$DEFAULT_APP_ROOT/dist/deploy/rollback-pair.js"
+    [[ -f "$coordinator" ]] || fail "rollback coordinator build missing from this installer's checkout: $coordinator"
+    declared_high_water=""
+    if coordinator_guards="$("$node_path" "$coordinator" guards)"; then
+      while IFS='=' read -r guard_key guard_value; do
+        if [[ "$guard_key" == "ACP_ROLLBACK_DATABASE_HIGH_WATER" ]]; then declared_high_water="$guard_value"; fi
+      done <<< "$coordinator_guards"
+    fi
+    [[ "$declared_high_water" =~ ^agent-control-plane\.database-content/v[0-9]+$ ]] ||
+      fail "the rollback coordinator in this installer's checkout does not declare the database high-water check, so it could restore a pair the live database has moved past; run deploy/install-launchd.sh from a checkout built with that check and pass --app-root"
 
     # Prevalidation, before anything is stopped, restored or replaced. The index digest is the one
     # value deliberately kept outside the pair: a pair that vouches for its own index vouches for
@@ -869,7 +890,7 @@ case "$command_name" in
     # B's code is the defect this whole mechanism exists to prevent — and puts the previous
     # generation back if any step fails. A failed rollback therefore ends with the old generation
     # whole, so the job is started again rather than left down.
-    "$node_path" "$validator" validate "${rollback_flags[@]}" >/dev/null ||
+    "$node_path" "$coordinator" validate "${rollback_flags[@]}" >/dev/null ||
       fail "sealed rollback pair failed validation: $pair_root"
 
     # The service state before this rollback touched it. Always starting the job afterwards would
@@ -879,7 +900,7 @@ case "$command_name" in
     if job_loaded; then service_was_loaded=1; else service_was_loaded=0; fi
     if [[ "$service_was_loaded" == "1" ]]; then stop_job maintenance; else stop_job; fi
     wait_for_stop
-    if ! rollback_report="$("$node_path" "$validator" rollback "${rollback_flags[@]}")"; then
+    if ! rollback_report="$("$node_path" "$coordinator" rollback "${rollback_flags[@]}")"; then
       rm -rf "$state_dir/rollback-stage"
       if [[ "$service_was_loaded" == "1" ]]; then start_job; fi
       fail "rollback failed; the previous generation and the original service state were restored"

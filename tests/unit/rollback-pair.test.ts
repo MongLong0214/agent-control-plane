@@ -16,19 +16,24 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
+import Database from "better-sqlite3";
 import { afterAll, describe, expect, it } from "vitest";
 
+import { isAcpError, type AcpError } from "../../src/core/errors.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Db } from "../../src/db/database.ts";
 import {
   ROLLBACK_PAIR_INDEX_FILE,
   ROLLBACK_PAIR_MANIFEST_FILE,
+  applyRollbackPair,
   rollbackToSealedPair,
   sealRollbackPair,
   stageRollbackPair,
   validateRollbackPair,
   type ApplyOptions,
+  type RollbackPairDatabaseHighWater,
   type RollbackPairExpectation,
   type RollbackPairManifest,
   type RollbackPairMember,
@@ -1025,5 +1030,378 @@ describe("the exact rollback pair", () => {
 
     const survivors = existsSync(stageParent) ? readdirSync(stageParent) : [];
     expect(survivors).toEqual([]);
+  });
+});
+
+/**
+ * A rollback must preserve current writes (SSOT U5). A pair is sealed at one moment and applied at
+ * another, and restoring its image rewinds the database to the seal: on 115916ce applying the
+ * morning's pre-deploy pair would have discarded everything written since, and reported success.
+ *
+ * Every row here is in-process and execs nothing. The refusals are reached before any interpreter
+ * runs, and acceptance is shown by `failAfter: "recovery"`, which fires only after apply's own
+ * re-check of the live database has passed and before anything is installed.
+ */
+const STALE = ReasonCode.ROLLBACK_PAIR_STALE_DATABASE;
+const REMEDY = "seal a fresh pair from the stopped current database";
+
+/** One committed write, the kind the daemon makes every minute it runs. Read-write, so it leaves no sidecar. */
+const writeAuditEvent = (databasePath: string, kind: string): void => {
+  const raw = new Database(databasePath);
+  try {
+    raw
+      .prepare("INSERT INTO audit_events (at, kind, evidence_json) VALUES (?, ?, ?)")
+      .run(new Date().toISOString(), kind, "{}");
+  } finally {
+    raw.close();
+  }
+};
+
+const maxAuditEventId = (databasePath: string): number | null => {
+  const raw = new Database(databasePath);
+  try {
+    return raw.prepare("SELECT max(event_id) FROM audit_events").pluck().get() as number | null;
+  } finally {
+    raw.close();
+  }
+};
+
+/** The structured refusal an attempt ends in. An attempt that is accepted fails the row by saying so. */
+const refusal = (attempt: () => unknown): AcpError => {
+  try {
+    attempt();
+  } catch (error) {
+    if (isAcpError(error)) return error;
+    throw error;
+  }
+  throw new Error("accepted: the attempt was not refused");
+};
+
+/** Every byte and every name a refused rollback could have touched, as one comparable string. */
+const deploymentState = (fixture: Fixture, pair: SealedRollbackPair): string =>
+  JSON.stringify({
+    database: digestOfFile(fixture.databasePath),
+    state: readdirSync(dirname(fixture.databasePath)).sort(),
+    launchAgents: readdirSync(dirname(fixture.plistDestination)).sort(),
+    home: readdirSync(fixture.home).sort(),
+    appRoot: walk(fixture.appRoot),
+    pair: treeFingerprint(pair.root),
+  });
+
+describe("a rollback preserves every write made since its pair was sealed (SSOT U5)", () => {
+  it("records where the sealed image stood, and accepts a pair sealed from the stopped live database", async () => {
+    const fixture = makeFixture();
+    writeAuditEvent(fixture.databasePath, "before-the-seal");
+    const pair = await sealRollbackPair(fixture.pairsRoot, fixture.sources);
+
+    const highWater = pair.manifest.database.highWater;
+    expect(highWater, "the seal recorded no high-water mark for its database").toBeDefined();
+    expect(highWater!.contentSha256).toMatch(/^sha256:[a-f0-9]{64}$/);
+    expect(highWater!.userVersion).toBe(pair.manifest.identity.schemaVersion);
+    expect(highWater!.auditEventId).toBe(maxAuditEventId(fixture.databasePath));
+    // On disk, under the index the retained digest covers — not only in what `seal` returned.
+    expect(readPairManifest(pair.root).database.highWater).toEqual(highWater);
+
+    // Accepted at every point a rollback checks: validation, staging, and apply's re-check just
+    // before its first mutation. Reaching the injected failure is the proof the last one passed.
+    expect(() => validateRollbackPair(pair.root, expectationFor(fixture, pair))).not.toThrow();
+    expect(() =>
+      rollbackToSealedPair(pair.root, expectationFor(fixture, pair), join(fixture.home, "stage"), {
+        failAfter: "recovery",
+      }),
+    ).toThrow(/injected failure after recovery/);
+
+    // No live database at all is nothing to preserve: the rebuilt-machine case a pair exists for.
+    renameSync(fixture.databasePath, join(fixture.home, "moved-away.sqlite"));
+    expect(() => validateRollbackPair(pair.root, expectationFor(fixture, pair))).not.toThrow();
+  });
+
+  it("refuses a pair the live database has moved past, at every entrypoint, changing nothing", async () => {
+    const fixture = makeFixture();
+    writeAuditEvent(fixture.databasePath, "before-the-seal");
+    const pair = await sealRollbackPair(fixture.pairsRoot, fixture.sources);
+    // Staged while the pair was still current, so apply's own re-check is reached on its own below.
+    const staged = stageRollbackPair(pair.root, expectationFor(fixture, pair), join(fixture.home, "stage"));
+
+    writeAuditEvent(fixture.databasePath, "after-the-seal");
+    const written = maxAuditEventId(fixture.databasePath);
+    const before = deploymentState(fixture, pair);
+
+    const attempts: Array<[string, () => unknown]> = [
+      ["validate", () => validateRollbackPair(pair.root, expectationFor(fixture, pair))],
+      ["stage", () => stageRollbackPair(pair.root, expectationFor(fixture, pair), join(fixture.home, "stage-again"))],
+      ["rollback", () => rollbackToSealedPair(pair.root, expectationFor(fixture, pair), join(fixture.home, "stage-rb"))],
+      ["apply", () => applyRollbackPair(staged)],
+    ];
+    for (const [entrypoint, attempt] of attempts) {
+      const refused = refusal(attempt);
+      expect(refused.reasonCode, `${entrypoint}: ${refused.message}`).toBe(STALE);
+      expect(refused.message).toContain(REMEDY);
+      // Database bytes, sidecars, install destinations, the pair, and no stage or recovery copy.
+      expect(deploymentState(fixture, pair), `${entrypoint} changed something while refusing`).toBe(before);
+    }
+
+    // The evidence says how far the live database is past the seal, for the operator reading it.
+    const { sealed, live } = refusal(() => validateRollbackPair(pair.root, expectationFor(fixture, pair)))
+      .evidence as { sealed: RollbackPairDatabaseHighWater; live: RollbackPairDatabaseHighWater };
+    expect(live.auditEventId).toBe(sealed.auditEventId! + 1);
+
+    // The remedy the refusal names works: a pair sealed from the database as it is now is accepted,
+    // and the write the refusals protected is still there.
+    const fresh = await sealRollbackPair(fixture.pairsRoot, fixture.sources);
+    expect(() => validateRollbackPair(fresh.root, expectationFor(fixture, fresh))).not.toThrow();
+    expect(() =>
+      rollbackToSealedPair(fresh.root, expectationFor(fixture, fresh), join(fixture.home, "stage-fresh"), {
+        failAfter: "recovery",
+      }),
+    ).toThrow(/injected failure after recovery/);
+    expect(maxAuditEventId(fixture.databasePath)).toBe(written);
+  });
+
+  it("refuses a write no counter can see: an in-place update", async () => {
+    const fixture = makeFixture();
+    const insert = new Database(fixture.databasePath);
+    insert
+      .prepare(
+        "INSERT INTO capacity_snapshots (snapshot_id, provider, bucket_id, remaining_percent, capabilities_json, " +
+          "sensor_health, runtime_health, allocation_admission, observed_at, source) " +
+          "VALUES ('snapshot-1', 'provider', 'bucket', 80, '{}', 'HEALTHY', 'HEALTHY', 'OPEN', '2026-10-03T00:00:00Z', 'test')",
+      )
+      .run();
+    insert.close();
+    const pair = await sealRollbackPair(fixture.pairsRoot, fixture.sources);
+
+    const update = new Database(fixture.databasePath);
+    update.prepare("UPDATE capacity_snapshots SET remaining_percent = 12.5 WHERE snapshot_id = 'snapshot-1'").run();
+    update.close();
+
+    const refused = refusal(() => validateRollbackPair(pair.root, expectationFor(fixture, pair)));
+    expect(refused.reasonCode).toBe(STALE);
+    // Every counter agrees with the seal. Only the content says the database moved.
+    const { sealed, live } = refused.evidence as { sealed: RollbackPairDatabaseHighWater; live: RollbackPairDatabaseHighWater };
+    expect(live.auditEventId).toBe(sealed.auditEventId);
+    expect(live.userVersion).toBe(sealed.userVersion);
+    expect(live.contentSha256).not.toBe(sealed.contentSha256);
+  });
+
+  it("counts a write still in the write-ahead log, which the main file alone does not have", async () => {
+    const { fixture, pair } = await sealFixture();
+    const mainBefore = digestOfFile(fixture.databasePath);
+    const writer = new Database(fixture.databasePath);
+    try {
+      writer.pragma("wal_autocheckpoint = 0");
+      writer
+        .prepare("INSERT INTO audit_events (at, kind, evidence_json) VALUES (?, ?, ?)")
+        .run(new Date().toISOString(), "in-the-log", "{}");
+      // Committed, and only in the log: a check that read the main file would see no write at all.
+      expect(statSync(`${fixture.databasePath}-wal`).size).toBeGreaterThan(0);
+      expect(digestOfFile(fixture.databasePath)).toBe(mainBefore);
+      // The sidecars the writer holds are part of the live database too. A measurement that
+      // opened the live file in place would replay or checkpoint the log and rewrite the index,
+      // which the main file's bytes alone cannot show (ACP1058).
+      const sidecars = [`${fixture.databasePath}-wal`, `${fixture.databasePath}-shm`];
+      const sidecarsBefore = sidecars.map((path) => digestOfFile(path));
+      const namesBefore = readdirSync(dirname(fixture.databasePath)).sort();
+
+      const refused = refusal(() => validateRollbackPair(pair.root, expectationFor(fixture, pair)));
+      expect(refused.reasonCode).toBe(STALE);
+      expect(digestOfFile(fixture.databasePath), "measuring the live database changed it").toBe(mainBefore);
+      expect(
+        sidecars.map((path) => digestOfFile(path)),
+        "measuring the live database changed its -wal or -shm",
+      ).toEqual(sidecarsBefore);
+      expect(readdirSync(dirname(fixture.databasePath)).sort(), "measuring created or removed a name").toEqual(
+        namesBefore,
+      );
+    } finally {
+      writer.close();
+    }
+  });
+
+  it("refuses a pair sealed before the mark existed, and one whose mark is malformed", async () => {
+    const { fixture, pair } = await sealFixture();
+    // What the previous seal wrote: this manifest without the mark, under the digest it printed.
+    const manifest = readPairManifest(pair.root);
+    delete manifest.database.highWater;
+    writePairManifest(pair.root, manifest);
+    const legacyDigest = reindex(pair.root);
+    const before = deploymentState(fixture, pair);
+
+    // Refused although nothing has been written since the seal: unknown is not current.
+    for (const attempt of [
+      () => validateRollbackPair(pair.root, expectationFor(fixture, pair, { indexDigest: legacyDigest })),
+      () =>
+        rollbackToSealedPair(
+          pair.root,
+          expectationFor(fixture, pair, { indexDigest: legacyDigest }),
+          join(fixture.home, "stage-legacy"),
+        ),
+    ]) {
+      const refused = refusal(attempt);
+      expect(refused.reasonCode).toBe(STALE);
+      expect(refused.message).toMatch(/records no database high-water mark/);
+      expect(refused.message).toContain(REMEDY);
+      expect(deploymentState(fixture, pair)).toBe(before);
+    }
+
+    // Present but malformed is not a legacy pair; it is not a pair.
+    const forged = readPairManifest(pair.root);
+    forged.database.highWater = { contentSha256: "not-a-digest", userVersion: 1, auditEventId: null };
+    writePairManifest(pair.root, forged);
+    const forgedDigest = reindex(pair.root);
+    expect(() =>
+      validateRollbackPair(pair.root, expectationFor(fixture, pair, { indexDigest: forgedDigest })),
+    ).toThrow(/manifest has an invalid shape/);
+  });
+
+  /**
+   * Opens the database read-write, runs `statements`, and closes it, so no sidecar is left behind.
+   *
+   * Raw rather than through `Db`, so the only write between a seal and its check is the one a row
+   * makes. `Db` registers `acp_ingress_claim_authorized` on every connection it opens, and SQLite
+   * cannot prepare a write to `inbound_messages` whose triggers name an unknown function, so a raw
+   * connection registers it too — answering "not authorized", so the stub admits nothing a trigger
+   * guards. The rows here carry no turn claim, which is the only thing those triggers ask it about.
+   */
+  const writeTo = (databasePath: string, statements: (raw: Database.Database) => void): void => {
+    const raw = new Database(databasePath);
+    raw.function("acp_ingress_claim_authorized", { varargs: true }, () => 0);
+    try {
+      statements(raw);
+    } finally {
+      raw.close();
+    }
+  };
+
+  it("ACP1058-R2: refuses a write that moves only a row's hidden rowid, which ingress reads as arrival order", async () => {
+    const fixture = makeFixture();
+    writeTo(fixture.databasePath, (raw) =>
+      raw
+        .prepare(
+          "INSERT INTO inbound_messages (channel, nonce, actor, received_at) " +
+            "VALUES ('telegram', 'm1', 'owner', '2026-10-03T00:00:00Z')",
+        )
+        .run(),
+    );
+    const pair = await sealRollbackPair(fixture.pairsRoot, fixture.sources);
+    // Positive control: nothing has been written since the seal, so the pair is current.
+    expect(() => validateRollbackPair(pair.root, expectationFor(fixture, pair))).not.toThrow();
+
+    const declared = "SELECT * FROM inbound_messages ORDER BY channel, nonce";
+    let declaredBefore: unknown;
+    writeTo(fixture.databasePath, (raw) => {
+      declaredBefore = raw.prepare(declared).all();
+      expect(raw.prepare("UPDATE inbound_messages SET rowid = 100 WHERE nonce = 'm1'").run().changes).toBe(1);
+      // Only the hidden identity moved. Every declared value is what it was, and the moved value is
+      // one `pendingOwnerMessages` hands out as `arrivalSequence`.
+      expect(raw.prepare(declared).all()).toEqual(declaredBefore);
+      expect(raw.prepare("SELECT rowid FROM inbound_messages WHERE nonce = 'm1'").pluck().get()).toBe(100);
+    });
+    const before = deploymentState(fixture, pair);
+
+    const refused = refusal(() => validateRollbackPair(pair.root, expectationFor(fixture, pair)));
+    expect(refused.reasonCode, refused.message).toBe(STALE);
+    expect(refused.message).toMatch(/live database has changed since this pair was sealed/);
+    const { sealed, live } = refused.evidence as {
+      sealed: RollbackPairDatabaseHighWater;
+      live: RollbackPairDatabaseHighWater;
+    };
+    expect(live.auditEventId).toBe(sealed.auditEventId);
+    expect(live.userVersion).toBe(sealed.userVersion);
+    expect(live.contentSha256).not.toBe(sealed.contentSha256);
+    expect(deploymentState(fixture, pair), "the refusal changed something").toBe(before);
+  });
+
+  it("ACP1058-R2: reaches a hidden rowid through whichever name is not shadowed, and keys a WITHOUT ROWID table by its declared key", async () => {
+    const fixture = makeFixture();
+    writeTo(fixture.databasePath, (raw) => {
+      // `rowid` is a declared column here, so the name no longer reaches the row's identity.
+      raw.exec("CREATE TABLE acp1058_shadowed (rowid TEXT, payload TEXT)");
+      raw.exec("INSERT INTO acp1058_shadowed (rowid, payload) VALUES ('declared', 'kept')");
+      // No hidden rowid at all: the declared primary key is the row's whole identity.
+      raw.exec("CREATE TABLE acp1058_keyed (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID");
+      raw.exec("INSERT INTO acp1058_keyed (k, v) VALUES ('a', 'one'), ('b', 'two')");
+    });
+    const pair = await sealRollbackPair(fixture.pairsRoot, fixture.sources);
+    // Positive control, and the proof a WITHOUT ROWID table is measured at all: selecting a rowid
+    // from it is an error, so a digest that asked for one would refuse every pair here.
+    expect(() => validateRollbackPair(pair.root, expectationFor(fixture, pair))).not.toThrow();
+
+    writeTo(fixture.databasePath, (raw) =>
+      expect(raw.prepare("UPDATE acp1058_shadowed SET _rowid_ = 100").run().changes).toBe(1),
+    );
+    const moved = refusal(() => validateRollbackPair(pair.root, expectationFor(fixture, pair)));
+    expect(moved.reasonCode, moved.message).toBe(STALE);
+
+    // A WITHOUT ROWID table's key and values are declared columns, so a write to either is seen.
+    const keyedFixture = makeFixture();
+    writeTo(keyedFixture.databasePath, (raw) => {
+      raw.exec("CREATE TABLE acp1058_keyed (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID");
+      raw.exec("INSERT INTO acp1058_keyed (k, v) VALUES ('a', 'one'), ('b', 'two')");
+    });
+    const keyedPair = await sealRollbackPair(keyedFixture.pairsRoot, keyedFixture.sources);
+    expect(() => validateRollbackPair(keyedPair.root, expectationFor(keyedFixture, keyedPair))).not.toThrow();
+    writeTo(keyedFixture.databasePath, (raw) => raw.exec("UPDATE acp1058_keyed SET k = 'c' WHERE k = 'a'"));
+    const rekeyed = refusal(() => validateRollbackPair(keyedPair.root, expectationFor(keyedFixture, keyedPair)));
+    expect(rekeyed.reasonCode, rekeyed.message).toBe(STALE);
+  });
+
+  it("ACP1058-R2: refuses to measure a table whose every rowid name is shadowed, rather than leaving its identity out", async () => {
+    const fixture = makeFixture();
+    writeTo(fixture.databasePath, (raw) => {
+      raw.exec('CREATE TABLE acp1058_opaque ("rowid" TEXT, "_rowid_" TEXT, "OID" TEXT)');
+      raw.exec("INSERT INTO acp1058_opaque VALUES ('a', 'b', 'c')");
+    });
+    const published = (): string[] => (existsSync(fixture.pairsRoot) ? readdirSync(fixture.pairsRoot) : []);
+    const before = published();
+    await expect(sealRollbackPair(fixture.pairsRoot, fixture.sources)).rejects.toThrow(
+      /no name reaches its hidden rowid/,
+    );
+    expect(published(), "a refused seal published a pair").toEqual(before);
+  });
+
+  it("ACP1058-R2: refuses a mark recorded under another content definition instead of comparing digests that cannot agree", async () => {
+    const { fixture, pair } = await sealFixture();
+    const sealedMark = pair.manifest.database.highWater!;
+    expect(sealedMark.contentFormat, "the seal did not say which definition its digest follows").toBe(
+      "agent-control-plane.database-content/v2",
+    );
+
+    // v1 hashed declared values only and recorded no label; a label this build does not measure
+    // under is the same case. Neither digest is comparable with a live v2 one, so neither is
+    // compared: nothing has been written since the seal, and both are still refused, explicitly.
+    for (const contentFormat of [undefined, "agent-control-plane.database-content/v1"]) {
+      const manifest = readPairManifest(pair.root);
+      if (contentFormat === undefined) delete manifest.database.highWater!.contentFormat;
+      else manifest.database.highWater!.contentFormat = contentFormat;
+      writePairManifest(pair.root, manifest);
+      const indexDigest = reindex(pair.root);
+      const before = deploymentState(fixture, pair);
+
+      for (const attempt of [
+        () => validateRollbackPair(pair.root, expectationFor(fixture, pair, { indexDigest })),
+        () =>
+          rollbackToSealedPair(
+            pair.root,
+            expectationFor(fixture, pair, { indexDigest }),
+            join(fixture.home, "stage-format"),
+          ),
+      ]) {
+        const refused = refusal(attempt);
+        expect(refused.reasonCode, refused.message).toBe(STALE);
+        expect(refused.message).toMatch(/recorded under a different database content definition/);
+        expect(refused.message).toContain(REMEDY);
+        expect(deploymentState(fixture, pair), `${String(contentFormat)} changed something`).toBe(before);
+      }
+    }
+
+    // A label that is not a string is not an older definition; it is not a pair.
+    const forged = readPairManifest(pair.root);
+    (forged.database.highWater as unknown as { contentFormat: unknown }).contentFormat = 2;
+    writePairManifest(pair.root, forged);
+    const forgedDigest = reindex(pair.root);
+    expect(() =>
+      validateRollbackPair(pair.root, expectationFor(fixture, pair, { indexDigest: forgedDigest })),
+    ).toThrow(/manifest has an invalid shape/);
   });
 });
