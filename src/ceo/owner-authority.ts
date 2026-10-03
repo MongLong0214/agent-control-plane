@@ -30,8 +30,9 @@ export interface OwnerAuthorityPort {
   assertConsumedApproval(receipt: OwnerApprovalReceipt, candidateSnapshotDigest: string | null): Decision<void>;
   /**
    * Atomically consume an admitted receipt for the candidate (or null for a non-candidate
-   * owner operation). Retained artifacts use assertApproval; only an authorising write calls
-   * this one-way transition.
+   * owner operation). A receipt minted for a candidate is consumed for that candidate only.
+   * Retained artifacts use assertApproval; only an authorising write calls this one-way
+   * transition.
    */
   consumeApproval(receipt: OwnerApprovalReceipt, candidateSnapshotDigest: string | null): Decision<void>;
 }
@@ -190,18 +191,9 @@ export class OwnerAuthority implements OwnerAuthorityPort {
 
       const receiptDigest = digestOf(receipt);
       const prior = this.consumedReceipt(receiptDigest);
+      const bound = this.candidateBinding(receipt, receiptDigest, prior, candidateSnapshotDigest);
+      if (!bound.allowed) return bound;
       if (prior) {
-        if (prior.candidateSnapshotDigest !== candidateSnapshotDigest) {
-          return deny(
-            ReasonCode.EVIDENCE_STALE,
-            "owner approval receipt was consumed for a different candidate",
-            {
-              receiptDigest,
-              approvedCandidateSnapshotDigest: prior.candidateSnapshotDigest,
-              presentedCandidateSnapshotDigest: candidateSnapshotDigest,
-            },
-          );
-        }
         return deny(
           ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
           "owner approval receipt has already been consumed",
@@ -256,7 +248,10 @@ export class OwnerAuthority implements OwnerAuthorityPort {
     receipt: OwnerApprovalReceipt,
     candidateSnapshotDigest: string | null,
   ): Decision<void> {
-    const prior = this.consumedReceipt(digestOf(receipt));
+    const receiptDigest = digestOf(receipt);
+    const prior = this.consumedReceipt(receiptDigest);
+    const bound = this.candidateBinding(receipt, receiptDigest, prior, candidateSnapshotDigest);
+    if (!bound.allowed) return bound;
     if (!prior) {
       return deny(
         ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
@@ -264,17 +259,72 @@ export class OwnerAuthority implements OwnerAuthorityPort {
         { candidateSnapshotDigest },
       );
     }
-    if (prior.candidateSnapshotDigest !== candidateSnapshotDigest) {
+    return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * Whether this receipt may authorise this candidate — the one judgement consumption and
+   * re-admission share, so neither can bind a receipt to a candidate the other would refuse.
+   * `candidateSnapshotDigest` null is a non-candidate owner operation (a repair), which binds no
+   * candidate and is judged only against its own prior consumption.
+   *
+   * - A receipt minted while its run named a candidate authorises that candidate only. Admission
+   *   compares it with the run's pointer, but a caller may consume for the candidate it was
+   *   handed — a bootstrap CONFIRM names its own — so this is where a receipt for S is refused
+   *   for T, before anything is consumed (PR #1050 review, RF1050-03).
+   * - A receipt minted with no candidate (an unpromoted bootstrap) is bound to the candidate it
+   *   is first consumed for, and to no other afterwards.
+   * - A receipt consumed with no candidate authorises none. The bootstrap heads before RF1050-01
+   *   consumed Repo Factory approvals that way, not knowing the candidate the CEO confirmed, so
+   *   that record cannot say which candidate it served. It is refused with its remedy named rather
+   *   than read as authority for whichever candidate is presented next, which would let one
+   *   approval serve two confirmations; a new owner decision serves the run (RF1050-04).
+   */
+  private candidateBinding(
+    receipt: OwnerApprovalReceipt,
+    receiptDigest: string,
+    prior: { candidateSnapshotDigest: string | null } | null,
+    candidateSnapshotDigest: string | null,
+  ): Decision<void> {
+    if (
+      candidateSnapshotDigest !== null &&
+      receipt.candidateSnapshotDigest !== null &&
+      receipt.candidateSnapshotDigest !== candidateSnapshotDigest
+    ) {
       return deny(
         ReasonCode.EVIDENCE_STALE,
-        "retained owner decision belongs to a different candidate",
+        "owner approval receipt names a different candidate than the one it is presented for",
         {
-          approvedCandidateSnapshotDigest: prior.candidateSnapshotDigest,
-          currentCandidateSnapshotDigest: candidateSnapshotDigest,
+          receiptDigest,
+          approvedCandidateSnapshotDigest: receipt.candidateSnapshotDigest,
+          presentedCandidateSnapshotDigest: candidateSnapshotDigest,
         },
       );
     }
-    return allow(ReasonCode.OK, undefined);
+    if (prior === null || prior.candidateSnapshotDigest === candidateSnapshotDigest) {
+      return allow(ReasonCode.OK, undefined);
+    }
+    if (prior.candidateSnapshotDigest === null) {
+      return deny(
+        ReasonCode.EVIDENCE_STALE,
+        "owner approval receipt was consumed without naming a candidate, so it authorises none; a new owner decision is required",
+        {
+          receiptDigest,
+          approvedCandidateSnapshotDigest: null,
+          presentedCandidateSnapshotDigest: candidateSnapshotDigest,
+          remedy: "NEW_OWNER_DECISION",
+        },
+      );
+    }
+    return deny(
+      ReasonCode.EVIDENCE_STALE,
+      "owner approval receipt was consumed for a different candidate",
+      {
+        receiptDigest,
+        approvedCandidateSnapshotDigest: prior.candidateSnapshotDigest,
+        presentedCandidateSnapshotDigest: candidateSnapshotDigest,
+      },
+    );
   }
 
   /** Doctor input: a deployment with no owner identity cannot satisfy a human gate. */

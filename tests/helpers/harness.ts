@@ -1,7 +1,7 @@
 import { join } from "node:path";
 
 import { ManualClock } from "../../src/core/clock.ts";
-import { ControlPlane } from "../../src/app/control-plane.ts";
+import { ControlPlane, type ControlPlaneConfig } from "../../src/app/control-plane.ts";
 import { PROJECT_MANIFEST_SCHEMA_ID, manifestDigest, type ProjectManifest } from "../../src/contracts/manifest.ts";
 import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { Daemon, type AuthenticatedOperatorPeer } from "../../src/daemon/daemon.ts";
@@ -73,6 +73,8 @@ export const makeHarness = (
      * cannot lose anything the first one had.
      */
     root?: string;
+    /** Issue #246 — the Repo Factory work root and GitHub double the composed runner uses. */
+    repoFactory?: ControlPlaneConfig["repoFactory"];
   } = {},
 ): Harness => {
   const root = options.root ?? tempDir("acp-harness-");
@@ -121,6 +123,7 @@ console.log('verification ok');`,
     ...(options.githubKernelOptions ? { githubKernelOptions: options.githubKernelOptions } : {}),
     ...(options.githubAppEnvFile ? { githubAppEnvFile: options.githubAppEnvFile } : {}),
     ...(options.githubAppPrivateKeyPath ? { githubAppPrivateKeyPath: options.githubAppPrivateKeyPath } : {}),
+    ...(options.repoFactory ? { repoFactory: options.repoFactory } : {}),
   });
 
   // A route for the roles the control plane binds. The daemon wires the real CLI
