@@ -17,6 +17,12 @@ import {
   type PeerMessageSuccession,
   peerMessageCarrySuccessionOf,
 } from "../registry/canonical-self-claim.ts";
+import { digestOf } from "../core/digest.ts";
+import {
+  type PeerMessageNoticeAuthority,
+  type PeerMessageNoticeEntry,
+  peerMessageNoticeEntryOf,
+} from "../outbox/outbox.ts";
 import {
   DEFAULT_BACKUP_RETENTION,
   assertIntegrity,
@@ -64,6 +70,20 @@ export interface DatabaseDiagnostics {
 
 const USER_VERSION_PRAGMA = /^\s*user_version(?:\s*=\s*\d+)?\s*;?\s*$/i;
 const TABLE_INFO_PRAGMA = /^\s*PRAGMA\s+(?:main\.)?table_info\s*\([^)]*\)\s*;?\s*$/i;
+
+/**
+ * The digest of a stored ingress payload as admission digested it (`digestOf` over the parsed
+ * JSON), or null when there is no payload or it does not parse. Read by the carry record's insert
+ * trigger (ACP-RESTART-02), so it never throws into SQLite.
+ */
+const admittedPayloadDigest = (payloadJson: unknown): string | null => {
+  if (typeof payloadJson !== "string") return null;
+  try {
+    return digestOf(JSON.parse(payloadJson) as unknown);
+  } catch {
+    return null;
+  }
+};
 
 const firstSqlVerb = (sql: string): string =>
   sql
@@ -279,6 +299,8 @@ export class Db {
   #ingressDeleteMarkers: Array<{ channel: string }> = [];
   /** The one succession a peer-message carry may record, while the self-claim's carry writes. */
   #peerMessageCarryMarkers: PeerMessageSuccession[] = [];
+  /** The one refusal-notice entry the outbox may write, while it writes it (ACP-RESTART-04). */
+  #peerMessageNoticeMarkers: PeerMessageNoticeEntry[] = [];
 
   /**
    * The file this connection opened. Capability issuance is keyed by it: two `Db` objects
@@ -402,9 +424,17 @@ export class Db {
       fromSessionId: unknown, fromSessionIncarnation: unknown, fromGeneration: unknown, fromAssignmentId: unknown,
       toSessionId: unknown, toSessionIncarnation: unknown, toGeneration: unknown, toAssignmentId: unknown,
       actorId: unknown, conversationUuid: unknown, buzzActorId: unknown, recoveryAuditEventId: unknown,
+      sourcePayloadDigest: unknown, admittedPayloadJson: unknown,
     ) => {
       const marker = this.#peerMessageCarryMarkers[this.#peerMessageCarryMarkers.length - 1];
-      return marker &&
+      // ACP-RESTART-02: the digest a record states is the digest of the admitted row its key names
+      // at the moment it is written — the trigger hands that row over — and a CARRIED record must
+      // state one. Never the outbox pointer's, which any statement can rewrite.
+      const digestHolds = sourcePayloadDigest === null
+        ? outcome === "REFUSED"
+        : typeof sourcePayloadDigest === "string" &&
+          admittedPayloadDigest(admittedPayloadJson) === sourcePayloadDigest;
+      return marker && digestHolds &&
         (outcome === "REFUSED" || (outcome === "CARRIED" && marker.proven)) &&
         marker.roleKey === roleKey &&
         marker.fromSessionId === fromSessionId &&
@@ -419,6 +449,28 @@ export class Db {
         marker.conversationUuid === conversationUuid &&
         marker.buzzActorId === buzzActorId &&
         marker.recoveryAuditEventId === recoveryAuditEventId
+        ? 1
+        : 0;
+    });
+    // ACP-RESTART-04: a refusal-notice entry is accepted only while the outbox holds the marker for
+    // exactly this entry, every column of it.
+    this.#raw.function("acp_peer_message_notice_authorized", (
+      messageId: unknown, entry: unknown, roleKey: unknown, reason: unknown, sender: unknown,
+      sourceChannel: unknown, sourceNonce: unknown, bindingGeneration: unknown, sessionId: unknown,
+      sessionIncarnation: unknown,
+    ) => {
+      const marker = this.#peerMessageNoticeMarkers[this.#peerMessageNoticeMarkers.length - 1];
+      return marker &&
+        marker.messageId === messageId &&
+        marker.entry === entry &&
+        marker.roleKey === roleKey &&
+        marker.reason === reason &&
+        marker.sender === sender &&
+        marker.sourceChannel === sourceChannel &&
+        marker.sourceNonce === sourceNonce &&
+        marker.bindingGeneration === bindingGeneration &&
+        marker.sessionId === sessionId &&
+        marker.sessionIncarnation === sessionIncarnation
         ? 1
         : 0;
     });
@@ -1007,6 +1059,27 @@ export class Db {
     try { return write(); } finally { this.#peerMessageCarryMarkers.pop(); }
   }
 
+  /**
+   * Writes one peer-message refusal-notice entry (ACP-RESTART-04) under the marker its insert
+   * trigger requires.
+   *
+   * The authority is minted only by the outbox, at the fence that rejects a queued peer message and
+   * at the current holder's report, for that one entry; this checks the brand and takes the entry
+   * from the token, never from the caller. So a raw statement cannot write an entry, and a holder
+   * of the authority cannot write any other.
+   */
+  withPeerMessageNotice<T>(authority: PeerMessageNoticeAuthority, write: () => T): T {
+    const entry = peerMessageNoticeEntryOf(authority, this);
+    if (entry === null) {
+      return fail(ReasonCode.COMPLETION_AUTHORITY_DENIED, "PEER_MESSAGE_NOTICE_AUTHORITY_DENIED", {});
+    }
+    if (!this.#raw.inTransaction) {
+      return fail(ReasonCode.COMPLETION_AUTHORITY_DENIED, "a peer-message notice requires the fence's transaction", {});
+    }
+    this.#peerMessageNoticeMarkers.push(entry);
+    try { return write(); } finally { this.#peerMessageNoticeMarkers.pop(); }
+  }
+
   /** The ingress guard alone may remove expired or superseded replay evidence. */
   withIngressDelete<T>(authority: IngressDeleteAuthority, channel: string, write: () => T): T {
     if (!isIngressDeleteAuthority(authority, this, channel)) {
@@ -1255,6 +1328,12 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   PEER_MESSAGE_CARRY_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
   PEER_MESSAGE_CARRY_NO_REPLACE: ReasonCode.CONFLICT,
   PEER_MESSAGE_CARRY_IMMUTABLE: ReasonCode.CONFLICT,
+  // ACP-RESTART-04 — the notice owed to the CEO is evidence only the outbox may write, never
+  // rewritten or removed; ACP-RESTART-02 — a Buzz event's admitted row keeps its key.
+  PEER_MESSAGE_NOTICE_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
+  PEER_MESSAGE_NOTICE_NO_REPLACE: ReasonCode.CONFLICT,
+  PEER_MESSAGE_NOTICE_IMMUTABLE: ReasonCode.CONFLICT,
+  INBOUND_BUZZ_SOURCE_KEY_IMMUTABLE: ReasonCode.CONFLICT,
   // The canonical-turn ledger, which had no entries here at all: every one of its denials came
   // out of `db.tx` as a raw Error rather than as a typed refusal, so a claim whose source insert
   // tripped a guard threw instead of denying. The guards are what this ledger is *for*, and the

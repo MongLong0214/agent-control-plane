@@ -86,7 +86,7 @@ import {
   buzzMessageSigningRequest,
   deliverBuzzMessage,
   ownerMessagePointerOf,
-  peerMessageRefusalsFor,
+  peerMessageRefusalNoticeOf,
   peerProofIsCurrent,
   selfClaimCarriedTo,
   type BuzzMentionRouter,
@@ -654,7 +654,7 @@ export const startLocalMcpListeners = async (
           respond(await ctoConversation.registerEndpoint(server, args.endpoint)),
       );
       /*
-       * The three owner-message tools, registered in this same composition — not on a second
+       * The owner-message tools, registered in this same composition — not on a second
        * server, and not against a durable endpoint registry.
        *
        * `roleKey` is the only thing a caller may say, and it is a **lookup key**: it selects
@@ -694,6 +694,17 @@ export const startLocalMcpListeners = async (
         },
         async (args: { roleKey: string; messageId: string }) =>
           respond(ctoConversation.rejectOwnerMessage(server, args.roleKey, args.messageId)),
+      );
+      server.registerTool(
+        "role_owner_message_report_refusal",
+        {
+          description:
+            "Record that this connection told the CEO about one rejected peer message the claim " +
+            "listed under `refusedAtRestart`, so later holders are no longer shown it.",
+          inputSchema: { roleKey: z.string().min(1), messageId: z.string().min(1) },
+        },
+        async (args: { roleKey: string; messageId: string }) =>
+          respond(ctoConversation.reportPeerMessageRefusal(server, args.roleKey, args.messageId)),
       );
     }
     return server;
@@ -3609,10 +3620,13 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
         );
         const unresolved = taken.unresolved;
         const withheld = taken.withheld;
-        // ACP-PEER-SUCCESSION-01: the CEO peer messages this holder's own restart refused to carry,
-        // by id, event and reason and never their text, so the CTO can tell the CEO in the thread.
+        // ACP-PEER-SUCCESSION-01, ACP-RESTART-04: the CEO peer messages ACP rejected while they
+        // were queued for this role — on a revoke, a takeover, a runtime move or a restart that
+        // refused to carry them — that no holder has reported yet, by id, event, signer and reason
+        // and never their text, so the CTO can tell the CEO in the thread and then report it.
+        // Shown to the role's exact current holder only, whether or not it is the carry successor.
         // Present only when there is one, so a handover without any keeps its shape.
-        const refusals = peerMessageRefusalsFor(cp.db, holder);
+        const refusals = cp.outbox.peerMessageRefusalNoticesFor(holder).map(peerMessageRefusalNoticeOf);
         const notices = refusals.length > 0 ? { refusedAtRestart: refusals } : {};
         const message = taken.claimed[0];
         // Nothing new was handed over: either the queue is empty, or an unresolved hand-over is
@@ -3724,6 +3738,13 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
         if (refusal) return refusal;
         return cp.outbox.rejectForHolder(messageId, holder);
       }),
+
+    /**
+     * ACP-RESTART-04 — the role's current holder says it told the CEO about one rejected peer
+     * message listed under `refusedAtRestart`, which retires that notice for every later holder.
+     */
+    reportRefusal: (messageId: string, holder: HolderIdentity): Decision<void> =>
+      cp.outbox.reportPeerMessageRefusal(messageId, holder),
   };
 };
 

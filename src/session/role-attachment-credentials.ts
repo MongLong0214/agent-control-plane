@@ -196,6 +196,10 @@ export class RoleAttachmentCredentials {
       description: "Reject a message held by this connection.",
       inputSchema: { roleKey: z.string().min(1), messageId: z.string().min(1) },
     }, async ({ roleKey, messageId }) => respond(port.rejectOwnerMessage(server, roleKey, messageId)));
+    server.registerTool("role_owner_message_report_refusal", {
+      description: "Record that this connection told the CEO about one refused peer message.",
+      inputSchema: { roleKey: z.string().min(1), messageId: z.string().min(1) },
+    }, async ({ roleKey, messageId }) => respond(port.reportPeerMessageRefusal(server, roleKey, messageId)));
     return allow(ReasonCode.OK, close);
   }
 

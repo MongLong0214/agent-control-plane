@@ -454,6 +454,8 @@ const asV34Fixture = (path: string, options: { unresolvedTurn?: boolean } = {}):
       DROP TRIGGER IF EXISTS inbound_messages_delete_authority;
       DROP TRIGGER IF EXISTS inbound_claim_authority_markers_insert_guard;
       DROP TABLE IF EXISTS inbound_claim_authority_markers;
+      -- v40's carry guard reads the admitted payload (ACP-RESTART-02); a v34 image has no v40 guard.
+      DROP TRIGGER IF EXISTS peer_message_carries_insert_authority;
     `);
     const present = raw
       .prepare("SELECT 1 AS present FROM pragma_table_info('inbound_messages') WHERE name = 'payload_json'")

@@ -130,8 +130,11 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   /-- CP-HI-06 — DELETE followed by INSERT is also a first claim\.[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_override_insert_authority[\s\S]*?\nEND;/,
   // v39 alone installs this guard, the owner-reply intent's key (R1056-02).
   /-- CP-HI-06 — an owner reply's recorded intent \(#1036, R1056-02\) is found by its key alone[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_owner_reply_key_immutable[\s\S]*?\nEND;/,
-  // v40 alone creates the peer-message carry record and its guards (ACP-PEER-SUCCESSION-01).
-  /-- -{75}\n-- peer_message_carries[\s\S]*?CREATE INDEX IF NOT EXISTS peer_message_carries_by_successor[^;]*;/,
+  // v40 alone creates the peer-message carry record and its guards (ACP-PEER-SUCCESSION-01), and
+  // the refusal notices beside them (ACP-RESTART-04).
+  /-- -{75}\n-- peer_message_carries[\s\S]*?CREATE INDEX IF NOT EXISTS peer_message_refusal_notices_by_role[^;]*;/,
+  // v40 alone installs the Buzz source key guard (ACP-RESTART-02).
+  /-- CP-HI-06 — a Buzz event's admitted row \(ACP-RESTART-02, schema v40\)[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_buzz_source_key_immutable[\s\S]*?\nEND;/,
 ];
 
 /**
@@ -2668,12 +2671,34 @@ const v39: SchemaMigration = {
   checksum: () => migrationChecksum("v39-owner-reply-intent-keeps-its-key", SCHEMA_VERSION),
 };
 
-/** v40's guards over the carry record, read from schema.sql by name. */
+/**
+ * v40's guards, read from schema.sql by name: over the carry record, over the refusal notices
+ * (ACP-RESTART-04), and over a Buzz event's admitted key (ACP-RESTART-02).
+ */
 const V40_PEER_MESSAGE_CARRY_TRIGGER_NAMES: readonly string[] = [
   "peer_message_carries_insert_authority",
   "peer_message_carries_no_replace",
   "peer_message_carries_immutable",
   "peer_message_carries_no_delete",
+  "peer_message_refusal_notices_insert_authority",
+  "peer_message_refusal_notices_no_replace",
+  "peer_message_refusal_notices_immutable",
+  "peer_message_refusal_notices_no_delete",
+  "inbound_messages_buzz_source_key_immutable",
+];
+
+/** v40's two record tables, each with its one index, read from schema.sql by pattern. */
+const V40_RECORD_TABLES: ReadonlyArray<{ name: string; table: RegExp; index: RegExp }> = [
+  {
+    name: "peer_message_carries",
+    table: /CREATE TABLE IF NOT EXISTS peer_message_carries \([\s\S]*?\n\);/,
+    index: /CREATE INDEX IF NOT EXISTS peer_message_carries_by_successor[^;]*;/,
+  },
+  {
+    name: "peer_message_refusal_notices",
+    table: /CREATE TABLE IF NOT EXISTS peer_message_refusal_notices \([\s\S]*?\n\);/,
+    index: /CREATE INDEX IF NOT EXISTS peer_message_refusal_notices_by_role[^;]*;/,
+  },
 ];
 
 /**
@@ -2683,12 +2708,17 @@ const V40_PEER_MESSAGE_CARRY_TRIGGER_NAMES: readonly string[] = [
  * `actor` text, both of which an ordinary statement writes. This creates the record — an append-only
  * table whose insert needs the self-claim's connection-local carry marker — and its guards.
  *
- * Additive: one new table, its index and four triggers; no existing row or object is changed, so
- * every v39 row is kept as it is. A queued peer message written before this has no record and is
+ * Beside it, the notices the CEO is owed for every queued peer message a fence rejects
+ * (ACP-RESTART-04): an append-only table whose insert needs the outbox's connection-local notice
+ * marker. And one guard on an existing table, `inbound_messages`: a Buzz event's admitted row keeps
+ * its key (ACP-RESTART-02), since the carry record names that row by its key.
+ *
+ * Additive: two new tables, an index each, and nine triggers; no existing row or object is changed,
+ * so every v39 row is kept as it is. A queued peer message written before this has no record and is
  * carried by nothing until a v40 restart decides it.
  *
- * v12 and v13 replay a fixed snapshot that does not contain the table, but a chain test can build a
- * v39 image out of a current database, which does. So a table already present is accepted only
+ * v12 and v13 replay a fixed snapshot that does not contain the tables, but a chain test can build
+ * a v39 image out of a current database, which does. So a table already present is accepted only
  * when it is exactly schema.sql's and empty — a populated one holds records nothing here vouched
  * for, and stamping it v40 would make them evidence. The triggers are dropped and recreated, as v39
  * does for its own, so the chain always ends with schema.sql's bodies.
@@ -2701,31 +2731,25 @@ const v40: SchemaMigration = {
   fromVersion: 39,
   toVersion: 40,
   apply: (raw) => {
-    const tableDdl = schemaObject(
-      /CREATE TABLE IF NOT EXISTS peer_message_carries \([\s\S]*?\n\);/,
-      "the peer_message_carries table",
-      SCHEMA_VERSION,
-    );
-    const indexDdl = schemaObject(
-      /CREATE INDEX IF NOT EXISTS peer_message_carries_by_successor[^;]*;/,
-      "the peer_message_carries index",
-      SCHEMA_VERSION,
-    );
-    const existing = (raw.prepare(
-      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'peer_message_carries'",
-    ).get() as { sql: string } | undefined)?.sql;
-    if (existing !== undefined) {
-      const normalise = (sql: string): string => sql
-        .replace(/^CREATE TABLE IF NOT EXISTS /i, "CREATE TABLE ")
-        .replace(/--[^\n]*/g, "").replace(/"/g, "").replace(/;\s*$/, "").replace(/\s+/g, " ").trim();
-      if (normalise(existing) !== normalise(tableDdl)
-          || raw.prepare("SELECT 1 FROM peer_message_carries LIMIT 1").get()) {
-        throw new Error("v40 pre-existing peer_message_carries table does not match the current schema or is populated");
+    for (const record of V40_RECORD_TABLES) {
+      const tableDdl = schemaObject(record.table, `the ${record.name} table`, SCHEMA_VERSION);
+      const indexDdl = schemaObject(record.index, `the ${record.name} index`, SCHEMA_VERSION);
+      const existing = (raw.prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+      ).get(record.name) as { sql: string } | undefined)?.sql;
+      if (existing !== undefined) {
+        const normalise = (sql: string): string => sql
+          .replace(/^CREATE TABLE IF NOT EXISTS /i, "CREATE TABLE ")
+          .replace(/--[^\n]*/g, "").replace(/"/g, "").replace(/;\s*$/, "").replace(/\s+/g, " ").trim();
+        if (normalise(existing) !== normalise(tableDdl)
+            || raw.prepare(`SELECT 1 FROM ${record.name} LIMIT 1`).get()) {
+          throw new Error(`v40 pre-existing ${record.name} table does not match the current schema or is populated`);
+        }
+      } else {
+        raw.exec(tableDdl);
       }
-    } else {
-      raw.exec(tableDdl);
+      raw.exec(indexDdl);
     }
-    raw.exec(indexDdl);
     raw.exec(dropsFor(V40_PEER_MESSAGE_CARRY_TRIGGER_NAMES));
     raw.exec(triggerDdlFor(V40_PEER_MESSAGE_CARRY_TRIGGER_NAMES, SCHEMA_VERSION));
   },
@@ -2884,6 +2908,11 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "peer_message_carries_no_replace", sentinel: "PEER_MESSAGE_CARRY_NO_REPLACE", introducedIn: 40 },
   { name: "peer_message_carries_immutable", sentinel: "PEER_MESSAGE_CARRY_IMMUTABLE", introducedIn: 40 },
   { name: "peer_message_carries_no_delete", sentinel: "PEER_MESSAGE_CARRY_IMMUTABLE", introducedIn: 40 },
+  { name: "peer_message_refusal_notices_insert_authority", sentinel: "PEER_MESSAGE_NOTICE_AUTHORITY_DENIED", introducedIn: 40 },
+  { name: "peer_message_refusal_notices_no_replace", sentinel: "PEER_MESSAGE_NOTICE_NO_REPLACE", introducedIn: 40 },
+  { name: "peer_message_refusal_notices_immutable", sentinel: "PEER_MESSAGE_NOTICE_IMMUTABLE", introducedIn: 40 },
+  { name: "peer_message_refusal_notices_no_delete", sentinel: "PEER_MESSAGE_NOTICE_IMMUTABLE", introducedIn: 40 },
+  { name: "inbound_messages_buzz_source_key_immutable", sentinel: "INBOUND_BUZZ_SOURCE_KEY_IMMUTABLE", introducedIn: 40 },
   { name: "canonical_turn_sources_admission_matches_claim", sentinel: "CANONICAL_TURN_SOURCE_NOT_CLAIM_TIME", introducedIn: 32 },
 ];
 

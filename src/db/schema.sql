@@ -1174,7 +1174,10 @@ CREATE INDEX IF NOT EXISTS outbox_retry_ready ON outbox(next_attempt_at) WHERE s
 --   successor is shown so it can tell the CEO. Written in the claim transaction that recovers the
 --   predecessor, binds the successor and moves the outbox row, or not at all.
 --   Integrity: the peer hand-over accepts a holder other than the one the admission proof names
---   only through a CARRIED record that matches it field for field. The outbox row's
+--   only through a CARRIED record that matches it field for field, and only while the admitted
+--   row at the record's key still digests to the record's `source_payload_digest` (ACP-RESTART-02)
+--   — the digest the insert trigger verified against that row when the record was written, never
+--   the outbox pointer's, which any statement can rewrite. The outbox row's
 --   OUTBOX_RETARGETED mark and the recovery audit row's `actor` text are ordinary columns any
 --   statement can write, and are not evidence of anything. A record is inserted only under the
 --   connection-local marker `Db.withPeerMessageCarry` raises for one exact succession, from a
@@ -1189,6 +1192,10 @@ CREATE TABLE IF NOT EXISTS peer_message_carries (
   -- The admitted event, as the outbox row's pointer names it: the ingress row's key.
   source_channel           TEXT,
   source_nonce             TEXT,
+  -- ACP-RESTART-02: the digest of the payload the admitted row at that key held when the record
+  -- was written, verified by the insert trigger against that row. Null only on a REFUSED record
+  -- whose source could not be read.
+  source_payload_digest    TEXT,
   role_key                 TEXT NOT NULL,
   from_session_id          TEXT NOT NULL,
   from_session_incarnation TEXT NOT NULL,
@@ -1208,7 +1215,8 @@ CREATE TABLE IF NOT EXISTS peer_message_carries (
   created_at               TEXT NOT NULL,
   PRIMARY KEY (message_id, outcome),
   CHECK ((outcome = 'CARRIED') = (refusal IS NULL)),
-  CHECK (outcome = 'REFUSED' OR (source_channel IS NOT NULL AND source_nonce IS NOT NULL)),
+  CHECK (outcome = 'REFUSED' OR (source_channel IS NOT NULL AND source_nonce IS NOT NULL
+                                 AND source_payload_digest IS NOT NULL)),
   -- One hop: a carry names the generation after the released one, and another runtime.
   CHECK (to_binding_generation = from_binding_generation + 1),
   CHECK (to_session_id <> from_session_id)
@@ -1217,14 +1225,19 @@ CREATE TABLE IF NOT EXISTS peer_message_carries (
 -- CP-HI-06 — the hand-over's only evidence of a same-conversation succession, so ordinary SQL must
 -- not be able to write one. `acp_peer_message_carry_authorized` answers 1 only while the
 -- self-claim's carry holds the marker for this exact succession, and a CARRIED record only when that
--- succession was proven continuous.
+-- succession was proven continuous. It is also handed the admitted row the record's key names, and
+-- answers 1 only when the record's payload digest is that row's (ACP-RESTART-02): required on a
+-- CARRIED record, and checked on a REFUSED one whenever it states one.
 CREATE TRIGGER IF NOT EXISTS peer_message_carries_insert_authority
 BEFORE INSERT ON peer_message_carries
 WHEN acp_peer_message_carry_authorized(
   NEW.outcome, NEW.role_key,
   NEW.from_session_id, NEW.from_session_incarnation, NEW.from_binding_generation, NEW.from_assignment_id,
   NEW.to_session_id, NEW.to_session_incarnation, NEW.to_binding_generation, NEW.to_assignment_id,
-  NEW.actor_id, NEW.conversation_uuid, NEW.buzz_actor_id, NEW.recovery_audit_event_id
+  NEW.actor_id, NEW.conversation_uuid, NEW.buzz_actor_id, NEW.recovery_audit_event_id,
+  NEW.source_payload_digest,
+  (SELECT payload_json FROM inbound_messages
+    WHERE channel = NEW.source_channel AND nonce = NEW.source_nonce)
 ) <> 1
 BEGIN
   SELECT RAISE(ABORT, 'PEER_MESSAGE_CARRY_AUTHORITY_DENIED');
@@ -1257,6 +1270,92 @@ END;
 
 CREATE INDEX IF NOT EXISTS peer_message_carries_by_successor
   ON peer_message_carries(to_session_id, to_binding_generation);
+
+-- ---------------------------------------------------------------------------
+-- peer_message_refusal_notices  (schema v40, ACP-RESTART-04)
+--   Lifecycle: the notice owed to the CEO for a queued peer message (#1044) that ACP rejected while
+--   it was still PENDING — on a revoke (a plain one, or the operator's dead-binding door), a
+--   takeover by another runtime, a same-generation runtime move, or a canonical restart that
+--   refused to carry it. One OWED entry per message, written by the fence in the transaction that rejects the row;
+--   one REPORTED entry, written when the role's current holder says it told the CEO. Shown, as
+--   metadata only, to whoever holds the role while an OWED entry has no REPORTED one — whether or
+--   not that holder is the carry successor — because the daemon cannot sign Buzz in a canonical
+--   room and the holder is how the CEO is told.
+--   Integrity: the outbox row's status says the message was rejected, not that anyone was told; an
+--   ordinary statement can write either. So an entry is inserted only under the connection-local
+--   marker `Db.withPeerMessageNotice` raises for that one exact entry, from a capability only the
+--   outbox mints at the rejecting fence and at the holder's report; a REPORTED entry only beside
+--   the OWED one for the same message and role. Never updated, never deleted. Never the payload.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS peer_message_refusal_notices (
+  message_id               TEXT NOT NULL,
+  entry                    TEXT NOT NULL CHECK (entry IN ('OWED','REPORTED')),
+  role_key                 TEXT NOT NULL,
+  -- OWED: why the message was rejected — the path's category, or the restart's carry refusal.
+  reason                   TEXT CHECK (reason IN ('REVOKED','REPLACED','RUNTIME_MOVED',
+                                                  'DIFFERENT_ACTOR_OR_SIGNER','DIFFERENT_LINEAGE',
+                                                  'ALREADY_CARRIED','ALREADY_CLAIMED',
+                                                  'SOURCE_UNREADABLE')),
+  -- OWED: the Buzz identity that signed the event and the admitted event's key, as the outbox
+  -- row's pointer named them when it was rejected; null when that pointer could not be read.
+  sender                   TEXT,
+  source_channel           TEXT,
+  source_nonce             TEXT,
+  -- OWED: the generation and session the message was addressed to. REPORTED: the holder that
+  -- reported it, with its incarnation.
+  binding_generation       INTEGER NOT NULL,
+  session_id               TEXT NOT NULL,
+  session_incarnation      TEXT,
+  created_at               TEXT NOT NULL,
+  PRIMARY KEY (message_id, entry),
+  CHECK ((entry = 'OWED') = (reason IS NOT NULL)),
+  CHECK (entry = 'OWED' OR session_incarnation IS NOT NULL)
+);
+
+-- CP-HI-06 — an entry is evidence that the CEO is owed a notice, or was given one; ordinary SQL must
+-- not be able to write either. `acp_peer_message_notice_authorized` answers 1 only while the outbox
+-- holds the marker for this exact entry, and a REPORTED entry needs its OWED one.
+CREATE TRIGGER IF NOT EXISTS peer_message_refusal_notices_insert_authority
+BEFORE INSERT ON peer_message_refusal_notices
+WHEN acp_peer_message_notice_authorized(
+  NEW.message_id, NEW.entry, NEW.role_key, NEW.reason, NEW.sender, NEW.source_channel,
+  NEW.source_nonce, NEW.binding_generation, NEW.session_id, NEW.session_incarnation
+) <> 1
+  OR (NEW.entry = 'REPORTED' AND NOT EXISTS (
+    SELECT 1 FROM peer_message_refusal_notices
+     WHERE message_id = NEW.message_id AND entry = 'OWED' AND role_key = NEW.role_key
+  ))
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_NOTICE_AUTHORITY_DENIED');
+END;
+
+-- CP-HI-06 — one OWED and one REPORTED entry per message, ever; a second of either is refused.
+CREATE TRIGGER IF NOT EXISTS peer_message_refusal_notices_no_replace
+BEFORE INSERT ON peer_message_refusal_notices
+WHEN EXISTS (
+  SELECT 1 FROM peer_message_refusal_notices
+   WHERE message_id = NEW.message_id AND entry = NEW.entry
+)
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_NOTICE_NO_REPLACE');
+END;
+
+-- CP-HI-08 — an entry is never rewritten.
+CREATE TRIGGER IF NOT EXISTS peer_message_refusal_notices_immutable
+BEFORE UPDATE ON peer_message_refusal_notices
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_NOTICE_IMMUTABLE');
+END;
+
+-- CP-HI-08 — and never removed: a deleted OWED entry is a CEO who is never told.
+CREATE TRIGGER IF NOT EXISTS peer_message_refusal_notices_no_delete
+BEFORE DELETE ON peer_message_refusal_notices
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_NOTICE_IMMUTABLE');
+END;
+
+CREATE INDEX IF NOT EXISTS peer_message_refusal_notices_by_role
+  ON peer_message_refusal_notices(role_key, entry);
 
 -- ---------------------------------------------------------------------------
 -- inbound_messages
@@ -1462,6 +1561,21 @@ WHEN (OLD.channel = 'owner-reply-intent' OR NEW.channel = 'owner-reply-intent')
  AND (NEW.channel IS NOT OLD.channel OR NEW.nonce IS NOT OLD.nonce)
 BEGIN
   SELECT RAISE(ABORT, 'INBOUND_OWNER_REPLY_KEY_IMMUTABLE');
+END;
+
+-- CP-HI-06 — a Buzz event's admitted row (ACP-RESTART-02, schema v40) is found by its key alone:
+-- channel 'buzz' and the event's nonce, named by the outbox pointer and by a peer message's carry
+-- record. The payload, REPLACE and DELETE guards above keep the row; they did not keep its key, so
+-- an UPDATE could move the admitted CEO instruction aside and a new row with other words take its
+-- key. No row may leave this channel, enter it, or change its nonce in it by UPDATE. The whole
+-- channel rather than its peer rows alone: nothing moves a Buzz key, and an owner mention's row is
+-- found by its key the same way.
+CREATE TRIGGER IF NOT EXISTS inbound_messages_buzz_source_key_immutable
+BEFORE UPDATE OF channel, nonce ON inbound_messages
+WHEN (OLD.channel = 'buzz' OR NEW.channel = 'buzz')
+ AND (NEW.channel IS NOT OLD.channel OR NEW.nonce IS NOT OLD.nonce)
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_BUZZ_SOURCE_KEY_IMMUTABLE');
 END;
 
 -- ---------------------------------------------------------------------------

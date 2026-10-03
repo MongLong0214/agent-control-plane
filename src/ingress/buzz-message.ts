@@ -311,6 +311,9 @@ export const peerProofIsCurrent = (
  * (`peer_message_carries_insert_authority`) — and only when every field of it matches:
  *
  *   - this row's message id and the admitted event its pointer names (channel and nonce);
+ *   - the admitted row at that key, which must still digest to the record's
+ *     `source_payload_digest` (ACP-RESTART-02) — the digest the record's insert trigger verified
+ *     against that row at carry time, never the outbox pointer's, which any statement can rewrite;
  *   - the proof's CTO half as the predecessor (role key, generation, session), and this holder as
  *     the successor (role key, generation, session, incarnation);
  *   - the Buzz identity the admitted event was addressed to as the record's signer;
@@ -332,9 +335,10 @@ export const selfClaimCarriedTo = (
   const pointer = ownerMessagePointerOf(candidate.payload);
   const mention = typeof source?.mention === "string" ? source.mention.trim() : "";
   if (!pointer || mention.length === 0 || proofCto.roleKey !== holder.roleKey) return false;
-  return db.get<{ carried: number }>(
-    `SELECT EXISTS (
-       SELECT 1 FROM peer_message_carries c
+  const carried = db.get<{ digest: string | null; admitted: string | null }>(
+    `SELECT c.source_payload_digest AS digest, i.payload_json AS admitted
+       FROM peer_message_carries c
+         JOIN inbound_messages i ON i.channel = c.source_channel AND i.nonce = c.source_nonce
          JOIN assignments prev ON prev.assignment_id = c.from_assignment_id
          JOIN assignments next ON next.assignment_id = c.to_assignment_id
          JOIN sessions next_s ON next_s.session_id = c.to_session_id
@@ -356,7 +360,7 @@ export const selfClaimCarriedTo = (
           AND tb.executor_kind = ? AND tb.target_locator = c.conversation_uuid
           AND e.kind = 'DEAD_BINDING_RECOVERED'
           AND e.role_key = c.role_key AND e.session_id = c.from_session_id
-     ) AS carried`,
+        LIMIT 1`,
     [
       candidate.messageId, pointer.sourceChannel, pointer.sourceNonce,
       holder.roleKey,
@@ -365,40 +369,51 @@ export const selfClaimCarriedTo = (
       mention,
       SELF_CLAIM_EXECUTOR_KIND,
     ],
-  )?.carried === 1;
+  );
+  // ACP-RESTART-02: the bytes at the record's key are the bytes the record was written for.
+  if (!carried || typeof carried.digest !== "string" || typeof carried.admitted !== "string") return false;
+  try {
+    return digestOf(JSON.parse(carried.admitted) as unknown) === carried.digest;
+  } catch {
+    return false;
+  }
 };
 
 /**
- * A queued peer message the successor's restart refused to carry (ACP-PEER-SUCCESSION-01), as the
- * successor is told about it so it can tell the CEO in the thread: the daemon cannot sign Buzz in a
- * canonical room. Metadata only — never the payload.
+ * A queued CEO peer message ACP rejected while it was still queued, as the role's current holder is
+ * told about it so it can tell the CEO in the thread: the daemon cannot sign Buzz in a canonical
+ * room. Owed on every path that rejects one — a revoke, a takeover, a runtime move, or a canonical
+ * restart that refused to carry it (ACP-PEER-SUCCESSION-01, ACP-RESTART-04) — and shown to whoever
+ * holds the role until a holder reports it. Metadata only — never the payload.
  */
 export interface PeerMessageRefusalNotice {
   readonly messageId: string;
-  /** The Buzz event the CEO sent, when the record names a Buzz nonce. */
+  /** The Buzz event the CEO sent, when the notice names a Buzz nonce. */
   readonly sourceEventId: string | null;
-  /** `PeerMessageCarryRefusal`: why it was not carried. */
+  /** The Buzz identity that signed that event, when the notice could read it. */
+  readonly sender: string | null;
+  /**
+   * Why it was rejected: `REVOKED`, `REPLACED` or `RUNTIME_MOVED` for the path, or the restart's
+   * `PeerMessageCarryRefusal` when a canonical restart refused to carry it.
+   */
   readonly reason: string;
 }
 
-/** The REFUSED carry records addressed to exactly this holder, oldest first. Only reads. */
-export const peerMessageRefusalsFor = (
-  db: Pick<Db, "all">,
-  holder: { roleKey: string; bindingGeneration: number; targetSessionId: string; sessionIncarnation: string },
-): PeerMessageRefusalNotice[] =>
-  db.all<{ message_id: string; source_nonce: string | null; refusal: string }>(
-    `SELECT message_id, source_nonce, refusal FROM peer_message_carries
-      WHERE outcome = 'REFUSED' AND role_key = ? AND to_binding_generation = ?
-        AND to_session_id = ? AND to_session_incarnation = ?
-      ORDER BY rowid`,
-    [holder.roleKey, holder.bindingGeneration, holder.targetSessionId, holder.sessionIncarnation],
-  ).map((row) => ({
-    messageId: row.message_id,
-    sourceEventId: row.source_nonce?.startsWith(BUZZ_MESSAGE_NONCE_PREFIX)
-      ? row.source_nonce.slice(BUZZ_MESSAGE_NONCE_PREFIX.length)
-      : null,
-    reason: row.refusal,
-  }));
+/** One owed notice, as `Outbox.peerMessageRefusalNoticesFor` reads it, in the holder's shape. */
+export const peerMessageRefusalNoticeOf = (row: {
+  message_id: string;
+  reason: string;
+  sender: string | null;
+  source_channel: string | null;
+  source_nonce: string | null;
+}): PeerMessageRefusalNotice => ({
+  messageId: row.message_id,
+  sourceEventId: row.source_channel === "buzz" && row.source_nonce?.startsWith(BUZZ_MESSAGE_NONCE_PREFIX)
+    ? row.source_nonce.slice(BUZZ_MESSAGE_NONCE_PREFIX.length)
+    : null,
+  sender: row.sender,
+  reason: row.reason,
+});
 
 /** The durable replay key for one Buzz event. */
 export const buzzMessageNonce = (eventId: string): string =>

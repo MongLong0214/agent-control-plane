@@ -12,6 +12,7 @@ import {
   type BuzzRelaySocketHandlers,
   type BuzzSubscriberScheduler,
 } from "../../src/buzz/buzz-mention-subscriber.ts";
+import { digestOf } from "../../src/core/digest.ts";
 import { type Decision, allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { SCHEMA_VERSION, openDb } from "../../src/db/database.ts";
@@ -140,6 +141,7 @@ interface CarryRow {
   refusal: string | null;
   source_channel: string | null;
   source_nonce: string | null;
+  source_payload_digest: string | null;
   role_key: string;
   from_session_id: string;
   from_session_incarnation: string;
@@ -781,6 +783,7 @@ describe("a canonical restart keeps the CEO's queued peer message (2026-10-03)",
         refusal: null,
         source_channel: "buzz",
         source_nonce: buzzMessageNonce(event.id),
+        source_payload_digest: digestOf(JSON.parse(fixture.inbound(event.id).payload_json)),
         role_key: fixture.ctoRoleKey,
         from_session_id: fixture.first.sessionId,
         from_session_incarnation: fixture.first.binding.sessionIncarnation,
@@ -1160,6 +1163,344 @@ describe("a canonical restart keeps the CEO's queued peer message (2026-10-03)",
       await twice.close();
     }
   });
+
+  /** The ingress row of one admitted Buzz event, whole. */
+  const admittedRow = (fixture: Fixture, eventId: string) =>
+    fixture.harness.cp.db.get<{ actor: string; received_at: string; payload_json: string; turn_claim_json: string | null }>(
+      `SELECT actor, received_at, payload_json, turn_claim_json FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`,
+      [buzzMessageNonce(eventId)],
+    )!;
+
+  /**
+   * The reviewer's ACP-RESTART-02 substitution, in ordinary statements: the admitted row moved off
+   * its key, other words inserted at the vacated key, and the outbox pointer's digest rewritten to
+   * match them. Each step's refusal is returned rather than thrown, so the hand-over is asked either
+   * way.
+   */
+  const substitute = (fixture: Fixture, eventId: string, messageId: string, text: string): string[] => {
+    const { db } = fixture.harness.cp;
+    const nonce = buzzMessageNonce(eventId);
+    const original = admittedRow(fixture, eventId);
+    const forged = { ...(JSON.parse(original.payload_json) as Record<string, unknown>), text };
+    const refused: string[] = [];
+    const attempt = (sql: string, params: unknown[]) => {
+      try {
+        db.run(sql, params);
+      } catch (error) {
+        refused.push(String((error as Error).message));
+      }
+    };
+    attempt(`UPDATE inbound_messages SET nonce = nonce || ':moved' WHERE channel = 'buzz' AND nonce = ?`, [nonce]);
+    attempt(
+      `INSERT INTO inbound_messages (channel, nonce, actor, received_at, payload_json) VALUES ('buzz', ?, ?, ?, ?)`,
+      [nonce, original.actor, original.received_at, JSON.stringify(forged)],
+    );
+    attempt(
+      `UPDATE outbox SET payload_json = json_set(payload_json, '$.sourcePayloadDigest', ?) WHERE message_id = ?`,
+      [digestOf(forged), messageId],
+    );
+    return refused;
+  };
+
+  it("(o) ACP-RESTART-02: the reviewer's substitution after a genuine carry is refused — the moved key, and the bytes the carry record does not name", async () => {
+    const fixture = await startFixture();
+    try {
+      const { harness } = fixture;
+      const event = await fixture.ceoSays("원래의 CEO 지시");
+      const [queued] = fixture.peerRows();
+      const successor = await restart(fixture, 2);
+      const ledger = ownerMessageLedger(harness.cp);
+      const holder = fixture.holderOf(successor.sessionId);
+
+      // The reviewer's witness, through the ordinary statement path. The move is refused, so the
+      // key is never vacated and the insert of other words at it is refused too; only the outbox
+      // pointer's digest (finding 01's raw-writable column) is rewritten, which withholds the row.
+      const admittedBefore = admittedRow(fixture, event.id);
+      const refused = substitute(fixture, event.id, queued!.message_id, "바꿔치기된 지시");
+      const before = fixture.writes();
+      const taken = ledger.claim(holder);
+      expect(handedOver(taken.allowed ? taken.value : null).claimed?.text).not.toBe("바꿔치기된 지시");
+      expect(refused).toEqual([
+        expect.stringMatching(/INBOUND_BUZZ_SOURCE_KEY_IMMUTABLE/),
+        expect.stringMatching(/INBOUND_MESSAGE_NO_REPLACE/),
+      ]);
+      expect(admittedRow(fixture, event.id)).toEqual(admittedBefore);
+      expect(handedOver(taken.allowed ? taken.value : null)).toMatchObject({
+        claimed: null,
+        withheld: [{ messageId: queued!.message_id }],
+      });
+      expect(fixture.writes()).toBe(before);
+      // The record names the admitted bytes, read from the admitted row.
+      expect(fixture.carries()).toEqual([expect.objectContaining({
+        outcome: "CARRIED",
+        source_payload_digest: digestOf(JSON.parse(admittedBefore.payload_json)),
+      })]);
+    } finally {
+      await fixture.close();
+    }
+
+    // The record's digest holds on its own: a writer that got past the key guard — here, a second
+    // connection that drops it — substitutes the bytes, and the hand-over still refuses them.
+    const past = await startFixture();
+    try {
+      const { harness } = past;
+      const event = await past.ceoSays("키 가드 뒤에서도 지켜지는 지시");
+      const [queued] = past.peerRows();
+      const successor = await restart(past, 2);
+      const side = new Database(harness.cp.db.file);
+      try {
+        side.exec(`DROP TRIGGER inbound_messages_buzz_source_key_immutable`);
+      } finally {
+        side.close();
+      }
+      expect(substitute(past, event.id, queued!.message_id, "가드를 넘어 바꿔치기된 지시")).toEqual([]);
+      const before = past.writes();
+      const taken = ownerMessageLedger(harness.cp).claim(past.holderOf(successor.sessionId));
+      expect(taken.allowed, JSON.stringify(taken)).toBe(true);
+      expect(handedOver(taken.allowed ? taken.value : null)).toMatchObject({
+        claimed: null,
+        withheld: [{ messageId: queued!.message_id }],
+      });
+      expect(past.writes()).toBe(before);
+      expect(past.peerRows()[0]!.status).toBe("PENDING");
+    } finally {
+      await past.close();
+    }
+  });
+
+  it("(o2) ACP-RESTART-02: the carry record's insert trigger checks its digest against the admitted row — other bytes are refused even under the capability", async () => {
+    const fixture = await startFixture();
+    try {
+      const event = await fixture.ceoSays("다이제스트로 묶이는 지시");
+      const rowsBefore = fixture.peerRows();
+      const inboundBefore = fixture.inbound(event.id);
+      const { db } = fixture.harness.cp;
+      const run = db.run.bind(db);
+      let swapped = 0;
+      const spy = vi.spyOn(db, "run").mockImplementation(((sql: string, params: unknown[] = []) => {
+        if (/INSERT INTO peer_message_carries/.test(sql) && params[1] === "CARRIED") {
+          swapped += 1;
+          return run(sql, params.map((value, index) => (index === 5 ? digestOf({ text: "다른 바이트" }) : value)));
+        }
+        return run(sql, params);
+      }) as typeof db.run);
+      let outcome: unknown;
+      try {
+        outcome = await fixture.claimAs(2).catch((error: unknown) => error);
+      } finally {
+        spy.mockRestore();
+      }
+      expect(swapped).toBe(1);
+      expect(String(outcome instanceof Error ? outcome.message : JSON.stringify(outcome))).toMatch(/PEER_MESSAGE_CARRY_AUTHORITY_DENIED/);
+      expect(fixture.peerRows()).toEqual(rowsBefore);
+      expect(fixture.inbound(event.id)).toEqual(inboundBefore);
+      expect(fixture.carries()).toEqual([]);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  /** Writes a receipt's settlement onto one admitted turn, as the receipt path would. */
+  const settleReceipt = (fixture: Fixture, eventId: string, settlement: "REPLY_OUTBOX" | "UNANSWERABLE" | "UNRESOLVED") =>
+    fixture.harness.cp.db.run(
+      `UPDATE inbound_messages
+          SET turn_claim_json = json_set(turn_claim_json, '$.settledAt', ?, '$.settlement', ?)
+        WHERE channel = 'buzz' AND nonce = ?`,
+      [fixture.harness.clock.nowIso(), settlement, buzzMessageNonce(eventId)],
+    );
+
+  it("(p) ACP-RESTART-03: a restart with a queued message whose turn a receipt already settled completes, refuses the row and keeps the receipt", async () => {
+    for (const settlement of ["REPLY_OUTBOX", "UNANSWERABLE", "UNRESOLVED"] as const) {
+      const fixture = await startFixture();
+      try {
+        const event = await fixture.ceoSays(`${settlement} 로 정리된 지시`);
+        const [queued] = fixture.peerRows();
+        settleReceipt(fixture, event.id, settlement);
+        const receipt = fixture.inbound(event.id);
+
+        fixture.harness.clock.advance(60_000);
+        const claimed = await fixture.claimAs(2).catch((error: unknown) => error);
+        expect(claimed, String(claimed instanceof Error ? claimed.message : "")).toMatchObject({ allowed: true });
+        const successor = (claimed as { value: { sessionId: string; binding: { bindingGeneration: number } } }).value;
+        expect(successor.binding.bindingGeneration).toBe(2);
+        expect(fixture.harness.cp.bindings.active(fixture.ctoRoleKey)?.sessionId).toBe(successor.sessionId);
+        expect(fixture.peerRows()[0]).toMatchObject({
+          message_id: queued!.message_id,
+          status: "REJECTED",
+          reason_code: ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
+          binding_generation: 1,
+        });
+        // The receipt stands exactly as it was: no no-reply fact written beside it.
+        expect(fixture.inbound(event.id)).toEqual(receipt);
+        expect(fixture.carries().map((carry) => [carry.message_id, carry.outcome, carry.refusal])).toEqual([
+          [queued!.message_id, "REFUSED", "ALREADY_CLAIMED"],
+        ]);
+        expect(noticesFor(fixture, fixture.holderOf(successor.sessionId))).toEqual([
+          expect.objectContaining({ messageId: queued!.message_id, reason: "ALREADY_CLAIMED" }),
+        ]);
+      } finally {
+        await fixture.close();
+      }
+    }
+  });
+
+  it("(p2) ACP-RESTART-03: the ordinary fences — revoke, takeover, runtime move, the stranded-SENT sweep — keep a settled receipt too", async () => {
+    for (const path of ["revoke", "takeover", "runtime-move", "sweep"] as const) {
+      const fixture = await startFixture();
+      try {
+        const { harness } = fixture;
+        const event = await fixture.ceoSays(`${path} 전에 정리된 지시`);
+        const [queued] = fixture.peerRows();
+        if (path === "sweep") {
+          const taken = ownerMessageLedger(harness.cp).claim(fixture.holderOf(fixture.first.sessionId));
+          expect(handedOver(taken.allowed ? taken.value : null).claimed?.messageId).toBe(queued!.message_id);
+        }
+        settleReceipt(fixture, event.id, "REPLY_OUTBOX");
+        const receipt = fixture.inbound(event.id);
+        const other = () => {
+          const session = harness.cp.sessions.create({ provider: "scripted", model: "cto-other", buzzAddress: PROJECT_ROOM });
+          expect(harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "test").allowed).toBe(true);
+          return session;
+        };
+        const run = (): unknown => {
+          switch (path) {
+            case "revoke":
+              return harness.cp.bindings.revoke(fixture.ctoRoleKey, "operator stop");
+            case "takeover":
+            case "runtime-move":
+              return harness.cp.bindings.switchTo({
+                role: Role.PRIMARY_CTO,
+                projectId: fixture.projectId,
+                sessionId: other().sessionId,
+                reason: path,
+                conversation: path === "takeover" ? "REPLACED" : "SURVIVED",
+              });
+            case "sweep":
+              harness.cp.db.run(`UPDATE sessions SET lifecycle = 'STOPPED' WHERE session_id = ?`, [fixture.first.sessionId]);
+              return { allowed: harness.cp.outbox.fenceUndeliverable() === 1 };
+          }
+        };
+        const outcome = (() => {
+          try {
+            return run();
+          } catch (error) {
+            return error;
+          }
+        })();
+        expect(outcome, `${path}: ${outcome instanceof Error ? outcome.message : JSON.stringify(outcome)}`)
+          .toMatchObject({ allowed: true });
+        expect(fixture.peerRows()[0], path).toMatchObject({ message_id: queued!.message_id, status: "REJECTED" });
+        expect(fixture.inbound(event.id), path).toEqual(receipt);
+      } finally {
+        await fixture.close();
+      }
+    }
+  });
+
+  /** The notices the role's current holder is shown, as `role_owner_message_claim` returns them. */
+  const noticesFor = (fixture: Fixture, holder: HolderIdentity): unknown => {
+    const taken = ownerMessageLedger(fixture.harness.cp).claim(holder);
+    expect(taken.allowed, JSON.stringify(taken)).toBe(true);
+    return (taken.allowed ? (taken.value as unknown as Record<string, unknown>) : {})["refusedAtRestart"];
+  };
+
+  it("(q) ACP-RESTART-04: a plain revoke, then a canonical restart — the new holder is told, until it reports it", async () => {
+    const fixture = await startFixture();
+    try {
+      const { harness } = fixture;
+      const event = await fixture.ceoSays("철회로 거절된 지시");
+      const [queued] = fixture.peerRows();
+      expect(harness.cp.bindings.revoke(fixture.ctoRoleKey, "operator stop").allowed).toBe(true);
+      expect(fixture.peerRows()[0]!.status).toBe("REJECTED");
+      const successor = await restart(fixture, 2);
+
+      const notice = {
+        messageId: queued!.message_id,
+        sourceEventId: event.id,
+        sender: fixture.ceo.pubkey,
+        reason: "REVOKED",
+      };
+      const holder = fixture.holderOf(successor.sessionId);
+      expect(noticesFor(fixture, holder)).toEqual([notice]);
+      expect(JSON.stringify(noticesFor(fixture, holder))).not.toContain("철회로 거절된");
+      // Shown again until reported; a former holder's tuple is shown nothing and cannot report.
+      expect(noticesFor(fixture, holder)).toEqual([notice]);
+      expect(noticesFor(fixture, fixture.holderAt(fixture.first.sessionId, 1))).toBeUndefined();
+      const ledger = ownerMessageLedger(harness.cp);
+      expect(ledger.reportRefusal(queued!.message_id, fixture.holderAt(fixture.first.sessionId, 1)).allowed).toBe(false);
+      expect(ledger.reportRefusal("msg_nothing_owed", holder).reasonCode).toBe(ReasonCode.NOT_FOUND);
+
+      // The holder reports it: retired for it and for every later holder; a repeat is OK.
+      expect(ledger.reportRefusal(queued!.message_id, holder).reasonCode).toBe(ReasonCode.OK);
+      expect(ledger.reportRefusal(queued!.message_id, holder).reasonCode).toBe(ReasonCode.OK);
+      expect(noticesFor(fixture, holder)).toBeUndefined();
+      const third = await restart(fixture, 3);
+      expect(noticesFor(fixture, fixture.holderOf(third.sessionId))).toBeUndefined();
+
+      // The entries are evidence: ordinary SQL can neither forge, rewrite nor remove one.
+      const entries = harness.cp.db.all<Record<string, unknown>>(
+        `SELECT * FROM peer_message_refusal_notices ORDER BY rowid`,
+      );
+      expect(entries.map((entry) => [entry["message_id"], entry["entry"], entry["reason"]])).toEqual([
+        [queued!.message_id, "OWED", "REVOKED"],
+        [queued!.message_id, "REPORTED", null],
+      ]);
+      const columns = Object.keys(entries[0]!);
+      const insert = (row: Record<string, unknown>) => harness.cp.db.run(
+        `INSERT INTO peer_message_refusal_notices (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`,
+        columns.map((column) => row[column]),
+      );
+      expect(() => insert({ ...entries[0], message_id: "msg_forged" })).toThrow(/PEER_MESSAGE_NOTICE_AUTHORITY_DENIED/);
+      expect(() => harness.cp.db.run(`UPDATE peer_message_refusal_notices SET reason = 'REPLACED'`))
+        .toThrow(/PEER_MESSAGE_NOTICE_IMMUTABLE/);
+      expect(() => harness.cp.db.run(`DELETE FROM peer_message_refusal_notices WHERE entry = 'REPORTED'`))
+        .toThrow(/PEER_MESSAGE_NOTICE_IMMUTABLE/);
+      for (const counterfeit of [{}, { entry: entries[0] }, null]) {
+        expect(() => harness.cp.db.tx(() =>
+          harness.cp.db.withPeerMessageNotice(counterfeit as never, () => insert({ ...entries[0], message_id: "msg_forged" })),
+        )).toThrow(/PEER_MESSAGE_NOTICE_AUTHORITY_DENIED/);
+      }
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("(q2) ACP-RESTART-04: a takeover, the operator's door and a runtime move each leave the next holder a notice", async () => {
+    for (const path of ["takeover", "operator", "runtime-move"] as const) {
+      const fixture = await startFixture();
+      try {
+        const { harness } = fixture;
+        const event = await fixture.ceoSays(`${path} 로 거절된 지시`);
+        const [queued] = fixture.peerRows();
+        let next: HolderIdentity;
+        if (path === "operator") {
+          operatorReleases(fixture);
+          next = fixture.holderOf((await restart(fixture, 2)).sessionId);
+        } else {
+          const other = harness.cp.sessions.create({ provider: "scripted", model: "cto-other", buzzAddress: PROJECT_ROOM });
+          expect(harness.cp.sessions.transition(other.sessionId, SessionLifecycle.READY, "test").allowed).toBe(true);
+          const switched = harness.cp.bindings.switchTo({
+            role: Role.PRIMARY_CTO,
+            projectId: fixture.projectId,
+            sessionId: other.sessionId,
+            reason: path,
+            conversation: path === "takeover" ? "REPLACED" : "SURVIVED",
+          });
+          expect(switched.allowed, JSON.stringify(switched)).toBe(true);
+          next = fixture.holderOf(other.sessionId);
+        }
+        expect(fixture.peerRows()[0]!.status, path).toBe("REJECTED");
+        expect(noticesFor(fixture, next), path).toEqual([{
+          messageId: queued!.message_id,
+          sourceEventId: event.id,
+          sender: fixture.ceo.pubkey,
+          reason: { takeover: "REPLACED", operator: "REVOKED", "runtime-move": "RUNTIME_MOVED" }[path],
+        }]);
+      } finally {
+        await fixture.close();
+      }
+    }
+  });
 });
 
 describe("schema v40: the carry record arrives by an additive migration", () => {
@@ -1175,6 +1516,13 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
     "peer_message_carries_insert_authority",
     "peer_message_carries_no_delete",
     "peer_message_carries_no_replace",
+  ];
+  /** v40's other objects (ACP-RESTART-02, -04): the notices and their guards, and the Buzz key guard. */
+  const NOTICE_TRIGGERS = [
+    "peer_message_refusal_notices_immutable",
+    "peer_message_refusal_notices_insert_authority",
+    "peer_message_refusal_notices_no_delete",
+    "peer_message_refusal_notices_no_replace",
   ];
   /** Every row of every table, by table, so a migration that touched any of them shows. */
   const dump = (raw: Database.Database, except: readonly string[]): Record<string, unknown[]> =>
@@ -1203,9 +1551,12 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
     db.close();
     const legacy = new Database(path);
     legacy.exec(CARRY_TRIGGERS.map((name) => `DROP TRIGGER ${name};`).join("\n"));
+    legacy.exec(`${NOTICE_TRIGGERS.map((name) => `DROP TRIGGER ${name};`).join("\n")}
+      DROP INDEX peer_message_refusal_notices_by_role; DROP TABLE peer_message_refusal_notices;
+      DROP TRIGGER inbound_messages_buzz_source_key_immutable;`);
     if (populateCarries) {
       legacy.exec(`INSERT INTO peer_message_carries VALUES (
-        'msg_unvouched', 'CARRIED', NULL, 'buzz', 'buzz-message:x', 'PRIMARY_CTO:p', 's1', 'i1', 1, 'a1',
+        'msg_unvouched', 'CARRIED', NULL, 'buzz', 'buzz-message:x', 'sha256:x', 'PRIMARY_CTO:p', 's1', 'i1', 1, 'a1',
         's2', 'i2', 2, 'a2', 'actor', 'uuid', 'buzz', 1, '${NOW}')`);
     } else {
       legacy.exec(`DROP INDEX peer_message_carries_by_successor; DROP TABLE peer_message_carries;`);
@@ -1238,6 +1589,7 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
   it("migrates a v38 database through v39 to v40, keeping every row, and the new record is guarded from the first", () => {
     const { path, before } = legacyImage(38);
     expect(Object.keys(before)).not.toContain("peer_message_carries");
+    expect(Object.keys(before)).not.toContain("peer_message_refusal_notices");
     approveMigration(path, "ACP-PEER-SUCCESSION-01 v38 fixture");
     const migrated = openDb(path);
     try {
@@ -1254,9 +1606,17 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
         `SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'peer_message_carries' ORDER BY name`,
       ).map((row) => row.name)).toEqual(CARRY_TRIGGERS);
       expect(migrated.get<{ n: number }>(`SELECT COUNT(*) AS n FROM peer_message_carries`)?.n).toBe(0);
+      expect(migrated.all<{ name: string }>(
+        `SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'peer_message_refusal_notices' ORDER BY name`,
+      ).map((row) => row.name)).toEqual(NOTICE_TRIGGERS);
+      expect(migrated.get<{ n: number }>(`SELECT COUNT(*) AS n FROM peer_message_refusal_notices`)?.n).toBe(0);
+      // ACP-RESTART-02: the Buzz row written before v40 keeps its key from v40 on.
+      expect(() => migrated.run(
+        `UPDATE inbound_messages SET nonce = nonce || ':moved' WHERE channel = 'buzz'`,
+      )).toThrow(/INBOUND_BUZZ_SOURCE_KEY_IMMUTABLE/u);
       expect(() => migrated.run(
         `INSERT INTO peer_message_carries VALUES (
-          'msg_forged', 'CARRIED', NULL, 'buzz', 'buzz-message:x', 'PRIMARY_CTO:p', 's1', 'i1', 1, 'a1',
+          'msg_forged', 'CARRIED', NULL, 'buzz', 'buzz-message:x', 'sha256:x', 'PRIMARY_CTO:p', 's1', 'i1', 1, 'a1',
           's2', 'i2', 2, 'a2', 'actor', 'uuid', 'buzz', 1, ?)`, [NOW],
       )).toThrow(/PEER_MESSAGE_CARRY_AUTHORITY_DENIED/);
       // v39's own guard arrived on the way.
@@ -1268,7 +1628,7 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
     }
     const after = new Database(path, { readonly: true });
     try {
-      expect(dump(after, ["schema_migrations", "peer_message_carries"])).toEqual(before);
+      expect(dump(after, ["schema_migrations", "peer_message_carries", "peer_message_refusal_notices"])).toEqual(before);
     } finally {
       after.close();
     }
