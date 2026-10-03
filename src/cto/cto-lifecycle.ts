@@ -8,12 +8,14 @@ import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { isWithin } from "../guard/workspace-probe.ts";
 import type { OwnerAuthorityPort } from "../ceo/owner-authority.ts";
+import { type SessionLiveness, probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { Role, type RoleBinding, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
+import { SELF_CLAIM_EXECUTOR_KIND, defaultProcessAncestryInspector } from "../registry/canonical-self-claim.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderAdapter, ProviderRegistry, SessionHandle } from "../runtime/provider.ts";
 import type { RunEngine } from "../run/run-engine.ts";
@@ -162,7 +164,9 @@ export class CtoLifecycle {
       if (session?.lifecycle === SessionLifecycle.READY) {
         // READY is what the control plane last wrote about the session, not proof that the
         // provider still has one. Reusing a session on that alone is the false-ready path
-        // §14.3 exists to close, so the provider has to answer for the exact session first.
+        // §14.3 exists to close, so the provider has to answer for the exact session first —
+        // except an adopted canonical CTO, which no provider launched; its process answers.
+        if (this.#isAdoptedCanonical(existing)) return this.#dispatchToAdoptedCanonical(existing, session, runId);
         const live = await this.probeBoundSession(session);
         if (live.allowed) return allow(ReasonCode.OK, existing);
         this.audit.record({
@@ -190,6 +194,9 @@ export class CtoLifecycle {
       return this.recoveryTakeover(projectId, "bound CTO session is not ready", runId);
     }
 
+    // A released canonical role is not given a spawned CTO either; its conversation re-claims it.
+    const released = this.#releasedCanonicalHolder(projectId, roleKey);
+    if (released) return this.#refuseAdoptedCanonical(released, null, null, runId);
     const created = await this.spawn(projectId, "primary-cto");
     if (!created.allowed) return created as Decision<RoleBinding>;
 
@@ -542,6 +549,11 @@ export class CtoLifecycle {
           { projectId, sessionId: current.sessionId, lifecycle: session?.lifecycle ?? null },
         );
       }
+      // A canonical role is never given a spawned replacement; its own conversation re-claims it.
+      if (this.#isAdoptedCanonical(current)) return this.#refuseAdoptedCanonical(current, session, null, runId);
+    } else {
+      const released = this.#releasedCanonicalHolder(projectId, roleKey);
+      if (released) return this.#refuseAdoptedCanonical(released, null, null, runId);
     }
 
     const recovery = this.buildRecoveryPackage(projectId, reason);
@@ -956,6 +968,132 @@ export class CtoLifecycle {
     return probeSessionHealth(adapter, handleFor(session));
   }
 
+  /**
+   * Whether the binding is held by an adopted canonical CTO: an interactive runtime the canonical
+   * self-claim bound, which no provider adapter launched and so none can answer for or replace.
+   * Read from durable state — the holding actor's lifetime `SELF_CLAIM_EXECUTOR_KIND` target and
+   * its current runtime being this binding's session — never from a provider or model string.
+   */
+  #isAdoptedCanonical(binding: RoleBinding): boolean {
+    return this.db.get<{ held: number }>(
+      `SELECT 1 AS held FROM assignments a
+         JOIN conversational_actors c ON c.actor_id = a.actor_id
+         JOIN actor_target_bindings tb ON tb.target_actor_id = a.actor_id
+        WHERE a.assignment_id = ? AND tb.executor_kind = ? AND c.current_session_id = ?`,
+      [binding.assignmentId, SELF_CLAIM_EXECUTOR_KIND, binding.sessionId],
+    ) !== undefined;
+  }
+
+  /**
+   * Where no binding is active, whether the role's latest holder was an adopted canonical CTO: an
+   * actor with a `SELF_CLAIM_EXECUTOR_KIND` target at the highest `binding_generation` this role
+   * key has ever been granted, ACTIVE or REVOKED. A released canonical binding (`binding
+   * recover-dead`, or the dead-binding recovery before the re-claim lands) leaves no actor to ask,
+   * and this lineage is the durable fact that the role is still canonical. A role with no history,
+   * or whose latest holder is not canonical, answers null and is provisioned as before.
+   */
+  #releasedCanonicalHolder(projectId: string, roleKey: string): CanonicalHolder | null {
+    const latest = this.db.get<{ bindingGeneration: number; sessionId: string; status: "ACTIVE" | "REVOKED" }>(
+      `SELECT a.binding_generation AS bindingGeneration, a.session_id AS sessionId, a.status AS status
+         FROM assignments a
+         JOIN actor_target_bindings tb ON tb.target_actor_id = a.actor_id
+        WHERE a.role_key = ? AND tb.executor_kind = ?
+          AND a.binding_generation = (SELECT MAX(binding_generation) FROM assignments WHERE role_key = ?)`,
+      [roleKey, SELF_CLAIM_EXECUTOR_KIND, roleKey],
+    );
+    return latest ? { projectId, roleKey, ...latest } : null;
+  }
+
+  /**
+   * A READY adopted canonical CTO is dispatched to only while its recorded process is the one
+   * running. Asking the provider adapter instead is what turned a live canonical CTO to ERROR and
+   * spawned a replacement on 2026-10-03: the adapter cannot vouch for a session it never started.
+   * ALIVE reuses the binding and writes nothing; every other answer refuses.
+   */
+  #dispatchToAdoptedCanonical(binding: RoleBinding, session: SessionRecord, runId: string): Decision<RoleBinding> {
+    const liveness = this.#adoptedProcessLiveness(session);
+    if (liveness === "ALIVE") return allow(ReasonCode.OK, binding);
+    return this.#refuseAdoptedCanonical(binding, session, liveness, runId);
+  }
+
+  /**
+   * The liveness rule the canonical self-claim and `recoverDeadCanonicalBinding` already apply,
+   * `probeSessionLiveness` over the recorded `(os_pid, start token)`, with two readings narrower
+   * for dispatch. A row missing either half names no identifiable process (`#predecessorProcessIsGone`
+   * declines to decide on one too), so it is UNKNOWN. And `EPERM`, which the rule reads as ALIVE
+   * because it must never evict, is separated out: it returns before the start token is compared,
+   * so it does not show that the process signalled is the one recorded, and dispatch needs that.
+   * The token is read the way the claim recorded it (the claim's inspector's start-token reader),
+   * not as `ps` lstart text, which would call every live canonical CTO dead.
+   */
+  #adoptedProcessLiveness(session: SessionRecord): SessionLiveness | "EPERM" {
+    if (session.osPid === null || session.osProcessStartedAt === null) return "UNKNOWN";
+    let signalRefused = false;
+    const liveness = probeSessionLiveness(session.osPid, session.osProcessStartedAt, {
+      signal: (pid) => {
+        try {
+          process.kill(pid, 0);
+        } catch (error) {
+          signalRefused = (error as { code?: unknown }).code === "EPERM";
+          throw error;
+        }
+      },
+      startedAt: defaultProcessAncestryInspector.readStartToken,
+    });
+    return liveness === "ALIVE" && signalRefused ? "EPERM" : liveness;
+  }
+
+  /**
+   * A canonical role is neither dispatched into a runtime that is not running nor handed a
+   * spawned replacement: the canonical owner forbids a new actor in that role, and the role
+   * recovers when its own conversation claims it again. `liveness` is null when the row is
+   * already terminal, or the binding already released, and the process was not asked.
+   *
+   * The audit row is the only write. The session's lifecycle is left as it is even on DEAD:
+   * ERROR is terminal (it leads only to STOPPED), the daemon's reconcile already records a
+   * vanished process, and a misread here must never be able to end a live canonical session.
+   * DEAD and a terminal row wait for the re-claim; EPERM and UNKNOWN decided nothing, so the
+   * same dispatch asked again may succeed.
+   */
+  #refuseAdoptedCanonical(
+    holder: CanonicalHolder,
+    session: SessionRecord | null,
+    liveness: SessionLiveness | "EPERM" | null,
+    runId: string | undefined,
+  ): Decision<RoleBinding> {
+    const evidence = {
+      projectId: holder.projectId,
+      sessionId: holder.sessionId,
+      bindingGeneration: holder.bindingGeneration,
+      assignmentStatus: holder.status,
+      lifecycle: session?.lifecycle ?? null,
+      osPid: session?.osPid ?? null,
+      liveness,
+    };
+    const awaitingReclaim = liveness === null || liveness === "DEAD";
+    this.audit.record({
+      kind: "CTO_DISPATCH_REFUSED_CANONICAL",
+      reasonCode: awaitingReclaim ? ReasonCode.CANONICAL_CTO_AWAITING_RECLAIM : ReasonCode.PROBE_FAILED,
+      projectId: holder.projectId,
+      runId: runId ?? null,
+      sessionId: holder.sessionId,
+      roleKey: holder.roleKey,
+      evidence,
+    });
+    if (awaitingReclaim) {
+      return deny(
+        ReasonCode.CANONICAL_CTO_AWAITING_RECLAIM,
+        "the canonical CTO's runtime is not running; it recovers the role by claiming it again, and the run stays queued",
+        evidence,
+      );
+    }
+    return deny(
+      ReasonCode.PROBE_FAILED,
+      "the canonical CTO's recorded process could not be shown to be running; nothing was changed and the run stays queued",
+      evidence,
+    );
+  }
+
   /** A replacement that never became authoritative must not remain a live orphan. */
   private async stopUnusedSession(sessionId: string, reason: string): Promise<void> {
     const session = this.sessions.get(sessionId);
@@ -980,6 +1118,9 @@ export class CtoLifecycle {
     }
   }
 }
+
+/** The holder a canonical refusal names: the active binding, or the released role's latest assignment. */
+type CanonicalHolder = Pick<RoleBinding, "projectId" | "roleKey" | "sessionId" | "bindingGeneration" | "status">;
 
 const isUnavailable = (lifecycle: SessionLifecycle | undefined): boolean =>
   lifecycle === SessionLifecycle.ERROR || lifecycle === SessionLifecycle.STOPPED;
