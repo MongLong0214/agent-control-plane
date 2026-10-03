@@ -1019,6 +1019,18 @@ const lineSplitter = (onLine: (line: string) => void, onOverflow: () => void): (
   };
 };
 
+/** A client request in flight: the id the client gave it, and the relay's number for it or null. */
+interface InFlightRequest {
+  client: unknown;
+  upstream: number | null;
+}
+
+/** A request of the client's as it arrived: the line, byte for byte, and what it parsed to. */
+interface ClientRequest {
+  message: RelayedMessage;
+  line: string;
+}
+
 /** One daemon connection, and everything that belongs to it and to no other (review PR1051-R2). */
 interface Link {
   socket: Socket;
@@ -1027,13 +1039,14 @@ interface Link {
   closed: boolean;
   /**
    * The client's requests written on this link and not yet answered, keyed by the id the relay sent
-   * each under: `client` is the id the client gave it, `upstream` the relay's number for it.
+   * each under: `client` is the id the client gave it, `upstream` the relay's number for it, or
+   * null when it left under the client's own id because no proxy was listening (review PR1057-R3).
    */
-  inFlight: Map<string, { client: unknown; upstream: number }>;
+  inFlight: Map<string, InFlightRequest>;
   /** The relay's own requests on this link, each answered by this link and by no other. */
   waiters: Map<string, (message: RelayedMessage | null) => void>;
   /** Replayable requests written on this link, remembered only once the daemon answers them with success. */
-  initializes: Map<string, RelayedMessage>;
+  initializes: Map<string, ClientRequest>;
   wakeRegistrations: Map<string, unknown>;
   /** Whether the relay has registered its wake proxy on this link of its own accord. */
   proxyOffered: boolean;
@@ -1107,21 +1120,32 @@ const wakeRefusalReason = (message: RelayedMessage): string => {
  *     the proxy itself unless the client registered another endpoint, so a wake reaches a session
  *     whose model never called the tool. The daemon wakes on every registration it accepts, so
  *     that registration is also the first wake through the proxy.
- *   - **The client's requests leave under ids of the relay's** (review PR1057-R2). The relay's own
- *     requests — the restore's replays and the proxy's registration, which goes out on a live
- *     link alongside the client's traffic — share the connection with the client's, and an id the
- *     client may also use is one whose answer the relay would take, handing the relay's answer to
- *     the client as the client's. So each client request is sent under the next number the relay
- *     counts, and its answer goes back under the client's own id; the relay's own requests carry
- *     strings, which no number equals. A client's `notifications/cancelled` is sent naming the
- *     number its request went under, and not sent at all when it names no request in flight, since
- *     the id it names may be one of the relay's. An answer to no request in flight — the late answer
- *     to a request of the relay's it stopped waiting for — is dropped, never passed to the client.
+ *   - **Once its proxy listens, the client's requests leave under ids of the relay's** (review
+ *     PR1057-R2). The relay's own requests — the restore's replays and the proxy's registration,
+ *     which goes out on a live link alongside the client's traffic — share the connection with the
+ *     client's, and an id the client may also use is one whose answer the relay would take, handing
+ *     the relay's answer to the client as the client's. So each client request is sent under the
+ *     next number the relay counts, and its answer goes back under the client's own id; the relay's
+ *     own requests carry strings, which no number equals. A client's `notifications/cancelled` is
+ *     sent naming the number its request went under, and not sent at all when it names no request
+ *     in flight, since the id it names may be one of the relay's. An answer to no request in flight
+ *     — the late answer to a request of the relay's it stopped waiting for — is dropped, never
+ *     passed to the client.
+ *   - **Until then nothing is renamed** (review PR1057-R3). With no proxy listening — no messaging
+ *     in the environment, a socket the proxy may not forward to, or the proxy not yet open — the
+ *     relay sends no request of its own on a live link, so there is nothing to keep apart: every
+ *     line in either direction passes exactly as it arrived, a cancel included, and a restore
+ *     replays the client's `initialize` as the client sent it, all as before the proxy existed. A
+ *     request that left under the client's own id before the proxy opened is answered and cancelled
+ *     under that id, and the numbers and strings the relay counts afterwards skip every id such a
+ *     request still has in flight. Keyed on the proxy listening rather than on the messaging
+ *     variables being present: a complete environment whose socket the proxy may not forward to
+ *     opens no proxy, and renaming there would change the client's bytes with no proxy to protect.
  *
- * Seeing those messages, and renaming request ids, is the only reason this relay reads JSON-RPC
- * at all. A client request leaves with its id renamed, but for that one registration with nothing
- * else changed, and an answer returns with the client's id restored; every other line is forwarded
- * exactly as it arrived.
+ * Seeing those messages, and renaming request ids once the proxy listens, is the only reason this
+ * relay reads JSON-RPC at all. Once it listens, a client request leaves with its id renamed, but for
+ * that one registration with nothing else changed, and an answer returns with the client's id
+ * restored; every other line is forwarded exactly as it arrived.
  */
 const relayWithReattach = (
   first: Socket,
@@ -1144,13 +1168,16 @@ const relayWithReattach = (
     let stdoutFailed = false;
     let stdoutBlocked = false;
     let daemonBlocked = false;
-    /** The client's `initialize` a daemon answered with a result, replayed under an id of the relay's own. */
-    let clientInitialize: RelayedMessage | null = null;
+    /**
+     * The client's `initialize` a daemon answered with a result: replayed under an id of the relay's
+     * own while a proxy listens, and as the client sent it while none does.
+     */
+    let clientInitialize: ClientRequest | null = null;
     let clientInitialized: string | null = null;
     let wakeArguments: unknown = undefined;
     /** Counts the relay's own requests, whose ids are strings. */
     let internalIds = 0;
-    /** Counts the client's requests, which leave under these numbers rather than their own ids. */
+    /** Counts the client's requests, which leave under these numbers rather than their own ids once a proxy listens. */
     let upstreamIds = 0;
     /** Listening, or null: no messaging in the environment, a directory it may not use, or not yet open. */
     let proxy: WakeProxy | null = null;
@@ -1238,9 +1265,9 @@ const relayWithReattach = (
     };
 
     /** Notes a request written on `link` that a restarted daemon would be restored with, if it succeeds. */
-    const noteReplayable = (link: Link, key: string, message: RelayedMessage): void => {
+    const noteReplayable = (link: Link, key: string, message: RelayedMessage, line: string): void => {
       if (message.method === "initialize") {
-        link.initializes.set(key, message);
+        link.initializes.set(key, { message, line });
         return;
       }
       if (message.method !== "tools/call") return;
@@ -1273,6 +1300,27 @@ const relayWithReattach = (
     };
 
     /**
+     * The relay's next number for a client request on `link`, past any id a request sent under the
+     * client's own id before the proxy opened still has in flight there (review PR1057-R3).
+     */
+    const nextUpstreamId = (link: Link): number => {
+      do {
+        upstreamIds += 1;
+      } while (link.inFlight.has(idKey(upstreamIds)));
+      return upstreamIds;
+    };
+
+    /** An id for one of the relay's own requests on `link`, past any id in flight there, as `nextUpstreamId`. */
+    const nextInternalId = (link: Link, prefix: string): string => {
+      let id: string;
+      do {
+        internalIds += 1;
+        id = `${prefix}-${internalIds}`;
+      } while (link.inFlight.has(idKey(id)));
+      return id;
+    };
+
+    /**
      * The client's registration of the session's own messaging socket, pointed at the proxy; null
      * for every other message, which leaves unchanged but for its id. Only an `endpoint` exactly equal to the
      * environment's socket is rewritten, so the client cannot steer the proxy, and the proxy's
@@ -1291,20 +1339,22 @@ const relayWithReattach = (
     };
 
     /**
-     * The client's cancel of one of its requests, naming the number that request was sent under; null
-     * when no request of the client's with the id it names is in flight on `link`. Passed on as it
-     * arrived, a cancel names an id in the daemon's space, where it may be one of the relay's own.
+     * The client's cancel of one of its requests, naming the number that request was sent under, or
+     * as it arrived when that request left under the client's own id; null when no request of the
+     * client's with the id it names is in flight on `link`. Passed on as it arrived, a cancel names an
+     * id in the daemon's space, where it may be one of the relay's own.
      */
-    const cancelUpstream = (link: Link, message: RelayedMessage): string | null => {
+    const cancelUpstream = (link: Link, message: RelayedMessage, line: string): string | null => {
       const params = message.params as { requestId?: unknown } | null | undefined;
       if (typeof params !== "object" || params === null) return null;
       const named = idKey(params.requestId);
-      let upstream: number | undefined;
+      let found: InFlightRequest | undefined;
       for (const request of link.inFlight.values()) {
-        if (idKey(request.client) === named) upstream = request.upstream;
+        if (idKey(request.client) === named) found = request;
       }
-      if (upstream === undefined) return null;
-      return JSON.stringify({ ...message, params: { ...params, requestId: upstream } });
+      if (found === undefined) return null;
+      if (found.upstream === null) return line;
+      return JSON.stringify({ ...message, params: { ...params, requestId: found.upstream } });
     };
 
     const fromClient = lineSplitter((line) => {
@@ -1316,19 +1366,31 @@ const relayWithReattach = (
         if (id !== undefined) undelivered(id, "agent-control-plane is reattaching; this request was not sent");
         return;
       }
+      if (proxy === null) {
+        // No proxy, so no request of the relay's own on this link: the line leaves exactly as it
+        // arrived, under the client's own id, as before the proxy existed (review PR1057-R3).
+        if (id !== undefined) {
+          const key = idKey(id);
+          link.inFlight.set(key, { client: id, upstream: null });
+          noteReplayable(link, key, message as RelayedMessage, line);
+        } else if (message?.method === "notifications/initialized") {
+          clientInitialized = line;
+        }
+        send(link, line);
+        return;
+      }
       if (id !== undefined) {
         // Sent under the relay's next number, never under the client's own id (review PR1057-R2).
-        upstreamIds += 1;
-        const upstream = upstreamIds;
+        const upstream = nextUpstreamId(link);
         const key = idKey(upstream);
         link.inFlight.set(key, { client: id, upstream });
         const outbound = pointAtProxy(message as RelayedMessage) ?? (message as RelayedMessage);
-        noteReplayable(link, key, outbound);
+        noteReplayable(link, key, outbound, line);
         send(link, JSON.stringify({ ...outbound, id: upstream }));
         return;
       }
       if (message?.method === "notifications/cancelled") {
-        const cancel = cancelUpstream(link, message);
+        const cancel = cancelUpstream(link, message, line);
         if (cancel !== null) send(link, cancel);
         return;
       }
@@ -1371,12 +1433,13 @@ const relayWithReattach = (
         if (request !== undefined) {
           link.inFlight.delete(key);
           settleReplayable(link, key, message as RelayedMessage);
-          return toClient(JSON.stringify({ ...message, id: request.client }));
-        }
-        // An answer to no request in flight, such as the late answer to one of the relay's own it
-        // stopped waiting for. The client would take it for the answer to whichever of its requests
-        // carries that id. An error answering no id at all is the daemon's to report, and passes.
-        if (id !== null) {
+          // Sent under the client's own id, it is answered under it, and the line passes as it arrived.
+          if (request.upstream !== null) return toClient(JSON.stringify({ ...message, id: request.client }));
+        } else if (proxy !== null && id !== null) {
+          // An answer to no request in flight, such as the late answer to one of the relay's own it
+          // stopped waiting for. The client would take it for the answer to whichever of its requests
+          // carries that id. An error answering no id at all is the daemon's to report, and passes.
+          // With no proxy the relay has no request of its own on a live link, and it passes as before.
           io.stderr.write("attach: dropped an answer to no request in flight\n");
           return;
         }
@@ -1498,8 +1561,7 @@ const relayWithReattach = (
       if (clientInitialize === null) return true;
       if (clientInitialized === null) return true;
       link.proxyOffered = true;
-      internalIds += 1;
-      const id = `acp-relay-wake-proxy-${internalIds}`;
+      const id = nextInternalId(link, "acp-relay-wake-proxy");
       const registration = { endpoint: opened.path };
       const answer = await ask(link, id, JSON.stringify({
         jsonrpc: "2.0",
@@ -1528,14 +1590,14 @@ const relayWithReattach = (
     const restore = async (link: Link, deadlineAt: number, signal: AbortSignal): Promise<boolean> => {
       const initialize = clientInitialize;
       if (initialize !== null) {
-        internalIds += 1;
-        const id = `acp-relay-reinitialize-${internalIds}`;
-        if ((await ask(link, id, JSON.stringify({ ...initialize, id }), deadlineAt, signal)) === null) return false;
+        // With no proxy, as the client sent it and under its id, as before the proxy (review PR1057-R3).
+        const id = proxy === null ? initialize.message.id : nextInternalId(link, "acp-relay-reinitialize");
+        const line = proxy === null ? initialize.line : JSON.stringify({ ...initialize.message, id });
+        if ((await ask(link, id, line, deadlineAt, signal)) === null) return false;
         if (clientInitialized !== null) link.socket.write(`${clientInitialized}\n`);
       }
       if (wakeArguments !== undefined && !supersededByProxy(wakeArguments)) {
-        internalIds += 1;
-        const id = `acp-relay-rewake-${internalIds}`;
+        const id = nextInternalId(link, "acp-relay-rewake");
         const answer = await ask(link, id, JSON.stringify({
           jsonrpc: "2.0",
           id,

@@ -18,6 +18,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vites
 
 import {
   ATTACH_EXIT,
+  RELAY_REATTACHING_ERROR,
   runAttachRelay,
   runAttachRelayCommand,
   type ReattachPolicy,
@@ -864,6 +865,218 @@ describe("the relay's own requests cannot take a client's answer (review PR1057-
     expect(JSON.stringify(client.line.id)).not.toBe(JSON.stringify(registration.line.id));
     door.answer(registration, REGISTERED);
     door.answer(client, CLIENT_RESULT);
+    await r.finish();
+  });
+});
+
+/**
+ * Review PR1057-R3. The id renaming PR1057-R2 added keeps the relay's own requests apart from the
+ * client's, and the relay sends a request of its own on a live link only once its proxy listens.
+ * Without one — no messaging in the environment, only half of it, or a socket the proxy may not
+ * forward to — the relay is the byte pipe it was before the proxy existed: every line in either
+ * direction passes exactly as it arrived, under the client's own ids, a cancel included, and a
+ * restore replays the client's `initialize` as the client sent it.
+ *
+ * Every frame below is spaced as `JSON.stringify` never spaces it, and one carries a `\u` escape it
+ * would decode, so a line the relay parsed and wrote again cannot pass for the line it was given.
+ */
+const SPACED = {
+  initialize: `{ "jsonrpc": "2.0", "id": "init-1", "method": "initialize", "params": { "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name":"fixture-client","version":"1"} } }`,
+  initialized: `{"jsonrpc" : "2.0", "method" : "notifications/initialized"}`,
+  list: `{  "id":"client-42",  "jsonrpc":"2.0", "method":"tools/list" , "params":{} }`,
+  held: `{"jsonrpc":"2.0","id":"held-7","method":"tools/call","params":{ "name":"fixture_slow","arguments":{} }}`,
+  cancel: `{ "jsonrpc":"2.0", "method":"notifications/cancelled", "params":{ "requestId":"held-7", "reason":"caf\\u00e9" } }`,
+  strayCancel: `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"never-sent" , "reason":"fixture"}}`,
+  afterRestore: `{"jsonrpc":"2.0", "method":"tools/list", "id":"after-restore-3"}`,
+  stray: `{ "jsonrpc":"2.0", "id":"stray-9", "result":{ } }`,
+} as const;
+
+/** The stand-in daemon's answer to a request, spaced as no serializer spaces it, under the id it was sent. */
+const spacedAnswer = (id: unknown, method: string): string =>
+  `{ "jsonrpc" : "2.0" ,  "id" : ${JSON.stringify(id)} , "result" : { "answered" : ${JSON.stringify(method)} } }`;
+
+/**
+ * A stand-in daemon behind the reattach door that keeps each connection's bytes exactly as they
+ * arrived and answers every request at once with `spacedAnswer`, but a `tools/call` of `fixture_slow`,
+ * which it never answers.
+ */
+const recordingDoor = async (dir: string) => {
+  const path = join(dir, "door.sock");
+  const connections: Array<{ socket: Socket; raw: string }> = [];
+  const server = createServer((socket) => {
+    socket.on("error", () => undefined);
+    const connection = { socket, raw: "" };
+    connections.push(connection);
+    socket.write(`${JSON.stringify({ ok: true, reasonCode: ReasonCode.OK, admitted: STAND_IN_TUPLE })}\n`);
+    let text = "";
+    socket.on("data", (chunk: Buffer) => {
+      connection.raw += chunk.toString("utf8");
+      text += chunk.toString("utf8");
+      for (let newline = text.indexOf("\n"); newline >= 0; newline = text.indexOf("\n")) {
+        const line = JSON.parse(text.slice(0, newline)) as StandInLine;
+        text = text.slice(newline + 1);
+        if (line.id === undefined || line.method === undefined) continue;
+        if (line.method === "tools/call" && line.params?.name === "fixture_slow") continue;
+        socket.write(`${spacedAnswer(line.id, line.method)}\n`);
+      }
+    });
+  });
+  await listen(server, path);
+  closers.push(async () => {
+    for (const { socket } of connections) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  return { path, connections };
+};
+
+const lines = (...frames: string[]): string => frames.map((frame) => `${frame}\n`).join("");
+
+type MessagingVariable = (typeof MESSAGING_ENV)[number];
+
+/** How a case leaves the relay without a proxy: what it hands the relay, or what the environment holds. */
+interface Unproxied {
+  name: string;
+  /** Set: run through `runAttachRelayCommand`, which reads the environment. Unset: `runAttachRelay`. */
+  env?: (sessionPath: string) => Partial<Record<MessagingVariable, string>>;
+  /** For `runAttachRelay`: the messaging it is handed, given the session's socket in a directory it may not use. */
+  messaging?: (sessionPath: string, openSessionPath: string) => SessionMessaging | undefined;
+  stderr: string;
+}
+
+const UNPROXIED: Unproxied[] = [
+  { name: "no messaging is handed to the relay", messaging: () => undefined, stderr: "" },
+  { name: "the environment holds neither messaging variable", env: () => ({}), stderr: "" },
+  {
+    name: "the environment holds the session's socket and no token",
+    env: (sessionPath) => ({ CLAUDE_CODE_MESSAGING_SOCKET: sessionPath }),
+    stderr: "",
+  },
+  {
+    name: "the environment holds the token and no session socket",
+    env: () => ({ CLAUDE_CODE_MESSAGING_TOKEN: MESSAGING_TOKEN }),
+    stderr: "",
+  },
+  {
+    name: "the environment holds the session's socket and an empty token",
+    env: (sessionPath) => ({ CLAUDE_CODE_MESSAGING_SOCKET: sessionPath, CLAUDE_CODE_MESSAGING_TOKEN: "" }),
+    stderr: "",
+  },
+  {
+    name: "the environment holds the token and an empty session socket",
+    env: () => ({ CLAUDE_CODE_MESSAGING_SOCKET: "", CLAUDE_CODE_MESSAGING_TOKEN: MESSAGING_TOKEN }),
+    stderr: "",
+  },
+  {
+    name: "the session's socket is in a directory the daemon would refuse, so no proxy opens",
+    messaging: (_sessionPath, openSessionPath) => ({ socketPath: openSessionPath, token: MESSAGING_TOKEN }),
+    stderr: "attach: wake proxy not opened directory-not-owner-only\n",
+  },
+];
+
+describe("with no wake proxy the relay changes no byte in either direction (review PR1057-R3)", () => {
+  for (const unproxied of UNPROXIED) {
+    it(`passes every line through exactly as it arrived when ${unproxied.name}`, async () => {
+      const dir = mkdtempSync("/tmp/acpwn-");
+      roots.push(dir);
+      const session = await recordingSocket(join(dir, "client.sock"));
+      const open = join(dir, "open");
+      mkdirSync(open);
+      chmodSync(open, 0o755);
+      const openSession = await recordingSocket(join(open, "client.sock"));
+      const door = await recordingDoor(dir);
+      const paths = { claimPath: join(dir, "absent.sock"), ctoPath: join(dir, "absent.sock"), reattachPath: door.path };
+      if (unproxied.env !== undefined) Object.assign(process.env, unproxied.env(session.path));
+      const r = unproxied.env !== undefined
+        ? relay(paths, { entry: "command" })
+        : relay(paths, { messaging: unproxied.messaging?.(session.path, openSession.path) });
+
+      r.stdin.write(lines(SPACED.initialize, SPACED.initialized, SPACED.list, SPACED.held, SPACED.cancel, SPACED.strayCancel));
+      expect(await until(() => r.received().some((message) => message.id === "client-42"))).toBe(true);
+      await pauseFor(100);
+      // Soft, so each direction and the restore is judged on its own when one of them changes a byte.
+      // Client to daemon: each line as the client wrote it, the request ids its own, both cancels sent.
+      expect.soft(door.connections[0]!.raw).toBe(
+        lines(SPACED.initialize, SPACED.initialized, SPACED.list, SPACED.held, SPACED.cancel, SPACED.strayCancel),
+      );
+
+      // Daemon to client: an answer to no request of the client's passes as well, as it always did.
+      door.connections[0]!.socket.write(`${SPACED.stray}\n`);
+      expect.soft(await until(() => r.received().some((message) => message.id === "stray-9"), 1_000)).toBe(true);
+
+      // A restarted daemon is given the client's `initialize` as the client sent it, and then its
+      // `notifications/initialized`, before anything else.
+      door.connections[0]!.socket.destroy();
+      expect(await until(() => (door.connections[1]?.raw ?? "").includes("notifications/initialized"))).toBe(true);
+      r.stdin.write(lines(SPACED.afterRestore));
+      expect(await until(() => r.received().some((message) => message.id === "after-restore-3"))).toBe(true);
+      expect.soft(door.connections[1]!.raw).toBe(lines(SPACED.initialize, SPACED.initialized, SPACED.afterRestore));
+
+      // Every answer reached the client as the daemon wrote it; the one line of the relay's own is
+      // its report that the held request's outcome is unknown, under that request's own id.
+      expect.soft(r.out()).toBe(lines(
+        spacedAnswer("init-1", "initialize"),
+        spacedAnswer("client-42", "tools/list"),
+        SPACED.stray,
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: "held-7",
+          error: {
+            code: RELAY_REATTACHING_ERROR,
+            message: "the agent-control-plane connection closed before this request was answered; its outcome is unknown",
+          },
+        }),
+        spacedAnswer("after-restore-3", "tools/list"),
+      ));
+      expect.soft(r.err()).toBe(unproxied.stderr);
+      expect(door.connections).toHaveLength(2);
+      // And no proxy: nothing opened beside either socket, and neither was sent a byte.
+      expect(proxiesIn(dir)).toEqual([]);
+      expect(readdirSync(open).filter((name) => PROXY_NAME.test(name))).toEqual([]);
+      expect(session.received).toEqual([]);
+      expect(openSession.received).toEqual([]);
+      await r.finish();
+    });
+  }
+
+  it("answers and cancels a request sent before the proxy opened under the client's own id, and counts the relay's ids past it", async () => {
+    const dir = mkdtempSync("/tmp/acpwt-");
+    roots.push(dir);
+    const session = await recordingSocket(join(dir, "client.sock"));
+    const door = await holdingDoor(dir);
+    const r = relay(
+      { claimPath: join(dir, "absent.sock"), ctoPath: join(dir, "absent.sock"), reattachPath: door.path },
+      { messaging: { socketPath: session.path, token: MESSAGING_TOKEN } },
+    );
+    // Written before the relay is admitted, so they are read before its proxy listens: they leave
+    // under the client's own ids, one a number the relay counts and one an id it generates.
+    const early = [1, OLD_GENERATED_ID].map((id) => r.requestAs(id, "tools/call", { name: "fixture_tool", arguments: {} }));
+    const initialize = r.requestAs("init", "initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: qualified });
+    expect((await initialize).error).toBeUndefined();
+    expect(await until(() => door.held.length === 2)).toBe(true);
+    expect(door.held.map((entry) => entry.line.id)).toEqual([1, OLD_GENERATED_ID]);
+
+    // Initialized once the proxy listens: the relay registers it, and a later request is renamed.
+    r.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+    expect(await until(() => door.held.some(isRegistration))).toBe(true);
+    const late = r.requestAs("late", "tools/call", { name: "fixture_tool", arguments: {} });
+    expect(await until(() => door.held.length === 4)).toBe(true);
+    // The daemon never has two requests outstanding under one id.
+    const ids = door.held.map((entry) => JSON.stringify(entry.line.id));
+    expect(new Set(ids).size).toBe(ids.length);
+
+    // A cancel of an early request names it as the daemon knows it: under the client's own id.
+    r.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1, reason: "fixture" } })}\n`);
+    expect(await until(() => door.notifications.some((line) => line.method === "notifications/cancelled"))).toBe(true);
+    expect(door.notifications.filter((line) => line.method === "notifications/cancelled").map((line) => line.params?.requestId)).toEqual([1]);
+
+    // The registration's answer first, then each client's: every client answer under its own id.
+    for (const entry of [door.held.find(isRegistration)!, ...door.held.filter((entry) => !isRegistration(entry))]) {
+      door.answer(entry, isRegistration(entry) ? REGISTERED : CLIENT_RESULT);
+    }
+    for (const answered of [...early, late]) expect((await answered).result).toEqual(CLIENT_RESULT);
+    await pauseFor(100);
+    expect(r.out()).not.toContain("structuredContent");
+    expect(r.err()).toBe("");
     await r.finish();
   });
 });
