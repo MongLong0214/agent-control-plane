@@ -20,11 +20,20 @@ $HOME/.agent-control-plane/rollback-pairs/. It selects nothing implicitly: the p
 WAL-complete database backup, the runtime closure and the launchd generation together, and
 --expected-index-digest is the SHA256(SHA256SUMS) retained outside the pair, without which a
 pair can vouch for a forgery of itself. Prevalidation runs before anything is stopped.
+The rollback is validated and applied by this installer's own checkout's
+dist/deploy/rollback-pair.js, never the deployment's, and is refused unless that build checks
+the pair against the live database; after rolling back into an older generation, run the next
+rollback from a current checkout with --app-root.
 
 The job always uses $HOME/.agent-control-plane because that is agentcpd's configured
 state root. Secrets never go in the plist: store ACP_MCP_TOKEN and ACP_OPERATOR_TOKEN (both required),
 optional Buzz variables, and optional Telegram variables as generic-password Keychain items under the
 selected service. Telegram is disabled when none of its variables are present and refuses a partial set.
+
+With ACP_TELEGRAM_EXTERNAL_CONSUMER=hermes, Hermes is the only Telegram consumer: ACP polls nothing
+and startup refuses if ACP_TELEGRAM_BOT_TOKEN is also stored. The lane opens only when
+ACP_TELEGRAM_EXTERNAL_SECRET (the value Hermes presents) is stored too, and then needs
+ACP_TELEGRAM_OWNER_ID and ACP_TELEGRAM_CHAT_ID, the owner declared as telegram:<id> in owner-identities.
 
 BUZZ_PRIVATE_KEY has a second source. When no such item exists under the selected service,
 the launcher falls back to the Buzz desktop app's own store, whose layout is a JSON object
@@ -496,6 +505,7 @@ for optional in ACP_OPERATOR_ACTOR BUZZ_PRIVATE_KEY ACP_BUZZ_INGRESS_SECRET ACP_
   ACP_TELEGRAM_CHAT_ID ACP_TELEGRAM_ALLOWED_CHAT_IDS ACP_TELEGRAM_WEBHOOK_SECRET \
   ACP_TELEGRAM_POLL_TIMEOUT_SECONDS ACP_TELEGRAM_RETRY_DELAY_MS \
   ACP_TELEGRAM_DEFAULT_PROJECT_ID ACP_TELEGRAM_API_BASE_URL ACP_TELEGRAM_TRANSPORT_RETENTION_MS \
+  ACP_TELEGRAM_EXTERNAL_CONSUMER ACP_TELEGRAM_EXTERNAL_SECRET \
   ACP_CANONICAL_SESSIONS_JSON ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION \
   ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256 \
   ACP_CANONICAL_CTO_PEER_PROTOCOL ACP_CANONICAL_CTO_BUZZ_PURPOSE \
@@ -832,8 +842,25 @@ case "$command_name" in
     pair_root="$(cd -P -- "$pair_root" && pwd)"
     [[ "${pair_root##*/}" == "$pair_id" ]] ||
       fail "the sealed pair directory resolves to a different id: $pair_root"
-    validator="$app_root/dist/deploy/rollback-pair.js"
-    [[ -f "$validator" ]] || fail "rollback pair validator build missing: $validator"
+    # The coordinator is this installer's own checkout's build, never the deployment's (ACP1058-R1).
+    # The deployment's is the runtime this rollback replaces: a deployment built before a check
+    # would validate and apply a pair without it, and a rollback into an older generation installs
+    # that generation's coordinator for the next rollback to find. This is the rule
+    # scripts/verify-pair-independently.mjs already keeps for the same reason. When this installer
+    # runs from inside the deployment the two are the same build, so the coordinator is asked what it
+    # enforces before it is handed anything: one that cannot check whether the live database has
+    # moved past the pair is refused here, before anything is stopped, and the way forward is the
+    # installer of a checkout built with the check, given --app-root.
+    coordinator="$DEFAULT_APP_ROOT/dist/deploy/rollback-pair.js"
+    [[ -f "$coordinator" ]] || fail "rollback coordinator build missing from this installer's checkout: $coordinator"
+    declared_high_water=""
+    if coordinator_guards="$("$node_path" "$coordinator" guards)"; then
+      while IFS='=' read -r guard_key guard_value; do
+        if [[ "$guard_key" == "ACP_ROLLBACK_DATABASE_HIGH_WATER" ]]; then declared_high_water="$guard_value"; fi
+      done <<< "$coordinator_guards"
+    fi
+    [[ "$declared_high_water" =~ ^agent-control-plane\.database-content/v[0-9]+$ ]] ||
+      fail "the rollback coordinator in this installer's checkout does not declare the database high-water check, so it could restore a pair the live database has moved past; run deploy/install-launchd.sh from a checkout built with that check and pass --app-root"
 
     # Prevalidation, before anything is stopped, restored or replaced. The index digest is the one
     # value deliberately kept outside the pair: a pair that vouches for its own index vouches for
@@ -869,7 +896,7 @@ case "$command_name" in
     # B's code is the defect this whole mechanism exists to prevent — and puts the previous
     # generation back if any step fails. A failed rollback therefore ends with the old generation
     # whole, so the job is started again rather than left down.
-    "$node_path" "$validator" validate "${rollback_flags[@]}" >/dev/null ||
+    "$node_path" "$coordinator" validate "${rollback_flags[@]}" >/dev/null ||
       fail "sealed rollback pair failed validation: $pair_root"
 
     # The service state before this rollback touched it. Always starting the job afterwards would
@@ -879,7 +906,7 @@ case "$command_name" in
     if job_loaded; then service_was_loaded=1; else service_was_loaded=0; fi
     if [[ "$service_was_loaded" == "1" ]]; then stop_job maintenance; else stop_job; fi
     wait_for_stop
-    if ! rollback_report="$("$node_path" "$validator" rollback "${rollback_flags[@]}")"; then
+    if ! rollback_report="$("$node_path" "$coordinator" rollback "${rollback_flags[@]}")"; then
       rm -rf "$state_dir/rollback-stage"
       if [[ "$service_was_loaded" == "1" ]]; then start_job; fi
       fail "rollback failed; the previous generation and the original service state were restored"

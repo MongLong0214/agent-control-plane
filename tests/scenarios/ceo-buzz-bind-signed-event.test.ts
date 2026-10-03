@@ -665,6 +665,10 @@ describe("ACP1055: a binding-shaped message is never delivered, and a refused bi
 
   it("ACP1055-02: answers a refused binding's replay with the refusal again, so a reconnect asks for the same window", async () => {
     const f = await startBindFixture();
+    // A minute past the CTO's binding, so the older owner message below is still signed after it:
+    // one signed before the binding is refused (BUZZ_MENTION_PRECEDES_BINDING), and this row is
+    // about the window, not about that floor.
+    f.h.clock.advance(60_000);
     // A challenge for the CEO's key, then a different key bound through the relay-signed form.
     const token = await f.mint();
     await bindByRelayEnvelope(f, f.otherCeoKey.pubkey, "acp1055-other-key");
