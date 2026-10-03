@@ -1,0 +1,42 @@
+Limit: sessions.buzz_address carries no immutability trigger in the schema or the live database, which is what lets the same live holder's row be corrected in place without a migration
+Limit: the correction runs only when a relay reattaches, which every daemon restart causes; a CTO whose relay never reattaches keeps its old room until it does
+Ruled-out: revoking the generation-1 binding and re-claiming at generation 2 | the same-live recovery refuses a live process whose recorded buzz_address differs from the configured room, so the CTO would have to restart its claude process
+Ruled-out: awaiting the correction inside the reattach admission | opening the room shells the Buzz CLI, so a Buzz outage would block or time out every reattach of that CTO
+Ruled-out: correcting a row whose entry names no buzzAddress to ACP_BUZZ_CHANNEL | that entry asked for the default behaviour, and nothing rewrites a live row for an entry that did not ask for a room
+Warn: changing a CTO's buzz_address withholds every peer message already queued for it under the old room, because the hand-over compares the admitted room with the current buzz_address
+Unverified: the live correction was not exercised against the real Buzz relay; the tests use in-process fake resolvers only
+Record-Id: r-u6ctoroom
+Provenance: inherited 421f479e9191825c97ce45a8984a9ef881829560
+
+Limit: the claim and the reattach correction are composed before the subscriber starts, and until it does their room check answers null and checks nothing; the startup cross-check that follows applies the same rule to every entry and refuses the whole start
+Limit: the startup cross-check reads configuration only, never a session's buzz_address, so a row left in a room no entry names any more is not found by it
+Ruled-out: making the subscriber's REQ follow each entry's buzzAddress | the subscription keeps the rooms its own file declares, as ACP_BUZZ_CHANNEL is refused at startup rather than added to it
+Warn: an entry without buzzAddress is now checked against its own subscriber identity's rooms rather than the union, so a CTO identity that lists only its project room while ACP_BUZZ_CHANNEL is another room refuses startup until the entry names that room as buzzAddress
+Unverified: no live relay or live daemon was run; startup goes through main() with an inert WebSocket and delivery through the subscriber harness with a modelled relay filter
+Record-Id: r-568f4263e272
+Follows: r-u6ctoroom
+Provenance: inherited 915bc63a1d06c6c9fe4c132bb447e72b192e526e
+
+Limit: the claim and reattach sockets open before the mention subscriber starts, because the subscriber needs the Buzz message ingress, which needs the listeners; startup therefore holds the room-writing steps behind a one-way latch released after the subscriber decision
+Warn: a claim that lands before the latch is released is refused with CONFLICT and the relay does not retry claims, so a claim racing a daemon start exits and must be run again; on the wire this refusal is the same CONFLICT as a room mismatch
+Warn: a reattach is admitted during startup and only its Buzz room correction waits for the latch; the correction is fire-and-forget, so it runs once the rooms are checked and never if the start is refused
+Unverified: the full suite and a live daemon were not run for this repair; the startup witnesses drive the real main() with the process evidence and the room opener replaced
+Record-Id: r-1060startlatch
+Follows: r-568f4263e272
+Provenance: inherited d6e2ab429239a34d0764b9d64bb1b263c46dc9a2
+
+Limit: admit() derives the conversation before its lineage probes and the lineage reads the native start before walking the relay's parents, so the tuple compared inside the correction's transaction cannot see a /resume or a reused pid during that walk; the claim's commit checkpoint runs after the last process read instead
+Warn: any process read added to the correction's transaction belongs above the assertClaudeIdentityStillLive checkpoint; the checkpoint re-verifies the claude process, not the relay-to-claude parent link
+Unverified: reattach admission itself writes nothing and keeps no checkpoint, so its identity can go stale the same way between admission and a later call
+Record-Id: r-1060r101
+Follows: r-1060startlatch
+Provenance: inherited 20df8c0741155885be73516462a3c03d0642eec3
+
+Limit: the release now waits for the Telegram long-poll start, so a slow start holds early corrections longer
+Warn: settleCanonicalRooms() must stay the last statement of main()'s startup try block; any startup step added after it that can still refuse would let a held correction write before the start is refused
+Record-Id: r-1060fu01
+Follows: r-1060r101
+Provenance: inherited fc63039ece52f8bbbf9b037d953504b582d115b0
+
+Provenance: inherited 1bc542836044d5e19e46063618f2bf3cb7abd371
+X-Claude-Session: https://claude.ai/code/session_0125xavK2hjM9n55cHBkK4bB
