@@ -1,0 +1,12 @@
+Limit: Rollback's applyRollbackPair overwrites the sealed runtime in place at the already-resolved $app_root/dist and never creates a new generation directory, so the rollback branch repoints current at $app_root rather than a path read out of the rollback report.
+Ruled-out: ln -sfn directly on $state_dir/current | unlinks the old name and creates the new one as two separate syscalls, leaving a window where current resolves to nothing
+Unverified: The refusal of an existing current owned by a different uid is implemented but not exercised by an automated test in this sandbox, because creating a decoy owned by another user needs root and passwordless sudo is unavailable here.
+Record-Id: r-195ab5693854
+Provenance: inherited eee3c00dcfb058d6a5dfad1decb22331d189557a
+
+Limit: A review (ACP1052-R1) found the current-link safety checks ran only after rollback or install/upgrade had already replaced the runtime, database, launcher and plist and restarted the service, so a refusal there exited 1 with no compensation after the deployment had already applied.
+Ruled-out: leaving update_current_link as one function and moving its call earlier | a single function cannot be both an early-only check (before app_root/the sealed pair are even known) and a late-only write (after the deployment it names has succeeded)
+Warn: publish_current_link must stay non-fatal on any failure (print a warning to stderr, return 0) rather than call fail, because current is a convenience path for an external reader, not this deployment's own correctness boundary.
+Warn: makeDisposableAppRoot copies this repository's own dist/, which an earlier row in the same suite run (one that targets --app-root root directly) can already have cloned a fake node interpreter into; assert dist/bin/node against a snapshot taken at fixture creation, not against assumed absence.
+Record-Id: r-e8449a05e765
+Provenance: inherited d6539ac2ba6b81fe2cd2da10e21995c415a0b64d
