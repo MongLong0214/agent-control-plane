@@ -1,0 +1,165 @@
+Limit: no consumer delivers an owner-reply item yet: a completed turn's reply is durably owed and readable through pendingOwnerReplies, and delivery belongs to the U6 surface path once Hermes carries signed canonical replies (hermes-agent#63)
+Limit: a Telegram ingress row keeps no chat id in the clear (payload is {text, messageId}, audit stores conversation as [not-stored]), so a Telegram reply item is addressed by the ingress claim's scope and chat digests and the owner's message id, and a sender must resolve the chat against its allowlist
+Ruled-out: a dedicated owner-reply table behind a schema migration | a foreign key to canonical_turns cannot hold for the ingress lane's turn ids, and a schema bump edits the digest-pinned migrations.ts and needs an approved live migration
+Ruled-out: an owner-reply kind in the governed outbox table | its rows are fenced to a role's session and swept by expiry, fencing and the generic delivery loop, none of which an owner reply may pass through before a consumer exists
+Warn: the canonical sweep queues a reply only in the transaction that moves the turn to COMPLETED; queueing on every accepted COMPLETED receipt would answer a turn that a redelivery or another settlement already completed a second time
+Warn: one reply per owner message is enforced by the anchor check in enqueueOwnerReply, not by the row key, because the canonical and ingress lanes mint different turn ids for the same message
+Warn: an ingress claim settled by a COMPLETED receipt carries settledAt with settlement REPLY_OUTBOX and never repliedAt or noReplyAt; readers that treat settledAt as terminal rely on that
+Record-Id: r-1036ownerreply
+Provenance: inherited 5ae2be0e11a32f0ee5ed0faabe79e17c4b036d36
+
+Warn: the falsifiability harness compiles every mutant, and a row's killedBy may name only one distinct test because vitest -t takes one pattern; a replacement of `if (false)` around a block that reads a narrowed variable fails tsc and is reported as an unusable row, not a kill
+Record-Id: r-1036mutantshape
+Follows: r-1036ownerreply
+Provenance: inherited 34727b2a786d498dc21a286877e969cc55536df2
+
+Limit: a Buzz channel identity can be reused across CEO generations and a reused key signs an earlier generation's events just as validly, so the CEO generation and the receiving CTO session are bound into the signed payload at receipt and compared with the registry immediately before admission's first write
+Limit: the signed-time window narrows a reused key and does not close it: whoever holds a reused key can still sign an event dated inside the current window, and nothing on the daemon side tells it from the current CEO's
+Limit: a peer message admitted before a CEO rotation is still handed to its CTO after it; the hand-over checks only the holder fence every holder-claimed row has
+Ruled-out: adding the CEO's Buzz channel identity to the owner allowlist | it hands the CEO the owner's authority (owner gates, approvals, the owner's reply), a delegation nobody granted; a peer is instead whoever the registry says the current CEO binding speaks as, toward its bound PRIMARY_CTO only
+Ruled-out: re-checking the CEO generation when the CTO takes a peer message | a refusal at hand-over has to burn the row, which is a write, where admission refuses with none
+Warn: the live CEO runtime's buzz_actor_id is NULL, so every CEO mention is refused (fail-closed) until #1037 issues the credential bindActor needs; do not unblock it with an owner-list entry or a second binding path
+Warn: activation also needs the CEO's key on ACP_BUZZ_ALLOWED_ACTORS and the CTO runtime's buzz_address equal to the room the CEO writes in; this change configures neither
+Warn: health now counts a coded refusal as admission-refused:<reasonCode> and a bare REFUSED as admission-refused, so a reader totalling refusals must sum both
+Record-Id: r-1038peeringress
+Provenance: inherited b24844fc62bfed6a3c36fee5f510c332a0f72713
+
+Warn: a peer-rule mutant that replaces a refusal's condition with `if (false)` does not compile when the refusal reads `current.value`, because TypeScript drops the narrowing inside a literally unreachable block; replace the condition with one that is always false at runtime instead
+Record-Id: r-1038mutantshape
+Follows: r-1038peeringress
+Provenance: inherited 881d0ff23f96cc838e3efc1a5867d2d7e2b863f9
+
+Limit: the per-call check is only the binding fence; Gateway death is covered by the relay's stdin ending with the Gateway, not by re-reading the process on each call
+Ruled-out: rotating the adopted CEO from generation N to N+1 with a fresh session and secret on every attach | withdrawn at the owner's direction: a generation per reconnect adds no security, because the relay could only prove what the kernel-peer admission already proves, and every respawn would spend a generation the next respawn must name
+Ruled-out: letting every turn the Gateway profile runs hold the CEO's mutation authority | a cron job or a delegated subagent would then start runs as the owner without the owner having asked
+Ruled-out: reading caller provenance from tool arguments as a fallback | a model writes arguments, so a provenance-shaped object there is the caller describing itself
+Warn: this change binds no Buzz channel identity; the adopted CEO runtime's buzz_actor_id stays as adoption left it, so #1038's CEO peer ingress stays closed until the one writer of that column can consume this admission instead of a session secret
+Warn: cto_binding_bind and cto_binding_release are not served on the adopted CEO tool socket: they take the runtime's session secret as their principal, which an adopted runtime does not hold
+Warn: the adopted CEO tool socket must never call ceoConversation.attach; it is how the CEO calls ACP, and registering it would let the daemon open sampling outside the adopted lineage
+Unverified: the process tree above a relay that a live Hermes Gateway spawns was not observed; the tests state that tree
+Record-Id: r-14245cb5eec2
+Provenance: inherited 0e8e1cfc1dc23b8a855061040de17ed3a43af792
+
+Limit: Telegram rows admitted before this change carry no chatId in their payload, so a COMPLETED receipt for them is unaddressable and the turn stays IN_DOUBT; an update an older binary admitted and this one claims also fails claim()'s INGRESS_ADMITTED payload digest
+Limit: r-1036ownerreply's Limit that a Telegram reply item is addressed by the claim's scope and chat digests, and its Warn that one reply per owner message rests on an anchor check, were true when written and are false after this commit: the address comes from the admitted payload and coverage spans every source of the turn
+Ruled-out: addressing a Telegram reply from the claim's sessionDigest or legacySessionDigest | legacySessionDigest is not frozen by the identity trigger so a later write moves the reply, freezing it needs a trigger change and a migration, and a digest names a conversation without saying where it is
+Ruled-out: keeping the earlier ruling against putting the Telegram chat id in the admitted payload | it leaves a Telegram reply with no immutable address; the payload-digest cost at an upgrade is accepted instead and is bounded to messages admitted before it and still unclaimed
+Warn: only the turn coordinator holds a database's owner-reply authority (claimed once per database identity, released on close); anything else that needs an owner reply must go through the coordinator
+Warn: reconcileIngressReceipt takes (source, query, settle) and completeClaimFromHermesReceipt accepts only a coordinator-issued, single-use IngressReceiptSettlement; code that handed the guard a receipt it built must route through the coordinator's receipt port
+Warn: one owner message gets at most one reply across both lanes: a message answered through ingress (repliedAt or a reserved CEO answer) or named by another item owes nothing new, and a turn whose messages are only partly covered is refused and stays IN_DOUBT
+Record-Id: r-1041r2settle
+Follows: r-1036ownerreply
+Provenance: inherited bad10797d6c818b0d4459891463f5d19c2e012aa
+
+Warn: a reserved Telegram reply counts as the owner's answer only when it carries turnAnswered: true; an apology the transport delivered leaves the answer the receipt proves still owed, and a check that treats any reservation as answered silently drops it
+Record-Id: r-1041r2apology
+Follows: r-1041r2settle
+Provenance: inherited c1635021808e4e15a612971e3d8cda9c99502440
+
+Limit: a reattached connection re-reads only the binding on each call; identity is not re-derived per call because the relay's stdio is claude's and the connection closes when claude exits
+Ruled-out: claiming on every spawn of a live canonical CTO claimant | the claim refuses an ACTIVE binding, and the secret it would mint proves nothing the process tree does not; a reattach admitted on the process tree reuses no credential, so the relay's no-reconnect rule, which exists to stop a plaintext secret being reused across a daemon restart, does not reach it
+Warn: the relay claims only on CTO_REATTACH_UNBOUND or when the reattach socket is absent or silent; every other reattach refusal ends the attach, and the relay's copy of that code must stay equal to the catalogue's
+Unverified: the ancestry half of admitRuntimeLineage is not independently witnessed on the CTO path: removing it fails no CTO test, because the canonical claim's own derivation already walked the same ancestry
+Record-Id: r-d53a8c71bea3
+Provenance: inherited 63fe8b9cf15ce6682810743716cddc3b6a4cd24e
+
+Limit: the CEO cannot produce the binding envelope itself: it is HMAC-signed with the deployment's Buzz ingress secret, so the relay that holds that secret has to sign it for the CEO's session
+Ruled-out: requiring the session secret, or minting one, for the adopted CEO's Buzz channel identity binding | an adopted runtime keeps no secret, and the kernel-peer lineage admission already proves the caller is that session; the admission is passed to the same writer instead, so the column keeps one writer and one UPDATE
+Warn: the admitted binding path answers every refusal it can know before it writes, so unlike the secret path it leaves no INGRESS_REFUSED or INGRESS_REPLAY audit row for a refused attempt
+Warn: the identity bound is the actor the relay-signed envelope names; a binding for a different actor needs an envelope signed for it, and the signature covers this session and the nonce
+Unverified: buzz_actor_bind's own binding fence is not independently witnessed: removing it fails no test, because the provenance guard re-runs the same authenticator before any mutation
+Record-Id: r-689183c0e29f
+Provenance: inherited 7fe0e3687f0999e50c417e85d1c767e4e7f07a41
+
+Limit: a legacy lstart-only row is decided by lstart only when the row was written after the recorded second ended; the recorded process was alive then, so any successor starts in a later second; a row written inside that second is refused
+Limit: the native start pin is the first SESSION_NATIVE_START_PINNED audit event for the session, because a dedicated column needs a migration and the migration list is frozen
+Ruled-out: rewriting sessions.os_process_started_at to the exact native token | probeSessionLiveness and the Gateway delivery authority read that column as ps lstart and would then call the live Gateway dead; the token is pinned beside it instead
+Warn: lstart is parsed in the daemon's local time zone, the zone ps renders it in; a daemon whose TZ differs from the one that wrote the row would misjudge the legacy rule
+Record-Id: r-060c803c04d5
+Provenance: inherited 5c97a60922060bdf9b13d38fbec4813f0c120a5e
+
+Ruled-out: resolving the Keychain deployment token before asking the canonical CTO reattach socket | it made the one door that needs no credential unreachable without one; the token is now acquired only for the self-claim and cto.mcp.sock fallback
+Warn: when the reattach answers unbound and no token can be read, the relay exits without claiming: a claim it could not then attach with would spend a generation for nothing
+Record-Id: r-401af8a9be83
+Provenance: inherited 715cf9b6799606777d885463fa7c4b5e3849a262
+
+Limit: a CEO channel identity carried by another session row, or a CEO runtime that served an earlier CEO generation, refuses every CEO mention; a fresh identity per CEO generation is the remedy, so if #1037 binds the earlier key or re-binds the same runtime, peer delivery stays refused
+Limit: the reuse check reads three facts: another session row with the key, an earlier CEO assignment on this runtime, and a recorded runtime move onto it before this generation; a key held outside those records is not visible
+Limit: the generation's lower time bound is in whole seconds, so an exclusive identity's event signed in the fraction of the start second before the start is admitted
+Limit: a withheld peer row stays PENDING with its turn open until the holder rejects it by id; nothing sweeps it
+Ruled-out: building the peer generation proof in the sink when a frame is processed | a frame that waited behind another admission across a rotation was stamped with the generation it was processed under; the subscriber's receipt, read when the frame arrives, is presented instead
+Ruled-out: placing a reused key's events in a generation by their created_at | it is the signer's own claim and the review admitted an event signed under generation 1 and dated 60 s ahead; a reused identity is refused outright
+Ruled-out: burning a peer row whose proof is stale when the CTO asks for it | the hand-over must refuse before its first write; the row is withheld, reported by id, and retired by the holder's own reject
+Warn: a peer message is rejected, not carried, on a CTO takeover or runtime move, unlike an owner message; the CEO has to send it again
+Warn: Outbox.claimForHolder withholds every IDENTITY_BOUND_KINDS row by default; a new caller that passes no proof predicate hands over no peer message
+Warn: r-1038peeringress's Limit that a peer message admitted before a CEO rotation is still handed over, and its Ruled-out of re-checking at hand-over, are no longer true
+Record-Id: r-1044peerfence
+Follows: r-1038peeringress
+Provenance: inherited 27838aa1995d50b86125787e0dcc54114b25b79d
+
+Limit: only the two kernel-peer tool listeners and the claim listener end their connections on close; the token-authenticated MCP sockets in agentcpd.ts still wait for connections to drain, and that change is prepared but not applied because agentcpd.ts has another writer
+Warn: server.close() alone waits for every accepted connection to end, and a tool connection ends only when the Gateway or claude behind it does; a listener that drops its connection set brings back a shutdown that never reaches the lock release
+Record-Id: r-1aeda09affe2
+Provenance: inherited b16c9fac40aa851e7e6a0518b1ac3b704637544f
+
+Warn: closeSocketServer ends only connections registered through trackConnection; a new local MCP socket that accepts long-lived peers must register them, or a shutdown with one attached waits forever again
+Unverified: the daemon-level shutdown is tested by reproducing main's order (tool socket, MCP listeners, daemon.stop) in-process, not by signalling a running agentcpd main
+Record-Id: r-236d4dff52dd
+Provenance: inherited 618616e704a686fedce661f590b4d030b6646fc8
+
+Ruled-out: refusing only an identity another live session speaks as | #1038 reads a key any other session row carries, a stopped one included, as ambiguous, so a binding the partial unique index allows would bind nothing a CEO peer turn admits
+Warn: the admitted binding path refuses a key any other session row carries while the secret path still lets a respawn re-register a stopped incarnation's key; the difference is deliberate, because #1038 refuses CEO peer events on a reused key
+Record-Id: r-d8b47d2fc1d4
+Provenance: inherited 7466d733deecc85f4dd38192d9fe6464d9316f1b
+
+Limit: a CEO runtime with no pinned native start (one not yet admitted on its tool socket, and adopted before #1037) is still delivered to on the lstart comparison alone
+Record-Id: r-6cc7dcb426b0
+Provenance: inherited 9f00cc1fc9b27929622964fdbd18b10e270b8862
+
+Limit: an unpinned legacy row whose lstart local time is not exactly one instant, as inside a fall-back hour, is refused for its original process as well as any successor; such a CEO needs re-adoption, which pins the exact token
+Ruled-out: pinning a legacy row's native token inside the lineage judgment | a refusal that came after it, such as a Gateway readback naming another start, left a pin row for a process the admission never accepted; the caller now pins after its last check
+Ruled-out: falling back to the live native token when a CEO runtime row has no pin, in Gateway delivery | it compared the live process with itself; an unpinned row now needs the same legacy evidence the tool admission accepts, or delivery is refused
+Record-Id: r-d55fc114aa43
+Provenance: inherited 79f59a99931fd0275c99a0be03db5c75df042af6
+
+Limit: the relay comes back only through a reattach socket that answered when it started; a deployment without one keeps the byte pipe that exits with its connection
+Ruled-out: exiting the canonical CTO relay when the daemon's side of the connection closes | a daemon restart then left the ACTIVE binding with no tools and no wake path, because Claude Code does not respawn a dead stdio MCP server; reconnecting through the lineage reattach reuses no credential, so the old no-reconnect reason does not reach it
+Ruled-out: holding client requests until the daemon returns | unbounded buffering; a request during reattach, or in flight at the close, is answered at once with RELAY_REATTACHING_ERROR
+Ruled-out: claiming after a refused reattach | a reconnect would then mint a generation; a refusal (unbound, revoked, ancestry mismatch) ends the relay instead
+Unverified: live Claude Code's handling of RELAY_REATTACHING_ERROR and of a session whose initialize the relay replayed was not observed; the tests drive a scripted client
+Record-Id: r-13fba6a57d32
+Provenance: inherited eb85976e37e7565d18fce0f1021b9e212ee2d6a0
+
+Limit: SESSION_NATIVE_START_PINNED has one reader and one writer in SessionRegistry, shared by createWithPinnedStart (#1045) and the adopted Gateway's lineage admission (#1037); the identical pair each branch added was merged into one
+Ruled-out: keeping the unread-capacity keep's naive lstart parse beside the lineage admission's DST-aware one | inside a fall-back hour the naive reading settles on one of two instants without saying so; both legacy lstart rules now share lstartSecondStartMs, which answers only for an lstart that is exactly one instant
+Warn: the unread-capacity keep and createWithPinnedStart now refuse an lstart inside a fall-back hour, so such a row is not pinned at launch and takes the hold, revoke and failover paths instead of being kept
+Record-Id: r-3f584a2be7b1
+Provenance: inherited 44d6336348d1dc339df3ecbf852d5b66399ffe85
+
+Limit: the native start pin is the first SESSION_NATIVE_START_PINNED audit event for the session, with one reader and writer in SessionRegistry shared by createWithPinnedStart, the unread-capacity keep and incumbent adoption; no admission writes it, and a dedicated column would need a migration while the migration list is frozen
+Ruled-out: narrowing the legacy lstart rule (an unpinned lstart row admitted when written after its start second) to the one adopted CEO gen2 row, which decision efb9dbd0 allowed as a bounded compatibility | the row it would have preserved died with the Gateway redeploy of 2026-10-03T00:40Z, so the stricter option was taken: the rule is deleted, and an unpinned lstart row is refused by the adopted CEO tool admission, the canonical CTO reattach and Gateway delivery alike, writing nothing
+Ruled-out: rewriting sessions.os_process_started_at to the exact native token | probeSessionLiveness and the Gateway delivery authority read that column as ps lstart and would then call the live Gateway dead; the token is pinned beside it instead
+Ruled-out: falling back to the live native token when a CEO runtime row has no pin, in Gateway delivery | it compared the live process with itself; an unpinned row is now refused
+Warn: the same-second pid reuse risk of the lineage admission and Gateway delivery was removed by deleting the path that read a one-second start, not by making it safe; any lstart-based identity reintroduced there brings it back
+Warn: the unread-capacity keep (#1045) still pins an lstart row by its own lstart rule, and the lineage admission compares that pin exactly like any other, so the keep's rule is the one remaining place a one-second start becomes an exact identity
+Record-Id: r-35a7c596fbfd
+Supersedes: r-060c803c04d5
+Supersedes: r-d55fc114aa43
+Supersedes: r-6cc7dcb426b0
+Supersedes: r-3f584a2be7b1
+Provenance: inherited edbfe7092d7886789a60369d1d3e1895911ba127
+
+Limit: a JSON-RPC notification has no answer, so notifications/initialized is replayed once it was written on a live connection; initialize is replayed only once a daemon answered it with a result, and the wake registration only once a daemon answered it ok:true
+Ruled-out: remembering replay state as the client sends it | taken from the requests, a request the client was told was not sent ran on return and a refused registration replaced the accepted endpoint; replay state is taken from the daemon's answers rather than from the client's requests
+Ruled-out: admitting a reconnect whose acknowledgement names no binding tuple | it cannot be compared with the first admission's tuple, so it is refused rather than admitted unchecked
+Ruled-out: writing a daemon reason code on stderr when a reconnect names another binding | the relay found the mismatch itself and was sent no code; it writes its own stage message rather than a daemon reason code it was not sent
+Ruled-out: pausing the client's stdin inside a chunk when stdout stops accepting writes | a chunk is bounded by stdin's own high-water mark, so pausing between chunks rather than inside one already bounds what one chunk can add to stdout
+Warn: a daemon older than PR1051 acknowledges a reattach with no binding tuple: a relay from this build that meets one at start keeps the byte pipe that exits with its connection, and one that meets it on a reconnect exits with a malformed reattach reply
+Warn: r-13fba6a57d32's Limit that the relay comes back only through a reattach socket that answered when it started is false after this commit: a configured reattach socket is kept whatever it answered at start, because a door that did not answer may belong to a daemon that opened its claim socket and has not yet opened this one
+Warn: the relay's AdmittedTuple must keep the members of CanonicalCtoAdmittedTuple in src/daemon/canonical-self-claim-listener.ts; the relay imports nothing daemon-side, so the two are kept in step by hand
+Unverified: live Claude Code and a real daemon process restart were not exercised: the restart tests run the relay in-process against the real listeners, or against stand-ins rather than the real daemon
+Record-Id: r-169dbe3e90c9
+Provenance: inherited 8300bbe107af6a35f4a85b7752f845db41b7a0ee
+
+Provenance: inherited c185683333037ef783bb36aa1f6d031c9a14b410
+Claude-Session: https://claude.ai/code/session_0125xavK2hjM9n55cHBkK4bB
