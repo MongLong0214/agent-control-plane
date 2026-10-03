@@ -1952,7 +1952,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
 
     it.each([
       ["its pid answers ESRCH", restarted],
-      ["its pid was reused under a different start token", () => standardChain({ startedAt: "different lifetime" })],
+      ["its pid was reused under a different start token", () => standardChain({ startedAt: "Fri Jan  1 00:00:01 2027" })],
     ] as const)("the same conversational actor reclaims the role when %s", async (_shape, chain) => {
       const { core, projectId, roleKey, first, predecessor } = await heldByDeadPredecessor("prj_dead_but_held");
 
@@ -2459,7 +2459,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     expect(core.bindings.revoke(roleKeyFor(Role.PRIMARY_CTO, { projectId }), "lost attachment").allowed).toBe(true);
 
     // Same pid, different lifetime: the process the row named is gone and another holds its number.
-    const recycled = standardChain({ startedAt: "different lifetime" });
+    const recycled = standardChain({ startedAt: "Fri Jan  1 00:00:01 2027" });
     expect(chainInspector(recycled).snapshot(predecessor.osPid!)?.startedAt).not.toBe(predecessor.osProcessStartedAt);
 
     const claimed = await makeSubject(core, projectId, { chain: recycled }).claim(baseRequest(core, projectId, {
@@ -2472,7 +2472,7 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     // The claimant's own pair, never the predecessor's — a same-live recovery would have required
     // these two to be equal, which is exactly the claim a recycled pid may not make.
     expect(successor.osPid).toBe(predecessor.osPid);
-    expect(successor.osProcessStartedAt).toBe("different lifetime");
+    expect(successor.osProcessStartedAt).toBe("Fri Jan  1 00:00:01 2027");
     expect(successor.osProcessStartedAt).not.toBe(predecessor.osProcessStartedAt);
     expect(core.sessions.require(predecessor.sessionId).lifecycle).toBe(SessionLifecycle.STOPPED);
   });

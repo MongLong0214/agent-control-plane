@@ -176,3 +176,9 @@ export const readProcessStartToken = (pid: number): string | null => {
   if (process.platform === "darwin") return readDarwinStartToken(pid);
   return null;
 };
+
+/**
+ * The Darwin token `readProcessStartToken` renders: `pbi_start_tvsec` and the six-digit
+ * `pbi_start_tvusec`, captured as groups 1 and 2.
+ */
+export const DARWIN_START_TOKEN = /^darwin-tv:(\d+)\.(\d{6})$/;

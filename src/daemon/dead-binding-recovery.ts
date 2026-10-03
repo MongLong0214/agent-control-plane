@@ -1,5 +1,6 @@
 import { type Decision, allow, deny } from "../core/errors.ts";
-import { processStartedAt } from "../core/process-identity.ts";
+import { DARWIN_START_TOKEN, readProcessStartToken } from "../core/process-argv.ts";
+import { lstartSecondStartMs, processStartedAt } from "../core/process-identity.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
@@ -27,6 +28,37 @@ export const DEAD_BINDING_RECOVERY_ROLE = Role.PRIMARY_CTO;
  */
 export type SessionLiveness = "ALIVE" | "DEAD" | "UNKNOWN";
 
+/** One format a session row records its process start in, and the reader that renders it. */
+interface StartFormat {
+  matches(value: string): boolean;
+  read(pid: number): string | null;
+}
+
+const NATIVE_START: StartFormat = {
+  matches: (value) => DARWIN_START_TOKEN.test(value),
+  read: readProcessStartToken,
+};
+
+const LSTART_START: StartFormat = {
+  matches: (value) => lstartSecondStartMs(value) !== null,
+  read: processStartedAt,
+};
+
+/**
+ * The format `recorded` was written in, or null when it is in neither format a session row
+ * carries.
+ *
+ * A native token is matched by the pattern of the reader that writes it (`DARWIN_START_TOKEN`
+ * beside `readProcessStartToken`), so this cannot drift from what the claim recorded. Only
+ * `darwin-tv:` is recognised: ACP deploys on Darwin, and a `linux-clk:` row is answered
+ * `UNKNOWN` rather than guessed at.
+ */
+const startFormatOf = (recorded: string): StartFormat | null => {
+  if (NATIVE_START.matches(recorded)) return NATIVE_START;
+  if (LSTART_START.matches(recorded)) return LSTART_START;
+  return null;
+};
+
 /**
  * Proves — or fails to prove — that the process a session names is gone.
  *
@@ -40,6 +72,16 @@ export type SessionLiveness = "ALIVE" | "DEAD" | "UNKNOWN";
  * same number is positive evidence that the recorded process has exited and an unrelated one has
  * inherited its slot. Without this branch a recovery would be impossible after any pid reuse,
  * which on a busy host is a matter of hours.
+ *
+ * The comparison only means anything when both sides are in one format, and a session row
+ * records its start in one of two: the canonical self-claim writes the native `darwin-tv:` token
+ * its inspector read (`readProcessStartToken`), every other writer `ps -o lstart=` text. So the
+ * live process is read in the format its row was recorded in — see `startFormatOf`. A recorded
+ * start in neither format cannot be compared with anything, and is `UNKNOWN` rather than a
+ * mismatch: reading it as one called a live canonical CTO dead and revoked its binding. The same
+ * holds for the live value: an injected `probe.startedAt` replaces the reader, never the format
+ * check, so a live value in another format than the record is `UNKNOWN` too. Only two values in
+ * one format that differ are `DEAD`.
  */
 export const probeSessionLiveness = (
   osPid: number | null,
@@ -51,7 +93,6 @@ export const probeSessionLiveness = (
 ): SessionLiveness => {
   if (osPid === null || !Number.isSafeInteger(osPid) || osPid <= 0) return "UNKNOWN";
   const signal = probe.signal ?? ((pid: number) => process.kill(pid, 0));
-  const readStartedAt = probe.startedAt ?? processStartedAt;
   try {
     signal(osPid);
   } catch (error) {
@@ -66,8 +107,11 @@ export const probeSessionLiveness = (
   // Something answers on that number. Whether it is *this* session's process is a question the
   // pid alone cannot answer.
   if (recordedStartedAt === null) return "ALIVE";
-  const current = readStartedAt(osPid);
+  const format = startFormatOf(recordedStartedAt);
+  if (format === null) return "UNKNOWN";
+  const current = (probe.startedAt ?? format.read)(osPid);
   if (current === null) return "UNKNOWN";
+  if (!format.matches(current)) return "UNKNOWN";
   return current === recordedStartedAt ? "ALIVE" : "DEAD";
 };
 

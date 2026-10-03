@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { systemClock, type Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
-import { readProcessArgv, readProcessStartToken } from "../core/process-argv.ts";
+import { DARWIN_START_TOKEN, readProcessArgv, readProcessStartToken } from "../core/process-argv.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { probeSessionLiveness, recoverDeadCanonicalBinding } from "../daemon/dead-binding-recovery.ts";
 import type { AuditLog, AuditRecord } from "../db/audit.ts";
@@ -932,10 +932,9 @@ const registrySizeWithinBound = (size: number): boolean =>
  * Linux's `linux-clk:` ticks since boot among them — has no such instant: placing it on the wall
  * clock means sampling the boot time, and that estimate moves with probe latency. Such a token is
  * not converted at all; the reader refuses the registry as unverifiable.
+ *
+ * The ancestor's native start as nanoseconds since the Unix epoch, or `null` for a non-Darwin token.
  */
-const DARWIN_START_TOKEN = /^darwin-tv:(\d+)\.(\d{6})$/;
-
-/** The ancestor's native start as nanoseconds since the Unix epoch, or `null` for a non-Darwin token. */
 const darwinStartEpochNs = (token: string | null): bigint | null => {
   const darwin = DARWIN_START_TOKEN.exec(token ?? "");
   if (!darwin) return null;
