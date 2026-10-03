@@ -719,13 +719,7 @@ export class CtoLifecycle {
 
     if (current && session && session.lifecycle !== SessionLifecycle.STOPPED) {
       try {
-        await this.providers.requireForRole(session.provider, Role.PRIMARY_CTO).stopSession({
-          externalSessionId: current.sessionId,
-          provider: session.provider,
-          model: session.model,
-          effort: session.effort,
-          pid: session.osPid,
-        });
+        await this.stopProviderSession(session);
       } catch (error) {
         this.db.tx(() => {
           const latest = this.sessions.require(current.sessionId);
@@ -1127,18 +1121,22 @@ export class CtoLifecycle {
     );
   }
 
+  /**
+   * Stops a CTO runtime through the provider's own handle. The control plane's `ses_cto_…` alias
+   * means nothing to the provider: a stop addressed to it left the provider's session running
+   * while the row said STOPPED. `handleFor` rebuilds the provider id from the incarnation, as the
+   * bound-session probe already does.
+   */
+  private async stopProviderSession(session: SessionRecord): Promise<void> {
+    await this.providers.requireForRole(session.provider, Role.PRIMARY_CTO).stopSession(handleFor(session));
+  }
+
   /** A replacement that never became authoritative must not remain a live orphan. */
   private async stopUnusedSession(sessionId: string, reason: string): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session || session.lifecycle === SessionLifecycle.STOPPED) return;
     try {
-      await this.providers.requireForRole(session.provider, Role.PRIMARY_CTO).stopSession({
-        externalSessionId: sessionId,
-        provider: session.provider,
-        model: session.model,
-        effort: session.effort,
-        pid: session.osPid,
-      });
+      await this.stopProviderSession(session);
       this.sessions.transition(sessionId, SessionLifecycle.STOPPED, reason);
     } catch (error) {
       this.sessions.transition(sessionId, SessionLifecycle.ERROR, `${reason}: provider stop failed`);

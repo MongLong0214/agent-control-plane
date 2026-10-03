@@ -9,8 +9,9 @@ import { recoverDeadCanonicalBinding } from "../../src/daemon/dead-binding-recov
 import { ExecutionMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { SELF_CLAIM_EXECUTOR_KIND, SELF_CLAIM_PROTOCOL } from "../../src/registry/canonical-self-claim.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
+import type { SessionHandle } from "../../src/runtime/provider.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
-import { makeHarness, registerFixtureProject, type Harness } from "../helpers/harness.ts";
+import { makeHarness, registerFixtureProject, TEST_OWNER, type Harness } from "../helpers/harness.ts";
 import { TestProductionAdapter } from "../helpers/production-adapter.ts";
 
 afterAll(cleanupTempDirs);
@@ -54,6 +55,25 @@ const exitedPid = (): number => {
 
 const count = (h: Harness, table: "sessions" | "conversational_actors"): number =>
   h.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`)?.n ?? -1;
+
+/**
+ * ACP-CTO-R2-01: a CTO runtime the lifecycle stops must be stopped under the provider's own id —
+ * the handle `startSession` returned, whose id the session row keeps as its incarnation prefix —
+ * and the provider must stop reporting it. A stop addressed to the control plane's `ses_cto_…`
+ * alias wrote STOPPED while the provider's session stayed HEALTHY.
+ */
+const expectStoppedAtProvider = async (
+  h: Harness,
+  stop: { mock: { calls: unknown[][] } },
+  handle: SessionHandle,
+  sessionId: string,
+): Promise<void> => {
+  expect(h.cp.sessions.require(sessionId).incarnation.split("#")[0]).toBe(handle.externalSessionId);
+  expect(stop.mock.calls).toHaveLength(1);
+  expect(stop.mock.calls[0]?.[0]).toMatchObject({ externalSessionId: handle.externalSessionId, provider: handle.provider });
+  expect(await h.scripted.probeSession(handle)).toBe("UNAVAILABLE");
+  expect(h.cp.sessions.require(sessionId).lifecycle).toBe(SessionLifecycle.STOPPED);
+};
 
 /**
  * Binds the project's PRIMARY_CTO the way the canonical self-claim binds one: a `claude` /
@@ -380,6 +400,7 @@ describe("a canonical claim landing while a CTO is being provisioned", () => {
       });
       if (!run.allowed) throw new Error(run.message);
       const launched = vi.spyOn(h.scripted, "startSession");
+      const stop = vi.spyOn(h.scripted, "stopSession");
       let raced = 0;
       const race = (): void => {
         raced += 1;
@@ -428,8 +449,61 @@ describe("a canonical claim landing while a CTO is being provisioned", () => {
           `SELECT session_id, lifecycle FROM sessions WHERE provider = 'scripted'`,
         );
         expect(spawned).toHaveLength(1);
-        expect(spawned[0]?.lifecycle).toBe(SessionLifecycle.STOPPED);
+        const handle = await (launched.mock.results[0]?.value as Promise<SessionHandle>);
+        await expectStoppedAtProvider(h, stop, handle, spawned[0]?.session_id ?? "");
       }
+    } finally {
+      h.cp.close();
+    }
+  });
+});
+
+describe("a CTO runtime the lifecycle stops is stopped under the provider's own id", () => {
+  it("stale recovery refusal: a takeover whose binding moved while it launched stops its replacement", async () => {
+    const h = makeHarness();
+    try {
+      const { projectId } = await registerFixtureProject(h);
+      const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+      const first = await h.cp.cto.ensurePrimaryCto(projectId, "setup");
+      if (!first.allowed) throw new Error(first.message);
+      expect(h.cp.sessions.transition(first.value.sessionId, SessionLifecycle.ERROR, "runtime lost").allowed).toBe(true);
+      const launched = vi.spyOn(h.scripted, "startSession");
+      const stop = vi.spyOn(h.scripted, "stopSession");
+      // The binding moves while the replacement is being launched.
+      vi.spyOn(h.scripted, "probeSession").mockImplementationOnce(async () => {
+        expect(h.cp.bindings.revoke(roleKey, "moved during the takeover").allowed).toBe(true);
+        return "HEALTHY";
+      });
+
+      const takeover = await h.cp.cto.recoveryTakeover(projectId, "outgoing session died");
+
+      expect(takeover).toMatchObject({ allowed: false, reasonCode: ReasonCode.WRITE_BINDING_GENERATION_STALE });
+      expect(launched).toHaveBeenCalledOnce();
+      const replacement = h.cp.db.get<{ session_id: string }>(
+        `SELECT session_id FROM sessions WHERE provider = 'scripted' AND session_id <> ?`,
+        [first.value.sessionId],
+      );
+      const handle = await (launched.mock.results[0]?.value as Promise<SessionHandle>);
+      await expectStoppedAtProvider(h, stop, handle, replacement?.session_id ?? "");
+    } finally {
+      h.cp.close();
+    }
+  });
+
+  it("project suspension stops the bound CTO under the provider's own id", async () => {
+    const h = makeHarness();
+    try {
+      const { projectId } = await registerFixtureProject(h);
+      const launched = vi.spyOn(h.scripted, "startSession");
+      const bound = await h.cp.cto.ensurePrimaryCto(projectId, "setup");
+      if (!bound.allowed) throw new Error(bound.message);
+      const handle = await (launched.mock.results[0]?.value as Promise<SessionHandle>);
+      expect(await h.scripted.probeSession(handle)).toBe("HEALTHY");
+      const stop = vi.spyOn(h.scripted, "stopSession");
+
+      expect(await h.cp.cto.suspendProject(projectId, true, "capacity", TEST_OWNER)).toMatchObject({ allowed: true });
+
+      await expectStoppedAtProvider(h, stop, handle, bound.value.sessionId);
     } finally {
       h.cp.close();
     }
