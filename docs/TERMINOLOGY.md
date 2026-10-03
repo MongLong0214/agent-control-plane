@@ -2,9 +2,8 @@
 
 확정: 오너 결정 2026-08-14. 작성: CTO 총괄. 저장소 반입: 이 커밋.
 
-이 파일이 단어의 정본이다. `scripts/verify-terminology.mjs` 가 금지어를 검사하며,
-`pnpm terminology` 로 단독 실행할 수 있고 CI 가 매 푸시마다 돌린다. 규약이 문서에만
-있으면 지켜지는지 알 수 없고, 검사에만 있으면 왜 그런지 알 수 없다 — 둘 다 둔다.
+이 파일이 단어의 정본이다. 금지어 검사(`scripts/verify-terminology.mjs`)는 2026-10-02
+저장소 규칙 검사 정리 때 오너 지시로 삭제됐다 — 이 규약은 이제 문서로만 지켜진다.
 근거 자료: `~/projects/agent-control-plane` 전수(234파일 90,172줄),
 `~/.hermes/bridge/same-session-acp` 전수(12파일 16,084줄), `~/.hermes/bridge/ssot/SSOT.md`.
 

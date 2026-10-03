@@ -158,43 +158,37 @@ describe("the daemon startup probe", () => {
         state: "REFUSED",
         decision: {
           allowed: false,
-          reasonCode: ReasonCode.DOCTOR_ERROR,
+          // BLOCKED, not ERROR: the CRITICAL that used to set the status was the coverage finding.
+          reasonCode: ReasonCode.DOCTOR_BLOCKED,
           blockingFindings: expect.arrayContaining([
-            expect.objectContaining({ code: "ROLE_COVERAGE_NO_VALID_COVERAGE" }),
             expect.objectContaining({ code: "TRUSTED_GATE_CREDENTIAL_MISSING" }),
           ]),
         },
         bootstrapDoor: { opened: false, closed: false },
       },
     });
-    expect(withoutLoginPaths.stages[1]).toMatchObject({
-      credentialAvailable: true,
-      startup: {
-        state: "BOOTSTRAP_PARKED",
-        decision: {
-          allowed: false,
-          reasonCode: ReasonCode.DOCTOR_ERROR,
-          blockingFindings: [expect.objectContaining({ code: "ROLE_COVERAGE_NO_VALID_COVERAGE" })],
-        },
-        bootstrapDoor: { opened: true, closed: true },
+    // The credential is what refuses that start, not the unread quota beside it.
+    const refusedBy = (startup(withoutLoginPaths.stages[0]!).decision["blockingFindings"] as Array<{ code: string }>)
+      .map((finding) => finding.code);
+    expect(refusedBy).not.toContain("ROLE_COVERAGE_NO_VALID_COVERAGE");
+    // Capacity is availability: with the credential present and no quota readable, the daemon
+    // starts and reads DEGRADED. It used to park here, with the claim socket and cto.mcp.sock shut.
+    const startedDegraded = {
+      state: "STARTED",
+      decision: {
+        allowed: true,
+        reasonCode: ReasonCode.OK,
+        doctorStatus: "DEGRADED",
+        blockingFindings: [],
       },
-    });
-    expect(withoutLoginPaths.stages[2]).toMatchObject({
-      credentialAvailable: true,
-      startup: {
-        state: "BOOTSTRAP_PARKED",
-        decision: {
-          allowed: false,
-          reasonCode: ReasonCode.DOCTOR_ERROR,
-          blockingFindings: [expect.objectContaining({ code: "ROLE_COVERAGE_NO_VALID_COVERAGE" })],
-        },
-        bootstrapDoor: { opened: true, closed: true },
-      },
-    });
+      bootstrapDoor: { opened: false, closed: false },
+    };
+    expect(withoutLoginPaths.stages[1]).toMatchObject({ credentialAvailable: true, startup: startedDegraded });
+    expect(withoutLoginPaths.stages[2]).toMatchObject({ credentialAvailable: true, startup: startedDegraded });
     expect(withoutLoginPaths.stages[3]).toMatchObject({
       firstStart: {
         state: "REFUSED",
-        decision: { allowed: false, reasonCode: ReasonCode.DOCTOR_ERROR },
+        decision: { allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED },
         bootstrapDoor: { opened: false, closed: false },
       },
       immediateRestart: {
@@ -203,15 +197,7 @@ describe("the daemon startup probe", () => {
         bootstrapDoor: { opened: false, closed: false },
       },
       backoffWait: { retryNotBefore: expect.any(String), waitedMs: expect.any(Number) },
-      retryAfterBackoff: {
-        state: "BOOTSTRAP_PARKED",
-        decision: {
-          allowed: false,
-          reasonCode: ReasonCode.DOCTOR_ERROR,
-          blockingFindings: [expect.objectContaining({ code: "ROLE_COVERAGE_NO_VALID_COVERAGE" })],
-        },
-        bootstrapDoor: { opened: true, closed: true },
-      },
+      retryAfterBackoff: startedDegraded,
     });
   });
 });

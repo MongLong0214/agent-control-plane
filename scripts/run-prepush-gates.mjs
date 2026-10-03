@@ -64,8 +64,7 @@ if (process.argv.includes("--list")) {
 process.stdout.write(
   `${RULE}\ngates: ${GATES.length} gate(s) from scripts/lib/prepush-gates.mjs, ` +
     `run by scripts/run-prepush-gates.mjs\n` +
-    "This is the same runner .github/workflows/ci.yml invokes; `pnpm gates:ci-parity` is what\n" +
-    "refuses a workflow that verifies anything this manifest does not own.\n" +
+    "This is the same runner .github/workflows/ci.yml invokes.\n" +
     `${RULE}\n`,
 );
 

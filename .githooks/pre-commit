@@ -1,5 +1,5 @@
 #!/bin/sh
-# Three things that went wrong repeatedly, made impossible rather than remembered.
+# Two things that went wrong repeatedly, made impossible rather than remembered.
 #
 # 1. The falsifiability harness edits guarded sources in place and restores them at the end. Its
 #    own start-up check asks "is the tree dirty?", which a *concurrent* commit passes trivially:
@@ -7,12 +7,11 @@
 #    reached a commit that way, twice. The sentinel file exists for exactly the window where
 #    committing is unsafe — during a live run and after a killed one — so that is the thing to ask.
 #
-# 2. Editing a line a mutation row anchors to leaves the row matching nothing, which means it
-#    checks nothing while still reporting the guard as covered. Three times on one branch, each
-#    found forty minutes into CI. The anchors pass is a string search and costs about a second.
-#
-# 3. A workflow can still parse as YAML while its `run:` block has invalid Bash, or can call a
+# 2. A workflow can still parse as YAML while its `run:` block has invalid Bash, or can call a
 #    package script that a merge removed. Both used to become visible only after CI started.
+#
+# The falsifiability anchors pass that used to run here was removed on 2026-10-02 with the other
+# repository-rule checks: the harness is run by hand, and no commit waits on it.
 set -e
 
 SENTINEL="$(git rev-parse --git-dir)/verify-guards-in-flight.json"
@@ -30,15 +29,5 @@ fi
 # fails for unrelated reasons gets switched off.
 if ! CI=true pnpm ci:preflight; then
   echo "pre-commit: the workflow commands do not match the working tree." >&2
-  exit 1
-fi
-
-# Unconditionally. The first version ran it only when `src/` or the harness itself was staged,
-# which excluded the one case the newest half of that check exists for: deleting or renaming a
-# test file a row names in `killedBy`. A filter written to save a second had a hole shaped exactly
-# like the defect, one hour after that pattern was catalogued.
-if ! node scripts/verify-guards-are-falsifiable.mjs --anchors-only; then
-  echo "pre-commit: a falsifiability row no longer names something that exists." >&2
-  echo "Fix the row, or say why the guard or test it named is gone." >&2
   exit 1
 fi

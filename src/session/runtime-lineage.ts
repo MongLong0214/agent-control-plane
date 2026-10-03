@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { readProcessStartToken } from "../core/process-argv.ts";
-import { processStartedAt } from "../core/process-identity.ts";
+import { lstartSecondStartMs, processStartedAt } from "../core/process-identity.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /**
@@ -106,65 +106,6 @@ export interface NativeStartPins {
 
 const refuse = (message: string): Decision<RuntimeLineage> => deny(ReasonCode.CONFLICT, message, {});
 
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-const LSTART = /^[A-Z][a-z]{2} ([A-Z][a-z]{2}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/;
-
-interface LocalSecond {
-  year: number;
-  month: number;
-  day: number;
-  hours: number;
-  minutes: number;
-  seconds: number;
-}
-
-const rendersAs = (instant: number, local: LocalSecond): boolean => {
-  const at = new Date(instant);
-  if (at.getFullYear() !== local.year) return false;
-  if (at.getMonth() !== local.month) return false;
-  if (at.getDate() !== local.day) return false;
-  if (at.getHours() !== local.hours) return false;
-  if (at.getMinutes() !== local.minutes) return false;
-  return at.getSeconds() === local.seconds;
-};
-
-/** Every DST shift in use is a multiple of 15 minutes and at most two hours; four hours is margin. */
-const OFFSET_STEP_MS = 15 * 60_000;
-const OFFSET_STEPS = 16;
-
-/**
- * The one UTC instant at which the second `ps -o lstart=` rendered began, or null.
- *
- * `ps` renders in its own local time and the daemon spawns it with its own environment, so the
- * daemon's local time is the zone the text is in. A local time is not always one instant: where
- * clocks fall back it names two (review PR1046-R1, round 2: `Sun Nov  1 01:30:00 2026` in
- * America/New_York is both 05:30Z and 06:30Z), and where they spring forward it names none. Every
- * instant within four hours of the naive reading is tried, and only a reading with exactly one
- * instant is an answer; the rest are null, which every caller refuses.
- */
-const lstartInstant = (lstart: string): number | null => {
-  const parts = LSTART.exec(lstart);
-  if (parts === null) return null;
-  const month = MONTHS.indexOf(parts[1]!);
-  if (month === -1) return null;
-  const local: LocalSecond = {
-    year: Number(parts[6]),
-    month,
-    day: Number(parts[2]),
-    hours: Number(parts[3]),
-    minutes: Number(parts[4]),
-    seconds: Number(parts[5]),
-  };
-  const naive = new Date(local.year, local.month, local.day, local.hours, local.minutes, local.seconds).getTime();
-  if (!Number.isFinite(naive)) return null;
-  const instants: number[] = [];
-  for (let step = -OFFSET_STEPS; step <= OFFSET_STEPS; step += 1) {
-    const candidate = naive + step * OFFSET_STEP_MS;
-    if (rendersAs(candidate, local)) instants.push(candidate);
-  }
-  return instants.length === 1 ? instants[0]! : null;
-};
-
 /**
  * Is the live process at the row's pid the one the row recorded? Returns the native token to pin
  * when the answer was decided from a legacy record, or null when nothing needs pinning. It writes
@@ -180,7 +121,7 @@ const lstartInstant = (lstart: string): number | null => {
  *     process was alive then, so any process that replaced it started later, in a later second,
  *     and renders a different lstart. Then the live token is pinned and compared exactly from then
  *     on. A row written inside its own process's start second is ambiguous and is refused, and so is
- *     an lstart whose local time is not exactly one instant (`lstartInstant`).
+ *     an lstart whose local time is not exactly one instant (`lstartSecondStartMs`).
  *
  * Exported for the Gateway delivery authority, which asks the same question of the same row.
  */
@@ -197,7 +138,7 @@ export const recordedStartIsLive = (
   const pinned = pins.pinnedNativeStart(runtime.sessionId);
   if (pinned !== null) return pinned === startToken ? allow(ReasonCode.OK, null) : notThis();
   if (runtime.osProcessStartedAt !== processes.startedAt(pid)) return notThis();
-  const started = lstartInstant(runtime.osProcessStartedAt);
+  const started = lstartSecondStartMs(runtime.osProcessStartedAt);
   if (started === null) {
     return deny(
       ReasonCode.CONFLICT,

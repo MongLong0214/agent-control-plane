@@ -8,7 +8,7 @@ import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { readProcessArgv, readProcessStartToken } from "../core/process-argv.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
+import { probeSessionLiveness, recoverDeadCanonicalBinding } from "../daemon/dead-binding-recovery.ts";
 import type { AuditLog, AuditRecord } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
@@ -1971,16 +1971,9 @@ export class CanonicalSelfClaim {
         );
       }
 
-      // Clause 2 — pid/startedAt re-verified one last time, at the commit boundary itself, inside
-      // this transaction. Everything above this point ran outside the transaction (including the
-      // async Buzz-resolution await); a pid reused in the gap between that last check and this
-      // write is still a real, distinct window, and this is the last point it can be caught
-      // before `identity.pid`/`identity.startedAt` are written as though verified.
-      const stillLiveAtCommit = this.#assertClaimantStillLive(identity);
-      if (!stillLiveAtCommit.allowed) return stillLiveAtCommit as Decision<CanonicalSelfClaimReceipt>;
-
-      // A live canonical actor may replace only its exact revoked runtime attachment.
-      // This is not dead-process recovery and grants no authority over another holder.
+      // A live canonical actor may replace only its exact revoked runtime attachment (the same-live
+      // branch). Dead-process recovery happens only in the #831 branch, only for this same actor's
+      // own binding, and grants no authority over another holder.
       const incumbent = this.db.get<{
         actor_id: string; current_session_id: string; current_session_incarnation: string;
         target_binding_id: string;
@@ -2004,8 +1997,7 @@ export class CanonicalSelfClaim {
       // all, and a rule about a live actor must not answer for an actor that no longer exists.
       const predecessorRuntimeIsGone = predecessor !== null &&
         this.#predecessorProcessIsGone(predecessor.osPid, predecessor.osProcessStartedAt);
-      if (incumbent && predecessor && predecessorRuntimeIsGone &&
-          predecessor.lifecycle !== SessionLifecycle.STOPPED && predecessor.lifecycle !== SessionLifecycle.ERROR) {
+      if (incumbent && predecessor && predecessorRuntimeIsGone) {
         // Falling through alone does not reach the ordinary claim: `sessions_buzz_actor` is a
         // partial unique index over *live* rows, so a dead runtime left at READY keeps the
         // canonical Buzz identity and the ordinary claim below dies at `bindBuzzActor` with
@@ -2013,7 +2005,52 @@ export class CanonicalSelfClaim {
         // code. The restore path this claim then takes states the same precondition (a genuine
         // restart leaves the old session terminal), so the row is reconciled to the process fact
         // below, inside this transaction, and rolls back with everything else if anything denies.
-        abandonedRuntimeSessionId = predecessor.sessionId;
+        // A row that is already STOPPED or ERROR already says so and is left as written.
+        if (predecessor.lifecycle !== SessionLifecycle.STOPPED && predecessor.lifecycle !== SessionLifecycle.ERROR) {
+          abandonedRuntimeSessionId = predecessor.sessionId;
+        }
+        // Policy change (2026-10-02): the dead predecessor may still hold the role ACTIVE, because
+        // nothing revokes an assignment when its process dies, and `bind` below then refused the
+        // restarted canonical session BINDING_ALREADY_ACTIVE — locked out of its own role until an
+        // operator ran `binding recover-dead`. Keeping that refusal and leaving the release to the
+        // operator door was rejected: a restarted canonical session must recover its own role
+        // without owner authority, and the proof that bounds it is the one that door applies.
+        // When the holder is this same actor (the UUID derived and verified above), the release is
+        // made here by `recoverDeadCanonicalBinding` itself, not a copy of its rule: the same
+        // DEAD-only proof over this claim's own seam, the same revoke and the same
+        // DEAD_BINDING_RECOVERED record, inside this transaction so it lands only together with
+        // the successor generation. Another actor's binding is not this claim's
+        // to release and is left for `bind` to refuse; ALIVE, EPERM and UNKNOWN never reach here.
+        // Policy change (2026-10-02, later): this used to require a non-terminal row as well, and
+        // a daemon restart is exactly what makes the row terminal — its reconcile moves every
+        // live session whose pid is gone to ERROR and revokes nothing — so the commonest restart
+        // still refused BINDING_ALREADY_ACTIVE. The row's lifecycle decides only whether it is
+        // reconciled; whether the binding is released is still the probe's answer alone.
+        const held = this.db.get<{ actor_id: string }>(
+          `SELECT actor_id FROM assignments WHERE role_key = ? AND status = 'ACTIVE'`,
+          [roleKey],
+        );
+        if (held?.actor_id === incumbent.actor_id) {
+          // The entitlement's project, never the request's, for the reason the role key is.
+          const { projectId } = entry;
+          // The seam `#predecessorProcessIsGone` reads, so the start token is compared in the
+          // format this claim recorded it and the two reads cannot disagree about one row.
+          const startedAt = (pid: number) => this.#processInspector.snapshot(pid)?.startedAt ?? null;
+          const released = recoverDeadCanonicalBinding(`canonical-self-claim:${incumbent.actor_id}`, {
+            projectId,
+            role: Role.PRIMARY_CTO,
+            sessionId: predecessor.sessionId,
+            sessionIncarnation: predecessor.incarnation,
+            expectedBindingGeneration: currentMax,
+          }, {
+            db: this.db,
+            audit: this.audit,
+            sessions: this.sessions,
+            bindings: this.bindings,
+            liveness: { signal: this.#processSignal, startedAt },
+          });
+          if (!released.allowed) return released as Decision<CanonicalSelfClaimReceipt>;
+        }
       } else if (incumbent && predecessor &&
           predecessor.lifecycle !== SessionLifecycle.STOPPED && predecessor.lifecycle !== SessionLifecycle.ERROR) {
         const active = this.db.get(
@@ -2059,6 +2096,20 @@ export class CanonicalSelfClaim {
         }
         predecessorSessionId = predecessor.sessionId;
       }
+
+      // Clause 2 — pid/startedAt and the derived session re-verified one last time, at the commit
+      // boundary itself, inside this transaction. Everything before the transaction ran outside it
+      // (including the async Buzz-resolution await), and the predecessor probes above — the
+      // release's included — signal and shell out to `ps` inside it: real time in which the
+      // claimant can `/resume` into another conversation or lose its pid to reuse. So this check
+      // was moved here, after the last process read the transaction makes, rather than repeated
+      // (ACP1039-R1-01: it used to sit before the probes, and a claimant that changed during the
+      // release committed under its old identity); a refusal here rolls the release back with
+      // everything else. A further check just before `bind` was rejected: nothing from here to the
+      // commit leaves this process, so it would re-read the same facts without closing a window.
+      // Any process read added to this transaction later belongs above this line.
+      const stillLiveAtCommit = this.#assertClaimantStillLive(identity);
+      if (!stillLiveAtCommit.allowed) return stillLiveAtCommit as Decision<CanonicalSelfClaimReceipt>;
 
       if (abandonedRuntimeSessionId !== null) {
         const reconciled = this.sessions.transition(abandonedRuntimeSessionId, SessionLifecycle.STOPPED,

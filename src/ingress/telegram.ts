@@ -263,10 +263,11 @@ export class TelegramIngress {
       // rewrite (`inbound_messages_payload_immutable`). The claim's `legacySessionDigest` is not
       // frozen, so an owner reply addressed from it could be moved by a later write (#1041 R1041-01).
       //
-      // An earlier change ruled this out because the payload digest moves with its shape: an update
-      // an older binary admitted and this one claims fails `claim()`'s INGRESS_ADMITTED comparison.
-      // That cost is accepted here rather than leaving a Telegram reply with no immutable address;
-      // it is bounded to messages admitted before an upgrade and still unclaimed at it.
+      // An earlier change ruled this out because the payload digest moves with its shape. The live
+      // batch materializer hands `claim()` the stored payload, so a message an older binary admitted
+      // still claims under its own digest (#1041 round 2 measured this). What it lacks is a chat: a
+      // COMPLETED receipt for such a turn is unaddressable and leaves it unsettled, accepted here
+      // rather than leaving every Telegram reply with no immutable address at all.
       chatId: message?.chat?.id === undefined ? null : String(message.chat.id),
       messageThreadId: message?.message_thread_id ?? null,
     };

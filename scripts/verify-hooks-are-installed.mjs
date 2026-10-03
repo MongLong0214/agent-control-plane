@@ -38,7 +38,6 @@ const HOOK_DIR = resolve(
 const WIRING = [
   { name: "pre-commit", path: join(HOOK_DIR, "pre-commit") },
   { name: "commit-msg", path: join(HOOK_DIR, "commit-msg.commitlore-chained") },
-  { name: "pre-push", path: join(HOOK_DIR, "pre-push.commitlore-chained") },
 ];
 
 for (const wired of WIRING) {
@@ -59,7 +58,7 @@ for (const wired of WIRING) {
   }
 }
 
-for (const hook of ["pre-commit", "commit-msg", "pre-push"]) {
+for (const hook of ["pre-commit", "commit-msg"]) {
   const path = join(ROOT, ".githooks", hook);
   try {
     // 0o111: some bit of execute. A hook without it is skipped by git in silence, which is the

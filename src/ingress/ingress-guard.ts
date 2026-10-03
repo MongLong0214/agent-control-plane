@@ -7,12 +7,14 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import type { OwnerApprovalReceipt } from "../ceo/owner-authority.ts";
-import { REPLY_OUTBOX_RESULT_KIND, REPLY_OUTBOX_SETTLEMENT } from "../conversation/owner-reply-outbox.ts";
 import {
   type IngressReceiptSettlement,
-  type ReceiptLookupQuery,
+  REPLY_OUTBOX_RESULT_KIND,
+  REPLY_OUTBOX_SETTLEMENT,
+  ownerReplyOwing,
   redeemIngressReceiptSettlement,
-} from "../conversation/turn-coordinator.ts";
+} from "../conversation/owner-reply-outbox.ts";
+import type { ReceiptLookupQuery } from "../conversation/turn-coordinator.ts";
 import { SessionLifecycle } from "../domain/types.ts";
 import { isAdmittedRuntime, type AdmittedRuntime } from "../session/runtime-lineage.ts";
 import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
@@ -756,6 +758,30 @@ export class IngressGuard {
    * capability: it exposes no receipt and a missing, malformed, or historic claim cannot be
    * upgraded from the live binding on restart.
    */
+  /**
+   * Records that a handler in this process has started answering this message, until the returned
+   * `end` is called — when it finishes, however it finishes, and when it throws.
+   *
+   * Only a handler whose answer leaves without a durable reservation needs this. A Telegram answer
+   * is reserved through `recordResultIf` before it is sent, and that reservation is refused for a
+   * message the owner-reply outbox already owes; a Buzz answer is returned inline to the relay, so
+   * nothing durable stands between it and the owner, and the receipt side has to wait instead.
+   */
+  beginTurnHandler(channel: string, nonce: string): { end(): void } {
+    const key = handlerKey(channel, nonce);
+    const running = RUNNING_TURN_HANDLERS.get(this.db.identity) ?? new Set<string>();
+    RUNNING_TURN_HANDLERS.set(this.db.identity, running);
+    running.add(key);
+    let ended = false;
+    return {
+      end: () => {
+        if (ended) return;
+        ended = true;
+        running.delete(key);
+      },
+    };
+  }
+
   receiptIdentityForClaim(channel: string, nonce: string): ReceiptLookupQuery | null {
     const row = this.db.get<{ turn_claim_json: string | null }>(
       `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
@@ -808,7 +834,7 @@ export class IngressGuard {
    * has read this settlement back.
    */
   completeClaimFromHermesReceipt(settlement: IngressReceiptSettlement): Decision<void> {
-    const issued = redeemIngressReceiptSettlement(settlement);
+    const issued = redeemIngressReceiptSettlement(settlement, this.db);
     if (issued === null) {
       return deny(
         ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN,
@@ -1321,6 +1347,21 @@ export class IngressGuard {
             ReasonCode.RESOURCE_COLLISION,
             "cannot transition an ingress result for a turn already resolved as no-reply or settled by a delivery failure",
             { channel, nonce },
+          );
+        }
+      }
+      // An answer and an owner-reply obligation for one message exclude each other in either order
+      // (#1041 review, R1041-02, round 2). The obligation side refuses a message whose answer is
+      // already reserved here; this side refuses to reserve, complete or settle a CEO answer for a
+      // message whose reply a target receipt already queued. A sentence that is not the CEO's
+      // answer (`turnAnswered: false`) discharges nothing and is not refused.
+      if (carriesTheAnswer(result)) {
+        const owedBy = ownerReplyOwing(this.db, { channel, nonce });
+        if (owedBy !== null) {
+          return deny(
+            ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT,
+            "this message's answer is already owed through the owner-reply outbox",
+            { channel, nonce, owedBy },
           );
         }
       }
@@ -1927,6 +1968,17 @@ export class IngressGuard {
           { channel, nonce },
         );
       }
+      // `repliedAt` is the answer reaching the owner; the owner-reply outbox already owing this
+      // message's answer is the other half of the same exclusion (R1041-02, round 2). Buzz reaches
+      // this directly, without a reservation step to refuse first.
+      const owedBy = ownerReplyOwing(this.db, { channel, nonce });
+      if (owedBy !== null) {
+        return deny(
+          ReasonCode.CONVERSATION_TURN_REPLY_CONFLICT,
+          "this message's answer is already owed through the owner-reply outbox",
+          { channel, nonce, owedBy },
+        );
+      }
       const updated = this.db.run(
         `UPDATE inbound_messages
             SET turn_claim_json = json_set(turn_claim_json, '$.repliedAt', ?)
@@ -2318,6 +2370,23 @@ const PROCESS_INCARNATION = `${process.pid}#${
 export const processIncarnationForClaims = (): string => PROCESS_INCARNATION;
 
 /**
+ * The turn handlers running in this process right now, by database file and `channel\u0000nonce`.
+ *
+ * In memory on purpose. The question it answers is "is code in this process about to hand this
+ * message an answer?", and only a live process can be asked it: a durable open claim says the
+ * outcome was never recorded, which is equally true of a handler still running and of one that
+ * finished with an apology or a timeout and left the claim open by design. Reading the second
+ * case as the first held matching receipts back indefinitely (#1041 review, R1041-04).
+ */
+const RUNNING_TURN_HANDLERS = new Map<string, Set<string>>();
+
+const handlerKey = (channel: string, nonce: string): string => `${channel}\u0000${nonce}`;
+
+/** Whether a handler registered through `beginTurnHandler` is running for this message now. */
+export const turnHandlerRunning = (db: Db, channel: string, nonce: string): boolean =>
+  RUNNING_TURN_HANDLERS.get(db.identity)?.has(handlerKey(channel, nonce)) ?? false;
+
+/**
  * Whether a stored claim was taken by a process that is not this one.
  *
  * Both guards are load-bearing. An absent `claimedByProcess` is a row from a build older than the
@@ -2571,6 +2640,12 @@ const sameReceiptIdentity = (left: ReceiptLookupQuery, right: ReceiptLookupQuery
   && left.targetAttestationId === right.targetAttestationId
   && left.executorSessionId === right.executorSessionId
   && left.executorSessionIncarnation === right.executorSessionIncarnation;
+
+/** Whether a reply-lifecycle result carries the CEO's answer rather than a composed sentence. */
+const carriesTheAnswer = (result: unknown): boolean => {
+  if (typeof result !== "object" || result === null || Array.isArray(result)) return false;
+  return (result as { turnAnswered?: unknown }).turnAnswered === true;
+};
 
 const nonEmptyReceipt = (receipt: {
   outcome: "COMPLETED" | "ABORTED";
