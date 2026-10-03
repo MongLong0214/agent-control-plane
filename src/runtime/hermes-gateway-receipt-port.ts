@@ -1,6 +1,6 @@
 import { request } from "node:http";
 
-import type { TelegramDeliveryReport } from "../conversation/owner-reply-outbox.ts";
+import { type TelegramDeliveryReport, telegramChatIdOf } from "../conversation/owner-reply-outbox.ts";
 import type { ReceiptLookupQuery, ReceiptLookupResult, ReceiptPort } from "../conversation/turn-coordinator.ts";
 import { isDigest } from "../core/digest.ts";
 import type { Db } from "../db/database.ts";
@@ -114,7 +114,7 @@ const deliveryReport = (delivery: Record<string, unknown>): TelegramDeliveryRepo
     confirmed: delivery["state"] === HERMES_DELIVERY_CONFIRMED_STATE,
     obligationId: boundedText(obligationId) ? obligationId : null,
     contentDigest: isDigest(contentDigest) ? contentDigest : null,
-    chatId: positiveId(delivery["chat_id"]),
+    chatId: telegramChatIdOf(delivery["chat_id"]),
     replyToMessageId: positiveId(delivery["reply_to_message_id"]),
     messageIds,
   };

@@ -414,6 +414,16 @@ export class ConversationTurnCoordinator {
   /** Told after a settlement that wrote a new owner-reply item has committed (#1036). */
   readonly #ownerReplyListeners = new Set<() => void>();
 
+  /**
+   * When each parked Telegram reply was last asked about by a later read (A3), as a sequence number
+   * from `#deliveryReads`; a reply never asked about has none. Later reads go least recently read
+   * first, so a pass that runs out of budget hands the rest of the queue to the next pass instead of
+   * spending every pass on the same oldest replies whose receipts are unavailable (R-A3-02). In
+   * memory only: a restart starts the order over, at the oldest, which costs at most one rotation.
+   */
+  readonly #deliveryReadAt = new Map<string, number>();
+  #deliveryReads = 0;
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
@@ -1782,11 +1792,31 @@ export class ConversationTurnCoordinator {
     // A3: a completed Telegram turn whose reply is still parked, asked again inside what is left of
     // this pass's budget. Kept out of the counts above, which describe in-doubt turns: a later read
     // that fails leaves its reply parked, as it already was, and the next pass asks again.
-    for (const turnRequestId of awaitingEvidence) {
+    for (const turnRequestId of this.#leastRecentlyRead(awaitingEvidence)) {
       if (Date.now() - startedAt >= budgetMs) break;
+      // Marked before the read, so an overlapping pass sends this reply to the back too.
+      this.#deliveryReads += 1;
+      this.#deliveryReadAt.set(turnRequestId, this.#deliveryReads);
       await this.#readTelegramDeliveryEvidence(turnRequestId);
     }
     return { swept: candidates.length, settled, unresolved: candidates.length - settled, failed };
+  }
+
+  /**
+   * `awaiting` (queue order, oldest first) reordered never-read first, then least recently read,
+   * queue order breaking ties. Every reply a pass did not reach sorts ahead of every reply it did,
+   * so each one is read within ceil(n / m) passes, m being how many reads one pass's budget holds.
+   * Replies no longer awaiting are forgotten here.
+   */
+  #leastRecentlyRead(awaiting: readonly string[]): readonly string[] {
+    const live = new Set(awaiting);
+    for (const turnRequestId of this.#deliveryReadAt.keys()) {
+      if (!live.has(turnRequestId)) this.#deliveryReadAt.delete(turnRequestId);
+    }
+    return awaiting
+      .map((turnRequestId, queued) => ({ turnRequestId, queued, read: this.#deliveryReadAt.get(turnRequestId) ?? 0 }))
+      .sort((a, b) => a.read - b.read || a.queued - b.queued)
+      .map((entry) => entry.turnRequestId);
   }
 
   /**

@@ -76,10 +76,14 @@ const daemonFixture = (): Fixture =>
     },
   });
 
-const claimOne = async (fixture: Fixture, updateId: number): Promise<TelegramExternalTurnIdentity> => {
+const claimOne = async (
+  fixture: Fixture,
+  updateId: number,
+  chatId: number = CHAT_ID,
+): Promise<TelegramExternalTurnIdentity> => {
   const ingress = await startTelegramExternalIngress(fixture.cp, tempDir("a3-"), fixture.laneConfig);
   try {
-    const answer = await sendOverSocket(ingress.socketPath, envelope(updateId, `질문 ${updateId}`));
+    const answer = await sendOverSocket(ingress.socketPath, envelope(updateId, `질문 ${updateId}`, { chatId }));
     if (!answer.allowed) throw new Error(`the lane refused the fixture turn: ${JSON.stringify(answer)}`);
     return answer.turn;
   } finally {
@@ -116,10 +120,10 @@ const requestsFor = (updateId: number): number =>
   gateway.requests.filter((request) => request.path === `/v1/canonical-surface/receipts/telegram/${updateId}`).length;
 
 /** What the item must record for an update the Gateway reported delivered with `gatewayDelivery`. */
-const deliveredRecord = (updateId: number, changes: { messageIds?: number[] } = {}) => ({
+const deliveredRecord = (updateId: number, changes: { messageIds?: number[]; chatId?: number } = {}) => ({
   transport: "telegram",
   carrier: "hermes",
-  chatId: CHAT_ID,
+  chatId: changes.chatId ?? CHAT_ID,
   replyToMessageId: updateId + 100,
   messageIds: changes.messageIds ?? [9_000 + updateId],
   contentDigest: gatewayReplyDigest(updateId),
@@ -277,6 +281,7 @@ describe("A3: a Telegram owner reply is DELIVERED on Hermes' own delivery eviden
         ["content digest that is no digest", (u) => gatewayDelivery(u, { content_digest: "sha256:short" }), "delivery-content-digest-mismatch"],
         ["chat", (u) => gatewayDelivery(u, { chat_id: CHAT_ID + 1 }), "delivery-chat-mismatch"],
         ["chat as text", (u) => gatewayDelivery(u, { chat_id: String(CHAT_ID) }), "delivery-chat-mismatch"],
+        ["chat with the other sign", (u) => gatewayDelivery(u, { chat_id: -CHAT_ID }), "delivery-chat-mismatch"],
         ["reply-to", (u) => gatewayDelivery(u, { reply_to_message_id: u + 101 }), "delivery-reply-to-mismatch"],
         ["empty message ids", (u) => gatewayDelivery(u, { message_ids: [] }), "delivery-message-ids-invalid"],
         ["a message id that is not positive", (u) => gatewayDelivery(u, { message_ids: [9_000 + u, 0] }), "delivery-message-ids-invalid"],
@@ -472,6 +477,134 @@ describe("A3: a Telegram owner reply is DELIVERED on Hermes' own delivery eviden
       });
       expect(ownerReplyFor(fixture.cp.db, conflicting)?.delivery).toMatchObject(deliveredRecord(133));
     } finally {
+      fixture.cp.close();
+    }
+  });
+});
+
+/** A supergroup's chat id: negative, and admitted when allowlisted (R-A3-01). */
+const GROUP_CHAT = -1_001_234_567_890;
+
+describe("A3 R-A3-01: a negative (group) chat id is the admission's domain, not a mismatch", () => {
+  it("records DELIVERED for a negative chat in the settling receipt", async () => {
+    const fixture = externalLaneFixture({
+      chatId: GROUP_CHAT,
+      configure: (config) => {
+        const composed = withConfiguredHermesGatewayReceipt(config, { ACP_HERMES_GATEWAY_API_KEY: GATEWAY_KEY });
+        return { ...composed, hermesGatewayReceipt: { ...composed.hermesGatewayReceipt!, port } };
+      },
+    });
+    try {
+      const turn = await claimOne(fixture, 141, GROUP_CHAT);
+      answering((u) => gatewayReceipt(u, turn, { delivery: gatewayDelivery(u, { chat_id: GROUP_CHAT }) }));
+      await fixture.cp.conversation.reconcileUnresolved(5_000);
+      expect(ownerReplyFor(fixture.cp.db, turn.turnRequestId)).toMatchObject({
+        status: "DELIVERED",
+        address: { channel: "telegram", conversation: String(GROUP_CHAT) },
+        delivery: deliveredRecord(141, { chatId: GROUP_CHAT }),
+      });
+      expect(auditRows(fixture.cp.db, "OWNER_REPLY_UNDELIVERED", turn.turnRequestId)).toEqual([]);
+    } finally {
+      fixture.cp.close();
+    }
+  });
+
+  it("records DELIVERED for a negative chat on a later read, and refuses another group's chat", async () => {
+    const fixture = externalLaneFixture({
+      chatId: GROUP_CHAT,
+      configure: (config) => {
+        const composed = withConfiguredHermesGatewayReceipt(config, { ACP_HERMES_GATEWAY_API_KEY: GATEWAY_KEY });
+        return { ...composed, hermesGatewayReceipt: { ...composed.hermesGatewayReceipt!, port } };
+      },
+    });
+    try {
+      const turn = await claimOne(fixture, 142, GROUP_CHAT);
+      answering((u) => gatewayReceipt(u, turn, { delivery: null }));
+      await fixture.cp.conversation.reconcileUnresolved(5_000);
+      expect(ownerReplyFor(fixture.cp.db, turn.turnRequestId)?.status).toBe("PENDING");
+      answering((u) => gatewayReceipt(u, turn, { delivery: gatewayDelivery(u, { chat_id: GROUP_CHAT }) }));
+      await fixture.cp.conversation.reconcileUnresolved(5_000);
+      expect(ownerReplyFor(fixture.cp.db, turn.turnRequestId)).toMatchObject({
+        status: "DELIVERED",
+        delivery: deliveredRecord(142, { chatId: GROUP_CHAT }),
+      });
+
+      const other = await claimOne(fixture, 143, GROUP_CHAT);
+      answering((u) => gatewayReceipt(u, other, { delivery: gatewayDelivery(u, { chat_id: GROUP_CHAT - 1 }) }));
+      await fixture.cp.conversation.reconcileUnresolved(5_000);
+      expect(ownerReplyFor(fixture.cp.db, other.turnRequestId)?.status).toBe("PENDING");
+      expect(auditRows(fixture.cp.db, "OWNER_REPLY_UNDELIVERED", other.turnRequestId).map((row) => row.evidence["cause"]))
+        .toEqual(["delivery-chat-mismatch"]);
+    } finally {
+      fixture.cp.close();
+    }
+  });
+
+  it("reads back a stored DELIVERED record whose chat id is negative", async () => {
+    const fixture = daemonFixture();
+    try {
+      const turn = await claimOne(fixture, 144);
+      answering((u) => gatewayReceipt(u, turn));
+      await fixture.cp.conversation.reconcileUnresolved(5_000);
+      const stored = JSON.parse(itemResult(fixture, turn.turnRequestId)!) as {
+        delivery: Record<string, unknown> & { evidenceDigest: string };
+      };
+      // The record a group chat's delivery stores, written in place to isolate the reader.
+      const { evidenceDigest: _previous, ...fields } = { ...stored.delivery, chatId: GROUP_CHAT };
+      const delivery = { ...fields, evidenceDigest: digestOf(fields) };
+      fixture.cp.db.run(
+        "UPDATE inbound_messages SET result_json = ? WHERE channel = 'owner-reply' AND nonce = ?",
+        [JSON.stringify({ ...stored, delivery }), turn.turnRequestId],
+      );
+      expect(() => ownerReplyFor(fixture.cp.db, turn.turnRequestId)).not.toThrow();
+      expect(ownerReplyFor(fixture.cp.db, turn.turnRequestId)).toMatchObject({
+        status: "DELIVERED",
+        delivery: { ...deliveredRecord(144, { chatId: GROUP_CHAT }), evidenceDigest: delivery.evidenceDigest },
+      });
+    } finally {
+      fixture.cp.close();
+    }
+  });
+});
+
+describe("A3 R-A3-02: later reads rotate, so unavailable older receipts cannot starve a younger reply", () => {
+  it("delivers the youngest parked reply within ceil(n / reads-per-pass) passes", async () => {
+    const fixture = daemonFixture();
+    const ingress = await startTelegramExternalIngress(fixture.cp, tempDir("a3-rot-"), fixture.laneConfig);
+    try {
+      // 24 older replies and one younger, all settled COMPLETED with no delivery evidence yet.
+      const turns = new Map<number, TelegramExternalTurnIdentity>();
+      answering((u) => (turns.has(u) ? gatewayReceipt(u, turns.get(u)!, { delivery: null }) : { status: "NEVER_FOUND" }));
+      const youngest = 324;
+      for (let updateId = 300; updateId <= youngest; updateId += 1) {
+        const answer = await sendOverSocket(ingress.socketPath, envelope(updateId, `질문 ${updateId}`));
+        if (!answer.allowed) throw new Error(`the lane refused update ${updateId}: ${JSON.stringify(answer)}`);
+        turns.set(updateId, answer.turn);
+        await fixture.cp.conversation.reconcileUnresolved(5_000);
+      }
+      expect(pendingOwnerReplies(fixture.cp.db)).toHaveLength(25);
+
+      // The older receipts are unavailable and slow; the youngest is delivered. A 50 ms budget holds
+      // about two 30 ms reads, so each pass is cut short long before the youngest in queue order.
+      gateway.answer = (u) => (u === youngest
+        ? { kind: "json", body: gatewayReceipt(u, turns.get(u)!) }
+        : {
+            kind: "deferred",
+            answer: new Promise<GatewayAnswer>((resolve) => {
+              setTimeout(() => resolve({ kind: "json", body: { status: "PENDING" } }), 30);
+            }),
+          });
+      const bound = 25; // ceil(25 replies / at least one read per pass)
+      let passes = 0;
+      while (passes < bound && ownerReplyFor(fixture.cp.db, turns.get(youngest)!.turnRequestId)?.status !== "DELIVERED") {
+        passes += 1;
+        await fixture.cp.conversation.reconcileUnresolved(50);
+      }
+      expect(requestsFor(youngest), "lookups of the youngest reply's receipt").toBeGreaterThan(1);
+      expect(ownerReplyFor(fixture.cp.db, turns.get(youngest)!.turnRequestId)?.status).toBe("DELIVERED");
+      expect(passes).toBeLessThanOrEqual(bound);
+    } finally {
+      await ingress.close();
       fixture.cp.close();
     }
   });

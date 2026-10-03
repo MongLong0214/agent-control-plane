@@ -204,6 +204,8 @@ export const externalLaneFixture = (options: {
   configure?: (config: ControlPlaneConfig) => ControlPlaneConfig;
   hermesCeo?: boolean;
   otherCtos?: number;
+  /** The allowlisted owner chat; `CHAT_ID` by default. A group chat's id is negative. */
+  chatId?: number;
 } = {}): ExternalLaneFixture => {
   const root = tempDir("acp-u4-");
   const clock = new ManualClock(NOW);
@@ -216,6 +218,7 @@ export const externalLaneFixture = (options: {
   for (let index = 0; index < (options.otherCtos ?? 0); index += 1) attestedCto(cp, index);
   const laneConfig = configuredTelegramExternalConsumerConfig(baseConfig(root, clock).ownerIdentities ?? [], {
     ...LANE_ENV,
+    ACP_TELEGRAM_CHAT_ID: String(options.chatId ?? CHAT_ID),
   });
   if (!laneConfig) throw new Error("the fixture's lane environment did not configure a lane");
   return { cp, root, clock, ceoActorId, laneConfig, open };

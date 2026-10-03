@@ -190,7 +190,7 @@ export interface TelegramDeliveryReport {
   readonly obligationId: string | null;
   /** A `sha256:` digest. */
   readonly contentDigest: string | null;
-  /** A positive safe integer. */
+  /** A safe integer of either sign, the domain Telegram admission accepts (`telegramChatIdOf`). */
   readonly chatId: number | null;
   /** A positive safe integer. */
   readonly replyToMessageId: number | null;
@@ -383,6 +383,16 @@ const textOf = (value: unknown): string | null => {
   if (typeof value !== "string") return null;
   return value.trim() === "" ? null : value;
 };
+
+/**
+ * A Telegram chat id in exactly the domain Telegram admission accepts one in: any safe integer,
+ * negative included, because a group or supergroup chat id is negative and may be allowlisted
+ * (`TelegramIngress.authenticatedRequest` admits `Number.isSafeInteger(message.chat.id)`). The
+ * receipt port and the stored-record reader both read a chat id through this, so neither can refuse
+ * a chat admission let in. A message id stays a positive safe integer (`positiveIdOf`).
+ */
+export const telegramChatIdOf = (value: unknown): number | null =>
+  typeof value === "number" && Number.isSafeInteger(value) ? value : null;
 
 const positiveIdOf = (value: unknown): number | null => {
   if (typeof value !== "number") return null;
@@ -721,7 +731,7 @@ const positiveIdsOf = (value: unknown): number[] | null => {
 const telegramDeliveryOf = (fields: Record<string, unknown>): OwnerReplyTelegramDelivery | null => {
   if (JSON.stringify(Object.keys(fields).sort()) !== JSON.stringify(TELEGRAM_DELIVERY_FIELDS)) return null;
   const { contentDigest, receiptId, obligationId, deliveredAt, evidenceDigest } = fields;
-  const chatId = positiveIdOf(fields["chatId"]);
+  const chatId = telegramChatIdOf(fields["chatId"]);
   const replyToMessageId = positiveIdOf(fields["replyToMessageId"]);
   const messageIds = positiveIdsOf(fields["messageIds"]);
   if (fields["carrier"] !== "hermes" || chatId === null || replyToMessageId === null || messageIds === null) return null;
