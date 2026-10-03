@@ -2,6 +2,7 @@ import type { ControlPlane } from "../app/control-plane.ts";
 import { type Decision, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { Role, roleKeyFor } from "../domain/types.ts";
+import { isContinuityRevocationReason } from "../continuity/continuity-kernel.ts";
 import { probeSessionLiveness, type SessionLiveness } from "../daemon/dead-binding-recovery.ts";
 
 /**
@@ -14,11 +15,18 @@ import { probeSessionLiveness, type SessionLiveness } from "../daemon/dead-bindi
  * the kernel, the previous incumbent's death — so the daemon now asks the same core itself. The
  * operator command stays, as a way to ask sooner; it is no longer needed.
  *
- * An attempt is made only when all three hold, each read before the Gateway is asked anything:
- * no CEO binding is active, the newest CEO generation is REVOKED, and that generation's runtime
- * process is DEAD. Anything else is not attempted and writes nothing — a live incumbent, an active
- * binding (including the one a previous attempt created, which is why repeated passes mint one
- * generation and not one per pass), or a role that was never bound.
+ * An attempt is made only when all four hold, each read before the Gateway is asked anything:
+ * no CEO binding is active, the newest CEO generation is REVOKED, continuity revoked it (its
+ * `assignments.revoked_reason` is one continuity writes — `isContinuityRevocationReason`, the
+ * predicate continuity's own restoration reads), and that generation's runtime process is DEAD.
+ * Anything else is not attempted and writes nothing — a live incumbent, an active binding
+ * (including the one a previous attempt created, which is why repeated passes mint one generation
+ * and not one per pass), a role that was never bound, or a revocation continuity did not write.
+ *
+ * The reason is read rather than ignored because a revocation an operator or the owner chose is a
+ * decision to stop the CEO, and re-binding it by itself would overrule that decision. Any other
+ * reason, or none, is read as such a decision (fail-closed): only the operator's `adopt hermes`
+ * binds it again.
  *
  * A refused attempt is retried on a later pass, no sooner than an exponential backoff allows. Its
  * audit row is written once per distinct refusal of a revoked generation, not once per pass: the
@@ -33,6 +41,7 @@ export type HermesAutoAdoptionSkip =
   | "DAEMON_LOCK_NOT_HELD"
   | "CEO_ACTIVE"
   | "NO_REVOKED_CEO"
+  | "REVOKED_BY_DECISION"
   | "INCUMBENT_NOT_DEAD"
   | "BACKING_OFF";
 
@@ -68,17 +77,18 @@ export const createHermesAutoAdoption = (cp: ControlPlane, options: HermesAutoAd
   let inFlight = false;
   let failure: { generation: number; count: number; retryNotBefore: number } | null = null;
 
-  /** The three preconditions, read synchronously; nothing here writes or asks the Gateway. */
+  /** The four preconditions, read synchronously; nothing here writes or asks the Gateway. */
   const revokedDeadGeneration = (): { generation: number } | HermesAutoAdoptionSkip => {
     if (cp.bindings.active(roleKey) !== null) return "CEO_ACTIVE";
     const latest = cp.db.get<{ binding_generation: number; session_id: string; session_incarnation: string;
-      status: string }>(
-      `SELECT binding_generation, session_id, session_incarnation, status
+      status: string; revoked_reason: string | null }>(
+      `SELECT binding_generation, session_id, session_incarnation, status, revoked_reason
          FROM assignments WHERE role_key = ? ORDER BY binding_generation DESC LIMIT 1`,
       [roleKey],
     );
     if (latest === undefined) return "NO_REVOKED_CEO";
     if (latest.status !== "REVOKED") return "NO_REVOKED_CEO";
+    if (!isContinuityRevocationReason(latest.revoked_reason)) return "REVOKED_BY_DECISION";
     const incumbent = cp.sessions.get(latest.session_id);
     if (incumbent === null) return "INCUMBENT_NOT_DEAD";
     if (incumbent.incarnation !== latest.session_incarnation) return "INCUMBENT_NOT_DEAD";

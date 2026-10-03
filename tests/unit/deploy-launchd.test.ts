@@ -43,8 +43,13 @@ const CANONICAL_ACTIVATION_VARIABLES = [
   "ACP_CANONICAL_CTO_PEER_PROTOCOL",
   "ACP_CANONICAL_CTO_BUZZ_PURPOSE",
 ] as const;
+/**
+ * No head variable: `ACP_HERMES_EXPECTED_LIVE_SESSION_ID` and `ACP_HERMES_TARGET_SESSION_ID` are read
+ * by nothing since the head follows the Gateway inside the lineage, so the launcher no longer looks
+ * them up (2026-10-03).
+ */
+const HERMES_RETIRED_HEAD_VARIABLES = ["ACP_HERMES_EXPECTED_LIVE_SESSION_ID", "ACP_HERMES_TARGET_SESSION_ID"] as const;
 const HERMES_ADOPTION_VARIABLES = [
-  "ACP_HERMES_EXPECTED_LIVE_SESSION_ID", "ACP_HERMES_TARGET_SESSION_ID",
   "ACP_HERMES_LINEAGE_ROOT_DIGEST", "ACP_HERMES_EXECUTABLE", "ACP_HERMES_PROFILE",
   "ACP_HERMES_HOME", "ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY", "ACP_HERMES_GATEWAY_API_KEY",
 ] as const;
@@ -285,7 +290,7 @@ if [[ "$target" == *"agentcpd.js" ]]; then
   # to carry had already gone stale twice: it said the canonical group ran 17-24 when it runs 17-22,
   # put lsof at 25-26 when it is 23-24, and gave Hermes an overlapping 26-33. A comment restating a
   # derived position is the second authority the derivation was introduced to remove.
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
     "\${ACP_TELEGRAM_BOT_TOKEN-}" "\${ACP_TELEGRAM_OWNER_ID-}" \
     "\${ACP_TELEGRAM_CHAT_ID-}" "\${ACP_TELEGRAM_WEBHOOK_SECRET-}" \
     "\${BUZZ_PRIVATE_KEY:-<unset>}" "\${ACP_BUZZ_BINARY:-<unset>}" \
@@ -300,7 +305,6 @@ if [[ "$target" == *"agentcpd.js" ]]; then
     "\${ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH-}" "\${ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256-}" \
     "\${ACP_CANONICAL_CTO_PEER_PROTOCOL-}" "\${ACP_CANONICAL_CTO_BUZZ_PURPOSE-}" \
     "$(command -v lsof || printf '<unresolvable>')" "$(lsof_scan)" \
-    "\${ACP_HERMES_EXPECTED_LIVE_SESSION_ID-}" "\${ACP_HERMES_TARGET_SESSION_ID-}" \
     "\${ACP_HERMES_LINEAGE_ROOT_DIGEST-}" "\${ACP_HERMES_EXECUTABLE-}" \
     "\${ACP_HERMES_PROFILE-}" "\${ACP_HERMES_HOME-}" \
     "\${ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY-}" "\${ACP_HERMES_GATEWAY_API_KEY-}" >> "$ACP_LAUNCHER_ENV_LOG"
@@ -1249,10 +1253,13 @@ exec /bin/cp "$@"
     for (const name of HERMES_ADOPTION_VARIABLES) {
       expect(lookups).toContain(`find-generic-password -w -s test-service -a ${name}`);
     }
+    for (const name of HERMES_RETIRED_HEAD_VARIABLES) {
+      expect(lookups).not.toContain(`-a ${name}`);
+    }
 
     // An absent account cannot be filled from the inherited shell; daemon validation owns
     // rejection of the partial group (tested in operator-socket.test.ts).
-    const missing = HERMES_ADOPTION_VARIABLES[7];
+    const missing = HERMES_ADOPTION_VARIABLES[HERMES_ADOPTION_VARIABLES.length - 1]!;
     harness.env["ACP_HERMES_KEYCHAIN_ACCOUNTS"] = HERMES_ADOPTION_VARIABLES.slice(0, -1).join(",");
     rmSync(harness.launcherEnvLog);
     launched = runGeneratedLauncher(harness);

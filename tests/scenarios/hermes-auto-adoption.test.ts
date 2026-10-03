@@ -4,10 +4,19 @@ import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import { HERMES_AUTO_ADOPTED, HERMES_AUTO_ADOPTION_REFUSED } from "../../src/bootstrap/hermes-auto-adoption.ts";
+import {
+  CONTINUITY_COVERAGE_REVOCATION_REASON,
+  CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX,
+  CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON,
+} from "../../src/continuity/continuity-kernel.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { processStartedAt } from "../../src/core/process-identity.ts";
-import { createConfiguredHermesAutoAdoption, startHermesAutoAdoption } from "../../src/daemon/agentcpd.ts";
+import {
+  createConfiguredHermesAutoAdoption,
+  createConfiguredHermesIncumbentAdoption,
+  startHermesAutoAdoption,
+} from "../../src/daemon/agentcpd.ts";
 import { Role, SessionLifecycle } from "../../src/domain/types.ts";
 import type { HermesGatewayIdentity } from "../../src/runtime/hermes-gateway-identity.ts";
 import type { HermesTargetBindResponse } from "../../src/runtime/hermes-target-bind.ts";
@@ -37,6 +46,8 @@ const OLD_HEAD = "20260923_000000_gen2_head";
 const NEW_HEAD = "20261001_120000_compressed_head";
 const RUNTIME = "fixture-runtime";
 const DEAD_PID = 2147483647;
+/** The revocation the 2026-10-03 redeploy produced, written the way continuity writes it. */
+const FAILOVER_REFUSED = `${CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX}COVERAGE_NONE`;
 const hermesExecutable = new URL("../fixtures/hermes-target-bind-producer.sh", import.meta.url).pathname;
 
 const PRODUCER = `
@@ -79,10 +90,10 @@ interface Scene {
 
 /**
  * CEO gen1 bound to a Hermes runtime with an authenticated target (born at OLD_HEAD), then — unless
- * `revoke` is false — revoked the way continuity revokes it. Its process is dead unless
- * `incumbentAlive`, in which case the incumbent row records this live test process.
+ * `revoke` is false — revoked with `revokeReason` (by default a continuity reason). Its process is
+ * dead unless `incumbentAlive`, in which case the incumbent row records this live test process.
  */
-const scene = (options: { revoke?: boolean; incumbentAlive?: boolean } = {}): Scene => {
+const scene = (options: { revoke?: boolean; revokeReason?: string; incumbentAlive?: boolean } = {}): Scene => {
   const h = makeHarness();
   harnesses.push(h);
   const home = tempDir("acp-auto-adopt-");
@@ -111,7 +122,7 @@ const scene = (options: { revoke?: boolean; incumbentAlive?: boolean } = {}): Sc
   if (!bound.allowed) throw new Error(bound.message);
   const actorId = h.cp.db.get<{ actor_id: string }>("SELECT actor_id FROM assignments WHERE role_key = 'CEO'")!.actor_id;
   if (options.revoke !== false) {
-    expect(h.cp.bindings.revoke("CEO", "continuity: the Gateway was redeployed").allowed).toBe(true);
+    expect(h.cp.bindings.revoke("CEO", options.revokeReason ?? FAILOVER_REFUSED).allowed).toBe(true);
   }
   const token = readProcessStartToken(process.pid);
   expect(token).not.toBeNull();
@@ -134,7 +145,7 @@ const scene = (options: { revoke?: boolean; incumbentAlive?: boolean } = {}): Sc
 };
 
 describe("Hermes CEO auto-adoption — adopted with no person and no configured head", () => {
-  it("adopts the redeployed Gateway: REVOKED, incumbent DEAD, same lineage, head rotated", async () => {
+  it("adopts the redeployed Gateway: revoked by continuity, incumbent DEAD, same lineage, head rotated", async () => {
     const s = scene();
     expect(Object.keys(s.configuration)).not.toContain("ACP_HERMES_EXPECTED_LIVE_SESSION_ID");
     expect(Object.keys(s.configuration)).not.toContain("ACP_HERMES_TARGET_SESSION_ID");
@@ -182,6 +193,49 @@ describe("Hermes CEO auto-adoption — adopted with no person and no configured 
     expect(s.gateway.reads).toBe(reads);
     expect(s.h.cp.db.all("SELECT binding_generation, status FROM assignments WHERE role_key = 'CEO' ORDER BY binding_generation"))
       .toEqual([{ binding_generation: 1, status: "REVOKED" }, { binding_generation: 2, status: "ACTIVE" }]);
+  });
+});
+
+describe("Hermes CEO auto-adoption — only a revocation continuity wrote", () => {
+  it.each([
+    ["coverage", CONTINUITY_COVERAGE_REVOCATION_REASON],
+    ["incomplete failover", CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON],
+    ["refused failover", FAILOVER_REFUSED],
+  ])("adopts after a continuity revocation (%s)", async (_name, reason) => {
+    const s = scene({ revokeReason: reason });
+    expect(await s.auto().tick("periodic")).toMatchObject({ attempted: true, decision: { allowed: true } });
+    expect(s.h.cp.bindings.active("CEO")?.bindingGeneration).toBe(s.revokedGeneration + 1);
+  });
+
+  it("does not attempt after an operator's or owner's revocation, and the operator can still adopt", async () => {
+    for (const reason of ["operator stopped the CEO", "owner release"]) {
+      const s = scene({ revokeReason: reason });
+      const before = snapshot(s.h);
+      expect(await s.auto().tick("periodic")).toEqual({ attempted: false, skipped: "REVOKED_BY_DECISION" });
+      expect(await s.auto().tick("ceo_revoked")).toEqual({ attempted: false, skipped: "REVOKED_BY_DECISION" });
+      expect(s.gateway.reads).toBe(0);
+      expect(snapshot(s.h)).toEqual(before);
+      // `agentctl adopt hermes` is the way back: the same core, asked by the operator.
+      const operatorAdopt = createConfiguredHermesIncumbentAdoption(s.h.cp, s.configuration, {
+        identityReader: () => async () => { s.gateway.reads++; return s.gateway.answer(); },
+        authorityHeld: () => true,
+      })!;
+      expect(await operatorAdopt()).toMatchObject({ allowed: true });
+      expect(s.h.cp.bindings.active("CEO")?.bindingGeneration).toBe(s.revokedGeneration + 1);
+    }
+  });
+
+  it("does not attempt when the revocation's reason is absent or not one continuity writes (fail-closed)", async () => {
+    for (const reason of [null, "", `${CONTINUITY_COVERAGE_REVOCATION_REASON} (edited)`,
+      "Hermes bootstrap credential delivery failed"]) {
+      const s = scene();
+      s.h.cp.db.run("UPDATE assignments SET revoked_reason = ? WHERE role_key = 'CEO' AND binding_generation = ?",
+        [reason, s.revokedGeneration]);
+      const before = snapshot(s.h);
+      expect(await s.auto().tick("periodic")).toEqual({ attempted: false, skipped: "REVOKED_BY_DECISION" });
+      expect(s.gateway.reads).toBe(0);
+      expect(snapshot(s.h)).toEqual(before);
+    }
   });
 });
 
@@ -262,7 +316,7 @@ describe("Hermes CEO auto-adoption — wired to the revocation", () => {
       // The startup pass finds the CEO still bound and leaves it.
       await new Promise((resolve) => setImmediate(resolve));
       expect(s.gateway.reads).toBe(0);
-      expect(s.h.cp.bindings.revoke("CEO", "continuity: the Gateway was redeployed").allowed).toBe(true);
+      expect(s.h.cp.bindings.revoke("CEO", FAILOVER_REFUSED).allowed).toBe(true);
       for (let wait = 0; wait < 100 && s.h.cp.bindings.active("CEO") === null; wait++) {
         await new Promise((resolve) => setTimeout(resolve, 20));
       }

@@ -114,6 +114,14 @@ export const CONTINUITY_REVOCATION_REASONS: readonly string[] = [
   CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON,
 ];
 
+/**
+ * Whether a `revoked_reason` is one continuity wrote. Any other text, or none, reads as a release
+ * someone chose; the Hermes CEO auto-adoption (`hermes-auto-adoption.ts`) asks the same question.
+ */
+export const isContinuityRevocationReason = (reason: string | null): boolean =>
+  reason !== null && (CONTINUITY_REVOCATION_REASONS.includes(reason) ||
+    reason.startsWith(CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX));
+
 /** Preferred normal binding (§15.1) in priority order per capability. */
 const PREFERENCE: Readonly<Record<string, readonly string[]>> = {
   ceo: ["gpt", "claude"],
@@ -983,9 +991,8 @@ export class ContinuityKernel {
         WHERE role_key = ? ORDER BY binding_generation DESC LIMIT 1`,
       [roleKey],
     );
-    if (!latest || latest.status !== "REVOKED" || latest.revoked_reason === null) return false;
-    return CONTINUITY_REVOCATION_REASONS.includes(latest.revoked_reason) ||
-      latest.revoked_reason.startsWith(CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX);
+    if (!latest || latest.status !== "REVOKED") return false;
+    return isContinuityRevocationReason(latest.revoked_reason);
   }
 
   /** The scope each owed role carried, read from the revoked row because no binding holds it. */
