@@ -258,26 +258,18 @@ interface SupervisorRecord {
   error?: { code: string; errno: number };
 }
 
-let recordDirectory: string | undefined;
-let recordSequence = 0;
-const nextRecordPath = (): string => {
-  if (recordDirectory === undefined) {
-    const directory = mkdtempSync(join(tmpdir(), "acp-bounded-supervisor-"));
-    recordDirectory = directory;
-    process.once("exit", () => rmSync(directory, { recursive: true, force: true }));
-  }
-  recordSequence += 1;
-  return join(recordDirectory, `${recordSequence}.json`);
-};
-
-const takeRecord = (path: string): SupervisorRecord | undefined => {
+/**
+ * One directory per call, removed as soon as the record is read. A directory per worker process,
+ * removed from an `exit` handler, was the first shape and it leaked: vitest's fork workers end
+ * without running `exit` handlers, and every worker left an empty directory in `tmpdir()`.
+ */
+const takeRecord = (directory: string): SupervisorRecord | undefined => {
   try {
-    return JSON.parse(readFileSync(path, "utf8")) as SupervisorRecord;
+    return JSON.parse(readFileSync(join(directory, "record.json"), "utf8")) as SupervisorRecord;
   } catch {
     return undefined;
   } finally {
-    rmSync(path, { force: true });
-    rmSync(`${path}.tmp`, { force: true });
+    rmSync(directory, { recursive: true, force: true });
   }
 };
 
@@ -296,7 +288,7 @@ const superviseSync = (
   timeout: number,
 ): { result: SpawnSyncReturns<string | Buffer>; timedOut: boolean } => {
   const modes = stdioModes(options.stdio);
-  const recordPath = nextRecordPath();
+  const recordDirectory = mkdtempSync(join(tmpdir(), "acp-bounded-supervisor-"));
   const {
     detached: _detached,
     timeout: _timeout,
@@ -320,7 +312,7 @@ const superviseSync = (
     graceMs: GROUP_SIGTERM_GRACE_MS,
     settleMs: GROUP_SIGKILL_SETTLE_MS,
     pollMs: GROUP_POLL_MS,
-    report: recordPath,
+    report: join(recordDirectory, "record.json"),
     nodeOptionsCarrier: NODE_OPTIONS_CARRIER,
   };
   const outer = spawnSync(process.execPath, ["-e", SUPERVISOR_SOURCE, "--", JSON.stringify(config)], {
@@ -330,7 +322,7 @@ const superviseSync = (
     timeout: timeout + GROUP_SIGTERM_GRACE_MS + GROUP_SIGKILL_SETTLE_MS + SUPERVISOR_SLACK_MS,
     killSignal: "SIGKILL",
   });
-  const record = takeRecord(recordPath);
+  const record = takeRecord(recordDirectory);
 
   if (record?.error !== undefined) {
     const { code, errno } = record.error;

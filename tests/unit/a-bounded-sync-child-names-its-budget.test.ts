@@ -1,7 +1,8 @@
 import type * as ChildProcessModule from "node:child_process";
+import type * as FsModule from "node:fs";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -17,6 +18,11 @@ vi.mock("node:child_process", async (importOriginal) => {
   return { ...actual, spawnSync: vi.fn(actual.spawnSync), execFileSync: vi.fn(actual.execFileSync) };
 });
 const { execFileSync, spawn, spawnSync } = await import("node:child_process");
+/** Wrapped so the directories a supervised call reports through can be found and checked. */
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof FsModule>();
+  return { ...actual, mkdtempSync: vi.fn(actual.mkdtempSync) };
+});
 
 /**
  * #872. The helper exists so a wedged synchronous child becomes a failure that names itself instead
@@ -286,5 +292,23 @@ describe("a timed-out detached child whose leader ignores SIGTERM still takes it
       if (Number.isInteger(leader) && leader > 1) forceKill(-leader);
       if (Number.isInteger(grandchild) && grandchild > 1) forceKill(grandchild);
     }
+  });
+});
+
+describe("a supervised call leaves nothing behind", () => {
+  it("removes the directory its supervisor reported through, on an answer and on a timeout", () => {
+    // The first shape kept one directory per worker and removed it from an `exit` handler, which
+    // vitest's fork workers never run: every worker that made a detached call left one in tmpdir.
+    vi.mocked(mkdtempSync).mockClear();
+    boundedSpawnSync("/bin/sh", ["-c", "exit 0"], { detached: true });
+    expect(() => boundedSpawnSync("/bin/sleep", ["30"], { timeout: 100, detached: true })).toThrowError(
+      /\/bin\/sleep 30 did not answer within 100ms/,
+    );
+    const used = vi
+      .mocked(mkdtempSync)
+      .mock.results.map((result) => String(result.value))
+      .filter((directory) => basename(directory).startsWith("acp-bounded-supervisor-"));
+    for (const directory of used) expect(existsSync(directory), `${directory} was left behind`).toBe(false);
+    expect(used, "not one directory per call, so a call shared or skipped one").toHaveLength(2);
   });
 });
