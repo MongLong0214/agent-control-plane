@@ -2075,6 +2075,15 @@ export class IngressGuard {
     //
     // Terminal reply failures need a person, not a timer. `agentctl doctor system` reads these
     // exact rows and reports the unanswerable or unknown delivery state.
+    //
+    // A message an unresolved canonical turn consumed is exempt as well, whatever its own columns
+    // say. The coordinator claims without `turn_claim_json` (the Hermes external lane always does),
+    // so the first exemption cannot see such a turn, and this row's payload is the only address a
+    // COMPLETED receipt's owner reply can be given (`ownerReplyAddressFor`): pruned, the receipt
+    // settles nothing and the turn stays IN_DOUBT (R1062-02). Once the turn settles, its reply item
+    // carries its own address and the row expires like any other. Keyed on the canonical ledger for
+    // every channel rather than on the external lane alone: `ownerReplyAddressFor` reads this
+    // payload whichever lane admitted the message.
     const authority = new IngressDeleteAuthorityToken(this.db, channel);
     this.db.withIngressDelete(authority, channel, () => this.db.run(
       `DELETE FROM inbound_messages
@@ -2108,7 +2117,14 @@ export class IngressGuard {
                 AND json_extract(result_json, '$.sent') IS NOT 1
               )
             )
-          ), 0)`,
+          ), 0)
+          AND NOT EXISTS (
+            SELECT 1 FROM canonical_turn_sources AS source
+              JOIN canonical_turns AS turn ON turn.turn_request_id = source.turn_request_id
+             WHERE source.source_channel = inbound_messages.channel
+               AND source.source_nonce = inbound_messages.nonce
+               AND turn.lifecycle_state = 'IN_DOUBT'
+          )`,
       [channel, new Date(new Date(this.clock.nowIso()).getTime() - ttlMs).toISOString()],
     ));
   }

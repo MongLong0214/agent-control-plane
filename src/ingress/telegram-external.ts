@@ -1,5 +1,4 @@
 import type { ControlPlane } from "../app/control-plane.ts";
-import type { TurnPermit } from "../conversation/turn-coordinator.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -16,17 +15,17 @@ import {
  *
  * Hermes polls the bot. For an update from the bound owner chat it connects to this lane's socket
  * before running anything, and runs the turn only when the answer is `allowed`. By then ACP has
- * admitted the update, claimed a canonical turn for the Hermes CEO and committed its dispatch row,
- * so a turn Hermes runs always has a ledger entry, and the receipt Hermes records for it carries
- * the identity this lane returned.
+ * admitted the update, claimed a canonical turn for the Hermes CEO and dispatched it, in one
+ * committed transaction, so a turn Hermes runs always has a ledger entry, and the receipt Hermes
+ * records for it carries the identity this lane returned.
  *
  * Nothing here is a new authority. The update passes `TelegramIngress.admit` (the shared secret in
  * constant time, the owner and chat allowlists, safe integer ids, the `INGRESS_ADMITTED` payload
  * digest); the turn passes `ConversationTurnCoordinator.claim` (attestation currency, a READY
  * session and its incarnation, the payload digest against admission); and the turn settles only
- * through the coordinator's sealed receipt port and its eight-field match. Every refusal before the
- * dispatch commits leaves the database as it was: admission and claim run in one `txDecision`, so
- * a refused claim takes the admission, and its spent nonce, back with it.
+ * through the coordinator's sealed receipt port and its eight-field match. Every refusal leaves the
+ * database as it was: admission, claim and dispatch run in one `txDecision`, so a refused claim or a
+ * failed dispatch write takes the admission, and its spent nonce, back with it (R1062-01).
  *
  * The coordinator's claim is used rather than `IngressGuard.claimTurn`, which mints a turn id of
  * its own; the turn this lane claims has exactly one id, the coordinator's.
@@ -160,15 +159,15 @@ const refusal = (decision: { reasonCode: string; message: string }): TelegramExt
   message: decision.message,
 });
 
-interface ClaimedExternalTurn {
-  permit: TurnPermit;
-  answer: TelegramExternalAnswer & { allowed: true };
-}
-
 /**
  * One lane per daemon. The guard is this lane's own, with the external consumer's allowlists and no
- * in-flight recovery: an update this lane admitted either holds a canonical turn or was rolled back,
- * so there is no half-run handler for a redelivery to resume.
+ * in-flight recovery: an update this lane admitted either holds a dispatched canonical turn or was
+ * rolled back, so there is no half-run handler for a redelivery to resume.
+ *
+ * The guard's ordinary nonce expiry still runs here. It does not decide what this lane recognizes
+ * as a replay — the canonical source does, and that never expires — and it keeps the ingress row an
+ * unresolved canonical turn's settlement still needs (`IngressGuard.prune`), so expiry costs this
+ * lane nothing (R1062-02).
  */
 export class TelegramExternalUpdateLane {
   readonly #cp: ControlPlane;
@@ -194,35 +193,39 @@ export class TelegramExternalUpdateLane {
   /**
    * Answers one envelope through `respond`, once.
    *
-   * For a new turn `respond` is the send `ConversationTurnCoordinator.dispatch` holds, so the
-   * canonical turn and its dispatch row are committed before Hermes reads that it may run. Every
-   * other answer is a refusal or a replay, and neither writes.
+   * For a new turn `respond` is the send `ConversationTurnCoordinator.dispatchOnCommit` holds, so it
+   * runs only after the admission, the canonical turn and its dispatch row have committed together.
+   * Every other answer is a refusal or a replay, and neither writes.
    */
   async handle(value: unknown, respond: (answer: TelegramExternalAnswer) => void): Promise<void> {
     const envelope = parseEnvelope(value);
     if (!envelope.allowed) return respond(refusal(envelope));
 
-    let claimed = this.#claim(envelope.value);
+    let claimed = this.#claim(envelope.value, respond);
     if (!claimed.allowed && claimed.reasonCode === ReasonCode.CONVERSATION_TURN_IN_DOUBT) {
       // A4. The CEO's previous turn is still in doubt, usually because its receipt has not been
       // swept yet. Ask the receipt port once, inside a bounded wait, and claim again once. The
       // rollback above left nothing behind, so the second claim starts from the same database.
       await this.#reconcileOnce();
-      claimed = this.#claim(envelope.value);
+      claimed = this.#claim(envelope.value, respond);
     }
     if (!claimed.allowed) {
       if (claimed.reasonCode === ReasonCode.INGRESS_REPLAY_IGNORED) return respond(this.#replay(envelope.value));
       return respond(refusal(claimed));
     }
-    const { permit, answer } = claimed.value;
-    const dispatched = await this.#cp.conversation.dispatch(permit, () => respond(answer));
-    if (!dispatched.allowed) respond(refusal(dispatched));
+    // Allowed: `respond` already ran, from the commit of the transaction that dispatched the turn.
   }
 
-  /** Admission and claim in one transaction: either both commit or neither leaves a row. */
-  #claim(envelope: TelegramExternalEnvelope): Decision<ClaimedExternalTurn> {
+  /**
+   * Admission, claim and dispatch in one transaction: all three commit, and only then is the answer
+   * sent, or none of them leaves a row and no answer is sent.
+   */
+  #claim(
+    envelope: TelegramExternalEnvelope,
+    respond: (answer: TelegramExternalAnswer) => void,
+  ): Decision<TelegramExternalAnswer & { allowed: true }> {
     const { update } = envelope;
-    return this.#cp.db.txDecision((): Decision<ClaimedExternalTurn> => {
+    return this.#cp.db.txDecision((): Decision<TelegramExternalAnswer & { allowed: true }> => {
       const admitted = this.#ingress.admit(update, envelope.secret);
       if (!admitted.allowed) return deny(admitted.reasonCode, admitted.message, admitted.evidence);
       // `admit` wraps a forward as untrusted data for an executor ACP drives. Here Hermes runs the
@@ -232,6 +235,18 @@ export class TelegramExternalUpdateLane {
         return deny(
           ReasonCode.UNTRUSTED_CONTENT_IS_DATA,
           "forwarded Telegram content is not run as an owner turn",
+          { updateId: update.update_id },
+        );
+      }
+      // R1062-02. `admit` recognizes a replay by its ingress row, and that row expires with the
+      // nonce window; the canonical source this lane claimed under the same nonce does not. Past
+      // the window `admit` would take a replay for a new update and the claim would collide with
+      // the source. Reached only after `admit` checked the secret, the owner and the chat, and the
+      // refusal rolls this admission back, so the replay answer below is read without a write.
+      if (this.#canonicalSource(admitted.value.nonce)) {
+        return deny(
+          ReasonCode.INGRESS_REPLAY_IGNORED,
+          "this update already holds a canonical turn",
           { updateId: update.update_id },
         );
       }
@@ -283,17 +298,32 @@ export class TelegramExternalUpdateLane {
           { updateId: update.update_id },
         );
       }
-      return allow(ReasonCode.OK, { permit: claimed.value, answer });
+      // The dispatch row joins this transaction and the answer waits for its commit (R1062-01): a
+      // dispatch write that fails takes the admission and the claim back with it, and a crash
+      // before the commit leaves nothing a restart has to recover.
+      const dispatched = this.#cp.conversation.dispatchOnCommit(claimed.value, () => respond(answer));
+      if (!dispatched.allowed) return deny(dispatched.reasonCode, dispatched.message, dispatched.evidence);
+      return allow(ReasonCode.OK, answer);
     });
+  }
+
+  /** The canonical source this lane claims under `nonce`, which no ingress expiry removes. */
+  #canonicalSource(nonce: string): { turn_request_id: string; source_digest: string } | undefined {
+    return this.#cp.db.get<{ turn_request_id: string; source_digest: string }>(
+      `SELECT turn_request_id, source_digest FROM canonical_turn_sources
+        WHERE source_channel = 'telegram' AND source_nonce = ? AND source_attempt = 1`,
+      [nonce],
+    );
   }
 
   /**
    * The answer to an update this lane already claimed, read without writing.
    *
-   * Reached only when `admit` refused the update as a replay, which it does after the secret, the
-   * allowlists and the ids passed, so the caller here is the authenticated one. The update's own
-   * admitted payload decides whether it is the same update: a different text or chat under a spent
-   * update id is refused, never answered with the first one's turn.
+   * Reached only when the update was refused as a replay — by `admit` while its ingress row lives,
+   * by `#claim` from the canonical source once that row has expired — and both refuse only after the
+   * secret, the allowlists and the ids passed, so the caller here is the authenticated one. The
+   * update's own admitted payload decides whether it is the same update: a different text or chat
+   * under a spent update id is refused, never answered with the first one's turn.
    */
   #replay(envelope: TelegramExternalEnvelope): TelegramExternalAnswer {
     const { update } = envelope;
@@ -304,11 +334,7 @@ export class TelegramExternalUpdateLane {
       });
     }
     const nonce = this.#ingress.nonceFor(update);
-    const source = this.#cp.db.get<{ turn_request_id: string; source_digest: string }>(
-      `SELECT turn_request_id, source_digest FROM canonical_turn_sources
-        WHERE source_channel = 'telegram' AND source_nonce = ? AND source_attempt = 1`,
-      [nonce],
-    );
+    const source = this.#canonicalSource(nonce);
     if (!source) {
       return refusal({
         reasonCode: ReasonCode.INGRESS_REPLAY_IGNORED,
@@ -327,8 +353,9 @@ export class TelegramExternalUpdateLane {
       [source.turn_request_id],
     );
     if (!turn || !dispatched) {
-      // A claim whose dispatch never committed: the process stopped between the two. Hermes was
-      // never told it could run this turn, so it is not told now either.
+      // A claim with no dispatch. This lane commits the two together, so the turn is not one it
+      // claimed — the long-poll lane claims under the same nonces. Hermes was never told it could
+      // run this turn, so it is not told now either.
       return refusal({
         reasonCode: ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN,
         message: "this update's turn was claimed and never dispatched",

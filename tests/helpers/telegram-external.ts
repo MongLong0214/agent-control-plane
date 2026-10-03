@@ -1,3 +1,4 @@
+import { copyFileSync, existsSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createConnection } from "node:net";
 import { join } from "node:path";
@@ -47,10 +48,16 @@ export const LANE_ENV = {
 export interface ExternalLaneFixture {
   cp: ControlPlane;
   root: string;
+  clock: ManualClock;
   /** Absent when the fixture was asked for no Hermes CEO. */
   ceoActorId: string | null;
   /** The parsed lane configuration, through the production parser. */
   laneConfig: TelegramExternalConsumerConfig;
+  /**
+   * A control plane over the database under `root` (this fixture's own by default), composed the
+   * way the first one was: what a daemon restart opens. Close the one it replaces first.
+   */
+  open(root?: string): ControlPlane;
 }
 
 const baseConfig = (root: string, clock: ManualClock): ControlPlaneConfig => ({
@@ -72,16 +79,24 @@ const baseConfig = (root: string, clock: ManualClock): ControlPlaneConfig => ({
   reviewer: { preferred: { provider: "scripted", model: "scripted-reviewer", effort: "xhigh" }, fallbacks: [] },
 });
 
-const bindHermesCeo = (cp: ControlPlane): string => {
+interface HermesCeoTarget {
+  pid: number;
+  head: string;
+  lineage: string;
+}
+
+const FIRST_CEO: HermesCeoTarget = { pid: GATEWAY_PID, head: HEAD, lineage: LINEAGE };
+
+const bindHermesCeo = (cp: ControlPlane, target: HermesCeoTarget = FIRST_CEO): string => {
   const gateway = cp.sessions.create({
     provider: "hermes",
     model: "hermes-runtime",
-    osPid: GATEWAY_PID,
+    osPid: target.pid,
     osStartedAt: "Sat Oct  3 07:00:00 2026",
   });
   expect(cp.sessions.transition(gateway.sessionId, SessionLifecycle.READY).allowed).toBe(true);
   cp.sessions.pinNativeStart(gateway.sessionId, "darwin-tv:1790000000.000001");
-  const claimed = { executorKind: "hermes", targetLocator: HEAD, targetLocatorDigest: LINEAGE };
+  const claimed = { executorKind: "hermes", targetLocator: target.head, targetLocatorDigest: target.lineage };
   let receipt: HermesTargetBindResponse | null = null;
   const bound = cp.bindings.bind({
     role: Role.CEO,
@@ -103,19 +118,46 @@ const bindHermesCeo = (cp: ControlPlane): string => {
           actor_id: tuple.actorId,
           binding_generation: tuple.generation,
           executor_runtime_identity: RUNTIME,
-          requested_session_id: HEAD,
-          lineage_root_digest: LINEAGE,
+          requested_session_id: target.head,
+          lineage_root_digest: target.lineage,
         };
         receipt = { ...fields, receipt_digest: digestOf(fields) };
         return claimed;
       },
     },
   });
-  expect(bound.allowed).toBe(true);
+  expect(bound, JSON.stringify(bound)).toMatchObject({ allowed: true });
   return cp.db.get<{ actor_id: string }>(
     "SELECT actor_id FROM assignments WHERE role_key = ? AND status = 'ACTIVE'",
     [roleKeyFor(Role.CEO)],
   )!.actor_id;
+};
+
+/**
+ * Binds the CEO role to another Hermes Gateway with a lineage of its own, which is a different
+ * target actor: what replacing the CEO leaves behind. Returns the new CEO's actor id.
+ */
+export const replaceHermesCeo = (cp: ControlPlane, index: number): string => {
+  expect(cp.bindings.revoke(roleKeyFor(Role.CEO), "u4 fixture: CEO replaced").reasonCode).toBe("OK");
+  return bindHermesCeo(cp, {
+    pid: GATEWAY_PID + index,
+    head: `${HEAD}-replacement-${index}`,
+    lineage: `sha256:${index.toString(16).padStart(64, "d")}`,
+  });
+};
+
+/**
+ * The database files exactly as they are on disk at this instant, copied under a fresh root: what a
+ * process killed at this instant leaves for the next one to open. Nothing the open transaction has
+ * not committed is in them, because SQLite's write-ahead log ignores frames no commit closed.
+ */
+export const crashImage = (fixture: Pick<ExternalLaneFixture, "root">): string => {
+  const image = tempDir("acp-u4-crash-");
+  for (const suffix of ["", "-wal"]) {
+    const from = join(fixture.root, `state.sqlite${suffix}`);
+    if (existsSync(from)) copyFileSync(from, join(image, `state.sqlite${suffix}`));
+  }
+  return image;
 };
 
 /**
@@ -165,13 +207,18 @@ export const externalLaneFixture = (options: {
 } = {}): ExternalLaneFixture => {
   const root = tempDir("acp-u4-");
   const clock = new ManualClock(NOW);
-  const base = baseConfig(root, clock);
-  const cp = new ControlPlane(options.configure ? options.configure(base) : base);
+  const open = (at: string = root): ControlPlane => {
+    const base = baseConfig(at, clock);
+    return new ControlPlane(options.configure ? options.configure(base) : base);
+  };
+  const cp = open();
   const ceoActorId = options.hermesCeo === false ? null : bindHermesCeo(cp);
   for (let index = 0; index < (options.otherCtos ?? 0); index += 1) attestedCto(cp, index);
-  const laneConfig = configuredTelegramExternalConsumerConfig(base.ownerIdentities ?? [], { ...LANE_ENV });
+  const laneConfig = configuredTelegramExternalConsumerConfig(baseConfig(root, clock).ownerIdentities ?? [], {
+    ...LANE_ENV,
+  });
   if (!laneConfig) throw new Error("the fixture's lane environment did not configure a lane");
-  return { cp, root, ceoActorId, laneConfig };
+  return { cp, root, clock, ceoActorId, laneConfig, open };
 };
 
 /** One owner update, in the envelope Hermes sends. */
