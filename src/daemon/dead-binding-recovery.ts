@@ -1,5 +1,6 @@
 import { type Decision, allow, deny } from "../core/errors.ts";
-import { processStartedAt } from "../core/process-identity.ts";
+import { DARWIN_START_TOKEN, readProcessStartToken } from "../core/process-argv.ts";
+import { lstartSecondStartMs, processStartedAt } from "../core/process-identity.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
@@ -28,6 +29,20 @@ export const DEAD_BINDING_RECOVERY_ROLE = Role.PRIMARY_CTO;
 export type SessionLiveness = "ALIVE" | "DEAD" | "UNKNOWN";
 
 /**
+ * The reader that renders a live process's start in the format `recorded` was written in, or
+ * null when `recorded` is in neither format a session row carries.
+ *
+ * A native token is matched by the claim's own pattern and read by the claim's own reader, so
+ * this cannot drift from what the claim recorded. Only `darwin-tv:` is recognised: ACP deploys on
+ * Darwin, and a `linux-clk:` row is answered `UNKNOWN` rather than guessed at.
+ */
+const liveStartReaderFor = (recorded: string): ((pid: number) => string | null) | null => {
+  if (DARWIN_START_TOKEN.test(recorded)) return readProcessStartToken;
+  if (lstartSecondStartMs(recorded) !== null) return processStartedAt;
+  return null;
+};
+
+/**
  * Proves — or fails to prove — that the process a session names is gone.
  *
  * `UNKNOWN` is returned wherever the evidence does not decide, and every caller here treats it
@@ -40,6 +55,14 @@ export type SessionLiveness = "ALIVE" | "DEAD" | "UNKNOWN";
  * same number is positive evidence that the recorded process has exited and an unrelated one has
  * inherited its slot. Without this branch a recovery would be impossible after any pid reuse,
  * which on a busy host is a matter of hours.
+ *
+ * The comparison only means anything when both sides are in one format, and a session row
+ * records its start in one of two: the canonical self-claim writes the native `darwin-tv:` token
+ * its inspector read (`readProcessStartToken`), every other writer `ps -o lstart=` text. So the
+ * live process is read in the format its row was recorded in — see `liveStartReaderFor`. A
+ * recorded start in neither format cannot be compared with anything, and is `UNKNOWN` rather
+ * than a mismatch: reading it as one called a live canonical CTO dead and revoked its binding.
+ * An injected `probe.startedAt` is used as given.
  */
 export const probeSessionLiveness = (
   osPid: number | null,
@@ -51,7 +74,6 @@ export const probeSessionLiveness = (
 ): SessionLiveness => {
   if (osPid === null || !Number.isSafeInteger(osPid) || osPid <= 0) return "UNKNOWN";
   const signal = probe.signal ?? ((pid: number) => process.kill(pid, 0));
-  const readStartedAt = probe.startedAt ?? processStartedAt;
   try {
     signal(osPid);
   } catch (error) {
@@ -66,6 +88,8 @@ export const probeSessionLiveness = (
   // Something answers on that number. Whether it is *this* session's process is a question the
   // pid alone cannot answer.
   if (recordedStartedAt === null) return "ALIVE";
+  const readStartedAt = probe.startedAt ?? liveStartReaderFor(recordedStartedAt);
+  if (readStartedAt === null) return "UNKNOWN";
   const current = readStartedAt(osPid);
   if (current === null) return "UNKNOWN";
   return current === recordedStartedAt ? "ALIVE" : "DEAD";
