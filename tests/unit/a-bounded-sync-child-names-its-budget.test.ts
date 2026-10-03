@@ -16,7 +16,7 @@ vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof ChildProcessModule>();
   return { ...actual, spawnSync: vi.fn(actual.spawnSync), execFileSync: vi.fn(actual.execFileSync) };
 });
-const { execFileSync, spawnSync } = await import("node:child_process");
+const { execFileSync, spawn, spawnSync } = await import("node:child_process");
 
 /**
  * #872. The helper exists so a wedged synchronous child becomes a failure that names itself instead
@@ -164,5 +164,127 @@ describe("a timed-out detached child takes its process group with it", () => {
     timeOutWithGrandchild(false, (argv) =>
       boundedExecFileSync("/bin/sh", argv, { encoding: "utf8", timeout: 1_000, detached: true }),
     );
+  });
+});
+
+/**
+ * The cases above all have a direct child that dies on SIGTERM, so `spawnSync` returns as soon as
+ * its own timeout signals that child and the group cleanup gets its turn. A direct child that
+ * ignores SIGTERM is the case that was never covered: `spawnSync` waits for the direct child, so
+ * cleanup that only starts once the call returns never starts at all. A review reproduced exactly
+ * that through both wrappers — both groups stayed alive until an outside watchdog killed them.
+ *
+ * Here the leader and its grandchild both ignore SIGTERM, the budget is 100ms, and the group has
+ * to be gone when the wrapper returns, within the escalation's own bound: the SIGTERM grace (2s,
+ * which runs in full because nothing here honours SIGTERM — hence the lower bound) plus the
+ * SIGKILL settle (1s) plus slack for starting the supervising process under load. A backstop
+ * outside the call kills the group at 8s, so a regression fails in seconds instead of waiting out
+ * the grandchild's 30s and leaves nothing behind.
+ */
+describe("a timed-out detached child whose leader ignores SIGTERM still takes its group with it", () => {
+  const scratch: string[] = [];
+  afterEach(() => {
+    for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  const BACKSTOP_SECONDS = 8;
+  const RESISTANT_SCRIPT = `trap '' TERM; ( exec /bin/sleep 30 ) & echo "$$ $!" > "$1"; wait`;
+
+  const exists = (target: number): boolean => {
+    try {
+      process.kill(target, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== "ESRCH";
+    }
+  };
+
+  const forceKill = (target: number): void => {
+    try {
+      process.kill(target, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  };
+
+  const timeOutResistantGroup = (call: (argv: readonly string[]) => unknown): void => {
+    const dir = mkdtempSync(join(tmpdir(), "acp-bounded-resistant-"));
+    scratch.push(dir);
+    const pidFile = join(dir, "pids");
+    const backstop = spawn(
+      "/bin/sh",
+      [
+        "-c",
+        `sleep ${BACKSTOP_SECONDS}; read leader grandchild < "$1" && kill -KILL -"$leader" "$grandchild" 2>/dev/null`,
+        "sh",
+        pidFile,
+      ],
+      { detached: true, stdio: "ignore" },
+    );
+    backstop.unref();
+    let leader = Number.NaN;
+    let grandchild = Number.NaN;
+    try {
+      const started = Date.now();
+      expect(() => call(["-c", RESISTANT_SCRIPT, "sh", pidFile])).toThrowError(
+        /\/bin\/sh -c .* did not answer within 100ms/,
+      );
+      const elapsedMs = Date.now() - started;
+      [leader, grandchild] = readFileSync(pidFile, "utf8").trim().split(" ").map(Number) as [number, number];
+      expect(leader, "the leader recorded no pid").toBeGreaterThan(1);
+      expect(grandchild, "the leader recorded no grandchild pid").toBeGreaterThan(1);
+      expect(exists(-leader), `process group ${leader} outlived its timed-out call`).toBe(false);
+      expect(exists(grandchild), `grandchild ${grandchild} outlived its timed-out call`).toBe(false);
+      expect(elapsedMs, "the group was not escalated until something outside the call killed it").toBeLessThan(
+        5_000,
+      );
+      expect(elapsedMs, "SIGKILL came without the SIGTERM grace before it").toBeGreaterThanOrEqual(2_000);
+    } finally {
+      if (backstop.pid !== undefined) forceKill(-backstop.pid);
+      if (!Number.isInteger(leader) && existsSync(pidFile)) {
+        [leader, grandchild] = readFileSync(pidFile, "utf8").trim().split(" ").map(Number) as [number, number];
+      }
+      if (Number.isInteger(leader) && leader > 1) forceKill(-leader);
+      if (Number.isInteger(grandchild) && grandchild > 1) forceKill(grandchild);
+    }
+  };
+
+  it("through boundedSpawnSync", () => {
+    timeOutResistantGroup((argv) =>
+      boundedSpawnSync("/bin/sh", argv, { encoding: "utf8", timeout: 100, detached: true }),
+    );
+  });
+
+  it("through boundedExecFileSync", () => {
+    timeOutResistantGroup((argv) =>
+      boundedExecFileSync("/bin/sh", argv, { encoding: "utf8", timeout: 100, detached: true }),
+    );
+  });
+
+  it("is reaped from the caller's side when the supervisor itself is killed", () => {
+    // The supervisor holds the escalation, so a supervisor that dies holds nothing. `maxBuffer` is
+    // the ordinary way that happens: `spawnSync` kills the process it ran — now the supervisor —
+    // and the child it started would be left running. The supervisor records the child's pid
+    // before anything else, and that record is what the caller reaps the group by.
+    const dir = mkdtempSync(join(tmpdir(), "acp-bounded-overflow-"));
+    scratch.push(dir);
+    const pidFile = join(dir, "pids");
+    let leader = Number.NaN;
+    let grandchild = Number.NaN;
+    try {
+      const result = boundedSpawnSync(
+        "/bin/sh",
+        ["-c", `( exec /bin/sleep 30 ) & echo "$$ $!" > "$1"; head -c 2000000 /dev/zero; wait`, "sh", pidFile],
+        { detached: true, maxBuffer: 1_000 },
+      );
+      [leader, grandchild] = readFileSync(pidFile, "utf8").trim().split(" ").map(Number) as [number, number];
+      expect((result.error as NodeJS.ErrnoException | undefined)?.code).toBe("ENOBUFS");
+      expect(result.pid, "the result names the supervisor rather than the child").toBe(leader);
+      expect(exists(-leader), `process group ${leader} outlived its supervisor`).toBe(false);
+      expect(exists(grandchild), `grandchild ${grandchild} outlived its supervisor`).toBe(false);
+    } finally {
+      if (Number.isInteger(leader) && leader > 1) forceKill(-leader);
+      if (Number.isInteger(grandchild) && grandchild > 1) forceKill(grandchild);
+    }
   });
 });

@@ -625,6 +625,9 @@ exec /bin/ps "$@"
         enforcement: { memoryLimit: "observed", resourceLimitsEnforced: true, childContainmentEnforced: true },
       });
       expect(outcome.peakRssMb).toBeTypeOf("number");
+      // The shim has to be what answered. A cached shim that cannot run leaves PATH to find the
+      // real `ps`, and every assertion above then passes with no identity having raced away.
+      expect(existsSync(failLeaderIdentityOnce), "the ps shim never ran, so nothing raced away").toBe(true);
     } finally {
       if (previousSentinel === undefined) delete process.env["ACP_PS_SHIM_LSTART_ONCE_SENTINEL"];
       else process.env["ACP_PS_SHIM_LSTART_ONCE_SENTINEL"] = previousSentinel;

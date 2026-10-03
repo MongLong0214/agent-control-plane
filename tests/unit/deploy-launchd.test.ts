@@ -15,7 +15,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 
@@ -23,7 +23,7 @@ import { Db } from "../../src/db/database.ts";
 import { parseLauncherBinding, sealRollbackPair, type SealedRollbackPair } from "../../src/deploy/rollback-pair.ts";
 import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
-import { stableFixtureBinDir, stableFixtureExecutable } from "../helpers/stable-fixture-executable.ts";
+import { stableFixtureBinDir, stableFixtureExecutable, stableFixtureLink } from "../helpers/stable-fixture-executable.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -423,15 +423,19 @@ const assertProviderUnresolvable = (harness: InstallerHarness, ...names: string[
   }
 };
 
-const writeProviderCli = (path: string, body: string): string => {
-  writeFileSync(path, body, { mode: 0o755 });
-  chmodSync(path, 0o755);
+/**
+ * An executable at exactly `path`, as a hard link to a cached entry rather than bytes written for
+ * this run: these are executed (through `started_of`, by a launcher run, by the installer), and a
+ * fresh file per run is a fresh executable inode per run for syspolicyd. The link keeps what the
+ * rows measure — a regular file at that path with that realpath — and is measured itself by "the
+ * suite's executable fixture writers" at the end of this file.
+ */
+const writeProviderCli = (path: string, body: string): string =>
   // The path as written, because that is what the installer pins: it records the answer the
   // installing shell gave, which is the PATH entry plus the name and carries whatever spelling
   // that entry had. Returning the canonical path instead would disagree with a correct pin on
   // every host whose temporary directory is itself a link — which macOS's is.
-  return path;
-};
+  stableFixtureLink(path, body);
 
 /** A provider CLI that carries its own interpreter, as a compiled one does. */
 const SELF_CONTAINED_CLI = "#!/bin/sh\nexit 0\n";
@@ -537,6 +541,20 @@ const makeDisposableAppRoot = (): string => {
   return realpathSync(appRoot);
 };
 
+/**
+ * The sealed closure's own interpreter: a shim handing everything to the real one, linked from the
+ * cache like `writeProviderCli`'s. Sealing refuses a symlinked member, which a hard link is not.
+ * The copied `dist` can already hold a `bin/node` an earlier install put there; it is removed first,
+ * because a link cannot land on an existing name and writing through that fresh copy is what
+ * minted an executable inode per run.
+ */
+const writeSealedPairNode = (runtimeRoot: string): string => {
+  mkdirSync(join(runtimeRoot, "bin"), { recursive: true, mode: 0o700 });
+  const node = join(runtimeRoot, "bin", "node");
+  rmSync(node, { force: true });
+  return stableFixtureLink(node, `#!/bin/bash\nexec ${process.execPath} "$@"\n`);
+};
+
 interface PairFixture {
   pair: SealedRollbackPair;
   appRoot: string;
@@ -578,11 +596,7 @@ const sealPairFor = async (
   writeFileSync(join(runtimeRoot, GENERATION_MARKER), `${generation}\n`, { mode: 0o600 });
   // The interpreter travels inside the closure, so the rollback runs the sealed one rather than
   // whatever `node` this machine happens to have.
-  mkdirSync(join(runtimeRoot, "bin"), { recursive: true, mode: 0o700 });
-  writeFileSync(join(runtimeRoot, "bin", "node"), `#!/bin/bash\nexec ${process.execPath} "$@"\n`, {
-    mode: 0o755,
-  });
-  chmodSync(join(runtimeRoot, "bin", "node"), 0o755);
+  writeSealedPairNode(runtimeRoot);
 
   const launcherDestination = join(realpathSync(state), "agentcpd-launch.sh");
   const plistDestination = join(
@@ -1368,9 +1382,7 @@ exec /bin/cp "$@"
     // succeeds and production silently has no transport at all.
     const userLocalBin = join(harness.home, "user-local-bin");
     mkdirSync(userLocalBin, { recursive: true });
-    const buzzPath = join(userLocalBin, "buzz");
-    writeFileSync(buzzPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-    chmodSync(buzzPath, 0o755);
+    const buzzPath = writeProviderCli(join(userLocalBin, "buzz"), SELF_CONTAINED_CLI);
     harness.env["PATH"] = `${userLocalBin}:${harness.env["PATH"] ?? ""}`;
     harness.env["ACP_BUZZ_INGRESS_SECRET"] = "ingress-secret";
     harness.env["ACP_BUZZ_ALLOWED_ACTORS"] = "actor-one";
@@ -1677,9 +1689,7 @@ exec /bin/cp "$@"
     mkdirSync(versions, { recursive: true });
     const onPath = join(harness.home, "acp-provider-cli-onpath");
     mkdirSync(onPath, { recursive: true });
-    const accepted = join(versions, "1.0.0");
-    writeFileSync(accepted, SELF_CONTAINED_CLI, { mode: 0o755 });
-    chmodSync(accepted, 0o755);
+    const accepted = writeProviderCli(join(versions, "1.0.0"), SELF_CONTAINED_CLI);
     const stable = join(onPath, "claude");
     symlinkSync(accepted, stable);
     harness.env["PATH"] = isolatedInstallerPath(harness, onPath);
@@ -1698,9 +1708,7 @@ exec /bin/cp "$@"
 
     // The updater runs: a new version arrives, the stable name moves to it, and the version this
     // install resolved and accepted is removed.
-    const replacement = join(versions, "2.0.0");
-    writeFileSync(replacement, SELF_CONTAINED_CLI, { mode: 0o755 });
-    chmodSync(replacement, 0o755);
+    const replacement = writeProviderCli(join(versions, "2.0.0"), SELF_CONTAINED_CLI);
     rmSync(stable);
     symlinkSync(replacement, stable);
     rmSync(accepted);
@@ -2620,5 +2628,70 @@ exit 0
     expect(tree.filter((path) => path.endsWith(".plist"))).toEqual([]);
     expect(readFileSync(template, "utf8")).toContain("__ACP_");
     expect(tree.filter((path) => path.endsWith(".plist.template"))).toEqual([template]);
+  });
+});
+
+/**
+ * syspolicyd records one provenance row per new executable inode exec'd, and that table cannot be
+ * pruned (tests/helpers/stable-fixture-executable.ts). The rows above execute provider CLIs, the
+ * Buzz CLI, an updater's versioned files and a sealed closure's interpreter, and each run writes
+ * them into that run's own fresh home, because the rows need them at those paths.
+ *
+ * What is measured here is the writers themselves, run twice the way those rows call them: once to
+ * warm the cache and once more as the repeated run. A cache directory that stays the same size says
+ * nothing about this — a writer that bypasses it never touches it. So the measurement reads the
+ * executables each run actually left at the paths its rows use, and the repeated run must have
+ * minted none: every executable it left shares an inode with one the warm run left, which two fresh
+ * homes can only do through the cache.
+ */
+describe("the suite's executable fixture writers", () => {
+  const writeEveryExecutableFixture = (): string => {
+    const home = tempDir("acp-launchd-writers-");
+    // The names the rows use: provider CLIs (#785, #954), the Buzz CLI (#423), an updater's
+    // versions (#954), and the link target the leak row reads its sentinel from.
+    for (const name of [
+      "claude",
+      "codex",
+      "grok",
+      "acp-sibling-probe",
+      "claude-1.0",
+      "buzz",
+      "1.0.0",
+      "2.0.0",
+      "node-ACPCANONICALSENTINEL",
+    ]) {
+      writeProviderCli(join(home, name), SELF_CONTAINED_CLI);
+    }
+    mkdirSync(join(home, "scripted"));
+    writeProviderCli(join(home, "scripted", "codex"), ENV_INTERPRETER_CLI);
+    writeSealedPairNode(join(home, "runtime"));
+    return home;
+  };
+
+  const executables = (root: string): { path: string; inode: string }[] => {
+    const found: { path: string; inode: string }[] = [];
+    const walk = (directory: string): void => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const path = join(directory, entry.name);
+        if (entry.isDirectory()) walk(path);
+        const stat = lstatSync(path);
+        if (stat.isFile() && (stat.mode & 0o111) !== 0) {
+          found.push({ path: relative(root, path), inode: `${stat.dev}:${stat.ino}` });
+        }
+      }
+    };
+    walk(root);
+    return found;
+  };
+
+  it("mint no executable inode on a repeated run beyond the warm cache", () => {
+    const warm = new Set(executables(writeEveryExecutableFixture()).map(({ inode }) => inode));
+    const repeated = executables(writeEveryExecutableFixture());
+
+    expect(repeated.length, "the writers left no executables, so this measured nothing").toBe(11);
+    expect(
+      repeated.filter(({ inode }) => !warm.has(inode)).map(({ path }) => path),
+      "a repeated run wrote these as new executable inodes",
+    ).toEqual([]);
   });
 });
