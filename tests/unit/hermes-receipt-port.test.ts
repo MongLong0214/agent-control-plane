@@ -89,7 +89,7 @@ describe("Hermes receipt port", () => {
     expect(execute.mock.calls[0]?.[0]).not.toHaveProperty("text");
   });
 
-  it("maps a terminal completed receipt without echoing the query identity", async () => {
+  it("maps a terminal completed receipt, with its reply content, without echoing the query identity", async () => {
     const execute = vi.fn<(input: HermesAcpInput) => Promise<HermesAcpResult>>(async (_input) => ({
       status: "COMPLETED",
       receiptIdentity: terminalIdentity,
@@ -108,6 +108,7 @@ describe("Hermes receipt port", () => {
       receiptId: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
       evidenceDigest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
       reasonCode: "OK",
+      content: "terminal-only-content",
       ...terminalIdentity,
     });
   });

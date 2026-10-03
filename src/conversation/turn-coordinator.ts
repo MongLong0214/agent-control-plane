@@ -116,6 +116,12 @@ export type ReceiptLookupResult =
       readonly evidenceDigest: string;
       readonly reasonCode: string;
       /**
+       * The reply text a `COMPLETED` receipt proves, when the port carries it (#1036). For Hermes
+       * it is the assistant content, and `evidenceDigest` is its digest. The coordinator stores it
+       * in the owner-reply item unchecked; the sender refuses text that does not match the digest.
+       */
+      readonly content?: string;
+      /**
        * The identity the receipt itself attests to — every field `ReceiptLookupQuery` names, not
        * an echo of the query.
        *
@@ -388,6 +394,9 @@ export class ConversationTurnCoordinator {
   /** The right to create owner-reply obligations, claimed once per database (R1041-03). */
   readonly #ownerReplies: OwnerReplyAuthority;
 
+  /** Told after a settlement that wrote a new owner-reply item has committed (#1036). */
+  readonly #ownerReplyListeners = new Set<() => void>();
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
@@ -397,6 +406,33 @@ export class ConversationTurnCoordinator {
     this.#materialization = db.claimTurnMaterializationAuthority();
     this.#ownerReplies = claimOwnerReplyAuthority(db);
     this.#receiptPort = receiptPort;
+  }
+
+  /**
+   * Registers a listener for new owner-reply items, and returns its removal (#1036).
+   *
+   * This is the delivery consumer's wake-up. It is called once per settlement that wrote a new
+   * item, after that transaction returned, and on a later microtask. A synchronous call could run
+   * inside a caller's outer transaction, before anything had committed. A listener that throws is
+   * ignored: the item is durable, and the consumer's startup sweep finds it anyway.
+   */
+  onOwnerReplyEnqueued(listener: () => void): () => void {
+    this.#ownerReplyListeners.add(listener);
+    return () => {
+      this.#ownerReplyListeners.delete(listener);
+    };
+  }
+
+  #announceOwnerReply(): void {
+    for (const listener of this.#ownerReplyListeners) {
+      queueMicrotask(() => {
+        try {
+          listener();
+        } catch {
+          /* the item is durable; the consumer's sweep finds it */
+        }
+      });
+    }
   }
 
   /**
@@ -479,6 +515,37 @@ export class ConversationTurnCoordinator {
     // the row has to be *committed* before the message goes out: a transaction still open when the
     // target receives it is a dispatch that happened and a record that can still roll back.
     return allow(ReasonCode.OK, await send());
+  }
+
+  /**
+   * `dispatch` for a caller whose claim is still inside its own transaction: the dispatch row joins
+   * that transaction, and `send` runs once it commits.
+   *
+   * `dispatch` commits the row in a transaction of its own, so a caller that claimed in one
+   * transaction and dispatched in the next had two commits with a window between them. A failure
+   * or a crash in that window kept a claimed turn nobody was ever told to run, and the inbound
+   * message it consumed stayed spent (R1062-01). Here the claim and its dispatch commit together or
+   * not at all.
+   *
+   * The order is still not the caller's. The send is handed in, as it is to `dispatch`, and is held
+   * by `Db.afterCommit`: it runs only after the outermost transaction commits, and a rollback
+   * anywhere in that transaction discards it with the row. So the two things the order exists to
+   * prevent stay impossible — a send whose row could still roll back, and a send with no row.
+   * Outside a transaction this is `dispatch` without the `await`: the row commits on its own and
+   * the send follows at once.
+   *
+   * `send` is not awaited, and what it throws surfaces from the commit that ran it, after the row
+   * is durable. A send that must report its own failure to the target does that itself.
+   *
+   * Ruled out: a public step that only writes the row, with the caller sending after its own
+   * commit. It is `markDispatching` public beside `dispatch` again, rejected before because a
+   * caller that can pick the order will eventually pick the wrong one.
+   */
+  dispatchOnCommit(permit: TurnPermit, send: () => void): Decision<void> {
+    const marked = this.#markDispatching(permit);
+    if (!marked.allowed) return deny(marked.reasonCode, marked.message, marked.evidence);
+    this.db.afterCommit(send);
+    return allow(ReasonCode.OK, undefined);
   }
 
   #markDispatching(permit: TurnPermit): Decision<void> {
@@ -1407,6 +1474,7 @@ export class ConversationTurnCoordinator {
       evidenceDigest: result.evidenceDigest,
       reasonCode: result.reasonCode,
     };
+    const replyText = result.content ?? null;
     const settlement = issueIngressReceiptSettlement(this.#ownerReplies, this.db, {
       channel: source.channel,
       nonce: source.nonce,
@@ -1425,7 +1493,8 @@ export class ConversationTurnCoordinator {
       }
       // A completed target receipt has an owner-reply obligation (#1036): the claim's settlement
       // and the reply land in this one transaction or neither does.
-      return this.db.txDecision(() => {
+      let enqueued = false;
+      const decided = this.db.txDecision(() => {
         const settled = settle(settlement);
         if (!settled.allowed) return settled;
         // Read back, independently of what the closure reports: every member of the claim's frozen
@@ -1453,11 +1522,15 @@ export class ConversationTurnCoordinator {
             evidenceDigest: receipt.evidenceDigest,
             reasonCode: receipt.reasonCode,
           },
+          replyText,
           handlerRunning: (member) => turnHandlerRunning(this.db, member.channel, member.nonce),
         });
         if (!reply.allowed) return deny(reply.reasonCode, reply.message, reply.evidence);
+        enqueued = reply.value.status === "ENQUEUED";
         return settled;
       });
+      if (decided.allowed && enqueued) this.#announceOwnerReply();
+      return decided;
     } finally {
       withdrawIngressReceiptSettlement(settlement);
     }
@@ -1597,11 +1670,10 @@ export class ConversationTurnCoordinator {
    *    second half, so `#settleFromReceipt` refused every `COMPLETED` outright. The owner-reply
    *    lane (`owner-reply-outbox.ts`) is that half now: the settlement and the item addressed to
    *    the turn's own ingress conversation commit together or not at all, and a turn whose reply
-   *    cannot be addressed stays `IN_DOUBT`. What that lane does not have yet is a consumer — no
-   *    code delivers an item, so a completed turn's reply is durably owed and visible through
-   *    `pendingOwnerReplies`, not sent. Delivery is the U6 surface path's, once Hermes carries
-   *    canonical replies with signer provenance (MongLong0214/hermes-agent#63). `ABORTED` carries
-   *    no reply obligation and settles exactly as it did before.
+   *    cannot be addressed stays `IN_DOUBT`. The item carries the receipt's reply text when the
+   *    port supplies it, and `owner-reply-consumer.ts` delivers it, woken through
+   *    `onOwnerReplyEnqueued` once the settlement has committed. `ABORTED` carries no reply
+   *    obligation and settles exactly as it did before.
    */
   async reconcileUnresolved(
     /**
@@ -1673,7 +1745,8 @@ export class ConversationTurnCoordinator {
         targetAttestationId: result.targetAttestationId,
         executorSessionId: result.executorSessionId,
         executorSessionIncarnation: result.executorSessionIncarnation,
-      }, { outcome: result.outcome, receiptId: result.receiptId, evidenceDigest: result.evidenceDigest, reasonCode: result.reasonCode });
+      }, { outcome: result.outcome, receiptId: result.receiptId, evidenceDigest: result.evidenceDigest, reasonCode: result.reasonCode },
+      result.content ?? null);
       if (decision.allowed) settled += 1;
       // A denial here — wrong generation, mismatched identity, or an already-settled turn a
       // concurrent settlement reached first — leaves the turn exactly as it was. It is not
@@ -1738,6 +1811,8 @@ export class ConversationTurnCoordinator {
       executorSessionIncarnation: string;
     },
     receipt: TurnReceipt & { outcome: "COMPLETED" | "ABORTED" },
+    /** The reply text the receipt carried, stored with the item it obliges (#1036). */
+    replyText: string | null,
   ): Decision<TurnMaterialization> {
     // Checked first, and against no table: a receipt attesting to a different turn than the one
     // this sweep asked about is not evidence about this row at all, whatever else it says. A port
@@ -1753,7 +1828,8 @@ export class ConversationTurnCoordinator {
     }
     // `txDecision`, not `tx`: the owner-reply half below can refuse after the observation was
     // written, and that refusal has to take the observation with it (#664's discipline).
-    return this.db.txDecision(() => {
+    let enqueued = false;
+    const decided: Decision<TurnMaterialization> = this.db.txDecision(() => {
       const row = this.db.get<{
         binding_generation: number;
         target_binding_id: string;
@@ -1858,11 +1934,15 @@ export class ConversationTurnCoordinator {
           evidenceDigest: receipt.evidenceDigest,
           reasonCode: receipt.reasonCode,
         },
+        replyText,
         handlerRunning: (source) => turnHandlerRunning(this.db, source.channel, source.nonce),
       });
       if (!reply.allowed) return deny(reply.reasonCode, reply.message, reply.evidence);
+      enqueued = reply.value.status === "ENQUEUED";
       return observed;
     });
+    if (decided.allowed && enqueued) this.#announceOwnerReply();
+    return decided;
   }
 
   /**

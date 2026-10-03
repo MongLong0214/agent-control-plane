@@ -6,6 +6,11 @@ import { decode } from "nostr-tools/nip19";
 import { makeAuthEvent } from "nostr-tools/nip42";
 import { finalizeEvent, getPublicKey, validateEvent, verifyEvent } from "nostr-tools/pure";
 
+import {
+  type OwnerReplyPublication,
+  type OwnerReplySignedEvent,
+  redeemOwnerReplyPublication,
+} from "../conversation/owner-reply-outbox.ts";
 import type { BuzzPeerBinding } from "../ingress/buzz-message.ts";
 
 /**
@@ -397,7 +402,7 @@ export interface BuzzMentionEvent {
 }
 
 /**
- * What the admission seam did with one envelope, in the only four answers this subscriber can act
+ * What the admission seam did with one envelope, in the only five answers this subscriber can act
  * on differently.
  *
  * Only the two **durable** answers are cursor-trusted, and the split between `REFUSED` and the
@@ -413,8 +418,19 @@ export interface BuzzMentionEvent {
  * So a refusal is a statement about **one event** and never about where the window should be. It
  * is still deterministic — asking again produces the same refusal — which is why it does not
  * reconnect either; it simply costs nothing and changes nothing.
+ *
+ * `PRECEDES_BINDING` is the one refusal that is cursor-trusted: the event was signed before the
+ * addressed role's current binding generation was created, so it was never this binding's, and
+ * the window it moves to is earlier than anything this binding can be handed. Without the advance,
+ * a subscriber whose window was never set — a new identity, a new room — would ask for the room's
+ * whole history again on every reconnect.
  */
-export type BuzzMentionAdmission = "DURABLE" | "ALREADY_DURABLE" | "REFUSED" | "RETRY";
+export type BuzzMentionAdmission =
+  | "DURABLE"
+  | "ALREADY_DURABLE"
+  | "REFUSED"
+  | "RETRY"
+  | "PRECEDES_BINDING";
 
 /** One verified event, addressed, on its way to the admission seam. */
 export interface BuzzMentionAdmissionRequest {
@@ -776,6 +792,12 @@ type BuzzMentionRejection =
    * bucket needs the seam to pass its code through, which this surface does not receive.
    */
   | "admission-already-durable"
+  /**
+   * The sink answered `PRECEDES_BINDING`: the event was signed before the addressed role's binding
+   * generation was created. The one count for that refusal — nothing writes an audit row per event,
+   * because a first subscription can be handed a room's whole history.
+   */
+  | "admission-precedes-binding"
   | "frame-too-large"
   | "frame-not-json"
   | "frame-not-a-message"
@@ -823,10 +845,11 @@ export interface BuzzMentionCounters {
    * Frames the seam made newly durable — `DURABLE`, and nothing else.
    *
    * Narrowed from "produced an admission attempt", which was true of all four answers and so
-   * could not tell a delivery from a refusal. The other three each carry their own reason below,
+   * could not tell a delivery from a refusal. The other four each carry their own reason below,
    * because every one of them is a frame that arrived and did not newly reach a session, and they
    * call for different repairs: a refusal is about authority, a retry is about the role's peer
-   * being down, and an already-durable is about a reconnect asking for the boundary event again.
+   * being down, an already-durable is about a reconnect asking for the boundary event again, and a
+   * precedes-binding is history from before the role's binding generation.
    */
   readonly admitted: number;
   /**
@@ -858,7 +881,7 @@ class FrameTally {
 
   record(outcome: BuzzMentionFrameOutcome): void {
     this.#framesHandled += 1;
-    // `DURABLE` and nothing else. Three of the four answers are not deliveries, and an earlier
+    // `DURABLE` and nothing else. Four of the five answers are not deliveries, and an earlier
     // version of this line excluded only `REFUSED` — which left `RETRY` reporting a delivery while
     // the role's peer was down, and `ALREADY_DURABLE` incrementing once per reconnect for one
     // message. A merge-gate review measured both. `health.json` is the one place an operator looks
@@ -898,6 +921,16 @@ interface SubscriptionDeps {
   readonly openSocket: BuzzRelaySocketFactory;
   readonly scheduler: BuzzSubscriberScheduler;
   readonly reportRoleNotHeld: BuzzMentionRoleNotHeldReporter;
+  /** Told each time a connection authenticates, so a sender can retry what waited for it (#1036). */
+  readonly authenticated: () => void;
+}
+
+/** A publish waiting for the relay's `OK`, tied to the connection it was sent on. */
+interface PendingPublish {
+  readonly generation: number;
+  readonly timer: number;
+  readonly answer: Promise<BuzzPublishAck>;
+  readonly settle: (ack: BuzzPublishAck) => void;
 }
 
 /**
@@ -947,6 +980,8 @@ class BuzzMentionSubscription {
   /** Frames are handled one at a time; a second must not overtake the first's admission. */
   #queue: Promise<void> = Promise.resolve();
   readonly #tally = new FrameTally();
+  /** Replies sent on this identity's connection and not yet answered, by event id (#1036). */
+  readonly #publishes = new Map<string, PendingPublish>();
 
   constructor(
     deps: SubscriptionDeps,
@@ -966,6 +1001,121 @@ class BuzzMentionSubscription {
 
   get subscriptionId(): string {
     return this.#subscriptionId;
+  }
+
+  get pubkey(): string {
+    return this.#pubkey;
+  }
+
+  get rooms(): readonly string[] {
+    return this.#rooms;
+  }
+
+  /** Authenticated and subscribed on a live connection: the state in which the relay takes an EVENT. */
+  get ready(): boolean {
+    return this.#isCurrent(this.#generation) && this.#subscribed;
+  }
+
+  /**
+   * Signs the owner reply a publication describes, as this identity. The template is built here
+   * from the publication; a plain copy is returned, never the key.
+   */
+  signOwnerReply(publication: OwnerReplyPublication): BuzzSignedEvent | null {
+    if (publication.intent !== null || publication.signer !== this.#pubkey) return null;
+    if (!this.#rooms.includes(publication.room)) return null;
+    const signed = finalizeEvent(
+      {
+        kind: BUZZ_MENTION_KIND,
+        created_at: publication.createdAt,
+        tags: ownerReplyTags(publication),
+        content: publication.content,
+      },
+      this.#secretKey,
+    );
+    return {
+      id: signed.id,
+      pubkey: signed.pubkey,
+      created_at: signed.created_at,
+      kind: signed.kind,
+      tags: signed.tags.map((tag) => [...tag]),
+      content: signed.content,
+      sig: signed.sig,
+    };
+  }
+
+  /**
+   * Sends a publication's recorded event on this identity's live connection, once `#isOwnerReply`
+   * holds for it against `recorded`, the turn's intent as storage held it when the publication was
+   * spent, and waits for the relay's verdict on it. What goes out is the stored event.
+   *
+   * A second publish of an id still waiting shares the first one's answer rather than sending
+   * again. A connection that is not authenticated sends nothing and answers `UNAVAILABLE`, and so
+   * does one that ends before the relay answers. The relay may or may not hold the event then; the
+   * caller resends the same event, and the relay keeps one copy of an id.
+   *
+   * The verdict is read on this connection's frame queue, behind any mention admission still
+   * running, so a slow admission can turn a verdict into a `TIMEOUT`. The resend that follows is
+   * the same event.
+   */
+  publishOwnerReply(
+    publication: OwnerReplyPublication,
+    recorded: OwnerReplySignedEvent | null,
+    timeoutMs: number,
+  ): Promise<BuzzPublishAck> {
+    const event = publication.intent;
+    if (event === null || recorded === null || !this.#isOwnerReply(publication, event, recorded)) {
+      return Promise.resolve({ status: "UNAUTHORIZED" });
+    }
+    return this.#publish(recorded, timeoutMs);
+  }
+
+  /**
+   * The publication's event is the intent storage holds for its turn now, id and bytes, and is this
+   * identity's validly signed reply, to its room and anchor, with its text (R1056-01).
+   */
+  #isOwnerReply(publication: OwnerReplyPublication, event: BuzzSignedEvent, recorded: BuzzSignedEvent): boolean {
+    if (event.id !== recorded.id || eventFrame(event) !== eventFrame(recorded)) return false;
+    if (publication.signer !== this.#pubkey || event.pubkey !== this.#pubkey) return false;
+    if (!this.#rooms.includes(publication.room)) return false;
+    if (event.kind !== BUZZ_MENTION_KIND || event.content !== publication.content) return false;
+    if (JSON.stringify(event.tags) !== JSON.stringify(ownerReplyTags(publication))) return false;
+    // `verifyEvent` marks the object it checks, so it checks a copy.
+    return verifyEvent({ ...event, tags: event.tags.map((tag) => [...tag]) });
+  }
+
+  #publish(event: BuzzSignedEvent, timeoutMs: number): Promise<BuzzPublishAck> {
+    if (!this.ready) return Promise.resolve({ status: "UNAVAILABLE" });
+    const waiting = this.#publishes.get(event.id);
+    if (waiting !== undefined) return waiting.answer;
+    const generation = this.#generation;
+    let settle: (ack: BuzzPublishAck) => void = () => undefined;
+    const answer = new Promise<BuzzPublishAck>((resolve) => {
+      settle = resolve;
+    });
+    const timer = this.#deps.scheduler.setTimer(timeoutMs, () => {
+      this.#settlePublish(event.id, { status: "TIMEOUT" });
+    });
+    this.#publishes.set(event.id, { generation, timer, answer, settle });
+    try {
+      this.#send(generation, JSON.stringify(["EVENT", event]));
+    } catch {
+      // A socket that refuses the write has not sent anything, and says so now rather than at the timeout.
+      this.#settlePublish(event.id, { status: "UNAVAILABLE" });
+    }
+    return answer;
+  }
+
+  #settlePublish(id: string, ack: BuzzPublishAck): void {
+    const waiting = this.#publishes.get(id);
+    if (waiting === undefined) return;
+    this.#publishes.delete(id);
+    this.#deps.scheduler.clearTimer(waiting.timer);
+    waiting.settle(ack);
+  }
+
+  /** A connection that ends takes its unanswered publishes with it. */
+  #abandonPublishes(): void {
+    for (const id of [...this.#publishes.keys()]) this.#settlePublish(id, { status: "UNAVAILABLE" });
   }
 
   open(): void {
@@ -1056,6 +1206,7 @@ class BuzzMentionSubscription {
     this.#generation = 0;
     this.#subscribed = false;
     this.#authEventId = null;
+    this.#abandonPublishes();
     // The adapter's own retire path: listeners off, socket closed once, and deliberately no
     // notification back — this drop *is* the subscriber's decision, and being told about it would
     // schedule a reconnect for a connection the subscriber itself just ended.
@@ -1074,6 +1225,7 @@ class BuzzMentionSubscription {
     this.#generation = 0;
     this.#subscribed = false;
     this.#authEventId = null;
+    this.#abandonPublishes();
     if (this.#stopped || this.#timer !== null) return;
     const step = Math.min(this.#attempt, RELAY_RECONNECT_BACKOFF_MS.length - 1);
     const delay = RELAY_RECONNECT_BACKOFF_MS[step] ?? 30_000;
@@ -1225,7 +1377,15 @@ class BuzzMentionSubscription {
       return rejected("frame-not-a-message");
     }
     const id = frame[1];
-    if (id !== this.#authEventId) return ACCEPTED;
+    if (id !== this.#authEventId) {
+      // #1036. The relay's verdict on a reply this connection sent, when it is one. A verdict that
+      // arrives on a later connection than the send is not taken: that send was already answered
+      // `UNAVAILABLE` when its connection ended.
+      if (this.#publishes.get(id)?.generation === generation) {
+        this.#settlePublish(id, publishAckOf(frame[2], frame[3]));
+      }
+      return ACCEPTED;
+    }
     if (frame[2] !== true) {
       this.#reconnect(generation);
       return rejected("auth-refused");
@@ -1247,6 +1407,7 @@ class BuzzMentionSubscription {
     };
     if (this.#since !== null) filter["since"] = this.#since;
     this.#send(generation, JSON.stringify(["REQ", this.#subscriptionId, filter]));
+    this.#deps.authenticated();
     return ACCEPTED;
   }
 
@@ -1418,13 +1579,117 @@ class BuzzMentionSubscription {
     // *up* is what the outer `Math.max` refuses — the mark only ever moves forward.
     const claimed = Math.min(event.created_at, this.#deps.scheduler.nowSeconds());
     this.#since = Math.max(this.#since ?? 0, claimed);
-    // Both remaining answers advance the mark — a replay must not be re-requested forever — and
-    // only what they are *called* differs. `DURABLE` is the delivery; `ALREADY_DURABLE` is the
-    // boundary event arriving again because `since` is inclusive.
+    // Every remaining answer advances the mark — a replay must not be re-requested forever, and an
+    // event signed before the role's binding is refused again on every request — and only what they
+    // are *called* differs. `DURABLE` is the delivery; `ALREADY_DURABLE` is the boundary event
+    // arriving again because `since` is inclusive; `PRECEDES_BINDING` is history from before the
+    // binding, whose refusal is terminal. It keeps the connection, like every deterministic answer.
     if (admission === "ALREADY_DURABLE") return { rejected: "admission-already-durable", admission };
+    if (admission === "PRECEDES_BINDING") return { rejected: "admission-precedes-binding", admission };
     return { rejected: null, admission };
   }
 }
+
+/** A signed Nostr event, exactly as it goes on the wire. */
+export interface BuzzSignedEvent {
+  readonly id: string;
+  readonly pubkey: string;
+  readonly created_at: number;
+  readonly kind: number;
+  readonly tags: readonly (readonly string[])[];
+  readonly content: string;
+  readonly sig: string;
+}
+
+/**
+ * What became of one publish.
+ *
+ * `ACCEPTED`, `DUPLICATE` and `REFUSED` are the relay's NIP-01 `OK` verdict reduced to a fixed
+ * category. The relay's own text never leaves this module: the relay chooses it, so it may carry
+ * anything at all (R1056-04). Keeping a truncated copy of it, or its prefix, was ruled out rather
+ * than kept, because the relay chooses those too. `TIMEOUT` means no verdict came within the bound. `UNAVAILABLE`
+ * means the signer had no authenticated connection, or lost it before the relay answered.
+ * `UNAUTHORIZED` means the publication was not an issued one, or its event is not the stored
+ * owner reply it claims to be.
+ */
+export type BuzzPublishAck =
+  | { readonly status: "ACCEPTED" }
+  | { readonly status: "DUPLICATE" }
+  | { readonly status: "REFUSED"; readonly category: "REFUSED_RATE_LIMIT" | "REFUSED_OTHER" }
+  | { readonly status: "TIMEOUT" }
+  | { readonly status: "UNAVAILABLE" }
+  | { readonly status: "UNAUTHORIZED" };
+
+/** The relay's `OK`, as the category this module hands out. */
+const publishAckOf = (accepted: boolean, message: string): BuzzPublishAck => {
+  if (message.startsWith("duplicate:")) return { status: "DUPLICATE" };
+  if (accepted) return { status: "ACCEPTED" };
+  return { status: "REFUSED", category: message.startsWith("rate-limited:") ? "REFUSED_RATE_LIMIT" : "REFUSED_OTHER" };
+};
+
+/** The EVENT frame `event` goes out in, its fields in one fixed order: the bytes the relay receives. */
+const eventFrame = (event: BuzzSignedEvent): string => JSON.stringify(["EVENT", {
+  id: event.id,
+  pubkey: event.pubkey,
+  created_at: event.created_at,
+  kind: event.kind,
+  tags: event.tags,
+  content: event.content,
+  sig: event.sig,
+}]);
+
+/** An owner reply's tags: the room, and the event it answers, in the shape the live relay writes. */
+const ownerReplyTags = (publication: OwnerReplyPublication): string[][] => [
+  ["h", publication.room],
+  ["e", publication.replyToEventId, "", "reply"],
+];
+
+/**
+ * Publishing as the identities this subscriber holds, over their own connections (#1036).
+ *
+ * The owner-reply consumer's way out to the relay. It is not a second client. Each identity's
+ * socket is already authenticated as that identity (NIP-42), so a reply sent on it is accepted as
+ * that identity's. The key never leaves this module: callers get signatures, not secrets.
+ *
+ * It signs and sends owner replies and nothing else (R1056-01). Both calls take an
+ * `OwnerReplyPublication` that the owner-reply outbox issued from a stored item, and that the
+ * call spends. The template and the event come from that publication, never from the caller, and
+ * are checked here against its text, signer, room and the event it answers.
+ *
+ * The `buzz messages send` CLI that `BuzzAdapter` delivers through was decided against for owner
+ * replies: its invocation takes a channel, content and mentions, and no reply tag.
+ */
+export interface BuzzReplyPublisher {
+  readonly relayUrl: string | null;
+  /** The rooms an identity this daemon holds subscribes to, or `null` for one it does not hold. */
+  roomsOf(pubkey: string): readonly string[] | null;
+  /** Whether that identity's connection has authenticated, so the relay will take an event on it. */
+  ready(pubkey: string): boolean;
+  /**
+   * Signs the reply an issued publication with no recorded intent describes. `null` when the
+   * publication is not an issued one, already has an intent, or names an identity or room this
+   * daemon does not hold.
+   */
+  signOwnerReply(publication: OwnerReplyPublication): BuzzSignedEvent | null;
+  /**
+   * Sends an issued publication's recorded event on its signer's connection, and resolves with the
+   * relay's verdict or the lack of one. Anything but that exact, validly signed reply, equal in id
+   * and bytes to the intent storage holds for its turn when it is sent, is `UNAUTHORIZED` and is
+   * not sent.
+   */
+  publishOwnerReply(publication: OwnerReplyPublication, timeoutMs: number): Promise<BuzzPublishAck>;
+  /** Called after any identity's connection authenticates: at startup and after every reconnect. */
+  onAuthenticated(listener: () => void): () => void;
+}
+
+const NO_REPLY_PUBLISHER: BuzzReplyPublisher = Object.freeze({
+  relayUrl: null,
+  roomsOf: () => null,
+  ready: () => false,
+  signOwnerReply: () => null,
+  publishOwnerReply: () => Promise.resolve({ status: "UNAVAILABLE" } as const),
+  onAuthenticated: () => () => undefined,
+});
 
 /** What a started subscriber offers its caller, and what a disabled one offers instead. */
 export interface BuzzMentionSubscriberHandle {
@@ -1462,6 +1727,8 @@ export interface BuzzMentionSubscriberHandle {
   readonly identityRooms: readonly BuzzSubscriberIdentityRooms[];
   /** Settles once every frame delivered so far has been handled. For tests; production ignores it. */
   settled(): Promise<void>;
+  /** Publishing as these identities, for the owner-reply consumer (#1036). */
+  readonly replies: BuzzReplyPublisher;
   close(): void;
 }
 
@@ -1480,6 +1747,7 @@ const DISABLED: BuzzMentionSubscriberHandle = {
   roleKeys: [],
   rooms: [],
   identityRooms: [],
+  replies: NO_REPLY_PUBLISHER,
   settled: () => Promise.resolve(),
   close: () => {
     /* nothing was opened */
@@ -1521,7 +1789,20 @@ export const startBuzzMentionSubscriber = (
     openSocket: options.openSocket ?? nativeRelaySocketFactory,
     scheduler: options.scheduler ?? nativeSubscriberScheduler(),
     reportRoleNotHeld: options.reportRoleNotHeld ?? nativeRoleNotHeldReporter,
+    // On a later microtask, so a listener never runs inside this connection's frame handling.
+    authenticated: () => {
+      for (const listener of authenticatedListeners) {
+        queueMicrotask(() => {
+          try {
+            listener();
+          } catch {
+            /* a listener's failure is its own; the connection carries on */
+          }
+        });
+      }
+    },
   };
+  const authenticatedListeners = new Set<() => void>();
 
   const seenPaths = new Set<string>();
   const seenFiles = new Set<string>();
@@ -1593,6 +1874,10 @@ export const startBuzzMentionSubscriber = (
   // The original error is rethrown rather than wrapped. The operator needs the constructor's own
   // failure — a relay refusal, a bad URL, a runtime with no `WebSocket` — and an unwind error in
   // its place would report that cleanup happened while hiding why startup refused at all.
+  /** The subscription that holds an identity, for publishing as it (#1036). */
+  const holding = (pubkey: string): BuzzMentionSubscription | null =>
+    prepared.find((subscription) => subscription.pubkey === pubkey) ?? null;
+
   try {
     for (const subscription of prepared) subscription.open();
   } catch (err) {
@@ -1625,6 +1910,29 @@ export const startBuzzMentionSubscriber = (
     identityRooms,
     settled: async () => {
       for (const subscription of prepared) await subscription.settled();
+    },
+    replies: {
+      relayUrl: options.config.relayUrl,
+      roomsOf: (pubkey) => holding(pubkey)?.rooms ?? null,
+      ready: (pubkey) => holding(pubkey)?.ready ?? false,
+      signOwnerReply: (value) => {
+        const redeemed = redeemOwnerReplyPublication(value);
+        return redeemed === null ? null : holding(redeemed.publication.signer)?.signOwnerReply(redeemed.publication) ?? null;
+      },
+      publishOwnerReply: (value, timeoutMs) => {
+        // Spent and checked against storage here, with nothing awaited before the frame is written.
+        const redeemed = redeemOwnerReplyPublication(value);
+        const subscription = redeemed === null ? null : holding(redeemed.publication.signer);
+        return redeemed === null || subscription === null
+          ? Promise.resolve({ status: "UNAUTHORIZED" })
+          : subscription.publishOwnerReply(redeemed.publication, redeemed.recorded, timeoutMs);
+      },
+      onAuthenticated: (listener) => {
+        authenticatedListeners.add(listener);
+        return () => {
+          authenticatedListeners.delete(listener);
+        };
+      },
     },
     close: () => {
       for (const subscription of prepared) subscription.close();

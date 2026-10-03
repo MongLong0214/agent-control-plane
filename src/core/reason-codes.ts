@@ -460,6 +460,16 @@ export const ReasonCode = {
   BUZZ_PEER_TARGET_NOT_BOUND_CTO: "BUZZ_PEER_TARGET_NOT_BOUND_CTO",
   /** #1038 — a CEO-authored envelope that arrived on a room other than the addressed CTO's project channel. */
   BUZZ_PEER_CHANNEL_MISMATCH: "BUZZ_PEER_CHANNEL_MISMATCH",
+  /**
+   * A role-addressed Buzz mention, from the owner or the CEO as a peer, signed before the
+   * addressed role's current binding generation was created.
+   *
+   * The relay's history holds every mention ever sent to a channel identity, and a subscriber
+   * opening for the first time — a new identity, a new room — asks for all of it. Such an event
+   * was never addressed to this generation, so it is refused, and the refusal is terminal: asking
+   * again gives the same answer. Not a staleness code, because nothing re-derived would admit it.
+   */
+  BUZZ_MENTION_PRECEDES_BINDING: "BUZZ_MENTION_PRECEDES_BINDING",
 
   // --- canonical turns -----------------------------------------------------
   /**
@@ -641,6 +651,31 @@ export const ReasonCode = {
    */
   CONVERSATION_TURN_REPLY_IN_FLIGHT: "CONVERSATION_TURN_REPLY_IN_FLIGHT",
   /**
+   * An owner-reply item (#1036) is addressed to a channel this daemon has no reply transport for.
+   * Telegram is the case on a deployment without ACP Telegram ingress. The item stays `PENDING`:
+   * it is never dropped, and it is never sent through another channel instead.
+   */
+  OWNER_REPLY_UNDELIVERABLE_NO_TRANSPORT: "OWNER_REPLY_UNDELIVERABLE_NO_TRANSPORT",
+  /**
+   * An owner-reply item names no Buzz channel identity this daemon holds, so there is nothing to
+   * sign the reply as. The identity is the one the owner's message mentioned. A reply signed by a
+   * different identity would answer as a role the owner did not ask.
+   */
+  OWNER_REPLY_IDENTITY_UNKNOWN: "OWNER_REPLY_IDENTITY_UNKNOWN",
+  /** The identity that would sign an owner reply is not subscribed to the room the item names. */
+  OWNER_REPLY_WRONG_ROOM: "OWNER_REPLY_WRONG_ROOM",
+  /**
+   * An owner-reply item carries no reply text, or text whose digest is not the receipt's
+   * evidence digest. A reply must be the text the receipt proved, and nothing else.
+   */
+  OWNER_REPLY_BODY_UNAVAILABLE: "OWNER_REPLY_BODY_UNAVAILABLE",
+  /** The relay answered an owner reply's publish with `OK false`. The item stays `PENDING` and retries. */
+  OWNER_REPLY_RELAY_REFUSED: "OWNER_REPLY_RELAY_REFUSED",
+  /** The relay did not answer an owner reply's publish within its bound. The item stays `PENDING` and retries. */
+  OWNER_REPLY_RELAY_TIMEOUT: "OWNER_REPLY_RELAY_TIMEOUT",
+  /** The signer's relay connection went away before the relay answered. The item stays `PENDING` and retries. */
+  OWNER_REPLY_RELAY_UNAVAILABLE: "OWNER_REPLY_RELAY_UNAVAILABLE",
+  /**
    * A reconciled receipt names a different target binding than the one this turn was claimed
    * against. Kept apart from the generation/runtime checks because it is a distinct fact: which
    * Hermes conversation this turn belongs to, not which execution of it.
@@ -761,6 +796,13 @@ export const ReasonCode = {
   SCHEMA_MIGRATION_NOT_APPROVED: "SCHEMA_MIGRATION_NOT_APPROVED",
   FINALIZATION_ATTEMPT_STALE: "FINALIZATION_ATTEMPT_STALE",
   FINALIZATION_COMPENSATION_REQUIRED: "FINALIZATION_COMPENSATION_REQUIRED",
+  /**
+   * A sealed rollback pair whose database image the live database has moved past, or one sealed
+   * before pairs recorded where their image stood (SSOT U5). Applying it would rewind the database
+   * to the seal and discard every write since. Staleness, not a fault in the pair: the answer is a
+   * fresh pair sealed from the stopped current database, never a repair of this one.
+   */
+  ROLLBACK_PAIR_STALE_DATABASE: "ROLLBACK_PAIR_STALE_DATABASE",
 } as const;
 
 export type ReasonCode = (typeof ReasonCode)[keyof typeof ReasonCode];
@@ -803,6 +845,7 @@ export const STALENESS_REASON_CODES: ReadonlySet<ReasonCode> = new Set([
   ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
   ReasonCode.REGISTERED_SET_GENERATION_MISMATCH,
   ReasonCode.ROLE_PEER_STALE,
+  ReasonCode.ROLLBACK_PAIR_STALE_DATABASE,
   ReasonCode.SNAPSHOT_STALE,
   ReasonCode.WRITE_BINDING_GENERATION_STALE,
 ]);

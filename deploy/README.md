@@ -278,6 +278,15 @@ inventory and every file digest, the declared schema, runtime and service identi
 member is a regular non-symlink file, and that every member is still inside the pair root after
 its path is resolved.
 
+The validation and the rollback itself run in the installer's **own checkout's**
+`dist/deploy/rollback-pair.js`, not the deployment's: the deployment's is the runtime being
+replaced, a deployment built before a check would skip it, and a rollback into an older generation
+installs that generation's copy. The installer first asks that build (`rollback-pair.js guards`)
+whether it refuses a pair the live database has moved past, and stops there if it does not. Run
+from inside a deployment that a rollback took back to such a generation, the installer therefore
+refuses; run the next rollback from a checkout built with the check, with
+`--app-root <deployment>`.
+
 Seal a pair with `node dist/deploy/rollback-pair.js seal …` — run
 `node dist/deploy/rollback-pair.js --help` for its flags. It states every identity on the command
 line rather than reading any of it from the host, so the same command seals the generation being

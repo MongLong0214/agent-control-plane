@@ -1192,6 +1192,9 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   INBOUND_OVERRIDE_AUTHORITY_IMMUTABLE: ReasonCode.CONFLICT,
   INGRESS_OVERRIDE_CLAIM_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
   INBOUND_TURN_CLAIM_IDENTITY_IMMUTABLE: ReasonCode.CONFLICT,
+  // #1036 — an owner reply's recorded intent is found by its key, so moving the key is a conflict
+  // with the row that holds it, as rewriting its payload is.
+  INBOUND_OWNER_REPLY_KEY_IMMUTABLE: ReasonCode.CONFLICT,
   // The canonical-turn ledger, which had no entries here at all: every one of its denials came
   // out of `db.tx` as a raw Error rather than as a typed refusal, so a claim whose source insert
   // tripped a guard threw instead of denying. The guards are what this ledger is *for*, and the

@@ -175,12 +175,13 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string }> = 
   {
     // #1036: the receipt observation and settlement are written through `#observeVerified`, then
     // the owner-reply half can refuse — a `tx` here would keep a completion whose reply was never
-    // written.
+    // written. The opener assigns the decision so the enqueue wake can fire after the commit.
     label: "ConversationTurnCoordinator.#settleFromReceipt",
     file: "conversation/turn-coordinator.ts",
     anchor:
       "written, and that refusal has to take the observation with it (#664's discipline).\n" +
-      "    return this.db.txDecision(() => {",
+      "    let enqueued = false;\n" +
+      "    const decided: Decision<TurnMaterialization> = this.db.txDecision(() => {",
   },
   {
     label: "IngressGuard.claimOwnerBatch",

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   cpSync,
@@ -15,14 +15,17 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import Database from "better-sqlite3";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { Db } from "../../src/db/database.ts";
 import { parseLauncherBinding, sealRollbackPair, type SealedRollbackPair } from "../../src/deploy/rollback-pair.ts";
 import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { stableFixtureBinDir, stableFixtureExecutable, stableFixtureLink } from "../helpers/stable-fixture-executable.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -75,31 +78,28 @@ interface CommandResult {
   stderr: string;
 }
 
-const writeExecutable = (path: string, content: string): void => {
-  writeFileSync(path, content, { mode: 0o700 });
-  chmodSync(path, 0o700);
+/**
+ * Overrides one PATH-resolved name for a single test by prepending a stable, content-hashed
+ * shim directory ahead of the harness's own (also stable, shared-across-tests) `bin`. `bin`
+ * itself must never be written into after `makeHarness` creates it — it is shared by every test
+ * that calls `makeHarness`, so two tests wanting different content for the same name (e.g. a
+ * `sleep` that exits immediately instead of the default short delay) need their own directory,
+ * not a rewrite of the shared one.
+ */
+const overridePath = (harness: InstallerHarness, name: string, script: string): void => {
+  const shimDirectory = dirname(stableFixtureExecutable(name, script));
+  harness.env["PATH"] = `${shimDirectory}:${harness.env["PATH"]}`;
 };
 
 const makeHarness = (): InstallerHarness => {
   const home = tempDir("acp-launchd-home-");
-  const bin = join(home, "fake-bin");
-  mkdirSync(bin, { recursive: true, mode: 0o700 });
-  chmodSync(bin, 0o700);
-
-  const launchLog = join(home, "launchctl.log");
-  const securityLog = join(home, "security.log");
-  const launcherEnvLog = join(home, "launcher-env.log");
-  const stateAdminLog = join(home, "state-admin.log");
-  const loaded = join(home, "launchd.loaded");
-  const stdoutLog = join(home, ".agent-control-plane", "agentcpd.out.log");
-  const lock = join(home, ".agent-control-plane", "agentcpd.lock");
-  const launchctl = join(bin, "launchctl");
-  const security = join(bin, "security");
-  const node = join(bin, "node-wrapper");
-
-  writeExecutable(
-    launchctl,
-    `#!/bin/bash
+  // `bin` is a stable, content-hashed directory shared across every call to `makeHarness`, not a
+  // fresh `fake-bin` subdirectory of `home`: the scripts below are constant text (every per-run
+  // value they need travels through an env var the harness sets, never through the script
+  // itself), so writing a fresh copy into a fresh tempDir on every test only minted a new
+  // executable inode per test for syspolicyd's provenance table, which cannot be pruned. See
+  // tests/helpers/stable-fixture-executable.ts.
+  const launchctlScript = `#!/bin/bash
 set -euo pipefail
 printf '%s\\n' "$*" >> "$ACP_LAUNCHCTL_LOG"
 case "\${1:-}" in
@@ -171,13 +171,10 @@ case "\${1:-}" in
     exit 64
     ;;
 esac
-`,
-  );
+`;
   // Shorten start_job's one-second polls while leaving the two-second stop-lock fake observable.
-  writeExecutable(join(bin, "sleep"), "#!/bin/bash\n/bin/sleep 0.1\n");
-  writeExecutable(
-    security,
-    `#!/bin/bash
+  const sleepScript = "#!/bin/bash\n/bin/sleep 0.1\n";
+  const securityScript = `#!/bin/bash
 set -euo pipefail
 printf '%s\\n' "$*" >> "$ACP_SECURITY_LOG"
 [[ "\${1:-}" == "find-generic-password" ]] || exit 64
@@ -225,11 +222,8 @@ case "$account" in
     ;;
   *) printf 'fake-keychain-value\\n' ;;
 esac
-`,
-  );
-  writeExecutable(
-    node,
-    `#!/bin/bash
+`;
+  const nodeWrapperScript = `#!/bin/bash
 set -euo pipefail
 target="\${1:-}"
 if [[ "$target" == *"state-admin.js" ]]; then
@@ -292,23 +286,23 @@ if [[ "$target" == *"agentcpd.js" ]]; then
   # to carry had already gone stale twice: it said the canonical group ran 17-24 when it runs 17-22,
   # put lsof at 25-26 when it is 23-24, and gave Hermes an overlapping 26-33. A comment restating a
   # derived position is the second authority the derivation was introduced to remove.
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
-    "\${ACP_TELEGRAM_BOT_TOKEN-}" "\${ACP_TELEGRAM_OWNER_ID-}" \
-    "\${ACP_TELEGRAM_CHAT_ID-}" "\${ACP_TELEGRAM_WEBHOOK_SECRET-}" \
-    "\${BUZZ_PRIVATE_KEY:-<unset>}" "\${ACP_BUZZ_BINARY:-<unset>}" \
-    "\${ACP_CLAUDE_BINARY:-<unset>}" "\${ACP_CODEX_BINARY:-<unset>}" "\${ACP_GROK_BINARY:-<unset>}" \
-    "$(command -v claude || printf '<unresolvable>')" \
-    "$(command -v codex || printf '<unresolvable>')" \
-    "$(command -v grok || printf '<unresolvable>')" \
-    "$(started_of "\${ACP_CLAUDE_BINARY:-}"),$(started_of "\${ACP_CODEX_BINARY:-}"),$(started_of "\${ACP_GROK_BINARY:-}")" \
-    "$(command -v node || printf '<unresolvable>')" \
-    "$(command -v acp-sibling-probe || printf '<unresolvable>')" \
-    "\${ACP_CANONICAL_SESSIONS_JSON-}" "\${ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION-}" \
-    "\${ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH-}" "\${ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256-}" \
-    "\${ACP_CANONICAL_CTO_PEER_PROTOCOL-}" "\${ACP_CANONICAL_CTO_BUZZ_PURPOSE-}" \
-    "$(command -v lsof || printf '<unresolvable>')" "$(lsof_scan)" \
-    "\${ACP_HERMES_LINEAGE_ROOT_DIGEST-}" "\${ACP_HERMES_EXECUTABLE-}" \
-    "\${ACP_HERMES_PROFILE-}" "\${ACP_HERMES_HOME-}" \
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \\
+    "\${ACP_TELEGRAM_BOT_TOKEN-}" "\${ACP_TELEGRAM_OWNER_ID-}" \\
+    "\${ACP_TELEGRAM_CHAT_ID-}" "\${ACP_TELEGRAM_WEBHOOK_SECRET-}" \\
+    "\${BUZZ_PRIVATE_KEY:-<unset>}" "\${ACP_BUZZ_BINARY:-<unset>}" \\
+    "\${ACP_CLAUDE_BINARY:-<unset>}" "\${ACP_CODEX_BINARY:-<unset>}" "\${ACP_GROK_BINARY:-<unset>}" \\
+    "$(command -v claude || printf '<unresolvable>')" \\
+    "$(command -v codex || printf '<unresolvable>')" \\
+    "$(command -v grok || printf '<unresolvable>')" \\
+    "$(started_of "\${ACP_CLAUDE_BINARY:-}"),$(started_of "\${ACP_CODEX_BINARY:-}"),$(started_of "\${ACP_GROK_BINARY:-}")" \\
+    "$(command -v node || printf '<unresolvable>')" \\
+    "$(command -v acp-sibling-probe || printf '<unresolvable>')" \\
+    "\${ACP_CANONICAL_SESSIONS_JSON-}" "\${ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION-}" \\
+    "\${ACP_CANONICAL_EXPECTED_EXECUTOR_REALPATH-}" "\${ACP_CANONICAL_EXPECTED_EXECUTOR_SHA256-}" \\
+    "\${ACP_CANONICAL_CTO_PEER_PROTOCOL-}" "\${ACP_CANONICAL_CTO_BUZZ_PURPOSE-}" \\
+    "$(command -v lsof || printf '<unresolvable>')" "$(lsof_scan)" \\
+    "\${ACP_HERMES_LINEAGE_ROOT_DIGEST-}" "\${ACP_HERMES_EXECUTABLE-}" \\
+    "\${ACP_HERMES_PROFILE-}" "\${ACP_HERMES_HOME-}" \\
     "\${ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY-}" "\${ACP_HERMES_GATEWAY_API_KEY-}" >> "$ACP_LAUNCHER_ENV_LOG"
   # Mirrors the real precondition in src/daemon/agentcpd.ts: a Buzz credential without the
   # ingress pair is a startup error, not a degraded mode. Without this, a launcher that
@@ -321,8 +315,22 @@ if [[ "$target" == *"agentcpd.js" ]]; then
   exit 0
 fi
 exit 90
-`,
-  );
+`;
+  const bin = stableFixtureBinDir({
+    launchctl: launchctlScript,
+    security: securityScript,
+    "node-wrapper": nodeWrapperScript,
+    sleep: sleepScript,
+  });
+  const node = join(bin, "node-wrapper");
+
+  const launchLog = join(home, "launchctl.log");
+  const securityLog = join(home, "security.log");
+  const launcherEnvLog = join(home, "launcher-env.log");
+  const stateAdminLog = join(home, "state-admin.log");
+  const loaded = join(home, "launchd.loaded");
+  const stdoutLog = join(home, ".agent-control-plane", "agentcpd.out.log");
+  const lock = join(home, ".agent-control-plane", "agentcpd.lock");
 
   return {
     home,
@@ -364,9 +372,14 @@ const runInstaller = (
   // is relative to, or the shell resolves nothing and the row measures absence instead.
   cwd?: string,
 ): CommandResult => {
+  // `detached: true` so a timeout group-kills this subtree instead of leaving it behind: orphaned
+  // `install-launchd.sh install` and `fake-bin/security` processes with PPID 1 were observed
+  // outliving a timed-out test here by more than an hour. `boundedSpawnSync` does this only when
+  // asked; its `terminateGroup` docstring says why this site stays synchronous.
   const result = boundedSpawnSync("bash", [command, ...args], {
     encoding: "utf8",
     env: harness.env,
+    detached: true,
     ...(cwd ? { cwd } : {}),
   });
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
@@ -412,15 +425,19 @@ const assertProviderUnresolvable = (harness: InstallerHarness, ...names: string[
   }
 };
 
-const writeProviderCli = (path: string, body: string): string => {
-  writeFileSync(path, body, { mode: 0o755 });
-  chmodSync(path, 0o755);
+/**
+ * An executable at exactly `path`, as a hard link to a cached entry rather than bytes written for
+ * this run: these are executed (through `started_of`, by a launcher run, by the installer), and a
+ * fresh file per run is a fresh executable inode per run for syspolicyd. The link keeps what the
+ * rows measure — a regular file at that path with that realpath — and is measured itself by "the
+ * suite's executable fixture writers" at the end of this file.
+ */
+const writeProviderCli = (path: string, body: string): string =>
   // The path as written, because that is what the installer pins: it records the answer the
   // installing shell gave, which is the PATH entry plus the name and carries whatever spelling
   // that entry had. Returning the canonical path instead would disagree with a correct pin on
   // every host whose temporary directory is itself a link — which macOS's is.
-  return path;
-};
+  stableFixtureLink(path, body);
 
 /** A provider CLI that carries its own interpreter, as a compiled one does. */
 const SELF_CONTAINED_CLI = "#!/bin/sh\nexit 0\n";
@@ -526,6 +543,20 @@ const makeDisposableAppRoot = (): string => {
   return realpathSync(appRoot);
 };
 
+/**
+ * The sealed closure's own interpreter: a shim handing everything to the real one, linked from the
+ * cache like `writeProviderCli`'s. Sealing refuses a symlinked member, which a hard link is not.
+ * The copied `dist` can already hold a `bin/node` an earlier install put there; it is removed first,
+ * because a link cannot land on an existing name and writing through that fresh copy is what
+ * minted an executable inode per run.
+ */
+const writeSealedPairNode = (runtimeRoot: string): string => {
+  mkdirSync(join(runtimeRoot, "bin"), { recursive: true, mode: 0o700 });
+  const node = join(runtimeRoot, "bin", "node");
+  rmSync(node, { force: true });
+  return stableFixtureLink(node, `#!/bin/bash\nexec ${process.execPath} "$@"\n`);
+};
+
 interface PairFixture {
   pair: SealedRollbackPair;
   appRoot: string;
@@ -548,6 +579,8 @@ const sealPairFor = async (
   harness: InstallerHarness,
   appRoot: string,
   generation = "sealed-generation",
+  /** Shapes the sealed runtime closure before it is sealed, as a different generation's would be. */
+  prepareRuntime?: (runtimeRoot: string) => void,
 ): Promise<PairFixture> => {
   const state = join(harness.home, ".agent-control-plane");
   mkdirSync(state, { recursive: true, mode: 0o700 });
@@ -565,13 +598,10 @@ const sealPairFor = async (
   const runtimeRoot = join(source, "runtime");
   cpSync(join(root, "dist"), runtimeRoot, { recursive: true });
   writeFileSync(join(runtimeRoot, GENERATION_MARKER), `${generation}\n`, { mode: 0o600 });
+  prepareRuntime?.(runtimeRoot);
   // The interpreter travels inside the closure, so the rollback runs the sealed one rather than
   // whatever `node` this machine happens to have.
-  mkdirSync(join(runtimeRoot, "bin"), { recursive: true, mode: 0o700 });
-  writeFileSync(join(runtimeRoot, "bin", "node"), `#!/bin/bash\nexec ${process.execPath} "$@"\n`, {
-    mode: 0o755,
-  });
-  chmodSync(join(runtimeRoot, "bin", "node"), 0o755);
+  writeSealedPairNode(runtimeRoot);
 
   const launcherDestination = join(realpathSync(state), "agentcpd-launch.sh");
   const plistDestination = join(
@@ -637,6 +667,87 @@ const structuralFlags = (fixture: PairFixture): string[] => [
   "--expect-node-version",
   fixture.pair.manifest.identity.runtime.nodeVersion,
 ];
+
+const rollbackArgs = (fixture: PairFixture): string[] => [
+  "--pair-id",
+  fixture.pair.pairId,
+  "--expected-index-digest",
+  fixture.pair.indexDigest,
+  ...structuralFlags(fixture),
+];
+
+/**
+ * Turns a copy of this build's runtime closure into one whose rollback coordinator predates the
+ * database high-water check (ACP1058-R1): the check returns at once, and the coordinator no longer
+ * declares it. Everything else is this build's, so it validates and applies the same pair format,
+ * which is what a deployment built before the check does with a pair that records a mark — it
+ * reads past the mark and restores the image. (Also measured outside the suite with an app root
+ * holding a real 115916ce build: the 5e6c1764 installer exited 0 and discarded the write made after
+ * the seal; this installer refused with ROLLBACK_PAIR_STALE_DATABASE and stopped nothing.)
+ *
+ * Anchored on the compiled text, and the anchor is required: a compiled shape this no longer
+ * matches fails here rather than quietly leaving the check in and letting every row below pass.
+ */
+const predateHighWaterCheck = (runtimeRoot: string): void => {
+  const coordinator = join(runtimeRoot, "deploy", "rollback-pair.js");
+  const source = readFileSync(coordinator, "utf8");
+  const anchor = "const assertLiveDatabaseAtSeal = (manifest, root) => {";
+  expect(source.split(anchor).length - 1, "the compiled high-water check moved; update this anchor").toBe(1);
+  writeFileSync(
+    coordinator,
+    source
+      .replace(anchor, `${anchor}\n    return;`)
+      .replaceAll("ACP_ROLLBACK_DATABASE_HIGH_WATER", "ACP_ROLLBACK_PREDATES_THE_CHECK"),
+  );
+};
+
+/** What `rollback-pair.js guards` says the coordinator under `appRoot` enforces. */
+const declaredGuards = (appRoot: string): string =>
+  boundedSpawnSync(process.execPath, [join(appRoot, "dist", "deploy", "rollback-pair.js"), "guards"], {
+    encoding: "utf8",
+  }).stdout;
+
+/** One committed write after a seal, the kind the daemon makes every minute it runs. */
+const writeAfterTheSeal = (databasePath: string): number => {
+  const raw = new Database(databasePath);
+  try {
+    raw
+      .prepare("INSERT INTO audit_events (at, kind, evidence_json) VALUES (?, ?, ?)")
+      .run(new Date().toISOString(), "written-after-the-seal", "{}");
+    return raw.prepare("SELECT max(event_id) FROM audit_events").pluck().get() as number;
+  } finally {
+    raw.close();
+  }
+};
+
+/**
+ * Read-write on purpose: a read-only open of a WAL database with no sidecars creates `-wal` and
+ * `-shm` beside it and leaves them, which the snapshot below would report as the refusal's doing.
+ */
+const maxAuditEventId = (databasePath: string): number | null => {
+  const raw = new Database(databasePath);
+  try {
+    return raw.prepare("SELECT max(event_id) FROM audit_events").pluck().get() as number | null;
+  } finally {
+    raw.close();
+  }
+};
+
+/** Every byte a refused rollback could have replaced, as one comparable value. */
+const deploymentSnapshot = (harness: InstallerHarness, appRoot: string, databasePath: string): string => {
+  const state = join(harness.home, ".agent-control-plane");
+  const digest = (path: string): string =>
+    existsSync(path) ? createHash("sha256").update(readFileSync(path)).digest("hex") : "<absent>";
+  return JSON.stringify({
+    database: digest(databasePath),
+    sidecars: readdirSync(state).filter((name) => name.startsWith("state.sqlite")).sort(),
+    generation: digest(join(appRoot, "dist", GENERATION_MARKER)),
+    coordinator: digest(join(appRoot, "dist", "deploy", "rollback-pair.js")),
+    plist: digest(plistPath(harness)),
+    launcher: digest(launcherPath(harness)),
+    stage: existsSync(join(state, "rollback-stage")) ? readdirSync(join(state, "rollback-stage")) : "<absent>",
+  });
+};
 
 /**
  * The repository tree as git sees it: tracked files plus untracked ones that are not ignored.
@@ -779,7 +890,7 @@ describe("launchd deployment artifact", () => {
     const originalPlist = readFileSync(plistPath(harness), "utf8");
     const originalLauncher = readFileSync(launcherPath(harness), "utf8");
     const stateAdminBefore = existsSync(harness.stateAdminLog) ? readFileSync(harness.stateAdminLog, "utf8") : "";
-    writeExecutable(join(harness.bin, "sleep"), "#!/bin/bash\nexit 0\n");
+    overridePath(harness, "sleep", "#!/bin/bash\nexit 0\n");
     harness.env["ACP_BOOTOUT_PRINT_LAG"] = "31";
     writeFileSync(harness.launchLog, "");
 
@@ -808,11 +919,13 @@ describe("launchd deployment artifact", () => {
     const originalRuntime = readFileSync(runtimeNode);
     const originalPlist = readFileSync(plistPath(harness), "utf8");
     const originalLauncher = readFileSync(launcherPath(harness), "utf8");
-    const nextNode = join(harness.bin, "node-new");
-    writeExecutable(nextNode, `${readFileSync(harness.node, "utf8")}\n# changed interpreter generation\n`);
+    const nextNode = stableFixtureExecutable(
+      "node-new",
+      `${readFileSync(harness.node, "utf8")}\n# changed interpreter generation\n`,
+    );
     const nextNodeBefore = readFileSync(nextNode);
     const stateAdminBefore = existsSync(harness.stateAdminLog) ? readFileSync(harness.stateAdminLog, "utf8") : "";
-    writeExecutable(join(harness.bin, "sleep"), "#!/bin/bash\nexit 0\n");
+    overridePath(harness, "sleep", "#!/bin/bash\nexit 0\n");
     harness.env["ACP_BOOTOUT_PRINT_LAG"] = "31";
     writeFileSync(harness.launchLog, "");
 
@@ -839,15 +952,18 @@ describe("launchd deployment artifact", () => {
     const originalNode = readFileSync(join(runtimeDir, "node"));
     const originalPlist = readFileSync(plistPath(harness), "utf8");
     const originalLauncher = readFileSync(launcherPath(harness), "utf8");
-    const nextNode = join(harness.bin, "node-new");
-    writeExecutable(nextNode, `${readFileSync(harness.node, "utf8")}\n# new generation\n`);
-    writeExecutable(join(harness.bin, "cp"), `#!/bin/bash
+    const nextNode = stableFixtureExecutable("node-new", `${readFileSync(harness.node, "utf8")}\n# new generation\n`);
+    overridePath(
+      harness,
+      "cp",
+      `#!/bin/bash
 if [[ "\${@: -1}" == *"/.node."* ]]; then
   printf 'partial' > "\${@: -1}"
   exit 1
 fi
 exec /bin/cp "$@"
-`);
+`,
+    );
     writeFileSync(harness.launchLog, "");
 
     const result = runInstaller(installer, ["upgrade", "--app-root", appRoot, "--node", nextNode], harness);
@@ -867,17 +983,23 @@ exec /bin/cp "$@"
     expect(runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status).toBe(0);
     const runtimeDir = join(appRoot, "dist", "bin");
     const originalNode = readFileSync(join(runtimeDir, "node"));
-    const nextNode = join(harness.bin, "node-new");
-    writeExecutable(nextNode, `${readFileSync(harness.node, "utf8")}\n# new generation\n`);
+    const nextNode = stableFixtureExecutable("node-new", `${readFileSync(harness.node, "utf8")}\n# new generation\n`);
     const modeLog = join(harness.home, "stage-mode.log");
-    writeExecutable(join(harness.bin, "cp"), `#!/bin/bash
+    // `modeLog` is a fresh per-run log path; it travels through an env var so the shim script
+    // text stays constant rather than being interpolated into it per run.
+    harness.env["ACP_CP_SHIM_MODE_LOG"] = modeLog;
+    overridePath(
+      harness,
+      "cp",
+      `#!/bin/bash
 if [[ "\${@: -1}" == *"/.node."* ]]; then
-  stat -f '%Lp' "$(dirname -- "\${@: -1}")" >> "${modeLog}"
+  stat -f '%Lp' "$(dirname -- "\${@: -1}")" >> "$ACP_CP_SHIM_MODE_LOG"
   printf 'partial' > "\${@: -1}"
   exit 1
 fi
 exec /bin/cp "$@"
-`);
+`,
+    );
     chmodSync(runtimeDir, 0o777);
     writeFileSync(harness.launchLog, "");
 
@@ -897,8 +1019,7 @@ exec /bin/cp "$@"
     expect(runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status).toBe(0);
     const runtimeDir = join(appRoot, "dist", "bin");
     const previousNode = readFileSync(join(runtimeDir, "node"));
-    const nextNode = join(harness.bin, "node-new");
-    writeExecutable(nextNode, `${readFileSync(harness.node, "utf8")}\n# new generation\n`);
+    const nextNode = stableFixtureExecutable("node-new", `${readFileSync(harness.node, "utf8")}\n# new generation\n`);
     const upgraded = runInstaller(installer, ["upgrade", "--app-root", appRoot, "--node", nextNode], harness);
     expect(upgraded.status, upgraded.stderr).toBe(0);
     expect(readFileSync(join(runtimeDir, "node"))).not.toEqual(previousNode);
@@ -917,7 +1038,7 @@ exec /bin/cp "$@"
     const originalLauncher = readFileSync(launcherPath(harness), "utf8");
     const originalRuntime = readFileSync(join(appRoot, "dist", "bin", "node"));
     const stateAdminBefore = existsSync(harness.stateAdminLog) ? readFileSync(harness.stateAdminLog, "utf8") : "";
-    writeExecutable(join(harness.bin, "sleep"), "#!/bin/bash\nexit 0\n");
+    overridePath(harness, "sleep", "#!/bin/bash\nexit 0\n");
     harness.env["ACP_BOOTOUT_PRINT_LAG"] = "31";
     writeFileSync(harness.launchLog, "");
 
@@ -943,7 +1064,7 @@ exec /bin/cp "$@"
   it("recovers a maintenance bootout that unregisters beyond the initial recovery observations", () => {
     const harness = makeHarness();
     expect(runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness).status).toBe(0);
-    writeExecutable(join(harness.bin, "sleep"), "#!/bin/bash\nexit 0\n");
+    overridePath(harness, "sleep", "#!/bin/bash\nexit 0\n");
     harness.env["ACP_BOOTOUT_PRINT_LAG"] = "36";
     writeFileSync(harness.launchLog, "");
 
@@ -960,7 +1081,7 @@ exec /bin/cp "$@"
     const harness = makeHarness();
     const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
     expect(installed.status, installed.stderr).toBe(0);
-    writeExecutable(join(harness.bin, "sleep"), "#!/bin/bash\nexit 0\n");
+    overridePath(harness, "sleep", "#!/bin/bash\nexit 0\n");
     harness.env["ACP_BOOTOUT_PRINT_LAG"] = "1000";
     writeFileSync(harness.launchLog, "");
 
@@ -979,7 +1100,7 @@ exec /bin/cp "$@"
     const harness = makeHarness();
     const installed = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node], harness);
     expect(installed.status, installed.stderr).toBe(0);
-    writeExecutable(join(harness.bin, "sleep"), "#!/bin/bash\nexit 0\n");
+    overridePath(harness, "sleep", "#!/bin/bash\nexit 0\n");
     harness.env["ACP_BOOTOUT_PRINT_LAG"] = "31";
     writeFileSync(harness.launchLog, "");
 
@@ -1347,9 +1468,7 @@ exec /bin/cp "$@"
     // succeeds and production silently has no transport at all.
     const userLocalBin = join(harness.home, "user-local-bin");
     mkdirSync(userLocalBin, { recursive: true });
-    const buzzPath = join(userLocalBin, "buzz");
-    writeFileSync(buzzPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-    chmodSync(buzzPath, 0o755);
+    const buzzPath = writeProviderCli(join(userLocalBin, "buzz"), SELF_CONTAINED_CLI);
     harness.env["PATH"] = `${userLocalBin}:${harness.env["PATH"] ?? ""}`;
     harness.env["ACP_BUZZ_INGRESS_SECRET"] = "ingress-secret";
     harness.env["ACP_BUZZ_ALLOWED_ACTORS"] = "actor-one";
@@ -1656,9 +1775,7 @@ exec /bin/cp "$@"
     mkdirSync(versions, { recursive: true });
     const onPath = join(harness.home, "acp-provider-cli-onpath");
     mkdirSync(onPath, { recursive: true });
-    const accepted = join(versions, "1.0.0");
-    writeFileSync(accepted, SELF_CONTAINED_CLI, { mode: 0o755 });
-    chmodSync(accepted, 0o755);
+    const accepted = writeProviderCli(join(versions, "1.0.0"), SELF_CONTAINED_CLI);
     const stable = join(onPath, "claude");
     symlinkSync(accepted, stable);
     harness.env["PATH"] = isolatedInstallerPath(harness, onPath);
@@ -1677,9 +1794,7 @@ exec /bin/cp "$@"
 
     // The updater runs: a new version arrives, the stable name moves to it, and the version this
     // install resolved and accepted is removed.
-    const replacement = join(versions, "2.0.0");
-    writeFileSync(replacement, SELF_CONTAINED_CLI, { mode: 0o755 });
-    chmodSync(replacement, 0o755);
+    const replacement = writeProviderCli(join(versions, "2.0.0"), SELF_CONTAINED_CLI);
     rmSync(stable);
     symlinkSync(replacement, stable);
     rmSync(accepted);
@@ -1885,10 +2000,14 @@ exec /bin/cp "$@"
     const link = join(harness.home, `node-${supplied}`);
     symlinkSync(target, link);
     // Emits both paths the way the real utility emits the one it was handed, so the row measures
-    // suppression of the channel rather than of one particular sentence.
-    writeExecutable(
-      join(harness.bin, "readlink"),
-      `#!/bin/bash\nprintf 'readlink: %s: Permission denied (target %s)\\n' "\${2:-}" "${target}" >&2\nexit 1\n`,
+    // suppression of the channel rather than of one particular sentence. `target` travels through
+    // an env var rather than being interpolated into the script so the shim stays byte-constant
+    // across runs.
+    harness.env["ACP_READLINK_SHIM_TARGET"] = target;
+    overridePath(
+      harness,
+      "readlink",
+      `#!/bin/bash\nprintf 'readlink: %s: Permission denied (target %s)\\n' "\${2:-}" "$ACP_READLINK_SHIM_TARGET" >&2\nexit 1\n`,
     );
 
     const refused = runInstaller(
@@ -2316,14 +2435,103 @@ exec /bin/cp "$@"
     expect(existsSync(harness.loaded)).toBe(false);
   });
 
+  it("ACP1058-R1: refuses a stale pair even when the app root's own coordinator predates the check", async () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    // A deployment built before the check. Its coordinator validates and applies the pair below
+    // without asking whether the live database has moved since the seal.
+    predateHighWaterCheck(join(appRoot, "dist"));
+    expect(declaredGuards(appRoot)).not.toContain("ACP_ROLLBACK_DATABASE_HIGH_WATER");
+    expect(runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status).toBe(0);
+    const fixture = await sealPairFor(harness, appRoot);
+    writeFileSync(join(appRoot, "dist", GENERATION_MARKER), "generation-b\n", { mode: 0o600 });
+    const written = writeAfterTheSeal(fixture.databasePath);
+    const untouched = deploymentSnapshot(harness, appRoot, fixture.databasePath);
+    writeFileSync(harness.launchLog, "");
+
+    const result = runInstaller(
+      installer,
+      ["rollback", "--app-root", appRoot, "--node", harness.node, ...rollbackArgs(fixture)],
+      harness,
+    );
+
+    expect(result.status, "the rollback ran through the app root's own coordinator and rewound the database").not.toBe(0);
+    expect(result.stderr).toContain("ROLLBACK_PAIR_STALE_DATABASE");
+    expect(maxAuditEventId(fixture.databasePath), "the write made after the seal was discarded").toBe(written);
+    expect(deploymentSnapshot(harness, appRoot, fixture.databasePath), "a refused rollback changed something").toBe(
+      untouched,
+    );
+    expect(subcommands(harness.launchLog), "a refused rollback stopped the service").not.toContain("bootout");
+  });
+
+  it("ACP1058-R1: still refuses a stale pair on the next rollback, after one installed a closure that predates the check", async () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    const deploymentInstaller = join(appRoot, "deploy", "install-launchd.sh");
+    expect(runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness).status).toBe(0);
+
+    // The documented invocation — the installer inside the deployment, no --app-root — returning to
+    // a generation built before the check. The database has not moved since that pair was sealed.
+    const older = await sealPairFor(harness, appRoot, "generation-before-the-check", predateHighWaterCheck);
+    const first = runInstaller(deploymentInstaller, ["rollback", "--node", harness.node, ...rollbackArgs(older)], harness);
+    expect(first.status, first.stderr).toBe(0);
+    // The rollback replaced the runtime, its coordinator included: what is installed now is older.
+    expect(readFileSync(join(appRoot, "dist", GENERATION_MARKER), "utf8").trim()).toBe("generation-before-the-check");
+    expect(declaredGuards(appRoot)).not.toContain("ACP_ROLLBACK_DATABASE_HIGH_WATER");
+
+    // A pair sealed now, and then a write the next rollback must not discard.
+    const next = await sealPairFor(harness, appRoot, "generation-next");
+    const written = writeAfterTheSeal(next.databasePath);
+    const untouched = deploymentSnapshot(harness, appRoot, next.databasePath);
+
+    // From this checkout, naming the deployment: the check runs in this checkout's coordinator,
+    // not in the older one the deployment now carries.
+    writeFileSync(harness.launchLog, "");
+    const fromCheckout = runInstaller(
+      installer,
+      ["rollback", "--app-root", appRoot, "--node", harness.node, ...rollbackArgs(next)],
+      harness,
+    );
+    expect(fromCheckout.status, "the second rollback rewound the database through the older coordinator").not.toBe(0);
+    expect(fromCheckout.stderr).toContain("ROLLBACK_PAIR_STALE_DATABASE");
+    expect(maxAuditEventId(next.databasePath)).toBe(written);
+    expect(deploymentSnapshot(harness, appRoot, next.databasePath)).toBe(untouched);
+    expect(subcommands(harness.launchLog)).not.toContain("bootout");
+
+    // From the installer inside the deployment, whose own coordinator is now the older one: it
+    // cannot run the check, so the installer refuses to use it, before anything is stopped.
+    writeFileSync(harness.launchLog, "");
+    const fromDeployment = runInstaller(
+      deploymentInstaller,
+      ["rollback", "--node", harness.node, ...rollbackArgs(next)],
+      harness,
+    );
+    expect(fromDeployment.status, "the second rollback rewound the database through the older coordinator").not.toBe(0);
+    expect(fromDeployment.stderr).toMatch(/does not declare the database high-water check/);
+    expect(maxAuditEventId(next.databasePath)).toBe(written);
+    expect(deploymentSnapshot(harness, appRoot, next.databasePath)).toBe(untouched);
+    expect(subcommands(harness.launchLog)).not.toContain("bootout");
+
+    // The remedy both refusals name works over the older deployment: a pair sealed from the database
+    // as it is now, applied through this checkout, keeps the write.
+    const fresh = await sealPairFor(harness, appRoot, "generation-fresh");
+    const remedied = runInstaller(
+      installer,
+      ["rollback", "--app-root", appRoot, "--node", harness.node, ...rollbackArgs(fresh)],
+      harness,
+    );
+    expect(remedied.status, remedied.stderr).toBe(0);
+    expect(readFileSync(join(appRoot, "dist", GENERATION_MARKER), "utf8").trim()).toBe("generation-fresh");
+    expect(maxAuditEventId(fresh.databasePath)).toBe(written);
+  });
+
   it("rejects a substring-only installer stub", () => {
-    const stub = join(tempDir("acp-launchd-stub-"), "install-launchd.sh");
     const stubText = `#!/bin/bash
 # Usage: install start restart upgrade rollback --pair-id --expected-index-digest
 # find-generic-password render-launchd-plist.mjs
 exit 0
 `;
-    writeExecutable(stub, stubText);
+    const stub = stableFixtureExecutable("install-launchd.sh", stubText);
     boundedExecFileSync("bash", ["-n", stub]);
     for (const token of ["rollback", "--pair-id", "find-generic-password", "render-launchd-plist.mjs"]) {
       expect(stubText).toContain(token);
@@ -2480,8 +2688,7 @@ exit 0
     const originalPlist = readFileSync(plistPath(harness), "utf8");
     const originalLauncher = readFileSync(launcherPath(harness), "utf8");
     writeFileSync(harness.launchLog, "");
-    const nextNode = join(harness.bin, "node-new");
-    writeExecutable(nextNode, `${readFileSync(harness.node, "utf8")}\n# new generation\n`);
+    const nextNode = stableFixtureExecutable("node-new", `${readFileSync(harness.node, "utf8")}\n# new generation\n`);
 
     const result = runInstaller(installer, ["upgrade", "--app-root", appRoot, "--node", nextNode], harness);
 
@@ -2550,7 +2757,7 @@ exit 0
     const appRoot = makeDisposableAppRoot();
     // Nothing else in this script calls `ln`; failing it unconditionally isolates publish's own
     // rename step without disturbing any other step the installer takes.
-    writeExecutable(join(harness.bin, "ln"), "#!/bin/bash\nexit 1\n");
+    overridePath(harness, "ln", "#!/bin/bash\nexit 1\n");
 
     const result = runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness);
 
@@ -2568,7 +2775,7 @@ exit 0
     ).toBe(0);
     const fixture = await sealPairFor(harness, appRoot);
     writeFileSync(harness.launchLog, "");
-    writeExecutable(join(harness.bin, "ln"), "#!/bin/bash\nexit 1\n");
+    overridePath(harness, "ln", "#!/bin/bash\nexit 1\n");
 
     const result = runInstaller(
       installer,
@@ -2597,5 +2804,70 @@ exit 0
     expect(tree.filter((path) => path.endsWith(".plist"))).toEqual([]);
     expect(readFileSync(template, "utf8")).toContain("__ACP_");
     expect(tree.filter((path) => path.endsWith(".plist.template"))).toEqual([template]);
+  });
+});
+
+/**
+ * syspolicyd records one provenance row per new executable inode exec'd, and that table cannot be
+ * pruned (tests/helpers/stable-fixture-executable.ts). The rows above execute provider CLIs, the
+ * Buzz CLI, an updater's versioned files and a sealed closure's interpreter, and each run writes
+ * them into that run's own fresh home, because the rows need them at those paths.
+ *
+ * What is measured here is the writers themselves, run twice the way those rows call them: once to
+ * warm the cache and once more as the repeated run. A cache directory that stays the same size says
+ * nothing about this — a writer that bypasses it never touches it. So the measurement reads the
+ * executables each run actually left at the paths its rows use, and the repeated run must have
+ * minted none: every executable it left shares an inode with one the warm run left, which two fresh
+ * homes can only do through the cache.
+ */
+describe("the suite's executable fixture writers", () => {
+  const writeEveryExecutableFixture = (): string => {
+    const home = tempDir("acp-launchd-writers-");
+    // The names the rows use: provider CLIs (#785, #954), the Buzz CLI (#423), an updater's
+    // versions (#954), and the link target the leak row reads its sentinel from.
+    for (const name of [
+      "claude",
+      "codex",
+      "grok",
+      "acp-sibling-probe",
+      "claude-1.0",
+      "buzz",
+      "1.0.0",
+      "2.0.0",
+      "node-ACPCANONICALSENTINEL",
+    ]) {
+      writeProviderCli(join(home, name), SELF_CONTAINED_CLI);
+    }
+    mkdirSync(join(home, "scripted"));
+    writeProviderCli(join(home, "scripted", "codex"), ENV_INTERPRETER_CLI);
+    writeSealedPairNode(join(home, "runtime"));
+    return home;
+  };
+
+  const executables = (root: string): { path: string; inode: string }[] => {
+    const found: { path: string; inode: string }[] = [];
+    const walk = (directory: string): void => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const path = join(directory, entry.name);
+        if (entry.isDirectory()) walk(path);
+        const stat = lstatSync(path);
+        if (stat.isFile() && (stat.mode & 0o111) !== 0) {
+          found.push({ path: relative(root, path), inode: `${stat.dev}:${stat.ino}` });
+        }
+      }
+    };
+    walk(root);
+    return found;
+  };
+
+  it("mint no executable inode on a repeated run beyond the warm cache", () => {
+    const warm = new Set(executables(writeEveryExecutableFixture()).map(({ inode }) => inode));
+    const repeated = executables(writeEveryExecutableFixture());
+
+    expect(repeated.length, "the writers left no executables, so this measured nothing").toBe(11);
+    expect(
+      repeated.filter(({ inode }) => !warm.has(inode)).map(({ path }) => path),
+      "a repeated run wrote these as new executable inodes",
+    ).toEqual([]);
   });
 });

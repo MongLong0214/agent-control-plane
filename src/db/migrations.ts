@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 38;
+export const SCHEMA_VERSION = 39;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -128,6 +128,8 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   /CREATE TRIGGER IF NOT EXISTS inbound_claim_authority_markers_insert_guard[\s\S]*?\nEND;/,
   /-- CP-HI-06 — a first-write target\/override proof must come from[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_override_claim_authority[\s\S]*?\nEND;/,
   /-- CP-HI-06 — DELETE followed by INSERT is also a first claim\.[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_override_insert_authority[\s\S]*?\nEND;/,
+  // v39 alone installs this guard, the owner-reply intent's key (R1056-02).
+  /-- CP-HI-06 — an owner reply's recorded intent \(#1036, R1056-02\) is found by its key alone[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_owner_reply_key_immutable[\s\S]*?\nEND;/,
 ];
 
 /**
@@ -2626,6 +2628,44 @@ const v38: SchemaMigration = {
   checksum: () => migrationChecksum("v38-canonical-verified-target-override", SCHEMA_VERSION),
 };
 
+/**
+ * The v38 claim guards that act only once a v38 receipt exists. As v38 wrote them they tested for a
+ * receipt at exactly 38, which a database bootstrapped at any later version does not hold, so on
+ * such a database all three were inert. Their body now tests for 38 or later instead; v39
+ * reinstalls them.
+ */
+const V38_RECEIPT_GATED_TRIGGER_NAMES: readonly string[] = [
+  "inbound_messages_override_authority_immutable",
+  "inbound_messages_override_claim_authority",
+  "inbound_messages_override_insert_authority",
+];
+
+/**
+ * #1036, R1056-02. An owner reply's recorded intent is an `inbound_messages` row on channel
+ * `owner-reply-intent`, found by its key. v35 and v38 keep its payload, refuse a REPLACE and refuse
+ * a DELETE; none of them keeps the key, and a moved nonce reads as no intent, after which a retry
+ * signs and sends a second, different reply. This installs the guard that keeps the key.
+ *
+ * It is also the first version after v38, so it reinstalls the three v38 claim guards with the body
+ * that stays live past 38 (`V38_RECEIPT_GATED_TRIGGER_NAMES`). Triggers only, no table or row
+ * change. Each is dropped first, as v38 does for its own guards, so a chain that reached here with
+ * one already present still ends with schema.sql's body.
+ *
+ * A live database at v38 reaches this step only through an approved migration
+ * (`assertMigrationApproved`), as it does every step.
+ */
+const v39: SchemaMigration = {
+  id: "v39-owner-reply-intent-keeps-its-key",
+  fromVersion: 38,
+  toVersion: 39,
+  apply: (raw) => {
+    const names = [...V38_RECEIPT_GATED_TRIGGER_NAMES, "inbound_messages_owner_reply_key_immutable"];
+    raw.exec(dropsFor(names));
+    raw.exec(triggerDdlFor(names, SCHEMA_VERSION));
+  },
+  checksum: () => migrationChecksum("v39-owner-reply-intent-keeps-its-key", SCHEMA_VERSION),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -2654,6 +2694,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v36,
   v37,
   v38,
+  v39,
 ]);
 
 interface RequiredTrigger {
@@ -2771,6 +2812,7 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "inbound_messages_override_insert_authority", sentinel: "INGRESS_OVERRIDE_CLAIM_AUTHORITY_DENIED", introducedIn: 38 },
   { name: "inbound_messages_delete_authority", sentinel: "INGRESS_MESSAGE_DELETE_AUTHORITY_DENIED", introducedIn: 38 },
   { name: "inbound_claim_authority_markers_insert_guard", sentinel: "INGRESS_OVERRIDE_CLAIM_AUTHORITY_DENIED", introducedIn: 38 },
+  { name: "inbound_messages_owner_reply_key_immutable", sentinel: "INBOUND_OWNER_REPLY_KEY_IMMUTABLE", introducedIn: 39 },
   { name: "canonical_turn_sources_admission_matches_claim", sentinel: "CANONICAL_TURN_SOURCE_NOT_CLAIM_TIME", introducedIn: 32 },
 ];
 
