@@ -197,16 +197,22 @@ export class CtoLifecycle {
     // A released canonical role is not given a spawned CTO either; its conversation re-claims it.
     const released = this.#releasedCanonicalHolder(projectId, roleKey);
     if (released) return this.#refuseAdoptedCanonical(released, null, null, runId);
-    const created = await this.spawn(projectId, "primary-cto");
+    const created = await this.spawn(projectId, "primary-cto", { roleKey, runId });
     if (!created.allowed) return created as Decision<RoleBinding>;
 
-    const bound = this.bindings.bind({
-      roleKey,
-      role: Role.PRIMARY_CTO,
-      sessionId: created.value,
-      projectId,
-      mode: "PREFERRED",
+    // A canonical claim that landed after `spawn`'s pre-launch check is refused in the transaction
+    // that would bind; the launched session is stopped rather than left a live orphan.
+    const bound = this.db.txDecision(() => {
+      if (this.#releasedCanonicalHolder(projectId, roleKey)) {
+        return deny<RoleBinding>(ReasonCode.CANONICAL_CTO_AWAITING_RECLAIM, "the role became canonical during provisioning", { projectId });
+      }
+      return this.bindings.bind({ roleKey, role: Role.PRIMARY_CTO, sessionId: created.value, projectId, mode: "PREFERRED" });
     });
+    if (!bound.allowed && bound.reasonCode === ReasonCode.CANONICAL_CTO_AWAITING_RECLAIM) {
+      const claimed = this.#releasedCanonicalHolder(projectId, roleKey);
+      await this.stopUnusedSession(created.value, "canonical role claimed during provisioning");
+      return claimed ? this.#refuseAdoptedCanonical(claimed, null, null, runId) : bound;
+    }
     if (!bound.allowed) {
       this.sessions.transition(created.value, SessionLifecycle.STOPPED, "binding refused");
       return bound;
@@ -557,12 +563,17 @@ export class CtoLifecycle {
     }
 
     const recovery = this.buildRecoveryPackage(projectId, reason);
-    const incoming = await this.spawn(projectId, "acting-cto-recovery");
+    const incoming = await this.spawn(projectId, "acting-cto-recovery", { roleKey, runId });
     if (!incoming.allowed) return incoming as Decision<RoleBinding>;
 
     // #664 — this body's own handoff-record write must not survive a denial, including
     // one that comes back from the nested `bindings.switchTo` call below.
     const takeover = this.db.txDecision(() => {
+      // A canonical claim that landed after `spawn`'s pre-launch check, even one released again,
+      // leaves no trace in the active binding, so the lineage is what is read here.
+      if (this.#releasedCanonicalHolder(projectId, roleKey)) {
+        return deny<RoleBinding>(ReasonCode.CANONICAL_CTO_AWAITING_RECLAIM, "the role became canonical during recovery", { projectId });
+      }
       // `spawn` awaits provider work. Do not let a session that recovered, or a binding
       // that moved in that interval, be displaced by a stale emergency decision.
       const currentNow = this.bindings.active(roleKey);
@@ -632,7 +643,11 @@ export class CtoLifecycle {
       return switched;
     });
     if (!takeover.allowed) {
+      const claimed = takeover.reasonCode === ReasonCode.CANONICAL_CTO_AWAITING_RECLAIM
+        ? this.#releasedCanonicalHolder(projectId, roleKey)
+        : null;
       await this.stopUnusedSession(incoming.value, "recovery takeover refused");
+      if (claimed) return this.#refuseAdoptedCanonical(claimed, null, null, runId);
     }
     return takeover;
   }
@@ -845,8 +860,18 @@ export class CtoLifecycle {
     };
   }
 
-  /** Fresh session → Buzz → doctor readiness. Any failed step stops the activation. */
-  private async spawn(projectId: string, purpose: string): Promise<Decision<string>> {
+  /**
+   * Fresh session → Buzz → doctor readiness. Any failed step stops the activation.
+   *
+   * `canonicalGuard` names the role a primary-CTO provisioning fills. The caller checked the role's
+   * canonical lineage before calling, and the awaits below can let a canonical claim land (and be
+   * released) after that check, so the lineage is read again immediately before the launch.
+   */
+  private async spawn(
+    projectId: string,
+    purpose: string,
+    canonicalGuard?: { roleKey: string; runId: string | undefined },
+  ): Promise<Decision<string>> {
     const adapter = this.providers.hasRoleScoped(this.preference.provider)
       ? this.providers.requireForRole(this.preference.provider, Role.PRIMARY_CTO)
       : this.providers.get(this.preference.provider);
@@ -870,6 +895,10 @@ export class CtoLifecycle {
       if (!prepared.allowed) return prepared as Decision<string>;
     }
 
+    if (canonicalGuard) {
+      const claimed = this.#releasedCanonicalHolder(projectId, canonicalGuard.roleKey);
+      if (claimed) return this.#refuseAdoptedCanonical<string>(claimed, null, null, canonicalGuard.runId);
+    }
     const handle = await adapter.startSession({
       model: this.preference.model,
       effort: this.preference.effort,
@@ -991,6 +1020,10 @@ export class CtoLifecycle {
    * recover-dead`, or the dead-binding recovery before the re-claim lands) leaves no actor to ask,
    * and this lineage is the durable fact that the role is still canonical. A role with no history,
    * or whose latest holder is not canonical, answers null and is provisioned as before.
+   *
+   * Provisioning awaits, and a canonical claim can land — and be released again — inside one of
+   * those awaits, which the active binding alone cannot show. So this is asked again after the
+   * awaits: just before the launch (`spawn`), and inside the transaction that would bind.
    */
   #releasedCanonicalHolder(projectId: string, roleKey: string): CanonicalHolder | null {
     const latest = this.db.get<{ bindingGeneration: number; sessionId: string; status: "ACTIVE" | "REVOKED" }>(
@@ -1055,12 +1088,12 @@ export class CtoLifecycle {
    * DEAD and a terminal row wait for the re-claim; EPERM and UNKNOWN decided nothing, so the
    * same dispatch asked again may succeed.
    */
-  #refuseAdoptedCanonical(
+  #refuseAdoptedCanonical<T = RoleBinding>(
     holder: CanonicalHolder,
     session: SessionRecord | null,
     liveness: SessionLiveness | "EPERM" | null,
     runId: string | undefined,
-  ): Decision<RoleBinding> {
+  ): Decision<T> {
     const evidence = {
       projectId: holder.projectId,
       sessionId: holder.sessionId,

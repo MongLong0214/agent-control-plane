@@ -34,7 +34,7 @@ export const PARTIAL_TIMESTAMP_ORDERINGS = new Map([
   // consequence of the tie is a person sent to the wrong nonce — real, and still not a reason to
   // edit a frozen input without the authority that froze it.
   ["src/db/migrations.ts:2314", "ORDER BY received_at ASC"],
-  ["src/cto/cto-lifecycle.ts:795", "ORDER BY created_at DESC"],
+  ["src/cto/cto-lifecycle.ts:810", "ORDER BY created_at DESC"],
   // `currentPendingNormalHandoff` was here, re-keyed from 1956 to 1918 and due to move again. Four
   // changes in a row went red on it and none of them touched the query: the entry is keyed to a
   // line, so every edit above it moves it. Re-keying a fifth time fixes today's tree and not that,

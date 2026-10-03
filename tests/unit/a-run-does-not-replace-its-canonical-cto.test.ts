@@ -56,17 +56,11 @@ const count = (h: Harness, table: "sessions" | "conversational_actors"): number 
   h.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`)?.n ?? -1;
 
 /**
- * A project whose PRIMARY_CTO is bound the way the canonical self-claim binds one: a `claude` /
+ * Binds the project's PRIMARY_CTO the way the canonical self-claim binds one: a `claude` /
  * `claude-cli` runtime row with its pid and start token, and an actor whose lifetime target is a
- * `SELF_CLAIM_EXECUTOR_KIND` conversation. The `claude` adapter registered beside it is the one
- * the deployed daemon asked; it launched nothing here, so it answers UNAVAILABLE for this session.
+ * `SELF_CLAIM_EXECUTOR_KIND` conversation.
  */
-const canonicalProject = async (recorded: { osPid: number | null; startedAt: string | null }) => {
-  const h = makeHarness();
-  const { projectId, repositoryId } = await registerFixtureProject(h);
-  const claude = new TestProductionAdapter(h.clock, "claude");
-  h.cp.providers.register(claude);
-
+const bindCanonical = (h: Harness, projectId: string, recorded: { osPid: number | null; startedAt: string | null }) => {
   const session = h.cp.sessions.create({
     provider: "claude",
     model: "claude-cli",
@@ -92,6 +86,33 @@ const canonicalProject = async (recorded: { osPid: number | null; startedAt: str
     },
   });
   if (!bound.allowed) throw new Error(bound.message);
+  return { session, binding: bound.value };
+};
+
+/** The operator's dead-binding door releasing a canonical binding whose process is gone. */
+const releaseCanonical = (h: Harness, projectId: string, binding: { sessionId: string; bindingGeneration: number }) => {
+  const released = recoverDeadCanonicalBinding("operator", {
+    projectId,
+    role: Role.PRIMARY_CTO,
+    sessionId: binding.sessionId,
+    sessionIncarnation: h.cp.sessions.require(binding.sessionId).incarnation,
+    expectedBindingGeneration: binding.bindingGeneration,
+  }, { db: h.cp.db, audit: h.cp.audit, sessions: h.cp.sessions, bindings: h.cp.bindings });
+  if (!released.allowed) throw new Error(released.message);
+};
+
+/**
+ * A project whose PRIMARY_CTO is a canonical CTO bound by `bindCanonical`, with a QUEUED run. The
+ * `claude` adapter registered beside it is the one the deployed daemon asked; it launched nothing
+ * here, so it answers UNAVAILABLE for this session.
+ */
+const canonicalProject = async (recorded: { osPid: number | null; startedAt: string | null }) => {
+  const h = makeHarness();
+  const { projectId, repositoryId } = await registerFixtureProject(h);
+  const claude = new TestProductionAdapter(h.clock, "claude");
+  h.cp.providers.register(claude);
+  const { session, binding } = bindCanonical(h, projectId, recorded);
+  const bound = { value: binding };
 
   const run = h.cp.runs.create({
     projectId,
@@ -317,6 +338,98 @@ describe("a run's dispatch does not replace its adopted canonical CTO", () => {
       expect(h.cp.audit.byKind("CTO_DISPATCH_REFUSED_CANONICAL")).toHaveLength(0);
       expect(h.cp.sessions.require(first.value.sessionId).lifecycle).toBe(SessionLifecycle.ERROR);
       expect(count(h, "sessions")).toBe(before + 1);
+    } finally {
+      h.cp.close();
+    }
+  });
+});
+
+/**
+ * ACP-CTO-R1-01: the lineage check ran before provisioning awaited, and a canonical claim that
+ * landed and was released inside that await left nothing in the active binding to see. Each case
+ * starts from a role with no history, so the first check passes, and installs the claim and its
+ * release through the real binding registry and dead-binding door inside the awaited provider step.
+ */
+describe("a canonical claim landing while a CTO is being provisioned", () => {
+  const entries = {
+    ensurePrimaryCto: (h: Harness, projectId: string, runId: string) => h.cp.cto.ensurePrimaryCto(projectId, runId),
+    recoveryTakeover: (h: Harness, projectId: string, runId: string) =>
+      h.cp.cto.recoveryTakeover(projectId, "no CTO is bound", runId),
+    "run dispatch": (h: Harness, _projectId: string, runId: string) => h.cp.runs.dispatch(runId),
+  } as const;
+
+  const cases: Array<[keyof typeof entries, "probeRuntime" | "probeSession"]> = [
+    ["ensurePrimaryCto", "probeRuntime"],
+    ["recoveryTakeover", "probeRuntime"],
+    ["run dispatch", "probeRuntime"],
+    ["ensurePrimaryCto", "probeSession"],
+    ["recoveryTakeover", "probeSession"],
+    ["run dispatch", "probeSession"],
+  ];
+
+  it.each(cases)("%s refuses when the claim and its release land during %s", async (entry, step) => {
+    const h = makeHarness();
+    try {
+      const { projectId, repositoryId } = await registerFixtureProject(h);
+      const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+      const run = h.cp.runs.create({
+        projectId,
+        executionMode: ExecutionMode.STANDARD,
+        contract: CONTRACT,
+        repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+      });
+      if (!run.allowed) throw new Error(run.message);
+      const launched = vi.spyOn(h.scripted, "startSession");
+      let raced = 0;
+      const race = (): void => {
+        raced += 1;
+        const { binding } = bindCanonical(h, projectId, { osPid: exitedPid(), startedAt: "darwin-tv:1790000100.000001" });
+        releaseCanonical(h, projectId, binding);
+      };
+      // probeRuntime runs before the launch, probeSession after it; both are awaited by `spawn`.
+      if (step === "probeRuntime") {
+        vi.spyOn(h.scripted, "probeRuntime").mockImplementationOnce(async () => {
+          race();
+          return "HEALTHY";
+        });
+      } else {
+        vi.spyOn(h.scripted, "probeSession").mockImplementationOnce(async () => {
+          race();
+          return "HEALTHY";
+        });
+      }
+
+      const answered = await entries[entry](h, projectId, run.value.runId);
+
+      expect(raced).toBe(1);
+      expect(answered).toMatchObject({ allowed: false, reasonCode: ReasonCode.CANONICAL_CTO_AWAITING_RECLAIM });
+      expect(h.cp.runs.require(run.value.runId).state).toBe(RunState.QUEUED);
+      // The canonical lineage is the only history the role has: generation 1, released, and no
+      // binding or actor minted after it.
+      expect(h.cp.bindings.active(roleKey)).toBeNull();
+      expect(h.cp.db.all<{ g: number; status: string }>(
+        `SELECT binding_generation AS g, status FROM assignments WHERE role_key = ? ORDER BY binding_generation`,
+        [roleKey],
+      )).toEqual([{ g: 1, status: "REVOKED" }]);
+      expect(count(h, "conversational_actors")).toBe(1);
+      expect(h.cp.audit.byKind("RECOVERY_TAKEOVER")).toHaveLength(0);
+      expect(h.cp.audit.byKind("PRIMARY_CTO_ACTIVATED")).toHaveLength(0);
+      const refused = h.cp.audit.byKind("CTO_DISPATCH_REFUSED_CANONICAL");
+      expect(refused).toHaveLength(1);
+      expect(refused[0]?.reasonCode).toBe(ReasonCode.CANONICAL_CTO_AWAITING_RECLAIM);
+      if (step === "probeRuntime") {
+        // Refused before the launch: the only session is the canonical one the race installed.
+        expect(launched).not.toHaveBeenCalled();
+        expect(count(h, "sessions")).toBe(1);
+      } else {
+        // Launched before the claim landed: refused in the binding transaction, and stopped.
+        expect(launched).toHaveBeenCalledOnce();
+        const spawned = h.cp.db.all<{ session_id: string; lifecycle: string }>(
+          `SELECT session_id, lifecycle FROM sessions WHERE provider = 'scripted'`,
+        );
+        expect(spawned).toHaveLength(1);
+        expect(spawned[0]?.lifecycle).toBe(SessionLifecycle.STOPPED);
+      }
     } finally {
       h.cp.close();
     }
