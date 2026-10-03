@@ -9,7 +9,12 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { FailureClass as FailureClassCode, type FailureClass } from "../domain/types.ts";
 import { IngressGuard } from "../ingress/ingress-guard.ts";
-import { adoptedCanonicalRuntimeSql, isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
+import {
+  type CanonicalSuccession,
+  adoptedCanonicalRuntimeSql,
+  isAdoptedCanonicalRuntime,
+  isSameActorCanonicalSuccession,
+} from "../registry/canonical-self-claim.ts";
 import {
   type FencedEnvelope,
   HOLDER_CLAIMED_KINDS,
@@ -1322,6 +1327,17 @@ export class Outbox {
     fromGeneration: number,
     toGeneration: number,
     toSessionId: string,
+    options: {
+      /**
+       * Revoke shape only (`fromGeneration === toGeneration`), and only from
+       * `BindingRegistry.revoke`'s `holdPeerMessagesForSameActorSuccessor`: a `PENDING`
+       * `IDENTITY_BOUND_KINDS` row addressed to exactly this session and never carried before is
+       * left untouched — neither retargeted nor rejected — and listed under `held`, for
+       * `carryPeerMessagesToSameActorSuccessor` to carry or reject in the same transaction. Every
+       * other row is decided exactly as it is without this option.
+       */
+      holdPeerMessagesAddressedTo?: string;
+    } = {},
   ): { retargeted: string[]; rejected: string[] } {
     const now = this.clock.nowIso();
     const pending = this.db.all<RawOutbox>(
@@ -1345,9 +1361,25 @@ export class Outbox {
 
     const retargeted: string[] = [];
     const rejected: string[] = [];
+    const held: string[] = [];
+    const holdFor = toGeneration === fromGeneration ? options.holdPeerMessagesAddressedTo : undefined;
 
     for (const row of pending) {
       const holderClaimed = HOLDER_CLAIMED_KINDS.has(row.kind as MessageKind);
+      // The hold (2026-10-03). Only `PENDING` — a `SENT` peer row's outcome is unknown and it is
+      // rejected below as always — and only a row that has not been carried before: the
+      // `OUTBOX_RETARGETED` mark is the once-only rule `carryPeerMessagesToSameActorSuccessor`
+      // asserts again, so a row that already spent its carry is rejected here, not held.
+      if (
+        holdFor !== undefined &&
+        IDENTITY_BOUND_KINDS.has(row.kind as MessageKind) &&
+        row.status === "PENDING" &&
+        row.target_session_id === holdFor &&
+        row.reason_code !== ReasonCode.OUTBOX_RETARGETED
+      ) {
+        held.push(row.message_id);
+        continue;
+      }
       const retargetable = holderClaimed
         ? // A holder-claimed row moves only on a *successor takeover*, and only from `PENDING`.
           //
@@ -1373,7 +1405,8 @@ export class Outbox {
           //
           // And never an `IDENTITY_BOUND_KINDS` row (#1044): a peer message was admitted for this
           // generation's exact session, so a successor is exactly who must not be handed it. It
-          // falls through to the reject below, which settles its ingress claim.
+          // falls through to the reject below, which settles its ingress claim. (The one exception,
+          // the same conversation restarted, never reaches this line: the hold above takes it.)
           row.status === "PENDING" &&
           toGeneration !== fromGeneration &&
           !IDENTITY_BOUND_KINDS.has(row.kind as MessageKind)
@@ -1427,10 +1460,95 @@ export class Outbox {
       kind: "OUTBOX_FENCE",
       reasonCode: ReasonCode.OUTBOX_RETARGETED,
       roleKey,
-      evidence: { fromGeneration, toGeneration, toSessionId, retargeted, rejected },
+      evidence: holdFor === undefined
+        ? { fromGeneration, toGeneration, toSessionId, retargeted, rejected }
+        : { fromGeneration, toGeneration, toSessionId, retargeted, rejected, held },
     });
 
     return { retargeted, rejected };
+  }
+
+  /**
+   * The carry for peer messages a same-actor dead-predecessor recovery held (2026-10-03), called
+   * inside the canonical self-claim's transaction once the successor generation is bound.
+   *
+   * #1044 rejects a queued `PEER_MESSAGE` on every takeover and runtime move, because it was
+   * admitted for one exact CTO session and a successor is exactly who must not be handed it. A
+   * canonical restart is the one move that does not hand it to anyone else: the conversation, its
+   * actor and its Buzz channel identity are unchanged, and only the process and the generation
+   * moved. So here, and only when `isSameActorCanonicalSuccession` says the durable state is that
+   * succession, a `PENDING` peer row still addressed to the predecessor at the released generation
+   * is carried to the successor once:
+   *
+   *   - stamped `OUTBOX_RETARGETED`, by a compare-and-set on the mark's absence, so a row already
+   *     carried is never carried a second time — a second restart's hold refuses it and the
+   *     rejection below closes it;
+   *   - with its stored proof untouched. The proof is admission evidence and is never rewritten;
+   *     the hand-over (`peerProofIsCurrent`) accepts this holder only as the proof's one-hop
+   *     successor, reading the same durable facts and this row's mark, and still asks every CEO
+   *     and room clause it asks of any holder.
+   *
+   * Every other identity-bound row left at the released generation — the succession not proven,
+   * a row already carried, a row that is not `PENDING`, or one addressed to another runtime — is
+   * rejected and its ingress claim settled in this transaction, which is what the revoke would have
+   * done to it. Nothing is left addressed to a generation nobody holds.
+   */
+  carryPeerMessagesToSameActorSuccessor(
+    succession: CanonicalSuccession,
+  ): { retargeted: string[]; rejected: string[] } {
+    const { roleKey, fromGeneration, fromSessionId, toGeneration, toSessionId } = succession;
+    return this.db.tx(() => {
+      const rows = this.db.all<RawOutbox>(
+        `SELECT * FROM outbox
+          WHERE role_key = ? AND binding_generation = ?
+            AND kind IN (${HOLDER_CLAIMED_KIND_SQL})
+            AND status IN ('PENDING','IN_FLIGHT','SENT')
+          ORDER BY created_at, rowid`,
+        [roleKey, fromGeneration],
+      ).filter((row) => IDENTITY_BOUND_KINDS.has(row.kind as MessageKind));
+      if (rows.length === 0) return { retargeted: [], rejected: [] };
+
+      const proven = isSameActorCanonicalSuccession(this.db, succession);
+      const retargeted: string[] = [];
+      const rejected: string[] = [];
+      for (const row of rows) {
+        // The whole tuple the read named, and the mark's absence, in the write itself.
+        const moved =
+          proven && row.status === "PENDING" && row.target_session_id === fromSessionId
+            ? this.db.run(
+                `UPDATE outbox SET binding_generation = ?, target_session_id = ?, reason_code = ?
+                  WHERE message_id = ? AND status = 'PENDING'
+                    AND role_key = ? AND binding_generation = ? AND target_session_id = ?
+                    AND (reason_code IS NULL OR reason_code <> ?)`,
+                [
+                  toGeneration, toSessionId, ReasonCode.OUTBOX_RETARGETED, row.message_id,
+                  roleKey, fromGeneration, fromSessionId, ReasonCode.OUTBOX_RETARGETED,
+                ],
+              ).changes
+            : 0;
+        if (moved === 1) {
+          retargeted.push(row.message_id);
+          continue;
+        }
+        this.db.run(
+          `UPDATE outbox SET status = 'REJECTED', reason_code = ?,
+                             claim_token = NULL, claimed_at = NULL,
+                             retry_eligible = 0, next_attempt_at = NULL
+            WHERE message_id = ?`,
+          [ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, row.message_id],
+        );
+        this.settleHolderClaimOrThrow(row.message_id);
+        rejected.push(row.message_id);
+      }
+
+      this.audit.record({
+        kind: "OUTBOX_FENCE",
+        reasonCode: ReasonCode.OUTBOX_RETARGETED,
+        roleKey,
+        evidence: { fromGeneration, toGeneration, fromSessionId, toSessionId, retargeted, rejected },
+      });
+      return { retargeted, rejected };
+    });
   }
 
   /**
@@ -1695,6 +1813,7 @@ interface RawOutbox {
   retry_eligible?: number | null;
   next_attempt_at?: string | null;
   sent_at?: string | null;
+  reason_code?: string | null;
 }
 
 /**

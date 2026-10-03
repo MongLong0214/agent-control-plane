@@ -84,6 +84,7 @@ import {
   BuzzMessageIngress,
   buzzMessageNonce,
   buzzMessageSigningRequest,
+  carriedToSameActorSuccessor,
   deliverBuzzMessage,
   ownerMessagePointerOf,
   peerProofIsCurrent,
@@ -3592,7 +3593,15 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
           holder,
           (candidate) =>
             candidate.kind !== MessageKind.PEER_MESSAGE ||
-            peerProofIsCurrent(admittedPeerSource(cp, candidate.payload), ceo, holder, ctoChannel),
+            peerProofIsCurrent(
+              admittedPeerSource(cp, candidate.payload),
+              ceo,
+              holder,
+              ctoChannel,
+              // The one holder besides the proof's own: its conversation restarted once, the row
+              // carried to it by the canonical self-claim's recovery (2026-10-03).
+              carriedToSameActorSuccessor(cp.db, candidate.messageId, holder),
+            ),
         );
         const unresolved = taken.unresolved;
         const withheld = taken.withheld;

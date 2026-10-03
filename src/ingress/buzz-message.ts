@@ -3,6 +3,9 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import type { Db } from "../db/database.ts";
+import { MessageKind } from "../outbox/envelope.ts";
+import { isSameActorCanonicalSuccession } from "../registry/canonical-self-claim.ts";
 
 import type { IngressGuard, IngressRequest, TurnClaim, TurnIdentity } from "./ingress-guard.ts";
 
@@ -227,6 +230,15 @@ export interface AdmittedPeerSource {
   readonly conversation: unknown;
 }
 
+/** The CTO half of a stored peer proof, as `peerProofIsCurrent` read it. */
+export interface PeerProofCto {
+  readonly roleKey: string;
+  readonly bindingGeneration: number;
+  readonly sessionId: string;
+}
+
+const noSuccessor = (): boolean => false;
+
 /**
  * Whether a queued peer message may still be handed to this holder (#1044) — the hand-over's
  * question, asked before the hand-over writes anything.
@@ -240,6 +252,11 @@ export interface AdmittedPeerSource {
  *
  * The CTO half is compared field by field with the holder rather than trusted from the outbox row:
  * a row's addressing columns are the outbox's, while the proof is what admission signed.
+ *
+ * One holder besides the proof's own is accepted (2026-10-03): the same canonical conversation
+ * restarted once, which the self-claim's dead-predecessor recovery carried the row to. The proof is
+ * not rewritten to name it; `successorOf` establishes it from durable state, one hop only, and
+ * every CEO and room clause above is asked of it unchanged.
  */
 export const peerProofIsCurrent = (
   source: AdmittedPeerSource | undefined,
@@ -247,23 +264,77 @@ export const peerProofIsCurrent = (
   holder: { roleKey: string; bindingGeneration: number; targetSessionId: string },
   /** The receiving CTO session's current `buzz_address`, or null. */
   ctoChannel: string | null,
+  /**
+   * Whether this holder is the one-hop same-actor canonical successor of the CTO session the
+   * proof names, for this row (`carriedToSameActorSuccessor`). Asked only when the proof's CTO
+   * half names generation `holder.bindingGeneration - 1` and another session; the default answers
+   * no, so a caller that supplies nothing accepts the proof's exact holder alone.
+   */
+  successorOf: (proofCto: PeerProofCto) => boolean = noSuccessor,
 ): boolean => {
   if (!source || !ceo || ceo.channelIdentityReused) return false;
   const stored = source.proof;
   if (!stored || typeof stored !== "object" || Array.isArray(stored)) return false;
   const proof = stored as Record<string, unknown>;
+  const ctoGeneration = proof["ctoBindingGeneration"];
+  const ctoSession = proof["ctoSessionId"];
   return (
     proof["ceoBindingGeneration"] === ceo.bindingGeneration &&
     proof["ceoSessionId"] === ceo.sessionId &&
     ceo.channelIdentity !== null &&
     sameChannelIdentity(ceo.channelIdentity, source.author) &&
     proof["ctoRoleKey"] === holder.roleKey &&
-    proof["ctoBindingGeneration"] === holder.bindingGeneration &&
-    proof["ctoSessionId"] === holder.targetSessionId &&
     ctoChannel !== null &&
-    source.conversation === ctoChannel
+    source.conversation === ctoChannel &&
+    // The CTO the proof names is this holder — or, the one case besides it (2026-10-03), the
+    // holder is that CTO's conversation restarted once: generation + 1, another session, and the
+    // durable succession and this row's carry mark say so. The proof itself is never rewritten.
+    ((ctoGeneration === holder.bindingGeneration && ctoSession === holder.targetSessionId) ||
+      (typeof ctoGeneration === "number" &&
+        Number.isSafeInteger(ctoGeneration) &&
+        holder.bindingGeneration === ctoGeneration + 1 &&
+        typeof ctoSession === "string" &&
+        ctoSession !== holder.targetSessionId &&
+        successorOf({ roleKey: holder.roleKey, bindingGeneration: ctoGeneration, sessionId: ctoSession })))
   );
 };
+
+/**
+ * The durable succession lookup `peerProofIsCurrent` asks at hand-over, for one queued row and one
+ * holder. Yes only when both hold:
+ *
+ *   - the row is a `PENDING` `PEER_MESSAGE` addressed to exactly this holder's role key, generation
+ *     and session, and carries the `OUTBOX_RETARGETED` mark — which, on a peer row, only
+ *     `Outbox.carryPeerMessagesToSameActorSuccessor` writes;
+ *   - `isSameActorCanonicalSuccession` says the proof's CTO generation and session were released by
+ *     the canonical self-claim's dead-predecessor recovery and this holder is the same actor's next
+ *     generation, on the same Buzz channel identity.
+ *
+ * Only reads, as `claimForHolder`'s predicate must.
+ */
+export const carriedToSameActorSuccessor = (
+  db: Pick<Db, "get">,
+  messageId: string,
+  holder: { roleKey: string; bindingGeneration: number; targetSessionId: string },
+) => (proofCto: PeerProofCto): boolean =>
+  db.get<{ carried: number }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM outbox
+        WHERE message_id = ? AND kind = ? AND status = 'PENDING' AND reason_code = ?
+          AND role_key = ? AND binding_generation = ? AND target_session_id = ?
+     ) AS carried`,
+    [
+      messageId, MessageKind.PEER_MESSAGE, ReasonCode.OUTBOX_RETARGETED,
+      holder.roleKey, holder.bindingGeneration, holder.targetSessionId,
+    ],
+  )?.carried === 1 &&
+  isSameActorCanonicalSuccession(db, {
+    roleKey: proofCto.roleKey,
+    fromGeneration: proofCto.bindingGeneration,
+    fromSessionId: proofCto.sessionId,
+    toGeneration: holder.bindingGeneration,
+    toSessionId: holder.targetSessionId,
+  });
 
 /** The durable replay key for one Buzz event. */
 export const buzzMessageNonce = (eventId: string): string =>

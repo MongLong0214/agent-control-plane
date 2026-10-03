@@ -179,6 +179,14 @@ export interface DeadBindingRecoveryDeps {
     signal?: (pid: number) => void;
     startedAt?: (pid: number) => string | null;
   };
+  /**
+   * Hold the released generation's queued peer messages instead of rejecting them. Only the
+   * canonical self-claim sets it, because only it binds the same conversational actor's next
+   * generation inside this same transaction and then carries or rejects every held row
+   * (`BindingRegistry.carryPeerMessagesToSameActorSuccessor`). The operator door passes nothing:
+   * it binds no successor, so a held row would be left addressed to a generation nobody holds.
+   */
+  holdPeerMessagesForSameActorSuccessor?: boolean;
 }
 
 export interface DeadBindingRecoveryReceipt {
@@ -356,6 +364,7 @@ export const recoverDeadCanonicalBinding = (
     const revoked = deps.bindings.revoke(
       roleKey,
       `dead canonical binding recovery: session ${request.sessionId} process ${session.osPid ?? "unknown"} is gone`,
+      deps.holdPeerMessagesForSameActorSuccessor === true ? { holdPeerMessagesForSameActorSuccessor: true } : {},
     );
     if (!revoked.allowed) return revoked as Decision<DeadBindingRecoveryReceipt>;
 

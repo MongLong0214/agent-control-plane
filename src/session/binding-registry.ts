@@ -17,6 +17,7 @@ import {
   roleKeyFor,
 } from "../domain/types.ts";
 import type { Outbox } from "../outbox/outbox.ts";
+import type { CanonicalSuccession } from "../registry/canonical-self-claim.ts";
 import type { TaskGraph } from "../run/task-graph.ts";
 import { servedHermesHeads } from "./hermes-target-head.ts";
 import type { SessionRegistry } from "./session-registry.ts";
@@ -700,7 +701,17 @@ export class BindingRegistry {
   revoke(
     roleKey: string,
     reason: string,
-    options: { allowBlockedRuns?: boolean } = {},
+    options: {
+      allowBlockedRuns?: boolean;
+      /**
+       * Leave this generation's queued, never-carried peer messages addressed to the outgoing
+       * runtime PENDING instead of rejecting them (`Outbox.retargetOrReject`'s hold). Only the
+       * canonical self-claim's dead-predecessor recovery passes it, and only because it binds the
+       * same actor's next generation in the same transaction and then calls
+       * `carryPeerMessagesToSameActorSuccessor`, which carries or rejects every held row.
+       */
+      holdPeerMessagesForSameActorSuccessor?: boolean;
+    } = {},
   ): Decision<void> {
     return this.db.tx(() => {
       const current = this.active(roleKey);
@@ -726,6 +737,9 @@ export class BindingRegistry {
         current.bindingGeneration,
         current.bindingGeneration,
         current.sessionId,
+        options.holdPeerMessagesForSameActorSuccessor === true
+          ? { holdPeerMessagesAddressedTo: current.sessionId }
+          : {},
       );
       // Nothing to retarget onto — everything pending for a revoked role is stale.
       for (const id of fence.retargeted) {
@@ -743,6 +757,18 @@ export class BindingRegistry {
       this.#notifySwitch({ ...current, status: "REVOKED" });
       return allow(ReasonCode.OK, undefined);
     });
+  }
+
+  /**
+   * The second half of `revoke`'s `holdPeerMessagesForSameActorSuccessor`, called by the canonical
+   * self-claim inside its claim transaction once the successor generation is bound. Every peer
+   * message the hold left at the released generation is carried to the successor once or rejected
+   * with its turn settled; which, is `Outbox.carryPeerMessagesToSameActorSuccessor`'s decision.
+   */
+  carryPeerMessagesToSameActorSuccessor(
+    succession: CanonicalSuccession,
+  ): { retargeted: string[]; rejected: string[] } {
+    return this.outbox.carryPeerMessagesToSameActorSuccessor(succession);
   }
 
   active(roleKey: string): RoleBinding | null {
