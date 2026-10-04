@@ -277,6 +277,8 @@ export interface FakeTurnScript {
   whileLatched?: () => void | Promise<void>;
   /** Never reaches the broker and spawns nothing. */
   neverRuns?: boolean;
+  /** Awaited inside the admitted effect just before the child is spawned. */
+  beforeSpawn?: () => Promise<void>;
 }
 
 /**
@@ -320,6 +322,7 @@ export class FakeWorkerAdapter implements ProviderAdapter {
     if (script.neverRuns) return refused("the provider could not be launched");
     if (!request.managedWrite) return refused("WRITE_REQUIRES_MANAGED_RUN: no managed write");
     const authorised = await this.broker.authorize(request.managedWrite, async () => {
+      if (script.beforeSpawn) await script.beforeSpawn();
       this.launches += 1;
       // Its command line carries the worker session the way the provider CLI's does (`--session-id`).
       const child = spawn(

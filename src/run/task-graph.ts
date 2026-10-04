@@ -445,7 +445,14 @@ export class TaskGraph {
    * the synchronous receipt primitive used by tests and recovery import; the MCP worker
    * allocator is deliberately routed only through this admission method.
    */
-  async startWorkerExecution(input: ExecutionStart): Promise<Decision<ExecutionRecord>> {
+  async startWorkerExecution(
+    input: ExecutionStart,
+    /**
+     * #1070 ACP-WORKER-03 — asked once more after the capacity probe, before the execution is opened:
+     * a caller whose admission was withdrawn while the probe ran (a daemon that began to stop) opens none.
+     */
+    stillAdmitting: () => boolean = () => true,
+  ): Promise<Decision<ExecutionRecord>> {
     // Do not ask capacity to allocate a worker whose durable identity is already invalid.
     // `startExecution` repeats this check inside its transaction after the async probe.
     const workerBinding = this.assertLiveWorkerBinding(input);
@@ -467,6 +474,9 @@ export class TaskGraph {
     };
     const capacity = await this.#capacity.refreshForWorkerFanout(target);
     if (!capacity.allowed) return capacity as Decision<ExecutionRecord>;
+    if (!stillAdmitting()) {
+      return deny(ReasonCode.CONFLICT, "the admission was withdrawn before the execution was opened", { runId: input.runId, taskId: input.taskId });
+    }
     return this.startExecution(input);
   }
 

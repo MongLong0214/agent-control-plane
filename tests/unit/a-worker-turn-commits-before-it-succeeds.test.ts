@@ -334,6 +334,34 @@ describe("#512 a worker turn commits before it succeeds", () => {
       expect(existsSync(lock)).toBe(false);
     });
 
+    it("commit failure: another writer holds the worktree's index", async () => {
+      // Index contention, the way git sees it: a concurrent git command holds `index.lock` when the
+      // commit is made. Nothing is committed, the branch does not move, and the other writer's lock is
+      // left exactly as it was — never taken over or removed.
+      const world = coreWorld();
+      const adapter = fakeFor(world);
+      const lock = join(world.repoPath, ".git", "index.lock");
+      const runner = makeRunner(world, adapter, {
+        commit: {
+          commit: async (repo, input) => {
+            writeFileSync(lock, "another writer's index\n");
+            return plumbingWorkerCommit.commit(repo, input);
+          },
+        },
+      });
+      const base = head(world);
+      const executionId = await startTurn(world, runner);
+      await runner.settled(executionId);
+      expect(world.tasks.execution(executionId)!.status).toBe("FAILED");
+      const diagnostics = expectFailureShape(world, runner, executionId);
+      expect(diagnostics["reason"]).toBe("COMMIT_FAILED");
+      expect(fileAt(world, "src/app.js")).toBe("module.exports = () => 2;\n");
+      expect(head(world)).toBe(base);
+      expect(readFileSync(lock, "utf8")).toBe("another writer's index\n");
+      rmSync(lock, { force: true });
+      expect(gitSync(world.repoPath, ["diff", "--cached", "--name-only"])).toBe("");
+    });
+
     it("an out-of-scope change", async () => {
       const world = coreWorld();
       const adapter = fakeFor(world);

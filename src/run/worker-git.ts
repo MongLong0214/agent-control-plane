@@ -1,6 +1,22 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, type Stats } from "node:fs";
+import {
+  closeSync,
+  copyFileSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  readlinkSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  type Stats,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import { digestOf, sha256 } from "../core/digest.ts";
@@ -28,6 +44,11 @@ import { canonical, isWithin } from "../guard/workspace-probe.ts";
  *   credential or askpass helper is configured.
  * - System and global configuration are not read (`GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL=/dev/null`),
  *   HOME is an empty private directory, and replace refs are ignored.
+ * - The index is excluded from the git-dir comparison only for its stat cache: what it stages is
+ *   fenced separately (`stagedContent`), and the commit locks it and updates only the committed
+ *   paths, so no one's staged work is erased (ACP-WORKER-06).
+ * - A gitlink's contents live in another repository, which is never run: one is accepted only with
+ *   nothing checked out at its path, in every pass (ACP-WORKER-05).
  */
 
 const GIT_TIMEOUT_MS = 120_000;
@@ -87,6 +108,12 @@ export interface TreeScan {
   unsafe: string[];
   /** Untracked agent configuration at the root, ignored or not. */
   untrackedAgentConfiguration: string[];
+  /**
+   * Gitlinks (submodules) whose path is anything but absent or an empty directory: checked out, or
+   * replaced. Also in `unsafe`. Their state lives in another repository, which the control plane will
+   * not run git inside, so a turn never starts on one and never ends having made one (ACP-WORKER-05).
+   */
+  populatedGitlinks: string[];
 }
 
 const dotGitIdentity = (workTree: string): { kind: "dir" | "file"; stat: Stats; bytes: Buffer | null } | null => {
@@ -335,8 +362,21 @@ export const scanAgainst = async (
 
   const entries: WorkerDiffEntry[] = [];
   const unsafe: string[] = [];
+  const populatedGitlinks: string[] = [];
   for (const [path, base] of tracked) {
-    if (base.type !== "blob") continue;
+    if (base.type === "commit") {
+      // A gitlink. Git reads a checked-out submodule's state from the submodule's own repository; this
+      // scan does not, so the only states it can vouch for are the ones with nothing in them.
+      if (!gitlinkIsEmpty(repo.workTree, path)) {
+        unsafe.push(path);
+        populatedGitlinks.push(path);
+      }
+      continue;
+    }
+    if (base.type !== "blob") {
+      unsafe.push(path);
+      continue;
+    }
     const now = readWorktreePath(repo.workTree, path, format);
     if (now.kind === "missing") entries.push({ path, mode: null, sha256: null, blob: null });
     else if (now.kind === "unsafe") unsafe.push(path);
@@ -351,8 +391,32 @@ export const scanAgainst = async (
     entries: entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)),
     unsafe: unsafe.sort(),
     untrackedAgentConfiguration: untrackedAgentConfiguration.sort(),
+    populatedGitlinks: populatedGitlinks.sort(),
   };
 };
+
+/** A gitlink's path is absent, or an empty directory reached without a symlink: nothing checked out. */
+const gitlinkIsEmpty = (workTree: string, path: string): boolean => {
+  let cursor = workTree;
+  for (const part of path.split("/").slice(0, -1)) {
+    cursor = join(cursor, part);
+    const stat = lstatOrNull(cursor);
+    if (!stat) return true;
+    if (!stat.isDirectory()) return false;
+  }
+  const stat = lstatOrNull(join(workTree, path));
+  if (!stat) return true;
+  return stat.isDirectory() && readdirSync(join(workTree, path)).length === 0;
+};
+
+/**
+ * What an index stages: each entry's tag, mode, object id, stage and path (`ls-files -s -v`), and not
+ * its stat cache. A `git status` that refreshes the cache leaves this unchanged; staging anything,
+ * marking an entry, or removing one changes it (ACP-WORKER-06). `GIT_OPTIONAL_LOCKS=0` keeps the read
+ * from rewriting the index it reads.
+ */
+export const stagedContent = async (repo: PinnedRepository, index?: string): Promise<string> =>
+  digestOf((await must(repo, ["ls-files", "-s", "-v", "-z"], index ? { index } : {})).split("\0").filter(Boolean));
 
 /** Paths the real index stages against a tree; read from the index alone, never the worktree. */
 export const stagedAgainst = async (repo: PinnedRepository, treeIsh: string): Promise<string[]> =>
@@ -364,18 +428,35 @@ export const stagedAgainst = async (repo: PinnedRepository, treeIsh: string): Pr
 export interface WorkerCommitPort {
   commit(
     repo: PinnedRepository,
-    input: { baseHead: string; branch: string; entries: readonly WorkerDiffEntry[]; message: string; format: "sha1" | "sha256" },
+    input: {
+      baseHead: string;
+      branch: string;
+      entries: readonly WorkerDiffEntry[];
+      message: string;
+      format: "sha1" | "sha256";
+      /** `stagedContent` of the real index before the turn; the commit refuses if it has changed. */
+      stagedBaseline: string;
+    },
   ): Promise<Decision<string>>;
 }
 
 /**
  * Commits exactly `entries` on top of `baseHead`, through plumbing over a private index: no filter,
  * no hook, no worktree read by git. Each blob is written from bytes read here and must hash to the id
- * the change was verified with. The branch moves only from `baseHead` (`update-ref` with its old
- * value), and only then is the real index replaced by the new tree.
+ * the change was verified with.
+ *
+ * The real index is never replaced wholesale (ACP-WORKER-06). It is locked the way git locks it — its
+ * `index.lock` created exclusively — and a lock someone else holds means another writer is at work:
+ * nothing is committed. Under the lock its staged content must still be the turn's baseline, so no
+ * one's staged work is overwritten; the branch then moves from `baseHead` (`update-ref` with its old
+ * value), and only the committed paths are updated, in a copy of the real index that replaces it
+ * through the lock. Every other entry, its stat cache included, is kept as it was.
  */
 export const plumbingWorkerCommit: WorkerCommitPort = {
   commit: async (repo, input) => {
+    const realIndex = join(repo.gitDir, "index");
+    const lock = `${realIndex}.lock`;
+    let held = false;
     try {
       const index = join(repo.scratch, "commit.index");
       await must(repo, ["read-tree", input.baseHead], { index });
@@ -393,9 +474,24 @@ export const plumbingWorkerCommit: WorkerCommitPort = {
         }
         lines.push(`${entry.mode} ${written}\t${entry.path}`);
       }
-      await must(repo, ["update-index", "-z", "--index-info"], { index, input: lines.map((line) => `${line}\0`).join("") });
+      const indexInfo = lines.map((line) => `${line}\0`).join("");
+      await must(repo, ["update-index", "-z", "--index-info"], { index, input: indexInfo });
       const tree = (await must(repo, ["write-tree"], { index })).trim();
       const commit = (await must(repo, ["commit-tree", tree, "-p", input.baseHead, "--no-gpg-sign", "-m", input.message])).trim();
+
+      try {
+        writeFileSync(lock, "", { flag: "wx", mode: 0o644 });
+        held = true;
+      } catch (error) {
+        return deny(ReasonCode.CONFLICT, "the worktree's index is locked by another writer; nothing was committed", {
+          error: error instanceof Error ? error.message.slice(0, 300) : String(error),
+        });
+      }
+      const copy = join(repo.scratch, "real.index");
+      if (lstatOrNull(realIndex)) copyFileSync(realIndex, copy);
+      if ((await stagedContent(repo, copy)) !== input.stagedBaseline) {
+        return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, "the index's staged content changed during the turn; nothing was committed", {});
+      }
       const moved = await runPinnedGit(repo, ["update-ref", "-m", "agent-control-plane: worker commit", `refs/heads/${input.branch}`, commit, input.baseHead]);
       if (moved.exitCode !== 0) {
         return deny(ReasonCode.INTERNAL_ERROR, "the branch could not be moved to the worker commit", {
@@ -403,18 +499,33 @@ export const plumbingWorkerCommit: WorkerCommitPort = {
           error: moved.stderr.slice(0, 500),
         });
       }
-      const indexed = await runPinnedGit(repo, ["read-tree", commit]);
-      if (indexed.exitCode !== 0) {
-        return deny(ReasonCode.INTERNAL_ERROR, "the worker commit exists, but the worktree's index could not be moved to it", {
+      const updated = await runPinnedGit(
+        repo,
+        ["-c", "core.splitIndex=false", "update-index", "--no-split-index", "-z", "--index-info"],
+        { index: copy, input: indexInfo },
+      );
+      if (updated.exitCode !== 0) {
+        return deny(ReasonCode.INTERNAL_ERROR, "the worker commit exists, but the worktree's index could not be updated; it is left as it was", {
           head: commit,
-          error: indexed.stderr.slice(0, 500),
+          error: updated.stderr.slice(0, 500),
         });
       }
+      const descriptor = openSync(lock, "w");
+      try {
+        writeSync(descriptor, readFileSync(copy));
+        fsyncSync(descriptor);
+      } finally {
+        closeSync(descriptor);
+      }
+      renameSync(lock, realIndex);
+      held = false;
       return allow(ReasonCode.OK, commit);
     } catch (error) {
       return deny(ReasonCode.INTERNAL_ERROR, "the worker commit could not be written", {
         error: error instanceof Error ? error.message.slice(0, 500) : String(error),
       });
+    } finally {
+      if (held) rmSync(lock, { force: true });
     }
   },
 };

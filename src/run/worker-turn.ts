@@ -27,6 +27,7 @@ import {
   plumbingWorkerCommit,
   scanAgainst,
   stagedAgainst,
+  stagedContent,
 } from "./worker-git.ts";
 
 export type { WorkerCommitPort, WorkerDiffEntry } from "./worker-git.ts";
@@ -208,6 +209,8 @@ interface TurnFacts extends DurableFacts {
   config: string;
   /** Every git-dir file before the turn (bar the index). */
   gitDirFingerprint: string;
+  /** What the real index staged before the turn (`stagedContent`): its entries, never its stat cache. */
+  stagedBaseline: string;
 }
 
 interface InFlightTurn {
@@ -320,6 +323,8 @@ export const workerProcessReleaseOf = (value: unknown, db: Db): WorkerProcessIde
 
 export class WorkerTurnRunner {
   readonly #turns = new Map<string, InFlightTurn>();
+  /** Starts still being admitted: preparing, or opening their execution, and not yet a turn. */
+  readonly #admissions = new Set<Promise<void>>();
   readonly #busyWorktrees = new Set<string>();
   readonly #pollMs: number;
   readonly #processes: WorkerProcessPort;
@@ -346,9 +351,27 @@ export class WorkerTurnRunner {
    * another writer's are never reset, cleaned or folded into this turn (#512).
    */
   async start(request: WorkerTurnRequest): Promise<Decision<{ executionId: string }>> {
-    if (this.#stopping) {
-      return deny(ReasonCode.CONFLICT, "the daemon is stopping; no worker turn starts", { taskId: request.taskId });
+    if (this.#stopping) return this.stoppingRefusal(request.taskId);
+    // ACP-WORKER-03: an admission is tracked from its first step, not from its launch. A shutdown that
+    // begins while it is still preparing waits for it, and it launches nothing once shutdown has begun.
+    let settle!: () => void;
+    const admission = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    this.#admissions.add(admission);
+    try {
+      return await this.admit(request);
+    } finally {
+      this.#admissions.delete(admission);
+      settle();
     }
+  }
+
+  private stoppingRefusal(taskId: string): Decision<never> {
+    return deny(ReasonCode.CONFLICT, "the daemon is stopping; no worker turn starts", { taskId });
+  }
+
+  private async admit(request: WorkerTurnRequest): Promise<Decision<{ executionId: string }>> {
     const timeoutMs = Math.min(request.timeoutMs ?? WORKER_TURN_MAX_TIMEOUT_MS, WORKER_TURN_MAX_TIMEOUT_MS);
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
       return deny(ReasonCode.INVALID_ARGUMENT, "a worker turn timeout must be a positive number of milliseconds", {
@@ -377,6 +400,7 @@ export class WorkerTurnRunner {
     try {
       scratch = this.#scratchDir("acp-worker-git-");
       const prepared = await this.prepareWorktree(facts, scratch);
+      if (this.#stopping) return this.stoppingRefusal(request.taskId);
       if (!prepared.allowed) return prepared as Decision<{ executionId: string }>;
       const turn = prepared.value;
       const started = await this.ports.tasks.startWorkerExecution({
@@ -390,9 +414,14 @@ export class WorkerTurnRunner {
         worktreeId: worktree,
         concurrencyWidth: this.ports.tasks.runningWidth(turn.runId) + 1,
         runtimeManaged: true,
-      });
-      if (!started.allowed) return started as Decision<{ executionId: string }>;
+      }, () => !this.#stopping);
+      if (!started.allowed) return this.#stopping ? this.stoppingRefusal(request.taskId) : started as Decision<{ executionId: string }>;
       const executionId = started.value.executionId;
+      if (this.#stopping) {
+        // Opened in the instant before shutdown began; it is closed, never launched.
+        this.ports.tasks.finishExecution(executionId, { status: "ABANDONED", failureClass: "infrastructure" }, turn.runId);
+        return this.stoppingRefusal(request.taskId);
+      }
       this.ports.audit.record({
         kind: WorkerTurnEvent.STARTED,
         runId: turn.runId,
@@ -441,6 +470,9 @@ export class WorkerTurnRunner {
    */
   async shutdown(budgetMs = DEFAULT_SHUTDOWN_BUDGET_MS): Promise<{ drained: boolean; outstanding: string[] }> {
     this.#stopping = true;
+    // An admission that sees `#stopping` refuses before it opens an execution or registers a turn, so
+    // every turn that will ever exist is already in `#turns`; the admissions are waited for too.
+    const admissions = [...this.#admissions];
     const turns = [...this.#turns.values()];
     for (const turn of turns) {
       turn.stopping = true;
@@ -448,7 +480,7 @@ export class WorkerTurnRunner {
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
     const finished = await Promise.race([
-      Promise.allSettled(turns.map((turn) => turn.promise)).then(() => true),
+      Promise.allSettled([...turns.map((turn) => turn.promise), ...admissions]).then(() => true),
       new Promise<boolean>((resolve) => {
         timer = setTimeout(() => resolve(false), budgetMs);
       }),
@@ -461,11 +493,13 @@ export class WorkerTurnRunner {
           ORDER BY execution_id`,
       )
       .map((row) => row.execution_id);
+    const pendingStarts = this.#admissions.size;
+    const drained = finished && pendingStarts === 0 && this.#turns.size === 0;
     this.ports.audit.record({
       kind: WorkerTurnEvent.SHUTDOWN_DRAINED,
-      evidence: { drained: finished, turns: turns.length, executions: outstanding },
+      evidence: { drained, turns: turns.length, admissions: admissions.length, pendingStarts, executions: outstanding },
     });
-    return { drained: finished && outstanding.length === 0, outstanding };
+    return { drained: drained && outstanding.length === 0, outstanding };
   }
 
   /** Read-only: an execution's state, with diagnostics kept apart from the success digest. */
@@ -872,6 +906,15 @@ export class WorkerTurnRunner {
       }
       const staged = await stagedAgainst(repo, head);
       const scan = await scanAgainst(repo, head, objectFormat, "prepare");
+      // ACP-WORKER-05: a checked-out submodule keeps its state in another repository, which this
+      // runner never runs git inside, so it cannot verify one is clean or that a turn left it alone.
+      if (scan.populatedGitlinks.length > 0) {
+        return deny(
+          ReasonCode.CONFLICT,
+          "the claimed worktree has a checked-out or replaced submodule; a worker turn cannot verify one, so it does not start",
+          { worktreeId: worktree, paths: scan.populatedGitlinks.slice(0, 50) },
+        );
+      }
       const dirty = [...staged, ...scan.entries.map((entry) => entry.path), ...scan.unsafe];
       if (dirty.length > 0) {
         return deny(
@@ -891,12 +934,14 @@ export class WorkerTurnRunner {
         );
       }
       const config = await effectiveConfig(repo);
+      const stagedBaseline = await stagedContent(repo);
       return allow(ReasonCode.OK, {
         ...facts,
         repo,
         baseHead: head,
         objectFormat,
         config,
+        stagedBaseline,
         gitDirFingerprint: gitDirFingerprint(repo),
       });
     } catch (error) {
@@ -933,6 +978,8 @@ export class WorkerTurnRunner {
       }
     }, this.#pollMs);
     try {
+      // Stopped between admission and launch (a shutdown, a cancel or a takeover): nothing is launched.
+      if (controller.signal.aborted) throw new Error("the turn was stopped before its provider was launched");
       result = await adapter.invoke({
         prompt: workerPrompt(facts),
         workdir: facts.claim.worktree,
@@ -956,6 +1003,8 @@ export class WorkerTurnRunner {
         },
         onSpawn: (pid, startedAt) => {
           spawned = true;
+          // A provider that starts after its turn was stopped is never recorded, so the adapter kills it.
+          if (controller.signal.aborted || this.#stopping) throw new Error("the turn was stopped before its provider started");
           const recorded = this.ports.tasks.recordWorkerProcess(
             executionId, pid, startedAt,
             new WorkerProcessAuthorityToken(this.ports.db, "record", { executionId, pid, startedAt }),
@@ -1218,6 +1267,7 @@ export class WorkerTurnRunner {
           entries: first.entries,
           message: commitMessage(facts),
           format: facts.objectFormat,
+          stagedBaseline: facts.stagedBaseline,
         });
         if (!committed.allowed) {
           const head = typeof committed.evidence["head"] === "string" ? committed.evidence["head"] : null;
@@ -1314,6 +1364,11 @@ export class WorkerTurnRunner {
       const now = await headOf(repo);
       if (now.head !== facts.baseHead || now.branch !== facts.claim.branch) {
         return refused("HEAD_MOVED", ReasonCode.WRITE_EFFECT_FENCE_LOST, "HEAD or the branch moved during the turn");
+      }
+      // ACP-WORKER-06: someone staged, unstaged or marked an entry during the turn. A stat-cache refresh
+      // (the CLI's own `git status`) changes nothing here; staged work is never folded in or overwritten.
+      if ((await stagedContent(repo)) !== facts.stagedBaseline) {
+        return refused("STAGED_CONTENT_CHANGED", ReasonCode.WRITE_EFFECT_FENCE_LOST, "the index's staged content changed during the turn");
       }
       const scan = await scanAgainst(repo, facts.baseHead, facts.objectFormat, "observe");
       const outOfScope = new Set<string>(scan.unsafe);
