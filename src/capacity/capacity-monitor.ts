@@ -152,6 +152,66 @@ export const CAPACITY_DEFAULTS = {
   unattendedProbeOptIns: [] as readonly string[],
 };
 
+/** How many successive readings a role binding keeps for burn; only the newest two per window are read. */
+const ROLE_HISTORY_LIMIT = 16;
+
+/** One window observation, in the shape `capacity_snapshots` stores it. */
+interface BurnObservation {
+  bucket_id: string;
+  remaining_percent: number;
+  reset_at: string | null;
+  observed_at: string;
+}
+
+/**
+ * Recent, same-window deltas are the only burn evidence used for a worker reserve. `rows` are
+ * ordered by window, newest observation first. A first observation, a malformed timestamp, or a
+ * reset that increased quota is not a measured zero; the caller receives NaN and the
+ * corresponding bucket is held back. Shared by the persisted and the role-binding paths.
+ */
+const burnRateByBucket = (rows: readonly BurnObservation[]): Record<string, number> => {
+  const byBucket = new Map<string, BurnObservation[]>();
+  for (const row of rows) {
+    const entries = byBucket.get(row.bucket_id) ?? [];
+    entries.push(row);
+    byBucket.set(row.bucket_id, entries);
+  }
+  const rates: Record<string, number> = {};
+  for (const [bucketId, entries] of byBucket) {
+    const latest = entries[0];
+    const previous = entries[1];
+    if (!latest || !previous || latest.reset_at !== previous.reset_at) {
+      rates[bucketId] = Number.NaN;
+      continue;
+    }
+    const latestAt = new Date(latest.observed_at).getTime();
+    const previousAt = new Date(previous.observed_at).getTime();
+    const elapsedHours = (latestAt - previousAt) / (60 * 60 * 1000);
+    if (!Number.isFinite(elapsedHours) || elapsedHours <= 0) {
+      rates[bucketId] = Number.NaN;
+      continue;
+    }
+    // An increase under one reset window is inconsistent evidence. Treating it as no
+    // burn would understate reserve, so hold the bucket rather than guessing a rate.
+    const consumed = previous.remaining_percent - latest.remaining_percent;
+    rates[bucketId] = consumed < 0 ? Number.NaN : consumed / elapsedHours;
+  }
+  return rates;
+};
+
+/**
+ * The demand's burn facts from one per-window map: the map itself, and the aggregate as the
+ * largest measured rate, unknown when no window was measured.
+ */
+const withBurnRates = (demand: DynamicReserveDemand, rates: Record<string, number>): DynamicReserveDemand => {
+  const known = Object.values(rates).filter((rate) => Number.isFinite(rate));
+  return {
+    ...demand,
+    burnRatePercentPerHour: known.length > 0 ? Math.max(...known) : Number.NaN,
+    burnRatePercentPerHourByBucket: rates,
+  };
+};
+
 const isPlainRecord = (value: unknown): value is Record<string, unknown> => {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value);
@@ -328,6 +388,14 @@ export interface ProviderFailureContinuity {
 export class CapacityMonitor {
   // Deliberately not persisted: provider-global rows cannot represent role provenance.
   readonly #roleSnapshots = new WeakMap<RoleCapacityBinding, CapacityReading>();
+  /**
+   * #512 — the §14.5 burn source for a role binding: its own successive real probe readings,
+   * bounded to the newest `ROLE_HISTORY_LIMIT`. A role-scoped provider has no other: its readings
+   * never reach `capacity_snapshots`, and rows a provider wrote there before it became role-scoped
+   * must not stand in for this binding. In memory and keyed by the registration, so a restart or
+   * an invalidated binding starts it empty, and burn is unknown until two readings exist.
+   */
+  readonly #roleHistory = new WeakMap<RoleCapacityBinding, CapacityReading[]>();
   readonly #options: Required<CapacityOptions>;
 
   /** Exact-binding measurement used by explicit-role admission; never provider-global persistence. */
@@ -349,6 +417,11 @@ export class CapacityMonitor {
       return this.unknownRoleCapacity(provider, role);
     }
     this.#roleSnapshots.set(binding, structuredClone(reading));
+    // One entry per observation, as `capacity_snapshots`' (provider, bucket, observed_at) key keeps
+    // one row per observation: a collector answering the same observation twice replaces it.
+    const history = (this.#roleHistory.get(binding) ?? []).filter((entry) => entry.observedAt !== reading.observedAt);
+    history.push(structuredClone(reading));
+    this.#roleHistory.set(binding, history.slice(-ROLE_HISTORY_LIMIT));
     return this.roleCapacity(binding, reading);
   }
 
@@ -706,6 +779,7 @@ export class CapacityMonitor {
     // is a live measurement, and a live measurement is exactly what this gate exists to ask
     // for.
     let production: ProviderCapacity[];
+    let roleBinding: RoleCapacityBinding | null = null;
     if (target.role !== undefined) {
       const binding = this.providers.capacityBindingForRole(target.provider, target.role);
       const reading = await this.refreshForRole(target.provider, target.role);
@@ -721,6 +795,7 @@ export class CapacityMonitor {
           "the selected role capacity binding is unavailable or invalidated", { provider: target.provider, role: target.role });
       }
       production = [this.roleCapacity(binding, reading)];
+      roleBinding = binding;
     } else {
       const readings = await this.refresh(trigger, [target.provider]);
       // `representative`, not `require`: no role was named here, and `require` refuses that on
@@ -797,8 +872,16 @@ export class CapacityMonitor {
           { provider: selected.provider, capabilities: target.capabilities },
         );
       }
+      // #512 — a role binding's per-window burn is this monitor's own measurement, so it is
+      // re-derived here, from the binding's history now that the probe above has added the reading
+      // being admitted. `workerReserveDemand` computed the same map before that probe; a map from
+      // any other source is not trusted for a role binding. A demand without a per-window map keeps
+      // its aggregate, as before.
+      const demand = roleBinding && target.reserveDemand.burnRatePercentPerHourByBucket
+        ? withBurnRates(target.reserveDemand, this.roleBurnRateByBucket(roleBinding))
+        : target.reserveDemand;
       const reserves = new Map(
-        this.dynamicReserveByBucket(selected, target.reserveDemand).map((reserve) => [reserve.bucketId, reserve]),
+        this.dynamicReserveByBucket(selected, demand).map((reserve) => [reserve.bucketId, reserve]),
       );
       const applicable = selected.buckets.filter((bucket) =>
         target.capabilities.some((capability) => bucket.capabilities.includes(capability)),
@@ -845,8 +928,19 @@ export class CapacityMonitor {
   /**
    * §14.5 production input. Counts are read from durable state immediately before the
    * worker allocator asks for admission; callers cannot manufacture a zero-demand reserve.
+   *
+   * `role` names the role-scoped capacity binding the allocation is admitted against (WORKER for
+   * a provider whose adapters are registered per role, such as Claude). The provenance is read
+   * from the registry here, never supplied by the caller, and admission still refuses it unless it
+   * is the exact binding the fresh probe measured. Omitted, the demand carries no binding, which
+   * is what a provider without role-scoped adapters is admitted with.
+   *
+   * Burn for a role-scoped provider comes only from the role binding's in-memory history and never
+   * from `capacity_snapshots`, which such a provider does not write: rows left there from before it
+   * became role-scoped would otherwise measure a burn nothing current observed.
    */
-  workerReserveDemand(provider: string): DynamicReserveDemand {
+  workerReserveDemand(provider: string, role?: Role): DynamicReserveDemand {
+    const capacityBinding = role === undefined ? null : this.providers.capacityBindingForRole(provider, role);
     const roles = this.db.all<{ role: string; n: number }>(
       `SELECT role, COUNT(*) AS n
          FROM assignments
@@ -872,18 +966,21 @@ export class CapacityMonitor {
     const inFlightRuns = this.db.get<{ n: number }>(
       `SELECT COUNT(DISTINCT run_id) AS n FROM task_executions WHERE status = 'RUNNING'`,
     )?.n ?? 0;
-    const rates = this.measuredBurnRateByBucket(provider);
-    const knownRates = Object.values(rates).filter((rate) => Number.isFinite(rate));
-    return {
+    const rates = this.providers.hasRoleScoped(provider)
+      ? (capacityBinding ? this.roleBurnRateByBucket(capacityBinding) : {})
+      : this.measuredBurnRateByBucket(provider);
+    // The per-bucket map is authoritative when present. The aggregate is retained for callers
+    // that need a compact fact and remains unknown when no window was measured.
+    return withBurnRates({
+      ...(capacityBinding
+        ? { binding: { provider: capacityBinding.provider, role: capacityBinding.role, generation: capacityBinding.generation } }
+        : {}),
       criticalRoleInvocations: roleDemand.ceo + roleDemand.cto + roleDemand.reviewer,
       expectedReviews,
       inFlightRuns,
-      // The per-bucket map is authoritative when present. This aggregate is retained for
-      // callers that need a compact fact and remains unknown when no window was measured.
-      burnRatePercentPerHour: knownRates.length > 0 ? Math.max(...knownRates) : Number.NaN,
+      burnRatePercentPerHour: Number.NaN,
       roleDemand,
-      burnRatePercentPerHourByBucket: rates,
-    };
+    }, rates);
   }
 
   /** Latest known state for a provider, recomputed from the newest stored buckets. */
@@ -1126,51 +1223,42 @@ export class CapacityMonitor {
     });
   }
 
-  /**
-   * Recent, same-window deltas are the only burn evidence used for a worker reserve. A
-   * first observation, a malformed timestamp, or a reset that increased quota is not a
-   * measured zero; the caller receives NaN and the corresponding bucket is held back.
-   */
+  /** Burn for a provider without role-scoped adapters, from its persisted readings. */
   private measuredBurnRateByBucket(provider: string): Record<string, number> {
-    const rows = this.db.all<{
-      bucket_id: string;
-      remaining_percent: number;
-      reset_at: string | null;
-      observed_at: string;
-    }>(
+    const rows = this.db.all<BurnObservation>(
       `SELECT bucket_id, remaining_percent, reset_at, observed_at
          FROM capacity_snapshots
         WHERE provider = ? AND remaining_percent IS NOT NULL
         ORDER BY bucket_id ASC, observed_at DESC`,
       [provider],
     );
-    const byBucket = new Map<string, typeof rows>();
-    for (const row of rows) {
-      const entries = byBucket.get(row.bucket_id) ?? [];
-      entries.push(row);
-      byBucket.set(row.bucket_id, entries);
-    }
-    const rates: Record<string, number> = {};
-    for (const [bucketId, entries] of byBucket) {
-      const latest = entries[0];
-      const previous = entries[1];
-      if (!latest || !previous || latest.reset_at !== previous.reset_at) {
-        rates[bucketId] = Number.NaN;
-        continue;
+    return burnRateByBucket(rows);
+  }
+
+  /**
+   * The same formula over a role binding's in-memory history, newest first per window as the
+   * persisted query orders it. A window with fewer than two readings, two readings across a reset,
+   * or an increase is unknown, exactly as there.
+   */
+  private roleBurnRateByBucket(binding: RoleCapacityBinding): Record<string, number> {
+    const rows: BurnObservation[] = [];
+    for (const reading of this.#roleHistory.get(binding) ?? []) {
+      for (const bucket of reading.buckets) {
+        // `remaining_percent IS NOT NULL`: an unknown quota is not an observation of burn.
+        if (typeof bucket.remainingPercent !== "number" || !Number.isFinite(bucket.remainingPercent)) continue;
+        rows.push({
+          bucket_id: bucket.id,
+          remaining_percent: bucket.remainingPercent,
+          reset_at: bucket.resetAt,
+          observed_at: reading.observedAt,
+        });
       }
-      const latestAt = new Date(latest.observed_at).getTime();
-      const previousAt = new Date(previous.observed_at).getTime();
-      const elapsedHours = (latestAt - previousAt) / (60 * 60 * 1000);
-      if (!Number.isFinite(elapsedHours) || elapsedHours <= 0) {
-        rates[bucketId] = Number.NaN;
-        continue;
-      }
-      // An increase under one reset window is inconsistent evidence. Treating it as no
-      // burn would understate reserve, so hold the bucket rather than guessing a rate.
-      const consumed = previous.remaining_percent - latest.remaining_percent;
-      rates[bucketId] = consumed < 0 ? Number.NaN : consumed / elapsedHours;
     }
-    return rates;
+    rows.sort((a, b) =>
+      a.bucket_id === b.bucket_id
+        ? (a.observed_at < b.observed_at ? 1 : a.observed_at > b.observed_at ? -1 : 0)
+        : (a.bucket_id < b.bucket_id ? -1 : 1));
+    return burnRateByBucket(rows);
   }
 
   private enrich(input: CapacityReading): ProviderCapacity {

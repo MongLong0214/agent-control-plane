@@ -108,9 +108,9 @@ export interface CtoPreference {
  */
 /**
  * The workdir to persist for a provisioned session: the adapter's, when it is inside the
- * managed runtime root, and the root itself otherwise.
+ * managed runtime root, and the root itself otherwise. Shared with worker provisioning.
  */
-const containedWorkdir = (reported: string | null | undefined, managedRoot: string): string => {
+export const containedWorkdir = (reported: string | null | undefined, managedRoot: string): string => {
   if (!reported) return managedRoot;
   return reported === managedRoot || isWithin(managedRoot, reported) ? reported : managedRoot;
 };
@@ -1168,9 +1168,10 @@ const handleFor = (session: SessionRecord): SessionHandle => ({
 /**
  * An adapter that cannot prove the constituted session is authenticated and reachable
  * fails the check: a version banner or a lifecycle row is not session liveness (§14.3),
- * and a DEGRADED answer is not one either.
+ * and a DEGRADED answer is not one either. Exported so worker provisioning asks the same
+ * question rather than a copy of it.
  */
-const probeSessionHealth = async (
+export const probeSessionHealth = async (
   adapter: ProviderAdapter,
   handle: SessionHandle,
 ): Promise<Decision<void>> => {
@@ -1184,7 +1185,7 @@ const probeSessionHealth = async (
     });
   }
   if (health !== "HEALTHY") {
-    return deny(ReasonCode.SESSION_NOT_READY, "provider cannot prove the CTO session is ready", {
+    return deny(ReasonCode.SESSION_NOT_READY, "provider cannot prove the constituted session is ready", {
       provider: adapter.provider,
       runtimeHealth: health,
     });

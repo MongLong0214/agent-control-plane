@@ -11,6 +11,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import {
   type FailureClass,
+  Role,
   RunState,
   type TaskCategory,
   type TaskClass,
@@ -104,7 +105,12 @@ export interface ExecutionRecord {
 /** The worker allocator must admit its exact lower-priority allocation before recording it. */
 export interface WorkerCapacityGate {
   refreshForWorkerFanout(target?: WorkerFanoutCapacityTarget): Promise<Decision<void>>;
-  workerReserveDemand(provider: string): DynamicReserveDemand;
+  workerReserveDemand(provider: string, role?: Role): DynamicReserveDemand;
+  /**
+   * Whether the provider's adapters, and so its capacity, are registered per role. Such a
+   * provider is admitted only against a named role: provider-only admission refuses it.
+   */
+  hasRoleScoped(provider: string): boolean;
 }
 
 /**
@@ -432,24 +438,48 @@ export class TaskGraph {
     // `startExecution` repeats this check inside its transaction after the async probe.
     const workerBinding = this.assertLiveWorkerBinding(input);
     if (!workerBinding.allowed) return workerBinding as Decision<ExecutionRecord>;
+    const capacity = await this.admitWorkerFanout(input.provider, input.model, {
+      runId: input.runId,
+      taskId: input.taskId,
+    });
+    if (!capacity.allowed) return capacity as Decision<ExecutionRecord>;
+    return this.startExecution(input);
+  }
+
+  /**
+   * §14.2/§14.5 — the one worker fan-out admission, shared by execution start and by worker
+   * provisioning (`worker-staffing.ts`), so both ask capacity the same question.
+   *
+   * A provider whose adapters are registered per role (Claude, under the deployment's ambient
+   * OAuth identity) is admitted as `Role.WORKER`: the fresh reading is that role binding's own
+   * probe, and the reserve demand carries the binding it was measured for. Provider-only
+   * admission refuses such a provider outright, which is what left every Claude worker
+   * unroutable. Naming the role does not relax anything: an unknown, stale or unreadable reading
+   * still refuses as `CAPACITY_UNKNOWN_NOT_ROUTABLE`, and the dynamic reserve still applies.
+   */
+  async admitWorkerFanout(
+    provider: string,
+    model: string,
+    evidence: Record<string, unknown> = {},
+  ): Promise<Decision<void>> {
     if (!this.#capacity) {
       return deny(
         ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
         "worker execution has no attached capacity admission gate",
-        { runId: input.runId, taskId: input.taskId, provider: input.provider },
+        { ...evidence, provider },
       );
     }
+    const role = this.#capacity.hasRoleScoped(provider) ? Role.WORKER : undefined;
     const target: WorkerFanoutCapacityTarget = {
-      provider: input.provider,
-      capabilities: [this.workerCapability(input.model)],
+      provider,
+      ...(role === undefined ? {} : { role }),
+      capabilities: [this.workerCapability(model)],
       priority: "worker",
       // The monitor reads durable role/running-work facts. Passing the complete demand on
       // this production path makes worker priority explicit instead of caller-optional.
-      reserveDemand: this.#capacity.workerReserveDemand(input.provider),
+      reserveDemand: this.#capacity.workerReserveDemand(provider, role),
     };
-    const capacity = await this.#capacity.refreshForWorkerFanout(target);
-    if (!capacity.allowed) return capacity as Decision<ExecutionRecord>;
-    return this.startExecution(input);
+    return this.#capacity.refreshForWorkerFanout(target);
   }
 
   finishExecution(

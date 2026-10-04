@@ -253,6 +253,10 @@ export class BindingRegistry {
         const independence = this.assertReviewerIndependence(input.runId, input.sessionId);
         if (!independence.allowed) return independence as Decision<RoleBinding>;
       }
+      if (input.role === Role.WORKER) {
+        const independence = this.assertWorkerIndependence(input);
+        if (!independence.allowed) return independence as Decision<RoleBinding>;
+      }
 
       const generation = this.nextGeneration(roleKey);
       const assignmentId = newAssignmentId();
@@ -496,6 +500,10 @@ export class BindingRegistry {
       }
       if (input.role === "BLIND_REVIEWER" && input.runId) {
         const independence = this.assertReviewerIndependence(input.runId, input.sessionId);
+        if (!independence.allowed) return independence as Decision<RoleBinding>;
+      }
+      if (input.role === Role.WORKER) {
+        const independence = this.assertWorkerIndependence(input);
         if (!independence.allowed) return independence as Decision<RoleBinding>;
       }
 
@@ -973,6 +981,50 @@ export class BindingRegistry {
         ReasonCode.REVIEWER_SESSION_IS_PRODUCER,
         "candidate reviewer session belongs to the run's producer set",
         { runId, sessionId, producers: [...producers] },
+      );
+    }
+    return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * #512 — a WORKER is an implementer, never the session that routes or reviews it. Refused when
+   * the incoming session holds any active non-WORKER binding, by the binding's recorded session
+   * or by its actor's live runtime, or when it owns the task's run.
+   *
+   * A backstop under the worker provisioning path, which only ever binds a session it has just
+   * constituted. It does not depend on that caller: any `bind` or `switchTo` that names a WORKER
+   * is asked the same question.
+   */
+  private assertWorkerIndependence(input: BindInput): Decision<void> {
+    const held = this.db.get<{ role_key: string; role: string }>(
+      `SELECT a.role_key, a.role
+         FROM assignments a
+         LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+        WHERE a.status = 'ACTIVE' AND a.role <> 'WORKER'
+          AND (a.session_id = ? OR c.current_session_id = ?)
+        ORDER BY a.role_key
+        LIMIT 1`,
+      [input.sessionId, input.sessionId],
+    );
+    if (held) {
+      return deny(
+        ReasonCode.WORKER_SESSION_NOT_INDEPENDENT,
+        "a worker session must not hold another role",
+        { sessionId: input.sessionId, roleKey: held.role_key, role: held.role },
+      );
+    }
+    const owned = this.db.get<{ run_id: string }>(
+      `SELECT run_id FROM runs
+        WHERE owner_session_id = ?
+          AND (run_id = ? OR run_id = (SELECT run_id FROM tasks WHERE task_id = ?))
+        LIMIT 1`,
+      [input.sessionId, input.runId ?? null, input.taskId ?? null],
+    );
+    if (owned) {
+      return deny(
+        ReasonCode.WORKER_SESSION_NOT_INDEPENDENT,
+        "a worker session must not be the owner of the task's run",
+        { sessionId: input.sessionId, runId: owned.run_id },
       );
     }
     return allow(ReasonCode.OK, undefined);

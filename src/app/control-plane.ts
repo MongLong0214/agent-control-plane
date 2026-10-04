@@ -33,6 +33,7 @@ import { BlindReviewGate, type ReviewerPreference } from "../review/blind-review
 import { CandidatePipeline } from "../run/candidate-pipeline.ts";
 import { type CompletionAuthority, type CompletionAuthoritySet, RunEngine } from "../run/run-engine.ts";
 import { TaskGraph } from "../run/task-graph.ts";
+import { WorkerStaffing } from "../run/worker-staffing.ts";
 import { ClaudeCliAdapter, CodexCliAdapter, GrokCliAdapter, type CliAdapterOptions } from "../runtime/cli-adapters.ts";
 import {
   GuardedInvocationWriteBroker,
@@ -273,6 +274,8 @@ export class ControlPlane {
   readonly worktrees: WorktreeManager;
   readonly guard: ManagedWriteGuard;
   readonly tasks: TaskGraph;
+  /** #512 — the production path that mints a task's first WORKER binding. */
+  readonly workers: WorkerStaffing;
   readonly runs: RunEngine;
   readonly verification: VerificationEngine;
   readonly review: BlindReviewGate;
@@ -543,7 +546,8 @@ export class ControlPlane {
       this.tasks.attach({
         capacity: {
           refreshForWorkerFanout: (target) => this.capacity.refreshForWorkerFanout(target),
-          workerReserveDemand: (provider) => this.capacity.workerReserveDemand(provider),
+          workerReserveDemand: (provider, role) => this.capacity.workerReserveDemand(provider, role),
+          hasRoleScoped: (provider) => this.providers.hasRoleScoped(provider),
         },
       });
       this.review.attach({
@@ -724,6 +728,14 @@ export class ControlPlane {
       });
       this.cto.attach({ readiness: { checkSession: (id) => this.doctor.sessionReadiness(id) } });
       this.continuity.attach({ readiness: { checkSession: (id) => this.doctor.sessionReadiness(id) } });
+      this.workers = new WorkerStaffing(this.db, this.clock, this.audit, {
+        runs: this.runs,
+        tasks: this.tasks,
+        bindings: this.bindings,
+        sessions: this.sessions,
+        providers: this.providers,
+        readiness: { checkSession: (id) => this.doctor.sessionReadiness(id) },
+      }, runtimeRoot);
     } catch (error) {
       this.db.close();
       throw error;
