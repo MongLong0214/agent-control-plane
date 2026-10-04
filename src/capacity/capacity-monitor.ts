@@ -155,6 +155,23 @@ export const CAPACITY_DEFAULTS = {
 /** How many successive readings a role binding keeps for burn; only the newest two per window are read. */
 const ROLE_HISTORY_LIMIT = 16;
 
+/**
+ * One accepted observation in a role binding's burn history.
+ *
+ * `identity` is the collector's own observation instant — the raw `observedAt`, parsed, so the
+ * same instant written two ways is one observation. It is the only identity a reading carries:
+ * `source` names the collector, not the observation, and `rawOutputDigest` digests content, which
+ * an idle account repeats across genuinely separate reads. `acceptedAt` is the normalized instant
+ * at which the monitor first accepted the observation; a re-read of it replaces this entry and
+ * keeps that first instant, so a permitted clock lead that normalizes later on a re-read cannot
+ * turn one observation into two.
+ */
+interface RoleObservation {
+  readonly identity: number;
+  readonly acceptedAt: string;
+  readonly buckets: CapacityReading["buckets"];
+}
+
 /** One window observation, in the shape `capacity_snapshots` stores it. */
 interface BurnObservation {
   bucket_id: string;
@@ -389,13 +406,13 @@ export class CapacityMonitor {
   // Deliberately not persisted: provider-global rows cannot represent role provenance.
   readonly #roleSnapshots = new WeakMap<RoleCapacityBinding, CapacityReading>();
   /**
-   * #512 — the §14.5 burn source for a role binding: its own successive real probe readings that
-   * enrichment judged HEALTHY, bounded to the newest `ROLE_HISTORY_LIMIT`. A role-scoped provider has no other: its readings
+   * #512 — the §14.5 burn source for a role binding: its own distinct real probe observations
+   * that enrichment judged HEALTHY, bounded to the newest `ROLE_HISTORY_LIMIT`. A role-scoped provider has no other: its readings
    * never reach `capacity_snapshots`, and rows a provider wrote there before it became role-scoped
    * must not stand in for this binding. In memory and keyed by the registration, so a restart or
    * an invalidated binding starts it empty, and burn is unknown until two readings exist.
    */
-  readonly #roleHistory = new WeakMap<RoleCapacityBinding, CapacityReading[]>();
+  readonly #roleHistory = new WeakMap<RoleCapacityBinding, RoleObservation[]>();
   readonly #options: Required<CapacityOptions>;
 
   /** Exact-binding measurement used by explicit-role admission; never provider-global persistence. */
@@ -424,11 +441,18 @@ export class CapacityMonitor {
     // never enter. Its timestamp is the normalized one, so a permitted clock lead cannot sit in
     // the future of every later reading.
     if (measured.sensorHealth === "HEALTHY") {
-      // One entry per observation, as `capacity_snapshots`' (provider, bucket, observed_at) key
-      // keeps one row per observation: a collector answering the same observation twice replaces it.
-      const observation: CapacityReading = structuredClone({ ...reading, observedAt: measured.observedAt });
-      const history = (this.#roleHistory.get(binding) ?? []).filter((entry) => entry.observedAt !== observation.observedAt);
-      history.push(observation);
+      // One entry per observation, keyed by the collector's own instant (`RoleObservation`): a
+      // re-read of the same observation replaces its entry and keeps the instant it was first
+      // accepted at, however that observation's lead normalizes now.
+      const identity = Date.parse(reading.observedAt);
+      const previous = this.#roleHistory.get(binding) ?? [];
+      const first = previous.find((entry) => entry.identity === identity);
+      const history = previous.filter((entry) => entry.identity !== identity);
+      history.push({
+        identity,
+        acceptedAt: first?.acceptedAt ?? new Date(Date.parse(measured.observedAt)).toISOString(),
+        buckets: structuredClone(reading.buckets),
+      });
       this.#roleHistory.set(binding, history.slice(-ROLE_HISTORY_LIMIT));
     }
     return measured;
@@ -856,6 +880,17 @@ export class CapacityMonitor {
         { provider: selected.provider, capabilities: unroutable, admission: selected.allocationAdmission },
       );
     }
+    // #512 — a role-scoped worker is admitted only on a fresh reading. §14.3's stale grace keeps a
+    // reading routable for a while after its freshness window; that grace still applies to the
+    // critical roles' admission here, but a worker's quota claim has to be current evidence at the
+    // moment it is decided, whatever burn history already exists.
+    if (trigger === RefreshTrigger.WORKER_FANOUT && roleBinding && selected.sensorHealth !== "HEALTHY") {
+      return deny(
+        ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
+        "a role-scoped worker is admitted only on a fresh capacity reading",
+        { provider: selected.provider, role: target.role ?? null, sensorHealth: selected.sensorHealth, ageMs: selected.ageMs },
+      );
+    }
 
     if (target.capabilities.some(isWorkerCapability) && target.priority !== "worker") {
       return deny(
@@ -1251,15 +1286,16 @@ export class CapacityMonitor {
    */
   private roleBurnRateByBucket(binding: RoleCapacityBinding): Record<string, number> {
     const rows: BurnObservation[] = [];
-    for (const reading of this.#roleHistory.get(binding) ?? []) {
-      for (const bucket of reading.buckets) {
+    for (const observation of this.#roleHistory.get(binding) ?? []) {
+      for (const bucket of observation.buckets) {
         // `remaining_percent IS NOT NULL`: an unknown quota is not an observation of burn.
         if (typeof bucket.remainingPercent !== "number" || !Number.isFinite(bucket.remainingPercent)) continue;
         rows.push({
           bucket_id: bucket.id,
           remaining_percent: bucket.remainingPercent,
           reset_at: bucket.resetAt,
-          observed_at: reading.observedAt,
+          // Canonical ISO, so the newest-first ordering below compares instants, not spellings.
+          observed_at: observation.acceptedAt,
         });
       }
     }

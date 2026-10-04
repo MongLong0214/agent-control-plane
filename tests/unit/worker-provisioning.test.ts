@@ -1029,7 +1029,8 @@ describe("ACP1069-R1-01: only readings the monitor accepts as current are burn e
   it("a STALE reading is not an observation, even inside the stale grace", async () => {
     await withFixture(async (f) => {
       f.claude.setCapacity(claudeReadingAt(f.harness, 81, 10));
-      conserve(await f.provision());
+      // Refused as evidence at decision time (ROUND1-ESCAPE-01) and kept out of the history.
+      expect((await f.provision()).reasonCode).toBe(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE);
       f.claude.setCapacity(claudeReadingAt(f.harness, 80, 0));
       conserve(await f.provision());
       expectNothingSpawned(f, 0);
@@ -1279,6 +1280,118 @@ describe("ACP1069-R1-03: a worker receipt is admitted and recorded as its sessio
       expect(refused.reasonCode).toBe(ReasonCode.CONFLICT);
       expect(f.harness.cp.tasks.get(f.taskId)?.state).toBe(TaskState.READY);
       expect(recorded(f).executions).toEqual([]);
+    });
+  });
+});
+
+/** A started receipt for a worker bound directly as Claude Opus, through the socket. */
+const startedReceipt = (f: Fixture, workerSessionId: string) =>
+  f.cto.call("task_receipt_submit", {
+    idempotencyKey: randomUUID(),
+    runId: f.runId,
+    taskId: f.taskId,
+    phase: "started",
+    workerSessionId,
+    repositoryId: f.repositoryId,
+  });
+
+const expectNotStarted = (f: Fixture): void => {
+  expect(f.harness.cp.tasks.get(f.taskId)?.state).toBe(TaskState.READY);
+  expect(f.harness.cp.db.all(`SELECT 1 FROM task_executions WHERE task_id = ?`, [f.taskId])).toEqual([]);
+};
+
+describe("ACP1069-R2-01: one collector observation is one burn observation, however often it is re-read", () => {
+  const conserve = (body: ToolBody) => expect(body.reasonCode, body.message).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+  /** An unchanged 81% observation the collector dated 50 seconds ahead of the monitor's clock. */
+  const leadObservation = (f: Fixture) => claudeReadingAt(f.harness, 81, -50 / 60);
+
+  it("provisioning: the same led observation re-read 30 seconds later is still one observation", async () => {
+    await withFixture(async (f) => {
+      const observation = leadObservation(f);
+      f.claude.setCapacity(observation);
+      conserve(await f.provision());
+      f.harness.clock.advance(30_000);
+      f.claude.setCapacity(structuredClone(observation));
+      conserve(await f.provision());
+      expect(f.claude.capacityProbes).toBe(2);
+      expectNothingSpawned(f, 0);
+    }, { primeReading: false });
+  });
+
+  it("receipt: the same led observation re-read 30 seconds later does not start the execution", async () => {
+    await withFixture(async (f) => {
+      const worker = bindWorker(f.harness, f.taskId, { provider: "claude", model: "opus" });
+      const observation = leadObservation(f);
+      f.claude.setCapacity(observation);
+      conserve(await startedReceipt(f, worker));
+      f.harness.clock.advance(30_000);
+      f.claude.setCapacity(structuredClone(observation));
+      conserve(await startedReceipt(f, worker));
+      expectNotStarted(f);
+    }, { primeReading: false });
+  });
+
+  it("distinct observations are ordered by instant, not by how their timestamps are written", async () => {
+    await withFixture(async (f) => {
+      // 81% two minutes ago, written at +09:00 so its text sorts after the newer one; then 80% now.
+      const older = claudeReadingAt(f.harness, 81, 2);
+      const offset = new Date(Date.parse(older.observedAt) + 9 * 60 * 60 * 1000).toISOString().replace("Z", "+09:00");
+      expect(Date.parse(offset)).toBe(Date.parse(older.observedAt));
+      await takeWorkerReading(f.harness, f.claude, { ...older, observedAt: offset }, claudeReadingAt(f.harness, 80, 0));
+      const admitted = await f.provision();
+      expect(admitted.reasonCode, admitted.message).toBe(ReasonCode.OK);
+    }, { primeReading: false });
+  });
+
+  it("the same instant written another way is the same observation", async () => {
+    await withFixture(async (f) => {
+      const observation = leadObservation(f);
+      f.claude.setCapacity(observation);
+      conserve(await f.provision());
+      f.harness.clock.advance(30_000);
+      const rewritten = observation.observedAt.replace(/\.\d{3}Z$/, "+00:00");
+      expect(rewritten).not.toBe(observation.observedAt);
+      expect(Date.parse(rewritten)).toBe(Date.parse(observation.observedAt));
+      f.claude.setCapacity({ ...structuredClone(observation), observedAt: rewritten });
+      conserve(await f.provision());
+      expectNothingSpawned(f, 0);
+    }, { primeReading: false });
+  });
+});
+
+describe("ROUND1-ESCAPE-01: a Claude worker is admitted only on a fresh reading, whatever burn is measured", () => {
+  /** Two valid observations (81% three minutes ago, 80% one minute ago), then a reading ten minutes old. */
+  const measuredThenStale = async (f: Fixture): Promise<void> => {
+    await takeWorkerReading(f.harness, f.claude, claudeReadingAt(f.harness, 80, 1), claudeReadingAt(f.harness, 79, 10));
+    expect(f.harness.cp.capacity.workerReserveDemand("claude", Role.WORKER).burnRatePercentPerHourByBucket?.[BUCKET])
+      .toBeCloseTo(30, 5);
+  };
+
+  it("provisioning refuses a STALE latest reading", async () => {
+    await withFixture(async (f) => {
+      await measuredThenStale(f);
+      const refused = await f.provision();
+      expect(refused.reasonCode, refused.message).toBe(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE);
+      expectNothingSpawned(f, 0);
+    });
+  });
+
+  it("a started receipt refuses a STALE latest reading and the task stays READY", async () => {
+    await withFixture(async (f) => {
+      const worker = bindWorker(f.harness, f.taskId, { provider: "claude", model: "opus" });
+      await measuredThenStale(f);
+      const refused = await startedReceipt(f, worker);
+      expect(refused.reasonCode, refused.message).toBe(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE);
+      expectNotStarted(f);
+    });
+  });
+
+  it("unchanged in this PR: the CTO role's dispatch admission keeps the §14.3 stale grace", async () => {
+    await withFixture(async (f) => {
+      f.claude.setCapacity(claudeReadingAt(f.harness, 79, 10));
+      const admitted = await f.harness.cp.capacity.refreshForDispatch({ provider: "claude", role: Role.PRIMARY_CTO, capabilities: ["cto"] });
+      expect(admitted.reasonCode).toBe(ReasonCode.OK);
+      expect(f.harness.cp.capacity.currentForRole("claude", Role.PRIMARY_CTO)?.sensorHealth).toBe("STALE");
     });
   });
 });
