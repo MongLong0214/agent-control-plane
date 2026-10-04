@@ -854,7 +854,7 @@ const startWorkerWithMeasuredReserve = async (input: {
   }
 
   const task = cp.tasks.ready(created.value.runId)[0]!;
-  const workerSessionId = bindWorkerForTask(cp, task.taskId);
+  const workerSessionId = bindWorkerForTask(cp, task.taskId, { provider: "gpt", model: "worker" });
   const demand = input.reserveDemandOverride ?? cp.capacity.workerReserveDemand("gpt");
   const demandOverride = input.reserveDemandOverride
     ? vi.spyOn(cp.capacity, "workerReserveDemand").mockReturnValue(input.reserveDemandOverride)

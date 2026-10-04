@@ -62,6 +62,11 @@ export const ReasonCode = {
   REVIEWER_NOT_INDEPENDENT: "REVIEWER_NOT_INDEPENDENT",
   REVIEWER_SESSION_IS_PRODUCER: "REVIEWER_SESSION_IS_PRODUCER",
   FINAL_CEO_SESSION_NOT_INDEPENDENT: "FINAL_CEO_SESSION_NOT_INDEPENDENT",
+  /**
+   * A WORKER binding named a session that holds another role or owns the task's run. The CTO
+   * routes and reviews; the implementer is a separate session (#512).
+   */
+  WORKER_SESSION_NOT_INDEPENDENT: "WORKER_SESSION_NOT_INDEPENDENT",
 
   // --- CP-HI-05 Trusted GitHub Credential ---------------------------------
   TRUSTED_CREDENTIAL_UNAVAILABLE: "TRUSTED_CREDENTIAL_UNAVAILABLE",
