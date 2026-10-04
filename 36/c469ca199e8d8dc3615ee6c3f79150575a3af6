@@ -1,0 +1,21 @@
+Limit: right after a restart or an idle period the WORKER role's in-memory burn history holds one reading, so the first task_worker_provision is refused CAPACITY_ADMISSION_CONSERVE and the second admits; unknown capacity stays refused rather than borrowed from another role
+Ruled-out: reading capacity_snapshots for a per-role provider | a live database can still hold Claude rows from before #917, which would produce a burn rate from old history
+Warn: task_worker_provision accepts only provider claude with model opus; any other provider or model is refused and nothing is substituted
+Warn: bind() and switchTo() refuse a WORKER on a session that holds another active role or owns the task's run (WORKER_SESSION_NOT_INDEPENDENT); this is code-level only until the v41 trigger
+Warn: a refusal after the worker session is created stops that session, so no READY worker is left behind
+Record-Id: r-workerprovision
+Provenance: inherited e29b03109b6ea520e733723b052611481b21daeb
+
+Limit: a capacity reading enters the WORKER burn history only after enrichment judges it HEALTHY, stored at its normalized time; sensor health is counted, runtime health is not
+Warn: WORKER separation is checked in every bind and switchTo whatever the incoming role, counting recorded sessions, live runtimes and moved actors, so a WORKER session can never also hold another role in either order
+Warn: task_receipt_submit takes provider and model from the bound worker session; a receipt naming different ones is refused CONFLICT before any probe, and omitted fields now mean the session's
+Record-Id: r-workerprovisionr1
+Follows: r-workerprovision
+Provenance: inherited fa3d79d4cdb2027466a11c7d40a164c7bd96a144
+
+Limit: Claude WORKER admission requires a HEALTHY reading at decision time whatever burn history exists; critical-role admission (PRIMARY_CTO dispatch, blind review, provider switch) still accepts a STALE reading inside the grace window and is unchanged here
+Ruled-out: keying burn history on rawOutputDigest | an idle account repeats the same output across genuinely separate reads, so zero burn could never be measured; the collector's raw observedAt instant is the identity instead
+Warn: a re-read of the same observation replaces its history entry and keeps the instant it was first accepted, so one observation can never count as two
+Record-Id: r-workerprovisionr2
+Follows: r-workerprovisionr1
+Provenance: inherited 7afbb0f21a4557c09d71b748dc7db35a70e8a1db
