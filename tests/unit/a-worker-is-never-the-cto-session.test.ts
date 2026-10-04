@@ -36,6 +36,14 @@ const V41_TRIGGERS = [
   "assignments_session_holds_no_worker_on_activate",
   "conversational_actors_session_holds_no_worker",
   "runs_owner_session_not_its_worker",
+  // #1070: the worker-process record's guards, installed by the same step.
+  "task_executions_worker_process_record_authority",
+  "task_executions_worker_process_record_not_inserted",
+  "task_executions_worker_process_release_authority",
+  "task_executions_worker_process_release_not_inserted",
+  "task_executions_worker_process_write_once",
+  "task_executions_runtime_managed_immutable",
+  "task_executions_outstanding_process_no_delete",
 ];
 const IN_V41 = V41_TRIGGERS.map(() => "?").join(", ");
 
@@ -162,6 +170,7 @@ describe("#512 a WORKER is never the CTO's session", () => {
       const columns = db.all<{ name: string }>(`SELECT name FROM pragma_table_info('task_executions')`).map((row) => row.name);
       expect(columns).toContain("runtime_managed");
       expect(columns).toContain("worker_process_started_at");
+      expect(columns).toContain("worker_process_released_at");
       expect(db.get<{ version: number }>(`SELECT MAX(version) AS version FROM schema_migrations`)?.version).toBe(SCHEMA_VERSION);
     } finally {
       db.close();
@@ -487,7 +496,7 @@ const asV40Image = (path: string, seed?: (raw: Database.Database) => void): void
   const raw = new Database(path);
   try {
     for (const trigger of V41_TRIGGERS) raw.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
-    for (const column of ["runtime_managed", "worker_process_started_at"]) {
+    for (const column of ["runtime_managed", "worker_process_started_at", "worker_process_released_at"]) {
       raw.exec(`ALTER TABLE task_executions DROP COLUMN ${column}`);
     }
     raw.function("acp_schema_migration_authorized", () => 1);

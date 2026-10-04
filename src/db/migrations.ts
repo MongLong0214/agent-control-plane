@@ -137,6 +137,8 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   /-- CP-HI-06 — a Buzz event's admitted row \(ACP-RESTART-02, schema v40\)[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_buzz_source_key_immutable[\s\S]*?\nEND;/,
   // v41 alone installs the worker-session independence guards (#512), both directions.
   /-- -{75}\n-- worker session independence[\s\S]*?CREATE TRIGGER IF NOT EXISTS runs_owner_session_not_its_worker[\s\S]*?\nEND;/,
+  // v41 alone installs the worker-process record guards (#1070): they name columns v41 adds.
+  /-- -{75}\n-- worker process record[\s\S]*?CREATE TRIGGER IF NOT EXISTS task_executions_outstanding_process_no_delete[\s\S]*?\nEND;/,
 ];
 
 /**
@@ -2800,7 +2802,22 @@ const V41_WORKER_INDEPENDENCE_TRIGGER_NAMES: readonly string[] = [
   "runs_owner_session_not_its_worker",
 ];
 
-/** v41's two task_executions columns, each with the shape schema.sql declares for it. */
+/**
+ * v41's guards on the worker-process record (#1070): the pid and start time and the release are each
+ * written only under the runner's connection-local authority, the record is write-once,
+ * `runtime_managed` is fixed at insert, and an outstanding row is never deleted.
+ */
+const V41_WORKER_PROCESS_TRIGGER_NAMES: readonly string[] = [
+  "task_executions_worker_process_record_authority",
+  "task_executions_worker_process_record_not_inserted",
+  "task_executions_worker_process_release_authority",
+  "task_executions_worker_process_release_not_inserted",
+  "task_executions_worker_process_write_once",
+  "task_executions_runtime_managed_immutable",
+  "task_executions_outstanding_process_no_delete",
+];
+
+/** v41's task_executions columns, each with the shape schema.sql declares for it. */
 const V41_TASK_EXECUTION_COLUMNS: ReadonlyArray<{
   name: string;
   type: string;
@@ -2811,6 +2828,7 @@ const V41_TASK_EXECUTION_COLUMNS: ReadonlyArray<{
 }> = [
   { name: "runtime_managed", type: "INTEGER", notnull: 1, defaultValue: "0", unvouched: "runtime_managed <> 0" },
   { name: "worker_process_started_at", type: "TEXT", notnull: 0, defaultValue: null, unvouched: "worker_process_started_at IS NOT NULL" },
+  { name: "worker_process_released_at", type: "TEXT", notnull: 0, defaultValue: null, unvouched: "worker_process_released_at IS NOT NULL" },
 ];
 
 /**
@@ -2844,7 +2862,8 @@ const V41_WORKER_SESSION_VIOLATIONS = `
  * `task_executions.runtime_managed` marks the executions the runtime launched: their started and
  * finished receipts are the control plane's, never the CTO's. `task_executions.worker_process_started_at`
  * holds the OS start time read from the spawned process, so a restart can tell the recorded worker
- * from a process that merely reuses its pid.
+ * from a process that merely reuses its pid, and `worker_process_released_at` records when that
+ * process was confirmed gone: until then it is outstanding, whatever the execution's status says.
  *
  * And the implementer is a separate session, whichever role is attached first. Three triggers refuse
  * an ACTIVE WORKER binding whose session is its run owner's or holds another ACTIVE non-WORKER
@@ -2858,7 +2877,15 @@ const V41_WORKER_SESSION_VIOLATIONS = `
  * decide which of the two roles the shared session should lose, so the step throws and the whole
  * migration rolls back with every row as it was. It never revokes, rewrites or deletes data.
  *
- * Additive otherwise: two nullable-or-defaulted columns and seven triggers. A chain test can build a
+ * The worker-process record is the database's too (#1070). The pid and start time are written only
+ * under the runner's connection-local authority for the exact execution, pid and start time its
+ * provider reported at spawn, and the release only under its authority for the process it confirmed
+ * gone; both are write-once; `runtime_managed` is fixed at insert; a runtime-managed row is never
+ * inserted with a process, no row is inserted released, and no row whose process is outstanding is
+ * deleted. A raw writer could otherwise point a restart's kill at any process of this user, or admit
+ * a retry while the old process still runs.
+ *
+ * Additive otherwise: three nullable-or-defaulted columns and fourteen triggers. A chain test can build a
  * v40 image out of a current database, which already has both columns; a column already present is
  * accepted only with schema.sql's exact shape and no value this step did not write, and the
  * triggers are dropped and recreated, as v40 does for its own.
@@ -2904,8 +2931,9 @@ const v41: SchemaMigration = {
         + `or another role (${violations.join(", ")}); nothing was changed`,
       );
     }
-    raw.exec(dropsFor(V41_WORKER_INDEPENDENCE_TRIGGER_NAMES));
-    raw.exec(triggerDdlFor(V41_WORKER_INDEPENDENCE_TRIGGER_NAMES, SCHEMA_VERSION));
+    const v41Triggers = [...V41_WORKER_INDEPENDENCE_TRIGGER_NAMES, ...V41_WORKER_PROCESS_TRIGGER_NAMES];
+    raw.exec(dropsFor(v41Triggers));
+    raw.exec(triggerDdlFor(v41Triggers, SCHEMA_VERSION));
   },
   checksum: () => migrationChecksum("v41-runtime-managed-worker-turns", SCHEMA_VERSION),
 };
@@ -3081,6 +3109,13 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "assignments_session_holds_no_worker_on_activate", sentinel: "WORKER_SESSION_NOT_INDEPENDENT", introducedIn: 41 },
   { name: "conversational_actors_session_holds_no_worker", sentinel: "WORKER_SESSION_NOT_INDEPENDENT", introducedIn: 41 },
   { name: "runs_owner_session_not_its_worker", sentinel: "WORKER_SESSION_NOT_INDEPENDENT", introducedIn: 41 },
+  { name: "task_executions_worker_process_record_authority", sentinel: "TASK_EXECUTION_WORKER_PROCESS_RECORD_AUTHORITY_DENIED", introducedIn: 41 },
+  { name: "task_executions_worker_process_record_not_inserted", sentinel: "TASK_EXECUTION_WORKER_PROCESS_RECORD_AUTHORITY_DENIED", introducedIn: 41 },
+  { name: "task_executions_worker_process_release_authority", sentinel: "TASK_EXECUTION_WORKER_PROCESS_RELEASE_AUTHORITY_DENIED", introducedIn: 41 },
+  { name: "task_executions_worker_process_release_not_inserted", sentinel: "TASK_EXECUTION_WORKER_PROCESS_RELEASE_AUTHORITY_DENIED", introducedIn: 41 },
+  { name: "task_executions_worker_process_write_once", sentinel: "TASK_EXECUTION_WORKER_PROCESS_IMMUTABLE", introducedIn: 41 },
+  { name: "task_executions_runtime_managed_immutable", sentinel: "TASK_EXECUTION_RUNTIME_MANAGED_IMMUTABLE", introducedIn: 41 },
+  { name: "task_executions_outstanding_process_no_delete", sentinel: "TASK_EXECUTION_WORKER_PROCESS_IMMUTABLE", introducedIn: 41 },
   { name: "canonical_turn_sources_admission_matches_claim", sentinel: "CANONICAL_TURN_SOURCE_NOT_CLAIM_TIME", introducedIn: 32 },
 ];
 

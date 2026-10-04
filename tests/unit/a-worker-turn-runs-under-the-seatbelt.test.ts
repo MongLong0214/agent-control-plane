@@ -6,7 +6,7 @@ import { ACP_SCRATCH_ROOT } from "../../src/core/scratch-root.ts";
 import { ClaudeCliAdapter } from "../../src/runtime/cli-adapters.ts";
 import type { InvocationRequest, InvocationResult, ProviderAdapter } from "../../src/runtime/provider.ts";
 import { WorkerTurnRunner } from "../../src/run/worker-turn.ts";
-import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
+import { requireSeatbelt, seatbeltStatus } from "../helpers/seatbelt.ts";
 import { cleanupTempDirs, gitSync, makeCore, tempDir } from "../helpers/fixtures.ts";
 import { seedWorkerWorld } from "../helpers/worker-turn-fixture.ts";
 
@@ -27,10 +27,6 @@ afterAll(() => {
   rmSync(isolatedHome, { recursive: true, force: true });
 });
 
-const seatbeltCanApply = (): boolean =>
-  process.platform === "darwin" &&
-  existsSync("/usr/bin/sandbox-exec") &&
-  boundedSpawnSync("/usr/bin/sandbox-exec", ["-p", "(version 1)\n(allow default)", "/usr/bin/true"]).status === 0;
 
 /**
  * A provider stand-in for the real ClaudeCliAdapter. It reports the argv it was given, edits the one
@@ -60,7 +56,7 @@ process.stdout.write(JSON.stringify({ type: "result", session_id: sessionId, res
 };
 
 describe("#512 a worker turn under the real Claude adapter and seatbelt", () => {
-  it("edits only inside the claimed worktree with acceptEdits and no extra grant, and commits it", async () => {
+  it("edits only inside the claimed worktree with acceptEdits and no extra grant, and commits it", async (ctx) => {
     expect(ACP_SCRATCH_ROOT.startsWith(`${isolatedHome}/`)).toBe(true);
     const core = makeCore();
     const world = seedWorkerWorld(core);
@@ -102,11 +98,12 @@ describe("#512 a worker turn under the real Claude adapter and seatbelt", () => 
     await runner.settled(started.value.executionId);
     const execution = world.tasks.execution(started.value.executionId)!;
 
-    if (!seatbeltCanApply()) {
-      // No unconfined fallback exists: without seatbelt the turn cannot succeed or commit.
+    if (!seatbeltStatus().applies) {
+      // No unconfined fallback exists: without seatbelt the turn cannot succeed or commit. The
+      // confinement this test claims is then unverified here, so it is skipped loudly — never passed.
       expect(execution.status).not.toBe("SUCCEEDED");
       expect(gitSync(world.repoPath, ["rev-parse", "HEAD"])).toBe(base);
-      return;
+      requireSeatbelt(ctx);
     }
 
     expect(execution.status, JSON.stringify(runner.describe(execution.executionId, world.runId))).toBe("SUCCEEDED");

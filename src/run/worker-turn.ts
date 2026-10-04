@@ -1,20 +1,35 @@
-import { createHash } from "node:crypto";
-import { lstatSync, readFileSync, readdirSync, readlinkSync, type Stats } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
-
 import type { Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { allow, deny, isAcpError, type Decision, type Evidence } from "../core/errors.ts";
-import { readProcessStartToken } from "../core/process-argv.ts";
+import { readProcessArgv, readProcessStartToken } from "../core/process-argv.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { acpScratchDir } from "../core/scratch-root.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { type FailureClass, Role, SessionLifecycle, TaskState, roleKeyFor } from "../domain/types.ts";
-import { git } from "../git/git.ts";
 import { type ManagedWriteGuard, WriteOperation } from "../guard/managed-write-guard.ts";
 import { canonical } from "../guard/workspace-probe.ts";
 import type { InvocationResult, ProviderAdapter } from "../runtime/provider.ts";
+import { rmSync } from "node:fs";
 import type { ExecutionRecord, TaskGraph } from "./task-graph.ts";
+import {
+  type PinnedRepository,
+  type WorkerCommitPort,
+  type WorkerDiffEntry,
+  committedChanges,
+  dotGitFingerprint,
+  effectiveConfig,
+  gitDirFingerprint,
+  headOf,
+  objectFormatOf,
+  parentOf,
+  pinRepository,
+  plumbingWorkerCommit,
+  scanAgainst,
+  stagedAgainst,
+} from "./worker-git.ts";
+
+export type { WorkerCommitPort, WorkerDiffEntry } from "./worker-git.ts";
 
 /**
  * #512 — the control plane runs one worker turn for a task the CTO chose.
@@ -24,11 +39,17 @@ import type { ExecutionRecord, TaskGraph } from "./task-graph.ts";
  * run, task, claim — and everything else is read from durable facts: the task's live WORKER binding
  * and the session its actor serves now, and the claim's worktree, branch and owned paths.
  *
- * The success order is fixed: the provider edits → the change is observed twice and must not move
- * between the two → the run's authority is re-checked through the Managed Write Guard → the control
- * plane commits exactly the observed paths → the commit is checked against the observation → only
- * then is the execution finished SUCCEEDED, with a digest bound to that commit's HEAD. Nothing is
- * ever reset or cleaned: a failure leaves every byte where the turn left it.
+ * The success order is fixed: the provider edits → its process is confirmed gone → the change is
+ * observed twice and must not move between the two → the run's authority is re-checked through the
+ * Managed Write Guard → the control plane commits exactly the observed paths → the commit is checked
+ * against the observation → only then is the execution finished SUCCEEDED, in the same transaction as
+ * the evidence its digest is computed from. Nothing is ever reset or cleaned: a failure leaves every
+ * byte where the turn left it. Every git call is pinned and filter-free (`worker-git.ts`).
+ *
+ * The worker's process is tracked apart from its execution's status (ACP-WORKER-03): a takeover or a
+ * cancel ends the execution at once, while the child may still be running. The process stays
+ * outstanding until it is confirmed gone; until then no other turn of the task starts, and a restart
+ * reconciles it whatever the execution's status says.
  */
 
 /** A worker turn may not be asked to run longer than this (#512). */
@@ -38,9 +59,8 @@ export const WORKER_TURN_PROVIDER = "claude";
 export const WORKER_TURN_MODEL = "opus";
 
 const DEFAULT_POLL_MS = 1_000;
-const CONTROL_PLANE_COMMITTER = ["-c", "user.name=agent-control-plane", "-c", "user.email=agent-control-plane@localhost.invalid"];
-/** Every git call this runner makes: no hooks, no fsmonitor, no signing prompt. */
-const HARDENED = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false"];
+const DEFAULT_PROCESS_SETTLE_MS = 2_000;
+const DEFAULT_SHUTDOWN_BUDGET_MS = 15_000;
 
 /** Audit kinds this runner writes; `describe` reads them back. */
 export const WorkerTurnEvent = {
@@ -51,6 +71,7 @@ export const WorkerTurnEvent = {
   ORPHAN_KILLED: "TASK_WORKER_ORPHAN_KILLED",
   ORPHAN_GONE: "TASK_WORKER_ORPHAN_GONE",
   ORPHAN_UNIDENTIFIED: "TASK_WORKER_ORPHAN_UNIDENTIFIED",
+  SHUTDOWN_DRAINED: "TASK_WORKER_TURNS_DRAINED",
 } as const;
 
 export interface WorkerTurnRequest {
@@ -61,16 +82,6 @@ export interface WorkerTurnRequest {
   /** The run owner the MCP owner fence authenticated — never a payload value. */
   ownerSessionId: string;
   ownerBindingGeneration: number;
-}
-
-/** One changed path, as the worktree holds it. A deletion has neither mode nor content. */
-export interface WorkerDiffEntry {
-  path: string;
-  mode: "100644" | "100755" | "120000" | null;
-  /** sha256 of the file's bytes (a symlink's target), null for a deletion. */
-  sha256: string | null;
-  /** The git object id the same bytes have, used to check the commit; not part of the digest. */
-  blob: string | null;
 }
 
 /** What a success digest commits to; every input is written to the audit record beside it. */
@@ -106,6 +117,8 @@ export interface WorkerProcessPort {
   alive(pid: number): boolean;
   /** Whether any process remains in the group the worker led. */
   groupAlive(pid: number): boolean;
+  /** The command line of a live pid as the OS reports it; null when it cannot be read. */
+  argv(pid: number): readonly string[] | null;
   killGroup(pid: number): void;
 }
 
@@ -122,53 +135,13 @@ export const osWorkerProcesses: WorkerProcessPort = {
   startToken: (pid) => readProcessStartToken(pid),
   alive: (pid) => signalable(pid),
   groupAlive: (pid) => signalable(-pid),
+  argv: (pid) => readProcessArgv(pid),
   killGroup: (pid) => {
     try {
       process.kill(-pid, "SIGKILL");
     } catch {
       /* already gone */
     }
-  },
-};
-
-/** The control plane's commit of a verified change. Injectable so a failing commit can be measured. */
-export interface WorkerCommitPort {
-  commit(worktree: string, paths: readonly string[], message: string): Promise<Decision<string>>;
-}
-
-/** Stages exactly `paths`, refuses if the index then holds anything else, and commits. */
-export const gitWorkerCommit: WorkerCommitPort = {
-  commit: async (worktree, paths, message) => {
-    const added = await git(worktree, [...HARDENED, "--literal-pathspecs", "add", "-A", "--", ...paths], { allowFailure: true });
-    if (added.exitCode !== 0) {
-      return deny(ReasonCode.INTERNAL_ERROR, "git add of the verified paths failed", {
-        exitCode: added.exitCode,
-        error: added.stderr.slice(0, 500),
-      });
-    }
-    const staged = await git(worktree, [...HARDENED, "diff", "--cached", "--no-renames", "--name-only", "-z"], { allowFailure: true });
-    const stagedPaths = staged.stdout.split("\0").filter(Boolean).sort();
-    const expected = [...paths].sort();
-    if (staged.exitCode !== 0 || stagedPaths.join("\0") !== expected.join("\0")) {
-      return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "the index holds something other than the verified paths", {
-        paths: stagedPaths,
-        expected,
-      });
-    }
-    const committed = await git(
-      worktree,
-      [...HARDENED, ...CONTROL_PLANE_COMMITTER, "commit", "--no-verify", "--no-gpg-sign", "-q", "-m", message],
-      { allowFailure: true },
-    );
-    if (committed.exitCode !== 0) {
-      return deny(ReasonCode.INTERNAL_ERROR, "git commit failed", {
-        exitCode: committed.exitCode,
-        error: committed.stderr.slice(0, 500),
-      });
-    }
-    const head = await git(worktree, ["rev-parse", "--verify", "HEAD^{commit}"], { allowFailure: true });
-    if (head.exitCode !== 0) return deny(ReasonCode.INTERNAL_ERROR, "the new HEAD cannot be read", {});
-    return allow(ReasonCode.OK, head.stdout.trim());
   },
 };
 
@@ -182,6 +155,10 @@ export interface WorkerTurnOptions {
    * before the commit's authority is re-checked — where a concurrent writer would land.
    */
   beforeCommit?: () => void | Promise<void>;
+  /** Allocates a turn's private git scratch. Defaults to the control plane's own scratch root. */
+  scratchDir?: (prefix: string) => string;
+  /** How long a finished turn waits for its process group to go before killing it, and again after. */
+  processSettleMs?: number;
 }
 
 /** Ports the runner needs; the composition root supplies them, none is a service it could misuse. */
@@ -212,7 +189,7 @@ interface ClaimFacts {
   ownedPaths: string[];
 }
 
-interface TurnFacts {
+interface DurableFacts {
   runId: string;
   taskId: string;
   taskTitle: string;
@@ -221,10 +198,23 @@ interface TurnFacts {
   ownerBindingGeneration: number;
   worker: WorkerIdentity;
   claim: ClaimFacts;
+}
+
+interface TurnFacts extends DurableFacts {
+  repo: PinnedRepository;
   baseHead: string;
   objectFormat: "sha1" | "sha256";
-  gitDirs: string[];
-  gitControlDigest: string;
+  /** `git config --list --show-origin` before the turn. */
+  config: string;
+  /** Every git-dir file before the turn (bar the index). */
+  gitDirFingerprint: string;
+}
+
+interface InFlightTurn {
+  promise: Promise<void>;
+  controller: AbortController;
+  /** Set by `shutdown`: the turn ends ABANDONED with the daemon, not FAILED. */
+  stopping: boolean;
 }
 
 type CommitOutcome =
@@ -250,17 +240,6 @@ interface Observation {
 export const isAgentConfiguration = (path: string): boolean =>
   path === ".mcp.json" || path.split("/").includes(".claude");
 
-/** Repository-root agent configuration git does not track, ignored files included. */
-const untrackedAgentConfiguration = async (worktree: string): Promise<string[]> => {
-  const listed = await git(
-    worktree,
-    [...HARDENED, "--literal-pathspecs", "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", ".claude", ".mcp.json"],
-    { allowFailure: true },
-  );
-  if (listed.exitCode !== 0) throw new Error("the worktree's untracked agent configuration cannot be listed");
-  return listed.stdout.split("\0").filter(Boolean);
-};
-
 export interface WorkerExecutionView {
   execution: {
     executionId: string;
@@ -272,6 +251,7 @@ export interface WorkerExecutionView {
     workerSessionId: string;
     workerProcessId: number | null;
     workerProcessStartedAt: string | null;
+    workerProcessReleasedAt: string | null;
     worktreeId: string | null;
     startedAt: string;
     endedAt: string | null;
@@ -283,28 +263,79 @@ export interface WorkerExecutionView {
   diagnostics: { kind: string; evidence: Evidence } | null;
 }
 
+export type ReconcileOutcome = "KILLED" | "KILL_UNCONFIRMED" | "GONE" | "NEVER_LAUNCHED" | "UNIDENTIFIED";
+
+/** Whether a live pid was confirmed, immediately before a kill, as the process an execution launched. */
+type ProcessOwnership = "OWNED" | "START_TIME_NOT_CONFIRMED" | "COMMAND_LINE_NOT_CONFIRMED";
+
 const insideOwned = (path: string, owned: readonly string[]): boolean =>
   owned.some((root) => root === "." || path === root || path.startsWith(`${root}/`));
-
-const gitBlobId = (format: "sha1" | "sha256", bytes: Buffer): string =>
-  createHash(format).update(Buffer.concat([Buffer.from(`blob ${bytes.length}\0`), bytes])).digest("hex");
 
 const errorText = (error: unknown): string =>
   isAcpError(error) ? `${error.reasonCode}: ${error.message}` : error instanceof Error ? error.message : String(error);
 
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** One worker process as an execution records it: the execution, the pid and its OS start time. */
+export interface WorkerProcessIdentity {
+  executionId: string;
+  pid: number;
+  startedAt: string | null;
+}
+
+/**
+ * #1070 ACP-WORKER-03 — the authority to record a worker process, or to record it released.
+ *
+ * Minted only in this module, by the runner: a record authority in the spawn report of its own
+ * invocation, for the pid and start time the provider reported; a release authority at the moment it
+ * has confirmed that exact process gone. Each is scoped to its one process — the database's triggers
+ * accept the write only for the execution, pid and start time the token names — and a record token
+ * never releases nor a release token records. Callers never construct one, and a raw statement never
+ * holds one.
+ */
+class WorkerProcessAuthorityToken {
+  readonly #minted = true;
+  readonly #db: Db;
+  readonly #kind: "record" | "release";
+  readonly #process: WorkerProcessIdentity;
+
+  constructor(db: Db, kind: "record" | "release", process: WorkerProcessIdentity) {
+    this.#db = db;
+    this.#kind = kind;
+    this.#process = Object.freeze({ ...process });
+  }
+
+  static processOf(value: unknown, db: Db, kind: "record" | "release"): WorkerProcessIdentity | null {
+    if (typeof value !== "object" || value === null || !(#minted in value)) return null;
+    const token = value as WorkerProcessAuthorityToken;
+    return token.#db === db && token.#kind === kind ? token.#process : null;
+  }
+}
+
+export type WorkerProcessAuthority = WorkerProcessAuthorityToken;
+export const workerProcessRecordOf = (value: unknown, db: Db): WorkerProcessIdentity | null =>
+  WorkerProcessAuthorityToken.processOf(value, db, "record");
+export const workerProcessReleaseOf = (value: unknown, db: Db): WorkerProcessIdentity | null =>
+  WorkerProcessAuthorityToken.processOf(value, db, "release");
+
 export class WorkerTurnRunner {
-  readonly #turns = new Map<string, Promise<void>>();
+  readonly #turns = new Map<string, InFlightTurn>();
   readonly #busyWorktrees = new Set<string>();
   readonly #pollMs: number;
   readonly #processes: WorkerProcessPort;
   readonly #commit: WorkerCommitPort;
   readonly #beforeCommit: (() => void | Promise<void>) | undefined;
+  readonly #scratchDir: (prefix: string) => string;
+  readonly #processSettleMs: number;
+  #stopping = false;
 
   constructor(private readonly ports: WorkerTurnPorts, options: WorkerTurnOptions = {}) {
     this.#pollMs = options.pollMs ?? DEFAULT_POLL_MS;
     this.#processes = options.processes ?? osWorkerProcesses;
-    this.#commit = options.commit ?? gitWorkerCommit;
+    this.#commit = options.commit ?? plumbingWorkerCommit;
     this.#beforeCommit = options.beforeCommit;
+    this.#scratchDir = options.scratchDir ?? acpScratchDir;
+    this.#processSettleMs = options.processSettleMs ?? DEFAULT_PROCESS_SETTLE_MS;
   }
 
   /**
@@ -315,6 +346,9 @@ export class WorkerTurnRunner {
    * another writer's are never reset, cleaned or folded into this turn (#512).
    */
   async start(request: WorkerTurnRequest): Promise<Decision<{ executionId: string }>> {
+    if (this.#stopping) {
+      return deny(ReasonCode.CONFLICT, "the daemon is stopping; no worker turn starts", { taskId: request.taskId });
+    }
     const timeoutMs = Math.min(request.timeoutMs ?? WORKER_TURN_MAX_TIMEOUT_MS, WORKER_TURN_MAX_TIMEOUT_MS);
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
       return deny(ReasonCode.INVALID_ARGUMENT, "a worker turn timeout must be a positive number of milliseconds", {
@@ -338,9 +372,11 @@ export class WorkerTurnRunner {
       return deny(ReasonCode.CONFLICT, "the claimed worktree already has a worker turn in flight", { worktreeId: worktree });
     }
     this.#busyWorktrees.add(worktree);
+    let scratch: string | null = null;
     let launched = false;
     try {
-      const prepared = await this.prepareWorktree(facts);
+      scratch = this.#scratchDir("acp-worker-git-");
+      const prepared = await this.prepareWorktree(facts, scratch);
       if (!prepared.allowed) return prepared as Decision<{ executionId: string }>;
       const turn = prepared.value;
       const started = await this.ports.tasks.startWorkerExecution({
@@ -375,20 +411,61 @@ export class WorkerTurnRunner {
         },
       });
       launched = true;
-      const running = this.execute(adapter, turn, executionId, timeoutMs).finally(() => {
+      const turnScratch = scratch;
+      const inFlight: InFlightTurn = { promise: Promise.resolve(), controller: new AbortController(), stopping: false };
+      inFlight.promise = this.execute(adapter, turn, executionId, timeoutMs, inFlight).finally(() => {
         this.#busyWorktrees.delete(worktree);
         this.#turns.delete(executionId);
+        rmSync(turnScratch, { recursive: true, force: true });
       });
-      this.#turns.set(executionId, running);
+      this.#turns.set(executionId, inFlight);
       return allow(ReasonCode.OK, { executionId });
     } finally {
-      if (!launched) this.#busyWorktrees.delete(worktree);
+      if (!launched) {
+        this.#busyWorktrees.delete(worktree);
+        if (scratch) rmSync(scratch, { recursive: true, force: true });
+      }
     }
   }
 
   /** Resolves when the turn for `executionId` has finished, however it finished. Test and stop seam. */
   async settled(executionId: string): Promise<void> {
-    await this.#turns.get(executionId);
+    await this.#turns.get(executionId)?.promise;
+  }
+
+  /**
+   * Stops every owned turn before the daemon gives up its authority (ACP-WORKER-03). No new turn
+   * starts; each in-flight turn is aborted (its child's process group is killed) and drained within
+   * the budget, and ends ABANDONED. A process that could not be confirmed gone stays recorded as
+   * outstanding — durably, so the next start reconciles it and no retry of its task runs before.
+   */
+  async shutdown(budgetMs = DEFAULT_SHUTDOWN_BUDGET_MS): Promise<{ drained: boolean; outstanding: string[] }> {
+    this.#stopping = true;
+    const turns = [...this.#turns.values()];
+    for (const turn of turns) {
+      turn.stopping = true;
+      turn.controller.abort();
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finished = await Promise.race([
+      Promise.allSettled(turns.map((turn) => turn.promise)).then(() => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), budgetMs);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    const outstanding = this.ports.db
+      .all<{ execution_id: string }>(
+        `SELECT execution_id FROM task_executions
+          WHERE runtime_managed = 1 AND worker_process_id IS NOT NULL AND worker_process_released_at IS NULL
+          ORDER BY execution_id`,
+      )
+      .map((row) => row.execution_id);
+    this.ports.audit.record({
+      kind: WorkerTurnEvent.SHUTDOWN_DRAINED,
+      evidence: { drained: finished, turns: turns.length, executions: outstanding },
+    });
+    return { drained: finished && outstanding.length === 0, outstanding };
   }
 
   /** Read-only: an execution's state, with diagnostics kept apart from the success digest. */
@@ -419,6 +496,7 @@ export class WorkerTurnRunner {
         workerSessionId: execution.workerSessionId,
         workerProcessId: execution.workerProcessId,
         workerProcessStartedAt: execution.workerProcessStartedAt,
+        workerProcessReleasedAt: execution.workerProcessReleasedAt,
         worktreeId: execution.worktreeId,
         startedAt: execution.startedAt,
         endedAt: execution.endedAt,
@@ -433,73 +511,89 @@ export class WorkerTurnRunner {
   }
 
   /**
-   * Startup reconciliation for runtime-managed executions still RUNNING (#512). Nothing is ever
-   * re-invoked. A recorded worker is killed only when its pid, the OS start time read from that pid
-   * now, and this execution's ownership of the pair all match; an identification that is not certain
-   * kills nothing, and the task is then blocked from another turn while that process may live.
+   * Startup reconciliation (#512, ACP-WORKER-03/04). Nothing is ever re-invoked. Every runtime-managed
+   * execution still RUNNING, and every recorded worker process not yet confirmed gone — whatever its
+   * execution's status — is reconciled.
+   *
+   * Ownership is decided from one snapshot of the outstanding process claims taken before any state
+   * changes, so ending one claimant can never make another look unique. A recorded worker is killed
+   * only when its pid, the OS start time read from that pid now, and a single claim on that pid all
+   * match; anything less kills nothing and leaves the process outstanding, which keeps its task from
+   * another turn until the process is confirmed gone.
    */
-  reconcileAfterRestart(): Array<{ executionId: string; outcome: "KILLED" | "GONE" | "NEVER_LAUNCHED" | "UNIDENTIFIED" }> {
+  async reconcileAfterRestart(): Promise<Array<{ executionId: string; outcome: ReconcileOutcome }>> {
     const rows = this.ports.db.all<{
       execution_id: string;
       run_id: string;
       task_id: string;
       worker_session_id: string;
+      status: string;
       worker_process_id: number | null;
       worker_process_started_at: string | null;
     }>(
-      `SELECT execution_id, run_id, task_id, worker_session_id, worker_process_id, worker_process_started_at
-         FROM task_executions WHERE status = 'RUNNING' AND runtime_managed = 1 ORDER BY execution_id`,
+      `SELECT execution_id, run_id, task_id, worker_session_id, status, worker_process_id, worker_process_started_at
+         FROM task_executions
+        WHERE runtime_managed = 1
+          AND (status = 'RUNNING' OR (worker_process_id IS NOT NULL AND worker_process_released_at IS NULL))
+        ORDER BY execution_id`,
     );
-    const outcomes: Array<{ executionId: string; outcome: "KILLED" | "GONE" | "NEVER_LAUNCHED" | "UNIDENTIFIED" }> = [];
+    const claimsOnPid = new Map<number, number>();
+    for (const row of rows) {
+      if (row.worker_process_id !== null) {
+        claimsOnPid.set(row.worker_process_id, (claimsOnPid.get(row.worker_process_id) ?? 0) + 1);
+      }
+    }
+    const outcomes: Array<{ executionId: string; outcome: ReconcileOutcome }> = [];
     for (const row of rows) {
       const pid = row.worker_process_id;
       const recorded = row.worker_process_started_at;
-      let outcome: "KILLED" | "GONE" | "NEVER_LAUNCHED" | "UNIDENTIFIED";
+      let outcome: ReconcileOutcome;
       let observed: string | null = null;
+      let ownership: ProcessOwnership | null = null;
       if (pid === null) {
         outcome = this.launchWasAuthorised(row.execution_id) ? "UNIDENTIFIED" : "NEVER_LAUNCHED";
-      } else if (!this.#processes.alive(pid) && !this.#processes.groupAlive(pid)) {
+      } else if (this.releaseIfGone(row.execution_id, pid, recorded)) {
         outcome = "GONE";
       } else {
         observed = this.#processes.alive(pid) ? this.#processes.startToken(pid) : null;
-        const sharedWithAnother = this.ports.db.get<{ n: number }>(
-          `SELECT COUNT(*) AS n FROM task_executions
-            WHERE worker_process_id = ? AND worker_process_started_at IS ? AND execution_id <> ?
-              AND status = 'RUNNING'`,
-          [pid, recorded, row.execution_id],
-        )?.n ?? 0;
-        const owned = recorded !== null && observed !== null && observed === recorded && sharedWithAnother === 0;
-        if (owned) {
+        const owned = recorded !== null && observed !== null && observed === recorded && claimsOnPid.get(pid) === 1;
+        ownership = owned ? this.ownershipOf(row.execution_id, pid, recorded) : null;
+        if (owned && ownership === "OWNED") {
           this.#processes.killGroup(pid);
-          outcome = "KILLED";
+          if (await this.waitGone(pid, recorded, this.#processSettleMs)) {
+            this.releaseIfGone(row.execution_id, pid, recorded);
+            outcome = "KILLED";
+          } else {
+            outcome = "KILL_UNCONFIRMED";
+          }
         } else {
           outcome = "UNIDENTIFIED";
         }
       }
-      const finished = this.ports.tasks.finishExecution(
-        row.execution_id,
-        { status: "ABANDONED", failureClass: "infrastructure" },
-        row.run_id,
-      );
+      const finished = row.status === "RUNNING"
+        ? this.ports.tasks.finishExecution(row.execution_id, { status: "ABANDONED", failureClass: "infrastructure" }, row.run_id)
+        : null;
       this.ports.audit.record({
         kind: outcome === "KILLED"
           ? WorkerTurnEvent.ORPHAN_KILLED
-          : outcome === "UNIDENTIFIED"
+          : outcome === "UNIDENTIFIED" || outcome === "KILL_UNCONFIRMED"
             ? WorkerTurnEvent.ORPHAN_UNIDENTIFIED
             : WorkerTurnEvent.ORPHAN_GONE,
         runId: row.run_id,
         sessionId: row.worker_session_id,
-        reasonCode: finished.allowed ? ReasonCode.OK : finished.reasonCode,
+        reasonCode: finished === null || finished.allowed ? ReasonCode.OK : finished.reasonCode,
         evidence: {
           executionId: row.execution_id,
           taskId: row.task_id,
-          status: "ABANDONED",
-          reason: `restart found the runtime-managed execution RUNNING: ${outcome}`,
+          status: row.status === "RUNNING" ? "ABANDONED" : row.status,
+          reason: `restart reconciled the runtime-managed execution (${row.status}): ${outcome}`,
           pid,
           recordedStartedAt: recorded,
           observedStartedAt: observed,
+          claimsOnPid: pid === null ? 0 : (claimsOnPid.get(pid) ?? 0),
+          ownership,
           killed: outcome === "KILLED",
-          reexecutionBlocked: outcome === "UNIDENTIFIED",
+          reexecutionBlocked: outcome === "UNIDENTIFIED" || outcome === "KILL_UNCONFIRMED",
         },
       });
       outcomes.push({ executionId: row.execution_id, outcome });
@@ -510,7 +604,7 @@ export class WorkerTurnRunner {
   // -------------------------------------------------------------------------
 
   /** The durable facts of a turn: run, task, live WORKER identity and the claim. No caller value is trusted. */
-  private readFacts(request: WorkerTurnRequest): Decision<Omit<TurnFacts, "baseHead" | "objectFormat" | "gitDirs" | "gitControlDigest">> {
+  private readFacts(request: WorkerTurnRequest): Decision<DurableFacts> {
     const { db } = this.ports;
     const run = db.get<{
       state: string;
@@ -552,12 +646,19 @@ export class WorkerTurnRunner {
         executionId: running.execution_id,
       });
     }
+    const outstanding = this.outstandingProcess(request.taskId);
+    if (outstanding) {
+      return deny(ReasonCode.CONFLICT, "an earlier turn of this task left a worker process that is not confirmed gone; the task is not executed again before it is", {
+        taskId: request.taskId,
+        executionId: outstanding.executionId,
+        pid: outstanding.pid,
+      });
+    }
     const blocked = this.blockedOrphan(request.taskId);
     if (blocked) {
-      return deny(ReasonCode.CONFLICT, "an earlier turn of this task left a process that could not be identified; it is not executed again while that process may live", {
+      return deny(ReasonCode.CONFLICT, "an earlier turn of this task may have launched a process that was never recorded; it is not executed again", {
         taskId: request.taskId,
-        executionId: blocked.executionId,
-        pid: blocked.pid,
+        executionId: blocked,
       });
     }
 
@@ -747,66 +848,56 @@ export class WorkerTurnRunner {
   }
 
   /**
-   * The worktree a turn may start from: a live checkout on the claim's branch with nothing
-   * uncommitted. Anything else is refused, never reset — on a retry this is what verifies that the
-   * previous attempt's preserved state is safe to build on.
+   * The worktree a turn may start from: the registered checkout's git dir pinned, on the claim's
+   * branch, its index staging nothing, and every byte equal to HEAD's tree — computed here, with no
+   * git command that could apply a filter. Anything else is refused, never reset: on a retry this is
+   * what verifies that the previous attempt's preserved state is safe to build on. The configuration
+   * and the git dir are recorded last, as the baseline the turn is held to.
    */
-  private async prepareWorktree(
-    facts: Omit<TurnFacts, "baseHead" | "objectFormat" | "gitDirs" | "gitControlDigest">,
-  ): Promise<Decision<TurnFacts>> {
+  private async prepareWorktree(facts: DurableFacts, scratch: string): Promise<Decision<TurnFacts>> {
     const worktree = facts.claim.worktree;
     try {
-      const top = await git(worktree, ["rev-parse", "--show-toplevel"], { allowFailure: true });
-      if (top.exitCode !== 0 || canonical(top.stdout.trim()) !== worktree) {
-        return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "the claimed worktree is not a live git work tree", { worktreeId: worktree });
-      }
-      const branch = await git(worktree, ["symbolic-ref", "--short", "-q", "HEAD"], { allowFailure: true });
-      if (branch.exitCode !== 0 || branch.stdout.trim() !== facts.claim.branch) {
+      const pinned = pinRepository(worktree, scratch);
+      if (!pinned.allowed) return pinned as Decision<never>;
+      const repo = pinned.value;
+      const objectFormat = await objectFormatOf(repo);
+      const { head, branch } = await headOf(repo);
+      if (!head) return deny(ReasonCode.PROBE_FAILED, "the claimed worktree has no HEAD commit", { worktreeId: worktree });
+      if (branch !== facts.claim.branch) {
         return deny(ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH, "the claimed worktree is not on the claimed branch", {
           worktreeId: worktree,
           branch: facts.claim.branch,
-          observed: branch.stdout.trim() || null,
+          observed: branch,
         });
       }
-      const status = await git(worktree, [...HARDENED, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"], { allowFailure: true });
-      if (status.exitCode !== 0) {
-        return deny(ReasonCode.PROBE_FAILED, "the claimed worktree's status cannot be read", { worktreeId: worktree });
-      }
-      if (status.stdout.length > 0) {
+      const staged = await stagedAgainst(repo, head);
+      const scan = await scanAgainst(repo, head, objectFormat, "prepare");
+      const dirty = [...staged, ...scan.entries.map((entry) => entry.path), ...scan.unsafe];
+      if (dirty.length > 0) {
         return deny(
           ReasonCode.CONFLICT,
           "the claimed worktree holds uncommitted changes; a worker turn starts only from a clean tree, and the control plane never resets or cleans one",
-          { worktreeId: worktree, paths: parseStatus(status.stdout).map((entry) => entry.path).slice(0, 50) },
+          { worktreeId: worktree, paths: [...new Set(dirty)].slice(0, 50) },
         );
       }
-      const head = await git(worktree, ["rev-parse", "--verify", "HEAD^{commit}"], { allowFailure: true });
-      if (head.exitCode !== 0) return deny(ReasonCode.PROBE_FAILED, "the claimed worktree has no HEAD commit", { worktreeId: worktree });
-      // `git status` does not show ignored files, and `.claude/settings.local.json` is usually ignored.
-      // Left by an earlier turn, it would be loaded by this one's CLI (the `local` setting source), so a
-      // turn starts only when the root's agent configuration is all tracked — never cleaned away here.
-      const leftover = await untrackedAgentConfiguration(worktree);
-      if (leftover.length > 0) {
+      // Git's ignore rules hide `.claude/settings.local.json` from a status. Left by an earlier turn, it
+      // would be loaded by this one's CLI (the `local` setting source), so a turn starts only when the
+      // root's agent configuration is all tracked — never cleaned away here.
+      if (scan.untrackedAgentConfiguration.length > 0) {
         return deny(
           ReasonCode.CONFLICT,
           "the claimed worktree holds agent configuration git does not track; a worker turn would load it, and the control plane never removes it",
-          { worktreeId: worktree, paths: leftover.slice(0, 50) },
+          { worktreeId: worktree, paths: scan.untrackedAgentConfiguration.slice(0, 50) },
         );
       }
-      const format = await git(worktree, ["rev-parse", "--show-object-format"], { allowFailure: true });
-      const objectFormat = format.stdout.trim() === "sha256" ? "sha256" : "sha1";
-      const gitDir = await git(worktree, ["rev-parse", "--absolute-git-dir"], { allowFailure: true });
-      const commonDir = await git(worktree, ["rev-parse", "--git-common-dir"], { allowFailure: true });
-      if (gitDir.exitCode !== 0 || commonDir.exitCode !== 0) {
-        return deny(ReasonCode.PROBE_FAILED, "the claimed worktree's git directory cannot be read", { worktreeId: worktree });
-      }
-      const common = commonDir.stdout.trim();
-      const gitDirs = [...new Set([gitDir.stdout.trim(), isAbsolute(common) ? common : resolve(worktree, common)])];
+      const config = await effectiveConfig(repo);
       return allow(ReasonCode.OK, {
         ...facts,
-        baseHead: head.stdout.trim(),
+        repo,
+        baseHead: head,
         objectFormat,
-        gitDirs,
-        gitControlDigest: gitControlDigest(gitDirs),
+        config,
+        gitDirFingerprint: gitDirFingerprint(repo),
       });
     } catch (error) {
       return deny(ReasonCode.PROBE_FAILED, "the claimed worktree could not be inspected", {
@@ -816,8 +907,14 @@ export class WorkerTurnRunner {
     }
   }
 
-  private async execute(adapter: ProviderAdapter, facts: TurnFacts, executionId: string, timeoutMs: number): Promise<void> {
-    const controller = new AbortController();
+  private async execute(
+    adapter: ProviderAdapter,
+    facts: TurnFacts,
+    executionId: string,
+    timeoutMs: number,
+    inFlight: InFlightTurn,
+  ): Promise<void> {
+    const controller = inFlight.controller;
     let timedOut = false;
     let stopped = false;
     let spawned = false;
@@ -859,7 +956,10 @@ export class WorkerTurnRunner {
         },
         onSpawn: (pid, startedAt) => {
           spawned = true;
-          const recorded = this.ports.tasks.recordWorkerProcess(executionId, pid, startedAt);
+          const recorded = this.ports.tasks.recordWorkerProcess(
+            executionId, pid, startedAt,
+            new WorkerProcessAuthorityToken(this.ports.db, "record", { executionId, pid, startedAt }),
+          );
           // Throwing makes the adapter kill the child: a process this execution cannot record must not run.
           if (!recorded.allowed) throw new Error(`${recorded.reasonCode}: ${recorded.message}`);
         },
@@ -872,8 +972,10 @@ export class WorkerTurnRunner {
       clearInterval(poll);
     }
 
+    // The process this turn launched must be gone before anything it may have written is read.
+    const processGone = await this.settleProcess(executionId);
     try {
-      await this.conclude(facts, executionId, { result, thrown, spawned, timedOut, stopped });
+      await this.conclude(facts, executionId, { result, thrown, spawned, timedOut, stopped, processGone, stopping: inFlight.stopping });
     } catch (error) {
       // The runner must leave a record even when its own evaluation fails; the bytes stay as they are.
       this.fail(facts, executionId, "FAILED", "infrastructure", {
@@ -890,7 +992,15 @@ export class WorkerTurnRunner {
   private async conclude(
     facts: TurnFacts,
     executionId: string,
-    turn: { result: InvocationResult | null; thrown: string | null; spawned: boolean; timedOut: boolean; stopped: boolean },
+    turn: {
+      result: InvocationResult | null;
+      thrown: string | null;
+      spawned: boolean;
+      timedOut: boolean;
+      stopped: boolean;
+      processGone: boolean;
+      stopping: boolean;
+    },
   ): Promise<void> {
     const { result } = turn;
     const stdoutSha256 = result ? sha256(result.stdout ?? result.text) : null;
@@ -899,15 +1009,29 @@ export class WorkerTurnRunner {
       stdoutSha256,
       providerSessionId: result?.providerSessionId ?? null,
       spawned: turn.spawned,
+      processGone: turn.processGone,
       error: (result?.error ?? turn.thrown)?.slice(0, 500) ?? null,
     };
-    // Observed for every outcome, so a failure keeps the digest of whatever the turn left behind.
-    const observed = turn.spawned ? await this.observe(facts) : null;
+    // Observed for every outcome whose writer is gone, so a failure keeps the digest of whatever the
+    // turn left behind. A writer that may still be running is not read at all.
+    const observed = turn.spawned && turn.processGone ? await this.observe(facts) : null;
     const diffDigest = observed?.diffDigest ?? null;
     const evidence = { ...base, diffDigest, paths: observed?.entries.map((entry) => entry.path) ?? [] };
 
     if (!this.isRunning(executionId)) {
       this.refuseLate(facts, executionId, { ...evidence, reason: "EXECUTION_NO_LONGER_RUNNING" });
+      return;
+    }
+    if (turn.stopping) {
+      this.fail(facts, executionId, "ABANDONED", "infrastructure", { ...evidence, reason: "DAEMON_STOPPING", reasonCode: ReasonCode.INTERNAL_ERROR });
+      return;
+    }
+    if (!turn.processGone) {
+      this.fail(facts, executionId, "FAILED", "infrastructure", {
+        ...evidence,
+        reason: "PROCESS_OUTSTANDING",
+        reasonCode: ReasonCode.INTERNAL_ERROR,
+      });
       return;
     }
     if (turn.timedOut || result?.error === "timeout") {
@@ -977,7 +1101,9 @@ export class WorkerTurnRunner {
       return;
     }
 
-    // SUCCEEDED only now, after the commit, bound to its exact HEAD.
+    // SUCCEEDED only now, after the commit, bound to its exact HEAD — and in one transaction with the
+    // evidence its digest is computed from (ACP-WORKER-02): if that evidence cannot be stored, the
+    // receipt is not finished SUCCEEDED either.
     const inputs: WorkerSuccessDigestInputs = {
       executionId,
       workerSessionId: facts.worker.sessionId,
@@ -989,8 +1115,41 @@ export class WorkerTurnRunner {
       diffDigest: observed.diffDigest,
     };
     const resultDigest = workerSuccessDigest(inputs);
-    const finished = this.ports.tasks.finishExecution(executionId, { status: "SUCCEEDED", resultDigest }, facts.runId);
-    if (!finished.allowed) {
+    // A holder, not a `let`: the transaction body assigns it, and a narrowed local would hide that.
+    const step: { failedAt: "finish" | "evidence" | null } = { failedAt: null };
+    let finished: Decision<unknown>;
+    try {
+      finished = this.ports.db.txDecision(() => {
+        const done = this.ports.tasks.finishExecution(executionId, { status: "SUCCEEDED", resultDigest }, facts.runId);
+        if (!done.allowed) {
+          step.failedAt = "finish";
+          return done;
+        }
+        const recorded = this.ports.audit.record({
+          kind: WorkerTurnEvent.SUCCEEDED,
+          runId: facts.runId,
+          sessionId: facts.worker.sessionId,
+          roleKey: facts.worker.roleKey,
+          evidence: {
+            ...inputs,
+            resultDigest,
+            taskId: facts.taskId,
+            head: facts.baseHead,
+            paths: observed.entries.map((entry) => entry.path),
+          },
+        });
+        if (!recorded.allowed) {
+          step.failedAt = "evidence";
+          return recorded;
+        }
+        return done;
+      });
+    } catch (error) {
+      step.failedAt = step.failedAt ?? "evidence";
+      finished = deny(ReasonCode.AUDIT_WRITE_FAILED, "the success evidence could not be written", { error: errorText(error).slice(0, 300) });
+    }
+    if (finished.allowed) return;
+    if (step.failedAt === "finish") {
       this.refuseLate(facts, executionId, {
         ...evidence,
         reason: "FINISH_REFUSED_AFTER_COMMIT",
@@ -999,18 +1158,11 @@ export class WorkerTurnRunner {
       });
       return;
     }
-    this.ports.audit.record({
-      kind: WorkerTurnEvent.SUCCEEDED,
-      runId: facts.runId,
-      sessionId: facts.worker.sessionId,
-      roleKey: facts.worker.roleKey,
-      evidence: {
-        ...inputs,
-        resultDigest,
-        taskId: facts.taskId,
-        head: facts.baseHead,
-        paths: observed.entries.map((entry) => entry.path),
-      },
+    this.fail(facts, executionId, "FAILED", "infrastructure", {
+      ...evidence,
+      reason: "SUCCESS_EVIDENCE_NOT_RECORDED",
+      reasonCode: finished.reasonCode,
+      commitHead: committed.head,
     });
   }
 
@@ -1031,7 +1183,6 @@ export class WorkerTurnRunner {
         failureClass: "infrastructure",
       },
     };
-    const paths = first.entries.map((entry) => entry.path).sort();
     const authorised = await this.ports.guard.authorize(
       {
         operation: WriteOperation.GIT_COMMIT,
@@ -1061,14 +1212,21 @@ export class WorkerTurnRunner {
           };
           return;
         }
-        const committed = await this.#commit.commit(facts.claim.worktree, paths, commitMessage(facts));
+        const committed = await this.#commit.commit(facts.repo, {
+          baseHead: facts.baseHead,
+          branch: facts.claim.branch,
+          entries: first.entries,
+          message: commitMessage(facts),
+          format: facts.objectFormat,
+        });
         if (!committed.allowed) {
+          const head = typeof committed.evidence["head"] === "string" ? committed.evidence["head"] : null;
           state.outcome = {
             ok: false,
             reason: "COMMIT_FAILED",
             reasonCode: committed.reasonCode,
             message: committed.message,
-            head: null,
+            head,
             failureClass: "infrastructure",
           };
           return;
@@ -1106,30 +1264,33 @@ export class WorkerTurnRunner {
 
   /** The commit's parent is the base, its change is exactly the observed one, and nothing is left over. */
   private async verifyCommit(facts: TurnFacts, head: string, first: Observation): Promise<Decision<void>> {
-    const worktree = facts.claim.worktree;
-    const parent = await git(worktree, ["rev-parse", "--verify", `${head}^1`], { allowFailure: true });
-    if (parent.exitCode !== 0 || parent.stdout.trim() !== facts.baseHead) {
+    const repo = facts.repo;
+    if ((await parentOf(repo, head)) !== facts.baseHead) {
       return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, "the commit's parent is not the turn's base", { head });
     }
-    const tree = await git(worktree, [...HARDENED, "diff-tree", "-r", "-z", "--no-renames", "--no-commit-id", "--raw", facts.baseHead, head], { allowFailure: true });
-    if (tree.exitCode !== 0) return deny(ReasonCode.PROBE_FAILED, "the commit's change cannot be read", { head });
-    const committed = parseRawDiff(tree.stdout);
+    const committed = await committedChanges(repo, facts.baseHead, head);
     const expected = first.entries.map((entry) => `${entry.path}\0${entry.mode ?? "-"}\0${entry.blob ?? "-"}`).sort();
     const actual = committed.map((entry) => `${entry.path}\0${entry.mode ?? "-"}\0${entry.blob ?? "-"}`).sort();
     if (expected.join("\n") !== actual.join("\n")) {
       return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, "the commit differs from the verified change", { head });
     }
-    const left = await git(worktree, [...HARDENED, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"], { allowFailure: true });
-    if (left.exitCode !== 0 || left.stdout.length > 0) {
+    const now = await headOf(repo);
+    if (now.head !== head || now.branch !== facts.claim.branch) {
+      return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, "the branch does not name the worker commit", { head });
+    }
+    const left = await scanAgainst(repo, head, facts.objectFormat, "verify");
+    if (left.entries.length > 0 || left.unsafe.length > 0) {
       return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, "the worktree still differs from the commit", { head });
     }
     return allow(ReasonCode.OK, undefined);
   }
 
   /**
-   * The worktree after a turn, relative to its base. Git's own control files are compared byte for
-   * byte before any git command runs here: a worker that rewrote `.git/config` or a hook could
-   * otherwise run code as the daemon through the very commands that inspect its work.
+   * The worktree after a turn, relative to its base. Before git is asked anything, the `.git` entry
+   * and every file of the pinned git dirs are compared with the filesystem against the pre-turn
+   * baseline; then the effective configuration is compared too. Any difference refuses the turn: a
+   * worker that rewrote a config, an include target, a hook or the `.git` indirection never gets a
+   * git command run under it.
    */
   private async observe(facts: TurnFacts): Promise<Observation> {
     const refused = (reason: string, reasonCode: ReasonCode, message: string): Observation => ({
@@ -1139,42 +1300,33 @@ export class WorkerTurnRunner {
       outOfScope: [],
       agentConfiguration: [],
     });
-    const worktree = facts.claim.worktree;
+    const repo = facts.repo;
     try {
-      if (gitControlDigest(facts.gitDirs) !== facts.gitControlDigest) {
-        return refused("GIT_CONTROL_CHANGED", ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "git configuration, hooks or HEAD changed during the turn");
+      if (dotGitFingerprint(repo.workTree) !== repo.dotGit) {
+        return refused("GIT_INDIRECTION_CHANGED", ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "the worktree's .git entry changed during the turn");
       }
-      const head = await git(worktree, ["rev-parse", "--verify", "HEAD^{commit}"], { allowFailure: true });
-      const branch = await git(worktree, ["symbolic-ref", "--short", "-q", "HEAD"], { allowFailure: true });
-      if (head.stdout.trim() !== facts.baseHead || branch.stdout.trim() !== facts.claim.branch) {
+      if (gitDirFingerprint(repo) !== facts.gitDirFingerprint) {
+        return refused("GIT_DIR_CHANGED", ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "a file of the git dir changed during the turn");
+      }
+      if ((await effectiveConfig(repo)) !== facts.config) {
+        return refused("GIT_CONFIG_CHANGED", ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "the repository's effective git configuration changed during the turn");
+      }
+      const now = await headOf(repo);
+      if (now.head !== facts.baseHead || now.branch !== facts.claim.branch) {
         return refused("HEAD_MOVED", ReasonCode.WRITE_EFFECT_FENCE_LOST, "HEAD or the branch moved during the turn");
       }
-      const status = await git(worktree, [...HARDENED, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"], { allowFailure: true });
-      if (status.exitCode !== 0) return refused("STATUS_UNREADABLE", ReasonCode.PROBE_FAILED, "the worktree status cannot be read");
-      const parsed = parseStatus(status.stdout);
-      if (parsed.some((entry) => entry.index !== " " && entry.index !== "?")) {
-        return refused("INDEX_CHANGED", ReasonCode.WRITE_EFFECT_FENCE_LOST, "something was staged during the turn");
+      const scan = await scanAgainst(repo, facts.baseHead, facts.objectFormat, "observe");
+      const outOfScope = new Set<string>(scan.unsafe);
+      const agentConfiguration = new Set<string>(scan.untrackedAgentConfiguration);
+      for (const entry of scan.entries) {
+        if (isAgentConfiguration(entry.path)) agentConfiguration.add(entry.path);
+        if (!insideOwned(entry.path, facts.claim.ownedPaths)) outOfScope.add(entry.path);
       }
-      const entries: WorkerDiffEntry[] = [];
-      const outOfScope = new Set<string>();
-      const agentConfiguration = new Set<string>();
-      for (const { path } of parsed) {
-        if (isAgentConfiguration(path)) agentConfiguration.add(path);
-        const entry = diffEntry(worktree, path, facts.objectFormat);
-        if (entry === null) {
-          outOfScope.add(path);
-          continue;
-        }
-        entries.push(entry);
-        if (!insideOwned(path, facts.claim.ownedPaths)) outOfScope.add(path);
-      }
-      // The turn started with none (`prepareWorktree`), so any listed now is the turn's, ignored or not.
-      for (const path of await untrackedAgentConfiguration(worktree)) agentConfiguration.add(path);
       for (const path of agentConfiguration) outOfScope.add(path);
       return {
         problem: null,
-        entries,
-        diffDigest: entries.length > 0 ? workerDiffDigest(facts.baseHead, entries) : null,
+        entries: scan.entries,
+        diffDigest: scan.entries.length > 0 ? workerDiffDigest(facts.baseHead, scan.entries) : null,
         outOfScope: [...outOfScope].sort(),
         agentConfiguration: [...agentConfiguration].sort(),
       };
@@ -1187,26 +1339,133 @@ export class WorkerTurnRunner {
     return this.ports.tasks.execution(executionId)?.status === "RUNNING";
   }
 
+  /** The recorded process and every member of its group are gone, or its pid now names another process. */
+  private confirmedGone(pid: number, startedAt: string | null): boolean {
+    if (this.#processes.groupAlive(pid)) return false;
+    if (!this.#processes.alive(pid)) return true;
+    const now = this.#processes.startToken(pid);
+    return startedAt !== null && now !== null && now !== startedAt;
+  }
+
+  /**
+   * Confirms the recorded process gone and, only then, records it released under an authority minted
+   * here for that one execution, pid and start time (#1070). Returns whether the process is gone; a
+   * release the database refuses leaves it outstanding, which only ever blocks a retry.
+   */
+  private releaseIfGone(executionId: string, pid: number, startedAt: string | null): boolean {
+    if (!this.confirmedGone(pid, startedAt)) return false;
+    this.ports.tasks.releaseWorkerProcess(executionId, new WorkerProcessAuthorityToken(this.ports.db, "release", { executionId, pid, startedAt }));
+    return true;
+  }
+
+  /**
+   * Whether a live pid is, right now, the process this execution launched (#1070) — asked immediately
+   * before any kill. The OS start time it reports must be the recorded one, and its command line must
+   * carry this execution's worker session as `--session-id <id>`, as every provider invocation the
+   * runner makes does. A pid whose start time or command line cannot be read is not confirmed, and
+   * nothing that is not confirmed is killed: it stays outstanding and blocks its task instead.
+   */
+  private ownershipOf(executionId: string, pid: number, startedAt: string | null): ProcessOwnership {
+    const now = this.#processes.alive(pid) ? this.#processes.startToken(pid) : null;
+    if (startedAt === null || now === null || now !== startedAt) return "START_TIME_NOT_CONFIRMED";
+    const session = this.ports.db.get<{ incarnation: string }>(
+      `SELECT s.incarnation FROM task_executions e JOIN sessions s ON s.session_id = e.worker_session_id
+        WHERE e.execution_id = ? AND e.runtime_managed = 1`,
+      [executionId],
+    );
+    const expected = session?.incarnation.split("#", 1)[0] ?? "";
+    const argv = this.#processes.argv(pid);
+    if (expected === "" || argv === null) return "COMMAND_LINE_NOT_CONFIRMED";
+    for (let index = 0; index + 1 < argv.length; index += 1) {
+      if (argv[index] === "--session-id" && argv[index + 1] === expected) return "OWNED";
+    }
+    return "COMMAND_LINE_NOT_CONFIRMED";
+  }
+
+  private async waitGone(pid: number, startedAt: string | null, budgetMs: number): Promise<boolean> {
+    const deadline = Date.now() + budgetMs;
+    for (;;) {
+      if (this.confirmedGone(pid, startedAt)) return true;
+      if (Date.now() >= deadline) return false;
+      await sleep(20);
+    }
+  }
+
+  /**
+   * After the provider call returns, its process is confirmed gone — waited for, then its group killed
+   * (this runner launched it), then waited for again — and only then released. One that will not go
+   * stays outstanding.
+   */
+  private async settleProcess(executionId: string): Promise<boolean> {
+    const execution = this.ports.tasks.execution(executionId);
+    const pid = execution?.workerProcessId ?? null;
+    if (!execution || pid === null) return true;
+    if (execution.workerProcessReleasedAt !== null) return true;
+    const startedAt = execution.workerProcessStartedAt;
+    let gone = await this.waitGone(pid, startedAt, this.#processSettleMs);
+    if (!gone) {
+      // Only a process positively confirmed as this execution's is killed; any other stays outstanding.
+      if (this.ownershipOf(executionId, pid, startedAt) === "OWNED") this.#processes.killGroup(pid);
+      gone = await this.waitGone(pid, startedAt, this.#processSettleMs);
+    }
+    if (gone) this.releaseIfGone(executionId, pid, startedAt);
+    return gone;
+  }
+
+  /**
+   * Ends the execution with its diagnostics in one transaction. If the full diagnostics cannot be
+   * stored, the reason alone is; the execution is never left RUNNING for want of an audit row, and
+   * never carries a success digest.
+   */
   private fail(
     facts: TurnFacts,
     executionId: string,
-    status: "FAILED" | "TIMEOUT",
+    status: "FAILED" | "TIMEOUT" | "ABANDONED",
     failureClass: FailureClass,
     evidence: Record<string, unknown>,
   ): void {
-    const finished = this.ports.tasks.finishExecution(executionId, { status, failureClass, resultDigest: null }, facts.runId);
-    if (!finished.allowed) {
-      this.refuseLate(facts, executionId, { ...evidence, attemptedStatus: status, finishReasonCode: finished.reasonCode });
+    const attempt = (diagnostics: Record<string, unknown> | null): { stage: "finish" | "evidence" | null; decision: Decision<unknown> } => {
+      const step: { stage: "finish" | "evidence" | null } = { stage: null };
+      try {
+        const decision = this.ports.db.txDecision(() => {
+          const finished = this.ports.tasks.finishExecution(executionId, { status, failureClass, resultDigest: null }, facts.runId);
+          if (!finished.allowed) {
+            step.stage = "finish";
+            return finished;
+          }
+          if (diagnostics === null) return finished;
+          const recorded = this.ports.audit.record({
+            kind: WorkerTurnEvent.FAILED,
+            runId: facts.runId,
+            sessionId: facts.worker.sessionId,
+            roleKey: facts.worker.roleKey,
+            reasonCode: (diagnostics["reasonCode"] as ReasonCode | undefined) ?? null,
+            evidence: { executionId, taskId: facts.taskId, status, failureClass, ...diagnostics } as Evidence,
+          });
+          if (!recorded.allowed) {
+            step.stage = "evidence";
+            return recorded;
+          }
+          return finished;
+        });
+        return { stage: step.stage, decision };
+      } catch (error) {
+        return { stage: step.stage ?? "evidence", decision: deny(ReasonCode.AUDIT_WRITE_FAILED, errorText(error).slice(0, 300), {}) };
+      }
+    };
+    const full = attempt(evidence);
+    if (full.decision.allowed) return;
+    if (full.stage === "finish") {
+      this.refuseLate(facts, executionId, { ...evidence, attemptedStatus: status, finishReasonCode: full.decision.reasonCode });
       return;
     }
-    this.ports.audit.record({
-      kind: WorkerTurnEvent.FAILED,
-      runId: facts.runId,
-      sessionId: facts.worker.sessionId,
-      roleKey: facts.worker.roleKey,
-      reasonCode: (evidence["reasonCode"] as ReasonCode | undefined) ?? null,
-      evidence: { executionId, taskId: facts.taskId, status, failureClass, ...evidence } as Evidence,
+    const minimal = attempt({
+      reason: evidence["reason"] ?? "UNKNOWN",
+      reasonCode: evidence["reasonCode"] ?? null,
+      diagnosticsRejected: full.decision.reasonCode,
     });
+    if (minimal.decision.allowed) return;
+    attempt(null);
   }
 
   /** A result for an execution that is no longer RUNNING is refused, and recorded with its diagnostics. */
@@ -1227,22 +1486,38 @@ export class WorkerTurnRunner {
   }
 
   private eventsFor(runId: string, executionId: string): Array<{ kind: string; evidence: Evidence }> {
+    const kinds = Object.values(WorkerTurnEvent);
     return this.ports.db
       .all<{ kind: string; evidence_json: string }>(
         `SELECT kind, evidence_json FROM audit_events
-          WHERE run_id = ? AND kind IN (?, ?, ?, ?, ?, ?, ?)
+          WHERE run_id = ? AND kind IN (${kinds.map(() => "?").join(", ")})
             AND json_extract(evidence_json, '$.executionId') = ?
           ORDER BY event_id`,
-        [runId, ...Object.values(WorkerTurnEvent), executionId],
+        [runId, ...kinds, executionId],
       )
       .map((row) => ({ kind: row.kind, evidence: JSON.parse(row.evidence_json) as Evidence }));
   }
 
   /**
-   * An earlier turn of this task whose process a restart could not identify, while that process may
-   * still live: its pid was never recorded, or its process group still has a member.
+   * An earlier turn of this task whose recorded process is not confirmed gone. One that is gone by now
+   * is released here, durably; one that may still live keeps the task from another turn.
    */
-  private blockedOrphan(taskId: string): { executionId: string; pid: number | null } | null {
+  private outstandingProcess(taskId: string): { executionId: string; pid: number } | null {
+    const rows = this.ports.db.all<{ execution_id: string; worker_process_id: number; worker_process_started_at: string | null }>(
+      `SELECT execution_id, worker_process_id, worker_process_started_at FROM task_executions
+        WHERE task_id = ? AND worker_process_id IS NOT NULL AND worker_process_released_at IS NULL
+        ORDER BY execution_id`,
+      [taskId],
+    );
+    for (const row of rows) {
+      if (this.releaseIfGone(row.execution_id, row.worker_process_id, row.worker_process_started_at)) continue;
+      return { executionId: row.execution_id, pid: row.worker_process_id };
+    }
+    return null;
+  }
+
+  /** An earlier turn of this task that may have launched a process never recorded: no pid to confirm gone. */
+  private blockedOrphan(taskId: string): string | null {
     const rows = this.ports.db.all<{ evidence_json: string }>(
       `SELECT evidence_json FROM audit_events
         WHERE kind = ? AND json_extract(evidence_json, '$.taskId') = ?
@@ -1251,10 +1526,7 @@ export class WorkerTurnRunner {
     );
     for (const row of rows) {
       const evidence = JSON.parse(row.evidence_json) as { executionId?: unknown; pid?: unknown };
-      const pid = typeof evidence.pid === "number" ? evidence.pid : null;
-      if (pid === null || this.#processes.alive(pid) || this.#processes.groupAlive(pid)) {
-        return { executionId: String(evidence.executionId ?? ""), pid };
-      }
+      if (evidence.pid === null || evidence.pid === undefined) return String(evidence.executionId ?? "");
     }
     return null;
   }
@@ -1272,74 +1544,6 @@ export class WorkerTurnRunner {
     ));
   }
 }
-
-/** `git status --porcelain=v1 -z --no-renames`: `XY path` records, NUL-terminated. */
-const parseStatus = (stdout: string): Array<{ index: string; worktree: string; path: string }> =>
-  stdout
-    .split("\0")
-    .filter((record) => record.length >= 4)
-    .map((record) => ({ index: record[0]!, worktree: record[1]!, path: record.slice(3) }));
-
-/** `git diff-tree -r -z --raw`: `:oldmode newmode oldsha newsha status` then the path. */
-const parseRawDiff = (stdout: string): Array<{ path: string; mode: string | null; blob: string | null }> => {
-  const fields = stdout.split("\0").filter((field) => field.length > 0);
-  const out: Array<{ path: string; mode: string | null; blob: string | null }> = [];
-  for (let index = 0; index + 1 < fields.length; index += 2) {
-    const meta = fields[index]!.replace(/^:/, "").split(" ");
-    const status = meta[4] ?? "";
-    const deleted = status.startsWith("D");
-    out.push({ path: fields[index + 1]!, mode: deleted ? null : (meta[1] ?? null), blob: deleted ? null : (meta[3] ?? null) });
-  }
-  return out;
-};
-
-/** One changed path as the filesystem holds it; null for anything git would not commit as a file. */
-const diffEntry = (worktree: string, path: string, format: "sha1" | "sha256"): WorkerDiffEntry | null => {
-  const full = join(worktree, path);
-  let stat: Stats;
-  try {
-    stat = lstatSync(full);
-  } catch (error) {
-    if ((error as { code?: string }).code === "ENOENT") return { path, mode: null, sha256: null, blob: null };
-    throw error;
-  }
-  if (stat.isSymbolicLink()) {
-    const target = Buffer.from(readlinkSync(full));
-    return { path, mode: "120000", sha256: sha256(target), blob: gitBlobId(format, target) };
-  }
-  if (stat.isFile()) {
-    const bytes = readFileSync(full);
-    return { path, mode: (stat.mode & 0o100) !== 0 ? "100755" : "100644", sha256: sha256(bytes), blob: gitBlobId(format, bytes) };
-  }
-  // A directory (nested repository or submodule) or a special file is never a worker's change to commit.
-  return null;
-};
-
-/**
- * Bytes of the git files that decide what git *runs* or what HEAD *is*: config, attributes, hooks and
- * HEAD, in the worktree's git dir and its common dir. Read with the filesystem, never with git.
- */
-const gitControlDigest = (gitDirs: readonly string[]): string => {
-  const parts: Array<{ path: string; bytes: string | null }> = [];
-  const read = (path: string): void => {
-    try {
-      parts.push({ path, bytes: sha256(readFileSync(path)) });
-    } catch {
-      parts.push({ path, bytes: null });
-    }
-  };
-  for (const dir of gitDirs) {
-    for (const file of ["config", "config.worktree", "HEAD", join("info", "attributes")]) read(join(dir, file));
-    let hooks: string[] = [];
-    try {
-      hooks = readdirSync(join(dir, "hooks")).sort();
-    } catch {
-      hooks = [];
-    }
-    for (const hook of hooks) read(join(dir, "hooks", hook));
-  }
-  return digestOf(parts);
-};
 
 const workerPrompt = (facts: TurnFacts): string =>
   [

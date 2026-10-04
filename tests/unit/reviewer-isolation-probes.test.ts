@@ -7,19 +7,15 @@ import { claimReviewerCodexHome, provisionReviewerCodexHome } from "../../src/ru
 
 import { ManualClock } from "../../src/core/clock.ts";
 import { CodexCliAdapter, __testing, reviewerEnvironment } from "../../src/runtime/cli-adapters.ts";
-import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { requireSeatbelt, seatbeltStatus } from "../helpers/seatbelt.ts";
 
 afterAll(cleanupTempDirs);
 
-const seatbeltCanApply = (): boolean =>
-  process.platform === "darwin" &&
-  existsSync("/usr/bin/sandbox-exec") &&
-  boundedSpawnSync("/usr/bin/sandbox-exec", ["-p", "(version 1)\n(allow default)", "/usr/bin/true"]).status === 0;
 
 describe("CP-HI-04 reviewer isolation probes", () => {
-  it("runs private Codex bootstrap and resume through the real local egress lease", async () => {
-    if (!seatbeltCanApply()) return;
+  it("runs private Codex bootstrap and resume through the real local egress lease", async (ctx) => {
+    requireSeatbelt(ctx);
     const root = provisionReviewerCodexHome();
     const fixture = realpathSync(tempDir("acp-private-lease-"));
     const packet = join(fixture, "packet");
@@ -109,8 +105,8 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
       rmSync(dirname(root), { recursive: true, force: true });
     }
   }, 30000);
-  it("allows only private-home runtime/refresh writes while native negative boundaries bite", () => {
-    if (!seatbeltCanApply()) return;
+  it("allows only private-home runtime/refresh writes while native negative boundaries bite", (ctx) => {
+    requireSeatbelt(ctx);
     const root = provisionReviewerCodexHome();
     const sibling = provisionReviewerCodexHome();
     const packet = realpathSync(tempDir("acp-private-native-packet-"));
@@ -215,7 +211,7 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
     // thread event makes this regression fail instead of silently accepting a local id.
   });
 
-  it("#360 actively proves the profile denies producer transcript reads", async () => {
+  it("#360 actively proves the profile denies producer transcript reads", async (ctx) => {
     const packetRoot = tempDir("acp-review-probe-packet-");
     const transcript = join(tempDir("acp-review-probe-transcript-"), "cto-history.jsonl");
     const credentialScope = tempDir("acp-review-probe-provider-");
@@ -235,16 +231,17 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
       5_000,
     );
 
-    if (!seatbeltCanApply()) {
+    if (!seatbeltStatus().applies) {
+      // Unconfinable here: the probe must refuse to attest, and the confinement claim is skipped loudly.
       expect(result.enforced).toBe(false);
-      return;
+      requireSeatbelt(ctx);
     }
     expect(result).toEqual({ enforced: true });
     // Removing either the profile's file-read deny or the live probe turns this into a
     // false result instead of a static list assertion.
   });
 
-  it("#360 actively proves a reviewer cannot execute a shell or write outside its packet", async () => {
+  it("#360 actively proves a reviewer cannot execute a shell or write outside its packet", async (ctx) => {
     const packetRoot = tempDir("acp-review-probe-packet-");
     const credentialScope = tempDir("acp-review-probe-provider-");
     const profile = __testing.reviewerProfile(
@@ -261,9 +258,10 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
       5_000,
     );
 
-    if (!seatbeltCanApply()) {
+    if (!seatbeltStatus().applies) {
+      // Unconfinable here: the probe must refuse to attest, and the confinement claim is skipped loudly.
       expect(result.enforced).toBe(false);
-      return;
+      requireSeatbelt(ctx);
     }
     expect(result).toEqual({ enforced: true });
     // If `(deny process-exec*)`, `(deny file-write*)`, or either active probe disappears,

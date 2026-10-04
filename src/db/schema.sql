@@ -785,6 +785,11 @@ CREATE TABLE IF NOT EXISTS task_executions (
   -- was spawned, never from the database clock. A pid alone does not identify a process, so a
   -- restart kills a recorded worker only while the live pid still reports this start time.
   worker_process_started_at TEXT,
+  -- #512 (schema v41) — when the recorded worker process was confirmed gone. A process is tracked
+  -- apart from its execution's status: a takeover or a cancel ends the execution at once, while the
+  -- child may still be running. Until this is set the process is outstanding, a restart reconciles
+  -- it whatever the status says, and no other turn of the task may start.
+  worker_process_released_at TEXT,
   UNIQUE (task_id, attempt)
 );
 
@@ -1020,6 +1025,97 @@ WHEN NEW.owner_session_id IS NOT NULL
  )
 BEGIN
   SELECT RAISE(ABORT, 'WORKER_SESSION_NOT_INDEPENDENT');
+END;
+
+-- ---------------------------------------------------------------------------
+-- worker process record  (#512, #1070 ACP-WORKER-03, schema v41)
+-- ---------------------------------------------------------------------------
+-- CP-HI-06 — the process a runtime-managed execution launched is what a restart may kill, and while
+-- it is outstanding no other turn of its task starts. Raw SQL writers are in scope. One that wrote a
+-- pid and start time into an execution would point a restart's kill at any process of this user; one
+-- that marked the process released, or cleared, rewrote or deleted the record of it, would admit a
+-- retry while the old process still runs.
+--
+-- So the record is written only under `acp_worker_process_record_authorized`, a connection-local
+-- marker the worker runner holds while it records the one execution, pid and OS start time its
+-- provider reported at spawn; the release only under `acp_worker_process_release_authorized`, which
+-- it holds for the one process it has just confirmed gone. Another connection has neither function
+-- and cannot write either. The record is write-once: the pid and its start time are written together
+-- once and never change, the release is never cleared or moved, and whether the runtime launched the
+-- execution is fixed when it is inserted. A runtime-managed row is never inserted with a process, no
+-- row is inserted released, and a row whose process is outstanding is never deleted.
+CREATE TRIGGER IF NOT EXISTS task_executions_worker_process_record_authority
+BEFORE UPDATE OF worker_process_id, worker_process_started_at ON task_executions
+WHEN OLD.worker_process_id IS NULL
+ AND NEW.worker_process_id IS NOT NULL
+ AND acp_worker_process_record_authorized(
+       NEW.execution_id, NEW.worker_process_id, NEW.worker_process_started_at) <> 1
+BEGIN
+  SELECT RAISE(ABORT, 'TASK_EXECUTION_WORKER_PROCESS_RECORD_AUTHORITY_DENIED');
+END;
+
+-- CP-HI-06 — a runtime-managed execution is inserted without a process; the runner records it at
+-- spawn. No execution is inserted with a start time, which only the runner's record writes.
+CREATE TRIGGER IF NOT EXISTS task_executions_worker_process_record_not_inserted
+BEFORE INSERT ON task_executions
+WHEN NEW.worker_process_started_at IS NOT NULL
+  OR (NEW.runtime_managed = 1 AND NEW.worker_process_id IS NOT NULL)
+BEGIN
+  SELECT RAISE(ABORT, 'TASK_EXECUTION_WORKER_PROCESS_RECORD_AUTHORITY_DENIED');
+END;
+
+-- CP-HI-06 — the release needs the runner's marker for the exact execution, pid and start time.
+CREATE TRIGGER IF NOT EXISTS task_executions_worker_process_release_authority
+BEFORE UPDATE OF worker_process_released_at ON task_executions
+WHEN NEW.worker_process_released_at IS NOT NULL
+ AND OLD.worker_process_released_at IS NULL
+ AND (NEW.worker_process_id IS NULL
+      OR acp_worker_process_release_authorized(
+           NEW.execution_id, NEW.worker_process_id, NEW.worker_process_started_at) <> 1)
+BEGIN
+  SELECT RAISE(ABORT, 'TASK_EXECUTION_WORKER_PROCESS_RELEASE_AUTHORITY_DENIED');
+END;
+
+-- CP-HI-06 — no execution is inserted already released: nothing has confirmed its process gone.
+CREATE TRIGGER IF NOT EXISTS task_executions_worker_process_release_not_inserted
+BEFORE INSERT ON task_executions
+WHEN NEW.worker_process_released_at IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'TASK_EXECUTION_WORKER_PROCESS_RELEASE_AUTHORITY_DENIED');
+END;
+
+-- CP-HI-06 — the pid and its start time are written once, together; the release is never cleared or
+-- moved. A cleared or rewritten pid would hide the process a retry has to wait for.
+CREATE TRIGGER IF NOT EXISTS task_executions_worker_process_write_once
+BEFORE UPDATE OF worker_process_id, worker_process_started_at, worker_process_released_at ON task_executions
+WHEN (OLD.worker_process_id IS NOT NULL
+       AND (NEW.worker_process_id IS NOT OLD.worker_process_id
+            OR NEW.worker_process_started_at IS NOT OLD.worker_process_started_at))
+  OR (OLD.worker_process_id IS NULL
+       AND NEW.worker_process_id IS NULL
+       AND NEW.worker_process_started_at IS NOT OLD.worker_process_started_at)
+  OR (OLD.worker_process_released_at IS NOT NULL
+       AND NEW.worker_process_released_at IS NOT OLD.worker_process_released_at)
+BEGIN
+  SELECT RAISE(ABORT, 'TASK_EXECUTION_WORKER_PROCESS_IMMUTABLE');
+END;
+
+-- CP-HI-06 — whether the runtime launched an execution is fixed at insert. Flipping it would take a
+-- launched process out of restart reconciliation, or hand the runtime's receipts to the CTO.
+CREATE TRIGGER IF NOT EXISTS task_executions_runtime_managed_immutable
+BEFORE UPDATE OF runtime_managed ON task_executions
+WHEN NEW.runtime_managed IS NOT OLD.runtime_managed
+BEGIN
+  SELECT RAISE(ABORT, 'TASK_EXECUTION_RUNTIME_MANAGED_IMMUTABLE');
+END;
+
+-- CP-HI-06 — a row whose process is outstanding is never deleted, so the process is never forgotten.
+CREATE TRIGGER IF NOT EXISTS task_executions_outstanding_process_no_delete
+BEFORE DELETE ON task_executions
+WHEN OLD.worker_process_id IS NOT NULL
+ AND OLD.worker_process_released_at IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'TASK_EXECUTION_WORKER_PROCESS_IMMUTABLE');
 END;
 
 -- ---------------------------------------------------------------------------

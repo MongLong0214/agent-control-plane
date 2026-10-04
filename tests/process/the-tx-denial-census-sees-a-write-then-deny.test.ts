@@ -226,6 +226,17 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string }> = 
     anchor:
       "the ingress claim it closes are one transition, and half of it is worse than none of it.\n    return this.db.txDecision(() => {",
   },
+  {
+    // #1070 ACP-WORKER-02: SUCCEEDED and the evidence that can recompute its digest are one write.
+    label: "WorkerTurnRunner.conclude (success receipt and evidence)",
+    file: "run/worker-turn.ts",
+    anchor: "      finished = this.ports.db.txDecision(() => {",
+  },
+  {
+    label: "WorkerTurnRunner.fail (failure receipt and diagnostics)",
+    file: "run/worker-turn.ts",
+    anchor: "        const decision = this.ports.db.txDecision(() => {",
+  },
 ];
 
 /** Every EXEMPT and DEFERRED entry, so a marker drifting out of its body is caught for all of them, not just one. */

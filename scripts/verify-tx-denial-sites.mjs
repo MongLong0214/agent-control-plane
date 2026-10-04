@@ -177,6 +177,13 @@ const EXPECTED_CONVERTED_SITES = [
   // #1036: the receipt observation and the settlement are written through `#observeVerified`, and
   // the owner-reply half can refuse after them. The refusal has to take both back.
   { file: "conversation/turn-coordinator.ts", symbol: "#settleFromReceipt", label: "ConversationTurnCoordinator.#settleFromReceipt", evidence: "helper:#observeVerified" },
+  // #512/#1070 ACP-WORKER-02: a WORKER turn's finished receipt and its evidence are one write. The
+  // success body finishes the execution SUCCEEDED and then records TASK_WORKER_TURN_SUCCEEDED; a
+  // refused or failed audit write must take the SUCCEEDED back, or a success would stand with no
+  // evidence that can recompute its digest. The failure body does the same for FAILED and its
+  // diagnostics.
+  { file: "run/worker-turn.ts", symbol: "conclude", label: "WorkerTurnRunner.conclude (success receipt and evidence)", evidence: "direct" },
+  { file: "run/worker-turn.ts", symbol: "fail", label: "WorkerTurnRunner.fail (failure receipt and diagnostics)", evidence: "direct" },
 ];
 
 /**

@@ -13,7 +13,7 @@ import {
   type ManagedInvocationWrite,
   type ManagedInvocationWriteBroker,
 } from "../../src/runtime/provider.ts";
-import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
+import { requireSeatbelt, seatbeltStatus } from "../helpers/seatbelt.ts";
 import { cleanupTempDirs, gitSync, makeCore, makeRepo, seedActor, seedRun, tempDir } from "../helpers/fixtures.ts";
 
 /**
@@ -32,10 +32,6 @@ afterAll(() => {
   rmSync(isolatedHome, { recursive: true, force: true });
 });
 
-const seatbeltCanApply = (): boolean =>
-  process.platform === "darwin" &&
-  existsSync("/usr/bin/sandbox-exec") &&
-  boundedSpawnSync("/usr/bin/sandbox-exec", ["-p", "(version 1)\n(allow default)", "/usr/bin/true"]).status === 0;
 
 /** A provider stand-in which writes both inside and outside the authorised directory. */
 const writeScopeProbe = (repository: string): string => {
@@ -61,7 +57,7 @@ process.stdout.write(JSON.stringify({ outsideDenied }));
 };
 
 describe("CP-HI-01 local runtime write broker", () => {
-  it("#355 refuses an ungranted CLI write and actively denies a provider write outside its guarded target", async () => {
+  it("#355 refuses an ungranted CLI write and actively denies a provider write outside its guarded target", async (ctx) => {
     expect(ACP_SCRATCH_ROOT.startsWith(`${isolatedHome}/`)).toBe(true);
     const core = makeCore();
     const repository = makeRepo();
@@ -274,12 +270,12 @@ describe("CP-HI-01 local runtime write broker", () => {
       },
     });
 
-    if (!seatbeltCanApply()) {
-      // No unconfined fallback is allowed. The assertion above still proves an ungranted
-      // request cannot launch; the platform-specific denial is exercised where seatbelt runs.
+    if (!seatbeltStatus().applies) {
+      // No unconfined fallback is allowed: the grant must not have produced an unconfined write. The
+      // confinement this test claims is then unverified here, so it is skipped loudly — never passed.
       expect(withGrant.ok).toBe(false);
       expect(existsSync(join(outside, "escaped.txt"))).toBe(false);
-      return;
+      requireSeatbelt(ctx);
     }
 
     expect(withGrant.ok, JSON.stringify(withGrant)).toBe(true);

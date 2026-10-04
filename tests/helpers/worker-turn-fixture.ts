@@ -1,16 +1,17 @@
+import Database from "better-sqlite3";
 import { type ChildProcess, spawn } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import type { DynamicReserveDemand } from "../../src/capacity/capacity-monitor.ts";
 import { ClaimRegistry } from "../../src/claims/claim-registry.ts";
-import type { Clock } from "../../src/core/clock.ts";
+import { type Clock, ManualClock } from "../../src/core/clock.ts";
 import { allow } from "../../src/core/errors.ts";
 import { newAssignmentId, newRepositoryId, newRunId, newSessionId } from "../../src/core/ids.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import type { AuditLog } from "../../src/db/audit.ts";
-import type { Db } from "../../src/db/database.ts";
+import { AuditLog } from "../../src/db/audit.ts";
+import { Db } from "../../src/db/database.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { ManagedWriteGuard } from "../../src/guard/managed-write-guard.ts";
 import { realWorkspaceProbe } from "../../src/guard/workspace-probe.ts";
@@ -24,10 +25,11 @@ import {
   type ProviderAdapter,
   type SessionHandle,
 } from "../../src/runtime/provider.ts";
-import type { BindingRegistry } from "../../src/session/binding-registry.ts";
-import type { SessionRegistry } from "../../src/session/session-registry.ts";
-import type { Telemetry } from "../../src/telemetry/telemetry.ts";
-import { gitSync, makeRepo } from "./fixtures.ts";
+import { Outbox } from "../../src/outbox/outbox.ts";
+import { BindingRegistry } from "../../src/session/binding-registry.ts";
+import { SessionRegistry } from "../../src/session/session-registry.ts";
+import { Telemetry } from "../../src/telemetry/telemetry.ts";
+import { gitSync, makeRepo, tempDir } from "./fixtures.ts";
 
 /**
  * #512 — one ACTIVE run whose PRIMARY_CTO owns it, one task, a WORKER bound the way PR-A binds one
@@ -53,6 +55,8 @@ export interface WorkerWorld {
   repositoryId: string;
   identity: string;
   repoPath: string;
+  /** The main checkout: `repoPath` itself, or the repository a linked `repoPath` belongs to. */
+  mainRepoPath: string;
   branch: string;
   cto: { sessionId: string; incarnation: string; roleKey: string; generation: number };
   taskId: string;
@@ -70,8 +74,34 @@ export interface WorldCore {
   telemetry: Telemetry;
 }
 
+/** `makeCore` on a database file, for the witnesses that open a second, outside connection to it. */
+export const fileCore = (path: string): WorldCore => {
+  const db = new Db(path);
+  const clock = new ManualClock();
+  const audit = new AuditLog(db, clock);
+  const outbox = new Outbox(db, clock, audit);
+  const sessions = new SessionRegistry(db, clock, audit);
+  return { db, clock, audit, sessions, bindings: new BindingRegistry(db, clock, audit, sessions, outbox), telemetry: new Telemetry(db, clock) };
+};
+
+/**
+ * A raw writer on an outside connection that has registered its own `acp_worker_process_record_authorized`
+ * answering 1 — the one forgery a connection-local marker cannot see — writing a pid and start time
+ * into an execution. What stands between that row and a kill is the runner's ownership check.
+ */
+export const forgeWorkerProcessRecord = (path: string, executionId: string, pid: number, startedAt: string | null): void => {
+  const raw = new Database(path);
+  try {
+    raw.function("acp_worker_process_record_authorized", { varargs: true }, () => 1);
+    raw.prepare(`UPDATE task_executions SET worker_process_id = ?, worker_process_started_at = ? WHERE execution_id = ?`)
+      .run(pid, startedAt, executionId);
+  } finally {
+    raw.close();
+  }
+};
+
 /** A capacity gate that admits: provider capacity is PR-A's change (B1), not what these witnesses measure. */
-const admittingCapacity = {
+export const admittingCapacity = {
   refreshForWorkerFanout: async () => allow(ReasonCode.OK, undefined),
   workerReserveDemand: (): DynamicReserveDemand => ({
     criticalRoleInvocations: 0,
@@ -89,6 +119,8 @@ export const seedWorkerWorld = (
     projectId?: string;
     /** The worker session's incarnation, as a provider-provisioned session carries it (`<provider session id>#<at>`). */
     workerIncarnation?: string;
+    /** Register a linked worktree (its `.git` is a file) as the run's checkout, not the main checkout. */
+    linkedWorktree?: boolean;
   } = {},
 ): WorkerWorld => {
   const { db, clock, audit, sessions, bindings, telemetry } = core;
@@ -97,12 +129,18 @@ export const seedWorkerWorld = (
   const identity = `github:acme/${projectId}`;
   const generation = options.ownerGeneration ?? 1;
   const ownedPaths = options.ownedPaths ?? ["src"];
-  const repoPath = makeRepo({
+  const mainRepoPath = makeRepo({
     "README.md": "# worker fixture\n",
     "src/app.js": "module.exports = () => 1;\n",
   });
   const branch = "task/worker";
-  gitSync(repoPath, ["checkout", "-q", "-b", branch]);
+  let repoPath = mainRepoPath;
+  if (options.linkedWorktree) {
+    repoPath = join(tempDir("acp-linked-worktree-"), "tree");
+    gitSync(mainRepoPath, ["worktree", "add", "-q", "-b", branch, repoPath]);
+  } else {
+    gitSync(mainRepoPath, ["checkout", "-q", "-b", branch]);
+  }
 
   const runId = newRunId();
   const repositoryId = newRepositoryId();
@@ -183,7 +221,7 @@ export const seedWorkerWorld = (
   return {
     db, clock, audit, sessions, bindings, tasks, claims, guard,
     broker: new GuardedInvocationWriteBroker(guard),
-    runId, projectId, repositoryId, identity, repoPath, branch,
+    runId, projectId, repositoryId, identity, repoPath, mainRepoPath, branch,
     cto: { sessionId: ctoSessionId, incarnation: ctoIncarnation, roleKey, generation },
     taskId, worker, claimId, ownedPaths,
   };
@@ -283,7 +321,12 @@ export class FakeWorkerAdapter implements ProviderAdapter {
     if (!request.managedWrite) return refused("WRITE_REQUIRES_MANAGED_RUN: no managed write");
     const authorised = await this.broker.authorize(request.managedWrite, async () => {
       this.launches += 1;
-      const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+      // Its command line carries the worker session the way the provider CLI's does (`--session-id`).
+      const child = spawn(
+        process.execPath,
+        ["-e", "setInterval(() => {}, 1000)", "--", "--session-id", request.externalSessionId ?? ""],
+        { detached: true, stdio: "ignore" },
+      );
       this.children.push(child);
       const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
       const kill = (): void => {

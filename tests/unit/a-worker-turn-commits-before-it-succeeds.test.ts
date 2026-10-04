@@ -14,20 +14,28 @@ import {
   WorkerTurnEvent,
   WorkerTurnRunner,
   type WorkerTurnOptions,
-  gitWorkerCommit,
   workerDiffDigest,
   workerSuccessDigest,
   type WorkerSuccessDigestInputs,
 } from "../../src/run/worker-turn.ts";
-import { cleanupTempDirs, gitSync, makeCore } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, gitSync, makeCore, tempDir } from "../helpers/fixtures.ts";
+import { plumbingWorkerCommit } from "../../src/run/worker-git.ts";
 import { makeHarness } from "../helpers/harness.ts";
 import { FakeWorkerAdapter, seedWorkerWorld, type WorkerWorld } from "../helpers/worker-turn-fixture.ts";
-import type { ProviderAdapter } from "../../src/runtime/provider.ts";
+import type { InvocationRequest, InvocationResult, ProviderAdapter } from "../../src/runtime/provider.ts";
+
+/** Launches through the broker like the fake, but its spawn never reaches the receipt: no pid is recorded. */
+class UnrecordedSpawnAdapter extends FakeWorkerAdapter {
+  override invoke(request: InvocationRequest): Promise<InvocationResult> {
+    return super.invoke({ ...request, onSpawn: undefined });
+  }
+}
 
 const makeRunner = (world: WorkerWorld, adapter: ProviderAdapter, options: WorkerTurnOptions = {}): WorkerTurnRunner =>
   new WorkerTurnRunner(
     { db: world.db, clock: world.clock, audit: world.audit, tasks: world.tasks, guard: world.guard, workerAdapter: () => adapter },
-    { pollMs: 10, ...options },
+    // Scratch for the pinned git calls stays in this test's own temp tree, never the daemon's state root.
+    { pollMs: 10, scratchDir: (prefix) => tempDir(prefix), ...options },
   );
 
 /**
@@ -98,10 +106,10 @@ describe("#512 a worker turn commits before it succeeds", () => {
     let statusAtCommit: string | null = null;
     const runner = makeRunner(world, adapter, {
       commit: {
-        commit: async (worktree, paths, message) => {
+        commit: async (repo, input) => {
           // The ordering witness: at the moment the control plane commits, the receipt is still open.
           statusAtCommit = world.tasks.execution(world.tasks.executions(world.runId)[0]!.executionId)!.status;
-          return gitWorkerCommit.commit(worktree, paths, message);
+          return plumbingWorkerCommit.commit(repo, input);
         },
       },
     });
@@ -301,14 +309,14 @@ describe("#512 a worker turn commits before it succeeds", () => {
     it("commit failure", async () => {
       const world = coreWorld();
       const adapter = fakeFor(world);
-      const lock = join(world.repoPath, ".git", "index.lock");
+      const lock = join(world.repoPath, ".git", "refs", "heads", `${world.branch}.lock`);
       const runner = makeRunner(world, adapter, {
         commit: {
-          commit: async (worktree, paths, message) => {
-            // A real git refusal: another process holds the index lock when the commit runs.
+          commit: async (repo, input) => {
+            // A real git refusal: another process holds the branch's ref lock when the commit moves it.
             writeFileSync(lock, "");
             try {
-              return await gitWorkerCommit.commit(worktree, paths, message);
+              return await plumbingWorkerCommit.commit(repo, input);
             } finally {
               rmSync(lock, { force: true });
             }
@@ -468,7 +476,7 @@ describe("#512 a worker turn commits before it succeeds", () => {
 
       // The daemon restarts: a fresh runner over the same database reconciles. The old runner is dropped.
       const restarted = makeRunner(world, adapter);
-      expect(restarted.reconcileAfterRestart()).toEqual([{ executionId, outcome: "KILLED" }]);
+      expect(await restarted.reconcileAfterRestart()).toEqual([{ executionId, outcome: "KILLED" }]);
       expect(world.tasks.execution(executionId)!.status).toBe("ABANDONED");
       // Killed by the reconcile itself — the abandoned runner does not stop this child.
       await waitFor(() => {
@@ -497,7 +505,7 @@ describe("#512 a worker turn commits before it succeeds", () => {
       const pid = world.tasks.execution(executionId)!.workerProcessId!;
 
       const restarted = makeRunner(world, adapter);
-      expect(restarted.reconcileAfterRestart()).toEqual([{ executionId, outcome: "UNIDENTIFIED" }]);
+      expect(await restarted.reconcileAfterRestart()).toEqual([{ executionId, outcome: "UNIDENTIFIED" }]);
       expect(world.tasks.execution(executionId)!.status).toBe("ABANDONED");
       // Still alive well after the abandoned runner has seen the ABANDONED status: nothing killed it.
       await new Promise((resolve) => setTimeout(resolve, 200));
@@ -534,6 +542,45 @@ describe("#512 a worker turn commits before it succeeds", () => {
       });
       expect(retried.allowed).toBe(true);
       if (retried.allowed) await restarted.settled(retried.value.executionId);
+    });
+
+    it("a launch the guard admitted whose process was never recorded blocks every retry of its task", async () => {
+      // The provider launched — the guard admitted it — but its pid never reached the receipt, as when
+      // the daemon dies between the spawn and the record. Nothing can confirm that process gone.
+      const world = coreWorld();
+      const adapter = new UnrecordedSpawnAdapter(world.broker);
+      adapters.push(adapter);
+      adapter.script = { hold: true, ignoreAbort: true };
+      const runner = makeRunner(world, adapter);
+      const executionId = await startTurn(world, runner);
+      await waitFor(() => adapter.launches === 1, "the provider launch");
+      expect(world.tasks.execution(executionId)!.workerProcessId).toBeNull();
+
+      const restarted = makeRunner(world, adapter);
+      expect(await restarted.reconcileAfterRestart()).toEqual([{ executionId, outcome: "UNIDENTIFIED" }]);
+      expect(world.tasks.execution(executionId)!.status).toBe("ABANDONED");
+
+      const retry = () => restarted.start({
+        runId: world.runId,
+        taskId: world.taskId,
+        claimId: world.claimId,
+        ownerSessionId: world.cto.sessionId,
+        ownerBindingGeneration: world.cto.generation,
+      });
+      const whileAlive = await retry();
+      expect(whileAlive.allowed).toBe(false);
+      expect(whileAlive.reasonCode).toBe(ReasonCode.CONFLICT);
+      expect(whileAlive.allowed ? "" : whileAlive.message).toMatch(/never recorded/);
+
+      // Even once that process is gone the block stands: there is no pid by which to know it is.
+      adapter.killAll();
+      await runner.settled(executionId);
+      adapter.script = { writes: { "src/app.js": "module.exports = () => 2;\n" } };
+      const afterwards = await retry();
+      expect(afterwards.allowed).toBe(false);
+      expect(afterwards.reasonCode).toBe(ReasonCode.CONFLICT);
+      expect(afterwards.allowed ? "" : afterwards.message).toMatch(/never recorded/);
+      expect(adapter.launches).toBe(1);
     });
   });
 

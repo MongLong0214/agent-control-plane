@@ -1627,8 +1627,7 @@ export class Daemon {
     // #512 — a worker turn this control plane launched is never re-invoked. Its recorded process is
     // killed only when pid, OS start time and ownership all match; otherwise nothing is killed and
     // the task is blocked from another turn. Either way the execution ends ABANDONED.
-    const orphanedExecutions: string[] = this.cp.workerTurns
-      .reconcileAfterRestart()
+    const orphanedExecutions: string[] = (await this.cp.workerTurns.reconcileAfterRestart())
       .map((orphan) => orphan.executionId);
 
     // A receipt that says RUNNING across a restart has no live worker behind it.
@@ -2922,13 +2921,20 @@ export class Daemon {
   }
 
   async stop(): Promise<void> {
+    // #512 (ACP-WORKER-03) — before this daemon gives up its authority, every worker turn it owns is
+    // aborted and drained. A process that would not be confirmed gone stays recorded as outstanding,
+    // durably, so the next start reconciles it and no retry of its task runs first.
+    const workers = await this.cp.workerTurns.shutdown();
     this.wakeBootstrap("ABANDONED");
     for (const timer of this.#timers) clearInterval(timer);
     this.#timers = [];
     this.uninstallContinuityCoordinator();
     // Only its own: a successor that registered after this daemon keeps its supplier.
     this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
-    this.cp.audit.record({ kind: "DAEMON_STOPPED", evidence: { pid: process.pid } });
+    this.cp.audit.record({
+      kind: "DAEMON_STOPPED",
+      evidence: { pid: process.pid, drained: workers.drained, executions: workers.outstanding },
+    });
     this.lock.release();
   }
 }

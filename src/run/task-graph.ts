@@ -4,7 +4,7 @@ import type {
   WorkerFanoutCapacityTarget,
 } from "../capacity/capacity-monitor.ts";
 import { digestOf } from "../core/digest.ts";
-import { type Decision, allow, deny, fail } from "../core/errors.ts";
+import { type Decision, allow, deny, fail, isAcpError } from "../core/errors.ts";
 import { newTaskId } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
@@ -24,6 +24,7 @@ import {
 } from "../export/baseline-contract.ts";
 import { BaselineRecorder } from "../export/baseline-recorder.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
+import type { WorkerProcessAuthority } from "./worker-turn.ts";
 
 export interface TaskSpec {
   /** Caller-chosen local key used to express dependencies within one submission. */
@@ -109,6 +110,8 @@ export interface ExecutionRecord {
   workerProcessId: number | null;
   /** The OS start time the spawned process reported, never the database clock. */
   workerProcessStartedAt: string | null;
+  /** When the recorded process was confirmed gone; null while it is outstanding (or none was recorded). */
+  workerProcessReleasedAt: string | null;
   repositoryId: string | null;
   worktreeId: string | null;
 }
@@ -637,21 +640,62 @@ export class TaskGraph {
    * Written once, while the execution is still RUNNING, so a restart can find the worker and tell
    * it apart from a later process that reuses its pid. `startedAt` is the OS start time read from
    * the process; a null one is recorded as unknown, which a restart treats as unidentifiable.
+   *
+   * #1070 — only under the record authority the worker runner mints in its own invocation's spawn
+   * report. The database refuses the write otherwise, and for any execution, pid or start time other
+   * than the ones the authority names, so no other writer can point a restart's kill at a process.
    */
-  recordWorkerProcess(executionId: string, pid: number, startedAt: string | null): Decision<void> {
+  recordWorkerProcess(
+    executionId: string,
+    pid: number,
+    startedAt: string | null,
+    authority: WorkerProcessAuthority,
+  ): Decision<void> {
     if (!Number.isSafeInteger(pid) || pid <= 0) {
       return deny(ReasonCode.INVALID_ARGUMENT, "a worker process id must be a positive integer", { executionId, pid });
     }
-    const written = this.db.run(
-      `UPDATE task_executions SET worker_process_id = ?, worker_process_started_at = ?
-        WHERE execution_id = ? AND status = 'RUNNING' AND runtime_managed = 1 AND worker_process_id IS NULL`,
-      [pid, startedAt, executionId],
-    ).changes;
+    let written: number;
+    try {
+      written = this.db.withWorkerProcessRecord(authority, () => this.db.run(
+        `UPDATE task_executions SET worker_process_id = ?, worker_process_started_at = ?
+          WHERE execution_id = ? AND status = 'RUNNING' AND runtime_managed = 1 AND worker_process_id IS NULL`,
+        [pid, startedAt, executionId],
+      ).changes);
+    } catch (error) {
+      if (isAcpError(error)) return deny(error.reasonCode, error.message, { executionId, pid });
+      throw error;
+    }
     if (written !== 1) {
       return deny(ReasonCode.CONFLICT, "only a running runtime-managed execution records its process, once", {
         executionId,
         pid,
       });
+    }
+    return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * #512 — the recorded worker process was confirmed gone. Written once, whatever the execution's
+   * status is by then: the process and the receipt end at different moments.
+   *
+   * #1070 — only under the release authority the worker runner mints when it has confirmed that exact
+   * process gone. The database refuses the write otherwise, and refuses it for any execution, pid or
+   * start time other than the ones the authority names.
+   */
+  releaseWorkerProcess(executionId: string, authority: WorkerProcessAuthority): Decision<void> {
+    let released: number;
+    try {
+      released = this.db.withWorkerProcessRelease(authority, () => this.db.run(
+        `UPDATE task_executions SET worker_process_released_at = ?
+          WHERE execution_id = ? AND worker_process_id IS NOT NULL AND worker_process_released_at IS NULL`,
+        [this.clock.nowIso(), executionId],
+      ).changes);
+    } catch (error) {
+      if (isAcpError(error)) return deny(error.reasonCode, error.message, { executionId });
+      throw error;
+    }
+    if (released !== 1) {
+      return deny(ReasonCode.CONFLICT, "only an outstanding worker process is released, once", { executionId });
     }
     return allow(ReasonCode.OK, undefined);
   }
@@ -989,6 +1033,7 @@ interface RawExecution {
   runtime_managed: number;
   worker_process_id: number | null;
   worker_process_started_at: string | null;
+  worker_process_released_at: string | null;
   repository_id: string | null;
   worktree_id: string | null;
 }
@@ -1011,6 +1056,7 @@ const hydrateExecution = (row: RawExecution): ExecutionRecord => ({
   runtimeManaged: row.runtime_managed === 1,
   workerProcessId: row.worker_process_id,
   workerProcessStartedAt: row.worker_process_started_at,
+  workerProcessReleasedAt: row.worker_process_released_at,
   repositoryId: row.repository_id,
   worktreeId: row.worktree_id,
 });
